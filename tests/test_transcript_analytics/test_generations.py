@@ -27,7 +27,7 @@ def test_metadata_add_change_delete_rebuilds(source):
         else:
             meta.write_text(json.dumps({"agentType": value}))
         assert store.ingest(projects, data)["rebuilt"] == 1
-        rows = pq.read_table(data / f"agents__{store.srckey(path.name)}.parquet").to_pylist()
+        rows = pq.read_table(store._table_path(data, "agents", store.srckey(path.name))).to_pylist()
         assert [r["agent_type"] for r in rows] == ([] if value is None else [value])
         assert store.ingest(projects, data)["unchanged"] == 1
 
@@ -35,7 +35,7 @@ def test_metadata_add_change_delete_rebuilds(source):
 def test_mixed_generation_is_excluded_even_after_source_disappears(source):
     projects, path, data = source
     store.ingest(projects, data)
-    table = data / f"hooks__{store.srckey(path.name)}.parquet"
+    table = store._table_path(data, "hooks", store.srckey(path.name))
     content = pq.read_table(table)
     pq.write_table(
         content.replace_schema_metadata({**content.schema.metadata, b"ta.generation": b"other"}),
@@ -55,7 +55,7 @@ def test_semantics_upgrade_retains_but_excludes_history(source, monkeypatch):
     accepted, excluded = store.compatible_sources(data)
     assert accepted == []
     assert excluded[0]["reason"] == "incompatible semantics"
-    assert len(list(data.glob("*.parquet"))) == 6
+    assert len(list(data.rglob("*.parquet"))) == 6
 
 
 def test_symlink_sources_are_not_ingested(source):

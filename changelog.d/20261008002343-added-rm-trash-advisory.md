@@ -1,0 +1,1 @@
+- A session that deletes user data with `rm`, `unlink` or `shred` (Claude Code memory, plans and settings, `~/.genesis` config and output, the gitignored identity and local config files) now gets a note pointing it at `python -m genesis.trash put`, which can be undone. The note is advisory and never blocks a command.

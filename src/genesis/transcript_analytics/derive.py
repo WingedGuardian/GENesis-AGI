@@ -23,20 +23,23 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from genesis.transcript_analytics import query, store
+from genesis.transcript_analytics import catalog, query, store
 from genesis.transcript_analytics.locks import publication, restore_epoch
 
-DERIVED_VIEWS = ("tool_calls", "turns", "hooks", "events", "session_meta", "agents", "sessions")
+DERIVED_VIEWS = query._DERIVED
 
 
 def is_current(data: Path) -> bool:
     return query.derived_current(data)
 
 
-def build(data: Path, *, lock_path: Path | None = None) -> dict:
+def build(data: Path, *, lock_path: Path | None = None, if_stale: bool = False) -> dict:
     t0 = time.monotonic()
     root = data / "derived"
     with store._locked(lock_path or store.DEFAULT_LOCK):
+        selected = catalog.load(data)
+        if if_stale and query.derived_current(data, selected):
+            return {"derived": "current; nothing to do"}
         root.mkdir(
             parents=True, exist_ok=True
         )  # BEFORE reading input_fp: creating it bumps data's mtime
@@ -51,20 +54,28 @@ def build(data: Path, *, lock_path: Path | None = None) -> dict:
         staging = root / ".staging" / stamp
         staging.mkdir(parents=True)
         try:
-            keys, excluded = store.compatible_sources(data)
-            with contextlib.closing(query.connect(data, live=True)) as con:
+            keys, excluded = store.compatible_sources(data, selected)
+            with contextlib.closing(query.connect(data, live=True, selected=selected)) as con:
                 for v in DERIVED_VIEWS:
                     out = str(staging / f"{v}.parquet").replace("'", "''")
                     con.execute(
                         f"COPY (SELECT * FROM {v}) TO '{out}' (FORMAT parquet, COMPRESSION zstd)"  # noqa: S608 — fixed names, escaped path
                     )
+                identity_coverage = query.turn_identity_coverage(con)
             manifest = {
                 "views_version": query.VIEWS_VERSION,
                 "restore_epoch": restore_epoch(),
                 "input_fp": input_fp,
+                "catalog_revision": selected.revision if selected is not None else None,
+                "population_revision": selected.population_revision
+                if selected is not None
+                else None,
                 "semantics": {k.decode(): os.fsdecode(v) for k, v in store.semantics().items()},
                 "coverage": {"included": len(keys), "excluded": excluded},
-                "inventory": store.inventory(data),
+                "denominators": {"turns": identity_coverage["candidate_rows"]},
+                "denominator_basis": {"turns": "candidate_turn_rows"},
+                "turn_identity_coverage": identity_coverage,
+                "inventory": store.inventory(data, selected),
                 "sources": [
                     {
                         k.decode(): (
@@ -72,7 +83,7 @@ def build(data: Path, *, lock_path: Path | None = None) -> dict:
                             if k == b"ta.source"
                             else v.decode()
                         )
-                        for k, v in store.source_metadata(data, key)[0].items()
+                        for k, v in store.source_metadata(data, key, selected)[0].items()
                         if k in (b"ta.source", b"ta.fp", b"ta.generation")
                     }
                     for key in keys

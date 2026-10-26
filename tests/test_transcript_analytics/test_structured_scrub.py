@@ -173,8 +173,7 @@ def test_duplicate_key_population_cannot_restore_shadowed_secret(wrap, string_en
     if string_encoded:
         raw = json.dumps({"content": raw})
     text, failed = scrub.scrub_text(raw)
-    assert not failed and token not in text
-    assert "harmless" in text
+    assert failed and text is None
 
 
 def test_duplicate_identity_and_credential_keys_have_same_preservation_rule():
@@ -184,5 +183,4 @@ def test_duplicate_identity_and_credential_keys_have_same_preservation_rule():
         + json.dumps(token)
         + ',"id":"harmless","password":"synthetic-value","password":"other"}'
     )
-    assert not failed and token not in text and "synthetic-value" not in text
-    assert json.loads(text) == {"id": "harmless", "password": "[REDACTED]"}
+    assert failed and text is None

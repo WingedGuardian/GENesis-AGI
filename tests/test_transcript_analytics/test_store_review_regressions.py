@@ -37,7 +37,7 @@ def test_prune_wrong_nonempty_root_refused(tmp_path):
     (wrong / "x.jsonl").write_text("{}\n")
     with pytest.raises(ValueError, match="root differs"):
         store.prune(data, before="2026-01-01", projects=wrong)
-    assert len(list(data.glob("fragments__*.parquet"))) == 1
+    assert len(store.source_keys(data)) == 1
 
 
 def test_prune_utc_boundary_and_unknown_timestamps(tmp_path):
@@ -45,7 +45,7 @@ def test_prune_utc_boundary_and_unknown_timestamps(tmp_path):
     for path in root.glob("*.jsonl"):
         path.unlink()
     assert store.prune(data, before="2026-01-01", projects=root) == 1
-    assert len(list(data.glob("fragments__*.parquet"))) == 2
+    assert len(store.source_keys(data)) == 2
 
 
 def test_last_source_pruned_invalidates_and_builds_empty_snapshot(tmp_path):
@@ -53,8 +53,9 @@ def test_last_source_pruned_invalidates_and_builds_empty_snapshot(tmp_path):
     derive.build(data)
     (root / "0.jsonl").unlink()
     assert store.prune(data, before="2026-01-01", projects=root) == 1
-    assert not query.snapshot_compatible(data)
-    assert query.run_query(data, "select count(*) from turns")[1] == [(0,)]
+    assert query.snapshot_compatible(data) and not query.derived_current(data)
+    assert query.run_query(data, "select count(*) from turns")[1] == [(1,)]
+    assert query.run_query(data, "select count(*) from turns", live=True)[1] == [(0,)]
     derive.build(data)
     assert query.snapshot_compatible(data)
     assert query.run_query(data, "select count(*) from turns")[1] == [(0,)]

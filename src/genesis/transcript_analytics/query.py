@@ -9,17 +9,33 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import stat
 import sys
+import tempfile
+import weakref
 from pathlib import Path
 
 import duckdb
 
-from genesis.transcript_analytics import store
+from genesis.transcript_analytics import catalog, store
 from genesis.transcript_analytics.extract import TABLES
 from genesis.transcript_analytics.locks import publication, restore_epoch
 
-VIEWS_VERSION = "8"
-_DERIVED = ("tool_calls", "turns", "hooks", "events", "session_meta", "agents", "sessions")
+VIEWS_VERSION = "16"
+_DERIVED = (
+    "tool_calls",
+    "turns",
+    "hooks",
+    "events",
+    "session_meta",
+    "agents",
+    "sessions",
+    "actor_lineage",
+    "executors",
+    "delegation_rollups",
+    "context_rollups",
+    "metric_coverage",
+)
 
 
 def snapshot_manifest(data: Path) -> dict:
@@ -36,20 +52,47 @@ def snapshot_compatible(data: Path) -> bool:
     return (
         manifest.get("views_version") == VIEWS_VERSION
         and manifest.get("restore_epoch") == restore_epoch()
-        and manifest.get("semantics")
-        == {k.decode(): v.decode() for k, v in store.semantics().items()}
+        and isinstance(manifest.get("semantics"), dict)
+        and store.semantics_compatible(
+            {
+                k.encode(): v.encode()
+                for k, v in manifest["semantics"].items()
+                if isinstance(k, str) and isinstance(v, str)
+            }
+        )
         and all((cur / f"{v}.parquet").is_file() for v in _DERIVED)
     )
 
 
-def derived_current(data: Path) -> bool:
-    return (
-        snapshot_compatible(data)
-        and snapshot_manifest(data).get("input_fp") == data.stat().st_mtime_ns
+def derived_current(data: Path, selected=store._READ_CATALOG) -> bool:
+    selected = store._selection(data, selected)
+    manifest = snapshot_manifest(data)
+    return snapshot_compatible(data) and (
+        manifest.get("catalog_revision") == selected.revision
+        if selected is not None
+        else manifest.get("input_fp") == data.stat().st_mtime_ns
     )
 
 
-def connect(data: Path, *, memory_limit=None, threads=None, live=False):
+def _spill_directory():
+    root = Path(os.environ.get("TA_DUCKDB_TMP", Path.home() / "tmp/transcript-analytics/duckdb")).absolute()
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    info = root.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.getuid()):
+        raise ValueError("DuckDB temporary root is not an owned directory")
+    # Each connection gets an atomically created 0700 child, independently of
+    # umask and any permissive pre-existing root on trusted local storage.
+    temporary = tempfile.TemporaryDirectory(prefix="private-", dir=root)
+    child = Path(temporary.name).lstat()
+    if not stat.S_ISDIR(child.st_mode) or child.st_uid != os.getuid() or child.st_mode & 0o077:
+        temporary.cleanup()
+        raise ValueError("DuckDB spill directory is not private")
+    return temporary
+
+
+def connect(
+    data: Path, *, memory_limit=None, threads=None, live=False, selected=store._READ_CATALOG
+):
     """Internal unlocked connection; only compatible sources enter live views."""
     import pyarrow as pa
 
@@ -60,13 +103,13 @@ def connect(data: Path, *, memory_limit=None, threads=None, live=False):
     ram, cpu = (float(v) for v in budget.split(",")) if budget else (3_000_000_000, 200)
     memory_limit = memory_limit or f"{max(1, int(ram * 0.5))}B"
     threads = threads or max(1, int(cpu / 100))
+    temporary = _spill_directory()
     con = duckdb.connect()
+    weakref.finalize(con, temporary.cleanup)
     try:
-        tmp = Path(os.environ.get("TA_DUCKDB_TMP", Path.home() / "tmp/transcript-analytics/duckdb"))
-        tmp.mkdir(parents=True, exist_ok=True)
         con.execute("SET memory_limit = ?", [memory_limit])
         con.execute(f"SET threads={int(threads)}")
-        con.execute("SET temp_directory = ?", [str(tmp)])
+        con.execute("SET temp_directory = ?", [temporary.name])
         con.execute("SET preserve_insertion_order=false")
         con.execute("SET autoinstall_known_extensions=false")
         con.execute("SET autoload_known_extensions=false")
@@ -76,14 +119,18 @@ def connect(data: Path, *, memory_limit=None, threads=None, live=False):
                 path = str(snap / f"{view}.parquet").replace("'", "''")
                 con.execute(f"CREATE VIEW {view} AS SELECT * FROM read_parquet('{path}')")  # noqa: S608 — fixed view names, escaped local path
         else:
-            keys, _excluded = store.compatible_sources(data)
+            selected = store._selection(data, selected)
+            keys, _excluded = store.compatible_sources(data, selected)
             for table in TABLES:
-                files = [str(store._table_path(data, table, key)) for key in keys]
+                files = [str(store._table_path(data, table, key, selected)) for key in keys]
                 if files:
                     con.from_parquet(files, union_by_name=False).create_view(f"raw_{table}")
                 else:
                     con.register(f"_empty_{table}", pa.Table.from_pylist([], schema=SCHEMAS[table]))
                     con.execute(f"CREATE VIEW raw_{table} AS SELECT * FROM _empty_{table}")  # noqa: S608 — fixed table names
+            from .reconcile import install
+
+            install(con)
             con.execute(_VIEWS)
         con.execute("SET lock_configuration=true")
         return con
@@ -93,19 +140,27 @@ def connect(data: Path, *, memory_limit=None, threads=None, live=False):
 
 
 @contextlib.contextmanager
-def read_connection(data, *, live=False):
+def _read_state(data, *, live=False):
     if not live:
         with publication():
+            selected = catalog.load(data)
             if snapshot_compatible(data):
-                with contextlib.closing(connect(data)) as con:
-                    yield con
+                with contextlib.closing(connect(data, selected=selected)) as con:
+                    yield con, selected, snapshot_manifest(data)
                 return
     # Release publication before acquiring writer: same order as restore/build.
     with (
         store._locked(store.DEFAULT_LOCK),
         publication(),
-        contextlib.closing(connect(data, live=True)) as con,
     ):
+        selected = catalog.load(data)
+        with contextlib.closing(connect(data, live=True, selected=selected)) as con:
+            yield con, selected, None
+
+
+@contextlib.contextmanager
+def read_connection(data, *, live=False):
+    with _read_state(data, live=live) as (con, _selected, _snapshot):
         yield con
 
 
@@ -130,20 +185,31 @@ def _scrub_labels(sql, window, baseline):
     }
 
 
+def turn_identity_coverage(con):
+    """Count candidate rows without claiming an exact unique-message total."""
+    candidates, uncertain = con.execute(
+        "SELECT count(*), count(*) FILTER(WHERE count_uncertain) FROM turns"
+    ).fetchone()
+    return {
+        "candidate_rows": candidates,
+        "uncertain_candidate_rows": uncertain,
+        "unambiguous_candidate_rows": candidates - uncertain,
+    }
+
+
 def run_query(
     data: Path, sql: str, params=None, *, live=False, manifest_path=None, window=None, baseline=None
 ):
     """Read a consistent generation; stale compatible snapshots remain usable."""
-    with read_connection(data, live=live) as con:
-        snapshot = snapshot_manifest(data) if not live and snapshot_compatible(data) else None
+    with _read_state(data, live=live) as (con, selected, snapshot):
         if snapshot:
             coverage, inventory = snapshot.get("coverage", {}), snapshot.get("inventory", {})
-            stale = not derived_current(data)
+            stale = not derived_current(data, selected)
         else:
-            keys, excluded = store.compatible_sources(data)
+            keys, excluded = store.compatible_sources(data, selected)
             coverage, inventory = (
                 {"included": len(keys), "excluded": excluded},
-                store.inventory(data),
+                store.inventory(data, selected),
             )
             stale = False
         print(
@@ -153,7 +219,11 @@ def run_query(
                     "stale": stale,
                     "coverage": coverage,
                     "inventory": inventory,
-                    "latest_collection": store.inventory(data),
+                    "latest_collection": store.inventory(data, selected),
+                    "catalog_revision": snapshot.get("catalog_revision")
+                    if snapshot
+                    else (selected.revision if selected is not None else None),
+                    "latest_catalog_revision": selected.revision if selected is not None else None,
                 }
             ),
             file=sys.stderr,
@@ -163,14 +233,21 @@ def run_query(
         if manifest_path:
             from .provenance import write_manifest
 
-            snapshot = snapshot_manifest(data) if not live and snapshot_compatible(data) else None
-            keys, excluded = ([], []) if snapshot else store.compatible_sources(data)
+            keys, excluded = ([], []) if snapshot else store.compatible_sources(data, selected)
+            identity_coverage = turn_identity_coverage(con)
             write_manifest(
                 manifest_path,
                 {
                     **_scrub_labels(sql, window, baseline),
                     "snapshot": snapshot,
-                    "snapshot_current": derived_current(data),
+                    "snapshot_current": derived_current(data, selected),
+                    "catalog_revision": snapshot.get("catalog_revision")
+                    if snapshot
+                    else (selected.revision if selected is not None else None),
+                    "population_revision": snapshot.get("population_revision")
+                    if snapshot
+                    else (selected.population_revision if selected is not None else None),
+                    "latest_catalog_revision": selected.revision if selected is not None else None,
                     "inventory": inventory,
                     "live": live,
                     "versions": {k.decode(): v.decode() for k, v in store.semantics().items()},
@@ -181,12 +258,16 @@ def run_query(
                         v: con.execute(f"SELECT count(*) FROM {v}").fetchone()[0]  # noqa: S608 — fixed view names
                         for v in ("tool_calls", "turns", "sessions")
                     },
+                    "denominator_basis": {"turns": "candidate_turn_rows"},
+                    "turn_identity_coverage": identity_coverage,
                     "result_rows": len(result[1]),
                     "source_references": [s["ta.source"] for s in snapshot["sources"]]
                     if snapshot
                     else [
                         store.source_identity(
-                            os.fsdecode(store.source_metadata(data, key)[0].get(b"ta.source", b""))
+                            os.fsdecode(
+                                store.source_metadata(data, key, selected)[0].get(b"ta.source", b"")
+                            )
                         )
                         for key in keys
                     ],
@@ -195,58 +276,34 @@ def run_query(
         return result
 
 
-_VIEWS = """
-CREATE OR REPLACE VIEW file_span AS
-SELECT source_file, min(ts) AS file_first, max(ts) AS file_last FROM raw_fragments GROUP BY source_file;
-
--- A record repeated inside ONE file counts once (review SF-5: 630 such pairs).
-CREATE OR REPLACE VIEW fragments AS
-SELECT * FROM raw_fragments
-QUALIFY row_number() OVER (PARTITION BY source_file, uuid IS NULL, coalesce(uuid, line_no::VARCHAR) ORDER BY line_no) = 1;
-
--- Which file's copy of a message is the original. Copies arise two ways, both
--- measured: a resumed session re-writes earlier records WITH their original
--- timestamps, and a spawned child agent's file begins with a copy of the ONE
--- parent fragment that spawned it. The original holds the most fragments of
--- the message; among equally complete copies, the file that started earliest,
--- then ended earliest (the original stops when the resumed one continues).
-CREATE OR REPLACE VIEW message_copy AS
-SELECT message_id, source_file FROM (
-  SELECT f.message_id, f.source_file, count(*) AS n, min(s.file_first) AS file_first,
-         max(s.file_last) AS file_last
-  FROM fragments f JOIN file_span s USING (source_file)
-  WHERE f.message_id IS NOT NULL
-  GROUP BY f.message_id, f.source_file)
-QUALIFY row_number() OVER (PARTITION BY message_id
-                           ORDER BY n DESC, file_first NULLS LAST, file_last NULLS LAST, source_file) = 1;
-
--- One row per tool_use_id, ASSEMBLED: call columns from the call row in the
--- message's original file (else the earliest file), result columns from the
--- result row in that same file (else the earliest file holding one). Picking a
--- single row let a result-only orphan in another file replace the real call.
+_TOOL_VIEWS = """
 CREATE OR REPLACE VIEW tool_calls AS
 WITH calls AS (
   SELECT c.* FROM raw_tool_calls c
-  LEFT JOIN message_copy m ON m.message_id = c.message_id
-  LEFT JOIN file_span s ON s.source_file = c.source_file
+  LEFT JOIN message_copy m ON m.turn_key = 'provider:' || c.message_id
+
   WHERE c.line_no_call IS NOT NULL
   QUALIFY row_number() OVER (PARTITION BY c.tool_use_id
                              ORDER BY (c.source_file = m.source_file) DESC NULLS LAST,
-                                      s.file_first NULLS LAST, s.file_last NULLS LAST, c.source_file,
+                                      c.source_file,
                                       c.line_no_call) = 1),
 results AS (
   SELECT r.* FROM raw_tool_calls r
   LEFT JOIN calls k ON k.tool_use_id = r.tool_use_id
-  LEFT JOIN file_span s ON s.source_file = r.source_file
+
   WHERE r.has_result
   QUALIFY row_number() OVER (PARTITION BY r.tool_use_id
                              ORDER BY (r.source_file = k.source_file) DESC NULLS LAST,
-                                      s.file_first NULLS LAST, s.file_last NULLS LAST, r.source_file,
+                                      r.source_file,
                                       r.line_no_result) = 1)
 SELECT
-  coalesce(k.source_file, r.source_file) AS source_file, coalesce(k.session_id, r.session_id) AS session_id,
-  coalesce(k.agent_id, r.agent_id) AS agent_id, coalesce(k.tool_use_id, r.tool_use_id) AS tool_use_id,
-  k.message_id, k.line_no_call, r.line_no_result, k.ts_call, r.ts_result,
+  coalesce(k.source_file, r.source_file) AS source_file,
+ CASE WHEN len(own.context_sessions)=1 THEN own.context_sessions[1]
+ WHEN own.context_sessions IS NULL THEN coalesce(k.session_id,r.session_id) END AS session_id,
+  json_extract_string(own.executor_id,'$[1]') AS agent_id, coalesce(k.tool_use_id, r.tool_use_id) AS tool_use_id,
+  CASE WHEN NOT coalesce(states.identity_conflict,false) THEN k.message_id END AS message_id,
+  coalesce(states.identity_conflict,false) AS message_identity_conflict,
+  k.line_no_call, r.line_no_result, k.ts_call, r.ts_result,
   coalesce(CAST(date_diff('millisecond', try_cast(k.ts_call AS TIMESTAMPTZ), try_cast(r.ts_result AS TIMESTAMPTZ))
                 AS BIGINT), CASE WHEN k.source_file = r.source_file THEN r.latency_ms END) AS latency_ms,
   k.tool, k.mcp_server, k.mcp_tool, k.command, k.file_path, k.subagent_type, k.skill_arg, k.description,
@@ -256,87 +313,168 @@ SELECT
   r.tool_use_result_text, r.result_len, r.exit_code, r.interrupted, r.denial_kind,
   r.hook_event, r.hook_tool, r.hook_command, r.hook_script,
   coalesce(k.scrub_failed, false) OR coalesce(r.scrub_failed, false) AS scrub_failed,
-  r.source_file AS result_source_file
-FROM calls k FULL OUTER JOIN results r ON r.tool_use_id = k.tool_use_id;
+  r.source_file AS result_source_file, k.call_uuid,
+  own.executor_id, own.attribution_status, own.attribution_reason, own.context_sessions,
+  lineage.parent_actor_id AS delegator_id, lineage.lineage_status,
+ coalesce(counts.call_variants=1 AND NOT states.content_conflict,false) AS call_valid,
+ coalesce(counts.result_variants=1,false) AS result_valid,
+  counts.call_variants > 1 AS content_conflict, counts.result_variants > 1 AS result_conflict,
+  counts.source_references
+FROM calls k FULL OUTER JOIN results r ON r.tool_use_id = k.tool_use_id
+LEFT JOIN tool_ownership own ON own.tool_use_id=k.tool_use_id
+LEFT JOIN event_states states ON states.event_key=coalesce('uuid:' || k.call_uuid,'local:' || k.source_file || ':' || k.line_no_call)
+LEFT JOIN actor_lineage lineage ON lineage.actor_id=own.executor_id
+LEFT JOIN (SELECT tool_use_id, count(DISTINCT call_hash) AS call_variants,
+ count(DISTINCT result_hash) AS result_variants,
+ list(DISTINCT struct_pack(source_file:=source_file,line_no_call:=line_no_call,line_no_result:=line_no_result)
+ ORDER BY struct_pack(source_file:=source_file,line_no_call:=line_no_call,line_no_result:=line_no_result)) AS source_references
+ FROM raw_tool_calls GROUP BY tool_use_id) counts
+ ON counts.tool_use_id=coalesce(k.tool_use_id,r.tool_use_id);
 
+"""
+
+_TURN_VIEWS = """
 CREATE OR REPLACE VIEW turns AS
-WITH selected AS (
- SELECT fr.* FROM fragments fr JOIN message_copy USING (message_id, source_file)
- UNION ALL SELECT * FROM fragments WHERE message_id IS NULL
- QUALIFY row_number() OVER (PARTITION BY uuid IS NULL, coalesce(uuid, source_file || ':' || line_no)
- ORDER BY source_file, line_no) = 1
-), f AS (SELECT *, CASE WHEN message_id IS NOT NULL THEN 'provider:' || message_id
- ELSE coalesce('uuid:' || uuid, 'local:' || source_file || ':' || line_no) END AS turn_key FROM selected),
--- Metadata selects the first non-null value in source record order.
-g AS (
-  SELECT turn_key, any_value(message_id ORDER BY line_no ASC NULLS LAST, source_file ASC NULLS LAST, message_id ASC NULLS LAST) AS message_id,
-         any_value(session_id ORDER BY line_no ASC NULLS LAST, source_file ASC NULLS LAST, session_id ASC NULLS LAST) AS session_id, any_value(agent_id ORDER BY line_no ASC NULLS LAST, source_file ASC NULLS LAST, agent_id ASC NULLS LAST) AS agent_id,
-         any_value(source_file ORDER BY line_no ASC NULLS LAST, source_file ASC NULLS LAST, source_file ASC NULLS LAST) AS source_file, min(ts) AS ts, max(ts) AS ts_last,
-         count(*) AS n_records, bool_or(stop_reason IS NOT NULL) AS usage_available,
-         CAST(sum(n_tool_use) AS DECIMAL(38,0)) AS n_tool_use, bool_or(is_sidechain) AS is_sidechain,
-         any_value(entrypoint ORDER BY line_no ASC NULLS LAST, source_file ASC NULLS LAST, entrypoint ASC NULLS LAST) AS entrypoint, any_value(attribution_skill ORDER BY line_no ASC NULLS LAST, source_file ASC NULLS LAST, attribution_skill ASC NULLS LAST) AS attribution_skill,
-         any_value(attribution_mcp_server ORDER BY line_no ASC NULLS LAST, source_file ASC NULLS LAST, attribution_mcp_server ASC NULLS LAST) AS attribution_mcp_server,
-         any_value(attribution_mcp_tool ORDER BY line_no ASC NULLS LAST, source_file ASC NULLS LAST, attribution_mcp_tool ASC NULLS LAST) AS attribution_mcp_tool, any_value(effort ORDER BY line_no ASC NULLS LAST, source_file ASC NULLS LAST, effort ASC NULLS LAST) AS effort,
-         bool_or(is_api_error) AS is_api_error, bool_or(scrub_failed) AS scrub_failed, any_value(cwd ORDER BY line_no ASC NULLS LAST, source_file ASC NULLS LAST, cwd ASC NULLS LAST) AS cwd, any_value(git_branch ORDER BY line_no ASC NULLS LAST, source_file ASC NULLS LAST, git_branch ASC NULLS LAST) AS git_branch,
-         any_value(version ORDER BY line_no ASC NULLS LAST, source_file ASC NULLS LAST, version ASC NULLS LAST) AS version
-  FROM f GROUP BY turn_key),
--- The LAST fragment in line order supplies usage, NULLs included: arg_max skips
--- NULL values, which would mix columns from different fragments (review N-2).
-l AS (
-  SELECT * EXCLUDE (rn) FROM (
-    SELECT turn_key, stop_reason, model, request_id, input_tokens, output_tokens, cache_read,
-           cache_create, cache_create_5m, cache_create_1h, thinking_tokens,
-           row_number() OVER (PARTITION BY turn_key ORDER BY line_no DESC) AS rn
-    FROM f) WHERE rn = 1)
-SELECT g.* EXCLUDE (turn_key), l.stop_reason, l.model, l.request_id,
-       CASE WHEN g.usage_available THEN l.input_tokens END AS input_tokens,
-       CASE WHEN g.usage_available THEN l.output_tokens END AS output_tokens,
-       CASE WHEN g.usage_available THEN l.cache_read END AS cache_read,
-       CASE WHEN g.usage_available THEN l.cache_create END AS cache_create,
-       CASE WHEN g.usage_available THEN l.cache_create_5m END AS cache_create_5m,
-       CASE WHEN g.usage_available THEN l.cache_create_1h END AS cache_create_1h,
-       CASE WHEN g.usage_available THEN l.thinking_tokens END AS thinking_tokens
-FROM g JOIN l USING (turn_key);
+WITH grouped AS (
+ SELECT turn_key, any_value(message_id ORDER BY sequence_line,source_file) AS message_id,
+ any_value(session_id ORDER BY sequence_line,source_file) AS observed_session_id,
+ any_value(agent_id ORDER BY sequence_line,source_file) AS observed_agent_id,
+ any_value(representation_source ORDER BY sequence_line,source_file) AS source_file,
+ arg_min(ts,try_cast(ts AS TIMESTAMPTZ)) AS ts,arg_max(ts,try_cast(ts AS TIMESTAMPTZ)) AS ts_last,count(*) AS n_records,
+ bool_and(assembly_complete) AS assembly_complete,bool_or(content_conflict) AS content_conflict,
+ CASE WHEN count(DISTINCT executor_id)=1 AND count(*) FILTER(WHERE executor_id IS NULL)=0
+ THEN any_value(executor_id) END AS executor_id,
+ CASE WHEN bool_or(attribution_status='conflicting') THEN 'conflicting'
+ WHEN count(DISTINCT executor_id)!=1 OR count(*) FILTER(WHERE executor_id IS NULL)>0 THEN 'unresolved'
+ WHEN bool_or(attribution_status='inferred') THEN 'inferred' ELSE 'confirmed' END AS attribution_status,
+ list(DISTINCT attribution_reason ORDER BY attribution_reason) AS attribution_reasons,
+ flatten(list(source_references ORDER BY sequence_line)) AS source_references,
+ list_sort(list_distinct(flatten(list(context_sessions ORDER BY sequence_line)))) AS context_sessions,
+ CASE WHEN NOT bool_or(content_conflict) AND NOT bool_or(identity_conflict) AND bool_and(assembly_complete) THEN CAST(sum(n_tool_use) AS DECIMAL(38,0)) END AS n_tool_use,bool_or(is_sidechain) AS is_sidechain,
+ any_value(entrypoint ORDER BY sequence_line,source_file) AS entrypoint,
+ any_value(attribution_skill ORDER BY sequence_line,source_file) AS attribution_skill,
+ any_value(attribution_mcp_server ORDER BY sequence_line,source_file) AS attribution_mcp_server,
+ any_value(attribution_mcp_tool ORDER BY sequence_line,source_file) AS attribution_mcp_tool,
+ any_value(effort ORDER BY sequence_line,source_file) AS effort,
+ any_value(cwd ORDER BY sequence_line,source_file) AS cwd,
+ any_value(git_branch ORDER BY sequence_line,source_file) AS git_branch,
+ any_value(version ORDER BY sequence_line,source_file) AS version
+ FROM assembled_fragments GROUP BY turn_key
+), final AS (
+ SELECT * FROM observations
+ QUALIFY row_number() OVER(PARTITION BY turn_key ORDER BY
+ (stop_reason IS NOT NULL) DESC,source_file,line_no,payload_hash)=1
+), base AS (
+ SELECT g.* EXCLUDE(content_conflict,executor_id,attribution_status,attribution_reasons,
+ source_references,context_sessions),
+ e.content_conflict,e.executor_id,e.attribution_status,e.attribution_reasons,
+ e.source_references,e.context_sessions,e.is_api_error,e.scrub_failed,
+ e.distinct_event_count,e.physical_observation_count,e.terminal_variants,e.identity_conflict,e.count_uncertain,
+ final.stop_reason,final.model,final.request_id,
+ (g.assembly_complete AND NOT e.content_conflict AND NOT e.state_conflict
+ AND NOT e.identity_conflict AND e.executor_id IS NOT NULL AND e.attribution_status IN ('confirmed','inferred')
+ AND e.terminal_variants=1
+ AND final.stop_reason IS NOT NULL AND final.has_usage AND NOT final.is_api_error) AS usage_available,
+ (e.identity_conflict OR e.state_conflict OR e.terminal_variants>1) AS final_usage_conflict,
+ final.input_tokens,final.output_tokens,final.cache_read,final.cache_create,
+ final.cache_create_5m,final.cache_create_1h,final.thinking_tokens
+ FROM grouped g JOIN turn_evidence e USING(turn_key) JOIN final USING(turn_key)
+)
+SELECT b.* EXCLUDE(observed_agent_id,observed_session_id,input_tokens,output_tokens,cache_read,cache_create,cache_create_5m,cache_create_1h,thinking_tokens),
+ CASE WHEN usage_available THEN input_tokens END AS input_tokens,
+ CASE WHEN usage_available THEN output_tokens END AS output_tokens,
+ CASE WHEN usage_available THEN cache_read END AS cache_read,
+ CASE WHEN usage_available THEN cache_create END AS cache_create,
+ CASE WHEN usage_available THEN cache_create_5m END AS cache_create_5m,
+ CASE WHEN usage_available THEN cache_create_1h END AS cache_create_1h,
+ CASE WHEN usage_available THEN thinking_tokens END AS thinking_tokens,
+ CASE WHEN len(b.context_sessions)=1 THEN b.context_sessions[1] END AS session_id,
+ json_extract_string(b.executor_id,'$[1]') AS agent_id,
+ l.parent_actor_id AS delegator_id,l.lineage_status,l.lineage_reason
+FROM base b LEFT JOIN actor_lineage l ON b.executor_id=l.actor_id;
 
+"""
+
+_SOURCE_VIEWS = """
 CREATE OR REPLACE VIEW hooks AS
-SELECT * EXCLUDE (rn) FROM (
-  SELECT *, row_number() OVER (PARTITION BY uuid IS NULL, coalesce(uuid, source_file || ':' || line_no)
-                               ORDER BY source_file, line_no) AS rn FROM raw_hooks) WHERE rn = 1;
+WITH keyed AS (
+ SELECT *,coalesce('uuid:' || uuid,'local:' || source_file || ':' || line_no) AS event_key
+ FROM raw_hooks
+), states AS (
+ SELECT event_key,count(DISTINCT record_hash)>1 AS content_conflict,
+ CASE WHEN count(DISTINCT actor_id)=1 AND NOT bool_or(context_conflict)
+ THEN any_value(actor_id ORDER BY actor_id) END AS executor_id,
+ list(DISTINCT context_session_id ORDER BY context_session_id) AS context_sessions,
+ bool_or(context_conflict) AS context_conflict,
+ list(DISTINCT struct_pack(source_file:=source_file,line_no:=line_no)
+ ORDER BY struct_pack(source_file:=source_file,line_no:=line_no)) AS source_references
+ FROM keyed GROUP BY event_key
+)
+SELECT k.* EXCLUDE(event_key,agent_id,session_id),s.content_conflict,s.source_references,
+ CASE WHEN NOT s.content_conflict THEN s.executor_id END AS executor_id,
+ CASE WHEN s.content_conflict OR s.context_conflict THEN 'conflicting'
+ WHEN s.executor_id IS NULL THEN 'unresolved' ELSE 'confirmed' END AS attribution_status,
+ s.context_sessions,CASE WHEN len(s.context_sessions)=1 THEN s.context_sessions[1] END AS session_id,
+ CASE WHEN NOT s.content_conflict THEN json_extract_string(s.executor_id,'$[1]') END AS agent_id
+FROM keyed k JOIN states s USING(event_key)
+QUALIFY row_number() OVER(PARTITION BY event_key ORDER BY source_file,line_no)=1;
 
 CREATE OR REPLACE VIEW events AS
-SELECT * EXCLUDE (rn) FROM (
-  SELECT *, row_number() OVER (PARTITION BY uuid IS NULL, coalesce(uuid, source_file || ':' || line_no)
-                               ORDER BY source_file, line_no) AS rn FROM raw_events) WHERE rn = 1;
+WITH keyed AS (
+ SELECT *,coalesce('uuid:' || uuid,'local:' || source_file || ':' || line_no) AS event_key
+ FROM raw_events
+), states AS (
+ SELECT event_key,count(DISTINCT record_hash)>1 AS content_conflict,
+ CASE WHEN count(DISTINCT actor_id)=1 AND NOT bool_or(context_conflict)
+ THEN any_value(actor_id ORDER BY actor_id) END AS executor_id,
+ list(DISTINCT context_session_id ORDER BY context_session_id) AS context_sessions,
+ bool_or(context_conflict) AS context_conflict,
+ list(DISTINCT struct_pack(source_file:=source_file,line_no:=line_no)
+ ORDER BY struct_pack(source_file:=source_file,line_no:=line_no)) AS source_references
+ FROM keyed GROUP BY event_key
+)
+SELECT k.* EXCLUDE(event_key,agent_id,session_id),s.content_conflict,s.source_references,
+ CASE WHEN NOT s.content_conflict THEN s.executor_id END AS executor_id,
+ CASE WHEN s.content_conflict OR s.context_conflict THEN 'conflicting'
+ WHEN s.executor_id IS NULL THEN 'unresolved' ELSE 'confirmed' END AS attribution_status,
+ s.context_sessions,CASE WHEN len(s.context_sessions)=1 THEN s.context_sessions[1] END AS session_id,
+ CASE WHEN NOT s.content_conflict THEN json_extract_string(s.executor_id,'$[1]') END AS agent_id
+FROM keyed k JOIN states s USING(event_key)
+QUALIFY row_number() OVER(PARTITION BY event_key ORDER BY source_file,line_no)=1;
 
 CREATE OR REPLACE VIEW session_meta AS
-SELECT session_id, kind, value, pr_repository, min(ts) AS ts, bool_or(scrub_failed) AS scrub_failed
+SELECT session_id, kind, value, pr_repository, arg_max(ts,try_cast(ts AS TIMESTAMPTZ)) AS ts, bool_or(scrub_failed) AS scrub_failed
 FROM raw_session_meta GROUP BY session_id, kind, value, pr_repository;
 
 CREATE OR REPLACE VIEW agents AS
 SELECT * EXCLUDE (rn) FROM (
-  SELECT *, row_number() OVER (PARTITION BY agent_id ORDER BY source_file) AS rn FROM raw_agents) WHERE rn = 1;
+  SELECT *, row_number() OVER (PARTITION BY actor_id ORDER BY source_file) AS rn FROM raw_agents) WHERE rn = 1;
 
 CREATE OR REPLACE VIEW sessions AS
 WITH t AS (
-  SELECT session_id, min(ts) AS first_ts, max(ts_last) AS last_ts, count(*) AS n_turns,
-         count(*) FILTER (WHERE agent_id IS NULL) AS n_main_turns, count(DISTINCT agent_id) AS n_subagents,
+  SELECT session_id, arg_min(ts,try_cast(ts AS TIMESTAMPTZ)) AS first_ts, arg_max(ts_last,try_cast(ts_last AS TIMESTAMPTZ)) AS last_ts, count(*) AS n_turns,
+ count(*) FILTER(WHERE count_uncertain) AS n_turns_count_uncertain,
+         count(*) FILTER (WHERE executor_id IS NOT NULL AND agent_id IS NULL) AS n_main_turns,
+         count(*) FILTER(WHERE executor_id IS NULL) AS n_unattributed_turns, count(DISTINCT agent_id) AS n_subagents,
          CAST(sum(output_tokens) AS DECIMAL(38,0)) AS output_tokens, CAST(sum(input_tokens) AS DECIMAL(38,0)) AS input_tokens,
          CAST(sum(cache_read) AS DECIMAL(38,0)) AS cache_read, CAST(sum(cache_create) AS DECIMAL(38,0)) AS cache_create,
          count(*) FILTER (WHERE NOT usage_available) AS n_turns_no_usage,
          list(DISTINCT model ORDER BY model ASC NULLS LAST) AS models,
-         any_value(cwd ORDER BY ts ASC NULLS LAST, source_file ASC NULLS LAST, message_id ASC NULLS LAST, cwd ASC NULLS LAST) AS cwd,
-         any_value(git_branch ORDER BY ts ASC NULLS LAST, source_file ASC NULLS LAST, message_id ASC NULLS LAST, git_branch ASC NULLS LAST) AS git_branch
+         any_value(cwd ORDER BY try_cast(ts AS TIMESTAMPTZ) ASC NULLS LAST, source_file ASC NULLS LAST, message_id ASC NULLS LAST, cwd ASC NULLS LAST) AS cwd,
+         any_value(git_branch ORDER BY try_cast(ts AS TIMESTAMPTZ) ASC NULLS LAST, source_file ASC NULLS LAST, message_id ASC NULLS LAST, git_branch ASC NULLS LAST) AS git_branch
   FROM turns GROUP BY session_id),
 c AS (
-  SELECT session_id, count(*) AS n_tool_calls,
-         count(*) FILTER (WHERE error_source = 'flag') AS n_errors_flagged,
-         count(*) FILTER (WHERE error_source = 'text') AS n_errors_text,
-         count(*) FILTER (WHERE error_class = 'hook_block') AS n_hook_blocks
+  SELECT session_id, count(*) FILTER(WHERE call_valid) AS n_tool_calls,
+         count(*) FILTER(WHERE NOT call_valid) AS n_tool_calls_excluded,
+         count(*) FILTER (WHERE call_valid AND result_valid AND error_source = 'flag') AS n_errors_flagged,
+         count(*) FILTER (WHERE call_valid AND result_valid AND error_source = 'text') AS n_errors_text,
+         count(*) FILTER (WHERE call_valid AND result_valid AND error_class = 'hook_block') AS n_hook_blocks
   FROM tool_calls GROUP BY session_id),
 m AS (
   -- Untimed titles retain the empty timestamp key; equal keys choose the
   -- lexically greatest non-null title, independent of scan/parallel order.
-  SELECT session_id, arg_max(value, coalesce(ts, '') ORDER BY value DESC NULLS LAST) FILTER (WHERE kind = 'ai-title') AS ai_title,
+  SELECT session_id, arg_max(value, coalesce(try_cast(ts AS TIMESTAMPTZ), '-infinity'::TIMESTAMPTZ) ORDER BY value DESC NULLS LAST) FILTER (WHERE kind = 'ai-title') AS ai_title,
+         arg_max(value, coalesce(try_cast(ts AS TIMESTAMPTZ), '-infinity'::TIMESTAMPTZ) ORDER BY value DESC NULLS LAST) FILTER(WHERE kind='custom-title') AS custom_title,
          list(DISTINCT value ORDER BY value ASC NULLS LAST) FILTER (WHERE kind = 'pr-link') AS pr_numbers,
          list(DISTINCT struct_pack(repository := pr_repository, number := value)
               ORDER BY struct_pack(repository := pr_repository, number := value) ASC NULLS LAST) FILTER (WHERE kind = 'pr-link') AS pr_links
@@ -346,8 +484,63 @@ s AS (SELECT session_id, bool_or(scrub_failed) AS scrub_failed FROM (
  UNION ALL SELECT session_id,scrub_failed FROM hooks UNION ALL SELECT session_id,scrub_failed FROM events
  UNION ALL SELECT session_id,scrub_failed FROM session_meta UNION ALL SELECT session_id,scrub_failed FROM agents
 ) GROUP BY session_id)
-SELECT t.*, coalesce(c.n_tool_calls, 0) AS n_tool_calls, coalesce(c.n_errors_flagged, 0) AS n_errors_flagged,
+SELECT t.*, coalesce(c.n_tool_calls, 0) AS n_tool_calls, coalesce(c.n_tool_calls_excluded,0) AS n_tool_calls_excluded, coalesce(c.n_errors_flagged, 0) AS n_errors_flagged,
        coalesce(c.n_errors_text, 0) AS n_errors_text, coalesce(c.n_hook_blocks, 0) AS n_hook_blocks,
-       m.ai_title, m.pr_numbers, m.pr_links, coalesce(s.scrub_failed, false) AS scrub_failed
-FROM t LEFT JOIN c USING (session_id) LEFT JOIN m USING (session_id) LEFT JOIN s USING (session_id);
+       m.ai_title, m.custom_title, m.pr_numbers, m.pr_links, coalesce(s.scrub_failed, false) AS scrub_failed
+FROM t LEFT JOIN c ON c.session_id IS NOT DISTINCT FROM t.session_id
+LEFT JOIN m ON m.session_id IS NOT DISTINCT FROM t.session_id
+LEFT JOIN s ON s.session_id IS NOT DISTINCT FROM t.session_id;
+
 """
+
+_COVERAGE_VIEWS = """
+CREATE OR REPLACE VIEW executors AS
+SELECT executor_id,attribution_status,count(*) AS n_turns,
+ count(*) FILTER(WHERE count_uncertain) AS n_turns_count_uncertain,
+ count(*) FILTER(WHERE usage_available) AS n_turns_with_usage,
+ CAST(sum(output_tokens) AS DECIMAL(38,0)) AS output_tokens
+FROM turns GROUP BY executor_id,attribution_status;
+
+CREATE OR REPLACE VIEW delegation_rollups AS
+WITH RECURSIVE membership(turn_key,actor_id) AS (
+ SELECT turn_key,executor_id FROM turns WHERE executor_id IS NOT NULL
+ UNION
+ SELECT m.turn_key,l.parent_actor_id FROM membership m JOIN actor_lineage l ON l.actor_id=m.actor_id
+ WHERE l.parent_actor_id IS NOT NULL AND l.lineage_status IN ('confirmed','inferred')
+)
+SELECT actor_id,count(DISTINCT turn_key) AS n_turns_inclusive,
+ count(DISTINCT turn_key) FILTER(WHERE usage_available) AS n_turns_with_usage,
+ CAST(sum(output_tokens) AS DECIMAL(38,0)) AS output_tokens_inclusive
+FROM membership JOIN turns USING(turn_key) GROUP BY actor_id;
+
+CREATE OR REPLACE VIEW context_rollups AS
+SELECT context_session_id,count(DISTINCT turn_key) AS n_turns_inclusive,
+ count(DISTINCT turn_key) FILTER(WHERE count_uncertain) AS n_turns_count_uncertain,
+ count(DISTINCT turn_key) FILTER(WHERE usage_available) AS n_turns_with_usage,
+ CAST(sum(output_tokens) AS DECIMAL(38,0)) AS output_tokens_inclusive
+FROM turns,unnest(context_sessions) c(context_session_id) GROUP BY context_session_id;
+
+CREATE OR REPLACE VIEW metric_coverage AS
+SELECT 'turn_content' AS metric,count(*) FILTER(WHERE NOT content_conflict) AS included,
+ count(*) FILTER(WHERE content_conflict) AS excluded FROM turns
+UNION ALL SELECT 'turn_identity',count(*) FILTER(WHERE NOT count_uncertain),count(*) FILTER(WHERE count_uncertain) FROM turns
+UNION ALL SELECT 'turn_assembly',count(*) FILTER(WHERE assembly_complete),count(*) FILTER(WHERE NOT assembly_complete) FROM turns
+UNION ALL SELECT 'turn_usage',count(*) FILTER(WHERE usage_available),count(*) FILTER(WHERE NOT usage_available) FROM turns
+UNION ALL SELECT 'turn_executor',count(*) FILTER(WHERE executor_id IS NOT NULL),count(*) FILTER(WHERE executor_id IS NULL) FROM turns
+UNION ALL SELECT 'turn_input_tokens',count(*) FILTER(WHERE input_tokens IS NOT NULL),count(*) FILTER(WHERE input_tokens IS NULL) FROM turns
+UNION ALL SELECT 'turn_output_tokens',count(*) FILTER(WHERE output_tokens IS NOT NULL),count(*) FILTER(WHERE output_tokens IS NULL) FROM turns
+UNION ALL SELECT 'turn_cache_read',count(*) FILTER(WHERE cache_read IS NOT NULL),count(*) FILTER(WHERE cache_read IS NULL) FROM turns
+UNION ALL SELECT 'turn_cache_create',count(*) FILTER(WHERE cache_create IS NOT NULL),count(*) FILTER(WHERE cache_create IS NULL) FROM turns
+UNION ALL SELECT 'turn_cache_create_5m',count(*) FILTER(WHERE cache_create_5m IS NOT NULL),count(*) FILTER(WHERE cache_create_5m IS NULL) FROM turns
+UNION ALL SELECT 'turn_cache_create_1h',count(*) FILTER(WHERE cache_create_1h IS NOT NULL),count(*) FILTER(WHERE cache_create_1h IS NULL) FROM turns
+UNION ALL SELECT 'turn_thinking_tokens',count(*) FILTER(WHERE thinking_tokens IS NOT NULL),count(*) FILTER(WHERE thinking_tokens IS NULL) FROM turns
+UNION ALL SELECT 'tool_call_content',count(*) FILTER(WHERE call_valid),count(*) FILTER(WHERE NOT call_valid) FROM tool_calls
+UNION ALL SELECT 'hook_content',count(*) FILTER(WHERE NOT content_conflict),count(*) FILTER(WHERE content_conflict) FROM hooks
+UNION ALL SELECT 'event_content',count(*) FILTER(WHERE NOT content_conflict),count(*) FILTER(WHERE content_conflict) FROM events
+UNION ALL SELECT 'tool_result_content',count(*) FILTER(WHERE result_valid),count(*) FILTER(WHERE NOT result_valid) FROM tool_calls
+UNION ALL SELECT 'spawn_association',count(*) FILTER(WHERE association_status IN ('confirmed','inferred')),
+ count(*) FILTER(WHERE association_status NOT IN ('confirmed','inferred')) FROM spawn_associations;
+"""
+
+
+_VIEWS = _TOOL_VIEWS + _TURN_VIEWS + _SOURCE_VIEWS + _COVERAGE_VIEWS

@@ -68,7 +68,7 @@ def test_ingest_builds_one_file_per_table_and_skips_unchanged(env):
     assert s1["rebuilt"] == 1 and s1["unchanged"] == 0
     key = store.srckey("p1/" + f.name)
     for t in TABLES:
-        assert (data / f"{t}__{key}.parquet").exists()
+        assert store._table_path(data, t, key).exists()
     s2 = store.ingest(projects, data)
     assert s2["rebuilt"] == 0 and s2["unchanged"] == 1
 
@@ -103,21 +103,19 @@ def test_crash_before_commit_marker_forces_rebuild(env, monkeypatch):
     store.ingest(projects, data)
     with open(f, "a") as fh:
         fh.write(json.dumps(_asst("m2", "2026-10-01T00:00:05Z", 7, stop="end_turn")) + "\n")
-    real_replace = os.replace
+    real_write = pq.write_table
 
-    # Crash on a NON-marker table: with the marker published last it is still
-    # stale here; if the marker were published first it would already claim
-    # the new fingerprint and the half-published source would never rebuild.
-    def crash_on_marker(src, dst):
-        if os.path.basename(str(dst)).startswith("agents__"):
-            raise OSError("simulated crash before commit marker")
-        return real_replace(src, dst)
+    def crash_on_table(body, dst, **kwargs):
+        if os.path.basename(str(dst)) == "agents.parquet":
+            raise OSError("simulated failure before generation finalization")
+        return real_write(body, dst, **kwargs)
 
-    monkeypatch.setattr(store.os, "replace", crash_on_marker)
+    monkeypatch.setattr(pq, "write_table", crash_on_table)
     crashed = store.ingest(projects, data)  # the failure is isolated per source, not fatal
     assert crashed["failed"] == 1 and crashed["rebuilt"] == 0
-    assert list((data / ".staging").iterdir()) == []  # temp files cleaned up
-    monkeypatch.setattr(store.os, "replace", real_replace)
+    assert list((data / ".staging/sources").iterdir()) == []
+    assert connect(data).sql("select count(*) from turns").fetchone() == (1,)
+    monkeypatch.setattr(pq, "write_table", real_write)
     s = store.ingest(projects, data)  # marker still old -> source is stale -> rebuilt
     assert s["rebuilt"] == 1
     assert connect(data).sql("select count(*) from turns").fetchone() == (2,)
@@ -129,7 +127,7 @@ def test_missing_table_file_forces_rebuild_and_vanished_source_is_kept(env):
     _write(f, [_asst("m1", "2026-10-01T00:00:00Z", 5, stop="end_turn")])
     store.ingest(projects, data)
     key = store.srckey("p1/" + f.name)
-    (data / f"hooks__{key}.parquet").unlink()
+    store._table_path(data, "hooks", key).unlink()
     assert store.ingest(projects, data)["rebuilt"] == 1
     f.unlink()  # CC expired the transcript
     s = store.ingest(projects, data)
@@ -153,7 +151,7 @@ def test_fingerprint_metadata_and_staging_is_outside_globs(env):
     _write(f, [_asst("m1", "2026-10-01T00:00:00Z", 5, stop="end_turn")])
     store.ingest(projects, data)
     key = store.srckey("p1/" + f.name)
-    md = pq.read_metadata(data / f"fragments__{key}.parquet").metadata
+    md = pq.read_metadata(store._table_path(data, "fragments", key)).metadata
     fp = json.loads(md[b"ta.fp"])
     st = os.stat(f)
     assert fp == {
@@ -163,7 +161,7 @@ def test_fingerprint_metadata_and_staging_is_outside_globs(env):
         "mtime_ns": st.st_mtime_ns,
     }
     assert md[b"ta.source"].decode() == "p1/" + f.name
-    assert not list((data / ".staging").glob("*"))  # nothing left behind
+    assert not list((data / ".staging/sources").iterdir())
 
 
 def test_turns_view_attributes_resumed_copies_to_earliest_file(env):
@@ -194,7 +192,11 @@ def test_turns_view_attributes_resumed_copies_to_earliest_file(env):
     rows = con.sql(
         "select session_id, n_records, output_tokens from turns where message_id='mX'"
     ).fetchall()
-    assert rows == [(SID, 1, 9)]  # one turn, attributed to the original, not double-counted
+    assert rows == [(None, 1, None)]  # one content candidate, no fabricated actor-cost vector
+    assert con.sql("select usage_available,attribution_status from turns where message_id='mX'").fetchall() == [(False, "unresolved")]
+    assert con.sql(
+        "select attribution_status,executor_id from turns where message_id='mX'"
+    ).fetchone() == ("unresolved", None)
     assert con.sql("select count(*) from turns").fetchone() == (4,)
 
 

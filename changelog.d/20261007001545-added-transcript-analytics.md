@@ -1,1 +1,1 @@
-- Add opt-in local Claude Code transcript analytics with hourly capped collection, on-demand SQL and opportunity scans, scrubbed source evidence, and reproducible report manifests. All-project encrypted raw backups preserve subagent context and original source paths when explicitly enabled.
+- Install the opt-in transcript analytics extra, hourly supervised collection timer and opportunity-scan skill; unavailable optional dependencies keep the timer disabled without failing core installation.

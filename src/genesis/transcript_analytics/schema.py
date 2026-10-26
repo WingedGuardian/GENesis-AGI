@@ -8,11 +8,20 @@ staleness check rebuilds every source written under an older version.
 
 import pyarrow as pa
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "5"
 
 S, INT, B = pa.string(), pa.int64(), pa.bool_()
 
-_COMMON = [("source_file", S), ("session_id", S), ("agent_id", S)]
+_COMMON = [
+    ("source_file", S),
+    ("session_id", S),
+    ("agent_id", S),
+    ("record_session_id", S),
+    ("context_session_id", S),
+    ("actor_id", S),
+    ("source_role", S),
+    ("context_conflict", B),
+]
 
 SCHEMAS: dict[str, pa.Schema] = {
     "tool_calls": pa.schema(
@@ -21,6 +30,11 @@ SCHEMAS: dict[str, pa.Schema] = {
             ("tool_use_id", S),
             ("message_id", S),
             ("line_no_call", INT),
+            ("call_uuid", S),
+            ("call_hash", S),
+            ("result_hash", S),
+            ("result_agent_id", S),
+            ("result_agent_ids", pa.list_(S)),
             ("line_no_result", INT),
             ("ts_call", S),
             ("ts_result", S),
@@ -63,6 +77,13 @@ SCHEMAS: dict[str, pa.Schema] = {
             ("uuid", S),
             ("message_id", S),
             ("request_id", S),
+            ("request_id_hash", S),
+            ("content_hash", S),
+            ("payload_hash", S),
+            ("immutable_hash", S),
+            ("usage_hash", S),
+            ("terminal_hash", S),
+            ("has_usage", B),
             ("ts", S),
             ("model", S),
             ("stop_reason", S),
@@ -97,6 +118,7 @@ SCHEMAS: dict[str, pa.Schema] = {
             ("uuid", S),
             ("ts", S),
             ("kind", S),
+            ("record_hash", S),
             ("hook_event", S),
             ("hook_name", S),
             ("command", S),
@@ -117,6 +139,7 @@ SCHEMAS: dict[str, pa.Schema] = {
             ("uuid", S),
             ("ts", S),
             ("subtype", S),
+            ("record_hash", S),
             ("level", S),
             ("duration_ms", INT),
             ("message_count", INT),
@@ -145,6 +168,9 @@ SCHEMAS: dict[str, pa.Schema] = {
             ("source_file", S),
             ("agent_id", S),
             ("session_id", S),
+            ("parent_agent_id", S),
+            ("context_session_id", S),
+            ("actor_id", S),
             ("agent_type", S),
             ("description", S),
             ("tool_use_id", S),

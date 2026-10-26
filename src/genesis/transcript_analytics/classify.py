@@ -18,6 +18,7 @@ does not mean success (plan §14):
 
 from __future__ import annotations
 
+import json
 import re
 
 _HOOK_RE = re.compile(
@@ -45,9 +46,7 @@ _FLAGGED_RULES: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
         ("timeout", r"timed out"),
         ("parse_refused", r"^This command could not be parsed safely"),
         ("model_unavailable", r"is temporarily unavailable"),
-        # A JSON error object counts only with a STRING message: a success can
-        # carry "error": null (none observed in the corpus, 2026-10-04).
-        ("mcp_error", r'^(Error calling tool|\{"error":\s*"|MCP error)'),
+        ("mcp_error", r"^(Error calling tool|MCP error)"),
         ("malformed_call", r"^POSSIBLY a malformed tool call"),
         ("stopped", r"^(Not run: |\[Request interrupted)"),
         ("permission_denied", r"^(Permission to use|Permission denied)"),
@@ -118,11 +117,18 @@ def classify(
     # its closing "]:" past char 1,500 (71 rows, 2026-10-04). The other rules are
     # start-anchored (or near-start) and only need the head window.
     is_hook = _HOOK_RE.match(full) is not None
+    try:
+        error_object = json.loads(full)
+    except (ValueError, RecursionError):
+        error_object = None
+    structural_error = isinstance(error_object, dict) and isinstance(error_object.get("error"), str)
     if is_error is True:
         if is_hook:
             return "hook_block", "flag"
         if denial_kind == "user-rejected":
             return "user_rejected", "flag"
+        if structural_error:
+            return "mcp_error", "flag"
         for name, rx in _FLAGGED_RULES:
             if rx.search(head):
                 return name, "flag"
@@ -131,6 +137,8 @@ def classify(
         return "other", "flag"
     if is_error is False:
         return None, None
+    if structural_error:
+        return "mcp_error", "text"
     # Absent flag: strong evidence only.
     if is_hook:
         return "hook_block", "text"

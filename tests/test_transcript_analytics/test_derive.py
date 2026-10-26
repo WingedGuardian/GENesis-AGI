@@ -7,7 +7,7 @@ import os
 
 import pytest
 
-from genesis.transcript_analytics import derive, query, store
+from genesis.transcript_analytics import catalog, derive, query, store
 
 SID = "11111111-2222-3333-4444-555555555555"
 
@@ -180,6 +180,7 @@ def test_failed_derive_retains_stale_snapshot_and_original_provenance(built, mon
     projects, data, source = built
     derive.build(data)
     first = (data / "derived/current").resolve()
+    saved_revision = catalog.load(data).revision
     extra = projects / "p/new.jsonl"
     extra.write_text(json.dumps(_asst("new-message", "2026-10-02T00:00:00Z", 99)) + "\n")
     store.ingest(projects, data)
@@ -195,6 +196,9 @@ def test_failed_derive_retains_stale_snapshot_and_original_provenance(built, mon
     _, rows = query.run_query(data, "SELECT count(*) FROM turns", manifest_path=manifest)
     assert rows == [(2,)]
     recorded = json.loads(manifest.read_text())
+    assert recorded["catalog_revision"] == saved_revision
+    assert recorded["latest_catalog_revision"] == catalog.load(data).revision
+    assert recorded["catalog_revision"] != recorded["latest_catalog_revision"]
     assert recorded["snapshot_current"] is False
     assert recorded["coverage"]["included"] == 1
     assert recorded["source_references"] == ["p/" + source.name]

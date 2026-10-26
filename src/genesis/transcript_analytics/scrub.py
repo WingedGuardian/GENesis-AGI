@@ -1,14 +1,10 @@
-"""Secret scrubbing for stored text, reusing Genesis's own scrubber.
+"""Scoped credential scrubbing for stored text and reconstructed evidence.
 
-``scripts/hooks/secret_scrub.py`` is stdlib-only and fail-safe: on an internal
-error it returns a placeholder, never the raw input (secret_scrub.py:426-443).
-It is imported by path from the Genesis checkout (``GENESIS_REPO``, default
-``~/genesis``) because this tool lives outside the repo.
-
-Fail closed: if the scrubber cannot be imported, or it returns its error
-placeholder, the text is NOT stored (None) and the row is flagged
-``scrub_failed``. The scrubber covers credential shapes, not IPs/emails;
-the store is local and mode 0700.
+The trusted checkout's stdlib-only shared scrubber and credential-label helper
+are loaded from the same bytes. Missing or failing policy withholds text and
+flags ``scrub_failed``. Recognized JSON is decoded before applying that policy;
+unrecognized malformed encodings retain the shared plain-text policy. This is
+credential scrubbing, not a guarantee that text contains no secrets or PII.
 """
 
 from __future__ import annotations
@@ -16,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections import Counter
 from pathlib import Path
 
 _PLACEHOLDER = "[scrub-error: content withheld]"
@@ -38,18 +35,23 @@ def _load():
         src = path.read_bytes()
         namespace: dict = {"__name__": "_ta_secret_scrub", "__file__": str(path)}
         exec(compile(src, str(path), "exec"), namespace)  # noqa: S102 - trusted local Genesis file
-        return namespace["scrub"], hashlib.sha256(src).hexdigest()[:12]
+        return (
+            namespace["scrub"],
+            namespace["credential_label_kind"],
+            hashlib.sha256(src).hexdigest()[:12],
+        )
     except Exception:  # noqa: BLE001 - any failure means: do not store text
-        return None, None
+        return None, None, None
 
 
-_scrub, _VERSION = _load()
+_scrub, _label_kind, _VERSION = _load()
+_ADAPTER_VERSION = "scoped-json-4"
 
 
 def version() -> str | None:
     """Content hash of the loaded scrubber, stamped into every stored source so a
     scrubber upgrade re-scrubs stored text on the next ingest (review SF-2)."""
-    return _VERSION
+    return f"{_VERSION}:{_ADAPTER_VERSION}" if _VERSION else None
 
 
 def available() -> bool:
@@ -77,64 +79,105 @@ def load_json(raw):
 
 
 def scrub_text(text: str | None) -> tuple[str | None, bool]:
-    """Scrub plain text and embedded JSON; malformed structured input is withheld."""
-    return _scrub_text(text, 0)
+    """Scoped JSON/credential scrubbing; unrecognized malformed encodings remain.
+
+    Recognized malformed objects/members, duplicate keys and exhausted budgets
+    are withheld. Ordinary shell quoting and unrecognized malformed arrays or
+    scalars retain the shared plain-text policy.
+    """
+    return _scrub_text(text, 0, [64])
 
 
-def _scrub_text(text, depth):
+def _scrub_text(text, depth, budget):
     if not text:
         return text, False
-    if _scrub is None or depth > 64:
+    if _scrub is None or _label_kind is None or depth > 64:
         return None, True
     try:
-        # Decode objects before regex matching, including shell/log prefixes.
-        if text.lstrip().startswith('"'):
-            try:
-                scalar, _ = load_json(text)
-            except ValueError:
-                scalar = None
-            if isinstance(scalar, str):
-                clean, failed = _scrub_text(scalar, depth + 1)
-                return (
-                    (None, True)
-                    if failed
-                    else (text if clean == scalar else json.dumps(clean, ensure_ascii=True), False)
-                )
-        for attempts, match in enumerate(re.finditer(r"[\{\[]", text), 1):
-            if attempts > 64:
+        pieces = []
+        cursor = 0
+        while cursor < len(text):
+            match = re.search(r'[\{\["]', text[cursor:])
+            if match is None:
+                pieces.append(text[cursor:])
+                break
+            start = cursor + match.start()
+            budget[0] -= 1
+            if budget[0] < 0:
                 return None, True
-            start = match.start()
             pairs, duplicates = _object_pairs()
-            decoder = json.JSONDecoder(object_pairs_hook=pairs)
             try:
-                value, end = decoder.raw_decode(text, start)
+                value, end = json.JSONDecoder(object_pairs_hook=pairs).raw_decode(text, start)
             except ValueError:
-                continue
-            if isinstance(value, (dict, list)):
-                clean, failed = scrub_json(value, _depth=depth + 1)
-                if not failed and not duplicates[0] and json.loads(clean) == value:
-                    clean = text[start:end]
-                prefix, prefix_failed = _scrub_text(text[:start], depth + 1)
-                suffix, suffix_failed = _scrub_text(text[end:], depth + 1)
-                if failed or prefix_failed or suffix_failed:
+                if text[start] == "{" and re.match(r'\{[ \t\r\n]*"', text[start:]):
                     return None, True
-                return (prefix or "") + clean + (suffix or ""), False
-        # Malformed quoted credential keys cannot be safely flattened.
-        if _credential_candidate(text):
-            return None, True
-        out = _scrub(text)
-        return (None, True) if out == _PLACEHOLDER else (out, False)
-    except Exception:  # noqa: BLE001 - failures never expose original text
+                pieces.append(text[cursor : start + 1])
+                cursor = start + 1
+                continue
+            if duplicates[0]:
+                return None, True
+            # A detached quoted member cannot safely represent a full object.
+            if isinstance(value, str) and re.match(r"[ \t\r\n]*:", text[end:]):
+                return None, True
+            clean, failed = scrub_json(value, _depth=depth + 1, _budget=budget)
+            if failed:
+                return None, True
+            replacement = text[start:end] if json.loads(clean) == value else clean
+            sensitive = _scrub(replacement)
+            if not isinstance(sensitive, str) or sensitive == _PLACEHOLDER:
+                return None, True
+            protected = replacement != text[start:end] or sensitive != replacement
+            pieces.extend(
+                (
+                    text[cursor:start],
+                    (replacement, isinstance(value, str)) if protected else replacement,
+                )
+            )
+            cursor = end
+        out = _scrub_spans(text, pieces)
+        return (None, True) if not isinstance(out, str) or out == _PLACEHOLDER else (out, False)
+    except Exception:  # noqa: BLE001 - no raw fallback after sanitizer failure
         return None, True
 
 
-def _credential_candidate(text):
-    for match in re.finditer(r'"((?:[^"\\]|\\.)*)"\s*:', text):
-        key = json.loads('"' + match.group(1) + '"')
-        probe = key + ": " + "x" * 32
-        if _scrub(probe) != probe:
-            return True
-    return False
+def _scrub_spans(text, pieces):
+    """Apply prose policy without exposing sanitized JSON delimiters to regexes.
+
+    A private-use prefix has more occurrences of its anchor than the entire
+    input, so neither literal data nor control removal can manufacture it.
+    Prefer an absent anchor; if all 6,400 BMP private-use characters occur,
+    choosing the least frequent bounds expansion across the 64-span budget.
+    """
+    protected = any(isinstance(piece, tuple) for piece in pieces)
+    if not protected:
+        return _scrub("".join(pieces))
+    counts = Counter(char for char in text if "\ue000" <= char <= "\uf8ff")
+    anchor = next(
+        (chr(code) for code in range(0xE000, 0xF900) if chr(code) not in counts),
+        None,
+    )
+    if anchor is None:
+        anchor = min(counts, key=counts.get)
+    prefix = anchor * max(6, counts[anchor] + 1)
+    rendered, replacements = [], []
+    for index, piece in enumerate(pieces):
+        if isinstance(piece, tuple):
+            replacement, quoted = piece
+            marker = f"{prefix}{index}{anchor}"
+            if quoted:
+                marker = f'"{marker}"'
+            rendered.append(marker)
+            replacements.append((marker, replacement))
+        else:
+            rendered.append(piece)
+    out = _scrub("".join(rendered))
+    if not isinstance(out, str) or out == _PLACEHOLDER:
+        raise ValueError("shared scrubber failed")
+    for marker, replacement in replacements:
+        out = out.replace(marker, replacement)
+    if prefix in out or out.count(anchor) > counts[anchor]:
+        raise ValueError("protected JSON marker altered")
+    return out
 
 
 _IDENTITY_ROOT = frozenset({"uuid", "parentUuid", "sessionId", "agentId", "requestId"})
@@ -153,15 +196,15 @@ def _identity_path(path, block_type):
     )
 
 
-def scrub_json(value, *, preserve_identity=False, _depth=0):
+def scrub_json(value, *, preserve_identity=False, _depth=0, _budget=None):
     """Scrub decoded JSON before serialization; preserve only transcript ID paths.
 
-    Credential labels use the loaded scrubber's own policy, with an opaque
-    probe value, so JSON quoting cannot hide the key/value relationship.
+    Credential labels use the helper loaded from the same bytes as the scrubber.
     """
-    if _scrub is None or _depth > 64:
+    if _scrub is None or _label_kind is None or _depth > 64:
         return None, True
     failed = False
+    budget = [64] if _budget is None else _budget
 
     def walk(item, path=(), depth=_depth, block_type=None):
         nonlocal failed
@@ -173,22 +216,20 @@ def scrub_json(value, *, preserve_identity=False, _depth=0):
         if isinstance(item, dict):
             out = {}
             for key, child in item.items():
-                clean_key, error = _scrub_text(key, depth + 1)
+                clean_key, error = _scrub_text(key, depth + 1, budget)
                 failed |= error
-                probe = key + ": " + "x" * 32
-                labeled = _scrub(probe)
-                if labeled == _PLACEHOLDER:
+                if clean_key in out:
                     failed = True
-                out[clean_key or "[withheld]"] = (
+                out[clean_key] = (
                     "[REDACTED]"
-                    if labeled != probe
+                    if _label_kind(key) is not None
                     else walk(child, (*path, key), depth + 1, item.get("type"))
                 )
             return out
         if isinstance(item, list):
             return [walk(child, (*path, index), depth + 1) for index, child in enumerate(item)]
         if isinstance(item, str):
-            clean, error = _scrub_text(item, depth + 1)
+            clean, error = _scrub_text(item, depth + 1, budget)
             failed |= error
             return clean
         return item

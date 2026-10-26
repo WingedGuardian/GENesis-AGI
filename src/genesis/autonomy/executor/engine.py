@@ -818,6 +818,13 @@ class CCSessionExecutor:
                 task_id, exc_info=True,
             )
             return False
+        except _worktree.StaleWorktreeError as exc:
+            # Not a bug: a previous run left work git would not remove. Record
+            # the reason on the task instead of "Unexpected error".
+            logger.warning("Task %s cannot create its worktree: %s", task_id, exc)
+            with contextlib.suppress(InvalidTransitionError):
+                await self._fail_task(task_id, str(exc))
+            return False
         except Exception:
             logger.error(
                 "Task %s failed with unhandled exception",
@@ -1316,6 +1323,8 @@ class CCSessionExecutor:
                 wt_path, task_id,
             )
             return True
+        except _worktree.StaleWorktreeError:
+            raise
         except RuntimeError:
             logger.warning(
                 "Worktree recovery failed for task %s", task_id,

@@ -48,74 +48,62 @@ def _acknowledge(enforced):
             os.close(fd)
 
 
-def _await_ready(proc, descriptor):
+def _await_ready(owned, descriptor):
     deadline = time.monotonic() + _START_TIMEOUT
+    readiness = select.poll()
+    readiness.register(descriptor, select.POLLIN | select.POLLHUP | select.POLLERR)
     while time.monotonic() < deadline:
-        readable, _, _ = select.select(
-            [descriptor], [], [], max(0, min(0.1, deadline - time.monotonic()))
-        )
+        owned.checkpoint()
+        if owned.signals:
+            return False
+        readable = readiness.poll(max(0, min(100, (deadline - time.monotonic()) * 1000)))
+        owned.checkpoint()
+        if owned.signals:
+            return False
         if readable:
             return os.read(descriptor, 1) == b"1"
-        if proc.poll() is not None:
+        if owned.exited():
             return False
     return False
-
-
-def _stop_worker(unit, proc):
-    from genesis.hostmetrics import run
-
-    run.stop_scope(unit)
-    if proc is not None and proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=15)
 
 
 def _launch(argv, ram, cpu, lease):
     from genesis.hostmetrics import run
     from genesis.hostmetrics.jobs import systemd_env
 
-    unit = run.unit_name("transcript-analytics", os.urandom(6).hex())
+    unit = run.unit_name("transcript-analytics", os.urandom(16).hex())
     props = [f"MemoryMax={ram}", "MemorySwapMax=0", f"CPUQuota={cpu:.2f}%", "RuntimeMaxSec=1h"]
     ready_read, ready_write = os.pipe()
-    proc = None
+    owned = run.OwnedProcess()
+    code = 69
     try:
-        command = run.scope_argv(unit, props, None, sys.executable, "-m", __name__, *argv)
-        proc = subprocess.Popen(
-            command,
-            pass_fds=(ready_write,),
-            start_new_session=True,
-            env={**systemd_env(), _CHILD: f"{ram},{cpu:.2f}", _READY: str(ready_write)},
-        )
-        os.close(ready_write)
-        ready_write = -1
-        if not _await_ready(proc, ready_read):
-            _stop_worker(unit, proc)
-            print(
-                "transcript analytics unavailable: worker scope did not confirm enforced limits",
-                file=sys.stderr,
+        with owned:
+            command = run.scope_argv(unit, props, None, sys.executable, "-m", __name__, *argv)
+            owned.check_cancelled()
+            owned.start_scoped(
+                command, unit,
+                pass_fds=(ready_write,),
+                start_new_session=True,
+                env={**systemd_env(), _CHILD: f"{ram},{cpu:.2f}", _READY: str(ready_write)},
             )
-            return 69
-        # The named active scope is now visible in the admission ledger. Only now
-        # can another analytics command measure remaining headroom.
-        fcntl.flock(lease, fcntl.LOCK_UN)
-        code = proc.wait()
-        return 128 - code if code < 0 else code
-    except OSError as exc:
-        if proc is not None:
-            _stop_worker(unit, proc)
+            os.close(ready_write)
+            ready_write = -1
+            if not _await_ready(owned, ready_read):
+                owned.check_cancelled()
+                raise run.ProbeRefused("worker scope did not confirm enforced limits")
+            owned.check_cancelled()
+            # The confirmed named scope now participates in the admission ledger.
+            fcntl.flock(lease, fcntl.LOCK_UN)
+            code = owned.wait()
+    except run.Cancelled:
+        pass
+    except (OSError, run.ProbeRefused, subprocess.TimeoutExpired) as exc:
         print(f"transcript analytics unavailable: {exc}", file=sys.stderr)
-        return 69
-    except BaseException:
-        _stop_worker(unit, proc)
-        raise
     finally:
         os.close(ready_read)
         if ready_write != -1:
             os.close(ready_write)
+    return owned.outcome(128 - code if code < 0 else code)
 
 
 def ensure_capped(argv: list[str], cfg: Config) -> int | None:
@@ -132,6 +120,9 @@ def ensure_capped(argv: list[str], cfg: Config) -> int | None:
         return 69
     try:
         return _admit(argv, cfg)
+    except ValueError as exc:
+        print(f"transcript analytics unavailable: configuration: {exc}", file=sys.stderr)
+        return 69
     except OSError as exc:
         print(f"transcript analytics unavailable: admission infrastructure: {exc}", file=sys.stderr)
         return 69
@@ -150,6 +141,14 @@ def _admit(argv, cfg):
         except BlockingIOError:
             print("transcript analytics deferred: admission in progress", file=sys.stderr)
             return 75
+        # Uninstall holds this same lease while retiring the canonical base file.
+        # A stale Config object or surviving private opt-in cannot readmit work.
+        from . import config
+
+        cfg = config.load()
+        if not cfg.enabled or (cfg.data_dir / "DISABLED").exists():
+            print("transcript analytics unavailable: collection was disabled", file=sys.stderr)
+            return 69
         snap = take_snapshot([], 0.5)
         if snap.memory is None:
             print(

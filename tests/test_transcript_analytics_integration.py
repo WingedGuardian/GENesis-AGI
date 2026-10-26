@@ -20,6 +20,7 @@ def base(tmp_path, monkeypatch):
     monkeypatch.delenv(resources._CHILD, raising=False)
     path = tmp_path / "transcript_analytics.yaml"
     path.write_text("enabled: false\n")
+    monkeypatch.setattr(config, "_base_path", lambda: path)
     return path
 
 
@@ -58,7 +59,7 @@ def test_broken_private_overlay_does_not_fall_back(base):
 
 
 @pytest.fixture
-def admitted(monkeypatch):
+def admitted(base, monkeypatch):
     from genesis.hostmetrics import __main__ as metrics
     from genesis.hostmetrics.host import HostMemory
     from genesis.hostmetrics.preflight import Snapshot
@@ -73,8 +74,19 @@ def admitted(monkeypatch):
         {},
     )
     monkeypatch.setattr(metrics, "take_snapshot", lambda *args: snap)
+    from genesis.hostmetrics import run as runner
+
+    base.write_text("enabled: true\n")
     run = Mock(return_value=Mock(wait=Mock(return_value=0)))
-    monkeypatch.setattr(resources.subprocess, "Popen", run)
+    owned = Mock(spec=runner.OwnedProcess)
+    owned.signals = 0
+    owned.__enter__ = Mock(return_value=owned)
+    owned.__exit__ = Mock(return_value=False)
+    owned.start_scoped.side_effect = lambda argv, unit, **kwargs: run(argv, **kwargs)
+    owned.wait.side_effect = lambda: run.return_value.wait()
+    owned.outcome.side_effect = lambda code: code
+    run.owned = owned
+    monkeypatch.setattr(runner, "OwnedProcess", lambda: owned)
     monkeypatch.setattr(resources, "_await_ready", lambda *args: True)
     return run, snap, metrics
 
@@ -114,6 +126,8 @@ def test_preflight_refuses_current_load_or_oversized_request(
 ):
     run, snap, metrics = admitted
     memory = replace(snap.memory, available=available)
+    if ram_bytes is not None:
+        base.with_suffix(".local.yaml").write_text(f"ram_bytes: {ram_bytes}\n")
     monkeypatch.setattr(metrics, "take_snapshot", lambda *args: replace(snap, memory=memory))
     assert resources.ensure_capped([], config.Config(enabled=True, ram_bytes=ram_bytes)) == 75
     assert verdict in capsys.readouterr().err
@@ -170,14 +184,18 @@ def test_launch_rejection_is_unavailable_and_child_failure_preserved(base, admit
     proc.poll.return_value = 1
     proc.wait.return_value = 1
     monkeypatch.setattr(resources, "_await_ready", lambda *args: False)
-    from genesis.hostmetrics import run as runner
-
-    stop = Mock()
-    monkeypatch.setattr(runner, "stop_scope", stop)
     assert resources.ensure_capped([], config.Config(enabled=True)) == 69
-    assert stop.call_count == 1
+    assert run.owned.__exit__.call_count == 1
+    assert run.owned.__exit__.call_args.args[0].__name__ == "ProbeRefused"
     monkeypatch.setattr(resources, "_await_ready", lambda *args: True)
     assert resources.ensure_capped([], config.Config(enabled=True)) == 1
+
+
+def test_persistent_disable_overrides_stale_enabled_config(base, admitted):
+    run, _, _ = admitted
+    base.write_text("enabled: false\n")
+    assert resources.ensure_capped([], config.Config(enabled=True)) == 69
+    run.assert_not_called()
 
 
 def test_positive_acknowledgement_requires_real_enforcement(monkeypatch):

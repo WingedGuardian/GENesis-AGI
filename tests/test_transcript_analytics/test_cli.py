@@ -51,7 +51,8 @@ def test_ingest_returns_deferred_when_snapshot_lock_busy(tmp_path, monkeypatch, 
     monkeypatch.setattr(store, "ingest", lambda *a, **kw: {"failed": 0})
     monkeypatch.setattr(derive, "is_current", lambda *a: False)
 
-    def busy(*args):
+    def busy(*args, **kwargs):
+        assert kwargs == {"if_stale": True}
         raise store.Busy("busy")
 
     monkeypatch.setattr(derive, "build", busy)
@@ -96,9 +97,9 @@ def test_status_tolerates_corrupt_marker_stats_and_counts_snapshots(tmp_path, mo
 
     data = tmp_path / "store"
     data.mkdir()
-    bad = data / f"{store.MARKER}__bad.parquet"
+    bad = data / f"{store.MARKER}__{'a' * 16}.parquet"
     bad.write_bytes(b"not parquet")
-    stats = data / f"{store.MARKER}__stats.parquet"
+    stats = data / f"{store.MARKER}__{'b' * 16}.parquet"
     table = pa.table({"value": [1]}).replace_schema_metadata({b"ta.stats": b'{"malformed":"bad"}'})
     pq.write_table(table, stats)
     (data / "derived" / "old").mkdir(parents=True)

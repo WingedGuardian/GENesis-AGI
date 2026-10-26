@@ -7,6 +7,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from genesis.transcript_analytics import derive, query, store
+from genesis.transcript_analytics import publication as source_publication
 
 
 def _assistant(mid="m", **extra):
@@ -84,7 +85,7 @@ def test_retention_accounts_for_skipped_and_unknown_raw_records(tmp_path, tail):
     assert store.prune(data, before="2026-01-01", projects=projects) == 0
 
 
-def test_rename_retires_original_without_doubling_uuidless_rows(tmp_path):
+def test_rename_retains_accepted_uuidless_physical_rows(tmp_path):
     records = [
         _assistant(),
         {"type": "system", "subtype": "api_error", "timestamp": "2025-01-01T00:00:00Z"},
@@ -93,10 +94,10 @@ def test_rename_retires_original_without_doubling_uuidless_rows(tmp_path):
     derive.build(data)
     path.rename(projects / "renamed.jsonl")
     assert store.ingest(projects, data)["failed"] == 0
-    assert not query.snapshot_compatible(data)
-    assert len(store.compatible_sources(data)[0]) == 1
-    assert query.run_query(data, "select count(*) from raw_fragments", live=True)[1] == [(1,)]
-    assert query.run_query(data, "select count(*) from events", live=True)[1] == [(1,)]
+    assert query.snapshot_compatible(data) and not query.derived_current(data)
+    assert len(store.compatible_sources(data)[0]) == 2
+    assert query.run_query(data, "select count(*) from raw_fragments", live=True)[1] == [(2,)]
+    assert query.run_query(data, "select count(*) from events", live=True)[1] == [(2,)]
 
 
 def test_failed_rename_staging_retains_original(tmp_path, monkeypatch):
@@ -111,29 +112,38 @@ def test_failed_rename_staging_retains_original(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("fail_marker", [False, True])
-def test_interrupted_rename_publication_never_exposes_two_generations(
+def test_interrupted_rename_publication_retains_accepted_identities(
     tmp_path, monkeypatch, fail_marker
 ):
     projects, data, path = _setup(tmp_path, [_assistant()])
     derive.build(data)
     path.rename(projects / "renamed.jsonl")
-    real_replace = os.replace
+    if fail_marker:
+        original = source_publication.publish
+        def fail(root, document):
+            proposed = json.loads(document)
+            if len(proposed["sources"]) == 2:
+                raise source_publication.Failed("interrupted new-source selector publication")
+            return original(root, document)
 
-    def fail(src, dest):
-        dest = str(dest)
-        if dest.endswith(".parquet") and (
-            dest.rsplit("/", 1)[-1].startswith("fragments__") == fail_marker
-        ):
-            raise OSError("interrupted publication")
-        return real_replace(src, dest)
-
-    monkeypatch.setattr(os, "replace", fail)
-    assert store.ingest(projects, data)["failed"] == 1
-    assert not query.snapshot_compatible(data)
-    assert len(store.compatible_sources(data)[0]) == 0
-    monkeypatch.setattr(os, "replace", real_replace)
+        monkeypatch.setattr(source_publication, "publish", fail)
+        with pytest.raises(source_publication.Failed):
+            store.ingest(projects, data)
+        monkeypatch.setattr(source_publication, "publish", original)
+    else:
+        original = source_publication.finalize
+        monkeypatch.setattr(
+            source_publication,
+            "finalize",
+            lambda *a: (_ for _ in ()).throw(OSError("interrupted finalization")),
+        )
+        assert store.ingest(projects, data)["failed"] == 1
+        monkeypatch.setattr(source_publication, "finalize", original)
+    assert query.snapshot_compatible(data) and not query.derived_current(data)
+    assert len(store.compatible_sources(data)[0]) == 1  # failed new source was never accepted
+    assert store.srckey(path.name) in store.compatible_sources(data)[0]
     assert store.ingest(projects, data)["failed"] == 0
-    assert len(store.compatible_sources(data)[0]) == 1
+    assert len(store.compatible_sources(data)[0]) == 2
     assert not store.compatible_sources(data)[1]
 
 
@@ -237,17 +247,9 @@ def test_semantic_stamp_includes_storage_scrub_and_identity_transforms():
     import hashlib
     from pathlib import Path
 
-    expected = hashlib.sha256(
-        b"".join(
-            Path(store.__file__).with_name(name).read_bytes()
-            for name in (
-                "extract.py",
-                "classify.py",
-                "schema.py",
-                "scrub.py",
-                "identity.py",
-                "store.py",
-            )
-        )
-    ).hexdigest()
+    digest = hashlib.sha256(b"ta-extraction-v1\0")
+    for name in ("extract.py", "classify.py", "schema.py", "scrub.py", "identity.py"):
+        raw = Path(store.__file__).with_name(name).read_bytes()
+        digest.update(name.encode() + b"\0" + len(raw).to_bytes(8, "big") + raw)
+    expected = digest.hexdigest()
     assert expected == store.EXTRACTION_VERSION

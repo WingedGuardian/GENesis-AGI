@@ -13,7 +13,9 @@ from genesis.transcript_analytics.extract import extract_source
 from genesis.transcript_analytics.query import connect
 
 SID = "11111111-2222-3333-4444-555555555555"
-TOKEN = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"  # pragma: allowlist secret — synthetic fixture
+TOKEN = (
+    "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+)  # pragma: allowlist secret — synthetic fixture
 
 
 def _asst(mid, ts, out, stop=None, uuid=None, sid=SID, tools=()):
@@ -231,7 +233,9 @@ def test_sf6_tool_call_copies_follow_the_turn_attribution(env):
     )
     store.ingest(projects, data, lock_path=lock)
     c = connect(data)
-    assert c.sql("select session_id from tool_calls where tool_use_id='tX'").fetchone() == (SID,)
+    assert c.sql(
+        "select session_id,attribution_status from tool_calls where tool_use_id='tX'"
+    ).fetchone() == (None, "unresolved")
     assert c.sql(
         "select count(*) from tool_calls tc join turns t using (message_id) "
         "where tc.session_id is distinct from t.session_id"
@@ -270,14 +274,15 @@ def test_n2_usage_comes_from_the_last_fragment_even_when_it_is_null(env):
 def test_n3_stale_staging_files_are_swept_and_nothing_is_left(env):
     projects, data, lock = env
     (data / ".staging").mkdir(parents=True)
-    old = data / ".staging" / "fragments__dead.999.tmp"
+    old = data / ".staging" / "fragments__000000000000dead.999.tmp"
     old.write_bytes(b"x")
     os.utime(old, (1, 1))
     _write(
         projects / "p" / f"{SID}.jsonl", [_asst("m1", "2026-10-01T00:00:00Z", 1, stop="end_turn")]
     )
     store.ingest(projects, data, lock_path=lock)
-    assert list((data / ".staging").iterdir()) == []
+    assert list((data / ".staging/sources").iterdir()) == []
+    assert not old.exists()
 
 
 def test_n8_hooks_view_dedupes_across_files(env):

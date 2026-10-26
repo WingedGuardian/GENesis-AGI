@@ -3,10 +3,10 @@
 Every rule here is a measured fact about the transcript format (plan §2-§14,
 2026-10-04), not an assumption:
 
-* Pairing is per file: 0 of 160k tool_use/tool_result pairs span files.
+* Pairing is per file; derived views reconcile cross-source copies separately.
 * One assistant message is split across several records (one per content
   block); each record becomes a ``fragments`` row and ``turns`` is derived in
-  a view (usage from the LAST fragment in line order).
+  a view after identity/state and ordered-sequence reconciliation.
 * ``is_error`` is tri-state; absent is not success. Failure text is classified
   from the CONTENT block; ``toolUseResult`` is kept only when it adds
   information beyond ``"Error: " + content``.
@@ -21,12 +21,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
 from genesis.transcript_analytics.classify import _hook_script, classify, parse_hook_block
-from genesis.transcript_analytics.identity import normalize_rows
+from genesis.transcript_analytics.identity import encode_identity, normalize_rows
 from genesis.transcript_analytics.scrub import scrub_json, scrub_text
 
 TABLES = ("tool_calls", "fragments", "hooks", "events", "session_meta", "agents")
@@ -81,6 +82,7 @@ _EVENT_SUBTYPES = frozenset(
     }
 )
 _META_KINDS = {
+    "custom-title": "customTitle",
     "ai-title": "aiTitle",
     "permission-mode": "permissionMode",
     "mode": "mode",
@@ -130,6 +132,28 @@ def _block_text(content) -> str:
     return ""
 
 
+def _result_agent_ids(content, structured) -> list[str]:
+    """Retain every recognized ID before association, preserving text boundaries."""
+    candidates = set()
+    if isinstance(structured, dict):
+        value = _str(structured.get("agentId"))
+        if value:
+            candidates.add(value)
+    texts = []
+    if isinstance(content, str):
+        texts.append(content)
+    elif isinstance(content, list):
+        texts.extend(part["text"] for part in content if isinstance(part, dict)
+                     and part.get("type") == "text" and isinstance(part.get("text"), str))
+    if isinstance(structured, str):
+        texts.append(structured)
+    for text in texts:
+        candidates.update(match.group(1) for match in re.finditer(
+            r"(?:^|\n)agentId: ([A-Za-z0-9_-]+)(?=\s|$)", text
+        ))
+    return sorted(candidates)
+
+
 def _complete_lines(path: Path, stop_at: int | None, counter: dict):
     """Yield complete lines (newline stripped) within the first ``stop_at`` bytes.
 
@@ -166,11 +190,67 @@ def _int(v) -> int | None:
     return v if isinstance(v, int) and not isinstance(v, bool) and -_INT64 <= v < _INT64 else None
 
 
+def _token(v) -> int | None:
+    value = _int(v)
+    return value if value is not None and value >= 0 else None
+
+
+def _hash(value):
+    """Compare complete producer payloads without persisting success text."""
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, ensure_ascii=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _message_state(record, message, *, immutable=False):
+    # Source/context labels can be rewritten in inherited transcripts. These
+    # behavioral flags alter extraction and cannot be discarded as placement.
+    body = (
+        {key: value for key, value in message.items() if key not in {"usage", "stop_reason"}}
+        if immutable
+        else message
+    )
+    return _hash(
+        {
+            "message": body,
+            "is_api_error": record.get("isApiErrorMessage") is True,
+            "api_error_status": _int(record.get("apiErrorStatus")),
+        }
+    )
+
+
+def _request_state(record):
+    value = record.get("requestId")
+    return _hash({"unknown": True} if value is None else {"value": value})
+
+
+def _terminal_state(record, message):
+    # Distinct content blocks can legitimately share one terminal assertion.
+    # All remaining message state and exact typed request evidence must agree.
+    body = {key: value for key, value in message.items() if key != "content"}
+    return _hash({"message_state": _message_state(record, body), "request": _request_state(record)})
+
+
+def source_context(rel, record_sid=None):
+    parts = Path(rel).parts
+    if "subagents" in parts:
+        index = parts.index("subagents")
+        return parts[index - 1] if index else "source:" + rel
+    return record_sid or "source:" + rel
+
+
+def actor_identity(context, agent):
+    return json.dumps(
+        [encode_identity(context), encode_identity(agent) if agent is not None else None],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+
+
 def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractResult:
     res = ExtractResult()
     t = res.tables
-    pending: dict[str, dict] = {}  # tool_use_id -> row awaiting its result
-    results_seen: set[str] = set()
+    pending: dict[str, list[dict]] = {}  # tool_use_id -> row awaiting its result
     agent_id_from_name = (
         path.name[len("agent-") : -len(".jsonl")] if path.name.startswith("agent-") else None
     )
@@ -200,21 +280,29 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
             res.last_timestamp = timestamp.isoformat()
 
         rtype = _str(r.get("type"))
-        sid = _str(r.get("sessionId"))
+        sid = _str(r.get("sessionId")) or None
         if first_sid is None and sid:
             first_sid = sid
-        ts = _str(r.get("timestamp"))
+        ts = timestamp.isoformat().replace("+00:00", "Z") if timestamp is not None else None
         agent_id = _str(r.get("agentId")) or agent_id_from_name
         msg = r.get("message") if isinstance(r.get("message"), dict) else None
-        common = {"source_file": rel, "session_id": sid, "agent_id": agent_id}
+        context = source_context(rel, sid)
+        physical_agent = agent_id_from_name
+        common = {
+            "source_file": rel,
+            "session_id": sid or "source:" + rel,
+            "record_session_id": sid,
+            "context_session_id": context,
+            "agent_id": agent_id,
+            "actor_id": actor_identity(context, physical_agent),
+            "source_role": "child" if physical_agent else "main",
+            "context_conflict": bool(
+                (physical_agent and sid and sid != context)
+                or (_str(r.get("agentId")) and r.get("agentId") != physical_agent)
+            ),
+        }
 
-        if (
-            rtype == "assistant"
-            and msg is not None
-            and (
-                (isinstance(msg.get("id"), str) and msg["id"]) or r.get("isApiErrorMessage") is True
-            )
-        ):
+        if rtype == "assistant" and msg is not None:
             if msg.get("model") == "<synthetic>" and r.get("isApiErrorMessage") is not True:
                 continue
             usage = (
@@ -236,21 +324,29 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                 {
                     **common,
                     "line_no": line_no,
-                    "uuid": _str(r.get("uuid")),
-                    "message_id": _str(msg.get("id")),
-                    "request_id": _str(r.get("requestId")),
+                    "uuid": _str(r.get("uuid")) or None,
+                    "message_id": _str(msg.get("id")) or None,
+                    "request_id": _str(r.get("requestId")) or None,
+                    "request_id_hash": _request_state(r),
+                    "content_hash": _hash(msg.get("content")),
+                    "payload_hash": _message_state(r, msg),
+                    "immutable_hash": _message_state(r, msg, immutable=True),
+                    "usage_hash": _hash(msg.get("usage")),
+                    "terminal_hash": _terminal_state(r, msg),
+                    "has_usage": isinstance(msg.get("usage"), dict)
+                    and r.get("isApiErrorMessage") is not True,
                     "ts": ts,
                     "model": _str(msg.get("model")),
-                    "stop_reason": None
-                    if r.get("isApiErrorMessage") is True
-                    else _str(msg.get("stop_reason")),
-                    "input_tokens": _int(usage.get("input_tokens")),
-                    "output_tokens": _int(usage.get("output_tokens")),
-                    "cache_read": _int(usage.get("cache_read_input_tokens")),
-                    "cache_create": _int(usage.get("cache_creation_input_tokens")),
-                    "cache_create_5m": _int(cc.get("ephemeral_5m_input_tokens")),
-                    "cache_create_1h": _int(cc.get("ephemeral_1h_input_tokens")),
-                    "thinking_tokens": _int(otd.get("thinking_tokens")),
+                    # Preserve the producer assertion for whole-terminal agreement;
+                    # has_usage and is_api_error independently prohibit its vector.
+                    "stop_reason": _str(msg.get("stop_reason")),
+                    "input_tokens": _token(usage.get("input_tokens")),
+                    "output_tokens": _token(usage.get("output_tokens")),
+                    "cache_read": _token(usage.get("cache_read_input_tokens")),
+                    "cache_create": _token(usage.get("cache_creation_input_tokens")),
+                    "cache_create_5m": _token(cc.get("ephemeral_5m_input_tokens")),
+                    "cache_create_1h": _token(cc.get("ephemeral_1h_input_tokens")),
+                    "thinking_tokens": _token(otd.get("thinking_tokens")),
                     "is_sidechain": bool(r.get("isSidechain")),
                     "entrypoint": _str(r.get("entrypoint")),
                     "attribution_skill": _str(r.get("attributionSkill")),
@@ -259,7 +355,7 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                     "effort": _str(r.get("effort"))
                     if not isinstance(r.get("effort"), dict)
                     else None,
-                    "is_api_error": bool(r.get("isApiErrorMessage")),
+                    "is_api_error": r.get("isApiErrorMessage") is True,
                     "api_error_status": _int(r.get("apiErrorStatus")),
                     "cwd": _str(r.get("cwd")),
                     "git_branch": _str(r.get("gitBranch")),
@@ -274,6 +370,7 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                     not isinstance(b, dict)
                     or b.get("type") != "tool_use"
                     or not isinstance(b.get("id"), str)
+                    or not b.get("id")
                 ):
                     continue
                 inp = b.get("input") if isinstance(b.get("input"), dict) else {}
@@ -283,45 +380,49 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                     _, mcp_server, mcp_tool = name.split("__", 2)
                 cmd, cmd_failed = scrub_text(_str(inp.get("command")))
                 desc, desc_failed = scrub_text(_str(inp.get("description")))
-                pending[b["id"]] = {
-                    **common,
-                    "tool_use_id": b["id"],
-                    "message_id": _str(msg.get("id")),
-                    "line_no_call": line_no,
-                    "line_no_result": None,
-                    "ts_call": ts,
-                    "ts_result": None,
-                    "latency_ms": None,
-                    "tool": name,
-                    "mcp_server": mcp_server,
-                    "mcp_tool": mcp_tool,
-                    "command": cmd,
-                    "file_path": _str(inp.get("file_path")),
-                    "subagent_type": _str(inp.get("subagent_type")),
-                    "skill_arg": _str(inp.get("skill")),
-                    "description": desc,
-                    "input_len": len(json.dumps(inp, ensure_ascii=False)),
-                    "is_sidechain": bool(r.get("isSidechain")),
-                    "attribution_skill": _str(r.get("attributionSkill")),
-                    "entrypoint": _str(r.get("entrypoint")),
-                    "cwd": _str(r.get("cwd")),
-                    "git_branch": _str(r.get("gitBranch")),
-                    "has_result": False,
-                    "is_error": None,
-                    "error_source": None,
-                    "error_class": None,
-                    "error_text": None,
-                    "tool_use_result_text": None,
-                    "result_len": None,
-                    "exit_code": None,
-                    "interrupted": None,
-                    "denial_kind": None,
-                    "hook_event": None,
-                    "hook_tool": None,
-                    "hook_command": None,
-                    "hook_script": None,
-                    "scrub_failed": cmd_failed or desc_failed,
-                }
+                pending.setdefault(b["id"], []).append(
+                    {
+                        **common,
+                        "tool_use_id": b["id"],
+                        "message_id": _str(msg.get("id")) or None,
+                        "line_no_call": line_no,
+                        "call_uuid": _str(r.get("uuid")) or None,
+                        "call_hash": _hash(b),
+                        "line_no_result": None,
+                        "ts_call": ts,
+                        "ts_result": None,
+                        "latency_ms": None,
+                        "tool": name,
+                        "mcp_server": mcp_server,
+                        "mcp_tool": mcp_tool,
+                        "command": cmd,
+                        "file_path": _str(inp.get("file_path")),
+                        "subagent_type": _str(inp.get("subagent_type")),
+                        "skill_arg": _str(inp.get("skill")),
+                        "description": desc,
+                        "input_len": len(json.dumps(inp, ensure_ascii=False)),
+                        "is_sidechain": bool(r.get("isSidechain")),
+                        "attribution_skill": _str(r.get("attributionSkill")),
+                        "entrypoint": _str(r.get("entrypoint")),
+                        "cwd": _str(r.get("cwd")),
+                        "git_branch": _str(r.get("gitBranch")),
+                        "has_result": False,
+                        "is_error": None,
+                        "error_source": None,
+                        "error_class": None,
+                        "error_text": None,
+                        "tool_use_result_text": None,
+                        "result_len": None,
+                        "exit_code": None,
+                        "interrupted": None,
+                        "denial_kind": None,
+                        "hook_event": None,
+                        "hook_tool": None,
+                        "hook_command": None,
+                        "hook_script": None,
+                        "scrub_failed": cmd_failed or desc_failed,
+                    }
+                )
             continue
 
         if rtype == "user" and msg is not None and isinstance(msg.get("content"), list):
@@ -331,10 +432,10 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
             tur = r.get("toolUseResult") if len(result_blocks) == 1 else None
             for b in result_blocks:
                 tid = _str(b.get("tool_use_id"))
-                if not tid or tid in results_seen:
+                if not tid:
                     continue
-                results_seen.add(tid)
-                row = pending.pop(tid, None)
+                call_rows = pending.pop(tid, [])
+                row = call_rows[0] if call_rows else None
                 if row is None:  # orphan result: its call is not in this file
                     row = {
                         **common,
@@ -376,16 +477,22 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                 if cls == "exit_nonzero":
                     head = content.strip().split("\n", 1)[0]
                     try:
-                        exit_code = int(head.removeprefix("Exit code ").strip())
+                        exit_code = _int(int(head.removeprefix("Exit code ").strip()))
                     except ValueError:
                         exit_code = None
                 hook = parse_hook_block(content) if cls == "hook_block" else None
                 hook_cmd, hook_failed = scrub_text(hook["hook_command"]) if hook else (None, False)
+                result_agent_ids = _result_agent_ids(b.get("content"), tur)
                 if hook:  # name the script from the SCRUBBED command only (review SF-1)
                     hook["hook_script"] = _hook_script(hook_cmd) if hook_cmd else None
                 row.update(
                     {
                         "line_no_result": line_no,
+                        "result_hash": _hash(
+                            {"block": b, "toolUseResult": tur, "denial_kind": denial}
+                        ),
+                        "result_agent_ids": result_agent_ids,
+                        "result_agent_id": result_agent_ids[0] if len(result_agent_ids) == 1 else None,
                         "ts_result": ts,
                         "latency_ms": _ms_between(row.get("ts_call"), ts),
                         "has_result": True,
@@ -423,6 +530,37 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                     }
                 )
                 t["tool_calls"].append(row)
+                for additional in call_rows[1:]:
+                    result_fields = {
+                        k: v
+                        for k, v in row.items()
+                        if k
+                        in {
+                            "line_no_result",
+                            "ts_result",
+                            "has_result",
+                            "result_hash",
+                            "result_agent_id",
+                            "result_agent_ids",
+                            "is_error",
+                            "error_source",
+                            "error_class",
+                            "error_text",
+                            "tool_use_result_text",
+                            "result_len",
+                            "exit_code",
+                            "interrupted",
+                            "denial_kind",
+                            "hook_event",
+                            "hook_tool",
+                            "hook_command",
+                            "hook_script",
+                        }
+                    }
+                    additional.update(result_fields)
+                    additional["latency_ms"] = _ms_between(additional.get("ts_call"), ts)
+                    additional["scrub_failed"] |= row["scrub_failed"]
+                    t["tool_calls"].append(additional)
             continue
 
         att = r.get("attachment")
@@ -437,9 +575,10 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                 {
                     **common,
                     "line_no": line_no,
-                    "uuid": _str(r.get("uuid")),
+                    "uuid": _str(r.get("uuid")) or None,
                     "ts": ts,
                     "kind": att.get("type"),
+                    "record_hash": _hash(att),
                     "hook_event": _str(att.get("hookEvent")),
                     "hook_name": _str(att.get("hookName")),
                     "command": hcmd,
@@ -483,9 +622,17 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                 {
                     **common,
                     "line_no": line_no,
-                    "uuid": _str(r.get("uuid")),
+                    "uuid": _str(r.get("uuid")) or None,
                     "ts": ts,
                     "subtype": r.get("subtype"),
+                    "record_hash": _hash(
+                        {
+                            k: v
+                            for k, v in r.items()
+                            if k
+                            not in {"sessionId", "agentId", "isSidechain", "uuid", "parentUuid"}
+                        }
+                    ),
                     "level": _str(r.get("level")),
                     "duration_ms": _int(r.get("durationMs")),
                     "message_count": _int(r.get("messageCount")),
@@ -532,7 +679,9 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
     res.stats["bytes_read"] = counter["consumed"]
     if counter["consumed"] != (path.stat().st_size if stop_at is None else stop_at):
         res.chronology_known = False  # Torn/truncated captured prefix has unknown chronology.
-    t["tool_calls"].extend(pending.values())  # calls whose result never arrived (yet)
+    t["tool_calls"].extend(
+        row for calls in pending.values() for row in calls
+    )  # calls whose result never arrived (yet)
 
     if agent_id_from_name:
         meta_path = path.with_name(f"agent-{agent_id_from_name}.meta.json")
@@ -547,11 +696,14 @@ def extract_source(path: Path, rel: str, stop_at: int | None = None) -> ExtractR
                     "source_file": rel,
                     "agent_id": agent_id_from_name,
                     "session_id": first_sid,
+                    "parent_agent_id": _str(meta.get("parentAgentId")) or None,
+                    "context_session_id": source_context(rel, first_sid),
+                    "actor_id": actor_identity(source_context(rel, first_sid), agent_id_from_name),
                     "agent_type": _str(meta.get("agentType")) or _str(meta.get("taskKind")),
                     # Scrubbed like tool_calls.description (review N-4).
                     "description": description,
                     "scrub_failed": desc_failed,
-                    "tool_use_id": _str(meta.get("toolUseId")),
+                    "tool_use_id": _str(meta.get("toolUseId")) or None,
                     "spawn_depth": _int(meta.get("spawnDepth")),
                     "request_shape": _str(meta.get("requestShape")),
                     "non_interactive": meta.get("requestNonInteractive")

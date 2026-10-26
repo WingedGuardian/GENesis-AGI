@@ -540,6 +540,19 @@ def _isolate_alert_queue(tmp_path):
     mp.undo()
 
 
+# ── Safety: prevent tests from moving files into the REAL trash ─────────────
+@pytest.fixture(autouse=True)
+def _isolate_trash_root(tmp_path):
+    """Point ``genesis.trash``'s home trash at tmp. A test's ``tmp_path`` sits on
+    the same volume as ``~/.genesis``, so without this any code path that trashes
+    (cognitive rollback, the task-worktree reset) would rename test files into
+    the live ``~/.genesis/trash``. Fixture-owned ``MonkeyPatch``, as above."""
+    mp = pytest.MonkeyPatch()
+    mp.setattr("genesis.trash.home_trash_root", lambda: tmp_path / "genesis-trash")
+    yield
+    mp.undo()
+
+
 # ── Safety: prevent tests from creating the REAL content-boundary key ───────
 @pytest.fixture(autouse=True)
 def _isolate_boundary_key(tmp_path):
@@ -551,6 +564,17 @@ def _isolate_boundary_key(tmp_path):
     mp = pytest.MonkeyPatch()
     mp.setattr("genesis.env.boundary_key_path", lambda: tmp_path / "boundary_key")
     mp.setattr(sanitizer, "_boundary_key", None)
+    yield
+    mp.undo()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_checkout_lock_path(tmp_path):
+    mp = pytest.MonkeyPatch()
+    mp.setattr(
+        "genesis.cc.checkout_lock.checkout_lock_path",
+        lambda: tmp_path / "genesis-checkout.lock",
+    )
     yield
     mp.undo()
 

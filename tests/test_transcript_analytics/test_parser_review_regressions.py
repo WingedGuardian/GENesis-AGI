@@ -43,7 +43,8 @@ def test_synthetic_api_error_retained_without_provider_id(tmp_path):
     fragment = extract.extract_source(path, path.name).tables["fragments"][0]
     assert fragment["is_api_error"] is True
     assert fragment["message_id"] is None
-    assert fragment["output_tokens"] is None and fragment["stop_reason"] is None
+    assert fragment["output_tokens"] is None and not fragment["has_usage"]
+    assert fragment["stop_reason"] == "end_turn"  # observed assertion, never a usable usage vector
 
 
 def test_read_never_crosses_captured_prefix(tmp_path, monkeypatch):

@@ -46,6 +46,13 @@ different SESSION TYPES, not two phases of one session's life** (user decision,
   PR. Its unit of work is the queue, not the card. That is the
   **`closing-session`** skill; load it instead when the job is "get the open PRs
   merged".
+- **A cloud coding agent (Devin) is a third kind of builder.** It works from the
+  public repo in its own VM, with no access to an install: no running Genesis, no
+  `~/.genesis/`, none of an install's hooks or local reviewers. Hand it only
+  self-contained, spec-complete work whose tests run in CI, off the enforcement-hook
+  surface, as a public issue. Only the owner applies the `devin-ready` label that
+  hands it over: the label starts a paid session, so a session never applies it.
+  Its PRs join the same queue (closing-session, "Devin-built PRs").
 
 The handoff between them is **the PR itself** — a durable artifact that survives
 compaction and session death, so nothing has to be remembered across the
@@ -3654,6 +3661,18 @@ Verify before any commit:
   full-suite rule: test targets must still be named, and do not count on the
   full-suite guard to see inside the wrapper. Guide:
   `docs/reference/resource-budget.md`.
+- **Deleting user or project data goes through the trash, not `rm`.** A file or
+  directory you did not create in this session (memory and plans, config, a
+  deliverable, notes) goes to `… -m genesis.trash put PATH --reason R`, which
+  renames it into `~/.genesis/trash/` with a tombstone so
+  `… -m genesis.trash restore ENTRY` can bring it back. `rm` stays fine for
+  what you created yourself and for temp (`~/tmp`, cc-tmp, the scratchpad).
+  Unlike `rm -f`, a missing path is a refusal (exit 1); a path starting with
+  `-` goes after `--`. The trash makes a deletion recoverable; it does not
+  replace asking the user first where deleting their data needs their OK.
+  When `put` refuses (another volume, the database, a file a running process
+  is using), ask the user; do
+  not fall back to `rm`. Guide: `docs/reference/trash.md`.
 - **Commit continuously**: after every logical unit of work. Uncommitted = lost.
 - **PR closes a ledger item → cite `Ledger: <item-id>` in the PR body** (the
   32-hex `session_ledger` row id, own line, e.g. `Ledger: 71337fab…`). The

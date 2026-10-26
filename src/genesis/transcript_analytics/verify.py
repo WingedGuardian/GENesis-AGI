@@ -4,7 +4,7 @@ import contextlib
 import hashlib
 import json
 
-from . import query, store
+from . import catalog, query, store
 from .locks import publication
 
 
@@ -20,19 +20,21 @@ def _digest(con, view):
 
 def verify(data):
     with store._locked(store.DEFAULT_LOCK), publication():
+        selected = catalog.load(data)
         if not query.snapshot_compatible(data):
             return {"ok": False, "unavailable": "no compatible snapshot; run derive"}
         with (
-            contextlib.closing(query.connect(data)) as snap,
-            contextlib.closing(query.connect(data, live=True)) as live,
+            contextlib.closing(query.connect(data, selected=selected)) as snap,
+            contextlib.closing(query.connect(data, live=True, selected=selected)) as live,
         ):
             comparisons = {
                 v: {"snapshot": _digest(snap, v), "live": _digest(live, v)} for v in query._DERIVED
             }
-        keys, excluded = store.compatible_sources(data)
+        keys, excluded = store.compatible_sources(data, selected)
         return {
             "ok": all(v["snapshot"] == v["live"] for v in comparisons.values()) and not excluded,
             "coverage": {"included": len(keys), "excluded": excluded},
-            "snapshot_current": query.derived_current(data),
+            "snapshot_current": query.derived_current(data, selected),
+            "catalog_revision": selected.revision if selected is not None else None,
             "views": comparisons,
         }

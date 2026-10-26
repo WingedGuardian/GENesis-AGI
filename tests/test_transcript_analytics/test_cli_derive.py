@@ -32,7 +32,7 @@ def built(tmp_path):
     return projects, data, path
 
 
-def test_ingest_cli_derives_only_when_something_changed(built, monkeypatch, capsys):
+def test_ingest_cli_requests_locked_conditional_derivation(built, monkeypatch, capsys):
     from genesis.transcript_analytics import cli, config, resources
 
     monkeypatch.setattr(config, "load", lambda: config.Config(enabled=True))
@@ -41,7 +41,7 @@ def test_ingest_cli_derives_only_when_something_changed(built, monkeypatch, caps
     projects, data, f = built
     calls = []
     monkeypatch.setattr(
-        derive, "build", lambda d, **k: calls.append(d) or {"dir": "x", "views": []}
+        derive, "build", lambda d, **k: calls.append((d, k)) or {"dir": "x", "views": []}
     )
     args = ["--projects", str(projects), "--data", str(data), "ingest"]
     assert cli.main(args) == 0 and len(calls) == 1  # no snapshot yet -> build
@@ -49,11 +49,12 @@ def test_ingest_cli_derives_only_when_something_changed(built, monkeypatch, caps
     with open(f, "a") as fh:
         fh.write(json.dumps(_asst("m3", "2026-10-01T00:00:03Z", 1)) + "\n")
     # Freshness is derived from the inputs, not from whether THIS run rebuilt (re-audit SF-1):
-    assert cli.main(args) == 0 and len(calls) == 1  # snapshot reports current -> no derive
+    assert cli.main(args) == 0 and len(calls) == 2  # currentness is checked inside build
     monkeypatch.setattr(derive, "is_current", lambda d: False)
     assert (
-        cli.main(args) == 0 and len(calls) == 2
-    )  # snapshot stale -> derive, even with nothing rebuilt
+        cli.main(args) == 0 and len(calls) == 3
+    )  # stale or current: one locked operation receives the request
+    assert all(options == {"if_stale": True} for _, options in calls)
 
 
 def test_reaudit_sf3_ingest_survives_a_derive_failure(built, monkeypatch, capsys):

@@ -61,6 +61,10 @@ Install via Claude Code's plugin manager.
 
 ## Infrastructure (Optional)
 
+For preparation of the pinned Codebase provider, see
+[managed Codebase configuration staging](docs/reference/codebase-managed.md).
+Staging does not activate a provider or change the indexing queue.
+
 - **Qdrant**: Vector search for memory. Install and run on port 6333.
   ```bash
   docker run -d --name qdrant -p 6333:6333 qdrant/qdrant

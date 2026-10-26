@@ -51,6 +51,7 @@ def _positive_window(value):
 
 
 def cmd_ingest(args) -> int:
+    from genesis.transcript_analytics import publication as source_publication
     from genesis.transcript_analytics import scrub, store
 
     args.since = _positive_window(args.since)
@@ -71,14 +72,31 @@ def cmd_ingest(args) -> int:
         # rebuild, losing the failure text for good (review SF-2).
         print(f"transcript-analytics: {e}", file=sys.stderr)
         return 2
+    except source_publication.Failed as exc:
+        print(
+            json.dumps(
+                {
+                    "publication_failed": True,
+                    "durability_uncertain": isinstance(exc, source_publication.Uncertain),
+                    "reason": str(exc),
+                    "staged_unpublished": getattr(exc, "staged_unpublished", None),
+                    "rebuilt_staged": getattr(exc, "rebuilt_staged", None),
+                    "rebuilt_durably_committed": getattr(exc, "rebuilt_durably_committed", None),
+                    "last_durable_revision": getattr(exc, "last_durable_revision", None),
+                    "visible_revision": getattr(exc, "visible_revision", None),
+                }
+            ),
+            file=sys.stderr,
+        )
+        return 2
     from genesis.transcript_analytics import derive
 
     derive_failed = False
     derive_deferred = False
     # Freshness is DERIVED from the inputs (re-audit SF-1), not from what this run did.
-    if not args.no_derive and not derive.is_current(args.data):
+    if not args.no_derive:
         try:
-            s["derived"] = derive.build(args.data)
+            s["derived"] = derive.build(args.data, if_stale=True)
         except store.Busy:
             s["derived"] = "skipped: lock busy"
             derive_deferred = True
@@ -97,11 +115,8 @@ def cmd_derive(args) -> int:
     if args.timer and _disabled(args):
         print("transcript-analytics: disabled by lever; nothing done")
         return 0
-    if args.if_stale and derive.is_current(args.data):
-        print(json.dumps({"derived": "current; nothing to do"}))
-        return 0
     try:
-        print(json.dumps(derive.build(args.data)))
+        print(json.dumps(derive.build(args.data, if_stale=args.if_stale)))
     except store.Busy:
         print("transcript-analytics: another ingest/prune is running; skipped")
         return 75
@@ -159,13 +174,14 @@ def _marker_totals(markers):
                 raise ValueError("malformed count is not a nonnegative integer")
             malformed += count
         except (OSError, ValueError, TypeError) as exc:
-            marker_errors.append({"marker": m.name, "reason": str(exc)})
+            marker_errors.append({"marker": m.name, "path": str(m), "reason": str(exc)})
     return malformed, marker_errors
 
 
 def _status(args):
-    from genesis.transcript_analytics import query, store
+    from genesis.transcript_analytics import catalog, query, store
 
+    selected = catalog.load(args.data)
     sources = store.discover(args.projects)
     stale = 0
     source_errors = []
@@ -175,12 +191,17 @@ def _status(args):
         except FileNotFoundError:  # removed since discovery (review N-6)
             continue
         try:
-            if not store.is_current(args.data, store.srckey(rel), store.source_fingerprint(p, st)):
+            if not store.is_current(
+                args.data, store.srckey(rel), store.source_fingerprint(p, st), selected, source=rel
+            ):
                 stale += 1
         except (OSError, ValueError) as exc:
             stale += 1
             source_errors.append({"source": store.source_identity(rel), "reason": str(exc)})
-    markers = list(args.data.glob(f"{store.MARKER}__*.parquet"))
+    markers = [
+        store._table_path(args.data, store.MARKER, key, selected)
+        for key in store.source_keys(args.data, selected)
+    ]
     malformed, marker_errors = _marker_totals(markers)
     source_size, snapshot_size, size_errors = _parquet_bytes(args.data)
     out = {
@@ -197,11 +218,12 @@ def _status(args):
         "malformed_lines": malformed,
         "disabled": (args.data / "DISABLED").exists(),
     }
-    keys, excluded = store.compatible_sources(args.data)
+    keys, excluded = store.compatible_sources(args.data, selected)
     out["coverage"] = {"included": len(keys), "excluded": excluded}
-    out["inventory"] = store.inventory(args.data)
+    out["inventory"] = store.inventory(args.data, selected)
+    out["catalog_revision"] = selected.revision if selected is not None else None
     out["snapshot"] = query.snapshot_manifest(args.data)
-    out["snapshot_current"] = query.derived_current(args.data)
+    out["snapshot_current"] = query.derived_current(args.data, selected)
     out["snapshot_compatible"] = query.snapshot_compatible(args.data)
     return out
 
@@ -217,7 +239,9 @@ def cmd_status(args) -> int:
 
 
 def _cell(v, width: int) -> str:
-    s = "NULL" if v is None else str(v).replace("\n", "\\n")
+    from genesis.transcript_analytics.rendering import terminal_text
+
+    s = terminal_text(v)
     # Display preview only: the stored value is intact; the marker says how much is hidden.
     return s if len(s) <= width else s[:width] + f"…(+{len(s) - width} chars)"
 
@@ -243,6 +267,9 @@ def cmd_sql(args) -> int:
         w.writerows(rows)
         return 0
     shown = rows[: args.max_rows]
+    from genesis.transcript_analytics.rendering import terminal_text
+
+    cols = [terminal_text(c) for c in cols]
     cells = [[_cell(v, args.cell_width) for v in r] for r in shown]
     widths = [max([len(c)] + [len(r[i]) for r in cells]) for i, c in enumerate(cols)]
     print("  ".join(c.ljust(w) for c, w in zip(cols, widths, strict=True)))
@@ -320,33 +347,10 @@ def _configure(ap):
     p = sub.add_parser("prune")
     p.add_argument("--before", required=True)
     p.set_defaults(handler=cmd_prune)
-    p = sub.add_parser("evidence", help="show bounded scrubbed call/result context")
-    p.add_argument("--tool-use-id", required=True)
-    p.add_argument("--context", type=int)
-    p.add_argument("--max-bytes", type=int)
-    p.set_defaults(handler=cmd_evidence)
     sub.add_parser("verify", help="compare all snapshot and live rows").set_defaults(
         handler=cmd_verify
     )
     ap.set_defaults(func=run)
-
-
-def cmd_evidence(args):
-    from .evidence import evidence
-
-    print(
-        json.dumps(
-            evidence(
-                args.data,
-                args.projects,
-                args.tool_use_id,
-                surrounding=args.context if args.context is not None else args.cfg.evidence_records,
-                budget=args.max_bytes if args.max_bytes is not None else args.cfg.evidence_bytes,
-            ),
-            ensure_ascii=False,
-        )
-    )
-    return 0
 
 
 def cmd_verify(args):
@@ -362,6 +366,9 @@ def run(args, argv=None):
 
     try:
         cfg = config.load()
+    except config.NotInstalled as exc:
+        print(json.dumps({"installed": False, "enabled": False, "reason": str(exc)}))
+        return 0 if args.cmd == "status" else 69
     except Exception as exc:  # configuration errors must not enable collection
         print(f"transcript analytics configuration unavailable: {exc}", file=sys.stderr)
         return 2

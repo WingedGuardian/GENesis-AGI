@@ -8,7 +8,7 @@ from decimal import Decimal
 import duckdb
 import pyarrow as pa
 
-from genesis.transcript_analytics import derive, query, store
+from genesis.transcript_analytics import derive, query, reconcile, store
 from genesis.transcript_analytics.extract import TABLES
 from genesis.transcript_analytics.schema import SCHEMAS
 
@@ -22,6 +22,17 @@ def _rows():
                     "source_file": f"source-{index:02}.jsonl",
                     "session_id": "s",
                     "message_id": f"m-{index:02}",
+                    "record_session_id": "s",
+                    "context_session_id": "s",
+                    "actor_id": '["s",null]',
+                    "source_role": "main",
+                    "context_conflict": False,
+                    "content_hash": f"content-{index}-{fragment}",
+                    "payload_hash": f"payload-{index}-{fragment}",
+                    "immutable_hash": f"immutable-{index}-{fragment}",
+                    "request_id_hash": "no-request",
+                    "terminal_hash": f"terminal-{index}",
+                    "has_usage": True,
                     "line_no": fragment,
                     "uuid": f"u-{index}-{fragment}",
                     "ts": f"2026-01-01T00:00:{index:02}Z",
@@ -47,6 +58,10 @@ def _rows():
                 {
                     "source_file": f"source-{index:02}.jsonl",
                     "session_id": "s",
+                    "context_session_id": "s",
+                    "actor_id": '["s",null]',
+                    "context_conflict": False,
+                    "line_no": index + 3,
                     "kind": "ai-title",
                     "value": f"title-{index:02}",
                     "scrub_failed": False,
@@ -54,6 +69,10 @@ def _rows():
                 {
                     "source_file": f"source-{index:02}.jsonl",
                     "session_id": "s",
+                    "context_session_id": "s",
+                    "actor_id": '["s",null]',
+                    "context_conflict": False,
+                    "line_no": index + 3,
                     "kind": "pr-link",
                     "value": str(index),
                     "pr_repository": f"org/repo-{index % 3}",
@@ -71,6 +90,7 @@ def _connection(rows, reverse=False):
     for name in TABLES:
         source = list(reversed(rows[name])) if reverse else rows[name]
         con.register(f"raw_{name}", pa.Table.from_pylist(source, schema=SCHEMAS[name]))
+    reconcile.install(con)
     con.execute(query._VIEWS)
     return con
 
@@ -110,7 +130,12 @@ def test_metadata_selection_keeps_first_nonnull_and_latest_title_timestamp():
     rows["fragments"][0]["git_branch"] = None
     rows["session_meta"].append(
         {
+            "source_file": "dated.jsonl",
+            "line_no": 1,
             "session_id": "s",
+            "context_session_id": "s",
+            "actor_id": '["s",null]',
+            "context_conflict": False,
             "kind": "ai-title",
             "value": "dated",
             "ts": "2026-02-01T00:00:00Z",

@@ -1,0 +1,1 @@
+- Add opt-in transcript analytics commands with enforced resource scopes, durable ownership registration and cooperative cancellation.

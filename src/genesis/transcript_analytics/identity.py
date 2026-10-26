@@ -7,8 +7,21 @@ normalization, so encoding cannot hide credentials from the text scrubber.
 import os
 
 IDENTITY_FIELDS = frozenset(
-    {"session_id", "agent_id", "uuid", "message_id", "request_id", "tool_use_id"}
+    {
+        "session_id",
+        "agent_id",
+        "uuid",
+        "message_id",
+        "request_id",
+        "tool_use_id",
+        "record_session_id",
+        "context_session_id",
+        "parent_agent_id",
+        "call_uuid",
+        "result_agent_id",
+    }
 )
+IDENTITY_LIST_FIELDS = frozenset({"result_agent_ids"})
 
 
 def encode_identity(value: str) -> str:
@@ -40,6 +53,11 @@ def normalize_rows(tables: dict[str, list[dict]]) -> None:
     for rows in tables.values():
         for row in rows:
             for key, value in row.items():
+                if key in IDENTITY_LIST_FIELDS and isinstance(value, list):
+                    row[key] = [
+                        encode_identity(item) if isinstance(item, str) else item for item in value
+                    ]
+                    continue
                 if not isinstance(value, str):
                     continue
                 if key == "source_file":

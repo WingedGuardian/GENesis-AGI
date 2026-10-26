@@ -21,20 +21,51 @@ class Config:
     evidence_bytes: int = 65536
 
 
+class NotInstalled(ValueError):
+    """The canonical installed configuration was retired or is unavailable."""
+
+
+def _base_path() -> Path:
+    from genesis.env import repo_root
+
+    return repo_root() / "config/transcript_analytics.yaml"
+
+
+def persistent_values(base_path: Path | None = None) -> dict:
+    """Read saved settings without expanding paths or incorporating a kill switch."""
+    import yaml
+
+    from genesis._config_overlay import merge_local_overlay
+
+    path = base_path or _base_path()
+    if not path.is_file():
+        raise NotInstalled("canonical transcript analytics configuration is not installed")
+    try:
+        base = yaml.safe_load(path.read_text())
+    except OSError as exc:
+        raise NotInstalled("canonical transcript analytics configuration is unreadable") from exc
+    except (yaml.YAMLError, UnicodeError):
+        # Parser messages quote source lines, which may contain private values.
+        raise ValueError("canonical transcript analytics configuration is invalid") from None
+    if not isinstance(base, dict):
+        raise ValueError("transcript analytics config must be a mapping")
+    values = merge_local_overlay(base, path, strict=True)
+    from_values(values)
+    return values
+
+
 def load(base_path: Path | None = None, *, ignore_kill: bool = False) -> Config:
     """Read base and strict private overlay; malformed settings never opt in."""
     if not ignore_kill and os.environ.get("GENESIS_TRANSCRIPT_ANALYTICS_DISABLED") == "1":
         return Config()
-    import yaml
+    values = persistent_values(base_path)
+    return from_values(values)
 
-    from genesis._config_overlay import merge_local_overlay
-    from genesis.env import repo_root
 
-    path = base_path or repo_root() / "config/transcript_analytics.yaml"
-    base = yaml.safe_load(path.read_text()) if path.exists() else {}
-    if not isinstance(base, dict):
+def from_values(values: dict) -> Config:
+    """Validate a persistent mapping through the same runtime configuration policy."""
+    if not isinstance(values, dict):
         raise ValueError("transcript analytics config must be a mapping")
-    values = merge_local_overlay(base, path, strict=True)
     if type(values.get("enabled", False)) is not bool:
         raise ValueError("enabled must be a boolean")
     if values.get("scope", "all") != "all":
@@ -42,6 +73,8 @@ def load(base_path: Path | None = None, *, ignore_kill: bool = False) -> Config:
     kwargs = {key: value for key, value in values.items() if key in Config.__dataclass_fields__}
     for key in ("projects_dir", "data_dir"):
         if key in kwargs:
+            if not isinstance(kwargs[key], str) or not kwargs[key] or "\0" in kwargs[key]:
+                raise ValueError(f"{key} must be a nonempty path string without NUL")
             kwargs[key] = Path(kwargs[key]).expanduser()
             if not kwargs[key].is_absolute():
                 raise ValueError(f"{key} must be absolute")
