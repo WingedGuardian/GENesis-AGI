@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: laude-institute/headlong
-          ref: eab04ad4097fb2030f27bee6026e24f57289f12d
+          ref: eab04ad4097fb2030f27bee6026e24f57289f12d  # pragma: allowlist secret (public upstream commit pin)
           path: upstream-headlong
           persist-credentials: false
       - name: Build credential-free evaluation image
