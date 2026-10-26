@@ -88,12 +88,15 @@ def _snapshot(sandbox, host: str, stamp: str, *, complete: bool = True,
         (snap / "COMPLETE").write_text("")
 
 
-def _run(sandbox, *, backend="local", host_override=None):
+def _run(sandbox, *, backend="local", host_override=None, extra_args=()):
     env = dict(os.environ)
     env.update(
         HOME=str(sandbox["home"]), GENESIS_DIR=str(sandbox["gd"]),
         GENESIS_BACKUP_PASSPHRASE="testpass", QDRANT_URL="http://127.0.0.1:1",
         PATH=f'{sandbox["bind"]}:{os.environ["PATH"]}',
+        # This fixture owns a fresh private database, with no server process.
+        # Host /proc visibility is unrelated to the offline sandbox boundary.
+        GENESIS_RESTORE_HOLDER_SCAN="none",
     )
     if backend == "local":
         env["GENESIS_BACKUP_TIER2_BACKEND"] = "local"
@@ -103,7 +106,7 @@ def _run(sandbox, *, backend="local", host_override=None):
     if host_override is not None:
         env["GENESIS_BACKUP_NAS_HOST"] = host_override
     return subprocess.run(
-        ["bash", str(_RESTORE), "--from", str(sandbox["backup"]), "--force"],
+        ["bash", str(_RESTORE), "--from", str(sandbox["backup"]), "--force", *extra_args],
         env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL,
     )
 

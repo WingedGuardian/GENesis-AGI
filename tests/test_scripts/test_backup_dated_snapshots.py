@@ -85,6 +85,7 @@ def backup_env(tmp_path):
         'prev=""\n'
         'for a in "$@"; do\n'
         f'  [ "$prev" = "-c" ] && printf "%s\\n" "$a" >> "{smb_log}"\n'
+        '  if [ "$prev" = "-c" ] && [[ "$a" =~ ^cd\\ \\"Genesis/[^/]+/[0-9]{8}T[0-9]{6}Z\\"$ ]]; then printf "NT_STATUS_OBJECT_PATH_NOT_FOUND\\n"; exit 1; fi\n'
         '  prev="$a"\n'
         "done\n"
         "exit 0\n",
@@ -467,9 +468,9 @@ def test_extra_upload_failure_keeps_complete_but_marks_offsite_unconfirmed(backu
     assert status["extra_upload_failed"] == 1, status
     assert status["tier2_status"] == "partial", status
     assert status["offsite_confirmed"] is False, status
-    assert "extra dirs are incomplete (0 not archived, 0 partial, 1 not uploaded)" in proc.stdout, proc.stdout[
-        -1500:
-    ]
+    assert "extra dirs are incomplete (0 not archived, 0 partial, 1 not uploaded)" in proc.stdout, (
+        proc.stdout[-1500:]
+    )
     # Codex round 3: the failed upload is named in COMPLETE, so restore reports the gap.
     lines = (snap / "COMPLETE").read_text().splitlines()
     assert any(ln.startswith("skipped ") and ln.endswith("(upload failed)") for ln in lines), lines

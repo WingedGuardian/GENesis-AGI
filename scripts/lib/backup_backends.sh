@@ -212,6 +212,63 @@ backend_get() {
         *)     return 1 ;;
     esac
 }
+# Strict payload listing: 3 = absent optional directory, 1 = transport/list error.
+backend_list_strict() {
+    local output rc=0
+    case "$_BACKEND" in
+        local)
+            output=$(LC_ALL=C _t_ctl ls -1A -- "$_BACKEND_LOCAL_ROOT/$1" 2>&1) || rc=$?
+            if [ "$rc" -ne 0 ]; then
+                if [ "$rc" -eq 2 ] && [[ "$output" == *"No such file or directory"* ]]; then return 3; fi
+                return 1
+            fi
+            printf '%s\n' "$output" ;;
+        smb)
+            output=$(_smb_run -c "cd \"$1\"" 2>&1) || rc=$?
+            if [[ "$output" == *NT_STATUS_OBJECT_NAME_NOT_FOUND* || "$output" == *NT_STATUS_OBJECT_PATH_NOT_FOUND* ]]; then return 3; fi
+            if [ "$rc" -ne 0 ] || [[ "$output" == *NT_STATUS_* ]]; then return 1; fi
+            output=$(_smb_run -c "cd \"$1\"; ls" 2>&1) || rc=$?
+            if [ "$rc" -ne 0 ] || [[ "$output" == *NT_STATUS_* ]]; then return 1; fi
+            awk '$1!="." && $1!=".." && $2 ~ /^[DAHSRN]+$/ {print $1}' <<<"$output" ;;
+        *) return 1 ;;
+    esac
+}
+
+# Never publish a partly copied pooled object or manifest under its final name.
+backend_put_atomic() {
+    local source="$1" target="$2" stage output rc=0
+    stage="$(dirname "$target")/.partial-$(date +%s)-${BASHPID:-$$}-${RANDOM}-${RANDOM}"
+    case "$_BACKEND" in
+        smb)
+            local _SMB_OP_TIMEOUT="$_BACKEND_XFER_TIMEOUT"
+            output=$(_smb_run -c "cd \"$(dirname "$stage")\"; put \"$source\" \"$(basename "$stage")\"" 2>&1) || rc=$?
+            [[ "$output" != *NT_STATUS_* ]] || rc=1 ;;
+        local) backend_put "$source" "$stage" || rc=$? ;;
+        *) rc=1 ;;
+    esac
+    if [ "$rc" -ne 0 ]; then backend_delete "$stage" || true; return 1; fi
+    case "$_BACKEND" in
+        local) _t_ctl mv -f -- "$_BACKEND_LOCAL_ROOT/$stage" "$_BACKEND_LOCAL_ROOT/$target" || rc=$? ;;
+        smb)
+            output=$(_smb_run -c "cd \"$(dirname "$target")\"; rename \"$(basename "$stage")\" \"$(basename "$target")\"" 2>&1) || rc=$?
+            [[ "$output" != *NT_STATUS_* ]] || rc=1 ;;
+        *) rc=1 ;;
+    esac
+    if [ "$rc" -ne 0 ]; then backend_delete "$stage" || true; return 1; fi
+}
+
+backend_list_dirs_strict() {
+    local output rc=0
+    case "$_BACKEND" in
+        local) _t_ctl find "$_BACKEND_LOCAL_ROOT/$1" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' ;;
+        smb)
+            output=$(_smb_run -c "cd \"$1\"; ls" 2>&1) || rc=$?
+            if [ "$rc" -ne 0 ] || [[ "$output" == *NT_STATUS_* ]]; then return 1; fi
+            awk '$1!="." && $1!=".." && $2 ~ /D/ {print $1}' <<<"$output" ;;
+        *) return 1 ;;
+    esac
+}
+
 backend_list() {
     case "$_BACKEND" in
         smb)   _smb_list "$1" ;;
