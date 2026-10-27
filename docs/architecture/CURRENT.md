@@ -4284,10 +4284,18 @@ tool-disabled CC probe without changing its schedule or routing authority.
   removed), every path of the two-dot diff, plus a symlink or non-directory
   parent of one (nothing is read or removed through such a parent), that is not at the tag's bytes is COPIED to
   `~/.genesis/deploy-backups/<ts>-live-move-repair/` (with `REPAIR.json`,
-  fsynced) before anything changes, then restored with `git restore
+  fsynced, and the new directory's entries in `deploy-backups` and the
+  Genesis home fsynced too) before anything changes, then restored with `git restore
   --source=<tag>`. A path holding what the update did not write (another
-  edit, a flag, a staged or unmerged entry, a gitlink) is still saved and
-  restored, and reported with its exact re-apply step. The guard then judges
+  edit, a flag, a staged or unmerged entry, a gitlink, a directory symlink
+  inside a target directory, a FIFO, socket or device) is still saved and
+  restored, and reported with its exact re-apply step: a foreign index
+  entry's blob is saved under `index-blobs/` and written back by the step
+  before one atomic NUL-delimited `update-index -z --index-info` call; both
+  flags of an `s` entry are restored; a FIFO is made again (`mkfifo -m`);
+  a socket or device holds nothing to save and is recorded by type and mode
+  and reported as removed. A failure before the checkout itself changes (a
+  failed backup included) exits 0 at `--boot`. The guard then judges
   again and only its SAFE removes the state (byte-identical re-read); `guards`
   or `holds` (an edit off the move's paths) keeps it, its result naming the
   restore before what still holds, and exits 0; a kept "partial" record is
@@ -4298,9 +4306,14 @@ tool-disabled CC probe without changing its schedule or routing authority.
   check. A main row is out of scope (exit 3; 0 at `--boot`). The engine
   writes its merges with `core.fsync=committed`. The deploy-health collector
   `collect_live_repairs` reads every `REPAIR.json` into `live_repair_saved:<n>`
-  (until re-applied or `--dismiss`ed; a malformed report is skipped row by
+  (until re-applied, judged by the node's kind: a file's bytes, a symlink's
+  target, a directory's saved tree, a FIFO's mode, plus the index entries
+  and flags; or `--dismiss`ed; a malformed report is skipped row by
   row) and `live_repair_unresolved`, worded by the awareness check (never paging), and
-  each repair also queues an alert.
+  each repair also queues an alert. A run killed after its restore and
+  before it wrote its result is finished by the next run that finds every
+  recorded path at the tag (with or without the state, and only while it
+  holds update.lock, so a running repair's report is never touched).
   `--post-merge` on `live` never runs the engine. What is recorded and sent to
   the host guardian is the origin/main commit `live` is built on.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;

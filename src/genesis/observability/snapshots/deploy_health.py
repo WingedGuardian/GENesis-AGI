@@ -46,6 +46,7 @@ import logging
 import os
 import re
 import signal
+import stat
 import subprocess
 import time
 from datetime import UTC, datetime
@@ -969,15 +970,70 @@ def collect_live_repairs(genesis_home_dir: Path, now: float | None = None) -> di
 
 
 def _reapplied(backup: Path, repo: str | None, row: dict) -> bool:
-    """Are the saved bytes back in the checkout (a file the repair copied)?"""
-    saved = row.get("saved_as")
-    if not (isinstance(saved, str) and saved and repo and isinstance(row.get("path"), str)):
+    """Is the row back the way the repair found it? Its node, when the repair
+    changed it (a file's bytes, a symlink's target, a directory's saved tree, a
+    FIFO's or socket's type, or absent), and always its index entries and flags."""
+    path = row.get("path")
+    if not (repo and isinstance(path, str)):
         return False
-    with contextlib.suppress(OSError):
-        a, b = backup / saved, Path(repo) / row["path"]
-        if a.is_file() and not a.is_symlink() and b.is_file() and not b.is_symlink():
-            return a.read_bytes() == b.read_bytes()
+    try:
+        if row.get("disk_changed") and not _node_back(backup, Path(repo) / path, row):
+            return False
+        return _index_back(Path(repo), path, row)
+    except (OSError, TypeError, ValueError, RecursionError):
+        return False
+
+
+def _node_back(backup: Path, here: Path, row: dict) -> bool:
+    saved, special = row.get("saved_as"), row.get("special")
+    if row.get("disk") == "absent":
+        return not os.path.lexists(here)
+    if isinstance(saved, str) and saved:
+        return _same_node(backup / saved, here)
+    if isinstance(special, dict):
+        st = os.lstat(here)
+        kind = (
+            "fifo" if stat.S_ISFIFO(st.st_mode) else "socket" if stat.S_ISSOCK(st.st_mode) else ""
+        )
+        mode_ok = kind == "socket" or f"{stat.S_IMODE(st.st_mode):04o}" == special.get("mode")
+        return bool(kind) and kind == special.get("type") and mode_ok
     return False
+
+
+def _same_node(saved: Path, here: Path) -> bool:
+    """The saved node against the checkout's, never following a symlink. A
+    socket in the checkout is ignored: the repair cannot save one."""
+    a, b = os.lstat(saved), os.lstat(here)
+    if stat.S_ISLNK(a.st_mode):
+        return stat.S_ISLNK(b.st_mode) and os.readlink(saved) == os.readlink(here)
+    if stat.S_ISREG(a.st_mode):
+        return stat.S_ISREG(b.st_mode) and saved.read_bytes() == here.read_bytes()
+    if stat.S_ISFIFO(a.st_mode):
+        return stat.S_ISFIFO(b.st_mode)
+    if not (stat.S_ISDIR(a.st_mode) and stat.S_ISDIR(b.st_mode)):
+        return False
+    names = sorted(os.listdir(saved))
+    theirs = sorted(n for n in os.listdir(here) if not stat.S_ISSOCK(os.lstat(here / n).st_mode))
+    return names == theirs and all(_same_node(saved / n, here / n) for n in names)
+
+
+def _index_back(repo: Path, path: str, row: dict) -> bool:
+    """The path's index entries and flag are the ones the repair recorded."""
+    want, flag = row.get("index"), row.get("flag")
+    if not isinstance(want, list):
+        return False
+    spec = f":(literal){path}"
+    rc, out, _ = _run_git(repo, "ls-files", "-s", "-z", "--", spec, timeout=_CHEAP_TIMEOUT_S)
+    rc2, tags, _ = _run_git(repo, "ls-files", "-v", "-z", "--", spec, timeout=_CHEAP_TIMEOUT_S)
+    if rc != 0 or rc2 != 0:
+        return False
+    have = [
+        meta.split()
+        for meta, _, p in (rec.partition("\t") for rec in out.split("\0") if rec)
+        if p == path  # a directory's pathspec also lists what is under it
+    ]
+    flagged = [r[0] for r in tags.split("\0") if r[2:] == path and (r[0] == "S" or r[0].islower())]
+    return have == want and (flagged[0] if flagged else None) == flag
 
 
 def live_repair_findings(repairs: dict | None) -> list[str]:

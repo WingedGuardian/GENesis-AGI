@@ -193,6 +193,9 @@ class World:
                     nodes[rel] = "link:" + os.readlink(full)
                 elif full.is_dir():
                     nodes[rel] = "dir"
+                elif not full.is_file():  # a FIFO or socket: opening it would block
+                    st = os.lstat(full)
+                    nodes[rel] = f"special:{st.st_mode:o}"
                 else:
                     nodes[rel] = full.read_bytes()
         return nodes
@@ -403,6 +406,30 @@ def _foreign_gitlink(w):
     return "Z5"
 
 
+def _foreign_both_flags(w):
+    """`ls-files -v` tags a path with both flags `s` (MEASURED, git 2.43)."""
+    _git(w.root, "update-index", "--skip-worktree", "sub/s1")
+    _git(w.root, "update-index", "--assume-unchanged", "sub/s1")
+    (w.root / "sub" / "s1").write_text("hidden edit\n")
+    return "sub/s1"
+
+
+def _foreign_symlink(w):
+    os.symlink("A", w.root / "Z5")
+    return "Z5"
+
+
+def _foreign_dir_symlink_inside_dir(w):
+    """os.walk lists a directory symlink among the dirnames, not the files."""
+    os.symlink("../sub", w.root / "P" / "notes")
+    return "P"
+
+
+def _foreign_fifo_inside_dir(w):
+    os.mkfifo(w.root / "P" / "pipe", 0o640)
+    return "P"
+
+
 @pytest.mark.parametrize(
     "make",
     [
@@ -413,12 +440,17 @@ def _foreign_gitlink(w):
         _foreign_unmerged,
         _foreign_skip_worktree,
         _foreign_gitlink,
+        _foreign_both_flags,
+        _foreign_symlink,
+        _foreign_dir_symlink_inside_dir,
+        _foreign_fifo_inside_dir,
     ],
 )
 def test_td3_a_foreign_path_is_saved_healed_and_reported(w, make):
     """T-D3: something the update did not write, on a path the switch writes.
     The repair saves it, heals the tree anyway, lists the path as foreign, and
-    the step it prints puts the node and its index entries back exactly."""
+    the step it prints puts the node and its index entries back exactly; the
+    deploy-health reader then stops reporting it, whatever the node's kind."""
     killed_tag_side(w, "Z3")
     # The edit is made with the killed switch's stale index.lock moved aside
     # (git refuses an index write while it stands), then put back.
@@ -447,6 +479,219 @@ def test_td3_a_foreign_path_is_saved_healed_and_reported(w, make):
     assert {k: v for k, v in after.items() if k.startswith(path + "/")} == sub_before
     assert _git(w.root, "ls-files", "-s", "--", path) == index_before
     assert _git(w.root, "ls-files", "-v", "--", path) == flags_before
+    found = _dh().collect_live_repairs(w.gen)
+    assert found["saved"] == [], "re-applied, still reported"
+
+
+def _lock_aside(w: World, fn):
+    """Run ``fn`` with the killed switch's stale index.lock moved aside (git
+    refuses an index write while it stands), then put it back."""
+    lock = w.root / ".git" / "index.lock"
+    lock.rename(lock.with_name("held"))
+    try:
+        return fn()
+    finally:
+        lock.with_name("held").rename(lock)
+
+
+def test_r1_a_foreign_staged_blob_survives_gc_and_is_reapplied(w):
+    """Codex c4385619761: staged content that differs from the worktree's is
+    only in the object store; once the repair drops its index entry a
+    `git gc --prune=now` deletes it. The backup holds the blob's bytes and the
+    re-apply step writes the object back before the index entry."""
+    killed_tag_side(w, "Z3")
+
+    def stage():
+        (w.root / "A").write_text("staged by someone\n")
+        _git(w.root, "add", "A")
+        (w.root / "A").write_text("then edited again\n")
+
+    _lock_aside(w, stage)
+    index_before = _git(w.root, "ls-files", "-s", "--", "A")
+    oid = index_before.split()[1]
+    assert w.repair().returncode == 0
+    _git(w.root, "gc", "-q", "--prune=now")
+    assert (
+        subprocess.run(["git", "-C", str(w.root), "cat-file", "-e", oid], env=_git_env()).returncode
+        != 0
+    ), "control: gc pruned the staged blob"
+    step = w.report()["reapply"][0]
+    subprocess.run(["bash", "-c", step], check=True, env=w.env())
+    assert _git(w.root, "ls-files", "-s", "--", "A") == index_before
+    assert _git(w.root, "cat-file", "blob", oid) == "staged by someone"
+    assert (w.root / "A").read_text() == "then edited again\n"
+
+
+def test_r1_a_name_with_a_newline_reapplies_its_index_entry(tmp_path, monkeypatch):
+    """Codex c4385619771 / Devin c4385592698: index records are NUL-delimited, so
+    a path with a newline neither breaks the re-apply step nor feeds git an
+    extra record; and nothing is removed before the step that can fail."""
+    name = "odd\nname"
+    monkeypatch.setitem(TO_FILES, name, "theirs\n")
+    w = World(tmp_path)
+    killed_tag_side(w, "Z3")  # odd\nname sorts after Z3: never written
+
+    def stage():
+        (w.root / name).write_text("mine\n")
+        _git(w.root, "add", "--", name)
+
+    _lock_aside(w, stage)
+    index_before = _git(w.root, "ls-files", "-s", "-z")
+    assert w.repair().returncode == 0
+    rows = {row["path"]: row for row in w.report()["paths"]}
+    assert rows[name]["class"] == "foreign"
+    [step] = w.report()["reapply"]
+    r = subprocess.run(["bash", "-c", step], capture_output=True, text=True, env=w.env())
+    assert r.returncode == 0, r.stderr
+    assert _git(w.root, "ls-files", "-s", "-z") == index_before
+    assert (w.root / name).read_text() == "mine\n"
+
+
+@pytest.mark.parametrize("kind", ["fifo", "socket"])
+def test_r1_a_fifo_or_socket_on_a_move_path_is_recorded(w, monkeypatch, kind):
+    """Devin c4385592015: a node that holds no bytes is still recorded (type
+    and mode) and reported as foreign; a FIFO's re-apply step makes it again,
+    a socket's says it is gone (its process binds it again)."""
+    import socket as socketlib
+
+    killed_tag_side(w, "Z3")  # Z5 is a target-only path, unwritten
+    keep = None
+    if kind == "fifo":
+        os.mkfifo(w.root / "Z5", 0o640)
+    else:
+        monkeypatch.chdir(w.root)  # a unix socket path is capped near 108 bytes
+        keep = socketlib.socket(socketlib.AF_UNIX)
+        keep.bind("Z5")
+    try:
+        r = w.repair()
+    finally:
+        if keep is not None:
+            keep.close()
+    assert r.returncode == 0, r.stdout + r.stderr
+    row = {row["path"]: row for row in w.report()["paths"]}["Z5"]
+    assert row["class"] == "foreign", row
+    assert row["special"]["type"] == kind, row
+    if kind == "fifo":
+        assert row["special"]["mode"] == "0640", row
+    [step] = w.report()["reapply"]
+    assert step in r.stdout
+    subprocess.run(["bash", "-c", step], check=True, env=w.env())
+    import stat as st
+
+    if kind == "fifo":
+        mode = os.lstat(w.root / "Z5").st_mode
+        assert st.S_ISFIFO(mode) and st.S_IMODE(mode) == 0o640
+        assert _dh().collect_live_repairs(w.gen)["saved"] == []
+    else:
+        assert "socket" in step and not (w.root / "Z5").exists()
+
+
+def test_r1_the_backup_is_durable_in_its_parents_before_the_checkout_changes(w, mod, monkeypatch):
+    """Devin c4385592132: the new backup's entry in deploy-backups (and that
+    directory's own entry, when the run created it) is fsynced before _apply."""
+    killed_tag_side(w, "Z3")
+    events: list[tuple[str, str]] = []
+    real_fsync, real_apply = mod._fsync_dir, mod.Repair._apply
+
+    def fsync(path):
+        events.append(("fsync", os.path.abspath(path)))
+        return real_fsync(path)
+
+    def apply(self, *a, **kw):
+        events.append(("apply", ""))
+        return real_apply(self, *a, **kw)
+
+    monkeypatch.setattr(mod, "_fsync_dir", fsync)
+    monkeypatch.setattr(mod.Repair, "_apply", apply)
+    assert mod.Repair(str(w.state), str(w.root), True, 0).run() == 0
+    before_apply = events[: events.index(("apply", ""))]
+    backup = str(w.backups()[-1])
+    synced = [p for _, p in before_apply]
+    assert backup in synced
+    assert str(w.gen / "deploy-backups") in synced, "the backup's entry was never synced"
+    assert str(w.gen) in synced, "deploy-backups' own entry was never synced"
+    # the parents are synced after the report is written into the backup
+    assert synced.index(str(w.gen / "deploy-backups")) > synced.index(backup)
+
+
+def test_r1_a_backup_that_fails_at_boot_leaves_the_server_to_start(w):
+    """Devin c4385592320: a backup that cannot be written (a full disk, a
+    permission) changed nothing in the checkout, so --boot exits 0."""
+    if os.geteuid() == 0:
+        pytest.skip("running as root: the permission cannot be refused")
+    killed_tag_side(w, "Z3")
+    root = w.gen / "deploy-backups"
+    root.mkdir()
+    root.chmod(0o500)
+    before = w.snapshot()
+    try:
+        r = w.repair(mode="--boot")
+    finally:
+        root.chmod(0o755)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "nothing was changed" in r.stderr, r.stderr
+    assert w.snapshot() == before and w.state.exists()
+
+
+def test_r1_a_failure_after_the_checkout_changed_stays_fatal_at_boot(w, mod, monkeypatch):
+    """The other side of c4385592320: once _apply began, a failure exits 1."""
+    killed_tag_side(w, "Z3")
+    real = mod._git
+
+    def fail_at_restore(repo, *args, **kw):
+        if args[:1] == ("restore",):
+            raise mod.RepairError("restore failed")
+        return real(repo, *args, **kw)
+
+    monkeypatch.setattr(mod, "_git", fail_at_restore)
+    assert mod.main(["--boot", str(w.state), str(w.root)]) == 1
+
+
+@pytest.mark.parametrize("window", ["before_clear", "before_finish"])
+def test_r1_an_interrupted_reports_result_is_finished_by_the_next_run(w, mod, monkeypatch, window):
+    """Codex c4385619777: killed after the restore but before the result was
+    written (state still there, or already cleared), the next run finds the
+    tree healed and finishes the report, so the reader never calls it
+    unresolved."""
+    killed_tag_side(w, "Z3")
+    target = "_after" if window == "before_clear" else "_finish"
+
+    def die(self, *a, **kw):
+        raise Killed
+
+    monkeypatch.setattr(mod.Repair, target, die)
+    with pytest.raises(Killed):
+        mod.Repair(str(w.state), str(w.root), True, 0).run()
+    assert w.report()["result"] is None
+    assert w.state.exists() is (window == "before_clear")
+    assert w.snapshot() == tag_snapshot()
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not w.state.exists()
+    assert len(w.backups()) == 1, "a new backup was made"
+    assert w.report()["result"].startswith("healed"), w.report()["result"]
+    later = time.time() + 2 * 3600
+    assert _dh().live_repair_findings(_dh().collect_live_repairs(w.gen, now=later)) == []
+
+
+def test_r1_a_report_a_running_repair_holds_is_never_finished(w, mod, monkeypatch):
+    """No state and an unfinished report, but update.lock is held: a repair may
+    be writing that report right now, so it is left alone."""
+    killed_tag_side(w, "Z3")
+
+    def die(self, *a, **kw):
+        raise Killed
+
+    monkeypatch.setattr(mod.Repair, "_finish", die)
+    with pytest.raises(Killed):
+        mod.Repair(str(w.state), str(w.root), True, 0).run()
+    fd = _hold(w.gen / "locks" / "update.lock")
+    try:
+        r = w.repair()
+    finally:
+        os.close(fd)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert w.report()["result"] is None
 
 
 # ── T-D4: what an interrupted write leaves is the engine's ───────────────────

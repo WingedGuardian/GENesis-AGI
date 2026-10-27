@@ -12,14 +12,16 @@ objects a power loss took cannot be judged, so the whole tree is restored to
 HEAD and a clean tree clears it. Run from a kit outside the checkout (the
 checkout is what may be half-written): python3 -I -S, standard library only.
 Exit 1 only where a start would run a half-written tree; at boot every failure
-before the first write exits 0 (the server starts as it did before). A main row
-is out of scope (QD3): exit 3 by command, 0 at boot."""
+before the checkout itself changes exits 0 (the server starts as it did before),
+a failed backup included. A main row is out of scope (QD3): exit 3 by command, 0
+at boot."""
 
 from __future__ import annotations
 
 import argparse
 import contextlib
 import fcntl
+import functools
 import hashlib
 import importlib.util
 import json
@@ -38,7 +40,7 @@ _POLL_S = 1.0
 _PROC = "/proc"
 SUFFIX = "-live-move-repair"
 _now, _sleep = time.monotonic, time.sleep  # a test's fake clock replaces both
-_wrote = False  # set at the first change to disk
+_changed = False  # set when the checkout itself starts to change (_apply)
 
 
 class RepairError(Exception):
@@ -124,6 +126,48 @@ def _as_index(entry) -> list[tuple[str, str, str]]:
     return [(entry[0], entry[1], "0")] if entry else []
 
 
+_KINDS = (
+    (stat.S_ISFIFO, "fifo"),
+    (stat.S_ISSOCK, "socket"),
+    (stat.S_ISCHR, "char-device"),
+    (stat.S_ISBLK, "block-device"),
+)
+
+
+def _special(full: str) -> dict:
+    """The type and permission bits of a node that holds no bytes to copy."""
+    st = os.lstat(full)
+    kind = next((name for test, name in _KINDS if test(st.st_mode)), "unknown")
+    return {"type": kind, "mode": f"{stat.S_IMODE(st.st_mode):04o}"}
+
+
+def _copy_node(src: str, dst: str, unsaved: list[dict], root: str) -> None:
+    """copytree's copy function: a FIFO is made again (it holds no bytes); a
+    socket or a device cannot be, so it is recorded instead of failing the
+    whole copy (copy2 raises on both)."""
+    st = os.lstat(src)
+    if stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
+        shutil.copy2(src, dst, follow_symlinks=False)
+    elif stat.S_ISFIFO(st.st_mode):
+        os.mkfifo(dst)
+        os.chmod(dst, stat.S_IMODE(st.st_mode))
+    else:
+        unsaved.append({"path": os.path.relpath(src, root), **_special(src)})
+
+
+def _index_state(repo: str) -> tuple[dict, dict]:
+    """path -> [(mode, oid, stage)] of the index, and path -> its `ls-files -v`
+    tag when flagged: S skip-worktree, lowercase assume-unchanged, s both."""
+    index: dict[str, list[tuple[str, str, str]]] = {}
+    for rec in _z(_git(repo, "ls-files", "-s", "-z").stdout):
+        meta, path = rec.split("\t", 1)
+        mode, oid, stage = meta.split()
+        index.setdefault(path, []).append((mode, oid, stage))
+    listing = _z(_git(repo, "ls-files", "-v", "-z").stdout)
+    flags = {r[2:]: r[0] for r in listing if r[0] == "S" or r[0].islower()}
+    return index, flags
+
+
 def _pid_alive(pid: int) -> bool:
     """Running and not a zombie (deploy_marker.sh's _deploy_marker_holder_live)."""
     try:
@@ -188,8 +232,6 @@ def _fsync_dir(path: str) -> None:
 
 
 def write_json(path: str, data: dict) -> None:
-    global _wrote
-    _wrote = True
     tmp = f"{path}.{os.getpid()}.tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as fh:
@@ -244,23 +286,44 @@ def _load_guard():
 
 
 def reapply_step(repo: str, backup: str, row: dict) -> str:
-    """The shell step that puts a foreign row back the way the repair found it."""
+    """The shell step that puts a foreign row back the way the repair found it.
+    Its index part runs first, as one `update-index -z --index-info` call (a
+    mode-0 record drops the restored entry, the saved entries follow): git
+    applies that stream whole or not at all (MEASURED, git 2.43), and the saved
+    blobs are written back to the object store before it, so nothing is
+    removed before the step that can fail. Records are NUL-terminated: a path
+    may hold a newline."""
     q, path = shlex.quote, row["path"]
     dst = os.path.join(repo, path)
     steps = []
+    if [tuple(e) for e in row["index"]] != _as_index(row["tag"]):
+        for rel in row.get("blobs") or []:
+            blob = q(os.path.join(backup, rel))
+            steps.append(f"git -C {q(repo)} hash-object -w --no-filters -- {blob} >/dev/null")
+        null = "0" * len((row["index"] or [row["tag"]])[0][1])
+        recs = [f"0 {null}\t{path}"] + [f"{m} {o} {s}\t{path}" for m, o, s in row["index"]]
+        fields = " ".join(q(r) for r in recs)
+        steps.append(f"printf '%s\\0' {fields} | git -C {q(repo)} update-index -z --index-info")
     if row["disk_changed"]:
         steps.append(f"rm -rf -- {q(dst)}")
+        special = row.get("special")
         if row["saved_as"]:
             src = os.path.join(backup, row["saved_as"])
             steps += [f"mkdir -p -- {q(os.path.dirname(dst))}", f"cp -a -- {q(src)} {q(dst)}"]
-    if [tuple(e) for e in row["index"]] != _as_index(row["tag"]):
-        steps.append(f"git -C {q(repo)} update-index --force-remove -- {q(path)}")
-        if row["index"]:
-            lines = "".join(f"{m} {o} {s}\t{path}\n" for m, o, s in row["index"])
-            steps.append(f"printf %s {q(lines)} | git -C {q(repo)} update-index --index-info")
-    if row["flag"]:
-        flag = "--skip-worktree" if row["flag"] in "Ss" else "--assume-unchanged"
-        steps.append(f"git -C {q(repo)} update-index {flag} -- {q(path)}")
+        elif special and special["type"] == "fifo":
+            steps.append(f"mkdir -p -- {q(os.path.dirname(dst))}")
+            steps.append(f"mkfifo -m {special['mode']} -- {q(dst)}")
+        elif special:
+            gone = (
+                f"{path} was a {special['type']} (mode {special['mode']}); it held nothing"
+                " to save, so whatever made it must make it again"
+            )
+            steps.append(f"echo {q(gone)} >&2")
+    flag = row["flag"]
+    if flag and flag in "Ss":
+        steps.append(f"git -C {q(repo)} update-index --skip-worktree -- {q(path)}")
+    if flag and flag.islower():  # `s` is both (git-ls-files(1) -v and -t)
+        steps.append(f"git -C {q(repo)} update-index --assume-unchanged -- {q(path)}")
     return " && ".join(steps)
 
 
@@ -291,14 +354,22 @@ class Repair:
             for fd in self._fds:
                 os.close(fd)
 
+    def _update_lock(self) -> str:
+        locks = os.path.join(os.environ.get("GENESIS_HOME") or self.home, "locks")
+        os.makedirs(locks, exist_ok=True)
+        return os.path.join(locks, "update.lock")
+
     def _run(self) -> int:
         if not os.path.lexists(self.state_path):
+            # A run killed between clearing the state and writing its result. A
+            # repair holds update.lock from start to finish, so only with that
+            # lock free is an unfinished report not one being written right now.
+            if self._unfinished() and self._hold(self._update_lock(), 0) is not None:
+                self._finish_interrupted()
             self._say("nothing to repair: there is no update state")
             return 0
         deadline = _now() + (BOOT_BUDGET_S if self.boot else self.wait)
-        locks = os.path.join(os.environ.get("GENESIS_HOME") or self.home, "locks")
-        os.makedirs(locks, exist_ok=True)
-        lock = os.path.join(locks, "update.lock")
+        lock = self._update_lock()
         if self._hold(lock, 0) is None:
             pid = (_load(self.state_path) or {}).get("pid")
             if self.boot and isinstance(pid, int) and pid > 1 and _pid_alive(pid):
@@ -332,8 +403,10 @@ class Repair:
         to = self._live_target(state)
         if verdict == self.guard.SAFE and to:
             self._clear(raw)  # a repair killed after it healed, before it cleared
+            self._finish_interrupted()
             return 0
         if verdict != self.guard.MIXED_TREE:
+            self._finish_interrupted()  # e.g. killed after a heal that keeps the state
             self._say(f"nothing to repair: the checkout is not half-written ({verdict}: {reason})")
             return 0
         if not to:
@@ -350,6 +423,49 @@ class Repair:
             return 1
         return self._heal(state, raw, to, index_lock)
 
+    def _unfinished(self) -> list[tuple[str, dict]]:
+        """This checkout's reports with no result (file reads only, no git)."""
+        return [
+            (p, m)
+            for p, m in manifests(self.backups)
+            if m.get("result") is None and m.get("repo") == self.repo
+        ]
+
+    def _finish_interrupted(self) -> None:
+        """Write the result of a run killed after its restore and before its
+        result: every path it records is the tag's again, with HEAD still at
+        the tag. Called only while this run holds update.lock (no repair is
+        writing any report); one that does not match stays unfinished, so the
+        reader keeps calling it unresolved."""
+        found = self._unfinished()
+        if not found:
+            return
+        head = _out(self.repo, "rev-parse", "--verify", "-q", "HEAD^{commit}", check=False)
+        self.fmt = _out(self.repo, "rev-parse", "--show-object-format")
+        index, flags = _index_state(self.repo)
+        kept = os.path.lexists(self.state_path)
+        for path, m in found:
+            if m.get("tag") != head or not self._at_tag(m, index, flags):
+                continue
+            result = "healed, state kept" if kept else "healed"
+            result += " (finished by a later run: the run that restored the paths was interrupted)"
+            self._finish(os.path.dirname(path), m, result, 0)
+
+    def _at_tag(self, m: dict, index: dict, flags: dict) -> bool:
+        if not (isinstance(m.get("ts"), str) and isinstance(m.get("reapply"), list)):
+            return False
+        rows = m.get("paths")
+        try:
+            for row in rows:
+                p, w = row["path"], tuple(row["tag"]) if row["tag"] else None
+                if _node(self.repo, p, self.fmt) != _as_disk(w):
+                    return False
+                if index.get(p, []) != _as_index(w) or p in flags:
+                    return False
+        except (KeyError, TypeError, ValueError, OSError):
+            return False
+        return isinstance(rows, list)
+
     def _live_target(self, state: object) -> str | None:
         """The move's target of a live row (rule 6's record, or 6a's own_head)."""
         if not isinstance(state, dict) or state.get("phase") != "merging":
@@ -365,13 +481,7 @@ class Repair:
         readable = _git(repo, "cat-file", "-e", f"{to}^{{tree}}", check=False).returncode == 0
         self.fmt = _out(repo, "rev-parse", "--show-object-format")
         self.want, self.other = _tree(repo, tag), _tree(repo, to) if readable else {}
-        index: dict[str, list[tuple[str, str, str]]] = {}
-        for rec in _z(_git(repo, "ls-files", "-s", "-z").stdout):
-            meta, path = rec.split("\t", 1)
-            mode, oid, stage = meta.split()
-            index.setdefault(path, []).append((mode, oid, stage))
-        listing = _z(_git(repo, "ls-files", "-v", "-z").stdout)
-        flags = {r[2:]: r[0] for r in listing if r[0] == "S" or r[0].islower()}
+        index, flags = _index_state(repo)
         if readable:
             paths = set(_z(_git(repo, "diff", "-z", "--no-renames", "--name-only", tag, to).stdout))
         else:  # every change against HEAD (the tag), flagged and untracked included
@@ -405,8 +515,10 @@ class Repair:
         disk_changed = node != _as_disk(w)
         if not disk_changed and entries == _as_index(w) and p not in flags:
             return None
+        special = _special(os.path.join(self.repo, p)) if node and node[0] == "other" else None
         foreign = (
             p in flags
+            or special is not None  # never the switch's: it writes files, links, dirs
             or "160000" in (w or ("",))[:1] + (o or ("",))[:1]
             or entries not in (_as_index(w), _as_index(o))
             or (disk_changed and not self._engine_wrote(p, node, o))
@@ -420,21 +532,27 @@ class Repair:
             "other": o,
             "index": entries,
             "flag": flags.get(p),
+            "special": special,  # a FIFO's, a socket's or a device's type and mode
             "saved_as": None,
+            "blobs": [],  # the index entries' blobs, saved (a foreign row's)
+            "unsaved": [],  # sockets and devices inside a saved directory
         }
 
     def _engine_wrote(self, p: str, node, o) -> bool:
         """The switch's doing: the target's bytes; a path git unlinked before
         writing; an interrupted write (empty, or a prefix of the target's
-        bytes); an ephemeral path; a directory of target files."""
+        bytes); an ephemeral path; a directory of target files. os.walk lists
+        a directory symlink among the subdirectories (and never follows it), so
+        those are judged with the files."""
         if node is None or node == o or re.search(self.ephemeral, " " + p):
             return True
         full = os.path.join(self.repo, p)
         if node[0] == "dir":
             return all(
                 _node(self.repo, rel, self.fmt) == self.other.get(rel)
-                for top, _subdirs, files in os.walk(full)
-                for rel in (os.path.relpath(os.path.join(top, f), self.repo) for f in files)
+                for top, subdirs, files in os.walk(full)
+                for name in files + [d for d in subdirs if os.path.islink(os.path.join(top, d))]
+                for rel in (os.path.relpath(os.path.join(top, name), self.repo),)
             )
         if node[0] not in ("100644", "100755") or not o or o[0] not in ("100644", "100755"):
             return False
@@ -445,21 +563,28 @@ class Repair:
 
     def _save(self, backup: str, manifest: dict, index_lock: str) -> None:
         """Copy every node about to change, and the stale index.lock, and make
-        them and REPAIR.json durable before anything changes."""
-        global _wrote
-        _wrote = True
+        them and REPAIR.json durable before anything changes: the node (a FIFO,
+        socket or device is recorded by type and mode, as it holds no bytes), a
+        foreign row's index blobs (the restore drops their only reference, and
+        a gc would then delete them), and the new directory's entries up to
+        the Genesis home."""
         os.makedirs(backup)
         for older, m in manifests(self.backups):
             if m.get("result") is None and os.path.dirname(older) != backup:
                 write_json(older, {**m, "result": "superseded"})  # a run killed partway
         for row in manifest["paths"]:
+            if row["class"] == "foreign" and [tuple(e) for e in row["index"]] != _as_index(
+                row["tag"]
+            ):
+                self._save_blobs(backup, row)
             if not row["disk_changed"] or row["disk"] in ("absent", "other"):
                 continue
             row["saved_as"] = os.path.join("tree", row["path"])
             src, dst = os.path.join(self.repo, row["path"]), os.path.join(backup, row["saved_as"])
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             if row["disk"] == "dir":
-                shutil.copytree(src, dst, symlinks=True)
+                copy = functools.partial(_copy_node, unsaved=row["unsaved"], root=self.repo)
+                shutil.copytree(src, dst, symlinks=True, copy_function=copy)
             else:
                 shutil.copy2(src, dst, follow_symlinks=False)
         if os.path.lexists(index_lock):
@@ -469,15 +594,36 @@ class Repair:
         manifest["reapply"] = [reapply_step(self.repo, backup, r) for r in foreign]
         for top, _subdirs, files in os.walk(backup, topdown=False):
             for f in files:
-                if not os.path.islink(os.path.join(top, f)):
+                if stat.S_ISREG(os.lstat(os.path.join(top, f)).st_mode):  # a FIFO would block
                     with open(os.path.join(top, f), "rb") as fh:
                         os.fsync(fh.fileno())
             _fsync_dir(top)
         write_json(os.path.join(backup, "REPAIR.json"), manifest)
+        # The new directory's entry, and deploy-backups' own (it may be new).
+        _fsync_dir(self.backups)
+        _fsync_dir(self.home)
         if os.path.lexists(index_lock):
             os.unlink(index_lock)
 
+    def _save_blobs(self, backup: str, row: dict) -> None:
+        """The blob of each of the row's index entries (a gitlink names a
+        commit, not stored here), by object id under index-blobs/. A blob the
+        object store already lacks was lost before the repair: nothing to save."""
+        for mode, oid, _stage in row["index"]:
+            rel = os.path.join("index-blobs", oid)
+            if mode == "160000" or rel in row["blobs"]:
+                continue
+            got = _git(self.repo, "cat-file", "blob", oid, check=False)
+            if got.returncode != 0:
+                continue
+            os.makedirs(os.path.join(backup, "index-blobs"), exist_ok=True)
+            with open(os.path.join(backup, rel), "wb") as fh:
+                fh.write(got.stdout)
+            row["blobs"].append(rel)
+
     def _apply(self, rows: list[dict], index: dict) -> None:
+        global _changed
+        _changed = True  # from here a failure may leave the checkout part-restored
         repo = self.repo
         flagged = [r["path"] for r in rows if r["flag"]]
         for opt in ("--no-skip-worktree", "--no-assume-unchanged"):  # one flag per call
@@ -623,7 +769,7 @@ def main(argv: list[str]) -> int:
     try:
         return Repair(args.state, os.path.abspath(args.repo), args.boot, args.wait).run()
     except Exception as exc:  # noqa: BLE001 - every failure is named; at boot it sets the exit
-        if args.boot and not _wrote:
+        if args.boot and not _changed:  # a failed backup changed nothing in the checkout
             _log(f"skipped; nothing was changed ({type(exc).__name__}: {exc})")
             return 0
         _log(f"failed ({type(exc).__name__}: {exc}); the update state is kept")
