@@ -25,6 +25,12 @@ from genesis.transcript_analytics.extract import TABLES
 
 VIEWS_VERSION = "24"
 _READS = weakref.WeakKeyDictionary()
+
+
+class NoSnapshot(ValueError):
+    """``connect(snapshot_only=True)`` found no current snapshot to load."""
+
+
 _DERIVED = (
     "tool_calls",
     "turns",
@@ -61,7 +67,7 @@ _DERIVED = (
 )
 
 
-def _snapshot(data, selection):
+def _snapshot_directory(data):
     # The disposable layout is a real derived/ directory whose current
     # selector is a symlink into it; anything else is malformed cache and
     # the reader falls back to the live views.
@@ -75,19 +81,52 @@ def _snapshot(data, selection):
     directory = selector.resolve(strict=True)
     if directory.parent != root or not directory.is_dir():
         raise ValueError("invalid snapshot selector")
+    return directory
+
+
+def _read_manifest(directory):
     # A FIFO or device in the cache must not block the reader (or a rebuild
     # holding the writer lock); only a regular file is read.
     with store._open_regular(directory / "MANIFEST.json") as handle:
-        manifest = json.loads(handle.read())
-    if (
-        not isinstance(manifest, dict)
-        or manifest.get("views_version") != VIEWS_VERSION
-        or manifest.get("inputs_signature") != store.inputs_signature(data, selection=selection)
-        or manifest.get("views") != list(_DERIVED)
-        or not isinstance(manifest.get("schemas"), dict)
-    ):
+        return json.loads(handle.read())
+
+
+def _manifest_current(data, selection, manifest):
+    return (
+        isinstance(manifest, dict)
+        and manifest.get("views_version") == VIEWS_VERSION
+        and manifest.get("inputs_signature") == store.inputs_signature(data, selection=selection)
+        and manifest.get("views") == list(_DERIVED)
+        and isinstance(manifest.get("schemas"), dict)
+    )
+
+
+def _snapshot(data, selection):
+    directory = _snapshot_directory(data)
+    manifest = _read_manifest(directory)
+    if not _manifest_current(data, selection, manifest):
         raise ValueError("snapshot is not current")
     return directory, manifest
+
+
+def snapshot_state(data, *, selection):
+    """The snapshot's manifest and whether the reader would load it, without loading it.
+
+    Returns (manifest|None, current|None): current is True only when the reader's
+    own freshness test passes; False when a snapshot exists but is stale or
+    unreadable; None when there is no snapshot at all. Schema compatibility is
+    checked only as the tables load, so a True here can still fall back.
+    """
+    try:
+        manifest = _read_manifest(_snapshot_directory(data))
+    except (OSError, ValueError, RuntimeError):
+        root, current = data / "derived", data / "derived" / "current"
+        try:
+            invalid_root = root.is_symlink() or (root.exists() and not root.is_dir())
+            return None, (False if invalid_root or current.is_symlink() or current.exists() else None)
+        except OSError:
+            return None, False
+    return manifest, _manifest_current(data, selection, manifest)
 
 
 def _load_snapshot(con, data, selection):
@@ -310,7 +349,7 @@ def connect(
             if snapshot is not None:
                 _READS[con]["snapshot"] = snapshot
             elif snapshot_only:
-                raise ValueError("no current snapshot")
+                raise NoSnapshot("no current snapshot")
             else:
                 _load_live_derived(con, records, memory_limit, threads)
         else:
@@ -389,9 +428,37 @@ def turn_identity_coverage(con):
 
 
 def run_query(
-    data: Path, sql: str, params=None, *, live: bool = False, manifest_path=None, window=None, baseline=None
+    data: Path,
+    sql: str,
+    params=None,
+    *,
+    live: bool = False,
+    manifest_path=None,
+    window=None,
+    baseline=None,
 ):
     """Read a current cache or the captured live views; never serve stale cache."""
+
+    def consume(rel):
+        result = (rel.columns, rel.fetchall()) if rel is not None else ([], [])
+        return result, len(result[1])
+
+    return _query(
+        data,
+        sql,
+        params,
+        consume=consume,
+        live=live,
+        manifest_path=manifest_path,
+        window=window,
+        baseline=baseline,
+    )
+
+
+def _query(
+    data, sql, params=None, *, consume, live=False, manifest_path=None, window=None, baseline=None
+):
+    """Consume one execution completely before recording its query evidence."""
     with contextlib.closing(connect(data, live=live)) as con:
         coverage = _READS[con]["coverage"]
         snapshot = _READS[con].get("snapshot")
@@ -418,9 +485,9 @@ def run_query(
                 raise
             raise duckdb.CatalogException(
                 f"{exc}\nlive=False reads derived views only; raw_* views and"
-                " reconciliation intermediates need live=True"
+                " reconciliation intermediates need live=True (--live)"
             ) from exc
-        result = (rel.columns, rel.fetchall()) if rel is not None else ([], [])
+        result, result_rows = consume(rel)
         if manifest_path:
             identity_coverage = turn_identity_coverage(con)
             _write_manifest(
@@ -443,13 +510,9 @@ def run_query(
                     },
                     "denominator_basis": {"turns": "candidate_turn_rows"},
                     "turn_identity_coverage": identity_coverage,
-                    "result_rows": len(result[1]),
+                    "result_rows": result_rows,
                     "source_references": [
-                        store.source_identity(
-                            os.fsdecode(
-                                record.metadata.get(b"ta.source", b"")
-                            )
-                        )
+                        store.source_identity(os.fsdecode(record.metadata.get(b"ta.source", b"")))
                         for record in _READS[con]["selection"][0]
                     ],
                 },

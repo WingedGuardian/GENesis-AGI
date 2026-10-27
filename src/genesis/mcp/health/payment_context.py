@@ -37,6 +37,7 @@ import logging
 import re
 import secrets
 import unicodedata
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from urllib.parse import unquote_plus, urlsplit
@@ -302,6 +303,39 @@ _SAME_FORM_JS = (
     "(a, b) => { const f = (e) => (e.closest('button, input') || e).form || null;"
     " const x = f(a); return !!x && x === f(b); }"
 )
+# A checkbox input's one label, when that label's control is the input itself:
+# a styled box draws over its input, and a click lands on the label instead.
+_OWN_LABEL_JS = (
+    "(e) => (e.tagName.toLowerCase() === 'input' && e.labels && e.labels.length === 1"
+    " && e.labels[0].control === e) ? e.labels[0] : null"
+)
+# How long a trial tick on the input itself may take before its label is tried.
+CONSENT_TRIAL_MS = 3000
+# A point on a label whose topmost element is the label or a plain part of it,
+# never a link, button or other control inside it: a click there ticks the
+# label's control, where a click on a link would follow it. Returned as check()'s
+# position takes it: from the top-left of the label's padding box, inside its
+# border (Playwright adds the border widths to the position it is given).
+_LABEL_POINT_JS = r"""(lab) => {
+  const r = lab.getBoundingClientRect();
+  const s = getComputedStyle(lab);
+  const left = r.left + (parseFloat(s.borderLeftWidth) || 0);
+  const top = r.top + (parseFloat(s.borderTopWidth) || 0);
+  const bad = 'a,button,select,textarea,summary,[href],[role=link],[role=button],[contenteditable]';
+  const ys = [0.5, 0.25, 0.75].map((f) => r.top + r.height * f);
+  const xs = [4, 8, 0.1, 0.25, 0.5, 0.75].map((v) => r.left + (v < 1 ? r.width * v : v));
+  for (const y of ys) for (const x of xs) {
+    if (x < left || y < top) continue;  // on the border: no position reaches it
+    const e = document.elementFromPoint(x, y);
+    if (!e || !(e === lab || lab.contains(e))) continue;
+    const i = e.closest(bad);
+    if (i && lab.contains(i)) continue;
+    const inp = e.closest('input');
+    if (inp && inp !== lab.control) continue;
+    return {x: x - left, y: y - top};
+  }
+  return null;
+}"""
 # Two targets that are one checkbox (a label and its control).
 _SAME_CONTROL_JS = (
     "(a, b) => { const c = (e) => (e.tagName.toLowerCase() === 'label' ? e.control : e);"
@@ -330,7 +364,9 @@ _TICKED_JS = (
     " : e.getAttribute('aria-checked') === 'true') : null))"
 )
 # What a step clicks, as the tap lists it.
-_STEP_LABEL_JS = "(e) => (e.innerText || e.value || e.getAttribute('aria-label') || '').slice(0, 200)"
+_STEP_LABEL_JS = (
+    "(e) => (e.innerText || e.value || e.getAttribute('aria-label') || '').slice(0, 200)"
+)
 _TEXT_JS = "() => (document.body ? document.body.innerText : '')"
 # One character past cf.MONEY_MAX: an over-long text is refused, never cut into a price.
 _INNER_TEXT_JS = "(e) => (e.innerText || e.textContent || '').slice(0, 201)"
@@ -384,6 +420,17 @@ class _Flow:
     report: Callable[[str], Awaitable[None]] | None = None
     granted: bool = False  # past the tap: keep the client's idle clock fed
     done: asyncio.Event = field(default_factory=asyncio.Event)
+    # The payment window's requests (counts, and the hosts of failed ones): logged
+    # when a step finds nothing, the one view of a window that cannot be watched.
+    net: dict = field(
+        default_factory=lambda: {
+            "started": 0,
+            "finished": 0,
+            "failed": 0,
+            "hosts": [],
+            "pending": {},
+        }
+    )
 
 
 # What may sit between a value's characters in a URL and still read as it:
@@ -1021,12 +1068,37 @@ _PAGE_SHAPE_JS = (
 )
 
 
+def _net(flow: _Flow, what: str, request) -> None:
+    """Count a payment-window request event; keep a failed one's host and error,
+    and the host of each one still pending (no path or query: a URL can carry
+    page data)."""
+    with contextlib.suppress(Exception):
+        flow.net[what] += 1
+        host = urlsplit(request.url).hostname or "?"
+        if what == "started":
+            flow.net["pending"][id(request)] = host
+            return
+        flow.net["pending"].pop(id(request), None)
+        if what == "failed" and len(flow.net["hosts"]) < 8:
+            flow.net["hosts"].append(f"{host} {str(request.failure or '')[:60]}")
+
+
+def _net_summary(flow: _Flow) -> str:
+    """The window's request counts, failed hosts and still-pending hosts, for a log."""
+    net = flow.net
+    pending = Counter(net["pending"].values()).most_common(8)
+    return (
+        f"{net['started']} started, {net['finished']} finished, {net['failed']} failed;"
+        f" failed {net['hosts']}; pending {pending}"
+    )
+
+
 def _how_many(count: int) -> str:
     """A refusal's match count, as words (no selector or page text in a code)."""
     return "none" if count == 0 else "several"
 
 
-async def _steps(ppage, args: cf.CardArgs) -> tuple[list[str], list]:
+async def _steps(ppage, args: cf.CardArgs, flow: _Flow) -> tuple[list[str], list]:
     """Click each step in order, in the payment window, before the form is read
     and before the tap: no card value exists yet, and a step is a click, never
     a value. Each waits for its element (``STEP_WAIT_S``), which must be exactly
@@ -1044,18 +1116,36 @@ async def _steps(ppage, args: cf.CardArgs) -> tuple[list[str], list]:
         # Only a shown element can be clicked: a page that keeps a hidden copy
         # of a control (another layout's header, say) still has one to click.
         loc = frame.locator(sel).filter(visible=True)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + STEP_WAIT_S
         with contextlib.suppress(Exception):
             await asyncio.wait_for(
                 loc.first.wait_for(state="visible", timeout=STEP_WAIT_S * 1000),
                 STEP_WAIT_S + 5,
             )
-        if (count := await _step(loc.count())) != 1:
+        # A page that re-renders can swap the element between that wait and the
+        # count (measured): ask again until exactly one is there, or time is up.
+        count, handle = 0, None
+        while True:
+            with contextlib.suppress(Exception):
+                count = await _step(loc.count())
+                if count == 1:
+                    handle = await _step(loc.element_handle(timeout=2000))
+            if handle is not None or loop.time() >= deadline:
+                break
+            await asyncio.sleep(TICK_S)
+        if handle is None:
             shape = None
             with contextlib.suppress(Exception):
                 shape = await _step(frame.evaluate(_PAGE_SHAPE_JS))
-            logger.warning("payment step %d matched %d (page %s)", n, count, shape)
+            logger.warning(
+                "payment step %d matched %d (page %s; requests %s)",
+                n,
+                count,
+                shape,
+                _net_summary(flow),
+            )
             raise _Stop(f"step_not_found:{n}:{_how_many(count)}")
-        handle = await _step(loc.element_handle(timeout=5000))
         try:
             if not await _owned_by(handle, frame):
                 raise _Stop(f"step_not_found:{n}:owner")
@@ -1087,12 +1177,63 @@ async def _steps(ppage, args: cf.CardArgs) -> tuple[list[str], list]:
     return labels, snapshots
 
 
+async def _tickable(handle, frame):
+    """How a consent box takes its tick: ``(element, position)`` to click, or
+    None. The box itself when a trial tick on it passes. Else its own label (the
+    input's one label, whose control is that input, in the same frame), at a
+    point on no link or button inside it, when a trial tick there passes. An
+    input with no such label keeps its full trial window. A trial changes
+    nothing; the checks before and after the tick still read the box itself."""
+    try:
+        await _step(handle.check(trial=True, timeout=CONSENT_TRIAL_MS))
+        return handle, None
+    except Exception as e:  # noqa: BLE001 - never the exception's text
+        logger.warning("payment consent trial tick failed (%s)", type(e).__name__)
+    try:
+        label = (await _step(handle.evaluate_handle(_OWN_LABEL_JS))).as_element()
+    except Exception:  # noqa: BLE001
+        label = None
+    if label is None:  # no label to click through: the rest of the input's window
+        try:
+            await _step(handle.check(trial=True, timeout=CLICK_MS - CONSENT_TRIAL_MS))
+            return handle, None
+        except Exception as e:  # noqa: BLE001
+            logger.warning("payment consent trial tick failed (%s)", type(e).__name__)
+            return None
+    try:
+        if not await _owned_by(label, frame) or not await _step(
+            label.evaluate(_SAME_CONTROL_JS, handle)
+        ):
+            return None
+        position = await _label_point(label)
+        if position is None:
+            return None
+        await _step(label.check(trial=True, timeout=CLICK_MS, position=position))
+        return label, position
+    except Exception as e:  # noqa: BLE001
+        logger.warning("payment consent label trial tick failed (%s)", type(e).__name__)
+        return None
+
+
+async def _label_point(label) -> dict | None:
+    """A point on the label clear of links (``_LABEL_POINT_JS``), scrolled into
+    view first, as check()'s position; None when there is none."""
+    with contextlib.suppress(Exception):
+        await _step(label.scroll_into_view_if_needed(timeout=CLICK_MS))
+    point = await _step(label.evaluate(_LABEL_POINT_JS))
+    if not isinstance(point, dict):
+        return None
+    return {"x": float(point["x"]), "y": float(point["y"])}
+
+
 async def _consents(
     ppage, args: cf.CardArgs, fields: dict[str, _Field], before_tap: bool = False
 ) -> list[tuple]:
     """Each consent target: exactly one enabled checkbox (or a label of one) of
     the top document or of a frame that holds a card field, with a label the
-    tap can show whole. ``(handle, label)``, in order. ``before_tap``: the box
+    tap can show whole. ``(box, label, (click target, position))``, in order:
+    every check reads the box; only the tick goes through the click target.
+    ``before_tap``: the box
     must be unticked (nothing ticked it but the approved fill) and tickable (a
     trial tick, which changes nothing)."""
     out, frames_seen = [], []
@@ -1106,27 +1247,25 @@ async def _consents(
             raise _Stop(f"consent_not_found:{n}:{_how_many(count)}")
         handle = await _step(loc.element_handle(timeout=5000))
         if not await _owned_by(handle, frame):
-            raise _Stop("consent_not_found")
+            raise _Stop(f"consent_not_found:{n}:owner")
         info = await _step(handle.evaluate(CONSENT_JS))
         if not isinstance(info, dict) or info.get("box") is not True:
-            raise _Stop("consent_not_found")
+            raise _Stop(f"consent_not_found:{n}:box")
         label = info.get("label")
         if not isinstance(label, str) or not label.strip() or info.get("visible") is not True:
             raise _Stop("consent_unlabelled")
         if len(label) > CONSENT_LABEL_CHARS:
             raise _Stop("consent_label_too_long")
-        for other_frame, other in zip(frames_seen, (h for h, _lab in out), strict=True):
+        for other_frame, other in zip(frames_seen, (h for h, _lab, _c in out), strict=True):
             if other_frame is frame and await _step(handle.evaluate(_SAME_CONTROL_JS, other)):
-                raise _Stop("consent_not_found")
-        if before_tap:
-            if info.get("checked") is not False:
-                raise _Stop("consent_pre_ticked")
-            try:
-                await _step(handle.check(trial=True, timeout=CLICK_MS))
-            except Exception as e:  # noqa: BLE001 - never the exception's text
-                logger.warning("payment consent trial tick failed (%s)", type(e).__name__)
-                raise _Stop("consent_not_found") from None
-        out.append((handle, label))
+                raise _Stop(f"consent_not_found:{n}:duplicate")
+        if before_tap and info.get("checked") is not False:
+            raise _Stop("consent_pre_ticked")
+        # Before and after the tap alike, so the tick goes where the trial passed.
+        click = await _tickable(handle, frame)
+        if click is None:
+            raise _Stop(f"consent_not_found:{n}:trial")
+        out.append((handle, label, click))
         frames_seen.append(frame)
     return out
 
@@ -1134,13 +1273,25 @@ async def _consents(
 async def _tick(consents: list[tuple], filled: list[str]) -> None:
     """Tick each consent box (after the tap), then check every one is ticked.
     Each box is checked against the tap's label just before its own tick: a
-    tick fires the page's handlers, which a later refusal cannot take back."""
-    for handle, label in consents:
+    tick fires the page's handlers, which a later refusal cannot take back.
+    A label is checked again too: the card fill can change the page under it, so
+    it must still be the box's label, and its point is read afresh."""
+    for handle, label, (target, position) in consents:
         info = await _step(handle.evaluate(CONSENT_JS))
         if not isinstance(info, dict) or info.get("box") is not True or info.get("label") != label:
             raise _Stop("consent_failed", filled=filled)
         try:
-            await _step(handle.check(timeout=CLICK_MS))
+            if position is None:
+                await _step(target.check(timeout=CLICK_MS))
+            else:
+                if not await _step(target.evaluate(_SAME_CONTROL_JS, handle)):
+                    raise _Stop("consent_failed", filled=filled)
+                position = await _label_point(target)
+                if position is None:
+                    raise _Stop("consent_failed", filled=filled)
+                await _step(target.check(timeout=CLICK_MS, position=position))
+        except _Stop:
+            raise
         except Exception as e:  # noqa: BLE001 - never the exception's text
             logger.warning("payment consent tick failed (%s)", type(e).__name__)
             raise _Stop("consent_failed", filled=filled) from None
@@ -1149,7 +1300,7 @@ async def _tick(consents: list[tuple], filled: list[str]) -> None:
 
 async def _ticked(consents: list[tuple], filled: list[str]) -> None:
     """Every consent box is ticked and still has the label the tap showed."""
-    for handle, label in consents:
+    for handle, label, _click in consents:
         info = await _step(handle.evaluate(CONSENT_JS))
         if (
             not isinstance(info, dict)
@@ -1169,7 +1320,7 @@ async def _consents_kept(consents: list[tuple], frames: list) -> bool:
     what can be shown (measured in Camoufox): its frame detached, its element
     disconnected, or its handle dead while its frame still answers (the frame
     loaded a new document). Anything else unanswered is a refusal."""
-    for (handle, label), frame in zip(consents, frames, strict=True):
+    for (handle, label, _click), frame in zip(consents, frames, strict=True):
         if frame.is_detached():
             continue
         try:
@@ -1531,7 +1682,7 @@ async def _save_stage_inner(
     card_frames = frozenset(id(f.frame) for f in fields.values())
     shown_before = await _read_total(ppage, args, pay, card_frames)
     try:  # each consent's frame, while its handle can still name it
-        consent_frames = [await _step(h.owner_frame()) for h, _lab in consents]
+        consent_frames = [await _step(h.owner_frame()) for h, _lab, _c in consents]
     except Exception:  # noqa: BLE001 - nothing clicked yet
         return "failed_before_pay"
     boxes = await _boxes(ppage)  # a box the save ticks was never approved
@@ -1707,6 +1858,12 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
         guard = _UrlGuard(flow)
         await _step(pctx.route("**/*", guard.handle))
         pctx.on("request", guard.on_request)
+        for event, what in (
+            ("request", "started"),
+            ("requestfinished", "finished"),
+            ("requestfailed", "failed"),
+        ):
+            pctx.on(event, lambda r, what=what: _net(flow, what, r))
         seed = None
         if session:  # into an empty sessionStorage of the same origin, before page scripts
             seed = await _step(
@@ -1738,7 +1895,7 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     step_labels: list[str] = []
     step_snapshots: list = []
     if args.steps:
-        step_labels, step_snapshots = await _steps(ppage, args)
+        step_labels, step_snapshots = await _steps(ppage, args, flow)
         if not await _mask_ok(ppage):
             raise _Stop("mask_unverified")
         host, top = _top(flow, ppage, site)  # a step may move the checkout within its site
@@ -1774,7 +1931,7 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     fields, pay, label = await _resolve(ppage, args)
     origins = {k: f.origin for k, f in fields.items()}
     seen = {**origins, "pay": pay.origin}
-    consent_labels = [lab for _h, lab in await _consents(ppage, args, fields, before_tap=True)]
+    consent_labels = [lab for _h, lab, _c in await _consents(ppage, args, fields, before_tap=True)]
     save, save_label = await _resolve_save(ppage, args, fields)
     if save is not None:
         seen["save"] = save.origin
@@ -1840,9 +1997,7 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
 
     # Granted: the page must still show what the tap was for, fields re-resolved.
     fields, pay, _label = await _resolve(ppage, args)
-    if not await _same_page(
-        ppage, args, top, seen, label, title, fields, pay, hooks, extras=early
-    ):
+    if not await _same_page(ppage, args, top, seen, label, title, fields, pay, hooks, extras=early):
         raise _Stop("page_changed")
     if args.late:  # the billing config's values, now the owner has approved this page
         try:
@@ -1858,7 +2013,7 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
         consents = await _consents(ppage, args, fields)
     except _Stop:
         raise _Stop("page_changed") from None
-    if [lab for _h, lab in consents] != consent_labels:
+    if [lab for _h, lab, _c in consents] != consent_labels:
         raise _Stop("page_changed")
     if args.save is not None:
         try:

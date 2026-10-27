@@ -151,3 +151,21 @@ only `derived/` and syncs its parent directory before returning, without changin
 or inventory. Live queries work immediately and snapshots rebuild from durable
 records even when their original transcripts are permanently gone. Additional backup and restore command wiring is deferred; it does not gate
 collection, live search or opportunity scanning.
+
+## CLI status and verification
+
+Status captures accepted source records once for marker totals, coverage and the
+snapshot input signature. Concurrent collection can publish newer records while
+that response finishes; the captured metadata remains internally consistent.
+Status uses the same confined snapshot-selector boundary as the reader and does
+not load snapshot pages. SQL previews retain only their display limit, CSV streams
+in batches, and both preserve complete query counts in manifests. Default source
+and data paths honor `CLAUDE_HOME` and `GENESIS_HOME`; explicit paths remain chosen
+paths and the installed configuration is still required.
+An individual source stat or fingerprint failure is reported in `source_errors`
+and counted stale while status continues inspecting other sources. A source that
+vanishes before its initial stat keeps the existing skipped-source behavior.
+`verify` uses the same captured selection for the configured cache reader and
+forced live reader, one connection at a time. It compares schema, row counts and
+row digests for every shared relation. Missing, stale or unreadable caches report
+unavailable rather than passing a comparison of live views with themselves.

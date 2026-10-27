@@ -90,6 +90,16 @@ class El:
         self.connected = True  # still in its document
         self.gone = False  # its document was replaced: every script on it raises
         self.form = None  # its form, for _SAME_FORM_JS
+        self.own_label = None  # an input's one label El (whose .control is this El)
+        self.control = None  # a label's control El
+        self.label_point = {
+            "x": 5.0,
+            "y": 5.0,
+        }  # _LABEL_POINT_JS's answer (None: none; or a callable)
+        self.fail_trials = 0  # the next N trial ticks time out (a passing overlay)
+        self.positions: list = []  # where each check() aimed
+        self.ticked_at: list = []  # where each real (not trial) check() aimed
+        self.on_fill = None  # called after this element is filled
 
 
 class Handle:
@@ -126,6 +136,10 @@ class Handle:
             ]
         if js is pc._CHECKBOX_JS:
             return self.el.checkbox
+        if js is pc.CONSENT_JS and self.el.control is not None:
+            # As the real script: the box's state, but `connected` is the label's own.
+            info = await Handle(self.el.control, self.frame).evaluate(js, arg)
+            return {**info, "connected": self.el.connected}
         if js is pc.CONSENT_JS:
             return {
                 "box": self.el.checkbox,
@@ -135,7 +149,7 @@ class Handle:
                 "connected": self.el.connected,
             }
         if js is pc._SAME_CONTROL_JS:
-            return arg.el is self.el
+            return (self.el.control or self.el) is (arg.el.control or arg.el)
         if js is pc._SUBMITS_JS:
             return self.el.submits
         if js is pc._RELATED_JS:
@@ -144,11 +158,42 @@ class Handle:
             return self.el.text
         if js is pc._INNER_TEXT_JS:
             return self.el.text
+        if js is pc._LABEL_POINT_JS:
+            lp = self.el.label_point
+            return lp() if callable(lp) else lp
         if js is pc._SAME_FORM_JS:
             return self.el.form is not None and self.el.form == arg.el.form
         raise AssertionError("unexpected script")
 
-    async def check(self, timeout=None, trial=False):
+    async def evaluate_handle(self, js):
+        if js is not pc._OWN_LABEL_JS:
+            raise AssertionError("unexpected script")
+        lab = self.el.own_label
+        # As found, unfiltered: the flow itself must confirm the label's control.
+        target = Handle(lab, self.frame) if lab is not None else None
+
+        class Wrapped:
+            def as_element(self):
+                return target
+
+        return Wrapped()
+
+    async def scroll_into_view_if_needed(self, timeout=None):
+        return None
+
+    async def check(self, timeout=None, trial=False, position=None):
+        self.el.positions.append(position)
+        if not trial:
+            self.el.ticked_at.append(position)
+        if trial and self.el.fail_trials:
+            self.el.fail_trials -= 1
+            raise TimeoutError("covered for now")
+        if self.el.control is not None:  # a label: its control takes the tick
+            if self.el.untickable:
+                raise RuntimeError("not tickable")
+            if not trial:
+                self.el.control.checked = not self.el.control.unchecks
+            return
         if not self.el.checkbox or self.el.untickable:
             raise RuntimeError("not tickable")
         if not trial:
@@ -156,6 +201,8 @@ class Handle:
 
     async def fill(self, value, timeout=None):
         self.el.value = "x" if self.el.mangle else value
+        if self.el.on_fill is not None:
+            self.el.on_fill()
 
     async def select_option(self, timeout=None, value=None, label=None):
         if label is not None:
@@ -582,6 +629,7 @@ def _clean(monkeypatch):
         ("TICK_S", 0.01),
         ("ATTACH_S", 0.05),
         ("TOTAL_STABLE_S", 0.02),
+        ("STEP_WAIT_S", 0.3),
     ):
         monkeypatch.setattr(pc, name, value)
     # The flow reads Camoufox's media defaults for the payment context. CI's test
@@ -2645,7 +2693,7 @@ async def test_no_consent_sends_no_consent_labels(vault):
 async def test_a_consent_target_that_is_not_a_checkbox_is_refused_before_the_tap(vault):
     ns = checkout()
     out, _ = await _run(ns, consent=["#email"])
-    assert out["code"] == "consent_not_found" and vault.ops("release_request") == []
+    assert out["code"] == "consent_not_found:1:box" and vault.ops("release_request") == []
 
 
 async def test_a_consent_label_changed_after_the_tap_types_nothing(vault):
@@ -2732,9 +2780,11 @@ async def test_a_step_that_ticks_a_box_through_its_label_is_refused(vault):
     [
         (lambda box: setattr(box, "checked", True), "consent_pre_ticked"),
         (lambda box: setattr(box, "label", "   "), "consent_unlabelled"),
-        (lambda box: setattr(box, "label", "x" * (pc.CONSENT_LABEL_CHARS + 1)),
-         "consent_label_too_long"),
-        (lambda box: setattr(box, "untickable", True), "consent_not_found"),
+        (
+            lambda box: setattr(box, "label", "x" * (pc.CONSENT_LABEL_CHARS + 1)),
+            "consent_label_too_long",
+        ),
+        (lambda box: setattr(box, "untickable", True), "consent_not_found:1:trial"),
     ],
 )
 async def test_a_consent_box_the_tap_cannot_cover_is_refused_before_it(vault, setup, code):
@@ -2750,7 +2800,7 @@ async def test_the_same_consent_box_twice_is_refused(vault):
     _consent_box(ns)
     spec = {"selector": "#agree", "frames": ["iframe#card"]}
     out, _ = await _run(ns, consent=[spec, spec])
-    assert out["code"] == "consent_not_found" and vault.ops("release_request") == []
+    assert out["code"] == "consent_not_found:2:duplicate" and vault.ops("release_request") == []
 
 
 async def test_a_consent_label_swapped_on_the_way_to_pay_stops_before_pay(vault):
@@ -2970,9 +3020,10 @@ async def test_save_stops_before_pay_when_the_total_does_not_fit(vault, total, c
     out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
     assert out["code"] == code
     assert ns.saves == [True] and ns.pay_clicks == []
-    assert out["status"].endswith(cf.TEXTS[code].split(".")[-1]) or "Pay was NOT clicked" in out[
-        "status"
-    ]
+    assert (
+        out["status"].endswith(cf.TEXTS[code].split(".")[-1])
+        or "Pay was NOT clicked" in out["status"]
+    )
 
 
 async def test_a_service_that_did_not_show_the_ceiling_types_nothing(vault):
@@ -3226,7 +3277,6 @@ async def test_a_consent_that_cannot_be_read_is_a_refusal(vault):
     assert out["code"] == "saved_page_changed" and ns.pay_clicks == []
 
 
-
 async def test_a_bank_frame_shown_only_while_the_total_settles_is_a_challenge(vault):
     # It shows during the wait for the total and hides before the final check:
     # only the check inside the wait sees it.
@@ -3234,6 +3284,7 @@ async def test_a_bank_frame_shown_only_while_the_total_settles_is_a_challenge(va
     bank = Frame("https://hooks.stripe.com/3d_secure_2/x")
     bank.parent_frame = ns.ppage.main_frame
     ns.ppage.extra.append(bank)
+
     def flash():
         bank.visible = True
         # Hidden again at the first read of the total, which comes after the
@@ -3258,9 +3309,7 @@ async def test_a_save_that_changes_nothing_never_pays(vault):
     assert out["status"] == cf.TEXTS["save_unconfirmed"]
 
 
-async def test_a_pay_label_that_is_the_price_source_must_still_read_the_total(
-    vault, monkeypatch
-):
+async def test_a_pay_label_that_is_the_price_source_must_still_read_the_total(vault, monkeypatch):
     # No total element: Pay's label is where the total was read, so a label
     # gone back to a placeholder at the final check is refused.
     ns = save_checkout()
@@ -3356,3 +3405,189 @@ async def test_a_step_target_owned_by_another_frame_says_owner(vault):
     out, _ = await _run(ns, steps=["#cart"])
     assert out["code"] == "step_not_found:1:owner"
     assert vault.ops("release_request") == []
+
+
+# ── a re-render between the wait and the count; the window's network on a miss ──
+
+
+async def test_a_step_target_swapped_by_a_re_render_is_found_on_the_next_look(vault, monkeypatch):
+    # Measured on a live checkout: the header re-renders, so the element seen
+    # shown is gone when the count runs; a moment later its replacement is there.
+    ns = checkout()
+    ns.ppage.main_frame.elements["#cart"] = [El(tag="button")]
+    real, seen = Loc.count, []
+
+    async def first_look_misses(self):
+        if self.sel == "#cart" and not seen:
+            seen.append(True)
+            return 0
+        return await real(self)
+
+    monkeypatch.setattr(Loc, "count", first_look_misses)
+    out, _ = await _run(ns, steps=["#cart"])
+    assert out["code"] == "submitted_unverified" and seen == [True]
+
+
+def test_the_network_summary_keeps_hosts_never_paths():
+    flow = pc._Flow(task=None)
+
+    class Req:
+        def __init__(self, url, failure=None):
+            self.url, self.failure = url, failure
+
+    done = Req("https://shop.example.com/app.js?session=abc")
+    stuck = Req("https://cdn.example.net/bundle.js?token=xyz")
+    broken = Req("https://api.example.org/config?user=me", failure="NS_ERROR_NET_RESET")
+    for r in (done, stuck, broken):
+        pc._net(flow, "started", r)
+    pc._net(flow, "finished", done)
+    pc._net(flow, "failed", broken)
+    text = pc._net_summary(flow)
+    assert "3 started, 1 finished, 1 failed" in text
+    assert "api.example.org NS_ERROR_NET_RESET" in text
+    assert "('cdn.example.net', 1)" in text  # still pending
+    for secret in ("session=abc", "token=xyz", "user=me", "/app.js", "/config"):
+        assert secret not in text
+
+
+async def test_a_step_miss_logs_the_window_network(vault, caplog):
+    ns = checkout()
+    out, _ = await _run(ns, steps=["#nothing"])
+    assert out["code"] == "step_not_found:1:none"
+    assert "payment step 1 matched 0" in caplog.text and "started" in caplog.text
+
+
+# ── a styled consent box takes its tick through its own label ─────────────
+
+
+def _styled(ns, label_text="I authorize the debit"):
+    """A consent input a click cannot reach (a drawn box over it), with its own
+    label, as measured on a live hosted checkout."""
+    box = _consent_box(ns, label_text)
+    box.untickable = True
+    lab = El(tag="label")
+    lab.control = box
+    box.own_label = lab
+    return box, lab
+
+
+async def test_a_styled_consent_box_is_ticked_through_its_own_label(vault):
+    ns = checkout()
+    box, _lab = _styled(ns)
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "submitted_unverified"
+    assert vault.ops("release_request")[0]["consent_labels"] == ["I authorize the debit"]
+    assert box.checked  # the input itself, through the label
+
+
+async def test_a_styled_box_without_a_label_is_refused_before_the_tap(vault):
+    ns = checkout()
+    box = _consent_box(ns)
+    box.untickable = True
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "consent_not_found:1:trial"
+    assert vault.ops("release_request") == [] and not box.checked
+
+
+async def test_a_label_for_another_box_is_never_used(vault):
+    ns = checkout()
+    box, lab = _styled(ns)
+    lab.control = El()  # its control is some other element
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "consent_not_found:1:trial"
+    assert vault.ops("release_request") == [] and not box.checked
+
+
+async def test_a_label_in_another_frame_is_never_used(vault):
+    ns = checkout()
+    box, lab = _styled(ns)
+    lab.owner = Frame(SHOP)
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "consent_not_found:1:trial"
+    assert vault.ops("release_request") == []
+
+
+async def test_a_label_that_cannot_take_a_tick_either_is_refused(vault):
+    ns = checkout()
+    _box, lab = _styled(ns)
+    lab.untickable = True
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "consent_not_found:1:trial"
+    assert vault.ops("release_request") == []
+
+
+# ── review round on the label route ───────────────────────────────────────
+
+
+async def test_a_save_that_drops_the_label_and_unticks_the_box_never_pays(vault):
+    # The checks read the box itself, never the label used to click it.
+    ns = save_checkout()
+    box, lab = _styled(ns)
+
+    def drop_label_untick_box():
+        lab.connected = False
+        box.checked = False
+
+    _after_save(ns, drop_label_untick_box)
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00", consent=CONSENT)
+    assert out["code"] == "saved_page_changed" and ns.pay_clicks == []
+
+
+async def test_a_label_with_no_point_clear_of_links_is_refused(vault):
+    ns = checkout()
+    box, lab = _styled(ns)
+    lab.label_point = None  # every point on it lands on a link or button
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "consent_not_found:1:trial"
+    assert vault.ops("release_request") == [] and not box.checked
+
+
+async def test_the_tick_uses_the_point_the_label_trial_passed(vault):
+    ns = checkout()
+    box, lab = _styled(ns)
+    lab.label_point = {"x": 7.0, "y": 21.0}
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "submitted_unverified" and box.checked
+    assert lab.positions and set(map(str, lab.positions)) == {"{'x': 7.0, 'y': 21.0}"}
+
+
+async def test_a_box_with_no_label_keeps_its_full_trial_window(vault):
+    ns = checkout()
+    box = _consent_box(ns)
+    box.fail_trials = 1  # covered by an overlay for the first look only
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "submitted_unverified" and box.checked
+
+
+async def test_the_tick_reads_the_label_point_again_after_the_fill(vault):
+    ns = checkout()
+    box, lab = _styled(ns)
+    lab.label_point = lambda: (
+        {"x": 9.0, "y": 30.0} if ns.els["number"].value else {"x": 7.0, "y": 21.0}
+    )
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "submitted_unverified" and box.checked
+    assert lab.ticked_at == [{"x": 9.0, "y": 30.0}]
+
+
+async def test_a_label_with_no_clear_point_after_the_fill_never_ticks(vault):
+    ns = checkout()
+    box, lab = _styled(ns)
+    lab.label_point = lambda: None if ns.els["number"].value else {"x": 7.0, "y": 21.0}
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "consent_failed" and not box.checked and lab.ticked_at == []
+
+
+async def test_a_label_moved_to_another_box_by_the_fill_never_ticks(vault):
+    ns = checkout()
+    box, lab = _styled(ns)
+    other = El(tag="input")
+    other.checkbox = True
+
+    def move():
+        lab.control = other
+
+    ns.els["number"].on_fill = move
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "consent_failed"
+    assert not box.checked and not other.checked and lab.ticked_at == []

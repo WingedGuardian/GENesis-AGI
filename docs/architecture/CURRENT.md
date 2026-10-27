@@ -273,7 +273,16 @@ Acceptance: 400 live roots replayed through both stores, 0 node-set differences.
 The FalkorDB projection is rebuilt hourly by `genesis-graph-project.timer`
 (`memory/graphstore_project.py`); that schedule is its staleness bound, and an
 engine restart leaves no projection until the next run (the engine keeps no data
-on disk). At runtime only `graph.traverse()` READS the engine (the projector
+on disk). Before the swap, the projector runs the callers' own traversal and
+marker queries on the new graph (`graphstore_falkor._WARM_TRAVERSALS`) and prints
+the outcome (`warm-up: ...`) in the unit's journal. Engine time for the first
+read of a freshly projected graph was 52-358 ms where later reads took 1-3.5 ms,
+and each read timeout recorded from 2026-10-21 to 2026-10-26 was that first read
+during a container I/O stall; with the warm-up the first read took 1.2-2.9 ms in
+15 of 15 test runs. A warm-up that fails logs a warning and publishes the graph
+cold.
+
+ At runtime only `graph.traverse()` READS the engine (the projector
 writes it, the health probe pings it): its callers are `memory_recall`
 enrichment (MCP, and genesis-server's tool API), `memory_expand`, and
 `drift_recall` (MCP drift mode and the ambient worker). Recall's own graph step (`graph_expansion.py`) reads
@@ -288,8 +297,12 @@ ticks, age) and, for a read that timed out, the store's own account
 (`GraphUnavailableError.diag` from `graphstore_falkor._bounded`): its budget,
 how far past the deadline it fired (`late_ms` — large means the caller's event
 loop was held, about zero means the engine did not answer), the function names
-of the awaits it cancelled, and the container's PSI stall time across the wait.
-Rows carry `primary_ms`, a latency spread of answered traversals per store, and
+and lines of the 16 innermost awaits it cancelled, the connection the client's
+pool was about to hand out (`conn`: `no_client`, `new`, `idle_open` or
+`idle_closed`, read before the read; `in_use`: reads already in flight), and the
+container's PSI stall time across the wait. The report names the phase those
+frames put the wait in (`construct`, `connect` or `reply`; a row from before the
+connection reading prints `unknown` unless its frames alone name the leg). Rows carry `primary_ms`, a latency spread of answered traversals per store, and
 the report prints each reset's cause. The engine unit keeps its own record of
 slow moments (`--slowlog-max-len 4096`, `--latency-monitor-threshold 100`).
 A call's first fallback, selection failure or error is also written as
@@ -327,7 +340,12 @@ it runs with: the memory lifespan's router reloads its secrets file with
 `override=True`, so a key the file carries beats the exec-time value; the file
 counts only if it and every symlink met resolving it, including links inside a
 link's own target, are unchanged by ctime since the server started, and a
-missing or changed file is unknown), and its database
+missing or changed file is unknown, except that a file changed only in keys the
+census does not read is carried: each row records `secrets_digest`, a hash of
+the six keys it reads, and the next census proves a changed file whose current
+values hash the same for the same pid and start (`carried: true`; the latest
+census row only; never when the file names `SECRETS_PATH` or
+`GENESIS_REPO_ROOT`)), and its database
 scope (the primary database is fixed at import from the exec env or the root
 default, and a path in the file becomes a second one; `foreign` only when every
 one of them differs from the live database by `(st_dev, st_ino)`, no symlink on
@@ -2935,7 +2953,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 2f013ed7b 2026-10-23
+verified: 3e27b4794 2026-10-23
 ```
 
 - Verification refresh is limited to the sampled qualification-runner behavior
@@ -2964,7 +2982,14 @@ verified: 2f013ed7b 2026-10-23
   candidate adds the parser, durable per-source records, audited historical
   readers and live query views. Readers capture immutable source selections;
   tool blocks remain distinct, and uncertain result or delegation matches stay
-  unresolved. CLI and scheduling arrive in dependent changes. Additional backup
+  unresolved. This CLI candidate exposes opt-in capped collection, status, live
+  SQL, disposable cache building and independent live/cache verification. The
+  canonical configuration defaults off and accepts the existing private overlay;
+  default paths follow the canonical runtime homes while explicit paths win.
+  Status reads confined snapshot metadata and reports individual source stat or
+  fingerprint errors while continuing; bounded SQL previews and streaming CSV
+  preserve full query counts without retaining every result row in Python.
+  Scheduling arrives in a dependent change. Additional backup
   and recovery integration is deferred independently of collection and search.
   Unknown historical content is excluded from content metrics. Views version 24
   preserves missing call/result hashes as unknown and admits ownership from the
@@ -3224,6 +3249,29 @@ verified: 2f013ed7b 2026-10-23
   were included in acceptance; the E2E observed no Python network attempts.
   This is synthetic wiring evidence, not real
   model quality, provider billing or deployment. See `docs/reference/qualification-runner.md`.
+- **Contained Headlong stock controls**: opt-in developer CI under
+  `scripts/ci/headlong_*`, separate from the canonical proposal baseline in
+  PR #3590. Pinned upstream modules execute only inside a disposable container,
+  with synthetic providers and fixture effects. The intended matrix has nine
+  route controls plus eight selected upstream test invocations; actual success
+  requires the contained job's report. This supplies no real CLI/model, owner
+  policy, initiative, or G/H/B/C runtime-parity result. No production entry point
+  is added. See `docs/reference/headlong-offline-controls.md`. This stamp refresh
+  covers this developer-evaluation slice, not a new audit of the whole subsystem.
+- **Contained native action port**: the same opt-in CI image also qualifies real
+  Claude Code through the public Agent SDK against a loopback scripted backend.
+  Its MCP tool invokes actual canonical proposal claims and a fixed disposable
+  effect. Eleven expected cells and a separate handler-error instrument control
+  require native completion plus independent committed-state/artifact checks.
+  Integrated success requires the actual contained report. No production provider,
+  inference, B/C orchestration or Codex parity is added. See
+  `docs/reference/headlong-native-action-port.md`.
+- **Contained Headlong reference redaction**: a separate B-only derived source
+  preserves controller-issued references through generic card masking while
+  retaining other secret rules and rejecting reference loss/boundary conflicts.
+  Independently runnable contained controls compare pinned/adapted sanitizers;
+  this adds no production provider or native monolith qualification. See
+  `docs/reference/headlong-reference-redaction.md`.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).
@@ -4172,10 +4220,12 @@ tool-disabled CC probe without changing its schedule or routing authority.
   count there, one anywhere else (the rebuild having moved nothing) `holds`. A "merging"
   row on `live` whose record update.sh already dropped (it adopted the tip,
   own_head is that tip) is judged the same way toward own_head, so a rollback
-  killed partway after adoption is caught too. The remedy follows HEAD: at the
-  tag, put the paths back and Dismiss; at the update's new code (main's merge
-  or the rebuilt tip), put them back and finish with `--post-merge`
-  (Dismissing there leaves code bootstrap never ran on). The dashboard's progress poll returns the guard's remedy
+  killed partway after adoption is caught too. The remedy follows HEAD: on a
+  live row at the tag, the repair (`scripts/deploy_candidates repair-move`,
+  below), then the by-hand steps for when its kit is not installed; at the update's new code (main's merge or the rebuilt tip), put the
+  paths back and finish with `--post-merge` (Dismissing there leaves code
+  bootstrap never ran on); a main row at the tag keeps the by-hand text (save,
+  restore, Dismiss). The dashboard's progress poll returns the guard's remedy
   (`guard_remedy`) and the update card shows it. `deploy_code_only.sh` and the live engine refuse to
   restart or move the checkout while it guards; a plain `update.sh` exits 5
   (before tagging or writing anything), and the dashboard's `/apply` answers
@@ -4265,6 +4315,62 @@ tool-disabled CC probe without changing its schedule or routing authority.
   the exit code agree. Otherwise the run exits 1 and leaves no
   `update_refused.json`.
   The rebuilt tip is recorded in the "merging" row as soon as it is adopted.
+  **The live-move repair** (`scripts/lib/live_move_repair.py`, #3492 PR D1;
+  `scripts/deploy_candidates repair-move [--wait N] [--dismiss TS] [--explain]`
+  runs the copy bootstrap installs under `~/.genesis/lib/live-repair/current`,
+  never the checkout's; installing that kit, and running the repair at every
+  server start, is PR D2, not yet built; `--explain` needs no kit, using the
+  checkout's copy read-only when none is installed) heals a live row's `mixed_tree`
+  with HEAD at the rollback tag, toward the tag, never toward the target (HEAD
+  at the target, a rollback killed partway, is refused with exit 1 and nothing
+  changed: finishing that rollback is a later PR, D1f): under update.lock and
+  genesis-checkout.lock (every git lock a killed switch leaves, `index.lock`,
+  `HEAD.lock`, the branch's ref lock and `packed-refs.lock`, is waited for while
+  a process holds it, then saved into the backup's `git/` and removed by one
+  step, on every path that ends healed; a same-user process whose open files
+  cannot be read counts as a holder only if it is a git or the lock is under
+  30 s old, so a non-git process that cannot be inspected and holds a lock
+  longer than that has it judged stale), every path of the two-dot diff, plus
+  a symlink or non-directory parent of one (nothing is read or removed through
+  such a parent), plus every index entry under one of those (restoring a path
+  drops them; a directory holding a foreign one is foreign too), that is not
+  at the tag's bytes is COPIED to
+  `~/.genesis/deploy-backups/<ts>-live-move-repair/` (with `REPAIR.json`,
+  fsynced, and the new directory's entries in `deploy-backups` and the
+  Genesis home fsynced too; a directory row is copied whole, and a row inside
+  it points into that copy; `.git/index` is copied byte for byte as `git/index`)
+  before anything changes, then restored with `git restore
+  --source=<tag>`. A torn index (its trailing checksum fails: git reads it
+  unchecked, then cannot write it back) is rebuilt from the tag after that
+  copy, and the result says so. Permission bits other than the executable
+  bit are not saved: git does not track them, and a restore gives them the
+  umask's, as any checkout does. A path holding what the update did not write (another
+  edit, a flag, a staged or unmerged entry, a gitlink, a directory symlink
+  inside a target directory, a FIFO, socket or device) is still saved and
+  restored, and reported with its exact re-apply step: a foreign index
+  entry's blob is saved under `index-blobs/` and written back by the step
+  before one atomic NUL-delimited `update-index -z --index-info` call; both
+  flags of an `s` entry are restored; a FIFO is made again (`mkfifo -m`);
+  a socket or device holds nothing to save and is recorded by type and mode
+  and reported as removed. A failure before the checkout itself changes (a
+  failed backup included) exits 0 at `--boot`. The guard then judges
+  again and only its SAFE removes the state (byte-identical re-read); `guards`
+  or `holds` (an edit off the move's paths) keeps it, its result naming the
+  restore before what still holds, and exits 0; a kept "partial" record is
+  rewritten "moving" (same byte-identical check), so the guard then reads it
+  `holds`, not `mixed_tree` again; anything
+  else is `unresolved` (exit 1). A target whose objects are
+  gone (its root tree, or any subtree or blob classification reads) is healed
+  by the whole tree against HEAD and cleared by a clean-tree
+  check. A main row is out of scope (exit 3; 0 at `--boot`). The engine
+  writes its merges with `core.fsync=committed`. Each repair prints its report
+  (re-apply steps included) and queues an alert (critical when anything was
+  not the update's, the index was torn, or it did not heal); `REPAIR.json`
+  and `manifests()` are the contract its readers (deploy health, the
+  awareness check, the guardian's diagnosis) read, and those readers arrive
+  in a follow-up PR: until then the command output and the alert carry the
+  report. A run killed after its restore and before its result leaves no
+  result; the next run removes a healed state without a new backup.
   `--post-merge` on `live` never runs the engine. What is recorded and sent to
   the host guardian is the origin/main commit `live` is built on.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;

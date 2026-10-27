@@ -737,7 +737,8 @@ def _state_guard_verdict() -> tuple[str, str, str | None]:
             "guards",
             "it could not be checked",
             f"{_STATE_FILE} could not be checked, so it is kept. Run "
-            "scripts/update.sh --post-merge (it refuses a half-written tree), or Dismiss "
+            "scripts/update.sh --post-merge (it refuses a half-written tree; on live, "
+            "scripts/deploy_candidates repair-move puts such a tree back), or Dismiss "
             "it on the update card.",
         )
 
