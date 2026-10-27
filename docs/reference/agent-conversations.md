@@ -84,8 +84,12 @@ Windows over SSH, a uv-managed interpreter can sit behind a junction the session
 refuses to traverse. The agent's machine must resolve the configured host name
 (on a tailnet, enable the tailnet's DNS on that machine).
 
-Genesis starts each turn with no knowledge of the calling session, so the
-caller writes a self-contained brief. A completed task whose reply looked like
+Each `genesis_ask` runs a full Genesis background session on the owner's shared
+model limits, and at most two peer turns run at once. The client defaults to
+the read-only `observe` profile; pass `profile: "interact"` only when Genesis
+must act (send a message, file a report, browse), since `interact` runs on the
+largest model. Genesis starts each turn with no knowledge of the calling
+session, so the caller writes a self-contained brief. A completed task whose reply looked like
 a credential comes back with `replyError: disclosure_refused` and no text; the
 client says so rather than returning an empty answer.
 

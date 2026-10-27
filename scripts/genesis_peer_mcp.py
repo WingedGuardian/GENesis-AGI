@@ -25,6 +25,8 @@ import asyncio
 import os
 import time
 import uuid
+from dataclasses import dataclass
+from typing import Literal
 
 import httpx
 from fastmcp import FastMCP
@@ -35,8 +37,14 @@ TERMINAL = {"TASK_STATE_COMPLETED", "TASK_STATE_FAILED", "TASK_STATE_CANCELED"}
 POLL_S = 10
 RETRY_S = 3
 SEND_ATTEMPTS = 3
-# Keep every call well inside a 10-minute harness tool timeout.
+# One deadline per tool call, covering sends and polling; with the 30 s request
+# timeout and the final result fetch, a call ends well inside a 10-minute
+# harness tool timeout.
 MAX_WAIT_S = 480
+RETRY_SAME_ID = (
+    "Call genesis_ask again with this message_id and the same text and options: "
+    "an exact retry never duplicates work."
+)
 
 
 def _client() -> httpx.AsyncClient:
@@ -53,12 +61,38 @@ def _client() -> httpx.AsyncClient:
     )
 
 
-def _error(resp: httpx.Response) -> dict:
+@dataclass
+class _Reply:
+    status: int | None  # None: the request or its body was lost
+    data: object = None  # the parsed JSON body, when it was JSON
+    text: str = ""
+    lost: str = ""  # why it was lost
+
+
+async def _request(http: httpx.AsyncClient, method: str, path: str, **kwargs) -> _Reply:
+    """Every HTTP call goes through here, and it never raises.
+
+    A request whose response is lost (connection, timeout, a body that cannot be
+    read) may still have taken effect on the server, so callers keep whatever
+    ids they hold and report the loss instead of failing the tool call.
+    """
     try:
-        body = resp.json()
+        resp = await http.request(method, path, **kwargs)
+        text = resp.text
+    except httpx.RequestError as exc:
+        return _Reply(None, lost=f"{type(exc).__name__}: {exc}"[:300])
+    try:
+        data = resp.json()
     except ValueError:
-        body = resp.text[:500]
-    return {"status": resp.status_code, "error": body}
+        data = None
+    return _Reply(resp.status_code, data, text)
+
+
+def _error(reply: _Reply) -> dict:
+    if reply.status is None:
+        return {"error": "transport", "detail": reply.lost}
+    body = reply.data if reply.data is not None else reply.text[:500]
+    return {"status": reply.status, "error": body}
 
 
 def _summary(task: dict) -> dict:
@@ -95,41 +129,43 @@ def _add_note(out: dict, text: str) -> dict:
     return out
 
 
-async def _poll(http: httpx.AsyncClient, task_id: str, wait_s: int) -> dict:
-    deadline = time.monotonic() + min(max(0, wait_s), MAX_WAIT_S)
+def _deadline(wait_s: int) -> float:
+    return time.monotonic() + min(max(0, wait_s), MAX_WAIT_S)
+
+
+async def _poll(http: httpx.AsyncClient, task_id: str, deadline: float) -> dict:
     while True:
-        resp = await http.get(f"/tasks/{task_id}")
-        if resp.status_code == 200:
-            summary = _summary(resp.json())
+        r = await _request(http, "GET", f"/tasks/{task_id}")
+        if r.status == 200 and isinstance(r.data, dict):
+            summary = _summary(r.data)
             if summary["state"] in TERMINAL:
                 return await _with_full_result(http, summary)
             hint = "Still running. Call genesis_check with this task_id to keep waiting."
-        elif resp.status_code == 404:
+        elif r.status == 404:
             # Admission may not have committed yet, or it was refused.
             summary = {"task_id": task_id, "state": "NOT_YET_KNOWN"}
             hint = (
                 "Genesis has no record of this task yet. If this persists, the send was "
-                "refused or the id is wrong: call genesis_ask again with the same "
-                "message_id (an exact retry never duplicates work)."
+                "refused or the id is wrong. " + RETRY_SAME_ID
             )
-        elif resp.status_code == 503:
+        elif r.status in (None, 200, 503):
+            # Lost, unreadable or briefly unavailable: the task itself is unaffected.
             summary = {"task_id": task_id, "state": "UNAVAILABLE"}
-            hint = "Genesis is briefly unavailable. Call genesis_check again shortly."
+            hint = "Genesis could not be reached just now. Call genesis_check again shortly."
         else:
-            return {"task_id": task_id, **_error(resp)}
+            return {"task_id": task_id, **_error(r)}
         if time.monotonic() >= deadline:
             return _add_note(summary, hint)
         await asyncio.sleep(POLL_S)
 
 
 async def _with_full_result(http: httpx.AsyncClient, summary: dict) -> dict:
-    if summary["state"] != "TASK_STATE_COMPLETED":
-        return summary
-    resp = await http.get(f"/tasks/{summary['task_id']}/result")
-    if resp.status_code == 200:
-        summary["reply"] = resp.text
+    # A failed or canceled task can also have a committed report worth reading.
+    r = await _request(http, "GET", f"/tasks/{summary['task_id']}/result")
+    if r.status == 200:
+        summary["reply"] = r.text
         summary["reply_is_summary"] = False
-    elif summary.get("reply"):
+    elif summary.get("reply") and summary["state"] == "TASK_STATE_COMPLETED":
         _add_note(summary, "The full reply is unavailable; the reply shown is a shortened head.")
     return summary
 
@@ -138,20 +174,24 @@ async def _with_full_result(http: httpx.AsyncClient, summary: dict) -> dict:
 async def genesis_ask(
     message: str,
     context_id: str | None = None,
-    profile: str | None = None,
-    effort: str | None = None,
+    profile: Literal["observe", "interact"] = "observe",
+    effort: Literal["low", "medium", "high"] | None = None,
     in_reply_to: str | None = None,
     message_id: str | None = None,
     wait_s: int = 300,
 ) -> dict:
-    """Send Genesis a task or question and wait up to wait_s seconds (max 480) for the answer.
+    """Hand Genesis a task or question and wait up to wait_s seconds (max 480) for the answer.
 
+    Each call runs a full Genesis background session (minutes, not seconds) on
+    the owner's shared model limits, and at most two run at once across every
+    connected agent. Use it for what this session cannot do itself (messaging,
+    Genesis's memory, its other tools), not for quick lookups.
     Genesis starts with NO knowledge of this session: write a self-contained
     brief (goal, relevant facts, file contents it needs, what done looks like).
     Pass context_id from an earlier answer to continue that conversation.
-    profile: "interact" (can act: messaging, browsing, memory) or "observe"
-    (read-only); omitted, Genesis picks from its autonomy level.
-    effort: "low" | "medium" | "high".
+    profile: "observe" (default: read-only, answers questions, cheaper model)
+    or "interact" (can act: send messages, file reports, browse; runs on the
+    largest model). Choose interact only when Genesis must DO something.
     in_reply_to: the message_id of a genesis_inbox message this answers; it
     needs that message's context_id too.
     message_id: pass the message_id an earlier call returned to retry that
@@ -160,9 +200,8 @@ async def genesis_ask(
     """
     if in_reply_to and not context_id:
         return {"error": "in_reply_to needs the context_id of the message being answered."}
-    meta: dict = {}
-    if profile:
-        meta["profile"] = profile
+    deadline = _deadline(wait_s)
+    meta: dict = {"profile": profile}
     if effort:
         meta["effort"] = effort
     if in_reply_to:
@@ -179,22 +218,32 @@ async def genesis_ask(
         msg["contextId"] = context_id
     body = {"message": msg, "configuration": {"returnImmediately": True}, "metadata": meta}
     async with _client() as http:
-        # A 503 send may still commit: retry the SAME messageId, never a new one.
+        # A 503 or a lost response may still have committed the send: retry the
+        # SAME messageId, never a new one, and keep any receipt id a 503 named.
+        known_task = None
         for attempt in range(SEND_ATTEMPTS):
             if attempt:
+                if time.monotonic() >= deadline:
+                    break
                 await asyncio.sleep(RETRY_S * attempt)
-            resp = await http.post("/message:send", json=body)
-            if resp.status_code != 503:
+            r = await _request(http, "POST", "/message:send", json=body)
+            if r.status == 503 and isinstance(r.data, dict) and r.data.get("taskId"):
+                known_task = r.data["taskId"]
+            if r.status not in (None, 503):
                 break
-        if resp.status_code == 200:
-            data = resp.json()
-            out = await _poll(http, data.get("task", data)["id"], wait_s)
+        task = r.data.get("task", r.data) if isinstance(r.data, dict) else None
+        if r.status == 200 and isinstance(task, dict) and task.get("id"):
+            out = await _poll(http, task["id"], deadline)
+        elif r.status in (None, 503, 200) and known_task:
+            out = await _poll(http, known_task, deadline)
+        elif r.status in (None, 503, 200):
+            # Lost, still unavailable, or an answer that is not Genesis's: the
+            # send may or may not have been admitted.
+            out = _add_note(
+                _error(r), "The send may or may not have reached Genesis. " + RETRY_SAME_ID
+            )
         else:
-            out = _error(resp)
-            err = out["error"]
-            task_id = err.get("taskId") if isinstance(err, dict) else None
-            if resp.status_code == 503 and task_id:
-                out = await _poll(http, task_id, wait_s)
+            out = _error(r)
         out["message_id"] = message_id
         return out
 
@@ -203,24 +252,31 @@ async def genesis_ask(
 async def genesis_check(task_id: str, wait_s: int = 300) -> dict:
     """Wait up to wait_s seconds (max 480) more for a task from genesis_ask, then report it."""
     async with _client() as http:
-        return await _poll(http, task_id, wait_s)
+        return await _poll(http, task_id, _deadline(wait_s))
 
 
 @mcp.tool
-async def genesis_tasks(context_id: str | None = None, page_size: int = 10) -> dict:
-    """List this peer's recent Genesis tasks, newest first, optionally for one conversation."""
+async def genesis_tasks(
+    context_id: str | None = None, page_size: int = 10, page_token: str | None = None
+) -> dict:
+    """List this peer's recent Genesis tasks, newest first, optionally for one conversation.
+
+    Pass next_page_token from a previous call as page_token (with the same
+    context_id) for the next page.
+    """
     params: dict = {"pageSize": max(1, min(page_size, 100))}
     if context_id:
         params["contextId"] = context_id
+    if page_token:
+        params["pageToken"] = page_token
     async with _client() as http:
-        resp = await http.get("/tasks", params=params)
-        if resp.status_code != 200:
-            return _error(resp)
-        data = resp.json()
+        r = await _request(http, "GET", "/tasks", params=params)
+        if r.status != 200 or not isinstance(r.data, dict):
+            return _error(r)
         return {
-            "tasks": [_summary(t) for t in data.get("tasks", [])],
-            "total": data.get("totalSize"),
-            "next_page_token": data.get("nextPageToken") or None,
+            "tasks": [_summary(t) for t in r.data.get("tasks", [])],
+            "total": r.data.get("totalSize"),
+            "next_page_token": r.data.get("nextPageToken") or None,
         }
 
 
@@ -228,11 +284,11 @@ async def genesis_tasks(context_id: str | None = None, page_size: int = 10) -> d
 async def genesis_cancel(task_id: str) -> dict:
     """Cancel a running Genesis task."""
     async with _client() as http:
-        resp = await http.post(f"/tasks/{task_id}:cancel", json={})
-        if resp.status_code == 200:
-            return _summary(resp.json())
+        r = await _request(http, "POST", f"/tasks/{task_id}:cancel", json={})
+        if r.status == 200 and isinstance(r.data, dict):
+            return _summary(r.data)
         return _add_note(
-            {"task_id": task_id, **_error(resp)},
+            {"task_id": task_id, **_error(r)},
             "Check the task with genesis_check; a cancellation may still be in progress.",
         )
 
@@ -250,17 +306,16 @@ async def genesis_inbox(ack: list[str] | None = None, page_token: str | None = N
     async with _client() as http:
         acked, ack_failed = [], []
         for message_id in ack or []:
-            resp = await http.post(f"/outbox/{message_id}:ack", json={})
-            (acked if resp.status_code == 200 else ack_failed).append(message_id)
+            r = await _request(http, "POST", f"/outbox/{message_id}:ack", json={})
+            (acked if r.status == 200 else ack_failed).append(message_id)
         params: dict = {"pageSize": 20}
         if page_token:
             params["pageToken"] = page_token
-        resp = await http.get("/outbox", params=params)
-        if resp.status_code != 200:
-            return {**_error(resp), "acked": acked, "ack_failed": ack_failed}
-        data = resp.json()
+        r = await _request(http, "GET", "/outbox", params=params)
+        if r.status != 200 or not isinstance(r.data, dict):
+            return {**_error(r), "acked": acked, "ack_failed": ack_failed}
         messages = []
-        for item in data.get("messages", []):
+        for item in r.data.get("messages", []):
             m = item.get("message", {})
             messages.append(
                 {
@@ -272,7 +327,7 @@ async def genesis_inbox(ack: list[str] | None = None, page_token: str | None = N
             )
         out = {
             "messages": messages,
-            "next_page_token": data.get("nextPageToken") or None,
+            "next_page_token": r.data.get("nextPageToken") or None,
         }
         if ack:
             out.update(acked=acked, ack_failed=ack_failed)
@@ -283,8 +338,8 @@ async def genesis_inbox(ack: list[str] | None = None, page_token: str | None = N
 async def genesis_health() -> dict:
     """Check that Genesis's peer API is reachable and this peer's credential works."""
     async with _client() as http:
-        resp = await http.get("/health")
-        return resp.json() if resp.status_code == 200 else _error(resp)
+        r = await _request(http, "GET", "/health")
+        return r.data if r.status == 200 and isinstance(r.data, dict) else _error(r)
 
 
 if __name__ == "__main__":

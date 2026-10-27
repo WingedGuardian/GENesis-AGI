@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import httpx
@@ -21,6 +22,8 @@ SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "genesis_peer_mcp.py"
 def peer(monkeypatch):
     spec = importlib.util.spec_from_file_location("genesis_peer_mcp", SCRIPT)
     mod = importlib.util.module_from_spec(spec)
+    # dataclasses resolve their module through sys.modules.
+    monkeypatch.setitem(sys.modules, spec.name, mod)
     spec.loader.exec_module(mod)
     monkeypatch.setattr(mod, "POLL_S", 0)
     monkeypatch.setattr(mod, "RETRY_S", 0)
@@ -111,7 +114,7 @@ async def test_task_unknown_at_the_deadline_points_at_a_same_id_retry(peer, monk
     out = await _fn(peer.genesis_ask)("hello", wait_s=0)
 
     assert out["state"] == "NOT_YET_KNOWN"
-    assert "same message_id" in out["note"]
+    assert "this message_id" in out["note"]
 
 
 async def test_transient_503_while_polling_keeps_waiting(peer, monkeypatch):
@@ -237,3 +240,158 @@ def test_missing_configuration_names_both_variables(peer, monkeypatch):
     monkeypatch.delenv("GENESIS_PEER_TOKEN", raising=False)
     with pytest.raises(RuntimeError, match="GENESIS_PEER_URL and GENESIS_PEER_TOKEN"):
         peer._client()
+
+
+async def test_lost_send_responses_keep_the_retry_id(peer, monkeypatch):
+    def handler(request, n):
+        raise httpx.ConnectError("connection reset")
+
+    calls = _bind(peer, monkeypatch, handler)
+    out = await _fn(peer.genesis_ask)("send the email", wait_s=5)
+
+    sends = _sends(calls)
+    assert len(sends) == peer.SEND_ATTEMPTS
+    assert {s["message"]["messageId"] for s in sends} == {out["message_id"]}
+    assert out["error"] == "transport"
+    assert "this message_id" in out["note"]
+
+
+async def test_one_lost_send_response_is_retried_with_the_same_id(peer, monkeypatch):
+    def handler(request, n):
+        if request.url.path.endswith("/message:send"):
+            if n == 1:
+                raise httpx.ReadTimeout("lost")
+            return httpx.Response(200, json={"task": _task("TASK_STATE_SUBMITTED")})
+        if request.url.path.endswith("/result"):
+            return httpx.Response(200, text="done")
+        return httpx.Response(200, json=_task("TASK_STATE_COMPLETED"))
+
+    calls = _bind(peer, monkeypatch, handler)
+    out = await _fn(peer.genesis_ask)("hello", wait_s=5)
+
+    first, second = _sends(calls)
+    assert first["message"]["messageId"] == second["message"]["messageId"]
+    assert out["state"] == "TASK_STATE_COMPLETED"
+    assert out["message_id"] == first["message"]["messageId"]
+
+
+async def test_lost_poll_keeps_the_task_and_message_ids(peer, monkeypatch):
+    def handler(request, n):
+        if request.url.path.endswith("/message:send"):
+            return httpx.Response(200, json={"task": _task("TASK_STATE_SUBMITTED")})
+        raise httpx.ConnectError("down")
+
+    _bind(peer, monkeypatch, handler)
+    out = await _fn(peer.genesis_ask)("hello", wait_s=0)
+
+    assert out["task_id"] == "task-1"
+    assert out["state"] == "UNAVAILABLE"
+    assert out["message_id"]
+
+
+async def test_failed_task_still_returns_its_committed_report(peer, monkeypatch):
+    def handler(request, n):
+        if request.url.path.endswith("/result"):
+            return httpx.Response(200, text="full failure report")
+        return httpx.Response(200, json=_task("TASK_STATE_FAILED", error="execution_failed"))
+
+    _bind(peer, monkeypatch, handler)
+    out = await _fn(peer.genesis_check)("task-1", wait_s=0)
+
+    assert out["state"] == "TASK_STATE_FAILED"
+    assert out["reply"] == "full failure report"
+
+
+async def test_task_listing_forwards_the_page_token(peer, monkeypatch):
+    page = {"tasks": [_task("TASK_STATE_COMPLETED")], "totalSize": 11, "nextPageToken": "p2"}
+    calls = _bind(peer, monkeypatch, lambda request, n: httpx.Response(200, json=page))
+    out = await _fn(peer.genesis_tasks)(context_id="ctx-1", page_token="p2")
+
+    assert calls[0].url.params["pageToken"] == "p2"
+    assert calls[0].url.params["contextId"] == "ctx-1"
+    assert out["next_page_token"] == "p2"
+
+
+async def test_ask_defaults_to_the_read_only_profile(peer, monkeypatch):
+    def handler(request, n):
+        if request.url.path.endswith("/message:send"):
+            return httpx.Response(200, json={"task": _task("TASK_STATE_SUBMITTED")})
+        return httpx.Response(200, json=_task("TASK_STATE_WORKING"))
+
+    calls = _bind(peer, monkeypatch, handler)
+    await _fn(peer.genesis_ask)("what did we decide about saves?", wait_s=0)
+
+    assert _sends(calls)[0]["metadata"] == {"profile": "observe"}
+
+
+async def test_explicit_interact_is_forwarded(peer, monkeypatch):
+    def handler(request, n):
+        if request.url.path.endswith("/message:send"):
+            return httpx.Response(200, json={"task": _task("TASK_STATE_SUBMITTED")})
+        return httpx.Response(200, json=_task("TASK_STATE_WORKING"))
+
+    calls = _bind(peer, monkeypatch, handler)
+    await _fn(peer.genesis_ask)("file this bug", profile="interact", wait_s=0)
+
+    assert _sends(calls)[0]["metadata"]["profile"] == "interact"
+
+
+async def test_lost_result_fetch_keeps_the_task_and_the_head_reply(peer, monkeypatch):
+    head = _task("TASK_STATE_COMPLETED")
+    head["status"]["message"] = {"parts": [{"text": "short head"}]}
+
+    def handler(request, n):
+        if request.url.path.endswith("/result"):
+            raise httpx.ReadTimeout("lost")
+        return httpx.Response(200, json=head)
+
+    _bind(peer, monkeypatch, handler)
+    out = await _fn(peer.genesis_check)("task-1", wait_s=0)
+
+    assert out["task_id"] == "task-1"
+    assert out["reply"] == "short head"
+    assert "shortened head" in out["note"]
+
+
+async def test_failed_task_without_a_report_gets_no_head_note(peer, monkeypatch):
+    head = _task("TASK_STATE_FAILED", error="execution_failed")
+    head["status"]["message"] = {"parts": [{"text": "partial"}]}
+
+    def handler(request, n):
+        if request.url.path.endswith("/result"):
+            return httpx.Response(409, json={"code": "result_unavailable"})
+        return httpx.Response(200, json=head)
+
+    _bind(peer, monkeypatch, handler)
+    out = await _fn(peer.genesis_check)("task-1", wait_s=0)
+
+    assert out["state"] == "TASK_STATE_FAILED"
+    assert "note" not in out
+
+
+async def test_unreadable_send_reply_keeps_the_retry_id(peer, monkeypatch):
+    def handler(request, n):
+        return httpx.Response(200, text="<html>proxy error</html>")
+
+    _bind(peer, monkeypatch, handler)
+    out = await _fn(peer.genesis_ask)("hello", wait_s=0)
+
+    assert out["message_id"]
+    assert "this message_id" in out["note"]
+
+
+async def test_a_receipt_named_by_an_earlier_503_survives_a_later_loss(peer, monkeypatch):
+    def handler(request, n):
+        if request.url.path.endswith("/message:send"):
+            if n == 1:
+                return httpx.Response(503, json={"code": "not_ready", "taskId": "task-1"})
+            raise httpx.ConnectError("down")
+        if request.url.path.endswith("/result"):
+            return httpx.Response(200, text="done")
+        return httpx.Response(200, json=_task("TASK_STATE_COMPLETED"))
+
+    _bind(peer, monkeypatch, handler)
+    out = await _fn(peer.genesis_ask)("hello", wait_s=5)
+
+    assert out["task_id"] == "task-1"
+    assert out["reply"] == "done"
