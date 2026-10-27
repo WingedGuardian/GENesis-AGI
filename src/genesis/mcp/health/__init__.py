@@ -52,7 +52,8 @@ def init_health_mcp(
         from genesis.observability.mcp_middleware import InstrumentationMiddleware
 
         # service._db is the long-lived health connection (set in init_health_mcp's caller)
-        mcp.add_middleware(InstrumentationMiddleware(activity_tracker, "health", db=service._db))
+        db = service._db if getattr(activity_tracker, "persist_activity", True) else None
+        mcp.add_middleware(InstrumentationMiddleware(activity_tracker, "health", db=db))
 
     logger.info("Health MCP wired to HealthDataService")
 
@@ -97,6 +98,7 @@ from genesis.mcp.health import skill_usage_status as _skill_usage_status  # noqa
 from genesis.mcp.health import status as _status  # noqa: E402
 from genesis.mcp.health import task_tools as _task_tools  # noqa: E402
 from genesis.mcp.health import update_history as _update_history  # noqa: E402
+from genesis.mcp.health import validator_writes as _validator_writes  # noqa: E402, F401
 from genesis.mcp.health import web_tools as _web_tools  # noqa: E402, F401
 from genesis.mcp.health import zero_drop_tools as _zero_drop_tools  # noqa: E402, F401
 

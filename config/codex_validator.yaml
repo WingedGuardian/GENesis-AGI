@@ -1,0 +1,2 @@
+# Calibration must pass before an authorized local overlay clears this gate.
+dry_run_only: true

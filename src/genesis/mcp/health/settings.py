@@ -43,6 +43,10 @@ class SettingsDomain:
 
 
 _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
+    "codex_validator": SettingsDomain(
+        name="codex_validator", description="Post-calibration validator ledger write gate",
+        config_filename="codex_validator.yaml", readonly=False, needs_restart=False,
+    ),
     "tts": SettingsDomain(
         name="tts",
         description="Text-to-speech voice settings (provider, voice, synthesis params)",
@@ -2231,7 +2235,14 @@ def _validate_provider_outage_notify(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_codex_validator(changes: dict) -> list[str]:
+    from genesis.session_awareness.codex_validator_config import valid_gate
+
+    return [] if valid_gate(changes) else ["Only the boolean dry_run_only field is accepted"]
+
+
 _DOMAIN_VALIDATORS: dict[str, Any] = {
+    "codex_validator": _validate_codex_validator,
     "graphstore": _validate_graphstore,
     "ego_reconcile": _validate_ego_reconcile,
     "follow_up_watchdog": _validate_follow_up_watchdog,

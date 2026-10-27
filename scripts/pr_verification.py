@@ -127,6 +127,14 @@ from genesis.session_awareness.pr_evidence import (  # noqa: E402
     parse_evidence,
     reason_for,
 )
+from genesis.session_awareness.pr_recording import (  # noqa: E402
+    _DuplicateKey,
+    _no_duplicates,
+    resolve_repo,
+)
+from genesis.session_awareness.pr_recording import (  # noqa: E402
+    attempt_note as recording_attempt_note,
+)
 
 __all__ = [
     "MAX_EVIDENCE_BYTES",
@@ -155,28 +163,6 @@ def build_reason(doc: EvidenceDocument, decision: Decision) -> str:
     return reason_for(doc, decision)
 
 
-def resolve_repo(open_repos: list[str], pr_number: int, repo: str) -> str:
-    """Return *repo* if ``(repo, pr_number)`` is an OPEN obligation, else raise LookupError.
-
-    The document names the repository, so nothing is chosen here — only CHECKED.
-    Before the document named it, a ``--repo`` flag did, unchecked, and it closed a
-    DIFFERENT repository's obligation with this PR's evidence at exit 0, permanently
-    (MEASURED end-to-end on an earlier draft). "Nothing open for this PR" and "that
-    repo is not among the open ones" are different facts, so they read differently.
-    """
-    if not open_repos:
-        raise LookupError(
-            f"no OPEN row for PR #{pr_number} — it may be discharged already, or "
-            f"never opened. Run `python3 scripts/repo_pulse_worker.py "
-            f"--verification-backlog` to see the open set."
-        )
-    if repo not in open_repos:
-        raise LookupError(
-            f"no OPEN row for {repo}#{pr_number} (the repository the evidence document "
-            f"names). Open rows for PR #{pr_number}: {', '.join(open_repos)}. If the "
-            f"document names the wrong repository, correct the document."
-        )
-    return repo
 
 
 SCHEMA_TEMPLATE = {
@@ -281,14 +267,7 @@ async def _write(
             # A long prefix can push the validator's words past the backlog's clip;
             # the clip marker names the read that shows them whole. And a park, which
             # is a judgment the note must own up to.
-            attempt_note = None
-            if not decision.closing:
-                attempt_note = str(note).strip()
-                visible = [g for g in decision.derivation.gaps if g.startswith(NOTE_PREFIXED_GAPS)]
-                if visible:
-                    attempt_note = "; ".join(visible) + " — " + attempt_note
-                if decision.parked:
-                    attempt_note = "PARKED (nothing material established) — " + attempt_note
+            attempt_note = recording_attempt_note(decision, note)
 
             if dry_run:
                 print("pr_verification: DRY RUN — nothing written.")
@@ -400,22 +379,8 @@ async def _write(
         return 1
 
 
-class _DuplicateKey(ValueError):
-    pass
 
 
-def _no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    # json.loads keeps the LAST of two equal keys without a word, so a document with
-    # "verdict" twice records whichever the author wrote second. Refuse instead.
-    out: dict[str, object] = {}
-    for key, value in pairs:
-        if key in out:
-            raise _DuplicateKey(
-                f"the evidence document repeats the key {key!r} in one object; JSON "
-                f"would keep only the last one silently, so it is refused"
-            )
-        out[key] = value
-    return out
 
 
 def _refuse(message: str, code: int) -> int:

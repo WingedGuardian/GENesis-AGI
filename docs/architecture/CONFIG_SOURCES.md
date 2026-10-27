@@ -130,6 +130,15 @@ every other placeholder is env → inline `:-default` → left literal.
 
 ## 3. `config/*.yaml` and `.local.yaml` overlays
 
+Validator verification recording has a strict calibration gate in
+`session_awareness/codex_validator_config.py`. The tracked
+`config/codex_validator.yaml` must contain only `dry_run_only: true`; invalid
+base or overlay forces preview. A fresh user-first strict overlay is read on
+every request, and only its exact boolean false enables writes. The existing
+`codex_validator` settings domain supplies the later operator lever; validator
+clients cannot change settings. No overlay is cleared by installation or by a
+tool argument. See `docs/reference/codex-validator-writers.md`.
+
 Base files in `config/` are tracked upstream defaults. Four patterns exist. Each
 describes the default path; the exceptions known when this was written are listed
 with it, and the code is the authority where the two disagree.

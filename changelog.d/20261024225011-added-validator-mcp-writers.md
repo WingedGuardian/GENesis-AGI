@@ -1,0 +1,2 @@
+- Added validator-only memory and eligible private follow-up tools, plus strict evidence-derived verification recording with a server-forced preview gate until calibration opt-in.
+- Keep validator-health activity metrics in memory without letting instrumentation commit or roll back unrelated pending work; historical provider reads and other clients retain their existing behavior.
