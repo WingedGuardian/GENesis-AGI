@@ -3,14 +3,17 @@
 This opt-in CI experiment characterizes pinned stock mechanics and three fake
 text-provider routes. It is a separate slice from the canonical proposal baseline
 in PR #3590. It does not implement a native executor, ego-policy adaptation or
-runtime comparison, and uses no real CLI, model, credentials or production data.
+runtime comparison, and uses no real CLI, model, credentials or production data
+in its stock workload. The workflow also runs the separate
+[native action-port probe](headlong-native-action-port.md).
 
 The `Headlong offline controls` workflow runs when its files change in a PR, or
 on manual dispatch once available on the default branch. Source is pinned to
 `laude-institute/headlong` commit
 `eab04ad4097fb2030f27bee6026e24f57289f12d`. The build context contains an archive
-of that source and the two fixture scripts; it excludes checkout credentials
-and the Genesis tree. The base image is digest-pinned and SDK version is pinned.
+of that source, fixture scripts, committed Genesis source and license; it excludes
+checkout credentials, settings, home data and repository metadata. The stock
+workload does not import Genesis. The base image is digest-pinned and SDK version is pinned.
 Package versions and source hashes identify the actual run; package repository
 contents are not frozen across builds.
 

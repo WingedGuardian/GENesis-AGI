@@ -3258,6 +3258,14 @@ verified: 3e27b4794 2026-10-23
   policy, initiative, or G/H/B/C runtime-parity result. No production entry point
   is added. See `docs/reference/headlong-offline-controls.md`. This stamp refresh
   covers this developer-evaluation slice, not a new audit of the whole subsystem.
+- **Contained native action port**: the same opt-in CI image also qualifies real
+  Claude Code through the public Agent SDK against a loopback scripted backend.
+  Its MCP tool invokes actual canonical proposal claims and a fixed disposable
+  effect. Eleven expected cells and a separate handler-error instrument control
+  require native completion plus independent committed-state/artifact checks.
+  Integrated success requires the actual contained report. No production provider,
+  inference, B/C orchestration or Codex parity is added. See
+  `docs/reference/headlong-native-action-port.md`.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).
