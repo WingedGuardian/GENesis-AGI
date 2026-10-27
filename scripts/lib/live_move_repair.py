@@ -427,7 +427,10 @@ class Repair:
         locks = [path for _name, path in self._locks()]  # index.lock first
         while held := [p for p in locks if os.path.lexists(p) and _held_open(p)]:
             if _now() >= deadline:
-                self._say(f"{held[0]} is still held by a running git after the wait")
+                self._say(
+                    f"{held[0]} is still held, or too recent to call stale (under"
+                    f" {LOCK_FRESH_S} s old), after the wait; run the repair again"
+                )
                 return 1
             _sleep(_POLL_S)
         return self._judge_state(locks[0])
