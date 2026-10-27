@@ -206,9 +206,9 @@ def _report(**over) -> dict:
     return report
 
 
-def _reports(*reports) -> str:
-    """The report read's output: each REPAIR.json followed by a NUL."""
-    return "".join(json.dumps(r) + "\0" for r in reports)
+def _reports(report: dict) -> str:
+    """The report the container picked, as the collector reads it back."""
+    return json.dumps(report)
 
 
 _JOURNAL = (
@@ -216,17 +216,24 @@ _JOURNAL = (
 )
 
 
-def _repair_exec(journal: tuple[int, str], report: tuple[int, str]):
-    async def fake(container, cmd, timeout=15.0):
-        return journal if "journalctl" in cmd else report
+def _repair_exec(monkeypatch, journal: tuple[int, str], report: tuple[int, str]):
+    import genesis.guardian.collector as gc
 
-    return fake
+    async def user(container, cmd, timeout=15.0):
+        return journal
+
+    async def picked(container, cmd, data, timeout, user="ubuntu"):
+        rc, doc = report
+        return rc, ("a login banner\n" + gc._REPAIR_MARK + doc) if doc else ""
+
+    monkeypatch.setattr(gc, "_incus_exec_user", user)
+    monkeypatch.setattr(gc, "_incus_exec_stdin", picked)
 
 
 async def _collect(monkeypatch, journal: str, report: str) -> str:
     import genesis.guardian.collector as gc
 
-    monkeypatch.setattr(gc, "_incus_exec_user", _repair_exec((0, journal), (0, report)))
+    _repair_exec(monkeypatch, (0, journal), (0, report))
     return await gc._collect_live_repair(GuardianConfig())
 
 
@@ -243,28 +250,35 @@ async def test_live_repair_absent_is_empty(config, monkeypatch):
     import genesis.guardian.collector as gc
 
     # no matching journal line; no backup directory (the `cd` fails)
-    monkeypatch.setattr(gc, "_incus_exec_user", _repair_exec((0, ""), (1, "")))
+    _repair_exec(monkeypatch, (0, ""), (0, ""))
     assert await gc._collect_live_repair(config) == ""
+
+
+async def test_live_repair_pick_runs_as_the_configured_container_user(monkeypatch):
+    """The pick reads ~/.genesis/deploy-backups, so it runs as the configured
+    container user (cred_watch._incus_exec_stdin's contract), never a default."""
+    import genesis.guardian.collector as gc
+
+    seen = []
+
+    async def picked(container, cmd, data, timeout, user="ubuntu"):
+        seen.append((container, user))
+        return 0, gc._REPAIR_MARK + _reports(_report())
+
+    async def journal(container, cmd, timeout=15.0):
+        return 0, ""
+
+    monkeypatch.setattr(gc, "_incus_exec_stdin", picked)
+    monkeypatch.setattr(gc, "_incus_exec_user", journal)
+    config = GuardianConfig(container_name="box", container_user="someone")
+    assert "newest report" in await gc._collect_live_repair(config)
+    assert seen == [("box", "someone")]
 
 
 async def test_live_repair_unparseable_report_keeps_journal(monkeypatch):
     for bad in ("{not json", "[" * 100000 + "]" * 100000):  # RecursionError too
-        text = await _collect(monkeypatch, _JOURNAL, bad + "\0")
+        text = await _collect(monkeypatch, _JOURNAL, bad)
         assert "update.lock is still held" in text and "report" not in text
-
-
-async def test_live_repair_skips_dismissed_superseded_and_old(monkeypatch):
-    text = await _collect(
-        monkeypatch,
-        "",
-        _reports(
-            _report(ts=_ts(2), result="healed"),
-            _report(ts=_ts(1), result="superseded"),
-            _report(ts=_ts(0.5), dismissed_at="2026-10-21T00:00:00Z"),
-        ),
-    )
-    assert '"healed"' in text and "superseded" not in text and "unresolved" not in text
-    assert await _collect(monkeypatch, "", _reports(_report(ts=_ts(7)))) == ""
 
 
 async def test_live_repair_path_cannot_break_out_of_its_line(monkeypatch):
@@ -355,59 +369,97 @@ def _container_sh(cmd: str, home, extra_path=None) -> str:
     return done.stdout
 
 
-def test_report_read_is_bounded_and_skips_symlinks(tmp_path):
-    import os
-
-    import genesis.guardian.collector as gc
-
-    backups = tmp_path / ".genesis" / "deploy-backups"
-    zero = backups / "20261022T000001Z-1-live-move-repair"
-    sparse = backups / "20261022T000002Z-2-live-move-repair"
-    zero.mkdir(parents=True)
-    sparse.mkdir()
-    os.symlink("/dev/zero", zero / "REPAIR.json")
-    with open(sparse / "REPAIR.json", "wb") as fh:
-        fh.truncate(200 * 1024 * 1024)  # sparse: no disk used
-    total, _widest = (int(n) for n in _container_sh(gc._REPAIR_REPORT, tmp_path).split())
-    assert total <= 4 * 1024 * 1024 + 16  # one report at most, and only a capped read of it
-
-
-def test_report_read_still_returns_a_report(tmp_path):
+def _pick(home) -> bytes:
+    """Run the container-side report pick, as the collector pipes it, in a scratch HOME."""
     import subprocess
+    import sys
 
     import genesis.guardian.collector as gc
 
-    one = tmp_path / ".genesis" / "deploy-backups" / "20261022T000001Z-1-live-move-repair"
-    one.mkdir(parents=True)
-    (one / "REPAIR.json").write_text(json.dumps({"ts": "x"}))
-    out = subprocess.run(
-        ["bash", "-c", gc._REPAIR_REPORT],
-        env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
+    return subprocess.run(
+        [sys.executable, "-I", "-S", "-"],
+        input=gc._REPAIR_PICK,
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
         capture_output=True,
-        text=True,
         timeout=60,
     ).stdout
-    assert out == json.dumps({"ts": "x"}) + "\0"
 
 
-def test_report_read_never_follows_a_symlinked_report(tmp_path):
-    """A report symlinked to a regular file elsewhere is not read: only the
-    repair's own files are the repair's report."""
+def _backup_dir(home, name: str):
+    d = home / ".genesis" / "deploy-backups" / f"{name}-live-move-repair"
+    d.mkdir(parents=True)
+    return d
+
+
+def test_report_pick_is_bounded_and_skips_non_files(tmp_path):
     import os
-    import subprocess
 
     import genesis.guardian.collector as gc
 
+    os.symlink("/dev/zero", _backup_dir(tmp_path, _ts(0.1)) / "REPAIR.json")
+    os.mkfifo(_backup_dir(tmp_path, _ts(0.2)) / "REPAIR.json")
+    with open(_backup_dir(tmp_path, _ts(0.3)) / "REPAIR.json", "wb") as fh:
+        fh.truncate(200 * 1024 * 1024)  # sparse: no disk used
+    padded = json.dumps(_report(ts=_ts(0.4))).encode() + b" " * (10 * 1024 * 1024)
+    (_backup_dir(tmp_path, _ts(0.4)) / "REPAIR.json").write_bytes(padded)
+    out = _pick(tmp_path)
+    assert out.startswith(gc._REPAIR_MARK.encode())
+    assert len(out) <= len(gc._REPAIR_MARK) + 4 * 1024 * 1024
+
+
+def test_report_pick_returns_the_report(tmp_path):
+    import genesis.guardian.collector as gc
+
+    older = _report(ts=_ts(1), result="healed, the older one")
+    (_backup_dir(tmp_path, _ts(1)) / "REPAIR.json").write_text(json.dumps(older))
+    raw = json.dumps(_report()).encode()
+    (_backup_dir(tmp_path, _ts()) / "REPAIR.json").write_bytes(raw)
+    assert _pick(tmp_path) == gc._REPAIR_MARK.encode() + raw  # the newest eligible one
+
+
+def test_report_pick_surfaces_an_over_cap_report_instead_of_an_older_one(tmp_path):
+    """A newest report over the 4 MiB cap is not silently skipped (an older
+    report would then read as the newest): the pick says it was too large."""
+    import genesis.guardian.collector as gc
+
+    older = _report(ts=_ts(1), result="healed, the older one")
+    (_backup_dir(tmp_path, _ts(1)) / "REPAIR.json").write_text(json.dumps(older))
+    ts = _ts()
+    big = json.dumps(_report(ts=ts)).encode()[:-1] + b', "pad": "'
+    big += b"y" * (gc._REPAIR_REPORT_BYTES + 10) + b'"}'
+    (_backup_dir(tmp_path, ts) / "REPAIR.json").write_bytes(big)
+    out = _pick(tmp_path)
+    assert out.startswith(gc._REPAIR_MARK.encode()), out[:200]
+    picked = json.loads(out[len(gc._REPAIR_MARK) :])
+    assert "report too large" in picked["result"], picked
+    assert picked["ts"] == ts
+    assert len(out) <= len(gc._REPAIR_MARK) + gc._REPAIR_REPORT_BYTES
+
+
+def test_report_pick_never_follows_a_symlinked_report(tmp_path):
+    """A report symlinked to a file elsewhere is not read: only the repair's own
+    files are the repair's report."""
+    import os
+
     elsewhere = tmp_path / "elsewhere.json"
-    elsewhere.write_text(json.dumps({"ts": "not the repair's"}))
-    one = tmp_path / ".genesis" / "deploy-backups" / "20261022T000001Z-1-live-move-repair"
-    one.mkdir(parents=True)
-    os.symlink(elsewhere, one / "REPAIR.json")
-    out = subprocess.run(
-        ["bash", "-c", gc._REPAIR_REPORT], env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
-        capture_output=True, text=True, timeout=60,
-    ).stdout
-    assert out == "\0"
+    elsewhere.write_text(json.dumps(_report(result="not the repair's")))
+    os.symlink(elsewhere, _backup_dir(tmp_path, _ts()) / "REPAIR.json")
+    assert _pick(tmp_path) == b""
+
+
+def test_report_pick_skips_dismissed_superseded_and_old(tmp_path):
+    for hours, over in (
+        (0.5, {"dismissed_at": "2026-10-21T00:00:00Z"}),
+        (1, {"result": "superseded"}),
+        (2, {"result": "healed"}),
+    ):
+        (_backup_dir(tmp_path, _ts(hours)) / "REPAIR.json").write_text(
+            json.dumps(_report(ts=_ts(hours), **over))
+        )
+    assert b'"healed"' in _pick(tmp_path)
+    old = tmp_path / "old"
+    (_backup_dir(old, _ts(7)) / "REPAIR.json").write_text(json.dumps(_report(ts=_ts(7))))
+    assert _pick(old) == b""
 
 
 def test_journal_read_is_bounded(tmp_path):
@@ -424,3 +476,65 @@ def test_journal_read_is_bounded(tmp_path):
     total, widest = (int(n) for n in _container_sh(gc._REPAIR_JOURNAL, tmp_path, bin_dir).split())
     assert widest <= 400
     assert total <= 20 * 401
+
+
+# End to end: the collector's real container commands, run by a local bash
+# against a scratch HOME standing in for the container.
+
+
+def _local_container(monkeypatch, home):
+    import asyncio
+    import os
+
+    import genesis.guardian.collector as gc
+
+    bin_dir = home / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "journalctl").write_text("#!/bin/bash\nexit 0\n")
+    (bin_dir / "journalctl").chmod(0o755)
+    env = {"HOME": str(home), "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}"}
+    outputs: list[str] = []
+
+    async def run(cmd: str, data: bytes | None) -> tuple[int, str]:
+        proc = await asyncio.create_subprocess_exec(
+            "bash",
+            "-c",
+            cmd,
+            env=env,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(data or b""), timeout=60)
+        outputs.append(out.decode("utf-8", "replace"))
+        return proc.returncode or 0, outputs[-1]
+
+    async def user(container, cmd, timeout=15.0):
+        return await run(cmd, None)
+
+    async def stdin(container, cmd, data, timeout, user="ubuntu"):
+        return await run(cmd, data)
+
+    monkeypatch.setattr(gc, "_incus_exec_user", user)
+    monkeypatch.setattr(gc, "_incus_exec_stdin", stdin, raising=False)
+    return outputs
+
+
+def _write_report(home, name: str, report: dict | None = None, raw: bytes | None = None):
+    d = home / ".genesis" / "deploy-backups" / f"{name}-live-move-repair"
+    d.mkdir(parents=True)
+    (d / "REPAIR.json").write_bytes(raw if raw is not None else json.dumps(report).encode())
+    return d
+
+
+async def test_e2e_older_eligible_report_behind_five_ineligible_is_shown(tmp_path, monkeypatch):
+    import genesis.guardian.collector as gc
+
+    _local_container(monkeypatch, tmp_path)
+    _write_report(tmp_path, _ts(3), _report(ts=_ts(3), result="healed, the older one"))
+    for i in range(5):  # newer, every one ineligible
+        hours = 2 - i * 0.3
+        over = {"result": "superseded"} if i % 2 else {"dismissed_at": "2026-10-21T00:00:00Z"}
+        _write_report(tmp_path, _ts(hours), _report(ts=_ts(hours), **over))
+    text = await gc._collect_live_repair(GuardianConfig())
+    assert "healed, the older one" in text

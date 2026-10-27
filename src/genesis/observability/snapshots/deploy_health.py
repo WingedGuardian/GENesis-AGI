@@ -28,6 +28,9 @@ This snapshot makes that drift visible:
   the behind-count, tier-2 pending and host drift are measured from the
   commit `live` was built on, never HEAD, so a candidate's own files never
   read as undeployed merges
+- ``live_repairs`` — what the live-move repair (scripts/lib/live_move_repair.py)
+  reported after healing a half-written `live` checkout: paths it saved that
+  were not the update's, an unresolved repair
 
 The awareness tick's ``_check_deploy_staleness`` consumes the same collectors
 to raise a dashboard/morning-report observation. Everything is best-effort:
@@ -44,6 +47,7 @@ import os
 import re
 import signal
 import subprocess
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -919,6 +923,72 @@ def live_findings(live: dict | None) -> list[str]:
     return found
 
 
+#: A repair report with no result yet is a repair still running, or one killed
+#: partway; after this long it is the latter.
+REPAIR_UNFINISHED_S = 3600
+
+
+def collect_live_repairs(genesis_home_dir: Path, now: float | None = None) -> dict:
+    """The live-move repair's REPAIR.json reports (scripts/lib/live_move_repair.py):
+    each saved path that was not the update's, with its re-apply step, until its
+    bytes are back in the checkout or the report is dismissed (a newer report's
+    row for a path replaces an older one's); and whether the newest repair is
+    unresolved, or has had no result for REPAIR_UNFINISHED_S (killed partway)."""
+    now = time.time() if now is None else now
+    rows: dict[str, str] = {}
+    unresolved = False
+    for d in sorted((genesis_home_dir / "deploy-backups").glob("*-live-move-repair")):
+        try:
+            m = json.loads((d / "REPAIR.json").read_text(encoding="utf-8"))
+            age = now - (d / "REPAIR.json").stat().st_mtime
+        except (OSError, ValueError, RecursionError):
+            continue
+        if not isinstance(m, dict):
+            continue
+        result = m.get("result")
+        unresolved = (result is None and age > REPAIR_UNFINISHED_S) or str(result).startswith(
+            "unresolved"
+        )
+        unresolved = unresolved and not m.get("dismissed_at")
+        # Shapes as the guardian's collector checks them: a report of the wrong
+        # shape is skipped row by row, never raised (that would blank the snapshot).
+        paths, steps = m.get("paths"), m.get("reapply")
+        paths = [r for r in paths if isinstance(r, dict)] if isinstance(paths, list) else []
+        steps = steps if isinstance(steps, list) else []
+        repo = m.get("repo") if isinstance(m.get("repo"), str) else None
+        foreign = [r for r in paths if r.get("class") == "foreign"]
+        for row, step in zip(foreign, steps, strict=False):
+            path = row.get("path")
+            if not isinstance(path, str) or not isinstance(step, str):
+                continue
+            if m.get("dismissed_at") or _reapplied(d, repo, row):
+                rows.pop(path, None)
+            else:
+                rows[path] = step
+    return {"saved": list(rows.values()), "unresolved": unresolved}
+
+
+def _reapplied(backup: Path, repo: str | None, row: dict) -> bool:
+    """Are the saved bytes back in the checkout (a file the repair copied)?"""
+    saved = row.get("saved_as")
+    if not (isinstance(saved, str) and saved and repo and isinstance(row.get("path"), str)):
+        return False
+    with contextlib.suppress(OSError):
+        a, b = backup / saved, Path(repo) / row["path"]
+        if a.is_file() and not a.is_symlink() and b.is_file() and not b.is_symlink():
+            return a.read_bytes() == b.read_bytes()
+    return False
+
+
+def live_repair_findings(repairs: dict | None) -> list[str]:
+    """The ``live_repair_*`` keys of a :func:`collect_live_repairs` dict."""
+    repairs = repairs or {}
+    found = [f"live_repair_saved:{len(repairs['saved'])}"] if repairs.get("saved") else []
+    if repairs.get("unresolved"):
+        found.append("live_repair_unresolved")
+    return found
+
+
 # Sustained-staleness thresholds (the awareness check's paging axis). A
 # finding-CLASS boundary, so they live here beside derive_findings — the
 # single producer of finding keys — not in the awareness layer: an alert
@@ -938,6 +1008,7 @@ def derive_findings(
     behind_threshold: int = 50,
     main_checkout: dict | None = None,
     live: dict | None = None,
+    live_repairs: dict | None = None,
 ) -> list[str]:
     """Stable, order-deterministic finding keys — the alert/dedup contract.
 
@@ -953,7 +1024,8 @@ def derive_findings(
     ``main_checkout_unreadable`` when that could not be read: never nothing, so
     an unreadable tree cannot clear a standing dirty finding. ``clean``,
     ``not_deploy_root`` and ``deploying`` add nothing. ``live``
-    (:func:`collect_live`) adds the ``live_*`` keys of :func:`live_findings`."""
+    (:func:`collect_live`) adds the ``live_*`` keys of :func:`live_findings`, and
+    ``live_repairs`` (:func:`collect_live_repairs`) the ``live_repair_*`` keys."""
     findings: list[str] = []
     if missing_units:
         findings.append("missing_units:" + ",".join(sorted(missing_units)))
@@ -974,6 +1046,7 @@ def derive_findings(
         findings.append(f"behind_upstream:{commits_behind}")
     findings.extend(main_checkout_findings(main_checkout))
     findings.extend(live_findings(live))
+    findings.extend(live_repair_findings(live_repairs))
     return findings
 
 
@@ -1020,6 +1093,7 @@ def _collect_sync(repo: Path, genesis_home_dir: Path) -> dict:
         "main_checkout": main_checkout,
         "live": live,
         "upto": upto,
+        "live_repairs": collect_live_repairs(genesis_home_dir),
     }
 
 
@@ -1042,6 +1116,7 @@ async def deploy_health(db: aiosqlite.Connection | None) -> dict:
             update_age_days=update.get("age_days"),
             main_checkout=collected["main_checkout"],
             live=collected["live"],
+            live_repairs=collected["live_repairs"],
         )
         return {
             "status": "attention" if findings else "healthy",
@@ -1053,6 +1128,7 @@ async def deploy_health(db: aiosqlite.Connection | None) -> dict:
             "host_gateway": collected["host_gateway"],
             "main_checkout": collected["main_checkout"],
             "live": collected["live"],
+            "live_repairs": collected["live_repairs"],
         }
     except Exception:
         logger.error("deploy_health snapshot failed", exc_info=True)

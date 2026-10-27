@@ -51,7 +51,10 @@ bootstrap_refuse_if_server_live "$@" || exit 3
 UPDATE_STATE="$HOME/.genesis/update_state.json"
 # A second argument "guard": the shared guard's message, printed just before,
 # is the remedy (a half-written checkout, which --post-merge refuses), so the
-# generic one is not added to it.
+# generic one is not added to it. "at-tag": the checkout is at the rollback tag,
+# so on live the repair (scripts/deploy_candidates repair-move) is named too;
+# every other refusal (a merge in progress, the forward "finish with
+# --post-merge" case) is not one the repair heals.
 _crash_recovery_refuse() {
     local _reason="$1" _current_branch _current_head
     _current_branch="$(git -C "$GENESIS_ROOT" symbolic-ref --short -q HEAD 2>/dev/null || true)"
@@ -60,6 +63,9 @@ _crash_recovery_refuse() {
     echo "  Current branch/HEAD: ${_current_branch:-<detached>} @ ${_current_head:-<unreadable>}; rollback tag: ${ROLLBACK_TAG:-<missing>} @ ${rb_commit:-<unresolved>}." >&2
     if [ "${2:-}" != guard ]; then
         echo "  Resolve the checkout, then re-run scripts/bootstrap.sh; or finish forward with scripts/update.sh --post-merge (it refuses a half-written tree; then follow its message); or remove ~/.genesis/update_state.json once decided." >&2
+        if [ "${2:-}" = at-tag ] && [ "${ORIGINAL_BRANCH:-}" = live ]; then
+            echo "  On live, scripts/deploy_candidates repair-move puts a half-written checkout back to the rollback tag (it saves every path it changes first, and says when there is nothing to repair)." >&2
+        fi
     fi
     exit 1
 }
@@ -254,7 +260,7 @@ PY
                     if [ "$_guard_rc" -eq 6 ]; then
                         _crash_recovery_refuse "the update state cannot be finished forward (see above)" guard
                     fi
-                    _crash_recovery_refuse "the update state guard did not clear this state (exit $_guard_rc)"
+                    _crash_recovery_refuse "the update state guard did not clear this state (exit $_guard_rc)" at-tag
                 fi
             fi
             dirty_paths=""

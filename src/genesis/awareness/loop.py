@@ -1727,10 +1727,12 @@ async def _check_deploy_staleness(db) -> None:
         # The drift paragraph (and its update.sh recovery sentence) only when a
         # drift class is present: update.sh REFUSES a dirty deploy checkout, so
         # telling someone to run it for a dirty-only state is wrong advice.
-        if set(classes) - _DEPLOY_CHECKOUT_CLASSES - _DEPLOY_LIVE_CLASSES:
+        if set(classes) - _DEPLOY_CHECKOUT_CLASSES - _DEPLOY_LIVE_CLASSES - _DEPLOY_REPAIR_CLASSES:
             paragraphs.append(_deploy_drift_paragraph(snap, age_days, behind, git_facts))
         if set(classes) & _DEPLOY_LIVE_CLASSES:
             paragraphs.append(_deploy_live_paragraph(snap, findings))
+        if set(classes) & _DEPLOY_REPAIR_CLASSES:
+            paragraphs.append(_deploy_repair_paragraph(snap.get("live_repairs") or {}))
         if "main_checkout_dirty" in classes:
             paragraph = _deploy_checkout_dirty_paragraph(checkout)
             if carried and checkout.get("count") is not None:
@@ -1781,6 +1783,29 @@ _DEPLOY_LIVE_CLASSES = frozenset(
         "live_candidate_tier2",
     }
 )
+
+#: Finding classes from the live-move repair's reports
+#: (deploy_health.live_repair_findings): their own wording, and they never page.
+_DEPLOY_REPAIR_CLASSES = frozenset({"live_repair_saved", "live_repair_unresolved"})
+
+
+def _deploy_repair_paragraph(repairs: dict) -> str:
+    parts: list[str] = []
+    saved = repairs.get("saved") or []
+    if saved:
+        parts.append(
+            f"Genesis put a half-written `live` checkout back to its rollback tag and saved "
+            f"{len(saved)} path(s) that were not the update's (someone's edits). Each "
+            "re-apply step, if they are still wanted: " + " ; ".join(saved) + ". Once "
+            "decided, scripts/deploy_candidates repair-move --dismiss <ts> clears this."
+        )
+    if repairs.get("unresolved"):
+        parts.append(
+            "The last live-move repair did not finish (its REPAIR.json under "
+            "~/.genesis/deploy-backups/ says why); scripts/deploy_candidates repair-move "
+            "runs it again."
+        )
+    return " ".join(parts)
 
 
 def _deploy_drift_paragraph(snap: dict, age_days, behind, git_facts: dict) -> str:

@@ -2064,10 +2064,14 @@ verified: fbb0b6f19 2026-10-21
   `deploy_candidates drop`. The diagnosis snapshot carries the boot repair's
   `live-move repair:` journal lines and a summary of the newest
   `deploy-backups/*-live-move-repair/REPAIR.json` that is neither dismissed
-  nor superseded (6 h window on its own `ts`), JSON-quoted, capped at 2,000
+  nor superseded (6 h window on its own `ts`), chosen inside the container
+  (one `python3 -I -S -` over stdin, as the configured container user, #3627)
+  so newer ineligible reports cannot hide it; JSON-quoted, capped at 2,000
   characters and fenced as untrusted; empty, and the prompt unchanged, when
   there are none. The container reads are bounded where they are produced
-  (regular non-symlink reports, 4 MiB each; journal lines cut to 400), and
+  (one regular report opened without following a symlink, 4 MiB; a newer one
+  over that cap is shown as "report too large", never skipped for an older
+  one; journal lines cut to 400), and
   Telegram alert fields are cut before escaping. Residual: a container that
   fakes git's own output can still pass the probe.
 - **Merged ≠ deployed**: guardian code reaches the host ONLY via
@@ -4172,10 +4176,12 @@ tool-disabled CC probe without changing its schedule or routing authority.
   count there, one anywhere else (the rebuild having moved nothing) `holds`. A "merging"
   row on `live` whose record update.sh already dropped (it adopted the tip,
   own_head is that tip) is judged the same way toward own_head, so a rollback
-  killed partway after adoption is caught too. The remedy follows HEAD: at the
-  tag, put the paths back and Dismiss; at the update's new code (main's merge
-  or the rebuilt tip), put them back and finish with `--post-merge`
-  (Dismissing there leaves code bootstrap never ran on). The dashboard's progress poll returns the guard's remedy
+  killed partway after adoption is caught too. The remedy follows HEAD: on a
+  live row at the tag, the repair (`scripts/deploy_candidates repair-move`,
+  below), then the by-hand steps for when its kit is not installed; at the update's new code (main's merge or the rebuilt tip), put the
+  paths back and finish with `--post-merge` (Dismissing there leaves code
+  bootstrap never ran on); a main row at the tag keeps the by-hand text (save,
+  restore, Dismiss). The dashboard's progress poll returns the guard's remedy
   (`guard_remedy`) and the update card shows it. `deploy_code_only.sh` and the live engine refuse to
   restart or move the checkout while it guards; a plain `update.sh` exits 5
   (before tagging or writing anything), and the dashboard's `/apply` answers
@@ -4265,6 +4271,36 @@ tool-disabled CC probe without changing its schedule or routing authority.
   the exit code agree. Otherwise the run exits 1 and leaves no
   `update_refused.json`.
   The rebuilt tip is recorded in the "merging" row as soon as it is adopted.
+  **The live-move repair** (`scripts/lib/live_move_repair.py`, #3492 PR D1;
+  `scripts/deploy_candidates repair-move [--wait N] [--dismiss TS] [--explain]`
+  runs the copy bootstrap installs under `~/.genesis/lib/live-repair/current`,
+  never the checkout's; installing that kit, and running the repair at every
+  server start, is PR D2, not yet built; `--explain` needs no kit, using the
+  checkout's copy read-only when none is installed) heals a live row's `mixed_tree`
+  with HEAD at the rollback tag, toward the tag, never toward the target (HEAD
+  at the target, a rollback killed partway, is refused with exit 1 and nothing
+  changed: finishing that rollback is a later PR, D1f): under update.lock and
+  genesis-checkout.lock (a stale `index.lock` no process holds is saved and
+  removed), every path of the two-dot diff, plus a symlink or non-directory
+  parent of one (nothing is read or removed through such a parent), that is not at the tag's bytes is COPIED to
+  `~/.genesis/deploy-backups/<ts>-live-move-repair/` (with `REPAIR.json`,
+  fsynced) before anything changes, then restored with `git restore
+  --source=<tag>`. A path holding what the update did not write (another
+  edit, a flag, a staged or unmerged entry, a gitlink) is still saved and
+  restored, and reported with its exact re-apply step. The guard then judges
+  again and only its SAFE removes the state (byte-identical re-read); `guards`
+  or `holds` (an edit off the move's paths) keeps it, its result naming the
+  restore before what still holds, and exits 0; a kept "partial" record is
+  rewritten "moving" (same byte-identical check), so the guard then reads it
+  `holds`, not `mixed_tree` again; anything
+  else is `unresolved` (exit 1). A target whose objects are
+  gone is healed by the whole tree against HEAD and cleared by a clean-tree
+  check. A main row is out of scope (exit 3; 0 at `--boot`). The engine
+  writes its merges with `core.fsync=committed`. The deploy-health collector
+  `collect_live_repairs` reads every `REPAIR.json` into `live_repair_saved:<n>`
+  (until re-applied or `--dismiss`ed; a malformed report is skipped row by
+  row) and `live_repair_unresolved`, worded by the awareness check (never paging), and
+  each repair also queues an alert.
   `--post-merge` on `live` never runs the engine. What is recorded and sent to
   the host guardian is the origin/main commit `live` is built on.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;
