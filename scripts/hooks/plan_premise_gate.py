@@ -56,15 +56,22 @@ from plan_doc import live_section, plan_path, premise_answers, strip_quoted  # n
 _REPO_PATH = re.compile(
     r"(?<![\w./~-])(?:\./)?(?:src|scripts|tests|\.claude|docs|config|\.github)/[\w./-]*\w\.[A-Za-z]{1,5}\b"
 )
-#: No answer at all: a placeholder, not a wrong answer. ``n/a`` alone (or with a
-#: dangling dash) is empty; ``n/a — <reason>`` is an answer. The issue form renders
-#: an empty field as ``_No response_``. An answer that is only an unfilled template
-#: slot (``<the caller>``) is empty too, without a rule here: CommonMark reads such a
-#: line as an HTML block, which ``strip_quoted`` blanks.
+#: No answer at all: a placeholder, not a wrong answer. Matched on the answer's
+#: RENDERED text (``premise_answers``), so ``**N/A**`` and `` `n/a` `` read as
+#: ``N/A``. ``n/a`` alone (or with a dangling dash) is empty; ``n/a — <reason>`` is
+#: an answer. The issue form's empty field, ``_No response_``, renders as
+#: ``No response``.
 _EMPTY = re.compile(
-    r"^(?:_no response_|n/?a[.:]?(?:\s*[—–-]+)?|none\.?|tbd\.?|todo\.?|\?+|-+|—+|\.+|…)?$",
+    r"^(?:_?no response_?"
+    r"|(?:n/?a|n\.a\.|none|tbd|todo|not applicable)[.:]?(?:\s*[—–-]+)?"
+    r"|\?+|[-—–\s]+|\.+|…)?$",
     re.IGNORECASE,
 )
+#: An unfilled template slot such as ``<caller named and tracked, or why there is
+#: none>``, the block message's own remedy text. CommonMark drops a slot that parses
+#: as an HTML tag, but one with commas or other non-attribute text stays literal, so
+#: it is removed here rather than left to that accident.
+_PLACEHOLDER = re.compile(r"<[^<>\n]*>")
 #: A safety bound, not a corpus figure: the largest plan on the measuring install
 #: was 786 KB (checked in 1.3 s), so 8 MB leaves room for any real plan while
 #: refusing a runaway file. Over it, the payload's own plan text is used instead.
@@ -109,7 +116,15 @@ def _read_regular(path: Path) -> str:
 
 
 def _empty(answer: str) -> bool:
-    return bool(_EMPTY.match(answer.strip()))
+    return bool(_EMPTY.match(_PLACEHOLDER.sub("", answer).replace("\u200b", "").strip()))
+
+
+def _problem(n: int, question: str, answer: str) -> str:
+    """Why answer ``n`` does not count. An answer written INSIDE the template's
+    brackets reads as a placeholder; say so, rather than call written text empty."""
+    if answer.strip() and not _EMPTY.match(answer.replace("\u200b", "").strip()):
+        return f"answer {n} ({question}) is only a <placeholder>: replace it, brackets included"
+    return f"answer {n} ({question}) is missing or empty"
 
 
 def _check(payload: dict) -> int:
@@ -122,7 +137,7 @@ def _check(payload: dict) -> int:
         problems = ["the plan has no `## Premise checks` section"]
     else:
         problems = [
-            f"answer {n} ({question}) is missing or empty"
+            _problem(n, question, answers.get(n, ""))
             for n, question in enumerate(_QUESTIONS, start=1)
             if _empty(answers.get(n, ""))
         ]

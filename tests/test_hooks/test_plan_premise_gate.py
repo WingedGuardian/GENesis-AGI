@@ -375,3 +375,117 @@ def test_a_device_plan_path_is_not_read(home: Path) -> None:
         },
     )
     assert r.returncode == 0, r.stderr
+
+
+_HEAD = "# Fix\n\nEdit `scripts/x.py`.\n\n## Premise checks\n"
+
+
+def test_a_trailing_list_cannot_fill_a_missing_answer(home: Path) -> None:
+    plan = _HEAD + "1. a\n2. b\n4. d\n5. e\n6. f\n\nOpen items:\n1. still to do\n"
+    r = _run(home, plan)
+    assert r.returncode == 2
+    assert "answer 3 (" in r.stderr
+
+
+def test_a_preamble_list_cannot_shift_empty_answers_away(home: Path) -> None:
+    plan = _HEAD + "Checked:\n1. x\n2. y\n\nAnswers:\n1. a\n2. b\n3. c\n4. d\n5.\n6.\n"
+    r = _run(home, plan)
+    assert r.returncode == 2
+    assert "answer 5 (" in r.stderr and "answer 6 (" in r.stderr
+
+
+@pytest.mark.parametrize("decorated", ["**N/A**", "`n/a`", "_TBD_", "*?*", "[](https://example.com)"])
+def test_an_answer_that_renders_empty_is_empty(home: Path, decorated: str) -> None:
+    plan = _COMPLETE.replace("6. Shape: about 200 counted lines, one PR.", f"6. {decorated}")
+    r = _run(home, plan)
+    assert r.returncode == 2
+    assert "answer 6 (" in r.stderr
+
+
+def test_a_link_with_text_is_an_answer(home: Path) -> None:
+    plan = _COMPLETE.replace("6. Shape: about 200 counted lines, one PR.", "6. [the shape note](https://example.com)")
+    assert _run(home, plan).returncode == 0
+
+
+def test_the_remedy_template_copied_verbatim_is_six_empty_answers(home: Path) -> None:
+    first = _run(home, "# Fix\n\nEdit `src/genesis/x.py`.\n")
+    template = first.stderr.split("## Premise checks\n", 1)[1].split("\n\n", 1)[0]
+    plan = _HEAD + "\n".join(line.strip() for line in template.splitlines()) + "\n"
+    r = _run(home, plan)
+    assert r.returncode == 2
+    assert sum(line.startswith("  - answer ") for line in r.stderr.splitlines()) == 6
+
+
+def test_a_block_writes_nothing_on_stdout(home: Path) -> None:
+    r = _run(home, "# Fix\n\nEdit `src/genesis/x.py`.\n")
+    assert r.returncode == 2
+    assert r.stdout == ""
+
+
+def test_a_longer_list_after_the_next_heading_is_not_the_answers(home: Path) -> None:
+    steps = "".join(f"{n}. step {n}\n" for n in range(1, 9))
+    plan = _HEAD + "1. a\n2. b\n3. c\n\n## Steps\n" + steps
+    r = _run(home, plan)
+    assert r.returncode == 2
+    assert "answer 4 (" in r.stderr
+
+
+def test_a_short_preamble_list_does_not_hide_full_answers(home: Path) -> None:
+    body = _COMPLETE.split("## Premise checks\n", 1)[1]
+    plan = _HEAD + "Checked first:\n1. the reader\n2. the gate\n\nAnswers:\n" + body
+    assert _run(home, plan).returncode == 0, "the six-item list is the answers"
+
+
+def test_answer_text_joins_continuation_lines_with_a_space() -> None:
+    from tests.conftest import private_module
+
+    doc = private_module("plan_doc_text", _HOOK.parent / "plan_doc.py")
+    answers = doc.premise_answers("## Premise checks\n1. Shape:\n   about 200 lines\n")
+    assert answers == {1: "Shape: about 200 lines"}
+
+
+_FULL = "".join(f"{n}. answer {n}\n" for n in range(1, 7))
+
+
+@pytest.mark.parametrize(
+    "split",
+    ["\nEvidence: x\n\n", "\n---\n\n", "\n> a quoted note\n\n", ")"],
+    ids=["paragraph", "rule", "blockquote", "delimiter-change"],
+)
+def test_answers_split_into_several_lists_all_count(home: Path, split: str) -> None:
+    if split == ")":
+        body = "1. answer 1\n2. answer 2\n3. answer 3\n4) answer 4\n5) answer 5\n6) answer 6\n"
+    else:
+        body = "1. answer 1\n2. answer 2\n3. answer 3\n" + split + "4. answer 4\n5. answer 5\n6. answer 6\n"
+    assert _run(home, _HEAD + body).returncode == 0
+
+
+def test_a_longer_steps_list_in_the_section_cannot_replace_empty_answers(home: Path) -> None:
+    steps = "".join(f"{n}. step {n}\n" for n in range(1, 9))
+    plan = _HEAD + _FULL.replace("6. answer 6", "6.") + "\nSteps:\n" + steps
+    r = _run(home, plan)
+    assert r.returncode == 2
+    assert "answer 6 (" in r.stderr
+
+
+def test_a_long_list_under_a_subheading_cannot_replace_empty_answers(home: Path) -> None:
+    evidence = "".join(f"{n}. evidence {n}\n" for n in range(1, 8))
+    plan = _HEAD + _FULL.replace("6. answer 6", "6. TBD") + "\n### Evidence\n" + evidence
+    r = _run(home, plan)
+    assert r.returncode == 2
+    assert "answer 6 (" in r.stderr
+
+
+def test_an_answer_written_inside_the_brackets_is_named_as_a_placeholder(home: Path) -> None:
+    plan = _COMPLETE.replace("4. Caller: adopt_first_gate, tracked by #42.", "4. <caller: adopt_first_gate, tracked by #42>")
+    r = _run(home, plan)
+    assert r.returncode == 2
+    assert "answer 4 (" in r.stderr and "only a <placeholder>" in r.stderr
+
+
+@pytest.mark.parametrize("empty", ["none —", "TBD:", "N.A.", "not applicable", "– –", "\u200b"])
+def test_more_placeholder_spellings_are_empty(home: Path, empty: str) -> None:
+    plan = _COMPLETE.replace("5. Numbers: 66 plans, counted by the replay script.", f"5. {empty}")
+    r = _run(home, plan)
+    assert r.returncode == 2
+    assert "answer 5 (" in r.stderr

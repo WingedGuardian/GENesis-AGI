@@ -208,14 +208,20 @@ def premise_answers(text: str) -> dict[int, str] | None:
     heading shown inside an example does not count. Read AS IT RENDERS, like the
     rest of this module: the section runs from the first heading titled "Premise
     check(s)" or "Premise question(s)" to the next heading of the same or a higher
-    level, and its answers are the items of its top-level ordered lists. An item
-    nested inside an answer is part of that answer, never an answer of its own, and
-    text after a list belongs to no answer.
-
-    Answers are keyed by the number written on each item when those numbers are
-    all distinct, so "1. 2. 4." reports answer 3 missing; an autonumbered list
-    ("1. 1. 1.", which CommonMark renders as 1, 2, 3) is keyed by position. Each
-    answer's text is its item's source text, joined.
+    level (a deeper subheading stays inside it). Its answers are the items of its
+    top-level ordered lists. Each list is keyed ON ITS OWN, by the numbers written
+    on its items when they are all distinct, or by position when the list is
+    autonumbered ("1. 1. 1.", which CommonMark renders as 1, 2, 3), so one list's
+    numbering never renumbers another's. The keys are then pooled and the FIRST
+    list carrying a number supplies that answer. So answers split into several
+    lists by a paragraph, a rule or a blockquote still all count, a trailing
+    "open items" list cannot replace an answer given earlier, and "1. 2. 4." with
+    nothing else reports answer 3 missing. A list that only supplies a number the
+    answers lack does fill it: this reads structure, not intent. An item nested
+    inside an answer is part of that answer, never an answer of its own. Each
+    answer's text is what the item RENDERS as: emphasis and code markers dropped,
+    inline HTML (a ``<placeholder>`` CommonMark reads as a tag) dropped, link text
+    kept, line breaks as spaces. So ``**N/A**`` reads as ``N/A``.
     """
     parsed = _blocks(text)
     if parsed is None:
@@ -229,24 +235,39 @@ def premise_answers(text: str) -> dict[int, str] | None:
             break
     if start is None:
         return None
-    items: list[tuple[str, list[str]]] = []
+    lists: list[list[tuple[str, list[str]]]] = []
     current: list[str] | None = None
     for tok in tokens[start + 1 :]:
         if tok.type == "heading_open" and tok.level == 0 and int(tok.tag[1:]) <= depth:
             break
-        if tok.type == "list_item_open" and tok.level == 1 and tok.markup in (".", ")"):
+        if tok.type == "ordered_list_open" and tok.level == 0:
+            lists.append([])
+        elif tok.type == "list_item_open" and tok.level == 1 and lists and tok.markup in (".", ")"):
             current = []
-            items.append((tok.info, current))
+            lists[-1].append((tok.info, current))
         elif tok.type == "list_item_close" and tok.level == 1:
             current = None
         elif tok.type == "inline" and current is not None:
-            current.append(tok.content.strip())
-    written = [info for info, _ in items]
-    by_number = all(n.isdigit() for n in written) and len(set(written)) == len(written)
-    return {
-        (int(info) if by_number else pos): " ".join(p for p in parts if p)
-        for pos, (info, parts) in enumerate(items, start=1)
-    }
+            current.append(_rendered_text(tok))
+    answers: dict[int, str] = {}
+    for items in lists:
+        written = [info for info, _ in items]
+        by_number = all(n.isdigit() for n in written) and len(set(written)) == len(written)
+        for pos, (info, parts) in enumerate(items, start=1):
+            answers.setdefault(int(info) if by_number else pos, " ".join(p for p in parts if p))
+    return answers
+
+
+def _rendered_text(inline) -> str:
+    """An inline token as it reads rendered: text, code and link text kept,
+    emphasis markers and inline HTML dropped, line breaks as spaces."""
+    out = []
+    for child in inline.children or []:
+        if child.type in ("text", "code_inline"):
+            out.append(child.content)
+        elif child.type in ("softbreak", "hardbreak"):
+            out.append(" ")
+    return "".join(out).strip()
 
 
 def _premise_answers_by_line(text: str) -> dict[int, str] | None:
