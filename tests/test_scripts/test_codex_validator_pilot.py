@@ -3,7 +3,7 @@
 import copy
 import json
 import os
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from types import SimpleNamespace
 from xml.etree.ElementTree import Element, SubElement, tostring
@@ -375,7 +375,7 @@ def test_dispatch_requires_workspace(pilot):
         runner.execute({"version": 1, "operation": "pilot_packet"})
 
 
-@pytest.mark.parametrize("ending", ["timeout", "cancel", "repeat_cancel"])
+@pytest.mark.parametrize("ending", ["timeout", "cancel", "repeat_cancel", "creation"])
 def test_recipe_shutdown_allows_governor_to_stop_separate_child(pilot, tmp_path, monkeypatch, ending):
     import asyncio
     import signal
@@ -402,8 +402,12 @@ def test_recipe_shutdown_allows_governor_to_stop_separate_child(pilot, tmp_path,
         async with asyncio.timeout(5):
             while not ready.exists():
                 await asyncio.sleep(0.01)
+            # "creation": the cancel lands before the handle is returned.
+            while ending == "creation" and not release.exists():
+                await asyncio.sleep(0.01)
         return proc
 
+    release = tmp_path / "release"
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fixture_governor)
     monkeypatch.setattr(pilot, "PROBE_TIMEOUT", 0.1 if ending == "timeout" else 10)
 
@@ -418,6 +422,9 @@ def test_recipe_shutdown_allows_governor_to_stop_separate_child(pilot, tmp_path,
             if ending == "repeat_cancel":
                 await asyncio.sleep(0.02)
                 task.cancel()
+            if ending == "creation":
+                await asyncio.sleep(0.02)
+                release.touch()
         with pytest.raises(TimeoutError if ending == "timeout" else asyncio.CancelledError):
             await task
         assert launched[0].returncode == 143
@@ -510,3 +517,124 @@ def test_fixed_recipe_child_environment_bounds_and_cleanup(pilot, tmp_path, monk
         "pytest",
         *pilot.RECIPES["queue_snapshot"][0],
     ]
+
+
+def _custom_handler(signum, frame):
+    pass
+
+
+@pytest.mark.parametrize("prior", ["default", "ignore", "custom"])
+@pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+def test_recipe_run_restores_the_prior_sigterm_handler(
+    pilot, tmp_path, monkeypatch, prior, outcome
+):
+    import asyncio
+    import signal
+
+    handlers = {"default": signal.SIG_DFL, "ignore": signal.SIG_IGN, "custom": _custom_handler}
+    handler = handlers[prior]
+
+    async def run(*args):
+        assert signal.getsignal(signal.SIGTERM) != handler
+        if outcome == "cancel":
+            raise asyncio.CancelledError
+        if outcome == "error":
+            raise ValueError("fixture refused")
+        return b"results"
+
+    monkeypatch.setattr(pilot, "_run_recipe", run)
+    original = signal.signal(signal.SIGTERM, handler)
+    try:
+        if outcome == "success":
+            assert pilot._run_recipe_bounded(ROOT, "queue_snapshot", tmp_path) == b"results"
+        else:
+            with pytest.raises(asyncio.CancelledError if outcome == "cancel" else ValueError):
+                pilot._run_recipe_bounded(ROOT, "queue_snapshot", tmp_path)
+        assert signal.getsignal(signal.SIGTERM) == handler
+    finally:
+        signal.signal(signal.SIGTERM, original)
+
+
+_PROBE_PARENT = r"""
+import asyncio, json, pathlib, signal, sys
+cfg = json.loads(sys.argv[1])
+sys.path[:0] = cfg["paths"]
+import codex_validator_pilot as pilot
+root = pathlib.Path(cfg["scratch"])
+actual_create = asyncio.create_subprocess_exec
+async def governor(*argv, **kwargs):
+    proc = await actual_create(sys.executable, "-I", "-c", cfg["body"], cfg["ready"], **kwargs)
+    (root / "governor.pid").write_text(str(proc.pid))
+    return proc
+asyncio.create_subprocess_exec = governor
+prior = signal.getsignal(signal.SIGTERM)
+try:
+    pilot._run_recipe_bounded(pathlib.Path(cfg["runtime"]), "queue_snapshot", root / "scratch")
+except asyncio.CancelledError:
+    assert signal.getsignal(signal.SIGTERM) == prior
+    print("cancelled", flush=True)
+else:
+    raise AssertionError("Interrupted recipe returned normally")
+"""
+
+
+def test_real_sigterm_stops_the_recipe_through_the_governor(tmp_path):
+    """A SIGTERM to the request process mid-batch stops the group, never orphans it."""
+    import json
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    ready = tmp_path / "job.pid"
+    body = (
+        "import pathlib,signal,subprocess,sys,time\n"
+        "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)'],start_new_session=True)\n"
+        "def stop(*args):\n"
+        " child.terminate();child.wait(timeout=5);raise SystemExit(143)\n"
+        "signal.signal(signal.SIGTERM,stop)\n"
+        "pending=pathlib.Path(sys.argv[1]).with_suffix('.pending')\n"
+        "pending.write_text(str(child.pid));pending.replace(sys.argv[1])\n"
+        "time.sleep(30)\n"
+    )
+    (tmp_path / "scratch").mkdir()
+    cfg = {
+        "paths": [str(ROOT / "scripts"), str(ROOT / "src")],
+        "scratch": str(tmp_path),
+        "runtime": str(ROOT),
+        "body": body,
+        "ready": str(ready),
+    }
+    parent = subprocess.Popen(
+        [sys.executable, "-I", "-c", _PROBE_PARENT, json.dumps(cfg)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    governor_file = tmp_path / "governor.pid"
+    job = governor = None
+    stopped = False
+    try:
+        deadline = time.monotonic() + 10
+        while not (ready.exists() and governor_file.exists()):
+            assert parent.poll() is None, parent.communicate(timeout=5)
+            assert time.monotonic() < deadline, "fixture governor never started its job"
+            time.sleep(0.01)
+        job = int(ready.read_text())
+        governor = int(governor_file.read_text())
+        parent.send_signal(signal.SIGTERM)
+        stdout, stderr = parent.communicate(timeout=15)
+        assert parent.returncode == 0 and stdout == b"cancelled\n", stderr
+        for pid in (governor, job):
+            with pytest.raises(ProcessLookupError):
+                os.kill(pid, 0)
+        stopped = True
+    finally:
+        if parent.poll() is None:
+            os.killpg(parent.pid, signal.SIGKILL)
+            parent.communicate(timeout=5)
+        # Only a failed run can leave them; never signal a pid proven gone (reuse).
+        for pid in () if stopped else (job, governor):
+            if pid:
+                with suppress(ProcessLookupError):
+                    os.kill(pid, signal.SIGKILL)

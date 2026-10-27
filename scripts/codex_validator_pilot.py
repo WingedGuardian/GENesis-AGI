@@ -16,7 +16,7 @@ import signal
 import stat
 import tempfile
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -218,6 +218,36 @@ async def _stop_recipe(proc):
         await reap_bounded(proc)
 
 
+async def _finish_stop(proc):
+    # Finish bounded shutdown even if the caller cancels again. Never detach cleanup.
+    stopping = tracked_task(_stop_recipe(proc), name="codex-validator-probe-stop")
+    while not stopping.done():
+        try:
+            await asyncio.shield(stopping)
+        except asyncio.CancelledError:
+            continue
+    stopping.result()
+
+
+async def _spawn_recipe(argv: list[str], **kwargs):
+    # A cancel can land after the child exists but before its handle returns.
+    # Creation runs on under the shield, so the handle is recovered and the
+    # group stopped through _stop_recipe (TERM first, which the governor
+    # forwards to its job) before the cancel propagates.
+    # Not tracked_task: its failure log would reach the request CLI's stderr,
+    # which carries only the static refusal. Always awaited to completion below.
+    creation = asyncio.ensure_future(asyncio.create_subprocess_exec(*argv, **kwargs))
+    try:
+        return await asyncio.shield(creation)
+    except BaseException:
+        while not creation.done():
+            with suppress(BaseException):
+                await asyncio.shield(creation)
+        if not creation.cancelled() and creation.exception() is None:
+            await _finish_stop(creation.result())
+        raise
+
+
 async def _run_recipe(runtime: Path, recipe: str, scratch: Path) -> bytes:
     env = child_environment()
     install_home = Path(env["HOME"])
@@ -254,8 +284,8 @@ async def _run_recipe(runtime: Path, recipe: str, scratch: Path) -> bytes:
         "-q",
         f"--junitxml={junit}",
     ]
-    proc = await asyncio.create_subprocess_exec(
-        *argv,
+    proc = await _spawn_recipe(
+        argv,
         cwd=runtime,
         env=env,
         stdin=asyncio.subprocess.DEVNULL,
@@ -278,16 +308,29 @@ async def _run_recipe(runtime: Path, recipe: str, scratch: Path) -> bytes:
             raise ValueError("Pilot results exceed their limit")
         return raw
     except BaseException:
-        # Finish bounded shutdown even if the caller cancels again, then
-        # propagate the original failure/cancellation. Never detach cleanup.
-        stopping = tracked_task(_stop_recipe(proc), name="codex-validator-probe-stop")
-        while not stopping.done():
-            try:
-                await asyncio.shield(stopping)
-            except asyncio.CancelledError:
-                continue
-        stopping.result()
+        # Stop the group, then propagate the original failure/cancellation.
+        await _finish_stop(proc)
         raise
+
+
+async def _run_recipe_scoped(runtime: Path, recipe: str, scratch: Path) -> bytes:
+    # SIGTERM becomes a cancellation, so the batch stops through _stop_recipe
+    # and the request CLI refuses with exit 2 instead of dying mid-batch.
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGTERM, asyncio.current_task().cancel)
+    try:
+        return await _run_recipe(runtime, recipe, scratch)
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
+
+
+def _run_recipe_bounded(runtime: Path, recipe: str, scratch: Path) -> bytes:
+    prior = signal.getsignal(signal.SIGTERM)
+    try:
+        return asyncio.run(_run_recipe_scoped(runtime, recipe, scratch))
+    finally:
+        # Loop removal/close resets SIGTERM to SIG_DFL; restore only after it.
+        signal.signal(signal.SIGTERM, prior)
 
 
 def measured_cases(raw: bytes, recipe: str) -> list[str]:
@@ -363,7 +406,7 @@ def probe(workspace: Path, runtime: Path, pr: int) -> dict:
         sync_directory(directory)
         with tempfile.TemporaryDirectory(prefix="probe-", dir=workspace / ".codex") as temporary:
             cases = measured_cases(
-                asyncio.run(_run_recipe(runtime, row["recipe"], Path(temporary))), row["recipe"]
+                _run_recipe_bounded(runtime, row["recipe"], Path(temporary)), row["recipe"]
             )
         after = bound_state(runtime, config, row, token=before["bracket"])
         receipt = {

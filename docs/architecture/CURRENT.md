@@ -4486,9 +4486,11 @@ verified: 3e27b479 2026-10-23
   cancellation through owned-child cleanup. The request CLI sanitizes cancellation;
   these observations are not functional verdicts. `pilot_packet` and `pilot_probe`
   use launch-owned private configuration, fixed source-bound fixture recipes,
-  strict case counts, a private operation mutex, and finite shared
-  deployment-lock brackets. Probe receipts describe fixture coverage, not live
-  production behavior. Resource admission uses installation policy while test
+  strict case counts, a private operation mutex, finite shared deployment-lock
+  brackets, and the same scoped SIGTERM cancellation (the governor's group is
+  stopped TERM-first, including during creation). Probe receipts describe
+  fixture coverage, not live production behavior. Resource admission uses
+  installation policy while test
   children use a private home and the installation pytest lock. Request creation
   and retirement
   use the admitted workspace patch path. Verification recording and publication

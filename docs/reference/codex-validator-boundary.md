@@ -158,7 +158,13 @@ and exact pytest case counts. Probes serialize on the private operation lock,
 hold the existing deployment lock shared during the finite batch, and verify
 serving identity before and after it. The resource governor uses the real
 installation policy; test children use a private home while retaining the
-installation's pytest lock. A failed attempted batch retires its prior receipt.
+installation's pytest lock. The batch scopes SIGTERM to task cancellation the
+same way: a SIGTERM delivered during the batch, or a cancellation during process
+creation or collection, gives the owned group SIGTERM first (the governor
+forwards it to its separately scoped job), then a group kill and a bounded reap,
+and the request CLI refuses with exit 2. A SIGTERM after the batch's loop has
+closed takes the prior handler's action, as on the serving path. A failed
+attempted batch retires its prior receipt.
 Completed receipts are atomically published in the private workspace and state
 the limits of the disposable fixtures. They do not prove live provider or queue
 behavior. Forced preview and launcher activation remain separate work.
