@@ -1699,11 +1699,11 @@ async def _save_stage(flow, ppage, args, save, top, title, label, pay, hooks, fi
     code = await _save_stage_inner(
         flow, ppage, args, save, top, title, label, pay, hooks, fields, consents
     )
+    if flow.url_blocked or flow.url_leaked:
+        code = _typing_outcome(flow)
     with contextlib.suppress(Exception):  # a log line, never a reason to stop
         new = sorted({_frame_origin(f.url) for f in list(ppage.frames) if f.url not in before})
         logger.warning("payment save stage ended %s; new frames: %s", code or "ok", new or "none")
-    if flow.url_blocked or flow.url_leaked:
-        return _typing_outcome(flow)
     return code
 
 
