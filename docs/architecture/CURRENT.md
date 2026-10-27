@@ -273,7 +273,16 @@ Acceptance: 400 live roots replayed through both stores, 0 node-set differences.
 The FalkorDB projection is rebuilt hourly by `genesis-graph-project.timer`
 (`memory/graphstore_project.py`); that schedule is its staleness bound, and an
 engine restart leaves no projection until the next run (the engine keeps no data
-on disk). At runtime only `graph.traverse()` READS the engine (the projector
+on disk). Before the swap, the projector runs the callers' own traversal and
+marker queries on the new graph (`graphstore_falkor._WARM_TRAVERSALS`) and prints
+the outcome (`warm-up: ...`) in the unit's journal. Engine time for the first
+read of a freshly projected graph was 52-358 ms where later reads took 1-3.5 ms,
+and each read timeout recorded from 2026-10-21 to 2026-10-26 was that first read
+during a container I/O stall; with the warm-up the first read took 1.2-2.9 ms in
+15 of 15 test runs. A warm-up that fails logs a warning and publishes the graph
+cold.
+
+ At runtime only `graph.traverse()` READS the engine (the projector
 writes it, the health probe pings it): its callers are `memory_recall`
 enrichment (MCP, and genesis-server's tool API), `memory_expand`, and
 `drift_recall` (MCP drift mode and the ambient worker). Recall's own graph step (`graph_expansion.py`) reads

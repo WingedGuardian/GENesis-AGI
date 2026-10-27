@@ -238,6 +238,34 @@ _PUBLISH_LOCK_TTL_S = 300
 #: edges/s, a 9.06s full projection of 68,064 nodes / 236,937 edges.
 _PROJECT_BATCH = 10_000
 
+#: The reads a projection runs on its STAGING graph before the swap, so that no
+#: caller's read is the first one. MEASURED 2026-10-26 (FalkorDB 4.20.4, 106k
+#: nodes / 406k edges; engine time from SLOWLOG): the first traversal of a
+#: freshly projected graph took 52-64 ms on an idle box, up to 146 ms under
+#: added load, and up to 358 ms on a live install, almost all of it in the
+#: Filter and end-node operators the first time they evaluated a path's
+#: properties; reads after it took 1-3.5 ms. All four read timeouts recorded
+#: there from 2026-10-21 to 2026-10-26 were that first read, each with 24-293 ms
+#: of container I/O stall recorded across its wait. With this warm-up the
+#: first live read took 1.2-2.9 ms in 15 of 15 runs at both depths: the warmth
+#: and the per-graph plan cache survive the RENAME. A warm-up with different
+#: query text left about 12 ms, so the texts must be the callers' own.
+#:
+#: Each pair is a (depth, min_strength) a caller passes: `memory_recall` and
+#: `memory_expand` traverse at (2, 0.3), `drift_recall` at (1, 0.5). The depth is
+#: part of the query TEXT, so each one is its own plan-cache entry.
+_WARM_TRAVERSALS = ((2, 0.3), (1, 0.5))
+#: The root's edge must pass every threshold above, or the walk stops before the
+#: operators that carry the cost see a row and warms nothing.
+_WARM_MIN_STRENGTH = max(s for _d, s in _WARM_TRAVERSALS)
+#: The whole warm-up's bound. It is only an optimisation, so a slow or hung
+#: engine costs the projection this much and never `_PROJECT_TIMEOUT_S` per read.
+_WARM_TIMEOUT_S = 5.0
+
+#: The empty-result path's second query (`_assert_projection_exists`), shared
+#: with the warm-up so the two texts cannot drift apart.
+_PROJECTION_MARKER_COUNT = "MATCH (m:ProjectionMeta) RETURN count(m)"
+
 # Hop-wise validity, over the properties the projection mirrors. Mirrors the
 # SQLite predicate in `graphstore.invalid_memory_ids` -- a non-zero deprecated
 # hides, a NULL invalid_at never expires, and a memory with no metadata row at
@@ -744,6 +772,81 @@ class FalkorGraphStore:
                 "graph rolled backwards is not."
             )
 
+    async def _warm(
+        self,
+        staging: str,
+        edges: list[tuple[str, str, str, float | None]],
+        meta: dict[str, tuple[float | None, int]],
+        now: float,
+    ) -> str:
+        """Run the callers' own queries on ``staging``, so no caller's read is the
+        first (see `_WARM_TRAVERSALS`). Returns one line for the projector's own
+        output, which is what the hourly unit's journal keeps.
+
+        Never raises an ``Exception``: a failed warm-up publishes a cold graph,
+        which is what every projection did before. A cancellation still
+        propagates, so the caller's cleanup drops staging.
+
+        The root comes from the edges already in hand rather than from a query:
+        the first edge strong enough for every threshold whose two ends are both
+        visible. From any other root the traversal's own predicate stops the walk
+        before the operators that carry the cost see a row, and the warm-up would
+        succeed while warming nothing.
+        """
+        started = time.monotonic()
+        deadline = started + _WARM_TIMEOUT_S
+        root = None
+        rows: list[int] = []
+        try:
+            # Inside the try: a strength stored as TEXT (the column has no
+            # CHECK) would raise here, and an optimisation must never cost the
+            # projection it serves.
+            root = next(
+                (
+                    s
+                    for s, t, _ty, st in edges
+                    if isinstance(st, (int, float))
+                    and st >= _WARM_MIN_STRENGTH
+                    and not _is_hidden(meta.get(s), now)
+                    and not _is_hidden(meta.get(t), now)
+                ),
+                None,
+            )
+            if root is not None:
+                for depth, min_strength in _WARM_TRAVERSALS:
+                    result = await self._query(
+                        _TRAVERSE.replace("{depth}", str(depth)),
+                        {
+                            "root": root,
+                            "min_strength": min_strength,
+                            "now": now,
+                            "include_deprecated": False,
+                        },
+                        key=staging,
+                        timeout=max(0.0, deadline - time.monotonic()),
+                    )
+                    rows.append(len(result.result_set or []))
+            await self._query(
+                _PROJECTION_MARKER_COUNT,
+                {},
+                key=staging,
+                timeout=max(0.0, deadline - time.monotonic()),
+            )
+        except Exception as exc:
+            ms = (time.monotonic() - started) * 1000
+            logger.warning(
+                "falkordb: warming the new projection failed after %.0f ms; "
+                "publishing it cold, so the first read after the swap pays the "
+                "warm-up instead",
+                ms,
+                exc_info=True,
+            )
+            return f"FAILED after {ms:.0f} ms ({type(exc).__name__}); published cold"
+        ms = (time.monotonic() - started) * 1000
+        if root is None:
+            return f"marker only in {ms:.0f} ms: no edge qualified as a root"
+        return f"warmed in {ms:.0f} ms (traversal rows {rows})"
+
     # ── GraphStore protocol ───────────────────────────────────────────
 
     async def traverse(
@@ -931,9 +1034,7 @@ class FalkorGraphStore:
                 }
                 raise err
         with _labelled("marker"):
-            result = await self._query(
-                "MATCH (m:ProjectionMeta) RETURN count(m)", {}, timeout=timeout
-            )
+            result = await self._query(_PROJECTION_MARKER_COUNT, {}, timeout=timeout)
         rows = result.result_set or []
         if not (rows and rows[0] and rows[0][0]):
             raise GraphUnavailableError(
@@ -1000,7 +1101,7 @@ class FalkorGraphStore:
 
     # ── projection ────────────────────────────────────────────────────
 
-    async def project(self, db: aiosqlite.Connection) -> dict[str, int]:
+    async def project(self, db: aiosqlite.Connection) -> dict[str, int | str]:
         """Rebuild the whole projection from ``memory_links``. Explicit, not scheduled.
 
         Automated since F3 slice 1: `genesis-graph-project.timer` calls the
@@ -1140,7 +1241,7 @@ class FalkorGraphStore:
 
     async def _project_locked(
         self, db: aiosqlite.Connection, token: str | None
-    ) -> dict[str, int]:
+    ) -> dict[str, int | str]:
         """The body of `project()`, run under its per-key lock."""
         # ONE SNAPSHOT for both reads. These are two statements, and in
         # autocommit each takes its own WAL read snapshot — so a writer
@@ -1285,6 +1386,9 @@ class FalkorGraphStore:
                 key=staging,
                 timeout=_PROJECT_TIMEOUT_S,
             )
+            # After the marker, so the marker count is warmed against the graph
+            # that will be published; before the swap, so no caller pays it.
+            warm = await self._warm(staging, edges, meta, now)
 
             try:
                 await self._publish_swap(staging, token)
@@ -1318,7 +1422,7 @@ class FalkorGraphStore:
             raise
 
         hidden = sum(1 for mid in ids if _is_hidden(meta.get(mid), now))
-        return {"nodes": len(ids), "edges": len(edges), "hidden": hidden}
+        return {"nodes": len(ids), "edges": len(edges), "hidden": hidden, "warm": warm}
 
     async def _ensure_index(self, *, key: str | None = None) -> None:
         """Create the id index if it is not already there.

@@ -699,7 +699,9 @@ async def test_two_projections_of_one_key_never_interleave(tmp_path):
             if "CREATE INDEX" in cypher:
                 order.append(f"{self._tag}:start")
                 await _asyncio.sleep(0.05)  # a window for the other run to barge in
-            elif "ProjectionMeta" in cypher:
+            elif cypher == falkor_mod._PROJECTION_MARKER_COUNT:
+                # The warm-up's last read, so the bracket covers the whole build
+                # up to the swap, the warm-up included.
                 order.append(f"{self._tag}:end")
             return object()
 
@@ -2054,3 +2056,210 @@ async def test_an_unreadable_pool_never_costs_the_diagnosis(tmp_path):
     diag = await _timed_out_diag(store)
     assert (diag["conn"], diag["in_use"]) == (None, None)
     assert diag["frames"]
+
+
+
+
+# ── the first read after a projection ──────────────────────────────────────
+# MEASURED 2026-10-26 (engine time): the first traversal of a freshly projected
+# graph took 52-64 ms on an idle engine, up to 146 ms under added load and up to
+# 358 ms on a live install, mostly in the Filter (52-54 ms) and the end-node
+# traverse (8 ms); reads after it took 1-3.5 ms. The projector now pays it on the
+# staging graph before the swap (`_WARM_TRAVERSALS`).
+
+
+def _recording_client(
+    calls: list[tuple[str, str]], *, fail_warm: bool = False, hang_warm: bool = False
+):
+    class _Conn:
+        async def delete(self, key):
+            calls.append((key, "DELETE"))
+
+        async def set(self, *a, **k):
+            return True  # the cross-process publish claim is granted
+
+        async def eval(self, script, _n, *keys_and_args):
+            if "rename" in script:
+                calls.append((keys_and_args[1], "SWAP"))
+            return 1
+
+        async def scan(self, *_a, **_k):
+            return 0, []  # no orphan staging graphs to sweep
+
+    class _Graph:
+        def __init__(self, key):
+            self._key = key
+
+        async def query(self, cypher, _params=None):
+            calls.append((self._key, cypher))
+            if fail_warm and cypher.lstrip().startswith("MATCH p="):
+                raise RuntimeError("engine refused the warm-up")
+            if hang_warm and cypher.lstrip().startswith("MATCH p="):
+                import asyncio as _asyncio
+
+                await _asyncio.sleep(30)  # an engine that never answers
+            return type("R", (), {"result_set": []})()
+
+    class _Client:
+        connection = _Conn()
+
+        def __init__(self, *a, **k):
+            pass
+
+        def select_graph(self, key):
+            return _Graph(key)
+
+    return _Client
+
+
+async def _links_db(rows, meta=()):
+    import aiosqlite
+
+    db = await aiosqlite.connect(":memory:")
+    await db.execute(
+        "CREATE TABLE memory_links (source_id TEXT, target_id TEXT, link_type TEXT, strength REAL)"
+    )
+    await db.execute(
+        "CREATE TABLE memory_metadata (memory_id TEXT, invalid_at TEXT, deprecated INTEGER)"
+    )
+    await db.executemany("INSERT INTO memory_links VALUES (?, ?, ?, ?)", rows)
+    await db.executemany("INSERT INTO memory_metadata VALUES (?, ?, ?)", meta)
+    await db.commit()
+    return db
+
+
+async def _project_recorded(tmp_path, rows, meta=(), **kw):
+    calls: list[tuple[str, str]] = []
+    params: list[dict] = []
+    client = _recording_client(calls, **kw)
+    real_select = client.select_graph
+
+    def select(self, key):
+        graph = real_select(self, key)
+        inner = graph.query
+
+        async def query(cypher, p=None):
+            if cypher.lstrip().startswith("MATCH p="):
+                params.append(p)
+            return await inner(cypher, p)
+
+        graph.query = query
+        return graph
+
+    client.select_graph = select
+    db = await _links_db(rows, meta)
+    try:
+        store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"), graph_key="test_warm")
+        with (
+            patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+            patch.object(falkor_mod, "_FalkorDB", client),
+        ):
+            await store.project(db)
+    finally:
+        await db.close()
+    return calls, params, f"test_warm_staging_{os.getpid()}"
+
+
+def _warm_queries(calls, key):
+    return [
+        (i, c) for i, (k, c) in enumerate(calls) if k == key and c.lstrip().startswith("MATCH p=")
+    ]
+
+
+async def test_the_projector_warms_the_staging_graph_before_the_swap(tmp_path):
+    calls, params, staging = await _project_recorded(tmp_path, [("a", "b", "related_to", 0.9)])
+    marker = next(i for i, (_k, c) in enumerate(calls) if c.startswith("CREATE (:ProjectionMeta"))
+    swap = calls.index((staging, "SWAP"))
+    between = [c for k, c in calls[marker + 1 : swap] if k == staging]
+    # The production query texts themselves, so the engine's per-graph plan cache
+    # is warm as well as the data each operator first touches: the traversal at
+    # each depth a caller uses, and the empty-result path's marker count.
+    assert between == [
+        falkor_mod._TRAVERSE.replace("{depth}", "2"),
+        falkor_mod._TRAVERSE.replace("{depth}", "1"),
+        falkor_mod._PROJECTION_MARKER_COUNT,
+    ], calls
+    # Each depth runs with its callers' own threshold (recall 0.3, drift 0.5).
+    assert [(p["root"], p["min_strength"]) for p in params] == [("a", 0.3), ("a", 0.5)]
+
+
+async def test_a_failed_warm_up_still_publishes_the_projection(tmp_path):
+    calls, _params, staging = await _project_recorded(
+        tmp_path, [("a", "b", "related_to", 0.9)], fail_warm=True
+    )
+    assert (staging, "SWAP") in calls, "a cold graph is today's behaviour, never a refusal"
+
+
+async def test_the_warm_up_starts_from_a_root_whose_walk_passes_the_filter(tmp_path):
+    """The cold cost sits in the operators that evaluate a path's properties
+    (MEASURED: the Filter 52-54 ms, the end-node traverse 8 ms, on a cold first
+    read). A walk from a hidden root, or along an edge too weak for the threshold,
+    stops before those operators see a row, so it would warm nothing and say so
+    nowhere."""
+    _calls, params, _staging = await _project_recorded(
+        tmp_path,
+        [
+            ("aaa_weak", "x", "related_to", 0.2),
+            ("bbb_hidden", "x", "related_to", 0.9),
+            ("ccc", "zzz_hidden_end", "related_to", 0.9),
+            ("ddd_seen", "y", "related_to", 0.9),
+        ],
+        [("bbb_hidden", None, 1), ("zzz_hidden_end", None, 1)],
+    )
+    assert params and {p["root"] for p in params} == {"ddd_seen"}, params
+
+
+async def test_no_eligible_root_skips_the_traversal_but_still_publishes(tmp_path):
+    calls, params, staging = await _project_recorded(
+        tmp_path, [("a", "b", "related_to", 0.2)]
+    )
+    assert params == [], params
+    assert (staging, "SWAP") in calls
+
+
+async def test_an_empty_projection_skips_the_warm_up(tmp_path):
+    calls, _params, staging = await _project_recorded(tmp_path, [])
+    assert not _warm_queries(calls, staging), calls
+    assert (staging, "SWAP") in calls
+
+
+async def test_a_hung_warm_up_costs_its_own_bound_and_still_publishes(tmp_path):
+    """The warm-up is an optimisation: an engine that stops answering costs the
+    projection `_WARM_TIMEOUT_S` in all, never `_PROJECT_TIMEOUT_S` per read."""
+    with patch.object(falkor_mod, "_WARM_TIMEOUT_S", 0.2):
+        t = time.monotonic()
+        calls, _params, staging = await _project_recorded(
+            tmp_path, [("a", "b", "related_to", 0.9)], hang_warm=True
+        )
+        elapsed = time.monotonic() - t
+    assert (staging, "SWAP") in calls
+    assert elapsed < 2.0, f"the warm-up held the projection {elapsed:.1f}s"
+
+
+async def test_the_projection_reports_what_its_warm_up_did(tmp_path):
+    async def warm_of(rows, meta=(), **kw):
+        db = await _links_db(rows, meta)
+        try:
+            store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"), graph_key="test_warm")
+            with (
+                patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+                patch.object(falkor_mod, "_FalkorDB", _recording_client([], **kw)),
+            ):
+                return (await store.project(db))["warm"]
+        finally:
+            await db.close()
+
+    assert (await warm_of([("a", "b", "t", 0.9)])).startswith("warmed in ")
+    assert (await warm_of([("a", "b", "t", 0.9)], fail_warm=True)).startswith("FAILED after ")
+    assert (await warm_of([("a", "b", "t", 0.2)])).startswith("marker only")
+
+
+async def test_a_text_strength_never_costs_the_projection_its_warm_up(tmp_path):
+    """`memory_links.strength` has no CHECK, so SQLite keeps a non-numeric value
+    as TEXT. The projection never compared strengths in Python before; the
+    warm-up's root choice must skip such a row, not raise."""
+    calls, params, staging = await _project_recorded(
+        tmp_path, [("a", "b", "t", "strong"), ("c", "d", "t", 0.9)]
+    )
+    assert (staging, "SWAP") in calls
+    assert {p["root"] for p in params} == {"c"}, params
