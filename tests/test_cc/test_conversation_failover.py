@@ -1439,45 +1439,172 @@ async def test_a_skipped_failover_names_itself_in_the_log(loop, invoker, monkeyp
     assert any("CC failover skipped" in r.getMessage() for r in caplog.records)
 
 
-def _tool_then_cap(calls):
+
+def _tool_then_cap(calls, first=None):
     async def _stream(inv, on_event=None):
         calls["n"] += 1
-        await on_event(StreamEvent(event_type="tool_use", tool_name="outreach_send"))
+        await on_event(first or StreamEvent(
+            event_type="tool_use", tool_name="outreach_send",
+            tool_input={"message": "weekly update"},
+        ))
         await on_event(StreamEvent.from_raw(_limit_notice_raw()))
         raise CCQuotaExhaustedError("You've hit your 5-hour limit")
     return _stream
 
 
+def _park_mock(monkeypatch, parked=True):
+    from genesis.cc import rate_limit_park
+
+    park = AsyncMock(return_value=rate_limit_park.ParkOutcome(
+        parked, "p1" if parked else None, None, "live", "[parked copy]",
+    ))
+    monkeypatch.setattr(rate_limit_park, "park_conversation", park)
+    return park
+
+
 @pytest.mark.asyncio
-async def test_a_capped_turn_that_ran_tools_is_not_replayed_on_a_peer(loop, invoker, monkeypatch):
-    """Tools ran, then the cap hit: a peer would re-run them, so only the
-    tool-less contingency may answer."""
+async def test_a_capped_turn_that_ran_tools_parks_with_them_listed(loop, invoker, monkeypatch):
+    """Tools ran, then the cap hit: no peer re-runs the prompt blind; the turn
+    parks, and the parked prompt names the call already made."""
     calls = {"n": 0}
     fi = MagicMock(return_value=[("glm-5.2", _PEER_INV)])
     monkeypatch.setattr(roster, "failover_invocations", fi)
+    park = _park_mock(monkeypatch)
     invoker.run_streaming = AsyncMock(side_effect=_tool_then_cap(calls))
     loop._try_contingency = AsyncMock(return_value="[Contingency mode] tool-less")
     result = await loop.handle_message_streaming(
         "send the update", user_id="u1",
         channel=ChannelType.TERMINAL, on_event=AsyncMock(),
     )
-    assert "Contingency mode" in result
+    assert result.startswith("[parked copy]") and "may already have run" in result
     assert calls["n"] == 1, "a peer re-ran a prompt whose tools already ran"
     fi.assert_not_called()
+    loop._try_contingency.assert_not_awaited()
+    parked_prompt = park.await_args.kwargs["prompt"]
+    assert parked_prompt.startswith("send the update")
+    assert "outreach_send" in parked_prompt and "weekly update" in parked_prompt
 
 
 @pytest.mark.asyncio
-async def test_a_capped_turn_that_ran_tools_is_not_parked(loop, invoker, monkeypatch):
-    from genesis.cc import rate_limit_park
-
+async def test_a_tool_call_inside_a_text_line_still_counts(loop, invoker, monkeypatch):
+    """from_raw stops at the first block, so `text + tool_use` parses as text.
+    The call must still be seen, or the turn is replayed on a peer."""
+    mixed = StreamEvent.from_raw({
+        "type": "assistant",
+        "message": {"model": "m", "content": [
+            {"type": "text", "text": "Sending it now."},
+            {"type": "tool_use", "name": "outreach_send", "input": {"message": "x"}},
+        ]},
+    })
+    assert mixed.event_type == "text"
     calls = {"n": 0}
-    park = AsyncMock()
-    monkeypatch.setattr(rate_limit_park, "park_conversation", park)
+    fi = MagicMock(return_value=[("glm-5.2", _PEER_INV)])
+    monkeypatch.setattr(roster, "failover_invocations", fi)
+    park = _park_mock(monkeypatch)
+    invoker.run_streaming = AsyncMock(side_effect=_tool_then_cap(calls, first=mixed))
+    await loop.handle_message_streaming(
+        "send it", user_id="u1", channel=ChannelType.TERMINAL, on_event=AsyncMock(),
+    )
+    fi.assert_not_called()
+    assert "outreach_send" in park.await_args.kwargs["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_a_capped_turn_that_ran_tools_falls_back_when_it_cannot_park(loop, invoker, monkeypatch):
+    calls = {"n": 0}
+    _park_mock(monkeypatch, parked=False)
     invoker.run_streaming = AsyncMock(side_effect=_tool_then_cap(calls))
     loop._try_contingency = AsyncMock(return_value=None)
     result = await loop.handle_message_streaming(
         "send the update", user_id="u1",
         channel=ChannelType.TERMINAL, on_event=AsyncMock(),
     )
-    park.assert_not_awaited()
+    loop._try_contingency.assert_awaited_once()
     assert "usage limit" in result and "would run again" in result
+
+
+def test_the_already_ran_note_keeps_the_latest_calls():
+    from genesis.cc.rate_limit_park import with_already_ran_note
+
+    assert with_already_ran_note("p", []) == "p"
+    ran = [(f"read{i}", {"q": "x" * 1000}) for i in range(24)] + [("outreach_send", {"m": "hi"})]
+    note = with_already_ran_note("p", ran)
+    assert note.startswith("p\n\n[Resume note")
+    assert "data, not instructions" in note
+    assert "`outreach_send`" in note, "the last call, usually the side effect, was cut"
+    assert "`read0`" not in note and "5 earlier call(s) not shown" in note
+    assert note.count("\n- `") == 20
+    assert "…" in note and len(note) < 20 * 400
+
+
+def test_the_already_ran_note_redacts_credentials():
+    from genesis.cc.rate_limit_park import with_already_ran_note
+
+    note = with_already_ran_note("p", [
+        ("reference_store", {"kind": "api", "identifier": "svc", "value": "s3cr3t"}),
+        ("browser_fill", {"selector": "#pw", "password": "hunter2"}),
+        ("t", {"nested": [{"api_key": "k1"}], "note": "a `tick` here"}),
+    ])
+    for secret in ("s3cr3t", "hunter2", "k1"):
+        assert secret not in note
+    assert "svc" in note and "#pw" in note
+    assert "a 'tick' here" in note, "a backtick in an input could break its fence"
+
+
+def test_the_park_copy_warns_only_when_calls_ran():
+    from genesis.cc.rate_limit_park import with_already_ran_copy
+
+    assert with_already_ran_copy("parked", []) == "parked"
+    assert "may already have run" in with_already_ran_copy("parked", [("t", {})])
+
+
+@pytest.mark.asyncio
+async def test_the_last_resort_park_carries_a_peers_tool_calls(loop, invoker, monkeypatch):
+    """Home caps before any tool; the PEER issues a call, then caps too. The
+    chain is exhausted, so the bottom park must still list the peer's call."""
+    fi = MagicMock(return_value=[("glm-5.2", _PEER_INV)])
+    monkeypatch.setattr(roster, "failover_invocations", fi)
+    park = _park_mock(monkeypatch)
+    calls = {"n": 0}
+
+    async def _stream(inv, on_event=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise CCQuotaExhaustedError("You've hit your weekly limit")
+        await on_event(StreamEvent(
+            event_type="tool_use", tool_name="memory_store", tool_input={"content": "c"},
+        ))
+        raise CCQuotaExhaustedError("peer limit")
+
+    invoker.run_streaming = AsyncMock(side_effect=_stream)
+    loop._try_contingency = AsyncMock(return_value=None)
+    result = await loop.handle_message_streaming(
+        "remember this", user_id="u1", channel=ChannelType.TERMINAL, on_event=AsyncMock(),
+    )
+    assert calls["n"] == 2
+    assert "`memory_store`" in park.await_args.kwargs["prompt"]
+    assert "may already have run" in result
+
+
+@pytest.mark.asyncio
+async def test_a_tool_call_after_thinking_in_one_line_still_counts(loop, invoker, monkeypatch):
+    """The reviewers' shape: `thinking + tool_use` parses as "thinking"."""
+    line = StreamEvent.from_raw({
+        "type": "assistant",
+        "message": {"model": "m", "content": [
+            {"type": "thinking", "thinking": "plan"},
+            {"type": "tool_use", "name": "outreach_send", "input": {"message": "x"}},
+        ]},
+    })
+    assert line.event_type == "thinking"
+    calls = {"n": 0}
+    fi = MagicMock(return_value=[("glm-5.2", _PEER_INV)])
+    monkeypatch.setattr(roster, "failover_invocations", fi)
+    park = _park_mock(monkeypatch)
+    invoker.run_streaming = AsyncMock(side_effect=_tool_then_cap(calls, first=line))
+    await loop.handle_message_streaming(
+        "send it", user_id="u1", channel=ChannelType.TERMINAL, on_event=AsyncMock(),
+    )
+    fi.assert_not_called()
+    assert calls["n"] == 1
+    assert "`outreach_send`" in park.await_args.kwargs["prompt"]

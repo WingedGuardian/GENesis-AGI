@@ -3582,7 +3582,10 @@ class CCInvoker:
                         cc_version = event_raw.get("version", "unknown")
                         logger.info("CC version: %s", cc_version)
 
-                    if event.event_type == "text" and event.text:
+                    # Not CC's own synthetic line (a usage-limit notice): it is
+                    # not an answer, and collected as one it made an empty
+                    # rate-limited result read as served instead of raising.
+                    if event.event_type == "text" and event.text and not event.is_synthetic:
                         collected_text.append(event.text)
                     if etype == "assistant":
                         # Read off the RAW content array, not the parsed

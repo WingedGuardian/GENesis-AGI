@@ -908,7 +908,7 @@ class ConversationLoop:
             # "tool_use progress is fine before a failover". That was true while
             # failover happened solely on an exception; it stopped being true when
             # an empty non-error return also advanced to the next peer.
-            streamed = {"text": False, "tools": False}
+            streamed = {"text": False, "tools": False, "ran": []}
 
             async def _failover_tracked(ev: StreamEvent) -> None:
                 # strip(): this flag is EVIDENCE — it gates the double-output
@@ -930,8 +930,11 @@ class ConversationLoop:
                     streamed["text"] = True
                 # Any tool call counts: from this event on, a replay of the
                 # prompt with full tools could repeat what the call did.
-                if ev.event_type == "tool_use":
+                # tool_uses(), not event_type: a `text + tool_use` line parses
+                # as "text" and would hide the call.
+                for call in ev.tool_uses():
                     streamed["tools"] = True
+                    streamed["ran"].append(call)
                 if on_event:
                     await on_event(ev)
 
@@ -969,16 +972,33 @@ class ConversationLoop:
                 # — but only if NO answer text streamed yet (else re-streaming the
                 # peer's reply would double-output to the user).
                 if streamed["tools"]:
-                    # The turn ran tools before the cap hit. A peer or a parked
-                    # resume would re-run the whole prompt with full tools and
-                    # could repeat those effects (an outreach send, a write), so
-                    # only the tool-less contingency may answer — the same rule
-                    # as the `_Unreplayable` branch below.
+                    # The turn issued tool calls before the cap hit. A peer, or a
+                    # resume of the bare prompt, would re-issue them blind (a
+                    # second send, a second write). So no peer: the turn PARKS,
+                    # and the parked prompt lists the calls already made so the
+                    # resumed run checks before repeating any. Tool-less
+                    # contingency is not tried first — it cannot finish the work,
+                    # and its answer would precede the resumed one. It is only
+                    # the fallback when nothing could be parked.
                     logger.warning(
                         "CC failover skipped for session %s: the turn already ran "
-                        "tools — tool-less contingency only, no park (%s)",
-                        session["id"][:8], type(e).__name__,
+                        "%d tool call(s) — parking with them listed (%s)",
+                        session["id"][:8], len(streamed["ran"]), type(e).__name__,
                     )
+                    outcome = await rate_limit_park.park_conversation(
+                        self._db,
+                        prompt=rate_limit_park.with_already_ran_note(
+                            prompt_text, streamed["ran"],
+                        ),
+                        origin_session_id=session["id"],
+                        exc=e,
+                        model=model,
+                        effort=effort,
+                    )
+                    if outcome.parked:
+                        return rate_limit_park.with_already_ran_copy(
+                            outcome.copy, streamed["ran"],
+                        )
                     fallback = await self._try_contingency(
                         prompt_text, system_prompt, channel,
                         session_id=session["id"],
@@ -986,11 +1006,6 @@ class ConversationLoop:
                     )
                     if fallback is not None:
                         return fallback
-                    logger.error(
-                        "Contingency failed after a capped turn that ran tools — "
-                        "NOT parking, because a park would replay them: %s",
-                        e, exc_info=True,
-                    )
                     return _CAPPED_AFTER_TOOLS_NOTICE
                 if not streamed["text"]:
                     roster_reply = await self._try_roster_failover(
@@ -1042,15 +1057,21 @@ class ConversationLoop:
                 # durably so it auto-resumes when capacity returns (rate_limit_park
                 # owns the reset parse, the cc_sessions resume-time write, and the
                 # mode-aware copy — replacing the old sentence nothing backed).
+                # A failover PEER may have issued tool calls before this point
+                # (they land in the same tracker), so the park carries them.
                 outcome = await rate_limit_park.park_conversation(
                     self._db,
-                    prompt=prompt_text,
+                    prompt=rate_limit_park.with_already_ran_note(
+                        prompt_text, streamed["ran"],
+                    ),
                     origin_session_id=session["id"],
                     exc=e,
                     model=model,
                     effort=effort,
                 )
-                return outcome.copy
+                return rate_limit_park.with_already_ran_copy(
+                    outcome.copy, streamed["ran"],
+                )
             except CCReplayUnsafeError as e:
                 # Ahead of the terminal `except CCError`, which would otherwise
                 # dead-end this turn on raw internal prose. `streamed` is passed
