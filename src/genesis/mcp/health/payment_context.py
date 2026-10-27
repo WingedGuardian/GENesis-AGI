@@ -303,6 +303,14 @@ _SAME_FORM_JS = (
     "(a, b) => { const f = (e) => (e.closest('button, input') || e).form || null;"
     " const x = f(a); return !!x && x === f(b); }"
 )
+# A checkbox input's one label, when that label's control is the input itself:
+# a styled box draws over its input, and a click lands on the label instead.
+_OWN_LABEL_JS = (
+    "(e) => (e.tagName.toLowerCase() === 'input' && e.labels && e.labels.length === 1"
+    " && e.labels[0].control === e) ? e.labels[0] : null"
+)
+# How long a trial tick on the input itself may take before its label is tried.
+CONSENT_TRIAL_MS = 3000
 # Two targets that are one checkbox (a label and its control).
 _SAME_CONTROL_JS = (
     "(a, b) => { const c = (e) => (e.tagName.toLowerCase() === 'label' ? e.control : e);"
@@ -1138,6 +1146,31 @@ async def _steps(ppage, args: cf.CardArgs, flow: _Flow) -> tuple[list[str], list
     return labels, snapshots
 
 
+async def _tickable(handle, frame):
+    """What takes the tick for a consent box: ``handle`` when a trial tick on it
+    passes; else its own label (the input's one label, whose control is that
+    input, in the same frame) when a trial tick on the label passes; else None.
+    A trial changes nothing."""
+    try:
+        await _step(handle.check(trial=True, timeout=CONSENT_TRIAL_MS))
+        return handle
+    except Exception as e:  # noqa: BLE001 - never the exception's text
+        logger.warning("payment consent trial tick failed (%s)", type(e).__name__)
+    try:
+        label = (await _step(handle.evaluate_handle(_OWN_LABEL_JS))).as_element()
+        if (
+            label is None
+            or not await _owned_by(label, frame)
+            or not await _step(label.evaluate(_SAME_CONTROL_JS, handle))
+        ):
+            return None
+        await _step(label.check(trial=True, timeout=CLICK_MS))
+        return label
+    except Exception as e:  # noqa: BLE001
+        logger.warning("payment consent label trial tick failed (%s)", type(e).__name__)
+        return None
+
+
 async def _consents(
     ppage, args: cf.CardArgs, fields: dict[str, _Field], before_tap: bool = False
 ) -> list[tuple]:
@@ -1157,10 +1190,10 @@ async def _consents(
             raise _Stop(f"consent_not_found:{n}:{_how_many(count)}")
         handle = await _step(loc.element_handle(timeout=5000))
         if not await _owned_by(handle, frame):
-            raise _Stop("consent_not_found")
+            raise _Stop(f"consent_not_found:{n}:owner")
         info = await _step(handle.evaluate(CONSENT_JS))
         if not isinstance(info, dict) or info.get("box") is not True:
-            raise _Stop("consent_not_found")
+            raise _Stop(f"consent_not_found:{n}:box")
         label = info.get("label")
         if not isinstance(label, str) or not label.strip() or info.get("visible") is not True:
             raise _Stop("consent_unlabelled")
@@ -1168,16 +1201,14 @@ async def _consents(
             raise _Stop("consent_label_too_long")
         for other_frame, other in zip(frames_seen, (h for h, _lab in out), strict=True):
             if other_frame is frame and await _step(handle.evaluate(_SAME_CONTROL_JS, other)):
-                raise _Stop("consent_not_found")
-        if before_tap:
-            if info.get("checked") is not False:
-                raise _Stop("consent_pre_ticked")
-            try:
-                await _step(handle.check(trial=True, timeout=CLICK_MS))
-            except Exception as e:  # noqa: BLE001 - never the exception's text
-                logger.warning("payment consent trial tick failed (%s)", type(e).__name__)
-                raise _Stop("consent_not_found") from None
-        out.append((handle, label))
+                raise _Stop(f"consent_not_found:{n}:duplicate")
+        if before_tap and info.get("checked") is not False:
+            raise _Stop("consent_pre_ticked")
+        # Before and after the tap alike, so the tick goes where the trial passed.
+        target = await _tickable(handle, frame)
+        if target is None:
+            raise _Stop(f"consent_not_found:{n}:trial")
+        out.append((target, label))
         frames_seen.append(frame)
     return out
 

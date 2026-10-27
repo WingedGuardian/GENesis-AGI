@@ -90,6 +90,8 @@ class El:
         self.connected = True  # still in its document
         self.gone = False  # its document was replaced: every script on it raises
         self.form = None  # its form, for _SAME_FORM_JS
+        self.own_label = None  # an input's one label El (whose .control is this El)
+        self.control = None  # a label's control El
 
 
 class Handle:
@@ -126,6 +128,8 @@ class Handle:
             ]
         if js is pc._CHECKBOX_JS:
             return self.el.checkbox
+        if js is pc.CONSENT_JS and self.el.control is not None:
+            return await Handle(self.el.control, self.frame).evaluate(js, arg)
         if js is pc.CONSENT_JS:
             return {
                 "box": self.el.checkbox,
@@ -135,7 +139,7 @@ class Handle:
                 "connected": self.el.connected,
             }
         if js is pc._SAME_CONTROL_JS:
-            return arg.el is self.el
+            return (self.el.control or self.el) is (arg.el.control or arg.el)
         if js is pc._SUBMITS_JS:
             return self.el.submits
         if js is pc._RELATED_JS:
@@ -148,7 +152,26 @@ class Handle:
             return self.el.form is not None and self.el.form == arg.el.form
         raise AssertionError("unexpected script")
 
+    async def evaluate_handle(self, js):
+        if js is not pc._OWN_LABEL_JS:
+            raise AssertionError("unexpected script")
+        lab = self.el.own_label
+        # As found, unfiltered: the flow itself must confirm the label's control.
+        target = Handle(lab, self.frame) if lab is not None else None
+
+        class Wrapped:
+            def as_element(self):
+                return target
+
+        return Wrapped()
+
     async def check(self, timeout=None, trial=False):
+        if self.el.control is not None:  # a label: its control takes the tick
+            if self.el.untickable:
+                raise RuntimeError("not tickable")
+            if not trial:
+                self.el.control.checked = not self.el.control.unchecks
+            return
         if not self.el.checkbox or self.el.untickable:
             raise RuntimeError("not tickable")
         if not trial:
@@ -2646,7 +2669,7 @@ async def test_no_consent_sends_no_consent_labels(vault):
 async def test_a_consent_target_that_is_not_a_checkbox_is_refused_before_the_tap(vault):
     ns = checkout()
     out, _ = await _run(ns, consent=["#email"])
-    assert out["code"] == "consent_not_found" and vault.ops("release_request") == []
+    assert out["code"] == "consent_not_found:1:box" and vault.ops("release_request") == []
 
 
 async def test_a_consent_label_changed_after_the_tap_types_nothing(vault):
@@ -2735,7 +2758,7 @@ async def test_a_step_that_ticks_a_box_through_its_label_is_refused(vault):
         (lambda box: setattr(box, "label", "   "), "consent_unlabelled"),
         (lambda box: setattr(box, "label", "x" * (pc.CONSENT_LABEL_CHARS + 1)),
          "consent_label_too_long"),
-        (lambda box: setattr(box, "untickable", True), "consent_not_found"),
+        (lambda box: setattr(box, "untickable", True), "consent_not_found:1:trial"),
     ],
 )
 async def test_a_consent_box_the_tap_cannot_cover_is_refused_before_it(vault, setup, code):
@@ -2751,7 +2774,7 @@ async def test_the_same_consent_box_twice_is_refused(vault):
     _consent_box(ns)
     spec = {"selector": "#agree", "frames": ["iframe#card"]}
     out, _ = await _run(ns, consent=[spec, spec])
-    assert out["code"] == "consent_not_found" and vault.ops("release_request") == []
+    assert out["code"] == "consent_not_found:2:duplicate" and vault.ops("release_request") == []
 
 
 async def test_a_consent_label_swapped_on_the_way_to_pay_stops_before_pay(vault):
@@ -3407,3 +3430,62 @@ async def test_a_step_miss_logs_the_window_network(vault, caplog):
     out, _ = await _run(ns, steps=["#nothing"])
     assert out["code"] == "step_not_found:1:none"
     assert "payment step 1 matched 0" in caplog.text and "started" in caplog.text
+
+
+# ── a styled consent box takes its tick through its own label ─────────────
+
+
+def _styled(ns, label_text="I authorize the debit"):
+    """A consent input a click cannot reach (a drawn box over it), with its own
+    label, as measured on a live hosted checkout."""
+    box = _consent_box(ns, label_text)
+    box.untickable = True
+    lab = El(tag="label")
+    lab.control = box
+    box.own_label = lab
+    return box, lab
+
+
+async def test_a_styled_consent_box_is_ticked_through_its_own_label(vault):
+    ns = checkout()
+    box, _lab = _styled(ns)
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "submitted_unverified"
+    assert vault.ops("release_request")[0]["consent_labels"] == ["I authorize the debit"]
+    assert box.checked  # the input itself, through the label
+
+
+async def test_a_styled_box_without_a_label_is_refused_before_the_tap(vault):
+    ns = checkout()
+    box = _consent_box(ns)
+    box.untickable = True
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "consent_not_found:1:trial"
+    assert vault.ops("release_request") == [] and not box.checked
+
+
+async def test_a_label_for_another_box_is_never_used(vault):
+    ns = checkout()
+    box, lab = _styled(ns)
+    lab.control = El()  # its control is some other element
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "consent_not_found:1:trial"
+    assert vault.ops("release_request") == [] and not box.checked
+
+
+async def test_a_label_in_another_frame_is_never_used(vault):
+    ns = checkout()
+    box, lab = _styled(ns)
+    lab.owner = Frame(SHOP)
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "consent_not_found:1:trial"
+    assert vault.ops("release_request") == []
+
+
+async def test_a_label_that_cannot_take_a_tick_either_is_refused(vault):
+    ns = checkout()
+    _box, lab = _styled(ns)
+    lab.untickable = True
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "consent_not_found:1:trial"
+    assert vault.ops("release_request") == []
