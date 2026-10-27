@@ -66,6 +66,8 @@ import hashlib
 import html
 import json
 import logging
+import re
+import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -75,6 +77,7 @@ import aiosqlite
 from genesis.db.crud import observations
 from genesis.db.crud import outreach as outreach_history
 from genesis.recon import career_outreach_config as cfg
+from genesis.security.output_scanner import redact_credentials, scan_outbound
 from genesis.security.sanitizer import strip_control_chars
 
 logger = logging.getLogger(__name__)
@@ -242,6 +245,98 @@ def _reply_text(result: object) -> str:
     if isinstance(result, dict):
         return str(result.get("text") or result.get("output") or "")
     return str(result or "")
+
+
+# Bound on each remote diagnostic excerpt (the CLI's result text, its stderr) kept in a
+# dispatch-failure detail. Why a bound at all: the detail is joined into job_health's
+# ``last_error`` (no length bound of its own), which is rendered into awareness signals and
+# reflection prompts, so a remote that dumps a long error would flood each of them. Why
+# 300: a CLI's own failure message is one or two lines, which fits with room to spare. The
+# TAIL is what is kept, because a CLI's last line is where it says why it exited (warnings
+# come first), and the cut is declared with a marker. The adapter keeps at most the last
+# 2,000 chars of stderr.
+_EXCERPT_CHARS = 300
+# Location-style findings that may stay in an owner-facing health record. Credentials are
+# redacted in place; anything else the scanner still flags withholds the excerpt whole.
+_ALLOWED_FINDINGS = frozenset({"rfc1918_ip", "internal_file_path", "localhost_port"})
+# ``terminal_reason`` is a closed CLI vocabulary (e.g. ``api_error``): accept the token
+# shape, never free text.
+_REASON_TOKEN = re.compile(r"[a-z][a-z0-9_]{0,39}")
+
+
+def _without_invisible(text: str) -> str:
+    """``text`` with Unicode control / format characters (categories Cc and Cf: NUL,
+    zero-width, bidi) DELETED, so a credential split by one is contiguous again for the
+    scanner. Other invisible-looking characters (combining joiners, fillers) are not
+    covered; the threat is an accidental leak by the remote CLI, not crafted stderr."""
+    return "".join(
+        ch for ch in text if ch in "\n\t" or unicodedata.category(ch) not in ("Cc", "Cf")
+    )
+
+
+def _scrubbed_excerpt(label: str, raw: object) -> str | None:
+    """A scrubbed, one-line, bounded excerpt of remote diagnostic text, or None when empty.
+
+    Fails closed: if the scrubber raises, or something it could not redact remains, the
+    text is omitted and the excerpt says it was withheld."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        # Scrub BEFORE bounding, so a cut cannot split a credential below the
+        # scrubber's length floor. Scrub once on the raw text (an assignment is redacted
+        # to the end of its line, so line structure matters), then flatten, then scrub
+        # and scan the FLATTENED text: flattening turns NUL / zero-width runs into a
+        # space, which can join a credential or card number the raw pass never saw. A
+        # copy with those characters deleted is scanned too, for a credential they split.
+        scrubbed, _ = redact_credentials(raw)
+        text, _ = redact_credentials(strip_control_chars(scrubbed))
+        leftover = (
+            set(scan_outbound(text).detected)
+            | set(scan_outbound(_without_invisible(scrubbed)).detected)
+        ) - _ALLOWED_FINDINGS
+    except Exception:
+        logger.warning("career outreach: %s scrubber failed; withheld", label, exc_info=True)
+        return f"{label} withheld (scrubber failed)"
+    if leftover:
+        return f"{label} withheld (unredactable content: {', '.join(sorted(leftover))})"
+    if not text:
+        return None
+    if len(text) > _EXCERPT_CHARS:
+        omitted = len(text) - _EXCERPT_CHARS
+        text = f"<omitted first {omitted:,} chars> {text[-_EXCERPT_CHARS:]}"
+    return f"{label}: {text}"
+
+
+def _dispatch_failure_detail(result: dict, fallback: str) -> str:
+    """The adapter's error plus the remote's own diagnosis.
+
+    A failed ``claude -p --output-format json`` puts its CAUSE in stdout's result object
+    (``result``, ``api_error_status``, ``terminal_reason``), while stderr often holds
+    only a tag or an unrelated warning (MEASURED on a forced exit-1 run); so both are
+    kept. The adapter returns the parsed result as ``result_text`` on a non-zero exit;
+    an exit-0 ``is_error`` run carries it as ``text``."""
+    parts = [str(result.get("error") or fallback)[:120]]
+    cause = result.get("result_text")
+    if cause is None and result.get("is_error"):
+        cause = result.get("text")
+    # The cause goes right after the error: a renderer that cuts last_error short
+    # (one health alarm shows 80 chars) then still shows the start of it.
+    excerpt = _scrubbed_excerpt("cause", cause)
+    if excerpt:
+        parts.append(excerpt)
+    code = result.get("exit_code")
+    if isinstance(code, int) and not isinstance(code, bool):
+        parts.append(f"exit={code}")
+    status = result.get("api_error_status")
+    if isinstance(status, int) and not isinstance(status, bool):
+        parts.append(f"api_status={status}")
+    reason = result.get("terminal_reason")
+    if isinstance(reason, str) and _REASON_TOKEN.fullmatch(reason):
+        parts.append(f"reason={reason}")
+    excerpt = _scrubbed_excerpt("stderr", result.get("stderr"))
+    if excerpt:
+        parts.append(excerpt)
+    return " | ".join(parts)
 
 
 def _parse_json(text: str) -> object | None:
@@ -970,11 +1065,13 @@ class CareerOutreachMonitor:
         # that dead bridge as reachable, the exact silent failure this probe exists to
         # catch. (A `parse_fallback` reply is still reachable — the hop answered.)
         if isinstance(result, dict) and (result.get("error") or result.get("is_error")):
-            detail = result.get("error") or "claude -p reported is_error"
+            # Keep the remote's own diagnosis (exit code + scrubbed stderr), so the next
+            # failure names its cause instead of only "Remote claude exited 1".
+            detail = _dispatch_failure_detail(result, "claude -p reported is_error")
             return CareerOutreachResult(
                 mode="observe",
                 errors=1,
-                details=[f"observe: bridge probe failed: {str(detail)[:120]}"],
+                details=[f"observe: bridge probe failed: {detail}"],
             )
         if not _reply_text(result).strip():
             return CareerOutreachResult(
@@ -1012,9 +1109,13 @@ class CareerOutreachMonitor:
             # Adapter-level failure (disabled / unhealthy / IPC error / timeout)
             # comes back as an error DICT — it does NOT raise. Surface it so the
             # runner records a job-health FAILURE, and stop the loop.
-            if isinstance(result, dict) and result.get("error"):
+            # An exit-0 run that reports `is_error` (dead model auth) is the same failure
+            # as a top-level `error`; classifying its reply text would mislabel it a
+            # protocol failure and drop its cause. Either way it is one error and a stop.
+            if isinstance(result, dict) and (result.get("error") or result.get("is_error")):
                 errors += 1
-                details.append(f"auto-run dispatch error: {str(result.get('error'))[:120]}")
+                detail = _dispatch_failure_detail(result, "claude -p reported is_error")
+                details.append(f"auto-run dispatch error: {detail}")
                 break
             # Classify the reply ONCE into a closed outcome; match on TYPE. Every
             # malformed shape is a ProtocolError decided inside classify_autorun_reply,

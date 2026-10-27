@@ -345,11 +345,27 @@ class SshIPCAdapter:
         stderr = stderr_bytes.decode()
 
         if proc.returncode != 0:
-            return {
+            failed = {
                 "error": f"Remote claude exited {proc.returncode}",
-                "stderr": stderr[:2000],
+                "exit_code": proc.returncode,
+                # The TAIL: a CLI's final stderr line says why it exited, and any
+                # preamble (ssh warnings) comes first.
+                "stderr": stderr[-2000:],
                 "stdout": stdout[:2000],
             }
+            # A failed `claude -p --output-format json` reports its CAUSE in stdout's
+            # result object, often with only a tag on stderr. Parse the FULL stdout
+            # (the result is the last line, past any head cut) and pass the cause on.
+            # Only an is_error result is a cause: a non-error result's text is the
+            # model's own reply, not a diagnosis.
+            parsed = self._parse_cc_output(stdout)
+            if not parsed.get("parse_fallback") and parsed.get("is_error"):
+                text = parsed.get("text")
+                # Same 2,000-char tail bound as stderr, for the same reader.
+                failed["result_text"] = text[-2000:] if isinstance(text, str) else ""
+                failed["api_error_status"] = parsed.get("api_error_status")
+                failed["terminal_reason"] = parsed.get("terminal_reason")
+            return failed
 
         return self._parse_cc_output(stdout)
 
@@ -402,7 +418,12 @@ class SshIPCAdapter:
             try:
                 parsed = json.loads(line)
                 if isinstance(parsed, dict) and parsed.get("type") == "result":
-                    usage = parsed.get("usage", {})
+                    # Non-dict usage / modelUsage must not raise: this parse also runs
+                    # on the failure path, where a raise would lose the diagnosis.
+                    usage = parsed.get("usage")
+                    usage = usage if isinstance(usage, dict) else {}
+                    model_usage = parsed.get("modelUsage")
+                    model_usage = model_usage if isinstance(model_usage, dict) else {}
                     return {
                         "text": parsed.get("result", ""),
                         "session_id": parsed.get("session_id", ""),
@@ -411,7 +432,9 @@ class SshIPCAdapter:
                         "output_tokens": usage.get("output_tokens", 0),
                         "duration_ms": parsed.get("duration_ms", 0),
                         "is_error": parsed.get("is_error", False),
-                        "model_used": next(iter(parsed.get("modelUsage", {})), ""),
+                        "api_error_status": parsed.get("api_error_status"),
+                        "terminal_reason": parsed.get("terminal_reason"),
+                        "model_used": next(iter(model_usage), ""),
                     }
             except json.JSONDecodeError:
                 continue

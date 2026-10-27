@@ -252,6 +252,92 @@ class TestSshIPCAdapterSend:
 
         assert "error" in result
         assert "exited 1" in result["error"]
+        # The exit code and stderr travel as their own fields, so a caller can report
+        # them without parsing the error string (the SHELL path's shape).
+        assert result["exit_code"] == 1
+        assert result["stderr"] == "Permission denied"
+
+    @pytest.mark.asyncio
+    async def test_send_cc_nonzero_exit_passes_result_cause(self):
+        # A failed `claude -p --output-format json` puts its cause in stdout's result
+        # object; the adapter parses the FULL stdout (the result line is last, past
+        # the 2,000-char head cut) and passes the cause on.
+        config = IPCConfig(method="ssh", ssh_host="user@host")
+        adapter = SshIPCAdapter(config)
+        result_line = json.dumps({
+            "type": "result", "is_error": True, "api_error_status": 404,
+            "terminal_reason": "api_error", "result": "There's an issue with the model.",
+        })
+        stdout = ("x" * 3000 + "\n" + result_line + "\n").encode()
+
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (stdout, b"[claude-code:unrecognized_model]")
+        mock_proc.returncode = 1
+
+        with patch("genesis.modules.external.ipc.asyncio.create_subprocess_exec",
+                    return_value=mock_proc):
+            result = await adapter.send("dispatch", data={"prompt": "test"}, method="CC")
+
+        assert result["exit_code"] == 1
+        assert result["result_text"] == "There's an issue with the model."
+        assert result["api_error_status"] == 404
+        assert result["terminal_reason"] == "api_error"
+
+    @pytest.mark.asyncio
+    async def test_send_cc_nonzero_exit_tolerates_null_usage(self):
+        # The failure path now parses stdout; a null usage / modelUsage must not raise
+        # (a raise would replace the exit code and stderr with a generic error).
+        config = IPCConfig(method="ssh", ssh_host="user@host")
+        adapter = SshIPCAdapter(config)
+        result_line = json.dumps({
+            "type": "result", "is_error": True, "usage": None, "modelUsage": None,
+            "result": "API Error: Connection refused",
+        })
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (result_line.encode(), b"")
+        mock_proc.returncode = 1
+
+        with patch("genesis.modules.external.ipc.asyncio.create_subprocess_exec",
+                    return_value=mock_proc):
+            result = await adapter.send("dispatch", data={"prompt": "test"}, method="CC")
+
+        assert result["exit_code"] == 1
+        assert result["result_text"] == "API Error: Connection refused"
+
+    @pytest.mark.asyncio
+    async def test_send_cc_nonzero_exit_non_error_result_is_not_a_cause(self):
+        # A non-zero exit whose result line is NOT is_error carries the model's own
+        # reply; that text is not a diagnosis and is not passed on as one.
+        config = IPCConfig(method="ssh", ssh_host="user@host")
+        adapter = SshIPCAdapter(config)
+        result_line = json.dumps({"type": "result", "is_error": False, "result": "a draft"})
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (result_line.encode(), b"hook failed")
+        mock_proc.returncode = 1
+
+        with patch("genesis.modules.external.ipc.asyncio.create_subprocess_exec",
+                    return_value=mock_proc):
+            result = await adapter.send("dispatch", data={"prompt": "test"}, method="CC")
+
+        assert result["exit_code"] == 1
+        assert "result_text" not in result
+
+    @pytest.mark.asyncio
+    async def test_send_cc_nonzero_exit_keeps_stderr_tail(self):
+        # A long stderr keeps its TAIL, where the CLI's final error line sits.
+        config = IPCConfig(method="ssh", ssh_host="user@host")
+        adapter = SshIPCAdapter(config)
+
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (b"", b"w" * 5000 + b"FINAL ERROR")
+        mock_proc.returncode = 1
+
+        with patch("genesis.modules.external.ipc.asyncio.create_subprocess_exec",
+                    return_value=mock_proc):
+            result = await adapter.send("dispatch", data={"prompt": "test"}, method="CC")
+
+        assert result["stderr"].endswith("FINAL ERROR")
+        assert len(result["stderr"]) == 2000
 
     @pytest.mark.asyncio
     async def test_send_shell_command(self):
