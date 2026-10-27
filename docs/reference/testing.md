@@ -209,12 +209,33 @@ guardrail (code in the test process could get around it), not a sandbox.
     where CI raises "not found", and a system-level `systemctl` also gets "Failed
     to connect to bus".
 
-### The live closure: tests run without this machine's live state
+### The live closure: tests run without this machine's credentials or live state
 
-`tests/_live_closure.py`, armed right after the live fence, takes live state
-paths and endpoints out of the process environment before any test runs, so a
-test behaves as it does on CI. Child processes inherit it.
+`tests/_live_closure.py`, armed right after the live fence, takes credentials,
+live state paths and endpoints out of the process environment before any test
+runs, so a test behaves as it does on CI, where none exist. Child processes
+inherit it.
 
+- `SECRETS_PATH` names a file that does not exist, so every `secrets.env`
+  loader that honours it loads nothing. Each test gets its own such path under
+  its `tmp_path`, so a script that writes there (`restore.sh`) cannot leave a
+  file for the next test. A test that runs `backup.sh` or `restore.sh` against
+  a sandbox `GENESIS_DIR` drops `SECRETS_PATH` from the child's environment, so
+  the sandbox decides where the secrets file is, as on CI.
+- Credential-shaped variables are removed for the run: `SSH_AUTH_SOCK`,
+  `GH_TOKEN`, `GITHUB_TOKEN`, `GIT_ASKPASS`, `SSH_ASKPASS`, a bare `API_KEY`,
+  names starting `VSCODE_GIT_`, and names containing `_API_KEY`, `_SECRET`,
+  `PASSWORD`, `PASSPHRASE`, `WEBHOOK`, `CREDENTIAL`, `_ACCESS_KEY` or
+  `_PRIVATE_KEY`, starting `API_KEY_`, or ending `_TOKEN`, `_PASS`, `_KEY_ID`
+  or `_AUTH_CONFIG`. The run summary lists their names, never values.
+- `GH_CONFIG_DIR` points at an empty directory, `GIT_TERMINAL_PROMPT=0`,
+  `GIT_SSH_COMMAND=false`, and `GIT_CONFIG_GLOBAL=/dev/null`,
+  `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_SYSTEM=/dev/null` close git's user and
+  system configuration (and any credential helper in it) whatever `HOME` or
+  `XDG_CONFIG_HOME` say, even for an explicit `git config --system`. Config git
+  takes from the environment (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT` and
+  its `KEY_n`/`VALUE_n`) is removed. A test that needs a git identity sets it
+  itself, as on CI.
 - `GENESIS_DB_PATH` is set when the plugin is imported, before pytest imports
   any `tests/test*/conftest.py`, so a module that resolves the database path at
   import (or as a default argument) binds the closure's file, never the
@@ -227,12 +248,24 @@ test behaves as it does on CI. Child processes inherit it.
 - `GENESIS_MCP_LOG_DIR` names a directory that does not exist, so importing the
   health MCP opens no log in the shared `~/tmp`.
 - A test that sets its own value with `monkeypatch` still wins.
-  `GENESIS_LIVE_E2E=1` changes none of these.
+- `GENESIS_LIVE_E2E=1` (the opt-in live tests) leaves `SECRETS_PATH` and the
+  credential variables in place, and the summary says so; the git, gh,
+  database, hook-URL and log settings still apply.
 - The closure's directory is removed at the end of the run; a child that
-  outlives pytest is left with paths that do not exist.
-- Not covered: a reader that builds its own database path instead of
-  resolving `genesis_db_path()`, and a child started with an environment that
-  does not carry these variables.
+  outlives pytest is left with paths that do not exist, so no credentials.
+- Not covered:
+  - a reader that builds its own path to `secrets.env` or the database
+    instead of honouring these variables;
+  - a credential under a name the rule does not match: for example `*_OAUTH`,
+    `*_BEARER*`, a bare `*_KEY` or `*_PWD`, a DSN, a credential embedded in a
+    URL value (`DATABASE_URL`, `HTTP_PROXY`), or a variable pointing at a
+    credential file (`AWS_PROFILE`, `DOCKER_CONFIG`, `NETRC`, `KUBECONFIG`);
+  - credentials a program finds through the home directory rather than the
+    environment (`~/.ssh`, tool config files);
+  - a child started with an environment that does not carry these variables,
+    including tests that strip every `GIT_*` variable from a child (its git
+    then reads the home's user config again);
+  - a repository-local `core.askPass` or `credential.helper`.
 
 ## Integration Tests
 
