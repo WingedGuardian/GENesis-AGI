@@ -92,6 +92,9 @@ class El:
         self.form = None  # its form, for _SAME_FORM_JS
         self.own_label = None  # an input's one label El (whose .control is this El)
         self.control = None  # a label's control El
+        self.label_point = {"x": 5.0, "y": 5.0}  # _LABEL_POINT_JS's answer (None: none)
+        self.fail_trials = 0  # the next N trial ticks time out (a passing overlay)
+        self.positions: list = []  # where each check() aimed
 
 
 class Handle:
@@ -129,7 +132,9 @@ class Handle:
         if js is pc._CHECKBOX_JS:
             return self.el.checkbox
         if js is pc.CONSENT_JS and self.el.control is not None:
-            return await Handle(self.el.control, self.frame).evaluate(js, arg)
+            # As the real script: the box's state, but `connected` is the label's own.
+            info = await Handle(self.el.control, self.frame).evaluate(js, arg)
+            return {**info, "connected": self.el.connected}
         if js is pc.CONSENT_JS:
             return {
                 "box": self.el.checkbox,
@@ -148,6 +153,8 @@ class Handle:
             return self.el.text
         if js is pc._INNER_TEXT_JS:
             return self.el.text
+        if js is pc._LABEL_POINT_JS:
+            return self.el.label_point
         if js is pc._SAME_FORM_JS:
             return self.el.form is not None and self.el.form == arg.el.form
         raise AssertionError("unexpected script")
@@ -165,7 +172,14 @@ class Handle:
 
         return Wrapped()
 
-    async def check(self, timeout=None, trial=False):
+    async def scroll_into_view_if_needed(self, timeout=None):
+        return None
+
+    async def check(self, timeout=None, trial=False, position=None):
+        self.el.positions.append(position)
+        if trial and self.el.fail_trials:
+            self.el.fail_trials -= 1
+            raise TimeoutError("covered for now")
         if self.el.control is not None:  # a label: its control takes the tick
             if self.el.untickable:
                 raise RuntimeError("not tickable")
@@ -3489,3 +3503,46 @@ async def test_a_label_that_cannot_take_a_tick_either_is_refused(vault):
     out, _ = await _run(ns, consent=CONSENT)
     assert out["code"] == "consent_not_found:1:trial"
     assert vault.ops("release_request") == []
+
+
+# ── review round on the label route ───────────────────────────────────────
+
+
+async def test_a_save_that_drops_the_label_and_unticks_the_box_never_pays(vault):
+    # The checks read the box itself, never the label used to click it.
+    ns = save_checkout()
+    box, lab = _styled(ns)
+
+    def drop_label_untick_box():
+        lab.connected = False
+        box.checked = False
+
+    _after_save(ns, drop_label_untick_box)
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00", consent=CONSENT)
+    assert out["code"] == "saved_page_changed" and ns.pay_clicks == []
+
+
+async def test_a_label_with_no_point_clear_of_links_is_refused(vault):
+    ns = checkout()
+    box, lab = _styled(ns)
+    lab.label_point = None  # every point on it lands on a link or button
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "consent_not_found:1:trial"
+    assert vault.ops("release_request") == [] and not box.checked
+
+
+async def test_the_tick_uses_the_point_the_label_trial_passed(vault):
+    ns = checkout()
+    box, lab = _styled(ns)
+    lab.label_point = {"x": 7.0, "y": 21.0}
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "submitted_unverified" and box.checked
+    assert lab.positions and set(map(str, lab.positions)) == {"{'x': 7.0, 'y': 21.0}"}
+
+
+async def test_a_box_with_no_label_keeps_its_full_trial_window(vault):
+    ns = checkout()
+    box = _consent_box(ns)
+    box.fail_trials = 1  # covered by an overlay for the first look only
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "submitted_unverified" and box.checked
