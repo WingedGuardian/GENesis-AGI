@@ -6,6 +6,8 @@ COPY headlong/ /headlong/
 COPY src/ /genesis-src/
 COPY LICENSE /genesis-source-pin /fixture/
 COPY headlong_fixture.py headlong_controls.py headlong_native_controls.py headlong_native_provider.py /fixture/
+COPY headlong_prompt_references.py headlong_reference_patch.py headlong_reference_controls.py /fixture/
+RUN cp -a /headlong /headlong-b && python3 /fixture/headlong_reference_patch.py /headlong-b
 RUN chmod 755 /fixture/headlong_fixture.py && ln -s headlong_fixture.py /fixture/fake-claude && dpkg-query -W > /fixture/packages.txt && pip freeze > /fixture/python-packages.txt
 ENV HOME=/work/home PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/genesis-src
 USER 65532:65532

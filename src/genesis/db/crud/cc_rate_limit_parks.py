@@ -262,6 +262,19 @@ async def mark_terminal_if_unchanged(
     return cursor.rowcount == 1
 
 
+async def set_open_payload(db: aiosqlite.Connection, park_id: str, payload: dict) -> bool:
+    """Replace an OPEN park's payload (a later attempt merged its record in).
+    True iff the row was still open."""
+    cursor = await db.execute(
+        """UPDATE cc_rate_limit_parks
+           SET payload_json = ?, updated_at = ?
+           WHERE id = ? AND status IN ('parked', 'resuming')""",
+        (json.dumps(payload), _now(), park_id),
+    )
+    await db.commit()
+    return cursor.rowcount == 1
+
+
 async def get_by_id(db: aiosqlite.Connection, park_id: str) -> dict | None:
     cursor = await db.execute(
         "SELECT * FROM cc_rate_limit_parks WHERE id = ?",

@@ -396,6 +396,9 @@ def test_a_switch_that_fails_partway_says_what_changed(dc, dc_ready, capsys):
     assert "failed partway" in err, err
     assert "z.bin" in err or "b.txt" in err, err  # a path the move touched
     assert "nothing moved" not in err, err
+    # A hand rebuild records no move, so the repair has nothing to read: the
+    # paths go back by hand (#3492 PR D1).
+    assert "Put the tracked ones back" in err and "repair-move" not in err, err
     assert w.git(w.root, "symbolic-ref", "--short", "HEAD").stdout.strip() == "main"
 
 
@@ -1121,7 +1124,10 @@ def test_a_switch_that_fails_partway_records_partial(dc, dc_ready, capsys):
     w.git(w.root, "config", "filter.bad.required", "true")
     rec = _MoveRecord(_own_row(w))
     assert w.run(dc, "rebuild", extra_env=_own_env()) == 1
-    assert "failed partway" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert "failed partway" in err
+    # Recorded in update.sh's row, the move is one the repair reads (#3492 PR D1).
+    assert "Put them back with scripts/deploy_candidates repair-move" in err, err
     got = json.loads(rec.read_text())
     assert got["phase"] == "partial" and got["to"] != w.rev("HEAD")
 
@@ -1948,3 +1954,17 @@ def test_an_unreadable_head_after_the_move_is_unknown_not_on_live(
     assert "could not be read" in out, out
     assert "validation holds the lock: scripts/deploy_code_only.sh restart" not in out, out
     assert "on a detached" not in out, "an unreadable HEAD was reported as detached"
+
+
+def test_td20_a_guard_the_engine_cannot_load_names_the_live_repair(
+    dc, dc_ready, tmp_path, monkeypatch
+):
+    """T-D20 (#3492 PR D1): the engine refuses a state it cannot judge, and the
+    refusal names the repair for a half-written live checkout beside the
+    --post-merge it keeps (which refuses such a tree)."""
+    w = dc_ready
+    (w.home / ".genesis" / "update_state.json").write_text('{"phase": "merging"}')
+    monkeypatch.setattr(dc, "_SCRIPT_DIR", str(tmp_path))  # no lib/update_state_guard.py here
+    why = dc.Engine(w.root, w.env)._update_state_refusal()
+    assert why and "could not be checked" in why, why
+    assert "scripts/deploy_candidates repair-move" in why, why
