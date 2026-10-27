@@ -407,3 +407,58 @@ def test_a_key_shape_takes_its_whole_token(text):
     out, _ = redact_credentials(f"use {text} now")
     assert "TAILSECRET" not in out
     assert out.endswith(" now")
+
+
+def test_an_env_assignment_takes_a_value_wrapped_onto_the_next_line():
+    from genesis.security.output_scanner import redact_credentials
+
+    out, found = redact_credentials('API_TOKEN=\n"abc def TAILSECRET"\nnext line stays')
+    assert "TAILSECRET" not in out
+    assert out.endswith("\nnext line stays")
+    assert found == ["env_variable_secret"]
+
+
+@pytest.mark.parametrize("prefix", ["sk-", "gsk_", "ghp_"])
+def test_a_key_shape_inside_a_json_string_keeps_the_closing_quote(prefix):
+    import json
+
+    from genesis.security.output_scanner import redact_credentials
+
+    out, _ = redact_credentials('{"note": "use ' + prefix + "a" * 36 + '", "answer": "OK"}')
+    assert json.loads(out)["answer"] == "OK"
+    assert "a" * 20 not in out
+
+
+@pytest.mark.parametrize("sep", ["\n", "\r\n", "\n\n", "\n \n"])
+def test_a_value_below_a_name_the_cut_swallowed_goes_with_it(sep):
+    from genesis.security.output_scanner import redact_credentials
+
+    out, _ = redact_credentials("note password: abcdefgh123 API_TOKEN=" + sep + "TAILSECRET\nkept")
+    assert "TAILSECRET" not in out
+    assert out.endswith("\nkept")
+
+
+def test_a_flagged_line_ending_in_a_colon_keeps_the_lines_below():
+    from genesis.security.output_scanner import redact_credentials
+
+    text = "def connect(host, password=DEFAULT_PASSWORD):\n    open(host)\n    return 1"
+    out, _ = redact_credentials(text)
+    assert out == "def connect(host, [redacted:credential_assignment]\n    open(host)\n    return 1"
+
+
+def test_a_crlf_line_ending_survives_the_cut():
+    from genesis.security.output_scanner import redact_credentials
+
+    out, _ = redact_credentials("a\r\npassword: abcdefgh123 tail\r\nb")
+    assert out == "a\r\n[redacted:credential_assignment]\r\nb"
+
+
+def test_assignment_redaction_is_linear_on_hostile_text():
+    import time
+
+    from genesis.security.output_scanner import redact_credentials
+
+    hostile = "password: abcdefgh1 " * 100_000 + ": = " * 200_000
+    start = time.perf_counter()
+    redact_credentials(hostile)
+    assert time.perf_counter() - start < 2

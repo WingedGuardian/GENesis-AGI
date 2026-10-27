@@ -150,18 +150,13 @@ _REDACTABLE = frozenset(
         "env_variable_secret",
     }
 )
-# An assignment the detectors flag is redacted to the END OF ITS LINE. Trimming
-# to the exact value span meant parsing quotes, escapes and delimiters, and each
-# parse left some tail ("abcdefgh!rest", a quoted "abc def", mixed quotes)
-# that no detector recognises any more, so it shipped. Losing the rest of the
-# line is the cheap side of that trade. Every pattern below ends in [^\n]*,
-# which cannot fail, so none of them backtracks.
-_REDACT_OVERRIDES: dict[str, re.Pattern[str]] = {
-    "credential_assignment": re.compile(
-        r"(?i)(password|token|secret|api[_\s]?key)\s*[:=]\s*['\"]?[a-zA-Z0-9/+=_\-]{8,}[^\n]*",
-    ),
-    "env_variable_secret": re.compile(r"\b[A-Z_]{3,}_(KEY|SECRET|TOKEN|PASSWORD)\s*=[^\n]*"),
-}
+# An assignment the detectors flag is redacted from where the DETECTOR's match
+# starts to the end of the line its match ends on. Trimming to the exact value
+# meant parsing quotes, escapes and delimiters, and each parse left some tail
+# ("abcdefgh!rest", a quoted "abc def") that no detector recognises any more.
+# Taking the detector's own span, not a re-derived one, means a value it saw
+# across a line break (CRLF, a blank line) goes too.
+_ASSIGNMENTS = ("credential_assignment", "env_variable_secret")
 # A JSON member is a credential when a WORD of its key names one (key split on
 # punctuation and camelCase), unless the key's last word says the value is a
 # number or flag ABOUT the credential (token_count, password_required).
@@ -210,14 +205,16 @@ _KEY_WORD = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+")
 _JSON_MEMBER = re.compile(r'"([^"\n]{1,200})"(\s*:\s*)"(?:[^"\\\n]|\\.)*"')
 
 
-# One redactor per redactable pattern, built once. An assignment uses its
-# end-of-line override; a key shape takes the whole contiguous token, so a key
-# followed by ".rest" or "!rest" cannot leave "rest" behind for no detector to see.
+# One redactor per key shape, built once. It takes the whole token up to
+# whitespace, a quote or a backslash, so a key followed by ".rest" or "!rest"
+# cannot leave "rest" behind, and a key inside a JSON string keeps the string's
+# closing quote.
 _REDACTORS: dict[str, re.Pattern[str]] = {
-    name: _REDACT_OVERRIDES.get(name) or re.compile(pattern.pattern.removesuffix(r"\b") + r"\S*")
+    name: re.compile(pattern.pattern.removesuffix(r"\b") + r"""[^\s"'\\]*""")
     for name, pattern in _OUTPUT_PATTERNS
-    if name in _REDACTABLE
+    if name in _REDACTABLE and name not in _ASSIGNMENTS
 }
+_DETECTORS: dict[str, re.Pattern[str]] = dict(_OUTPUT_PATTERNS)
 
 
 def _is_credential_key(key: str) -> bool:
@@ -241,17 +238,48 @@ def redact_credentials(content: str) -> tuple[str, list[str]]:
     guarantee still run ``scan_outbound`` (or a stricter check) on the result.
     """
     found: list[str] = []
-    for name, pattern in _OUTPUT_PATTERNS:
-        if name not in _REDACTABLE:
-            continue
-        pattern = _REDACTORS[name]
-        content, count = pattern.subn(f"[redacted:{name}]", content)
-        if count:
-            found.append(name)
+    # JSON members first: a credential value is replaced whole, inside its quotes,
+    # before a free-text redactor can reach it.
     redacted = _JSON_MEMBER.sub(_redact_json_member, content)
     if redacted != content:
         found.append("json_credential")
-    return redacted, found
+    content, cut = _cut_assignments(redacted)
+    found += cut
+    for name, pattern in _REDACTORS.items():
+        content, count = pattern.subn(f"[redacted:{name}]", content)
+        if count:
+            found.append(name)
+    return content, found
+
+
+def _cut_assignments(content: str) -> tuple[str, list[str]]:
+    """Cut each flagged assignment from its match to the end of its last line."""
+    spans: list[tuple[int, int, str]] = []
+    for name in _ASSIGNMENTS:
+        newline = -1  # matches arrive in order: find each line's end once, not per match
+        for match in _DETECTORS[name].finditer(content):
+            if newline < match.end():
+                newline = content.find("\n", match.end())
+                newline = len(content) if newline < 0 else newline
+            end = newline
+            if end > match.start() and content[end - 1] == "\r":
+                end -= 1  # keep a CRLF line ending whole
+            spans.append((match.start(), max(end, match.end()), name))
+    if not spans:
+        return content, []
+    spans.sort()
+    merged = [list(spans[0])]
+    for start, end, name in spans[1:]:
+        if start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end, name])
+    parts, pos = [], 0
+    for start, end, name in merged:
+        parts += [content[pos:start], f"[redacted:{name}]"]
+        pos = end
+    parts.append(content[pos:])
+    return "".join(parts), sorted({name for _, _, name in spans}, key=_ASSIGNMENTS.index)
 
 
 def pattern_names() -> frozenset[str]:

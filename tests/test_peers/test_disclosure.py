@@ -102,3 +102,32 @@ def test_a_credential_the_redactor_cannot_cut_still_withholds_the_reply():
     text, redacted = disclosable_reply('{"password": ["' + "synthetic" + "credential" + '"]}')
     assert text is None
     assert redacted == []
+
+
+def test_an_api_key_in_a_json_reply_is_redacted_and_the_answer_kept():
+    from genesis.peers.results import disclosable_reply
+
+    text, redacted = disclosable_reply('{"api_key": "sk-' + "a" * 30 + '", "answer": "OK"}')
+    assert text == '{"api_key": "[redacted:json_credential]", "answer": "OK"}'
+    assert redacted == ["json_credential"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"note": "sk-' + "Q" * 24 + '\\u002dTAILSECRETTAILSECRET"}',
+        "use sk-" + "Q" * 24 + '"TAILSECRETTAILSECRET now',
+        "use sk-" + "Q" * 24 + "'-TAILSECRETTAILSECRET now",
+    ],
+)
+def test_a_key_cut_short_at_a_quote_or_escape_withholds_the_reply(text):
+    from genesis.peers.results import disclosable_reply
+
+    assert disclosable_reply(text)[0] is None
+
+
+def test_a_key_before_an_ordinary_escape_is_redacted_not_withheld():
+    from genesis.peers.results import disclosable_reply
+
+    text, _ = disclosable_reply('{"note": "sk-' + "Q" * 24 + '\\nnext line"}')
+    assert text == '{"note": "[redacted:api_key_openai]\\nnext line"}'
