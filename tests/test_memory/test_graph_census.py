@@ -1451,3 +1451,46 @@ def test_a_file_naming_secrets_path_is_never_carried_even_when_it_names_itself(
         prior={(80, census._iso(_PAST)): proof.secrets_digest(vals)},
     )
     assert p["carried"] is False
+def _rewrite_during_read(monkeypatch, path, new_text):
+    """The file changes while the census reads it: the case a digest must never
+    be issued for, since the server still holds the old content. The rewrite
+    lands inside the read, between its two snapshots."""
+    real = Path.read_text
+
+    def racing(self, *a, **k):
+        if self == path:
+            path.write_text(new_text)
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", racing)
+
+
+def test_an_edit_during_the_proven_read_is_unknown(monkeypatch, tmp_path):
+    secrets = tmp_path / "own.env"
+    secrets.write_text("GENESIS_GRAPH_TELEMETRY_DISABLED=1\n")
+    start = secrets.stat().st_ctime + 0.5
+    import time as _time
+
+    _time.sleep(max(0.0, start - _time.time()) + 0.6)
+    _rewrite_during_read(monkeypatch, secrets, "GENESIS_GRAPH_TELEMETRY_DISABLED=0\n")
+    assert proof.secrets_values(secrets, start) is None
+
+
+def test_an_edit_during_the_carry_read_is_not_read(monkeypatch, tmp_path):
+    """A different size, so the snapshot sees it deterministically; a same-size
+    rewrite inside one change-time tick is the stated residual, harmless because
+    a carry only ever returns values matching the already-proven digest."""
+    secrets = tmp_path / "own.env"
+    secrets.write_text("GENESIS_GRAPH_TELEMETRY_DISABLED=1\nOTHER=1\n")
+    _rewrite_during_read(monkeypatch, secrets, "GENESIS_GRAPH_TELEMETRY_DISABLED=0\nOTHER=11\n")
+    assert proof.changed_secrets_values(secrets, _PAST) is None
+
+
+def test_an_edit_between_the_check_and_the_read_is_unknown(monkeypatch, tmp_path):
+    """The other half of the window: the edit lands after the change-time check
+    but before the read starts, so the read itself sees one stable state."""
+    secrets = tmp_path / "own.env"
+    secrets.write_text("GENESIS_GRAPH_TELEMETRY_DISABLED=0\n")
+    start = secrets.stat().st_ctime - 100  # the file now postdates the start
+    monkeypatch.setattr(proof, "_unchanged_since", lambda _p, _s: True)  # the stale check
+    assert proof.secrets_values(secrets, start) is None
