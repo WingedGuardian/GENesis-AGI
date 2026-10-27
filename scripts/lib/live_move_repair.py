@@ -87,15 +87,20 @@ def _parents(p: str) -> list[str]:
     return out
 
 
-def _beyond_link(repo: str, p: str) -> bool:
-    """Is a parent of ``p`` a symlink or a non-directory? Then ``p`` is not in the
-    checkout: an lstat or unlink of it would act THROUGH that parent (a symlink
-    can point outside the checkout), and git itself calls such a path absent."""
+def _link_parent(repo: str, p: str) -> str | None:
+    """The parent of ``p`` that is a symlink or a non-directory, if any. Then
+    ``p`` is not in the checkout: an lstat or unlink of it would act THROUGH
+    that parent (a symlink can point outside the checkout), and git itself
+    calls such a path absent."""
     for d in _parents(p):
         full = os.path.join(repo, d)
         if os.path.islink(full) or (os.path.lexists(full) and not os.path.isdir(full)):
-            return True
-    return False
+            return d
+    return None
+
+
+def _beyond_link(repo: str, p: str) -> bool:
+    return _link_parent(repo, p) is not None
 
 
 def _node(repo: str, p: str, fmt: str) -> tuple[str, str] | None:
@@ -303,14 +308,22 @@ def _load_guard():
     return module
 
 
-def reapply_step(repo: str, backup: str, row: dict) -> str:
+def reapply_step(repo: str, backup: str, row: dict, below: list[str] | tuple = ()) -> str:
     """The shell step that puts a foreign row back the way the repair found it.
     Its index part runs first, as one `update-index -z --index-info` call (a
     mode-0 record drops the restored entry, the saved entries follow): git
     applies that stream whole or not at all (MEASURED, git 2.43), and the saved
     blobs are written back to the object store before it, so nothing is
     removed before the step that can fail. Records are NUL-terminated: a path
-    may hold a newline."""
+    may hold a newline. ``below`` are the row paths under this one: the restore
+    put their entries in the index, and git silently skips a file entry added
+    above one (MEASURED, git 2.43), so a row that re-adds an entry drops them
+    first (only rows whose own steps run after, parents first, and re-add what
+    they held, or that held nothing).
+    A row the repair saw beyond a symlinked or non-directory parent
+    (``unreachable_through``) gets its index state only: once that parent's
+    own step puts it back, the path is not in the checkout, and no step may
+    act through it."""
     q, path = shlex.quote, row["path"]
     dst = os.path.join(repo, path)
     steps = []
@@ -319,10 +332,23 @@ def reapply_step(repo: str, backup: str, row: dict) -> str:
             blob = q(os.path.join(backup, rel))
             steps.append(f"git -C {q(repo)} hash-object -w --no-filters -- {blob} >/dev/null")
         null = "0" * len((row["index"] or [row["tag"]])[0][1])
-        recs = [f"0 {null}\t{path}"] + [f"{m} {o} {s}\t{path}" for m, o, s in row["index"]]
+        # Only a stage-0 file entry conflicts with entries below it; an unmerged
+        # one (stages 1-3) sits beside them, so dropping them would only stage
+        # deletions nothing puts back.
+        stage0 = any(s == "0" for _m, _o, s in row["index"])
+        drops = [*below, path] if stage0 else [path]
+        recs = [f"0 {null}\t{d}" for d in drops]
+        recs += [f"{m} {o} {s}\t{path}" for m, o, s in row["index"]]
         fields = " ".join(q(r) for r in recs)
         steps.append(f"printf '%s\\0' {fields} | git -C {q(repo)} update-index -z --index-info")
-    if row["disk_changed"]:
+    parent = row.get("unreachable_through")
+    if parent and row["disk_changed"]:
+        note = (
+            f"{path} was not reachable through {parent} (a symlink or non-directory);"
+            " only its index state is re-applied"
+        )
+        steps.append(f"echo {q(note)} >&2")
+    elif row["disk_changed"]:
         steps.append(f"rm -rf -- {q(dst)}")
         special = row.get("special")
         if row["saved_as"]:
@@ -523,6 +549,7 @@ class Repair:
         cannot be read), of every change against HEAD (the tag)."""
         repo = self.repo
         self.other = _tree(repo, to) if to else {}
+        self.tag_dirs = {d for p in self.want for d in _parents(p)}
         revs = (self.tag, to) if to else ("HEAD",)
         paths = set(_z(_git(repo, "diff", "-z", "--no-renames", "--name-only", *revs).stdout))
         if not to:  # flagged and untracked paths included
@@ -537,7 +564,10 @@ class Repair:
                 if os.path.islink(full) or (os.path.lexists(full) and not os.path.isdir(full)):
                     paths.add(d)
         # The inventory is the restore's footprint: restoring a row path drops
-        # every index entry under it, so each such entry is a row of its own.
+        # every index entry under it and every index entry above it (a file
+        # entry `sub` where the tag has sub/, MEASURED git 2.43), so each such
+        # entry is a row of its own.
+        paths |= {d for p in list(paths) for d in _parents(p) if d in index}
         paths |= {q for q in index if paths.intersection(_parents(q))}
         rows = [r for r in (self._row(p, index, flags) for p in sorted(paths)) if r]
         # A foreign row's disk step needs its directory back (a gitlink's empty
@@ -555,6 +585,8 @@ class Repair:
         w, o = self.want.get(p), self.other.get(p)
         entries = index.get(p, [])
         disk_changed = node != _as_disk(w)
+        if w is None and p in self.tag_dirs and node in (None, ("dir", "")):
+            disk_changed = False  # a tag directory: its files are rows of their own
         if not disk_changed and entries == _as_index(w) and p not in flags:
             return None
         special = _special(os.path.join(self.repo, p)) if node and node[0] == "other" else None
@@ -578,6 +610,8 @@ class Repair:
             "saved_as": None,
             "blobs": [],  # the index entries' blobs, saved (a foreign row's)
             "unsaved": [],  # sockets and devices inside a saved directory
+            # Seen beyond this symlinked or non-directory parent: not in the checkout.
+            "unreachable_through": _link_parent(self.repo, p),
         }
 
     def _engine_wrote(self, p: str, node, o) -> bool:
@@ -632,8 +666,23 @@ class Repair:
                 shutil.copytree(src, dst, symlinks=True, copy_function=copy)
             else:
                 shutil.copy2(src, dst, follow_symlinks=False)
-        foreign = [r for r in manifest["paths"] if r["class"] == "foreign"]
-        manifest["reapply"] = [reapply_step(self.repo, backup, r) for r in foreign]
+        below: dict[str, list[str]] = {}
+        for r in manifest["paths"]:
+            # Only rows whose own step re-adds what they held, or that held
+            # nothing: dropping an engine row's entry would leave a staged
+            # deletion nothing puts back.
+            if r["class"] != "foreign" and r["index"]:
+                continue
+            for d in _parents(r["path"]):
+                below.setdefault(d, []).append(r["path"])
+        # Parents first: a parent's step puts back the node its children sit under.
+        foreign = sorted(
+            (r for r in manifest["paths"] if r["class"] == "foreign"),
+            key=lambda r: r["path"].split("/"),
+        )
+        manifest["reapply"] = [
+            reapply_step(self.repo, backup, r, below.get(r["path"], ())) for r in foreign
+        ]
         self._sync(backup)
         write_json(os.path.join(backup, "REPAIR.json"), manifest)
         self._retire_locks(backup)
@@ -679,21 +728,34 @@ class Repair:
             full = os.path.join(repo, row["path"])
             if row["disk"] == "dir" and row["disk_changed"]:
                 shutil.rmtree(full)
-            elif row["disk"] != "absent" and (w is None or row["disk"] == "other"):
+            elif (
+                row["disk_changed"]
+                and row["disk"] != "absent"
+                and (w is None or row["disk"] == "other")
+            ):
                 os.unlink(full)
         # `git restore` drops an index entry the tag lacks but refuses a path known
         # to neither, and refuses an index path under a named tag file (P/inner
         # under P), which naming P covers (MEASURED, git 2.43).
-        named = {r["path"] for r in rows if r["path"] in self.want or r["path"] in index}
+        # An index entry above a row (a file `sub` where the tag has sub/) is
+        # dropped by restoring that row (MEASURED, git 2.43); naming it would
+        # restore the whole tag directory, files that are not rows included.
+        tag_dirs = {d for p in self.want for d in _parents(p)}
+        named = {
+            r["path"]
+            for r in rows
+            if r["path"] in self.want or (r["path"] in index and r["path"] not in tag_dirs)
+        }
         spec = sorted(p for p in named if not named.intersection(_parents(p)))
         if spec:
             data = b"".join(os.fsencode(":(literal)" + p) + b"\0" for p in spec)
             _git(repo, "restore", f"--source={self.tag}", "--staged", "--worktree",
                  "--pathspec-from-file=-", "--pathspec-file-nul", data=data)  # fmt: skip
-        tag_dirs = {d for p in self.want for d in _parents(p)}
         for row in rows:
             for d in _parents(row["path"]):
-                if d not in tag_dirs:
+                # Never through a symlinked or non-directory parent: that
+                # rmdir would act outside the checkout.
+                if d not in tag_dirs and not _beyond_link(repo, d):
                     with contextlib.suppress(OSError):
                         os.rmdir(os.path.join(repo, d))
 
