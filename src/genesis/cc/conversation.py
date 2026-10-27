@@ -106,6 +106,13 @@ _TRUNCATION_NOTICE = (
     "you want another attempt."
 )
 
+_CAPPED_AFTER_TOOLS_NOTICE = (
+    "⚠️ Genesis hit its usage limit partway through this answer, after it had "
+    "already run tools. It is not being retried or queued automatically, "
+    "because those tools would run again. Send it again if you want another "
+    "attempt."
+)
+
 
 def _replay_notice(exc: CCReplayUnsafeError) -> str:
     if isinstance(exc, CCStreamTruncatedError):
@@ -909,8 +916,22 @@ class ConversationLoop:
                 # SERVED and clears stale blocks. A whitespace-only text block
                 # is truthy but shows the user nothing, so counting it let a
                 # silent-cap attempt erase a genuine quota block.
-                if ev.event_type == "text" and ev.text and ev.text.strip():
+                # Nor does CC's own limit notice ("You've hit your weekly
+                # limit"), which arrives as a synthetic assistant text line
+                # just before the quota error. Counting it skipped the
+                # full-tools failover and sent the turn straight to tool-less
+                # contingency (measured on a capped Telegram turn).
+                if (
+                    ev.event_type == "text"
+                    and ev.text
+                    and ev.text.strip()
+                    and not ev.is_synthetic
+                ):
                     streamed["text"] = True
+                # Any tool call counts: from this event on, a replay of the
+                # prompt with full tools could repeat what the call did.
+                if ev.event_type == "tool_use":
+                    streamed["tools"] = True
                 if on_event:
                     await on_event(ev)
 
@@ -947,6 +968,30 @@ class ConversationLoop:
                 # Phase 3: failover to a roster peer (full tools) BEFORE contingency
                 # — but only if NO answer text streamed yet (else re-streaming the
                 # peer's reply would double-output to the user).
+                if streamed["tools"]:
+                    # The turn ran tools before the cap hit. A peer or a parked
+                    # resume would re-run the whole prompt with full tools and
+                    # could repeat those effects (an outreach send, a write), so
+                    # only the tool-less contingency may answer — the same rule
+                    # as the `_Unreplayable` branch below.
+                    logger.warning(
+                        "CC failover skipped for session %s: the turn already ran "
+                        "tools — tool-less contingency only, no park (%s)",
+                        session["id"][:8], type(e).__name__,
+                    )
+                    fallback = await self._try_contingency(
+                        prompt_text, system_prompt, channel,
+                        session_id=session["id"],
+                        was_resume=resume_id is not None,
+                    )
+                    if fallback is not None:
+                        return fallback
+                    logger.error(
+                        "Contingency failed after a capped turn that ran tools — "
+                        "NOT parking, because a park would replay them: %s",
+                        e, exc_info=True,
+                    )
+                    return _CAPPED_AFTER_TOOLS_NOTICE
                 if not streamed["text"]:
                     roster_reply = await self._try_roster_failover(
                         invocation, session=session, channel=channel,
@@ -972,6 +1017,16 @@ class ConversationLoop:
                         return roster_reply.notice or _TRUNCATION_NOTICE
                     if roster_reply is not None:
                         return roster_reply
+                else:
+                    # The one branch that skips the full-tools failover without
+                    # trying a peer, so it names itself: without this line the
+                    # turn's log goes straight from the quota error to a
+                    # contingency answer and the skip is invisible.
+                    logger.warning(
+                        "CC failover skipped for session %s: answer text already "
+                        "streamed this turn — degrading to contingency (%s)",
+                        session["id"][:8], type(e).__name__,
+                    )
                 fallback = await self._try_contingency(
                     prompt_text, system_prompt, channel,
                     session_id=session["id"],
