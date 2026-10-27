@@ -46,6 +46,49 @@ on the next request; no new admission or disclosure is allowed. Accepted work is
 Genesis-owned and can be canceled explicitly; revocation does not replay it or
 introduce new per-tool leases. See restore/epoch cautions in the registry guide.
 
+## Connect a same-owner agent (generic client)
+
+`scripts/genesis_peer_mcp.py` is a single-file stdio MCP server that speaks this
+contract. Any MCP-capable agent you own (Claude Code, Codex, OpenCode) can use
+it to hand Genesis a task and read the answer. It needs `uv` and Python 3.10+
+on the agent's machine and nothing from a Genesis checkout. Tools:
+`genesis_ask`, `genesis_check`, `genesis_tasks`, `genesis_cancel`,
+`genesis_inbox` (messages Genesis started; see the [pull outbox](agent-outbox.md))
+and `genesis_health`.
+
+On the Genesis host, once per agent: add a distinct credential to `secrets.env`
+as `GENESIS_PEER_<NAME>_TOKEN`, restart through `scripts/deploy_code_only.sh
+restart`, then:
+
+```bash
+python -m genesis peers register <name> --same-owner --token-name GENESIS_PEER_<NAME>_TOKEN
+python -m genesis peers grant <name> conversation allow
+```
+
+On the agent's machine, copy the script and register it with each harness:
+
+```bash
+claude mcp add --scope user genesis-peer -e GENESIS_PEER_URL=https://YOUR-HOST/v1/agent/a2a -e GENESIS_PEER_TOKEN=<value> -- uv run --no-managed-python --script /path/to/genesis_peer_mcp.py
+codex mcp add genesis-peer --env GENESIS_PEER_URL=https://YOUR-HOST/v1/agent/a2a --env GENESIS_PEER_TOKEN=<value> -- uv run --no-managed-python --script /path/to/genesis_peer_mcp.py
+```
+
+`genesis_ask` and `genesis_check` wait up to `wait_s` (default 300, capped at
+480) seconds, plus a few send retries, so give the harness a tool timeout of
+about 10 minutes; Codex defaults lower, so set `tool_timeout_sec` on its
+`genesis-peer` entry. Each `genesis_ask` result carries its `message_id`;
+passing it back retries that exact send without duplicating work. The client
+keeps no local state: `genesis_inbox` never acknowledges on read, and only the
+ids the agent passes back as `ack` are marked collected, so a message the
+agent has not dealt with is shown again rather than lost. `--no-managed-python` uses the machine's own Python: on
+Windows over SSH, a uv-managed interpreter can sit behind a junction the session
+refuses to traverse. The agent's machine must resolve the configured host name
+(on a tailnet, enable the tailnet's DNS on that machine).
+
+Genesis starts each turn with no knowledge of the calling session, so the
+caller writes a self-contained brief. A completed task whose reply looked like
+a credential comes back with `replyError: disclosure_refused` and no text; the
+client says so rather than returning an empty answer.
+
 ## Wire contract
 
 Use `Authorization: Bearer <vault-supplied value>` and `A2A-Version: 1.0`.
