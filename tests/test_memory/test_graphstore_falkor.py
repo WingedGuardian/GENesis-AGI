@@ -1066,13 +1066,26 @@ async def test_every_network_operation_goes_through_the_bounded_chokepoint():
 
     # And the accessor can be sidestepped entirely by touching the attribute:
     # `self._db.connection.delete(...)` never calls `_connection()`.
+    # One exemption: `_pool_state` reads the pool's in-memory lists for the
+    # timeout diagnosis. It is exempt only while it cannot reach the socket: it
+    # stays synchronous, awaits nothing, and CALLS nothing through
+    # `.connection` (a sync method could still hand back an unawaited command).
+    state_readers = {"_pool_state"}
+    for node in methods:
+        if node.name in state_readers:
+            assert isinstance(node, ast.FunctionDef), f"{node.name} must stay synchronous"
+            assert not any(isinstance(n, ast.Await) for n in ast.walk(node)), node.name
+            for n in ast.walk(node):
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+                    chain = ast.unparse(n.func)
+                    assert ".connection" not in chain, f"{node.name} calls {chain}"
     raw = sorted(
         node.name
         for node in methods
         for inner in ast.walk(node)
         if isinstance(inner, ast.Attribute)
         and inner.attr == "connection"
-        and node.name != "_connection"
+        and node.name not in {"_connection", *state_readers}
     )
     assert not raw, f"self._db.connection must go through _connection(); touched by {raw}"
 
@@ -1951,6 +1964,100 @@ async def test_the_pressure_read_is_container_scoped_only():
     with patch.object(readings, "read_psi_totals", _record):
         falkor_mod._psi_totals()
     assert seen == {"cgroup_only": True}
+# ── T2: which leg of a read the deadline caught ────────────────────────────
+# Every instrumented timeout before T2 ended `_readline>readline>readuntil>
+# _wait_for_data`. redis-py reads a reconnect's handshake reply and a query's
+# reply through those same four frames, so four could not say which one the
+# deadline caught. Sixteen keep the frame that does (counted: 16 on the reply
+# path, 19 on the handshake path, deepest kept).
+
+
+class _PoolConn:
+    def __init__(self, connected: bool):
+        self.is_connected = connected
+
+
+def _client_with_pool(idle: list, in_use: int):
+    pool = type("Pool", (), {})()
+    pool._available_connections = idle
+    pool._in_use_connections = {object() for _ in range(in_use)}
+    return type("C", (), {"connection": type("R", (), {"connection_pool": pool})()})()
+
+
+async def _timed_out_diag(store, factory_effect=None, budget=0.05):
+    async def _factory():
+        if factory_effect:
+            factory_effect()
+        await _nest(20)
+
+    with pytest.raises(GraphUnavailableError) as caught:
+        await store._bounded(_factory, timeout=budget, what="graph query")
+    return caught.value.diag
+
+
+async def _nest(depth: int):
+    if depth:
+        await _nest(depth - 1)
+    else:
+        import asyncio as _asyncio
+
+        await _asyncio.sleep(5)
+
+
+async def test_a_timeout_keeps_sixteen_frames_with_their_lines(tmp_path):
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    diag = await _timed_out_diag(store)
+    assert len(diag["frames"]) == falkor_mod._DIAG_FRAMES == 16, diag["frames"]
+    assert diag["frames"][-1] == "sleep"
+    assert diag["frames"][-2] == "_nest"
+    assert len(diag["frame_lines"]) == 16
+    assert all(isinstance(n, int) and n > 0 for n in diag["frame_lines"])
+    import redis
+
+    assert diag["client_version"] == redis.__version__  # what the lines are lines OF
+
+
+@pytest.mark.parametrize(
+    ("idle", "in_use", "conn"),
+    [
+        ([], 0, "new"),
+        ([_PoolConn(True)], 1, "idle_open"),
+        ([_PoolConn(True), _PoolConn(False)], 2, "idle_closed"),  # the pool pops the LAST
+    ],
+)
+async def test_a_timeout_records_the_connection_the_pool_would_hand_out(
+    tmp_path, idle, in_use, conn
+):
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    store._db = _client_with_pool(idle, in_use)
+    diag = await _timed_out_diag(store)
+    assert (diag["conn"], diag["in_use"]) == (conn, in_use)
+
+
+async def test_the_connection_state_is_read_before_the_read_runs(tmp_path):
+    """The read itself takes the connection out of the idle list, so a reading
+    taken at the timeout would always say "new"."""
+    idle = [_PoolConn(True)]
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    store._db = _client_with_pool(idle, 0)
+    diag = await _timed_out_diag(store, factory_effect=idle.clear)
+    assert diag["conn"] == "idle_open"
+
+
+async def test_no_client_yet_is_its_own_state(tmp_path):
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    diag = await _timed_out_diag(store)
+    assert (diag["conn"], diag["in_use"]) == ("no_client", None)
+
+
+async def test_an_unreadable_pool_never_costs_the_diagnosis(tmp_path):
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    store._db = object()  # no `.connection`: a client shape we do not know
+    diag = await _timed_out_diag(store)
+    assert (diag["conn"], diag["in_use"]) == (None, None)
+    assert diag["frames"]
+
+
 
 
 # ── the first read after a projection ──────────────────────────────────────

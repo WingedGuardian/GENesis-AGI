@@ -104,8 +104,15 @@ GRAPH_KEY = "genesis_memory"
 #: an unbounded wait. Do not read it as "falling back is free".
 _READ_TIMEOUT_S = 0.5
 
-#: How many innermost frame NAMES a timeout's diagnosis keeps (see `_timeout_diag`).
-_DIAG_FRAMES = 4
+#: How many innermost frames a timeout's diagnosis keeps (see `_timeout_diag`).
+#: Four could not tell a reconnect's handshake from a query's reply: redis-py
+#: reads both through the same `_readline>readline>readuntil>_wait_for_data`,
+#: and every instrumented timeout ended in exactly those four. MEASURED with
+#: redis 8.1.0: the reply path is 16 frames deep, the handshake path 20 or more,
+#: and the frames that tell them apart (`_send_command_parse_response`;
+#: `ensure_connection`, `connect_check_health`) sit within the deepest 16 either
+#: way. The window keeps the DEEPEST frames, so frames added above never move it.
+_DIAG_FRAMES = 16
 
 
 def _psi_totals() -> dict[str, int] | None:
@@ -122,6 +129,16 @@ def _psi_totals() -> dict[str, int] | None:
         return None
 
 
+def _client_version() -> str | None:
+    """The redis-py version, which ``frame_lines`` mean nothing without."""
+    try:
+        import redis
+
+        return str(redis.__version__)
+    except Exception:
+        return None
+
+
 def _timeout_diag(
     exc: BaseException,
     *,
@@ -129,13 +146,15 @@ def _timeout_diag(
     started: float,
     fired_at: float | None,
     psi_before: dict[str, int] | None,
+    pool: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """What a deadline that fired can say about its own cause. Never raises.
 
     - ``frames``: function names of the awaits the deadline cancelled, deepest
       last (the TimeoutError's cause is that CancelledError). Names only: no
-      paths, no arguments. A connect shows ``_graph``; a reply never sent shows
-      the client's reader.
+      paths, no arguments. A client construction shows ``_graph``; a handshake
+      shows ``ensure_connection``/``connect_check_health``; a reply never sent
+      shows ``_send_command_parse_response`` above the client's reader.
     - ``late_ms``: how long after the deadline the event loop got to run it,
       read from a marker timer due at the same instant. The deadline runs on the
       loop, so a loop held by synchronous work runs it late: large means THIS
@@ -145,6 +164,10 @@ def _timeout_diag(
       cleanup lands here and never in ``late_ms``.
     - ``psi_stall_us``: the container's cgroup stall time (µs) across the wait,
       per resource. ``avg10`` cannot see a sub-second stall.
+    - ``frame_lines``: the line each of ``frames`` was at, so a first connect and
+      a reconnect inside the same function stay apart.
+    - ``conn`` / ``in_use``: the connection the pool was about to hand out, read
+      BEFORE the read (see `_pool_state`).
     """
     diag: dict[str, Any] = {
         "budget_ms": round(timeout * 1000, 1),
@@ -152,7 +175,9 @@ def _timeout_diag(
         "late_ms": None,
         "cancel_ms": None,
         "frames": None,
+        "frame_lines": None,
         "psi_stall_us": None,
+        **(pool or {"conn": None, "in_use": None}),
     }
     try:
         now = time.monotonic()
@@ -164,10 +189,14 @@ def _timeout_diag(
         tb = cancelled.__traceback__ if cancelled is not None else None
         if tb is not None:
             names: list[str] = []
+            lines: list[int] = []
             while tb is not None:
                 names.append(tb.tb_frame.f_code.co_name)
+                lines.append(tb.tb_lineno)
                 tb = tb.tb_next
             diag["frames"] = names[-_DIAG_FRAMES:]
+            diag["frame_lines"] = lines[-_DIAG_FRAMES:]
+            diag["client_version"] = _client_version()
         after = _psi_totals()
         if psi_before and after:
             diag["psi_stall_us"] = {
@@ -501,6 +530,43 @@ class FalkorGraphStore:
         await self._graph()
         return self._db.connection
 
+    def _pool_state(self) -> dict[str, Any]:
+        """The connection the client's pool will hand the next read, and how many
+        it has out. Synchronous and read before the read, with no await between,
+        so on one event loop nothing can change it first; another coroutine's
+        read already in flight is what ``in_use`` counts.
+
+        ``conn``: ``"no_client"`` (not constructed yet: the read will build it),
+        ``"new"`` (nothing idle: the pool will open one, handshake included),
+        ``"idle_open"`` / ``"idle_closed"`` (the idle connection the pool pops,
+        its LAST, by whether it still holds a socket). ``idle_open`` cannot see a
+        socket the server already closed. MEASURED on redis 8.1.0: that read
+        fails fast with ``ConnectionError`` ("Connection lost") rather than
+        timing out, so it reaches telemetry as an error, never as a timeout
+        diagnosis; the next read opens a new connection.
+
+        "Nothing can change it first" fails in one rare window: a read waiting
+        on the pool's lock while another coroutine's ``release()`` disconnects
+        under it. Its frames then sit under ``get_connection`` and read as a
+        connect.
+
+        Reads redis-py's private pool lists, so any surprise reads ``None``.
+        """
+        state: dict[str, Any] = {"conn": None, "in_use": None}
+        if self._db is None:
+            state["conn"] = "no_client"
+            return state
+        try:
+            pool = self._db.connection.connection_pool
+            idle = pool._available_connections
+            in_use = len(pool._in_use_connections)
+            last = idle[-1] if idle else None
+            conn = "new" if last is None else "idle_open" if last.is_connected else "idle_closed"
+            state.update(conn=conn, in_use=in_use)
+        except Exception:
+            logger.debug("pool state unreadable for the timeout diagnosis", exc_info=True)
+        return state
+
     async def _bounded(
         self, factory: Callable[[], Awaitable[Any]], *, timeout: float, what: str
     ) -> Any:
@@ -523,6 +589,9 @@ class FalkorGraphStore:
         # it rather than extending it: the call stays bounded by `timeout`.
         started = time.monotonic()
         psi_before = _psi_totals()
+        # Before the factory runs: the read itself takes this connection out of
+        # the idle list, so a reading taken at the timeout would always say "new".
+        pool = self._pool_state()
         remaining = max(0.0, started + timeout - time.monotonic())
         # A marker due at the same instant as the deadline: when it ran is when
         # the loop got to the deadline, apart from any cancellation cleanup after.
@@ -542,6 +611,7 @@ class FalkorGraphStore:
                 started=started,
                 fired_at=fired[0] if fired else None,
                 psi_before=psi_before,
+                pool=pool,
             )
             raise err from exc
         except GraphUnavailableError:
