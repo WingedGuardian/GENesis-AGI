@@ -288,8 +288,12 @@ ticks, age) and, for a read that timed out, the store's own account
 (`GraphUnavailableError.diag` from `graphstore_falkor._bounded`): its budget,
 how far past the deadline it fired (`late_ms` — large means the caller's event
 loop was held, about zero means the engine did not answer), the function names
-of the awaits it cancelled, and the container's PSI stall time across the wait.
-Rows carry `primary_ms`, a latency spread of answered traversals per store, and
+and lines of the 16 innermost awaits it cancelled, the connection the client's
+pool was about to hand out (`conn`: `no_client`, `new`, `idle_open` or
+`idle_closed`, read before the read; `in_use`: reads already in flight), and the
+container's PSI stall time across the wait. The report names the phase those
+frames put the wait in (`construct`, `connect` or `reply`; a row from before the
+connection reading prints `unknown` unless its frames alone name the leg). Rows carry `primary_ms`, a latency spread of answered traversals per store, and
 the report prints each reset's cause. The engine unit keeps its own record of
 slow moments (`--slowlog-max-len 4096`, `--latency-monitor-threshold 100`).
 A call's first fallback, selection failure or error is also written as
