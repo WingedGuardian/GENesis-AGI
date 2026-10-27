@@ -92,9 +92,14 @@ class El:
         self.form = None  # its form, for _SAME_FORM_JS
         self.own_label = None  # an input's one label El (whose .control is this El)
         self.control = None  # a label's control El
-        self.label_point = {"x": 5.0, "y": 5.0}  # _LABEL_POINT_JS's answer (None: none)
+        self.label_point = {
+            "x": 5.0,
+            "y": 5.0,
+        }  # _LABEL_POINT_JS's answer (None: none; or a callable)
         self.fail_trials = 0  # the next N trial ticks time out (a passing overlay)
         self.positions: list = []  # where each check() aimed
+        self.ticked_at: list = []  # where each real (not trial) check() aimed
+        self.on_fill = None  # called after this element is filled
 
 
 class Handle:
@@ -154,7 +159,8 @@ class Handle:
         if js is pc._INNER_TEXT_JS:
             return self.el.text
         if js is pc._LABEL_POINT_JS:
-            return self.el.label_point
+            lp = self.el.label_point
+            return lp() if callable(lp) else lp
         if js is pc._SAME_FORM_JS:
             return self.el.form is not None and self.el.form == arg.el.form
         raise AssertionError("unexpected script")
@@ -177,6 +183,8 @@ class Handle:
 
     async def check(self, timeout=None, trial=False, position=None):
         self.el.positions.append(position)
+        if not trial:
+            self.el.ticked_at.append(position)
         if trial and self.el.fail_trials:
             self.el.fail_trials -= 1
             raise TimeoutError("covered for now")
@@ -193,6 +201,8 @@ class Handle:
 
     async def fill(self, value, timeout=None):
         self.el.value = "x" if self.el.mangle else value
+        if self.el.on_fill is not None:
+            self.el.on_fill()
 
     async def select_option(self, timeout=None, value=None, label=None):
         if label is not None:
@@ -2770,8 +2780,10 @@ async def test_a_step_that_ticks_a_box_through_its_label_is_refused(vault):
     [
         (lambda box: setattr(box, "checked", True), "consent_pre_ticked"),
         (lambda box: setattr(box, "label", "   "), "consent_unlabelled"),
-        (lambda box: setattr(box, "label", "x" * (pc.CONSENT_LABEL_CHARS + 1)),
-         "consent_label_too_long"),
+        (
+            lambda box: setattr(box, "label", "x" * (pc.CONSENT_LABEL_CHARS + 1)),
+            "consent_label_too_long",
+        ),
         (lambda box: setattr(box, "untickable", True), "consent_not_found:1:trial"),
     ],
 )
@@ -3008,9 +3020,10 @@ async def test_save_stops_before_pay_when_the_total_does_not_fit(vault, total, c
     out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
     assert out["code"] == code
     assert ns.saves == [True] and ns.pay_clicks == []
-    assert out["status"].endswith(cf.TEXTS[code].split(".")[-1]) or "Pay was NOT clicked" in out[
-        "status"
-    ]
+    assert (
+        out["status"].endswith(cf.TEXTS[code].split(".")[-1])
+        or "Pay was NOT clicked" in out["status"]
+    )
 
 
 async def test_a_service_that_did_not_show_the_ceiling_types_nothing(vault):
@@ -3264,7 +3277,6 @@ async def test_a_consent_that_cannot_be_read_is_a_refusal(vault):
     assert out["code"] == "saved_page_changed" and ns.pay_clicks == []
 
 
-
 async def test_a_bank_frame_shown_only_while_the_total_settles_is_a_challenge(vault):
     # It shows during the wait for the total and hides before the final check:
     # only the check inside the wait sees it.
@@ -3272,6 +3284,7 @@ async def test_a_bank_frame_shown_only_while_the_total_settles_is_a_challenge(va
     bank = Frame("https://hooks.stripe.com/3d_secure_2/x")
     bank.parent_frame = ns.ppage.main_frame
     ns.ppage.extra.append(bank)
+
     def flash():
         bank.visible = True
         # Hidden again at the first read of the total, which comes after the
@@ -3296,9 +3309,7 @@ async def test_a_save_that_changes_nothing_never_pays(vault):
     assert out["status"] == cf.TEXTS["save_unconfirmed"]
 
 
-async def test_a_pay_label_that_is_the_price_source_must_still_read_the_total(
-    vault, monkeypatch
-):
+async def test_a_pay_label_that_is_the_price_source_must_still_read_the_total(vault, monkeypatch):
     # No total element: Pay's label is where the total was read, so a label
     # gone back to a placeholder at the final check is refused.
     ns = save_checkout()
@@ -3546,3 +3557,37 @@ async def test_a_box_with_no_label_keeps_its_full_trial_window(vault):
     box.fail_trials = 1  # covered by an overlay for the first look only
     out, _ = await _run(ns, consent=CONSENT)
     assert out["code"] == "submitted_unverified" and box.checked
+
+
+async def test_the_tick_reads_the_label_point_again_after_the_fill(vault):
+    ns = checkout()
+    box, lab = _styled(ns)
+    lab.label_point = lambda: (
+        {"x": 9.0, "y": 30.0} if ns.els["number"].value else {"x": 7.0, "y": 21.0}
+    )
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "submitted_unverified" and box.checked
+    assert lab.ticked_at == [{"x": 9.0, "y": 30.0}]
+
+
+async def test_a_label_with_no_clear_point_after_the_fill_never_ticks(vault):
+    ns = checkout()
+    box, lab = _styled(ns)
+    lab.label_point = lambda: None if ns.els["number"].value else {"x": 7.0, "y": 21.0}
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "consent_failed" and not box.checked and lab.ticked_at == []
+
+
+async def test_a_label_moved_to_another_box_by_the_fill_never_ticks(vault):
+    ns = checkout()
+    box, lab = _styled(ns)
+    other = El(tag="input")
+    other.checkbox = True
+
+    def move():
+        lab.control = other
+
+    ns.els["number"].on_fill = move
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "consent_failed"
+    assert not box.checked and not other.checked and lab.ticked_at == []
