@@ -273,7 +273,16 @@ Acceptance: 400 live roots replayed through both stores, 0 node-set differences.
 The FalkorDB projection is rebuilt hourly by `genesis-graph-project.timer`
 (`memory/graphstore_project.py`); that schedule is its staleness bound, and an
 engine restart leaves no projection until the next run (the engine keeps no data
-on disk). At runtime only `graph.traverse()` READS the engine (the projector
+on disk). Before the swap, the projector runs the callers' own traversal and
+marker queries on the new graph (`graphstore_falkor._WARM_TRAVERSALS`) and prints
+the outcome (`warm-up: ...`) in the unit's journal. Engine time for the first
+read of a freshly projected graph was 52-358 ms where later reads took 1-3.5 ms,
+and each read timeout recorded from 2026-10-21 to 2026-10-26 was that first read
+during a container I/O stall; with the warm-up the first read took 1.2-2.9 ms in
+15 of 15 test runs. A warm-up that fails logs a warning and publishes the graph
+cold.
+
+ At runtime only `graph.traverse()` READS the engine (the projector
 writes it, the health probe pings it): its callers are `memory_recall`
 enrichment (MCP, and genesis-server's tool API), `memory_expand`, and
 `drift_recall` (MCP drift mode and the ambient worker). Recall's own graph step (`graph_expansion.py`) reads
@@ -288,8 +297,12 @@ ticks, age) and, for a read that timed out, the store's own account
 (`GraphUnavailableError.diag` from `graphstore_falkor._bounded`): its budget,
 how far past the deadline it fired (`late_ms` — large means the caller's event
 loop was held, about zero means the engine did not answer), the function names
-of the awaits it cancelled, and the container's PSI stall time across the wait.
-Rows carry `primary_ms`, a latency spread of answered traversals per store, and
+and lines of the 16 innermost awaits it cancelled, the connection the client's
+pool was about to hand out (`conn`: `no_client`, `new`, `idle_open` or
+`idle_closed`, read before the read; `in_use`: reads already in flight), and the
+container's PSI stall time across the wait. The report names the phase those
+frames put the wait in (`construct`, `connect` or `reply`; a row from before the
+connection reading prints `unknown` unless its frames alone name the leg). Rows carry `primary_ms`, a latency spread of answered traversals per store, and
 the report prints each reset's cause. The engine unit keeps its own record of
 slow moments (`--slowlog-max-len 4096`, `--latency-monitor-threshold 100`).
 A call's first fallback, selection failure or error is also written as
@@ -327,7 +340,12 @@ it runs with: the memory lifespan's router reloads its secrets file with
 `override=True`, so a key the file carries beats the exec-time value; the file
 counts only if it and every symlink met resolving it, including links inside a
 link's own target, are unchanged by ctime since the server started, and a
-missing or changed file is unknown), and its database
+missing or changed file is unknown, except that a file changed only in keys the
+census does not read is carried: each row records `secrets_digest`, a hash of
+the six keys it reads, and the next census proves a changed file whose current
+values hash the same for the same pid and start (`carried: true`; the latest
+census row only; never when the file names `SECRETS_PATH` or
+`GENESIS_REPO_ROOT`)), and its database
 scope (the primary database is fixed at import from the exec env or the root
 default, and a path in the file becomes a second one; `foreign` only when every
 one of them differs from the live database by `(st_dev, st_ino)`, no symlink on
@@ -2935,7 +2953,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 2f013ed7b 2026-10-24
+verified: 3e27b4794 2026-10-23
 ```
 
 - Verification refresh is limited to the sampled qualification-runner behavior
@@ -2964,7 +2982,14 @@ verified: 2f013ed7b 2026-10-24
   candidate adds the parser, durable per-source records, audited historical
   readers and live query views. Readers capture immutable source selections;
   tool blocks remain distinct, and uncertain result or delegation matches stay
-  unresolved. CLI and scheduling arrive in dependent changes. Additional backup
+  unresolved. This CLI candidate exposes opt-in capped collection, status, live
+  SQL, disposable cache building and independent live/cache verification. The
+  canonical configuration defaults off and accepts the existing private overlay;
+  default paths follow the canonical runtime homes while explicit paths win.
+  Status reads confined snapshot metadata and reports individual source stat or
+  fingerprint errors while continuing; bounded SQL previews and streaming CSV
+  preserve full query counts without retaining every result row in Python.
+  Scheduling arrives in a dependent change. Additional backup
   and recovery integration is deferred independently of collection and search.
   Unknown historical content is excluded from content metrics. Views version 24
   preserves missing call/result hashes as unknown and admits ownership from the
@@ -4358,6 +4383,10 @@ verified: 3e27b479 2026-10-23
   structural uncertainty and heredoc completeness independently. Proven inert
   fragments retain narrow relief; complex valid heredoc forms can still be
   refused. See `docs/reference/shell-parse-completeness.md` for the boundary.
+  For hash-free scanner inputs, its unquoted scanner consumes backslash/non-newline
+  pairs as word data. Hash-containing calls retain their earlier scanner behavior
+  to avoid a comment/quote regression; generic #3257/#3264 remain partial/open.
+  Existing continuation, heredoc proof, size bounds and nested refusals remain.
   Codex's local CLI also has a budget-only shell action hook in
   `.codex/config.toml` (`scripts/hooks/codex-review-stop`). It consumes the
   existing commit/request budget decisions, denies approval-required or unknown
