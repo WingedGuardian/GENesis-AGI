@@ -660,6 +660,9 @@ def test_a_global_attributes_file_cannot_downgrade_substantiality(repos, monkeyp
     (fake_home / "attrs").write_text("*.py binary\n")
     (fake_home / ".gitconfig").write_text(f"[core]\n\tattributesFile = {fake_home}/attrs\n")
     monkeypatch.setenv("HOME", str(fake_home))
+    # The poison reaches git through HOME's .gitconfig, which the suite's live
+    # closure (GIT_CONFIG_GLOBAL=/dev/null) would otherwise keep git from reading.
+    monkeypatch.delenv("GIT_CONFIG_GLOBAL", raising=False)
 
     assert review_scope.classify_change_substantiality(cwd=cwd) == "substantial", (
         "a global core.attributesFile marking *.py binary downgraded the "

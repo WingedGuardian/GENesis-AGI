@@ -36,6 +36,10 @@ gpg = private_module("git_push_guard", _HOOKS / "git_push_guard.py")
 def _isolate_git_config(monkeypatch):
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    # Stock ssh transport, as these cases model: the guard declines to probe when
+    # either is set, and the suite's live closure sets GIT_SSH_COMMAND=false.
+    monkeypatch.delenv("GIT_SSH_COMMAND", raising=False)
+    monkeypatch.delenv("GIT_SSH", raising=False)
 
 
 def _parsed_push_seg(command: str):

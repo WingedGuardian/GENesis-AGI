@@ -1498,6 +1498,7 @@ def test_a_relative_genesis_home_still_finds_the_vault(_keyed, backup_env, tmp_p
     offsite = tmp_path / "offsite"
     offsite.mkdir()
     env = dict(os.environ)
+    env.pop("SECRETS_PATH", None)  # GENESIS_DIR names the secrets file, as on CI
     env.update(
         HOME=str(backup_env["home"]),
         GENESIS_HOME=".genesis",
