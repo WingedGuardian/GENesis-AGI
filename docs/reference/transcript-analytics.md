@@ -37,10 +37,10 @@ live views over the same captured source selection. `verify` requires an availab
 current cache and compares schemas, counts and row digests with forced live views.
 Excluded sources keep verification incomplete.
 
-Use `sql --live` for raw tables and SQL text containing raw-looking names, including
-harmless literals or comments. The first release retains that documented text-gate
-usability quirk. A query's `--window` is a provenance label; filter timestamps in
-SQL for an actual analysis window. `--since` selects source files during ingestion
+Plain `sql` sees the derived views only, whether or not the cache is current; use
+`sql --live` for the raw tables and reconciliation intermediates. A query's
+`--window` is a provenance label; filter timestamps in SQL for an actual analysis
+window. `--since` selects source files during ingestion
 and does not filter the records returned by SQL. Use a distinct `--manifest PATH`
 for each query so later queries do not overwrite earlier evidence.
 

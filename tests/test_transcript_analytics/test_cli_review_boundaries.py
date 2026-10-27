@@ -58,6 +58,8 @@ def test_status_uses_reader_selector_boundary_without_reading_pages(tmp_path, mo
     manifest = {
         "views_version": query.VIEWS_VERSION,
         "inputs_signature": "captured",
+        "views": list(query._DERIVED),
+        "schemas": {},
         "marker": "synthetic",
     }
     if kind != "absent":
@@ -103,7 +105,54 @@ def test_status_uses_reader_selector_boundary_without_reading_pages(tmp_path, mo
     else:
         assert observed is None
         assert current is (None if kind in {"absent", "empty"} else False)
-    assert query.snapshot_manifest(data) == (manifest if kind in {"valid", "stale"} else {})
+
+
+def _published(tmp_path, manifest_text=None):
+    """A derived/current selector over one generation holding MANIFEST.json."""
+    data = tmp_path / "data"
+    generation = data / "derived" / "generation"
+    generation.mkdir(parents=True)
+    (data / "derived" / "current").symlink_to("generation", target_is_directory=True)
+    if manifest_text is not None:
+        (generation / "MANIFEST.json").write_text(manifest_text)
+    return data, generation
+
+
+def test_status_does_not_block_on_a_special_manifest(tmp_path, monkeypatch):
+    import threading
+
+    data, generation = _published(tmp_path)
+    os.mkfifo(generation / "MANIFEST.json")
+    monkeypatch.setattr(store, "inputs_signature", lambda *a, **k: "captured")
+    result = []
+    reader = threading.Thread(
+        target=lambda: result.append(cli._snapshot_state(data, selection=([], []))), daemon=True
+    )
+    reader.start()
+    reader.join(timeout=10)
+    assert not reader.is_alive(), "status blocked on a FIFO manifest"
+    assert result == [(None, False)]
+
+
+@pytest.mark.parametrize(
+    "change",
+    [{"views": ["tool_calls"]}, {"schemas": None}, {"views_version": "older"}],
+    ids=["views-list", "schemas", "views-version"],
+)
+def test_status_calls_current_only_what_the_reader_would_load(tmp_path, monkeypatch, change):
+    manifest = {
+        "views_version": query.VIEWS_VERSION,
+        "inputs_signature": "captured",
+        "views": list(query._DERIVED),
+        "schemas": {},
+    }
+    manifest.update(change)
+    data, _ = _published(tmp_path, json.dumps(manifest))
+    monkeypatch.setattr(store, "inputs_signature", lambda *a, **k: "captured")
+    observed, current = cli._snapshot_state(data, selection=([], []))
+    assert observed == manifest and current is False
+    with pytest.raises(ValueError, match="not current"):
+        query._snapshot(data, ([], []))
 
 
 @pytest.mark.parametrize("claude", [False, True])

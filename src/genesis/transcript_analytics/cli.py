@@ -3,7 +3,7 @@
     ta ingest [--since DAYS] [--timer]   build/refresh the per-source Parquet store
     ta status                            store size, sources, staleness
     ta sql "<query>" [--csv]             query the views (tool_calls, turns, hooks, events,
-                                         session_meta, agents, sessions; raw_<table> too)
+                                         session_meta, agents, sessions; raw_<table> with --live)
     ta prune --before YYYY-MM-DD         drop sources whose transcript is GONE and is older
 
 ``--timer`` honours the off-switch: GENESIS_TRANSCRIPT_ANALYTICS_DISABLED=1 or a
@@ -171,32 +171,15 @@ def _marker_totals(markers):
 
 
 def _snapshot_state(data, *, selection):
-    """The derived snapshot's manifest and whether it matches the store today.
+    """The derived snapshot's manifest and whether the reader would use it.
 
-    Returns (manifest|None, current|None): current is True only when the
-    manifest exists and its views_version and inputs signature match the
-    store; False when a snapshot exists but is stale or unreadable.
+    The reader owns both the manifest read (regular files only) and the
+    freshness test, so status can never call current a cache the reader
+    rejects: see ``query.snapshot_state``.
     """
-    import json as _json
+    from genesis.transcript_analytics import query
 
-    from genesis.transcript_analytics import query, store
-
-    current = data / "derived" / "current"
-    try:
-        manifest = _json.loads((query._snapshot_directory(data) / "MANIFEST.json").read_text())
-    except (OSError, ValueError, RuntimeError):
-        root = data / "derived"
-        try:
-            invalid_root = root.is_symlink() or (root.exists() and not root.is_dir())
-            return None, (False if invalid_root or current.is_symlink() or current.exists() else None)
-        except OSError:
-            return None, False
-    current_flag = (
-        isinstance(manifest, dict)
-        and manifest.get("views_version") == query.VIEWS_VERSION
-        and manifest.get("inputs_signature") == store.inputs_signature(data, selection=selection)
-    )
-    return manifest, current_flag
+    return query.snapshot_state(data, selection=selection)
 
 
 def _status(args):
@@ -369,7 +352,9 @@ def _configure(ap):
     p.add_argument("--window", help="analysis window label; SQL must apply this filter")
     p.add_argument("--baseline", help="deployment commit or baseline identifier")
     p.add_argument(
-        "--live", action="store_true", help="query the per-source files, not the snapshot (slow)"
+        "--live",
+        action="store_true",
+        help="query the per-source files, not the snapshot (slow); also exposes raw_<table> views",
     )
     p.add_argument("--max-rows", type=_nonnegative_int, default=100)
     p.add_argument(

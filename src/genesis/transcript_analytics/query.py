@@ -25,6 +25,12 @@ from genesis.transcript_analytics.extract import TABLES
 
 VIEWS_VERSION = "24"
 _READS = weakref.WeakKeyDictionary()
+
+
+class NoSnapshot(ValueError):
+    """``connect(snapshot_only=True)`` found no current snapshot to load."""
+
+
 _DERIVED = (
     "tool_calls",
     "turns",
@@ -78,21 +84,49 @@ def _snapshot_directory(data):
     return directory
 
 
-def _snapshot(data, selection):
-    directory = _snapshot_directory(data)
+def _read_manifest(directory):
     # A FIFO or device in the cache must not block the reader (or a rebuild
     # holding the writer lock); only a regular file is read.
     with store._open_regular(directory / "MANIFEST.json") as handle:
-        manifest = json.loads(handle.read())
-    if (
-        not isinstance(manifest, dict)
-        or manifest.get("views_version") != VIEWS_VERSION
-        or manifest.get("inputs_signature") != store.inputs_signature(data, selection=selection)
-        or manifest.get("views") != list(_DERIVED)
-        or not isinstance(manifest.get("schemas"), dict)
-    ):
+        return json.loads(handle.read())
+
+
+def _manifest_current(data, selection, manifest):
+    return (
+        isinstance(manifest, dict)
+        and manifest.get("views_version") == VIEWS_VERSION
+        and manifest.get("inputs_signature") == store.inputs_signature(data, selection=selection)
+        and manifest.get("views") == list(_DERIVED)
+        and isinstance(manifest.get("schemas"), dict)
+    )
+
+
+def _snapshot(data, selection):
+    directory = _snapshot_directory(data)
+    manifest = _read_manifest(directory)
+    if not _manifest_current(data, selection, manifest):
         raise ValueError("snapshot is not current")
     return directory, manifest
+
+
+def snapshot_state(data, *, selection):
+    """The snapshot's manifest and whether the reader would load it, without loading it.
+
+    Returns (manifest|None, current|None): current is True only when the reader's
+    own freshness test passes; False when a snapshot exists but is stale or
+    unreadable; None when there is no snapshot at all. Schema compatibility is
+    checked only as the tables load, so a True here can still fall back.
+    """
+    try:
+        manifest = _read_manifest(_snapshot_directory(data))
+    except (OSError, ValueError, RuntimeError):
+        root, current = data / "derived", data / "derived" / "current"
+        try:
+            invalid_root = root.is_symlink() or (root.exists() and not root.is_dir())
+            return None, (False if invalid_root or current.is_symlink() or current.exists() else None)
+        except OSError:
+            return None, False
+    return manifest, _manifest_current(data, selection, manifest)
 
 
 def _load_snapshot(con, data, selection):
@@ -123,14 +157,6 @@ def _load_snapshot(con, data, selection):
             con.execute("ROLLBACK")
         print(json.dumps({"event": "snapshot_fallback", "reason": type(exc).__name__}), file=sys.stderr)
         return None
-
-
-def snapshot_manifest(data):
-    try:
-        value = json.loads((_snapshot_directory(data) / "MANIFEST.json").read_text())
-        return value if isinstance(value, dict) else {}
-    except (OSError, ValueError, RuntimeError):
-        return {}
 
 
 def derived_current(data, *, selection=None):
@@ -323,7 +349,7 @@ def connect(
             if snapshot is not None:
                 _READS[con]["snapshot"] = snapshot
             elif snapshot_only:
-                raise ValueError("no current snapshot")
+                raise NoSnapshot("no current snapshot")
             else:
                 _load_live_derived(con, records, memory_limit, threads)
         else:
