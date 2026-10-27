@@ -987,9 +987,8 @@ class ConversationLoop:
                     )
                     outcome = await rate_limit_park.park_conversation(
                         self._db,
-                        prompt=rate_limit_park.with_already_ran_note(
-                            prompt_text, streamed["ran"],
-                        ),
+                        prompt=prompt_text,
+                        ran=streamed["ran"],
                         origin_session_id=session["id"],
                         exc=e,
                         model=model,
@@ -1061,9 +1060,8 @@ class ConversationLoop:
                 # (they land in the same tracker), so the park carries them.
                 outcome = await rate_limit_park.park_conversation(
                     self._db,
-                    prompt=rate_limit_park.with_already_ran_note(
-                        prompt_text, streamed["ran"],
-                    ),
+                    prompt=prompt_text,
+                    ran=streamed["ran"],
                     origin_session_id=session["id"],
                     exc=e,
                     model=model,

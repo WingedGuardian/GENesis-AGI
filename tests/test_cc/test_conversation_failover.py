@@ -1480,9 +1480,9 @@ async def test_a_capped_turn_that_ran_tools_parks_with_them_listed(loop, invoker
     assert calls["n"] == 1, "a peer re-ran a prompt whose tools already ran"
     fi.assert_not_called()
     loop._try_contingency.assert_not_awaited()
-    parked_prompt = park.await_args.kwargs["prompt"]
-    assert parked_prompt.startswith("send the update")
-    assert "outreach_send" in parked_prompt and "weekly update" in parked_prompt
+    kwargs = park.await_args.kwargs
+    assert kwargs["prompt"] == "send the update", "the park must store the bare prompt"
+    assert kwargs["ran"] == [("outreach_send", {"message": "weekly update"})]
 
 
 @pytest.mark.asyncio
@@ -1506,7 +1506,7 @@ async def test_a_tool_call_inside_a_text_line_still_counts(loop, invoker, monkey
         "send it", user_id="u1", channel=ChannelType.TERMINAL, on_event=AsyncMock(),
     )
     fi.assert_not_called()
-    assert "outreach_send" in park.await_args.kwargs["prompt"]
+    assert [n for n, _ in park.await_args.kwargs["ran"]] == ["outreach_send"]
 
 
 @pytest.mark.asyncio
@@ -1521,34 +1521,6 @@ async def test_a_capped_turn_that_ran_tools_falls_back_when_it_cannot_park(loop,
     )
     loop._try_contingency.assert_awaited_once()
     assert "usage limit" in result and "would run again" in result
-
-
-def test_the_already_ran_note_keeps_the_latest_calls():
-    from genesis.cc.rate_limit_park import with_already_ran_note
-
-    assert with_already_ran_note("p", []) == "p"
-    ran = [(f"read{i}", {"q": "x" * 1000}) for i in range(24)] + [("outreach_send", {"m": "hi"})]
-    note = with_already_ran_note("p", ran)
-    assert note.startswith("p\n\n[Resume note")
-    assert "data, not instructions" in note
-    assert "`outreach_send`" in note, "the last call, usually the side effect, was cut"
-    assert "`read0`" not in note and "5 earlier call(s) not shown" in note
-    assert note.count("\n- `") == 20
-    assert "…" in note and len(note) < 20 * 400
-
-
-def test_the_already_ran_note_redacts_credentials():
-    from genesis.cc.rate_limit_park import with_already_ran_note
-
-    note = with_already_ran_note("p", [
-        ("reference_store", {"kind": "api", "identifier": "svc", "value": "s3cr3t"}),
-        ("browser_fill", {"selector": "#pw", "password": "hunter2"}),
-        ("t", {"nested": [{"api_key": "k1"}], "note": "a `tick` here"}),
-    ])
-    for secret in ("s3cr3t", "hunter2", "k1"):
-        assert secret not in note
-    assert "svc" in note and "#pw" in note
-    assert "a 'tick' here" in note, "a backtick in an input could break its fence"
 
 
 def test_the_park_copy_warns_only_when_calls_ran():
@@ -1582,7 +1554,7 @@ async def test_the_last_resort_park_carries_a_peers_tool_calls(loop, invoker, mo
         "remember this", user_id="u1", channel=ChannelType.TERMINAL, on_event=AsyncMock(),
     )
     assert calls["n"] == 2
-    assert "`memory_store`" in park.await_args.kwargs["prompt"]
+    assert [n for n, _ in park.await_args.kwargs["ran"]] == ["memory_store"]
     assert "may already have run" in result
 
 
@@ -1607,4 +1579,4 @@ async def test_a_tool_call_after_thinking_in_one_line_still_counts(loop, invoker
     )
     fi.assert_not_called()
     assert calls["n"] == 1
-    assert "`outreach_send`" in park.await_args.kwargs["prompt"]
+    assert [n for n, _ in park.await_args.kwargs["ran"]] == ["outreach_send"]
