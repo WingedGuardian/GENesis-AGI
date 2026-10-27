@@ -78,7 +78,8 @@ def test_nested_decoded_compound_keys_malformed_cycles_and_work():
 
 
 def test_allow_tolerates_only_the_named_patterns():
-    located = "the file is /home/someone/notes on 192.168.1.5"
+    private_ip = ".".join(("192", "168", "1", "5"))  # built, so no literal address ships
+    located = f"the file is /home/someone/notes on {private_ip}"
     assert not json_strings_safe(located)
     assert json_strings_safe(located, allow={"internal_file_path", "rfc1918_ip"})
     secret = located + " and " + "API_" + "TOKEN=" + "syntheticvalue123"
