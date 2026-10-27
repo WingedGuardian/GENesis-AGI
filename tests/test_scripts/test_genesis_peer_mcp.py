@@ -7,6 +7,7 @@ no server runs.
 
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import sys
@@ -395,3 +396,32 @@ async def test_a_receipt_named_by_an_earlier_503_survives_a_later_loss(peer, mon
 
     assert out["task_id"] == "task-1"
     assert out["reply"] == "done"
+
+
+def test_idle_task_worker_is_suppressed_before_the_server_starts():
+    # The guard's own top-level statements, so a commented-out or unreachable
+    # call cannot pass and run() arguments do not matter.
+    tree = ast.parse(SCRIPT.read_text())
+    guard = next(
+        n for n in tree.body if isinstance(n, ast.If) and "__main__" in ast.unparse(n.test)
+    )
+    texts = [ast.unparse(n) for n in guard.body]
+    gate = next(
+        i for i, x in enumerate(texts) if "_suppress_docket_worker(mcp)" in x.split("\n")[0]
+    )
+    run = next(i for i, x in enumerate(texts) if x.startswith("mcp.run("))
+    assert gate < run
+
+
+async def test_the_gate_stops_the_worker_and_costs_no_tool(peer):
+    from fastmcp import Client
+
+    # The premise that makes suppression free: no tool here uses the task queue.
+    assert peer.mcp._support_tasks_by_default is False
+    tools = peer.mcp._tool_manager._tools
+    assert tools
+    assert all(t.task_config.mode == "forbidden" for t in tools.values())
+    assert peer._suppress_docket_worker(peer.mcp) is True
+    async with Client(peer.mcp) as client:
+        assert peer.mcp._docket is None
+        assert len(await client.list_tools()) == len(tools)
