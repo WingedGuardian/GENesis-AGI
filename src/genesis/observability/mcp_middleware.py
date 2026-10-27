@@ -50,7 +50,9 @@ class InstrumentationMiddleware(Middleware):
     here only closes a *trailing* read txn (it can never discard a tool's own
     write); any non-clean exit — a raised ``Exception``, or a ``BaseException`` no
     clause catches (``asyncio.CancelledError``, ``SystemExit``, …) — rolls back the
-    possibly-partial write instead of committing it. The boundary swallows
+    possibly-partial write instead of committing it, but only when no other call
+    is in flight on the shared connection (a rollback then would discard a
+    concurrent call's uncommitted write; see ``on_call_tool``). The boundary swallows
     nothing: a ``BaseException`` is not caught at all, and the one ``except
     Exception`` clause always re-raises — sometimes as a ``ToolError`` chained to
     the original, when the argument diagnosis below can name a better cause. DB
@@ -66,6 +68,11 @@ class InstrumentationMiddleware(Middleware):
         self._tracker = tracker
         self._server = server_name
         self._db = db
+        # Tool calls in flight on this server's shared connection. The MCP SDK
+        # runs each request in its own task, so calls overlap; a failure
+        # rollback is only safe when no other call can have an uncommitted
+        # statement on the same connection (see on_call_tool's finally).
+        self._calls_in_flight: int = 0
         # Latches True once a post-spawn deploy is confirmed (staleness is
         # monotonic — it never reverts). A False verdict is deliberately NOT
         # cached; see _is_stale.
@@ -86,6 +93,7 @@ class InstrumentationMiddleware(Middleware):
         # and commit a partial). Nothing is swallowed: the ``except Exception``
         # below always re-raises, and a cancellation is not caught at all.
         success = False
+        self._calls_in_flight += 1
         try:
             if tool_name in GUARDED_MCP_TOOLS:
                 # Raises ToolError (block mode) if this subprocess is running
@@ -144,13 +152,34 @@ class InstrumentationMiddleware(Middleware):
             # cancelled `commit()` is durable afterwards. Issuing a rollback
             # here would either be a no-op behind the commit already in the
             # queue, or would discard a successful tool call's writes.
+            #
+            # The failure rollback runs only when this is the ONLY call in
+            # flight. The connection is shared and SerializedConnection lets
+            # two calls' statements interleave, so a rollback while another
+            # call sits between its execute and its own commit discards THAT
+            # call's write while it goes on to report success (reproduced by
+            # tests/test_observability/test_mcp_middleware_concurrency.py).
+            # Skipping it under concurrency leaves this call's partial
+            # statement, if any, for the next commit to flush: the same
+            # outcome a peer's commit already produced before this guard. It
+            # also leaves this call's read snapshot open until a peer's own
+            # boundary closes it, so the WAL checkpoint can stay pinned for as
+            # long as that peer runs. Per-call atomicity on one shared
+            # connection needs per-request connections, which this boundary
+            # cannot provide. Only calls through this middleware are counted.
             try:
                 if self._db is not None:
                     try:
                         if success:
                             await self._db.commit()
-                        else:
+                        elif self._calls_in_flight == 1:
                             await self._db.rollback()
+                        else:
+                            logger.warning(
+                                "Skipped rollback after failed %s: %d other "
+                                "call(s) in flight on the shared connection",
+                                provider, self._calls_in_flight - 1,
+                            )
                     except Exception:
                         logger.warning(
                             "DB %s after %s failed",
@@ -158,6 +187,10 @@ class InstrumentationMiddleware(Middleware):
                             provider, exc_info=True,
                         )
             finally:
+                # Decrement first and unconditionally: the record below can
+                # raise BaseException too, and a leaked count would disable the
+                # failure rollback for the life of the server process.
+                self._calls_in_flight -= 1
                 try:
                     self._tracker.record(
                         provider,
