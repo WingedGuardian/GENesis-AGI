@@ -716,6 +716,16 @@ def _hold(path: Path) -> int:
     return fd
 
 
+def _aged(path: Path) -> None:
+    """A lock left by an EARLIER kill: older than LOCK_FRESH_S. A lock made a
+    moment ago is fresh, and wherever this user runs a process whose fds cannot
+    be read (a CI runner, a systemd-user install; pytest's PID namespace hides
+    them locally) a fresh lock counts as held."""
+    if path.exists():
+        old = time.time() - 3600
+        os.utime(path, (old, old))
+
+
 def _no_git(monkeypatch):
     real = subprocess.run
 
@@ -749,6 +759,7 @@ def test_td6_a_zombie_holder_is_dead_and_a_lock_freed_in_time_is_repaired(w, mod
     repair waits; the lock frees after 30 s, inside the 60 s budget, and the
     checkout is healed."""
     killed_tag_side(w, "Z3")
+    _aged(w.root / ".git" / "index.lock")
     zombie = subprocess.Popen(["true"])
     deadline = time.monotonic() + 30
     while Path(f"/proc/{zombie.pid}/stat").read_text().rsplit(") ", 1)[-1][:1] != "Z":
@@ -828,6 +839,7 @@ def test_td6_an_index_lock_a_git_still_holds_is_waited_for(w, mod, monkeypatch):
     finally:
         holder.kill()
         holder.wait()
+    _aged(lock)
     assert mod.Repair(str(w.state), str(w.root), True, 0).run() == 0
     assert (w.backups()[-1] / "git" / "index.lock").exists() and not lock.exists()
 
@@ -1596,6 +1608,7 @@ def test_r4_the_safe_branch_retires_a_stale_index_lock(w):
     left: it is saved and removed before the state is cleared, so git works."""
     w.write_state(w.row())
     (w.root / ".git" / "index.lock").write_bytes(b"stale")
+    _aged(w.root / ".git" / "index.lock")
     r = w.repair("--wait", "3")
     assert r.returncode == 0, r.stdout + r.stderr
     assert not w.state.exists()
