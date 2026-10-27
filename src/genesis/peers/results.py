@@ -2,7 +2,6 @@
 
 import hashlib
 import os
-import re
 import stat
 from pathlib import Path
 
@@ -29,17 +28,9 @@ STATES = {
 }
 
 
-# A redacted key shape stops at a quote or backslash so JSON around it stays
-# valid; a marker followed by a unicode escape ("\u002d") or by a quote and
-# more token means the cut fell short.
-_SHORT_CUT = re.compile(r"\[redacted:api_key_[a-z]+\](?:\\u|[\"'][A-Za-z0-9_-])")
-
-
 def disclosable_reply(text):
     """The reply with credentials redacted, or None when it still cannot be disclosed."""
     text, redacted = redact_credentials(text)
-    if _SHORT_CUT.search(text):
-        return None, redacted
     return (text if json_strings_safe(text, allow=REPLY_ALLOW) else None), redacted
 
 

@@ -112,18 +112,12 @@ def test_an_api_key_in_a_json_reply_is_redacted_and_the_answer_kept():
     assert redacted == ["json_credential"]
 
 
-@pytest.mark.parametrize(
-    "text",
-    [
-        '{"note": "sk-' + "Q" * 24 + '\\u002dTAILSECRETTAILSECRET"}',
-        "use sk-" + "Q" * 24 + '"TAILSECRETTAILSECRET now',
-        "use sk-" + "Q" * 24 + "'-TAILSECRETTAILSECRET now",
-    ],
-)
-def test_a_key_cut_short_at_a_quote_or_escape_withholds_the_reply(text):
+def test_a_key_cut_short_at_an_escape_hides_its_head_and_is_disclosed():
+    # Owner ruling: the rest of a key whose head is redacted is not worth a blank reply.
     from genesis.peers.results import disclosable_reply
 
-    assert disclosable_reply(text)[0] is None
+    text, _ = disclosable_reply('{"note": "sk-' + "Q" * 24 + '\\u002dTAIL"}')
+    assert text == '{"note": "[redacted:api_key_openai]\\u002dTAIL"}'
 
 
 def test_a_key_before_an_ordinary_escape_is_redacted_not_withheld():
