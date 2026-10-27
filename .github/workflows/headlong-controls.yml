@@ -1,0 +1,83 @@
+name: Headlong offline controls
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/headlong-controls.yml'
+      - 'scripts/ci/headlong_*'
+      - 'tests/test_scripts/test_headlong_controls.py'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+concurrency:
+  group: headlong-controls-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  controls:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CONTROL_CONTAINER: headlong-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          repository: laude-institute/headlong
+          ref: eab04ad4097fb2030f27bee6026e24f57289f12d  # pragma: allowlist secret (public upstream commit pin)
+          path: upstream-headlong
+          persist-credentials: false
+      - name: Build credential-free evaluation image
+        run: |
+          set -euo pipefail
+          context="$RUNNER_TEMP/headlong-context"
+          mkdir -p "$context/headlong"
+          test "$(git -C upstream-headlong rev-parse HEAD)" = eab04ad4097fb2030f27bee6026e24f57289f12d
+          git -C upstream-headlong archive HEAD | tar -x -C "$context/headlong"
+          printf '%s\n' eab04ad4097fb2030f27bee6026e24f57289f12d > "$context/headlong/.source-pin"
+          cp scripts/ci/headlong_fixture.py scripts/ci/headlong_controls.py "$context/"
+          cp scripts/ci/headlong_controls.Dockerfile "$context/Dockerfile"
+          docker build -t headlong-controls "$context"
+          docker image inspect headlong-controls > "$RUNNER_TEMP/headlong-image.json"
+      - name: Run stock controls inside disposable containment
+        # Flag semantics: https://docs.docker.com/reference/cli/docker/container/run/
+        run: |
+          set -euo pipefail
+          docker create --name "$CONTROL_CONTAINER" --init --network none --read-only \
+            --user 65532:65532 --cap-drop ALL --security-opt no-new-privileges \
+            --pids-limit 256 --memory 1g --memory-swap 1g --cpus 1 \
+            --tmpfs /work:rw,exec,nosuid,nodev,size=512m,mode=1777 \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,size=128m,mode=1777 headlong-controls
+          docker inspect "$CONTROL_CONTAINER" > "$RUNNER_TEMP/headlong-container.json"
+          timeout 600 docker start -a "$CONTROL_CONTAINER" > "$RUNNER_TEMP/headlong-report.json"
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$CONTROL_CONTAINER")" = 0
+          python3 - "$RUNNER_TEMP/headlong-report.json" <<'PY'
+          import itertools, json, sys
+          with open(sys.argv[1]) as stream:
+              report = json.load(stream)
+          assert report["schema"] == "headlong-stock-controls/v1"
+          assert report["source_pin"] == "eab04ad4097fb2030f27bee6026e24f57289f12d"
+          assert report["status"] == "pass" and report["cleanup_confirmed"] is True
+          assert report["sdk"] == "0.2.172"
+          assert all(isinstance(report["dependencies"][key], str) and report["dependencies"][key].strip() for key in ("os", "python"))
+          expected = set(itertools.product(("fixed", "http", "cli"), ("effect", "noop", "failure")))
+          assert len(report["routes"]) == report["route_passed"] == report["route_total"] == 9
+          assert {(row["route"], row["control"]) for row in report["routes"]} == expected
+          assert len(report["upstream"]) == 8 and all(row["passed"] is True for row in report["upstream"] + report["routes"])
+          print("9/9 route controls and 8/8 selected upstream test invocations passed")
+          PY
+      - name: Remove only this evaluation container
+        if: always()
+        run: docker rm -f "$CONTROL_CONTAINER" || true
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: headlong-controls-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/headlong-report.json
+            ${{ runner.temp }}/headlong-image.json
+            ${{ runner.temp }}/headlong-container.json
+          retention-days: 7
+          if-no-files-found: error

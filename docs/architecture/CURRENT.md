@@ -2953,7 +2953,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 2f013ed7b 2026-10-23
+verified: 3e27b4794 2026-10-23
 ```
 
 - Verification refresh is limited to the sampled qualification-runner behavior
@@ -3249,6 +3249,15 @@ verified: 2f013ed7b 2026-10-23
   were included in acceptance; the E2E observed no Python network attempts.
   This is synthetic wiring evidence, not real
   model quality, provider billing or deployment. See `docs/reference/qualification-runner.md`.
+- **Contained Headlong stock controls**: opt-in developer CI under
+  `scripts/ci/headlong_*`, separate from the canonical proposal baseline in
+  PR #3590. Pinned upstream modules execute only inside a disposable container,
+  with synthetic providers and fixture effects. The intended matrix has nine
+  route controls plus eight selected upstream test invocations; actual success
+  requires the contained job's report. This supplies no real CLI/model, owner
+  policy, initiative, or G/H/B/C runtime-parity result. No production entry point
+  is added. See `docs/reference/headlong-offline-controls.md`. This stamp refresh
+  covers this developer-evaluation slice, not a new audit of the whole subsystem.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).
