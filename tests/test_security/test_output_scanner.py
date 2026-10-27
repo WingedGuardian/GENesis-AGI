@@ -223,3 +223,66 @@ def test_card_shaped_but_not_a_card_is_safe():
     bad_luhn = _TEST_CARD[:-1] + "3"
     for text in (f"order {bad_luhn}", f"score 0.{_TEST_CARD}", "ts 1728600000000"):
         assert scan_outbound(text).safe, text
+
+
+def test_redact_credentials_cuts_secrets_and_keeps_locations():
+    from genesis.security.output_scanner import redact_credentials
+
+    key = "sk-" + "a" * 30
+    text = (
+        f"use {key} from /home/someone/app on localhost:8080\n"
+        + "DB_"
+        + "PASSWORD=hunter2hunter2\n"
+        + '{"api_key": "abc\\"def", "name": "x"}'
+    )
+    out, found = redact_credentials(text)
+    assert key not in out and "hunter2" not in out and 'abc\\"def' not in out
+    assert "/home/someone/app" in out and "localhost:8080" in out
+    assert '"name": "x"' in out
+    assert {"api_key_openai", "json_credential"} <= set(found)
+    assert {"credential_assignment", "env_variable_secret"} & set(found)
+    assert scan_outbound(out).detected == ["internal_file_path", "localhost_port"]
+
+
+def test_redact_credentials_leaves_clean_text_alone():
+    from genesis.security.output_scanner import redact_credentials
+
+    assert redact_credentials("nothing to see") == ("nothing to see", [])
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'password: "abcdefgh!TAILSECRET"',
+        "secret=abcdefgh\u00e9TAILSECRET",
+        "token: abcdefgh%7ETAILSECRET",
+        "api_key = abcdefgh/ok.TAILSECRET",
+    ],
+)
+def test_redaction_takes_the_whole_credential_token(text):
+    from genesis.security.output_scanner import redact_credentials
+
+    out, found = redact_credentials(text)
+    assert "TAILSECRET" not in out
+    assert found == ["credential_assignment"]
+
+
+def test_json_member_redaction_is_linear_on_hostile_text():
+    import time
+
+    from genesis.security.output_scanner import redact_credentials
+
+    # Quadratic before: a long quote-free keyword run closed by a quote with no
+    # colon took 1.2 s at 40 KB. Linear is well under a second at 400 KB.
+    hostile = '"' + "token password " * 27_000 + '" x'
+    start = time.perf_counter()
+    redact_credentials(hostile)
+    assert time.perf_counter() - start < 5
+
+
+def test_json_member_with_an_ordinary_key_is_kept():
+    from genesis.security.output_scanner import redact_credentials
+
+    text = '{"name": "value", "api_key": "abc", "count": "3"}'
+    out, _ = redact_credentials(text)
+    assert out == '{"name": "value", "api_key": "[redacted:json_credential]", "count": "3"}'

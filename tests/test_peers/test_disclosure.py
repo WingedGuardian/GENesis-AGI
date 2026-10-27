@@ -75,3 +75,21 @@ def test_nested_decoded_compound_keys_malformed_cycles_and_work():
     assert not json_strings_safe(
         {"answer": json.dumps({"password": "".join(["synthetic", "credential"])})}
     )
+
+
+def test_allow_tolerates_only_the_named_patterns():
+    located = "the file is /home/someone/notes on 192.168.1.5"
+    assert not json_strings_safe(located)
+    assert json_strings_safe(located, allow={"internal_file_path", "rfc1918_ip"})
+    secret = located + " and " + "API_" + "TOKEN=" + "syntheticvalue123"
+    assert not json_strings_safe(secret, allow={"internal_file_path", "rfc1918_ip"})
+    keyed = {"note": located, "password": "syntheticcredential"}
+    assert not json_strings_safe(keyed, allow={"internal_file_path", "rfc1918_ip"})
+
+
+def test_reply_allow_names_real_scanner_patterns():
+    from genesis.peers.results import REPLY_ALLOW
+    from genesis.security.output_scanner import pattern_names
+
+    assert pattern_names() >= REPLY_ALLOW
+    assert "payment_card" not in REPLY_ALLOW

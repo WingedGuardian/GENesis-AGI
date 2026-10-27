@@ -135,3 +135,64 @@ def scan_outbound(content: str) -> ScanResult:
     )
 
     return ScanResult(safe=False, detected=detected, risk_level=risk_level)
+
+
+# Credential shapes a redactor can cut out in place. Location-style patterns
+# (private IPs, home paths, localhost ports) are not secrets and are left as is;
+# card numbers need a checksum, not a regex, so they are never redacted here.
+_REDACTABLE = frozenset(
+    {
+        "api_key_openai",
+        "api_key_anthropic",
+        "api_key_groq",
+        "api_key_github",
+        "credential_assignment",
+        "env_variable_secret",
+    }
+)
+# The detector stops a credential_assignment value at its first character
+# outside [A-Za-z0-9/+=_-]; redaction must take the whole token, or a password
+# like "abcdefgh!rest" would keep "!rest". Same prefix, then everything up to a
+# delimiter.
+_REDACT_OVERRIDES: dict[str, re.Pattern[str]] = {
+    "credential_assignment": re.compile(
+        r"(?i)(password|token|secret|api[_\s]?key)\s*[:=]\s*['\"]?"
+        r"[a-zA-Z0-9/+=_\-]{8,}[^\s'\"`,;)}\]]*",
+    ),
+}
+_CREDENTIAL_KEY_WORDS = re.compile(r"(?i)password|token|secret|api[_\s]?key")
+# A JSON member `"key": "value"`, matched without nested quantifiers so the scan
+# stays linear on long quote-free text; the key is tested in the callback.
+_JSON_MEMBER = re.compile(r'("[^"\n]{1,200}"\s*:\s*)"(?:[^"\\\n]|\\.)*"')
+
+
+def _redact_json_member(match: re.Match[str]) -> str:
+    if _CREDENTIAL_KEY_WORDS.search(match.group(1)):
+        return match.group(1) + '"[redacted:json_credential]"'
+    return match.group(0)
+
+
+def redact_credentials(content: str) -> tuple[str, list[str]]:
+    """Replace credential-shaped spans with ``[redacted:<pattern>]``.
+
+    Returns the redacted text and the pattern names that matched. This is a
+    best-effort cut for content headed to a trusted reader; callers that need a
+    guarantee still run ``scan_outbound`` (or a stricter check) on the result.
+    """
+    found: list[str] = []
+    for name, pattern in _OUTPUT_PATTERNS:
+        if name not in _REDACTABLE:
+            continue
+        pattern = _REDACT_OVERRIDES.get(name, pattern)
+        content, count = pattern.subn(f"[redacted:{name}]", content)
+        if count:
+            found.append(name)
+    redacted = _JSON_MEMBER.sub(_redact_json_member, content)
+    if redacted != content:
+        found.append("json_credential")
+    return redacted, found
+
+
+def pattern_names() -> frozenset[str]:
+    """Every name ``scan_outbound`` can report, for callers that allow-list some."""
+    return frozenset(name for name, _ in _OUTPUT_PATTERNS) | {"payment_card"}
