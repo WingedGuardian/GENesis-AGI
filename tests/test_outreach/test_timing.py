@@ -101,3 +101,11 @@ def test_result_is_utc_iso_and_lexicographically_comparable():
     a, b = _iso(earlier), _iso(later)
     assert a.endswith("+00:00") and b.endswith("+00:00")
     assert a < b  # lexicographic order == chronological order for UTC ISO
+
+
+@pytest.mark.parametrize("bad", ["25:00", "9:99", "13am", "0:45pm"])
+def test_invalid_clock_raises(bad):
+    """Out-of-range clock fields raise TimingParseError, never a bare ValueError
+    that would escape outreach_send's error handling."""
+    with pytest.raises(TimingParseError):
+        resolve_preferred_timing(bad, now=NOW, tz="UTC")

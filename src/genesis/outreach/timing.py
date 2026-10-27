@@ -84,6 +84,9 @@ def resolve_preferred_timing(
                 raise TimingParseError(
                     f"could not interpret preferred_timing '{raw}'")
             hour = hour % 12 + (12 if meridiem.startswith("p") else 0)
+        if hour > 23 or minute > 59:
+            raise TimingParseError(
+                f"could not interpret preferred_timing '{raw}'")
         local_now = base_utc.astimezone(local_tz)
         candidate = local_now.replace(
             hour=hour, minute=minute, second=0, microsecond=0)

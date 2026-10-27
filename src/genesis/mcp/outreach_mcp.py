@@ -270,12 +270,17 @@ async def outreach_send(
 
         await pending_outreach.ensure_table(_db)  # idempotent safety net
         deliver_after = resolved_dt.isoformat()
+        # The drain routes "high" to submit_urgent(); it has no "critical"
+        # case. Normalize here so a scheduled critical send keeps the urgent
+        # delivery semantics an immediate critical send gets (the drain is
+        # out of scope — see issue #3544 scope limits).
+        queued_urgency = "high" if urgency == "critical" else urgency
         pending_id = await pending_outreach.enqueue(
             _db,
             message=message,
             category=category,
             channel=channel,
-            urgency=urgency,
+            urgency=queued_urgency,
             deliver_after=deliver_after,
             thread_id=thread_id,
             validated_recipient=validated_recipient,

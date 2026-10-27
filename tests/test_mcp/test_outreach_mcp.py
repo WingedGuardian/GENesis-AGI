@@ -1138,3 +1138,22 @@ async def test_drain_picks_up_resolved_row(
     assert await pending_outreach.drain(pending_db, now=before) == []
     rows = await pending_outreach.drain(pending_db, now=after)
     assert [r["id"] for r in rows] == [out["pending_id"]]
+
+
+async def test_scheduled_critical_queued_as_high(
+    pending_db, frozen_clock, swap_runtime
+):
+    """urgency='critical' + future timing stores 'high': the drain routes only
+    'high' to submit_urgent, so a scheduled critical send must carry the value
+    that keeps its urgent delivery semantics."""
+    pipe = AsyncMock()
+    swap_runtime(pipe, pending_db)
+    tools = await mcp.get_tools()
+    out = json.loads(await tools["outreach_send"].fn(
+        message="ping", category="notification", channel="telegram",
+        urgency="critical", preferred_timing="in 2 hours",
+    ))
+    assert out["status"] == "queued"
+    pipe.submit_urgent.assert_not_awaited()
+    rows = await _pending_rows(pending_db)
+    assert rows[0]["urgency"] == "high"
