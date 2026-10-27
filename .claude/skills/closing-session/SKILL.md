@@ -1694,19 +1694,10 @@ the rest of it goes.
 
 A review session drains a queue sorted by age, and the older the PR the more
 likely it is no longer work — its content already merged under a different
-number. Observed twice in one session on 2026-09-15 (unquantified: nobody
-counted the old PRs that WERE still work, so treat this as a prompt to check,
-not a base rate).
+number. (Incident: `references/incidents-closing-session.md` opf-1.)
 
 **Squash merges are why this is not obvious.** A squash rewrites the commits, so
-the branch's own history never becomes an ancestor of `main`. MEASURED on a
-two-commit branch whose work had landed as one squashed commit:
-
-| test | result |
-| --- | --- |
-| `git merge-base --is-ancestor <branch> main` | rc 1 — reads as UNMERGED |
-| `git cherry -v main <branch>` | `+` on BOTH commits — reads as unique |
-| `git diff origin/main..HEAD -- <files>` | **empty — correctly detects it** |
+the branch's own history never becomes an ancestor of `main`. Neither `git merge-base --is-ancestor` nor `git cherry` detects a multi-commit squash; the two-dot diff below does. (Incident: `references/incidents-closing-session.md` opf-2.)
 
 `git cherry` compares patch-ids, so it DOES catch a squash of a single commit —
 and is blind exactly when the squash combined several, which is the common case.
@@ -1732,14 +1723,7 @@ open PR's own head just returns that PR:
 gh api repos/<owner>/<repo>/commits/<sha-on-main>/pulls --jq '.[] | "\(.number) \(.state)"'
 ```
 
-MEASURED 2026-09-15, one worktree, the cost of skipping the §0 head check (and
-build-session, "Date the code before classifying a red"): a tree four commits
-behind its PR head produced a CRITICAL finding, a full adversarial audit, a
-public issue, a commit and review evidence — all describing a defect the branch
-had already fixed in a commit that tree could not see. The same audit declared
-two functions absent from the codebase when both exist at the head, which turned
-a reviewer's correct finding into a rejected one. Every measurement was true of
-the tree it ran in and false about the PR.
+Skipping the §0 head check (and build-session, "Date the code before classifying a red") produces findings that are true of the tree you ran in and false about the PR. (Incident: `references/incidents-closing-session.md` opf-3.)
 
 **Treat a finding that is too good as a staleness signal first** — a defect that
 would break the feature outright, a symbol a careful author somehow forgot.

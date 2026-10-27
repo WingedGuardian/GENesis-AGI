@@ -212,7 +212,8 @@ def _merge_residue(
     """genesis_merge_residue's records (NUL-separated on the wire, so every
     legal file name arrives exactly; bytes that are not UTF-8 are kept as
     surrogates); any failure to run it is residue. ``ephemeral_ok`` leaves out
-    the known-ephemeral paths."""
+    the known-ephemeral paths. Read as bytes and decoded here: text mode would
+    turn a carriage return in a name into a newline, naming another file."""
     proc = subprocess.run(
         [
             "bash",
@@ -227,14 +228,13 @@ def _merge_residue(
             "1" if ephemeral_ok else "",
         ],
         capture_output=True,
-        text=True,
-        errors="surrogateescape",
         env=_env(),
         timeout=_TIMEOUT_S,
     )
     if proc.returncode != 0:
         return [f"(the merge residue check failed: exit {proc.returncode})"]
-    return [rec for rec in proc.stdout.split("\0") if rec]
+    out = proc.stdout.decode("utf-8", "surrogateescape")
+    return [rec for rec in out.split("\0") if rec]
 
 
 def _conflict_recorded(conflicts_path: str, deploy_head: str) -> bool:
