@@ -894,6 +894,165 @@ with contextlib.redirect_stdout(sys.stderr):
         assert not output.exists()
 
 
+class TestWorkflowEvidence:
+    @staticmethod
+    def steps():
+        return yaml.safe_load(CI.read_text())["jobs"]["collected-floor"]["steps"]
+
+    def step(self, name):
+        return next(s for s in self.steps() if s.get("name") == name)
+
+    def shell(self, name, cwd, env, prefix=""):
+        script = self.step(name)["run"]
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+        return subprocess.run(["bash", "-c", prefix + script], cwd=cwd,
+                              env={**os.environ, **env}, text=True, capture_output=True)
+
+    @staticmethod
+    def outputs(path):
+        return dict(line.split("=", 1) for line in path.read_text().splitlines())
+
+    @pytest.fixture
+    def merge(self, tmp_path, evidence_env, monkeypatch):
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        for role in ("AUTHOR", "COMMITTER"):
+            monkeypatch.setenv(f"GIT_{role}_NAME", "Test")
+            monkeypatch.setenv(f"GIT_{role}_EMAIL", "test@example.invalid")
+
+        def git(*args, input=None):
+            return subprocess.run(["git", *args], cwd=repo, input=input, text=True,
+                                  capture_output=True, check=True).stdout.strip()
+
+        git("init", "-q")
+        empty = git("mktree", input="")
+        root = git("commit-tree", empty, "-m", "root")
+        base = git("commit-tree", empty, "-p", root, "-m", "base")
+        head = git("commit-tree", empty, "-p", root, "-m", "branch")
+        comparison = git("commit-tree", empty, "-p", base, "-p", head, "-m", "merge")
+        git("checkout", "--detach", comparison)
+        env = {**evidence_env, "EVENT_NAME": "pull_request", "PR_HEAD_SHA": head,
+               "PUSH_BEFORE_SHA": base, "GITHUB_SHA": comparison,
+               "GITHUB_OUTPUT": str(tmp_path / "base-output")}
+        return repo, git, env, base, head, comparison
+
+    @pytest.mark.parametrize("case", ["valid", "wrong", "missing", "read-fails", "write-fails", "push", "single"])
+    def test_workflow_parent_identity(self, merge, case):
+        repo, git, env, base, head, comparison = merge
+        prefix = ""
+        if case in {"wrong", "missing"}:
+            env["PR_HEAD_SHA"] = base if case == "wrong" else ""
+        if case == "read-fails":
+            prefix = 'git() { if [[ "$*" == "rev-parse HEAD^2" ]]; then return 1; fi; command git "$@"; };\n'
+        if case == "write-fails":
+            prefix = 'printf() { if [[ "$1" == pr_head=* ]]; then return 1; fi; builtin printf "$@"; };\n'
+        if case == "push":
+            env["EVENT_NAME"] = "push"
+        if case == "single":
+            git("checkout", "--detach", head)
+        result = self.shell("Resolve the base commit", repo, env, prefix)
+        assert result.returncode == (REFUSED if case == "single" else OK), result.stderr
+        if case == "single":
+            assert not Path(env["GITHUB_OUTPUT"]).exists()
+            return
+        outputs = self.outputs(Path(env["GITHUB_OUTPUT"]))
+        assert outputs == {"base": base, "head": comparison, **({"pr_head": head} if case == "valid" else {})}
+        git("checkout", "--detach", base)
+        assert self.outputs(Path(env["GITHUB_OUTPUT"])) == outputs
+
+    def compare_env(self, tmp_path, evidence_env):
+        env = {**evidence_env, "RUNNER_TEMP": str(tmp_path),
+               "GITHUB_OUTPUT": str(tmp_path / "compare-output"), "MODE": "none"}
+        (tmp_path / "collected-floor").mkdir()
+        return env
+
+    @pytest.mark.parametrize("verdict", [OK, FAIL, REFUSED])
+    @pytest.mark.parametrize("case", ["valid", "push", "missing", "mkdir-fails", "output-fails"])
+    def test_workflow_optional_setup_preserves_status(self, tmp_path, evidence_env, verdict, case):
+        env = self.compare_env(tmp_path, evidence_env)
+        prefix = 'python3() { printf "%s\\n" "$@" > "$RUNNER_TEMP/args"; return ' + str(verdict) + '; };\n'
+        if case == "push":
+            env["GITHUB_EVENT_NAME"] = "push"
+        if case == "missing":
+            env["COLLECTED_REVIEW_HEAD_SHA"] = ""
+        if case == "mkdir-fails":
+            prefix += 'mktemp() { return 1; };\n'
+        if case == "output-fails":
+            env["GITHUB_OUTPUT"] = str(tmp_path)
+        result = self.shell("Compare the collected ids", REPO, env, prefix)
+        assert result.returncode == verdict, result.stderr
+        out = tmp_path / "collected-floor"
+        args = ["scripts/ci/collected_floor.py", str(out / "base.json"), str(out / "pr.json"),
+                "--changed", str(out / "changed.txt"), "--no-body"]
+        if case == "valid":
+            directory = Path(self.outputs(Path(env["GITHUB_OUTPUT"]))["evidence_dir"])
+            assert directory.parent == tmp_path
+            assert directory.name.startswith("collected-review-123-2-")
+            args += ["--evidence", str(directory / "review-v1.json")]
+        assert (tmp_path / "args").read_text().splitlines() == args
+
+    @pytest.mark.parametrize("case,verdict,complete", [("clean", OK, True), ("loss", FAIL, True), ("errors", OK, False)])
+    def test_workflow_producer_after_base_checkout(self, tmp_path, merge, case, verdict, complete):
+        repo, git, env, base, head, comparison = merge
+        result = self.shell("Resolve the base commit", repo, env)
+        assert result.returncode == OK, result.stderr
+        outputs = self.outputs(Path(env["GITHUB_OUTPUT"]))
+        git("checkout", "--detach", base)
+        env = self.compare_env(tmp_path, env)
+        contexts = {"github.event.pull_request.number": "7", "steps.body.outputs.mode": "none",
+                    **{f"steps.base.outputs.{k}": v for k, v in outputs.items()}}
+        for name, expression in self.step("Compare the collected ids")["env"].items():
+            env[name] = contexts[expression.removeprefix("${{ ").removesuffix(" }}")]
+        out = tmp_path / "collected-floor"
+        tree(out / "base.json", BASE, errors=["base collection error"] if case == "errors" else [])
+        tree(out / "pr.json", BASE[:-1] if case == "loss" else BASE)
+        (out / "changed.txt").write_bytes(b"")
+        # Execute the shipped producer from the scratch checkout, now on base.
+        scripts = repo / "scripts"
+        scripts.symlink_to(REPO / "scripts", target_is_directory=True)
+        result = self.shell("Compare the collected ids", repo, env)
+        assert result.returncode == verdict, result.stdout + result.stderr
+        directory = Path(self.outputs(Path(env["GITHUB_OUTPUT"]))["evidence_dir"])
+        report = json.loads((directory / "review-v1.json").read_text())
+        assert report["complete"] is complete
+        assert report["floor_exit_code"] == verdict
+        assert (report["base_sha"], report["head_sha"], report["comparison_sha"]) == (base, head, comparison)
+        assert (report["pr_number"], report["run_id"], report["producer_attempt"]) == (7, 123, 2)
+        assert report["vanished"] == ([{"id": BASE[-1], "path": "tests/b/test_y.py", "explained": False}] if case == "loss" else [])
+        assert bool(report["errors"]["base"]) == (case == "errors")
+
+    def test_workflow_upload_and_provenance_contract(self):
+        steps = self.steps()
+        base = self.step("Resolve the base commit")
+        compare = self.step("Compare the collected ids")
+        assert base["env"]["PR_HEAD_SHA"] == "${{ github.event.pull_request.head.sha }}"
+        assert "${{" not in base["run"] + compare["run"]
+        assert compare["id"] == "compare"
+        assert compare["env"] == {
+            "MODE": "${{ steps.body.outputs.mode }}",
+            "COLLECTED_REVIEW_PR_NUMBER": "${{ github.event.pull_request.number }}",
+            "COLLECTED_REVIEW_BASE_SHA": "${{ steps.base.outputs.base }}",
+            "COLLECTED_REVIEW_HEAD_SHA": "${{ steps.base.outputs.pr_head }}",
+            "COLLECTED_REVIEW_COMPARISON_SHA": "${{ steps.base.outputs.head }}",
+        }
+        raw = self.step("Preserve the collected ids")
+        assert raw == {"name": "Preserve the collected ids", "if": "${{ !cancelled() }}",
+                       "uses": "actions/upload-artifact@v7", "with": {
+                           "name": "collected-floor", "path": "${{ runner.temp }}/collected-floor/",
+                           "if-no-files-found": "ignore", "retention-days": 14}}
+        compact = next(s for s in steps if s.get("name") == "Preserve collected review evidence")
+        assert steps.index(compact) == steps.index(raw) + 1
+        assert compact == {
+            "name": "Preserve collected review evidence",
+            "if": "${{ !cancelled() && github.event_name == 'pull_request' && steps.compare.outputs.evidence_dir != '' }}",
+            "continue-on-error": True, "uses": "actions/upload-artifact@v7",
+            "with": {"name": "collected-review-v1-${{ github.run_id }}-${{ github.run_attempt }}",
+                     "path": "${{ steps.compare.outputs.evidence_dir }}/review-v1.json",
+                     "if-no-files-found": "ignore", "retention-days": 14},
+        }
+        assert all("continue-on-error" not in step for step in steps if step is not compact)
+
+
 class TestWorkflowContract:
     def _jobs(self):
         return yaml.safe_load(CI.read_text())["jobs"]
