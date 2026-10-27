@@ -1,0 +1,193 @@
+# Offline owned-loop mechanics
+
+`scripts/ci/ego_owned_state.py` is the private C1 reducer for an offline runtime
+comparison. It uses the existing `Campaign` exclusive writer and append-only
+`answers.jsonl` evidence format. It adds no production store, runtime source,
+provider or approval authority. `ego_owned_loop.py` supplies the contained adapter;
+actual native qualification requires the contained report, independently of
+passing state tests.
+
+The immutable manifest binds the synthetic external feed, response program,
+executor/model, source identities, trajectory references and pacing. External
+events have unique IDs, contiguous sequence numbers and nondecreasing due times.
+They never supply C's timers. This profile accepts only `claude-code` and
+`genesis_ego_cycle`; source hashes describe the intended state, loop, context,
+bridge and case files. They are metadata here, not proof those files ran.
+
+Each complete record carries `schema: ego-owned-journal/v1` and one transition:
+
+| Kind | Meaning |
+|---|---|
+| manifest | Exact workload/configuration identity |
+| acknowledgement, phase=intake | Copied external event; repeat intake is idempotent |
+| dispatch, stage=prepared | Fresh attempt, selected logical event, starting state |
+| dispatch, stage=bound | Actual trigger UUID, nonce, config/prompt digests and status |
+| observation | Outcome, supplied evidence and recomputed next state |
+
+Replay rejects torn tails, changed manifests, invalid schemas/transitions and
+next-state mismatches. Canonical JSON comparison distinguishes booleans from
+integer sequence/cursor values. Transitions validate on a copy before appending;
+failed writes never publish the candidate in-memory state. Campaign retains its
+existing crash, synchronization, lock and private-directory semantics.
+
+The external cursor advances only after an accepted observation for the next
+FIFO event. Generated timers reserve and complete separate ordinals. Empty feeds
+still produce timers; base/factor/cap/hold are explicit manifest values, with
+hold fixed to one in C1. No-op/refusal increases backoff, capped at the configured
+limit; completed work or accepted reactive engagement resets it. Ready external
+input wins a timer tie. Related-memory pointer selection persists in observations.
+
+A fully observed safe provider error retains the logical event and a retry time;
+new arrivals remain admitted but cannot bypass it. `blocked` and `uncertain`
+outcomes halt automatic scheduling. An unpaired prepared/bound attempt also
+prevents replay on reopening. This reducer does not infer child completion or
+reconcile effects; its caller must independently collect and validate
+that evidence before supplying an observation.
+
+Host-safe state tests cover timers, bursts, ties/preemption, retry order, restart,
+torn journals, writer exclusion, failed append and malformed manifests/transitions.
+They use synthetic evidence and never invoke upstream or native executables.
+Full ego workflow, production dispatch, multiple egos/generations, Codex execution
+and useful model behavior remain outside this state component's qualification.
+
+`ego_owned_loop.py` is an explicit finite offline CLI, runnable only inside the
+same preflighted image as the native bridge. `--root` selects a fresh owned
+manifest under `/work`; `--steps` is an attempt budget, not a declaration of
+success. Exhausted response programs stop without waiting for another timer.
+It validates the image source pin and five component hashes before opening the
+journal. No production daemon, source activation or automatic failover is added.
+
+For each selected input/timer it records prepared intent, obtains the actual
+pinned trajectory writer's trigger UUID, publishes a fresh config/nonce, renders
+and redacts context, then records the bound digests before launching the existing
+native bridge. The context wrapper calls only pinned data helpers: identity,
+goals, the fixture skill, current trigger, recent stream and deterministic related
+memory prefilter. It never evaluates model text or loads `.env` defaults. Tiered
+recap and the legacy model shell tools remain unavailable in this profile.
+
+The child uses its own process group. Completion, stop or error reaps that child
+and checks group closure before a cleanup receipt is accepted. Late output/receipt
+failure leaves an uncertain attempt: the collector may commit uncertainty, while
+an abrupt interruption may leave unpaired intent. Reopening cannot automatically
+invoke either.
+Stop interrupts backoff. This is fixture process ownership, not production
+generation fencing or reconciliation after an abruptly killed parent.
+
+Before committing an observation, the adapter independently reads canonical
+proposal state and effect bytes, then checks the child receipt, actual run/header/
+observation/final correlation, trigger/nonce/config/prompt hashes, typed native
+terminal and the closed MCP tool profile. It records requested and resolved model
+identities separately. Required captured artifacts must be present; later
+continuity verifies each retained relative path, size and SHA256 before carrying
+accepted earlier references forward. A provider error is retryable only with
+complete typed no-effect evidence; partial/failed handlers remain uncertain.
+
+`ego_owned_controls.py` adds an early four-case smoke: two actual timer wakes,
+effect plus a separate-process reopen/refused second claim, reactive input and a
+reference conflict with zero SDK requests. The expected population is six
+attempts and five native sessions, scored separately from B's established matrix.
+The controller retains synthetic manifests, journals, prompts, receipts, trajectory
+snapshots, database and effect artifacts in its JSON report before scratch cleanup.
+SDK HOME caches are excluded. The workflow retains this report and Docker settings
+alongside the stock/reference/native/B foundation reports. Source/binary/container,
+physical-effect and cleanup verification of the actual run is still required.
+
+The shared native population in `ego_owned_matrix.py` replays all thirteen
+mechanics cases from `ego_runtime_cases.py` using C's own timer/cursor/pacing
+semantics. Native invocation counts are derived from actual receipts and checked
+against the predeclared applicability. The forced operational UUID, exact history
+lookup, large context, safe provider-error retry, partial effects and reference
+conflicts retain separate expected outcomes. A typed native final alone cannot
+qualify a completed effect. Expected failure cases must also match the declared
+collector and protected-call error; unrelated artifact or binding failures cannot
+qualify merely by producing uncertainty. C halts uncertain partial effects, which differs
+from the monolith's pacing after its visible-work probe.
+
+The same report keeps a distinct pure reducer population:36event/outcome/clock
+cells,17burst/delivery cells,6restart/manifest/writer guards and one ladder/cap/
+reopen cell. One impossible empty-feed altered-duplicate combination is declared
+excluded. Synthetic reducer observations establish no native work or policy
+authority. All60cell IDs must match the inventory exactly; counts alone cannot
+hide a missing cell. A144mutant calibration checks the scoring instrument.
+Typed counter/time checks reject Python boolean/integer aliases, and retries
+must retain the bound logical event and wake. Actual synthetic journals are
+retained for detached replay inspection.
+
+The new container/report are separate from the early smoke and existing
+foundation arms. Qualification requires actual post-review contained results,
+source/binary/container identities and independent artifact/state/effect readback.
+Real-process interruption, timing/recovery cells and the final B/C comparison
+follow separately. Neither native mechanics nor synthetic state scoring establish
+full workflow, useful model behavior, production or Codex parity.
+
+`ego_owned_recovery.py` adds a separate instrumented process population. The
+trusted `ego_owned_probe.py` wrapper pauses at twelve declared intake/dispatch/
+native/claim/effect/receipt/commit boundaries, or injects seven late-I/O faults
+around the unchanged bridge. Each interrupted campaign reopens through the plain
+C CLI with its original manifest; the fixture never repairs its cursor or journal.
+Uncertain cells retain an unused response slot, so program exhaustion cannot
+explain the absence of replay; this includes all seven late-I/O faults. Raw
+journal/trajectory/config/driver snapshots are captured before the plain reader
+reopens the campaign. Stage predicates check that writer boundary, and later
+journal records must preserve the captured prefix.
+Before dispatch intent, reopen can execute once. Unpaired intent stays uncertain.
+A committed observation restores progress without repeating the effect.
+
+The controller keeps the existing container init. It first calibrates adoption
+and reaping using harmless processes, waits only its own direct Popen, validates
+outer/child ancestry and groups before signalling, and retains barrier/closure
+process snapshots. Detached or unaccounted survivors make the run incomplete and
+require a design decision; no broader fencing is silently introduced.
+
+Late database/output/pending-write/close/rename failures must occur after a real
+typed native result, one canonical effect, observation and final. They leave no
+published driver, preserve the single effect and halt C uncertain without accepted
+progress or replay. Full pending bytes remain evidence, never a repaired receipt.
+The intentional missing-driver error, pending identity and child cleanup must
+match; unrelated collection errors cannot qualify the expected uncertainty.
+
+The seventh container retains this population separately from native13/pure60.
+Actual post-review contained results and independent artifact/process readback
+are required; host exception/stub tests do not establish real crash recovery.
+Actual timer/backoff/arrival/stop cells and final B/C readback follow separately.
+
+`ego_owned_timing.py` adds a separate actual-clock population in an eighth
+contained CI arm. It runs six ordinary no-op timer wakes across two plain-CLI
+processes, retaining the first committed wake and writer bytes before reopen.
+Dispatch starts must honor the actual 5/10/20/40/40-second waits and cursor zero.
+Three fixed arrival offsets (3/5/8 seconds from the immutable manifest start)
+are all retained and classified against the first actual observation/backoff;
+at least one must land during backoff and dispatch before the previous timer
+wake. An inapplicable set is incomplete, never selected down to a passing cell.
+
+The lifecycle cells send SIGTERM after a committed no-op and before its next
+wake, and start a second plain C writer while the first is paused bound. The
+signal must preserve the stored wake without another native attempt; contention
+must fail before SDK work and leave the journal unchanged. The first writer
+then completes one canonical effect. Scoped cleanup and process censuses reject
+survivors. Twenty-four missing-evidence mutants calibrate the actual rows.
+Host tests use injected clocks and native/upstream stubs; actual clock and CLI
+lifecycle claims require post-review contained results plus independent raw
+readback. The final B/C report remains separate work.
+
+`ego_runtime_report.comparison` consumes the B native mechanics, C native/state,
+C recovery and C timing reports from the same CI image/source pin. The pure
+consumer produces `ego-comparison-report.json`, keyed by the frozen thirteen
+mechanics cases, and rejects missing/duplicate cases, mixed source/native
+profiles, numeric boolean aliases and incomplete populations. Requested and
+resolved model identities accompany native records. Reducer, interruption,
+late-I/O and actual-clock denominators stay separate.
+
+The table preserves observed differences: B records provider failures as run
+errors even when the outer shell exits zero, while C records a logical retry.
+B appends its own idle marker after a nonproductive successful native final.
+After a visible effect with a missing final, B may reset pacing while C stops
+uncertain. A successful native final alone is not proof of completed work.
+The summary still requires independent retained-byte/process/container readback;
+it selects no winner and establishes neither useful-model performance nor
+production/full-workflow readiness. Codex remains an unqualified separate native
+adapter that must satisfy the same invocation, authority, artifact, continuity
+and lifecycle contract and run the declared populations.
+Only the thirteen native mechanics cases are bilateral in this table. The
+additional state/recovery/timing populations are explicitly C evidence; this
+run establishes no B-versus-C recovery or actual-clock parity result.

@@ -2935,7 +2935,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 2f013ed7b 2026-10-23
+verified: 2f013ed7b 2026-10-24
 ```
 
 - Verification refresh is limited to the sampled qualification-runner behavior
@@ -3224,6 +3224,70 @@ verified: 2f013ed7b 2026-10-23
   were included in acceptance; the E2E observed no Python network attempts.
   This is synthetic wiring evidence, not real
   model quality, provider billing or deployment. See `docs/reference/qualification-runner.md`.
+- **Contained Headlong stock controls**: opt-in developer CI under
+  `scripts/ci/headlong_*`, separate from the canonical proposal baseline in
+  PR #3590. Pinned upstream modules execute only inside a disposable container,
+  with synthetic providers and fixture effects. The intended matrix has nine
+  route controls plus eight selected upstream test invocations; actual success
+  requires the contained job's report. This supplies no real CLI/model, owner
+  policy, initiative, or G/H/B/C runtime-parity result. No production entry point
+  is added. See `docs/reference/headlong-offline-controls.md`. This stamp refresh
+  covers this developer-evaluation slice, not a new audit of the whole subsystem.
+- **Contained native action port**: the same opt-in CI image also qualifies real
+  Claude Code through the public Agent SDK against a loopback scripted backend.
+  Its MCP tool invokes actual canonical proposal claims and a fixed disposable
+  effect. Eleven expected cells and a separate handler-error instrument control
+  require native completion plus independent committed-state/artifact checks.
+  Integrated success requires the actual contained report. No production provider,
+  inference, B/C orchestration or Codex parity is added. See
+  `docs/reference/headlong-native-action-port.md`.
+- **Contained Headlong reference redaction**: a separate B-only derived source
+  preserves controller-issued references through generic card masking while
+  retaining other secret rules and rejecting reference loss/boundary conflicts.
+  Independently runnable contained controls compare pinned/adapted sanitizers;
+  this adds no production provider or native monolith qualification. See
+  `docs/reference/headlong-reference-redaction.md`.
+- **Native monolith probe**: opt-in contained B1 experiment replaces only the
+  pinned monolith invocation, retaining outer context/probe/backoff/wake code.
+  Thirteen cases/fifteen wakes/thirteen native sessions plus reader correlations
+  require actual state, bytes, run attribution, context and pacing evidence.
+  Integration requires its actual post-review CI report. Tiered memory is off,
+  deterministic related context remains on, and only the protected MCP effect is
+  exposed; no full runtime, dispatcher or capability parity follows. See
+  `docs/reference/headlong-native-monolith.md`.
+  The reference-redaction prerequisite retains issued IDs; explicit conflicts
+  stop before SDK execution and preserve existing timer/reactive pacing.
+  A private shared mechanics inventory describes the same cases without
+  replacing their predicates. The reused bridge has closed fixture source
+  attribution (`monolith` default or `ego-owned-loop`) on all native records;
+  this adds no C loop or new proposal authority.
+- **Offline C1 journal state**: `scripts/ci/ego_owned_state.py` reuses Campaign
+  for immutable manifest, intake, prepared/bound attempt and observation records.
+  External cursor, generated timer ordinals, pacing/retry and related-memory
+  pointers replay from that private journal; unresolved attempts stop automatic
+  replay. `ego_owned_loop.py` adds a finite contained adapter using the existing
+  native bridge and pinned data-only context helpers; it verifies independent
+  proposal/effect and retained child evidence before logical commit. A separate
+  four-case native smoke requires actual contained results; state tests alone
+  do not establish native C success, full workflow/Codex parity or production
+  activation. See `docs/reference/ego-owned-loop.md`.
+  The shared thirteen-case native corpus and a separate sixty-cell synthetic
+  reducer population have their own contained report, exact ID coverage and
+  mutation controls. Actual contained evidence is required; real-process crash/
+  timing/recovery and final B/C comparison remain separate qualification work.
+  A separate instrumented recovery controller declares twelve process-kill and
+  seven late-I/O cells, preserving plain-C reopen and existing container-init
+  ownership. Actual native process/cleanup evidence is required; its host tests
+  establish neither abrupt recovery nor actual clock behavior. Timing and final
+  B/C readback remain separate.
+  An additional contained actual-clock controller covers timer waits across
+  plain-CLI reopen, fixed reactive arrivals, backoff shutdown and exclusive
+  writer contention. It requires a genuine during-backoff arrival and retains
+  the complete population; injected-clock tests do not qualify those timings.
+  A pure comparison consumer joins same-pin B/C mechanics and separate reducer,
+  recovery and timing reports into the frozen case table. It preserves their
+  different failure/pacing semantics and requires independent artifact/process
+  verification; report flags alone confer no production or Codex qualification.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).
