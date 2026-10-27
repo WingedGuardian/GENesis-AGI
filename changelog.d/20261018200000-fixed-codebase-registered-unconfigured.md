@@ -1,1 +1,0 @@
-- An install where codebase-memory-mcp is registered but its managed setup was never done now says so: a health alert names what is missing (the settings file or the enabled query unit) with the configure/enable remedy and the opt-out file, and bootstrap, install and update print one matching line instead of an unconditional pointer. Creating the opt-out file silences both.

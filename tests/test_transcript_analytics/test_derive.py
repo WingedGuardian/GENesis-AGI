@@ -1,5 +1,6 @@
 """Disposable snapshots, complete reads, and history-only fresh restore."""
 
+import contextlib
 import hashlib
 import json
 import os
@@ -7,6 +8,7 @@ import shutil
 import tarfile
 from pathlib import Path
 
+import duckdb
 import pyarrow.parquet as pq
 import pytest
 
@@ -77,6 +79,7 @@ def test_snapshot_matches_shared_current_and_historical_corpus(tmp_path):
     "dangling", "loop", "escaping",
 ])
 def test_every_snapshot_open_or_read_error_falls_back_once(built, capsys, fault):
+    """One snapshot_fallback event, then the derived views are computed live."""
     _projects, data, _path = built
     current = data / "derived/current"
     table = current / "tool_calls.parquet"
@@ -277,14 +280,117 @@ def test_symlink_derived_root_is_discarded_on_build(built):
     assert derive.is_current(data)
 
 
-def test_raw_views_stay_forbidden_when_fallback_serves_live_graph(built):
-    """Codex: enforce live mode for raw views after snapshot fallback."""
+def _relations(con):
+    return {
+        name for (name,) in con.execute(
+            "SELECT view_name FROM duckdb_views() WHERE NOT internal"
+            " UNION SELECT table_name FROM duckdb_tables() WHERE NOT internal"
+        ).fetchall() if not name.startswith("_derived_")
+    }
+
+
+def _view_contents(con):
+    """Each derived view's schema and every row, in a stable order."""
+    out = {}
+    for view in query._DERIVED:
+        schema = [tuple(row[:2]) for row in con.execute(f"DESCRIBE {view}").fetchall()]
+        rows = sorted(repr(row) for row in con.execute(f"SELECT * FROM {view}").fetchall())
+        out[view] = (schema, rows)
+    return out
+
+
+def test_live_false_exposes_the_same_relations_with_or_without_a_snapshot(built):
+    """Round 3 class fix: a failed snapshot load must not widen what live=False can
+    read. Before, the fallback served the whole live graph (raw_* views, the
+    reconcile intermediates) and only a SQL text check stood in front of it. Now
+    the derived views are computed on a private connection and copied in."""
+    _projects, data, _path = built
+    with query.read_connection(data) as con:
+        assert query._READS[con].get("snapshot") is not None
+        with_snapshot = _relations(con)
+        expected = _view_contents(con)
+    shutil.rmtree(data / "derived")
+    with query.read_connection(data) as con:
+        assert query._READS[con].get("snapshot") is None
+        fallback = _relations(con)
+        got = _view_contents(con)
+    assert fallback == with_snapshot
+    assert got == expected
+    assert set(query._DERIVED) <= fallback
+    assert not {name for name in fallback if name.startswith(("raw_", "call_", "_empty_"))}
+    assert not (data / "derived").exists(), "a reader must never write the store"
+
+
+def test_is_current_never_computes_the_live_fallback(built, monkeypatch):
+    """derive.build asks derived_current under the writer lock; a stale cache
+    must answer False without the full live computation. A corrupt table keeps
+    the manifest readable, so derived_current reaches connect()."""
+    _projects, data, _path = built
+    (data / "derived/current/tool_calls.parquet").write_bytes(b"not parquet")
+    monkeypatch.setattr(query, "_load_live_derived", lambda *a, **k: pytest.fail("computed live"))
+    assert not derive.is_current(data)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT count(*) FROM raw_tool_calls",
+        "SELECT count(*) FROM RAW_TOOL_CALLS",
+        'SELECT count(*) FROM "Raw_Tool_Calls"',
+        "SELECT count(*) FROM query_table('ra' || 'w_tool_calls')",
+        "SELECT count(*) FROM call_observations",
+    ],
+)
+@pytest.mark.parametrize("snapshot", [True, False])
+def test_raw_relations_are_unreachable_without_live(built, sql, snapshot):
+    """Case, quoting and a name built at run time all fail the same way in both
+    modes, because the relation is absent rather than filtered by text."""
+    _projects, data, _path = built
+    if not snapshot:
+        shutil.rmtree(data / "derived")
+    with pytest.raises(duckdb.CatalogException, match="need live=True"):
+        query.run_query(data, sql, live=False)
+
+
+def test_both_instances_get_half_the_memory_during_the_copy(built, monkeypatch):
+    """The private live graph and the caller's connection are both alive while
+    the derived views are copied, so neither may hold the whole budget."""
     _projects, data, _path = built
     shutil.rmtree(data / "derived")
-    with pytest.raises(ValueError, match="require --live"):
-        query.run_query(data, "SELECT count(*) FROM raw_tool_calls", live=False)
-    columns, rows = query.run_query(data, "SELECT count(*) FROM raw_tool_calls", live=True)
-    assert rows
+    seen = []
+    real = query._configured
+
+    def spy(memory_limit, threads):
+        seen.append(memory_limit)
+        return real(memory_limit, threads)
+
+    monkeypatch.setattr(query, "_configured", spy)
+    with query.connect(data, memory_limit="1000MB", threads=1) as con:
+        limit = con.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+    assert seen == ["1000MB", "500000000B"]
+    with contextlib.closing(real("1000MB", 1)) as fresh:  # restored once the copy ends
+        assert limit == fresh.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+    assert query._half("2GiB") == f"{2**30}B" and query._half("16MB") == "8000000B"
+
+
+def test_live_true_still_reads_raw_views(built):
+    _projects, data, _path = built
+    shutil.rmtree(data / "derived")
+    _columns, rows = query.run_query(data, "SELECT count(*) FROM raw_tool_calls", live=True)
+    assert rows[0][0] > 0
+
+
+@pytest.mark.parametrize("name", ["MANIFEST.json", "tool_calls.parquet"])
+def test_a_special_file_in_the_snapshot_falls_back_instead_of_blocking(built, name):
+    """A FIFO in place of MANIFEST.json used to block the reader's read_text();
+    one in place of a table blocked the full Parquet read the same way."""
+    _projects, data, _path = built
+    damaged = (data / "derived/current").resolve()
+    (damaged / name).unlink()
+    os.mkfifo(damaged / name)
+    with query.read_connection(data) as con:
+        assert query._READS[con].get("snapshot") is None
+        assert con.execute("SELECT count(*) FROM tool_calls").fetchone()[0] > 0
 
 
 def test_malformed_layout_is_swept_before_rebuild(built):

@@ -1121,7 +1121,9 @@ def test_every_documented_validation_hold_uses_the_scripts_lock_path():
     docs = [
         SCRIPT,
         root / ".claude" / "skills" / "build-session" / "SKILL.md",
-        root / "changelog.d" / "20260927020000-added-deploy-code-only.md",
+        root / "CHANGELOG.md",
+        # Release assembly consumes fragments; check both storage phases.
+        *sorted((root / "changelog.d").glob("*.md")),
     ]
     found = 0
     for doc in docs:

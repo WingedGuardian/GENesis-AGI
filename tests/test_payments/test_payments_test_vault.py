@@ -32,6 +32,7 @@ import pytest
 
 from genesis.db.crud import payment_vault_events as audit
 from genesis.payments import approval as ap
+from genesis.payments import vault_migrate as vm
 from genesis.payments import vault_store as vs
 from genesis.payments.peer_check import ARGV_MISMATCH, PeerPolicy, PeerRefused
 from tests.conftest import private_module
@@ -355,29 +356,16 @@ def test_r5_the_only_card_shaped_literal_is_the_stripe_test_card():
     assert len(uses) == 1 and len(compared) == 1  # its one use: word.lower() == "y"
 
 
-# -- R6 ------------------------------------------------------------------------
+# -- the vault key (R6, the passphrase file, is retired with the passphrase) ------------
 
 
-def test_r6_the_passphrase_file_must_be_private_and_not_a_link(tmp_path):
-    layout = _test_root(tmp_path)
-    other = tmp_path / "elsewhere"
-    other.write_text("p\n")
-    os.symlink(other, layout.passphrase)
-    with pytest.raises(H.Refused, match="^R6: .* missing or a symlink"):
-        H.read_passphrase(layout)
-    layout.passphrase.unlink()
-    layout.passphrase.write_text("p\n")
-    os.chmod(layout.passphrase, 0o644)
-    with pytest.raises(H.Refused, match="^R6: .* not a private"):
-        H.read_passphrase(layout)
-    os.chmod(layout.passphrase, 0o600)
-    assert H.read_passphrase(layout) == "p"
-
-
-def test_r6_setup_writes_a_private_generated_passphrase(built):
+def test_setup_writes_no_passphrase_file_and_a_private_key(built):
     layout, _ = built
-    assert oct(os.stat(layout.passphrase).st_mode & 0o777) == "0o600"
-    assert len(H.read_passphrase(layout)) >= 40
+    assert not (layout.root / "passphrase").exists()
+    assert oct(os.stat(layout.vault / vs.IDENTITY).st_mode & 0o777) == "0o600"
+    assert not (layout.vault / vs.SEALED_IDENTITY).exists()
+    assert vm.migration_state(layout.vault) is None
+    assert vs.vault_status(layout.vault)["error"] is None
 
 
 # -- R7 ------------------------------------------------------------------------
@@ -866,7 +854,7 @@ async def test_end_to_end_request_tap_claim_is_value_free(built):
     events = [r["event"] for r in rows]
     for e in (
         "service_start",
-        "unlock",
+        "key_loaded",
         "release_requested",
         "approval_requested",
         "approval_granted",
@@ -879,11 +867,11 @@ async def test_end_to_end_request_tap_claim_is_value_free(built):
     lines = message.split("\n")
     assert lines[1] == H.TEST_LINE and f"Card: {CARD_LINE}" in lines
     # The value-free sweep: audit rows, every message, the child's output, every file.
-    passphrase = H.read_passphrase(layout)
+    key = (layout.vault / vs.IDENTITY).read_text().strip()  # the vault's secret key
     shown = json.dumps(rows) + console.text
-    assert H.TEST_NUMBER not in shown and passphrase not in shown
+    assert H.TEST_NUMBER not in shown and key not in shown
     assert not ap.holds_long_digit_run(shown)
-    assert H.TEST_NUMBER.encode() not in child_bytes and passphrase.encode() not in child_bytes
+    assert H.TEST_NUMBER.encode() not in child_bytes and key.encode() not in child_bytes
     for path in layout.root.rglob("*"):
         if path.is_file() and not path.is_symlink():
             assert H.TEST_NUMBER.encode() not in path.read_bytes(), path
@@ -1140,6 +1128,46 @@ async def test_a_failing_approver_shutdown_still_stops_the_vault(built):
     console.close()
     assert not layout.socket.exists()
     assert "service_stop" in [r["event"] for r in (await _rows(layout))[before:]]
+
+
+@pytest.fixture
+def unloadable(tmp_path, tmp_path_factory, checkouts, own_overlay):
+    """A fresh test vault whose key the service refuses: others can read it."""
+    layout, state = _setup_fast(
+        tmp_path_factory.mktemp("k") / "testvault", checkouts, tmp_path / "fakehome"
+    )
+    os.chmod(layout.vault / vs.IDENTITY, 0o644)
+    return layout, state
+
+
+async def test_serve_refuses_when_the_key_did_not_load(unloadable, tmp_path):
+    layout, state = unloadable
+    console = Console()
+    stop = asyncio.Event()
+    ready = []
+
+    async def on_ready(_service, _registry):
+        ready.append(True)
+        stop.set()
+
+    try:
+        with pytest.raises(H.Refused, match=r"^serve: the test vault's key did not load \(.+\)$"):
+            await H.run_serve(
+                layout,
+                state,
+                live=_live(tmp_path / "fakehome"),
+                approver=console.approver,
+                timeout_cap_s=30,
+                stop=stop,
+                release_peer=lambda *_a, **_k: None,
+                on_ready=on_ready,
+            )
+    finally:
+        console.close()
+    assert ready == []  # no approver started, nothing served
+    assert not layout.socket.exists()
+    events = [r["event"] for r in await _rows(layout)]
+    assert "key_load_refused" in events and "key_loaded" not in events
 
 
 def test_one_serve_or_teardown_at_a_time(tmp_path, tmp_path_factory, checkouts, own_overlay):

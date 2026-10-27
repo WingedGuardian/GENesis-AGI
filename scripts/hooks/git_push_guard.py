@@ -946,7 +946,7 @@ def _walk_merge_into_main(
     # asserts a waiver that was never consulted, in a store whose entire purpose
     # is answering "was this escape reached for?", and the row carries nothing to
     # reconcile it against. An honest row needs the branch resolved first; see
-    # the follow-up. `# escalation-ack` belongs to the local commit-streak gate;
+    # the follow-up. `# escalation-ack` belonged to the retired commit-streak gate;
     # `# final-round-accept` is recognized only for stale-tree compatibility.
     for s in merge_git_segs:
         if getattr(s, "depth", 0) > 0:

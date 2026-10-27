@@ -175,11 +175,11 @@ def test_writer_killed_mid_ingest_leaves_a_clean_store(env):
     )
     assert proc.returncode == -9, proc.stderr
     # Whatever the crash left, readers take no lock and read cleanly.
-    c = connect(data)
+    c = connect(data, live=True)
     survivors = c.sql("select count(*) from raw_fragments").fetchone()[0]
     assert 0 <= survivors < 4
     # The crash left records without a projects root; adoption re-binds them.
     store.ingest(projects, data, lock_path=lock, adopt_projects_root=True)
     assert not (data / ".staging").exists()
-    assert connect(data).sql("select count(*) from raw_fragments").fetchone() == (4,)
+    assert connect(data, live=True).sql("select count(*) from raw_fragments").fetchone() == (4,)
     assert len(store.compatible_sources(data)[0]) == 4

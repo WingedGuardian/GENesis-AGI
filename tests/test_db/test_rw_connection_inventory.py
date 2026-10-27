@@ -15,6 +15,8 @@ _UNRELATED_OR_SNAPSHOT = {
     "eval/bench/isolation.py",
     # The card vault's own cards.db (0600, in the 0700 vault dir), never genesis.db.
     "payments/vault_store.py",
+    # vault migrate's copy of that cards.db (a new file in a new 0700 sibling dir).
+    "payments/vault_migrate.py",
 }
 _ISOLATED_RECOVERY_WRITERS = {
     # Stdlib-only, existing staged file; restore/update publish only on success.

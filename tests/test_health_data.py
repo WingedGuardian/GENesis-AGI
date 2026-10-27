@@ -17,6 +17,10 @@ from genesis.routing.types import (
     RoutingConfig,
 )
 
+# The health snapshot's deploy section would run the real deploy engine
+# (see the deploy_engine_unanswered fixture in tests/conftest.py).
+pytestmark = pytest.mark.usefixtures("deploy_engine_unanswered")
+
 
 def _make_provider(name: str, *, free: bool = True) -> ProviderConfig:
     return ProviderConfig(

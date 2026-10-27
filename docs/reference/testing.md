@@ -145,6 +145,70 @@ stability:
 - **Hook enforcement** (`test_hooks/`): Verifies that PreToolUse hooks
   correctly block dangerous tool invocations.
 
+### The live fence: tests never run real commands on the machine
+
+`tests/_live_fence.py`, armed for every run by `tests/conftest.py`, stops a
+test from starting a real process against the machine it runs on. It is a
+guardrail (code in the test process could get around it), not a sandbox.
+
+- **Refused, and the test fails:**
+  - `claude` (anything but a bare `--version` or `--help`; `claude.exe` and
+    `claude-code` count) and `sudo`;
+  - any `systemctl`/`systemd-run`/`gh`/`loginctl` called by a real path outside
+    the test's temp dirs (`tempfile.gettempdir()` and pytest's basetemp);
+  - a deploy script run against live state — refused by the SCRIPT, not the
+    fence: the fence exports `GENESIS_TEST_FENCE_LIVE_ROOTS` (this checkout's
+    real root, plus the real home's `~/.genesis`/`~/genesis` when they exist,
+    plus a root named in `GENESIS_LIVE_FENCE_LIVE_ROOT`) and
+    `GENESIS_TEST_FENCE_LOG` (the fence's own log), and
+    `scripts/lib/live_system_guard.sh`'s `refuse_if_test_fenced_live` makes each
+    deploy script (`scripts/{update,deploy_code_only,restore,backup,
+    bootstrap}.sh` and `deploy_candidates`) print `REFUSED (test fence): ...`,
+    append the same line to the log, and exit 97 when its acting root,
+    `HOME`, `GENESIS_HOME` or `HOME/.genesis` is at or under a listed root
+    (or a path it must check cannot be resolved provably). This runs inside the script after bash's own expansion, so no
+    launch spelling escapes it — `bash script`, `bash -c`, `BASH_ENV`,
+    `--rcfile`, a here-string, whatever a child starts.
+
+  The in-process refusal is a `BaseException`, so an `except Exception`
+  fallback in the code under test cannot catch it and try another route; in a
+  forked child the child exits 127 instead.
+- **Answered like CI, and reported:** `systemctl`, `systemd-run`, `gh` and
+  `loginctl` called by bare name (and `claude --version`/`--help`) reach a stub
+  that answers as the real tool does on a CI runner, where nothing is reachable
+  ("Failed to connect to bus", exit 1; `gh` unauthenticated, exit 4). The test
+  is not failed; the call is listed under "live-state reads answered by a
+  stub". Stub the call in the test if its result matters. A stub exists only
+  for a tool installed on the machine, so `shutil.which` still reports a missing
+  tool as missing.
+- **A refusal drained after its test ended** (a detached child) fails the
+  whole session, listed under "refusals outside their test". Reporting ends at
+  the final session drain. The unique shim directory remains for surviving
+  children until normal temp cleanup, so inherited PATH lookups keep refusing.
+- Only the resolved program is ever judged in-process — never argv or a shell
+  string. Any program inside the test's temp dirs runs, so a test that needs a
+  fake of one of these tools puts it in `tmp_path`.
+- Give a test that runs a deploy script a private `HOME` and point the script's
+  root at a fixture tree (the `tests/test_scripts/_deploy_station.py` fixture
+  is the model); the script then runs its normal path.
+- Two explicit opt-outs, each listed in the run summary:
+  - `user_manager`: may run the real `systemd-run` (a transient `--user` scope, a
+    unit check) and gets the real session-bus variables back.
+  - `real_tool("gh", ...)`: deliberately runs the named installed tools (a
+    table checked against their own `--help`, a kernel probe).
+  Deploy scripts against live state stay refused for both.
+- Known gaps, by design (an in-process fence sees only this interpreter's own
+  launches; the OS-level sandbox is the answer):
+  - a program a child process starts by absolute path;
+  - a child given a hand-built `env` without the fence's `PATH` and bus
+    variables: a script that defaults `XDG_RUNTIME_DIR` when it is unset then
+    reaches the real user manager;
+  - whatever a child shell string or a real `systemd-run` in a `user_manager`
+    test goes on to start;
+  - the stubs answer like CI only approximately: `claude --version` exits 127
+    where CI raises "not found", and a system-level `systemctl` also gets "Failed
+    to connect to bus".
+
 ## Integration Tests
 
 Integration tests in `tests/integration/` require running external services
