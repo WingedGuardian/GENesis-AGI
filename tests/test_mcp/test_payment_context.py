@@ -86,6 +86,7 @@ class El:
         self.submits = False  # a submit control (_SUBMITS_JS)
         self.text = ""  # its visible text (a step's label)
         self.label_visible = True  # its consent label comes from a visible element
+        self.visible = True  # shown (a hidden copy is not a step's target)
         self.connected = True  # still in its document
         self.gone = False  # its document was replaced: every script on it raises
         self.form = None  # its form, for _SAME_FORM_JS
@@ -188,12 +189,20 @@ class BoxArray:
 
 
 class Loc:
-    def __init__(self, frame, sel):
-        self.frame, self.sel = frame, sel
+    def __init__(self, frame, sel, visible_only=False):
+        self.frame, self.sel, self.visible_only = frame, sel, visible_only
+
+    def _els(self):
+        return [
+            e for e in self.frame.elements.get(self.sel, []) if not self.visible_only or e.visible
+        ]
 
     @property
     def first(self):
         return self
+
+    def filter(self, visible=None):
+        return Loc(self.frame, self.sel, visible_only=bool(visible))
 
     async def wait_for(self, state=None, timeout=None):
         # A widget that mounts late: its elements appear when something waits.
@@ -201,17 +210,17 @@ class Loc:
         late = self.frame.late.pop(self.sel, None)
         if late is not None:
             self.frame.elements[self.sel] = late
-        if not self.frame.elements.get(self.sel):
+        if not self._els():
             raise TimeoutError("not attached")
 
     async def count(self):
-        return len(self.frame.elements.get(self.sel, []))
+        return len(self._els())
 
     async def evaluate(self, js):
-        return await Handle(self.frame.elements[self.sel][0], self.frame).evaluate(js)
+        return await Handle(self._els()[0], self.frame).evaluate(js)
 
     async def element_handle(self, timeout=None):
-        return Handle(self.frame.elements[self.sel][0], self.frame)
+        return Handle(self._els()[0], self.frame)
 
 
 class Frame:
@@ -2503,7 +2512,7 @@ async def test_without_the_steps_a_form_behind_clicks_is_not_found(vault):
 async def test_a_step_that_matches_nothing_stops_before_the_tap(vault):
     ns = behind_steps()
     out, _ = await _run(ns, steps=["#absent"])
-    assert out["code"] == "step_not_found"
+    assert out["code"] == "step_not_found:1:none"  # which step, and how many matched
     assert vault.ops("release_request") == [] and ns.pctx.closed
 
 
@@ -2891,7 +2900,8 @@ async def test_a_late_billing_field_that_is_not_there_stops_before_the_tap(vault
     monkeypatch.setattr(cf, "billing_value", lambda name: "1 Config St")
     extra = {"address_line1": {"selector": "#nowhere", "frames": ["iframe#card"]}}
     out, _ = await _run(ns, extra_fields=extra)
-    assert out["code"] == "extra_field_not_found" and vault.ops("release_request") == []
+    assert out["code"] == "extra_field_not_found:address_line1:none"
+    assert vault.ops("release_request") == []
 
 
 async def test_a_step_inside_the_pay_control_is_refused(vault):
@@ -3291,3 +3301,58 @@ async def test_a_card_frame_that_changes_origin_after_the_save_stops_before_pay(
     _after_save(ns, lambda: setattr(card, "url", "https://other-origin.example/form"))
     out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
     assert out["code"] == "saved_page_changed" and ns.pay_clicks == []
+
+
+# ── steps match one visible element; refusals say which and how many ─────
+
+
+async def test_a_hidden_copy_of_a_step_target_is_not_counted(vault):
+    ns = checkout()
+    shown, hidden = El(tag="button"), El(tag="button")
+    hidden.visible = False
+    clicks: list[str] = []
+    shown.on_click = lambda: clicks.append("shown")
+    hidden.on_click = lambda: clicks.append("hidden")
+    ns.ppage.main_frame.elements["#cart"] = [hidden, shown]
+    out, _ = await _run(ns, steps=["#cart"])
+    assert out["code"] == "submitted_unverified"
+    assert clicks == ["shown"]
+
+
+async def test_two_shown_step_targets_say_several(vault, caplog):
+    ns = checkout()
+    ns.ppage.main_frame.elements["#cart"] = [El(tag="button"), El(tag="button")]
+    out, _ = await _run(ns, steps=["#cart"])
+    assert out["code"] == "step_not_found:1:several"
+    assert out["status"] == cf.TEXTS["step_not_found"]
+    assert vault.ops("release_request") == []
+    assert "payment step 1 matched 2" in caplog.text
+
+
+async def test_the_second_step_that_finds_nothing_is_named(vault):
+    ns = checkout()
+    ns.ppage.main_frame.elements["#cart"] = [El(tag="button")]
+    out, _ = await _run(ns, steps=["#cart", "#checkout"])
+    assert out["code"] == "step_not_found:2:none"
+
+
+async def test_a_consent_that_matches_two_boxes_says_several(vault):
+    ns = checkout()
+    _consent_box(ns)
+    card = ns.ppage.main_frame.elements["iframe#card"][0].child
+    other = El()
+    other.checkbox, other.label = True, "Save this card"
+    card.elements["#agree"].append(other)
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "consent_not_found:1:several"
+    assert vault.ops("release_request") == []
+
+
+async def test_a_step_target_owned_by_another_frame_says_owner(vault):
+    ns = checkout()
+    el = El(tag="button")
+    el.owner = Frame(SHOP)  # found through the top document, but lives elsewhere
+    ns.ppage.main_frame.elements["#cart"] = [el]
+    out, _ = await _run(ns, steps=["#cart"])
+    assert out["code"] == "step_not_found:1:owner"
+    assert vault.ops("release_request") == []
