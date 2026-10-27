@@ -189,6 +189,86 @@ def strip_quoted(text: str) -> str:
     return "\n".join(lines)
 
 
+#: The plan-time premise section's title (``.claude/docs/premise-check.md``, "At
+#: plan and issue time"), matched on a heading's RENDERED text at any level. Real
+#: plans use all four spellings (MEASURED 2026-10-27 over one install's 72 plans:
+#: "Premise check" 8, "Premise questions" 4, "Premise checks" 1); the issue form
+#: says "Premise checks".
+_PREMISE_TITLE = re.compile(r"premise\s+(?:checks?|questions?)\b", re.IGNORECASE)
+#: The line-rule fallback, used only without a parser.
+_PREMISE_HEADING_LINE = re.compile(r"^#{1,6}[ \t]+premise[ \t]+(?:checks?|questions?)\b", re.IGNORECASE)
+_ANY_HEADING_LINE = re.compile(r"^#{1,6}[ \t]")
+_ANSWER_LINE = re.compile(r"^ {0,3}([1-9])[.)](?:[ \t]+(.*))?$")
+
+
+def premise_answers(text: str) -> dict[int, str] | None:
+    """The numbered answers under a plan's premise heading, or None without one.
+
+    ``text`` is read as given; callers pass the live, quote-stripped section, so a
+    heading shown inside an example does not count. Read AS IT RENDERS, like the
+    rest of this module: the section runs from the first heading titled "Premise
+    check(s)" or "Premise question(s)" to the next heading of the same or a higher
+    level, and its answers are the items of its top-level ordered lists. An item
+    nested inside an answer is part of that answer, never an answer of its own, and
+    text after a list belongs to no answer.
+
+    Answers are keyed by the number written on each item when those numbers are
+    all distinct, so "1. 2. 4." reports answer 3 missing; an autonumbered list
+    ("1. 1. 1.", which CommonMark renders as 1, 2, 3) is keyed by position. Each
+    answer's text is its item's source text, joined.
+    """
+    parsed = _blocks(text)
+    if parsed is None:
+        return _premise_answers_by_line(text)
+    _, _, tokens = parsed
+    start = depth = None
+    for i, tok in enumerate(tokens):
+        title = _visible_text(tokens[i + 1]).strip() if i + 1 < len(tokens) else ""
+        if tok.type == "heading_open" and tok.level == 0 and _PREMISE_TITLE.match(title):
+            start, depth = i + 1, int(tok.tag[1:])
+            break
+    if start is None:
+        return None
+    items: list[tuple[str, list[str]]] = []
+    current: list[str] | None = None
+    for tok in tokens[start + 1 :]:
+        if tok.type == "heading_open" and tok.level == 0 and int(tok.tag[1:]) <= depth:
+            break
+        if tok.type == "list_item_open" and tok.level == 1 and tok.markup in (".", ")"):
+            current = []
+            items.append((tok.info, current))
+        elif tok.type == "list_item_close" and tok.level == 1:
+            current = None
+        elif tok.type == "inline" and current is not None:
+            current.append(tok.content.strip())
+    written = [info for info, _ in items]
+    by_number = all(n.isdigit() for n in written) and len(set(written)) == len(written)
+    return {
+        (int(info) if by_number else pos): " ".join(p for p in parts if p)
+        for pos, (info, parts) in enumerate(items, start=1)
+    }
+
+
+def _premise_answers_by_line(text: str) -> dict[int, str] | None:
+    """``premise_answers`` without a parser: line rules, so the check still runs."""
+    lines = text.split("\n")
+    start = next((i for i, line in enumerate(lines) if _PREMISE_HEADING_LINE.match(line)), None)
+    if start is None:
+        return None
+    answers: dict[int, str] = {}
+    current: int | None = None
+    for line in lines[start + 1 :]:
+        if _ANY_HEADING_LINE.match(line):
+            break
+        item = _ANSWER_LINE.match(line)
+        if item and int(item.group(1)) not in answers:
+            current = int(item.group(1))
+            answers[current] = (item.group(2) or "").strip()
+        elif current is not None and line.strip():
+            answers[current] = f"{answers[current]} {line.strip()}".strip()
+    return answers
+
+
 def live_section(content: str) -> str:
     """The part of a plan above its superseded-content divider.
 
