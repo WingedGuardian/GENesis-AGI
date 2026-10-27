@@ -2982,7 +2982,14 @@ verified: 2f013ed7b 2026-10-23
   candidate adds the parser, durable per-source records, audited historical
   readers and live query views. Readers capture immutable source selections;
   tool blocks remain distinct, and uncertain result or delegation matches stay
-  unresolved. CLI and scheduling arrive in dependent changes. Additional backup
+  unresolved. This CLI candidate exposes opt-in capped collection, status, live
+  SQL, disposable cache building and independent live/cache verification. The
+  canonical configuration defaults off and accepts the existing private overlay;
+  default paths follow the canonical runtime homes while explicit paths win.
+  Status reads confined snapshot metadata and reports individual source stat or
+  fingerprint errors while continuing; bounded SQL previews and streaming CSV
+  preserve full query counts without retaining every result row in Python.
+  Scheduling arrives in a dependent change. Additional backup
   and recovery integration is deferred independently of collection and search.
   Unknown historical content is excluded from content metrics. Views version 24
   preserves missing call/result hashes as unknown and admits ownership from the
