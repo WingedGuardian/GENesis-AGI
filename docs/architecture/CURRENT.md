@@ -340,7 +340,12 @@ it runs with: the memory lifespan's router reloads its secrets file with
 `override=True`, so a key the file carries beats the exec-time value; the file
 counts only if it and every symlink met resolving it, including links inside a
 link's own target, are unchanged by ctime since the server started, and a
-missing or changed file is unknown), and its database
+missing or changed file is unknown, except that a file changed only in keys the
+census does not read is carried: each row records `secrets_digest`, a hash of
+the six keys it reads, and the next census proves a changed file whose current
+values hash the same for the same pid and start (`carried: true`; the latest
+census row only; never when the file names `SECRETS_PATH` or
+`GENESIS_REPO_ROOT`)), and its database
 scope (the primary database is fixed at import from the exec env or the root
 default, and a path in the file becomes a second one; `foreign` only when every
 one of them differs from the live database by `(st_dev, st_ino)`, no symlink on
