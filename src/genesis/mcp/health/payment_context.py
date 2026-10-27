@@ -37,6 +37,7 @@ import logging
 import re
 import secrets
 import unicodedata
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from urllib.parse import unquote_plus, urlsplit
@@ -384,6 +385,13 @@ class _Flow:
     report: Callable[[str], Awaitable[None]] | None = None
     granted: bool = False  # past the tap: keep the client's idle clock fed
     done: asyncio.Event = field(default_factory=asyncio.Event)
+    # The payment window's requests (counts, and the hosts of failed ones): logged
+    # when a step finds nothing, the one view of a window that cannot be watched.
+    net: dict = field(
+        default_factory=lambda: {
+            "started": 0, "finished": 0, "failed": 0, "hosts": [], "pending": {}
+        }
+    )
 
 
 # What may sit between a value's characters in a URL and still read as it:
@@ -1021,12 +1029,37 @@ _PAGE_SHAPE_JS = (
 )
 
 
+def _net(flow: _Flow, what: str, request) -> None:
+    """Count a payment-window request event; keep a failed one's host and error,
+    and the host of each one still pending (no path or query: a URL can carry
+    page data)."""
+    with contextlib.suppress(Exception):
+        flow.net[what] += 1
+        host = urlsplit(request.url).hostname or "?"
+        if what == "started":
+            flow.net["pending"][id(request)] = host
+            return
+        flow.net["pending"].pop(id(request), None)
+        if what == "failed" and len(flow.net["hosts"]) < 8:
+            flow.net["hosts"].append(f"{host} {str(request.failure or '')[:60]}")
+
+
+def _net_summary(flow: _Flow) -> str:
+    """The window's request counts, failed hosts and still-pending hosts, for a log."""
+    net = flow.net
+    pending = Counter(net["pending"].values()).most_common(8)
+    return (
+        f"{net['started']} started, {net['finished']} finished, {net['failed']} failed;"
+        f" failed {net['hosts']}; pending {pending}"
+    )
+
+
 def _how_many(count: int) -> str:
     """A refusal's match count, as words (no selector or page text in a code)."""
     return "none" if count == 0 else "several"
 
 
-async def _steps(ppage, args: cf.CardArgs) -> tuple[list[str], list]:
+async def _steps(ppage, args: cf.CardArgs, flow: _Flow) -> tuple[list[str], list]:
     """Click each step in order, in the payment window, before the form is read
     and before the tap: no card value exists yet, and a step is a click, never
     a value. Each waits for its element (``STEP_WAIT_S``), which must be exactly
@@ -1044,18 +1077,36 @@ async def _steps(ppage, args: cf.CardArgs) -> tuple[list[str], list]:
         # Only a shown element can be clicked: a page that keeps a hidden copy
         # of a control (another layout's header, say) still has one to click.
         loc = frame.locator(sel).filter(visible=True)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + STEP_WAIT_S
         with contextlib.suppress(Exception):
             await asyncio.wait_for(
                 loc.first.wait_for(state="visible", timeout=STEP_WAIT_S * 1000),
                 STEP_WAIT_S + 5,
             )
-        if (count := await _step(loc.count())) != 1:
+        # A page that re-renders can swap the element between that wait and the
+        # count (measured): ask again until exactly one is there, or time is up.
+        count, handle = 0, None
+        while True:
+            with contextlib.suppress(Exception):
+                count = await _step(loc.count())
+                if count == 1:
+                    handle = await _step(loc.element_handle(timeout=2000))
+            if handle is not None or loop.time() >= deadline:
+                break
+            await asyncio.sleep(TICK_S)
+        if handle is None:
             shape = None
             with contextlib.suppress(Exception):
                 shape = await _step(frame.evaluate(_PAGE_SHAPE_JS))
-            logger.warning("payment step %d matched %d (page %s)", n, count, shape)
+            logger.warning(
+                "payment step %d matched %d (page %s; requests %s)",
+                n,
+                count,
+                shape,
+                _net_summary(flow),
+            )
             raise _Stop(f"step_not_found:{n}:{_how_many(count)}")
-        handle = await _step(loc.element_handle(timeout=5000))
         try:
             if not await _owned_by(handle, frame):
                 raise _Stop(f"step_not_found:{n}:owner")
@@ -1707,6 +1758,12 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
         guard = _UrlGuard(flow)
         await _step(pctx.route("**/*", guard.handle))
         pctx.on("request", guard.on_request)
+        for event, what in (
+            ("request", "started"),
+            ("requestfinished", "finished"),
+            ("requestfailed", "failed"),
+        ):
+            pctx.on(event, lambda r, what=what: _net(flow, what, r))
         seed = None
         if session:  # into an empty sessionStorage of the same origin, before page scripts
             seed = await _step(
@@ -1738,7 +1795,7 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     step_labels: list[str] = []
     step_snapshots: list = []
     if args.steps:
-        step_labels, step_snapshots = await _steps(ppage, args)
+        step_labels, step_snapshots = await _steps(ppage, args, flow)
         if not await _mask_ok(ppage):
             raise _Stop("mask_unverified")
         host, top = _top(flow, ppage, site)  # a step may move the checkout within its site

@@ -582,6 +582,7 @@ def _clean(monkeypatch):
         ("TICK_S", 0.01),
         ("ATTACH_S", 0.05),
         ("TOTAL_STABLE_S", 0.02),
+        ("STEP_WAIT_S", 0.3),
     ):
         monkeypatch.setattr(pc, name, value)
     # The flow reads Camoufox's media defaults for the payment context. CI's test
@@ -3356,3 +3357,53 @@ async def test_a_step_target_owned_by_another_frame_says_owner(vault):
     out, _ = await _run(ns, steps=["#cart"])
     assert out["code"] == "step_not_found:1:owner"
     assert vault.ops("release_request") == []
+
+
+# ── a re-render between the wait and the count; the window's network on a miss ──
+
+
+async def test_a_step_target_swapped_by_a_re_render_is_found_on_the_next_look(vault, monkeypatch):
+    # Measured on a live checkout: the header re-renders, so the element seen
+    # shown is gone when the count runs; a moment later its replacement is there.
+    ns = checkout()
+    ns.ppage.main_frame.elements["#cart"] = [El(tag="button")]
+    real, seen = Loc.count, []
+
+    async def first_look_misses(self):
+        if self.sel == "#cart" and not seen:
+            seen.append(True)
+            return 0
+        return await real(self)
+
+    monkeypatch.setattr(Loc, "count", first_look_misses)
+    out, _ = await _run(ns, steps=["#cart"])
+    assert out["code"] == "submitted_unverified" and seen == [True]
+
+
+def test_the_network_summary_keeps_hosts_never_paths():
+    flow = pc._Flow(task=None)
+
+    class Req:
+        def __init__(self, url, failure=None):
+            self.url, self.failure = url, failure
+
+    done = Req("https://shop.example.com/app.js?session=abc")
+    stuck = Req("https://cdn.example.net/bundle.js?token=xyz")
+    broken = Req("https://api.example.org/config?user=me", failure="NS_ERROR_NET_RESET")
+    for r in (done, stuck, broken):
+        pc._net(flow, "started", r)
+    pc._net(flow, "finished", done)
+    pc._net(flow, "failed", broken)
+    text = pc._net_summary(flow)
+    assert "3 started, 1 finished, 1 failed" in text
+    assert "api.example.org NS_ERROR_NET_RESET" in text
+    assert "('cdn.example.net', 1)" in text  # still pending
+    for secret in ("session=abc", "token=xyz", "user=me", "/app.js", "/config"):
+        assert secret not in text
+
+
+async def test_a_step_miss_logs_the_window_network(vault, caplog):
+    ns = checkout()
+    out, _ = await _run(ns, steps=["#nothing"])
+    assert out["code"] == "step_not_found:1:none"
+    assert "payment step 1 matched 0" in caplog.text and "started" in caplog.text
