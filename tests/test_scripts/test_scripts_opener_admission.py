@@ -87,6 +87,8 @@ _ALLOWLIST: dict[str, str] = {
     "backfill_session_charters.py": _OPERATOR_ONE_OFF,
     "backfill_session_memories.py": _OPERATOR_ONE_OFF,
     "backfill_source_subsystem.py": _OPERATOR_ONE_OFF,
+    "ci/headlong_monolith_controls.py": _CI_FIXTURE,
+    "ci/headlong_native_bridge.py": _CI_FIXTURE,
     "ci/headlong_native_controls.py": _CI_FIXTURE,
     "cleanup_fenced_knowledge_units.py": _OPERATOR_ONE_OFF,
     "cleanup_pipeline_noise.py": _OPERATOR_ONE_OFF,
