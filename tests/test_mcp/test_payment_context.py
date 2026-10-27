@@ -1230,7 +1230,7 @@ async def test_a_page_that_moved_while_waiting_cancels_the_release(vault):
     ns = checkout()
     vault.on_status = lambda: setattr(ns.ppage.extra[0], "url", "https://evil.example.org/f")
     out, _ = await _run(ns)
-    assert out["code"] == "page_changed"
+    assert out["code"] == "page_changed:granted"
     assert vault.ops("release_claim") == [] and len(vault.ops("release_cancel")) == 1
 
 
@@ -1273,7 +1273,7 @@ async def test_a_value_that_does_not_land_stops_before_pay(vault, logs):
     clicked = []
     ns.els["pay"].on_click = lambda: clicked.append(1)
     out, _ = await _run(ns)
-    assert out["code"] == "failed_before_pay"
+    assert out["code"] == "failed_before_pay:held"
     assert out["field"] == "cvc" and out["filled"] == ["number", "expiry", "cvc"]
     assert clicked == [] and ns.pctx.closed
     _sweep(out, logs)
@@ -1283,7 +1283,7 @@ async def test_pay_disabled_after_filling_stops_before_pay(vault):
     ns = checkout()
     vault.on_claim = lambda: ns.els["pay"].pay.update(live=False)
     out, _ = await _run(ns)
-    assert out["code"] == "failed_before_pay" and "field" not in out
+    assert out["code"] == "failed_before_pay:page" and "field" not in out
 
 
 async def test_an_unanswered_claim_is_not_cancelled(vault):
@@ -1357,11 +1357,15 @@ async def test_abort_ends_the_flow_with_a_result_and_cancels(vault):
 @pytest.mark.parametrize(
     ("hook", "change", "code"),
     [
-        ("on_status", lambda ns: ns.els["pay"].pay.update(label="Pay $99.99"), "page_changed"),
+        (
+            "on_status",
+            lambda ns: ns.els["pay"].pay.update(label="Pay $99.99"),
+            "page_changed:granted",
+        ),
         (
             "on_status",
             lambda ns: setattr(ns.ppage.main_frame, "text", "Total $29.99"),
-            "page_changed",
+            "page_changed:granted",
         ),
         (
             "on_claim",
@@ -1378,7 +1382,11 @@ async def test_abort_ends_the_flow_with_a_result_and_cancels(vault):
             "claimed_not_filled",
         ),
         # Same origin, amount, Pay and fields, but another order under the tapped title.
-        ("on_status", lambda ns: setattr(ns.ppage, "_title", "Order 2 - Checkout"), "page_changed"),
+        (
+            "on_status",
+            lambda ns: setattr(ns.ppage, "_title", "Order 2 - Checkout"),
+            "page_changed:granted",
+        ),
         (
             "on_claim",
             lambda ns: setattr(ns.ppage, "_title", "Order 2 - Checkout"),
@@ -1480,7 +1488,7 @@ async def test_the_mask_is_checked_before_each_field(vault):
         out, _ = await _run(ns)
     finally:
         Handle.fill = real
-    assert out["code"] == "failed_before_pay" and out["field"] == "expiry"
+    assert out["code"] == "failed_before_pay:frame" and out["field"] == "expiry"
     assert ns.els["expiry"].value == ""
 
 
@@ -1498,7 +1506,7 @@ async def test_a_frame_moved_before_pay_stops_before_pay(vault):
         out, _ = await _run(ns)
     finally:
         Handle.fill = real
-    assert out["code"] == "failed_before_pay" and "field" not in out
+    assert out["code"] == "failed_before_pay:page" and "field" not in out
 
 
 async def test_a_challenge_like_frame_present_before_pay_is_ignored(vault):
@@ -1683,7 +1691,7 @@ async def test_a_select_whose_label_is_wrong_does_not_land(vault):
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(Handle, "select_option", select_option)
         out, _ = await _run(ns)
-    assert out["code"] == "failed_before_pay" and out["field"] == "exp_month"
+    assert out["code"] == "failed_before_pay:held" and out["field"] == "exp_month"
 
 
 async def _filling(ns, last_kind, change):
@@ -1718,7 +1726,7 @@ async def test_pay_and_extras_are_rechecked_right_before_pay(vault, change):
     clicked = []
     ns.els["pay"].on_click = lambda: clicked.append(1)
     out = await _filling(ns, "name", lambda: change(ns))
-    assert out["code"] == "failed_before_pay" and clicked == []
+    assert out["code"] == "failed_before_pay:page" and clicked == []
 
 
 @pytest.mark.parametrize(
@@ -1732,7 +1740,7 @@ async def test_a_card_field_rewritten_by_a_later_fill_stops_before_pay(vault, lo
     clicked = []
     ns.els["pay"].on_click = lambda: clicked.append(1)
     out = await _filling(ns, "name", lambda: setattr(ns.els[kind], "value", value))
-    assert out["code"] == "failed_before_pay" and out["field"] == kind and clicked == []
+    assert out["code"] == "failed_before_pay:held_at_pay" and out["field"] == kind and clicked == []
     assert out["filled"] == ["number", "expiry", "cvc", "name"]
     _sweep(out, logs)
 
@@ -1764,7 +1772,9 @@ async def test_card_fields_are_read_back_after_the_last_pay_check(vault):
     finally:
         Handle.fill, Handle.evaluate = real_fill, real_eval
     assert len(reads) == 1
-    assert out["code"] == "failed_before_pay" and out["field"] == "cvc" and clicked == []
+    assert (
+        out["code"] == "failed_before_pay:held_at_pay" and out["field"] == "cvc" and clicked == []
+    )
 
 
 async def test_a_widget_that_mounts_after_load_is_waited_for_before_the_tap(vault):
@@ -1803,9 +1813,9 @@ async def test_two_card_kinds_on_one_element_are_refused_before_the_tap(vault):
 @pytest.mark.parametrize(
     ("hits", "code"),
     [
-        (1, "page_changed"),  # after the grant: the release is cancelled
+        (1, "page_changed:granted"),  # after the grant: the release is cancelled
         (2, "claimed_not_filled"),  # after the claim: nothing typed
-        (3, "failed_before_pay"),  # before Pay: not clicked
+        (3, "failed_before_pay:page"),  # before Pay: not clicked
     ],
 )
 async def test_a_bot_check_appearing_after_the_tap_stops_the_flow(vault, hits, code):
@@ -1817,7 +1827,7 @@ async def test_a_bot_check_appearing_after_the_tap_stops_the_flow(vault, hits, c
     hooks.interstitial = AsyncMock(side_effect=[False] * hits + [True] * 10)
     out, _ = await _run(ns, hooks=hooks)
     assert out["code"] == code and clicked == []
-    if code == "page_changed":
+    if code.startswith("page_changed"):
         assert vault.ops("release_claim") == []
 
 
@@ -1850,7 +1860,7 @@ async def test_an_extra_field_changed_while_waiting_cancels(vault):
     ns = checkout()
     vault.on_status = lambda: setattr(ns.els["email"], "value", "")
     out, _ = await _run(ns)
-    assert out["code"] == "page_changed" and vault.ops("release_claim") == []
+    assert out["code"] == "page_changed:granted" and vault.ops("release_claim") == []
 
 
 async def test_an_extra_field_that_does_not_keep_its_value_requests_nothing(vault):
@@ -2705,7 +2715,7 @@ async def test_a_consent_label_changed_after_the_tap_types_nothing(vault):
 
     vault.on_status = swap
     out, _ = await _run(ns, consent=[{"selector": "#agree", "frames": ["iframe#card"]}])
-    assert out["code"] == "page_changed"
+    assert out["code"] == "page_changed:consent_label"
     assert ns.els["number"].value == "" and not box.checked
     assert vault.ops("release_claim") == []
 
@@ -2941,7 +2951,7 @@ async def test_a_late_billing_value_that_reprices_stops_before_the_claim(vault, 
     monkeypatch.setattr(Handle, "fill", fill)
     extra = {"address_line1": {"selector": "#street", "frames": ["iframe#card"]}}
     out, _ = await _run(ns, extra_fields=extra)
-    assert out["code"] == "page_changed"
+    assert out["code"] == "page_changed:after_late"
     assert vault.ops("release_claim") == [] and ns.els["number"].value == ""
 
 
@@ -3012,7 +3022,7 @@ async def test_save_then_pay_within_the_ceiling(vault, logs):
         ("Pay $25.01", "total_over_ceiling"),
         ("Pay $5.00", "total_under_subtotal"),
         (None, "total_not_shown"),
-        ("Buy now $21.50", "saved_page_changed"),
+        ("Buy now $21.50", "saved_page_changed:pay"),
     ],
 )
 async def test_save_stops_before_pay_when_the_total_does_not_fit(vault, total, code):
@@ -3021,7 +3031,7 @@ async def test_save_stops_before_pay_when_the_total_does_not_fit(vault, total, c
     assert out["code"] == code
     assert ns.saves == [True] and ns.pay_clicks == []
     assert (
-        out["status"].endswith(cf.TEXTS[code].split(".")[-1])
+        out["status"].endswith(cf.TEXTS[code.split(":")[0]].split(".")[-1])
         or "Pay was NOT clicked" in out["status"]
     )
 
@@ -3114,7 +3124,7 @@ async def test_an_error_after_the_save_says_the_card_was_saved(vault, monkeypatc
     async def broken(*a, **k):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(pc, "_saved_page_ok", broken)
+    monkeypatch.setattr(pc, "_saved_page_changed", broken)
     out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
     assert out["code"] == "saved_stopped" and ns.pay_clicks == []
 
@@ -3133,16 +3143,16 @@ async def test_a_negative_total_is_not_read(vault):
 
 async def test_a_popup_during_the_last_recheck_stops_before_pay(vault, monkeypatch):
     ns = save_checkout()
-    real = pc._saved_page_ok
+    real = pc._saved_page_changed
 
     async def popup_then_ok(*a, **k):
         ok = await real(*a, **k)
         pc._flow.popups += 1
         return ok
 
-    monkeypatch.setattr(pc, "_saved_page_ok", popup_then_ok)
+    monkeypatch.setattr(pc, "_saved_page_changed", popup_then_ok)
     out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
-    assert out["code"] == "saved_page_changed" and ns.pay_clicks == []
+    assert out["code"] == "saved_page_changed:nav" and ns.pay_clicks == []
 
 
 # ── Codex rounds 1-2 on the save stage ─────────────────────────────────────
@@ -3184,7 +3194,7 @@ async def test_a_pay_label_with_a_second_number_is_refused(vault):
     ns.ppage.main_frame.elements["#total"] = [total]
     _after_save(ns, lambda: setattr(total, "text", "$19.99"))
     out, _ = await _run(ns, save=SAVE, amount_max="$25.00", total="#total")
-    assert out["code"] == "saved_page_changed" and ns.pay_clicks == []
+    assert out["code"] == "saved_page_changed:pay" and ns.pay_clicks == []
 
 
 async def test_a_pay_label_without_digits_still_passes_with_a_total_element(vault):
@@ -3235,7 +3245,7 @@ async def test_a_consent_changed_by_the_save_stops_before_pay(vault, change):
     box = _consent_box(ns)
     _after_save(ns, lambda: change(box))
     out, _ = await _run(ns, save=SAVE, amount_max="$25.00", consent=CONSENT)
-    assert out["code"] == "saved_page_changed" and ns.pay_clicks == []
+    assert out["code"] == "saved_page_changed:consents" and ns.pay_clicks == []
 
 
 def _card_frame(ns):
@@ -3274,7 +3284,7 @@ async def test_a_consent_that_cannot_be_read_is_a_refusal(vault):
 
     _after_save(ns, unreadable)
     out, _ = await _run(ns, save=SAVE, amount_max="$25.00", consent=CONSENT)
-    assert out["code"] == "saved_page_changed" and ns.pay_clicks == []
+    assert out["code"] == "saved_page_changed:consents" and ns.pay_clicks == []
 
 
 async def test_a_bank_frame_shown_only_while_the_total_settles_is_a_challenge(vault):
@@ -3313,15 +3323,15 @@ async def test_a_pay_label_that_is_the_price_source_must_still_read_the_total(va
     # No total element: Pay's label is where the total was read, so a label
     # gone back to a placeholder at the final check is refused.
     ns = save_checkout()
-    real = pc._saved_page_ok
+    real = pc._saved_page_changed
 
     async def placeholder_then_check(*a, **k):
         ns.els["pay"].pay["label"] = "Pay $--.--"
         return await real(*a, **k)
 
-    monkeypatch.setattr(pc, "_saved_page_ok", placeholder_then_check)
+    monkeypatch.setattr(pc, "_saved_page_changed", placeholder_then_check)
     out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
-    assert out["code"] == "saved_page_changed" and ns.pay_clicks == []
+    assert out["code"] == "saved_page_changed:pay" and ns.pay_clicks == []
 
 
 async def test_a_save_control_in_the_pay_form_is_refused(vault):
@@ -3341,7 +3351,7 @@ async def test_a_box_the_save_ticks_stops_before_pay(vault):
     ns.ppage.main_frame.elements["#autopay"] = [extra]
     _after_save(ns, lambda: setattr(extra, "checked", True))
     out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
-    assert out["code"] == "saved_page_changed" and ns.pay_clicks == []
+    assert out["code"] == "saved_page_changed:consents" and ns.pay_clicks == []
 
 
 async def test_a_card_frame_that_changes_origin_after_the_save_stops_before_pay(vault):
@@ -3349,7 +3359,7 @@ async def test_a_card_frame_that_changes_origin_after_the_save_stops_before_pay(
     card = ns.ppage.main_frame.elements["iframe#card"][0].child
     _after_save(ns, lambda: setattr(card, "url", "https://other-origin.example/form"))
     out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
-    assert out["code"] == "saved_page_changed" and ns.pay_clicks == []
+    assert out["code"] == "saved_page_changed:card_origin" and ns.pay_clicks == []
 
 
 # ── steps match one visible element; refusals say which and how many ─────
@@ -3530,7 +3540,7 @@ async def test_a_save_that_drops_the_label_and_unticks_the_box_never_pays(vault)
 
     _after_save(ns, drop_label_untick_box)
     out, _ = await _run(ns, save=SAVE, amount_max="$25.00", consent=CONSENT)
-    assert out["code"] == "saved_page_changed" and ns.pay_clicks == []
+    assert out["code"] == "saved_page_changed:consents" and ns.pay_clicks == []
 
 
 async def test_a_label_with_no_point_clear_of_links_is_refused(vault):
@@ -3591,3 +3601,47 @@ async def test_a_label_moved_to_another_box_by_the_fill_never_ticks(vault):
     out, _ = await _run(ns, consent=CONSENT)
     assert out["code"] == "consent_failed"
     assert not box.checked and not other.checked and lab.ticked_at == []
+
+
+# ── each refusal names its cause; the result and the save's new frames are logged ──
+
+
+def test_a_spelled_out_three_d_secure_url_is_a_challenge():
+    assert pc._is_challenge("https://pay.example.com/three-d-secure/challenge")
+    assert pc._is_challenge("https://pay.example.com/threedsecure")
+    assert not pc._is_challenge("https://shop.example.com/checkout")
+
+
+async def test_every_result_is_logged_once_with_its_code(vault, logs):
+    ns = checkout()
+    out, _ = await _run(ns)
+    hits = [line for line in logs if line.startswith("payment fill result")]
+    assert len(hits) == 1 and out["code"] in hits[0] and "claimed=True" in hits[0]
+
+
+async def test_a_new_frame_at_the_save_is_logged_by_origin_only(vault, logs):
+    ns = save_checkout()
+    late = Frame("https://verify.example.net/step?token=abc123")
+    late.parent_frame = ns.ppage.main_frame
+    _after_save(ns, lambda: ns.ppage.extra.append(late))
+    await _run(ns, save=SAVE, amount_max="$25.00")
+    hits = [line for line in logs if "save stage ended" in line]
+    assert len(hits) == 1 and "https://verify.example.net" in hits[0]
+    assert "token" not in hits[0] and "/step" not in hits[0]
+
+
+async def test_a_consent_refusal_after_the_grant_keeps_its_own_code(vault):
+    ns = checkout()
+    box, lab = _styled(ns)
+    vault.on_status = lambda: setattr(lab, "label_point", None)
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "page_changed:consent_not_found:1:trial"
+    assert vault.ops("release_claim") == [] and not box.checked
+
+
+async def test_a_consent_box_unreadable_at_the_tick_is_consent_failed(vault):
+    ns = checkout()
+    box = _consent_box(ns)
+    vault.on_claim = lambda: setattr(box, "gone", True)
+    out, _ = await _run(ns, consent=CONSENT)
+    assert out["code"] == "consent_failed" and not box.checked

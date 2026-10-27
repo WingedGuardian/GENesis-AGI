@@ -440,6 +440,10 @@ their own Chrome, or, when card fill is on, use `browser_fill_card`:
   other code before Pay (`failed_before_pay`, `claimed_not_filled`, a
   refusal): Pay was not clicked; a single-use card may be spent, so ask the
   owner before trying again.
+- A code after the tap can carry a suffix naming the check that stopped it
+  (`page_changed:granted`, `failed_before_pay:held`,
+  `saved_page_changed:pay`). What to do follows the part before the first
+  colon; report the whole code to the owner.
 
 **Credentials.**
 - Do not type a password, code or card number the user pasted into chat. Ask
