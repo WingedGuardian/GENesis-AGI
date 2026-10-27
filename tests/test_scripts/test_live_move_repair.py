@@ -648,11 +648,11 @@ def test_r1_a_failure_after_the_checkout_changed_stays_fatal_at_boot(w, mod, mon
 
 
 @pytest.mark.parametrize("window", ["before_clear", "before_finish"])
-def test_r1_an_interrupted_reports_result_is_finished_by_the_next_run(w, mod, monkeypatch, window):
+def test_r1_an_interrupted_report_is_not_unresolved_once_healed(w, mod, monkeypatch, window):
     """Codex c4385619777: killed after the restore but before the result was
-    written (state still there, or already cleared), the next run finds the
-    tree healed and finishes the report, so the reader never calls it
-    unresolved."""
+    written (state still there, or already cleared), the next run clears the
+    healed state without a new backup, and the reader, which asks the guard
+    rather than the report, never calls it unresolved."""
     killed_tag_side(w, "Z3")
     target = "_after" if window == "before_clear" else "_finish"
 
@@ -669,29 +669,8 @@ def test_r1_an_interrupted_reports_result_is_finished_by_the_next_run(w, mod, mo
     assert r.returncode == 0, r.stdout + r.stderr
     assert not w.state.exists()
     assert len(w.backups()) == 1, "a new backup was made"
-    assert w.report()["result"].startswith("healed"), w.report()["result"]
     later = time.time() + 2 * 3600
     assert _dh().live_repair_findings(_dh().collect_live_repairs(w.gen, now=later)) == []
-
-
-def test_r1_a_report_a_running_repair_holds_is_never_finished(w, mod, monkeypatch):
-    """No state and an unfinished report, but update.lock is held: a repair may
-    be writing that report right now, so it is left alone."""
-    killed_tag_side(w, "Z3")
-
-    def die(self, *a, **kw):
-        raise Killed
-
-    monkeypatch.setattr(mod.Repair, "_finish", die)
-    with pytest.raises(Killed):
-        mod.Repair(str(w.state), str(w.root), True, 0).run()
-    fd = _hold(w.gen / "locks" / "update.lock")
-    try:
-        r = w.repair()
-    finally:
-        os.close(fd)
-    assert r.returncode == 0, r.stdout + r.stderr
-    assert w.report()["result"] is None
 
 
 # ── T-D4: what an interrupted write leaves is the engine's ───────────────────
@@ -1215,6 +1194,91 @@ def test_td17_an_unreadable_target_is_healed_by_the_full_tree(w):
             assert (backup / "tree" / rel).read_bytes() == node, rel
 
 
+def _retarget(w: World, change) -> None:
+    """Rebuild ``to`` as the current target plus ``change(w)`` (a symlink, or a
+    directory that becomes a file), then put `live` back at the tag."""
+    _git(w.root, "checkout", "-q", "--detach", w.to)
+    change(w)
+    _git(w.root, "add", "-A")
+    _git(w.root, "commit", "-qm", "retarget")
+    w.to = _git(w.root, "rev-parse", "HEAD")
+    _git(w.root, "checkout", "-q", "-B", "live", w.tag)
+
+
+def _nested_dir_rows(w):
+    """Codex c4385987795: P and P/inner are both directory rows."""
+    killed_tag_side(w, "prepared")
+    (w.root / "P" / "inner").unlink()
+    (w.root / "P" / "inner").mkdir()
+    (w.root / "P" / "inner" / "mine.txt").write_text("notes\n")
+
+
+def _symlink_row_in_dir_row(w):
+    """Audit S1: the target's P holds a symlink, so P/l is a row inside row P."""
+    _retarget(w, lambda w: os.symlink("inner", w.root / "P" / "l"))
+    killed_tag_side(w, "prepared")
+
+
+@pytest.mark.parametrize("make", [_nested_dir_rows, _symlink_row_in_dir_row])
+def test_r2_a_row_inside_a_saved_directory_is_saved_by_it(w, make):
+    """Rows nested in a directory row are covered by its recursive copy (a
+    second copy collided on every retry); each keeps a saved_as inside it. The
+    index is kept byte for byte before anything changes."""
+    make(w)
+    index_before = (w.root / ".git" / "index").read_bytes()
+    before = w.snapshot()
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert w.snapshot() == tag_snapshot() and not w.state.exists()
+    backup = w.backups()[-1]
+    assert (backup / "git" / "index").read_bytes() == index_before
+    for row in w.report()["paths"]:
+        if row["disk_changed"] and row["disk"] not in ("absent", "other"):
+            assert os.path.lexists(backup / row["saved_as"]), row
+    for step in w.report()["reapply"]:
+        subprocess.run(["bash", "-c", step], check=True, env=w.env())
+    if w.report()["reapply"]:
+        assert {k: v for k, v in w.snapshot().items() if k.startswith("P")} == {
+            k: v for k, v in before.items() if k.startswith("P")
+        }
+
+
+def _missing(w: World, spec: str) -> None:
+    oid = _git(w.root, "rev-parse", f"{w.to}:{spec}")
+    (w.root / ".git" / "objects" / oid[:2] / oid[2:]).unlink()
+
+
+@pytest.mark.parametrize("lost", ["subtree", "blob"])
+def test_r2_a_missing_object_below_a_readable_root_takes_the_full_tree(w, lost):
+    """Codex c4385987781: the target's root tree reads, but a subtree the diff
+    needs, or a blob classification reads, is gone: the full-tree path heals."""
+    killed_tag_side(w, "Z3")
+    if lost == "blob":
+        _lock_aside(w, lambda: (w.root / "sub" / "s1").write_text("mine\n"))
+    _missing(w, "sub" if lost == "subtree" else "sub/s1")
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert w.snapshot() == tag_snapshot() and not w.state.exists()
+    assert w.report()["result"].startswith("healed (the target was unreadable)")
+
+
+@pytest.mark.parametrize("victim", ["Z3", "prepared"])
+def test_r2_a_torn_index_is_kept_and_rebuilt_from_the_tag(w, victim):
+    """Audit S4: git reads a torn index without checking it (no error), then
+    refuses to write it back. The repair keeps its bytes, rebuilds it from the
+    tag, heals, and says so."""
+    killed_tag_side(w, victim)
+    index = w.root / ".git" / "index"
+    torn = index.read_bytes()[: len(index.read_bytes()) // 2]
+    index.write_bytes(torn)
+    r = w.repair(mode="--boot")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert w.snapshot() == tag_snapshot() and not w.state.exists()
+    assert _git(w.root, "status", "--porcelain", "-uall") == ""
+    assert (w.backups()[-1] / "git" / "index").read_bytes() == torn
+    assert "index was torn" in w.report()["result"], w.report()["result"]
+
+
 # ── T-D19: the report's reader ───────────────────────────────────────────────
 
 
@@ -1257,25 +1321,72 @@ def test_td19_the_collector_reports_until_reapplied_or_dismissed(w):
     assert dh.live_repair_findings(dh.collect_live_repairs(w.gen)) == []
 
 
-def test_td19_an_unfinished_report_is_unresolved_after_an_hour(tmp_path):
+def test_r2_a_mode_only_edit_is_not_reapplied_until_its_mode_is_back(w):
+    """Codex c4385987787: the reader compares what the writer compares, the
+    executable bit (the one permission git tracks) as well as the bytes."""
     dh = _dh()
-    root = tmp_path / "deploy-backups"
-    old = root / "20260101T000000Z-1-live-move-repair"
-    old.mkdir(parents=True)
-    (old / "REPAIR.json").write_text(json.dumps({"result": None}))
-    now = (old / "REPAIR.json").stat().st_mtime
-    assert dh.live_repair_findings(dh.collect_live_repairs(tmp_path, now=now + 60)) == []
-    found = dh.collect_live_repairs(tmp_path, now=now + 2 * 3600)
+    killed_tag_side(w, "Z3")  # sub/s1 is still the tag's bytes
+    (w.root / "sub" / "s1").chmod(0o755)
+    assert w.repair().returncode == 0
+    assert not os.access(w.root / "sub" / "s1", os.X_OK)
+    [step] = w.report()["reapply"]
+    assert dh.collect_live_repairs(w.gen)["saved"] == [step]
+    subprocess.run(["bash", "-c", step], check=True, env=w.env())
+    assert os.access(w.root / "sub" / "s1", os.X_OK)
+    assert dh.collect_live_repairs(w.gen)["saved"] == []
+
+
+def _killed_mid_repair(w: World, mod, monkeypatch, where: str) -> None:
+    """A repair killed right after its restore (``_apply``), or at it."""
+    real = mod.Repair._apply
+
+    def die(self, *a, **kw):
+        if where == "after_apply":
+            real(self, *a, **kw)
+        raise Killed
+
+    monkeypatch.setattr(mod.Repair, "_apply", die)
+    with pytest.raises(Killed):
+        mod.Repair(str(w.state), str(w.root), True, 0).run()
+    monkeypatch.setattr(mod.Repair, "_apply", real)
+    assert w.report()["result"] is None
+
+
+def test_td19_an_unfinished_repair_is_unresolved_while_the_tree_is_mixed(w, mod, monkeypatch):
+    """The reader derives "unresolved" from the guard at read time: a report
+    that never finished, an hour old, counts only while the shared guard still
+    calls the checkout half-written; a later heal clears it."""
+    dh = _dh()
+    killed_tag_side(w, "Z3")
+    _killed_mid_repair(w, mod, monkeypatch, "at_apply")
+    later = time.time() + 2 * 3600
+    assert dh.live_repair_findings(dh.collect_live_repairs(w.gen, now=time.time())) == []
+    found = dh.collect_live_repairs(w.gen, now=later)
     assert dh.live_repair_findings(found) == ["live_repair_unresolved"]
     findings = dh.derive_findings(
         missing_units=[], tier2_pending=[], host_gateway={}, commits_behind=0, live_repairs=found
     )
     assert findings == ["live_repair_unresolved"]
-    new = root / "20260102T000000Z-1-live-move-repair"
-    new.mkdir()
-    (new / "REPAIR.json").write_text(json.dumps({"result": "healed"}))
-    found = dh.collect_live_repairs(tmp_path, now=now + 2 * 3600)
-    assert dh.live_repair_findings(found) == [], "a later heal resolves it"
+    assert w.repair().returncode == 0
+    assert dh.live_repair_findings(dh.collect_live_repairs(w.gen, now=later)) == []
+
+
+def _dir_becomes_file(w):
+    shutil.rmtree(w.root / "sub")
+    (w.root / "sub").write_text("now a file\n")
+
+
+def test_r2_a_repair_killed_after_restoring_a_tag_directory_is_not_unresolved(w, mod, monkeypatch):
+    """Audit S2: killed after its restore, on a path that is a directory in the
+    tag, the report keeps no result; the next run clears the healed state and
+    the reader, judging the tree, reports nothing unresolved."""
+    _retarget(w, _dir_becomes_file)
+    killed_tag_side(w, "prepared")
+    _killed_mid_repair(w, mod, monkeypatch, "after_apply")
+    assert w.snapshot() == tag_snapshot() and w.state.exists()
+    assert w.repair().returncode == 0 and not w.state.exists()
+    later = time.time() + 2 * 3600
+    assert _dh().collect_live_repairs(w.gen, now=later)["unresolved"] is False
 
 
 # ── T-D20: the remedy text ───────────────────────────────────────────────────

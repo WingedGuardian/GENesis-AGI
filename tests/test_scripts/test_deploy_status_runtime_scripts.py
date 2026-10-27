@@ -564,6 +564,7 @@ _FRESH = (
     "scripts/lib/live_checkout.py",
     "scripts/lib/managed_units.py",
     "scripts/lib/update_state_guard.py",
+    "scripts/lib/live_move_repair.py",
     "scripts/hooks/bash_allowlist_guard.sh",
     "scripts/hooks/bash_allowlist_lib.sh",
     "scripts/lib/deploy_marker.sh",

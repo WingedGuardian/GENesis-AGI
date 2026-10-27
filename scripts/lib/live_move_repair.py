@@ -110,6 +110,9 @@ def _node(repo: str, p: str, fmt: str) -> tuple[str, str] | None:
     if stat.S_ISLNK(st.st_mode):
         mode, data = "120000", os.fsencode(os.readlink(full))
     elif stat.S_ISREG(st.st_mode):
+        # The executable bit is the one permission git tracks (a 0600 file reads
+        # unchanged to `git status`, MEASURED git 2.43): a restore gives other bits
+        # the umask's, as any checkout does, and only to the tag's own bytes.
         mode = "100755" if st.st_mode & stat.S_IXUSR else "100644"
         with open(full, "rb") as fh:
             data = fh.read()
@@ -361,11 +364,6 @@ class Repair:
 
     def _run(self) -> int:
         if not os.path.lexists(self.state_path):
-            # A run killed between clearing the state and writing its result. A
-            # repair holds update.lock from start to finish, so only with that
-            # lock free is an unfinished report not one being written right now.
-            if self._unfinished() and self._hold(self._update_lock(), 0) is not None:
-                self._finish_interrupted()
             self._say("nothing to repair: there is no update state")
             return 0
         deadline = _now() + (BOOT_BUDGET_S if self.boot else self.wait)
@@ -402,11 +400,11 @@ class Repair:
         verdict, reason = self.guard.state_verdict(state, self.repo)
         to = self._live_target(state)
         if verdict == self.guard.SAFE and to:
-            self._clear(raw)  # a repair killed after it healed, before it cleared
-            self._finish_interrupted()
+            # A repair killed after it healed, before it cleared. Its report keeps
+            # no result; readers judge "unresolved" by the guard, not by it.
+            self._clear(raw)
             return 0
         if verdict != self.guard.MIXED_TREE:
-            self._finish_interrupted()  # e.g. killed after a heal that keeps the state
             self._say(f"nothing to repair: the checkout is not half-written ({verdict}: {reason})")
             return 0
         if not to:
@@ -423,49 +421,6 @@ class Repair:
             return 1
         return self._heal(state, raw, to, index_lock)
 
-    def _unfinished(self) -> list[tuple[str, dict]]:
-        """This checkout's reports with no result (file reads only, no git)."""
-        return [
-            (p, m)
-            for p, m in manifests(self.backups)
-            if m.get("result") is None and m.get("repo") == self.repo
-        ]
-
-    def _finish_interrupted(self) -> None:
-        """Write the result of a run killed after its restore and before its
-        result: every path it records is the tag's again, with HEAD still at
-        the tag. Called only while this run holds update.lock (no repair is
-        writing any report); one that does not match stays unfinished, so the
-        reader keeps calling it unresolved."""
-        found = self._unfinished()
-        if not found:
-            return
-        head = _out(self.repo, "rev-parse", "--verify", "-q", "HEAD^{commit}", check=False)
-        self.fmt = _out(self.repo, "rev-parse", "--show-object-format")
-        index, flags = _index_state(self.repo)
-        kept = os.path.lexists(self.state_path)
-        for path, m in found:
-            if m.get("tag") != head or not self._at_tag(m, index, flags):
-                continue
-            result = "healed, state kept" if kept else "healed"
-            result += " (finished by a later run: the run that restored the paths was interrupted)"
-            self._finish(os.path.dirname(path), m, result, 0)
-
-    def _at_tag(self, m: dict, index: dict, flags: dict) -> bool:
-        if not (isinstance(m.get("ts"), str) and isinstance(m.get("reapply"), list)):
-            return False
-        rows = m.get("paths")
-        try:
-            for row in rows:
-                p, w = row["path"], tuple(row["tag"]) if row["tag"] else None
-                if _node(self.repo, p, self.fmt) != _as_disk(w):
-                    return False
-                if index.get(p, []) != _as_index(w) or p in flags:
-                    return False
-        except (KeyError, TypeError, ValueError, OSError):
-            return False
-        return isinstance(rows, list)
-
     def _live_target(self, state: object) -> str | None:
         """The move's target of a live row (rule 6's record, or 6a's own_head)."""
         if not isinstance(state, dict) or state.get("phase") != "merging":
@@ -478,14 +433,59 @@ class Repair:
         self.tag = tag = self.guard._tag_commit(state, repo)
         if _out(repo, "rev-parse", "--verify", "HEAD^{commit}") != tag:
             raise RepairError("HEAD is not the rollback tag")
-        readable = _git(repo, "cat-file", "-e", f"{to}^{{tree}}", check=False).returncode == 0
         self.fmt = _out(repo, "rev-parse", "--show-object-format")
-        self.want, self.other = _tree(repo, tag), _tree(repo, to) if readable else {}
+        ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + f"-{os.getpid()}"
+        backup = os.path.join(self.backups, ts + SUFFIX)
+        torn = self._keep_index(backup, index_lock)
+        self.want, self.ephemeral = _tree(repo, tag), _ephemeral()
         index, flags = _index_state(repo)
-        if readable:
-            paths = set(_z(_git(repo, "diff", "-z", "--no-renames", "--name-only", tag, to).stdout))
-        else:  # every change against HEAD (the tag), flagged and untracked included
-            paths = set(_z(_git(repo, "diff", "-z", "--no-renames", "--name-only", "HEAD").stdout))
+        rows = None
+        if _git(repo, "cat-file", "-e", f"{to}^{{tree}}", check=False).returncode == 0:
+            # Classification reads the target's subtrees and blobs too; one a
+            # power loss took below a readable root makes it unreadable.
+            with contextlib.suppress(RepairError):
+                rows = self._rows(to, index, flags)
+        readable = rows is not None
+        rows = rows if readable else self._rows(None, index, flags)
+        manifest = {"ts": ts, "repo": repo, "state_row": state, "tag": tag, "other": to}
+        manifest.update(result=None, paths=rows, reapply=[], dismissed_at=None, index_rebuilt=torn)
+        self._save(backup, manifest, index_lock)
+        self._apply(rows, index)
+        _git(repo, "update-index", "-q", "--refresh", check=False)
+        return self._after(backup, manifest, state, raw, readable, index_lock)
+
+    def _keep_index(self, backup: str, index_lock: str) -> bool:
+        """Copy .git/index byte for byte, and a stale index.lock, into the backup
+        before anything changes. A torn index (its trailing checksum fails: git
+        reads one without checking it, then cannot write it back) is rebuilt
+        from HEAD, the tag; its staged entries cannot be read, so its bytes are
+        the record. Returns whether it was rebuilt."""
+        index = _out(self.repo, "rev-parse", "--path-format=absolute", "--git-path", "index")
+        os.makedirs(os.path.join(backup, "git"))
+        for src in (index, index_lock):
+            if os.path.lexists(src):
+                shutil.copy2(src, os.path.join(backup, "git", os.path.basename(src)))
+        if not os.path.lexists(index):
+            return False
+        with open(index, "rb") as fh:
+            data = fh.read()
+        n = hashlib.new(self.fmt).digest_size
+        if data[-n:] in (hashlib.new(self.fmt, data[:-n]).digest(), bytes(n)):  # 0s: skipHash
+            return False
+        self._sync(backup)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(index_lock)
+        _git(self.repo, "read-tree", "HEAD")
+        return True
+
+    def _rows(self, to: str | None, index: dict, flags: dict) -> list[dict]:
+        """The rows of the move's paths toward ``to``; with None (the target
+        cannot be read), of every change against HEAD (the tag)."""
+        repo = self.repo
+        self.other = _tree(repo, to) if to else {}
+        revs = (self.tag, to) if to else ("HEAD",)
+        paths = set(_z(_git(repo, "diff", "-z", "--no-renames", "--name-only", *revs).stdout))
+        if not to:  # flagged and untracked paths included
             paths |= set(_z(_git(repo, "ls-files", "-z", "--others", "--exclude-standard").stdout))
             paths |= set(flags)
         # A symlink or non-directory parent of ANY path: its own row (in a tag
@@ -496,16 +496,7 @@ class Repair:
                 full = os.path.join(repo, d)
                 if os.path.islink(full) or (os.path.lexists(full) and not os.path.isdir(full)):
                     paths.add(d)
-        self.ephemeral = _ephemeral()
-        rows = [r for r in (self._row(p, index, flags) for p in sorted(paths)) if r]
-        ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + f"-{os.getpid()}"
-        backup = os.path.join(self.backups, ts + SUFFIX)
-        manifest = {"ts": ts, "repo": repo, "state_row": state, "tag": tag, "other": to}
-        manifest.update(result=None, paths=rows, reapply=[], dismissed_at=None)
-        self._save(backup, manifest, index_lock)
-        self._apply(rows, index)
-        _git(repo, "update-index", "-q", "--refresh", check=False)
-        return self._after(backup, manifest, state, raw, readable, index_lock)
+        return [r for r in (self._row(p, index, flags) for p in sorted(paths)) if r]
 
     def _row(self, p: str, index: dict, flags: dict) -> dict | None:
         """The path's row when anything about it is not the tag's, else None."""
@@ -562,16 +553,17 @@ class Repair:
         return len(have) < len(blob) and blob.startswith(have)
 
     def _save(self, backup: str, manifest: dict, index_lock: str) -> None:
-        """Copy every node about to change, and the stale index.lock, and make
-        them and REPAIR.json durable before anything changes: the node (a FIFO,
+        """Copy every node about to change, and make them, the index copies
+        _keep_index made and REPAIR.json durable before anything changes: the node (a FIFO,
         socket or device is recorded by type and mode, as it holds no bytes), a
         foreign row's index blobs (the restore drops their only reference, and
         a gc would then delete them), and the new directory's entries up to
         the Genesis home."""
-        os.makedirs(backup)
         for older, m in manifests(self.backups):
             if m.get("result") is None and os.path.dirname(older) != backup:
                 write_json(older, {**m, "result": "superseded"})  # a run killed partway
+        # A directory row is copied whole; a row inside it is saved by that copy.
+        whole = {r["path"] for r in manifest["paths"] if r["disk"] == "dir" and r["disk_changed"]}
         for row in manifest["paths"]:
             if row["class"] == "foreign" and [tuple(e) for e in row["index"]] != _as_index(
                 row["tag"]
@@ -580,6 +572,8 @@ class Repair:
             if not row["disk_changed"] or row["disk"] in ("absent", "other"):
                 continue
             row["saved_as"] = os.path.join("tree", row["path"])
+            if whole.intersection(_parents(row["path"])):
+                continue
             src, dst = os.path.join(self.repo, row["path"]), os.path.join(backup, row["saved_as"])
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             if row["disk"] == "dir":
@@ -587,23 +581,24 @@ class Repair:
                 shutil.copytree(src, dst, symlinks=True, copy_function=copy)
             else:
                 shutil.copy2(src, dst, follow_symlinks=False)
-        if os.path.lexists(index_lock):
-            os.makedirs(os.path.join(backup, "git"))
-            shutil.copy2(index_lock, os.path.join(backup, "git", "index.lock"))
         foreign = [r for r in manifest["paths"] if r["class"] == "foreign"]
         manifest["reapply"] = [reapply_step(self.repo, backup, r) for r in foreign]
+        self._sync(backup)
+        write_json(os.path.join(backup, "REPAIR.json"), manifest)
+        if os.path.lexists(index_lock):
+            os.unlink(index_lock)
+
+    def _sync(self, backup: str) -> None:
+        """Make the backup durable: its files and directories, then its own
+        entry and deploy-backups' (it may be new)."""
         for top, _subdirs, files in os.walk(backup, topdown=False):
             for f in files:
                 if stat.S_ISREG(os.lstat(os.path.join(top, f)).st_mode):  # a FIFO would block
                     with open(os.path.join(top, f), "rb") as fh:
                         os.fsync(fh.fileno())
             _fsync_dir(top)
-        write_json(os.path.join(backup, "REPAIR.json"), manifest)
-        # The new directory's entry, and deploy-backups' own (it may be new).
         _fsync_dir(self.backups)
         _fsync_dir(self.home)
-        if os.path.lexists(index_lock):
-            os.unlink(index_lock)
 
     def _save_blobs(self, backup: str, row: dict) -> None:
         """The blob of each of the row's index entries (a gitlink names a
@@ -714,6 +709,8 @@ class Repair:
         _fsync_dir(self.home)
 
     def _finish(self, backup: str, manifest: dict, result: str, rc: int) -> int:
+        if manifest["index_rebuilt"]:
+            result += "; the index was torn: rebuilt from the tag, its bytes saved as git/index"
         manifest["result"] = result
         write_json(os.path.join(backup, "REPAIR.json"), manifest)
         body = f"{result}. The checkout went back to {manifest['tag'][:12]}; what changed is saved in {backup}."
@@ -721,7 +718,8 @@ class Repair:
             body += " These paths were not the update's; to re-apply them:\n"
             body += "\n".join(manifest["reapply"])
         self._say(body)
-        severity = "critical" if manifest["reapply"] or rc else "warning"
+        loud = manifest["reapply"] or manifest["index_rebuilt"] or rc
+        severity = "critical" if loud else "warning"
         key = f"live_move_repair:{manifest['ts']}"
         subprocess.run(
             ["bash", "-c", '. "$1/alert_queue.sh" && queue_alert "$2" live_move_repair "$3" "$4" "$5"',

@@ -4285,8 +4285,14 @@ tool-disabled CC probe without changing its schedule or routing authority.
   parent of one (nothing is read or removed through such a parent), that is not at the tag's bytes is COPIED to
   `~/.genesis/deploy-backups/<ts>-live-move-repair/` (with `REPAIR.json`,
   fsynced, and the new directory's entries in `deploy-backups` and the
-  Genesis home fsynced too) before anything changes, then restored with `git restore
-  --source=<tag>`. A path holding what the update did not write (another
+  Genesis home fsynced too; a directory row is copied whole, and a row inside
+  it points into that copy; `.git/index` is copied byte for byte as `git/index`)
+  before anything changes, then restored with `git restore
+  --source=<tag>`. A torn index (its trailing checksum fails: git reads it
+  unchecked, then cannot write it back) is rebuilt from the tag after that
+  copy, and the result says so. Permission bits other than the executable
+  bit are not saved: git does not track them, and a restore gives them the
+  umask's, as any checkout does. A path holding what the update did not write (another
   edit, a flag, a staged or unmerged entry, a gitlink, a directory symlink
   inside a target directory, a FIFO, socket or device) is still saved and
   restored, and reported with its exact re-apply step: a foreign index
@@ -4302,18 +4308,21 @@ tool-disabled CC probe without changing its schedule or routing authority.
   rewritten "moving" (same byte-identical check), so the guard then reads it
   `holds`, not `mixed_tree` again; anything
   else is `unresolved` (exit 1). A target whose objects are
-  gone is healed by the whole tree against HEAD and cleared by a clean-tree
+  gone (its root tree, or any subtree or blob classification reads) is healed
+  by the whole tree against HEAD and cleared by a clean-tree
   check. A main row is out of scope (exit 3; 0 at `--boot`). The engine
   writes its merges with `core.fsync=committed`. The deploy-health collector
   `collect_live_repairs` reads every `REPAIR.json` into `live_repair_saved:<n>`
-  (until re-applied, judged by the node's kind: a file's bytes, a symlink's
-  target, a directory's saved tree, a FIFO's mode, plus the index entries
+  (until re-applied, judged by the node's kind: a file or symlink by the
+  repair's own `_node`, git mode with the executable bit and blob id; a
+  directory's saved tree, a FIFO's mode, plus the index entries
   and flags; or `--dismiss`ed; a malformed report is skipped row by
   row) and `live_repair_unresolved`, worded by the awareness check (never paging), and
-  each repair also queues an alert. A run killed after its restore and
-  before it wrote its result is finished by the next run that finds every
-  recorded path at the tag (with or without the state, and only while it
-  holds update.lock, so a running repair's report is never touched).
+  each repair also queues an alert. `live_repair_unresolved` needs the newest
+  report to say so (or to have no result after an hour) AND the shared guard,
+  run at read time, to call the update state `mixed_tree`: a run killed after
+  its restore and before its result leaves no result, and only the tree says
+  whether it healed (the next run removes a healed state without a new backup).
   `--post-merge` on `live` never runs the engine. What is recorded and sent to
   the host guardian is the origin/main commit `live` is built on.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;
