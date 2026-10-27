@@ -350,7 +350,12 @@ async def test_record_census_writes_one_row(db, monkeypatch):
 
     await census.record_census(db)
     # The live database is the one THIS process's connection holds open.
-    assert seen == {"host_pid": os.getpid(), "include_host": True, "live_held_by": os.getpid()}
+    assert seen == {
+        "host_pid": os.getpid(),
+        "include_host": True,
+        "live_held_by": os.getpid(),
+        "prior": {},  # no earlier census row to carry from
+    }
 
     cur = await db.execute(
         "SELECT dimension, metrics_json FROM eval_events WHERE event_type = ?",
@@ -1085,3 +1090,364 @@ def test_a_detour_in_the_windows_boundary_second_is_counted(repo):
     a, b = "a" * 40, "b" * 40
     detour = _reflog_line(a, b, 100) + _reflog_line(b, a, 100)
     assert b in gc._window_held(reader, detour, 100.4, a, 0)
+# ── carry-forward: a secrets.env edit no longer leaves every server unknown ──
+# A server's switch and database come partly from secrets.env, proven only when
+# the file is unchanged since the server started. Any later edit, even to an
+# unrelated key, made every running server unknown and reset the cutover clock.
+# Now a row records a digest of the census-relevant keys it proved; the next
+# census carries a server whose file changed only in OTHER keys.
+
+from genesis.memory import graph_census_proof as proof  # noqa: E402
+
+_PAST = 1_700_000_100.0  # a start before any file this test writes: "changed since"
+
+
+def _census_with_prior(proc_root, repo, tmp_path, argv, env, *, started, prior):
+    import time as _time
+
+    r, _, _ = repo
+    live = tmp_path / "live.db"
+    live.touch()
+    _proc(
+        proc_root,
+        80,
+        argv,
+        started=started or _time.time() + 60,
+        env=env,
+        exe=str(tmp_path / "sys" / "bin" / "python3.12"),
+    )
+    [p] = census.build_census(r, proc_root=proc_root, live_db=live, prior=prior)["procs"]
+    return p
+
+
+def test_a_proven_row_records_its_digest(
+    proc_root, repo, tmp_path, main_venv
+):
+    secrets = tmp_path / "own.env"
+    secrets.write_text("GENESIS_GRAPH_TELEMETRY_DISABLED=0\n")
+    env = {"SECRETS_PATH": str(secrets)}
+    p = _census_one(proc_root, repo, tmp_path, main_venv, env)
+    assert p["secrets_digest"] == proof.secrets_digest({"GENESIS_GRAPH_TELEMETRY_DISABLED": "0"})
+    assert p["carried"] is False
+
+
+def test_an_edit_to_another_key_is_carried(proc_root, repo, tmp_path, main_venv):
+    secrets = tmp_path / "own.env"
+    secrets.write_text("GENESIS_GRAPH_TELEMETRY_DISABLED=0\nOTHER=1\n")
+    env = {"SECRETS_PATH": str(secrets)}
+    digest = proof.secrets_digest({"GENESIS_GRAPH_TELEMETRY_DISABLED": "0"})
+    secrets.write_text("GENESIS_GRAPH_TELEMETRY_DISABLED=0\nOTHER=2\n")
+    started_at = census._iso(_PAST)
+    p = _census_with_prior(
+        proc_root, repo, tmp_path, main_venv, env, started=_PAST, prior={(80, started_at): digest}
+    )
+    assert (p["carried"], p["telemetry_off"], p["secrets_digest"]) == (True, False, digest)
+
+
+def test_an_edit_to_a_census_key_is_not_carried(proc_root, repo, tmp_path, main_venv):
+    secrets = tmp_path / "own.env"
+    env = {"SECRETS_PATH": str(secrets)}
+    digest = proof.secrets_digest({"GENESIS_GRAPH_TELEMETRY_DISABLED": "0"})
+    secrets.write_text("GENESIS_GRAPH_TELEMETRY_DISABLED=1\n")
+    p = _census_with_prior(
+        proc_root,
+        repo,
+        tmp_path,
+        main_venv,
+        env,
+        started=_PAST,
+        prior={(80, census._iso(_PAST)): digest},
+    )
+    assert (p["carried"], p["telemetry_off"], p["secrets_digest"]) == (False, None, None)
+
+
+@pytest.mark.parametrize(
+    "prior",
+    [
+        None,  # no previous row
+        {},  # a previous row without this server
+        {(81, "x"): "d"},  # another pid and start
+    ],
+)
+def test_no_matching_prior_row_means_no_carry(proc_root, repo, tmp_path, main_venv, prior):
+    secrets = tmp_path / "own.env"
+    secrets.write_text("OTHER=2\n")
+    p = _census_with_prior(
+        proc_root,
+        repo,
+        tmp_path,
+        main_venv,
+        {"SECRETS_PATH": str(secrets)},
+        started=_PAST,
+        prior=prior,
+    )
+    assert (p["carried"], p["telemetry_off"]) == (False, None)
+
+
+def test_another_pid_with_the_same_start_is_not_carried(proc_root, repo, tmp_path, main_venv):
+    secrets = tmp_path / "own.env"
+    secrets.write_text("OTHER=2\n")
+    p = _census_with_prior(
+        proc_root, repo, tmp_path, main_venv, {"SECRETS_PATH": str(secrets)},
+        started=_PAST, prior={(81, census._iso(_PAST)): proof.secrets_digest({})},
+    )
+    assert p["carried"] is False
+
+
+def test_a_reused_pid_with_a_new_start_is_not_carried(proc_root, repo, tmp_path, main_venv):
+    secrets = tmp_path / "own.env"
+    secrets.write_text("OTHER=2\n")
+    digest = proof.secrets_digest({})
+    p = _census_with_prior(
+        proc_root,
+        repo,
+        tmp_path,
+        main_venv,
+        {"SECRETS_PATH": str(secrets)},
+        started=_PAST,
+        prior={(80, census._iso(_PAST - 50)): digest},
+    )
+    assert p["carried"] is False
+
+
+def test_a_missing_file_is_never_carried(proc_root, repo, tmp_path, main_venv):
+    env = {"SECRETS_PATH": str(tmp_path / "gone.env")}
+    p = _census_with_prior(
+        proc_root,
+        repo,
+        tmp_path,
+        main_venv,
+        env,
+        started=_PAST,
+        prior={(80, census._iso(_PAST)): proof.secrets_digest({})},
+    )
+    assert (p["carried"], p["telemetry_off"]) == (False, None)
+
+
+def test_a_symlink_swapped_after_start_is_never_carried(proc_root, repo, tmp_path, main_venv):
+    """A retargeted link is a different file, not an edit of the proven one."""
+    real = tmp_path / "real.env"
+    real.write_text("OTHER=2\n")
+    link = tmp_path / "link.env"
+    link.symlink_to(real)
+    p = _census_with_prior(
+        proc_root,
+        repo,
+        tmp_path,
+        main_venv,
+        {"SECRETS_PATH": str(link)},
+        started=_PAST,
+        prior={(80, census._iso(_PAST)): proof.secrets_digest({})},
+    )
+    assert p["carried"] is False
+
+
+@pytest.mark.parametrize("key", ["SECRETS_PATH", "GENESIS_REPO_ROOT"])
+def test_a_file_that_moves_the_secrets_path_is_never_carried(
+    proc_root, repo, tmp_path, main_venv, key
+):
+    """A lazy router rebuild would then read a file nobody proved."""
+    secrets = tmp_path / "own.env"
+    secrets.write_text(f"{key}={tmp_path}/elsewhere\n")
+    vals = {key: f"{tmp_path}/elsewhere"}
+    p = _census_with_prior(
+        proc_root,
+        repo,
+        tmp_path,
+        main_venv,
+        {"SECRETS_PATH": str(secrets)},
+        started=_PAST,
+        prior={(80, census._iso(_PAST)): proof.secrets_digest(vals)},
+    )
+    assert p["carried"] is False
+
+
+#: Written out rather than read from the module, so a key dropped there fails
+#: here instead of silently dropping its own test case.
+_CENSUS_KEYS = (
+    "GENESIS_GRAPH_TELEMETRY_DISABLED",
+    "GENESIS_DB_PATH",
+    "GENESIS_REPO_ROOT",
+    "HOME",
+    "GENESIS_HOME",
+    "SECRETS_PATH",
+)
+
+
+def test_the_digest_keys_are_every_key_the_census_reads_from_the_file():
+    assert set(proof.CENSUS_SECRET_KEYS) == set(_CENSUS_KEYS)
+
+
+@pytest.mark.parametrize("key", _CENSUS_KEYS)
+def test_the_digest_covers_each_census_key(key):
+    base = {k: "/a" for k in _CENSUS_KEYS}
+    assert proof.secrets_digest(base) != proof.secrets_digest({**base, key: "/b"})
+    assert proof.secrets_digest(base) != proof.secrets_digest(
+        {k: v for k, v in base.items() if k != key}
+    )
+    assert proof.secrets_digest(base) == proof.secrets_digest({**base, "OTHER": "x"})
+
+
+def test_a_carried_row_holds_no_value(proc_root, repo, tmp_path, main_venv):
+    import json as _json
+
+    secrets = tmp_path / "own.env"
+    secrets.write_text(f"GENESIS_DB_PATH={tmp_path}/sekrit-db.db\nAPI_KEY_X=sekrit\n")
+    vals = {"GENESIS_DB_PATH": f"{tmp_path}/sekrit-db.db"}
+    p = _census_with_prior(
+        proc_root,
+        repo,
+        tmp_path,
+        main_venv,
+        {"SECRETS_PATH": str(secrets)},
+        started=_PAST,
+        prior={(80, census._iso(_PAST)): proof.secrets_digest(vals)},
+    )
+    assert p["carried"] is True
+    assert "sekrit" not in _json.dumps(p)
+
+
+def test_prior_digests_reads_only_a_current_schema_row():
+    row = {
+        "v": census.CENSUS_SCHEMA,
+        "procs": [
+            {"pid": 1, "started_at": "s1", "secrets_digest": "d1"},
+            {"pid": 2, "started_at": "s2", "secrets_digest": None},
+            {"pid": 3, "started_at": "s3"},  # a row from before digests
+            {"pid": "x", "started_at": "s4", "secrets_digest": "d4"},  # malformed
+        ],
+    }
+    assert census.prior_digests(row) == {(1, "s1"): "d1"}
+    assert census.prior_digests({**row, "v": census.CENSUS_SCHEMA - 1}) == {}
+    assert census.prior_digests(None) == {}
+    assert census.prior_digests({"v": census.CENSUS_SCHEMA, "procs": "nope"}) == {}
+
+
+async def test_record_census_carries_from_the_latest_row_only(db, monkeypatch):
+    """The latest row decides. One that cannot be used means no carry, never a
+    reach past it to an older row that could."""
+    monkeypatch.delenv("GENESIS_GRAPH_TELEMETRY_DISABLED", raising=False)
+    seen: dict = {}
+    monkeypatch.setattr(census, "build_census", lambda **kw: seen.update(kw) or {"procs": []})
+
+    def row(ts: str, metrics) -> tuple:
+        body = metrics if isinstance(metrics, str) else json.dumps(metrics)
+        return (ts, "system", census.CENSUS_EVENT_TYPE, body)
+
+    usable = {"v": census.CENSUS_SCHEMA, "procs": [
+        {"pid": 5, "started_at": "s5", "secrets_digest": "d5"}]}
+    insert = (
+        "INSERT INTO eval_events (timestamp, dimension, event_type, metrics_json) "
+        "VALUES (?, ?, ?, ?)"
+    )
+    await db.execute(insert, row("2026-01-01T00:00:00.000000Z", usable))
+    await db.commit()
+    await census.record_census(db)
+    assert seen["prior"] == {(5, "s5"): "d5"}
+
+    # A newer row of another schema now sits on top: it decides, and carries nothing.
+    await db.execute(insert, row("2099-01-01T00:00:00.000000Z", {**usable, "v": 2}))
+    await db.commit()
+    await census.record_census(db)
+    assert seen["prior"] == {}
+def test_a_file_whose_home_moves_the_secrets_path_is_never_carried(
+    proc_root, repo, tmp_path, main_venv
+):
+    """The server resolves `~` in its secrets path with the HOME a reload set.
+    The digest matches here, so only re-deriving the path can refuse it."""
+    home = tmp_path / "home"
+    home.mkdir()
+    secrets = home / "own.env"
+    other = tmp_path / "other"
+    secrets.write_text(f"HOME={other}\n")
+    env = {"SECRETS_PATH": "~/own.env", "HOME": str(home)}
+    p = _census_with_prior(
+        proc_root,
+        repo,
+        tmp_path,
+        main_venv,
+        env,
+        started=_PAST,
+        prior={(80, census._iso(_PAST)): proof.secrets_digest({"HOME": str(other)})},
+    )
+    assert (p["carried"], p["telemetry_off"]) == (False, None)
+
+
+def test_the_real_chain_carries_across_censuses(proc_root, repo, tmp_path, main_venv):
+    """What one census writes, through the JSON a row is stored as, is what the
+    next census carries from: no hand-built digest or key anywhere."""
+    import time as _time
+
+    r, _, _ = repo
+    secrets = tmp_path / "own.env"
+    secrets.write_text("GENESIS_GRAPH_TELEMETRY_DISABLED=0\nOTHER=1\n")
+    start = secrets.stat().st_ctime + 0.5  # started after the file was written
+    live = tmp_path / "live.db"
+    live.touch()
+    _proc(
+        proc_root,
+        80,
+        main_venv,
+        started=start,
+        env={"SECRETS_PATH": str(secrets)},
+        exe=str(tmp_path / "sys" / "bin" / "python3.12"),
+    )
+
+    def run(prior):
+        m = census.build_census(r, proc_root=proc_root, live_db=live, prior=prior)
+        return m, m["procs"][0]
+
+    m1, p1 = run(None)
+    assert (p1["carried"], p1["telemetry_off"]) == (False, False)
+    assert p1["secrets_digest"]
+    _time.sleep(max(0.0, start - _time.time()) + 0.6)
+    secrets.write_text("GENESIS_GRAPH_TELEMETRY_DISABLED=0\nOTHER=2\n")  # after the start
+    m2, p2 = run(census.prior_digests(json.loads(json.dumps(m1))))
+    assert (p2["carried"], p2["telemetry_off"], p2["secrets_digest"]) == (
+        True,
+        False,
+        p1["secrets_digest"],
+    )
+    _m3, p3 = run(census.prior_digests(json.loads(json.dumps(m2))))
+    assert (p3["carried"], p3["telemetry_off"]) == (True, False)
+    secrets.write_text("GENESIS_GRAPH_TELEMETRY_DISABLED=1\nOTHER=2\n")  # a census key
+    _m4, p4 = run(census.prior_digests(json.loads(json.dumps(m2))))
+    assert (p4["carried"], p4["telemetry_off"]) == (False, None)
+
+
+async def test_a_corrupt_latest_row_never_stops_the_census(db, monkeypatch):
+    """`get_events` decodes the latest row; one that will not decode must cost
+    the carry, never the census row itself (it would stay latest forever)."""
+    monkeypatch.delenv("GENESIS_GRAPH_TELEMETRY_DISABLED", raising=False)
+    seen: dict = {}
+    monkeypatch.setattr(census, "build_census", lambda **kw: seen.update(kw) or {"procs": []})
+    await db.execute(
+        "INSERT INTO eval_events (timestamp, dimension, event_type, metrics_json) "
+        "VALUES (?, ?, ?, ?)",
+        ("2099-01-01T00:00:00.000000Z", "system", census.CENSUS_EVENT_TYPE, "{"),
+    )
+    await db.commit()
+    await census.record_census(db)
+    assert seen["prior"] == {}
+    cur = await db.execute(
+        "SELECT COUNT(*) FROM eval_events WHERE event_type = ?", (census.CENSUS_EVENT_TYPE,)
+    )
+    assert (await cur.fetchone())[0] == 2
+def test_a_file_naming_secrets_path_is_never_carried_even_when_it_names_itself(
+    proc_root, repo, tmp_path, main_venv
+):
+    """The re-derived path is unchanged here, so only the key rule refuses it: a
+    file that names where secrets live is not carried, whatever it names."""
+    secrets = tmp_path / "own.env"
+    secrets.write_text(f"SECRETS_PATH={secrets}\n")
+    vals = {"SECRETS_PATH": str(secrets)}
+    p = _census_with_prior(
+        proc_root,
+        repo,
+        tmp_path,
+        main_venv,
+        {"SECRETS_PATH": str(secrets)},
+        started=_PAST,
+        prior={(80, census._iso(_PAST)): proof.secrets_digest(vals)},
+    )
+    assert p["carried"] is False
