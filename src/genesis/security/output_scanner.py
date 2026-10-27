@@ -150,25 +150,86 @@ _REDACTABLE = frozenset(
         "env_variable_secret",
     }
 )
-# The detector stops a credential_assignment value at its first character
-# outside [A-Za-z0-9/+=_-]; redaction must take the whole token, or a password
-# like "abcdefgh!rest" would keep "!rest". Same prefix, then everything up to a
-# delimiter.
+# An assignment the detectors flag is redacted to the END OF ITS LINE. Trimming
+# to the exact value span meant parsing quotes, escapes and delimiters, and each
+# parse left some tail ("abcdefgh!rest", a quoted "abc def", mixed quotes)
+# that no detector recognises any more, so it shipped. Losing the rest of the
+# line is the cheap side of that trade. Every pattern below ends in [^\n]*,
+# which cannot fail, so none of them backtracks.
 _REDACT_OVERRIDES: dict[str, re.Pattern[str]] = {
     "credential_assignment": re.compile(
-        r"(?i)(password|token|secret|api[_\s]?key)\s*[:=]\s*['\"]?"
-        r"[a-zA-Z0-9/+=_\-]{8,}[^\s'\"`,;)}\]]*",
+        r"(?i)(password|token|secret|api[_\s]?key)\s*[:=]\s*['\"]?[a-zA-Z0-9/+=_\-]{8,}[^\n]*",
     ),
+    "env_variable_secret": re.compile(r"\b[A-Z_]{3,}_(KEY|SECRET|TOKEN|PASSWORD)\s*=[^\n]*"),
 }
-_CREDENTIAL_KEY_WORDS = re.compile(r"(?i)password|token|secret|api[_\s]?key")
+# A JSON member is a credential when a WORD of its key names one (key split on
+# punctuation and camelCase), unless the key's last word says the value is a
+# number or flag ABOUT the credential (token_count, password_required).
+# Free-form tails (name, id, url) do not exempt a key: their values could be
+# the secret. "tokens" is deliberately absent: "max_tokens" is common.
+_CREDENTIAL_WORDS = frozenset(
+    {
+        "password",
+        "passwords",
+        "passwd",
+        "pwd",
+        "secret",
+        "secrets",
+        "token",
+        "apikey",
+        "apikeys",
+        "credential",
+        "credentials",
+        "passphrase",
+        "authorization",
+        "accesskey",
+        "privatekey",
+    }
+)
+_ABOUT_WORDS = frozenset(
+    {
+        "count",
+        "type",
+        "types",
+        "required",
+        "policy",
+        "limit",
+        "limits",
+        "length",
+        "size",
+        "usage",
+        "expiry",
+        "expires",
+        "expiration",
+        "ttl",
+    }
+)
+_KEY_WORD = re.compile(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|\d+")
 # A JSON member `"key": "value"`, matched without nested quantifiers so the scan
-# stays linear on long quote-free text; the key is tested in the callback.
-_JSON_MEMBER = re.compile(r'("[^"\n]{1,200}"\s*:\s*)"(?:[^"\\\n]|\\.)*"')
+# stays linear on long quote-free text; the key is judged in the callback.
+_JSON_MEMBER = re.compile(r'"([^"\n]{1,200})"(\s*:\s*)"(?:[^"\\\n]|\\.)*"')
+
+
+# One redactor per redactable pattern, built once. An assignment uses its
+# end-of-line override; a key shape takes the whole contiguous token, so a key
+# followed by ".rest" or "!rest" cannot leave "rest" behind for no detector to see.
+_REDACTORS: dict[str, re.Pattern[str]] = {
+    name: _REDACT_OVERRIDES.get(name) or re.compile(pattern.pattern.removesuffix(r"\b") + r"\S*")
+    for name, pattern in _OUTPUT_PATTERNS
+    if name in _REDACTABLE
+}
+
+
+def _is_credential_key(key: str) -> bool:
+    words = [w.lower() for w in _KEY_WORD.findall(key)]
+    joined = {a + b for a, b in zip(words, words[1:], strict=False)}  # "api"+"key", "private"+"key"
+    named = _CREDENTIAL_WORDS & (set(words) | joined)
+    return bool(named) and (not words or words[-1] not in _ABOUT_WORDS)
 
 
 def _redact_json_member(match: re.Match[str]) -> str:
-    if _CREDENTIAL_KEY_WORDS.search(match.group(1)):
-        return match.group(1) + '"[redacted:json_credential]"'
+    if _is_credential_key(match.group(1)):
+        return f'"{match.group(1)}"{match.group(2)}"[redacted:json_credential]"'
     return match.group(0)
 
 
@@ -183,7 +244,7 @@ def redact_credentials(content: str) -> tuple[str, list[str]]:
     for name, pattern in _OUTPUT_PATTERNS:
         if name not in _REDACTABLE:
             continue
-        pattern = _REDACT_OVERRIDES.get(name, pattern)
+        pattern = _REDACTORS[name]
         content, count = pattern.subn(f"[redacted:{name}]", content)
         if count:
             found.append(name)

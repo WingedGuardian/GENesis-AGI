@@ -94,3 +94,11 @@ def test_reply_allow_names_real_scanner_patterns():
 
     assert pattern_names() >= REPLY_ALLOW
     assert "payment_card" not in REPLY_ALLOW
+
+
+def test_a_credential_the_redactor_cannot_cut_still_withholds_the_reply():
+    from genesis.peers.results import disclosable_reply
+
+    text, redacted = disclosable_reply('{"password": ["' + "synthetic" + "credential" + '"]}')
+    assert text is None
+    assert redacted == []

@@ -286,3 +286,124 @@ def test_json_member_with_an_ordinary_key_is_kept():
     text = '{"name": "value", "api_key": "abc", "count": "3"}'
     out, _ = redact_credentials(text)
     assert out == '{"name": "value", "api_key": "[redacted:json_credential]", "count": "3"}'
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'password: "abcdefgh,TAILSECRET"',
+        "password: 'abcdefgh TAILSECRET'",
+        'API_TOKEN="abc def TAILSECRET"',
+        "DB_SECRET_KEY='xx yy TAILSECRET'",
+    ],
+)
+def test_quoted_credential_values_are_redacted_to_the_closing_quote(text):
+    from genesis.security.output_scanner import redact_credentials
+
+    out, found = redact_credentials(text)
+    assert "TAILSECRET" not in out
+    assert found
+
+
+def test_json_keys_that_only_contain_a_credential_word_keep_their_values():
+    from genesis.security.output_scanner import redact_credentials
+
+    text = (
+        '{"token_count": "1200", "token_type": "Bearer", '
+        '"tokenizer": "cl100k", "password_required": "false"}'
+    )
+    assert redact_credentials(text) == (text, [])
+
+
+@pytest.mark.parametrize("key", ["access_token", "db_password", "apiKey", "client_secret", "token"])
+def test_json_keys_named_as_credentials_are_redacted(key):
+    from genesis.security.output_scanner import redact_credentials
+
+    out, found = redact_credentials('{"' + key + '": "TAILSECRETvalue"}')
+    assert "TAILSECRET" not in out
+    assert found == ["json_credential"]
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "secret_key",
+        "api_secret_key",
+        "secrets",
+        "passwords",
+        "api_keys",
+        "password_hash",
+        "token_value",
+        "token ",
+        "accessToken",
+        "API-KEY",
+        "x.password",
+        "privateKey",
+        "credentials",
+    ],
+)
+def test_keys_that_name_a_credential_in_any_form_are_redacted(key):
+    from genesis.security.output_scanner import redact_credentials
+
+    out, found = redact_credentials('{"' + key + '": "TAILSECRETvalue"}')
+    assert "TAILSECRET" not in out
+    assert found == ["json_credential"]
+
+
+@pytest.mark.parametrize(
+    "key", ["max_tokens", "password_policy", "token_count", "tokenizer", "token_type"]
+)
+def test_keys_about_a_credential_keep_their_values(key):
+    from genesis.security.output_scanner import redact_credentials
+
+    text = '{"' + key + '": "keep-me"}'
+    assert redact_credentials(text) == (text, [])
+
+
+def test_mixed_quotes_cannot_leave_a_tail():
+    from genesis.security.output_scanner import redact_credentials
+
+    out, _ = redact_credentials('password = "abcdefgh\'TAILSECRET" and more')
+    assert "TAILSECRET" not in out
+
+
+def test_an_assignment_is_cut_to_the_end_of_its_line_only():
+    from genesis.security.output_scanner import redact_credentials
+
+    out, _ = redact_credentials("a\npassword: abcdefgh!TAILSECRET\nnext line stays")
+    assert out == "a\n[redacted:credential_assignment]\nnext line stays"
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "passwd",
+        "pwd",
+        "password2",
+        "passphrase",
+        "access_key",
+        "Authorization",
+        "token_type_value",
+        "password_name",
+        "token_id",
+        "token_url",
+    ],
+)
+def test_more_credential_key_shapes_are_redacted(key):
+    from genesis.security.output_scanner import redact_credentials
+
+    out, found = redact_credentials('{"' + key + '": "TAILSECRETvalue"}')
+    assert "TAILSECRET" not in out
+    assert found == ["json_credential"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["sk-" + "a" * 30 + ".TAILSECRETvalue", "gsk_" + "b" * 30 + "-TAILSECRET"],
+)
+def test_a_key_shape_takes_its_whole_token(text):
+    from genesis.security.output_scanner import redact_credentials
+
+    out, _ = redact_credentials(f"use {text} now")
+    assert "TAILSECRET" not in out
+    assert out.endswith(" now")
