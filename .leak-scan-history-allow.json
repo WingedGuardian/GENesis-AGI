@@ -1,0 +1,60 @@
+{
+  "entries": [
+    {
+      "commit": "42293ad2c56c812eeabe766151a2fd257c9054f4",
+      "path": "src/genesis/payments/vault_store.py",
+      "type": "Base64 High Entropy String",
+      "sha1": "9a96960baa4d8c0559cf89f72b5f3486736762e9",
+      "reason": "the public BIP-173 bech32 character set (_BECH32), not sensitive; main's copy carries the inline pragma"
+    },
+    {
+      "commit": "d5cd51b23a2bcf4216c1927c2013a46fcce9056b",
+      "path": "src/genesis/transcript_analytics/history.py",
+      "type": "Hex High Entropy String",
+      "sha1": "9daca38d7176aa5d908c9b3a28da779cdd129c46",
+      "reason": "public flat-v1 extraction compatibility fingerprint for the audited historical reader, not sensitive; current source adds the inline pragma"
+    },
+    {
+      "commit": "d5cd51b23a2bcf4216c1927c2013a46fcce9056b",
+      "path": "src/genesis/transcript_analytics/history.py",
+      "type": "Hex High Entropy String",
+      "sha1": "58c8b2906827849da194ff98d00822f3472fa688",
+      "reason": "public record-v5 extraction compatibility fingerprint for the preserved producer, not sensitive; current source adds the inline pragma"
+    },
+    {
+      "commit": "d5cd51b23a2bcf4216c1927c2013a46fcce9056b",
+      "path": "src/genesis/transcript_analytics/history.py",
+      "type": "Hex High Entropy String",
+      "sha1": "260fadbed7362c10436aec8a789841fc6dac18e4",
+      "reason": "public record-v5 extraction compatibility fingerprint for the previous producer, not sensitive; current source adds the inline pragma"
+    },
+    {
+      "commit": "ee5b322f10f94809adfbcc059ff40a02993a4c7b",
+      "path": ".github/workflows/headlong-controls.yml",
+      "type": "Hex High Entropy String",
+      "sha1": "66cc57646d4d1a06ce8c3687cb9020d5aca0c37c",
+      "reason": "the public commit pin of the upstream Headlong repository, not sensitive; current source adds the inline pragma"
+    },
+    {
+      "commit": "ee5b322f10f94809adfbcc059ff40a02993a4c7b",
+      "path": "scripts/ci/headlong_controls.py",
+      "type": "Hex High Entropy String",
+      "sha1": "66cc57646d4d1a06ce8c3687cb9020d5aca0c37c",
+      "reason": "the public commit pin of the upstream Headlong repository, not sensitive; current source adds the inline pragma"
+    },
+    {
+      "commit": "0337f42c2b0c1f60a13225189ecf74d83324ddf8",
+      "path": "scripts/ci/headlong_reference_controls.py",
+      "type": "Hex High Entropy String",
+      "sha1": "47784580758b20256793a484ce89c74d6724936c",
+      "reason": "a synthetic patterned value in a redaction test corpus, not sensitive; current source adds the inline pragma"
+    },
+    {
+      "commit": "4c486a9fa4ab7516275edbe6111db4803497fed8",
+      "path": "scripts/ci/headlong_bridge_patch.json",
+      "type": "Base64 High Entropy String",
+      "sha1": "6a8d40a692b07fb6cc5de90574519cfcb250d947",
+      "reason": "shell assignment text in a test fixture patch, read as base64 between escaped quotes, not sensitive; current source splits the matched run with a space"
+    }
+  ]
+}

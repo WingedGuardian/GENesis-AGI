@@ -35,6 +35,10 @@ async def create_all_tables(db: aiosqlite.Connection) -> None:
     # Schema migrations BEFORE indexes — migrations add columns that indexes may reference
     await _migrate_add_columns(db)
 
+    from genesis.db.peer_status import install_base
+
+    await install_base(db)
+
     # INVARIANT: every column an entry below references must already exist here —
     # i.e. it is in a canonical CREATE TABLE above OR added by
     # _migrate_add_columns. A legacy DB only has the numbered-migration runner
@@ -1690,6 +1694,16 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
     await _try_alter(db,
         "ALTER TABLE procedural_memory ADD COLUMN surfaced_count INTEGER NOT NULL DEFAULT 0",
         "procedural_memory.surfaced_count")
+
+    # Lessons as data: a lesson row's trigger_spec and authorship record (both
+    # JSON, NULL on an earned procedure). Here as well as in the base table
+    # because bootstrap seeds procedures before numbered migrations run.
+    await _try_alter(db,
+        "ALTER TABLE procedural_memory ADD COLUMN trigger_spec TEXT",
+        "procedural_memory.trigger_spec")
+    await _try_alter(db,
+        "ALTER TABLE procedural_memory ADD COLUMN lesson TEXT",
+        "procedural_memory.lesson")
 
     # Rebuild cognitive_state table if CHECK constraint lacks resilience_degradation.
     # SQLite can't ALTER CHECK constraints — requires table rebuild.

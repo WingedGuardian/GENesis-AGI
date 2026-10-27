@@ -67,6 +67,13 @@ _OPERATOR_ONE_OFF = (
     "automatic entry point; a human is present, and some of these must be "
     "able to inspect a suspect database"
 )
+# CI controls that run inside a disposable container and open only their own
+# synthetic fixture database under a scratch root.
+_CI_FIXTURE = (
+    "CI-only control: opens its own synthetic fixture.sqlite3 under a scratch "
+    "root inside a disposable container, never genesis.db — outside the "
+    "admission domain"
+)
 _ALLOWLIST: dict[str, str] = {
     "dev/mw2_classifier_probe.py": _OPERATOR_ONE_OFF,
     "ambient_replay.py": _OPERATOR_ONE_OFF,
@@ -80,6 +87,7 @@ _ALLOWLIST: dict[str, str] = {
     "backfill_session_charters.py": _OPERATOR_ONE_OFF,
     "backfill_session_memories.py": _OPERATOR_ONE_OFF,
     "backfill_source_subsystem.py": _OPERATOR_ONE_OFF,
+    "ci/headlong_native_controls.py": _CI_FIXTURE,
     "cleanup_fenced_knowledge_units.py": _OPERATOR_ONE_OFF,
     "cleanup_pipeline_noise.py": _OPERATOR_ONE_OFF,
     "cleanup_subsystem_qdrant.py": _OPERATOR_ONE_OFF,
@@ -87,6 +95,7 @@ _ALLOWLIST: dict[str, str] = {
     "entity_backfill.py": _OPERATOR_ONE_OFF,
     "entity_cleanup_fake_commits.py": _OPERATOR_ONE_OFF,
     "gen_memory_quality_chart.py": _OPERATOR_ONE_OFF,
+    "graph_cutover_report.py": _OPERATOR_ONE_OFF,  # read-only (mode=ro) verdict report
     "ledger_shadow_report.py": _OPERATOR_ONE_OFF,
     "lib/index_marker.py": (
         "opens its OWN code-intel queue database under marker_dir(), never "
@@ -168,6 +177,45 @@ def _provider_config_reader(rel, node, chain) -> bool:
     )
 
 
+def _queue_import_reader(rel, node, chain) -> bool:
+    """Only the independent queue's exact read-only diagnostic connection."""
+    expected = ast.parse(
+        'sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=0.5)', mode="eval"
+    ).body
+    return (
+        rel == "lib/index_marker_legacy.py"
+        and bool(chain)
+        and chain[0].name == "import_status"
+        and ast.dump(node) == ast.dump(expected)
+    )
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        'sqlite3.connect("genesis.db")',
+        "sqlite3.connect(database.as_uri(), uri=True, timeout=0.5)",
+        'sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=5)',
+    ],
+)
+def test_queue_reader_exception_cannot_exempt_another_opener(tmp_path, monkeypatch, extra):
+    tree = ast.parse((_SCRIPTS / "lib/index_marker_legacy.py").read_text())
+    status = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "import_status"
+    )
+    calls = list(_connect_calls(tree))
+    assert len(calls) == 1 and _queue_import_reader("lib/index_marker_legacy.py", *calls[0])
+    status.body.append(ast.parse(extra).body[0])
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "lib/index_marker_legacy.py").write_text(ast.unparse(tree))
+    monkeypatch.setitem(globals(), "_SCRIPTS", tmp_path)
+    monkeypatch.setitem(globals(), "_ALLOWLIST", {})
+    with pytest.raises(AssertionError, match="raw sqlite3.connect without"):
+        test_every_scripts_opener_consults_the_admission_fence()
+
+
 @pytest.mark.parametrize(
     "extra",
     [
@@ -246,7 +294,7 @@ def test_every_scripts_opener_consults_the_admission_fence():
                             "use the unaliased module name"
                         )
         for node, chain in _connect_calls(tree):
-            if _provider_config_reader(rel, node, chain):
+            if _provider_config_reader(rel, node, chain) or _queue_import_reader(rel, node, chain):
                 continue
             if rel in _ALLOWLIST:
                 seen_allowlisted.add(rel)

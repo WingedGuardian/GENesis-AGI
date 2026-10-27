@@ -112,6 +112,7 @@ HOOK_SURFACE_FILES = frozenset(
         "scripts/review_budget.py",
         "scripts/review_findings.py",
         "scripts/review_reflection.py",
+        "scripts/review_late.py",
         "scripts/review_deadline.py",
         "scripts/external_review.py",
         "scripts/lib/gate_menu.py",
@@ -169,9 +170,7 @@ def _parse_external_identity_scalar(raw: str) -> object:
     if raw.startswith('"'):
         value, end = json.JSONDecoder().raw_decode(raw)
         suffix = raw[end:]
-        if suffix.strip() and (
-            not suffix[:1].isspace() or not suffix.lstrip().startswith("#")
-        ):
+        if suffix.strip() and (not suffix[:1].isspace() or not suffix.lstrip().startswith("#")):
             raise ValueError("unexpected content after quoted scalar")
         return value
     if raw.startswith("'"):
@@ -237,9 +236,11 @@ def confirmation_marker(head: str) -> str:
     return CONFIRMATION_MARKER_TEMPLATE.format(head=normalized)
 
 
-
 class _BudgetExhausted(Exception):
-    """The aggregate lookup budget ran out before this call could be issued."""
+    """The aggregate lookup budget ran out before this call could be issued.
+
+    ``args[0]``, when present, carries the ``gh_failure:<class>`` codes recorded
+    so far, so a persistent class still reaches the result."""
 
 
 class _Truncated(Exception):
@@ -264,10 +265,21 @@ def _unknown(*errors: str, current_head: str = "") -> dict[str, Any]:
         "strongly_discouraged": True,
         "open_keys": [],
         "reflection_keys": "unknown",
+        "body": None,
+        "body_changed": False,
         "reviewers_reported": [],
         "expected_reviewers": [],
+        "commits": [],
+        "marks": [],
+        "findings": [],
+        "late_state": "unknown",
         "errors": [e for e in errors if e],
     }
+
+
+def _iso(when: datetime | None, raw: object) -> object:
+    """``when`` as ISO-8601, or ``raw`` unchanged when it carried no time."""
+    return when.isoformat() if when is not None else raw
 
 
 def _full_sha(value: object) -> str | None:
@@ -409,6 +421,19 @@ def evaluate_evidence(
     the configured identity template CONFIRM a head (``current_head_reviewed``)
     and never add a round.
 
+    A round advances only on the newest reviewed head (owner ruling
+    2026-10-12). Every review MARKS the head it reviewed, clean or not; a finding
+    review that lands on a head after one of that head's descendants was marked
+    is a LATE review of an earlier round. It opens no round, and is listed in
+    ``findings`` with the round it belongs to (``round_head``), for the round
+    reflection to owe (``review_late``, from its cutover on). Each ``findings``
+    entry carries the decision itself as ``late``, and each ``rounds`` entry
+    carries ``opened_at``, so a reader never re-derives either. Membership in
+    ``rounds[].reviews`` does NOT mean "not late": a late review on a head that
+    already is a round is listed there too. Ancestry comes from each commit's ``parents`` when the caller
+    passes ``commit_heads`` entries as ``{"sha", "parents"}``; a bare SHA knows
+    no ancestry, so it never makes a review late.
+
     Evidence before ``cutover`` (default ``ROUND_RULE_CUTOVER_ISO``) keeps the
     old rule: every head the PRIMARY reviewed, clean included. Items carrying no
     timestamp are treated as before it. The count is the union of the two, so at
@@ -423,15 +448,56 @@ def evaluate_evidence(
         return _unknown("malformed_current_head", current_head=str(current_head or ""))
 
     commits: list[str] = []
+    # Each commit's parents, where the caller supplied them (the GraphQL read
+    # does; a bare SHA, as test seams pass, carries none). Ancestry is read only
+    # from this graph, never from list order: GitHub lists a PR's commits by
+    # date, not by parent (MEASURED on #3203: 6 of 22 neighbours are not parent
+    # and child).
+    parents_of: dict[str, tuple[str, ...]] = {}
     for raw in commit_heads:
+        parents: tuple[str, ...] | None = None
+        if isinstance(raw, Mapping):
+            raw_parents = raw.get("parents")
+            raw = raw.get("sha")
+            if raw_parents is not None:
+                if not isinstance(raw_parents, list):
+                    return _unknown("malformed_pr_commit", current_head=head)
+                parsed = [_full_sha(p) for p in raw_parents]
+                if any(p is None for p in parsed):
+                    return _unknown("malformed_pr_commit", current_head=head)
+                parents = tuple(p for p in parsed if p is not None)
         full = _full_sha(raw)
         if full is None:
             return _unknown("malformed_pr_commit", current_head=head)
         if full not in commits:
             commits.append(full)
+        if parents is not None:
+            parents_of[full] = parents
     if head not in commits:
         return _unknown("current_head_missing_from_commits", current_head=head)
     order = {sha: index for index, sha in enumerate(commits)}
+
+    ancestors_memo: dict[str, frozenset[str]] = {}
+
+    def ancestors(sha: str) -> frozenset[str]:
+        """Every PR commit reachable through ``sha``'s parents, itself excluded.
+
+        A commit with no parent record (a force-pushed head, or a bare seam SHA)
+        has none known, so it can be no head's ancestor and suppresses nothing:
+        a missing edge only ever makes the count larger, never smaller.
+        """
+        if sha in ancestors_memo:
+            return ancestors_memo[sha]
+        seen: set[str] = set()
+        stack = list(parents_of.get(sha, ()))
+        while stack:
+            node = stack.pop()
+            if node in seen or node not in order:
+                continue  # the base branch's commits are not the PR's
+            seen.add(node)
+            stack.extend(parents_of.get(node, ()))
+        ancestors_memo[sha] = frozenset(seen)
+        return ancestors_memo[sha]
 
     identities: list[re.Pattern[str]] = []
     for template in external_identity_templates:
@@ -449,13 +515,23 @@ def evaluate_evidence(
         return _unknown("malformed_round_cutover", current_head=head)
 
     legacy: set[str] = set()  # the old rule's heads, before cutover
+    # When each legacy head was first counted by the old rule: the earliest TIMED
+    # pre-cutover evidence. A head with ANY untimed evidence (a pending review)
+    # has no knowable opening: the untimed piece may be the earliest, so the
+    # minimum over the timed ones alone would be a made-up boundary.
+    legacy_times: dict[str, tuple[datetime, object]] = {}
+    legacy_untimed: set[str] = set()
     confirmed: set[str] = set()  # heads the primary (or the identity) reviewed
     found: dict[str, dict[str, Any]] = {}  # round head -> what landed there
 
-    def confirm(sha: str, before: bool) -> None:
+    def confirm(sha: str, before: bool, when: datetime | None = None, raw: object = None) -> None:
         confirmed.add(sha)
         if before:
             legacy.add(sha)
+            if when is None:
+                legacy_untimed.add(sha)
+            elif sha not in legacy_times or when < legacy_times[sha][0]:
+                legacy_times[sha] = (when, raw)
 
     def add_round(
         sha: str, login: str, findings: int, source: Mapping[str, Any] | None = None
@@ -474,6 +550,20 @@ def evaluate_evidence(
 
     def report(sha: str, login: str) -> None:
         reported.setdefault(sha, set()).add(login)
+
+    # MARKS: every head some reviewer looked at, and when, clean reviews
+    # included (owner ruling 2026-10-12: any review marks a head). They decide
+    # whether a finding review opens a round: once a head has been reviewed, a
+    # review that then lands on one of its ANCESTORS is a late review of an
+    # earlier round, never a new round.
+    marks: list[tuple[str, datetime | None, object]] = []
+
+    def mark(sha: str, when: datetime | None, raw: object) -> None:
+        marks.append((sha, when, raw))
+
+    # Every post-cutover finding review, in arrival order of the input. Which of
+    # them open a round is decided below, once every mark is known.
+    events: list[dict[str, Any]] = []
 
     surface_only = review_findings.surface_only_logins()
     for item in reviews:
@@ -508,13 +598,29 @@ def evaluate_evidence(
             return _unknown("malformed_review_head", current_head=head)
         before = when is None or when < cut
         if primary:
-            confirm(sha, before)
+            confirm(sha, before, when, item.get("submitted_at"))
         elif when is None:
             # Only a test seam omits the time; a non-primary review cannot be
             # placed on either side of the cutover, and dropping it undercounts.
             return _unknown("review_time_missing", current_head=head)
         if item.get("state") != "PENDING":
             report(sha, login)
+            raw_tops, raw_body = item.get("top_level"), item.get("body")
+            # A review record with no body and no top-level comment is the
+            # wrapper GitHub makes for a reply inside a thread: nobody reviewed
+            # the head it names, so it marks nothing.
+            # A row with no comment list at all reads the same way: marking less
+            # can only make the count larger. Only a COMMENTED review (or one
+            # whose state is missing or unknown) can be a wrapper: an approval,
+            # a change request or a dismissed review with no text is still a
+            # review of the head.
+            reply_only = (
+                item.get("state") not in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED")
+                and (raw_tops is None or (isinstance(raw_tops, list) and not raw_tops))
+                and (raw_body is None or (isinstance(raw_body, str) and not raw_body.strip()))
+            )
+            if not reply_only:
+                mark(sha, when, item.get("submitted_at"))
         if before:
             continue
         top_level = item.get("top_level")
@@ -531,11 +637,14 @@ def evaluate_evidence(
         in_body = review_findings.body_finding_count(login, body)
         findings = len(flagged) + in_body
         if findings:
-            add_round(
-                sha,
-                login,
-                findings,
-                _round_source(item, login, flagged, in_body),
+            events.append(
+                {
+                    "sha": sha,
+                    "when": when,
+                    "login": login,
+                    "findings": findings,
+                    "source": _round_source(item, login, flagged, in_body),
+                }
             )
         elif not top_level and review_findings.declares_findings(login, body):
             # Its body says it posted findings and no top-level comment
@@ -555,6 +664,15 @@ def evaluate_evidence(
         ok, when = _parse_time(item.get("created_at"))
         if not ok:
             return _unknown("malformed_comment_time", current_head=head)
+        # A comment can be edited. Its MARK takes the edit time and everything
+        # else its creation time: a later mark makes fewer reviews late, an
+        # earlier event time makes fewer late too, so each side raises the count.
+        marked_raw = item.get("updated_at") or item.get("created_at")
+        ok, marked = _parse_time(marked_raw)
+        if not ok:
+            return _unknown("malformed_comment_time", current_head=head)
+        if marked is None or (when is not None and marked < when):
+            marked = when  # never earlier than the comment itself
         before = when is None or when < cut
         # The confirmation marker and the identity template are matched on TEXT,
         # not on who wrote it, so a deleted author's comment still counts for both.
@@ -567,10 +685,14 @@ def evaluate_evidence(
                     continue  # confirms only, as for a clean comment below
                 if error:
                     return _unknown(error, current_head=head)
-                confirm(resolved or "", before)
+                confirm(resolved or "", before, when, item.get("created_at"))
                 # Matched on TEXT, so whoever posted it is not the reviewer: the
                 # configured identity is, named by its position in the config.
                 report(resolved or "", f"identity:{index}")
+                # No MARK: the template is matched on text from any author, so
+                # anyone could post it. A mark can make a review late and lower
+                # the count, which a confirmation never could; leaving it out can
+                # only make the count larger.
         if login is None or author_type is None:
             continue  # deleted author: never the primary
         if not isinstance(login, str) or not isinstance(author_type, str):
@@ -588,29 +710,87 @@ def evaluate_evidence(
                 continue
             if error:
                 return _unknown(error, current_head=head)
-            confirm(resolved or "", before)
+            confirm(resolved or "", before, when, item.get("created_at"))
             report(resolved or "", login)
+            mark(resolved or "", marked, marked_raw)
             continue
         is_findings, sha = review_findings.codex_comment_finding_head(body)
         if is_findings and sha is not None:
             report(sha, login)  # a report on either side of the cutover, like a review
+            mark(sha, marked, marked_raw)
         if is_findings and not before:
             if sha is None:
                 return _unknown("codex_findings_comment_unbound", current_head=head)
             confirm(sha, False)
             comment_id = item.get("id")
-            add_round(
-                sha,
-                login,
-                1,
+            events.append(
                 {
-                    "id": None,
+                    "sha": sha,
+                    "when": when,
                     "login": login,
-                    "submitted_at": item.get("created_at"),
-                    # A findings comment has no review object; its own id keys it.
-                    "finding_keys": [f"i{comment_id}" if _is_id(comment_id) else None],
-                },
+                    "findings": 1,
+                    "source": {
+                        "id": None,
+                        "login": login,
+                        "submitted_at": item.get("created_at"),
+                        # A findings comment has no review object; its own id keys it.
+                        "finding_keys": [f"i{comment_id}" if _is_id(comment_id) else None],
+                    },
+                }
             )
+
+    # Which finding reviews open a round (owner ruling 2026-10-12). A review on
+    # head X opens one iff X has no round yet and no head that is a strict
+    # DESCENDANT of X had been reviewed (marked, clean or not) strictly before
+    # it arrived. Otherwise it is a late review of an earlier round: it joins X's
+    # round when X has one, and opens nothing. Decided in arrival order, so the
+    # first finding review on a head decides it (marks only accumulate, so a
+    # later one could only be suppressed too). A head outside the commit graph
+    # (force-pushed away) has no known descendants, so it opens a round as it
+    # always did. A head the old rule already counted (``legacy``) is a round,
+    # so a late review of it joins it.
+    #
+    # Each review's own verdict is kept as ``late``, from the SAME predicate, so
+    # a reader never re-derives it: a later review on a head that already opened
+    # a round is late too, and still joins that round. Marks only accumulate, so
+    # once one review on a head is late every later one is.
+    #
+    # The predicate runs for EVERY event, so it must not scan the marks each
+    # time (events x marks is quadratic at the supported 5,000-row reads, on a
+    # hook path a SIGKILL fails open). Precompute, for each head, the earliest
+    # time any strict descendant was marked: collapse the marks to the earliest
+    # per marked head, then walk each one's ancestors once. "Some descendant mark
+    # is strictly before ``when``" is then "the earliest one is".
+    first_mark: dict[str, datetime] = {}
+    for m_sha, m_when, _ in marks:
+        if m_when is not None and (m_sha not in first_mark or m_when < first_mark[m_sha]):
+            first_mark[m_sha] = m_when
+    descendant_marked: dict[str, datetime] = {}
+    for m_sha, m_when in first_mark.items():
+        for older in ancestors(m_sha):
+            if older not in descendant_marked or m_when < descendant_marked[older]:
+                descendant_marked[older] = m_when
+
+    def marked_after(sha: str, when: datetime | None) -> bool:
+        """Was a strict descendant of ``sha`` marked strictly before ``when``?"""
+        earliest = descendant_marked.get(sha)
+        return when is not None and earliest is not None and earliest < when
+
+    opened: dict[str, bool] = {sha: True for sha in legacy}
+    first_event: dict[str, dict[str, Any]] = {}  # each head's earliest finding review
+    timed = sorted(
+        range(len(events)),
+        key=lambda i: (events[i]["when"] is None, events[i]["when"] or cut, i),
+    )
+    for i in timed:
+        event = events[i]
+        event["late"] = marked_after(event["sha"], event["when"])
+        first_event.setdefault(event["sha"], event)
+        if event["sha"] not in opened:
+            opened[event["sha"]] = not event["late"]
+    for event in events:  # input order, so each round lists its reviews as before
+        if opened[event["sha"]]:
+            add_round(event["sha"], event["login"], event["findings"], event["source"])
 
     paths: list[str] = []
     for item in changed_files:
@@ -632,7 +812,24 @@ def evaluate_evidence(
     count = len(heads)
     current_reviewed = head in confirmed
     confirmation_requested = head in confirmation_heads
-    # A head force-pushed out of the PR sorts before every live commit.
+
+    def opened_at(sha: str) -> object:
+        """When round ``sha`` opened: for a head the old rule counted, its
+        earliest pre-cutover evidence, or None when any of that evidence has no
+        time (a pending review, which may be the earliest); otherwise its opening
+        finding review. A legacy head never takes a later post-cutover review's
+        time, which would misplace it in the order of rounds."""
+        if sha in legacy:
+            stamp = None if sha in legacy_untimed else legacy_times.get(sha)
+            return _iso(*stamp) if stamp else None
+        event = first_event[sha]
+        return _iso(event["when"], event["source"]["submitted_at"])
+
+    # A head force-pushed out of the PR sorts before every live commit. This
+    # order is for stable output only: it is the commit list's DATE order, so a
+    # reader finds a round by its head, never by its position. Exception,
+    # pending #3302-B: ``trend`` below, and the push guard's findings-per-round
+    # arrow, still read this order.
     rounds = [
         {
             "head": sha,
@@ -640,6 +837,7 @@ def evaluate_evidence(
             "findings": found[sha]["findings"] if sha in found else None,
             "reviewers": found[sha]["reviewers"] if sha in found else [],
             "reviews": found[sha]["reviews"] if sha in found else [],
+            "opened_at": opened_at(sha),
         }
         for sha in sorted(round_heads, key=lambda s: (order.get(s, -1), s))
     ]
@@ -694,23 +892,28 @@ def evaluate_evidence(
             if scored[-1] < scored[-2]
             else "flat"
         )
+    # The open round is the CURRENT HEAD's own round, found by identity. The
+    # order of ``rounds`` follows the PR's commit list, which GitHub sorts by
+    # date, not ancestry: after a rebase or cherry-pick a commit can be listed
+    # after the head. Nothing may take a meaning from that order (#3302), except
+    # ``trend`` and the guard's findings arrow until #3302-B.
+    by_head = {r["head"]: r for r in rounds}
     if not rounds:
         round_state = "none"
-    elif rounds[-1]["head"] == head:
+    elif head in round_heads:
         round_state = "open"
     else:
         round_state = "complete"
 
-    # What a round reflection must answer for. NOTHING READS THESE YET: the
-    # reflection tool and the commit-gate check that consume them are later PRs
-    # of the same series, so until then they are reported, never enforced. The
-    # newest round only, and only while it is open. NOT attached: a review
-    # submitted on an earlier head after the fix was pushed stays on that head,
-    # so it is never owed here.
+    # What a round reflection must answer for, read by review_reflection.status
+    # and by the commit gate, which denies a content commit while any is owed.
+    # The current head's round only, and only while it is open. A LATE review (one that opened no round, above) never lands here: it
+    # is listed in ``findings`` with the round it belongs to, and ``review_late``
+    # owes those keys from its cutover on.
     seen: dict[str, None] = {}  # ordered and linear, however many keys arrive
     keys_known = True
     if round_state == "open":
-        for source in rounds[-1]["reviews"]:
+        for source in by_head[head]["reviews"]:
             for key in source["finding_keys"]:
                 if key is None:
                     keys_known = False
@@ -721,7 +924,7 @@ def evaluate_evidence(
         # not read findings, so a head the primary reviewed CLEAN before the
         # cutover reads the same way: unknown. Fail-closed, and only a PR whose
         # current head predates the cutover can reach it.
-        keys_known = keys_known and rounds[-1]["head"] not in legacy
+        keys_known = keys_known and head not in legacy
     open_keys = list(seen)
     # Who the settle window waits for: every reviewer that reported on ANY other
     # head of this PR, clean reviews included (a reviewer that reviewed an
@@ -730,6 +933,50 @@ def evaluate_evidence(
     # window: a reviewer that has not posted yet is indistinguishable from one
     # that never will.
     expected = sorted({login for sha, who in reported.items() if sha != head for login in who})
+
+    # Every post-cutover finding review and the round it belongs to: its own
+    # head's round, else (a late review of a head that never opened one) the
+    # newest round head it descends from, else None. None means either no
+    # earlier round, or no single newest one (the two sides of a merge both
+    # opened rounds); a reader must never take it as owed by nobody.
+    # ``late`` is the review's own verdict from the round rule above. When
+    # ``current_head`` is the PR's tip, as ``evaluate_pr`` always passes it, a
+    # review on it is never late (the tip has no descendant in the PR), so late
+    # keys never enter ``open_keys``; a caller passing an older head gets no such
+    # guarantee. ``late_state`` says whether
+    # every finding OUTSIDE the open round could be keyed; it is kept apart from
+    # ``reflection_keys`` so an unkeyable finding there cannot make a known open
+    # round unknown. Times here are normalised ISO-8601 (``+00:00``), so a
+    # reader never compares GitHub's ``Z`` form with Python's as strings.
+    def round_of(sha: str) -> str | None:
+        if sha in round_heads:
+            return sha
+        older = {r for r in ancestors(sha) if r in round_heads}
+        # The newest by ANCESTRY: the one round head every other candidate is an
+        # ancestor of. Two incomparable candidates (the two sides of a merge) have
+        # no newest, and list order (by date) cannot pick one: None, never a guess.
+        newest = [r for r in older if older - {r} <= ancestors(r)]
+        return newest[0] if len(newest) == 1 else None
+
+    open_head = head if round_state == "open" else None
+    findings_out: list[dict[str, Any]] = []
+    late_known = True
+    for event in events:
+        keys = list(event["source"]["finding_keys"])
+        # The open round's own keys are already judged by ``reflection_keys``.
+        in_open_round = event["sha"] == open_head and opened[event["sha"]]
+        if not in_open_round and any(k is None for k in keys):
+            late_known = False
+        findings_out.append(
+            {
+                "head": event["sha"],
+                "submitted_at": _iso(event["when"], event["source"]["submitted_at"]),
+                "login": event["login"],
+                "keys": keys,
+                "round_head": round_of(event["sha"]),
+                "late": event["late"],
+            }
+        )
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -754,6 +1001,15 @@ def evaluate_evidence(
         "reflection_keys": "ok" if keys_known else "unknown",
         "reviewers_reported": sorted(reported.get(head, set())),
         "expected_reviewers": expected,
+        # ``parents`` is None where the caller gave no ancestry, so a reader can
+        # tell "unknown" from a root commit (``[]``).
+        "commits": [
+            {"sha": sha, "parents": list(parents_of[sha]) if sha in parents_of else None}
+            for sha in commits
+        ],
+        "marks": [{"head": sha, "at": _iso(when, raw)} for sha, when, raw in marks],
+        "findings": findings_out,
+        "late_state": "ok" if late_known else "unknown",
         "errors": [],
     }
 
@@ -764,8 +1020,10 @@ def _default_runner(argv: Sequence[str], *, timeout: float) -> tuple[int, str, s
             list(argv), capture_output=True, text=True, timeout=timeout, check=False
         )
         return result.returncode, result.stdout, result.stderr
-    except Exception:
-        return 1, "", "runner_failed"
+    except Exception as exc:  # noqa: BLE001 - classified by _gh_failure_class, never raised
+        # The exception TYPE, never its text: a subprocess timeout must read as
+        # `timeout` there, the same as an exception the harness wrapper catches.
+        return 1, "", f"runner_failed:{type(exc).__name__}"
 
 
 def _json_lines(raw: str, source: str) -> tuple[list[dict[str, Any]] | None, str | None]:
@@ -802,6 +1060,98 @@ _GRAPHQL_MAX_PAGES = 50
 #: 8s cap was.
 _GRAPHQL_READ_SECONDS = 20.0
 
+#: Error codes that mean only "GitHub could not be read just now": a failed or
+#: timed-out read, or a lookup that ran out of its time budget. The ONLY codes
+#: an install-local ask switch (`hooks.asks.review_request`) may treat as
+#: transient. Everything else that reads as unknown -- deleted findings,
+#: truncated responses, a malformed record, a configuration error, a head
+#: that moved -- is persistent or a tamper signal and must keep asking.
+#: `gh_failure:<class>` entries ride along with these codes (see
+#: `_gh_failure_class`). Only the classes in TRANSIENT_GH_FAILURES count: an
+#: auth failure, a not-found, a 4xx or an unclassified failure (`other`,
+#: `runner_raised`) is not "GitHub could not answer just now" and keeps asking.
+TRANSIENT_ERRORS = frozenset(
+    {
+        "graphql_unreadable",
+        "graphql_read_timeout",
+        "final_head_unreadable",
+        "files_unreadable",
+        "lookup_budget_exhausted",
+    }
+)
+
+TRANSIENT_GH_FAILURES = frozenset({"timeout", "hook_deadline", "network", "rate_limited"})
+
+
+def _transient_gh_failure(code: str) -> bool:
+    cls = code[len("gh_failure:") :]
+    if cls in TRANSIENT_GH_FAILURES:
+        return True
+    return cls.startswith("http_5") and len(cls) == 8 and cls[5:].isdigit()
+
+
+def errors_are_transient(errors: Any) -> bool:
+    """True when ``errors`` is a non-empty list of transient read failures only."""
+    if not isinstance(errors, list) or not errors:
+        return False
+    return all(
+        isinstance(e, str)
+        and (e in TRANSIENT_ERRORS or (e.startswith("gh_failure:") and _transient_gh_failure(e)))
+        for e in errors
+    )
+
+
+def failure_errors(failures: Sequence[str]) -> list[str]:
+    """``gh_failure:<class>`` for EVERY distinct failed-call class, first-seen order.
+
+    The vocabulary is small and fixed, so this stays bounded. Cutting the list to
+    the first few dropped a late persistent class (auth, not_found) behind
+    recovered transient ones, and errors_are_transient() then read the whole
+    result as transient.
+
+    Classes of calls that RECOVERED on retry are kept on purpose: a recovered
+    `auth` or `other` makes an otherwise transient result ask. That is the safe
+    direction for an approval prompt; do not drop them to save a prompt.
+    """
+    return [f"gh_failure:{cls}" for cls in dict.fromkeys(failures)]
+
+
+def _gh_failure_class(stderr: str) -> str:
+    """A short, fixed-vocabulary class for a failed gh call (never raw stderr).
+
+    The raw text can carry account details, so only the class is kept. The
+    point is that one occurrence says WHY a read failed, not only that it did.
+    """
+    text = stderr or ""
+    if text.startswith("runner_failed:"):
+        kind = text.split(":", 1)[1]
+        if kind == "TimeoutExpired":
+            return "timeout"
+        # The caller's timeout_for refused to issue the call: production's
+        # review_deadline.bounded_timeout raises DeadlineExpired (a RuntimeError
+        # subclass), and the wrapper records the CONCRETE type name.
+        if kind in ("DeadlineExpired", "RuntimeError"):
+            return "hook_deadline"
+        return "runner_raised"
+    low = text.lower()
+    if "rate limit" in low or "secondary rate" in low:
+        return "rate_limited"
+    code = re.search(r"\bHTTP (\d{3})\b", text)
+    if code:
+        return f"http_{code.group(1)}"
+    # Persistent classes before `timeout`: an auth message that also mentions a
+    # timeout must keep asking, never read as transient.
+    if "auth" in low or "credential" in low or "token" in low:
+        return "auth"
+    if "timed out" in low or "timeout" in low or "deadline exceeded" in low:
+        return "timeout"
+    if "could not resolve" in low:
+        return "not_found"
+    if "connection" in low or "network" in low or "dial tcp" in low or "eof" in low:
+        return "network"
+    return "other"
+
+
 #: One connection per REST endpoint the lookup used to call, projected to the
 #: fields ``evaluate_evidence`` reads and nothing more.
 _GRAPHQL_CONNECTIONS = {
@@ -813,7 +1163,7 @@ _GRAPHQL_CONNECTIONS = {
     ),
     "comments": (
         "comments(first: 100, after: $after_comments) { pageInfo { hasNextPage endCursor } "
-        "nodes { fullDatabaseId body createdAt author { login __typename } } }"
+        "nodes { fullDatabaseId body createdAt updatedAt author { login __typename } } }"
     ),
     "files": (
         "files(first: 100, after: $after_files) { pageInfo { hasNextPage endCursor } "
@@ -821,7 +1171,7 @@ _GRAPHQL_CONNECTIONS = {
     ),
     "commits": (
         "commits(first: 100, after: $after_commits) { pageInfo { hasNextPage endCursor } "
-        "nodes { commit { oid } } }"
+        "nodes { commit { oid parents(first: 100) { totalCount nodes { oid } } } } }"
     ),
 }
 
@@ -838,7 +1188,7 @@ def _graphql_query(names: Sequence[str]) -> str:
     return (
         f"query($owner: String!, $name: String!, $number: Int!{params}) "
         "{ repository(owner: $owner, name: $name) { pullRequest(number: $number) "
-        f"{{ headRefOid {fields} }} }} }}"
+        f"{{ headRefOid body {fields} }} }} }}"
     )
 
 
@@ -939,6 +1289,7 @@ def _graphql_rows(name: str, nodes: object) -> tuple[list[dict[str, Any]], bool]
                     "type": kind,
                     "body": node.get("body"),
                     "created_at": node.get("createdAt"),
+                    "updated_at": node.get("updatedAt"),
                 }
             )
         elif name == "files":
@@ -952,7 +1303,22 @@ def _graphql_rows(name: str, nodes: object) -> tuple[list[dict[str, Any]], bool]
             commit = node.get("commit")
             if not isinstance(commit, dict):
                 raise ValueError(name)
-            rows.append({"sha": commit.get("oid")})
+            # Every parent is read. A missing edge would not only leave a late
+            # review counted (the safe side) but could make round_of's "one newest
+            # round ancestor" falsely unique, so a parent list that did not come
+            # back complete makes the whole read unknown.
+            parents = commit.get("parents")
+            if not isinstance(parents, dict) or not isinstance(parents.get("nodes"), list):
+                raise ValueError(name)
+            total = parents.get("totalCount")
+            if not isinstance(total, int) or total != len(parents["nodes"]):
+                raise ValueError(name)
+            oids = []
+            for parent in parents["nodes"]:
+                if not isinstance(parent, dict) or not isinstance(parent.get("oid"), str):
+                    raise ValueError(name)
+                oids.append(parent["oid"])
+            rows.append({"sha": commit.get("oid"), "parents": oids})
     return rows, path_changed
 
 
@@ -985,6 +1351,9 @@ def _review_digest(rows: Sequence[Mapping[str, object]], rf: Any) -> list[tuple[
                 tuple(named and isinstance(b, str) and rf.is_finding(login, b) for b in tops),
                 rf.body_finding_count(login, body) if named else 0,
                 rf.declares_findings(login, body) if named else False,
+                # Whether the review MARKS its head: an empty review with no
+                # comment is a reply wrapper, which marks nothing.
+                bool(body.strip()),
             )
         )
     return digest
@@ -1052,14 +1421,19 @@ def _evaluate_pr_inner(
         remaining = deadline.remaining()
         if remaining is not None:
             if deadline.exhausted(minimum_useful=floor):
-                raise _BudgetExhausted
+                raise _BudgetExhausted(failure_errors(failures))
             seconds = min(seconds, remaining)
         try:
             return runner(argv, timeout=timeout_for(seconds))
-        except Exception:
-            return 1, "", "runner_failed"
+        except Exception as exc:  # noqa: BLE001 - classified, never raised
+            return 1, "", f"runner_failed:{type(exc).__name__}"
 
     repo_owner, _, repo_name = repo.partition("/")
+    #: Classes of the failed gh calls, in order, reported beside the error code.
+    failures: list[str] = []
+
+    def unknown(*errors: str, current_head: str = "") -> dict[str, Any]:
+        return _unknown(*errors, *failure_errors(failures), current_head=current_head)
 
     def snapshot(names: Sequence[str]) -> tuple[dict[str, Any] | None, str | None]:
         """The PR head plus every page of the named connections, in ONE query.
@@ -1074,15 +1448,22 @@ def _evaluate_pr_inner(
         old path hit it was not counted (a same-day run under the budget saw 0
         of 70, an earlier one showed a p90 above it).
 
-        Every page re-reads ``headRefOid``; a head that moves between pages is
-        the same race the final head read below exists to catch.
+        Every page re-reads ``headRefOid`` and the PR body; a head that moves
+        between pages is the same race the final head read below exists to
+        catch, and a body that moves is reported as ``body_moved``.
         """
         rows: dict[str, list[dict[str, Any]]] = {item: [] for item in names}
         cursors: dict[str, str] = {}
         pending = list(names)
         head: str | None = None
+        body: str | None = None
+        body_moved = False
         path_changed = False
         read = Deadline.after(_GRAPHQL_READ_SECONDS, monotonic=monotonic)
+        # Failures recorded by an EARLIER snapshot say nothing about this one: a
+        # recovered failure there must not make this read's budget exhaustion look
+        # transient.
+        failures_before = len(failures)
         for _page in range(_GRAPHQL_MAX_PAGES):
             # ONE clock reading decides both whether to call and how long the
             # call may take. Two readings leave a gap a stall can fall into:
@@ -1090,6 +1471,11 @@ def _evaluate_pr_inner(
             # #2594); just short of it, it issued a call too small to finish.
             left = read.remaining()
             if left is None or left < floor:
+                if _page and len(failures) == failures_before:
+                    # Pages were read and no call failed: the PR's evidence is too
+                    # large to read in this budget. That holds on every attempt, so
+                    # it is NOT on the transient allowlist (it keeps asking).
+                    return None, "graphql_read_budget_pages"
                 return None, "graphql_read_timeout"
             argv = [
                 "gh",
@@ -1107,9 +1493,20 @@ def _evaluate_pr_inner(
             for item in pending:
                 if item in cursors:
                     argv += ["-f", f"after_{item}={cursors[item]}"]
-            rc, raw, _ = run(argv, min(8.0, left))
+            rc, raw, err = run(argv, min(8.0, left))
             if rc != 0:
-                return None, "graphql_unreadable"
+                failures.append(_gh_failure_class(err))
+                # One retry: a single failed read used to decide the whole
+                # result, which surfaced as an "unreadable history" prompt for
+                # PRs a later read handled fine. Only while the read budget
+                # still covers a useful call.
+                left = read.remaining()
+                if left is None or left < floor:
+                    return None, "graphql_unreadable"
+                rc, raw, err = run(argv, min(8.0, left))
+                if rc != 0:
+                    failures.append(_gh_failure_class(err))
+                    return None, "graphql_unreadable"
             try:
                 payload = json.loads(raw)
                 # gh exits non-zero on an `errors` response, including one that
@@ -1125,6 +1522,14 @@ def _evaluate_pr_inner(
             page_head = data.get("headRefOid")
             if not isinstance(page_head, str):
                 return None, "graphql_malformed"
+            # The body is compared on every page, as the head is: an edit seen
+            # on a later page of this read must not be lost.
+            page_body = data.get("body")
+            if isinstance(page_body, str):
+                if body is None:
+                    body = page_body
+                elif page_body != body:
+                    body_moved = True
             if head is None:
                 head = page_head
             elif page_head != head:
@@ -1155,7 +1560,16 @@ def _evaluate_pr_inner(
                     cursors[item] = cursor
                     following.append(item)
             if not following:
-                return {"head": head, "path_changed": path_changed, **rows}, None
+                return (
+                    {
+                        "head": head,
+                        "body": body,
+                        "body_moved": body_moved,
+                        "path_changed": path_changed,
+                        **rows,
+                    },
+                    None,
+                )
             pending = following
         return None, f"{pending[0]}_response_truncated"
 
@@ -1173,7 +1587,7 @@ def _evaluate_pr_inner(
     if needed or test_head is None:
         first, error = snapshot(needed)
         if error or first is None:
-            return _unknown(error or "graphql_unreadable", current_head=test_head or "")
+            return unknown(error or "graphql_unreadable", current_head=test_head or "")
         if test_head is None:
             test_head = str(first["head"]).strip()
 
@@ -1189,7 +1603,7 @@ def _evaluate_pr_inner(
         fetched[item] = rows or []
 
     if first is not None and "files" in needed and first.get("path_changed"):
-        rc, raw, _ = run(
+        rc, raw, err = run(
             [
                 "gh",
                 "api",
@@ -1201,7 +1615,8 @@ def _evaluate_pr_inner(
             8,
         )
         if rc != 0:
-            return _unknown("files_unreadable", current_head=test_head)
+            failures.append(_gh_failure_class(err))
+            return unknown("files_unreadable", current_head=test_head)
         rows, error = _json_lines(raw, "files")
         if error:
             return _unknown(error, current_head=test_head)
@@ -1224,14 +1639,16 @@ def _evaluate_pr_inner(
     final_head = os.environ.get("_TEST_REVIEW_BUDGET_HEAD_AFTER")
     if final_head is None and os.environ.get("_TEST_REVIEW_BUDGET_HEAD") is not None:
         final_head = test_head
-    mutable = [item for item in ("reviews", "comments") if item in needed]
+    # The commit graph is re-read too: it decides which reviews are late, and the
+    # PR's commit list can change (a base branch moving) while its head does not.
+    mutable = [item for item in ("reviews", "comments", "commits") if item in needed]
     second: dict[str, Any] | None = None
     if final_head is None or mutable:
         second, error = snapshot(mutable)
         if error or second is None:
             if error == "graphql_unreadable":
                 error = "final_head_unreadable"
-            return _unknown(error or "final_head_unreadable", current_head=test_head)
+            return unknown(error or "final_head_unreadable", current_head=test_head)
         if final_head is None:
             final_head = str(second["head"]).strip()
     if final_head != test_head:
@@ -1249,14 +1666,17 @@ def _evaluate_pr_inner(
         if not same:
             return _unknown("evidence_changed_during_evaluation", current_head=final_head)
 
-    commit_heads: list[str] = []
+    commit_heads: list[str | dict[str, Any]] = []
     for item in fetched["commits"]:
         sha = item.get("sha")
         if not isinstance(sha, str):
             return _unknown("commits_malformed", current_head=test_head)
-        commit_heads.append(sha)
+        # A seam row may omit parents; the evaluator then knows no ancestry.
+        commit_heads.append(
+            {"sha": sha, "parents": item["parents"]} if item.get("parents") is not None else sha
+        )
 
-    return evaluate_evidence(
+    result = evaluate_evidence(
         current_head=test_head,
         commit_heads=commit_heads,
         reviews=fetched["reviews"],
@@ -1265,6 +1685,23 @@ def _evaluate_pr_inner(
         external_identity_templates=external_identity_templates,
         primary_login=primary_login,
     )
+    # The PR body, for the reflection's acceptance points. It is not evidence
+    # the count rests on, so a body edited between the two reads leaves the
+    # count standing; but acceptance must bind the body as it now is, so the
+    # final read's body is the one returned, and two reads that disagree return
+    # no body and say so (``body_changed``), for the reader to refuse rather
+    # than check acceptance against either.
+    reads = [s for s in (first, second) if s is not None]
+    bodies = [s.get("body") for s in reads]
+    result["body_changed"] = any(s.get("body_moved") for s in reads) or (
+        len(bodies) == 2 and bodies[0] != bodies[1]
+    )
+    result["body"] = None if result["body_changed"] or not bodies else bodies[-1]
+    # A test that supplies every input makes no read, so it names the body too.
+    seam_body = os.environ.get("_TEST_REVIEW_BUDGET_BODY")
+    if seam_body is not None and not reads:
+        result["body"] = seam_body
+    return result
 
 
 def evaluate_pr(*args: Any, **kwargs: Any) -> dict[str, Any]:
@@ -1277,8 +1714,11 @@ def evaluate_pr(*args: Any, **kwargs: Any) -> dict[str, Any]:
     """
     try:
         return _evaluate_pr_inner(*args, **kwargs)
-    except _BudgetExhausted:
-        return _unknown("lookup_budget_exhausted")
+    except _BudgetExhausted as exc:
+        # The classes of calls that failed before the stop travel with it: a
+        # persistent one (auth, not_found) must keep the result non-transient.
+        recorded = exc.args[0] if exc.args else []
+        return _unknown("lookup_budget_exhausted", *recorded)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

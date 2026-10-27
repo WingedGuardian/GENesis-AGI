@@ -197,6 +197,28 @@ def test_healthy_profile_no_defects():
     assert _infra_missing_protections(_profile()) == []
 
 
+@pytest.mark.parametrize(
+    "knob",
+    ["false", "0", "no", "off", "FALSE", "Off", " no ", "0B"],
+)
+def test_incus_false_swap_words_are_detected(knob):
+    assert "container_swap_knob_off" in _infra_missing_protections(_profile(knob=knob))
+
+
+@pytest.mark.parametrize(
+    "knob",
+    ["true", "1", "yes", "on", "4294967296", "4GiB", "", None],
+)
+def test_swap_on_and_unset_values_are_healthy(knob):
+    assert "container_swap_knob_off" not in _infra_missing_protections(_profile(knob=knob))
+
+
+def test_absent_swap_knob_is_healthy():
+    profile = _profile()
+    del profile["sections"]["host_virt"]["facts"]["container_limits"]["limits.memory.swap"]
+    assert "container_swap_knob_off" not in _infra_missing_protections(profile)
+
+
 def test_cc_tmp_shared_fs_detected_in_lxc():
     # cc-tmp NOT isolated on an lxc container → the nag fires.
     assert "cc_tmp_shared_fs" in _infra_missing_protections(
@@ -777,6 +799,13 @@ def test_every_rule_slug_has_detail_text():
             _profile(falkordb_active="inactive", falkordb_mode="falkordb")
         )
     )
+    # codebase-memory-mcp registered but not set up (its own section).
+    prof_cbm = _profile()
+    prof_cbm["sections"]["codebase_mcp"] = {
+        "status": "ok",
+        "facts": {"registered": True, "disabled": False, "config_present": False},
+    }
+    producible |= set(_infra_missing_protections(prof_cbm))
     assert producible == set(_loop._INFRA_POSTURE_DETAIL)
 
 
@@ -900,3 +929,50 @@ def test_tailscale_watchdog_rule_silent_otherwise(tailscaled, state):
         _profile(tailscaled=tailscaled, ts_watchdog=state)
     )
 
+
+# ── codebase-memory-mcp: a tooling gap, not a crash-resilience one ────────────
+
+_CBM_UNSET = {"registered": True, "disabled": False, "config_present": False}
+
+
+def _with_cbm(profile: dict, facts: dict) -> dict:
+    profile["sections"]["codebase_mcp"] = {"status": "ok", "facts": facts}
+    return profile
+
+
+@pytest.mark.asyncio
+async def test_codebase_alert_alone_does_not_claim_crash_resilience(monkeypatch):
+    db = await _setup()
+    try:
+        _use_profile(monkeypatch, _with_cbm(_profile(), _CBM_UNSET))
+        await _check_infra_protection_posture(db)
+        (alert,) = await _alerts(db)
+        assert "codebase_mcp_registered_unconfigured" in alert["content"]
+        assert "crash-resilience guarantee" not in alert["content"]
+        assert "developer-tooling gap" in alert["content"]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_codebase_alert_beside_a_real_protection_keeps_both_trailers(monkeypatch):
+    db = await _setup()
+    try:
+        _use_profile(monkeypatch, _with_cbm(_profile(swap_max=0), _CBM_UNSET))
+        await _check_infra_protection_posture(db)
+        (alert,) = await _alerts(db)
+        assert "crash-resilience guarantee" in alert["content"]
+        assert "codebase_mcp_registered_unconfigured: a developer-tooling gap" in alert["content"]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_codebase_opt_out_is_silent(monkeypatch):
+    db = await _setup()
+    try:
+        _use_profile(monkeypatch, _with_cbm(_profile(), {**_CBM_UNSET, "disabled": True}))
+        await _check_infra_protection_posture(db)
+        assert await _alerts(db) == []
+    finally:
+        await db.close()

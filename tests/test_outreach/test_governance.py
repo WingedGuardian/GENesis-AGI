@@ -1001,3 +1001,189 @@ def test_a_malformed_window_disables_rather_than_raising(start, end, caplog):
         "failing toward disabled must still be LOUD — a silently-ignored typo is "
         "how someone concludes quiet hours works when it does not"
     )
+
+
+# ---------------------------------------------------------------------------
+# Topic-identity signal types and empty contexts never match on the
+# topic-blind content hash (R3). The secondary hashes only context[:200] and
+# ignores topic, so for signal types whose topic IS the message identity it can
+# only ever drop a DISTINCT message; the primary (signal_type, topic, category)
+# check still collapses genuine repeats.
+# ---------------------------------------------------------------------------
+
+_SHARED_HEADER = (
+    "Morning Report\n\nGround Truth: 12 open PRs, 3 follow-ups due, "
+    "no critical observations, backups healthy, all providers up. "
+    "Ground truth restated in full so the first 200 characters are identical "
+    "across days when nothing urgent leads the report."
+)
+
+
+async def _delivered(db, *, rid, signal_type, topic, category, context, at=None):
+    when = at or datetime.now(UTC).isoformat()
+    await outreach_crud.create(
+        db,
+        id=rid,
+        signal_type=signal_type,
+        topic=topic,
+        category=category,
+        salience_score=1.0,
+        channel="telegram",
+        message_content=context,
+        content_hash=content_hash(context),
+        created_at=when,
+    )
+    await outreach_crud.record_delivery(db, rid, delivered_at=when)
+
+
+def test_shared_header_fills_the_hash_window():
+    # Guard-the-guard: the fixture really shares its whole 200-char hash key.
+    assert len(_SHARED_HEADER) >= 200
+    assert content_hash(_SHARED_HEADER + " day one") == content_hash(
+        _SHARED_HEADER + " day two"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("signal_type", "category", "old_topic", "new_topic"),
+    [
+        ("queued_alert", "blocker", "alert:backup:aaaaaaaaaaaa", "alert:backup:bbbbbbbbbbbb"),
+        ("morning_report", "digest", "Morning Report — 2026-09-28", "Morning Report — 2026-09-29"),
+        (
+            "career_outreach_nudged",
+            "notification",
+            "Career outreach: 3 staged draft(s) 2026-10-01 aaaa1111",
+            "Career outreach: 3 staged draft(s) 2026-10-01 bbbb2222",
+        ),
+    ],
+)
+async def test_identity_types_distinct_topic_not_duplicate(
+    db, signal_type, category, old_topic, new_topic
+):
+    gate = GovernanceGate(_cfg_no_quiet(notification_daily=50, max_daily=50), db)
+    await _delivered(
+        db, rid="old", signal_type=signal_type, topic=old_topic,
+        category=category, context=_SHARED_HEADER + " first",
+    )
+    req = OutreachRequest(
+        category=OutreachCategory(category),
+        topic=new_topic,
+        context=_SHARED_HEADER + " second",
+        salience_score=1.0,
+        signal_type=signal_type,
+    )
+    assert await gate.is_duplicate(req) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("signal_type", "category", "topic"),
+    [
+        ("queued_alert", "blocker", "alert:backup:aaaaaaaaaaaa"),
+        ("morning_report", "digest", "Morning Report — 2026-09-29"),
+        ("career_outreach_nudged", "notification", "Career outreach: 3 staged draft(s) 2026-10-01 aaaa1111"),
+    ],
+)
+async def test_identity_types_same_topic_still_duplicate(db, signal_type, category, topic):
+    gate = GovernanceGate(_cfg_no_quiet(), db)
+    await _delivered(
+        db, rid="old", signal_type=signal_type, topic=topic,
+        category=category, context="whatever was sent",
+    )
+    req = OutreachRequest(
+        category=OutreachCategory(category),
+        topic=topic,
+        context="a different body entirely",
+        salience_score=1.0,
+        signal_type=signal_type,
+    )
+    assert await gate.is_duplicate(req) is True
+
+
+@pytest.mark.asyncio
+async def test_morning_report_same_date_denied_already_sent(db):
+    gate = GovernanceGate(_cfg_no_quiet(), db)
+    topic = "Morning Report — 2026-09-29"
+    await _delivered(
+        db, rid="mr", signal_type="morning_report", topic=topic,
+        category="digest", context=_SHARED_HEADER,
+    )
+    result = await gate.check(
+        OutreachRequest(
+            category=OutreachCategory.DIGEST, topic=topic,
+            context=_SHARED_HEADER, salience_score=1.0, signal_type="morning_report",
+        )
+    )
+    assert result.verdict == GovernanceVerdict.DENY
+    assert result.reason == "morning report already sent today"
+
+
+@pytest.mark.asyncio
+async def test_morning_report_next_day_inside_window_allowed(db):
+    """Replay of the measured drop: yesterday's report delivered 24 h minus a few
+    seconds ago (the next draft finished faster), identical 200-char header."""
+    gate = GovernanceGate(_cfg_no_quiet(), db)
+    yesterday = (datetime.now(UTC) - timedelta(hours=24) + timedelta(seconds=7)).isoformat()
+    await _delivered(
+        db, rid="mr-1", signal_type="morning_report",
+        topic="Morning Report — 2026-09-28", category="digest",
+        context=_SHARED_HEADER + " yesterday's details", at=yesterday,
+    )
+    result = await gate.check(
+        OutreachRequest(
+            category=OutreachCategory.DIGEST, topic="Morning Report — 2026-09-29",
+            context=_SHARED_HEADER + " today's details", salience_score=1.0,
+            signal_type="morning_report",
+        )
+    )
+    assert result.verdict == GovernanceVerdict.ALLOW
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("context", ["", "   \n\t "])
+async def test_empty_context_never_hash_matches(db, context):
+    """outreach_recovery submits deferred_retry with context="", so every
+    recovered delivery shares one hash; a second one must not be dropped."""
+    gate = GovernanceGate(_cfg_no_quiet(), db)
+    await _delivered(
+        db, rid="retry-1", signal_type="deferred_retry", topic="first topic",
+        category="alert", context=context,
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.ALERT, topic="second topic", context=context,
+        salience_score=1.0, signal_type="deferred_retry",
+    )
+    assert await gate.is_duplicate(req) is False
+
+
+@pytest.mark.asyncio
+async def test_empty_context_same_topic_still_duplicate(db):
+    """The empty-context rule exempts only the content-hash check: a repeat
+    with the same topic still collapses on the primary check."""
+    gate = GovernanceGate(_cfg_no_quiet(), db)
+    await _delivered(
+        db, rid="retry-1", signal_type="deferred_retry", topic="same topic",
+        category="alert", context="",
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.ALERT, topic="same topic", context="",
+        salience_score=1.0, signal_type="deferred_retry",
+    )
+    assert await gate.is_duplicate(req) is True
+
+
+@pytest.mark.asyncio
+async def test_non_identity_type_keeps_content_hash_secondary(db):
+    """Other signal types keep the topic-blind secondary (control: same shape
+    as the identity-type test, a type outside the set, still collapses)."""
+    gate = GovernanceGate(_cfg_no_quiet(), db)
+    await _delivered(
+        db, rid="h", signal_type="health_alert", topic="topic A",
+        category="alert", context=_SHARED_HEADER + " a",
+    )
+    req = OutreachRequest(
+        category=OutreachCategory.ALERT, topic="topic B",
+        context=_SHARED_HEADER + " b", salience_score=1.0, signal_type="health_alert",
+    )
+    assert await gate.is_duplicate(req) is True

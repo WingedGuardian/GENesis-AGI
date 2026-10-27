@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -23,6 +24,10 @@ from pathlib import Path
 import pytest
 
 _HOOK = Path(__file__).resolve().parents[2] / "scripts" / "hooks" / "pr_close_advisory.py"
+_HOOKS = _HOOK.parent
+if str(_HOOKS) not in sys.path:
+    sys.path.insert(0, str(_HOOKS))
+import pr_close_predicate  # noqa: E402
 
 #: Assembled rather than written literally: a bare `-f` in a test source line
 #: reads as a force-push to the repo's own shell guard, which blocks the whole
@@ -78,7 +83,9 @@ FIRES = [
     # Flag shapes around the group word. The separated `-R o/r` form is the one
     # that was a real bypass in the merge gate, and a hand-rolled narrowing
     # broke `--repo o/r` here by reading the flag's VALUE as the group.
-    pytest.param("gh -R owner/repo pr close 1", id="short-repo-flag-before-pr"),
+    pytest.param(
+        "gh -R owner/repo pr close 1", id="short-repo-flag-before-pr"
+    ),  # Deliberate safe-side over-match; this placement is not relied on.
     pytest.param("gh --repo=owner/repo pr close 1", id="attached-repo-flag-before-pr"),
 ]
 
@@ -191,17 +198,25 @@ def test_the_note_states_the_limit_it_cannot_see():
 
 
 #: The phrases the superseded-PR exception must carry in EVERY note: who may use
-#: it, and the evidence each condition needs (owner ruling, 2026-10-04; the
-#: genesis-development skill, "A superseded PR is the one exception").
+#: it, and the evidence each condition needs (owner rulings 2026-10-04 for the
+#: closing session and 2026-10-06 for a rework's builder; the closing-session
+#: skill, "A superseded PR is the one exception").
 _EXCEPTION_PHRASES = (
-    "only the CLOSING session may use",
-    "not a build or reviewer session",
+    "only two sessions may use",
+    "the CLOSING session, or the BUILDER of a rework that replaces this PR",
+    "Never a reviewer session",
+    "never Devin, even as a rework's builder",
+    "only when all three hold",
+    "a `## Rework spec` comment on this PR posted by a maintainer",
+    "including a non-maintainer author of this PR, is not authorization",
+    "the LAST replacement has opened and every replacement is open or merged",
     "owner's authorization of the supersession is on record",
     "successor PR is open or merged",
     "checked against the successor and current main",
     "naming the file:line that now does it",
     "moot (saying why)",
-    "one part neither covered nor moot keeps the PR open",
+    "a retired PR keeps its labels",
+    "the PR stays open with a comment naming that part",
 )
 
 
@@ -218,11 +233,21 @@ def test_the_note_states_the_superseded_pr_exception():
     note = _note(_run("gh pr close 1"))
     _assert_full_exception(note)
     assert "also stays open" not in note
+    # The conditions bind BOTH eligible sessions, and a rework's builder is also
+    # its reviving session, so the reviving-session route must exclude it.
+    assert (
+        "(b) you are the closing session, or the builder of a rework that "
+        "replaces this PR, and all three conditions above hold" in note
+    )
+    assert "(c) you are reviving this PR with no rework replacing it" in note
+    assert "a rework's builder retires only under the superseded-PR" in note
+    assert "if you are Devin and this PR is one your rework replaces, do not " in note
+    assert "let the user answer" in note
     skill = (
         Path(__file__).resolve().parents[2]
         / ".claude"
         / "skills"
-        / "genesis-development"
+        / "closing-session"
         / "SKILL.md"
     ).read_text(encoding="utf-8")
     assert "**A superseded PR is the one exception" in skill, (
@@ -236,6 +261,7 @@ def test_the_short_note_states_the_superseded_pr_exception_too():
     not a pointer to "that rule's conditions"."""
     note = _note(_run("echo ok # a note \\\ngh pr close 5"))
     assert "could not check whether it closes" in note
+    assert "unless you are reviving it with no rework replacing it" in note
     _assert_full_exception(note)
 
 
@@ -345,6 +371,7 @@ def test_the_prefilter_pattern_itself(text, hit):
     [
         (["gh", "pr", "close", "1"], "pr"),
         (["gh", "--repo", "owner/repo", "pr", "close"], "pr"),
+        # Deliberate safe-side over-match; this placement is not relied on.
         (["gh", "-R", "owner/repo", "pr", "close"], "pr"),
         (["gh", "--repo=owner/repo", "pr", "close"], "pr"),
         (["gh", "run", "list", "--workflow", "pr", "close"], "run"),
@@ -357,7 +384,7 @@ def test_the_group_word_reads_the_option_table_not_the_dashes(argv, group):
     `gh --repo owner/repo pr close` and silenced a real close — the same defect
     the shared parser was hardened against, reproduced one level up. The table
     comes off `shell_parse`'s spec so the two cannot disagree."""
-    assert _module()._gh_group(argv) == group
+    assert pr_close_predicate._gh_group(argv) == group
 
 
 def _fires(command: str) -> bool:
@@ -368,9 +395,7 @@ def _fires(command: str) -> bool:
     across the cases being distinguished. Single commands only -- the compound
     handling has its own cases in the smoke matrix.
     """
-    import shlex
-
-    return _module()._closes_a_pr(shlex.split(command)) is not None
+    return pr_close_predicate.pr_close_reason(shlex.split(command)) is not None
 
 
 @pytest.mark.parametrize(
@@ -599,6 +624,7 @@ def test_help_INSIDE_a_value_does_not_silence_a_real_close(command):
         # These are the direction the widening could break, and they are the
         # reason it is a measured union rather than "skip anything dashed".
         pytest.param("gh pr list", False, id="still-silent-on-a-list"),
+        # Deliberate safe-side over-match; this placement is not relied on.
         pytest.param("gh -R o/r pr list", False, id="still-silent-with-a-repo-flag"),
         pytest.param(
             "gh run list --workflow pr close", False, id="still-silent-on-a-workflow-named-pr"

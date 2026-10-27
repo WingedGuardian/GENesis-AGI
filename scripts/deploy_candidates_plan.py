@@ -14,9 +14,11 @@ Flat sibling of deploy_candidates.py (see that file for the commands).
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import os
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
 
@@ -37,7 +39,12 @@ from deploy_candidates_core import (  # noqa: E402
     after_move,
     out,
 )
-from deploy_candidates_gate import SYNC_HOOKS, non_file_kind, sync_hook_names  # noqa: E402
+from deploy_candidates_gate import (  # noqa: E402
+    HELPER_ARRAYS,
+    SYNC_HOOKS,
+    non_file_kind,
+    sync_hook_names,
+)
 
 
 def shared_with(repo: Repo, base: str, heads: dict[str, str]) -> dict[str, list[str]]:
@@ -243,12 +250,90 @@ def ensure_reflog_kept(repo: Repo) -> None:
 
 
 class Move(NamedTuple):
-    """What a move did: whether the checkout's files changed, and the commit
-    `live` is at afterwards (its old tip when nothing changed, else the plan's
-    tip). Every post-move WARNING names ``at``, never a commit that is not live."""
+    """What a move did: whether the checkout's files changed, the commit `live`
+    is at afterwards (its old tip when nothing changed, else the plan's tip), and
+    the commit HEAD was at before (the source's head, checked under the lock).
+    Every post-move WARNING names ``at``, never a commit that is not live."""
 
     files: bool
     at: str
+    before: str | None
+    head_left: str | None = None  # where HEAD went if it left `live` in the last instant
+    head_unknown: bool = False  # where HEAD is could not be read after the move
+
+
+class Source(NamedTuple):
+    """Where the checkout was when the command read it (#3492): the ref HEAD is
+    on (None: detached), the commit HEAD names, the commit `live` names, another
+    worktree with `live` checked out (None: none), and the tracked changes
+    (dirty_lines: the excused paths stay excused). Before a move, preflight has
+    refused any tracked change and another worktree on `live`, so the last two
+    are empty. Every write and every success return re-checks all five, because
+    a session can commit, switch or edit at any time and takes no Genesis lock."""
+
+    branch_ref: str | None
+    head: str | None
+    live_ref: str | None
+    elsewhere: str | None
+    dirty: tuple[str, ...]
+
+
+def read_source(repo: Repo) -> Source:
+    p = repo.git("symbolic-ref", "-q", "HEAD", check=False)
+    if p.returncode not in (0, 1):  # 1: a detached HEAD; anything else: git cannot say
+        raise repo._unknown("which branch is checked out", p)
+    ref = p.stdout.strip() if p.returncode == 0 else ""
+    return Source(
+        ref or None,
+        repo.resolve("HEAD"),
+        repo.resolve(LIVE_REF),
+        repo.live_checked_out_elsewhere(),
+        tuple(repo.dirty_lines()),
+    )
+
+
+#: What a manifest-only change (a drop off `live`, or --no-rebuild) depends on:
+#: it never touches the working tree, so tracked edits there do not concern it.
+REF_FIELDS = ("branch_ref", "head", "live_ref")
+_FIELD_NAMES = {
+    "branch_ref": "HEAD's branch",
+    "head": "HEAD",
+    "live_ref": "`live`",
+    "elsewhere": "another worktree with `live`",
+}
+
+
+def source_mismatch(
+    repo: Repo, source: Source, fields: tuple[str, ...] = Source._fields
+) -> str | None:
+    """How the checkout now differs from ``source`` in ``fields``, or None."""
+    now = read_source(repo)
+    for field in fields:
+        was, is_ = getattr(source, field), getattr(now, field)
+        if was == is_:
+            continue
+        if field == "dirty":
+            return "tracked files changed:\n" + "\n".join("  " + ln for ln in now.dirty)
+        return f"{_FIELD_NAMES[field]} is now {is_ or 'none'}, not {was or 'none'}"
+    return None
+
+
+def moved_source_refusal(why: str, unchanged: str) -> Refusal:
+    return Refusal(
+        f"the checkout is not where its caller left it ({why}); someone else changed it "
+        f"meanwhile; {unchanged}. Keep that work, then retry."
+    )
+
+
+def refuse_moved_source(
+    repo: Repo,
+    source: Source,
+    unchanged: str = "nothing moved",
+    fields: tuple[str, ...] = Source._fields,
+) -> None:
+    why = source_mismatch(repo, source, fields)
+    if why:
+        raise moved_source_refusal(why, unchanged)
 
 
 _CHECKOUT_LOCK_WAIT_S = 300.0
@@ -289,21 +374,49 @@ def _acquire_checkout_lock(repo: Repo) -> int:
         raise
 
 
-def move_checkout(repo: Repo, plan: Plan, branch: str | None) -> Move:
+#: The move record: {"to": <tip>, "phase": <phase>}, saying how far the move
+#: got, so its caller and every crash-recovery reader (update_state_guard.py)
+#: never infer from git what the move did. Phases: "ref" (the ref is about to
+#: move, the tree is unchanged), "moving" (the switch is about to run),
+#: "partial" (git wrote part of the tree and failed), "clean" (git refused and
+#: wrote nothing), "done" (the checkout is at "to"). Where it goes is the
+#: repo's (Repo.record_move): the engine writes it into the calling update.sh's
+#: own update_state.json row as "live_move" (#3492); with no caller, nowhere.
+MOVE_PHASES = ("ref", "moving", "partial", "clean", "done")
+
+
+def _write_move_record(repo: Repo, to: str, phase: str, *, before: bool) -> None:
+    """Record the move's phase. Before the move a failure refuses (nothing has
+    moved: a missing record must keep meaning "the engine never moved"); after
+    it, a failure only warns (repo.record_move decides both)."""
+    repo.record_move(to, phase, before=before)
+
+
+def move_checkout(
+    repo: Repo, plan: Plan, source: Source, before_write: Callable[[], None] | None = None
+) -> Move:
     lock_fd = _acquire_checkout_lock(repo)
     try:
-        return _move_checkout_locked(repo, plan, branch)
+        return _move_checkout_locked(repo, plan, source, before_write or (lambda: None))
     finally:
         os.close(lock_fd)
 
 
-def _move_checkout_locked(repo: Repo, plan: Plan, branch: str | None) -> Move:
+def _move_checkout_locked(
+    repo: Repo, plan: Plan, source: Source, before_write: Callable[[], None]
+) -> Move:
     """Point the checkout at ``plan.tip``: not at all when nothing changed, the
     ref alone when only commits changed, otherwise ONE `git switch`. Returns
     whether the checkout's files changed and where `live` is (a Move). Git
     configuration for `live` is
     written only after the move succeeded, so a refused move writes nothing; a
-    failure after the move is a WARNING (core.after_move), never a refusal."""
+    failure after the move is a WARNING (core.after_move), never a refusal.
+    The checkout must still be at ``source``: checked in full, under the
+    lock, just before each path's first write (a move record, the ref or the
+    switch) or its unchanged result. A mismatch writes nothing. The caller's
+    ``before_write`` (drop's manifest change) runs right after that check, so
+    it happens only while the source holds."""
+    branch = source.branch_ref.removeprefix("refs/heads/") if source.branch_ref else None
     live_base, live_merged = repo.live_chain(plan.base)
     cur_tip = repo.resolve(LIVE_REF)
     files_moved = False
@@ -317,18 +430,28 @@ def _move_checkout_locked(repo: Repo, plan: Plan, branch: str | None) -> Move:
         # driver changed: MEASURED, git 2.43), so the tree decides, not the list.
         and repo.tree(cur_tip) == repo.tree(plan.tip)
     ):
+        refuse_moved_source(repo, source)  # update.sh restarts on this tree
+        before_write()
         at = cur_tip  # nothing moves: `live` stays where it is
         out(f"  checkout: unchanged ({cur_tip[:12]}): same origin/main, same candidate heads.")
     elif branch == LIVE_BRANCH and cur_tip and repo.tree(cur_tip) == repo.tree(plan.tip):
         # Same files under new commits: move the ref, not the working tree.
-        repo.git(
+        refuse_moved_source(repo, source)
+        before_write()
+        _write_move_record(repo, plan.tip, "ref", before=True)
+        p = repo.git(
             "update-ref",
             "-m",
             f"deploy-candidates: rebuild (tree unchanged) onto {plan.base[:12]}",
             LIVE_REF,
             plan.tip,
             cur_tip,
+            check=False,
         )
+        if p.returncode != 0:  # the compare-and-swap: `live` is no longer cur_tip
+            _write_move_record(repo, plan.tip, "clean", before=False)
+            raise moved_source_refusal(f"`live` moved: {p.stderr.strip()}", "nothing moved")
+        _write_move_record(repo, plan.tip, "done", before=False)
         out(
             f"  checkout: tree unchanged; `live` moved to {plan.tip[:12]} without touching the files."
         )
@@ -352,6 +475,9 @@ def _move_checkout_locked(repo: Repo, plan: Plan, branch: str | None) -> Move:
             else None
         )
         before = _worktree_status(repo, move_paths)
+        refuse_moved_source(repo, source)
+        before_write()
+        _write_move_record(repo, plan.tip, "moving", before=True)
         p = repo.git("switch", "--no-overwrite-ignore", "-C", LIVE_BRANCH, plan.tip, check=False)
         if p.returncode != 0:
             # git returns a post-checkout hook's status AFTER the checkout has
@@ -364,6 +490,7 @@ def _move_checkout_locked(repo: Repo, plan: Plan, branch: str | None) -> Move:
                 # write error; MEASURED, git 2.43). Compare, never infer.
                 changed = sorted({rec[3:] for rec in before ^ _worktree_status(repo, move_paths)})
                 if changed:
+                    _write_move_record(repo, plan.tip, "partial", before=False)
                     more = f"\n  … and {len(changed) - 20} more" if len(changed) > 20 else ""
                     raise Refusal(
                         f"git failed partway through moving the checkout to {plan.tip[:12]}: HEAD "
@@ -375,6 +502,7 @@ def _move_checkout_locked(repo: Repo, plan: Plan, branch: str | None) -> Move:
                         "the new untracked ones, fix the cause below, then retry:\n"
                         + p.stderr.strip()
                     )
+                _write_move_record(repo, plan.tip, "clean", before=False)
                 raise Refusal(
                     f"git refused to move the checkout to {plan.tip[:12]}; nothing moved:\n{p.stderr.strip()}"
                 )
@@ -384,10 +512,24 @@ def _move_checkout_locked(repo: Repo, plan: Plan, branch: str | None) -> Move:
             )
         else:
             out(f"  checkout: moved to {plan.tip[:12]}.")
+        _write_move_record(repo, plan.tip, "done", before=False)
         files_moved = True
+        after_move(
+            f"`live` is at {at[:12]}",
+            "reading the reflog of `live`",
+            lambda: _warn_live_slipped(repo, source, plan.tip),
+        )
+        after_move(
+            f"`live` is at {at[:12]}",
+            "reading HEAD's reflog",
+            lambda: _warn_head_slipped(repo, source),
+        )
     # Past the commit point: the checkout has moved (or was already right), so
     # nothing below may raise a refusal that would claim nothing changed.
     state = f"`live` is at {at[:12]}"
+    # None: the read failed (after_move warned). That is not "on `live`": the
+    # restart advice must not load a checkout nobody could read (#3516).
+    head_left = after_move(state, "reading where HEAD is", lambda: _head_left_live(repo))
     after_move(state, "keeping the reflog of `live` (git config)", lambda: ensure_reflog_kept(repo))
     up = after_move(
         state,
@@ -400,10 +542,102 @@ def _move_checkout_locked(repo: Repo, plan: Plan, branch: str | None) -> Move:
         out(
             f"  WARNING: could not set `live` to track {BASE_REMOTE}/{BASE_BRANCH}: {up.stderr.strip()}"
         )
-    return Move(files_moved, at)
+    return Move(files_moved, at, source.head, head_left or None, head_left is None)
 
 
-def restore_moved_hooks(repo: Repo, before: str | None, after: str) -> None:
+def _head_left_live(repo: Repo) -> str:
+    """Every arm leaves HEAD on `live` (#3492): the unchanged and ref-only arms
+    require it at the re-check, the switch puts it there. A session that
+    switched branch after the last re-check moves nothing back (git's
+    update-ref guards only `live` itself, not symbolic HEAD), so it is named,
+    and the caller replaces its restart advice. Returns where HEAD went, or ""
+    when it is on `live`. Never refuses; a git that cannot say (symbolic-ref
+    exits other than 0 or 1, the detached answer) raises, so after_move warns
+    and the caller reports where HEAD is as unknown, never as detached."""
+    p = repo.git("symbolic-ref", "-q", "HEAD", check=False)
+    if p.returncode not in (0, 1):
+        raise repo._unknown("which branch is checked out", p)
+    ref = p.stdout.strip() if p.returncode == 0 else ""
+    if ref == LIVE_REF:
+        return ""
+    where = (
+        ref.removeprefix("refs/heads/")
+        if ref
+        else f"a detached {(repo.resolve('HEAD') or 'HEAD')[:12]}"
+    )
+    out(
+        f"  WARNING: HEAD is now on {where}, not `live`: a session switched branch while this "
+        "ran. `live` is as reported; the checkout is not."
+    )
+    return where
+
+
+def _warn_live_slipped(repo: Repo, source: Source, tip: str) -> None:
+    """The residual window (#3492): between the pre-write re-check and git taking
+    its index.lock, a session commit can still land, and `switch -C` resets
+    `live` over it. The reflog says what `live` was when the switch ran; a value
+    other than the source's is named, never refused (the move has happened).
+
+    Blind spot: when `live` already sat at ``tip`` (only reachable from main: on
+    `live` that tip would be the unchanged path), `switch -C live <tip>` logs
+    nothing, so `live@{1}` is an older value and a slip there cannot be told
+    from it; that case is not checked. A tracked edit in the window is not
+    seen at all: only a commit leaves a reflog entry. When `live` did not exist,
+    the switch's own creation is its only entry: an older one means a session
+    created it in the window."""
+    if source.live_ref == tip:
+        return  # reset to itself: git logged nothing to compare
+    p = repo.git("rev-parse", "--verify", "-q", f"{LIVE_REF}@{{1}}^{{commit}}", check=False)
+    was = p.stdout.strip()
+    if source.live_ref is None:
+        if p.returncode == 0 and was:
+            out(
+                f"  WARNING: live was at {was[:12]}, not absent, when the move ran; "
+                f"{was[:12]} is kept in live's reflog."
+            )
+    elif p.returncode != 0 or not was:
+        out(
+            f"  NOTE: the reflog of `live` could not be read; it was {source.live_ref[:12]} before."
+        )
+    elif was != source.live_ref:
+        out(
+            f"  WARNING: live was at {was[:12]}, not {source.live_ref[:12]}, when the move ran; "
+            f"{was[:12]} is kept in live's reflog."
+        )
+
+
+def _warn_head_slipped(repo: Repo, source: Source) -> None:
+    """HEAD's reflog says where HEAD was when the switch ran (#3492): its own
+    last entries are "checkout: moving from <branch> to live", preceded on
+    `live` by "branch: Reset to <tip>" (git writes both, MEASURED 2.43), and
+    the entry before them is HEAD then. A session that switched branch in the
+    window, or committed on main (which `live`'s reflog cannot see), is named;
+    a commit on `live` is left to _warn_live_slipped. Never refuses."""
+    p = repo.git("reflog", "-3", "--format=%H%x09%gs", "HEAD", check=False)
+    entries = [ln.split("\t", 1) for ln in p.stdout.splitlines() if "\t" in ln]
+    prefix, suffix = "checkout: moving from ", f" to {LIVE_BRANCH}"
+    ours = 1
+    if (
+        len(entries) >= 2
+        and entries[0][1] == f"{prefix}{LIVE_BRANCH}{suffix}"
+        and entries[1][1].startswith("branch: Reset to ")
+    ):
+        ours = 2
+    if p.returncode != 0 or len(entries) <= ours or not entries[0][1].startswith(prefix):
+        out("  NOTE: HEAD's reflog could not be read; where HEAD was is not checked.")
+        return
+    was_branch = entries[0][1][len(prefix) :].removesuffix(suffix)
+    was_head = entries[ours][0]
+    want_branch = (source.branch_ref or "").removeprefix("refs/heads/")
+    if was_branch != want_branch or (want_branch != LIVE_BRANCH and was_head != source.head):
+        out(
+            f"  WARNING: HEAD was on {was_branch} at {was_head[:12]}, not {want_branch} at "
+            f"{(source.head or 'none')[:12]}, when the move ran; that work is kept "
+            "(its branch, or HEAD's reflog)."
+        )
+
+
+def restore_moved_hooks(repo: Repo, before: str | None, after: str) -> list[str]:
     """Replace each installed git hook whose bytes are exactly that hook as the
     checkout held it BEFORE the move (``before``) with the moved-to version.
 
@@ -413,34 +647,39 @@ def restore_moved_hooks(repo: Repo, before: str | None, after: str) -> None:
     retirement) sync would keep it as "user-modified" and readiness would then
     refuse every rebuild. A hook equal to the pre-move checkout's copy was put
     there by a sync of that checkout, so this run may replace it; one edited by
-    hand equals neither side and is left for sync-hooks.sh to report. The names
+    hand equals neither side and is left in place. The names
     are BOTH checkouts' lists: a hook the old checkout installed is deleted when
     the new checkout no longer installs it (no source, or its list no longer
     names it), since nothing else ever removes an installed hook. Runs before
-    sync_git_hooks, after the move;
-    failures are reported per hook, never fatal."""
+    sync_git_hooks, after the move. Returns why it could not leave a hook as the
+    moved-to checkout installs it ([] when it could), a hand-edited hook
+    included: the caller decides whether that fails it (restore-hooks) or is
+    a warning past the commit point (rebuild, drop)."""
     if not before:
-        return
+        return []
     hooks_dir = repo.hooks_dir()
     if os.path.realpath(hooks_dir) != os.path.realpath(Path(repo.common_dir()) / "hooks"):
         # sync-hooks.sh installs into $GIT_COMMON_DIR/hooks; with core.hooksPath
         # pointing elsewhere readiness already refuses, and this must not write
         # where sync does not.
-        out("  NOTE: core.hooksPath is set; installed hooks were not restored.")
-        return
+        return ["core.hooksPath is set; installed hooks were not restored"]
     # A hook is managed on a side only when that side's list names it AND its
     # source exists: a name leaving the list is gone even if its file stays (an
     # approved list change enabled another candidate's file, and the list change
     # was dropped). An unreadable list is unknown, never "empty": nothing is
     # restored from an unknown old side, nothing deleted for an unknown new one.
+    failures: list[str] = []
     listed: dict[str, list[str] | None] = {}
+    helpers: list[str] = []
     for ref in (before, after):
         try:
             listed[ref] = sync_hook_names(repo.show(ref, SYNC_HOOKS) or "")
+            if ref == after:
+                helpers = sync_hook_names(repo.show(ref, SYNC_HOOKS) or "", HELPER_ARRAYS)
         except Refusal as exc:
             listed[ref] = None
-            out(
-                f"  NOTE: cannot read the hook list at {ref[:12]} ({exc}); its hooks were not restored."
+            failures.append(
+                f"cannot read the hook list at {ref[:12]} ({exc}); its hooks were not restored"
             )
     names: list[str] = []
     for ref in (before, after):
@@ -449,48 +688,80 @@ def restore_moved_hooks(repo: Repo, before: str | None, after: str) -> None:
         if name in (".", ".."):
             continue
         try:
-            _restore_one(
+            why = _restore_one(
                 repo,
                 hooks_dir / name,
                 f"scripts/hooks/{name}",
                 before if listed[before] is not None and name in listed[before] else None,
                 after,
                 after_listed=listed[after] is None or name in listed[after],
+                helper=name in helpers,
             )
         except (OSError, Refusal) as exc:
-            out(f"  NOTE: could not restore git hook {name} ({exc}); sync-hooks.sh follows.")
+            why = f"could not restore git hook {name} ({exc})"
+        if why:
+            failures.append(why)
+    return failures
 
 
 def _restore_one(
-    repo: Repo, dst: Path, path: str, before: str | None, after: str, after_listed: bool
-) -> None:
+    repo: Repo,
+    dst: Path,
+    path: str,
+    before: str | None,
+    after: str,
+    after_listed: bool,
+    helper: bool = False,
+) -> str | None:
     """``before`` is None when the old checkout did not manage this name, and
-    ``after_listed`` False when the moved-to list no longer names it."""
-    if before is None:
-        return
-    if non_file_kind(repo, before, path):
-        return  # the old copy came from sync-hooks.sh (a link's target) or nowhere
-    old = repo.blob_at(before, path)
+    ``after_listed`` False when the moved-to list no longer names it; ``helper``
+    is True for a name in the moved-to HELPERS_TO_SYNC. Returns why the hook was
+    left as neither checkout installs it, or None."""
     new_kind = non_file_kind(repo, after, path)
+    if (
+        helper
+        and dst.is_file()
+        and new_kind != "symbolic link"
+        and (new_kind or repo.blob_at(after, path) is None)
+    ):
+        # A helper is Genesis's own and the moved-to checkout has no source for
+        # it, so sync-hooks.sh skips it: removed here, as a hook the moved-to
+        # list drops is (a failure to remove it is the caller's failure).
+        dst.unlink()
+        out(f"  removed git helper {dst.name}: the moved-to checkout has no source for it.")
+        return None
+    if before is None:
+        return None
+    if non_file_kind(repo, before, path):
+        return None  # the old copy came from sync-hooks.sh (a link's target) or nowhere
+    old = repo.blob_at(before, path)
     if new_kind == "symbolic link":
-        return  # sync-hooks.sh installs what a link points at; leave it to sync
+        return None  # sync-hooks.sh installs what a link points at; leave it to sync
     # A directory or submodule installs nothing (sync-hooks.sh skips it), so the
     # moved-to side counts as having no source for this hook.
     new = repo.blob_at(after, path) if after_listed and not new_kind else None
     if old is None or old == new or not dst.is_file():
-        return
-    if repo.git("hash-object", "--no-filters", "--", str(dst)).stdout.strip() != old:
-        if new is None:
-            # sync-hooks.sh will not mention a name its list no longer has.
-            out(
-                f"  NOTE: git hook {dst.name} is no longer installed by this checkout but "
-                "was edited by hand; left in place."
-            )
-        return  # not the old checkout's copy: edited by hand, or never synced
+        return None
+    have = repo.git("hash-object", "--no-filters", "--", str(dst)).stdout.strip()
+    if have == new:
+        return None  # already the moved-to checkout's copy
+    # A hash .genesis-hook-versions lists is a version Genesis shipped: written
+    # by Genesis, like the old checkout's copy, so never a hand edit.
+    shipped = have != old and _shipped_version(repo, dst)
+    if have != old and new is not None and (helper or shipped):
+        # sync-hooks.sh overwrites a helper always, and a shipped version: the
+        # post-condition decides.
+        return None
+    if have != old and not shipped:
+        # Edited by hand (or never synced): left in place, and reported even when
+        # the moved-to list no longer names it, which no later check would.
+        # Readiness refuses any such hook before a rebuild moves anything.
+        unlisted = " (the moved-to checkout no longer installs it)" if new is None else ""
+        return f"git hook {dst.name} was edited by hand{unlisted}; left in place"
     if new is None:
         dst.unlink()
         out(f"  removed git hook {dst.name}: the moved-to checkout no longer installs it.")
-        return
+        return None
     tmp = dst.with_name(f"{dst.name}.tmp.{os.getpid()}")
     try:
         # repo.git decodes with surrogateescape: encoding back is byte-exact.
@@ -501,20 +772,33 @@ def _restore_one(
         tmp.unlink(missing_ok=True)
         raise
     out(f"  restored git hook {dst.name} to the moved-to checkout's version.")
+    return None
 
 
-def sync_git_hooks(repo: Repo) -> None:
+def _shipped_version(repo: Repo, dst: Path) -> bool:
+    """Whether sync-hooks.sh would call the installed hook a stale prior version
+    and replace it: its own test, `name:<sha256>` in the checkout's
+    .genesis-hook-versions."""
+    try:
+        listed = (repo.root / ".genesis-hook-versions").read_text().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return False
+    return f"{dst.name}:{hashlib.sha256(dst.read_bytes()).hexdigest()}" in listed
+
+
+def sync_git_hooks(repo: Repo) -> str | None:
     """Install the git hooks from the checkout (deploy_code_only.sh's step):
-    sync-hooks.sh is idempotent and never overwrites a hook someone modified;
-    its non-zero exits are reported, never fatal. On `live` the hook sources,
+    sync-hooks.sh is idempotent and never overwrites a hook someone modified.
+    Returns why it did not complete (missing, could not run, timed out, any
+    non-zero exit, 2 included), or None; its exit 0 does not prove every copy
+    landed (hook_install_failures checks that). On `live` the hook sources,
     sync-hooks.sh itself included, are reviewed main's or an approved
     candidate's: admission refuses any other candidate that changes them, and a
     rebuild or drop excludes any candidate that is not the sole, approved owner of
     a hook path it changes."""
     script = repo.root / "scripts" / "hooks" / "sync-hooks.sh"
     if not script.is_file():
-        out(f"  NOTE: {script} is missing; the git hook copies were not synced.")
-        return
+        return f"{script} is missing; the git hook copies were not synced"
     try:
         p = subprocess.run(
             ["bash", str(script), "--quiet"],
@@ -526,16 +810,14 @@ def sync_git_hooks(repo: Repo) -> None:
         )
         rc = p.returncode
     except (OSError, subprocess.TimeoutExpired) as exc:
-        out(f"  NOTE: sync-hooks.sh could not run ({exc}); the git hooks are as they were.")
-        return
-    if rc == 0:
-        out("  Git hook copies in sync.")
-    elif rc == 2:
-        out("  NOTE: sync-hooks.sh left a user-modified git hook alone (exit 2).")
-    else:
-        out(
-            f"  NOTE: sync-hooks.sh could not sync the git hooks (exit {rc}); they are as they were."
-        )
+        return f"sync-hooks.sh could not run ({exc}); the git hooks are as they were"
+    said = f": {p.stderr.strip()}" if p.stderr.strip() else ""  # it names the hook
+    if rc == 2:
+        return f"sync-hooks.sh left a user-modified git hook alone (exit 2){said}"
+    if rc:
+        return f"sync-hooks.sh could not sync the git hooks (exit {rc}){said}"
+    out("  Git hook copies in sync.")
+    return None
 
 
 def fast_forward_main(repo: Repo, base: str) -> None:

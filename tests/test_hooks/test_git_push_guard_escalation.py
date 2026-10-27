@@ -339,6 +339,11 @@ def test_shell_expanded_body_cannot_claim_confirmation_exemption(monkeypatch):
         'git commit -m "fix"',
         "gh pr create --head feat/x --title x --body x",
         "gh pr close 1372 --repo owner/repo",
+        "gh api -X PATCH repos/o/r/pulls/5 -f state=closed",
+        (
+            'gh api graphql -f \'query=mutation { closePullRequest(input:{pullRequestId:"x"}) '
+            "{ clientMutationId } }'"
+        ),
     ],
 )
 def test_review_approval_cannot_cover_another_gated_action(monkeypatch, capsys, other):
@@ -347,6 +352,118 @@ def test_review_approval_cannot_cover_another_gated_action(monkeypatch, capsys, 
     _payload(monkeypatch, command)
     assert _mod.main() == 2
     assert "review request separately" in capsys.readouterr().err
+
+
+def test_review_approval_plus_unlisted_get_is_refused(monkeypatch, capsys):
+    _evidence(monkeypatch, [(h, "COMMENTED") for h in HEADS[:4]])
+    _payload(monkeypatch, f"{TRIGGER} && gh api repos/o/r/pulls/5")
+    assert _mod.main() == 2
+    assert "review request separately" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "other",
+    [
+        "gh api graphql -f query='mutation{updatePullRequest(input:{pullRequestId:\"X\",state:CLOSED}){clientMutationId}}'",
+        "gh api graphql -F query=@q.graphql",
+        "gh api repos/o/r/pulls/5 -X PATCH --input body.json",
+        "gh api 'repos/o/r/pulls/5#x' -X PATCH -f state=closed",
+        "gh issue close 5",
+        "echo x",
+        "python3 -c 'print(1)'",
+        "git rev-parse HEAD",
+        "git status >file",
+        "git log -1 >> .git/config",
+        "gh alias set pv -- pr view",
+        "gh api repos/o/r/pulls --jq '.[] | \"pr view\"'",
+        "gh pr view 5 --unmodelled-flag x",
+        "gh workflow run pr view",
+        "./gh pr view 5",
+        "/tmp/x/git status",
+        "./sleep 1",
+        "git log -1 --format=%B --output=.git/config",
+        "git log -1 --ext-diff",
+        "git log -p",
+        "git log -1 --stat",
+        "git log --patch -2",
+        "git log -u",
+        "git log -1",
+        "git log --oneline -5",
+        "git log -1 --format=%G?",
+    ],
+    ids=[
+        "graphql-mutation-with-other-name",
+        "graphql-query-from-file",
+        "rest-body-from-file",
+        "rest-endpoint-fragment",
+        "issue-close",
+        "echo",
+        "python",
+        "git-rev-parse",
+        "redirected-git-status",
+        "appending-git-log",
+        "gh-alias-carrying-pr-view",
+        "gh-api-naming-pr-view",
+        "gh-pr-view-unmodelled-flag",
+        "gh-workflow-run-carrying-pr-view",
+        "path-qualified-gh",
+        "path-qualified-git",
+        "path-qualified-sleep",
+        "git-log-output-file",
+        "git-log-ext-diff",
+        "git-log-patch-runs-textconv",
+        "git-log-stat",
+        "git-log-patch-long",
+        "git-log-u",
+        "git-log-plain",
+        "git-log-oneline",
+        "git-log-signature-format-runs-gpg",
+    ],
+)
+def test_review_approval_blocks_unlisted_compound_steps(monkeypatch, capsys, other):
+    _evidence(monkeypatch, [(h, "COMMENTED") for h in HEADS[:4]])
+    _payload(monkeypatch, f"{TRIGGER} && {other}")
+    assert _mod.main() == 2
+    reason = capsys.readouterr().err
+    if other == "gh api graphql -F query=@q.graphql":
+        assert "BLOCKED: a GraphQL request" in reason
+    else:
+        assert "review request separately" in reason
+
+
+@pytest.mark.parametrize(
+    ("other", "before"),
+    [
+        ("cd {wt}", True),
+        ("sleep 600;", False),
+        ("gh pr checks 5", False),
+        ("gh pr view 5", False),
+        ("git status", False),
+        ("git -C {wt} status --short", True),
+    ],
+    ids=["cd", "sleep", "gh-pr-checks", "gh-pr-view", "git-status", "git-c-status"],
+)
+def test_review_approval_allows_inert_neighbors(monkeypatch, capsys, tmp_path, other, before):
+    _evidence(monkeypatch, [(h, "COMMENTED") for h in HEADS[:4]])
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    other = other.format(wt=wt)
+    command = f"{other} && {TRIGGER}" if before else f"{TRIGGER} && {other}"
+    _payload(monkeypatch, command)
+    assert _mod.main() == 0
+    assert "review request separately" not in capsys.readouterr().err
+
+
+def test_close_neighbor_message_names_the_pull_request_close(monkeypatch, capsys):
+    _evidence(monkeypatch, [(h, "COMMENTED") for h in HEADS[:4]])
+    _payload(monkeypatch, f"gh pr close 5 && {TRIGGER}")
+    assert _mod.main() == 2
+    message = capsys.readouterr().err
+    assert "closes a pull request (`gh pr close`)" in message
+    assert (
+        "Run the review request separately so one approval cannot authorize multiple actions."
+        in message
+    )
 
 
 @pytest.mark.parametrize(
@@ -388,6 +505,125 @@ def test_literal_number_url_and_repo_flag_resolve(monkeypatch):
 )
 def test_comment_identity_parser_keeps_supported_literal_forms(command, number, repo):
     assert _mod._comment_target(_argv(command)) == (number, repo)
+
+
+@pytest.mark.parametrize("flag", ["--repo {}", "--repo={}", "-R {}", "-R{}", "-R={}"])
+@pytest.mark.parametrize("repo", ["owner/repo", "other/repo", "github.com/owner/repo"])
+@pytest.mark.parametrize("placement", ["global", "before", "after"])
+def test_mixed_review_selectors_deny_before_budget(monkeypatch, capsys, flag, repo, placement):
+    selector = flag.format(repo)
+    url = "https://github.com/owner/repo/pull/1372"
+    command = {
+        "global": f"gh {selector} pr comment {url}",
+        "before": f"gh pr comment {selector} {url}",
+        "after": f"gh pr comment {url} {selector}",
+    }[placement] + ' --body "@codex review"'
+    monkeypatch.setattr(_mod._review_budget, "evaluate_pr", lambda *a, **kw: pytest.fail("budget lookup"))
+    monkeypatch.setattr(_mod, "_derive_repo_from_cwd", lambda *a: pytest.fail("cwd fallback"))
+    assert _mod._comment_target(_argv(command)) == (None, None)
+    assert _decision(command)[0] == "deny"
+    _payload(monkeypatch, command)
+    assert _mod.main() == 2
+    assert "Never combine a URL" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("selector", [
+    "https://elsewhere.invalid/owner/repo/pull/1372",
+    "http://elsewhere.invalid/owner/repo/pull/1372",
+    "1372 --repo elsewhere.invalid/owner/repo",
+    "1372 -Relsewhere.invalid/owner/repo",
+    "1372 --repo=elsewhere.invalid/owner/repo",
+    "ssh://github.com/owner/repo/pull/1372",
+])
+def test_unsupported_explicit_review_hosts_deny_before_budget(monkeypatch, capsys, selector):
+    command = f'gh pr comment {selector} --body "@codex review"'
+    monkeypatch.setattr(_mod._review_budget, "evaluate_pr", lambda *a, **kw: pytest.fail("budget lookup"))
+    assert _mod._comment_target(_argv(command)) == (None, None)
+    _payload(monkeypatch, command)
+    assert _mod.main() == 2
+    assert "Other explicit hosts are unsupported" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flags", ['--repo ""', "--repo=", '-R ""', "-R=", "--repo", "-R",
+                                     "--repo owner/repo --repo="])
+def test_empty_repo_flag_does_not_erase_mixed_review_identity(monkeypatch, flags):
+    command = f'gh pr comment https://github.com/owner/repo/pull/1372 --body "@codex review" {flags}'
+    monkeypatch.setattr(_mod._review_budget, "evaluate_pr", lambda *a, **kw: pytest.fail("budget lookup"))
+    assert _mod._comment_target(_argv(command)) == (None, None)
+    assert _decision(command)[0] == "deny"
+
+
+@pytest.mark.parametrize("selector", [
+    "1372", "'#1372'", "1372 --repo owner/repo", "1372 --repo=owner/repo",
+    "1372 -R owner/repo", "1372 -Rowner/repo", "1372 -R=owner/repo",
+    "1372 --repo github.com/owner/repo", "https://github.com/owner/repo/pull/1372",
+    "http://github.com/owner/repo/pull/1372/files#x",
+])
+def test_literal_review_identity_queries_intended_budget(monkeypatch, selector):
+    seen = []
+
+    def budget(repo, number, **kwargs):
+        seen.append((repo, number))
+        return {"status": "ok", "approval_required": False}
+
+    monkeypatch.setattr(_mod._review_budget, "evaluate_pr", budget)
+    monkeypatch.setattr(_mod, "_derive_repo_from_cwd", lambda *a: "owner/repo")
+    assert _decision(f'gh pr comment {selector} --body "@codex review"') == ("allow", "")
+    assert seen == [("owner/repo", "1372")]
+
+
+@pytest.mark.parametrize(
+    ("selector", "repo"),
+    [
+        ("owner/repo/pull/1372", None),
+        ("owner/repo/pull/1372 --repo owner/repo", "owner/repo"),
+    ],
+)
+def test_schemeless_pr_shaped_target_uses_literal_branch_policy(monkeypatch, selector, repo):
+    token = "owner/repo/pull/1372"
+    assert _mod._PR_URL_RE.match(token) is None
+    assert _mod._LITERAL_URL_RE.fullmatch(token) is None
+
+    command = f'gh pr comment {selector} --body "@codex review"'
+    monkeypatch.setattr(
+        _mod._review_budget,
+        "evaluate_pr",
+        lambda *a, **kw: pytest.fail("budget lookup"),
+    )
+    monkeypatch.setattr(_mod, "_derive_repo_from_cwd", lambda *a: "owner/repo")
+    assert _mod._comment_target(_argv(command)) == (None, repo)
+    decision, reason = _decision(command)
+    assert decision == "ask"
+    assert "could not be resolved to a literal PR number" in reason
+
+
+@pytest.mark.parametrize("flag", ["--repo=", '-R ""'])
+def test_empty_repo_advisory_names_the_missing_value(monkeypatch, flag):
+    command = f'gh pr comment 1372 {flag} --body "@codex review"'
+    monkeypatch.setattr(
+        _mod._review_budget,
+        "evaluate_pr",
+        lambda *a, **kw: pytest.fail("budget lookup"),
+    )
+    monkeypatch.setattr(_mod, "_derive_repo_from_cwd", lambda *a: "owner/repo")
+    decision, reason = _decision(command)
+    assert decision == "deny"
+    assert "--repo (empty value)" in reason
+
+
+@pytest.mark.parametrize("body", ['--body "--repo other/repo @codex review"',
+                                 '-b "-Rother/repo @codex review"',
+                                 '--body="--repo=other/repo @codex review"'])
+def test_url_review_body_flags_do_not_create_mixed_selector(monkeypatch, body):
+    seen = []
+
+    def budget(repo, number, **kwargs):
+        seen.append((repo, number))
+        return {"status": "ok", "approval_required": False}
+
+    monkeypatch.setattr(_mod._review_budget, "evaluate_pr", budget)
+    assert _decision(f"gh pr comment https://github.com/owner/repo/pull/1372 {body}") == ("allow", "")
+    assert seen == [("owner/repo", "1372")]
 
 
 @pytest.mark.parametrize(
@@ -605,3 +841,134 @@ def test_a_clean_confirmation_spends_the_gate_lanes_one_free_request(monkeypatch
         f"gh pr comment 1372 --repo owner/repo --body '@codex review\n{marker}'"
     )
     assert decision == "ask"
+
+
+# ── hooks.asks.review_request: silences ONLY the unreadable-history ask ──────
+
+
+def _unreadable(monkeypatch, *errors):
+    """GitHub unreadable JUST NOW: the evaluator's transient read-failure result."""
+    _evidence(monkeypatch)
+    codes = errors or ("graphql_unreadable", "gh_failure:http_502")
+    monkeypatch.setattr(
+        _mod._review_budget,
+        "evaluate_pr",
+        lambda *a, **k: _mod._review_budget._unknown(*codes),
+    )
+
+
+def test_unreadable_history_prompt_names_why(monkeypatch):
+    _unreadable(monkeypatch)
+    decision, reason = _decision()
+    assert decision == "ask"
+    assert "could not be read reliably. Evaluator: " in reason
+
+
+def test_review_request_off_turns_only_the_unreadable_ask_into_a_note(monkeypatch, capsys):
+    _unreadable(monkeypatch)
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "review_request=off")
+    assert _decision()[0] == "note"
+
+    _payload(monkeypatch, TRIGGER)
+    assert _mod.main() == 0
+    out = json.loads(capsys.readouterr().out)["hookSpecificOutput"]
+    assert "permissionDecision" not in out
+    assert "hooks.asks.review_request: off" in out["additionalContext"]
+    assert "could not be read reliably" in out["additionalContext"]
+
+
+def test_review_request_off_keeps_the_round_cap_ask(monkeypatch, capsys):
+    _evidence(monkeypatch, [(h, "COMMENTED") for h in HEADS[:4]])
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "review_request=off")
+    assert _decision()[0] == "ask"
+    _payload(monkeypatch, TRIGGER)
+    assert _mod.main() == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["hookSpecificOutput"]["permissionDecision"] == "ask"
+
+
+def test_review_request_off_keeps_the_unresolved_target_ask(monkeypatch):
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "review_request=off")
+    assert _decision('gh pr comment --body "@codex review"')[0] == "ask"
+
+
+def test_review_request_off_still_denies_a_dispatched_session(monkeypatch, capsys):
+    _unreadable(monkeypatch)
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "review_request=off")
+    _payload(monkeypatch, TRIGGER)
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    assert _mod.main() == 2
+    assert "could not be read reliably" in capsys.readouterr().err
+
+
+def test_review_request_off_still_refuses_a_compound(monkeypatch, capsys):
+    _unreadable(monkeypatch)
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "review_request=off")
+    _payload(monkeypatch, f"{TRIGGER} && git commit -m x")
+    assert _mod.main() == 2
+    assert "review request separately" in capsys.readouterr().err
+
+
+def test_review_request_on_keeps_the_unreadable_ask(monkeypatch):
+    _unreadable(monkeypatch)
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "review_request=on")
+    assert _decision()[0] == "ask"
+
+
+def test_evaluator_exception_is_named_in_the_prompt(monkeypatch):
+    _evidence(monkeypatch)
+
+    def boom(*a, **k):
+        raise TimeoutError("slow")
+
+    monkeypatch.setattr(_mod._review_budget, "evaluate_pr", boom)
+    decision, reason = _decision()
+    assert decision == "ask"
+    assert "evaluator_raised:TimeoutError" in reason
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "review_findings_deleted",
+        "commits_response_truncated",
+        "invalid_external_identity_template",
+        "evidence_changed_during_evaluation",
+        "codex_findings_comment_unbound",
+    ],
+)
+def test_review_request_off_keeps_persistent_and_tamper_codes_asking(monkeypatch, code):
+    _unreadable(monkeypatch, code)
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "review_request=off")
+    assert _decision()[0] == "ask"
+
+
+def test_review_request_off_keeps_a_malformed_record_asking(monkeypatch):
+    _evidence(monkeypatch)
+    monkeypatch.setenv("_TEST_REVIEW_BUDGET_COMMITS", "not-json")
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "review_request=off")
+    assert _decision()[0] == "ask"
+
+
+def test_review_request_off_needs_the_request_to_be_the_whole_command(monkeypatch):
+    _unreadable(monkeypatch)
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "review_request=off")
+    assert _decision(f"{TRIGGER} && gh pr ready 1372")[0] == "ask"
+
+
+def test_hook_side_failures_are_not_transient(monkeypatch):
+    _evidence(monkeypatch)
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "review_request=off")
+
+    def boom(*a, **k):
+        raise TimeoutError("slow")
+
+    monkeypatch.setattr(_mod._review_budget, "evaluate_pr", boom)
+    assert _decision()[0] == "ask"
+
+
+def test_an_evaluator_without_the_allowlist_asks(monkeypatch):
+    _unreadable(monkeypatch)
+    monkeypatch.setenv("_TEST_HOOK_ASK_POLICY", "review_request=off")
+    monkeypatch.delattr(_mod._review_budget, "errors_are_transient")
+    assert _decision()[0] == "ask"

@@ -15,7 +15,9 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -255,11 +257,9 @@ def test_b9_no_pipe_to_shell():
     # … replaced by download-to-file then execute-from-file (full download first).
     assert 'curl -LsSf https://astral.sh/uv/install.sh -o "$_uv_installer"' in code
     assert 'sh "$_uv_installer"' in code
-    # The codebase-memory installer moved to scripts/lib/cbm_installer.sh, shared
-    # with install.sh; bootstrap must reach it through that one site rather than
-    # growing a second copy of the fetch.
+    # The optional legacy helper remains independently pinned; ordinary setup
+    # no longer invokes it or fetches a raw provider.
     assert "raw.githubusercontent.com/DeusData/codebase-memory-mcp" not in code
-    assert '. "$SCRIPT_DIR/lib/cbm_installer.sh"' in code
 
 
 _CBM_PIN_RE = re.compile(r'GENESIS_CBM_INSTALLER_COMMIT="(?P<commit>[0-9a-f]{40})"')
@@ -305,11 +305,6 @@ def test_b9_cbm_installer_is_pinned_and_verified_from_one_site():
         "the installer's stderr carries its integrity errors; do not discard it — "
         f"{exec_line.strip()!r}"
     )
-    # Both install paths reach the tool through this one site.
-    for script in (BOOTSTRAP, INSTALL):
-        assert '. "$SCRIPT_DIR/lib/cbm_installer.sh"' in _code(script), (
-            f"{script.name}: does not source the shared cbm installer"
-        )
 
 
 def _run_cbm_install(tmp_path: Path, payload: str, digest: str | None, label: str):
@@ -647,66 +642,13 @@ def test_b9_direct_run_honours_the_kill_switch(tmp_path):
     assert proc.returncode == 4 and not fetched, proc.stderr
 
 
-def _cbm_outcome_block(script: Path) -> str:
-    """The caller's whole outcome path: the source, the CALL, and the `case`.
-
-    Anchored on the source line rather than on `case`, because the wire between
-    them — `genesis_cbm_install || _cbm_rc=$?` — is the part most easily broken.
-    A slice that starts at `case` and injects `_cbm_rc` itself leaves that
-    assignment outside everything it executes.
-    """
-    lines = script.read_text().splitlines()
-    # Anchored on the kill-switch guard's `if [ -z "$_cbm_disable" ]` — the
-    # if/elif/else encloses the source line, the call wire and the `case`, so
-    # slicing from any inner line leaves an orphaned `fi`; `_cbm_disable` is
-    # pre-set by the caller to a nonexistent path so the else branch runs.
-    start = next(i for i, ln in enumerate(lines) if ln.strip() == 'if [ -z "$_cbm_disable" ]; then')
-    end = next(i for i, ln in enumerate(lines) if i > start and ln.strip() == "esac")
-    end = next(i for i, ln in enumerate(lines) if i > end and ln.strip() == "fi")
-    return "\n".join(lines[start : end + 1]) + "\n"
-
-
-def test_b9_callers_render_a_digest_mismatch_distinctly(tmp_path):
-    """rc 3 exists so a wrong pin cannot hide inside a network-failure message.
-
-    That only holds if the CALLERS say something different for it, and if the
-    return actually reaches them. Both are exercised together: the real source
-    line, the real call and the real `case` are run against a stub library that
-    returns the code under test, so the `|| _cbm_rc=$?` wire is inside the
-    harness rather than bypassed by injecting `_cbm_rc` directly. MEASURED with
-    that wire replaced by `|| true`: install.sh rendered a pin/digest mismatch
-    as `+ codebase-memory-mcp installed/upgraded`.
-    """
+def test_normal_setup_does_not_install_upgrade_or_probe_raw_codebase():
+    """Managed staging owns the pin; ordinary setup never executes a PATH provider."""
     for script in (BOOTSTRAP, INSTALL):
-        block = _cbm_outcome_block(script)
-        stub_root = tmp_path / script.stem
-        (stub_root / "lib").mkdir(parents=True)
-        (stub_root / "lib" / "cbm_installer.sh").write_text(
-            'genesis_cbm_install() { return "${FAKE_CBM_RC}"; }\n'
-        )
-        rendered = {}
-        for rc in ("0", "1", "2", "3"):
-            proc = subprocess.run(
-                [
-                    "/bin/bash",
-                    "-c",
-                    f'set -euo pipefail\nSCRIPT_DIR="{stub_root}"\n'
-                    f'_cbm_disable="{stub_root}/no-sentinel-present"\n{block}',
-                ],
-                capture_output=True,
-                text=True,
-                env={"PATH": "/usr/bin:/bin", "FAKE_CBM_RC": rc},
-            )
-            assert proc.returncode == 0, proc.stderr
-            rendered[rc] = proc.stdout.strip()
-        assert "digest" in rendered["3"].lower(), (
-            f"{script.name}: a digest mismatch is not named — {rendered['3']!r}"
-        )
-        for other in ("0", "1", "2"):
-            assert rendered["3"] != rendered[other], (
-                f"{script.name}: a wrong pin renders identically to outcome {other} "
-                f"— {rendered['3']!r}"
-            )
+        code = "\n".join(line for line in script.read_text().splitlines() if not line.lstrip().startswith("#"))
+        assert "genesis_cbm_install" not in code
+        assert "cbm_installer.sh" not in code
+        assert "codebase-memory-mcp --version" not in code
 
 
 # ── CDPATH: `cd` SEARCHES it, and echoes what it resolves ────────────
@@ -789,6 +731,19 @@ def _assert_recovery_refused(proc: subprocess.CompletedProcess, state_path: Path
     assert state_path.exists(), "a refusal must retain update state"
 
 
+def _assert_refused_half_written(proc: subprocess.CompletedProcess, state_path: Path) -> None:
+    """A merging-phase refusal at the tag: the shared guard's half-written
+    verdict (#3492), whose message is the remedy (save, restore, Dismiss) and
+    says --post-merge refuses; the generic advice to finish forward is not added."""
+    output = proc.stdout + proc.stderr
+    assert proc.returncode == 1 and "REFUSE:" in output, output
+    assert "Current branch/HEAD:" in output and "holds part of an update's checkout" in output
+    assert "save any you want to keep" in output and "Dismiss" in output, output
+    assert "Do NOT run scripts/update.sh --post-merge" in output, output
+    assert "finish forward with" not in output, output
+    assert state_path.exists(), "a refusal must retain update state"
+
+
 def _assert_recovered(
     proc: subprocess.CompletedProcess, state_path: Path, root: Path, rollback: str
 ) -> None:
@@ -862,6 +817,9 @@ def test_update_state_persists_the_recovery_ownership_inputs(
         old_commit="abc",
         started_at="2026-01-01T00:00:00Z",
         services_stopped=services_stopped,
+        # Which kind of run wrote it: the restart guard reads a --post-merge's
+        # "fetching" as covering merged code (#3139).
+        post_merge=False,
     )
 
 
@@ -929,8 +887,8 @@ def test_unsafe_recovery_cases_refuse_without_moving_unowned_code(tmp_path, case
         assert "state is unreadable" in output
     if case == "fetching-at-deploy-head":
         assert (
-            "the checkout moved while the update was in phase 'fetching', "
-            "before it could have merged"
+            "the checkout is not at the rollback tag of an update that stopped in "
+            "phase 'fetching'"
         ) in output
     if case in {"empty-tag", "unresolvable-tag"}:
         assert "rollback tag" in output
@@ -1061,15 +1019,17 @@ def test_recovery_warns_at_tag_or_skips_a_live_process(
     )
 
     if case == "live-pid":
-        assert proc.returncode == 0, proc.stdout + proc.stderr
-        assert "still running" in proc.stdout
+        # A live process at the recorded pid, nothing holding update.lock: no
+        # update is running, so this is a crash; HEAD is not the merge it
+        # recorded, so recovery refuses and touches nothing (#3532 round 3).
+        assert proc.returncode == 1, proc.stdout + proc.stderr
+        assert "still running" not in proc.stdout and "not interfering" not in proc.stdout
         assert state_path.exists()
         assert _recovery_git(root, "rev-parse", "HEAD") == deploy
         return
     if phase == "merging":
         # Refuse a dirty checkout at the rollback tag after an interrupted merge.
-        _assert_recovery_refused(proc, state_path)
-        assert "tracked files changed during the merge" in proc.stdout + proc.stderr
+        _assert_refused_half_written(proc, state_path)
         assert _recovery_git(root, "rev-parse", "HEAD") == rollback
         assert local.read_text() == "operator edit\n"
         return
@@ -1093,8 +1053,7 @@ def test_a_merge_killed_writing_only_an_ephemeral_path_is_refused(tmp_path, phas
     (root / "AGENTS.md").write_text("index v2, half writ")
     proc, state_path = _recover(tmp_path, root, phase=phase, own_head="")
     if phase == "merging":
-        _assert_recovery_refused(proc, state_path)
-        assert "tracked files changed during the merge" in proc.stdout + proc.stderr
+        _assert_refused_half_written(proc, state_path)
         assert "AGENTS.md" in proc.stdout + proc.stderr
     else:
         _assert_recovered(proc, state_path, root, rollback)
@@ -1127,10 +1086,31 @@ def test_a_merge_killed_writing_a_flagged_path_is_refused(tmp_path, flag):
     (root / "changed.txt").write_text("half-written by the merge\n")
     assert _recovery_git(root, "status", "--porcelain") == ""  # really hidden
     proc, state_path = _recover(tmp_path, root, phase="merging", own_head="")
-    _assert_recovery_refused(proc, state_path)
-    assert "tracked files changed during the merge" in proc.stdout + proc.stderr
+    _assert_refused_half_written(proc, state_path)
     assert "changed.txt" in proc.stdout + proc.stderr
     assert _recovery_git(root, "rev-parse", "HEAD") == rollback
+
+
+@pytest.mark.parametrize("conflict", [True, False], ids=["conflict-exit", "killed-before-merge"])
+def test_a_merge_conflict_exit_is_not_recovered_as_a_crash(tmp_path, conflict):
+    """#3139: update.sh's conflict exit leaves "merging" at the tag plus
+    update_conflicts.json for the same commit. That is the resolver's anchor (its
+    rollback tag and old commit for the later --post-merge), not a crash: it is
+    kept and nothing is recorded. Without the conflict record it is a run killed
+    before its merge, recovered as before."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    dot = tmp_path / "home" / ".genesis"
+    dot.mkdir(parents=True)
+    if conflict:
+        (dot / "update_conflicts.json").write_text(json.dumps({"deploy_head": rollback}))
+    proc, state_path = _recover(
+        tmp_path, root, phase="merging", own_head=rollback, deploy_head=rollback
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert state_path.exists() is conflict
+    said = "stopped on merge conflicts" in proc.stdout
+    assert said is conflict, proc.stdout
+    assert ("Crash recovery complete" in proc.stdout) is not conflict
 
 
 @pytest.mark.parametrize("phase", ["activation", "", "MIGRATIONS", "health-check"])
@@ -1177,7 +1157,7 @@ def test_a_merge_killed_after_writing_only_new_files_is_refused(tmp_path):
     proc, state_path = _recover(
         tmp_path, root, phase="merging", own_head="", deploy_head=deploy
     )
-    _assert_recovery_refused(proc, state_path)
+    _assert_refused_half_written(proc, state_path)
     assert "migrations/0099_new.py" in proc.stdout + proc.stderr
     assert _recovery_git(root, "rev-parse", "HEAD") == rollback
 
@@ -1237,4 +1217,623 @@ def test_update_records_its_own_head_the_moment_it_adopts_the_merge():
     record = code.index('_write_state "merging"', adopt)
     between = code[adopt:record]
     assert "\nfi" not in between, "the state write must sit inside the adoption branch"
-    assert code.count('_write_state "merging"') == 2
+    # On `live` (#3370) the rebuilt tip is adopted the same way, in the merge's place.
+    live = code.index('UPDATE_OWN_HEAD="$_live_tip"')
+    assert "\nfi" not in code[live : code.index('_write_state "merging"', live)]
+    assert code.count('_write_state "merging"') == 3
+
+
+# ── Crash recovery is RECORDED in update_history (#2631) ─────────────
+
+
+def _migrated_genesis_root(tmp_path: Path, root: Path) -> Path:
+    """Give the recovery fixture a database built by the real migration chain.
+
+    The recording step runs ``PYTHONPATH=$GENESIS_ROOT/src python3`` against
+    ``$GENESIS_ROOT/data/genesis.db``, so the fixture root gets this checkout's
+    ``src`` (a git-excluded symlink: untracked, so recovery never sees it as an
+    edit) and a database that every shipped migration has run on — with HOME and
+    secrets sandboxed, since 0086 seeds a user config file.
+    """
+    import asyncio
+
+    import aiosqlite
+
+    from genesis.db.migrations.runner import MigrationRunner
+
+    (root / "src").symlink_to(REPO_ROOT / "src")
+    with (root / ".git" / "info" / "exclude").open("a") as fh:
+        fh.write("/src\n/data/\n")
+    db = root / "data" / "genesis.db"
+    db.parent.mkdir(parents=True)
+
+    async def _migrate() -> None:
+        async with aiosqlite.connect(str(db)) as conn:
+            results = await MigrationRunner(conn).run_pending()
+            assert results and all(r.success for r in results)
+
+    sandbox = tmp_path / "migrate-home"
+    sandbox.mkdir()
+    saved = {k: os.environ.get(k) for k in ("HOME", "SECRETS_PATH", "USER_TIMEZONE")}
+    os.environ["HOME"] = str(sandbox)
+    os.environ["SECRETS_PATH"] = str(sandbox / "isolated-secrets.env")
+    os.environ.pop("USER_TIMEZONE", None)
+    try:
+        asyncio.run(_migrate())
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    return db
+
+
+def _history(db: Path) -> list[tuple]:
+    import sqlite3
+
+    con = sqlite3.connect(db)
+    try:
+        return con.execute(
+            "SELECT status, old_tag, new_tag, rollback_tag, failure_reason FROM update_history"
+        ).fetchall()
+    finally:
+        con.close()
+
+
+def test_crash_recovery_records_a_crashed_recovered_row(tmp_path):
+    """The recovery's INSERT lands on a database built by the real migrations.
+
+    Before the fix the 0024 CHECK rejected 'crashed_recovered', the IntegrityError
+    was swallowed, and the table stayed empty."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    deploy = _recovery_commit_file(root, "changed.txt", "deployed\n", "deploy")
+    db = _migrated_genesis_root(tmp_path, root)
+    proc, state_path = _recover(tmp_path, root, own_head=deploy, deploy_head=deploy)
+
+    _assert_recovered(proc, state_path, root, rollback)
+    assert _history(db) == [
+        ("crashed_recovered", "", "", "rollback", "Crashed in phase: merging")
+    ]
+    assert "WARNING" not in proc.stdout + proc.stderr
+
+
+def test_a_failed_crash_record_is_reported_on_stderr_and_stays_non_fatal(tmp_path):
+    """A refused INSERT names its error on stderr; recovery still completes."""
+    import sqlite3
+
+    root, _, rollback = _recovery_repo(tmp_path)
+    deploy = _recovery_commit_file(root, "changed.txt", "deployed\n", "deploy")
+    db = _migrated_genesis_root(tmp_path, root)
+    con = sqlite3.connect(db)
+    con.execute("DROP TABLE update_history")
+    con.commit()
+    con.close()
+    proc, state_path = _recover(tmp_path, root, own_head=deploy, deploy_head=deploy)
+
+    _assert_recovered(proc, state_path, root, rollback)
+    assert "failed to record crash recovery" in proc.stderr
+    assert "no such table: update_history" in proc.stderr
+
+
+def test_a_crash_recovered_twice_from_the_same_state_is_recorded_once(tmp_path):
+    """A bootstrap killed after the INSERT commits but before the state file is
+    removed re-reads the same state; the row id is derived from that run, so the
+    second recovery adds nothing. A different run still gets its own row."""
+    root, _, rollback = _recovery_repo(tmp_path)
+    deploy = _recovery_commit_file(root, "changed.txt", "deployed\n", "deploy")
+    db = _migrated_genesis_root(tmp_path, root)
+    run = {"own_head": deploy, "deploy_head": deploy, "started_at": "2026-10-18T20:00:00+00:00"}
+    first, _ = _recover(tmp_path, root, **run)
+    assert first.returncode == 0, first.stderr
+    again, state_path = _recover(tmp_path, root, **run)  # same state, as if re-read
+    _assert_recovered(again, state_path, root, rollback)
+    assert len(_history(db)) == 1
+    other, _ = _recover(tmp_path, root, **{**run, "started_at": "2026-10-18T21:00:00+00:00"})
+    assert other.returncode == 0, other.stderr
+    assert len(_history(db)) == 2
+
+
+# ── a live row's move record, and the shared guard (#3492 gap 4) ───────────────
+
+
+def _guard_tests():
+    # Imported here: test_update_state_guard imports nothing from this module,
+    # but keep the dependency one-way and lazy.
+    from tests.test_scripts import test_update_state_guard as g
+
+    return g
+
+
+def _recover_with(
+    tmp_path: Path,
+    root: Path,
+    state: dict,
+    *,
+    scripts: Path | None = None,
+    token: int | None = None,
+) -> tuple[subprocess.CompletedProcess, Path]:
+    """The crash-recovery block over ``state``, as _recover runs it, with
+    GENESIS_HOME unset (update.lock is then under HOME) and, optionally, another
+    scripts directory (a stub guard)."""
+    home = tmp_path / "home"
+    path = home / ".genesis" / "update_state.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state))
+    script = (
+        '#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR="${RECOVERY_SCRIPTS:?}"\n'
+        'GENESIS_ROOT="${RECOVERY_ROOT:?}"\nUPDATE_STATE="$HOME/.genesis/update_state.json"\n'
+        '. "$SCRIPT_DIR/lib/deploy_marker.sh"\n. "$SCRIPT_DIR/lib/deploy_checkout.sh"\n'
+        '. "$SCRIPT_DIR/lib/deploy_recovery.sh"\nEPHEMERAL_BACKUP_ROOT="${TEST_BACKUP_ROOT:?}"\n'
+        + _crash_recovery_source()
+        + "\necho AFTER_RECOVERY\n"
+    )
+    env = _recovery_env(
+        HOME=str(home),
+        RECOVERY_SCRIPTS=str(scripts or REPO_ROOT / "scripts"),
+        RECOVERY_ROOT=str(root),
+        TEST_BACKUP_ROOT=str(home / ".genesis" / "premerge-backups" / "test-run"),
+    )
+    env.pop("GENESIS_HOME", None)
+    env.pop("GENESIS_BOOTSTRAP_UPDATE_PID", None)
+    if token is not None:
+        env["GENESIS_BOOTSTRAP_UPDATE_PID"] = str(token)
+    proc = subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, timeout=60, env=env
+    )
+    return proc, path
+
+
+def _live_state(d: dict, phase: str = "moving", **over) -> dict:
+    g = _guard_tests()
+    return {**g.live_row(d, phase), **over}
+
+
+def test_t4h_a_live_switch_killed_after_a_dropped_candidates_path_is_refused(tmp_path):
+    """T4h (S5a): HEAD at the tag, the record "moving", and F on disk (the path
+    a dropped candidate had deleted, which only the two-dot range names).
+    Recovery used to delete the state and continue: now it refuses, keeps the
+    state and touches nothing."""
+    g = _guard_tests()
+    d = g.diverged_live(tmp_path / "repo")
+    (d["root"] / "F").write_text("f\n")
+    proc, path = _recover_with(tmp_path, d["root"], _live_state(d))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1 and "REFUSE:" in out, out
+    assert "  ?? F" in out and path.exists(), out
+    assert _recovery_git(d["root"], "rev-parse", "HEAD") == d["old"]
+    assert (d["root"] / "F").read_text() == "f\n"
+    assert not g.post_merge_advice(out), out
+
+
+def test_t4g_bootstrap_refuses_a_real_diverged_switch_kill(tmp_path):
+    """T4g, bootstrap: the same over a real `git switch` SIGKILLed after F."""
+    g = _guard_tests()
+    d = g.diverged_live(tmp_path / "repo", tag_only=False)
+    g.kill_switch_after(d["root"], d["new"], "Z")
+    proc, path = _recover_with(tmp_path, d["root"], _live_state(d))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1 and "  ?? F" in out and path.exists(), out
+
+
+def test_t4i_a_rollback_killed_midway_back_to_the_tag_is_refused_with_the_guards_remedy(
+    tmp_path,
+):
+    """T4i (S18): HEAD on `live` at the rebuilt tip, a tag-only file written by
+    a rollback checkout killed partway. The guard's message, and nothing else:
+    put the paths back, then finish forward (HEAD is the tip, SF1); never the
+    generic line, and never a bare Dismiss."""
+    g = _guard_tests()
+    d = g.diverged_live(tmp_path / "repo")
+    _recovery_git(d["root"], "checkout", "-q", "-B", "live", d["new"])
+    (d["root"] / "O").write_text("o\n")
+    proc, path = _recover_with(tmp_path, d["root"], _live_state(d, "done"))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1 and "REFUSE:" in out and path.exists(), out
+    assert "  ?? O" in out and "save any you want to keep" in out, out
+    assert "finish forward with" not in out, "the generic remedy was added"
+    g.forward_message_is_true(out)
+
+
+def test_t4j_a_finished_live_move_is_told_to_finish_with_post_merge(tmp_path):
+    """T4j: HEAD on `live` at the rebuilt tip, nothing else written: the live
+    text (finish forward), not "the checkout is not at the merge it recorded"."""
+    g = _guard_tests()
+    d = g.diverged_live(tmp_path / "repo")
+    _recovery_git(d["root"], "checkout", "-q", "-B", "live", d["new"])
+    proc, path = _recover_with(tmp_path, d["root"], _live_state(d, "done"))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1 and path.exists(), out
+    assert "the update ran on live" in out and "rebuilt tip" in out, out
+    assert "scripts/update.sh --post-merge" in out, out
+
+
+def _stub_scripts(tmp_path: Path, rc: int) -> Path:
+    """scripts/lib as shipped, with update_state_guard.py replaced by a stub that
+    prints a line and exits ``rc`` (a guard that crashed or could not run)."""
+    scripts = tmp_path / "stub-scripts"
+    shutil.copytree(REPO_ROOT / "scripts" / "lib", scripts / "lib")
+    (scripts / "lib" / "update_state_guard.py").write_text(
+        f"import sys\nprint('STUB GUARD SAID THIS')\nsys.exit({rc})\n"
+    )
+    return scripts
+
+
+@pytest.mark.parametrize("rc", [0, 1, 2, 4, 126, 127])
+def test_t4k_recovery_at_the_tag_proceeds_only_on_the_guards_exit_10(tmp_path, rc):
+    """T4k (S-3): at the tag in "merging", bootstrap delegates to the shared
+    guard and proceeds ONLY on its exit 10; any other code, a crash (1), a usage
+    error (2) or a shell that could not run it (126, 127) included, refuses and
+    prints what the guard said (deploy_code_only.sh's rule)."""
+    root, _common, rollback = _recovery_repo(tmp_path)
+    state = {
+        "phase": "merging",
+        "rollback_tag": "rollback",
+        "original_branch": "main",
+        "own_head": "",
+        "deploy_head": "",
+        "pid": 2_147_483_647,
+    }
+    proc, path = _recover_with(tmp_path, root, state, scripts=_stub_scripts(tmp_path, rc))
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1 and "REFUSE:" in out, out
+    assert "STUB GUARD SAID THIS" in out and path.exists(), out
+    assert _recovery_git(root, "rev-parse", "HEAD") == rollback
+
+
+def test_t4k_control_the_guards_exit_10_proceeds(tmp_path):
+    root, _common, rollback = _recovery_repo(tmp_path)
+    state = {
+        "phase": "merging",
+        "rollback_tag": "rollback",
+        "original_branch": "main",
+        "own_head": "",
+        "deploy_head": "",
+        "pid": 2_147_483_647,
+    }
+    proc, path = _recover_with(tmp_path, root, state, scripts=_stub_scripts(tmp_path, 10))
+    assert proc.returncode == 0 and not path.exists(), proc.stdout + proc.stderr
+
+
+def _holding(lock: Path) -> subprocess.Popen:
+    holder = subprocess.Popen(["flock", str(lock), "sleep", "120"])
+    deadline = time.monotonic() + 30
+    while subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0:
+        assert time.monotonic() < deadline, "the holder never took the lock"
+        time.sleep(0.05)
+    return holder
+
+
+def test_t4l_an_update_lock_still_held_means_still_running(tmp_path):
+    """T4l (S-5): the state's pid is dead, but update.lock is held (an orphaned
+    engine keeps update.sh's fd): the update is still running, possibly mid
+    switch, so recovery does nothing and keeps the state, and bootstrap STOPS
+    there (#3532 round 1): nothing after it may install or rewrite config under
+    a move still in flight."""
+    root, _common, rollback = _recovery_repo(tmp_path)
+    home = tmp_path / "home"
+    lock = home / ".genesis" / "locks" / "update.lock"
+    lock.parent.mkdir(parents=True)
+    lock.touch()
+    holder = subprocess.Popen(["flock", str(lock), "sleep", "120"])
+    try:
+        deadline = time.monotonic() + 30
+        while subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0:
+            assert time.monotonic() < deadline, "the holder never took the lock"
+            time.sleep(0.05)
+        state = {
+            "phase": "merging",
+            "rollback_tag": "rollback",
+            "original_branch": "main",
+            "own_head": "",
+            "deploy_head": "",
+            "pid": 2_147_483_647,
+        }
+        proc, path = _recover_with(tmp_path, root, state)
+    finally:
+        holder.kill()
+        holder.wait()
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1 and "update.lock" in out, out
+    assert "AFTER_RECOVERY" not in out, "bootstrap went on under an update still running"
+    assert path.exists() and _recovery_git(root, "rev-parse", "HEAD") == rollback
+
+
+def test_t4l_update_sh_running_bootstrap_under_its_own_lock_goes_on(tmp_path):
+    """Control: update.sh runs bootstrap while it holds update.lock, naming
+    its own pid (GENESIS_BOOTSTRAP_UPDATE_PID), which its state records: the
+    normal path, and it must go on."""
+    root, _common, rollback = _recovery_repo(tmp_path)
+    lock = tmp_path / "home" / ".genesis" / "locks" / "update.lock"
+    lock.parent.mkdir(parents=True)
+    lock.touch()
+    holder = _holding(lock)
+    try:
+        state = {
+            "phase": "bootstrap",
+            "rollback_tag": "rollback",
+            "original_branch": "main",
+            "own_head": "",
+            "deploy_head": "",
+            "pid": os.getpid(),
+        }
+        proc, path = _recover_with(tmp_path, root, state, token=os.getpid())
+    finally:
+        holder.kill()
+        holder.wait()
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0 and "not interfering" in out and "AFTER_RECOVERY" in out, out
+    assert path.exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root opens a mode-000 file")
+def test_t4l_an_unopenable_update_lock_is_named_as_such(tmp_path):
+    """An update.lock bootstrap cannot open is "maybe held": it refuses, and says
+    the lock cannot be opened rather than telling the reader to wait for a
+    holder that may not exist."""
+    root, _common, rollback = _recovery_repo(tmp_path)
+    lock = tmp_path / "home" / ".genesis" / "locks" / "update.lock"
+    lock.parent.mkdir(parents=True)
+    lock.touch()
+    lock.chmod(0)
+    try:
+        state = {
+            "phase": "merging",
+            "rollback_tag": "rollback",
+            "original_branch": "main",
+            "own_head": "",
+            "deploy_head": "",
+            "pid": 2_147_483_647,
+        }
+        proc, path = _recover_with(tmp_path, root, state)
+    finally:
+        lock.chmod(0o600)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1 and "cannot be opened" in out, out
+    assert "AFTER_RECOVERY" not in out and path.exists()
+    assert _recovery_git(root, "rev-parse", "HEAD") == rollback
+
+
+def test_t4l_control_a_free_update_lock_recovers(tmp_path):
+    """Control: the lock file exists and nobody holds it; bootstrap never
+    creates it when it is absent."""
+    root, _common, rollback = _recovery_repo(tmp_path)
+    home = tmp_path / "home"
+    lock = home / ".genesis" / "locks" / "update.lock"
+    lock.parent.mkdir(parents=True)
+    lock.touch()
+    state = {
+        "phase": "merging",
+        "rollback_tag": "rollback",
+        "original_branch": "main",
+        "own_head": "",
+        "deploy_head": "",
+        "pid": 2_147_483_647,
+    }
+    proc, path = _recover_with(tmp_path, root, state)
+    assert proc.returncode == 0 and not path.exists(), proc.stdout + proc.stderr
+    lock.unlink()
+    proc, path = _recover_with(tmp_path, root, state)
+    assert proc.returncode == 0 and not lock.exists(), proc.stdout + proc.stderr
+
+
+def _zombie_pid() -> tuple[subprocess.Popen, int]:
+    """A child that has exited and is not reaped: `kill -0` still succeeds."""
+    child = subprocess.Popen(["true"])
+    deadline = time.monotonic() + 30
+    while True:
+        stat = Path(f"/proc/{child.pid}/stat").read_text()
+        if stat[stat.rindex(")") + 2] == "Z":
+            return child, child.pid
+        assert time.monotonic() < deadline, "the child never became a zombie"
+        time.sleep(0.02)
+
+
+@pytest.mark.parametrize("who", ["zombie", "reused", "wrong-token"])
+def test_r3_a_live_looking_pid_with_the_lock_held_refuses(tmp_path, who):
+    """P1: update.sh was killed; its pid is a zombie, or was reused by an
+    unrelated process. `kill -0` succeeds either way, and the old "still
+    running" branch went on with bootstrap under an orphaned engine holding
+    update.lock. Only bootstrap's own ancestor may hold it and go on."""
+    root, _common, rollback = _recovery_repo(tmp_path)
+    lock = tmp_path / "home" / ".genesis" / "locks" / "update.lock"
+    lock.parent.mkdir(parents=True)
+    lock.touch()
+    holder = _holding(lock)
+    zombie = None
+    try:
+        if who == "zombie":
+            zombie, pid = _zombie_pid()
+        else:
+            pid = holder.pid  # alive, unrelated to bootstrap
+        token = pid + 1 if who == "wrong-token" else None
+        state = {
+            "phase": "merging",
+            "rollback_tag": "rollback",
+            "original_branch": "main",
+            "own_head": "",
+            "deploy_head": "",
+            "pid": pid,
+        }
+        proc, path = _recover_with(tmp_path, root, state, token=token)
+    finally:
+        holder.kill()
+        holder.wait()
+        if zombie is not None:
+            zombie.wait()
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 1 and "update.lock" in out, out
+    assert "AFTER_RECOVERY" not in out, "bootstrap went on under an orphaned engine"
+    assert path.exists() and _recovery_git(root, "rev-parse", "HEAD") == rollback
+
+
+def test_r3_a_zombie_pid_with_the_lock_free_is_recovered_as_dead(tmp_path):
+    """A zombie is a dead update: with nothing holding the lock, crash recovery
+    runs (it used to say "still running" and skip it)."""
+    root, _common, rollback = _recovery_repo(tmp_path)
+    zombie, pid = _zombie_pid()
+    try:
+        state = {
+            "phase": "merging",
+            "rollback_tag": "rollback",
+            "original_branch": "main",
+            "own_head": "",
+            "deploy_head": "",
+            "pid": pid,
+        }
+        proc, path = _recover_with(tmp_path, root, state)
+    finally:
+        zombie.wait()
+    out = proc.stdout + proc.stderr
+    assert "CRASHED" in out and "still running" not in out, out
+    assert proc.returncode == 0 and not path.exists(), out
+
+
+def test_review_s3_update_sh_names_itself_on_its_bootstrap_call():
+    """#3532 round-3 review S3: without the token every update's bootstrap would
+    refuse (update.lock is held) and the update roll back. Pinned exactly."""
+    code = _code(UPDATE)
+    assert (
+        'GENESIS_BOOTSTRAP_UPDATE_PID="$$" GENESIS_BOOTSTRAP_ALLOW_LIVE=1 '
+        '"$GENESIS_ROOT/scripts/bootstrap.sh"'
+    ) in code
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root opens a mode-000 file")
+def test_review_n1_update_sh_s_own_call_survives_an_unopenable_lock(tmp_path):
+    """#3532 round-3 review N1: update.sh's own bootstrap (the token equals the
+    state's pid) goes on even when it cannot open update.lock to look: the
+    update holding it is the one that started this bootstrap."""
+    root, _common, rollback = _recovery_repo(tmp_path)
+    lock = tmp_path / "home" / ".genesis" / "locks" / "update.lock"
+    lock.parent.mkdir(parents=True)
+    lock.touch()
+    lock.chmod(0)
+    try:
+        state = {
+            "phase": "bootstrap",
+            "rollback_tag": "rollback",
+            "original_branch": "main",
+            "own_head": "",
+            "deploy_head": "",
+            "pid": os.getpid(),
+        }
+        proc, path = _recover_with(tmp_path, root, state, token=os.getpid())
+    finally:
+        lock.chmod(0o600)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 0 and "AFTER_RECOVERY" in out, out
+    assert path.exists()
+
+
+#: The bootstrap call of the update.sh every install runs ONCE against this
+#: tree: the one before the token, frozen in a temp copy before it merges
+#: (update.sh copies itself and execs the copy). Verbatim from
+#: scripts/update.sh at d67ee3369 (main before #3532, line 3100). Pinned,
+#: not read from origin/main, which carries the token once this merges.
+_PRE_TOKEN_CALL = (
+    'GENESIS_BOOTSTRAP_ALLOW_LIVE=1 "$GENESIS_ROOT/scripts/bootstrap.sh" 2>&1 | tail -10'
+)
+
+
+def _old_bootstrap_call() -> str:
+    """The previous update.sh's call, checked against this tree's: the same
+    line without the token this PR added."""
+    token = 'GENESIS_BOOTSTRAP_UPDATE_PID="$$" '
+    ours = _this_bootstrap_call()
+    assert token in ours, "this tree's call no longer names its pid"
+    assert ours.replace(token, "").strip() == _PRE_TOKEN_CALL, ours
+    return _PRE_TOKEN_CALL
+
+
+def _this_bootstrap_call() -> str:
+    return next(
+        ln
+        for ln in UPDATE.read_text().splitlines()
+        if '/scripts/bootstrap.sh" 2>&1 | tail' in ln and not ln.lstrip().startswith("#")
+    )
+
+
+def _under_update_parent(tmp_path, call: str, *, state_pid: str = "$$"):
+    """Run `call` the way update.sh runs it: from a bash that holds update.lock
+    and has written a state row whose pid is `state_pid` (shell text, default
+    its own $$). GENESIS_ROOT points at a tree whose bootstrap.sh is this
+    tree's crash-recovery block followed by AFTER_RECOVERY."""
+    root, _common, rollback = _recovery_repo(tmp_path)
+    home = tmp_path / "home"
+    (home / ".genesis" / "locks").mkdir(parents=True)
+    fake = tmp_path / "fake-root"
+    (fake / "scripts").mkdir(parents=True)
+    harness = fake / "scripts" / "bootstrap.sh"
+    harness.write_text(
+        '#!/usr/bin/env bash\nset -euo pipefail\nSCRIPT_DIR="${RECOVERY_SCRIPTS:?}"\n'
+        'GENESIS_ROOT="${RECOVERY_ROOT:?}"\nUPDATE_STATE="$HOME/.genesis/update_state.json"\n'
+        '. "$SCRIPT_DIR/lib/deploy_marker.sh"\n. "$SCRIPT_DIR/lib/deploy_checkout.sh"\n'
+        '. "$SCRIPT_DIR/lib/deploy_recovery.sh"\nEPHEMERAL_BACKUP_ROOT="${TEST_BACKUP_ROOT:?}"\n'
+        + _crash_recovery_source()
+        + "\necho AFTER_RECOVERY\n"
+    )
+    harness.chmod(0o755)
+    parent = (
+        "set -Eeuo pipefail\n"
+        'exec {_UPDATE_LOCK_FD}>"$HOME/.genesis/locks/update.lock"\n'
+        'flock -n "$_UPDATE_LOCK_FD"\n'
+        "sleep 120 & _other=$!\n"
+        "trap 'kill $_other 2>/dev/null || true' EXIT\n"
+        'printf \'{"phase": "merging", "rollback_tag": "rollback", '
+        '"original_branch": "main", "own_head": "", "deploy_head": "", '
+        f'"pid": %s}}\' "{state_pid}" > "$HOME/.genesis/update_state.json"\n'
+        f'GENESIS_ROOT="{fake}"\n' + call + "\necho PARENT_DONE\n"
+    )
+    env = _recovery_env(
+        HOME=str(home),
+        RECOVERY_SCRIPTS=str(REPO_ROOT / "scripts"),
+        RECOVERY_ROOT=str(root),
+        TEST_BACKUP_ROOT=str(home / ".genesis" / "premerge-backups" / "test-run"),
+    )
+    env.pop("GENESIS_HOME", None)
+    env.pop("GENESIS_BOOTSTRAP_UPDATE_PID", None)
+    proc = subprocess.run(
+        ["bash", "-c", parent], capture_output=True, text=True, env=env, timeout=60
+    )
+    return proc, proc.stdout + proc.stderr, root, rollback
+
+
+def test_upgrade_the_previous_update_sh_runs_this_bootstrap(tmp_path):
+    """#3532 upgrade path: the update that brings this change in is run by the
+    PREVIOUS update.sh (a frozen temp copy), which calls the NEW bootstrap its
+    own way: no token, holding update.lock, its pid in the state. Bootstrap must
+    take it as the update's own step (its parent is the recorded pid), or every
+    such update refuses, rolls back, and the next one does the same."""
+    call = _old_bootstrap_call()
+    assert "GENESIS_BOOTSTRAP_UPDATE_PID" not in call, call
+    proc, out, _root, _rb = _under_update_parent(tmp_path, call)
+    assert proc.returncode == 0 and "AFTER_RECOVERY" in out and "PARENT_DONE" in out, out
+    assert "not interfering" in out, out
+
+
+def test_upgrade_this_update_sh_s_token_carries_a_call_that_is_not_a_direct_child(tmp_path):
+    """The token is kept for robustness: this tree's own call goes on even
+    where bootstrap is not update.sh's direct child (here, run from a
+    subshell), because update.sh names its pid."""
+    call = _this_bootstrap_call()
+    assert 'GENESIS_BOOTSTRAP_UPDATE_PID="$$"' in call, call
+    proc, out, _root, _rb = _under_update_parent(tmp_path, "( " + call + " )")
+    assert proc.returncode == 0 and "AFTER_RECOVERY" in out and "not interfering" in out, out
+
+
+@pytest.mark.parametrize("who", ["hand-run", "reused"])
+def test_upgrade_only_the_recorded_pid_as_direct_parent_goes_on(tmp_path, who):
+    """No token, update.lock held. A hand run during a live update (its parent
+    is a shell, not the recorded update) refuses; so does a recorded pid that
+    is alive but is not bootstrap's parent (a reused pid)."""
+    if who == "hand-run":
+        # Two commands, so bash -c forks: bootstrap's parent is that shell.
+        call = 'bash -c ""$GENESIS_ROOT/scripts/bootstrap.sh"; exit \\$?" 2>&1 | tail -10'
+        proc, out, root, rollback = _under_update_parent(tmp_path, call)
+    else:
+        call = _old_bootstrap_call()
+        proc, out, root, rollback = _under_update_parent(tmp_path, call, state_pid="$_other")
+    assert proc.returncode != 0 and "REFUSE: an update holds update.lock" in out, out
+    assert "AFTER_RECOVERY" not in out, out
+    assert _recovery_git(root, "rev-parse", "HEAD") == rollback

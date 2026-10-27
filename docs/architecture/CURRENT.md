@@ -31,7 +31,8 @@ grown to 16 with 6 unnamed here, and nothing marked the list partial.)
 
 **Absence from this file is never absence in Genesis.** The map is deliberately
 incomplete. Verify by enumeration before any "Genesis lacks X" claim — the
-audit-by-enumeration protocol in the genesis-development skill.
+audit-by-enumeration protocol in the spec-session skill ("Auditing Existing
+Capabilities").
 
 **How this file stays honest.** Every entry claims its top-level
 `src/genesis` modules in a fenced `yaml subsystem-map` block and carries a
@@ -144,9 +145,31 @@ Easy-to-forget mechanisms:
   when the server can't answer. Latency budget: 4.5s server / 4.75s client
   (sized to the production engine's measured cold path — embed + a 1.0s
   rerank timebox + retrieval under load; see the #1169 timeout
-  investigation), inside the hook wrapper's 10s ceiling. The
+  investigation), inside the hook wrapper's 10s ceiling. The hook keeps to
+  that ceiling with an 8s soft deadline counted from process start and a
+  process-level hard stop at 8.5s (`scripts/hooks/hook_deadline.py`) that
+  ends a run stuck inside one step, with a one-line out-of-time notice and the
+  blocked frame on stderr, instead of being killed silently. Every run also
+  writes one `[hook-phases]` stderr line (`scripts/hooks/hook_phases.py`): the
+  milliseconds each step took, the container's pressure stall averages, and,
+  on a hard stop, the step that was cut. The
   `memory_proactive` MCP tool shares the engine but stays unfiltered/
   un-reranked.
+- **FTS term counts are bounded** (`db/crud/_fts.py` `bounded_terms`,
+  `FTS_MAX_TERMS`): the expanded query (`intent.expand_query`), the raw prompt
+  when it becomes the file-keyword lane's base (`_expand_fts_query`), and the
+  AND→OR retry (`or_fallback`) keep at most that many FTS5 tokens (32), counted
+  over every operand (repeats included) in the `porter ascii` tokenizer's units
+  (`fts5_tokens`: a snake_case word is one token per piece), filled with the
+  most frequent terms in the prompt. A query within the budget is unchanged. Without it
+  a long paste ORed every word, scored most of `memory_fts`, timed recall out and
+  spilled 60-190 MiB temp sorts. The strict AND first pass is de-duplicated when over the budget (`and_pass`): it
+  matches the same rows, and a repeated-word paste no longer costs seconds per
+  recall (measured 2026-10-09 on a synthetic 20k-row in-memory table: 400 repeated
+  operands 12.7 s, de-duplicated 0.04 s). Accepted cost: on
+  long prompts the top results shift (median 29% overlap with the unbounded
+  ranking, measured 2026-10-08). The tag co-occurrence index also skips the
+  `session_note` tag (on ~59% of rows), which otherwise widened every expansion.
 - `procedure_recall` deliberately uses Jaccard tag-overlap
   (`learning/procedural/matcher.py find_relevant`), not hybrid retrieval.
 - External-world recall results are provenance-wrapped (`wrap_external_recall`)
@@ -209,8 +232,9 @@ any live flip. Centrality persistence widened from top-500 to all-nonzero
 a real bridge-node population; `centrality_cache` gains its first reader.
 
 **Graph backend is a SEAM (`memory/graphstore.py`)** — traversal and centrality
-run through a `GraphStore` protocol with one implementation today,
-`NetworkxGraphStore` (the in-process MultiDiGraph projection of `memory_links`);
+run through a `GraphStore` protocol with two implementations: the default
+`NetworkxGraphStore` (the in-process MultiDiGraph projection of `memory_links`)
+and `FalkorGraphStore` (below);
 `memory/graph.py` is a facade that owns the single production instance and the
 backend choice. The contract, and the reason the seam exists: a read that cannot
 REACH its store RAISES `GraphUnavailableError` and never returns empty — empty
@@ -246,6 +270,121 @@ docs (2026-09-07): only the NAMED-PATH form works for hop-wise filtering, the
 engine has NO temporal types despite its own documentation listing them, and a
 loading engine answers `BusyLoadingError` — which is unavailable, never empty.
 Acceptance: 400 live roots replayed through both stores, 0 node-set differences.
+The FalkorDB projection is rebuilt hourly by `genesis-graph-project.timer`
+(`memory/graphstore_project.py`); that schedule is its staleness bound, and an
+engine restart leaves no projection until the next run (the engine keeps no data
+on disk). Before the swap, the projector runs the callers' own traversal and
+marker queries on the new graph (`graphstore_falkor._WARM_TRAVERSALS`) and prints
+the outcome (`warm-up: ...`) in the unit's journal. Engine time for the first
+read of a freshly projected graph was 52-358 ms where later reads took 1-3.5 ms,
+and each read timeout recorded from 2026-10-21 to 2026-10-26 was that first read
+during a container I/O stall; with the warm-up the first read took 1.2-2.9 ms in
+15 of 15 test runs. A warm-up that fails logs a warning and publishes the graph
+cold.
+
+ At runtime only `graph.traverse()` READS the engine (the projector
+writes it, the health probe pings it): its callers are `memory_recall`
+enrichment (MCP, and genesis-server's tool API), `memory_expand`, and
+`drift_recall` (MCP drift mode and the ambient worker). Recall's own graph step (`graph_expansion.py`) reads
+`memory_links` through SQL and never touches it.
+**Every traversal outcome is recorded** for the default-on cutover (owner gate:
+14 days in falkordb mode with zero fallbacks): `eval_events` rows
+(`event_type="graph_traverse"`, `dimension="system"`) built by
+`memory/graph_telemetry.py`, one per caller call, with the configured mode, the
+store that answered, and the exception class of any fallback, selection failure
+or error. Each such event also names the process at that moment (pid, start
+ticks, age) and, for a read that timed out, the store's own account
+(`GraphUnavailableError.diag` from `graphstore_falkor._bounded`): its budget,
+how far past the deadline it fired (`late_ms` — large means the caller's event
+loop was held, about zero means the engine did not answer), the function names
+and lines of the 16 innermost awaits it cancelled, the connection the client's
+pool was about to hand out (`conn`: `no_client`, `new`, `idle_open` or
+`idle_closed`, read before the read; `in_use`: reads already in flight), and the
+container's PSI stall time across the wait. The report names the phase those
+frames put the wait in (`construct`, `connect` or `reply`; a row from before the
+connection reading prints `unknown` unless its frames alone name the leg). Rows carry `primary_ms`, a latency spread of answered traversals per store, and
+the report prints each reset's cause. The engine unit keeps its own record of
+slow moments (`--slowlog-max-len 4096`, `--latency-monitor-threshold 100`).
+A call's first fallback, selection failure or error is also written as
+its own row the moment it happens, so a process killed mid-request cannot lose the
+evidence that the clock broke. A row that fails to write is carried as
+`prior_write_failures` on the next row and appended to
+`~/.genesis/telemetry/graph_traverse_lost_writes.jsonl`, which outlives the
+process. `graph_traverse_prune` deletes rows, and file lines, older than 30 days;
+kill switch `GENESIS_GRAPH_TELEMETRY_DISABLED=1`.
+The fallback WARNINGs alone could never answer this: MCP servers log to stderr,
+which never reaches the journal.
+A memory server started before that code was deployed traverses without writing
+anything, so genesis-server also runs an **hourly census** (`graph_traverse_census`
+job, `:45`, `memory/graph_census.py`): one `eval_events` row
+(`event_type="graph_traverse_census"`) listing each live
+`genesis_mcp_server.py --server memory` process with its start time, every
+commit the main checkout has held since it started (read by
+`scripts/lib/serving_commit.py`, the reader the deploy scripts use, which refuses
+on a reflog gap, a move in the start second, a clock step back or git's expiry
+cutoff), whether ALL of them contain the telemetry module (a module imported
+after start loads whatever is on disk then), plus whether HEAD has the module
+and whether `src/genesis/memory/` is dirty. Git runs with `--no-optional-locks`,
+so the hourly read never takes the index lock a deploy needs. Since schema 2
+("conservative unknowns", rules in `memory/graph_census_proof.py`) a server's row
+is clean only when three more things are PROVEN, each derived the way that
+server derives it, never from the census process's own state: its code source
+(its `argv[0]` is in main's `.venv/bin` and the `pyvenv.cfg` CPython finds from
+that raw path is main's, it runs main's own server script, no
+`PYTHONEXECUTABLE` or dotted `-W`/`PYTHONWARNINGS` category is set, and nothing
+that venv's site-packages, the directories its `.pth` files add (main's `src`
+included, searched for customize modules), `PYTHONPATH`, the script's directory
+or the system `sitecustomize` can load replaces main's `genesis` or any module
+the server imports at runtime), its kill switch (what
+it runs with: the memory lifespan's router reloads its secrets file with
+`override=True`, so a key the file carries beats the exec-time value; the file
+counts only if it and every symlink met resolving it, including links inside a
+link's own target, are unchanged by ctime since the server started, and a
+missing or changed file is unknown, except that a file changed only in keys the
+census does not read is carried: each row records `secrets_digest`, a hash of
+the six keys it reads, and the next census proves a changed file whose current
+values hash the same for the same pid and start (`carried: true`; the latest
+census row only; never when the file names `SECRETS_PATH` or
+`GENESIS_REPO_ROOT`)), and its database
+scope (the primary database is fixed at import from the exec env or the root
+default, and a path in the file becomes a second one; `foreign` only when every
+one of them differs from the live database by `(st_dev, st_ino)`, no symlink on
+those paths changed since the server started, and none of its open descriptors
+is the live database, since the open handle is what a long-lived connection
+uses; unreadable descriptors are never foreign; and only for a server whose
+code is proven). The census host must also hold the live database it names
+open (`live_db_moved` otherwise). The threat model is accidental drift (owner
+ruling): deliberately constructed inputs, such as a swapped ancestor directory
+or forged bytecode, are documented residuals in the module docstring. Anything unproven
+lands in `unknown_reasons` or `telemetry_off: null`, and the verdict reads the
+row as not clean, so the clock waits for that server to restart. Since schema 3
+the census covers the other traversal producers it can see in `/proc`, not
+only memory servers:
+- ambient workers: the same source proof against main's worker script, with the
+  switch and database taken from the launch environment, since the worker loads
+  no secrets file;
+- the census host's own row, proven from where its genesis modules actually
+  loaded;
+- any other python process on main's venv (found by its absolute interpreter
+  path, or by resolving a bare `python` through its own PATH): history and
+  database scope only (owner ruling);
+- replay, listed as excluded because it is not live traffic (owner ruling);
+- another bridge or server beside the host, always dirty.
+
+A census-level `head_history_telemetry` checks every commit HEAD held in the
+last 2h30m, so the CODE HISTORY of a process that lived and died between two
+censuses is still covered; its source and switch are not. Every producer row
+uses the memory servers' database rule above. The cutover clock can only start
+at a census with no producer that could be running older code; a row of an older schema reads dirty
+("predates the current census contract"). Pruned with the telemetry rows.
+**The verdict** is `scripts/graph_cutover_report.py` over the pure
+`memory/graph_cutover.py`: PASS needs 14 days on the clock, at least 100
+falkordb-served traversals and falkordb traffic on at least 10 UTC days in the
+last 14. Outcomes are an allowlist (`primary` counts, `cancelled` is neutral but
+reported, anything else restarts the clock, as do a non-falkordb `configured` or
+`served`, a dirty census row and a census gap over 2h15m). Lost writes, an
+unreadable row, a stale or missing census, or telemetry switched off make it
+INCONCLUSIVE. Exit 0/1/2 = PASS/NOT_YET/INCONCLUSIVE, 3 = the report failed.
 
 Freshness has one stated boundary: all 13 `invalidate_graph_cache()` sites are
 `memory_links` writers, while the visibility predicate below reads
@@ -340,10 +479,36 @@ unclassified row never expires.
 Spawning, tracking, and recovering Claude Code sessions — Genesis's hands for
 any task bigger than an LLM call.
 
+Machine connectors can adopt a prepared `cc_sessions` receipt through the same
+native runner (`cc/managed_session.py`, `DirectSessionRunner.adopt`), rather than
+adding another execution queue. This opt-in mode registers before start hooks,
+uses the existing background breaker plus a fail-closed effective ceiling,
+keeps external unattended provenance, and supervises cancellation/deadline
+cleanup. Structured terminal state and private full artifacts distinguish model
+failure/partial output from legacy completion. Receipt retention and boot orphan
+reconciliation prevent automatic replay; live registered work is excluded from
+the stale reaper. It is a native primitive, not an enabled peer transport. See
+`docs/reference/native-managed-sessions.md`.
+
+Roster-eligible managed API turns now select a provider through enforced
+tool-disabled, empty-MCP readiness checks before executing their task once.
+Only provider refusals advance the configured roster; post-start failure never
+switches providers or parks work. Preflight consumes the original deadline and
+held native capacity. Selection/endpoint attribution uses one roster snapshot,
+with additional metadata writes on an owned DB connection. The recovery worker
+shares the OAuth-compatible readiness helper. `cc_fallback` is a non-routing
+**Fallback** observation in the neural monitor for conversations and managed
+turns; actual committed outcomes, not readiness alone, establish success.
+
+Ordinary streaming and readiness share final-effective quota classification:
+allowed/warning and explicitly usable overage are not refusals, and a later
+allowed event supersedes a rejection. Result and no-result streaming paths
+preserve usable answers, real refusal health and dropped-output replay guards.
+
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: 6aae986bb 2026-10-04
+verified: a8fa35a35 2026-10-23
 ```
 
 - **Foreground model billing routes** (`scripts/gmodel`, `cc/gmodel_routes.py`,
@@ -907,10 +1072,34 @@ treats `start == end` as off, matching `ego/cadence.py`), so nothing delays an
 owner-facing send by default. The salience thresholds and the shared daily cap
 are the other timing/volume controls on that path.
 
+Governance can also DROP an owner-facing send as a duplicate, writing no history
+row (`GovernanceGate._is_duplicate`). Inside the signal type's window
+(`_DEDUP_WINDOWS`, default 24 h; 0 turns dedup off), a delivered row with the same
+`(signal_type, topic, category)` suppresses it, and so does one with the same
+signal type, category and `content_hash` (SHA-256 of the first 200 characters of
+`context`, topic ignored). The content-hash match is skipped for the signal types
+whose topic is the message identity (`_TOPIC_IS_IDENTITY`: `queued_alert`,
+`morning_report`, `career_outreach_nudged`, `peer_message`) and for any empty or whitespace-only
+context. Before that exemption, at least 3 of a live install's 84 recorded
+morning-report job runs (mid-July to October) delivered nothing this way: the
+next day's report finished drafting a few seconds sooner, fell inside the 24 h
+window, and opened with the same 200 characters. For a queued alert the topic is
+`alert:<dedupe_key>`, or `alert:<source>` when the producer passed no key, so a
+keyless producer's distinct alerts still collide on the topic check. `backup.sh`
+gives a repeated failure one dedupe key with `alert_stable_key`
+(`scripts/lib/alert_queue.sh`), which leaves the per-run
+`Time:`/`Duration:`/`SQLite lines:` lines out of the hash.
+
+Peer messages use their peer/epoch/message identity as the topic. Every
+`agent_send` first reserves the existing pending queue; the adapter checks its
+immutable payload and canceled/dequeued state before committing a new outbox
+message. Collection ACKs and peer traffic are excluded from human engagement
+judgments, without changing outbound governance or granting authority.
+
 ```yaml subsystem-map
 entry: autonomy-egress
 modules: [autonomy, outreach, distribution, content, campaigns]
-verified: d6edbcc6 2026-09-11
+verified: 0164dd1f0 2026-10-14
 ```
 
 - **The chokepoint is `outreach/pipeline.py _deliver`** — ~12 send paths
@@ -1095,7 +1284,7 @@ Note: the *learning* package hosts the other big scheduler (see entry 10).
 ```yaml subsystem-map
 entry: scheduling-background
 modules: [surplus, scheduler, follow_ups]
-verified: 50b79ffb 2026-09-01
+verified: a8fa35a358bc 2026-10-23
 ```
 
 - **Surplus generators are deliberately BLIND to `infrastructure_alert`
@@ -1136,7 +1325,12 @@ verified: 50b79ffb 2026-09-01
   distinct labels classified `external_untrusted` (wrapped on recall).
 - **`scheduler/` (top-level package) is the UserJobScheduler** — user-authored
   cron jobs (via MCP) that dispatch background DirectSessions. Distinct from
-  `surplus/scheduler.py`.
+  `surplus/scheduler.py`. Saved `active` is desired intent, while MCP/dashboard
+  `registered` derives current membership in the running scheduler. Failed
+  create registration retains the saved ID; retry `resume` on that ID or the
+  next startup reloads active intent. There is no automatic in-process
+  registration retry loop. Dispatch history `passed` means spawn accepted,
+  not session completion or delivery. See [user-job recovery](../reference/user-jobs.md).
 - `follow_ups/` = accountability ledger + dispatcher (every 5 min) that turns
   follow-ups into surplus tasks; retention sweep on the learning scheduler. The
   `follow_up_create` MCP tool routes USER-OWNED and purely-local operational work
@@ -1339,10 +1533,63 @@ Every surface a human (or host process) talks to Genesis through.
 
 ```yaml subsystem-map
 entry: channels-interfaces
-modules: [channels, dashboard, mcp, hosting, browser, mail]
-verified: 637f7f7bb679 2026-10-05
+modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
+verified: 74c474c0f 2026-10-24
 ```
 
+The neural monitor includes the non-routing **Fallback** observation, and the
+dashboard labels the shared fallback indicator as last successful/observed use.
+Individual managed provider selection remains scoped to its native receipt;
+the shared banner is not an assertion about all concurrent sessions.
+
+- **peers/**: operator-managed SQLite registry, explicit SAM/fallback authentication,
+  pinned node/realm/principal and scoped credentials. Disabled by default; no
+  implicit capability grants. Enrollment requires no daily task budget; the
+  deprecated allowance field remains only for database compatibility. Local
+  `genesis peers` CLI writes relationships; `/v1/agent/a2a/health` authenticates
+  through the existing runtime loop. The Agent Card returns `503 not_ready`
+  until the conversation service below is installed and ready.
+  Revocation disables access immediately; only active peer credentials contribute
+  to fallback readiness, while inactive credentials still participate in scope
+  collision checks. Scope checks also reject equality with loaded active/fallback
+  Flask signing keys, without request-time credential-file reads.
+  Local readiness reads a consistent, read-only registry snapshot and reuses
+  conversation admission's runner/database checks. Intentional disablement has
+  its own startup/capability status and does not count as a deploy regression.
+  Health snapshots and the existing minute status writer report current readiness
+  independently of the boot manifest. External health accepts only a sample from
+  the active primary server's MainPID observed within 90 seconds. Authenticated
+  health probes return 503 with readiness details when enabled but unready.
+  The existing awareness tick records readiness incidents and sends ordered
+  outage/recovery Telegram notices. Unknown readings preserve an open incident;
+  deliberate disablement closes it quietly. Incident/phase delivery history
+  supplies durable retry deduplication without a second queue.
+  `peers/conversation.py` serves same-owner asynchronous A2A conversations on the
+  existing Flask/runtime loop: it atomically persists native receipts, binds
+  contexts and retries to relationship epochs, and admits at most two
+  outstanding peer turns globally and per peer, without a daily submission
+  quota. Fresh native turns use Genesis identity/cognition, available memory
+  enrichment, observe/interact tools, external unattended provenance and the
+  native background ceiling. Result heads and full artifacts have bounded
+  disclosure checks. Approval attribution survives notification updates; the API
+  lists pending owner actions and never resolves them.
+  Native receipts record their public-state clock through transactional native
+  and attributed-approval triggers. Get/List share state, timestamp and pending
+  approvals in one authorized snapshot; List uses timestamp/ID ordering and an
+  opaque issued-position cursor scoped to peer/epoch/context. Heartbeats do not
+  bump public status, and incomplete projections fail readiness explicitly.
+  Presented peer/backend bearers are refused before owner mutation shortcuts. Deployment/enrollment and
+  connector-only ingress verification are separate prerequisites. No new listener
+  or peer execution queue. See `docs/reference/peer-registry.md` and
+  `docs/reference/agent-conversations.md`.
+  `peers/outbox.py` retains addressed A2A messages for collection, with scoped
+  idempotent ACKs and atomic first-reply correlation in the native receipt.
+  `channels/agent_adapter.py` queues locally through ordinary outreach governance;
+  `agent_send` is denied to observe/restricted mail profiles and available to
+  permitted interact turns. Pending/deferred delivery preserves typed message
+  identity. ACKs confer no owner engagement or approval. This is a pull channel,
+  not an HTTP sender or new listener; the separately operated peer client must
+  durably deduplicate before ACK/execution. See `docs/reference/agent-outbox.md`.
 - **channels/**: adapter framework. Telegram (`bridge.py` =
   `genesis-bridge.service`, boots a full runtime — LEGACY FALLBACK ONLY:
   it yields at startup, exit 200, when the genesis-server process lock is
@@ -1375,10 +1622,20 @@ verified: 637f7f7bb679 2026-10-05
   `per_device` scope; default `global`.
 - **dashboard/**: Flask blueprint at `/genesis` (~53 route modules);
   `_async_route` bridges sync Flask onto the runtime event loop; heartbeat
-  thread detects degraded-but-alive Flask; web terminal.
+  thread detects degraded-but-alive Flask; web terminal (its WebSocket accepts
+  same-origin handshakes only: `routes/terminal._refuse_cross_origin_terminal`).
   **Auth posture — API READS ARE OPEN BY DEFAULT, and this is the fact auditors
-  keep rediscovering.** Exactly two `before_request` hooks exist, and between
-  them they leave a gap: `auth._check_auth` is blueprint-level and gates HTML
+  keep rediscovering.** Two app-level hooks act on API reads, and neither
+  authenticates: `host_gate.check_host_header` refuses a request whose Host header
+  does not name this machine (IP literal, `localhost`, its hostnames, its
+  Tailscale name, or `GENESIS_DASHBOARD_ALLOWED_HOSTS`; `/v1/*` is out of
+  scope, and the supervisor's network-open routes pass by IP; it is not a cross-site
+  control, because a page can aim a request at an IP address), and
+  `auth.check_api_network_scope` refuses an untrusted TCP peer (loopback and
+  the tailnet are trusted, and the host's proxy delivers LAN traffic as
+  loopback). Both are registered by `auth.apply_dashboard_gates`, which the
+  standalone host and the Agent Zero server-startup extension both call. The
+  credential hooks leave a gap: `auth._check_auth` is blueprint-level and gates HTML
   pages only, returning None for any `/api/` or `/v1/` path;
   `auth.check_api_mutation_auth` is app-level and returns None for
   GET/HEAD/OPTIONS. So a dashboard password does protect the blueprint's HTML
@@ -1388,8 +1645,8 @@ verified: 637f7f7bb679 2026-10-05
   anyone (a static shell whose data comes from the open API reads below). It
   protects the MUTATION routes only while the `GENESIS_DASHBOARD_API_AUTH` kill
   switch is on (the default); set to off, `check_api_mutation_auth` returns
-  before any credential check. And **no request hook gates an API read on any
-  install, configured or not.** A GET under the API prefixes (`/api/genesis/`
+  before any credential check. And **no request hook requires a credential for
+  an API read on any install, configured or not.** A GET under the API prefixes (`/api/genesis/`
   and `/api/t/`) is therefore anonymous unless its own handler adds a
   predicate, and only a small minority do (`routes/references.py` is one: its
   `_auth_or_403` does refuse an anonymous caller once a password is set).
@@ -1408,10 +1665,61 @@ verified: 637f7f7bb679 2026-10-05
   `cc/session_config._MCP_PROFILES`. `genesis-health` is the big one (~35 tool
   modules). `standalone_health.py` serves from `~/.genesis/status.json` when no
   live runtime (stale-but-functional).
-  External Codebase has explicit pinned configuration staging/diagnostics in
-  `scripts/codebase_managed.py`; staging does not activate it or alter the
-  existing indexing route. See `docs/reference/codebase-managed.md`.
-- **hosting/**: the OUTER layer that calls the runtime. `standalone.py` is the
+  External Codebase has pinned configuration staging/diagnostics and bounded
+  native query unit entry points in `scripts/codebase_managed.py`.
+  Status separately observes conditional queue initialization-lock prerequisites
+  without opening the queue or changing current-schema availability.
+  Install and bootstrap render disabled query/client-slice templates without
+  auto-upgrading a PATH provider. Staging does not activate it; MCP registration always uses
+  the managed launcher, including absent PATH binaries. Queued indexing uses the
+  existing durable queue and an exact-build native worker in a separate
+  8 GiB, zero-swap scope, with final managed admission and canonical repository
+  locks. This does not activate the service or establish production capacity
+  or unattended resource-failure readiness. See
+  `docs/reference/codebase-managed.md`.
+  The queue's `scripts/lib/index_marker_legacy.py` isolates malformed legacy
+  artifacts in retained import receipts without replacing business failures;
+  real filesystem/SQLite errors remain visible. Schema 2 upgrades metadata
+  atomically and older writers refuse it. The marker CLI `import-status`
+  observes receipt totals without initialization or migration. This does not
+  implement persistent resource quarantine or the runner's separate list/claim
+  error propagation.
+  Whole-install removal enters the same fixed guarded transaction from direct
+  and host cleanup: runner/repository/lifecycle locks survive exec and all root
+  deletions; native query/client cgroup proof and orphan-scope checks precede
+  cleanup regardless of configuration validity. External configured state and
+  foreign symlink targets are retained. Host cleanup uses the container user's
+  default coordination namespace unless an explicit `--container-genesis-home`
+  names an external namespace; literal argv assigns it after login initialization.
+  No live-install removal acceptance is
+  claimed by isolated fixture tests.
+  Native enable/disable/remove share the fixed exclusive lifecycle lock. Enable
+  validates installed immutable state, typed backend commands/caps and loaded
+  client slice limits; it requires initial quiescence, enables without starting,
+  revalidates after reload, then starts and proves readiness.
+  Source authority rejects configuration and implicit dependency namespaces at
+  full-name, dash-prefix and unit-type scopes across native lookup paths.
+  Failed startup attempts the same canonical-source retirement as disable/remove: inspect both
+  fixed sources before a validated reload and refuse unsupported definitions.
+  Supported canonical retirement remains usable without valid settings or the
+  selected interpreter, proves actual quiescence and preserves immutable state.
+  Remove unlinks fixed artifacts only after validating the full population;
+  partial unlink failures refresh only after proving quiescence and accepted
+  remaining sources. Managed frontends use the installed interpreter and
+  normalized HOME, preserve literal paths through a fixed environment bridge,
+  and prove shared admission and kernel caps inside the transient child:
+  256 MiB/zero swap/Tasks32 under a 2 GiB/zero-swap/Tasks512 aggregate. They
+  retain fixed analysis tools, permanent PID readiness and native stop
+  propagation without backend activation or a raw fallback. Their own-cap OOMs
+  use the existing counted containment policy; uncertain or ancestor-limit
+  events still page, and explicit operator overrides remain. Queued-worker
+  admission integration remains separate.
+- **hosting/**: the OUTER layer that calls the runtime. Standalone's scoped peer
+  request-input handler provides a trusted 256 KiB body reader with a five-second
+  absolute deadline on peer send/cancel POST paths. It bounds framing and refusal
+  cleanup while preserving the configured listener and ordinary-route/WebSocket
+  policies; it does not activate the peer API. See
+  [peer request input](../reference/peer-request-input.md). `standalone.py` is the
   default (`python -m genesis serve`; also hosts the OpenClaw
   `/v1/chat/completions` endpoint, and registers the desk brain at
   `/v1/desk/chat/completions` — `dashboard/routes/desk_api.py`, an
@@ -1426,11 +1734,131 @@ verified: 637f7f7bb679 2026-10-05
   All `/v1` bearer reads go through `genesis.env.bearer_token`. Text-only, and an
   empty completion is a 502 rather than a blank turn); Agent Zero adapter
   optional.
-- **browser/**: profile/state layer only (persistent
-  `~/.genesis/browser-profile`, `BrowserLayer` enum (the navigate result's
-  `layer` values, numbered as in `mcp/health/browser.py`), pgrep patterns as
-  the single source of process detection). The automation TOOLS live in
-  `mcp/health/browser.py`.
+- **browser/**: profile/state layer (`profile.py` reads and clears
+  cookies in BOTH local profiles, `~/.genesis/camoufox-profile` and
+  `~/.genesis/browser-profile`, matching domains by whole label and refusing to
+  edit a profile another process has open; the cookie tools use the live
+  browser context instead when this process runs that browser),
+  `BrowserLayer` enum (the navigate result's `layer` values, numbered as in
+  `mcp/health/browser.py`), pgrep patterns as the single source of process
+  detection, plus two launch guards:
+  `engine.py` resolves the Camoufox binary every launch passes as
+  `executable_path` (camoufox's own read-only selection; never its in-launch
+  delete-and-download), also asked by the `browser_automation` capability in a
+  subprocess; `packages.py` refuses a launch on browser modules pip replaced
+  under the process. Before the browser tools launch Camoufox or the Chromium
+  fallback, `profile_backup.py` copies the profile to
+  `<profile>.pre-v<version>-<time>` when a different browser build is about to
+  open it (the profile's own record against the engine's; caches and locks left
+  out, launch locks only at the profile root; a copy the profile changed under is
+  discarded, and so is one whose own record is not the version its label names;
+  a copy whose files still match the profile's makes a second copy unnecessary,
+  so a launch that never opened the profile makes no second one; a lock beside
+  the profile makes concurrent sessions copy once; a copy never moves the disk
+  into the disk guardian's ORANGE or RED free-space tier, judged by the guardian's
+  own `dg_floor_tier` through `util/disk_headroom.py` (time-to-full left out: the
+  copy's own burst would raise it), though a disk already ORANGE
+  still gets one; never stops the launch, though a launch waits up to 10 minutes
+  for another session's copy of the same profile).
+  `scripts/browser.py` copies too when it can import Genesis (else it says so and
+  launches without a copy). The Chromium fallback and that CLI run
+  through patchright when installed. `scripts/disk_hygiene.sh` keeps
+  the newest copy per profile, and the newest per version for 90 days. Once
+  the paired Camoufox engine has been in use 14 days, it also removes older
+  engine versions and the pre-0.5 root engine (`scripts/prune_browser_engines.py`
+  decides; none while an override or `camoufox set` choice is in effect or access
+  times are not kept, never an engine a running browser uses, the one the browser
+  profile last ran, or one launched in 14 days, never camoufox 0.5's own files).
+  Every install gets the `browser` extra (pinned camoufox 0.5.7+, playwright and
+  patchright on one minor): bootstrap.sh and install.sh install it after the core
+  packages, never fatally (`venv_setup.sh` `install_browser_extra`, checked by
+  `provision.py check-packages`). `provision.py` (run by
+  `scripts/install_browser_stack.sh`: unit `genesis-browser-stack.service`, which
+  bootstrap starts without waiting and its daily timer retries; inline in
+  install.sh) installs what the tools launch: the
+  engine the camoufox package pairs with (only from camoufox 0.5.7: 0.4's fetch
+  empties the cache and 0.5.3-0.5.6 have no pin), the Chromium the fallback
+  launches (`chromium.py`: patchright's when installed, else playwright's; where
+  it lives is asked of the package's own `install --dry-run`, and a build counts
+  only with its marker AND executable, a broken one repaired by upstream's
+  `install --force`), and their system libraries (`install-deps` through
+  `sudo -n`, else the command is printed). Free space is checked on every
+  destination with the disk guardian's effective figure (`util/disk_headroom.py`);
+  every step's timeout comes off one run budget inside the unit's limit. One
+  outcome line; a re-run is a no-op. The Chromium launches refuse with the
+  operator step while their build is not installed: the MCP fallback judges it at
+  the executable its started driver names, the CLI where the package's dry-run says
+  the headless shell lives. The `browser_automation` capability is probed when
+  genesis-server starts, so after an update that pins a new engine it reads
+  degraded until the next restart after the unit finishes (documented, not
+  refreshed). The automation TOOLS live in
+  `mcp/health/browser.py`: each layer (Camoufox, Chromium, remote CDP,
+  TinyFish) has its own idle clock and cleanup, so a stale-page restart or the
+  1 h idle reclaim of one layer never touches another (TinyFish included:
+  leaving it does not end its paid session, which bills until its own idle
+  reclaim); a click that opens a new tab switches the tools to it. `browser_fill` refuses a payment card number
+  as the value and `browser_run_js` one in its script (the value check only:
+  telling card FIELDS apart is not judged yet; the planned card-fill flow in #3172 owns it).
+  `browser_fill_card` (off unless `config/payments.yaml` `card_fill.enabled`) pays with a
+  vault card in a second, short-lived Camoufox `BrowserContext` that only
+  `mcp/health/payment_context.py` creates or holds (an AST contract test pins it):
+  the merchant's cookies and storage (sessionStorage included) are handed over,
+  it refuses a checkout or card frame not on https at a host the vault's release
+  accepts (a dotted DNS name: no IP, single-label or loopback host), every
+  document is masked transparent from creation and kept so by an observer, top-layer content
+  (modal dialogs, popovers, fullscreen, backdrops, view transitions) and the page background included; a nested frame Camoufox's init script
+  missed (no mask at all) is masked by evaluate and re-checked, while a defeated mask or an unmasked
+  top document fails the check, the owner's tap shows the Pay button label and the
+  extra field names, the tool clicks Pay itself and returns fixed codes only.
+  Card values never leave in a URL: a Pay control whose form DECLARES GET is
+  refused before the tap, and a context-wide network route aborts the first
+  request of any redirect chain whose URL carries a typed card value
+  (`card_url_blocked`, do not retry): the number anywhere in a digit run; the
+  CVC, expiry, name and postal code as a whole parameter or path segment equal
+  to the value (exact equality, so a coincidental `?qty=123` with CVC 123 is
+  blocked too). A script-handled form that is GET only by default is not
+  refused. A redirect hop carrying one cannot be stopped by a
+  route; it is seen and reported (`card_url_leaked`; before Pay,
+  `card_url_before_pay`, or `card_value_in_request` when only a short value
+  matched, which may be a coincidence). WebSocket URLs are not covered. This guards a trusted
+  merchant's flawed form, not a hostile page script: one that reads a field can
+  still send it another way (a request body, an encoding the guard does not undo).
+  Selectors are plain CSS (a `>>` chain, an `engine=` part, quoted text or XPath
+  is refused, mirroring Playwright's own selector parser) and every
+  resolved element must live in the frame whose origin the tap shows
+  (`owner_frame`); a checkout whose host is itself a public suffix is refused;
+  the accessibility tree is off while card fill is on (owner ruling Q14).
+  Top-level navigation requests (sent, committed or not; a fragment or history
+  change sends none) and new windows are counted from the first keystroke: a
+  checkout that moves on while the card is typed ends `moved_while_filling`
+  (do not retry), never "nothing paid", unless a card value also went out in
+  a URL, which ends `card_url_before_pay` (also do not retry). Not seen: a
+  script-only submit (fetch, no navigation) and a navigation inside a child
+  frame (a hosted card frame posting its own form). The network-guard flags are checked
+  again after the last await before the click; a bank frame preloaded hidden
+  and shown after Pay is a `challenge`.
+  Before the tap it waits up to 10 s for a hosted widget's frames, fields, Pay
+  and total to mount (after it, a missing element means the page changed).
+  After the grant, after the claim and before Pay it re-checks the tapped
+  title, origins, Pay control, amount, extra fields and for a bot check, and
+  before Pay reads every card field back; it keeps reporting progress until
+  the end, so a client's idle timeout does not cancel it past the claim.
+  While it runs, the idle reclaim skips Camoufox, Turnstile's X clicks in the
+  same MCP process stand down (other processes on the display: not yet), and after the claim a stale-page restart is refused. Cookies are not
+  handed back to the main context yet, and a 3DS challenge closes the context
+  (`challenge`, outcome unknown).
+  Every `_impl_browser_*` result and error passes `@_redacted` (card numbers in
+  snapshots, script results, urls, titles and exception text become
+  `[card redacted]`; a contract test requires the decorator on each), and the
+  `security/card_redaction` log filter sits on the `mcp_health.log` handler
+  (every propagated `genesis.*` record) and on the browser, FastMCP and MCP
+  SDK lowlevel-server loggers, redacting log lines and tracebacks. The tool
+  timeout text and the CAPTCHA Telegram alert's page URL are redacted too.
+  Results are also checked for a card SPLIT across structure (digit groups on
+  separate snapshot lines, list items or dict values; a container that spells
+  one is withheld whole), and `browser_screenshot` refuses to capture a page
+  whose frames render a card in text, field values, placeholders, labels,
+  titles, alt text, options or CSS-generated content.
 - **mail/**: Gmail IMAP recon (weekly two-layer monitor: cheap-LLM briefs →
   CC judge, sanitizer-wrapped) + reply poller (4h) + `ReplyHandler` dispatching
   restricted `mail`-profile sessions. Sending is NOT here — all sends go
@@ -1579,15 +2007,24 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 83a835e32 2026-10-08
+verified: fbb0b6f19 2026-10-21
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
   systemd timer; `check.py` runs 6 parallel probes → 6-state machine → act;
   Proxmox disk/RAM provisioning verbs) and container side (`watchdog.py`
   monitors the host Guardian every awareness tick, incl. git-SHA code-drift
-  detection). Config `~/.genesis/guardian_remote.yaml`; missing → silently
+  detection; the drift comparison runs only on `main` and `live`, while the
+  host reconcilers that share its version probe run on any branch).
+  Config `~/.genesis/guardian_remote.yaml`; missing → silently
   disabled.
+- **Shared backup decryption (development candidate)**: the standalone
+  `guardian/cred_integrity.py` file authenticates one passphrase-encrypted,
+  integrity-protected message for credential recovery and backup/restore.
+  It runs under system Python without Genesis imports. File recovery replaces
+  destinations only after successful authentication; the streaming API accepts
+  results only after checking the complete message. Native GPG controls cover
+  this candidate; installed rollout and configured-NAS writes remain unverified.
 - **guard-layer watch** (`guardian/guard_layer_watch.py`, a SIDE-watch in
   `run_check`, not a `probe_*`): asks whether the AGENT TOOLING can still
   evaluate — the `genesis-hook` LAUNCHER end to end, the container venv
@@ -1624,6 +2061,33 @@ verified: 83a835e32 2026-10-08
   stabilization window, or a network outage; repeated restarts (flap) or max-restarts
   escalate to a durable owner/Telegram alert. This is why a wedged/dead surplus needs no
   `subsystem_stale` alert (§9): it is detected and self-healed here at 900s.
+  Each tick also reads the container's `io.pressure`; above full avg10 25% it
+  logs, besides the pressure line, the top in-container processes by current
+  I/O rate with their systemd units and, for a process under a Claude Code
+  session, that session's `claude` pid (`_log_io_culprits`, a 1 s sample
+  through the shared `genesis.util.proc_io` sampler the Guardian's recovery
+  also uses). The line carries the summed in-container rate as its
+  denominator: a small total during a stall points outside what the container
+  can see (the host, a process owned by another user, or I/O byte counters
+  miss, such as fsync storms and swap). Unreadable processes are counted, and
+  command lines are never logged.
+- **Recovery on a `live` checkout** (#3492 D3): `REVERT_CODE` (stash, then
+  revert HEAD) never runs where the container checkout is on `live`, judged by
+  git's own HEAD (`refs/heads/live` bans, whatever the manifest says) and then
+  `scripts/lib/live_checkout.py`, both over `incus exec`; a failed git, or
+  anything but a clean `other`, counts as live. `check.py` turns that proposal into
+  `RESTART_CONTAINER` before Gate 2 (after F.1's git-health redirect), and
+  `recovery.py` refuses it as a backstop. A restart ends lock holders and lets
+  a boot repair run where one is installed; a bad candidate is removed by
+  `deploy_candidates drop`. The diagnosis snapshot carries the boot repair's
+  `live-move repair:` journal lines and a summary of the newest
+  `deploy-backups/*-live-move-repair/REPAIR.json` that is neither dismissed
+  nor superseded (6 h window on its own `ts`), JSON-quoted, capped at 2,000
+  characters and fenced as untrusted; empty, and the prompt unchanged, when
+  there are none. The container reads are bounded where they are produced
+  (regular non-symlink reports, 4 MiB each; journal lines cut to 400), and
+  Telegram alert fields are cut before escaping. Residual: a container that
+  fakes git's own output can still pass the probe.
 - **Merged ≠ deployed**: guardian code reaches the host ONLY via
   `scripts/update.sh` / `guardian-gateway.sh` (the host-deploy gate in the dev
   skill). Known wart: the watchdog's stale-alert wording inverts when the
@@ -1833,8 +2297,38 @@ verified: b70bf6f35 2026-10-09
   fsck auto-resolves `git_deep` only (fsck READS — a passing fsck must never
   clear a live `rootfs_readonly` cheap alert). Creates carry
   `skip_if_duplicate=True` (atomic INSERT…WHERE NOT EXISTS — the only guard
-  that works across concurrent loops). Probe sensitivity is deliberately
-  single-failure; do not add consecutive-failure gating.
+  that works across concurrent loops). The cheap probe stays single-failure.
+  **The deep fsck re-checks once before paging (#2745, owner decision
+  2026-10-08, superseding the single-failure rule for this probe):** a failing
+  run is re-run 120 s later (an `asyncio.sleep`, cancellable at shutdown). A
+  re-run that fails on its own pages `critical` as before, with "(reproduced on
+  re-check)" and its failing lines; a re-run that times out, is killed or cannot
+  start is inconclusive, keeps the first run's lines and pages with "(re-check
+  did not complete: ...)". A service stop is not a failure: the stop cancels an
+  in-flight scan, and a fsck that died of SIGTERM aborts the scan with no
+  verdict and no row. Because a re-check can race too, a failing re-check
+  whose every line is `missing <type> <sha>` for an object that exists on a
+  `git cat-file --batch-check` lookup right after (same type) is recorded as a
+  transient (scan race, with the re-check's lines kept); any other line, an
+  absent object or a failed lookup still pages. The lookup reads headers only,
+  so it never clears an object fsck called corrupt: those print `error:` lines.
+  It ignores replace refs (as fsck does), and never vouches for the empty tree
+  or empty blob, which git can answer from memory with no file on disk.
+  A failure that passes its re-check becomes one `high`
+  `git_deep_transient` row PER event (morning report and dashboard, never
+  Telegram). A clean run does not resolve these rows; they expire on the 3-day
+  `infrastructure_alert` TTL, so a recurrence shows as several rows. Why: all 5
+  deep alerts recorded 2026-07-18 to 2026-10-08 were resolved without repair (2
+  by the monitor's next run, 3 by a manual re-run), in an object store shared by
+  hundreds of worktrees; on 2026-10-09 a concurrent `git fetch` writing a ref
+  mid-scan, and later a `git add` (blobs plus an index), were caught producing
+  exactly such "missing" lines (2 of 3 live scans that night; objects present
+  seconds later). fsck
+  runs with `--no-dangling`, and the evidence keeps every non-noise line (stderr
+  first), so thousands of dangling objects can no longer bury the real error.
+  The tick dispatches the deep scan out-of-band (`_dispatch_git_health_deep`),
+  so neither fsck run holds the tick lock; a run still going after ~37 min logs
+  one WARNING (the daily scan has stalled).
 
 - **awareness/**: the 5-min heartbeat. Signal collectors (the richer
   `learning/signals/*` set REPLACES the bootstrap placeholders in
@@ -1858,7 +2352,15 @@ verified: b70bf6f35 2026-10-09
   so a deploy would refuse): its own wording without the update.sh advice,
   never critical; an unreadable status alerts only on the second consecutive
   tick, and the first unreadable tick (or a tick during a deploy) holds the
-  check rather than resolving a standing dirty alert.
+  check rather than resolving a standing dirty alert. On `live` (the integration
+  branch `scripts/deploy_candidates` rebuilds), the drift is measured from the
+  commit `live` was built on, and five non-paging `live_*` classes have their own
+  wording (`live` unreadable; the checkout off `live` while the manifest lists
+  candidates; listed candidates `live` does not hold; `live` holding candidates
+  nothing lists; a candidate's update.sh-only files on `live`), held over a deploy
+  tick and a first unreadable tick the same way. A first tick whose engine read did
+  not answer is held too; a second in a row raises `live_unreadable` only while a
+  live alert stands in the store, so an install that never uses `live` never alerts.
   Also (hourly) ego cycle liveness (`_check_ego_liveness`, `ego/liveness.py`): an
   ego with no COMPLETED cycle past a conservative multiple of its current
   interval (the `job_health.last_success` gap — never the `is_running`/heartbeat/
@@ -2454,9 +2956,69 @@ Self-improvement loops and the instrumentation that keeps them honest.
 
 ```yaml subsystem-map
 entry: learning-evaluation
-modules: [learning, eval, experimentation, feedback, calibration, ledger]
-verified: 4117f6ed 2026-10-05
+modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
+verified: 3e27b4794 2026-10-23
 ```
+
+- Verification refresh is limited to the sampled qualification-runner behavior
+  below; other learning and evaluation evidence retains its dated basis.
+- **learning/skills/usage.py**: skill-usage telemetry (issue #3197), read-only
+  glue over Claude Code transcripts and `cc_sessions.skill_tags`. Per skill:
+  tool loads, slash loads, SKILL.md reads (not counted in a session that edits
+  that file), skill-injection nudges, dispatched injections, agent-frontmatter
+  preloads and nudge-to-use conversion, with a state (active / zombie / dead /
+  not_nudgeable). The state counts only CHOSEN uses (loads, slash loads,
+  reads); injections and preloads are configured deliveries, shown as columns
+  and never deciding it (owner ruling, 2026-10-20). Every
+  transcript count is split interactive (`entrypoint: cli`) vs headless, since
+  headless dispatch, SDK and test runs outnumber interactive sessions many times.
+  Exposed as the `skill_usage_status` health MCP tool (single-flight, progress
+  per file) and `python -m genesis.learning.skills.usage`. A zero means none
+  found in the scanned sessions; the window and denominators are in the output.
+  It parses transcripts itself; `transcript_analytics/extract.py` also reads
+  `Skill` tool_use records, so once that library's storage ships this report
+  should become a query over it rather than a second parser.
+
+- **transcript_analytics/**: optional local transcript analytics library. It
+  extracts physical records, preserves unresolved identity and usage, and
+  applies the shared credential scrubber to structured content. Schema5 records
+  distinguish executor identity from delegation evidence. This development
+  candidate adds the parser, durable per-source records, audited historical
+  readers and live query views. Readers capture immutable source selections;
+  tool blocks remain distinct, and uncertain result or delegation matches stay
+  unresolved. This CLI candidate exposes opt-in capped collection, status, live
+  SQL, disposable cache building and independent live/cache verification. The
+  canonical configuration defaults off and accepts the existing private overlay;
+  default paths follow the canonical runtime homes while explicit paths win.
+  Status reads confined snapshot metadata and reports individual source stat or
+  fingerprint errors while continuing; bounded SQL previews and streaming CSV
+  preserve full query counts without retaining every result row in Python.
+  Scheduling arrives in a dependent change. Additional backup
+  and recovery integration is deferred independently of collection and search.
+  Unknown historical content is excluded from content metrics. Views version 24
+  preserves missing call/result hashes as unknown and admits ownership from the
+  same evidence used by supported status and delegation; absent envelopes remain
+  distinct. Duplicate orphan results retain scrub-failure evidence. Query manifests
+  identify the views version. Historical actors without identities cannot form
+  lineage nodes. Paired-result IDs remain searchable raw evidence but do not
+  prove or contradict lineage: their independent result context was not retained.
+  Independent companion evidence and scoped unpaired results remain eligible;
+  paired-only associations stay unresolved and excluded from confirmed coverage.
+  Ingestion keeps one captured
+  canonical root, rejects malformed persisted root bindings and isolates source
+  stat failures. Transcript and sidecar-fingerprint reads admit regular descriptors
+  without blocking; fingerprint metadata is limited to 1 MiB. The extractor's
+  independent sidecar reopen remains outside adversarial-concurrency guarantees;
+  parser signatures and historical formats are unchanged.
+  It does not describe a deployed capability.
+  Hook names are limited to literal command targets and option-free supported
+  interpreter operands; ambiguous commands report `<unknown>` while preserving
+  their scrubbed command. Invalid negative durations/counts and reversed call
+  timestamps remain unknown; signed exit codes remain signed. Both model-refusal
+  subtypes retain selected scrubbed diagnostics. Recursive JSON is treated as a
+  malformed record, and chronology is evaluated against the captured byte limit,
+  including an incomplete suffix in its fingerprint. Dependent query views must
+  preserve those unknown-duration semantics when deriving fallback latency.
 
 - **The graders are TOLD the response status; they must never infer it.** The
   triage/outcome/delta graders each judge an `InteractionSummary`, and the
@@ -2579,8 +3141,13 @@ verified: 4117f6ed 2026-10-05
   Qdrant); bare arm = `--safe-mode` (the only OAuth-compatible CLAUDE.md
   suppression; `--bare` refuses OAuth) + cleanroom CLAUDE_CONFIG_DIR.
   Task set is PRIVATE (`~/.genesis/eval/bench_tasks_v1.jsonl`; loader
-  refuses in-repo paths). Judge = `bench_task_success` rubric, UNCALIBRATED
-  v1 (every surface stamps `judge_calibrated: false`). Every new
+  refuses in-repo paths). Judge = `bench_task_success` 1.1.0, UNCALIBRATED
+  (every surface stamps `judge_calibrated: false`). Missing or contradicted
+  explicitly required deliverables receive an instructed score ceiling of0.5,
+  below the unchanged0.6 pass threshold; writing quality stays separate.
+  Progress/refusal outcomes retain their task context. This prompt instruction
+  is not deterministic semantic enforcement; old-version references require
+  fresh review. Skill replay shares the rubric. Every new
   genesis-memory tool must be classified in `eval/bench/arms.py`
   (static-AST forcing test). Don't run across Sun 07:30 (J-9 aggregation).
   **A5 read surface** (WS-1 A5): the persisted paired win-rate is readable via
@@ -2597,8 +3164,8 @@ verified: 4117f6ed 2026-10-05
   and recovery state. Incremental publication follows durable append; uncertain
   publication stops derived-state reading until reconstruction. Historical
   reading never creates or truncates files; version-1 evidence cannot execute.
-  No transport, CLI, automatic execution or qualification verdict is wired yet;
-  subsequent replacement PRs supply those callers. Production credentials and
+  The isolated qualification CLI supplies explicit execution and reporting
+  callers; it does not schedule automatic execution. Production credentials and
   accounting stores are outside this boundary. See
   `docs/reference/qualification-journal.md`. Offline reference admission also
   binds current policy, source-labelled decisions and whole-corpus feedback
@@ -2611,6 +3178,98 @@ verified: 4117f6ed 2026-10-05
   remains a review obligation. Human approval binds the exact corpus and policy;
   receipts do not authenticate
   reviewers or calibrate confidence. See `docs/reference/qualification-references.md`.
+  Corpus validation registers rubric/J9/novelty versions and class floors;
+  standalone adapters run production relevance and novelty judgments with
+  synthetic routers or caller-provided transport. Novelty uses disposable
+  full-schema SQLite fixtures and observes the actual rendered candidate IDs.
+  The isolated runner supplies execution/reporting orchestration.
+  See `docs/reference/qualification-corpus.md`.
+  Qualification's pinned transport supplies a caller-provided adapter router
+  through the production delegate, a shared one-egress wire guard, response-hook
+  durability and exact lexical Decimal GET billing. Documented selected-route
+  metadata is checked on live acceptance and replay; gateway response caching
+  is explicitly disabled. Contradictory served identities retain unresolved
+  liability, while expense settlement cannot qualify invalid routing evidence.
+  Frozen schedule/provider
+  mapping and dedicated nonreset credentials are required; any journal incident
+  pauses new requests and replay until verified recovery. These checks do not
+  admit more than reported or exact limit-minus-spend headroom supports. Local
+  client setup precedes durable dispatch; recovery metadata uses the shared JSON
+  authority before redaction, and diagnostic formatting cannot interrupt calls.
+  External JSON has explicit local byte/depth bounds and a shared forward string
+  scanner. Unsafe response/receipt bodies retain opaque error evidence; decoded
+  strings stay untrusted through bounded nested JSON redaction. Refusals preserve
+  unresolved funding and never resend a completion.
+  Credential lending preserves known redaction values while keeping production
+  aliases hidden from the SDK, including log calls on SDK threads.
+  These checks do not
+  establish provider spend bounds or owner approval. This verification refresh covers the qualification slice;
+  other learning/evaluation entries retain their previous verification scope.
+  See `docs/reference/qualification-transport.md`.
+  Complete offline preflight checks all registered corpus floors, current
+  reference policy/approval/source identities and explicit call-site parameters.
+  Production rendering determines duplicate questions and selected novelty IDs.
+  Historical exports require full Git identifiers and repository-relative paths;
+  procedure metadata requires strings or string lists. Independent database
+  reads verify committed effects; evidence binds schema creation and table DDL.
+  Normalizer source evidence includes builtin tool registries and the shared
+  shallow MCP source population; full path/hash rechecks detect membership drift,
+  and cached owners must match an uncached scan without cache invalidation.
+  Disposable current/promoted replay uses both real stores, checks all original
+  procedure columns and verifies new insertion semantics; synthetic classifiers
+  isolate novelty wiring. Dedicated serial process only; no execution consent,
+  paid eligibility, model quality or promotion follows from this evidence.
+  A fresh interpreter follows checkout changes; unchanged checkouts permit
+  repeated checks with matching caches.
+  The runner recomputes it before credentials. See
+  `docs/reference/qualification-preflight.md`.
+  Complete admission requires exact source archives in durable private storage
+  and separately restored bytes bound by human approval. Original paths remain
+  logical provenance identities; archive creation supplies no approval or
+  independent-backup claim. Missing retained evidence refuses before rendering.
+  The isolated serial CLI supports Flash-only, explicit Pro–Flash or historical MiMo–Flash execution
+  under an exact frozen operating plan and a separate local spending assertion.
+  An explicit manifest-bound Pro incumbent sample retains complete reference
+  admission and full Flash gates. Sampled Pro reports completion separately
+  from qualification; execution and detached reporting use the same declared
+  paired population and status rules. Exploratory case and reference-class comparisons do
+  not treat repeated responses as independent cases or authorize promotion.
+  A credential-scoped lock precedes journal writers and credential reads. The
+  actual pre-dispatch key snapshot must fund the whole selected pending
+  population, including effective/member headroom; uncertain evidence stops
+  acquisition without resending dispatched coordinates. Observed expenses and
+  unresolved liability remain distinct; operating allowances are not guaranteed
+  invoice ceilings. Source population/cache checks at admission and completion
+  invalidate scoring on detected drift, without a per-request source-integrity
+  guarantee. Detached reports score retained snapshots under current admission,
+  read no credentials and do not authenticate current external spending consent.
+  Unmarked legacy histories retain detailed incomplete reports; malformed sample
+  markers are refused during validation.
+  No paid quality, promotion or live activation follows from synthetic wiring.
+  After source review, the integrated runner passed 1,777 affected tests and a
+  complete synthetic 750-case/2,250-request actual-CLI run plus credential-free
+  detached report. Independent readback reconciled all 9,001 journal rows and
+  531 frozen source/test inputs. Current-main database schema and test controls
+  were included in acceptance; the E2E observed no Python network attempts.
+  This is synthetic wiring evidence, not real
+  model quality, provider billing or deployment. See `docs/reference/qualification-runner.md`.
+- **Contained Headlong stock controls**: opt-in developer CI under
+  `scripts/ci/headlong_*`, separate from the canonical proposal baseline in
+  PR #3590. Pinned upstream modules execute only inside a disposable container,
+  with synthetic providers and fixture effects. The intended matrix has nine
+  route controls plus eight selected upstream test invocations; actual success
+  requires the contained job's report. This supplies no real CLI/model, owner
+  policy, initiative, or G/H/B/C runtime-parity result. No production entry point
+  is added. See `docs/reference/headlong-offline-controls.md`. This stamp refresh
+  covers this developer-evaluation slice, not a new audit of the whole subsystem.
+- **Contained native action port**: the same opt-in CI image also qualifies real
+  Claude Code through the public Agent SDK against a loopback scripted backend.
+  Its MCP tool invokes actual canonical proposal claims and a fixed disposable
+  effect. Eleven expected cells and a separate handler-error instrument control
+  require native completion plus independent committed-state/artifact checks.
+  Integrated success requires the actual contained report. No production provider,
+  inference, B/C orchestration or Codex parity is added. See
+  `docs/reference/headlong-native-action-port.md`.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).
@@ -2735,9 +3394,21 @@ How every LLM call picks a provider, and the registry for non-LLM tools.
 ```yaml subsystem-map
 entry: routing-providers
 modules: [routing, providers, decisions]
-verified: b0867170e8e3 2026-10-02
+verified: 9a95483a8e7f 2026-10-09
 ```
 
+- Verification refresh is limited to the interim general judge ordering below;
+  other provider-health evidence retains its original dated basis.
+- **Interim general judge preference (2026-10-09)**: the shipped `judge`
+  chain tries V4.1 Flash through DeepSeek direct, then OpenRouter, then V4 Pro.
+  This owner-selected ordering precedes completed quality qualification; it is
+  not a claim that Flash has met the protected judgment gates. J9 relevance
+  and the skill-edit critic also consume the general judge chain. J9 chain
+  offsets retain rotation and can select Pro first for a rotated call. Bench
+  and skill replay inherit the chain when no judge override is supplied. An explicit
+  provider override can still lead with Pro. Standalone single-provider defaults
+  and the sole validated novelty suppressor retain Pro. Model identity remains
+  recorded per judgment; comparisons across providers require that attribution.
 - **Provider health evidence**: NVIDIA's `/v1/models` catalog is supported
   but observational only; success, failure and probe exceptions do not mutate
   its breakers. Probe support, credential presence and breaker authority are
@@ -2975,20 +3646,81 @@ config resolution, and hygiene utilities.
 ```yaml subsystem-map
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
-          restore, util, infra_profile, onboarding, hostmetrics, trash, env.py,
-          _config_overlay.py]
-verified: 477efb7f7 2026-10-05
+          restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
+          env.py, _config_overlay.py]
+verified: 8a62059720cd 2026-10-22
 ```
 
+`observability` seeds `cc_fallback` idle and reads its content-free last-run
+provider/model/outcome. Failed historical attempts render as a warning, not an
+inferred current provider outage. The readiness worker uses the shared
+tool-disabled CC probe without changing its schedule or routing authority.
+
+- **payments/**: the encrypted card vault, virtual cards only.
+  `python -m genesis vault init|add|list|retire|migrate|status` (`payments/cli.py`);
+  `vault_store.py` keeps `~/.genesis/payment_vault/` (0700, files 0600): an age
+  X25519 identity in `identity.key` with no passphrase (owner ruling a4a95392:
+  the per-payment Telegram tap is the gate, the cards are merchant-locked
+  virtual cards), its public key, and `cards.db`, whose card details exist only
+  as age blobs encrypted to that key, each carrying its own `card_ref` and
+  merchant scope; cards.db also records the key file's sha256 and public key,
+  checked before any add, so a damaged or swapped key is refused; the public
+  key is checked again on the connection that writes the card, so a swapped
+  database takes nothing. A vault made before the ruling holds the key sealed
+  as `identity.age` and is refused until `vault migrate` unseals it once (the
+  passphrase asked one last time; the vault is copied aside first; a migration
+  killed part-way resumes with no passphrase). `add` requires a merchant scope
+  or `--single-use`; init/add/retire/migrate need a TTY that can hide input
+  and refuse inside a coding agent's session, Claude Code or Codex (accident
+  guard). Needs the `payments` extra, which bootstrap and
+  install.sh install on every install as a non-fatal step after the core
+  (`venv_setup.sh` `install_runtime_extras`, with the `test` extra).
+  `vault_service.py` runs inside genesis-server (started from
+  `StandaloneAdapter.serve()`, never the bridge or terminal): it loads the
+  X25519 identity from `identity.key` at start, and again on `status` or a
+  release request while none is held (so a migrate or init under a running
+  server takes effect), and drops it on a key/recipient mismatch and at stop.
+  It serves status and the release ops on `~/.genesis/run/payment_vault.sock`
+  (0700 dir, peer uid checked with SO_PEERCRED); `vault unlock` and `vault
+  lock` are retired and answer why. Every load, refused load and drop lands in
+  `payment_vault_events`; a load fails closed without its audit row.
+  `approval.py` `PaymentApprovalRegistry` (created in `serve()`, audited
+  through the vault service's own connection, bot attached after Telegram
+  starts) asks the owner to approve a card release: a code-built,
+  `parse_mode=None` message with one `payapprove:<nonce>` button. A tap
+  grants only from the first `TELEGRAM_ALLOWED_USERS` id, on that exact chat,
+  message id and text, unedited and accessible, once; anything else, a missing
+  bot or audit, or 10 minutes without a tap refuses. Nonces live in memory
+  only; no `approval_requests` row is written, and the type is in the gate's
+  approve-all denylist, `refuse_generic` and both dashboard filters.
+  `release.py` serves the release ops (request, status, claim, cancel) to the
+  verified genesis-health peer; `release_client.py` is that peer's side, used
+  by `browser_fill_card`, and `card_fill.py` holds the tool's rules (the
+  switch, launch prefs, argument checks, fixed result texts).
+  Backup: `scripts/lib/payment_vault_backup.sh` from
+  backup.sh §8 writes the three files as ONE GPG-encrypted tar,
+  `creds/payment_vault.tar.gpg`, renamed into place once (cards.db via SQLite
+  online backup, under the vault's directory lock, only when the set passes the
+  check restore reruns), so no reader can mix files from two backups;
+  `payment_vault` in `backup_status.json` is ok/absent/skipped (not
+  attempted)/failed/missing, and failed or missing fails the run (non_db).
+  restore.sh decrypts it only when it comes from the selected off-site snapshot
+  (or Tier-1 when none was selected), checks member types and the vault, and
+  stages it fresh in `~/.genesis/restore-creds/payment_vault/` (an earlier copy
+  is moved aside); it never places it.
 - **trash/**: recoverable deletes. `trash(path, reason=, caller=)` renames an
   item into the Genesis trash (`~/.genesis/trash`) with a tombstone, never
   copying, and refuses an item on another volume;
-  `python -m genesis.trash list|restore`. Callers: cognitive rollback and the
-  orphan task-worktree reset (`docs/reference/trash.md`). Stdlib only.
+  `python -m genesis.trash list|restore`. Callers: cognitive rollback, the
+  orphan task-worktree reset, and the dashboard's file-browser and memory-file
+  deletes (`docs/reference/trash.md`). Stdlib only.
 - **hostmetrics/**: stdlib-only resource readings (container cgroup memory and
   CPU, PSI, disks, and the host's headroom through the guardian gateway) and the
   `preflight`/`status` CLI that admits or refuses a heavy job against the
-  budget (`docs/reference/resource-budget.md`). Importable without the runtime.
+  budget (`docs/reference/resource-budget.md`). `run` requires a reachable user
+  manager and acknowledged scope; first caller cancellation stays cooperative,
+  a second forces, and stopped-scope cleanup outlives the leader. Watchdog stops
+  alone arm a ten-second force deadline. Importable without the runtime.
 
 - **onboarding/**: the live *functional floor* (`floor.py`) — the honest "is this
   install usable" signal (CC OAuth login + ≥1 routing LLM key + ≥1 embedding key),
@@ -3066,7 +3798,48 @@ verified: 477efb7f7 2026-10-05
   not trip it (the 2026-09-18 log-storm class). Both land with the runtime
   corruption trip.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
-  without it interleaved commits pin `in_transaction` until restart). Two
+  without it interleaved commits pin `in_transaction` until restart). Every
+  statement through a `SerializedConnection` (its cursors' row fetches too),
+  and every recall read through the RO pool (`HybridRetriever._ro_read`), in
+  any process that uses them, is timed by `db/_slow_log.timed`: one taking at
+  least `GENESIS_SQLITE_SLOW_MS` (default 1000, `0` = off) logs one WARNING
+  naming the SQL (never its parameters) or read helper, the in-process wait vs
+  the run (run includes SQLite's busy-timeout wait and lock-retry backoff), the
+  outcome (ok / cancelled / error) and what it was stuck behind — rate-limited
+  per label and outcome to one line per 60 s unless a repeat is twice as slow.
+  When a lock outlives the retry budget (`DB lock persisted through N attempts
+  … giving up`, or a lock error on the unretried `executescript`),
+  `db/lock_holders.py` records local failure context, then samples the kernel
+  lock table on a worker; these readings do not prove who caused the failure.
+  It preserves the SQLite error name (`SQLITE_BUSY_SNAPSHOT` is a stale read
+  snapshot that retry cannot refresh), separately from any `lock_table_error`.
+  Kernel lines on the database, `-wal` and `-shm` files are matched by inode
+  and decoded to SQLite roles (`-shm` byte 120 = writer, 121
+  checkpointer, 122 recoverer, 123-127 reader marks, 128 open), each pid
+  labelled credential-free (`pid_breakdown.process_label`). SQLite's own
+  waiters are INVISIBLE there (non-blocking `F_SETLK`, sleep-and-retry), so it
+  retains positive-PID, nonwaiting POSIX WRITE ranges covering byte 120 as
+  writer candidates and keeps all other raw rows. POSIX locks are per process,
+  so an in-process
+  holder shows only as `self`; the snapshot therefore also lists every
+  connection of this process on the same database that a factory opened
+  (`get_db`/`SerializedConnection`, `get_raw_db`, `connect_aiosqlite_rw`, and
+  `connect_sqlite_rw` via a weakref-able `factory=` subclass), each with the
+  `module:function` that opened it and `in_transaction` (an implicit write
+  transaction holds the write lock until commit with nothing running), plus,
+  for a `SerializedConnection`, its asyncio lock state and statement (never
+  bound parameters; inline literals can appear). NOT covered: direct
+  `sqlite3.connect`/`aiosqlite.connect` calls outside those factories (about
+  two dozen sites: attention, eval, browser profile, payments vault, guardian
+  watchdog, migrations, integrity and others) and the read-only pool. Task
+  names are counted, unnamed `Task-N` folded into `Task-*`. The capture
+  call awaits nothing (the in-process state is read on the loop thread, the
+  lock table on a worker thread via a tracked task), at most once per
+  registered canonical database per process per 60 s, into `~/.genesis/logs/lock_snapshots/`
+  (7 days / 20 MB); the warning line names the file or why there is none.
+  `GENESIS_LOCK_SNAPSHOT_DISABLED=1` turns it off.
+  Not timed: raw `aiosqlite`/`sqlite3` connections and the unlocked
+  `db.cursor()` / `cursor.execute()` routes (unused in production). Two
   schema paths coexist: base DDL (`schema/_tables.py`, 117 CREATE TABLE, a count
   that drifts every table-adding PR — re-measure, do not trust) plus versioned
   `migrations/` run ONCE at startup before any
@@ -3156,7 +3929,14 @@ verified: 477efb7f7 2026-10-05
   `scripts/lib/deploy_marker.sh` + `deploy_checkout.sh` on every snapshot
   (listed in deploy_status.sh `_RUNTIME_FRESH_SCRIPTS`), read-only
   (`GIT_OPTIONAL_LOCKS=0`, own process group killed on timeout): do not copy
-  the ephemeral-path regex into Python. **Total-cessation detection** (`observability/liveness.py`,
+  the ephemeral-path regex into Python. Its `live` collector runs
+  `scripts/lib/live_checkout.py` and `scripts/deploy_candidates list --json` (one
+  read-only engine reading: the manifest's state, what it lists, and what `live`
+  holds per the engine's `live_set`; the engine is the manifest's reader, nothing
+  in src/ reads the manifest), both bounded the same way; on `live` the
+  behind-count, tier-2 and host drift are measured from merge-base(HEAD,
+  origin/main), because the engine's `switch -C live <sha>` sets no upstream.
+  **Total-cessation detection** (`observability/liveness.py`,
   and for outreach a deliberately channel-INDEPENDENT heartbeat in
   `outreach/heartbeat.py`): a subsystem that stops entirely emits nothing, so
   absence-of-signal is itself the signal — the alarm keys on the gap since the
@@ -3166,7 +3946,14 @@ verified: 477efb7f7 2026-10-05
   only pulse and reads as never-having-run (false green).
 - **security/**: prompt-injection defense + outbound scanning — sanitizer is
   LOG-ONLY for internal sources (perimeter EMAIL/INBOX can block);
-  `output_scanner` = deterministic outbound secrets/IP scan; `skill_scan`
+  `output_scanner` = deterministic outbound secrets/IP scan (a payment card
+  number is a critical finding); `card_shapes` = the one payment-card-number
+  detector (ASCII digits, alphanumeric boundary, standard groupings, brand
+  prefix + length, Luhn, UUID groups skipped; stdlib-only so scripts load it
+  by path), used by the browser tool guards, `reference_store`, reference
+  extraction and `output_scanner`; `card_redaction` = redaction built on it
+  (result walker incl. JSON text, numbers and cards split across lines or
+  values, the `redacted` tool decorator, the `CARD_FILTER` log filter), used by the browser tools; `skill_scan`
   shells to external NVIDIA SkillSpector. NOT auth or secrets storage (that's
   `runtime/init/secrets.py` + `env.py`). **`immunity.py` = the WS-3 kill
   switch + gate policy**: `gate_mode()` re-reads `config/ws3_immunity.yaml` +
@@ -3283,6 +4070,12 @@ verified: 477efb7f7 2026-10-05
   MCP tool (facts-only refresh cross-process, flock-guarded) + sentinel digest
   + the user-CLAUDE.md `container-specs` block (content owner:
   `infra_profile/claude_md.py`; update.sh invokes `--claude-md-block`).
+  All three CLAUDE.md block writers (this one, `write_sentinel_block` in
+  `scripts/lib/claude_md_blocks.sh`, and host-setup.sh, which ships that
+  function into the container) share one rule, pinned by one fixture table in
+  `tests/test_scripts/test_claude_md_blocks.py`: a marker is a whole line,
+  duplicate well-formed blocks collapse to one, and unbalanced markers leave the
+  file untouched with the reason printed (the CLI exits 1).
   Distinct from `observability/snapshots/infrastructure.py` (dynamic health) —
   don't merge them. Memory-resilience invariants are first-class facts:
   container `cgroup_memory_swap_max` (tri-state — "0" IS the 2026-07 wedge
@@ -3311,7 +4104,25 @@ verified: 477efb7f7 2026-10-05
   awareness tick (`resilience/tailscale_watchdog_events.py`), never read into
   the annotation prompt.
 - **restore/**: thin CLI → `scripts/restore.sh` (counterpart of the 6h
-  encrypted `scripts/backup.sh` timer).
+  encrypted `scripts/backup.sh` timer). `db/crud/peer_restore.py` resets peer
+  permissions in staged backup restores and update's pre-migration rollback
+  candidate: disabled mode, empty grants, renewed epochs; no credential reads.
+  A connection-local SQLite authorizer refuses trigger/view execution and writes
+  beyond those reset targets; required peer tables must be ordinary tables.
+  Guardian snapshot rollback instead warns at its existing action-approval gate
+  that approval explicitly reauthorizes saved peers.
+  encrypted `scripts/backup.sh` timer). Recovery pins a selected off-site snapshot across retries,
+  authenticates legacy and v2 transcript archives, and verifies pooled
+  objects before restoring. Pooled SMB downloads retain the backend credential
+  lease until the off-site pull returns; library definitions load before that lease.
+  Explicit local directories take precedence over
+  off-site configuration; independently identified Tier-1 audit records restore
+  additively with separate provenance. Cache entry points validate selected identity
+  and required component inventory structure,
+  and interrupted retirement resumes through fenced tombstones. Identical legacy
+  copies collapse; distinct decoded copies require an explicit encoding choice.
+  Reader support precedes new-format capture;
+  persistent analytics settings recovery lands separately.
 - **util/**: `atomic_write_text`, `tracked_task` (logs swallowed exceptions),
   `process_lock` (the reason bare `python -m genesis serve` blocks systemd),
   tmp discipline (`~/tmp` for large temp — never override TMPDIR),
@@ -3331,6 +4142,177 @@ verified: 477efb7f7 2026-10-05
   check under it and remove a marker only when its holder is dead or theirs.
   Exception: `bootstrap.sh`'s crash recovery still removes it unconditionally.
   `secrets_path()` is repo-relative unless SECRETS_PATH set.
+- **Managed systemd user units** (deploy scripts, no `src/genesis` module):
+  `bootstrap.sh` renders `scripts/systemd/*.template` and `setup-vnc.sh`
+  renders `scripts/systemd/vnc/` into `~/.config/systemd/user`, both through
+  `scripts/lib/managed_units.sh`. Every render ends with a
+  `# genesis-managed v1 sha256=` stamp of its own body
+  (`scripts/lib/managed_units.py` holds the grammar), so a later run tells
+  Genesis's output from a hand edit: an edited unit is KEPT and named, never
+  overwritten. A plain `update.sh` run checks every unit BEFORE it stops
+  anything and exits 4 naming the edited ones (on `live`, a unit only the
+  rebuilt tip brings is judged after the move, so that exit 4 follows the stop
+  and a rollback onto the old tip); `--post-merge` does not refuse
+  (its merge already happened), and bootstrap keeps and names the unit
+  instead (`--take-template <unit>` installs the template and
+  backs the old file up under `~/.genesis/deploy-backups/`, pruned at 90 days by
+  `disk_hygiene.sh`); a unit from before stamps is accepted when it matches a
+  version of its template in git history. Local unit changes belong in a
+  drop-in (`<unit>.d/*.conf`), which nothing here touches. Timers listed in
+  `~/.genesis/config/disabled_timers` are not re-enabled (`systemctl mask`
+  cannot work on a unit in `~/.config/systemd/user`). The dashboard's update
+  card shows edited units (stamp check only). A refusal is recorded in
+  `~/.genesis/update_refused.json` (units, commit judged), which every other
+  preflight verdict removes; the supervised update's orchestrator removes it
+  before tier 1 and never escalates while it stands. `update.sh` prints what bootstrap changed
+  outside the checkout at the end of every run, a failed one included. A
+  symlinked (masked) unit is replaced only by `--take-template <unit>`, never by
+  `--take-templates`. The root-owned files the deploy writes under `/etc`
+  (bootstrap's journald and sshd drop-ins, and the memory and network resilience
+  drop-ins and watchdog units) carry the same stamp through
+  `scripts/lib/managed_etc.sh`: one edited by hand (or a symlink) is KEPT and
+  named in the run summary as `kept-etc <path>` (so is one sudo could not
+  inspect or read, which is never written), a file from before stamps is
+  stamped once without restarting anything (the networkd keep-config drop-in
+  and journald: nothing else runs; the memory-resilience drop-ins, oomd's
+  config included, and the network watchdog units: a `systemctl daemon-reload`
+  only; sshd: `sshd -t` only), and `--take-template <full path>` (or `etc:*`,
+  never a bare `*`) replaces one after copying it, mode 0600, to the same path
+  under the run's `~/.genesis/deploy-backups/<time>/`. A taken sshd drop-in that
+  `sshd -t` rejects is put back from that copy. Unlike units, an edited `/etc`
+  file does not make the update refuse yet: each has had one Genesis content
+  version, so keeping it loses nothing; the refusal comes with the first content
+  change (#3282).
+  `--take-templates`.
+- **Deployment status** (`scripts/lib/deploy_status.sh`): status captures the
+  MainPID, invocation, runtime edits and runtime overrides once for its printed
+  fields and bracket calculation. This keeps those fields aligned with the
+  token; it does not make separate systemd/git/file reads an atomic snapshot.
+  Direct `_bracket` calls without captured arguments retain their own reads.
+- **The restart guard, `~/.genesis/update_state.json`** (deploy scripts and the
+  dashboard update routes, #3139): `update.sh` writes it at each phase; an
+  update that merged code and never activated it, or that stopped on merge
+  conflicts, leaves it behind. Whether it still guards is ONE rule,
+  `scripts/lib/update_state_guard.py` (stdlib; `safe` / `guards` /
+  `conflict_pending` / `mixed_tree` / `holds`, plus the remedy text): a "done"
+  state, a plain run's "fetching" at its rollback tag, and a "merging" at the tag
+  with no merge residue and no recorded conflict guard nothing. A guarding state
+  is one of two kinds (#3532): `guards` (exit 0) is merged code complete on disk
+  that bootstrap has not run on, which `--post-merge` finishes; `holds` (exit 6)
+  is every state where finishing forward is wrong or unknown (the update never
+  changed the checkout, it is not where the update left it, the record cannot be
+  trusted or read, a merge is in progress), whose message names the remedy
+  (usually: save any edit, Dismiss, run the update again). HEAD at the update's
+  own new code (`own_head`) in any phase is checked for a rollback checkout
+  killed partway back to the tag (the two-dot residue back toward the tag),
+  main and `live` alike. Merge residue at the tag is `mixed_tree` (exit 4): a half-written
+  checkout, whose message lists the paths and says to save, restore and
+  Dismiss. Residue counts tracked changes only on the paths the merge
+  (`rollback...deploy_head`) writes; a tracked change elsewhere (an indexer's,
+  another session's) with nothing merged `holds`, not `mixed_tree`. A "merging" row carrying the live engine's move record
+  (`live_move`, #3492) is judged by the TWO-DOT diff a `git switch` writes
+  (the old and new `live` tips diverge, so main's symmetric range would miss
+  what a dropped candidate had deleted), toward the record's target with HEAD
+  at the tag, and back toward the tag with HEAD at the target (a rollback
+  checkout killed partway); only tracked changes on the switch's own paths
+  count there, one anywhere else (the rebuild having moved nothing) `holds`. A "merging"
+  row on `live` whose record update.sh already dropped (it adopted the tip,
+  own_head is that tip) is judged the same way toward own_head, so a rollback
+  killed partway after adoption is caught too. The remedy follows HEAD: at the
+  tag, put the paths back and Dismiss; at the update's new code (main's merge
+  or the rebuilt tip), put them back and finish with `--post-merge`
+  (Dismissing there leaves code bootstrap never ran on). The dashboard's progress poll returns the guard's remedy
+  (`guard_remedy`) and the update card shows it. `deploy_code_only.sh` and the live engine refuse to
+  restart or move the checkout while it guards; a plain `update.sh` exits 5
+  (before tagging or writing anything), and the dashboard's `/apply` answers
+  409 on both paths; `--post-merge` finishes only `guards` (a resolved, committed conflict and a
+  merge that landed before update.sh recorded it read so too), and refuses
+  (exit 5, main and `live` alike) a `conflict_pending`, a `mixed_tree`, a
+  `holds`, a state with nothing to finish, or a guard that could not run, with
+  the guard's remedy. Bootstrap's crash recovery and update.sh's kept-state line
+  print that remedy too. Only the run
+  that wrote the file deletes it on its exits (never a `--post-merge`, never a
+  run that had not written yet), a rollback that left merged code keeps it, and
+  bootstrap's crash recovery keeps a pending conflict. Bootstrap's crash
+  recovery judges liveness by update.lock alone, never the recorded pid (a
+  zombie or a reused pid looks alive): held, it goes on only when the state's
+  pid is running it, either named in `GENESIS_BOOTSTRAP_UPDATE_PID` (update.sh
+  passes its own pid) or as bootstrap's direct parent (`$PPID`, how an
+  update.sh from before the token calls it: every install runs that one once,
+  against this bootstrap, on the update that brings it in), and refuses
+  otherwise, a hand-run bootstrap during a live update (its parent is a shell)
+  or an orphaned engine included; free, the update is dead and recovery runs.
+  At the tag in "merging" it goes on only on the guard's exit 10, printing
+  the guard's message otherwise. The dashboard's progress poll is read-only:
+  it reports the verdict and offers Dismiss, the one retirement by hand. The
+  residue check is `genesis_merge_residue` in `scripts/lib/deploy_checkout.sh`
+  (`--two-dot` for a live row). One exception
+  in the engine: the "merging" row of the `update.sh` that is running the
+  rebuild (its pid named in `DEPLOY_CANDIDATES_OWN_STATE_PID`, equal to the
+  engine's parent, update.lock handed over, a plain run) is neither refused nor
+  retired; a run that names a pid whose row is not that run's own refuses.
+- **`update.sh` on `live`** (#2978, #3370): the merge's place, after the stop,
+  is taken by the deploy-candidates engine's rebuild (`scripts/deploy_candidates.py
+  rebuild`, the `live-engine` block). Everything else is main's path: one DB
+  snapshot and one sample of the running services before the stop, the same
+  "fetching"/"merging" rows, the armed rollback trap. Readiness judges the
+  checkout the stopped server will start from (both units definitely stopped).
+  update.lock is handed to the engine; `update.sh` holds genesis-checkout.lock
+  only while it clears the excused local edits, never across the rebuild (the
+  engine's move takes that lock itself). A refusal, failure or interrupt of the
+  rebuild runs the normal rollback. `update.sh` names the branch and commit it
+  verified (`rebuild --expect-branch --expect-head`, #3492); the engine records
+  that source (branch ref, HEAD, the `live` ref, no other worktree on `live`, a
+  clean tracked tree) once, at the command's start, judges the move's safety
+  from that same read (never re-reading it as a new baseline) before it
+  fetches, and re-checks all of it in preflight and again under
+  genesis-checkout.lock just before its move's first write or its "unchanged"
+  result. An on-`live` `drop` writes the manifest under that lock, right after
+  that last re-check; a manifest-only `drop` (off `live`, `--no-rebuild`)
+  re-checks the branch, HEAD and `live` before writing it. A session commit,
+  switch or tracked edit in that window refuses the move with nothing moved
+  and no move record (a hand `rebuild`/`drop` without the flags checks the
+  source it read itself); a `live` ref update that loses its compare-and-swap
+  records `clean` and refuses the same way. Through `update.sh`, a refused
+  branch switch is then switched back by the rollback (the session's commits
+  survive on their branch; only HEAD moves). A commit or branch switch that
+  still slips in after the last re-check is named by a WARNING read from the
+  reflogs of `live` and HEAD and kept there (a direct `live` ref update from
+  main while `live` already sat at the tip is not seen: git logs nothing
+  then). A tracked edit in that last window, before git takes index.lock, is
+  not warned about. What the engine did to the checkout is read
+  from its move record (`live_move` in update.sh's own "merging" row:
+  `{"to", "phase"}` with phase `ref` / `moving` / `partial` / `clean` / `done`,
+  written by the engine before and after the move, durably (fsynced) before it,
+  and only while the row is still that run's own; a record that cannot be
+  written before the move refuses it; the row outlives the run, so a crash
+  leaves it for every reader; the old `~/.genesis/live_move.json` side file is
+  no longer written or read: no engine ever moved a checkout before it, as
+  readiness refuses every move until PR C2's marker exists), never inferred from git: a moved checkout is adopted only when HEAD is on
+  `live` at exactly the commit the record names, then moved back to the
+  rollback tag with its git hooks restored (`restore-hooks`), and the services
+  restart on the old tip. `restore-hooks` exits 1 when a hook could not be
+  restored, the hook list could not be read, `sync-hooks.sh` is missing, fails,
+  times out or exits non-zero, or afterwards any hook the checkout lists is not
+  installed byte-identical and executable (readiness's own check,
+  `hook_install_failures` in `deploy_candidates_gate.py`), a hand-edited hook
+  included; the rollback then reports itself incomplete (a rebuild or drop,
+  past its commit point, only warns). A record that cannot be read, that says
+  git wrote part of the tree, or that says the switch began while the two-dot
+  residue toward its target is non-empty (HEAD not at the target) means a
+  possibly mixed working tree: nothing is restarted, the rollback reports
+  itself incomplete, the state is kept with its record, and the guard's
+  `mixed_tree` message is printed. A switch that began and wrote nothing
+  restarts the old tip. Exit 4 after such a rollback needs it to
+  have completed, hook restore, every service restart and a restarted
+  genesis-server answering its health endpoint included; that health wait (up
+  to 180 s) runs only on the units-refusal path that can exit 4, inside the
+  rollback's single verdict, so the history row, `last_update_failure.json` and
+  the exit code agree. Otherwise the run exits 1 and leaves no
+  `update_refused.json`.
+  The rebuilt tip is recorded in the "merging" row as soon as it is adopted.
+  `--post-merge` on `live` never runs the engine. What is recorded and sent to
+  the host guardian is the origin/main commit `live` is built on.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;
   dicts merge, lists REPLACE wholesale); dependency-free by design to stay
   import-cycle-safe.
@@ -3343,7 +4325,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: b70bf6f35 2026-10-09
+verified: 3e27b479 2026-10-23
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -3378,12 +4360,46 @@ verified: b70bf6f35 2026-10-09
   `update.sh` restores AGENTS.md to HEAD before its merge — saving any local
   edits under `~/.genesis/premerge-backups/` first — so the block must live in
   the commit).
+  The skill LISTING Claude Code sends every session has its own budget,
+  `skillListingBudgetFraction` in `.claude/settings.json` (0.02; CC's default is
+  0.01). The budget in characters is the model's context window × the model's
+  characters per token × the fraction, so a smaller window gets a smaller
+  listing. Over budget, CC (2.1.299) keeps every skill's name but drops the lower-
+  priority skills' descriptions, and logs `Skill listing over budget` only in a
+  debug log. MEASURED 2026-10-21 on one install: 122 skills needed 41,712 chars
+  against the default's 30,000 for each of the `sonnet`, `opus` and `haiku`
+  aliases; at 0.02 none of them warns. A model with a 200k-token window gets
+  about a fifth of that, so it still drops descriptions at 0.02. The setting
+  applies only to sessions launched at a checkout's root (the main checkout or a
+  worktree): CC reads project settings from the launch directory, and a session
+  started in `src/` was measured to keep the default. Most dispatched sessions run
+  outside the repo (`background_session_dir`, see `cc/invoker.py`) and keep 0.01
+  too; `--settings` does not carry this key (#3543). Re-measure
+  with `claude -p --model <m> --debug-file <f>` when the catalog or installed
+  plugins grow, or for a model with a smaller window.
+  The shared guard parser (`scripts/hooks/shell_parse.py`) carries nested
+  structural uncertainty and heredoc completeness independently. Proven inert
+  fragments retain narrow relief; complex valid heredoc forms can still be
+  refused. See `docs/reference/shell-parse-completeness.md` for the boundary.
+  For hash-free scanner inputs, its unquoted scanner consumes backslash/non-newline
+  pairs as word data. Hash-containing calls retain their earlier scanner behavior
+  to avoid a comment/quote regression; generic #3257/#3264 remain partial/open.
+  Existing continuation, heredoc proof, size bounds and nested refusals remain.
   Codex's local CLI also has a budget-only shell action hook in
   `.codex/config.toml` (`scripts/hooks/codex-review-stop`). It consumes the
   existing commit/request budget decisions, denies approval-required or unknown
   evidence, and returns control to the user without native approval or Genesis
   lifecycle registration. It does not enforce the future reflection gates or
   cover arbitrary indirect execution. See `docs/reference/codex-review-stop.md`.
+  A separate, inactive `scripts/hooks/codex-validator-adapter` translates native
+  validator calls to the existing guards concurrently. It requires an absolute
+  Bash cd/exit opener terminated by a newline, confines patches to validator
+  scratch roots, translates asks
+  to denials and preserves advisories. Six source-bound publishing-allowance
+  tests retain direct evidence only; separate independent-state controls verify
+  the actual ask/refusal and existing push-cache effects. It has no ordinary configuration wiring
+  or role-specific publishing/store policy yet. See
+  `docs/reference/codex-validator-boundary.md`.
   Codex has a separate external-client adapter in `.codex/config.toml`: it
   starts the existing standalone health and memory MCP servers through a
   launcher that scrubs inherited Genesis session identity, provenance,
@@ -3401,15 +4417,17 @@ verified: b70bf6f35 2026-10-09
   The separately launched validator can admit one canonical invocation of
   `scripts/codex_validator_request.py` through its native shell hook. Its
   bounded, private UUID request files use strict JSON and a closed operation
-  schema. `serving_status` and `serving_verify` project the existing deployment
-  status tripwire with bounded output and owned-child cleanup; unknown states
-  return static observations. `pilot_packet` and `pilot_probe` use launch-owned
-  private configuration, fixed source-bound fixture recipes, strict case counts,
-  a private operation mutex, and finite shared deployment-lock brackets. Probe
-  receipts describe fixture coverage, not live production behavior. Resource
-  admission uses installation policy while test children use a private home and
-  the installation pytest lock. Request creation and retirement use the admitted
-  workspace patch path. Verification recording and publication operations
+  schema. `serving_status` and `serving_verify` project one invocation of the
+  existing deployment status tripwire, with bounded collection and scoped SIGTERM
+  cancellation through owned-child cleanup. The request CLI sanitizes cancellation;
+  these observations are not functional verdicts. `pilot_packet` and `pilot_probe`
+  use launch-owned private configuration, fixed source-bound fixture recipes,
+  strict case counts, a private operation mutex, and finite shared
+  deployment-lock brackets. Probe receipts describe fixture coverage, not live
+  production behavior. Resource admission uses installation policy while test
+  children use a private home and the installation pytest lock. Request creation
+  and retirement
+  use the admitted workspace patch path. Verification recording and publication
   remain GROUNDWORK, and this boundary has no
   activation wiring in the ordinary project configuration. Its dedicated
   launcher must establish private workspace modes and umask before activation.
@@ -3419,6 +4437,14 @@ verified: b70bf6f35 2026-10-09
   creating a charter, or joining Genesis foreground/background lifecycle
   management. Recall remains read-oriented rather than side-effect-free: its
   normal retrieval-use metadata may still be updated.
+  The same project configuration exposes 15 explicitly named GitNexus tools
+  through `.claude/mcp/run-gitnexus`, reusing the existing installed-version and
+  Node pin checks. It adds no Genesis writers or lifecycle integration. GitNexus
+  snapshots can be stale; connection startup does not rebuild an index, and
+  source-editing `rename` and group-metadata `group_sync` are excluded. Raw
+  Cypher and incidental cache/recovery effects remain; this catalog is not a
+  side-effect-free server contract. See
+  `docs/reference/codex-gitnexus.md` for native qualification and configuration.
   `web-research` is the shared method for foreground sessions, the
   `genesis-researcher` subagent, and research-profile background sessions;
   task risk and breadth select its depth. Tier-2 `research` resources resolve and
@@ -3436,7 +4462,13 @@ verified: b70bf6f35 2026-10-09
   (3) the same exact values in the `GENESIS_PRIVATE_PATTERNS` CI secret. CI is
   WARN-not-block on the broad classes (never hard-blocks a contributor's legit
   RFC1918 example); only exact-value matches hard-fail, on canonical non-fork
-  PRs. Procedure: `public-repo leak-detection design`.
+  PRs and pushes. The CI scan runs on PRs to main and pushes to main
+  (`ci.yml`, required check `leak-detector`) AND on every push to every other
+  branch (`branch-leak-scan.yml`, advisory check `branch-leak-scan`, which also
+  scans the branch's commit history with gitleaks), so a branch with no PR is
+  still scanned; both call `scripts/ci/leak_scan.sh`. Scan logs name
+  `path:line` only, never the matched text.
+  Procedure: `public-repo leak-detection design`.
 - **bookmark/**: two-tier session bookmarks stored as episodic memories +
   a lookup table; enrichment runs on surplus compute.
 - **workflows/**: YAML DAG executor — GROUNDWORK(workflow-engine), built with

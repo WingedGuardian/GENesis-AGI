@@ -21,6 +21,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -273,7 +274,9 @@ def test_pressure_retrigger_is_rate_limited(box):
 # ── poll + state file ────────────────────────────────────────────
 
 
-def _poll(box, measure_lines: dict[str, str], act=1, raw_sizes: dict[str, int] | None = None) -> dict:
+def _poll(
+    box, measure_lines: dict[str, str], act=1, raw_sizes: dict[str, int] | None = None, extra: str = ""
+) -> dict:
     """check_disks + write_state with dg_measure answering per path.
 
     raw_sizes stubs a path's raw statvfs size in dg_raw_sizes_mb (the domain
@@ -302,6 +305,7 @@ def _poll(box, measure_lines: dict[str, str], act=1, raw_sizes: dict[str, int] |
         esac
     }}
     dg_io_snapshot() {{ :; }}
+{extra}
     check_disks
     write_state
     echo "next=$NEXT_POLL"
@@ -746,6 +750,27 @@ def test_a_process_name_with_a_tab_cannot_split_the_snapshot(box):
         proc.wait()
 
 
+def test_a_process_name_with_a_newline_stays_in_the_snapshot(box):
+    """A newline in comm: a first-line read of stat stopped inside the name and
+    dropped the writer from the snapshot (review finding)."""
+    # One write: bash's printf splits at the newline, and each write replaces
+    # the whole name.
+    code = ("import os, time; fd = os.open('/proc/self/comm', os.O_WRONLY); os.write(fd, b'dl\\nfake'); "
+            "print('ready', flush=True); time.sleep(60)")
+    proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL)
+    assert proc.stdout.readline().strip() == "ready"
+    try:
+        assert Path(f"/proc/{proc.pid}/comm").read_text() == "dl\nfake\n", "fixture precondition: renamed"
+        start = Path(f"/proc/{proc.pid}/stat").read_bytes().rpartition(b")")[2].split()[19].decode()
+        out = _run(box, "dg_io_snapshot").stdout.splitlines()
+        mine = [ln for ln in out if ln.split(" ")[0] == str(proc.pid)]
+        assert mine, "the renamed process is in the snapshot"
+        assert mine[0].split(" ")[1] == start and mine[0].split(" ")[3] == "dl_fake"
+    finally:
+        proc.kill()
+        proc.wait()
+
+
 # ── round-1 review findings ──────────────────────────────────────
 
 
@@ -818,12 +843,11 @@ def test_uninstall_stops_the_watchgod_and_both_pressure_instances():
     # email scan reads a literal name@word.service as an address), so match
     # the instance suffixes next to that variable.
     text = (_ROOT / "scripts" / "uninstall.sh").read_text()
-    assert text.count("genesis-tmp-watchgod.service") >= 2
+    assert "genesis-tmp-watchgod.service" in text
     assert text.count("PRESSURE_UNIT=genesis-disk-hygiene-pressure") == 1
-    assert text.count("P=genesis-disk-hygiene-pressure;") == 1
+    assert 'codebase_managed.py" uninstall -- --genesis-only --non-interactive' in text
     for suffix in ("@standard.service", "@last-resort.service"):
         assert text.count("${PRESSURE_UNIT}" + suffix) == 1, f"in-container path misses {suffix}"
-        assert text.count("\\${P}" + suffix) == 1, f"host-driven path misses {suffix}"
 
 
 def test_the_domain_key_ignores_which_wall_binds(box):
@@ -1278,3 +1302,37 @@ def test_attribution_names_the_trash_stores_separately(box):
     assert str(box["home"] / ".genesis" / "trash") in measured
     assert str(box["home"] / ".genesis" / "worktree-trash") in measured
     assert str(box["home"] / ".genesis") in measured
+
+
+
+def test_the_cc_reserve_waits_for_a_runaway_emptying_in_the_same_poll(box):
+    """check_disks runs the runaway response BEFORE the levers: when it has
+    just emptied a file in cc-tmp, cc-tmp's RED keeps its reserve for a poll
+    (released first, the writer would eat it in seconds)."""
+    cc = box["home"] / ".genesis" / "cc-tmp"
+    cc.mkdir()
+    reserve = cc / ".watchgod-reserve"
+    with open(reserve, "wb") as fh:
+        fh.truncate(16 * 1024 * 1024)
+    relieved = 'wg_runaway_check() { RUNAWAY_RELIEVED[$CC_KEY]=1; }'
+    _poll(box, {str(cc): "100 2048 0 - - ext4"}, raw_sizes={str(cc): 2048}, extra=relieved)
+    assert reserve.exists(), "the response's relief is seen by the same poll's lever"
+    red = [p for p in _pages(box) if p["title"].startswith("Disk nearly full")]
+    assert "reserve held" in red[0]["body"]
+    # Control: with nothing relieved, the same RED releases it.
+    _poll(box, {str(cc): "100 2048 0 - - ext4"}, raw_sizes={str(cc): 2048}, extra="wg_runaway_check() { :; }")
+    assert not reserve.exists()
+
+
+
+def test_a_fault_in_the_runaway_response_never_costs_the_home_levers(box):
+    """$HOME's RED levers run BEFORE the runaway response: an unbound variable
+    in the response kills the poll under set -u, and must not do so before
+    the reserve is released (review finding)."""
+    reserve = box["home"] / ".genesis" / "watchgod" / "reserve"
+    reserve.parent.mkdir(parents=True, exist_ok=True)
+    reserve.write_bytes(b"x")
+    crash = 'wg_runaway_check() { local x="$__never_set_anywhere__"; }'
+    with pytest.raises(AssertionError):
+        _poll(box, {"/": "100 100000 0 - - ext4"}, extra=crash)  # the HOME domain is measured as its mount
+    assert not reserve.exists(), "the home RED released its reserve before the response ran"

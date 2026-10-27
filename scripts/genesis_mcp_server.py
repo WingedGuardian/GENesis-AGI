@@ -29,6 +29,68 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 _VALID_SERVERS = {"health", "memory", "outreach", "recon", "discord-bot"}
+
+_SERVER_DECLARED_VARS: dict[str, frozenset[str]] = {
+    "health": frozenset(
+        {
+            "FIRECRAWL_API_KEY",  # mcp/health/web_tools.py: _SEARCH_BACKEND_KEYS
+            "API_KEY_TINYFISH",  # mcp/health/web_tools.py: _SEARCH_BACKEND_KEYS
+            "API_KEY_TAVILY",  # mcp/health/web_tools.py: _SEARCH_BACKEND_KEYS
+            "API_KEY_EXA",  # mcp/health/web_tools.py: _SEARCH_BACKEND_KEYS
+            "API_KEY_PERPLEXITY",  # mcp/health/web_tools.py: _SEARCH_BACKEND_KEYS
+            "API_KEY_BRAVE",  # web/search.py: WebSearcher, reached via web_tools.py
+            "GENESIS_BACKUP_REPO",  # mcp/health/errors.py
+            "GENESIS_VNC_PASSWORD",  # mcp/health/browser.py
+        }
+    ),
+    "memory": frozenset(
+        {
+            "API_KEY_VOYAGE",  # memory/reranker.py, constructed in _bootstrap_memory
+        }
+    ),
+    "outreach": frozenset(
+        {
+            "DISCORD_WEBHOOK_URL",  # mcp/outreach_mcp.py via _discord_webhook_env
+            "OUTREACH_RECIPIENT_DISCORD",  # mcp/outreach_mcp.py
+        }
+    ),
+    "recon": frozenset(),  # No additional secret reads beyond _MCP_VARS.
+    "discord-bot": frozenset(),  # DISCORD_BOT_TOKEN is already in _MCP_VARS.
+}
+
+_SERVER_DECLARED_PREFIXES: dict[str, tuple[str, ...]] = {
+    "health": (),  # No dynamic key families beyond the declared health keys.
+    "memory": (),  # No dynamic key families beyond the declared memory key.
+    "outreach": ("DISCORD_WEBHOOK_",),  # mcp/outreach_mcp.py via _discord_webhook_env
+    "recon": (),  # No additional dynamic key families.
+    "discord-bot": (),  # No additional dynamic key families.
+}
+
+_STANDALONE_ROUTER_SERVERS = frozenset({"health", "memory", "outreach", "recon"})
+
+
+def _standalone_routing_env_names(server: str) -> frozenset[str]:
+    if server not in _STANDALONE_ROUTER_SERVERS:
+        return frozenset()
+
+    try:
+        from genesis.env import repo_root
+        from genesis.routing.config import load_config
+        from genesis.routing.litellm_delegate import api_key_env_names
+
+        config = load_config(
+            repo_root() / "config" / "model_routing.yaml",
+            check_api_keys=False,
+        )
+        return frozenset(
+            name
+            for provider in config.providers.values()
+            for name in api_key_env_names(provider.provider_type)
+        )
+    except Exception:
+        return frozenset()
+
+
 _DEFAULT_FLAG = Path.home() / ".genesis" / "cc_context_enabled"
 _DEFAULT_STATUS = Path.home() / ".genesis" / "status.json"
 
@@ -724,6 +786,11 @@ def main(argv: list[str] | None = None) -> None:
         # documented knob is inert and every call silently stays at the 1000s default
         # (Codex P2 on #1587).
         "GENESIS_DELIBERATE_TIMEOUT_S",
+        # Graph-traversal telemetry kill switch (memory/graph_telemetry.py): the
+        # memory server makes most traversals, so a secrets.env setting that never
+        # reached it would leave the documented switch inert where it matters.
+        "GENESIS_GRAPH_TELEMETRY_DISABLED",
+        "GENESIS_MCP_ENV_RECORDER",  # File-only opt-out must precede installation.
     }
     import os
 
@@ -749,6 +816,28 @@ def main(argv: list[str] | None = None) -> None:
     # SerializedConnection retry holds its asyncio lock throughout) — accepted:
     # failing that write faster would help nothing.
     os.environ.setdefault("GENESIS_DB_BUSY_TIMEOUT_MS", "15000")
+
+    try:
+        from dotenv import dotenv_values
+
+        from genesis.env import genesis_home
+        from genesis.observability.mcp_env_reads import install
+
+        secret_keys = frozenset(dotenv_values(secrets)) if secrets.is_file() else frozenset()
+        declared = (
+            frozenset(_MCP_VARS)
+            | _SERVER_DECLARED_VARS[args.server]
+            | _standalone_routing_env_names(args.server)
+        )
+        install(
+            args.server,
+            declared=declared,
+            declared_prefixes=_SERVER_DECLARED_PREFIXES[args.server],
+            secret_keys=secret_keys,
+            log_path=genesis_home() / "logs" / "mcp_env_reads.jsonl",
+        )
+    except Exception:
+        logger.warning("Could not install MCP environment read recorder", exc_info=True)
 
     transport_kwargs = _build_transport_kwargs(args)
 

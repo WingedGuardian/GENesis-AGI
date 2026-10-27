@@ -51,15 +51,18 @@ def test_rollback_restores_db_only_when_migrated(text: str) -> None:
     assert "migrations ran but no current DB snapshot exists" in rb, (
         "migrated-but-no-snapshot must be a LOUD rollback failure, not a silent success"
     )
-    assert 'cp "$DB_FILE.pre-update" "$DB_FILE"' in rb, (
-        "restore copies the pre-update snapshot back"
+    assert 'cp "$DB_FILE.pre-update.peer-restore" "$DB_FILE"' in rb, (
+        "restore copies the authority-reset pre-update candidate back"
     )
-    # The snapshot flag is set ONLY on a successful `.backup` this run.
-    snap = text[text.find("--- Snapshotting database ---") : text.find("_do_rollback() {")]
-    assert "DB_SNAPSHOT_TAKEN=1" in snap, "flag set on successful .backup"
-    assert snap.index("DB_SNAPSHOT_TAKEN=1") > snap.index('".backup'), (
-        "flag set AFTER the .backup succeeds, inside the success branch"
-    )
+    # Current-run authority is granted only after the bounded worker succeeds.
+    snap = text[text.index("# BEGIN db-snapshot") : text.index("# END db-snapshot")]
+    assert 'exec python3 -I -S - "$1" "$2"' in snap
+    assert 'if timeout --kill-after=5s' in snap
+    assert 'snapshot "$DB_FILE" "$_PEER_RESTORE_PY"; then\n        DB_SNAPSHOT_TAKEN=1' in snap
+    # The isolated worker invokes the selected authority source before publishing.
+    assert snap.index('exec(compile(authority,') < snap.index('namespace["reset_peer_authority"](candidate)')
+    assert snap.index('namespace["reset_peer_authority"](candidate)') < snap.index('publish(candidate, guarded)')
+    assert 'if [ "$restart_ok" = "true" ] && [ "$db_ok" = "true" ]; then' in rb
     assert 'rm -f "$DB_FILE-wal" "$DB_FILE-shm"' in rb, (
         "restore MUST clear the stale WAL/SHM or SQLite replays the migrated changes"
     )
@@ -77,10 +80,16 @@ def test_rollback_restores_db_only_when_migrated(text: str) -> None:
 def test_recovery_detection_forces_server_restart(text: str) -> None:
     # Between health_check state and the restart block.
     seg = text[text.find('_write_state "health_check"') : text.find("# ── Restart services")]
-    assert "last_update_failure.json" in seg, "recovery detection checks the failure artifact"
-    assert "rolled_back | failed)" in seg, "and the last update_history status"
-    assert 'WERE_RUNNING+=("genesis-server")' in seg, (
-        "a recovery run forces genesis-server to restart"
+    # The evidence lives in the one predicate shared with the no-delta dispatch.
+    owed = re.search(r"# BEGIN restart-owed[^\n]*\n(.*?)# END restart-owed", text, re.DOTALL)
+    assert owed, "restart-owed block not found"
+    pending = owed.group(1)
+    assert "_server_recovery_pending" in seg, "recovery detection asks the shared predicate"
+    assert '[ -e "$SERVER_RESTART_OWED" ]' in pending, "it checks the restart an update owes"
+    assert "last_update_failure.json" in pending, "and the failure artifact"
+    assert "rolled_back | failed)" in pending, "and the last update_history status"
+    assert 'WERE_RUNNING=("genesis-server" "${WERE_RUNNING[@]}")' in seg, (
+        "a recovery run forces genesis-server to restart, ahead of a running bridge"
     )
     assert "_OPERATOR_STOP=true" in seg, (
         "an operator-stop (no artifact) is recorded, not force-started"
@@ -127,7 +136,11 @@ def _extract_recovery_block(text: str) -> str:
     assert helpers, "deploy-outcome-probes block not found in update.sh"
     start = text.index("_metadata_python() {")
     selector = text[start : text.index("\n}\n", start) + 3]
-    return selector + helpers.group(1) + seg
+    # The restart obligation (#3451) the block also reads: its file and the
+    # shared pending-recovery reader. Optional, so the slice still runs against a
+    # script from before it existed (how the #3451 tests were seen to fail first).
+    owed = re.search(r"# BEGIN restart-owed[^\n]*\n(.*?)# END restart-owed", text, re.DOTALL)
+    return selector + helpers.group(1) + (owed.group(1) if owed else "") + seg
 
 
 def _run_recovery(tmp_path: Path, text: str, *, artifact: bool, last_status: str | None) -> bool:

@@ -166,7 +166,9 @@ def test_call_site_falls_back_when_the_target_is_unwritable(tmp_path, monkeypatc
     monkeypatch.delenv("CI", raising=False)
     monkeypatch.setenv("GENESIS_PYTEST_LOCK", "0")
 
-    config = SimpleNamespace(option=SimpleNamespace(basetemp=None))
+    config = SimpleNamespace(
+        option=SimpleNamespace(basetemp=None), pluginmanager=pytest.PytestPluginManager()
+    )
     with pytest.warns(RuntimeWarning, match="could not place pytest basetemp"):
         mod.pytest_configure(config)  # must not raise
     try:
@@ -192,7 +194,9 @@ def test_call_site_actually_redirects(tmp_path, monkeypatch):
     monkeypatch.delenv("CI", raising=False)
     monkeypatch.setenv("GENESIS_PYTEST_LOCK", "0")
 
-    config = SimpleNamespace(option=SimpleNamespace(basetemp=None))
+    config = SimpleNamespace(
+        option=SimpleNamespace(basetemp=None), pluginmanager=pytest.PytestPluginManager()
+    )
     mod.pytest_configure(config)
     try:
         expected = big / "pytest" / str(os.getpid())
@@ -216,7 +220,9 @@ def test_call_site_reads_the_CI_variable(tmp_path, monkeypatch):
     monkeypatch.setenv("TMPDIR", str(tmp_path / "runner-tmp"))
     monkeypatch.setenv("GENESIS_PYTEST_LOCK", "0")
 
-    config = SimpleNamespace(option=SimpleNamespace(basetemp=None))
+    config = SimpleNamespace(
+        option=SimpleNamespace(basetemp=None), pluginmanager=pytest.PytestPluginManager()
+    )
     mod.pytest_configure(config)
     try:
         assert config.option.basetemp is None, "CI must be exempt, read from $CI"
@@ -238,7 +244,9 @@ def test_call_site_reads_TMPDIR_for_the_cc_tmp_case(tmp_path, monkeypatch):
     monkeypatch.setenv("TMPDIR", str(home / ".genesis" / "cc-tmp"))
     monkeypatch.setenv("GENESIS_PYTEST_LOCK", "0")
 
-    config = SimpleNamespace(option=SimpleNamespace(basetemp=None))
+    config = SimpleNamespace(
+        option=SimpleNamespace(basetemp=None), pluginmanager=pytest.PytestPluginManager()
+    )
     mod.pytest_configure(config)
     try:
         assert config.option.basetemp == str(big / "pytest" / str(os.getpid()))
@@ -724,7 +732,9 @@ def test_unconfigure_removes_its_own_unwritable_leaf(tmp_path, monkeypatch):
     monkeypatch.delenv("CI", raising=False)
     monkeypatch.setenv("GENESIS_PYTEST_LOCK", "0")
 
-    config = SimpleNamespace(option=SimpleNamespace(basetemp=None))
+    config = SimpleNamespace(
+        option=SimpleNamespace(basetemp=None), pluginmanager=pytest.PytestPluginManager()
+    )
     mod.pytest_configure(config)
     leaf = Path(config.option.basetemp)
     sealed = _sealed_leaf(leaf, 0o000)

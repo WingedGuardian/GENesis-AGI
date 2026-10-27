@@ -1505,6 +1505,31 @@ async def _resolution_label(gate, request_id: str) -> str:
     return f"⚠️ Already resolved ({actual})"
 
 
+async def _handle_payment_tap(ctx: HandlerContext, query, user) -> None:
+    """``payapprove:<nonce>``: one answer per tap, "Approved" only for a grant."""
+    registry = ctx.payment_approvals
+    granted = False
+    if registry is None:
+        answer = "Payment approval is unavailable here"
+    else:
+        try:
+            granted = await registry.handle_tap(
+                query.data.split(":", 1)[1], user.id if user else None, query.message
+            )
+        except Exception:
+            log.error("payment approval tap failed", exc_info=True)
+        answer = "Approved" if granted else "Refused"
+    try:
+        await query.answer(answer, show_alert=not granted)
+    except Exception:
+        log.debug("Failed to answer payment approval tap", exc_info=True)
+    if granted:
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            log.debug("Failed to remove the payment approval button", exc_info=True)
+
+
 async def handle_callback_query(
     ctx: HandlerContext, update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
@@ -1525,6 +1550,11 @@ async def handle_callback_query(
     """
     query = update.callback_query
     if not query:
+        return
+    # Card-release approval: decided by the registry alone, before the generic
+    # allowlist and before the approve/reject fall-through to ReplyWaiter.
+    if (query.data or "").startswith("payapprove:"):
+        await _handle_payment_tap(ctx, query, update.effective_user)
         return
 
     user = update.effective_user

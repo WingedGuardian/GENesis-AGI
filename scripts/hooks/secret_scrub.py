@@ -265,24 +265,64 @@ _STRUCTURED_CREDENTIAL_PATTERN = re.compile(
 # Labeled API/access/secret tokens — keep the label, redact the value.
 # ``secret[_\s-]?access[_\s-]?key`` is listed explicitly (before the shorter
 # ``secret[_\s-]?key``) so the AWS secret-key label is caught.
+_TOKEN_LABEL = (  # noqa: S105 - credential label regex, not a value
+    r"(?<![A-Za-z])(?:api[_\s-]?key|access[_\s-]?token|bearer[_\s-]?token|"  # noqa: S105
+    r"secret[_\s-]?access[_\s-]?key|secret[_\s-]?key|auth[_\s-]?token|"
+    r"refresh[_\s-]?token|api[_\s-]?secret|private[_\s-]?key)"
+)
 _CREDENTIAL_TOKEN_PATTERN = re.compile(
     # (?<![A-Za-z]) (not \b) so an underscore-joined prefix still matches, e.g.
     # the ``aws_secret_access_key`` form used in ~/.aws/credentials.
-    r"(?<![A-Za-z])(?:api[_\s-]?key|access[_\s-]?token|bearer[_\s-]?token|"
-    r"secret[_\s-]?access[_\s-]?key|secret[_\s-]?key|auth[_\s-]?token|"
-    r"refresh[_\s-]?token|api[_\s-]?secret|private[_\s-]?key)"
-    r"\s*(?:is\s+|[:=]\s*)(?P<token>[A-Za-z0-9_\-\./+]{16,})",
+    _TOKEN_LABEL + r"\s*(?:is\s+|[:=]\s*)(?P<token>[A-Za-z0-9_\-\./+]{16,})",
     re.IGNORECASE,
 )
+
+# HTTP credential headers. Their VALUE is the secret, whatever its shape: a
+# scheme plus a token (``Bearer x``, ``Basic YTpi``), a parameter list
+# (``Digest username=..., response=...``, ``AWS4-HMAC-SHA256 Credential=...``)
+# or cookie pairs (``SID=...; HttpOnly``). Everything from the separator to the
+# END OF THE LINE is withheld, and quoting is deliberately not read: three
+# review rounds each found a quoting shape (a curl argument with escaped
+# quotes, an escaped quote inside a JSON value, double-encoded JSON) where a
+# value grammar stopped early and let the credential through. Not finding the
+# end of the value is what removes that whole class. The cost is that a
+# one-line record (a serialized tool response) loses everything after such a
+# header, the cheap direction. The label may sit in a quoted or escaped-quoted
+# key (``'authorization': ...``, ``\"cookie\": ...``). ``credential_label_kind``
+# also treats these names as token labels, so a structured member is withheld
+# whatever its value looks like.
+_HEADER_LABEL = r"(?<![A-Za-z])(?:(?:proxy[_\s-]?)?authorization|(?:set[_\s-]?)?cookie)"
+_HEADER_PATTERN = re.compile(
+    # The value may start on the NEXT line (pretty-printed JSON puts it there),
+    # so the gap after the separator may hold one line break.
+    _HEADER_LABEL + r"(?:\\?[\"'])?[ \t]*[:=][ \t]*(?:\r?\n[ \t]*)?(?P<value>[^\r\n]*[^\s])",
+    re.IGNORECASE,
+)
+
+
+# A bearer credential wherever it appears, with no header label in front: a
+# curl command line, a log line, a copied value. The word after "bearer" is
+# withheld whatever it is. A configured bearer secret only has to be non-empty
+# ASCII, so neither a length floor, nor a character class, nor a list of prose
+# words can tell a credential from text: "Bearer token" may be the token. Prose
+# that mentions a bearer loses the following word, the cheap direction. The
+# value ends at whitespace or a quote, and an escaping backslash before a
+# closing quote stays outside it, so a serialized string keeps its escapes.
+_BEARER_VALUE_PATTERN = re.compile(
+    r"(?<![A-Za-z])bearer[ \t]+"
+    r"(?P<token>[^\s\"']+?)(?=\\[\"']|[\s\"']|\Z)",
+    re.IGNORECASE,
+)
+
 
 # password/passphrase/pin values — keep the label, redact the value. A quoted
 # value is captured whole (the quote alternatives let the value contain spaces);
 # an unquoted value stops at whitespace/separator. The left anchor is
 # ``(?<![A-Za-z])`` (not ``\b``) so an underscore-joined label still matches —
 # e.g. the ``DB_PASSWORD`` form has no word boundary between ``_`` and ``P``.
+_PASSWORD_LABEL = r"(?<![A-Za-z])(?:password|pass(?:word)?|pwd|passphrase|passcode|pin)"  # noqa: S105
 _SINGLE_CREDENTIAL_PATTERN = re.compile(
-    r"(?<![A-Za-z])(?:password|pass(?:word)?|pwd|passphrase|passcode|pin)"
-    r"\s*(?:is\s+|[:=]\s*)"
+    _PASSWORD_LABEL + r"\s*(?:is\s+|[:=]\s*)"
     r"(?P<value>\"[^\"]*\"|'[^']*'|[^\s,;]{4,})",
     re.IGNORECASE,
 )
@@ -372,14 +412,34 @@ _URL_CREDENTIAL_PATTERN = re.compile(
 # so `_SECRET_KEY_HINT` no longer saw SECRET_/TOKEN_ and the value stopped being
 # redacted at all. Bounding a repeat that feeds a downstream semantic check can
 # break the check rather than just the reach.
+_ENV_LABEL = r"(?<![A-Za-z0-9])(?P<key>_{0,4}[A-Z][A-Z0-9_]{2,512})"
 _ENV_ASSIGNMENT_PATTERN = re.compile(
-    r"(?<![A-Za-z0-9])(?P<key>_{0,4}[A-Z][A-Z0-9_]{2,512})"
-    r"(?P<sep>\s*=\s*)"
+    _ENV_LABEL + r"(?P<sep>\s*=\s*)"
     r"(?P<val>\"[^\"]+\"|'[^']+'|[^\s]{6,})",
 )
 _SECRET_KEY_HINT = re.compile(
     r"KEY|SECRET|TOKEN|PASSWORD|PASSWD|PASS|AUTH|API|CRED|PRIVATE", re.IGNORECASE
 )
+
+
+def credential_label_kind(label: str) -> str | None:
+    """Recognize structured labels using the exact plain-text vocabulary.
+
+    Structured values have no prose length floor. Environment labels retain
+    uppercase/key-shape constraints; the secret hint alone is insufficient.
+    """
+    for kind, pattern in (
+        ("token", _TOKEN_LABEL),
+        ("token", _HEADER_LABEL),
+        ("password", _PASSWORD_LABEL),
+    ):
+        if re.search(pattern + r"\s*\Z", label, re.IGNORECASE):
+            return kind
+    match = re.search(_ENV_LABEL + r"\s*\Z", label)
+    if match and _SECRET_KEY_HINT.search(match.group("key")):
+        return "env"
+    return None
+
 
 # Files whose CONTENTS are secret by nature. ONE vocabulary, anchored per path
 # segment; reused by command_touches_secret via tokenisation.
@@ -435,6 +495,8 @@ def scrub(text: str) -> str:
         text = _redact_pem_blocks(text)
         text = _KNOWN_KEY_PREFIX_PATTERN.sub(_REDACTED, text)
         text = _STRUCTURED_CREDENTIAL_PATTERN.sub(_REDACTED, text)
+        text = _redact_value_group(_HEADER_PATTERN, text, "value")
+        text = _redact_value_group(_BEARER_VALUE_PATTERN, text, "token")
         text = _redact_value_group(_CREDENTIAL_TOKEN_PATTERN, text, "token")
         text = _redact_value_group(_SINGLE_CREDENTIAL_PATTERN, text, "value")
         text = _redact_value_group(_URL_CREDENTIAL_PATTERN, text, "pw")

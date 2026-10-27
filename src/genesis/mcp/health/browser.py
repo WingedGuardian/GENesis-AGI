@@ -1,8 +1,11 @@
 """Browser automation tools for genesis-health MCP.
 
 Provides lightweight, on-demand browser tools with lazy initialization.
-The browser launches only when the first navigation/interaction tool is called,
-stays warm for the session, and shuts down when the MCP server exits.
+A browser launches only when the first navigation/interaction tool needs it and
+stays warm while used. Each layer (Camoufox, Chromium, remote CDP, TinyFish) has
+its own lifecycle: it is reclaimed after an hour without a tool call on it,
+a stale page restarts only its own layer, and everything shuts down when the
+MCP server exits.
 
 Primary browser: Camoufox (anti-detection Firefox). Persistent profile at
 ~/.genesis/camoufox-profile/ so cookies, localStorage, and login sessions
@@ -17,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import json
 import logging
 import math
 import os
@@ -25,36 +29,49 @@ import re
 import signal
 import time
 import uuid
+import weakref
 from datetime import UTC, datetime
 from pathlib import Path
 
 from fastmcp import Context
 
-from genesis.mcp.health import mcp
+from genesis.browser import chromium, engine, packages, profile_backup
+from genesis.browser.types import CAMOUFOX_PROFILE_DIR, BrowserLayer
+from genesis.mcp.health import mcp, payment_context
+from genesis.payments import card_fill
+from genesis.security.card_redaction import CARD_FILTER, contains_card_text, redact_text
+from genesis.security.card_redaction import redacted as _redacted
+from genesis.security.card_shapes import contains_card_number
+from genesis.util.mcp_logging import configure_mcp_logging
 
 logger = logging.getLogger(__name__)
 
-# File-based logging for the entire MCP health server — routes ALL log
-# output to ~/tmp/mcp_health.log so it's readable after timeouts.
-# The MCP server runs as a CC child process; its stderr is inaccessible.
-_mcp_log_dir = Path.home() / "tmp"
-if _mcp_log_dir.is_dir():
-    _mcp_fh = logging.FileHandler(_mcp_log_dir / "mcp_health.log")
-    _mcp_fh.setFormatter(logging.Formatter(
-        "%(asctime)s [%(name)s] %(levelname)s %(message)s",
-    ))
-    _mcp_fh.setLevel(logging.DEBUG)
-    # Attach to root logger so ALL genesis.* logs are captured
-    logging.getLogger("genesis").addHandler(_mcp_fh)
+# Fixed texts: a refusal never echoes the value it refused.
+_REFUSE_CARD_VALUE = (
+    "Refused: the value looks like a payment card number. Card numbers are never "
+    "typed with the general browser tools; hand card entry to the user (see the "
+    "browser-automation skill, Safety gates)."
+)
+_REFUSE_CARD_RUN_JS = (
+    "Refused: the script contains what looks like a payment card number. Card "
+    "numbers never go through browser_run_js; hand card entry to the user (see the "
+    "browser-automation skill, Safety gates)."
+)
+
+# Read the environment once, at import; optional logging cannot abort startup.
+# The shared selector also gives daily rotation the same fixed absolute path.
+_mcp_log_dir = configure_mcp_logging(CARD_FILTER)
 
 # Direct file-write debug log for Turnstile — bypasses logging framework
 # entirely to guarantee output is visible. The logging.FileHandler approach
 # produced empty files despite correct setup (likely a process/import issue).
-_TS_LOG_PATH = Path.home() / "tmp" / "turnstile_debug.log"
+_TS_LOG_PATH = _mcp_log_dir / "turnstile_debug.log" if _mcp_log_dir is not None else None
 
 
 def _ts_log_write(msg: str) -> None:
     """Write a timestamped line directly to the Turnstile debug log."""
+    if _TS_LOG_PATH is None:
+        return
     try:
         # Deliberate LOCAL import despite the module-level one: it keeps this
         # writer out of reach of patch.object(browser, "datetime"), which the
@@ -66,7 +83,7 @@ def _ts_log_write(msg: str) -> None:
 
         ts = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
         with open(_TS_LOG_PATH, "a") as f:
-            f.write(f"{ts} {msg}\n")
+            f.write(f"{ts} {redact_text(msg)}\n")
             f.flush()
     except Exception:
         pass  # debug logging must never crash the tool
@@ -85,10 +102,39 @@ class _TsLog:
 
 _ts_log = _TsLog()
 
+
+# ---------------------------------------------------------------------------
+# Card-number redaction of tool output and logs
+# ---------------------------------------------------------------------------
+# A page can show a card number. Every _impl_browser_* result passes through
+# @_redacted, and CARD_FILTER (security/card_redaction.py) sits on the loggers
+# below and on the mcp_health.log handler. A logger filter sees only records
+# created on that logger, so each emitting logger is named: this module, the
+# genesis.browser modules it calls, FastMCP's tool and server loggers
+# (tool_manager logs a tool exception with its traceback, server logs call
+# arguments at debug) and the MCP SDK's lowlevel server logger. Logger-level,
+# because FastMCP's configure_logging replaces the fastmcp handlers.
+_REDACTED_LOGGERS = (
+    __name__,
+    "genesis.browser.engine",
+    "genesis.browser.profile",
+    "genesis.browser.profile_backup",
+    "genesis.browser.provision",
+    "genesis.mcp.health.payment_context",
+    "genesis.payments.card_fill",
+    "genesis.payments.release_client",
+    "fastmcp.tools.tool_manager",
+    "fastmcp.tools.tool",
+    "fastmcp.server.server",
+    "mcp.server.lowlevel.server",
+)
+for _name in _REDACTED_LOGGERS:
+    logging.getLogger(_name).addFilter(CARD_FILTER)
+
 # Prevents concurrent browser init/cleanup races across tool calls.
 _browser_lock = asyncio.Lock()
 
-_PROFILE_DIR = Path.home() / ".genesis" / "camoufox-profile"
+_PROFILE_DIR = CAMOUFOX_PROFILE_DIR
 _CHROMIUM_PROFILE_DIR = Path.home() / ".genesis" / "browser-profile"
 
 # Module-level browser state — persists across tool calls within a session.
@@ -114,6 +160,11 @@ _remote_last_url: str | None = None  # URL at last Genesis action (drift detecti
 # disconnect and cleanup on purpose: the tab is never closed (owner ruling), so
 # a reconnect finds it again and reuses it instead of opening another one.
 _remote_target_ids: dict[str, str] = {}
+# Target ids of the tabs that opened the current Genesis tab when a click
+# followed a new tab (_follow_new_page), nearest last, keyed like
+# _remote_target_ids and kept as long: a reconnect replaces every page object,
+# so this is how it finds its way back to the opener once that tab has closed.
+_remote_openers: dict[str, list[str]] = {}
 # Opens and closes run under asyncio.shield, kept until they end: asyncio
 # holds only a weak reference to a task, so one whose caller was cancelled
 # could be garbage-collected midway. async_cleanup drains what still runs.
@@ -133,11 +184,21 @@ _tinyfish_session_id: str | None = None  # For cleanup via DELETE
 # User watches/interacts via noVNC at http://<tailscale-ip>:6080/vnc.html
 _collaborate_mode = False
 
-# Idle timeout — auto-cleanup browser after 1 hour of no tool calls.
-# User-approved value (2026-04-21). Background asyncio task polls every 60s.
-_last_used: float = 0.0
+# Idle timeout — each layer is reclaimed after 1 hour with no tool call ON THAT
+# LAYER. User-approved value (2026-04-21). Background asyncio task polls every
+# 60s. One timestamp per layer: with a single shared one, any call on any layer
+# kept every other layer alive, so a browser left behind on a layer switch
+# (Camoufox → remote CDP) never idled out, and a paid TinyFish session billed on
+# (#2874). Keyed by BrowserLayer; a layer is absent until first used.
+_layer_last_used: dict[BrowserLayer, float] = {}
 _idle_task: asyncio.Task | None = None
 _IDLE_TIMEOUT_S = 3600  # 1 hour
+
+# For _input_stall_diagnostics: when each local layer was launched (monotonic),
+# and the last JS dialog each page raised (_on_dialog).
+_layer_launched: dict[BrowserLayer, float] = {}
+_last_dialog: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_dialog_tasks: set[asyncio.Task] = set()
 
 _SCREENSHOT_DIR = Path.home() / "tmp"
 _VNC_DISPLAY = ":99"
@@ -197,27 +258,198 @@ def _is_page_alive(page) -> bool:
         return False
 
 
+def _layer_page(layer: BrowserLayer):
+    """The page a layer currently drives (None when the layer is closed)."""
+    return {
+        BrowserLayer.CAMOUFOX: _stealth_page,
+        BrowserLayer.CHROMIUM: _page,
+        BrowserLayer.REMOTE_CDP: _remote_page,
+        BrowserLayer.TINYFISH: _tinyfish_page,
+    }[layer]
+
+
+def _layer_of(page) -> BrowserLayer | None:
+    """Which layer drives ``page`` (by identity), or None."""
+    if page is None:
+        return None
+    for layer in BrowserLayer:
+        if _layer_page(layer) is page:
+            return layer
+    return None
+
+
+def _layer_open(layer: BrowserLayer) -> bool:
+    """True while a layer holds anything its cleanup must release.
+
+    Wider than "has a live page" on purpose: a dropped CDP connection leaves its
+    Playwright driver, and a dropped TinyFish connection leaves a session that
+    still bills until it is DELETEd.
+    """
+    if layer is BrowserLayer.CAMOUFOX:
+        return _stealth_cm is not None
+    if layer is BrowserLayer.CHROMIUM:
+        return _context is not None or _playwright is not None
+    if layer is BrowserLayer.REMOTE_CDP:
+        return _remote_browser is not None or _remote_pw is not None
+    return (
+        _tinyfish_browser is not None
+        or _tinyfish_pw is not None
+        or _tinyfish_session_id is not None
+    )
+
+
+def _forget_layer(layer: BrowserLayer, page) -> None:
+    """Bookkeeping shared by every layer's cleanup: drop its idle clock, and
+    stop the tools pointing at its page."""
+    global _active_page
+    _layer_last_used.pop(layer, None)
+    _layer_launched.pop(layer, None)
+    for tab in [t for t, entry in _opened_by.items() if entry[3] is layer]:
+        _opened_by.pop(tab, None)
+    if page is not None and _active_page is page:
+        _active_page = None
+
+
+# Closes of detached local layers still running (see _run_close), and the
+# window-closed reaps (_on_local_context_closed). Held here because the event
+# loop keeps only a weak reference to a task; async_cleanup waits for them, so
+# the MCP exit cannot end the process mid-close.
+_pending_closes: set[asyncio.Task] = set()
+
+
+async def _run_close(coro) -> None:
+    """Run a close that nothing else can find again, to completion.
+
+    Its caller has already detached the layer's globals (or never assigned
+    them), so if the caller is cancelled (the MCP exit cancelling an idle
+    reclaim, a tool timeout) no later cleanup could reach the resource. The
+    close therefore runs as one task, held in _pending_closes (the event loop
+    keeps only a weak reference to a task), which the caller awaits shielded;
+    a cancelled caller leaves it running and async_cleanup awaits it.
+    """
+    task = asyncio.ensure_future(coro)
+    _pending_closes.add(task)
+    task.add_done_callback(_pending_closes.discard)
+    await asyncio.shield(task)
+
+
+async def _close_step(aw, what: str) -> None:
+    """Await one close step with the user-approved 10 s cap; log, never raise."""
+    try:
+        await asyncio.wait_for(aw, timeout=10.0)
+    except TimeoutError:
+        logger.warning("%s timed out (10s) — it may be orphaned", what)
+    except Exception:
+        logger.debug("%s failed", what, exc_info=True)
+
+
+async def _close_camoufox(cm) -> None:
+    await _close_step(cm.__aexit__(None, None, None), "Camoufox cleanup")
+
+
+async def _close_chromium(ctx, pw) -> None:
+    # One task for both steps: the driver is stopped even when the caller is
+    # cancelled during the context close.
+    if ctx is not None:
+        await _close_step(ctx.close(), "Browser context close")
+    if pw is not None:
+        await _close_step(pw.stop(), "Playwright stop")
+
+
+async def _cleanup_camoufox() -> None:
+    """Close Camoufox (layer 1) and its Playwright driver. Touches no other layer.
+
+    The globals are detached BEFORE the close, so the context's own "close"
+    event (see _on_local_context_closed) finds nothing to do.
+    """
+    global _stealth_cm, _stealth_browser, _stealth_page
+
+    cm, page = _stealth_cm, _stealth_page
+    _stealth_cm = None
+    _stealth_browser = None
+    _stealth_page = None
+    _forget_layer(BrowserLayer.CAMOUFOX, page)
+    if cm is not None:
+        await _run_close(_close_camoufox(cm))
+
+
+async def _cleanup_chromium() -> None:
+    """Close the Chromium fallback (layer 2) and stop its driver. Touches no
+    other layer. Globals detached first, as in _cleanup_camoufox."""
+    global _playwright, _context, _page
+
+    pw, ctx, page = _playwright, _context, _page
+    _playwright = None
+    _context = None
+    _page = None
+    _forget_layer(BrowserLayer.CHROMIUM, page)
+    if ctx is not None or pw is not None:
+        await _run_close(_close_chromium(ctx, pw))
+
+
+_LAYER_CLEANUP = {
+    BrowserLayer.CAMOUFOX: lambda: _cleanup_camoufox(),
+    BrowserLayer.CHROMIUM: lambda: _cleanup_chromium(),
+    BrowserLayer.REMOTE_CDP: lambda: _cleanup_remote_cdp(),
+    BrowserLayer.TINYFISH: lambda: _cleanup_tinyfish(),
+}
+
+
+def _on_local_context_closed(layer: BrowserLayer, ctx) -> None:
+    """A local browser's context closed on its own (its window was closed, or
+    the browser exited). Run that layer's cleanup, which stops the Playwright
+    driver: without this the driver stayed alive until the next cleanup.
+
+    A close event from a context this module no longer holds (an old launch,
+    or our own cleanup, which detaches first) is ignored.
+    """
+    current = _stealth_browser if layer is BrowserLayer.CAMOUFOX else _context
+    if current is None or current is not ctx:
+        return
+    logger.warning("%s window closed — stopping its driver", layer.value)
+
+    async def _reap():
+        if layer is BrowserLayer.CAMOUFOX:  # its payment context closed with it
+            await payment_context.abort("browser_closed")  # outside the lock: it can wait
+        async with _browser_lock:
+            now = _stealth_browser if layer is BrowserLayer.CAMOUFOX else _context
+            if now is ctx:
+                await _LAYER_CLEANUP[layer]()
+
+    from genesis.util.tasks import tracked_task
+
+    task = tracked_task(_reap(), name=f"browser-{layer.value}-closed")
+    _pending_closes.add(task)  # retained, and drained by async_cleanup
+    task.add_done_callback(_pending_closes.discard)
+
+
 async def async_cleanup():
-    """Shut down browser. Called from MCP lifespan, idle timeout, or manually.
+    """Shut down EVERY browser layer. Called from the MCP lifespan end.
+
+    Idle reclaim and stale-page recovery use the per-layer cleanups instead
+    (_cleanup_camoufox, _cleanup_chromium, _cleanup_remote_cdp,
+    _cleanup_tinyfish), so they never disconnect remote CDP or end a paid
+    TinyFish session that is still in use.
 
     Safe to call when the browser is already dead — all steps are
     individually guarded so a crashed Camoufox won't hang cleanup.
     Each cleanup step has a 10s timeout (user-approved) to prevent hanging
     if the Playwright Node.js driver or browser process is stuck. Orphaned
-    processes that survive timeout are caught by the process reaper (hourly at :15).
+    processes that survive timeout are only observed by the process reaper
+    (hourly at :15), which reports them and does not kill them.
     """
-    global _playwright, _context, _page, _stealth_cm, _stealth_browser, _stealth_page, _active_page
-    global _idle_task, _last_used
+    global _active_page, _idle_task
 
     _active_page = None
+    # First: a release not yet claimed is cancelled, the payment context closed.
+    await payment_context.abort("mcp_exit")
 
-    # Cancel idle watcher first — prevent re-entrant cleanup
+    # Cancel the idle watcher first, so it cannot reclaim a layer concurrently.
     if _idle_task is not None:
         _idle_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await _idle_task
         _idle_task = None
-    _last_used = 0.0
 
     # Remote CDP: disconnect (does NOT close user's Chrome), then let shielded
     # closes that outlived their caller finish, within the same 10s bound.
@@ -227,119 +459,218 @@ async def async_cleanup():
 
     # TinyFish: terminate cloud session (stops credit burn)
     await _cleanup_tinyfish()
-
-    if _context is not None:
-        try:
-            await asyncio.wait_for(_context.close(), timeout=10.0)
-        except TimeoutError:
-            logger.warning("Browser context close timed out (10s)")
-        except Exception:
-            logger.debug("Browser context cleanup failed", exc_info=True)
-        _context = None
-        _page = None
-    if _playwright is not None:
-        try:
-            await asyncio.wait_for(_playwright.stop(), timeout=10.0)
-        except TimeoutError:
-            logger.warning("Playwright stop timed out (10s) — driver may be orphaned")
-        except Exception:
-            logger.debug("Playwright cleanup failed", exc_info=True)
-        _playwright = None
-    if _stealth_cm is not None:
-        try:
-            await asyncio.wait_for(
-                _stealth_cm.__aexit__(None, None, None), timeout=10.0,
-            )
-        except TimeoutError:
-            logger.warning("Camoufox cleanup timed out (10s)")
-        except Exception:
-            logger.debug("Camoufox cleanup failed", exc_info=True)
-        _stealth_cm = None
-        _stealth_browser = None
-        _stealth_page = None
+    await _cleanup_chromium()
+    await _cleanup_camoufox()
+    # Closes a cancelled reclaim or launch left running: each step is capped
+    # at 10 s, so this wait is bounded.
+    # asyncio.wait, not gather: a cancelled gather cancels what it waits for.
+    if _pending_closes:
+        await asyncio.wait(set(_pending_closes))
+    _layer_last_used.clear()
+    _opened_by.clear()
 
 
 async def _ensure_browser():
     """Lazily initialize Camoufox (primary browser) with persistent profile.
 
-    Returns the active page. Raises ImportError if camoufox is not installed.
+    Returns the active page. Raises engine.CamoufoxNotReady when there is no
+    launchable engine, and packages.BrowserPackagesChanged when the browser
+    packages changed under this process.
     In collaborate mode, launches headed on virtual display :99 for VNC sharing.
     Uses anti-detection Firefox by default for all browsing.
 
     Detects stale pages (e.g. browser killed by a concurrent session) and
-    automatically cleans up + re-initializes.
+    restarts Camoufox alone: remote CDP and TinyFish are left as they are.
     """
     global _stealth_cm, _stealth_browser, _stealth_page
 
     async with _browser_lock:
-        if _stealth_page is not None:
-            if _is_page_alive(_stealth_page):
-                return _stealth_page
-            logger.warning("Camoufox page is stale — restarting browser")
-            await async_cleanup()
+        if _stealth_page is not None and _is_page_alive(_stealth_page):
+            return _stealth_page
+        if payment_context.past_claim():  # a restart would close a claimed card's window
+            raise payment_context.PaymentInFlight(card_fill.TEXTS["payment_in_flight"])
+        if _layer_open(BrowserLayer.CAMOUFOX):
+            logger.warning("Camoufox page is stale — restarting Camoufox")
+            await _cleanup_camoufox()
+
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CAMOUFOX))
+        # Launch an explicit engine: without one camoufox resolves it itself, and
+        # from 0.5 on that deletes a pre-0.5 engine and downloads the pinned one
+        # inside this call. With it, camoufox still may fetch an add-on or its
+        # fingerprint model and write its config, but never touches an engine.
+        status = engine.resolve_camoufox_engine()
+        if not status.ready:
+            raise engine.CamoufoxNotReady(status.detail)
+        # A different engine upgrades the profile on first open; keep the way back.
+        await asyncio.to_thread(profile_backup.backup_camoufox_profile, _PROFILE_DIR, status.path)
 
         from camoufox.async_api import AsyncCamoufox
+        # Again past the import: an upgrade that began after the first check
+        # would have mixed old loaded modules with new files.
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.CAMOUFOX))
 
         _PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
         # Always headed — Xvfb :99 is always running.
         os.environ["DISPLAY"] = _VNC_DISPLAY
 
-        _stealth_cm = AsyncCamoufox(
+        prefs = {
+            # Camoufox disables session history (max_entries=0) for
+            # anti-detection.  Re-enable it so back/forward navigation
+            # works in collaborate mode.
+            "browser.sessionhistory.max_entries": 10,
+            "browser.sessionhistory.max_total_viewers": -1,
+        }
+        # Read once per launch: prefs cannot change under a running browser.
+        pinned = card_fill.card_fill_enabled()
+        if pinned:
+            prefs.update(card_fill.CARD_FILL_PREFS)
+        cm = AsyncCamoufox(
+            executable_path=str(status.path),
             headless=False,
             persistent_context=True,
             user_data_dir=str(_PROFILE_DIR),
             humanize=2.5,  # Native Camoufox cursor humanization (Bézier curves, max 2.5s)
             window=(1920, 1080),  # Fill VNC display (Xvfb :99 is 1920x1080x24)
-            firefox_user_prefs={
-                # Camoufox disables session history (max_entries=0) for
-                # anti-detection.  Re-enable it so back/forward navigation
-                # works in collaborate mode.
-                "browser.sessionhistory.max_entries": 10,
-                "browser.sessionhistory.max_total_viewers": -1,
-            },
+            firefox_user_prefs=prefs,
         )
-        _stealth_browser = await _stealth_cm.__aenter__()
+        # Nothing is assigned until __aenter__ succeeds, so a failed launch
+        # leaves no half-open layer behind. __aenter__ starts the Playwright
+        # driver before launching the browser (camoufox AsyncCamoufox), so a
+        # failed launch stops that driver here or it would be orphaned.
+        try:
+            ctx = await cm.__aenter__()
+        except BaseException:
+            await _run_close(_close_camoufox(cm))
+            raise
         # With persistent_context, browser IS the context
-        _stealth_page = _stealth_browser.pages[0] if _stealth_browser.pages else await _stealth_browser.new_page()
+        _stealth_cm, _stealth_browser = cm, ctx
+        payment_context.set_prefs_pinned(pinned)
+        _layer_launched[BrowserLayer.CAMOUFOX] = time.monotonic()
+        ctx.on("close", lambda c: _on_local_context_closed(BrowserLayer.CAMOUFOX, c))
+        ctx.on("dialog", _on_dialog)
+        _stealth_page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         mode_str = "headed (collaborate)" if _collaborate_mode else "headed"
         logger.info("Camoufox browser launched %s with persistent profile at %s", mode_str, _PROFILE_DIR)
         return _stealth_page
 
 
+def _patchright_installed() -> bool:
+    # Package metadata, not an import: a half-removed patchright whose metadata
+    # remains still counts as installed, so its import failure is reported.
+    return packages.installed_versions().get("patchright") is not None
+
+
+_warned_no_patchright = False
+# The browser extra carries patchright, pinned beside the playwright it pairs with.
+_PATCHRIGHT_STEP = engine.PACKAGE_HINT
+
+
+class PatchrightBroken(ImportError):
+    """patchright is installed but cannot be imported; the message is the repair."""
+
+
+def _chromium_package() -> str:
+    """The package the Chromium fallback runs through: patchright, which hides the
+    automation signals plain Playwright leaves, whenever it is installed."""
+    global _warned_no_patchright
+    if _patchright_installed():
+        return "patchright"
+    if not _warned_no_patchright:
+        _warned_no_patchright = True
+        logger.warning(
+            "patchright is not installed; the Chromium fallback uses plain Playwright, "
+            "which sites can detect. Operator step: %s",
+            _PATCHRIGHT_STEP,
+        )
+    return "playwright"
+
+
+def _chromium_async_playwright(package: str):
+    """``async_playwright`` from ``package``. An installed patchright whose import
+    fails is re-raised: switching silently to the detectable Chromium would hide
+    the broken install."""
+    if package == "patchright":
+        try:
+            from patchright.async_api import async_playwright
+        except ImportError as exc:
+            raise PatchrightBroken(
+                f"patchright is installed but cannot be imported ({exc}); tell the user; "
+                f"operator step: reinstall it ({_PATCHRIGHT_STEP})"
+            ) from exc
+    else:
+        from playwright.async_api import async_playwright
+    return async_playwright
+
+
 async def _ensure_chromium_fallback():
-    """Lazily initialize Playwright Chromium as fallback browser.
+    """Lazily initialize the Chromium fallback browser (patchright when installed).
 
     Use only when Camoufox fails on a specific site. Persistent profile at
     ~/.genesis/browser-profile/ (separate from Camoufox profile).
 
-    Detects stale pages and automatically re-initializes.
+    Detects stale pages and restarts Chromium alone (other layers untouched).
     """
     global _playwright, _context, _page
 
     async with _browser_lock:
-        if _page is not None:
-            if _is_page_alive(_page):
-                return _page
-            logger.warning("Chromium page is stale — restarting browser")
-            await async_cleanup()
+        if _page is not None and _is_page_alive(_page):
+            return _page
+        if _layer_open(BrowserLayer.CHROMIUM):
+            logger.warning("Chromium page is stale — restarting Chromium")
+            await _cleanup_chromium()
 
-        from playwright.async_api import async_playwright
-
-        _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-
-        # Always headed — Xvfb :99 is always running.
+        package = _chromium_package()
+        # Selected once: every check below guards the package this launch imports,
+        # even if one is installed or removed meanwhile.
+        dists = (package,)
+        packages.check_loaded_browser_modules(dists)
+        async_playwright = _chromium_async_playwright(package)
+        # Again past the import: an upgrade that began after the first check
+        # would have mixed old loaded modules with new files.
+        packages.check_loaded_browser_modules(dists)
+        # Always headed — Xvfb :99 is always running. Set before the driver starts:
+        # it copies the environment then, and the browser inherits the driver's.
         os.environ["DISPLAY"] = _VNC_DISPLAY
+        pw = await async_playwright().start()
+        try:
+            # An upgrade while the driver started can remove the revision this
+            # loaded driver launches: that needs a restart, not provisioning.
+            packages.check_loaded_browser_modules(dists)
+            # Before the profile copy and the launch: Playwright's own error for a
+            # missing browser tells the reader to run `<package> install`, a download
+            # no session may start. Judged where the driver itself will launch from.
+            missing = chromium.not_ready_at(package, "chromium", pw.chromium.executable_path)
+            if missing:
+                raise chromium.ChromiumNotReady(missing)
 
-        _playwright = await async_playwright().start()
-        _context = await _playwright.chromium.launch_persistent_context(
-            user_data_dir=str(_CHROMIUM_PROFILE_DIR),
-            headless=False,
-            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
-                  "--start-maximized"],
-            viewport={"width": 1280, "height": 720},
-        )
-        _page = _context.pages[0] if _context.pages else await _context.new_page()
+            await asyncio.to_thread(
+                profile_backup.backup_chromium_profile, _CHROMIUM_PROFILE_DIR, package
+            )
+            # And after the copy, which can wait minutes for another session's: an
+            # upgrade in that window must not reach the launch.
+            packages.check_loaded_browser_modules(dists)
+            _CHROMIUM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
+            ctx = await pw.chromium.launch_persistent_context(
+                user_data_dir=str(_CHROMIUM_PROFILE_DIR),
+                headless=False,
+                args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+                      "--start-maximized"],
+                # patchright's guidance: a fixed viewport is a fingerprint; the
+                # page follows the (maximized) window instead.
+                no_viewport=True,
+            )
+        except BaseException:
+            # Stop the driver this launch started; left running, the next
+            # launch would start another and orphan this one.
+            await _run_close(_close_chromium(None, pw))
+            raise
+        _playwright, _context = pw, ctx
+        _layer_launched[BrowserLayer.CHROMIUM] = time.monotonic()
+        ctx.on("close", lambda c: _on_local_context_closed(BrowserLayer.CHROMIUM, c))
+        ctx.on("dialog", _on_dialog)
+        _page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         mode_str = "headed (collaborate)" if _collaborate_mode else "headed"
         logger.info("Chromium fallback launched %s with profile at %s", mode_str, _CHROMIUM_PROFILE_DIR)
         return _page
@@ -411,7 +742,7 @@ async def _cleanup_remote_cdp() -> None:
     it does NOT terminate the remote Chrome process, and it does not close the
     Genesis tab either (it lives in the user's own context). The tab is left
     open on purpose and ``_remote_target_ids`` is kept, so the next connect
-    reuses it.
+    reuses it. Touches no other layer.
 
     The globals are cleared BEFORE the first await, and only the handles taken
     here are closed (shielded). A cleanup that outlives its caller (a second
@@ -420,6 +751,7 @@ async def _cleanup_remote_cdp() -> None:
     """
     global _remote_pw, _remote_browser, _remote_page, _remote_last_url, _active_page
 
+    _forget_layer(BrowserLayer.REMOTE_CDP, _remote_page)
     remote_browser, remote_pw = _remote_browser, _remote_pw
     if _active_page is not None and _active_page is _remote_page:
         _active_page = None
@@ -489,7 +821,11 @@ async def _ensure_remote_cdp(cdp_url: str | None = None):
                 "--user-data-dir=%USERPROFILE%\\chrome-genesis"
             )
 
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.REMOTE_CDP))
         from playwright.async_api import async_playwright
+        # Again past the import: an upgrade that began after the first check
+        # would have mixed old loaded modules with new files.
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.REMOTE_CDP))
 
         # The attempt is built in locals and published to the globals only once
         # it has a tab, so a failed or cancelled attempt is cleaned up through
@@ -544,6 +880,12 @@ async def _ensure_remote_cdp(cdp_url: str | None = None):
             ) from e
         # No await between the tab lookup returning and this publish.
         _remote_pw, _remote_browser, _remote_page = pw, remote_browser, page
+        if _remote_openers.get(url):
+            # A followed tab, reused: its close is handled as before the
+            # reconnect, minus the opener's page object, which is gone.
+            page.once("close", lambda _p: _on_followed_tab_closed(BrowserLayer.REMOTE_CDP, url, page))
+            if page.is_closed():  # it closed during the lookup, before the handler
+                _on_followed_tab_closed(BrowserLayer.REMOTE_CDP, url, page)
         return page
 
 
@@ -602,7 +944,16 @@ async def _genesis_remote_tab(remote_browser, url: str, late: list | None = None
     """
     known_id = _remote_target_ids.get(url)
     contexts = list(remote_browser.contexts)
-    if known_id is not None and await _remote_target_exists(remote_browser, known_id):
+    exists = known_id is not None and await _remote_target_exists(remote_browser, known_id)
+    # A Genesis tab a click followed has closed: go back to the nearest tab
+    # that opened it which Chrome still has, as the tools do while connected.
+    # An id is dropped only once Chrome has said it is gone.
+    chain = _remote_openers.get(url, [])
+    while known_id is not None and not exists and chain:
+        exists = await _remote_target_exists(remote_browser, chain[-1])
+        known_id = chain.pop()
+        _remote_target_ids[url] = known_id
+    if exists:
         for ctx in contexts:
             # Newest first: the Genesis tab was opened after the user's tabs,
             # so this usually finds it without probing every user tab.
@@ -659,6 +1010,7 @@ async def _genesis_remote_tab(remote_browser, url: str, late: list | None = None
             "be found again; closed it"
         )
     _remote_target_ids[url] = target_id
+    _remote_openers.pop(url, None)  # a new tab has no opener
     logger.info("CDP remote connected, opened a Genesis tab (target %s)", target_id)
     return page
 
@@ -667,9 +1019,11 @@ async def _cleanup_tinyfish():
     """Clean up TinyFish browser session (terminate to stop credit burn).
 
     Timeouts match the existing user-approved 10s pattern in async_cleanup().
+    Touches no other layer.
     """
     global _tinyfish_pw, _tinyfish_browser, _tinyfish_page, _tinyfish_session_id
 
+    _forget_layer(BrowserLayer.TINYFISH, _tinyfish_page)
     if _tinyfish_browser is not None:
         try:
             await asyncio.wait_for(_tinyfish_browser.close(), timeout=10.0)
@@ -719,20 +1073,33 @@ async def _ensure_tinyfish_browser(url: str | None = None) -> tuple:
     Returns (page, is_new_session). When is_new_session is True and url was
     provided, the page has already navigated to the URL (skip goto).
 
-    Always call _cleanup_tinyfish() when done to terminate the session
-    and stop credit consumption.
+    _cleanup_tinyfish() terminates the session and stops credit consumption:
+    at idle reclaim, at async_cleanup, and here before a stale session is
+    replaced. Switching to another layer does not end it.
     """
     global _tinyfish_pw, _tinyfish_browser, _tinyfish_page, _tinyfish_session_id
 
     async with _browser_lock:
         # Already connected and alive — reuse
-        if _tinyfish_page is not None and _tinyfish_browser is not None:
-            if _tinyfish_browser.is_connected() and _is_page_alive(_tinyfish_page):
-                return _tinyfish_page, False
+        if (
+            _tinyfish_page is not None
+            and _tinyfish_browser is not None
+            and _tinyfish_browser.is_connected()
+            and _is_page_alive(_tinyfish_page)
+        ):
+            return _tinyfish_page, False
+        # A dropped connection keeps its driver AND its session id, which bills
+        # until DELETEd: end both before creating a new session over them.
+        if _layer_open(BrowserLayer.TINYFISH):
             logger.warning("TinyFish session stale — cleaning up")
             await _cleanup_tinyfish()
 
+        # Before the session: it is billed from the moment it is created.
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.TINYFISH))
         from playwright.async_api import async_playwright
+        # Again past the import: an upgrade that began after the first check
+        # would have mixed old loaded modules with new files.
+        packages.check_loaded_browser_modules(_layer_dists(BrowserLayer.TINYFISH))
 
         from genesis.providers.tinyfish_client import browser_session_create
 
@@ -796,40 +1163,82 @@ async def _ensure_tinyfish_browser(url: str | None = None) -> tuple:
 
 def _on_tinyfish_disconnected():
     """Handle TinyFish CDP disconnection — clear state, log warning."""
-    global _tinyfish_browser, _tinyfish_page, _tinyfish_session_id
+    global _tinyfish_browser, _tinyfish_page, _tinyfish_session_id, _active_page
     sid = _tinyfish_session_id[:12] if _tinyfish_session_id else "unknown"
     logger.warning("TinyFish CDP disconnected (session %s)", sid)
+    if _active_page is not None and _active_page is _tinyfish_page:
+        _active_page = None  # the tools report "No page open" instead of a dead page's errors
     _tinyfish_browser = None
     _tinyfish_page = None
-    # session_id is intentionally NOT cleared here — async_cleanup()
-    # or next _ensure_tinyfish_browser() will attempt DELETE
+    # session_id is intentionally NOT cleared here: _cleanup_tinyfish (the
+    # next _ensure_tinyfish_browser, idle reclaim or async_cleanup) still has
+    # to DELETE it to stop the billing.
 
 
-def _touch():
-    """Record browser activity timestamp for idle timeout tracking."""
-    global _last_used
-    _last_used = time.monotonic()
+def _touch(layer: BrowserLayer | None = None) -> None:
+    """Record activity on ONE layer for idle tracking: ``layer``, or the layer
+    of the active page when None. Other layers' clocks keep running."""
+    if layer is None:
+        layer = _layer_of(_active_page)
+    if layer is not None:
+        _layer_last_used[layer] = time.monotonic()
+
+
+async def _reclaim_idle_layers(now: float) -> None:
+    """One idle pass: clean up each open layer unused for _IDLE_TIMEOUT_S.
+
+    Each layer is judged on its own clock, so an abandoned Camoufox is reclaimed
+    while remote CDP stays in use. An open layer with no clock yet (one launched
+    outside _get_page, e.g. by medium.py's direct _ensure_browser, while the
+    watcher was already running) starts its clock at this pass. The cleanup runs
+    under _browser_lock and re-checks the clock there, so a tool call that
+    touched the layer meanwhile keeps it.
+
+    A layer in use is never reclaimed mid-call: every page-acting _impl_* tool
+    (all but sessions, clear_domain and collaborate, which touch no page;
+    the first two stamp the layer whose live cookie jar they use) stamps
+    its layer when it starts, every one of them but browser_fill is capped by
+    _with_tool_timeout at 300 s or less, far inside _IDLE_TIMEOUT_S, and
+    browser_fill, which has no overall deadline, stamps the filled page's layer
+    at every step (_no_stall).
+    """
+    for layer in BrowserLayer:
+        if not _layer_open(layer):
+            _layer_last_used.pop(layer, None)
+            continue
+        last = _layer_last_used.setdefault(layer, now)
+        if now - last < _IDLE_TIMEOUT_S:
+            continue
+        if layer is BrowserLayer.CAMOUFOX and payment_context.in_flight():
+            continue  # a payment holds it (the flow also keeps its clock fresh)
+        async with _browser_lock:
+            last = _layer_last_used.get(layer, now)
+            if layer is BrowserLayer.CAMOUFOX and payment_context.in_flight():
+                continue
+            if _layer_open(layer) and now - last >= _IDLE_TIMEOUT_S:
+                logger.info(
+                    "Browser layer %s idle for %ds — reclaiming it", layer.value, _IDLE_TIMEOUT_S,
+                )
+                await _LAYER_CLEANUP[layer]()
 
 
 async def _idle_watcher_loop():
-    """Background task: cleanup browser after idle timeout (1 hour).
+    """Background task: reclaim each browser layer after 1 hour idle on it.
 
-    Polls every 60s. When the browser has been idle for _IDLE_TIMEOUT_S,
-    calls async_cleanup() and exits. CancelledError is the normal shutdown
-    path (MCP lifespan exit or explicit cleanup).
-
-    Note: does NOT acquire _browser_lock before cleanup. async_cleanup()
-    cancels and awaits _idle_task (this very coroutine), so holding the
-    lock here would self-deadlock. Cleanup is safe without the lock because
-    it sets _active_page = None atomically at entry and is individually
-    guarded throughout.
+    Polls every 60s and exits once no layer is open (_get_page restarts it).
+    CancelledError is the normal shutdown path (async_cleanup at MCP lifespan
+    exit). Per-layer cleanups never cancel this task, so it may hold
+    _browser_lock while reclaiming without deadlocking itself.
     """
     try:
         while True:
             await asyncio.sleep(60)
-            if _last_used > 0 and (time.monotonic() - _last_used) >= _IDLE_TIMEOUT_S:
-                logger.info("Browser idle for %ds — auto-cleaning up", _IDLE_TIMEOUT_S)
-                await async_cleanup()
+            try:
+                await _reclaim_idle_layers(time.monotonic())
+            except Exception:
+                # One failed reclaim must not end idle tracking of the others.
+                logger.warning("Browser idle reclaim failed", exc_info=True)
+            if not any(_layer_open(layer) for layer in BrowserLayer):
                 return
     except asyncio.CancelledError:
         return
@@ -1105,22 +1514,57 @@ async def _get_page(
 
     Returns (page, is_new_tinyfish_session) — is_new_tinyfish_session is True
     only when a fresh TinyFish session was just created (URL already loaded).
+
+    Moving to another layer closes nothing (owner ruling): the layer left
+    behind, TinyFish included, is reclaimed by its own idle clock.
     """
     global _active_page
+    layer = _requested_layer(stealth, remote, tinyfish)
     is_new_tinyfish = False
+    try:
+        if layer is BrowserLayer.TINYFISH:
+            page, is_new_tinyfish = await _ensure_tinyfish_browser(url=tinyfish_url)
+        elif layer is BrowserLayer.REMOTE_CDP:
+            page = await _ensure_remote_cdp(cdp_url)
+        elif layer is BrowserLayer.CAMOUFOX:
+            await _ensure_vnc()
+            page = await _ensure_browser()
+        else:
+            await _ensure_vnc()
+            page = await _ensure_chromium_fallback()
+    finally:
+        # Even when the ensure failed: a half-made layer (a TinyFish session
+        # created before its page load timed out) still bills, and only the
+        # watcher reclaims it.
+        _start_idle_watcher()
+    if payment_context.is_payment_page(page):  # never: no tool may act on that context
+        raise RuntimeError("refused: the payment context is not a tool page")
+    _active_page = page
+    # Leaving TinyFish does NOT end its session: ending a paid session because
+    # of what it costs is automatic cost control, which the design principles
+    # rule out (cost is observed, the user decides). Its own idle clock bounds
+    # an abandoned session to the idle window, like every other layer.
+    _touch(layer)
+    return page, is_new_tinyfish
+
+
+def _layer_dists(layer: BrowserLayer) -> tuple[str, ...]:
+    """The browser packages ``layer`` imports: what its launch guard checks and its
+    import-error advice weighs. One answer, so the two cannot drift apart."""
+    if layer is BrowserLayer.CAMOUFOX:
+        return packages.CAMOUFOX_DISTS
+    if layer is BrowserLayer.CHROMIUM:
+        return (_chromium_package(),)  # the one package the fallback runs
+    return packages.PLAYWRIGHT_ONLY
+
+
+def _requested_layer(stealth: bool, remote: bool, tinyfish: bool) -> BrowserLayer:
+    """The layer a browser_navigate call asks for (same precedence as _get_page)."""
     if tinyfish:
-        _active_page, is_new_tinyfish = await _ensure_tinyfish_browser(url=tinyfish_url)
-    elif remote:
-        _active_page = await _ensure_remote_cdp(cdp_url)
-    elif stealth:
-        await _ensure_vnc()
-        _active_page = await _ensure_browser()
-    else:
-        await _ensure_vnc()
-        _active_page = await _ensure_chromium_fallback()
-    _touch()
-    _start_idle_watcher()
-    return _active_page, is_new_tinyfish
+        return BrowserLayer.TINYFISH
+    if remote:
+        return BrowserLayer.REMOTE_CDP
+    return BrowserLayer.CAMOUFOX if stealth else BrowserLayer.CHROMIUM
 
 
 # Prefixes of the text _snapshot_page returns when there is no snapshot. An
@@ -1309,6 +1753,11 @@ async def _human_scroll(page, pixels: int, *, direction: str = "down") -> None:
 # for 22 minutes until the browser was killed externally.  This asyncio-level
 # wrapper is the ONLY reliable timeout for Camoufox browser tools.
 _TOOL_TIMEOUT_S: float = 60.0
+# The event-loop time (loop.time()) at which the innermost _with_tool_timeout
+# around this call expires; None outside one (browser_fill has no deadline).
+_tool_deadline: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "_tool_deadline", default=None
+)
 
 
 async def _with_tool_timeout(
@@ -1324,18 +1773,26 @@ async def _with_tool_timeout(
     On timeout, resets ``_active_page`` to None so subsequent tool calls
     don't operate on a page left in an indeterminate state.
     """
+    # The deadline is published in _tool_deadline, so optional work late in
+    # the call (_input_stall_diagnostics) can fit itself inside it.
+    deadline = asyncio.get_running_loop().time() + timeout_s
+    outer = _tool_deadline.get()
+    token = _tool_deadline.set(deadline if outer is None else min(outer, deadline))
     try:
         return await asyncio.wait_for(coro, timeout=timeout_s)
     except TimeoutError:
         global _active_page
         logger.warning("%s timed out after %.0fs — resetting active page", operation, timeout_s)
         _active_page = None
+        # Outside @_redacted: the operation names the caller's selector or key.
         return {
-            "error": (
+            "error": redact_text(
                 f"{operation} timed out after {timeout_s:.0f}s. {note}"
                 "Browser state was reset — call browser_navigate to resume."
             )
         }
+    finally:
+        _tool_deadline.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -1367,6 +1824,9 @@ _CALL_LOG_RECORD = re.compile(r"\s*(?:- |\d+ × )(.*)")
 # can make throw, our own ambiguity message quoting page attributes) is page or
 # caller text, however much it looks like a call log.
 _CLICK_ERROR_ATTR = "_genesis_click_error"
+# Where in its target's border box a failed humanized click aimed, set on that
+# click's own error: the point _input_stall_diagnostics hit-tests.
+_CLICK_OFFSET_ATTR = "_genesis_click_offset"
 
 
 async def _click_call(click) -> None:
@@ -1713,7 +2173,14 @@ async def _humanized_click(page, target, timeout: int, is_label: bool = False) -
         kwargs["position"] = {"x": pos["x"], "y": pos["y"]}
     # No position: Playwright picks its own point from the element's quads,
     # which handles every shape the sampler above could not.
-    await _click_call(target.click(**kwargs))
+    try:
+        await _click_call(target.click(**kwargs))
+    except Exception as err:
+        # Only a point this attempt chose, on the selector's own element: a
+        # label's, Playwright's or a fallback's point is not known here.
+        if pos is not None and not is_label:
+            setattr(err, _CLICK_OFFSET_ATTR, [pos["bl"] + pos["x"], pos["bt"] + pos["y"]])
+        raise
 
 
 async def _stealth_click(page, selector: str, timeout: int = 10000) -> None:
@@ -1945,12 +2412,16 @@ class FillStalled(Exception):
     """A browser call inside browser_fill made no progress for _FILL_STALL_S."""
 
 
-async def _no_stall(awaitable, what: str, *, report_progress: bool = True):
+async def _no_stall(
+    awaitable, what: str, layer: BrowserLayer | None, *, report_progress: bool = True
+):
     """Await one browser call of a fill, failing if it stalls.
 
     A completed step is activity for BOTH idle watchdogs that could reclaim a
-    fill with no overall deadline: this server's (_IDLE_TIMEOUT_S, via _touch)
-    and the MCP client's (via the _fill_progress reporter). A key-down step
+    fill with no overall deadline: this server's (_IDLE_TIMEOUT_S, via _touch
+    on ``layer``, the filled page's own layer: a navigate on another layer may
+    have moved the active page meanwhile) and the MCP client's (via the
+    _fill_progress reporter). A key-down step
     passes report_progress=False: a report can wait up to
     _FILL_PROGRESS_SEND_S, which would stretch the key's hold.
     """
@@ -1960,7 +2431,8 @@ async def _no_stall(awaitable, what: str, *, report_progress: bool = True):
         raise FillStalled(
             f"{what} made no progress for {_FILL_STALL_S:.0f}s"
         ) from None
-    _touch()
+    if layer is not None:  # never the active page's layer: see the docstring
+        _touch(layer)
     report = _fill_progress.get() if report_progress else None
     if report is not None:
         await report(what)
@@ -1980,14 +2452,15 @@ async def _human_type(page, selector: str, value: str) -> None:
 
     Chromium fallback (dev/test): atomic page.fill() (no delay overhead).
     """
+    layer = _layer_of(page)
     if not _is_camoufox_active() and not _is_remote_active():
-        await _no_stall(page.fill(selector, value, timeout=10000), "fill")
+        await _no_stall(page.fill(selector, value, timeout=10000), "fill", layer)
         return
 
     # Clear field reliably (works on React controlled inputs)
-    await _no_stall(page.fill(selector, "", timeout=10000), "clearing the field")
-    # Click to focus the field
-    await _no_stall(page.click(selector, timeout=10000), "focusing the field")
+    await _no_stall(page.fill(selector, "", timeout=10000), "clearing the field", layer)
+    # Click to focus the field. A click's own error, so _fill can read its call log.
+    await _no_stall(_click_call(page.click(selector, timeout=10000)), "focusing the field", layer)
     # Type per-keystroke with hold time + flight time (IKI) jitter.
     # Hold time: log-normal, median ~86ms (CMU Keystroke Dynamics calibration).
     # Flight time: 50-200ms uniform with 5% thinking pauses.
@@ -1998,10 +2471,11 @@ async def _human_type(page, selector: str, value: str) -> None:
         await _no_stall(
             page.keyboard.down(char),
             f"keystroke {i + 1} of {len(value)}",
+            layer,
             report_progress=False,
         )
         await asyncio.sleep(hold_s)
-        await _no_stall(page.keyboard.up(char), f"keystroke {i + 1} of {len(value)}")
+        await _no_stall(page.keyboard.up(char), f"keystroke {i + 1} of {len(value)}", layer)
         # Flight phase: gap to next key
         iki = random.uniform(0.05, 0.20)  # 50-200ms
         # 5% chance of a "thinking pause" (300-1000ms)
@@ -2046,14 +2520,14 @@ async def _send_turnstile_alert(page_url: str) -> None:
             severity=AlertSeverity.WARNING,
             title="CAPTCHA Challenge Detected",
             body=(
-                f"Browser at {page_url} hit a Cloudflare challenge. "
+                f"Browser at {redact_text(page_url)} hit a Cloudflare challenge. "
                 f"Auto-resolve and VNC click both failed after multiple attempts. "
                 f"Genesis will retry on next navigation.\n\n"
                 f"VNC available at: {vnc_url}"
             ),
         )
         await channel.send(alert)
-        logger.info("CAPTCHA alert sent to Telegram for %s", page_url)
+        logger.info("CAPTCHA alert sent to Telegram for %s", redact_text(page_url))
     except Exception:
         logger.warning("Failed to send CAPTCHA Telegram alert", exc_info=True)
 
@@ -2324,6 +2798,14 @@ async def _read_pointer_position(
 
 
 async def _vnc_click_turnstile(page) -> bool:
+    """:func:`_vnc_click_now`, unless a card payment runs (it would aim at the
+    active X window, which can be the payment window); a payment cannot start
+    while it clicks."""
+    with payment_context.try_x_input() as ok:
+        return ok and await _vnc_click_now(page)
+
+
+async def _vnc_click_now(page) -> bool:
     """Click the Turnstile checkbox via VNC trusted input (fallback).
 
     Uses vncdotool to send a mouse click through the VNC protocol, producing
@@ -2719,6 +3201,10 @@ async def _wait_for_turnstile(page, response=None, timeout_ms: int = 15000) -> d
                 _ts_log.info("RESOLVED: playwright_captcha (challenge gone)")
                 return {"status": "resolved", "method": "playwright_captcha"}
 
+        # Phases 2-3 click on the shared display, where a payment window may be.
+        if payment_context.in_flight():
+            return {"status": "blocked", "reason": "payment_in_flight"}
+
         # Phase 2: VNC click — last resort fallback
         _ts_log.info("PHASE 2: VNC click fallback")
         logger.warning(
@@ -2757,6 +3243,8 @@ async def _wait_for_turnstile(page, response=None, timeout_ms: int = 15000) -> d
                     attempt,
                 )
             else:
+                if payment_context.in_flight():  # stood down, not a VNC fault
+                    return {"status": "blocked", "reason": "payment_in_flight"}
                 vnc_failed_count += 1
                 logger.warning(
                     "VNC click attempt %d failed — repairing VNC infra",
@@ -2812,6 +3300,7 @@ async def _wait_for_turnstile(page, response=None, timeout_ms: int = 15000) -> d
 # ---------------------------------------------------------------------------
 
 
+@_redacted
 async def _impl_browser_navigate(
     url: str,
     stealth: bool = True,
@@ -2821,11 +3310,17 @@ async def _impl_browser_navigate(
 ) -> dict:
     """Navigate to a URL and return the page snapshot."""
     global _remote_last_url
-    _touch()
     _ts_log.info("browser_navigate called: url=%s stealth=%s remote=%s tinyfish=%s", url, stealth, remote, tinyfish)
 
     if tinyfish and remote:
         return {"error": "Cannot use tinyfish and remote simultaneously — pick one."}
+    # The layer this call uses, not the one it leaves: an abandoned layer's
+    # idle clock keeps running. After the check above, so a rejected call
+    # keeps no layer (a paid TinyFish session above all) alive. It is also the
+    # layer the result reports: the global active page can move to another
+    # layer while this call's goto runs (an overlapping navigate).
+    layer = _requested_layer(stealth, remote, tinyfish)
+    _touch(layer)
 
     # No timing switch for remote CDP: _human_delay already uses collaborate
     # timing (0.5-2 s) whenever the remote page is active, whatever
@@ -2839,8 +3334,30 @@ async def _impl_browser_navigate(
         )
     except ConnectionError as e:
         return {"error": str(e)}
+    except engine.CamoufoxNotReady as e:
+        # The guard before the resolver already refused stale modules, so this
+        # lead appears only when pip ran during the resolver call itself; then
+        # restarting comes first, as for any import error.
+        changed = packages.packages_changed_message(
+            packages.stale_loaded_modules(_layer_dists(BrowserLayer.CAMOUFOX))
+        )
+        lead = f"{changed} " if changed else ""
+        return {"error": f"{lead}Camoufox is not ready: {e}"}
+    except chromium.ChromiumNotReady as e:
+        return {"error": f"Chromium is not ready: {e}"}
+    except packages.BrowserPackagesChanged as e:
+        return {"error": str(e)}
+    except payment_context.PaymentInFlight:
+        return {"error": card_fill.TEXTS["payment_in_flight"], "code": "payment_in_flight"}
+    except PatchrightBroken as e:
+        # Restarting comes first when a package changed under this session, as for
+        # any import error; otherwise the message is patchright's own repair.
+        dists = _layer_dists(BrowserLayer.CHROMIUM)
+        if packages.packages_changed_message(packages.stale_loaded_modules(dists)):
+            return {"error": packages.import_error_message(e, dists)}
+        return {"error": str(e)}
     except ImportError as e:
-        return {"error": f"Browser not available: {e}. Install with: pip install playwright"}
+        return {"error": packages.import_error_message(e, _layer_dists(layer))}
 
     try:
         # Skip goto only when TinyFish session was JUST created with this URL
@@ -2866,23 +3383,11 @@ async def _impl_browser_navigate(
             _remote_last_url = page.url
 
         snapshot = await _snapshot_page(page)
-
-        def _layer_name():
-            from genesis.browser.types import BrowserLayer
-
-            if tinyfish:
-                return BrowserLayer.TINYFISH.value
-            if _is_remote_active():
-                return BrowserLayer.REMOTE_CDP.value
-            if _is_camoufox_active():
-                return BrowserLayer.CAMOUFOX.value
-            return BrowserLayer.CHROMIUM.value
-
         result = {
             "url": page.url,
             "title": await page.title(),
             "snapshot": snapshot,
-            "layer": _layer_name(),
+            "layer": layer.value,
         }
         if turnstile_result:
             result["turnstile"] = turnstile_result
@@ -2907,8 +3412,277 @@ async def _impl_browser_navigate(
         return {"error": str(e), "url": url}
 
 
+# A click that opens a new tab or popup is followed: the tools switch to it.
+# Playwright emits the page's "popup" event only once the new tab's FIRST
+# RESPONSE has arrived, so the wait has to cover that. MEASURED 2026-10-05 on
+# a newer browser stack than the pinned minimums (Camoufox 156 / Playwright
+# 1.62 / patchright 1.62.3), served over local HTTP, seconds from click to event:
+#   window.open (no noopener): Camoufox 0.06-0.11, patchright 0.016, CDP ~0
+#   target=_blank link:        Camoufox 3.1, 3.1, 7.8 (first window of a fresh
+#                              profile); patchright 0.03; CDP ~0
+#   _blank to a 2 s server:    Camoufox 2.4-3.1, patchright 1.97, CDP 2.01
+# A noopener tab in Firefox opens in a new content process, hence the seconds.
+# Waiting 10 s after EVERY click would be the price of catching those, so the
+# long wait applies only to a click whose target DECLARES a new tab (a link,
+# area or form with a non-self target, its own or the document's <base
+# target>; see _OPENS_NEW_TAB_JS). Every other click waits up to 1 s (from the
+# click's return; the 0.3 s navigation settle runs inside it), which covers a
+# script's window.open answering within about a second. A tab whose first
+# response comes later than its window is not followed: the result has no
+# new_page and the tools stay on the original.
+# Tab followed by a click -> (the page that opened it, its remote target id,
+# its URL at the time, the layer). Lets a close walk back to the nearest live
+# ancestor; a layer's cleanup drops that layer's entries (_forget_layer).
+_opened_by: dict = {}
+
+_NEW_TAB_WAIT_S: float = 1.0
+_NOT_FOLLOWED_LAYER_MOVED = "not followed: the browser layer changed during the click"
+_NEW_TAB_DECLARED_WAIT_S: float = 10.0
+
+# True when clicking ``e`` opens a new browsing context by declaration: a link
+# or area with a target other than the current one, or a submit control whose
+# form (or its own formtarget) names one. With no target of its own, a link or
+# form takes the document's first <base target> (HTML Standard, "the base
+# element"). _parent/_top are the current tab on a top-level page. A named
+# target already in use here (this window's name, or an iframe/frame of this
+# document) navigates that and opens nothing; a name held by ANOTHER existing
+# window, or by a frame of another document, cannot be seen from here, so it
+# still counts: the cost is the longer wait, never a wrongly driven page.
+_OPENS_NEW_TAB_JS = """
+(e) => {
+  const own = (v) => {
+    if (!v) return false;
+    const k = v.trim().toLowerCase();
+    if (['_self', '_parent', '_top'].includes(k)) return false;
+    if (k === '_blank') return true;
+    const doc = e.ownerDocument;
+    if (doc.defaultView && doc.defaultView.name === v) return false;
+    return !Array.from(doc.querySelectorAll('iframe[name], frame[name]'))
+      .some((f) => f.getAttribute('name') === v);
+  };
+  const base = () => {
+    const b = e.ownerDocument.querySelector('base[target]');
+    return b ? b.getAttribute('target') : null;
+  };
+  const target = (el, attr) => (el.hasAttribute(attr) ? el.getAttribute(attr) : base());
+  const link = e.closest('a[href], area[href]');
+  if (link && own(target(link, 'target'))) return true;
+  // Only a SUBMIT control sends its form: a text field, checkbox or
+  // type=button inside a target=_blank form opens nothing.
+  const ctl = e.closest('button, input');
+  // The IDL type applies the defaults: a button with no or an invalid type
+  // is a submit button.
+  const submits = ctl && ['submit', 'image'].includes((ctl.type || '').toLowerCase());
+  if (submits && ctl.form) {
+    const t = ctl.hasAttribute('formtarget')
+      ? ctl.getAttribute('formtarget') : target(ctl.form, 'target');
+    if (own(t)) return true;
+  }
+  return false;
+}
+"""
+
+
+async def _declares_new_tab(page, selector: str) -> bool:
+    """Whether the click target declares a new tab (see _OPENS_NEW_TAB_JS).
+    Best effort: an unreadable target counts as not declaring one."""
+    try:
+        return bool(
+            await asyncio.wait_for(
+                page.locator(selector).first.evaluate(_OPENS_NEW_TAB_JS), timeout=2.0,
+            )
+        )
+    except Exception:
+        logger.debug("new-tab classifier failed for %s", selector, exc_info=True)
+        return False
+
+
+def _set_layer_page(layer: BrowserLayer, page) -> None:
+    global _stealth_page, _page, _remote_page, _tinyfish_page
+    if layer is BrowserLayer.CAMOUFOX:
+        _stealth_page = page
+    elif layer is BrowserLayer.CHROMIUM:
+        _page = page
+    elif layer is BrowserLayer.REMOTE_CDP:
+        _remote_page = page
+    else:
+        _tinyfish_page = page
+
+
+# One action at a time per page for every tool that acts on the page (click,
+# fill, upload, key press, run_js; fill's focus click can open a tab too): a
+# click's tab watch, held from its click to its follow, must not see a tab
+# another action opened. The tools exempt from it, each with its reason, are
+# _PAGE_ACTION_EXEMPT in tests/test_mcp/test_browser_tools.py. A tab the page opens on its own in that
+# window still can be (the comment above _opened_by), and so can one from a
+# browser_navigate of the same page, which does not take this lock.
+_page_action_locks: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
+
+# How long a tool waits for the page's previous action. 10 s keeps the wait,
+# plus a key press or a click's own work, inside its 30 s / 60 s tool timeout,
+# whose expiry would reset the active page under the action holding the lock.
+_PAGE_ACTION_WAIT_S: float = 10.0
+_PAGE_BUSY = {
+    "error": "Another click, fill, upload, key press or script is still running "
+    "on this page; nothing was sent. Retry once it returns."
+}
+_PAGE_MOVED = {
+    "error": "The tools are no longer on the page this call was for (a click followed "
+    "a new tab, a navigate, or a reset); nothing was sent. Call browser_snapshot first."
+}
+
+
+@contextlib.asynccontextmanager
+async def _page_action(page):
+    """Yield None, holding ``page``'s action lock, or the error result when
+    the caller must not act: the page stayed busy for _PAGE_ACTION_WAIT_S
+    (nothing held), or the tools are no longer on it (a click ahead followed a
+    new tab, a navigate, a reset), so acting would hit a page they no longer
+    drive."""
+    lock = _page_action_locks.get(page)
+    if lock is None:
+        lock = _page_action_locks[page] = asyncio.Lock()
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=_PAGE_ACTION_WAIT_S)
+    except TimeoutError:
+        yield dict(_PAGE_BUSY)
+        return
+    try:
+        yield None if page is _active_page else dict(_PAGE_MOVED)
+    finally:
+        lock.release()
+
+
+def _on_followed_tab_closed(layer: BrowserLayer, remote_url: str | None, new) -> None:
+    """``new``, a tab a click followed, closed: if its layer still drives it,
+    go back to the nearest live tab that opened it (see _follow_new_page)."""
+    global _active_page, _remote_last_url
+    if _layer_page(layer) is not new:
+        return  # not driven (never followed, or already moved on); keep the chain
+    cur, restore = new, None
+    while cur in _opened_by:
+        prev, prev_target_id, prev_url, _ = _opened_by.pop(cur)
+        if _is_page_alive(prev):
+            restore = (prev, prev_target_id, prev_url)
+            break
+        cur = prev
+    if restore is None:
+        # No live ancestor: stop driving the closed tab rather than leave
+        # every later tool call failing on it. _remote_openers is left as it
+        # is: a dropped CDP connection closes every page object, the opener's
+        # first, and a reconnect then finds the tabs that are really still
+        # open by their ids.
+        _set_layer_page(layer, None)
+        if _active_page is new:
+            _active_page = None
+        logger.info("New tab closed and no tab that opened it is left — %s drives no page", layer.value)
+        return
+    prev, prev_target_id, prev_url = restore
+    _set_layer_page(layer, prev)
+    if layer is BrowserLayer.REMOTE_CDP:
+        chain = _remote_openers.get(remote_url, [])
+        if prev_target_id is None:
+            _remote_target_ids.pop(remote_url, None)
+            _remote_openers.pop(remote_url, None)
+        else:
+            _remote_target_ids[remote_url] = prev_target_id
+            # Its own openers are the ones before it.
+            _remote_openers[remote_url] = chain[: chain.index(prev_target_id)] if prev_target_id in chain else []
+        # The restored tab's drift baseline: if it changed while the popup
+        # was open, the next action gets the drift advisory.
+        _remote_last_url = prev_url
+    if _active_page is new:
+        _active_page = prev
+    logger.info("New tab closed — %s is back on the tab that opened it", layer.value)
+
+
+async def _follow_new_page(old, new) -> str | None:
+    """Make ``new`` (a tab or popup a click on ``old`` opened) the page its
+    layer drives, and the active page. ``old`` is never closed.
+
+    Remote CDP: the new tab becomes THE Genesis tab (its target id is the one
+    a reconnect looks for), because the tools drive one tab per session and
+    the drift guard, timing and health checks all key on _remote_page. The
+    original tab stays open in the user's Chrome and is no longer driven. A
+    new remote tab whose target id cannot be read is NOT followed: a reconnect
+    could not find it again, and would return to the original instead. The
+    openers' target ids are kept in _remote_openers for a reconnect.
+
+    When ``new`` closes while its layer still drives it (a sign-in popup that
+    closes itself), the layer goes back to the nearest live tab that opened it,
+    or, if none is left, drives no page (the tools then say so, and the next
+    browser_navigate on that layer starts afresh).
+
+    Returns None once ``new`` is followed, else why it was not (a note for the
+    click result).
+    """
+    global _active_page
+
+    layer = _layer_of(old)
+    if layer is None or payment_context.is_payment_page(new):
+        return _NOT_FOLLOWED_LAYER_MOVED
+    # The endpoint whose Genesis tab id the follow and a later close rewrite
+    # (_remote_target_ids is keyed by CDP URL). While remote CDP drives ``old``
+    # this is that connection's URL: a connect to another endpoint first cleans
+    # this layer up, which drops its _opened_by entries (_forget_layer).
+    remote_url = _remote_cdp_url if layer is BrowserLayer.REMOTE_CDP else None
+    # Keep the map from growing with every popup: first point each entry past
+    # its closed openers (a close walks through them to a live one), then drop
+    # the entries of closed tabs, which nothing points at any more.
+    for key in list(_opened_by):
+        entry = _opened_by[key]
+        while not _is_page_alive(entry[0]) and entry[0] in _opened_by:
+            entry = _opened_by[entry[0]]
+        _opened_by[key] = entry
+    for gone in [p for p in _opened_by if not _is_page_alive(p)]:
+        _opened_by.pop(gone, None)
+    try:
+        old_url = old.url
+    except Exception:
+        old_url = None
+    # Who opened it, so a close can walk back to the nearest LIVE ancestor (a
+    # popup that opened a popup, then both closed, returns to the original).
+    _opened_by[new] = (old, _remote_target_ids.get(remote_url), old_url, layer)
+    # BEFORE any await: a popup that closes itself during the target-id lookup
+    # below must still find its close handler (measured: registered after the
+    # await, a close 240-360 ms in was missed and the next reconnect opened a
+    # second Genesis tab).
+    new.once("close", lambda _p: _on_followed_tab_closed(layer, remote_url, new))
+    new_target_id = await _cdp_target_id(new) if layer is BrowserLayer.REMOTE_CDP else None
+    why = None
+    if new.is_closed():
+        why = "not followed: it closed again before the click returned"
+    elif _layer_page(layer) is not old or _active_page is not old:
+        # The click's layer moved on, or a navigate made another layer active:
+        # the next tool would not act on the new tab, so the result must not
+        # report it as followed.
+        why = _NOT_FOLLOWED_LAYER_MOVED
+    elif layer is BrowserLayer.REMOTE_CDP and new_target_id is None:
+        why = "not followed: its tab could not be identified for a reconnect"
+    if why is not None:
+        _opened_by.pop(new, None)
+        return why
+    _set_layer_page(layer, new)
+    if layer is BrowserLayer.REMOTE_CDP:
+        opener_id = _remote_target_ids.get(remote_url)
+        if opener_id is not None:
+            _remote_openers.setdefault(remote_url, []).append(opener_id)
+        _remote_target_ids[remote_url] = new_target_id
+    _active_page = new
+    logger.info("Click opened a new tab — %s now drives it: %s", layer.value, new.url)
+    return None
+
+
+@_redacted
 async def _impl_browser_click(selector: str) -> dict:
-    """Click an element on the current page."""
+    """Click an element on the current page.
+
+    A new tab or popup the click opens (``target=_blank``, ``window.open``) is
+    followed: it becomes the page the tools drive, the result's url and
+    snapshot are its own, and ``new_page`` reports it. The original tab stays
+    open. Wait windows: _NEW_TAB_WAIT_S / _NEW_TAB_DECLARED_WAIT_S.
+    """
     _touch()
     async with _browser_lock:
         if _active_page is None:
@@ -2924,9 +3698,48 @@ async def _impl_browser_click(selector: str) -> dict:
                 "recommendation": "Call browser_snapshot() to see current page state before acting.",
             }
         page = _active_page
+    # Its tab watch must see only what this click opens, so no other click,
+    # key press or script runs on this page meanwhile (_page_action).
+    async with _page_action(page) as refused:
+        return refused or await _click_and_follow(page, selector)
+
+
+async def _click_and_follow(page, selector: str) -> dict:
+    """The click of _impl_browser_click, its new-tab wait, and the follow."""
+    new_pages: list = []
+    arrived = asyncio.Event()
+
+    def _on_popup(p) -> None:
+        new_pages.append(p)
+        arrived.set()
+
+    sent_error = None
+    nav = None
     try:
         await _human_delay()
-        await _stealth_click(page, selector)
+        wait_s = (
+            _NEW_TAB_DECLARED_WAIT_S if await _declares_new_tab(page, selector)
+            else _NEW_TAB_WAIT_S
+        )
+        # Listen from just before the click, not across the delay above: a
+        # popup the page opened on its own during the delay is not this
+        # click's. (One whose first response arrives later still can be.)
+        page.on("popup", _on_popup)
+        nav = _NavWatch(page)  # for _with_stall_diagnostics, from the click on
+        try:
+            await _stealth_click(page, selector)
+        except Exception as e:
+            # Sent, then failed (a post-click wait timed out, or the page
+            # closed): a tab it was already seen to open is still followed,
+            # with the error as a warning. With none, it is the error result.
+            # Playwright emits no "popup" once the opener has closed, so a tab
+            # opened just before the page closed itself is not seen at all; a
+            # context-wide watch would claim tabs other pages open (on remote
+            # CDP, the user's own), so it is not used.
+            if isinstance(e, ClickBlocked) or not _click_was_sent(e, selector) or all(p.is_closed() for p in new_pages):
+                raise
+            sent_error = e
+        clicked_at = time.monotonic()
         # A click may trigger navigation (form submit, link). Playwright's click
         # waits only for navigations it sees start, and the keyboard and
         # shadow-DOM fallbacks wait for none, so settle briefly to let a nav
@@ -2935,25 +3748,463 @@ async def _impl_browser_click(selector: str) -> dict:
         await asyncio.sleep(0.3)
         with contextlib.suppress(Exception):
             await page.wait_for_load_state("domcontentloaded", timeout=3000)
-        _update_remote_url()  # Click may cause navigation (form submit, link)
-        snapshot = await _snapshot_page(page)
-        return {"clicked": selector, "url": page.url, "snapshot": snapshot}
+        # Wait until a popup that is still OPEN arrives: a helper that closed
+        # itself at once must not end the window for the real one.
+        while True:
+            arrived.clear()
+            remaining = wait_s - (time.monotonic() - clicked_at)
+            if remaining <= 0 or any(not p.is_closed() for p in new_pages):
+                break
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(arrived.wait(), timeout=remaining)
     except Exception as e:
-        # A ClickBlocked carries page markup, never Playwright's call log.
-        if not isinstance(e, ClickBlocked) and _click_was_sent(e, selector):
-            return {
-                "error": (
-                    f"Click on '{selector}' failed after it was or may have been sent, "
-                    "so it may already have taken effect: call browser_snapshot and "
-                    f"check before clicking again. Detail: {e}"
-                )
-            }
-        return {"error": f"Click failed on '{selector}': {e}"}
+        return await _with_stall_diagnostics(
+            _click_failed(selector, e), page, selector, e, "browser_click", nav
+        )
+    finally:
+        with contextlib.suppress(Exception):
+            page.remove_listener("popup", _on_popup)
+        if nav is not None:
+            nav.stop()
+    clicked = page
+    result: dict = {"clicked": selector}
+    if sent_error is not None:
+        result["warning"] = _click_failed(selector, sent_error)["error"]
+    try:
+        if new_pages:
+            # One click can open several (a helper that closes at once, an ad):
+            # follow the first still open; the others are listed, not driven.
+            new = next((p for p in new_pages if not p.is_closed()), new_pages[0])
+            with contextlib.suppress(Exception):
+                await new.wait_for_load_state("domcontentloaded", timeout=3000)
+            if new.is_closed():
+                why = "not followed: it closed again before the click returned"
+            else:
+                async with _browser_lock:
+                    why = await _follow_new_page(page, new)
+            title = ""
+            with contextlib.suppress(Exception):
+                title = await new.title()
+            result["new_page"] = {"url": new.url, "title": title}
+            also = [p.url for p in new_pages if p is not new and not p.is_closed()]
+            if also:
+                result["new_page"]["also_opened"] = also
+            if why is None:
+                page = new
+            else:
+                result["new_page"]["note"] = why
+        _update_remote_url()  # Click may cause navigation (form submit, link)
+        result["url"] = page.url
+        result["snapshot"] = await _snapshot_page(page)
+        if page is not clicked and page.is_closed():
+            # The followed tab closed itself while this result was read (a
+            # sign-in popup): its close handler moved the tools back, so report
+            # the page they are on now (normally the tab that opened it).
+            back = _active_page
+            result["new_page"]["note"] = (
+                "followed, then it closed itself: url and snapshot are the page the tools are on now"
+                if back is not None
+                else "followed, then it closed itself: no tab that opened it is left"
+            )
+            if back is not None:
+                result["url"] = back.url
+                result["snapshot"] = await _snapshot_page(back)
+                _update_remote_url()  # the agent has just seen this page
+        return result
+    except Exception as e:
+        # The click was sent; the tools may already be on a new tab.
+        failed = _click_failed(selector, e, sent=True)
+        if "new_page" in result:
+            failed["new_page"] = result["new_page"]
+        return failed
 
 
+def _click_failed(selector: str, e: Exception, sent: bool = False) -> dict:
+    """The error result of a failed browser_click: ``sent`` once the click is
+    known to have been sent (its follow and snapshot), else from the error."""
+    # A ClickBlocked carries page markup, never Playwright's call log.
+    if sent or (not isinstance(e, ClickBlocked) and _click_was_sent(e, selector)):
+        return {
+            "error": (
+                f"Click on '{selector}' failed after it was or may have been sent, "
+                "so it may already have taken effect: call browser_snapshot and "
+                f"check before clicking again. Detail: {e}"
+            )
+        }
+    return {"error": f"Click failed on '{selector}': {e}"}
+
+
+# --- Input-stall diagnostics ----------------------------------------------
+# A long-lived Camoufox was seen stalling every real mouse action at
+# "performing click action" while a script click (element.click()) worked, and
+# a fresh instance did not reproduce it. The candidate causes (a JS dialog, the
+# window losing focus or visibility on the X display, a navigation, the target
+# moving or being covered, something that accrues with instance age) cannot be
+# told apart afterwards, so a failure that reached that record carries this
+# snapshot, taken then, holding only the fields that separate those causes.
+# Read-only and value-free: every string must be on its field's allowlist
+# (_FIELD_TOKENS) and every number is rounded and bounded (_clamp, _bounded).
+# Each probe is bounded, so the whole snapshot costs at most two _STALL_PROBE_S
+# waits (4 s), and inside a tool deadline (_tool_deadline: browser_click's 60 s)
+# a probe runs only if its whole wait ends _STALL_DEADLINE_MARGIN_S before
+# that deadline: a late failure keeps its own error instead of becoming the
+# generic timeout-and-reset result.
+_STALL_PROBE_S: float = 2.0  # a healthy page answers in milliseconds
+_STALL_DEADLINE_MARGIN_S: float = 1.0  # the error path after the snapshot is ~ms
+_STALL_MAX_PX = 16384  # the widest viewport accepted, in CSS pixels
+_STALL_MAX_AGE_S = 7 * 86400  # ages are capped at a week
+_STALL_MAX_PAGES = 100
+
+# Each probe answers with ONE primitive string, built in the page and bounded
+# there. Decoding an answer runs synchronously in this process, outside any
+# timeout, and on a main-world layer (all but Camoufox) the page can redefine
+# the getters a probe reads AND the builtins Playwright's own in-page
+# serializer calls on an object or array result (``then``, ``stack``,
+# ``Object.entries``); a top-level string skips that walk. Each value is
+# length-prefixed (E): "s<len>:<text>" (at most 40 characters), "n<number>;"
+# (a primitive number), "t"/"f", "z" (null), or "i" ("<invalid>": a value of
+# another type or size, or a getter that threw). A probe that throws anyway
+# answers "<threw>", never the thrown value. Only operators are used (typeof,
+# ===, + on primitives, .length of a primitive string): a "captured" builtin
+# would be the page's own in its main world. _decode reads the answer back,
+# and _token and the number checks below re-check every value. What this
+# cannot reach is Playwright's own main-world plumbing around the script (how
+# it compiles the function and builds its arguments, and the text of an error
+# raised there): only an isolated world closes that.
+_PROBE_BOUND_JS = """
+  const S = (f) => { try { const v = f(); return typeof v === 'string' && v.length <= 40 ? v : '<invalid>'; } catch (_) { return '<invalid>'; } };
+  const N = (f) => { try { const v = f(); return typeof v === 'number' ? v : '<invalid>'; } catch (_) { return '<invalid>'; } };
+  const B = (f) => { try { const v = f(); return v === true || v === false ? v : '<invalid>'; } catch (_) { return '<invalid>'; } };
+  const E = (...vs) => {
+    let w = '';
+    for (let i = 0; i < vs.length; i++) {
+      const v = vs[i];
+      w += typeof v === 'number' ? 'n' + v + ';' : v === true ? 't' : v === false ? 'f' : v === null ? 'z'
+        : typeof v === 'string' && v.length <= 40 && v !== '<invalid>' ? 's' + v.length + ':' + v : 'i';
+    }
+    return w;
+  };
+"""
+_PROBE_MAX_CHARS = 1024  # ten values of at most 45 characters each fit easily
+
+# visibility, has_focus, ready_state, modal_dialog. modal_dialog: a modal
+# <dialog> makes the rest of the page inert, so real input to it is dropped
+# while a script click still dispatches.
+_DOC_KEYS = ("visibility", "has_focus", "ready_state", "modal_dialog")
+_DOC_STATE_JS = "() => {" + _PROBE_BOUND_JS + """
+  try {
+    return E(S(() => document.visibilityState), B(() => document.hasFocus()),
+             S(() => document.readyState), B(() => !!document.querySelector('dialog:modal')));
+  } catch (_) { return '<threw>'; }
+}"""
+
+# The viewport (2 values), the target's box (4), then the hit: null when no
+# point is known, "<invalid>" when the box is unreadable, else x, y, rel, tag.
+# ``o``: the offset in the target's box the click aimed at (_CLICK_OFFSET_ATTR),
+# or null when Playwright chose the point, which this code cannot know. The page
+# can tamper with how ``o`` is built, so the sums are bounded too. The box is
+# the element's own frame's, so the hit test is too. It descends open shadow
+# roots, and containment crosses them (as _PICK_POINT_JS does): a document-level
+# hit stops at the outermost host, which would read as a cover.
+_TARGET_STATE_JS = "(e, o) => {" + _PROBE_BOUND_JS + """
+  try {
+    const r = e.getBoundingClientRect();
+    const bx = N(() => r.x), by = N(() => r.y), bw = N(() => r.width), bh = N(() => r.height);
+    const vw = N(() => innerWidth), vh = N(() => innerHeight);
+    if (!o) return E(vw, vh, bx, by, bw, bh, null);
+    const x = N(() => bx + o[0]), y = N(() => by + o[1]);
+    if (typeof x !== 'number' || typeof y !== 'number') return E(vw, vh, bx, by, bw, bh, '<invalid>');
+    const within = (m, t) => { for (; m; m = m.parentNode || m.host) if (m === t) return true; return false; };
+    let n = e.ownerDocument.elementFromPoint(x, y);
+    for (let m; n && n.shadowRoot && (m = n.shadowRoot.elementFromPoint(x, y)) && m !== n; ) n = m;
+    const rel = !n ? 'none' : n === e ? 'target' : within(n, e) ? 'inside' : within(e, n) ? 'ancestor' : 'other';
+    return E(vw, vh, bx, by, bw, bh, x, y, rel, n ? S(() => n.localName) : null);
+  } catch (_) { return '<threw>'; }
+}"""
+
+
+# How JavaScript writes a primitive number ('' + v).
+_JS_NUMBER = re.compile(r"-?(?:\d+(?:\.\d+)?(?:e[+-]\d+)?|Infinity)|NaN")
+
+
+def _decode(w) -> list | None:
+    """The values a probe encoded (E in _PROBE_BOUND_JS), or None if ``w`` is
+    not a well-formed answer."""
+    if type(w) is not str or len(w) > _PROBE_MAX_CHARS:
+        return None
+    out: list = []
+    i = 0
+    try:
+        while i < len(w):
+            c, i = w[i], i + 1
+            if c in "tfzi":
+                out.append({"t": True, "f": False, "z": None, "i": "<invalid>"}[c])
+            elif c == "n":
+                j = w.index(";", i)
+                if not _JS_NUMBER.fullmatch(w[i:j]):
+                    return None
+                out.append(float(w[i:j]))
+                i = j + 1
+            elif c == "s":
+                j = w.index(":", i)
+                n = w[i:j]  # digits only: a sign or "_" could move ``end`` backwards
+                if not (n.isascii() and n.isdecimal()) or int(n) > 40 or (end := j + 1 + int(n)) > len(w):
+                    return None
+                out.append(w[j + 1:end])
+                i = end
+            else:
+                return None
+    except ValueError:
+        return None
+    return out
+
+
+# _TARGET_STATE_JS's values, in the shape _target_state reads.
+def _target_fields(v: list) -> dict | None:
+    if len(v) not in (7, 10):
+        return None
+    hit = v[6] if len(v) == 7 else {"at": v[6:8], "rel": v[8], "tag": v[9]}
+    return {"viewport": v[0:2], "box": v[2:6], "hit": hit}
+
+
+# Every string a probe returns is page-controlled: a tag names whatever the
+# page wrote (a custom element "secret-hunter2"), and on a layer that evaluates
+# in the page's main world (all but Camoufox) the page can redefine the getters
+# the probes read. So each string must be on its own field's allowlist: one
+# that is not becomes "<unlisted>" (a custom-element tag: "<custom>"), and a
+# value of the wrong shape becomes "<invalid>". Listed values are lowercased.
+_FIELD_TOKENS: dict[str, frozenset[str]] = {
+    # HTML living standard elements, plus the SVG and MathML ones a click lands on.
+    "tag": frozenset(
+        ["a", "abbr", "address", "area", "article", "aside", "audio", "b", "base", "bdi", "bdo", "blockquote", "body", "br", "button", "canvas", "caption", "cite", "code", "col", "colgroup", "data", "datalist", "dd", "del", "details", "dfn", "dialog", "div", "dl", "dt", "em", "embed", "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "head", "header", "hgroup", "hr", "html", "i", "iframe", "img", "input", "ins", "kbd", "label", "legend", "li", "link", "main", "map", "mark", "menu", "meta", "meter", "nav", "noscript", "object", "ol", "optgroup", "option", "output", "p", "picture", "pre", "progress", "q", "rp", "rt", "ruby", "s", "samp", "script", "search", "section", "select", "slot", "small", "source", "span", "strong", "style", "sub", "summary", "sup", "table", "tbody", "td", "template", "textarea", "tfoot", "th", "thead", "time", "title", "tr", "track", "u", "ul", "var", "video", "wbr", "svg", "g", "path", "circle", "ellipse", "line", "polyline", "polygon", "rect", "use", "text", "tspan", "image", "foreignobject", "math"]
+    ),
+    "visibility": frozenset({"visible", "hidden", "prerender"}),
+    "ready_state": frozenset({"loading", "interactive", "complete"}),
+    "rel": frozenset({"none", "target", "inside", "ancestor", "other"}),
+    "dialog": frozenset({"alert", "confirm", "prompt", "beforeunload"}),
+}
+# A valid custom element name: lowercase start, and a hyphen (HTML standard).
+_CUSTOM_TAG = re.compile(r"[a-z][a-z0-9._-]*-[a-z0-9._-]*")
+# Dialogs and launch time are recorded for the local layers only.
+_TRACKED_LAYERS = (BrowserLayer.CAMOUFOX, BrowserLayer.CHROMIUM)
+
+
+def _token(v, field: str):
+    """``v`` if it is on ``field``'s allowlist (_FIELD_TOKENS), lowercased.
+    A probe's own "<invalid>" (_PROBE_BOUND_JS) stays "<invalid>"."""
+    if type(v) is not str or v == "<invalid>":
+        return "<invalid>"
+    low = v.lower()
+    if low in _FIELD_TOKENS[field]:
+        return low
+    return "<custom>" if field == "tag" and _CUSTOM_TAG.fullmatch(low) else "<unlisted>"
+
+
+# Page-supplied numbers: a coordinate or size is clamped to [0, the viewport]
+# and an extent outside its range is invalid, both rounded; anything that is
+# not a finite number is invalid. An age or count this process measured is
+# rounded and capped.
+def _finite(v) -> bool:  # a JS BigInt arrives as an int of any size
+    return type(v) is float and math.isfinite(v) or type(v) is int and abs(v) <= 2**53
+
+
+def _clamp(v, hi):
+    return round(min(max(v, 0), hi)) if _finite(v) else "<invalid>"
+
+
+def _bounded(v, lo, hi):
+    return round(v) if _finite(v) and lo <= v <= hi else "<invalid>"
+
+
+def _doc_state(got: dict) -> dict:
+    return {
+        k: _token(got.get(k), k) if k in _FIELD_TOKENS else got.get(k)
+        if type(got.get(k)) is bool else "<invalid>"
+        for k in _DOC_KEYS
+    }
+
+
+# The target's box against the viewport, and what lies under the point the
+# click used; ``aimed``: whether that point is known.
+def _target_state(got: dict, aimed: bool) -> dict:
+    vp = got.get("viewport")
+    vw, vh = vp if type(vp) is list and len(vp) == 2 else (None, None)
+    vw, vh = _bounded(vw, 1, _STALL_MAX_PX), _bounded(vh, 1, _STALL_MAX_PX)
+    if "<invalid>" in (vw, vh):
+        return {"viewport": "<invalid>"}
+    out: dict = {"viewport": [vw, vh], "box": "<invalid>", "in_viewport": "<invalid>"}
+    box = got.get("box")
+    if type(box) is list and len(box) == 4 and all(map(_finite, box)):
+        x, y, w, h = box
+        out["box"] = [_clamp(x, vw), _clamp(y, vh), _clamp(w, vw), _clamp(h, vh)]
+        out["in_viewport"] = x + w > 0 and y + h > 0 and x < vw and y < vh
+    out["hit"] = {"point": "unknown"} if not aimed else "<invalid>"
+    hit = got.get("hit")
+    if aimed and type(hit) is dict and type(at := hit.get("at")) is list and len(at) == 2:
+        tag = hit.get("tag")
+        out["hit"] = {
+            "at": [_clamp(at[0], vw), _clamp(at[1], vh)],
+            "rel": _token(hit.get("rel"), "rel"),
+            "tag": None if tag is None else _token(tag, "tag"),
+        }
+    return out
+
+
+# Record a JS dialog for _input_stall_diagnostics, then settle it as Playwright
+# does when nothing listens (_on_dialog in playwright/_impl/_browser_context.py:
+# accept a beforeunload, dismiss the rest). Any listener turns that default
+# off, so this one settles every dialog itself, and says so when it cannot: a
+# dialog left open blocks the page. Its message is page text and is not kept.
+def _on_dialog(dialog) -> None:
+    kind = dialog.type
+    settle = dialog.accept() if kind == "beforeunload" else dialog.dismiss()
+    seen = {"type": _token(kind, "dialog"), "at": time.monotonic(), "settled": False}
+    with contextlib.suppress(Exception):
+        _last_dialog[dialog.page] = seen
+
+    async def _settle() -> None:
+        try:
+            await settle
+        except Exception:
+            logger.warning("JS dialog could not be settled", exc_info=True)
+            return
+        seen["settled"] = True
+
+    task = asyncio.ensure_future(_settle())
+    _dialog_tasks.add(task)
+    task.add_done_callback(_dialog_tasks.discard)
+
+
+# Counts main-frame navigations of ``page`` from construction to stop(), from
+# Playwright's "framenavigated" event: browser_navigate does not take the
+# page-action lock, so a click's page can load another document before or
+# while _input_stall_diagnostics probes it. An event, not a page round trip,
+# so the click pays nothing for it. It also counts a same-document navigation
+# (pushState, a hash change): a route change re-renders the page, so a
+# snapshot after one does not show what the failed click saw either.
+class _NavWatch:
+    def __init__(self, page) -> None:
+        self.page, self.count, self.armed = page, 0, False
+        with contextlib.suppress(Exception):
+            page.on("framenavigated", self._on_nav)
+            self.armed = True
+
+    def _on_nav(self, frame) -> None:
+        with contextlib.suppress(Exception):
+            if frame is self.page.main_frame:
+                self.count += 1
+
+    def stop(self) -> None:
+        with contextlib.suppress(Exception):
+            self.page.remove_listener("framenavigated", self._on_nav)
+
+
+# One in-page probe, bounded by _STALL_PROBE_S: its answer decoded (_decode)
+# and passed through ``check``, or why it failed. Skipped when its whole wait would not end by
+# ``end`` (loop time, from the tool deadline): a cut-short wait would read as
+# a hung page.
+async def _probe(call, check, end: float | None) -> dict:
+    if end is not None and asyncio.get_running_loop().time() + _STALL_PROBE_S > end:
+        return {"probe_skipped": "tool_deadline"}
+    try:
+        got = await asyncio.wait_for(call(), timeout=_STALL_PROBE_S)
+        if got == "<threw>":
+            return {"probe_failed": "page_script_threw"}
+        out = None if (vals := _decode(got)) is None else check(vals)
+        return {"probe_failed": "unexpected answer"} if out is None else out
+    except Exception as err:  # a probe that hangs, throws or answers oddly is itself a finding
+        return {"probe_failed": type(err).__name__}
+
+
+# What the page and its layer looked like when a click stalled at "performing
+# click action" (see the comment above _STALL_PROBE_S). A page that ``nav`` saw
+# navigate since the click is reported, not probed. ``offset``: where in the
+# target the failing click aimed (_CLICK_OFFSET_ATTR), or None when that is
+# unknown. Never raises.
+async def _input_stall_diagnostics(page, selector: str, nav: _NavWatch | None, offset=None) -> dict:
+    layer = _layer_of(page)
+    tracked = layer in _TRACKED_LAYERS
+    launched = _layer_launched.get(layer)  # only the local layers are recorded
+    now = time.monotonic()
+    diag: dict = {
+        "layer": layer.value if layer is not None else None,
+        # "not_tracked", never None: a null would read as "no dialog seen".
+        "instance_age_s": "not_tracked" if launched is None else min(round(now - launched), _STALL_MAX_AGE_S),
+        "open_pages": None,
+        "last_dialog": None if tracked else "not_tracked",
+    }
+    with contextlib.suppress(Exception):
+        diag["open_pages"] = min(len(page.context.pages), _STALL_MAX_PAGES)
+    if tracked and (seen := _last_dialog.get(page)) is not None:
+        age = min(round(now - seen["at"]), _STALL_MAX_AGE_S)
+        diag["last_dialog"] = {"type": _token(seen["type"], "dialog"), "age_s": age, "settled": seen["settled"]}
+    # With no watch, whether the page navigated is unknown, so nothing is probed.
+    if nav is None or not nav.armed:
+        diag["navigated"] = "not_tracked"
+        diag["document"] = diag["target"] = {"probe_skipped": "navigation_not_tracked"}
+        return diag
+    if not nav.count:
+        deadline = _tool_deadline.get()
+        end = None if deadline is None else deadline - _STALL_DEADLINE_MARGIN_S
+        diag["document"] = await _probe(
+            lambda: page.evaluate(_DOC_STATE_JS),
+            lambda v: _doc_state(dict(zip(_DOC_KEYS, v, strict=True))) if len(v) == len(_DOC_KEYS) else None,
+            end,
+        )
+        # Playwright's own timeout fires first (an unretrieved driver future
+        # otherwise outlives the cancelled wait); _probe's bound backs up a hung driver.
+        diag["target"] = await _probe(
+            lambda: page.locator(selector).first.evaluate(
+                _TARGET_STATE_JS, offset, timeout=_STALL_PROBE_S * 750
+            ),
+            lambda v: None if (got := _target_fields(v)) is None else _target_state(got, offset is not None),
+            end,
+        )
+    # A navigation since the click, before or during the probes: they read
+    # (or would read) another document.
+    diag["navigated"] = nav.count > 0
+    if nav.count:
+        diag["document"] = diag["target"] = {"probe_skipped": "page_navigated"}
+    return diag
+
+
+# ``result``, with a ``diagnostics`` field when ``err`` is a click's own error
+# whose call log reached "performing click action" (_call_log). The snapshot is
+# also logged as one line of JSON. ``nav`` was started before the click.
+async def _with_stall_diagnostics(
+    result: dict, page, selector: str, err: BaseException, tool: str, nav: _NavWatch | None
+) -> dict:
+    records = _call_log(err, selector)
+    # Stalled AT the click: the log ends there. A log that went on (click action
+    # done, waiting for scheduled navigations) timed out after a delivered click.
+    if not records or records[-1] != _CLICK_SENT_MARK:
+        return result
+    try:
+        diag = await _input_stall_diagnostics(page, selector, nav, getattr(err, _CLICK_OFFSET_ATTR, None))
+    except Exception as diag_err:  # never let the snapshot replace the error
+        diag = {"diagnostics_failed": type(diag_err).__name__}
+    result["diagnostics"] = diag
+    logger.warning("%s stalled at 'performing click action': %s", tool, json.dumps(diag, default=str))
+    return result
+
+
+@_redacted
 async def _impl_browser_fill(selector: str, value: str) -> dict:
-    """Fill a form field on the current page."""
-    global _active_page
+    """Fill a form field on the current page.
+
+    A value containing a payment card number is refused before anything is
+    typed or logged.
+
+    Known limit: the check reads the VALUE. Whether the target field is a card
+    field is not judged here; deciding that from page attributes misses labels
+    in other languages, placeholders and frames, so it is not judged anywhere
+    yet; the planned card-fill flow (#3172) owns it, where a field it fails to
+    find fails the fill (safe). A model already holding a card could type it in
+    pieces; the planned card vault and input and output redaction (#3172) are
+    what keep real numbers out of its context.
+    """
+    if contains_card_number(value):
+        return {"error": _REFUSE_CARD_VALUE}
     _touch()
     async with _browser_lock:
         if _active_page is None:
@@ -2969,8 +4220,20 @@ async def _impl_browser_fill(selector: str, value: str) -> dict:
                 "recommendation": "Call browser_snapshot() to see current page state before acting.",
             }
         page = _active_page
+    # _human_type's focus click can open a tab, which a concurrent click's tab
+    # watch would otherwise claim as its own (_page_action).
+    async with _page_action(page) as refused:
+        return refused or await _fill(page, selector, value)
+
+
+async def _fill(page, selector: str, value: str) -> dict:
+    """The typing of _impl_browser_fill, under its page's action lock."""
+    global _active_page
+    nav = None
     try:
         await _human_delay()
+        # For _with_stall_diagnostics: from the clearing and focus click on.
+        nav = _NavWatch(page)
         await _human_type(page, selector, value)
         _update_remote_url()  # Fill + Enter may cause navigation
         return {"filled": selector, "url": page.url}
@@ -2997,9 +4260,14 @@ async def _impl_browser_fill(selector: str, value: str) -> dict:
             )
         }
     except Exception as e:
-        return {"error": f"Fill failed on '{selector}': {e}"}
+        failed = {"error": f"Fill failed on '{selector}': {e}"}
+        return await _with_stall_diagnostics(failed, page, selector, e, "browser_fill", nav)
+    finally:
+        if nav is not None:
+            nav.stop()
 
 
+@_redacted
 async def _impl_browser_upload(selector: str, file_path: str) -> dict:
     """Upload a file to a file input element on the current page.
 
@@ -3024,14 +4292,92 @@ async def _impl_browser_upload(selector: str, file_path: str) -> dict:
     p = Path(file_path)
     if not p.is_file():
         return {"error": f"File not found or not a regular file: {file_path}"}
-    try:
-        await _human_delay()
-        await page.set_input_files(selector, str(p), timeout=10000)
-        return {"uploaded": p.name, "selector": selector, "url": page.url}
-    except Exception as e:
-        return {"error": f"Upload failed on '{selector}': {e}"}
+    async with _page_action(page) as refused:
+        if refused:
+            return refused
+        try:
+            await _human_delay()
+            await page.set_input_files(selector, str(p), timeout=10000)
+            return {"uploaded": p.name, "selector": selector, "url": page.url}
+        except Exception as e:
+            return {"error": f"Upload failed on '{selector}': {e}"}
 
 
+# A screenshot is pixels: text redaction cannot reach a card number drawn in
+# it. Before capturing, every frame is read for the text a page can RENDER:
+# innerText, every element's placeholder, value, aria-label, aria-placeholder,
+# aria-valuetext, title and alt attributes, <option> text, form-field values,
+# CSS ::before/::after content (an attr() there is resolved), SVG text, and
+# the same inside open shadow roots. The pieces go through the split-aware card
+# check; a card number anywhere refuses the capture and no file is written. A
+# frame that cannot be read refuses it as well, except one already detached.
+# Not read: text drawn into a canvas or an image, closed shadow roots, and a
+# change to the page between this read and the capture.
+_PAGE_TEXT_JS = r"""() => {
+  const out = [document.body ? document.body.innerText : ''];
+  const ATTRS = ['placeholder', 'value', 'aria-label', 'aria-placeholder',
+                 'aria-valuetext', 'title', 'alt'];
+  const pseudo = (el, which) => {
+    const c = getComputedStyle(el, which).content;
+    if (!c || c === 'none' || c === 'normal') return;
+    out.push(c.replace(/attr\(([^)]+)\)/g, (_, n) => el.getAttribute(n.trim()) || ''));
+  };
+  const visit = (root) => {
+    for (const el of root.querySelectorAll('*')) {
+      // A field's live value replaces its value attribute: reading both would
+      // repeat each group and hide a segmented card from the split check.
+      const field = el.matches('input, textarea, select');
+      for (const a of ATTRS) {
+        const v = a === 'value' && field ? null : el.getAttribute(a);
+        if (v) out.push(v);
+      }
+      if (field) out.push(String(el.value || ''));
+      if (el.matches('option')) out.push(el.text || '');
+      if (el instanceof SVGElement && el.matches('text, tspan')) out.push(el.textContent || '');
+      pseudo(el, '::before');
+      pseudo(el, '::after');
+      if (el.shadowRoot) {
+        for (const child of el.shadowRoot.children) out.push(child.innerText || '');
+        visit(el.shadowRoot);
+      }
+    }
+  };
+  visit(document);
+  return out.join('\n');
+}"""
+_SCREENSHOT_FRAME_READ_S: float = 5.0
+_REFUSE_CARD_SCREENSHOT = (
+    "Refused: the page shows what looks like a payment card number, so no "
+    "screenshot was taken. Use browser_snapshot, which redacts it."
+)
+_REFUSE_UNREAD_SCREENSHOT = (
+    "Refused: a frame of the page could not be read to check it for a payment "
+    "card number, so no screenshot was taken."
+)
+
+
+async def _screenshot_refusal(page) -> str | None:
+    """A fixed refusal when the page may show a card number, else None."""
+    texts = []
+    for frame in list(page.frames):
+        try:
+            text = await asyncio.wait_for(
+                frame.evaluate(_PAGE_TEXT_JS), timeout=_SCREENSHOT_FRAME_READ_S
+            )
+        except Exception:
+            if frame.is_detached():
+                continue
+            logger.warning("Screenshot card check could not read a frame", exc_info=True)
+            return _REFUSE_UNREAD_SCREENSHOT
+        texts.append(text if isinstance(text, str) else str(text))
+    if not texts:
+        return _REFUSE_UNREAD_SCREENSHOT
+    if contains_card_text("\n".join(texts)):
+        return _REFUSE_CARD_SCREENSHOT
+    return None
+
+
+@_redacted
 async def _impl_browser_screenshot() -> dict:
     """Take a screenshot of the current page."""
     _touch()
@@ -3043,6 +4389,9 @@ async def _impl_browser_screenshot() -> dict:
             return health
         page = _active_page
     try:
+        refusal = await _screenshot_refusal(page)
+        if refusal:
+            return {"error": refusal, "url": page.url}
         _SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
         # Unique per call: consecutive captures must not overwrite one another
         # (a session capturing 8 pages kept only the last one). The timestamp
@@ -3066,6 +4415,7 @@ async def _impl_browser_screenshot() -> dict:
         return {"error": f"Screenshot failed: {e}"}
 
 
+@_redacted
 async def _impl_browser_snapshot() -> dict:
     """Return the accessibility tree snapshot of the current page."""
     global _remote_last_url
@@ -3101,12 +4451,36 @@ async def _impl_browser_snapshot() -> dict:
         return {"error": f"Snapshot failed: {e}"}
 
 
+def _is_patchright_page(page) -> bool:
+    return type(page).__module__.startswith("patchright")
+
+
+async def _evaluate_main_world(page, expression: str):
+    """``page.evaluate`` in the page's own JavaScript world. patchright evaluates
+    in an isolated world by default (``isolated_context=True``), where the page's
+    own globals are invisible; browser_run_js is the DevTools console, so it asks
+    for the main world on patchright pages. DOM reads elsewhere work in either."""
+    if _is_patchright_page(page):
+        return await page.evaluate(expression, isolated_context=False)
+    return await page.evaluate(expression)
+
+
+@_redacted
 async def _impl_browser_run_js(expression: str) -> dict:
     """Execute JavaScript on the current page and return the result.
 
     Runs JS in the browser's V8 engine via Playwright page.evaluate().
-    Equivalent to Chrome DevTools console. Expressions are logged for audit.
+    Equivalent to Chrome DevTools console. Expressions are logged for audit,
+    so one containing a card number is refused before that log line.
+
+    Known limit (a documented residual, by owner decision): the check reads the
+    expression's TEXT, so a script that computes a number at runtime
+    (``'4242'+'4242'+…``) is not caught. No text check can close that for an
+    arbitrary evaluator; the guard catches the accidental literal, and the
+    planned card vault (#3172) keeps real numbers out of the agent's context.
     """
+    if contains_card_number(expression):
+        return {"error": _REFUSE_CARD_RUN_JS}
     _touch()
     async with _browser_lock:
         if _active_page is None:
@@ -3115,51 +4489,232 @@ async def _impl_browser_run_js(expression: str) -> dict:
         if health:
             return health
         page = _active_page
-    try:
-        logger.info("browser_run_js: %s", expression[:200])
-        result = await page.evaluate(expression)
-        _update_remote_url()  # JS may cause navigation
-        return {"result": result, "url": page.url}
-    except Exception as e:
-        return {"error": f"JS execution failed: {e}"}
+    async with _page_action(page) as refused:  # a script may open a tab
+        if refused:
+            return refused
+        try:
+            logger.info("browser_run_js: %s", expression[:200])
+            result = await _evaluate_main_world(page, expression)
+            _update_remote_url()  # JS may cause navigation
+            return {"result": result, "url": page.url}
+        except Exception as e:
+            return {"error": f"JS execution failed: {e}"}
 
 
+def _cookie_profiles() -> tuple[tuple[str, Path], ...]:
+    """The two local browser profiles the cookie tools cover, labelled."""
+    return (("camoufox", _PROFILE_DIR), ("chromium", _CHROMIUM_PROFILE_DIR))
+
+
+def _live_cookie_context(kind: str):
+    """See :func:`_live_cookie_context_unstamped`; also refreshes that layer's
+    idle clock when a live context is returned, so a session using only the
+    cookie tools keeps the browser whose jar it is reading. Only that layer:
+    the active page's layer is not touched by a cookie call."""
+    ctx = _live_cookie_context_unstamped(kind)
+    if ctx is not None:
+        _touch(BrowserLayer.CAMOUFOX if kind == "camoufox" else BrowserLayer.CHROMIUM)
+    return ctx
+
+
+def _live_cookie_context_unstamped(kind: str):
+    """This process's live browser context for a profile, or None.
+
+    While the browser runs, its cookie jar lives in memory and is written back
+    to the file, so the live context's cookie API is the only correct way to
+    read or change it. Camoufox's persistent context IS the browser object.
+
+    Liveness is the CONTEXT's, not the remembered page's: cookies belong to the
+    context, and the user closing one tab leaves the context (and its lock on
+    the profile) in place. A context this process holds counts until cleanup
+    clears it; a crashed one makes the cookie call fail, which is reported as
+    an error, never as an empty result. Callers hold ``_browser_lock`` so a
+    browser that is still starting is waited for, not missed.
+    """
+    if kind == "camoufox":
+        return _stealth_browser if _stealth_cm is not None else None
+    return _context
+
+
+# Bound on one cookie call to a live browser context. Camoufox is the reason:
+# a Playwright call into it has hung for 22 minutes (see _TOOL_TIMEOUT_S), and
+# these two tools have no tool-level timeout. A cookie read or clear on a
+# healthy browser returns in well under a second, so 30 s means a hung browser,
+# and the profile then reports an error instead of blocking the tool forever.
+# The tools also wait for _browser_lock first; every holder of that lock runs
+# under its own tool timeout, so that wait ends when the holder's does.
+_COOKIE_CALL_TIMEOUT_S: float = 30.0
+
+
+async def _cookie_call(awaitable):
+    return await asyncio.wait_for(awaitable, timeout=_COOKIE_CALL_TIMEOUT_S)
+
+
+def _expired_copy(cookie: dict) -> dict:
+    """The same cookie (name, domain, path, partition) already expired.
+
+    Setting it deletes that one cookie in place. Playwright's filtered
+    clear_cookies() instead clears the WHOLE jar and re-adds the rest
+    (server/browserContext.js clearCookies, 1.58.0), so a failed re-add would
+    log the profile out of every site. Every identity field is kept, including
+    Chromium's ``_crHasCrossSiteAncestor``, which Playwright otherwise defaults
+    to true and so would name a different partition.
+    """
+    keep = (
+        "name", "domain", "path", "secure", "httpOnly", "sameSite",
+        "partitionKey", "_crHasCrossSiteAncestor",
+    )
+    return {**{k: cookie[k] for k in keep if k in cookie}, "value": "deleted", "expires": 1}
+
+
+def _cookie_key(cookie: dict) -> tuple:
+    """A cookie's identity: the fields :func:`_expired_copy` keeps that name
+    WHICH cookie, including Chromium's ancestor bit (part of the partition)."""
+    return (
+        cookie.get("name"), cookie.get("domain"), cookie.get("path"),
+        cookie.get("partitionKey"), cookie.get("_crHasCrossSiteAncestor"),
+    )
+
+
+@_redacted
 async def _impl_browser_sessions() -> dict:
-    """List logged-in sessions from the persistent browser profile.
+    """List cookie counts per domain in both local browser profiles.
 
-    Does NOT launch a browser — reads the cookie database directly.
+    Does NOT launch a browser. A profile whose browser runs in this process is
+    read through the live context; otherwise the cookie file is read
+    read-only. Each entry says which source it used. Holds ``_browser_lock``
+    (see :func:`_impl_browser_clear_domain`).
     """
-    try:
-        from genesis.browser.profile import BrowserProfileManager
-        mgr = BrowserProfileManager()
-        info = mgr.get_info()
-        return {
-            "profile_path": info.profile_path,
-            "exists": info.exists,
-            "size_mb": info.size_mb,
-            "sessions": [
-                {"domain": s.domain, "cookie_count": s.cookie_count}
-                for s in info.sessions
-            ],
-        }
-    except Exception as e:
-        return {"error": f"Failed to read browser sessions: {e}"}
+    from collections import Counter
+
+    from genesis.browser.profile import BrowserProfileManager
+
+    profiles = []
+    async with _browser_lock:
+        for kind, pdir in _cookie_profiles():
+            entry: dict = {"browser": kind, "profile_path": str(pdir)}
+            try:
+                ctx = _live_cookie_context(kind)
+                if ctx is not None:
+                    counts = Counter(
+                        (c.get("domain") or "").lstrip(".")
+                        for c in await _cookie_call(ctx.cookies())
+                    )
+                    entry.update(
+                        source="live browser",
+                        exists=True,
+                        sessions=[
+                            {"domain": d, "cookie_count": n} for d, n in sorted(counts.items())
+                        ],
+                    )
+                else:
+                    mgr = BrowserProfileManager(pdir, browser=kind)
+                    info = mgr.get_info()
+                    entry.update(
+                        source="profile file",
+                        exists=info.exists,
+                        size_mb=info.size_mb,
+                        sessions=[
+                            {"domain": s.domain, "cookie_count": s.cookie_count}
+                            for s in info.sessions
+                        ],
+                    )
+                    if info.error:
+                        entry["error"] = info.error
+                    pid = mgr.running_pid()
+                    if pid is not None:
+                        entry["note"] = (
+                            f"open in another browser process (pid {pid}); the file "
+                            "can lag that browser's live cookies"
+                        )
+            except Exception as e:
+                entry["error"] = f"Failed to read {kind} sessions: {e!r}"
+            profiles.append(entry)
+    return {"profiles": profiles}
 
 
+@_redacted
 async def _impl_browser_clear_domain(domain: str) -> dict:
-    """Clear cookies for a specific domain (selective logout).
+    """Clear the cookies of a domain and its subdomains in both profiles.
 
-    Does NOT launch a browser — modifies the cookie database directly.
+    Exact label matching: ``x.com`` clears ``x.com`` and ``*.x.com``, never
+    ``netflix.com``. Does NOT launch a browser: a profile whose browser runs in
+    this process is cleared through the live context, a closed one in its
+    cookie file, and one open in another process is refused (that browser
+    would write its cookies back) with the reason in its entry.
+
+    Holds ``_browser_lock``, which browser startup and stale-page restarts also
+    hold: mid-startup the context is still unset, so an unlocked call would
+    edit the profile FILE the browser is opening, and two concurrent clears
+    would both count the same cookies. A live context's layer has its idle
+    clock refreshed, so a session using only these keeps that browser.
     """
+    from genesis.browser.profile import (
+        BrowserProfileManager,
+        ProfileInUse,
+        domain_matches,
+        normalize_domain,
+    )
+
     try:
-        from genesis.browser.profile import BrowserProfileManager
-        mgr = BrowserProfileManager()
-        removed = mgr.clear_domain(domain)
-        return {"domain": domain, "cookies_removed": removed}
-    except Exception as e:
-        return {"error": f"Failed to clear domain '{domain}': {e}"}
+        d = normalize_domain(domain)
+    except ValueError as e:
+        return {"error": str(e)}
+
+    total = 0
+    profiles = []
+    async with _browser_lock:
+        for kind, pdir in _cookie_profiles():
+            entry: dict = {"browser": kind}
+            try:
+                ctx = _live_cookie_context(kind)
+                if ctx is not None:
+                    matched = [
+                        c for c in await _cookie_call(ctx.cookies())
+                        if domain_matches(c.get("domain", ""), d)
+                    ]
+                    failed = None
+                    if matched:
+                        # Only the matching cookies are touched; nothing else
+                        # in the jar is cleared or re-added.
+                        try:
+                            await _cookie_call(
+                                ctx.add_cookies([_expired_copy(c) for c in matched])
+                            )
+                        except Exception as e:
+                            failed = e  # re-read below: report what was removed
+                    try:
+                        after = {
+                            _cookie_key(c) for c in await _cookie_call(ctx.cookies())
+                            if domain_matches(c.get("domain", ""), d)
+                        }
+                    except Exception as e:
+                        raise RuntimeError(
+                            f"re-reading the jar failed ({e!r}) after the delete "
+                            f"{'failed: ' + repr(failed) if failed else 'succeeded'}; "
+                            "removed count unknown"
+                        ) from e
+                    # By identity, not a net difference: a cookie a page sets
+                    # meanwhile must not cancel one that was really removed.
+                    n = sum(_cookie_key(c) not in after for c in matched)
+                    entry.update(source="live browser", removed=n)
+                    if failed is not None:
+                        entry["error"] = f"Failed to clear {kind} cookies: {failed!r}"
+                    elif after:
+                        entry["error"] = f"{len(after)} matching cookies remain after the clear"
+                else:
+                    n = BrowserProfileManager(pdir, browser=kind).clear_domain(d)
+                    entry.update(source="profile file", removed=n)
+                total += n
+            except ProfileInUse as e:
+                entry["error"] = str(e)
+            except Exception as e:
+                entry["error"] = f"Failed to clear {kind} cookies: {e!r}"
+            profiles.append(entry)
+    return {"domain": d, "cookies_removed": total, "profiles": profiles}
 
 
+@_redacted
 async def _impl_browser_press_key(key: str, count: int = 1) -> dict:
     """Press a keyboard key on the current page."""
     _touch()
@@ -3171,14 +4726,92 @@ async def _impl_browser_press_key(key: str, count: int = 1) -> dict:
             return health
         page = _active_page
     count = max(1, min(count, 50))
+    async with _page_action(page) as refused:  # Enter on a link may open a tab
+        if refused:
+            return refused
+        try:
+            for i in range(count):
+                if i > 0:
+                    await asyncio.sleep(random.uniform(0.05, 0.15))
+                await page.keyboard.press(key)
+            return {"pressed": key, "count": count, "url": page.url}
+        except Exception as e:
+            return {"error": f"Key press failed for '{key}': {e}"}
+
+
+# ---------------------------------------------------------------------------
+# browser_fill_card: the flow is payment_context's; this is the entry point
+# ---------------------------------------------------------------------------
+
+
+async def _close_browser_for_payment(ctx) -> None:
+    """The payment context would not close: close Camoufox, and it with it, if
+    it is still the launch the payment ran on (not one started since)."""
+    async with _browser_lock:
+        if _stealth_browser is ctx:
+            await _cleanup_camoufox()
+
+
+@_redacted
+async def _impl_browser_fill_card(
+    card_ref: str = "",
+    amount: str = "",
+    fields: dict | None = None,
+    pay: str | dict | None = None,
+    expiry_format: str = "MM/YY",
+    extra_fields: dict | None = None,
+    steps: list | None = None,
+    consent: list | None = None,
+    save: str | dict | None = None,
+    amount_max: str | None = None,
+    total: str | dict | None = None,
+    report=None,
+) -> dict:
+    """Pay with a vault card in an isolated browser context. See browser_fill_card."""
     try:
-        for i in range(count):
-            if i > 0:
-                await asyncio.sleep(random.uniform(0.05, 0.15))
-            await page.keyboard.press(key)
-        return {"pressed": key, "count": count, "url": page.url}
-    except Exception as e:
-        return {"error": f"Key press failed for '{key}': {e}"}
+        if not card_fill.card_fill_enabled():
+            return card_fill.result("card_fill_disabled")
+        if card_fill.playwright_debug_on():
+            return card_fill.result("playwright_debug_on")
+        args = card_fill.validate(
+            card_ref,
+            amount,
+            fields,
+            pay,
+            expiry_format,
+            extra_fields,
+            steps,
+            consent,
+            save,
+            amount_max,
+            total,
+        )
+        # Short hold: every browser tool waits on this lock, and the flow waits minutes.
+        async with _browser_lock:
+            page, ctx = _active_page, _stealth_browser
+            if page is None or not _is_page_alive(page):
+                return card_fill.result("no_page")
+            if _layer_of(page) is not BrowserLayer.CAMOUFOX or ctx is None:
+                return card_fill.result("not_camoufox")
+            if card_fill.origin_of(page.url) is None:
+                return card_fill.result("not_http")
+            if not payment_context.prefs_pinned():
+                return card_fill.result("prefs_not_pinned")
+            if packages.stale_loaded_modules(_layer_dists(BrowserLayer.CAMOUFOX)):
+                return card_fill.result("browser_packages_changed")
+        _touch(BrowserLayer.CAMOUFOX)
+        hooks = payment_context.Hooks(
+            alive=lambda: _stealth_browser is ctx,
+            touch=lambda: _touch(BrowserLayer.CAMOUFOX),
+            interstitial=_detect_interstitial,
+            close_browser=lambda: _close_browser_for_payment(ctx),
+        )
+        return await payment_context.fill_card(args, ctx, page, hooks, report)
+    except card_fill.Refused as r:
+        return card_fill.result(r.code)
+    except Exception as e:  # noqa: BLE001 - never an exception's text: it may quote the page
+        logger.error("browser_fill_card failed (%s)", type(e).__name__)
+        return card_fill.result("internal_error")
 
 
 # ---------------------------------------------------------------------------
@@ -3268,6 +4901,13 @@ async def browser_click(selector: str) -> dict:
     and script fallbacks are not hit-tested, so verify what they did.
     For manual keyboard navigation, use browser_press_key with Tab/Space.
 
+    New tab or popup (target=_blank, window.open): the tools switch to it;
+    url and snapshot are its own, "new_page" names it, and the original stays
+    open. If it closes itself, the tools go back. It must open within 10 s
+    (a declared target) or 1 s, or it is not followed. Several: the first
+    still open is followed, "new_page.also_opened" lists the rest. A
+    "warning" holds an error raised after the click had opened its tab.
+
     Returns the updated page snapshot after clicking. "clicked" means the
     click was sent; confirm the page changed. An error that says the click
     may already have taken effect is not a failed click: call browser_snapshot
@@ -3307,6 +4947,9 @@ async def browser_fill(selector: str, value: str, ctx: Context | None = None) ->
     keystroke) makes no progress for 30 s, and then the page is reset if it
     is still the active page. Progress is reported as the fill advances, so
     the MCP client's idle timeout does not cancel a long fill.
+
+    A value containing a payment card number is refused; card entry is handed
+    to the user.
     """
     steps = 0
     last_sent = time.monotonic()
@@ -3361,6 +5004,11 @@ async def browser_screenshot() -> dict:
     call gets its own file, so consecutive screenshots don't overwrite one
     another and sort chronologically) and returns the path. Always read the
     returned "path" — never reconstruct it. Use the Read tool to view it.
+
+    Refused, with no file written, when the text the page renders in any
+    frame (visible text, form values, placeholders, labels, titles, alt text,
+    CSS-generated content) shows a payment card number, or a frame cannot be
+    read to check.
     """
     return await _with_tool_timeout(
         _impl_browser_screenshot(), 30.0, "browser_screenshot"
@@ -3387,6 +5035,8 @@ async def browser_run_js(expression: str) -> dict:
     Chrome DevTools console. Returns the expression result.
 
     Example: browser_run_js('document.title')
+
+    An expression containing a payment card number is refused.
     """
     return await _with_tool_timeout(
         _impl_browser_run_js(expression), _TOOL_TIMEOUT_S, "browser_run_js"
@@ -3395,19 +5045,25 @@ async def browser_run_js(expression: str) -> dict:
 
 @mcp.tool()
 async def browser_sessions() -> dict:
-    """List logged-in sessions from the persistent browser profile.
+    """List logged-in sessions in both local browser profiles.
 
-    Reads the Chrome cookie database without launching a browser.
-    Shows which domains have saved cookies/sessions.
+    Covers Camoufox (~/.genesis/camoufox-profile) and Chromium
+    (~/.genesis/browser-profile), one labelled entry each, with cookie counts
+    per domain. Never launches a browser: a browser running in this session is
+    read live, otherwise the profile's cookie file is read.
     """
     return await _impl_browser_sessions()
 
 
 @mcp.tool()
 async def browser_clear_domain(domain: str) -> dict:
-    """Clear cookies for a specific domain (selective logout).
+    """Clear cookies for a domain and its subdomains (selective logout).
 
-    Modifies the cookie database directly without launching a browser.
+    Matches whole labels: 'x.com' clears x.com and api.x.com, never
+    netflix.com. Covers both local profiles and returns the number removed,
+    per profile and in total. Never launches a browser. A profile open in
+    another session's browser is refused for that profile (its entry says
+    why), because that browser would write its cookies back.
     Example: browser_clear_domain('github.com')
     """
     return await _impl_browser_clear_domain(domain)
@@ -3435,6 +5091,68 @@ async def browser_press_key(key: str, count: int = 1) -> dict:
 
 
 @mcp.tool()
+async def browser_fill_card(
+    card_ref: str = "",
+    amount: str = "",
+    fields: dict | None = None,
+    pay: str | dict | None = None,
+    expiry_format: str = "MM/YY",
+    extra_fields: dict | None = None,
+    steps: list | None = None,
+    consent: list | None = None,
+    save: str | dict | None = None,
+    amount_max: str | None = None,
+    total: str | dict | None = None,
+    ctx: Context | None = None,
+) -> dict:
+    """Pay with a vault card on the open Camoufox checkout after the owner's
+    Telegram tap; fills in a separate window and clicks Pay itself. Card values
+    never reach you. Usage and limits: the browser-automation skill, "Money".
+
+    card_ref: card_ + 12 hex. amount: the total as the page shows it, digits
+    included; with save, the subtotal before the card, one price with its
+    currency symbol. fields: kind -> CSS selector or {"selector", "frames":
+    [iframe selector, ...]}; kinds number (required), expiry or exp_month +
+    exp_year, cvc, name or first_name + last_name, postal_code. pay: the Pay
+    button, same shape. Selectors: printable plain CSS (no ``>>``, engine=
+    prefix, quoted text or XPath), each in the frame its chain names.
+    expiry_format: MM/YY, MM / YY, MM-YY, MMYY, MM/YYYY or MMYYYY.
+    extra_fields: name -> {"selector", "value"} (+ "frames": the top document
+    or a frame holding a card field); names email, name, phone, address_line1,
+    address_line2, city, region, postal_code, country, company. No "value":
+    read from card_fill.billing in the payments config.
+    steps: up to 8 clicks, same shape, before anything is read; no checkbox.
+    consent: up to 2 checkboxes, ticked only after the tap.
+    save: the control that stores the card, clicked before Pay. amount_max
+    (needs save): the ceiling the tap approves, amount's currency; Pay only if
+    amount <= total <= amount_max. total (needs save): the total's element;
+    default Pay's label.
+
+    Returns {code, status, host} (+ filled, field, reason where they apply).
+    submitted_unverified: check the order. challenge, card_url_blocked,
+    card_url_leaked, pay_click_unknown, outcome_unknown, moved_while_filling,
+    card_url_before_pay, card_value_in_request, and any code after a save: do
+    NOT retry; tell the owner. Refused while card fill is off or another
+    payment runs.
+    """
+    last_sent, sent = 0.0, 0
+
+    async def report(message: str) -> None:
+        nonlocal last_sent, sent
+        if ctx is None or time.monotonic() - last_sent < _FILL_PROGRESS_EVERY_S:
+            return
+        last_sent, sent = time.monotonic(), sent + 1  # MCP progress must increase
+        with contextlib.suppress(Exception):  # best effort: a lost report changes nothing
+            await asyncio.wait_for(
+                ctx.report_progress(sent, message=message), timeout=_FILL_PROGRESS_SEND_S
+            )
+
+    return await _impl_browser_fill_card(
+        card_ref, amount, fields, pay, expiry_format, extra_fields, steps, consent, save, amount_max, total, report=report
+    )
+
+
+@mcp.tool()
 async def browser_collaborate(enable: bool = True) -> dict:
     """Toggle collaborative timing mode.
 
@@ -3451,6 +5169,7 @@ async def browser_collaborate(enable: bool = True) -> dict:
     return _impl_browser_collaborate(enable)
 
 
+@_redacted
 def _impl_browser_collaborate(enable: bool = True) -> dict:
     """Set the timing profile explicitly (see browser_collaborate)."""
     global _collaborate_mode

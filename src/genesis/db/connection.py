@@ -20,6 +20,9 @@ from typing import Any
 import aiosqlite
 from aiosqlite.context import Result
 
+from genesis.db import lock_holders
+from genesis.db._slow_log import timed
+
 # BUSY_TIMEOUT_MS moved to genesis.env (it is an env-tunable default; env.py
 # sits below this module in the import graph) — re-exported here for the many
 # historical `from genesis.db.connection import BUSY_TIMEOUT_MS` importers.
@@ -49,7 +52,17 @@ def connect_sqlite_rw(
 
     admission_path = Path(path).expanduser()
     assert_admitted(admission_path)
-    return sqlite3.connect(str(admission_path.resolve()), *args, **kwargs)
+    # A weakref-able subclass, so a lock-holder snapshot can name this
+    # connection; skipped when the caller chose its own factory (keyword, or
+    # positional: it is sqlite3.connect's 6th parameter).
+    tracked = "factory" not in kwargs and len(args) < 5
+    if tracked:
+        kwargs["factory"] = lock_holders.TrackedSqliteConnection
+    resolved = admission_path.resolve()
+    conn = sqlite3.connect(str(resolved), *args, **kwargs)
+    if tracked:
+        lock_holders.register(conn, db_path=resolved, kind="sqlite3")
+    return conn
 
 
 class _GuardedAiosqliteConnector:
@@ -67,6 +80,9 @@ class _GuardedAiosqliteConnector:
         self._kwargs = kwargs
         self._existing_only = existing_only
         self._connection: aiosqlite.Connection | None = None
+        # Who asked for this connection, for a lock-holder snapshot; taken now,
+        # while the requesting code is still on the stack.
+        self._site = lock_holders.caller_site()
 
     async def _open(self) -> aiosqlite.Connection:
         from genesis.db.admission import assert_admitted
@@ -90,6 +106,7 @@ class _GuardedAiosqliteConnector:
                 open_error.add_note(f"connection cleanup failed: {close_error!r}")
             raise
         self._connection = connection
+        lock_holders.register(connection, db_path=self._db_path, kind="aiosqlite", site=self._site)
         return connection
 
     def __await__(self) -> Generator[Any, None, aiosqlite.Connection]:
@@ -369,6 +386,9 @@ class SerializedConnection:
             "_consecutive_errors",
             "_max_errors",
             "_db_path",
+            "_holder",
+            "_cancelled_holder",
+            "_inflight",
         }
     )
 
@@ -387,6 +407,18 @@ class SerializedConnection:
         object.__setattr__(self, "_consecutive_errors", 0)
         object.__setattr__(self, "_max_errors", self._MAX_LOCK_ERRORS)
         object.__setattr__(self, "_db_path", db_path)
+        # Slow-statement attribution (genesis.db._slow_log): the SQL holding the
+        # lock, the last one cancelled while holding it (its statement keeps
+        # running on the worker thread), and the cursor fetches in progress, in
+        # the order they were queued (one entry per fetch, removed by that fetch
+        # alone: fetches on different cursors overlap and finish in any order).
+        object.__setattr__(self, "_holder", None)
+        object.__setattr__(self, "_cancelled_holder", None)
+        object.__setattr__(self, "_inflight", {})
+        # Named in a lock-holder snapshot of its database (weakly held); the
+        # site is the code that opened it (get_db's caller, for get_db).
+        if db_path is not None:
+            lock_holders.register(self, db_path=db_path, kind="serialized")
 
     # -- Attribute passthrough (e.g. row_factory, in_transaction) ----------
 
@@ -400,6 +432,48 @@ class SerializedConnection:
             setattr(self._conn, name, value)
 
     # -- Error tracking and recovery ----------------------------------------
+
+    @asynccontextmanager
+    async def _locked_timed(self, sql: str) -> AsyncIterator[None]:
+        """Hold ``self._lock`` for one operation, timing the wait and the run.
+
+        A slow operation is named in the log (``genesis.db._slow_log``) with
+        what it was most likely stuck behind: a cursor fetch still running on
+        the worker thread, else the lock holder when it started waiting, else a
+        statement cancelled while holding the lock (it keeps running after the
+        lock is released). ``sql`` is the statement text; parameters never
+        reach it."""
+        if self._inflight:
+            # aiosqlite runs one request queue, first in first out: the oldest
+            # fetch still in progress is the one ahead of this statement.
+            blocked_by = next(iter(self._inflight.values()))
+        elif self._lock.locked():
+            blocked_by = self._holder
+        else:
+            blocked_by = self._cancelled_holder
+        with timed(sql, blocked_by=blocked_by) as t:
+            async with self._lock:
+                t.acquired()
+                object.__setattr__(self, "_holder", sql)
+                object.__setattr__(self, "_cancelled_holder", None)
+                try:
+                    yield
+                except asyncio.CancelledError:
+                    object.__setattr__(self, "_cancelled_holder", sql)
+                    raise
+
+    def _capture_lock_holders(self, exc: Exception, *, attempts: int, backoff_s: float) -> str:
+        """Schedule sampled lock evidence; return the log text for it.
+
+        Awaits nothing (the caller holds ``self._lock``, so it must not wait on
+        /proc or the disk here) and never raises; see ``lock_holders``."""
+        _target, text = lock_holders.schedule_capture(
+            self,
+            error=getattr(exc, "sqlite_errorname", None),
+            attempts=attempts,
+            backoff_s=backoff_s,
+        )
+        return text
 
     def _reset_error_count(self) -> None:
         object.__setattr__(self, "_consecutive_errors", 0)
@@ -476,13 +550,15 @@ class SerializedConnection:
                 if not _is_lock_error(e):
                     raise
                 if attempt >= attempts:
+                    snapshot = self._capture_lock_holders(e, attempts=attempts, backoff_s=slept)
                     logger.warning(
                         "DB lock persisted through %d attempts (%.2fs of retry backoff"
                         " on top of busy_timeout) — giving up; a lock error in a QUIET"
                         " period (no concurrent sessions) points at a long-holder, not"
-                        " convoy loss",
+                        " convoy loss; lock-holder snapshot: %s",
                         attempts,
                         slept,
+                        snapshot,
                     )
                     await self._handle_lock_error(e)  # counts the episode; re-raises
                     raise  # unreachable (belt-and-suspenders, matches existing style)
@@ -506,10 +582,11 @@ class SerializedConnection:
         parameters: Iterable[Any] | None = None,
     ) -> Result:
         async def _locked() -> aiosqlite.Cursor:
-            async with self._lock:
-                return await self._retry_locked(lambda: self._conn.execute(sql, parameters))
+            async with self._locked_timed(sql):
+                cursor = await self._retry_locked(lambda: self._conn.execute(sql, parameters))
+            return _TimedCursor(cursor, sql, self)  # type: ignore[return-value]
 
-        return Result(_locked())
+        return _CursorResult(_locked())
 
     def executemany(
         self,
@@ -521,7 +598,7 @@ class SerializedConnection:
             # consumed by a failed first attempt, so the retry would silently
             # execute zero/partial rows and "succeed".
             params = list(parameters)
-            async with self._lock:
+            async with self._locked_timed(sql):
                 return await self._retry_locked(lambda: self._conn.executemany(sql, params))
 
         return Result(_locked())
@@ -532,7 +609,7 @@ class SerializedConnection:
         parameters: Iterable[Any] | None = None,
     ) -> Result:
         async def _locked() -> list[aiosqlite.Row]:
-            async with self._lock:
+            async with self._locked_timed(sql):
                 return await self._retry_locked(
                     lambda: self._conn.execute_fetchall(sql, parameters)
                 )
@@ -545,7 +622,7 @@ class SerializedConnection:
         parameters: Iterable[Any] | None = None,
     ) -> Result:
         async def _locked() -> tuple | None:
-            async with self._lock:
+            async with self._locked_timed(sql):
                 return await self._retry_locked(lambda: self._conn.execute_insert(sql, parameters))
 
         return Result(_locked())
@@ -555,7 +632,7 @@ class SerializedConnection:
         # partially apply before the lock error, so re-running it is not
         # idempotent. Keeps the pre-retry behavior: count + re-raise.
         async def _locked() -> aiosqlite.Cursor:
-            async with self._lock:
+            async with self._locked_timed(sql):
                 if self._db_path is not None:
                     from genesis.db.integrity import assert_not_quarantined
 
@@ -566,6 +643,10 @@ class SerializedConnection:
                     return result
                 except sqlite3.OperationalError as e:
                     if _is_lock_error(e):
+                        logger.warning(
+                            "DB lock on executescript (not retried); lock-holder snapshot: %s",
+                            self._capture_lock_holders(e, attempts=1, backoff_s=0.0),
+                        )
                         await self._handle_lock_error(e)
                     raise
 
@@ -574,7 +655,7 @@ class SerializedConnection:
     # -- Simple async operations -------------------------------------------
 
     async def commit(self) -> None:
-        async with self._lock:
+        async with self._locked_timed("COMMIT"):
             await self._retry_locked(lambda: self._conn.commit())
 
     async def rollback(self) -> None:
@@ -582,15 +663,17 @@ class SerializedConnection:
         # ROLLBACK that never lands leaves in_transaction=True permanently —
         # the exact wedge this class exists to prevent. Previously this path
         # had NO lock handling at all.
-        async with self._lock:
+        async with self._locked_timed("ROLLBACK"):
             await self._retry_locked(lambda: self._conn.rollback())
 
     async def close(self) -> None:
         async with self._lock:
+            object.__setattr__(self, "_holder", "<close>")
             await self._conn.close()
 
     async def cursor(self) -> aiosqlite.Cursor:
         async with self._lock:
+            object.__setattr__(self, "_holder", "<cursor>")
             if self._db_path is not None:
                 from genesis.db.integrity import assert_not_quarantined
 
@@ -681,6 +764,7 @@ async def get_raw_db(
     assert_admitted(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     db = await aiosqlite.connect(str(path))
+    lock_holders.register(db, db_path=path, kind="aiosqlite")
     try:
         db.row_factory = aiosqlite.Row
         await db.execute("PRAGMA journal_mode=WAL")
@@ -701,6 +785,7 @@ async def open_ro_connection(
     path: str | Path = DEFAULT_DB_PATH,
     *,
     cache_size_kib: int = RO_CACHE_SIZE_KIB,
+    busy_timeout_ms: int | None = None,
 ) -> aiosqlite.Connection:
     """Open a standalone READ-ONLY aiosqlite connection (``mode=ro``, WAL-aware).
 
@@ -729,9 +814,14 @@ async def open_ro_connection(
     assert_admitted(Path(path))
     uri = f"file:{Path(path)}?mode=ro"
     conn = await aiosqlite.connect(uri, uri=True)
-    conn.row_factory = aiosqlite.Row
-    await conn.execute(f"PRAGMA busy_timeout={db_busy_timeout_ms()}")
-    await conn.execute(f"PRAGMA cache_size={cache_size_kib}")
+    try:
+        conn.row_factory = aiosqlite.Row
+        timeout = db_busy_timeout_ms() if busy_timeout_ms is None else busy_timeout_ms
+        await conn.execute(f"PRAGMA busy_timeout={int(timeout)}")
+        await conn.execute(f"PRAGMA cache_size={cache_size_kib}")
+    except BaseException:
+        await conn.close()
+        raise
     return conn
 
 
@@ -739,6 +829,80 @@ class ReadPoolClosed(Exception):
     """Raised by :meth:`ReadConnectionPool.acquire` when the pool is closed or
     was never opened. Callers treat it as "use the shared connection instead."
     """
+
+
+class _TimedCursor:
+    """The cursor ``SerializedConnection.execute`` hands back, with its row
+    fetches timed under the statement's SQL.
+
+    Rows are fetched AFTER ``execute`` returns and the lock is released, so for
+    a streaming read the fetch is where the work happens. Timing it names the
+    scan itself, and marks it in flight so a statement queued behind it on the
+    worker thread is attributed to it. Everything else, reads and writes of
+    attributes alike, passes through to the aiosqlite cursor.
+    """
+
+    __slots__ = ("_cursor", "_sql", "_owner")
+
+    def __init__(self, cursor: aiosqlite.Cursor, sql: str, owner: SerializedConnection) -> None:
+        object.__setattr__(self, "_cursor", cursor)
+        object.__setattr__(self, "_sql", sql)
+        object.__setattr__(self, "_owner", owner)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._cursor, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._cursor, name, value)  # e.g. row_factory, arraysize
+
+    async def _timed_fetch(self, fetch: Callable[..., Awaitable[Any]], *args: Any) -> Any:
+        owner = self._owner
+        token = object()  # this fetch's own entry; another cursor's may overlap it
+        with timed(self._sql) as t:
+            t.acquired()  # a fetch queues for no lock of ours: all of it is run time
+            owner._inflight[token] = self._sql
+            try:
+                return await fetch(*args)
+            except asyncio.CancelledError:
+                # Its fetch keeps running on the worker thread, like a cancelled
+                # statement: let the next statement name it.
+                object.__setattr__(owner, "_cancelled_holder", self._sql)
+                raise
+            finally:
+                owner._inflight.pop(token, None)
+
+    async def fetchone(self) -> Any:
+        return await self._timed_fetch(self._cursor.fetchone)
+
+    async def fetchmany(self, size: int | None = None) -> Any:
+        return await self._timed_fetch(self._cursor.fetchmany, size)
+
+    async def fetchall(self) -> Any:
+        return await self._timed_fetch(self._cursor.fetchall)
+
+    async def __aiter__(self) -> AsyncIterator[Any]:
+        # aiosqlite's own iteration batch (64), not sqlite3's arraysize (1).
+        while rows := await self.fetchmany(self._cursor.iter_chunk_size):
+            for row in rows:
+                yield row
+
+    async def close(self) -> None:
+        await self._cursor.close()
+
+    async def __aenter__(self) -> _TimedCursor:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.close()
+
+
+class _CursorResult(Result):
+    """``Result`` for ``execute``: aiosqlite's ``Result.__aexit__`` closes only a
+    real ``aiosqlite.Cursor`` (an isinstance check), so ``async with
+    db.execute(...)`` would leave a ``_TimedCursor`` open. This closes it."""
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        await self._obj.close()
 
 
 class ReadConnectionPool:

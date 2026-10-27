@@ -72,6 +72,22 @@ async def test_generate_returns_outreach_request(db, mock_health, mock_drafter):
 
 
 @pytest.mark.asyncio
+async def test_topic_is_one_report_per_utc_day(db, mock_health, mock_drafter):
+    """Governance treats the morning-report topic as the message identity
+    (governance._TOPIC_IS_IDENTITY): one topic per UTC date, so a same-day
+    resend collapses and the next day's report never does. Pin the format."""
+    import re
+    from datetime import UTC, datetime
+
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    before = datetime.now(UTC).strftime("%Y-%m-%d")
+    req = await gen.generate()
+    after = datetime.now(UTC).strftime("%Y-%m-%d")
+    assert re.fullmatch(r"Morning Report — \d{4}-\d{2}-\d{2}", req.topic)
+    assert req.topic[-10:] in {before, after}  # robust across a UTC midnight
+
+
+@pytest.mark.asyncio
 async def test_critical_issues_dedupes_subsystem_stale(db, mock_health, mock_drafter):
     """A subsystem already surfaced as a subsystem_stale:<name> alert is NOT listed
     a second time by the heartbeat-staleness block (P2-6 dedup). A subsystem with a
@@ -1009,6 +1025,21 @@ async def test_prompt_contract_grounding_rules():
     assert "Protective facts are never risks" in prompt
 
 
+async def test_prompt_contract_windowed_counts_are_history():
+    """The prompt preserves recorded windows without inventing measurement times."""
+    from genesis.outreach.morning_report import MorningReportGenerator as G
+
+    prompt = G._load_system_prompt()
+    assert prompt is not None
+    assert "Figures in observations are recorded evidence" in prompt
+    assert "Do not infer a measurement timestamp from row age." in prompt
+    assert "This corroboration rule does not remove" in prompt
+    assert "including outreach blockers" in prompt
+    assert "that observation's claim, not an established fact" in prompt
+    assert "was measured when that observation" not in prompt
+    assert "its figures still date from when it" not in prompt
+
+
 async def test_negated_protection_never_tagged_protective(db, mock_health, mock_drafter):
     """The REAL shipping alert class: 'systemd-oomd … is not enforced' is a
     live risk. Tagging it protective would invert it and — via the prompt
@@ -1247,3 +1278,359 @@ async def test_a_BLIND_detector_is_not_reported_as_a_fresh_count(
     assert "UNAVAILABLE" in ground_truth and "blind" in ground_truth, (
         f"and must name the fault rather than a number: {ground_truth}"
     )
+
+
+# ── Live facts (issue: report stated stale/mixed facts as current) ─────────
+
+
+def _health_with(infrastructure=None, queues=None):
+    return {
+        "cost": {},
+        "queues": queues or {},
+        "infrastructure": infrastructure or {},
+        "surplus": {},
+        "awareness": {},
+        "cc_sessions": {},
+    }
+
+
+@pytest.mark.asyncio
+async def test_format_health_shows_live_pid_budget(db, mock_health, mock_drafter):
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    section = gen._format_health(
+        _health_with(
+            infrastructure={
+                "pids": {
+                    "status": "healthy",
+                    "current": 980,
+                    "max": 2400,
+                    "pct": 40.8,
+                    "scope": "user-1000.slice",
+                    "path": "/sys/fs/cgroup/x",
+                }
+            }
+        )
+    )
+    assert "PID budget: 41% (980/2400, user-1000.slice)" in section
+
+
+@pytest.mark.asyncio
+async def test_format_health_pid_budget_uncapped(db, mock_health, mock_drafter):
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    section = gen._format_health(
+        _health_with(
+            infrastructure={
+                "pids": {"status": "healthy", "current": 1500, "max": "max", "pct": None}
+            }
+        )
+    )
+    pid_line = next(line for line in section.splitlines() if "PID budget" in line)
+    assert "1500" in pid_line
+    assert "unavailable" not in pid_line
+    # The container root can still be capped by the host above our view.
+    assert "uncapped" not in pid_line
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "pids",
+    [
+        {"status": "error", "error": "boom"},
+        {"status": "unavailable"},
+        None,  # metric missing entirely
+        {"status": "healthy", "current": 5, "max": 10},  # pct missing: malformed
+    ],
+)
+async def test_format_health_pid_budget_unavailable_never_a_number(
+    db, mock_health, mock_drafter, pids
+):
+    infra = {} if pids is None else {"pids": pids}
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    section = gen._format_health(_health_with(infrastructure=infra))
+    pid_line = next(line for line in section.splitlines() if "PID budget" in line)
+    assert pid_line == "- PID budget: unavailable"
+
+
+@pytest.mark.asyncio
+async def test_format_health_splits_deferred_recovery_from_worklist(db, mock_health, mock_drafter):
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    section = gen._format_health(
+        _health_with(
+            queues={
+                "deferred_work": 131,
+                "deferred_recovery": 31,
+                "deferred_worklist": 100,
+                "dead_letters": 0,
+            }
+        )
+    )
+    assert "deferred=131" not in section  # the mixed total is not the headline
+    assert "recovery backlog=31" in section
+    assert "scheduled worklist=100" in section
+    assert "not a backlog" in section
+
+
+@pytest.mark.asyncio
+async def test_format_health_deferred_split_names_stalled_overlap(db, mock_health, mock_drafter):
+    # A worklist item stalled past a full drain cycle counts in BOTH subsets;
+    # the line must say so, from the DIRECT stalled count, never from
+    # recovery + worklist - total (three separate queries can disagree).
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    section = gen._format_health(
+        _health_with(
+            queues={
+                "deferred_work": 125,  # R + W - total would say 5
+                "deferred_recovery": 30,
+                "deferred_worklist": 100,
+                "deferred_worklist_stalled": 10,
+            }
+        )
+    )
+    assert "recovery backlog=30" in section
+    assert "10 stalled worklist" in section
+    assert "5 stalled" not in section
+
+
+@pytest.mark.asyncio
+async def test_format_health_deferred_no_stalled_clause_without_direct_count(
+    db, mock_health, mock_drafter
+):
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    section = gen._format_health(
+        _health_with(
+            queues={"deferred_work": 120, "deferred_recovery": 30, "deferred_worklist": 100}
+        )
+    )
+    assert "recovery backlog=30" in section
+    assert "stalled" not in section
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "queues",
+    [
+        {"status": "error", "error": "boom"},  # the whole queues section failed
+        {},  # deferred_work absent
+        # the deferred query failed: the producer leaves every split None
+        {
+            "deferred_work": None,
+            "deferred_recovery": None,
+            "deferred_worklist": None,
+            "deferred_worklist_stalled": None,
+        },
+        {"deferred_work": 120, "deferred_recovery": 30, "deferred_worklist": None},
+        {"deferred_work": 120, "deferred_recovery": None, "deferred_worklist": 90},
+    ],
+)
+async def test_format_health_deferred_unavailable_never_a_zero(
+    db, mock_health, mock_drafter, queues
+):
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    section = gen._format_health(_health_with(queues=queues))
+    line = next(x for x in section.splitlines() if "Deferred work" in x)
+    assert line == "- Deferred work: unavailable"
+
+
+@pytest.mark.asyncio
+async def test_format_health_deferred_query_failed_says_unavailable(db, mock_health, mock_drafter):
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    section = gen._format_health(
+        _health_with(
+            queues={"deferred_work": None, "deferred_recovery": None, "deferred_worklist": 0}
+        )
+    )
+    assert "Deferred work: unavailable" in section
+
+
+async def _insert_obs(db, oid, otype, content, priority="high", surfaced_count=0):
+    from datetime import UTC, datetime
+
+    await db.execute(
+        "INSERT INTO observations (id, source, type, content, priority, created_at, "
+        "surfaced_count) VALUES (?, 'test', ?, ?, ?, ?, ?)",
+        (oid, otype, content, priority, datetime.now(UTC).isoformat(), surfaced_count),
+    )
+    await db.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audit_priority", ["low", "high"])
+@pytest.mark.parametrize(
+    "otype",
+    [
+        "gap_clustering",
+        "wing_audit",
+        "self_unblock",
+        "memory_audit",
+        "procedure_audit",
+        "prompt_effectiveness_review",
+        "quarantined_reflection",
+    ],
+)
+async def test_reflection_audit_rows_absent_from_report_sections(
+    db, mock_health, mock_drafter, otype, audit_priority
+):
+    # Real self-audit rows are written at "low" (surplus/intake.py); "low" is the
+    # case the activity list renders today. "high" covers the other sections.
+    await _insert_obs(
+        db, "audit-row", otype, "AUDIT-ROW-MARKER drift text", priority=audit_priority
+    )
+    await _insert_obs(
+        db,
+        "audit-standing",
+        otype,
+        "AUDIT-STANDING-MARKER",
+        priority=audit_priority,
+        surfaced_count=5,
+    )
+    await _insert_obs(db, "real-row", "bug_identified", "REAL-ROW-MARKER")
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+
+    activity = await gen._get_activity_summary()
+    assert "AUDIT-ROW-MARKER" not in activity
+    assert "REAL-ROW-MARKER" in activity
+    # Still accounted for, as internal: never silently vanished.
+    assert "Genesis internal: 2 items" in activity
+
+    insights = await gen._get_observation_insights()
+    assert insights is not None
+    assert "AUDIT-ROW-MARKER" not in insights
+    assert "REAL-ROW-MARKER" in insights
+    assert "audit-row" not in gen._pending_surface_ids
+
+    standing = await gen._get_standing_items()
+    assert standing is None or "AUDIT-STANDING-MARKER" not in standing
+
+    context = await gen._assemble_context()
+    assert "AUDIT-ROW-MARKER" not in context
+    assert "AUDIT-STANDING-MARKER" not in context
+
+
+@pytest.mark.asyncio
+async def test_contradiction_rows_stay_in_report(db, mock_health, mock_drafter):
+    # Contradictions are written for human judgment; the report must still show them.
+    await _insert_obs(db, "contra-row", "contradiction", "CONTRA-ROW-MARKER")
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    insights = await gen._get_observation_insights()
+    assert insights is not None
+    assert "CONTRA-ROW-MARKER" in insights
+
+
+def test_report_internal_set_does_not_widen_the_shared_set():
+    # The report-local exclusion must not leak into INTERNAL_OBS_TYPES, which
+    # the dashboard observations panel also reads (gap_clustering stays visible
+    # there on purpose).
+    from genesis.db.crud.observations import INTERNAL_OBS_TYPES
+
+    assert "gap_clustering" not in INTERNAL_OBS_TYPES
+    assert "contradiction" not in INTERNAL_OBS_TYPES
+    assert set(_mr_mod._REPORT_INTERNAL_OBS_TYPES) >= INTERNAL_OBS_TYPES
+
+
+@pytest.mark.asyncio
+async def test_failed_stalled_count_keeps_the_deferred_figures(db, mock_health, mock_drafter):
+    # Only the stalled count failed (its own error): the three good figures
+    # still render, without a stalled clause. The report keys on None only,
+    # never on error strings.
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    section = gen._format_health(
+        _health_with(
+            queues={
+                "deferred_work": 120,
+                "deferred_recovery": 30,
+                "deferred_worklist": 100,
+                "deferred_worklist_stalled": None,
+                "errors": ["deferred_worklist_stalled: query failed"],
+            }
+        )
+    )
+    line = next(x for x in section.splitlines() if "Deferred work" in x)
+    assert "recovery backlog=30" in line
+    assert "scheduled worklist=100" in line
+    assert "stalled" not in line
+
+
+def _health_line(section: str, label: str) -> str:
+    return next(x for x in section.splitlines() if x.startswith(f"- {label}"))
+
+
+_ERROR_SECTION = {"status": "error", "error": "boom"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("health", "label", "figures"),
+    [
+        # Every figure _format_health prints from a snapshot section.
+        (
+            {"queues": _ERROR_SECTION},
+            "Queues",
+            ["dead_letters=unavailable", "pending_embeddings=unavailable"],
+        ),
+        (
+            {"queues": {"dead_letters": None, "pending_embeddings": None}},
+            "Queues",
+            ["dead_letters=unavailable", "pending_embeddings=unavailable"],
+        ),
+        ({"surplus": _ERROR_SECTION}, "Surplus", ["queue_depth=unavailable"]),
+        ({"surplus": {"status": "idle"}}, "Surplus", ["queue_depth=unavailable"]),
+        ({"awareness": _ERROR_SECTION}, "Awareness", ["ticks_24h=unavailable"]),
+        ({"awareness": {"status": "unknown"}}, "Awareness", ["ticks_24h=unavailable"]),
+        (
+            {"cc_sessions": _ERROR_SECTION},
+            "CC Sessions",
+            ["foreground=unavailable", "background=unavailable", "failed_24h=unavailable"],
+        ),
+        (
+            # The cc_sessions snapshot's own no-DB shape: statuses, no counts.
+            {
+                "cc_sessions": {
+                    "foreground": {"status": "unknown"},
+                    "background": {"status": "unknown"},
+                }
+            },
+            "CC Sessions",
+            ["foreground=unavailable", "background=unavailable", "failed_24h=unavailable"],
+        ),
+    ],
+)
+async def test_health_figures_never_fabricate_a_zero_or_none(
+    db, mock_health, mock_drafter, health, label, figures
+):
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    section = gen._format_health({**_health_with(), **health})
+    line = _health_line(section, label)
+    for fig in figures:
+        assert fig in line
+    assert "None" not in section
+    assert "=0" not in line
+
+
+@pytest.mark.asyncio
+async def test_health_figures_render_real_values(db, mock_health, mock_drafter):
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    section = gen._format_health(
+        {
+            **_health_with(
+                queues={
+                    "dead_letters": 0,
+                    "pending_embeddings": 150,
+                    "deferred_work": 0,
+                    "deferred_recovery": 0,
+                    "deferred_worklist": 0,
+                }
+            ),
+            "surplus": {"status": "idle", "queue_depth": 2},
+            "awareness": {"ticks_24h": 288},
+            "cc_sessions": {
+                "foreground": {"status": "healthy", "active": 2},
+                "background": {"status": "error", "active": 1},  # budget read failed only
+                "failed_24h": 3,
+            },
+        }
+    )
+    assert "dead_letters=0, pending_embeddings=150" in section
+    assert "queue_depth=2" in section
+    assert "ticks_24h=288" in section
+    assert "foreground=2, background=1, failed_24h=3" in section
+    assert "Embedding queue elevated**: 150 pending" in section

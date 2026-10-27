@@ -3,12 +3,13 @@
 It runs under the test interpreter (the venv it would answer for) with a fake
 installed project on PYTHONPATH, so every case is about metadata this test
 wrote. Exit codes: 0 match, 1 differs (a reinstall clears it), 2 cannot tell,
-3 the interpreter is older than the incoming requires-python.
+3 the interpreter is outside the incoming requires-python (too old or too new).
 """
 
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -445,3 +446,93 @@ def test_this_repositorys_pyproject_is_a_layout_the_gate_can_certify():
         "pyproject.toml's build configuration left the shape "
         "scripts/lib/venv_matches_pyproject.py can certify: teach the gate the new shape"
     )
+
+
+# ── --extras: presence of the optional groups every install installs ─────────
+#
+# Presence only, against what the TEST interpreter really has installed:
+# `packaging` and `pytest` are always there, the made-up name never is.
+
+_ABSENT = "genesis-test-absent-package-xyz"
+
+
+def _extras(pyproject: str, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, str(GATE), "--extras", *args],
+        input=pyproject,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def _groups(**groups: list[str]) -> str:
+    # JSON string arrays are valid TOML, including specs that quote a marker value.
+    body = "".join(f"{name} = {json.dumps(specs)}\n" for name, specs in groups.items())
+    return '[project]\nname = "fixture"\ndependencies = []\n' + _OPT + body
+
+
+def test_extras_present_is_a_match():
+    res = _extras(_groups(test=["packaging", "pytest>=1"]), "test")
+    assert (res.returncode, res.stdout) == (0, ""), res.stderr
+
+
+@pytest.mark.parametrize(
+    ("spec", "needle"),
+    [
+        (_ABSENT, f"missing: {_ABSENT} [test]"),
+        ("packaging<1", "unsatisfied: packaging [test]"),
+    ],
+)
+def test_extras_name_each_missing_or_unsatisfied_package(spec, needle):
+    res = _extras(_groups(test=["pytest", spec]), "test")
+    assert res.returncode == 1
+    assert needle in res.stdout
+    assert "pytest" not in res.stdout  # only the differences are printed
+
+
+def test_an_extra_the_pyproject_does_not_declare_is_a_difference_not_cannot_tell():
+    res = _extras(_groups(test=["pytest"]), "test,payments")
+    assert res.returncode == 1
+    assert "extra not declared: [payments]" in res.stdout
+
+
+def test_extras_skip_a_requirement_whose_marker_does_not_apply():
+    res = _extras(_groups(test=[f'{_ABSENT}; python_version < "3"']), "test")
+    assert (res.returncode, res.stdout) == (0, "")
+
+
+def test_extras_only_check_the_groups_named():
+    res = _extras(_groups(test=["pytest"], voice=[_ABSENT]), "test")
+    assert res.returncode == 0
+
+
+def test_extras_default_to_the_install_set():
+    """With no list the gate checks INSTALL_EXTRAS, so it reports a group the
+    install set names and this pyproject leaves out."""
+    res = _extras(_groups(test=["pytest"]))
+    assert res.returncode == 1
+    assert "extra not declared: [payments]" in res.stdout
+
+
+def test_extras_cannot_tell_from_an_unreadable_pyproject():
+    res = _extras("not = [toml", "test")
+    assert res.returncode == 2
+
+
+def test_the_install_set_is_printed_and_declared_here():
+    """bash reads the list with --install-extras; every name in it must be a group
+    this repository declares, or every install's extras step fails."""
+    res = subprocess.run(
+        [sys.executable, str(GATE), "--install-extras"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert res.returncode == 0
+    names = res.stdout.strip().split(",")
+    assert names == ["test", "payments"]
+    declared = tomllib.loads((REPO / "pyproject.toml").read_text())["project"][
+        "optional-dependencies"
+    ]
+    assert set(names) <= set(declared)

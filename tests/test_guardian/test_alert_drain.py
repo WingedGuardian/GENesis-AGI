@@ -218,3 +218,122 @@ async def test_drain_request_opts_out_of_pipeline_deferral(tmp_path, monkeypatch
     assert request.defer_retry is False
     # And FAILED keeps the entry — this queue stays the single owner.
     assert len(list(tmp_path.glob("*.json"))) == 1
+
+
+class _GovernedPipeline:
+    """submit_raw stand-in that runs the REAL GovernanceGate dedup against a
+    real DB and, on delivery, writes the same history row the pipeline writes
+    (outreach/pipeline.py: signal_type, topic, category, content_hash(context),
+    delivered_at). Exercises the drain's real request through the real gate."""
+
+    def __init__(self, db) -> None:
+        from genesis.outreach.config import OutreachConfig, QuietHours
+        from genesis.outreach.governance import GovernanceGate
+
+        self._db = db
+        self._gate = GovernanceGate(
+            OutreachConfig(
+                quiet_hours=QuietHours(start="22:00", end="07:00"),
+                channel_preferences={"default": "telegram"},
+                thresholds={},
+                max_daily=50,
+                surplus_daily=1,
+                content_daily=3,
+                notification_daily=50,
+                morning_report_time="07:00",
+                engagement_timeout_hours=24,
+                engagement_poll_minutes=60,
+            ),
+            db,
+        )
+        self.statuses: list[OutreachStatus] = []
+
+    async def submit_raw(self, text, request, **kw) -> OutreachResult:
+        from datetime import UTC, datetime
+
+        from genesis.db.crud import outreach as outreach_crud
+        from genesis.outreach.governance import content_hash
+
+        if await self._gate.is_duplicate(request):
+            status = OutreachStatus.REJECTED
+        else:
+            now = datetime.now(UTC).isoformat()
+            rid = f"r{len(self.statuses)}"
+            await outreach_crud.create(
+                self._db,
+                id=rid,
+                signal_type=request.signal_type or request.category.value,
+                topic=request.topic,
+                category=request.category.value,
+                salience_score=request.salience_score,
+                channel="telegram",
+                message_content=text,
+                created_at=now,
+                content_hash=content_hash(request.context),
+            )
+            await outreach_crud.record_delivery(self._db, rid, delivered_at=now)
+            status = OutreachStatus.DELIVERED
+        self.statuses.append(status)
+        return OutreachResult(
+            outreach_id="x", status=status, channel="telegram",
+            message_content=text, governance_result=None,
+        )
+
+
+@pytest.fixture
+async def outreach_db():
+    import aiosqlite
+
+    from genesis.db.schema import create_all_tables
+
+    conn = await aiosqlite.connect(":memory:")
+    conn.row_factory = aiosqlite.Row
+    await create_all_tables(conn)
+    yield conn
+    await conn.close()
+
+
+# Shaped like a real queued backup page: the drain prepends the title, so the
+# per-run lines sit past character 200 and two DIFFERENT failures that share
+# their opening share a content hash.
+_LONG_TITLE = "Backup alert (Telegram send failed)"
+_LONG_BODY = (
+    "Genesis backup FAILED on the host. Reason: the encrypted push to the "
+    "backups repository was rejected by the remote after three attempts, so "
+    "this run's snapshot is local only and the off-site copy is stale. "
+)
+
+
+@pytest.mark.asyncio
+async def test_distinct_keys_sharing_a_prefix_both_deliver(tmp_path, monkeypatch, outreach_db):
+    from genesis.outreach.governance import content_hash
+
+    a = f"{_LONG_TITLE}\n\n{_LONG_BODY}Detail: first failure"
+    b = f"{_LONG_TITLE}\n\n{_LONG_BODY}Detail: second, different failure"
+    assert content_hash(a) == content_hash(b)  # guard-the-guard: hashes collide
+
+    root = tmp_path / "queue"
+    monkeypatch.setattr("genesis.env.alert_queue_root", lambda: root)
+    pipe = _GovernedPipeline(outreach_db)
+    _enqueue(root, dedupe_key="backup:aaaaaaaaaaaa", title=_LONG_TITLE,
+             body=_LONG_BODY + "Detail: first failure")
+    await alert_drain._make_drainer(_RT(pipeline=pipe))()
+    _enqueue(root, dedupe_key="backup:bbbbbbbbbbbb", title=_LONG_TITLE,
+             body=_LONG_BODY + "Detail: second, different failure")
+    await alert_drain._make_drainer(_RT(pipeline=pipe))()
+
+    assert pipe.statuses == [OutreachStatus.DELIVERED, OutreachStatus.DELIVERED]
+
+
+@pytest.mark.asyncio
+async def test_same_key_repeat_is_still_suppressed(tmp_path, monkeypatch, outreach_db):
+    root = tmp_path / "queue"
+    monkeypatch.setattr("genesis.env.alert_queue_root", lambda: root)
+    pipe = _GovernedPipeline(outreach_db)
+    for _ in range(2):
+        _enqueue(root, dedupe_key="backup:aaaaaaaaaaaa", title=_LONG_TITLE,
+                 body=_LONG_BODY + "Detail: same failure")
+        await alert_drain._make_drainer(_RT(pipeline=pipe))()
+
+    assert pipe.statuses == [OutreachStatus.DELIVERED, OutreachStatus.REJECTED]
+    assert q.list_queued(root) == []  # REJECTED stays terminal

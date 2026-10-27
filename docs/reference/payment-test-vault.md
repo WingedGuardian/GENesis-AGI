@@ -1,0 +1,102 @@
+# Payment test vault
+
+`scripts/payments_test_vault.py` runs a card-fill branch live, before it merges,
+against a vault that holds only Stripe's public test Visa. The live vault, its
+socket, its cards and the main Telegram bot are never used.
+
+## What it builds
+
+`setup` makes one fixed directory, `~/tmp/payment-test-vault` (under the account's home), holding:
+
+| Path | What it is |
+|---|---|
+| `venv/` | A venv whose `import genesis` is the branch worktree's `src/`, then the main venv's packages (a `.pth` file, no copy) |
+| `home/` | The test MCP's `HOME`, so its browser profile is `home/.genesis/camoufox-profile`, not the live one |
+| `home/.genesis/payment_vault/` | The test vault: one card, `TEST 4242`, multi-use, scoped to `--merchant` |
+| `home/.genesis/run/payment_vault.sock` | The test vault's socket (bound by `serve`) |
+| `home/genesis-test.db` | The audit database (full schema, so the test MCP starts normally) |
+| `mcp.json` | One server, `genesis-health-b1test`: the test venv's python running the worktree's `scripts/genesis_mcp_server.py --server health` |
+
+It also writes `config/payments.local.yaml` (`card_fill.enabled: true`) in the
+**worktree**, never in the main checkout, and only if no such file exists.
+
+`serve` runs the test vault service. Its approvals are asked **in the serve
+terminal**, not on Telegram: the same registry as genesis-server
+(`payments/approval.py`) sends the text a tap would show to the terminal, and a
+typed `y` settles it through the registry's own `handle_tap` (anything else
+refuses). No Telegram bot is involved. Every approval starts with:
+
+```
+Payment approval
+TEST: test vault, Stripe test card only
+...
+Card: TEST 4242 ending 4242
+```
+
+The registry refuses any other card line, and the console it sends through
+refuses any text without the `TEST:` line. A typed line is only ever compared
+with `y`; it reaches no other code.
+
+## Owner steps
+
+1. Find the merchant: the registrable domain the test checkout's **payment**
+   page shows after redirects (a navigate-only dry run).
+2. Set up, with the main venv's python, from the main checkout:
+
+   ```bash
+   ~/genesis/.venv/bin/python ~/genesis/scripts/payments_test_vault.py setup \
+       --worktree <card-fill branch worktree> --merchant <domain from step 1>
+   ```
+
+   The directory must not exist yet. Setup also refuses when it would not be
+   on the same mount as the Genesis trash (teardown moves it there) or when its
+   socket path cannot be bound; with the fixed short path neither happens on a
+   standard install.
+3. Close any browser another session has open (or wait for its idle reclaim):
+   `serve` refuses while one runs, and a release is refused while one runs.
+4. In one terminal: `~/genesis/.venv/bin/python ~/genesis/scripts/payments_test_vault.py serve`.
+   `--approval-timeout-s 60` shortens the approval wait for an expiry test.
+   The test vault service loads the test vault's key when it starts, like the
+   live one; there is no passphrase and no relock.
+5. In another terminal, start the test session yourself, with the command
+   `serve` prints:
+   `cd <worktree> && claude --strict-mcp-config --mcp-config ~/tmp/payment-test-vault/mcp.json`.
+   Only the test MCP is loaded in that session. The browser shows on `:99`.
+6. Approve in the **serve terminal** (type `y`, Enter). Check the `TEST:` line is there.
+7. Exit the test Claude session first (its health MCP keeps the test database
+    open, and the trash refuses a directory in use). Ctrl-C the serve, then
+    `~/genesis/.venv/bin/python ~/genesis/scripts/payments_test_vault.py teardown`.
+    It stops a running serve and moves the directory to the Genesis trash, then
+    removes the overlay if it is still the file setup wrote. If the trash
+    refuses the directory, nothing is removed and teardown can be run again.
+    The lifecycle lock is a file beside the directory
+    (`~/tmp/.payment-test-vault.serve.lock`); teardown removes it.
+
+## Refusals
+
+Each refusal prints its code.
+
+| Code | Refuses |
+|---|---|
+| R1 | (computes the live paths: `~/.genesis`, the operator's and genesis-server's `GENESIS_HOME`, every listening `payment_vault.sock`) |
+| R2 | A test directory equal to, inside, or holding a live Genesis home; an existing one at setup; one without the harness marker later; a teardown of one holding entries setup never made; a new one on another volume than the Genesis trash or on the Claude Code temp volume; a serve while another serve or a teardown holds the directory's lifecycle lock (and a teardown while a serve holds it); a test audit database (or its `-wal`/`-shm`) that is a link, has a second hard link, or is a live database |
+| R3 | A test socket whose directory resolves outside the test directory or to a live run directory, a file there sharing a live socket's inode, or a listener already there; at setup, a socket path that cannot be bound |
+| R4 | A test vault holding anything but the one `TEST 4242` card setup added |
+| R5 | (by construction: no option, stdin or file takes card data) |
+| R6 | (retired with the vault passphrase) |
+| R7 | A release from a test MCP whose `HOME`, `GENESIS_HOME`, `GENESIS_DB_PATH`, `XDG_CACHE_HOME` or `SECRETS_PATH` is outside the test directory, whose `GENESIS_REPO_ROOT` is not the worktree, or that has a session bus, a `PYTHON*` variable or a bot token. The test MCP starts through `launch.py`, which removes those three classes from the environment it inherits before it execs the server. Serve refuses an `mcp.json` or `launch.py` that changed since setup |
+| R8 | A test peer policy that names the main venv python or the main server script |
+| R9 | A worktree that is the main checkout, on `main`, the copy the harness itself imports, or nested with the test directory |
+| R10 | A card-fill overlay outside the worktree's `config/` (or in the main checkout's own `config/`; a worktree under `.claude/worktrees/` is fine), or over an existing file; a serve whose overlay is missing, changed, or not the file setup wrote (setup records its inode). Teardown removes only that file, and says when it leaves one for you to delete |
+| Q16 | A serve or a release while a browser not started by the test MCP runs |
+
+Teardown
+signals only a process whose own command line is
+`payments_test_vault.py serve` (one test directory per account), never genesis-server or
+itself, and refuses otherwise without removing anything.
+
+The harness and every Genesis process run as one user, so a same-user process
+can get past all of this. These refusals stop mistakes, not an adversary. The
+test MCP inherits the rest of your environment from Claude Code (`DISPLAY`
+included, so its browser shows on `:99`); only the variables R7 names are
+checked.

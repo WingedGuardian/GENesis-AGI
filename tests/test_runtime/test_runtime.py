@@ -41,6 +41,8 @@ def _all_init_patches():
         patch("genesis.runtime.GenesisRuntime._init_health_data"),
         patch("genesis.runtime.GenesisRuntime._init_outreach", new_callable=AsyncMock),
         patch("genesis.runtime.GenesisRuntime._init_autonomy"),
+        # Spawns a subprocess; test_browser_capability.py covers it.
+        patch("genesis.runtime.GenesisRuntime._init_browser_automation", new_callable=AsyncMock),
     ]
 
 

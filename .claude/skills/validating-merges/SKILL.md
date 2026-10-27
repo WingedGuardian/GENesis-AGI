@@ -7,7 +7,7 @@ description: >
   "validate the merged PRs", "work the verification backlog", "did that PR
   actually work", "run the post-merge E2E". It owns the obligation ledger the
   repo-pulse worker fills. Do NOT load it for building a change and opening its
-  PR (that is `genesis-development`), or for driving open PRs to merge (that is
+  PR (that is `build-session`), or for driving open PRs to merge (that is
   `closing-session`).
 # MEASURED against the real scorer (`scripts/hooks/skill_injection_hook.py`),
 # both directions, 6 advertised triggers and 10 control prompts, 2026-09-26:
@@ -50,7 +50,7 @@ Three session types touch a PR and they are not phases of one life:
 
 | type | owns | skill |
 |---|---|---|
-| **build** | an item from Ready until its PR exists | `genesis-development` |
+| **build** | an item from Ready until its PR exists | `build-session` |
 | **closing** | the open-PR queue, until merged | `closing-session` |
 | **validator** | the MERGED PR, until its obligation is discharged | this one |
 
@@ -347,3 +347,199 @@ a defect in the tool — file it; do not edit the evidence to fit.
 Devin's install and hybrid PRs carry `E2E:` lines written for Genesis to run.
 The validator is their natural consumer — those are the rows where the
 declaration is most likely to be both present and actionable.
+
+**Load `genesis-development` (the shared core) first** if this session has not:
+it holds the review-chain, evidence and private-data rules every session uses.
+
+## Deploys: detach `update.sh` from the session
+
+**DEPLOYS ARE THE EXCEPTION (to the core's `run_in_background` rule), and this is the one to get right.**
+`scripts/update.sh` must be **DETACHED FROM THE SESSION ENTIRELY** — not
+foregrounded, and not backgrounded. (`bootstrap.sh` and `host-setup.sh` are long
+too but are NOT in this group; see the warning below before reaching for either.)
+
+- Foreground is impossible: MEASURED 2026-09-16, a bare `update.sh` ran **1022s**,
+  1.7× the 600000ms hard ceiling.
+- `run_in_background` is NOT the fix either, despite having no 120s ceiling: it is
+  tied to the SESSION's lifetime, and deploys launched that way were killed mid-run
+  on 2026-07-22 (leaving genesis-server DOWN during bootstrap) and 2026-09-16
+  (during the pre-update backup). The precise kill mechanism is UNRESOLVED — three
+  candidates are eliminated in CC memory `deploy_detach_not_background`, and the
+  successor hypothesis there is hedged, not established. Detachment removes the
+  coupling to this session, which is what every remaining candidate runs through.
+  It is not immunity in general: an OOM kill reaches a systemd unit just as readily.
+
+```bash
+XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
+DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}" \
+systemd-run --user --collect --unit genesis-deploy-manual \
+  --working-directory=$HOME/genesis \
+  --setenv=PATH="$PATH" --setenv=SSH_AUTH_SOCK --setenv=GENESIS_SYNC_PRIVATE_PATTERNS \
+  /bin/bash -c 'mkdir -p ~/tmp; exec ./scripts/update.sh > ~/tmp/deploy-$(date +%Y%m%d-%H%M).log 2>&1'
+```
+
+substituting the checkout root you actually ran from for `$HOME/genesis` if it
+differs — `scripts/install.sh` sets `REPO_DIR` from its own location, so
+noncanonical checkouts are supported, and `update.sh` derives its root the same way, so the canonical path is an example, not a
+constant. (Keep the command itself pasteable — a literal `<placeholder>` in the
+value is a shell syntax error.)
+
+**Two preconditions, checked before detaching, not after:**
+
+- **Linger.** A `--user` unit dies with the user manager when your last login
+  session ends unless linger is enabled. `loginctl show-user $(id -u) -p Linger`
+  must print `Linger=yes`; if it does not, run `loginctl enable-linger $(id -u)`
+  first (one-time, needs sudo). Without it the "detached" deploy survives the CC
+  session only as long as you stay logged in — which is the same coupling, one
+  level up.
+- **Noninteractive sudo.** `update.sh` runs `bootstrap.sh` on every run that
+  applies a change (its "Run bootstrap" step), and bootstrap calls `sudo`. The no-sudo claim covers only
+  `update.sh`'s own text, not its transitive calls. If sudo prompts anywhere on
+  this install, the detached deploy aborts mid-bootstrap. Require NOPASSWD-style
+  sudo: sudo's per-terminal timestamps mean refreshing the credential in your
+  terminal does not authorize the no-TTY calls inside the unit, and a warm
+  cache expires mid-deploy anyway. Check it in the same no-TTY service
+  context the deploy will get, with the bus variables set:
+  `systemd-run --user --wait --pipe --quiet --collect -- sudo -n true` must
+  exit 0 (MEASURED 2026-10-01: `--scope --wait` is refused outright, "--wait
+  may not be combined with --scope"). If it fails, run the deploy in a
+  terminal instead.
+
+**`mkdir -p ~/tmp` is part of the command, not tidiness.** `~/tmp` is not
+guaranteed — `install.sh` and `bootstrap.sh` create it only when `/tmp` is small —
+and the shell opens the redirect *before* exec'ing `update.sh`, so a missing
+directory kills the unit instantly, before the deploy's own `mkdir -p "$HOME/tmp"`
+near the top of `update.sh` can run. With `--collect` that leaves nothing behind to diagnose,
+which is the same invisible failure the verify step below exists for.
+
+**The bus variables come first, and they are not decoration.** A CC session often
+has no `XDG_RUNTIME_DIR`, and without it the `systemd-run --user` CLIENT cannot
+reach the user manager: MEASURED 2026-09-16, a scrubbed environment gives
+`Failed to connect to bus: No medium found` and nothing starts at all. `--setenv`
+configures the prospective *unit* and cannot help the client connect, so it is no
+substitute. `update.sh` exports exactly these two near its top for the same reason, and
+`cc/invoker.py` records the same failure as measured on a live install. This one is
+easy to get wrong by testing in a session that happens to have the variables —
+which is how it reached review here.
+
+**A transient service inherits the user manager's environment, not your shell's.**
+Only what you name with `--setenv` crosses over, so a deploy depending on an
+exported variable silently changes behaviour: `SSH_AUTH_SOCK` (`update.sh`'s
+`git fetch` of a private SSH remote fails without the agent) and
+`GENESIS_SYNC_PRIVATE_PATTERNS` (`bootstrap.sh` branches on it) are forwarded above. Naming an unset variable is
+harmless — measured, the unit still starts.
+
+**Never apply this to `bootstrap.sh` or `host-setup.sh`.** Both need a channel a
+detached service does not have. `bootstrap.sh` runs under `set -euo pipefail` and
+calls bare `sudo` (the journald and sshd drop-in steps' `sudo mkdir`), so wherever
+sudo prompts it aborts partway through configuring the machine — and "sudo is
+passwordless here" is a fact about one box, not about the recipe. `host-setup.sh` is
+worse: interactive, run on the bare host VM, and its "Delete and recreate? [Y/n]"
+prompt treats EOF as the default `Y`, so detaching it stops and renames the existing
+container. `update.sh` is the only script in this family with **no sudo calls of
+its own** — it does invoke `bootstrap.sh` (its "Run bootstrap" step), which does call
+sudo, hence the noninteractive-sudo precondition above — and it remains the only
+one covered. Run the other two in a real terminal;
+the advisory no longer fires on them rather than offer a recipe that breaks them.
+
+Wrap **the command you actually ran** — `update.sh` and `bootstrap.sh` are not
+interchangeable and take their own arguments. If you build that wrapper
+programmatically, quote the
+whole inner script as one unit (`shlex.quote`) rather than interpolating an
+already-quoted command into `bash -c '…'`: MEASURED, the naive form turns
+`--msg 'a b'` into `--msg a` and executes a `$(…)` the user quoted as data.
+
+`--setenv=PATH` is load-bearing: a `--user` unit otherwise gets systemd's default
+PATH, which omits `~/.local/bin`, so bootstrap takes its `uv not found — installing…`
+branch rather than the branch an interactive run takes. The shipped code sidesteps
+this by passing the whole environment (`updates.py::_apply_direct` uses
+`env=os.environ.copy()`).
+
+**Two things that look like detachment and are not.** `systemd-run --user --scope`
+keeps the CALLER'S session id (MEASURED) — cgroup-isolated, still session-held;
+`_apply_direct` gets away with it only because its parent is genesis-server rather
+than a CC session. And **`setsid` is not detachment**: it runs the program in a new
+session but does not background it or stop the caller waiting on it — MEASURED,
+`timeout 1 setsid bash -c 'sleep 4; echo > f'` exits 124 having written no file.
+What detaches is the default transient SERVICE mode (no `--scope`): MEASURED
+2026-10-01 on systemd 255, a service child's parent is the user manager and it
+runs in a new process session, while a `--scope` child's parent is the calling
+shell. `--unit` does not detach anything — an auto-named service lands in the
+same place — it only gives the unit a fixed name for the verify step below.
+
+Then VERIFY it took — with the same two bus variables set (a scrubbed session
+otherwise gets a bus error, which says nothing about the launch),
+`systemctl --user is-active genesis-deploy-manual` must print `active`. `systemd-run` does NOT inherit the tool's cwd, so a bare relative
+path resolves under `$HOME`, bash exits instantly, `--collect` reaps the unit, and
+a failed launch is indistinguishable from a successful one. (It also reports
+`inactive` once the deploy has FINISHED, so check promptly and read the log for the
+outcome.) `genesis-server` going `inactive` mid-run is EXPECTED. When the server is
+up, `POST /api/genesis/updates/apply` with `{"supervised": false}` does the same job
+and passes the environment for you.
+
+**A mid-run kill is never a no-op, but what it does depends on the signal and on
+the phase.** Three windows, in order. From where `trap '_on_signal INT' INT` arms
+the rollback trap — just BEFORE `_write_state "merging"`, not after the merge — an
+interrupt runs `_on_signal` → `_do_rollback`. Between `trap '_on_signal_prestop …'`
+and there, `_on_signal_prestop` restarts the services it stopped and explicitly does
+not roll back. Earlier still — during the pre-update backup (the `backup.sh` call) —
+**no INT/TERM trap is installed yet**, so a SIGTERM there runs no handler at all. That last point matters
+for diagnosis: "no trap ran" does NOT identify a kill as SIGKILL, because the
+untrapped window produces the same evidence. Note too that `_do_rollback` disarms
+INT/TERM as it starts, so a second signal lands mid-rollback with default
+disposition, and the rollback has failure exits that report `ROLLBACK INCOMPLETE`.
+Either way: verify state (server active, no mid-rebase, pin, both CC versions)
+before re-running; it is idempotent. (A non-blocking PreToolUse advisory hook,
+`scripts/hooks/deploy_timeout_advisory.py`, nudges toward this whenever a command
+can run `update.sh`, and stays quiet on reads of it. It deliberately does not
+check whether you already detached: that needs systemd-run's option grammar, an
+open set, so a detached launch still gets the note.)
+
+**Why this paragraph is worded so defensively:** PR #1221 shipped both this policy
+and that hook on 2026-07-22 prescribing `run_in_background`, from a CC memory
+written two days earlier. An incident that same day refuted it. The correction
+landed only in a second CC memory on 07-23, both public surfaces kept the original,
+and a third deploy was killed by this advice 56 days later. A remedy is only as
+good as the case it was actually executed against.
+
+An earlier draft of this paragraph also claimed #1221 shipped a second, already-stale
+assertion about signal handling. That was **false, and worth recording as the more
+useful lesson**: it was inferred from the CC memory #1221 was written from, rather
+than read out of the commit, which shipped the correct claim. A note is evidence
+about what someone believed when they wrote it — never about what the code says
+now, and never about what some other artifact contains. Open the commit.
+
+## Host-Deploy Gate (merged ≠ deployed)
+
+A merged PR that touches host-deployed paths is **NOT done at merge**. The
+guardian and the host VM only pick up changes when `scripts/update.sh` runs —
+merging and walking away leaves the host running stale code indefinitely
+(observed live: a host guardian sat 3 PRs behind for a week because every
+session assumed deploy "happens somehow").
+
+**Trigger paths** (match = this gate applies): `src/genesis/guardian/`,
+`scripts/guardian-gateway.sh`, `scripts/install_guardian.sh`,
+`scripts/host-setup.sh`, `scripts/update.sh`, `scripts/lib/cc_version.sh`.
+
+**After merging such a PR, in the same session:**
+
+1. Run `scripts/update.sh` from `~/genesis`, DETACHED from the session with
+   the `systemd-run --user` recipe under "DEPLOYS ARE THE EXCEPTION" above, never in the
+   foreground or via `run_in_background` (it redeploys the guardian when
+   guardian-relevant paths changed and heals host/container CC + Node pin
+   drift — including on a no-delta run).
+2. Verify the deploy landed: gateway `version` op reports the expected
+   `deployed_commit` / CC version; guardian tick healthy in its journal.
+3. State the deploy + verification result explicitly in the wrap-up. If the
+   deploy cannot happen this session, record it — never leave deploy as an
+   implicit assumption. A purely LOCAL blocker (host unreachable tonight) is a
+   `follow_up_create` row. A blocker exposing a REPO-level gap (a missing reconcile
+   mechanism, no self-heal path) needs BOTH: an issue for the mechanism fix, AND a
+   local row for the fact that THIS install is still undeployed — another
+   contributor can close the issue without ever touching this host, which is
+   exactly the stale-host failure above.
+
+**The reverse direction is equally binding**: host VMs are deploy targets,
+never edit-in-place dev environments. An emergency hand-edit on a host gets a
+same-day PR that lands the same change at source — a host divergence that
+outlives its incident is a bug.

@@ -19,6 +19,7 @@ not one.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -119,3 +120,186 @@ def test_the_documented_return_contract_matches_the_code() -> None:
 
     assert "1 — blocked" in header
     assert "could not tell" in header, "the undeterminable case must be documented"
+
+
+def _fake_venv(tmp_path: Path) -> tuple[Path, Path]:
+    """A venv whose pip records its arguments and whose python imports anything."""
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    log = tmp_path / "pip.args"
+    (venv / "bin" / "pip").write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{log}"\n')
+    (venv / "bin" / "python").write_text("#!/bin/sh\nexit 0\n")
+    for name in ("pip", "python"):
+        (venv / "bin" / name).chmod(0o755)
+    return venv, log
+
+
+@pytest.mark.parametrize(("extras", "target_suffix"), [("", ""), ("browser", "[browser]")])
+def test_extras_name_the_install_target(tmp_path: Path, extras: str, target_suffix: str) -> None:
+    """bootstrap.sh and install.sh install the core packages first, then the
+    `browser` extra as a second, non-fatal call through the same guard."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "-q", cwd=repo)
+    venv, log = _fake_venv(tmp_path)
+    arg = f' "{extras}"' if extras else ""
+    script = f'source "{_LIB}"; editable_install_guarded "{repo}" "{venv}"{arg}'
+    res = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=120)
+    assert res.returncode == RC_OK, res.stdout + res.stderr
+    assert log.read_text().splitlines()[:3] == ["install", "-e", f"{repo}{target_suffix}"]
+
+
+def _recording_venv(tmp_path: Path, *, check_rc: int = 0) -> tuple[Path, Path]:
+    """A venv whose pip and python append their arguments to one log; python
+    exits ``check_rc`` for `check-packages` and 0 otherwise."""
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    log = tmp_path / "calls"
+    (venv / "bin" / "pip").write_text(f'#!/bin/sh\necho "pip $*" >> "{log}"\n')
+    (venv / "bin" / "python").write_text(
+        "#!/bin/sh\n"
+        f'echo "python $*" >> "{log}"\n'
+        f'case "$*" in *check-packages*) echo "browser-stack: patchright is not installed"; '
+        f"exit {check_rc};; esac\nexit 0\n"
+    )
+    for name in ("pip", "python"):
+        (venv / "bin" / name).chmod(0o755)
+    return venv, log
+
+
+def _install_browser_extra(
+    tmp_path: Path, venv: Path, env_extra: dict | None = None
+) -> subprocess.CompletedProcess:
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    _git("init", "-q", cwd=repo)
+    script = f'set -euo pipefail; source "{_LIB}"; install_browser_extra "{repo}" "{venv}"'
+    env = {**os.environ, "GENESIS_HOME": str(tmp_path / "gh"), **(env_extra or {})}
+    return subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, timeout=120, env=env
+    )
+
+
+def test_browser_extra_marks_the_cache_then_installs_then_checks(tmp_path: Path) -> None:
+    """mark-legacy before pip: once camoufox 0.5 is installed, its fetch deletes a
+    cache holding a pre-0.5 engine that has no .0.5_FLAG (__main__.py:259-263)."""
+    venv, log = _recording_venv(tmp_path)
+    res = _install_browser_extra(tmp_path, venv)
+    assert res.returncode == 0, res.stdout + res.stderr
+    calls = log.read_text().splitlines()
+    assert calls[0] == "python -m genesis.browser.provision mark-legacy"
+    assert calls[1].startswith(f"pip install -e {tmp_path / 'repo'}[browser]")
+    # The checkout's pyproject.toml, not the installed metadata pip may have left stale.
+    assert calls[-1] == (
+        f"python -m genesis.browser.provision check-packages "
+        f"--pyproject {tmp_path / 'repo'}/pyproject.toml"
+    )
+
+
+def test_browser_extra_reports_what_pip_left_out(tmp_path: Path) -> None:
+    """pip's status is masked and the core import check passes regardless, so the
+    package check is what makes a failed browser install visible."""
+    venv, _ = _recording_venv(tmp_path, check_rc=1)
+    res = _install_browser_extra(tmp_path, venv)
+    assert res.returncode == 1
+    assert "patchright is not installed" in res.stdout
+
+
+def test_browser_extra_waits_for_a_running_provisioner(tmp_path: Path) -> None:
+    """pip replacing camoufox/playwright/patchright under a running browser-stack
+    unit can mix pins mid-install: the upgrade takes the provisioner's lock."""
+    import fcntl
+
+    venv, log = _recording_venv(tmp_path)
+    lock = tmp_path / "gh" / "locks" / "browser-stack.lock"
+    lock.parent.mkdir(parents=True)
+    with open(lock, "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        res = _install_browser_extra(
+            tmp_path, venv, env_extra={"GENESIS_BROWSER_STACK_WAIT_S": "1"}
+        )
+    assert res.returncode != 0
+    assert not any(c.startswith("pip install") for c in log.read_text().splitlines())
+    assert "browser-stack" in res.stdout + res.stderr
+
+
+# ── install_runtime_extras: the test and payments extras ──────────────────────
+
+
+def _extras_venv(tmp_path: Path, *, list_out: str = "test,payments", check_rc: int = 0):
+    """A venv whose pip and python log their arguments. python answers the gate's
+    --install-extras with *list_out* (nothing and exit 1 when empty) and its
+    --extras check with *check_rc*; every other call (the import check) exits 0."""
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    log = tmp_path / "calls"
+    (venv / "bin" / "pip").write_text(f'#!/bin/sh\necho "pip $*" >> "{log}"\n')
+    list_rc = 0 if list_out else 1
+    (venv / "bin" / "python").write_text(
+        "#!/bin/sh\n"
+        f'echo "python $*" >> "{log}"\n'
+        'case "$*" in\n'
+        f'  *--install-extras*) printf "%s\\n" "{list_out}"; exit {list_rc};;\n'
+        f'  *--extras*) cat > /dev/null; echo "missing: pyrage [payments]"; exit {check_rc};;\n'
+        "esac\nexit 0\n"
+    )
+    for name in ("pip", "python"):
+        (venv / "bin" / name).chmod(0o755)
+    return venv, log
+
+
+def _install_runtime_extras(tmp_path: Path, venv: Path, env_extra: dict | None = None):
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    (repo / "pyproject.toml").write_text('[project]\nname = "fixture"\n')
+    _git("init", "-q", cwd=repo)
+    script = f'set -euo pipefail; source "{_LIB}"; install_runtime_extras "{repo}" "{venv}"'
+    env = {**os.environ, **(env_extra or {})}
+    env.pop("GENESIS_DEPLOY_SUMMARY", None)
+    env.update(env_extra or {})
+    return subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, timeout=120, env=env
+    )
+
+
+def test_runtime_extras_read_the_list_install_it_then_check_it(tmp_path: Path) -> None:
+    """The list comes from the gate (one record of it), pip installs exactly that
+    list as the extras of THIS checkout, and the gate checks it against the
+    checkout's pyproject.toml."""
+    venv, log = _extras_venv(tmp_path)
+    res = _install_runtime_extras(tmp_path, venv)
+    assert res.returncode == 0, res.stdout + res.stderr
+    calls = log.read_text().splitlines()
+    gate = tmp_path / "repo" / "scripts" / "lib" / "venv_matches_pyproject.py"
+    assert calls[0] == f"python -P {gate} --install-extras"
+    assert calls[1].startswith(f"pip install -e {tmp_path / 'repo'}[test,payments]")
+    assert calls[-1] == f"python -P {gate} --extras test,payments"
+
+
+def test_runtime_extras_report_what_pip_left_out(tmp_path: Path) -> None:
+    """pip's status is masked, so the gate's check is what makes it visible; the
+    deploy summary gets a line because update.sh shows only bootstrap's tail."""
+    venv, _ = _extras_venv(tmp_path, check_rc=1)
+    summary = tmp_path / "summary"
+    res = _install_runtime_extras(tmp_path, venv, {"GENESIS_DEPLOY_SUMMARY": str(summary)})
+    assert res.returncode == 1
+    assert "missing: pyrage [payments]" in res.stdout
+    line = summary.read_text()
+    assert line.startswith("warning: runtime extras [test,payments] incomplete")
+    # The safe remedy: never a bare editable install (the guard may be the reason).
+    assert "scripts/update.sh --post-merge" in line and "pip install" not in line
+
+
+def test_runtime_extras_install_nothing_when_the_list_cannot_be_read(tmp_path: Path) -> None:
+    venv, log = _extras_venv(tmp_path, list_out="")
+    res = _install_runtime_extras(tmp_path, venv)
+    assert res.returncode == 1
+    assert not any(c.startswith("pip ") for c in log.read_text().splitlines())
+    assert "cannot read the list" in res.stderr
+
+
+def test_runtime_extras_failure_without_a_summary_writes_nothing_else(tmp_path: Path) -> None:
+    venv, _ = _extras_venv(tmp_path, check_rc=1)
+    res = _install_runtime_extras(tmp_path, venv)
+    assert res.returncode == 1
+    assert list(tmp_path.glob("summary*")) == []

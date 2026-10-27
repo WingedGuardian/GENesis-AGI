@@ -9,8 +9,11 @@ file legitimately holds.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
+
+import pytest
 
 LIB = Path(__file__).resolve().parents[2] / "scripts" / "lib" / "load_secrets.sh"
 
@@ -115,3 +118,45 @@ class TestLoadSecrets:
         )
         assert proc.returncode == 0
         assert "alive" in proc.stdout
+
+
+@pytest.mark.parametrize("locale", ["C", "C.UTF-8"])
+@pytest.mark.parametrize("value", ["\u00a0edge\u00a0", "\u2003edge\u2003", "edge\u0085inside", "edge\u2028inside"])
+def test_unicode_value_bytes_are_not_syntax_whitespace(tmp_path, locale, value):
+    path = tmp_path / "secrets.env"
+    path.write_text("GENESIS_BACKUP_PASSPHRASE=" + value + "\n")
+    proc = subprocess.run(
+        ["bash", "-c", 'source "$1"; load_secrets_file "$2"; printf "%s\\0%s" "$GENESIS_BACKUP_PASSPHRASE" "$LC_ALL"',
+         "test", str(LIB), str(path)],
+        env={**os.environ, "LC_ALL": locale}, capture_output=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    actual, restored_locale = proc.stdout.split(b"\0")
+    assert actual == value.encode()
+    assert restored_locale.decode() == locale
+
+
+@pytest.mark.parametrize("incoming_locale", [None, "C", "C.UTF-8"])
+@pytest.mark.parametrize("file_locale", ["C", "C.UTF-8"])
+@pytest.mark.parametrize("locale_first", [False, True])
+@pytest.mark.parametrize("quoted", [False, True])
+def test_file_locale_exports_without_changing_ascii_syntax(
+    tmp_path, incoming_locale, file_locale, locale_first, quoted
+):
+    value = "\u2003edge\u2003"
+    locale_line = "LC_ALL=" + file_locale + "\n"
+    value_line = "GENESIS_BACKUP_PASSPHRASE=" + ('"' + value + '"' if quoted else value) + "\n"
+    path = tmp_path / "secrets.env"
+    path.write_text(locale_line + value_line if locale_first else value_line + locale_line)
+    env = os.environ.copy()
+    env.pop("LC_ALL", None)
+    if incoming_locale is not None:
+        env["LC_ALL"] = incoming_locale
+    proc = subprocess.run(
+        ["bash", "-c", 'source "$1"; load_secrets_file "$2"; printf "%s\\0%s" "$GENESIS_BACKUP_PASSPHRASE" "$LC_ALL"',
+         "test", str(LIB), str(path)], env=env, capture_output=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    actual, exported_locale = proc.stdout.split(b"\0")
+    assert actual == value.encode()
+    assert exported_locale.decode() == file_locale

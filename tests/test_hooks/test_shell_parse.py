@@ -10,15 +10,19 @@ from __future__ import annotations
 import ast
 import inspect
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
 
 _SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 sys.path.insert(0, str(_SCRIPTS / "hooks"))
+import pr_close_predicate as pcp  # noqa: E402
 import shell_parse as sp  # noqa: E402
 
 NV = "--no" + "-verify"  # keep the literal out of this file's own text
@@ -31,6 +35,15 @@ def _push_blocked(cmd: str) -> bool:
 
 def _commit_nv(cmd: str) -> bool:
     return any(sp.commit_skips_hooks(s.argv) for s in sp.analyze(cmd))
+
+
+def _nested_blind(program: str, tail: str) -> str:
+    payload = f"""echo "$(echo 'a"b')" ; {program} {tail}"""
+    return "bash -c " + shlex.quote(payload)
+
+
+def _nested_script(script: str) -> str:
+    return "bash -c " + shlex.quote(script)
 
 
 # ── pytest-invocation detection (shared by the test guards) ─────────────
@@ -168,6 +181,106 @@ class TestNesting:
         assert _push_blocked("echo `git push`")
 
 
+def test_nested_tokenization_failure_is_structural_and_withholds_prefix():
+    command = "echo ok; " + _nested_blind("git", "$ACTION origin feature-x")
+    result = sp._analyze_bounded(command)
+    assert result.bound_reason is None
+    assert result.structural_incomplete is True
+    assert result.diagnostic is sp._BLIND_STRUCTURAL
+    assert any(segment.argv == ["echo", "ok"] for segment in sp.analyze(command))
+    segments, blind = sp.analyze_checked(command)
+    assert segments == []
+    assert blind is sp._BLIND_STRUCTURAL
+
+
+def test_root_tokenization_keeps_legacy_non_bounds_behavior():
+    command = "echo 'a"
+    assert sp.untokenizable(command)
+    segments, blind = sp.analyze_checked(command)
+    assert segments
+    assert blind is sp._BLIND_UNTOKENIZABLE
+
+
+def test_nested_continuation_and_built_escape_are_reported():
+    continued = _nested_script("echo ok # don't\ngit pu\\\nsh origin feature-x")
+    _, continuation = sp.analyze_checked(continued)
+    assert continuation is sp._BLIND_CONTINUATION
+
+    escaped = _nested_script("echo ok # don't\ngit $'pu\\x73h' origin feature-x")
+    _, built = sp.analyze_checked(escaped)
+    assert built is sp._BLIND_BUILT_ESCAPE
+
+
+def test_root_legacy_failure_contrasts_with_nested_structural_failure():
+    script = "echo ok # don't\ngit $ACTION origin feature-x"
+    direct = sp._analyze_bounded(script)
+    assert direct.bound_reason is None
+    assert direct.structural_incomplete is False
+    assert sp.analyze_checked(script)[0]
+
+    nested = _nested_script(script)
+    result = sp._analyze_bounded(nested)
+    assert result.structural_incomplete is True
+    assert sp.analyze_checked(nested) == ([], sp._BLIND_STRUCTURAL)
+    assert sp.unresolved_verb_programs(nested) == frozenset({"git"})
+
+
+def test_built_escape_precedence_keeps_structural_recovery():
+    command = "echo $'\\x41'; " + _nested_script(
+        "echo ok # don't\ngit $ACTION origin feature-x"
+    )
+    result = sp._analyze_bounded(command)
+    assert result.diagnostic is sp._BLIND_BUILT_ESCAPE
+    assert result.structural_incomplete is True
+    assert sp.analyze_checked(command) == ([], sp._BLIND_BUILT_ESCAPE)
+    assert sp.unresolved_verb_programs(command) == frozenset({"git"})
+
+
+def test_supported_nested_control_remains_complete():
+    segments, blind = sp.analyze_checked("bash -c 'echo ok; git push origin feature-x'")
+    assert blind is None
+    assert any(segment.exe == "git" for segment in segments)
+
+
+def test_structural_fact_survives_higher_priority_continuation():
+    command = _nested_blind("git", "$ACTION origin feature-x") + " \\\n  echo done"
+    result = sp._analyze_bounded(command)
+    assert result.diagnostic is sp._BLIND_CONTINUATION
+    assert result.structural_incomplete is True
+    assert sp.analyze_checked(command) == ([], sp._BLIND_CONTINUATION)
+
+
+def test_structural_recovery_adds_only_dispatcher_candidates():
+    assert "git" in sp.unresolved_verb_programs(_nested_blind("git", "$ACTION origin feature-x"))
+    assert "git" in sp.unresolved_verb_programs(
+        _nested_blind("g\\\nit", "$ACTION origin feature-x")
+    )
+    assert "gh" in sp.unresolved_verb_programs(
+        _nested_blind("gh", "pr $GH_ACTION --title x --body y")
+    )
+    assert not sp.unresolved_verb_programs("echo 'a git")
+
+
+def test_proven_root_data_body_is_not_reintroduced_for_recovery():
+    command = "cat <<'EOF'\ngit status documentation\nEOF\n" + _nested_blind("printf", "ok")
+    assert sp.excise_data_heredoc(command) is not None
+    result = sp._analyze_bounded(command)
+    assert result.structural_incomplete is True
+    assert "git status documentation" not in result.decision_text
+    assert "git" not in sp.unresolved_verb_programs(command)
+
+
+def test_length_and_depth_bounds_skip_structural_recovery():
+    long_command = "x" * (sp.MAX_COMMAND_CHARS + 1) + " git $ACTION"
+    assert sp.unresolved_verb_programs(long_command) == frozenset()
+
+    nested = "git $ACTION"
+    for _ in range(sp.MAX_SUBSTITUTION_DEPTH + 1):
+        nested = "bash -c " + shlex.quote(nested)
+    assert sp.over_nested(nested)
+    assert sp.unresolved_verb_programs(nested) == frozenset()
+
+
 # ── override binding ────────────────────────────────────────────────────
 
 
@@ -197,15 +310,15 @@ class TestOverride:
 
     def test_independent_sigils_coexist(self):
         # Codex P2: two INDEPENDENT acks must be able to share one trailing comment —
-        # at escalation round 2 a genuine-but-unrecognized audit needs BOTH audit-ack
-        # (Rule 3) and depth-ack (Rule 2.5). Every whitespace token is scanned, so order
-        # is irrelevant and each sigil matches its own token.
+        # a merge commit can need BOTH depth-ack (Rule 2.5) and review-override
+        # (Rule 2). Every whitespace token is scanned, so order is irrelevant and
+        # each sigil matches its own token.
         for cmd in (
-            "git commit -m x # audit-ack depth-ack",
-            "git commit -m x # depth-ack audit-ack",
+            "git commit -m x # review-override depth-ack",
+            "git commit -m x # depth-ack review-override",
         ):
             seg = sp.analyze(cmd)[0].raw
-            assert sp.has_trailing_override(seg, sigil="audit-ack"), cmd
+            assert sp.has_trailing_override(seg, sigil="review-override"), cmd
             assert sp.has_trailing_override(seg, sigil="depth-ack"), cmd
         # Every merge-gate sigil must be in _KNOWN_SIGILS or it ENDS the leading run and
         # silently breaks combined waivers. scheduled-review-override (newest) combined
@@ -237,8 +350,8 @@ class TestOverride:
         seg = sp.analyze("git commit -m x # TODO consider depth-ack later")[0].raw
         assert not sp.has_trailing_override(seg, sigil="depth-ack")
         # a non-sigil token AHEAD of a real sigil ends the run (the sigil is unreachable)
-        seg2 = sp.analyze("git commit -m x # depth-ack-nope audit-ack")[0].raw
-        assert not sp.has_trailing_override(seg2, sigil="audit-ack")
+        seg2 = sp.analyze("git commit -m x # depth-ack-nope review-override")[0].raw
+        assert not sp.has_trailing_override(seg2, sigil="review-override")
 
 
 # ── commit hook-skip flag detection ─────────────────────────────────────
@@ -878,8 +991,8 @@ class TestSigilRunRegression:
     def test_an_unlisted_leading_sigil_no_longer_ends_the_run(self):
         h = sp.has_trailing_override
 
-        assert h("git merge f  # merge-to-main-override audit-ack", "audit-ack")
-        assert h("git merge f  # audit-ack merge-to-main-override", "audit-ack")
+        assert h("git merge f  # merge-to-main-override depth-ack", "depth-ack")
+        assert h("git merge f  # depth-ack merge-to-main-override", "depth-ack")
         assert h("git merge f  # merge-to-main-override", "merge-to-main-override")
 
     def test_prose_still_ends_the_run(self):
@@ -899,7 +1012,7 @@ class TestSigilRunRegression:
 
         The population is ``scripts/**.py``, NOT ``scripts/hooks/*.py``: a
         hooks-only glob misses ``review_enforcement_commit.py``, where
-        ``audit-ack`` and ``depth-ack`` are queried — 2 of the declared sigils,
+        ``review-override`` and ``depth-ack`` are queried — 2 of the declared sigils,
         invisible to a scan that claimed to cover "every hook".
         """
         _DEFAULT_SIGIL = inspect.signature(sp._has_trailing_override).parameters["sigil"].default
@@ -1472,3 +1585,1114 @@ def test_sh_carries_the_union_because_the_allowlist_is_keyed_on_a_basename():
     # basename really does identify the binary.
     assert "h" not in sp._C_BUNDLE_OPTIONS["dash"]
     assert "git" not in [seg.exe for seg in sp.analyze("dash -ch 'git push origin main'")]
+
+
+_UNPROVEN_DATA_HEREDOC_CASES = [
+    ("parameter-expansion", "cat ${x:-<<'EOF'}", "EOF", (), (), True, True),
+    ("file-descriptor", "cat <<'EOF' >&file", "EOF", (), (), True, True),
+    ("fd-number", "cat <<'EOF' 01>file", "EOF", (), (), True, True),
+    ("writer-substitution", "x=$(cat <<'EOF' > f", "EOF", (), (")",), True, True),
+    ("path-cat", "./cat <<'EOF'", "EOF", (), (), True, True),
+    ("process-substitution", "cat <<'EOF' > >(bash)", "EOF", (), (), True, True),
+    ("function-definition", "cat() { bash; }; cat <<'EOF'", "EOF", (), (), True, True),
+    ("path-assignment", "PATH=/tmp cat <<'EOF'", "EOF", (), (), True, True),
+    ("sudo", "sudo cat <<'EOF'", "EOF", (), (), True, True),
+    ("env", "env cat <<'EOF'", "EOF", (), (), True, True),
+    ("second-line-open-quote", "echo \"x\ncat <<'EOF'", "EOF", (), (), False, False),
+    ("body-delimiter-prefix", "git commit -m \"$(cat <<'EOF'", "EOF", ("EOF)",), (')"',), False, True),
+    ("body-delimiter-space", "cat <<'EOF'", "EOF", ("EOF ",), (), True, True),
+    ("body-delimiter-cr", "cat <<'EOF'", "EOF", ("EOF\r",), (), True, True),
+    ("body-delimiter-tab", "cat <<'EOF'", "EOF", ("\tEOF",), (), True, True),
+    ("strip-tabs", "cat <<-'EOF'", "EOF", (), (), True, True),
+    ("unquoted", "cat <<EOF", "EOF", (), (), True, True),
+    ("double-quoted", 'cat <<"EOF"', "EOF", (), (), True, True),
+    ("two-openers", "cat <<'EOF' <<'BAR'", "EOF", (), (), True, True),
+    ("pipe", "cat <<'EOF' | bash", "EOF", (), (), True, True),
+    ("writer", "cat > f <<'EOF'", "EOF", (), (), True, True),
+    ("trailing-backslash", "cat <<'EOF'\\", "EOF", (), (), False, True),
+    ("rebase-exec", "git rebase --exec \"$(cat <<'EOF'", "EOF", (), (')"',), True, True),
+    ("git-global-option", "git -c x=y commit -F - <<'EOF'", "EOF", (), (), True, True),
+    ("python", "python3 - <<'PY'", "PY", (), (), True, True),
+    ("tail-glued-digit-2", "cat <<'EOF' >/dev/null2>/dev/null", "EOF", (), (), True, True),
+    ("tail-glued-digit-1", "cat <<'EOF' >/dev/null1>/dev/null", "EOF", (), (), True, True),
+    ("tail-glued-chain", "cat <<'EOF' >/dev/null1>/dev/null2>/dev/null", "EOF", (), (), True, True),
+    (
+        "second-data-heredoc",
+        "git commit -F - <<'ONE'",
+        "ONE",
+        (),
+        ("git tag -F - t <<'TWO'", "message", "TWO"),
+        True,
+        True,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("name", "head", "delimiter", "body_prefix", "after_terminator", "body_visible", "after_visible"),
+    _UNPROVEN_DATA_HEREDOC_CASES,
+    ids=[case[0] for case in _UNPROVEN_DATA_HEREDOC_CASES],
+)
+@pytest.mark.parametrize("push_location", ["body", "after"])
+def test_unproven_data_heredocs_stay_visible(
+    name,
+    head,
+    delimiter,
+    body_prefix,
+    after_terminator,
+    body_visible,
+    after_visible,
+    push_location,
+):
+    body_lines = list(body_prefix)
+    body_lines.append(
+        "git push --force origin main" if push_location == "body" else "ordinary prose"
+    )
+    lines = [head, *body_lines, delimiter, *after_terminator]
+    if push_location == "after":
+        lines.append("git push --force origin main")
+    command = "\n".join(lines)
+
+    assert sp.excise_data_heredoc(command) is None, name
+    visible = any(sp.git_subcommand(seg.argv) == "push" for seg in sp.analyze(command))
+    assert visible is (body_visible if push_location == "body" else after_visible), command
+
+
+def test_unterminated_data_heredoc_is_not_excised_and_keeps_main_visibility():
+    command = "cat <<'EOF'\ngit push --force origin main"
+    assert sp.excise_data_heredoc(command) is None
+    assert any(sp.git_subcommand(seg.argv) == "push" for seg in sp.analyze(command))
+
+
+def test_the_exact_review_corpus_keeps_its_post_heredoc_push_visible():
+    command = (
+        "python3 - <<'PY'\n"
+        "# It feeds the reviewer's answer into this gate. `cmd`\n"
+        "'''\n"
+        "PY\n"
+        "git push --force origin main"
+    )
+    assert sp.excise_data_heredoc(command) is None
+    assert any(sp.git_subcommand(seg.argv) == "push" for seg in sp.analyze(command))
+
+
+_DATA_HEREDOC_RELIEF_CASES = [
+    ("cat", "cat <<'EOF'", ""),
+    ("cat-dash", "cat - <<'EOF'", ""),
+    ("cat-redirects", "cat <<'EOF' >/dev/null 2>/dev/null", ""),
+    ("git-commit-short-file", "git commit -F - <<'EOF'", ""),
+    ("git-commit-file", "git commit --file - <<'EOF'", ""),
+    ("git-commit-file-equals", "git commit --file=- <<'EOF'", ""),
+    ("git-tag", "git tag -a v1 -F - <<'EOF'", ""),
+    ("git-notes", "git notes add -F - <<'EOF'", ""),
+    ("git-notes-append", "git notes append -F - <<'EOF'", ""),
+    ("gh-pr-create", 'gh pr create --title "x y" --body-file - <<\'EOF\'', ""),
+    ("gh-issue-comment", "gh issue comment 5 -F - <<'EOF'", ""),
+    ("gh-issue-create", "gh issue create --title x --body-file - <<'EOF'", ""),
+    ("gh-issue-edit", "gh issue edit 5 --body-file=- <<'EOF'", ""),
+    ("gh-pr-edit", "gh pr edit 5 --body-file=- <<'EOF'", ""),
+    ("gh-pr-comment", "gh pr comment 5 --body-file - <<'EOF'", ""),
+    ("git-commit-message", 'git commit -m "$(cat <<\'EOF\'', ')"'),
+    ("git-commit-message-equals", 'git commit --message="$(cat <<\'EOF\'', ')"'),
+    ("gh-pr-body", 'gh pr create --title t -b "$(cat <<\'EOF\'', ')"'),
+    ("gh-pr-comment-body", 'gh pr comment 5 --body "$(cat <<\'EOF\'', ')"'),
+]
+
+_DATA_HEREDOC_BODY = (
+    "it's prose with an apostrophe\n"
+    "`a backtick`\n"
+    "$(git push --force origin main)\n"
+    "# don't treat this as a command\n"
+    "line ending in \\\n"
+    "git push --force origin main"
+)
+
+
+@pytest.mark.parametrize(
+    ("name", "head", "closing"),
+    _DATA_HEREDOC_RELIEF_CASES,
+    ids=[case[0] for case in _DATA_HEREDOC_RELIEF_CASES],
+)
+def test_proven_data_heredocs_are_excised_and_idempotent(name, head, closing):
+    command = f"{head}\n{_DATA_HEREDOC_BODY}\nEOF\n{closing}"
+    excised = sp.excise_data_heredoc(command)
+    assert excised is not None, name
+    excised_text, body = excised
+    assert "git push --force origin main" in body
+    assert sp._excised_text(command) == excised_text
+    assert sp._excised_text(excised_text) == excised_text
+    assert not any(
+        sp.git_subcommand(seg.argv) == "push" for seg in sp.analyze(command)
+    )
+    assert not any(
+        "git push --force origin main" in segment
+        for segment in sp.split_segments(command)
+    )
+    assert not sp.untokenizable(command)
+    assert sp.analyze_checked(command)[1] is None
+
+
+def test_plain_data_heredoc_preserves_a_later_push():
+    command = "cat <<'EOF'\nprose\nEOF\ngit push --force origin main"
+    excised = sp.excise_data_heredoc(command)
+    assert excised is not None
+    assert excised[0].endswith("git push --force origin main")
+    assert any(sp.git_subcommand(seg.argv) == "push" for seg in sp.analyze(command))
+
+
+def test_data_heredoc_excision_rejects_unbounded_or_single_line_commands():
+    assert sp.excise_data_heredoc("cat <<'EOF'") is None
+    assert (
+        sp.excise_data_heredoc(
+            "cat <<'EOF'\n" + "x" * (sp.MAX_COMMAND_CHARS + 1) + "\nEOF"
+        )
+        is None
+    )
+
+
+def test_data_heredoc_excision_is_linear_on_long_first_lines():
+    # Guards against super-linear backtracking, which at these lengths costs
+    # seconds; the bound is loose so shared CI runners don't flake on it.
+    commands = [
+        "cat " + "\\" * 16_000 + " <<'EOF'\nbody\nEOF",
+        "cat " + "x" * 48_000 + " <<'EOF'\nbody\nEOF",
+    ]
+    for command in commands:
+        best = float("inf")
+        for _ in range(5):
+            started = time.perf_counter()
+            assert sp.excise_data_heredoc(command) is None
+            best = min(best, time.perf_counter() - started)
+        assert best < 0.5, (len(command), best)
+
+
+@pytest.mark.parametrize(
+    ("argv", "method", "endpoint"),
+    [
+        (["gh", "api", "repos/o/r/pulls"], "GET", "repos/o/r/pulls"),
+        (["gh", "api", "repos/o/r/issues", "-f", "title=x"], "POST", "repos/o/r/issues"),
+        (["gh", "api", "repos/o/r/issues", "--input", "b.json"], "POST", "repos/o/r/issues"),
+        (["gh", "api", "-X", "GET", "search/issues", "-f", "q=x"], "GET", "search/issues"),
+        (["gh", "api", "-XPATCH", "repos/o/r/pulls/5"], "PATCH", "repos/o/r/pulls/5"),
+        (["gh", "api", "-X=delete", "repos/o/r/git/refs/x"], "DELETE", "repos/o/r/git/refs/x"),
+        (["gh", "-X", "PUT", "api", "repos/o/r/pulls/5/merge"], "PUT", "repos/o/r/pulls/5/merge"),
+        (["gh", "api", "-i", "-X", "PATCH", "repos/o/r/pulls/5"], "PATCH", "repos/o/r/pulls/5"),
+        (["gh", "api", "-X", "GET", "-X", "POST", "x"], "POST", "x"),
+        (["gh", "api", "--jq", "-X", "repos/o/r"], "GET", "repos/o/r"),
+    ],
+)
+def test_gh_api_request_reads_the_effective_method(argv, method, endpoint) -> None:
+    """gh's own defaulting (gh api --help, gh 2.101.0): GET, or POST once a
+    parameter or --input is given; an explicit -X/--method wins, the last one
+    kept; a flag's VALUE (`--jq -X`) is never read as the flag."""
+    req = sp.gh_api_request(argv)
+    assert req is not None
+    assert (req.method, req.endpoint) == (method, endpoint)
+
+
+def test_gh_api_request_is_none_off_the_api_group() -> None:
+    assert sp.gh_api_request(["gh", "workflow", "run", "api"]) is None
+    assert sp.gh_api_request(["gh", "pr", "view", "5"]) is None
+    assert sp.gh_api_request(["git", "push"]) is None
+
+
+# ── a here-doc body that carries the parse across its terminator (#3433) ──────
+#
+# parse_segments has no here-doc state, so a body that leaves the segmenter open (an
+# unmatched backtick in what reads as a redirect target, an apostrophe) merges the
+# terminator and the commands after it into one segment. The fix REPORTS that as a
+# bounds-type blind spot; it never changes the segmentation. Literals are assembled
+# so this file's own text does not carry a gated command.
+
+_HD_GIT = "g" + "it"
+_HD_PUSH = " ".join([_HD_GIT, "pu" + "sh", "--" + "force", "origin", "main"])
+_HD_STATUS = _HD_GIT + " st" + "atus"
+_HD_COMMIT = " ".join([_HD_GIT, "com" + "mit", "-m", "x"])
+
+# (id, command, must the check fire, the statement bash runs after the here-doc,
+#  the text bash is asked about when it differs from the command)
+_HEREDOC_MATRIX = [
+    ("issue-tee", "tee out.txt <<'EOF'\nx<`\nEOF\n" + _HD_PUSH, True, _HD_PUSH, None),
+    ("issue-cat-redirect", "cat > notes.md <<'EOF'\nUse a<`b for markup\nEOF\n" + _HD_PUSH,
+     True, _HD_PUSH, None),
+    ("issue-python-stdin", "python3 - <<'PY'\nx<`y`z`\nPY\n" + _HD_PUSH, True, _HD_PUSH, None),
+    ("issue-tab-strip", "cat <<-'EOF'\nx<`\n\tEOF\n" + _HD_PUSH, True, _HD_PUSH, None),
+    ("quote-class", "tee f <<'EOF'\nit's\nEOF\n" + _HD_PUSH + "\necho '", True, _HD_PUSH,
+     "tee f <<'EOF'\nit's\nEOF\n" + _HD_PUSH),
+    ("two-openers", "cat <<'A' >/dev/null; tee b <<'B'\nB\nA\nx<`\nB\n" + _HD_PUSH,
+     True, _HD_PUSH, None),
+    ("decoy-copy", "cd ~/proj && tee f <<'EOF'\ncd /x\n" + _HD_PUSH + "\nx<`\nEOF\n" + _HD_PUSH,
+     True, _HD_PUSH, None),
+    ("crlf", "tee f <<'EOF'\r\nx<`\r\nEOF\r\n" + _HD_PUSH, True, _HD_PUSH, None),
+    ("unquoted-delimiter", "tee f <<EOF\nx<`\nEOF\n" + _HD_PUSH, True, _HD_PUSH, None),
+    ("terminator-paren", "x=$(tee f <<'EOF'\nx<`\nEOF)\n" + _HD_PUSH, True, _HD_PUSH, None),
+    ("excised-then-second", "cat <<'A'\nhi\nA\ntee b <<'B'\nx<`\nB\n" + _HD_PUSH,
+     True, _HD_PUSH, None),
+    ("depth1-bash-c", "bash -c 'tee f <<EOF\nx<`\nEOF\n" + _HD_PUSH + "'", True, _HD_PUSH,
+     "tee f <<EOF\nx<`\nEOF\n" + _HD_PUSH),
+    ("comment-opener-hole", "echo hi # see <<Z\ntee f <<'X'\nx<`\nX\n" + _HD_PUSH + "\nZ",
+     True, _HD_PUSH, None),
+    ("ctl-plain-cat-excised", "cat <<'EOF'\nx<`\nEOF\n" + _HD_PUSH, False, _HD_PUSH, None),
+    ("ctl-clean-body", "tee f <<'EOF'\nhello\nEOF\n" + _HD_PUSH, False, _HD_PUSH, None),
+    # fail-closed: no terminator line while something follows (bash runs nothing here)
+    ("unterminated", "tee f <<'EOF'\nx<`\n" + _HD_PUSH, True, _HD_PUSH, None),
+    # fail-closed: spaces are not stripped, so there is no terminator line
+    ("tab-strip-spaces-unterminated", "cat <<-'EOF'\nx<`\n  EOF\n" + _HD_PUSH, True,
+     _HD_PUSH, None),
+    ("ctl-herestring", "cat <<< 'x<`'\n" + _HD_PUSH, False, _HD_PUSH, None),
+    ("ctl-commit-idiom", _HD_GIT + " commit -am \"$(cat <<'EOF'\nmsg\nEOF\n)\" && " + _HD_STATUS,
+     False, _HD_STATUS, None),
+    ("ctl-bash-c-clean", "bash -c 'cat <<EOF\nx\nEOF\necho done'", False, "echo done",
+     "cat <<EOF\nx\nEOF\necho done"),
+    ("ctl-echo-mention", 'echo "use <<EOF\nEOF\nthen" && ls', False, "ls", None),
+    ("ctl-subshell", "(cat > f <<'EOF'\nx\nEOF\ncd sub && " + _HD_STATUS + ")", False,
+     _HD_STATUS, None),
+    ("ctl-markdown-code", "cat > n.md <<'EOF'\nRun `make` then `x`\nEOF\n" + _HD_GIT + " add n.md",
+     False, _HD_GIT + " add n.md", None),
+    # The depth-1 shape that MEASURED 93 false fires before the suffix test: the
+    # substitution hands the nested parse a script ending in the terminator and `)`.
+    ("ctl-substitution-apostrophe",
+     "cd sub && " + _HD_GIT + " commit -m \"$(cat <<'EOF'\nit's done\nEOF\n)\"",
+     False, "cd sub", None),
+]
+
+
+def _hd_argv_present(command: str, statement: str) -> bool:
+    """Whether some parsed segment, at any depth, IS ``statement``."""
+    return any(seg.argv == statement.split() for seg in sp.analyze(command))
+
+
+@pytest.mark.parametrize(
+    ("command", "fires", "statement", "oracle_text"),
+    [pytest.param(*row[1:], id=row[0]) for row in _HEREDOC_MATRIX],
+)
+def test_heredoc_hidden_suffix_matrix(command, fires, statement, oracle_text):
+    """The check fires exactly on the rows whose body carries the parse across the
+    terminator, and a fire withholds every segment (bounds-type, like a bound)."""
+    segments, blind = sp.analyze_checked(command)
+    if fires:
+        assert blind is sp._BLIND_HEREDOC_BODY
+        assert segments == []
+    else:
+        assert blind is not sp._BLIND_HEREDOC_BODY
+        assert not sp._analyze_bounded(command).heredoc_incomplete
+
+
+_HD_MARK = "__SUFFIX_MARK__"
+
+
+def _bash_runs_statement_at(text: str, statement: str, sandbox: Path) -> bool:
+    """Whether bash parses the LAST ``statement`` in ``text`` as a statement.
+
+    Never executes anything: bash only parses a function definition and prints it
+    (``declare -f``), in a restricted shell, with a fake ``git`` first on PATH, in an
+    empty directory that is no repository. The statement is replaced by a marker, and
+    function-body statements are printed indented while here-doc body text is not.
+    """
+    cut = text.rindex(statement)
+    probe = text[:cut] + _HD_MARK + text[cut + len(statement):]
+    result = subprocess.run(
+        [shutil.which("bash"), "-r", "-c", "f() {\n" + probe + "\n}\ndeclare -f f"],
+        env={
+            "PATH": str(sandbox / "bin"),
+            "HOME": str(sandbox / "work"),
+            "GIT_CEILING_DIRECTORIES": str(sandbox),
+        },
+        cwd=str(sandbox / "work"),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0 or "f ()" not in result.stdout:
+        return False  # bash could not end the body there: no statement after it
+    return re.search(r"^ {4,}.*\b" + _HD_MARK + r"\b", result.stdout, re.M) is not None
+
+
+@pytest.fixture
+def bash_oracle_sandbox(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("the oracle arm needs bash")
+    (tmp_path / "bin").mkdir()
+    (tmp_path / "work").mkdir()
+    fake = tmp_path / "bin" / "git"
+    fake.write_text("#!/bin/sh\necho FAKE-git >&2\nexit 97\n")
+    fake.chmod(0o755)
+    return tmp_path
+
+
+@pytest.mark.parametrize(
+    ("command", "fires", "statement", "oracle_text"),
+    [pytest.param(*row[1:], id=row[0]) for row in _HEREDOC_MATRIX],
+)
+def test_heredoc_hidden_suffix_matrix_against_bash(
+    command, fires, statement, oracle_text, bash_oracle_sandbox
+):
+    """The oracle arm: every fire is a place bash really runs the statement after the
+    here-doc, and every non-fire where bash runs it leaves it visible in the parse."""
+    runs = _bash_runs_statement_at(oracle_text or command, statement, bash_oracle_sandbox)
+    if fires:
+        if _hd_carried_only(oracle_text or command):
+            assert runs, "a carried-state fire must be a body bash ends before the statement"
+    elif runs:
+        assert _hd_argv_present(command, statement), (
+            "bash runs this statement, the check is silent, so the parse must show it"
+        )
+
+
+def _hd_carried_only(text: str) -> bool:
+    """Whether every report on ``text`` is the carried-state test, the one that claims
+    bash ended the body. The fail-closed reports claim only that it is unproven."""
+    splits: list[int] = []
+    openers: list[int] = []
+    sp.parse_segments(text, _splits=splits, _openers=openers)
+    found = sp._heredoc_hidden_suffixes(text, splits, openers)
+    return bool(found) and all(why == "carried" for _, why, _ in found)
+
+
+def test_heredoc_check_never_changes_the_segmentation():
+    """Public parse output is byte-identical with and without the split recording,
+    and every recorded split is a newline the parse really split on."""
+    corpus = [row[1] for row in _HEREDOC_MATRIX] + [
+        "a; b && c || d | e & f\ng",
+        "echo 'x\ny' > \"$(z\n)\" ; w",
+        "echo $((1<<2)) # c <<A\n(( x<<=1 )); cat <<B\nB",
+    ]
+    for command in corpus:
+        splits: list[int] = []
+        openers: list[int] = []
+        starts: list[int] = []
+        recorded = sp.parse_segments(command, _splits=splits, _openers=openers, _starts=starts)
+        assert recorded == sp.parse_segments(command)
+        assert len(starts) == len(recorded)
+        assert all(command[i] == "\n" for i in splits)
+        assert all(command[i : i + 2] == "<<" and command[i + 2 : i + 3] != "<" for i in openers)
+        assert sp.split_segments(command) == [
+            p.raw for p in sp.parse_segments(sp._excised_text(command))
+        ]
+
+
+def test_heredoc_check_keeps_a_plain_cat_body_excised():
+    command = "cat <<'EOF'\nx<`\nEOF\n" + _HD_PUSH
+    assert sp.excise_data_heredoc(command) is not None
+    segments, blind = sp.analyze_checked(command)
+    assert blind is None
+    assert _hd_argv_present(command, _HD_PUSH)
+
+
+def test_heredoc_blind_spot_is_registered_and_bounds_type():
+    assert sp._BLIND_HEREDOC_BODY in sp._ALL_BLIND_SPOTS
+    assert sp._BLIND_HEREDOC_BODY.bounds_induced is True
+    assert sp.rewrites_before_running("tee out.txt <<'EOF'\nx<`\nEOF\n" + _HD_PUSH)
+    assert not sp.rewrites_before_running("tee out.txt <<'EOF'\nhello\nEOF\n" + _HD_PUSH)
+
+
+_HD_HIDES = "tee out.txt <<'EOF'\nx<`\nEOF\n"
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        # untokenizable keeps precedence: the discard guard's measured exemption
+        pytest.param(_HD_HIDES + _HD_PUSH + " # don't", "_BLIND_UNTOKENIZABLE",
+                     id="untokenizable-outranks"),
+        pytest.param(_HD_HIDES + _HD_PUSH + " \\\n --tags", "_BLIND_CONTINUATION",
+                     id="continuation-outranks"),
+        pytest.param(_HD_HIDES + _HD_PUSH + " $'\\x41'", "_BLIND_BUILT_ESCAPE",
+                     id="built-escape-outranks"),
+        pytest.param("x" * (sp.MAX_COMMAND_CHARS) + "\n" + _HD_HIDES + _HD_PUSH,
+                     "_BLIND_OVER_LONG", id="length-outranks"),
+        pytest.param(_HD_HIDES + _HD_GIT + " $V origin", "_BLIND_HEREDOC_BODY",
+                     id="outranks-unresolved-verb"),
+    ],
+)
+def test_heredoc_blind_spot_precedence(command, expected):
+    assert sp.analyze_checked(command)[1] is getattr(sp, expected)
+
+
+def test_heredoc_blind_spot_under_a_depth_bound_reports_the_bound():
+    inner = _HD_HIDES + _HD_PUSH
+    for _ in range(sp.MAX_SUBSTITUTION_DEPTH + 2):
+        inner = "echo \"$(" + inner + ")\""
+    nested = "bash -c 'tee f <<EOF\nx<`\nEOF\nls' ; " + inner
+    assert sp.analyze_checked(nested)[1] is sp._BLIND_OVER_NESTED
+
+
+def test_unresolved_verb_still_recovered_when_a_heredoc_withholds_the_parse():
+    """The push guard's one recovered fact must survive the new reason: a here-doc
+    parse is complete, so it still contributes (it can only add a refusal)."""
+    command = _HD_GIT + " $V origin\n" + _HD_HIDES + "ls"
+    assert sp.analyze_checked(command)[1] is sp._BLIND_HEREDOC_BODY
+    assert sp.unresolved_verb_programs(command) == frozenset({"git"})
+
+
+def _hd_line_events(text: str) -> int:
+    """Python line events executed by the recording parse and the check together:
+    deterministic, unlike wall-clock."""
+    count = 0
+
+    def tracer(frame, event, arg):
+        nonlocal count
+        if event == "line":
+            count += 1
+        return tracer
+
+    previous = sys.gettrace()
+    sys.settrace(tracer)
+    try:
+        splits: list[int] = []
+        openers: list[int] = []
+        sp.parse_segments(text, _splits=splits, _openers=openers)
+        sp._heredoc_hidden_suffixes(text, splits, openers)
+    finally:
+        sys.settrace(previous)
+    return count
+
+
+_HD_ADVERSARIAL = {
+    "many-openers-many-matching-lines": lambda n: ("tee f <<'A'\n" + "A\n" * n)[:n],
+    "many-openers-on-one-line": lambda n: ("cat " + "<<A " * n)[:n],
+    "alternating-opener-and-tab-lines": lambda n: ("x <<-A\n\tA\n" * n)[:n],
+    "exact-opener-then-tab-lines": lambda n: ("x <<A\n\tA\n" * n)[:n],
+    "opener-per-line-unclosed-quote": lambda n: ("x <<'A\n" * n)[:n],
+    "opener-per-line-no-terminator": lambda n: ("x <<A\n" * n)[:n],
+    "one-huge-token-then-opener": lambda n: "x" * n + "\ntee <<'E'\nx<`\nE\nls",
+    "unquoted-unterminated-openers-and-expansions": lambda n: ("x <<A\n$(\n" * n)[:n],
+    "unresolvable-delimiters-on-one-line": lambda n: ("cat " + "<<$A " * n)[:n],
+    "quoted-decoys": lambda n: ("echo '<<A' \"<<B\" <<C\n" * n)[:n],
+    "arithmetic-shifts": lambda n: ("echo $((1<<2)) <<A\n" * n)[:n],
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_HD_ADVERSARIAL))
+def test_heredoc_scan_is_linear_on_adversarial_shapes(shape):
+    """Doubling the input at most doubles the scan's work (Python line events, so
+    deterministic). A lookup that filters after its bisect (one mixed index for
+    ``<<`` and ``<<-``) goes quadratic on the exact-opener-then-tab-lines shape:
+    MEASURED, a ratio of 3.97 there against 2.00 for the split indexes."""
+    build = _HD_ADVERSARIAL[shape]
+    small, large = _hd_line_events(build(6_000)), _hd_line_events(build(12_000))
+    assert large <= 2.2 * small + 50, (shape, small, large)
+
+
+def test_heredoc_scan_does_one_bisect_per_candidate(monkeypatch):
+    calls = 0
+
+    def counting(real):
+        def bisect(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return real(*args, **kwargs)
+
+        return bisect
+
+    monkeypatch.setattr(sp, "_bisect_right", counting(sp._bisect_right))
+    monkeypatch.setattr(sp, "_bisect_left", counting(sp._bisect_left))
+    text = ("x <<-A\n\tA)\n$(\n" * sp.MAX_COMMAND_CHARS)[: sp.MAX_COMMAND_CHARS]
+    splits: list[int] = []
+    openers: list[int] = []
+    sp.parse_segments(text, _splits=splits, _openers=openers)
+    sp._heredoc_hidden_suffixes(text, splits, openers)
+    # per opener: the body start, its row, the substitution-ending test (up to four),
+    # the terminator and the expansion test
+    assert 0 < calls <= 8 * text.count("<<")
+
+
+# ── #3433 review: where an opener is, what its delimiter is, what bash expands ──
+#
+# A pre-PR review found three ways the first version missed a command bash runs:
+# a quoted `<<` taken for an opener (its delimiter then swallowed the real one), a
+# delimiter spelled with quoting bash removes differently, and a body bash expands
+# because its delimiter is unquoted. Each row here was confirmed against bash before
+# the fix: no blind spot, and no segment for the statement.
+
+_HD_LOCK = "tee o <<"
+_HD_X = "x<`\n"
+
+# (id, command, the statement bash runs after the body)
+_HD_REVIEW_HIDDEN = [
+    ("decoy-single-quoted", "grep '<<' f; " + _HD_LOCK + "'EOF'\n" + _HD_X + "EOF\n" + _HD_PUSH),
+    ("decoy-double-quoted", 'echo "<<" <<"EOF"\n' + _HD_X + "EOF\n" + _HD_PUSH),
+    ("decoy-glued", "echo '<<'<<'EOF'\n" + _HD_X + "EOF\n" + _HD_PUSH),
+    ("delimiter-locale-quoted", _HD_LOCK + '$"EOF"\n' + _HD_X + "EOF\n" + _HD_PUSH),
+    ("delimiter-ansi-c", _HD_LOCK + "$'EOF'\n" + _HD_X + "EOF\n" + _HD_PUSH),
+    ("delimiter-empty-ansi-c-inside", _HD_LOCK + "E$''OF\n" + _HD_X + "EOF\n" + _HD_PUSH),
+    ("delimiter-backslash-in-single-quotes",
+     "tee o <<-'E\\nF'\n" + _HD_X + "\tE\\nF\n" + _HD_PUSH),
+    ("delimiter-unresolvable-expansion", _HD_LOCK + "$X\n" + _HD_X + "$X\n" + _HD_PUSH),
+]
+
+
+@pytest.mark.parametrize(
+    "command", [pytest.param(row[1], id=row[0]) for row in _HD_REVIEW_HIDDEN]
+)
+def test_heredoc_review_reproducers_are_reported(command):
+    segments, blind = sp.analyze_checked(command)
+    assert blind is sp._BLIND_HEREDOC_BODY
+    assert segments == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    # the unresolvable row is reported because the parse cannot know, not because
+    # bash ends the body there, so the oracle does not apply to it
+    [pytest.param(row[1], id=row[0]) for row in _HD_REVIEW_HIDDEN[:-1]],
+)
+def test_heredoc_review_reproducers_against_bash(command, bash_oracle_sandbox):
+    """The oracle arm: bash really ends the body before the hidden statement, and
+    the parse (before the report) does not show it."""
+    assert _bash_runs_statement_at(command, _HD_PUSH, bash_oracle_sandbox)
+    assert not _hd_argv_present(command, _HD_PUSH)
+
+
+# An UNQUOTED delimiter: bash expands the body, so a substitution in it runs. Quoted
+# in the text the parser reads, it is inert to the parser.
+_HD_EXPANDED = [
+    ("dollar-paren", "cat <<EOF\n'$(" + _HD_PUSH + ")'\nEOF", "$(" + _HD_PUSH + ")"),
+    ("backtick", "cat <<EOF\n'`" + _HD_PUSH + "`'\nEOF", "`" + _HD_PUSH + "`"),
+    ("tab-strip", "cat <<-EOF\n\t'$(" + _HD_PUSH + ")'\n\tEOF\nls", "$(" + _HD_PUSH + ")"),
+    ("unterminated", "cat <<EOF\n'$(" + _HD_PUSH + ")'", "$(" + _HD_PUSH + ")"),
+]
+
+
+@pytest.mark.parametrize(
+    "command", [pytest.param(row[1], id=row[0]) for row in _HD_EXPANDED]
+)
+def test_unquoted_heredoc_body_with_a_substitution_is_reported(command):
+    segments, blind = sp.analyze_checked(command)
+    assert blind is sp._BLIND_HEREDOC_BODY
+    assert segments == []
+
+
+def _bash_expands_in_body(text: str, substitution: str, sandbox: Path) -> bool:
+    """Whether bash keeps ``substitution`` in an UNQUOTED here-doc body, where it
+    expands it. Parses and prints only (see :func:`_bash_runs_statement_at`)."""
+    result = subprocess.run(
+        [shutil.which("bash"), "-r", "-c", "f() {\n" + text + "\n}\ndeclare -f f"],
+        env={"PATH": str(sandbox / "bin"), "HOME": str(sandbox / "work"),
+             "GIT_CEILING_DIRECTORIES": str(sandbox)},
+        cwd=str(sandbox / "work"), capture_output=True, text=True, timeout=30,
+    )
+    out = result.stdout
+    return "f ()" in out and re.search(r"<<-?EOF\n", out) is not None and substitution in out
+
+
+@pytest.mark.parametrize(
+    ("command", "substitution"),
+    # The unterminated row runs to the end of the function text, so the wrapper
+    # cannot frame it. MEASURED instead (harmless): ``cat <<EOF`` newline
+    # ``'$(echo RAN)'`` under ``bash -r -c`` prints 'RAN' after the warning that the
+    # here-doc was delimited by end-of-file.
+    [pytest.param(row[1], row[2], id=row[0]) for row in _HD_EXPANDED if row[0] != "unterminated"],
+)
+def test_unquoted_heredoc_body_reproducers_against_bash(command, substitution,
+                                                        bash_oracle_sandbox):
+    assert _bash_expands_in_body(command, substitution, bash_oracle_sandbox)
+    assert not _hd_argv_present(command, _HD_PUSH)
+
+
+# (id, command): never reported, and the trailing status command stays visible.
+_HD_REVIEW_QUIET = [
+    ("here-string", "cat <<< \"$(date)\"\necho `date`\n" + _HD_STATUS),
+    ("quoted-text", "echo '<<EOF'\necho $(date)\n" + _HD_STATUS),
+    ("unquoted-plain-variable", "cat > f <<EOF\nhello $HOME\nEOF\n" + _HD_STATUS),
+    ("quoted-delimiter-substitution", "python3 - <<'PY'\nprint('$(x)')\nPY\n" + _HD_STATUS),
+    ("crlf", "tee f <<'EOF'\r\nhi\r\nEOF\r\n" + _HD_STATUS),
+    ("tab-strip", "cat <<-EOF\n\thi\n\tEOF\n" + _HD_STATUS),
+    ("ansi-c-delimiter-clean", "tee f <<$'EOF'\nhi\nEOF\n" + _HD_STATUS),
+    # a line starting with the delimiter and holding a `)` counts only AFTER the
+    # opener: here it is the opener's own line
+    ("substitution-ending-line-before-the-body",
+     "PYTHONPATH=$(pwd) python3 - <<'PY'\nprint(1)\nPY\n" + _HD_STATUS),
+]
+
+# FAIL-CLOSED by owner ruling: a `<<` bash would not call an opener (a comment,
+# arithmetic, text inside another body) is still recorded, because telling them apart
+# means emulating bash. These are reported although nothing is hidden. The ruling
+# accepts that cost; the corpus measurement beside the blind spot prices it.
+_HD_REPORTED_BY_DESIGN = [
+    ("arithmetic-shift", "echo $((1<<2))\necho $(date)\n" + _HD_STATUS),
+    ("arithmetic-command", "(( x <<= 1 ))\necho ${x}\n" + _HD_STATUS),
+    ("comment", "echo hi # see <<EOF\necho $(date)\n" + _HD_STATUS),
+    ("opener-written-inside-a-quoted-body",
+     "cat > s.sh <<'EOF'\ncat <<X\n$(date)\nX\nEOF\n" + _HD_STATUS),
+    ("unresolvable-opener-inside-a-quoted-body",
+     "cat > s.md <<'EOF'\nuse <<$X here\nEOF\n" + _HD_STATUS),
+    ("unterminated-quoted-body", "tee f <<'EOF'\nhi\n" + _HD_STATUS),
+    ("opener-line-quote-spans-lines", "cat <<'EOF' \"a\nb\"\nhi\nEOF\n" + _HD_STATUS),
+]
+
+
+@pytest.mark.parametrize(
+    "command", [pytest.param(row[1], id=row[0]) for row in _HD_REPORTED_BY_DESIGN]
+)
+def test_heredoc_fail_closed_reports_what_it_cannot_prove(command):
+    assert sp.analyze_checked(command)[1] is sp._BLIND_HEREDOC_BODY
+
+
+# The second review's five classes (#3433): bash runs the push, and the first rework
+# showed no segment and no bound-type blind spot. (id, command, how bash runs it)
+_HD_G = " ".join([_HD_GIT, "pu" + "sh", "origin", "ORACLE"])
+_HD_SECOND_REVIEW = [
+    ("hash-not-a-comment-escaped", "echo a \\ # ; cat <<'EOF'\na<`b\nEOF\n" + _HD_G, "runs"),
+    ("hash-not-a-comment-regex", "[[ a =~ (#) ]] && cat <<'EOF'\na<`b\nEOF\n" + _HD_G, "runs"),
+    ("arithmetic-opened-in-a-body",
+     "cat <<'EOF'\n((\nEOF\ncat <<'EOF2'\na<`b\nEOF2\n" + _HD_G, "runs"),
+    ("arithmetic-opened-in-backticks", "echo `echo ((`; cat <<'EOF'\na<`b\nEOF\n" + _HD_G, "runs"),
+    ("decoy-paren-line-between-queued-openers",
+     "cat <<'A' <<'B'\nA)\nB\nA\na<`b\nB\n" + _HD_G, "runs"),
+    ("unterminated-in-backticks", "x=`cat <<'EOF'\na<$(b\n`\n" + _HD_G, "runs"),
+    ("unterminated-in-process-substitution", "<(cat <<''\na<`b\nQ\n); " + _HD_G, "runs"),
+    ("expansion-after-a-nested-opener",
+     "x=`cat <<'EOF'\nq\n`\ncat <<E2\n'$(" + _HD_G + ")'\nE2\nEOF\n", "expands"),
+]
+
+
+@pytest.mark.parametrize(
+    "command", [pytest.param(row[1], id=row[0]) for row in _HD_SECOND_REVIEW]
+)
+def test_heredoc_second_review_reproducers_are_reported(command):
+    segments, blind = sp.analyze_checked(command)
+    assert blind is sp._BLIND_HEREDOC_BODY
+    assert segments == []
+
+
+@pytest.mark.parametrize(
+    ("command", "how"), [pytest.param(*row[1:], id=row[0]) for row in _HD_SECOND_REVIEW]
+)
+def test_heredoc_second_review_reproducers_against_bash(command, how, bash_oracle_sandbox):
+    """The oracle arm: bash really runs the push (as a statement, or as a substitution
+    in a body it expands, printed under the unquoted ``<<E2``), and the parse does not
+    show it. Parses and prints only (see :func:`_bash_runs_statement_at`)."""
+    if how == "runs":
+        assert _bash_runs_statement_at(command, _HD_G, bash_oracle_sandbox)
+    else:
+        sandbox = bash_oracle_sandbox
+        out = subprocess.run(
+            [shutil.which("bash"), "-r", "-c", "f() {\n" + command + "\n}\ndeclare -f f"],
+            env={"PATH": str(sandbox / "bin"), "HOME": str(sandbox / "work"),
+                 "GIT_CEILING_DIRECTORIES": str(sandbox)},
+            cwd=str(sandbox / "work"), capture_output=True, text=True, timeout=30,
+        ).stdout
+        assert "<<E2\n'$(" + _HD_G + ")'\nE2" in out
+    assert not _hd_argv_present(command, _HD_G)
+
+
+# The third review's class (#3433): the delimiter word runs straight into the backtick
+# that closes an enclosing backtick substitution. The word scanner reads that backtick
+# as a NEW substitution and swallows the rest, so no word is delimited and the
+# fail-closed check used to skip the opener silently. bash ends the word at the
+# backtick and runs the push.
+_HD_BACKTICK_WORD = [
+    ("echo-semicolon", "echo `cat <<EOF`; " + _HD_G),
+    ("assignment", "x=`cat <<EOF`; " + _HD_G),
+    ("newline", "echo `cat <<EOF`\n" + _HD_G),
+    ("quoted-word", "echo `cat <<'EOF'`; " + _HD_G),
+    ("tab-strip-newline", "echo `cat <<-EOF`\n" + _HD_G),
+    ("backslash-word", "echo `cat <<E\\OF`; " + _HD_G),
+    ("empty-quotes-in-word", "echo `cat <<EO''F`; " + _HD_G),
+    ("fd-prefix-then-assignment", "echo `cat 2<<EOF` y=1; " + _HD_G),
+    ("second-backtick-pair", "echo `cat <<EOF`; echo `x`; " + _HD_G),
+    ("inside-parameter-default", "echo ${x:-`cat <<EOF`}; " + _HD_G),
+    ("inside-command-substitution", "echo $(echo `cat <<EOF`); " + _HD_G),
+]
+
+
+@pytest.mark.parametrize("command", [pytest.param(c, id=i) for i, c in _HD_BACKTICK_WORD])
+def test_heredoc_word_closed_by_a_backtick_is_reported(command):
+    segments, blind = sp.analyze_checked(command)
+    assert blind is not None and blind.bounds_induced, blind
+    assert segments == []
+
+
+@pytest.mark.parametrize("command", [pytest.param(c, id=i) for i, c in _HD_BACKTICK_WORD])
+def test_heredoc_word_closed_by_a_backtick_against_bash(command, bash_oracle_sandbox):
+    """The oracle arm: bash runs the push as its own statement, and the parse does
+    not show it."""
+    assert _bash_runs_statement_at(command, _HD_G, bash_oracle_sandbox)
+    assert not _hd_argv_present(command, _HD_G)
+
+
+def test_heredoc_word_closed_by_a_backtick_with_nothing_after_is_quiet():
+    assert sp.analyze_checked("echo `cat <<EOF`")[1] is None
+
+
+# With no newline after the opener's word there is no body, and bash reads the rest
+# of the line as the segmenter does, so nothing can hide there (#3433: an arithmetic
+# shift was reported, and the secrets.env guard read that as touching the file).
+# (id, command, what bash is shown: an opener with no body would eat the wrapper's
+# closing brace as its body, so its empty body's terminator is supplied)
+_HD_SINGLE_LINE = [
+    ("arithmetic-then-argument", "echo $((1<<2)) 'notes.txt'; " + _HD_STATUS, ""),
+    ("arithmetic-then-command", "echo $((1<<2)); " + _HD_STATUS, ""),
+    ("opener-then-command", "cat <<EOF; " + _HD_STATUS, "\nEOF"),
+    ("quoted-opener-then-command", "cat <<'EOF' && " + _HD_STATUS, "\nEOF"),
+]
+
+
+@pytest.mark.parametrize(
+    ("command", "frame"), [pytest.param(c, f, id=i) for i, c, f in _HD_SINGLE_LINE]
+)
+def test_heredoc_opener_with_no_newline_after_is_quiet(command, frame, bash_oracle_sandbox):
+    assert sp.analyze_checked(command)[1] is None
+    assert _hd_argv_present(command, _HD_STATUS)
+    sandbox = bash_oracle_sandbox
+    out = subprocess.run(
+        [shutil.which("bash"), "-r", "-c", "f() {\n" + command + frame + "\n}\ndeclare -f f"],
+        env={"PATH": str(sandbox / "bin"), "HOME": str(sandbox / "work"),
+             "GIT_CEILING_DIRECTORIES": str(sandbox)},
+        cwd=str(sandbox / "work"), capture_output=True, text=True, timeout=30,
+    ).stdout
+    # a statement: indented, after any (empty) body bash prints at column 0
+    assert re.search(r"^ +.*" + re.escape(_HD_STATUS), out, re.M), out
+
+
+def test_heredoc_word_ending_the_text_without_an_open_quote_is_quiet():
+    """Prose quoting the idiom with escaped backticks inside a double-quoted
+    argument: the extractor hands the nested parse ``bash <<'EOF'\\``, whose word
+    ends the text but leaves nothing open, and nothing follows it."""
+    command = ('gh pr comment 1 --body "e.g. \\`bash <<\'EOF\'\\` runs its body" && '
+               + _HD_STATUS)
+    assert sp.analyze_checked(command)[1] is None
+
+
+def test_heredoc_word_swallowed_to_the_end_of_the_text_is_reported():
+    """An open quote in the word runs the scanner to the end of the text, where
+    the word cannot be delimited at all: still reported."""
+    assert sp.analyze_checked("cat <<'EOF; " + _HD_G)[1] is not None
+
+
+# The fourth review's classes (#3433). C1: inside `$(…)` or `<(…)` bash ends a body
+# on a line that STARTS with the delimiter and holds a later `)`, and runs what follows
+# the delimiter on it. C2: the substitution extractor ends a `$(` at a `)` inside a
+# body, so the nested script it hands the parse stops before the terminator and never
+# shows the command after it.
+_HD_COMMIT = _HD_GIT + " com" + "mit"
+_HD_SUBSTITUTION_END = [
+    ("c1-space", "echo $(cat <<EOF\nx\nEOF " + _HD_G + ")\nEOF"),
+    ("c1-tab", "echo $(cat <<EOF\nx\nEOF\t" + _HD_G + ")\nEOF"),
+    ("c1-glued", "echo $(cat <<EOF\nx\nEOF" + _HD_G + ")\nEOF"),
+    ("c1-tab-strip", "echo $(cat <<-EOF\nx\n\tEOF " + _HD_G + ")\nEOF"),
+    ("c1-quoted", "echo $(cat <<'EOF'\nx\nEOF " + _HD_G + ")\nEOF"),
+    ("c1-process-substitution", "cat <(cat <<'EOF'\nx\nEOF" + _HD_G + ")\nEOF"),
+    ("c2-unquoted", 'echo "$(cat <<EOF\n)\nEOF\n' + _HD_G + '\n)"'),
+    ("c2-commit-message", _HD_COMMIT + " -m \"$(cat <<'EOF'\n)\nEOF\n" + _HD_G + "\n)\""),
+    # Found by the round's fuzz: quotes in the body flip the OUTER segmenter, so the
+    # segment the substitution is cut from ends inside the body too. Bodies are read
+    # in the outermost text, not in that segment.
+    ("c2-quotes-in-body", "cd s && " + _HD_COMMIT + " -q -m \"$(cat <<'EOF'\n\"\n\"\nEOF\n"
+     + _HD_G + "\n)\""),
+    ("c2-quotes-in-body-tab-strip", "gh pr create --body \"$(cat <<-EOF\n\"\n\"\n\tEOF\n"
+     + _HD_G + "\n)\""),
+]
+
+
+@pytest.mark.parametrize("command", [pytest.param(c, id=i) for i, c in _HD_SUBSTITUTION_END])
+def test_heredoc_ended_inside_a_substitution_is_reported(command):
+    segments, blind = sp.analyze_checked(command)
+    assert blind is not None and blind.bounds_induced, blind
+    assert segments == []
+
+
+@pytest.mark.parametrize("command", [pytest.param(c, id=i) for i, c in _HD_SUBSTITUTION_END])
+def test_heredoc_ended_inside_a_substitution_against_bash(command, bash_oracle_sandbox):
+    """The oracle arm: bash prints the body ended by its ``EOF`` line and the push
+    after it inside the substitution, and the parse does not show it."""
+    sandbox = bash_oracle_sandbox
+    out = subprocess.run(
+        [shutil.which("bash"), "-r", "-c", "f() {\n" + command + "\n}\ndeclare -f f"],
+        env={"PATH": str(sandbox / "bin"), "HOME": str(sandbox / "work"),
+             "GIT_CEILING_DIRECTORIES": str(sandbox)},
+        cwd=str(sandbox / "work"), capture_output=True, text=True, timeout=30,
+    ).stdout
+    assert "\nEOF\n\n" + _HD_G in out
+    assert not _hd_argv_present(command, _HD_G)
+
+
+# The message idiom stays smooth where it is provably inert: a quoted delimiter, its
+# terminator line exactly, then only blanks and the `)` closing the substitution. The
+# `cd … &&` prefix keeps the excision (a narrower, older relief) out of the way, so
+# these exercise the exemption itself. A `)` or an apostrophe in the body is what
+# made the extractor cut the script short.
+_HD_IDIOM_BODIES = ["1) first\n2) second", "it's (done", "plain)", "a)\nb)\nc)"]
+
+
+@pytest.mark.parametrize("body", _HD_IDIOM_BODIES)
+@pytest.mark.parametrize("receiver", [
+    "cd sub && " + _HD_COMMIT + " -q -m",
+    "cd sub && gh pr create --title t --body",
+    _HD_GIT + " -C sub com" + "mit -m",
+])
+def test_quoted_message_idiom_cut_by_the_extractor_is_exempt(receiver, body):
+    command = f"{receiver} \"$(cat <<'EOF'\n{body}\nEOF\n)\""
+    assert sp.analyze_checked(command)[1] is None
+
+
+@pytest.mark.parametrize(
+    ("command", "why"),
+    [
+        pytest.param("cd sub && " + _HD_COMMIT + " -m \"$(cat <<'EOF'\n1) a\nEOF\nls\n)\"",
+                     "a command between the terminator and the closing paren", id="c2-shape"),
+        pytest.param("cd sub && " + _HD_COMMIT + " -m \"$(cat <<EOF\n1) a\nEOF\n)\"",
+                     "an unquoted delimiter: the body expands", id="unquoted"),
+        pytest.param("cd sub && " + _HD_COMMIT + " -m \"$(cat <<'EOF'\n1) a\nEOF ok\n)\"",
+                     "no exact terminator line", id="no-exact-terminator"),
+        pytest.param("cd sub && " + _HD_COMMIT + " -m \"$(cat <<'EOF'\n1) a\nEOF\n; )\"",
+                     "something other than blanks before the paren", id="not-blank-before-paren"),
+    ],
+)
+def test_quoted_message_idiom_exemption_is_narrow(command, why):
+    assert sp.analyze_checked(command)[1] is sp._BLIND_HEREDOC_BODY, why
+
+
+def test_quoted_message_idiom_exemption_holds_when_the_extractor_overruns():
+    """An apostrophe in the body sends the extractor PAST the closing paren, so the
+    script it hands the parse holds the terminator and then outer text. The body's
+    real end and the paren after it are read in the outer text all the same."""
+    command = ("cd sub && " + _HD_COMMIT
+               + " -q -m \"$(cat <<'EOF'\nthe container's key\nEOF\n)\" f.py")
+    assert sp.analyze_checked(command)[1] is None
+
+
+@pytest.mark.parametrize(
+    "second",
+    ["<<'X'", "3<<'X'", "2>&1 <<'X'", "| cat <<'X'", "<<-'X'"],
+)
+@pytest.mark.parametrize("tail", ["", " > /dev/null", "; true"])
+def test_a_second_opener_in_the_message_idiom_is_never_exempt(second, tail):
+    """A second opener takes its body from the lines after the first terminator,
+    so the `)` there is data to bash and the substitution keeps running: the
+    exemption must not apply (it requires the substitution's only opener)."""
+    body = "\ta\n\tEOF" if "-" in second else "a\nEOF"
+    command = (
+        f"echo \"$(cat <<'EOF' {second}\n{body}\n)\nX\n" + _HD_G + f"\n){tail}\""
+    ).replace("cat <<'EOF' <<-'X'", "cat <<-'EOF' <<-'X'")
+    segments, blind = sp.analyze_checked(command)
+    assert blind is not None and blind.bounds_induced, (command, blind)
+
+
+def test_a_command_on_the_idiom_opener_line_stays_visible():
+    """The exemption only covers the body: anything on the opener line is parsed."""
+    command = "x=\"$(cat <<'EOF'; " + _HD_G + "\nmsg\nEOF\n)\""
+    segments, blind = sp.analyze_checked(command)
+    assert blind is not None or any(s.argv[:2] == _HD_G.split()[:2] for s in segments)
+
+
+def test_quoted_message_idiom_exemption_needs_the_opener_at_the_top_of_it(
+    bash_oracle_sandbox,
+):
+    """Inside a subshell in the substitution, the paren after the body closes the
+    subshell, not the substitution, and what follows it still runs."""
+    command = "x=\"$( (cat <<'EOF'\nit's\nEOF\n) ; " + _HD_G + " )\""
+    assert sp.analyze_checked(command)[1] is sp._BLIND_HEREDOC_BODY
+    sandbox = bash_oracle_sandbox
+    out = subprocess.run(
+        [shutil.which("bash"), "-r", "-c", "f() {\n" + command + "\n}\ndeclare -f f"],
+        env={"PATH": str(sandbox / "bin"), "HOME": str(sandbox / "work"),
+             "GIT_CEILING_DIRECTORIES": str(sandbox)},
+        cwd=str(sandbox / "work"), capture_output=True, text=True, timeout=30,
+    ).stdout
+    assert "\nEOF\n ) " + _HD_G in out  # bash runs it after the subshell
+
+
+@pytest.mark.parametrize(
+    ("command", "statement"),
+    [pytest.param(row[1], _HD_STATUS, id=row[0]) for row in _HD_REVIEW_QUIET],
+)
+def test_heredoc_review_controls_stay_quiet(command, statement):
+    segments, blind = sp.analyze_checked(command)
+    assert blind is None
+    assert _hd_argv_present(command, statement)
+
+
+def test_unquoted_heredoc_body_with_a_parameter_expansion_is_reported():
+    """``${`` is reported by owner ruling: bash expands it, and its operators can
+    nest a command the parser does not read."""
+    command = "cat > f <<EOF\nhome ${HOME}\nEOF\n" + _HD_STATUS
+    assert sp.analyze_checked(command)[1] is sp._BLIND_HEREDOC_BODY
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        pytest.param("grep '<<' f; tee o <<'EOF'", ["<<'EOF'"], id="single-quoted-decoy"),
+        pytest.param('echo "<<" <<"EOF"', ['<<"EOF"'], id="double-quoted-decoy"),
+        pytest.param("echo $'<<' <<E", ["<<E"], id="ansi-c-decoy"),
+        # every `<<` outside quotes, by owner ruling: no comment or arithmetic model
+        pytest.param("echo hi # <<A\ncat <<B", ["<<A", "<<B"], id="comment"),
+        pytest.param("echo $((1<<2)) <<C", ["<<2", "<<C"], id="arithmetic"),
+        pytest.param("(( a<<=1 )); cat <<D", ["<<=", "<<D"], id="arithmetic-command"),
+        pytest.param("( (cat <<F) )", ["<<F"], id="nested-subshells-are-not-arithmetic"),
+        pytest.param("cat <<<x <<-G", ["<<-G"], id="here-string"),
+    ],
+)
+def test_heredoc_openers_are_every_unquoted_operator(command, expected):
+    openers: list[int] = []
+    assert sp.parse_segments(command, _openers=openers) == sp.parse_segments(command)
+    assert len(openers) == len(expected)
+    assert [command[i : i + len(e)] for i, e in zip(openers, expected, strict=True)] == expected
+
+
+@pytest.mark.parametrize(
+    ("word", "expected"),
+    [
+        ("EOF", ("EOF", False)),
+        ("'EOF'", ("EOF", True)),
+        ('"EOF"', ("EOF", True)),
+        ("\\EOF", ("EOF", True)),
+        ("E\\OF", ("EOF", True)),
+        ('$"EOF"', ("EOF", True)),
+        ("$'EOF'", ("EOF", True)),
+        ("E$''OF", ("EOF", True)),
+        ("'E\\nF'", ("E\\nF", True)),
+        ('"E\\OF"', ("E\\OF", True)),
+        ('"E\\$F"', ("E$F", True)),
+        ('"E\\"F"', ('E"F', True)),
+        ("EOF\r", ("EOF\r", False)),
+        ("a{b,c}", ("a{b,c}", False)),
+        ("$X", None),
+        ("E$", None),
+        ("`x`", None),
+        ('"E$F"', None),
+        ("$'E\\x4fF'", None),
+        ("'E\nF'", None),
+        ("'EOF", None),
+    ],
+)
+def test_heredoc_delimiter_follows_bash_quote_removal(word, expected):
+    """MEASURED against bash 5.2 (``declare -f`` prints the delimiter it chose): the
+    spellings the review named, and the ones the implementation refuses to guess."""
+    assert sp._heredoc_delimiter(word) == expected
+
+
+class TestPrCloseReason:
+    @pytest.mark.parametrize(
+        ("argv", "reason"),
+        [
+            pytest.param(
+                ["gh", "api", "-X", "PATCH", "repos/o/r/pulls/5", "-f", "state=closed"],
+                "a REST `state=closed` PATCH to a pull-request endpoint",
+                id="rest-separated-field",
+            ),
+            pytest.param(
+                [
+                    "gh",
+                    "api",
+                    "--method",
+                    "PATCH",
+                    "repos/o/r/pulls/5",
+                    "--raw-field",
+                    "state=closed",
+                ],
+                "a REST `state=closed` PATCH to a pull-request endpoint",
+                id="rest-long-separated-values",
+            ),
+            pytest.param(
+                ["gh", "api", "-XPATCH", "repos/o/r/pulls/5", "-fstate=closed"],
+                "a REST `state=closed` PATCH to a pull-request endpoint",
+                id="rest-glued-values",
+            ),
+            pytest.param(
+                ["gh", "api", "--method=PATCH", "repos/o/r/pulls/5", "--field=state=closed"],
+                "a REST `state=closed` PATCH to a pull-request endpoint",
+                id="rest-long-glued-values",
+            ),
+            pytest.param(
+                ["gh", "api", "-f", "state=closed", "-X", "PATCH", "repos/o/r/pulls/5"],
+                "a REST `state=closed` PATCH to a pull-request endpoint",
+                id="rest-fields-before-method",
+            ),
+            pytest.param(
+                ["gh", "api", "-X", "patch", "repos/o/r/pulls/5", "-f", "state=closed"],
+                "a REST `state=closed` PATCH to a pull-request endpoint",
+                id="rest-method-case-insensitive",
+            ),
+            pytest.param(
+                ["/usr/bin/gh", "api", "-X", "PATCH", "repos/o/r/pulls/5", "-f", "state=closed"],
+                "a REST `state=closed` PATCH to a pull-request endpoint",
+                id="rest-absolute-gh",
+            ),
+            pytest.param(
+                ["gh", "api", "-X", "PATCH", "repos/o/r/pulls/5", "-F", "state=closed"],
+                "a REST `state=closed` PATCH to a pull-request endpoint",
+                id="rest-typed-field",
+            ),
+            pytest.param(["gh", "pr", "close", "5"], "`gh pr close`", id="gh-pr-close"),
+            pytest.param(
+                # Deliberate safe-side over-match; this placement is not relied on.
+                ["gh", "-R", "o/r", "pr", "close", "5"],
+                "`gh pr close`",
+                id="gh-pr-close-separated-repo",
+            ),
+            pytest.param(
+                [
+                    "gh",
+                    "api",
+                    "graphql",
+                    "-f",
+                    'query=mutation { closePullRequest(input:{pullRequestId:"x"}) { clientMutationId } }',
+                ],
+                "a `closePullRequest` GraphQL mutation",
+                id="graphql-close-mutation",
+            ),
+            pytest.param(
+                ["gh", "api", "-X", "PATCH", "repos/o/r/issues/5", "-f", "state=closed"],
+                "a REST `state=closed` PATCH to an issue-or-pull-request endpoint",
+                id="rest-issues-endpoint",
+            ),
+            pytest.param(
+                ["gh", "--repo", "api", "pr", "close", "5"],
+                "`gh pr close`",
+                id="gh-repo-value-before-pr-close",
+            ),
+        ],
+    )
+    def test_text_visible_closes_have_reasons(self, argv, reason):
+        assert pcp.pr_close_reason(argv) == reason
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            pytest.param(
+                ["gh", "api", "repos/o/r/pulls/5", "-f", "state=closed"],
+                id="rest-default-post",
+            ),
+            pytest.param(
+                ["gh", "api", "-X", "POST", "repos/o/r/pulls/5", "-f", "state=closed"],
+                id="rest-post",
+            ),
+            pytest.param(
+                ["gh", "api", "-X", "DELETE", "repos/o/r/pulls/5", "-f", "state=closed"],
+                id="rest-delete",
+            ),
+            pytest.param(
+                ["gh", "api", "-X", "PATCH", "repos/o/r/pulls/5", "-f", "state=open"],
+                id="rest-open",
+            ),
+            pytest.param(
+                ["gh", "api", "-X", "PATCH", "repos/o/r/pulls/5", "-f", "state=draft"],
+                id="rest-draft",
+            ),
+            pytest.param(
+                ["gh", "api", "-X", "PATCH", "pulls", "-f", "state=closed"],
+                id="rest-incomplete-path",
+            ),
+            pytest.param(["gh", "repo", "view", "o/r"], id="not-api"),
+            pytest.param(
+                ["git", "api", "-X", "PATCH", "repos/o/r/pulls/5", "-f", "state=closed"],
+                id="not-gh",
+            ),
+            pytest.param(["gh", "pr", "close", "5", "--help"], id="terminal-help"),
+            pytest.param(
+                [
+                    "gh",
+                    "api",
+                    "graphql",
+                    "-f",
+                    'query=query { closePullRequest(input:{pullRequestId:"x"}) { clientMutationId } }',
+                ],
+                id="graphql-name-without-mutation",
+            ),
+        ],
+    )
+    def test_non_closes_have_no_reason(self, argv):
+        assert pcp.pr_close_reason(argv) is None

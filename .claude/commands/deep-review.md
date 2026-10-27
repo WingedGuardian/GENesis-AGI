@@ -7,7 +7,7 @@ Why this exists: an internal review-loop analysis of recent PRs found that first
 findings were real, pre-existing bugs — the initial pushes had been self-reviewed with the
 WRONG SHAPE (a pattern/secrets scan), not an adversarial logic audit. This command makes the
 right-shape pass the easy default. (It reliably kills the first round; it is NOT a cure for the
-whole loop — fix-churn and hand-rolled parsing drive the tail. See the Common Traps entry on
+whole loop — fix-churn and hand-rolled parsing drive the tail. See build-session's Common Traps entry on
 CLI parsing.)
 
 Note: `/deep-review` is the LOCAL pre-push adversarial pass (Claude-model reviewers). It does
@@ -62,6 +62,9 @@ Prime each reviewer with the RIGHT SHAPE (what a lint scan misses). Paste this i
 > change depends on, verdict each independently with evidence and a falsifier, ask what the
 > caller does differently because of its output, and say whether a better shape exists (an
 > existing chokepoint it re-implements, a simpler mechanism, a place the problem disappears).
+> Emit the `Design-premise:` block exactly as `.claude/docs/premise-check.md` "The output"
+> specifies (the required Expected line under the verdict, verdict first on each `P<n>`
+> line, one line per trailer, plain lines, a blank line after it, one block); code reads it.
 > A correct fix to the wrong problem is the one defect another review round cannot find.
 >
 > Assume there are bugs; enumerate the whole CLASS, not just the named cases. Read the
@@ -89,11 +92,18 @@ Prime each reviewer with the RIGHT SHAPE (what a lint scan misses). Paste this i
 
 ## 3. Triage → stage the class-level fix (don't commit yet)
 
-3-bucket disposition: FIX real+material now / evidence-tiered documented-accept / escalate.
+First verify the findings. Re-derive each load-bearing, contradictory or surprising one
+from ground truth (the code, a run, live state), refuting by default. An inconclusive
+refutation never overturns a well-grounded finding, and a refutation needs the same
+evidence as the finding (closing-session, "Review-loop discipline").
+
+Then the 3-bucket disposition: FIX real+material now / evidence-tiered documented-accept / escalate.
 When you fix, fix the mechanism/class — a per-instance patch is what spawns the next review
 round. `git add` the fix, but do NOT commit yet — the commit is the last step, after the marker.
-If you're on your 3rd EXTERNAL cross-model defect-bearing round, STOP at the escalation cap
-(see SKILL.md) — internal self/subagent audits like this one never count toward it.
+If the PR's open review round owes a round reflection (`python3 scripts/review_reflection.py status`),
+commit that reflection BEFORE you stage the fix: the commit gate denies content commits while it is
+owed, and refuses a reflection commit while anything is staged (closing-session's SKILL.md, Rule R).
+Internal self/subagent audits like this one are never review rounds.
 
 **A fix is not done until you have enumerated the CLASS'S OTHER MEMBERS and said what you
 found there.** The reviewer named the instance it happened to reach; the same defect usually
@@ -134,7 +144,7 @@ started, and neither of which the findings list will tell you about:
   costs one paragraph.
 - `python3 "$ROOT/scripts/review_state.py" mark --agent-output "$EVID"` — this is an INTERNAL
   (same-model) audit, so a plain `mark` is correct: it satisfies the commit review-depth gate and
-  NEVER counts toward the cross-model escalation streak, whatever it found. No outcome flag is
+  never moves the local cross-model streak (which no gate reads any more), whatever it found. No outcome flag is
   needed. (EXTERNAL is judged by the reviewing MODEL, not the gateway: only a non-Anthropic model —
   Codex, or the install's configured secondary reviewer (`merge_gate.secondary_reviewer`);
   NOT OpenRouter, and never a Genesis internal model — is marked

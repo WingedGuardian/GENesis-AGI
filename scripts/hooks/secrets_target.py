@@ -4,7 +4,7 @@ The first version of this gate matched the literal ``secrets.env`` in a Bash
 command. An adversarial review broke it in seconds with shapes nobody would call
 exotic — ``cat ~/genesis/secrets.*``, ``cat secrets.e*``, ``cat s*.env`` — and it
 never saw ``Read``/``Grep`` at all, since it was wired only to ``Bash``. That is
-the hand-rolled-matcher tar pit the genesis-development skill names: every round
+the hand-rolled-matcher tar pit the build-session skill names: every round
 finds one more spelling, and it does not converge.
 
 So this module asks a different question. Not "does the text look like the
@@ -477,10 +477,14 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "") -> boo
     if not command:
         return False
 
-    # Heredoc bodies are data — unless the heredoc feeds an interpreter, in
-    # which case the body IS the executed payload and must be scanned.
     exec_heredoc = _heredoc_feeds_an_executor(command)
-    scan = command if exec_heredoc else _HEREDOC.sub(" ", command)
+    excised = None if exec_heredoc else shell_parse.excise_data_heredoc(command)
+    if excised is not None:
+        scan = excised[0]
+    else:
+        # Heredoc bodies are data — unless the heredoc feeds an interpreter, in
+        # which case the body IS the executed payload and must be scanned.
+        scan = command if exec_heredoc else _HEREDOC.sub(" ", command)
     # Quoted regions are DATA for the command-level arm too: a commit message
     # naming the file is not an operand. The declared shell-variable residual
     # (`f=secrets; cat $f.env`) is unquoted, so it survives stripping.

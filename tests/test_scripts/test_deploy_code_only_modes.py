@@ -96,9 +96,11 @@ _SCRIPT_FILES = (
     "deploy_code_only.sh",
     "lib/guardian_pause.sh",
     "lib/deploy_marker.sh",
+    "lib/live_system_guard.sh",
     "lib/alert_queue.sh",
     "lib/deploy_status.sh",
     "lib/deploy_checkout.sh",
+    "lib/server_session_refusal.sh",
     "lib/checkout_lock.sh",
     "lib/deploy_recovery.sh",
     "lib/port_owned_by.py",
@@ -108,6 +110,10 @@ _SCRIPT_FILES = (
     "lib/live_checkout.py",
     "lib/venv_matches_pyproject.py",
 )
+
+
+def test_script_inventory_includes_required_live_guard():
+    assert "lib/live_system_guard.sh" in _SCRIPT_FILES
 
 
 def _install_the_script(st) -> None:
@@ -442,7 +448,7 @@ def test_a_python_too_old_for_the_pyproject_is_not_sent_to_a_reinstall(station):
     )
     r = _run(station)
     assert r.returncode == 1
-    assert "needs a newer Python" in r.stderr, r.stderr
+    assert "needs a Python version (its requires-python)" in r.stderr, r.stderr
     assert "update.sh" not in r.stderr, "a reinstall into this venv cannot fix it"
     assert _git(station["root"], "rev-parse", "HEAD") == head
 
@@ -1114,8 +1120,10 @@ def test_every_documented_validation_hold_uses_the_scripts_lock_path():
     root = SCRIPT.parent.parent
     docs = [
         SCRIPT,
-        root / ".claude" / "skills" / "genesis-development" / "SKILL.md",
-        root / "changelog.d" / "20260927020000-added-deploy-code-only.md",
+        root / ".claude" / "skills" / "build-session" / "SKILL.md",
+        root / "CHANGELOG.md",
+        # Release assembly consumes fragments; check both storage phases.
+        *sorted((root / "changelog.d").glob("*.md")),
     ]
     found = 0
     for doc in docs:

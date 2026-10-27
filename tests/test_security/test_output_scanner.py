@@ -198,3 +198,267 @@ def test_benign_lookalikes_not_flagged(text):
     result = scan_outbound(text)
     assert result.safe is True
     assert result.detected == []
+
+
+_TEST_CARD = "4242" * 4  # Stripe's public test number, built from parts
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"Paid with {_TEST_CARD} today",
+        f"card {_TEST_CARD[:4]} {_TEST_CARD[4:8]} {_TEST_CARD[8:12]} {_TEST_CARD[12:]}",
+    ],
+    ids=["unbroken", "grouped"],
+)
+def test_payment_card_is_critical(text):
+    result = scan_outbound(text)
+    assert not result.safe
+    assert "payment_card" in result.detected
+    assert result.risk_level == "high"
+
+
+def test_card_shaped_but_not_a_card_is_safe():
+    # Luhn-failing, decimal fraction, and an epoch timestamp.
+    bad_luhn = _TEST_CARD[:-1] + "3"
+    for text in (f"order {bad_luhn}", f"score 0.{_TEST_CARD}", "ts 1728600000000"):
+        assert scan_outbound(text).safe, text
+
+
+def test_redact_credentials_cuts_secrets_and_keeps_locations():
+    from genesis.security.output_scanner import redact_credentials
+
+    key = "sk-" + "a" * 30
+    text = (
+        f"use {key} from /home/someone/app on localhost:8080\n"
+        + "DB_"
+        + "PASSWORD=hunter2hunter2\n"
+        + '{"api_key": "abc\\"def", "name": "x"}'
+    )
+    out, found = redact_credentials(text)
+    assert key not in out and "hunter2" not in out and 'abc\\"def' not in out
+    assert "/home/someone/app" in out and "localhost:8080" in out
+    assert '"name": "x"' in out
+    assert {"api_key_openai", "json_credential"} <= set(found)
+    assert {"credential_assignment", "env_variable_secret"} & set(found)
+    assert scan_outbound(out).detected == ["internal_file_path", "localhost_port"]
+
+
+def test_redact_credentials_leaves_clean_text_alone():
+    from genesis.security.output_scanner import redact_credentials
+
+    assert redact_credentials("nothing to see") == ("nothing to see", [])
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'password: "abcdefgh!TAILSECRET"',
+        "secret=abcdefgh\u00e9TAILSECRET",
+        "token: abcdefgh%7ETAILSECRET",
+        "api_key = abcdefgh/ok.TAILSECRET",
+    ],
+)
+def test_redaction_takes_the_whole_credential_token(text):
+    from genesis.security.output_scanner import redact_credentials
+
+    out, found = redact_credentials(text)
+    assert "TAILSECRET" not in out
+    assert found == ["credential_assignment"]
+
+
+def test_json_member_redaction_is_linear_on_hostile_text():
+    import time
+
+    from genesis.security.output_scanner import redact_credentials
+
+    # Quadratic before: a long quote-free keyword run closed by a quote with no
+    # colon took 1.2 s at 40 KB. Linear is well under a second at 400 KB.
+    hostile = '"' + "token password " * 27_000 + '" x'
+    start = time.perf_counter()
+    redact_credentials(hostile)
+    assert time.perf_counter() - start < 5
+
+
+def test_json_member_with_an_ordinary_key_is_kept():
+    from genesis.security.output_scanner import redact_credentials
+
+    text = '{"name": "value", "api_key": "abc", "count": "3"}'
+    out, _ = redact_credentials(text)
+    assert out == '{"name": "value", "api_key": "[redacted:json_credential]", "count": "3"}'
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'password: "abcdefgh,TAILSECRET"',
+        "password: 'abcdefgh TAILSECRET'",
+        'API_TOKEN="abc def TAILSECRET"',
+        "DB_SECRET_KEY='xx yy TAILSECRET'",
+    ],
+)
+def test_quoted_credential_values_are_redacted_to_the_closing_quote(text):
+    from genesis.security.output_scanner import redact_credentials
+
+    out, found = redact_credentials(text)
+    assert "TAILSECRET" not in out
+    assert found
+
+
+def test_json_keys_that_only_contain_a_credential_word_keep_their_values():
+    from genesis.security.output_scanner import redact_credentials
+
+    text = (
+        '{"token_count": "1200", "token_type": "Bearer", '
+        '"tokenizer": "cl100k", "password_required": "false"}'
+    )
+    assert redact_credentials(text) == (text, [])
+
+
+@pytest.mark.parametrize("key", ["access_token", "db_password", "apiKey", "client_secret", "token"])
+def test_json_keys_named_as_credentials_are_redacted(key):
+    from genesis.security.output_scanner import redact_credentials
+
+    out, found = redact_credentials('{"' + key + '": "TAILSECRETvalue"}')
+    assert "TAILSECRET" not in out
+    assert found == ["json_credential"]
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "secret_key",
+        "api_secret_key",
+        "secrets",
+        "passwords",
+        "api_keys",
+        "password_hash",
+        "token_value",
+        "token ",
+        "accessToken",
+        "API-KEY",
+        "x.password",
+        "privateKey",
+        "credentials",
+    ],
+)
+def test_keys_that_name_a_credential_in_any_form_are_redacted(key):
+    from genesis.security.output_scanner import redact_credentials
+
+    out, found = redact_credentials('{"' + key + '": "TAILSECRETvalue"}')
+    assert "TAILSECRET" not in out
+    assert found == ["json_credential"]
+
+
+@pytest.mark.parametrize(
+    "key", ["max_tokens", "password_policy", "token_count", "tokenizer", "token_type"]
+)
+def test_keys_about_a_credential_keep_their_values(key):
+    from genesis.security.output_scanner import redact_credentials
+
+    text = '{"' + key + '": "keep-me"}'
+    assert redact_credentials(text) == (text, [])
+
+
+def test_mixed_quotes_cannot_leave_a_tail():
+    from genesis.security.output_scanner import redact_credentials
+
+    out, _ = redact_credentials('password = "abcdefgh\'TAILSECRET" and more')
+    assert "TAILSECRET" not in out
+
+
+def test_an_assignment_is_cut_to_the_end_of_its_line_only():
+    from genesis.security.output_scanner import redact_credentials
+
+    out, _ = redact_credentials("a\npassword: abcdefgh!TAILSECRET\nnext line stays")
+    assert out == "a\n[redacted:credential_assignment]\nnext line stays"
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "passwd",
+        "pwd",
+        "password2",
+        "passphrase",
+        "access_key",
+        "Authorization",
+        "token_type_value",
+        "password_name",
+        "token_id",
+        "token_url",
+    ],
+)
+def test_more_credential_key_shapes_are_redacted(key):
+    from genesis.security.output_scanner import redact_credentials
+
+    out, found = redact_credentials('{"' + key + '": "TAILSECRETvalue"}')
+    assert "TAILSECRET" not in out
+    assert found == ["json_credential"]
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["sk-" + "a" * 30 + ".TAILSECRETvalue", "gsk_" + "b" * 30 + "-TAILSECRET"],
+)
+def test_a_key_shape_takes_its_whole_token(text):
+    from genesis.security.output_scanner import redact_credentials
+
+    out, _ = redact_credentials(f"use {text} now")
+    assert "TAILSECRET" not in out
+    assert out.endswith(" now")
+
+
+def test_an_env_assignment_takes_a_value_wrapped_onto_the_next_line():
+    from genesis.security.output_scanner import redact_credentials
+
+    out, found = redact_credentials('API_TOKEN=\n"abc def TAILSECRET"\nnext line stays')
+    assert "TAILSECRET" not in out
+    assert out.endswith("\nnext line stays")
+    assert found == ["env_variable_secret"]
+
+
+@pytest.mark.parametrize("prefix", ["sk-", "gsk_", "ghp_"])
+def test_a_key_shape_inside_a_json_string_keeps_the_closing_quote(prefix):
+    import json
+
+    from genesis.security.output_scanner import redact_credentials
+
+    out, _ = redact_credentials('{"note": "use ' + prefix + "a" * 36 + '", "answer": "OK"}')
+    assert json.loads(out)["answer"] == "OK"
+    assert "a" * 20 not in out
+
+
+@pytest.mark.parametrize("sep", ["\n", "\r\n", "\n\n", "\n \n"])
+def test_a_value_below_a_name_the_cut_swallowed_goes_with_it(sep):
+    from genesis.security.output_scanner import redact_credentials
+
+    out, _ = redact_credentials("note password: abcdefgh123 API_TOKEN=" + sep + "TAILSECRET\nkept")
+    assert "TAILSECRET" not in out
+    assert out.endswith("\nkept")
+
+
+def test_a_flagged_line_ending_in_a_colon_keeps_the_lines_below():
+    from genesis.security.output_scanner import redact_credentials
+
+    text = "def connect(host, password=DEFAULT_PASSWORD):\n    open(host)\n    return 1"
+    out, _ = redact_credentials(text)
+    assert out == "def connect(host, [redacted:credential_assignment]\n    open(host)\n    return 1"
+
+
+def test_a_crlf_line_ending_survives_the_cut():
+    from genesis.security.output_scanner import redact_credentials
+
+    out, _ = redact_credentials("a\r\npassword: abcdefgh123 tail\r\nb")
+    assert out == "a\r\n[redacted:credential_assignment]\r\nb"
+
+
+def test_assignment_redaction_is_linear_on_hostile_text():
+    import time
+
+    from genesis.security.output_scanner import redact_credentials
+
+    hostile = "password: abcdefgh1 " * 100_000 + ": = " * 200_000
+    start = time.perf_counter()
+    redact_credentials(hostile)
+    assert time.perf_counter() - start < 2

@@ -64,7 +64,8 @@ caught twice: a different device number (another disk, a btrfs subvolume), and
 the kernel's own refusal to rename across mount points (a bind mount, an
 overlay's lower layer). The refusal says to ask the user before deleting the
 item any other way. A trash directory that is a symlink, owned by another
-user, or not mode 0700 is refused too.
+user, or not mode 0700 is refused too, both when trashing and when listing or
+restoring (an entry forged into such a directory is never restored).
 
 Renaming something a process is using splits it: the process keeps writing to
 the moved copy, and whoever opens the old path next gets a new, empty one. For
@@ -105,8 +106,40 @@ revisit it.
   reaped; the task fails saying so, and it needs `git worktree unlock` or a
   manual removal.
 
-The dashboard's delete actions are #2926 PR 5, and an advisory on shell `rm` is
-PR 6.
+- **Dashboard file API delete** (`DELETE /api/genesis/files/delete`; no button
+  calls it today): the file (a symlink path deletes its target, as the route
+  always has). A file the trash refuses (Claude Code's temp volume, another
+  volume) is left alone with a 409. Neither `~/.genesis/trash` nor
+  `~/.genesis/worktree-trash` is listed or opened by the file browser: every
+  trashed item is renamed to `item`, so the browser's name rules could no
+  longer see what it was.
+- **Dashboard memory-file delete** (the config modal's Delete): the memory
+  file, as the link when it is a symlink. `MEMORY.md` is never deleted.
+
+## The advisory on shell deletes
+
+A session that runs `rm`, `unlink` or `shred` on user data gets a note from the
+PreToolUse hook `scripts/hooks/rm_trash_advisory.py`: if the delete ran, the data
+is gone, and next time `put` would have kept it. The note is advisory only. It
+never blocks or asks, it reaches the session while the command is already
+running, and a dispatched session sees it the same way.
+
+It fires only when an operand is an existing path in a user-data location, or,
+for `rm -r`, a directory holding one: Claude Code memory, plans, settings,
+`CLAUDE.md`, skills, agents, commands and hookify rules under `~/.claude`;
+`config`, `output`, `knowledge`, `uploads`, `skill-library`, `plans`, `eval`,
+`voice-transcripts`, `infrastructure` and the two remote yamls under
+`~/.genesis`; and, in any Genesis checkout, the gitignored files git cannot
+restore (the four user identity files, `config/*.local.yaml`,
+`.claude/settings.local.json`, `secrets.env`), plus wherever `CLAUDE_HOME`,
+`GENESIS_PLANS_DIR`, `GENESIS_OUTPUT_DIR`, `GENESIS_VOICE_TRANSCRIPT_DIR` or
+`SECRETS_PATH` point when set. Temp, cc-tmp, repo files and
+anything else stay silent. So does anything it cannot read: an operand holding
+a shell variable, a relative path after a `cd` it cannot follow, a command the
+parser cannot read, `find -delete`, `git clean`, `xargs rm`, and deletes from
+inside another program. Over 30 days of one install's transcripts this set
+fired on about 7 commands a month, and most were a session's own drafts, which
+is why the note says "if this session created them, nothing to do".
 
 ## What does not go to the trash, and why
 
@@ -122,6 +155,11 @@ PR 6.
 - **Code with no production caller**, left as it is: the browser profile's
   `backup()`/`reset()` and the unwired `pending_reminders_hook.py`. They should
   use the trash if they are ever wired.
+- **Knowledge-upload Cancel** in the dashboard: the staged copy of a file just
+  uploaded from your browser, whose original stays on your machine. Upload
+  staging, like other temp.
+- **Database rows**: deleting a follow-up, a knowledge entry, a memory or a
+  reference from the dashboard deletes rows, not files, and is not covered.
 - **Task branches, not yet covered**: the executor's worktree cleanup still
   force-deletes a task's branch after the task ends, so a failed task's
   unpushed commits lose their only ref (#3020).

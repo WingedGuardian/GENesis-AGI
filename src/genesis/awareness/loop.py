@@ -33,6 +33,8 @@ from genesis.awareness.signals import SignalCollector, collect_all
 from genesis.awareness.types import Depth, TickResult
 from genesis.cc.constants import RATE_LIMIT_DEFERRAL_TTL_S
 from genesis.db.crud import awareness_ticks, observations
+from genesis.infra_profile.codebase_mcp import SLUG as _CODEBASE_MCP_SLUG
+from genesis.infra_profile.codebase_mcp import needs_setup as codebase_mcp_needs_setup
 from genesis.infra_profile.store import load_profile
 from genesis.observability.events import GenesisEventBus
 from genesis.observability.failure_details import failure_details
@@ -172,8 +174,18 @@ async def _persist_health_alerts(db) -> None:
     try:
         from genesis.db.crud import alert_events as _ae
         from genesis.mcp.health.errors import _compute_alerts
+        from genesis.observability.agent_api_alerts import ALERT_ID, active_alerts, notify_pending
+        from genesis.runtime import GenesisRuntime
 
-        alerts, _current_ids = await _compute_alerts()
+        observation = {}
+        queue_unknown_ids: set[str] = set()
+        alerts, _current_ids = await _compute_alerts(
+            agent_api_observation=observation, queue_unknown_ids=queue_unknown_ids,
+        )
+        # Also preserve an open API incident if the health service itself could
+        # not initialize and _compute_alerts returned before taking a snapshot.
+        alerts = [a for a in alerts if a.get("id") != ALERT_ID]
+        alerts.extend(await active_alerts(db, observation))
         active = [
             {
                 "alert_id": a["id"],
@@ -184,7 +196,12 @@ async def _persist_health_alerts(db) -> None:
             for a in alerts
             if a.get("id")
         ]
-        await _ae.reconcile_open_set(db, active=active, now=datetime.now(UTC).isoformat())
+        state = observation.get("status")
+        reasons = {ALERT_ID: state} if state in {"healthy", "disabled"} else None
+        await _ae.reconcile_open_set(db, active=active, now=datetime.now(UTC).isoformat(),
+                                     resolution_reasons=reasons, preserve_ids=queue_unknown_ids)
+        runtime = GenesisRuntime.peek()
+        await notify_pending(db, getattr(runtime, "_outreach_pipeline", None))
     except Exception:
         logger.debug("alert_events persistence failed (best-effort)", exc_info=True)
 
@@ -546,7 +563,7 @@ _last_memory_integrity_key: str = ""
 # `probe_falkordb` reports it DOWN. So the lever moves back first.
 _FALKORDB_STAND_DOWN = (
     "To stand it down instead, first set graphstore `mode: networkx` "
-    "(settings_update(\"graphstore\", {\"mode\": \"networkx\"}), or "
+    '(settings_update("graphstore", {"mode": "networkx"}), or '
     "~/.genesis/config/graphstore.local.yaml) — while `mode: falkordb` is "
     "selected, memory-graph reads depend on the engine, every recall falls back "
     "to NetworkX with a warning, and the health probe reports it DOWN — then "
@@ -598,8 +615,9 @@ _INFRA_POSTURE_DETAIL = {
         "(scripts/host-setup.sh prints the swapfile recipe)"
     ),
     "container_swap_knob_off": (
-        "incus limits.memory.swap is explicitly false — swap stays disabled "
-        "across container restarts. On the host: incus config set <container> "
+        "incus limits.memory.swap holds an Incus false value (false/0/no/off, "
+        "any case, or a zero byte size) — swap stays disabled across container "
+        "restarts. On the host: incus config set <container> "
         "limits.memory.swap true (scripts/host-setup.sh sets this; the host "
         "guardian also reconciles it when healthy)"
     ),
@@ -674,7 +692,33 @@ _INFRA_POSTURE_DETAIL = {
         "back; `systemctl --user enable genesis-falkordb` makes it survive the "
         "next reboot. " + _FALKORDB_STAND_DOWN
     ),
+    _CODEBASE_MCP_SLUG: (
+        "codebase-memory-mcp is registered (this checkout's .mcp.json or the "
+        "user-scope ~/.claude.json), but its managed setup is incomplete — the "
+        "settings file ~/.genesis/config/codebase-managed.json is missing or fails "
+        "validation (`scripts/codebase_managed.py status` names the error), or the "
+        "query unit genesis-cbm-query.service is not enabled — so its launcher refuses and "
+        "every Claude Code session shows the server as failed to connect. Fix: "
+        "run `configure` (with an already obtained pinned binary) and then "
+        "`enable`, per docs/reference/codebase-managed.md, section \"If you see "
+        "the 'registered but unconfigured' alert\". Not wanted? Create the "
+        "kill-switch file (the `sentinel` path in the settings file if one exists, "
+        "else ~/.genesis/codebase-memory-mcp.disabled or the path "
+        "CODEBASE_MEMORY_MCP_DISABLE_FILE names) and this alert stops. It reads "
+        "the infrastructure profile, so after either fix take a refresh "
+        "(`infrastructure_profile(refresh=true)`)"
+    ),
 }
+
+# Slugs that are a developer-tooling gap rather than a crash-resilience one, so
+# the alert's crash-resilience trailer does not claim otherwise for them.
+_INFRA_POSTURE_TOOLING_SLUGS = frozenset({_CODEBASE_MCP_SLUG})
+
+
+def _codebase_mcp_could_alert(section: dict) -> bool:
+    """Whether retained codebase_mcp facts could have fed its posture rule."""
+    facts = section.get("facts")
+    return isinstance(facts, dict) and codebase_mcp_needs_setup(facts) is True
 
 # UnitFileState values that mean an operator ENABLED the graph engine.
 _FALKORDB_ENABLED_STATES = frozenset({"enabled", "enabled-runtime"})
@@ -700,10 +744,7 @@ def _falkordb_selected(facts: dict) -> bool:
 
 def _falkordb_armed(facts: dict) -> bool:
     """Selected by the lever, or enabled by an operator — either is intent."""
-    return (
-        _falkordb_selected(facts)
-        or facts.get("unit_enabled") in _FALKORDB_ENABLED_STATES
-    )
+    return _falkordb_selected(facts) or facts.get("unit_enabled") in _FALKORDB_ENABLED_STATES
 
 
 def _falkordb_could_alert(section: dict) -> bool:
@@ -799,12 +840,17 @@ def _infra_missing_protections(profile: dict) -> list[str]:
     # container (meminfo swap isn't virtualized; verified live 2026-07-16).
     if _explicit_zero(_facts("host_system").get("swap_total_kb")):
         missing.append("host_swap_absent")
-    # Persistent incus knob, visible container-side. Explicit "false" only —
-    # the incus default is true, so absent/unset is healthy. Covers installs
-    # WITHOUT a working guardian (the guardian reconciles this knob itself).
+    # Persistent incus knob, visible container-side. Any nonempty Incus false
+    # value is off; the Incus default is true, so absent/unset is healthy.
+    # Covers installs WITHOUT a working guardian (the guardian reconciles this
+    # knob itself).
     limits = _facts("host_virt").get("container_limits")
-    if isinstance(limits, dict) and limits.get("limits.memory.swap") == "false":
-        missing.append("container_swap_knob_off")
+    raw = limits.get("limits.memory.swap") if isinstance(limits, dict) else None
+    if isinstance(raw, str) and raw.strip():
+        from genesis.guardian.swap_watch import is_swap_on
+
+        if not is_swap_on(raw):
+            missing.append("container_swap_knob_off")
     # Network plane, gated on networkd actually managing the default route
     # (collectors/container.py::_networkd_manages_link). On a NetworkManager
     # box the fact is False/absent, so these rules stay silent — the
@@ -869,6 +915,12 @@ def _infra_missing_protections(profile: dict) -> list[str]:
         or (falkordb_state is None and falkordb.get("socket_present") is False)
     ):
         missing.append("falkordb_selected_not_running")
+    # codebase-memory-mcp registered (so every session tries it) but not set up,
+    # and the owner has not opted out with the kill-switch file. The verdict is
+    # the SAME function the installers' notice runs; None (could not tell)
+    # stays silent, per this function's contract.
+    if codebase_mcp_needs_setup(_facts("codebase_mcp")) is True:
+        missing.append(_CODEBASE_MCP_SLUG)
     return sorted(missing)
 
 
@@ -883,12 +935,17 @@ _POSTURE_PLANES = (
     # make the rules fall silent AND leave `unverifiable` empty — resolving an
     # open engine alert while the engine is still broken and unobservable.
     "falkordb",
+    # Same reason: the codebase-memory-mcp rule's only input.
+    "codebase_mcp",
 )
 
 # Planes whose retained facts are non-empty even when they could never have fed
 # a rule. For these, "retained facts" is not evidence of a prior posture, so the
 # hold applies only when the retained state could actually have alerted.
-_POSTURE_PLANE_RELEVANT = {"falkordb": _falkordb_could_alert}
+_POSTURE_PLANE_RELEVANT = {
+    "falkordb": _falkordb_could_alert,
+    "codebase_mcp": _codebase_mcp_could_alert,
+}
 
 
 def _infra_unverifiable_planes(profile: dict) -> list[str]:
@@ -963,9 +1020,19 @@ async def _check_infra_protection_posture(db) -> None:
             content = (
                 f"Infra protection posture: {len(missing)} protection(s) "
                 f"missing on this install (profile collected {collected_at}): "
-                f"{details}. Each missing protection removes a crash-resilience "
-                f"guarantee this box relies on (2026-07 incident class)."
+                f"{details}."
             )
+            if any(slug not in _INFRA_POSTURE_TOOLING_SLUGS for slug in missing):
+                content += (
+                    " Each missing protection removes a crash-resilience "
+                    "guarantee this box relies on (2026-07 incident class)."
+                )
+            tooling = [slug for slug in missing if slug in _INFRA_POSTURE_TOOLING_SLUGS]
+            if tooling:
+                content += (
+                    f" {', '.join(tooling)}: a developer-tooling gap, not a "
+                    f"crash-resilience one."
+                )
             if unverifiable:
                 content += (
                     f" Additionally unverifiable (section collector failing, "
@@ -1397,6 +1464,8 @@ def _finding_like(finding_class: str) -> str:
     carries free text (edited file names, a probe's error) that can contain the
     class name; `_` is a LIKE wildcard, so `missing-units` would match too."""
     return f"%[findings: %{finding_class}%"
+
+
 _last_deploy_alert_at: float = 0.0
 _last_deploy_alert_key: str = ""
 # The deploy checkout's status on the previous tick (deploy_health's
@@ -1417,6 +1486,24 @@ _last_main_checkout_status: str = ""
 # supersedes it. Either way every other finding class is reconciled on the
 # same tick.
 _last_actionable_main_checkout: dict | None = None
+# Likewise for the `live` classes (deploy_health's live["state"]): a deploy in
+# progress, or the FIRST unreadable tick, carries the last actionable tick's
+# live findings rather than resolving or raising them.
+_last_live_state: str = ""
+_last_actionable_live_findings: list[str] | None = None
+# Whether the previous tick's live reading was unknown (off `live`, the engine
+# did not answer). A second consecutive one is not carried again: it raises
+# live_unreadable while a live alert stands in the store, else nothing, so an
+# install that never uses `live` never alerts on a slow engine.
+_last_live_unknown: bool = False
+# On `live` the tier-2 and Guardian comparisons run against the base `live` was
+# built on. A tick with no base (unreadable, mid-deploy, ambiguous bases) runs
+# neither, so their findings are carried from the last tick that had one, never
+# resolved by a comparison that did not run.
+_BASE_DEPENDENT_CLASSES = frozenset(
+    {"tier2_pending", "host_guardian_drift", "host_guardian_unknown_commit"}
+)
+_last_actionable_base_findings: list[str] | None = None
 
 
 async def _check_deploy_staleness(db) -> None:
@@ -1425,6 +1512,8 @@ async def _check_deploy_staleness(db) -> None:
     Best-effort — the whole body is guarded and never raises into the tick."""
     global _last_deploy_alert_at, _last_deploy_alert_key
     global _last_main_checkout_status, _last_actionable_main_checkout
+    global _last_live_state, _last_actionable_live_findings, _last_live_unknown
+    global _last_actionable_base_findings
     if db is None:
         return
     try:
@@ -1433,6 +1522,7 @@ async def _check_deploy_staleness(db) -> None:
         # can monkeypatch the module attribute.
         from genesis.observability.snapshots.deploy_health import (
             deploy_health,
+            live_unknown,
             main_checkout_findings,
         )
 
@@ -1460,7 +1550,9 @@ async def _check_deploy_staleness(db) -> None:
                 checkout = _last_actionable_main_checkout
                 carried = True
             elif await observations.has_unresolved_matching(
-                db, source="deploy_staleness_monitor", content_like=_finding_like("main_checkout_dirty")
+                db,
+                source="deploy_staleness_monitor",
+                content_like=_finding_like("main_checkout_dirty"),
             ):
                 # A dirty alert stands and nothing in memory says its count or
                 # names: carry the class alone, so the alert is kept (or
@@ -1489,6 +1581,73 @@ async def _check_deploy_staleness(db) -> None:
             ] + main_checkout_findings(checkout)
         else:
             _last_actionable_main_checkout = checkout
+        live = snap.get("live") or {}
+        live_state = live.get("state") or ""
+        previous_live_state = _last_live_state
+        _last_live_state = live_state
+        unknown = live_unknown(live)
+        previous_unknown = _last_live_unknown
+        _last_live_unknown = unknown
+        # Not acted on: a deploy in progress, the FIRST unreadable tick, or the
+        # FIRST reading that says nothing either way (off `live`, the engine did
+        # not answer). The last actionable live findings are carried.
+        if unknown and previous_unknown:
+            # A second unknown tick in a row: escalate from the store, not from
+            # memory (a restart clears memory several times a day). With a live
+            # alert standing it becomes live_unreadable; with none, nothing.
+            standing = False
+            for cls in sorted(_DEPLOY_LIVE_CLASSES):
+                if await observations.has_unresolved_matching(
+                    db, source="deploy_staleness_monitor", content_like=_finding_like(cls)
+                ):
+                    standing = True
+                    break
+            if not standing:
+                logger.info("deploy staleness: live reading unknown twice, no live alert stands")
+            findings = [f for f in findings if f.split(":", 1)[0] not in _DEPLOY_LIVE_CLASSES] + (
+                ["live_unreadable"] if standing else []
+            )
+        elif (
+            live_state == "deploying"
+            or (live_state == "unreadable" and previous_live_state != "unreadable")
+            or unknown
+        ):
+            carried_live = _last_actionable_live_findings
+            if carried_live is None:
+                # Nothing in memory (the process restarted): carry the class of
+                # every standing live alert, as the checkout path does, so it is
+                # kept (or superseded), never resolved by a tick that read nothing.
+                carried_live = []
+                for cls in sorted(_DEPLOY_LIVE_CLASSES):
+                    if await observations.has_unresolved_matching(
+                        db, source="deploy_staleness_monitor", content_like=_finding_like(cls)
+                    ):
+                        carried_live.append(cls if cls == "live_unreadable" else f"{cls}:?")
+            findings = [
+                f for f in findings if f.split(":", 1)[0] not in _DEPLOY_LIVE_CLASSES
+            ] + list(carried_live)
+        else:
+            _last_actionable_live_findings = [
+                f for f in findings if f.split(":", 1)[0] in _DEPLOY_LIVE_CLASSES
+            ]
+        on_live = live_state == "live" or bool(live.get("on_live_branch"))
+        if on_live and not live.get("base"):
+            carried_base = _last_actionable_base_findings
+            if carried_base is None:
+                # A restart cleared memory: carry the class of each standing alert.
+                carried_base = []
+                for cls in sorted(_BASE_DEPENDENT_CLASSES):
+                    if await observations.has_unresolved_matching(
+                        db, source="deploy_staleness_monitor", content_like=_finding_like(cls)
+                    ):
+                        carried_base.append(f"{cls}:?" if cls == "tier2_pending" else cls)
+            findings = [
+                f for f in findings if f.split(":", 1)[0] not in _BASE_DEPENDENT_CLASSES
+            ] + list(carried_base)
+        else:
+            _last_actionable_base_findings = [
+                f for f in findings if f.split(":", 1)[0] in _BASE_DEPENDENT_CLASSES
+            ]
         if not findings:
             await _resolve_deploy_staleness(db)
             return
@@ -1568,8 +1727,10 @@ async def _check_deploy_staleness(db) -> None:
         # The drift paragraph (and its update.sh recovery sentence) only when a
         # drift class is present: update.sh REFUSES a dirty deploy checkout, so
         # telling someone to run it for a dirty-only state is wrong advice.
-        if set(classes) - _DEPLOY_CHECKOUT_CLASSES:
+        if set(classes) - _DEPLOY_CHECKOUT_CLASSES - _DEPLOY_LIVE_CLASSES:
             paragraphs.append(_deploy_drift_paragraph(snap, age_days, behind, git_facts))
+        if set(classes) & _DEPLOY_LIVE_CLASSES:
+            paragraphs.append(_deploy_live_paragraph(snap, findings))
         if "main_checkout_dirty" in classes:
             paragraph = _deploy_checkout_dirty_paragraph(checkout)
             if carried and checkout.get("count") is not None:
@@ -1607,6 +1768,19 @@ async def _check_deploy_staleness(db) -> None:
 #: that has not been deployed. They get their own wording and never page:
 #: the critical branch keys only on stale_update and missing_units.
 _DEPLOY_CHECKOUT_CLASSES = frozenset({"main_checkout_dirty", "main_checkout_unreadable"})
+#: Finding classes about `live`, the integration branch scripts/deploy_candidates
+#: rebuilds from the deploy manifest (deploy_health.live_findings). Their own
+#: wording, no update.sh drift paragraph, and they never page.
+_DEPLOY_LIVE_CLASSES = frozenset(
+    {
+        "live_unbound",
+        "live_unreadable",
+        "live_off_branch",
+        "live_unbuilt",
+        "live_unlisted",
+        "live_candidate_tier2",
+    }
+)
 
 
 def _deploy_drift_paragraph(snap: dict, age_days, behind, git_facts: dict) -> str:
@@ -1635,8 +1809,79 @@ def _deploy_drift_paragraph(snap: dict, age_days, behind, git_facts: dict) -> st
         + "; ".join(detail)
         + ". Bare git merges deploy code but skip tier-2 activation "
         "(systemd units, guardian host redeploy, CC/Node pins). "
-        "Recovery: run scripts/update.sh from ~/genesis."
+        + (
+            "Recovery: run scripts/update.sh from ~/genesis (on `live` it rebuilds "
+            "`live` from the deploy manifest first)."
+            if (git_facts.get("live") == "live")
+            else "Recovery: run scripts/update.sh from ~/genesis."
+        )
     )
+
+
+def _deploy_live_paragraph(snap: dict, findings: list[str]) -> str:
+    live = snap.get("live") or {}
+    parts: list[str] = []
+    for f in findings:
+        cls, _, value = f.partition(":")
+        if cls == "live_unreadable":
+            parts.append(
+                "Whether this install runs the `live` integration branch as its deploy "
+                "manifest says could not be read on two consecutive checks "
+                f"({live.get('reason') or 'no reason given'}): scripts/deploy_candidates "
+                "status shows what the engine reads."
+            )
+        elif cls == "live_unbound":
+            parts.append(
+                "HEAD is the branch `live`, but no deploy manifest of this repository "
+                "binds it (the manifest is missing or names another repository). The "
+                "deploy scripts refuse this checkout, restart included, until the "
+                "manifest is restored or the checkout leaves `live` "
+                "(scripts/deploy_candidates status shows what it holds)."
+            )
+        elif cls == "live_unbuilt":
+            parts.append(
+                "The deploy manifest lists "
+                + ("candidates" if value == "?" else f"{value} candidate(s)")
+                + " that `live` does not hold: added since the last rebuild, or left out "
+                "of it (a conflict, a hook without approval, a failed check). "
+                "scripts/deploy_candidates status names each one and why; a rebuild "
+                "brings in the ones it can."
+            )
+        elif cls == "live_unlisted":
+            parts.append(
+                "`live` holds "
+                + ("candidates" if value == "?" else f"{value} candidate(s)")
+                + " that no deploy manifest of this repository lists (dropped without a "
+                "rebuild, or the manifest is missing), so their code is checked out with "
+                "nothing tracking it. scripts/deploy_candidates status names them; the "
+                "next rebuild removes them from `live`."
+            )
+        elif cls == "live_off_branch":
+            parts.append(
+                "The deploy manifest lists "
+                + (
+                    "candidates (their count was not read on this check)"
+                    if value == "?"
+                    else f"{value} candidate(s)"
+                )
+                + ", but the checkout is not "
+                "on `live`, so its files do not have them. To run them: scripts/deploy_candidates "
+                "rebuild (it rebuilds `live` from the manifest and moves the checkout onto "
+                "it; a bare git switch would run whatever `live` held before), then "
+                "scripts/deploy_code_only.sh restart. To stop listing one: "
+                "scripts/deploy_candidates drop <branch>. A candidate whose PR has "
+                "merged stays listed until the next rebuild retires it, or until that "
+                "drop; scripts/deploy_candidates status shows which."
+            )
+        elif cls == "live_candidate_tier2":
+            parts.append(
+                "`live` carries "
+                + ("update.sh-only files" if value == "?" else f"{value} update.sh-only file(s)")
+                + " from its candidates, over "
+                "the base it was built on; they are active only if scripts/update.sh ran "
+                "after the last rebuild."
+            )
+    return " ".join(parts)
 
 
 def _deploy_checkout_dirty_paragraph(checkout: dict) -> str:
@@ -2199,9 +2444,7 @@ async def _nocow_flag(db_path: Path) -> bool | None:
         return None
 
     try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=_NOCOW_PROBE_TIMEOUT_S
-        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_NOCOW_PROBE_TIMEOUT_S)
     except TimeoutError:
         # RECORD FIRST, clear on success — never the other way round. `_kill_probe`
         # awaits, so it is a cancellation point: a tick cancelled during the reap
@@ -2402,15 +2645,68 @@ async def _check_git_health(db) -> None:
 # so it still runs in a router-degraded startup, the exact window a
 # belt-and-suspenders integrity check matters. A monotonic >=24h guard gives a
 # daily cadence that also fires once on the first tick after any restart (no
-# interval-reset starvation). The fsck runs in a thread (check_git_deep ->
-# to_thread) so it never blocks the tick. None = "never run this boot".
+# interval-reset starvation). The tick dispatches it OUT-OF-BAND (fsck can run up
+# to its 900 s timeout, twice with the re-check, and must not hold the tick lock);
+# the daily slot is claimed before the run, so overlapping ticks stay
+# single-flight. None = "never run this boot".
 _GIT_DEEP_INTERVAL_S = 24 * 3600
 _last_git_deep_run_at: float | None = None
+_git_deep_task = None  # strong reference to the out-of-band run
+# Set by a service stop, cleared by start: a tick that resumes after the stop
+# signal must not launch a scan nothing will cancel before the DB closes.
+_git_deep_stopped = False
+_git_deep_stuck_warned = False
+
+
+def _git_deep_stuck_s() -> int:
+    """Two fsck timeouts, the re-check wait and the object lookup, plus 5 min."""
+    from genesis.observability import git_health as g
+
+    return 2 * g._DEEP_TIMEOUT_S + g._FSCK_RECHECK_DELAY_S + g._LOOKUP_TIMEOUT_S + 300
+
+
+def _cancel_git_deep_task() -> None:
+    """Stop an in-flight deep scan at shutdown: a scan cut off by the stop
+    proves nothing and must not leave a verdict or a page behind. Also refuses
+    every later dispatch until the loop starts again."""
+    global _git_deep_stopped
+    _git_deep_stopped = True
+    if _git_deep_task is not None and not _git_deep_task.done():
+        _git_deep_task.cancel()
+
+
+def _dispatch_git_health_deep(db) -> None:
+    """Start the daily deep scan as a background task when it is due and not
+    already running, and never after a service stop; the tick never awaits it."""
+    global _git_deep_task, _git_deep_stuck_warned
+    if _git_deep_stopped:
+        return
+    if _git_deep_task is not None and not _git_deep_task.done():
+        # Two fsck timeouts plus the re-check wait bound a healthy run; past that
+        # the git child is stuck in uninterruptible I/O (a timeout kills any other)
+        # and the daily scan has stopped.
+        started = _last_git_deep_run_at
+        limit = _git_deep_stuck_s()
+        stalled = started is not None and time.monotonic() - started > limit
+        if stalled and not _git_deep_stuck_warned:
+            _git_deep_stuck_warned = True
+            logger.warning("git deep fsck still running after %ds; daily scan stalled", limit)
+        return
+    _git_deep_stuck_warned = False
+    last = _last_git_deep_run_at
+    if last is not None and time.monotonic() - last < _GIT_DEEP_INTERVAL_S:
+        return
+    from genesis.util.tasks import tracked_task
+
+    _git_deep_task = tracked_task(
+        _check_git_health_deep(db), name="git-deep-fsck", subsystem=Subsystem.AWARENESS
+    )
 
 
 async def _check_git_health_deep(db) -> None:
     """Daily `git fsck --full` content-verifying scan: writes the deep verdict
-    slot and, on failure, a critical observation. Best-effort; never raises.
+    slot and, on failure, a critical observation. Best-effort; never raises except
+    CancelledError, which a service stop uses to abort the scan with no verdict.
 
     Runs at most once per ``_GIT_DEEP_INTERVAL_S`` (and once on the first tick
     after a restart). NOT gated on ``db``: git integrity matters most when the DB
@@ -2432,7 +2728,8 @@ async def _check_git_health_deep(db) -> None:
 
     if report.ok:
         # Self-heal: a passing content-verifying fsck clears open DEEP alerts
-        # (category="git_deep" only). The verdict file already self-heals per
+        # (category="git_deep" only; git_deep_transient rows are records of past
+        # events and expire on their own TTL). The verdict file already self-heals per
         # slot; without this, the observations outlive recovery as stale
         # criticals and get amplified into false actions (2026-07-16 "git
         # corruption" alarm, seeded by a transient fsck race across ~112
@@ -2455,6 +2752,9 @@ async def _check_git_health_deep(db) -> None:
                     logger.info("git deep-health recovered: resolved %d alert(s)", healed)
             except Exception:
                 logger.debug("git deep-health auto-resolve failed", exc_info=True)
+            transient = report.details.get("fsck_transient")
+            if transient:
+                await _record_git_deep_transient(db, transient, report.checked_at)
         return
     if db is None:
         return
@@ -2476,6 +2776,11 @@ async def _check_git_health_deep(db) -> None:
         if len(detail_lines) >= 5:
             break
     detail = ("\n" + "\n".join(detail_lines)) if detail_lines else ""
+    recheck = report.details.get("fsck_recheck")
+    if report.details.get("fsck_reproduced"):
+        failures += " (reproduced on re-check)"
+    elif recheck:
+        failures += f" (re-check did not complete: {recheck})"
     try:
         created = await observations.create(
             db,
@@ -2510,6 +2815,42 @@ async def _check_git_health_deep(db) -> None:
             logger.debug("git deep-health alert suppressed (duplicate unresolved): %s", failures)
     except Exception:
         logger.debug("Failed to create git deep-health observation", exc_info=True)
+
+
+async def _record_git_deep_transient(db, transient: dict, checked_at: str) -> None:
+    """One 'high' row PER transient event (a fsck failure that passed on
+    re-check): shown in the morning report and dashboard, never paged (only
+    critical rows reach Telegram). A clean run does not resolve it; it expires on
+    the infrastructure_alert TTL, so a recurrence shows as more rows. The verdict
+    leads the body because those surfaces truncate content."""
+    lines = (transient.get("lines") or "").strip()
+    if transient.get("recheck_lines"):
+        lines += f"\nre-check reported (all present on lookup):\n{transient['recheck_lines']}"
+    if transient.get("race"):
+        verdict = (
+            "git fsck failed twice, but every object the re-check called missing exists "
+            "— a scan race with another writer"
+        )
+    else:
+        verdict = f"git fsck failed once and PASSED on re-check {transient.get('delay_s')}s later"
+    try:
+        await observations.create(
+            db,
+            id=str(uuid.uuid4()),
+            source="git_health_monitor",
+            type="infrastructure_alert",
+            category="git_deep_transient",
+            skip_if_duplicate=True,
+            content_hash=hashlib.sha256(f"git_deep_transient:{checked_at}".encode()).hexdigest(),
+            content=(
+                f"{verdict} — transient, no action needed unless this recurs "
+                f"(rc={transient.get('rc')}).\n{lines}"
+            ),
+            priority="high",
+            created_at=datetime.now(UTC).isoformat(),
+        )
+    except Exception:
+        logger.debug("Failed to create git deep-transient observation", exc_info=True)
 
 
 # Daily offline git-bundle publish (F.4). Publishes a *verified* `git bundle` of
@@ -2661,9 +3002,59 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
 # last severity stored, so we fire on a NEW scope or an ESCALATION (degraded→error)
 # but suppress a same-or-LOWER severity within the window — no storm, no A→B→A
 # oscillation flood, and no alert announcing a de-escalation (an improvement).
-_last_pid_alerts: dict[str | None, tuple[int, float]] = {}
+# scope -> (severity rank, monotonic time of the last alert, resolved since?).
+_last_pid_alerts: dict[str | None, tuple[int, float, bool]] = {}
+# Indirection so tests can drive the cooldown clock without patching
+# time.monotonic, which the asyncio event loop itself reads.
+_pid_clock = time.monotonic
 _PID_BUDGET_ALERT_COOLDOWN_S = 3600  # one alert per scope per hour unless it escalates
 _PID_SEVERITY_RANK = {"degraded": 1, "error": 2}
+# Resolve an open alert only once utilization is clearly back down: the alert
+# fires at 80% (the collector's degraded threshold), and resolving anywhere
+# under 80% would close and reopen it on every tick of a load hovering at the
+# line. 5 points of hysteresis.
+_PID_RESOLVE_PCT = 75.0
+
+
+async def _resolve_pid_budget_alert(db, pct: float | None) -> None:
+    """Resolve open PID-budget alerts on a healthy tick below _PID_RESOLVE_PCT.
+
+    Keeps a peak from an earlier tick from reading as a current condition (the
+    morning report shows the live figure beside it). No in-memory guard: an
+    alert written before a restart or deploy must resolve too, so the store is
+    asked. A read-only probe gates the write, so a healthy tick with nothing
+    open writes nothing. A resolve that closed rows marks every scope's cooldown
+    as resolved: a new degradation then re-alerts after a quarter of the
+    cooldown instead of the full hour, while load oscillating around the line
+    still cannot alert every other tick.
+    ``pct`` None (no finite sub-cap visible) is resolvable.
+    """
+    global _last_pid_alerts  # noqa: PLW0603
+    if db is None or (pct is not None and pct >= _PID_RESOLVE_PCT):
+        return
+    try:
+        if not await observations.has_unresolved_matching(
+            db, source="pid_budget_monitor", content_like="%"
+        ):
+            return
+        note = (
+            "PID budget healthy: no sub-cap visible"
+            if pct is None
+            else f"PID budget back below {_PID_RESOLVE_PCT:.0f}%"
+        )
+        resolved = await observations.resolve_by_source_and_type(
+            db,
+            source="pid_budget_monitor",
+            type="infrastructure_alert",
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes=note,
+        )
+    except Exception:
+        logger.debug("Failed to resolve pid_budget alert observation", exc_info=True)
+        return
+    if resolved:
+        _last_pid_alerts = {s: (v[0], v[1], True) for s, v in _last_pid_alerts.items()}
+        logger.info("PID budget healthy again: resolved %d alert observation(s)", resolved)
 
 
 async def _check_pid_budget(db, budget: dict | None = None) -> None:
@@ -2674,8 +3065,9 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
     read green (the blind spot this closes). The collector walks the cgroup chain and
     reports whichever level binds (session scope / user slice / container root); this
     emits a scope-matched remedy at degraded (>=80%) -> 'high'; error (>=90%) ->
-    'critical'. Fork-free cgroup read; best-effort — never raises into the tick.
-    `budget` may be injected (tests); otherwise it reads live."""
+    'critical'. A later HEALTHY read below _PID_RESOLVE_PCT resolves any open alert
+    (see `_resolve_pid_budget_alert`). Fork-free cgroup read; best-effort — never raises
+    into the tick. `budget` may be injected (tests); otherwise it reads live."""
     global _last_pid_alerts  # noqa: PLW0603
     try:
         if budget is None:
@@ -2687,19 +3079,46 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
         return
 
     status = budget.get("status")
+    if status == "healthy":
+        # Only a definite healthy read resolves; unavailable/unknown never does.
+        await _resolve_pid_budget_alert(db, budget.get("pct"))
+        return
     if status not in ("degraded", "error"):
-        return  # healthy / no sub-cap (pids.max="max") / unavailable → nothing to alert
+        return  # unavailable / unknown → nothing to alert, nothing to resolve
+    # Record WHO holds the budget on every low tick, cooldown or not: the holders
+    # may be gone by the next alert, and the count alone cannot name them.
+    breakdown = None
+    if budget.get("path"):
+        from genesis.observability import pid_breakdown
+
+        try:
+            try:
+                breakdown = await asyncio.to_thread(pid_breakdown.snapshot_for, budget)
+            except RuntimeError:
+                # No worker thread could start: the budget itself is exhausted,
+                # the tick this exists for. The collector's finite work limits
+                # also apply inline. (The executor queued the work before failing
+                # to start a thread, so a later worker may take a second,
+                # harmless snapshot file.)
+                breakdown = pid_breakdown.snapshot_for(budget)
+        except Exception:
+            logger.warning("pid budget breakdown could not run", exc_info=True)
     scope = budget.get("scope")
-    now = time.monotonic()
+    now = _pid_clock()
     # Per-scope cooldown with escalation bypass: fire when the scope is new, its
     # window expired, or it ESCALATED to a higher severity; suppress a same-or-lower
     # severity within the window — that covers a repeat, an A→B→A oscillation (each
     # scope cools independently), AND a de-escalation error→degraded (never alert
     # because things improved).
+    # After a resolve the scope's window shrinks to a quarter of the cooldown: a
+    # fresh episode is news, but a load swinging across the line every tick must
+    # still not alert every other tick (critical at >=90%).
     rank = _PID_SEVERITY_RANK[status]
     prev = _last_pid_alerts.get(scope)
-    if prev is not None and (now - prev[1]) < _PID_BUDGET_ALERT_COOLDOWN_S and rank <= prev[0]:
-        return
+    if prev is not None and rank <= prev[0]:
+        window = _PID_BUDGET_ALERT_COOLDOWN_S / 4 if prev[2] else _PID_BUDGET_ALERT_COOLDOWN_S
+        if (now - prev[1]) < window:
+            return
     if db is None:
         return  # can't write the observation now; retry next tick (cooldown not consumed)
     pct = budget.get("pct")
@@ -2741,7 +3160,7 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
     # Set before the await so a failed create still cools per-tick retries for the
     # same scope+severity. Prune scopes older than the cooldown to bound the map
     # (the server's own chain is a small fixed set, but keep it tidy regardless).
-    _last_pid_alerts[scope] = (rank, now)
+    _last_pid_alerts[scope] = (rank, now, False)
     _last_pid_alerts = {
         s: v for s, v in _last_pid_alerts.items() if now - v[1] < _PID_BUDGET_ALERT_COOLDOWN_S
     }
@@ -2755,6 +3174,13 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
                 f"{where} at {pct:.0f}% ({current}/{maximum} tasks). When it fills, new "
                 f"processes fail with 'Cannot fork' even though memory/CPU/disk are fine. "
                 f"Each Claude Code session spawns MCP subprocess trees. {remedy}"
+                + (f" {breakdown['text']}" if breakdown else "")
+                + (
+                    " Full breakdown: "
+                    + str(breakdown["file"]).encode("utf-8", "backslashreplace").decode("utf-8")
+                    if breakdown and breakdown.get("file")
+                    else ""
+                )
             ),
             priority=priority,
             created_at=datetime.now(UTC).isoformat(),
@@ -2906,6 +3332,7 @@ async def _check_provider_outage_notify(db) -> None:
             if _breakers is not None:
                 current_incident_identity = _breakers.current_incident_identity
                 incident_owner = _breakers.incident_owner
+
                 def provider_still_failing(name, _reg=_breakers):
                     return _reg.get(name).state != ProviderState.CLOSED
 
@@ -2952,11 +3379,15 @@ async def _check_provider_outage_notify(db) -> None:
             # them at critical in this same tick, which delivers the pending
             # notification — the point of turning the lever up.
             await _promote_demoted_provider_notify(
-                db, coverage_for=coverage_for, incident_owner=incident_owner,
+                db,
+                coverage_for=coverage_for,
+                incident_owner=incident_owner,
             )
 
         written = await sweep_due_notifications(
-            db, priority=priority, provider_still_failing=provider_still_failing,
+            db,
+            priority=priority,
+            provider_still_failing=provider_still_failing,
             current_incident_identity=current_incident_identity,
             incident_owner=incident_owner,
             coverage_for=coverage_for,
@@ -2998,7 +3429,10 @@ async def _open_notify_rows(db) -> list[dict]:
 
 
 async def _promote_demoted_provider_notify(
-    db, *, coverage_for=None, incident_owner=None,
+    db,
+    *,
+    coverage_for=None,
+    incident_owner=None,
 ) -> None:
     """Resolve high-priority notify rows so live mode can rewrite them critical.
 
@@ -3031,8 +3465,11 @@ async def _promote_demoted_provider_notify(
             except Exception:
                 return True  # unknown → the sweep keeps critical, so promote
 
-        demoted = [r["id"] for r in await _open_notify_rows(db)
-                   if r.get("priority") == "high" and _now_critical(r)]
+        demoted = [
+            r["id"]
+            for r in await _open_notify_rows(db)
+            if r.get("priority") == "high" and _now_critical(r)
+        ]
         if demoted:
             from datetime import UTC, datetime
 
@@ -3605,6 +4042,7 @@ class AwarenessLoop:
         Does NOT stop the scheduler — that happens in stop().
         """
         self._stopping = True
+        _cancel_git_deep_task()
 
     @property
     def tick_count(self) -> int:
@@ -3667,6 +4105,8 @@ class AwarenessLoop:
         waiting one full interval.  This keeps status.json fresh from the
         moment the bridge starts, preventing watchdog false-positives.
         """
+        global _git_deep_stopped
+        _git_deep_stopped = False
         self._scheduler.add_job(
             self._on_tick,
             IntervalTrigger(minutes=self._interval),
@@ -3736,6 +4176,7 @@ class AwarenessLoop:
     async def stop(self) -> None:
         """Stop the scheduler, waiting for any running tick to finish."""
         self._stopping = True
+        _cancel_git_deep_task()
         self._scheduler.shutdown(wait=True)
         logger.info("Awareness Loop stopped")
 
@@ -3932,10 +4373,11 @@ class AwarenessLoop:
             # inside). Writes a verdict to the shared mount for the guardian.
             await _check_git_health(self._db)
             # Daily deep fsck (F.1) — content-verifying scan for zeroed-but-present
-            # objects the cheap probe misses. Self-guards to ~daily and runs in a
-            # thread. Loop-driven (not the learning scheduler) so it survives a
-            # router-degraded startup.
-            await _check_git_health_deep(self._db)
+            # objects the cheap probe misses. Self-guards to ~daily; dispatched
+            # OUT-OF-BAND so its fsck (and a failing run's re-check) never holds
+            # the tick lock. Loop-driven (not the learning scheduler) so it
+            # survives a router-degraded startup.
+            _dispatch_git_health_deep(self._db)
             # Daily offline git-bundle publish (F.4) — a verified `git bundle` of
             # the repo to the shared mount, health-gated, so the host guardian can
             # archive an offline re-clone lifeline. Self-guards to ~daily and runs

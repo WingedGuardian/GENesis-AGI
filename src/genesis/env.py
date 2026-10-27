@@ -215,6 +215,16 @@ def falkordb_socket_path() -> Path:
     return genesis_home() / "falkordb" / "falkordb.sock"
 
 
+def vault_socket_path() -> Path:
+    """Unix socket of the payment-card vault service (``~/.genesis/run/payment_vault.sock``).
+
+    genesis-server listens; ``python -m genesis vault`` connects. Its directory
+    is the 0700 boundary (``~/.genesis`` itself is 0755). Composed from
+    ``genesis_home()`` so tests redirect it to a tmp dir.
+    """
+    return genesis_home() / "run" / "payment_vault.sock"
+
+
 def alert_queue_root() -> Path:
     """Durable alert-queue root for the CONTAINER side (``~/.genesis/alerts/queue``).
 
@@ -472,6 +482,23 @@ def db_busy_timeout_ms() -> int:
         return max(100, int(raw))
     except ValueError:
         return BUSY_TIMEOUT_MS
+
+
+def sqlite_slow_ms() -> int:
+    """Threshold (ms) at which a timed SQLite statement is logged as slow
+    (``genesis.db._slow_log``; default 1000).
+
+    Overridable via ``GENESIS_SQLITE_SLOW_MS``; ``0`` or a negative value turns
+    the log off. Missing or non-integer values fall back to the default. It only
+    decides what is LOGGED — it never changes how a statement runs.
+    """
+    raw = os.environ.get("GENESIS_SQLITE_SLOW_MS", "").strip()
+    if not raw:
+        return 1000
+    try:
+        return int(raw)
+    except ValueError:
+        return 1000
 
 
 def recall_rerank_gate_off() -> bool:

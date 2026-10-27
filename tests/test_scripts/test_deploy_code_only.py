@@ -25,6 +25,7 @@ test_venv_matches_pyproject.py.
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import re
 import subprocess
@@ -53,6 +54,12 @@ from tests.test_scripts._deploy_station import run as _run
 from tests.test_scripts._deploy_station import systemctl_shim as _systemctl_shim
 
 pytestmark = pytest.mark.skipif(__import__("sys").platform.startswith("win"), reason="bash-only")
+
+
+def _premerge_backup_root(station) -> Path:
+    roots = list((station["home"] / ".genesis" / "premerge-backups").iterdir())
+    assert len(roots) == 1, roots
+    return roots[0]
 
 
 # ── the happy path ──────────────────────────────────────────────────────────
@@ -180,6 +187,90 @@ def test_a_finished_update_left_behind_does_not_block(station):
     r = _run(station)
     assert r.returncode == 0, r.stderr
     assert "genesis-server pid 2222" in r.stdout, r.stdout
+
+
+def _guard_state(station, content: dict, *, conflict: bool = False) -> str:
+    """Write update_state.json against a rollback tag `pre` at the station's HEAD."""
+    head = _git(station["root"], "rev-parse", "HEAD")
+    _git(station["root"], "tag", "-f", "pre")
+    if content.get("deploy_head") == "HEAD":
+        content = {**content, "deploy_head": head}
+    dot = station["home"] / ".genesis"
+    (dot / "update_state.json").write_text(json.dumps(content))
+    if conflict:
+        (dot / "update_conflicts.json").write_text(json.dumps({"deploy_head": head}))
+    return head
+
+
+def test_a_merge_conflict_waiting_on_its_resolver_is_refused(station):
+    """#3139: the shared rule's conflict verdict, and its remedy."""
+    head = _guard_state(
+        station, {"phase": "merging", "rollback_tag": "pre", "deploy_head": "HEAD"}, conflict=True
+    )
+    _advance_upstream(station)
+    r = _run(station)
+    _assert_untouched(station, head, r)
+    assert "merge conflicts" in r.stderr and "Resolve" in r.stderr
+
+
+def test_merged_code_never_activated_is_refused(station):
+    # The rollback tag is not HEAD: the checkout holds what the run merged.
+    head = _guard_state(station, {"phase": "merging", "rollback_tag": "not-head"})
+    _advance_upstream(station)
+    r = _run(station)
+    _assert_untouched(station, head, r)
+    assert "update.sh --post-merge" in r.stderr and "Dismiss" in r.stderr
+
+
+def test_a_run_that_stopped_before_merging_anything_does_not_block(station):
+    """The shared rule, not "any phase but done": a plain run that left its
+    "fetching" state with nothing merged guards nothing."""
+    _guard_state(
+        station,
+        {"phase": "fetching", "rollback_tag": "pre", "deploy_head": "HEAD", "post_merge": False},
+    )
+    tip = _advance_upstream(station)
+    r = _run(station)
+    assert r.returncode == 0, r.stderr
+    assert _git(station["root"], "rev-parse", "HEAD") == tip
+
+
+@pytest.mark.parametrize("mode", ["deploy", "pull"])
+def test_a_harmless_leftover_is_removed_before_the_pull_moves_head(station, mode):
+    """SF-C: after the pull HEAD is off the leftover's rollback tag, where the
+    same file would read as guarding merged code (update.sh would then exit 5
+    and the card would offer --post-merge)."""
+    _guard_state(
+        station,
+        {"phase": "fetching", "rollback_tag": "pre", "deploy_head": "HEAD", "post_merge": False},
+    )
+    _advance_upstream(station)
+    r = _run(station) if mode == "deploy" else _run(station, "pull")
+    assert r.returncode == 0, r.stderr
+    assert not (station["home"] / ".genesis" / "update_state.json").exists()
+
+
+def test_restart_moves_nothing_and_leaves_a_harmless_leftover(station):
+    state = station["home"] / ".genesis" / "update_state.json"
+    _guard_state(
+        station,
+        {"phase": "fetching", "rollback_tag": "pre", "deploy_head": "HEAD", "post_merge": False},
+    )
+    r = _run(station, "restart")
+    assert r.returncode == 0, r.stderr
+    assert state.exists(), "restart does not move HEAD; the leftover stays harmless"
+
+
+def test_a_post_merge_fetching_state_is_refused(station):
+    """SF1: a --post-merge writes "fetching" over code already merged."""
+    head = _guard_state(
+        station,
+        {"phase": "fetching", "rollback_tag": "pre", "deploy_head": "HEAD", "post_merge": True},
+    )
+    _advance_upstream(station)
+    r = _run(station)
+    _assert_untouched(station, head, r)
+    assert "update.sh --post-merge" in r.stderr
 
 
 def test_a_branch_other_than_main_is_refused(station):
@@ -592,8 +683,8 @@ def test_the_dirty_tree_verdict_matches_update_sh(station, edit, refuses):
 # ── findings from the adversarial audit ─────────────────────────────────────
 def test_an_excused_file_changed_upstream_does_not_block_the_merge(station):
     """AGENTS.md is excused when dirty; if upstream also changes it, the local
-    rewrite is discarded (it regenerates), exactly as update.sh does before its
-    merge. Without that, the merge aborts on it on every run."""
+    rewrite is saved before reset, exactly as update.sh does before its merge.
+    Without the reset, the merge aborts on it on every run."""
     (station["root"] / "AGENTS.md").write_text("rewritten by an indexer\n")
     tip = _advance_upstream(station, "upstream stats", {"AGENTS.md": "new stats\n"})
     r = _run(station)
@@ -602,10 +693,102 @@ def test_an_excused_file_changed_upstream_does_not_block_the_merge(station):
     assert (station["root"] / "AGENTS.md").read_text() == "new stats\n"
 
 
+@pytest.mark.parametrize(
+    "stop_writer", [False, True], ids=["pre-stop-backup", "stop-writer-backup"]
+)
+def test_ephemeral_edit_is_backed_up_before_and_after_the_stop(station, stop_writer):
+    root = station["root"]
+    (root / "AGENTS.md").write_text("install-local stats\n")
+    _advance_upstream(
+        station,
+        "stats and code",
+        {"AGENTS.md": "new stats\n", "src/genesis/_upstream.py": "value = 1\n"},
+    )
+    env = (
+        dict(
+            station["env"],
+            ON_STOP=f'printf "rewritten during stop\\n" > "{root}/AGENTS.md"',
+        )
+        if stop_writer
+        else None
+    )
+    r = _run(station, env=env)
+    assert r.returncode == 0, r.stdout + r.stderr
+    backup_root = _premerge_backup_root(station)
+    assert re.fullmatch(r"\d{8}T\d{6}Z-\d+", backup_root.name)
+    assert (backup_root / "AGENTS.md" / "current").read_text() == "install-local stats\n"
+    assert r.stdout.index("Backed up local edits to AGENTS.md") < r.stdout.index(
+        "Stopping genesis-server"
+    )
+    if stop_writer:
+        assert (backup_root / "late" / "AGENTS.md" / "current").read_text() == (
+            "rewritten during stop\n"
+        )
+
+
+def test_an_edit_made_during_the_stop_is_backed_up_and_reset(station):
+    root = station["root"]
+    tip = _advance_upstream(
+        station,
+        "stats and code",
+        {"AGENTS.md": "new stats\n", "src/genesis/_upstream.py": "value = 2\n"},
+    )
+    env = dict(
+        station["env"],
+        ON_STOP=f'printf "written during stop\\n" > "{root}/AGENTS.md"',
+    )
+
+    r = _run(station, env=env)
+
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (root / "AGENTS.md").read_text() == "new stats\n"
+    assert _git(root, "rev-parse", "HEAD") == tip
+    backup_root = _premerge_backup_root(station)
+    assert (backup_root / "late" / "AGENTS.md" / "current").read_text() == "written during stop\n"
+    assert not (backup_root / "AGENTS.md").exists()
+    assert r.stdout.index("Stopping genesis-server") < r.stdout.index(
+        "Backed up local edits made during the stop to AGENTS.md"
+    )
+    assert not _alerts(station)
+
+
+@pytest.mark.parametrize("case", ["backup-failure", "flagged-edit"])
+def test_pre_stop_backup_and_hidden_edit_failures_refuse_without_alert(station, case):
+    root = station["root"]
+    original = (
+        "install-local stats\n" if case == "backup-failure" else "hidden install-local stats\n"
+    )
+    (root / "AGENTS.md").write_text(original)
+    if case == "flagged-edit":
+        _git(root, "update-index", "--assume-unchanged", "AGENTS.md")
+    _advance_upstream(station, "upstream stats", {"AGENTS.md": "new stats\n"})
+    head = _git(root, "rev-parse", "HEAD")
+    if case == "backup-failure":
+        (station["home"] / ".genesis" / "premerge-backups").write_text("not a directory\n")
+
+    r = _run(station)
+
+    assert r.returncode == 1, (r.stdout, r.stderr)
+    assert (
+        "could not back up local edits to AGENTS.md"
+        if case == "backup-failure"
+        else "hidden by assume-unchanged or skip-worktree"
+    ) in r.stderr
+    assert _git(root, "rev-parse", "HEAD") == head
+    if case == "backup-failure":
+        assert "server NOT stopped" in r.stderr
+    else:
+        assert (root / "AGENTS.md").read_text() == original
+        assert "git update-index --no-assume-unchanged" in r.stderr
+        assert "scripts/update.sh" not in r.stderr
+    assert (
+        not station["calls"].exists() or "stop genesis-server" not in station["calls"].read_text()
+    )
+    assert not _restarted(station)
+    assert not _alerts(station)
+
+
 def _late_collision(station, files: dict[str, str]) -> tuple[str, dict, object]:
-    """Upstream adds config/secrets.local.yaml (ignored here) plus *files*, and an
-    ignored copy of it appears at the stop, after the collision scan: git refuses
-    the merge. Returns HEAD before the run, the env, and the local file."""
     root = station["root"]
     (root / ".git" / "info").mkdir(exist_ok=True)
     (root / ".git" / "info" / "exclude").write_text("secrets.local.yaml\n")
@@ -618,38 +801,76 @@ def _late_collision(station, files: dict[str, str]) -> tuple[str, dict, object]:
     return head, env, local
 
 
-def test_a_refused_merge_names_the_excused_files_it_reset(station):
-    """Devin, #2557: an excused file the range also changes is reset before the
-    fast-forward. When git then refuses the merge (an ignored file that appears
-    after the collision scan), "nothing merged" must not hide that reset: the
-    refusal names it, and pages nobody (the file regenerates, as update.sh treats
-    it)."""
+@pytest.mark.parametrize("staged", [False, True], ids=["worktree", "staged"])
+def test_a_refused_merge_names_the_excused_files_it_reset(station, staged):
     root = station["root"]
-    (root / "AGENTS.md").write_text("rewritten by an indexer\n")
+    if staged:
+        (root / "AGENTS.md").write_text("staged by hand\n")
+        _git(root, "add", "AGENTS.md")
+        (root / "AGENTS.md").write_text("and edited again\n")
+    else:
+        (root / "AGENTS.md").write_text("rewritten by an indexer\n")
     head, env, local = _late_collision(station, {"AGENTS.md": "new stats\n"})
     r = _run(station, env=env)
     assert r.returncode == 1, (r.stdout, r.stderr)
     assert "git refused the fast-forward" in r.stderr and "nothing merged" in r.stderr, r.stderr
-    assert "Reset to HEAD for it" in r.stderr and "AGENTS.md" in r.stderr, r.stderr
-    assert "Resetting AGENTS.md" in r.stdout, "each reset is named as it happens"
+    assert "Local edits saved under" in r.stderr and "AGENTS.md" in r.stderr, r.stderr
+    assert "Resetting AGENTS.md" in r.stdout
+    backup_root = _premerge_backup_root(station)
+    assert (backup_root / "AGENTS.md" / "current").read_text() == (
+        "and edited again\n" if staged else "rewritten by an indexer\n"
+    )
     assert _git(root, "rev-parse", "HEAD") == head
-    assert local.read_text() == "LOCAL\n"
+    if not staged:
+        assert local.read_text() == "LOCAL\n"
     assert not _alerts(station)
 
 
-def test_a_staged_excused_file_and_a_refused_merge_page_nobody(station):
-    """The reset takes a staged edit too; the refusal still names it, and is still
-    a refusal, not a failure to page about."""
+def test_a_failed_reset_alerts_and_is_not_reported(station):
+    import shutil
+
     root = station["root"]
-    (root / "AGENTS.md").write_text("staged by hand\n")
-    _git(root, "add", "AGENTS.md")
-    (root / "AGENTS.md").write_text("and edited again\n")
-    head, env, _ = _late_collision(station, {"AGENTS.md": "new stats\n"})
-    r = _run(station, env=env)
+    (root / "AGENTS.md").write_text("install-local stats\n")
+    _advance_upstream(
+        station,
+        "stats and code",
+        {"AGENTS.md": "new stats\n", "src/genesis/_upstream.py": "value = 3\n"},
+    )
+    head = _git(root, "rev-parse", "HEAD")
+    real_git = shutil.which("git")
+    assert real_git is not None
+    _exec(
+        station["shims"] / "git",
+        "#!/bin/bash\n"
+        'args=("$@")\n'
+        "for ((i = 0; i < ${#args[@]}; i++)); do\n"
+        '  if [[ "${args[i]}" == checkout && "${args[i+1]:-}" == HEAD '
+        '&& "${args[i+2]:-}" == -- && "${args[i+3]:-}" == AGENTS.md ]]; then\n'
+        '    echo "forced reset failure" >&2\n'
+        "    exit 1\n"
+        "  fi\n"
+        "done\n"
+        f'exec "{real_git}" "$@"\n',
+    )
+
+    r = _run(station)
+
     assert r.returncode == 1, (r.stdout, r.stderr)
-    assert "nothing merged" in r.stderr and "AGENTS.md" in r.stderr, r.stderr
+    assert "could not reset AGENTS.md" in r.stderr
     assert _git(root, "rev-parse", "HEAD") == head
-    assert not _alerts(station)
+    assert (root / "AGENTS.md").read_text() == "install-local stats\n"
+    backup_root = _premerge_backup_root(station)
+    assert (backup_root / "AGENTS.md" / "current").read_text() == "install-local stats\n"
+    calls = station["calls"].read_text()
+    assert "stop genesis-server" in calls
+    assert calls.index("start genesis-server") > calls.index("stop genesis-server")
+    assert "restart genesis-server" not in calls
+    alerts = _alerts(station)
+    assert len(alerts) == 1, alerts
+    body = alerts[0].read_text()
+    assert "phase 'merging'" in body
+    assert "started again on that tree" in body
+    assert "Local edits saved under" not in body
 
 
 def test_a_locally_deleted_excused_file_does_not_block_the_merge(station):
@@ -688,7 +909,7 @@ def test_a_run_killed_after_the_resets_names_them_in_the_alert(station):
     alerts = _alerts(station)
     assert len(alerts) == 1, alerts
     body = alerts[0].read_text()
-    assert "Reset to HEAD for the merge" in body and "AGENTS.md" in body, body
+    assert "Local edits saved under" in body and "AGENTS.md" in body, body
 
 
 def test_a_transitional_file_edited_locally_and_upstream_goes_to_update_sh(station):
@@ -803,3 +1024,54 @@ def test_a_path_argument_in_the_unit_is_not_read_as_its_python(station):
     _advance_upstream(station)
     r = _run(station, env={**station["env"], "UNIT_ARGS": "--db-path=/data/x.db"})
     assert r.returncode == 0, r.stderr
+
+
+# ── the extras advisory: warns about missing test/payments packages, never refuses ──
+
+
+def _run_extras_advisory(tmp_path: Path, gate_out: str, gate_rc: int):
+    """Run deploy_code_only.sh's _extras_advisory alone (the script is not a library),
+    with a venv python that answers the gate's --extras call as told."""
+    code = SCRIPT.read_text()
+    start = code.index("_extras_advisory() {")
+    body = code[start : code.index("\n}\n", start) + 3]
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").write_text(
+        f"#!/bin/sh\ncat > /dev/null\nprintf '%s' '{gate_out}'\nexit {gate_rc}\n"
+    )
+    (venv / "bin" / "python").chmod(0o755)
+    script = f'{body}\n_extras_advisory "the working tree" "[project]"; echo "rc=$?"'
+    return subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "VENV_DIR": str(venv), "_SELF_DIR": str(tmp_path)},
+    )
+
+
+def test_the_extras_advisory_warns_and_never_refuses(tmp_path):
+    res = _run_extras_advisory(tmp_path, "missing: pyrage [payments] (required >=1.4)\n", 1)
+    assert "rc=0" in res.stdout
+    assert "WARNING: the venv lacks optional packages" in res.stderr
+    assert "missing: pyrage [payments]" in res.stderr
+    # Plain update.sh stops at "Already up to date" on a current tree.
+    assert "scripts/update.sh --post-merge" in res.stderr
+
+
+@pytest.mark.parametrize(
+    ("gate_out", "gate_rc"),
+    [
+        ("", 0),  # everything installed
+        # A gate that predates --extras reads it as a checkout path (measured on
+        # origin/main's gate): rc 1 with lines that are not package lines.
+        ("genesis-v3 is installed from /x, not --extras\npackage root: /x/src\n", 1),
+        ("extra not declared: [payments]\n", 1),  # not a reinstall problem
+    ],
+    ids=["present", "older-gate", "undeclared-group"],
+)
+def test_the_extras_advisory_is_silent_unless_packages_are_missing(tmp_path, gate_out, gate_rc):
+    res = _run_extras_advisory(tmp_path, gate_out, gate_rc)
+    assert "rc=0" in res.stdout
+    assert res.stderr == ""

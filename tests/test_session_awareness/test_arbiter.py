@@ -20,6 +20,7 @@ from genesis.session_awareness.arbiter import (
     judge_candidates,
     parse_verdict,
 )
+from tests._live_fence import _S
 
 
 def _envelope(result: str) -> str:
@@ -128,7 +129,8 @@ async def test_judge_ok_with_fake_claude(tmp_path):
     fake = _fake_claude(tmp_path, """
         import json, sys
         sys.stdin.read()
-        print(json.dumps({"result": '```json\\n{"picks": [2]}\\n```'}))
+        print(json.dumps({"result": '```json\\n{"picks": [2]}\\n```',
+                          "modelUsage": {"claude-haiku-5-5": {}}}))
     """)
     verdict = await judge_candidates(
         {"ema_turns": 4}, "q", CANDS,
@@ -136,6 +138,7 @@ async def test_judge_ok_with_fake_claude(tmp_path):
     )
     assert verdict == {
         "arbiter": "ok", "picks": [2], "prompt_version": PROMPT_VERSION,
+        "served_model": "claude-haiku-5-5",
     }
 
 
@@ -204,8 +207,10 @@ async def test_timeout_group_kills_children(tmp_path):
 
 
 @pytest.mark.skipif(
-    shutil.which("claude") is None, reason="claude CLI not on PATH",
+    os.environ.get("GENESIS_LIVE_E2E") != "1" or shutil.which("claude", path=_S.orig_path) is None,
+    reason="requires an installed Claude CLI and opt-in with GENESIS_LIVE_E2E=1",
 )
+@pytest.mark.real_tool("claude")
 @pytest.mark.asyncio
 async def test_live_arbiter_e2e():
     """The smoke test through the real module: deterministic pick."""
