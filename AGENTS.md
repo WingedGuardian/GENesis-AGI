@@ -61,7 +61,10 @@ not build it. When you build a rework:
   old PR with a comment that maps every part of it, file by file, to the
   `file:line` in a
   replacement covering it (or says why that part is moot), and leave its labels
-  on. If any part is neither, leave the old PR open and name that part on it.
+  on. Judge each part by the problem it solved, never by whether its code
+  survived: covered means a replacement or `main` delivers that guarantee, moot
+  means the problem itself is gone or the owner dropped it. If any part is
+  neither, leave the old PR open and name that part on it.
   If the spec ends with a `Follow-up: <id>` line, copy that line into the body
   of the replacement that will merge into main LAST. A merge into any other
   base completes it too, so never put it on a PR that merges into another PR.
