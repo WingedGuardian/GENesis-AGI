@@ -2064,14 +2064,10 @@ verified: fbb0b6f19 2026-10-21
   `deploy_candidates drop`. The diagnosis snapshot carries the boot repair's
   `live-move repair:` journal lines and a summary of the newest
   `deploy-backups/*-live-move-repair/REPAIR.json` that is neither dismissed
-  nor superseded (6 h window on its own `ts`), chosen inside the container
-  (one `python3 -I -S -` over stdin, as the configured container user, #3627)
-  so newer ineligible reports cannot hide it; JSON-quoted, capped at 2,000
+  nor superseded (6 h window on its own `ts`), JSON-quoted, capped at 2,000
   characters and fenced as untrusted; empty, and the prompt unchanged, when
   there are none. The container reads are bounded where they are produced
-  (one regular report opened without following a symlink, 4 MiB; a newer one
-  over that cap is shown as "report too large", never skipped for an older
-  one; journal lines cut to 400), and
+  (regular non-symlink reports, 4 MiB each; journal lines cut to 400), and
   Telegram alert fields are cut before escaping. Residual: a container that
   fakes git's own output can still pass the probe.
 - **Merged ≠ deployed**: guardian code reaches the host ONLY via
@@ -4280,9 +4276,17 @@ tool-disabled CC probe without changing its schedule or routing authority.
   with HEAD at the rollback tag, toward the tag, never toward the target (HEAD
   at the target, a rollback killed partway, is refused with exit 1 and nothing
   changed: finishing that rollback is a later PR, D1f): under update.lock and
-  genesis-checkout.lock (a stale `index.lock` no process holds is saved and
-  removed), every path of the two-dot diff, plus a symlink or non-directory
-  parent of one (nothing is read or removed through such a parent), that is not at the tag's bytes is COPIED to
+  genesis-checkout.lock (every git lock a killed switch leaves, `index.lock`,
+  `HEAD.lock`, the branch's ref lock and `packed-refs.lock`, is waited for while
+  a process holds it, then saved into the backup's `git/` and removed by one
+  step, on every path that ends healed; a same-user process whose open files
+  cannot be read counts as a holder only if it is a git or the lock is under
+  30 s old, so a non-git process that cannot be inspected and holds a lock
+  longer than that has it judged stale), every path of the two-dot diff, plus
+  a symlink or non-directory parent of one (nothing is read or removed through
+  such a parent), plus every index entry under one of those (restoring a path
+  drops them; a directory holding a foreign one is foreign too), that is not
+  at the tag's bytes is COPIED to
   `~/.genesis/deploy-backups/<ts>-live-move-repair/` (with `REPAIR.json`,
   fsynced, and the new directory's entries in `deploy-backups` and the
   Genesis home fsynced too; a directory row is copied whole, and a row inside
@@ -4311,18 +4315,14 @@ tool-disabled CC probe without changing its schedule or routing authority.
   gone (its root tree, or any subtree or blob classification reads) is healed
   by the whole tree against HEAD and cleared by a clean-tree
   check. A main row is out of scope (exit 3; 0 at `--boot`). The engine
-  writes its merges with `core.fsync=committed`. The deploy-health collector
-  `collect_live_repairs` reads every `REPAIR.json` into `live_repair_saved:<n>`
-  (until re-applied, judged by the node's kind: a file or symlink by the
-  repair's own `_node`, git mode with the executable bit and blob id; a
-  directory's saved tree, a FIFO's mode, plus the index entries
-  and flags; or `--dismiss`ed; a malformed report is skipped row by
-  row) and `live_repair_unresolved`, worded by the awareness check (never paging), and
-  each repair also queues an alert. `live_repair_unresolved` needs the newest
-  report to say so (or to have no result after an hour) AND the shared guard,
-  run at read time, to call the update state `mixed_tree`: a run killed after
-  its restore and before its result leaves no result, and only the tree says
-  whether it healed (the next run removes a healed state without a new backup).
+  writes its merges with `core.fsync=committed`. Each repair prints its report
+  (re-apply steps included) and queues an alert (critical when anything was
+  not the update's, the index was torn, or it did not heal); `REPAIR.json`
+  and `manifests()` are the contract its readers (deploy health, the
+  awareness check, the guardian's diagnosis) read, and those readers arrive
+  in a follow-up PR: until then the command output and the alert carry the
+  report. A run killed after its restore and before its result leaves no
+  result; the next run removes a healed state without a new backup.
   `--post-merge` on `live` never runs the engine. What is recorded and sent to
   the host guardian is the origin/main commit `live` is built on.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;

@@ -37,6 +37,7 @@ import time
 _LIB = os.path.dirname(os.path.abspath(__file__))
 BOOT_BUDGET_S = 60  # every wait at boot, inside systemd's default 90 s start timeout
 _POLL_S = 1.0
+LOCK_FRESH_S = 30  # see _held_open; under BOOT_BUDGET_S, so a boot just after a kill still heals
 _PROC = "/proc"
 SUFFIX = "-live-move-repair"
 _now, _sleep = time.monotonic, time.sleep  # a test's fake clock replaces both
@@ -202,10 +203,21 @@ def _flock(path: str, deadline: float) -> int | None:
 
 def _held_open(path: str) -> bool:
     """Does a process hold ``path`` open (git holds index.lock open from creation)?
-    A live process of this user whose fds cannot be read may: it counts. Other
-    users' fds are never readable here (MEASURED: /proc/1/fd is EACCES), so a
-    rule counting them would keep every stale lock forever; nor is a zombie's
-    (EACCES too, and it holds nothing)."""
+    Readable fd tables are matched exactly. Other users' fds are never readable
+    here (MEASURED: /proc/1/fd is EACCES), nor is a zombie's (it holds nothing).
+    A live process of this user whose fds cannot be read (non-dumpable: (sd-pam),
+    gpg-agent, tailscaled, MEASURED on a systemd-user install) counts only if it
+    is a git (its comm stays readable) or the lock is younger than LOCK_FRESH_S
+    (a tool may write the index through a library; a real writer holds it for
+    ms to seconds). Residual: a non-dumpable non-git process holding a lock
+    longer than that has it judged stale. A ref lock's fd is closed once its
+    value is written, so a ref transaction in flight is seen only through the
+    same freshness bound; update.lock and genesis-checkout.lock, held here,
+    keep Genesis's own movers out."""
+    try:
+        fresh = time.time() - os.lstat(path).st_mtime < LOCK_FRESH_S
+    except OSError:
+        fresh = False
     for pid in os.listdir(_PROC):
         if not pid.isdigit() or int(pid) == os.getpid():
             continue
@@ -214,7 +226,10 @@ def _held_open(path: str) -> bool:
                 continue
             fds = os.listdir(f"{_PROC}/{pid}/fd")
         except PermissionError:
-            if _pid_alive(int(pid)):
+            comm = ""
+            with contextlib.suppress(OSError), open(f"{_PROC}/{pid}/comm") as fh:
+                comm = fh.read()
+            if (fresh or comm.startswith("git")) and _pid_alive(int(pid)):
                 return True
             continue
         except OSError:
@@ -383,15 +398,13 @@ class Repair:
         if self._hold(os.path.join(common, "genesis-checkout.lock"), deadline) is None:
             self._say("the checkout lock (genesis-checkout.lock) is still held after the wait")
             return 1
-        index_lock = _out(
-            self.repo, "rev-parse", "--path-format=absolute", "--git-path", "index.lock"
-        )
-        while os.path.lexists(index_lock) and _held_open(index_lock):
+        locks = [path for _name, path in self._locks()]  # index.lock first
+        while held := [p for p in locks if os.path.lexists(p) and _held_open(p)]:
             if _now() >= deadline:
-                self._say(f"{index_lock} is still held by a running git after the wait")
+                self._say(f"{held[0]} is still held by a running git after the wait")
                 return 1
             _sleep(_POLL_S)
-        return self._judge_state(index_lock)
+        return self._judge_state(locks[0])
 
     def _judge_state(self, index_lock: str) -> int:
         with open(self.state_path, "rb") as fh:
@@ -402,6 +415,8 @@ class Repair:
         if verdict == self.guard.SAFE and to:
             # A repair killed after it healed, before it cleared. Its report keeps
             # no result; readers judge "unresolved" by the guard, not by it.
+            # A switch killed before it wrote anything leaves only its locks.
+            self._retire_locks(self._backup_dir())
             self._clear(raw)
             return 0
         if verdict != self.guard.MIXED_TREE:
@@ -434,9 +449,9 @@ class Repair:
         if _out(repo, "rev-parse", "--verify", "HEAD^{commit}") != tag:
             raise RepairError("HEAD is not the rollback tag")
         self.fmt = _out(repo, "rev-parse", "--show-object-format")
-        ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + f"-{os.getpid()}"
-        backup = os.path.join(self.backups, ts + SUFFIX)
-        torn = self._keep_index(backup, index_lock)
+        backup = self._backup_dir()
+        ts = os.path.basename(backup)[: -len(SUFFIX)]
+        torn = self._keep_index(backup)
         self.want, self.ephemeral = _tree(repo, tag), _ephemeral()
         index, flags = _index_state(repo)
         rows = None
@@ -449,32 +464,57 @@ class Repair:
         rows = rows if readable else self._rows(None, index, flags)
         manifest = {"ts": ts, "repo": repo, "state_row": state, "tag": tag, "other": to}
         manifest.update(result=None, paths=rows, reapply=[], dismissed_at=None, index_rebuilt=torn)
-        self._save(backup, manifest, index_lock)
+        self._save(backup, manifest)
         self._apply(rows, index)
         _git(repo, "update-index", "-q", "--refresh", check=False)
         return self._after(backup, manifest, state, raw, readable, index_lock)
 
-    def _keep_index(self, backup: str, index_lock: str) -> bool:
-        """Copy .git/index byte for byte, and a stale index.lock, into the backup
-        before anything changes. A torn index (its trailing checksum fails: git
+    def _backup_dir(self) -> str:
+        ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + f"-{os.getpid()}"
+        return os.path.join(self.backups, ts + SUFFIX)
+
+    def _locks(self) -> list[tuple[str, str]]:
+        """(git-path name, absolute path) of each lock a killed switch can leave:
+        index.lock mid-write; HEAD.lock and the branch's ref lock at its ref
+        transaction (MEASURED, git 2.43); packed-refs.lock."""
+        ref = _out(self.repo, "symbolic-ref", "-q", "HEAD", check=False)
+        names = ["index.lock", "HEAD.lock", "packed-refs.lock"] + ([f"{ref}.lock"] if ref else [])
+        where = _out(self.repo, "rev-parse", "--path-format=absolute",
+                     *(a for n in names for a in ("--git-path", n)))  # fmt: skip
+        return list(zip(names, where.split("\n"), strict=True))
+
+    def _retire_locks(self, backup: str) -> None:
+        """The one retire step for every confirmed-stale git lock (no process
+        holds it, by _held_open): copied into the backup's git/, made durable,
+        then removed. Called wherever the repair ends healed, before anything
+        restores (the restore needs index.lock gone)."""
+        stale = [(n, p) for n, p in self._locks() if os.path.lexists(p) and not _held_open(p)]
+        for name, path in stale:
+            os.makedirs(os.path.dirname(os.path.join(backup, "git", name)), exist_ok=True)
+            shutil.copy2(path, os.path.join(backup, "git", name), follow_symlinks=False)
+        if stale:
+            self._sync(backup)
+        for _name, path in stale:
+            os.unlink(path)
+
+    def _keep_index(self, backup: str) -> bool:
+        """Copy .git/index byte for byte into the backup before anything
+        changes (its locks are kept by _retire_locks). A torn index (its trailing checksum fails: git
         reads one without checking it, then cannot write it back) is rebuilt
         from HEAD, the tag; its staged entries cannot be read, so its bytes are
         the record. Returns whether it was rebuilt."""
         index = _out(self.repo, "rev-parse", "--path-format=absolute", "--git-path", "index")
         os.makedirs(os.path.join(backup, "git"))
-        for src in (index, index_lock):
-            if os.path.lexists(src):
-                shutil.copy2(src, os.path.join(backup, "git", os.path.basename(src)))
         if not os.path.lexists(index):
             return False
+        shutil.copy2(index, os.path.join(backup, "git", "index"))
         with open(index, "rb") as fh:
             data = fh.read()
         n = hashlib.new(self.fmt).digest_size
         if data[-n:] in (hashlib.new(self.fmt, data[:-n]).digest(), bytes(n)):  # 0s: skipHash
             return False
         self._sync(backup)
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(index_lock)
+        self._retire_locks(backup)
         _git(self.repo, "read-tree", "HEAD")
         return True
 
@@ -496,7 +536,18 @@ class Repair:
                 full = os.path.join(repo, d)
                 if os.path.islink(full) or (os.path.lexists(full) and not os.path.isdir(full)):
                     paths.add(d)
-        return [r for r in (self._row(p, index, flags) for p in sorted(paths)) if r]
+        # The inventory is the restore's footprint: restoring a row path drops
+        # every index entry under it, so each such entry is a row of its own.
+        paths |= {q for q in index if paths.intersection(_parents(q))}
+        rows = [r for r in (self._row(p, index, flags) for p in sorted(paths)) if r]
+        # A foreign row's disk step needs its directory back (a gitlink's empty
+        # one included): a changed directory row holding one is foreign too.
+        held = {d for r in rows if r["class"] == "foreign" and r["disk_changed"]
+                for d in _parents(r["path"])}  # fmt: skip
+        for r in rows:
+            if r["path"] in held and r["disk"] == "dir" and r["disk_changed"]:
+                r["class"] = "foreign"
+        return rows
 
     def _row(self, p: str, index: dict, flags: dict) -> dict | None:
         """The path's row when anything about it is not the tag's, else None."""
@@ -532,10 +583,10 @@ class Repair:
     def _engine_wrote(self, p: str, node, o) -> bool:
         """The switch's doing: the target's bytes; a path git unlinked before
         writing; an interrupted write (empty, or a prefix of the target's
-        bytes); an ephemeral path; a directory of target files. os.walk lists
-        a directory symlink among the subdirectories (and never follows it), so
-        those are judged with the files."""
-        if node is None or node == o or re.search(self.ephemeral, " " + p):
+        bytes); an ephemeral path (matched whole, as the guard does); a
+        directory of target files. os.walk lists a directory symlink among the
+        subdirectories (and never follows it), so those are judged with the files."""
+        if node is None or node == o or re.fullmatch(f"(?:{self.ephemeral})", " " + p):
             return True
         full = os.path.join(self.repo, p)
         if node[0] == "dir":
@@ -552,7 +603,7 @@ class Repair:
         blob = _git(self.repo, "cat-file", "blob", o[1]).stdout
         return len(have) < len(blob) and blob.startswith(have)
 
-    def _save(self, backup: str, manifest: dict, index_lock: str) -> None:
+    def _save(self, backup: str, manifest: dict) -> None:
         """Copy every node about to change, and make them, the index copies
         _keep_index made and REPAIR.json durable before anything changes: the node (a FIFO,
         socket or device is recorded by type and mode, as it holds no bytes), a
@@ -585,8 +636,7 @@ class Repair:
         manifest["reapply"] = [reapply_step(self.repo, backup, r) for r in foreign]
         self._sync(backup)
         write_json(os.path.join(backup, "REPAIR.json"), manifest)
-        if os.path.lexists(index_lock):
-            os.unlink(index_lock)
+        self._retire_locks(backup)
 
     def _sync(self, backup: str) -> None:
         """Make the backup durable: its files and directories, then its own
@@ -756,7 +806,7 @@ def main(argv: list[str]) -> int:
         return 0
     if not (args.state and args.repo):
         return 2
-    if args.dismiss:  # the collector stops reporting a dismissed repair's saves
+    if args.dismiss:  # REPAIR.json's readers stop reporting a dismissed repair's saves
         home = os.path.dirname(os.path.abspath(args.state))
         path = os.path.join(home, "deploy-backups", args.dismiss + SUFFIX, "REPAIR.json")
         if (manifest := _load(path)) is None:

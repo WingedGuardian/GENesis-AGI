@@ -294,7 +294,8 @@ def assert_healed(w: World, before: dict) -> None:
     row, and every pre-repair node not at the tag's bytes saved byte-equal."""
     assert w.snapshot() == tag_snapshot(), "the checkout is not the tag's tree"
     assert _git(w.root, "status", "--porcelain", "-uall", "--ignored") == ""
-    assert not (w.root / ".git" / "index.lock").exists()
+    for lock in ("index.lock", "HEAD.lock", "refs/heads/live.lock"):
+        assert not (w.root / ".git" / lock).exists(), f"a stale {lock} was left"
     assert not w.state.exists(), "the healed state was not cleared"
     assert w.guard_rc() == 10
     backup = w.backups()[-1]
@@ -449,8 +450,8 @@ def _foreign_fifo_inside_dir(w):
 def test_td3_a_foreign_path_is_saved_healed_and_reported(w, make):
     """T-D3: something the update did not write, on a path the switch writes.
     The repair saves it, heals the tree anyway, lists the path as foreign, and
-    the step it prints puts the node and its index entries back exactly; the
-    deploy-health reader then stops reporting it, whatever the node's kind."""
+    the step it prints puts the node and its index entries back exactly,
+    whatever the node's kind."""
     killed_tag_side(w, "Z3")
     # The edit is made with the killed switch's stale index.lock moved aside
     # (git refuses an index write while it stands), then put back.
@@ -479,8 +480,6 @@ def test_td3_a_foreign_path_is_saved_healed_and_reported(w, make):
     assert {k: v for k, v in after.items() if k.startswith(path + "/")} == sub_before
     assert _git(w.root, "ls-files", "-s", "--", path) == index_before
     assert _git(w.root, "ls-files", "-v", "--", path) == flags_before
-    found = _dh().collect_live_repairs(w.gen)
-    assert found["saved"] == [], "re-applied, still reported"
 
 
 def _lock_aside(w: World, fn):
@@ -581,7 +580,6 @@ def test_r1_a_fifo_or_socket_on_a_move_path_is_recorded(w, monkeypatch, kind):
     if kind == "fifo":
         mode = os.lstat(w.root / "Z5").st_mode
         assert st.S_ISFIFO(mode) and st.S_IMODE(mode) == 0o640
-        assert _dh().collect_live_repairs(w.gen)["saved"] == []
     else:
         assert "socket" in step and not (w.root / "Z5").exists()
 
@@ -651,8 +649,7 @@ def test_r1_a_failure_after_the_checkout_changed_stays_fatal_at_boot(w, mod, mon
 def test_r1_an_interrupted_report_is_not_unresolved_once_healed(w, mod, monkeypatch, window):
     """Codex c4385619777: killed after the restore but before the result was
     written (state still there, or already cleared), the next run clears the
-    healed state without a new backup, and the reader, which asks the guard
-    rather than the report, never calls it unresolved."""
+    healed state without a new backup."""
     killed_tag_side(w, "Z3")
     target = "_after" if window == "before_clear" else "_finish"
 
@@ -669,8 +666,6 @@ def test_r1_an_interrupted_report_is_not_unresolved_once_healed(w, mod, monkeypa
     assert r.returncode == 0, r.stdout + r.stderr
     assert not w.state.exists()
     assert len(w.backups()) == 1, "a new backup was made"
-    later = time.time() + 2 * 3600
-    assert _dh().live_repair_findings(_dh().collect_live_repairs(w.gen, now=later)) == []
 
 
 # ── T-D4: what an interrupted write leaves is the engine's ───────────────────
@@ -838,7 +833,7 @@ def test_td6_an_index_lock_a_git_still_holds_is_waited_for(w, mod, monkeypatch):
 
 
 def test_td6_an_unreadable_fd_list_of_this_user_may_hold_the_lock(mod, tmp_path, monkeypatch):
-    """A live process of this user whose fds cannot be read (EACCES) MAY hold
+    """A live git of this user whose fds cannot be read (EACCES) MAY hold
     the lock: it counts as held. A zombie's fd list is EACCES too, and a zombie
     holds nothing, so it does not count (MEASURED: a zombie's /proc/<pid>/fd is
     EACCES to its own user)."""
@@ -848,6 +843,7 @@ def test_td6_an_unreadable_fd_list_of_this_user_may_hold_the_lock(mod, tmp_path,
     entry = proc / str(os.getppid())  # a live process of this user
     (entry / "fd").mkdir(parents=True)
     (entry / "stat").write_text("1 (git) S 1 1\n")
+    (entry / "comm").write_text("git\n")
     monkeypatch.setattr(mod, "_PROC", str(proc))
     assert mod._held_open("/x/index.lock") is False, "control: a readable, empty fd list"
     (entry / "fd").chmod(0)
@@ -896,50 +892,6 @@ def test_td7_a_repair_killed_partway_converges(w, mod, monkeypatch):
     assert r.returncode == 0, r.stdout + r.stderr
     assert not w.state.exists() and w.snapshot() == tag_snapshot()
     assert json.loads((first / "REPAIR.json").read_text())["result"] == "superseded"
-
-
-def _guardian_pick(home: Path) -> dict | None:
-    """The host guardian's container-side report pick (#3627), run against this HOME."""
-    from genesis.guardian import collector as gc
-
-    out = subprocess.run(
-        [sys.executable, "-I", "-S", "-"],
-        input=gc._REPAIR_PICK,
-        env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
-        capture_output=True,
-        timeout=60,
-    ).stdout
-    return json.loads(out.split(gc._REPAIR_MARK.encode(), 1)[1]) if out else None
-
-
-def test_the_guardian_picks_what_this_writer_left_eligible(w, mod, monkeypatch):
-    """#3627: the guardian's pick reads the fields THIS writer writes. A run
-    killed partway (result unset) is eligible until the next run marks it
-    superseded; the healed report is then the one shown, until --dismiss."""
-    killed_tag_side(w, "Z3")
-    real = mod._git
-
-    def die_at_restore(repo, *args, **kw):
-        if args[:1] == ("restore",):
-            raise Killed
-        return real(repo, *args, **kw)
-
-    monkeypatch.setattr(mod, "_git", die_at_restore)
-    with pytest.raises(Killed):
-        mod.Repair(str(w.state), str(w.root), True, 0).run()
-    killed = _guardian_pick(w.home)
-    assert killed is not None and killed["result"] is None, killed
-    assert w.repair(mode="--boot").returncode == 0
-    healed = _guardian_pick(w.home)
-    assert healed is not None and healed["result"] == "healed", healed
-    d = subprocess.run(
-        ["python3", "-I", "-S", str(MODULE), "--dismiss", healed["ts"], str(w.state), str(w.root)],
-        capture_output=True,
-        text=True,
-        env=w.env(),
-    )
-    assert d.returncode == 0, d.stderr
-    assert _guardian_pick(w.home) is None  # one superseded, one dismissed: nothing to show
 
 
 # ── T-D8: only the guard's SAFE clears ───────────────────────────────────────
@@ -1279,61 +1231,16 @@ def test_r2_a_torn_index_is_kept_and_rebuilt_from_the_tag(w, victim):
     assert "index was torn" in w.report()["result"], w.report()["result"]
 
 
-# ── T-D19: the report's reader ───────────────────────────────────────────────
-
-
-def _dh():
-    return importlib.import_module("genesis.observability.snapshots.deploy_health")
-
-
-def test_td19_the_collector_reports_until_reapplied_or_dismissed(w):
-    dh = _dh()
-    killed_tag_side(w, "Z3")
-    (w.root / "sub" / "s1").write_text("mine\n")
-    assert w.repair().returncode == 0
-    found = dh.collect_live_repairs(w.gen)
-    assert dh.live_repair_findings(found) == ["live_repair_saved:1"], found
-    assert found["saved"] == w.report()["reapply"]
-    subprocess.run(["bash", "-c", found["saved"][0]], check=True, env=w.env())
-    assert dh.live_repair_findings(dh.collect_live_repairs(w.gen)) == [], (
-        "re-applied, still reported"
-    )
-    (w.root / "sub" / "s1").write_text("s1\n")
-    assert dh.live_repair_findings(dh.collect_live_repairs(w.gen)) == ["live_repair_saved:1"]
-    path = w.backups()[-1] / "REPAIR.json"
-    assert (
-        subprocess.run(
-            [
-                "python3",
-                "-I",
-                "-S",
-                str(MODULE),
-                "--dismiss",
-                w.report()["ts"],
-                str(w.state),
-                str(w.root),
-            ],
-            env=w.env(),
-        ).returncode
-        == 0
-    )
-    assert json.loads(path.read_text())["dismissed_at"]
-    assert dh.live_repair_findings(dh.collect_live_repairs(w.gen)) == []
-
-
-def test_r2_a_mode_only_edit_is_not_reapplied_until_its_mode_is_back(w):
-    """Codex c4385987787: the reader compares what the writer compares, the
-    executable bit (the one permission git tracks) as well as the bytes."""
-    dh = _dh()
+def test_r2_a_mode_only_edit_reapplies_its_mode(w):
+    """Codex c4385987787, the writer half: an executable-bit-only edit is
+    foreign, and its re-apply step puts the bit back."""
     killed_tag_side(w, "Z3")  # sub/s1 is still the tag's bytes
     (w.root / "sub" / "s1").chmod(0o755)
     assert w.repair().returncode == 0
     assert not os.access(w.root / "sub" / "s1", os.X_OK)
     [step] = w.report()["reapply"]
-    assert dh.collect_live_repairs(w.gen)["saved"] == [step]
     subprocess.run(["bash", "-c", step], check=True, env=w.env())
     assert os.access(w.root / "sub" / "s1", os.X_OK)
-    assert dh.collect_live_repairs(w.gen)["saved"] == []
 
 
 def _killed_mid_repair(w: World, mod, monkeypatch, where: str) -> None:
@@ -1352,41 +1259,19 @@ def _killed_mid_repair(w: World, mod, monkeypatch, where: str) -> None:
     assert w.report()["result"] is None
 
 
-def test_td19_an_unfinished_repair_is_unresolved_while_the_tree_is_mixed(w, mod, monkeypatch):
-    """The reader derives "unresolved" from the guard at read time: a report
-    that never finished, an hour old, counts only while the shared guard still
-    calls the checkout half-written; a later heal clears it."""
-    dh = _dh()
-    killed_tag_side(w, "Z3")
-    _killed_mid_repair(w, mod, monkeypatch, "at_apply")
-    later = time.time() + 2 * 3600
-    assert dh.live_repair_findings(dh.collect_live_repairs(w.gen, now=time.time())) == []
-    found = dh.collect_live_repairs(w.gen, now=later)
-    assert dh.live_repair_findings(found) == ["live_repair_unresolved"]
-    findings = dh.derive_findings(
-        missing_units=[], tier2_pending=[], host_gateway={}, commits_behind=0, live_repairs=found
-    )
-    assert findings == ["live_repair_unresolved"]
-    assert w.repair().returncode == 0
-    assert dh.live_repair_findings(dh.collect_live_repairs(w.gen, now=later)) == []
-
-
 def _dir_becomes_file(w):
     shutil.rmtree(w.root / "sub")
     (w.root / "sub").write_text("now a file\n")
 
 
-def test_r2_a_repair_killed_after_restoring_a_tag_directory_is_not_unresolved(w, mod, monkeypatch):
+def test_r2_a_repair_killed_after_restoring_a_tag_directory_is_cleared(w, mod, monkeypatch):
     """Audit S2: killed after its restore, on a path that is a directory in the
-    tag, the report keeps no result; the next run clears the healed state and
-    the reader, judging the tree, reports nothing unresolved."""
+    tag, the report keeps no result; the next run clears the healed state."""
     _retarget(w, _dir_becomes_file)
     killed_tag_side(w, "prepared")
     _killed_mid_repair(w, mod, monkeypatch, "after_apply")
     assert w.snapshot() == tag_snapshot() and w.state.exists()
     assert w.repair().returncode == 0 and not w.state.exists()
-    later = time.time() + 2 * 3600
-    assert _dh().collect_live_repairs(w.gen, now=later)["unresolved"] is False
 
 
 # ── T-D20: the remedy text ───────────────────────────────────────────────────
@@ -1590,37 +1475,6 @@ def test_sf2_never_deletes_through_a_symlinked_parent(tmp_path):
     assert w.state.exists()
 
 
-@pytest.mark.parametrize(
-    "paths",
-    [
-        ["oops"],
-        "x",
-        [{"path": ["a"], "class": "foreign"}],
-        [{"path": "p", "class": "foreign"}, 7],
-    ],
-)
-def test_sf3_a_malformed_report_never_blanks_the_snapshot(tmp_path, paths):
-    """SF3: a REPAIR.json of the wrong shape is skipped row by row, never raised
-    (an exception there blanks the whole deploy-health snapshot)."""
-    dh = _dh()
-    d = tmp_path / "deploy-backups" / "20260101T000000Z-1-live-move-repair"
-    d.mkdir(parents=True)
-    report = {"result": "healed", "paths": paths, "reapply": ["step", 5], "repo": ["r"]}
-    (d / "REPAIR.json").write_text(json.dumps(report))
-    found = dh.collect_live_repairs(tmp_path)
-    assert isinstance(found["saved"], list)
-    assert all(isinstance(s, str) for s in found["saved"])
-
-
-def test_sf3_a_non_list_reapply_counts_as_none(tmp_path):
-    dh = _dh()
-    d = tmp_path / "deploy-backups" / "20260101T000000Z-1-live-move-repair"
-    d.mkdir(parents=True)
-    report = {"result": "healed", "paths": [{"path": "p", "class": "foreign"}], "reapply": "s"}
-    (d / "REPAIR.json").write_text(json.dumps(report))
-    assert dh.collect_live_repairs(tmp_path)["saved"] == []
-
-
 def test_sf4_repair_move_explain_works_with_no_kit(w):
     """SF4a: with no kit installed (it arrives in PR D2), --explain still prints
     the by-hand steps, from the checkout's own module (it only prints)."""
@@ -1662,3 +1516,186 @@ def test_low5_the_live_hint_rides_only_the_at_tag_refusal():
     for c in calls:
         if "--post-merge" in c or "a merge is in progress" in c:
             assert not c.endswith(" at-tag"), c
+
+
+# ── Round 4: the inventory is the restore's footprint; one stale-lock rule ───
+
+
+def _staged_desc(w):
+    """Codex c4386510837: a staged P/notes whose worktree bytes differ."""
+    (w.root / "P" / "notes").write_text("STAGED\n")
+    _git(w.root, "add", "--", "P/notes")
+    (w.root / "P" / "notes").write_text("WORKTREE\n")
+    return "P/notes"
+
+
+def _skip_worktree_desc(w):
+    """Skip-worktree P/flagged whose disk file is absent (silent before)."""
+    (w.root / "P" / "flagged").write_text("FLAGGED\n")
+    _git(w.root, "add", "--", "P/flagged")
+    _git(w.root, "update-index", "--skip-worktree", "P/flagged")
+    (w.root / "P" / "flagged").unlink()
+    return "P/flagged"
+
+
+def _deep_desc(w):
+    (w.root / "P" / "x" / "y").mkdir(parents=True)
+    (w.root / "P" / "x" / "y" / "deep").write_text("DEEP\n")
+    _git(w.root, "add", "--", "P/x/y/deep")
+    return "P/x/y/deep"
+
+
+def _gitlink_desc(w):
+    """A gitlink P/sub (an empty directory on disk): silent before."""
+    (w.root / "P" / "sub").mkdir()
+    _git(w.root, "update-index", "--add", "--cacheinfo", f"160000,{w.tag},P/sub")
+    return "P/sub"
+
+
+def _lock_aside_if_any(w: World, fn):
+    lock = w.root / ".git" / "index.lock"
+    return _lock_aside(w, fn) if lock.exists() else fn()
+
+
+@pytest.mark.parametrize("make", [_staged_desc, _skip_worktree_desc, _deep_desc, _gitlink_desc])
+def test_r4_an_index_entry_under_a_row_path_is_its_own_row(w, make):
+    """Restoring P (a file in the tag) drops every index entry under P, so each
+    is a row of its own: classified foreign, its blob saved, and after a
+    `git gc --prune=now` the printed re-apply steps put the entry, its flag and
+    its node back. Invariant: every pre-repair index entry the repair changed
+    has a row."""
+    killed_tag_side(w, "prepared")
+    path = _lock_aside_if_any(w, lambda: make(w))
+    index_before = _git(w.root, "ls-files", "-s", "-z")
+    entry = _git(w.root, "ls-files", "-s", "--", path)
+    flags = _git(w.root, "ls-files", "-v", "--", path)
+    node = w.snapshot().get(path)
+    assert w.repair().returncode == 0
+    rows = {row["path"]: row for row in w.report()["paths"]}
+    after = {r.split("\t", 1)[1]: r for r in _git(w.root, "ls-files", "-s", "-z").split("\0") if r}
+    for rec in (r for r in index_before.split("\0") if r):
+        p = rec.split("\t", 1)[1]
+        if after.get(p) != rec:
+            assert p in rows, f"{p}: its index entry changed and it has no row"
+    assert rows[path]["class"] == "foreign", rows[path]
+    mode, oid = entry.split()[:2]
+    if mode != "160000":
+        assert (w.backups()[-1] / "index-blobs" / oid).is_file(), "the staged blob was not saved"
+    _git(w.root, "-c", "gc.reflogExpire=now", "-c", "gc.reflogExpireUnreachable=now", "gc", "-q",
+         "--prune=now")  # fmt: skip
+    for step in w.report()["reapply"]:
+        r = subprocess.run(["bash", "-c", step], capture_output=True, text=True, env=w.env())
+        assert r.returncode == 0, step + "\n" + r.stderr
+    assert _git(w.root, "ls-files", "-s", "--", path) == entry
+    assert _git(w.root, "ls-files", "-v", "--", path) == flags
+    assert w.snapshot().get(path) == node
+
+
+def test_r4_the_safe_branch_retires_a_stale_index_lock(w):
+    """Codex c4386510848: the tree is already the tag's, a stale index.lock is
+    left: it is saved and removed before the state is cleared, so git works."""
+    w.write_state(w.row())
+    (w.root / ".git" / "index.lock").write_bytes(b"stale")
+    r = w.repair("--wait", "3")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not w.state.exists()
+    assert not (w.root / ".git" / "index.lock").exists(), "the stale lock was left"
+    assert (w.backups()[-1] / "git" / "index.lock").read_bytes() == b"stale"
+    (w.root / "K").write_text("k2\n")
+    _git(w.root, "add", "K")
+
+
+def test_r4_ref_locks_a_killed_transaction_left_are_retired(w):
+    """A switch killed at its reference transaction leaves HEAD.lock and the
+    branch's lock: both are saved and removed, so `live` can move again."""
+    killed_tag_side(w, "prepared")
+    assert (w.root / ".git" / "HEAD.lock").exists(), "control: the kill left HEAD.lock"
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    backup = w.backups()[-1]
+    for lock in ("HEAD.lock", "refs/heads/live.lock"):
+        assert not (w.root / ".git" / lock).exists(), lock
+        assert (backup / "git" / lock).exists(), lock
+    _git(w.root, "update-ref", "refs/heads/live", "HEAD")
+    _git(w.root, "switch", "-q", "-c", "probe")
+
+
+def _fake_proc(tmp_path: Path, comm: str) -> tuple[Path, Path]:
+    """A /proc with one live process of this user, ``comm``, whose fd list
+    cannot be read (non-dumpable)."""
+    entry = tmp_path / "proc" / str(os.getppid())
+    (entry / "fd").mkdir(parents=True)
+    (entry / "stat").write_text(f"1 ({comm}) S 1 1\n")
+    (entry / "comm").write_text(comm + "\n")
+    (entry / "fd").chmod(0)
+    lock = tmp_path / "index.lock"
+    lock.write_bytes(b"")
+    return tmp_path / "proc", lock
+
+
+@pytest.mark.parametrize(
+    ("comm", "age", "held"),
+    [("codex", 0, True), ("codex", 600, False), ("(sd-pam)", 600, False), ("git", 600, True)],
+)
+def test_r4_an_unreadable_process_holds_only_if_git_or_the_lock_is_fresh(
+    mod, tmp_path, monkeypatch, comm, age, held
+):
+    """A same-uid process whose fds cannot be read holds the lock if it is a
+    git, or while the lock is younger than LOCK_FRESH_S (a non-git tool may
+    write the index through a library); an old lock with only non-git
+    unreadable processes around ((sd-pam), gpg-agent) is stale."""
+    if os.geteuid() == 0:
+        pytest.skip("running as root: EACCES cannot be produced")
+    proc, lock = _fake_proc(tmp_path, comm)
+    then = time.time() - age
+    os.utime(lock, (then, then))
+    monkeypatch.setattr(mod, "_PROC", str(proc))
+    try:
+        assert mod._held_open(str(lock)) is held
+    finally:
+        (proc / str(os.getppid()) / "fd").chmod(0o755)
+
+
+def test_r4_ephemeral_paths_match_whole_like_the_guard(tmp_path, monkeypatch):
+    """Codex c4386510850: `notes AGENTS.md` is not the top-level AGENTS.md; a
+    foreign edit there is reported with its re-apply step."""
+    monkeypatch.setitem(TAG_FILES, "notes AGENTS.md", "n1\n")
+    monkeypatch.setitem(TO_FILES, "notes AGENTS.md", "n2\n")
+    w = World(tmp_path)
+    killed_tag_side(w, "prepared")
+    (w.root / "notes AGENTS.md").write_text("FOREIGN EDIT\n")
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    rows = {row["path"]: row for row in w.report()["paths"]}
+    assert rows["notes AGENTS.md"]["class"] == "foreign", rows["notes AGENTS.md"]
+    [step] = w.report()["reapply"]
+    subprocess.run(["bash", "-c", step], check=True, env=w.env())
+    assert (w.root / "notes AGENTS.md").read_text() == "FOREIGN EDIT\n"
+
+
+def test_r4_a_fresh_ref_lock_is_waited_for_never_left_behind(w, mod, tmp_path, monkeypatch):
+    """Outside a PID namespace a fresh lock with a non-dumpable non-git process
+    around counts as held. The repair waits on EVERY lock it retires, not only
+    index.lock: past the budget it exits 1 with the state kept (never cleared
+    with the lock still in place); once the lock is older than LOCK_FRESH_S it
+    is saved and retired and the checkout heals."""
+    if os.geteuid() == 0:
+        pytest.skip("running as root: EACCES cannot be produced")
+    killed_tag_side(w, "prepared")
+    proc, _ = _fake_proc(tmp_path, "codex")
+    monkeypatch.setattr(mod, "_PROC", str(proc))
+    clock = FakeClock()
+    monkeypatch.setattr(mod, "_now", clock.now)
+    monkeypatch.setattr(mod, "_sleep", clock.sleep)
+    head_lock = w.root / ".git" / "HEAD.lock"
+    try:
+        assert mod.Repair(str(w.state), str(w.root), True, 0).run() == 1
+        assert w.state.exists() and head_lock.exists() and w.backups() == []
+        old = time.time() - 2 * mod.LOCK_FRESH_S
+        for lock in (head_lock, w.root / ".git" / "refs" / "heads" / "live.lock"):
+            os.utime(lock, (old, old))
+        assert mod.Repair(str(w.state), str(w.root), True, 0).run() == 0
+    finally:
+        (proc / str(os.getppid()) / "fd").chmod(0o755)
+    assert not w.state.exists() and not head_lock.exists()
+    assert (w.backups()[-1] / "git" / "HEAD.lock").exists()

@@ -28,9 +28,6 @@ This snapshot makes that drift visible:
   the behind-count, tier-2 pending and host drift are measured from the
   commit `live` was built on, never HEAD, so a candidate's own files never
   read as undeployed merges
-- ``live_repairs`` — what the live-move repair (scripts/lib/live_move_repair.py)
-  reported after healing a half-written `live` checkout: paths it saved that
-  were not the update's, an unresolved repair
 
 The awareness tick's ``_check_deploy_staleness`` consumes the same collectors
 to raise a dashboard/morning-report observation. Everything is best-effort:
@@ -41,15 +38,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import importlib.util
 import json
 import logging
 import os
 import re
 import signal
-import stat
 import subprocess
-import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -925,167 +919,6 @@ def live_findings(live: dict | None) -> list[str]:
     return found
 
 
-#: A repair report with no result yet is a repair still running, or one killed
-#: partway; after this long it is the latter.
-REPAIR_UNFINISHED_S = 3600
-
-
-_REPAIR_SCRIPT = Path(__file__).resolve().parents[4] / "scripts" / "lib" / "live_move_repair.py"
-_GUARD_SCRIPT = Path(__file__).resolve().parents[4] / "scripts" / "lib" / "update_state_guard.py"
-
-
-def _script(path: Path):
-    """A script of the tree this module ships in, loaded afresh: the repair's
-    own rules, so this reader judges what the writer judged."""
-    spec = importlib.util.spec_from_file_location(f"_deploy_health_{path.stem}", path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"{path} cannot be loaded")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def collect_live_repairs(genesis_home_dir: Path, now: float | None = None) -> dict:
-    """The live-move repair's REPAIR.json reports (scripts/lib/live_move_repair.py):
-    each saved path that was not the update's, with its re-apply step, until its
-    node is back in the checkout (bytes and executable bit, as the repair judges
-    a node) or the report is dismissed (a newer report's row for a path replaces
-    an older one's); and whether the newest repair is unresolved, or has had no
-    result for REPAIR_UNFINISHED_S (killed partway), while the update state's
-    guard still calls the checkout half-written: a repair killed after its
-    restore leaves no result, and only the tree says whether it healed."""
-    now = time.time() if now is None else now
-    rows: dict[str, str] = {}
-    unresolved, repo = False, None
-    node, loaded = None, False  # the repair's node identity, loaded on first use
-    for d in sorted((genesis_home_dir / "deploy-backups").glob("*-live-move-repair")):
-        try:
-            m = json.loads((d / "REPAIR.json").read_text(encoding="utf-8"))
-            age = now - (d / "REPAIR.json").stat().st_mtime
-        except (OSError, ValueError, RecursionError):
-            continue
-        if not isinstance(m, dict):
-            continue
-        result = m.get("result")
-        unresolved = (result is None and age > REPAIR_UNFINISHED_S) or str(result).startswith(
-            "unresolved"
-        )
-        unresolved = unresolved and not m.get("dismissed_at")
-        # Shapes as the guardian's collector checks them: a report of the wrong
-        # shape is skipped row by row, never raised (that would blank the snapshot).
-        paths, steps = m.get("paths"), m.get("reapply")
-        paths = [r for r in paths if isinstance(r, dict)] if isinstance(paths, list) else []
-        steps = steps if isinstance(steps, list) else []
-        repo = m.get("repo") if isinstance(m.get("repo"), str) else None
-        foreign = [r for r in paths if r.get("class") == "foreign"]
-        for row, step in zip(foreign, steps, strict=False):
-            path = row.get("path")
-            if not isinstance(path, str) or not isinstance(step, str):
-                continue
-            if not loaded and not m.get("dismissed_at"):
-                loaded = True
-                try:
-                    node = _script(_REPAIR_SCRIPT)._node
-                except Exception:  # noqa: BLE001 - unloadable: nothing reads as re-applied
-                    node = None
-            if m.get("dismissed_at") or _reapplied(d, repo, row, node):
-                rows.pop(path, None)
-            else:
-                rows[path] = step
-    return {
-        "saved": list(rows.values()),
-        "unresolved": unresolved and _mixed(genesis_home_dir, repo),
-    }
-
-
-def _mixed(genesis_home_dir: Path, repo: str | None) -> bool:
-    """Does the shared restart guard call the checkout half-written? Doubt
-    (no checkout named, a guard that cannot run) keeps the report's word."""
-    try:
-        guard = _script(_GUARD_SCRIPT)
-        verdict, _ = guard.verdict(str(genesis_home_dir / "update_state.json"), repo)
-    except Exception:  # noqa: BLE001 - any failure to decide keeps "unresolved"
-        return True
-    return verdict == guard.MIXED_TREE
-
-
-def _reapplied(backup: Path, repo: str | None, row: dict, node) -> bool:
-    """Is the row back the way the repair found it? Its node, when the repair
-    changed it (a file's bytes and x bit, a symlink's target, a directory's saved tree, a
-    FIFO's or socket's type, or absent), and always its index entries and flags."""
-    path = row.get("path")
-    if not (repo and isinstance(path, str)):
-        return False
-    try:
-        if row.get("disk_changed") and not _node_back(backup, Path(repo) / path, row, node):
-            return False
-        return _index_back(Path(repo), path, row)
-    except (OSError, TypeError, ValueError, RecursionError):
-        return False
-
-
-def _node_back(backup: Path, here: Path, row: dict, node) -> bool:
-    saved, special = row.get("saved_as"), row.get("special")
-    if row.get("disk") == "absent":
-        return not os.path.lexists(here)
-    if isinstance(saved, str) and saved:
-        return _same_node(backup / saved, here, node)
-    if isinstance(special, dict):
-        st = os.lstat(here)
-        kind = (
-            "fifo" if stat.S_ISFIFO(st.st_mode) else "socket" if stat.S_ISSOCK(st.st_mode) else ""
-        )
-        mode_ok = kind == "socket" or f"{stat.S_IMODE(st.st_mode):04o}" == special.get("mode")
-        return bool(kind) and kind == special.get("type") and mode_ok
-    return False
-
-
-def _same_node(saved: Path, here: Path, node) -> bool:
-    """The saved node against the checkout's, never following a symlink. A file
-    or symlink is compared by the repair's own ``_node``: its git mode (the
-    executable bit is the one permission git tracks) and blob id. A socket in
-    the checkout is ignored: the repair cannot save one."""
-    a, b = os.lstat(saved), os.lstat(here)
-    if stat.S_ISLNK(a.st_mode) or stat.S_ISREG(a.st_mode):
-        ident = [node(str(p.parent), p.name, "sha1") for p in (saved, here)]
-        return ident[0] is not None and ident[0] == ident[1]
-    if stat.S_ISFIFO(a.st_mode):
-        return stat.S_ISFIFO(b.st_mode)
-    if not (stat.S_ISDIR(a.st_mode) and stat.S_ISDIR(b.st_mode)):
-        return False
-    names = sorted(os.listdir(saved))
-    theirs = sorted(n for n in os.listdir(here) if not stat.S_ISSOCK(os.lstat(here / n).st_mode))
-    return names == theirs and all(_same_node(saved / n, here / n, node) for n in names)
-
-
-def _index_back(repo: Path, path: str, row: dict) -> bool:
-    """The path's index entries and flag are the ones the repair recorded."""
-    want, flag = row.get("index"), row.get("flag")
-    if not isinstance(want, list):
-        return False
-    spec = f":(literal){path}"
-    rc, out, _ = _run_git(repo, "ls-files", "-s", "-z", "--", spec, timeout=_CHEAP_TIMEOUT_S)
-    rc2, tags, _ = _run_git(repo, "ls-files", "-v", "-z", "--", spec, timeout=_CHEAP_TIMEOUT_S)
-    if rc != 0 or rc2 != 0:
-        return False
-    have = [
-        meta.split()
-        for meta, _, p in (rec.partition("\t") for rec in out.split("\0") if rec)
-        if p == path  # a directory's pathspec also lists what is under it
-    ]
-    flagged = [r[0] for r in tags.split("\0") if r[2:] == path and (r[0] == "S" or r[0].islower())]
-    return have == want and (flagged[0] if flagged else None) == flag
-
-
-def live_repair_findings(repairs: dict | None) -> list[str]:
-    """The ``live_repair_*`` keys of a :func:`collect_live_repairs` dict."""
-    repairs = repairs or {}
-    found = [f"live_repair_saved:{len(repairs['saved'])}"] if repairs.get("saved") else []
-    if repairs.get("unresolved"):
-        found.append("live_repair_unresolved")
-    return found
-
-
 # Sustained-staleness thresholds (the awareness check's paging axis). A
 # finding-CLASS boundary, so they live here beside derive_findings — the
 # single producer of finding keys — not in the awareness layer: an alert
@@ -1105,7 +938,6 @@ def derive_findings(
     behind_threshold: int = 50,
     main_checkout: dict | None = None,
     live: dict | None = None,
-    live_repairs: dict | None = None,
 ) -> list[str]:
     """Stable, order-deterministic finding keys — the alert/dedup contract.
 
@@ -1121,8 +953,7 @@ def derive_findings(
     ``main_checkout_unreadable`` when that could not be read: never nothing, so
     an unreadable tree cannot clear a standing dirty finding. ``clean``,
     ``not_deploy_root`` and ``deploying`` add nothing. ``live``
-    (:func:`collect_live`) adds the ``live_*`` keys of :func:`live_findings`, and
-    ``live_repairs`` (:func:`collect_live_repairs`) the ``live_repair_*`` keys."""
+    (:func:`collect_live`) adds the ``live_*`` keys of :func:`live_findings`."""
     findings: list[str] = []
     if missing_units:
         findings.append("missing_units:" + ",".join(sorted(missing_units)))
@@ -1143,7 +974,6 @@ def derive_findings(
         findings.append(f"behind_upstream:{commits_behind}")
     findings.extend(main_checkout_findings(main_checkout))
     findings.extend(live_findings(live))
-    findings.extend(live_repair_findings(live_repairs))
     return findings
 
 
@@ -1190,7 +1020,6 @@ def _collect_sync(repo: Path, genesis_home_dir: Path) -> dict:
         "main_checkout": main_checkout,
         "live": live,
         "upto": upto,
-        "live_repairs": collect_live_repairs(genesis_home_dir),
     }
 
 
@@ -1213,7 +1042,6 @@ async def deploy_health(db: aiosqlite.Connection | None) -> dict:
             update_age_days=update.get("age_days"),
             main_checkout=collected["main_checkout"],
             live=collected["live"],
-            live_repairs=collected["live_repairs"],
         )
         return {
             "status": "attention" if findings else "healthy",
@@ -1225,7 +1053,6 @@ async def deploy_health(db: aiosqlite.Connection | None) -> dict:
             "host_gateway": collected["host_gateway"],
             "main_checkout": collected["main_checkout"],
             "live": collected["live"],
-            "live_repairs": collected["live_repairs"],
         }
     except Exception:
         logger.error("deploy_health snapshot failed", exc_info=True)

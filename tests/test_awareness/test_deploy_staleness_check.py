@@ -894,23 +894,3 @@ async def test_the_unbound_class_has_its_own_wording(db, monkeypatch):
     await loop._check_deploy_staleness(db)
     [row] = await _rows(db)
     assert "no deploy manifest of this repository binds it" in row["content"]
-
-
-async def test_td19_a_live_repair_report_raises_its_own_wording_then_resolves(db, monkeypatch):
-    """T-D19 (#3492 PR D1): the live-move repair's report becomes the deploy
-    observation with the exact re-apply step, no update.sh advice, high (never
-    critical); a later tick without it resolves the observation."""
-    step = "rm -rf -- /x/sub/s1 && cp -a -- /b/tree/sub/s1 /x/sub/s1"
-    snap = _snap(["live_repair_saved:1", "live_repair_unresolved"])
-    snap["live_repairs"] = {"saved": [step], "unresolved": True}
-    _patch_snapshot(monkeypatch, snap)
-    await loop._check_deploy_staleness(db)
-    rows = await _rows(db)
-    assert len(rows) == 1 and rows[0]["priority"] == "high", rows
-    content = rows[0]["content"]
-    assert step in content and "repair-move --dismiss" in content, content
-    assert "did not finish" in content and "update.sh" not in content, content
-    _patch_snapshot(monkeypatch, _snap([]))
-    await loop._check_deploy_staleness(db)
-    assert await _rows(db) == []
-    assert len(await _rows(db, resolved=1)) == 1
