@@ -21,6 +21,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
 import sqlite3
 import subprocess
 import sys
@@ -378,6 +379,13 @@ class TestAuditFindings:
 
     def test_grep_glob_alone_is_gated(self, fake_home: Path) -> None:
         assert self._touches(paths=[str(fake_home / "genesis" / "secrets*")])
+
+    def test_nested_unreadable_receiver_is_unknown(self) -> None:
+        spec = importlib.util.spec_from_file_location("st", _HOOKS / "secrets_target.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        command = "bash -c " + shlex.quote("echo ok # don't\ncat $SECRET_PATH")
+        assert mod._heredoc_feeds_an_executor(command)
 
     # ── a NAME must never outrank the INODE ─────────────────────────────────
     def test_a_dot_example_name_pointing_at_the_real_file_is_gated(self, fake_home: Path) -> None:

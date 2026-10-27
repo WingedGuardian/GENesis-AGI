@@ -1013,6 +1013,19 @@ async def _submits_pay_form(ppage, args: cf.CardArgs, frame, handle) -> bool:
         return True
 
 
+# A page's shape when a step finds no match, for the server log: numbers and the
+# load state only, never page text (the window cannot otherwise be seen).
+_PAGE_SHAPE_JS = (
+    "() => [innerWidth, innerHeight, document.querySelectorAll('button').length,"
+    " document.readyState]"
+)
+
+
+def _how_many(count: int) -> str:
+    """A refusal's match count, as words (no selector or page text in a code)."""
+    return "none" if count == 0 else "several"
+
+
 async def _steps(ppage, args: cf.CardArgs) -> tuple[list[str], list]:
     """Click each step in order, in the payment window, before the form is read
     and before the tap: no card value exists yet, and a step is a click, never
@@ -1024,22 +1037,28 @@ async def _steps(ppage, args: cf.CardArgs) -> tuple[list[str], list]:
     page script that ticks one later. Returns (what each step clicked, the
     snapshots)."""
     labels, snapshots = [], []
-    for frames, sel in args.steps:
+    for n, (frames, sel) in enumerate(args.steps, 1):
         frame = await _walk(ppage.main_frame, frames, wait=True)
         if frame is None or (frames and not cf.secure_origin(cf.origin_of(frame.url))):
-            raise _Stop("step_not_found")
-        loc = frame.locator(sel)
+            raise _Stop(f"step_not_found:{n}:frame")
+        # Only a shown element can be clicked: a page that keeps a hidden copy
+        # of a control (another layout's header, say) still has one to click.
+        loc = frame.locator(sel).filter(visible=True)
         with contextlib.suppress(Exception):
             await asyncio.wait_for(
-                loc.first.wait_for(state="attached", timeout=STEP_WAIT_S * 1000),
+                loc.first.wait_for(state="visible", timeout=STEP_WAIT_S * 1000),
                 STEP_WAIT_S + 5,
             )
-        if await _step(loc.count()) != 1:
-            raise _Stop("step_not_found")
+        if (count := await _step(loc.count())) != 1:
+            shape = None
+            with contextlib.suppress(Exception):
+                shape = await _step(frame.evaluate(_PAGE_SHAPE_JS))
+            logger.warning("payment step %d matched %d (page %s)", n, count, shape)
+            raise _Stop(f"step_not_found:{n}:{_how_many(count)}")
         handle = await _step(loc.element_handle(timeout=5000))
         try:
             if not await _owned_by(handle, frame):
-                raise _Stop("step_not_found")
+                raise _Stop(f"step_not_found:{n}:owner")
             # A checkbox is a consent: only `consent` ticks one, after the tap. A
             # target that ticks a box (itself, its label's control, a role=checkbox
             # ancestor) is refused up front; the box snapshots around the click
@@ -1078,13 +1097,13 @@ async def _consents(
     trial tick, which changes nothing)."""
     out, frames_seen = [], []
     card_frames = {id(f.frame) for f in fields.values()}
-    for frames, sel in args.consent:
+    for n, (frames, sel) in enumerate(args.consent, 1):
         frame = await _walk(ppage.main_frame, frames)
         if frame is None or (frame is not ppage.main_frame and id(frame) not in card_frames):
-            raise _Stop("consent_not_found")
+            raise _Stop(f"consent_not_found:{n}:frame")
         loc = frame.locator(sel)
-        if await _step(loc.count()) != 1:
-            raise _Stop("consent_not_found")
+        if (count := await _step(loc.count())) != 1:
+            raise _Stop(f"consent_not_found:{n}:{_how_many(count)}")
         handle = await _step(loc.element_handle(timeout=5000))
         if not await _owned_by(handle, frame):
             raise _Stop("consent_not_found")
@@ -1186,16 +1205,16 @@ async def _extras(
     seen: list = []
     card_frames = {id(f.frame) for f in fields.values()}
     chosen = [(n, v) for n, v in args.extra.items() if names is None or n in names]
-    for _name, ((frames, sel), value) in chosen:
+    for name, ((frames, sel), value) in chosen:
         frame = await _walk(ppage.main_frame, frames, wait=fill)
         if frame is None:
-            raise _Stop("extra_field_not_found")
+            raise _Stop(f"extra_field_not_found:{name}:frame")
         if frame is not ppage.main_frame and id(frame) not in card_frames:
             raise _Stop("extra_field_origin")
         loc = frame.locator(sel)
         await _attached(loc, fill)
-        if await _step(loc.count()) != 1:
-            raise _Stop("extra_field_not_found")
+        if (count := await _step(loc.count())) != 1:
+            raise _Stop(f"extra_field_not_found:{name}:{_how_many(count)}")
         handle = await _step(loc.element_handle(timeout=5000))
         if not await _owned_by(handle, frame):
             raise _Stop("extra_field_not_found")

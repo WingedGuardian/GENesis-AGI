@@ -14784,12 +14784,14 @@ def _run_merge_and_push_gates() -> int:
             # their sharper diagnostics. Bounds keep main's immediate refusal.
             blind_spot_deny = (
                 f"BLOCKED: this command {blind.cause} and mentions a gated "
-                "operation, so the guard cannot verify what it would actually run.\n"
+                "operation; a Git or GitHub operation may run, and the guard "
+                "cannot establish which one.\n"
                 f"To proceed: {blind.hint}. If you are WRITING TEXT (a commit "
                 "message, a plan, review notes) whose content merely mentions "
                 "push or merge, use the Write tool instead of a here-doc. If "
-                "you are RUNNING a git command, rewrite it in a "
-                "directly-parseable form (plain quotes, or -F <file>)."
+                "you are RUNNING a git command, split unreadable compounds or "
+                "rewrite it in a directly-parseable form (plain quotes, or "
+                "-F <file>)."
             )
             if blind.bounds_induced:
                 print(blind_spot_deny, file=sys.stderr)

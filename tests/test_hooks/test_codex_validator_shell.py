@@ -59,6 +59,14 @@ def test_exact_carrier_and_read_only_probe(modules, files):
     assert request.read_bytes() == original
 
 
+def test_nested_unreadable_exact_invocation_is_rejected(modules, files):
+    shell, _ = modules
+    workspace, _, runtime, command = files
+    nested = "bash -c " + shlex.quote("echo ok # don't\n" + command)
+    with pytest.raises(ValueError):
+        shell.check_command(nested, workspace, runtime)
+
+
 @pytest.mark.parametrize("change", [
     lambda c: c + "\n", lambda c: c + " # comment", lambda c: " " + c,
     lambda c: "env " + c, lambda c: "timeout 3 " + c,
