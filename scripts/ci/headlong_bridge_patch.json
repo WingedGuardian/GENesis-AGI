@@ -1,0 +1,6 @@
+{
+  "before": "    shellm --model \"$run_model\" --traj \"$TRAJ_ID\" --context-scope run \\\n    \"${shellm_flags[@]}\" \\\n    --prompt-file \"$prompt_file_tmp\"",
+  "after": "    HEADLONG_REFERENCE_TRIGGER=\"$trigger_step_id\" HEADLONG_NATIVE_PROMPT_STATUS=\"$native_prompt_status\" \\\n    /fixture/headlong_native_bridge.py --model \"$run_model\" --traj \"$TRAJ_ID\" --workdir \"$run_dir\" \\\n    --prompt-file \"$prompt_file_tmp\"",
+  "prompt_before": "prompt_redact \"$route_prompt\" > \"$prompt_file_tmp\"",
+  "prompt_after": "native_prompt_status=0\n HEADLONG_REFERENCE_TRIGGER=\"$trigger_step_id\" prompt_redact \"$route_prompt\" > \"$prompt_file_tmp\" 2>/dev/null || native_prompt_status=$?\nif [[ \"$native_prompt_status\" != 0 ]]; then : > \"$prompt_file_tmp\"; fi"
+}

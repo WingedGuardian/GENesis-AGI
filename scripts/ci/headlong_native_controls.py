@@ -8,6 +8,7 @@ import json
 import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 
 import aiosqlite
 from headlong_controls import dependency_inventory, preflight, tree_hash
@@ -18,6 +19,42 @@ from genesis.db.schema import TABLES
 
 KINDS = ("echo", "approved", "pending", "rejected", "revoked", "develop", "duplicate", "foreign", "legacy", "unknown", "provider_error")
 EFFECT = b"native-fixture-effect\n"
+
+
+@dataclasses.dataclass(frozen=True)
+class EffectHooks:
+    receipt_file: Path | None = None
+    on_effect: Any = None
+
+    def record(self, call):
+        if self.receipt_file is None:
+            return
+        try:
+            with self.receipt_file.open("a") as stream:
+                line = json.dumps(call) + "\n"
+                if stream.write(line) != len(line):
+                    raise OSError("short receipt write")
+        except Exception as exc:
+            call.update(outcome="error", error=f"{type(exc).__name__}: {exc}")
+            raise
+
+
+@dataclasses.dataclass
+class NativeFixture:
+    root: Path
+    kind: str
+    port: Any
+    backend: Any
+    cli: Path
+    prompt: str | None = None
+    model: str = "sonnet"
+    cwd: Path | None = None
+
+
+@dataclasses.dataclass
+class NativeTrace:
+    messages: list = dataclasses.field(default_factory=list)
+    stderr: list = dataclasses.field(default_factory=list)
 
 
 def write_effect(root):
@@ -40,8 +77,9 @@ async def prepare_case(db, kind):
 
 
 class EffectPort:
-    def __init__(self, db, root, inject_error=False):
+    def __init__(self, db, root, inject_error=False, hooks=None):
         self.db, self.root, self.inject_error = db, root, inject_error
+        self.hooks = hooks or EffectHooks()
         self.calls = []
 
     async def call(self, arguments):
@@ -63,12 +101,16 @@ class EffectPort:
                 call["outcome"] = "refused"
                 if call["claim"]:
                     write_effect(self.root)
+                    if self.hooks.on_effect:
+                        self.hooks.on_effect()
                     call["outcome"] = "executed"
             return {"content": [{"type": "text", "text": json.dumps({"claimed": call["claim"], "outcome": call["outcome"]})}],
                     "is_error": call["outcome"] != "executed"}
         except Exception as exc:
             call.update(outcome="error", error=f"{type(exc).__name__}: {exc}")
             raise
+        finally:
+            self.hooks.record(call)
 
 
 async def observe(root, port, native, backend):
@@ -109,7 +151,7 @@ def qualify(kind, evidence):
     return "pass" if sorted(map(json.dumps, calls)) == sorted(map(json.dumps, expected)) else "fail"
 
 
-async def native_turn(root, kind, port, backend, cli, messages, stderr):
+async def native_turn(fixture, trace):
     # Import lazily: host-safe tests never execute or initialize the native CLI.
     from claude_agent_sdk import (
         ClaudeAgentOptions,
@@ -121,20 +163,21 @@ async def native_turn(root, kind, port, backend, cli, messages, stderr):
 
     @tool("claim_effect", "Claim a proposal and perform the fixed synthetic effect", {"proposal_id": str})
     async def claim_effect(arguments):
-        return await port.call(arguments)
+        return await fixture.port.call(arguments)
 
     result = None
-    home = root / "home"
+    messages, stderr = trace.messages, trace.stderr
+    home = fixture.root / "home"
     home.mkdir()
-    options = ClaudeAgentOptions(cli_path=str(cli), cwd=str(root), tools=[],
+    options = ClaudeAgentOptions(cli_path=str(fixture.cli), cwd=str(fixture.cwd or fixture.root), tools=[], verbatim_prompts=True,
         system_prompt={"type": "preset", "preset": "claude_code"}, setting_sources=[], strict_mcp_config=True,
         mcp_servers={"fixture": create_sdk_mcp_server(name="fixture", tools=[claim_effect])},
-        permission_mode="dontAsk", allowed_tools=[TOOL], model="sonnet", max_turns=4, stderr=stderr.append,
+        permission_mode="dontAsk", allowed_tools=[TOOL], model=fixture.model, max_turns=4, stderr=stderr.append,
         env={"HOME": str(home), "CLAUDE_CONFIG_DIR": str(home / "config"), "ANTHROPIC_API_KEY": "dummy-offline-fixture",
-             "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{backend.server.server_port}",
+             "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{fixture.backend.server.server_port}",
              "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"})
     async with ClaudeSDKClient(options=options) as client:
-        await client.query(f"fixture-native-{kind}: synthetic offline qualification")
+        await client.query(fixture.prompt if fixture.prompt is not None else f"fixture-native-{fixture.kind}: synthetic offline qualification")
         async for message in client.receive_response():
             messages.append({"type": type(message).__name__, "data": dataclasses.asdict(message)})
             if isinstance(message, ResultMessage):
@@ -151,10 +194,11 @@ async def run_case(root, kind, cli):
         await prepare_case(db, kind)
         port = EffectPort(db, root, inject_error=kind == "handler_error")
         result, messages, stderr, error = None, [], [], None
+        trace = NativeTrace(messages, stderr)
         with Backend(kind, port) as backend:
             try:
                 async with asyncio.timeout(40):
-                    result, messages, stderr = await native_turn(root, kind, port, backend, cli, messages, stderr)
+                    result, messages, stderr = await native_turn(NativeFixture(root, kind, port, backend, cli), trace)
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
         evidence = await observe(root, port, result, backend.evidence)
