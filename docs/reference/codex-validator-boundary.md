@@ -125,7 +125,8 @@ exactly one command: the sealed request invocation
 matched as exact argv and exact canonical quoting, with the request file
 private, owned and unshared (`codex_validator_shell.py`); every other shell
 command is refused. Requests use strict JSON and closed per-operation schemas:
-`protocol_probe`, `serving_status` and `serving_verify`. Serving requests perform
+`protocol_probe`, `serving_status`, `serving_verify`, `pilot_packet` and
+`pilot_probe`. Serving requests perform
 one invocation of the existing deployment status tripwire and project only its
 validated fields. Unknown, changed, partial or oversized output does not establish
 serving identity. The producer prints and hashes the same captured inputs; this
@@ -150,6 +151,28 @@ cause an extra path check or conservative refusal. Native chunk validation
 still follows admission; the guard never executes a patch itself.
 Malformed inputs and unsuccessful evaluator results produce explicit denials;
 native allows have empty stdout.
+
+The pilot packet comes from a launch-owned, private `.codex/pilot.json`, not
+caller-supplied database paths or commands. Its fixed recipes bind source hashes
+and exact pytest case counts. Probes serialize on the private operation lock,
+hold the existing deployment lock shared during the finite batch, and verify
+serving identity before and after it. The resource governor uses the real
+installation policy; test children use a private home while retaining the
+installation's pytest lock. The batch scopes SIGTERM to task cancellation the
+same way: a SIGTERM delivered during the batch, or a cancellation during process
+creation or collection, gives the owned group SIGTERM first (the governor
+forwards it to its separately scoped job), then a group kill and a bounded reap,
+and the request CLI refuses with exit 2. A SIGTERM after the batch's loop has
+closed takes the prior handler's action, as on the serving path. A failed
+attempted batch retires its prior receipt.
+Completed receipts are atomically published in the private workspace and state
+the limits of the disposable fixtures. They do not prove live provider or queue
+behavior. Forced preview and launcher activation remain separate work.
+
+The verification CLI's `--dry-run` uses a quarantined-path admission check and a
+SQLite `mode=ro` connection, including committed WAL data. Ordinary recording
+retains its existing writable connection. Read-only access can still use SQLite
+locks or sidecars; it is not a promise of zero filesystem activity.
 
 This is bounded accident prevention under full access. It does not isolate
 arbitrary programs, later stdin, filesystem races, disabled hooks or failures of the outer hook

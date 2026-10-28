@@ -73,6 +73,11 @@ it at that worktree's ``data/genesis.db``, which does not exist — the tool the
 correctly reports "no database" while the real ledger sits in the main checkout.
 Run it from the main checkout, or pass ``--db-path``.
 
+PREVIEW. ``--dry-run`` reads through a read-only URI, including committed WAL
+rows, without opening a writer that could checkpoint the ledger. SQLite may
+still coordinate shared-memory sidecars and locks. Real recording uses the
+existing guarded writer and the same decision policy.
+
 THE ROW KEY. The document names its row — ``repo`` and ``pr`` — and ``--pr`` must
 match it. That second copy is deliberate: a closed row cannot be amended through
 this tool, so a typo INSIDE the document (``"pr": 2257`` in a document about #2273)
@@ -106,6 +111,7 @@ import asyncio
 import json
 import sqlite3
 import sys
+from contextlib import asynccontextmanager
 from datetime import UTC
 from pathlib import Path
 
@@ -138,6 +144,26 @@ __all__ = [
     "resolve_repo",
     "validate_evidence",
 ]
+
+
+@asynccontextmanager
+async def _ledger_connection(path: Path, *, dry_run: bool):
+    """Preview committed WAL rows without opening a checkpoint-capable writer."""
+    import aiosqlite
+
+    from genesis.db.admission import assert_admitted
+    from genesis.db.connection import connect_aiosqlite_rw
+
+    if not dry_run:
+        async with connect_aiosqlite_rw(path, timeout=10) as db:
+            yield db
+        return
+
+    assert_admitted(path)
+    async with aiosqlite.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=10) as db:
+        # The context also closes the handle if this recheck raises.
+        assert_admitted(path)
+        yield db
 
 
 def validate_evidence(doc: object) -> EvidenceDocument:
@@ -230,21 +256,13 @@ async def _write(
         )
         return 1
 
-    # The admission seam every real connection path in this repo uses, NOT the
-    # advisory predicate: admission.py says that one is for callers where
-    # continuing would not open the database, and this one opens it read-write to
-    # mutate a permanent ledger. It raises in TWO places — synchronously at
-    # construction and again inside the post-open re-check — so the try must cover
-    # the context manager, not just the call.
-    from genesis.db.connection import connect_aiosqlite_rw
-
     pr_number = doc.pr
     # Set the moment a writer COMMITS. Anything that fails after that (the success
     # print, the connection's close) must not be reported as "nothing recorded" —
     # a retry would then meet a closed row and a message that contradicts it.
     committed: str | None = None
     try:
-        async with connect_aiosqlite_rw(resolved, timeout=10) as db:
+        async with _ledger_connection(resolved, dry_run=dry_run) as db:
             await db.execute("PRAGMA busy_timeout=5000")
             db.row_factory = aiosqlite.Row
 

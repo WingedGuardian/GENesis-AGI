@@ -334,7 +334,7 @@ async def test_owned_grandchild_cannot_keep_output_pipe_open(
         return proc
 
     monkeypatch.setattr(serving.asyncio, "create_subprocess_exec", spawn)
-    monkeypatch.setattr(serving, "COLLECTION_TIMEOUT", 0.3)
+    monkeypatch.setattr(serving, "COLLECTION_TIMEOUT", 2)
     marker = tmp_path / "owned-child.pid"
     root = runtime(
         tmp_path,

@@ -1,0 +1,1 @@
+- The inactive validator boundary now supports private, source-bound pilot packets and fixed fixture probes with serving checks and completed receipts (a SIGTERM delivered during a probe batch stops the probe's process group, and the request refuses with exit 2); launcher activation and verification preview wiring remain separate work.
