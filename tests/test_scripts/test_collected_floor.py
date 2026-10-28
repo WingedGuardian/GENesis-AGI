@@ -15,12 +15,10 @@ import os
 import select
 import subprocess
 import sys
-import types
 from pathlib import Path
 
 import pytest
 import yaml
-from _pytest.fixtures import FixtureManager
 
 REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / "scripts" / "ci" / "collected_floor.py"
@@ -454,11 +452,15 @@ class TestStructuralMoves:
         elif case == "class_header":
             source = source.replace("class TestA:", "class TestA(object):")
         elif case == "param_id":
-            # Same AST and parameter values, but a collection hook changes one node ID.
+            # Same AST and parameter values, but a conftest hook changes one node ID
+            # (test_param[1] -> test_param[renamed]). Use pytest's public id hook:
+            # assigning the private item._nodeid stopped renaming anything in
+            # pytest 9.2, where Node.nodeid reads a different private field.
             (project / "conftest.py").write_text(
-                "def pytest_collection_modifyitems(items):\n"
-                "    for item in items:\n"
-                "        item._nodeid = item.nodeid.replace('[1]', '[renamed]')\n"
+                "def pytest_make_parametrize_id(config, val, argname):\n"
+                "    if argname == 'x' and type(val) is int and val == 1:\n"
+                "        return 'renamed'\n"
+                "    return None\n"
             )
         old.unlink()
         if case == "duplicate_survivor":
@@ -654,31 +656,48 @@ class TestStructuralMoves:
         path.write_text("def not_valid(:")
         assert definitions(path) == {}
         assert definitions(tmp_path / "missing.py") == {}
-        # Compile the real function at this path, then use ordinary pytest Function items.
-        path.write_text("def test_param(x): pass\n")
-        module_code = compile(path.read_text(), str(path), "exec")
-        function_code = next(
-            constant for constant in module_code.co_consts if isinstance(constant, types.CodeType)
+        # Collect real parametrized items in-process through pytest's public entry
+        # point. Hand-built Function items stopped carrying "[param]" in their node
+        # ID in pytest 9.2 (it comes only from a real callspec there), which would
+        # silently skip the parametrized-suffix branch of _move_key.
+        path.write_text(
+            "import pytest\n"
+            "@pytest.mark.parametrize('x', [1, '2001:db8::1'])\n"
+            "def test_param(x): pass\n"
         )
-        callobj = types.FunctionType(function_code, {})
-        config = pytest.Config.fromdictargs({}, ["--rootdir", str(tmp_path)])
-        session = pytest.Session.from_config(config)
-        session._fixturemanager = FixtureManager(session)
-        module = pytest.Module.from_parent(session, path=path)
+        (tmp_path / "pytest.ini").write_text("[pytest]\n")
+        items = []
+
+        class Capture:
+            @staticmethod
+            def pytest_collection_finish(session):
+                items.extend(session.items)
+
+        monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+        monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)  # The inner run takes no outer options.
+        modules_before = set(sys.modules)
+        try:
+            code = pytest.main(
+                ["--collect-only", "-q", "-p", "no:cacheprovider", "--import-mode=importlib",
+                 "--rootdir", str(tmp_path), "-c", str(tmp_path / "pytest.ini"), str(path)],
+                plugins=[Capture()],
+            )
+        finally:
+            for name in set(sys.modules) - modules_before:
+                if getattr(sys.modules[name], "__file__", None) == str(path):
+                    del sys.modules[name]
+        assert code == pytest.ExitCode.OK
+        assert [item.nodeid for item in items] == [
+            "test_cases.py::test_param[1]",
+            "test_cases.py::test_param[2001:db8::1]",
+        ]
         cache = {}
         calls = []
         original = definitions
         monkeypatch.setattr(plugin, "_definitions", lambda p: (calls.append(p), original(p))[1])
-        for parameter in ["1", "2001:db8::1"]:
-            item = pytest.Function.from_parent(
-                module,
-                name=f"test_param[{parameter}]",
-                callobj=callobj,
-                originalname="test_param",
-            )
-            item._nodeid = f"test_cases.py::test_param[{parameter}]"
-            item._location = ("test_cases.py", 0, "test_param")
-            assert plugin._move_key(item, tmp_path, "test_cases.py", cache) is not None
+        for item in items:
+            key = plugin._move_key(item, tmp_path, "test_cases.py", cache)
+            assert key is not None and key[0] == item.nodeid.split("::", 1)[1]
         assert calls == [path]
         assert plugin._move_key(item, tmp_path / "other-root", "test_cases.py", cache) is None
 
