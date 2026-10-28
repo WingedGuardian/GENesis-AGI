@@ -1341,13 +1341,16 @@ class CCSessionExecutor:
     )
 
     def _seed_notepad(self, task_id: str) -> None:
-        """Write an empty TASK_NOTEPAD.md into the task worktree."""
+        """Seed TASK_NOTEPAD.md only when no entry already exists."""
         wt_path = self._worktree_paths.get(task_id)
         if not wt_path:
             return
         notepad = Path(wt_path) / "TASK_NOTEPAD.md"
         try:
-            notepad.write_text(self._NOTEPAD_SKELETON, encoding="utf-8")
+            with notepad.open("x", encoding="utf-8") as stream:
+                stream.write(self._NOTEPAD_SKELETON)
+        except FileExistsError:
+            return
         except OSError:
             logger.debug("Failed to seed notepad for task %s", task_id)
 
@@ -1413,14 +1416,12 @@ class CCSessionExecutor:
             )
 
     async def _cleanup_worktree(self, task_id: str) -> None:
-        """Remove worktree if one was created for this task."""
+        """Release in-memory ownership without clearing the retained checkout's locator."""
         self._bases.pop(task_id, None)
         wt_path = self._worktree_paths.pop(task_id, None)
         if wt_path is None:
             return
         await _worktree.cleanup_worktree(wt_path, _REPO_ROOT)
-        with contextlib.suppress(Exception):
-            await self._set_output(task_id, "worktree_path", "")
 
     # =================================================================
     # Notification

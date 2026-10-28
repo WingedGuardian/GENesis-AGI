@@ -160,9 +160,12 @@ is why the note says "if this session created them, nothing to do".
   staging, like other temp.
 - **Database rows**: deleting a follow-up, a knowledge entry, a memory or a
   reference from the dashboard deletes rows, not files, and is not covered.
-- **Task branches, not yet covered**: the executor's worktree cleanup still
-  force-deletes a task's branch after the task ends, so a failed task's
-  unpushed commits lose their only ref (#3020).
+- **Task completion** retains checkout contents, registrations and refs, and
+  keeps the saved worktree path. This is not full task durability: creation-time
+  pruning, branch resets and orphan handling still need the follow-up for
+  #3020/#3060. A planning retry can refuse a retained checkout until exact
+  reattachment is implemented. Independent lifecycle cleanup is unchanged;
+  retention at completion is not a backup or expiry policy.
 
 ## Retention and backups
 
