@@ -1047,6 +1047,17 @@ class TestSettingsStructure:
             f"the {tool} PreToolUse entry does not run plan_confidence_reminder.py"
         )
 
+    def test_the_plan_premise_gate_is_wired(self, settings: dict) -> None:
+        """Built is not wired: the gate's own tests pass with its settings entry
+        deleted, and an unwired blocking hook fails silent."""
+        commands = " ".join(
+            h.get("command", "")
+            for e in settings["hooks"]["PreToolUse"]
+            if "ExitPlanMode" in (e.get("matcher") or "").split("|")
+            for h in e.get("hooks", [])
+        )
+        assert "hooks/plan_premise_gate.py" in commands
+
     def test_bash_hook_is_command(self, settings: dict) -> None:
         """Bash hooks are type=command (inline bash -c or Python script)."""
         for entry in settings["hooks"]["PreToolUse"]:
