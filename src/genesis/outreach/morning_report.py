@@ -281,8 +281,12 @@ class MorningReportGenerator:
         self._event_bus = event_bus
         self._pending_surface_ids: list[str] = []
         self._pending_mq_ids: list[str] = []
+        self._pending_persisting_ids: list[str] = []
 
     async def generate(self) -> OutreachRequest:
+        # Before the context is built: this report's own new rows still have
+        # no surfaced_at, so they are not counted twice at delivery.
+        self._pending_persisting_ids = await self._persisting_zero_drop_ids()
         context = await self._assemble_context()
         today = datetime.now(UTC).strftime("%Y-%m-%d")
         topic = f"Morning Report — {today}"
@@ -315,6 +319,32 @@ class MorningReportGenerator:
             verbatim=True,
         )
 
+    async def _persisting_zero_drop_ids(self) -> list[str]:
+        """Open zero-drop alert rows a previous report already surfaced.
+
+        "What I Noticed" shows a row once (``get_unsurfaced``), and the
+        detector's replacement rows inherit that history, so after the first
+        report nothing would count again and the fault could never reach
+        Standing Items. Every report still states the condition (the
+        Ground Truth stranded-work line), so each delivered report counts
+        one surfacing for each such row (read in generate(), marked in
+        confirm_delivery()). Scoped to the zero-drop alerts; every other
+        observation type keeps its show-once count.
+        """
+        try:
+            from genesis.db.crud.observations import open_surfaced_ids
+            from genesis.session_awareness.zero_drop_worker import (
+                ALERT_TYPE,
+                PERSISTENT_ALERT_SOURCES,
+            )
+
+            return await open_surfaced_ids(
+                self._db, sources=PERSISTENT_ALERT_SOURCES, type=ALERT_TYPE
+            )
+        except Exception:
+            logger.warning("morning report: persisting zero-drop read failed", exc_info=True)
+            return []
+
     async def confirm_delivery(self) -> None:
         """Mark surfaced items as consumed after successful delivery.
 
@@ -324,7 +354,9 @@ class MorningReportGenerator:
 
         Observations: only calls mark_surfaced — retrieved/influenced
         tracking is handled by _get_activity_summary to avoid
-        double-counting.
+        double-counting. That covers the rows this report showed in
+        "What I Noticed" plus the open zero-drop alerts it restated
+        (_persisting_zero_drop_ids).
 
         Message-queue rows rendered into the report are marked responded;
         nothing else ever closes them (the 7-day expiry job is the only
@@ -333,12 +365,15 @@ class MorningReportGenerator:
         """
         now = datetime.now(UTC).isoformat()
 
-        ids = self._pending_surface_ids
+        # Persisting zero-drop rows were read in generate(), so only rows that
+        # were open when this report was written count for it.
+        ids = list(dict.fromkeys([*self._pending_surface_ids, *self._pending_persisting_ids]))
         if ids:
             from genesis.db.crud.observations import mark_surfaced
 
             await mark_surfaced(self._db, ids, now)
             self._pending_surface_ids = []
+            self._pending_persisting_ids = []
 
         mq_ids = self._pending_mq_ids
         if mq_ids:
@@ -1425,7 +1460,16 @@ class MorningReportGenerator:
                     surfaced_dt = datetime.fromisoformat(last_surfaced)
                     if surfaced_dt.tzinfo is None:
                         surfaced_dt = surfaced_dt.replace(tzinfo=UTC)
-                    changed_since_last = surfaced_dt > last_report_dt
+                    # A row written since the last report is new text, even
+                    # when it carries an older surfaced_at from the row it
+                    # replaced (zero-drop alerts, carry_surfacing).
+                    try:
+                        created_dt = datetime.fromisoformat(obs.get("created_at") or "")
+                        if created_dt.tzinfo is None:
+                            created_dt = created_dt.replace(tzinfo=UTC)
+                    except (ValueError, TypeError):
+                        created_dt = surfaced_dt
+                    changed_since_last = max(surfaced_dt, created_dt) > last_report_dt
                 except (ValueError, TypeError):
                     pass
             status = "" if changed_since_last else " [unchanged]"
