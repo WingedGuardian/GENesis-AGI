@@ -27,6 +27,10 @@ basename for an interpreter, and only when that word looks like a module or a
 script path (no ``:`` or ``=``). Never any other argument: argv can carry
 credentials.
 
+The same trees, weighed by summed RSS instead of threads, name the culprit in
+the container memory alarm (``memory_summary``); that line is text only, with
+no snapshot file.
+
 Each snapshot is a JSON file under ``<genesis_home>/logs/pid_snapshots/``; the
 writer prunes files older than 7 days and keeps the directory under 20 MB.
 ``GENESIS_PID_BREAKDOWN_DISABLED=1`` turns it off.
@@ -285,15 +289,16 @@ def _pids_by_cgroup_prefix(prefix: str | None, truncated: set[str]) -> set[int]:
     return found
 
 
-def _group_processes(pids: set[int], prefix: str | None) -> tuple[list[dict], int, int, int]:
-    """``(trees, threads_seen, vanished, excluded)`` for the given pids.
+def _read_process_info(
+    pids: set[int], prefix: str | None
+) -> tuple[dict[int, tuple[str, str, int, int, int]], dict[int, str | None], int, int]:
+    """``(info, cgroup, vanished, excluded)`` for the given pids.
 
-    A pid that exits between the cgroup read and its ``stat`` read is counted in
-    ``vanished``. Unreadable/outside membership or a reused PID is ``excluded``.
-    Trees are sorted by threads, largest first. Reads remain a best-effort sample.
+    ``info``: pid -> (comm, state, ppid, threads, starttime). A zombie reports 0
+    or 1 thread; it still holds a pid, so it counts at least 1. A pid that exits
+    between the cgroup read and its ``stat`` read is counted in ``vanished``.
+    Unreadable/outside membership or a reused PID is ``excluded``.
     """
-    # pid -> (comm, state, ppid, threads, starttime). A zombie reports 0 or 1
-    # thread; it still holds a pid, so it counts at least 1.
     info: dict[int, tuple[str, str, int, int, int]] = {}
     cgroup: dict[int, str | None] = {}
     vanished = 0
@@ -314,7 +319,16 @@ def _group_processes(pids: set[int], prefix: str | None) -> tuple[list[dict], in
             comm, state, ppid, threads, starttime = stat
             info[pid] = (comm, state, ppid, max(1, threads), starttime)
             cgroup[pid] = path
+    return info, cgroup, vanished, excluded
 
+
+def _tree_members(
+    info: dict[int, tuple[str, str, int, int, int]], cgroup: dict[int, str | None]
+) -> dict[int, list[int]]:
+    """``{root pid: [member pids]}``: the tree each process belongs to.
+
+    Shared by the PID breakdown (``_group_processes``) and the memory breakdown
+    (``memory_trees``), so both name the same trees."""
     root_of: dict[int, int] = {}
     for pid in info:
         path: list[int] = []
@@ -348,6 +362,16 @@ def _group_processes(pids: set[int], prefix: str | None) -> tuple[list[dict], in
     members: dict[int, list[int]] = {}
     for pid, root in root_of.items():
         members.setdefault(root, []).append(pid)
+    return members
+
+
+def _group_processes(pids: set[int], prefix: str | None) -> tuple[list[dict], int, int, int]:
+    """``(trees, threads_seen, vanished, excluded)`` for the given pids.
+
+    Trees are sorted by threads, largest first. Reads remain a best-effort sample.
+    """
+    info, cgroup, vanished, excluded = _read_process_info(pids, prefix)
+    members = _tree_members(info, cgroup)
 
     trees = []
     for root, group in members.items():
@@ -481,6 +505,120 @@ def summarize(snapshot: dict) -> str:
     if snapshot.get("truncated"):
         text += " Collection is a partial sample (" + ", ".join(snapshot["truncated"]) + ")."
     # Filesystem-surrogate paths retain byte identity in JSON; the alert is text.
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+# How many trees the memory alarm names. Three: the spec's ask, and enough to show
+# whether one tree dominates or the load is spread, while staying one line long.
+_MEMORY_TOP_N = 3
+# The characters a rendered label may keep: ``_SAFE_ARG_RE``'s alphabet, plus the
+# space, ``-m`` form, ``[comm]`` brackets and ``(exited)`` that the labelling
+# itself produces. None of them is special in HTML.
+_UNSAFE_LABEL_RE = re.compile(r"[^A-Za-z0-9_.@/+\- \[\]()]")
+
+
+def memory_trees(root: str | None = None, top_n: int = _MEMORY_TOP_N) -> dict:
+    """The process trees holding the most memory under cgroup ``root``.
+
+    ``root`` defaults to the cgroup filesystem root, which is what the container
+    memory alarm measures (``memory.current`` / ``memory.stat`` there). Trees are
+    the PID breakdown's trees (``_tree_members``); each is weighed by the summed
+    ``VmRSS`` of its members (``cc_slots.read_proc_rss_mb``, the reader the CC-slot
+    tree RSS already uses). Summed RSS double-counts pages shared within a tree, so
+    it is an upper bound (``cc_slots.slot_tree_rss_mb`` measures the size of that
+    over-count). ``cc_slots.slot_tree_rss_mb`` itself is not used: it walks every
+    descendant of a pid it is given, and the question here is which pids are the
+    roots, which that walk cannot answer.
+
+    Reads only world-readable files (``stat``, ``cgroup``, ``status``, ``cmdline``),
+    the same set the PID breakdown documents as working in genesis-server's
+    sandbox. Returns ``{"status": "sampled", "trees": [...], "processes_seen",
+    "rss_unreadable", "truncated"}`` or ``{"status": "unavailable", "reason": ...}``.
+    """
+    from genesis.observability.cc_slots import read_proc_rss_mb
+
+    root = root or _CGROUP_ROOT
+    prefix = _cgroup_prefix(root)
+    if prefix is None:
+        return {"status": "unavailable", "reason": f"{root} is outside the cgroup mount"}
+    truncated: set[str] = set()
+    pids = _pids_by_cgroup_prefix(prefix, truncated)
+    if not pids:
+        return {"status": "unavailable", "reason": f"no process readable under {_PROC}"}
+    info, cgroup, _vanished, _excluded = _read_process_info(pids, prefix)
+    if not info:
+        return {"status": "unavailable", "reason": f"stat unreadable for all {len(pids)} processes"}
+    rss: dict[int, float] = {}
+    for pid in info:
+        value = read_proc_rss_mb(pid)
+        if value is not None:
+            rss[pid] = value
+    # A zombie has no VmRSS line and holds no memory: it is not an unreadable read.
+    unreadable = sum(1 for pid in info if pid not in rss and info[pid][1] != "Z")
+    if not rss:
+        return {
+            "status": "unavailable",
+            "reason": f"VmRSS unreadable for all {len(info)} processes",
+        }
+    trees = []
+    for tree_root, group in _tree_members(info, cgroup).items():
+        trees.append(
+            {
+                "root_pid": tree_root,
+                "root_starttime": info[tree_root][4],
+                "rss_mb": round(sum(rss.get(p, 0.0) for p in group), 1),
+                "children": len(group) - 1,
+            }
+        )
+    trees.sort(key=lambda t: t["rss_mb"], reverse=True)
+    top = trees[:top_n]
+    for tree in top:
+        tree["label"] = _label_if_same(tree["root_pid"], tree["root_starttime"])
+    return {
+        "status": "sampled",
+        "trees": top,
+        "processes_seen": len(info),
+        "rss_unreadable": unreadable,
+        "truncated": sorted(truncated),
+    }
+
+
+def memory_summary(root: str | None = None) -> str:
+    """One line naming the top memory trees, for the memory alarm's message.
+
+    Never raises and never returns empty: when the breakdown cannot be taken the
+    line says so and why, so an alarm without a culprit is never mistaken for an
+    alarm whose culprit was looked for and not found. Blocking (one /proc pass):
+    call it through ``asyncio.to_thread``.
+    """
+    taken = datetime.now(UTC).strftime("%H:%MZ")
+    if os.environ.get(_DISABLE_ENV) == "1":
+        return f"Process breakdown unavailable: disabled ({_DISABLE_ENV}=1)."
+    try:
+        result = memory_trees(root)
+    except Exception as exc:  # noqa: BLE001 - a diagnostic must not take the alert down
+        logger.warning("memory tree breakdown failed", exc_info=True)
+        return f"Process breakdown unavailable: {type(exc).__name__}."
+    if result["status"] != "sampled":
+        return f"Process breakdown unavailable: {result['reason']}."
+
+    def gb(mb: float) -> str:
+        return f"{mb / 1024:.1f} GB" if mb >= 1024 else f"{mb:.0f} MB"
+
+    # A label is credential-free (``process_label``), but its ``[comm]`` fallback is
+    # any 15 bytes a process chose. This line reaches HTML-rendered surfaces (the
+    # Sentinel's Telegram approval renders the alarm text unescaped), so anything
+    # outside the label alphabet becomes "?" rather than markup.
+    parts = [
+        f"{_UNSAFE_LABEL_RE.sub('?', t['label'])} (pid {t['root_pid']}): "
+        f"{gb(t['rss_mb'])}, {t['children']} children"
+        for t in result["trees"]
+    ]
+    text = f"Top memory trees at {taken} (summed RSS): " + "; ".join(parts) + "."
+    if result["rss_unreadable"]:
+        text += f" RSS unreadable for {result['rss_unreadable']} of {result['processes_seen']} processes."
+    if result["truncated"]:
+        text += " Partial sample (" + ", ".join(result["truncated"]) + ")."
     return text.encode("utf-8", "backslashreplace").decode("utf-8")
 
 
