@@ -1756,7 +1756,11 @@ async def _check_deploy_staleness(db) -> None:
             id=str(uuid.uuid4()),
             source="deploy_staleness_monitor",
             type="infrastructure_alert",
-            content=" ".join(paragraphs) + f" [findings: {', '.join(findings)}]",
+            # Text a database column can always hold: one field that is not
+            # valid Unicode (a lone surrogate) is escaped, never the whole alert lost.
+            content=(" ".join(paragraphs) + f" [findings: {', '.join(findings)}]")
+            .encode("utf-8", "backslashreplace")
+            .decode("utf-8"),
             priority=priority,
             created_at=datetime.now(UTC).isoformat(),
             content_hash=content_hash,
@@ -1808,45 +1812,61 @@ def _deploy_repair_identity(repairs: dict) -> str:
     malformed lines), hashed: the alert's identity changes when they do."""
     named = {
         k: repairs.get(k)
-        for k in ("saved", "saved_from", "dismiss", "moved_on", "malformed", "malformed_in")
+        for k in (
+            "saved",
+            "saved_from",
+            "dismiss",
+            "moved_on",
+            "malformed",
+            "refused",
+            "malformed_in",
+        )
     }
     return hashlib.sha256(json.dumps(named, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
 def _deploy_repair_paragraph(repairs: dict) -> str:
+    # Every ts printed into a command goes through the one display encoder.
+    from genesis.observability.snapshots.deploy_health import shell_word
+
     parts: list[str] = []
     saved = repairs.get("saved") or []
-    dismiss = repairs.get("dismiss") or ["<ts>"]
+    dismiss = repairs.get("dismiss") or []
     if saved:
         shown = saved[:_DEPLOY_REPAIR_STEPS_SHOWN]
         more = len(saved) - len(shown)
-        # The reports holding the omitted steps, each named by its ts;
-        # without each step's report, every report with an offered step.
+        # The omitted steps are offered here once the shown ones are run (they
+        # then read re-applied, and the alert's identity changes). Never the
+        # report's stored reapply list: it also holds the steps withheld here.
         source = repairs.get("saved_from") or []
-        where = (
-            source[len(shown) :]
-            if len(source) == len(saved)
-            else [ts for ts in dismiss if ts != "<ts>"]
+        rest = ""
+        if more:
+            where = sorted(set(source[len(shown) :])) if len(source) == len(saved) else []
+            rest = f" (and {more} more" + (
+                f", from repair {' and '.join(where)}" if where else ""
+            )
+            rest += (
+                ": each is offered here once the steps above are run; the reapply list "
+                "stored with a repair is not a substitute, as it keeps steps withheld "
+                "here because running them would overwrite newer work)"
+            )
+        clears = (
+            ". Once decided, "
+            + " and ".join(
+                f"scripts/deploy_candidates repair-move --dismiss {shell_word(ts)}"
+                for ts in dismiss
+            )
+            + " clears this."
+            if dismiss
+            else ". Once decided, scripts/deploy_candidates repair-move --dismiss <ts> clears this."
         )
-        reports = " and ".join(
-            f"~/.genesis/deploy-backups/{ts}-live-move-repair/REPAIR.json"
-            for ts in sorted(set(where))
-        )
-        rest = f" (and {more} more" if more else ""
-        if more and reports:
-            rest += f": see the reapply list in {reports}"
-        rest += ")" if more else ""
         parts.append(
             f"Genesis put a half-written `live` checkout back to its rollback tag and saved "
             f"{len(saved)} path(s) that were not the update's (someone's edits). Each "
             "re-apply step, if they are still wanted, run in this order: "
             + " && ".join(shown)
             + rest
-            + ". Once decided, "
-            + " and ".join(
-                f"scripts/deploy_candidates repair-move --dismiss {ts}" for ts in dismiss
-            )
-            + " clears this."
+            + clears
         )
     if repairs.get("moved_on"):
         parts.append(
@@ -1854,14 +1874,27 @@ def _deploy_repair_paragraph(repairs: dict) -> str:
             + " Their steps are no longer offered: running one would overwrite what is "
             "there now. repair-move --dismiss <ts> clears each."
         )
-    if repairs.get("malformed"):
-        malformed_in = repairs.get("malformed_in") or ["<ts>"]
+    refused = repairs.get("refused") or 0
+    rows = (repairs.get("malformed") or 0) - refused
+    if rows > 0:
+        malformed_in = repairs.get("malformed_in") or []
         parts.append(
-            f"{repairs['malformed']} row(s) of live-move repair reports are not what the "
+            f"{rows} row(s) of live-move repair reports are not what the "
             "repair writes, so no step is offered for them (their reports are under "
-            "~/.genesis/deploy-backups/). "
-            + " and ".join(f"repair-move --dismiss {ts}" for ts in malformed_in)
-            + " clears this."
+            "~/.genesis/deploy-backups/)."
+            + (
+                " "
+                + " and ".join(f"repair-move --dismiss {shell_word(ts)}" for ts in malformed_in)
+                + " clears this."
+                if malformed_in
+                else ""
+            )
+        )
+    if refused > 0:
+        parts.append(
+            f"{refused} live-move repair report(s) under ~/.genesis/deploy-backups/ were "
+            "not read at all (a name, file type, size or checkout the repair never "
+            "writes); moving them out of that directory clears this."
         )
     if repairs.get("unresolved"):
         parts.append(

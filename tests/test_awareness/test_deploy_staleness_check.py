@@ -933,7 +933,7 @@ async def test_a_live_repair_paragraph_caps_its_steps_and_names_the_ts(db, monke
     [row] = await _rows(db)
     content = row["content"]
     assert all(s in content for s in steps[:5]) and "step-5" not in content, content
-    assert "and 3 more" in content and "REPAIR.json" in content, content
+    assert "and 3 more" in content and "offered here once" in content, content
     assert "repair-move --dismiss 20261027T000000Z-7" in content, content
     assert "20261020T000000Z-3 are no longer re-applicable" in content, content
     assert row["priority"] == "high"
@@ -941,8 +941,8 @@ async def test_a_live_repair_paragraph_caps_its_steps_and_names_the_ts(db, monke
 
 async def test_omitted_repair_steps_name_the_reports_that_hold_them(db, monkeypatch):
     """Devin c4399914589: two reports of four steps each. The three steps past
-    the fifth come from both reports, so each report holding one is named; no
-    placeholder path is ever printed."""
+    the fifth come from both reports, so each report holding one is named by
+    its ts (never as a path to its stored list); no placeholder is printed."""
     first, second = "20261027T000000Z-1", "20261028T000000Z-2"
     snap = _snap(["live_repair_saved:8"])
     snap["live_repairs"] = {
@@ -954,9 +954,8 @@ async def test_omitted_repair_steps_name_the_reports_that_hold_them(db, monkeypa
     await loop._check_deploy_staleness(db)
     [row] = await _rows(db)
     content = row["content"]
-    assert "<ts>" not in content, content
-    assert f"deploy-backups/{second}-live-move-repair/REPAIR.json" in content, content
-    assert f"deploy-backups/{first}-live-move-repair/REPAIR.json" not in content, content
+    assert "<ts>" not in content and "REPAIR.json" not in content, content
+    assert f"(and 3 more, from repair {second}:" in content, content
     snap["live_repairs"]["saved_from"] = [first] * 6 + [second] * 2  # omitted span both
     _patch_snapshot(monkeypatch, snap)
     monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
@@ -964,9 +963,8 @@ async def test_omitted_repair_steps_name_the_reports_that_hold_them(db, monkeypa
     await loop._check_deploy_staleness(db)
     [row] = await _rows(db)
     content = row["content"]
-    assert "<ts>" not in content, content
-    for ts in (first, second):
-        assert f"deploy-backups/{ts}-live-move-repair/REPAIR.json" in content, content
+    assert "<ts>" not in content and "REPAIR.json" not in content, content
+    assert f"(and 3 more, from repair {first} and {second}:" in content, content
 
 
 async def test_a_later_snapshot_with_other_repair_steps_refreshes_the_alert(db, monkeypatch):
@@ -999,3 +997,58 @@ async def test_malformed_repair_rows_have_their_own_wording(db, monkeypatch):
     content = row["content"]
     assert row["priority"] == "high" and "update.sh" not in content, content
     assert "2 row(s)" in content and "repair-move --dismiss 20261027T000000Z-1" in content
+
+
+async def test_omitted_repair_steps_never_point_at_the_stored_list(db, monkeypatch):
+    """CodeRabbit c4401473620: the stored reapply list keeps the steps the
+    reader withholds, so the paragraph never sends anyone to it; the omitted
+    steps are offered here once the shown ones are run."""
+    snap = _snap(["live_repair_saved:8"])
+    snap["live_repairs"] = {
+        "saved": [f"step-{n}" for n in range(8)],
+        "saved_from": ["20261027T000000Z-1"] * 8,
+        "dismiss": ["20261027T000000Z-1"],
+    }
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert "and 3 more" in content and "offered here once" in content, content
+    assert "reapply list in" not in content and "REPAIR.json" not in content, content
+
+
+async def test_every_ts_in_a_repair_command_is_shell_quoted(db, monkeypatch):
+    """The loader refuses a report name the writer never makes; the paragraph
+    quotes every ts it prints anyway, so no ts text can end a shown command."""
+    bad = "20260101T000000Z-1; touch MARKER; #"
+    snap = _snap(["live_repair_saved:1", "live_repair_malformed:1"])
+    snap["live_repairs"] = {"saved": ["step"], "dismiss": [bad], "malformed": 1,
+                            "malformed_in": [bad]}  # fmt: skip
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert f"--dismiss {bad}" not in content, content
+    assert f"--dismiss '{bad}'" in content, content
+
+
+async def test_a_report_never_read_is_named_without_a_dismiss_command(db, monkeypatch):
+    snap = _snap(["live_repair_malformed:1"])
+    snap["live_repairs"] = {"malformed": 1, "refused": 1, "malformed_in": []}
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert "1 live-move repair report(s)" in content and "<ts>" not in content, content
+    assert "--dismiss" not in content, content
+
+
+async def test_one_unencodable_field_never_drops_the_deploy_alert(db, monkeypatch):
+    """An unrelated finding (stale_update) and a repair field holding a lone
+    surrogate: the observation is still written, the field escaped."""
+    snap = _snap(["stale_update:9.0d,30behind", "live_repair_saved:1"], age_days=9.0, behind=30)
+    snap["live_repairs"] = {"saved": ["rm -rf -- /x/Z\udcff"], "dismiss": ["20261027T000000Z-1"]}
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    assert "stale_update" in row["content"] and "Z\\udcff" in row["content"], row["content"]

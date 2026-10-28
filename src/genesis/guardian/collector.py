@@ -491,15 +491,22 @@ _REPAIR_JOURNAL = (
 # symlink (not /dev/zero, not a FIFO), and only its first _REPAIR_REPORT_BYTES.
 # A report over that cap is not skipped (an older one would then read as the
 # newest): in its window it is shown as "report too large", its ts from its dir.
-# Piped to `python3 -I -S -` over stdin, so no quoting reaches a shell.
+# Piped to `python3 -I -S -` over stdin, so no quoting reaches a shell. It
+# cannot import the repair's load_report (the container's checkout may be the
+# half-written tree), so it carries the same rules: a dir named as the writer's
+# _backup_dir names it (_REPAIR_NAME, the writer's REPORT_NAME), never a
+# symlinked dir, and the same byte cap (REPORT_BYTES); a parity test holds them
+# equal. It never runs git and shows no step, so the report's repo is not
+# compared with a checkout here.
+_REPAIR_NAME = r"([0-9]{8}T[0-9]{6}Z-[0-9]+)\-live\-move\-repair"
 _REPAIR_REPORT_BYTES = 4 * 1024 * 1024  # D1 writes about 0.5 KB per path
 _REPAIR_WINDOW_S = 6 * 3600  # the journal read's window
 _REPAIR_MARK = "REPAIR.json\n"  # a login shell may print first
 _REPAIR_PICK = f"""
-import calendar, json, os, stat, sys, time
+import calendar, json, os, re, stat, sys, time
 root = os.path.expanduser("~/.genesis/deploy-backups")
 try:
-    names = sorted((n for n in os.listdir(root) if n.endswith("-live-move-repair")), reverse=True)
+    names = sorted((n for n in os.listdir(root) if re.fullmatch({_REPAIR_NAME!r}, n)), reverse=True)
 except OSError:
     names = []
 for name in names:
@@ -509,6 +516,8 @@ for name in names:
     except ValueError:
         pass
     try:
+        if not stat.S_ISDIR(os.lstat(os.path.join(root, name)).st_mode):
+            continue
         flags =os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
         fd = os.open(os.path.join(root, name, "REPAIR.json"), flags)
         try:

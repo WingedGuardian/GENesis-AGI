@@ -2087,9 +2087,11 @@ verified: fbb0b6f19 2026-10-21
   so newer ineligible reports cannot hide it; JSON-quoted, capped at 2,000
   characters and fenced as untrusted; empty, and the prompt unchanged, when
   there are none. The container reads are bounded where they are produced
-  (one regular report opened without following a symlink, 4 MiB; a newer one
-  over that cap is shown as "report too large", never skipped for an older
-  one; journal lines cut to 400), and
+  (only a report dir named as the writer names it and not a symlink; one
+  regular report opened without following a symlink, 4 MiB, the repair
+  loader's own rules, held equal by a parity test; a newer one over that cap
+  is shown as "report too large", never skipped for an older one; journal
+  lines cut to 400), and
   Telegram alert fields are cut before escaping. Residual: a container that
   fakes git's own output can still pass the probe.
 - **Merged ≠ deployed**: guardian code reaches the host ONLY via
@@ -4387,7 +4389,14 @@ tool-disabled CC probe without changing its schedule or routing authority.
   not the update's, the index was torn, or it did not heal); `REPAIR.json`
   and `manifests()` are the contract its readers (deploy health, the
   awareness check, the guardian's diagnosis) read. The deploy-health
-  collector `collect_live_repairs` reads every `REPAIR.json` into
+  collector `collect_live_repairs` reads every `REPAIR.json` through the
+  repair's one loader, `load_report(dir, checkout)`: a report dir not named as
+  `_backup_dir` names it, a symlinked dir, a `REPAIR.json` that is not a
+  regular file (opened without following a symlink or blocking on a FIFO) of
+  at most 4 MiB holding a JSON object of at most 20,000 rows, or a report whose
+  `repo` is not the deploy checkout (`repo_root()`) is refused whole, counted in
+  `live_repair_malformed:<n>` and `refused`, and never read further: no git
+  runs in a checkout a report names. It feeds
   `live_repair_saved:<n>`: each foreign row's re-apply step, OFFERED only
   while running it destroys nothing nobody saved: the checkout's HEAD is
   still the report's `tag` commit and each part the step writes (its node,
@@ -4413,12 +4422,20 @@ tool-disabled CC probe without changing its schedule or routing authority.
   relative, a copy or blob resolving outside its backup dir, an entry that is
   not git's, a FIFO mode not octal, a flag not one letter) is skipped as
   malformed (`live_repair_malformed:<n>`, until its report is dismissed); a
-  malformed report is skipped row by row. It loads the repair's module only
-  for an undismissed report's foreign row (an unloadable module offers
-  nothing and blanks nothing), and reads each checkout's index
+  malformed report is skipped row by row. Each step's every token goes through
+  one display encoder (`shell_word`: shell quoting, or bash `$'...'` built
+  from the original bytes for anything outside printable ASCII), so a shown
+  step is printable ASCII and runs exactly; rows are indexed by path once per
+  report. It loads the repair's module once per snapshot when any report dir
+  exists (an unloadable module reads every report as refused and blanks
+  nothing), and reads the checkout's index
   and HEAD once per snapshot. The awareness paragraph quotes at most five
-  steps, names the report(s) holding the rest and each `--dismiss <ts>`, and
-  is replaced whenever the steps or reports it names change. `live_repair_unresolved` needs the newest report to
+  steps (the rest are offered there once those are run; it never points at
+  the stored reapply list, which keeps withheld steps), shell-quotes each
+  `--dismiss <ts>`, escapes any text a database column cannot hold rather
+  than losing the alert, and is replaced whenever the steps or reports it
+  names change. `GET /api/genesis/health` reduces `live_repairs` to its counts
+  for a caller without the internal bearer or a verified session. `live_repair_unresolved` needs the newest report to
   say so (or to have no result after an hour) AND the shared guard, run at
   read time and only then, to call the update state `mixed_tree`: a run
   killed after its restore and before its result leaves no result, and only

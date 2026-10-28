@@ -47,6 +47,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import signal
 import stat
 import subprocess
@@ -950,8 +951,39 @@ def _script(path: Path):
     return module
 
 
-def collect_live_repairs(genesis_home_dir: Path, now: float | None = None) -> dict:
-    """The live-move repair's REPAIR.json reports (scripts/lib/live_move_repair.py).
+def shell_word(text: str) -> str:
+    """One shell word for ``text``, shown as printable ASCII: shlex's quoting
+    when every character is printable ASCII (or a tab), else bash ANSI-C
+    quoting ($'...') made from the original bytes (os.fsencode, so a non-UTF-8
+    name's surrogates map back to its bytes): run, it is exactly ``text``.
+    Every token a repair text interpolates goes through it."""
+    if all(c == "\t" or " " <= c <= "~" for c in text):
+        return shlex.quote(text)
+    out = []
+    for byte in os.fsencode(text):
+        if byte in (0x27, 0x5C):  # ' and \\
+            out.append("\\" + chr(byte))
+        elif 0x20 <= byte <= 0x7E:
+            out.append(chr(byte))
+        else:
+            out.append(f"\\x{byte:02x}")
+    return "$'" + "".join(out) + "'"
+
+
+def collect_live_repairs(
+    genesis_home_dir: Path, repo_dir: Path | str, now: float | None = None
+) -> dict:
+    """The live-move repair's REPAIR.json reports (scripts/lib/live_move_repair.py)
+    for the deploy checkout ``repo_dir``.
+
+    Every report is read through the repair's own ``load_report``: a report
+    dir it refuses (a name the writer never makes, a symlinked dir, a
+    REPAIR.json that is not a regular file within the byte cap, not a JSON
+    object, over the row cap, or naming another checkout than ``repo_dir``)
+    is counted in ``malformed`` and ``refused`` and never read further: no
+    git runs in a checkout a report names. The repair's module loads once
+    per call when any report dir exists (unloadable, no report can be read:
+    each counts as refused).
 
     ``saved``: each foreign row's re-apply step, OFFERED only while running it
     destroys nothing nobody saved: the checkout is still on the report's
@@ -960,6 +992,8 @@ def collect_live_repairs(genesis_home_dir: Path, now: float | None = None) -> di
     step puts back, and every index entry it drops below its own path (the
     writer's ``below``, engine rows included) holds what the repair left there
     or nothing: a row there that cannot be judged (malformed) withholds it.
+    Each step is the repair's ``reapply_step`` with every token through
+    :func:`shell_word`, so it is printable ASCII and runs exactly.
     ``saved_from``: the ts of each offered step's report, in the same order.
     It clears once the step would change nothing
     (:func:`_verdict`) or the report is dismissed (a newer report's row for a
@@ -968,51 +1002,62 @@ def collect_live_repairs(genesis_home_dir: Path, now: float | None = None) -> di
     holds one line per report naming how many, its ts and its backup dir, until
     it is dismissed. ``dismiss``: the ts of each report with an offered step.
     REPAIR.json is user-writable, so untrusted: its stored step text is never
-    shown (each offered step is rebuilt by the repair's ``reapply_step``), and
-    a row any field of which is not what the writer writes (:func:`_fields_ok`),
-    or that no step can be built for, is skipped and counted in ``malformed``
-    (``malformed_in``: the ts of each undismissed report holding one).
-    ``unresolved``: the newest repair
+    shown, and a row any field of which is not what the writer writes
+    (:func:`_fields_ok`), or that no step can be built for, is skipped and
+    counted in ``malformed`` (``malformed_in``: the ts of each undismissed
+    report holding one). ``unresolved``: the newest repair
     says so, or has had no result for REPAIR_UNFINISHED_S (killed partway),
     while the update state's guard still calls the checkout half-written: a
     repair killed after its restore leaves no result, and only the tree says
-    whether it healed. The repair's module loads only for an undismissed
-    report's foreign row (unloadable, no helper of it is called and every
-    such row reads moved on), the guard only for a report that reads unresolved;
-    each checkout's index and HEAD are read once per call."""
+    whether it healed. The guard loads only for a report that reads
+    unresolved; the checkout's index and HEAD are read once per call."""
     now = time.time() if now is None else now
+    repo = str(repo_dir)
     offered: dict[str, tuple[str, str]] = {}  # path -> (step, ts)
     moved: dict[str, tuple[str, str]] = {}  # path -> (ts, backup dir)
-    unresolved, repo, malformed = False, None, 0
+    unresolved, malformed, refused = False, 0, 0
     malformed_in: set[str] = set()
-    repair, loaded = None, False
     checkouts: dict = {}
-    for d in sorted((genesis_home_dir / "deploy-backups").glob("*" + _REPAIR_SUFFIX)):
+    backups = genesis_home_dir / "deploy-backups"
+    try:
+        names = sorted(n for n in os.listdir(backups) if n.endswith(_REPAIR_SUFFIX))
+    except OSError:
+        names = []
+    repair = None
+    if names:
         try:
-            m = json.loads((d / "REPAIR.json").read_text(encoding="utf-8"))
-            age = now - (d / "REPAIR.json").stat().st_mtime
-        except (OSError, ValueError, RecursionError):
+            repair = _script(_REPAIR_SCRIPT)
+        except Exception:  # noqa: BLE001 - unloadable: no report can be read
+            logger.warning("live-move repair module could not be loaded", exc_info=True)
+    for name in names:
+        d = backups / name
+        if repair is None:
+            malformed, refused = malformed + 1, refused + 1
             continue
-        if not isinstance(m, dict):
+        try:
+            loaded = repair.load_report(str(d), repo)
+        except repair.BadReport as exc:
+            logger.debug("live-move repair report refused: %s", exc)
+            malformed, refused = malformed + 1, refused + 1
             continue
+        if loaded is None:
+            continue
+        m, ts, rows, by_path = loaded["report"], loaded["ts"], loaded["rows"], loaded["by_path"]
+        age = now - loaded["mtime"]
         result, dismissed = m.get("result"), bool(m.get("dismissed_at"))
         unresolved = (result is None and age > REPAIR_UNFINISHED_S) or str(result).startswith(
             "unresolved"
         )
         unresolved = unresolved and not dismissed
-        # Shapes as the guardian's collector checks them: a report of the wrong
-        # shape is skipped row by row, never raised (that would blank the snapshot).
-        paths = m.get("paths")
-        paths = [r for r in paths if isinstance(r, dict)] if isinstance(paths, list) else []
-        repo = m.get("repo") if isinstance(m.get("repo"), str) else None
         tag = m.get("tag") if isinstance(m.get("tag"), str) else None
-        ts = d.name[: -len(_REPAIR_SUFFIX)]
         # Parents first, by path components (`a/b` before `a-b`), as the
         # writer orders its steps.
         foreign = sorted(
-            (r for r in paths if r.get("class") == "foreign"),
+            (r for r in rows if r.get("class") == "foreign"),
             key=lambda r: str(r.get("path")).split("/"),
         )
+        # Each row is checked once; a step's drop list reads these by path.
+        ok = {id(r): _fields_ok(d, r) for r in foreign}
         judged: list[tuple[str, dict, str]] = []
         for row in foreign:
             path = row.get("path")
@@ -1021,30 +1066,23 @@ def collect_live_repairs(genesis_home_dir: Path, now: float | None = None) -> di
                     offered.pop(path, None)
                     moved.pop(path, None)
                 continue
-            if not _fields_ok(d, row):
+            if not ok[id(row)]:
                 malformed += 1
                 malformed_in.add(ts)
                 continue
-            if not loaded:
-                loaded = True
-                try:
-                    repair = _script(_REPAIR_SCRIPT)
-                except Exception:  # noqa: BLE001 - unloadable: nothing can be judged
-                    repair = None
             judged.append((path, row, _verdict(repair, d, repo, tag, row, checkouts)))
         # A row's step drops the index entries of the rows below it before it
         # re-adds its own: offered only while none of those moved on, and each
         # entry it drops still holds what the repair left there, or nothing.
-        # With the repair's module unloadable every verdict is "moved" already.
-        gone = [p + "/" for p, _, v in judged if v == "moved"]
-        below = _below(repair, paths) if judged and repair is not None else {}
+        gone = {a for p, _, v in judged if v == "moved" for a in repair._parents(p)}
+        below = _below(repair, rows) if judged else {}
         for path, row, verdict in judged:
             offered.pop(path, None)
             moved.pop(path, None)
-            if verdict == "offer" and any(g.startswith(path + "/") for g in gone):
+            if verdict == "offer" and path in gone:
                 verdict = "moved"
             if verdict == "offer" and not all(
-                _left_alone(repair, d, paths, p, _checkout(repair, repo, checkouts))
+                _left_alone(repair, by_path, ok, p, _checkout(repair, repo, checkouts))
                 for p in _drops(repair, row, below.get(path, ()))
             ):
                 verdict = "moved"
@@ -1053,7 +1091,9 @@ def collect_live_repairs(genesis_home_dir: Path, now: float | None = None) -> di
                 # checked row, the report's own dir and the writer's `below`.
                 try:
                     offered[path] = (
-                        repair.reapply_step(repo, str(d), row, below.get(path, ())),
+                        repair.reapply_step(
+                            repo, str(d), row, below.get(path, ()), quote=shell_word
+                        ),
                         ts,
                     )
                 except Exception:  # noqa: BLE001 - a row no step can be built for is malformed
@@ -1070,11 +1110,12 @@ def collect_live_repairs(genesis_home_dir: Path, now: float | None = None) -> di
         "dismiss": sorted({ts for _, ts in offered.values()}),
         "moved_on": [
             f"{n} saved path(s) from repair {ts} are no longer re-applicable here (the "
-            f"checkout moved on); their bytes are in {backup}"
+            f"checkout moved on); their bytes are in {shell_word(backup)}"
             for (ts, backup), n in sorted(counts.items())
         ],
         "moved_on_paths": len(moved),
         "malformed": malformed,
+        "refused": refused,
         "malformed_in": sorted(malformed_in),
         "unresolved": unresolved and _mixed(genesis_home_dir, repo),
     }
@@ -1183,24 +1224,23 @@ def _drops(repair, row: dict, below) -> list[str]:
     return list(below) if any(e[2] == "0" for e in row["index"]) else []
 
 
-def _left_alone(repair, backup: Path, paths: list[dict], path: str, state: dict | None) -> bool:
+def _left_alone(repair, by_path: dict, ok: dict, path: str, state: dict | None) -> bool:
     """Does every row of ``path`` hold, in the index, what the repair left
     there, or nothing? An engine row's leftover is the tag's entry (the repair
     put it back); a foreign row's too (the restore wrote the tag's). A row that
-    cannot be judged (malformed, another class) never reads as left alone."""
+    cannot be judged (malformed, another class) never reads as left alone.
+    ``by_path``: the report's rows by path; ``ok``: each foreign row's check."""
     if state is None:
         return False
     have = [tuple(e) for e in state["entries"].get(path, [])]
-    for r in paths:
-        if r.get("path") != path:
-            continue
+    for r in by_path.get(path, ()):
         if r.get("class") == "foreign":
-            ok = _fields_ok(backup, r)
+            good = ok.get(id(r), False)
         else:
-            ok = r.get("class") == "engine" and (
+            good = r.get("class") == "engine" and (
                 r.get("tag") is None or _entry(r.get("tag"), False)
             )
-        if not ok or have not in ([], repair._as_index(r.get("tag"))):
+        if not good or have not in ([], repair._as_index(r.get("tag"))):
             return False
     return True
 
@@ -1211,10 +1251,12 @@ def _checkout(repair, repo: str | None, checkouts: dict) -> dict | None:
     if repo not in checkouts:
         checkouts[repo] = None
         if repair is not None and repo and os.path.isabs(repo) and os.path.isdir(repo):
-            with contextlib.suppress(Exception):
+            try:
                 entries, flags = repair._index_state(repo)
                 head = repair._out(repo, "rev-parse", "--verify", "-q", "HEAD^{commit}")
                 checkouts[repo] = {"entries": entries, "flags": flags, "head": head}
+            except Exception:  # noqa: BLE001 - unreadable: every row reads moved on
+                logger.debug("deploy checkout index unreadable for repair rows", exc_info=True)
     return checkouts[repo]
 
 
@@ -1547,7 +1589,7 @@ def _collect_sync(repo: Path, genesis_home_dir: Path) -> dict:
         "main_checkout": main_checkout,
         "live": live,
         "upto": upto,
-        "live_repairs": collect_live_repairs(genesis_home_dir),
+        "live_repairs": collect_live_repairs(genesis_home_dir, repo),
     }
 
 

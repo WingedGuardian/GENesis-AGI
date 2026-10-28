@@ -11,7 +11,8 @@ come from this directory's conftest.py.
 
 from __future__ import annotations
 
-import importlib
+import contextlib
+import importlib.util
 import json
 import os
 import shutil
@@ -67,17 +68,17 @@ def _dh():
 
 
 def _saved(w) -> list[str]:
-    return _dh().collect_live_repairs(w.gen)["saved"]
+    return _dh().collect_live_repairs(w.gen, w.root)["saved"]
 
 
 def _moved_on(w) -> list[str]:
     """The informational lines: rows no longer offered (the checkout moved on)."""
-    return _dh().collect_live_repairs(w.gen)["moved_on"]
+    return _dh().collect_live_repairs(w.gen, w.root)["moved_on"]
 
 
 def _cleared(w) -> bool:
     """Re-applied: neither offered nor read as moved on (both leave `saved` empty)."""
-    found = _dh().collect_live_repairs(w.gen)
+    found = _dh().collect_live_repairs(w.gen, w.root)
     return found["saved"] == [] and found["moved_on"] == []
 
 
@@ -100,7 +101,7 @@ def _reported_then_cleared_by_its_steps(w) -> None:
     assert steps, "control: the repair found nothing foreign"
     assert _saved(w) == steps, "a foreign row was not reported before its step ran"
     _run_steps(w)
-    found = _dh().collect_live_repairs(w.gen)
+    found = _dh().collect_live_repairs(w.gen, w.root)
     assert found["saved"] == [], "re-applied, still reported"
     assert found["moved_on"] == [], "re-applied, read as moved on"
 
@@ -282,7 +283,7 @@ def test_rows_pair_with_their_steps_in_the_writers_order(tmp_path):
     report = {"result": "healed", "repo": str(repo), "paths": rows, "reapply": ["A/B", "A-B"]}
     report["tag"] = _git(repo, "rev-parse", "HEAD")
     (d / "REPAIR.json").write_text(json.dumps(report))
-    [step] = _dh().collect_live_repairs(tmp_path)["saved"]
+    [step] = _dh().collect_live_repairs(tmp_path, tmp_path / "repo")["saved"]
     assert step == f"rm -rf -- {repo}/a/b", step  # a/b's own step, regenerated
 
 
@@ -335,13 +336,13 @@ def test_td19_a_step_is_offered_only_while_the_path_is_as_the_repair_left_it(w):
     killed_tag_side(w, "Z3")
     (w.root / "sub" / "s1").write_text("mine\n")
     assert w.repair().returncode == 0
-    found = dh.collect_live_repairs(w.gen)
+    found = dh.collect_live_repairs(w.gen, w.root)
     assert dh.live_repair_findings(found) == ["live_repair_saved:1"], found
     assert found["saved"] == w.report()["reapply"] and found["moved_on"] == []
     _run_steps(w)
-    assert dh.live_repair_findings(dh.collect_live_repairs(w.gen)) == []
+    assert dh.live_repair_findings(dh.collect_live_repairs(w.gen, w.root)) == []
     (w.root / "sub" / "s1").write_text("mine v2, a later edit\n")
-    found = dh.collect_live_repairs(w.gen)
+    found = dh.collect_live_repairs(w.gen, w.root)
     assert found["saved"] == [], "a step offered over content the repair never put there"
     assert dh.live_repair_findings(found) == ["live_repair_moved_on:1"], found
     [line] = found["moved_on"]
@@ -349,7 +350,7 @@ def test_td19_a_step_is_offered_only_while_the_path_is_as_the_repair_left_it(w):
     assert ts in line and str(w.backups()[-1]) in line and "1 saved path(s)" in line, line
     _dismiss(w, ts)
     assert w.report()["dismissed_at"]
-    assert dh.live_repair_findings(dh.collect_live_repairs(w.gen)) == []
+    assert dh.live_repair_findings(dh.collect_live_repairs(w.gen, w.root)) == []
 
 
 def test_f1_a_checkout_moved_off_the_tag_is_not_offered_a_step(w):
@@ -360,7 +361,7 @@ def test_f1_a_checkout_moved_off_the_tag_is_not_offered_a_step(w):
     assert w.repair().returncode == 0
     assert len(_saved(w)) == 1, "control: an untouched row is offered"
     _git(w.root, "switch", "-q", "-C", "live", w.to)
-    found = _dh().collect_live_repairs(w.gen)
+    found = _dh().collect_live_repairs(w.gen, w.root)
     assert found["saved"] == []
     [line] = found["moved_on"]
     assert w.report()["ts"] in line and str(w.backups()[-1]) in line, line
@@ -435,7 +436,7 @@ def test_m10_a_socket_inside_a_saved_directory_is_ignored(w, monkeypatch):
     monkeypatch.chdir(w.root / "P")
     with socket.socket(socket.AF_UNIX) as s:
         s.bind("sock")
-        found = _dh().collect_live_repairs(w.gen)
+        found = _dh().collect_live_repairs(w.gen, w.root)
     assert found["saved"] == [] and found["moved_on"] == [], found
 
 
@@ -446,7 +447,7 @@ def test_m11_a_socket_row_is_not_reapplied_by_a_node_of_another_type(w, monkeypa
         s.bind("Z5")
         assert w.repair().returncode == 0
     os.mkfifo(w.root / "Z5")
-    found = _dh().collect_live_repairs(w.gen)
+    found = _dh().collect_live_repairs(w.gen, w.root)
     assert found["saved"] == [] and len(found["moved_on"]) == 1, found
 
 
@@ -469,10 +470,14 @@ def _git_repo(tmp_path: Path) -> tuple[Path, str]:
     return repo, _git(repo, "rev-parse", "HEAD")
 
 
-def _collect_bounded(home: Path, seconds: float = 10.0) -> dict:
-    """collect_live_repairs on a thread, failing (not hanging) past ``seconds``."""
+def _collect_bounded(home: Path, repo: Path | None = None, seconds: float = 10.0) -> dict:
+    """collect_live_repairs on a thread, failing (not hanging) past ``seconds``.
+    The deploy checkout is ``repo``, by default ``home``/repo."""
     out: dict = {}
-    t = threading.Thread(target=lambda: out.update(_dh().collect_live_repairs(home)), daemon=True)
+    repo = home / "repo" if repo is None else repo
+    t = threading.Thread(
+        target=lambda: out.update(_dh().collect_live_repairs(home, repo)), daemon=True
+    )
     t.start()
     t.join(seconds)
     assert not t.is_alive(), f"collect_live_repairs still running after {seconds}s"
@@ -533,7 +538,7 @@ def test_f3_a_large_file_is_compared_without_reading_it_whole(tmp_path):
     (d / "REPAIR.json").write_text(json.dumps(report))
     tracemalloc.start()
     try:
-        found = _dh().collect_live_repairs(tmp_path)
+        found = _dh().collect_live_repairs(tmp_path, tmp_path / "repo")
         _cur, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
@@ -569,7 +574,7 @@ def test_f3_the_index_is_read_once_per_repo_per_snapshot(tmp_path, monkeypatch):
         _report_at(tmp_path, f"20260101T00000{n}Z-{n}", result="healed", repo=str(repo),
                    tag=head, paths=[_row(f"a{n}"), _row(f"b{n}")],
                    reapply=[f"s{n}a", f"s{n}b"])  # fmt: skip
-    _dh().collect_live_repairs(tmp_path)
+    _dh().collect_live_repairs(tmp_path, tmp_path / "repo")
     assert reads == [str(repo)], reads
 
 
@@ -578,7 +583,7 @@ def test_f3_a_gone_repo_costs_no_git_call_per_row(tmp_path, monkeypatch):
     gone = tmp_path / "no-such-repo"
     _report_at(tmp_path, "20260101T000000Z-1", result="healed", repo=str(gone), tag="0" * 40,
                paths=[_row("a"), _row("b"), _row("c")], reapply=["sa", "sb", "sc"])  # fmt: skip
-    found = _dh().collect_live_repairs(tmp_path)
+    found = _dh().collect_live_repairs(tmp_path, gone)
     assert len(reads) <= 1, reads
     assert found["saved"] == [] and len(found["moved_on"]) == 1, found
 
@@ -605,15 +610,15 @@ def test_td19_an_unfinished_repair_is_unresolved_while_the_tree_is_mixed(w, mod,
     killed_tag_side(w, "Z3")
     _killed_mid_repair(w, mod, monkeypatch, "at_apply")
     later = time.time() + LATER
-    assert dh.live_repair_findings(dh.collect_live_repairs(w.gen, now=time.time())) == []
-    found = dh.collect_live_repairs(w.gen, now=later)
+    assert dh.live_repair_findings(dh.collect_live_repairs(w.gen, w.root, now=time.time())) == []
+    found = dh.collect_live_repairs(w.gen, w.root, now=later)
     assert dh.live_repair_findings(found) == ["live_repair_unresolved"]
     findings = dh.derive_findings(
         missing_units=[], tier2_pending=[], host_gateway={}, commits_behind=0, live_repairs=found
     )
     assert findings == ["live_repair_unresolved"]
     assert w.repair().returncode == 0
-    assert dh.live_repair_findings(dh.collect_live_repairs(w.gen, now=later)) == []
+    assert dh.live_repair_findings(dh.collect_live_repairs(w.gen, w.root, now=later)) == []
 
 
 @pytest.mark.parametrize("window", ["before_clear", "before_finish"])
@@ -630,7 +635,10 @@ def test_r1_an_interrupted_report_is_not_unresolved_once_healed(w, mod, monkeypa
         mod.Repair(str(w.state), str(w.root), True, 0).run()
     assert w.repair().returncode == 0 and not w.state.exists()
     dh = _dh()
-    assert dh.live_repair_findings(dh.collect_live_repairs(w.gen, now=time.time() + LATER)) == []
+    assert (
+        dh.live_repair_findings(dh.collect_live_repairs(w.gen, w.root, now=time.time() + LATER))
+        == []
+    )
 
 
 def test_r2_a_killed_repair_on_a_tag_directory_reads_resolved(w, mod, monkeypatch):
@@ -641,7 +649,7 @@ def test_r2_a_killed_repair_on_a_tag_directory_reads_resolved(w, mod, monkeypatc
     _killed_mid_repair(w, mod, monkeypatch, "after_apply")
     assert w.snapshot() == tag_snapshot() and w.state.exists()
     assert w.repair().returncode == 0 and not w.state.exists()
-    assert _dh().collect_live_repairs(w.gen, now=time.time() + LATER)["unresolved"] is False
+    assert _dh().collect_live_repairs(w.gen, w.root, now=time.time() + LATER)["unresolved"] is False
 
 
 # ── loading only what a report needs ────────────────────────────────────────
@@ -666,30 +674,32 @@ def _spy_scripts(monkeypatch) -> list[str]:
     return loaded
 
 
-def test_the_repair_module_loads_only_for_an_undismissed_foreign_row(tmp_path, monkeypatch):
+def test_the_repair_module_loads_once_and_only_when_a_report_exists(tmp_path, monkeypatch):
+    """Every report is read through the repair's load_report, so its module
+    loads once per call when any report dir exists, and never when none does."""
     loaded = _spy_scripts(monkeypatch)
+    (tmp_path / "deploy-backups").mkdir()
+    _dh().collect_live_repairs(tmp_path, tmp_path)
+    assert loaded == [], "a module loaded with no report"
     engine = {"path": "A", "class": "engine", "disk": "absent", "disk_changed": True}
     foreign = {**engine, "class": "foreign", "index": [], "tag": None, "flag": None}
     _report_at(tmp_path, "20260101T000000Z-1", result="healed", repo=str(tmp_path), paths=[engine])
     _report_at(tmp_path, "20260101T000001Z-2", result="healed", repo=str(tmp_path),
                paths=[foreign], reapply=["step"], dismissed_at="2026-01-01T00:00:00Z")  # fmt: skip
-    found = _dh().collect_live_repairs(tmp_path)
-    assert (found["saved"], found["unresolved"]) == ([], False), found
-    assert loaded == [], "a module loaded with no undismissed foreign row"
-    _report_at(tmp_path, "20260101T000002Z-3", result="healed", repo=str(tmp_path),
-               paths=[foreign], reapply=["step"])  # fmt: skip
-    _dh().collect_live_repairs(tmp_path)
+    found = _dh().collect_live_repairs(tmp_path, tmp_path)
+    assert (found["saved"], found["unresolved"], found["malformed"]) == ([], False, 0), found
     assert loaded == ["live_move_repair.py"], loaded
 
 
 def test_the_guard_runs_only_when_a_report_reads_unresolved(tmp_path, monkeypatch):
     loaded = _spy_scripts(monkeypatch)
     _report_at(tmp_path, "20260101T000000Z-1", result="healed", repo=str(tmp_path), paths=[])
-    assert _dh().collect_live_repairs(tmp_path)["unresolved"] is False
-    assert loaded == []
-    _report_at(tmp_path, "20260101T000001Z-2", result="unresolved: x", repo=str(tmp_path))
-    _dh().collect_live_repairs(tmp_path)
-    assert loaded == ["update_state_guard.py"], loaded
+    assert _dh().collect_live_repairs(tmp_path, tmp_path)["unresolved"] is False
+    assert "update_state_guard.py" not in loaded, loaded
+    _report_at(tmp_path, "20260101T000001Z-2", result="unresolved: x", repo=str(tmp_path),
+               paths=[])  # fmt: skip
+    _dh().collect_live_repairs(tmp_path, tmp_path)
+    assert loaded.count("update_state_guard.py") == 1, loaded
 
 
 # ── a malformed report never blanks the snapshot ────────────────────────────
@@ -711,7 +721,7 @@ def test_sf3_a_malformed_report_never_blanks_the_snapshot(tmp_path, paths):
     dh = _dh()
     report = {"result": "healed", "paths": paths, "reapply": ["step", 5], "repo": ["r"]}
     _report_at(tmp_path, "20260101T000000Z-1", **report)
-    found = dh.collect_live_repairs(tmp_path)
+    found = dh.collect_live_repairs(tmp_path, tmp_path / "repo")
     assert isinstance(found["saved"], list)
     assert all(isinstance(s, str) for s in found["saved"])
 
@@ -719,7 +729,7 @@ def test_sf3_a_malformed_report_never_blanks_the_snapshot(tmp_path, paths):
 def test_sf3_a_non_list_reapply_counts_as_none(tmp_path):
     report = {"result": "healed", "paths": [{"path": "p", "class": "foreign"}], "reapply": "s"}
     _report_at(tmp_path, "20260101T000000Z-1", **report)
-    assert _dh().collect_live_repairs(tmp_path)["saved"] == []
+    assert _dh().collect_live_repairs(tmp_path, tmp_path / "repo")["saved"] == []
 
 
 def test_f2_a_saved_as_through_a_symlink_in_the_backup_is_skipped(tmp_path):
@@ -758,10 +768,10 @@ def test_f1_a_parent_is_withheld_while_a_row_below_it_moved_on(tmp_path):
     child = _row("a/b", disk_changed=False, tag=tag_b, index=[["100644", saved, "0"]])
     _report_at(tmp_path, "20260101T000000Z-1", result="healed", repo=str(repo), tag=head,
                paths=[parent, child], reapply=["parent step", "child step"])  # fmt: skip
-    found = _dh().collect_live_repairs(tmp_path)
+    found = _dh().collect_live_repairs(tmp_path, tmp_path / "repo")
     assert found["saved"] == [] and found["moved_on_paths"] == 2, found
     _git(repo, "reset", "-q", "--", "a/b")  # the child back as the repair left it
-    parent_step, child_step = _dh().collect_live_repairs(tmp_path)["saved"]
+    parent_step, child_step = _dh().collect_live_repairs(tmp_path, tmp_path / "repo")["saved"]
     assert parent_step.startswith("printf") and "\ta/b" in parent_step  # drops a/b first
     assert "\ta/b" in child_step and "\ta'" not in child_step
 
@@ -849,7 +859,7 @@ def test_p1_an_engine_row_below_holding_newer_staging_withholds_its_parent(w):
     assert _saved(w) == [parent_step, child_step], "control: an untouched repair offers both"
     oid = _hash(w, "NEWER T\n")
     _git(w.root, "update-index", "--cacheinfo", f"100644,{oid},sub/t")
-    found = _dh().collect_live_repairs(w.gen)
+    found = _dh().collect_live_repairs(w.gen, w.root)
     assert found["saved"] == [child_step], found
     assert found["moved_on_paths"] == 1, found
     for step in found["saved"]:
@@ -886,7 +896,7 @@ def test_p1_a_malformed_row_below_withholds_its_parent(tmp_path, staged):
         (repo / "a" / "b").write_text("newer staging\n")
         _git(repo, "add", "a/b")
         (repo / "a" / "b").write_text("tag\n")
-    found = _dh().collect_live_repairs(tmp_path)
+    found = _dh().collect_live_repairs(tmp_path, tmp_path / "repo")
     assert found["saved"] == [], found
     assert found["malformed"] == 1 and found["moved_on_paths"] == 1, found
 
@@ -894,7 +904,7 @@ def test_p1_a_malformed_row_below_withholds_its_parent(tmp_path, staged):
 def test_p1_a_well_formed_child_as_left_still_offers_its_parent(tmp_path):
     """The control for the two above: nothing written since, both offered."""
     _parent_and_child(tmp_path, child_flag=None)
-    parent_step, child_step = _dh().collect_live_repairs(tmp_path)["saved"]
+    parent_step, child_step = _dh().collect_live_repairs(tmp_path, tmp_path / "repo")["saved"]
     assert "\ta/b" in parent_step and "\ta/b" in child_step
 
 
@@ -903,8 +913,9 @@ def test_p1_a_well_formed_child_as_left_still_offers_its_parent(tmp_path):
 
 def test_an_unloadable_repair_module_keeps_every_other_finding(tmp_path, monkeypatch):
     """Devin c4399914406 / CodeRabbit c4399949029 / Codex c4399950954: with
-    the repair's module unreadable, no helper of it is called; the foreign row
-    reads moved on and deploy_health keeps its other findings."""
+    the repair's module unreadable, no report can be read through its loader:
+    each counts as refused (a finding of its own, never a blank snapshot) and
+    deploy_health keeps its other findings."""
     import asyncio
 
     import genesis.env
@@ -919,13 +930,13 @@ def test_an_unloadable_repair_module_keeps_every_other_finding(tmp_path, monkeyp
         raise PermissionError(f"{path}: denied")
 
     monkeypatch.setattr(dh, "_script", unreadable)
-    found = dh.collect_live_repairs(home)
-    assert found["saved"] == [] and found["moved_on_paths"] == 1, found
+    found = dh.collect_live_repairs(home, repo)
+    assert found["saved"] == [] and (found["malformed"], found["refused"]) == (1, 1), found
     monkeypatch.setattr(genesis.env, "genesis_home", lambda: home)
     monkeypatch.setattr(genesis.env, "repo_root", lambda: repo)
     snap = asyncio.run(dh.deploy_health(None))
     assert snap["status"] != "error", snap
-    assert "live_repair_moved_on:1" in snap["findings"], snap["findings"]
+    assert "live_repair_malformed:1" in snap["findings"], snap["findings"]
 
 
 # -- a failed open never leaks a descriptor --
@@ -960,13 +971,13 @@ def test_malformed_rows_are_their_own_finding(tmp_path):
     repo, head = _git_repo(tmp_path)
     _report_at(tmp_path, "20260101T000000Z-1", result="healed", repo=str(repo), tag=head,
                paths=[_row("../x"), _row("Z", flag="1")], reapply=[])  # fmt: skip
-    found = dh.collect_live_repairs(tmp_path)
+    found = dh.collect_live_repairs(tmp_path, tmp_path / "repo")
     assert found["malformed"] == 2 and found["malformed_in"] == ["20260101T000000Z-1"], found
     assert dh.live_repair_findings(found) == ["live_repair_malformed:2"]
     report = tmp_path / "deploy-backups" / "20260101T000000Z-1-live-move-repair" / "REPAIR.json"
     data = json.loads(report.read_text())
     report.write_text(json.dumps({**data, "dismissed_at": "2026-01-02T00:00:00Z"}))
-    found = dh.collect_live_repairs(tmp_path)
+    found = dh.collect_live_repairs(tmp_path, tmp_path / "repo")
     assert found["malformed"] == 0 and dh.live_repair_findings(found) == [], found
 
 
@@ -981,6 +992,263 @@ def test_each_offered_step_names_its_report(tmp_path):
         rows = [_row(f"d{n}/f{i}", disk_changed=False, flag="S") for i in range(4)]
         _report_at(tmp_path, ts, result="healed", repo=str(repo), tag=head, paths=rows,
                    reapply=[])  # fmt: skip
-    found = _dh().collect_live_repairs(tmp_path)
+    found = _dh().collect_live_repairs(tmp_path, tmp_path / "repo")
     assert len(found["saved"]) == 8, found
     assert found["saved_from"] == ["20260101T000000Z-1"] * 4 + ["20260102T000000Z-2"] * 4
+
+
+# -- one loader: every reader reads a report through load_report --
+
+
+def _writer():
+    """The repair module, loaded fresh (no scratch World, unlike `mod`)."""
+    spec = importlib.util.spec_from_file_location("live_move_repair_caps", MODULE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _valid_report(tmp_path: Path, name: str = "20260101T000000Z-1") -> tuple[Path, Path]:
+    """A report the writer could have left: one foreign row whose saved file
+    is offered back (the path absent, as the repair left it). (repo, dir)."""
+    repo, head = _git_repo(tmp_path)
+    _report_at(tmp_path, name, result="healed", repo=str(repo), tag=head,
+               paths=[_row("Z", saved_as="tree/Z")], reapply=[])  # fmt: skip
+    d = tmp_path / "deploy-backups" / f"{name}-live-move-repair"
+    (d / "tree").mkdir()
+    (d / "tree" / "Z").write_text("saved\n")
+    return repo, d
+
+
+def test_control_the_valid_report_offers_its_step(tmp_path):
+    repo, d = _valid_report(tmp_path)
+    found = _collect_bounded(tmp_path, repo)
+    assert found["malformed"] == 0, found
+    assert found["saved"] == [
+        f"rm -rf -- {repo}/Z && mkdir -p -- {repo} && cp -a -- {d}/tree/Z {repo}/Z"
+    ], found
+
+
+def test_the_report_name_is_the_writers_backup_dir(mod):
+    """The loader's name rule is derived from the writer's own _backup_dir:
+    every name it makes matches, and the ts is that name less the suffix."""
+    from types import SimpleNamespace
+
+    name = os.path.basename(mod.Repair._backup_dir(SimpleNamespace(backups="/b")))
+    assert mod.report_ts(name) == name[: -len(mod.SUFFIX)], name
+    for bad in (
+        "x-live-move-repair",
+        "20260101T000000Z-1; touch MARKER; #-live-move-repair",
+        "20260101T000000Z-1\n-live-move-repair",
+        "20260101T000000Z-\udcff-live-move-repair",
+        "2026010\u0661T000000Z-1-live-move-repair",  # a non-ASCII digit
+        "20260101T000000Z-1-live-move-repair.old",
+    ):
+        assert mod.report_ts(bad) is None, bad
+
+
+def _release(fifo: Path) -> None:
+    """Open the FIFO's write end once, so a reader blocked on it (the RED run)
+    returns; no reader, nothing to release."""
+    with contextlib.suppress(OSError):
+        os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+
+
+def test_a_fifo_report_is_refused_promptly(tmp_path):
+    """Codex c4401481304: a FIFO REPAIR.json is never opened for a blocking
+    read (that wedged the whole health snapshot); it is refused and counted."""
+    repo, d = _valid_report(tmp_path)
+    (d / "REPAIR.json").unlink()
+    os.mkfifo(d / "REPAIR.json")
+    try:
+        found = _collect_bounded(tmp_path, repo)
+    finally:
+        _release(d / "REPAIR.json")
+    assert found["saved"] == [] and found["malformed"] == 1, found
+    assert found["malformed_in"] == [], "a report never read is not named for --dismiss"
+
+
+def test_a_report_linked_to_an_endless_device_is_refused_promptly(tmp_path):
+    repo, d = _valid_report(tmp_path)
+    (d / "REPAIR.json").unlink()
+    os.symlink("/dev/zero", d / "REPAIR.json")
+    found = _collect_bounded(tmp_path, repo)
+    assert found["saved"] == [] and found["malformed"] == 1, found
+
+
+def test_a_report_over_the_byte_cap_is_refused(tmp_path):
+    mod = _writer()
+    repo, d = _valid_report(tmp_path)
+    body = (d / "REPAIR.json").read_text()
+    (d / "REPAIR.json").write_text(body + " " * mod.REPORT_BYTES)  # still valid JSON
+    found = _collect_bounded(tmp_path, repo)
+    assert found["saved"] == [] and found["malformed"] == 1, found
+
+
+def test_a_report_over_the_row_cap_is_refused(tmp_path):
+    mod = _writer()
+    repo, head = _git_repo(tmp_path)
+    rows = [{"path": f"r{n}"} for n in range(mod.REPORT_ROWS + 1)]
+    _report_at(tmp_path, "20260101T000000Z-1", result="healed", repo=str(repo), tag=head,
+               paths=rows, reapply=[])  # fmt: skip
+    found = _collect_bounded(tmp_path, repo)
+    assert found["saved"] == [] and found["malformed"] == 1, found
+
+
+def test_a_symlinked_report_dir_is_refused(tmp_path):
+    repo, d = _valid_report(tmp_path, "20260101T000000Z-1")
+    elsewhere = tmp_path / "elsewhere"
+    d.rename(elsewhere)
+    os.symlink(elsewhere, d)
+    found = _collect_bounded(tmp_path, repo)
+    assert found["saved"] == [] and found["malformed"] == 1, found
+
+
+def test_a_report_dir_name_the_writer_never_makes_is_refused(tmp_path):
+    """Codex c4401481317: the ts comes from the dir name, so a name that is not
+    the writer's format is refused whole and never reaches a shown command."""
+    repo, _ = _valid_report(tmp_path, "20260101T000000Z-1; touch MARKER; #")
+    found = _collect_bounded(tmp_path, repo)
+    assert found["saved"] == [] and found["malformed"] == 1, found
+    assert found["dismiss"] == [] and found["malformed_in"] == [], found
+    assert "MARKER" not in json.dumps(found), found
+
+
+def test_a_report_for_another_checkout_runs_no_git_there(tmp_path):
+    """The report's `repo` must be the deploy checkout the reader was given: git
+    never runs in a checkout a report names (git runs that checkout's
+    core.fsmonitor), and no step targets it."""
+    deploy, _ = _git_repo(tmp_path)
+    other = tmp_path / "other"
+    other.mkdir()
+    _git(other, "init", "-q")
+    (other / "kept").write_text("kept\n")
+    _git(other, "add", "-A")
+    _git(other, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "t")
+    marker = tmp_path / "fsmonitor-ran"
+    _git(other, "config", "core.fsmonitor", f"touch {marker}; false")
+    _report_at(tmp_path, "20260101T000000Z-1", result="healed", repo=str(other),
+               tag=_git(other, "rev-parse", "HEAD"), paths=[_row("Z", disk="absent")],
+               reapply=[])  # fmt: skip
+    marker.unlink(missing_ok=True)  # the config command itself may have run it
+    found = _collect_bounded(tmp_path, deploy)
+    assert not marker.exists(), "git ran in the checkout the report named"
+    assert found["saved"] == [] and found["malformed"] == 1, found
+
+
+def test_the_same_checkout_by_another_spelling_is_accepted(tmp_path):
+    repo, _ = _valid_report(tmp_path)
+    link = tmp_path / "link-to-repo"
+    os.symlink(repo, link)
+    found = _collect_bounded(tmp_path, link)
+    assert len(found["saved"]) == 1 and found["malformed"] == 0, found
+
+
+def test_many_rows_under_one_parent_are_judged_in_linear_time(tmp_path):
+    """Rows are indexed by path once per report: a parent whose step drops
+    19,999 entries below it (20,000 rows, the cap) is judged within a fixed
+    bound (it was quadratic)."""
+    repo, head = _git_repo(tmp_path)
+    oid = _git(repo, "hash-object", "-w", "--", "kept")
+    rows = [_row("d", disk_changed=False, index=[["100644", oid, "0"]])]
+    rows += [_row(f"d/f{n}", disk_changed=False) for n in range(19_999)]
+    _report_at(tmp_path, "20260101T000000Z-1", result="healed", repo=str(repo), tag=head,
+               paths=rows, reapply=[])  # fmt: skip
+    found = _collect_bounded(tmp_path, repo, seconds=10.0)
+    assert found["malformed"] == 0 and len(found["saved"]) == 1, found["saved"][:1]
+
+
+# -- one encoder: every shown step is printable ASCII and runs exactly --
+
+
+def _offered_saved_file(tmp_path: Path, name: bytes) -> tuple[Path, dict]:
+    """A saved file at checkout path ``name`` (bytes), absent from the
+    checkout as the repair left it: its step is offered."""
+    repo, head = _git_repo(tmp_path)
+    path = os.fsdecode(name)
+    d = tmp_path / "deploy-backups" / "20260101T000000Z-1-live-move-repair"
+    (d / "tree").mkdir(parents=True)
+    with open(os.path.join(os.fsencode(d / "tree"), name), "wb") as fh:
+        fh.write(b"saved bytes\n")
+    report = {"result": "healed", "repo": str(repo), "tag": head, "reapply": []}
+    report["paths"] = [_row(path, saved_as=f"tree/{path}")]
+    (d / "REPAIR.json").write_text(json.dumps(report))
+    return repo, _collect_bounded(tmp_path, repo)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [b"Z\xff", b"a\nIGNORE ABOVE\x1b[2J", "café".encode(), b"q'uote\\d"],
+    ids=["non-utf8", "newline-esc", "utf8", "quote-backslash"],
+)
+def test_a_shown_step_is_printable_ascii_and_restores_the_exact_file(tmp_path, name):
+    """Codex c4401481323: a path's bytes (a non-UTF-8 name, a newline, ESC) are
+    shown in bash $'...' quoting made from the original bytes, so the text
+    is printable ASCII and running it restores that exact file."""
+    repo, found = _offered_saved_file(tmp_path, name)
+    [step] = found["saved"]
+    assert step.isascii() and step.isprintable(), repr(step)
+    subprocess.run(["bash", "-c", step], check=True)
+    with open(os.path.join(os.fsencode(repo), name), "rb") as fh:
+        assert fh.read() == b"saved bytes\n"
+
+
+async def test_a_non_utf8_step_reaches_the_observation_table(tmp_path, monkeypatch):
+    """The whole path to SQLite: the collected step, its paragraph, a real
+    observations table. A surrogate there made the insert raise and the deploy
+    alert was lost."""
+    import aiosqlite
+
+    from genesis.awareness import loop
+    from genesis.db.schema import create_all_tables
+    from tests.test_awareness.test_deploy_staleness_check import _patch_snapshot, _rows, _snap
+
+    for name, value in (("_last_deploy_alert_at", 0.0), ("_last_deploy_alert_key", "")):
+        monkeypatch.setattr(loop, name, value)
+    _repo, found = _offered_saved_file(tmp_path, b"Z\xff")
+    snap = _snap(_dh().live_repair_findings(found))
+    snap["live_repairs"] = found
+    _patch_snapshot(monkeypatch, snap)
+    db = await aiosqlite.connect(":memory:")
+    db.row_factory = aiosqlite.Row
+    try:
+        await create_all_tables(db)
+        await loop._check_deploy_staleness(db)
+        [row] = await _rows(db)
+    finally:
+        await db.close()
+    assert found["saved"][0] in row["content"], row["content"]
+
+
+# -- the guardian's pick applies the loader's rules (it cannot import it) --
+
+
+def test_the_guardian_pick_shares_the_loaders_name_rule_and_cap(mod):
+    """The pick runs as `python3 -I -S -` inside the container, so it carries
+    its own copy of the loader's rules: the same name pattern, the same cap."""
+    from genesis.guardian import collector as gc
+
+    assert mod.REPORT_NAME.pattern == gc._REPAIR_NAME
+    assert gc._REPAIR_REPORT_BYTES == mod.REPORT_BYTES
+
+
+@pytest.mark.parametrize("case", ["bad-name", "linked-dir"])
+def test_the_guardian_pick_refuses_what_the_loader_refuses(tmp_path, mod, case):
+    """A name the writer never makes, and a symlinked report dir, are skipped by
+    the pick as by load_report (the control: the same report as a plain dir
+    with the writer's name is picked)."""
+    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + "-1"
+    gen = tmp_path / ".genesis"
+    report = {"ts": ts, "result": "healed", "repo": "/r", "paths": [], "reapply": []}
+    _report_at(gen, ts, **report)
+    assert _guardian_pick(tmp_path) is not None, "control: the plain report is picked"
+    d = gen / "deploy-backups" / f"{ts}{mod.SUFFIX}"
+    if case == "bad-name":
+        d.rename(d.with_name(f"{ts}; x{mod.SUFFIX}"))
+    else:
+        elsewhere = tmp_path / "elsewhere"
+        d.rename(elsewhere)
+        os.symlink(elsewhere, d)
+    with pytest.raises(mod.BadReport):
+        mod.load_report(str(next((gen / "deploy-backups").iterdir())), "/r")
+    assert _guardian_pick(tmp_path) is None
