@@ -247,10 +247,26 @@ inherit it.
   memory hook as a child never posts to the live server.
 - `GENESIS_MCP_LOG_DIR` names a directory that does not exist, so importing the
   health MCP opens no log in the shared `~/tmp`.
+- `HOME` names a private directory for the whole session, created when the
+  plugin is imported (before any `genesis` module loads, so nothing binds the
+  real home first), with `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`
+  and `XDG_STATE_HOME` inside it. Anything resolved through `Path.home()`, `~`
+  or those variables (tokens, the Guardian's shared policy file, caches,
+  stamps, logs, `~/tmp` scratch, `~/.claude`, `~/.genesis`, `~/.ssh`,
+  `~/.aws`) lands there instead. It starts with only `tmp/`. It sits in the
+  real home's big-tmp directory (`GENESIS_BIG_TMP`, else `~/tmp`) where the
+  basetemp redirect applies, else in the default temp dir, and is removed at
+  the end of the run; a killed run's home ages out through the daily `~/tmp`
+  prune. The box lock and basetemp are placed with `HOME` set back to what it
+  was when the run started, so both keep their locations. `tests._live_fence.real_home()` names
+  the real home for a test that must use it, and `PLAYWRIGHT_BROWSERS_PATH`
+  keeps pointing at the real browser cache so the UI tests find their browser.
+  The run summary names the home, and any `genesis` module that was already
+  loaded when it was set (none is expected).
 - A test that sets its own value with `monkeypatch` still wins.
-- `GENESIS_LIVE_E2E=1` (the opt-in live tests) leaves `SECRETS_PATH` and the
-  credential variables in place, and the summary says so; the git, gh,
-  database, hook-URL and log settings still apply.
+- `GENESIS_LIVE_E2E=1` (the opt-in live tests) leaves `SECRETS_PATH`, the
+  credential variables and `HOME` in place, and the summary says so; the git,
+  gh, database, hook-URL and log settings still apply.
 - The closure's directory is removed at the end of the run; a child that
   outlives pytest is left with paths that do not exist, so no credentials.
 - Not covered:
@@ -260,11 +276,19 @@ inherit it.
     `*_BEARER*`, a bare `*_KEY` or `*_PWD`, a DSN, a credential embedded in a
     URL value (`DATABASE_URL`, `HTTP_PROXY`), or a variable pointing at a
     credential file (`AWS_PROFILE`, `DOCKER_CONFIG`, `NETRC`, `KUBECONFIG`);
-  - credentials a program finds through the home directory rather than the
-    environment (`~/.ssh`, tool config files);
-  - a child started with an environment that does not carry these variables,
-    including tests that strip every `GIT_*` variable from a child (its git
-    then reads the home's user config again);
+  - a path resolved from the password database rather than `HOME` (OpenSSH
+    finds `~/.ssh` that way), and a child started with an environment that has
+    no `HOME` at all (Python and bash then fall back to the real home);
+  - an explicit `GENESIS_HOME` a test or the environment sets, and an explicit
+    `GENESIS_BIG_TMP`, which `big_tmp_dir()` keeps using as given;
+  - other variables that already hold a path under the real home when the
+    run starts (a plugin's data directory, a session socket): they are
+    passed through unchanged;
+  - `tempfile` output, which goes to `TMPDIR` (on some installs a directory in
+    the real home);
+  - a child started with an environment that does not carry these variables
+    (a test that strips every `GIT_*` variable from a child still leaves it
+    the private `HOME`, so its git reads only the empty test home's config);
   - a repository-local `core.askPass` or `credential.helper`.
 
 ## Integration Tests

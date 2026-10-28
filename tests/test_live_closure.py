@@ -11,11 +11,12 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePath
 
 import pytest
 
 from tests import _live_closure as closure
+from tests import _live_fence
 
 _REPO = Path(__file__).resolve().parent.parent
 _SECRETS_HALF_OFF = pytest.mark.skipif(
@@ -27,8 +28,10 @@ _CLOSURE_VARS = (
     "PYTEST_CURRENT_TEST", "GENESIS_LIVE_E2E", "GENESIS_DB_PATH", "SECRETS_PATH",
     "GENESIS_PROACTIVE_HOOK_URL", "GENESIS_MCP_LOG_DIR", "GH_CONFIG_DIR",
     "GIT_TERMINAL_PROMPT", "GIT_SSH_COMMAND", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM",
-    "GIT_CONFIG_SYSTEM",
+    "GIT_CONFIG_SYSTEM", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME",
 )  # fmt: skip
+# The home of the user running the suite: this session's HOME is a private one.
+_REAL_HOME = _live_fence.real_home()
 
 
 def test_the_root_conftest_names_the_closure_in_pytest_plugins(request):
@@ -132,9 +135,12 @@ def pytest_configure(config):
 
 
 def pytest_unconfigure(config):
+    import shutil
+
     from tests import _live_closure
 
     _live_closure.uninstall_files(config)
+    shutil.rmtree(getattr(config, "_genesis_live_home_cleanup", "") or "/nonexistent", ignore_errors=True)
 """
 
 # A ``test*`` subdirectory conftest of a directory argument: pytest imports it
@@ -147,6 +153,9 @@ import genesis.mcp.health.task_tools  # noqa: F401
 
 print("EARLY_ENV=" + os.environ.get("GENESIS_DB_PATH", "<unset>"))
 print("EARLY_SECRETS=" + os.environ.get("SECRETS_PATH", "<unset>"))
+from pathlib import Path as _P  # noqa: E402
+
+print("EARLY_HOME=" + str(_P.home()))
 if os.environ.get("CLOSURE_PROBE_RESET_DB"):
     # Something resetting the variable between the plugin's import and configure.
     os.environ["GENESIS_DB_PATH"] = os.environ["CLOSURE_PROBE_RESET_DB"]
@@ -168,7 +177,18 @@ def _git(*args, env=None):
 
 
 def test_bound():
+    import sys
+    from pathlib import Path
+
     print("BASE=" + _live_closure._S.base)
+    print("GENESIS_AT_IMPORT=" + ",".join(_live_closure._S.genesis_at_import))
+    print("TEST_HOME=" + str(Path.home()))
+    child = subprocess.run(
+        [sys.executable, "-c", "from pathlib import Path; print(Path.home())"],
+        capture_output=True, text=True, check=True,
+    )
+    print("CHILD_HOME=" + child.stdout.strip())
+    print("XDG_CONFIG_HOME=" + os.environ.get("XDG_CONFIG_HOME", "<unset>"))
     print("DB_CONST=" + str(connection.DEFAULT_DB_PATH))
     print("DB_DEFAULT=" + str(inspect.signature(connection.init_db).parameters["path"].default))
     print("TASK_DB=" + str(task_tools._DB_PATH))
@@ -209,6 +229,9 @@ def _subrun(tmp_path: Path, extra_env: dict[str, str] | None = None) -> subproce
     env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(_REPO), str(_REPO / "src")])}
     for name in _CLOSURE_VARS:
         env.pop(name, None)
+    # The parent's HOME is this session's private one: hand the sub-run the real
+    # home, so its own redirect is what it shows.
+    env["HOME"] = _REAL_HOME or env["HOME"]
     env.update(extra_env or {})
     out = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-s", "-p", "no:cacheprovider", str(tmp_path)],
@@ -256,8 +279,9 @@ def test_an_opt_in_live_run_keeps_the_state_closures(tmp_path):
     assert _value(out.stdout, "DB_CONST") == expected, out.stdout
     assert _value(out.stdout, "HOOK_URL") == "http://127.0.0.1:9"
     assert _value(out.stdout, "CLOSURE_PROBE_API_KEY") == "probe-value"
-    assert "GENESIS_LIVE_E2E=1, secrets left in place" in out.stdout
+    assert "GENESIS_LIVE_E2E=1, secrets and HOME left in place" in out.stdout
     assert _value(out.stdout, "GIT_CONFIG_GLOBAL") == os.devnull
+    assert _value(out.stdout, "TEST_HOME") == (_REAL_HOME or "")  # HOME untouched
 
 
 def test_the_closure_directory_is_removed_at_unconfigure(tmp_path):
@@ -335,3 +359,160 @@ def test_git_askpass_helpers_and_inherited_config_are_removed(tmp_path):
     ):  # fmt: skip
         assert _value(out.stdout, name) == "<absent>", out.stdout
     assert _value(out.stdout, "GIT_HELPER") == "", out.stdout
+
+
+def test_the_home_is_private_from_before_any_subdirectory_conftest(tmp_path):
+    """Acceptance 1: no ``genesis`` module is loaded when the closure is imported,
+    a ``tests/test*/conftest.py`` already sees the private home, and so do a test
+    and the children it starts. Nothing needs moving afterwards."""
+    out = _subrun(tmp_path)
+    home = _value(out.stdout, "TEST_HOME")
+    assert _value(out.stdout, "GENESIS_AT_IMPORT") == "", out.stdout
+    assert home != _REAL_HOME and "genesis-test-home-" in home, out.stdout
+    assert _value(out.stdout, "EARLY_HOME") == home, out.stdout
+    assert _value(out.stdout, "CHILD_HOME") == home, out.stdout
+    assert _value(out.stdout, "XDG_CONFIG_HOME") == str(Path(home) / ".config")
+    assert "HOME redirected" in out.stdout
+    assert not os.path.exists(home)  # removed at the end of that run
+
+
+def test_this_session_runs_with_a_private_home():
+    if not closure._S.home:
+        pytest.skip("HOME not redirected (GENESIS_LIVE_E2E=1, or it could not be)")
+    home = Path(closure._S.home)
+    assert Path.home() == home and str(home) != _REAL_HOME
+    assert (home / "tmp").is_dir()
+    for name, rel in closure._XDG_ROOTS.items():
+        assert os.environ[name] == str(home / rel), name
+    assert closure._S.genesis_at_import == ()
+
+
+_STATE_ROOTS = (".genesis", ".claude", "tmp", ".cache", ".config", ".local/share", ".local/state")
+
+
+def test_no_genesis_module_holds_a_state_path_under_the_real_home():
+    """The check that replaces moving paths after the fact: every ``genesis``
+    module loaded so far (configure's lock and tmp modules included) resolved
+    the private home. The checkout itself may live under the real home."""
+    if not closure._S.home or _REAL_HOME is None:
+        pytest.skip("HOME not redirected here")
+    roots = [Path(_REAL_HOME, r) for r in _STATE_ROOTS]
+    # The test home itself sits in the real ~/tmp; paths inside it are private.
+    ours = Path(closure._S.home)
+    offenders = []
+    for name, module in list(sys.modules.items()):
+        if module is None or not (name == "genesis" or name.startswith("genesis.")):
+            continue
+        for attr, value in list(vars(module).items()):
+            if (
+                isinstance(value, PurePath)
+                and value != ours
+                and ours not in value.parents
+                and any(value == root or root in value.parents for root in roots)
+            ):
+                offenders.append(f"{name}.{attr}={value}")
+    assert offenders == []
+
+
+def test_the_box_lock_and_basetemp_keep_their_real_home_locations(request):
+    """Acceptance 4: placed with HOME set back to the real home, so neither moved
+    into the private one."""
+    from genesis.util import pytest_lock
+
+    if not closure._S.home:
+        pytest.skip("HOME not redirected here")
+    home = Path(closure._S.home)
+    basetemp = Path(request.config._tmp_path_factory.getbasetemp())
+    assert home not in basetemp.parents and basetemp != home
+    lock = request.config._genesis_pytest_lock
+    if lock.acquired:
+        path = Path(lock._path)
+        assert home not in path.parents
+        if not os.environ.get(pytest_lock.PATH_ENV) and _REAL_HOME:
+            assert Path(_REAL_HOME, ".genesis") in path.parents, path
+        return
+    # Placed under the private home (no .genesis there), the lock path would be
+    # None and the run would silently take no lock at all.
+    excused = [
+        name
+        for name in (pytest_lock.HELD_ENV, pytest_lock.DISABLE_ENV, pytest_lock.PATH_ENV)
+        if os.environ.get(name)
+    ]
+    if excused or not _REAL_HOME or not Path(_REAL_HOME, ".genesis").is_dir():
+        pytest.skip(f"no lock expected here ({excused or 'no install'})")
+    pytest.fail("an install exists and nothing excused the box lock, yet none was taken")
+
+
+def test_configure_places_basetemp_by_the_real_home_not_the_test_home(tmp_path, monkeypatch):
+    """Acceptance 4, independent of how this run was launched (a runner that
+    holds the box lock or passes --basetemp hides it from the test above):
+    ``tests/conftest.py``'s ``pytest_configure``, driven with HOME set to the
+    session's private home, places basetemp under ``tmp`` of HOME as the run
+    started. That HOME is a fixture, so nothing touches the real one, and it
+    differs from the passwd entry, which is what the placement must NOT follow
+    (``sudo -E`` or an overridden HOME)."""
+    import importlib.util
+    from types import SimpleNamespace
+
+    if not closure._S.home:
+        pytest.skip("HOME not redirected here")
+    fake_real = tmp_path / "real-home"
+    (fake_real / "tmp").mkdir(parents=True)
+    monkeypatch.setattr(closure._S, "home_before", str(fake_real))
+    assert _live_fence.real_home() != str(fake_real)
+    monkeypatch.setenv("HOME", closure._S.home)
+    monkeypatch.delenv("GENESIS_BIG_TMP", raising=False)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("TMPDIR", raising=False)
+    monkeypatch.setenv("GENESIS_PYTEST_LOCK", "0")
+    spec = importlib.util.spec_from_file_location(
+        "_genesis_conftest_probe_closure", _REPO / "tests" / "conftest.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    config = SimpleNamespace(
+        option=SimpleNamespace(basetemp=None), pluginmanager=pytest.PytestPluginManager()
+    )
+    mod.pytest_configure(config)
+    try:
+        assert config.option.basetemp == str(fake_real / "tmp" / "pytest" / str(os.getpid()))
+        assert os.environ["HOME"] == closure._S.home  # restored after placement
+    finally:
+        mod.pytest_unconfigure(config)
+
+
+def test_real_home_falls_back_to_the_starting_home_without_a_passwd_entry(monkeypatch):
+    """Numeric-UID containers need not have an /etc/passwd entry: the lookup must
+    not stop collection, only an absolute HOME counts, and it is HOME as the run
+    started. The live HOME is the session's private home by then, and taking it
+    would point the fence and the box lock at the wrong tree."""
+
+    def no_entry(uid):
+        raise KeyError(uid)
+
+    monkeypatch.setattr(_live_fence.pwd, "getpwuid", no_entry)
+    monkeypatch.setenv("HOME", "/the/private/home")  # the redirect, as in a run
+    monkeypatch.setattr(_live_fence, "_HOME_AT_IMPORT", "/some/home")
+    assert _live_fence.real_home() == "/some/home"
+    monkeypatch.setattr(_live_fence, "_HOME_AT_IMPORT", "relative/home")
+    assert _live_fence.real_home() is None
+    monkeypatch.setattr(_live_fence, "_HOME_AT_IMPORT", None)
+    assert _live_fence.real_home() is None
+
+
+def test_the_fence_module_saw_home_before_the_redirect():
+    if not closure._S.home:
+        pytest.skip("HOME not redirected here")
+    assert closure._S.home_before == _live_fence._HOME_AT_IMPORT
+    assert closure._S.home != _live_fence._HOME_AT_IMPORT
+
+
+def test_the_update_routes_bind_the_private_home():
+    """#3660: the update routes' state files, bound at import, sit under the
+    session's private home, so a test that starts the real orchestrator cannot
+    remove the real update_refused.json."""
+    from genesis.dashboard.routes import updates
+
+    if not closure._S.home:
+        pytest.skip("HOME not redirected here")
+    assert Path(closure._S.home) in updates._REFUSED_FILE.parents

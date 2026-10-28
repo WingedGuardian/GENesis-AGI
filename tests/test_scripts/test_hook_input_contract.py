@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pytest
 
+from tests import _live_fence
+
 _REPO = Path(__file__).resolve().parents[2]
 _SCRIPTS = _REPO / "scripts"
 
@@ -76,7 +78,10 @@ def _run(script_rel: str, stdin: str, *, env_var: str | None = None, dispatched:
 # Install-agnostic triggers: the destructive guard blocks by path breadth (home
 # is a shallow path on any runner); the protected-paths guard matches the `~`
 # alias, so neither case hardcodes this box's `/home/ubuntu`.
-_HOME = str(Path.home())
+# The REAL home as literal text: the live closure gives the session a deep
+# private HOME, which as an absolute path would clear the destructive guard's
+# depth floor. Only the command text uses it; the guards run with the test HOME.
+_HOME = _live_fence.real_home() or str(Path.home())
 
 # (script, tool_name, tool_input, must_block) — the safety-critical exit-2 guards.
 _BLOCKING_CASES = [

@@ -40,17 +40,29 @@ closure too:
   the memory hook as a child never posts to the live server.
 - ``GENESIS_MCP_LOG_DIR`` names a directory that does not exist, so importing the
   health MCP's browser module opens no log in the shared ``~/tmp``.
+- ``HOME`` names a private directory for the session, with the four XDG base
+  directories inside it, so everything resolved through ``Path.home()``, ``~``
+  or XDG (tokens, the Guardian's shared policy file, caches, stamps, logs,
+  ``~/tmp`` scratch, ``~/.claude``, ``~/.genesis``, tool credential files) uses
+  it instead of the real home. It is made when this plugin is imported, before
+  any ``genesis`` module loads, so no module binds the real home first (the
+  summary names any that had; none is expected). It sits in the real home's
+  big-tmp directory where the suite's basetemp redirect applies, else in the
+  default temp dir; ``tests/conftest.py`` places the box lock and basetemp with
+  ``HOME`` set back to the real home and removes this one at unconfigure.
+  ``tests._live_fence.real_home()`` names the real home for tests that must;
+  ``PLAYWRIGHT_BROWSERS_PATH`` keeps naming the real browser cache.
 
-Everything but ``SECRETS_PATH`` and ``GENESIS_DB_PATH`` is set in
+Everything but ``SECRETS_PATH``, ``GENESIS_DB_PATH`` and ``HOME`` is set in
 ``pytest_configure``: a ``tests/test*/conftest.py`` that read a credential, ran
 git, or imported the memory hook or the health MCP's browser module would see
 the real values first (none does).
 
 A test that sets its own value (``monkeypatch.setenv``) still wins: the closure
 is applied before any test runs. With ``GENESIS_LIVE_E2E=1`` the opt-in live
-tests need real credentials, so ``SECRETS_PATH`` and the credential removal are
-skipped and the summary says so; the git, gh, database, hook-URL and log
-closures stay on.
+tests need real credentials and act on the live install's state, so
+``SECRETS_PATH``, the credential removal and the HOME redirect are skipped and
+the summary says so; the git, gh, database, hook-URL and log closures stay on.
 
 Why at import: ``tests/conftest.py`` names this plugin in ``pytest_plugins``, so
 pytest imports it while registering the root conftest, before it imports any
@@ -67,12 +79,12 @@ it is still never the live database.
 
 Not covered (stated residuals): a reader that builds its own path to
 ``secrets.env`` or the database instead of honouring these variables; a
-credential under a name the rule does not match; credentials a program finds
-through the home directory rather than the environment (``~/.ssh``, tool
-config files: the private-HOME closure is the answer there); a child started
-with an environment that does not carry these variables, including the tests
-that strip every ``GIT_*`` variable from a child's environment (its git then
-reads the home's user config again); a repository-local ``core.askPass`` or
+credential under a name the rule does not match; a path resolved from the
+password database rather than HOME (OpenSSH finds ``~/.ssh`` that way), and a
+child started with no ``HOME`` at all (Python and bash then fall back to the
+real home); an explicit ``GENESIS_HOME``; ``tempfile`` output, which follows
+``TMPDIR``; a child started with an environment that does not carry these
+variables; a repository-local ``core.askPass`` or
 ``credential.helper``; and every credential name class listed in
 ``docs/reference/testing.md`` ("Not covered").
 """
@@ -80,6 +92,7 @@ reads the home's user config again); a repository-local ``core.askPass`` or
 from __future__ import annotations
 
 import atexit
+import importlib.util
 import os
 import re
 import shutil
@@ -88,6 +101,8 @@ import tempfile
 from pathlib import Path
 
 import pytest
+
+from tests import _live_fence
 
 _CREDENTIAL_NAME = re.compile(
     r"_API_KEY|^API_KEY_|^API_KEY$|_TOKEN$|_SECRET|PASSWORD|PASSPHRASE|_PASS$|WEBHOOK"
@@ -108,14 +123,107 @@ _NEVER = re.compile(r"^(PYTEST_|GENESIS_LIVE_)|^(GUARDIAN_SECRETS|GENESIS_SECRET
 _CLOSED_PORT_URL = "http://127.0.0.1:9"  # discard port: nothing listens
 
 
+_XDG_ROOTS = {
+    "XDG_CONFIG_HOME": ".config",
+    "XDG_DATA_HOME": ".local/share",
+    "XDG_CACHE_HOME": ".cache",
+    "XDG_STATE_HOME": ".local/state",
+}
+
+
 class _State:
     installed = False
     base = ""  # the closure's own directory, made at import
     live_e2e = False
     removed: tuple[str, ...] = ()
+    home = ""  # the session's test HOME, "" when not redirected
+    real_home: str | None = None
+    # HOME as the run started (None when unset). The box lock and basetemp are
+    # placed from this, as Path.home() places them without the closure.
+    home_before: str | None = None
+    # genesis modules already loaded when this plugin was imported: each could
+    # have bound the real home before the redirect. Expected empty.
+    genesis_at_import: tuple[str, ...] = ()
 
 
 _S = _State()
+
+
+def _load_tmp_policy():
+    """``genesis/util/tmp.py`` by file path, under a private name.
+
+    Importing it as ``genesis.util.tmp`` would first run
+    ``genesis/util/__init__.py``, whose ``process_lock`` binds ``Path.home()``
+    at import, before the redirect below. The file imports only os and pathlib."""
+    path = Path(__file__).resolve().parent.parent / "src" / "genesis" / "util" / "tmp.py"
+    spec = importlib.util.spec_from_file_location("_genesis_live_closure_tmp_policy", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _home_parent(real: str | None) -> str | None:
+    """Where the test home goes: the real home's big-tmp directory
+    (``GENESIS_BIG_TMP``, else ``<real home>/tmp``, created when missing as
+    ``big_tmp_dir()`` does) when the suite's basetemp redirect applies there,
+    else the default temp dir (``None``).
+
+    ``real`` is the home ``Path.home()`` gave as the run started. An explicit
+    ``--basetemp`` is not known when this runs (no config object at plugin
+    import), so it is judged as absent."""
+    if real is None:
+        return None
+    try:
+        policy = _load_tmp_policy()
+        if not policy.should_redirect_pytest_basetemp(
+            current_basetemp=None,
+            ci_env=os.environ.get("CI"),
+            tmpdir_env=os.environ.get("TMPDIR"),
+        ):
+            return None
+    except Exception as exc:  # noqa: BLE001 - placement only; the default temp dir is safe
+        sys.stderr.write(f"genesis: test HOME placed in the default temp dir ({exc!r})\n")
+        return None
+    big = os.environ.get("GENESIS_BIG_TMP") or os.path.join(real, "tmp")
+    try:
+        os.makedirs(big, exist_ok=True)
+    except OSError as exc:
+        sys.stderr.write(f"genesis: test HOME placed in the default temp dir ({exc})\n")
+        return None
+    return big
+
+
+def _starting_home() -> str | None:
+    """``Path.home()`` as the run started: HOME when set and absolute, else the
+    passwd entry (``real_home()``)."""
+    if _S.home_before and os.path.isabs(_S.home_before):
+        return _S.home_before
+    return _S.real_home
+
+
+def _redirect_home() -> None:
+    """Point HOME, and the four XDG base directories, at a private directory for
+    the session (see the module notes). On failure the run keeps the real home
+    and says so: the status quo, never a failed collection."""
+    try:
+        parent = _home_parent(_starting_home())
+        home = Path(tempfile.mkdtemp(prefix="genesis-test-home-", dir=parent))
+        (home / "tmp").mkdir()
+    except OSError as exc:
+        sys.stderr.write(f"genesis: test HOME not redirected ({exc}); tests use the real home\n")
+        return
+    started = _starting_home()
+    if started is not None:
+        # Playwright resolves its cache from HOME, as the lock and basetemp do.
+        cache = Path(started) / ".cache" / "ms-playwright"
+        if "PLAYWRIGHT_BROWSERS_PATH" not in os.environ and cache.is_dir():
+            # Read-only use: the UI tests still find their browser.
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(cache)
+    os.environ["HOME"] = str(home)
+    for name, rel in _XDG_ROOTS.items():
+        os.environ[name] = str(home / rel)
+    _S.home = str(home)
+
 
 # Set when this plugin is IMPORTED, not in install(): see the module docstring.
 _S.base = tempfile.mkdtemp(prefix="genesis-live-closure-")
@@ -129,6 +237,22 @@ _NO_SECRETS = str(Path(_S.base) / "no-secrets.env")
 os.environ["GENESIS_DB_PATH"] = _IMPORT_TIME_DB
 if os.environ.get("GENESIS_LIVE_E2E") != "1":
     os.environ["SECRETS_PATH"] = _NO_SECRETS
+_S.real_home = _live_fence.real_home()
+_S.home_before = os.environ.get("HOME")
+if os.environ.get("GENESIS_LIVE_E2E") != "1":
+    _redirect_home()
+# Taken after the redirect, so a genesis import made while placing it counts too.
+_S.genesis_at_import = tuple(
+    sorted(m for m in sys.modules if m == "genesis" or m.startswith("genesis."))
+)
+if _S.genesis_at_import:
+    sys.stderr.write(
+        "genesis: modules loaded before the live closure redirected HOME may hold "
+        "the real home: " + ", ".join(_S.genesis_at_import) + "\n"
+    )
+# The same fallback as the closure's own directory; tests/conftest.py removes it
+# in pytest_unconfigure (read-only trees such as git objects need its forced form).
+atexit.register(lambda: _S.installed or not _S.home or shutil.rmtree(_S.home, ignore_errors=True))
 
 
 def credential_names(environ) -> list[str]:
@@ -178,6 +302,8 @@ def install(config) -> None:
     # run to the MCP servers' shared ~/tmp/mcp_health.log.
     os.environ["GENESIS_MCP_LOG_DIR"] = str(Path(_S.base) / "no-mcp-log")
     config._genesis_live_closure_dir = _S.base
+    if _S.home:
+        config._genesis_live_home_cleanup = _S.home
     _S.installed = True
 
 
@@ -212,9 +338,15 @@ def pytest_terminal_summary(terminalreporter):
     if not _S.installed:
         return
     tr = terminalreporter
+    if _S.genesis_at_import:
+        tr.section("live closure: modules loaded before the HOME redirect", red=True)
+        tr.write_line(", ".join(_S.genesis_at_import))
     if _S.live_e2e:
-        tr.section("live closure: GENESIS_LIVE_E2E=1, secrets left in place")
+        tr.section("live closure: GENESIS_LIVE_E2E=1, secrets and HOME left in place")
         return
+    if _S.home:
+        tr.section("live closure: HOME redirected for this run")
+        tr.write_line(f"HOME={_S.home} (XDG base directories inside it)")
     if _S.removed:
         tr.section("live closure: credential variables removed for this run")
         tr.write_line(", ".join(_S.removed))
