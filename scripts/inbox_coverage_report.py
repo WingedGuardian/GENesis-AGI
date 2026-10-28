@@ -23,6 +23,7 @@ import os
 import sqlite3
 import sys
 from collections.abc import Callable
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -59,6 +60,9 @@ class RowInput:
     processed_at: str | None
     rowid: int
     item_urls: list[str] | None
+    # normalized URL -> original URL as stored, so the coverage check runs on
+    # the same token the live gate sees (matching uses the normalized form).
+    item_raw: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -68,7 +72,7 @@ class Report:
     totals: dict[str, int] = field(default_factory=dict)
 
 
-def _row_item_urls(batch_items: object) -> list[str] | None:
+def _row_item_urls(batch_items: object) -> tuple[list[str], dict[str, str]] | None:
     """A row's item URLs, or ``None`` when the row is legacy.
 
     Only a ``BATCH_ITEMS_V2_PREFIX`` payload decodes into item texts; anything
@@ -90,6 +94,7 @@ def _row_item_urls(batch_items: object) -> list[str] | None:
         return None
     urls: list[str] = []
     seen: set[str] = set()
+    raw_by_norm: dict[str, str] = {}
     for item in items:
         if not isinstance(item, str):
             continue
@@ -98,7 +103,8 @@ def _row_item_urls(batch_items: object) -> list[str] | None:
             if url not in seen:
                 seen.add(url)
                 urls.append(url)
-    return urls
+                raw_by_norm[url] = raw
+    return urls, raw_by_norm
 
 
 def _entry(url: str, cls: str, response="", covered="", reason="") -> dict:
@@ -145,7 +151,11 @@ def _classify_url(
                 response, covered = "missing", "unknown"
             else:
                 response = "present"
-                covered = "yes" if _uncovered_urls(text, url) == [] else "no"
+                # The live gate judges coverage on the ORIGINAL item URL —
+                # tracking params stripped for matching would wrongly convict
+                # a response that cited exactly what the item carried.
+                cited = row.item_raw.get(url, url)
+                covered = "yes" if _uncovered_urls(text, cited) == [] else "no"
         return _entry(url, "evaluated", response, covered)
 
     if _attributed(rows, url, ("pending", "processing")):
@@ -260,6 +270,9 @@ def _scan_notes(inbox: Path, file_name: str | None) -> list[NoteInput]:
             continue
         if path.name.endswith(RESPONSE_SUFFIX):
             continue
+        # Sync-conflict and temp files are artifacts, never notes.
+        if ".sync-conflict-" in path.name or path.name.endswith(".tmp"):
+            continue
         rel = path.relative_to(inbox)
         if file_name is not None and path.name != file_name:
             continue
@@ -292,7 +305,7 @@ def main(argv: list[str] | None = None) -> int:
     notes = _scan_notes(inbox.resolve(), args.file)
 
     rows_by_file: dict[str, list[RowInput]] = {}
-    with connect_readonly(args.db) as conn:
+    with closing(connect_readonly(args.db)) as conn:
         for note in notes:
             rows_by_file[note.path] = [
                 RowInput(
@@ -301,13 +314,15 @@ def main(argv: list[str] | None = None) -> int:
                     response_path=r[2],
                     processed_at=r[3],
                     rowid=r[4],
-                    item_urls=_row_item_urls(r[5]),
+                    item_urls=decoded[0] if decoded else None,
+                    item_raw=decoded[1] if decoded else {},
                 )
                 for r in conn.execute(
                     "SELECT status, error_message, response_path, processed_at,"
                     " rowid, batch_items FROM inbox_items WHERE file_path = ?",
                     (note.path,),
                 )
+                for decoded in [_row_item_urls(r[5])]
             ]
 
     generated_at = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -325,6 +340,23 @@ def main(argv: list[str] | None = None) -> int:
             return None
 
     report = build_report(notes, rows_by_file, _read_response)
+
+    # The output is the report's ONLY write, so it must never land on the
+    # read-only corpus: an inbox note or a *.genesis.md response named by
+    # --out would be truncated. Resolve first so symlinks cannot smuggle a
+    # target inside the inbox.
+    out_resolved = out.resolve()
+    from genesis.inbox.scanner import RESPONSE_SUFFIX
+
+    if out_resolved.is_relative_to(inbox.resolve()) or (
+        out_resolved.name.endswith(RESPONSE_SUFFIX) and out_resolved.exists()
+    ):
+        print(
+            f"refusing to write the report over inbox/response file: {out}",
+            file=sys.stderr,
+        )
+        return 2
+
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(
         render_md(report, generated_at=generated_at, inbox=str(inbox), db=str(args.db))

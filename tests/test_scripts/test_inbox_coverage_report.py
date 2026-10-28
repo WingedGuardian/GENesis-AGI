@@ -320,6 +320,55 @@ def test_missing_db_exits_2(tmp_path: Path) -> None:
     assert rc == 2
 
 
+def test_out_inside_inbox_exits_2(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    note = inbox / "note.md"
+    note.write_text(f"{URL}\n")
+    db = tmp_path / "genesis.db"
+    _make_db(db)
+    rc = _rep.main(
+        ["--inbox", str(inbox), "--db", str(db), "--out", str(note)]
+    )
+    assert rc == 2
+    assert note.read_text() == f"{URL}\n"
+
+
+def test_response_file_out_exits_2(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    (inbox / "note.md").write_text(f"{URL}\n")
+    response = tmp_path / "note.genesis.md"
+    response.write_text(f"**Source:** {URL}\n")
+    db = tmp_path / "genesis.db"
+    _make_db(db)
+    rc = _rep.main(
+        ["--inbox", str(inbox), "--db", str(db), "--out", str(response)]
+    )
+    assert rc == 2
+    assert response.read_text() == f"**Source:** {URL}\n"
+
+
+def test_tracked_url_coverage_uses_original(tmp_path: Path) -> None:
+    tracked = f"{URL}?utm_source=x"
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    note = inbox / "note.md"
+    note.write_text(f"{tracked}\n")
+    # The response cited exactly what the item carried — the live gate calls
+    # that covered, and the report must agree.
+    response = tmp_path / "r.genesis.md"
+    response.write_text(f"**Source:** {tracked}\n")
+    db = tmp_path / "genesis.db"
+    _make_db(db)
+    _insert(db, note, batch_items=_v2(tracked), response_path=str(response))
+    out = tmp_path / "out.md"
+    assert _rep.main(
+        ["--inbox", str(inbox), "--db", str(db), "--out", str(out)]
+    ) == 0
+    assert f"| {URL} | evaluated | present | yes |  |" in out.read_text()
+
+
 def test_render_has_denominators(tmp_path: Path) -> None:
     _, _, _, md = _run(tmp_path, note_text=f"{URL}\nhttps://example.org/b\n")
     assert (
