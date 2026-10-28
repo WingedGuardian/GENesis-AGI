@@ -4913,12 +4913,15 @@ def test_build_env_refuses_when_an_override_strips_the_confinement(invoker):
         )
 
 
-def test_an_unallowlisted_invocation_is_untouched_by_any_of_this(invoker):
+def test_an_unallowlisted_invocation_is_untouched_by_any_of_this(invoker, monkeypatch):
     """No allowlist, no hardening, no refusal — the collateral-damage arm.
 
     Without it a refusal that fired on every dispatch would look exactly like
     a working confinement.
     """
+    # The test session sets XDG_DATA_HOME (the live closure's private home); the
+    # child would inherit it. This arm is about what the invoker ADDS.
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
     env = invoker._build_env(CCInvocation(prompt="hi"))
     assert "GENESIS_BASH_ALLOWLIST" not in env
     assert "XDG_DATA_HOME" not in env

@@ -394,8 +394,49 @@ def _is_introspection_only(config) -> bool:
 pytest_plugins = ["tests._live_fence", "tests._live_closure"]
 
 
+@contextlib.contextmanager
+def _placed_by_the_real_home():
+    """HOME set back to what it was as the run started while the box lock and
+    basetemp are placed, so both keep exactly the locations ``Path.home()`` gives
+    them without the live closure's private test HOME; restored after.
+
+    HOME as the run started, not the passwd entry: the two differ under
+    ``sudo -E`` or an overridden HOME, and the lock and basetemp follow HOME. A
+    run that started with HOME unset gets it unset again, so ``Path.home()``
+    falls back to the passwd entry as it would have.
+
+    Only CALL-time resolution may run inside. The modules the placement uses are
+    imported before entering: ``genesis.util``'s package init imports
+    ``process_lock``, which binds ``Path.home()`` at import, so importing it in
+    here would bind the real home for the whole run.
+
+    It undoes only the closure's own redirect: a HOME something else set (a test
+    driving this hook with its own HOME) is left alone."""
+    from tests import _live_closure
+
+    before = _live_closure._S.home_before
+    saved = os.environ.get("HOME")
+    if _live_closure._S.home and saved == _live_closure._S.home:
+        if before is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = before
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop("HOME", None)
+        else:
+            os.environ["HOME"] = saved
+
+
 def pytest_configure(config):
-    _configure_lock_and_basetemp(config)
+    # Imported under the test HOME, never inside the real-home window below.
+    import genesis.util.pytest_lock  # noqa: F401
+    import genesis.util.tmp  # noqa: F401
+
+    with _placed_by_the_real_home():
+        _configure_lock_and_basetemp(config)
     # Armed AFTER the lock (a run refused by it exits above) and after basetemp is
     # placed (the fence allows fakes under it). See tests/_live_fence.py.
     from tests import _live_closure, _live_fence
@@ -512,6 +553,16 @@ def pytest_unconfigure(config):
 
         _live_fence.uninstall_files(config)
         _live_closure.uninstall_files(config)
+        # The session's test HOME (tests/_live_closure.py), recorded on the config
+        # the closure installed on: a test that drives this hook with its own
+        # config never reaches the live one. Forced removal: tests leave
+        # read-only trees (git objects) in it.
+        home = getattr(config, "_genesis_live_home_cleanup", None)
+        if home:
+            try:
+                _force_rmtree(home)
+            except Exception as exc:  # noqa: BLE001 — best-effort, as below
+                _warn_without_escalating(f"genesis: cleanup of the test HOME {home} failed ({exc!r}).")
         if target:
             # BROAD for the same reason as pytest_configure's fallback: a hook that
             # raises turns a passing suite into exit 1, and cleanup is best-effort.

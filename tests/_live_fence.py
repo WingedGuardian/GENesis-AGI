@@ -324,19 +324,32 @@ def _stub_dir_without(names: frozenset[str]) -> str:
     return str(own)
 
 
+# HOME as the run started. tests/_live_closure.py imports this module before it
+# redirects HOME, so this is never the session's private home.
+_HOME_AT_IMPORT = os.environ.get("HOME")
+
+
+def real_home() -> str | None:
+    """The home of the user running the suite, whatever HOME says now.
+
+    From the password database. Numeric-UID containers need not have an
+    /etc/passwd entry, so HOME as the run started is the fallback (never the
+    live HOME, which the live closure has redirected by then); it is usable
+    identity only when absolute, otherwise None (deploys then remain refused).
+    Tests that must name the real home call this."""
+    try:
+        home = pwd.getpwuid(os.getuid()).pw_dir
+    except KeyError:
+        home = _HOME_AT_IMPORT
+    return home if home and os.path.isabs(home) else None
+
+
 def install(config) -> None:
     """Arm the fence for this process. Idempotent: an audit hook cannot be removed."""
     if _S.installed:
         return
     _S.pid = os.getpid()
-    try:
-        _S.real_home = pwd.getpwuid(os.getuid()).pw_dir
-    except KeyError:
-        # Numeric-UID containers need not have an /etc/passwd entry. HOME is
-        # usable identity only when absolute; otherwise deploys remain refused.
-        _S.real_home = os.environ.get("HOME")
-    if not _S.real_home or not os.path.isabs(_S.real_home):
-        _S.real_home = None
+    _S.real_home = real_home()
     _S.orig_path = os.environ.get("PATH", os.defpath)
     base = Path(tempfile.mkdtemp(prefix="genesis-live-fence-"))
     _S.base = str(base)
