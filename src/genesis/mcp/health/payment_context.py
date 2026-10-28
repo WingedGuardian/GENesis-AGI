@@ -270,6 +270,7 @@ _SESSION_JS = (
     " const k = sessionStorage.key(i); o[k] = sessionStorage.getItem(k); } return o; }"
 )
 _SAME_JS = "(a, b) => a === b"
+_CONNECTED_JS = "(e) => e.isConnected"
 # Whether clicking ``e`` ticks a box: a checkbox itself, a label whose control is
 # one, or inside a role=checkbox / role=switch element.
 _CHECKBOX_JS = r"""(e) => {
@@ -422,7 +423,6 @@ class _Flow:
     report: Callable[[str], Awaitable[None]] | None = None
     granted: bool = False  # past the tap: keep the client's idle clock fed
     done: asyncio.Event = field(default_factory=asyncio.Event)
-    guard: object = None  # the window's _UrlGuard: judges what a log line may name
     # The payment window's requests (counts, and the hosts of failed ones): logged
     # when a step finds nothing, the one view of a window that cannot be watched.
     net: dict = field(
@@ -1417,16 +1417,53 @@ async def _extras(
                     await _select(handle, value)
                 else:
                     await _step(handle.fill(value, timeout=10000))
-            except Exception:  # noqa: BLE001
-                raise _Stop("extra_field_failed") from None
-    for (_frame, handle), (_name, (_spec, value)) in zip(seen, chosen, strict=True):
-        if not check_values:  # located only (values typed later, after the tap)
-            break
+            except Exception as e:  # noqa: BLE001 - never the exception's text
+                logger.warning("payment extra field %s did not fill (%s)", name, type(e).__name__)
+                raise _Stop(f"extra_field_failed:{name}:fill") from None
+    if not check_values:  # located only (values typed later, after the tap)
+        return
+    reads = [
+        (name, value, await _extra_reads(frame, sel, handle, value))
+        for (frame, handle), (name, ((_frames, sel), value)) in zip(seen, chosen, strict=True)
+    ]
+    for name, value, (state, lens) in reads:
+        if state != "ok":
+            # Lengths and booleans only: the values are the owner's (an address,
+            # an email). The other fields' state tells a reset (several) from a
+            # rewrite (one).
+            logger.warning(
+                "payment extra field %s %s (typed %d chars; reads %s); others hold: %s",
+                name,
+                {"gone": "is no longer on the page", "unreadable": "could not be read"}.get(
+                    state, "did not hold its value"
+                ),
+                len(value),
+                lens,
+                {n: r[0] == "ok" for n, _v, r in reads if n != name},
+            )
+            raise _Stop(f"extra_field_failed:{name}:{state}")
+
+
+async def _extra_reads(frame, sel: str, handle, value: str) -> tuple[str, list[int]]:
+    """An extra field read back: "ok", "held" (it shows something else), "gone"
+    (no longer on the page) or "unreadable"; with the read-back's lengths. A
+    field a re-render replaced is found again by its selector and the new
+    element is read: the old one would still show the typed value."""
+    try:
+        if not await _step(handle.evaluate(_CONNECTED_JS)):
+            loc = frame.locator(sel)
+            if await _step(loc.count()) != 1:
+                return "gone", []
+            handle = await _step(loc.element_handle(timeout=5000))
+            if not await _owned_by(handle, frame):
+                return "gone", []
         got = await _step(handle.evaluate(EXTRA_VALUE_JS))
-        if not isinstance(got, list) or value.strip().casefold() not in {
-            g.strip().casefold() for g in got if isinstance(g, str)
-        }:
-            raise _Stop("extra_field_failed")
+    except Exception as e:  # noqa: BLE001 - never the exception's text
+        logger.warning("payment extra field read failed (%s)", type(e).__name__)
+        return "unreadable", []
+    reads = [g for g in got if isinstance(g, str)] if isinstance(got, list) else []
+    ok = value.strip().casefold() in {g.strip().casefold() for g in reads}
+    return ("ok" if ok else "held"), [len(g) for g in reads]
 
 
 async def _title(ppage) -> str:
@@ -1435,40 +1472,50 @@ async def _title(ppage) -> str:
     return (title if isinstance(title, str) else "")[:_TITLE_CHARS]
 
 
-async def _same_page(
+async def _page_change(
     ppage, args, top, seen, label, title, fields, pay, hooks, clicking=False, extras=None
-) -> bool:
-    """Everything the tap showed still holds: the top and frame origins, the
-    page title, Pay (the same label, a button, no GET submit), the mask, the
-    amount, and every extra field's value. Run after the tap, after the claim,
-    and before Pay."""
+) -> str | None:
+    """None when everything the tap showed still holds: the top and frame
+    origins, the page title, Pay (the same label, a button, no GET submit), the
+    mask, the amount, and every extra field's value. Else which check failed (a
+    code suffix). Run after the tap, after the claim, and before Pay."""
     if _moved(ppage, top, fields, pay, seen):
-        return False
+        return "moved"
     if await _title(ppage) != title:  # a same-origin SPA can swap the order under one URL
-        return False
+        return "title"
     if await hooks.interstitial(ppage):  # a bot check over the form takes the input
-        return False
-    if not _pay_ok(await _step(pay.handle.evaluate(PAY_JS)), label, clicking):
-        return False
-    if not await _mask_ok(ppage) or not await _amount_ok(ppage, args.amount):
-        return False
+        return "interstitial"
+    if why := _pay_why(await _step(pay.handle.evaluate(PAY_JS)), label, clicking):
+        return why
+    if not await _mask_ok(ppage):
+        return "mask"
+    if not await _amount_ok(ppage, args.amount):
+        return "amount"
     try:
         await _extras(ppage, args, fields, fill=False, names=extras)
-    except _Stop:
-        return False
-    return True
+    except _Stop as s:
+        return f"extras:{s.code}"
+    return None
+
+
+def _pay_why(info, label: str, clicking: bool) -> str | None:
+    """None when Pay is still the approved control: a button, not a GET submit,
+    the label the tap showed; and, to click it, connected and enabled. Else
+    which of those it fails."""
+    if not isinstance(info, dict) or info.get("button") is not True:
+        return "pay_button"
+    if info.get("get") is not False:
+        return "pay_get"
+    if info.get("label") != label:
+        return "pay_label"
+    if clicking and info.get("live") is not True:
+        return "pay_live"
+    return None
 
 
 def _pay_ok(info, label: str, clicking: bool) -> bool:
-    """Pay is still the approved control: a button, not a GET submit, the label
-    the tap showed; and, to click it, connected and enabled."""
-    return (
-        isinstance(info, dict)
-        and info.get("button") is True
-        and info.get("get") is False
-        and info.get("label") == label
-        and (not clicking or info.get("live") is True)
-    )
+    """Pay is still the approved control (``_pay_why``)."""
+    return _pay_why(info, label, clicking) is None
 
 
 async def _holds(f: _Field, kind: str, value: str) -> bool:
@@ -1553,19 +1600,23 @@ async def _await_grant(flow: _Flow, ppage, hooks: Hooks, report, main_page=None)
         await asyncio.sleep(POLL_S)
 
 
-def _frame_origin(url, guard) -> str:
-    """A frame's origin for a log line; never its path or query (they can carry
-    values), and ``about:``/``data:`` frames by scheme alone. An origin is named
-    only when the URL guard finds no armed value in it (a host can be made to
-    carry one); else, or with no guard to ask, "withheld"."""
+def _frame_kind(url, top: str, card_origins: frozenset[str]) -> str:
+    """A new frame for a log line, by what it is and never by any name a page
+    chose (a host can be made to carry a card value): a card frame's origin, the
+    checkout's own site, a known challenge, ``about:``/``data:`` by scheme, or
+    "other"."""
     origin = cf.origin_of(url)
-    if origin:
-        try:
-            return "withheld" if guard is None or guard.carries(origin) else origin
-        except Exception:  # noqa: BLE001 - unjudgeable: never named
-            return "withheld"
-    scheme = urlsplit(url).scheme if isinstance(url, str) else ""
-    return f"{scheme}:" if scheme.isalpha() else "opaque"
+    if origin is None:
+        scheme = urlsplit(url).scheme if isinstance(url, str) else ""
+        return f"{scheme}:" if scheme in ("about", "data", "blob", "javascript") else "opaque"
+    if origin in card_origins:
+        return "card_frame"
+    if _is_challenge(url):
+        return "challenge"
+    host, top_host = urlsplit(url).hostname, urlsplit(top).hostname
+    if host and top_host and registrable_domain(host) == registrable_domain(top_host):
+        return "checkout_site"
+    return "other"
 
 
 def _is_challenge(url) -> bool:
@@ -1710,10 +1761,15 @@ async def _save_stage(flow, ppage, args, save, top, title, label, pay, hooks, fi
     if flow.url_blocked or flow.url_leaked:
         code = _typing_outcome(flow)
     with contextlib.suppress(Exception):  # a log line, never a reason to stop
-        new = sorted(
-            {_frame_origin(f.url, flow.guard) for f in list(ppage.frames) if f.url not in before}
+        cards = frozenset(f.origin for f in fields.values())
+        new = Counter(
+            _frame_kind(f.url, top, cards) for f in list(ppage.frames) if f.url not in before
         )
-        logger.warning("payment save stage ended %s; new frames: %s", code or "ok", new or "none")
+        logger.warning(
+            "payment save stage ended %s; new frames: %s",
+            code or "ok",
+            dict(sorted(new.items())) or "none",
+        )
     return code
 
 
@@ -1827,15 +1883,16 @@ async def _saved_page_changed(
         if await hooks.interstitial(ppage):
             return "interstitial"
         info = await _step(pay.handle.evaluate(PAY_JS))
-        if not (
-            isinstance(info, dict)
-            and info.get("button") is True
-            and info.get("get") is False
-            and info.get("live") is True
-            and cf.label_shape(info.get("label")) == cf.label_shape(label)
-            and _label_price_ok(info.get("label"), total, args.total is None)
-        ):
-            return "pay"
+        if not isinstance(info, dict) or info.get("button") is not True:
+            return "pay_button"
+        if info.get("get") is not False:
+            return "pay_get"
+        if info.get("live") is not True:
+            return "pay_live"
+        if cf.label_shape(info.get("label")) != cf.label_shape(label):
+            return "pay_label"
+        if not _label_price_ok(info.get("label"), total, args.total is None):
+            return "pay_price"
         if args.total is not None and await _read_total(ppage, args, pay, card_frames) != total:
             return "total"
         if not await _mask_ok(ppage):
@@ -1911,7 +1968,7 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
         del handed
         pctx.on("dialog", lambda d: _spawn(d.dismiss()))
         await _step(pctx.add_init_script(MASK_INIT_JS))
-        guard = flow.guard = _UrlGuard(flow)
+        guard = _UrlGuard(flow)
         await _step(pctx.route("**/*", guard.handle))
         pctx.on("request", guard.on_request)
         for event, what in (
@@ -2053,8 +2110,10 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
 
     # Granted: the page must still show what the tap was for, fields re-resolved.
     fields, pay, _label = await _resolve(ppage, args)
-    if not await _same_page(ppage, args, top, seen, label, title, fields, pay, hooks, extras=early):
-        raise _Stop("page_changed:granted")
+    if why := await _page_change(
+        ppage, args, top, seen, label, title, fields, pay, hooks, extras=early
+    ):
+        raise _Stop(f"page_changed:granted:{why}")
     if args.late:  # the billing config's values, now the owner has approved this page
         try:
             await _extras(ppage, args, fields, fill=True, names=args.late)
@@ -2063,8 +2122,8 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
         # Before the claim: an address can re-price or re-render the checkout,
         # and nothing may be claimed for a page that no longer shows what the tap did.
         fields, pay, _label = await _resolve(ppage, args)
-        if not await _same_page(ppage, args, top, seen, label, title, fields, pay, hooks):
-            raise _Stop("page_changed:after_late")
+        if why := await _page_change(ppage, args, top, seen, label, title, fields, pay, hooks):
+            raise _Stop(f"page_changed:after_late:{why}")
     try:
         consents = await _consents(ppage, args, fields)
     except _Stop as s:
@@ -2106,11 +2165,11 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     guard.arm(values)  # before anything is typed
 
     # Typing. Nothing is typed into a page that changed after the tap.
-    if _gone(flow, ppage, hooks) or not await _same_page(
+    if why := _gone(flow, ppage, hooks) or await _page_change(
         ppage, args, top, seen, label, title, fields, pay, hooks
     ):
         values.clear()
-        raise _Stop("claimed_not_filled")
+        raise _Stop(f"claimed_not_filled:{why}")
     # From the first keystroke: a field's input handler can submit the checkout
     # itself, and that is no "nothing paid" stop.
     flow.typing_marks = (flow.nav_requests, flow.popups)
@@ -2139,10 +2198,10 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
         # between this and the click: a script changing what the tap showed in
         # that window is an accepted residual (owner ruling 07a1c756), and where
         # a card value can go in a URL is the network guard's job, not the DOM's.
-        if not await _same_page(
+        if why := await _page_change(
             ppage, args, top, seen, label, title, fields, pay, hooks, clicking=save is None
         ):
-            raise _Stop("failed_before_pay:page", filled=flow.typed)
+            raise _Stop(f"failed_before_pay:page:{why}", filled=flow.typed)
         if save is not None and (
             cf.origin_of(save.frame.url) != seen["save"]
             or not _pay_ok(await _step(save.handle.evaluate(PAY_JS)), save_label, True)

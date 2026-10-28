@@ -137,6 +137,8 @@ class Handle:
             ]
         if js is pc._CHECKBOX_JS:
             return self.el.checkbox
+        if js is pc._CONNECTED_JS:
+            return self.el.connected
         if js is pc.CONSENT_JS and self.el.control is not None:
             # As the real script: the box's state, but `connected` is the label's own.
             info = await Handle(self.el.control, self.frame).evaluate(js, arg)
@@ -1231,7 +1233,7 @@ async def test_a_page_that_moved_while_waiting_cancels_the_release(vault):
     ns = checkout()
     vault.on_status = lambda: setattr(ns.ppage.extra[0], "url", "https://evil.example.org/f")
     out, _ = await _run(ns)
-    assert out["code"] == "page_changed:granted"
+    assert out["code"] == "page_changed:granted:moved"
     assert vault.ops("release_claim") == [] and len(vault.ops("release_cancel")) == 1
 
 
@@ -1247,7 +1249,7 @@ async def test_a_page_that_moved_during_the_claim_types_nothing(vault):
     ns = checkout()
     vault.on_claim = lambda: setattr(ns.ppage, "url", "https://evil.example.org/x")
     out, _ = await _run(ns)
-    assert out["code"] == "claimed_not_filled"
+    assert out["code"] == "claimed_not_filled:moved"
     assert ns.els["number"].value == "" and vault.ops("release_cancel") == []
 
 
@@ -1284,7 +1286,7 @@ async def test_pay_disabled_after_filling_stops_before_pay(vault):
     ns = checkout()
     vault.on_claim = lambda: ns.els["pay"].pay.update(live=False)
     out, _ = await _run(ns)
-    assert out["code"] == "failed_before_pay:page" and "field" not in out
+    assert out["code"] == "failed_before_pay:page:pay_live" and "field" not in out
 
 
 async def test_an_unanswered_claim_is_not_cancelled(vault):
@@ -1361,17 +1363,17 @@ async def test_abort_ends_the_flow_with_a_result_and_cancels(vault):
         (
             "on_status",
             lambda ns: ns.els["pay"].pay.update(label="Pay $99.99"),
-            "page_changed:granted",
+            "page_changed:granted:pay_label",
         ),
         (
             "on_status",
             lambda ns: setattr(ns.ppage.main_frame, "text", "Total $29.99"),
-            "page_changed:granted",
+            "page_changed:granted:amount",
         ),
         (
             "on_claim",
             lambda ns: setattr(ns.ppage.main_frame, "text", "Total $29.99"),
-            "claimed_not_filled",
+            "claimed_not_filled:amount",
         ),
         # A child frame whose mask cannot be put back.
         (
@@ -1380,18 +1382,18 @@ async def test_abort_ends_the_flow_with_a_result_and_cancels(vault):
                 setattr(ns.ppage.extra[0], "masked", False),
                 setattr(ns.ppage.extra[0], "repairable", False),
             ),
-            "claimed_not_filled",
+            "claimed_not_filled:mask",
         ),
         # Same origin, amount, Pay and fields, but another order under the tapped title.
         (
             "on_status",
             lambda ns: setattr(ns.ppage, "_title", "Order 2 - Checkout"),
-            "page_changed:granted",
+            "page_changed:granted:title",
         ),
         (
             "on_claim",
             lambda ns: setattr(ns.ppage, "_title", "Order 2 - Checkout"),
-            "claimed_not_filled",
+            "claimed_not_filled:title",
         ),
     ],
 )
@@ -1507,7 +1509,7 @@ async def test_a_frame_moved_before_pay_stops_before_pay(vault):
         out, _ = await _run(ns)
     finally:
         Handle.fill = real
-    assert out["code"] == "failed_before_pay:page" and "field" not in out
+    assert out["code"] == "failed_before_pay:page:moved" and "field" not in out
 
 
 async def test_a_challenge_like_frame_present_before_pay_is_ignored(vault):
@@ -1712,22 +1714,25 @@ async def _filling(ns, last_kind, change):
 
 
 @pytest.mark.parametrize(
-    "change",
+    ("change", "why"),
     [
-        lambda ns: ns.els["pay"].pay.update(label="Pay $999.99"),
-        lambda ns: ns.els["pay"].pay.update(button=False),
-        lambda ns: setattr(ns.els["email"], "value", "other@example.org"),
-        lambda ns: setattr(ns.ppage.main_frame, "text", "Total $29.99"),
-        lambda ns: setattr(ns.ppage.extra[0], "url", "https://evil.example.org/f"),
-        lambda ns: setattr(ns.ppage, "_title", "Order 2 - Checkout"),
+        (lambda ns: ns.els["pay"].pay.update(label="Pay $999.99"), "pay_label"),
+        (lambda ns: ns.els["pay"].pay.update(button=False), "pay_button"),
+        (
+            lambda ns: setattr(ns.els["email"], "value", "other@example.org"),
+            "extras:extra_field_failed:email:held",
+        ),
+        (lambda ns: setattr(ns.ppage.main_frame, "text", "Total $29.99"), "amount"),
+        (lambda ns: setattr(ns.ppage.extra[0], "url", "https://evil.example.org/f"), "moved"),
+        (lambda ns: setattr(ns.ppage, "_title", "Order 2 - Checkout"), "title"),
     ],
 )
-async def test_pay_and_extras_are_rechecked_right_before_pay(vault, change):
+async def test_pay_and_extras_are_rechecked_right_before_pay(vault, change, why):
     ns = checkout()
     clicked = []
     ns.els["pay"].on_click = lambda: clicked.append(1)
     out = await _filling(ns, "name", lambda: change(ns))
-    assert out["code"] == "failed_before_pay:page" and clicked == []
+    assert out["code"] == f"failed_before_pay:page:{why}" and clicked == []
 
 
 @pytest.mark.parametrize(
@@ -1814,9 +1819,9 @@ async def test_two_card_kinds_on_one_element_are_refused_before_the_tap(vault):
 @pytest.mark.parametrize(
     ("hits", "code"),
     [
-        (1, "page_changed:granted"),  # after the grant: the release is cancelled
-        (2, "claimed_not_filled"),  # after the claim: nothing typed
-        (3, "failed_before_pay:page"),  # before Pay: not clicked
+        (1, "page_changed:granted:interstitial"),  # after the grant: the release is cancelled
+        (2, "claimed_not_filled:interstitial"),  # after the claim: nothing typed
+        (3, "failed_before_pay:page:interstitial"),  # before Pay: not clicked
     ],
 )
 async def test_a_bot_check_appearing_after_the_tap_stops_the_flow(vault, hits, code):
@@ -1861,14 +1866,17 @@ async def test_an_extra_field_changed_while_waiting_cancels(vault):
     ns = checkout()
     vault.on_status = lambda: setattr(ns.els["email"], "value", "")
     out, _ = await _run(ns)
-    assert out["code"] == "page_changed:granted" and vault.ops("release_claim") == []
+    assert (
+        out["code"] == "page_changed:granted:extras:extra_field_failed:email:held"
+        and vault.ops("release_claim") == []
+    )
 
 
 async def test_an_extra_field_that_does_not_keep_its_value_requests_nothing(vault):
     ns = checkout()
     ns.els["email"].mangle = True
     out, _ = await _run(ns)
-    assert out["code"] == "extra_field_failed" and vault.requests == []
+    assert out["code"] == "extra_field_failed:email:held" and vault.requests == []
 
 
 async def test_two_extra_names_on_one_element_are_refused(vault):
@@ -2954,7 +2962,7 @@ async def test_a_late_billing_value_that_reprices_stops_before_the_claim(vault, 
     monkeypatch.setattr(Handle, "fill", fill)
     extra = {"address_line1": {"selector": "#street", "frames": ["iframe#card"]}}
     out, _ = await _run(ns, extra_fields=extra)
-    assert out["code"] == "page_changed:after_late"
+    assert out["code"] == "page_changed:after_late:amount"
     assert vault.ops("release_claim") == [] and ns.els["number"].value == ""
 
 
@@ -3025,7 +3033,7 @@ async def test_save_then_pay_within_the_ceiling(vault, logs):
         ("Pay $25.01", "total_over_ceiling"),
         ("Pay $5.00", "total_under_subtotal"),
         (None, "total_not_shown"),
-        ("Buy now $21.50", "saved_page_changed:pay"),
+        ("Buy now $21.50", "saved_page_changed:pay_label"),
     ],
 )
 async def test_save_stops_before_pay_when_the_total_does_not_fit(vault, total, code):
@@ -3197,7 +3205,7 @@ async def test_a_pay_label_with_a_second_number_is_refused(vault):
     ns.ppage.main_frame.elements["#total"] = [total]
     _after_save(ns, lambda: setattr(total, "text", "$19.99"))
     out, _ = await _run(ns, save=SAVE, amount_max="$25.00", total="#total")
-    assert out["code"] == "saved_page_changed:pay" and ns.pay_clicks == []
+    assert out["code"] == "saved_page_changed:pay_price" and ns.pay_clicks == []
 
 
 async def test_a_pay_label_without_digits_still_passes_with_a_total_element(vault):
@@ -3334,7 +3342,7 @@ async def test_a_pay_label_that_is_the_price_source_must_still_read_the_total(va
 
     monkeypatch.setattr(pc, "_saved_page_changed", placeholder_then_check)
     out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
-    assert out["code"] == "saved_page_changed:pay" and ns.pay_clicks == []
+    assert out["code"] == "saved_page_changed:pay_price" and ns.pay_clicks == []
 
 
 async def test_a_save_control_in_the_pay_form_is_refused(vault):
@@ -3623,15 +3631,14 @@ async def test_every_result_is_logged_once_with_its_code(vault, logs):
     assert len(hits) == 1 and out["code"] in hits[0] and "claimed=True" in hits[0]
 
 
-async def test_a_new_frame_at_the_save_is_logged_by_origin_only(vault, logs):
+async def test_a_new_frame_at_the_save_is_logged_by_kind_only(vault, logs):
     ns = save_checkout()
     late = Frame("https://verify.example.net/step?token=abc123")
     late.parent_frame = ns.ppage.main_frame
     _after_save(ns, lambda: ns.ppage.extra.append(late))
     await _run(ns, save=SAVE, amount_max="$25.00")
     hits = [line for line in logs if "save stage ended" in line]
-    origins = ["https://verify.example.net"]  # origin only: no path, no query
-    assert hits == [f"payment save stage ended ok; new frames: {origins}NoneNone"]
+    assert hits == ["payment save stage ended ok; new frames: {'other': 1}NoneNone"]
 
 
 async def test_a_consent_refusal_after_the_grant_keeps_its_own_code(vault):
@@ -3666,16 +3673,109 @@ async def test_the_save_stage_log_names_a_url_outcome_over_its_own_code(vault, l
     assert ns.pay_clicks == []
 
 
-async def test_a_new_frame_whose_host_carries_the_card_number_is_withheld(vault, logs):
+async def test_a_frame_host_carrying_a_short_card_value_is_never_logged(vault, logs):
     ns = save_checkout()
-    late = Frame(f"https://{PAN}.verify.example.net/")
+    late = Frame(f"https://{CVC}.verify.example.net/")
     late.parent_frame = ns.ppage.main_frame
     _after_save(ns, lambda: ns.ppage.extra.append(late))
     await _run(ns, save=SAVE, amount_max="$25.00")
     hits = [line for line in logs if "save stage ended" in line]
-    assert len(hits) == 1 and "withheld" in hits[0] and PAN not in hits[0]
+    assert len(hits) == 1 and "'other': 1" in hits[0]
+    assert CVC not in hits[0] and "verify" not in hits[0]
 
 
-def test_a_frame_origin_is_withheld_without_a_guard_to_ask():
-    assert pc._frame_origin("https://verify.example.net/x", None) == "withheld"
-    assert pc._frame_origin("about:blank", None) == "about:"
+def test_a_new_frame_is_named_by_kind():
+    top, cards = "https://shop.example.com", frozenset({"https://pay.example.net"})
+    kind = pc._frame_kind
+    assert kind("https://pay.example.net/x", top, cards) == "card_frame"
+    assert kind("https://cdn.shop.example.com/w", top, cards) == "checkout_site"
+    assert kind("https://hooks.stripe.com/3d_secure_2/x", top, cards) == "challenge"
+    assert kind("about:blank", top, cards) == "about:"
+    assert kind("https://4242.example.org/", top, cards) == "other"
+
+
+def _late_billing(ns, monkeypatch):
+    """Street and city in the card frame, typed from the billing config after the tap."""
+    frame = ns.ppage.main_frame.elements["iframe#card"][0].child
+    street, city = El(), El()
+    frame.elements["#street"], frame.elements["#city"] = [street], [city]
+    monkeypatch.setattr(
+        cf, "billing_value", lambda name: {"city": "Testville"}.get(name, "1 Config St")
+    )
+    extra = {
+        "email": {"selector": "#email", "value": EMAIL},
+        "address_line1": {"selector": "#street", "frames": ["iframe#card"]},
+        "city": {"selector": "#city", "frames": ["iframe#card"]},
+    }
+    return street, city, extra
+
+
+async def test_a_late_field_that_does_not_hold_names_itself_and_the_others(
+    vault, logs, monkeypatch
+):
+    ns = checkout()
+    street, city, extra = _late_billing(ns, monkeypatch)
+    city.mangle = True  # the page shows something else than what was typed
+    out, _ = await _run(ns, extra_fields=extra)
+    assert out["code"] == "page_changed:late:extra_field_failed:city:held"
+    assert "Add Card and Pay were not clicked" in out["status"]
+    assert vault.ops("release_claim") == []
+    hits = [line for line in logs if "extra field city did not hold" in line]
+    assert len(hits) == 1 and "'address_line1': True" in hits[0]
+    assert "Testville" not in hits[0] and "Config" not in hits[0]  # lengths only
+
+
+async def test_a_late_field_a_later_fill_re_rendered_is_read_again(vault, monkeypatch):
+    # The old element is detached; the field is found again by its selector,
+    # and the new one, showing the value, is what counts.
+    ns = checkout()
+    street, city, extra = _late_billing(ns, monkeypatch)
+    frame = ns.ppage.main_frame.elements["iframe#card"][0].child
+    fresh = El()
+
+    def re_render():
+        street.connected = False
+        fresh.value = street.value
+        frame.elements["#street"] = [fresh]
+
+    city.on_fill = re_render
+    out, _ = await _run(ns, extra_fields=extra)
+    assert out["code"] == "submitted_unverified"
+
+
+async def test_a_late_field_removed_by_a_later_fill_is_gone(vault, monkeypatch):
+    ns = checkout()
+    street, city, extra = _late_billing(ns, monkeypatch)
+    frame = ns.ppage.main_frame.elements["iframe#card"][0].child
+
+    def remove():
+        street.connected = False
+        frame.elements["#street"] = []
+
+    city.on_fill = remove
+    out, _ = await _run(ns, extra_fields=extra)
+    assert out["code"] == "page_changed:late:extra_field_failed:address_line1:gone"
+    assert vault.ops("release_claim") == []
+
+
+async def test_a_late_field_that_cannot_be_read_still_names_itself(vault, logs, monkeypatch):
+    ns = checkout()
+    street, city, extra = _late_billing(ns, monkeypatch)
+    city.mangle = True  # the field that is wrong
+    street.on_fill = lambda: setattr(street, "gone", True)  # its frame reloaded
+    out, _ = await _run(ns, extra_fields=extra)
+    assert out["code"] == "page_changed:late:extra_field_failed:address_line1:unreadable"
+    assert any("extra field read failed" in x for x in logs)
+
+
+async def test_a_late_field_that_cannot_be_filled_says_fill(vault, logs, monkeypatch):
+    ns = checkout()
+    street, city, extra = _late_billing(ns, monkeypatch)
+
+    def refuse():
+        raise RuntimeError("covered")
+
+    street.on_fill = refuse
+    out, _ = await _run(ns, extra_fields=extra)
+    assert out["code"] == "page_changed:late:extra_field_failed:address_line1:fill"
+    assert any("extra field address_line1 did not fill (RuntimeError)" in x for x in logs)
