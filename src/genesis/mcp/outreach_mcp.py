@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -902,6 +903,16 @@ async def outreach_engagement(
     return True
 
 
+def _rate_limits(cfg) -> dict:
+    return {
+        "max_daily": cfg.max_daily,
+        "surplus_daily": cfg.surplus_daily,
+        "content_daily": cfg.content_daily,
+        "notification_daily": cfg.notification_daily,
+        "agent_daily_per_peer": cfg.agent_daily_per_peer,
+    }
+
+
 @mcp.tool()
 async def outreach_preferences(
     action: str = "get",
@@ -918,10 +929,7 @@ async def outreach_preferences(
                     "end": _config.quiet_hours.end,
                 },
                 "thresholds": _config.thresholds,
-                "rate_limits": {
-                    "max_daily": _config.max_daily,
-                    "surplus_daily": _config.surplus_daily,
-                },
+                "rate_limits": _rate_limits(_config),
             }
         # Standalone mode — use config loader which has sensible defaults
         from genesis.outreach.config import load_outreach_config
@@ -934,10 +942,7 @@ async def outreach_preferences(
                 "end": cfg.quiet_hours.end,
             },
             "thresholds": cfg.thresholds,
-            "rate_limits": {
-                "max_daily": cfg.max_daily,
-                "surplus_daily": cfg.surplus_daily,
-            },
+            "rate_limits": _rate_limits(cfg),
             "source": "defaults (standalone mode)",
         }
     if not preferences or not isinstance(preferences, dict):
@@ -962,9 +967,12 @@ async def outreach_preferences(
     mr = preferences.get("morning_report", {})
     eng = preferences.get("engagement", {})
 
-    from genesis.outreach.config import OutreachConfig, QuietHours
+    from genesis.outreach.config import QuietHours
 
-    merged = OutreachConfig(
+    # replace(), not a fresh OutreachConfig: a field this tool does not set
+    # keeps its current value instead of falling back to the class default.
+    merged = dataclasses.replace(
+        current,
         quiet_hours=QuietHours(
             start=qh.get("start", current.quiet_hours.start),
             end=qh.get("end", current.quiet_hours.end),
@@ -974,10 +982,11 @@ async def outreach_preferences(
         max_daily=int(rl.get("max_daily", current.max_daily)),
         surplus_daily=int(rl.get("surplus_daily", current.surplus_daily)),
         content_daily=int(rl.get("content_daily", current.content_daily)),
+        notification_daily=int(rl.get("notification_daily", current.notification_daily)),
+        agent_daily_per_peer=int(rl.get("agent_daily_per_peer", current.agent_daily_per_peer)),
         morning_report_time=mr.get("trigger_time", current.morning_report_time),
         engagement_timeout_hours=int(eng.get("timeout_hours", current.engagement_timeout_hours)),
         engagement_poll_minutes=int(eng.get("poll_interval_minutes", current.engagement_poll_minutes)),
-        immediate_escalation_alerts=current.immediate_escalation_alerts,
     )
 
     try:
