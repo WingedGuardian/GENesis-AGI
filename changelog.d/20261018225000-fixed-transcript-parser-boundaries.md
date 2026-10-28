@@ -1,1 +1,0 @@
-- Transcript analysis keeps uncertain hook names unknown while retaining scrubbed commands, rejects negative durations and counts, preserves surrounding records after deeply nested malformed JSON, retains scrubbed model-refusal diagnostics, and evaluates chronology against the captured input rather than later appends.

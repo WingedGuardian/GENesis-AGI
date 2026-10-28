@@ -1,0 +1,1 @@
+- **Card fill no longer misses a checkout step that re-renders.** A step looks for its one shown element again until its wait is up, so a page that replaces the button between two looks still has it clicked. When a step finds nothing, the server log also records the payment window's request counts and the hosts of failed and still-pending requests (host names only).

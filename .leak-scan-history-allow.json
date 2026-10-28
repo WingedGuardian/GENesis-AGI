@@ -27,6 +27,34 @@
       "type": "Hex High Entropy String",
       "sha1": "260fadbed7362c10436aec8a789841fc6dac18e4",
       "reason": "public record-v5 extraction compatibility fingerprint for the previous producer, not sensitive; current source adds the inline pragma"
+    },
+    {
+      "commit": "ee5b322f10f94809adfbcc059ff40a02993a4c7b",
+      "path": ".github/workflows/headlong-controls.yml",
+      "type": "Hex High Entropy String",
+      "sha1": "66cc57646d4d1a06ce8c3687cb9020d5aca0c37c",
+      "reason": "the public commit pin of the upstream Headlong repository, not sensitive; current source adds the inline pragma"
+    },
+    {
+      "commit": "ee5b322f10f94809adfbcc059ff40a02993a4c7b",
+      "path": "scripts/ci/headlong_controls.py",
+      "type": "Hex High Entropy String",
+      "sha1": "66cc57646d4d1a06ce8c3687cb9020d5aca0c37c",
+      "reason": "the public commit pin of the upstream Headlong repository, not sensitive; current source adds the inline pragma"
+    },
+    {
+      "commit": "0337f42c2b0c1f60a13225189ecf74d83324ddf8",
+      "path": "scripts/ci/headlong_reference_controls.py",
+      "type": "Hex High Entropy String",
+      "sha1": "47784580758b20256793a484ce89c74d6724936c",
+      "reason": "a synthetic patterned value in a redaction test corpus, not sensitive; current source adds the inline pragma"
+    },
+    {
+      "commit": "4c486a9fa4ab7516275edbe6111db4803497fed8",
+      "path": "scripts/ci/headlong_bridge_patch.json",
+      "type": "Base64 High Entropy String",
+      "sha1": "6a8d40a692b07fb6cc5de90574519cfcb250d947",
+      "reason": "shell assignment text in a test fixture patch, read as base64 between escaped quotes, not sensitive; current source splits the matched run with a space"
     }
   ]
 }

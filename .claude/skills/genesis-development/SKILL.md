@@ -323,9 +323,10 @@ thinking any of these, STOP — you are rationalizing a shortcut.
 | "I can skip the worktree, I'll be quick" | Concurrent session safety exists because "quick" commits have destroyed work before. Always worktree. |
 | "The error is transient, retry will fix it" | Diagnose first. Retrying a misdiagnosed error wastes tokens and masks root causes. |
 | "I'll add the follow-up later" | Records not created in-session are lost. File it now while context is fresh — Genesis-repo work as a GitHub issue, user-owned work as a follow-up. |
+| "It's a separate PR, so it's for another session" | A separate PR never means a separate session. In-scope work waits only on one of the three grounds in CLAUDE.md "Where deferred work goes" (blocked on an unmet precondition, gated on time or data, big enough to derail the session) or the user's direction (#1721). |
 | "I don't need a skill for this" | If a skill exists, use it. The using-superpowers Red Flags table exists for this exact rationalization. |
-| "This review round is the same class, it doesn't really count" | For an EXTERNAL cross-model round, the counter decides, not you — a repeat-class external round still counts; update it every external cycle and STOP at the cap. (Internal same-model reviews are never rounds.) |
-| "The user already said proceed, so I can keep looping" | The escalation/fix-attempt caps CONSUME standing approval. Round 4+ (or fix #4) on an old instruction is a violation, not obedience. |
+| "This review round is the same class, it doesn't really count" | The budget decides, not you: a head that drew findings is a round whatever its class. Read the count from `review_budget.py`, and commit the round's reflection before its fixes. (Internal same-model reviews are never rounds.) |
+| "The user already said proceed, so I can keep looping" | The round and fix-attempt caps CONSUME standing approval. Going past the lane's terminal round (or fix #4) on an old instruction is a violation, not obedience. |
 | "I'll just add the field the reviewer flagged" | A spec's required-set is closed — derive and enforce ALL of it at once, with one test locking the whole set, or the next round finds the next missing field (see build-session, Debugging Discipline: spec required-sets). |
 
 ### The review chain: a different model is the gate

@@ -1,0 +1,1 @@
+- Report saved schedule intent separately from live registration in MCP and the dashboard, retain job IDs on registration failure, and offer same-ID retry without creating duplicate schedules.

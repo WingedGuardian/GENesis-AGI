@@ -33,18 +33,18 @@ def hook():
 def _info(hook, tmp_path: Path, body: str) -> tuple[str, str]:
     """Write a plan and extract its (path, title).
 
-    The file MUST live under a `.claude/plans/` path: `_extract_plan_info`
-    only recognises a plan path matching that shape, and anything else falls
-    through to the newest file in the REAL `~/.claude/plans/`. That fallback
-    made an earlier version of this test pass by reading the developer's own
-    plan file — green, hermetic-looking, and proving nothing.
+    Driven with the shape Claude Code actually sends (`plan` + `planFilePath`).
+    An earlier harness passed `{"path": ...}`, a key CC never sends, which
+    reached the plan only through a regex fallback; and back then a miss fell
+    through to the newest file in the REAL `~/.claude/plans/`, which made one
+    version of this test pass by reading the developer's own plan file.
     """
     plans = tmp_path / ".claude" / "plans"
     plans.mkdir(parents=True, exist_ok=True)
     plan = plans / "some-plan.md"
     plan.write_text(body)
     path, title = hook._extract_plan_info(
-        {"tool_input": {"path": str(plan)}, "tool_output": {}},
+        {"tool_input": {"plan": body, "planFilePath": str(plan)}},
     )
     assert path == str(plan), (
         f"the harness did not reach its own fixture (got {path!r}) — any "

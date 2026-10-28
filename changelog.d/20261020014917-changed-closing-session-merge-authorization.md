@@ -1,1 +1,0 @@
-- A closing session asked to close out open PRs now merges each PR in scope that is ready at its current head, without asking again per PR. Override sigils, a PR that hit a round cap, terminal-round merge-and-accept, a real finding left unfixed, PRs over 1,000 counted lines, and design questions still need the owner's yes per PR.

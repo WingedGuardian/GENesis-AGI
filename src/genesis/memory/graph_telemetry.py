@@ -86,8 +86,9 @@ def _self_start(proc_root: Path = Path("/proc")) -> tuple[int, float]:
 
 
 def _moment() -> dict:
-    """Who broke the clock, read at the event: pid, the ``(pid, starttime)``
-    identity the census row also carries, and the process's age. A field that
+    """Who broke the clock, read at the event: pid, its raw start time in clock
+    ticks (``/proc/<pid>/stat`` field 22: converted to epoch seconds it joins the
+    census row's ``pid`` + ``started_at``), and the process's age. A field that
     cannot be read is None; this never raises."""
     global _START
     out: dict = {"pid": os.getpid(), "starttime_ticks": None, "proc_age_s": None}

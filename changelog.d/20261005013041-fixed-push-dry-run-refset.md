@@ -1,1 +1,0 @@
-- Re-push approval now uses Git's porcelain dry-run ref flag to distinguish first publishes from updates to the current branch. Recorded approvals retain an offline path; remapped refs and unsafe transports continue to require approval.

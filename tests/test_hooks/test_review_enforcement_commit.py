@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -778,14 +779,20 @@ def test_distinct_worktrees_get_distinct_markers(repo: Path, home: Path, tmp_pat
     assert len(markers) == 2, [m.name for m in markers]
 
 
-def _run_invalidate(command: str, repo: Path, home: Path) -> subprocess.CompletedProcess:
+def _run_invalidate(
+    command: str, repo: Path, home: Path, *, failed: bool = False
+) -> subprocess.CompletedProcess:
     """Run the PostToolUse invalidation hook for a successful commit."""
     payload = json.dumps(
         {
             "hook_event_name": "PostToolUse",
             "tool_name": "Bash",
             "tool_input": {"command": command},
-            "tool_response": {"stdout": "[feature/x abc1234] msg", "stderr": ""},
+            "tool_response": {
+                "stdout": "" if failed else "[feature/x abc1234] msg",
+                "stderr": "fatal: commit failed" if failed else "",
+                **({"error": "fatal: commit failed"} if failed else {}),
+            },
             "session_id": "test",
         }
     )
@@ -828,6 +835,16 @@ def test_invalidate_ignores_non_commit(repo: Path, home: Path) -> None:
     assert _mark(repo, home).returncode == 0
     _run_invalidate("echo not a commit", repo, home)
     assert len(_markers(home)) == 1  # marker survives
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_invalidate_nested_blind_commit_respects_failure(
+    repo: Path, home: Path, failed: bool
+) -> None:
+    assert _mark(repo, home).returncode == 0
+    command = "bash -c " + shlex.quote("echo ok # don't\ngit commit -m done")
+    _run_invalidate(command, repo, home, failed=failed)
+    assert len(_markers(home)) == int(failed)
 
 
 def test_invalidate_clears_when_the_parse_went_blind(repo: Path, home: Path) -> None:

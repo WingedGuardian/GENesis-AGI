@@ -290,3 +290,257 @@ class TestUserJobScheduler:
         assert len(scheduler._scheduler.get_jobs()) == 0
 
         await scheduler.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [False, RuntimeError("synthetic registration failure")])
+async def test_create_retains_saved_id_when_registration_fails(db, monkeypatch, failure):
+    from genesis.mcp.health import user_job_tools as tools
+    from genesis.scheduler.user_jobs import UserJobScheduler
+
+    scheduler = UserJobScheduler(db=db)
+    await scheduler.start()
+    monkeypatch.setattr(tools, "_db", db)
+    monkeypatch.setattr(tools, "_scheduler", scheduler)
+    original_add = scheduler.add_job
+
+    async def register(_):
+        if isinstance(failure, Exception):
+            raise failure
+        return failure
+
+    monkeypatch.setattr(scheduler, "add_job", register)
+    try:
+        result = await tools.user_job_create.fn(
+            title="Saved schedule", cron_expression="0 9 * * *", dispatch_prompt="test"
+        )
+        assert result["success"] is False
+        assert result["saved"] is True and result["registered"] is False
+        assert result["job_id"] in result["error"]
+        saved = await crud.get_job(db, result["job_id"])
+        assert saved["status"] == "active" and saved["dispatch_prompt"] == "test"
+        listed = await tools.user_job_list.fn()
+        assert listed["jobs"][0]["registered"] is False
+        monkeypatch.setattr(scheduler, "add_job", original_add)
+        retried = await tools.user_job_control.fn(result["job_id"], "resume")
+        assert retried["success"] is True and retried["registered"] is True
+        assert len(await crud.list_jobs(db)) == 1
+    finally:
+        await scheduler.stop()
+    # Recreate the runtime wrapper: no duplicate definition, startup reloads
+    # the retained active intent rather than trusting the old response.
+    restarted = UserJobScheduler(db=db)
+    await restarted.start()
+    try:
+        assert restarted.is_registered(result["job_id"])
+        assert len(restarted._scheduler.get_jobs()) == 1
+    finally:
+        await restarted.stop()
+
+
+@pytest.mark.asyncio
+async def test_resume_reports_failed_attempt_without_erasing_old_registration(db, monkeypatch):
+    from genesis.mcp.health import user_job_tools as tools
+    from genesis.scheduler.user_jobs import UserJobScheduler
+
+    job_id = await crud.create_job(db, title="Retained", cron_expression="0 9 * * *", dispatch_prompt="test")
+    scheduler = UserJobScheduler(db=db)
+    await scheduler.start()
+    monkeypatch.setattr(tools, "_scheduler", scheduler)
+    monkeypatch.setattr(scheduler, "_register_job", lambda _: False)
+    try:
+        result = await tools.user_job_control.fn(job_id, "resume")
+        assert result["success"] is False
+        assert result["registered"] is True
+        assert scheduler._scheduler.get_job(f"user_job:{job_id}") is not None
+        assert (await crud.get_job(db, job_id))["status"] == "active"
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["paused", "disabled"])
+async def test_add_refuses_nonactive_definitions(db, state):
+    from genesis.scheduler.user_jobs import UserJobScheduler
+
+    job_id = await crud.create_job(db, title="Inactive", cron_expression="0 9 * * *", dispatch_prompt="test")
+    await crud.update_job(db, job_id, status=state)
+    scheduler = UserJobScheduler(db=db)
+    await scheduler.start()
+    try:
+        assert await scheduler.add_job(job_id) is False
+        assert scheduler._scheduler.get_jobs() == []
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_public_add_refuses_unstarted_scheduler(db):
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+    from genesis.scheduler.user_jobs import UserJobScheduler
+
+    job_id = await crud.create_job(db, title="Stopped", cron_expression="0 9 * * *", dispatch_prompt="test")
+    scheduler = UserJobScheduler(db=db)
+    scheduler._scheduler = AsyncIOScheduler()
+    assert await scheduler.add_job(job_id) is False
+    assert scheduler._scheduler.get_jobs() == []
+
+
+@pytest.mark.asyncio
+async def test_registration_membership_is_current_and_not_persisted(db, monkeypatch):
+    from genesis.mcp.health import user_job_tools as tools
+    from genesis.scheduler.user_jobs import UserJobScheduler
+
+    job_id = await crud.create_job(db, title="Current", cron_expression="0 9 * * *", dispatch_prompt="test")
+    scheduler = UserJobScheduler(db=db)
+    await scheduler.start()
+    monkeypatch.setattr(tools, "_db", db)
+    monkeypatch.setattr(tools, "_scheduler", scheduler)
+    try:
+        assert scheduler.is_registered(job_id)
+        assert (await tools.user_job_list.fn())["jobs"][0]["registered"] is True
+    finally:
+        await scheduler.stop()
+    assert not scheduler.is_registered(job_id)
+    assert (await tools.user_job_list.fn())["jobs"][0]["registered"] is False
+    assert (await crud.get_job(db, job_id))["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_resume_pending_definition_reports_registration_failure(db, monkeypatch):
+    from genesis.scheduler.user_jobs import UserJobScheduler
+
+    job_id = await crud.create_job(db, title="Pending", cron_expression="0 9 * * *", dispatch_prompt="test")
+    scheduler = UserJobScheduler(db=db)
+    await scheduler.start()
+    await scheduler.pause_job(job_id)
+    monkeypatch.setattr(scheduler, "_register_job", lambda _: False)
+    try:
+        assert await scheduler.resume_job(job_id) is False
+        assert scheduler._scheduler.get_jobs() == []
+        assert (await crud.get_job(db, job_id))["status"] == "active"
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_reports_registration_and_failed_resume(db, monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+
+    from flask import Flask
+
+    from genesis.dashboard.routes import scheduler as routes
+    from genesis.runtime import GenesisRuntime
+    from genesis.scheduler.user_jobs import UserJobScheduler
+
+    job_id = await crud.create_job(db, title="Visible", cron_expression="0 9 * * *", dispatch_prompt="test")
+    scheduler = UserJobScheduler(db=db)
+    await scheduler.start()
+    await scheduler.pause_job(job_id)
+    monkeypatch.setattr(scheduler, "_register_job", lambda _: False)
+    runtime = SimpleNamespace(is_bootstrapped=True, db=db, _user_job_scheduler=scheduler)
+    monkeypatch.setattr(GenesisRuntime, "instance", lambda: runtime)
+    app = Flask(__name__)
+    app.config["GENESIS_EVENT_LOOP"] = asyncio.get_running_loop()
+    # Only these existing handlers: registering the shared global blueprint
+    # before dashboard.api loads would prevent its later page registration.
+    app.add_url_rule("/api/genesis/scheduler/user", view_func=routes.user_scheduler_jobs)
+    app.add_url_rule(
+        "/api/genesis/scheduler/user/<job_id>/control",
+        view_func=routes.user_job_control_endpoint, methods=["POST"],
+    )
+
+    def request(method, path, **kwargs):
+        with app.test_client() as client:
+            return getattr(client, method)(path, **kwargs).get_json()
+
+    try:
+        response = await asyncio.to_thread(
+            request, "post", f"/api/genesis/scheduler/user/{job_id}/control", json={"action": "resume"}
+        )
+        assert response["success"] is False
+        assert response["job_id"] == job_id
+        assert response["registered"] is False
+        assert response["error"]
+        listed = await asyncio.to_thread(request, "get", "/api/genesis/scheduler/user")
+        assert listed["jobs"][0]["status"] == "active"
+        assert listed["jobs"][0]["registered"] is False
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_add_checks_running_after_lookup(db, monkeypatch):
+    from genesis.scheduler.user_jobs import UserJobScheduler
+
+    job_id = await crud.create_job(db, title="Stop race", cron_expression="0 9 * * *", dispatch_prompt="test")
+    scheduler = UserJobScheduler(db=db)
+    await scheduler.start()
+    get_job = crud.get_job
+
+    async def stop_during_lookup(*args):
+        job = await get_job(*args)
+        await scheduler.stop()
+        return job
+
+    monkeypatch.setattr(crud, "get_job", stop_during_lookup)
+    assert await scheduler.add_job(job_id) is False
+    assert not scheduler.is_registered(job_id)
+
+
+@pytest.mark.asyncio
+async def test_start_counts_only_actual_registrations(db, caplog):
+    import logging
+
+    from genesis.scheduler.user_jobs import UserJobScheduler
+
+    await crud.create_job(db, title="Good", cron_expression="0 9 * * *", dispatch_prompt="test")
+    await crud.create_job(db, title="Bad", cron_expression="invalid", dispatch_prompt="test")
+    scheduler = UserJobScheduler(db=db)
+    with caplog.at_level(logging.INFO, logger="genesis.scheduler.user_jobs"):
+        await scheduler.start()
+    try:
+        assert "started with 1 registered, 1 pending job(s)" in caplog.text
+        assert len(await crud.list_jobs(db, status="active")) == 2
+    finally:
+        await scheduler.stop()
+
+
+@pytest.mark.asyncio
+async def test_failed_replacement_recovery_stays_single_after_restart(db, monkeypatch):
+    from genesis.mcp.health import user_job_tools as tools
+    from genesis.scheduler.user_jobs import UserJobScheduler
+
+    old_id = await crud.create_job(db, title="Original", cron_expression="0 9 * * *", dispatch_prompt="old")
+    scheduler = UserJobScheduler(db=db)
+    await scheduler.start()
+    monkeypatch.setattr(tools, "_db", db)
+    monkeypatch.setattr(tools, "_scheduler", scheduler)
+    try:
+        assert (await tools.user_job_control.fn(old_id, "pause"))["success"]
+        register = scheduler._register_job
+        monkeypatch.setattr(scheduler, "_register_job", lambda _: False)
+        replacement = await tools.user_job_create.fn(
+            title="Replacement", cron_expression="0 10 * * *", dispatch_prompt="new"
+        )
+        assert replacement["success"] is False and replacement["saved"] is True
+        # Retire the failed replacement's active intent BEFORE restoring old.
+        assert (await tools.user_job_control.fn(replacement["job_id"], "pause"))["success"]
+        assert (await crud.get_job(db, replacement["job_id"]))["status"] == "paused"
+        assert not scheduler.is_registered(replacement["job_id"])
+        # A failed restore remains a failure, and both definitions survive.
+        assert (await tools.user_job_control.fn(old_id, "resume"))["success"] is False
+        monkeypatch.setattr(scheduler, "_register_job", register)
+        assert (await tools.user_job_control.fn(old_id, "resume"))["success"] is True
+    finally:
+        await scheduler.stop()
+    restarted = UserJobScheduler(db=db)
+    await restarted.start()
+    try:
+        assert len(await crud.list_jobs(db)) == 2
+        assert len(await crud.list_jobs(db, status="active")) == 1
+        assert [j.id for j in restarted._scheduler.get_jobs()] == [f"user_job:{old_id}"]
+    finally:
+        await restarted.stop()
