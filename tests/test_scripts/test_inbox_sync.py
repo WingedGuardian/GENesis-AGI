@@ -778,3 +778,18 @@ def test_heartbeat_counts_held_responses(tmp_path):
     assert _run(env).returncode == 0
     assert held.exists()
     assert _heartbeat(env)["held"] == 1
+
+
+def test_symlinked_inbox_root_is_still_walked(tmp_path):
+    """The inbox root may be a symlink to the real folder; cleanup must walk it
+    (find does not follow a start-point symlink by default)."""
+    env, inbox, _, _ = _setup(tmp_path)
+    link = tmp_path / "inbox-link"
+    link.symlink_to(inbox)
+    env["GENESIS_INBOX_PATH"] = str(link)
+    gone = _old_response_file(inbox, "Projects/Gone-1.genesis.md")
+    _set_record(inbox, ["Projects/Gone-1.genesis.md"])
+    _set_listing(env, [])
+
+    assert _run(env).returncode == 0
+    assert not gone.exists(), "a vault deletion was not applied through a symlinked inbox root"
