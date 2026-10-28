@@ -1498,6 +1498,7 @@ def _sent_subject(smtp):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("given", "expected"), [
     ("Weekly backup report", "Weekly backup report"),
+    ("A" * 240, "A" * 200),
     (None, "Message from Genesis"),  # safety net only: never the body
 ])
 async def test_an_email_is_sent_with_its_authors_subject(config, db, monkeypatch, given, expected):
@@ -1557,14 +1558,17 @@ async def test_a_deferred_email_keeps_its_subject(config, db, mock_formatter):
 
 
 @pytest.mark.asyncio
-async def test_a_quarantined_subject_is_refused_before_the_approval_gate(config, db, monkeypatch):
+@pytest.mark.parametrize("prefix", ["key ", "A" * 200 + " "])
+async def test_a_quarantined_subject_is_refused_before_the_approval_gate(
+    config, db, monkeypatch, prefix,
+):
     pipe, smtp = _smtp_pipe(monkeypatch, config, db, None)
     held = MagicMock()
     held.check = AsyncMock()
     pipe.set_autonomy_gate(held)
     result = await pipe.submit(OutreachRequest(
         category=OutreachCategory.NOTIFICATION, topic="t",
-        email_subject="key sk-abcdefghij1234567890ABCDXYZ",
+        email_subject=prefix + "sk-abcdefghij1234567890ABCDXYZ",
         context="Body.", salience_score=1.0, channel="email", verbatim=True,
         validated_recipient="recipient@example.com",
     ))
@@ -1572,3 +1576,22 @@ async def test_a_quarantined_subject_is_refused_before_the_approval_gate(config,
     assert result.error == "Subject scan quarantine"
     held.check.assert_not_called()
     smtp.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("original", ["A" * 200, "A" * 240, "Re: " + "A" * 200])
+async def test_reply_preserves_full_thread_subject_in_mime(config, db, monkeypatch, original):
+    import genesis.mcp.outreach_mcp as mcp_mod
+
+    pipe, smtp = _smtp_pipe(monkeypatch, config, db, None)
+    monkeypatch.setattr(mcp_mod, "_pipeline", pipe)
+    monkeypatch.setattr(mcp_mod, "_db", db)
+    monkeypatch.setattr("genesis.db.crud.email_threads.get_thread", AsyncMock(return_value={
+        "recipient": "recipient@example.com", "subject": original,
+    }))
+    await mcp_mod.outreach_send.fn(
+        message="Following up.", category="notification", channel="email",
+        thread_id="t1", salience_score=1.0,
+    )
+    expected = original if original.startswith("Re:") else f"Re: {original}"
+    assert _sent_subject(smtp) == expected

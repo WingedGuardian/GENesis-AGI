@@ -884,7 +884,7 @@ class TestPollRefusesUnconfiguredChannel:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("subject", [None, "", "   "])
+@pytest.mark.parametrize("subject", [None, "", "   ", "\u202e", "\u200b \u2028"])
 async def test_an_email_without_a_subject_from_its_author_is_refused(subject):
     """Whoever writes the email writes its subject; a send without one is refused
     before anything is queued or delivered."""
@@ -894,6 +894,7 @@ async def test_an_email_without_a_subject_from_its_author_is_refused(subject):
 
     old = (mcp_mod._pipeline, mcp_mod._db)
     pipeline = AsyncMock()
+    pipeline.submit.side_effect = AssertionError("An empty cleaned subject must not reach the pipeline")
     mcp_mod._pipeline = pipeline
     mcp_mod._db = None
     try:
