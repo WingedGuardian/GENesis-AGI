@@ -1487,19 +1487,120 @@ def test_sf2_never_deletes_through_a_symlinked_parent(tmp_path):
     assert w.state.exists()
 
 
-def test_sf4_repair_move_explain_works_with_no_kit(w):
-    """SF4a: with no kit installed (it arrives in PR D2), --explain still prints
-    the by-hand steps, from the checkout's own module (it only prints)."""
-    entry = _entry_checkout(w)
-    shutil.copy2(MODULE, entry.parent / "lib" / MODULE.name)
+def test_sf4_repair_move_explain_works_with_no_kit(w, tmp_path):
+    """SF4a / CodeRabbit c4390266663: with no kit installed (it arrives in PR
+    D2), --explain still prints the by-hand steps. It reads the module as HEAD
+    committed it, never the working tree's copy, which can be one of the
+    half-written files: truncated here, so running it would fail."""
+    co = tmp_path / "co"
+    (co / "scripts" / "lib").mkdir(parents=True)
+    shutil.copy2(REPO / "scripts" / "deploy_candidates", co / "scripts" / "deploy_candidates")
+    for name in ("deploy_marker.sh", "live_system_guard.sh", MODULE.name):
+        shutil.copy2(LIB / name, co / "scripts" / "lib" / name)
+    _git(co, "init", "-q", "-b", "live")
+    _git(co, "add", "-A")
+    _git(co, "commit", "-qm", "tag")
+    half = co / "scripts" / "lib" / MODULE.name
+    half.write_bytes(MODULE.read_bytes()[:300])  # mid-docstring: a SyntaxError
+    control = subprocess.run(["python3", "-I", "-S", str(half), "--explain"], capture_output=True)
+    assert control.returncode != 0, "control: the truncated copy runs"
     e = subprocess.run(
-        ["bash", str(entry), "repair-move", "--explain"],
+        ["bash", str(co / "scripts" / "deploy_candidates"), "repair-move", "--explain"],
         capture_output=True,
         text=True,
         env=w.env(),
     )
     assert e.returncode == 0, e.stderr
     assert "git restore --source=<tag>" in e.stdout, e.stdout
+
+
+def test_explain_with_no_kit_ignores_a_callers_git_dir(w, tmp_path):
+    """The no-kit --explain reads the module from this checkout's HEAD even when
+    the caller exports GIT_DIR (a hook does): it never runs another repository's
+    committed module."""
+    co = tmp_path / "co"
+    (co / "scripts" / "lib").mkdir(parents=True)
+    shutil.copy2(REPO / "scripts" / "deploy_candidates", co / "scripts" / "deploy_candidates")
+    for name in ("deploy_marker.sh", "live_system_guard.sh", MODULE.name):
+        shutil.copy2(LIB / name, co / "scripts" / "lib" / name)
+    _git(co, "init", "-q", "-b", "live")
+    _git(co, "add", "-A")
+    _git(co, "commit", "-qm", "tag")
+    other = tmp_path / "other"
+    (other / "scripts" / "lib").mkdir(parents=True)
+    trap = tmp_path / "ran-the-other-module"
+    (other / "scripts" / "lib" / MODULE.name).write_text(f"open({str(trap)!r}, 'w').close()\n")
+    _git(other, "init", "-q")
+    _git(other, "add", "-A")
+    _git(other, "commit", "-qm", "other")
+    env = {**w.env(), "GIT_DIR": str(other / ".git")}
+    e = subprocess.run(
+        ["bash", str(co / "scripts" / "deploy_candidates"), "repair-move", "--explain"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert not trap.exists(), "ran the module GIT_DIR named"
+    assert e.returncode == 0, e.stderr
+    assert "git restore --source=<tag>" in e.stdout, e.stdout
+
+
+@pytest.mark.parametrize("lib", ["deploy_marker.sh", "live_system_guard.sh"])
+@pytest.mark.parametrize("damage", ["truncated", "removed"])
+def test_explain_survives_a_half_written_shell_lib(w, tmp_path, lib, damage):
+    """Audit SHOULD-FIX: repair-move sources neither of the checkout's shell libs
+    (the move it repairs may have truncated or removed them), so --explain still
+    prints the steps."""
+    co = tmp_path / "co"
+    (co / "scripts" / "lib").mkdir(parents=True)
+    shutil.copy2(REPO / "scripts" / "deploy_candidates", co / "scripts" / "deploy_candidates")
+    for name in ("deploy_marker.sh", "live_system_guard.sh", MODULE.name):
+        shutil.copy2(LIB / name, co / "scripts" / "lib" / name)
+    _git(co, "init", "-q", "-b", "live")
+    _git(co, "add", "-A")
+    _git(co, "commit", "-qm", "tag")
+    hurt = co / "scripts" / "lib" / lib
+    if damage == "truncated":
+        hurt.write_bytes(hurt.read_bytes()[:200])
+    else:
+        hurt.unlink()
+    env = {k: v for k, v in w.env().items() if k != "GENESIS_TEST_FENCE_LIVE_ROOTS"}
+    e = subprocess.run(
+        ["bash", str(co / "scripts" / "deploy_candidates"), "repair-move", "--explain"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert e.returncode == 0, e.stderr
+    assert "git restore --source=<tag>" in e.stdout, e.stdout
+
+
+def test_reapply_never_stages_a_deletion_of_an_engine_row(w):
+    """Audit LOW: an UNMERGED ancestor `sub` (git checks file/directory conflicts
+    per stage) beside a stage-0 sub/s1. The ancestor's step drops only rows whose
+    own steps re-add them, so no tag file is left staged for deletion."""
+    killed_tag_side(w, "prepared")
+
+    def plant():
+        oids = [_hash(w, f"UNMERGED {n}\n") for n in (1, 2, 3)]
+        recs = "".join(f"100644 {o} {n}\tsub\0" for n, o in zip((1, 2, 3), oids, strict=True))
+        subprocess.run(
+            ["git", "-C", str(w.root), "update-index", "-z", "--index-info"],
+            input=recs.encode(),
+            check=True,
+            env=_git_env(),
+        )
+
+    _lock_aside_if_any(w, plant)
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    for step in w.report()["reapply"]:
+        s = subprocess.run(["bash", "-c", step], capture_output=True, text=True, env=w.env())
+        assert s.returncode == 0, s.stderr
+    st = _git(w.root, "status", "--porcelain")
+    staged_deletions = [ln for ln in st.splitlines() if ln.startswith("D ")]
+    assert staged_deletions == [], st
+    assert "UU sub" in st, st
 
 
 def test_sf4_a_tag_side_live_message_is_actionable_with_no_kit(w):
@@ -1564,12 +1665,34 @@ def _gitlink_desc(w):
     return "P/sub"
 
 
+def _hash(w: World, body: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(w.root), "hash-object", "-w", "--stdin"],
+        input=body,
+        capture_output=True,
+        text=True,
+        check=True,
+        env=_git_env(),
+    ).stdout.strip()
+
+
+def _ancestor_file(w):
+    """#3657: the index holds a file `sub` where the disk (and the tag) hold
+    the directory sub/: restoring sub/s1 drops that ancestor entry."""
+    oid = _hash(w, "STAGED SUB\n")
+    _git(w.root, "update-index", "--force-remove", "sub/s1", "sub/t")
+    _git(w.root, "update-index", "--add", "--cacheinfo", f"100644,{oid},sub")
+    return "sub"
+
+
 def _lock_aside_if_any(w: World, fn):
     lock = w.root / ".git" / "index.lock"
     return _lock_aside(w, fn) if lock.exists() else fn()
 
 
-@pytest.mark.parametrize("make", [_staged_desc, _skip_worktree_desc, _deep_desc, _gitlink_desc])
+@pytest.mark.parametrize(
+    "make", [_staged_desc, _skip_worktree_desc, _deep_desc, _gitlink_desc, _ancestor_file]
+)
 def test_r4_an_index_entry_under_a_row_path_is_its_own_row(w, make):
     """Restoring P (a file in the tag) drops every index entry under P, so each
     is a row of its own: classified foreign, its blob saved, and after a
@@ -1712,3 +1835,82 @@ def test_r4_a_fresh_ref_lock_is_waited_for_never_left_behind(w, mod, tmp_path, m
         (proc / str(os.getppid()) / "fd").chmod(0o755)
     assert not w.state.exists() and not head_lock.exists()
     assert (w.backups()[-1] / "git" / "HEAD.lock").exists()
+
+
+# ── #3657 / #3658: index ancestors are rows; no step reaches through a link ──
+
+
+def _gc(w: World) -> None:
+    _git(w.root, "-c", "gc.reflogExpire=now", "-c", "gc.reflogExpireUnreachable=now", "gc", "-q",
+         "--prune=now")  # fmt: skip
+
+
+def _run_steps(w: World) -> None:
+    for step in w.report()["reapply"]:
+        r = subprocess.run(["bash", "-c", step], capture_output=True, text=True, env=w.env())
+        assert r.returncode == 0, step + "\n" + r.stderr
+
+
+def test_r5_an_index_ancestor_of_a_row_path_is_saved_and_reapplied(w):
+    """#3657 (Codex c4390238983): the index holds a foreign file `sub` while
+    the disk holds sub/; restoring sub/s1 drops that entry. It is a row of its
+    own, its blob is saved, and after `git gc --prune=now` the printed steps
+    put the staged `sub` back."""
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: _ancestor_file(w))
+    index_before = _git(w.root, "ls-files", "-s", "-z")
+    oid = _git(w.root, "ls-files", "-s", "--", "sub").split()[1]
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    rows = {row["path"]: row for row in w.report()["paths"]}
+    assert rows.get("sub", {}).get("class") == "foreign", sorted(rows)
+    assert (w.backups()[-1] / "index-blobs" / oid).is_file(), "the staged blob was not saved"
+    _gc(w)
+    gone = subprocess.run(["git", "-C", str(w.root), "cat-file", "-e", oid], env=_git_env())
+    assert gone.returncode != 0, "control: gc pruned the staged blob"
+    _run_steps(w)
+    assert _git(w.root, "ls-files", "-s", "-z") == index_before
+    assert _git(w.root, "cat-file", "blob", oid) == "STAGED SUB"
+
+
+@pytest.mark.parametrize("ancestor", [False, True], ids=["staged-child", "ancestor-file"])
+def test_r5_no_reapply_step_reaches_through_a_restored_symlink(w, tmp_path, ancestor):
+    """#3658 (Codex c4390238996): `sub` is a foreign symlink to a directory
+    outside the checkout and the index holds foreign content at sub/s1 (or,
+    with #3657, a foreign file `sub`). The repair never reads through the link;
+    neither may its steps: the outside file survives them unchanged, the child
+    gets only its index state back, and its row says it was not reachable."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "s1").write_text("not the checkout's\n")
+    killed_tag_side(w, "Z3")
+
+    def plant():
+        if ancestor:
+            _ancestor_file(w)
+        else:
+            (w.root / "sub" / "s1").write_text("STAGED S1\n")
+            _git(w.root, "add", "--", "sub/s1")
+        shutil.rmtree(w.root / "sub")
+        os.symlink(outside, w.root / "sub")
+
+    _lock_aside(w, plant)
+    index_before = _git(w.root, "ls-files", "-s", "-z")
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (outside / "s1").read_text() == "not the checkout's\n", "the repair reached outside"
+    rows = {row["path"]: row for row in w.report()["paths"]}
+    assert rows["sub"]["class"] == "foreign", rows["sub"]
+    if not ancestor:
+        assert rows["sub/s1"]["class"] == "foreign", rows["sub/s1"]
+        assert rows["sub/s1"].get("unreachable_through") == "sub", rows["sub/s1"]
+        [child] = [s for s in w.report()["reapply"] if "sub/s1" in s]
+        assert "rm -rf" not in child and "cp -a" not in child, child
+        assert "not reachable through" in child, child
+    _gc(w)
+    _run_steps(w)
+    assert (outside / "s1").exists(), "a re-apply step deleted a file outside the checkout"
+    assert (outside / "s1").read_text() == "not the checkout's\n"
+    assert sorted(p.name for p in outside.iterdir()) == ["s1"], "a step wrote outside"
+    assert os.readlink(w.root / "sub") == str(outside)
+    assert _git(w.root, "ls-files", "-s", "-z") == index_before
