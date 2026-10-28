@@ -31,4 +31,17 @@ if [[ ! -f "$MCP_SCRIPT" ]]; then
     exit 1
 fi
 
+# Shared-MCP rollout switch (scripts/lib/mcp_rollout.py). Only the form the
+# Claude Code registrations use (`--server <name>`, nothing else) on an install
+# that has opted in (the env stage, or the user overlay file) routes through it;
+# every other spawn, Codex's --external-client among them, is the per-session
+# server exactly as before. GENESIS_MCP_SHARED_DISABLED set to anything but 0
+# turns it off.
+ROLLOUT="$GENESIS_ROOT/scripts/lib/mcp_rollout.py"
+_rollout_home="${GENESIS_HOME:-${HOME:-}/.genesis}"
+if [[ $# -eq 2 && "$1" == --server && "${GENESIS_MCP_SHARED_DISABLED:-0}" == 0 && -f "$ROLLOUT" ]] \
+    && [[ -n "${GENESIS_MCP_SHARED_STAGE+set}" || -e "$_rollout_home/config/mcp_shared.json" ]]; then
+    exec "$PYTHON" -I -S "$ROLLOUT" launch --root "$GENESIS_ROOT" -- "$PYTHON" "$MCP_SCRIPT" "$@"
+fi
+
 exec "$PYTHON" "$MCP_SCRIPT" "$@"
