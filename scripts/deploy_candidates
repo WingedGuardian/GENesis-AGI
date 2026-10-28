@@ -41,32 +41,9 @@ export HOME
 die() { echo "ERROR: $*" >&2; exit 1; }
 
 _SELF_DIR="$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-# Test fence first (sourced): the engine only ever acts on the checkout this
-# script lives in — the manifest, its `git -C` worktree moves and update.lock
-# are all rooted at $_SELF_DIR/.. — so that root is first known here, before
-# the lock's mkdir. No-op unless GENESIS_TEST_FENCE_LIVE_ROOTS is armed.
-# repair-move sources neither lib: both are tracked files the half-written move
-# it repairs may have truncated or removed. The fence is a no-op unless armed;
-# armed, a guard that cannot load refuses (97) rather than skip it.
-if [ "${1:-}" = repair-move ]; then
-    if [ -n "${GENESIS_TEST_FENCE_LIVE_ROOTS:-}" ]; then
-        # shellcheck source=lib/live_system_guard.sh
-        . "$_SELF_DIR/lib/live_system_guard.sh" || exit 97
-        refuse_if_test_fenced_live "$(cd "$_SELF_DIR/.." && pwd)" || exit 97
-    fi
-else
-    # shellcheck source=lib/live_system_guard.sh
-    . "$_SELF_DIR/lib/live_system_guard.sh"
-    refuse_if_test_fenced_live "$(cd "$_SELF_DIR/.." && pwd)" || exit 97
-    # shellcheck source=lib/deploy_marker.sh
-    . "$_SELF_DIR/lib/deploy_marker.sh"
-    export DEPLOY_CANDIDATES_EPHEMERAL_RE="$EPHEMERAL_DIRTY_RE"
-fi
-
-LOCK_FILE="${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock"
-LOCK_HELD_RC=200
-WAIT_S="${GENESIS_DEPLOY_LOCK_WAIT:-7200}"
-
+# repair-move sources neither shell lib: both are tracked files the half-written
+# move it repairs may have truncated or removed. The test fence is a no-op unless
+# armed; armed, a guard that cannot load refuses (97) rather than skip it.
 # repair-move [--wait N] [--dismiss TS] [--explain]: puts back a `live` checkout a
 # killed switch left half-written (#3492). It runs the repair KIT bootstrap
 # installed (~/.genesis/lib/live-repair/current), never this checkout's copy: the
@@ -77,6 +54,11 @@ WAIT_S="${GENESIS_DEPLOY_LOCK_WAIT:-7200}"
 # tree's copy, which can itself be half-written. It runs from memory, so the
 # module is given the __file__ it reads at import.
 if [ "${1:-}" = repair-move ]; then
+    if [ -n "${GENESIS_TEST_FENCE_LIVE_ROOTS:-}" ]; then
+        # shellcheck source=lib/live_system_guard.sh
+        . "$_SELF_DIR/lib/live_system_guard.sh" || exit 97
+        refuse_if_test_fenced_live "$(cd "$_SELF_DIR/.." && pwd)" || exit 97
+    fi
     shift
     kit="$HOME/.genesis/lib/live-repair/current/live_move_repair.py"
     for a in "$@"; do
@@ -106,6 +88,21 @@ exec(compile(src, sys.argv[0], "exec"), {"__name__": "__main__", "__file__": sys
     esac
     exec python3 -I -S "$kit" "${mode[@]}" "$HOME/.genesis/update_state.json" "$(dirname "$_SELF_DIR")" "$@"
 fi
+
+# Test fence first (sourced): the engine only ever acts on the checkout this
+# script lives in — the manifest, its `git -C` worktree moves and update.lock
+# are all rooted at $_SELF_DIR/.. — so that root is first known here, before
+# the lock's mkdir. No-op unless GENESIS_TEST_FENCE_LIVE_ROOTS is armed.
+# shellcheck source=lib/live_system_guard.sh
+. "$_SELF_DIR/lib/live_system_guard.sh"
+refuse_if_test_fenced_live "$(cd "$_SELF_DIR/.." && pwd)" || exit 97
+# shellcheck source=lib/deploy_marker.sh
+. "$_SELF_DIR/lib/deploy_marker.sh"
+export DEPLOY_CANDIDATES_EPHEMERAL_RE="$EPHEMERAL_DIRTY_RE"
+
+LOCK_FILE="${GENESIS_HOME:-$HOME/.genesis}/locks/update.lock"
+LOCK_HELD_RC=200
+WAIT_S="${GENESIS_DEPLOY_LOCK_WAIT:-7200}"
 
 # --wait belongs to this shell; everything else goes to the engine as given.
 args=()
