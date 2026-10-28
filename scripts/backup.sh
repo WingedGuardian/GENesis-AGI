@@ -994,7 +994,7 @@ else
         if _tar_root_err="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.err 2>/dev/null)"; then
             _EXTRA_TAR_ERR="$_tar_root_err"
             _tar_root="$(python3 "$_SCRIPT_DIR/lib/extra_restore.py" verify "$_tar_tmp" "$GENESIS_BIG_TMP" 2>"$_tar_root_err")" || _tar_verify_rc=$?
-            _tar_root_why="$(head -c 300 "$_tar_root_err" | tr '\n' ' ')"
+            _tar_root_why="$(cat "$_tar_root_err")"
             rm -f "$_tar_root_err"
             _EXTRA_TAR_ERR=""
         else
