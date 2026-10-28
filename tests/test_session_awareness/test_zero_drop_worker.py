@@ -133,7 +133,7 @@ def _template_db(tmp_path_factory) -> str:
 
         # Safe in a SYNC fixture: no event loop is running at fixture-setup
         # time, and pytest-asyncio builds a fresh function-scoped loop per test
-        # (no `asyncio_default_fixture_loop_scope` is configured), so
+        # (`asyncio_default_test_loop_scope` is unset, so function), so
         # asyncio.run clearing the thread's current loop on exit affects
         # nothing. If a session-scoped loop is ever configured, revisit this.
         asyncio.run(_build())
