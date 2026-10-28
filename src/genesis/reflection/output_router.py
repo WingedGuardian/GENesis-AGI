@@ -149,7 +149,36 @@ def parse_deep_reflection_output(raw_json: str) -> DeepReflectionOutput:
         confidence_defaulted=raw_confidence is None,
         separability=float(data["separability"]) if data.get("separability") is not None else None,
         alternative_assessment=data.get("alternative_assessment"),
+        surplus_cited=_parse_surplus_cited(data.get("surplus_cited")),
     )
+
+
+# Surplus value probe: how much of the model-authored rejected-id list is kept
+# as a sample (see OutputRouter.route, step 10b). The full count is always
+# recorded beside it. Surplus insight ids are uuids or short hash ids (36
+# characters at most on a live install); an id longer than 128 cannot be one of
+# them and is counted but not sampled. 20 matches the gathered-set size
+# (ContextGatherer._promoted_surplus_digest, limit=20).
+_MAX_SURPLUS_ID_LEN = 128
+_REJECTED_SAMPLE = 20
+
+
+def _parse_surplus_cited(raw) -> list[str] | None:
+    """The ``surplus_cited`` id list, or None when the model did not report one.
+
+    A non-list value counts as not reported. Non-string and empty entries are
+    dropped, ids are stripped, and repeats keep their first position. Whether
+    each id was actually in the prompt is checked at routing time.
+    """
+    if not isinstance(raw, list):
+        return None
+    cited: list[str] = []
+    for entry in raw:
+        if isinstance(entry, str):
+            sid = entry.strip()
+            if sid and sid not in cited:
+                cited.append(sid)
+    return cited
 
 
 def parse_weekly_assessment_output(raw_json: str) -> WeeklyAssessmentOutput:
@@ -600,13 +629,37 @@ class OutputRouter:
                     "Failed to mark surplus insights consumed", exc_info=True,
                 )
 
+            # 10b. Surplus value probe: which gathered insights the reflection
+            #      says it drew on. Persisted with the completed event's details.
+            gathered = list(dict.fromkeys(gathered_surplus_ids))
+            # Ids outside the gathered set are counted in full ("rejected").
+            # A sample is kept as rejected_ids, so a format mismatch can be
+            # told apart from an invented id: the first _REJECTED_SAMPLE whole
+            # ids of plausible length. The list is model-authored and nothing
+            # else bounds it. An id is never cut, and the count stays the
+            # denominator for the sample.
+            cited = None
+            rejected: list[str] = []
+            if output.surplus_cited is not None:
+                allowed = set(gathered)
+                cited = [sid for sid in output.surplus_cited if sid in allowed]
+                rejected = [sid for sid in output.surplus_cited if sid not in allowed]
+            summary["surplus_probe"] = {
+                "gathered": gathered, "cited": cited, "rejected": len(rejected),
+                "rejected_ids": [
+                    sid for sid in rejected if len(sid) <= _MAX_SURPLUS_ID_LEN
+                ][:_REJECTED_SAMPLE],
+            }
+
         # 11. Emit events
         if self._event_bus:
             from genesis.observability.types import Severity, Subsystem
+            # The probe's id lists go in the details only, not the message.
+            brief = {k: v for k, v in summary.items() if k != "surplus_probe"}
             await self._event_bus.emit(
                 Subsystem.REFLECTION, Severity.INFO,
                 "deep_reflection.completed",
-                f"Deep reflection routed: {summary}",
+                f"Deep reflection routed: {brief}",
                 **summary,
             )
 

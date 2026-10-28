@@ -1195,6 +1195,16 @@ def _validate_surplus(changes: dict) -> list[str]:
         if isinstance(j, dict):
             for key in j:
                 _validate_positive_int(j, key, errors)
+    if "telegram" in changes:
+        tg = changes["telegram"]
+        if not isinstance(tg, dict):
+            errors.append("telegram must be a mapping")
+        else:
+            for key, value in tg.items():
+                if key != "post_insights":
+                    errors.append(f"Unknown key 'telegram.{key}'. Valid: post_insights")
+                elif not isinstance(value, bool):
+                    errors.append("telegram.post_insights must be true or false")
     if "task_defaults" in changes:
         td = changes["task_defaults"]
         if isinstance(td, dict):
