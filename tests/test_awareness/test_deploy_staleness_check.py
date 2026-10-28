@@ -894,3 +894,46 @@ async def test_the_unbound_class_has_its_own_wording(db, monkeypatch):
     await loop._check_deploy_staleness(db)
     [row] = await _rows(db)
     assert "no deploy manifest of this repository binds it" in row["content"]
+
+
+async def test_td19_a_live_repair_report_raises_its_own_wording_then_resolves(db, monkeypatch):
+    """T-D19 (#3492 PR D1): the live-move repair's report becomes the deploy
+    observation with the exact re-apply step, no update.sh advice, high (never
+    critical); a later tick without it resolves the observation."""
+    step = "rm -rf -- /x/sub/s1 && cp -a -- /b/tree/sub/s1 /x/sub/s1"
+    snap = _snap(["live_repair_saved:1", "live_repair_unresolved"])
+    snap["live_repairs"] = {"saved": [step], "unresolved": True}
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    rows = await _rows(db)
+    assert len(rows) == 1 and rows[0]["priority"] == "high", rows
+    content = rows[0]["content"]
+    assert step in content and "repair-move --dismiss" in content, content
+    assert "did not finish" in content and "update.sh" not in content, content
+    _patch_snapshot(monkeypatch, _snap([]))
+    await loop._check_deploy_staleness(db)
+    assert await _rows(db) == []
+    assert len(await _rows(db, resolved=1)) == 1
+
+
+async def test_a_live_repair_paragraph_caps_its_steps_and_names_the_ts(db, monkeypatch):
+    """F5: at most five steps inline (the rest counted, with the report named),
+    the actual `--dismiss <ts>`, and the informational line for rows the
+    checkout moved past."""
+    steps = [f"step-{n}" for n in range(8)]
+    snap = _snap(["live_repair_saved:8", "live_repair_moved_on:2"])
+    snap["live_repairs"] = {
+        "saved": steps,
+        "unresolved": False,
+        "dismiss": ["20261027T000000Z-7"],
+        "moved_on": ["2 saved path(s) from repair 20261020T000000Z-3 are no longer re-applicable"],
+    }
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert all(s in content for s in steps[:5]) and "step-5" not in content, content
+    assert "and 3 more" in content and "REPAIR.json" in content, content
+    assert "repair-move --dismiss 20261027T000000Z-7" in content, content
+    assert "20261020T000000Z-3 are no longer re-applicable" in content, content
+    assert row["priority"] == "high"
