@@ -44,6 +44,63 @@ phase: 10
 skill_type: workflow
 ---
 
+## Running under Codex
+
+This section applies to the separately qualified interactive Codex validator.
+It qualifies the shell-ledger and deploy directions below; the shared evidence,
+risk, control and finding-routing rules still apply. Read
+`.agents/skills/genesis-external-client/SKILL.md` and
+`docs/reference/codex-validator-boundary.md` before using the tools. The ordinary
+Codex external profile retains its health/recall floor and cannot write memories
+or verification records merely because this skill is discoverable.
+
+The dedicated launcher's MCP server keys are `genesis_validator_health` and
+`genesis_validator_memory`. Codex tool names use
+`mcp__<server-key>__<tool-name>`:
+
+| Operation | Server key | Tool |
+|---|---|---|
+| Record or preview evidence | genesis_validator_health | pr_verification_close |
+| Keep private findings | genesis_validator_health | follow_up_create / follow_up_list / follow_up_update |
+| Store an authorized measurement memory | genesis_validator_memory | memory_store |
+
+`pr_verification_close` takes evidence_json and an independent pr, with optional
+park, note, verdict expectation and dry_run. Verdicts are derived from the same
+strict document policy described below. Use that tool, **never the shell
+`pr_verification.py close` writer**. A server-forced preview writes no obligation
+or attempt note and discharges nothing. Actual recording stays locked until
+separately authorized calibration and operator opt-in; no request can clear it.
+After an uncertain real response, re-read stored evidence/count before retrying.
+
+This conversation is not a Genesis session. Do not register its transcript,
+create a charter, use the session ledger or pass its identifiers to session
+tools. Append progress/evidence/uncertainty to
+`~/.genesis/output/validator-runs/<date>.md`. Private follow-up creation uses a
+stable request_key and strategy=user_input_needed, without schedule, pin or
+session provenance. Updates cover eligible private records across clients;
+they cannot promote or dispatch them. Memory writes retain the existing
+collection/supersedes interface and partial-failure limits. Do not write memory
+to manufacture a verification result when that memory store is under test.
+
+**Never deploy, change a service, push, merge or fix code.** The deploy recipes
+and Host-Deploy Gate below describe the Claude operator's responsibilities.
+For Codex, a row waiting on deployment is NOT-YET-DONE: leave it open and note
+the required deploy in the run log/private follow-up. Do not invent deployment
+evidence or mark cannot-verify just because this client cannot deploy.
+
+Public issues and issue/PR timeline comments go through
+`scripts/file_tracker_issue.py`; comments use --comment-on <number> with a
+--body-file. Use body files and the canonical shell restrictions, never raw gh
+or API writes. Privacy/security findings stay local in eligible private
+follow-ups and the owner conversation. A successful scan is not permission to
+publish private content. Validators do not request development reviews or
+trigger paid agents; the filer is not a review-budget gate.
+
+**A native guard denial means stop that action and ask the owner.** Do not
+retry through another command spelling, subprocess, tool or client. Do not
+write stores under test or run migrations on live data. Discovery of this skill
+does not qualify or activate the launcher, and it does not authorize PR6.
+
 ## Load Gate
 
 Three session types touch a PR and they are not phases of one life:

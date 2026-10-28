@@ -4504,6 +4504,12 @@ verified: 3e27b479 2026-10-23
   creating a charter, or joining Genesis foreground/background lifecycle
   management. Recall remains read-oriented rather than side-effect-free: its
   normal retrieval-use metadata may still be updated.
+  `file_tracker_issue.py --comment-on` adds privacy-scanned issue/PR timeline
+  comments through the existing tracker/snapshot pipeline. It submits once and
+  reconciles uncertain outcomes by exact-body reads, never an automatic retry.
+  `.agents/skills/validating-merges` links to the canonical skill with explicit
+  Codex MCP mapping, no lifecycle enrollment and no deploy/fix/push/merge rules.
+  Discovery alone does not qualify or activate the dedicated validator.
   The same project configuration exposes 15 explicitly named GitNexus tools
   through `.claude/mcp/run-gitnexus`, reusing the existing installed-version and
   Node pin checks. It adds no Genesis writers or lifecycle integration. GitNexus
