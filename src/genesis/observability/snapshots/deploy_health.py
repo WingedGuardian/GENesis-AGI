@@ -957,7 +957,11 @@ def collect_live_repairs(genesis_home_dir: Path, now: float | None = None) -> di
     destroys nothing nobody saved: the checkout is still on the report's
     ``tag`` commit and each part the step writes (the node, the index entries,
     the flags) holds what the repair left there, nothing, or already what the
-    step puts back. It clears once the step would change nothing
+    step puts back, and every index entry it drops below its own path (the
+    writer's ``below``, engine rows included) holds what the repair left there
+    or nothing: a row there that cannot be judged (malformed) withholds it.
+    ``saved_from``: the ts of each offered step's report, in the same order.
+    It clears once the step would change nothing
     (:func:`_verdict`) or the report is dismissed (a newer report's row for a
     path replaces an older one's). A row that is neither (someone wrote the
     path since, or the checkout moved on) is never offered again: ``moved_on``
@@ -966,18 +970,21 @@ def collect_live_repairs(genesis_home_dir: Path, now: float | None = None) -> di
     REPAIR.json is user-writable, so untrusted: its stored step text is never
     shown (each offered step is rebuilt by the repair's ``reapply_step``), and
     a row any field of which is not what the writer writes (:func:`_fields_ok`),
-    or that no step can be built for, is skipped and counted in ``malformed``.
+    or that no step can be built for, is skipped and counted in ``malformed``
+    (``malformed_in``: the ts of each undismissed report holding one).
     ``unresolved``: the newest repair
     says so, or has had no result for REPAIR_UNFINISHED_S (killed partway),
     while the update state's guard still calls the checkout half-written: a
     repair killed after its restore leaves no result, and only the tree says
     whether it healed. The repair's module loads only for an undismissed
-    report's foreign row, the guard only for a report that reads unresolved;
+    report's foreign row (unloadable, no helper of it is called and every
+    such row reads moved on), the guard only for a report that reads unresolved;
     each checkout's index and HEAD are read once per call."""
     now = time.time() if now is None else now
     offered: dict[str, tuple[str, str]] = {}  # path -> (step, ts)
     moved: dict[str, tuple[str, str]] = {}  # path -> (ts, backup dir)
     unresolved, repo, malformed = False, None, 0
+    malformed_in: set[str] = set()
     repair, loaded = None, False
     checkouts: dict = {}
     for d in sorted((genesis_home_dir / "deploy-backups").glob("*" + _REPAIR_SUFFIX)):
@@ -1009,12 +1016,14 @@ def collect_live_repairs(genesis_home_dir: Path, now: float | None = None) -> di
         judged: list[tuple[str, dict, str]] = []
         for row in foreign:
             path = row.get("path")
+            if dismissed:
+                if isinstance(path, str):
+                    offered.pop(path, None)
+                    moved.pop(path, None)
+                continue
             if not _fields_ok(d, row):
                 malformed += 1
-                continue
-            if dismissed:
-                offered.pop(path, None)
-                moved.pop(path, None)
+                malformed_in.add(ts)
                 continue
             if not loaded:
                 loaded = True
@@ -1024,13 +1033,20 @@ def collect_live_repairs(genesis_home_dir: Path, now: float | None = None) -> di
                     repair = None
             judged.append((path, row, _verdict(repair, d, repo, tag, row, checkouts)))
         # A row's step drops the index entries of the rows below it before it
-        # re-adds its own: offered only while none of those moved on.
+        # re-adds its own: offered only while none of those moved on, and each
+        # entry it drops still holds what the repair left there, or nothing.
+        # With the repair's module unloadable every verdict is "moved" already.
         gone = [p + "/" for p, _, v in judged if v == "moved"]
-        below = _below(repair, paths) if judged else {}
+        below = _below(repair, paths) if judged and repair is not None else {}
         for path, row, verdict in judged:
             offered.pop(path, None)
             moved.pop(path, None)
             if verdict == "offer" and any(g.startswith(path + "/") for g in gone):
+                verdict = "moved"
+            if verdict == "offer" and not all(
+                _left_alone(repair, d, paths, p, _checkout(repair, repo, checkouts))
+                for p in _drops(repair, row, below.get(path, ()))
+            ):
                 verdict = "moved"
             if verdict == "offer":
                 # Never the stored text: the repair's own reapply_step, from the
@@ -1042,6 +1058,7 @@ def collect_live_repairs(genesis_home_dir: Path, now: float | None = None) -> di
                     )
                 except Exception:  # noqa: BLE001 - a row no step can be built for is malformed
                     malformed += 1
+                    malformed_in.add(ts)
             elif verdict == "moved":
                 moved[path] = (ts, str(d))
     counts: dict[tuple[str, str], int] = {}
@@ -1049,6 +1066,7 @@ def collect_live_repairs(genesis_home_dir: Path, now: float | None = None) -> di
         counts[key] = counts.get(key, 0) + 1
     return {
         "saved": [step for step, _ in offered.values()],
+        "saved_from": [ts for _, ts in offered.values()],
         "dismiss": sorted({ts for _, ts in offered.values()}),
         "moved_on": [
             f"{n} saved path(s) from repair {ts} are no longer re-applicable here (the "
@@ -1057,6 +1075,7 @@ def collect_live_repairs(genesis_home_dir: Path, now: float | None = None) -> di
         ],
         "moved_on_paths": len(moved),
         "malformed": malformed,
+        "malformed_in": sorted(malformed_in),
         "unresolved": unresolved and _mixed(genesis_home_dir, repo),
     }
 
@@ -1153,6 +1172,37 @@ def _below(repair, paths: list[dict]) -> dict[str, list[str]]:
         for d in repair._parents(r["path"]):
             below.setdefault(d, []).append(r["path"])
     return below
+
+
+def _drops(repair, row: dict, below) -> list[str]:
+    """The paths the row's step drops from the index below its own, as
+    ``reapply_step`` builds it: ``below`` when the step writes a stage-0
+    entry, else none (its own path is _verdict's)."""
+    if [tuple(e) for e in row["index"]] == repair._as_index(row.get("tag")):
+        return []
+    return list(below) if any(e[2] == "0" for e in row["index"]) else []
+
+
+def _left_alone(repair, backup: Path, paths: list[dict], path: str, state: dict | None) -> bool:
+    """Does every row of ``path`` hold, in the index, what the repair left
+    there, or nothing? An engine row's leftover is the tag's entry (the repair
+    put it back); a foreign row's too (the restore wrote the tag's). A row that
+    cannot be judged (malformed, another class) never reads as left alone."""
+    if state is None:
+        return False
+    have = [tuple(e) for e in state["entries"].get(path, [])]
+    for r in paths:
+        if r.get("path") != path:
+            continue
+        if r.get("class") == "foreign":
+            ok = _fields_ok(backup, r)
+        else:
+            ok = r.get("class") == "engine" and (
+                r.get("tag") is None or _entry(r.get("tag"), False)
+            )
+        if not ok or have not in ([], repair._as_index(r.get("tag"))):
+            return False
+    return True
 
 
 def _checkout(repair, repo: str | None, checkouts: dict) -> dict | None:
@@ -1334,17 +1384,20 @@ def _blob_is(full: str, st: os.stat_result, mode: str, oid: str) -> bool:
 
 
 def _same_bytes(a: str, b: str) -> bool:
-    fa, fb = _open_regular(a), _open_regular(b)
-    try:
-        while True:
-            x, y = os.read(fa, _CHUNK), os.read(fb, _CHUNK)
-            if x != y:
-                return False
-            if not x:
-                return True
+    fa = _open_regular(a)
+    try:  # the first descriptor is closed even when the second open fails
+        fb = _open_regular(b)
+        try:
+            while True:
+                x, y = os.read(fa, _CHUNK), os.read(fb, _CHUNK)
+                if x != y:
+                    return False
+                if not x:
+                    return True
+        finally:
+            os.close(fb)
     finally:
         os.close(fa)
-        os.close(fb)
 
 
 def _same_node(saved: str, here: str) -> bool:
@@ -1385,6 +1438,8 @@ def live_repair_findings(repairs: dict | None) -> list[str]:
         found.append(f"live_repair_moved_on:{repairs.get('moved_on_paths') or 0}")
     if repairs.get("unresolved"):
         found.append("live_repair_unresolved")
+    if repairs.get("malformed"):
+        found.append(f"live_repair_malformed:{repairs['malformed']}")
     return found
 
 

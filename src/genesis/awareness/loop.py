@@ -1704,6 +1704,11 @@ async def _check_deploy_staleness(db) -> None:
 
         priority = "critical" if critical else "high"
         alert_key = ",".join(classes) + ":" + priority
+        if set(classes) & _DEPLOY_REPAIR_CLASSES:
+            # The repair paragraph quotes commands and report names specific to
+            # this snapshot: other steps or reports are another alert, never
+            # the standing one left naming the old commands.
+            alert_key += ":" + _deploy_repair_identity(snap.get("live_repairs") or {})
         now = time.monotonic()
         if (
             now - _last_deploy_alert_at < _DEPLOY_ALERT_COOLDOWN_S
@@ -1787,10 +1792,25 @@ _DEPLOY_LIVE_CLASSES = frozenset(
 #: Finding classes from the live-move repair's reports
 #: (deploy_health.live_repair_findings): their own wording, and they never page.
 _DEPLOY_REPAIR_CLASSES = frozenset(
-    {"live_repair_saved", "live_repair_moved_on", "live_repair_unresolved"}
+    {
+        "live_repair_saved",
+        "live_repair_moved_on",
+        "live_repair_unresolved",
+        "live_repair_malformed",
+    }
 )
 #: Re-apply steps quoted inline; the rest are counted, and the report names them.
 _DEPLOY_REPAIR_STEPS_SHOWN = 5
+
+
+def _deploy_repair_identity(repairs: dict) -> str:
+    """What the repair paragraph names (steps, their reports, the moved-on and
+    malformed lines), hashed: the alert's identity changes when they do."""
+    named = {
+        k: repairs.get(k)
+        for k in ("saved", "saved_from", "dismiss", "moved_on", "malformed", "malformed_in")
+    }
+    return hashlib.sha256(json.dumps(named, sort_keys=True, default=str).encode()).hexdigest()[:16]
 
 
 def _deploy_repair_paragraph(repairs: dict) -> str:
@@ -1800,13 +1820,22 @@ def _deploy_repair_paragraph(repairs: dict) -> str:
     if saved:
         shown = saved[:_DEPLOY_REPAIR_STEPS_SHOWN]
         more = len(saved) - len(shown)
-        where = dismiss[0] if len(dismiss) == 1 else "<ts>"
-        rest = (
-            f" (and {more} more: see the reapply list in "
-            f"~/.genesis/deploy-backups/{where}-live-move-repair/REPAIR.json)"
-            if more
-            else ""
+        # The reports holding the omitted steps, each named by its ts;
+        # without each step's report, every report with an offered step.
+        source = repairs.get("saved_from") or []
+        where = (
+            source[len(shown) :]
+            if len(source) == len(saved)
+            else [ts for ts in dismiss if ts != "<ts>"]
         )
+        reports = " and ".join(
+            f"~/.genesis/deploy-backups/{ts}-live-move-repair/REPAIR.json"
+            for ts in sorted(set(where))
+        )
+        rest = f" (and {more} more" if more else ""
+        if more and reports:
+            rest += f": see the reapply list in {reports}"
+        rest += ")" if more else ""
         parts.append(
             f"Genesis put a half-written `live` checkout back to its rollback tag and saved "
             f"{len(saved)} path(s) that were not the update's (someone's edits). Each "
@@ -1824,6 +1853,15 @@ def _deploy_repair_paragraph(repairs: dict) -> str:
             " ".join(f"{line}." for line in repairs["moved_on"])
             + " Their steps are no longer offered: running one would overwrite what is "
             "there now. repair-move --dismiss <ts> clears each."
+        )
+    if repairs.get("malformed"):
+        malformed_in = repairs.get("malformed_in") or ["<ts>"]
+        parts.append(
+            f"{repairs['malformed']} row(s) of live-move repair reports are not what the "
+            "repair writes, so no step is offered for them (their reports are under "
+            "~/.genesis/deploy-backups/). "
+            + " and ".join(f"repair-move --dismiss {ts}" for ts in malformed_in)
+            + " clears this."
         )
     if repairs.get("unresolved"):
         parts.append(

@@ -826,3 +826,161 @@ def test_a_row_field_a_step_would_interpolate_is_validated(tmp_path, over):
                paths=[_row(**{"path": "Z", "disk": "absent", **over})], reapply=[])  # fmt: skip
     found = _collect_bounded(tmp_path)
     assert found["saved"] == [] and found["malformed"] == 1, found
+
+
+# -- every index entry a step drops is checked before it is offered --
+
+
+def _staged_at(w, path: str) -> str:
+    return _git(w.root, "ls-files", "-s", "--", path)
+
+
+def test_p1_an_engine_row_below_holding_newer_staging_withholds_its_parent(w):
+    """Codex c4399950919: the parent `sub`'s step drops sub/t (an engine row the
+    repair put back at the tag) before re-adding `sub`. Once someone stages
+    sub/t again, running the parent's step would drop that staging and no step
+    puts it back: the parent is withheld, the rest still offered."""
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: _ancestor_file(w))
+    assert w.repair().returncode == 0
+    rows = {r["path"]: r["class"] for r in w.report()["paths"]}
+    assert (rows["sub"], rows["sub/t"]) == ("foreign", "engine"), rows
+    parent_step, child_step = w.report()["reapply"]
+    assert _saved(w) == [parent_step, child_step], "control: an untouched repair offers both"
+    oid = _hash(w, "NEWER T\n")
+    _git(w.root, "update-index", "--cacheinfo", f"100644,{oid},sub/t")
+    found = _dh().collect_live_repairs(w.gen)
+    assert found["saved"] == [child_step], found
+    assert found["moved_on_paths"] == 1, found
+    for step in found["saved"]:
+        subprocess.run(["bash", "-c", step], check=True, env=w.env())
+    assert oid in _staged_at(w, "sub/t"), "an offered step dropped someone's staging"
+
+
+def _parent_and_child(tmp_path: Path, child_flag: str | None) -> tuple[Path, str]:
+    """A foreign parent `a` (a staged file where the tag has a/) and a foreign
+    child a/b below it, the checkout as the repair left both."""
+    repo, _ = _git_repo(tmp_path)
+    (repo / "a").mkdir()
+    (repo / "a" / "b").write_text("tag\n")
+    _git(repo, "add", "-A")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-qm", "a")
+    head = _git(repo, "rev-parse", "HEAD")
+    tag_b = ["100644", _git(repo, "rev-parse", "HEAD:a/b")]
+    saved = _git(repo, "hash-object", "-w", "--", "kept")
+    parent = _row("a", disk_changed=False, index=[["100644", saved, "0"]])
+    child = _row("a/b", disk_changed=False, tag=tag_b, index=[["100644", saved, "0"]])
+    child["flag"] = child_flag
+    _report_at(tmp_path, "20260101T000000Z-1", result="healed", repo=str(repo), tag=head,
+               paths=[parent, child], reapply=["parent step", "child step"])  # fmt: skip
+    return repo, head
+
+
+@pytest.mark.parametrize("staged", [False, True], ids=["untouched", "newer-staging"])
+def test_p1_a_malformed_row_below_withholds_its_parent(tmp_path, staged):
+    """Devin c4399914277: a child row skipped as malformed (here its flag) is
+    still in the parent's drop list. It cannot be judged, so the parent is
+    never offered: with newer staging at a/b, the step would drop it."""
+    repo, _ = _parent_and_child(tmp_path, child_flag="1")
+    if staged:
+        (repo / "a" / "b").write_text("newer staging\n")
+        _git(repo, "add", "a/b")
+        (repo / "a" / "b").write_text("tag\n")
+    found = _dh().collect_live_repairs(tmp_path)
+    assert found["saved"] == [], found
+    assert found["malformed"] == 1 and found["moved_on_paths"] == 1, found
+
+
+def test_p1_a_well_formed_child_as_left_still_offers_its_parent(tmp_path):
+    """The control for the two above: nothing written since, both offered."""
+    _parent_and_child(tmp_path, child_flag=None)
+    parent_step, child_step = _dh().collect_live_repairs(tmp_path)["saved"]
+    assert "\ta/b" in parent_step and "\ta/b" in child_step
+
+
+# -- a repair module that cannot load never blanks the snapshot --
+
+
+def test_an_unloadable_repair_module_keeps_every_other_finding(tmp_path, monkeypatch):
+    """Devin c4399914406 / CodeRabbit c4399949029 / Codex c4399950954: with
+    the repair's module unreadable, no helper of it is called; the foreign row
+    reads moved on and deploy_health keeps its other findings."""
+    import asyncio
+
+    import genesis.env
+
+    dh = _dh()
+    repo, head = _git_repo(tmp_path)
+    home = tmp_path / "gh"
+    _report_at(home, "20260101T000000Z-1", result="healed", repo=str(repo), tag=head,
+               paths=[_row("Z")], reapply=["s"])  # fmt: skip
+
+    def unreadable(path):
+        raise PermissionError(f"{path}: denied")
+
+    monkeypatch.setattr(dh, "_script", unreadable)
+    found = dh.collect_live_repairs(home)
+    assert found["saved"] == [] and found["moved_on_paths"] == 1, found
+    monkeypatch.setattr(genesis.env, "genesis_home", lambda: home)
+    monkeypatch.setattr(genesis.env, "repo_root", lambda: repo)
+    snap = asyncio.run(dh.deploy_health(None))
+    assert snap["status"] != "error", snap
+    assert "live_repair_moved_on:1" in snap["findings"], snap["findings"]
+
+
+# -- a failed open never leaks a descriptor --
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
+def test_an_unreadable_checkout_file_leaks_no_descriptor(tmp_path):
+    """Devin c4399914732 / Codex c4399950945: the saved copy opens, the
+    checkout's file does not; the saved copy's descriptor is closed anyway."""
+    dh = _dh()
+    saved, here = tmp_path / "saved", tmp_path / "here"
+    saved.write_text("same\n")
+    here.write_text("same\n")
+    here.chmod(0o000)
+    try:
+        before = len(os.listdir("/proc/self/fd"))
+        for _ in range(20):
+            with pytest.raises(OSError):
+                dh._same_bytes(str(saved), str(here))
+        assert len(os.listdir("/proc/self/fd")) == before
+    finally:
+        here.chmod(0o644)
+
+
+# -- malformed rows are a finding of their own --
+
+
+def test_malformed_rows_are_their_own_finding(tmp_path):
+    """Devin c4399914846: `live_repair_malformed:<n>` names the count, and the
+    reports holding them, until each is dismissed."""
+    dh = _dh()
+    repo, head = _git_repo(tmp_path)
+    _report_at(tmp_path, "20260101T000000Z-1", result="healed", repo=str(repo), tag=head,
+               paths=[_row("../x"), _row("Z", flag="1")], reapply=[])  # fmt: skip
+    found = dh.collect_live_repairs(tmp_path)
+    assert found["malformed"] == 2 and found["malformed_in"] == ["20260101T000000Z-1"], found
+    assert dh.live_repair_findings(found) == ["live_repair_malformed:2"]
+    report = tmp_path / "deploy-backups" / "20260101T000000Z-1-live-move-repair" / "REPAIR.json"
+    data = json.loads(report.read_text())
+    report.write_text(json.dumps({**data, "dismissed_at": "2026-01-02T00:00:00Z"}))
+    found = dh.collect_live_repairs(tmp_path)
+    assert found["malformed"] == 0 and dh.live_repair_findings(found) == [], found
+
+
+# -- each offered step carries the report it came from --
+
+
+def test_each_offered_step_names_its_report(tmp_path):
+    """Devin c4399914589: steps from two reports, each step paired with the ts
+    of the report that holds it."""
+    repo, head = _git_repo(tmp_path)
+    for n, ts in enumerate(("20260101T000000Z-1", "20260102T000000Z-2")):
+        rows = [_row(f"d{n}/f{i}", disk_changed=False, flag="S") for i in range(4)]
+        _report_at(tmp_path, ts, result="healed", repo=str(repo), tag=head, paths=rows,
+                   reapply=[])  # fmt: skip
+    found = _dh().collect_live_repairs(tmp_path)
+    assert len(found["saved"]) == 8, found
+    assert found["saved_from"] == ["20260101T000000Z-1"] * 4 + ["20260102T000000Z-2"] * 4

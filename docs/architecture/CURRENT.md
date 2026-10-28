@@ -4392,7 +4392,10 @@ tool-disabled CC probe without changing its schedule or routing authority.
   while running it destroys nothing nobody saved: the checkout's HEAD is
   still the report's `tag` commit and each part the step writes (its node,
   its index entries, its flags) holds what the repair left there, nothing, or
-  already what the step puts back. A row clears once running the step would
+  already what the step puts back, and every index entry the step drops below
+  its own path (engine rows included) holds what the repair left there or
+  nothing (a row there that cannot be judged withholds it). A row clears once
+  running the step would
   change nothing (judged part by part as the step is built: its index entries
   when the step writes them, its flags, and its node by git mode with the
   executable bit, then size, then bytes in 1 MiB chunks, a directory's saved
@@ -4409,10 +4412,13 @@ tool-disabled CC probe without changing its schedule or routing authority.
   a row any field of which is not what the writer writes (a path not plain
   relative, a copy or blob resolving outside its backup dir, an entry that is
   not git's, a FIFO mode not octal, a flag not one letter) is skipped as
-  malformed; a malformed report is skipped row by row. It loads the repair's module only
-  for an undismissed report's foreign row, and reads each checkout's index
+  malformed (`live_repair_malformed:<n>`, until its report is dismissed); a
+  malformed report is skipped row by row. It loads the repair's module only
+  for an undismissed report's foreign row (an unloadable module offers
+  nothing and blanks nothing), and reads each checkout's index
   and HEAD once per snapshot. The awareness paragraph quotes at most five
-  steps and names each `--dismiss <ts>`. `live_repair_unresolved` needs the newest report to
+  steps, names the report(s) holding the rest and each `--dismiss <ts>`, and
+  is replaced whenever the steps or reports it names change. `live_repair_unresolved` needs the newest report to
   say so (or to have no result after an hour) AND the shared guard, run at
   read time and only then, to call the update state `mixed_tree`: a run
   killed after its restore and before its result leaves no result, and only

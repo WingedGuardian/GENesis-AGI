@@ -937,3 +937,65 @@ async def test_a_live_repair_paragraph_caps_its_steps_and_names_the_ts(db, monke
     assert "repair-move --dismiss 20261027T000000Z-7" in content, content
     assert "20261020T000000Z-3 are no longer re-applicable" in content, content
     assert row["priority"] == "high"
+
+
+async def test_omitted_repair_steps_name_the_reports_that_hold_them(db, monkeypatch):
+    """Devin c4399914589: two reports of four steps each. The three steps past
+    the fifth come from both reports, so each report holding one is named; no
+    placeholder path is ever printed."""
+    first, second = "20261027T000000Z-1", "20261028T000000Z-2"
+    snap = _snap(["live_repair_saved:8"])
+    snap["live_repairs"] = {
+        "saved": [f"step-{n}" for n in range(8)],
+        "saved_from": [first] * 4 + [second] * 4,
+        "dismiss": [first, second],
+    }
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert "<ts>" not in content, content
+    assert f"deploy-backups/{second}-live-move-repair/REPAIR.json" in content, content
+    assert f"deploy-backups/{first}-live-move-repair/REPAIR.json" not in content, content
+    snap["live_repairs"]["saved_from"] = [first] * 6 + [second] * 2  # omitted span both
+    _patch_snapshot(monkeypatch, snap)
+    monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
+    monkeypatch.setattr(loop, "_last_deploy_alert_key", "")
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert "<ts>" not in content, content
+    for ts in (first, second):
+        assert f"deploy-backups/{ts}-live-move-repair/REPAIR.json" in content, content
+
+
+async def test_a_later_snapshot_with_other_repair_steps_refreshes_the_alert(db, monkeypatch):
+    """Codex c4399950938: same classes, different steps and report: the
+    standing observation is replaced, never left naming the old commands."""
+    old = _snap(["live_repair_saved:1"])
+    old["live_repairs"] = {"saved": ["old-step"], "dismiss": ["20261027T000000Z-1"]}
+    _patch_snapshot(monkeypatch, old)
+    await loop._check_deploy_staleness(db)
+    new = _snap(["live_repair_saved:1"])
+    new["live_repairs"] = {"saved": ["new-step"], "dismiss": ["20261028T000000Z-2"]}
+    _patch_snapshot(monkeypatch, new)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    assert "new-step" in row["content"] and "old-step" not in row["content"], row["content"]
+    assert "20261028T000000Z-2" in row["content"], row["content"]
+    # The same repair state on the next tick is still deduplicated.
+    _patch_snapshot(monkeypatch, new)
+    await loop._check_deploy_staleness(db)
+    assert len(await _rows(db)) == 1 and len(await _rows(db, resolved=1)) == 1
+
+
+async def test_malformed_repair_rows_have_their_own_wording(db, monkeypatch):
+    """Devin c4399914846: never paging, no update.sh advice, the report named."""
+    snap = _snap(["live_repair_malformed:2"])
+    snap["live_repairs"] = {"malformed": 2, "malformed_in": ["20261027T000000Z-1"]}
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert row["priority"] == "high" and "update.sh" not in content, content
+    assert "2 row(s)" in content and "repair-move --dismiss 20261027T000000Z-1" in content
