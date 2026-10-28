@@ -455,10 +455,13 @@ class TestStructuralMoves:
             source = source.replace("class TestA:", "class TestA(object):")
         elif case == "param_id":
             # Same AST and parameter values, but a collection hook changes one node ID.
+            # Uses the public pytest_make_parametrize_id hook: pytest 9.2 removed the
+            # private Node._nodeid, so assigning it no longer renames anything.
             (project / "conftest.py").write_text(
-                "def pytest_collection_modifyitems(items):\n"
-                "    for item in items:\n"
-                "        item._nodeid = item.nodeid.replace('[1]', '[renamed]')\n"
+                "def pytest_make_parametrize_id(config, val, argname):\n"
+                "    if type(val) is int and val == 1:\n"
+                "        return 'renamed'\n"
+                "    return None\n"
             )
         old.unlink()
         if case == "duplicate_survivor":

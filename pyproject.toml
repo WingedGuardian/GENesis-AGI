@@ -239,6 +239,16 @@ quote-style = "double"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Set explicitly so pytest-asyncio stops warning at configure time. Unset, an
+# async fixture's event loop takes the fixture's own caching scope (pytest-asyncio
+# configuration reference, asyncio_default_fixture_loop_scope). No async fixture
+# in tests/, src/ or scripts/ passes scope= or loop_scope= (AST sweep of async
+# defs decorated pytest.fixture or pytest_asyncio.fixture: 299, all in tests/,
+# 2026-10), so "function" gives each one the loop it already had. pytest 9.2 began
+# printing that configure-time warning to stderr ahead of the run's own output,
+# which broke a test that reads the first output line. An async fixture with a
+# wider scope now needs loop_scope= on its decorator to share a wider loop.
+asyncio_default_fixture_loop_scope = "function"
 # Remove a PASSING test's tmp_path at that test's teardown; keep only failures'
 # for debugging. Without it every run with its own --basetemp keeps every test
 # directory forever (pytest clears a basetemp only when the same name is
