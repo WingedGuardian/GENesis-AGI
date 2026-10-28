@@ -77,6 +77,25 @@ async def query_recent(
     return [dict(r) for r in reversed(rows)]
 
 
+async def latest_outbound(
+    db: aiosqlite.Connection,
+    chat_id: int,
+    thread_id: int,
+    *,
+    limit: int,
+) -> list[dict]:
+    """Genesis's own messages in one thread, newest first (``content`` and
+    ``timestamp`` only). A long message is one row per sent chunk."""
+    cursor = await db.execute(
+        """SELECT content, timestamp FROM telegram_messages
+           WHERE chat_id = ? AND thread_id = ? AND direction = 'outbound'
+           ORDER BY timestamp DESC, id DESC LIMIT ?""",
+        (chat_id, thread_id, limit),
+    )
+    rows = await cursor.fetchall()
+    return [{"content": r[0], "timestamp": r[1]} for r in rows]
+
+
 async def query_all_recent(
     db: aiosqlite.Connection,
     *,
