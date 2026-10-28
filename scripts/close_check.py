@@ -88,7 +88,8 @@ _REPO = regex.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_][A-Za-z0-9._-]
 #: state. Not here, so refused: ``hooks`` (a webhook URL can be the credential),
 #: ``keys``, ``collaborators``, ``invitations``, ``environments``, and under
 #: ``actions`` everything but runs, jobs and workflows (``actions/variables``
-#: holds plaintext values).
+#: holds plaintext values). A ``logs`` segment is refused anywhere: workflow
+#: logs mask secrets but can still carry derived or third-party sensitive text.
 _API_HEADS = frozenset(
     [
         "pulls",
@@ -175,6 +176,7 @@ class JournalCheck:
 class GrepCheck:
     pattern: str
     path: str
+    rev: str = "HEAD"  # repo paths are grepped at a commit, never in the worktree
 
 
 @dataclass(frozen=True)
@@ -187,6 +189,8 @@ class CheckRun:
     stdout_head: str = ""
     stdout_sha256: str = ""
     stdout_truncated: bool = False
+    #: The listing filled its page or limit, so it cannot prove an item absent.
+    listing_capped: bool = False
     stderr_head: str = ""
 
     @property
@@ -281,12 +285,12 @@ def plan_gh(check: GhCheck, repo: str) -> list[str]:
     if check.op == "run-list":
         if not isinstance(check.sha, str) or not _SHA.fullmatch(check.sha):
             raise Refused("run-list needs a commit sha (7 to 40 lowercase hex)")
-        return ["gh", "run", "list", "-R", repo, "--commit", check.sha, "--limit", "50",
+        return ["gh", "run", "list", "-R", repo, "--commit", check.sha, "--limit", str(RUN_LIST_LIMIT),
                 "--json", "name,workflowName,status,conclusion,headSha"]  # fmt: skip
     if check.op == "api":
         segments = (check.path if isinstance(check.path, str) else "").split("/")
         if not 0 < len(segments) <= 8 or any(
-            not _API_SEGMENT.fullmatch(s) or s in (".", "..") for s in segments
+            not _API_SEGMENT.fullmatch(s) or s in (".", "..", "logs") for s in segments
         ):
             raise Refused("api path must be 1 to 8 plain segments under repos/<repo>/")
         head = segments[0] if segments[0] != "actions" else "/".join(segments[:2])
@@ -311,8 +315,11 @@ def plan_grep(check: GrepCheck, repo_root: Path, env: dict) -> list[str]:
     if not check.pattern or len(check.pattern) > _PATTERN_MAX or "\0" in check.pattern:
         raise Refused("grep pattern must be 1 to 512 characters")
     if not check.path.startswith(("/", "~")):
+        rev = _rev(check.rev)
         path = "." if check.path == "." else _repo_path(check.path, repo_root, env)
-        return ["git", "grep", "-n", "-E", "-e", check.pattern, "--", path]
+        # At a commit, not the worktree: a local edit to a tracked file (a
+        # force-added, ignore-matched config holding a real key) never prints.
+        return ["git", "grep", "-n", "-E", "-e", check.pattern, rev, "--", path]
     logs = logs_dir().resolve()
     target = Path(check.path).expanduser().resolve()
     if not target.is_relative_to(logs) or not target.is_file():
@@ -320,7 +327,7 @@ def plan_grep(check: GrepCheck, repo_root: Path, env: dict) -> list[str]:
     return ["grep", "-n", "-E", "-e", check.pattern, "--", str(target)]
 
 
-def _env(home: str, kind: str, index: str | None) -> dict:
+def _env(home: str, kind: str, index: str | None, gh_token: str | None = None) -> dict:
     env = {
         "PATH": _SAFE_PATH, "HOME": home, "LANG": "C.UTF-8", "PAGER": "cat", "GIT_PAGER": "cat",
         "GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
@@ -331,10 +338,14 @@ def _env(home: str, kind: str, index: str | None) -> dict:
     if index:
         env["GIT_INDEX_FILE"] = index
     if kind == "gh":
-        # No GH_TOKEN: gh authenticates from its config (MEASURED under env -i),
-        # and a passed token is one --jq away from stdout. The config is a COPY
-        # in the temp HOME (see _gh_config_copy), so gh writes no real state.
+        # gh gets an EMPTY config dir in the temp HOME, so whatever state it
+        # writes is thrown away, and the token only as GH_TOKEN in this one
+        # child's environment: never a file copy that a hard kill could strand.
+        # No template can print the environment (--jq and --template are not
+        # expressible), and the parent's own GH_TOKEN is never inherited.
         env["GH_CONFIG_DIR"] = str(Path(home) / "gh")
+        if gh_token:
+            env["GH_TOKEN"] = gh_token
         env.update(GH_PROMPT_DISABLED="1", GH_NO_UPDATE_NOTIFIER="1", NO_COLOR="1")
     if kind == "journal" and os.environ.get("XDG_RUNTIME_DIR"):
         env["XDG_RUNTIME_DIR"] = os.environ["XDG_RUNTIME_DIR"]
@@ -354,6 +365,29 @@ def _index_copy(repo_root: Path, home: str, env: dict) -> str | None:
     dst = Path(home) / "index"
     shutil.copyfile(src, dst)
     return str(dst)
+
+
+#: Items per response for the gh templates that list: ``run list --limit`` and
+#: a ``gh api`` collection page (GitHub's default page size).
+RUN_LIST_LIMIT = 50
+API_PAGE_SIZE = 30
+
+
+def _listing_capped(argv: list[str], head: str, truncated: bool) -> bool:
+    """Whether a gh listing may have more items than it returned."""
+    if argv[:3] == ["gh", "run", "list"]:
+        cap = RUN_LIST_LIMIT
+    elif argv[:2] == ["gh", "api"]:
+        cap = API_PAGE_SIZE
+    else:
+        return False
+    if truncated:
+        return True
+    try:
+        items = json.loads(head)
+    except ValueError:
+        return False
+    return isinstance(items, list) and len(items) >= cap
 
 
 def _drain(stream, cap: int, sink: dict) -> None:
@@ -420,12 +454,14 @@ def _plan(check, repo_root: Path, repo: str, env: dict) -> list[str]:
     raise Refused(f"unknown check kind {type(check).__name__}")
 
 
-def _run_sql(check: SqlCheck, db_path: Path) -> CheckRun:
+def _run_sql(check: SqlCheck, db_path: Path, timeout_s: float) -> CheckRun:
     from genesis.db.readonly_query import run_readonly_query
 
     command = ("sql", check.sql)
     try:
-        res = run_readonly_query(db_path, check.sql, tuple(check.params), max_rows=SQL_MAX_ROWS)
+        res = run_readonly_query(
+            db_path, check.sql, tuple(check.params), max_rows=SQL_MAX_ROWS, timeout_s=timeout_s
+        )
     except Exception as exc:  # noqa: BLE001 - a failed read is a failed check, recorded
         return CheckRun(
             "sql", command, exit_code=1, stderr_head=f"{type(exc).__name__}: {exc}"[:STDERR_CAP]
@@ -449,7 +485,7 @@ def run(
     Never raises: a refusal, a malformed field, or a failure while preparing the
     check (the index copy, the ignore check) comes back as ``refused``."""
     if isinstance(check, SqlCheck):
-        return _run_sql(check, db_path)
+        return _run_sql(check, db_path, timeout_s)
     kind = type(check).__name__.removesuffix("Check").lower()
     try:
         home = tempfile.mkdtemp(prefix="close-check-", dir=_big_tmp())
@@ -457,21 +493,23 @@ def run(
         return CheckRun(kind, (), refused=f"could not prepare the check: {type(exc).__name__}")
     try:
         repo_root = Path(repo_root).resolve()
-        if kind == "gh":
-            _gh_config_copy(home)
         env = _env(home, kind, None)
-        env = _env(home, kind, _index_copy(repo_root, home, env))
+        index = _index_copy(repo_root, home, env)
+        env = _env(home, kind, index)
         argv = _plan(check, repo_root, repo, env)
-        exe = shutil.which(argv[0], path=_SAFE_PATH)
+        if kind == "gh":
+            # Read only once the check is accepted: a refusal never touches it.
+            env = _env(home, kind, index, _gh_token())
+        exe = _gh_exe() if argv[0] == "gh" else shutil.which(argv[0], path=_SAFE_PATH)
         if exe is None:
-            return CheckRun(
-                kind, tuple(argv), refused=f"{argv[0]} is not installed in {_SAFE_PATH}"
-            )
+            return CheckRun(kind, tuple(argv), refused=f"{argv[0]} is not installed")
         code, timed_out, out, err = _execute([exe, *argv[1:]], repo_root, env, timeout_s)
+        head = out.get("head", b"").decode(errors="replace")
+        truncated = out.get("total", 0) > STDOUT_CAP
         return CheckRun(
             kind, tuple(argv), exit_code=code, timed_out=timed_out,
-            stdout_head=out.get("head", b"").decode(errors="replace"),
-            stdout_sha256=out.get("sha", ""), stdout_truncated=out.get("total", 0) > STDOUT_CAP,
+            stdout_head=head, stdout_sha256=out.get("sha", ""), stdout_truncated=truncated,
+            listing_capped=_listing_capped(argv, head, truncated),
             stderr_head=err.get("head", b"").decode(errors="replace"),
         )  # fmt: skip
     except Refused as exc:
@@ -490,12 +528,46 @@ def _big_tmp() -> str:
     return big_tmp_dir()
 
 
-def _gh_config_copy(home: str) -> None:
-    """Copy gh's config into the temp HOME, so a read that refreshes gh's state
-    files writes the copy, which is removed with the HOME."""
-    src = Path(os.environ.get("GH_CONFIG_DIR") or Path.home() / ".config" / "gh")
-    if src.is_dir():
-        shutil.copytree(src, Path(home) / "gh")
+def _gh_candidates() -> tuple[str, ...]:
+    """Where gh may be installed: the package manager's location, then the two
+    the installer (scripts/install.sh) falls back to."""
+    return ("/usr/bin/gh", "/usr/local/bin/gh", str(Path.home() / ".local" / "bin" / "gh"))
+
+
+def _gh_exe() -> str | None:
+    for path in _gh_candidates():
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+#: What gh itself reads to find its token (``gh help environment``): passed to
+#: the token read only, never to the check.
+_GH_AUTH_VARS = ("GH_CONFIG_DIR", "XDG_CONFIG_HOME", "GH_TOKEN", "GITHUB_TOKEN", "GH_HOST")
+
+
+def _gh_token() -> str | None:
+    """The token gh would use, read with ``gh auth token`` from the real config
+    (a read: it prints the token and writes nothing). None when gh is not logged
+    in; the check then runs unauthenticated, which public reads allow."""
+    exe = _gh_exe()
+    if exe is None:
+        return None
+    env = {"PATH": _SAFE_PATH, "HOME": str(Path.home()), "GH_PROMPT_DISABLED": "1"}
+    env.update({k: os.environ[k] for k in _GH_AUTH_VARS if os.environ.get(k)})
+    try:
+        out = subprocess.run(
+            [exe, "auth", "token"],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    token = out.stdout.strip()
+    return token if out.returncode == 0 and token and "\n" not in token else None
 
 
 def matches(result: CheckRun, expect: str) -> bool:

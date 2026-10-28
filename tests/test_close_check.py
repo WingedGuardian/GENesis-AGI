@@ -9,6 +9,7 @@ are observed, not argued.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 import subprocess
@@ -25,6 +26,12 @@ cc = private_module(
 
 REPO = "owner/repo"
 SECRET = "SEKRIT-canary-7c1f"
+
+
+@pytest.fixture(autouse=True)
+def _no_real_gh_token(monkeypatch):
+    """No test reads this machine's gh token; a test that needs one stubs it."""
+    monkeypatch.setattr(cc, "_gh_token", lambda: None)
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -413,14 +420,115 @@ def test_an_expect_that_does_not_compile_is_no_match():
     assert cc.matches(res, "(") is False
 
 
-def test_gh_runs_on_a_copy_of_its_config(tmp_path, monkeypatch):
-    real = tmp_path / "real-gh"
-    real.mkdir()
-    (real / "hosts.yml").write_text("github.com: {}\n")
-    monkeypatch.setenv("GH_CONFIG_DIR", str(real))
-    home = tmp_path / "home"
-    home.mkdir()
-    cc._gh_config_copy(str(home))
-    env = cc._env(str(home), "gh", None)
-    assert env["GH_CONFIG_DIR"] == str(home / "gh")
-    assert (home / "gh" / "hosts.yml").read_text() == "github.com: {}\n"
+def test_gh_gets_the_token_in_its_env_and_an_empty_config_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "parent-token-never-inherited")
+    env = cc._env(str(tmp_path), "gh", None, "tok-123")
+    assert env["GH_TOKEN"] == "tok-123"
+    assert env["GH_CONFIG_DIR"] == str(tmp_path / "gh")
+    assert "GH_TOKEN" not in cc._env(str(tmp_path), "gh", None)
+    assert "GH_TOKEN" not in cc._env(str(tmp_path), "git", None, "tok-123")
+
+
+def test_no_token_file_is_written_for_a_gh_check(repo, tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_execute(argv, cwd, env, timeout_s):
+        gh_dir = Path(env["GH_CONFIG_DIR"])
+        seen["files"] = sorted(p.name for p in gh_dir.rglob("*")) if gh_dir.exists() else []
+        seen["token"] = env.get("GH_TOKEN")
+        return 0, False, {"head": b"{}", "sha": "", "total": 2}, {}
+
+    monkeypatch.setattr(cc, "_gh_token", lambda: "tok-xyz")
+    monkeypatch.setattr(cc, "_execute", fake_execute)
+    res = _run(cc.GhCheck("pr-checks", 1), repo, tmp_path)
+    assert res.ok and seen == {"files": [], "token": "tok-xyz"}
+
+
+def test_workflow_logs_are_not_readable():
+    for path in ("actions/runs/12/logs", "actions/jobs/9/logs"):
+        with pytest.raises(cc.Refused):
+            cc.plan_gh(cc.GhCheck("api", path=path), REPO)
+
+
+def test_a_failed_token_read_degrades_to_unauthenticated(monkeypatch):
+    monkeypatch.undo()  # drop the autouse stub: exercise the real function
+
+    def boom(*a, **kw):
+        raise FileNotFoundError("/usr/bin/gh")
+
+    monkeypatch.setattr(cc.subprocess, "run", boom)
+    assert cc._gh_token() is None
+
+
+# -- round 1 (Codex, Devin): listing caps, committed-tree grep, timeouts, gh lookup ----
+
+
+def test_repo_grep_reads_the_commit_not_the_worktree(repo, tmp_path):
+    (repo / "a.txt").write_text(f"alpha\nlocal-edit {SECRET}\n")
+    res = _run(cc.GrepCheck(pattern="local-edit|alpha", path="."), repo, tmp_path)
+    assert res.ok and "alpha" in res.stdout_head
+    assert SECRET not in res.stdout_head and "local-edit" not in res.stdout_head
+    assert _run(cc.GrepCheck(pattern="alpha", path=".", rev="-Ssecrets.env"), repo, tmp_path).refused
+
+
+def _fake_gh(monkeypatch, payload: str):
+    def fake_execute(argv, cwd, env, timeout_s):
+        return 0, False, {"head": payload.encode(), "sha": "", "total": len(payload)}, {}
+
+    monkeypatch.setattr(cc, "_execute", fake_execute)
+    monkeypatch.setattr(cc, "_gh_exe", lambda: "/usr/bin/gh")
+
+
+@pytest.mark.parametrize(
+    ("check", "items", "capped"),
+    [
+        (cc.GhCheck("run-list", sha="abc1234"), 50, True),
+        (cc.GhCheck("run-list", sha="abc1234"), 3, False),
+        (cc.GhCheck("api", path="pulls"), 30, True),
+        (cc.GhCheck("api", path="pulls"), 29, False),
+        (cc.GhCheck("pr-view", 1, fields=("state",)), 99, False),
+    ],
+)
+def test_a_saturated_listing_is_marked_capped(check, items, capped, repo, tmp_path, monkeypatch):
+    _fake_gh(monkeypatch, json.dumps([{"n": i} for i in range(items)]))
+    res = _run(check, repo, tmp_path)
+    assert res.ok and res.listing_capped is capped
+
+
+def test_sql_passes_the_callers_timeout(repo, tmp_path, monkeypatch):
+    import genesis.db.readonly_query as rq
+
+    seen = {}
+
+    def fake(path, sql, params=(), max_rows=None, timeout_s=None):
+        seen["timeout_s"] = timeout_s
+        return rq.QueryResult(columns=["x"], rows=[(1,)])
+
+    monkeypatch.setattr(rq, "run_readonly_query", fake)
+    res = cc.run(cc.SqlCheck("SELECT 1"), repo_root=repo, db_path=tmp_path / "t.db", repo=REPO, timeout_s=7)
+    assert res.ok and seen["timeout_s"] == 7
+
+
+def test_gh_is_found_where_the_installer_puts_it(tmp_path, monkeypatch):
+    local = tmp_path / "bin" / "gh"
+    local.parent.mkdir()
+    local.write_text("#!/bin/sh\n")
+    local.chmod(0o755)
+    monkeypatch.setattr(cc, "_gh_candidates", lambda: (str(tmp_path / "missing" / "gh"), str(local)))
+    assert cc._gh_exe() == str(local)
+
+
+def test_the_token_read_honors_ghs_own_config_lookup(monkeypatch):
+    monkeypatch.undo()  # drop the autouse stub: exercise the real function
+    seen = {}
+
+    def fake_run(argv, env, **kw):
+        seen.update(argv=argv, env=env)
+        return subprocess.CompletedProcess(argv, 0, stdout="tok-abc\n", stderr="")
+
+    monkeypatch.setattr(cc, "_gh_exe", lambda: "/opt/gh")
+    monkeypatch.setattr(cc.subprocess, "run", fake_run)
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/x/config")
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+    assert cc._gh_token() == "tok-abc"
+    assert seen["argv"] == ["/opt/gh", "auth", "token"] and seen["env"]["XDG_CONFIG_HOME"] == "/x/config"
