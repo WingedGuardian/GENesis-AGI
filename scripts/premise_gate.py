@@ -36,6 +36,10 @@ Run by ``.github/workflows/premise-gate.yml`` on ``issues`` events. Two jobs:
    posts no second comment (two runs overlapping in time still can, inside the
    race accepted below).
 
+``python3 scripts/premise_gate.py check <issue>`` is the read-only check a
+session runs BEFORE applying ``devin-ready`` (exit 0 ready, 1 answers missing,
+2 unreadable): the guard acts only after the paid label event.
+
 The answers are read by the plan reader's own parser
 (``scripts/hooks/plan_doc.premise_answers`` with the plan gate's emptiness rule),
 so a plan and an issue are held to one format.
@@ -287,12 +291,15 @@ Viewer = Callable[[int], "dict | None"]
 
 def _view(number: int) -> dict | None:
     """The issue's CURRENT body, labels and creation time, or None if gh fails."""
-    out = subprocess.run(
-        ["gh", "issue", "view", str(number), "--json", "body,labels,createdAt"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        out = subprocess.run(
+            ["gh", "issue", "view", str(number), "--json", "body,labels,createdAt"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:  # gh missing or not executable: unreadable, not "no answers"
+        return None
     if out.returncode != 0:
         return None
     try:
@@ -323,8 +330,43 @@ def live(event: dict, view: Viewer = _view) -> dict:
     return {**event, "issue": merged}
 
 
+def check(number: int, view: Viewer = _view) -> int:
+    """Read-only: whether issue ``number`` is ready for ``devin-ready``.
+
+    Run it BEFORE applying the label. Prints the missing premise answers (and,
+    for a ``bug`` issue, the missing verification answers). Returns 0 when the
+    six premise answers are complete, 1 when any is missing, 2 when the issue
+    cannot be read. Only the six decide the code, because only they decide
+    whether the guard removes the label.
+    """
+    issue = view(number)
+    if not isinstance(issue, dict):
+        print(f"premise_gate: issue {number}: could not be read", file=sys.stderr)
+        return 2
+    body = issue.get("body") or ""
+    six = missing_answers(body)
+    for n in six:
+        print(f"missing premise answer {n}: {_QUESTIONS[n - 1]}")
+    if BUG_LABEL in _label_names(issue):
+        for n in missing_answers(body, bug=True):
+            print(f"missing verification answer {n}: {VERIFICATION_QUESTIONS[n - 1]}")
+    if six:
+        print(
+            f"premise_gate: issue {number}: NOT ready for {DEVIN_LABEL} ({len(six)} of 6 missing)"
+        )
+        return 1
+    print(f"premise_gate: issue {number}: ready for {DEVIN_LABEL}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None, run: Runner = _gh, view: Viewer = _view) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
+    if args[:1] == ["check"]:
+        number = re.fullmatch(r"#?([0-9]+)", args[1]) if len(args) == 2 else None
+        if number is None:
+            print("usage: premise_gate.py check <issue-number>", file=sys.stderr)
+            return 2
+        return check(int(number.group(1)), view)
     path = args[0] if args else os.environ.get("GITHUB_EVENT_PATH", "")
     if not path:
         print("premise_gate: no event file", file=sys.stderr)
