@@ -239,6 +239,13 @@ quote-style = "double"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Explicit, so pytest-asyncio stops warning that it is unset (pytest 9.2 prints
+# that warning ahead of everything, including tests/conftest.py's own first
+# line). Unset, an async fixture's loop scope falls back to the fixture's own
+# caching scope; every async fixture under tests/ is function-scoped (none passes
+# `scope=` or `loop_scope=`), so "function" changes no fixture's loop. An async
+# fixture that needs a wider loop must now pass `loop_scope=` itself.
+asyncio_default_fixture_loop_scope = "function"
 # Remove a PASSING test's tmp_path at that test's teardown; keep only failures'
 # for debugging. Without it every run with its own --basetemp keeps every test
 # directory forever (pytest clears a basetemp only when the same name is
