@@ -2538,9 +2538,9 @@ verified: 477efb7f7 2026-10-05
   most do, because the docs-path exemption discharges rows a validator never
   looked at. `status` means "obligation discharged"; only `verdict` says a
   validator concluded anything. The verdict vocabulary and column names live with
-  the code (`crud/pr_verifications.py`) rather than here, since a four-value set
-  invented before the tool had run once is the kind of detail this map should not
-  be the second copy of. `doc_paths.is_doc_path`
+  the code (`crud/pr_verifications.py`) rather than here, since a five-value set
+  (`not-yet-done` was the fifth, added after the tool had run) is the kind of
+  detail this map should not be the second copy of. `doc_paths.is_doc_path`
   is a pinned duplicate of the merge gate's `_is_doc_path` (`src/` must not
   import `scripts/`), held in parity by
   `tests/test_session_awareness/test_doc_paths.py`.
