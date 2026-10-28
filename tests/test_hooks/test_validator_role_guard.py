@@ -141,6 +141,14 @@ SPELLED_DENIED = [
     'python -m genesis transcripts sql "select 1"',
     'git -C {main} clone https://example.test/r.git', 'git -C {main} init fixture',
     'python -m genesis.hostmetrics run --name fixture -- timeout 900 git status',
+    # Codex round-3 P2s (owner-approved fix 2026-10-28): an init destination and a
+    # config target redirected off the proven repo, honest-mistake scope.
+    'git init --template {scratch}/template', 'git init --shared=group --template {scratch}/t',
+    'git init -b main --object-format sha256', 'git init --unknown-option',
+    'git clone {main} {main}/clone --reference {scratch}/r',
+    'git config --file {main}/.git/config review.fixture changed',
+    'git config -f {home}/.codex/config.toml a.b c', 'git config --file={main}/.git/config a.b c',
+    'git config --global alias.x y', 'git config --system a.b c',
 ]
 
 
@@ -155,7 +163,26 @@ OUTPUT_DENIED = [
     'wget -P {main}/data https://example.test/fixture.db', 'wget -P {main}/.git/hooks https://example.test/pre-commit',
     # A relative save after a directory change has no proven directory, as for redirects.
     'cd {scratch} && curl -o page.html https://example.test/x',
+    # wget with no -O/-P saves into the cwd: here a tracked file in the main checkout.
+    'wget https://example.test/README', 'wget https://example.test/README https://example.test/x',
+    # -o is wget's LOG, not the document: the document still lands on the tracked file.
+    'wget -o {scratch}/log https://example.test/README',
 ]
+
+
+# P2 #3 (config selectors) must be exercised where the cwd is NOT the main
+# checkout, or the pre-existing "cannot move main" guard masks the selector check.
+SCRATCH_CONFIG_DENIED = [
+    'git config --file {main}/.git/config review.fixture changed',
+    'git config -f {home}/.codex/config.toml a.b c', 'git config --file={main}/.git/config a.b c',
+    'git config --global alias.x y', 'git config --system a.b c', 'git config --worktree a.b c',
+]
+
+
+@pytest.mark.parametrize('command', SCRATCH_CONFIG_DENIED)
+def test_config_location_selectors_are_denied_from_scratch(role, command):
+    with pytest.raises(role[0].Refused):
+        check(role, command, 'scratch')
 
 
 @pytest.mark.parametrize('command', OUTPUT_DENIED)
@@ -213,7 +240,13 @@ def test_spelled_role_operations_are_denied(role, command):
     'curl -o {scratch}/page.html https://example.test/x', 'curl -o - https://example.test/x',
     'wget -O {scratch}/page.html https://example.test/x', 'wget -qO- https://example.test/x',
     'cat {main}/.git/HEAD', 'git -C {main} log -1', 'cat {main}/.git/HEAD > {scratch}/head',
-    'wget -P {scratch} https://example.test/page.html',
+    'wget -P {scratch} https://example.test/page.html', 'wget -qO- https://example.test/x',
+    'wget https://example.test/page.html',
+    'git init {scratch}/fresh', 'git init -q {scratch}/fresh', 'git init --bare {scratch}/b.git',
+    'git init -b main --template {scratch}/tpl {scratch}/fresh',
+    'git clone --shared {main} {scratch}/clone', 'git clone --depth 1 {main} {scratch}/c2',
+    'git -C {scratch} config --file {scratch}/cfg a.b c', 'git -C {scratch} config a.b c',
+    'git -C {scratch} config --local a.b c',
     *['git ' + read for read in ('branch', 'branch --show-current', 'branch -a', 'branch --list "fix*"',
                                  'tag', 'tag --list', 'remote', 'remote -v', 'remote get-url origin',
                                  'worktree list', 'stash list', 'config --get user.name', 'config --list')],

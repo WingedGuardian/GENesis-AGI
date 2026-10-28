@@ -194,13 +194,55 @@ def _git_read(verb, rest):
     return False
 
 
+# Separated options whose NEXT token is the option's value, so that value is
+# not a destination operand. Unknown dashed tokens refuse (a value we did not
+# model could hide the real destination).
+_GIT_VALUE_OPTS = {
+    'init': {'--template', '--separate-git-dir', '-b', '--initial-branch',
+             '--object-format', '--ref-format'},
+    'clone': {'-b', '--branch', '-o', '--origin', '-u', '--upload-pack', '--reference',
+              '--reference-if-able', '--depth', '--template', '-c', '--config',
+              '--server-option', '--shallow-since', '--shallow-exclude', '-j', '--jobs',
+              '--separate-git-dir', '--filter', '--bundle-uri', '--revision', '--ref-format'},
+}
+_GIT_FLAGS = {
+    'init': {'-q', '--quiet', '--bare', '--shared'},
+    'clone': {'-l', '--local', '--no-hardlinks', '-s', '--shared', '-q', '--quiet', '-v',
+              '--verbose', '--progress', '-n', '--no-checkout', '--bare', '--mirror', '--sparse',
+              '--single-branch', '--no-single-branch', '--no-tags', '--dissociate',
+              '--recurse-submodules', '--remote-submodules'},
+}
+
+
+def _git_operands(verb, rest):
+    # Positional operands only: option VALUES (separated or =attached) are
+    # removed so they cannot be mistaken for a destination; an unmodeled dashed
+    # option refuses, because it might take a value this would read as a path.
+    operands, skip = [], False
+    for i, tok in enumerate(rest):
+        if skip:
+            skip = False
+            continue
+        if tok == '--':
+            operands.extend(rest[i + 1:])
+            break
+        if tok.startswith('-') and tok != '-':
+            name = tok.split('=', 1)[0]
+            if name in _GIT_VALUE_OPTS[verb]:
+                skip = '=' not in tok
+            elif name not in _GIT_FLAGS[verb]:
+                raise Refused('Validator Git mutation has no proven operation repository')
+            continue
+        operands.append(tok)
+    return operands
+
+
 def _git_destination(verb, rest, directory, context):
     # The destination is the last operand (a one-operand clone names its own
-    # directory after the source); an option-like one, or a separate git dir,
-    # leaves the created repository unproven.
-    operands = [w for w in rest if not w.startswith('-')]
-    if (rest and rest[-1].startswith('-')) or any(w.startswith('--separate-git-dir') for w in rest):
+    # directory after the source); a separate git dir leaves it unproven.
+    if any(w.split('=', 1)[0] == '--separate-git-dir' for w in rest):
         raise Refused('Validator Git mutation has no proven operation repository')
+    operands = _git_operands(verb, rest)
     if verb == 'clone' and len(operands) == 1:
         name = re.sub(r'\.git$', '', operands[0].rstrip('/').rsplit('/', 1)[-1].rsplit(':', 1)[-1])
         spelling = name or None
@@ -251,6 +293,19 @@ def _git(segment, context, git):
             raise Refused('Validator Git mutation has no proven operation repository')
         _git_destination(verb, rest, directory, context)
         return
+    if verb == 'config':
+        # A location selector writes off the proven repository: --file/--blob to
+        # any path (checked like an output), --global/--system/--worktree to a
+        # target the cwd cannot prove is scratch.
+        for i, tok in enumerate(rest):
+            name, sep, attached = tok.partition('=')
+            if name in {'--file', '-f', '--blob'}:
+                selector = attached if sep else (rest[i + 1] if i + 1 < len(rest) else None)
+                if selector is None:
+                    raise Refused('Validator Git config target is unresolved')
+                _check_output(selector, context, git)
+            elif name in {'--global', '--system', '--worktree'}:
+                raise Refused('Validator Git config writes outside the proven repository')
     if directory is None or uncertain:
         raise Refused('Validator Git mutation has no proven operation repository')
     checkout = git.checkout(str(directory))
@@ -435,6 +490,18 @@ def _network(segment, context, git):
         for url in urls:
             name = urlsplit(url if '://' in url else 'http://' + url).path.rsplit('/', 1)[-1]
             _check_output(directory.rstrip('/') + '/' + (name or 'index.html'), context, git)
+    # With no -O file, no -P and no --spider, wget saves each URL into the cwd:
+    # that implicit destination is an output too.
+    if not curl and not any(k == '--spider' for k, _ in options):
+        # Only -O/--output-document (the DOCUMENT) or -P suppress the cwd save;
+        # -o/--output-file is wget's LOG, so the document still lands in the cwd.
+        explicit = any((k in {'-O', '--output-document'} and v != '-')
+                       or k in {'-P', '--directory-prefix'} for k, v in options)
+        stdout = any(k in {'-O', '--output-document'} and v == '-' for k, v in options)
+        if not explicit and not stdout:
+            for url in urls:
+                name = urlsplit(url if '://' in url else 'http://' + url).path.rsplit('/', 1)[-1]
+                _check_output(name or 'index.html', context, git)
     methods = [v.upper() for k, v in options if k in {'-X', '--request', '--method'}]
     data = any(k in {'-d', '--data', '--data-raw', '--data-binary', '--data-urlencode',
                     '--post-data', '--post-file', '--body-data', '--body-file'} for k, _ in options)
