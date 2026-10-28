@@ -5,7 +5,8 @@ text-provider routes. It is a separate slice from the canonical proposal baselin
 in PR #3590. It does not implement a native executor, ego-policy adaptation or
 runtime comparison, and uses no real CLI, model, credentials or production data
 in its stock workload. The workflow also runs the separate
-[native action-port probe](headlong-native-action-port.md).
+[native action-port probe](headlong-native-action-port.md) and
+[monolith/native probe](headlong-native-monolith.md).
 The separate [reference-redaction controls](headlong-reference-redaction.md) adapt
 only a derived B tree; stock routes and their source remain unchanged.
 
