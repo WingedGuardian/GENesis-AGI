@@ -545,7 +545,8 @@ You are supervising a Genesis update. Your role is WATCH AND ESCALATE.
 7. If exit 5 (refused, an earlier update unfinished):
    Exit 5 means update.sh REFUSED, before changing anything, because an earlier
    update's ~/.genesis/update_state.json still guards code it merged and never
-   activated, or merge conflicts it is waiting on. That file is the restart guard:
+   activated, merge conflicts it is waiting on, or a checkout it left half-written
+   (which --post-merge refuses too). That file is the restart guard:
    never delete or edit ~/.genesis/update_state.json, and never run --post-merge
    yourself. Write to {summary_file}: "refused: <the message update.sh printed>".
    Do not write {escalation_file}. Done.
@@ -606,7 +607,8 @@ Do not write {escalation_file}. Done.
 If update.sh EXITS 5:
 Exit 5 means update.sh REFUSED, before changing anything, because an earlier
 update's ~/.genesis/update_state.json still guards code it merged and never
-activated, or merge conflicts it is waiting on. It is the restart guard: never
+activated, merge conflicts it is waiting on, or a checkout it left half-written
+(which --post-merge refuses too). It is the restart guard: never
 delete or edit ~/.genesis/update_state.json to get past it. Write to
 {summary_file}: "refused: <the message update.sh printed>". Do not write
 "tier3_needed" or anything else to {escalation_file}. Stop. Done.
@@ -713,7 +715,10 @@ def _load_state_guard():
 def _state_guard_verdict() -> tuple[str, str, str | None]:
     """The restart-guard verdict on update_state.json: (verdict, reason, remedy).
 
-    ``verdict`` is "safe", "guards" or "conflict_pending"; ``remedy`` is the
+    ``verdict`` is "safe", "guards" (merged code awaiting bootstrap, which
+    --post-merge finishes), "conflict_pending", "mixed_tree" (a half-written
+    checkout) or "holds" (finishing forward is wrong or unknown; --post-merge
+    refuses both of the last two); ``remedy`` is the
     message every refusing caller prints, None when safe. A guard that cannot be
     evaluated keeps an existing file (doubt keeps the guard)."""
     try:
@@ -731,8 +736,10 @@ def _state_guard_verdict() -> tuple[str, str, str | None]:
         return (
             "guards",
             "it could not be checked",
-            f"{_STATE_FILE} could not be checked, so it is kept. Finish that update "
-            "with scripts/update.sh --post-merge, or Dismiss it on the update card.",
+            f"{_STATE_FILE} could not be checked, so it is kept. Run "
+            "scripts/update.sh --post-merge (it refuses a half-written tree; on live, "
+            "scripts/deploy_candidates repair-move puts such a tree back), or Dismiss "
+            "it on the update card.",
         )
 
 
@@ -1173,6 +1180,7 @@ def update_progress():
 
     stale = False
     guard = None
+    guard_remedy = None
     if not in_progress and state_exists and phase != "done":
         # Only declare stale if state file is older than 60s
         import time
@@ -1181,9 +1189,11 @@ def update_progress():
             stale = age > 60
         except OSError:
             stale = True
-        # Whether it still guards merged code: the card says so and hides Retry.
-        # Asked only when a file exists and no update is running.
-        guard = _state_guard_verdict()[0]
+        # Whether it still guards merged code: the card says so, shows the
+        # guard's own remedy (a half-written tree's is not --post-merge, which
+        # refuses one) and hides Retry. Asked once, only when a file exists and
+        # no update is running.
+        guard, _reason, guard_remedy = _state_guard_verdict()
 
     return jsonify({
         "in_progress": in_progress,
@@ -1195,5 +1205,6 @@ def update_progress():
         "stale": stale,
         "guards": guard not in (None, "safe"),
         "guard": guard,
+        "guard_remedy": guard_remedy,
         "state_unreadable": state_unreadable,
     })

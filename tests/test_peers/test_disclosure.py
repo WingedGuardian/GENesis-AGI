@@ -75,3 +75,53 @@ def test_nested_decoded_compound_keys_malformed_cycles_and_work():
     assert not json_strings_safe(
         {"answer": json.dumps({"password": "".join(["synthetic", "credential"])})}
     )
+
+
+def test_allow_tolerates_only_the_named_patterns():
+    private_ip = ".".join(("192", "168", "1", "5"))  # built, so no literal address ships
+    located = f"the file is /home/someone/notes on {private_ip}"
+    assert not json_strings_safe(located)
+    assert json_strings_safe(located, allow={"internal_file_path", "rfc1918_ip"})
+    secret = located + " and " + "API_" + "TOKEN=" + "syntheticvalue123"
+    assert not json_strings_safe(secret, allow={"internal_file_path", "rfc1918_ip"})
+    keyed = {"note": located, "password": "syntheticcredential"}
+    assert not json_strings_safe(keyed, allow={"internal_file_path", "rfc1918_ip"})
+
+
+def test_reply_allow_names_real_scanner_patterns():
+    from genesis.peers.results import REPLY_ALLOW
+    from genesis.security.output_scanner import pattern_names
+
+    assert pattern_names() >= REPLY_ALLOW
+    assert "payment_card" not in REPLY_ALLOW
+
+
+def test_a_credential_the_redactor_cannot_cut_still_withholds_the_reply():
+    from genesis.peers.results import disclosable_reply
+
+    text, redacted = disclosable_reply('{"password": ["' + "synthetic" + "credential" + '"]}')
+    assert text is None
+    assert redacted == []
+
+
+def test_an_api_key_in_a_json_reply_is_redacted_and_the_answer_kept():
+    from genesis.peers.results import disclosable_reply
+
+    text, redacted = disclosable_reply('{"api_key": "sk-' + "a" * 30 + '", "answer": "OK"}')
+    assert text == '{"api_key": "[redacted:json_credential]", "answer": "OK"}'
+    assert redacted == ["json_credential"]
+
+
+def test_a_key_cut_short_at_an_escape_hides_its_head_and_is_disclosed():
+    # Owner ruling: the rest of a key whose head is redacted is not worth a blank reply.
+    from genesis.peers.results import disclosable_reply
+
+    text, _ = disclosable_reply('{"note": "sk-' + "Q" * 24 + '\\u002dTAIL"}')
+    assert text == '{"note": "[redacted:api_key_openai]\\u002dTAIL"}'
+
+
+def test_a_key_before_an_ordinary_escape_is_redacted_not_withheld():
+    from genesis.peers.results import disclosable_reply
+
+    text, _ = disclosable_reply('{"note": "sk-' + "Q" * 24 + '\\nnext line"}')
+    assert text == '{"note": "[redacted:api_key_openai]\\nnext line"}'

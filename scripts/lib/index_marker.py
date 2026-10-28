@@ -22,6 +22,7 @@ import argparse
 import errno
 import fcntl
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -42,15 +43,29 @@ VALID_MODES = ("fast", "moderate", "full")
 VALID_OUTCOMES = ("consume", "consume_full", "restore", "restore_backoff", "restore_failure")
 LOCK_WAIT_S = 0.5
 OUTCOME_LOCK_WAIT_S = 5.0
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _HASH_RE = re.compile(r"^[0-9a-f]{16}$")
 _CLAIM_RE = re.compile(r"^[0-9a-f]{32}$")
-_MIGRATION_CLAIM_RE = re.compile(r"^(?P<source>.+)\.migrating-[0-9a-f]{32}$")
-_SPOOL_RE = re.compile(r"^\.spool-(?P<hash>[0-9a-f]{16})-[0-9a-f]{32}\.spool$")
-_OUTCOME_SPOOL_RE = re.compile(
-    r"^\.outcome-spool-(?P<hash>[0-9a-f]{16})-(?P<claim>[0-9a-f]{32})-"
-    r"[0-9a-f]{32}\.spool$"
-)
+
+
+def _load_legacy():
+    name = "_genesis_index_marker_legacy"
+    module = sys.modules.get(name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(
+            name, Path(__file__).with_name("index_marker_legacy.py")
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+    return module
+
+
+_legacy = _load_legacy()
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS pending (
@@ -77,9 +92,6 @@ CREATE TABLE IF NOT EXISTS failed_outcomes (
  failed_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS repo_state (
  hash TEXT PRIMARY KEY, last_full REAL, full_backoff REAL);
-CREATE TABLE IF NOT EXISTS legacy_imports (
- path TEXT PRIMARY KEY, content_sha256 TEXT NOT NULL,
- source_mtime_ns INTEGER NOT NULL, imported_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS queue_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
@@ -186,6 +198,25 @@ def _is_busy(exc: sqlite3.OperationalError) -> bool:
     return "locked" in msg or "busy" in msg
 
 
+def _publish_schema(db: sqlite3.Connection) -> None:
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        for statement in _SCHEMA.split(";"):
+            if statement.strip():
+                db.execute(statement)
+        _legacy.upgrade_receipts(db)
+        db.execute(
+            "INSERT INTO queue_meta(key,value) VALUES('schema_version',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(SCHEMA_VERSION),),
+        )
+        db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
+
+
 def _initialize(db: sqlite3.Connection) -> None:
     """Create/upgrade the database once, serialized across fresh CLI processes."""
     version = db.execute("PRAGMA user_version").fetchone()[0]
@@ -217,13 +248,7 @@ def _initialize(db: sqlite3.Connection) -> None:
         mode = db.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
         if str(mode).lower() != "delete":
             raise RuntimeError(f"index queue refused rollback journal mode: {mode}")
-        db.executescript(_SCHEMA)
-        db.execute(
-            "INSERT INTO queue_meta(key,value) VALUES('schema_version',?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (str(SCHEMA_VERSION),),
-        )
-        db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        _publish_schema(db)
 
 
 def _connect(wait_s: float = LOCK_WAIT_S) -> sqlite3.Connection:
@@ -343,87 +368,7 @@ def _write_outcome_spool(h: str, claim_id: str, action: str) -> Path:
 
 
 def _legacy_files() -> list[Path]:
-    if not marker_dir().is_dir():
-        return []
-    return sorted(
-        path
-        for path in marker_dir().iterdir()
-        if path.is_file()
-        and not path.name.endswith(".tmp")
-        and (
-            path.name.endswith(".json")
-            or _MIGRATION_CLAIM_RE.fullmatch(path.name)
-            or _SPOOL_RE.fullmatch(path.name)
-            or _OUTCOME_SPOOL_RE.fullmatch(path.name)
-            or path.name.startswith(
-                (".outcome-", ".failed-outcome-", ".last-full-", ".full-backoff-")
-            )
-        )
-    )
-
-
-def _legacy_source_name(path: Path) -> str:
-    match = _MIGRATION_CLAIM_RE.fullmatch(path.name)
-    return match.group("source") if match else path.name
-
-
-def _claim_legacy_files(paths: list[Path]) -> list[tuple[Path, Path]]:
-    """Move replaceable legacy paths aside before reading them.
-
-    The deployed JSON writer does not honor ``.queue.lock``. A unique rename is
-    therefore the ownership boundary: a later atomic replacement recreates the
-    original pathname and cannot be deleted when this claim is retired. Existing
-    claims and immutable spool files are already safe and are resumed in place.
-    """
-    claimed: list[tuple[Path, Path]] = []
-    changed = False
-    for path in paths:
-        source_name = _legacy_source_name(path)
-        if (
-            _MIGRATION_CLAIM_RE.fullmatch(path.name)
-            or _SPOOL_RE.fullmatch(path.name)
-            or _OUTCOME_SPOOL_RE.fullmatch(path.name)
-        ):
-            claimed.append((path, path.with_name(source_name)))
-            continue
-        claim = path.with_name(f"{path.name}.migrating-{secrets.token_hex(16)}")
-        try:
-            os.replace(path, claim)
-        except FileNotFoundError:
-            continue
-        claimed.append((claim, path))
-        changed = True
-    if changed:
-        _fsync_dir(marker_dir())
-    return claimed
-
-
-def _legacy_lock():
-    marker_dir().mkdir(parents=True, exist_ok=True)
-    lock = (marker_dir() / ".queue.lock").open("a")
-    deadline = time.monotonic() + LOCK_WAIT_S
-    while True:
-        try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return lock
-        except OSError as exc:
-            if exc.errno not in (errno.EACCES, errno.EAGAIN):
-                lock.close()
-                raise
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                lock.close()
-                raise TimeoutError("legacy index-request queue busy; request not changed") from exc
-            time.sleep(min(0.01, remaining))
-
-
-def _quarantine(db: sqlite3.Connection, h: str, reason: str, raw: bytes) -> None:
-    db.execute(
-        "INSERT INTO failed(hash,reason,raw_payload,failed_at) VALUES(?,?,?,?) "
-        "ON CONFLICT(hash) DO UPDATE SET reason=excluded.reason,raw_payload=excluded.raw_payload,"
-        "failed_at=excluded.failed_at",
-        (h, reason, raw, time.time()),
-    )
+    return _legacy.legacy_files(marker_dir())
 
 
 def _record_failed_outcome(db: sqlite3.Connection, h: str, reason: str, raw: bytes) -> None:
@@ -433,44 +378,6 @@ def _record_failed_outcome(db: sqlite3.Connection, h: str, reason: str, raw: byt
         "raw_payload=excluded.raw_payload,failed_at=excluded.failed_at",
         (h, reason, raw, time.time()),
     )
-
-
-def _legacy_hash(path: Path) -> tuple[str | None, bool]:
-    """Return a legacy artifact's repo hash and whether it is outcome-like."""
-    name = path.name
-    outcome_spool = _OUTCOME_SPOOL_RE.fullmatch(name)
-    if outcome_spool:
-        return outcome_spool.group("hash"), True
-    spool = _SPOOL_RE.fullmatch(name)
-    if spool:
-        return spool.group("hash"), False
-    for prefix in (".outcome-", ".failed-outcome-", ".last-full-", ".full-backoff-"):
-        if name.startswith(prefix):
-            h = name.removeprefix(prefix)
-            return (h if _HASH_RE.fullmatch(h) else None), True
-    suffix = next(
-        (suffix for suffix in (".inflight.json", ".failed.json", ".json") if name.endswith(suffix)),
-        None,
-    )
-    if suffix is None:
-        return None, False
-    h = name[: -len(suffix)]
-    return (h if _HASH_RE.fullmatch(h) else None), False
-
-
-def _quarantine_unreadable(
-    db: sqlite3.Connection, source_path: Path, exc: OSError
-) -> None:
-    """Retire an unreadable claimed artifact without blocking other queue work."""
-    h, outcome_like = _legacy_hash(source_path)
-    if h is None:
-        return
-    reason = f"unreadable legacy marker ({exc.__class__.__name__})"
-    raw = source_path.name.encode(errors="replace")
-    if outcome_like:
-        _record_failed_outcome(db, h, reason, raw)
-    else:
-        _quarantine(db, h, reason, raw)
 
 
 def _record_outcome_db(
@@ -489,9 +396,7 @@ def _record_outcome_db(
     if not row:
         return "unowned"
     conflict_reason = f"conflicting durable outcomes for claim {claim_id}"
-    prior_failure = db.execute(
-        "SELECT reason FROM failed_outcomes WHERE hash=?", (h,)
-    ).fetchone()
+    prior_failure = db.execute("SELECT reason FROM failed_outcomes WHERE hash=?", (h,)).fetchone()
     if prior_failure and prior_failure["reason"] == conflict_reason:
         return "conflict"
     if row["outcome_action"] is None:
@@ -512,201 +417,20 @@ def _record_outcome_db(
     return "conflict"
 
 
-def _import_outcome(
-    db: sqlite3.Connection,
-    h: str,
-    raw: bytes,
-    *,
-    filename_claim: str | None = None,
-) -> None:
-    try:
-        data = json.loads(raw)
-    except (UnicodeDecodeError, ValueError):
-        data = None
-    payload_claim = data.get("claim_id") if isinstance(data, dict) else None
-    valid = (
-        _HASH_RE.fullmatch(h)
-        and isinstance(data, dict)
-        and data.get("version") == 1
-        and data.get("action") in VALID_OUTCOMES
-        and isinstance(payload_claim, str)
-        and _valid_number(data.get("recorded_at"))
-        and (filename_claim is None or filename_claim == payload_claim)
-    )
-    if valid:
-        state = _record_outcome_db(
-            db,
-            h,
-            payload_claim,
-            data["action"],
-            float(data["recorded_at"]),
-            raw,
-        )
-        if state == "unowned":
-            _record_failed_outcome(db, h, "invalid or stale durable outcome", raw)
-    elif _HASH_RE.fullmatch(h):
-        _record_failed_outcome(db, h, "invalid or stale durable outcome", raw)
-
-
 def _import_one(db: sqlite3.Connection, path: Path, raw: bytes) -> None:
-    name = path.name
-    outcome_spool = _OUTCOME_SPOOL_RE.fullmatch(name)
-    if outcome_spool:
-        _import_outcome(
-            db,
-            outcome_spool.group("hash"),
-            raw,
-            filename_claim=outcome_spool.group("claim"),
-        )
-        return
-    spool = _SPOOL_RE.fullmatch(name)
-    if spool:
-        h = spool.group("hash")
-        try:
-            data = json.loads(raw)
-        except (UnicodeDecodeError, ValueError):
-            data = None
-        data = _normalize_queue_data(data)
-        if data is not None and marker_hash(data["repo_path"]) == h:
-            _coalesce_pending(db, h, data)
-        else:
-            _quarantine(db, h, "malformed enqueue spool", raw)
-        return
-    for prefix, column in ((".last-full-", "last_full"), (".full-backoff-", "full_backoff")):
-        if name.startswith(prefix):
-            h = name[len(prefix) :]
-            try:
-                value = float(raw.decode().strip())
-            except (UnicodeDecodeError, ValueError):
-                return
-            if _HASH_RE.fullmatch(h) and math.isfinite(value):
-                db.execute("INSERT OR IGNORE INTO repo_state(hash) VALUES(?)", (h,))
-                if column == "last_full":
-                    db.execute("UPDATE repo_state SET last_full=? WHERE hash=?", (value, h))
-                else:
-                    db.execute("UPDATE repo_state SET full_backoff=? WHERE hash=?", (value, h))
-            return
-    if name.startswith(".failed-outcome-"):
-        h = name.removeprefix(".failed-outcome-")
-        if _HASH_RE.fullmatch(h):
-            _record_failed_outcome(db, h, "legacy failed outcome", raw)
-        return
-    if name.startswith(".outcome-"):
-        h = name.removeprefix(".outcome-")
-        _import_outcome(db, h, raw)
-        return
-    suffix = next(
-        (s for s in (".inflight.json", ".failed.json", ".json") if name.endswith(s)), None
+    operations = _legacy.QueueOperations(
+        normalize=_normalize_queue_data,
+        hash_repo=marker_hash,
+        coalesce=_coalesce_pending,
+        record_outcome=_record_outcome_db,
+        valid_number=_valid_number,
+        outcomes=VALID_OUTCOMES,
     )
-    if suffix is None:
-        return
-    h = name[: -len(suffix)]
-    if not _HASH_RE.fullmatch(h):
-        return
-    try:
-        data = json.loads(raw)
-    except (UnicodeDecodeError, ValueError):
-        data = None
-    data = _normalize_queue_data(data)
-    if suffix == ".failed.json":
-        if data is not None:
-            db.execute(
-                "INSERT INTO failed(hash,repo_path,tools,mode,requested_at,attempts,reason,raw_payload,failed_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(hash) DO UPDATE SET repo_path=excluded.repo_path,"
-                "tools=excluded.tools,mode=excluded.mode,requested_at=excluded.requested_at,attempts=excluded.attempts,"
-                "reason=excluded.reason,raw_payload=excluded.raw_payload,failed_at=excluded.failed_at",
-                (
-                    h,
-                    data["repo_path"],
-                    data["tools"],
-                    data["mode"],
-                    data["requested_at"],
-                    data.get("attempts", 0),
-                    "legacy terminal failure",
-                    raw,
-                    time.time(),
-                ),
-            )
-        else:
-            _quarantine(db, h, "malformed legacy failed marker", raw)
-    elif suffix == ".inflight.json":
-        if data is None:
-            _quarantine(db, h, "malformed legacy inflight marker", raw)
-        elif not db.execute("SELECT 1 FROM inflight WHERE hash=?", (h,)).fetchone():
-            claim_id = data.get("claim_id")
-            if not isinstance(claim_id, str) or not claim_id:
-                # The deployed pre-PR queue had inflight ownership but no
-                # nonce. Assign one during migration; reconciliation then
-                # treats its outcome as unknown and charges exactly one retry.
-                claim_id = secrets.token_hex(16)
-            db.execute(
-                "INSERT INTO inflight(hash,repo_path,tools,mode,requested_at,attempts,claim_id) VALUES(?,?,?,?,?,?,?)",
-                (
-                    h,
-                    data["repo_path"],
-                    data["tools"],
-                    data["mode"],
-                    data["requested_at"],
-                    data.get("attempts", 0),
-                    claim_id,
-                ),
-            )
-    elif data is not None:
-        _coalesce_pending(db, h, data)
-    else:
-        _quarantine(db, h, "malformed legacy pending marker", raw)
+    _legacy.import_one(db, path, raw, operations)
 
 
 def _migrate_legacy() -> None:
-    if not _legacy_files():
-        return
-    lock = _legacy_lock()
-    try:
-        paths = _claim_legacy_files(_legacy_files())
-        # Import ownership before sidecar/durable outcomes.
-        paths.sort(
-            key=lambda item: bool(
-                item[1].name.startswith(".outcome-")
-                or _OUTCOME_SPOOL_RE.fullmatch(item[1].name)
-            )
-        )
-        imported: list[Path] = []
-        with _write_db() as db:
-            for claimed_path, source_path in paths:
-                try:
-                    raw = claimed_path.read_bytes()
-                    source_mtime_ns = claimed_path.stat().st_mtime_ns
-                except FileNotFoundError:
-                    continue
-                except OSError as exc:
-                    _quarantine_unreadable(db, source_path, exc)
-                    imported.append(claimed_path)
-                    continue
-                digest = hashlib.sha256(raw).hexdigest()
-                prior = db.execute(
-                    "SELECT content_sha256,source_mtime_ns FROM legacy_imports WHERE path=?",
-                    (source_path.name,),
-                ).fetchone()
-                if (
-                    not prior
-                    or prior["content_sha256"] != digest
-                    or prior["source_mtime_ns"] != source_mtime_ns
-                ):
-                    _import_one(db, source_path, raw)
-                    db.execute(
-                        "INSERT INTO legacy_imports(path,content_sha256,source_mtime_ns,imported_at) "
-                        "VALUES(?,?,?,?) ON CONFLICT(path) DO UPDATE SET "
-                        "content_sha256=excluded.content_sha256,"
-                        "source_mtime_ns=excluded.source_mtime_ns,imported_at=excluded.imported_at",
-                        (source_path.name, digest, source_mtime_ns, time.time()),
-                    )
-                imported.append(claimed_path)
-        for path in imported:
-            path.unlink(missing_ok=True)
-        if imported:
-            _fsync_dir(marker_dir())
-    finally:
-        lock.close()
+    _legacy.migrate(marker_dir(), _write_db, _import_one, _fsync_dir, wait_s=LOCK_WAIT_S)
 
 
 def _prepare() -> None:
@@ -1009,6 +733,8 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("hash")
     p.add_argument("--repo", required=True)
     sub.add_parser("list")
+    p = sub.add_parser("import-status")
+    p.add_argument("--limit", type=int, default=20)
     for name in (
         "claim",
         "apply-outcome",
@@ -1031,6 +757,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--claim-id", required=True)
     p.add_argument("--attempts-inc", action="store_true")
     args = parser.parse_args(argv)
+    if args.cmd == "import-status":
+        try:
+            result = _legacy.import_status(database_path(), limit=args.limit)
+        except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:
+            print(json.dumps({"state": "error", "error": str(exc)}, ensure_ascii=True))
+            return 2
+        print(json.dumps(result, ensure_ascii=True))
+        return 0
     if args.cmd == "write":
         print(write_marker(args.repo, args.tools, args.mode))
         return 0

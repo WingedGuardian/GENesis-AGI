@@ -1,0 +1,1 @@
+- Reject transcript leaves replaced by symlinks during collection, and allow maintenance pruning after interrupted temporary selector swaps without following their targets.
