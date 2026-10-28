@@ -65,6 +65,10 @@ rate_limits:
   surplus_daily: 1
   content_daily: 3
   notification_daily: 10
+  # Messages to one enrolled peer agent per day. Peer messages skip quiet hours,
+  # salience and the daily budgets above (none of which they spend); this cap
+  # stops a loop from flooding a peer.
+  agent_daily_per_peer: 50
 
 morning_report:
   trigger_time: "07:00"
