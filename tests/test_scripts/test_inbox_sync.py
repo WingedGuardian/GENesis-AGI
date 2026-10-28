@@ -169,7 +169,7 @@ def _setup(tmp_path: Path) -> tuple[dict, Path, Path, Path]:
     return env, inbox, log, call_log
 
 
-_REMOTE = "dropbox:Apps/remotely-save/1/Genesis"
+_REMOTE = "dropbox:Apps/vault-sync/Inbox"
 
 
 def _record_path(inbox: Path) -> Path:

@@ -58,7 +58,7 @@ class InboxConfig:
     # timezone removed — uses genesis.env.user_timezone()
     evaluation_cooldown_seconds: int = 3600
     # rclone remote the inbox sync mirrors (``scripts/inbox_sync.sh``), e.g.
-    # ``dropbox:Apps/remotely-save/1/Genesis``. Empty = the sync is off on this
+    # ``dropbox:Apps/vault-sync/Inbox``. Empty = the sync is off on this
     # install: its timer runs and exits, and no staleness alert is raised.
     sync_remote: str = ""
 

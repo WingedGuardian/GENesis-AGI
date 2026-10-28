@@ -13,7 +13,7 @@ from genesis.inbox.config import load_inbox_config_from_string
 
 @pytest.mark.parametrize(
     "remote",
-    ["dropbox:Apps/remotely-save/1/Genesis", "gdrive:", "my_remote:path with spaces", "a.b-c:x"],
+    ["dropbox:Apps/vault-sync/Inbox", "gdrive:", "my_remote:path with spaces", "a.b-c:x"],
 )
 def test_valid_remotes(remote):
     assert sync_config.remote_is_valid(remote)

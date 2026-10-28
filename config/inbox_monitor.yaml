@@ -26,7 +26,7 @@ inbox_monitor:
   # "shadow" here or in the local overlay to observe without acting.
   url_coverage_mode: "enforce"
   # sync_remote: the rclone remote scripts/inbox_sync.sh mirrors into
-  # watch_path, e.g. "dropbox:Apps/remotely-save/1/Genesis". Empty (the
+  # watch_path, e.g. "dropbox:Apps/vault-sync/Inbox". Empty (the
   # default) means the sync is off: its timer still runs every 5 minutes and
   # exits at once, and no staleness alert is raised. Set it in the local
   # overlay (~/.genesis/config/inbox_monitor.local.yaml) to turn the sync on.
