@@ -1322,10 +1322,14 @@ class DirectSessionRunner:
         """Execute a single CC session. Called inside tracked_task."""
         _set_obs_session(session_id)
         telemetry: list[dict] = []
+        # The same calls with their RAW input, for a rate-limit park: it scrubs
+        # them itself, and telemetry's preview is an unscrubbed 200-char cut.
+        ran: list[tuple[str, object]] = []
         start = time.monotonic()
 
         async def on_event(event: StreamEvent) -> None:
             for name, tool_input in event.tool_uses():
+                ran.append((name, tool_input))
                 telemetry.append(
                     {
                         "name": name,
@@ -1477,6 +1481,9 @@ class DirectSessionRunner:
                 duration_s=round(elapsed, 1),
                 tools_called=telemetry,
             )
+            # Own statement (it never raises), so a failed write below cannot
+            # skip it; one quick row write, well inside the shutdown grace.
+            await self._record_resumed_calls(request, ran)
             try:
                 await self._store_result(session_id, request, cancel_result)
                 # Write the terminal 'failed' status BEFORE the outcome embed:
@@ -1514,7 +1521,12 @@ class DirectSessionRunner:
             db = getattr(self._rt, "_db", None)
             park_id = None
             if db is not None:
-                park_id = await rate_limit_park.park_direct_session(db, request=request, exc=exc)
+                park_id = await rate_limit_park.park_direct_session(
+                    db,
+                    request=request,
+                    exc=exc,
+                    ran=ran,
+                )
             if park_id is not None:
                 elapsed = time.monotonic() - start
                 parked_result = DirectSessionResult(
@@ -1554,6 +1566,9 @@ class DirectSessionRunner:
             await self._finalize_failure(session_id, request, exc, telemetry, start)
 
         except Exception as exc:
+            # Not in _finalize_failure: the rate-limit path above reuses it
+            # after park_direct_session already recorded these calls.
+            await self._record_resumed_calls(request, ran)
             await self._finalize_failure(session_id, request, exc, telemetry, start)
 
         finally:
@@ -1561,6 +1576,14 @@ class DirectSessionRunner:
             # before the run above). Best-effort; the disk-hygiene reaper catches
             # any orphans left by a hard SIGKILL that skips this finally.
             shutil.rmtree(_bg_session_root(session_id), ignore_errors=True)
+
+    async def _record_resumed_calls(self, request, ran) -> None:
+        """A resumed run that failed or was cancelled stays parked for a later
+        retry; record the calls it made so that retry checks before repeating
+        them. Best-effort, and a no-op for a run that is not a resume."""
+        db = getattr(self._rt, "_db", None)
+        if db is not None:
+            await rate_limit_park.record_resumed_run_calls(db, request.caller_context, ran)
 
     async def _finalize_failure(
         self,

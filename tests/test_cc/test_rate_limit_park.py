@@ -7,6 +7,7 @@ architect-#1 fix), resumed-close, and backoff math. Uses the real in-memory db.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -428,3 +429,187 @@ async def test_a_park_without_an_inventory_resumes_the_bare_prompt(db):
         "SELECT payload_json FROM direct_session_queue ORDER BY rowid DESC LIMIT 1",
     )
     assert _json.loads(row[0][0])["prompt"] == "plain request"
+
+
+# ── A RESUMED run that caps again adds its own calls to the record (#3654) ──
+# The resumed run is a fresh direct session. If it sends and then hits the
+# limit, the next resume must be told about that send, or it sends again.
+
+
+async def _redispatched_prompt(db, park_id):
+    import json as _json
+
+    from genesis.cc import rate_limit_resume as rlr
+
+    await rlr._redispatch(db, await parks.get_by_id(db, park_id))
+    row = await db.execute_fetchall(
+        "SELECT payload_json FROM direct_session_queue ORDER BY rowid DESC LIMIT 1",
+    )
+    return _json.loads(row[0][0])["prompt"]
+
+
+async def _resume_caps(db, park_id, ran):
+    """The resumed session for ``park_id`` hits the limit after ``ran``."""
+    await parks.claim(db, park_id)
+    resumed = _bg_request(caller_context=f"rate_limit_resume:{park_id}")
+    exc = CCRateLimitError("limit", raw_text="resets in 1h")
+    return await rlp.park_direct_session(
+        db, request=resumed, exc=exc, now=NOW, mode="live", ran=ran,
+    )
+
+
+async def test_a_resumed_run_that_sent_then_capped_is_not_told_to_send_blind(db):
+    secret = "sk-abcdefghijklmnopqrstuvwx1234"
+    first = await _park_ran(db, [("web_search", {"q": "status"})])
+    returned = await _resume_caps(db, first.park_id, [
+        ("outreach_send", {"message": "weekly update"}),
+        ("Bash", {"command": f"curl -H 'Authorization: Bearer {secret}' https://example.test"}),
+    ])
+    assert returned == first.park_id, "the re-limit left its own park"
+    row = await parks.get_by_id(db, first.park_id)
+    assert (row["attempts"], row["status"]) == (1, "parked"), "lineage changed"
+    assert secret not in row["payload_json"], "the resumed run's inputs were not scrubbed"
+    payload = await _payload(db, first.park_id)
+    assert payload["prompt"] == "send the update", "the stored prompt must stay bare"
+    assert [e["name"] for e in payload["ran"]] == ["web_search", "outreach_send", "Bash"]
+    prompt = await _redispatched_prompt(db, first.park_id)
+    assert "`outreach_send`" in prompt, "the next resume is not told about the send"
+
+
+async def test_a_bare_relimit_keeps_the_recorded_calls_unchanged(db):
+    first = await _park_ran(db, [("outreach_send", {"message": "a"})])
+    before = (await parks.get_by_id(db, first.park_id))["payload_json"]
+    await _resume_caps(db, first.park_id, None)
+    await _resume_caps(db, first.park_id, [])
+    row = await parks.get_by_id(db, first.park_id)
+    assert row["payload_json"] == before
+    assert row["attempts"] == 2
+
+
+async def test_the_call_is_recorded_even_when_the_relimit_escalates(db):
+    first = await _park_ran(db, None)
+    await db.execute(
+        "UPDATE cc_rate_limit_parks SET attempts = 39 WHERE id = ?", (first.park_id,),
+    )
+    await db.commit()
+    await _resume_caps(db, first.park_id, [("outreach_send", {"message": "a"})])
+    row = await parks.get_by_id(db, first.park_id)
+    assert row["status"] == "needs_user"
+    names = [e["name"] for e in (await _payload(db, first.park_id))["ran"]]
+    assert names == ["outreach_send"], "an escalated park lost the send"
+
+
+async def test_a_background_session_capped_after_a_send_parks_with_it(db):
+    exc = CCRateLimitError("limit", raw_text="resets in 30m")
+    pid = await rlp.park_direct_session(
+        db, request=_bg_request(), exc=exc, now=NOW, mode="live",
+        ran=[("outreach_send", {"message": "a"})],
+    )
+    payload = await _payload(db, pid)
+    assert payload["prompt"] == "bg work"
+    assert [e["name"] for e in payload["ran"]] == ["outreach_send"]
+    assert "`outreach_send`" in await _redispatched_prompt(db, pid)
+
+
+async def test_a_resume_whose_park_is_gone_reparks_with_its_calls(db):
+    resumed = _bg_request(caller_context="rate_limit_resume:rlp-doesnotexist")
+    exc = CCRateLimitError("limit", raw_text="resets in 30m")
+    pid = await rlp.park_direct_session(
+        db, request=resumed, exc=exc, now=NOW, mode="live",
+        ran=[("outreach_send", {"message": "a"})],
+    )
+    assert pid != "rlp-doesnotexist"
+    assert [e["name"] for e in (await _payload(db, pid))["ran"]] == ["outreach_send"]
+
+
+async def test_the_runner_hands_the_resumed_runs_calls_to_the_park(db, monkeypatch):
+    """Wiring: the calls DirectSessionRunner saw reach park_direct_session."""
+    from genesis.cc.types import StreamEvent
+
+    monkeypatch.setattr("genesis.cc.rate_limit_resume_config.effective_mode", lambda: "live")
+    first = await _park_ran(db, [("web_search", {"q": "status"})])
+    await parks.claim(db, first.park_id)
+
+    async def _send_then_cap(invocation, *, on_event=None):
+        await on_event(StreamEvent.from_raw({
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "text", "text": "sending"},
+                {"type": "tool_use", "name": "outreach_send", "input": {"message": "a"}},
+            ]},
+        }))
+        raise CCRateLimitError("limit", raw_text="resets in 30m")
+
+    runner = _park_runner(db)
+    runner._invoker.run_streaming = _send_then_cap
+    req = DirectSessionRequest(
+        prompt="send the update", delivery_mode=DeliveryMode.RESULT, origin_session_id="s1",
+        caller_context=f"rate_limit_resume:{first.park_id}",
+    )
+    result = await runner._run_session(req, "sess-resumed")
+    assert "parked for resume" in (result.error or "")
+    names = [e["name"] for e in (await _payload(db, first.park_id))["ran"]]
+    assert names == ["web_search", "outreach_send"]
+
+
+@pytest.mark.parametrize("ending", [RuntimeError("boom"), asyncio.CancelledError()])
+async def test_a_resumed_run_that_sent_then_died_records_the_send(db, ending):
+    """Failed or cancelled, the run's park stays `resuming` and the stale-claim
+    reclaim retries it later: that retry must be told about the send too."""
+    from genesis.cc.types import StreamEvent
+
+    first = await _park_ran(db, [("web_search", {"q": "status"})])
+    await parks.claim(db, first.park_id)
+
+    async def _send_then_die(invocation, *, on_event=None):
+        await on_event(StreamEvent.from_raw({
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "tool_use", "name": "outreach_send", "input": {"message": "a"}},
+            ]},
+        }))
+        raise ending
+
+    runner = _park_runner(db)
+    runner._invoker.run_streaming = _send_then_die
+    req = DirectSessionRequest(
+        prompt="send the update", delivery_mode=DeliveryMode.RESULT, origin_session_id="s1",
+        caller_context=f"rate_limit_resume:{first.park_id}",
+    )
+    with pytest.raises(type(ending)):
+        await runner._run_session(req, "sess-resumed")
+    row = await parks.get_by_id(db, first.park_id)
+    assert row["status"] == "resuming"
+    names = [e["name"] for e in (await _payload(db, first.park_id))["ran"]]
+    assert names == ["web_search", "outreach_send"]
+    assert "`outreach_send`" in await _redispatched_prompt(db, first.park_id)
+
+
+async def test_a_resume_capped_while_parking_is_off_still_records_its_send(db):
+    first = await _park_ran(db, None)
+    await parks.claim(db, first.park_id)
+    resumed = _bg_request(caller_context=f"rate_limit_resume:{first.park_id}")
+    exc = CCRateLimitError("limit", raw_text="resets in 1h")
+    pid = await rlp.park_direct_session(
+        db, request=resumed, exc=exc, now=NOW, mode="off",
+        ran=[("outreach_send", {"message": "a"})],
+    )
+    assert pid is None
+    names = [e["name"] for e in (await _payload(db, first.park_id))["ran"]]
+    assert names == ["outreach_send"]
+
+
+async def test_a_failed_record_never_costs_the_park_or_the_relimit(db, monkeypatch):
+    async def _broken(*a, **k):
+        raise RuntimeError("db hiccup")
+
+    monkeypatch.setattr(rlp, "_merge_into_open_park", _broken)
+    exc = CCRateLimitError("limit", raw_text="resets in 30m")
+    send = [("outreach_send", {"message": "a"})]
+    pid = await rlp.park_direct_session(
+        db, request=_bg_request(), exc=exc, now=NOW, mode="live", ran=send,
+    )
+    assert pid is not None, "a committed park was reported as not parked"
+    returned = await _resume_caps(db, pid, send)
+    assert returned == pid
+    assert (await parks.get_by_id(db, pid))["attempts"] == 1, "the relimit was skipped"
