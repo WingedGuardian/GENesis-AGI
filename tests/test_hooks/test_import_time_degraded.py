@@ -699,6 +699,11 @@ _NOT_WIRED = {
     # vanished guard. MEASURED 2026-10-01: 0 references to it in .claude/settings.json,
     # .claude/ or scripts/hooks/, so Claude Code never runs it as a hook.
     "deploy_candidates.py": "a CLI, not a hook: wired nowhere in .claude/settings.json",
+    # Not a hook either: the issue premise gate runs only in the GitHub Action
+    # .github/workflows/premise-gate.yml. Its `return 2` is "no event file", a usage
+    # error, and a failed import there fails the Actions job loudly. MEASURED
+    # 2026-10-28: 0 references to it in .claude/settings.json or scripts/hooks/.
+    "premise_gate.py": "an Actions script, not a hook: wired nowhere in .claude/settings.json",
     # Not a hook either: the validator's sealed shell command RUNS this program;
     # the PreToolUse decision is codex_validator_guard.py's. A failed import exits
     # 1 before any request is read, so nothing is served and the caller sees a
