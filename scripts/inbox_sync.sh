@@ -61,9 +61,13 @@ _shown() {
     # 1. Pull: Dropbox → local (get new files from Obsidian, skip .genesis.md
     #    so we don't overwrite local responses before push, and skip local
     #    ".genesis-*" state so the mirror never deletes it)
+    #    The second ".genesis-*" exclude covers DIRECTORIES of that name: the
+    #    first matches files only, so a vault folder named like a state file
+    #    would otherwise be mirrored over it (MEASURED, rclone 1.60).
     rclone sync "$REMOTE" "$LOCAL_PATH" \
         --exclude "*.genesis.md" \
         --exclude ".genesis-*" \
+        --exclude ".genesis-*/**" \
         --verbose 2>&1
 
     # 2. Detect user-deleted .genesis.md files, at any depth.
@@ -110,6 +114,14 @@ _shown() {
     PUSH_MAX_AGE=""
     LISTING_OK=""
     HELD=""
+    # A state path that is not a regular file (a directory left by an older
+    # mirror, say) would make the record unreadable and every cycle a silent
+    # "seed": say so on every cycle until someone removes it.
+    for state in "$SEEN" "$FILTER" "$LSF_ERR"; do
+        if [ -e "$state" ] && { [ -d "$state" ] || [ ! -f "$state" ]; } && [ ! -L "$state" ]; then
+            echo "WARNING: state path is not a regular file, so cleanup cannot run: $(_shown "$state")"
+        fi
+    done
     # Never write state through a pre-planted symlink (defense-in-depth;
     # single-tenant box, but rm -f is free and rm does not follow symlinks).
     rm -f -- "$LSF_ERR" "$FILTER"
@@ -130,6 +142,9 @@ _shown() {
                     *$'\n'*)
                         # grep -F reads a newline as two patterns, so this name
                         # cannot be matched safely. Keep it; never decide on it.
+                        # (Other control characters are listed by rclone in an
+                        # escaped form, so such a name never matches the listing
+                        # or the record: it is kept as never-listed. Fails safe.)
                         echo "Kept (name contains a newline, not compared): $(_shown "$rel")"
                         continue ;;
                 esac

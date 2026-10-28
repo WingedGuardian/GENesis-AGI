@@ -392,6 +392,27 @@ def test_symlinked_record_is_not_used_or_followed(tmp_path):
     assert not _record_path(inbox).is_symlink()
 
 
+def test_record_path_that_is_a_directory_is_reported_and_cleans_nothing(tmp_path):
+    """A directory at the record path (e.g. mirrored from a vault folder of that
+    name) must never be read as a record, and must be reported every cycle."""
+    env, inbox, log, _ = _setup(tmp_path)
+    f = _old_response_file(inbox, "Genesis-1.genesis.md")
+    (_record_path(inbox)).mkdir()
+    _set_listing(env, [])
+
+    assert _run(env).returncode == 0
+    assert f.exists()
+    assert "WARNING: state path is not a regular file" in log.read_text()
+
+
+def test_mirror_excludes_state_named_directories(tmp_path):
+    env, inbox, _, call_log = _setup(tmp_path)
+    _set_listing(env, [])
+    assert _run(env).returncode == 0
+    sync_calls = [c for c in call_log.read_text().splitlines() if c.startswith("rclone sync")]
+    assert sync_calls and "--exclude .genesis-*/**" in sync_calls[0], sync_calls
+
+
 def test_record_comes_from_the_post_push_listing(tmp_path):
     """A response pushed this cycle is recorded as seen, so deleting it in the
     vault before the next cycle is a deletion, not an upload to retry."""
