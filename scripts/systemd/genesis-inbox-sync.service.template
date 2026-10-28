@@ -1,0 +1,27 @@
+[Unit]
+Description=Genesis Inbox Sync — mirror the vault into the inbox and push responses back
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_DIR__
+ExecStart=/bin/bash __REPO_DIR__/scripts/inbox_sync.sh
+# The failure mode this bounds is a WEDGED rclone (a hung API connection): the
+# run holds the sync's flock, and while it lives the timer starts no other run,
+# so the sync silently stops. A normal cycle measured 1-2s on a live install
+# with ~330 responses, and rclone's own retries on a flaky API add minutes, not
+# tens of minutes. 30 minutes kills nothing legitimate and equals the staleness
+# alert's window, so a wedged run is killed about when the alert fires.
+TimeoutStartSec=1800
+# rclone, flock, find, sed and awk live in /usr/bin on supported installs; the
+# venv's interpreter reads Genesis config and runs genesis.trash.
+Environment=PATH=__VENV__/bin:/usr/local/bin:/usr/bin:/bin
+StandardOutput=journal
+StandardError=journal
+# Writes only under $HOME: the inbox, ~/.genesis (trash, state), the repo's
+# logs/, and rclone's config (token refresh).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=%h
+
+[Install]
+WantedBy=default.target

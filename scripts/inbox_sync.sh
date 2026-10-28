@@ -1,6 +1,13 @@
 #!/bin/bash
-# Sync Genesis inbox folder between Dropbox and local VM.
-# Runs via cron every 5 minutes.
+# Sync the Genesis inbox folder between a vault (an rclone remote, e.g. a
+# Dropbox folder an Obsidian vault syncs to) and the local inbox.
+# Run every 5 minutes by genesis-inbox-sync.timer. The remote is
+# inbox_monitor.sync_remote (config/inbox_monitor.yaml + the local overlay);
+# when it is empty the sync is off and each run exits at once.
+#
+# Every configured run writes a heartbeat ($GENESIS_HOME/state/inbox_sync.json:
+# last_run, last_ok, held). The awareness loop alerts when last_ok goes stale,
+# so a sync that stops running, or keeps failing, is noticed.
 #
 # Flow:
 #   1. Pull new files FROM Dropbox → local (two-way sync for responses)
@@ -23,17 +30,46 @@
 
 SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-DROPBOX_PATH="Apps/remotely-save/1/Genesis"
-REMOTE="dropbox:$DROPBOX_PATH"
-LOCAL_PATH="${GENESIS_INBOX_PATH:-$HOME/inbox}"
+LOG="${GENESIS_INBOX_SYNC_LOG:-$REPO_DIR/logs/inbox_sync.log}"
+# The interpreter that runs genesis.inbox.sync_config and genesis.trash
+# (overridable for tests).
+PYTHON="${GENESIS_PYTHON:-$REPO_DIR/.venv/bin/python}"
+
+mkdir -p "$(dirname "$LOG")"
+_stamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# Configuration comes from Genesis config, through one reader the server's
+# staleness check shares. A config that cannot be read, or a remote that is
+# not a valid rclone remote, stops the run with exit 1: never read as "off",
+# because "off" raises no alert.
+if ! CFG=$("$PYTHON" -m genesis.inbox.sync_config 2>&1); then
+    echo "--- $(_stamp) REFUSED: inbox sync config unusable: $(printf '%s' "$CFG" | tr -d '[:cntrl:]') ---" >> "$LOG"
+    exit 1
+fi
+REMOTE=$(printf '%s\n' "$CFG" | sed -n 's/^remote=//p')
+LOCAL_PATH=$(printf '%s\n' "$CFG" | sed -n 's/^watch_path=//p')
+HEARTBEAT=$(printf '%s\n' "$CFG" | sed -n 's/^heartbeat=//p')
+if [ -z "$REMOTE" ]; then
+    # Off on this install: nothing to sync, nothing to watch, nothing logged
+    # (the timer fires every 5 minutes on every install). Except one case: a
+    # caller that is NOT the systemd timer (no INVOCATION_ID, e.g. an old
+    # crontab line) means someone expects this to sync. That happens when an
+    # install that synced from cron updates before setting sync_remote, and
+    # it would otherwise stop syncing in silence.
+    if [ -z "${INVOCATION_ID:-}" ]; then
+        echo "--- $(_stamp) NOT SYNCING: inbox_monitor.sync_remote is empty, but this run did not come from genesis-inbox-sync.timer (a crontab line?). Set sync_remote in ~/.genesis/config/inbox_monitor.local.yaml to resume the sync. ---" >> "$LOG"
+    fi
+    exit 0
+fi
+if [ -z "$LOCAL_PATH" ] || [ -z "$HEARTBEAT" ]; then
+    echo "--- $(_stamp) REFUSED: inbox sync config incomplete: $(printf '%s' "$CFG" | tr -d '[:cntrl:]') ---" >> "$LOG"
+    exit 1
+fi
 # A trailing slash would make every relative path below start with "/", so no
 # local response could ever match the vault listing.
 [ "$LOCAL_PATH" != "/" ] && LOCAL_PATH="${LOCAL_PATH%/}"
-LOG="${GENESIS_INBOX_SYNC_LOG:-$REPO_DIR/logs/inbox_sync.log}"
-# The interpreter that runs `genesis.trash` (overridable for tests).
-PYTHON="${GENESIS_PYTHON:-$REPO_DIR/.venv/bin/python}"
 
-mkdir -p "$(dirname "$LOG")" "$LOCAL_PATH"
+mkdir -p "$LOCAL_PATH"
 
 # Single-flight: an API outage can stretch a cycle past the 5-min cron period
 # (rclone retries); overlapping runs would interleave deletions and log lines.
@@ -69,6 +105,8 @@ _shown() {
         --exclude ".genesis-*" \
         --exclude ".genesis-*/**" \
         --verbose 2>&1
+    pull_rc=$?
+    [ "$pull_rc" -ne 0 ] && echo "Pull failed (rc=$pull_rc); new notes did not arrive this cycle"
 
     # 2. Detect user-deleted .genesis.md files, at any depth.
     #    A local response is a USER DELETION only if a previous healthy listing
@@ -244,6 +282,36 @@ _shown() {
             rm -f -- "$SEEN.tmp"
             echo "WARNING: could not write the vault record ($SEEN); the previous record is kept"
         fi
+    fi
+
+    # 5. Heartbeat. "Ok" means the whole cycle worked: the pull, a healthy
+    #    listing and the push. last_ok keeps its previous value when this cycle
+    #    was not ok, so a sync that runs but keeps failing goes stale too.
+    #    held = responses the trash refused this cycle (alerted on while
+    #    non-zero: a deletion that cannot apply). Written atomically.
+    now=$(_stamp)
+    last_ok=""
+    prev_held=0
+    if [ -f "$HEARTBEAT" ] && [ ! -L "$HEARTBEAT" ]; then
+        last_ok=$(sed -n 's/.*"last_ok": *"\([0-9TZ:-]*\)".*/\1/p' "$HEARTBEAT" | head -n 1)
+        prev_held=$(sed -n 's/.*"held": *\([0-9][0-9]*\).*/\1/p' "$HEARTBEAT" | head -n 1)
+    fi
+    # held is measured only on a healthy listing; a failed-listing cycle keeps
+    # the previous count, so the held alert does not clear and re-fire.
+    [ -n "$LISTING_OK" ] || held="${prev_held:-0}"
+    if [ "$pull_rc" -eq 0 ] && [ -n "$LISTING_OK" ] && [ "$push_rc" -eq 0 ]; then
+        last_ok="$now"
+    else
+        listing_state="failed"
+        [ -n "$LISTING_OK" ] && listing_state="ok"
+        echo "Heartbeat: cycle not ok (pull rc=$pull_rc, listing $listing_state, push rc=$push_rc)"
+    fi
+    mkdir -p "$(dirname "$HEARTBEAT")"
+    if printf '{"last_run": "%s", "last_ok": "%s", "held": %d}\n' "$now" "$last_ok" "${held:-0}" > "$HEARTBEAT.tmp"; then
+        mv -f -- "$HEARTBEAT.tmp" "$HEARTBEAT"
+    else
+        rm -f -- "$HEARTBEAT.tmp"
+        echo "WARNING: could not write the heartbeat ($HEARTBEAT)"
     fi
 
     echo "--- done ---"

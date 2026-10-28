@@ -484,7 +484,7 @@ what's NOT in this list.
 |---|---|---|---|---|
 | Qdrant data deletion | Tests without delete guard | Production data lost | Delete guard + backup verify | 2026-03-16 |
 | Backup failure | Passphrase not set, push failure | No recovery point | Backup log monitoring | Ongoing (secrets) |
-| Scheduler job failure | Path error, permission issue | Backups (genesis-backup.timer) / inbox sync (cron) stop | Timer + cron output monitoring | Not yet hit |
+| Scheduler job failure | Path error, permission issue, a wiped crontab | Backups (genesis-backup.timer) / inbox sync (genesis-inbox-sync.timer) stop | Timer output monitoring; the inbox sync writes a heartbeat and the awareness loop alerts when it goes stale | Hit twice for the inbox sync while it ran from cron (a wiped crontab, unnoticed for days); now a timer plus a staleness alert |
 
 ### What's NOT in this list (prompt for forecast LLM)
 

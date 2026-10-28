@@ -14,17 +14,22 @@ from genesis.inbox.types import InboxConfig
 logger = logging.getLogger(__name__)
 
 
-def load_inbox_config(path: str | Path) -> InboxConfig:
+def load_inbox_config(path: str | Path, *, strict: bool = False) -> InboxConfig:
     """Load inbox config from a YAML file path.
 
     Merges ``config/inbox_monitor.local.yaml`` overlay (written by the
     dashboard settings panel) on top of the base file when present.
+
+    ``strict=True`` raises ``ConfigOverlayError`` on an unreadable or malformed
+    overlay instead of warning and ignoring it. The inbox sync needs that: its
+    remote lives only in the overlay, so a lenient read of a broken overlay
+    would turn the sync off without a word.
     """
     from genesis._config_overlay import merge_local_overlay
 
     base_path = Path(path)
     raw = yaml.safe_load(base_path.read_text()) or {}
-    raw = merge_local_overlay(raw, base_path)
+    raw = merge_local_overlay(raw, base_path, strict=strict)
     return _parse(raw)
 
 
@@ -119,4 +124,8 @@ def _parse(raw: dict) -> InboxConfig:
         evaluation_cooldown_seconds=_positive_int(
             "evaluation_cooldown_seconds", minimum=0,
         ),
+        # Kept verbatim (stripped): an invalid value must stay visibly SET so
+        # the sync refuses it and the staleness alert fires, rather than
+        # degrading to "off", which raises no alert at all.
+        sync_remote=str(section.get("sync_remote") or defaults["sync_remote"]).strip(),
     )

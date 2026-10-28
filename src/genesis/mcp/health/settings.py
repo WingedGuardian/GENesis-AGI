@@ -1046,6 +1046,20 @@ def _validate_inbox_monitor(changes: dict) -> list[str]:
             f"{sorted(valid_coverage_modes)}, got {coverage_mode!r}"
         )
 
+    # The inbox sync refuses an invalid remote (and the staleness alert then
+    # fires); rejecting it here keeps a typo from ever stopping the sync.
+    sync_remote = section.get("sync_remote")
+    if "sync_remote" in section and sync_remote is not None:  # null = off, as config.py reads it
+        from genesis.inbox.sync_config import remote_is_valid
+
+        if not isinstance(sync_remote, str) or (
+            sync_remote.strip() and not remote_is_valid(sync_remote.strip())
+        ):
+            errors.append(
+                "inbox_monitor.sync_remote must be empty or an rclone remote "
+                f"like 'name:path', got {sync_remote!r}"
+            )
+
     return errors
 
 
