@@ -244,7 +244,8 @@ def test_fallback_chain_has_no_retired_models(monkeypatch):
     """Codex rounds 1+2: the fallback carried gemini-2.0-flash ('Do not use'),
     then my round-1 fix picked gemini-3-flash-preview from the WRONG authority
     (the video-analysis doc) — the canonical routing config already replaced
-    that preview with gemini-3.5-flash + reasoning_effort=disable. The chain
+    that preview with gemini-3.5-flash with thinking suppressed (since #3674 a
+    raw thinkingConfig, thinkingBudget=0). The chain
     must mirror the ROUTING CONFIG's current choice, retired families and
     deprecated previews both rejected."""
     models = [m for m, *_ in version_gate._FALLBACK_MODELS]
@@ -255,7 +256,7 @@ def test_fallback_chain_has_no_retired_models(monkeypatch):
     assert any("gemini-3.5-flash" in m for m in models)
     # And the gemini entry mirrors the config's thinking-suppression param.
     gem = next(t for t in version_gate._FALLBACK_MODELS if "gemini" in t[0])
-    assert gem[2] == {"reasoning_effort": "disable"}
+    assert gem[2] == {"thinkingConfig": {"thinkingBudget": 0}}
 
 
 @pytest.mark.asyncio
