@@ -92,6 +92,15 @@ async def init_guardian_monitoring(rt) -> None:
         from genesis.guardian.findings_ingest import ingest_guardian_findings
         rt._awareness_loop.set_findings_ingest(ingest_guardian_findings)
         logger.info("Guardian findings ingest wired to awareness loop")
+
+        # Record alerts the Guardian sent to Telegram (sent-log gateway verb)
+        import functools
+
+        from genesis.guardian.sent_log_ingest import ingest_guardian_sent_log
+        rt._awareness_loop.set_guardian_sent_log_ingest(
+            functools.partial(ingest_guardian_sent_log, remote=remote),
+        )
+        logger.info("Guardian sent-log ingest wired to awareness loop")
     else:
         logger.warning(
             "Awareness loop not available — Guardian watchdog not wired",
