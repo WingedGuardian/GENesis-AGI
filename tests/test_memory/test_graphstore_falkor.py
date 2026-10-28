@@ -1139,10 +1139,13 @@ _ENGINE_ARMED = (
     and Path(falkordb_socket_path()).exists()
 )
 
-engine_gated = pytest.mark.skipif(
-    not _ENGINE_ARMED,
-    reason="live graph engine: opt in with GENESIS_LIVE_E2E=1 (and a client and socket)",
-)
+def engine_gated(fn):
+    return pytest.mark.live_service(
+        pytest.mark.skipif(
+            not _ENGINE_ARMED,
+            reason="live graph engine: opt in with GENESIS_LIVE_E2E=1 (and a client and socket)",
+        )(fn)
+    )
 
 #: Deliberately `test_`-prefixed and never the canonical `genesis_memory`.
 _TEST_GRAPH_KEY = "test_f2_roundtrip"

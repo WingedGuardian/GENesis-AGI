@@ -27,10 +27,13 @@ from genesis.qdrant.collections import (
 
 TEST_COLLECTION = "test_genesis_" + uuid.uuid4().hex[:8]
 
-pytestmark = pytest.mark.skipif(
-    os.environ.get("GENESIS_LIVE_E2E") != "1",
-    reason="writes to the live Qdrant; opt in with GENESIS_LIVE_E2E=1",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        os.environ.get("GENESIS_LIVE_E2E") != "1",
+        reason="writes to the live Qdrant; opt in with GENESIS_LIVE_E2E=1",
+    ),
+    pytest.mark.live_service,
+]
 
 
 def _uuid():
