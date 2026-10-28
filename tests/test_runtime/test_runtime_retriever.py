@@ -42,6 +42,7 @@ class TestRuntimeRetrieverProperties:
                "the lazy imports in genesis.runtime.init.memory; it runs against "
                "the live Qdrant, so opt in with GENESIS_LIVE_E2E=1",
     )
+    @pytest.mark.live_service
     @pytest.mark.asyncio
     async def test_retriever_created_after_bootstrap(self):
         # Probed here, inside the opted-in test, never at collection: a skipped
