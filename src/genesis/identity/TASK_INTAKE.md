@@ -108,6 +108,17 @@ Budget, timeline, technology, things to avoid.
 
 ## Access Needed
 Any credentials, accounts, or permissions the executor may need.
+
+## Premise checks
+Only when the plan names repo files (src/, scripts/, tests/, .claude/, docs/,
+config/, .github/): six numbered answers to the plan-time questions in
+.claude/docs/premise-check.md. `n/a — <reason>` counts as an answer.
+1. <outside-behaviour claims: measured or cited>
+2. <what was searched, and what was found>
+3. <scope limits, and the shared code they leave reachable>
+4. <the caller, and its tracker or why there is none>
+5. <how each number was measured>
+6. <expected counted lines, and the split or Shape: reason>
 ```
 
 ## Handoff

@@ -1,0 +1,87 @@
+# Issue premise gate: scripts/premise_gate.py (its docstring has the rules).
+# Labels an issue `premises-missing` until it carries the six plan-time premise
+# answers, and removes `devin-ready` (which starts a paid Devin session) from an
+# issue without them.
+name: Premise gate
+
+on:
+  # `issues` events run this file and the code it checks out from the DEFAULT
+  # branch, never from a fork or a pull request, so the checkout below is the
+  # repository's own reviewed code. The only untrusted input is the issue body,
+  # which the script reads through `gh`; no `${{ }}` expression below carries
+  # issue text, so none of it reaches a shell.
+  issues:
+    types: [opened, edited, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  issues: write
+
+# TWO jobs, chosen by job-level `if:` so an irrelevant event queues nothing.
+# A concurrency group keeps one running and ONE pending run, and a newer pending
+# run cancels the older one whatever `cancel-in-progress` says. So the guard has
+# no group (its actions are idempotent): a burst of label events at creation can
+# never cancel it. The label job is serialized per issue, and reads the issue's
+# CURRENT body and labels, so whichever run survives a burst acts on the latest
+# state.
+jobs:
+  guard:
+    if: github.event.action == 'labeled' && github.event.label.name == 'devin-ready'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/premise_gate.py
+            scripts/hooks/plan_doc.py
+            scripts/hooks/plan_premise_gate.py
+            scripts/hooks/hook_input.py
+            .github/ISSUE_TEMPLATE/bug_report.yml
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install the parser's dependencies
+        run: pip install "pyyaml==6.0.3" "markdown-it-py==4.0.0"
+      - name: Apply the premise gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 scripts/premise_gate.py "$GITHUB_EVENT_PATH"
+
+  label:
+    # Opened, edited or reopened, or the `bug` label added or removed: that label
+    # switches which section the issue owes. Never the devin-ready event, which
+    # is the guard's.
+    if: >-
+      contains(fromJSON('["opened", "edited", "reopened"]'), github.event.action)
+      || ((github.event.action == 'labeled' || github.event.action == 'unlabeled')
+      && github.event.label.name == 'bug')
+    concurrency:
+      group: premise-gate-label-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/premise_gate.py
+            scripts/hooks/plan_doc.py
+            scripts/hooks/plan_premise_gate.py
+            scripts/hooks/hook_input.py
+            .github/ISSUE_TEMPLATE/bug_report.yml
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install the parser's dependencies
+        run: pip install "pyyaml==6.0.3" "markdown-it-py==4.0.0"
+      - name: Apply the premise gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: python3 scripts/premise_gate.py "$GITHUB_EVENT_PATH"
