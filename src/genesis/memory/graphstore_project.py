@@ -134,7 +134,7 @@ def armed(socket_path: Path | None = None) -> tuple[bool, str]:
     return True, f"engine socket present at {sock}"
 
 
-async def build(graph_key: str = GRAPH_KEY) -> dict[str, int]:
+async def build(graph_key: str = GRAPH_KEY) -> dict[str, int | str]:
     """Project the live graph. Returns the projection's own counts."""
     import aiosqlite
 
@@ -278,6 +278,9 @@ def main() -> int:
         f"({stats['hidden']:,} of those nodes are currently hidden by the "
         f"validity predicate, which is applied per-read, not at projection time)"
     )
+    # The first-read warm-up's outcome (graphstore_falkor._WARM_TRAVERSALS): this
+    # line is how the hourly unit's journal shows whether it ran.
+    print(f"warm-up: {stats.get('warm', 'not reported')}")
     return 0
 
 

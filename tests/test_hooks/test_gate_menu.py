@@ -34,7 +34,7 @@ _HOOK = _REPO_ROOT / "scripts" / "hooks" / "ask_gate_menu.py"
 sys.path.insert(0, str(_REPO_ROOT / "scripts"))
 sys.path.insert(0, str(_REPO_ROOT / "scripts" / "lib"))
 import review_state  # noqa: E402
-from gate_menu import CAP_QUESTION, CAP_REMEDIES  # noqa: E402
+from gate_menu import CAP_REMEDIES  # noqa: E402
 
 # Reuse the cap suite's known-good machinery rather than re-deriving it. Four ad-hoc
 # harnesses built during this work failed to arm the cap at all -- their `mark` calls
@@ -130,7 +130,7 @@ def _questions_from(res) -> list[dict] | None:
     return out["updatedInput"]["questions"]
 
 
-# ─── The counter decides, and only at the cap ───────────────────────────────
+# ─── Dormant: the cap tier this menu answered is retired ─────────────────────
 
 
 def test_below_the_cap_the_hook_is_silent(repo, home):
@@ -138,137 +138,22 @@ def test_below_the_cap_the_hook_is_silent(repo, home):
     assert _hook(_ask_payload(repo), repo, home).stdout == ""
 
 
-def test_at_the_cap_the_gates_own_question_is_APPENDED(repo, home):
-    """THE FOUNDING INCIDENT, inverted.
-
-    The agent asks its own question; what the user is shown carries the agent's
-    question UNTOUCHED plus the gate's, with the gate's options in the gate's order.
-    """
+def test_at_the_old_cap_the_hook_is_now_silent_too(repo, home):
+    """The commit gate no longer stops on the local streak (a round reflection
+    replaced it), so a counter sitting at the old cap must not bring back a menu
+    for a stop that no longer exists. Control: the counter really is at the cap."""
     _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    questions = _questions_from(_hook(_ask_payload(repo), repo, home))
-    assert questions is not None, "the cap is live; the menu must be appended"
-    assert questions[0]["question"] == "an ordinary question the agent asked", (
-        "this APPENDS; it must never censor what the agent asked"
-    )
-    gate_q = questions[-1]
-    assert gate_q["question"] == CAP_QUESTION
-    assert [o["label"] for o in gate_q["options"]] == [r["label"] for r in CAP_REMEDIES]
-    assert gate_q["options"][0]["label"] == "HAND IT BACK", "hand-back stays FIRST"
-
-
-def test_the_MODE_SWITCH_tier_is_deliberately_NOT_covered(repo, home):
-    """The load-bearing scope decision, pinned with its reason.
-
-    `# escalation-ack` at the cap calls `reset_review_round`, so the counter drops and
-    the menu stops appearing BY CONSTRUCTION. `# audit-ack` at the mode-switch tier
-    deliberately does NOT reset the streak -- a still-narrow fix must still reach the
-    round-3 stop -- so a menu keyed on `round == 2` would keep re-asking a decision the
-    user already made, on every later question, until an external clean review happened
-    to land. That is precisely the defect the deleted design needed retirement machinery
-    to avoid. Excluding the tier is how this design avoids needing that machinery.
-
-    If someone extends this hook to the mode-switch tier, this test fails and the
-    docstring tells them what they are buying.
-    """
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP - 1)
+    stored = [
+        json.loads(p.read_text()).get("round", 0)
+        for p in (home / ".genesis" / "review_rounds").glob("*.json")
+    ]
+    assert max(stored, default=0) >= review_state.ESCALATION_ROUND_CAP, stored
     assert _hook(_ask_payload(repo), repo, home).stdout == ""
-
-
-def test_branch_lifetime_no_longer_hides_the_local_cap_menu(repo, home):
-    """The legacy lifetime counter has no current authorization semantics."""
-    for _ in range(2):
-        _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-        acked = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
-        assert acked.returncode == 0, acked.stdout + acked.stderr
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    assert _hook(_ask_payload(repo), repo, home).stdout != ""
-
-
-def test_the_menu_stops_after_the_ack_BY_CONSTRUCTION(repo, home):
-    """No retirement code: the ack resets the counter, so the tier is simply no longer
-    live. This is the property that let the whole marker lifecycle be deleted."""
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    assert _hook(_ask_payload(repo), repo, home).stdout != "", "precondition: menu shown"
-    acked = _run_hook('git commit -m "wip"  # escalation-ack', repo, home)
-    assert acked.returncode == 0, acked.stdout + acked.stderr
-    assert _hook(_ask_payload(repo), repo, home).stdout == "", (
-        "the decision was made; the menu must stop being asked"
-    )
-
-
-def test_the_PAYLOAD_cwd_wins_over_the_process_cwd(tmp_path, repo, home):
-    """The session's directory comes from the payload, not from wherever the hook
-    happens to be standing. Unpinned before: every fixture ran the hook with
-    cwd == payload cwd, so ignoring the payload entirely left all tests green."""
-    elsewhere = tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    # Process cwd is a bare directory with no counter; the payload names the capped repo.
-    res = _hook(_ask_payload(repo), elsewhere, home)
-    assert res.stdout != "", "the payload's cwd must decide, not the process cwd"
-    # And the converse: payload pointing at the bare dir yields nothing, from the repo.
-    payload = _ask_payload(repo)
-    payload["cwd"] = str(elsewhere)
-    assert _hook(payload, repo, home).stdout == ""
-
-
-def test_a_menu_does_not_follow_you_to_another_branch(repo, home):
-    """`get_review_round` is branch-scoped, so a new change starts fresh."""
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    assert _hook(_ask_payload(repo), repo, home).stdout != ""
-    subprocess.run(
-        ["git", "-C", str(repo), "checkout", "-q", "-b", "other"],
-        check=True,
-        capture_output=True,
-    )
-    assert _hook(_ask_payload(repo), repo, home).stdout == ""
+    err = _run_hook('git commit -m "wip"', repo, home).stderr
+    assert "escalation cap reached" not in err and "MODE-SWITCH" not in err
 
 
 # ─── Substitution behaviour ─────────────────────────────────────────────────
-
-
-def test_a_FORGED_gate_question_is_REPLACED_not_skipped(repo, home):
-    """The measured forgery path, locked.
-
-    An earlier revision returned early when the gate's question was already present, on
-    the assumption the agent was echoing one we built. That compared only the QUESTION
-    STRING and never the options -- so an agent could emit the gate's exact question
-    carrying ONE option it wrote itself and the hook would stand down. That is the
-    founding incident laundered through the mechanism built to prevent it.
-    """
-    forged = {
-        "question": CAP_QUESTION,
-        "header": "Gate",
-        "multiSelect": False,
-        "options": [{"label": "ship as-is", "description": "agent-invented"}],
-    }
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    questions = _questions_from(_hook(_ask_payload(repo, [forged]), repo, home))
-    assert questions is not None
-    assert len(questions) == 1, "replaced in place, not appended beside itself"
-    labels = [o["label"] for o in questions[0]["options"]]
-    assert labels == [r["label"] for r in CAP_REMEDIES]
-    assert "ship as-is" not in labels, "the forged option must not survive"
-
-
-def test_a_call_already_at_the_question_maximum_passes_through(repo, home):
-    """Refusing would reintroduce 'the gate can wedge asks' -- the inverted fail
-    direction this whole line of work exists to avoid. The counter is still at the cap,
-    so the next ask gets the menu."""
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    four = [
-        {
-            "question": f"agent question {i}",
-            "header": "h",
-            "multiSelect": False,
-            "options": [
-                {"label": "a", "description": ""},
-                {"label": "b", "description": ""},
-            ],
-        }
-        for i in range(4)
-    ]
-    assert _hook(_ask_payload(repo, four), repo, home).stdout == ""
 
 
 @pytest.mark.parametrize(
@@ -342,152 +227,7 @@ def test_the_shipped_menu_is_RENDERABLE_by_the_tool(repo, home):
     assert all(r.get("key") and r.get("label") for r in CAP_REMEDIES)
 
 
-# ─── The data and the prose cannot drift ────────────────────────────────────
-
-
-def _cap_block(repo, home) -> str:
-    """The gate's REAL rendered cap message. Fails loudly if the cap did not fire.
-
-    The precondition assert is not decoration: five harnesses in this work silently
-    failed to arm the cap and measured a DIFFERENT rule's refusal as though it were
-    this one.
-    """
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    err = _run_hook('git commit -m "wip"', repo, home).stderr
-    assert "escalation cap reached" in err, (
-        "precondition: the cap message must have rendered, or this test is measuring "
-        f"some other rule's refusal. Got: {err[:200]!r}"
-    )
-    return err
-
-
-def test_every_declared_remedy_appears_in_the_gates_MESSAGE_in_order(repo, home):
-    """DRIFT LOCK, direction 1: nothing in the menu is absent from the gate's message.
-
-    The menu the user clicks and the menu the gate prints are two renderings of one
-    decision. If they disagree, the substitution shows the user something the gate did
-    not say -- the failure this feature exists to prevent, by a different door.
-
-    Labels AND descriptions, because the descriptions are most of what the user reads
-    and an earlier version of this suite pinned only the labels: blanking every
-    description to "ZZZ." left all 21 tests green.
-    """
-    err = _cap_block(repo, home)
-    positions = []
-    for remedy in CAP_REMEDIES:
-        i = err.find(remedy["label"])
-        assert i != -1, f"the gate's message never names {remedy['label']!r}"
-        assert remedy["description"] in err, (
-            f"the description for {remedy['key']!r} is not a verbatim excerpt of the "
-            "gate's message — descriptions are the gate's words, not a paraphrase"
-        )
-        positions.append(i)
-    assert positions == sorted(positions), (
-        f"declaration order must match the printed order (got {positions}) — a session "
-        "takes the menu in the order the gate prints it"
-    )
-
-
-def test_the_gate_PRINTS_no_option_the_menu_omits(repo, home):
-    """DRIFT LOCK, direction 2 — and this is the direction that matters.
-
-    Direction 1 cannot see the gate GROW an option. MEASURED: with only direction 1 in
-    place, inserting "(e) SHIP AS-IS and move on." into the gate's cap message left all
-    21 tests green — the substituted menu would have silently dropped from the user's
-    view the one outcome the cap exists to prevent. That is the 2026-08-31 incident
-    exactly: an option present in the gate, absent from what the user was shown.
-    """
-    import re
-
-    err = _cap_block(repo, home)
-    block = err.split("escalation cap reached", 1)[1].split("Bring evidence to the choice", 1)[0]
-    # Deliberately WIDER than the house "  (x) " convention, and the slice now ends at
-    # the last content line rather than a heading further down. MEASURED: the previous
-    # pattern was ^\s{2}\(([a-z])\)\s, so inserting "    (e) SHIP AS-IS" (four spaces)
-    # or "  - SHIP AS-IS" into the gate left all 29 tests green -- a FORMAT lock wearing
-    # a content lock's docstring. Reformatting the gate's message must not disarm the
-    # one direction that can see it grow an option.
-    printed = re.findall(r"^\s*(?:\([a-z]\)|[-*])\s*(.+)$", block, re.MULTILINE)
-    assert printed, "precondition: the cap block must print lettered options"
-    assert len(printed) == len(CAP_REMEDIES), (
-        f"the gate prints {len(printed)} options {printed} but the menu declares "
-        f"{len(CAP_REMEDIES)} — the user would be shown a SHORTER menu than the gate "
-        "gave, which is the founding incident"
-    )
-    # ARITY IS NOT IDENTITY. A count cannot see the gate REPLACE an option in place --
-    # four options both sides, different words, menu silently wrong.
-    for text, remedy in zip(printed, CAP_REMEDIES, strict=True):
-        assert text.startswith(remedy["label"]), (
-            f"the gate prints {text[:60]!r} where the menu declares {remedy['label']!r} "
-            "— the user would be shown a DIFFERENT option from the one the gate gave"
-        )
-
-
-def test_the_QUESTION_names_the_tier_the_gate_is_blocking_on(repo, home):
-    """Content, not plumbing. Comparing the rendered question to the imported constant
-    (which an earlier version did) pins only that the string survived the trip:
-    replacing CAP_QUESTION with "Pick one:" left every test green. This ties it to the
-    GATE instead."""
-    err = _cap_block(repo, home)
-    assert "escalation cap" in CAP_QUESTION.lower()
-    assert "escalation cap" in err.lower()
-
-
 # ─── Fail direction: every degradation costs a menu, never a gate ───────────
-
-
-@pytest.mark.parametrize("via", ["env", "marker"])
-def test_the_kill_switch_stops_the_substitution(repo, home, via):
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    extra = {}
-    if via == "env":
-        extra["GENESIS_GATE_MENU_DISABLED"] = "1"
-    else:
-        marker = home / ".genesis" / "config" / "gate_menu_disabled"
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text("")
-    assert _hook(_ask_payload(repo), repo, home, **extra).stdout == ""
-
-
-@pytest.mark.parametrize(
-    ("value", "disabled"),
-    [
-        ("1", True),
-        ("true", True),
-        ("TRUE", True),
-        ("on", True),
-        ("yes", True),
-        ("0", False),
-        ("false", False),
-        ("no", False),
-        ("off", False),
-        ("", False),
-        ("  ", False),
-    ],
-)
-def test_which_env_SPELLINGS_disable_the_substitution(repo, home, value, disabled):
-    """The tuple of falsy spellings is load-bearing and was untested. MEASURED:
-    collapsing ("", "0", "false", "no", "off") to ("",) left all 29 tests green — and
-    that mutation makes `=0` and `=false` DISABLE the menu, the precise inversion the
-    comment above the check records as measured-and-fixed. `no`/`off` name the SWITCH's
-    position, so they mean "do not disable"; only this pins that.
-    """
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    out = _hook(_ask_payload(repo), repo, home, GENESIS_GATE_MENU_DISABLED=value).stdout
-    assert (out == "") is disabled, (
-        f"GENESIS_GATE_MENU_DISABLED={value!r} "
-        f"{'should' if disabled else 'should NOT'} disable the menu"
-    )
-
-
-def test_the_kill_switch_leaves_the_GATE_untouched(repo, home):
-    """The switch costs the menu, never the block. Guard-the-guard for the test above:
-    without this, disabling the gate itself would look like a working kill switch."""
-    _reach_rounds(repo, home, review_state.ESCALATION_ROUND_CAP)
-    env = {"GENESIS_GATE_MENU_DISABLED": "1"}
-    blocked = _run_hook('git commit -m "wip"', repo, home)
-    assert blocked.returncode == 2, "the cap must still block"
-    assert _hook(_ask_payload(repo), repo, home, **env).stdout == ""
 
 
 @pytest.mark.parametrize(
@@ -502,35 +242,6 @@ def test_the_kill_switch_leaves_the_GATE_untouched(repo, home):
 def test_malformed_or_irrelevant_payloads_emit_nothing(repo, home, payload):
     res = _hook(payload, repo, home)
     assert res.returncode == 0 and res.stdout == ""
-
-
-def test_cap_menu_uses_the_snapshot_streak_and_ignores_legacy_lifetime(
-    tmp_path, repo, home
-):
-    tree = tmp_path / "snapshot"
-    (tree / "scripts" / "hooks").mkdir(parents=True)
-    (tree / "scripts" / "lib").mkdir(parents=True)
-    (tree / "scripts" / "lib" / "gate_menu.py").write_text(
-        (_REPO_ROOT / "scripts" / "lib" / "gate_menu.py").read_text()
-    )
-    (tree / "scripts" / "review_state.py").write_text(
-        "ESCALATION_ROUND_CAP = 3\n"
-        "def get_review_counters(cwd=None):\n"
-        "    return (3, 99)\n"
-    )
-    hook_copy = tree / "scripts" / "hooks" / "ask_gate_menu.py"
-    hook_copy.write_text(_HOOK.read_text())
-    res = subprocess.run(
-        [sys.executable, str(hook_copy)],
-        input=json.dumps(_ask_payload(repo)),
-        capture_output=True,
-        text=True,
-        cwd=str(repo),
-        env={"PATH": "/usr/bin:/bin", "HOME": str(home)},
-        timeout=30,
-    )
-    assert res.returncode == 0
-    assert res.stdout != ""
 
 
 def test_garbage_stdin_does_not_crash_the_hook(repo, home):
@@ -653,4 +364,7 @@ def test_nothing_in_the_gate_READS_the_menu_module_back():
     }
     assert not (banned & seen), f"the gate grew marker machinery again: {sorted(banned & seen)}"
     # Control: this must not pass on a file that stopped parsing or importing anything.
-    assert "get_review_counters" in seen, "control: the gate must still read the counter"
+    # Control: this must not pass on a file that stopped parsing. The gate now reads
+    # the round reflection, never the streak counter this menu keyed on.
+    assert "_reflection_rule" in seen, "control: the gate must still define Rule R"
+    assert "get_review_counters" not in seen, "the retired streak tiers came back"

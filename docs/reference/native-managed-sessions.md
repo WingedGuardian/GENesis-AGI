@@ -30,6 +30,14 @@ task transcript persistence is unchanged. Informational limit events and usable
 overage do not reject readiness; a final effective refusal does, even alongside
 the exact readiness answer. Later allowed state can supersede an earlier refusal.
 
+Ordinary streaming uses the same final effective quota state, with or without
+a result event. Informational events do not mark provider health rate-limited
+or suppress the ordinary empty-output signal. A final refusal preserves any
+nonblank answer while updating provider health; without an answer it raises a
+rate-limit error. Missing output after a dropped stream line retains its
+non-replayable error instead of authorizing another execution. Actual model
+tier downgrades are still reported independently of quota classification.
+
 Once selected, one provider executes the real task through the existing native
 profile and approval gates. A successful readiness check cannot guarantee that
 the subsequent task will finish: a later limit or failure ends the task without

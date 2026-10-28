@@ -38,7 +38,10 @@ secrets file with ``override=True``, so a key the file carries beats the
 exec-time value (owner ruling, 2026-10-20). The file counts only if it exists
 and neither it nor any symlink on its path changed since the process started;
 a missing file is UNKNOWN, never "enabled", and so is a startup value whose
-file cannot be proven, since that file can override it.
+file cannot be proven, since that file can override it. One exception
+(``carry_secrets``): a file changed only in keys the census does not read is
+carried, when the latest census row proved this same server (pid and start)
+with the same census-key values; rows record that digest, never a value.
 
 **Database scope** (``db_paths`` + ``db_scope``): the primary database is fixed
 when the server script is imported (exec env, else ``<root>/data``); a
@@ -66,7 +69,21 @@ these deliberate constructions stay as residuals:
 - forged ``.pyc`` files, or a ``PYTHONPYCACHEPREFIX`` / ``-X pycache_prefix``;
 - files added beside the script or in site-packages after the start and
   removed before the census reads;
-- the stdlib or site-packages upgraded after the start.
+- the stdlib or site-packages upgraded after the start;
+- on the carry path only, a census-key edit written in place, the same size,
+  inside one change-time tick of the previous write and during the read
+  (MEASURED: change times step about 1 ms on this kind of filesystem, and 43 of
+  300 such synthetic rewrites passed the snapshot). Harmless by construction:
+  a carry returns only values whose digest equals the already-proven one, so it
+  never writes a new digest, and the next census reads the file as it is;
+- a venv process in another mount namespace (the test sandbox, MEASURED: 4 of 4
+  such processes) is judged on the host checkout's history, because its paths
+  are not ours to resolve; reading it unknown would reset the clock on every
+  census that lands during a sandboxed test run.
+
+Every fail-closed rule here was measured against the live processes before it
+shipped (owner ruling, 2026-10-20): a dirty row RESETS the 14-day clock, so a
+rule that routine processes trip would make the cutover unreachable.
 
 No reason code carries an environment value or a path from another process.
 """
@@ -75,6 +92,9 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import hashlib
+import io
+import json
 import os
 import re
 import sys
@@ -95,8 +115,28 @@ PROOF_ENV_KEYS = (
     "GENESIS_REPO_ROOT",
     "GENESIS_DB_PATH",
     "GENESIS_GRAPH_TELEMETRY_DISABLED",
+    "GENESIS_HOME",
 )
 _SWITCH = "GENESIS_GRAPH_TELEMETRY_DISABLED"
+#: PYTHON* variables this module models (each has its own rule above or below).
+_PY_ENV_MODELLED = frozenset(
+    {"PYTHONPATH", "PYTHONHOME", "PYTHONPLATLIBDIR", "PYTHONEXECUTABLE", "PYTHONWARNINGS"}
+)
+#: PYTHON* variables that cannot change which code a script run loads. Any other
+#: PYTHON* variable makes the source unknown: an allowlist, because CPython's
+#: set is small and stable, and a denylist only ever lists the vectors found so far.
+_PY_ENV_INERT = frozenset(
+    {
+        "PYTHONUNBUFFERED", "PYTHONDONTWRITEBYTECODE", "PYTHONIOENCODING", "PYTHONUTF8",
+        "PYTHONHASHSEED", "PYTHONFAULTHANDLER", "PYTHONNOUSERSITE", "PYTHONSAFEPATH",
+        "PYTHONTRACEMALLOC", "PYTHONMALLOC", "PYTHONCOERCECLOCALE", "PYTHONASYNCIODEBUG",
+        "PYTHONDEVMODE", "PYTHONSTARTUP",  # PYTHONSTARTUP: interactive sessions only
+    }
+)
+#: Interpreter flags (before the script) that cannot change which code loads.
+_PY_FLAGS_INERT = frozenset(
+    {"-I", "-P", "-u", "-B", "-E", "-s", "-S", "-O", "-OO", "-q", "-b", "-bb", "-R"}
+)
 #: setuptools' ``distutils-precedence.pth``, byte for byte after strip.
 _DISTUTILS_LINE = (
     "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local')"
@@ -168,6 +208,68 @@ def _dotted_warning_category(argv: tuple[str, ...], env: dict[str, str]) -> bool
     return any("." in (f.split(":") + ["", "", ""])[2] for f in filters)
 
 
+def _host_imports() -> frozenset[str]:
+    """Top-level modules THIS process has imported."""
+    return frozenset(n.split(".", 1)[0] for n in list(sys.modules))
+
+
+def options_unmodelled(argv: tuple[str, ...]) -> bool:
+    """Whether the interpreter options before the script include one these rules
+    do not model: anything but the inert flags, ``-X``/``-W`` (separate or
+    attached; ``-W`` is checked for imports on its own) and the ``-m``/``-c``/``-``
+    terminators. ``-mgenesis`` (attached) or ``--check-hash-based-pycs always``
+    would otherwise shift what is read as the script."""
+    i = 1
+    while i < len(argv) and argv[i].startswith("-"):
+        token = argv[i]
+        if token in ("-m", "-c", "-"):
+            return False
+        if token in _PY_FLAGS_INERT:
+            i += 1
+        elif token in ("-X", "-W"):
+            i += 2
+        elif token.startswith(("-X", "-W")) and len(token) > 2:
+            i += 1
+        else:
+            return True
+    return False
+
+
+def python_env_unmodelled(env: dict[str, str]) -> bool:
+    """Whether ``env`` sets a PYTHON* variable outside the modelled and inert sets."""
+    return any(
+        k.startswith("PYTHON") and k not in _PY_ENV_MODELLED and k not in _PY_ENV_INERT
+        for k in env
+    )
+
+
+def genesis_home_of(env: dict[str, str], file_vals: dict | None = None) -> Path | None:
+    """The Genesis home that process resolves, as ``genesis.env.genesis_home``
+    does: ``GENESIS_HOME``, else ``<HOME>/.genesis``. A proven secrets file's
+    values are laid over the launch env, because the router reload applies them
+    with ``override=True``. None when it cannot be resolved from here."""
+    merged = {**env, **(file_vals or {})}
+    if merged.get("GENESIS_HOME"):
+        return expand_home(merged["GENESIS_HOME"], merged)
+    home = merged.get("HOME")
+    if home is None:
+        import pwd
+
+        home = pwd.getpwuid(os.getuid()).pw_dir  # what Path.home() falls back to
+    return Path(home) / ".genesis" if os.path.isabs(home) else None
+
+
+def same_home(path: Path | None, host_home: Path) -> bool:
+    """Whether ``path`` is the census host's Genesis home: the same file when
+    both exist, else the same real path (a home not created yet)."""
+    if path is None:
+        return False
+    try:
+        return os.path.samefile(path, host_home)
+    except OSError:
+        return os.path.realpath(path) == os.path.realpath(host_home)
+
+
 def _has_dist_metadata(directory: Path) -> bool:
     """Whether ``directory`` holds package metadata. ``importlib.metadata``
     walks every ``sys.path`` entry, and an entry-point plugin loader (pydantic's,
@@ -200,7 +302,10 @@ def _finder_mapping(site: Path, module: str) -> dict | None:
     return None
 
 
-def _pth_verdict(site: Path, name: str, main_src: str, imports: set[str], added: list[str]) -> bool:
+def _pth_verdict(
+    site: Path, name: str, main_src: str, imports: set[str], added: list[str],
+    runtime: frozenset[str] = frozenset(),
+) -> bool:
     """Whether one ``.pth`` file is a known shape that cannot load other genesis
     code. Adds every module it imports to ``imports`` and every directory it puts
     on ``sys.path`` to ``added``."""
@@ -226,6 +331,12 @@ def _pth_verdict(site: Path, name: str, main_src: str, imports: set[str], added:
                 return False
             target = mapping.get("genesis")
             if target is not None and os.path.realpath(target) != os.path.join(main_src, "genesis"):
+                return False
+            # A finder serving a module the server itself imports (the census
+            # host runs the same code, so its imports are that set) redirects
+            # that dependency. Other keys (an unrelated tool's package) cannot
+            # be reached by the server's code.
+            if any(k != "genesis" and k in runtime for k in mapping):
                 return False
             imports.add(module)
             continue
@@ -296,6 +407,10 @@ def interpreter_source(
         reasons.append("python_executable_set")  # makes a venv python run as its base
     if _dotted_warning_category(proc.argv, proc.env):
         reasons.append("warnings_import")
+    if options_unmodelled(proc.argv):
+        reasons.append("interpreter_options_unmodelled")
+    if python_env_unmodelled(proc.env):
+        reasons.append("python_env_unmodelled")
 
     sites = sorted((venv / "lib").glob("python*/site-packages"))
     imports: set[str] = {"genesis", *_CUSTOMIZE}
@@ -313,7 +428,7 @@ def interpreter_source(
             reasons.append("site_packages_ambiguous")
         added: list[str] = []
         for name in names or []:
-            if not _pth_verdict(site, name, main_src, imports, added):
+            if not _pth_verdict(site, name, main_src, imports, added, _host_imports()):
                 reasons.append(f"unknown_pth:{name}")
         # site imports the customize modules from sys.path AFTER the .pth files
         # extend it, so a directory a .pth adds is searched too (main src included:
@@ -426,22 +541,134 @@ def _unchanged_since(path: Path, start: float) -> bool:
     return _links_unchanged_since(path, start) and path.stat().st_ctime < start
 
 
+def _snapshot(path: Path) -> tuple[int, int, int, int]:
+    """The file's identity and state: (device, inode, change time ns, size)."""
+    st = path.stat()
+    return st.st_dev, st.st_ino, st.st_ctime_ns, st.st_size
+
+
+def _read_stable(
+    path: Path, start: float
+) -> tuple[dict[str, str | None], tuple[int, int, int, int]] | None:
+    """The file read ONCE and parsed from that buffer, with the snapshot it was
+    checked against, or None unless the file had the same inode, size and
+    change time before and after the read and no symlink on its path changed
+    since ``start``. Closes the check-then-read race: an edit landing between a
+    change-time check and the parse would otherwise be read as content the check
+    proved, and a digest of it would then be carried indefinitely. A same-size
+    in-place rewrite within one change-time tick is not seen (see the module's
+    residuals)."""
+    from dotenv import dotenv_values
+
+    before = _snapshot(path)
+    text = path.read_text(encoding="utf-8")
+    after = _snapshot(path)
+    if after != before or not _links_unchanged_since(path, start):
+        return None
+    # Raw: interpolating ${VAR} here would use the census's environment, not
+    # that process's. A value that needs it reads as unknown downstream.
+    return dotenv_values(stream=io.StringIO(text), interpolate=False), after
+
+
 def secrets_values(path: Path | None, start: float) -> dict[str, str] | None:
     """The file's values as the process loaded them, or None when that cannot be
-    proven: missing, unreadable, or changed (it or a symlink on its path) since
-    the process started."""
+    proven: missing, unreadable, changed (it or a symlink on its path) since the
+    process started, or changed while being read."""
     if path is None:
         return None
     try:
         if not _unchanged_since(path, start):
             return None
-        from dotenv import dotenv_values
-
-        # Raw: interpolating ${VAR} here would use the census's environment, not
-        # that process's. A value that needs it reads as unknown below.
-        return {k: v for k, v in dotenv_values(path, interpolate=False).items() if v is not None}
+        read = _read_stable(path, start)
+        # The start check runs on the very snapshot the read was checked
+        # against: an edit after `_unchanged_since` but before the read shows here.
+        if read is None or read[1][2] >= int(start * 1e9):
+            return None
+        return {k: v for k, v in read[0].items() if v is not None}
     except Exception:
         return None
+
+
+#: Every secrets.env key the census reads (the switch, `db_paths`,
+#: `genesis_home_of`, `secrets_file`). A proven row records a digest over these
+#: and nothing else, so an edit to any OTHER key leaves a server's census
+#: values exactly as proven.
+CENSUS_SECRET_KEYS = (
+    _SWITCH,
+    "GENESIS_DB_PATH",
+    "GENESIS_REPO_ROOT",
+    "HOME",
+    "GENESIS_HOME",
+    "SECRETS_PATH",
+)
+
+
+def secrets_digest(vals: dict[str, str]) -> str:
+    """A digest of ``vals``' census-relevant keys: sorted ``(key, value)`` pairs,
+    an absent key simply absent. Only the digest is ever written to a row."""
+    pairs = sorted((k, vals[k]) for k in CENSUS_SECRET_KEYS if k in vals)
+    return hashlib.sha256(json.dumps(pairs).encode()).hexdigest()
+
+
+def changed_secrets_values(path: Path | None, start: float) -> dict[str, str] | None:
+    """The file's CURRENT census-relevant values, when its one fault is having
+    changed since ``start``: present, readable, and every symlink on its path
+    older than ``start``. None for any other fault (missing, unreadable, a
+    swapped link), and for a file that has not changed (`secrets_values`
+    proves that one)."""
+    if path is None:
+        return None
+    try:
+        # `_read_stable` checks every symlink on the path after the read.
+        if not path.is_file() or path.stat().st_ctime < start:
+            return None
+        read = _read_stable(path, start)
+        if read is None:
+            return None
+        return {k: v for k in CENSUS_SECRET_KEYS if (v := read[0].get(k)) is not None}
+    except Exception:
+        return None
+
+
+def carry_secrets(
+    path: Path | None,
+    start: float,
+    proven_digest: str | None,
+    *,
+    env: dict[str, str],
+    main_root: Path,
+) -> dict[str, str] | None:
+    """The values a server whose secrets file changed since it started is
+    running with, when that can still be proven: an earlier census row for this
+    same server (pid and start) proved a file whose census-relevant values equal
+    the current file's. Then every load the server can make, at startup or a
+    later router reload, yields exactly these values.
+
+    Refused when the current values could move the secrets file itself: the
+    file names ``SECRETS_PATH`` or ``GENESIS_REPO_ROOT``, or the path derived
+    with its values laid over the launch environment (as a reload's
+    ``expanduser`` sees a ``HOME`` it set) is not this file. A later reload would
+    otherwise read a file nobody proved.
+
+    Residuals, stated:
+    - a server whose startup router build failed reloads lazily at an arbitrary
+      later moment, so a census-key edit REVERTED between two censuses can leave
+      it holding the intermediate value. That needs both a broken startup and an
+      edit-and-revert inside one census interval (about two if a census write
+      crashed, since only the latest row is read);
+    - the model is three writers of a memory server's environment: its launch,
+      the MCP loader and the router reload. litellm's import-time
+      ``load_dotenv()`` (``override=False``, a ``.env`` walked up from its own
+      package) is a fourth that sets only unset keys; this is disproved by any
+      other env writer reachable from a memory server."""
+    if not proven_digest:
+        return None
+    current = changed_secrets_values(path, start)
+    if current is None or "SECRETS_PATH" in current or "GENESIS_REPO_ROOT" in current:
+        return None
+    if secrets_file({**env, **current}, main_root=main_root) != path:
+        return None
+    return current if secrets_digest(current) == proven_digest else None
 
 
 def switch_off(env: dict[str, str], file_vals: dict[str, str] | None) -> bool | None:

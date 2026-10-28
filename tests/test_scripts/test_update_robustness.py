@@ -12,7 +12,7 @@ Findings locked here:
   #3  network calls are bounded: git fetch (timeout), curl health (--max-time
       above the route's own budget), ssh legs (ServerAlive, not a blanket
       timeout that would kill a slow-but-alive redeploy).
-  #8  the pre-update DB snapshot uses sqlite3 `.backup` (consistent), not `cp`
+  #8  the pre-update DB snapshot uses SQLite's online backup API, not `cp`
       of a live WAL database (torn copy).
   #9  a broken migrations module rolls back; only a genuinely-absent one skips.
   #10 the container-specs refresh surfaces the real error, not a blanket
@@ -117,7 +117,7 @@ def test_ssh_legs_bound_dead_links_and_wedged_commands(text: str) -> None:
 
 # ── #8 — consistent DB snapshot ────────────────────────────────────────────
 def test_db_snapshot_uses_backup_not_cp(text: str) -> None:
-    assert 'sqlite3 "$DB_FILE" ".backup \'$DB_FILE.pre-update\'"' in text
+    assert 'reader.backup(target, pages=256)' in text
     assert 'cp "$DB_FILE" "$DB_FILE.pre-update"' not in text
 
 

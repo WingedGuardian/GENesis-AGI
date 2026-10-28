@@ -134,6 +134,122 @@ async def test_real_sdk_http_bounded_send_poll_full_continuation(http_bridge):
         assert "A considered reply" in b.invoker.run_streaming.call_args.args[0].prompt
 
 
+async def _clock_receipt(b, *, started="2026-01-01T00:00:00Z", state="running"):
+    from genesis.db.crud import cc_sessions
+
+    sid = str(uuid4())
+    await cc_sessions.create(
+        b.db, id=sid, session_type="background_task", model="sonnet",
+        started_at=started, last_activity_at=started, source_tag="agent_api",
+        metadata=json.dumps({"peer_id": "alpha", "peer_epoch": b.identities["alpha"].peer["epoch"],
+                             "context_id": str(uuid4()), "native_state": state}),
+    )
+    return sid
+
+
+async def test_status_clock_is_not_a_heartbeat_or_start_order(bridge):
+    identity = bridge.identities["alpha"]
+    old = await _clock_receipt(bridge)
+    newer = await _clock_receipt(bridge, started="2026-02-01T00:00:00Z")
+    before = project(await bridge.service.get(identity, old))["status"]["timestamp"]
+    await bridge.db.execute("UPDATE cc_sessions SET last_activity_at='2026-12-01T00:00:00Z' WHERE id=?", (old,))
+    await bridge.db.commit()
+    assert project(await bridge.service.get(identity, old))["status"]["timestamp"] == before
+    await asyncio.sleep(0.01)
+    await bridge.db.execute(
+        "UPDATE cc_sessions SET status='completed', metadata=json_set(metadata,'$.native_state','succeeded') WHERE id=?",
+        (old,),
+    )
+    await bridge.db.commit()
+    rows, _, _ = await bridge.service.list(identity, 20)
+    assert [r["id"] for r in rows] == [old, newer]
+    assert project(rows[0])["status"]["timestamp"] != before
+
+
+@pytest.mark.parametrize("mutation", ["delete", "update"])
+async def test_issued_task_cursor_survives_anchor_deletion(bridge, mutation):
+    identity = bridge.identities["alpha"]
+    for month in (1, 2, 3):
+        await _clock_receipt(bridge, started=f"2026-{month:02}-01T00:00:00Z")
+        await asyncio.sleep(0.002)
+    rows, token, total = await bridge.service.list(identity, 1)
+    assert total == 3 and token
+    if mutation == "delete":
+        await bridge.db.execute("DELETE FROM cc_sessions WHERE id=?", (rows[0]["id"],))
+    else:
+        await bridge.db.execute(
+            "UPDATE cc_sessions SET status='completed',metadata=json_set(metadata,'$.native_state','succeeded') WHERE id=?",
+            (rows[0]["id"],),
+        )
+    await bridge.db.commit()
+    following, _, total = await bridge.service.list(identity, 20, token)
+    assert total == (2 if mutation == "delete" else 3) and len(following) == 2
+    assert rows[0]["id"] not in {r["id"] for r in following}
+
+
+async def test_approval_transition_clock_is_in_the_task_snapshot(bridge):
+    identity = bridge.identities["alpha"]
+    sid = await _clock_receipt(bridge)
+    before = project(await bridge.service.get(identity, sid))["status"]["timestamp"]
+    await asyncio.sleep(0.01)
+    await bridge.db.execute(
+        "INSERT INTO approval_requests(id,action_type,action_class,description,context) VALUES(?,?,?,?,?)",
+        ("clock-approval", "test", "reversible", "Synthetic hold", json.dumps({"agent_session_id": sid})),
+    )
+    await bridge.db.commit()
+    view = project(await bridge.service.get(identity, sid))
+    assert view["status"]["state"] == "TASK_STATE_AUTH_REQUIRED"
+    assert view["status"]["timestamp"] != before
+    assert view["metadata"]["pendingOwnerActions"] is True
+
+
+async def test_http_list_get_share_approval_snapshot_and_cursor_scope(http_bridge, monkeypatch):
+    b, app, base, _ = http_bridge
+    app.config["GENESIS_CONVERSATION_SERVICE"] = b.service
+    ids = [await _clock_receipt(b) for _ in range(3)]
+    await b.db.execute(
+        "INSERT INTO approval_requests(id,action_type,action_class,description,context) VALUES(?,?,?,?,?)",
+        ("http-clock-hold", "test", "reversible", "Synthetic hold", json.dumps({"agent_session_id": ids[0]})),
+    )
+    await b.db.commit()
+    # The old per-row query must never be used by any task response.
+    monkeypatch.setattr(b.service, "has_pending_approval", AsyncMock(side_effect=AssertionError("split snapshot")))
+    async with sdk_client(base) as (client, _):
+        response = await client.get(base + ROOT + "/tasks", params={"pageSize": 1})
+        assert response.status_code == 200
+        first = response.json()
+        task = first["tasks"][0]
+        got = await client.get(base + ROOT + "/tasks/" + task["id"])
+        assert got.status_code == 200 and got.json()["status"] == task["status"]
+        token = first["nextPageToken"]
+        assert token
+        bad_context = await client.get(base + ROOT + "/tasks", params={"pageToken": token, "contextId": str(uuid4())})
+        assert bad_context.status_code == 400
+        import os
+
+        other = await client.get(base + ROOT + "/tasks", params={"pageToken": token},
+                                 headers={"Authorization": "Bearer " + os.environ["GENESIS_PEER_BETA_TOKEN"]})
+        assert other.status_code == 400
+        await b.registry.grant("alpha", "conversation", "deny")
+        assert (await client.get(base + ROOT + "/tasks", params={"pageToken": token})).status_code == 403
+
+
+@pytest.mark.parametrize("bad", [None, "garbage", "2026-02-30T00:00:00.000Z", "2026-01-01T24:00:00.000Z", "2026-01-01T24:01:00.000Z"])
+@pytest.mark.parametrize("operation", ["get", "list"])
+async def test_incomplete_owned_projection_outside_page_is_not_hidden(bridge, bad, operation):
+    identity = bridge.identities["alpha"]
+    sid = await _clock_receipt(bridge)
+    await _clock_receipt(bridge)
+    await bridge.db.execute("UPDATE cc_sessions SET a2a_status_at=? WHERE id=?", (bad, sid))
+    await bridge.db.commit()
+    with pytest.raises(ConversationRefusal) as refused:
+        if operation == "get":
+            await bridge.service.get(identity, sid)
+        else:
+            await bridge.service.list(identity, 1)
+    assert refused.value.code == "not_ready" and refused.value.status == 503
+
+
 def _fallback_turn(b, tool_turn, monkeypatch):
     from dataclasses import replace
 
@@ -454,7 +570,7 @@ async def test_admission_checks_database_before_taking_write_lock(bridge, monkey
 
     monkeypatch.setattr(bridge.service, "_same_database", checked)
     row = await asyncio.wait_for(bridge.service.send(bridge.identities["alpha"], incoming()), 3)
-    assert checks == 2  # Preflight and the actual admission connection.
+    assert checks == 3  # Preflight, admission, and the committed status re-read.
     monkeypatch.setattr(bridge.service, "_same_database", same_database)
     assert project(await settle(bridge, row))["status"]["state"] == "TASK_STATE_COMPLETED"
 
@@ -851,15 +967,37 @@ async def test_a_send_burst_does_identity_work_only_within_capacity(bridge, monk
 async def test_missing_partial_symlink_and_whole_result_scan(bridge):
     row = await settle(bridge, await bridge.service.send(bridge.identities["alpha"], incoming()))
     path = bridge.home / ".genesis/output" / f"bg-session-{row['id']}.md"
-    path.write_text("benign prefix\n" + json.dumps({"password": "syntheticcredential"}))
+    # A plainly keyed credential is redacted in place; a private path passes.
+    path.write_text("see /home/someone/notes\n" + json.dumps({"password": "syntheticcredential"}))
     meta = json.loads(row["metadata"])
     meta["result_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()  # as committed
     row["metadata"] = json.dumps(meta)
-    with pytest.raises(ConversationRefusal, match="disclosure_refused"):
-        full_result(row)
+    text = full_result(row)
+    assert "syntheticcredential" not in text
+    assert '"password": "[redacted:json_credential]"' in text
+    assert "/home/someone/notes" in text
     meta["output_text"] = path.read_text()
     row["metadata"] = json.dumps(meta)
+    view = project(row)
+    assert "syntheticcredential" not in json.dumps(view)
+    assert view["metadata"]["replyRedacted"] == ["json_credential"]
+    # One the redactor cannot see (an escaped key) still withholds the reply.
+    escaped = "".join(f"\\u{ord(c):04x}" for c in "password")
+    path.write_text('benign prefix\n{"' + escaped + '": "syntheticcredential"}')
+    meta["result_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    meta["output_text"] = path.read_text()
+    row["metadata"] = json.dumps(meta)
+    with pytest.raises(ConversationRefusal, match="disclosure_refused"):
+        full_result(row)
     assert "message" not in project(row)["status"]
+    # Withheld despite a redaction: the redacted pattern names are not disclosed.
+    path.write_text(path.read_text() + "\npassword=syntheticsecondvalue")
+    meta["result_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    meta["output_text"] = path.read_text()
+    row["metadata"] = json.dumps(meta)
+    withheld = project(row)
+    assert withheld["metadata"]["replyError"] == "disclosure_refused"
+    assert "replyRedacted" not in withheld["metadata"]
     other = bridge.home / "external-result"
     path.rename(other)
     path.symlink_to(other)
@@ -1215,8 +1353,9 @@ async def test_non_send_timeout_503_body_is_unchanged(http_bridge, monkeypatch):
         await release.wait()
         return False
 
-    # get_task sets g.peer_task_id before this await, then times out.
-    monkeypatch.setattr(b.service, "has_pending_approval", slow)
+    # The atomic task/approval snapshot now happens inside get(), not a later
+    # per-task approval query. Read timeouts still carry no send receipt ID.
+    monkeypatch.setattr(b.service, "get", slow)
     try:
         async with _peer_client() as client:
             response = await client.get(base + ROOT + f"/tasks/{row['id']}")
@@ -1318,7 +1457,7 @@ async def test_failure_after_commit_names_receipt_on_send_only(http_bridge, monk
     async def broken(*args, **kwargs):
         raise RuntimeError("synthetic projection failure")
 
-    monkeypatch.setattr(b.service, "has_pending_approval", broken)
+    monkeypatch.setattr(b.service, "get", broken)
     payload = message()
     sid = receipt_id(b.identities["alpha"], incoming(payload))
     unchanged = {
@@ -1329,7 +1468,9 @@ async def test_failure_after_commit_names_receipt_on_send_only(http_bridge, monk
         # send() committed the receipt; only the projection afterwards failed.
         sent = await _post(client, base, payload)
         assert sent.status_code == 503 and sent.json() == {**unchanged, "taskId": sid}
-        await settle(b, {"id": sid})
+        task = b.runner._active.get(sid)
+        if task is not None:
+            await asyncio.wait_for(asyncio.shield(task), 3)
         assert await _receipt_count(b) == 1
         # The same generic failure on a read route carries no task id.
         read = await client.get(base + ROOT + f"/tasks/{sid}")

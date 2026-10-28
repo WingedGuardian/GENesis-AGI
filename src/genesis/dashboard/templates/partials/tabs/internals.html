@@ -282,12 +282,15 @@
                 <template x-for="job in $store.genesisDashboard.userJobs.jobs" :key="job.id">
                   <div style="margin-bottom: 0.5rem; padding: 0.4rem 0.5rem; border: 1px solid rgba(255,255,255,0.06); border-radius: 4px; font-size: 0.76rem;">
                     <div style="display: flex; align-items: center; gap: 0.3rem;">
-                      <span class="status-dot" :style="`background: ${job.status === 'active' ? (job.last_status === 'failed' ? '#d9534f' : '#4caf50') : '#888'}`"></span>
+                      <span class="status-dot" :style="`background: ${job.status === 'active' ? (!job.registered ? '#f0ad4e' : (job.last_status === 'failed' ? '#d9534f' : '#4caf50')) : '#888'}`"></span>
                       <strong x-text="job.title" style="font-size: 0.78rem;"></strong>
                       <span style="margin-left: auto; font-size: 0.65rem; opacity: 0.6; font-family: monospace;" x-text="job.cron_expression"></span>
                     </div>
                     <div style="font-size: 0.68rem; opacity: 0.6; margin-top: 0.15rem;">
                       <span x-text="job.profile + ' · ' + job.model"></span>
+                      <template x-if="job.status === 'active' && !job.registered">
+                        <span> · registration pending</span>
+                      </template>
                       <template x-if="job.last_run_at">
                         <span x-text="' · last: ' + new Date(job.last_run_at).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})"></span>
                       </template>
@@ -306,10 +309,10 @@
                           Pause
                         </button>
                       </template>
-                      <template x-if="job.status === 'paused'">
+                      <template x-if="job.status === 'paused' || (job.status === 'active' && !job.registered)">
                         <button @click="$store.genesisDashboard.userJobAction(job.id, 'resume')"
                                 style="font-size: 0.62rem; padding: 0.15rem 0.4rem; border: 1px solid var(--color-border); border-radius: 3px; background: rgba(76,175,80,0.1); cursor: pointer; color: inherit;">
-                          Resume
+                          <span x-text="job.status === 'paused' ? 'Resume' : 'Retry registration'"></span>
                         </button>
                       </template>
                       <button @click="if(confirm('Delete this job?')) $store.genesisDashboard.userJobAction(job.id, 'delete')"

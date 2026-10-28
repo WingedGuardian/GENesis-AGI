@@ -605,6 +605,27 @@ class StreamEvent:
     #: re-implementing the extraction — see ``recognized_blocks``.
     _RECOGNIZED_BLOCKS = ("thinking", "text", "tool_use")
 
+    @property
+    def is_synthetic(self) -> bool:
+        """True for an ``assistant`` line the CLI wrote itself, not the model.
+
+        CC reports a usage limit as an assistant message with one text block
+        ("You've hit your weekly limit ...") whose ``message.model`` is
+        ``"<synthetic>"``; its transcript record also carries
+        ``isApiErrorMessage: true`` and ``error``. That text is a notice about
+        the run, not an answer, so a guard asking "did answer text reach the
+        user?" must not count it. The model check reads the ``message`` object
+        the stream event shares with the transcript record; the two flags are
+        honoured when the line carries them.
+        """
+        raw = self.raw or {}
+        if raw.get("type") != "assistant":
+            return False
+        message = raw.get("message")
+        if isinstance(message, dict) and message.get("model") == "<synthetic>":
+            return True
+        return raw.get("isApiErrorMessage") is True or bool(raw.get("error"))
+
     @staticmethod
     def recognized_blocks(raw: dict) -> int:
         """How many blocks on an ``assistant`` line ``from_raw`` could have used.

@@ -6,7 +6,8 @@ test in this area launched real update orchestrators on the machine running the
 suite. tests/_update_routes_sandbox.py isolates all of it; this test makes using
 it a rule rather than a habit: a module importing the routes either takes the
 ``updates_sandbox`` fixture, calls ``isolate_update_routes`` itself, or is named
-below with the reason it touches nothing.
+below with the reason it touches nothing (or, for the live fence's own tests,
+why it spawns under that fence instead).
 """
 
 from __future__ import annotations
@@ -21,6 +22,14 @@ _TEXT_ONLY = {
     "test_hooks/test_main_checkout_guard.py": "reads UPDATE_TIER_ENV and the template text",
     "test_ui/test_dashboard_e2e.py": "served by tests/test_ui/conftest.py, which calls "
     "isolate_update_routes for every dashboard it builds",
+}
+
+# Modules that spawn through the routes under the live fence on purpose. The
+# sandbox replaces the routes' Popen with a refusal, which would disable the
+# spawn branches these modules exist to replay.
+_FENCE_SPAWNS = {
+    "test_live_fence.py": "replays each spawn branch of the update routes under the "
+    "live fence (tests/_live_fence.py), with the routes' state and log paths in tmp_path",
 }
 
 
@@ -61,7 +70,7 @@ def test_every_importer_uses_the_sandbox():
     missing = []
     for path in _importers():
         rel = path.relative_to(TESTS).as_posix()
-        if rel in _TEXT_ONLY:
+        if rel in _TEXT_ONLY or rel in _FENCE_SPAWNS:
             continue
         text = path.read_text(encoding="utf-8")
         if "updates_sandbox" not in text and "isolate_update_routes" not in text:
@@ -73,9 +82,10 @@ def test_every_importer_uses_the_sandbox():
 
 
 def test_the_text_only_list_is_still_true():
-    """A name on the list that no longer imports the routes is stale."""
+    """A name on either list that no longer imports the routes is stale."""
     found = {p.relative_to(TESTS).as_posix() for p in _importers()}
-    assert set(_TEXT_ONLY) <= found, set(_TEXT_ONLY) - found
+    listed = set(_TEXT_ONLY) | set(_FENCE_SPAWNS)
+    assert listed <= found, listed - found
     # The e2e entry rests on its conftest building every dashboard in the sandbox.
     assert "isolate_update_routes(" in (TESTS / "test_ui" / "conftest.py").read_text()
 

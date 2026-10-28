@@ -11,6 +11,7 @@ import ast
 import inspect
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -34,6 +35,15 @@ def _push_blocked(cmd: str) -> bool:
 
 def _commit_nv(cmd: str) -> bool:
     return any(sp.commit_skips_hooks(s.argv) for s in sp.analyze(cmd))
+
+
+def _nested_blind(program: str, tail: str) -> str:
+    payload = f"""echo "$(echo 'a"b')" ; {program} {tail}"""
+    return "bash -c " + shlex.quote(payload)
+
+
+def _nested_script(script: str) -> str:
+    return "bash -c " + shlex.quote(script)
 
 
 # ── pytest-invocation detection (shared by the test guards) ─────────────
@@ -171,6 +181,106 @@ class TestNesting:
         assert _push_blocked("echo `git push`")
 
 
+def test_nested_tokenization_failure_is_structural_and_withholds_prefix():
+    command = "echo ok; " + _nested_blind("git", "$ACTION origin feature-x")
+    result = sp._analyze_bounded(command)
+    assert result.bound_reason is None
+    assert result.structural_incomplete is True
+    assert result.diagnostic is sp._BLIND_STRUCTURAL
+    assert any(segment.argv == ["echo", "ok"] for segment in sp.analyze(command))
+    segments, blind = sp.analyze_checked(command)
+    assert segments == []
+    assert blind is sp._BLIND_STRUCTURAL
+
+
+def test_root_tokenization_keeps_legacy_non_bounds_behavior():
+    command = "echo 'a"
+    assert sp.untokenizable(command)
+    segments, blind = sp.analyze_checked(command)
+    assert segments
+    assert blind is sp._BLIND_UNTOKENIZABLE
+
+
+def test_nested_continuation_and_built_escape_are_reported():
+    continued = _nested_script("echo ok # don't\ngit pu\\\nsh origin feature-x")
+    _, continuation = sp.analyze_checked(continued)
+    assert continuation is sp._BLIND_CONTINUATION
+
+    escaped = _nested_script("echo ok # don't\ngit $'pu\\x73h' origin feature-x")
+    _, built = sp.analyze_checked(escaped)
+    assert built is sp._BLIND_BUILT_ESCAPE
+
+
+def test_root_legacy_failure_contrasts_with_nested_structural_failure():
+    script = "echo ok # don't\ngit $ACTION origin feature-x"
+    direct = sp._analyze_bounded(script)
+    assert direct.bound_reason is None
+    assert direct.structural_incomplete is False
+    assert sp.analyze_checked(script)[0]
+
+    nested = _nested_script(script)
+    result = sp._analyze_bounded(nested)
+    assert result.structural_incomplete is True
+    assert sp.analyze_checked(nested) == ([], sp._BLIND_STRUCTURAL)
+    assert sp.unresolved_verb_programs(nested) == frozenset({"git"})
+
+
+def test_built_escape_precedence_keeps_structural_recovery():
+    command = "echo $'\\x41'; " + _nested_script(
+        "echo ok # don't\ngit $ACTION origin feature-x"
+    )
+    result = sp._analyze_bounded(command)
+    assert result.diagnostic is sp._BLIND_BUILT_ESCAPE
+    assert result.structural_incomplete is True
+    assert sp.analyze_checked(command) == ([], sp._BLIND_BUILT_ESCAPE)
+    assert sp.unresolved_verb_programs(command) == frozenset({"git"})
+
+
+def test_supported_nested_control_remains_complete():
+    segments, blind = sp.analyze_checked("bash -c 'echo ok; git push origin feature-x'")
+    assert blind is None
+    assert any(segment.exe == "git" for segment in segments)
+
+
+def test_structural_fact_survives_higher_priority_continuation():
+    command = _nested_blind("git", "$ACTION origin feature-x") + " \\\n  echo done"
+    result = sp._analyze_bounded(command)
+    assert result.diagnostic is sp._BLIND_CONTINUATION
+    assert result.structural_incomplete is True
+    assert sp.analyze_checked(command) == ([], sp._BLIND_CONTINUATION)
+
+
+def test_structural_recovery_adds_only_dispatcher_candidates():
+    assert "git" in sp.unresolved_verb_programs(_nested_blind("git", "$ACTION origin feature-x"))
+    assert "git" in sp.unresolved_verb_programs(
+        _nested_blind("g\\\nit", "$ACTION origin feature-x")
+    )
+    assert "gh" in sp.unresolved_verb_programs(
+        _nested_blind("gh", "pr $GH_ACTION --title x --body y")
+    )
+    assert not sp.unresolved_verb_programs("echo 'a git")
+
+
+def test_proven_root_data_body_is_not_reintroduced_for_recovery():
+    command = "cat <<'EOF'\ngit status documentation\nEOF\n" + _nested_blind("printf", "ok")
+    assert sp.excise_data_heredoc(command) is not None
+    result = sp._analyze_bounded(command)
+    assert result.structural_incomplete is True
+    assert "git status documentation" not in result.decision_text
+    assert "git" not in sp.unresolved_verb_programs(command)
+
+
+def test_length_and_depth_bounds_skip_structural_recovery():
+    long_command = "x" * (sp.MAX_COMMAND_CHARS + 1) + " git $ACTION"
+    assert sp.unresolved_verb_programs(long_command) == frozenset()
+
+    nested = "git $ACTION"
+    for _ in range(sp.MAX_SUBSTITUTION_DEPTH + 1):
+        nested = "bash -c " + shlex.quote(nested)
+    assert sp.over_nested(nested)
+    assert sp.unresolved_verb_programs(nested) == frozenset()
+
+
 # ── override binding ────────────────────────────────────────────────────
 
 
@@ -200,15 +310,15 @@ class TestOverride:
 
     def test_independent_sigils_coexist(self):
         # Codex P2: two INDEPENDENT acks must be able to share one trailing comment —
-        # at escalation round 2 a genuine-but-unrecognized audit needs BOTH audit-ack
-        # (Rule 3) and depth-ack (Rule 2.5). Every whitespace token is scanned, so order
-        # is irrelevant and each sigil matches its own token.
+        # a merge commit can need BOTH depth-ack (Rule 2.5) and review-override
+        # (Rule 2). Every whitespace token is scanned, so order is irrelevant and
+        # each sigil matches its own token.
         for cmd in (
-            "git commit -m x # audit-ack depth-ack",
-            "git commit -m x # depth-ack audit-ack",
+            "git commit -m x # review-override depth-ack",
+            "git commit -m x # depth-ack review-override",
         ):
             seg = sp.analyze(cmd)[0].raw
-            assert sp.has_trailing_override(seg, sigil="audit-ack"), cmd
+            assert sp.has_trailing_override(seg, sigil="review-override"), cmd
             assert sp.has_trailing_override(seg, sigil="depth-ack"), cmd
         # Every merge-gate sigil must be in _KNOWN_SIGILS or it ENDS the leading run and
         # silently breaks combined waivers. scheduled-review-override (newest) combined
@@ -240,8 +350,8 @@ class TestOverride:
         seg = sp.analyze("git commit -m x # TODO consider depth-ack later")[0].raw
         assert not sp.has_trailing_override(seg, sigil="depth-ack")
         # a non-sigil token AHEAD of a real sigil ends the run (the sigil is unreachable)
-        seg2 = sp.analyze("git commit -m x # depth-ack-nope audit-ack")[0].raw
-        assert not sp.has_trailing_override(seg2, sigil="audit-ack")
+        seg2 = sp.analyze("git commit -m x # depth-ack-nope review-override")[0].raw
+        assert not sp.has_trailing_override(seg2, sigil="review-override")
 
 
 # ── commit hook-skip flag detection ─────────────────────────────────────
@@ -881,8 +991,8 @@ class TestSigilRunRegression:
     def test_an_unlisted_leading_sigil_no_longer_ends_the_run(self):
         h = sp.has_trailing_override
 
-        assert h("git merge f  # merge-to-main-override audit-ack", "audit-ack")
-        assert h("git merge f  # audit-ack merge-to-main-override", "audit-ack")
+        assert h("git merge f  # merge-to-main-override depth-ack", "depth-ack")
+        assert h("git merge f  # depth-ack merge-to-main-override", "depth-ack")
         assert h("git merge f  # merge-to-main-override", "merge-to-main-override")
 
     def test_prose_still_ends_the_run(self):
@@ -902,7 +1012,7 @@ class TestSigilRunRegression:
 
         The population is ``scripts/**.py``, NOT ``scripts/hooks/*.py``: a
         hooks-only glob misses ``review_enforcement_commit.py``, where
-        ``audit-ack`` and ``depth-ack`` are queried — 2 of the declared sigils,
+        ``review-override`` and ``depth-ack`` are queried — 2 of the declared sigils,
         invisible to a scan that claimed to cover "every hook".
         """
         _DEFAULT_SIGIL = inspect.signature(sp._has_trailing_override).parameters["sigil"].default
@@ -1765,7 +1875,7 @@ def test_heredoc_hidden_suffix_matrix(command, fires, statement, oracle_text):
         assert segments == []
     else:
         assert blind is not sp._BLIND_HEREDOC_BODY
-        assert sp._analyze_bounded(command)[1] != "heredoc"
+        assert not sp._analyze_bounded(command).heredoc_incomplete
 
 
 _HD_MARK = "__SUFFIX_MARK__"
