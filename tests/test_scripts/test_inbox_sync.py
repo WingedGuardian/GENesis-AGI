@@ -793,3 +793,23 @@ def test_symlinked_inbox_root_is_still_walked(tmp_path):
 
     assert _run(env).returncode == 0
     assert not gone.exists(), "a vault deletion was not applied through a symlinked inbox root"
+
+
+def test_duplicate_config_keys_are_refused(tmp_path):
+    """The script trusts sync_config's output only when each key appears exactly
+    once: a value smuggling a second key= line must stop the run."""
+    env, inbox, log, call_log = _setup(tmp_path)
+    liar = tmp_path / "bin" / "lying-python"
+    liar.write_text(
+        "#!/bin/bash\n"
+        f"echo 'remote={_REMOTE}'\n"
+        f"echo 'watch_path={inbox}'\n"
+        "echo 'heartbeat=/tmp/x'\n"
+        "echo 'heartbeat=/tmp/y'\n"
+    )
+    liar.chmod(0o755)
+    env["GENESIS_PYTHON"] = str(liar)
+
+    assert _run(env).returncode == 1
+    assert call_log.read_text() == ""
+    assert "does not carry exactly one heartbeat= line" in log.read_text()

@@ -61,6 +61,15 @@ if [ -z "$REMOTE" ]; then
     fi
     exit 0
 fi
+# Exactly one line per key, or nothing is trusted: a value carrying a newline
+# would otherwise smuggle a second key= line in (sync_config refuses control
+# characters too; this is the script's own check of what it was handed).
+for key in remote watch_path heartbeat; do
+    if [ "$(printf '%s\n' "$CFG" | grep -c "^$key=")" -ne 1 ]; then
+        echo "--- $(_stamp) REFUSED: inbox sync config output does not carry exactly one $key= line ---" >> "$LOG"
+        exit 1
+    fi
+done
 if [ -z "$LOCAL_PATH" ] || [ -z "$HEARTBEAT" ]; then
     echo "--- $(_stamp) REFUSED: inbox sync config incomplete: $(printf '%s' "$CFG" | tr -d '[:cntrl:]') ---" >> "$LOG"
     exit 1

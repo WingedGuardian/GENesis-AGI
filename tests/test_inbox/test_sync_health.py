@@ -20,6 +20,13 @@ from genesis.inbox import sync_health
 from genesis.inbox.sync_health import STALE_AFTER, assess
 
 _NOW = datetime(2026, 10, 28, 18, 0, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def _home_is_tmp(monkeypatch, tmp_path):
+    """The sync's target must sit inside home (sync_config.mirror_target_problem);
+    these tests use watch paths under tmp_path, so home is tmp_path here."""
+    monkeypatch.setenv("HOME", str(tmp_path))
 _REMOTE = "dropbox:Apps/vault"
 
 
@@ -181,3 +188,35 @@ async def test_unreadable_config_raises_an_alert_and_clears_when_fixed(obs_db, m
     hb.write_text(_hb(_iso(datetime.now(UTC))))
     await sync_health.check_inbox_sync_health(obs_db)
     assert await _open_alerts(obs_db) == []
+
+
+async def test_unsafe_watch_path_raises_the_config_alert(obs_db, monkeypatch, tmp_path):
+    """A watch_path the sync refuses must surface as a config alert, not as a
+    misleading 'stale' one."""
+    hb = tmp_path / "inbox_sync.json"
+    monkeypatch.setattr("genesis.inbox.sync_config.heartbeat_path", lambda: hb)
+    monkeypatch.setattr("genesis.inbox.sync_config.load_sync_settings", lambda: (_REMOTE, Path("/")))
+    await sync_health.check_inbox_sync_health(obs_db)
+    [alert] = await _open_alerts(obs_db)
+    assert "cannot be the sync target" in alert["content"]
+
+
+async def test_config_alert_carries_the_exception_type_not_its_text(obs_db, monkeypatch, tmp_path):
+    monkeypatch.setattr("genesis.inbox.sync_config.heartbeat_path", lambda: tmp_path / "hb.json")
+
+    def broken():
+        raise ValueError("line 3: sync_remote: 'secret-ish overlay content'")
+
+    monkeypatch.setattr("genesis.inbox.sync_config.load_sync_settings", broken)
+    await sync_health.check_inbox_sync_health(obs_db)
+    [alert] = await _open_alerts(obs_db)
+    assert "ValueError" in alert["content"]
+    assert "secret-ish" not in alert["content"]
+
+
+async def test_oversized_heartbeat_reads_as_unreadable(obs_db, monkeypatch, tmp_path):
+    hb = _patch(monkeypatch, tmp_path, _REMOTE)
+    hb.write_text(" " * (sync_health._HEARTBEAT_MAX_BYTES + 10))
+    await sync_health.check_inbox_sync_health(obs_db)
+    [alert] = await _open_alerts(obs_db)
+    assert "unreadable" in alert["content"]

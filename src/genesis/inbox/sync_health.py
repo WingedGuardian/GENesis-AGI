@@ -108,37 +108,77 @@ def assess(remote: str, heartbeat_text: str | None, now: datetime) -> list[Probl
     return problems
 
 
+_HEARTBEAT_MAX_BYTES = 64 * 1024  # the real file is ~90 bytes
+
+
+def _read_heartbeat(path) -> str | None:
+    """The heartbeat's text, or None when it is missing, a symlink or not a
+    regular file. Opened without following a symlink, and read bounded: a
+    planted file can neither redirect the read nor exhaust memory."""
+    import os
+
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        import stat
+
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        data = os.read(fd, _HEARTBEAT_MAX_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(data) > _HEARTBEAT_MAX_BYTES:
+        return "{oversized}"  # reads as unreadable, so it is reported
+    return data.decode("utf-8", errors="replace")
+
+
 async def check_inbox_sync_health(db) -> None:
     """Raise or resolve the inbox-sync alerts. Never raises into the tick."""
     if db is None:
         return
     try:
         from genesis.db.crud import observations
-        from genesis.inbox.sync_config import heartbeat_path, load_sync_settings
+        from genesis.inbox.sync_config import (
+            heartbeat_path,
+            load_sync_settings,
+            mirror_target_problem,
+            remote_is_valid,
+        )
 
         now = datetime.now(UTC)
+        config_problem = None
         try:
-            remote, _ = load_sync_settings()
+            remote, watch_path = load_sync_settings()
         except Exception as exc:
             # The sync refuses to run on this too, so it must not be silent:
             # the remote usually lives only in the overlay, and a broken
-            # overlay would otherwise read as "sync off" on both sides.
+            # overlay would otherwise read as "sync off" on both sides. Only
+            # the exception TYPE goes in the alert: a YAML error quotes lines
+            # of the overlay, which the dashboard and digests would then show.
+            logger.warning("inbox sync config unreadable", exc_info=True)
+            config_problem = (
+                f"the inbox config (or its local overlay "
+                f"~/.genesis/config/inbox_monitor.local.yaml) cannot be read "
+                f"({type(exc).__name__}; the server log has the detail)"
+            )
+        else:
+            if remote and not remote_is_valid(remote):
+                config_problem = "inbox_monitor.sync_remote is not a valid rclone remote"
+            elif remote and (why := mirror_target_problem(watch_path)):
+                config_problem = f"inbox_monitor.watch_path cannot be the sync target: {why}"
+        if config_problem:
             problems = [
                 Problem(
                     "config",
                     "high",
-                    "Inbox sync: the inbox config (or its local overlay "
-                    "~/.genesis/config/inbox_monitor.local.yaml) cannot be read "
-                    f"({type(exc).__name__}: {exc}), so the sync is not running. "
-                    "Fix the file; the alert clears on the next tick.",
+                    f"Inbox sync: {config_problem}, so the sync refuses to run. "
+                    "Fix the setting; the alert clears on the next tick.",
                 )
             ]
         else:
-            path = heartbeat_path()
-            text = None
-            if path.is_file() and not path.is_symlink():
-                text = path.read_text(encoding="utf-8", errors="replace")
-            problems = assess(remote, text, now)
+            problems = assess(remote, _read_heartbeat(heartbeat_path()), now)
         active = {p.key for p in problems}
         for p in problems:
             await observations.create(
