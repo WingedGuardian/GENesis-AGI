@@ -689,6 +689,10 @@ _NOT_WIRED = {
     # direction for a gate whose whole measured design property is that it must
     # never become the thing that wedges the work.
     "adopt_first_gate.py": "fail-open by contract — refusing would wedge every edit and plan exit",
+    # plan_premise_gate shares that contract and that matcher: a broken import that
+    # refused would stop every ExitPlanMode until repair, for a check whose worst miss
+    # is a plan presented without its premise answers.
+    "plan_premise_gate.py": "fail-open by contract — refusing would wedge every plan exit",
     # Not a hook at all: the deploy-candidates engine is a command-line program run
     # through scripts/deploy_candidates. Its "return 2" is argparse's usage error,
     # and a failed import exiting 1 is the correct CLI answer ("failed"), not a

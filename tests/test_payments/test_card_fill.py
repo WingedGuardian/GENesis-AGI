@@ -661,7 +661,14 @@ def test_a_ceiling_in_another_currency_is_refused():
     assert e.value.code == "bad_amount_max"
 
 
-
 @pytest.mark.parametrize("text", ["R$ 21.50", "CA$21.50", "HK$21.50", "US$21.50"])
 def test_a_letter_prefixed_dollar_is_its_own_currency(text):
     assert cf.currency(text) != cf.currency("$21.50")
+
+
+def test_a_two_part_code_has_its_own_text_and_the_rest_fall_back():
+    granted = cf.result("page_changed:granted:title")["status"]
+    later = cf.result("page_changed:late:extra_field_failed:city:held")["status"]
+    assert "Nothing was filled" in granted
+    assert "Nothing was filled" not in later and "billing fields may have been typed" in later
+    assert cf.result("field_mismatch:cvc")["status"] == cf.TEXTS["field_mismatch"]
