@@ -1992,9 +1992,9 @@ _HD_HIDES = "tee out.txt <<'EOF'\nx<`\nEOF\n"
 @pytest.mark.parametrize(
     ("command", "expected"),
     [
-        # untokenizable keeps precedence: the discard guard's measured exemption
-        pytest.param(_HD_HIDES + _HD_PUSH + " # don't", "_BLIND_UNTOKENIZABLE",
-                     id="untokenizable-outranks"),
+        # Untokenization cannot exempt independently incomplete substitutions.
+        pytest.param(_HD_HIDES + _HD_PUSH + " # don't", "_BLIND_STRUCTURAL",
+                     id="structural-outranks-untokenizable"),
         pytest.param(_HD_HIDES + _HD_PUSH + " \\\n --tags", "_BLIND_CONTINUATION",
                      id="continuation-outranks"),
         pytest.param(_HD_HIDES + _HD_PUSH + " $'\\x41'", "_BLIND_BUILT_ESCAPE",
@@ -2261,8 +2261,8 @@ def test_heredoc_second_review_reproducers_are_reported(command):
 )
 def test_heredoc_second_review_reproducers_against_bash(command, how, bash_oracle_sandbox):
     """The oracle arm: bash really runs the push (as a statement, or as a substitution
-    in a body it expands, printed under the unquoted ``<<E2``), and the parse does not
-    show it. Parses and prints only (see :func:`_bash_runs_statement_at`)."""
+    in a body it expands, printed under the unquoted ``<<E2``). The checked parse
+    remains withheld. Parses and prints only (see :func:`_bash_runs_statement_at`)."""
     if how == "runs":
         assert _bash_runs_statement_at(command, _HD_G, bash_oracle_sandbox)
     else:
@@ -2274,7 +2274,7 @@ def test_heredoc_second_review_reproducers_against_bash(command, how, bash_oracl
             cwd=str(sandbox / "work"), capture_output=True, text=True, timeout=30,
         ).stdout
         assert "<<E2\n'$(" + _HD_G + ")'\nE2" in out
-    assert not _hd_argv_present(command, _HD_G)
+    assert sp.analyze_checked(command) == ([], sp._BLIND_HEREDOC_BODY)
 
 
 # The third review's class (#3433): the delimiter word runs straight into the backtick
@@ -2298,18 +2298,22 @@ _HD_BACKTICK_WORD = [
 
 
 @pytest.mark.parametrize("command", [pytest.param(c, id=i) for i, c in _HD_BACKTICK_WORD])
-def test_heredoc_word_closed_by_a_backtick_is_reported(command):
+def test_heredoc_word_closed_by_a_backtick_is_visible_or_reported(command):
     segments, blind = sp.analyze_checked(command)
-    assert blind is not None and blind.bounds_induced, blind
-    assert segments == []
+    if blind is not None:
+        assert blind.bounds_induced and segments == []
+    else:
+        assert any(segment.argv == _HD_G.split() for segment in segments)
 
 
 @pytest.mark.parametrize("command", [pytest.param(c, id=i) for i, c in _HD_BACKTICK_WORD])
 def test_heredoc_word_closed_by_a_backtick_against_bash(command, bash_oracle_sandbox):
-    """The oracle arm: bash runs the push as its own statement, and the parse does
-    not show it."""
+    """Bash runs the push as a statement; it must be visible or explicitly withheld."""
     assert _bash_runs_statement_at(command, _HD_G, bash_oracle_sandbox)
-    assert not _hd_argv_present(command, _HD_G)
+    segments, blind = sp.analyze_checked(command)
+    assert (blind is not None and blind.bounds_induced and not segments) or any(
+        segment.argv == _HD_G.split() for segment in segments
+    )
 
 
 def test_heredoc_word_closed_by_a_backtick_with_nothing_after_is_quiet():
@@ -2389,6 +2393,11 @@ _HD_SUBSTITUTION_END = [
 @pytest.mark.parametrize("command", [pytest.param(c, id=i) for i, c in _HD_SUBSTITUTION_END])
 def test_heredoc_ended_inside_a_substitution_is_reported(command):
     segments, blind = sp.analyze_checked(command)
+    if '\n"\n"\n' in command:
+        # Independent quote contexts now retain the complete substitution body.
+        assert blind is None
+        assert any(s.argv == _HD_G.split() and s.depth == 1 for s in segments)
+        return
     assert blind is not None and blind.bounds_induced, blind
     assert segments == []
 
@@ -2405,7 +2414,7 @@ def test_heredoc_ended_inside_a_substitution_against_bash(command, bash_oracle_s
         cwd=str(sandbox / "work"), capture_output=True, text=True, timeout=30,
     ).stdout
     assert "\nEOF\n\n" + _HD_G in out
-    assert not _hd_argv_present(command, _HD_G)
+    assert _hd_argv_present(command, _HD_G) == ('\n"\n"\n' in command)
 
 
 # The message idiom stays smooth where it is provably inert: a quoted delimiter, its
@@ -2413,18 +2422,21 @@ def test_heredoc_ended_inside_a_substitution_against_bash(command, bash_oracle_s
 # `cd … &&` prefix keeps the excision (a narrower, older relief) out of the way, so
 # these exercise the exemption itself. A `)` or an apostrophe in the body is what
 # made the extractor cut the script short.
-_HD_IDIOM_BODIES = ["1) first\n2) second", "it's (done", "plain)", "a)\nb)\nc)"]
+_HD_IDIOM_BODIES = [
+    ("1) first\n2) second", None), ("it's (done", sp._BLIND_STRUCTURAL),
+    ("plain)", None), ("a)\nb)\nc)", None),
+]
 
 
-@pytest.mark.parametrize("body", _HD_IDIOM_BODIES)
+@pytest.mark.parametrize("body,expected", _HD_IDIOM_BODIES)
 @pytest.mark.parametrize("receiver", [
     "cd sub && " + _HD_COMMIT + " -q -m",
     "cd sub && gh pr create --title t --body",
     _HD_GIT + " -C sub com" + "mit -m",
 ])
-def test_quoted_message_idiom_cut_by_the_extractor_is_exempt(receiver, body):
+def test_quoted_message_idiom_requires_a_proven_outer_boundary(receiver, body, expected):
     command = f"{receiver} \"$(cat <<'EOF'\n{body}\nEOF\n)\""
-    assert sp.analyze_checked(command)[1] is None
+    assert sp.analyze_checked(command)[1] is expected
 
 
 @pytest.mark.parametrize(
@@ -2444,13 +2456,13 @@ def test_quoted_message_idiom_exemption_is_narrow(command, why):
     assert sp.analyze_checked(command)[1] is sp._BLIND_HEREDOC_BODY, why
 
 
-def test_quoted_message_idiom_exemption_holds_when_the_extractor_overruns():
+def test_quoted_message_idiom_refuses_when_the_extractor_overruns():
     """An apostrophe in the body sends the extractor PAST the closing paren, so the
-    script it hands the parse holds the terminator and then outer text. The body's
-    real end and the paren after it are read in the outer text all the same."""
+    script it hands the parse holds the terminator and then outer text. Proving
+    the body inert cannot establish completeness of that enclosing parse."""
     command = ("cd sub && " + _HD_COMMIT
                + " -q -m \"$(cat <<'EOF'\nthe container's key\nEOF\n)\" f.py")
-    assert sp.analyze_checked(command)[1] is None
+    assert sp.analyze_checked(command) == ([], sp._BLIND_STRUCTURAL)
 
 
 @pytest.mark.parametrize(

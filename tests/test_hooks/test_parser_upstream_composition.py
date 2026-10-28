@@ -67,7 +67,9 @@ def test_accepted_complex_heredoc_structural_refusals(parser, prefix, body):
     # Owner-approved residue: valid inert data outside the canonical narrow proof
     # remains explicitly refused, never mistaken for a complete executable parse.
     command = 'echo "$(' + prefix + " <<'EOF'\n" + body + '\nEOF\n)"'
-    assert parser.analyze_checked(command) == ([], parser._BLIND_STRUCTURAL)
+    # Keeping the partial body's final byte preserves the quote; the heredoc
+    # boundary, not a synthetic tokenization error, now explains the refusal.
+    assert parser.analyze_checked(command) == ([], parser._BLIND_HEREDOC_BODY)
 
 
 @pytest.mark.parametrize('decoded', [False, True])
