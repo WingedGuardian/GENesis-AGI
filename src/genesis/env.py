@@ -249,6 +249,17 @@ def boundary_key_path() -> Path:
     return genesis_home() / "boundary_key"
 
 
+def mcp_credentials_dir() -> Path:
+    """Directory of the shared MCP service's caller credentials (``~/.genesis/mcp_credentials``).
+
+    Holds the static forwarder secret and one credential per external-client
+    profile, each mode 0600 in a 0700 directory. Written only by
+    ``genesis.caller_credentials.ensure_caller_credentials`` and read only by
+    its resolver. Composed from ``genesis_home()`` so tests redirect it.
+    """
+    return genesis_home() / "mcp_credentials"
+
+
 def internal_api_token_path() -> Path:
     """Path to the persistent internal API token (generated once at server boot).
 
