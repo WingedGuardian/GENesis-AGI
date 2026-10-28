@@ -1,6 +1,7 @@
 """Tests for the outreach pipeline orchestrator."""
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import aiosqlite
@@ -623,8 +624,10 @@ async def test_email_subject_reaches_mime_header(config, db, monkeypatch, approv
             "validated_recipient": "recipient@example.com",
         }, subject=topic)
     else:
+        # The topic is an internal key, never the subject: only email_subject is.
         result = await pipe.submit(OutreachRequest(
-            category=OutreachCategory.NOTIFICATION, topic=topic,
+            category=OutreachCategory.NOTIFICATION, topic="internal topic, not a subject",
+            email_subject=topic or None,
             context="The complete message body.", salience_score=1.0,
             channel="email", validated_recipient="recipient@example.com", verbatim=True,
         ))
@@ -1464,3 +1467,108 @@ async def test_missing_recipient_still_defers(
         "a missing recipient is recoverable and must stay retriable"
     )
     mock_deferred.enqueue.assert_called_once()
+
+
+def _smtp_pipe(monkeypatch, config, db, drafter):
+    from genesis.channels.email_adapter import EmailAdapter
+    from genesis.content.formatter import ContentFormatter
+
+    smtp = MagicMock()
+    smtp_class = MagicMock()
+    smtp_class.return_value.__enter__.return_value = smtp
+    monkeypatch.setattr("genesis.channels.email_adapter.smtplib.SMTP_SSL", smtp_class)
+    adapter = EmailAdapter("smtp.invalid", 465, "user", "password", "sender@example.com")
+    pipe = OutreachPipeline(
+        GovernanceGate(config, db), drafter, ContentFormatter(), {"email": adapter},
+        db=db, config=config,
+    )
+    return pipe, smtp
+
+
+def _sent_subject(smtp):
+    from email import policy
+    from email.parser import BytesParser
+
+    message = BytesParser(policy=policy.default).parsebytes(
+        smtp.send_message.call_args.args[0].as_bytes(policy=policy.SMTP),
+    )
+    return str(message["Subject"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("given", "expected"), [
+    ("Weekly backup report", "Weekly backup report"),
+    (None, "Message from Genesis"),  # safety net only: never the body
+])
+async def test_an_email_is_sent_with_its_authors_subject(config, db, monkeypatch, given, expected):
+    pipe, smtp = _smtp_pipe(monkeypatch, config, db, None)
+    result = await pipe.submit(OutreachRequest(
+        category=OutreachCategory.NOTIFICATION, topic="The backup finished overnight and",
+        email_subject=given,
+        context="The backup finished overnight and all checks passed.", salience_score=1.0,
+        channel="email", validated_recipient="recipient@example.com", verbatim=True,
+    ))
+    assert result.status == OutreachStatus.DELIVERED
+    assert _sent_subject(smtp) == expected
+
+
+@pytest.mark.asyncio
+async def test_the_drafter_is_never_asked_to_name_an_email(config, db, monkeypatch):
+    drafter = MagicMock()
+    drafter.draft = AsyncMock()
+    pipe, _ = _smtp_pipe(monkeypatch, config, db, drafter)
+    await pipe.submit(OutreachRequest(
+        category=OutreachCategory.NOTIFICATION, topic="t", context="Body.", salience_score=1.0,
+        channel="email", validated_recipient="recipient@example.com", verbatim=True,
+    ))
+    drafter.draft.assert_not_awaited()
+    assert not [c for c in drafter.method_calls if "subject" in c[0]]
+
+
+@pytest.mark.asyncio
+async def test_resume_sends_the_approved_subject(config, db, monkeypatch):
+    pipe, smtp = _smtp_pipe(monkeypatch, config, db, None)
+    result = await pipe.deliver_approved({
+        "category": "notification", "message": "Body.",
+        "validated_recipient": "recipient@example.com",
+    }, subject="Try Genesis")
+    assert result.status == OutreachStatus.DELIVERED
+    assert _sent_subject(smtp) == "Try Genesis"
+
+
+@pytest.mark.asyncio
+async def test_a_deferred_email_keeps_its_subject(config, db, mock_formatter):
+    failing = AsyncMock()
+    failing.send_message.side_effect = ConnectionError("Network down")
+    deferred = AsyncMock()
+    deferred.has_open = AsyncMock(return_value=False)
+    pipe = OutreachPipeline(
+        governance=GovernanceGate(config, db), drafter=None, formatter=mock_formatter,
+        channels={"email": failing}, deferred_queue=deferred, db=db, config=config,
+        recipients={"email": "recipient@example.com"},
+    )
+    await pipe.submit(OutreachRequest(
+        category=OutreachCategory.NOTIFICATION, topic="t", email_subject="Try Genesis",
+        context="Body.", salience_score=1.0, channel="email", verbatim=True,
+        validated_recipient="recipient@example.com",
+    ))
+    payload = json.loads(deferred.enqueue.call_args.kwargs["payload"])
+    assert payload["email_subject"] == "Try Genesis"
+
+
+@pytest.mark.asyncio
+async def test_a_quarantined_subject_is_refused_before_the_approval_gate(config, db, monkeypatch):
+    pipe, smtp = _smtp_pipe(monkeypatch, config, db, None)
+    held = MagicMock()
+    held.check = AsyncMock()
+    pipe.set_autonomy_gate(held)
+    result = await pipe.submit(OutreachRequest(
+        category=OutreachCategory.NOTIFICATION, topic="t",
+        email_subject="key sk-abcdefghij1234567890ABCDXYZ",
+        context="Body.", salience_score=1.0, channel="email", verbatim=True,
+        validated_recipient="recipient@example.com",
+    ))
+    assert result.status == OutreachStatus.FAILED
+    assert result.error == "Subject scan quarantine"
+    held.check.assert_not_called()
+    smtp.send_message.assert_not_called()

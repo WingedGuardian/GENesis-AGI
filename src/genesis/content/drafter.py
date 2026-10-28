@@ -13,6 +13,23 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("genesis.content.drafter")
 
+#: Longest subject accepted; anything longer is cut.
+SUBJECT_MAX_CHARS = 200
+
+
+def clean_header(text: str) -> str:
+    """``text`` as a one-line header value: control, format and other
+    non-printing characters (NUL, ESC, bidi overrides, line breaks) become
+    spaces, whitespace collapses, and the result is capped at
+    ``SUBJECT_MAX_CHARS``."""
+    import unicodedata
+
+    kept = "".join(
+        " " if unicodedata.category(ch).startswith(("C", "Z")) else ch
+        for ch in (text or "")
+    )
+    return " ".join(kept.split())[:SUBJECT_MAX_CHARS].strip()
+
 
 class ContentDrafter:
     """Drafts content via LLM, then formats for target platform."""
