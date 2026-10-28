@@ -144,6 +144,26 @@ SPELLED_DENIED = [
 ]
 
 
+# Owner 2026-10-28 (honest-mistake scope): the main checkout's .git, and files an
+# HTTP client saves, are outputs under the same rule as any shell redirect.
+OUTPUT_DENIED = [
+    'echo x > {main}/.git/config', 'echo x >> {main}/.git/HEAD', 'true > {main}/.git/hooks/fixture',
+    'curl -o {main}/README https://example.test/x', 'curl --output={main}/data/fixture.db https://example.test/x',
+    'curl -o {main}/.git/config https://example.test/x',
+    'wget -O {main}/README https://example.test/x', 'wget --output-document={home}/.codex/config.toml https://example.test/x',
+    'wget -o {main}/README https://example.test/x', 'wget --output-file={main}/README https://example.test/x',
+    'wget -P {main}/data https://example.test/fixture.db', 'wget -P {main}/.git/hooks https://example.test/pre-commit',
+    # A relative save after a directory change has no proven directory, as for redirects.
+    'cd {scratch} && curl -o page.html https://example.test/x',
+]
+
+
+@pytest.mark.parametrize('command', OUTPUT_DENIED)
+def test_saved_and_git_metadata_outputs_are_denied(role, command):
+    with pytest.raises(role[0].Refused, match='protected or unresolved'):
+        check(role, command)
+
+
 def test_linked_worktree_under_the_runtime_root_is_not_a_validator_workspace(role):
     """Validator workspaces sit outside the runtime root, so a worktree under it is not theirs."""
     module, paths = role
@@ -190,6 +210,10 @@ def test_spelled_role_operations_are_denied(role, command):
     'python -m genesis handoffs list', 'python -m genesis.hostmetrics status',
     'python -m genesis.hostmetrics run --name fixture --ram 1 --cpu 100 -- python -m pytest -q',
     'systemctl --user status genesis-fixture -l',
+    'curl -o {scratch}/page.html https://example.test/x', 'curl -o - https://example.test/x',
+    'wget -O {scratch}/page.html https://example.test/x', 'wget -qO- https://example.test/x',
+    'cat {main}/.git/HEAD', 'git -C {main} log -1', 'cat {main}/.git/HEAD > {scratch}/head',
+    'wget -P {scratch} https://example.test/page.html',
     *['git ' + read for read in ('branch', 'branch --show-current', 'branch -a', 'branch --list "fix*"',
                                  'tag', 'tag --list', 'remote', 'remote -v', 'remote get-url origin',
                                  'worktree list', 'stash list', 'config --get user.name', 'config --list')],

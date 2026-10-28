@@ -175,10 +175,12 @@ Git `-C` can recover a directory only when filesystem/repository selection is
 otherwise known. Ambiguous cwd-sensitive writes refuse; use a new anchored call
 or a proven absolute operation target.
 
-Direct shell output cannot target tracked main files, the qualified guard tree,
-main `data/`, local Genesis config or top-level database sidecars, either client's
-config, `$CODEX_HOME`, or a `secrets.env` basename. Both logical target names and
-canonical destinations retain protection through static root or file symlinks.
+Direct shell output, and a file `curl` (`-o`) or `wget` (`-O`, `-o`, `-P`)
+saves, cannot target tracked main files, the main checkout's `.git`, the
+qualified guard tree, main `data/`, local Genesis config or top-level database
+sidecars, either client's config, `$CODEX_HOME`, or a `secrets.env` basename.
+Both logical target names and canonical destinations retain protection through
+static root or file symlinks.
 Existing scratch-only patch
 checks cover patches. SQLite calls against protected store paths require an exact
 `file:…?mode=ro` URI, and visible write keywords refuse. Keyword-bearing SQL can

@@ -106,7 +106,7 @@ def _protected(target, git):
     state = home / '.genesis'
     roots = [ROOT / 'data', state / 'config', home / '.claude', home / '.codex',
              Path(os.environ.get('CODEX_HOME', str(home / '.codex'))),
-             ROOT / 'scripts/hooks', ROOT / '.claude/hooks',
+             ROOT / '.git', ROOT / 'scripts/hooks', ROOT / '.claude/hooks',
              RUNTIME_ROOT / 'scripts/hooks', RUNTIME_ROOT / '.claude/hooks']
     if (any(p.name == 'secrets.env' for p in (target, canonical))
             or any(target.is_relative_to(Path(os.path.abspath(p))) or canonical.is_relative_to(p.resolve()) for p in roots)
@@ -129,9 +129,15 @@ def _outputs(segment, context, git):
         # A quoted tilde is literal; leave it relative instead of expanding HOME.
         if raw.startswith(('\"', "'")) and value.startswith('~'):
             value = './' + value
-        target = _path(value, context.directory, home_unknown=context.home_unknown, resolve=False)
-        if not context.namespace or target is None or _protected(target, git):
-            raise Refused('Validator output targets a protected or unresolved path')
+        _check_output(value, context, git)
+
+
+def _check_output(value, context, git):
+    # One rule for every file the shell or a program writes: a resolvable,
+    # unprotected path in a known namespace.
+    target = _path(value, context.directory, home_unknown=context.home_unknown, resolve=False)
+    if not context.namespace or target is None or _protected(target, git):
+        raise Refused('Validator output targets a protected or unresolved path')
 
 
 _COMMANDS = None
@@ -405,18 +411,30 @@ def _processes(segment):
         raise Refused('Validators cannot signal Genesis processes')
 
 
-def _network(segment):
+def _network(segment, context, git):
     curl = segment.exe == 'curl'
     short = 'X:d:H:o:A:u:e:x:F:T:m:sb:IhLvGkqfS' if curl else 'O:qo:U:T:t:SP:'
     long = ('request= data= data-raw= data-binary= data-urlencode= json= form= upload-file= '
             'header= output= user-agent= user= referer= proxy= max-time= connect-timeout= '
             'url= cookie= get head silent show-error fail fail-with-body insecure location compressed '
             'retry= write-out=' if curl else 'method= post-data= post-file= body-data= body-file= '
-            'header= output-document= quiet timeout= tries= user-agent= spider no-check-certificate')
+            'header= output-document= output-file= directory-prefix= quiet timeout= tries= user-agent= spider '
+            'no-check-certificate')
     try:
         options, urls = getopt.gnu_getopt(segment.argv[1:], short, long.split())
     except getopt.GetoptError as exc:
         raise Refused('Unclassified HTTP client options') from exc
+    # A file the client saves (body, wget log) is an output like a shell redirect.
+    saved = {'-o', '--output'} if curl else {'-O', '--output-document', '-o', '--output-file'}
+    for value in (v for k, v in options if k in saved and v != '-'):
+        _check_output(value, context, git)
+    # wget -P saves each URL's file under a directory: check the directory and
+    # the file it would create there.
+    for directory in (v for k, v in options if not curl and k in {'-P', '--directory-prefix'}):
+        _check_output(directory, context, git)
+        for url in urls:
+            name = urlsplit(url if '://' in url else 'http://' + url).path.rsplit('/', 1)[-1]
+            _check_output(directory.rstrip('/') + '/' + (name or 'index.html'), context, git)
     methods = [v.upper() for k, v in options if k in {'-X', '--request', '--method'}]
     data = any(k in {'-d', '--data', '--data-raw', '--data-binary', '--data-urlencode',
                     '--post-data', '--post-file', '--body-data', '--body-file'} for k, _ in options)
@@ -517,7 +535,7 @@ def check_command(command, cwd):
         elif name in {'kill', 'pkill'}:
             _processes(segment)
         elif name in {'curl', 'wget'}:
-            _network(segment)
+            _network(segment, program, git)
         elif name == 'sqlite3':
             _sqlite(segment, program, command)
         elif name == 'systemd-run':
