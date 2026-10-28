@@ -342,7 +342,7 @@ async def test_a_task_path_linked_to_another_worktree_is_not_registered(repo):
 
 @pytest.mark.parametrize(
     "registration",
-    ["clean-removal", "real-prunable", "unlocked-stale"],
+    ["clean-removal", "real-prunable", "unlocked-stale", "wrong-branch", "detached"],
 )
 @pytest.mark.asyncio
 async def test_cleanup_retains_unpushed_commit_as_recoverable_ref(
@@ -364,6 +364,12 @@ async def test_cleanup_retains_unpushed_commit_as_recoverable_ref(
     if registration == "clean-removal":
         await worktree_mgr.cleanup_worktree(wt, repo)
     else:
+        if registration in ("wrong-branch", "detached"):
+            checkout = (
+                ["-b", "task/other", "main"]
+                if registration == "wrong-branch" else ["--detach", "main"]
+            )
+            subprocess.run(["git", "-C", str(wt), "checkout", "-q", *checkout], check=True)
         shutil.rmtree(wt)
         real_records = worktree_mgr._worktree_records
         records = await real_records(repo)
@@ -399,6 +405,16 @@ async def test_cleanup_retains_unpushed_commit_as_recoverable_ref(
         check=True,
     )
     subprocess.run(["git", "-C", str(repo), "gc", "--prune=now"], check=True)
+
+    if registration in ("wrong-branch", "detached"):
+        records = await worktree_mgr._worktree_records(repo)
+        stale = worktree_mgr._listed_record(records, wt)
+        assert stale is not None and "prunable" in stale and "locked" not in stale
+        assert stale.get("branch") == (
+            "refs/heads/task/other" if registration == "wrong-branch" else None
+        )
+        assert ("detached" in stale) == (registration == "detached")
+        assert await worktree_mgr.branch_tip(f"task/{TASK[:8]}", repo) == tip
 
     recovered = await worktree_mgr.create_worktree(
         TASK, repo, base, require_existing=True,

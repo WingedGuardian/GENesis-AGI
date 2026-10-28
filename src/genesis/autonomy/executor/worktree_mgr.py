@@ -248,7 +248,13 @@ async def create_worktree(
                 "the previous worktree is locked; unlock it or remove it by hand",
             )
         ref = f"refs/heads/{branch}"
-        if record.get("branch") != ref:
+        missing_prunable = (
+            tip is not None
+            and "prunable" in record
+            and not wt_path.exists()
+            and not wt_path.is_symlink()
+        )
+        if record.get("branch") != ref and not missing_prunable:
             raise _task_stale(
                 task_id,
                 branch,
