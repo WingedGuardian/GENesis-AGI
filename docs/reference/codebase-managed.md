@@ -460,7 +460,31 @@ runtime. Current-install tests are not a separate Python 3.10 runtime qualificat
 
 ## Queued indexing
 
-The existing idle-gated runner probes managed availability before and after
+Automatic consumption is paused while the queue protocol is incomplete. The
+runner holds its ordinary lock, then observes readiness before reconciliation,
+listing, claiming or invoking a provider. Missing, legacy and incomplete queues
+defer with exit 0, logged as a paused tick, so the unit does not read as failed
+while the pause is expected. Unsupported metadata, observation failures and a
+crashed or unreadable readiness helper stop with exit 76, as does a helper that
+reports ready (this protocol has no ready state yet); lock failures and a
+missing entrypoint or helper file still defer with exit 75. This binary never reports automatic readiness, including if
+a readiness value is manually changed. There is no setter or environment bypass.
+
+Explicit enqueue and queue APIs retain their schema-2 behavior. The observer can
+read known schema-3 metadata without upgrading or importing it; the writer still
+refuses a schema newer than 2. `python3 scripts/lib/index_marker.py automatic-ready`
+is read-only and returns the dedicated status 10 for an incomplete protocol or
+status 2 for an observation error. Queue-operation exceptions raised from `main()`
+also return 2. Status 10 is reserved so that an interpreter crash (status 1) is
+never mistaken for the expected pause; the runner treats any other status as a
+failure. The runner discards the observer's JSON, so read the current state
+with `python3 scripts/lib/index_marker.py automatic-ready`. `import-status`
+keeps its schema-2 receipt contract and refuses a schema-3 queue.
+Later provider storage, checked
+consumption and resource-failure safeguards must land before automatic work can
+resume; that readiness does not authorize lifting a freeze or disable sentinel.
+
+The retained idle-gated consumer probes managed availability before and after
 claiming a Codebase-only request. Unavailability leaves the pending generation
 uncharged; a post-claim refusal durably restores it. A combined request can
 complete GitNexus and requeue its unfinished Codebase leg before consuming the
@@ -525,13 +549,15 @@ or fix the runner's separate list/claim error handling tracked in #2043.
 
 ## Verification
 
-The runner's SQLite contention fixture verifies actual outcome replay: after
-the fixture locker releases the ordinary runner lock, a real recovery tick
-must retire pending, inflight and failure records and the outcome spool while
-calling the fake provider only once. An empty pending list or a successful
-lock-busy no-op does not prove completion. The fixture also bounds its locker
-readiness wait. These tests use an isolated home and fake provider; they do not
-qualify production indexing or explain a separate first-tick timeout.
+The transitional SQLite contention fixture explicitly drives real claim,
+fake-provider, durable outcome-spool and CLI reconciliation paths. After the
+locker releases the ordinary runner lock, reconciliation must retire pending,
+inflight, failure and spool state while showing only one provider call. Actual
+automatic ticks separately prove refusal without changing queue bytes. Explicit
+CLI replay is not automatic-dispatch acceptance. An empty pending list or a
+successful lock-busy no-op does not prove completion. The fixture bounds its
+locker readiness wait. These tests use an isolated home and fake provider; they
+do not qualify production indexing or explain a separate first-tick timeout.
 
 The configuration test suite uses synthetic paths and fixtures. Native staging
 acceptance explicitly opts in to the independently pinned release binary:

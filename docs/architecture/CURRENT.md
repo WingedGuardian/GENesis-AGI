@@ -1684,6 +1684,11 @@ the shared banner is not an assertion about all concurrent sessions.
   observes receipt totals without initialization or migration. This does not
   implement persistent resource quarantine or the runner's separate list/claim
   error propagation.
+  A read-only protocol observer now fences automatic consumption before any
+  reconciliation, list, claim or provider call. Explicit queue APIs still write
+  schema 2; observing known schema-3 metadata does not upgrade it. The observer
+  exposes no positive readiness result or setter; later protocol work and the
+  separate activation gates remain required.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
   deletions; native query/client cgroup proof and orphan-scope checks precede
