@@ -45,6 +45,22 @@ def _proc(
         (d / "fd" / str(i)).symlink_to(target)
 
 
+@pytest.fixture(autouse=True)
+def _host_home_as_a_homeless_process_resolves_it(monkeypatch):
+    """The fixture processes carry no HOME, so their Genesis home falls back to
+    the passwd entry, as ``Path.home()`` does. The census host's own home comes
+    from ``genesis_home()``, which under the live closure's private test HOME is
+    another directory, so every such process would read as running another
+    home. Pin the host's home to the one those processes resolve, as it is
+    outside a test run; compared by stat only, never read or written."""
+    import pwd
+
+    import genesis.env
+
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir) / ".genesis"
+    monkeypatch.setattr(genesis.env, "genesis_home", lambda: home)
+
+
 @pytest.fixture
 def proc_root(tmp_path) -> Path:
     root = tmp_path / "proc"
