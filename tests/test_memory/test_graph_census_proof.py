@@ -723,3 +723,66 @@ def test_code_read_from_stdin_is_not_the_named_script(tree):
     main = tree["main"]
     argv = [str(main / ".venv" / "bin" / "python"), "-", str(main / "scripts" / "genesis_mcp_server.py")]
     assert _source(tree, _proc(tree, argv=argv)) == ["script_not_absolute"]
+
+
+# ── round 3 (#3510): allowlists, the Genesis home, finders ────────────────
+
+
+@pytest.mark.parametrize(
+    "opts",
+    [['-mgenesis'], ["--check-hash-based-pycs", "always"], ["-uB"], ["--"]],
+)
+def test_an_interpreter_option_outside_the_allowlist_is_unknown(tree, opts):
+    """An option these rules do not model can shift what reads as the script."""
+    main = tree["main"]
+    argv = [str(main / ".venv" / "bin" / "python"), *opts, str(main / "scripts" / "genesis_mcp_server.py")]
+    assert "interpreter_options_unmodelled" in _source(tree, _proc(tree, argv=argv))
+
+
+@pytest.mark.parametrize("opts", [["-I"], ["-P"], ["-u", "-B"], ["-X", "dev"], ["-Xdev"], ["-O"]])
+def test_allowlisted_interpreter_options_pass(tree, opts):
+    """Every flag the repo's own launch sites use (measured: -I, -P, -X, -O)."""
+    main = tree["main"]
+    argv = [str(main / ".venv" / "bin" / "python"), *opts, str(main / "scripts" / "genesis_mcp_server.py")]
+    assert _source(tree, _proc(tree, argv=argv)) == []
+
+
+def test_an_unmodelled_python_variable_is_unknown(tree):
+    proc = _proc(tree, env={"PYTHONPYCACHEPREFIX": "/elsewhere"})
+    assert _source(tree, proc) == ["python_env_unmodelled"]
+
+
+def test_inert_python_variables_pass(tree):
+    proc = _proc(tree, env={"PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1"})
+    assert _source(tree, proc) == []
+
+
+def test_a_finder_redirecting_a_module_the_server_imports_is_unknown(tree, monkeypatch):
+    """The census host runs the same code, so its imports are the server's."""
+    monkeypatch.setattr(proof, "_host_imports", lambda: frozenset({"anomaly_detector"}))
+    assert _source(tree, _proc(tree)) == ["unknown_pth:__editable__.cloudsleuth-0.1.0.pth"]
+
+
+def test_a_finder_for_a_module_the_server_never_imports_passes(tree, monkeypatch):
+    monkeypatch.setattr(proof, "_host_imports", lambda: frozenset({"json"}))
+    assert _source(tree, _proc(tree)) == []
+
+
+def test_the_genesis_home_is_resolved_as_genesis_env_resolves_it(tmp_path):
+    home = tmp_path / "u"
+    assert proof.genesis_home_of({"HOME": str(home)}) == home / ".genesis"
+    assert proof.genesis_home_of({"HOME": str(home), "GENESIS_HOME": "~/alt"}) == home / "alt"
+    # A proven secrets file's value wins: the router reload applies it with override.
+    assert proof.genesis_home_of({"HOME": str(home)}, {"GENESIS_HOME": "/x"}) == Path("/x")
+    assert proof.genesis_home_of({"GENESIS_HOME": "relative"}) is None
+
+
+def test_same_home_compares_files_or_real_paths(tmp_path):
+    a = tmp_path / "home"
+    a.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(a)
+    assert proof.same_home(link, a)
+    assert proof.same_home(tmp_path / "not-yet", tmp_path / "not-yet")  # neither exists
+    assert not proof.same_home(tmp_path / "other", a)
+    assert not proof.same_home(None, a)

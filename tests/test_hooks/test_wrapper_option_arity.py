@@ -395,6 +395,7 @@ def _parser_arity(tool: str) -> dict[str, str]:
     return _getopt_arity(head)
 
 
+@pytest.mark.real_tool("sudo")  # reads each installed wrapper's own --help
 class TestTableAgreesWithTheToolsThemselves:
     """Re-derive arity from each installed tool and fail on the FAIL-OPEN direction.
 

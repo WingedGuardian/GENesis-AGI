@@ -2,8 +2,8 @@
 
 The closed event set lives here, not in a CHECK constraint (see the migration's
 docstring). ``detail`` is value-free by contract: who asked (pid, start time,
-process names) and why a request was refused, never a card value or the
-passphrase. Rows are kept forever.
+process names) and why a request was refused, never a card value or a key.
+Rows are kept forever.
 """
 
 from __future__ import annotations
@@ -17,6 +17,11 @@ EVENTS = frozenset(
     {
         "service_start",
         "service_stop",
+        # The key read from identity.key (vault_service.ensure_key).
+        "key_loaded",
+        "key_load_refused",
+        "key_dropped",
+        # Before the passphrase was dropped; kept so earlier rows stay valid.
         "unlock",
         "unlock_refused",
         "lock",

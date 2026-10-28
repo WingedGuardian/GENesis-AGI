@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """The escalation cap's remedy menu, as DATA, for the ask hook to substitute.
 
+DORMANT: the escalation cap this serves is retired (the commit gate now requires a
+round reflection instead), so the menu never appears. Kept until the follow-on
+cleanup deletes it; the text below describes the retired design.
+
 THE FOUNDING INCIDENT (2026-08-31). The escalation cap printed THREE remedies then; it
 prints the four lettered below today, which #1971 landed on 2026-09-13. The count in
 this paragraph is the count AT THE INCIDENT and does not drift with the gate. The relay

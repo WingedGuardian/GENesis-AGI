@@ -138,14 +138,53 @@ def test_relative_dash_operand_is_a_path(tmp_path, kind, name):
     assert_refused(guard(tmp_path, roots=tmp_path / name, **{kind: name}))
 
 
-@pytest.mark.parametrize("state", ["~", "~/state", "~synthetic-user/state", "~nobody", "~literal"])
+@pytest.mark.parametrize("state", ["~synthetic-user/state", "~nobody", "~literal"])
 @pytest.mark.parametrize("armed", [False, True])
-def test_tilde_state_is_explicitly_unsupported_only_when_armed(tmp_path, state, armed):
+def test_a_tilde_user_state_is_unsupported_only_when_armed(tmp_path, state, armed):
     result = guard(tmp_path, state=state, roots=tmp_path / "unrelated" if armed else None)
     if armed:
         assert_refused(result)
+        assert "unsupported tilde-form GENESIS_HOME" in result.stderr
     else:
         assert result.returncode == 0 and result.stderr == ""
+
+
+@pytest.mark.parametrize("state", ["~", "~/state"])
+def test_a_home_tilde_state_is_judged_in_both_expansions(tmp_path, state):
+    """Backup reads "~/x" as HOME/x and the lock path reads it literally from
+    the cwd (#3438): either one inside a listed root refuses, neither passes."""
+    home = tmp_path / "private-home"
+    tail = state[2:]
+    against_home = home / tail if tail else home
+    literal = tmp_path / state
+    assert guard(tmp_path, home=home, state=state, roots=tmp_path / "unrelated").returncode == 0
+    for root in (against_home, literal):
+        assert_refused(guard(tmp_path, home=home, state=state, roots=root))
+
+
+@pytest.mark.parametrize("home", [None, ""])
+def test_a_home_tilde_state_without_home_is_refused(tmp_path, home):
+    env = {"PATH": "/usr/bin:/bin", "GENESIS_HOME": "~/state",
+           "GENESIS_TEST_FENCE_LIVE_ROOTS": str(tmp_path / "unrelated")}
+    if home is not None:
+        env["HOME"] = home
+    result = subprocess.run(
+        ["/bin/bash", "-c", '. "$1"; refuse_if_test_fenced_live "$2"',
+         "path-contract", str(LIB), str(tmp_path / "private-code")],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=5,
+    )
+    assert_refused(result)
+    assert "tilde GENESIS_HOME with no HOME" in result.stderr
+
+
+def test_a_home_tilde_state_with_a_newline_terminated_home_is_refused(tmp_path):
+    """Backup's command substitution strips HOME's trailing newline, so "~"
+    would name the listed root itself while this guard resolved another path."""
+    live = tmp_path / "live"
+    live.mkdir()
+    result = guard(tmp_path, home=str(live) + "\n", state="~", roots=live)
+    assert_refused(result)
+    assert "newline-terminated HOME" in result.stderr
 
 
 @pytest.mark.parametrize("resolver", ["exit 7", "exit 0", "printf /private", "printf '\\n'", "printf 'relative\\n'"])

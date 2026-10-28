@@ -896,6 +896,8 @@ def parse_segments(
     redirs: list[str] = []
     i, n = 0, len(command)
     quote: str | None = None
+    # Comments are not modeled here; preserve the legacy hash-containing scan.
+    word_escapes = "#" not in command
     while i < n:
         c = command[i]
         if quote:
@@ -909,6 +911,12 @@ def parse_segments(
             if c == quote:
                 quote = None
             i += 1
+            continue
+        if word_escapes and c == "\\" and i + 1 < n and command[i + 1] != "\n":
+            # An escaped quote/operator is word data, not scanner state.
+            raw_buf.extend(command[i : i + 2])
+            argv_buf.extend(command[i : i + 2])
+            i += 2
             continue
         if c in ("'", '"'):
             quote = c
@@ -1122,14 +1130,12 @@ def _strip_trailing_comment(seg: str) -> str:
 
 
 # The recognized ack/override sigils. A trailing comment may carry several of these
-# together (`# audit-ack depth-ack`), so the leading run of the comment is allowed to
+# together (`# depth-ack review-override`), so the leading run of the comment is allowed to
 # contain any of them; the FIRST prose token ends the run. Kept in sync with the
 # sigils actually passed to has_trailing_override across the guard hooks.
 _KNOWN_SIGILS = (
     "review-override",
     "depth-ack",
-    "audit-ack",
-    "escalation-ack",
     "ci-override",
     "stale-review-override",
     "scheduled-review-override",
@@ -1179,7 +1185,7 @@ def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
 
     The sigil must appear in the LEADING contiguous run of recognized ack/override
     tokens: `# review-override: accepted P2s` (sigil first, prose follows) and
-    `# audit-ack depth-ack` (a run of two sigils — each satisfies its own check)
+    `# depth-ack review-override` (a run of two sigils — each satisfies its own check)
     both count, but `# not a review-override` / `# see review-override docs` do NOT
     — a prose token ahead of the sigil ends the run. This keeps independent acks
     able to coexist without letting an incidental or negated prose mention waive
@@ -1410,8 +1416,16 @@ def untokenizable(command: str) -> bool:
     escape-free decode does not touch — is tracked separately rather than closed
     here with a message-hostile broadening.
     """
+    return _raw_untokenizable(_excised_text(command))
+
+
+def _raw_untokenizable(command: str) -> bool:
+    # Default POSIX shlex raises only in quote/escape states (Python 3.12
+    # Lib/shlex.py read_token). Absence of all three chars proves it cannot fail.
+    if not any(c in command for c in "'\"\\"):
+        return False
     try:
-        shlex.split(_excised_text(command))
+        shlex.split(command)
         return False
     except ValueError:
         return True
@@ -1863,6 +1877,18 @@ _BLIND_BUILT_ESCAPE = BlindSpot(
     ),
 )
 
+_BLIND_STRUCTURAL = BlindSpot(
+    bounds_induced=True,
+    cause=(
+        "contains nested syntax or here-doc text this parser cannot tokenize safely "
+        "(for example an unbalanced quote inside a $(...) on a here-doc line)"
+    ),
+    hint=(
+        "split the unreadable compound into separate commands, or write prose or "
+        "script text to a file instead"
+    ),
+)
+
 #: One ``$'…'`` string: its body, with escaped characters (including an escaped
 #: quote) kept inside it. Found in the raw text without a quote model, so a ``$'``
 #: that is itself inside other quotes is found too; that over-reports, in the
@@ -2003,12 +2029,19 @@ def has_built_escape(command: str) -> bool:
 #: and every consumer's bounds branch already handles that contract.
 #:
 #: ORDERED AFTER :func:`untokenizable`, unlike the other bounds-type causes. The
-#: discard guard deliberately leaves untokenizable commands alone (its measured cost
-#: of refusing them is written beside that branch), and here-doc prose with an
-#: apostrophe is the commonest untokenizable command. Reporting this cause first
-#: would reclassify those commands to bounds-type and reverse that measured decision.
+#: discard guard deliberately leaves ROOT-level untokenizable commands alone (its
+#: measured cost of refusing them is written beside that branch), and here-doc prose
+#: with an apostrophe is the commonest one. Reporting this cause first would
+#: reclassify those commands to bounds-type and reverse that measured decision.
 #: The deliberate residual: an untokenizable command whose body ALSO hides a suffix
 #: keeps the untokenizable cause, and with it that guard's settled behaviour.
+#:
+#: That decision covers the ROOT text only. ``_BLIND_STRUCTURAL`` (nested
+#: extractions that cannot be tokenized) is ordered BEFORE untokenizable, and the
+#: substitution scan reads here-doc body lines as segments, so a ``$(…)`` with an
+#: apostrophe on a body line is reported as structural and refused when the command
+#: also mentions git. That reversal is accepted for that shape and named in
+#: docs/reference/shell-parse-completeness.md.
 #:
 #: COST, measured over 138,216 recorded unique commands on one install (the 15,488
 #: that contain ``<<``, so every command the check can touch). 101 commands (0.073%)
@@ -2263,6 +2296,7 @@ def _heredoc_hidden_suffixes(
     openers: list[int],
     origin: tuple[_HeredocLines, int] | None = None,
     in_substitution: bool = False,
+    _inert: list[bool] | None = None,
 ) -> list[tuple[int, str, int]]:
     """``(opener, why, at)`` for each here-doc in ``text`` whose body the parse cannot
     be trusted past. ``splits`` and ``openers`` come from the parse of ``text`` itself
@@ -2367,6 +2401,11 @@ def _heredoc_hidden_suffixes(
             # reads the rest of the line as the segmenter does (``echo $((1<<2)) x``).
             if end == n and _word_left_open(text[j:end]):
                 found.append((opener, "delimiter", j))
+            elif (
+                _inert is not None and in_substitution and len(openers) == 1
+                and end == n and end > j and _SIMPLE_WORDS.fullmatch(text, 0, opener)
+            ):
+                _inert.append(True)  # the entire extracted fragment has no body
             continue
         if newline != group_newline:
             group_newline = newline
@@ -2414,6 +2453,8 @@ def _heredoc_hidden_suffixes(
             and _SIMPLE_WORDS.fullmatch(text, 0, opener)
             and _CLOSES_SUBSTITUTION.match(whole, terminator + 1)
         ):
+            if _inert is not None:
+                _inert.append(True)  # this fragment's only body is proven inert
             break  # the exemption: nothing else in this substitution runs
         if terminator - base > n:
             found.append((opener, "cut", start - base))
@@ -2432,7 +2473,10 @@ def _heredoc_hides_suffix(command: str) -> bool:
     """Whether a here-doc body hides a suffix of ``command`` at any depth (the
     detector behind :data:`_BLIND_HEREDOC_BODY`, without its untokenizable
     precedence, and False when a size bound fired instead)."""
-    return "<<" in command and _analyze_bounded(command)[1] == "heredoc"
+    if "<<" not in command:
+        return False
+    result = _analyze_bounded(command)
+    return result.heredoc_incomplete and result.bound_reason is None
 
 
 def rewrites_before_running(command: str) -> bool:
@@ -2523,8 +2567,14 @@ def may_build_words(command: str) -> bool:
     )
 
 
+_STRUCTURAL_DISPATCHERS = (
+    ("git", re.compile(r"\bgit\b")),
+    ("gh", re.compile(r"\bgh\b")),
+)
+
+
 def unresolved_verb_programs(command: str) -> frozenset[str]:
-    """The programs whose operation is named by an expansion, in EITHER reading.
+    """The programs whose operation is unresolved, plus structural candidates.
 
     For a consumer whose segments :func:`analyze_checked` withheld. A bounds-type
     blind spot returns no segments, and with them the one per-segment fact the push
@@ -2537,17 +2587,26 @@ def unresolved_verb_programs(command: str) -> frozenset[str]:
     advisory targets) meant re-modelling the join, and review found a new defect in
     that modelling each round; those consumers refuse or give a short note instead.
     Reads the command as written and with continuations folded, and returns the
-    union. Bounded exactly like :func:`analyze_checked`: a reading that trips a SIZE
-    bound contributes nothing, and the caller's own bounds branch has already refused.
-    A here-doc reading (``"heredoc"``) is parsed in full, like a continued one, so its
-    segments still contribute: this fact can only add a refusal.
+    union. A structural candidate means only that a Git or GitHub operation may run;
+    it does not establish execution or recover operation details. A reading that
+    trips a length or depth bound contributes nothing, and the caller's own bounds
+    branch has already refused. Complete heredoc readings still contribute
+    refusal-only facts; they are not length/depth bounds.
     """
     programs: set[str] = set()
     for text in dict.fromkeys((command, fold_continuations(command))):
-        segments, reason = _analyze_bounded(text)
-        if reason in _SIZE_BOUND_REASONS:
+        result = _analyze_bounded(text)
+        if result.bound_reason:
             continue
-        programs.update(_basename(s.argv[0]) for s in segments if _dispatcher_verb_unresolved(s))
+        programs.update(
+            _basename(segment.argv[0])
+            for segment in result.segments
+            if _dispatcher_verb_unresolved(segment)
+        )
+        if result.structural_incomplete:
+            for program, pattern in _STRUCTURAL_DISPATCHERS:
+                if mentions(result.decision_text, pattern):
+                    programs.add(program)
     return frozenset(programs)
 
 
@@ -2600,6 +2659,7 @@ _ALL_BLIND_SPOTS = (
     _BLIND_UNCLASSIFIED_OPTION,
     _BLIND_CONTINUATION,
     _BLIND_BUILT_ESCAPE,
+    _BLIND_STRUCTURAL,
     _BLIND_HEREDOC_BODY,
 )
 
@@ -2631,7 +2691,7 @@ def over_nested(command: str) -> bool:
     Reports the DEPTH bound specifically. A command refused for LENGTH is a different
     blind spot with a different remedy; ask :func:`analyze_checked` for either.
     """
-    return _analyze_bounded(command)[1] == "depth"
+    return _analyze_bounded(command).bound_reason == "depth"
 
 
 def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
@@ -2682,12 +2742,15 @@ def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
     comment is valid shell that shlex cannot tokenize. Reversing the order costs
     2 of 45,956 real commands a reclassification and no change of verdict.
 
-    :data:`_BLIND_CONTINUATION` comes directly after the two bounds, and BEFORE
-    :func:`untokenizable`, for the same reason the bounds do: it is bounds-type, and
-    the discard guard acts on ``bounds_induced`` only, so a continued command that
-    was ALSO untokenizable would otherwise be handed the cause that guard ignores.
-    The bounds keep precedence because both are bounds-type — the verdict is the same —
-    and the bound's remedy is the one that must be acted on first.
+    Continuation and built-escape diagnostics follow the bounds. Structural
+    incompleteness follows those two and precedes root tokenization, so the legacy
+    non-bounds result remains intact unless a nested source could not be tokenized.
+    Every withholding cause has ``bounds_induced`` set: a consumer that trusts the
+    returned segments must not receive a partial list.
+
+    Structural incompleteness is retained independently of the selected diagnostic.
+    A higher-priority bound, continuation, or built escape can win the message while
+    recovery still needs the fact to add refusal-only Git/GitHub candidates.
 
     :data:`_BLIND_HEREDOC_BODY` is the one bounds-type cause ordered AFTER
     :func:`untokenizable`, and BEFORE the unresolved-verb causes. Here the precedence
@@ -2716,34 +2779,10 @@ def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
     flips it causes are exactly the commands moving from "clean parse" to "blind",
     with nothing else shifting underneath them.
     """
-    segments, reason = _analyze_bounded(command)
-    if reason == "length":
-        return [], _BLIND_OVER_LONG
-    if reason == "depth":
-        return [], _BLIND_OVER_NESTED
-    excised = _excised_text(command)
-    if has_continuation(excised):
-        return [], _BLIND_CONTINUATION
-    if has_built_escape(excised):
-        return [], _BLIND_BUILT_ESCAPE
-    if untokenizable(command):
-        return segments, _BLIND_UNTOKENIZABLE
-    if reason == "heredoc":
-        return [], _BLIND_HEREDOC_BODY
-    hidden = [s for s in segments if _dispatcher_verb_unresolved(s)]
-    if hidden:
-        # Two causes reach one predicate, and they need DIFFERENT remedies. The
-        # expansion cause is answered by writing the subcommand out; telling a
-        # session that when its subcommand is ALREADY literal names a rewrite it
-        # cannot perform, which is the failure mode a refusal message has to
-        # avoid — the message is the only way out of a hard block. Recovered by
-        # re-deriving the cause here rather than by adding a field to
-        # :class:`BlindSpot`, which its own docstring rules out and for a
-        # measured reason: a field makes every consumer choose again, silently.
-        if any(_unclassified_global(s.argv) for s in hidden):
-            return segments, _BLIND_UNCLASSIFIED_OPTION
-        return segments, _BLIND_UNRESOLVED_VERB
-    return segments, None
+    result = _analyze_bounded(command)
+    if result.diagnostic is not None and result.diagnostic.bounds_induced:
+        return [], result.diagnostic
+    return result.segments, result.diagnostic
 
 
 def _basename(token: str) -> str:
@@ -3996,63 +4035,47 @@ def analyze(command: str) -> list[Segment]:
     distinguish "found nothing" from "stopped looking", and a guard that conflates
     the two fails OPEN.
     """
-    return _analyze_bounded(command)[0]
+    return _analyze_bounded(command).segments
 
 
-#: The reasons :func:`_analyze_bounded` gives when a SIZE bound cut the parse short.
-#: ``"heredoc"`` is not one: that parse ran in full and reads part of it wrongly.
-_SIZE_BOUND_REASONS = frozenset({"length", "depth"})
+@dataclass
+class _AnalysisResult:
+    segments: list[Segment]
+    bound_reason: str | None
+    diagnostic: BlindSpot | None
+    structural_incomplete: bool
+    decision_text: str
+    heredoc_incomplete: bool
 
 
 def _analyze_bounded(
-    command: str,
-    *,
-    _depth: int = 0,
+    command: str, *, _depth: int = 0, _decision_text: str | None = None,
     _origin: tuple[_HeredocLines, int] | None = None,
     _in_substitution: bool = False,
-) -> tuple[list[Segment], str | None]:
-    """:func:`analyze`, plus which bound (if any) stopped it short of the whole command.
-
-    Returns ``(segments, reason)`` where reason is None, ``"length"``, ``"depth"`` or
-    ``"heredoc"``. ``"depth"`` is reported only when there was something left to
-    descend INTO and the bound refused it — reaching the bound with nothing nested
-    below is a complete parse, not a truncated one.
-
-    ``"heredoc"`` means the parse is complete but a here-doc body, at this depth or
-    any depth below, carried it across its terminator (see
-    :data:`_BLIND_HEREDOC_BODY`). It propagates up exactly like ``"depth"``, and both
-    size bounds outrank it: a bound is the stronger statement, and its remedy comes
-    first. The segments are returned unchanged, so :func:`analyze` is unaffected.
-
-    Both facts come from ONE traversal, on purpose. Answering "did this truncate?"
-    with a separate pass means a second model of shell syntax, and any disagreement
-    between the two is a silent fail-open: the parse stops early, the predictor says
-    it did not, and a buried command is invisible to both. That is not hypothetical —
-    it is what the hand-written counter this replaced actually did, on two measured
-    shapes. One parse, one answer.
-
-    The length cap lives HERE rather than in :func:`analyze_checked` so that
-    :func:`analyze` is bounded too. Putting it only on the checked path would leave
-    every bare-``analyze`` caller paying the unbounded first pass — which is the same
-    "unmigrated consumer" hole the checked path exists to close.
-
-    ``_depth`` is internal bookkeeping; every caller passes a command and nothing else.
-    """
+) -> _AnalysisResult:
+    """Parse once, retaining diagnostics and structural facts from every visited level."""
     # Past the cap, parse NOTHING. Not a prefix: truncating a command mid-string flips
     # the quoting state for everything after the cut, so a prefix parse is not a
     # partial answer, it is a confidently wrong one — and the guards match on the
     # resolved exe and argv. An empty list plus the reason is the honest result, and
     # every consumer that must not be blind is already asking for the reason.
     if _depth == 0 and len(command) > MAX_COMMAND_CHARS:
-        return [], "length"
+        return _AnalysisResult([], "length", _BLIND_OVER_LONG, False, command, False)
     proven_line = -1  # the end of the line whose here-doc body was proven and excised
     if _depth == 0:
         excised = excise_data_heredoc(command)
         if excised is not None:
             command = excised[0]
             proven_line = command.find("\n")
+    if _depth == 0 or _decision_text is None:
+        _decision_text = command
     out: list[Segment] = []
     truncated = False
+    # Accepted residue: complex inert heredoc prefixes outside the canonical
+    # proof below can be refused despite valid Bash; no broader grammar here.
+    structural_incomplete = _depth > 0 and _raw_untokenizable(command)
+    continuation = has_continuation(command)
+    built_escape = has_built_escape(command)
     # The newlines this parse split on, from the SAME parse, so the here-doc check
     # compares bash's body boundary against this parse rather than a second model.
     splits: list[int] = []
@@ -4067,12 +4090,18 @@ def _analyze_bounded(
     # so it would read as unterminated. Its line holds no other opener (the excision's
     # grammar admits none).
     openers = [o for o in openers if o > proven_line]
+    inert: list[bool] = []
+    carried = False
     try:
-        heredoc = bool(
-            _heredoc_hidden_suffixes(command, splits, openers, here, _in_substitution)
-        )
+        reports = _heredoc_hidden_suffixes(command, splits, openers, here, _in_substitution, inert)
+        heredoc = bool(reports)
+        carried = any(reason == "carried" for _, reason, _ in reports)
     except Exception:  # noqa: BLE001 — never raise inside the parse; unread is reported
         heredoc = True
+    # Only the canonical traversal's whole-fragment proof grants relief. An empty
+    # report list is NOT proof; decoded scripts never inherit an outer proof.
+    structural_incomplete = structural_incomplete and not inert
+    structural_message = structural_incomplete and not carried
     # Subshells opened and not yet closed by earlier segments of this command. A
     # `(` opener counts; a `)` closer (bare or glued) at the end of a segment
     # closes. Counted on the segment SOURCE text outside quotes and comments, so a
@@ -4130,26 +4159,54 @@ def _analyze_bounded(
             truncated = True
             continue
         for script, origin, in_substitution in nested:
-            inner_segs, inner_reason = _analyze_bounded(
-                script, _depth=_depth + 1, _origin=origin, _in_substitution=in_substitution
+            inner = _analyze_bounded(
+                script, _depth=_depth + 1, _decision_text=_decision_text,
+                _origin=origin, _in_substitution=in_substitution,
             )
-            truncated = truncated or inner_reason == "depth"
-            heredoc = heredoc or inner_reason == "heredoc"
-            for inner in inner_segs:
+            truncated = truncated or inner.bound_reason == "depth"
+            heredoc = heredoc or inner.heredoc_incomplete
+            structural_incomplete = structural_incomplete or inner.structural_incomplete
+            structural_message = structural_message or inner.diagnostic is _BLIND_STRUCTURAL
+            continuation = continuation or inner.diagnostic is _BLIND_CONTINUATION
+            built_escape = built_escape or inner.diagnostic is _BLIND_BUILT_ESCAPE
+            for inner_segment in inner.segments:
                 out.append(
                     Segment(
-                        exe=inner.exe,
-                        argv=inner.argv,
-                        override=override or inner.override,
-                        raw=inner.raw,
-                        depth=inner.depth + 1,
-                        redirects=inner.redirects,
-                        verb_unresolved=inner.verb_unresolved,
+                        exe=inner_segment.exe,
+                        argv=inner_segment.argv,
+                        override=override or inner_segment.override,
+                        raw=inner_segment.raw,
+                        depth=inner_segment.depth + 1,
+                        redirects=inner_segment.redirects,
+                        verb_unresolved=inner_segment.verb_unresolved,
                     )
                 )
-    if truncated:
-        return out, "depth"
-    return out, ("heredoc" if heredoc else None)
+    # No length re-check here: at depth 0 the over-long raw command returned
+    # above, and the decision text (the excised command) is never longer.
+    bound_reason = "depth" if truncated else None
+    root_untokenizable = _depth == 0 and _raw_untokenizable(_decision_text)
+    hidden = [segment for segment in out if _dispatcher_verb_unresolved(segment)]
+    if bound_reason == "depth":
+        diagnostic = _BLIND_OVER_NESTED
+    elif continuation:
+        diagnostic = _BLIND_CONTINUATION
+    elif built_escape:
+        diagnostic = _BLIND_BUILT_ESCAPE
+    elif structural_message:
+        diagnostic = _BLIND_STRUCTURAL
+    elif root_untokenizable:
+        diagnostic = _BLIND_UNTOKENIZABLE
+    elif heredoc:
+        diagnostic = _BLIND_HEREDOC_BODY
+    elif hidden and any(_unclassified_global(segment.argv) for segment in hidden):
+        diagnostic = _BLIND_UNCLASSIFIED_OPTION
+    elif hidden:
+        diagnostic = _BLIND_UNRESOLVED_VERB
+    else:
+        diagnostic = None
+    return _AnalysisResult(
+        out, bound_reason, diagnostic, structural_incomplete, _decision_text, heredoc
+    )
 
 
 def is_pytest_invocation(seg: Segment) -> bool:

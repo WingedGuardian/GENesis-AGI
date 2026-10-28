@@ -906,9 +906,8 @@ def evaluate_evidence(
         round_state = "complete"
 
     # What a round reflection must answer for, read by review_reflection.status
-    # (and by the commit gate once it enforces reflections; until then they are
-    # reported, never enforced). The current head's round only, and only while
-    # it is open. A LATE review (one that opened no round, above) never lands here: it
+    # and by the commit gate, which denies a content commit while any is owed.
+    # The current head's round only, and only while it is open. A LATE review (one that opened no round, above) never lands here: it
     # is listed in ``findings`` with the round it belongs to, and ``review_late``
     # owes those keys from its cutover on.
     seen: dict[str, None] = {}  # ordered and linear, however many keys arrive
@@ -1698,6 +1697,10 @@ def _evaluate_pr_inner(
         len(bodies) == 2 and bodies[0] != bodies[1]
     )
     result["body"] = None if result["body_changed"] or not bodies else bodies[-1]
+    # A test that supplies every input makes no read, so it names the body too.
+    seam_body = os.environ.get("_TEST_REVIEW_BUDGET_BODY")
+    if seam_body is not None and not reads:
+        result["body"] = seam_body
     return result
 
 
