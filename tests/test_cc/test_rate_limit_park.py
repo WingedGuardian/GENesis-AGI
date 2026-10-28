@@ -323,3 +323,108 @@ async def test_resume_redispatch_and_consumer_preserve_execution_fields(db):
     assert tuple(rebuilt.tool_exceptions) == ("WebFetch",)
     assert rebuilt.planning_instruction == "think first"
     assert rebuilt.profile == "campaign"
+
+
+
+# ── capped turns that already issued tool calls (#3649) ─────────────────
+_EARLY_SEND = [("outreach_send", {"message": "weekly update"})] + [
+    ("web_search", {"q": f"q{i}"}) for i in range(25)
+]
+
+
+async def _park_ran(db, ran, prompt="send the update"):
+    exc = CCQuotaExhaustedError("limit", raw_text="resets 5pm")
+    return await rlp.park_conversation(
+        db, prompt=prompt, origin_session_id="s1", exc=exc, now=NOW,
+        mode="live", ran=ran,
+    )
+
+
+async def _payload(db, park_id):
+    import json
+
+    return json.loads((await parks.get_by_id(db, park_id))["payload_json"])
+
+
+async def test_an_early_side_effect_is_named_however_many_calls_follow(db):
+    outcome = await _park_ran(db, _EARLY_SEND)
+    payload = await _payload(db, outcome.park_id)
+    assert payload["prompt"] == "send the update", "the stored prompt must stay bare"
+    names = [e["name"] for e in payload["ran"]]
+    assert names[0] == "outreach_send" and len(names) == 26
+    assert sum(1 for e in payload["ran"] if e["input"]) == 20, "previews: latest 20 only"
+    note = rlp.with_already_ran_note(payload["prompt"], payload["ran"])
+    assert "`outreach_send`, `web_search` x25" in note
+
+
+async def test_a_secret_inside_a_string_input_never_reaches_the_park_row(db):
+    secret = "sk-abcdefghijklmnopqrstuvwx1234"
+    ran = [("Bash", {"command": f"curl -H 'Authorization: Bearer {secret}' https://example.test"}),
+           ("browser_run_js", {"expression": f"fetch('/x?token={secret}')"})]
+    outcome = await _park_ran(db, ran)
+    row = await parks.get_by_id(db, outcome.park_id)
+    assert secret not in row["payload_json"]
+    assert "Bash" in row["payload_json"], "the call itself must still be named"
+
+
+async def test_inputs_are_withheld_when_the_scrubber_cannot_vouch(db, monkeypatch):
+    import genesis.transcript_analytics.scrub as scrub
+
+    # Content handed back WITH the failure flag: the flag alone must withhold it.
+    monkeypatch.setattr(scrub, "scrub_json", lambda *a, **k: ('{"command": "echo hi"}', True))
+    outcome = await _park_ran(db, [("Bash", {"command": "echo hi"})])
+    payload = await _payload(db, outcome.park_id)
+    assert payload["ran"] == [{"name": "Bash", "input": "<input withheld>"}]
+
+
+async def test_a_resend_lands_on_the_same_park_and_merges_its_calls(db):
+    first = await _park_ran(db, [("outreach_send", {"message": "a"})])
+    second = await _park_ran(db, [("memory_store", {"content": "b"})])
+    assert first.park_id == second.park_id, "a resend opened a second park"
+    names = [e["name"] for e in (await _payload(db, first.park_id))["ran"]]
+    assert names == ["outreach_send", "memory_store"]
+    rows = await db.execute_fetchall(
+        "SELECT COUNT(*) FROM cc_rate_limit_parks WHERE status IN ('parked','resuming')",
+    )
+    assert rows[0][0] == 1
+
+
+async def test_a_bare_resend_does_not_wipe_the_recorded_calls(db):
+    first = await _park_ran(db, [("outreach_send", {"message": "a"})])
+    await _park_ran(db, None)
+    names = [e["name"] for e in (await _payload(db, first.park_id))["ran"]]
+    assert names == ["outreach_send"]
+
+
+def test_an_oversized_inventory_names_its_gap():
+    inv = rlp.ran_inventory([("t", {})] * 600)
+    note = rlp.with_already_ran_note("p", inv)
+    assert "`t` x250, INVENTORY INCOMPLETE: 100 call(s) not recorded, `t` x250" in note
+
+
+async def test_redispatch_renders_the_note_from_the_stored_inventory(db):
+    import json as _json
+
+    from genesis.cc import rate_limit_resume as rlr
+
+    outcome = await _park_ran(db, [("outreach_send", {"message": "a"})])
+    await rlr._redispatch(db, await parks.get_by_id(db, outcome.park_id))
+    row = await db.execute_fetchall(
+        "SELECT payload_json FROM direct_session_queue ORDER BY rowid DESC LIMIT 1",
+    )
+    prompt = _json.loads(row[0][0])["prompt"]
+    assert prompt.startswith("send the update\n\n[Resume note")
+    assert "`outreach_send`" in prompt
+
+
+async def test_a_park_without_an_inventory_resumes_the_bare_prompt(db):
+    import json as _json
+
+    from genesis.cc import rate_limit_resume as rlr
+
+    outcome = await _park_ran(db, None, prompt="plain request")
+    await rlr._redispatch(db, await parks.get_by_id(db, outcome.park_id))
+    row = await db.execute_fetchall(
+        "SELECT payload_json FROM direct_session_queue ORDER BY rowid DESC LIMIT 1",
+    )
+    assert _json.loads(row[0][0])["prompt"] == "plain request"
