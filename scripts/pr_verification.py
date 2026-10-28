@@ -17,6 +17,8 @@ USAGE
     python3 scripts/pr_verification.py close --pr 1573 \\
         --note "needs an install with no graph engine" \\
         --evidence-file ~/.genesis/output/prv-1573.json
+    python3 scripts/pr_verification.py recheck --pr 2273 --index 0 \\
+        --result-file ~/.genesis/output/prv-2273-recheck.json
 
 THE VERDICT IS DERIVED FROM THE DOCUMENT, not chosen. The verdicts are the owner's
 standing ruling (2026-09-26, not-yet-done added 2026-10-27); which one a document
@@ -37,10 +39,11 @@ cannot-verify (row OPEN, "DEPLOYMENT NOT ESTABLISHED" named) whatever the claims
 Gaps are the declared ``gaps`` plus the ones the document implies: no negative
 control, any NOT_VERIFIABLE_HERE claim, any INFERRED claim, and a named SUSPECTED
 FAILURE for each claim that failed only at INFERRED. A declared gap is typed by its
-``kind``: ``method``, ``owner_only`` and ``event_gated`` (+``trigger``, +``recheck``)
-close with the gap named; ``not_yet_done`` keeps the row OPEN with its command at
-the head of the note. ``scope_limits``, the untyped list this replaced, is refused
-by name rather than mapped across.
+``kind``: ``method`` and ``owner_only`` close with the gap named; ``event_gated``
+closes and is stored on the row as a RECHECK, listed under "Rechecks due" in the
+backlog until a ``recheck`` result marks it done; ``not_yet_done`` keeps the row
+OPEN with its command at the head of the note. ``scope_limits``, the untyped list
+this replaced, is refused by name rather than mapped across.
 
 EACH CLAIM is ``pass``, ``fail`` or ``unverified``. ``unverified`` goes with tier
 NOT_VERIFIABLE_HERE and only with it; the model refuses either without the other,
@@ -108,11 +111,12 @@ live thing was observed doing it); ``ancestry`` is a fast positive path and neve
 negative verdict.
 
 EXIT CODES. 0 wrote (or dry-ran); 1 the ledger declined (no such open row, a race,
-an absent or quarantined database); 2 the request was malformed (bad evidence, a
-missing or discarded note, a PR mismatch, a --verdict/--park the document does not
-support, a merge commit that cannot be resolved); 3 refused on policy (a failing
-claim under any other --verdict, --park on a failure, a ``merge_commit`` that is
-not the PR's). Deliberately meaningful, which is why this is a separate script
+an absent or quarantined database, a recheck that is absent or already done); 2 the
+request was malformed (bad evidence, a missing or discarded note, a PR mismatch, a
+--verdict/--park the document does not support, a merge commit that cannot be
+resolved, a recheck index out of range); 3 refused on policy (a failing claim under
+any other --verdict, --park on a failure, a ``merge_commit`` that is not the PR's).
+Deliberately meaningful, which is why this is a separate script
 rather than a subcommand of ``repo_pulse_worker.py``: that module's documented
 contract is that its exit code is always 0.
 """
@@ -145,7 +149,9 @@ from genesis.session_awareness.pr_evidence import (  # noqa: E402
     Refusal,
     decide,
     parse_evidence,
+    parse_recheck_result,
     reason_for,
+    rechecks_for,
 )
 
 __all__ = [
@@ -390,6 +396,21 @@ async def _write(
                 if decision.parked:
                     attempt_note = "PARKED (nothing material established) — " + attempt_note
 
+            # Rechecks ride on a CLOSING outcome only. Before the column exists such a
+            # close is REFUSED, dry run included: closing anyway would discharge the
+            # row with its owed measurements written nowhere a reader lists them.
+            rechecks = rechecks_for(doc) if decision.closing else []
+            if rechecks and not await crud._rechecks_column_available(db):
+                print(
+                    f"pr_verification: refusing to close {target}#{pr_number} — it carries "
+                    f"{len(rechecks)} event-gated recheck(s), and the rechecks column is "
+                    f"not there yet, so they would be stored nowhere. Restart "
+                    f"genesis-server (or run the migration runner), then close. Nothing "
+                    f"was written.",
+                    file=sys.stderr,
+                )
+                return 1
+
             if dry_run:
                 print("pr_verification: DRY RUN — nothing written.")
                 print(f"  target   : {target}#{pr_number}")
@@ -401,6 +422,10 @@ async def _write(
                     print(f"  reason   : {reason}")
                 else:
                     print(f"  note     : {attempt_note}")
+                if rechecks:
+                    print(f"  rechecks : {len(rechecks)} to store")
+                    for i, r in enumerate(rechecks):
+                        print(f"    --index {i}  {r['trigger']}  recheck: {r['recheck']}")
                 print(f"  evidence : {len(payload.encode('utf-8'))} bytes")
                 return 0
 
@@ -417,6 +442,7 @@ async def _write(
                     reason=reason,
                     evidence=payload,
                     now=now,
+                    rechecks=rechecks or None,
                 )
                 if not changed:
                     print(
@@ -429,6 +455,11 @@ async def _write(
                     return 1
                 committed = f"CLOSED {target}#{pr_number} as {verdict}"
                 print(f"pr_verification: CLOSED {target}#{pr_number} — {reason} at {now}")
+                if rechecks:
+                    print(
+                        f"  {len(rechecks)} recheck(s) stored; they appear under Rechecks "
+                        f"due in --verification-backlog once their trigger passes."
+                    )
                 return 0
 
             outcome = await crud.record_attempt(
@@ -505,6 +536,112 @@ async def _write(
         return 1
 
 
+#: Why ``append_recheck_result`` matched nothing, as the exit code and the sentence a
+#: validator needs. 1 is the ledger declining; 2 is a request that cannot be right.
+_RECHECK_REFUSALS = {
+    "missing": (1, "there is no CLOSED row for {key} — a recheck belongs to a discharged row"),
+    "no-rechecks": (1, "{key} is closed but stores no rechecks"),
+    "not-json": (
+        1,
+        "{key}'s rechecks column is not valid JSON; read it with "
+        "`repo_pulse_worker.py --verification-log --pr {pr}`",
+    ),
+    "bad-entry": (
+        1,
+        "{key}'s recheck --index {index} is not in the stored shape; read it with "
+        "`repo_pulse_worker.py --verification-log --pr {pr}`",
+    ),
+    "out-of-range": (
+        2,
+        "{key} has no recheck at --index {index}; the backlog's Rechecks "
+        "due section prints the exact --index for each one",
+    ),
+    "already-done": (
+        1,
+        "recheck --index {index} on {key} is already done; a finished "
+        "recheck takes no further results",
+    ),
+    "unavailable": (
+        1,
+        "the rechecks column is not present yet — restart genesis-server "
+        "(or run the migration runner) and retry",
+    ),
+    "raced": (1, "{key} changed while this was being written; re-read it and retry"),
+}
+
+
+async def _recheck(
+    *,
+    db_path: str,
+    pr_number: int,
+    index: int,
+    repo: str,
+    result: str,
+    note: str,
+    dry_run: bool,
+) -> int:
+    from datetime import datetime
+
+    import aiosqlite
+
+    from genesis.db.connection import connect_aiosqlite_rw
+    from genesis.db.crud import pr_verifications as crud
+    from genesis.db.integrity import DatabaseIntegrityError
+
+    resolved = Path(db_path)
+    if not resolved.exists():
+        print(
+            f"pr_verification: no database at {resolved} — pass --db-path, or run "
+            f"from the main checkout.",
+            file=sys.stderr,
+        )
+        return 1
+    key = f"{repo}#{pr_number}"
+    state = None
+    try:
+        async with connect_aiosqlite_rw(resolved, timeout=10) as db:
+            await db.execute("PRAGMA busy_timeout=5000")
+            db.row_factory = aiosqlite.Row
+            if dry_run:
+                state = await crud.recheck_state(db, repo=repo, pr_number=pr_number, index=index)
+            else:
+                state = await crud.append_recheck_result(
+                    db,
+                    repo=repo,
+                    pr_number=pr_number,
+                    index=index,
+                    result=result,
+                    note=note,
+                    now=datetime.now(UTC).isoformat(),
+                )
+    except DatabaseIntegrityError as exc:
+        print(f"pr_verification: refusing to write — {exc}", file=sys.stderr)
+        return 1
+    except (sqlite3.Error, OSError) as exc:
+        # As in _write: a failure after the append committed (closing the connection)
+        # must not send the validator to append the same result twice.
+        landed = "the append COMMITTED" if state == "recorded" else "Nothing was recorded"
+        print(
+            f"pr_verification: the ledger declined — {type(exc).__name__}: {exc}. {landed}.",
+            file=sys.stderr,
+        )
+        return 0 if state == "recorded" else 1
+    if state not in ("ok", "recorded"):
+        code, why = _RECHECK_REFUSALS[state]
+        return _refuse(why.format(key=key, pr=pr_number, index=index), code)
+    verb = "DRY RUN — would append" if dry_run else "appended"
+    print(
+        f"pr_verification: {verb} {result!r} to recheck --index {index} on {key}. "
+        f"The row stays CLOSED."
+    )
+    if result == "failed" and not dry_run:
+        print(
+            "  The recheck FAILED: bring it to the user as fail-intent — a conversation, "
+            "never an automatic rollback. Nothing was filed; it stays due."
+        )
+    return 0
+
+
 class _DuplicateKey(ValueError):
     pass
 
@@ -526,6 +663,31 @@ def _no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
 def _refuse(message: str, code: int) -> int:
     print(f"pr_verification: {message}", file=sys.stderr)
     return code
+
+
+def _load_json(path: Path, what: str) -> object | int:
+    """The parsed file, or the exit code of a refusal already printed."""
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return _refuse(f"cannot read {what} file {path}: it does not exist", 2)
+    except OSError as exc:
+        return _refuse(f"cannot read {what} file {path}: {exc}", 2)
+    if len(raw) > MAX_EVIDENCE_BYTES:
+        return _refuse(
+            f"{what} file is {len(raw)} bytes, over the {MAX_EVIDENCE_BYTES}-byte "
+            f"cap — REFUSED rather than cut, because a truncated evidence record still "
+            f"looks complete.",
+            2,
+        )
+    try:
+        return json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicates)
+    except UnicodeDecodeError as exc:
+        return _refuse(f"{what} file is not UTF-8: {exc}", 2)
+    except json.JSONDecodeError as exc:
+        return _refuse(f"{what} file is not valid JSON: {exc}", 2)
+    except _DuplicateKey as exc:
+        return _refuse(str(exc), 2)
 
 
 def main(
@@ -579,34 +741,63 @@ def main(
     )
     close.add_argument("--db-path", default=None, help="override the database path")
 
+    recheck = sub.add_parser(
+        "recheck",
+        help="append a dated result to a CLOSED row's event-gated recheck (never reopens it)",
+    )
+    recheck.add_argument("--pr", type=int, required=True, help="the closed row's PR number")
+    recheck.add_argument(
+        "--index",
+        type=int,
+        required=True,
+        help="0-based position in the row's stored rechecks (NOT in the document's gaps); "
+        "the backlog's Rechecks due section prints it",
+    )
+    recheck.add_argument(
+        "--result-file",
+        required=True,
+        help='JSON {"repo": "owner/name", "result": "done" | "failed", "note": "..."}',
+    )
+    recheck.add_argument(
+        "--dry-run", action="store_true", help="check the target and show the append, write nothing"
+    )
+    recheck.add_argument("--db-path", default=None, help="override the database path")
+
     args = parser.parse_args(argv)
 
     if args.command == "print-schema":
         print(json.dumps(SCHEMA_TEMPLATE, indent=2))
         return 0
 
-    path = Path(args.evidence_file).expanduser()
-    try:
-        raw = path.read_bytes()
-    except FileNotFoundError:
-        return _refuse(f"cannot read evidence file {path}: it does not exist", 2)
-    except OSError as exc:
-        return _refuse(f"cannot read evidence file {path}: {exc}", 2)
-    if len(raw) > MAX_EVIDENCE_BYTES:
-        return _refuse(
-            f"evidence file is {len(raw)} bytes, over the {MAX_EVIDENCE_BYTES}-byte "
-            f"cap — REFUSED rather than cut, because a truncated evidence record still "
-            f"looks complete.",
-            2,
+    from genesis.env import genesis_db_path
+
+    if args.command == "recheck":
+        if args.index < 0:
+            return _refuse(f"--index must be 0 or more, got {args.index}", 2)
+        loaded = _load_json(Path(args.result_file).expanduser(), "result")
+        if isinstance(loaded, int):
+            return loaded
+        try:
+            res = parse_recheck_result(loaded)
+        except EvidenceError as exc:
+            return _refuse(f"the result file is malformed:\n{exc}", 2)
+        return asyncio.run(
+            _recheck(
+                db_path=args.db_path or str(genesis_db_path()),
+                pr_number=args.pr,
+                index=args.index,
+                repo=res.repo,
+                result=res.result,
+                note=res.note,
+                dry_run=args.dry_run,
+            )
         )
+
+    loaded = _load_json(Path(args.evidence_file).expanduser(), "evidence")
+    if isinstance(loaded, int):
+        return loaded
     try:
-        doc = validate_evidence(json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicates))
-    except UnicodeDecodeError as exc:
-        return _refuse(f"evidence file is not UTF-8: {exc}", 2)
-    except json.JSONDecodeError as exc:
-        return _refuse(f"evidence file is not valid JSON: {exc}", 2)
-    except _DuplicateKey as exc:
-        return _refuse(str(exc), 2)
+        doc = validate_evidence(loaded)
     except EvidenceError as exc:
         return _refuse(f"the evidence document is malformed:\n{exc}", 2)
 
@@ -637,8 +828,6 @@ def main(
             f"truncated evidence record still looks complete.",
             2,
         )
-
-    from genesis.env import genesis_db_path
 
     return asyncio.run(
         _write(

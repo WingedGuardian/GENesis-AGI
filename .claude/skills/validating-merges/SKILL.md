@@ -86,6 +86,15 @@ Read back what was decided, and on what evidence, with
 python3 scripts/repo_pulse_worker.py --verification-log [--pr <N>]
 ```
 
+and record a re-measurement owed by a CLOSED row (the backlog's "Rechecks due"
+section prints the exact command, `--index` included) with
+
+```bash
+python3 scripts/pr_verification.py recheck --pr <N> --index <I> \
+    --result-file ~/.genesis/output/prv-<N>-recheck.json [--dry-run]
+#   {"repo": "owner/name", "result": "done" | "failed", "note": "what it showed"}
+```
+
 Two mechanics worth knowing before your first run. **`--dry-run` resolves the
 target and renders the record without writing** — use it, because a closed row
 cannot be amended through this tool. And **`genesis_db_path()` is repo-root
@@ -336,10 +345,14 @@ because each pilot broke a field the obvious version would have had:
   of 158 untyped gaps, 35 were reachable work that had not been done, 44 waited on
   an event, 57 were method limits and 22 belonged to the owner — and the untyped
   list closed every one of them alike.
-  - `method` (`detail`), `owner_only` (`detail`) and `event_gated` (`detail`,
-    `trigger`: a real `YYYY-MM-DD` or a named event, `recheck`: one read-only
-    command or SQL that re-measures it) — close as `pass-with-measured-gaps` with
-    the gap named.
+  - `method` (`detail`) and `owner_only` (`detail`) — close as
+    `pass-with-measured-gaps` with the gap named.
+  - `event_gated` (`detail`, `trigger`: a real `YYYY-MM-DD` or a named event,
+    `recheck`: one read-only command or SQL that re-measures it) — closes, and is
+    stored on the row as a RECHECK. It shows under "Rechecks due" in the backlog
+    once a date trigger arrives (a named event always shows) until a `recheck`
+    result marks it `done`. A `failed` result is appended and keeps it due: bring
+    it to the user as fail-intent; the row is never reopened.
   - `not_yet_done` (`detail`, `command`) — keeps the row OPEN as `not-yet-done`.
   The old untyped `scope_limits` is refused by name, never mapped across: choosing
   each entry's kind is the judgment the untyped list let a close skip.

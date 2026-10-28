@@ -21,6 +21,7 @@ the schema authority; nothing here creates tables. ``now`` is always injected
 
 from __future__ import annotations
 
+import json
 import uuid
 
 import aiosqlite
@@ -73,6 +74,11 @@ VERDICTS = (
 #: The verdicts that DISCHARGE the obligation and therefore close the row. The
 #: others record an attempt and leave it OPEN, because the work is not done.
 PASS_VERDICTS = ("pass-mechanical", "pass-with-measured-gaps")
+
+#: What a recheck result says. ``done`` finishes the recheck; ``failed`` is
+#: appended and leaves it due, because a re-measurement that failed is a finding
+#: someone must still act on.
+RECHECK_RESULTS = ("done", "failed")
 
 # Per-CONNECTION-TARGET cache: only the TRUE result is cached — a missing table
 # (pre-migration window) is re-checked every call so a subprocess writer
@@ -193,6 +199,7 @@ async def close_verification(
     reason: str,
     evidence: str | None,
     now: str,
+    rechecks: list[dict] | None = None,
 ) -> bool:
     """Close an OPEN obligation with its verification record (the validator's
     write). True iff a row changed — a closed row never flips back or gets its
@@ -230,6 +237,14 @@ async def close_verification(
     price of a last-wins record: the row always describes its LATEST state, and nothing
     here keeps attempt history. If per-attempt history is ever wanted it needs a child
     table, which the shipping PR considered and rejected against the New-Store Gate.
+
+    ``rechecks`` are the document's event-gated gaps, each ``{trigger, recheck,
+    detail}``: a measurement that could not be taken yet because the event it waits
+    on had not happened. They are written in the SAME statement, with an empty
+    ``results`` list and ``done_at`` NULL, so a closed row and the rechecks it still
+    owes are one fact. Before the ``rechecks`` column exists they are not written —
+    the evidence document still carries them, and the caller is the one that can say
+    so (``_rechecks_column_available``).
     """
     if verdict not in PASS_VERDICTS:
         raise ValueError(
@@ -238,6 +253,7 @@ async def close_verification(
             f"record_attempt(), which leaves the row OPEN."
         )
     _check_evidence_size(evidence)
+    stored = _normalize_rechecks(rechecks)
     if not reason or not reason.strip():
         # A closed row with no reason is an unverifiable claim in permanent
         # record — the row would say "handled" and carry nothing. The schema
@@ -250,15 +266,61 @@ async def close_verification(
         return False
     if not await _verdict_columns_available(db):
         return False
-    cursor = await db.execute(
-        "UPDATE pr_verifications SET status = 'closed', closed_reason = ?, "
-        "closed_at = ?, evidence = ?, verdict = ?, last_attempt_at = ?, "
-        "last_attempt_note = NULL, attempt_count = attempt_count + 1 "
-        "WHERE repo = ? AND pr_number = ? AND status = 'open'",
-        (reason, now, evidence, verdict, now, repo, pr_number),
-    )
+    if stored is not None and await _rechecks_column_available(db):
+        cursor = await db.execute(
+            "UPDATE pr_verifications SET status = 'closed', closed_reason = ?, "
+            "closed_at = ?, evidence = ?, verdict = ?, last_attempt_at = ?, "
+            "last_attempt_note = NULL, attempt_count = attempt_count + 1, rechecks = ? "
+            "WHERE repo = ? AND pr_number = ? AND status = 'open'",
+            (reason, now, evidence, verdict, now, stored, repo, pr_number),
+        )
+    else:
+        cursor = await db.execute(
+            "UPDATE pr_verifications SET status = 'closed', closed_reason = ?, "
+            "closed_at = ?, evidence = ?, verdict = ?, last_attempt_at = ?, "
+            "last_attempt_note = NULL, attempt_count = attempt_count + 1 "
+            "WHERE repo = ? AND pr_number = ? AND status = 'open'",
+            (reason, now, evidence, verdict, now, repo, pr_number),
+        )
     await db.commit()
     return bool(cursor.rowcount)
+
+
+def _normalize_rechecks(rechecks: list[dict] | None) -> str | None:
+    """The stored JSON for *rechecks*, or None when there are none.
+
+    Built HERE, from the three caller fields only, so the stored shape — including
+    the ``results`` and ``done_at`` that :func:`append_recheck_result` and the prune
+    rule key on — has one author. Raises on a malformed entry: a caller that built
+    one has a bug, and a recheck stored without its command is one nobody can run.
+    """
+    if not rechecks:
+        return None
+    out = []
+    for item in rechecks:
+        fields = {k: item.get(k) if isinstance(item, dict) else None for k in _RECHECK_FIELDS}
+        if not all(isinstance(v, str) and v.strip() for v in fields.values()):
+            raise ValueError(f"a recheck needs non-empty {list(_RECHECK_FIELDS)}, got {item!r}")
+        out.append({**fields, "results": [], "done_at": None})
+    return json.dumps(out, ensure_ascii=False)
+
+
+_RECHECK_FIELDS = ("trigger", "recheck", "detail")
+
+
+async def _rechecks_column_available(db: aiosqlite.Connection) -> bool:
+    """Does the ``rechecks`` column exist? Asked EVERY time, uncached.
+
+    A SEPARATE guard from :func:`_verdict_columns_available`, not folded into it:
+    the two columns arrive in different migrations, so an install that has the
+    verdict columns and not this one is the ordinary state between this code's
+    deploy and the next migration run. Folding them would make that install refuse
+    every close for want of a column only rechecks need.
+    """
+    if not await _tables_available(db):
+        return False
+    cursor = await db.execute("PRAGMA table_info(pr_verifications)")
+    return "rechecks" in {row[1] for row in await cursor.fetchall()}
 
 
 async def _verdict_columns_available(db: aiosqlite.Connection) -> bool:
@@ -523,6 +585,13 @@ async def prune_closed(
     closed row. The guard lives HERE rather than only at the CLI because the
     caller that gets it wrong is the one that never thought about it — the CLI
     validates too, for a readable error instead of a traceback.
+
+    A closed row that still owes a recheck is KEPT, whatever its age: the recheck is
+    the only record that a measurement is still owed, and a row pruned at 180 days
+    with an event that had not happened yet would forgive it silently — the open-row
+    rule, one column over. A row whose ``rechecks`` is not valid JSON is kept too,
+    and never fails the prune: retention is a hygiene step, and a hygiene step that
+    deletes or crashes on what it cannot read has picked the two wrong defaults.
     """
     if older_than_days < 1:
         raise ValueError(
@@ -536,9 +605,191 @@ async def prune_closed(
     from datetime import datetime, timedelta
 
     cutoff = (datetime.fromisoformat(now) - timedelta(days=older_than_days)).isoformat()
+    keep = ""
+    if await _rechecks_column_available(db):
+        # json_each over a CASE, never over the raw column: SQLite does not promise
+        # to short-circuit AND, so json_valid() beside it would not stop json_each
+        # raising on a malformed row and failing the whole DELETE. The done_at
+        # lookup goes through the parent document by fullkey, which yields NULL
+        # (kept) rather than raising for an element that is not an object.
+        keep = (
+            " AND (rechecks IS NULL OR (json_valid(rechecks) AND NOT EXISTS ("
+            "SELECT 1 FROM json_each(CASE WHEN json_valid(rechecks) THEN rechecks "
+            "ELSE '[]' END) AS je WHERE json_extract(rechecks, je.fullkey || '.done_at') "
+            "IS NULL)))"
+        )
     cursor = await db.execute(
-        "DELETE FROM pr_verifications WHERE status = 'closed' AND closed_at < ?",
+        "DELETE FROM pr_verifications WHERE status = 'closed' AND closed_at < ?" + keep,
         (cutoff,),
     )
     await db.commit()
     return cursor.rowcount or 0
+
+
+# ── rechecks: event-gated gaps on a CLOSED row ──────────────────────────────
+
+
+async def list_rechecks_due(db: aiosqlite.Connection, *, today: str) -> list[dict]:
+    """Unfinished rechecks that are due, oldest close first. Empty pre-migration.
+
+    Due means: a date trigger (``pr_evidence.TRIGGER_DATE``) on or before *today*, or any
+    named-event trigger — whether an event has happened is not something a query
+    can know, so those are always listed and the validator judges. *today* is a
+    ``YYYY-MM-DD`` string in UTC, injected like ``now`` everywhere else here.
+
+    One dict per recheck: the row's key and title, ``index`` (its position in the
+    stored list — exactly what ``pr_verification.py recheck --index`` takes),
+    ``trigger``, ``recheck``, ``detail``, ``attempts`` and ``latest`` (the last
+    result, or None). Deliberately UNLIMITED: an unfinished recheck is an owed
+    measurement, and a capped read here would hide exactly the one nobody ran.
+
+    A row whose column is not valid JSON is not skipped, which would make it
+    invisible here AND unprunable — it is returned once with ``index`` None and
+    ``malformed`` True, so the reader can say so.
+    """
+    # Imported here, not at module scope: the evidence model imports THIS module, and
+    # the date pattern has one definition, which lives with the model.
+    from genesis.session_awareness.pr_evidence import TRIGGER_DATE
+
+    if not await _rechecks_column_available(db):
+        return []
+    cursor = await db.execute(
+        "SELECT repo, pr_number, pr_title, closed_at, rechecks FROM pr_verifications "
+        "WHERE status = 'closed' AND rechecks IS NOT NULL "
+        "ORDER BY closed_at ASC, repo ASC, pr_number ASC"
+    )
+    out: list[dict] = []
+    for row in await cursor.fetchall():
+        base = {
+            "repo": row[0],
+            "pr_number": row[1],
+            "pr_title": row[2],
+            "closed_at": row[3],
+        }
+        try:
+            items = json.loads(row[4])
+        except (TypeError, ValueError):
+            items = None
+        # Any non-object entry makes the whole list unreadable as rechecks: emitted
+        # once, never skipped, because a skipped row is invisible AND unprunable.
+        if not isinstance(items, list) or not all(isinstance(i, dict) for i in items):
+            out.append({**base, "index": None, "malformed": True})
+            continue
+        for index, item in enumerate(items):
+            if item.get("done_at") is not None:
+                continue
+            trigger = str(item.get("trigger") or "")
+            if TRIGGER_DATE.match(trigger) and trigger > today:
+                continue
+            results = item.get("results") if isinstance(item.get("results"), list) else []
+            out.append(
+                {
+                    **base,
+                    "index": index,
+                    "malformed": False,
+                    "trigger": trigger,
+                    "recheck": item.get("recheck"),
+                    "detail": item.get("detail"),
+                    "attempts": len(results),
+                    "latest": results[-1] if results else None,
+                }
+            )
+    return out
+
+
+async def recheck_state(db: aiosqlite.Connection, *, repo: str, pr_number: int, index: int) -> str:
+    """Why a result could or could not be appended at *index*, read without writing.
+
+    ``"ok"`` | ``"missing"`` (no CLOSED row for the key) | ``"no-rechecks"`` (NULL
+    or ``[]``) | ``"not-json"`` | ``"bad-entry"`` (the entry at *index* is not in the
+    stored shape) | ``"out-of-range"`` | ``"already-done"`` | ``"unavailable"``. Used by
+    a dry run, and after :func:`append_recheck_result` matched nothing, so the refusal
+    names the actual cause rather than one word for every state.
+    """
+    if not await _rechecks_column_available(db):
+        return "unavailable"
+    cursor = await db.execute(
+        "SELECT rechecks FROM pr_verifications WHERE repo = ? AND pr_number = ? "
+        "AND status = 'closed'",
+        (repo, pr_number),
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        return "missing"
+    if row[0] is None:
+        return "no-rechecks"
+    try:
+        items = json.loads(row[0])
+    except (TypeError, ValueError):
+        return "not-json"
+    if items == []:
+        return "no-rechecks"
+    if not isinstance(items, list):
+        return "bad-entry"
+    if not 0 <= index < len(items):
+        return "out-of-range"
+    entry = items[index]
+    if not isinstance(entry, dict) or not isinstance(entry.get("results"), list):
+        return "bad-entry"
+    if entry.get("done_at") is not None:
+        return "already-done"
+    return "ok"
+
+
+async def append_recheck_result(
+    db: aiosqlite.Connection,
+    *,
+    repo: str,
+    pr_number: int,
+    index: int,
+    result: str,
+    note: str,
+    now: str,
+) -> str:
+    """Append one dated result to a CLOSED row's recheck. ``"recorded"`` or a
+    :func:`recheck_state` cause.
+
+    The row is NOT reopened — ``status``, ``verdict``, ``closed_*`` and ``evidence``
+    are absent from the SET list, so "closed means discharged" stays true by the SQL
+    rather than by every caller remembering it. A recheck is a measurement owed
+    AFTER the discharge, and its failure is a new finding, not a retraction.
+
+    ONE statement: ``json_insert`` appends to ``results`` and, for ``done``,
+    ``json_set`` stamps ``done_at``, under a WHERE that re-checks the row is closed,
+    the column is valid, the entry exists and is unfinished. A read-modify-write in
+    Python would let two validators each append to the copy they read and one result
+    vanish. A ``done`` result finishes the recheck: a second result for it is
+    refused (``"already-done"``), never appended after the fact.
+    """
+    if result not in RECHECK_RESULTS:
+        raise ValueError(f"result must be one of {list(RECHECK_RESULTS)}, got {result!r}")
+    if not note or not note.strip():
+        raise ValueError(
+            "a recheck result requires a non-empty note — the measurement it took is "
+            "the whole value of the entry"
+        )
+    if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+        raise ValueError(f"index must be a non-negative integer, got {index!r}")
+    if not await _rechecks_column_available(db):
+        return "unavailable"
+    entry = json.dumps({"at": now, "result": result, "note": note.strip()}, ensure_ascii=False)
+    at = f"$[{index}]"
+    appended = "json_insert(rechecks, ?, json(?))"
+    value = f"json_set({appended}, ?, ?)" if result == "done" else appended
+    params: list = [f"{at}.results[#]", entry]
+    if result == "done":
+        params += [f"{at}.done_at", now]
+    cursor = await db.execute(
+        f"UPDATE pr_verifications SET rechecks = {value} "
+        "WHERE repo = ? AND pr_number = ? AND status = 'closed' AND json_valid(rechecks) "
+        "AND json_type(rechecks, ?) = 'object' AND json_type(rechecks, ?) = 'array' "
+        "AND json_extract(rechecks, ?) IS NULL",
+        (*params, repo, pr_number, at, f"{at}.results", f"{at}.done_at"),
+    )
+    await db.commit()
+    if cursor.rowcount:
+        return "recorded"
+    state = await recheck_state(db, repo=repo, pr_number=pr_number, index=index)
+    # "ok" here means the row changed between the UPDATE and this read — another
+    # writer. Say so rather than report a cause that is no longer true.
+    return "raced" if state == "ok" else state

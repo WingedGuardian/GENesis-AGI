@@ -152,6 +152,8 @@ def test_the_derivation_invariants_hold_on_every_document():
         if d.verdict == "pass-mechanical":
             assert not gaps and controls, "a clean pass carries no gap of any kind"
             assert all(t in pe.ESTABLISHING_TIERS for _, t in claims)
+        # A recheck exists exactly for an event-gated gap, and is stored only on close.
+        assert len(pe.rechecks_for(doc)) == sum(g["kind"] == "event_gated" for g in gaps)
 
 
 def test_the_two_formerly_DEAD_documents_each_have_their_verdict():
@@ -741,3 +743,33 @@ def test_the_merge_commit_hint_says_it_is_the_PRs_own_merge():
     msg = str(exc.value)
     assert "the PR's OWN merge commit" in msg and "deploy.detail" in msg
     assert "WHICH artifact" not in msg
+
+
+def test_rechecks_are_the_event_gated_gaps_alone_in_order():
+    """The recheck index counts event-gated gaps only, never positions in ``gaps``."""
+    second = {**EVENT, "trigger": "the next deploy", "recheck": "journalctl -n 50"}
+    doc = _doc(gaps=(METHOD, EVENT, GAP["owner_only"], second))
+    assert pe.rechecks_for(doc) == [
+        {"trigger": EVENT["trigger"], "recheck": EVENT["recheck"], "detail": EVENT["detail"]},
+        {"trigger": "the next deploy", "recheck": "journalctl -n 50", "detail": EVENT["detail"]},
+    ]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"result": "done", "note": "n"},
+        {"repo": REPO, "result": "passed", "note": "n"},
+        {"repo": REPO, "result": "done", "note": "  "},
+        {"repo": REPO, "result": "done", "note": "n", "index": 0},
+    ],
+)
+def test_a_recheck_result_is_strict(bad):
+    with pytest.raises(pe.EvidenceError) as exc:
+        pe.parse_recheck_result(bad)
+    assert str(exc.value).startswith("result.")
+
+
+def test_a_well_formed_recheck_result_parses():
+    r = pe.parse_recheck_result({"repo": REPO, "result": "failed", "note": "3 of 7 runs missing"})
+    assert (r.repo, r.result, r.note) == (REPO, "failed", "3 of 7 runs missing")
