@@ -411,7 +411,9 @@ their own Chrome, or, when card fill is on, use `browser_fill_card`:
   and `extra_field_not_found` carry the same detail.
 - A required consent checkbox in the card form (a debit authorization) goes in
   `consent`, never `steps`: the owner's tap shows its label, and the tool ticks
-  it only after the tap.
+  it only after the tap. Pass the checkbox input itself. When a styled box
+  covers it so a click can't land, the tool ticks it through the input's own
+  label (the one label whose control is that input, in the same frame).
 - Billing address fields can omit `"value"`: the tool then reads it from
   `card_fill.billing` in the install's private payments config, so the address
   stays out of tool arguments.
@@ -438,6 +440,12 @@ their own Chrome, or, when card fill is on, use `browser_fill_card`:
   other code before Pay (`failed_before_pay`, `claimed_not_filled`, a
   refusal): Pay was not clicked; a single-use card may be spent, so ask the
   owner before trying again.
+- A code after the tap can carry a suffix naming the check that stopped it
+  (`page_changed:granted:title`, `failed_before_pay:held`,
+  `saved_page_changed:pay_price`). What to do follows the part before the first
+  colon; report the whole code to the owner. `page_changed:granted` stopped
+  before anything was typed; any later `page_changed` may follow billing
+  fields being typed (never the card).
 
 **Credentials.**
 - Do not type a password, code or card number the user pasted into chat. Ask
