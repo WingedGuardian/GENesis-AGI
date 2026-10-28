@@ -135,9 +135,52 @@ def _replay_notice(exc: CCReplayUnsafeError) -> str:
 #: which must not stack the home model's `[Model / Effort]` prefix above it.
 CONTINGENCY_HEADER_PREFIX = "[Contingency mode"
 
-# Heading of the recap a FRESH turn already carries in its system prompt.
-# Shared with `_try_contingency`, which must not inject the same history twice.
+# Delimiters of the recap a FRESH turn carries in its system prompt. The home
+# CC session reads it there; `_try_contingency` lifts it OUT, because for the
+# tool-less backup model chat text belongs in the fenced user turn, never at
+# system authority. The end marker is what makes the lift exact: chat text is
+# defanged of it on insertion, so its first occurrence after the heading is
+# always the real end.
 _RECOVERY_CONTEXT_HEADING = "\n\n## Recent conversation (session recovered)\n"
+_RECOVERY_CONTEXT_END = "\n[end of recent conversation]"
+
+
+def _recovery_recap_block(recap: str) -> str:
+    """The fresh-turn system-prompt block, with any copy of the end marker
+    inside the chat text defanged so the lift below cannot stop early."""
+    body = recap.replace(_RECOVERY_CONTEXT_END, "\n[end of recent conversation_]")
+    return f"{_RECOVERY_CONTEXT_HEADING}{body}{_RECOVERY_CONTEXT_END}"
+
+
+# The ego-proposals topic context carries the thread's recent messages for
+# the home session; same treatment as the recap on the backup lane.
+_TOPIC_THREAD_HEADING = "### Recent Messages in This Thread:\n"
+_TOPIC_THREAD_END_TEXT = "[end of thread messages]"
+_TOPIC_THREAD_END = _TOPIC_THREAD_END_TEXT + "\n"
+
+
+def _lift_spans(prompt: str | None, heading: str, end: str) -> tuple[str | None, list[str]]:
+    """Remove EVERY ``heading`` ... ``end`` span from ``prompt``.
+
+    Returns (remaining prompt, lifted span bodies). Fails toward removing more:
+    each span ends at the first end marker after its heading (chat text is
+    defanged of the marker when the span is built), a heading with no end
+    marker after it cuts to the end of the prompt, and the loop runs until no
+    heading remains, so a stray copy elsewhere in the prompt (stored memory
+    text, a later fragment) can neither stop the lift early nor leave the real
+    span behind. Everything lifted is fenced by the caller, never dropped.
+    """
+    spans: list[str] = []
+    while prompt and heading in prompt:
+        start = prompt.index(heading)
+        stop = prompt.find(end, start + len(heading))
+        if stop == -1:
+            spans.append(prompt[start + len(heading):])
+            prompt = prompt[:start]
+            break
+        spans.append(prompt[start + len(heading):stop])
+        prompt = prompt[:start] + prompt[stop + len(end):]
+    return (prompt or None), [sp for sp in spans if sp.strip()]
 
 _RECENT_CONVERSATION_OPEN = "<recent_conversation>"
 _RECENT_CONVERSATION_CLOSE = "</recent_conversation>"
@@ -932,7 +975,7 @@ class ConversationLoop:
                     thread_id,
                 )
                 if recovery_context:
-                    system_prompt += _RECOVERY_CONTEXT_HEADING + recovery_context
+                    system_prompt += _recovery_recap_block(recovery_context)
                 resume_id = None
 
             # Topic-aware context: inject for BOTH new and resumed sessions.
@@ -1096,6 +1139,7 @@ class ConversationLoop:
                         prompt_text, system_prompt, channel,
                         session_id=session["id"],
                         was_resume=resume_id is not None,
+                        chat_ref=chat_ref, thread_id=thread_id,
                     )
                     if fallback is not None:
                         return fallback
@@ -1114,7 +1158,7 @@ class ConversationLoop:
                             prompt_text, system_prompt, channel,
                             session_id=session["id"],
                             was_resume=resume_id is not None,
-                        chat_ref=chat_ref, thread_id=thread_id,
+                            chat_ref=chat_ref, thread_id=thread_id,
                         )
                         if fallback is not None:
                             return fallback
@@ -2024,7 +2068,7 @@ class ConversationLoop:
                 int(thread_id), chat_id=topic_chat_id, limit=8,
             )
             if thread_messages:
-                lines.append("### Recent Messages in This Thread:\n")
+                lines.append(_TOPIC_THREAD_HEADING)
                 for m in thread_messages:
                     sender = m.get("sender", "?")
                     content = m.get("content", "")
@@ -2033,7 +2077,16 @@ class ConversationLoop:
                     if len(content) > 800:
                         content = content[:800] + "…"
                     prefix = "User" if sender == "user" else "Genesis"
+                    # Defanged of the end marker's bracket text (without its
+                    # newline, which the line format below supplies) so the
+                    # backup lane's lift of this section (`_lift_spans`) ends
+                    # at the real marker. No straddle: every join inserts
+                    # "**<sender>**: ", which the marker never contains.
+                    content = content.replace(
+                        _TOPIC_THREAD_END_TEXT, "[end of thread messages_]",
+                    )
                     lines.append(f"**{prefix}**: {content}\n")
+                lines.append(_TOPIC_THREAD_END)
 
             # ── Pending proposals board ─────────────────────────────────
             if not pending:
@@ -2407,10 +2460,12 @@ class ConversationLoop:
         arrives here: identity, the turn's own prompt fragments, the recent
         chat history, and a clause saying what it cannot do.
 
-        History: a FRESH turn already carries the recovery recap in its system
-        prompt (``_RECOVERY_CONTEXT_HEADING``). A RESUMED turn does not, because
-        its history lives inside the CC session being resumed, so it is loaded
-        here with the same reader and fenced into the user turn as untrusted.
+        History is only ever sent fenced into the user turn as untrusted data.
+        Chat text the home prompt carries (a FRESH turn's recap; the
+        ego-proposals topic's thread messages) is lifted out of the system
+        prompt and fenced: never left at system authority, never sent twice. A
+        RESUMED turn has no recap, because its history lives in the CC session
+        being resumed, so it is read here with the same reader.
 
         Returns formatted response string on success, None on failure.
         """
@@ -2443,7 +2498,12 @@ class ConversationLoop:
         # covers the fresh branch, which reuses the home prompt as built.
         system_prompt = _strip_session_configuration(system_prompt)
 
-        history_in_prompt = bool(system_prompt) and _RECOVERY_CONTEXT_HEADING in system_prompt
+        system_prompt, recap_spans = _lift_spans(
+            system_prompt, _RECOVERY_CONTEXT_HEADING, _RECOVERY_CONTEXT_END,
+        )
+        system_prompt, thread_spans = _lift_spans(
+            system_prompt, _TOPIC_THREAD_HEADING, _TOPIC_THREAD_END,
+        )
 
         if was_resume or system_prompt is None:
             try:
@@ -2461,11 +2521,13 @@ class ConversationLoop:
             )
         system_prompt += _CONTINGENCY_LANE_CLAUSE
 
-        user_content = prompt_text
-        if chat_ref and not history_in_prompt:
-            recap = await self._build_recovery_context(chat_ref, channel, thread_id)
-            if recap:
-                user_content = _fence_recent_conversation(recap, prompt_text)
+        recap = "\n".join(recap_spans + thread_spans) or None
+        if not recap_spans and chat_ref:
+            fresh = await self._build_recovery_context(chat_ref, channel, thread_id)
+            recap = "\n".join([fresh, *thread_spans]) if fresh else recap
+        user_content = (
+            _fence_recent_conversation(recap, prompt_text) if recap else prompt_text
+        )
 
         messages = [{"role": "user", "content": user_content}]
 
@@ -2487,9 +2549,7 @@ class ConversationLoop:
         logger.info(
             "Contingency response%s (%d chars, history %s, session %s)",
             model_note, len(response),
-            "fenced" if user_content is not prompt_text else (
-                "in prompt" if history_in_prompt else "none"
-            ),
+            "fenced" if recap else "none",
             (session_id or "-")[:8],
         )
         return f"{CONTINGENCY_HEADER_PREFIX}{model_note} — CC limits reached]\n\n{response}"
