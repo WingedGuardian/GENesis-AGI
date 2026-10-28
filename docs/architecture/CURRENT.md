@@ -3660,7 +3660,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py]
-verified: 8a62059720cd 2026-10-22
+verified: bba6115d75fe 2026-10-28
 ```
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
@@ -3809,6 +3809,14 @@ tool-disabled CC probe without changing its schedule or routing authority.
   is declared only at startup — a live server meeting `SQLITE_CORRUPT` does
   not trip it (the 2026-09-18 log-storm class). Both land with the runtime
   corruption trip.
+- **db/ request ownership (internal prerequisite, not activated):**
+  `RequestDatabase` supplies a stable facade with one fresh physical connection
+  per independent unit, bounded admission, retained cancellation cleanup and
+  cursor closure. It preserves explicit CRUD commits and refuses expired scopes;
+  it does not provide whole-tool atomicity. Existing MCP initialization still
+  uses its legacy connection. Service integration and detached-writer ownership
+  are separate prerequisites before shared activation. See
+  `docs/reference/request-database.md` for lifecycle and failure semantics.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Every
   statement through a `SerializedConnection` (its cursors' row fetches too),
