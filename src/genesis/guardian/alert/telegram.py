@@ -12,6 +12,7 @@ import json
 import logging
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 from genesis.guardian.alert.base import Alert, AlertChannel, AlertSeverity
@@ -50,6 +51,13 @@ def _cut(text: str, limit: int) -> str:
         kept.append(ch)
     return "".join(kept) + " … (cut)"
 
+def _is_numeric_id(value: str) -> bool:
+    """A Telegram chat or thread id in its numeric form (``-100…`` or digits)."""
+    value = str(value)
+    digits = value[1:] if value.startswith("-") else value
+    return digits.isascii() and digits.isdigit()
+
+
 # Sentinel returned by _poll_for_keyword_sync when getUpdates reports a 409
 # Conflict. A 409 means another consumer (the main Genesis bot) is actively
 # long-polling the SAME bot token — i.e. the main bot is alive. The caller
@@ -67,12 +75,17 @@ class TelegramAlertChannel(AlertChannel):
         chat_id: str,
         thread_id: str | None = None,
         timeout_s: float = 30.0,
+        sent_log_path: Path | None = None,
     ) -> None:
         self._bot_token = bot_token
         self._chat_id = chat_id
         self._thread_id = thread_id
         self._timeout = timeout_s
         self._api_base = _API_BASE.format(token=bot_token)
+        # Where delivered alerts are recorded for the container to ingest
+        # (alert/sent_log.py). None = not recorded (e.g. a container-side use).
+        self._sent_log_path = sent_log_path
+        self._sent_log_skip_warned = False
 
     async def send(self, alert: Alert) -> bool:
         """Format and send alert as HTML message to Telegram.
@@ -86,7 +99,44 @@ class TelegramAlertChannel(AlertChannel):
         msg_id = await loop.run_in_executor(
             None, self._send_message, text, "HTML",
         )
+        if msg_id is not None:
+            # Off the event loop: the append takes a file lock. Guarded, because
+            # the alert is already out: raising here would read as undelivered
+            # and the queue would re-send it.
+            try:
+                await loop.run_in_executor(None, self._record_sent, text, msg_id)
+            except Exception:
+                logger.warning("Could not record sent alert %s", msg_id, exc_info=True)
         return msg_id is not None
+
+    def _record_sent(self, text: str, message_id: int) -> None:
+        """Append a delivered alert to the sent log. Best-effort, never raises:
+        the alert is already out, and a logging failure must not report it as
+        undelivered (that would re-queue and re-send it)."""
+        if self._sent_log_path is None:
+            return
+        if not _is_numeric_id(self._chat_id) or (
+            self._thread_id and not _is_numeric_id(self._thread_id)
+        ):
+            # An @channel chat id (valid for Telegram) cannot key a stored row.
+            # Say so once, not on every alert.
+            if not self._sent_log_skip_warned:
+                self._sent_log_skip_warned = True
+                logger.warning("Sent alerts not recorded: chat/thread id is not numeric")
+            return
+        try:
+            from genesis.guardian.alert.sent_log import append_sent
+
+            append_sent(
+                self._sent_log_path,
+                chat_id=int(self._chat_id),
+                thread_id=int(self._thread_id) if self._thread_id else None,
+                message_id=message_id,
+                text=text,
+                kind="alert",
+            )
+        except Exception:
+            logger.warning("Could not record sent alert %s", message_id, exc_info=True)
 
     async def send_text(self, text: str) -> int | None:
         """Send a plain message and return its message_id (or None on failure).

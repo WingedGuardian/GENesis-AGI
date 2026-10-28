@@ -7,6 +7,7 @@ Usage:
     python -m genesis.guardian --test-approval  # E2E test the keyword-reply gate
     python -m genesis.guardian --disk-status  # print storage-pool JSON (read-only)
     python -m genesis.guardian --ram-status   # print RAM tier JSON (read-only)
+    python -m genesis.guardian --sent-log <since>  # delivered alerts since <epoch s> as JSON lines (read-only)
     python -m genesis.guardian --host-profile  # host body-schema JSON (read-only)
     python -m genesis.guardian --bundle-status # offline repo-bundle archive JSON (read-only)
     python -m genesis.guardian --provision-status              # host capacity (read-only)
@@ -57,6 +58,9 @@ def main() -> None:
     if "--ram-status" in sys.argv:
         asyncio.run(_ram_status())
         return
+
+    if "--sent-log" in sys.argv:
+        sys.exit(_sent_log(sys.argv))
 
     if "--host-profile" in sys.argv:
         sys.exit(asyncio.run(_host_profile()))
@@ -212,6 +216,37 @@ async def _ram_status() -> None:
     from genesis.guardian.memory_watch import memory_status_snapshot
 
     print(json.dumps(await memory_status_snapshot(load_config())))
+
+
+def _sent_log(argv: list[str]) -> int:
+    """Print delivered alerts with ts >= <since> as JSON lines (read-only).
+
+    One JSON object per entry, oldest first, at most ``sent_log.READ_LIMIT``,
+    then a terminal ``{"ok": true, "action": "sent-log", "count": N}`` line. The
+    container accepts entries only when that terminal line is present, so a
+    truncated response, or log noise on stderr standing in for an empty stdout,
+    is never read as data. Consumed by the `sent-log` gateway verb.
+    """
+    import json
+    import math
+
+    from genesis.guardian.alert.sent_log import read_since
+    from genesis.guardian.config import load_config
+
+    try:
+        since = float(argv[argv.index("--sent-log") + 1])
+        if not math.isfinite(since) or since < 0:
+            raise ValueError(since)
+    except (IndexError, ValueError):
+        print(json.dumps({"ok": False, "action": "sent-log", "error": "invalid since"}))
+        return 1
+
+    config = load_config()
+    entries = read_since(config.state_path / "alerts" / "sent_log.jsonl", since)
+    for entry in entries:
+        print(json.dumps(entry, ensure_ascii=False))
+    print(json.dumps({"ok": True, "action": "sent-log", "count": len(entries)}))
+    return 0
 
 
 async def _host_profile() -> int:
