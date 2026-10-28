@@ -171,7 +171,10 @@ _shown() {
                     HELD="$HELD$rel"$'\n'
                     held=$((held + 1))
                 fi
-            done < <(find "$LOCAL_PATH" -mindepth 1 -name '.*' -prune -o -type f -name '*.genesis.md' -print0)
+            # -H: follow the inbox root itself when it is a symlink (find does
+            # not by default, and the walk would then see nothing), but no
+            # symlink below it.
+            done < <(find -H "$LOCAL_PATH" -mindepth 1 -name '.*' -prune -o -type f -name '*.genesis.md' -print0)
             echo "Cleanup pass: vault listing $remote_count response file(s), cleaned $cleaned, held $held, kept $kept_unseen never-listed (will push)"
         else
             echo "Cleanup pass: no usable vault record yet — seeding it from this listing ($remote_count response file(s)); nothing cleaned this cycle"
