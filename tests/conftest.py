@@ -391,7 +391,19 @@ def _is_introspection_only(config) -> bool:
     )
 
 
+pytest_plugins = ["tests._live_fence"]
+
+
 def pytest_configure(config):
+    _configure_lock_and_basetemp(config)
+    # Armed AFTER the lock (a run refused by it exits above) and after basetemp is
+    # placed (the fence allows fakes under it). See tests/_live_fence.py.
+    from tests import _live_fence
+
+    _live_fence.install(config)
+
+
+def _configure_lock_and_basetemp(config):
     # ── Box-wide serialization ─────────────────────────────────────────────
     # Acquire BEFORE anything else, and before the basetemp early-return
     # below, so every exit path from this function is already governed.
@@ -406,8 +418,14 @@ def pytest_configure(config):
     from genesis.util import pytest_lock
     from genesis.util.tmp import big_tmp_dir, should_redirect_pytest_basetemp
 
+    global _BOX_LOCK
     lock = pytest_lock.acquire()
     config._genesis_pytest_lock = lock
+    _BOX_LOCK = lock
+    if not config.pluginmanager.hasplugin("timeout"):
+        # The holder record says so, which the stall report quotes: nothing
+        # will end a hung test in this run.
+        lock.note_suffix = "per-test timeout: none (pytest-timeout is not active)"
     if lock.blocked and not _is_introspection_only(config):
         pytest.exit(lock.message, returncode=pytest_lock.EXIT_LOCK_HELD)
     elif lock.blocked:
@@ -487,6 +505,9 @@ def pytest_unconfigure(config):
     produces."""
     target = getattr(config, "_genesis_basetemp_cleanup", None)
     try:
+        from tests import _live_fence
+
+        _live_fence.uninstall_files(config)
         if target:
             # BROAD for the same reason as pytest_configure's fallback: a hook that
             # raises turns a passing suite into exit 1, and cleanup is best-effort.
@@ -532,6 +553,20 @@ def updates_sandbox(tmp_path, monkeypatch):
     return isolate_update_routes(
         monkeypatch, tmp_path / "sandbox-home", scratch_repo(tmp_path / "sandbox-repo")
     )
+
+
+# ── The deploy engine probe: unanswered for tests that build a health snapshot ──
+@pytest.fixture
+def deploy_engine_unanswered(monkeypatch):
+    """The health snapshot's deploy section runs ``scripts/deploy_candidates list
+    --json`` against this checkout, which reads the install's real deploy manifest
+    and which the live fence refuses. Tests that build a whole snapshot answer it
+    the way an unreachable engine does (``None``: carried as unknown, never 0)."""
+    import importlib
+
+    # The package re-exports a function named deploy_health; patch the module.
+    module = importlib.import_module("genesis.observability.snapshots.deploy_health")
+    monkeypatch.setattr(module, "_observe_engine", lambda *args, **kwargs: None)
 
 
 # ── Graph-traversal telemetry is OFF unless a test opts in ─────────────────
@@ -589,6 +624,12 @@ def _isolate_alert_queue(tmp_path):
     # machine must not become an observation.
     mp.setenv("GENESIS_TSWD_STATE_FILE", str(tmp_path / "no-tailscale-watchdog.json"))
     mp.setenv("GENESIS_TSWD_SYSTEMCTL", "/bin/false")
+    # At >= 80% of the live PID budget the tick would also write a breakdown of
+    # the real /proc into the real ~/.genesis/logs/pid_snapshots.
+    mp.setenv("GENESIS_PID_BREAKDOWN_DISABLED", "1")
+    # Every test that exhausts the DB lock retries would otherwise write a
+    # lock-holder snapshot into the real ~/.genesis/logs/lock_snapshots.
+    mp.setenv("GENESIS_LOCK_SNAPSHOT_DISABLED", "1")
     yield
     mp.undo()
 
@@ -1071,6 +1112,50 @@ with contextlib.suppress(Exception):  # see the best-effort note above
     _claim_active_test_breadcrumb()
 
 
+# The box lock this session holds, for the per-test hooks below (they get no
+# ``config``). Set in ``pytest_configure``; ``BoxLock.note`` is a no-op unless
+# this process actually holds the lock.
+_BOX_LOCK = None
+
+_NO_TIMEOUT_WARNING = (
+    "genesis: pytest-timeout is not active (not installed, or disabled with "
+    "-p no:timeout), so the per-test timeout in pyproject.toml does nothing: a "
+    "hung test runs until killed and holds the box-wide test lock (every other "
+    "session's pytest waits). Install it into this venv: pytest-timeout, or the "
+    "package's [test] extra."
+)
+
+
+def pytest_sessionstart(session):
+    """Say LOUDLY, at the top of the run, when no per-test timeout applies.
+
+    pytest's own signal for this is ``Unknown config option: timeout`` in the
+    warnings summary at the END of the run, which is exactly when it no longer
+    helps. bootstrap installs the ``[test]`` extra as a non-fatal step
+    (``install_runtime_extras``), so a venv can still lack the plugin when that
+    step failed or before the first update that ran it; a hang observed on
+    2026-10-11 held the box lock for about 40 minutes in a venv without it.
+    """
+    config = session.config
+    if config.pluginmanager.hasplugin("timeout"):
+        return
+    reporter = config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is not None:
+        reporter.write_line(_NO_TIMEOUT_WARNING, yellow=True, bold=True)
+    else:
+        sys.stderr.write(_NO_TIMEOUT_WARNING + "\n")
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """Tell a contender that the tests are done and teardown is running.
+
+    Without this the record keeps naming the LAST test through basetemp removal
+    (``pytest_unconfigure``), so a slow teardown would read as that test hung.
+    """
+    if _BOX_LOCK is not None:
+        _BOX_LOCK.note("(session teardown)")
+
+
 def pytest_runtest_logstart(nodeid, location):
     """Record the test about to run, for a crash that never writes a report.
 
@@ -1088,6 +1173,8 @@ def pytest_runtest_logstart(nodeid, location):
     throughout -- a breadcrumb that could fail the suite it exists to diagnose
     would be a poor trade.
     """
+    if _BOX_LOCK is not None:
+        _BOX_LOCK.note(nodeid)
     path = os.environ.get(ACTIVE_TEST_FILE_ENV)
     if not path or not _owns_active_test_breadcrumb():
         return

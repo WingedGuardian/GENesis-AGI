@@ -110,7 +110,7 @@ async def promote_and_demote(db: aiosqlite.Connection) -> dict:
     # Earned rows and lessons are listed apart, so lessons (all at the same
     # authored confidence) never push earned rows out of the earned window.
     # Every lesson is checked for quarantine; none is ever promoted.
-    rows = await procedural.list_active(db, lessons=False) + await procedural.list_lessons(db)
+    rows = await procedural.list_active(db, lessons=False, limit=None) + await procedural.list_lessons(db)
     promotions = 0
     demotions = 0
     quarantined = 0

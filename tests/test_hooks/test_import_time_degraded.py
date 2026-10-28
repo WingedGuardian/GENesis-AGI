@@ -668,6 +668,10 @@ _NOT_WIRED = {
     # test_codex_review_stop::test_launcher_denies_each_module_scope_import_failure;
     # test_project_config_wires_fallback_launcher checks the actual entry point.
     "codex_review_stop.py": "Codex shell launcher converts every sibling import crash to exit 2",
+    # The inactive validator definition also runs its explicit-allow shell
+    # launcher. Missing/crashing sibling imports and a healthy allow control
+    # are measured by test_codex_validator_adapter's launcher import test.
+    "codex_validator_adapter.py": "Codex shell launcher converts every sibling import crash to exit 2",
     # Its remaining bare import is `shell_parse`, and its only usable degraded token
     # would be the pipe character — 52,220 of 74,282 commands (70.30%). Wiring it would
     # not make the broken state safe, it would make it UNREPAIRABLE, and a degraded
@@ -685,6 +689,10 @@ _NOT_WIRED = {
     # direction for a gate whose whole measured design property is that it must
     # never become the thing that wedges the work.
     "adopt_first_gate.py": "fail-open by contract — refusing would wedge every edit and plan exit",
+    # plan_premise_gate shares that contract and that matcher: a broken import that
+    # refused would stop every ExitPlanMode until repair, for a check whose worst miss
+    # is a plan presented without its premise answers.
+    "plan_premise_gate.py": "fail-open by contract — refusing would wedge every plan exit",
     # Not a hook at all: the deploy-candidates engine is a command-line program run
     # through scripts/deploy_candidates. Its "return 2" is argparse's usage error,
     # and a failed import exiting 1 is the correct CLI answer ("failed"), not a
@@ -1355,13 +1363,10 @@ def test_degraded_pretool_check_reads_the_stamp_exactly_as_the_healthy_path_does
 #:
 #: Keyed on the EXACT normalised command, not a substring. A substring key is an
 #: exemption with a wildcard on the end: a newly wired
-#: `python3 scripts/cc-deploy-timeout-guard.py` would inherit the shell hook's
+#: `python3 scripts/<hook>.py` would inherit a shell hook's
 #: waiver and never be executed, which is precisely the "a new guard fails by
 #: construction" guarantee this gate exists to make.
-_NOT_PYTHON_ON_BASH = {
-    "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cc-deploy-timeout-guard":
-        "shell script; never imports hook_input",
-}
+_NOT_PYTHON_ON_BASH: dict[str, str] = {}
 
 #: The inline `bash -c` guard is exempted by its own exact text, which is long and
 #: contains quoting, so it is matched after whitespace normalisation rather than
@@ -1391,6 +1396,7 @@ _INLINE_SHELL_PREFIX = "bash -c 'IN=$(cat);"
 _ADVISORY_BY_DESIGN = {
     "hooks/capped_read_advisory.py": "ADVISORY ONLY.",
     "hooks/credential_surface_hook.py": "Exit 0 always — advisory, never blocks.",
+    "hooks/deploy_timeout_advisory.py": "ADVISORY ONLY. It never blocks and never asks",
     "hooks/pipe_status_guard.py": "ADVISORY, never blocking:",
     "hooks/pr_close_advisory.py": "Say so; never block it.",
     "hooks/pre_push_privacy_review.py": "NON-BLOCKING.",

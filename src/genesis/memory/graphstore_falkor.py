@@ -104,6 +104,123 @@ GRAPH_KEY = "genesis_memory"
 #: an unbounded wait. Do not read it as "falling back is free".
 _READ_TIMEOUT_S = 0.5
 
+#: How many innermost frames a timeout's diagnosis keeps (see `_timeout_diag`).
+#: Four could not tell a reconnect's handshake from a query's reply: redis-py
+#: reads both through the same `_readline>readline>readuntil>_wait_for_data`,
+#: and every instrumented timeout ended in exactly those four. MEASURED with
+#: redis 8.1.0: the reply path is 16 frames deep, the handshake path 20 or more,
+#: and the frames that tell them apart (`_send_command_parse_response`;
+#: `ensure_connection`, `connect_check_health`) sit within the deepest 16 either
+#: way. The window keeps the DEEPEST frames, so frames added above never move it.
+_DIAG_FRAMES = 16
+
+
+def _psi_totals() -> dict[str, int] | None:
+    """This container's cumulative cgroup stall counters (µs), or None. Read at
+    the start of every bounded call and again at its timeout: 3 cgroupfs reads.
+    cgroup files ONLY: the ``/proc/pressure`` fallback is host-wide inside a
+    container, and host pressure must never be booked as this read's cause."""
+    try:
+        from genesis.hostmetrics.readings import read_psi_totals
+
+        return read_psi_totals(cgroup_only=True)
+    except Exception:
+        logger.debug("PSI totals unreadable for the timeout diagnosis", exc_info=True)
+        return None
+
+
+def _client_version() -> str | None:
+    """The redis-py version, which ``frame_lines`` mean nothing without."""
+    try:
+        import redis
+
+        return str(redis.__version__)
+    except Exception:
+        return None
+
+
+def _timeout_diag(
+    exc: BaseException,
+    *,
+    timeout: float,
+    started: float,
+    fired_at: float | None,
+    psi_before: dict[str, int] | None,
+    pool: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """What a deadline that fired can say about its own cause. Never raises.
+
+    - ``frames``: function names of the awaits the deadline cancelled, deepest
+      last (the TimeoutError's cause is that CancelledError). Names only: no
+      paths, no arguments. A client construction shows ``_graph``; a handshake
+      shows ``ensure_connection``/``connect_check_health``; a reply never sent
+      shows ``_send_command_parse_response`` above the client's reader.
+    - ``late_ms``: how long after the deadline the event loop got to run it,
+      read from a marker timer due at the same instant. The deadline runs on the
+      loop, so a loop held by synchronous work runs it late: large means THIS
+      process stalled, about zero means the engine did not answer in time.
+    - ``cancel_ms``: from that moment until the timeout surfaced. ``wait_for``
+      raises only once the cancelled operation finishes its own cleanup, so slow
+      cleanup lands here and never in ``late_ms``.
+    - ``psi_stall_us``: the container's cgroup stall time (µs) across the wait,
+      per resource. ``avg10`` cannot see a sub-second stall.
+    - ``frame_lines``: the line each of ``frames`` was at, so a first connect and
+      a reconnect inside the same function stay apart.
+    - ``conn`` / ``in_use``: the connection the pool was about to hand out, read
+      BEFORE the read (see `_pool_state`).
+    """
+    diag: dict[str, Any] = {
+        "budget_ms": round(timeout * 1000, 1),
+        "elapsed_ms": None,
+        "late_ms": None,
+        "cancel_ms": None,
+        "frames": None,
+        "frame_lines": None,
+        "psi_stall_us": None,
+        **(pool or {"conn": None, "in_use": None}),
+    }
+    try:
+        now = time.monotonic()
+        diag["elapsed_ms"] = round((now - started) * 1000, 1)
+        if fired_at is not None:
+            diag["late_ms"] = round((fired_at - started - timeout) * 1000, 1)
+            diag["cancel_ms"] = round((now - fired_at) * 1000, 1)
+        cancelled = exc.__cause__
+        tb = cancelled.__traceback__ if cancelled is not None else None
+        if tb is not None:
+            names: list[str] = []
+            lines: list[int] = []
+            while tb is not None:
+                names.append(tb.tb_frame.f_code.co_name)
+                lines.append(tb.tb_lineno)
+                tb = tb.tb_next
+            diag["frames"] = names[-_DIAG_FRAMES:]
+            diag["frame_lines"] = lines[-_DIAG_FRAMES:]
+            diag["client_version"] = _client_version()
+        after = _psi_totals()
+        if psi_before and after:
+            diag["psi_stall_us"] = {
+                k: after[k] - psi_before[k] for k in sorted(psi_before) if k in after
+            }
+    except Exception:  # a diagnosis must never cost the error it describes
+        logger.debug("timeout diagnosis incomplete", exc_info=True)
+    return diag
+
+
+@contextlib.contextmanager
+def _labelled(query: str):
+    """Name which of a traversal's two queries a timeout's ``.diag`` belongs to.
+    The marker query runs on what the first one left of the budget, so its frames
+    alone look identical to a main-query timeout."""
+    try:
+        yield
+    except GraphUnavailableError as exc:
+        diag = getattr(exc, "diag", None)
+        if isinstance(diag, dict):
+            diag.setdefault("query", query)
+        raise
+
+
 #: PROJECT bounds a batch job with no reader waiting on it, so it is sized to
 #: catch a HUNG engine and nothing else — 90x the slowest measured batch.
 _PROJECT_TIMEOUT_S = 30.0
@@ -120,6 +237,34 @@ _PUBLISH_LOCK_TTL_S = 300
 #: Batch size for the projection. MEASURED at 10k: 60,384 nodes/s and 29,867
 #: edges/s, a 9.06s full projection of 68,064 nodes / 236,937 edges.
 _PROJECT_BATCH = 10_000
+
+#: The reads a projection runs on its STAGING graph before the swap, so that no
+#: caller's read is the first one. MEASURED 2026-10-26 (FalkorDB 4.20.4, 106k
+#: nodes / 406k edges; engine time from SLOWLOG): the first traversal of a
+#: freshly projected graph took 52-64 ms on an idle box, up to 146 ms under
+#: added load, and up to 358 ms on a live install, almost all of it in the
+#: Filter and end-node operators the first time they evaluated a path's
+#: properties; reads after it took 1-3.5 ms. All four read timeouts recorded
+#: there from 2026-10-21 to 2026-10-26 were that first read, each with 24-293 ms
+#: of container I/O stall recorded across its wait. With this warm-up the
+#: first live read took 1.2-2.9 ms in 15 of 15 runs at both depths: the warmth
+#: and the per-graph plan cache survive the RENAME. A warm-up with different
+#: query text left about 12 ms, so the texts must be the callers' own.
+#:
+#: Each pair is a (depth, min_strength) a caller passes: `memory_recall` and
+#: `memory_expand` traverse at (2, 0.3), `drift_recall` at (1, 0.5). The depth is
+#: part of the query TEXT, so each one is its own plan-cache entry.
+_WARM_TRAVERSALS = ((2, 0.3), (1, 0.5))
+#: The root's edge must pass every threshold above, or the walk stops before the
+#: operators that carry the cost see a row and warms nothing.
+_WARM_MIN_STRENGTH = max(s for _d, s in _WARM_TRAVERSALS)
+#: The whole warm-up's bound. It is only an optimisation, so a slow or hung
+#: engine costs the projection this much and never `_PROJECT_TIMEOUT_S` per read.
+_WARM_TIMEOUT_S = 5.0
+
+#: The empty-result path's second query (`_assert_projection_exists`), shared
+#: with the warm-up so the two texts cannot drift apart.
+_PROJECTION_MARKER_COUNT = "MATCH (m:ProjectionMeta) RETURN count(m)"
 
 # Hop-wise validity, over the properties the projection mirrors. Mirrors the
 # SQLite predicate in `graphstore.invalid_memory_ids` -- a non-zero deprecated
@@ -385,6 +530,43 @@ class FalkorGraphStore:
         await self._graph()
         return self._db.connection
 
+    def _pool_state(self) -> dict[str, Any]:
+        """The connection the client's pool will hand the next read, and how many
+        it has out. Synchronous and read before the read, with no await between,
+        so on one event loop nothing can change it first; another coroutine's
+        read already in flight is what ``in_use`` counts.
+
+        ``conn``: ``"no_client"`` (not constructed yet: the read will build it),
+        ``"new"`` (nothing idle: the pool will open one, handshake included),
+        ``"idle_open"`` / ``"idle_closed"`` (the idle connection the pool pops,
+        its LAST, by whether it still holds a socket). ``idle_open`` cannot see a
+        socket the server already closed. MEASURED on redis 8.1.0: that read
+        fails fast with ``ConnectionError`` ("Connection lost") rather than
+        timing out, so it reaches telemetry as an error, never as a timeout
+        diagnosis; the next read opens a new connection.
+
+        "Nothing can change it first" fails in one rare window: a read waiting
+        on the pool's lock while another coroutine's ``release()`` disconnects
+        under it. Its frames then sit under ``get_connection`` and read as a
+        connect.
+
+        Reads redis-py's private pool lists, so any surprise reads ``None``.
+        """
+        state: dict[str, Any] = {"conn": None, "in_use": None}
+        if self._db is None:
+            state["conn"] = "no_client"
+            return state
+        try:
+            pool = self._db.connection.connection_pool
+            idle = pool._available_connections
+            in_use = len(pool._in_use_connections)
+            last = idle[-1] if idle else None
+            conn = "new" if last is None else "idle_open" if last.is_connected else "idle_closed"
+            state.update(conn=conn, in_use=in_use)
+        except Exception:
+            logger.debug("pool state unreadable for the timeout diagnosis", exc_info=True)
+        return state
+
     async def _bounded(
         self, factory: Callable[[], Awaitable[Any]], *, timeout: float, what: str
     ) -> Any:
@@ -403,12 +585,35 @@ class FalkorGraphStore:
         because the deadline has to cover connecting as well as the operation
         and the connect happens inside it.
         """
+        # The budget starts BEFORE the diagnosis's own read, so that read spends
+        # it rather than extending it: the call stays bounded by `timeout`.
+        started = time.monotonic()
+        psi_before = _psi_totals()
+        # Before the factory runs: the read itself takes this connection out of
+        # the idle list, so a reading taken at the timeout would always say "new".
+        pool = self._pool_state()
+        remaining = max(0.0, started + timeout - time.monotonic())
+        # A marker due at the same instant as the deadline: when it ran is when
+        # the loop got to the deadline, apart from any cancellation cleanup after.
+        fired: list[float] = []
+        marker = asyncio.get_running_loop().call_later(
+            remaining, lambda: fired.append(time.monotonic())
+        )
         try:
-            return await asyncio.wait_for(factory(), timeout=timeout)
+            return await asyncio.wait_for(factory(), timeout=remaining)
         except TimeoutError as exc:
-            raise GraphUnavailableError(
-                f"{what} exceeded {timeout}s — the engine is not answering"
-            ) from exc
+            err = GraphUnavailableError(f"{what} exceeded {timeout}s — the engine is not answering")
+            # Read by the traversal telemetry: every cutover-clock reset was one
+            # of these, and the class name alone named no cause.
+            err.diag = _timeout_diag(
+                exc,
+                timeout=timeout,
+                started=started,
+                fired_at=fired[0] if fired else None,
+                psi_before=psi_before,
+                pool=pool,
+            )
+            raise err from exc
         except GraphUnavailableError:
             # Already the right type and already carries the better message
             # (e.g. "cannot reach the graph engine at ..."). Re-wrapping would
@@ -420,6 +625,8 @@ class FalkorGraphStore:
             # returning [] would tell dream-centrality there are no bridges and
             # let it wipe the shield's thresholds.
             raise GraphUnavailableError(f"{what} failed: {exc}") from exc
+        finally:
+            marker.cancel()
 
     async def _query(
         self,
@@ -565,6 +772,81 @@ class FalkorGraphStore:
                 "graph rolled backwards is not."
             )
 
+    async def _warm(
+        self,
+        staging: str,
+        edges: list[tuple[str, str, str, float | None]],
+        meta: dict[str, tuple[float | None, int]],
+        now: float,
+    ) -> str:
+        """Run the callers' own queries on ``staging``, so no caller's read is the
+        first (see `_WARM_TRAVERSALS`). Returns one line for the projector's own
+        output, which is what the hourly unit's journal keeps.
+
+        Never raises an ``Exception``: a failed warm-up publishes a cold graph,
+        which is what every projection did before. A cancellation still
+        propagates, so the caller's cleanup drops staging.
+
+        The root comes from the edges already in hand rather than from a query:
+        the first edge strong enough for every threshold whose two ends are both
+        visible. From any other root the traversal's own predicate stops the walk
+        before the operators that carry the cost see a row, and the warm-up would
+        succeed while warming nothing.
+        """
+        started = time.monotonic()
+        deadline = started + _WARM_TIMEOUT_S
+        root = None
+        rows: list[int] = []
+        try:
+            # Inside the try: a strength stored as TEXT (the column has no
+            # CHECK) would raise here, and an optimisation must never cost the
+            # projection it serves.
+            root = next(
+                (
+                    s
+                    for s, t, _ty, st in edges
+                    if isinstance(st, (int, float))
+                    and st >= _WARM_MIN_STRENGTH
+                    and not _is_hidden(meta.get(s), now)
+                    and not _is_hidden(meta.get(t), now)
+                ),
+                None,
+            )
+            if root is not None:
+                for depth, min_strength in _WARM_TRAVERSALS:
+                    result = await self._query(
+                        _TRAVERSE.replace("{depth}", str(depth)),
+                        {
+                            "root": root,
+                            "min_strength": min_strength,
+                            "now": now,
+                            "include_deprecated": False,
+                        },
+                        key=staging,
+                        timeout=max(0.0, deadline - time.monotonic()),
+                    )
+                    rows.append(len(result.result_set or []))
+            await self._query(
+                _PROJECTION_MARKER_COUNT,
+                {},
+                key=staging,
+                timeout=max(0.0, deadline - time.monotonic()),
+            )
+        except Exception as exc:
+            ms = (time.monotonic() - started) * 1000
+            logger.warning(
+                "falkordb: warming the new projection failed after %.0f ms; "
+                "publishing it cold, so the first read after the swap pays the "
+                "warm-up instead",
+                ms,
+                exc_info=True,
+            )
+            return f"FAILED after {ms:.0f} ms ({type(exc).__name__}); published cold"
+        ms = (time.monotonic() - started) * 1000
+        if root is None:
+            return f"marker only in {ms:.0f} ms: no edge qualified as a root"
+        return f"warmed in {ms:.0f} ms (traversal rows {rows})"
+
     # ── GraphStore protocol ───────────────────────────────────────────
 
     async def traverse(
@@ -633,22 +915,23 @@ class FalkorGraphStore:
         # multi-second NetworkX rebuild on top. The budget belongs to the
         # TRAVERSAL, so it is stamped once here and spent down.
         deadline = time.monotonic() + _READ_TIMEOUT_S
-        result = await self._query(
-            _TRAVERSE.replace("{depth}", str(int(max_depth))),
-            {
-                "root": root_id,
-                "min_strength": float(min_strength),
-                # FLOAT, not int. Truncating both sides to whole seconds hides a
-                # memory for up to a second before it actually expires: with now
-                # at T.100 and invalid_at at T.900, `invalid_epoch > now` is
-                # T > T -> False here while SQLite and NetworkX both still say
-                # visible. Genesis's timestamps carry microseconds
-                # (`db/timeutil.py`), so the precision is real data, not a
-                # theoretical tail.
-                "now": time.time(),
-                "include_deprecated": bool(include_deprecated),
-            },
-        )
+        with _labelled("traverse"):
+            result = await self._query(
+                _TRAVERSE.replace("{depth}", str(int(max_depth))),
+                {
+                    "root": root_id,
+                    "min_strength": float(min_strength),
+                    # FLOAT, not int. Truncating both sides to whole seconds hides a
+                    # memory for up to a second before it actually expires: with now
+                    # at T.100 and invalid_at at T.900, `invalid_epoch > now` is
+                    # T > T -> False here while SQLite and NetworkX both still say
+                    # visible. Genesis's timestamps carry microseconds
+                    # (`db/timeutil.py`), so the precision is real data, not a
+                    # theoretical tail.
+                    "now": time.time(),
+                    "include_deprecated": bool(include_deprecated),
+                },
+            )
         nodes = [
             GraphNode(
                 memory_id=row[0],
@@ -733,12 +1016,25 @@ class FalkorGraphStore:
         else:
             timeout = deadline - time.monotonic()
             if timeout <= 0:
-                raise GraphUnavailableError(
+                err = GraphUnavailableError(
                     "the traversal budget was spent before the projection could be "
                     "confirmed — the engine is not answering fast enough to tell an "
                     "empty graph from an unbuilt one"
                 )
-        result = await self._query("MATCH (m:ProjectionMeta) RETURN count(m)", {}, timeout=timeout)
+                # No await was cancelled, so no frames: the first query used the
+                # whole budget. late_ms is how far past the deadline this is.
+                err.diag = {
+                    "budget_ms": round(_READ_TIMEOUT_S * 1000, 1),
+                    "elapsed_ms": None,
+                    "late_ms": round(-timeout * 1000, 1),
+                    "frames": None,
+                    "psi_stall_us": None,
+                    # The marker query was never issued: the first used the budget.
+                    "budget_spent": True,
+                }
+                raise err
+        with _labelled("marker"):
+            result = await self._query(_PROJECTION_MARKER_COUNT, {}, timeout=timeout)
         rows = result.result_set or []
         if not (rows and rows[0] and rows[0][0]):
             raise GraphUnavailableError(
@@ -805,7 +1101,7 @@ class FalkorGraphStore:
 
     # ── projection ────────────────────────────────────────────────────
 
-    async def project(self, db: aiosqlite.Connection) -> dict[str, int]:
+    async def project(self, db: aiosqlite.Connection) -> dict[str, int | str]:
         """Rebuild the whole projection from ``memory_links``. Explicit, not scheduled.
 
         Automated since F3 slice 1: `genesis-graph-project.timer` calls the
@@ -945,7 +1241,7 @@ class FalkorGraphStore:
 
     async def _project_locked(
         self, db: aiosqlite.Connection, token: str | None
-    ) -> dict[str, int]:
+    ) -> dict[str, int | str]:
         """The body of `project()`, run under its per-key lock."""
         # ONE SNAPSHOT for both reads. These are two statements, and in
         # autocommit each takes its own WAL read snapshot — so a writer
@@ -1090,6 +1386,9 @@ class FalkorGraphStore:
                 key=staging,
                 timeout=_PROJECT_TIMEOUT_S,
             )
+            # After the marker, so the marker count is warmed against the graph
+            # that will be published; before the swap, so no caller pays it.
+            warm = await self._warm(staging, edges, meta, now)
 
             try:
                 await self._publish_swap(staging, token)
@@ -1123,7 +1422,7 @@ class FalkorGraphStore:
             raise
 
         hidden = sum(1 for mid in ids if _is_hidden(meta.get(mid), now))
-        return {"nodes": len(ids), "edges": len(edges), "hidden": hidden}
+        return {"nodes": len(ids), "edges": len(edges), "hidden": hidden, "warm": warm}
 
     async def _ensure_index(self, *, key: str | None = None) -> None:
         """Create the id index if it is not already there.

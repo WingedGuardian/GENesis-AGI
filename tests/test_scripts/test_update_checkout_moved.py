@@ -909,13 +909,13 @@ def test_the_closing_banner_does_not_claim_a_rollback_that_did_not_happen():
     start = text.index("_do_rollback() {")
     body = text[start : text.index("\n_on_err() {", start)]  # the heredoc holds a column-0 }
     banner = body.index('echo "  Rolled back: $OLD_TAG ($OLD_COMMIT) on $ORIGINAL_BRANCH"')
-    gate = body.rindex(
-        'if [ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ] && [ "$db_ok" = "true" ]',
-        0,
-        banner,
-    )
+    gate = body.rindex('if [ "$rollback_ok" = true ]', 0, banner)
     assert "\n    fi\n" not in body[gate:banner]
     assert "NOT fully rolled back" in body[banner:]
+    # rollback_ok is the one verdict, and it needs every recovery step back.
+    verdict = body[body.index("local rollback_ok=false") : body.index("rollback_ok=true")]
+    for part in ("checkout_ok", "pip_ok", "db_ok", "hooks_ok", "svc_ok"):
+        assert f'"${part}"' in verdict, part
 
 
 _SWITCH_BACK = 'checkout -q --no-overwrite-ignore -B "$ORIGINAL_BRANCH" "$ROLLBACK_TAG"'

@@ -119,6 +119,8 @@ import subprocess
 import sys
 import time
 import unicodedata
+from collections.abc import Callable
+from typing import Literal, NamedTuple
 
 # Self-locate so `from hook_input import …` resolves both when CC runs this as a
 # script (sys.path[0] is this dir) AND when it is imported as a module for tests
@@ -338,11 +340,13 @@ try:
         raw_sets_repo_env,
         seg_redirects_repo,
     )
+    from pr_close_predicate import pr_close_reason  # noqa: E402
     from shell_parse import (  # noqa: E402
         _KNOWN_SIGILS,
         _REPARSE_CARRIERS,
         PushArg,
         PushArgKind,
+        Segment,
         analyze,
         analyze_checked,
         commit_skips_hooks,
@@ -942,7 +946,7 @@ def _walk_merge_into_main(
     # asserts a waiver that was never consulted, in a store whose entire purpose
     # is answering "was this escape reached for?", and the row carries nothing to
     # reconcile it against. An honest row needs the branch resolved first; see
-    # the follow-up. `# escalation-ack` belongs to the local commit-streak gate;
+    # the follow-up. `# escalation-ack` belonged to the retired commit-streak gate;
     # `# final-round-accept` is recognized only for stale-tree compatibility.
     for s in merge_git_segs:
         if getattr(s, "depth", 0) > 0:
@@ -2166,7 +2170,14 @@ def _doc_findings_mode() -> str:
 # command that merely MENTIONS a bare keyword alongside "sqlite3" without a write
 # (a `grep 'sqlite3 … DELETE' file`, or a read whose STRING VALUE is a keyword
 # like `WHERE s='DELETE'`) still matches. Excluding those needs real SQL/shell
-# parsing — tracked as a follow-up, not worth reintroducing bypass risk for.
+# parsing, which is not worth reintroducing bypass risk for. Read-only queries
+# go through `~/genesis/.venv/bin/python -m genesis db query "<sql>"` instead
+# (issue #3531; the venv interpreter, since a session shell has no `python` on
+# PATH and the system python3 cannot import genesis): SQLite
+# itself enforces read-only there (mode=ro, query_only, an allowlist
+# authorizer), and its command text carries no `sqlite3`, so no exemption is
+# needed here. A text-level exemption for `sqlite3 -readonly -safe` was
+# rejected: shell expansion, dot-commands and `.sqliterc` all bypassed it.
 _DML_KEYWORD_RE = re.compile(
     r"\b(?:INSERT|UPDATE|DELETE|DROP|ALTER|REPLACE)\b(?!\s*\()",
     re.IGNORECASE,
@@ -4401,7 +4412,7 @@ def _check_inline_review_findings(
     # that has always stopped it.
     #
     # WHAT THIS ENFORCES IS NARROWER THAN THE DOCTRINE IT SERVES, and the two
-    # must not be conflated. The genesis-development skill's always-fix floor is
+    # must not be conflated. The closing-session skill's always-fix floor is
     # severity AND KIND — "a P1, a security defect, anything destructive or
     # fail-open". This check can only see the severity LABEL a reviewer attached,
     # so a CodeRabbit MINOR naming a fail-open scores 0.0 and passes here. The
@@ -4933,11 +4944,11 @@ def _comment_positional(argv: list[str]) -> tuple[str | None, str | None]:
     return None, None
 
 
-# EXTRACTION patterns — what a target MEANS. `_PR_URL_RE` keeps its original
-# shape (trailing context tolerated, e.g. a `#issuecomment-…` fragment) because
-# it reads the number and OWNER/REPO out of a URL.
+# EXTRACTION patterns — what a target MEANS. `_PR_URL_RE` requires an explicit
+# scheme and host; scheme-less PR-shaped branch names stay branches. It permits
+# trailing context (e.g. a `#issuecomment-…` fragment) when reading a URL.
 _PR_NUMBER_RE = re.compile(r"#?([0-9]+)\Z")
-_PR_URL_RE = re.compile(r"(?:[a-z]+://[^/\s]+/)?([^/\s]+/[^/\s]+)/pull/(\d+)\b")
+_PR_URL_RE = re.compile(r"(?:[a-z]+://[^/\s]+/)([^/\s]+/[^/\s]+)/pull/(\d+)\b")
 
 # ALLOWLIST patterns — what the gate accepts as unambiguously LITERAL. See
 # `_unresolvable_identity` for why these are allowlists and not screens.
@@ -4947,7 +4958,7 @@ _PR_URL_RE = re.compile(r"(?:[a-z]+://[^/\s]+/)?([^/\s]+/[^/\s]+)/pull/(\d+)\b")
 # comment only at word start). It stops short of `?query`, because `?` is a
 # glob metacharacter and the shell WOULD act on it.
 _LITERAL_URL_RE = re.compile(
-    r"(?:[a-z]+://[A-Za-z0-9._-]+/)?[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+"
+    r"(?:[a-z]+://[A-Za-z0-9._-]+/)[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/pull/[0-9]+"
     r"(?:[/#][A-Za-z0-9._/#-]*)?\Z"
 )
 # A branch name in characters that are both legal in a git ref and inert to the
@@ -4965,7 +4976,8 @@ def _comment_target(argv: list[str]) -> tuple[str | None, str | None]:
     Number from a bare number, #N, or PR URL; a URL target ALSO carries its
     OWNER/REPO (counting against the hook cwd's repo for a cross-repo URL could
     produce a wrong count and a FALSE block — Codex round-1 finding). An
-    explicit ``--repo``/``-R`` flag wins over the URL-derived repo. A branch
+    explicit ``--repo``/``-R`` flag combined with a URL is refused, as are
+    unsupported explicit hosts; neither yields a usable identity. A branch
     target (non-numeric, non-URL positional) yields (None, …); the caller treats
     that unresolved identity as unknown evidence and asks/denies.
 
@@ -4976,6 +4988,8 @@ def _comment_target(argv: list[str]) -> tuple[str | None, str | None]:
     be commented on, and resolving one was reading an identity out of a command
     that cannot run.
     """
+    if _unresolvable_identity(argv) is not None:
+        return None, None
     tok, _ = _comment_positional(argv)
     pr_num: str | None = None
     url_repo: str | None = None
@@ -5052,10 +5066,16 @@ def _unresolvable_identity(argv: list[str]) -> str | None:
     # Checked against the value AS WRITTEN, before the host reduction, so an
     # expansion in the host position cannot be dropped on the way in.
     repo = _comment_repo_value(argv)
-    if repo is None and tok is not None:
-        url = _PR_URL_RE.match(tok)
-        repo = url.group(1) if url else None
+    url = _PR_URL_RE.match(tok) if tok is not None else None
+    if url:
+        if repo is not None:
+            return f"{tok} combined with --repo/-R"
+        if "://" in tok and not tok.startswith(("https://github.com/", "http://github.com/")):
+            return tok
+        repo = url.group(1)
     if repo is not None and not _LITERAL_REPO_RE.match(repo):
+        return repo or "--repo (empty value)"
+    if repo is not None and repo.count("/") == 2 and repo.split("/", 1)[0] != "github.com":
         return repo
     return None
 
@@ -5066,10 +5086,12 @@ def _unresolvable_identity_advisory(token: str) -> str:
         "the Codex round cap cannot be checked.\n"
         "This hook runs BEFORE the shell expands anything, so the PR target and "
         "the --repo value are readable only when they are written out. The gate "
-        "accepts what gh documents, spelled literally; anything else is refused "
+        "accepts literal identities on github.com; anything else is refused "
         "rather than counted against the wrong pull request, or against none.\n"
-        "Re-run with the identity written out — a number, #N or a PR URL, and "
-        "OWNER/REPO for the repo — one command per PR:\n"
+        "Use either a PR URL without --repo/-R, or a number/#N with an optional "
+        "OWNER/REPO or github.com/OWNER/REPO flag. Never combine a URL and a "
+        "repository flag, even when they agree. Other explicit hosts are unsupported. "
+        "Run one command per PR:\n"
         '  gh pr comment 1234 --body "@codex review"\n'
         "If that PR is already at the cap you will get the step-back advisory, "
         "which is the point."
@@ -5081,11 +5103,9 @@ def _comment_repo_value(argv: list[str]) -> str | None:
 
     Handles separated (``--repo o/r`` / ``-R o/r``), ``--repo=o/r``, glued
     ``-Ro/r`` and ``-R=o/r`` forms. The value is otherwise unnormalised — the
-    identity check needs it as the user typed it, host part included — with one
-    exception: an EMPTY value reads as absent. Both empty spellings are commands
-    gh rejects outright, and treating them alike keeps ``--repo=`` from being
-    refused with an empty-quoted token in the message while ``-R=`` (which no
-    branch below matches) reads as no flag at all.
+    identity check needs it as the user typed it, host part included. An empty
+    or missing value stays empty, not absent: even a malformed repository flag
+    must not erase the fact that a URL was combined with a second selector.
     """
     val: str | None = None
     skip_next = False
@@ -5105,17 +5125,17 @@ def _comment_repo_value(argv: list[str]) -> str | None:
         if tok in _COMMENT_VALUE_FLAGS:
             # --repo/-R are themselves value flags: read their value, then skip
             # it so the same token cannot also be scanned as a flag.
-            if tok in ("--repo", "-R") and i + 1 < len(argv):
-                val = argv[i + 1]
+            if tok in ("--repo", "-R"):
+                val = argv[i + 1] if i + 1 < len(argv) else ""
             skip_next = True
             continue
         if tok.startswith("--repo="):
             val = tok.split("=", 1)[1]
         elif tok.startswith("-R") and len(tok) > 2 and not tok.startswith("-R="):
             val = tok[2:]
-        elif tok.startswith("-R=") and len(tok) > 3:
+        elif tok.startswith("-R="):
             val = tok[3:]
-    return val or None
+    return val
 
 
 def _comment_repo(argv: list[str]) -> str | None:
@@ -5249,10 +5269,16 @@ def _format_rounds(result: dict) -> str:
     )
     parts = [f"{count} ({'gate' if gate else 'ordinary'} lane, terminal at {limit})"]
     rounds = result.get("rounds") or []
-    if result.get("round_state") == "open" and rounds:
-        newest = rounds[-1]
-        who = ", ".join(newest.get("reviewers") or []) or "pre-cutover rule"
-        parts.append(f"open at {str(newest.get('head'))[:10]} ({who})")
+    if result.get("round_state") == "open":
+        # The head's own round, by identity: ``rounds`` is in commit-list (date)
+        # order, so its last entry need not be the head's (#3302).
+        head = result.get("current_head")
+        own = next((r for r in rounds if r.get("head") == head), None)
+        if own is None:
+            who = "no round entry for the head"
+        else:
+            who = ", ".join(own.get("reviewers") or []) or "pre-cutover rule"
+        parts.append(f"open at {str(head)[:10]} ({who})")
     elif result.get("round_state") == "complete":
         parts.append("complete (a commit has landed since the last round)")
     counts = [r.get("findings") for r in rounds if r.get("findings") is not None]
@@ -5375,6 +5401,16 @@ def _comment_review_request(argv: list[str]) -> tuple[str | None, bool, bool | N
     return inline_body, opaque, None
 
 
+def _review_request_triggers(segs):
+    return [
+        (seg, body, signal)
+        for seg in segs
+        if gh_pr_subcommand(seg.argv) == "comment" and not gh_requests_help(seg.argv)
+        for body, _opaque, signal in (_comment_review_request(seg.argv),)
+        if signal is not False
+    ]
+
+
 def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = None) -> tuple[str, str]:
     """Return (allow|ask|note|deny, reason) for Codex review requests.
 
@@ -5386,13 +5422,7 @@ def _check_codex_round_escalation(segs, cmd: str = "", payload: dict | None = No
     are intentionally ignored: at the approval boundary only the hook's native
     user decision can authorize the action.
     """
-    triggers = [
-        (seg, body, signal)
-        for seg in segs
-        if gh_pr_subcommand(seg.argv) == "comment" and not gh_requests_help(seg.argv)
-        for body, _opaque, signal in (_comment_review_request(seg.argv),)
-        if signal is not False
-    ]
+    triggers = _review_request_triggers(segs)
     if not triggers:
         return "allow", ""
 
@@ -12274,13 +12304,6 @@ def _push_positionals(argv: list[str]) -> list[str]:
     ]
 
 
-# push.default modes that push the CURRENT branch to a SAME-NAMED remote ref (or
-# refuse). `upstream`/`tracking` push to a possibly-differently-named upstream, and
-# `matching` pushes every same-named branch — both broaden beyond a plain
-# current-branch update. Unset defaults to `simple` (safe), so it need not appear.
-_SAFE_PUSH_DEFAULTS = frozenset({"simple", "current"})
-
-
 def _git_config_get(base: list[str], key: str, *, all_values: bool = False, as_bool: bool = False):
     """Read a git config value. Returns ``(rc, stripped_stdout)``, or ``None`` on a
     read error / timeout / UNEXPECTED return code.
@@ -12310,26 +12333,32 @@ def _git_config_get(base: list[str], key: str, *, all_values: bool = False, as_b
     return r.returncode, r.stdout.strip()
 
 
+# push.default modes that push the CURRENT branch to a SAME-NAMED remote ref (or
+# refuse). `upstream`/`tracking` push to a possibly-differently-named upstream, and
+# `matching` pushes every same-named branch — both broaden beyond a plain
+# current-branch update. Unset defaults to `simple` (safe), so it need not appear.
+_SAFE_PUSH_DEFAULTS = frozenset({"simple", "current"})
+
+
 # push.recurseSubmodules values that do NOT push submodule commits (safe). Anything
 # else (on-demand / only / a boolean-true spelling) side-channels a submodule push.
 _SAFE_RECURSE_SUBMODULES = frozenset({"no", "false", "off", "0", "check"})
+_SAFE_PUSH_GPG_SIGN = frozenset({"false", "no", "off", "0"})
 
 
 def _push_config_is_simple(remote: str | None, cwd: str | None = None) -> bool:
-    """Whether the effective config leaves a plain current-branch push PLAIN —
-    the ONE config-safety predicate every auto-allowed re-push must pass.
+    """Whether config permits a recorded re-push to bypass the dry run.
 
-    ``_push_targets_current_branch`` calls this on EVERY path that can return
-    True (bare, ``<remote>``, ``<remote> <ref>`` and ``<remote> <src>:<dst>``), so
-    the re-push relaxation never reaches a push whose config was not read here.
+    ``_push_targets_current_branch`` applies the local static subset on every
+    path. Only a recorded URL/branch pair can use this full offline predicate;
+    an unrecorded branch must pass ``_push_dry_run_verdict`` instead.
     ALLOWLIST posture: simple only when NONE of the keys below is set to a
     value that changes the push.
 
     WHICH keys, and why these. Enumerated from git-config(1) and git-push(1)
     (git 2.43, consulted 2026-09-29) for the keys that change WHAT a push
-    executes, WHERE it lands, or WHICH refs it sends — and that apply to a push
-    WITHOUT applying equally to the fetch-side ``git ls-remote`` that
-    ``_push_is_republish`` runs to prove the branch is already published:
+    executes, WHERE it lands, or WHICH refs it sends. The full predicate keeps
+    the recorded offline route from relying on the local push shape alone:
 
       where it lands / which ref it updates
       • ``remote.<r>.push`` — a configured push refspec remaps or broadens;
@@ -12338,12 +12367,12 @@ def _push_config_is_simple(remote: str | None, cwd: str | None = None) -> bool:
         same-named one (both MEASURED with git 2.43 to update ``main`` from
         ``git push origin <cur>``);
       • push URL ≠ fetch URL — ``remote.<r>.pushurl`` or a
-        ``url.<base>.pushInsteadOf`` rewrite sends the push somewhere OTHER than
-        the URL ``ls-remote`` checked (MEASURED: ``git remote get-url --push``
-        reflects both rewrites while ``ls-remote`` still answered from the fetch
-        URL), so "already published" would be a fact about a different
-        repository. A remote with more than one URL refuses too: the push goes
-        to every URL, ``ls-remote`` asks only the first (MEASURED). For a
+        ``url.<base>.pushInsteadOf`` rewrite changes the push destination.
+        MEASURED: ``git remote get-url --push`` reflects both rewrites while
+        ``git ls-remote`` answers from the fetch URL, so the recorded route
+        retains the main predicate's push/fetch equality rule. A remote with
+        more than one URL refuses too: a push goes to every URL, while the
+        earlier branch-presence check observed only the first (MEASURED). For a
         raw-URL destination (no remote section to compare), any
         ``pushInsteadOf`` rule refuses;
       • a legacy ``$GIT_COMMON_DIR/remotes/<r>`` or ``branches/<r>`` file —
@@ -12366,11 +12395,11 @@ def _push_config_is_simple(remote: str | None, cwd: str | None = None) -> bool:
     Deliberately NOT here, and why (the stated residue):
       • ``core.sshCommand`` / ``GIT_SSH*``, ``credential.helper``,
         ``remote.<r>.vcs`` helpers, ``remote.<r>.proxy`` / ``core.gitProxy``,
-        ``remote.<r>.uploadpack``, ``url.<base>.insteadOf``: each runs (or
-        rewrites) for a FETCH as well — ``insteadOf`` rewrites ``ls-remote`` the
-        same way, so the republish probe sees the push's real destination — and
-        refusing a push cannot stop a program an unprompted ``git fetch`` (or
-        this guard's own ``ls-remote``) already runs;
+        ``remote.<r>.uploadpack``, ``url.<base>.insteadOf``: these are
+        transport/helper settings rather than the ref-set config this full
+        predicate covers. The unrecorded dry-run path separately rejects
+        ``remote.<r>.vcs`` and SSH overrides before contact; a real-URL dry run
+        can still run credential helpers, as documented by ``_push_dry_run``;
       • ``core.hooksPath`` and the ``pre-push`` hook it selects: this one DOES
         run only on a push, and is left out on purpose — installs set
         ``core.hooksPath`` to their own hook directory, so refusing it would
@@ -12453,12 +12482,12 @@ def _push_config_is_simple(remote: str | None, cwd: str | None = None) -> bool:
     if got is None:
         return False
     rc, out = got
-    if rc == 0 and out.lower() not in ("false", "no", "off", "0"):
+    if rc == 0 and out.lower() not in _SAFE_PUSH_GPG_SIGN:
         return False
     # 6. A legacy remote FILE carries push refspecs `git config` never shows.
     if _legacy_remote_file_exists(remote, base):
         return False
-    # 7. The push must land where the republish probe looked.
+    # 7. The recorded offline path requires identical push and fetch URL sets.
     return _push_url_matches_probe(remote, base)
 
 
@@ -12479,13 +12508,12 @@ def _legacy_remote_file_exists(remote: str, base: list[str]) -> bool:
 
 
 def _push_url_matches_probe(remote: str, base: list[str]) -> bool:
-    """Whether a push to ``remote`` lands on the URL ``git ls-remote`` answers from.
+    """Whether push and fetch URL sets match for the recorded offline route.
 
-    ``_push_is_republish`` proves "already published" with ``git ls-remote
-    <remote>``, which resolves the FETCH URL (``insteadOf`` applied). The push
-    itself goes to the PUSH URL, which ``remote.<r>.pushurl`` and
-    ``url.<base>.pushInsteadOf`` both move. When the two sets differ, the probe
-    describes a different repository and cannot vouch for this push.
+    The full predicate preserves main's conservative push/fetch equality rule:
+    ``remote.<r>.pushurl`` and ``url.<base>.pushInsteadOf`` can move the push
+    URL without changing the fetch URL. Unrecorded branches use the real-URL
+    dry run instead, whose porcelain output describes the push destination.
 
     For a raw URL/path destination there is no remote section to compare
     (``git remote get-url`` exits 2), so any ``pushInsteadOf`` rule at all
@@ -12514,6 +12542,230 @@ def _push_url_matches_probe(remote: str, base: list[str]) -> bool:
         rrc, _lines = rules
         return rrc == 1  # 1 = no such key: nothing can rewrite the push URL
     return False
+
+
+class _DryRunRef(NamedTuple):
+    flag: str
+    src: str
+    dst: str
+
+
+class _DryRunBlock(NamedTuple):
+    url: str
+    refs: tuple[_DryRunRef, ...]
+
+
+class _DryRunVerdict(NamedTuple):
+    kind: Literal["republish", "first"]
+    block: _DryRunBlock
+
+
+def _parse_push_porcelain(out: str) -> tuple[_DryRunBlock, ...] | None:
+    """Parse repeated ``To <url>``, one-or-more ref lines, and ``Done`` blocks.
+
+    Ref lines must match ``^([ +*=!-])\\t([^\\t]*)\\t(.+)$`` and contain a
+    source/destination colon. Any malformed line, empty block, missing
+    delimiter, or empty output is rejected.
+    """
+    blocks = []
+    url = None
+    refs = []
+    for line in out.splitlines():
+        if url is None:
+            if not line.startswith("To ") or not line[3:].strip():
+                return None
+            url = line[3:]
+            refs = []
+            continue
+        if line == "Done":
+            if not refs:
+                return None
+            blocks.append(_DryRunBlock(url, tuple(refs)))
+            url = None
+            refs = []
+            continue
+        match = re.fullmatch(r"([ +*=!-])\t([^\t]*)\t(.+)", line)
+        if match is None:
+            return None
+        refspec = match.group(2)
+        if ":" not in refspec:
+            return None
+        src, dst = refspec.split(":", 1)
+        if not dst:
+            return None
+        refs.append(_DryRunRef(match.group(1), src, dst))
+    if url is not None or not blocks:
+        return None
+    return tuple(blocks)
+
+
+def _push_dry_run(
+    positionals: list[str], cwd: str | None, family_flags: tuple[str, ...] = ()
+) -> tuple[_DryRunBlock, ...] | None:
+    """Append positionals and fail closed; this contacts the real push URL and runs credential helpers or SSH.
+
+    The transport precheck limits that side effect to supported transports;
+    recorded branches use the offline allowlist path instead. ``--no-verify``
+    skips pre-push hooks, and ``--recurse-submodules=no`` prevents recursion.
+    """
+    argv = (
+        ["git"]
+        + (["-C", cwd] if cwd else [])
+        + [
+            "-c",
+            "http.followRedirects=false",
+            "push",
+            "--dry-run",
+            "--porcelain",
+            "--no-verify",
+            "--recurse-submodules=no",
+            *family_flags,
+            *positionals,
+        ]
+    )
+    env = {
+        **os.environ,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "",
+        "SSH_ASKPASS": "",
+        "LC_ALL": "C",
+    }
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=_gh_timeout(10.0),
+            env=env,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return _parse_push_porcelain(result.stdout)
+
+
+_SCP_PUSH_URL_RE = re.compile(r"^[^/@:]+@[^/:]+:")
+_URL_SCHEME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*):")
+_ALLOWED_PUSH_URL_SCHEMES = frozenset({"https", "http", "ssh", "git", "file"})
+
+
+def _push_url_transport(url: str) -> str | None:
+    """Classify only built-in push transports and local paths."""
+    if not url or url != url.strip() or "\n" in url or "\r" in url:
+        return None
+    if url.startswith(("/", "./", "../", "~")) or re.match(r"^[A-Za-z]:[\\/]", url):
+        return "local"
+    if _SCP_PUSH_URL_RE.match(url):
+        return "ssh"
+    scheme = _URL_SCHEME_RE.match(url)
+    if scheme is not None:
+        name = scheme.group(1).lower()
+        if name not in _ALLOWED_PUSH_URL_SCHEMES:
+            return None
+        return name if url.lower().startswith(f"{name}://") else None
+    if ":" in url:
+        return None
+    return "local"
+
+
+def _push_url_without_userinfo(url: str) -> str:
+    """Remove only userinfo from supported scheme URLs."""
+    scheme = _URL_SCHEME_RE.match(url)
+    if (
+        scheme is None
+        or scheme.group(1).lower() not in _ALLOWED_PUSH_URL_SCHEMES
+        or not url.startswith("//", scheme.end())
+    ):
+        return url
+    authority_start = scheme.end() + 2
+    authority_end = min(
+        (index for separator in "/?#" if (index := url.find(separator, authority_start)) >= 0),
+        default=len(url),
+    )
+    userinfo_end = url.rfind("@", authority_start, authority_end)
+    if userinfo_end < 0:
+        return url
+    return url[:authority_start] + url[userinfo_end + 1 :]
+
+
+def _push_family_flags(seg) -> tuple[str, ...]:
+    """Address-family selectors the dry-run must use just like the real push."""
+    stream = push_arg_stream(getattr(seg, "argv", None) or [])
+    if stream is None:
+        return ()
+    flags = []
+    for arg in stream:
+        if arg.kind is PushArgKind.SHORT and arg.text in {"4", "6"}:
+            flags.append(f"-{arg.text}")
+        elif arg.kind is PushArgKind.LONG and arg.text in {"--ipv4", "--ipv6"}:
+            flags.append(arg.text)
+    return tuple(flags)
+
+
+def _push_transport_precheck(urls: set[str], remote: str | None, cwd: str | None) -> bool:
+    """Refuse helper transports and SSH overrides before contacting any push URL."""
+    if not urls:
+        return False
+    transports = [_push_url_transport(url) for url in urls]
+    if any(transport is None for transport in transports):
+        return False
+    if urls == {remote} and not _no_url_rewrite_rules(cwd):
+        # A raw destination is classified as typed, but git applies any
+        # insteadOf/pushInsteadOf rule inside the dry run, which could pick a
+        # transport this precheck never saw. A named remote's urls already
+        # carry the rewrite (`git remote get-url --push`).
+        return False
+    base = ["git"] + (["-C", cwd] if cwd else [])
+    if remote and not _looks_like_url(remote):
+        got = _git_config_get(base, f"remote.{remote}.vcs", all_values=True)
+        if got is None or got[0] == 0:
+            return False
+    if "ssh" in transports:
+        if "GIT_SSH_COMMAND" in os.environ or "GIT_SSH" in os.environ:
+            return False
+        got = _git_config_get(base, "core.sshCommand")
+        if got is None or got[0] == 0:
+            return False
+    return True
+
+
+def _push_dry_run_verdict(
+    seg, cur: str | None, remote: str | None, cwd: str | None = None
+) -> _DryRunVerdict | None:
+    """Verify one current-branch ref from a real-URL dry run; only unrecorded branches reach it.
+
+    The dry run contacts the push URL and can run credential helpers or SSH, so
+    the transport precheck runs first and a recorded allowlist entry is checked
+    before this function is called. Repository-selection overrides refuse
+    probing, and the porcelain destination must match a precheck URL.
+    """
+    if _repo_selection_env_set():
+        return None
+    positionals = _push_ref_positionals(getattr(seg, "argv", None) or [])
+    if positionals is None or not cur or not remote:
+        return None
+    urls = _push_dest_urls(remote, cwd)
+    if not urls or not _push_transport_precheck(urls, remote, cwd):
+        return None
+    blocks = _push_dry_run(positionals, cwd, _push_family_flags(seg))
+    if blocks is None or len(blocks) != 1 or len(blocks[0].refs) != 1:
+        return None
+    block = blocks[0]
+    if not any(
+        block.url == url
+        or _push_url_without_userinfo(block.url) == _push_url_without_userinfo(url)
+        for url in urls
+    ):
+        return None
+    ref = block.refs[0]
+    if ref.dst != f"refs/heads/{cur}" or ref.src not in ("HEAD", f"refs/heads/{cur}"):
+        return None
+    if ref.flag in (" ", "="):
+        return _DryRunVerdict("republish", block)
+    if ref.flag == "*":
+        return _DryRunVerdict("first", block)
+    return None
 
 
 def _run_git_lines(argv: list[str]) -> tuple[int, list[str]] | None:
@@ -12609,16 +12861,16 @@ def _push_ref_positionals(argv: list[str]) -> list[str] | None:
 def _push_targets_current_branch(
     seg, cur: str | None, remote: str | None, cwd: str | None = None
 ) -> bool:
-    """Whether a non-force ``git push`` seg plainly UPDATES the current branch ``cur``.
+    """Whether the push shape and local static config allow a republish verdict.
 
     ``remote`` is the destination the push will ACTUALLY go to, resolved by the
     caller with git's pushRemote/pushDefault precedence (``_effective_push_remote``).
 
-    ALLOWLIST posture — the branch checked against the remote is always ``cur``
-    itself, never a parsed destination. True ONLY when BOTH hold:
+    This is deliberately local-only: it does not contact a push URL or infer
+    whether the branch is already published. True ONLY when BOTH hold:
       1. Every flag after ``push`` is ref-set-neutral — a member of
-         ``_PUSH_SAFE_LONG_FLAGS`` / ``_PUSH_SAFE_VALUE_FLAGS``, or a short bundle
-         whose every letter is in ``_PUSH_SAFE_SHORT_LETTERS`` (``o`` carries a
+        ``_PUSH_SAFE_LONG_FLAGS`` / ``_PUSH_SAFE_VALUE_FLAGS``, or a short bundle
+        whose every letter is in ``_PUSH_SAFE_SHORT_LETTERS`` (``o`` = glued
          push-option value). ANY other flag (``--all`` / ``--tags`` / ``--delete``
          / a bundled ``-d`` / ``--stdin`` / ``--repo`` / unknown) → False.
       2. The positionals name a plain current-branch update:
@@ -12632,18 +12884,9 @@ def _push_targets_current_branch(
       3. The segment runs ``git`` directly — no ``VAR=value`` assignment or
          wrapper before it (``_push_seg_has_no_prefix``): an assignment such as
          ``GIT_CONFIG_COUNT=…`` hands the push config the checks below cannot see.
-      4. ``_push_config_is_simple(remote)`` — for EVERY recognised shape. This is
-         the single exit that can return True, so no spelling reaches the
-         re-push relaxation without the config check. Colon refspecs included:
-         their spelled-out destination is immune to the ``remote.<r>.push`` /
-         ``push.default`` remap (MEASURED), but not to the side channels that
-         ride along with any push — submodule recursion, followed tags, a
-         configured receive-pack program, a divergent push URL. One predicate
-         for all shapes costs an ask on the rare remap config and removes the
-         per-shape subset that let those side channels through.
-    The explicit ``--`` terminator is accepted, so ``git push -- origin HEAD``
-    follows the same re-push path as its plain spelling. Tokens after it are
-    positional, not options. Any unrecognized option re-prompts. argv-based
+      4. Main's full ``_push_config_is_simple`` gate rejects unsafe push config
+         and push/fetch URL differences before any probe.
+    Conservative by construction: any unrecognized form re-prompts. argv-based
     (quote-stripped).
     """
     if not cur:
@@ -12667,8 +12910,7 @@ def _push_targets_current_branch(
         if not shape_ok:
             return False
     # Every recognised shape — bare, `<remote>`, `<remote> <ref>`, `<remote>
-    # <src>:<dst>` — ends here, keyed on the remote git will ACTUALLY push to
-    # (resolved by the caller).
+    # <src>:<dst>` — ends here with only local config reads.
     return _push_config_is_simple(remote, cwd=cwd)
 
 
@@ -12679,17 +12921,39 @@ def _push_targets_current_branch(
 _INERT_GIT_NEIGHBOURS = frozenset({"status", "rev-parse", "add", "commit"})
 
 
-def _push_compound_is_inert(segs, push_seg, command: str) -> bool:
-    """Whether every OTHER segment of the command leaves push config alone.
+def _neighbours_are_inert(
+    segs, own_seg, command: str, seg_ok: Callable[[Segment], bool]
+) -> bool:
+    """Apply the shared structural checks before evaluating neighboring segments.
 
-    The hook reads config BEFORE any of the command runs, so a config write in
-    an earlier segment is invisible to ``_push_config_is_simple`` — MEASURED:
-    ``git config remote.origin.receivepack <prog> && git push origin HEAD`` was
-    auto-allowed, as was ``git remote set-url --add origin <url> && git push``.
-    What can write config is an open set (``git config``, ``git remote``,
-    ``git submodule``, an ``export``, any script), so this is an ALLOWLIST: a
-    ``cd``, or git running one of ``_INERT_GIT_NEIGHBOURS`` with no global
-    option but ``-C``. Anything else keeps the ask. Same shape as the
+    A redirect in a compound command is a refusal even when its target would
+    otherwise be inert. This intentionally over-blocks compounds; a lone
+    command is unaffected by ordinary redirects.
+    """
+    others = [s for s in segs if s is not own_seg]
+    if "<(" in command or ">(" in command:
+        return False
+    if others and ("<" in command or ">" in command):
+        return False
+    for s in others:
+        try:
+            words = shlex.split(s.raw or "", comments=True)
+        except ValueError:
+            return False
+        if words != list(s.argv or []):
+            return False  # a stripped wrapper (sudo / env / command …)
+        if not seg_ok(s):
+            return False
+    return True
+
+
+def _push_compound_is_inert(segs, push_seg, command: str) -> bool:
+    """Whether every non-push segment leaves the config read before the push unchanged.
+
+    The hook reads config before any segment runs, so an earlier write is
+    invisible to the local static and offline predicates. This is an
+    ALLOWLIST: a ``cd``, or git running one of ``_INERT_GIT_NEIGHBOURS`` with
+    no global option but ``-C``. Anything else keeps the ask. Same shape as the
     close-then-push check beside its caller.
 
     A subcommand name alone is not evidence: MEASURED by audit,
@@ -12704,20 +12968,9 @@ def _push_compound_is_inert(segs, push_seg, command: str) -> bool:
     accepted over-block; a lone ``git push … 2>&1`` is unaffected). Each
     neighbour must additionally re-tokenize to exactly its argv, which refuses
     a stripped wrapper. A substring match only ever keeps the ask."""
-    others = [s for s in segs if s is not push_seg]
-    if "<(" in command or ">(" in command:
-        return False
-    if others and ("<" in command or ">" in command):
-        return False
-    for s in others:
-        try:
-            words = shlex.split(s.raw or "", comments=True)
-        except ValueError:
-            return False
-        if words != list(s.argv or []):
-            return False  # a stripped wrapper (sudo / env / command …)
+    def push_neighbour_is_inert(s: Segment) -> bool:
         if s.exe == "cd":
-            continue
+            return True
         if s.exe != "git":
             return False
         i = 1
@@ -12725,9 +12978,61 @@ def _push_compound_is_inert(segs, push_seg, command: str) -> bool:
             if s.argv[i] != "-C":
                 return False  # -c / --exec-path / --git-dir / -p …
             i += 2
-        if git_subcommand(s.argv) not in _INERT_GIT_NEIGHBOURS:
+        return git_subcommand(s.argv) in _INERT_GIT_NEIGHBOURS
+
+    return _neighbours_are_inert(segs, push_seg, command, push_neighbour_is_inert)
+
+
+def _first_close_reason(segs) -> str | None:
+    for seg in segs:
+        reason = pr_close_reason(seg.argv)
+        if reason is not None:
+            return reason
+    return None
+
+
+def _review_request_compound_is_inert(segs, review_seg, command: str) -> bool:
+    """Whether every neighbor of a review request is on its inert allowlist.
+
+    The structural checks are ``_neighbours_are_inert``'s: the parse drops
+    redirects from a segment's ``raw``, so a redirect is tested on the raw
+    COMMAND, and any ``<`` or ``>`` in a command with a neighbor refuses —
+    including one belonging to the review request itself (an accepted
+    over-block, as in the push arm). A ``gh`` neighbor must resolve, through
+    ``gh_command``, to exactly ``pr view`` or ``pr checks`` with no unmodelled
+    flag; ``gh_pr_subcommand`` finds ``pr`` anywhere in argv, which reads
+    ``gh alias set pv -- pr view`` as a read. A neighbor must be spelled with
+    the bare program name. ``git log`` is deliberately absent (owner ruling
+    2026-10-18): under any spelling, repo config can make it run a program
+    (``gpg.program`` through ``log.showSignature`` or a ``%G`` format alias,
+    textconv drivers for diff output), and ``--output`` writes a file.
+    """
+
+    def review_neighbour_is_inert(s: Segment) -> bool:
+        # The bare name only: `exe` is a basename, so `./gh` or `/tmp/x/git`
+        # would otherwise pass as the real program.
+        if not s.argv or s.argv[0] != s.exe:
             return False
-    return True
+        if s.exe in {"cd", "sleep"}:
+            return True
+        if s.exe == "git":
+            i = 1
+            while i < len(s.argv) and s.argv[i].startswith("-"):
+                if s.argv[i] != "-C":
+                    return False
+                i += 2
+            return git_subcommand(s.argv) == "status"
+        if s.exe == "gh":
+            inv = gh_command(s.argv)
+            return (
+                inv is not None
+                and inv.group == "pr"
+                and inv.subcommand in {"view", "checks"}
+                and not inv.unmodelled
+            )
+        return False
+
+    return _neighbours_are_inert(segs, review_seg, command, review_neighbour_is_inert)
 
 
 def _push_seg_has_no_prefix(seg) -> bool:
@@ -12803,9 +13108,9 @@ def _ref_names_current_branch(ref: str, cur: str | None) -> bool:
 
     Four spellings do, and under default push config git treats them identically
     on a push: the bare branch name, ``HEAD``, its one-character alias ``@``, and
-    the fully-qualified ``refs/heads/<cur>``. (Under ``remote.<r>.push`` or
-    ``push.default=upstream`` the bare name and ``refs/heads/<cur>`` are REMAPPED;
-    the caller therefore also requires ``_push_config_is_simple``.) MEASURED with git 2.43 against a local bare remote:
+    the fully-qualified ``refs/heads/<cur>``. The caller still verifies Git's
+    actual destination and ref set, so these spellings are not trusted alone.
+    MEASURED with git 2.43 against a local bare remote:
     ``git push origin @`` creates ``refs/heads/<cur>`` exactly as
     ``git push origin HEAD`` does — and it still did with a local branch
     literally named ``@`` present at a different commit (git allows creating
@@ -13082,22 +13387,6 @@ def _remote_branch_sha(remote: str, branch: str, cwd: str | None = None) -> str 
     return None
 
 
-def _push_is_republish(remote: str | None, branch: str | None, cwd: str | None = None) -> bool:
-    """Whether this push targets a branch ALREADY on ``remote`` (a re-push).
-
-    A branch's FIRST push creates it on the remote (and prompted the user for
-    approval); a re-push updates that already-published branch. So a branch present
-    on the remote was approved on its first push and must not re-prompt. Fail-safe:
-    an unresolved remote/branch, or any ls-remote error/timeout/absence, → False
-    (fall through to the approval prompt). Deliberately does NOT check for unpushed
-    commits — re-pushing new fixes to an already-published branch is exactly the
-    case we allow.
-    """
-    if not remote or not branch:
-        return False
-    return _remote_branch_sha(remote, branch, cwd=cwd) is not None
-
-
 def _open_pr_count_for_branch(
     branch: str, cwd: str | None = None, push_urls: set[str] | None = None
 ) -> int | None:
@@ -13228,6 +13517,21 @@ def _urls_name_repo(urls: set[str], canonical: str) -> bool:
     if not urls or want is None:
         return False
     return all(_repo_identity_from_url(u) == want for u in urls)
+
+
+def _no_open_pr_deny_message(cur: str | None) -> str:
+    """The no-open-PR BLOCK text, shared by the plain and close-compound arms."""
+    return (
+        f"BLOCKED: re-push to '{cur}' — this branch is "
+        f"PUBLIC but has NO OPEN PR, so CI and the leak "
+        f"detector never run on it (ci.yml triggers on "
+        f"pull_request; a branch with no PR matches no "
+        f"trigger).\n"
+        f"Open its PR first — `gh pr create` — then push "
+        f"again. Or close the branch out if it is "
+        f"finished with. Both leave the branch in a state "
+        f"something actually looks at."
+    )
 
 
 def _no_pr_block_applies(urls: set[str]) -> bool:
@@ -13410,10 +13714,9 @@ def _push_publish_scope_holds(
     repo and nothing else in the command can change that.
 
     Reached only from the first-publish ask of a push that already passed
-    ``_push_targets_current_branch`` (allowlisted flags, no env/wrapper prefix, no
-    ``-c``, and ``_push_config_is_simple``: one URL, push URL == fetch URL, no push
-    refspec / mirror / receivepack / followTags / submodule recursion). On top of
-    that:
+    ``_push_targets_current_branch`` (allowlisted flags, no env/wrapper prefix,
+    side-effect config prechecks, and a dry-run proof of one matching URL/ref).
+    On top of that:
       * the destination's push URLs come from ``git remote get-url --push``, which
         applies ``insteadOf``/``pushInsteadOf``; a raw-URL destination has no remote
         to expand, so it qualifies only when no rewrite rule exists at all;
@@ -13460,10 +13763,8 @@ def _push_publish_scope_holds(
         return False
     if not _transport_is_plain(push_remote if named else None, cwd):
         return False
-    # LAST, because it is the one network call: the caller reached here because
-    # `_push_is_republish` said "not confirmed present", which is ALSO its answer
-    # to an ls-remote error or timeout. Silencing on that would let an
-    # already-public branch with no open PR skip the no-open-PR check.
+    # LAST, because it is the one network call. A dry-run verdict of "first"
+    # does not itself prove the branch absent if this separate probe fails.
     return len(urls) == 1 and _remote_branch_definitely_absent(next(iter(urls)), branch, cwd)
 
 
@@ -14483,12 +14784,14 @@ def _run_merge_and_push_gates() -> int:
             # their sharper diagnostics. Bounds keep main's immediate refusal.
             blind_spot_deny = (
                 f"BLOCKED: this command {blind.cause} and mentions a gated "
-                "operation, so the guard cannot verify what it would actually run.\n"
+                "operation; a Git or GitHub operation may run, and the guard "
+                "cannot establish which one.\n"
                 f"To proceed: {blind.hint}. If you are WRITING TEXT (a commit "
                 "message, a plan, review notes) whose content merely mentions "
                 "push or merge, use the Write tool instead of a here-doc. If "
-                "you are RUNNING a git command, rewrite it in a "
-                "directly-parseable form (plain quotes, or -F <file>)."
+                "you are RUNNING a git command, split unreadable compounds or "
+                "rewrite it in a directly-parseable form (plain quotes, or "
+                "-F <file>)."
             )
             if blind.bounds_induced:
                 print(blind_spot_deny, file=sys.stderr)
@@ -14606,23 +14909,32 @@ def _run_merge_and_push_gates() -> int:
             # specific diagnostic when both appear in one command.
             round_autonomous_deny = esc_msg
 
-        if esc_decision in ("ask", "note"):
-            other_gated_actions = [
-                s
-                for s in segs
-                if git_subcommand(s.argv) in {"commit", "push", "merge"}
-                or gh_pr_subcommand(s.argv) in {"create", "merge", "close"}
-            ]
-            if other_gated_actions:
+        if esc_decision == "ask":
+            review_triggers = _review_request_triggers(segs)
+            review_seg = review_triggers[0][0] if len(review_triggers) == 1 else None
+            if review_seg is not None and not _review_request_compound_is_inert(
+                segs, review_seg, cmd
+            ):
                 # Defer this refusal to the tail. Specific hard checks below
                 # (force push, --no-verify, merge gates, sqlite) must retain
                 # precedence over a compound-action diagnostic.
-                round_compound_deny = (
-                    "BLOCKED: this review request needs its own fresh user approval, "
-                    "but the same command also contains a commit, push, merge, close, "
-                    "or PR-create action. Run the review request separately so one "
-                    "approval cannot authorize multiple actions."
-                )
+                close_reason = _first_close_reason(segs)
+                if close_reason is not None:
+                    round_compound_deny = (
+                        "BLOCKED: this review request needs its own fresh user approval, "
+                        "but the same command also closes a pull request "
+                        f"({close_reason}). Run the review request separately so one "
+                        "approval cannot authorize multiple actions."
+                    )
+                else:
+                    round_compound_deny = (
+                        "BLOCKED: this review request needs its own fresh user approval, "
+                        "but the same command also runs a step that is not on the inert "
+                        "list (cd, sleep, git status, gh pr view/checks), or "
+                        "carries a redirect. "
+                        "Run the review request separately so one approval cannot "
+                        "authorize multiple actions."
+                    )
 
         # An interactive push defers to a native approve/deny dialog at the END
         # of main(), so every hard-block below (merge-into-main, the pr-merge
@@ -14799,15 +15111,12 @@ def _run_merge_and_push_gates() -> int:
                 #     goes silent (it is always on the remote);
                 #   • _push_targets_current_branch → a bare / `<remote>` / `<remote>
                 #     <cur|HEAD|@|refs/heads/cur>` / `<remote> HEAD:refs/heads/<cur>`
-                #     push with only allowlisted global options and ref-neutral flags,
-                #     and — for EVERY shape — a config `_push_config_is_simple`
-                #     accepts; everything else prompts;
+                #     push with allowlisted flags and safe local static config;
                 #   • _push_compound_is_inert (below) → no other segment could write
                 #     config before the push runs;
-                #   • _push_is_republish → live ls-remote confirms `cur` is present on
-                #     the remote git will ACTUALLY push to (pushRemote/pushDefault
-                #     resolved by _effective_push_remote, so a triangular fork workflow
-                #     checks the fork, not the upstream).
+                #   • a recorded URL/branch allowlist entry plus the full offline
+                #     config predicate allows without network; otherwise the real-URL
+                #     dry-run must prove a single current-branch ref and porcelain flag.
                 # Dispatched sessions were hard-denied above, so this _allow is
                 # unreachable for them (the human-not-agent boundary is preserved;
                 # this only relaxes RE-approval of an already-approved branch).
@@ -14819,31 +15128,28 @@ def _run_merge_and_push_gates() -> int:
                     and cur not in ("main", "master")
                     and _push_targets_current_branch(push_segs[0], cur, push_remote, cwd=pcwd)
                 ):
-                    # This push plainly updates the current branch `cur`, so it
-                    # qualifies for the first-push-only relaxation IF `cur` is
-                    # already on the remote. Decide that via the LOCAL allowlist
-                    # first (offline — immune to the transient ls-remote failure
-                    # that otherwise fail-closes _push_is_republish to a re-prompt),
-                    # then fall back to the live ls-remote leg. On an ls-remote HIT,
-                    # RECORD the confirmed-on-remote fact so later re-pushes decide
-                    # offline. SECURITY: the allowlist is written ONLY here, ONLY on
-                    # an ls-remote HIT (which proves `cur` is on the remote → its
-                    # first push was already approved), so it can never authorize a
-                    # genuine first push; a broken/absent push_allowlist degrades to
-                    # the pure ls-remote path (import guarded to None above).
-                    # `_push_dest_urls`, not `_remote_push_urls`: a destination
-                    # spelled as a raw URL names no configured remote, and without
-                    # its URL the open-PR lookup below sees no target, answers None,
-                    # and the public-repo no-PR block never runs.
+                    # The static predicate above is local-only. Resolve the actual
+                    # push URLs once for the offline allowlist and later PR lookup.
                     urls = _push_dest_urls(push_remote, cwd=pcwd) if push_remote else set()
                     # Deferred (NOT an inline return) so any hard-block in a compound
                     # command still takes precedence — see push_allow_reason above.
-                    if push_allowlist is not None and push_allowlist.is_recorded(urls, cur):
+                    verdict = None
+                    if (
+                        push_allowlist is not None
+                        and push_allowlist.is_recorded(urls, cur)
+                        and _push_config_is_simple(push_remote, cwd=pcwd)
+                    ):
                         push_allow_reason = (
                             f"re-push to '{cur}' (recorded as already on the remote — "
                             f"approved on its first push); only the first push prompts."
                         )
-                    elif _push_is_republish(push_remote, cur, pcwd):
+                    elif (
+                        (verdict := _push_dry_run_verdict(
+                            push_segs[0], cur, push_remote, cwd=pcwd
+                        ))
+                        is not None
+                        and verdict.kind == "republish"
+                    ):
                         if push_allowlist is not None and urls:
                             push_allowlist.record(urls, cur)
                         push_allow_reason = (
@@ -14905,11 +15211,11 @@ def _run_merge_and_push_gates() -> int:
                             # where this note is EMITTED, not here: a later arm's
                             # ask can still win, and its own drain must find them.
                         else:
-                            # `_push_is_republish` answers False on an ls-remote
-                            # error or timeout too, so "not confirmed present" is
-                            # not "absent": a branch already public with no open
-                            # PR would skip the no-open-PR block. Under
-                            # push_routine only (the probe is a network call),
+                            # `_push_dry_run_verdict` returns `None` on a dry-run
+                            # error or timeout, so failure to prove a republish is
+                            # not proof the branch is absent: a branch already
+                            # public with no open PR could skip the no-open-PR block.
+                            # With push_routine only (the probe is a network call),
                             # this is routine only when every destination
                             # definitely lacks the branch. Still classed routine
                             # so the ask names why the key did not apply.
@@ -14939,28 +15245,36 @@ def _run_merge_and_push_gates() -> int:
                     # branch, not a security boundary, so an unanswerable
                     # question must not manufacture prompts on every network
                     # blip.
-                    # An earlier segment that CLOSES a PR invalidates the state
-                    # this allow is read from. The hook runs before any of the
-                    # command executes, so `gh pr close <n> && git push` sees the
-                    # PR still open, keeps the silent allow, and then publishes
-                    # into exactly the PR-less state the ask exists to report.
-                    # The count cannot see a close that has not happened yet, so
-                    # the command's own shape has to.
+                    # A close is never an inert neighbour, so the
+                    # _push_compound_is_inert check further down would also ask
+                    # here. It runs first so the message names the close. On the
+                    # public repo it still takes the no-PR BLOCK below when the
+                    # branch already has no open PR: a close cannot add one, and
+                    # turning that deny into an ask would let one approval publish
+                    # the state the block forbids. Off the public repo the lookup
+                    # is skipped (_no_pr_block_applies is local and runs first).
                     closes_pr = any(
-                        gh_pr_subcommand(s.argv) == "close" for s in segs
+                        pr_close_reason(s.argv) is not None for s in segs
                     )
                     if push_allow_reason and closes_pr:
                         push_allow_reason = None
-                        ask_routine = True
-                        routine_dests.append((push_remote, urls, pcwd, cur))
-                        ask_reason = (
-                            f"re-push to '{cur}': an earlier step in this command "
-                            f"CLOSES a pull request, so the push that follows may "
-                            f"land on a branch with no open PR — outside CI and "
-                            f"the leak scan. Run the close and the push as "
-                            f"separate commands so each is judged on the state it "
-                            f"actually runs in."
-                        )
+                        if (
+                            not _push_is_dry_run(push_segs[0])
+                            and _no_pr_block_applies(urls)
+                            and _open_pr_count_for_branch(cur, cwd=pcwd, push_urls=urls) == 0
+                        ):
+                            no_open_pr_deny = _no_open_pr_deny_message(cur)
+                        else:
+                            ask_routine = True
+                            routine_dests.append((push_remote, urls, pcwd, cur))
+                            ask_reason = (
+                                f"re-push to '{cur}': an earlier step in this command "
+                                f"CLOSES a pull request, so the push that follows may "
+                                f"land on a branch with no open PR — outside CI and "
+                                f"the leak scan. Run the close and the push as "
+                                f"separate commands so each is judged on the state it "
+                                f"actually runs in."
+                            )
                     # NO `gh pr create` exemption: whether a same-command create
                     # yields a PR for THIS branch is not decidable from argv
                     # (another --head, --dry-run, a failing create before `&&`,
@@ -14987,17 +15301,7 @@ def _run_merge_and_push_gates() -> int:
                             # `&& gh pr create`, since the create needs the branch
                             # on the remote. Dispatched sessions never get here
                             # (`_is_dispatched()` denies every push above).
-                            no_open_pr_deny = (
-                                f"BLOCKED: re-push to '{cur}' — this branch is "
-                                f"PUBLIC but has NO OPEN PR, so CI and the leak "
-                                f"detector never run on it (ci.yml triggers on "
-                                f"pull_request; a branch with no PR matches no "
-                                f"trigger).\n"
-                                f"Open its PR first — `gh pr create` — then push "
-                                f"again. Or close the branch out if it is "
-                                f"finished with. Both leave the branch in a state "
-                                f"something actually looks at."
-                            )
+                            no_open_pr_deny = _no_open_pr_deny_message(cur)
                         else:
                             # Off the public repo — or when the public repo is not
                             # declared — the pre-existing ask, unchanged.
@@ -15015,17 +15319,28 @@ def _run_merge_and_push_gates() -> int:
                     # writes config or remotes ahead of the push is invisible
                     # to the predicate that just passed. Only an allowlisted
                     # neighbour keeps the relaxation.
-                    elif push_allow_reason and not _push_compound_is_inert(segs, push_segs[0], cmd):
+                    elif push_allow_reason and not _push_compound_is_inert(
+                        segs, push_segs[0], cmd
+                    ):
                         push_allow_reason = None
                         ask_routine = True
                         routine_dests.append((push_remote, urls, pcwd, cur))
-                        ask_reason = (
-                            f"re-push to '{cur}': another step in this command "
-                            f"may change git config or remotes before the push "
-                            f"runs, so the config check could not see what the "
-                            f"push will use. Run the push as its own command to "
-                            f"skip this prompt."
-                        )
+                        close_reason = _first_close_reason(segs)
+                        if close_reason is not None:
+                            ask_reason = (
+                                f"re-push to '{cur}': this command also CLOSES a "
+                                f"pull request ({close_reason}), so it is not an "
+                                f"inert compound. Run the push as its own command "
+                                f"to skip this prompt."
+                            )
+                        else:
+                            ask_reason = (
+                                f"re-push to '{cur}': another step in this command "
+                                f"may change git config or remotes before the push "
+                                f"runs, so the config check could not see what the "
+                                f"push will use. Run the push as its own command to "
+                                f"skip this prompt."
+                            )
                 elif (
                     not pcwd_unknown
                     and cur
@@ -15906,7 +16221,9 @@ def _run_merge_and_push_gates() -> int:
         if _is_sqlite_write(cmd):
             print(
                 "BLOCKED: Direct database writes via sqlite3 are not allowed. "
-                "Use CRUD modules or MCP tools instead.",
+                "Use CRUD modules or MCP tools instead. For a READ-ONLY query, use: "
+                '~/genesis/.venv/bin/python -m genesis db query "<sql>" '
+                "(read-only is enforced by SQLite; --json, --param, --limit).",
                 file=sys.stderr,
             )
             return 2

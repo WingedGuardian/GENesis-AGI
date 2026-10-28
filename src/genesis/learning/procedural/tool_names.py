@@ -98,6 +98,21 @@ def _genesis_mcp_names() -> frozenset[str]:
     return frozenset(name for names in _mcp_owners().values() for name in names)
 
 
+def _mcp_source_files(*, strict: bool = False):
+    """Exact shallow AST input population; evidence may require readable roots."""
+    root = Path(__file__).resolve().parents[2]
+    for server, module in _MCP_MODULES.items():
+        base = root.joinpath(*module.split(".")[1:])
+        if base.is_dir():
+            files = sorted(base.iterdir()) if strict else sorted(base.glob("*.py"))
+        else:
+            files = [base.with_suffix(".py")]
+        for path in files:
+            if not path.match("*.py") or f"{module}.{path.stem}" in _NOT_SERVED:
+                continue
+            yield server, path
+
+
 @functools.cache
 def _mcp_owners() -> dict[str, list[str]]:
     """Each Genesis MCP tool's short name -> its full name(s).
@@ -109,27 +124,21 @@ def _mcp_owners() -> dict[str, list[str]]:
     Modules in ``_NOT_SERVED`` are skipped. A file that cannot be read maps
     nothing, so its short names are dropped rather than guessed.
     """
-    root = Path(__file__).resolve().parents[2]
     owners: dict[str, list[str]] = {}
-    for server, module in _MCP_MODULES.items():
-        base = root.joinpath(*module.split(".")[1:])
-        files = sorted(base.glob("*.py")) if base.is_dir() else [base.with_suffix(".py")]
-        for path in files:
-            if f"{module}.{path.stem}" in _NOT_SERVED:
-                continue
-            try:
-                tree = ast.parse(path.read_text())
-            except (OSError, SyntaxError):
-                logger.warning("Cannot read MCP tool names from %s", path, exc_info=True)
-                continue
-            for node in ast.walk(tree):
-                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and any(
-                    isinstance(d, ast.Call)
-                    and isinstance(d.func, ast.Attribute)
-                    and d.func.attr == "tool"
-                    for d in node.decorator_list
-                ):
-                    owners.setdefault(node.name, []).append(f"mcp__{server}__{node.name}")
+    for server, path in _mcp_source_files():
+        try:
+            tree = ast.parse(path.read_text())
+        except (OSError, SyntaxError):
+            logger.warning("Cannot read MCP tool names from %s", path, exc_info=True)
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and any(
+                isinstance(d, ast.Call)
+                and isinstance(d.func, ast.Attribute)
+                and d.func.attr == "tool"
+                for d in node.decorator_list
+            ):
+                owners.setdefault(node.name, []).append(f"mcp__{server}__{node.name}")
     return owners
 
 

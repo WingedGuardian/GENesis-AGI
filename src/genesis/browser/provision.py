@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 Runner = Callable[..., subprocess.CompletedProcess]
 
 # No hang has been observed; this is the project's floor for an unattended step
-# (genesis-development, Timeout Policy). The engine download is about 1.3 GB.
+# (build-session, Timeout Policy). The engine download is about 1.3 GB.
 STEP_TIMEOUT_S = 7200
 # The unit's TimeoutStartSec (28800, four steps at the floor) less the fixed-timeout
 # probes outside this budget, at worst: the dry-run 600 s, ten ldd runs at 120 s

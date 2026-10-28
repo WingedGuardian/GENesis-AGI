@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""Is the FalkorDB graph engine ready to go default-on?
+
+Prints the cutover verdict computed by ``genesis.memory.graph_cutover`` from the
+durable rows: the traversal telemetry (``graph_traverse``), the hourly
+memory-server census (``graph_traverse_census``) and the local lost-writes file.
+
+    PASS          14 days on the clock with no fallback, enough falkordb traffic
+    NOT_YET       nothing wrong, not enough clock or traffic yet; says what is short
+    INCONCLUSIVE  some of the evidence may be missing; says what, with its time
+
+Exit status: 0 PASS, 1 NOT_YET, 2 INCONCLUSIVE, 3 the report itself failed
+(never 1, so a failure can never read as NOT_YET).
+
+Read-only: the database is opened with ``mode=ro`` and every row of both event
+types is read (no row limit: a capped read could hide the one fallback that
+matters). ``--now`` evaluates as of another time, for tests and replays.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import json
+import sqlite3
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+
+REPO_DIR = Path(__file__).resolve().parent.parent
+SRC_DIR = REPO_DIR / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+_EXIT = {"PASS": 0, "NOT_YET": 1, "INCONCLUSIVE": 2}
+_FAILED = 3
+
+
+class _Parser(argparse.ArgumentParser):
+    """argparse exits 2 on a usage error, which here would read as INCONCLUSIVE."""
+
+    def error(self, message: str):  # type: ignore[override]
+        self.print_usage(sys.stderr)
+        self.exit(_FAILED, f"{self.prog}: error: {message}\n")
+
+
+def read_rows(db_path: Path, event_type: str) -> list[tuple[str, str | None]]:
+    with contextlib.closing(
+        sqlite3.connect(f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True, timeout=10)
+    ) as conn:
+        return list(
+            conn.execute(
+                "SELECT timestamp, metrics_json FROM eval_events WHERE event_type = ?"
+                " ORDER BY timestamp",
+                (event_type,),
+            )
+        )
+
+
+def read_lost_writes(path: Path) -> list[str]:
+    """The file's lines, read under a shared ``flock``: appends and the in-place
+    prune (``graph_telemetry``) hold it exclusively, so the read never sees a
+    rewrite half done."""
+    try:
+        with path.open(encoding="utf-8", errors="replace") as fh:
+            fcntl.flock(fh, fcntl.LOCK_SH)
+            return fh.read().splitlines()
+    except FileNotFoundError:
+        return []
+
+
+#: Which leg of a read a timeout's frames put the wait in, by redis-py's own
+#: function names (8.1.0; a test pins each name to the installed client).
+#: Checked in order: a send on a connection that lost its socket reconnects
+#: INSIDE the reply call (`send_packed_command`), so its stack names both and
+#: must read as a connect.
+PHASE_FRAMES: dict[str, frozenset[str]] = {
+    "construct": frozenset({"_graph"}),
+    "connect": frozenset(
+        {
+            "get_connection",
+            "ensure_connection",
+            "connect",
+            "connect_check_health",
+            "_connect",
+            "on_connect_check_health",
+        }
+    ),
+    "reply": frozenset({"_send_command_parse_response", "parse_response"}),
+}
+
+
+def _phase(frames: list) -> str:
+    names = {str(f) for f in frames}
+    for phase, marks in PHASE_FRAMES.items():
+        if names & marks:
+            return phase
+    return "unknown"
+
+
+def _cause(event: dict) -> str:
+    """One reset event's own account of itself, written at the moment it broke
+    the clock (``graph_telemetry._moment`` plus the store's ``.diag``)."""
+    if "pid" not in event:
+        return "uninstrumented (written before timeout diagnostics)"
+    parts = [f"pid {event['pid']}"]
+    if event.get("proc_age_s") is not None:
+        parts[0] += f", age {event['proc_age_s']}s"
+    diag = event.get("diag") if isinstance(event.get("diag"), dict) else {}
+    if diag.get("budget_spent"):
+        parts.append("budget spent before the second query")
+    for key in ("budget_ms", "elapsed_ms", "late_ms", "cancel_ms"):
+        if diag.get(key) is not None:
+            parts.append(f"{key.removesuffix('_ms')} {diag[key]}ms")
+    if diag.get("query"):
+        parts.append(f"{diag['query']} query")
+    if isinstance(diag.get("frames"), list):
+        parts.append("at " + ">".join(str(f) for f in diag["frames"]))
+        if "conn" in diag:
+            parts.append(f"phase {_phase(diag['frames'])}")
+        else:
+            # Four frames, no connection reading: a handshake and a reply wait
+            # end in the same reader frames, so the phase cannot be told.
+            phase = _phase(diag["frames"])
+            parts.append(
+                f"phase {phase}" if phase != "unknown"
+                else "phase unknown (predates the connection capture)"
+            )
+    if "conn" in diag:
+        # Printed with or without frames: a spent budget has none.
+        parts.append(f"conn {diag['conn'] or 'unknown'}")
+        if diag.get("in_use") is not None:
+            parts.append(f"in_use {diag['in_use']}")
+    psi = diag.get("psi_stall_us") if isinstance(diag.get("psi_stall_us"), dict) else {}
+    stalls = {k: v for k, v in psi.items() if v}
+    if stalls:
+        parts.append("stall " + " ".join(f"{k}={v}us" for k, v in stalls.items()))
+    return ", ".join(parts)
+
+
+def render(v) -> str:
+    out = [f"FalkorDB default-on cutover: {v.status}"]
+    if v.clock_start:
+        out.append(f"  clock started {v.clock_start.isoformat()} ({v.days_on_clock} days)")
+    else:
+        out.append("  clock not started")
+    share = f"{v.cancelled / v.traversals:.1%}" if v.traversals else "n/a"
+    out.append(
+        f"  last 14 days: {v.falkordb_traversals} served by falkordb, traffic on "
+        f"{v.days_with_traffic} days, {v.cancelled} of {v.traversals} cancelled ({share})"
+    )
+    last = v.last_census.isoformat() if v.last_census else "never"
+    out.append(f"  census: {v.census_rows} rows, last {last}")
+    for reason in v.reasons:
+        out.append(f"  - {reason}")
+    if v.resets:
+        out.append("  clock resets (newest last):")
+        for r in v.resets[-10:]:
+            who = " ".join(str(r[k]) for k in ("proc", "caller") if r.get(k))
+            old = "" if r.get("in_window", True) else "  (before the window)"
+            out.append(f"    {r['at']}  {r['why']}{'  ' + who if who else ''}{old}")
+            for event in r.get("events") or []:
+                if isinstance(event, dict):
+                    out.append(f"      cause: {_cause(event)}")
+        if len(v.resets) > 10:
+            out.append(f"    ({len(v.resets) - 10} earlier, see --json)")
+    out.append(
+        "  residual: a database AND lost-writes-file failure at the same moment, or a"
+        " process killed in the instant a break is being written, can go uncounted."
+    )
+    return "\n".join(out)
+
+
+def main(argv: list[str] | None = None) -> int:
+    from genesis.env import genesis_db_path
+    from genesis.memory import graph_census, graph_cutover, graph_telemetry
+
+    ap = _Parser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--db", type=Path, default=None, help="database (default: the live one)")
+    ap.add_argument("--lost-writes", type=Path, default=None, help="lost-writes file")
+    ap.add_argument("--now", default=None, help="evaluate as of this ISO-8601 time")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    args = ap.parse_args(argv)
+    # The defaults are THIS install's database and lost-writes file; overriding
+    # one alone would mix two installs' evidence, in either direction.
+    if args.db is not None and args.lost_writes is None:
+        ap.error("--db needs --lost-writes (the lost-writes file of the same install)")
+    if args.lost_writes is not None and args.db is None:
+        ap.error("--lost-writes needs --db (the database of the same install)")
+
+    now = graph_cutover.parse_ts(args.now) if args.now else datetime.now(UTC)
+    if now is None:
+        ap.error(f"--now is not an ISO-8601 time: {args.now!r}")
+    db = args.db or genesis_db_path()
+    verdict = graph_cutover.evaluate(
+        read_rows(db, graph_telemetry.TELEMETRY_EVENT_TYPE),
+        read_rows(db, graph_census.CENSUS_EVENT_TYPE),
+        read_lost_writes(args.lost_writes or graph_telemetry.lost_writes_path()),
+        now,
+    )
+    print(json.dumps(verdict.to_json(), indent=2) if args.json else render(verdict))
+    return _EXIT[verdict.status]
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:  # noqa: BLE001 - any failure must not exit 1 (NOT_YET)
+        print(f"graph_cutover_report failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        sys.exit(_FAILED)

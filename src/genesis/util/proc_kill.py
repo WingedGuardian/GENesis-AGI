@@ -36,6 +36,10 @@ DEFAULT_REAP_TIMEOUT_S = 30.0
 class ProcessCleanupUncertain(RuntimeError):
     """Managed supervisor must retain ownership; process exit is unconfirmed."""
 
+    def __init__(self, message="Process cleanup is unconfirmed", *, process=None):
+        super().__init__(message)
+        self.process = process
+
 
 def kill_process_group(proc, sig: signal.Signals = signal.SIGKILL) -> None:
     """Signal the process group led by ``proc`` (Popen or asyncio Process).
@@ -230,6 +234,10 @@ async def spawn_owned(*args, **kwargs):
         # ordinary/nonstreaming callers (they do not use this opt-in helper).
         raise ProcessCleanupUncertain("Process creation is unconfirmed") from None
     if interrupted:
-        await confirm_process_exit(proc)
+        try:
+            await confirm_process_exit(proc)
+        except ProcessCleanupUncertain as exc:
+            exc.process = proc
+            raise
         raise asyncio.CancelledError
     return proc

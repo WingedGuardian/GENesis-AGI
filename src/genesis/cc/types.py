@@ -337,6 +337,9 @@ class CCInvocation:
     timeout_s: int = 7200
     allowed_tools: list[str] | None = None
     disallowed_tools: list[str] | None = None
+    # Positive removal of ALL built-in tools (--tools ""). An empty allowlist
+    # is not equivalent, especially under skip-permissions.
+    disable_tools: bool = False
     skip_permissions: bool = False
     skill_tags: list[str] | None = None
     working_dir: str | None = None
@@ -458,6 +461,10 @@ class CCInvocation:
         compare=False,
         repr=False,
     )
+
+    # --no-session-persistence: disposable print-mode checks must not leave
+    # transcripts in CC's separate project tree. Actual tasks keep persistence.
+    no_session_persistence: bool = False
 
     def __post_init__(self) -> None:
         # Producer-side loud validation of the WS-3 origin (the env READER is
@@ -589,6 +596,27 @@ class StreamEvent:
     #: a caller can ask "how many blocks would this line have produced?" without
     #: re-implementing the extraction — see ``recognized_blocks``.
     _RECOGNIZED_BLOCKS = ("thinking", "text", "tool_use")
+
+    @property
+    def is_synthetic(self) -> bool:
+        """True for an ``assistant`` line the CLI wrote itself, not the model.
+
+        CC reports a usage limit as an assistant message with one text block
+        ("You've hit your weekly limit ...") whose ``message.model`` is
+        ``"<synthetic>"``; its transcript record also carries
+        ``isApiErrorMessage: true`` and ``error``. That text is a notice about
+        the run, not an answer, so a guard asking "did answer text reach the
+        user?" must not count it. The model check reads the ``message`` object
+        the stream event shares with the transcript record; the two flags are
+        honoured when the line carries them.
+        """
+        raw = self.raw or {}
+        if raw.get("type") != "assistant":
+            return False
+        message = raw.get("message")
+        if isinstance(message, dict) and message.get("model") == "<synthetic>":
+            return True
+        return raw.get("isApiErrorMessage") is True or bool(raw.get("error"))
 
     @staticmethod
     def recognized_blocks(raw: dict) -> int:

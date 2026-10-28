@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import sys
+import time
 from collections import Counter
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -66,6 +67,39 @@ _PY_OPTS_WITH_VALUE = frozenset({"-X", "-W", "-Q"})
 #: Telemetry rows this process failed to write since the last one that landed.
 _write_failures = 0
 _proc_role: str | None = None
+#: Upper bounds (ms) of the primary-latency buckets; anything slower is ``ge500``.
+_PRIMARY_BUCKETS = ((10.0, "lt10"), (100.0, "lt100"), (250.0, "lt250"), (500.0, "lt500"))
+#: ``(starttime ticks, start epoch)`` of this process, read once.
+_START: tuple[int, float] | None = None
+
+
+def _self_start(proc_root: Path = Path("/proc")) -> tuple[int, float]:
+    """This process's start: its stat field 22 (ticks since boot) and the wall
+    clock it maps to through ``btime``. Not ``/proc/uptime``, which a container
+    may virtualise (lxcfs, measured 28 s off). Raises on anything unreadable."""
+    tail = (proc_root / "self" / "stat").read_text().rsplit(")", 1)[1].split()
+    ticks = int(tail[19])
+    for line in (proc_root / "stat").read_text().splitlines():
+        if line.startswith("btime "):
+            return ticks, float(line.split()[1]) + ticks / os.sysconf("SC_CLK_TCK")
+    raise ValueError("no btime in /proc/stat")
+
+
+def _moment() -> dict:
+    """Who broke the clock, read at the event: pid, its raw start time in clock
+    ticks (``/proc/<pid>/stat`` field 22: converted to epoch seconds it joins the
+    census row's ``pid`` + ``started_at``), and the process's age. A field that
+    cannot be read is None; this never raises."""
+    global _START
+    out: dict = {"pid": os.getpid(), "starttime_ticks": None, "proc_age_s": None}
+    try:
+        if _START is None:
+            _START = _self_start()
+        out["starttime_ticks"] = _START[0]
+        out["proc_age_s"] = round(max(0.0, time.time() - _START[1]), 3)
+    except Exception:
+        logger.debug("process start unreadable for the telemetry event", exc_info=True)
+    return out
 
 
 @dataclass
@@ -80,6 +114,9 @@ class _Tally:
     served: Counter = field(default_factory=Counter)
     configured: Counter = field(default_factory=Counter)
     events: list[dict] = field(default_factory=list)
+    #: Primary traversals' latency, per store that answered: bucket -> count.
+    primary_ms: dict[str, Counter] = field(default_factory=dict)
+    primary_ms_max: float | None = None
 
     def add(
         self,
@@ -89,21 +126,29 @@ class _Tally:
         served_by: str,
         primary_reason: str | None,
         final_reason: str | None,
+        diag: dict | None = None,
+        elapsed_ms: float | None = None,
     ) -> None:
         self.traversals += 1
         self.outcomes[outcome] += 1
         self.served[served_by] += 1
         self.configured[configured] += 1
         if outcome in _CLOCK_BREAKING:
-            self.events.append(
-                {
-                    "outcome": outcome,
-                    "configured": configured,
-                    "served_by": served_by,
-                    "primary_reason": primary_reason,
-                    "final_reason": final_reason,
-                }
-            )
+            event = {
+                "outcome": outcome,
+                "configured": configured,
+                "served_by": served_by,
+                "primary_reason": primary_reason,
+                "final_reason": final_reason,
+                **_moment(),
+            }
+            if diag is not None:
+                event["diag"] = diag
+            self.events.append(event)
+        elif outcome == "primary" and elapsed_ms is not None:
+            bucket = next((name for top, name in _PRIMARY_BUCKETS if elapsed_ms < top), "ge500")
+            self.primary_ms.setdefault(served_by, Counter())[bucket] += 1
+            self.primary_ms_max = max(self.primary_ms_max or 0.0, round(elapsed_ms, 1))
 
 
 #: The tally open for the current call, shared by every traversal it makes.
@@ -235,7 +280,7 @@ async def traversal_tally(
         await end_tally(token, db, db_path=db_path)
 
 
-async def note_traversal(db: aiosqlite.Connection, **outcome: str | None) -> None:
+async def note_traversal(db: aiosqlite.Connection, **outcome: object) -> None:
     """Record one traversal. The open tally takes it, except the call's FIRST
     clock-breaking outcome, which is written as its own row now so a process
     killed before the tally closes cannot take the broken clock with it. With
@@ -279,6 +324,9 @@ async def _write_tally(
             "events": tally.events,
             "prior_write_failures": carried,
         }
+        if tally.primary_ms:
+            metrics["primary_ms"] = {k: dict(v) for k, v in tally.primary_ms.items()}
+            metrics["primary_ms_max"] = tally.primary_ms_max
         from genesis.db.crud import j9_eval
 
         if db_path is not None:

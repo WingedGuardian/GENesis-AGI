@@ -5,6 +5,7 @@
         "MCP_TIMEOUT": "120000"
     },
     "cleanupPeriodDays": 180,
+    "skillListingBudgetFraction": 0.02,
     "attribution": {
         "commit": "",
         "pr": "",
@@ -343,8 +344,8 @@
                 "hooks": [
                     {
                         "type": "command",
-                        "command": "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cc-deploy-timeout-guard",
-                        "timeout": 5
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/deploy_timeout_advisory.py",
+                        "timeout": 10
                     }
                 ]
             },
@@ -406,6 +407,11 @@
                     {
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/adopt_first_gate.py --plan",
+                        "timeout": 15
+                    },
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/plan_premise_gate.py",
                         "timeout": 15
                     }
                 ]
@@ -594,6 +600,11 @@
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/main_checkout_guard.py",
                         "timeout": 30
+                    },
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/issue_dup_advisory.py",
+                        "timeout": 10
                     }
                 ]
             },
@@ -655,6 +666,11 @@
                         "type": "command",
                         "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/main_checkout_guard.py",
                         "timeout": 30
+                    },
+                    {
+                        "type": "command",
+                        "command": "${CLAUDE_PROJECT_DIR}/.claude/hooks/genesis-hook hooks/issue_dup_advisory.py",
+                        "timeout": 10
                     }
                 ]
             }

@@ -13,6 +13,12 @@ from genesis.mcp.health.constants import JOB_STALE_GAP_DAYS
 
 logger = logging.getLogger(__name__)
 
+# Actual alarmed depths; raw totals and scheduled display subsets are excluded.
+_QUEUE_DEPTH_FIELDS = frozenset({
+    "pending_embeddings", "dead_letters", "deferred_recovery", "deferred_processing",
+    "deferred_stuck", "failed_embeddings", "discarded_count",
+})
+
 
 async def _impl_health_errors(
     window_minutes: int = 60,
@@ -283,7 +289,9 @@ def _apply_ongoing_duration(
             logger.debug("ongoing-duration decoration failed", exc_info=True)
 
 
-async def _compute_alerts() -> tuple[list[dict], set[str]]:
+async def _compute_alerts(
+    *, agent_api_observation: dict | None = None, queue_unknown_ids: set[str] | None = None,
+) -> tuple[list[dict], set[str]]:
     """Pure alert computation — recompute the firing alert set from live health.
 
     Returns ``(alerts, current_ids)`` and carries NO ``_alert_history`` state.
@@ -298,6 +306,11 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
     _service = health_mcp_mod._service
     _activity_tracker = health_mcp_mod._activity_tracker
     _job_retry_registry = health_mcp_mod._job_retry_registry
+    if agent_api_observation is not None:
+        agent_api_observation.update(status="unknown")
+    if queue_unknown_ids is not None:
+        queue_unknown_ids.clear()
+        queue_unknown_ids.update(f"queue:{field}" for field in _QUEUE_DEPTH_FIELDS)
 
     # WS-2 P1b: ledger writer-hook failures — checked BEFORE the
     # uninitialized-service early return because the counter needs no health
@@ -429,6 +442,23 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
 
     snap = await _service.snapshot()
 
+    from genesis.observability.agent_api_alerts import active_alerts, alert_observation
+    from genesis.runtime import GenesisRuntime
+
+    runtime = GenesisRuntime.peek()
+    observation = alert_observation(
+        snap.get("agent_api"), boot_at=getattr(runtime, "_bootstrap_completed_at", None),
+    )
+    if agent_api_observation is not None:
+        agent_api_observation.clear()
+        agent_api_observation.update(observation)
+    try:
+        api_alerts = await active_alerts(_service._db, observation)
+        alerts.extend(api_alerts)
+        current_ids.update(a["id"] for a in api_alerts)
+    except Exception:
+        logger.warning("Peer API incident read unavailable", exc_info=True)
+
     # Import lazily to avoid circular imports in hook/test paths
     from genesis.observability._call_site_meta import _CALL_SITE_META
 
@@ -492,15 +522,12 @@ async def _compute_alerts() -> tuple[list[dict], set[str]]:
     # back in (see resilience/deferred_work.py:STALE_WORKLIST_DAYS), so a genuinely
     # broken drain still surfaces. `deferred_work`/`deferred_worklist` stay in the
     # snapshot for honest display but are not depth-alarmed here.
-    _QUEUE_DEPTH_FIELDS = {
-        "pending_embeddings",
-        "dead_letters",
-        "deferred_recovery",
-        "deferred_processing",
-        "deferred_stuck",
-        "failed_embeddings",
-        "discarded_count",
-    }
+    if queue_unknown_ids is not None:
+        queue_unknown_ids.clear()
+        queue_unknown_ids.update(
+            f"queue:{field}" for field in _QUEUE_DEPTH_FIELDS
+            if not isinstance(queues.get(field), int)
+        )
     for queue_name, depth in queues.items():
         if queue_name not in _QUEUE_DEPTH_FIELDS:
             continue
@@ -1453,8 +1480,10 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
     """
     import genesis.mcp.health_mcp as health_mcp_mod
 
-    alerts, current_ids = await _compute_alerts()
+    queue_unknown_ids: set[str] = set()
+    alerts, current_ids = await _compute_alerts(queue_unknown_ids=queue_unknown_ids)
     _alert_history = health_mcp_mod._alert_history
+    retained = {aid: stamp for aid, stamp in _alert_history.items() if aid in queue_unknown_ids}
 
     now = datetime.now(UTC).isoformat()
     for old_id in list(_alert_history.keys()):
@@ -1467,6 +1496,8 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
 
     if not active_only:
         for resolved_id, resolved_at in _alert_history.items():
+            if resolved_id in retained:
+                continue
             alerts.append(
                 {
                     "id": resolved_id,
@@ -1476,6 +1507,7 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
             )
 
     health_mcp_mod._alert_history = {aid: now for aid in current_ids}
+    health_mcp_mod._alert_history.update(retained)
 
     return alerts
 

@@ -20,6 +20,7 @@ from genesis.cc.session_manager import SessionManager
 from genesis.cc.system_prompt import SystemPromptAssembler
 from genesis.cc.types import CCInvocation, CCOutput
 from genesis.dashboard.routes.agent_api import ROOT, agent_api_bp
+from genesis.db.connection import SerializedConnection, get_db
 from genesis.db.schema import create_all_tables, seed_data
 from genesis.peers.auth import PeerIdentity
 from genesis.peers.conversation import ConversationRefusal, ConversationService, head
@@ -133,8 +134,172 @@ async def test_real_sdk_http_bounded_send_poll_full_continuation(http_bridge):
         assert "A considered reply" in b.invoker.run_streaming.call_args.args[0].prompt
 
 
+async def _clock_receipt(b, *, started="2026-01-01T00:00:00Z", state="running"):
+    from genesis.db.crud import cc_sessions
+
+    sid = str(uuid4())
+    await cc_sessions.create(
+        b.db, id=sid, session_type="background_task", model="sonnet",
+        started_at=started, last_activity_at=started, source_tag="agent_api",
+        metadata=json.dumps({"peer_id": "alpha", "peer_epoch": b.identities["alpha"].peer["epoch"],
+                             "context_id": str(uuid4()), "native_state": state}),
+    )
+    return sid
+
+
+async def test_status_clock_is_not_a_heartbeat_or_start_order(bridge):
+    identity = bridge.identities["alpha"]
+    old = await _clock_receipt(bridge)
+    newer = await _clock_receipt(bridge, started="2026-02-01T00:00:00Z")
+    before = project(await bridge.service.get(identity, old))["status"]["timestamp"]
+    await bridge.db.execute("UPDATE cc_sessions SET last_activity_at='2026-12-01T00:00:00Z' WHERE id=?", (old,))
+    await bridge.db.commit()
+    assert project(await bridge.service.get(identity, old))["status"]["timestamp"] == before
+    await asyncio.sleep(0.01)
+    await bridge.db.execute(
+        "UPDATE cc_sessions SET status='completed', metadata=json_set(metadata,'$.native_state','succeeded') WHERE id=?",
+        (old,),
+    )
+    await bridge.db.commit()
+    rows, _, _ = await bridge.service.list(identity, 20)
+    assert [r["id"] for r in rows] == [old, newer]
+    assert project(rows[0])["status"]["timestamp"] != before
+
+
+@pytest.mark.parametrize("mutation", ["delete", "update"])
+async def test_issued_task_cursor_survives_anchor_deletion(bridge, mutation):
+    identity = bridge.identities["alpha"]
+    for month in (1, 2, 3):
+        await _clock_receipt(bridge, started=f"2026-{month:02}-01T00:00:00Z")
+        await asyncio.sleep(0.002)
+    rows, token, total = await bridge.service.list(identity, 1)
+    assert total == 3 and token
+    if mutation == "delete":
+        await bridge.db.execute("DELETE FROM cc_sessions WHERE id=?", (rows[0]["id"],))
+    else:
+        await bridge.db.execute(
+            "UPDATE cc_sessions SET status='completed',metadata=json_set(metadata,'$.native_state','succeeded') WHERE id=?",
+            (rows[0]["id"],),
+        )
+    await bridge.db.commit()
+    following, _, total = await bridge.service.list(identity, 20, token)
+    assert total == (2 if mutation == "delete" else 3) and len(following) == 2
+    assert rows[0]["id"] not in {r["id"] for r in following}
+
+
+async def test_approval_transition_clock_is_in_the_task_snapshot(bridge):
+    identity = bridge.identities["alpha"]
+    sid = await _clock_receipt(bridge)
+    before = project(await bridge.service.get(identity, sid))["status"]["timestamp"]
+    await asyncio.sleep(0.01)
+    await bridge.db.execute(
+        "INSERT INTO approval_requests(id,action_type,action_class,description,context) VALUES(?,?,?,?,?)",
+        ("clock-approval", "test", "reversible", "Synthetic hold", json.dumps({"agent_session_id": sid})),
+    )
+    await bridge.db.commit()
+    view = project(await bridge.service.get(identity, sid))
+    assert view["status"]["state"] == "TASK_STATE_AUTH_REQUIRED"
+    assert view["status"]["timestamp"] != before
+    assert view["metadata"]["pendingOwnerActions"] is True
+
+
+async def test_http_list_get_share_approval_snapshot_and_cursor_scope(http_bridge, monkeypatch):
+    b, app, base, _ = http_bridge
+    app.config["GENESIS_CONVERSATION_SERVICE"] = b.service
+    ids = [await _clock_receipt(b) for _ in range(3)]
+    await b.db.execute(
+        "INSERT INTO approval_requests(id,action_type,action_class,description,context) VALUES(?,?,?,?,?)",
+        ("http-clock-hold", "test", "reversible", "Synthetic hold", json.dumps({"agent_session_id": ids[0]})),
+    )
+    await b.db.commit()
+    # The old per-row query must never be used by any task response.
+    monkeypatch.setattr(b.service, "has_pending_approval", AsyncMock(side_effect=AssertionError("split snapshot")))
+    async with sdk_client(base) as (client, _):
+        response = await client.get(base + ROOT + "/tasks", params={"pageSize": 1})
+        assert response.status_code == 200
+        first = response.json()
+        task = first["tasks"][0]
+        got = await client.get(base + ROOT + "/tasks/" + task["id"])
+        assert got.status_code == 200 and got.json()["status"] == task["status"]
+        token = first["nextPageToken"]
+        assert token
+        bad_context = await client.get(base + ROOT + "/tasks", params={"pageToken": token, "contextId": str(uuid4())})
+        assert bad_context.status_code == 400
+        import os
+
+        other = await client.get(base + ROOT + "/tasks", params={"pageToken": token},
+                                 headers={"Authorization": "Bearer " + os.environ["GENESIS_PEER_BETA_TOKEN"]})
+        assert other.status_code == 400
+        await b.registry.grant("alpha", "conversation", "deny")
+        assert (await client.get(base + ROOT + "/tasks", params={"pageToken": token})).status_code == 403
+
+
+@pytest.mark.parametrize("bad", [None, "garbage", "2026-02-30T00:00:00.000Z", "2026-01-01T24:00:00.000Z", "2026-01-01T24:01:00.000Z"])
+@pytest.mark.parametrize("operation", ["get", "list"])
+async def test_incomplete_owned_projection_outside_page_is_not_hidden(bridge, bad, operation):
+    identity = bridge.identities["alpha"]
+    sid = await _clock_receipt(bridge)
+    await _clock_receipt(bridge)
+    await bridge.db.execute("UPDATE cc_sessions SET a2a_status_at=? WHERE id=?", (bad, sid))
+    await bridge.db.commit()
+    with pytest.raises(ConversationRefusal) as refused:
+        if operation == "get":
+            await bridge.service.get(identity, sid)
+        else:
+            await bridge.service.list(identity, 1)
+    assert refused.value.code == "not_ready" and refused.value.status == 503
+
+
+def _fallback_turn(b, tool_turn, monkeypatch):
+    from dataclasses import replace
+
+    from genesis.cc import roster
+    from genesis.cc.exceptions import CCQuotaExhaustedError
+    from genesis.cc.provider_readiness import READY
+    from genesis.cc.types import StreamEvent
+
+    monkeypatch.setenv("GENESIS_HOME", str(b.registry.path.parent))
+    monkeypatch.setenv("SYNTHETIC_PROVIDER_KEY", "synthetic-key")
+    monkeypatch.setattr(
+        roster,
+        "load_roster",
+        lambda: {
+            "default": "claude",
+            "models": {
+                "claude": {"native_subscription": True},
+                "backup": {
+                    "model_id": "backup-id",
+                    "anthropic_base_url": "https://provider.example.org",
+                    "auth_env": "SYNTHETIC_PROVIDER_KEY",
+                    "failover_order": 1,
+                },
+            },
+        },
+    )
+    build = b.runner._build_invocation
+    b.runner._build_invocation = lambda req, sid: replace(build(req, sid), roster_eligible=True)
+
+    async def selected_turn(invocation, **kwargs):
+        if invocation.disable_tools:
+            if not invocation.anthropic_base_url:
+                raise CCQuotaExhaustedError("synthetic refusal")
+            await kwargs["on_event"](
+                StreamEvent(
+                    "init",
+                    raw={"type": "system", "subtype": "init", "tools": [], "mcp_servers": []},
+                )
+            )
+            return CCOutput("probe", READY, "backup-id", 0, 1, 1, 1, 0, tools_used=())
+        return await tool_turn(invocation, **kwargs)
+
+    return selected_turn
+
+
 @pytest.mark.parametrize("waiting", [True, False])
-async def test_agent_gate_owner_notification_resolution_and_wait_or_hold(http_bridge, waiting):
+@pytest.mark.parametrize("fallback", [False, True])
+async def test_agent_gate_owner_notification_resolution_and_wait_or_hold(
+    http_bridge, waiting, fallback, monkeypatch
+):
     from a2a.types import GetTaskRequest, TaskState
 
     from genesis.autonomy.approval import ApprovalManager
@@ -222,7 +387,9 @@ async def test_agent_gate_owner_notification_resolution_and_wait_or_hold(http_br
             exit_code=0,
         )
 
-    b.invoker.run_streaming.side_effect = tool_turn
+    b.invoker.run_streaming.side_effect = (
+        _fallback_turn(b, tool_turn, monkeypatch) if fallback else tool_turn
+    )
     async with sdk_client(base) as (client, transport):
         task = await sdk_send(transport, message())
         await asyncio.wait_for(sent.wait(), 3)
@@ -264,7 +431,7 @@ async def test_agent_gate_owner_notification_resolution_and_wait_or_hold(http_br
         done = await sdk_settle(transport, task.id)
         assert done.status.state == TaskState.TASK_STATE_COMPLETED
         assert (await client.get(base + ROOT + "/approvals")).json()["approvals"] == []
-        assert b.invoker.run_streaming.await_count == 1  # No generic cognition replay.
+        assert b.invoker.run_streaming.await_count == (3 if fallback else 1)
 
 
 def message(mid=None, context=None, **options):
@@ -286,7 +453,7 @@ def incoming(payload=None):
 async def bridge(tmp_path, monkeypatch):
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     path = tmp_path / "genesis.db"
-    db = await aiosqlite.connect(path)
+    db = await get_db(path)
     db.row_factory = aiosqlite.Row
     await create_all_tables(db)
     await seed_data(db)
@@ -380,6 +547,50 @@ async def test_send_retry_continuation_identity_result(bridge):
     assert "A considered reply" in calls[1].args[0].prompt
     assert calls[1].args[0].origin == "external_untrusted"
     assert calls[1].args[0].supervised is False
+
+
+async def test_bridge_uses_production_connection(bridge):
+    assert isinstance(bridge.db, SerializedConnection)
+    assert (await (await bridge.db.execute("PRAGMA journal_mode")).fetchone())[0] == "wal"
+    assert (await (await bridge.db.execute("PRAGMA foreign_keys")).fetchone())[0] == 1
+
+
+async def test_admission_checks_database_before_taking_write_lock(bridge, monkeypatch):
+    same_database = bridge.service._same_database
+    checks = 0
+
+    async def checked(db):
+        nonlocal checks
+        checks += 1
+        assert not db.in_transaction
+        # A runtime writer must be able to finish while identity is checked.
+        await bridge.db.execute("UPDATE peer_settings SET mode=mode WHERE id=1")
+        await bridge.db.commit()
+        await same_database(db)
+
+    monkeypatch.setattr(bridge.service, "_same_database", checked)
+    row = await asyncio.wait_for(bridge.service.send(bridge.identities["alpha"], incoming()), 3)
+    assert checks == 3  # Preflight, admission, and the committed status re-read.
+    monkeypatch.setattr(bridge.service, "_same_database", same_database)
+    assert project(await settle(bridge, row))["status"]["state"] == "TASK_STATE_COMPLETED"
+
+
+async def test_admission_rechecks_actual_database_after_enrichment(bridge, tmp_path, monkeypatch):
+    other_path = tmp_path / "other.db"
+    async with aiosqlite.connect(other_path):
+        pass
+
+    class ChangedRegistryAssembler:
+        async def assemble(self, **kwargs):
+            bridge.registry.path = other_path
+            return "Synthetic identity"
+
+    monkeypatch.setattr("genesis.peers.conversation.SystemPromptAssembler", ChangedRegistryAssembler)
+    with pytest.raises(ConversationRefusal, match="not_ready"):
+        await bridge.service.send(bridge.identities["alpha"], incoming())
+    bridge.invoker.run_streaming.assert_not_awaited()
+    assert (await (await bridge.db.execute("SELECT count(*) FROM cc_sessions")).fetchone())[0] == 0
+    assert bridge.service._enriching == {}
 
 
 async def test_changed_retry_conflicts(bridge):
@@ -641,12 +852,13 @@ async def test_host_bootstrap_records_peer_binding_readiness(bridge, monkeypatch
     monkeypatch.setattr("genesis.runtime._capabilities.write_capabilities_file", write)
     app = Flask(__name__)
     adapter = StandaloneAdapter()
+    app.config.update(GENESIS_PEER_RUNTIME=bridge.runtime, GENESIS_PEER_REGISTRY=bridge.registry)
     monkeypatch.setattr(adapter, "_create_flask_app", lambda: app)
     monkeypatch.setattr(
         adapter, "_register_blueprints", lambda: app.register_blueprint(agent_api_bp)
     )
     await adapter.bootstrap()
-    assert bridge.runtime._bootstrap_manifest["agent_api"] == ("ok" if enabled else "degraded")
+    assert bridge.runtime._bootstrap_manifest["agent_api"] == ("ok" if enabled else "disabled")
     assert "agent_api" in _CAPABILITY_DESCRIPTIONS
     write.assert_called_once_with(bridge.runtime)
 
@@ -721,10 +933,13 @@ async def test_failed_identity_work_releases_admission_claim(bridge, monkeypatch
 @pytest.mark.parametrize("peer", ["alpha", "beta"])
 async def test_a_send_burst_does_identity_work_only_within_capacity(bridge, monkeypatch, peer):
     entered, release = [], asyncio.Event()
+    both_entered = asyncio.Event()
 
     class SlowAssembler:
         async def assemble(self, **kwargs):
             entered.append(True)
+            if len(entered) == 2:
+                both_entered.set()
             await release.wait()
             return "Synthetic identity"
 
@@ -736,11 +951,14 @@ async def test_a_send_burst_does_identity_work_only_within_capacity(bridge, monk
     (refused,) = done
     with pytest.raises(ConversationRefusal, match="rate_limited"):
         await refused
+    # A refused send may finish while another admitted send is still awaiting
+    # its preflight or autonomy lookup. Wait for both actual assembly entries.
+    await asyncio.wait_for(both_entered.wait(), 5)
     assert len(entered) == 2
     release.set()
     for send in sends:
         if send is not refused:
-            task = bridge.runner._active.get((await send)["id"])
+            task = bridge.runner._active.get((await asyncio.wait_for(send, 10))["id"])
             if task:
                 await asyncio.wait_for(asyncio.shield(task), 3)
     assert bridge.service._enriching == {}
@@ -749,15 +967,37 @@ async def test_a_send_burst_does_identity_work_only_within_capacity(bridge, monk
 async def test_missing_partial_symlink_and_whole_result_scan(bridge):
     row = await settle(bridge, await bridge.service.send(bridge.identities["alpha"], incoming()))
     path = bridge.home / ".genesis/output" / f"bg-session-{row['id']}.md"
-    path.write_text("benign prefix\n" + json.dumps({"password": "syntheticcredential"}))
+    # A plainly keyed credential is redacted in place; a private path passes.
+    path.write_text("see /home/someone/notes\n" + json.dumps({"password": "syntheticcredential"}))
     meta = json.loads(row["metadata"])
     meta["result_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()  # as committed
     row["metadata"] = json.dumps(meta)
-    with pytest.raises(ConversationRefusal, match="disclosure_refused"):
-        full_result(row)
+    text = full_result(row)
+    assert "syntheticcredential" not in text
+    assert '"password": "[redacted:json_credential]"' in text
+    assert "/home/someone/notes" in text
     meta["output_text"] = path.read_text()
     row["metadata"] = json.dumps(meta)
+    view = project(row)
+    assert "syntheticcredential" not in json.dumps(view)
+    assert view["metadata"]["replyRedacted"] == ["json_credential"]
+    # One the redactor cannot see (an escaped key) still withholds the reply.
+    escaped = "".join(f"\\u{ord(c):04x}" for c in "password")
+    path.write_text('benign prefix\n{"' + escaped + '": "syntheticcredential"}')
+    meta["result_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    meta["output_text"] = path.read_text()
+    row["metadata"] = json.dumps(meta)
+    with pytest.raises(ConversationRefusal, match="disclosure_refused"):
+        full_result(row)
     assert "message" not in project(row)["status"]
+    # Withheld despite a redaction: the redacted pattern names are not disclosed.
+    path.write_text(path.read_text() + "\npassword=syntheticsecondvalue")
+    meta["result_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    meta["output_text"] = path.read_text()
+    row["metadata"] = json.dumps(meta)
+    withheld = project(row)
+    assert withheld["metadata"]["replyError"] == "disclosure_refused"
+    assert "replyRedacted" not in withheld["metadata"]
     other = bridge.home / "external-result"
     path.rename(other)
     path.symlink_to(other)
@@ -990,3 +1230,248 @@ async def test_not_started_persistence_stops_retrying_once_closing(bridge, monke
     monkeypatch.setattr(conversation, "update_state", failing_update)
     await asyncio.wait_for(bridge.service.send(identity, incoming()), 3)
     assert attempts == [1]
+
+
+async def test_not_started_retry_logs_error_type_without_private_values(bridge, monkeypatch, caplog):
+    import sqlite3
+
+    from genesis.peers import conversation
+
+    error = sqlite3.OperationalError("synthetic private SQL and values")
+    error.sqlite_errorname = "SQLITE_BUSY_SNAPSHOT"
+    original = conversation.update_state
+    attempts = 0
+
+    async def flaky_update(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts <= 2:
+            raise error
+        await original(*args, **kwargs)
+
+    monkeypatch.setattr(bridge.runner, "adopt", AsyncMock(side_effect=ValueError("not adopted")))
+    monkeypatch.setattr(conversation, "update_state", flaky_update)
+    row = await asyncio.wait_for(bridge.service.send(bridge.identities["alpha"], incoming()), 3)
+    assert attempts == 3
+    assert row["status"] == "failed"
+    # Two failures ~0.1s apart emit one warning; retries stay unlogged inside
+    # the throttle window.
+    assert caplog.text.count("exception=OperationalError, sqlite_errorname=SQLITE_BUSY_SNAPSHOT") == 1
+    assert str(error) not in caplog.text
+
+
+def _shrink_route_timeout(monkeypatch, app, endpoint, seconds):
+    """Patch one route's bound ``_async_route`` timeout instead of waiting 15s."""
+    view = app.view_functions[endpoint]
+    cell = view.__closure__[view.__code__.co_freevars.index("timeout")]
+    monkeypatch.setattr(cell, "cell_contents", seconds)
+
+
+def _peer_client():
+    import os
+
+    import httpx
+
+    return httpx.AsyncClient(
+        headers={
+            "Authorization": "Bearer " + os.environ["GENESIS_PEER_ALPHA_TOKEN"],
+            "A2A-Version": "1.0",
+            "Content-Type": "application/json",
+        },
+        trust_env=False,
+        timeout=10,
+    )
+
+
+async def _receipt_count(bridge):
+    return (
+        await (
+            await bridge.db.execute("SELECT count(*) FROM cc_sessions WHERE source_tag='agent_api'")
+        ).fetchone()
+    )[0]
+
+
+async def test_send_timeout_503_names_accepted_task_and_same_id_retry_adopts_it(
+    http_bridge, monkeypatch
+):
+    from genesis.peers.conversation import receipt_id
+
+    b, app, base, _ = http_bridge
+    app.config["GENESIS_CONVERSATION_SERVICE"] = b.service
+    _shrink_route_timeout(monkeypatch, app, "agent_api.send_message", 0.3)
+    reached, release = asyncio.Event(), asyncio.Event()
+    original = b.runner.adopt
+
+    async def delayed(sid, request):
+        reached.set()
+        await release.wait()
+        return await original(sid, request)
+
+    monkeypatch.setattr(b.runner, "adopt", delayed)
+    payload = message()
+    sid = receipt_id(b.identities["alpha"], incoming(payload))
+    try:
+        await _timed_out_send_then_retry(b, base, payload, sid, reached, release)
+    finally:
+        # A failed assertion must not strand the admission on the held adopt.
+        release.set()
+        await asyncio.gather(*tuple(b.service._admissions), return_exceptions=True)
+
+
+async def _timed_out_send_then_retry(b, base, payload, sid, reached, release):
+    async with _peer_client() as client:
+        first = await client.post(base + ROOT + "/message:send", content=json.dumps(payload))
+        # The owner decision keeps 503; the body now names the accepted task.
+        assert first.status_code == 503
+        body = first.json()
+        assert body["code"] == "not_ready" and body["error"]["status"] == "UNAVAILABLE"
+        assert body["taskId"] == sid
+        assert reached.is_set()
+        # The admission outlived the route: a same-messageId retry adopts it.
+        retry = await client.post(base + ROOT + "/message:send", content=json.dumps(payload))
+        assert retry.status_code == 200 and retry.json()["task"]["id"] == sid
+        release.set()
+        await asyncio.gather(*tuple(b.service._admissions))
+        await settle(b, {"id": sid})
+        assert await _receipt_count(b) == 1
+        assert b.invoker.run_streaming.await_count == 1
+        # A send that finishes inside the bound is still a plain 200 task.
+        fast = await client.post(base + ROOT + "/message:send", content=json.dumps(message()))
+        assert fast.status_code == 200 and "taskId" not in fast.json()
+        assert fast.json()["task"]["id"] != sid
+
+
+async def test_non_send_timeout_503_body_is_unchanged(http_bridge, monkeypatch):
+    b, app, base, _ = http_bridge
+    row = await b.service.send(b.identities["alpha"], incoming())
+    await settle(b, row)
+    app.config["GENESIS_CONVERSATION_SERVICE"] = b.service
+    _shrink_route_timeout(monkeypatch, app, "agent_api.get_task", 0.3)
+    release = asyncio.Event()
+
+    async def slow(*args, **kwargs):
+        await release.wait()
+        return False
+
+    # The atomic task/approval snapshot now happens inside get(), not a later
+    # per-task approval query. Read timeouts still carry no send receipt ID.
+    monkeypatch.setattr(b.service, "get", slow)
+    try:
+        async with _peer_client() as client:
+            response = await client.get(base + ROOT + f"/tasks/{row['id']}")
+    finally:
+        release.set()
+    assert response.status_code == 503
+    assert response.json() == {
+        "code": "not_ready",
+        "error": {"code": 503, "message": "Peer request refused", "status": "UNAVAILABLE"},
+    }
+
+
+def _hold_admission(b, level_after):
+    """Hold the pre-commit authority read in ``_admit`` until released."""
+    entered, release = asyncio.Event(), asyncio.Event()
+    entered.held_calls = 0
+
+    async def held(*args, **kwargs):
+        # Calls made while held are admission work; the native run's own
+        # authority read happens after release and is not counted.
+        if not release.is_set():
+            entered.held_calls += 1
+        entered.set()
+        await release.wait()
+        return level_after
+
+    b.runtime._autonomy_manager.effective_level = AsyncMock(side_effect=held)
+    return entered, release
+
+
+async def _post(client, base, payload):
+    return await client.post(base + ROOT + "/message:send", content=json.dumps(payload))
+
+
+async def test_pre_commit_timeout_retry_shares_the_original_admission(http_bridge, monkeypatch):
+    from genesis.peers.conversation import receipt_id
+
+    b, app, base, _ = http_bridge
+    app.config["GENESIS_CONVERSATION_SERVICE"] = b.service
+    _shrink_route_timeout(monkeypatch, app, "agent_api.send_message", 0.3)
+    entered, release = _hold_admission(b, 3)
+    payload = message()
+    sid = receipt_id(b.identities["alpha"], incoming(payload))
+    try:
+        async with _peer_client() as client:
+            first = await _post(client, base, payload)
+            assert first.status_code == 503 and first.json()["taskId"] == sid
+            assert entered.is_set() and await _receipt_count(b) == 0
+            # Still pre-commit: the retry waits on the same shielded work and
+            # can itself time out, naming the same receipt.
+            retry = await _post(client, base, payload)
+            assert retry.status_code == 503 and retry.json()["taskId"] == sid
+            release.set()
+            await asyncio.gather(*tuple(b.service._admissions))
+            done = await _post(client, base, payload)
+            assert done.status_code == 200 and done.json()["task"]["id"] == sid
+    finally:
+        release.set()
+        await asyncio.gather(*tuple(b.service._admissions), return_exceptions=True)
+    await settle(b, {"id": sid})
+    assert await _receipt_count(b) == 1
+    assert entered.held_calls == 1  # the retry did not start a second admission
+    assert b.invoker.run_streaming.await_count == 1
+
+
+async def test_timeout_then_refusal_names_receipt_that_never_commits(http_bridge, monkeypatch):
+    from genesis.peers.conversation import receipt_id
+
+    b, app, base, _ = http_bridge
+    app.config["GENESIS_CONVERSATION_SERVICE"] = b.service
+    _shrink_route_timeout(monkeypatch, app, "agent_api.send_message", 0.3)
+    # Authority drops below the floor while the admission is held: refused 403.
+    entered, release = _hold_admission(b, 0)
+    payload = message()
+    sid = receipt_id(b.identities["alpha"], incoming(payload))
+    try:
+        async with _peer_client() as client:
+            first = await _post(client, base, payload)
+            assert first.status_code == 503 and first.json()["taskId"] == sid
+            release.set()
+            await asyncio.gather(*tuple(b.service._admissions), return_exceptions=True)
+            assert (await client.get(base + ROOT + f"/tasks/{sid}")).status_code == 404
+            retry = await _post(client, base, payload)
+            assert retry.status_code == 403 and retry.json()["code"] == "unauthorized"
+            assert "taskId" not in retry.json()
+    finally:
+        release.set()
+        await asyncio.gather(*tuple(b.service._admissions), return_exceptions=True)
+    assert await _receipt_count(b) == 0
+    b.invoker.run_streaming.assert_not_awaited()
+
+
+async def test_failure_after_commit_names_receipt_on_send_only(http_bridge, monkeypatch):
+    from genesis.peers.conversation import receipt_id
+
+    b, app, base, _ = http_bridge
+    app.config["GENESIS_CONVERSATION_SERVICE"] = b.service
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("synthetic projection failure")
+
+    monkeypatch.setattr(b.service, "get", broken)
+    payload = message()
+    sid = receipt_id(b.identities["alpha"], incoming(payload))
+    unchanged = {
+        "code": "not_ready",
+        "error": {"code": 503, "message": "Peer request refused", "status": "UNAVAILABLE"},
+    }
+    async with _peer_client() as client:
+        # send() committed the receipt; only the projection afterwards failed.
+        sent = await _post(client, base, payload)
+        assert sent.status_code == 503 and sent.json() == {**unchanged, "taskId": sid}
+        task = b.runner._active.get(sid)
+        if task is not None:
+            await asyncio.wait_for(asyncio.shield(task), 3)
+        assert await _receipt_count(b) == 1
+        # The same generic failure on a read route carries no task id.
+        read = await client.get(base + ROOT + f"/tasks/{sid}")
+        assert read.status_code == 503 and read.json() == unchanged

@@ -699,7 +699,9 @@ async def test_two_projections_of_one_key_never_interleave(tmp_path):
             if "CREATE INDEX" in cypher:
                 order.append(f"{self._tag}:start")
                 await _asyncio.sleep(0.05)  # a window for the other run to barge in
-            elif "ProjectionMeta" in cypher:
+            elif cypher == falkor_mod._PROJECTION_MARKER_COUNT:
+                # The warm-up's last read, so the bracket covers the whole build
+                # up to the swap, the warm-up included.
                 order.append(f"{self._tag}:end")
             return object()
 
@@ -1064,13 +1066,26 @@ async def test_every_network_operation_goes_through_the_bounded_chokepoint():
 
     # And the accessor can be sidestepped entirely by touching the attribute:
     # `self._db.connection.delete(...)` never calls `_connection()`.
+    # One exemption: `_pool_state` reads the pool's in-memory lists for the
+    # timeout diagnosis. It is exempt only while it cannot reach the socket: it
+    # stays synchronous, awaits nothing, and CALLS nothing through
+    # `.connection` (a sync method could still hand back an unawaited command).
+    state_readers = {"_pool_state"}
+    for node in methods:
+        if node.name in state_readers:
+            assert isinstance(node, ast.FunctionDef), f"{node.name} must stay synchronous"
+            assert not any(isinstance(n, ast.Await) for n in ast.walk(node)), node.name
+            for n in ast.walk(node):
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+                    chain = ast.unparse(n.func)
+                    assert ".connection" not in chain, f"{node.name} calls {chain}"
     raw = sorted(
         node.name
         for node in methods
         for inner in ast.walk(node)
         if isinstance(inner, ast.Attribute)
         and inner.attr == "connection"
-        and node.name != "_connection"
+        and node.name not in {"_connection", *state_readers}
     )
     assert not raw, f"self._db.connection must go through _connection(); touched by {raw}"
 
@@ -1661,3 +1676,590 @@ async def test_the_visibility_choice_reaches_the_ENGINE_not_just_the_signature(
     # predicate it feeds is short-circuited by the flag.
     assert "now" in params, "the single-query-string design requires now bound in BOTH modes"
     assert "$now" in seen["cypher"]
+
+
+# ── A timeout records its own cause (T1: the cutover-clock resets) ─────────
+#
+# Every reset of the cutover clock since 2026-10-13 was a read TimeoutError, and
+# the row said only that. These pin what a timeout now carries on `.diag`, so the
+# next one names WHERE the wait was (frame names), WHETHER our own loop was late
+# at the deadline (`late_ms`), and the box's stall time across the wait.
+
+
+class _HangingGraph:
+    async def query(self, cypher, params):
+        await _hang_in_query()
+
+
+async def _hang_in_query():
+    import asyncio as _asyncio
+
+    await _asyncio.sleep(5)
+
+
+class _FastClient:
+    def __init__(self, *a, **k):
+        pass
+
+    def select_graph(self, key):
+        return _HangingGraph()
+
+
+async def test_a_query_timeout_names_the_awaits_it_cancelled(tmp_path):
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _FastClient),
+        patch.object(falkor_mod, "_READ_TIMEOUT_S", 0.05),
+        pytest.raises(GraphUnavailableError, match="exceeded") as caught,
+    ):
+        await store.traverse(None, "root", max_depth=2, min_strength=0.3)
+
+    diag = caught.value.diag
+    assert diag["budget_ms"] == 50.0
+    # Deepest last; the innermost is the library await the fake sits in, as the
+    # client's reader (`readuntil`) is for a real engine that never replies.
+    assert diag["frames"][-2:] == ["_hang_in_query", "sleep"], diag["frames"]
+    # A responsive loop fires the deadline on time.
+    assert diag["elapsed_ms"] >= 50.0
+    assert diag["late_ms"] < 40.0, diag
+
+
+async def test_a_connect_timeout_is_told_apart_from_a_query_timeout(tmp_path):
+    import threading
+
+    release = threading.Event()
+
+    class _SlowClient:
+        def __init__(self, *a, **k):
+            release.wait(timeout=5)
+
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    try:
+        with (
+            patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+            patch.object(falkor_mod, "_FalkorDB", _SlowClient),
+            patch.object(falkor_mod, "_READ_TIMEOUT_S", 0.05),
+            pytest.raises(GraphUnavailableError) as caught,
+        ):
+            await store.traverse(None, "root", max_depth=2, min_strength=0.3)
+    finally:
+        release.set()
+
+    frames = caught.value.diag["frames"]
+    assert "_graph" in frames, frames
+    assert "_hang_in_query" not in frames
+
+
+async def test_a_loop_blocked_past_the_deadline_shows_as_late(tmp_path):
+    """The discriminator for "our process stalled" vs "the engine was slow": the
+    deadline can only fire when the loop runs, so a blocked loop makes it late."""
+    import asyncio as _asyncio
+
+    class _BlockingGraph:
+        async def query(self, cypher, params):
+            await _asyncio.sleep(0.01)  # a real suspension first
+            time.sleep(0.3)  # then hold the loop well past the 50 ms deadline
+            await _asyncio.sleep(5)
+
+    class _Client(_FastClient):
+        def select_graph(self, key):
+            return _BlockingGraph()
+
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _Client),
+        patch.object(falkor_mod, "_READ_TIMEOUT_S", 0.05),
+        pytest.raises(GraphUnavailableError) as caught,
+    ):
+        await store.traverse(None, "root", max_depth=2, min_strength=0.3)
+
+    assert caught.value.diag["late_ms"] >= 150.0, caught.value.diag
+
+
+async def test_a_spent_budget_says_so_instead_of_naming_frames():
+    store = FalkorGraphStore(socket_path="/nonexistent.sock")
+    with pytest.raises(GraphUnavailableError, match="budget was spent") as caught:
+        await store._assert_projection_exists(deadline=time.monotonic() - 0.1)
+
+    diag = caught.value.diag
+    assert diag["budget_spent"] is True
+    assert diag["frames"] is None
+    assert diag["late_ms"] >= 100.0
+
+
+async def test_a_timeout_records_the_stall_time_across_its_wait(tmp_path):
+    reads = iter(
+        [
+            {"cpu_some": 1_000, "io_full": 50},
+            {"cpu_some": 251_000, "io_full": 50},
+        ]
+    )
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _FastClient),
+        patch.object(falkor_mod, "_READ_TIMEOUT_S", 0.05),
+        patch.object(falkor_mod, "_psi_totals", lambda: next(reads)),
+        pytest.raises(GraphUnavailableError) as caught,
+    ):
+        await store.traverse(None, "root", max_depth=2, min_strength=0.3)
+
+    assert caught.value.diag["psi_stall_us"] == {"cpu_some": 250_000, "io_full": 0}
+
+
+async def test_an_unreadable_pressure_file_never_costs_the_diagnosis(tmp_path):
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _FastClient),
+        patch.object(falkor_mod, "_READ_TIMEOUT_S", 0.05),
+        patch.object(falkor_mod, "_psi_totals", lambda: None),
+        pytest.raises(GraphUnavailableError) as caught,
+    ):
+        await store.traverse(None, "root", max_depth=2, min_strength=0.3)
+
+    diag = caught.value.diag
+    assert diag["psi_stall_us"] is None
+    assert "_hang_in_query" in diag["frames"]
+
+
+async def test_a_raising_pressure_reader_never_costs_the_error(tmp_path):
+    """The reader runs before the deadline's try, on every bounded call: if its
+    guard were lost, a reader fault would escape as something other than the
+    seam's error and turn a fallback into a failed recall."""
+    import genesis.hostmetrics.readings as readings
+
+    def _boom(*a, **k):
+        raise ValueError("unparseable pressure file")
+
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(readings, "read_psi_totals", _boom),
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _FastClient),
+        patch.object(falkor_mod, "_READ_TIMEOUT_S", 0.05),
+        pytest.raises(GraphUnavailableError) as caught,
+    ):
+        await store.traverse(None, "root", max_depth=2, min_strength=0.3)
+
+    assert caught.value.diag["psi_stall_us"] is None
+    assert caught.value.diag["query"] == "traverse"
+
+
+async def test_a_marker_query_timeout_is_named_as_the_marker(tmp_path):
+    """The second query of an empty traversal runs on what the first left of the
+    budget; its frames alone would look like a main-query timeout."""
+    import asyncio as _asyncio
+
+    class _EmptyThenHang:
+        async def query(self, cypher, params):
+            if "ProjectionMeta" in cypher:
+                await _asyncio.sleep(5)
+
+            class _R:
+                result_set: list = []
+
+            return _R()
+
+    class _Client(_FastClient):
+        def select_graph(self, key):
+            return _EmptyThenHang()
+
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _Client),
+        patch.object(falkor_mod, "_READ_TIMEOUT_S", 0.05),
+        pytest.raises(GraphUnavailableError) as caught,
+    ):
+        await store.traverse(None, "root", max_depth=2, min_strength=0.3)
+
+    diag = caught.value.diag
+    assert diag["query"] == "marker"
+    assert diag["budget_ms"] <= 50.0
+
+
+async def test_a_spent_budget_reports_the_traversal_budget_not_zero():
+    store = FalkorGraphStore(socket_path="/nonexistent.sock")
+    with pytest.raises(GraphUnavailableError) as caught:
+        await store._assert_projection_exists(deadline=time.monotonic() - 0.1)
+    assert caught.value.diag["budget_ms"] == falkor_mod._READ_TIMEOUT_S * 1000
+    # The marker query was never issued, so the diag must not blame it.
+    assert "query" not in caught.value.diag
+
+
+
+async def test_slow_cancellation_cleanup_is_not_reported_as_a_late_loop(tmp_path):
+    """wait_for raises only after the cancelled operation finishes cleaning up,
+    so that time must land in cancel_ms, never in late_ms (round 1, PR review)."""
+    import asyncio as _asyncio
+
+    class _SlowCleanupGraph:
+        async def query(self, cypher, params):
+            try:
+                await _asyncio.sleep(5)
+            finally:
+                await _asyncio.sleep(0.25)  # cleanup after the cancel arrives
+
+    class _Client(_FastClient):
+        def select_graph(self, key):
+            return _SlowCleanupGraph()
+
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _Client),
+        patch.object(falkor_mod, "_READ_TIMEOUT_S", 0.05),
+        pytest.raises(GraphUnavailableError) as caught,
+    ):
+        await store.traverse(None, "root", max_depth=2, min_strength=0.3)
+
+    diag = caught.value.diag
+    assert diag["late_ms"] < 40.0, diag
+    assert diag["cancel_ms"] >= 200.0, diag
+
+
+async def test_a_slow_diagnostic_read_spends_the_budget_not_extends_it(tmp_path):
+    """The budget starts before the pressure read, so the call stays bounded:
+    measured from OUTSIDE, since the read shifts any clock started after it."""
+    import asyncio as _asyncio
+
+    calls = []
+
+    def _slow_first_psi():
+        calls.append(1)
+        if len(calls) == 1:
+            time.sleep(0.1)  # only the read before the wait is slow
+        return {"cpu_some": 1}
+
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    loop = _asyncio.get_running_loop()
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _FastClient),
+        patch.object(falkor_mod, "_READ_TIMEOUT_S", 0.3),
+        patch.object(falkor_mod, "_psi_totals", _slow_first_psi),
+        pytest.raises(GraphUnavailableError),
+    ):
+        t0 = loop.time()
+        await store.traverse(None, "root", max_depth=2, min_strength=0.3)
+    total = loop.time() - t0
+    # Bounded: the 100 ms read is spent out of the 300 ms budget (~300 total);
+    # extending would give ~400.
+    assert total < 0.36, total
+
+
+async def test_the_pressure_read_is_container_scoped_only():
+    """Host-wide /proc/pressure must never be booked as this read's stall."""
+    import genesis.hostmetrics.readings as readings
+
+    seen = {}
+
+    def _record(*a, **k):
+        seen.update(k)
+        return None
+
+    with patch.object(readings, "read_psi_totals", _record):
+        falkor_mod._psi_totals()
+    assert seen == {"cgroup_only": True}
+# ── T2: which leg of a read the deadline caught ────────────────────────────
+# Every instrumented timeout before T2 ended `_readline>readline>readuntil>
+# _wait_for_data`. redis-py reads a reconnect's handshake reply and a query's
+# reply through those same four frames, so four could not say which one the
+# deadline caught. Sixteen keep the frame that does (counted: 16 on the reply
+# path, 19 on the handshake path, deepest kept).
+
+
+class _PoolConn:
+    def __init__(self, connected: bool):
+        self.is_connected = connected
+
+
+def _client_with_pool(idle: list, in_use: int):
+    pool = type("Pool", (), {})()
+    pool._available_connections = idle
+    pool._in_use_connections = {object() for _ in range(in_use)}
+    return type("C", (), {"connection": type("R", (), {"connection_pool": pool})()})()
+
+
+async def _timed_out_diag(store, factory_effect=None, budget=0.05):
+    async def _factory():
+        if factory_effect:
+            factory_effect()
+        await _nest(20)
+
+    with pytest.raises(GraphUnavailableError) as caught:
+        await store._bounded(_factory, timeout=budget, what="graph query")
+    return caught.value.diag
+
+
+async def _nest(depth: int):
+    if depth:
+        await _nest(depth - 1)
+    else:
+        import asyncio as _asyncio
+
+        await _asyncio.sleep(5)
+
+
+async def test_a_timeout_keeps_sixteen_frames_with_their_lines(tmp_path):
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    diag = await _timed_out_diag(store)
+    assert len(diag["frames"]) == falkor_mod._DIAG_FRAMES == 16, diag["frames"]
+    assert diag["frames"][-1] == "sleep"
+    assert diag["frames"][-2] == "_nest"
+    assert len(diag["frame_lines"]) == 16
+    assert all(isinstance(n, int) and n > 0 for n in diag["frame_lines"])
+    import redis
+
+    assert diag["client_version"] == redis.__version__  # what the lines are lines OF
+
+
+@pytest.mark.parametrize(
+    ("idle", "in_use", "conn"),
+    [
+        ([], 0, "new"),
+        ([_PoolConn(True)], 1, "idle_open"),
+        ([_PoolConn(True), _PoolConn(False)], 2, "idle_closed"),  # the pool pops the LAST
+    ],
+)
+async def test_a_timeout_records_the_connection_the_pool_would_hand_out(
+    tmp_path, idle, in_use, conn
+):
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    store._db = _client_with_pool(idle, in_use)
+    diag = await _timed_out_diag(store)
+    assert (diag["conn"], diag["in_use"]) == (conn, in_use)
+
+
+async def test_the_connection_state_is_read_before_the_read_runs(tmp_path):
+    """The read itself takes the connection out of the idle list, so a reading
+    taken at the timeout would always say "new"."""
+    idle = [_PoolConn(True)]
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    store._db = _client_with_pool(idle, 0)
+    diag = await _timed_out_diag(store, factory_effect=idle.clear)
+    assert diag["conn"] == "idle_open"
+
+
+async def test_no_client_yet_is_its_own_state(tmp_path):
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    diag = await _timed_out_diag(store)
+    assert (diag["conn"], diag["in_use"]) == ("no_client", None)
+
+
+async def test_an_unreadable_pool_never_costs_the_diagnosis(tmp_path):
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    store._db = object()  # no `.connection`: a client shape we do not know
+    diag = await _timed_out_diag(store)
+    assert (diag["conn"], diag["in_use"]) == (None, None)
+    assert diag["frames"]
+
+
+
+
+# ── the first read after a projection ──────────────────────────────────────
+# MEASURED 2026-10-26 (engine time): the first traversal of a freshly projected
+# graph took 52-64 ms on an idle engine, up to 146 ms under added load and up to
+# 358 ms on a live install, mostly in the Filter (52-54 ms) and the end-node
+# traverse (8 ms); reads after it took 1-3.5 ms. The projector now pays it on the
+# staging graph before the swap (`_WARM_TRAVERSALS`).
+
+
+def _recording_client(
+    calls: list[tuple[str, str]], *, fail_warm: bool = False, hang_warm: bool = False
+):
+    class _Conn:
+        async def delete(self, key):
+            calls.append((key, "DELETE"))
+
+        async def set(self, *a, **k):
+            return True  # the cross-process publish claim is granted
+
+        async def eval(self, script, _n, *keys_and_args):
+            if "rename" in script:
+                calls.append((keys_and_args[1], "SWAP"))
+            return 1
+
+        async def scan(self, *_a, **_k):
+            return 0, []  # no orphan staging graphs to sweep
+
+    class _Graph:
+        def __init__(self, key):
+            self._key = key
+
+        async def query(self, cypher, _params=None):
+            calls.append((self._key, cypher))
+            if fail_warm and cypher.lstrip().startswith("MATCH p="):
+                raise RuntimeError("engine refused the warm-up")
+            if hang_warm and cypher.lstrip().startswith("MATCH p="):
+                import asyncio as _asyncio
+
+                await _asyncio.sleep(30)  # an engine that never answers
+            return type("R", (), {"result_set": []})()
+
+    class _Client:
+        connection = _Conn()
+
+        def __init__(self, *a, **k):
+            pass
+
+        def select_graph(self, key):
+            return _Graph(key)
+
+    return _Client
+
+
+async def _links_db(rows, meta=()):
+    import aiosqlite
+
+    db = await aiosqlite.connect(":memory:")
+    await db.execute(
+        "CREATE TABLE memory_links (source_id TEXT, target_id TEXT, link_type TEXT, strength REAL)"
+    )
+    await db.execute(
+        "CREATE TABLE memory_metadata (memory_id TEXT, invalid_at TEXT, deprecated INTEGER)"
+    )
+    await db.executemany("INSERT INTO memory_links VALUES (?, ?, ?, ?)", rows)
+    await db.executemany("INSERT INTO memory_metadata VALUES (?, ?, ?)", meta)
+    await db.commit()
+    return db
+
+
+async def _project_recorded(tmp_path, rows, meta=(), **kw):
+    calls: list[tuple[str, str]] = []
+    params: list[dict] = []
+    client = _recording_client(calls, **kw)
+    real_select = client.select_graph
+
+    def select(self, key):
+        graph = real_select(self, key)
+        inner = graph.query
+
+        async def query(cypher, p=None):
+            if cypher.lstrip().startswith("MATCH p="):
+                params.append(p)
+            return await inner(cypher, p)
+
+        graph.query = query
+        return graph
+
+    client.select_graph = select
+    db = await _links_db(rows, meta)
+    try:
+        store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"), graph_key="test_warm")
+        with (
+            patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+            patch.object(falkor_mod, "_FalkorDB", client),
+        ):
+            await store.project(db)
+    finally:
+        await db.close()
+    return calls, params, f"test_warm_staging_{os.getpid()}"
+
+
+def _warm_queries(calls, key):
+    return [
+        (i, c) for i, (k, c) in enumerate(calls) if k == key and c.lstrip().startswith("MATCH p=")
+    ]
+
+
+async def test_the_projector_warms_the_staging_graph_before_the_swap(tmp_path):
+    calls, params, staging = await _project_recorded(tmp_path, [("a", "b", "related_to", 0.9)])
+    marker = next(i for i, (_k, c) in enumerate(calls) if c.startswith("CREATE (:ProjectionMeta"))
+    swap = calls.index((staging, "SWAP"))
+    between = [c for k, c in calls[marker + 1 : swap] if k == staging]
+    # The production query texts themselves, so the engine's per-graph plan cache
+    # is warm as well as the data each operator first touches: the traversal at
+    # each depth a caller uses, and the empty-result path's marker count.
+    assert between == [
+        falkor_mod._TRAVERSE.replace("{depth}", "2"),
+        falkor_mod._TRAVERSE.replace("{depth}", "1"),
+        falkor_mod._PROJECTION_MARKER_COUNT,
+    ], calls
+    # Each depth runs with its callers' own threshold (recall 0.3, drift 0.5).
+    assert [(p["root"], p["min_strength"]) for p in params] == [("a", 0.3), ("a", 0.5)]
+
+
+async def test_a_failed_warm_up_still_publishes_the_projection(tmp_path):
+    calls, _params, staging = await _project_recorded(
+        tmp_path, [("a", "b", "related_to", 0.9)], fail_warm=True
+    )
+    assert (staging, "SWAP") in calls, "a cold graph is today's behaviour, never a refusal"
+
+
+async def test_the_warm_up_starts_from_a_root_whose_walk_passes_the_filter(tmp_path):
+    """The cold cost sits in the operators that evaluate a path's properties
+    (MEASURED: the Filter 52-54 ms, the end-node traverse 8 ms, on a cold first
+    read). A walk from a hidden root, or along an edge too weak for the threshold,
+    stops before those operators see a row, so it would warm nothing and say so
+    nowhere."""
+    _calls, params, _staging = await _project_recorded(
+        tmp_path,
+        [
+            ("aaa_weak", "x", "related_to", 0.2),
+            ("bbb_hidden", "x", "related_to", 0.9),
+            ("ccc", "zzz_hidden_end", "related_to", 0.9),
+            ("ddd_seen", "y", "related_to", 0.9),
+        ],
+        [("bbb_hidden", None, 1), ("zzz_hidden_end", None, 1)],
+    )
+    assert params and {p["root"] for p in params} == {"ddd_seen"}, params
+
+
+async def test_no_eligible_root_skips_the_traversal_but_still_publishes(tmp_path):
+    calls, params, staging = await _project_recorded(
+        tmp_path, [("a", "b", "related_to", 0.2)]
+    )
+    assert params == [], params
+    assert (staging, "SWAP") in calls
+
+
+async def test_an_empty_projection_skips_the_warm_up(tmp_path):
+    calls, _params, staging = await _project_recorded(tmp_path, [])
+    assert not _warm_queries(calls, staging), calls
+    assert (staging, "SWAP") in calls
+
+
+async def test_a_hung_warm_up_costs_its_own_bound_and_still_publishes(tmp_path):
+    """The warm-up is an optimisation: an engine that stops answering costs the
+    projection `_WARM_TIMEOUT_S` in all, never `_PROJECT_TIMEOUT_S` per read."""
+    with patch.object(falkor_mod, "_WARM_TIMEOUT_S", 0.2):
+        t = time.monotonic()
+        calls, _params, staging = await _project_recorded(
+            tmp_path, [("a", "b", "related_to", 0.9)], hang_warm=True
+        )
+        elapsed = time.monotonic() - t
+    assert (staging, "SWAP") in calls
+    assert elapsed < 2.0, f"the warm-up held the projection {elapsed:.1f}s"
+
+
+async def test_the_projection_reports_what_its_warm_up_did(tmp_path):
+    async def warm_of(rows, meta=(), **kw):
+        db = await _links_db(rows, meta)
+        try:
+            store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"), graph_key="test_warm")
+            with (
+                patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+                patch.object(falkor_mod, "_FalkorDB", _recording_client([], **kw)),
+            ):
+                return (await store.project(db))["warm"]
+        finally:
+            await db.close()
+
+    assert (await warm_of([("a", "b", "t", 0.9)])).startswith("warmed in ")
+    assert (await warm_of([("a", "b", "t", 0.9)], fail_warm=True)).startswith("FAILED after ")
+    assert (await warm_of([("a", "b", "t", 0.2)])).startswith("marker only")
+
+
+async def test_a_text_strength_never_costs_the_projection_its_warm_up(tmp_path):
+    """`memory_links.strength` has no CHECK, so SQLite keeps a non-numeric value
+    as TEXT. The projection never compared strengths in Python before; the
+    warm-up's root choice must skip such a row, not raise."""
+    calls, params, staging = await _project_recorded(
+        tmp_path, [("a", "b", "t", "strong"), ("c", "d", "t", 0.9)]
+    )
+    assert (staging, "SWAP") in calls
+    assert {p["root"] for p in params} == {"c"}, params

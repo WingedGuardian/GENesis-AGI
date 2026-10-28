@@ -20,6 +20,7 @@ from typing import Any
 import aiosqlite
 from aiosqlite.context import Result
 
+from genesis.db import lock_holders
 from genesis.db._slow_log import timed
 
 # BUSY_TIMEOUT_MS moved to genesis.env (it is an env-tunable default; env.py
@@ -51,7 +52,17 @@ def connect_sqlite_rw(
 
     admission_path = Path(path).expanduser()
     assert_admitted(admission_path)
-    return sqlite3.connect(str(admission_path.resolve()), *args, **kwargs)
+    # A weakref-able subclass, so a lock-holder snapshot can name this
+    # connection; skipped when the caller chose its own factory (keyword, or
+    # positional: it is sqlite3.connect's 6th parameter).
+    tracked = "factory" not in kwargs and len(args) < 5
+    if tracked:
+        kwargs["factory"] = lock_holders.TrackedSqliteConnection
+    resolved = admission_path.resolve()
+    conn = sqlite3.connect(str(resolved), *args, **kwargs)
+    if tracked:
+        lock_holders.register(conn, db_path=resolved, kind="sqlite3")
+    return conn
 
 
 class _GuardedAiosqliteConnector:
@@ -69,6 +80,9 @@ class _GuardedAiosqliteConnector:
         self._kwargs = kwargs
         self._existing_only = existing_only
         self._connection: aiosqlite.Connection | None = None
+        # Who asked for this connection, for a lock-holder snapshot; taken now,
+        # while the requesting code is still on the stack.
+        self._site = lock_holders.caller_site()
 
     async def _open(self) -> aiosqlite.Connection:
         from genesis.db.admission import assert_admitted
@@ -92,6 +106,7 @@ class _GuardedAiosqliteConnector:
                 open_error.add_note(f"connection cleanup failed: {close_error!r}")
             raise
         self._connection = connection
+        lock_holders.register(connection, db_path=self._db_path, kind="aiosqlite", site=self._site)
         return connection
 
     def __await__(self) -> Generator[Any, None, aiosqlite.Connection]:
@@ -400,6 +415,10 @@ class SerializedConnection:
         object.__setattr__(self, "_holder", None)
         object.__setattr__(self, "_cancelled_holder", None)
         object.__setattr__(self, "_inflight", {})
+        # Named in a lock-holder snapshot of its database (weakly held); the
+        # site is the code that opened it (get_db's caller, for get_db).
+        if db_path is not None:
+            lock_holders.register(self, db_path=db_path, kind="serialized")
 
     # -- Attribute passthrough (e.g. row_factory, in_transaction) ----------
 
@@ -442,6 +461,19 @@ class SerializedConnection:
                 except asyncio.CancelledError:
                     object.__setattr__(self, "_cancelled_holder", sql)
                     raise
+
+    def _capture_lock_holders(self, exc: Exception, *, attempts: int, backoff_s: float) -> str:
+        """Schedule sampled lock evidence; return the log text for it.
+
+        Awaits nothing (the caller holds ``self._lock``, so it must not wait on
+        /proc or the disk here) and never raises; see ``lock_holders``."""
+        _target, text = lock_holders.schedule_capture(
+            self,
+            error=getattr(exc, "sqlite_errorname", None),
+            attempts=attempts,
+            backoff_s=backoff_s,
+        )
+        return text
 
     def _reset_error_count(self) -> None:
         object.__setattr__(self, "_consecutive_errors", 0)
@@ -518,13 +550,15 @@ class SerializedConnection:
                 if not _is_lock_error(e):
                     raise
                 if attempt >= attempts:
+                    snapshot = self._capture_lock_holders(e, attempts=attempts, backoff_s=slept)
                     logger.warning(
                         "DB lock persisted through %d attempts (%.2fs of retry backoff"
                         " on top of busy_timeout) — giving up; a lock error in a QUIET"
                         " period (no concurrent sessions) points at a long-holder, not"
-                        " convoy loss",
+                        " convoy loss; lock-holder snapshot: %s",
                         attempts,
                         slept,
+                        snapshot,
                     )
                     await self._handle_lock_error(e)  # counts the episode; re-raises
                     raise  # unreachable (belt-and-suspenders, matches existing style)
@@ -609,6 +643,10 @@ class SerializedConnection:
                     return result
                 except sqlite3.OperationalError as e:
                     if _is_lock_error(e):
+                        logger.warning(
+                            "DB lock on executescript (not retried); lock-holder snapshot: %s",
+                            self._capture_lock_holders(e, attempts=1, backoff_s=0.0),
+                        )
                         await self._handle_lock_error(e)
                     raise
 
@@ -630,10 +668,12 @@ class SerializedConnection:
 
     async def close(self) -> None:
         async with self._lock:
+            object.__setattr__(self, "_holder", "<close>")
             await self._conn.close()
 
     async def cursor(self) -> aiosqlite.Cursor:
         async with self._lock:
+            object.__setattr__(self, "_holder", "<cursor>")
             if self._db_path is not None:
                 from genesis.db.integrity import assert_not_quarantined
 
@@ -724,6 +764,7 @@ async def get_raw_db(
     assert_admitted(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     db = await aiosqlite.connect(str(path))
+    lock_holders.register(db, db_path=path, kind="aiosqlite")
     try:
         db.row_factory = aiosqlite.Row
         await db.execute("PRAGMA journal_mode=WAL")
@@ -744,6 +785,7 @@ async def open_ro_connection(
     path: str | Path = DEFAULT_DB_PATH,
     *,
     cache_size_kib: int = RO_CACHE_SIZE_KIB,
+    busy_timeout_ms: int | None = None,
 ) -> aiosqlite.Connection:
     """Open a standalone READ-ONLY aiosqlite connection (``mode=ro``, WAL-aware).
 
@@ -772,9 +814,14 @@ async def open_ro_connection(
     assert_admitted(Path(path))
     uri = f"file:{Path(path)}?mode=ro"
     conn = await aiosqlite.connect(uri, uri=True)
-    conn.row_factory = aiosqlite.Row
-    await conn.execute(f"PRAGMA busy_timeout={db_busy_timeout_ms()}")
-    await conn.execute(f"PRAGMA cache_size={cache_size_kib}")
+    try:
+        conn.row_factory = aiosqlite.Row
+        timeout = db_busy_timeout_ms() if busy_timeout_ms is None else busy_timeout_ms
+        await conn.execute(f"PRAGMA busy_timeout={int(timeout)}")
+        await conn.execute(f"PRAGMA cache_size={cache_size_kib}")
+    except BaseException:
+        await conn.close()
+        raise
     return conn
 
 

@@ -556,7 +556,9 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             -- when the TOPIC was written, as distinct from
             -- last_extracted_at, which is a pass watermark the extraction
             -- job advances even when it writes no topic.
-            topic_updated_at TEXT
+            topic_updated_at TEXT,
+            a2a_state        TEXT,
+            a2a_status_at    TEXT
         )
     """,
     "inbox_items": """
@@ -2151,7 +2153,8 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             severity     TEXT NOT NULL,               -- CRITICAL / WARNING / ... (computed)
             message      TEXT NOT NULL,
             created_at   TEXT NOT NULL DEFAULT (datetime('now')),
-            resolved_at  TEXT                         -- NULL = still open
+            resolved_at  TEXT,                        -- NULL = still open
+            resolution_reason TEXT                   -- healthy / disabled; legacy NULL
         )
     """,
     # ── WS-2 Cognitive Ledger (P1a) ──────────────────────────────────────
@@ -2485,6 +2488,14 @@ CREATE TABLE IF NOT EXISTS peer_grants (
         observed_change_key  TEXT,
         detail               TEXT,
         created_at           TEXT NOT NULL
+    )
+    """,
+    "payment_vault_events": """
+    CREATE TABLE IF NOT EXISTS payment_vault_events (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        event       TEXT NOT NULL,
+        detail      TEXT,
+        created_at  TEXT NOT NULL
     )
     """,
 }
@@ -2867,6 +2878,8 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_board_events_issue "
     "ON board_events(repo, issue_number, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_board_events_created ON board_events(created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_payment_vault_events_created "
+    "ON payment_vault_events(created_at)",
 ]
 
 # ─── Seed Data ────────────────────────────────────────────────────────────────

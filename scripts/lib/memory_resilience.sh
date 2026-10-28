@@ -44,23 +44,31 @@ _MEMRES_USER_SLICE_CONF=$'[Slice]\nManagedOOMMemoryPressure=kill\nManagedOOMMemo
 _MEMRES_USER_SERVICE_CONF=$'[Service]\nManagedOOMMemoryPressure=kill'
 _MEMRES_OOMD_CONF=$'[OOM]\nSwapUsedLimit=90%\nDefaultMemoryPressureLimit=60%\nDefaultMemoryPressureDurationSec=20s'
 
+# The write step is shared with every other /etc file Genesis manages
+# (scripts/lib/managed_etc.sh): stamped, and a drop-in edited by hand is KEPT and
+# named rather than overwritten. Sourced relative to this file, so the manual
+# `sudo bash -c 'source scripts/lib/memory_resilience.sh && …'` keeps working.
+# shellcheck source=managed_etc.sh
+# Pure parameter expansion, not dirname: callers may run with a minimal PATH.
+_MEMRES_LIB_DIR="${BASH_SOURCE[0]%/*}"
+[ "$_MEMRES_LIB_DIR" = "${BASH_SOURCE[0]}" ] && _MEMRES_LIB_DIR=.
+. "$_MEMRES_LIB_DIR/managed_etc.sh"
+
 # _memres_install_dropin <abs-path> <content> — write-if-different via sudo.
-# Sets _MEMRES_CHANGED=1 when it wrote (a variable, NOT stdout — capturing
-# stdout as the change flag would let any future diagnostic echo masquerade
-# as "changed" and churn systemd on idempotent runs). A failed write WARNS
-# instead of falling through to "already in place". Never fails the caller.
+# Sets _MEMRES_CHANGED=1 when the content changed (a variable, NOT stdout —
+# capturing stdout as the change flag would let any future diagnostic echo
+# masquerade as "changed" and churn systemd on idempotent runs), and
+# _MEMRES_RELOAD=1 when only the stamp line was added (daemon-reload, no oomd
+# restart). A failed write WARNS instead of falling through to "already in
+# place". Never fails the caller.
 _memres_install_dropin() {
-    local path="$1" content="$2"
-    if [[ "$(sudo cat "$path" 2>/dev/null)" == "$content" ]]; then
-        return 0
-    fi
-    if ! sudo mkdir -p "$(dirname "$path")" 2>/dev/null \
-        || ! printf '%s\n' "$content" | sudo tee "$path" >/dev/null 2>&1; then
-        echo "  WARNING: could not write $path (read-only /etc?) — drop-in NOT applied."
-        _MEMRES_FAILED=1
-        return 0
-    fi
-    _MEMRES_CHANGED=1
+    genesis_etc_put "$1" "$2" "" dropin
+    case "$GENESIS_ETC_RESULT" in
+        written|taken) _MEMRES_CHANGED=1 ;;
+        migrated) _MEMRES_RELOAD=1 ;;
+        kept-edited) _MEMRES_KEPT=1 ;;
+        kept-nonregular|uninspected|failed) _MEMRES_FAILED=1 ;;
+    esac
     return 0
 }
 
@@ -118,6 +126,8 @@ memory_resilience_apply() {
     fi
 
     _MEMRES_CHANGED=""
+    _MEMRES_RELOAD=""
+    _MEMRES_KEPT=""
     _MEMRES_FAILED=""
     _memres_install_dropin "$MEMRES_ETC_ROOT/systemd/system/user.slice.d/genesis-oomd.conf" "$_MEMRES_USER_SLICE_CONF"
     _memres_install_dropin "$MEMRES_ETC_ROOT/systemd/system/user@.service.d/genesis-oomd.conf" "$_MEMRES_USER_SERVICE_CONF"
@@ -133,9 +143,13 @@ memory_resilience_apply() {
         sudo systemctl daemon-reload 2>/dev/null || true
         sudo systemctl enable systemd-oomd 2>/dev/null || true
         sudo systemctl restart systemd-oomd 2>/dev/null || true
+    elif [[ -n "$_MEMRES_RELOAD" ]]; then
+        sudo systemctl daemon-reload 2>/dev/null || true
     fi
     if [[ -n "$_MEMRES_FAILED" ]]; then
         echo "  systemd-oomd policy NOT fully applied — see warnings above."
+    elif [[ -n "$_MEMRES_KEPT" ]]; then
+        echo "  systemd-oomd policy: a drop-in edited by hand was kept — see above."
     elif [[ -n "$_MEMRES_CHANGED" ]]; then
         echo "  systemd-oomd pressure-kill policy applied (user.slice kill @60% PSI; per-user manager kill)."
     else
@@ -178,12 +192,14 @@ pid_budget_apply() {
     fi
 
     _MEMRES_CHANGED=""
+    _MEMRES_RELOAD=""
+    _MEMRES_KEPT=""
     _MEMRES_FAILED=""
     # High-numbered so it wins over systemd's 10-defaults.conf (33%); the
     # user-.slice TEMPLATE dir applies to every per-user slice regardless of UID.
     _memres_install_dropin "$MEMRES_ETC_ROOT/systemd/system/user-.slice.d/90-genesis-tasksmax.conf" "$_MEMRES_TASKSMAX_CONF"
 
-    if [[ -n "$_MEMRES_CHANGED" ]]; then
+    if [[ -n "$_MEMRES_CHANGED$_MEMRES_RELOAD" ]]; then
         # daemon-reload re-reads unit config; TasksMax applies to an already-
         # running slice on reload and unconditionally at its next (re)start/login.
         # Best-effort: the drop-in on disk is the durable guarantee — a reload
@@ -192,6 +208,8 @@ pid_budget_apply() {
     fi
     if [[ -n "$_MEMRES_FAILED" ]]; then
         echo "  TasksMax drop-in NOT applied — see warning above (posture check will surface it)."
+    elif [[ -n "$_MEMRES_KEPT" ]]; then
+        echo "  TasksMax drop-in edited by hand was kept — see above."
     elif [[ -n "$_MEMRES_CHANGED" ]]; then
         echo "  PID ceiling raised: user-.slice TasksMax=60% (was systemd's 33% default)."
     else

@@ -6,7 +6,7 @@ producer never set. That test was green from day one while the real event
 could never enqueue anything: `surplus/dispatch.py` emitted only
 `task_id`/`task_type`, so `ReflexIngestor.handle_event` dropped it at the
 `if not error_type: return` admission gate. A hand-written intermediate is
-the bug's hiding place (genesis-development skill, fixture rule).
+the bug's hiding place (build-session skill, fixture rule).
 
 So this file drives `_handle_failure` — the actual emit site — through a real
 `GenesisEventBus` into the actual `ReflexIngestor.handle_event`, the same

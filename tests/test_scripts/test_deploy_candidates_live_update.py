@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -143,6 +144,249 @@ def test_restore_hooks_needs_update_lock(dc, dc_ready, capsys):
     capsys.readouterr()
     assert w.run(dc, "restore-hooks", tip, before, lock=False) == 1
     assert "update.lock" in capsys.readouterr().err
+
+
+# restore-hooks exits 1 whenever it leaves an installed hook other than HEAD's:
+# update.sh's live rollback reads that exit code as "the hooks did not come back"
+# (#3492 gap 2). Each case below names the step that failed.
+
+
+def _rolled_back(w, dc, capsys) -> tuple[str, str]:
+    before, tip = _hook_live(w, dc, capsys)
+    _roll_back(w, before)
+    capsys.readouterr()
+    return before, tip
+
+
+def _sync_script(w, body: str | None) -> None:
+    """Replace sync-hooks.sh on disk only (HEAD's copy, which the engine reads
+    the hook list from, is unchanged); None deletes it."""
+    path = w.root / "scripts" / "hooks" / "sync-hooks.sh"
+    if body is None:
+        path.unlink()
+    else:
+        path.write_text(body)
+
+
+_AS_ROOT = pytest.mark.skipif(
+    hasattr(os, "geteuid") and os.geteuid() == 0,
+    reason="root ignores the directory's mode bits, so the write cannot be denied",
+)
+
+
+@_AS_ROOT
+def test_restore_hooks_fails_when_a_hook_cannot_be_written(dc, dc_ready, capsys):
+    w = dc_ready
+    before, tip = _rolled_back(w, dc, capsys)
+    hooks = w.root / ".git" / "hooks"
+    hooks.chmod(0o555)
+    try:
+        assert w.run(dc, "restore-hooks", tip, before, lock=True) == 1
+    finally:
+        hooks.chmod(0o755)
+    err = capsys.readouterr().err
+    assert "ERROR: could not restore git hook pre-commit" in err, err
+
+
+@pytest.mark.parametrize(
+    ("body", "why"),
+    [
+        (None, "sync-hooks.sh is missing"),
+        ("#!/bin/bash\nexit 1\n", "(exit 1)"),
+        # Its stderr names the hook it could not copy: the failure carries it.
+        ("#!/bin/bash\necho 'cp failed for pre-commit' >&2\nexit 2\n", "cp failed for pre-commit"),
+        ("#!/bin/bash\nexec sleep 30\n", "could not run"),
+    ],
+    ids=["missing", "exit-1", "exit-2-names-the-hook", "timeout"],
+)
+def test_restore_hooks_fails_when_sync_hooks_fails(dc, dc_ready, capsys, monkeypatch, body, why):
+    """The restore itself succeeds (the hook is HEAD's again); only the sync
+    step fails, and that alone is exit 1."""
+    w = dc_ready
+    before, tip = _rolled_back(w, dc, capsys)
+    _sync_script(w, body)
+    monkeypatch.setattr(dc.plan, "SYNC_HOOKS_TIMEOUT", 2)
+    assert w.run(dc, "restore-hooks", tip, before, lock=True) == 1
+    err = capsys.readouterr().err
+    assert _installed(w) == BASE_HOOK
+    assert "ERROR: " in err and why in err, err
+
+
+def test_restore_hooks_judges_the_installed_hooks_not_the_sync_exit_code(dc, dc_ready, capsys):
+    """sync-hooks.sh exits 0 even when one of its copies failed. A hook the
+    restore never touches (commit-msg is the same on both sides) and that is
+    not HEAD's still fails the run, by name."""
+    w = dc_ready
+    before, tip = _rolled_back(w, dc, capsys)
+    _sync_script(w, "#!/bin/bash\nexit 0\n")
+    (w.root / ".git" / "hooks" / "commit-msg").write_text("#!/bin/sh\n# stale\nexit 0\n")
+    assert w.run(dc, "restore-hooks", tip, before, lock=True) == 1
+    err = capsys.readouterr().err
+    assert "installed git hook commit-msg differs from scripts/hooks/commit-msg" in err, err
+
+
+def test_restore_hooks_fails_on_a_hand_edited_hook(dc, dc_ready, capsys):
+    """N-4: a hook equal to neither checkout's copy is left in place, and the
+    run says the hooks are not HEAD's."""
+    w = dc_ready
+    before, tip = _rolled_back(w, dc, capsys)
+    mine = "#!/bin/sh\n# edited by hand\nexit 0\n"
+    (w.root / ".git" / "hooks" / "pre-commit").write_text(mine)
+    assert w.run(dc, "restore-hooks", tip, before, lock=True) == 1
+    err = capsys.readouterr().err
+    assert _installed(w) == mine
+    assert "ERROR: git hook pre-commit was edited by hand" in err, err
+
+
+def _unlisted_after_rollback(w, dc, capsys) -> tuple[str, str, Path]:
+    """An approved pair installs post-merge; the rollback's HEAD no longer
+    lists it. Returns (checkout before, tip, the installed hook)."""
+    before = w.rev("HEAD", w.root)
+    sync = (w.root / "scripts" / "hooks" / "sync-hooks.sh").read_text()
+    listed = sync.replace(
+        '    "pre-merge-commit"\n', '    "pre-merge-commit"\n    "post-merge"\n', 1
+    )
+    assert listed != sync, "the fixture's sync-hooks.sh changed shape"
+    w.candidate("feat/file", {"scripts/hooks/post-merge": "#!/bin/sh\nexit 0\n"})
+    w.candidate("feat/list", {"scripts/hooks/sync-hooks.sh": listed})
+    for b in ("feat/file", "feat/list"):
+        assert w.add(dc, b, "--approve-hooks", "owner, in chat") == 0, capsys.readouterr()
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    tip = w.rev("HEAD", w.root)
+    hook = w.root / ".git" / "hooks" / "post-merge"
+    assert hook.is_file(), "the approved pair did not install the hook"
+    _roll_back(w, before)
+    return before, tip, hook
+
+
+def test_restore_hooks_fails_on_a_hand_edited_hook_the_rollback_no_longer_lists(
+    dc, dc_ready, capsys
+):
+    """Only the restore can see this one: sync-hooks.sh and the post-condition
+    look at the names HEAD lists, and the rollback's HEAD no longer lists it."""
+    w = dc_ready
+    before, tip, hook = _unlisted_after_rollback(w, dc, capsys)
+    hook.write_text("#!/bin/sh\n# edited by hand\nexit 0\n")
+    capsys.readouterr()
+    assert w.run(dc, "restore-hooks", tip, before, lock=True) == 1
+    err = capsys.readouterr().err
+    assert hook.is_file(), "a hand-edited hook was removed"
+    assert "ERROR: git hook post-merge was edited by hand" in err, err
+
+
+def test_a_shipped_version_the_rollback_no_longer_lists_is_removed(dc, dc_ready, capsys):
+    """A hash .genesis-hook-versions lists is Genesis-written by proof, like the
+    old checkout's copy: an unlisted one is removed, not reported as a hand edit."""
+    w = dc_ready
+    before, tip, hook = _unlisted_after_rollback(w, dc, capsys)
+    shipped = b"#!/bin/sh\n# a shipped prior version\nexit 0\n"
+    hook.write_bytes(shipped)
+    (w.root / ".genesis-hook-versions").write_text(
+        f"post-merge:{hashlib.sha256(shipped).hexdigest()}\n"
+    )
+    capsys.readouterr()
+    assert w.run(dc, "restore-hooks", tip, before, lock=True) == 0, capsys.readouterr()
+    assert not hook.exists(), "a shipped, unlisted hook stayed installed"
+
+
+def test_a_helper_equal_to_neither_side_is_left_to_sync(dc, dc_ready, capsys):
+    """sync-hooks.sh always overwrites a helper (HELPERS_TO_SYNC), so a helper
+    that differs from both checkouts' copies is no hand edit: the sync replaces
+    it, and the post-condition, not the restore, decides."""
+    w = dc_ready
+    helper = "scripts/hooks/emit_bugfix_audit.py"
+    before = w.rev("HEAD", w.root)
+    w.candidate("feat/h", {helper: "# approved helper\n"})
+    assert w.add(dc, "feat/h", "--approve-hooks", "owner, in chat") == 0, capsys.readouterr()
+    assert w.run(dc, "rebuild") == 0, capsys.readouterr()
+    tip = w.rev("HEAD", w.root)
+    installed = w.root / ".git" / "hooks" / "emit_bugfix_audit.py"
+    assert installed.read_text() == "# approved helper\n"
+    _roll_back(w, before)
+    installed.write_text("# neither side\n")
+    capsys.readouterr()
+    assert w.run(dc, "restore-hooks", tip, before, lock=True) == 0, capsys.readouterr()
+    assert installed.read_text() == (w.root / helper).read_text()
+
+
+def test_a_known_prior_hook_version_is_left_to_sync(dc, dc_ready, capsys):
+    """A hook whose hash .genesis-hook-versions lists is a version Genesis
+    shipped, which sync-hooks.sh replaces: no hand edit, and the run is clean."""
+    w = dc_ready
+    before, tip = _rolled_back(w, dc, capsys)
+    prior = b"#!/bin/sh\n# a shipped prior version\nexit 0\n"
+    (w.root / ".git" / "hooks" / "pre-commit").write_bytes(prior)
+    (w.root / ".genesis-hook-versions").write_text(
+        f"pre-commit:{hashlib.sha256(prior).hexdigest()}\n"
+    )
+    assert w.run(dc, "restore-hooks", tip, before, lock=True) == 0, capsys.readouterr()
+    assert _installed(w) == BASE_HOOK
+
+
+def _helper_source_deleted(w) -> tuple[str, str, Path]:
+    """HEAD still lists emit_bugfix_audit.py but no longer has its source; the
+    installed copy equals neither side. Returns (moved from, HEAD, installed)."""
+    before = w.rev("HEAD", w.root)
+    w.git(
+        w.root, "-c", "core.hooksPath=/dev/null", "rm", "-q", "scripts/hooks/emit_bugfix_audit.py"
+    )
+    w.git(w.root, "-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "drop the helper")
+    installed = w.root / ".git" / "hooks" / "emit_bugfix_audit.py"
+    installed.write_text("# an obsolete helper\n")
+    return before, w.rev("HEAD", w.root), installed
+
+
+def test_a_helper_with_no_source_is_removed(dc, dc_ready, capsys):
+    """Helpers are Genesis's own: one the checkout lists but has no source for
+    is removed (as a hook the moved-to checkout no longer installs is)."""
+    w = dc_ready
+    before, head, installed = _helper_source_deleted(w)
+    assert w.run(dc, "restore-hooks", before, head, lock=True) == 0, capsys.readouterr()
+    assert not installed.exists(), "an obsolete helper stayed installed"
+
+
+@_AS_ROOT
+def test_a_helper_with_no_source_that_cannot_be_removed_fails(dc, dc_ready, capsys):
+    w = dc_ready
+    before, head, installed = _helper_source_deleted(w)
+    hooks = w.root / ".git" / "hooks"
+    hooks.chmod(0o555)
+    try:
+        assert w.run(dc, "restore-hooks", before, head, lock=True) == 1
+    finally:
+        hooks.chmod(0o755)
+    assert installed.exists()
+    assert "emit_bugfix_audit.py" in capsys.readouterr().err
+
+
+def test_restore_hooks_fails_on_a_hook_list_it_cannot_read(dc, dc_ready, capsys):
+    w = dc_ready
+    sync = (w.root / "scripts" / "hooks" / "sync-hooks.sh").read_text()
+    odd = sync.replace("HOOKS_TO_SYNC=(\n", "declare -a HOOKS_TO_SYNC=(\n", 1)
+    assert odd != sync, "the fixture's sync-hooks.sh changed shape"
+    moved_from = w.candidate("feat/odd", {"scripts/hooks/sync-hooks.sh": odd})
+    w.git(w.root, "fetch", "-q", "origin")
+    assert w.run(dc, "restore-hooks", moved_from, "HEAD", lock=True) == 1
+    err = capsys.readouterr().err
+    assert "ERROR: cannot read the hook list at" in err, err
+
+
+def test_restore_hooks_fails_when_core_hooks_path_is_set(dc, dc_ready, capsys, tmp_path):
+    w = dc_ready
+    before, tip = _rolled_back(w, dc, capsys)
+    w.git(w.root, "config", "core.hooksPath", str(tmp_path / "elsewhere"))
+    assert w.run(dc, "restore-hooks", tip, before, lock=True) == 1
+    err = capsys.readouterr().err
+    assert "ERROR: core.hooksPath is set" in err, err
+
+
+def test_a_clean_restore_reports_no_error(dc, dc_ready, capsys):
+    """Control: the restore and the sync succeed and every hook is HEAD's."""
+    w = dc_ready
+    before, tip = _rolled_back(w, dc, capsys)
+    assert w.run(dc, "restore-hooks", tip, before, lock=True) == 0
+    assert "ERROR" not in capsys.readouterr().err
+    assert _installed(w) == BASE_HOOK
 
 
 # ── live-shaped ──────────────────────────────────────────────────────────
@@ -357,7 +601,8 @@ def test_a_harmless_leftover_is_removed_before_a_move_and_kept_by_status(dc, dc_
     assert _engine_state(w, dc, content) == []
     state = w.home / ".genesis" / "update_state.json"
     assert state.exists(), "status (_move_refusals) only reports"
-    dc.Engine(w.root, w.env)._move_preflight(need_manifest=False)
+    engine = dc.Engine(w.root, w.env)
+    engine._move_preflight(need_manifest=False, source=dc.plan.read_source(engine))
     assert not state.exists()
 
 
@@ -365,6 +610,108 @@ def test_a_guarding_state_is_never_removed_before_a_move(dc, dc_ready):
     w = dc_ready
     _engine_state(w, dc, {"phase": "bootstrap", "rollback_tag": "pre"})
     state = w.home / ".genesis" / "update_state.json"
+    engine = dc.Engine(w.root, w.env)
     with pytest.raises(dc.Refusal):
-        dc.Engine(w.root, w.env)._move_preflight(need_manifest=False)
+        engine._move_preflight(need_manifest=False, source=dc.plan.read_source(engine))
     assert state.exists()
+
+
+# ── the caller's own "merging" row (#3370) ──────────────────────────────────
+
+
+def _own_row(w, **over) -> Path:
+    """update.sh's own row as it stands when it runs the rebuild after the stop:
+    "merging", a plain run, its own pid (this process's parent here, as update.sh
+    is the engine's parent there), the rollback tag at HEAD."""
+    w.git(w.root, "tag", "-f", "pre")
+    row = {
+        "phase": "merging",
+        "rollback_tag": "pre",
+        "deploy_head": w.rev("HEAD", w.root),
+        "pid": os.getppid(),
+        "post_merge": False,
+        **over,
+    }
+    state = w.home / ".genesis" / "update_state.json"
+    state.write_text(json.dumps(row))
+    return state
+
+
+def _rebuild_with_a_candidate(w, dc, capsys, **env: str) -> int:
+    w.candidate("feat/a", {"src/a.py": "a = 1\n"})
+    assert w.add(dc, "feat/a") == 0, capsys.readouterr()
+    return w.run(dc, "rebuild", extra_env=env)
+
+
+def test_the_callers_own_row_is_kept_through_the_rebuild(dc, dc_ready, capsys):
+    """A row the shared rule calls harmless is retired before a move, unless it
+    is the caller's own: update.sh's restart guard must survive the move it
+    guards. The engine adds its move record (live_move) to it and changes
+    nothing else (#3492)."""
+    w = dc_ready
+    state = _own_row(w)
+    before = json.loads(state.read_text())
+    rc = _rebuild_with_a_candidate(w, dc, capsys, DEPLOY_CANDIDATES_OWN_STATE_PID=str(os.getppid()))
+    assert rc == 0, capsys.readouterr()
+    assert w.live_merges(), "the rebuild did not move"
+    assert state.exists(), "the engine retired its caller's restart guard"
+    after = json.loads(state.read_text())
+    assert after.pop("live_move") == {"to": w.rev("refs/heads/live"), "phase": "done"}
+    assert after == before, "the engine changed its caller's row beyond its record"
+
+
+def test_the_callers_own_guarding_row_does_not_refuse(dc, dc_ready, capsys):
+    """Its row would GUARD (HEAD is off its rollback tag): still the caller's."""
+    w = dc_ready
+    w.advance_main({"m.txt": "m\n"})
+    w.git(w.root, "pull", "-q", "--ff-only", "origin", "main")
+    state = _own_row(w)
+    w.git(w.root, "tag", "-f", "pre", "HEAD~1")
+    rc = _rebuild_with_a_candidate(w, dc, capsys, DEPLOY_CANDIDATES_OWN_STATE_PID=str(os.getppid()))
+    assert rc == 0, capsys.readouterr()
+    assert state.exists() and w.live_merges()
+
+
+@pytest.mark.parametrize(
+    ("named", "over"),
+    [
+        (None, {}),
+        ("other", {"pid": "other"}),
+        ("ppid", {"pid": "other"}),
+        ("ppid", {"phase": "fetching"}),
+        ("ppid", {"post_merge": True}),
+    ],
+    ids=["not-named", "not-the-parent", "another-pid", "not-merging", "post-merge"],
+)
+def test_any_other_row_is_judged_by_the_shared_rule(dc, dc_ready, capsys, named, over):
+    """Controls: the exception needs every part. Off its tag, each of these rows
+    guards, so the rebuild refuses and the row stays. "other" is a pid that is
+    not this process's parent (whatever the parent is: a test sandbox may run
+    pytest as pid 1's child)."""
+    other, ppid = os.getppid() + 1, os.getppid()
+    w = dc_ready
+    w.advance_main({"m.txt": "m\n"})
+    w.git(w.root, "pull", "-q", "--ff-only", "origin", "main")
+    state = _own_row(w, **{k: other if v == "other" else v for k, v in over.items()})
+    w.git(w.root, "tag", "-f", "pre", "HEAD~1")
+    env = (
+        {}
+        if named is None
+        else {"DEPLOY_CANDIDATES_OWN_STATE_PID": str(ppid if named == "ppid" else other)}
+    )
+    rc = _rebuild_with_a_candidate(w, dc, capsys, **env)
+    assert rc == 1
+    assert "update_state.json" in capsys.readouterr().err
+    assert state.exists() and not w.live_merges()
+
+
+def test_the_exception_needs_the_handed_over_update_lock(dc, dc_ready):
+    """Without update.lock (status reads refusals unlocked) the same row, named,
+    still reads as an unfinished update."""
+    w = dc_ready
+    w.advance_main({"m.txt": "m\n"})
+    w.git(w.root, "pull", "-q", "--ff-only", "origin", "main")
+    _own_row(w)
+    w.git(w.root, "tag", "-f", "pre", "HEAD~1")
+    eng = dc.Engine(w.root, {**w.env, "DEPLOY_CANDIDATES_OWN_STATE_PID": str(os.getppid())})
+    assert [r for r in eng._move_refusals() if "update_state.json" in r]

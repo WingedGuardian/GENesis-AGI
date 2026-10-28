@@ -48,6 +48,14 @@ Commands:
         checkout once, and only when something changed; sync the git hooks;
         fast-forward local main. It does NOT restart the server: it prints the
         next step.
+  rebuild / drop [--expect-branch B --expect-head C]
+        Both or neither. The checkout must be on B at C (update.sh passes where
+        it verified it), or nothing changes. With or without them, the branch,
+        HEAD, `live`, another worktree on `live` and the tracked tree it read
+        are re-checked under genesis-checkout.lock just before the move's
+        first write or its "unchanged" result; an on-`live` drop writes the
+        manifest right after that check, and a manifest-only drop re-checks
+        the branch, HEAD and `live` before writing it.
   list  The manifest as written (checked to be this repository's). No network.
   status
         READINESS, and per candidate: whether it is in `live` now, what the next
@@ -200,15 +208,67 @@ from deploy_candidates_core import (  # noqa: E402
     out,
 )
 
+#: update.sh names its own pid here when it runs the rebuild after its stop: its
+#: "merging" row is then its restart guard, and where the move is recorded.
+OWN_STATE_PID = "DEPLOY_CANDIDATES_OWN_STATE_PID"
+
+
+def _replace_json(path: Path, data: dict, durable: bool) -> None:
+    """Replace ``path`` with ``data`` atomically (same-directory temp file and
+    os.replace). ``durable``: the temp file is fsynced before the rename and the
+    directory after it, so the new content survives a crash or power loss."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=4)
+            if durable:
+                fh.flush()
+                os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+    if durable:
+        fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
 
 def _err(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
+
+
+def _restart_advice(moved: plan.Move) -> None:
+    """The next step after a move. When HEAD left `live` in the last instant
+    (Move.head_left), a restart would load that branch's tree, so the advice is
+    to switch back first. When where HEAD is could not be read (Move.head_unknown),
+    a restart would load a checkout nobody verified, so no restart is advised."""
+    out("  The server was not restarted: it runs what it loaded until it does. Next step, when no")
+    if moved.head_unknown:
+        out(
+            "  validation holds the lock: the checkout could not be read after the move, so it is "
+            f"not known to be on `live` at {moved.at[:12]}. Check where HEAD is (git symbolic-ref "
+            "HEAD) and switch it back to `live` if it is elsewhere; no restart is advised until then."
+        )
+        return
+    if moved.head_left:
+        out(
+            f"  validation holds the lock: switch the checkout back to `live` (it is on "
+            f"{moved.head_left}), then scripts/deploy_code_only.sh restart (launch it detached)."
+        )
+        return
+    out("  validation holds the lock: scripts/deploy_code_only.sh restart (launch it detached).")
 
 
 class Engine(Repo):
     def __init__(self, root, env, gh=None, serving=None):
         super().__init__(root, env, gh=gh, serving=serving)
         self.store = manifest.ManifestStore(self.home, self.common_dir)
+        # Set by require_update_lock once this run holds update.lock exclusive.
+        self._update_lock_held = False
 
     # ── locks and preflight ──────────────────────────────────────────────
     def require_update_lock(self) -> None:
@@ -231,21 +291,52 @@ class Engine(Repo):
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             raise Refusal(f"update.lock is held by another process; {hint}.") from exc
+        self._update_lock_held = True
 
-    def _move_preflight(self, need_manifest: bool) -> tuple[dict | None, str]:
-        """Every refusal before a checkout move, in order. Returns the manifest
-        and the checkout's branch."""
+    def _move_preflight(self, need_manifest: bool, source: plan.Source) -> dict | None:
+        """Every refusal before a checkout move, in order. Returns the manifest.
+        ``source`` is the command's one baseline (#3492), read once at its start:
+        the branch, worktree and tracked-change refusals judge THAT read, so what
+        was judged safe is exactly what every later re-check compares to, and
+        the checkout must still match it here. It is never read again."""
         self.require_main_checkout()
+        if self.env.get(OWN_STATE_PID) and not self._own_update_state():
+            # A caller that names itself is update.sh, whose "merging" row the
+            # move records into (live_move). If the row is not that run's own,
+            # the shared rule could call it harmless and retire it, and the
+            # record would land in another update's state (#3492).
+            raise Refusal(
+                f"{self.update_state} is not the calling update's own row (phase "
+                '"merging", its pid, a plain run, update.lock handed over); nothing changed.'
+            )
         data = self.store.load()
         if need_manifest and data is None:
             raise Refusal(
                 f"no deploy manifest ({self.store.path}): nothing to rebuild. Add a candidate first."
             )
-        reasons = self._move_refusals()
+        reasons = self._move_refusals(source)
         if reasons:
             raise Refusal(reasons[0])
+        plan.refuse_moved_source(self, source, "nothing changed")
         self._retire_harmless_update_state()
-        return data, self.current_branch()
+        return data
+
+    def _expected_source(self, expect: tuple[str, str] | None) -> plan.Source:
+        """The checkout's source now. With ``expect`` (--expect-branch and
+        --expect-head: update.sh names the branch and commit it verified before
+        it handed over), the checkout must still be exactly there."""
+        source = plan.read_source(self)
+        if expect is None:
+            return source
+        branch, head = expect
+        want = (f"refs/heads/{branch}", self.resolve(head))
+        if want[1] is None or (source.branch_ref, source.head) != want:
+            raise Refusal(
+                f"the checkout is not where its caller left it: it is on "
+                f"{source.branch_ref or 'a detached HEAD'} at {(source.head or 'nothing')[:12]}, "
+                f"not {want[0]} at {head[:12]}; nothing changed."
+            )
+        return source
 
     def _update_state_refusal(self) -> str | None:
         """Why update_state.json forbids moving the checkout, or None.
@@ -256,7 +347,7 @@ class Engine(Repo):
         judges). A state that guards nothing (a finished run, one that stopped
         before merging anything) does not refuse; one that cannot be judged does."""
         path = str(self.update_state)
-        if not os.path.lexists(path):
+        if not os.path.lexists(path) or self._own_update_state():
             return None
         try:
             spec = importlib.util.spec_from_file_location(
@@ -274,7 +365,63 @@ class Engine(Repo):
         except Exception as exc:  # noqa: BLE001 - any failure to decide refuses
             return (
                 f"{path} could not be checked ({exc}); it is kept. Finish that update with "
-                "scripts/update.sh --post-merge, or Dismiss it on the dashboard's update card."
+                "scripts/update.sh --post-merge (it refuses a half-written tree; on `live`, "
+                "scripts/deploy_candidates repair-move puts such a tree back), or Dismiss it "
+                "on the dashboard's update card."
+            )
+
+    def _own_update_state(self) -> bool:
+        """Is update_state.json the in-flight row of the update.sh running this rebuild?
+
+        On `live`, update.sh writes its "merging" row after the stop, then runs the
+        rebuild in its merge slot, handing over update.lock and naming its own pid
+        in DEPLOY_CANDIDATES_OWN_STATE_PID. That row is the caller's restart guard
+        for the move about to happen: neither a refusal nor a leftover to retire.
+        It counts as the caller's only when this run holds update.lock through the
+        handed-over fd, the named pid is this process's parent, and the file records
+        that pid, phase "merging", from a plain run. Anything else is judged by the
+        shared rule."""
+        named = self.env.get(OWN_STATE_PID, "")
+        if not (self._update_lock_held and named.isdigit() and int(named) == os.getppid()):
+            return False
+        try:
+            with open(self.update_state, encoding="utf-8") as fh:
+                state = json.load(fh)
+        except (OSError, ValueError, RecursionError):
+            return False
+        return (
+            isinstance(state, dict)
+            and state.get("phase") == "merging"
+            and state.get("post_merge") is False
+            and type(state.get("pid")) is int
+            and state["pid"] == int(named)
+        )
+
+    def record_move(self, to: str, phase: str, *, before: bool) -> None:
+        """Record how far the move got as ``live_move`` in the calling update.sh's
+        own row (#3492), every other key kept, so its rollback and every
+        crash-recovery reader (update_state_guard.py) see it for as long as the
+        row lives. Written only while the row is still that run's own, checked
+        at each write. Before the move the write is durable (temp file fsynced,
+        renamed, directory fsynced) and a failure refuses: nothing has moved.
+        After it, a plain replace whose failure only warns. No named caller (a
+        hand run): no row to record in, so nothing is written."""
+        if not self.env.get(OWN_STATE_PID):
+            return
+        path = self.update_state
+        try:
+            if not self._own_update_state():
+                raise OSError("it is no longer the calling update's own row")
+            with open(path, encoding="utf-8") as fh:
+                state = json.load(fh)
+            state["live_move"] = {"to": to, "phase": phase}
+            _replace_json(path, state, durable=before)
+        except (OSError, ValueError, RecursionError) as exc:
+            if before:
+                raise Refusal(f"cannot record the move in {path} ({exc}); nothing moved") from exc
+            out(
+                f"  WARNING: the move's record ({phase}, toward {to[:12]}) could not be "
+                f"written to {path}: {exc}"
             )
 
     def _retire_harmless_update_state(self) -> None:
@@ -287,7 +434,11 @@ class Engine(Repo):
         leftover into a false restart guard. A file the rule cannot clear again
         here is left alone; a file it clears but this cannot remove refuses."""
         path = str(self.update_state)
-        if not os.path.lexists(path) or self._update_state_refusal() is not None:
+        if (
+            not os.path.lexists(path)
+            or self._own_update_state()
+            or self._update_state_refusal() is not None
+        ):
             return
         try:
             os.unlink(path)
@@ -299,27 +450,29 @@ class Engine(Repo):
                 "remove it, then run this again."
             ) from exc
 
-    def _move_refusals(self) -> list[str]:
+    def _move_refusals(self, source: plan.Source | None = None) -> list[str]:
         """Every reason the checkout must not move now, in the order rebuild and
         drop check them, WITHOUT raising: rebuild and drop refuse on the first,
         and status reports them all, so status never predicts a rebuild that
-        would refuse."""
+        would refuse. The checkout is judged from ``source`` (a move's baseline),
+        or from a fresh read (status)."""
         reasons: list[str] = []
         state_refusal = self._update_state_refusal()
         if state_refusal:
             reasons.append(state_refusal)
-        branch = self.current_branch()
+        source = plan.read_source(self) if source is None else source
+        branch = (source.branch_ref or "").removeprefix("refs/heads/") or None
         if branch not in (LIVE_BRANCH, BASE_BRANCH):
             reasons.append(
                 f"{self.root} is on {branch or 'a detached HEAD'}; `live` is built from main or `live`."
             )
-        elsewhere = self.live_checked_out_elsewhere()
+        elsewhere = source.elsewhere
         if elsewhere:
             reasons.append(
                 f"`live` is checked out in another worktree ({elsewhere}); moving it would change the files under "
                 "that worktree. Switch that worktree to another branch first."
             )
-        dirty = self.dirty_lines()
+        dirty = source.dirty
         if dirty:
             reasons.append(
                 f"{self.root} has uncommitted tracked changes; a rebuild never stashes or discards them. "
@@ -621,8 +774,9 @@ class Engine(Repo):
             "fetch origin first if origin/main does not resolve). Nothing changed."
         )
 
-    def cmd_drop(self, branch: str, no_rebuild: bool) -> int:
+    def cmd_drop(self, branch: str, no_rebuild: bool, expect: tuple[str, str] | None = None) -> int:
         self.require_update_lock()
+        source = self._expected_source(expect)
         # No manifest: nothing to drop, and the manifest is not created.
         if not self.store.exists():
             raise Refusal(
@@ -638,11 +792,14 @@ class Engine(Repo):
             keep = [c for c in d["candidates"] if c["branch"] != branch]
             return None if len(keep) == len(d["candidates"]) else {**d, "candidates": keep}
 
-        on_live = self.current_branch() == LIVE_BRANCH
+        on_live = source.branch_ref == LIVE_REF
         if not on_live or no_rebuild:
             refusal = None if on_live else self._off_live_hook_refusal(branch, data)
             if refusal:
                 raise Refusal(refusal)
+            # Decided on `source`: the manifest changes only while the branch,
+            # HEAD and `live` still hold (it never touches the working tree).
+            plan.refuse_moved_source(self, source, "nothing changed", plan.REF_FIELDS)
             after = self.store.update(remove)
             out(f"{branch} dropped from {self.store.path}.")
             core.after_move(
@@ -657,7 +814,7 @@ class Engine(Repo):
             return 0
         # On `live`: subtract-only, offline. Every refusal comes before the manifest
         # changes, so a drop that cannot take the code out never reports it gone.
-        self._move_preflight(need_manifest=True)
+        self._move_preflight(need_manifest=True, source=source)
         walk_base = self.resolve(BASE_REF)
         if not walk_base:
             raise Refusal(f"{BASE_REF} does not resolve.")
@@ -689,27 +846,30 @@ class Engine(Repo):
         )
         self._print_plan(p)
         self._refuse_blockers(p.tip, "the manifest still lists " + branch)
-        after = self.store.update(remove)
-        out(f"  {branch} dropped from {self.store.path}.")
-        before = self.resolve("HEAD")
+        saved: list[dict | None] = []
+
+        def save() -> None:  # under the checkout lock, after the move's last re-check
+            saved.append(self.store.update(remove))
+            out(f"  {branch} dropped from {self.store.path}.")
+
         try:
-            moved = plan.move_checkout(self, p, LIVE_BRANCH)
+            moved = plan.move_checkout(self, p, source, save)
         except Refusal as exc:
+            if not saved:
+                raise Refusal(
+                    f"{exc}\nThe manifest is unchanged: {branch} is still a candidate."
+                ) from exc
             raise Refusal(
                 f"{exc}\nThe manifest change WAS saved ({branch} is no longer a candidate), but `live` still "
                 "runs it: fix the above, then run scripts/deploy_candidates rebuild."
             ) from exc
+        after = saved[0]
         state = f"{branch} WAS dropped from the manifest and from `live`"
         if moved.files:
             # A dropped candidate's approved git hook is still installed; put
             # back what `live` now holds (drop is the repair path for a hook
             # that blocks every session).
-            core.after_move(
-                state,
-                "restoring moved git hooks",
-                lambda: plan.restore_moved_hooks(self, before, moved.at),
-            )
-            core.after_move(state, "syncing the git hooks", lambda: plan.sync_git_hooks(self))
+            self._sync_moved_hooks(state, moved.before, moved.at)
         core.after_move(
             state,
             "checking which candidates share its commits",
@@ -723,12 +883,7 @@ class Engine(Repo):
                 + " left `live` with it and come back at the next rebuild "
                 "unless their own reason still holds: drop them too to keep that code out."
             )
-        out(
-            "  The server was not restarted: it runs what it loaded until it does. Next step, when no"
-        )
-        out(
-            "  validation holds the lock: scripts/deploy_code_only.sh restart (launch it detached)."
-        )
+        _restart_advice(moved)
         return 0
 
     def _warn_shared(self, branch: str, before: dict, after: dict | None) -> None:
@@ -754,7 +909,9 @@ class Engine(Repo):
         back each installed hook that is exactly the moved-from version, then
         sync, as a rebuild does after its own move. It runs while
         update_state.json records the unfinished update, so it takes none of the
-        move refusals; it changes installed hooks only."""
+        move refusals; it changes installed hooks only. Exits 1 when any step
+        failed or any installed hook is not HEAD's afterwards (a hand-edited one
+        included): update.sh's rollback then reports itself incomplete."""
         self.require_update_lock()
         self.require_main_checkout()
         moved_from, moved_to = self.resolve(before), self.resolve(after)
@@ -768,9 +925,32 @@ class Engine(Repo):
                 f"HEAD is {(head or 'unresolvable')[:12]}, not {moved_to[:12]}: the checkout is not "
                 "where the rollback put it; nothing changed."
             )
-        plan.restore_moved_hooks(self, moved_from, moved_to)
-        plan.sync_git_hooks(self)
-        return 0
+        failures = plan.restore_moved_hooks(self, moved_from, moved_to)
+        synced = plan.sync_git_hooks(self)
+        # sync-hooks.sh exits 0 even when one of its copies failed, so the
+        # result is judged too: every hook HEAD lists, installed as HEAD has it.
+        failures += [synced] if synced else []
+        failures += gate.hook_install_failures(self)
+        for why in dict.fromkeys(failures):
+            _err(f"ERROR: {why}")
+        if failures:
+            _err(
+                "The installed git hooks are not the ones the rollback's checkout installs; "
+                "readiness refuses every rebuild until they are."
+            )
+        return 1 if failures else 0
+
+    def _sync_moved_hooks(self, state: str, before: str | None, at: str) -> None:
+        """A rebuild's or drop's hook steps after its move: past the commit point,
+        so any failure is a WARNING (the next rebuild's readiness refuses until
+        the installed hooks are HEAD's)."""
+        for what, step in (
+            ("restoring moved git hooks", lambda: plan.restore_moved_hooks(self, before, at)),
+            ("syncing the git hooks", lambda: plan.sync_git_hooks(self)),
+        ):
+            failed = core.after_move(state, what, step)
+            for why in [failed] if isinstance(failed, str) else failed or []:
+                out(f"  WARNING: {state}, but {what} failed: {why}")
 
     def cmd_live_shaped(self, commit: str) -> int:
         """Whether ``commit`` is what a rebuild makes: a commit on origin/main's
@@ -793,9 +973,10 @@ class Engine(Repo):
         out(base)
         return 0
 
-    def cmd_rebuild(self) -> int:
+    def cmd_rebuild(self, expect: tuple[str, str] | None = None) -> int:
         self.require_update_lock()
-        data, branch = self._move_preflight(need_manifest=True)
+        source = self._expected_source(expect)
+        data = self._move_preflight(need_manifest=True, source=source)
         rebuild_id = core.now().strftime("%Y%m%dT%H%M%SZ")
         out(f"deploy_candidates rebuild {rebuild_id}")
         ok, why = self.fetch(f"+refs/heads/{BASE_BRANCH}:{BASE_REF}")
@@ -836,16 +1017,10 @@ class Engine(Repo):
         p = self._attributed_plan(base, cands, rebuild_id, sticky, data)
         self._print_plan(p, sorted(gone))
         self._refuse_blockers(p.tip, "nothing was retired")
-        before = self.resolve("HEAD")
-        moved = plan.move_checkout(self, p, branch)
+        moved = plan.move_checkout(self, p, source)
         state = f"`live` is at {moved.at[:12]}"
         if moved.files:
-            core.after_move(
-                state,
-                "restoring moved git hooks",
-                lambda: plan.restore_moved_hooks(self, before, moved.at),
-            )
-            core.after_move(state, "syncing the git hooks", lambda: plan.sync_git_hooks(self))
+            self._sync_moved_hooks(state, moved.before, moved.at)
         # Past the commit point (`live` has moved): every step below is a
         # WARNING on failure, never a refusal claiming nothing changed.
         if retire:
@@ -853,12 +1028,7 @@ class Engine(Repo):
         core.after_move(
             state, "fast-forwarding local main", lambda: plan.fast_forward_main(self, base)
         )
-        out(
-            "  The server was not restarted: it runs what it loaded until it does. Next step, when no"
-        )
-        out(
-            "  validation holds the lock: scripts/deploy_code_only.sh restart (launch it detached)."
-        )
+        _restart_advice(moved)
         return 0
 
     def _retirements_held(
@@ -1129,11 +1299,15 @@ def _parser() -> argparse.ArgumentParser:
     d = sub.add_parser("drop")
     d.add_argument("branch")
     d.add_argument("--no-rebuild", action="store_true")
+    rb = sub.add_parser("rebuild")
+    # update.sh names where it left the checkout (#3492); both or neither.
+    for moving in (d, rb):
+        moving.add_argument("--expect-branch", metavar="BRANCH")
+        moving.add_argument("--expect-head", metavar="COMMIT")
     ls = sub.add_parser("list")
     # Machine-readable, for deploy health (observe()); the text form is unchanged.
     ls.add_argument("--json", action="store_true")
     sub.add_parser("status")
-    sub.add_parser("rebuild")
     # For update.sh on `live`: its rollback's hook restore, and the shape check
     # it runs before anything moves.
     r = sub.add_parser("restore-hooks")
@@ -1164,6 +1338,14 @@ def main(
         args = _parser().parse_args(argv)
     except SystemExit as exc:
         return int(exc.code or 0) if exc.code in (0, None) else 2
+    expect = (getattr(args, "expect_branch", None), getattr(args, "expect_head", None))
+    if (expect[0] is None) != (expect[1] is None):
+        _err("deploy_candidates: --expect-branch and --expect-head go together")
+        return 2
+    if "" in expect:
+        _err("deploy_candidates: --expect-branch and --expect-head cannot be empty")
+        return 2
+    expect = None if expect[0] is None else expect
     # The checkout this script lives in. `root` is for tests (scratch
     # repositories); nothing in the environment can point the engine elsewhere.
     engine = Engine(
@@ -1179,9 +1361,9 @@ def main(
         if args.cmd == "add":
             return engine.cmd_add(args.branch, args.owner, args.pr, args.approve_hooks)
         if args.cmd == "drop":
-            return engine.cmd_drop(args.branch, args.no_rebuild)
+            return engine.cmd_drop(args.branch, args.no_rebuild, expect)
         if args.cmd == "rebuild":
-            return engine.cmd_rebuild()
+            return engine.cmd_rebuild(expect)
         if args.cmd == "restore-hooks":
             return engine.cmd_restore_hooks(args.before, args.after)
         if args.cmd == "live-shaped":

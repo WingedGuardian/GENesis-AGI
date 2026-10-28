@@ -35,6 +35,20 @@ OWNED = "https://github.com/owner/private-fork"
 STRANGER = "https://github.com/stranger/repo"
 
 
+def _dry_run_verdict(republish: bool):
+    kind = "republish" if republish else "first"
+    flag = "=" if republish else "*"
+    block = gpg._DryRunBlock(
+        "file:///r.git",
+        (gpg._DryRunRef(flag, "HEAD", "refs/heads/feat/x"),),
+    )
+    return gpg._DryRunVerdict(kind, block)
+
+
+_FIRST_VERDICT = _dry_run_verdict(False)
+_REPUBLISH_VERDICT = _dry_run_verdict(True)
+
+
 def _repo(tmp_path, git_config=(), git_cmds=()) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir(parents=True)
@@ -99,7 +113,7 @@ def _decision(out: str):
 def _first_publish(monkeypatch):
     """A first push (the branch is not on the remote), no network, foreground."""
     monkeypatch.setenv("_TEST_CANONICAL_PUBLIC_REPO", "owner/repo")
-    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: False)
+    monkeypatch.setattr(gpg, "_push_dry_run_verdict", lambda *a, **k: _FIRST_VERDICT)
     monkeypatch.setattr(gpg, "push_allowlist", None)
     monkeypatch.setattr(gpg, "_is_dispatched", lambda: False)
     monkeypatch.setattr(gpg, "_remote_branch_definitely_absent", lambda *a, **k: True)
@@ -260,7 +274,7 @@ def test_a_qualifying_chained_create_on_the_public_repo_is_still_exempt(
 
 
 def test_close_then_repush_is_silenced(monkeypatch, tmp_path, capsys, off) -> None:
-    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_push_dry_run_verdict", lambda *a, **k: _REPUBLISH_VERDICT)
     rc, out, err = _run(monkeypatch, tmp_path, capsys, "gh pr close 5 && git push origin HEAD")
     _assert_silenced(rc, out, err)
     assert "CLOSES a pull request" in _hso(out)["additionalContext"]
@@ -359,7 +373,11 @@ def test_a_chained_step_is_judged_on_the_state_before_it_runs(
     moves either is classed by the state it started from and silenced. The
     hook_ask_policy docstring states this limit; if this test starts failing
     because the guard got stricter, update the docstring with it."""
-    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: republish)
+    monkeypatch.setattr(
+        gpg,
+        "_push_dry_run_verdict",
+        lambda *a, **k: _REPUBLISH_VERDICT if republish else _FIRST_VERDICT,
+    )
     monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 1)
     result = _run(monkeypatch, tmp_path, capsys, command)
     if not republish:
@@ -371,7 +389,7 @@ def test_a_chained_step_is_judged_on_the_state_before_it_runs(
 
 def test_a_chained_republish_is_silenced(monkeypatch, tmp_path, capsys, off) -> None:
     # Row 4: a re-push beside a step that is not on the inert-neighbour list.
-    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_push_dry_run_verdict", lambda *a, **k: _REPUBLISH_VERDICT)
     monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 1)
     rc, out, err = _run(
         monkeypatch, tmp_path, capsys, "git config core.abbrev 12 && git push origin HEAD"
@@ -384,7 +402,7 @@ def test_a_prless_republish_to_an_owned_non_public_repo_is_silenced(
     monkeypatch, tmp_path, capsys, off
 ) -> None:
     # Row 6: off the public repo the no-open-PR arm asks rather than blocks.
-    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_push_dry_run_verdict", lambda *a, **k: _REPUBLISH_VERDICT)
     monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 0)
     rc, out, err = _run(
         monkeypatch, tmp_path, capsys, "git push origin HEAD", (("remote.origin.url", OWNED),)
@@ -394,7 +412,7 @@ def test_a_prless_republish_to_an_owned_non_public_repo_is_silenced(
 
 
 def test_a_prless_republish_to_a_stranger_still_asks(monkeypatch, tmp_path, capsys, off) -> None:
-    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_push_dry_run_verdict", lambda *a, **k: _REPUBLISH_VERDICT)
     monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 0)
     _assert_asks(
         *_run(
@@ -462,7 +480,11 @@ def test_a_push_of_the_recorded_default_branch_still_asks(
 ) -> None:
     # Review P2: a default branch named other than main/master. origin/HEAD is
     # what the checkout recorded, read locally with no network call.
-    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: republish)
+    monkeypatch.setattr(
+        gpg,
+        "_push_dry_run_verdict",
+        lambda *a, **k: _REPUBLISH_VERDICT if republish else _FIRST_VERDICT,
+    )
     monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: open_prs)
     owned = (("remote.origin.url", OWNED),)
     rc, out, err = _run(monkeypatch, tmp_path, capsys, command, owned, git_cmds=_FEAT_IS_DEFAULT)
@@ -503,9 +525,7 @@ def test_a_recorded_default_elsewhere_keeps_the_silence(
 def test_a_first_push_whose_absence_is_unconfirmed_still_asks(
     monkeypatch, tmp_path, capsys, off
 ) -> None:
-    # Audit F2: `_push_is_republish` is False on an ls-remote error too. A branch
-    # already on the public repo with no open PR blocks when the probe answers,
-    # so a failed probe must not let it through silently.
+    # A dry-run error yields no verdict; that cannot qualify as a re-push.
     monkeypatch.setattr(gpg, "_remote_branch_definitely_absent", lambda *a, **k: False)
     # Owned origin: a first push to the public repo is refused before this matters.
     rc, out, err = _run(monkeypatch, tmp_path, capsys, "git push -u origin HEAD", _OWNED_ORIGIN)
@@ -561,7 +581,7 @@ def test_a_dispatched_session_is_still_denied(monkeypatch, tmp_path, capsys, off
 def test_the_no_open_pr_block_on_the_public_repo_is_unchanged(
     monkeypatch, tmp_path, capsys, off
 ) -> None:
-    monkeypatch.setattr(gpg, "_push_is_republish", lambda *a, **k: True)
+    monkeypatch.setattr(gpg, "_push_dry_run_verdict", lambda *a, **k: _REPUBLISH_VERDICT)
     monkeypatch.setattr(gpg, "_open_pr_count_for_branch", lambda *a, **k: 0)
     rc, out, err = _run(monkeypatch, tmp_path, capsys, "git push origin HEAD")
     assert rc == 2 and "NO OPEN PR" in err, (rc, out, err)

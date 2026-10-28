@@ -25,6 +25,22 @@ def _fake_claude(tmp_path: Path, body: str) -> str:
     return str(script)
 
 
+def test_judges_float_on_the_haiku_alias():
+    """Owner ruling 2026-10-18: every headless judge runs on the CC ``haiku``
+    alias, never a dated id, so it follows the newest Haiku the CC pin
+    resolves. One shared constant, so the three judges cannot drift apart."""
+    import re
+
+    from genesis.session_awareness.arbiter import ARBITER_MODEL
+    from genesis.session_awareness.headless import HEADLESS_JUDGE_MODEL
+    from genesis.session_awareness.ledger_extractor import EXTRACTOR_MODEL
+    from genesis.session_awareness.repo_pulse import PULSE_MODEL
+
+    assert HEADLESS_JUDGE_MODEL == "haiku"
+    assert ARBITER_MODEL == EXTRACTOR_MODEL == PULSE_MODEL == HEADLESS_JUDGE_MODEL
+    assert not re.search(r"\d", HEADLESS_JUDGE_MODEL)
+
+
 def test_build_argv_pinned_shape():
     argv = build_argv(MODEL, "claude", "/tmp/no_mcp.json")
     assert argv[argv.index("--model") + 1] == MODEL
@@ -91,6 +107,66 @@ async def test_ok_returns_stdout_and_isolated_env(tmp_path, monkeypatch):
     assert payload["cc"] == "1"
     assert payload["origin"] is None
     assert payload["fh"] == "0"  # dispatched pins (genesis.cc.child_env)
+
+
+@pytest.mark.asyncio
+async def test_judge_never_inherits_a_peer_route(tmp_path, monkeypatch):
+    """A parent launched through a peer route carries the routing env. Under
+    the ``haiku`` alias those slots would silently re-point the judge at the
+    peer's model, so the child must run native (the subscription)."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://peer.example")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "peer-token")
+    monkeypatch.setenv("ANTHROPIC_DEFAULT_HAIKU_MODEL", "peer-model")
+    monkeypatch.setenv("ANTHROPIC_MODEL", "peer-model")
+    # A gmodel launch also pins the native credentials EMPTY (and marks itself),
+    # which would leave a "native" judge with no login at all.
+    monkeypatch.setenv("GENESIS_ROSTER_MODEL", "peer")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "")
+    monkeypatch.setenv("CLAUDE_CODE_EFFORT_LEVEL", "low")
+    fake = _fake_claude(
+        tmp_path,
+        """
+        import json, os, sys
+        sys.stdin.read()
+        keys = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_MODEL",
+                "GENESIS_ROSTER_MODEL", "CLAUDE_CODE_OAUTH_TOKEN",
+                "CLAUDE_CODE_EFFORT_LEVEL")
+        print(json.dumps({k: os.environ.get(k) for k in keys}))
+        """,
+    )
+    res = await run_headless_json(
+        "prompt", model=MODEL, claude_path=fake, no_mcp_config="/dev/null", timeout_s=30
+    )
+    assert res["status"] == "ok"
+    assert set(json.loads(res["stdout"]).values()) == {None}
+
+
+@pytest.mark.asyncio
+async def test_ok_reports_the_served_model(tmp_path):
+    """Run rows record the id CC reports having served, not the alias."""
+    fake = _fake_claude(
+        tmp_path,
+        """
+        import json, sys
+        sys.stdin.read()
+        print(json.dumps({"result": "x", "modelUsage": {"claude-haiku-5-5": {}}}))
+        """,
+    )
+    res = await run_headless_json(
+        "prompt", model="haiku", claude_path=fake, no_mcp_config="/dev/null", timeout_s=30
+    )
+    assert res["status"] == "ok"
+    assert res["served_model"] == "claude-haiku-5-5"
+
+
+def test_served_model_is_none_when_unreadable_or_ambiguous():
+    from genesis.session_awareness.headless import served_model
+
+    assert served_model("not json") is None
+    assert served_model("[]") is None
+    assert served_model(json.dumps({"modelUsage": {}})) is None
+    assert served_model(json.dumps({"modelUsage": {"a": {}, "b": {}}})) is None
 
 
 @pytest.mark.asyncio

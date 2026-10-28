@@ -149,18 +149,13 @@ def test_p6_treats_an_unreadable_status_as_a_recovery() -> None:
     reading unknown as an operator stop would record success over what may be a
     live failure. Allowlist: exactly these three statuses recover, nothing else.
     """
-    text = UPDATE.read_text()
-    # Word boundary: `_nd_last_status=…` (the no-delta site) contains this name.
-    match = re.search(r'(?<![\w])_last_status="\$\(_latest_update_status\)"', text)
-    assert match, "P6 status read not found"
-    case_start = text.index('case "$_last_status" in', match.end())
-    case = text[case_start : text.index("esac", case_start)]
+    # P6 (and the no-delta dispatch) read it in the shared _server_recovery_pending.
+    pending = _block(UPDATE.read_text(), "restart-owed")
+    case_start = pending.index('case "$(_latest_update_status)" in')
+    case = pending[case_start : pending.index("esac", case_start)]
     arms = _case_arms(case)
     recovering = sorted(
-        status
-        for label, body in arms.items()
-        if "_recovery=true" in body
-        for status in label.split("|")
+        status for label, body in arms.items() if "return 0" in body for status in label.split("|")
     )
     assert recovering == ["failed", "rolled_back", "unreadable"]
 
@@ -184,10 +179,9 @@ def test_no_delta_path_never_records_success_over_an_unresolved_failure() -> Non
     assert recording == ['""|success'], f"only empty/success may record; recording: {recording}"
     assert "*" in arms and "_record_update_history" not in arms["*"]
     # P6 reads the SAME status through the SAME reader, so the two cannot drift.
-    assert re.findall(r"(\w+)=\"\$\(_latest_update_status\)\"", text) == [
-        "_nd_last_status",
-        "_last_status",
-    ]
+    assert re.findall(r"(\w+)=\"\$\(_latest_update_status\)\"", text) == ["_nd_last_status"]
+    assert text.count('case "$(_latest_update_status)" in') == 1
+    assert 'case "$(_latest_update_status)" in' in _block(text, "restart-owed")
     assert text.count("SELECT status FROM update_history ORDER BY datetime(started_at) DESC") == 1
 
 
@@ -486,7 +480,12 @@ def test_update_history_without_the_venv_warns_instead_of_skipping_silently(
 
 def _no_delta_block(text: str) -> str:
     start = text.index("    _nd_server_not_restarted=true\n")
-    return text[start : text.index("    _restart_tmp_watchgod_if_stale", start)]
+    # The restart obligation file the block retires (#3451), defined once in
+    # update.sh's restart-owed block.
+    owed = re.search(r"\n(SERVER_RESTART_OWED=[^\n]*\n)", text)
+    return (owed.group(1) if owed else "") + text[
+        start : text.index("    _restart_tmp_watchgod_if_stale", start)
+    ]
 
 
 def test_no_change_decision_matrix(tmp_path: Path) -> None:

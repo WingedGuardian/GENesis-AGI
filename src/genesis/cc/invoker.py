@@ -36,6 +36,11 @@ from genesis.cc.exceptions import (
     CCStreamTruncatedError,
     CCTimeoutError,
 )
+from genesis.cc.provider_readiness import (
+    probing_provider,
+    provider_status_isolated,
+    rate_limit_rejected,
+)
 from genesis.cc.types import (
     PROBE_CALLER_TAG,
     CCInvocation,
@@ -49,6 +54,7 @@ from genesis.cc.types import (
 from genesis.observability.spans import SpanKind, start_span
 from genesis.util.inflight import inflight
 from genesis.util.proc_kill import (
+    ProcessCleanupUncertain,
     confirm_process_exit,
     kill_process_group,
     process_group_alive,
@@ -1886,6 +1892,7 @@ class CCInvoker:
         # so concurrent sessions don't clobber each other and `/stop` can
         # interrupt the RIGHT proc. Single-threaded asyncio → no lock needed.
         self._active_procs: dict[str, asyncio.subprocess.Process] = {}
+        self._cleanup_owned_procs: set[str] = set()
         self._on_cc_status_change = on_cc_status_change
         self._on_model_downgrade = on_model_downgrade
         self._on_cc_empty_output = on_cc_empty_output
@@ -1995,6 +2002,8 @@ class CCInvoker:
 
     async def _fire_downgrade_callback(self, output: CCOutput) -> None:
         """Invoke model downgrade callback if applicable. Never raises."""
+        if probing_provider():
+            return
         if not output.downgraded or not self._on_model_downgrade:
             return
         try:
@@ -2015,7 +2024,7 @@ class CCInvoker:
 
         The silent-cap signature: an Anthropic-subscription cap makes ``claude -p``
         return 0-token, no-text output with ``is_error=False`` and no
-        ``rate_limit_event`` — which every success path reads as a completed run.
+        effective quota refusal — which success paths read as a completed run.
         Only invocations that opt in via ``expect_output`` (output-producing
         cognitive call sites) are considered; the caller has already confirmed the
         output is genuinely empty and non-error before calling this. This is
@@ -2023,12 +2032,27 @@ class CCInvoker:
         output is still returned to the caller exactly as before). Never raises;
         mirrors ``_fire_downgrade_callback``.
         """
-        if self._on_cc_empty_output is None:
+        if provider_status_isolated() or self._on_cc_empty_output is None:
             return
         try:
             await self._on_cc_empty_output(invocation, output)
         except Exception:
             logger.warning("CC empty-output callback failed", exc_info=True)
+
+    async def _observe_stream_limit(self, output: CCOutput, raw_event: dict | None) -> bool:
+        """Classify the final quota state without discarding a usable answer."""
+        if not rate_limit_rejected(raw_event):
+            return False
+        err = CCRateLimitError("CC rate limited (stream event)", raw_event=raw_event)
+        await self._notify_status_change(err)
+        if output.text.strip():
+            return True
+        if output.stream_lines_dropped:
+            raise _unreplayable_after_drop(
+                output.stream_lines_dropped,
+                "the result carried no text under a rate-limit event",
+            ) from err
+        raise err
 
     def _refuse_unenforceable_allowlist(self, inv: CCInvocation, span_settings: str | None) -> None:
         """Refuse to launch a Bash-restricted profile whose restriction will not
@@ -2358,7 +2382,7 @@ class CCInvoker:
             if settings_pins is not None
             else _settings_env_pins(tuple(inv.bash_allowlist))
         )
-        span_settings = cc_span_settings_path(pins)
+        span_settings = None if probing_provider() else cc_span_settings_path(pins)
         if span_settings:
             args += ["--settings", span_settings]
         else:
@@ -2377,10 +2401,14 @@ class CCInvoker:
             args += ["--allowedTools", ",".join(inv.allowed_tools)]
         if inv.disallowed_tools:
             args += ["--disallowedTools", ",".join(inv.disallowed_tools)]
+        if inv.disable_tools:
+            args += ["--tools", ""]
         if inv.bare:
             args.append("--bare")
         if inv.safe_mode:
             args.append("--safe-mode")
+        if inv.no_session_persistence:
+            args.append("--no-session-persistence")
         # Prompt is passed via stdin (see run/run_streaming), not as a CLI
         # argument.  This avoids argument-parsing edge cases (the "--"
         # separator broke -p prompt detection) and handles arbitrarily long
@@ -2648,7 +2676,9 @@ class CCInvoker:
         pin_dispatched_env(env)
         return env
 
-    def _register_proc(self, key: str, proc: asyncio.subprocess.Process) -> None:
+    def _register_proc(
+        self, key: str, proc: asyncio.subprocess.Process, *, confirm_cleanup: bool = False
+    ) -> str:
         """Register a live subprocess under a session key.
 
         Prunes dead entries first — a safety net so the registry only ever
@@ -2659,12 +2689,36 @@ class CCInvoker:
         the same key would orphan the prior proc — keep that invariant if the
         locking model changes.
         """
-        for dead in [k for k, p in self._active_procs.items() if p.returncode is not None]:
+        for dead in [
+            k
+            for k, p in self._active_procs.items()
+            if p.returncode is not None and k not in self._cleanup_owned_procs
+        ]:
             self._active_procs.pop(dead, None)
+        if key in self._cleanup_owned_procs:
+            key = f"pid:{proc.pid}:{id(proc)}"
         self._active_procs[key] = proc
+        if confirm_cleanup:
+            self._cleanup_owned_procs.add(key)
+        return key
 
     def _unregister_proc(self, key: str) -> None:
         self._active_procs.pop(key, None)
+        self._cleanup_owned_procs.discard(key)
+
+    async def _confirm_registered_exit(self, proc, key: str, **kwargs) -> None:
+        """Uncertain groups retain ownership even after their leader exits."""
+        try:
+            await confirm_process_exit(proc, **kwargs)
+        except ProcessCleanupUncertain as exc:
+            exc.process = proc
+            raise
+        except asyncio.CancelledError:
+            # confirm_process_exit delivers cancellation only after proving exit.
+            self._unregister_proc(key)
+            raise
+        else:
+            self._unregister_proc(key)
 
     async def interrupt(self, key: str | None = None) -> None:
         """Send SIGINT to a session's subprocess. No-op if none match.
@@ -2809,7 +2863,7 @@ class CCInvoker:
         Args:
             error: The CC error, or None on recovery (success after failure).
         """
-        if self._on_cc_status_change is None:
+        if provider_status_isolated() or self._on_cc_status_change is None:
             return
 
         async with self._status_lock:
@@ -3059,7 +3113,7 @@ class CCInvoker:
             )
             admission.release()
             reg_key = invocation.session_key or f"pid:{proc.pid}"
-            self._register_proc(reg_key, proc)
+            reg_key = self._register_proc(reg_key, proc)
             logger.info("CC subprocess spawned (PID %s)", proc.pid)
             set_oom_score_adj(proc.pid, 500)
             if invocation.on_spawn is not None:
@@ -3312,6 +3366,10 @@ class CCInvoker:
                 start_new_session=True,
             )
             admission.release()
+        except ProcessCleanupUncertain as exc:
+            if exc.process is not None:
+                self._register_proc(f"pid:{exc.process.pid}", exc.process, confirm_cleanup=True)
+            raise
         except FileNotFoundError:
             logger.error(
                 "Claude CLI not found at %r. Ensure @anthropic-ai/claude-code "
@@ -3330,7 +3388,7 @@ class CCInvoker:
         # pipe, task cancellation), reap the proc and drop the registry entry —
         # don't leak either. The streaming `try` below unregisters on its paths.
         reg_key = invocation.session_key or f"pid:{proc.pid}"
-        self._register_proc(reg_key, proc)
+        reg_key = self._register_proc(reg_key, proc, confirm_cleanup=invocation.confirm_cleanup)
         try:
             if invocation.on_spawn is not None:
                 try:
@@ -3351,10 +3409,7 @@ class CCInvoker:
                 self._unregister_proc(reg_key)
                 kill_process_group(proc)
             else:
-                try:
-                    await confirm_process_exit(proc)
-                finally:
-                    self._unregister_proc(reg_key)
+                await self._confirm_registered_exit(proc, reg_key)
             raise
 
         result_data: dict | None = None
@@ -3527,7 +3582,10 @@ class CCInvoker:
                         cc_version = event_raw.get("version", "unknown")
                         logger.info("CC version: %s", cc_version)
 
-                    if event.event_type == "text" and event.text:
+                    # Not CC's own synthetic line (a usage-limit notice): it is
+                    # not an answer, and collected as one it made an empty
+                    # rate-limited result read as served instead of raising.
+                    if event.event_type == "text" and event.text and not event.is_synthetic:
                         collected_text.append(event.text)
                     if etype == "assistant":
                         # Read off the RAW content array, not the parsed
@@ -3601,17 +3659,16 @@ class CCInvoker:
             kill_process_group(proc)
             raise
         finally:
-            try:
-                if invocation.confirm_cleanup:
-                    # After a clean result the child was only asked to stop:
-                    # give it the same reap and flush grace an ordinary run
-                    # gets below, then confirm the group is gone.
-                    await confirm_process_exit(
-                        proc,
-                        graceful=terminated_after_result,
-                        escalation_grace_s=_ESCALATION_GRACE_S,
-                    )
-            finally:
+            if invocation.confirm_cleanup:
+                # A result asks the child to stop; ownership ends only when
+                # the complete group, rather than just its leader, is gone.
+                await self._confirm_registered_exit(
+                    proc,
+                    reg_key,
+                    graceful=terminated_after_result,
+                    escalation_grace_s=_ESCALATION_GRACE_S,
+                )
+            else:
                 self._unregister_proc(reg_key)
 
         # Bounded reap: proc.terminate() on the result path is a GRACEFUL stop
@@ -3778,40 +3835,11 @@ class CCInvoker:
                     ) from err
                 raise err
 
-            # CC may return is_error=false but emit rate_limit_event in
-            # the stream.  Update rate-limited status for awareness/scheduling
-            # but still deliver the response if it has content — throwing away
-            # a valid answer just because the API signaled rate pressure wastes
-            # work and forces a contingency fallback the user didn't need.
-            if "rate_limit_event" in event_types:
-                if output.text and output.text.strip():
-                    # Valid response despite rate limit signal — deliver it
-                    # but mark CC as rate-limited so scheduling can back off.
-                    logger.info(
-                        "CC rate-limited but response has content (%d chars) — delivering",
-                        len(output.text),
-                    )
-                    err = CCRateLimitError(
-                        "CC rate limited (stream event)", raw_event=rate_limit_raw
-                    )
-                    await self._notify_status_change(err)
-                    await self._fire_downgrade_callback(output)
-                    return output
-                # Empty/no response — rate limit prevented a real answer
-                err = CCRateLimitError(
-                    output.text or "CC rate limited (stream event)",
-                    raw_event=rate_limit_raw,
-                )
-                await self._notify_status_change(err)
-                if oversized_dropped:
-                    # A rate-limit error is the one that reaches roster failover,
-                    # so this is the branch where a replay costs a SECOND live
-                    # peer running the same prompt with full tools.
-                    raise _unreplayable_after_drop(
-                        oversized_dropped,
-                        "the result carried no text under a rate-limit event",
-                    ) from err
-                raise err
+            # A later allowed state supersedes a rejection. A real final
+            # refusal still updates health, while any valid answer is delivered.
+            if await self._observe_stream_limit(output, rate_limit_raw):
+                await self._fire_downgrade_callback(output)
+                return output
 
             # A result arrived, but a dropped line left it with NO text — so the
             # dropped line WAS the answer. `_parse_result_dict` already recovers
@@ -3844,7 +3872,7 @@ class CCInvoker:
                 await self._notify_status_change(None)
             await self._fire_downgrade_callback(output)
             # Silent-cap detection: reaching here means is_error=False AND no
-            # rate_limit_event (both handled above) — empty text is the signal.
+            # effective quota refusal (both handled above) — empty text is the signal.
             if (
                 invocation.expect_output
                 and not output.is_error
@@ -3888,8 +3916,6 @@ class CCInvoker:
             )
 
         # No result event — treat collected text as response (success path)
-        if self._last_was_error:
-            await self._notify_status_change(None)
         output = CCOutput(
             session_id="",
             result_received=False,
@@ -3908,14 +3934,18 @@ class CCInvoker:
         )
         if bg_truncated:
             await _emit_bg_truncation_event(output.session_id)
+        if await self._observe_stream_limit(output, rate_limit_raw):
+            await self._fire_downgrade_callback(output)
+            return output
+        if self._last_was_error:
+            await self._notify_status_change(None)
         await self._fire_downgrade_callback(output)
-        # Silent-cap detection (no-result path): also guard on rate_limit_event,
-        # since the rate-limit branch above runs only inside the result_data block.
+        # As with a result event, informational quota events do not explain
+        # empty output. Effective refusals were already handled above.
         if (
             invocation.expect_output
             and not output.is_error
             and not output.text.strip()
-            and "rate_limit_event" not in event_types
             # A drop CAN reach here now: the bg-truncation exemption above lets a
             # dropped run through when real partial text survived. That is why
             # the exemption strips before testing — text that survives is text

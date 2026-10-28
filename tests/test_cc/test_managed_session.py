@@ -540,8 +540,9 @@ async def test_publication_failure_is_explicit_and_never_claims_full_result(
     assert invoker.run_streaming.await_count == 1
 
 
+@pytest.mark.parametrize("sqlite_error", [False, True])
 async def test_persistence_failure_retains_capacity_and_retry_does_not_double_cost(
-    db, native, monkeypatch
+    db, native, monkeypatch, caplog, sqlite_error
 ):
     import sqlite3
 
@@ -550,13 +551,17 @@ async def test_persistence_failure_retains_capacity_and_retry_does_not_double_co
     original_complete = manager.complete
     failed, release = asyncio.Event(), asyncio.Event()
     attempts = 0
+    error = RuntimeError("synthetic private SQL and values")
+    if sqlite_error:
+        error = sqlite3.OperationalError(str(error))
+        error.sqlite_errorname = "SQLITE_BUSY_SNAPSHOT"
 
     async def flaky_complete(*args, **kwargs):
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             failed.set()
-            raise sqlite3.OperationalError("synthetic temporary database failure")
+            raise error
         await release.wait()
         await original_complete(*args, **kwargs)
 
@@ -574,6 +579,9 @@ async def test_persistence_failure_retains_capacity_and_retry_does_not_double_co
     assert row["cost_usd"] == 0.2
     assert attempts == 2
     assert invoker.run_streaming.await_count == 1
+    name = "SQLITE_BUSY_SNAPSHOT" if sqlite_error else "None"
+    assert f"exception={type(error).__name__}, sqlite_errorname={name}" in caplog.text
+    assert str(error) not in caplog.text
 
 
 async def test_real_invoker_exception_contract_is_classified_without_raw_error(db, native):
@@ -647,7 +655,15 @@ async def test_stdin_failure_still_drains_when_both_kill_methods_refuse(
 
 
 @pytest.mark.parametrize("behavior", ["result", "eof", "cancel"])
-@pytest.mark.parametrize("scoped", [False, True], ids=["process-group", "user-scope"])
+@pytest.mark.parametrize(
+    "scoped",
+    [
+        pytest.param(False, id="process-group"),
+        # A real transient user scope: the live fence's systemd-run stub would
+        # answer "unavailable" and skip it, so it opts out (tests/_live_fence.py).
+        pytest.param(True, id="user-scope", marks=pytest.mark.user_manager),
+    ],
+)
 async def test_native_subprocess_lifecycle_and_provenance(
     db, native, tmp_path, monkeypatch, behavior, caplog, scoped
 ):
@@ -686,6 +702,13 @@ async def test_native_subprocess_lifecycle_and_provenance(
         "_build_args",
         lambda *args, **kwargs: [str(script), "-p", "--output-format", "json"],
     )
+    if scoped:
+        # Probe afresh: an earlier test's probe under the live fence's systemd-run
+        # stub fails and starts the module's retry cooldown, which would answer []
+        # here without probing at all.
+        monkeypatch.setattr("genesis.cc.invoker._SCOPE_ARGS", None)
+        monkeypatch.setattr("genesis.cc.invoker._SCOPE_PROBE_FAILED_AT", None)
+        monkeypatch.setattr("genesis.cc.invoker._SCOPE_PROBE_FAILURES", 0)
     prefix = await _get_scope_args() if scoped else []
     if scoped and not prefix:
         pytest.skip("Native user scope is unavailable on this test host")

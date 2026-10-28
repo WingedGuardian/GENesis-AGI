@@ -604,3 +604,130 @@ async def test_a_fault_building_the_row_never_reaches_the_caller(db, monkeypatch
     assert telemetry._write_failures == 1
     [line] = _lost_lines()
     assert line["clock_breaking"] == 1
+
+
+# ── T1: a clock-breaking event carries its own cause ──────────────────────
+
+
+class _DiagStore(_OkStore):
+    """Times out the way `graphstore_falkor._bounded` now does: the seam error
+    carrying a `.diag` of its own cause."""
+
+    DIAG = {"budget_ms": 500.0, "elapsed_ms": 501.2, "late_ms": 1.2,
+            "frames": ["_run", "query", "readuntil", "_wait_for_data"],
+            "psi_stall_us": {"cpu_some": 0}}
+
+    async def traverse(self, db, root_id, *, max_depth, min_strength, include_deprecated=False):
+        err = GraphUnavailableError("graph query exceeded 0.5s")
+        err.diag = dict(self.DIAG)
+        raise err from TimeoutError()
+
+
+@pytest.mark.asyncio
+async def test_a_fallback_event_carries_the_store_diag_and_the_process(db, monkeypatch):
+    import os
+
+    monkeypatch.setattr(graph_mod, "_traversal_store", lambda: _DiagStore())
+    monkeypatch.setattr(graph_mod, "_store", _OkStore(name="networkx"))
+
+    await graph_mod.traverse(db, "root")
+
+    [row] = await _rows(db)
+    [event] = row["events"]
+    assert event["primary_reason"] == "TimeoutError"
+    assert event["diag"] == _DiagStore.DIAG
+    assert event["pid"] == os.getpid()
+    assert isinstance(event["starttime_ticks"], int)
+    assert event["proc_age_s"] >= 0.0
+
+
+@pytest.mark.asyncio
+async def test_a_fallback_without_a_diag_still_names_the_process(db, monkeypatch):
+    import os
+
+    monkeypatch.setattr(graph_mod, "_traversal_store", lambda: _DeadStore())
+    monkeypatch.setattr(graph_mod, "_store", _OkStore(name="networkx"))
+
+    await graph_mod.traverse(db, "root")
+
+    [row] = await _rows(db)
+    [event] = row["events"]
+    assert "diag" not in event
+    assert event["pid"] == os.getpid()
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_process_start_never_costs_the_row(db, monkeypatch):
+    def _boom():
+        raise OSError("no /proc")
+
+    monkeypatch.setattr(telemetry, "_self_start", _boom)
+    monkeypatch.setattr(telemetry, "_START", None)  # read once per process
+    monkeypatch.setattr(graph_mod, "_traversal_store", lambda: _DiagStore())
+    monkeypatch.setattr(graph_mod, "_store", _OkStore(name="networkx"))
+
+    await graph_mod.traverse(db, "root")
+
+    [row] = await _rows(db)
+    [event] = row["events"]
+    assert event["starttime_ticks"] is None
+    assert event["proc_age_s"] is None
+    assert event["diag"] == _DiagStore.DIAG
+
+
+def test_process_start_is_read_from_btime_not_uptime(tmp_path):
+    """lxcfs virtualises /proc/uptime (measured 28 s off on this install), so
+    the age comes from btime plus the start ticks."""
+    import os
+
+    proc = tmp_path / "proc"
+    (proc / "self").mkdir(parents=True)
+    tck = os.sysconf("SC_CLK_TCK")
+    rest = ["S"] + ["0"] * 18 + [str(50 * tck)] + ["0"] * 5
+    (proc / "self" / "stat").write_text(f"77 (py thon) {' '.join(rest)}\n")
+    (proc / "stat").write_text("cpu 1 2 3\nbtime 1000\n")
+
+    ticks, started = telemetry._self_start(proc)
+
+    assert ticks == 50 * tck
+    assert started == 1050.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("ms", "bucket"),
+    [(9.9, "lt10"), (99.0, "lt100"), (249.0, "lt250"), (499.0, "lt500"), (500.0, "ge500")],
+)
+async def test_primary_traversals_are_bucketed_by_the_store_that_answered(db, ms, bucket):
+    async with telemetry.traversal_tally(db, caller="recall"):
+        await telemetry.note_traversal(
+            db, outcome="primary", configured="falkordb", served_by="falkordb",
+            primary_reason=None, final_reason=None, elapsed_ms=ms,
+        )
+
+    [row] = await _rows(db)
+    assert row["primary_ms"] == {"falkordb": {bucket: 1}}
+    assert row["primary_ms_max"] == ms
+
+
+@pytest.mark.asyncio
+async def test_a_real_traversal_records_its_primary_time(db, monkeypatch):
+    monkeypatch.setattr(graph_mod, "_traversal_store", lambda: _OkStore())
+
+    await graph_mod.traverse(db, "root")
+
+    [row] = await _rows(db)
+    assert set(row["primary_ms"]) == {"falkordb"}
+    assert sum(row["primary_ms"]["falkordb"].values()) == 1
+    assert row["primary_ms_max"] >= 0.0
+
+
+@pytest.mark.asyncio
+async def test_a_fallback_row_carries_no_primary_timing(db, monkeypatch):
+    monkeypatch.setattr(graph_mod, "_traversal_store", lambda: _DiagStore())
+    monkeypatch.setattr(graph_mod, "_store", _OkStore(name="networkx"))
+
+    await graph_mod.traverse(db, "root")
+
+    [row] = await _rows(db)
+    assert "primary_ms" not in row

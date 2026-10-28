@@ -40,11 +40,86 @@ from pathlib import Path
 # The shared hook-input helper lives in scripts/hooks/; this script runs from
 # scripts/ (a different sys.path[0]), so add the hooks dir before importing it.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
+from hook_deadline import (  # noqa: E402
+    LockedStdout,
+    arm_from_spawn,
+    disarm,
+    process_age_s,
+    written_units,
+)
+from hook_phases import PhaseClock  # noqa: E402
+
+# Per-step timings, written to stderr once per run (hook_phases.py). Created
+# before the hard stop is armed so a stop that fires during the imports below
+# still names the step it cut: each mark() starts a step, and a cut line names
+# the one still open as `running`.
+_PHASES = PhaseClock(age_s=process_age_s())
+_PHASE_LINE_WRITTEN = False  # set once main() has written this run's line
+_RUN_DEADLINE_AT: float | None = None  # this run's soft deadline (monotonic), once _run sets it
+
+
+def _phase_line(*, cut: bool = False, **extra: object) -> str:
+    """The run's phase line. Reads the run flags by name because a hard stop can
+    fire before the module has defined them. ``deadline_hit`` is judged now, at
+    render time, so work that crossed the deadline after the run's own checks (the
+    closing flush, a step the hard stop cut) is still reported as late."""
+    g = globals()
+    deadline_at = g.get("_RUN_DEADLINE_AT")
+    return _PHASES.line(
+        cut=cut,
+        recall_landed=g.get("_RECALL_LANDED"),
+        flushed=g.get("_FLUSHED"),
+        deadline_hit=None if deadline_at is None else time.monotonic() >= deadline_at,
+        **extra,
+    )
+
+
+if __name__ == "__main__":
+    # A crash while this module loads (a missing dependency, a broken genesis.env)
+    # happens before main() and its finally exist. Python prints the traceback,
+    # then this writes the phase line, whose open step names where it crashed. A
+    # deliberate sys.exit (a dispatched session) is not an uncaught exception, so
+    # it never reaches here and writes nothing, as documented.
+    _prior_excepthook = sys.excepthook
+
+    def _startup_excepthook(exc_type, exc, tb) -> None:  # type: ignore[no-untyped-def]
+        _prior_excepthook(exc_type, exc, tb)
+        if _PHASE_LINE_WRITTEN:
+            return
+        with contextlib.suppress(Exception):
+            sys.stderr.flush()
+            os.write(2, _phase_line(startup_error=exc_type.__name__).encode("utf-8", "replace"))
+
+    sys.excepthook = _startup_excepthook
+
+
+# The process-level hard stop (hook_deadline.py), armed as early as possible
+# and ONLY when this file runs as the hook: an import (a test, ambient_replay)
+# must never get a timer that calls os._exit. 8.5 s after spawn, below Claude
+# Code's 10 s limit, which it is measured to enforce up to several seconds late.
+# The lambda resolves _hard_stop_notice at fire time, so a stop that fires
+# during the imports below still works (it prints no notice).
+_HARD_STOP_S = 8.5
+_HARD_STOP = (
+    arm_from_spawn(
+        _HARD_STOP_S,
+        lambda: _hard_stop_notice(),
+        label="proactive_memory_hook",
+        # A run that already wrote its own line has finished: a stop landing
+        # between that write and disarm() adds nothing, rather than a second line.
+        diag=lambda: None if _PHASE_LINE_WRITTEN else _phase_line(cut=True),
+    )
+    if __name__ == "__main__"
+    else None
+)
+
+_PHASES.mark("imports")
 from hook_input import session_path  # noqa: E402
 from hook_output import (  # noqa: E402
     DEFAULT_BUDGET,
     HOOK_STDOUT_CAP,
     BoundedStdout,
+    clip_final_notice,
     clip_to_cost,
     utf16_len,
 )
@@ -65,6 +140,7 @@ if str(SRC_DIR) not in sys.path:
 from dotenv import load_dotenv  # noqa: E402
 
 # SECRETS_PATH wins, as in genesis.env.secrets_path().
+_PHASES.mark("dotenv")
 load_dotenv(
     Path(os.environ["SECRETS_PATH"]).expanduser()
     if os.environ.get("SECRETS_PATH")
@@ -80,7 +156,9 @@ def _genesis_db_path() -> Path:
     return importlib.import_module("genesis.env").genesis_db_path()
 
 
+_PHASES.mark("genesis_env")
 _DB_PATH = _genesis_db_path()
+_PHASES.mark("module")
 _MAX_RESULTS = 3  # Degraded-fallback result cap (the server owns the live budget).
 _MIN_PROMPT_WORDS = 1  # Stop words already filter greetings to 0 keywords
 _METRICS_PATH = Path.home() / ".genesis" / "proactive_metrics.json"
@@ -144,14 +222,19 @@ _MAX_PEERS_SHOWN = 12
 #: writes after a cut), so the announcement has to be a closing line, which is
 #: what _announce_cut is.
 #:
-#: 224 = the MEASURED widest rendering of that line (202 units: the longest
+#: Since #3096 the reserve holds TWO closing lines: the cut notice and the
+#: out-of-time notice (`_out_of_time_notice`), which can both close one run (a
+#: deferred flush can cut, and the same finally then owes the notice).
+#:
+#: 224 = the MEASURED widest rendering of the cut line (202 units: the longest
 #: block label this hook uses, `concurrent-directive`, plus a 7-digit dropped
-#: count) with headroom. The first value here was 160, picked by eyeballing the
+#: count) with headroom; the out-of-time line's widest rendering (a two-digit
+#: startup age) is added to it below. The first value here was 160, picked by eyeballing the
 #: template, and the test below caught it — which is the whole reason the number
 #: is asserted against a rendering instead of argued for in a comment. 2.3% of
 #: the budget, spent so the full notice fits rather than degrading to the terse
 #: fallback every time.
-_CUT_NOTICE_RESERVE = 224
+_CUT_NOTICE_RESERVE = 224 + 180
 
 _OUT: BoundedStdout | None = None
 
@@ -160,7 +243,12 @@ def _writer() -> BoundedStdout:
     """This hook's bounded stdout. Lazy so direct callers of helpers still work."""
     global _OUT
     if _OUT is None:
-        _OUT = BoundedStdout(DEFAULT_BUDGET, label="proactive", reserve=_CUT_NOTICE_RESERVE)
+        _OUT = BoundedStdout(
+            DEFAULT_BUDGET,
+            label="proactive",
+            reserve=_CUT_NOTICE_RESERVE,
+            stream=LockedStdout(),  # so the hard stop never interleaves a write
+        )
     return _OUT
 
 
@@ -182,9 +270,11 @@ def _emit_tracked(out: BoundedStdout, text: str, block: str) -> bool:
     wrongly marked surfaced is suppressed and never shown again, while one
     wrongly left unmarked is merely offered again.
     """
+    global _RECALL_LANDED
     if out.closed:
         return False
     out.emit(text, block=block)
+    _RECALL_LANDED = True
     return True
 
 
@@ -226,7 +316,22 @@ _SERVER_TIMEOUT_S = 4.75
 _SERVER_CONNECT_TIMEOUT_S = 0.25
 # Claude Code kills UserPromptSubmit hooks at 10 seconds. Keep the whole run
 # below that ceiling with enough room for the deferred flush and cut notice.
+# The ceiling counts from when Claude Code spawned the hook, so main() charges
+# the time already spent before _run (the launcher's `exec`, the interpreter,
+# imports, load_dotenv) against this budget: see _process_age_s.
 _RUN_DEADLINE_S = 8.0
+#: Set by _emit_tracked when a recall line reaches stdout; reset by _run.
+_RECALL_LANDED = False
+#: Set once the run's output is final (_flush_deferred ran); reset by _run.
+#: Read, with _RECALL_LANDED, by the deadline notice and the hard stop.
+_FLUSHED = False
+#: The process age main() measured before the run, for the notice text.
+_PROCESS_AGE = 0.0
+
+#: Process age, from hook_deadline.process_age_s (CLOCK_BOOTTIME against the
+#: start time in /proc/self/stat; /proc/uptime is lxcfs-virtualised). Kept under
+#: this name so callers and tests have one seam to patch.
+_process_age_s = process_age_s
 
 
 class _RunBudgetExpired(RuntimeError):
@@ -278,6 +383,13 @@ def _sqlite_connect(
             raise _RunBudgetExpired
     effective_timeout = timeout if remaining is None else min(timeout, remaining)
     conn = sqlite3.connect(str(db_path), timeout=effective_timeout, uri=uri)
+    # WAL + NORMAL: a commit no longer fsyncs. An fsync is an uninterruptible
+    # wait, which even the hard stop cannot cut short (the process cannot exit
+    # until it returns). NORMAL under WAL keeps the database consistent and
+    # risks only the last commits on power loss; the server uses the same
+    # setting (src/genesis/db/connection.py).
+    with contextlib.suppress(sqlite3.Error):
+        conn.execute("PRAGMA synchronous=NORMAL")
     if deadline is not None:
         conn.set_progress_handler(
             lambda: 1 if time.monotonic() >= deadline else 0,
@@ -1814,7 +1926,7 @@ def _heartbeat_write(
 ) -> float:
     """Write session heartbeat. Returns elapsed ms. Best-effort."""
     hb_start = time.monotonic()
-    if not session_id or not db_path.exists():
+    if not session_id or _deadline_expired(deadline) or not db_path.exists():
         return 0.0
 
     try:
@@ -1841,7 +1953,9 @@ def _heartbeat_write(
         # Prompt-time truth repair for the terminal session row: advance the
         # reaper's idle clock and undo an adoption-era 'completed' lie the
         # moment the user types (2026-09-04 ghost). Same best-effort posture.
-        touch_terminal_session_row_sync(str(db_path), session_id)
+        # It takes no deadline (its own 1 s lock wait), so skip it once spent.
+        if not _deadline_expired(deadline):
+            touch_terminal_session_row_sync(str(db_path), session_id)
     except Exception:
         pass  # Best-effort — never block
 
@@ -1945,7 +2059,7 @@ def _heartbeat_read_and_inject(
 ) -> float:
     """Read concurrent sessions and print [Concurrent] tags. Returns elapsed ms."""
     hb_start = time.monotonic()
-    if not session_id or not db_path.exists():
+    if not session_id or _deadline_expired(deadline) or not db_path.exists():
         return 0.0
 
     try:
@@ -2014,22 +2128,66 @@ def _heartbeat_read_and_inject(
     return (time.monotonic() - hb_start) * 1000
 
 
-async def _run(prompt: str, session_id: str = "") -> None:
-    """Run the hook within one aggregate budget and always flush deferred lines."""
+def _out_of_time_notice(process_age_s: float) -> str:
+    """The line a run that hit its deadline prints, so the gap is not silent.
+
+    The startup clause appears only when startup took a noticeable share of the
+    budget; an unknown age reads as 0 and says nothing.
+    """
+    started = (
+        f" ({process_age_s:.1f}s passed before it started)" if process_age_s >= 1.0 else ""
+    )
+    return (
+        f"[Memory: the hook ran out of its {_RUN_DEADLINE_S:g}s budget{started}, so recall "
+        "may be missing or incomplete this turn; use memory_recall if prior context matters]"
+    )
+
+
+#: The out-of-time notice's short form, emitted whole when the full one does not fit.
+_OUT_OF_TIME_SHORT = "[Memory: out of time; recall may be missing this turn]"
+
+
+def _hard_stop_notice() -> str | None:
+    """The line the hard stop adds, or None. Runs on the timer thread: no imports.
+
+    None once the output is final or a recall line already reached stdout (the
+    model has what the run produced). Clipped so stdout stays under the cap the
+    harness enforces: the notice, a leading and a trailing newline.
+    """
+    if _FLUSHED or _RECALL_LANDED or _HOOK_MODE == "off":
+        return None
+    # The timer holds STDOUT_LOCK while this runs, so written_units() counts
+    # every unit that reached the stream; the writer's own counter can lag a
+    # write by the length of one print().
+    return clip_final_notice(_out_of_time_notice(_PROCESS_AGE), emitted_units=written_units())
+
+
+async def _run(prompt: str, session_id: str = "", *, process_age_s: float = 0.0) -> None:
+    """Run the hook within one aggregate budget and always flush deferred lines.
+
+    ``process_age_s`` is how long the process ran before this call. The budget
+    shrinks by it, because Claude Code's 10 s limit counts from the spawn, not
+    from here. main() passes it; a direct caller (a test) gets the full budget.
+    """
+    global _RECALL_LANDED, _FLUSHED, _RUN_DEADLINE_AT
+    _RECALL_LANDED = False
+    _FLUSHED = False
     deferred_lines: list[str] = []
-    flushed = False
 
     def _flush_deferred() -> None:
         """Emit buffered session metadata at most once."""
-        nonlocal flushed
-        if flushed:
+        global _FLUSHED
+        if _FLUSHED:
             return
-        flushed = True
+        _FLUSHED = True
+        _PHASES.mark("flush")
         out = _writer()
         for line in deferred_lines:
             out.emit(line, block="session-metadata")
 
-    deadline = time.monotonic() + _RUN_DEADLINE_S
+    deadline = time.monotonic() + max(0.0, _RUN_DEADLINE_S - process_age_s)
+    _RUN_DEADLINE_AT = deadline
+    timed_out = False
     loop_deadline = asyncio.get_running_loop().time() + max(
         0.0,
         deadline - time.monotonic(),
@@ -2044,9 +2202,31 @@ async def _run(prompt: str, session_id: str = "") -> None:
                 deadline=deadline,
             )
     except TimeoutError:
+        timed_out = True
         return
     finally:
+        _PHASES.set(timed_out=timed_out)
+        # Owed only when the run had NOT reached its own output decision: every
+        # path that decides (off mode, a short prompt, the server and degraded
+        # paths) flushes first, so an expired deadline after that owes nothing.
+        # Captured BEFORE the flush below, which would otherwise make it vacuous.
+        owed = (
+            _HOOK_MODE != "off"  # recall was silenced on purpose: nothing went missing
+            and not _FLUSHED
+            and not _RECALL_LANDED
+            and (timed_out or _deadline_expired(deadline))
+        )
         _flush_deferred()
+        if owed:
+            # A closing line, like the cut notice: it spends the reserve, so a
+            # flush that used up the budget cannot clip or drop it.
+            _writer().emit_final(
+                _out_of_time_notice(process_age_s), fallback=_OUT_OF_TIME_SHORT
+            )
+        # After the closing flush and the notice, so a run that never flushed in
+        # its body (a timeout, an early deadline return) books that write to
+        # `flush`, and `finish` is only the cleanup and exit that follow.
+        _PHASES.mark("finish")
 
 
 async def _run_body(
@@ -2062,6 +2242,7 @@ async def _run_body(
 
     # ── Heartbeat ops (BEFORE memory recall — always complete) ─────
     heartbeat_ms = 0.0
+    _PHASES.mark("heartbeat_write")
     heartbeat_ms += _heartbeat_write(
         _DB_PATH,
         session_id,
@@ -2070,6 +2251,7 @@ async def _run_body(
     )
     if _deadline_expired(deadline):
         return
+    _PHASES.mark("heartbeat_read")
     heartbeat_ms += _heartbeat_read_and_inject(
         _DB_PATH,
         session_id,
@@ -2078,6 +2260,7 @@ async def _run_body(
     if _deadline_expired(deadline):
         return
 
+    _PHASES.mark("trail")
     keywords = _extract_keywords(prompt)
 
     # ── Session intent trail (runs on every message, even short ones) ─
@@ -2095,6 +2278,7 @@ async def _run_body(
         pass  # Intent trail must never block the hook
 
     # ── Recent tool activity (self-awareness for post-compaction context) ─
+    _PHASES.mark("activity")
     try:
         activity = _extract_genesis_summary(session_id)
         if activity:
@@ -2104,16 +2288,20 @@ async def _run_body(
 
     # File-context keywords (PostToolUse tracking): sent to the server as extra
     # FTS terms; merged into the local keyword set for the degraded fallback.
+    _PHASES.mark("recent_files")
     recent_files = _load_recent_files(session_id)
     file_keywords = _keywords_from_files(recent_files) if recent_files else []
     if _deadline_expired(deadline):
         return
 
     # off mode: session-local awareness only (heartbeat/trail already ran).
+    _PHASES.mark("gates")
     if _HOOK_MODE == "off":
+        _PHASES.set(path="off")
         _flush_deferred()
         # Record the turn so off-mode is observable in proactive_metrics.json
         # (how often recall is silenced) rather than a blind spot.
+        _PHASES.mark("metrics")
         _record_detail(
             fts_count=0,
             vector_count=0,
@@ -2138,14 +2326,17 @@ async def _run_body(
     # that already walks it; the alternative is deriving eligibility from a list
     # that was filtered for a different purpose.
     if len(_extract_keywords(prompt, window=False)) < _MIN_PROMPT_WORDS and not file_keywords:
+        _PHASES.set(path="short")
         _flush_deferred()
         return
 
     if not _DB_PATH.exists():
+        _PHASES.set(path="no_db")
         _flush_deferred()
         return
 
     # Self-heal: ensure knowledge_units has retrieved_count column (once)
+    _PHASES.mark("migration")
     _SENTINEL = Path.home() / ".genesis" / ".knowledge_retrieved_count_migrated"
     if not _SENTINEL.exists():
         try:
@@ -2160,6 +2351,7 @@ async def _run_body(
     if _deadline_expired(deadline):
         return
 
+    _PHASES.mark("suppress")
     suppress_ids = _compute_suppress_ids(session_id)
     now_iso = datetime.now(UTC).isoformat()
 
@@ -2168,12 +2360,17 @@ async def _run_body(
     server_ms: float | None = None
     server_reason: str | None = None
     if _HOOK_MODE != "local":
+        _PHASES.mark("server")
         _t_srv = time.monotonic()
         server_data, server_reason = await _call_server(
             prompt, session_id, file_keywords, suppress_ids
         )
+        _PHASES.set(server_reason=server_reason)
         server_ms = (time.monotonic() - _t_srv) * 1000
-        if _deadline_expired(deadline):
+        # An answer that already arrived is printed even when the budget ran out
+        # while waiting for it: printing costs microseconds, and the steps after
+        # it check the deadline themselves. Only a missing answer stops here.
+        if server_data is None and _deadline_expired(deadline):
             return
 
     if server_data is not None:
@@ -2186,6 +2383,8 @@ async def _run_body(
         # clamp, so `budgets.max` can be raised arbitrarily by a .local.yaml
         # overlay. The gate's rule is that a structural exemption may only cite a
         # bound configuration cannot change — this is the opposite of that.
+        _PHASES.set(path="server")
+        _PHASES.mark("server_emit")
         out = _writer()
         server_lines_landed = True
         for line in server_data.get("lines") or []:
@@ -2199,6 +2398,7 @@ async def _run_body(
         # recall. Best-effort; empty when the code index hasn't been built.
         # Suppressed when the engine is deliberately silenced (status "disabled" =
         # config kill switch → inject NOTHING), so code hints don't leak past it.
+        _PHASES.mark("code_hints")
         code_hits: list[dict] = []
         if server_data.get("status") != "disabled":
             code_keywords = keywords + [k for k in file_keywords if k not in keywords]
@@ -2242,10 +2442,12 @@ async def _run_body(
         if _deadline_expired(deadline):
             return
 
+        _PHASES.mark("ws_measure")
         ws_stats = _ws_measure(fused, session_id, surfaced_proc_id, now_iso, shadow=shadow)
         if _deadline_expired(deadline):
             return
         total_ms = (time.monotonic() - start) * 1000
+        _PHASES.mark("activity_row")
         _record_activity(
             _DB_PATH,
             total_ms,
@@ -2254,6 +2456,7 @@ async def _run_body(
         )
         if _deadline_expired(deadline):
             return
+        _PHASES.mark("metrics")
         _record_detail(
             # On the server path the HOOK does zero local fts/vector search — the
             # server owns retrieval. Report 0/0 (fused_count + mode carry meaning);
@@ -2278,6 +2481,9 @@ async def _run_body(
             server_ms=server_ms,
         )
         # Ambient fold on the server-returned prompt embedding (None-safe).
+        if _deadline_expired(deadline):
+            return
+        _PHASES.mark("fold")
         _ambient_fold(embedding, session_id, prompt, recent_files)
         return
 
@@ -2285,7 +2491,9 @@ async def _run_body(
     # Reached when the server is unreachable/slow (mode "server") or when the
     # operator forced local recall (GENESIS_PROACTIVE_HOOK_MODE=local).
     fallback_mode = "local" if _HOOK_MODE == "local" else "degraded"
+    _PHASES.set(path=fallback_mode)
     fallback_keywords = keywords + [k for k in file_keywords if k not in keywords]
+    _PHASES.mark("fts5")
     fts_results = _search_fts5(
         _DB_PATH,
         fallback_keywords,
@@ -2295,6 +2503,7 @@ async def _run_body(
     )
     if _deadline_expired(deadline):
         return
+    _PHASES.mark("code_index")
     from genesis.memory.provenance import is_garbage
 
     code_results = _search_code_index(
@@ -2304,6 +2513,7 @@ async def _run_body(
     )
     if _deadline_expired(deadline):
         return
+    _PHASES.mark("degraded_emit")
     fused = [r for r in fts_results if not is_garbage(r.get("content", ""))][:_MAX_RESULTS]
     if len(fused) < _MAX_RESULTS and code_results:
         fused += code_results[: _MAX_RESULTS - len(fused)]
@@ -2330,6 +2540,7 @@ async def _run_body(
     # injects FTS5 content locally, so it must record blockable external-world
     # hits that reach the prompt itself. Fire-and-forget after flush; the items
     # were enriched with origin_class by _format_degraded above.
+    _PHASES.mark("shadow")
     if fused:
         try:
             from genesis.security.immunity_shadow import (
@@ -2363,10 +2574,12 @@ async def _run_body(
 
     if _deadline_expired(deadline):
         return
+    _PHASES.mark("ws_measure")
     ws_stats = _ws_measure(fused, session_id, None, now_iso, shadow=None)
     if _deadline_expired(deadline):
         return
     total_ms = (time.monotonic() - start) * 1000
+    _PHASES.mark("activity_row")
     _record_activity(
         _DB_PATH,
         total_ms,
@@ -2375,6 +2588,7 @@ async def _run_body(
     )
     if _deadline_expired(deadline):
         return
+    _PHASES.mark("metrics")
     _record_detail(
         fts_count=len(fts_results),
         vector_count=0,
@@ -2393,6 +2607,9 @@ async def _run_body(
         server_ms=server_ms,
     )
     # No embedding on the fallback path — the ambient fold degrades silently.
+    if _deadline_expired(deadline):
+        return
+    _PHASES.mark("fold")
     _ambient_fold(None, session_id, prompt, recent_files)
 
 
@@ -2477,7 +2694,36 @@ def _spawn_ambient_worker(session_id: str) -> None:
 
 
 def main() -> None:
-    """Hook entry point."""
+    """Hook entry point: one run, then its phase line on stderr.
+
+    The line is written from this outermost ``finally`` so every exit writes it:
+    an empty or unparseable stdin, an early gate, the crash path (after its
+    traceback), and the ordinary return. One ``os.write`` of at most
+    ``MAX_LINE_BYTES`` is a single atomic write on a pipe, so a hard stop's own
+    stderr write can never land inside it. Inside main(), so the hard stop
+    still bounds it.
+    """
+    global _RUN_DEADLINE_AT
+    _PHASES.reset_run()
+    _RUN_DEADLINE_AT = None  # one run per process; reset for callers that run main() again
+    _PHASES.mark("stdin")
+    try:
+        _main()
+    finally:
+        _write_phase_line()
+
+
+def _write_phase_line() -> None:
+    """Write the phase line to stderr. Best-effort: it must never cost the prompt."""
+    global _PHASE_LINE_WRITTEN
+    with contextlib.suppress(Exception):
+        sys.stderr.flush()  # anything printed earlier (a traceback) stays first
+        os.write(2, _phase_line().encode("utf-8", "replace"))
+        _PHASE_LINE_WRITTEN = True
+
+
+def _main() -> None:
+    """Read the hook input and run."""
     try:
         raw = sys.stdin.read()
         if not raw.strip():
@@ -2488,8 +2734,10 @@ def main() -> None:
             return
 
         session_id = data.get("session_id", "")
+        global _PROCESS_AGE
+        _PROCESS_AGE = _process_age_s() or 0.0
         try:
-            asyncio.run(_run(prompt, session_id=session_id))
+            asyncio.run(_run(prompt, session_id=session_id, process_age_s=_PROCESS_AGE))
         finally:
             # In a `finally`, so a cut is announced on EVERY exit: the ordinary
             # return, an early return from one of _run's several gates, and the
@@ -2504,5 +2752,12 @@ def main() -> None:
         print(traceback.format_exc(), file=sys.stderr)
 
 
+# Marks made so far belong to module load and survive PhaseClock.reset_run().
+_PHASES.freeze_module()
+
+
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        disarm(_HARD_STOP)

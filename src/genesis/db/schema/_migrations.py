@@ -35,6 +35,10 @@ async def create_all_tables(db: aiosqlite.Connection) -> None:
     # Schema migrations BEFORE indexes — migrations add columns that indexes may reference
     await _migrate_add_columns(db)
 
+    from genesis.db.peer_status import install_base
+
+    await install_base(db)
+
     # INVARIANT: every column an entry below references must already exist here —
     # i.e. it is in a canonical CREATE TABLE above OR added by
     # _migrate_add_columns. A legacy DB only has the numbered-migration runner

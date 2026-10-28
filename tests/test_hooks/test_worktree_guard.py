@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import tempfile
 import time
@@ -114,6 +115,15 @@ class TestBashBlockAll:
         )
         assert result.returncode == 2
         assert "BLOCKED" in result.stderr
+
+    def test_nested_unreadable_removal_refuses_without_inventing_target(
+        self, guard_cmd: str
+    ) -> None:
+        target = "/tmp/not-a-real-worktree"
+        command = "bash -c " + shlex.quote(f"echo ok # don't\ngit worktree remove {target}")
+        result = _run_guard(guard_cmd, {"command": command})
+        assert result.returncode == 2
+        assert target not in result.stderr
 
     def test_removal_past_the_depth_bound_still_blocks(self, guard_cmd: str) -> None:
         """A removal nested past shell_parse's depth bound must NOT slip through.

@@ -33,6 +33,8 @@ from genesis.awareness.signals import SignalCollector, collect_all
 from genesis.awareness.types import Depth, TickResult
 from genesis.cc.constants import RATE_LIMIT_DEFERRAL_TTL_S
 from genesis.db.crud import awareness_ticks, observations
+from genesis.infra_profile.codebase_mcp import SLUG as _CODEBASE_MCP_SLUG
+from genesis.infra_profile.codebase_mcp import needs_setup as codebase_mcp_needs_setup
 from genesis.infra_profile.store import load_profile
 from genesis.observability.events import GenesisEventBus
 from genesis.observability.failure_details import failure_details
@@ -172,8 +174,18 @@ async def _persist_health_alerts(db) -> None:
     try:
         from genesis.db.crud import alert_events as _ae
         from genesis.mcp.health.errors import _compute_alerts
+        from genesis.observability.agent_api_alerts import ALERT_ID, active_alerts, notify_pending
+        from genesis.runtime import GenesisRuntime
 
-        alerts, _current_ids = await _compute_alerts()
+        observation = {}
+        queue_unknown_ids: set[str] = set()
+        alerts, _current_ids = await _compute_alerts(
+            agent_api_observation=observation, queue_unknown_ids=queue_unknown_ids,
+        )
+        # Also preserve an open API incident if the health service itself could
+        # not initialize and _compute_alerts returned before taking a snapshot.
+        alerts = [a for a in alerts if a.get("id") != ALERT_ID]
+        alerts.extend(await active_alerts(db, observation))
         active = [
             {
                 "alert_id": a["id"],
@@ -184,7 +196,12 @@ async def _persist_health_alerts(db) -> None:
             for a in alerts
             if a.get("id")
         ]
-        await _ae.reconcile_open_set(db, active=active, now=datetime.now(UTC).isoformat())
+        state = observation.get("status")
+        reasons = {ALERT_ID: state} if state in {"healthy", "disabled"} else None
+        await _ae.reconcile_open_set(db, active=active, now=datetime.now(UTC).isoformat(),
+                                     resolution_reasons=reasons, preserve_ids=queue_unknown_ids)
+        runtime = GenesisRuntime.peek()
+        await notify_pending(db, getattr(runtime, "_outreach_pipeline", None))
     except Exception:
         logger.debug("alert_events persistence failed (best-effort)", exc_info=True)
 
@@ -675,7 +692,33 @@ _INFRA_POSTURE_DETAIL = {
         "back; `systemctl --user enable genesis-falkordb` makes it survive the "
         "next reboot. " + _FALKORDB_STAND_DOWN
     ),
+    _CODEBASE_MCP_SLUG: (
+        "codebase-memory-mcp is registered (this checkout's .mcp.json or the "
+        "user-scope ~/.claude.json), but its managed setup is incomplete — the "
+        "settings file ~/.genesis/config/codebase-managed.json is missing or fails "
+        "validation (`scripts/codebase_managed.py status` names the error), or the "
+        "query unit genesis-cbm-query.service is not enabled — so its launcher refuses and "
+        "every Claude Code session shows the server as failed to connect. Fix: "
+        "run `configure` (with an already obtained pinned binary) and then "
+        "`enable`, per docs/reference/codebase-managed.md, section \"If you see "
+        "the 'registered but unconfigured' alert\". Not wanted? Create the "
+        "kill-switch file (the `sentinel` path in the settings file if one exists, "
+        "else ~/.genesis/codebase-memory-mcp.disabled or the path "
+        "CODEBASE_MEMORY_MCP_DISABLE_FILE names) and this alert stops. It reads "
+        "the infrastructure profile, so after either fix take a refresh "
+        "(`infrastructure_profile(refresh=true)`)"
+    ),
 }
+
+# Slugs that are a developer-tooling gap rather than a crash-resilience one, so
+# the alert's crash-resilience trailer does not claim otherwise for them.
+_INFRA_POSTURE_TOOLING_SLUGS = frozenset({_CODEBASE_MCP_SLUG})
+
+
+def _codebase_mcp_could_alert(section: dict) -> bool:
+    """Whether retained codebase_mcp facts could have fed its posture rule."""
+    facts = section.get("facts")
+    return isinstance(facts, dict) and codebase_mcp_needs_setup(facts) is True
 
 # UnitFileState values that mean an operator ENABLED the graph engine.
 _FALKORDB_ENABLED_STATES = frozenset({"enabled", "enabled-runtime"})
@@ -872,6 +915,12 @@ def _infra_missing_protections(profile: dict) -> list[str]:
         or (falkordb_state is None and falkordb.get("socket_present") is False)
     ):
         missing.append("falkordb_selected_not_running")
+    # codebase-memory-mcp registered (so every session tries it) but not set up,
+    # and the owner has not opted out with the kill-switch file. The verdict is
+    # the SAME function the installers' notice runs; None (could not tell)
+    # stays silent, per this function's contract.
+    if codebase_mcp_needs_setup(_facts("codebase_mcp")) is True:
+        missing.append(_CODEBASE_MCP_SLUG)
     return sorted(missing)
 
 
@@ -886,12 +935,17 @@ _POSTURE_PLANES = (
     # make the rules fall silent AND leave `unverifiable` empty — resolving an
     # open engine alert while the engine is still broken and unobservable.
     "falkordb",
+    # Same reason: the codebase-memory-mcp rule's only input.
+    "codebase_mcp",
 )
 
 # Planes whose retained facts are non-empty even when they could never have fed
 # a rule. For these, "retained facts" is not evidence of a prior posture, so the
 # hold applies only when the retained state could actually have alerted.
-_POSTURE_PLANE_RELEVANT = {"falkordb": _falkordb_could_alert}
+_POSTURE_PLANE_RELEVANT = {
+    "falkordb": _falkordb_could_alert,
+    "codebase_mcp": _codebase_mcp_could_alert,
+}
 
 
 def _infra_unverifiable_planes(profile: dict) -> list[str]:
@@ -966,9 +1020,19 @@ async def _check_infra_protection_posture(db) -> None:
             content = (
                 f"Infra protection posture: {len(missing)} protection(s) "
                 f"missing on this install (profile collected {collected_at}): "
-                f"{details}. Each missing protection removes a crash-resilience "
-                f"guarantee this box relies on (2026-07 incident class)."
+                f"{details}."
             )
+            if any(slug not in _INFRA_POSTURE_TOOLING_SLUGS for slug in missing):
+                content += (
+                    " Each missing protection removes a crash-resilience "
+                    "guarantee this box relies on (2026-07 incident class)."
+                )
+            tooling = [slug for slug in missing if slug in _INFRA_POSTURE_TOOLING_SLUGS]
+            if tooling:
+                content += (
+                    f" {', '.join(tooling)}: a developer-tooling gap, not a "
+                    f"crash-resilience one."
+                )
             if unverifiable:
                 content += (
                     f" Additionally unverifiable (section collector failing, "
@@ -2938,9 +3002,59 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
 # last severity stored, so we fire on a NEW scope or an ESCALATION (degraded→error)
 # but suppress a same-or-LOWER severity within the window — no storm, no A→B→A
 # oscillation flood, and no alert announcing a de-escalation (an improvement).
-_last_pid_alerts: dict[str | None, tuple[int, float]] = {}
+# scope -> (severity rank, monotonic time of the last alert, resolved since?).
+_last_pid_alerts: dict[str | None, tuple[int, float, bool]] = {}
+# Indirection so tests can drive the cooldown clock without patching
+# time.monotonic, which the asyncio event loop itself reads.
+_pid_clock = time.monotonic
 _PID_BUDGET_ALERT_COOLDOWN_S = 3600  # one alert per scope per hour unless it escalates
 _PID_SEVERITY_RANK = {"degraded": 1, "error": 2}
+# Resolve an open alert only once utilization is clearly back down: the alert
+# fires at 80% (the collector's degraded threshold), and resolving anywhere
+# under 80% would close and reopen it on every tick of a load hovering at the
+# line. 5 points of hysteresis.
+_PID_RESOLVE_PCT = 75.0
+
+
+async def _resolve_pid_budget_alert(db, pct: float | None) -> None:
+    """Resolve open PID-budget alerts on a healthy tick below _PID_RESOLVE_PCT.
+
+    Keeps a peak from an earlier tick from reading as a current condition (the
+    morning report shows the live figure beside it). No in-memory guard: an
+    alert written before a restart or deploy must resolve too, so the store is
+    asked. A read-only probe gates the write, so a healthy tick with nothing
+    open writes nothing. A resolve that closed rows marks every scope's cooldown
+    as resolved: a new degradation then re-alerts after a quarter of the
+    cooldown instead of the full hour, while load oscillating around the line
+    still cannot alert every other tick.
+    ``pct`` None (no finite sub-cap visible) is resolvable.
+    """
+    global _last_pid_alerts  # noqa: PLW0603
+    if db is None or (pct is not None and pct >= _PID_RESOLVE_PCT):
+        return
+    try:
+        if not await observations.has_unresolved_matching(
+            db, source="pid_budget_monitor", content_like="%"
+        ):
+            return
+        note = (
+            "PID budget healthy: no sub-cap visible"
+            if pct is None
+            else f"PID budget back below {_PID_RESOLVE_PCT:.0f}%"
+        )
+        resolved = await observations.resolve_by_source_and_type(
+            db,
+            source="pid_budget_monitor",
+            type="infrastructure_alert",
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes=note,
+        )
+    except Exception:
+        logger.debug("Failed to resolve pid_budget alert observation", exc_info=True)
+        return
+    if resolved:
+        _last_pid_alerts = {s: (v[0], v[1], True) for s, v in _last_pid_alerts.items()}
+        logger.info("PID budget healthy again: resolved %d alert observation(s)", resolved)
 
 
 async def _check_pid_budget(db, budget: dict | None = None) -> None:
@@ -2951,8 +3065,9 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
     read green (the blind spot this closes). The collector walks the cgroup chain and
     reports whichever level binds (session scope / user slice / container root); this
     emits a scope-matched remedy at degraded (>=80%) -> 'high'; error (>=90%) ->
-    'critical'. Fork-free cgroup read; best-effort — never raises into the tick.
-    `budget` may be injected (tests); otherwise it reads live."""
+    'critical'. A later HEALTHY read below _PID_RESOLVE_PCT resolves any open alert
+    (see `_resolve_pid_budget_alert`). Fork-free cgroup read; best-effort — never raises
+    into the tick. `budget` may be injected (tests); otherwise it reads live."""
     global _last_pid_alerts  # noqa: PLW0603
     try:
         if budget is None:
@@ -2964,19 +3079,46 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
         return
 
     status = budget.get("status")
+    if status == "healthy":
+        # Only a definite healthy read resolves; unavailable/unknown never does.
+        await _resolve_pid_budget_alert(db, budget.get("pct"))
+        return
     if status not in ("degraded", "error"):
-        return  # healthy / no sub-cap (pids.max="max") / unavailable → nothing to alert
+        return  # unavailable / unknown → nothing to alert, nothing to resolve
+    # Record WHO holds the budget on every low tick, cooldown or not: the holders
+    # may be gone by the next alert, and the count alone cannot name them.
+    breakdown = None
+    if budget.get("path"):
+        from genesis.observability import pid_breakdown
+
+        try:
+            try:
+                breakdown = await asyncio.to_thread(pid_breakdown.snapshot_for, budget)
+            except RuntimeError:
+                # No worker thread could start: the budget itself is exhausted,
+                # the tick this exists for. The collector's finite work limits
+                # also apply inline. (The executor queued the work before failing
+                # to start a thread, so a later worker may take a second,
+                # harmless snapshot file.)
+                breakdown = pid_breakdown.snapshot_for(budget)
+        except Exception:
+            logger.warning("pid budget breakdown could not run", exc_info=True)
     scope = budget.get("scope")
-    now = time.monotonic()
+    now = _pid_clock()
     # Per-scope cooldown with escalation bypass: fire when the scope is new, its
     # window expired, or it ESCALATED to a higher severity; suppress a same-or-lower
     # severity within the window — that covers a repeat, an A→B→A oscillation (each
     # scope cools independently), AND a de-escalation error→degraded (never alert
     # because things improved).
+    # After a resolve the scope's window shrinks to a quarter of the cooldown: a
+    # fresh episode is news, but a load swinging across the line every tick must
+    # still not alert every other tick (critical at >=90%).
     rank = _PID_SEVERITY_RANK[status]
     prev = _last_pid_alerts.get(scope)
-    if prev is not None and (now - prev[1]) < _PID_BUDGET_ALERT_COOLDOWN_S and rank <= prev[0]:
-        return
+    if prev is not None and rank <= prev[0]:
+        window = _PID_BUDGET_ALERT_COOLDOWN_S / 4 if prev[2] else _PID_BUDGET_ALERT_COOLDOWN_S
+        if (now - prev[1]) < window:
+            return
     if db is None:
         return  # can't write the observation now; retry next tick (cooldown not consumed)
     pct = budget.get("pct")
@@ -3018,7 +3160,7 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
     # Set before the await so a failed create still cools per-tick retries for the
     # same scope+severity. Prune scopes older than the cooldown to bound the map
     # (the server's own chain is a small fixed set, but keep it tidy regardless).
-    _last_pid_alerts[scope] = (rank, now)
+    _last_pid_alerts[scope] = (rank, now, False)
     _last_pid_alerts = {
         s: v for s, v in _last_pid_alerts.items() if now - v[1] < _PID_BUDGET_ALERT_COOLDOWN_S
     }
@@ -3032,6 +3174,13 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
                 f"{where} at {pct:.0f}% ({current}/{maximum} tasks). When it fills, new "
                 f"processes fail with 'Cannot fork' even though memory/CPU/disk are fine. "
                 f"Each Claude Code session spawns MCP subprocess trees. {remedy}"
+                + (f" {breakdown['text']}" if breakdown else "")
+                + (
+                    " Full breakdown: "
+                    + str(breakdown["file"]).encode("utf-8", "backslashreplace").decode("utf-8")
+                    if breakdown and breakdown.get("file")
+                    else ""
+                )
             ),
             priority=priority,
             created_at=datetime.now(UTC).isoformat(),

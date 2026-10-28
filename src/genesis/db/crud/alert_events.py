@@ -31,15 +31,22 @@ async def reconcile_open_set(
     *,
     active: list[dict],
     now: str,
+    resolution_reasons: dict[str, str] | None = None,
+    preserve_ids: set[str] | None = None,
 ) -> dict[str, int]:
     """Reconcile the durable open-set against the currently-firing ``active`` alerts.
 
     ``active`` is a list of ``{alert_id, source, severity, message}`` dicts.
     Opens rows for newly-firing alerts (idempotent via the partial unique
     index) and resolves any open row whose ``alert_id`` is no longer firing.
+    ``preserve_ids`` excludes unknown measurements from closure without
+    creating incidents or changing an existing episode's metadata.
     Returns ``{"opened": n, "resolved": n}``.
     """
     active_ids = [a["alert_id"] for a in active]
+    retained_ids = set(active_ids) | (preserve_ids or set())
+    if any(reason not in {"healthy", "disabled"} for reason in (resolution_reasons or {}).values()):
+        raise ValueError("invalid alert resolution reason")
 
     opened = 0
     for a in active:
@@ -58,12 +65,22 @@ async def reconcile_open_set(
         )
         opened += cursor.rowcount or 0
 
-    if active_ids:
-        placeholders = ",".join("?" for _ in active_ids)
+    # Persist closure and cause in the SAME statement. A later sample or
+    # process restart must not reinterpret deliberate disablement as recovery.
+    resolved = 0
+    for alert_id, reason in (resolution_reasons or {}).items():
+        if alert_id not in retained_ids:
+            cursor = await db.execute(
+                "UPDATE alert_events SET resolved_at=?, resolution_reason=? "
+                "WHERE alert_id=? AND resolved_at IS NULL", (now, reason, alert_id),
+            )
+            resolved += cursor.rowcount or 0
+    if retained_ids:
+        placeholders = ",".join("?" for _ in retained_ids)
         cursor = await db.execute(
             f"UPDATE alert_events SET resolved_at = ? "  # noqa: S608 - placeholders are bound params
             f"WHERE resolved_at IS NULL AND alert_id NOT IN ({placeholders})",
-            (now, *active_ids),
+            (now, *retained_ids),
         )
     else:
         # nothing firing → resolve every open row
@@ -71,7 +88,7 @@ async def reconcile_open_set(
             "UPDATE alert_events SET resolved_at = ? WHERE resolved_at IS NULL",
             (now,),
         )
-    resolved = cursor.rowcount or 0
+    resolved += cursor.rowcount or 0
 
     await db.commit()
     return {"opened": opened, "resolved": resolved}

@@ -7,7 +7,7 @@
 # All PII-bearing payloads are GPG-encrypted with GENESIS_BACKUP_PASSPHRASE.
 #
 # Backs up: SQLite DB, Qdrant snapshots, CC transcripts, auto-memory,
-# local config overlays, secrets.
+# local config overlays, secrets, credentials and the card vault (§8).
 #
 # Restore via scripts/restore.sh or `python -m genesis restore`.
 #
@@ -48,6 +48,14 @@ fi
 # Pluggable Tier-2 (off-site) backend interface — selects none/local/smb at runtime
 # (backward-compat: a configured GENESIS_BACKUP_NAS with no selector → smb).
 _SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Test fence first (sourced): this script acts on ${GENESIS_DIR:-$HOME/genesis},
+# and the refusal must precede the lock open and status writes below — so
+# GENESIS_DIR resolves here, not at its old later site. No-op unless the
+# suite-wide fence arms GENESIS_TEST_FENCE_LIVE_ROOTS.
+GENESIS_DIR="${GENESIS_DIR:-$HOME/genesis}"
+# shellcheck source=scripts/lib/live_system_guard.sh
+source "$_SCRIPT_DIR/lib/live_system_guard.sh"
+refuse_if_test_fenced_live "$GENESIS_DIR" || exit 97
 # shellcheck source=scripts/lib/backup_backends.sh
 source "$_SCRIPT_DIR/lib/backup_backends.sh"
 # Durable alert queue (F.3): if a Telegram alert can't send, persist it so the
@@ -79,7 +87,17 @@ fi
 # pre-deploy backup while update.sh prints "Backup complete".
 # shellcheck source=scripts/lib/dr_lock.sh
 source "$_SCRIPT_DIR/lib/dr_lock.sh"
-_GENESIS_HOME="${GENESIS_HOME:-$HOME/.genesis}"
+# Absolute from the start: §8 runs after `cd "$BACKUP_DIR"`, so a relative
+# GENESIS_HOME would otherwise resolve against the backups clone. -s keeps a
+# symlinked component as written, so the card vault step can still refuse a
+# symlinked vault directory (#3245 tracks where GENESIS_HOME is read from). A
+# leading ~ is expanded first, as the runtime's Path.expanduser does: the lib is
+# sourced here, before any cd, so its home rule is the one both scripts use.
+# shellcheck source=scripts/lib/backup_core_paths.sh
+source "$_SCRIPT_DIR/lib/backup_core_paths.sh"
+_GENESIS_HOME="$(realpath -s -m -- "$(_backup_core_home)")"
+# This legacy derivation can select a different path from the raw lock home.
+refuse_if_test_fenced_live "$_GENESIS_HOME" || exit 97
 _STATUS_FILE="$_GENESIS_HOME/backup_status.json"
 _RUN_ID="${GENESIS_BACKUP_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 _TRIGGER="${GENESIS_BACKUP_TRIGGER:-timer}"
@@ -125,6 +143,9 @@ _extras_gap_fingerprint() {
     } | LC_ALL=C sort -u | sha1sum | cut -c1-12
 }
 _SECRETS_OK=false
+_PV_STATUS="skipped"   # card vault in §8: ok/failed/absent/missing/skipped (see payment_vault_backup.sh)
+_PV_ARCHIVED=""        # §8's ok archive: "<key file> <recipient>" (payment_vault_backup.sh)
+_PV_COPIES=null        # pre-migrate vault copies still beside the vault at the end of the run
 _SUCCESS=false
 _FAILURE_REASON=""
 _FAILURE_CLASS="none"
@@ -171,7 +192,7 @@ _write_status() {
     if [ $((${_EXTRA_SKIPPED:-0} + ${_EXTRA_UPLOAD_FAILED:-0} + ${_EXTRA_PARTIAL:-0})) -gt 0 ]; then _extras_complete=false; fi
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_dirs_partial":${_EXTRA_PARTIAL:-0},"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"offsite_core_complete":$_offsite_core_complete,"extras_complete":$_extras_complete,"extras_gap":"$_extras_gap","offsite_core_alerted":${_ALERTED_CORE:-false},"extras_alerted_gap":"${_ALERTED_GAP:-}","tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_dirs_partial":${_EXTRA_PARTIAL:-0},"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"payment_vault":"${_PV_STATUS:-skipped}","payment_vault_copies":${_PV_COPIES:-null},"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"offsite_core_complete":$_offsite_core_complete,"extras_complete":$_extras_complete,"extras_gap":"$_extras_gap","offsite_core_alerted":${_ALERTED_CORE:-false},"extras_alerted_gap":"${_ALERTED_GAP:-}","tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
 STATUSEOF
 }
 
@@ -219,14 +240,15 @@ _on_exit() {
 }
 trap _on_exit EXIT
 
-GENESIS_DIR="${GENESIS_DIR:-$HOME/genesis}"
+# GENESIS_DIR resolved at the top of the script, before the test-fence check.
 BACKUP_DIR="$HOME/backups/genesis-backups"
 # Derive CC project dir from genesis dir path (CC convention: / → -)
 _CC_PROJECT_ID=$(echo "$GENESIS_DIR" | tr '/' '-')
 MEMORY_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}/memory"
 TRANSCRIPT_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}"
-# shellcheck source=scripts/lib/backup_core_paths.sh
-source "$_SCRIPT_DIR/lib/backup_core_paths.sh"
+# (backup_core_paths.sh is sourced above, before _GENESIS_HOME.)
+# shellcheck source=scripts/lib/payment_vault_backup.sh
+source "$_SCRIPT_DIR/lib/payment_vault_backup.sh"
 SECRETS_FILE="${SECRETS_PATH:-$GENESIS_DIR/secrets.env}"
 QDRANT_URL="${QDRANT_URL:-http://localhost:6333}"
 LOG_PREFIX="[genesis-backup]"
@@ -890,6 +912,12 @@ else
             # core path out of the way; the core backup already covers it.
             _extra_skip "overlaps $_core_hit, which the core backup restores" "$_d"
             continue
+        else
+            _core_rc=$?
+            if [ "$_core_rc" -ne 1 ]; then
+                _extra_skip "core path separation could not be established" "$_d"
+                continue
+            fi
         fi
         _dup=""
         for _prev in "${_extra_abs_seen[@]+"${_extra_abs_seen[@]}"}"; do
@@ -966,7 +994,7 @@ else
         if _tar_root_err="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.err 2>/dev/null)"; then
             _EXTRA_TAR_ERR="$_tar_root_err"
             _tar_root="$(python3 "$_SCRIPT_DIR/lib/extra_restore.py" verify "$_tar_tmp" "$GENESIS_BIG_TMP" 2>"$_tar_root_err")" || _tar_verify_rc=$?
-            _tar_root_why="$(head -c 300 "$_tar_root_err" | tr '\n' ' ')"
+            _tar_root_why="$(cat "$_tar_root_err")"
             rm -f "$_tar_root_err"
             _EXTRA_TAR_ERR=""
         else
@@ -1202,6 +1230,37 @@ if $_ENCRYPT_READY; then
         fi
     done
     log "Creds: $_CREDS_COUNT files (encrypted)"
+    # The card vault → creds/payment_vault.tar.gpg (scripts/lib/payment_vault_backup.sh).
+    # A failure or a vanished vault fails the run like a Qdrant gap: the rest of
+    # the backup still lands, and update.sh continues degraded on non_db.
+    # What the archive holds is recorded by the step itself: the copies
+    # `vault migrate` kept are deleted after the push only for THAT set.
+    _PV_RECORD="$GENESIS_BIG_TMP/.payment_vault_record.$$"
+    rm -f -- "$_PV_RECORD" 2>/dev/null || true
+    _PV_OUT="$(PAYMENT_VAULT_RECORD="$_PV_RECORD" backup_payment_vault \
+        "$_GENESIS_HOME/payment_vault" creds "$GENESIS_BIG_TMP")" \
+        || _PV_OUT="failed the vault step aborted"
+    if [ -f "$_PV_RECORD" ] && [ ! -L "$_PV_RECORD" ]; then
+        _PV_ARCHIVED="$(head -n 1 "$_PV_RECORD" 2>/dev/null)" || _PV_ARCHIVED=""
+    fi
+    rm -f -- "$_PV_RECORD" 2>/dev/null || true
+    read -r _PV_STATUS _PV_WHY <<< "$_PV_OUT"
+    case "$_PV_STATUS" in
+        ok | absent | missing | failed) ;;
+        *) _PV_STATUS="failed"; _PV_WHY="the vault step returned no known state" ;;
+    esac
+    if [ "$_PV_STATUS" = ok ]; then
+        log "Payment vault: 1 archive (encrypted)"
+    elif [ "$_PV_STATUS" = absent ]; then
+        log "Payment vault: none"
+    else
+        _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }payment vault backup $_PV_STATUS: ${_PV_WHY:-no reason given} (any earlier backed-up set is kept)"
+        if [ "$_FAILURE_CLASS" = "none" ]; then
+            _FAILURE_CLASS="non_db"
+            _FAILURE_STAGE="payment_vault"
+        fi
+        log "WARNING: payment vault backup $_PV_STATUS: ${_PV_WHY:-no reason given}"
+    fi
 else
     log "WARNING: GENESIS_BACKUP_PASSPHRASE not set — skipping creds backup (refusing plaintext)"
 fi
@@ -1400,13 +1459,21 @@ else
 
     # Upload creds (encrypted credential + wiring files) so the COMPLETE snapshot
     # genuinely includes them — a no-git fresh box pulls them from here (restore
-    # §8). One level of nesting: creds/*.gpg + creds/ssh/*.gpg; a failed upload of
-    # a present file flips _T2_OK, same contract as the payloads above.
+    # §8). One level of nesting: creds/*.gpg + creds/ssh/*.gpg (the card vault is
+    # the flat creds/payment_vault.tar.gpg); a failed upload of a present file
+    # flips _T2_OK, same contract as the payloads above.
     if [ -d creds ]; then
         backend_mkdir "${_T2_DIR}/creds"
         [ -d creds/ssh ] && backend_mkdir "${_T2_DIR}/creds/ssh"
         while IFS= read -r -d '' f; do
             rel="${f#creds/}"
+            # The clone keeps the last good vault archive when this run's vault step
+            # did not succeed. The snapshot carries it under another name, so it is
+            # never presented as this run's vault, and never lost to GFS pruning of
+            # the earlier snapshot that holds it; COMPLETE records the gap.
+            if [ "$rel" = "$PAYMENT_VAULT_ARCHIVE" ] && [ "$_PV_STATUS" != ok ]; then
+                rel="$PAYMENT_VAULT_LAST_GOOD"
+            fi
             if backend_put "$f" "${_T2_DIR}/creds/${rel}"; then
                 log "  off-site: uploaded creds/${rel}"
             else
@@ -1436,6 +1503,10 @@ else
             for _n in "${_EXTRA_PARTIAL_LABELS[@]+"${_EXTRA_PARTIAL_LABELS[@]}"}"; do
                 printf 'partial %s\n' "$_n"
             done
+            case "$_PV_STATUS" in
+                ok | absent) ;;
+                *) printf 'payment_vault %s\n' "$_PV_STATUS" ;;
+            esac
         } > "$_T2_MARKER"
         if ! backend_put "$_T2_MARKER" "${_T2_DIR}/COMPLETE"; then
             log "WARNING: off-site upload failed for COMPLETE marker — snapshot unusable for restore"
@@ -1532,6 +1603,13 @@ if ! grep -qx '.extra-manifest' .gitignore 2>/dev/null; then
     printf '.extra-manifest\n.extra-manifest.tmp\n' >> .gitignore
     log "Added .extra-manifest to the .gitignore exclusions"
 fi
+# The card vault's staging names (§8): a run killed between copy and rename must
+# never commit a half-written set.
+if ! grep -qx 'creds/\*\*/\.\*\.tmp' .gitignore 2>/dev/null; then
+    if [ -s .gitignore ] && [ -n "$(tail -c1 .gitignore)" ]; then printf '\n' >> .gitignore; fi
+    printf 'creds/**/.*.tmp\n' >> .gitignore
+    log "Added the credential staging names to the .gitignore exclusions"
+fi
 
 # --- Commit and push (Tier 1 only) ---
 log "Committing backup..."
@@ -1570,6 +1648,23 @@ else
         log "ERROR: git commit failed — repository may need re-clone from remote"
     fi
 fi
+
+# The copies `vault migrate` kept beside the vault hold every card it had, and
+# its unsealed key opens them: deleted once this run's archive of the migrated
+# vault (identity.key, that recipient) is on the backups remote
+# (scripts/lib/payment_vault_backup.sh). Never fails the run.
+read -r _PV_ARCH_KEY _PV_ARCH_RECIPIENT <<< "${_PV_ARCHIVED:-}" || true
+if [ "$_PV_STATUS" = ok ] && [ "$_TIER1_PUSHED" = true ] \
+    && [ "${_PV_ARCH_KEY:-}" = identity.key ] && [ -n "${_PV_ARCH_RECIPIENT:-}" ]; then
+    _PV_DROP="$(payment_vault_drop_copies "$_GENESIS_HOME/payment_vault" "$_PV_ARCH_RECIPIENT")" \
+        || _PV_DROP=""
+    read -r _PV_DELETED _PV_LEFT <<< "${_PV_DROP:-0 0}" || true
+    if [ "${_PV_DELETED:-0}" != 0 ] || [ "${_PV_LEFT:-0}" != 0 ]; then
+        log "Payment vault: pre-migrate copies: ${_PV_DELETED:-0} deleted, ${_PV_LEFT:-0} left (not a plain copy of this vault)"
+    fi
+fi
+_PV_COPIES="$(payment_vault_count_copies "$_GENESIS_HOME/payment_vault")" || _PV_COPIES=null
+case "$_PV_COPIES" in '' | *[!0-9]*) _PV_COPIES=null ;; esac
 
 if [ "$_SQLITE_LINES" -gt 0 ] && [ "$_SQLITE_BACKUP_VERIFIED" = "true" ] \
     && [ -z "$_FAILURE_REASON" ]; then

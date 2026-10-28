@@ -112,7 +112,7 @@ over.
   push spellings keep their ask; the guarantee that no branch stays public
   unchecked is the server-side leak scan on branch pushes, not this hook. A
   branch that is not ready for a PR stays committed locally, unpushed. Full
-  rule and what it does not model: the genesis-development SKILL, "A FIRST
+  rule and what it does not model: the build-session SKILL, "A FIRST
   push of the CURRENT branch".
 - `gh pr create` — a create only publishes code in the **implicit** form (no
   `--head`), where gh may *push* (and can fork) the current branch when it isn't

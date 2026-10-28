@@ -2394,10 +2394,11 @@
         },
 
         async dismissUpdate() {
-          // A record that still guards unactivated code: dismissing it lets
+          // A record that still guards (unactivated code, a half-written
+          // checkout, or a record that cannot be read): dismissing it lets
           // code-only deploys and the live engine restart onto the checkout.
           if (this.updateProgress?.guards && !(await this.showConfirm("Dismiss update record",
-            "An earlier update merged code it has not activated (or its record cannot be read).\n\nDismissing it lets code-only deploys restart onto the checkout as it stands. Dismiss anyway?"))) return;
+            "An earlier update has not finished: it merged code it has not activated, left the checkout half-written (on live, scripts/deploy_candidates repair-move puts that back; Dismiss does not), or its record cannot be read.\n\nDismissing it lets code-only deploys restart onto the checkout as it stands. Dismiss anyway?"))) return;
           try {
             await fetchApi("/api/genesis/updates/dismiss", { method: "POST" });
             this.updateProgress = {};
@@ -3313,11 +3314,14 @@
               headers: {'Content-Type': 'application/json'},
               body: JSON.stringify({ action }),
             });
-            if (resp && resp.ok) {
-              await this.fetchSchedulerData();
+            const data = resp ? await resp.json() : null;
+            if (!resp?.ok || data?.success !== true) {
+              alert(data?.error || "User job action failed. Check the current job status and retry.");
             }
           } catch (e) {
-            console.warn("User job action failed:", e);
+            alert("User job action failed. Check the current job status and retry.");
+          } finally {
+            await this.fetchSchedulerData();
           }
         },
 
@@ -4007,7 +4011,7 @@
           // Fallback is more specific than the rate-limit that triggered it, so it
           // takes precedence over the RATE_LIMITED/THROTTLED branch below.
           if (cc.fallback?.is_fallback) {
-            return { state: "fallback", reason: `running on ${cc.fallback.fallback || 'a roster peer'} (Claude ${(cc.fallback.reason || 'unavailable').replace(/_/g, ' ')})` };
+            return { state: "fallback", reason: `last fallback: ${cc.fallback.fallback || 'a roster peer'} (home model ${(cc.fallback.reason || 'unavailable').replace(/_/g, ' ')})` };
           }
           if (rt === "RATE_LIMITED" || rt === "THROTTLED") {
             return { state: "degraded", reason: `CC is ${rt.toLowerCase().replace('_', '-')}` };
@@ -5009,6 +5013,9 @@
           }
           if (this.updateStatus?.last_update?.status === "rolled_back" || this.updateStatus?.last_update?.status === "failed") {
             items.push({ level: "warning", title: "Last update failed", detail: this.updateStatus.last_update.failure_reason || "check Backup & Updates tab", href: "#update-section", tab: "backup", anchor: "update-section" });
+          }
+          if (this.updateStatus?.last_update?.status === "crashed_recovered") {
+            items.push({ level: "warning", title: "Last update crashed (recovered by bootstrap)", detail: this.updateStatus.last_update.failure_reason || "check Backup & Updates tab", href: "#update-section", tab: "backup", anchor: "update-section" });
           }
           for (const [name, state] of Object.entries(this.fetchState)) {
             if (state.state === "stale" || state.state === "error") {

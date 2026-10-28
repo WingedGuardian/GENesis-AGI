@@ -280,6 +280,9 @@ class LiteLLMDelegate:
                 cache_read_tokens=cache_read,
                 cost_usd=cost,
                 cost_known=cost_known,
+                served_model=(
+                    response.model if isinstance(getattr(response, "model", None), str) else None
+                ),
             )
         except TimeoutError:
             # Hard wall-clock cap fired — the provider hung past hard_timeout.
@@ -398,19 +401,24 @@ def _build_model_string(cfg: ProviderConfig) -> str:
     return cfg.model_id
 
 
+def api_key_env_names(provider_type: str) -> tuple[str, str, str]:
+    """Return the environment variable names checked for a provider API key."""
+    service = provider_type.upper()
+    return (
+        f"API_KEY_{service}",
+        f"{service}_API_KEY",
+        f"{service}_API_TOKEN",
+    )
+
+
 def _resolve_api_key(provider_type: str) -> str | None:
     """Resolve API key from environment variables.
 
     Checks three naming patterns for flexibility:
     API_KEY_{SERVICE}, {SERVICE}_API_KEY, {SERVICE}_API_TOKEN
     """
-    service = provider_type.upper()
-    for pattern in [
-        f"API_KEY_{service}",
-        f"{service}_API_KEY",
-        f"{service}_API_TOKEN",
-    ]:
-        val = os.environ.get(pattern)
+    for name in api_key_env_names(provider_type):
+        val = os.environ.get(name)
         if val and val not in ("None", "NA", ""):
             return val
     return None

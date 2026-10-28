@@ -1,13 +1,17 @@
-"""``python -m genesis vault``: create the card vault and add, list or retire cards.
+"""``python -m genesis vault``: create the card vault, add, list or retire cards,
+and migrate a vault made with a passphrase.
 
-The commands that read a secret (init, add, retire) run only in the owner's own
-terminal: both stdin and stdout must be a TTY, and they refuse inside a coding
-agent's session (Claude Code or Codex markers set). That is an accident guard, so a session
-never ends up holding a card number or the passphrase; it is not a boundary
+The vault has no passphrase (owner ruling a4a95392): its key is a 0600 file
+that genesis-server loads at start, and what releases a card is the owner's
+Telegram tap, every payment. The commands that read a secret or change the
+vault (init, add, retire, migrate) run only in the owner's own terminal: both
+stdin and stdout must be a TTY, and they refuse inside a coding agent's session
+(Claude Code or Codex markers set). That is an accident guard, so a session
+never ends up holding a card number or the old passphrase; it is not a boundary
 against a process that controls its own environment. Secrets are read with
 ``getpass`` and never echoed: a terminal that cannot hide input is refused,
 not answered in the clear. ``list`` and ``status`` show nothing secret and run
-anywhere.
+anywhere. ``unlock`` and ``lock`` are retired and say so.
 """
 
 from __future__ import annotations
@@ -17,10 +21,19 @@ import getpass
 import importlib.util
 import json
 import os
+import socket
+import subprocess
 import sys
 import warnings
 
+from genesis.env import vault_socket_path
+from genesis.payments import vault_migrate as vm
 from genesis.payments import vault_store as vs
+
+# A status answer is quick; one missing after 30 s means the server is wedged,
+# and the owner's terminal must not hang on it.
+_SERVICE_TIMEOUT_S = 30.0
+_MAX_REPLY = 64 * 1024  # a status reply is a few hundred bytes
 
 
 def _interactive() -> bool:
@@ -57,7 +70,7 @@ def _ask(prompt: str) -> str:
             raise vs.VaultError("cancelled; nothing was saved") from None
 
 
-def _owner_terminal(command: str) -> bool:
+def _owner_terminal(command: str, *, needs_crypto: bool = True) -> bool:
     if any(os.environ.get(name) for name in _AGENT_SESSION_MARKERS):
         print(
             f"vault {command}: refused inside a coding agent's session; "
@@ -68,8 +81,8 @@ def _owner_terminal(command: str) -> bool:
     if not _interactive():
         print(f"vault {command}: needs an interactive terminal.", file=sys.stderr)
         return False
-    missing = [m for m in ("pyrage", "zxcvbn") if importlib.util.find_spec(m) is None]
-    if missing:
+    missing = [m for m in ("pyrage",) if importlib.util.find_spec(m) is None]
+    if missing and needs_crypto:
         print(
             f"vault {command}: missing {', '.join(missing)}; install the payments extra "
             "(pip install -e '.[payments]').",
@@ -79,20 +92,97 @@ def _owner_terminal(command: str) -> bool:
     return True
 
 
+def _service(request: dict) -> dict | None:
+    """One request to the vault service; None when it is not running."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(_SERVICE_TIMEOUT_S)
+            conn.connect(str(vault_socket_path()))
+            conn.sendall((json.dumps(request) + "\n").encode())
+            reply = b""
+            while not reply.endswith(b"\n"):
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                reply += chunk
+                if len(reply) > _MAX_REPLY:
+                    raise vs.VaultError("the vault service sent an oversized reply")
+    except (FileNotFoundError, ConnectionRefusedError):
+        return None
+    except OSError as exc:
+        raise vs.VaultError(f"the vault service did not answer ({type(exc).__name__})") from None
+    try:
+        return json.loads(reply)
+    except ValueError:
+        raise vs.VaultError("the vault service sent an unreadable reply") from None
+
+
+_NOT_RUNNING = "the vault service is not running (it runs inside genesis-server)"
+_OLD_SERVER = (
+    "genesis-server may be running code from before the vault lost its passphrase: its "
+    "credential mirror would copy the unsealed key's backup to the host. Restart it "
+    "(scripts/deploy_code_only.sh restart) and run this again"
+)
+
+
+def _require_current_server() -> None:
+    """Refuse unless genesis-server runs code that keeps the vault off the host mirror.
+
+    A server on older code mirrors every ``creds/*.gpg``, the vault's archive
+    included, and the key in that archive is now unsealed. Proven current: its
+    status reply carries ``loaded_at``. Proven absent: no vault socket and the
+    unit is not active (it will start on this code). Anything else refuses.
+    """
+    svc = _service({"op": "status"})
+    if isinstance(svc, dict) and svc.get("ok") and "loaded_at" in svc:
+        return
+    if svc is None and not _server_unit_active():
+        return
+    raise vs.VaultError(_OLD_SERVER)
+
+
+def _server_unit_active() -> bool:
+    """Whether the genesis-server unit is active. No systemctl (an install without
+    a user systemd) means no such unit; an unanswered query counts as active."""
+    try:
+        cmd = ["systemctl", "--user", "is-active", "--quiet", "genesis-server"]
+        return subprocess.run(cmd, timeout=10, check=False).returncode == 0
+    except OSError:
+        return False
+    except subprocess.TimeoutExpired:
+        return True
+
+
+def _cmd_unlock(args: argparse.Namespace) -> int:
+    print(f"vault unlock: {vm.RETIRED}")
+    return 0
+
+
+def _cmd_lock(args: argparse.Namespace) -> int:
+    print(f"vault lock: {vm.RETIRED}; nothing was locked", file=sys.stderr)
+    return 2
+
+
 def _cmd_init(args: argparse.Namespace) -> int:
     if not _owner_terminal("init"):
         return 2
     try:
         vs.check_can_init()
-        first = _ask("New vault passphrase: ")
-        if first != _ask("Repeat it: "):
-            raise vs.VaultError("the passphrases differ; nothing was created")
-        vs.init_vault(first)
+        _require_current_server()
+        vs.init_vault()
     except vs.VaultError as exc:
         print(f"vault init: {exc}", file=sys.stderr)
         return 2
     print(f"vault created at {vs.vault_dir()}")
+    print(_BACKUP_HINT)
     return 0
+
+
+# The 6-hourly backup carries the vault (backup.sh §8); a change made now is not
+# in any backup until then.
+_BACKUP_HINT = (
+    "back it up now with scripts/backup.sh (otherwise the next scheduled backup takes it)"
+)
 
 
 def _cmd_add(args: argparse.Namespace) -> int:
@@ -125,6 +215,7 @@ def _cmd_add(args: argparse.Namespace) -> int:
         print(f"vault add: {exc}", file=sys.stderr)
         return 2
     print(f"added {ref} ({stored['brand']} ending {stored['last4']})")
+    print(_BACKUP_HINT)
     return 0
 
 
@@ -156,7 +247,7 @@ def _cmd_retire(args: argparse.Namespace) -> int:
     try:
         vs.check_ready()
         vs.check_active_card(args.card_ref)
-        vs.retire_card(args.card_ref, _ask("Vault passphrase: "))
+        vs.retire_card(args.card_ref)
     except vs.VaultError as exc:
         print(f"vault retire: {exc}", file=sys.stderr)
         return 2
@@ -164,14 +255,79 @@ def _cmd_retire(args: argparse.Namespace) -> int:
         f"retired {args.card_ref}; its encrypted details were removed from the vault "
         "(best effort on disk: also close the virtual card with its issuer)"
     )
+    # Until the next backup, a restore would bring the retired card's details back.
+    print(_BACKUP_HINT)
+    print(
+        "earlier backups still hold the card (git history, older snapshots, the host "
+        "archive); see docs/reference/recovery-and-portability-workflow.md"
+    )
+    _warn_copies()
     return 0
+
+
+def _warn_copies() -> None:
+    for copy in vm.pre_migrate_copies():
+        print(
+            f"{copy} (kept by vault migrate) still holds every card it had, and the vault's "
+            "key opens them; a backup that pushes the migrated vault to the backups repo "
+            "deletes it (backup_status.json payment_vault_copies counts any left)"
+        )
+
+
+def _cmd_migrate(args: argparse.Namespace) -> int:
+    if not _owner_terminal("migrate"):
+        return 2
+    try:
+        _require_current_server()
+        state = vm.migration_state()
+        if state is None:
+            print("the vault has no sealed key to migrate; nothing to do")
+            return 0
+        passphrase = (
+            _ask("Vault passphrase (asked this one last time): ") if state == "needed" else None
+        )
+        aside = vm.migrate_vault(passphrase)
+        del passphrase
+    except vs.VaultError as exc:
+        print(f"vault migrate: {exc}", file=sys.stderr)
+        return 2
+    if state == "cleanup":
+        print("removed the sealed identity.age a stopped migration left beside identity.key")
+    else:
+        print("vault migrated: its key is now identity.key (0600, no passphrase)")
+    if aside is not None:
+        print(f"the vault as it was (key still sealed) is kept in {aside}")
+    print(_BACKUP_HINT)
+    _warn_copies()
+    return 0
+
+
+def _service_line(service: dict | None) -> str:
+    if service is None:
+        return "service: not running"
+    if not service.get("ok"):
+        return f"service: {service.get('error', 'no answer')}"
+    if service.get("unlocked"):
+        line = f"service: key loaded since {service.get('loaded_at')}"
+    else:
+        line = f"service: no key loaded ({service.get('ready_error') or 'not initialised'})"
+    if not service.get("audit"):
+        line += " (audit log unavailable: no key is held)"
+    last = service.get("last_event")
+    if last:
+        line += f"; last event: {last['event']} at {last['created_at']}"
+    return line
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
     status = vs.vault_status()
+    try:
+        service = _service({"op": "status"})
+    except vs.VaultError as exc:
+        service = {"ok": False, "error": str(exc)}
     healthy = not status["error"] and all(i["private"] for i in status["files"].values())
     if args.json:
-        print(json.dumps(status, indent=2))
+        print(json.dumps({**status, "service": service}, indent=2))
         return 0 if healthy else 1
     print(
         f"vault: {status['path']} ({'initialised' if status['initialised'] else 'not initialised'})"
@@ -182,6 +338,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
         print(f"cards: {status['cards']['active']} active, {status['cards']['retired']} retired")
     for name, info in status["files"].items():
         print(f"  {name}: {info['mode']}{'' if info['private'] else '  NOT PRIVATE'}")
+    print(_service_line(service))
     return 0 if healthy else 1
 
 
@@ -189,7 +346,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p = subparsers.add_parser("vault", help="Encrypted payment card vault (virtual cards only)")
     sub = p.add_subparsers(dest="vault_command", required=True)
 
-    sub.add_parser("init", help="Create the vault and set its passphrase").set_defaults(
+    sub.add_parser("init", help="Create the vault (its key is a 0600 file)").set_defaults(
         func=_cmd_init
     )
 
@@ -203,9 +360,17 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     lp.add_argument("--json", action="store_true")
     lp.set_defaults(func=_cmd_list)
 
-    rp = sub.add_parser("retire", help="Retire a card and erase its details (needs the passphrase)")
+    rp = sub.add_parser("retire", help="Retire a card and erase its details")
     rp.add_argument("card_ref")
     rp.set_defaults(func=_cmd_retire)
+
+    sub.add_parser(
+        "migrate", help="Unseal a vault made with a passphrase, once (asks for it)"
+    ).set_defaults(func=_cmd_migrate)
+    sub.add_parser("unlock", help="Retired: the key loads at server start").set_defaults(
+        func=_cmd_unlock
+    )
+    sub.add_parser("lock", help="Retired: see `vault unlock`").set_defaults(func=_cmd_lock)
 
     sp = sub.add_parser("status", help="Whether the vault exists, card counts, file modes")
     sp.add_argument("--json", action="store_true")

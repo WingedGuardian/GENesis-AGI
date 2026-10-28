@@ -64,6 +64,10 @@ def _suppressed_awaited_result() -> OutreachResult:
 class OutreachPipeline:
     """Main outreach orchestrator."""
 
+    def channel_configured(self, channel: str) -> bool:
+        """Whether an owner notice has a local adapter and default recipient."""
+        return bool(self._channels.get(channel) and self._recipients.get(channel))
+
     def __init__(
         self,
         governance: GovernanceGate,

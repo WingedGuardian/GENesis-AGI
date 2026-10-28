@@ -470,6 +470,10 @@ const SITE_META = {
         name: 'G. Background', desc: 'Autonomous background sessions for reflections, inbox, and surplus tasks.',
         category: 'core', frequency: 'On demand', costPolicy: 'Subscription',
     },
+    'cc_fallback': {
+        name: 'Fallback', desc: 'Last execution on a configured roster fallback. Readiness checks do not count as completed tasks.',
+        category: 'core', frequency: 'On provider refusal', costPolicy: 'Configured roster (billing varies)',
+    },
     'model_fusion': {
         name: 'Fusion', desc: 'On-demand panel-of-models consult (OpenRouter Fusion) — synthesized verdict plus explicit dissent for high-stakes decisions. Invoked via the deliberate MCP tool.',
         category: 'reasoning', frequency: 'On demand (opt-in)', costPolicy: 'Paid (OpenRouter Fusion)',
@@ -1165,6 +1169,9 @@ function showDetail(item) {
         const runStr = runTime.toLocaleDateString('en-US', {month: 'short', day: 'numeric'})
             + ' ' + runTime.toLocaleTimeString('en-US', {hour12: false, hour: '2-digit', minute: '2-digit'});
         lastRunSection.appendChild(sectionRow('Time', runStr));
+        if (item.id === 'cc_fallback' && typeof item.data.last_run_success === 'boolean') {
+            lastRunSection.appendChild(sectionRow('Outcome', item.data.last_run_success ? 'Succeeded' : 'Failed'));
+        }
         if (item.data.last_run_provider) {
             lastRunSection.appendChild(sectionRow('Provider', item.data.last_run_provider + (item.data.last_run_model ? ' (' + item.data.last_run_model + ')' : '')));
         }
@@ -2057,8 +2064,8 @@ const SUBSYSTEM_GROUPS = {
     },
     contingency: {
         name: 'Contingency', domId: 'sub-contingency',
-        desc: 'Fallback API routing when primary CC providers are unavailable',
-        sites: ['contingency_foreground', 'contingency_micro'],
+        desc: 'Configured roster fallback activity and contingency API routing',
+        sites: ['contingency_foreground', 'contingency_micro', 'cc_fallback'],
     },
     utility: {
         name: 'Utility', domId: 'sub-utility',
@@ -2155,7 +2162,7 @@ function updateSubsystemGrid(data) {
         surplus:     [[3,5],[3,6],[4,6]],
         executor:    [[5,5],[6,5],[5,6],[6,6],[7,6],[6,7],[7,7]],
         outreach:    [[2,7],[3,7]],
-        contingency: [[4,7],[5,7]],
+        contingency: [[4,7],[5,7],[5,8]],
         model_fusion: [[1,8]],
     };
 

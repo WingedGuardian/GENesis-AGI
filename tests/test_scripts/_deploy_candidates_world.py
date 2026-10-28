@@ -302,6 +302,10 @@ class World:
         shutil.copy2(
             SCRIPTS / "lib" / "deploy_marker.sh", self.root / "scripts" / "lib" / "deploy_marker.sh"
         )
+        shutil.copy2(
+            SCRIPTS / "lib" / "live_system_guard.sh",
+            self.root / "scripts" / "lib" / "live_system_guard.sh",
+        )
 
     def plain_shell(
         self, *argv: str, extra_env: list[str] | None = None
