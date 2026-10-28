@@ -67,6 +67,13 @@ _OPERATOR_ONE_OFF = (
     "automatic entry point; a human is present, and some of these must be "
     "able to inspect a suspect database"
 )
+# CI controls that run inside a disposable container and open only their own
+# synthetic fixture database under a scratch root.
+_CI_FIXTURE = (
+    "CI-only control: opens its own synthetic fixture.sqlite3 under a scratch "
+    "root inside a disposable container, never genesis.db — outside the "
+    "admission domain"
+)
 _ALLOWLIST: dict[str, str] = {
     "dev/mw2_classifier_probe.py": _OPERATOR_ONE_OFF,
     "ambient_replay.py": _OPERATOR_ONE_OFF,
@@ -80,6 +87,9 @@ _ALLOWLIST: dict[str, str] = {
     "backfill_session_charters.py": _OPERATOR_ONE_OFF,
     "backfill_session_memories.py": _OPERATOR_ONE_OFF,
     "backfill_source_subsystem.py": _OPERATOR_ONE_OFF,
+    "ci/headlong_monolith_controls.py": _CI_FIXTURE,
+    "ci/headlong_native_bridge.py": _CI_FIXTURE,
+    "ci/headlong_native_controls.py": _CI_FIXTURE,
     "cleanup_fenced_knowledge_units.py": _OPERATOR_ONE_OFF,
     "cleanup_pipeline_noise.py": _OPERATOR_ONE_OFF,
     "cleanup_subsystem_qdrant.py": _OPERATOR_ONE_OFF,
