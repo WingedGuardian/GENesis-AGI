@@ -28,7 +28,10 @@ _HOLD_PARK_S = 3600.0
 
 
 def fingerprint(request) -> str:
-    return hashlib.sha256(json.dumps(asdict(request), sort_keys=True).encode()).hexdigest()
+    fields = asdict(request)
+    if not fields.get("contained_peer"):
+        fields.pop("contained_peer", None)  # Preserve all existing prepared receipts.
+    return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
 
 
 def prepared_metadata(request) -> dict:
@@ -139,12 +142,14 @@ async def run_managed(runner, request, sid: str, cancel: asyncio.Event):
     persistence fails, keep capacity reserved until persistence succeeds.
     """
     from genesis.cc.direct_session import DirectSessionResult
+    from genesis.cc.provider_readiness import isolated_provider
 
     db = runner._session_manager.db
     worker = None
     state, error = "failed", "execution_failed"
     result = DirectSessionResult(session_id=sid)
-    with private_execution():
+    isolation = isolated_provider(contained=True) if request.contained_peer else contextlib.nullcontext()
+    with isolation, private_execution():
         try:
             row = await cc_sessions.get_by_id(db, sid)
             deadline = datetime.fromisoformat(metadata(row)["deadline_at"])

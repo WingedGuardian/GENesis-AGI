@@ -500,10 +500,20 @@ shares the OAuth-compatible readiness helper. `cc_fallback` is a non-routing
 **Fallback** observation in the neural monitor for conversations and managed
 turns; actual committed outcomes, not readiness alone, establish success.
 
+Contained native peer requests take a separate public-context constructor before
+private profile/identity/MCP builders. Explicit tools-free and exact-facade
+invocation modes share owned scopes, helper processes and the receipt deadline.
+The complete managed operation isolates provider observations and private
+diagnostics, while ordinary same-owner work keeps its current behavior. Failed
+drain retains native ownership; no contained transcript pointer is fabricated.
+This primitive does not grant foreign admission; its consumer is separate.
+See `docs/reference/peer-execution.md`.
+
 Ordinary streaming and readiness share final-effective quota classification:
 allowed/warning and explicitly usable overage are not refusals, and a later
 allowed event supersedes a rejection. Result and no-result streaming paths
 preserve usable answers, real refusal health and dropped-output replay guards.
+
 
 ```yaml subsystem-map
 entry: execution-cc
@@ -3660,13 +3670,20 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py]
-verified: 8a62059720cd 2026-10-22
+verified: 6b183f47edce 2026-10-23
 ```
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
 provider/model/outcome. Failed historical attempts render as a warning, not an
 inferred current provider outage. The readiness worker uses the shared
 tool-disabled CC probe without changing its schedule or routing authority.
+
+Explicit private execution marks escaping exceptions without changing their
+types, arguments or causes. Automatic span errors inspect that provenance before
+formatting; the shared execution/span-writer diagnostic filters also cover
+marked causes, contexts and exception groups after the task-local scope exits.
+Ordinary diagnostics remain readable. This covers the named emitters, not every
+logger or unrelated exceptions with copied text and no provenance.
 
 - **payments/**: the encrypted card vault, virtual cards only.
   `python -m genesis vault init|add|list|retire|migrate|status` (`payments/cli.py`);
