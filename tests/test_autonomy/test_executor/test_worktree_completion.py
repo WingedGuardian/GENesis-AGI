@@ -18,7 +18,7 @@ from genesis.db.crud.task_states import create_intake_token
 from tests.test_autonomy.test_executor.test_engine import db as db
 from tests.test_autonomy.test_executor.test_worktree_mgr_stale import repo as repo
 
-TASK = "abcdef1234567890"
+TASK = "completion-fixture"
 BRANCH = f"task/{TASK[:8]}"
 
 
@@ -30,7 +30,7 @@ def _git(repo: Path, *args: str) -> str:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("history", ["attached", "detached", "private"])
-async def test_cleanup_preserves_unique_history_after_gc(repo, history):
+async def test_cleanup_preserves_history_with_visible_ref_gc(repo, history):
     wt = await worktree_mgr.create_worktree(TASK, repo, repo / "tasks")
     (wt / ".gitignore").write_text("TASK_NOTEPAD.md\n")
     _git(wt, "add", ".gitignore")
@@ -57,8 +57,11 @@ async def test_cleanup_preserves_unique_history_after_gc(repo, history):
     assert _git(repo, "worktree", "list", "--porcelain", "-z") == registration
     assert _git(repo, "show-ref") == refs
     assert (wt / "TASK_NOTEPAD.md").read_bytes() == b"private interrupted notes\n"
-    _git(wt, "reflog", "expire", "--expire=now", "--all")
-    _git(wt, "gc", "--prune=now")
+    # Main-checkout GC does not preserve linked-worktree private refs; use
+    # their owning worktree for that case, not a universal-GC durability claim.
+    gc_root = wt if history == "private" else repo
+    _git(gc_root, "reflog", "expire", "--expire=now", "--all")
+    _git(gc_root, "gc", "--prune=now")
     _git(repo, "cat-file", "-e", f"{unique}^{{commit}}")
     if history == "private":
         assert _git(wt, "rev-parse", "refs/worktree/saved") == unique

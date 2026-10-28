@@ -165,7 +165,9 @@ is why the note says "if this session created them, nothing to do".
   pruning, branch resets and orphan handling still need the follow-up for
   #3020/#3060. A planning retry can refuse a retained checkout until exact
   reattachment is implemented. Independent lifecycle cleanup is unchanged;
-  retention at completion is not a backup or expiry policy.
+  retention at completion is not a backup or expiry policy. Keeping a private
+  per-worktree ref does not guarantee its objects survive GC run from a
+  different checkout.
 
 ## Retention and backups
 
