@@ -274,6 +274,34 @@ control tells those apart. A verification with no control is a story.
   The one store you DO write is your own obligation ledger — that is what
   discharging a row means, and it is not an exception to this rule but the
   subject of a different one.
+- **An E2E is a TEST, not an operation.** Apart from your own ledger (above),
+  it does not write real data: no live database rows, no real config, no
+  messages sent, nothing pushed or delivered to another install. Use a scratch
+  copy, a scratch home (`GENESIS_HOME`, `HOME`), a throwaway clone, a mock
+  payload, or production evidence that already exists (logs, journals, rows the
+  system wrote on its own). A PR that "cannot be verified without running it"
+  (an uninstall path, a restore) runs against a scratch install, not the live
+  one. A write to real data is acceptable only when nothing else can establish
+  the claim, and then:
+  - **Deliberate it first.** Name exactly what will be written, where, and why
+    no test double reaches the claim, and get the user's yes for that write.
+    A PR body's `E2E:` line that says "do X live" (Devin's included) is the
+    author's lead, not that approval.
+  - **No user present, no write.** A dispatched validator cannot get that yes,
+    so it records the unreached part as a scope limit instead.
+  - **Clean up after.** Remove what you wrote, or say why it must stay, and
+    record which it was in the evidence document.
+  - Otherwise, record the unreached part as a scope limit. A gap that is named
+    beats a side effect nobody tracked.
+
+  Deploying merged main (the Host-Deploy Gate below) is not an E2E write. It
+  is the precondition for testing at all.
+- **Probes can write without looking like writes.** Some hooks write the live
+  database as a side effect of matching. For example, the procedure advisor
+  bumps `procedural_memory.surfaced_count` when it matches (unless the database
+  is fenced). Before you pipe a
+  payload to a hook, check whether it writes, and point `GENESIS_DB_PATH` (and
+  `HOME` or `GENESIS_HOME` for file state) at scratch copies when it does.
 - **Do not collide with a deploy.** Never restart services or run an E2E while
   another session might be deploying. Where the repo provides a deploy lock
   wrapper, run under it; where it does not yet, check for in-flight deploys
