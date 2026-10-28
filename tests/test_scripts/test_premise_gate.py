@@ -504,3 +504,64 @@ def test_the_label_queue_is_per_issue_and_both_parsers_are_installed() -> None:
 def test_the_label_job_runs_on_bug_relabels_but_never_on_devin_ready() -> None:
     cond = _workflow()["jobs"]["label"]["if"]
     assert "'bug'" in cond and "unlabeled" in cond and "devin-ready" not in cond
+
+
+# -- round 1: one may-add rule for both jobs, and an idempotent guard ----------
+
+
+def test_the_guard_never_labels_a_grandfathered_issue() -> None:
+    plan = gate.decide(
+        _event(
+            "labeled", "old bare spec", labels=["devin-ready"], label="devin-ready", created=_OLD
+        )
+    )
+    assert plan.remove == ["devin-ready"] and plan.add == []
+
+
+def test_the_guard_never_labels_a_bug_form_report() -> None:
+    plan = gate.decide(
+        _event("labeled", _bug_form_body(), labels=["devin-ready"], label="devin-ready")
+    )
+    assert plan.remove == ["devin-ready"] and plan.add == []
+
+
+def test_the_guard_does_nothing_once_devin_ready_is_gone() -> None:
+    plan = gate.decide(_event("labeled", "bare", labels=[], label="devin-ready"))
+    assert not plan.add and not plan.remove and not plan.comment
+
+
+def test_form_headings_inside_a_code_block_do_not_exempt() -> None:
+    body = "Work.\n\n```\n### Description\n### Steps to reproduce\n```\n"
+    assert gate.decide(_event("opened", body)).add == ["premises-missing"]
+
+
+def test_the_exemption_headings_come_from_the_form_file(tmp_path: Path) -> None:
+    form = tmp_path / "bug_report.yml"
+    form.write_text(
+        "body:\n"
+        "  - type: textarea\n    id: description\n    attributes:\n      label: What broke\n"
+        "  - type: textarea\n    id: steps\n    attributes:\n      label: How to see it\n"
+        "  - type: textarea\n    id: logs\n    attributes:\n      label: Logs\n",
+        encoding="utf-8",
+    )
+    assert gate._bug_form_headings(form) == ["### What broke", "### How to see it"]
+
+
+def test_an_unclosed_fence_in_a_real_form_report_keeps_its_exemption() -> None:
+    headings = gate._bug_form_headings()
+    body = (
+        f"{headings[0]}\n\n```\nTraceback (most recent call last):\n\n{headings[1]}\n\n1. run it\n"
+    )
+    assert gate.decide(_event("opened", body, labels=["bug"])).add == []
+
+
+def test_a_body_that_does_not_open_with_the_form_is_not_exempt() -> None:
+    headings = gate._bug_form_headings()
+    body = "Some context first.\n\n" + "".join(f"{h}\n\nx\n\n" for h in headings)
+    assert gate.decide(_event("opened", body, labels=["bug"])).add == ["premises-missing"]
+
+
+def test_a_live_read_without_a_label_list_keeps_the_event_labels() -> None:
+    ev = _event("labeled", "bare", labels=["devin-ready"], label="devin-ready")
+    for current in ({"body": "bare"}, {"body": "bare", "labels": None}):
+        assert "devin-ready" in gate.decide(gate.live(ev, lambda n, c=current: c)).remove

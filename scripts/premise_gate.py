@@ -27,10 +27,14 @@ Run by ``.github/workflows/premise-gate.yml`` on ``issues`` events. Two jobs:
    premise answers, it is removed and a comment names the missing ones. Devin
    builds a change, so it always needs the six, bug report or not (owner ruling
    2026-10-28); a verified bug report bound for Devin carries both sections. The
-   guard also brings ``premises-missing`` in line with the label rule above, so
-   the two jobs never disagree about it. That comment's first line is ``(aside)``, because a non-aside comment
-   on a Devin issue can start a paid session. This job has no grandfathering:
-   the label event is the paid trigger, whenever the issue was written.
+   comment's first line is ``(aside)``, because a non-aside comment on a Devin
+   issue can start a paid session. Removing ``devin-ready`` ignores
+   grandfathering: the label event is the paid trigger, whenever the issue was
+   written. ``premises-missing`` follows the label rule above, exemptions
+   included (one shared ``_may_add``), so the two jobs never disagree about it.
+   The guard acts only while ``devin-ready`` is still on the issue, so a re-run
+   posts no second comment (two runs overlapping in time still can, inside the
+   race accepted below).
 
 The answers are read by the plan reader's own parser
 (``scripts/hooks/plan_doc.premise_answers`` with the plan gate's emptiness rule),
@@ -79,8 +83,10 @@ VERIFICATION_QUESTIONS = (
 #: next edit, not at opening.
 GATE_EPOCH = "2026-10-28T00:00:00Z"
 #: The bug-report form. The headings of its STABLE fields (``BUG_FORM_FIELDS``)
-#: are read from the form itself, so renaming one cannot silently break the
-#: exemption, and adding a field cannot un-exempt the reports filed before it.
+#: are read from the form itself, so new reports track a renamed field, and adding
+#: a field cannot un-exempt the reports filed before it. Renaming one of these
+#: fields DOES un-exempt reports filed before the rename (their bodies carry the
+#: old heading), so rename them only with that in mind.
 BUG_FORM = Path(__file__).resolve().parents[1] / ".github" / "ISSUE_TEMPLATE" / "bug_report.yml"
 BUG_FORM_FIELDS = ("description", "steps")
 
@@ -104,10 +110,19 @@ def _bug_form_headings(path: Path = BUG_FORM) -> list[str]:
 
 
 def is_bug_form(body: str, headings: Sequence[str] | None = None) -> bool:
-    """Whether ``body`` was filed through the bug form: every field heading is present."""
+    """Whether ``body`` was filed through the bug form.
+
+    Judged on where the form PUTS its headings, not on how the body renders: the
+    body opens with the form's first heading, and every heading sits on a line of
+    its own. Raw lines, deliberately: an unclosed fence or HTML comment that a
+    reporter left in the Description would otherwise swallow the later headings
+    and drop a real report's exemption. A work issue that merely quotes the
+    headings in an example does not open with them, so it is not exempt.
+    """
     wanted = _bug_form_headings() if headings is None else list(headings)
-    lines = {line.rstrip() for line in (body or "").splitlines()}
-    return bool(wanted) and all(h in lines for h in wanted)
+    raw = [line.rstrip() for line in (body or "").splitlines()]
+    first = next((line for line in raw if line), "")
+    return bool(wanted) and first == wanted[0] and all(h in set(raw) for h in wanted)
 
 
 @dataclass
@@ -156,6 +171,14 @@ def _sync_missing_label(plan: Plan, issue: dict, labels: set[str], *, may_add: b
         plan.remove.append(MISSING_LABEL)
 
 
+def _may_add(issue: dict) -> bool:
+    """Whether the gate may newly ADD ``premises-missing`` to this issue: created
+    at or after ``GATE_EPOCH``, and not a bug-form report. The ONE rule both jobs
+    use, so they never disagree about an exempt issue."""
+    new = (issue.get("created_at") or "") >= GATE_EPOCH
+    return new and not is_bug_form(issue.get("body") or "")
+
+
 def decide(event: dict) -> Plan:
     """The label and comment changes for one ``issues`` event payload."""
     action = event.get("action") or ""
@@ -167,22 +190,21 @@ def decide(event: dict) -> Plan:
     plan = Plan()
 
     if action == "labeled" and changed == DEVIN_LABEL:
+        if DEVIN_LABEL not in labels:
+            return plan  # already removed (a re-run, or another guard run): no second comment
         # The paid trigger always needs the six premise answers, bug or not:
         # Devin builds a change, and the six are what specify one.
         six_missing = missing_answers(issue.get("body") or "")
         if six_missing:
             plan.remove.append(DEVIN_LABEL)
             plan.comment = _comment(six_missing)
-        _sync_missing_label(plan, issue, labels, may_add=True)
+        _sync_missing_label(plan, issue, labels, may_add=_may_add(issue))
         return plan
 
     relabelled_bug = action in ("labeled", "unlabeled") and changed == BUG_LABEL
     if action not in ("opened", "edited", "reopened") and not relabelled_bug:
         return plan
-    new = (issue.get("created_at") or "") >= GATE_EPOCH
-    _sync_missing_label(
-        plan, issue, labels, may_add=new and not is_bug_form(issue.get("body") or "")
-    )
+    _sync_missing_label(plan, issue, labels, may_add=_may_add(issue))
     return plan
 
 
@@ -293,7 +315,10 @@ def live(event: dict, view: Viewer = _view) -> dict:
         return event
     merged = dict(issue)
     merged["body"] = current.get("body") or ""
-    merged["labels"] = current.get("labels") or []
+    # A read with no label LIST tells us nothing about the labels: keep the
+    # event's, so the guard never mistakes "unknown" for "devin-ready is gone".
+    live_labels = current.get("labels")
+    merged["labels"] = live_labels if isinstance(live_labels, list) else issue.get("labels") or []
     merged["created_at"] = current.get("createdAt") or issue.get("created_at")
     return {**event, "issue": merged}
 
