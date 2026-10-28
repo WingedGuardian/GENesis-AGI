@@ -369,6 +369,53 @@ def test_tracked_url_coverage_uses_original(tmp_path: Path) -> None:
     assert f"| {URL} | evaluated | present | yes |  |" in out.read_text()
 
 
+def test_out_db_path_exits_2(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    (inbox / "note.md").write_text(f"{URL}\n")
+    db = tmp_path / "genesis.db"
+    _make_db(db)
+    before = db.read_bytes()
+    rc = _rep.main(["--inbox", str(inbox), "--db", str(db), "--out", str(db)])
+    assert rc == 2
+    assert db.read_bytes() == before
+
+
+def test_non_utf8_note_tolerated(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    (inbox / "note.md").write_bytes(f"win1252 \x92quote {URL}\n".encode())
+    db = tmp_path / "genesis.db"
+    _make_db(db)
+    out = tmp_path / "out.md"
+    assert _rep.main(
+        ["--inbox", str(inbox), "--db", str(db), "--out", str(out)]
+    ) == 0
+    assert f"| {URL} | never |  |  |  |" in out.read_text()
+
+
+def test_reason_cell_escaped(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    note = inbox / "note.md"
+    note.write_text(f"{URL}\n")
+    db = tmp_path / "genesis.db"
+    _make_db(db)
+    _insert(
+        db,
+        note,
+        status="failed",
+        batch_items=_v2(URL),
+        error_message="a|b: detail",
+    )
+    out = tmp_path / "out.md"
+    assert _rep.main(
+        ["--inbox", str(inbox), "--db", str(db), "--out", str(out)]
+    ) == 0
+    md = out.read_text()
+    assert f"| {URL} | failed |  |  | a\\|b |" in md
+
+
 def test_render_has_denominators(tmp_path: Path) -> None:
     _, _, _, md = _run(tmp_path, note_text=f"{URL}\nhttps://example.org/b\n")
     assert (

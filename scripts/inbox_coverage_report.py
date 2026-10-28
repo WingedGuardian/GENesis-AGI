@@ -201,6 +201,11 @@ def build_report(
     return report
 
 
+def _cell(value: str) -> str:
+    """One Markdown table cell: no newlines, pipes escaped, or the row splits."""
+    return " ".join(str(value).split()).replace("|", "\\|")
+
+
 def render_md(report: Report, *, generated_at: str, inbox: str, db: str) -> str:
     """Pure: render the report as markdown with every denominator shown."""
     t = report.totals
@@ -233,8 +238,8 @@ def render_md(report: Report, *, generated_at: str, inbox: str, db: str) -> str:
             "| --- | --- | --- | --- | --- |",
         ]
         lines += [
-            f"| {e['url']} | {e['class']} | {e['response']} | "
-            f"{e['covered']} | {e['reason']} |"
+            f"| {_cell(e['url'])} | {e['class']} | {e['response']} | "
+            f"{e['covered']} | {_cell(e['reason'])} |"
             for e in note["urls"]
         ]
         lines.append("")
@@ -244,8 +249,12 @@ def render_md(report: Report, *, generated_at: str, inbox: str, db: str) -> str:
 
 
 def connect_readonly(db_path: Path) -> sqlite3.Connection:
-    """Open the DB read-only via ``mode=ro`` — never ``immutable=1`` (WAL)."""
-    return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    """Open the DB read-only via ``mode=ro`` — never ``immutable=1`` (WAL).
+
+    ``Path.as_uri`` percent-encodes the path, so a ``--db`` value containing
+    ``?``, ``#`` or ``%`` still names the file the caller meant.
+    """
+    return sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
 
 
 def _note_urls(text: str) -> list[str]:
@@ -278,8 +287,14 @@ def _scan_notes(inbox: Path, file_name: str | None) -> list[NoteInput]:
             continue
         if any(part.startswith(".") for part in rel.parts):
             continue
+        # The monitor's read_content decodes with errors="replace"; a note
+        # carrying non-UTF-8 bytes must not abort the whole report.
         notes.append(
-            NoteInput(str(path), str(rel), _note_urls(path.read_text()))
+            NoteInput(
+                str(path),
+                str(rel),
+                _note_urls(path.read_text(encoding="utf-8", errors="replace")),
+            )
         )
     return notes
 
@@ -302,7 +317,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"database not found: {args.db}", file=sys.stderr)
         return 2
 
-    notes = _scan_notes(inbox.resolve(), args.file)
+    # abspath, NOT resolve(): the monitor scans the configured path without
+    # resolving symlinks, so inbox_items.file_path carries that spelling. A
+    # resolved path here would miss every row under a symlinked inbox.
+    notes = _scan_notes(Path(os.path.abspath(inbox)), args.file)
 
     rows_by_file: dict[str, list[RowInput]] = {}
     with closing(connect_readonly(args.db)) as conn:
@@ -335,8 +353,8 @@ def main(argv: list[str] | None = None) -> int:
 
     def _read_response(path: str) -> str | None:
         try:
-            return Path(path).read_text()
-        except (OSError, UnicodeDecodeError):
+            return Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
             return None
 
     report = build_report(notes, rows_by_file, _read_response)
@@ -348,8 +366,10 @@ def main(argv: list[str] | None = None) -> int:
     out_resolved = out.resolve()
     from genesis.inbox.scanner import RESPONSE_SUFFIX
 
-    if out_resolved.is_relative_to(inbox.resolve()) or (
-        out_resolved.name.endswith(RESPONSE_SUFFIX) and out_resolved.exists()
+    if (
+        out_resolved.is_relative_to(inbox.resolve())
+        or out_resolved == args.db.resolve()
+        or (out_resolved.name.endswith(RESPONSE_SUFFIX) and out_resolved.exists())
     ):
         print(
             f"refusing to write the report over inbox/response file: {out}",
@@ -359,7 +379,8 @@ def main(argv: list[str] | None = None) -> int:
 
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(
-        render_md(report, generated_at=generated_at, inbox=str(inbox), db=str(args.db))
+        render_md(report, generated_at=generated_at, inbox=str(inbox), db=str(args.db)),
+        encoding="utf-8",
     )
     print(out)
     return 0
