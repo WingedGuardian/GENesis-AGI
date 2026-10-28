@@ -33,7 +33,24 @@ from shell_parse import (
 
 ROOT = RUNTIME_ROOT
 PROC = Path('/proc')
-GIT_MOVES = frozenset(['commit', 'merge', 'rebase', 'stash', 'checkout', 'switch', 'reset', 'pull'])
+# Allowlists, not verb denylists: an operation outside them refuses (owner, 2026-10-27).
+# Git reads that change no work tree, index, ref or config, whatever their arguments.
+GIT_READS = frozenset([
+    'status', 'log', 'diff', 'show', 'rev-parse', 'ls-files', 'ls-tree', 'ls-remote', 'cat-file',
+    'grep', 'blame', 'annotate', 'shortlog', 'describe', 'rev-list', 'merge-base', 'show-ref',
+    'for-each-ref', 'name-rev', 'diff-tree', 'diff-files', 'diff-index', 'whatchanged', 'var',
+    'version', 'help', 'check-ignore', 'check-attr', 'check-ref-format', 'count-objects',
+    'verify-commit', 'verify-tag', 'range-diff', 'cherry', 'show-branch',
+])
+GIT_PUBLISH = frozenset(['push', 'send-pack', 'svn', 'p4'])
+GH_READS = {'pr': {'view', 'list', 'status', 'diff', 'checks'}, 'issue': {'view', 'list', 'status'},
+            'repo': {'view', 'list'}, 'run': {'view', 'list', 'watch'}, 'workflow': {'view', 'list'},
+            'release': {'view', 'list'}, 'gist': {'view', 'list'}, 'cache': {'list'},
+            'auth': {'status'}, 'status': {None}, 'search': None}
+GENESIS_READS = {'db': {'query'}, 'eval': {'results', 'datasets'}, 'handoffs': {'list'},
+                 'session-address': None, 'lessons': {'list', 'sample'}, 'peers': {'list'},
+                 'transcripts': {'status', 'verify'}}  # sql can write files (#3640)
+STORE_PORTS = frozenset([5000, 6333])
 DEPLOYS = frozenset(['update.sh', 'bootstrap.sh', 'restore.sh', 'backup.sh', 'disk_hygiene.sh'])
 READ_UNITS = frozenset(['status', 'show', 'is-active', 'list-units', 'cat'])
 SQL_WRITES = re.compile(r'\b(?:CREATE|VACUUM|ATTACH|DETACH|REINDEX|ANALYZE)\b', re.I)
@@ -74,7 +91,7 @@ class Context:
             elif kind == 'chdir':
                 changes += 1
                 current.directory = _path(value, current.directory, home_unknown=current.home_unknown)
-            elif kind != 'assignment_only':
+            elif kind not in {'assignment_only', 'appends'}:
                 current.directory = None
                 current.namespace &= kind != 'opaque'
         if changes > 1:
@@ -117,14 +134,105 @@ def _outputs(segment, context, git):
             raise Refused('Validator output targets a protected or unresolved path')
 
 
+_COMMANDS = None
+
+
+def _git_commands(git):
+    # Git ignores an alias that would hide a Git command (git-config, alias.*),
+    # so only a name outside this list can carry one, from any config source.
+    global _COMMANDS
+    if _COMMANDS is None:
+        listed = git.run('/', '--list-cmds=builtins,main,others')
+        if listed.returncode != 0:
+            raise Refused('Unresolved Git command list')
+        _COMMANDS = frozenset(listed.stdout.decode().split())
+    return _COMMANDS
+
+
+# Read forms of verbs that also write: listing flags only, no operand that names a target.
+_LIST_FLAGS = {
+    'branch': {'--show-current', '-a', '--all', '-r', '--remotes', '-l', '--list', '-v', '-vv',
+               '--verbose', '--no-color', '--color', '--contains', '--no-contains', '--merged',
+               '--no-merged', '--points-at', '--sort', '--format', '--column', '--no-column'},
+    'tag': {'-l', '--list', '-n', '--contains', '--no-contains', '--merged', '--no-merged',
+            '--points-at', '--sort', '--format', '--column', '--no-column'},
+}
+# Options that make a read verb run a program or write a file.
+_READ_EFFECTS = ('--output', '-O', '--open-files-in-pager', '--ext-diff')
+
+
+_CONFIG_READS = {'--get', '--get-all', '--get-regexp', '-l', '--list'}
+_CONFIG_WRITES = {'--add', '--unset', '--unset-all', '--replace-all', '--rename-section',
+                  '--remove-section', '-e', '--edit'}
+
+
+def _git_read(verb, rest):
+    if verb in GIT_READS:
+        return True
+    flags = [w.split('=', 1)[0] for w in rest if w.startswith('-')]
+    positionals = [w for w in rest if not w.startswith('-')]
+    if verb in _LIST_FLAGS:
+        # Listing only: every flag a listing flag, and an operand only as a
+        # --list pattern. Anything else (create, delete, move) is a write.
+        pattern = any(f in {'-l', '--list'} for f in flags)
+        known = all(f in _LIST_FLAGS[verb] or re.fullmatch(r'-n\d*', f) for f in flags)
+        return known and (not positionals or pattern)
+    if verb == 'remote':
+        return not rest or rest in (['-v'], ['--verbose']) or rest[:1] in (['show'], ['get-url'])
+    if verb == 'worktree':
+        return rest[:1] == ['list']
+    if verb == 'stash':
+        return rest[:1] in (['list'], ['show'])
+    if verb == 'config':
+        return bool(_CONFIG_READS & set(flags)) and not _CONFIG_WRITES & set(flags) and len(positionals) <= 2
+    return False
+
+
+def _git_destination(verb, rest, directory, context):
+    # The destination is the last operand (a one-operand clone names its own
+    # directory after the source); an option-like one, or a separate git dir,
+    # leaves the created repository unproven.
+    operands = [w for w in rest if not w.startswith('-')]
+    if (rest and rest[-1].startswith('-')) or any(w.startswith('--separate-git-dir') for w in rest):
+        raise Refused('Validator Git mutation has no proven operation repository')
+    if verb == 'clone' and len(operands) == 1:
+        name = re.sub(r'\.git$', '', operands[0].rstrip('/').rsplit('/', 1)[-1].rsplit(':', 1)[-1])
+        spelling = name or None
+    else:
+        spelling = operands[-1] if operands else '.'
+    target = _path(spelling, directory, home_unknown=context.home_unknown) if spelling else None
+    if target is None or not context.namespace or context.repository_unknown or target.is_relative_to(ROOT):
+        raise Refused('Validators cannot create a repository in the main checkout')
+
+
 def _git(segment, context, git):
     options = []
     index = git_subcommand_index(segment.argv, _options=options)
     verb = segment.argv[index] if index is not None else None
-    if verb == 'push':
+    if verb is not None and verb not in _git_commands(git):
+        raise Refused('Validator Git verb is not a Git command; an alias can run any command')
+    rest = segment.argv[index + 1:] if index is not None else []
+    if verb in GIT_PUBLISH or (verb == 'subtree' and 'push' in rest):
         raise Refused('Validators report findings; publishing code is prohibited')
-    if verb not in GIT_MOVES:
+    if verb is None or _git_read(verb, rest):
+        # A read stays a read only without options that run a program or write a
+        # file, and with configuration limited to output colour.
+        if any(w == e or w.startswith(e + '=') or (e == '-O' and w.startswith('-O'))
+               for w in rest for e in _READ_EFFECTS):
+            raise Refused('Validator Git read option runs a program or writes a file')
+        for name, value in options:
+            key = (value or '').split('=', 1)[0].lower()
+            if name.startswith('--config-env') or (name == '-c' and not key.startswith('color.')):
+                raise Refused('Validator Git read sets configuration beyond output colour')
+        for kind, value in (*segment.ancestors, *segment.contexts):
+            name, _, assigned = (value or '').partition('=')
+            if kind == 'assignment' and (
+                    name in {'GIT_CONFIG_PARAMETERS', 'GIT_EXTERNAL_DIFF', 'GIT_PAGER', 'PAGER'}
+                    or (name.startswith('GIT_CONFIG_KEY_') and not assigned.lower().startswith('color.'))):
+                raise Refused('Validator Git read sets configuration beyond output colour')
         return
+    # Every other verb can write: it needs a proven operation repository that is
+    # not the main checkout. clone and init create theirs at a destination.
     directory = context.directory
     uncertain = context.repository_unknown or seg_redirects_repo(segment) or not context.namespace
     for name, value in options:
@@ -132,6 +240,11 @@ def _git(segment, context, git):
             directory = _path(value, directory, home_unknown=context.home_unknown)
         elif value is not None or name == '--bare':
             uncertain = True
+    if verb in {'clone', 'init'}:
+        if uncertain:
+            raise Refused('Validator Git mutation has no proven operation repository')
+        _git_destination(verb, rest, directory, context)
+        return
     if directory is None or uncertain:
         raise Refused('Validator Git mutation has no proven operation repository')
     checkout = git.checkout(str(directory))
@@ -141,15 +254,16 @@ def _git(segment, context, git):
 
 def _github(argv):
     invocation = gh_command(argv)
-    forbidden = {'pr': {'create', 'merge', 'ready', 'close', 'edit', 'review', 'comment'},
-                 'issue': {'create', 'comment', 'close', 'edit'}, 'workflow': {'run'}}
     if invocation is None:
         raise Refused('Unresolved GitHub operation')
-    request = gh_api_request(argv)
-    if (invocation.group == 'label'
-            or invocation.subcommand in forbidden.get(invocation.group, set())
-            or (request is not None and (request.method not in {'GET', 'HEAD'}
-                                        or request.fields or request.has_input))):
+    if invocation.group == 'api':
+        request = gh_api_request(argv)
+        if request is None or request.method not in {'GET', 'HEAD'} or request.fields or request.has_input:
+            raise Refused('Validators publish only through the privacy-scanned filer')
+        return
+    action = invocation.subcommand or (invocation.positionals[0] if invocation.positionals else None)
+    if invocation.group not in GH_READS or (
+            GH_READS[invocation.group] is not None and action not in GH_READS[invocation.group]):
         raise Refused('Validators publish only through the privacy-scanned filer')
 
 
@@ -179,6 +293,36 @@ def _python_entry(argv):
     return options.selected or ('script', operands[0], tuple(operands[1:])) if operands or options.selected else None
 
 
+def _genesis_writer(rest):
+    # Only the CLI's read subcommands pass; bare help is a read too.
+    if not rest or rest[0] in {'-h', '--help'}:
+        return
+    reads = GENESIS_READS.get(rest[0], ())
+    if reads is not None and (len(rest) < 2 or rest[1] not in reads):
+        raise Refused('Validator cannot invoke a live Genesis writer')
+
+
+def _genesis_module(module, rest):
+    # `python -m genesis.<module>` is an entry point too. Only the resource
+    # governor's reads, and its `run` of a pytest batch, pass.
+    rest = list(rest)
+    if module != 'genesis.hostmetrics' or not rest:
+        raise Refused('Validator cannot invoke a live Genesis writer')
+    if rest[0] in {'status', 'preflight', '-h', '--help'}:
+        return
+    inner = rest[rest.index('--') + 1:] if rest[0] == 'run' and '--' in rest else []
+    if inner[:1] == ['timeout']:  # The repo's mandated outer bound: timeout [-k N] [-s SIG] DURATION.
+        inner = inner[1:]
+        while inner[:1] in (['-k'], ['-s']) and len(inner) > 1:
+            inner = inner[2:]
+        inner = inner[1:] if inner and re.fullmatch(r'\d+(?:\.\d+)?[smhd]?', inner[0]) else ['timeout']
+    pytest = (bool(inner) and Path(inner[0]).name == 'pytest') or (
+        bool(inner) and re.fullmatch(r'python(?:\d+(?:\.\d+)*)?', Path(inner[0]).name) is not None
+        and inner[1:3] == ['-m', 'pytest'])
+    if not pytest:
+        raise Refused('Validator resource-governor runs are limited to pytest batches')
+
+
 def _scripts(segment):
     argv, name = segment.argv, segment.exe
     operand, rest = argv[0], argv[1:]
@@ -195,11 +339,14 @@ def _scripts(segment):
             return
         kind, operand, rest = entry
         if kind == '-m':
-            if operand == 'genesis' and rest and (rest[0] in {
-                'restore', 'trash', 'serve', 'vault', 'peers', 'contribute',
-            } or tuple(rest[:2]) == ('handoffs', 'send')):
-                raise Refused('Validator cannot invoke a live Genesis writer')
+            if operand == 'genesis':
+                _genesis_writer(rest)
+            elif operand.startswith('genesis.'):
+                _genesis_module(operand, rest)
             return
+    elif name == 'genesis':
+        _genesis_writer(rest)  # The console script is the same entry point.
+        return
     elif name in {'.', 'source'}:
         operands = argv[2:] if argv[1:2] == ['--'] else argv[1:]
         if not operands:
@@ -278,11 +425,19 @@ def _network(segment):
     method = methods[-1] if methods else 'POST' if body else 'GET'
     if method in {'GET', 'HEAD'} and not body:
         return
-    for url in [*urls, *(v for k, v in options if k == '--url')]:
+    # The store ports refuse on every host: loopback has many spellings, names
+    # resolve to this machine, and a host-side proxy forwards to the stores from
+    # an address no local lookup can recognise (owner, 2026-10-27).
+    proxies = [v for k, v in options if k in {'-x', '--proxy'}]
+    for url in [*urls, *(v for k, v in options if k == '--url'), *proxies]:
         if '$' in url or '`' in url:
             raise Refused('Unresolved mutating HTTP destination')
         parsed = urlsplit(url if '://' in url else 'http://' + url)
-        if parsed.hostname in {'localhost', '127.0.0.1', '::1'} and parsed.port in {5000, 6333}:
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise Refused('Unresolved mutating HTTP destination') from exc
+        if port in STORE_PORTS:
             raise Refused('Validators cannot write live HTTP stores')
 
 
@@ -317,6 +472,18 @@ def _sqlite(segment, context, command):
         raise Refused('Validator protected SQLite access requires file URI mode=ro')
 
 
+GUARDED = frozenset(['git', 'gh', 'kill', 'pkill', 'curl', 'wget', 'sqlite3', 'systemctl',
+                     'systemd-run', 'genesis', '.', 'source'])
+
+
+def _guarded(segment):
+    # A program one of the checks above classifies, where appended words could
+    # change the operation: xargs-completed forms of these refuse.
+    name = segment.exe
+    return (name in GUARDED or name in _NESTED or re.fullmatch(r'python(?:\d+(?:\.\d+)*)?', name)
+            or (segment.argv and Path(segment.argv[0]).name in DEPLOYS | {'deploy_code_only.sh', 'watchgod'}))
+
+
 def check_command(command, cwd):
     if initial_directory(command) != Path(cwd).resolve():
         raise Refused('Validator role directory does not match its literal anchor')
@@ -341,6 +508,8 @@ def check_command(command, cwd):
         _outputs(segment, context.applied(segment.contexts) if ('assignment_only', None) in segment.contexts else context, git)
         program = context.applied(segment.contexts)
         name, argv = segment.exe, segment.argv
+        if _guarded(segment) and any(kind == 'appends' for kind, _ in (*segment.ancestors, *segment.contexts)):
+            raise Refused('Validator command takes words from input; its operation is unknown')
         if name == 'git':
             _git(segment, program, git)
         elif name == 'gh':
@@ -354,10 +523,13 @@ def check_command(command, cwd):
         elif name == 'systemd-run':
             raise Refused('Validators cannot launch system services')
         elif name == 'systemctl' and '--user' in argv:
-            _, operands = getopt.gnu_getopt(argv[1:], 'p:n:H:M:t:s:', [
-                'user', 'system', 'no-pager', 'no-legend', 'quiet', 'all', 'full',
-                'property=', 'lines=', 'host=', 'machine=', 'type=', 'state=', 'value',
-            ])
+            try:
+                _, operands = getopt.gnu_getopt(argv[1:], 'p:n:H:M:t:s:la', [
+                    'user', 'system', 'no-pager', 'no-legend', 'quiet', 'all', 'full',
+                    'property=', 'lines=', 'host=', 'machine=', 'type=', 'state=', 'value',
+                ])
+            except getopt.GetoptError as exc:
+                raise Refused('Unclassified user-service options') from exc
             if not operands or operands[0] not in READ_UNITS:
                 raise Refused('Validators cannot change user services')
         if argv:

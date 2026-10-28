@@ -3173,6 +3173,9 @@ def _strip_wrappers(argv: list[str], carried_open: int = 0, *, _contexts=None) -
         wrapper_name = _basename(tok)
         if _contexts is not None and wrapper_name not in _POLICY_NEUTRAL_WRAPPERS | {"env"}:
             _contexts.append(("opaque", None))
+        if _contexts is not None and wrapper_name == "xargs":
+            # xargs appends words read from stdin, so the parsed argv is a prefix.
+            _contexts.append(("appends", None))
         i += 1
         # `--` ends OPTION parsing only. It does not end the wrapper's positional
         # or assignment operands: `timeout -- 5 git push` still takes `5` as the

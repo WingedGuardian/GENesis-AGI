@@ -91,6 +91,116 @@ def test_denied_role_operations(role, command):
         check(role, command)
 
 
+# Round-1 review classes: a forbidden operation reached through a spelling the
+# named checks did not see. Each is refused; the allow controls keep the reads.
+SPELLED_DENIED = [
+    'echo push | xargs git', 'echo commit | xargs git', 'xargs -a list git',
+    "echo 'comment 1 --body x' | xargs gh pr", 'echo log | xargs git',
+    'git -c alias.pub=push pub origin HEAD', 'git --config-env=alias.pub=FIXTURE pub',
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.pub GIT_CONFIG_VALUE_0=push git pub',
+    'git -c alias.c=commit c',
+    *['genesis ' + action for action in ('restore', 'trash', 'handoffs send', 'serve', 'vault', 'peers', 'contribute')],
+    '{home}/.venv/bin/genesis ' + 'serve',
+    *['curl -XPOST http://' + host + ':5000/fixture' for host in (
+        '0.0.0.0', '127.0.0.2', 'localhost.', '[::ffff:127.0.0.1]', '127.1', '2130706433',  # noqa: S104 — URL text, nothing binds
+        '0x7f.0.0.1', '[::]', 'fixture.localhost')],
+    'wget --post-data=key=value http://127.0.0.2:6333/fixture',
+    # Allowlists: anything outside the named reads refuses (owner, 2026-10-27).
+    'curl -XPOST -dkey=value http://192.0.2.1:5000/fixture',
+    'curl -XPOST http://localhost.localdomain:5000/fixture', 'curl -XPOST http://%6cocalhost:6333/fixture',
+    'curl -x http://localhost:5000 -XPOST http://example.test/fixture',
+    'curl -XPOST http://localhost:5000x/fixture',
+    *['git ' + verb for verb in ('restore .', 'clean -fdx', 'cherry-pick HEAD', 'revert HEAD', 'am fixture',
+                                 'apply fixture.diff', 'rm README', 'checkout-index -a -f', 'bisect start',
+                                 'sparse-checkout set fixture', 'worktree add {scratch}/wt', 'fetch',
+                                 'branch fixture', 'tag fixture', 'config user.name fixture',
+                                 'send-pack origin', 'subtree push --prefix=x origin main')],
+    'git clone --shared {main} {main}/clone', 'git init', 'git -C {scratch} subtree push --prefix=x origin main',
+    *['gh ' + verb for verb in ('gist create fixture.md --public', 'release create v1 --notes x',
+                                'issue reopen 1', 'issue delete 1', 'issue transfer 1 o/r', 'pr reopen 1',
+                                'secret set FIXTURE --body x', 'variable set FIXTURE --body x', 'run rerun 1',
+                                'workflow enable fixture.yml', 'pr update-branch 1', 'pr checkout 1',
+                                'repo sync', 'alias set pc "pr comment"', 'pc 1 --body x')],
+    *['python -m genesis ' + action for action in (
+        'lessons deprecate 1', 'lessons review', 'handoffs mark 1', 'transcripts ingest', 'transcripts prune',
+        'db', 'eval run', 'health')],
+    'python -m genesis.trash put fixture --reason fixture', 'python -m genesis.db.migrations --apply',
+    'python -m genesis.hostmetrics run --name fixture -- git push',
+    'python -m genesis.hostmetrics run --name fixture', 'echo restore | xargs python -m genesis',
+    'echo http://localhost:5000/fixture | xargs curl -XPOST', 'echo kill 4101 | xargs scripts/watchgod',
+    'echo scripts/update.sh | xargs bash', 'echo 4101 | xargs kill',
+    'systemctl --user status genesis-fixture --now',
+    *['git ' + write for write in ('branch fixture', 'branch -d fixture', 'tag fixture', 'tag -d fixture',
+                                   'remote add fixture https://example.test/r.git', 'worktree prune',
+                                   'stash push', 'config --unset user.name', 'config --get --add a.b c')],
+    *['git ' + effect for effect in ('diff --output=fixture.diff', 'log -p --ext-diff',
+                                     'grep -O fixture', 'grep --open-files-in-pager=fixture fixture',
+                                     '-c core.pager=fixture log', '-c diff.external=fixture diff',
+                                     '--config-env=core.pager=FIXTURE log')],
+    'GIT_EXTERNAL_DIFF=fixture git diff', 'git -c alias.status=push status', 'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.pager GIT_CONFIG_VALUE_0=x git log',
+    'python -m genesis transcripts sql "select 1"',
+    'git -C {main} clone https://example.test/r.git', 'git -C {main} init fixture',
+    'python -m genesis.hostmetrics run --name fixture -- timeout 900 git status',
+]
+
+
+def test_linked_worktree_under_the_runtime_root_is_not_a_validator_workspace(role):
+    """Validator workspaces sit outside the runtime root, so a worktree under it is not theirs."""
+    module, paths = role
+    main = paths['main']
+    subprocess.run(['git', '-C', str(main), '-c', 'user.name=f', '-c', 'user.email=f@example.test',
+                    'commit', '-q', '-m', 'fixture'], check=True)
+    subprocess.run(['git', '-C', str(main), 'worktree', 'add', '-q', str(main / 'wt')], check=True)
+    for anchor in ('main', 'scratch'):
+        with pytest.raises(module.Refused):
+            check(role, 'git -C {main}/wt commit -m fixture', anchor)
+
+
+def test_inherited_git_config_reaches_the_probe_and_the_command_alike(role, monkeypatch):
+    """The probe keeps GIT_CONFIG_*, so injected configuration cannot split it from the command."""
+    module, paths = role
+    subprocess.run(['git', 'init', '-q', str(paths['scratch'])], check=True)
+    for key, value in (('GIT_CONFIG_COUNT', '1'), ('GIT_CONFIG_KEY_0', 'core.worktree'),
+                       ('GIT_CONFIG_VALUE_0', str(paths['main']))):
+        monkeypatch.setenv(key, value)
+    probe = module._Git().checkout(str(paths['scratch']))
+    shown = subprocess.run(['git', '-C', str(paths['scratch']), 'rev-parse', '--show-toplevel'],
+                           capture_output=True, text=True, check=True).stdout.strip()
+    assert probe is not None and probe[0] == shown
+    check(role, 'git commit -m fixture', 'scratch')
+
+
+@pytest.mark.parametrize('command', SPELLED_DENIED)
+def test_spelled_role_operations_are_denied(role, command):
+    with pytest.raises(role[0].Refused):
+        check(role, command)
+
+
+@pytest.mark.parametrize('command', [
+    'git -c color.ui=never status',
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=color.ui GIT_CONFIG_VALUE_0=never git log -1',
+    'genesis db query "select 1"', 'echo README | xargs cat',
+    'curl -XPOST -dkey=value http://192.0.2.1:8080/fixture', 'curl -sSf http://0.0.0.0:5000/health',
+    *['git ' + verb for verb in ('status', 'log -1', 'diff', 'show HEAD', 'rev-parse HEAD', 'ls-files',
+                                 'grep fixture', 'blame README', 'describe --always', 'for-each-ref')],
+    *['gh ' + read for read in ('pr view 1', 'pr list', 'pr diff 1', 'pr checks 1', 'issue view 1',
+                                'issue list', 'run list', 'search prs fixture', 'auth status', 'status',
+                                'release list', 'api repos/example/project')],
+    'genesis lessons list', 'genesis transcripts status', 'genesis peers list',
+    'python -m genesis handoffs list', 'python -m genesis.hostmetrics status',
+    'python -m genesis.hostmetrics run --name fixture --ram 1 --cpu 100 -- python -m pytest -q',
+    'systemctl --user status genesis-fixture -l',
+    *['git ' + read for read in ('branch', 'branch --show-current', 'branch -a', 'branch --list "fix*"',
+                                 'tag', 'tag --list', 'remote', 'remote -v', 'remote get-url origin',
+                                 'worktree list', 'stash list', 'config --get user.name', 'config --list')],
+    'gh run watch 1', 'gh repo list',
+    'python -m genesis.hostmetrics run --name fixture -- .venv/bin/pytest tests/fixture.py -q',
+    'python -m genesis.hostmetrics run --name fixture -- timeout -k 10 900 python -m pytest tests/fixture.py',
+])
+def test_spelled_read_controls_remain_allowed(role, command):
+    check(role, command)
+
+
 @pytest.mark.parametrize('operator', ['>', '>>', '>|', '&>', '<>'])
 @pytest.mark.parametrize('wrapper', ['{}', '({})', 'time {}', 'if {}; then :; fi'])
 def test_assignment_only_home_precedes_output_expansion(role, operator, wrapper):
@@ -124,7 +234,7 @@ def test_output_context_preserves_command_and_wrapper_order(role, body):
     ('curl -I http://127.0.0.1:6333/fixture', 'main'),
     ('wget -qO- http://localhost:5000/health', 'main'),
     ('curl -XPOST -dkey=value https://example.test/fixture', 'main'),
-    ('python -m genesis health', 'main'),
+    ('python -m genesis db query "select 1"', 'main'),
     ('python -c "print(\"-m genesis restore\")"', 'main'),
     ('python fixture.py -m genesis restore', 'main'),
     ('sqlite3 file:{main}/data/fixture.db?mode=ro "select 1"', 'main'),

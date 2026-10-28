@@ -126,12 +126,42 @@ An actual command or wrapper keeps the shell's pre-command redirect context;
 the canonical parser supplies the distinction without changing ordinary callers.
 
 The interactive adapter invokes `validator_role_guard.py` only for Bash calls.
-Ordinary Codex and Claude configurations do not acquire this policy. It denies
-all Git pushes, the specified checkout-moving Git operations against main,
-raw GitHub publication and API writes/fields, deploys, user-service changes,
-signals to identified Genesis processes, writes to the literal loopback HTTP
-stores on ports 5000/6333, and the named Genesis writer CLI commands. Public
-findings use the privacy-scanned filer once that capability is available.
+Ordinary Codex and Claude configurations do not acquire this policy. Git,
+GitHub and the Genesis CLI use allowlists, so an operation outside them refuses:
+
+- Git: every push-like publication (`push`, `send-pack`, `subtree push`, `svn`,
+  `p4`) refuses everywhere. Named reads (`status`, `log`, `diff`, `show`,
+  `rev-parse`, `ls-files`, `grep`, `blame` and similar, plus the listing forms
+  of `branch`, `tag`, `remote`, `worktree list`, `stash list`/`show` and
+  `config --get`/`--list`) pass anywhere, unless they carry an option that runs
+  a program or writes a file (`--output`, `-O`/`--open-files-in-pager`,
+  `--ext-diff`) or set configuration other than `color.*` through `-c`,
+  `--config-env` or the command's own `GIT_CONFIG_KEY_*`/`GIT_CONFIG_PARAMETERS`,
+  `GIT_EXTERNAL_DIFF` or pager assignments. Every other verb needs a proven
+  operation repository that is not the main checkout; `clone` and `init` are
+  judged by their destination, after any `-C`. A verb that is not a Git
+  command refuses: Git ignores an alias that would hide a command, so no alias
+  from `-c`, `--config-env`, `GIT_CONFIG_*` or a config file reaches Git.
+- GitHub: only reads pass (`pr`/`issue` view, list, status; `pr` diff and checks;
+  `repo` view and list; `run` view, list and watch; `workflow`, `release` and
+  `gist` view and list; `cache list`; `search`; `status`; `auth status`; `api`
+  GET or HEAD with no fields or input).
+- Genesis CLI, as `python -m genesis` or the `genesis` console script: only its
+  read subcommands pass (`db query`, `eval results`/`datasets`, `handoffs list`,
+  `session-address`, `lessons list`/`sample`, `peers list`, `transcripts
+  status`/`verify`; `transcripts sql` can write files and stays out until #3640
+  is fixed). `python -m genesis.<module>` refuses except the resource
+  governor's `status`, `preflight` and a `run` of a pytest batch, optionally
+  under an outer `timeout`.
+
+It also denies deploys, user-service changes, signals to identified Genesis
+processes, and mutating HTTP requests to ports 5000/6333 on any host, or
+through a `-x`/`--proxy` on those ports: loopback has many spellings, names
+resolve to this machine, and a host-side proxy forwards to the stores from an
+address no local check recognises. Proxy environment variables are not read. A
+guarded command that `xargs` completes from input refuses, because its operation
+is not visible. Public findings use the privacy-scanned filer once that
+capability is available.
 
 The guard consumes the canonical parser's optional occurrence, redirection,
 wrapper-assignment and source-origin facts. Existing parser consumers keep their
@@ -156,7 +186,8 @@ still be conservatively refused; the sanctioned read-only `genesis db query`
 entrypoint avoids that inherited textual limitation.
 
 This remains a bounded command guard. It does not inspect arbitrary programs,
-aliases, SQLite dot-command indirection, sourced SQL/config contents, later stdin, or escape filesystem races or
+shell aliases or functions, SQLite dot-command indirection, sourced SQL/config
+contents, other later stdin, or escape filesystem races or
 hardlink writes. Explicit CLI forms outside its option models may refuse.
 Read commands and proven scratch operations have positive controls; this does
 not claim shell or OS containment. The existing client trust/outer-hook failure
