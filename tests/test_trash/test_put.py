@@ -53,6 +53,47 @@ def test_put_needs_a_reason(tmp_path):
     assert a.exists()
 
 
+_SESSION_VARS = ("GENESIS_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID")
+
+
+def test_the_claude_code_session_id_is_recorded(tmp_path, monkeypatch):
+    # The shape a put from a Claude Code session has: CC sets only this one.
+    for var in _SESSION_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "cc-session")
+    stone = trash(_touch(tmp_path / "a.txt"), reason="r", caller="c")
+    assert stone.session_id == "cc-session"
+
+
+@pytest.mark.parametrize(
+    "present, expected",
+    [
+        (_SESSION_VARS, "GENESIS_SESSION_ID"),
+        (_SESSION_VARS[1:], "CLAUDE_CODE_SESSION_ID"),
+        (_SESSION_VARS[2:], "CLAUDE_SESSION_ID"),
+        ((), None),
+    ],
+)
+def test_the_session_id_follows_the_commit_hooks_order(tmp_path, monkeypatch, present, expected):
+    # The order scripts/hooks/prepare-commit-msg reads them in.
+    for var in _SESSION_VARS:
+        monkeypatch.delenv(var, raising=False)
+    for var in present:
+        monkeypatch.setenv(var, var)
+    stone = trash(_touch(tmp_path / "a.txt"), reason="r", caller="c")
+    assert stone.session_id == expected
+
+
+def test_an_empty_session_variable_falls_through(tmp_path, monkeypatch):
+    # As the hook's ${VAR:-...} does: set-but-empty counts as unset.
+    for var in _SESSION_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("GENESIS_SESSION_ID", "")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "cc-session")
+    stone = trash(_touch(tmp_path / "a.txt"), reason="r", caller="c")
+    assert stone.session_id == "cc-session"
+
+
 @pytest.mark.parametrize("which", ["file", "wal", "shm", "dir"])
 def test_the_live_database_is_never_trashed(which):
     db = env.genesis_db_path()
