@@ -4234,10 +4234,12 @@ tool-disabled CC probe without changing its schedule or routing authority.
   count there, one anywhere else (the rebuild having moved nothing) `holds`. A "merging"
   row on `live` whose record update.sh already dropped (it adopted the tip,
   own_head is that tip) is judged the same way toward own_head, so a rollback
-  killed partway after adoption is caught too. The remedy follows HEAD: at the
-  tag, put the paths back and Dismiss; at the update's new code (main's merge
-  or the rebuilt tip), put them back and finish with `--post-merge`
-  (Dismissing there leaves code bootstrap never ran on). The dashboard's progress poll returns the guard's remedy
+  killed partway after adoption is caught too. The remedy follows HEAD: on a
+  live row at the tag, the repair (`scripts/deploy_candidates repair-move`,
+  below), then the by-hand steps for when its kit is not installed; at the update's new code (main's merge or the rebuilt tip), put the
+  paths back and finish with `--post-merge` (Dismissing there leaves code
+  bootstrap never ran on); a main row at the tag keeps the by-hand text (save,
+  restore, Dismiss). The dashboard's progress poll returns the guard's remedy
   (`guard_remedy`) and the update card shows it. `deploy_code_only.sh` and the live engine refuse to
   restart or move the checkout while it guards; a plain `update.sh` exits 5
   (before tagging or writing anything), and the dashboard's `/apply` answers
@@ -4327,6 +4329,62 @@ tool-disabled CC probe without changing its schedule or routing authority.
   the exit code agree. Otherwise the run exits 1 and leaves no
   `update_refused.json`.
   The rebuilt tip is recorded in the "merging" row as soon as it is adopted.
+  **The live-move repair** (`scripts/lib/live_move_repair.py`, #3492 PR D1;
+  `scripts/deploy_candidates repair-move [--wait N] [--dismiss TS] [--explain]`
+  runs the copy bootstrap installs under `~/.genesis/lib/live-repair/current`,
+  never the checkout's; installing that kit, and running the repair at every
+  server start, is PR D2, not yet built; `--explain` needs no kit, using the
+  checkout's copy read-only when none is installed) heals a live row's `mixed_tree`
+  with HEAD at the rollback tag, toward the tag, never toward the target (HEAD
+  at the target, a rollback killed partway, is refused with exit 1 and nothing
+  changed: finishing that rollback is a later PR, D1f): under update.lock and
+  genesis-checkout.lock (every git lock a killed switch leaves, `index.lock`,
+  `HEAD.lock`, the branch's ref lock and `packed-refs.lock`, is waited for while
+  a process holds it, then saved into the backup's `git/` and removed by one
+  step, on every path that ends healed; a same-user process whose open files
+  cannot be read counts as a holder only if it is a git or the lock is under
+  30 s old, so a non-git process that cannot be inspected and holds a lock
+  longer than that has it judged stale), every path of the two-dot diff, plus
+  a symlink or non-directory parent of one (nothing is read or removed through
+  such a parent), plus every index entry under one of those (restoring a path
+  drops them; a directory holding a foreign one is foreign too), that is not
+  at the tag's bytes is COPIED to
+  `~/.genesis/deploy-backups/<ts>-live-move-repair/` (with `REPAIR.json`,
+  fsynced, and the new directory's entries in `deploy-backups` and the
+  Genesis home fsynced too; a directory row is copied whole, and a row inside
+  it points into that copy; `.git/index` is copied byte for byte as `git/index`)
+  before anything changes, then restored with `git restore
+  --source=<tag>`. A torn index (its trailing checksum fails: git reads it
+  unchecked, then cannot write it back) is rebuilt from the tag after that
+  copy, and the result says so. Permission bits other than the executable
+  bit are not saved: git does not track them, and a restore gives them the
+  umask's, as any checkout does. A path holding what the update did not write (another
+  edit, a flag, a staged or unmerged entry, a gitlink, a directory symlink
+  inside a target directory, a FIFO, socket or device) is still saved and
+  restored, and reported with its exact re-apply step: a foreign index
+  entry's blob is saved under `index-blobs/` and written back by the step
+  before one atomic NUL-delimited `update-index -z --index-info` call; both
+  flags of an `s` entry are restored; a FIFO is made again (`mkfifo -m`);
+  a socket or device holds nothing to save and is recorded by type and mode
+  and reported as removed. A failure before the checkout itself changes (a
+  failed backup included) exits 0 at `--boot`. The guard then judges
+  again and only its SAFE removes the state (byte-identical re-read); `guards`
+  or `holds` (an edit off the move's paths) keeps it, its result naming the
+  restore before what still holds, and exits 0; a kept "partial" record is
+  rewritten "moving" (same byte-identical check), so the guard then reads it
+  `holds`, not `mixed_tree` again; anything
+  else is `unresolved` (exit 1). A target whose objects are
+  gone (its root tree, or any subtree or blob classification reads) is healed
+  by the whole tree against HEAD and cleared by a clean-tree
+  check. A main row is out of scope (exit 3; 0 at `--boot`). The engine
+  writes its merges with `core.fsync=committed`. Each repair prints its report
+  (re-apply steps included) and queues an alert (critical when anything was
+  not the update's, the index was torn, or it did not heal); `REPAIR.json`
+  and `manifests()` are the contract its readers (deploy health, the
+  awareness check, the guardian's diagnosis) read, and those readers arrive
+  in a follow-up PR: until then the command output and the alert carry the
+  report. A run killed after its restore and before its result leaves no
+  result; the next run removes a healed state without a new backup.
   `--post-merge` on `live` never runs the engine. What is recorded and sent to
   the host guardian is the origin/main commit `live` is built on.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;
