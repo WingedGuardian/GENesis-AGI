@@ -339,6 +339,92 @@ class TestSshIPCAdapterSend:
         assert result["stderr"].endswith("FINAL ERROR")
         assert len(result["stderr"]) == 2000
 
+    async def _fail_with(self, stdout: bytes, stderr: bytes) -> dict:
+        adapter = SshIPCAdapter(IPCConfig(method="ssh", ssh_host="user@host"))
+        mock_proc = AsyncMock()
+        mock_proc.communicate.return_value = (stdout, stderr)
+        mock_proc.returncode = 1
+        with patch("genesis.modules.external.ipc.asyncio.create_subprocess_exec",
+                    return_value=mock_proc):
+            return await adapter.send("dispatch", data={"prompt": "test"}, method="CC")
+
+    @pytest.mark.asyncio
+    async def test_send_cc_stderr_scrubbed_before_its_tail(self):
+        # A credential crossing the 2,000-char cut must be redacted on the WHOLE text
+        # first: tailing first strips the `token=` the scrubber keys on and leaves the
+        # rest of the value looking like plain text (review finding, Codex's shape).
+        stderr = b"OAuth token=" + b"A" * 2240 + b"\nauthentication error"
+        result = await self._fail_with(b"", stderr)
+        assert "A" * 20 not in result["stderr"]
+        assert result["stderr"].endswith("authentication error")
+
+    @pytest.mark.asyncio
+    async def test_send_cc_result_text_scrubbed_before_its_tail(self):
+        line = json.dumps({
+            "type": "result", "is_error": True,
+            "result": "token=" + "B" * 2240 + "\nauth failed",
+        })
+        result = await self._fail_with(line.encode(), b"")
+        assert "B" * 20 not in result["result_text"]
+        assert result["result_text"].endswith("auth failed")
+
+    @pytest.mark.asyncio
+    async def test_send_cc_failure_stdout_is_scrubbed(self):
+        # The raw stdout the failure dict returns is scrubbed too: no field of this
+        # result carries an unscrubbed slice of the remote's output.
+        result = await self._fail_with(b"api_key=" + b"C" * 60 + b"\n", b"")
+        assert "C" * 20 not in result["stdout"]
+
+    @pytest.mark.asyncio
+    async def test_send_cc_hidden_credential_crossing_the_cut_is_withheld(self):
+        # A zero-width char inside `token=` hides the assignment from the redactor; a
+        # later cut would then drop the key and leave a bare value. The whole text is
+        # also scanned with such chars deleted, and an unredactable hit withholds it.
+        stderr = "token=\u200b".encode() + b"F" * 2300 + b"\nerr"
+        result = await self._fail_with(b"", stderr)
+        assert "F" * 20 not in result["stderr"]
+        assert result["stderr"] == "<withheld: unredactable content>"
+
+    @pytest.mark.asyncio
+    async def test_send_cc_result_fields_are_typed_or_dropped(self):
+        # api_error_status must be an int and terminal_reason a token: free text in
+        # either never reaches the returned dict.
+        line = json.dumps({
+            "type": "result", "is_error": True, "result": "x",
+            "api_error_status": "404 token=" + "Q" * 30,
+            "terminal_reason": "token=" + "Q" * 30,
+        })
+        result = await self._fail_with(line.encode(), b"")
+        assert result["api_error_status"] is None
+        assert result["terminal_reason"] is None
+
+    @pytest.mark.asyncio
+    async def test_send_cc_failure_drops_raw_json_stdout(self):
+        # JSON escaping hides a credential from the patterns (an escaped quote after
+        # `token=`), so once a structured result is parsed its raw stdout is not
+        # returned; the decoded, scrubbed result_text carries the cause (review finding).
+        line = json.dumps({
+            "type": "result", "is_error": True,
+            "result": 'auth failed token="' + "L" * 40 + '"',
+        })
+        result = await self._fail_with(line.encode(), b"")
+        assert "L" * 20 not in result["stdout"]
+        assert "L" * 20 not in result["result_text"]
+        assert result["stdout"] == "<omitted: structured result parsed; see result_text>"
+
+    @pytest.mark.asyncio
+    async def test_send_cc_failure_text_withheld_when_scrubber_fails(self):
+        # Fail closed: a scrubber error withholds the remote's text, never returns it raw.
+        def boom(_text):
+            raise RuntimeError("scrubber down")
+
+        with patch("genesis.modules.external.ipc.redact_credentials", boom):
+            result = await self._fail_with(b"out api_key=" + b"E" * 40, b"err token=" + b"E" * 40)
+        assert result["exit_code"] == 1
+        for field in ("stdout", "stderr"):
+            assert "E" * 20 not in result[field]
+            assert result[field] == "<withheld: output scrubber failed>"
+
     @pytest.mark.asyncio
     async def test_send_shell_command(self):
         config = IPCConfig(method="ssh", ssh_host="user@host", ssh_key="/tmp/key")

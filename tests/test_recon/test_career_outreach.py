@@ -679,12 +679,12 @@ async def test_observe_probe_stderr_is_scrubbed(db, monkeypatch):
 @pytest.mark.asyncio
 async def test_observe_probe_stderr_withheld_when_scrubber_fails(db, monkeypatch):
     # Fail closed: if the scrubber raises, the stderr is omitted and the detail says so.
-    import genesis.recon.career_outreach as co
+    import genesis.recon.career_outreach_diagnostics as diag
 
     def boom(_text):
         raise RuntimeError("scrubber down")
 
-    monkeypatch.setattr(co, "redact_credentials", boom, raising=False)
+    monkeypatch.setattr(diag, "redact_credentials", boom)
     _cfg(monkeypatch, mode="observe")
     probe = {"error": "Remote claude exited 1", "exit_code": 1,
              "stderr": f"auth failed for key {_FAKE_KEY}"}
@@ -759,6 +759,144 @@ async def test_autorun_dispatch_error_keeps_exit_code_and_stderr(db, monkeypatch
     assert result.errors >= 1
     detail = " ".join(result.details)
     assert "exit=2" in detail and "Error: not logged in" in detail
+
+
+@pytest.mark.asyncio
+async def test_observe_probe_error_string_is_scrubbed(db, monkeypatch):
+    # The top-level error can come from a module's exception text; it goes through the
+    # same scrub as the cause and stderr (review finding).
+    _cfg(monkeypatch, mode="observe")
+    probe = {"error": "Operation failed: token=" + "D" * 30}
+    mon, _ = _mon(db, _FakeModule(probe_result=probe))
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert result.errors == 1
+    assert "D" * 20 not in detail
+    assert "Operation failed" in detail
+
+
+@pytest.mark.asyncio
+async def test_codex_tail_shape_never_reaches_the_detail(db, monkeypatch):
+    # Acceptance replay of the review finding, end to end: the REAL adapter's failure
+    # dict for `OAuth token=` + a 2,240-char value + an auth error, fed into the real
+    # monitor. No run of the credential may reach the detail job health stores.
+    from unittest.mock import AsyncMock, patch
+
+    from genesis.modules.external.config import IPCConfig
+    from genesis.modules.external.ipc import SshIPCAdapter
+
+    adapter = SshIPCAdapter(IPCConfig(method="ssh", ssh_host="user@host"))
+    proc = AsyncMock()
+    proc.communicate.return_value = (b"", b"OAuth token=" + b"A" * 2240 + b" authentication error")
+    proc.returncode = 1
+    with patch("genesis.modules.external.ipc.asyncio.create_subprocess_exec", return_value=proc):
+        adapter_result = await adapter.send("dispatch", data={"prompt": "x"}, method="CC")
+
+    _cfg(monkeypatch, mode="observe")
+    mon, _ = _mon(db, _FakeModule(probe_result=adapter_result))
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert result.errors == 1 and "exit=1" in detail
+    assert "A" * 20 not in detail
+
+
+@pytest.mark.asyncio
+async def test_hidden_credential_crossing_the_adapter_cut_never_reaches_the_detail(
+    db, monkeypatch
+):
+    # Review finding: the adapter's cut dropped a `token=` that a zero-width char had
+    # hidden from its redactor, so the monitor's stronger pass saw a bare value. The
+    # REAL adapter's dict, fed to the real monitor, must not carry the value.
+    from unittest.mock import AsyncMock, patch
+
+    from genesis.modules.external.config import IPCConfig
+    from genesis.modules.external.ipc import SshIPCAdapter
+
+    adapter = SshIPCAdapter(IPCConfig(method="ssh", ssh_host="user@host"))
+    proc = AsyncMock()
+    proc.communicate.return_value = (b"", "token=\u200b".encode() + b"F" * 2300 + b"\nerr")
+    proc.returncode = 1
+    with patch("genesis.modules.external.ipc.asyncio.create_subprocess_exec", return_value=proc):
+        adapter_result = await adapter.send("dispatch", data={"prompt": "x"}, method="CC")
+
+    _cfg(monkeypatch, mode="observe")
+    mon, _ = _mon(db, _FakeModule(probe_result=adapter_result))
+    result = await mon.gather()
+    assert "F" * 20 not in " ".join(result.details)
+
+
+@pytest.mark.asyncio
+async def test_long_error_string_keeps_its_head(db, monkeypatch):
+    # An error string is a message start-first ("Operation failed: ..."); a long one
+    # keeps its head, with a marker, so a short-cut renderer still shows what failed.
+    _cfg(monkeypatch, mode="observe")
+    probe = {"error": "Operation failed: " + "x " * 300}
+    mon, _ = _mon(db, _FakeModule(probe_result=probe))
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert "bridge probe failed: Operation failed:" in detail
+    assert "<rest omitted:" in detail
+
+
+@pytest.mark.asyncio
+async def test_non_string_error_is_rendered_not_replaced(db, monkeypatch):
+    _cfg(monkeypatch, mode="observe")
+    mon, _ = _mon(db, _FakeModule(probe_result={"error": 503}))
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert "bridge probe failed: 503" in detail
+
+
+@pytest.mark.asyncio
+async def test_autorun_module_error_text_is_scrubbed(db, monkeypatch):
+    # The engine's own {"error": ...} text is remote text too: scrubbed whole before
+    # any bound, never cut first (the classifier no longer cuts it).
+    _cfg(monkeypatch, mode="live")
+    secret = "token=" + "G" * 30
+    mon, _ = _mon(db, _FakeModule(autorun_payload_error=f"auth failed {secret}"))
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert result.errors >= 1
+    assert "auth failed" in detail and "G" * 20 not in detail
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_pipeline_error_text_is_scrubbed(db, monkeypatch):
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(error="pipeline query failed token=" + "H" * 30)
+    mon, _ = _mon_bite(db, data)
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert result.errors == 1
+    assert "pipeline query failed" in detail and "H" * 20 not in detail
+
+
+@pytest.mark.asyncio
+async def test_guarded_raise_detail_is_scrubbed(db, monkeypatch):
+    # A sub-capability exception can embed remote text; its detail line is scrubbed
+    # whole, never cut first (review finding).
+    _cfg(monkeypatch, mode="live", bite_mode="live")
+    data = _FakeDataModule(pipeline={})
+    mon, _ = _mon_bite(db, data, reasoning_module=_FakeModule())
+
+    async def _raise(*a, **k):
+        raise RuntimeError("remote said token=" + "J" * 30)
+
+    mon._run_autorun = _raise
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert "auto-run raised: remote said" in detail and "J" * 20 not in detail
+
+
+@pytest.mark.asyncio
+async def test_verify_failed_reason_is_scrubbed(db, monkeypatch):
+    # The engine's verify_failed reason is remote text: scrubbed whole, not cut first.
+    _cfg(monkeypatch, mode="live", cap=2)
+    mod = _FakeModule(autoruns=[{"verify_failed": "bad source token=" + "K" * 30, "company": "A"}])
+    mon, _ = _mon(db, mod)
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert "verify_failed: A: bad source" in detail and "K" * 20 not in detail
 
 
 @pytest.mark.asyncio

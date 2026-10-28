@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shlex
 from pathlib import Path
 from typing import Protocol
@@ -15,8 +16,20 @@ import httpx
 from genesis.cc.child_env import FUNCTION_HOOKS_ENV
 from genesis.cc.types import CCModel, EffortLevel, model_supports_effort
 from genesis.modules.external.config import IPCConfig
+from genesis.security.output_scanner import (
+    LOCATION_FINDINGS,
+    redact_credentials,
+    scan_outbound_normalised,
+)
 
 logger = logging.getLogger(__name__)
+
+# Bound on each piece of remote output a failed CC dispatch returns (stdout, stderr, the
+# result text): enough for a CLI's error and its preamble, while keeping a runaway
+# remote's output out of every reader of the failure dict.
+_FAILURE_TEXT_CHARS = 2000
+# ``terminal_reason`` is a closed CLI vocabulary (e.g. ``api_error``): token shape only.
+_REASON_TOKEN = re.compile(r"[a-z][a-z0-9_]{0,39}")
 
 # Absolute adapter-level ceiling on a per-call ``--max-turns`` override, independent
 # of any one caller's config validation. `send()` params can flow from the generic
@@ -32,6 +45,29 @@ _MAX_TURNS_CEILING = 500
 # layer caps the one real caller at 1800; 3600 is the adapter backstop for any
 # caller that bypasses config validation. (Parity with _MAX_TURNS_CEILING.)
 _MAX_TIMEOUT_CEILING = 3600
+
+
+def _scrubbed_cut(text: object, *, tail: bool) -> str:
+    """``text`` scrubbed WHOLE, then cut to ``_FAILURE_TEXT_CHARS`` (its tail or head).
+
+    The order is the point: cutting first can strip the ``token=`` or key prefix the
+    scrubber keys on and leave the rest of a credential looking like plain text. The
+    scrubbed WHOLE text is then scanned with control / format characters normalised;
+    anything still flagged (a credential such a character hid from the redactor, a card
+    number) withholds the text, because a later cut could drop the part that marks it.
+    Fails closed: if the scrubber raises, the text is withheld and the value says so."""
+    if not isinstance(text, str) or not text:
+        return ""
+    try:
+        scrubbed, _ = redact_credentials(text)
+        leftover = scan_outbound_normalised(scrubbed) - LOCATION_FINDINGS
+    except Exception:
+        logger.warning("SSH CC dispatch: output scrubber failed; output withheld", exc_info=True)
+        return "<withheld: output scrubber failed>"
+    if leftover:
+        return "<withheld: unredactable content>"
+    n = _FAILURE_TEXT_CHARS
+    return scrubbed[-n:] if tail else scrubbed[:n]
 
 
 class IPCAdapter(Protocol):
@@ -345,29 +381,50 @@ class SshIPCAdapter:
         stderr = stderr_bytes.decode()
 
         if proc.returncode != 0:
-            failed = {
-                "error": f"Remote claude exited {proc.returncode}",
-                "exit_code": proc.returncode,
-                # The TAIL: a CLI's final stderr line says why it exited, and any
-                # preamble (ssh warnings) comes first.
-                "stderr": stderr[-2000:],
-                "stdout": stdout[:2000],
-            }
-            # A failed `claude -p --output-format json` reports its CAUSE in stdout's
-            # result object, often with only a tag on stderr. Parse the FULL stdout
-            # (the result is the last line, past any head cut) and pass the cause on.
-            # Only an is_error result is a cause: a non-error result's text is the
-            # model's own reply, not a diagnosis.
-            parsed = self._parse_cc_output(stdout)
-            if not parsed.get("parse_fallback") and parsed.get("is_error"):
-                text = parsed.get("text")
-                # Same 2,000-char tail bound as stderr, for the same reader.
-                failed["result_text"] = text[-2000:] if isinstance(text, str) else ""
-                failed["api_error_status"] = parsed.get("api_error_status")
-                failed["terminal_reason"] = parsed.get("terminal_reason")
-            return failed
+            # The scrub is CPU work over remote output of any size: run it off the
+            # event loop so a large failure dump cannot stall the server.
+            return await asyncio.to_thread(self._failure_result, proc.returncode, stdout, stderr)
 
         return self._parse_cc_output(stdout)
+
+    @classmethod
+    def _failure_result(cls, returncode: int, stdout: str, stderr: str) -> dict:
+        """The non-zero-exit dict: every remote text scrubbed whole BEFORE its cut."""
+        # A failed `claude -p --output-format json` reports its CAUSE in stdout's
+        # result object, often with only a tag on stderr. Parse the FULL stdout (the
+        # result is the last line) and pass the cause on. Only an is_error result is a
+        # cause: a non-error result's text is the model's own reply, not a diagnosis.
+        parsed = cls._parse_cc_output(stdout)
+        structured = not parsed.get("parse_fallback")
+        failed = {
+            "error": f"Remote claude exited {returncode}",
+            "exit_code": returncode,
+            # stderr keeps its TAIL: a CLI's final line says why it exited, and any
+            # preamble (ssh warnings) comes first.
+            "stderr": _scrubbed_cut(stderr, tail=True),
+            # Raw JSON stdout is not returned once its result is parsed: JSON escaping
+            # can hide a credential from the scrubber's patterns, and the decoded,
+            # scrubbed result text is what carries the cause.
+            "stdout": (
+                "<omitted: structured result parsed; see result_text>"
+                if structured
+                else _scrubbed_cut(stdout, tail=False)
+            ),
+        }
+        if structured and parsed.get("is_error"):
+            # Same scrub-then-tail as stderr, for the same reader.
+            failed["result_text"] = _scrubbed_cut(parsed.get("text"), tail=True)
+            # Typed fields only: an int status and a token-shaped reason; any other
+            # value (free text) is dropped rather than returned raw.
+            status = parsed.get("api_error_status")
+            reason = parsed.get("terminal_reason")
+            failed["api_error_status"] = (
+                status if isinstance(status, int) and not isinstance(status, bool) else None
+            )
+            failed["terminal_reason"] = (
+                reason if isinstance(reason, str) and _REASON_TOKEN.fullmatch(reason) else None
+            )
+        return failed
 
     async def _send_shell(self, command: str) -> dict:
         """Run a raw shell command on the remote machine.
