@@ -565,3 +565,82 @@ def test_a_live_read_without_a_label_list_keeps_the_event_labels() -> None:
     ev = _event("labeled", "bare", labels=["devin-ready"], label="devin-ready")
     for current in ({"body": "bare"}, {"body": "bare", "labels": None}):
         assert "devin-ready" in gate.decide(gate.live(ev, lambda n, c=current: c)).remove
+
+
+# -- check: the read-only pre-label check ------------------------------------
+
+
+def _issue(body: str, *labels: str) -> dict:
+    return {"body": body, "labels": [{"name": n} for n in labels], "createdAt": _NEW}
+
+
+@pytest.fixture
+def no_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``check`` is read-only through the injected viewer: any process it starts fails the test."""
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise AssertionError(f"check started a process: {args!r}")
+
+    monkeypatch.setattr(gate.subprocess, "run", refuse)
+
+
+def test_check_passes_an_issue_with_the_six(
+    capsys: pytest.CaptureFixture[str], no_subprocess: None
+) -> None:
+    gh = _FakeGh()
+    assert gate.main(["check", "7"], gh, lambda n: _issue(_COMPLETE)) == 0
+    assert "issue 7: ready for devin-ready" in capsys.readouterr().out
+    assert gh.calls == []
+
+
+def test_check_names_every_missing_answer(
+    capsys: pytest.CaptureFixture[str], no_subprocess: None
+) -> None:
+    gh = _FakeGh()
+    assert gate.main(["check", "#7"], gh, lambda n: _issue("bare")) == 1
+    out = capsys.readouterr().out
+    assert [f"missing premise answer {n}:" in out for n in range(1, 7)] == [True] * 6
+    assert "NOT ready" in out and "verification" not in out
+    assert gh.calls == []
+
+
+def test_check_on_a_verified_bug_still_needs_the_six(capsys: pytest.CaptureFixture[str]) -> None:
+    assert gate.main(["check", "7"], _FakeGh(), lambda n: _issue(_VERIFIED, "bug")) == 1
+    out = capsys.readouterr().out
+    assert "missing premise answer 1:" in out and "missing verification" not in out
+
+
+def test_check_lists_missing_verification_on_a_bug(capsys: pytest.CaptureFixture[str]) -> None:
+    assert gate.main(["check", "7"], _FakeGh(), lambda n: _issue(_COMPLETE, "bug")) == 0
+    out = capsys.readouterr().out
+    assert "missing verification answer 5:" in out and "issue 7: ready for devin-ready" in out
+
+
+@pytest.mark.parametrize("read", [None, [], "body"])
+def test_check_reports_an_unreadable_issue(read: object) -> None:
+    assert gate.main(["check", "7"], _FakeGh(), lambda n: read) == 2
+
+
+def test_check_counts_a_partial_answer_set(capsys: pytest.CaptureFixture[str]) -> None:
+    partial = _COMPLETE.replace("5. No numbers.\n", "5.\n")
+    assert gate.main(["check", "7"], _FakeGh(), lambda n: _issue(partial)) == 1
+    out = capsys.readouterr().out
+    assert "missing premise answer 5:" in out and "(1 of 6 missing)" in out
+
+
+@pytest.mark.parametrize(
+    "args", [["check"], ["check", "x"], ["check", "7", "8"], ["check", "\u00b2"], ["check", "##7"]]
+)
+def test_check_refuses_bad_arguments(args: list[str]) -> None:
+    def view(n: int) -> dict:
+        raise AssertionError("no read on bad arguments")
+
+    assert gate.main(args, _FakeGh(), view) == 2
+
+
+def test_view_treats_a_missing_gh_as_unreadable(monkeypatch: pytest.MonkeyPatch) -> None:
+    def no_gh(*args: object, **kwargs: object) -> None:
+        raise FileNotFoundError("gh")
+
+    monkeypatch.setattr(gate.subprocess, "run", no_gh)
+    assert gate._view(7) is None
