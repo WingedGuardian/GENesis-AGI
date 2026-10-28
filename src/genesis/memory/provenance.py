@@ -19,6 +19,7 @@ import logging
 import re
 from collections.abc import Iterable
 
+from genesis.caller_context import SESSION_ORIGIN_ENV, caller_context
 from genesis.security.sanitizer import (
     ContentSanitizer,
     ContentSource,
@@ -87,10 +88,10 @@ ORIGIN_CLASSES = frozenset({ORIGIN_OWNER, ORIGIN_FIRST_PARTY, ORIGIN_EXTERNAL_UN
 # from security.immunity) so provenance stays dependency-light and cycle-free.
 _SAFE_ORIGINS = frozenset({ORIGIN_OWNER, ORIGIN_FIRST_PARTY})
 
-#: Env var CCInvoker stamps on dispatched CC sessions (and their MCP server
-#: children) carrying the session-level WS-3 origin. See
-#: :func:`session_origin_from_env`.
-SESSION_ORIGIN_ENV = "GENESIS_SESSION_ORIGIN"
+#: ``SESSION_ORIGIN_ENV``, imported above, names the env var CCInvoker stamps on
+#: dispatched CC sessions and their MCP children with the session-level WS-3
+#: origin. ``genesis.caller_context`` defines it and is the only module that
+#: reads it. See :func:`session_origin_from_env`.
 
 
 def is_garbage(content: str | None) -> bool:
@@ -173,10 +174,12 @@ def session_origin_from_env() -> str | None:
     (``session_origin_from_env() or ORIGIN_FIRST_PARTY``), never forward a
     raw ``None``. The producer side (CCInvocation) validates loudly instead,
     so a typo'd origin fails at dispatch, not silently here.
-    """
-    import os
 
-    value = os.environ.get(SESSION_ORIGIN_ENV)
+    The value comes from :func:`genesis.caller_context.caller_context`: the
+    environment in stdio and in-process mode, a request-scoped caller where
+    one is set.
+    """
+    value = caller_context().origin
     if not value:
         return None
     if value not in ORIGIN_CLASSES:

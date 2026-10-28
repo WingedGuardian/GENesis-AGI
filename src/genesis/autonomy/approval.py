@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -60,10 +59,11 @@ class ApprovalManager:
 
         # Preserve ordinary gate contexts. Native/MCP origin is server-owned;
         # a peer cannot supply or overwrite the attribution used for disclosure.
+        from genesis.caller_context import caller_context
         from genesis.db.crud import cc_sessions
         from genesis.observability.session_context import get_session_id
 
-        sid = get_session_id() or os.environ.get("GENESIS_SESSION_ID")
+        sid = get_session_id() or caller_context().session_id
         if sid:
             session = await cc_sessions.get_by_id(self._db, sid)
             if session and session.get("source_tag") == "agent_api":

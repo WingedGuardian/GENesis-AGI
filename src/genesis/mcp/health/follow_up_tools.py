@@ -110,15 +110,11 @@ async def _impl_follow_up_create(
         return {"error": "scheduled_at is required when strategy is 'scheduled_task'"}
 
     try:
-        import os
-
+        from genesis.caller_context import caller_context
         from genesis.ego.domain_classifier import classify_domain
 
         # Detect dispatched session context for proper source attribution
-        if os.environ.get("GENESIS_CC_SESSION") == "1":
-            source = "ego_dispatch"
-        else:
-            source = "foreground_session"
+        source = "ego_dispatch" if caller_context().dispatched else "foreground_session"
 
         # Sacred-board authorization: the hot `follow_up` board is reserved for
         # sanctioned (≈ foreground) paths. An autonomous/dispatched CC session's
@@ -455,9 +451,9 @@ async def _impl_follow_up_update(
             # a re-affirm of an already-on-board item (existing kind == 'follow_up') is a
             # no-op that must NOT demote it, and moving TO tabled stays allowed.
             if resolved_kind == "follow_up" and existing.get("kind") != "follow_up":
-                import os
+                from genesis.caller_context import caller_context
 
-                if os.environ.get("GENESIS_CC_SESSION") == "1":
+                if caller_context().dispatched:
                     resolved_kind = "tabled"
                     autonomous_promotion_blocked = True
             effective_cond = (
