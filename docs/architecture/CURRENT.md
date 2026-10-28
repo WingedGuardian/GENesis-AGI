@@ -3272,6 +3272,16 @@ verified: 3e27b4794 2026-10-23
   Independently runnable contained controls compare pinned/adapted sanitizers;
   this adds no production provider or native monolith qualification. See
   `docs/reference/headlong-reference-redaction.md`.
+- **Native monolith probe**: opt-in contained B1 experiment replaces only the
+  pinned monolith invocation, retaining outer context/probe/backoff/wake code.
+  Thirteen cases/fifteen wakes/thirteen native sessions plus reader correlations
+  require actual state, bytes, run attribution, context and pacing evidence.
+  Integration requires its actual post-review CI report. Tiered memory is off,
+  deterministic related context remains on, and only the protected MCP effect is
+  exposed; no full runtime, dispatcher or capability parity follows. See
+  `docs/reference/headlong-native-monolith.md`.
+  The reference-redaction prerequisite retains issued IDs; explicit conflicts
+  stop before SDK execution and preserve existing timer/reactive pacing.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).
@@ -4319,8 +4329,9 @@ tool-disabled CC probe without changing its schedule or routing authority.
   `scripts/deploy_candidates repair-move [--wait N] [--dismiss TS] [--explain]`
   runs the copy bootstrap installs under `~/.genesis/lib/live-repair/current`,
   never the checkout's; installing that kit, and running the repair at every
-  server start, is PR D2, not yet built; `--explain` needs no kit, using the
-  checkout's copy read-only when none is installed) heals a live row's `mixed_tree`
+  server start, is PR D2, not yet built; `--explain` needs no kit: with none
+  installed it runs the module as HEAD committed it, from memory, never the
+  working tree's copy, which may itself be half-written) heals a live row's `mixed_tree`
   with HEAD at the rollback tag, toward the tag, never toward the target (HEAD
   at the target, a rollback killed partway, is refused with exit 1 and nothing
   changed: finishing that rollback is a later PR, D1f): under update.lock and
@@ -4332,8 +4343,9 @@ tool-disabled CC probe without changing its schedule or routing authority.
   30 s old, so a non-git process that cannot be inspected and holds a lock
   longer than that has it judged stale), every path of the two-dot diff, plus
   a symlink or non-directory parent of one (nothing is read or removed through
-  such a parent), plus every index entry under one of those (restoring a path
-  drops them; a directory holding a foreign one is foreign too), that is not
+  such a parent), plus every index entry under one of those and every index
+  entry above one (a file entry `sub` where the tag has `sub/`; restoring a
+  path drops them; a directory holding a foreign one is foreign too), that is not
   at the tag's bytes is COPIED to
   `~/.genesis/deploy-backups/<ts>-live-move-repair/` (with `REPAIR.json`,
   fsynced, and the new directory's entries in `deploy-backups` and the
@@ -4352,7 +4364,10 @@ tool-disabled CC probe without changing its schedule or routing authority.
   before one atomic NUL-delimited `update-index -z --index-info` call; both
   flags of an `s` entry are restored; a FIFO is made again (`mkfifo -m`);
   a socket or device holds nothing to save and is recorded by type and mode
-  and reported as removed. A failure before the checkout itself changes (a
+  and reported as removed. Steps run parents first; a row re-adding an index
+  entry first drops the entries the restore put below it; a row the repair
+  saw beyond a symlinked or non-directory parent (`unreachable_through`) gets
+  only its index state back, so no step acts through a link it restores. A failure before the checkout itself changes (a
   failed backup included) exits 0 at `--boot`. The guard then judges
   again and only its SAFE removes the state (byte-identical re-read); `guards`
   or `holds` (an edit off the move's paths) keeps it, its result naming the
