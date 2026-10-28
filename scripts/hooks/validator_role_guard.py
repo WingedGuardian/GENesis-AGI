@@ -132,10 +132,16 @@ def _outputs(segment, context, git):
         _check_output(value, context, git)
 
 
-def _check_output(value, context, git):
+_CONTEXT_DIR = object()
+
+
+def _check_output(value, context, git, base=_CONTEXT_DIR):
     # One rule for every file the shell or a program writes: a resolvable,
-    # unprotected path in a known namespace.
-    target = _path(value, context.directory, home_unknown=context.home_unknown, resolve=False)
+    # unprotected path in a known namespace. ``base`` overrides the directory a
+    # relative path resolves against, for a command (git -C) that writes
+    # relative to a directory other than the shell's own.
+    directory = context.directory if base is _CONTEXT_DIR else base
+    target = _path(value, directory, home_unknown=context.home_unknown, resolve=False)
     if not context.namespace or target is None or _protected(target, git):
         raise Refused('Validator output targets a protected or unresolved path')
 
@@ -163,8 +169,31 @@ _LIST_FLAGS = {
     'tag': {'-l', '--list', '-n', '--contains', '--no-contains', '--merged', '--no-merged',
             '--points-at', '--sort', '--format', '--column', '--no-column'},
 }
-# Options that make a read verb run a program or write a file.
+# Options that make a read verb run a program or write a file. --output and
+# --ext-diff do not abbreviate in their setup parsers (MEASURED git 2.43), but
+# git grep's --open-files-in-pager does (parse-options), down to --op, and its
+# short -O runs a pager too, bundled (-nO<cmd>) or glued (-O<cmd>) — so the open
+# pager is matched by prefix and by scanning the short cluster, not by spelling.
 _READ_EFFECTS = ('--output', '-O', '--open-files-in-pager', '--ext-diff')
+# git grep short options that take a value, consuming the glued remainder, so an
+# O inside that value is data, not the -O option.
+_READ_VALUE_SHORTS = frozenset('ABCfem')
+
+
+def _read_effects(verb, rest):
+    for w in rest:
+        name = w.split('=', 1)[0]
+        if name in ('--output', '--ext-diff') or name.startswith('-O'):
+            return True
+        if len(name) >= 4 and '--open-files-in-pager'.startswith(name):
+            return True
+        if verb == 'grep' and name.startswith('-') and not name.startswith('--') and name != '-':
+            for char in name[1:]:
+                if char == 'O':
+                    return True
+                if char in _READ_VALUE_SHORTS:
+                    break  # the rest of the cluster is this option's value
+    return False
 
 
 _CONFIG_READS = {'--get', '--get-all', '--get-regexp', '-l', '--list'}
@@ -253,6 +282,85 @@ def _git_destination(verb, rest, directory, context):
         raise Refused('Validators cannot create a repository in the main checkout')
 
 
+# git config's complete option set (git 2.43 `git config -h`). Classification is
+# by CANONICAL option, so a glued short value, an unambiguous long abbreviation
+# and a --no- negation all resolve to the same bucket, and an unmodeled dashed
+# token refuses — fail-closed, exactly like _git_operands.
+_CONFIG_LONG = frozenset([
+    '--global', '--system', '--local', '--worktree', '--file', '--blob',
+    '--get', '--get-all', '--get-regexp', '--get-urlmatch', '--replace-all',
+    '--add', '--unset', '--unset-all', '--rename-section', '--remove-section',
+    '--list', '--fixed-value', '--edit', '--get-color', '--get-colorbool',
+    '--type', '--bool', '--int', '--bool-or-int', '--bool-or-str', '--path',
+    '--expiry-date', '--null', '--name-only', '--includes', '--show-origin',
+    '--show-scope', '--default'])
+_CONFIG_SHORT = {'f': '--file', 'l': '--list', 'e': '--edit', 't': '--type', 'z': '--null'}
+_CONFIG_SELECTOR = frozenset(['--file', '--blob'])       # the value is a path/blob written off the proven repo
+_CONFIG_OFFREPO = frozenset(['--global', '--system', '--worktree'])
+_CONFIG_VALUE = frozenset(['--file', '--blob', '--type', '--default'])  # consume a separated option value
+
+
+def _config_long(name):
+    # Canonicalize a long option to one git config accepts: an exact match wins,
+    # else the single unambiguous prefix (git's own rule), else None.
+    if name in _CONFIG_LONG:
+        return name
+    hits = [opt for opt in _CONFIG_LONG if opt.startswith(name)]
+    return hits[0] if len(hits) == 1 else None
+
+
+def _git_config(rest, context, git, directory):
+    # A location selector writes off the proven repository: --file/--blob to any
+    # path (checked like an output, anchored at git's effective directory),
+    # --global/--system/--worktree to a target the cwd cannot prove is scratch.
+    # Every dashed token is canonicalized first so a respelling cannot slip past,
+    # and an unmodeled one refuses.
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok == '--':
+            break  # remaining tokens are the name/value operands
+        if not tok.startswith('-') or tok == '-':
+            i += 1
+            continue
+        if tok.startswith('--'):
+            name, sep, attached = tok.partition('=')
+            negated = name.startswith('--no-')
+            base = '--' + name[5:] if negated else name
+            canon = _config_long(base) if len(base) > 2 else None
+            if canon is None:
+                raise Refused('Validator Git config option is not modeled')
+            if not negated and canon in _CONFIG_SELECTOR:
+                selector = attached if sep else (rest[i + 1] if i + 1 < len(rest) else None)
+                if selector is None:
+                    raise Refused('Validator Git config target is unresolved')
+                _check_output(selector, context, git, base=directory)
+                i += 1 if sep else 2
+                continue
+            if not negated and canon in _CONFIG_OFFREPO:
+                raise Refused('Validator Git config writes outside the proven repository')
+            i += 2 if (not sep and not negated and canon in _CONFIG_VALUE) else 1
+            continue
+        # A short-option cluster: a value-taking short (-f/-t) ends it, its value
+        # glued or the next token.
+        j, consumed_next = 1, False
+        while j < len(tok):
+            canon = _CONFIG_SHORT.get(tok[j])
+            if canon is None:
+                raise Refused('Validator Git config option is not modeled')
+            if canon in _CONFIG_VALUE:
+                glued = tok[j + 1:]
+                value = glued or (rest[i + 1] if i + 1 < len(rest) else None)
+                consumed_next = not glued and value is not None
+                if canon in _CONFIG_SELECTOR:
+                    if value is None:
+                        raise Refused('Validator Git config target is unresolved')
+                    _check_output(value, context, git, base=directory)
+                break
+            j += 1
+        i += 2 if consumed_next else 1
+
+
 def _git(segment, context, git):
     options = []
     index = git_subcommand_index(segment.argv, _options=options)
@@ -265,8 +373,7 @@ def _git(segment, context, git):
     if verb is None or _git_read(verb, rest):
         # A read stays a read only without options that run a program or write a
         # file, and with configuration limited to output colour.
-        if any(w == e or w.startswith(e + '=') or (e == '-O' and w.startswith('-O'))
-               for w in rest for e in _READ_EFFECTS):
+        if _read_effects(verb, rest):
             raise Refused('Validator Git read option runs a program or writes a file')
         for name, value in options:
             key = (value or '').split('=', 1)[0].lower()
@@ -294,18 +401,7 @@ def _git(segment, context, git):
         _git_destination(verb, rest, directory, context)
         return
     if verb == 'config':
-        # A location selector writes off the proven repository: --file/--blob to
-        # any path (checked like an output), --global/--system/--worktree to a
-        # target the cwd cannot prove is scratch.
-        for i, tok in enumerate(rest):
-            name, sep, attached = tok.partition('=')
-            if name in {'--file', '-f', '--blob'}:
-                selector = attached if sep else (rest[i + 1] if i + 1 < len(rest) else None)
-                if selector is None:
-                    raise Refused('Validator Git config target is unresolved')
-                _check_output(selector, context, git)
-            elif name in {'--global', '--system', '--worktree'}:
-                raise Refused('Validator Git config writes outside the proven repository')
+        _git_config(rest, context, git, directory)
     if directory is None or uncertain:
         raise Refused('Validator Git mutation has no proven operation repository')
     checkout = git.checkout(str(directory))

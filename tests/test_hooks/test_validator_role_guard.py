@@ -176,6 +176,13 @@ SCRATCH_CONFIG_DENIED = [
     'git config --file {main}/.git/config review.fixture changed',
     'git config -f {home}/.codex/config.toml a.b c', 'git config --file={main}/.git/config a.b c',
     'git config --global alias.x y', 'git config --system a.b c', 'git config --worktree a.b c',
+    # Round-4 audit: git accepts glued short, unambiguous long-abbrev and --no-
+    # negation spellings, and the classifier is fail-closed on anything unmodeled.
+    'git config -f{main}/.git/config a.b c', 'git config --fil={main}/.git/config a.b c',
+    'git config --fil {main}/.git/config a.b c', 'git config -zf{main}/.git/config a.b c',
+    'git config --glo alias.x y', 'git config --sys a.b c', 'git config --wor a.b c',
+    'git config --blo {main}/.git/config a.b c',
+    'git config --bogus a.b c', 'git config -Q a.b c', 'git config -f',
 ]
 
 
@@ -185,9 +192,51 @@ def test_config_location_selectors_are_denied_from_scratch(role, command):
         check(role, command, 'scratch')
 
 
+@pytest.mark.parametrize('selector', [
+    '--file ../../main/.git/config', '--file=../../main/.git/config',
+    '-f ../../main/.git/config', '-f../../main/.git/config', '--fil=../../main/.git/config',
+])
+def test_config_selector_resolves_against_the_effective_git_directory(role, selector):
+    """git -C moves where a relative selector lands; the check must follow it, in every spelling.
+
+    Codex #3663 P2 plus the round-4 audit: with the shell cwd at the fixture root, a
+    relative selector that reaches the main checkout only from the -C directory passed
+    the guard because it was resolved against the cwd — and the glued/abbrev spellings
+    skipped the selector check entirely.
+    """
+    module, paths = role
+    (paths['scratch'] / 'nested').mkdir()
+    with pytest.raises(module.Refused):
+        check(role, 'git -C {scratch}/nested config ' + selector + ' review.fixture changed', 'scratch')
+
+
+def test_config_selector_under_the_effective_directory_stays_allowed(role):
+    """A -C directory's own relative selector is a scratch write and is permitted."""
+    module, paths = role
+    (paths['scratch'] / 'nested').mkdir()
+    check(role, 'git -C {scratch}/nested config --file cfg a.b c', 'scratch')
+
+
 @pytest.mark.parametrize('command', OUTPUT_DENIED)
 def test_saved_and_git_metadata_outputs_are_denied(role, command):
     with pytest.raises(role[0].Refused, match='protected or unresolved'):
+        check(role, command)
+
+
+# Round-4 audit: git grep --open-files-in-pager runs a program, and git accepts
+# it abbreviated (down to --op) or its short -O bundled in a cluster (-nO<cmd>) —
+# every spelling must refuse, like the exact one.
+GREP_EFFECT_DENIED = [
+    'git grep --open-files-in-pager=cmd needle', 'git grep --op=cmd needle',
+    'git grep --ope=cmd needle', 'git grep --open-files-in-pag=cmd needle',
+    'git grep --op needle', "git grep -O'cmd' needle", "git grep -nO'cmd' needle",
+    "git grep -niO'cmd' needle", "git grep -rniO'cmd' needle",
+]
+
+
+@pytest.mark.parametrize('command', GREP_EFFECT_DENIED)
+def test_grep_open_pager_is_denied_in_every_spelling(role, command):
+    with pytest.raises(role[0].Refused):
         check(role, command)
 
 
@@ -230,6 +279,9 @@ def test_spelled_role_operations_are_denied(role, command):
     'curl -XPOST -dkey=value http://192.0.2.1:8080/fixture', 'curl -sSf http://0.0.0.0:5000/health',
     *['git ' + verb for verb in ('status', 'log -1', 'diff', 'show HEAD', 'rev-parse HEAD', 'ls-files',
                                  'grep fixture', 'blame README', 'describe --always', 'for-each-ref')],
+    # Round-4: a glued pattern value or flag cluster carrying an O is a read, not -O.
+    'git grep -eFOO', 'git grep -e FOO fixture', 'git grep -rniE fixture', 'git grep -C3 fixture',
+    'git grep -A2 fixture', 'git grep -m5 fixture', 'git grep -f patterns.txt', 'git grep --only-matching fixture',
     *['gh ' + read for read in ('pr view 1', 'pr list', 'pr diff 1', 'pr checks 1', 'issue view 1',
                                 'issue list', 'run list', 'search prs fixture', 'auth status', 'status',
                                 'release list', 'api repos/example/project')],
@@ -247,6 +299,11 @@ def test_spelled_role_operations_are_denied(role, command):
     'git clone --shared {main} {scratch}/clone', 'git clone --depth 1 {main} {scratch}/c2',
     'git -C {scratch} config --file {scratch}/cfg a.b c', 'git -C {scratch} config a.b c',
     'git -C {scratch} config --local a.b c',
+    # Round-4: fail-closed config must still pass every benign write to the proven repo.
+    'git -C {scratch} config --add a.b c', 'git -C {scratch} config --replace-all a.b c',
+    'git -C {scratch} config --unset a.b', 'git -C {scratch} config --type int a.b 5',
+    'git -C {scratch} config -z --list', 'git -C {scratch} config --name-only --list',
+    'git -C {scratch} config -f{scratch}/cfg a.b c', 'git -C {scratch} config --fil={scratch}/cfg a.b c',
     *['git ' + read for read in ('branch', 'branch --show-current', 'branch -a', 'branch --list "fix*"',
                                  'tag', 'tag --list', 'remote', 'remote -v', 'remote get-url origin',
                                  'worktree list', 'stash list', 'config --get user.name', 'config --list')],
