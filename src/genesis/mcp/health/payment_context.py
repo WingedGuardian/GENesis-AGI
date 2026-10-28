@@ -1474,7 +1474,7 @@ async def _select_by_keys(ppage, handle, value: str, others: list) -> str:
     For extra fields only, whose values are billing text: it runs before the
     claim, when no card value exists in the window."""
     before = [await _step(h.evaluate(EXTRA_VALUE_JS)) for h in others]
-    await _step(handle.focus(timeout=CLICK_MS))
+    await _step(handle.focus())  # ElementHandle.focus takes no timeout; _step bounds it
     for ch in value:
         if not await _step(handle.evaluate(_FOCUSED_JS)):
             return "select"

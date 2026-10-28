@@ -177,6 +177,11 @@ TEXTS = {
     "billing fields may have been typed, but the card was not typed and Add Card and Pay "
     "were not clicked.",
     "page_changed:granted": "The checkout changed while waiting for approval." + _CANCELLED,
+    # The billing typing after approval failed (the code names the field and how):
+    # not necessarily a page change.
+    "page_changed:late": "Typing the billing fields after approval did not complete (the "
+    "code names the field and how). The request was cancelled; the card was not typed and "
+    "Add Card and Pay were not clicked.",
     "claim_refused": "The vault refused to hand over the card (reason given)." + _NONE,
     "claim_unanswered": "The vault did not answer the hand-over; a single-use card may now "
     "be spent." + _NONE,

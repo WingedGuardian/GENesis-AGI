@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import inspect
 import json
 import logging
 import re
@@ -226,7 +227,7 @@ class Handle:
         if not self.el.reverts:
             self.el.value = want
 
-    async def focus(self, timeout=None):
+    async def focus(self):
         _FOCUS["el"] = self.el if self.el.focusable else None
         _FOCUS["keys"] = self.el.keys_to or self.el  # where typed keys really land
 
@@ -3896,3 +3897,27 @@ async def test_a_card_select_that_reverts_is_never_typed_into(vault):
     ns.els["exp_month"].reverts = True
     out, _ = await _run(ns, fields={**ns.fields, "exp_month": "#mm", "exp_year": "#yy"})
     assert out["code"].startswith("failed_before_pay") and ns.ppage.keys_sent == []
+
+
+def test_the_fakes_take_only_what_playwright_takes():
+    # A fake that accepts a keyword the real method lacks hides a TypeError the
+    # live run raises (measured: ElementHandle.focus has no timeout).
+    pw = pytest.importorskip("playwright.async_api")
+    keyboard = type(Page("https://shop.example.com").keyboard)
+    pairs = [
+        (Handle, pw.ElementHandle),
+        (Loc, pw.Locator),
+        (Frame, pw.Frame),
+        (Page, pw.Page),
+        (keyboard, pw.Keyboard),
+    ]
+    bad = []
+    for fake, real in pairs:
+        for name, fn in vars(fake).items():
+            if name.startswith("_") or not callable(fn) or not hasattr(real, name):
+                continue
+            real_params = set(inspect.signature(getattr(real, name)).parameters)
+            for pname, param in inspect.signature(fn).parameters.items():
+                if param.default is not inspect.Parameter.empty and pname not in real_params:
+                    bad.append(f"{fake.__name__}.{name}({pname})")
+    assert bad == []
