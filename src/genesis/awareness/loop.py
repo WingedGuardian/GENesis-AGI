@@ -4027,6 +4027,7 @@ class AwarenessLoop:
         self._autonomous_cli_policy_export_fn = None
         self._briefing_writer_fn = None
         self._findings_ingest_fn = None
+        self._guardian_sent_log_ingest_fn = None
         self._session_observer_fn = None
         self._stopping: bool = False
         self._tick_count: int = 0
@@ -4524,6 +4525,16 @@ class AwarenessLoop:
                         logger.info("Ingested %d Guardian findings", count)
                 except Exception:
                     logger.error("Guardian findings ingest failed", exc_info=True)
+
+            # Record the alerts the host Guardian sent to Telegram (it posts
+            # outside the channel adapter, so nothing else stores them).
+            if self._guardian_sent_log_ingest_fn:
+                try:
+                    count = await self._guardian_sent_log_ingest_fn(self._db)
+                    if count:
+                        logger.info("Recorded %d Guardian-sent alerts", count)
+                except Exception:
+                    logger.warning("Guardian sent-log ingest failed", exc_info=True)
 
             # Sentinel fire alarm check — evaluate conditions and dispatch if needed
             if self._sentinel:
@@ -5145,6 +5156,10 @@ class AwarenessLoop:
     def set_findings_ingest(self, fn) -> None:
         """Inject Guardian findings ingest for reading diagnosis results."""
         self._findings_ingest_fn = fn
+
+    def set_guardian_sent_log_ingest(self, fn) -> None:
+        """Inject the per-tick pull of Guardian-sent alerts into telegram_messages."""
+        self._guardian_sent_log_ingest_fn = fn
 
     def set_session_observer(self, fn) -> None:
         """Inject session observer processor for tool activity notes."""
