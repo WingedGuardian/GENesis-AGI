@@ -598,6 +598,104 @@ def test_the_largest_bindable_pr_is_accepted(tmp_path, monkeypatch, capsys):
     assert "no rows for PR" in capsys.readouterr().out
 
 
+# ── Rechecks due (spec 2026-10-27, PR A) ─────────────────────────────────
+
+_EVENT = {"trigger": "the next weekly run", "recheck": "journalctl -n 20", "detail": "job ran?"}
+_PAST = {
+    "trigger": "2026-01-02",
+    "recheck": "python3 scripts/job_runs.py --since 2026-01-01",
+    "detail": "dated",
+}
+_FUTURE = {"trigger": "2999-01-01", "recheck": "echo later", "detail": "not yet"}
+
+
+def _build_rechecks(db: Path, rechecks: list[dict], *, results: tuple = ()) -> None:
+    async def go() -> None:
+        from genesis.db.crud import pr_verifications as crud
+
+        async with aiosqlite.connect(str(db)) as conn:
+            conn.row_factory = aiosqlite.Row
+            await build_pr_verifications(conn)
+            await conn.commit()
+            await crud.open_verification(
+                conn, repo=REPO, pr_number=40, pr_title="t", merged_at=NOW, now=NOW
+            )
+            await crud.close_verification(
+                conn,
+                repo=REPO,
+                pr_number=40,
+                verdict="pass-with-measured-gaps",
+                reason="r",
+                evidence="{}",
+                now=NOW,
+                rechecks=rechecks,
+            )
+            for index, result in results:
+                await crud.append_recheck_result(
+                    conn, repo=REPO, pr_number=40, index=index, result=result, note="n", now=NOW
+                )
+
+    asyncio.run(go())
+
+
+def test_a_due_recheck_prints_the_exact_record_command_and_its_history(tmp_path, capsys):
+    db = tmp_path / "genesis.db"
+    _build_rechecks(db, [_FUTURE, _PAST, _EVENT], results=((1, "failed"), (1, "failed")))
+    _w._print_verification_backlog(str(db))
+    out = capsys.readouterr().out
+    assert "Rechecks due: 2" in out
+    assert "recheck --pr 40 --index 1 --result-file" in out, "the stored index, exactly"
+    assert "recheck --pr 40 --index 2 --result-file" in out
+    assert "--index 0" not in out, "a future date is not due"
+    assert "latest failed 2026-09-20, 2 attempt(s)" in out
+    assert "never rechecked" in out
+    assert f"recheck: {_PAST['recheck']}" in out, "the command, whole"
+
+
+def test_a_finished_recheck_leaves_the_section(tmp_path, capsys):
+    db = tmp_path / "genesis.db"
+    _build_rechecks(db, [_EVENT], results=((0, "done"),))
+    _w._print_verification_backlog(str(db))
+    out = capsys.readouterr().out
+    assert "Rechecks due: 0" in out and "RECHECK" not in out
+
+
+def test_the_rechecks_section_is_skipped_before_its_migration(tmp_path, capsys):
+    db = tmp_path / "genesis.db"
+
+    async def go() -> None:
+        from genesis.db.crud import pr_verifications as crud
+        from tests.test_session_awareness.conftest import PR_VERIFICATION_MIGRATIONS
+
+        async with aiosqlite.connect(str(db)) as conn:
+            for mig in PR_VERIFICATION_MIGRATIONS[:2]:
+                await mig.up(conn)
+            await conn.commit()
+            await crud.open_verification(
+                conn, repo=REPO, pr_number=1, pr_title="t", merged_at=NOW, now=NOW
+            )
+
+    asyncio.run(go())
+    _w._print_verification_backlog(str(db))
+    out = capsys.readouterr().out
+    assert "Rechecks due: skipped" in out and "pre-migration" in out
+    assert "OPEN  owner/repo#1" in out, "the rest of the backlog still prints"
+
+
+def test_a_malformed_rechecks_column_is_shown_not_hidden(tmp_path, capsys):
+    db = tmp_path / "genesis.db"
+    _build_rechecks(db, [_EVENT])
+
+    async def corrupt() -> None:
+        async with aiosqlite.connect(str(db)) as conn:
+            await conn.execute("UPDATE pr_verifications SET rechecks = ?", ("not json",))
+            await conn.commit()
+
+    asyncio.run(corrupt())
+    _w._print_verification_backlog(str(db))
+    assert "rechecks column is not valid JSON" in capsys.readouterr().out
+
+
 # ── not-yet-done in the backlog (spec 2026-10-27, PR A) ──────────────────
 
 
@@ -626,3 +724,11 @@ def test_a_not_yet_done_row_sorts_after_a_failure_and_before_untouched(tmp_path,
     order = [out.index(f"owner/repo#{n} ") for n in (3, 2, 1)]
     assert order == sorted(order)
     assert "ATTEMPTED 1x  not-yet-done" in out
+
+
+def test_the_log_reader_prints_rechecks_as_STRUCTURE(tmp_path, capsys):
+    db = tmp_path / "genesis.db"
+    _build_rechecks(db, [_EVENT])
+    _w._print_verification_log(str(db), 40)
+    (record,) = _scoped_records(capsys.readouterr().out)
+    assert record["rechecks"][0]["recheck"] == _EVENT["recheck"], "parsed, not a string"

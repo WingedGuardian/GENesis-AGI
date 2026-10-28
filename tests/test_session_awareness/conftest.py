@@ -27,6 +27,7 @@ PR_VERIFICATION_MIGRATIONS = tuple(
     for name in (
         "20260906234824_pr_verifications",
         "20260926061637_pr_verification_verdict",
+        "20261028035444_pr_verification_rechecks",
     )
 )
 
