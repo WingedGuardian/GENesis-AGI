@@ -317,10 +317,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"database not found: {args.db}", file=sys.stderr)
         return 2
 
-    # abspath, NOT resolve(): the monitor scans the configured path without
-    # resolving symlinks, so inbox_items.file_path carries that spelling. A
-    # resolved path here would miss every row under a symlinked inbox.
-    notes = _scan_notes(Path(os.path.abspath(inbox)), args.file)
+    # absolute(), NOT resolve() or abspath(): the monitor scans the
+    # configured path verbatim, so inbox_items.file_path carries that
+    # spelling. abspath() collapses `..` before symlinks are followed
+    # (`/x/link/../inbox` != `/x/../inbox` when link is a symlink), and
+    # resolve() rewrites the spelling entirely — either misses the rows.
+    inbox = inbox.absolute()
+    notes = _scan_notes(inbox, args.file)
 
     rows_by_file: dict[str, list[RowInput]] = {}
     with closing(connect_readonly(args.db)) as conn:
@@ -367,7 +370,11 @@ def main(argv: list[str] | None = None) -> int:
     from genesis.inbox.scanner import RESPONSE_SUFFIX
 
     if (
-        out_resolved.is_relative_to(inbox.resolve())
+        # Unresolved: an --out spelled inside the inbox (including a symlink
+        # sitting in the inbox whose target lies outside it) is refused.
+        out.absolute().is_relative_to(inbox)
+        # Resolved: an --out spelled outside that resolves inside the inbox.
+        or out_resolved.is_relative_to(inbox.resolve())
         or out_resolved == args.db.resolve()
         or (out_resolved.name.endswith(RESPONSE_SUFFIX) and out_resolved.exists())
     ):

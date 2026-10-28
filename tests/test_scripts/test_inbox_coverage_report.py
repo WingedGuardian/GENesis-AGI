@@ -416,6 +416,21 @@ def test_reason_cell_escaped(tmp_path: Path) -> None:
     assert f"| {URL} | failed |  |  | a\\|b |" in md
 
 
+def test_out_symlink_inside_inbox_exits_2(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    (inbox / "note.md").write_text(f"{URL}\n")
+    target = tmp_path / "outside.md"
+    target.write_text("precious\n")
+    link = inbox / "link.md"
+    link.symlink_to(target)
+    db = tmp_path / "genesis.db"
+    _make_db(db)
+    rc = _rep.main(["--inbox", str(inbox), "--db", str(db), "--out", str(link)])
+    assert rc == 2
+    assert target.read_text() == "precious\n"
+
+
 def test_render_has_denominators(tmp_path: Path) -> None:
     _, _, _, md = _run(tmp_path, note_text=f"{URL}\nhttps://example.org/b\n")
     assert (
