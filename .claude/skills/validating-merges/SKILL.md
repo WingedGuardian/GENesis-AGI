@@ -100,7 +100,7 @@ count says anything about the other.
 
 ---
 
-## The four verdicts
+## The five verdicts
 
 Never pass/fail. Every PR gets exactly one of these (standing ruling) — and **you do
 not choose it: the tool DERIVES it from your evidence document**, so the verdict
@@ -108,14 +108,16 @@ always says what the evidence says:
 
 | derived when | verdict | the row | the route |
 |---|---|---|---|
-| `deploy.established` is false | `cannot-verify` | **stays OPEN** | deploy it and re-run — usually not-yet-done |
+| `deploy.established` is false | `cannot-verify` | **stays OPEN** | deploy it and re-run |
 | a claim FAILED at `MEASURED` or `READ` | `fail-intent` | **stays OPEN** | to the USER, as a conversation |
+| a `not_yet_done` gap | `not-yet-done` | **stays OPEN** | run the named commands, then re-run |
 | a claim failed only at `INFERRED` | `cannot-verify` | **stays OPEN** | measure it — a suspicion is not a finding |
 | nothing passing at `MEASURED` or `READ` | `cannot-verify` | **stays OPEN** | see the filing rule below |
 | established, controlled, no gap | `pass-mechanical` | **CLOSED** | nothing owed |
 | established, with any gap | `pass-with-measured-gaps` | **CLOSED** | file the gaps if reachable |
 
-A **gap** is anything you declared in `scope_limits`, plus what the document implies:
+A **gap** is anything you declared in `gaps` (typed by `kind` — see Evidence below),
+plus what the document implies:
 no negative control, any claim at `NOT_VERIFIABLE_HERE`, any claim at `INFERRED`, and
 a named `SUSPECTED FAILURE (INFERRED)` for each claim that failed only at `INFERRED`.
 A failure is gated by tier exactly as a pass is: only an ESTABLISHED one goes to the
@@ -147,7 +149,10 @@ the work you can actually do.
 
 A closing outcome refuses `--note` rather than silently discarding it — a closed
 row's prose belongs in the evidence document's `findings`, which does not change the
-verdict. (`scope_limits` would: every entry is a gap.)
+verdict. (`gaps` would: every entry is a gap.) `not-yet-done` is the one open
+outcome that needs no `--note`: its NOT YET DONE gaps already say what is left and
+the command that does it, and they lead the row's note; a note you add goes after
+them. `--park` is refused on it — undone work is not a reason it cannot be done.
 
 ---
 
@@ -180,8 +185,10 @@ RESOURCE.**
 
 **The abuse this marking invites, and the test that stops it.** *"I did not get
 to it" is never CANNOT-VERIFY.* Ask: **could I have done this with the access and
-the time I actually had?** If yes, it is NOT-YET-DONE — leave the row open and
-say so. Measured instance, the first validator session's own first PR: a
+the time I actually had?** If yes, it is NOT-YET-DONE — do it, or record each step
+as a `not_yet_done` gap with its `command`, which derives `not-yet-done`: the row
+stays open with the command at the head of its note, where the next validator
+starts. Measured instance, the first validator session's own first PR: a
 sub-claim was labelled unverifiable when it was reachable on that very box with a
 throwaway venv; it had been skipped for cost. If CANNOT-VERIFY becomes the
 routine escape, `closed` degrades to "we looked at it" and the word stops
@@ -208,8 +215,10 @@ different PR number. `git merge-base --is-ancestor <mergeCommit> HEAD` therefore
 returns a false *"not deployed"* while the code is live and behaviourally
 correct. Establish it by **content** (the change is present in the deployed
 artifact) or by **BEHAVIOUR** (the live thing was observed doing it), and check
-`baseRefName` before trusting `mergeCommit` at all. Ancestry is a fast positive
-path and never a negative verdict.
+`baseRefName` before reading anything about DEPLOYMENT into `mergeCommit`. The
+document's `merge_commit` is still that `mergeCommit` (`close` checks it); the
+parent squash you actually exercised goes in `deploy.detail`. Ancestry is a fast
+positive path and never a negative verdict.
 
 Report which copy of the code you actually exercised. A verdict that does not
 say is not a verdict.
@@ -315,8 +324,25 @@ because each pilot broke a field the obvious version would have had:
 - **`controls[]`** — a reader cannot distinguish a non-vacuous verification from
   a vacuous one without them. A document with none can still close, but never as
   `pass-mechanical`: "no negative control" becomes a named gap.
-- **`scope_limits[]`** — what this install could not reach, named. Each one is a
-  gap, so any entry makes the outcome `pass-with-measured-gaps`.
+- **`merge_commit`** — the PR's OWN merge commit, 7+ hex characters. `close` checks
+  it against GitHub (`gh pr view --json mergeCommit`) and refuses a mismatch with
+  exit 3, on `--dry-run` too; if gh cannot resolve it, the close is refused (exit 2)
+  rather than waved through. MEASURED 2026-10-27: 5 of 15 documents in one group
+  named main HEAD or the deployed commit instead. On a stacked PR this is still
+  GitHub's `mergeCommit` (on the parent branch); record the parent squash you
+  actually exercised in `deploy.detail`.
+- **`gaps[]`, each with a `kind`** — what this document leaves unestablished, and
+  the kind decides what it does. MEASURED 2026-10-27 over one evening's 99 closes:
+  of 158 untyped gaps, 35 were reachable work that had not been done, 44 waited on
+  an event, 57 were method limits and 22 belonged to the owner — and the untyped
+  list closed every one of them alike.
+  - `method` (`detail`), `owner_only` (`detail`) and `event_gated` (`detail`,
+    `trigger`: a real `YYYY-MM-DD` or a named event, `recheck`: one read-only
+    command or SQL that re-measures it) — close as `pass-with-measured-gaps` with
+    the gap named.
+  - `not_yet_done` (`detail`, `command`) — keeps the row OPEN as `not-yet-done`.
+  The old untyped `scope_limits` is refused by name, never mapped across: choosing
+  each entry's kind is the judgment the untyped list let a close skip.
 - **`findings[]`, each with a DISPOSITION** — an undispositioned finding is a
   drop wearing a record, and the validator refuses one.
 

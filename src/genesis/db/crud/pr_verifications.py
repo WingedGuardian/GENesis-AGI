@@ -55,21 +55,23 @@ def _check_evidence_size(evidence: str | None) -> None:
         )
 
 
-#: The four verdicts a validator session returns (owner standing ruling,
-#: 2026-09-26). Enforced HERE rather than by a CHECK constraint: SQLite cannot
-#: ALTER a CHECK, so a vocabulary this young — invented before the validator had
-#: run once — would cost a full table rebuild to widen. A raise also gives the
-#: caller (an LLM session) a message naming the legal values instead of
+#: The verdicts a validator session returns (owner standing ruling, 2026-09-26;
+#: ``not-yet-done`` added 2026-10-27). Enforced HERE rather than by a CHECK
+#: constraint: SQLite cannot ALTER a CHECK, so a vocabulary this young — invented
+#: before the validator had run once — would cost a full table rebuild to widen,
+#: and the fifth value arrived exactly that way. A raise also gives the caller (an
+#: LLM session) a message naming the legal values instead of
 #: ``IntegrityError: CHECK constraint failed``.
 VERDICTS = (
     "pass-mechanical",
     "pass-with-measured-gaps",
     "fail-intent",
+    "not-yet-done",
     "cannot-verify",
 )
 
 #: The verdicts that DISCHARGE the obligation and therefore close the row. The
-#: other two record an attempt and leave it OPEN, because the work is not done.
+#: others record an attempt and leave it OPEN, because the work is not done.
 PASS_VERDICTS = ("pass-mechanical", "pass-with-measured-gaps")
 
 # Per-CONNECTION-TARGET cache: only the TRUE result is cached — a missing table
@@ -232,8 +234,8 @@ async def close_verification(
     if verdict not in PASS_VERDICTS:
         raise ValueError(
             f"close_verification accepts only {list(PASS_VERDICTS)}, got {verdict!r}. "
-            f"'fail-intent' and 'cannot-verify' do not discharge the obligation — "
-            f"record them with record_attempt(), which leaves the row OPEN."
+            f"The other verdicts do not discharge the obligation — record them with "
+            f"record_attempt(), which leaves the row OPEN."
         )
     _check_evidence_size(evidence)
     if not reason or not reason.strip():
@@ -441,12 +443,14 @@ async def list_closed(
 
 
 async def list_open(db: aiosqlite.Connection, *, limit: int = 500) -> list[dict]:
-    """Open obligations — FAILED first, then NEVER-ATTEMPTED, then PARKED;
-    oldest merge first within each.
+    """Open obligations — FAILED first, then NOT-YET-DONE, then NEVER-ATTEMPTED,
+    then PARKED; oldest merge first within each.
 
     ``fail-intent`` leads because it is the one open state that is a finding: it
     goes to the user, and an open row is its only durable record, so a capped
     window must never be able to drop it behind untouched work (Codex, round 3).
+    ``not-yet-done`` comes next because it is the cheapest work in the ledger: a
+    validator already named the commands that finish it.
 
     Oldest-first within each group because the backlog's point is what has
     waited longest. The group split is newer and exists because this store now
@@ -461,7 +465,7 @@ async def list_open(db: aiosqlite.Connection, *, limit: int = 500) -> list[dict]
 
     The verdict is the discriminator and it is exact on an open row: a PASS
     verdict closes the row, so an OPEN row carries a verdict only after a recorded
-    non-closing attempt — ``fail-intent`` or ``cannot-verify``.
+    non-closing attempt — ``fail-intent``, ``not-yet-done`` or ``cannot-verify``.
 
     Assumes a Row factory. Empty pre-migration — and on a pre-migration database
     the ordering degrades to plain oldest-first rather than failing, because the
@@ -471,8 +475,8 @@ async def list_open(db: aiosqlite.Connection, *, limit: int = 500) -> list[dict]
         return []
     lim = max(1, min(int(limit), 2000))
     order = (
-        "CASE WHEN verdict = 'fail-intent' THEN 0 WHEN verdict IS NULL THEN 1 "
-        "ELSE 2 END ASC, merged_at ASC"
+        "CASE WHEN verdict = 'fail-intent' THEN 0 WHEN verdict = 'not-yet-done' THEN 1 "
+        "WHEN verdict IS NULL THEN 2 ELSE 3 END ASC, merged_at ASC"
         if await _verdict_columns_available(db)
         else "merged_at ASC"
     )
