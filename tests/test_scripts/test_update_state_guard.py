@@ -1171,6 +1171,8 @@ DISPLAY = {
     " lead": ("' lead'", "' lead.t'"),
     "tab\tx": ("$'tab\\tx'", "$'tab\\tx.t'"),
     "nl\nx": ("$'nl\\nx'", "$'nl\\nx.t'"),
+    "cr\rx": ("$'cr\\x0dx'", "$'cr\\x0dx.t'"),
+    "crlf\r\nx": ("$'crlf\\x0d\\nx'", "$'crlf\\x0d\\nx.t'"),
     'q"x': ("'q\"x'", "'q\"x.t'"),
     "\u00fcn": ("'\u00fcn'", "'\u00fcn.t'"),
     "back\\slash": ("'back\\slash'", "'back\\slash.t'"),
@@ -1209,7 +1211,8 @@ def test_r3_every_residue_path_is_shown_by_one_quoting_rule(guard, repo, name):
     assert len(lines) == 2, lines
     for token in (want_added, want_tracked):
         cmd = f"printf %s {token}"
-        got = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True).stdout
+        out = subprocess.run(["bash", "-c", cmd], capture_output=True).stdout
+        got = out.decode("utf-8", "surrogateescape")  # bytes: no newline translation
         assert got in (name, tracked), (token, got)
 
 

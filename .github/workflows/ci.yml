@@ -713,7 +713,9 @@ jobs:
         # "opt-in native qualification" skips. Two added reason-delivery cases
         # share that module flag. Four legacy-anchor refusal/no-op controls
         # bring the module to 76 new opt-ins, ceiling 344 -> 420.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 420
+        # Shared quote native qualification (#3614) adds twelve opt-in cases,
+        # ceiling 420 -> 432. Confirm the exact new-head set in PR CI.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 432
 
   collected-floor:
     # Tests that stop being collected make the suite SMALLER, not red. This job

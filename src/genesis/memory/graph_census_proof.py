@@ -38,7 +38,10 @@ secrets file with ``override=True``, so a key the file carries beats the
 exec-time value (owner ruling, 2026-10-20). The file counts only if it exists
 and neither it nor any symlink on its path changed since the process started;
 a missing file is UNKNOWN, never "enabled", and so is a startup value whose
-file cannot be proven, since that file can override it.
+file cannot be proven, since that file can override it. One exception
+(``carry_secrets``): a file changed only in keys the census does not read is
+carried, when the latest census row proved this same server (pid and start)
+with the same census-key values; rows record that digest, never a value.
 
 **Database scope** (``db_paths`` + ``db_scope``): the primary database is fixed
 when the server script is imported (exec env, else ``<root>/data``); a
@@ -67,9 +70,12 @@ these deliberate constructions stay as residuals:
 - files added beside the script or in site-packages after the start and
   removed before the census reads;
 - the stdlib or site-packages upgraded after the start;
-- a secrets edit landing between the change-time check and the read: at most
-  one census row reads the wrong switch, and the next census sees the new
-  change time, reads unknown, and resets the clock;
+- on the carry path only, a census-key edit written in place, the same size,
+  inside one change-time tick of the previous write and during the read
+  (MEASURED: change times step about 1 ms on this kind of filesystem, and 43 of
+  300 such synthetic rewrites passed the snapshot). Harmless by construction:
+  a carry returns only values whose digest equals the already-proven one, so it
+  never writes a new digest, and the next census reads the file as it is;
 - a venv process in another mount namespace (the test sandbox, MEASURED: 4 of 4
   such processes) is judged on the host checkout's history, because its paths
   are not ours to resolve; reading it unknown would reset the clock on every
@@ -86,6 +92,9 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import hashlib
+import io
+import json
 import os
 import re
 import sys
@@ -532,22 +541,134 @@ def _unchanged_since(path: Path, start: float) -> bool:
     return _links_unchanged_since(path, start) and path.stat().st_ctime < start
 
 
+def _snapshot(path: Path) -> tuple[int, int, int, int]:
+    """The file's identity and state: (device, inode, change time ns, size)."""
+    st = path.stat()
+    return st.st_dev, st.st_ino, st.st_ctime_ns, st.st_size
+
+
+def _read_stable(
+    path: Path, start: float
+) -> tuple[dict[str, str | None], tuple[int, int, int, int]] | None:
+    """The file read ONCE and parsed from that buffer, with the snapshot it was
+    checked against, or None unless the file had the same inode, size and
+    change time before and after the read and no symlink on its path changed
+    since ``start``. Closes the check-then-read race: an edit landing between a
+    change-time check and the parse would otherwise be read as content the check
+    proved, and a digest of it would then be carried indefinitely. A same-size
+    in-place rewrite within one change-time tick is not seen (see the module's
+    residuals)."""
+    from dotenv import dotenv_values
+
+    before = _snapshot(path)
+    text = path.read_text(encoding="utf-8")
+    after = _snapshot(path)
+    if after != before or not _links_unchanged_since(path, start):
+        return None
+    # Raw: interpolating ${VAR} here would use the census's environment, not
+    # that process's. A value that needs it reads as unknown downstream.
+    return dotenv_values(stream=io.StringIO(text), interpolate=False), after
+
+
 def secrets_values(path: Path | None, start: float) -> dict[str, str] | None:
     """The file's values as the process loaded them, or None when that cannot be
-    proven: missing, unreadable, or changed (it or a symlink on its path) since
-    the process started."""
+    proven: missing, unreadable, changed (it or a symlink on its path) since the
+    process started, or changed while being read."""
     if path is None:
         return None
     try:
         if not _unchanged_since(path, start):
             return None
-        from dotenv import dotenv_values
-
-        # Raw: interpolating ${VAR} here would use the census's environment, not
-        # that process's. A value that needs it reads as unknown below.
-        return {k: v for k, v in dotenv_values(path, interpolate=False).items() if v is not None}
+        read = _read_stable(path, start)
+        # The start check runs on the very snapshot the read was checked
+        # against: an edit after `_unchanged_since` but before the read shows here.
+        if read is None or read[1][2] >= int(start * 1e9):
+            return None
+        return {k: v for k, v in read[0].items() if v is not None}
     except Exception:
         return None
+
+
+#: Every secrets.env key the census reads (the switch, `db_paths`,
+#: `genesis_home_of`, `secrets_file`). A proven row records a digest over these
+#: and nothing else, so an edit to any OTHER key leaves a server's census
+#: values exactly as proven.
+CENSUS_SECRET_KEYS = (
+    _SWITCH,
+    "GENESIS_DB_PATH",
+    "GENESIS_REPO_ROOT",
+    "HOME",
+    "GENESIS_HOME",
+    "SECRETS_PATH",
+)
+
+
+def secrets_digest(vals: dict[str, str]) -> str:
+    """A digest of ``vals``' census-relevant keys: sorted ``(key, value)`` pairs,
+    an absent key simply absent. Only the digest is ever written to a row."""
+    pairs = sorted((k, vals[k]) for k in CENSUS_SECRET_KEYS if k in vals)
+    return hashlib.sha256(json.dumps(pairs).encode()).hexdigest()
+
+
+def changed_secrets_values(path: Path | None, start: float) -> dict[str, str] | None:
+    """The file's CURRENT census-relevant values, when its one fault is having
+    changed since ``start``: present, readable, and every symlink on its path
+    older than ``start``. None for any other fault (missing, unreadable, a
+    swapped link), and for a file that has not changed (`secrets_values`
+    proves that one)."""
+    if path is None:
+        return None
+    try:
+        # `_read_stable` checks every symlink on the path after the read.
+        if not path.is_file() or path.stat().st_ctime < start:
+            return None
+        read = _read_stable(path, start)
+        if read is None:
+            return None
+        return {k: v for k in CENSUS_SECRET_KEYS if (v := read[0].get(k)) is not None}
+    except Exception:
+        return None
+
+
+def carry_secrets(
+    path: Path | None,
+    start: float,
+    proven_digest: str | None,
+    *,
+    env: dict[str, str],
+    main_root: Path,
+) -> dict[str, str] | None:
+    """The values a server whose secrets file changed since it started is
+    running with, when that can still be proven: an earlier census row for this
+    same server (pid and start) proved a file whose census-relevant values equal
+    the current file's. Then every load the server can make, at startup or a
+    later router reload, yields exactly these values.
+
+    Refused when the current values could move the secrets file itself: the
+    file names ``SECRETS_PATH`` or ``GENESIS_REPO_ROOT``, or the path derived
+    with its values laid over the launch environment (as a reload's
+    ``expanduser`` sees a ``HOME`` it set) is not this file. A later reload would
+    otherwise read a file nobody proved.
+
+    Residuals, stated:
+    - a server whose startup router build failed reloads lazily at an arbitrary
+      later moment, so a census-key edit REVERTED between two censuses can leave
+      it holding the intermediate value. That needs both a broken startup and an
+      edit-and-revert inside one census interval (about two if a census write
+      crashed, since only the latest row is read);
+    - the model is three writers of a memory server's environment: its launch,
+      the MCP loader and the router reload. litellm's import-time
+      ``load_dotenv()`` (``override=False``, a ``.env`` walked up from its own
+      package) is a fourth that sets only unset keys; this is disproved by any
+      other env writer reachable from a memory server."""
+    if not proven_digest:
+        return None
+    current = changed_secrets_values(path, start)
+    if current is None or "SECRETS_PATH" in current or "GENESIS_REPO_ROOT" in current:
+        return None
+    if secrets_file({**env, **current}, main_root=main_root) != path:
+        return None
+    return current if secrets_digest(current) == proven_digest else None
 
 
 def switch_off(env: dict[str, str], file_vals: dict[str, str] | None) -> bool | None:

@@ -405,10 +405,15 @@ their own Chrome, or, when card fill is on, use `browser_fill_card`:
   checkout", "Add card") takes `steps`: the clicks, in order, each a selector or
   `{"selector", "frames"}`. The payment window replays them after it reopens the
   checkout's URL, before reading or filling anything. Steps are clicks only,
-  never values and never a checkbox.
+  never values and never a checkbox. Each must match exactly one SHOWN
+  element. A refusal names which item failed and why, for example
+  `step_not_found:2:none` (also `several`, `frame`, `owner`); `consent_not_found`
+  and `extra_field_not_found` carry the same detail.
 - A required consent checkbox in the card form (a debit authorization) goes in
   `consent`, never `steps`: the owner's tap shows its label, and the tool ticks
-  it only after the tap.
+  it only after the tap. Pass the checkbox input itself. When a styled box
+  covers it so a click can't land, the tool ticks it through the input's own
+  label (the one label whose control is that input, in the same frame).
 - Billing address fields can omit `"value"`: the tool then reads it from
   `card_fill.billing` in the install's private payments config, so the address
   stays out of tool arguments.

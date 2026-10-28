@@ -59,15 +59,11 @@ different SESSION TYPES, not two phases of one session's life** (user decision,
   the owner does not apply it by hand.
   Its PRs join the same queue (closing-session, "Devin-built PRs").
 
-The handoff between them is **the PR itself** — a durable artifact that survives
-compaction and session death, so nothing has to be remembered across the
-boundary. It also satisfies the `reviewer ≠ implementer, fresh context` contract
-structurally rather than by discipline.
-
-Why it matters here: fused, the first item's review loop consumes the whole
-session — several compactions deep — while everything else the owner arrived
-with goes untouched. **Finishing the PR is finishing the work.** Handing it to
-the queue is not abandoning it.
+The handoff between them is **the PR itself** (why the two are split, and the
+worktree that passes with it: closing-session, "Why this session type exists"). Why
+it matters here: fused, the first item's review loop consumes the whole session
+while everything else the owner arrived with goes untouched. **Finishing the PR
+is finishing the work.** Handing it to the queue is not abandoning it.
 
 Two consequences worth internalizing:
 
