@@ -4765,6 +4765,7 @@ async def _impl_browser_fill_card(
     save: str | dict | None = None,
     amount_max: str | None = None,
     total: str | dict | None = None,
+    success: str | None = None,
     report=None,
 ) -> dict:
     """Pay with a vault card in an isolated browser context. See browser_fill_card."""
@@ -4785,6 +4786,7 @@ async def _impl_browser_fill_card(
             save,
             amount_max,
             total,
+            success,
         )
         # Short hold: every browser tool waits on this lock, and the flow waits minutes.
         async with _browser_lock:
@@ -5103,6 +5105,7 @@ async def browser_fill_card(
     save: str | dict | None = None,
     amount_max: str | None = None,
     total: str | dict | None = None,
+    success: str | None = None,
     ctx: Context | None = None,
 ) -> dict:
     """Pay with a vault card on the open Camoufox checkout after the owner's
@@ -5126,10 +5129,12 @@ async def browser_fill_card(
     save: the control that stores the card, clicked before Pay. amount_max
     (needs save): the ceiling the tap approves, amount's currency; Pay only if
     amount <= total <= amount_max. total (needs save): the total's element;
-    default Pay's label.
+    default Pay's label. success: a top-document selector for a result the
+    checkout shows in place after Pay (no page change); shown and steady with
+    Pay gone, it gives submitted_in_place.
 
     Returns {code, status, host} (+ filled, field, reason where they apply).
-    submitted_unverified: check the order. challenge, card_url_blocked,
+    submitted_unverified: check the order. submitted_in_place, challenge, card_url_blocked,
     card_url_leaked, pay_click_unknown, outcome_unknown, moved_while_filling,
     card_url_before_pay, card_value_in_request, and any code after a save: do
     NOT retry; tell the owner. Refused while card fill is off or another
@@ -5148,7 +5153,19 @@ async def browser_fill_card(
             )
 
     return await _impl_browser_fill_card(
-        card_ref, amount, fields, pay, expiry_format, extra_fields, steps, consent, save, amount_max, total, report=report
+        card_ref,
+        amount,
+        fields,
+        pay,
+        expiry_format,
+        extra_fields,
+        steps,
+        consent,
+        save,
+        amount_max,
+        total,
+        success,
+        report=report,
     )
 
 
