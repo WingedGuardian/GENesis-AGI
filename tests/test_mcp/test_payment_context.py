@@ -3613,6 +3613,7 @@ def test_a_spelled_out_three_d_secure_url_is_a_challenge():
     assert pc._is_challenge("https://pay.example.com/three-d-secure/challenge")
     assert pc._is_challenge("https://pay.example.com/threedsecure")
     assert not pc._is_challenge("https://shop.example.com/checkout")
+    assert not pc._is_challenge("https://shop.example.com/three-d-shipping")
 
 
 async def test_every_result_is_logged_once_with_its_code(vault, logs):
@@ -3663,3 +3664,18 @@ async def test_the_save_stage_log_names_a_url_outcome_over_its_own_code(vault, l
     assert len(hits) == 1 and out["code"] != "total_over_ceiling"
     assert hits[0].startswith(f"payment save stage ended {out['code']};")
     assert ns.pay_clicks == []
+
+
+async def test_a_new_frame_whose_host_carries_the_card_number_is_withheld(vault, logs):
+    ns = save_checkout()
+    late = Frame(f"https://{PAN}.verify.example.net/")
+    late.parent_frame = ns.ppage.main_frame
+    _after_save(ns, lambda: ns.ppage.extra.append(late))
+    await _run(ns, save=SAVE, amount_max="$25.00")
+    hits = [line for line in logs if "save stage ended" in line]
+    assert len(hits) == 1 and "withheld" in hits[0] and PAN not in hits[0]
+
+
+def test_a_frame_origin_is_withheld_without_a_guard_to_ask():
+    assert pc._frame_origin("https://verify.example.net/x", None) == "withheld"
+    assert pc._frame_origin("about:blank", None) == "about:"

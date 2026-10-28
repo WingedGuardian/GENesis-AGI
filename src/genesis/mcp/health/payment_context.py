@@ -92,7 +92,9 @@ _NONCE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # 3DS challenge pages, by host or path. Inferred, not measured: an unknown
 # challenge still ends as "challenge" when the page does not move on in time.
 _CHALLENGE_HOSTS = ("cardinalcommerce.com", "3dsecure.io", "hooks.stripe.com")
-_CHALLENGE_PATH = re.compile(r"3d[-_]?secure|three[-_]?d[-_]?s|/3ds|/acs\b", re.IGNORECASE)
+_CHALLENGE_PATH = re.compile(
+    r"3d[-_]?secure|three[-_]?d[-_]?secure|three[-_]?ds|/3ds|/acs\b", re.IGNORECASE
+)
 
 # The mask (from the payment-tab guard design): the root element of every
 # document is made fully transparent, so its whole subtree (shadow trees,
@@ -420,6 +422,7 @@ class _Flow:
     report: Callable[[str], Awaitable[None]] | None = None
     granted: bool = False  # past the tap: keep the client's idle clock fed
     done: asyncio.Event = field(default_factory=asyncio.Event)
+    guard: object = None  # the window's _UrlGuard: judges what a log line may name
     # The payment window's requests (counts, and the hosts of failed ones): logged
     # when a step finds nothing, the one view of a window that cannot be watched.
     net: dict = field(
@@ -1550,12 +1553,17 @@ async def _await_grant(flow: _Flow, ppage, hooks: Hooks, report, main_page=None)
         await asyncio.sleep(POLL_S)
 
 
-def _frame_origin(url) -> str:
+def _frame_origin(url, guard) -> str:
     """A frame's origin for a log line; never its path or query (they can carry
-    values), and ``about:``/``data:`` frames by scheme alone."""
+    values), and ``about:``/``data:`` frames by scheme alone. An origin is named
+    only when the URL guard finds no armed value in it (a host can be made to
+    carry one); else, or with no guard to ask, "withheld"."""
     origin = cf.origin_of(url)
     if origin:
-        return origin
+        try:
+            return "withheld" if guard is None or guard.carries(origin) else origin
+        except Exception:  # noqa: BLE001 - unjudgeable: never named
+            return "withheld"
     scheme = urlsplit(url).scheme if isinstance(url, str) else ""
     return f"{scheme}:" if scheme.isalpha() else "opaque"
 
@@ -1702,7 +1710,9 @@ async def _save_stage(flow, ppage, args, save, top, title, label, pay, hooks, fi
     if flow.url_blocked or flow.url_leaked:
         code = _typing_outcome(flow)
     with contextlib.suppress(Exception):  # a log line, never a reason to stop
-        new = sorted({_frame_origin(f.url) for f in list(ppage.frames) if f.url not in before})
+        new = sorted(
+            {_frame_origin(f.url, flow.guard) for f in list(ppage.frames) if f.url not in before}
+        )
         logger.warning("payment save stage ended %s; new frames: %s", code or "ok", new or "none")
     return code
 
@@ -1901,7 +1911,7 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
         del handed
         pctx.on("dialog", lambda d: _spawn(d.dismiss()))
         await _step(pctx.add_init_script(MASK_INIT_JS))
-        guard = _UrlGuard(flow)
+        guard = flow.guard = _UrlGuard(flow)
         await _step(pctx.route("**/*", guard.handle))
         pctx.on("request", guard.on_request)
         for event, what in (
