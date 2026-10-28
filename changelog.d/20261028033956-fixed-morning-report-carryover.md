@@ -1,0 +1,1 @@
+- The morning report no longer repeats yesterday's alarm. It now sees what the previous report flagged as Urgent or BLOCKER and demotes an item that has not changed, saying what changed when it does re-raise one. Deploy lag ("N commits behind upstream") is no longer reported as urgent or as a blocker.
