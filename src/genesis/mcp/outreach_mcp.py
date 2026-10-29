@@ -34,6 +34,8 @@ _db = None
 
 def init_outreach_mcp(*, pipeline, engagement, config, db, activity_tracker=None) -> None:
     """Wire runtime dependencies. Called by GenesisRuntime."""
+    from genesis.db.request_database import RequestDatabase
+
     global _pipeline, _engagement, _config, _db
     _pipeline = pipeline
     _engagement = engagement
@@ -41,7 +43,7 @@ def init_outreach_mcp(*, pipeline, engagement, config, db, activity_tracker=None
     _db = db
 
     # Ensure pending_outreach table exists for standalone fallback
-    if db is not None and pipeline is None:
+    if db is not None and pipeline is None and not isinstance(db, RequestDatabase):
         import contextlib
 
         from genesis.db.crud.pending_outreach import ensure_table
@@ -54,10 +56,9 @@ def init_outreach_mcp(*, pipeline, engagement, config, db, activity_tracker=None
         with contextlib.suppress(RuntimeError):
             tracked_task(ensure_table(db), name="outreach-ensure-pending-table", logger=logger)
 
-    if activity_tracker is not None:
-        from genesis.observability.mcp_middleware import InstrumentationMiddleware
+    from genesis.observability.mcp_middleware import install_instrumentation
 
-        mcp.add_middleware(InstrumentationMiddleware(activity_tracker, "outreach", db=db))
+    install_instrumentation(mcp, activity_tracker, "outreach", db)
 
 
 @mcp.tool()

@@ -73,7 +73,7 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: cd784816 2026-09-09
+verified: 2ece179f9ebc 2026-10-28
 ```
 
 **Cross-store integrity is detect + repair.** SQLite (`memory_metadata`/
@@ -235,6 +235,12 @@ a real bridge-node population; `centrality_cache` gains its first reader.
 run through a `GraphStore` protocol with two implementations: the default
 `NetworkxGraphStore` (the in-process MultiDiGraph projection of `memory_links`)
 and `FalkorGraphStore` (below);
+opt-in `RequestDatabase` traversal declines NetworkX before projection and uses
+the existing SQL tier on its owning connection, including pending writes. Healthy
+selected FalkorDB retains projected-data semantics; its scoped fallback uses SQL.
+Legacy NetworkX and centrality behavior are unchanged. The shared SQL traversal
+uses exact delimited hex-ID cycle membership, so substrings, LIKE wildcards,
+empty IDs and NULs cannot hide distinct TEXT nodes.
 `memory/graph.py` is a facade that owns the single production instance and the
 backend choice. The contract, and the reason the seam exists: a read that cannot
 REACH its store RAISES `GraphUnavailableError` and never returns empty — empty
@@ -3660,7 +3666,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py]
-verified: 2ece179f9ebc 2026-10-28
+verified: 01943185f 2026-10-29
 ```
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
@@ -3818,8 +3824,16 @@ tool-disabled CC probe without changing its schedule or routing authority.
   writers their own unit, preserves other caller context, and tracks jobs from
   scheduling through shutdown, including cancellation before start. Activity,
   embedding-heartbeat, deferred-recall, bookmark and proactive tasks use it;
-  legacy connections keep ordinary task scheduling. Service integration remains
-  a separate prerequisite before shared activation. See
+  legacy connections keep ordinary task scheduling. Internal
+  `initialize_request_service` bootstraps memory/health/recon/outreach with
+  mandatory request middleware even without metrics, awaits outreach schema,
+  and refuses a separate memory read pool. Its tracker is bound and optionally
+  warmed once by the owning bootstrap; registration cannot rebind pending flushes
+  or duplicate history. Scoped health supports the standalone status-file service,
+  rejecting runtime snapshot sharing before changing registration. Reinitialization
+  replaces obsolete instrumentation in either DB mode. No CLI or transport
+  selects it yet; caller identity, bookmark policy and shared activation remain
+  separate work. See
   `docs/reference/request-database.md` for lifecycle and failure semantics.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Every

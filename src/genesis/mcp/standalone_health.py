@@ -48,11 +48,9 @@ class StandaloneHealthDataService:
         ignored: this reads a small file on every call, so there is nothing to
         cache and no in-flight compute to coalesce.
 
-        Parity here is hygiene, not a fix for an observed break — this class has
-        no production instantiation today, so nothing currently passes the
-        argument to it. It is declared so the two implementations of this
-        informal interface cannot drift into a TypeError if one is ever
-        substituted for the other.
+        The standalone MCP launcher uses this implementation for both stdio and
+        HTTP. Signature parity lets shared health consumers request a maximum
+        age without requiring the runtime implementation's cache or task sharing.
         """
         if not self._status_path.exists():
             return {

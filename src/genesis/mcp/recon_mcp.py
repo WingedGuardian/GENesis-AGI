@@ -252,10 +252,9 @@ def init_recon_mcp(
     _memory_store = memory_store
     _surplus_queue = surplus_queue
 
-    if activity_tracker is not None:
-        from genesis.observability.mcp_middleware import InstrumentationMiddleware
+    from genesis.observability.mcp_middleware import install_instrumentation
 
-        mcp.add_middleware(InstrumentationMiddleware(activity_tracker, "recon", db=db))
+    install_instrumentation(mcp, activity_tracker, "recon", db)
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

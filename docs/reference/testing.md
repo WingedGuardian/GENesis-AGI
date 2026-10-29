@@ -31,11 +31,34 @@ WAL cursor release and process-death recovery. Four explicit outcome comparisons
 keep the actual legacy middleware as the negative control. Shared MCP service E2E
 qualification is separate from this primitive coverage.
 
+Scoped graph selection and SQL identity parity are covered by
+`tests/test_memory/test_graph_request_database.py` and
+`tests/test_memory/test_graph_path_identity.py`. They use scratch SQLite with
+production table definitions, compare ordered traversal fields against NetworkX,
+and check own pending writes and selected-backend fallback. The FalkorDB boundary
+is simulated; these tests do not claim a live-engine or shared-service E2E run.
+
 `tests/test_db/test_request_database_tasks.py` exercises detached ownership,
 parent rollback, caller ContextVars, cancellation before start and during work,
 shutdown admission, and real activity/heartbeat persistence on scratch SQLite.
 It also checks deferred-recall and procedure-refresh bookkeeping when a job
 never enters its body. Providers and vector services are not called.
+
+For the service boundary, run the named files
+`tests/test_mcp/test_request_database_service.py`,
+`tests/test_mcp/test_request_service_initialization.py`,
+`tests/test_mcp/test_request_service_tool_bodies.py`, and
+`tests/test_mcp/test_request_standalone_health.py`. They use real FastMCP
+clients and service initializers with scratch SQLite, testing concurrent calls,
+protocol cancellation, finalization errors, durable explicit commits, restart,
+and real detached database writers. Standalone health status/alerts assert seeded
+SQL results across success, cancellation, enrichment error and shutdown; guard
+tests reject unsupported runtime health injection without mutating registration.
+Initialization also checks one bootstrap-owned history load, pending-flush
+ownership and scoped/legacy transitions. Bootstrap commit/cleanup failures across
+all four services preserve registration; bootstrap inside the current task's
+active unit is rejected before mutation. External host/provider/vector calls are stubbed;
+HTTP/UDS deployment and caller credentials need separate activation checks.
 
 Genesis v3 has **~21,000 test functions** across **~1,345 files** (counted
 2026-09-06 by `grep -rEh "^\s*(async )?def test_" tests/ --include=*.py | wc -l`;

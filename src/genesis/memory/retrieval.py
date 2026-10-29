@@ -672,6 +672,10 @@ class HybridRetriever:
         rerank_gate: ProviderRateGate | None = None,
         rerank_breaker: CircuitBreaker | None = None,
     ) -> None:
+        from genesis.db.request_database import RequestDatabase
+
+        if isinstance(db, RequestDatabase) and read_pool is not None:
+            raise ValueError("Request-owned retrieval must use read_pool=None")
         self._embeddings = embedding_provider
         self._qdrant = qdrant_client
         self._db = db

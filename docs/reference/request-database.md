@@ -5,6 +5,53 @@ services that retain a database object while concurrent requests need separate
 transactions. This prerequisite does not activate a shared MCP service or change
 existing stdio/in-process initialization.
 
+`genesis.mcp.request_service.initialize_request_service` is the internal opt-in
+bootstrap for memory, health, recon and outreach. Supply the facade and the
+service's ordinary dependencies. It awaits outreach table preparation inside
+a bootstrap unit, then returns the actual FastMCP server. Scoped health uses
+`StandaloneHealthDataService` holding that same facade; the common health
+initializer rejects the runtime health aggregator before changing registration
+because its shared snapshot task is not request-owned. Ordinary-connection
+runtime health remains supported. Memory requires `read_pool=None`.
+Call it before serving requests, and stop
+requests before closing the manager. Initialization is not a hot-reload API.
+Bootstrap owns an independent database unit; call it outside a unit owned by the
+current task. Database finalization completes before service registration starts,
+so a bootstrap commit or cleanup failure leaves registration unchanged. An
+initializer constructor failure still aborts startup; this is not transactional
+replacement of a running server.
+
+An optional activity tracker must already be bound to the identical facade.
+Its owning bootstrap binds it and optionally loads history once before registering
+services; repeated registration never rebinds or warms the tracker. This preserves
+historical counts and the database destination of pending flushes. A different
+database lifetime uses a new tracker. For example, before serving:
+
+```python
+tracker = ProviderActivityTracker()
+tracker.set_db(db)
+async with db.unit_of_work():
+    await tracker.warm_from_db()
+server = await initialize_request_service("recon", db=db, activity_tracker=tracker)
+```
+
+Here `db` is the already constructed `RequestDatabase`; the tracker and initializer
+are imported from `genesis.observability.provider_activity` and
+`genesis.mcp.request_service`, respectively. Bootstrap owns the manager's shutdown.
+
+Each service installs request ownership even when no activity tracker is
+provided. Every tool invocation gets an independent unit; exceptions and MCP
+cancellation roll back its pending work, and commit/cleanup failures propagate
+instead of reporting success. Metrics are optional and record finalization
+failure as a failed call. A normal result containing an `error` field remains
+a normal return. Reinitializing replaces this service's instrumentation in either
+database mode, removing an obsolete scoped boundary when returning to a legacy
+connection. Other services' middleware and unrelated middleware are retained.
+
+No CLI or transport currently selects this bootstrap. Shared activation must
+also supply caller identity, resolve the pending-bookmark policy explicitly,
+and arrange shutdown; database isolation does not provide those boundaries.
+
 Construct it with an existing database path and an explicit positive `max_units`.
 Use `async with db.unit_of_work():` around work. Each outer unit opens a fresh
 physical connection; nested scopes and joined child tasks share the current
@@ -54,9 +101,35 @@ SQL without a live unit and saved cursor operations after scope exit raise
 `DatabaseScopeError`. Cursors are closed at scope exit because a partially fetched
 SELECT can pin the WAL even when commit/rollback alone releases nothing.
 
+Graph traversal with this facade declines the NetworkX projection before building
+it and uses the existing SQL fallback on the current unit's connection. This sees
+the unit's own pending link writes and avoids a cache keyed to a stable facade
+whose underlying connection changes. Healthy selected FalkorDB traversal retains
+its existing projected-data semantics; if it becomes unavailable, scoped fallback
+uses SQL. Legacy NetworkX traversal and centrality are unchanged. SQL cycle
+exclusion compares complete TEXT IDs, including prefixes, wildcard characters,
+empty strings and embedded NULs, using delimited hex tokens.
+The existing traversal telemetry writer explicitly commits through its database
+handle. When that writer runs on the owning unit, preceding pending writes can
+therefore become durable before the tool returns; a later tool error cannot undo
+that prefix. Scoped routing does not remove existing explicit CRUD commits.
+
 Focused scratch-database coverage lives in
 `tests/test_db/test_request_database.py` and
 `tests/test_db/test_request_database_lifecycle.py`. Four legacy middleware
 controls assert the known interfering outcomes alongside the isolated outcomes;
 a shared physical connection cannot meet the isolation contract. These primitive tests are not shared-service activation
 or production qualification evidence.
+
+The `tests/test_mcp/test_request_*service*.py` files exercise the real
+FastMCP client/server path and service initializers over scratch SQLite. Coverage
+includes two clients, protocol cancellation, failed commits, lost replies,
+restart, and real procedure, activity, heartbeat, bookmark and graph-telemetry
+writes. Provider/vector calls are stubbed. This is in-process transport coverage,
+not HTTP/UDS deployment, credential enforcement, or live-service qualification.
+`tests/test_mcp/test_request_standalone_health.py` adds actual health status and
+alert bodies over request-owned SQL, including cancellation, enrichment failure
+and manager shutdown. External host/network/file collectors are replaced with
+isolated fixtures. Standalone means status-file health without runtime objects;
+it can still be hosted once for all clients. Neither these tests nor the internal
+initializer establish shared-process memory savings or activate that deployment.

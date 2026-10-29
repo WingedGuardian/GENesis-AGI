@@ -16,6 +16,7 @@ from typing import Any
 from fastmcp.exceptions import ToolError
 from fastmcp.server.middleware import Middleware
 
+from genesis.db.request_database import RequestDatabase
 from genesis.observability.commit_identity import is_stale
 from genesis.observability.commit_identity import (
     same_commit as _same_commit,  # noqa: F401 — re-exported for Part A's guard test
@@ -25,6 +26,20 @@ from genesis.observability.mcp_guarded_tools import GUARDED_MCP_TOOLS
 from genesis.observability.provider_activity import ProviderActivityTracker
 
 logger = logging.getLogger(__name__)
+
+
+def install_instrumentation(server, tracker, server_name: str, db) -> None:
+    """Scoped ownership is mandatory; metrics remain optional."""
+    # Replace the previous boundary even when returning to a legacy connection.
+    # Otherwise calls can still enter a retired scoped manager.
+    server.middleware[:] = [
+        middleware for middleware in server.middleware
+        if not (isinstance(middleware, InstrumentationMiddleware)
+                and middleware._server == server_name)
+    ]
+    if not isinstance(db, RequestDatabase) and tracker is None:
+        return
+    server.add_middleware(InstrumentationMiddleware(tracker, server_name, db=db))
 
 # Staleness verdict (`is_stale`) + the prefix-tolerant compare (`same_commit`) live
 # in the stdlib-only ``commit_identity`` leaf so the dashboard (Part B) shares the
@@ -41,14 +56,28 @@ class InstrumentationMiddleware(Middleware):
     All tracking is fire-and-forget — tracker errors never propagate to
     the MCP tool handler.
 
-    Per-call transaction boundary (WS-15 follow-up): when constructed with the
+    With RequestDatabase, each call owns an independent unit, including calls
+    without a tracker. Finalization errors propagate and are recorded as errors;
+    existing explicit CRUD commits remain durable. The boundary below describes
+    the legacy shared-connection path, retained for existing initialization.
+
+    Legacy per-call transaction boundary (WS-15 follow-up): when constructed with the
     server's long-lived ``db`` connection, each tool call commits only after a
-    clean return and rolls back otherwise. This releases the read snapshot that a
-    read-only tool would otherwise leave open in deferred-isolation mode — which
-    pins the SQLite WAL checkpoint and makes later writes fail "database is locked".
-    Writes already commit at the CRUD layer before the tool returns, so the commit
-    here only closes a *trailing* read txn (it can never discard a tool's own
-    write); any non-clean exit — a raised ``Exception``, or a ``BaseException`` no
+    clean return and rolls back otherwise. What that boundary can and cannot end
+    (measured on a scratch database, Python 3.12 / SQLite 3.45 / aiosqlite 0.22,
+    legacy implicit-BEGIN isolation, WAL):
+
+    - commit/rollback end an open WRITE transaction, i.e. one a DML statement
+      began and nothing has committed yet;
+    - a read-only call opens no transaction (a SELECT does not BEGIN in this
+      mode), so for it the boundary is a no-op;
+    - a partially read multi-row SELECT pins the WAL checkpoint until its cursor
+      is closed or read to the end, and commit/rollback do NOT release that pin
+      (a ``LIMIT 1`` read with ``fetchone()`` steps to the end and pins nothing).
+
+    Most writes already commit at the CRUD layer before the tool returns, so the
+    commit here only flushes a write the tool left uncommitted (it can never
+    discard a tool's own write); any non-clean exit — a raised ``Exception``, or a ``BaseException`` no
     clause catches (``asyncio.CancelledError``, ``SystemExit``, …) — rolls back the
     possibly-partial write instead of committing it, but only when no other call
     is in flight on the shared connection (a rollback then would discard a
@@ -61,7 +90,7 @@ class InstrumentationMiddleware(Middleware):
 
     def __init__(
         self,
-        tracker: ProviderActivityTracker,
+        tracker: ProviderActivityTracker | None,
         server_name: str,
         db: Any = None,
     ) -> None:
@@ -79,6 +108,32 @@ class InstrumentationMiddleware(Middleware):
         self._is_stale_latched: bool = False
 
     async def on_call_tool(self, context, call_next):
+        if not isinstance(self._db, RequestDatabase):
+            return await self._run_call(context, call_next)
+        started = time.monotonic()
+        success = False
+        try:
+            async with self._db.unit_of_work(independent=True):
+                result = await self._run_call(context, call_next, record=False)
+            success = True
+            return result
+        finally:
+            # Finalization failure is a failed invocation, and must propagate.
+            self._record(context.message.name, started, success)
+
+    def _record(self, tool_name, started, success):
+        if self._tracker is None:
+            return
+        provider = f"mcp.{self._server}.{tool_name}"
+        try:
+            self._tracker.record(
+                provider, latency_ms=(time.monotonic() - started) * 1000,
+                success=success,
+            )
+        except Exception:
+            logger.warning("Activity tracker record failed for %s", provider, exc_info=True)
+
+    async def _run_call(self, context, call_next, *, record=True):
         """Wrap tool invocations with timing, error tracking, and a per-call
         commit/rollback boundary (see class docstring)."""
         tool_name = context.message.name
@@ -97,8 +152,9 @@ class InstrumentationMiddleware(Middleware):
         try:
             if tool_name in GUARDED_MCP_TOOLS:
                 # Raises ToolError (block mode) if this subprocess is running
-                # stale code. Inside the try so the finally's rollback releases
-                # the read snapshot the staleness check opened on self._db.
+                # stale code. Inside the try so a block is recorded as a failed
+                # call. Its update_history read is LIMIT 1 + fetchone(), which
+                # opens no transaction and leaves no snapshot pinned.
                 await self._enforce_freshness(tool_name)
             result = await call_next(context)
             success = True
@@ -162,13 +218,14 @@ class InstrumentationMiddleware(Middleware):
             # Skipping it under concurrency leaves this call's partial
             # statement, if any, for the next commit to flush: the same
             # outcome a peer's commit already produced before this guard. It
-            # also leaves this call's read snapshot open until a peer's own
-            # boundary closes it, so the WAL checkpoint can stay pinned for as
-            # long as that peer runs. Per-call atomicity on one shared
-            # connection needs per-request connections, which this boundary
-            # cannot provide. Only calls through this middleware are counted.
+            # leaves no read snapshot behind: a read-only call opens no
+            # transaction, and a cursor-pinned snapshot is released only by
+            # closing the cursor, never by commit or rollback (class docstring).
+            # Per-call atomicity on one shared connection needs per-request
+            # connections, which the legacy boundary cannot provide. Only calls
+            # through this middleware are counted.
             try:
-                if self._db is not None:
+                if self._db is not None and not isinstance(self._db, RequestDatabase):
                     try:
                         if success:
                             await self._db.commit()
@@ -191,17 +248,8 @@ class InstrumentationMiddleware(Middleware):
                 # raise BaseException too, and a leaked count would disable the
                 # failure rollback for the life of the server process.
                 self._calls_in_flight -= 1
-                try:
-                    self._tracker.record(
-                        provider,
-                        latency_ms=(time.monotonic() - t0) * 1000,
-                        success=success,
-                    )
-                except Exception:
-                    logger.warning(
-                        "Activity tracker record failed for %s",
-                        provider, exc_info=True,
-                    )
+                if record:
+                    self._record(tool_name, t0, success)
 
     async def _enforce_freshness(self, tool_name: str) -> None:
         """Block a guarded tool when this subprocess is running stale code.

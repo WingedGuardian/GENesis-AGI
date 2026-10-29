@@ -100,10 +100,14 @@ def init(
     honor the ``reranker`` config mode + ``GENESIS_MEMORY_RERANK_OFF`` kill.
     """
     from genesis.bookmark.manager import BookmarkManager
+    from genesis.db.request_database import RequestDatabase
     from genesis.memory.linker import MemoryLinker
     from genesis.memory.retrieval import HybridRetriever
     from genesis.memory.store import MemoryStore
     from genesis.memory.user_model import UserModelEvolver
+
+    if isinstance(db, RequestDatabase) and read_pool is not None:
+        raise ValueError("Request-owned memory must use read_pool=None")
 
     # Resolve providers — support both old and new calling conventions
     store_emb = storage_embedding_provider or embedding_provider
@@ -149,10 +153,9 @@ def init(
         db=db,
     )
 
-    if activity_tracker is not None:
-        from genesis.observability.mcp_middleware import InstrumentationMiddleware
+    from genesis.observability.mcp_middleware import install_instrumentation
 
-        mcp.add_middleware(InstrumentationMiddleware(activity_tracker, "memory", db=db))
+    install_instrumentation(mcp, activity_tracker, "memory", db)
 
 
 def _require_init() -> None:
