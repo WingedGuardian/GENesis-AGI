@@ -369,12 +369,16 @@ def main(argv: list[str] | None = None) -> int:
     out_resolved = out.resolve()
     from genesis.inbox.scanner import RESPONSE_SUFFIX
 
+    # A note may itself be a symlink to an external file; --out naming that
+    # target would still truncate what the report just read.
+    note_targets = {Path(note.path).resolve() for note in notes}
     if (
         # Unresolved: an --out spelled inside the inbox (including a symlink
         # sitting in the inbox whose target lies outside it) is refused.
         out.absolute().is_relative_to(inbox)
         # Resolved: an --out spelled outside that resolves inside the inbox.
         or out_resolved.is_relative_to(inbox.resolve())
+        or out_resolved in note_targets
         or out_resolved == args.db.resolve()
         or (out_resolved.name.endswith(RESPONSE_SUFFIX) and out_resolved.exists())
     ):

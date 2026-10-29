@@ -431,6 +431,19 @@ def test_out_symlink_inside_inbox_exits_2(tmp_path: Path) -> None:
     assert target.read_text() == "precious\n"
 
 
+def test_out_naming_symlinked_note_target_exits_2(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    target = tmp_path / "real.md"
+    target.write_text(f"{URL}\n")
+    (inbox / "note.md").symlink_to(target)
+    db = tmp_path / "genesis.db"
+    _make_db(db)
+    rc = _rep.main(["--inbox", str(inbox), "--db", str(db), "--out", str(target)])
+    assert rc == 2
+    assert target.read_text() == f"{URL}\n"
+
+
 def test_render_has_denominators(tmp_path: Path) -> None:
     _, _, _, md = _run(tmp_path, note_text=f"{URL}\nhttps://example.org/b\n")
     assert (
