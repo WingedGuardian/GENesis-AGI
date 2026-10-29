@@ -576,7 +576,7 @@ class _ParsedSegment(NamedTuple):
     redirects: tuple[str, ...]
 
 
-def _command_sub_end(command: str, i: int, n: int) -> int:
+def _command_sub_end(command: str, i: int, n: int) -> int | None:
     """Index just past the matching ``)`` of a ``$(…)`` command substitution that
     opens at ``command[i:i+2] == "$("``.
 
@@ -585,44 +585,60 @@ def _command_sub_end(command: str, i: int, n: int) -> int:
     ``$(…)``/``(…)`` bumps the paren depth; a ``` `…` ``` backtick span is skipped
     whole. This bounds the sub at its TRUE close so a following control operator
     (``&& rm``) can never be swallowed into a redirect target (the Codex-P1
-    regression a paren-only balancer caused). Fail-open: an UNTERMINATED sub returns
-    ``n`` (consume to EOL) — it never raises (the module's no-crash contract).
+    regression a paren-only balancer caused). ``None`` means no matching close;
+    an endpoint of ``n`` means a proven closing delimiter at the end of the text.
 
     Shared by ``_redirect_target_end`` (target boundary) and ``_substitutions``
     (body extraction) so the two agree on where a ``$()`` ends — one scanner, not
     two divergent paren-counters.
     """
     depth, j = 1, i + 2
-    q: str | None = None  # in-body quote state
+    q: str | None = None
+    parents: list[tuple[int, str | None]] = []
     while j < n:
         ch = command[j]
+        if q != "'" and ch == "\\" and j + 1 < n:
+            j += 2
+            continue
+        if q != "'" and command.startswith("$(", j):
+            parents.append((depth, q))
+            depth, q = 1, None
+            j += 2
+            continue
+        if q != "'" and ch == "`":
+            j = _backtick_end(command, j, n) or n
+            continue
         if q is not None:
-            if q == '"' and ch == "\\" and j + 1 < n:  # \ escapes only inside "…"
-                j += 2
-                continue
             if ch == q:
                 q = None
             j += 1
             continue
-        if ch == "\\" and j + 1 < n:  # unquoted backslash escapes the next char
-            j += 2
-            continue
         if ch in ("'", '"'):  # a quoted span begins — its inner ) is data
             q = ch
             j += 1
-            continue
-        if ch == "`":  # nested backtick span — skip to its close (or EOL)
-            close = command.find("`", j + 1)
-            j = close + 1 if close != -1 else n
             continue
         if ch == "(":
             depth += 1
         elif ch == ")":
             depth -= 1
             if depth == 0:
-                return j + 1
+                if not parents:
+                    return j + 1
+                depth, q = parents.pop()
         j += 1
-    return n  # unterminated — fail-open to EOL, never raise
+    return None
+
+
+def _backtick_end(command: str, i: int, n: int) -> int | None:
+    j = i + 1
+    while j < n:
+        if command[j] == "\\" and j + 1 < n:
+            j += 2
+            continue
+        if command[j] == "`":
+            return j + 1
+        j += 1
+    return None
 
 
 def _redirect_target_end(command: str, j0: int, n: int) -> int:
@@ -644,27 +660,23 @@ def _redirect_target_end(command: str, j0: int, n: int) -> int:
     wq: str | None = None  # in-word quote state
     while j < n:
         ch = command[j]
+        if wq != "'" and ch == "\\" and j + 1 < n:
+            j += 2
+            continue
+        if wq != "'" and command.startswith("$(", j):
+            j = _command_sub_end(command, j, n) or n
+            continue
+        if wq != "'" and ch == "`":
+            j = _backtick_end(command, j, n) or n
+            continue
         if wq is not None:
-            if wq == '"' and ch == "\\" and j + 1 < n:
-                j += 2
-                continue
             if ch == wq:
                 wq = None
             j += 1
             continue
-        if ch == "\\" and j + 1 < n:  # unquoted backslash escapes the next char
-            j += 2
-            continue
         if ch in ("'", '"'):  # a quote span begins (or concatenates)
             wq = ch
             j += 1
-            continue
-        if ch == "$" and j + 1 < n and command[j + 1] == "(":  # $(…) command sub
-            j = _command_sub_end(command, j, n)  # quote/escape/nesting-aware close
-            continue
-        if ch == "`":  # `…` backtick sub — to the matching backtick (or EOL)
-            close = command.find("`", j + 1)
-            j = close + 1 if close != -1 else n
             continue
         if ch in _TARGET_STOP:  # unquoted metacharacter ends the word
             break
@@ -878,7 +890,9 @@ def parse_segments(
     split closes). Process substitution ``<(…)``/``>(…)`` stays in BOTH (documented gap).
     ``raw`` stays byte-identical to the historical ``split_segments`` output for every
     ordinary command (the cwd/occurrence consumers match ``Segment.raw`` against a fresh
-    re-split; locked by a golden test over a broad corpus). ONE intentional difference
+    re-split; locked by a golden test over a broad corpus). Substitution bodies retain
+    their own quote/operator context rather than changing the enclosing word's state.
+    Another intentional difference
     from the pre-#1455 scanner: a ``$(…)``/backtick target that contains an UNQUOTED
     control operator (``;`` ``&&`` ``||`` ``|``) is now paren-balanced into ONE segment
     instead of mis-split on that operator — which CLOSES an additional fail-open (HEAD
@@ -900,6 +914,20 @@ def parse_segments(
     word_escapes = "#" not in command
     while i < n:
         c = command[i]
+        end = None
+        if (
+            quote != "'" and command.startswith("$(", i)
+            # Keep unquoted arithmetic shifts visible to heredoc accounting.
+            and (quote == '"' or not command.startswith("$((", i))
+        ):
+            end = _command_sub_end(command, i, n) or n
+        elif quote != "'" and c == "`":
+            end = _backtick_end(command, i, n) or n
+        if end is not None:
+            raw_buf.append(command[i:end])
+            argv_buf.append(command[i:end])
+            i = end
+            continue
         if quote:
             raw_buf.append(c)
             argv_buf.append(c)
@@ -1115,6 +1143,21 @@ def _strip_trailing_comment(seg: str) -> str:
             prev_ws = False
             i += 1
             continue
+        if seg.startswith("$(", i):
+            # Keep the whole substitution verbatim: a `#` inside it is the
+            # substitution's own comment, not a trailing comment on this segment.
+            # (arithmetic and a `$((`-opening subshell both balance via the same end.)
+            end = _command_sub_end(seg, i, n) or n
+            out.append(seg[i:end])
+            prev_ws = False
+            i = end
+            continue
+        if c == "`":
+            end = _backtick_end(seg, i, n) or n
+            out.append(seg[i:end])
+            prev_ws = False
+            i = end
+            continue
         if c in ("'", '"'):
             quote = c
             out.append(c)
@@ -1204,6 +1247,21 @@ def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
                 quote = None
             prev_ws = False
             i += 1
+            continue
+        if seg.startswith("$(", i):
+            # A command substitution is one opaque region: a `#` inside it is the
+            # substitution's OWN comment, never a trailing override on the enclosing
+            # segment. Skip it whole so an inner `# review-override` cannot waive the
+            # gate for the enclosing command or a sibling (the nested commands still
+            # surface via `_substitutions` and are gated on their own). This covers
+            # arithmetic `$((…))` (harmless, no comments) and a subshell that merely
+            # opens `$((` — `_command_sub_end` balances both to the same close.
+            i = _command_sub_end(seg, i, n) or n
+            prev_ws = False
+            continue
+        if c == "`":
+            i = _backtick_end(seg, i, n) or n
+            prev_ws = False
             continue
         if c in ("'", '"'):
             quote = c
@@ -2282,7 +2340,7 @@ def _word_left_open(word: str) -> bool:
             continue
         if word.startswith("$(", i):
             end = _command_sub_end(word, i, n)
-            if end >= n and not word.endswith(")"):
+            if end is None:
                 return True
             i = end
             continue
@@ -2758,7 +2816,9 @@ def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
     commands is a measured decision, and here-doc prose with an apostrophe is the
     commonest untokenizable command, so reporting this cause first would reverse that
     decision for every such command. The reasoning and the residual it leaves are
-    written beside the blind spot.
+    written beside the blind spot. Independently proven structural incompleteness
+    cannot inherit that exemption: withheld segments always carry a bounds-type
+    diagnostic, even when root tokenization also fails.
 
     WITHHOLDING SEGMENTS ALSO WITHHOLDS THE FACTS ON THEM, which is how an earlier
     revision of this docstring came to claim the placement "never removes" a refusal
@@ -4046,6 +4106,8 @@ class _AnalysisResult:
     structural_incomplete: bool
     decision_text: str
     heredoc_incomplete: bool
+    substitution_incomplete: bool = False
+    structural_message: bool = False
 
 
 def _analyze_bounded(
@@ -4071,6 +4133,7 @@ def _analyze_bounded(
         _decision_text = command
     out: list[Segment] = []
     truncated = False
+    substitution_incomplete = False
     # Accepted residue: complex inert heredoc prefixes outside the canonical
     # proof below can be refused despite valid Bash; no broader grammar here.
     structural_incomplete = _depth > 0 and _raw_untokenizable(command)
@@ -4133,19 +4196,31 @@ def _analyze_bounded(
         if exe in _NESTED:
             script = _nested_script(argv, exe)
             if script:
+                # POSIX shlex retains these escapes inside double-quoted -c
+                # arguments, unlike Bash. Do not trust that decoded script.
+                if "\\$" in script or "\\`" in script:
+                    structural_incomplete = structural_message = True
                 nested.append((script, None, False))
 
         nested.extend(
             (script, None, False) for script in _embedded_commands(_argv(seg.argv_src))
         )
-        spans = _substitution_spans(raw)
+        incomplete: list[bool] = []
+        spans = _substitution_spans(raw, _incomplete=incomplete)
+        substitution_incomplete = substitution_incomplete or bool(incomplete and not inert)
         if spans:
             if command.startswith(raw, start):
                 # raw is a plain slice: read its bodies in the outermost text
                 source, offset = here[0], here[1] + start
             else:
                 source, offset = _HeredocLines(raw), 0  # a redirect rewrote raw
-            nested.extend((raw[a:b], (source, offset + a), True) for a, b in spans)
+            for a, b in spans:
+                script = raw[a:b]
+                # Backticks remove a layer of escaping before executing their
+                # body. Preserve the source, but do not trust its undecoded parse.
+                if raw[a - 1] == "`" and "\\" in script:
+                    structural_incomplete = structural_message = True
+                nested.append((script, (source, offset + a), True))
         if not nested:
             continue
         # Past the bound, STOP DESCENDING — and SAY SO. Every scanner below runs
@@ -4166,7 +4241,8 @@ def _analyze_bounded(
             truncated = truncated or inner.bound_reason == "depth"
             heredoc = heredoc or inner.heredoc_incomplete
             structural_incomplete = structural_incomplete or inner.structural_incomplete
-            structural_message = structural_message or inner.diagnostic is _BLIND_STRUCTURAL
+            structural_message = structural_message or inner.structural_message
+            substitution_incomplete = substitution_incomplete or inner.substitution_incomplete
             continuation = continuation or inner.diagnostic is _BLIND_CONTINUATION
             built_escape = built_escape or inner.diagnostic is _BLIND_BUILT_ESCAPE
             for inner_segment in inner.segments:
@@ -4192,7 +4268,7 @@ def _analyze_bounded(
         diagnostic = _BLIND_CONTINUATION
     elif built_escape:
         diagnostic = _BLIND_BUILT_ESCAPE
-    elif structural_message:
+    elif structural_message or (substitution_incomplete and not heredoc):
         diagnostic = _BLIND_STRUCTURAL
     elif root_untokenizable:
         diagnostic = _BLIND_UNTOKENIZABLE
@@ -4204,8 +4280,12 @@ def _analyze_bounded(
         diagnostic = _BLIND_UNRESOLVED_VERB
     else:
         diagnostic = None
+    structural_incomplete = structural_incomplete or substitution_incomplete
+    if structural_incomplete and (diagnostic is None or not diagnostic.bounds_induced):
+        diagnostic = _BLIND_STRUCTURAL
     return _AnalysisResult(
-        out, bound_reason, diagnostic, structural_incomplete, _decision_text, heredoc
+        out, bound_reason, diagnostic, structural_incomplete,
+        _decision_text, heredoc, substitution_incomplete, structural_message,
     )
 
 
@@ -4264,35 +4344,53 @@ def _substitutions(text: str) -> list[str]:
     return [text[a:b] for a, b in _substitution_spans(text)]
 
 
-def _substitution_spans(text: str) -> list[tuple[int, int]]:
+def _substitution_spans(
+    text: str, *, _incomplete: list[bool] | None = None,
+) -> list[tuple[int, int]]:
     """:func:`_substitutions` as ``(start, end)`` offsets of each body in ``text``, so
     the here-doc check can read a body the extraction cut against the text it was
-    cut from."""
+    cut from. An unclosed dollar body retains its final byte for best-effort
+    traversal; checked callers must withhold results when ``_incomplete`` is set."""
     subs: list[tuple[int, int]] = []
     i, n = 0, len(text)
-    in_sq = False
+    quote: str | None = None
     while i < n:
         c = text[i]
-        if in_sq:
+        if quote == "'":
             if c == "'":
-                in_sq = False
+                quote = None
             i += 1
             continue
-        if c == "'":
-            in_sq = True
+        if c == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if c == quote:
+            quote = None
+            i += 1
+            continue
+        if quote is None and c in ("'", '"'):
+            quote = c
             i += 1
             continue
         if c == "$" and i + 1 < n and text[i + 1] == "(":
             end = _command_sub_end(text, i, n)  # index past matching ')'
-            subs.append((i + 2, end - 1))  # body between $( and )
+            if end is None:
+                subs.append((i + 2, n))
+                if _incomplete is not None:
+                    _incomplete.append(True)
+                break
+            subs.append((i + 2, end - 1))
             i = end
             continue
         if c == "`":
-            j = text.find("`", i + 1)
-            if j != -1:
-                subs.append((i + 1, j))
-                i = j + 1
+            end = _backtick_end(text, i, n)
+            if end is not None:
+                subs.append((i + 1, end - 1))
+                i = end
                 continue
+            if _incomplete is not None:
+                _incomplete.append(True)
+            break
         i += 1
     return subs
 

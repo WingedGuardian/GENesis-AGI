@@ -44,8 +44,7 @@ WORDS = (
     "\\$x",
     "-n",
 )
-# #3264/#3271/#3272: quote-bearing tokens in substitutions can hide commands.
-SUBSTITUTION_WORDS = tuple(word for word in WORDS if "'" not in word and '"' not in word)
+SUBSTITUTION_WORDS = WORDS
 WRAPPERS = ("", "", "", "env X=1 ", "timeout 5 ", "nice -n 5 ", "command ", "X=1 ", "nohup ")
 REDIRECTS = ("", "", " 2>/dev/null", " >out", " 2>&1", " <in")
 SEPARATORS = (" ; ", " && ", " | ", "\n", " || ")
@@ -442,13 +441,11 @@ def test_literal_argv_controls(oracle: _BashOracle, command: str, expected: list
     ],
     ids=("gh3272",),
 )
-def test_known_gap_still_reproduces(oracle: _BashOracle, gap_id: str, command: str) -> None:
+def test_paired_substitutions_report_executed_suffix(oracle: _BashOracle, gap_id: str, command: str) -> None:
     observed = oracle.run(command)
     segments, blind = sp.analyze_checked(command)
-    message = f"{gap_id} is fixed; delete this row and re-enable its construct in the generator."
-    assert any(invocation[0] == "curl" for invocation in observed), message
-    assert blind is None, message
-    assert not any(segment.exe == "curl" for segment in segments), message
+    assert any(invocation[0] == "curl" for invocation in observed), gap_id
+    assert blind is not None or any(segment.exe == "curl" for segment in segments), gap_id
 
 
 @pytest.mark.parametrize("command", [
