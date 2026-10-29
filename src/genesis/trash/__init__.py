@@ -313,6 +313,7 @@ def trash(path: str | os.PathLike[str], *, reason: str, caller: str) -> Tombston
             os.environ.get("GENESIS_SESSION_ID")
             or os.environ.get("CLAUDE_CODE_SESSION_ID")
             or os.environ.get("CLAUDE_SESSION_ID")
+            or None
         ),
         trashed_at=datetime.now(UTC).isoformat(timespec="seconds"),
     )

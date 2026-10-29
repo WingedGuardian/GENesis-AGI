@@ -7,6 +7,7 @@ module: a name imported before the fixture runs is the REAL path.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -14,7 +15,7 @@ from pathlib import Path
 import pytest
 
 import genesis.env as env
-from genesis.trash import ITEM, TrashRefused, list_entries, trash
+from genesis.trash import ITEM, TOMBSTONE, TrashRefused, list_entries, trash
 from genesis.trash.__main__ import EXIT_REFUSED, EXIT_USAGE, main
 
 
@@ -92,6 +93,25 @@ def test_an_empty_session_variable_falls_through(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "cc-session")
     stone = trash(_touch(tmp_path / "a.txt"), reason="r", caller="c")
     assert stone.session_id == "cc-session"
+
+
+@pytest.mark.parametrize("genesis_id", [None, "", "genesis-session"])
+@pytest.mark.parametrize("cc_id", [None, "", "cc-session"])
+@pytest.mark.parametrize("legacy_id", [None, "", "legacy-session"])
+def test_session_id_absent_empty_and_nonempty_states(
+    tmp_path, monkeypatch, genesis_id, cc_id, legacy_id,
+):
+    values = (genesis_id, cc_id, legacy_id)
+    for name, value in zip(_SESSION_VARS, values, strict=True):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    expected = next((value for value in values if value), None)
+    stone = trash(_touch(tmp_path / "item.txt"), reason="r", caller="c")
+    assert stone.session_id == expected
+    stored = json.loads((Path(stone.root) / stone.entry_id / TOMBSTONE).read_text())
+    assert stored["session_id"] == expected
 
 
 @pytest.mark.parametrize("which", ["file", "wal", "shm", "dir"])
