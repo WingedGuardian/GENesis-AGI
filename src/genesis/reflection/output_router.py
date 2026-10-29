@@ -166,11 +166,12 @@ _REJECTED_SAMPLE = 20
 def _parse_surplus_cited(raw) -> list[str] | None:
     """The ``surplus_cited`` id list, or None when the model did not report one.
 
-    A non-list value counts as not reported. Non-string and empty entries are
-    dropped, ids are stripped, and repeats keep their first position. Whether
-    each id was actually in the prompt is checked at routing time.
+    A non-list value or a list with non-string entries counts as not reported.
+    Empty string entries are dropped, ids are stripped, and repeats keep their
+    first position. Whether each id was actually in the prompt is checked at
+    routing time.
     """
-    if not isinstance(raw, list):
+    if not isinstance(raw, list) or any(not isinstance(entry, str) for entry in raw):
         return None
     cited: list[str] = []
     for entry in raw:

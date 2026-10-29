@@ -93,22 +93,42 @@ class TestParseSurplusCited:
         )
         assert out.surplus_cited is None
 
-    def test_non_string_entries_dropped(self):
+    @pytest.mark.parametrize("cited", [[3, None, {"id": "b"}], ["a", 3], [False]])
+    def test_malformed_list_is_not_reported(self, cited):
         out = parse_deep_reflection_output(
             json.dumps(
                 {
                     "observations": ["o"],
-                    "surplus_cited": ["a", 3, None, {"id": "b"}, ""],
+                    "surplus_cited": cited,
                 }
             )
         )
-        assert out.surplus_cited == ["a"]
+        assert out.surplus_cited is None
 
 
 # ── Routing: the probe record ─────────────────────────────────────────
 
 
 class TestRouteRecordsCitations:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cited", [[3, None, {"id": "s1"}], ["s1", 3]])
+    async def test_malformed_list_remains_unreported_in_event(self, db, tmp_path, cited):
+        bus = AsyncMock()
+        router = OutputRouter(event_bus=bus, reflections_dir=tmp_path / "r")
+        await _promoted(db, ["s1"])
+        out = parse_deep_reflection_output(
+            json.dumps({"observations": ["synthetic reflection"], "surplus_cited": cited})
+        )
+        summary = await router.route(out, db, gathered_surplus_ids=("s1",))
+        assert summary["surplus_probe"]["cited"] is None
+        assert summary["surplus_consumed"] == 1
+        completed = [
+            c for c in bus.emit.call_args_list
+            if len(c.args) > 2 and c.args[2] == "deep_reflection.completed"
+        ]
+        assert len(completed) == 1
+        assert completed[0].kwargs["surplus_probe"]["cited"] is None
+
     @pytest.mark.asyncio
     async def test_cited_subset_recorded(self, db, router):
         await _promoted(db, ["s1", "s2", "s3"])
