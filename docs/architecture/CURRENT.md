@@ -1533,7 +1533,7 @@ Every surface a human (or host process) talks to Genesis through.
 
 ```yaml subsystem-map
 entry: channels-interfaces
-modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
+modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
 verified: 74c474c0f 2026-10-24
 ```
 
@@ -1864,6 +1864,24 @@ the shared banner is not an assertion about all concurrent sessions.
   restricted `mail`-profile sessions. Sending is NOT here — all sends go
   through the outreach gate (entry 3). Trap: never default a recipient to the
   agent's own address (self-send loop).
+- **live_agent/**: one persistent Claude Code session driven from a program
+  through `claude-agent-sdk` (`LiveAgent`): start-or-steer turns, explicit
+  interrupt, `can_use_tool` permission asks surfaced as approvals that default
+  to deny, and a bounded progress stream (`ProgressSummarizer`, lines ≤500
+  bytes) for a voice front end. It runs the install's pinned `claude`, with
+  Claude Code's own system prompt and every settings source, so it loads hooks,
+  skills and MCP servers like a terminal and registers as an owner foreground
+  session. Phase 0 host: `scripts/live_agent_cli.py`; only the `owner_cli`
+  initiator may call `turn()` until model-initiated turns pass the
+  autonomous-CLI approval gate. Turns the session injects itself
+  (background-task notifications, peer or scheduled messages) still run, as in
+  any terminal session, and each approval line shows the tool input it would
+  run. Traps (measured once each on CLI 2.1.299, 2026-10-22): a
+  `priority: "now"` steer waits for the running tool
+  to finish, then ABORTS the turn (its own result) and runs as the next turn,
+  while `interrupt()` kills the running tool; and a host started inside
+  another Claude Code session must drop that session's identity variables
+  (`PARENT_SESSION_VARS` in the CLI), which the SDK cannot remove.
 - GROUNDWORK: unified-bridge, outreach-pipeline (channels/base.py),
   guardian-dialogue (dashboard health route).
 
@@ -2709,7 +2727,8 @@ verified: 477efb7f7 2026-10-05
   two import-free hooks inline under a parity test) — this sweep is the WRITER
   its GROUNDWORK note named. Levers: settings domain `ledger_escalation` + env
   `GENESIS_LEDGER_ESCALATION_DISABLED`; `escalate_added_by` is a provenance
-  allow-list, foreground-only by default so the ambient extractor's PROPOSALS
+  allow-list, `foreground` + `relayed` (the owner's request written by a
+  dispatched session) by default, so the ambient extractor's PROPOSALS
   cannot ask the owner to dispose of something nobody committed to.
   **Trap: it must never write `session_ledger`** — an evidence write would bump
   `updated_at` and read as a disposition the owner never made, i.e. the sweep
@@ -3660,7 +3679,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py]
-verified: 8a62059720cd 2026-10-22
+verified: 9c2209df8 2026-10-29
 ```
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
@@ -3903,6 +3922,14 @@ tool-disabled CC probe without changing its schedule or routing authority.
   before draining); `DeferredWorkQueue` priorities + staleness policies;
   dead-letter replay. The `dream_synthesis_slice` worklist is deliberately
   excluded from the backlog alarm (drift-guard test pins it).
+  `StatusFileWriter` gathers runtime/DB data on-loop, then publishes immutable
+  JSON through one ordered executor job. Cancellation cannot release publication
+  admission before the actual file worker finishes. Runtime shutdown cancels the
+  minute writer loop and drains its publication before DB teardown, including
+  partial bootstrap. The status timestamp describes the collected snapshot, not
+  delayed publication; this keeps watchdog freshness checks truthful. This
+  protects event-loop responsiveness during slow status-file I/O; it does not
+  establish recovery of an independent SSH transport or shared storage.
   `NetworkSentinel` (`network_sentinel.py`) probes the open internet (DNS+TCP to
   public anchors) on a cadence and publishes a 3-state `network` axis
   (NORMAL/DEGRADED/OFFLINE) with asymmetric hysteresis — it OWNS its hysteresis

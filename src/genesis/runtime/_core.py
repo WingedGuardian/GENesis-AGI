@@ -634,6 +634,16 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
                 logger.exception("Failed to stop outreach recovery worker")
 
     async def shutdown(self) -> None:
+        # Also retire a writer installed by an incomplete bootstrap. Cancel the
+        # loop first, then wait for any worker it left behind before DB teardown.
+        if self._status_writer_task is not None and not self._status_writer_task.done():
+            self._status_writer_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._status_writer_task
+            logger.info("Stopped status writer loop")
+        if self._status_writer is not None:
+            await self._status_writer.aclose()
+
         if not self._bootstrapped:
             return
 
@@ -644,12 +654,6 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._approval_timeout_task
             logger.info("Stopped approval timeout poller")
-
-        if self._status_writer_task is not None and not self._status_writer_task.done():
-            self._status_writer_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._status_writer_task
-            logger.info("Stopped status writer loop")
 
         # Cancel-and-await in-flight direct sessions while the DB is still
         # open, so _run_session's CancelledError handler can persist a

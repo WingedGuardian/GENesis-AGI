@@ -92,6 +92,21 @@ async def test_ledger_add_explicit_invalid_added_by(db, sessions_dir):
     assert "added_by" in res["error"]
 
 
+async def test_ledger_add_relayed_is_caller_settable(db, sessions_dir, monkeypatch):
+    """A dispatched session relaying the owner's request onto a FOREGROUND
+    charter marks it `relayed`; nothing infers that, so the value must be
+    accepted from the caller and stored as given."""
+    monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "99998888-7777-6666-5555-444433332222")
+    with patch.object(tools, "_get_db", return_value=db):
+        res = await tools._impl_session_ledger_add(
+            SID, "the owner asked for this", added_by="relayed"
+        )
+    assert "error" not in res, res
+    item = await crud.get_ledger_item(db, res["id"])
+    assert item["added_by"] == "relayed"
+
+
 async def test_ledger_add_writes_mirror(db, sessions_dir):
     with patch.object(tools, "_get_db", return_value=db):
         await tools._impl_session_ledger_add(SID, "durable agreement")

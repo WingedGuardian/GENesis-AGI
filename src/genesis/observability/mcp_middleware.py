@@ -43,13 +43,22 @@ class InstrumentationMiddleware(Middleware):
 
     Per-call transaction boundary (WS-15 follow-up): when constructed with the
     server's long-lived ``db`` connection, each tool call commits only after a
-    clean return and rolls back otherwise. This releases the read snapshot that a
-    read-only tool would otherwise leave open in deferred-isolation mode — which
-    pins the SQLite WAL checkpoint and makes later writes fail "database is locked".
-    Writes already commit at the CRUD layer before the tool returns, so the commit
-    here only closes a *trailing* read txn (it can never discard a tool's own
-    write); any non-clean exit — a raised ``Exception``, or a ``BaseException`` no
-    clause catches (``asyncio.CancelledError``, ``SystemExit``, …) — rolls back the
+    clean return and rolls back otherwise. What that boundary can and cannot end
+    (measured on a scratch database, Python 3.12 / SQLite 3.45 / aiosqlite 0.22,
+    legacy implicit-BEGIN isolation, WAL):
+
+    - commit/rollback end an open WRITE transaction, i.e. one a DML statement
+      began and nothing has committed yet;
+    - a read-only call opens no transaction (a SELECT does not BEGIN in this
+      mode), so for it the boundary is a no-op;
+    - a partially read multi-row SELECT pins the WAL checkpoint until its cursor
+      is closed or read to the end, and commit/rollback do NOT release that pin
+      (a ``LIMIT 1`` read with ``fetchone()`` steps to the end and pins nothing).
+
+    Most writes already commit at the CRUD layer before the tool returns, so the
+    commit here only flushes a write the tool left uncommitted (it can never
+    discard a tool's own write); any non-clean exit — a raised ``Exception``,
+    or a ``BaseException`` no clause catches (``asyncio.CancelledError``, ``SystemExit``, …) — rolls back the
     possibly-partial write instead of committing it, but only when no other call
     is in flight on the shared connection (a rollback then would discard a
     concurrent call's uncommitted write; see ``on_call_tool``). The boundary swallows
@@ -97,8 +106,9 @@ class InstrumentationMiddleware(Middleware):
         try:
             if tool_name in GUARDED_MCP_TOOLS:
                 # Raises ToolError (block mode) if this subprocess is running
-                # stale code. Inside the try so the finally's rollback releases
-                # the read snapshot the staleness check opened on self._db.
+                # stale code. Inside the try so a block is recorded as a failed
+                # call. Its update_history read is LIMIT 1 + fetchone(), which
+                # opens no transaction and leaves no snapshot pinned.
                 await self._enforce_freshness(tool_name)
             result = await call_next(context)
             success = True
@@ -162,11 +172,13 @@ class InstrumentationMiddleware(Middleware):
             # Skipping it under concurrency leaves this call's partial
             # statement, if any, for the next commit to flush: the same
             # outcome a peer's commit already produced before this guard. It
-            # also leaves this call's read snapshot open until a peer's own
-            # boundary closes it, so the WAL checkpoint can stay pinned for as
-            # long as that peer runs. Per-call atomicity on one shared
-            # connection needs per-request connections, which this boundary
-            # cannot provide. Only calls through this middleware are counted.
+            # leaves no read snapshot behind: a read-only call opens no
+            # transaction, and a cursor-pinned snapshot is released only by
+            # closing the cursor, never by commit or rollback (class docstring).
+            # Per-call atomicity on one shared connection needs per-request
+            # connections, which this boundary cannot provide; that residual is
+            # tracked as P2b in the P4 shared-service design. Only calls
+            # through this middleware are counted.
             try:
                 if self._db is not None:
                     try:

@@ -939,6 +939,28 @@ neither blocks opening).
    covering three PRs costs the user one decision instead of three.
 4. Re-read the queue at the start of every pass. Never work from a remembered
    list: another session may have opened, closed, or pushed to any of them.
+5. **Triage every question before you ask it** (owner, 2026-10-28). A closing
+   session that asks about everything stalls its queue, and one that guesses
+   makes decisions nobody signed. Put each question in exactly ONE bucket first.
+   An assumption is never an answer.
+   1. **Answerable from evidence:** answer it yourself, citing the evidence
+      (file:line, PR, live query, ruling id).
+   2. **Covered by a standing rule:** do what the rule says, and name it in one
+      line. A rule that says "ask the owner" still means ask.
+   3. **Low-stakes and reversible:** decide, and log the decision for the
+      owner's review in this list's step 3 batch.
+   4. **A genuine owner decision:** ask with `AskUserQuestion`, carrying the
+      facts and the cost of each option, batched per this list's step 3 where
+      several are pending; or record it as a true blocker and move to the next
+      PR.
+
+   **Anything this skill already reserves for the owner is bucket 4, never 3:**
+   the "Always the owner's call" list under "4. The merge gate", a real finding
+   left unfixed, a NEW P1 on the fix-code at round 2, and any design, premise or
+   user-impact question a review raised. When unsure between 3 and 4, it is 4.
+
+   Check the triage by how few bucket-3 decisions the owner reverses: a reversal
+   means that kind of call belongs in bucket 4.
 
 ### Two reviewers pushing opposite values
 
