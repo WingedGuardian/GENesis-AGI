@@ -1028,6 +1028,7 @@ async def test_contingency_preserves_resume_fragments_beside_identity(loop):
         "approve this proposal",
         "## Pending proposals\n- P1: adopt-first demo",
         ChannelType.TELEGRAM, session_id="cc-live", was_resume=True,
+        chat_ref=None, thread_id=None,
     )
 
     assert "ok" in out  # reply text (contingency preamble is prefixed by the caller)
@@ -1339,6 +1340,8 @@ async def test_the_contingency_router_is_not_told_it_can_change_its_model(loop):
         ChannelType.TELEGRAM,
         session_id="cc-live",
         was_resume=True,
+        chat_ref=None,
+        thread_id=None,
     )
 
     assert "ok" in out
