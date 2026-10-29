@@ -327,6 +327,36 @@ _SINGLE_CREDENTIAL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# A credential label as a QUOTED KEY: a JSON member, a Python dict repr, or an
+# escaped (even twice-escaped) key inside a serialized string
+# (``{"api_key": "…"}``, ``{'DB_PASSWORD': b'…'}``, ``\\"pin\\": …``). The two
+# label patterns above need the separator right after the label, so the key's
+# closing quote defeated them and these values passed through whole (measured
+# 2026-10-28). The key must END at the label and sit between quotes, so
+# ``"pin_count"`` and ``"password_policy"`` never match; a ``_``/``-`` delimited
+# prefix is allowed (``OPENAI_API_KEY``, ``x-api-key``). A camelCase prefix
+# (``userPassword``) is NOT matched — admitting it would also match ``"spin"``
+# and ``"bypass"`` — and stays a stated residual.
+# The value follows the header rule above, for the same reason: the whole rest
+# of the line is withheld and quoting is not read. A first version parsed the
+# value as a string literal and a review found it ended early on the OTHER quote
+# kind (``"it's a secret"``), on ``b'…'``, on double escaping and on list
+# values — the exact class this file's header comment records. The cost is the
+# same cheap direction: a one-line record loses the rest of its line.
+# Linear: bounded prefix and whitespace repeats, a fixed label alternation, and
+# one to-end-of-line run per match.
+_QUOTED_KEY_EXTRA_LABEL = r"(?<![A-Za-z])(?:client[_\s-]?secret|id[_\s-]?token|secret|token|passwd)"
+_QUOTED_KEY_CREDENTIAL_PATTERN = re.compile(
+    r"(?<=[\"'])(?:[A-Za-z0-9]{1,64}[_-]){0,4}"
+    r"(?:" + _TOKEN_LABEL + r"|" + _PASSWORD_LABEL + r"|" + _QUOTED_KEY_EXTRA_LABEL + r")"
+    r"\\{0,3}[\"'][ \t\r\n]{0,64}[:=][ \t\r\n]{0,64}(?P<value>[^\r\n]*[^\s])",
+    re.IGNORECASE,
+)
+
+
+def _redact_quoted_key_values(text: str) -> str:
+    return _redact_value_group(_QUOTED_KEY_CREDENTIAL_PATTERN, text, "value")
+
 # Credentials embedded in a URL's userinfo section (the user/password pair that
 # can precede an "@" host separator). Only fires when an "@" follows, so a plain
 # host-and-port URL never matches.
@@ -497,6 +527,7 @@ def scrub(text: str) -> str:
         text = _STRUCTURED_CREDENTIAL_PATTERN.sub(_REDACTED, text)
         text = _redact_value_group(_HEADER_PATTERN, text, "value")
         text = _redact_value_group(_BEARER_VALUE_PATTERN, text, "token")
+        text = _redact_quoted_key_values(text)
         text = _redact_value_group(_CREDENTIAL_TOKEN_PATTERN, text, "token")
         text = _redact_value_group(_SINGLE_CREDENTIAL_PATTERN, text, "value")
         text = _redact_value_group(_URL_CREDENTIAL_PATTERN, text, "pw")

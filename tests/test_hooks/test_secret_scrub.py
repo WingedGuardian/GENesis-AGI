@@ -1058,3 +1058,104 @@ class TestHttpCredentialHeaders:
         start = time.perf_counter()
         s.scrub(shape)
         assert time.perf_counter() - start < 5.0
+
+
+class TestQuotedKeyCredentials:
+    """A credential label as a QUOTED key: a JSON member, a dict repr, or an
+    escaped key in a serialized string. The label patterns need the separator
+    right after the label, so the key's closing quote let these values through
+    whole (measured 2026-10-28: ``{"api_key": "..."}`` came back unchanged).
+    The value follows the header rule: the rest of the line is withheld and
+    quoting is not read, because a parsed value grammar ended early on the
+    shapes in ``test_no_quoting_shape_ends_the_value_early``."""
+
+    SECRET = "q7Lm2Xp9Rt4"  # pragma: allowlist secret
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            '{"api_key": "%s"}',
+            '{"access_token":"%s"}',
+            '{"secret_key": "%s", "region": "eu"}',
+            '{"private_key": "%s"}',
+            '{"password": "%s"}',
+            '{"passphrase": "%s"}',
+            "{'password': '%s'}",
+            "{'api_key': '%s'}",
+            '"{\\"api_key\\": \\"%s\\"}"',
+            '{\n  "auth_token":\n    "%s"\n}',
+            '{"API_KEY": "%s"}',
+            '{"password" : "%s"}',
+            '{"OPENAI_API_KEY": "%s"}',
+            '{"DB_PASSWORD": "%s"}',
+            '{"x-api-key": "%s"}',
+            '{"client_secret": "%s"}',
+            '{"secret": "%s"}',
+            '{"token": "%s"}',
+            '{"id_token": "%s"}',
+            '{"passwd": "%s"}',
+            '{"pin": %s}',
+        ],
+    )
+    def test_the_value_is_redacted(self, template):
+        out = s.scrub(template % self.SECRET)
+        assert self.SECRET not in out
+        assert R in out
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            '{"password": "it\'s a %s pass"}',
+            "{'password': 'say \"hi\" %s'}",
+            '{"password": "ab\\"cd %s"}',
+            "{'password': b'%s'}",
+            "{'password': u'%s'}",
+            '{"password"\n: "%s"}',
+            '{"password":\n\n"%s"}',
+            '{"password": ["%s"]}',
+            '{"password": "pre" + "%s"}',
+            '\\\\"password\\\\": \\\\"%s\\\\"',
+            '{"password": \u201c%s secret\u201d}',
+        ],
+    )
+    def test_no_quoting_shape_ends_the_value_early(self, template):
+        assert self.SECRET not in s.scrub(template % self.SECRET)
+
+    def test_the_rest_of_the_line_is_withheld(self):
+        # Decision (the header rule): quoting is not read, so a one-line record
+        # loses the rest of its line after a credential key. The next line stays.
+        text = '{"api_key": "' + self.SECRET + '", "n": 1}\nnext line'
+        assert s.scrub(text) == '{"api_key": ' + R + "\nnext line"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '{"pin_count": 5, "password_policy": "strict"}',
+            '{"api": "v1", "key": "k1", "token_count": 12}',
+            '{"keyboard": "us", "spinner": "dots"}',
+            '{"spin": 3, "bypass": true, "max_tokens": 512}',
+            "the api_key field is documented below",
+        ],
+    )
+    def test_lookalike_keys_are_kept(self, text):
+        assert s.scrub(text) == text
+
+    def test_a_camel_case_prefix_is_the_stated_residual(self):
+        # Admitting ``userPassword`` would also admit ``"spin"`` and ``"bypass"``.
+        assert self.SECRET in s.scrub('{"userPassword": "' + self.SECRET + '"}')
+
+    @pytest.mark.parametrize(
+        "unit",
+        ['"password":', "'pin' ", '"a_b_c_d_api_key"\\\\\\"', '"api_key"   \n', '"x-'],
+    )
+    def test_quoted_key_shapes_scale_linearly(self, unit):
+        import time
+
+        def cost(n):
+            start = time.perf_counter()
+            s.scrub(unit * n)
+            return time.perf_counter() - start
+
+        small, large = cost(10000), cost(40000)
+        assert large < 5.0
+        assert large < 12 * max(small, 0.002), f"4x input took {large / max(small, 1e-9):.1f}x"
