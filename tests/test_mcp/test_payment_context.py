@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import inspect
 import json
 import logging
 import re
@@ -78,6 +79,9 @@ class El:
         self.on_click = None
         self.owner = None  # the frame the element really lives in (None: the one it was found in)
         self.labels: dict = {}  # a select's option value -> label, where the two differ
+        self.reverts = False  # a select that undoes any choice a script makes
+        self.focusable = True  # takes focus when asked
+        self.keys_to = None  # another element that really gets the keys (a focus race)
         self.checkbox = False  # an input type=checkbox
         self.checked = False
         self.label = ""  # its <label> text
@@ -101,6 +105,9 @@ class El:
         self.positions: list = []  # where each check() aimed
         self.ticked_at: list = []  # where each real (not trial) check() aimed
         self.on_fill = None  # called after this element is filled
+
+
+_FOCUS: dict = {}  # the element a Handle.focus() last focused
 
 
 class Handle:
@@ -139,6 +146,8 @@ class Handle:
             return self.el.checkbox
         if js is pc._CONNECTED_JS:
             return self.el.connected
+        if js is pc._FOCUSED_JS:
+            return _FOCUS.get("el") is self.el
         if js is pc.CONSENT_JS and self.el.control is not None:
             # As the real script: the box's state, but `connected` is the label's own.
             info = await Handle(self.el.control, self.frame).evaluate(js, arg)
@@ -215,7 +224,12 @@ class Handle:
             want = value
         if want not in self.el.options:
             raise RuntimeError("no option")
-        self.el.value = want
+        if not self.el.reverts:
+            self.el.value = want
+
+    async def focus(self):
+        _FOCUS["el"] = self.el if self.el.focusable else None
+        _FOCUS["keys"] = self.el.keys_to or self.el  # where typed keys really land
 
     async def input_value(self, timeout=None):
         return self.el.value
@@ -345,6 +359,9 @@ class Page:
         self.handlers: dict = {}
         self.goto_to: str | None = None  # where goto lands (a redirect)
         self.moves: list = []  # mouse moves (the keepalive)
+        _FOCUS.clear()  # a fresh page has nothing focused
+        self.typed: list = []  # keyboard text not yet ended by a Tab
+        self.keys_sent: list = []  # every keyboard text, ever
         self.context = None
 
     @property
@@ -353,6 +370,33 @@ class Page:
 
     def on(self, event, fn):
         self.handlers.setdefault(event, []).append(fn)
+
+    @property
+    def keyboard(self):
+        page = self
+
+        class Keyboard:
+            async def type(self, text, delay=None):
+                page.keys_sent.append(text)
+                target = _FOCUS.get("keys")
+                if target is not None and target.tag != "select":
+                    target.value += text  # typed into an input
+                else:
+                    page.typed.append(text)
+
+            async def press(self, key):
+                # Tab ends the typeahead: the focused select takes the first
+                # option whose label starts with what was typed.
+                el, typed = _FOCUS.pop("keys", None), "".join(page.typed).casefold()
+                _FOCUS.pop("el", None)
+                page.typed.clear()
+                if key == "Tab" and el is not None and el.tag == "select":
+                    for v in el.options:
+                        if el.labels.get(v, v).casefold().startswith(typed):
+                            el.value = v
+                            break
+
+        return Keyboard()
 
     @property
     def mouse(self):
@@ -3779,3 +3823,101 @@ async def test_a_late_field_that_cannot_be_filled_says_fill(vault, logs, monkeyp
     out, _ = await _run(ns, extra_fields=extra)
     assert out["code"] == "page_changed:late:extra_field_failed:address_line1:fill"
     assert any("extra field address_line1 did not fill (RuntimeError)" in x for x in logs)
+
+
+# ── a select that reverts any scripted choice takes it by keyboard ──
+
+
+def _country_select(ns, monkeypatch, **el):
+    frame = ns.ppage.main_frame.elements["iframe#card"][0].child
+    country = El(tag="select", options=["-1", "235", "236", "237"])
+    country.labels = {
+        "-1": "",
+        "235": "United Kingdom",
+        "236": "United States",
+        "237": "United States Minor Outlying Islands",
+    }
+    country.value = "-1"
+    for k, v in el.items():
+        setattr(country, k, v)
+    frame.elements["#country"] = [country]
+    monkeypatch.setattr(cf, "billing_value", lambda name: "United States")
+    extra = {
+        "email": {"selector": "#email", "value": EMAIL},
+        "country": {"selector": "#country", "frames": ["iframe#card"]},
+    }
+    return country, extra
+
+
+async def test_a_select_that_reverts_scripted_choices_takes_one_typed(vault, monkeypatch):
+    ns = checkout()
+    country, extra = _country_select(ns, monkeypatch, reverts=True)
+    out, _ = await _run(ns, extra_fields=extra)
+    assert out["code"] == "submitted_unverified" and country.value == "236"
+    assert "".join(ns.ppage.keys_sent) == "United States"
+
+
+async def test_a_select_that_takes_a_scripted_choice_is_never_typed_into(vault, monkeypatch):
+    ns = checkout()
+    country, extra = _country_select(ns, monkeypatch)
+    out, _ = await _run(ns, extra_fields=extra)
+    assert out["code"] == "submitted_unverified" and country.value == "236"
+    assert ns.ppage.keys_sent == []  # no keyboard used
+
+
+async def test_a_select_that_will_not_take_focus_is_never_typed_into(vault, monkeypatch):
+    ns = checkout()
+    country, extra = _country_select(ns, monkeypatch, reverts=True, focusable=False)
+    out, _ = await _run(ns, extra_fields=extra)
+    assert out["code"] == "page_changed:late:extra_field_failed:country:select"
+    assert ns.ppage.keys_sent == [] and vault.ops("release_claim") == []
+
+
+async def test_a_typeahead_that_lands_on_a_longer_label_is_refused(vault, monkeypatch):
+    ns = checkout()
+    country, extra = _country_select(ns, monkeypatch, reverts=True)
+    country.options = ["-1", "237", "236"]  # the longer label comes first
+    out, _ = await _run(ns, extra_fields=extra)
+    assert out["code"] == "page_changed:late:extra_field_failed:country:select"
+    assert country.value == "237" and vault.ops("release_claim") == []
+
+
+async def test_keys_that_land_in_another_field_stop_the_flow(vault, monkeypatch):
+    # The select reads as focused, but the keys go into the card number field.
+    ns = checkout()
+    country, extra = _country_select(ns, monkeypatch, reverts=True)
+    country.keys_to = ns.els["number"]
+    out, _ = await _run(ns, extra_fields=extra)
+    assert out["code"] == "page_changed:late:extra_field_failed:country:keys"
+    assert vault.ops("release_claim") == []
+
+
+async def test_a_card_select_that_reverts_is_never_typed_into(vault):
+    ns = checkout(select_expiry=True)
+    ns.els["exp_month"].reverts = True
+    out, _ = await _run(ns, fields={**ns.fields, "exp_month": "#mm", "exp_year": "#yy"})
+    assert out["code"].startswith("failed_before_pay") and ns.ppage.keys_sent == []
+
+
+def test_the_fakes_take_only_what_playwright_takes():
+    # A fake that accepts a keyword the real method lacks hides a TypeError the
+    # live run raises (measured: ElementHandle.focus has no timeout).
+    pw = pytest.importorskip("playwright.async_api")
+    keyboard = type(Page("https://shop.example.com").keyboard)
+    pairs = [
+        (Handle, pw.ElementHandle),
+        (Loc, pw.Locator),
+        (Frame, pw.Frame),
+        (Page, pw.Page),
+        (keyboard, pw.Keyboard),
+    ]
+    bad = []
+    for fake, real in pairs:
+        for name, fn in vars(fake).items():
+            if name.startswith("_") or not callable(fn) or not hasattr(real, name):
+                continue
+            real_params = set(inspect.signature(getattr(real, name)).parameters)
+            for pname, param in inspect.signature(fn).parameters.items():
+                if param.default is not inspect.Parameter.empty and pname not in real_params:
+                    bad.append(f"{fake.__name__}.{name}({pname})")
+    assert bad == []

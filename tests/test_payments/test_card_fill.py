@@ -670,5 +670,7 @@ def test_a_two_part_code_has_its_own_text_and_the_rest_fall_back():
     granted = cf.result("page_changed:granted:title")["status"]
     later = cf.result("page_changed:late:extra_field_failed:city:held")["status"]
     assert "Nothing was filled" in granted
-    assert "Nothing was filled" not in later and "billing fields may have been typed" in later
+    assert "Nothing was filled" not in later and "Typing the billing fields" in later
+    other = cf.result("page_changed:consent_label")["status"]
+    assert "billing fields may have been typed" in other
     assert cf.result("field_mismatch:cvc")["status"] == cf.TEXTS["field_mismatch"]
