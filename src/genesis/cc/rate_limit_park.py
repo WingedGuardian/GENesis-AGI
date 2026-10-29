@@ -372,6 +372,7 @@ async def park_direct_session(
     now: datetime | None = None,
     mode: str | None = None,
     ran: list[tuple[str, object]] | None = None,
+    inventory: list[dict] | None = None,
 ) -> str | None:
     """Park (or re-limit) a background session that hit a rate limit.
 
@@ -381,15 +382,25 @@ async def park_direct_session(
     this run made rather than repeating it; a run that issued none leaves the
     stored record as it was.
 
+    Internal callers may instead pass ``inventory`` already produced by
+    ``ran_inventory`` / ``merge_inventory``; this trusted representation is
+    bounded again but not scrubbed a second time. Pass only one representation.
+
     Returns the park id if the work was parked/re-parked, or None when parking
     is disabled (mode=off) or failed — the caller then keeps current behavior.
     """
+    # Internal runner callers already scrub and bound each event. Raw-call
+    # callers keep the same interface; never stringify a preview twice.
+    if ran is not None and inventory is not None:
+        raise ValueError("pass raw ran calls or precomputed inventory, not both")
     now = now or datetime.now(UTC)
     mode = mode if mode is not None else cfg_mod.effective_mode()
     if mode == "off":
         # A resume already in flight keeps its park 'resuming', and the stale
         # reclaim still retries it once parking is back on: record its calls.
-        await record_resumed_run_calls(db, getattr(request, "caller_context", None), ran)
+        await record_resumed_run_calls(
+            db, getattr(request, "caller_context", None), ran, inventory=inventory,
+        )
         return None
     cfg = cfg_mod.load_config()
 
@@ -399,8 +410,9 @@ async def park_direct_session(
 
     caller_context = getattr(request, "caller_context", None)
     lineage_id = parse_park_id(caller_context)
-    inventory = ran_inventory(ran) if ran else []
-
+    inventory = (
+        merge_inventory(None, inventory) if inventory is not None else ran_inventory(ran or [])
+    )
     try:
         # A resumed session re-limited → update its own park in place so the
         # attempts counter (and the needs_user escalation) survives (architect #1).
@@ -505,7 +517,8 @@ async def _record_into_park(
 
 
 async def record_resumed_run_calls(
-    db: aiosqlite.Connection, caller_context: str | None, ran: list[tuple[str, object]] | None,
+    db: aiosqlite.Connection, caller_context: str | None,
+    ran: list[tuple[str, object]] | None = None, *, inventory: list[dict] | None = None,
 ) -> None:
     """A resumed run ended WITHOUT re-limiting (failed, cancelled, timed out)
     after issuing tool calls: add them to its park's inventory.
@@ -513,11 +526,19 @@ async def record_resumed_run_calls(
     Its park stays ``resuming`` and the stale-claim reclaim re-dispatches it
     later; without this, that retry would repeat this run's calls blind. A
     non-resume caller_context, or a run with no calls, is a no-op.
+
+    ``inventory`` is the internal, already scrubbed alternative to raw ``ran``
+    calls, as in ``park_direct_session``.
     """
+    if ran is not None and inventory is not None:
+        raise ValueError("pass raw ran calls or precomputed inventory, not both")
     park_id = parse_park_id(caller_context)
-    if park_id is None or not ran:
+    if park_id is None:
         return
-    await _record_into_park(db, park_id, ran_inventory(ran))
+    inventory = (
+        merge_inventory(None, inventory) if inventory is not None else ran_inventory(ran or [])
+    )
+    await _record_into_park(db, park_id, inventory)
 
 
 async def mark_resumed_if_lineage(db: aiosqlite.Connection, caller_context: str | None) -> None:

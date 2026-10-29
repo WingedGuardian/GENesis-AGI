@@ -613,3 +613,157 @@ async def test_a_failed_record_never_costs_the_park_or_the_relimit(db, monkeypat
     returned = await _resume_caps(db, pid, send)
     assert returned == pid
     assert (await parks.get_by_id(db, pid))["attempts"] == 1, "the relimit was skipped"
+
+
+@pytest.mark.parametrize("ending", ["cap", "error", "cancel", "off", "success"])
+async def test_runner_releases_raw_inputs_before_session_exit(db, monkeypatch, ending):
+    import weakref
+
+    from genesis.cc.types import CCOutput, StreamEvent
+
+    class ToolInput(dict):
+        pass
+
+    monkeypatch.setattr(rlp.cfg_mod, "effective_mode", lambda: "off" if ending == "off" else "live")
+    first = await _park_ran(db, None)
+    await parks.claim(db, first.park_id)
+
+    async def emit(on_event):
+        raw = ToolInput(content="synthetic payload " * 10000, password="synthetic secret")
+        ref = weakref.ref(raw)
+        await on_event(StreamEvent.from_raw({
+            "type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Write", "input": raw},
+            ]},
+        }))
+        return ref
+
+    async def invoke(invocation, *, on_event=None):
+        ref = await emit(on_event)
+        assert ref() is None, "runner retains raw input after event callback returns"
+        if ending in {"cap", "off"}:
+            raise CCRateLimitError("limit", raw_text="resets in 30m")
+        if ending == "error":
+            raise RuntimeError("synthetic failure")
+        if ending == "cancel":
+            raise asyncio.CancelledError()
+        return CCOutput(
+            session_id="synthetic-run", text="done", model_used="synthetic",
+            cost_usd=0, input_tokens=0, output_tokens=0, duration_ms=1, exit_code=0,
+        )
+
+    runner = _park_runner(db)
+    runner._invoker.run_streaming = invoke
+    req = DirectSessionRequest(prompt="synthetic task", caller_context=f"rate_limit_resume:{first.park_id}")
+    error = {"error": RuntimeError, "cancel": asyncio.CancelledError, "off": CCRateLimitError}.get(ending)
+    if error:
+        with pytest.raises(error):
+            await runner._run_session(req, "synthetic-run")
+    else:
+        await runner._run_session(req, "synthetic-run")
+    inventory = (await _payload(db, first.park_id)).get("ran", [])
+    if ending == "success":
+        assert inventory == []  # successful completion still does not append
+    else:
+        assert [e["name"] for e in inventory] == ["Write"]
+        assert "synthetic secret" not in inventory[0]["input"]
+
+
+@pytest.mark.parametrize("count", [0, 1, 20, 21, 500, 501, 1003])
+async def test_streamed_inventory_matches_existing_batch_contract(db, monkeypatch, count):
+    from genesis.cc.types import StreamEvent
+
+    monkeypatch.setattr(rlp.cfg_mod, "effective_mode", lambda: "live")
+    calls = [(f"tool_{i % 3}", {"ordinal": i, "password": "synthetic secret"}) for i in range(count)]
+    expected = rlp.ran_inventory(calls)
+    first = await _park_ran(db, None)
+    await parks.claim(db, first.park_id)
+
+    async def invoke(invocation, *, on_event=None):
+        for start in range(0, count, 3):
+            await on_event(StreamEvent.from_raw({
+                "type": "assistant", "message": {"content": [
+                    {"type": "text", "text": "synthetic event"},
+                    *[{"type": "tool_use", "name": name, "input": inp}
+                      for name, inp in calls[start:start + 3]],
+                ]},
+            }))
+        raise CCRateLimitError("limit", raw_text="resets in 30m")
+
+    runner = _park_runner(db)
+    runner._invoker.run_streaming = invoke
+    req = DirectSessionRequest(prompt="synthetic task", caller_context=f"rate_limit_resume:{first.park_id}")
+    await runner._run_session(req, "synthetic-run")
+    actual = (await _payload(db, first.park_id)).get("ran", [])
+    assert actual == expected
+    assert sum(e.get("omitted", 1) for e in actual) == count
+    assert len(actual) <= 501
+    assert sum(bool(e.get("input")) for e in actual) <= 20
+
+
+@pytest.mark.parametrize("path", ["fresh", "resume", "off", "failure"])
+async def test_precomputed_inventory_is_not_scrubbed_again(db, monkeypatch, path):
+    inventory = rlp.ran_inventory([("Write", {"content": "synthetic content"})])
+    first = await _park_ran(db, None)
+    await parks.claim(db, first.park_id)
+    context = f"rate_limit_resume:{first.park_id}"
+
+    def no_second_scrub(_):
+        raise AssertionError("precomputed previews must not be re-encoded")
+
+    monkeypatch.setattr(rlp, "ran_inventory", no_second_scrub)
+    if path == "failure":
+        await rlp.record_resumed_run_calls(db, context, inventory=inventory)
+        pid = first.park_id
+    else:
+        result = await rlp.park_direct_session(
+            db, request=_bg_request(caller_context=None if path == "fresh" else context),
+            exc=CCRateLimitError("limit"), mode="off" if path == "off" else "live",
+            inventory=inventory,
+        )
+        pid = first.park_id if path == "off" else result
+    assert (await _payload(db, pid))["ran"] == inventory
+
+
+@pytest.mark.parametrize("path", ["live", "off", "failure"])
+@pytest.mark.parametrize("empty", [True, False])
+async def test_raw_and_precomputed_inventory_are_mutually_exclusive(db, path, empty):
+    raw = [] if empty else [("Write", {})]
+    inventory = [] if empty else rlp.ran_inventory(raw)
+    with pytest.raises(ValueError, match="not both"):
+        if path == "failure":
+            await rlp.record_resumed_run_calls(db, None, raw, inventory=inventory)
+        else:
+            await rlp.park_direct_session(
+                db, request=_bg_request(), exc=CCRateLimitError("limit"),
+                mode=path, ran=raw, inventory=inventory,
+            )
+
+
+@pytest.mark.parametrize("failure", ["exception", "flag"])
+async def test_runner_keeps_call_name_when_preview_scrubbing_fails(db, monkeypatch, failure):
+    from genesis.cc.types import StreamEvent
+
+    def broken_scrub(_):
+        if failure == "exception":
+            raise RuntimeError("synthetic scrub failure")
+        return "unsafe synthetic preview", True
+
+    monkeypatch.setattr("genesis.transcript_analytics.scrub.scrub_json", broken_scrub)
+    monkeypatch.setattr(rlp.cfg_mod, "effective_mode", lambda: "live")
+    first = await _park_ran(db, None)
+    await parks.claim(db, first.park_id)
+
+    async def invoke(invocation, *, on_event=None):
+        await on_event(StreamEvent.from_raw({
+            "type": "assistant", "message": {"content": [
+                {"type": "tool_use", "name": "Write", "input": {"content": "synthetic"}},
+            ]},
+        }))
+        raise CCRateLimitError("limit")
+
+    runner = _park_runner(db)
+    runner._invoker.run_streaming = invoke
+    req = DirectSessionRequest(prompt="synthetic task", caller_context=f"rate_limit_resume:{first.park_id}")
+    await runner._run_session(req, "synthetic-run")
+    assert (await _payload(db, first.park_id))["ran"] == [{"name": "Write", "input": "<input withheld>"}]
