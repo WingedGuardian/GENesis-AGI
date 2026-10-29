@@ -120,11 +120,22 @@ def _registered_mcp_tool_names(modpath: str) -> list[str]:
     """
     mod = __import__(modpath, fromlist=["mcp"])
     server = mod.mcp
-    manager = getattr(server, "_tool_manager", None)
-    tools = getattr(manager, "_tools", None)
-    if isinstance(tools, dict):
-        return list(tools.keys())
-    raise RuntimeError(f"cannot enumerate MCP tools for {modpath!r}")
+    # FastMCP's public listing API is async and can filter hidden tools. These
+    # synchronous security callers need ALL local registrations, including
+    # disabled tools. Keep this private dependency at one tested boundary.
+    from fastmcp.tools.base import Tool
+    from fastmcp.utilities.components import FastMCPComponent
+
+    provider = getattr(server, "local_provider", None)
+    components = getattr(provider, "_components", None)
+    if not isinstance(components, dict) or not components:
+        raise RuntimeError(f"cannot enumerate MCP tools for {modpath!r}")
+    if any(not isinstance(component, FastMCPComponent) for component in components.values()):
+        raise RuntimeError(f"invalid MCP component registry for {modpath!r}")
+    names = [component.name for component in components.values() if isinstance(component, Tool)]
+    if not names or any(not isinstance(name, str) or not name for name in names):
+        raise RuntimeError(f"invalid MCP tool registry for {modpath!r}")
+    return list(dict.fromkeys(names))
 
 
 def render_mcp_servers(

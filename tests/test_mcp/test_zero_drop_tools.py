@@ -169,7 +169,7 @@ async def test_both_tools_are_registered_on_the_health_server():
     assert hasattr(health, "_impl_zero_drop_status")
     assert hasattr(health, "_impl_zero_drop_ack")
 
-    registered = await mcp.get_tools()
+    registered = {tool.name: tool for tool in await mcp.list_tools()}
     assert {"zero_drop_status", "zero_drop_ack"} <= set(registered)
 
 

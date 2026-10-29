@@ -47,7 +47,7 @@ def _wire(db, monkeypatch):
 
 
 async def _call(prospect_id, subject="Hello", body="World"):
-    tools = await om.mcp.get_tools()
+    tools = {tool.name: tool for tool in await om.mcp.list_tools()}
     return json.loads(
         await tools["marketing_send"].fn(
             prospect_id=prospect_id,

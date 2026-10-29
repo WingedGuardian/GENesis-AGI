@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -345,27 +344,7 @@ async def genesis_health() -> dict:
         return r.data if r.status == 200 and isinstance(r.data, dict) else _error(r)
 
 
-def _suppress_docket_worker(server: FastMCP) -> bool:
-    """Stop fastmcp 2.x starting an idle task-queue worker this server never uses.
-
-    Same gate as Genesis's shared MCP launcher: without it fastmcp 2.14 runs a
-    fakeredis worker that polls at 100 Hz for a task queue no tool here uses
-    (every tool is task mode "forbidden"). The attribute is private, so it is set
-    only when it exists. Delete this when the dependency floor reaches fastmcp 3,
-    where docket is no longer a default (prefecthq/fastmcp#2887).
-    """
-    if not hasattr(server, "_is_mounted"):
-        return False
-    server._is_mounted = True
-    return True
 
 
 if __name__ == "__main__":
-    if not _suppress_docket_worker(mcp):
-        # stdout is the MCP channel; say it on stderr so version drift is visible.
-        print(
-            "genesis-peer: this fastmcp has no _is_mounted; its idle task-queue "
-            "worker, if any, is not suppressed",
-            file=sys.stderr,
-        )
     mcp.run()

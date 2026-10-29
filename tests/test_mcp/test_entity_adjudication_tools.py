@@ -18,7 +18,7 @@ from genesis.mcp.memory_mcp import mcp
 
 
 async def _tools():
-    return await mcp.get_tools()
+    return {tool.name: tool for tool in await mcp.list_tools()}
 
 
 async def _seed_proposal(db, name_a, norm_a, name_b, norm_b):
