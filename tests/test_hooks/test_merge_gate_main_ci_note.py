@@ -46,18 +46,23 @@ class TestTheNote:
     def test_a_red_base_names_the_run_its_head_and_failing_jobs(self, monkeypatch):
         _runs(monkeypatch, _run(42, "failure", sha="ab" * 20))
         note = gpg._main_ci_red_note("7", REPO)
-        first, jobs, remedy = note.split("\n")
+        first, red, jobs, weigh, flake, details = note.split("\n")
         assert first.startswith(
-            "NOTE: PR #7 — main's latest completed CI run 42 (head abababababab) is failure"
+            "NOTE: PR #7 — main's latest conclusive CI run 42 (head abababababab) is failure"
         )
+        assert red == "Merging lands this PR on a red base, with no signal about it."
         assert jobs == "failing jobs: test"
-        assert "gh run view 42 --log-failed" in remedy
+        assert weigh.startswith("Weigh it before merging")
+        assert flake == "A flake or infra failure on the base is no reason to hold an unrelated PR."
+        assert details == "Details: gh run view 42 --repo owner/repo --log-failed"
 
     def test_a_green_base_says_nothing(self, monkeypatch):
         _runs(monkeypatch, _run(42, "success"))
         assert gpg._main_ci_red_note("7", REPO) is None
 
-    @pytest.mark.parametrize("passed_over", ["cancelled", "skipped", "neutral", "stale"])
+    @pytest.mark.parametrize(
+        "passed_over", ["cancelled", "skipped", "neutral", "stale", "action_required"]
+    )
     def test_runs_without_a_signal_are_passed_over_to_the_latest_real_one(
         self, monkeypatch, passed_over
     ):
@@ -74,10 +79,10 @@ class TestTheNote:
         _runs(monkeypatch, _run(43, "success"), _run(42, "failure"))
         assert gpg._main_ci_red_note("7", REPO) is None
 
-    @pytest.mark.parametrize("red", ["failure", "timed_out", "startup_failure", "action_required"])
+    @pytest.mark.parametrize("red", ["failure", "timed_out", "startup_failure"])
     def test_every_red_conclusion_is_red(self, monkeypatch, red):
         _runs(monkeypatch, _run(42, red))
-        assert f"is {red}:" in gpg._main_ci_red_note("7", REPO)
+        assert f"is {red}." in gpg._main_ci_red_note("7", REPO)
 
     def test_no_completed_run_in_reach_says_nothing(self, monkeypatch):
         _runs(monkeypatch, _run(44, "cancelled"), _run(43, "", status="queued"))
@@ -97,6 +102,71 @@ class TestTheNote:
         _runs(monkeypatch, _run(42, "failure"))
         monkeypatch.setenv("_TEST_GH_RUN_FAILED_JOBS", "nope")
         assert "failing jobs: (could not be read)" in gpg._main_ci_red_note("7", REPO)
+
+    def test_a_run_with_no_failed_job_is_not_called_unreadable(self, monkeypatch):
+        _runs(monkeypatch, _run(42, "startup_failure"))
+        monkeypatch.setenv("_TEST_GH_RUN_FAILED_JOBS", "[]")
+        note = gpg._main_ci_red_note("7", REPO)
+        assert "failing jobs: none reported as failed or timed out (see the run)" in note
+        assert "could not be read" not in note
+
+    def test_without_a_repo_the_suggested_command_names_none(self, monkeypatch):
+        _runs(monkeypatch, _run(42, "failure"))
+        note = gpg._main_ci_red_note("7")
+        assert "Details: gh run view 42 --log-failed" in note
+        assert "--repo" not in note
+
+    def test_every_red_workflow_gets_its_own_block(self, monkeypatch):
+        monkeypatch.setattr(gpg, "_required_ci_workflows", lambda: ("CI", "CodeQL"))
+        monkeypatch.setenv(
+            "_TEST_GH_MAIN_CI_RUNS",
+            json.dumps({"CI": [_run(42, "failure")], "CodeQL": [_run(43, "failure")]}),
+        )
+        note = gpg._main_ci_red_note("7", REPO)
+        assert "latest conclusive CI run 42 " in note
+        assert "latest conclusive CodeQL run 43 " in note
+
+    def test_no_line_is_cut_by_the_sanitizer_at_realistic_lengths(self, monkeypatch):
+        """The caller bounds each line at _GATE_TEXT_MAX_CHARS by cutting its middle,
+        so a NOTE line over the cap would lose its advice. Long but real values."""
+        monkeypatch.setattr(gpg, "_required_ci_workflows", lambda: ("Continuous Integration",))
+        monkeypatch.setenv("_TEST_GH_BASE_REF", "release/2026-10-maintenance")
+        monkeypatch.setenv(
+            "_TEST_GH_RUN_FAILED_JOBS", json.dumps(["test (ubuntu-latest, 3.12)", "collected-floor"])
+        )
+        monkeypatch.setenv(
+            "_TEST_GH_MAIN_CI_RUNS",
+            json.dumps([_run(45, "", status="queued"), _run(40884275871999, "startup_failure")]),
+        )
+        note = gpg._main_ci_red_note("37680", "some-long-owner-name/Some-Long-Repository-Name")
+        assert "omitted" not in gpg._sanitize_gate_text(note)
+        assert all(len(line) <= gpg._GATE_TEXT_MAX_CHARS for line in note.split("\n"))
+
+    @pytest.mark.parametrize("stdout", ["null", '{"a": 1}', "[1, 2]"])
+    def test_a_malformed_live_run_list_skips_only_that_workflow(self, monkeypatch, stdout):
+        """The live gh path (no seam): a non-list answer skips its workflow."""
+        import subprocess as sp
+
+        monkeypatch.delenv("_TEST_GH_MAIN_CI_RUNS", raising=False)
+        monkeypatch.setattr(gpg, "_required_ci_workflows", lambda: ("CI", "CodeQL"))
+
+        def _fake(argv, **kw):
+            wf = argv[argv.index("--workflow") + 1]
+            out = stdout if wf == "CI" else json.dumps([_run(43, "failure")])
+            return sp.CompletedProcess(argv, 0, out, "")
+
+        monkeypatch.setattr(gpg.subprocess, "run", _fake)
+        note = gpg._main_ci_red_note("7", REPO)
+        assert note is not None and "CodeQL run 43 " in note and "CI run" not in note
+
+    def test_an_unreadable_workflow_does_not_hide_a_red_one(self, monkeypatch):
+        monkeypatch.setattr(gpg, "_required_ci_workflows", lambda: ("CI", "CodeQL"))
+        monkeypatch.setenv(
+            "_TEST_GH_MAIN_CI_RUNS",
+            json.dumps({"CI": "__error__", "CodeQL": [_run(43, "failure")]}),
+        )
+        note = gpg._main_ci_red_note("7", REPO)
+        assert note is not None and "CodeQL run 43 " in note and "CI run" not in note
 
     def test_the_off_switch_reads_nothing(self, monkeypatch):
         monkeypatch.setenv("_TEST_MAIN_CI_NOTE", "off")
@@ -133,7 +203,7 @@ class TestInTheReport:
         _runs(monkeypatch, _run(42, "failure"))
         rc = gpg.check_pr_report("7", repo=REPO)
         out, err = capsys.readouterr()
-        assert "NOTE: PR #7 — main's latest completed CI run 42" in err
+        assert "NOTE: PR #7 — main's latest conclusive CI run 42" in err
         assert "  failing jobs: test" in err
         assert "MERGEABLE (all gates pass)" in out
         assert rc == 0
@@ -142,7 +212,7 @@ class TestInTheReport:
         _report_env(monkeypatch)
         _runs(monkeypatch, _run(42, "success"))
         assert gpg.check_pr_report("7", repo=REPO) == 0
-        assert "latest completed" not in capsys.readouterr().err
+        assert "latest conclusive" not in capsys.readouterr().err
 
     def test_a_raising_note_never_takes_the_report_down(self, monkeypatch, capsys):
         _report_env(monkeypatch)
@@ -191,7 +261,7 @@ class TestInTheReport:
         _runs(monkeypatch, _run(45, "", status="in_progress"), _run(44, "cancelled"), _run(43, "", status="queued"),
               _run(42, "failure"))
         note = gpg._main_ci_red_note("7", REPO)
-        assert "2 newer CI run(s) on main are still in progress" in note
+        assert "2 newer CI run(s) on main have not completed yet" in note
 
     def test_the_note_never_says_do_not_merge(self, monkeypatch):
         _runs(monkeypatch, _run(42, "failure"))

@@ -374,7 +374,7 @@ blocked. An empty result from your own query is "my query found nothing", never
 It prints one line per gate, then a `verdict` line. Read every line — a PR can
 be Codex-clean and still blocked by CI, base branch, or pin receipts.
 
-**A `NOTE: … latest completed … run … is <red>` line on stderr means the PR's
+**A `NOTE: … latest conclusive … run … is <red>` line on stderr means the PR's
 BASE branch is red** (advisory, owner ruling 2026-10-28; it never moves the
 verdict). The PR's own green CI ran on the base as it was then, so merging now
 lands it on a red base with no fresh signal about it. Weigh it, don't stall on

@@ -10422,10 +10422,13 @@ def _check_main_reverts(pr_num: str, repo: str | None = None) -> tuple[str, str]
 # --- main-ci: the base branch's own CI is red (cross-PR merge collision) ---
 
 #: Conclusions that say nothing about the base's health: a run cancelled because
-#: a newer push superseded it, or one that never ran its jobs. Passed over.
-_MAIN_CI_NO_SIGNAL = frozenset({"cancelled", "skipped", "neutral", "stale", ""})
+#: a newer push superseded it, one that never ran its jobs, or one waiting on an
+#: approval (``action_required``). Passed over.
+_MAIN_CI_NO_SIGNAL = frozenset(
+    {"cancelled", "skipped", "neutral", "stale", "action_required", ""}
+)
 #: Conclusions that mean the base is red.
-_MAIN_CI_RED = frozenset({"failure", "timed_out", "startup_failure", "action_required"})
+_MAIN_CI_RED = frozenset({"failure", "timed_out", "startup_failure"})
 #: How many of the base's newest push runs are read to find a completed one. Many
 #: are cancelled by the next push: MEASURED 2026-10-29 over main's last 500 CI push
 #: runs, the longest streak without a signal was 8 runs, and 43 of the last 100
@@ -10453,16 +10456,19 @@ def _main_ci_red_note(pr_num: str, repo: str | None = None) -> str | None:
 
     Reads, per required CI workflow (``_required_ci_workflows``): the base branch's
     newest push runs, passing over cancelled and skipped ones, and for a red run its
-    failing job names. Any read failure, or no completed run in reach, returns None:
-    the NOTE is silent rather than wrong. That includes the CI merge-gate workflows,
+    failing job names. Every red workflow gets its own block. A workflow whose runs
+    cannot be read, or with no completed run in reach, is skipped; when none is red
+    the result is None: the NOTE is silent rather than wrong. That includes the CI merge-gate workflows,
     whose token has no ``actions: read``, so the NOTE appears only in a local
-    ``--check-pr``. "Latest completed" is literal: newer runs still in progress are
+    ``--check-pr``. "Latest completed" is literal: newer runs not yet completed are
     counted on a detail line, since one of them may carry the fix. The caller
     sanitizes every line before printing.
 
     Tests inject ``_TEST_GH_MAIN_CI_RUNS`` (a JSON array shaped like ``gh run list
-    --json databaseId,status,conclusion,headSha``) and ``_TEST_GH_RUN_FAILED_JOBS``
-    (a JSON array of job names). ``_TEST_MAIN_CI_NOTE=off`` skips every read: the
+    --json databaseId,status,conclusion,headSha``, used for every workflow, or an
+    object mapping workflow name to such an array, where a name it lacks or the
+    value ``"__error__"`` reads as unreadable) and ``_TEST_GH_RUN_FAILED_JOBS`` (a
+    JSON array of job names, or ``"__error__"``). ``_TEST_MAIN_CI_NOTE=off`` skips every read: the
     hook-test conftest sets it so report tests make no live call.
     """
     if os.environ.get("_TEST_MAIN_CI_NOTE") == "off":
@@ -10470,71 +10476,101 @@ def _main_ci_red_note(pr_num: str, repo: str | None = None) -> str | None:
     base = _pr_base_ref(pr_num, repo)
     if not base:
         return None
-    for workflow in _required_ci_workflows():
-        raw = os.environ.get("_TEST_GH_MAIN_CI_RUNS")
-        if raw is None:
-            try:
-                result = subprocess.run(
-                    [
-                        "gh", "run", "list", *_repo_args(repo),
-                        "--workflow", workflow, "--branch", base, "--event", "push",
-                        "--limit", str(_MAIN_CI_RUN_LIMIT),
-                        "--json", "databaseId,status,conclusion,headSha",
-                    ],
-                    capture_output=True, text=True, timeout=_gh_timeout(8),
-                )
-            except Exception:  # noqa: BLE001 - advisory: silent on a failed read
-                return None
-            if result.returncode != 0:
-                return None
-            raw = result.stdout
+    blocks = [
+        block
+        for workflow in _required_ci_workflows()
+        if (block := _main_ci_red_block(pr_num, base, workflow, repo))
+    ]
+    return "\n".join(blocks) if blocks else None
+
+
+def _main_ci_runs(base: str, workflow: str, repo: str | None) -> list | None:
+    """The base's newest push runs of *workflow*, newest first; None when unreadable."""
+    raw = os.environ.get("_TEST_GH_MAIN_CI_RUNS")
+    if raw is not None:
         try:
-            runs = json.loads(raw or "[]")
+            seeded = json.loads(raw)
         except ValueError:
             return None
-        if not isinstance(runs, list):
-            return None
-        latest = next(
-            (
-                r for r in runs
-                if isinstance(r, dict)
-                and r.get("status") == "completed"
-                and (r.get("conclusion") or "") not in _MAIN_CI_NO_SIGNAL
-            ),
-            None,
+        if isinstance(seeded, dict):
+            seeded = seeded.get(workflow, "__error__")
+        return seeded if isinstance(seeded, list) else None
+    try:
+        result = subprocess.run(
+            [
+                "gh", "run", "list", *_repo_args(repo),
+                "--workflow", workflow, "--branch", base, "--event", "push",
+                "--limit", str(_MAIN_CI_RUN_LIMIT),
+                "--json", "databaseId,status,conclusion,headSha",
+            ],
+            capture_output=True, text=True, timeout=_gh_timeout(8),
         )
-        if latest is None or latest.get("conclusion") not in _MAIN_CI_RED:
-            continue
-        newer_running = sum(
-            1
-            for r in runs[: runs.index(latest)]
-            if isinstance(r, dict) and r.get("status") != "completed"
-        )
-        run_id = str(latest.get("databaseId") or "")
-        if not run_id.isdigit():
-            return None
-        jobs = _run_failed_jobs(run_id, repo)
-        head = str(latest.get("headSha") or "")[:12]
-        lines = [
-            f"NOTE: PR #{pr_num} — {base}'s latest completed {workflow} run {run_id} "
-            f"(head {head}) is {latest.get('conclusion')}: merging lands this PR on a red "
-            f"base, with no signal about it.",
-            "failing jobs: " + (", ".join(jobs) if jobs else "(could not be read)"),
-            f"Weigh it before merging: does this PR touch what those jobs test, or fix "
-            f"them? A flake or infra failure on the base is no reason to hold an "
-            f"unrelated PR. Details: gh run view {run_id} --log-failed",
-        ]
-        if newer_running:
-            lines.append(
-                f"{newer_running} newer {workflow} run(s) on {base} are still in "
-                f"progress; one may already carry the fix."
-            )
-        return "\n".join(lines)
-    return None
+    except Exception:  # noqa: BLE001 - advisory: an unreadable workflow is skipped
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        runs = json.loads(result.stdout or "[]")
+    except ValueError:
+        return None
+    return runs if isinstance(runs, list) else None
 
 
-def _run_failed_jobs(run_id: str, repo: str | None = None) -> list[str]:
-    """Names of a run's failed or timed-out jobs; [] when they cannot be read."""
+def _main_ci_red_block(pr_num: str, base: str, workflow: str, repo: str | None) -> str | None:
+    """The NOTE lines for one required workflow whose latest completed run is red."""
+    runs = _main_ci_runs(base, workflow, repo)
+    if runs is None:
+        return None
+    latest = next(
+        (
+            r for r in runs
+            if isinstance(r, dict)
+            and r.get("status") == "completed"
+            and (r.get("conclusion") or "") not in _MAIN_CI_NO_SIGNAL
+        ),
+        None,
+    )
+    if latest is None or latest.get("conclusion") not in _MAIN_CI_RED:
+        return None
+    newer_pending = sum(
+        1
+        for r in runs[: runs.index(latest)]
+        if isinstance(r, dict) and r.get("status") != "completed"
+    )
+    run_id = str(latest.get("databaseId") or "")
+    if not run_id.isdigit():
+        return None
+    jobs = _run_failed_jobs(run_id, repo)
+    if jobs is None:
+        listed = "(could not be read)"
+    elif jobs:
+        listed = ", ".join(jobs)
+    else:
+        listed = "none reported as failed or timed out (see the run)"
+    head = str(latest.get("headSha") or "")[:12]
+    view = " ".join(["gh run view", run_id, *_repo_args(repo), "--log-failed"])
+    # One idea per line: the caller's sanitizer cuts any line over
+    # _GATE_TEXT_MAX_CHARS in the middle, which is where the advice would sit.
+    lines = [
+        f"NOTE: PR #{pr_num} — {base}'s latest conclusive {workflow} run {run_id} "
+        f"(head {head}) is {latest.get('conclusion')}.",
+        "Merging lands this PR on a red base, with no signal about it.",
+        "failing jobs: " + listed,
+        "Weigh it before merging: does this PR touch what those jobs test, or fix them?",
+        "A flake or infra failure on the base is no reason to hold an unrelated PR.",
+        f"Details: {view}",
+    ]
+    if newer_pending:
+        lines.append(
+            f"{newer_pending} newer {workflow} run(s) on {base} have not completed yet; "
+            f"one may carry the fix."
+        )
+    return "\n".join(lines)
+
+
+def _run_failed_jobs(run_id: str, repo: str | None = None) -> list[str] | None:
+    """Names of a run's failed or timed-out jobs: ``[]`` when it has none (a
+    workflow-level failure), None when the job list cannot be read."""
     raw = os.environ.get("_TEST_GH_RUN_FAILED_JOBS")
     if raw is None:
         try:
@@ -10546,15 +10582,17 @@ def _run_failed_jobs(run_id: str, repo: str | None = None) -> list[str]:
                 capture_output=True, text=True, timeout=_gh_timeout(8),
             )
         except Exception:  # noqa: BLE001 - advisory: an unreadable job list is shown as such
-            return []
+            return None
         if result.returncode != 0:
-            return []
+            return None
         raw = result.stdout
     try:
         names = json.loads(raw or "[]")
     except ValueError:
-        return []
-    return [str(n) for n in names if isinstance(n, str)] if isinstance(names, list) else []
+        return None
+    if not isinstance(names, list):
+        return None
+    return [str(n) for n in names if isinstance(n, str)]
 
 
 # --- rework: a rebuild of a sent-back PR carries its contract (owner decision) ---
