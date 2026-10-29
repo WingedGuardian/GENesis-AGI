@@ -2709,7 +2709,8 @@ verified: 477efb7f7 2026-10-05
   two import-free hooks inline under a parity test) — this sweep is the WRITER
   its GROUNDWORK note named. Levers: settings domain `ledger_escalation` + env
   `GENESIS_LEDGER_ESCALATION_DISABLED`; `escalate_added_by` is a provenance
-  allow-list, foreground-only by default so the ambient extractor's PROPOSALS
+  allow-list, `foreground` + `relayed` (the owner's request written by a
+  dispatched session) by default, so the ambient extractor's PROPOSALS
   cannot ask the owner to dispose of something nobody committed to.
   **Trap: it must never write `session_ledger`** — an evidence write would bump
   `updated_at` and read as a disposition the owner never made, i.e. the sweep

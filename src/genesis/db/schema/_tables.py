@@ -1992,7 +1992,7 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             source_ref  TEXT,
             added_by    TEXT NOT NULL DEFAULT 'foreground'
                         CHECK(added_by IN ('foreground','ambient','pulse',
-                                           'ambient_ledger_extractor')),
+                                           'ambient_ledger_extractor','relayed')),
             evidence    TEXT,
             source_quote TEXT,   -- provenance; resolvers write `evidence`, never this
             created_at  TEXT NOT NULL,

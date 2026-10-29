@@ -39,7 +39,7 @@ CFG = {
     "quiet_days": 5,
     "max_per_run": 5,
     "priority": "high",
-    "escalate_added_by": ["foreground"],
+    "escalate_added_by": ["foreground", "relayed"],
 }
 
 
@@ -296,6 +296,29 @@ async def test_ambient_extractor_rows_are_excluded_by_default(db, sessions_dir):
     await _mk_row(db, session_id="s1", created_days_ago=30, added_by="ambient_ledger_extractor")
     _mk_liveness(sessions_dir, "s1", days_ago=30)
     assert (await _sweep(db, sessions_dir))["created"] == 0
+
+
+async def test_relayed_rows_escalate_under_the_shipped_defaults(db, sessions_dir):
+    """`relayed` IS the owner's commitment (a dispatched session writing down
+    what the owner asked for), so it gets the same safety net as foreground.
+    Uses the module's DEFAULTS, not CFG, so this pins the shipped default."""
+    from genesis.session_awareness.ledger_escalation_config import DEFAULTS
+
+    await _mk_row(db, session_id="s1", created_days_ago=30, added_by="relayed")
+    _mk_liveness(sessions_dir, "s1", days_ago=30)
+    result = await _sweep(db, sessions_dir, escalate_added_by=DEFAULTS["escalate_added_by"])
+    assert result["created"] == 1
+
+
+async def test_plain_ambient_rows_stay_excluded_by_default(db, sessions_dir):
+    """`ambient` only says a dispatched session wrote the row, not that anyone
+    agreed to it; widening the default for `relayed` must not sweep it in."""
+    from genesis.session_awareness.ledger_escalation_config import DEFAULTS
+
+    await _mk_row(db, session_id="s1", created_days_ago=30, added_by="ambient")
+    _mk_liveness(sessions_dir, "s1", days_ago=30)
+    result = await _sweep(db, sessions_dir, escalate_added_by=DEFAULTS["escalate_added_by"])
+    assert result["created"] == 0
 
 
 async def test_allow_list_can_be_widened_deliberately(db, sessions_dir):
