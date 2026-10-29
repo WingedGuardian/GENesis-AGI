@@ -561,7 +561,7 @@ async def _traverse_cte(
         f"""
         WITH RECURSIVE connected(target_id, link_type, depth, strength, path) AS (
             SELECT target_id, link_type, 1, strength,
-                   source_id || ',' || target_id
+                   ',' || hex(source_id) || ',' || hex(target_id) || ','
             FROM memory_links
             WHERE source_id = ?
               AND target_id <> source_id
@@ -598,12 +598,14 @@ async def _traverse_cte(
                                 AND {_HIDDEN_CTE})
             UNION ALL
             SELECT ml.target_id, ml.link_type, c.depth + 1, ml.strength,
-                   c.path || ',' || ml.target_id
+                   c.path || hex(ml.target_id) || ','
             FROM memory_links ml
             JOIN connected c ON ml.source_id = c.target_id
             WHERE c.depth < ?
               AND ml.strength >= ?
-              AND c.path NOT LIKE '%' || ml.target_id || '%'
+              -- Hex tokens cannot contain commas: compare exact TEXT IDs,
+              -- including empty/NUL IDs, without substring or LIKE semantics.
+              AND instr(c.path, ',' || hex(ml.target_id) || ',') = 0
               -- Only the TARGET is gated in the recursive step, unchanged: a
               -- row's source is some earlier row's target and was already
               -- checked there, so the anchor is the only place a source needs

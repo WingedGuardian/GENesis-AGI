@@ -38,6 +38,19 @@ SQL without a live unit and saved cursor operations after scope exit raise
 `DatabaseScopeError`. Cursors are closed at scope exit because a partially fetched
 SELECT can pin the WAL even when commit/rollback alone releases nothing.
 
+Graph traversal with this facade declines the NetworkX projection before building
+it and uses the existing SQL fallback on the current unit's connection. This sees
+the unit's own pending link writes and avoids a cache keyed to a stable facade
+whose underlying connection changes. Healthy selected FalkorDB traversal retains
+its existing projected-data semantics; if it becomes unavailable, scoped fallback
+uses SQL. Legacy NetworkX traversal and centrality are unchanged. SQL cycle
+exclusion compares complete TEXT IDs, including prefixes, wildcard characters,
+empty strings and embedded NULs, using delimited hex tokens.
+The existing traversal telemetry writer explicitly commits through its database
+handle. When that writer runs on the owning unit, preceding pending writes can
+therefore become durable before the tool returns; a later tool error cannot undo
+that prefix. Scoped routing does not remove existing explicit CRUD commits.
+
 Focused scratch-database coverage lives in
 `tests/test_db/test_request_database.py` and
 `tests/test_db/test_request_database_lifecycle.py`. Four legacy middleware
