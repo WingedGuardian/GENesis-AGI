@@ -415,6 +415,7 @@ class _Flow:
     popup: bool = False
     popups: int = 0
     navs: int = 0  # top-document commits, counted from the Pay click
+    subframe_navs: set = field(default_factory=set)  # subframes that re-navigated since the click
     nav_requests: int = 0  # top-document navigation requests, sent or not yet committed
     typing_marks: tuple[int, int] | None = None  # (nav_requests, popups) as typing began
     url_blocked: bool = False  # the network guard aborted a request carrying a card value
@@ -1682,6 +1683,7 @@ async def _outcome(
     ppage,
     start: str,
     before: set,
+    shown_before: dict,
     popups: int,
     site: str,
     hooks: Hooks,
@@ -1710,22 +1712,31 @@ async def _outcome(
             _is_challenge(f.url) for f in list(ppage.frames) if f.url not in before
         ):
             return "challenge"
+        # Navigation is weighed BEFORE an in-place result, and again after the
+        # awaited look below, so a move that lands on the same tick (or during
+        # the await) opens the grace window instead of being pre-empted by a
+        # marker still valid in the old document.
+        if not moved and (ppage.url != start or flow.navs):
+            moved, deadline = True, loop.time() + NAV_GRACE_S
         if (
             not moved
             and args is not None
             and args.success is not None
             and not marked_before
-            and await _shows_success(ppage, args, pay, save, before)
+            and await _shows_success(ppage, args, pay, save, shown_before, flow.subframe_navs)
         ):
-            # A checkout that shows its result without changing page. Pay also
-            # leaves while the payment is submitting, so it must hold, not flash.
-            hits, first = hits + 1, first if first is not None else loop.time()
-            if hits >= 2 and loop.time() - first >= SUCCESS_STABLE_S:
-                return "submitted_in_place"
+            if ppage.url != start or flow.navs:  # navigated during the awaited look
+                moved, deadline = True, loop.time() + NAV_GRACE_S
+                hits, first = 0, None
+            else:
+                # A checkout that shows its result without changing page. Pay
+                # also leaves while the payment is submitting, so it must hold,
+                # not flash.
+                hits, first = hits + 1, first if first is not None else loop.time()
+                if hits >= 2 and loop.time() - first >= SUCCESS_STABLE_S:
+                    return "submitted_in_place"
         else:
             hits, first = 0, None
-        if not moved and (ppage.url != start or flow.navs):
-            moved, deadline = True, loop.time() + NAV_GRACE_S
         hooks.touch()
         await _beat()
         await asyncio.sleep(TICK_S)
@@ -1751,17 +1762,22 @@ async def _marker_shown(ppage, args: cf.CardArgs) -> bool:
         return True
 
 
-async def _shows_success(ppage, args: cf.CardArgs, pay, save, before: set) -> bool:
+async def _shows_success(
+    ppage, args: cf.CardArgs, pay, save, shown_before: dict, navigated: set
+) -> bool:
     """The call's ``success`` marker shows in the top document: a shown match that
     is neither Pay nor the save control (as clicked, or as found now; nor holds
     one or sits inside one), while Pay is no longer a live control, no bank
-    frame shows and no new frame has appeared since the click. Yes or no only:
-    nothing of the page is kept."""
+    frame shows and no frame hidden-or-absent at the click is shown now. Yes or
+    no only: nothing of the page is kept. The caller's ``success`` marker is the
+    load-bearing input: it must be one that cannot be visible while a challenge is
+    open, since an in-page challenge with no iframe and no navigation (a frameless
+    OTP overlay) is invisible to the frame checks here (tracked: #3769)."""
     try:
         loc = ppage.main_frame.locator(args.success).filter(visible=True)
         if await _step(loc.count()) < 1:
             return False
-        if await _bank_frame_shown(ppage) or await _new_frame_shown(ppage, before):
+        if await _bank_frame_shown(ppage) or await _new_frame_shown(ppage, shown_before, navigated):
             return False
         live, pay_now = await _pay_now(ppage, args)
         if live:
@@ -1777,11 +1793,36 @@ async def _shows_success(ppage, args: cf.CardArgs, pay, save, before: set) -> bo
         return False
 
 
-async def _new_frame_shown(ppage, before: set) -> bool:
-    """A frame that appeared since the click and is shown (a bank check can be on
-    a host no pattern knows), or one that cannot be asked."""
+async def _visible_frames(ppage) -> dict:
+    """The subframes showing at this moment, mapped to the URL each showed then.
+    A frame that cannot be asked is omitted (treated as NOT shown), so if it
+    becomes askable and visible after Pay it is caught as a newly shown frame —
+    the safe direction for a payment. The URL is kept so a frame shown then that
+    navigates IN PLACE to a challenge (same identity, new URL) is still caught."""
+    shown = {}
     for f in list(ppage.frames):
-        if f is ppage.main_frame or f.url in before or f.url.startswith(("about:", "data:")):
+        if f is ppage.main_frame:
+            continue
+        try:
+            if await _step((await _step(f.frame_element())).is_visible()):
+                shown[f] = f.url
+        except Exception:  # noqa: BLE001
+            pass
+    return shown
+
+
+async def _new_frame_shown(ppage, shown_before: dict, navigated: set) -> bool:
+    """A subframe showing now that was not showing the SAME document at the click:
+    newly attached, present-but-hidden then and revealed since, shown then but
+    navigated in place to another URL, OR shown then but re-navigated to the same
+    URL (a new document — ``navigated`` records those). A challenge loaded as a
+    nested iframe is itself a new frame here, so it is caught the same way.
+    Identity, its own URL, and re-navigation — a per-frame check, not a global URL
+    set — across every scheme, since a bank check keeps a frame's identity and may
+    keep its URL, or render in about:blank or srcdoc. One that cannot be asked is
+    not ruled out."""
+    for f in list(ppage.frames):
+        if f is ppage.main_frame or (shown_before.get(f) == f.url and f not in navigated):
             continue
         try:
             if await _step((await _step(f.frame_element())).is_visible()):
@@ -2405,10 +2446,21 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
         )
         if code:
             return cf.result(code, flow.host, filled=flow.typed)
-    ppage.on(
-        "framenavigated", lambda fr: fr is ppage.main_frame and setattr(flow, "navs", flow.navs + 1)
-    )
+
+    def _on_navigated(fr):
+        # The top document's commits count as a move; a SUBFRAME that re-navigates
+        # (even to the same URL, a new document) is recorded so a challenge loaded
+        # in place into a frame shown at the click is not mistaken for that frame.
+        if fr is ppage.main_frame:
+            flow.navs += 1
+        else:
+            flow.subframe_navs.add(fr)
+
+    ppage.on("framenavigated", _on_navigated)
     start, before, popups = ppage.url, {f.url for f in list(ppage.frames)}, flow.popups
+    shown_before = await _visible_frames(
+        ppage
+    )  # by identity, to catch a hidden frame revealed at Pay
     # A result marker already showing before Pay proves nothing about Pay.
     marked_before = args.success is not None and await _marker_shown(ppage, args)
     flow.paid = True  # set before the click: a click that raised may still have landed
@@ -2419,7 +2471,18 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
         click_raised = True
         logger.warning("payment Pay click raised (%s)", type(e).__name__)
     code = await _outcome(
-        flow, ppage, start, before, popups, site, hooks, args, pay, save, marked_before
+        flow,
+        ppage,
+        start,
+        before,
+        shown_before,
+        popups,
+        site,
+        hooks,
+        args,
+        pay,
+        save,
+        marked_before,
     )
     if code == _NO_SETTLE:
         # Nothing moved on. After a clean click that is a bank check or a stuck
