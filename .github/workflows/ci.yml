@@ -717,7 +717,9 @@ jobs:
         # ceiling 420 -> 432. Confirm the exact new-head set in PR CI.
         # Scanned comments: eight filer cases and one skill-discovery opt-in.
         # Main ceiling 432 + 9 = 441; confirm exact identities in PR CI.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 441
+        # Card-fill keyboard selection adds one playwright importorskip browser
+        # test that skips without the browser stack, ceiling 441 -> 442.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 442
 
   collected-floor:
     # Tests that stop being collected make the suite SMALLER, not red. This job
