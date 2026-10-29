@@ -30,6 +30,9 @@ from tests.test_session_awareness.conftest import (
 MIG = PR_VERIFICATION_MIGRATIONS[0]
 MIG_VERDICT = PR_VERIFICATION_MIGRATIONS[1]
 
+#: Every verdict that does NOT close the row, derived rather than listed.
+NON_CLOSING = tuple(v for v in verif_crud.VERDICTS if v not in verif_crud.PASS_VERDICTS)
+
 NOW = "2026-09-06T23:00:00+00:00"
 OLD = "2026-01-01T00:00:00+00:00"
 REPO = "owner/repo"
@@ -180,7 +183,7 @@ async def test_close_records_evidence_and_only_touches_open_rows(db):
     assert (await _row(db, 12))["evidence"] == "health 200"
 
 
-# ── the four verdicts: who closes, who parks ─────────────────────────────
+# ── the verdicts: who closes, who parks ──────────────────────────────────
 
 
 async def _open(db, n, merged="2026-09-06T10:00:00Z"):
@@ -206,7 +209,7 @@ async def test_a_pass_closes_the_row_and_records_its_verdict(db, verdict):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("verdict", ["fail-intent", "cannot-verify"])
+@pytest.mark.parametrize("verdict", NON_CLOSING)
 async def test_close_refuses_a_non_closing_verdict(db, verdict):
     """These two do not discharge the obligation, so the closer must not take
     them — one writer per state transition."""
@@ -228,7 +231,7 @@ async def test_close_refuses_an_unknown_verdict(db):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("verdict", ["fail-intent", "cannot-verify"])
+@pytest.mark.parametrize("verdict", NON_CLOSING)
 async def test_record_attempt_leaves_the_row_open_with_its_reason(db, verdict):
     await _open(db, 53)
     out = await verif_crud.record_attempt(
@@ -1004,3 +1007,18 @@ async def test_list_open_puts_an_established_FAILURE_ahead_of_everything(db):
     assert [r["pr_number"] for r in rows] == [90, 92, 91], "failed, untouched, parked"
     capped = await verif_crud.list_open(db, limit=1)
     assert [r["pr_number"] for r in capped] == [90], "no cap may hide a failure"
+
+
+@pytest.mark.asyncio
+async def test_list_open_puts_not_yet_done_after_fail_intent_and_before_untouched(db):
+    """The cheapest work in the ledger: the commands that finish it are named."""
+    await _open(db, 100, merged="2026-09-09T00:00:00Z")  # will FAIL
+    await _open(db, 101, merged="2026-09-01T00:00:00Z")  # untouched, oldest
+    await _open(db, 102, merged="2026-09-08T00:00:00Z")  # not-yet-done, newer
+    await _open(db, 103, merged="2026-08-01T00:00:00Z")  # parked, oldest of all
+    for n, verdict in ((100, "fail-intent"), (102, "not-yet-done"), (103, "cannot-verify")):
+        await verif_crud.record_attempt(
+            db, repo=REPO, pr_number=n, verdict=verdict, note="n", now=NOW
+        )
+    rows = await verif_crud.list_open(db)
+    assert [r["pr_number"] for r in rows] == [100, 102, 101, 103]

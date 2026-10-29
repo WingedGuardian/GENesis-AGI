@@ -41,6 +41,42 @@ repo-relative path (`src/`, `scripts/`, `tests/`, `.claude/`, `docs/`, `config/`
 answer is empty. That is all it checks: whether an answer is true stays the
 reviewer's question.
 
+**On an issue,** the same parser applies, through the premise gate Action
+(`scripts/premise_gate.py`). An issue without its answers carries the
+`premises-missing` label until it has them. Issues opened before the gate, and bug
+reports filed through the bug-report form, are not newly labelled.
+
+**A bug report answers different questions.** Its question is whether the bug is
+real, not how to build a change, so an issue labelled `bug` carries a
+`## Verification` section instead, with five numbered answers:
+
+```markdown
+## Verification
+1. <reproduced: how, and on which commit (a fresh main, not a stale checkout)>
+2. <evidence: the exact command and its output>
+3. <reporter-side causes ruled out: misuse, local config, a stale tree, credentials>
+4. <searched: no existing issue, and no fix already on main>
+5. <expected vs actual>
+```
+
+**`devin-ready` always needs the six premise answers,** bug or not, because Devin
+builds a change. Applying it to an issue without them removes it again, with an
+`(aside)` comment naming the missing answers, because that label starts a paid
+Devin session. Devin's own integration watches the label, so a session it has
+already started is not stopped; the label is the visible control. The check runs
+when the label is applied: editing the answers out later leaves `devin-ready` in
+place. `premises-missing` always means the issue's OWN section is incomplete (the
+Verification for a bug report), so a verified bug report that lacks the six loses
+`devin-ready` and gets the comment, but not that label.
+
+**Check before applying the label.** The Action acts only after the label event,
+and on a busy runner queue that can be minutes after Devin has started. So a
+session runs `python3 scripts/premise_gate.py check <issue>` first, and applies
+`devin-ready` only when it exits 0. Exit 1 lists the missing answers: fix the
+issue, never apply the label over them. Exit 2 means the issue could not be read,
+which is not a pass. On a `bug` issue it also lists missing Verification answers;
+those do not change the exit code, because only the six decide the label.
+
 ## Why it exists
 
 Review rounds accumulate for two reasons that the round COUNT cannot tell apart.

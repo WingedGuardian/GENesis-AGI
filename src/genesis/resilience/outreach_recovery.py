@@ -139,6 +139,8 @@ class OutreachRecoveryWorker:
             request = OutreachRequest(
                 category=category,
                 topic=payload.get("topic", ""),
+                # The subject the original send resolved (and the owner saw).
+                email_subject=payload.get("email_subject"),
                 context="",  # Original context not stored — delivery is pre-formatted
                 salience_score=0.9,
                 signal_type="deferred_retry",
