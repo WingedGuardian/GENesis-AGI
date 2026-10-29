@@ -9,8 +9,8 @@ import pytest
 from fastmcp import Client, FastMCP
 from fastmcp.server.middleware import Middleware
 
-from genesis.db.connection import get_db
-from genesis.db.request_database import RequestDatabase
+from genesis.db.connection import drain_connection_worker, get_db
+from genesis.db.request_database import DatabaseScopeError, RequestDatabase
 from genesis.db.schema import create_all_tables
 from genesis.mcp.request_service import initialize_request_service
 from genesis.mcp.standalone_health import StandaloneHealthDataService
@@ -46,6 +46,86 @@ def isolate_module(monkeypatch, name):
             monkeypatch.setattr(module, key, getattr(module, key))
     monkeypatch.setattr(module, "mcp", FastMCP(f"scoped-{name}"))
     return module
+
+
+def bootstrap_dependencies(name, db):
+    if name == "memory":
+        return dict(embedding_provider=object(), qdrant_client=object(), process_pending_bookmarks=False)
+    if name == "health":
+        return dict(service=StandaloneHealthDataService(status_path=db.path.parent / "status.json", db=db))
+    if name == "outreach":
+        return dict(pipeline=None, engagement=None, config=None)
+    return {}
+
+
+@pytest.mark.parametrize("name", ["memory", "health", "recon", "outreach"])
+@pytest.mark.parametrize("failure", ["commit", "cleanup"])
+async def test_failed_bootstrap_finalization_never_registers(database, monkeypatch, name, failure):
+    from genesis.db import request_database
+
+    module = isolate_module(monkeypatch, name)
+    manager = RequestDatabase(database.path, max_units=1)
+    key = "_service" if name == "health" else "_db"
+    prior = getattr(module, key)
+    middleware = list(module.mcp.middleware)
+    commits = 0
+    connections = []
+
+    async def factory(*args, **kwargs):
+        conn = await get_db(*args, **kwargs)
+        raw = conn._conn
+        connections.append(raw)
+        real_commit, real_close = raw.commit, raw.close
+
+        async def commit():
+            nonlocal commits
+            commits += 1
+            # Outreach ensure_table commits explicitly before unit finalization.
+            if failure == "commit" and commits == (2 if name == "outreach" else 1):
+                raise RuntimeError("synthetic bootstrap finalization failure")
+            await real_commit()
+
+        async def close():
+            await real_close()
+            await drain_connection_worker(raw)
+            if failure == "cleanup":
+                raise RuntimeError("synthetic bootstrap finalization failure")
+
+        monkeypatch.setattr(raw, "commit", commit)
+        monkeypatch.setattr(raw, "close", close)
+        return conn
+
+    monkeypatch.setattr(request_database, "get_db", factory)
+    try:
+        with pytest.raises(RuntimeError, match="synthetic bootstrap finalization failure"):
+            await initialize_request_service(name, db=manager, **bootstrap_dependencies(name, manager))
+        assert getattr(module, key) is prior
+        assert module.mcp.middleware == middleware
+        assert commits == (2 if name == "outreach" else 1)
+        assert not manager._owners and not manager._workers and not manager._jobs
+        assert all(not getattr(conn, "_thread", conn).is_alive() for conn in connections)
+    finally:
+        if failure == "cleanup":
+            # A close error must keep the manager quarantined even though this
+            # instrument closed the physical connection before raising.
+            with pytest.raises(DatabaseScopeError, match="closure"):
+                await manager.close()
+        else:
+            await manager.close()
+
+
+@pytest.mark.parametrize("name", ["memory", "health", "recon", "outreach"])
+async def test_bootstrap_rejects_joining_callers_unit_before_registration(database, monkeypatch, name):
+    module = isolate_module(monkeypatch, name)
+    key = "_service" if name == "health" else "_db"
+    prior = getattr(module, key)
+    middleware = list(module.mcp.middleware)
+    async with database.unit_of_work():
+        with pytest.raises(DatabaseScopeError, match="Independent work"):
+            await initialize_request_service(name, db=database, **bootstrap_dependencies(name, database))
+        assert getattr(module, key) is prior
+        assert module.mcp.middleware == middleware
+        assert (await database.execute_fetchall("SELECT 1"))[0][0] == 1
 
 
 @pytest.mark.parametrize("name", ["memory", "health", "recon", "outreach"])

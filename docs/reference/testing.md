@@ -55,7 +55,9 @@ and real detached database writers. Standalone health status/alerts assert seede
 SQL results across success, cancellation, enrichment error and shutdown; guard
 tests reject unsupported runtime health injection without mutating registration.
 Initialization also checks one bootstrap-owned history load, pending-flush
-ownership and scoped/legacy transitions. External host/provider/vector calls are stubbed;
+ownership and scoped/legacy transitions. Bootstrap commit/cleanup failures across
+all four services preserve registration; bootstrap inside the current task's
+active unit is rejected before mutation. External host/provider/vector calls are stubbed;
 HTTP/UDS deployment and caller credentials need separate activation checks.
 
 Genesis v3 has **~21,000 test functions** across **~1,345 files** (counted

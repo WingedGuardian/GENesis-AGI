@@ -26,6 +26,8 @@ async def initialize_request_service(name: str, *, db: RequestDatabase, activity
     A supplied tracker must already use this facade; its owning bootstrap binds
     and optionally warms it once, before registration. Rebinding here could move
     a pending flush away from the manager that owns it.
+    Bootstrap owns an independent unit and must not run inside an active unit
+    owned by this task. Registration starts only after that unit finalizes.
     """
     if not isinstance(db, RequestDatabase):
         raise TypeError("initialize_request_service requires RequestDatabase")
@@ -38,10 +40,10 @@ async def initialize_request_service(name: str, *, db: RequestDatabase, activity
             raise ValueError("Health service must use the supplied RequestDatabase")
     else:
         dependencies["db"] = db
-    async with db.unit_of_work():
+    async with db.unit_of_work(independent=True):
         if name == "outreach":
             from genesis.db.crud.pending_outreach import ensure_table
 
             await ensure_table(db)
-        getattr(module, initializer)(activity_tracker=activity_tracker, **dependencies)
+    getattr(module, initializer)(activity_tracker=activity_tracker, **dependencies)
     return module.mcp

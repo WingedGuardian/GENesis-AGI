@@ -15,6 +15,11 @@ because its shared snapshot task is not request-owned. Ordinary-connection
 runtime health remains supported. Memory requires `read_pool=None`.
 Call it before serving requests, and stop
 requests before closing the manager. Initialization is not a hot-reload API.
+Bootstrap owns an independent database unit; call it outside a unit owned by the
+current task. Database finalization completes before service registration starts,
+so a bootstrap commit or cleanup failure leaves registration unchanged. An
+initializer constructor failure still aborts startup; this is not transactional
+replacement of a running server.
 
 An optional activity tracker must already be bound to the identical facade.
 Its owning bootstrap binds it and optionally loads history once before registering
