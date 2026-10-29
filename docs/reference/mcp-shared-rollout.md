@@ -61,6 +61,18 @@ in the overlay. Adapter argv placeholders: `{python}` `{root}` `{server}` `{url}
 `{stage}`. These names and the adapter contract are provisional: the shared
 service and the adapter own them and set their own where they differ.
 
+The stdlib reader is `genesis.mcp.shared_config.load_config`; the rollout helper
+re-exports it and its configuration error. The merge stays shallow: an overlay's
+server key replaces that key, including a complete nested `service` object.
+Direct script execution works with `python -I -S` and imports no MCP/provider or
+runtime modules. The deploy helper captures both reader and CLI source when it
+is sourced, so a merge cannot change either part of that run's reader.
+
+Package floors are FastMCP 2.14.6 and MCP 1.30, retaining their current major API
+lines. This prepares the inert shared core; a dependency range does not qualify
+every later release or activate shared routing. No shared-service launcher or
+service unit is added by the reader extraction.
+
 A session decides once, when Claude Code spawns its MCP servers. Changing the stage
 affects new sessions; running ones keep the command they started with.
 

@@ -65,9 +65,8 @@ dependencies = [
     "flask>=3.0",
     "flask-sock>=0.7",
     "wsproto>=1.2",  # transitive dep of flask-sock; pin to prevent silent uninstall
-    "fastmcp>=2.0,<3.0",  # <3 for API stability (3.x breaks the API). Genesis uses fastmcp stdio
-                         # transport only (no OpenAPIProvider/OAuthProxy), so its OpenAPI/OAuth CVEs
-                         # (CVE-2026-32871/27124/2025-64340, unfixed pre-3.2.0) are not reachable.
+    "fastmcp>=2.14.6,<3.0",  # retain the 2.x middleware API; shared execution qualifies exact versions
+    "mcp>=1.30,<2",  # stateful session ownership, limits and deletion used by the inert shared core
     "detect-secrets>=1.4",  # Phase 6 contribution sanitizer — REQUIRED floor. sanitize.py fails closed if missing.
     "pymupdf>=1.27",  # PDF text extraction for knowledge ingestion pipeline
     "scrapling>=0.4.7",  # Web fetching with TLS fingerprint impersonation

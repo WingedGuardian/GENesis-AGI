@@ -33,6 +33,22 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
+# The deploy helper captures this file AND the stdlib reader before a merge.
+# Its private prefix already defines these names; ordinary script/import callers
+# load the same module from this checkout, including under python -I -S.
+if not globals().get("_GENESIS_MCP_CONFIG_SNAPSHOT", False):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+    from genesis.mcp.shared_config import (
+        CONFIG_NAME,
+        SharedConfigError,
+        load_config,
+    )
+    from genesis.mcp.shared_config import (
+        overlay_path as overlay_path,
+    )
+
+RolloutError = SharedConfigError
+
 STAGES = ("off", "memory-floor", "health-reads", "writes")
 STAGE_SERVERS = {
     "off": (),
@@ -53,13 +69,6 @@ MAX_STAGE = "off"
 
 KILL_SWITCH = "GENESIS_MCP_SHARED_DISABLED"
 STAGE_ENV = "GENESIS_MCP_SHARED_STAGE"
-CONFIG_NAME = "mcp_shared.json"
-
-
-class RolloutError(Exception):
-    """The rollout configuration cannot be used as written."""
-
-
 class Decision(NamedTuple):
     argv: list
     shared: bool
@@ -70,43 +79,6 @@ def _stage(value, where):
     if not isinstance(value, str) or value not in STAGES:
         raise RolloutError(f"{where}: stage {value!r} is not one of {', '.join(STAGES)}")
     return value
-
-
-def overlay_path(env):
-    home = env.get("GENESIS_HOME") or str(Path(env.get("HOME") or Path.home()) / ".genesis")
-    path = Path(home).expanduser()
-    if not path.is_absolute():
-        raise RolloutError(f"GENESIS_HOME must be an absolute path (got {home!r})")
-    return path / "config" / CONFIG_NAME
-
-
-def _read(path):
-    try:
-        data = json.loads(path.read_text())
-    except FileNotFoundError:
-        return None
-    except (OSError, ValueError) as exc:
-        raise RolloutError(f"cannot read {path}: {exc}") from exc
-    if not isinstance(data, dict):
-        raise RolloutError(f"{path}: expected a JSON object")
-    return data
-
-
-def load_config(root, env):
-    """The tracked defaults under <root>/config, with the user overlay merged per key."""
-    config = {"stage": "off", "adapter": {"argv": []}, "servers": {}}
-    for layer in (_read(Path(root) / "config" / CONFIG_NAME), _read(overlay_path(env))):
-        if not layer:
-            continue
-        if "stage" in layer:
-            config["stage"] = layer["stage"]
-        if isinstance(layer.get("adapter"), dict):
-            config["adapter"] = {**config["adapter"], **layer["adapter"]}
-        for name, spec in (layer.get("servers") or {}).items():
-            if not isinstance(spec, dict):
-                raise RolloutError(f"servers.{name}: expected an object")
-            config["servers"][name] = {**config["servers"].get(name, {}), **spec}
-    return config
 
 
 def _run(argv):
