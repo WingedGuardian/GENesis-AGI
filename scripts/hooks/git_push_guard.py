@@ -1160,6 +1160,9 @@ _MERGE_GATE_BUDGET_S = 45.0
 # included, which used to inherit it only as a side effect of the escalation
 # gate. It stays None on the `--check-pr` reporting path, which is not a hook
 # invocation and has no registration to overrun, so that one uses full caps.
+# main() disarms it on exit (#2904), so an in-process caller (a test) never
+# inherits a spent budget; gates called directly, outside main(), still arm it
+# and leave it armed, which is why tests/test_hooks/conftest.py resets it too.
 _merge_deadline: float | None = None
 
 
@@ -14567,7 +14570,7 @@ def main() -> int:
     single hole in "every override attempt leaves a row", and it fails in the
     direction of a MISSING record, never a false one.
     """
-    global _ASK_EMITTED
+    global _ASK_EMITTED, _merge_deadline
     _PENDING_OVERRIDES.clear()  # a second call in-process must not inherit rows
     _MERGE_READ_CACHE.clear()  # nor reads cached during another invocation
     _ASK_EMITTED = False
@@ -14579,6 +14582,14 @@ def main() -> int:
         outcome = "blocked" if rc == 2 else ("asked" if _ASK_EMITTED else "allowed")
         return rc
     finally:
+        # Nor may anything that runs in-process after this call inherit its
+        # deadline (#2904): once it expires, `_gh_timeout` raises, and a later
+        # direct call such as `_commit_at_prefix` fails for a reason that has
+        # nothing to do with it. Disarmed on EXIT rather than entry, because the
+        # leak reaches calls that never go through main() again. And BEFORE the
+        # flush, so a flush that raises cannot skip it. The production hook is one
+        # process per call, so this changes nothing there.
+        _merge_deadline = None
         _flush_overrides(outcome)
 
 
