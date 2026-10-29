@@ -93,6 +93,19 @@ async def test_different_numbers_are_not_merged(db):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [0, -1, -10])
+@pytest.mark.parametrize("has_insight", [False, True])
+async def test_nonpositive_limit_returns_no_insights(db, limit, has_insight):
+    if has_insight:
+        await _mk(db, "eligible", "learning", "a real learning")
+
+    assert await _recent_decisions(db, limit=limit) == []
+    assert await _recent_decisions(db, limit=1) == (
+        ["a real learning"] if has_insight else []
+    )
+
+
+@pytest.mark.asyncio
 async def test_stops_at_limit_distinct_entries(db):
     for i in range(12):
         await _mk(db, f"n{i}", "learning", f"distinct {i}", minutes_ago=i)

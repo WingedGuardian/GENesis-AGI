@@ -301,6 +301,9 @@ async def _recent_decisions(
     Newest first, at most ``limit`` entries, with repeats collapsed to their
     newest copy (see ``_insight_dedup_key``).
     """
+    if limit <= 0:
+        return []
+
     # Exclude noisy/mechanical types; everything else surfaces.
     _EXCLUDED_TYPES = (
         # Mechanical / tick-level
