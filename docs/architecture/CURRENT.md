@@ -3660,7 +3660,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py]
-verified: bba6115d75fe 2026-10-28
+verified: 2ece179f9ebc 2026-10-28
 ```
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
@@ -3814,8 +3814,12 @@ tool-disabled CC probe without changing its schedule or routing authority.
   per independent unit, bounded admission, retained cancellation cleanup and
   cursor closure. It preserves explicit CRUD commits and refuses expired scopes;
   it does not provide whole-tool atomicity. Existing MCP initialization still
-  uses its legacy connection. Service integration and detached-writer ownership
-  are separate prerequisites before shared activation. See
+  uses its legacy connection. `spawn_database_task` gives scoped detached
+  writers their own unit, preserves other caller context, and tracks jobs from
+  scheduling through shutdown, including cancellation before start. Activity,
+  embedding-heartbeat, deferred-recall, bookmark and proactive tasks use it;
+  legacy connections keep ordinary task scheduling. Service integration remains
+  a separate prerequisite before shared activation. See
   `docs/reference/request-database.md` for lifecycle and failure semantics.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Every

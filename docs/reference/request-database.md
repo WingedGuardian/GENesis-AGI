@@ -12,6 +12,22 @@ unit. Separate request tasks use `independent=True` to avoid inheriting a parent
 unit. Detached tasks must acquire their own unit; ordinary context inheritance
 does not make detached work independent. Await joined tasks before leaving scope.
 
+Use `spawn_database_task(db, coroutine, name=...)` for detached work. With this
+facade it clears only the database lease, preserves other caller ContextVars,
+and opens a fresh unit before running the body. Legacy connections keep ordinary
+`tracked_task` scheduling. The manager tracks jobs before they start, closes
+unstarted coroutines on cancellation/admission failure, and cancels and joins
+jobs during shutdown. Best-effort jobs may be cancelled by shutdown; this is not
+a durable queue. Never await an independent writer while holding a pending write
+transaction on the parent connection.
+
+Provider activity flushes, embedding heartbeats, deferred recall writes,
+pending-bookmark processing and proactive trace/cache/counter tasks use this
+helper. Inline work remains in its caller's unit. Deferred-recall reservations
+and procedure-cache refresh guards are released even on cancellation before
+the body starts. Ambient bookmark routing policy remains a separate activation
+requirement; independent database ownership does not choose the caller's session.
+
 The facade uses the standard WAL, busy timeout, cache and synchronous pragmas,
 with foreign keys disabled for compatibility with existing MCP connections.
 Existing-only opens retain quarantine admission checks. Owned connections never

@@ -136,6 +136,7 @@ class RequestDatabase:
         self._current: ContextVar[_Lease | None] = ContextVar("database_lease", default=None)
         self._owners: set[asyncio.Task] = set()
         self._workers: set[asyncio.Task] = set()
+        self._jobs: set[asyncio.Task] = set()
         self._closing = False
         self._close_task: asyncio.Task | None = None
         self._unclosed: set[_Lease] = set()
@@ -232,8 +233,46 @@ class RequestDatabase:
                         logger.error("Database connection closure could not be confirmed")
                 self._owners.discard(owner)
 
+    def spawn(self, coroutine, **task_options) -> asyncio.Task:
+        """Schedule independent work, preserving all non-database context.
+
+        Ownership starts synchronously, including jobs cancelled before their
+        coroutine enters or while waiting for admission. Shutdown joins them.
+        """
+        from genesis.util.tasks import tracked_task
+
+        if self._closing:
+            coroutine.close()
+            raise DatabaseScopeError("Database manager is closing")
+        started = False
+
+        async def run():
+            nonlocal started
+            async with self.unit_of_work():
+                started = True
+                return await coroutine
+
+        def finished(task):
+            if not started:
+                coroutine.close()
+            self._jobs.discard(task)
+
+        token = self._current.set(None)
+        runner = run()
+        try:
+            task = tracked_task(runner, **task_options)
+        except BaseException:
+            runner.close()
+            coroutine.close()
+            raise
+        finally:
+            self._current.reset(token)
+        self._jobs.add(task)
+        task.add_done_callback(finished)
+        return task
+
     async def _shutdown(self) -> None:
-        owners = tuple(self._owners)
+        owners = tuple(self._owners | self._jobs)
         for task in owners:
             task.cancel()
         await asyncio.gather(*owners, return_exceptions=True)
@@ -303,3 +342,12 @@ class RequestDatabase:
     @property
     def total_changes(self):
         return self._lease().require_active().total_changes
+
+
+def spawn_database_task(db, coroutine, **task_options) -> asyncio.Task:
+    """Detach work with database ownership; preserve legacy task scheduling."""
+    if isinstance(db, RequestDatabase):
+        return db.spawn(coroutine, **task_options)
+    from genesis.util.tasks import tracked_task
+
+    return tracked_task(coroutine, **task_options)
