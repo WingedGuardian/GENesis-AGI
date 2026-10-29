@@ -197,7 +197,9 @@ _shown() {
     #    a local file that happens to reuse its path).
     #    On a failed-listing cycle PUSH_MAX_AGE gates this to fresh files only
     #    (see step 2) so a not-yet-cleaned deletion can't be re-uploaded.
-    #    On a healthy cycle, responses HELD in step 2 are excluded by name.
+    #    On a healthy cycle, exclude HELD and already-listed responses by
+    #    name. Responses are write-once; a deletion after the initial listing
+    #    must not turn into a new upload before the next cleanup cycle.
     if [ -n "$PUSH_MAX_AGE" ]; then
         rclone copy "$LOCAL_PATH" "$REMOTE" \
             --include "*.genesis.md" \
@@ -209,7 +211,8 @@ _shown() {
         {
             while IFS= read -r h; do
                 [ -n "$h" ] && printf -- '- %s\n' "$(_filter_literal "$h")"
-            done <<< "$HELD"
+            done <<< "$HELD
+$REMOTE_GENESIS"
             printf '%s\n' '+ *.genesis.md' '- **'
         } > "$FILTER"
         rclone copy "$LOCAL_PATH" "$REMOTE" \

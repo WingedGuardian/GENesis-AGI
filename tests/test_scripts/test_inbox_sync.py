@@ -39,6 +39,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 _SCRIPT = Path(
     os.environ.get(
         "INBOX_SYNC_SCRIPT_UNDER_TEST",
@@ -73,6 +75,9 @@ case "$1" in
   copy)
     [ "${RCLONE_COPY_RC:-0}" -ne 0 ] && exit "$RCLONE_COPY_RC"
     if [ -n "${RCLONE_VAULT_DIR:-}" ]; then
+      if [ -n "${RCLONE_DELETE_BEFORE_COPY:-}" ]; then
+        rm -f -- "$RCLONE_VAULT_DIR/$RCLONE_DELETE_BEFORE_COPY"
+      fi
       src="$2"; filter=""; ignore_existing=""
       prev=""
       for a in "$@"; do
@@ -429,6 +434,29 @@ def test_record_comes_from_the_post_push_listing(tmp_path):
     assert _run(env).returncode == 0
     assert not fresh.exists(), "a deletion right after the push was not honoured"
     assert not (vault / fresh.name).exists(), "the deleted response was resurrected"
+
+
+@pytest.mark.parametrize("name", ["Seen-1.genesis.md", "nested/a[1]*?.genesis.md"])
+def test_deletion_between_listing_and_push_is_not_resurrected(tmp_path, name):
+    env, inbox, _, _ = _setup(tmp_path)
+    vault = _use_vault_dir(env, tmp_path)
+    remote = _vault_file(vault, name)
+    local = _old_response_file(inbox, name)
+    fresh = _old_response_file(inbox, "New-1.genesis.md")
+    _set_record(inbox, [name])
+    env["RCLONE_DELETE_BEFORE_COPY"] = name
+
+    assert _run(env).returncode == 0
+    assert not remote.exists(), "a deletion after listing was re-uploaded"
+    assert local.exists()
+    assert (vault / fresh.name).read_bytes() == fresh.read_bytes()
+    assert name in _record_names(inbox)
+
+    del env["RCLONE_DELETE_BEFORE_COPY"]
+    assert _run(env).returncode == 0
+    assert not local.exists()
+    assert not remote.exists()
+    assert list((Path(env["GENESIS_HOME"]) / "trash").glob("*/tombstone.json"))
 
 
 def test_deletion_between_push_and_record_is_still_honoured(tmp_path):
