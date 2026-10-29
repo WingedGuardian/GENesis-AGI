@@ -341,14 +341,26 @@ def _pushes(command: str) -> bool:
 @pytest.mark.xfail(
     strict=True,
     raises=AssertionError,
-    reason="#3257: a backslash-escaped quote outside quotes hides the next command",
+    reason="#3257 remains on hash-bearing source; the shared escape repair is partial",
 )
 @PROFILE
 @given(st.lists(_ESCAPABLE, min_size=1, max_size=4), st.sampled_from(["\n", "; ", " && "]))
 @example(words=["It's", "done"], separator="; ")
+@example(words=["#", "It's"], separator="; ")
 def test_a_backslash_escaped_word_never_hides_the_next_command(
     words: list[str], separator: str
 ) -> None:
+    escaped = " ".join("".join(c if c.isalnum() else "\\" + c for c in w) for w in words)
+    assert _pushes(f"echo {escaped}{separator}{shlex.join(_PUSH)}")
+
+
+@PROFILE
+@given(st.lists(_ESCAPABLE, min_size=1, max_size=4), st.sampled_from(["\n", "; ", " && "]))
+@example(words=["It's", "done"], separator="; ")
+def test_hash_free_backslash_escaped_words_reveal_the_next_command(
+    words: list[str], separator: str
+) -> None:
+    assume(all("#" not in word for word in words))
     escaped = " ".join("".join(c if c.isalnum() else "\\" + c for c in w) for w in words)
     assert _pushes(f"echo {escaped}{separator}{shlex.join(_PUSH)}")
 

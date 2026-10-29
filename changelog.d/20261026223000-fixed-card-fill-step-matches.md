@@ -1,0 +1,1 @@
+- **Card fill says which step, consent or extra field it could not find.** A refusal now names the item and why (`step_not_found:2:none`, `:several`, `:frame` or `:owner`), and a checkout step counts only shown elements, so a hidden copy of a button no longer makes the step ambiguous.

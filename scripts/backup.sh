@@ -144,6 +144,8 @@ _extras_gap_fingerprint() {
 }
 _SECRETS_OK=false
 _PV_STATUS="skipped"   # card vault in §8: ok/failed/absent/missing/skipped (see payment_vault_backup.sh)
+_PV_ARCHIVED=""        # §8's ok archive: "<key file> <recipient>" (payment_vault_backup.sh)
+_PV_COPIES=null        # pre-migrate vault copies still beside the vault at the end of the run
 _SUCCESS=false
 _FAILURE_REASON=""
 _FAILURE_CLASS="none"
@@ -190,7 +192,7 @@ _write_status() {
     if [ $((${_EXTRA_SKIPPED:-0} + ${_EXTRA_UPLOAD_FAILED:-0} + ${_EXTRA_PARTIAL:-0})) -gt 0 ]; then _extras_complete=false; fi
     mkdir -p "$(dirname "$_STATUS_FILE")"
     cat > "$_STATUS_FILE" <<STATUSEOF
-{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_dirs_partial":${_EXTRA_PARTIAL:-0},"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"payment_vault":"${_PV_STATUS:-skipped}","duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"offsite_core_complete":$_offsite_core_complete,"extras_complete":$_extras_complete,"extras_gap":"$_extras_gap","offsite_core_alerted":${_ALERTED_CORE:-false},"extras_alerted_gap":"${_ALERTED_GAP:-}","tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
+{"timestamp":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","run_id":"$_RUN_ID","success":$_SUCCESS,"sqlite_lines":$_SQLITE_LINES,"qdrant_collections":$_QDRANT_COUNT,"transcript_files":$_TRANSCRIPT_COUNT,"memory_files":$_MEMORY_COUNT,"eval_files":${_EVAL_COUNT:-0},"extra_dirs":${_EXTRA_COUNT:-0},"extra_dirs_skipped":${_EXTRA_SKIPPED:-0},"extra_dirs_partial":${_EXTRA_PARTIAL:-0},"extra_upload_failed":${_EXTRA_UPLOAD_FAILED:-0},"secrets_encrypted":$_SECRETS_OK,"payment_vault":"${_PV_STATUS:-skipped}","payment_vault_copies":${_PV_COPIES:-null},"duration_s":$_duration,"failure_reason":"$_safe_reason","failure_class":"$_FAILURE_CLASS","failure_stage":"$_FAILURE_STAGE","db_integrity_status":"$_DB_INTEGRITY_STATUS","sqlite_backup_verified":$_SQLITE_BACKUP_VERIFIED,"tier2_status":"${_T2_STATUS:-unknown}","offsite_confirmed":$_offsite_confirmed,"offsite_core_complete":$_offsite_core_complete,"extras_complete":$_extras_complete,"extras_gap":"$_extras_gap","offsite_core_alerted":${_ALERTED_CORE:-false},"extras_alerted_gap":"${_ALERTED_GAP:-}","tier2_backend":"${_T2_BACKEND:-none}","snapshot_id":"${_T2_STAMP:-}","snapshot_count":${_T2_SNAPSHOT_COUNT:-null},"pruned_count":${_T2_PRUNED:-null},"tier1_pushed":$_TIER1_PUSHED}
 STATUSEOF
 }
 
@@ -992,7 +994,7 @@ else
         if _tar_root_err="$(mktemp -p "$GENESIS_BIG_TMP" extra.XXXXXX.err 2>/dev/null)"; then
             _EXTRA_TAR_ERR="$_tar_root_err"
             _tar_root="$(python3 "$_SCRIPT_DIR/lib/extra_restore.py" verify "$_tar_tmp" "$GENESIS_BIG_TMP" 2>"$_tar_root_err")" || _tar_verify_rc=$?
-            _tar_root_why="$(head -c 300 "$_tar_root_err" | tr '\n' ' ')"
+            _tar_root_why="$(cat "$_tar_root_err")"
             rm -f "$_tar_root_err"
             _EXTRA_TAR_ERR=""
         else
@@ -1231,8 +1233,17 @@ if $_ENCRYPT_READY; then
     # The card vault → creds/payment_vault.tar.gpg (scripts/lib/payment_vault_backup.sh).
     # A failure or a vanished vault fails the run like a Qdrant gap: the rest of
     # the backup still lands, and update.sh continues degraded on non_db.
-    _PV_OUT="$(backup_payment_vault "$_GENESIS_HOME/payment_vault" creds "$GENESIS_BIG_TMP")" \
+    # What the archive holds is recorded by the step itself: the copies
+    # `vault migrate` kept are deleted after the push only for THAT set.
+    _PV_RECORD="$GENESIS_BIG_TMP/.payment_vault_record.$$"
+    rm -f -- "$_PV_RECORD" 2>/dev/null || true
+    _PV_OUT="$(PAYMENT_VAULT_RECORD="$_PV_RECORD" backup_payment_vault \
+        "$_GENESIS_HOME/payment_vault" creds "$GENESIS_BIG_TMP")" \
         || _PV_OUT="failed the vault step aborted"
+    if [ -f "$_PV_RECORD" ] && [ ! -L "$_PV_RECORD" ]; then
+        _PV_ARCHIVED="$(head -n 1 "$_PV_RECORD" 2>/dev/null)" || _PV_ARCHIVED=""
+    fi
+    rm -f -- "$_PV_RECORD" 2>/dev/null || true
     read -r _PV_STATUS _PV_WHY <<< "$_PV_OUT"
     case "$_PV_STATUS" in
         ok | absent | missing | failed) ;;
@@ -1637,6 +1648,23 @@ else
         log "ERROR: git commit failed — repository may need re-clone from remote"
     fi
 fi
+
+# The copies `vault migrate` kept beside the vault hold every card it had, and
+# its unsealed key opens them: deleted once this run's archive of the migrated
+# vault (identity.key, that recipient) is on the backups remote
+# (scripts/lib/payment_vault_backup.sh). Never fails the run.
+read -r _PV_ARCH_KEY _PV_ARCH_RECIPIENT <<< "${_PV_ARCHIVED:-}" || true
+if [ "$_PV_STATUS" = ok ] && [ "$_TIER1_PUSHED" = true ] \
+    && [ "${_PV_ARCH_KEY:-}" = identity.key ] && [ -n "${_PV_ARCH_RECIPIENT:-}" ]; then
+    _PV_DROP="$(payment_vault_drop_copies "$_GENESIS_HOME/payment_vault" "$_PV_ARCH_RECIPIENT")" \
+        || _PV_DROP=""
+    read -r _PV_DELETED _PV_LEFT <<< "${_PV_DROP:-0 0}" || true
+    if [ "${_PV_DELETED:-0}" != 0 ] || [ "${_PV_LEFT:-0}" != 0 ]; then
+        log "Payment vault: pre-migrate copies: ${_PV_DELETED:-0} deleted, ${_PV_LEFT:-0} left (not a plain copy of this vault)"
+    fi
+fi
+_PV_COPIES="$(payment_vault_count_copies "$_GENESIS_HOME/payment_vault")" || _PV_COPIES=null
+case "$_PV_COPIES" in '' | *[!0-9]*) _PV_COPIES=null ;; esac
 
 if [ "$_SQLITE_LINES" -gt 0 ] && [ "$_SQLITE_BACKUP_VERIFIED" = "true" ] \
     && [ -z "$_FAILURE_REASON" ]; then

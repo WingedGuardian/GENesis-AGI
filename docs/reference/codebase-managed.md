@@ -488,6 +488,41 @@ clear the sentinel, release the freeze or retry unattended after resource failur
 Follow the supervised production acceptance and resource gates in
 `../architecture/codebase-managed-runtime.md`.
 
+### Legacy queue import evidence
+
+The queue upgrades its import metadata atomically to schema 2. Each legacy
+artifact is isolated by a savepoint: malformed content produces a retained
+receipt containing its exact raw bytes and a reason, while unrelated valid
+requests continue. These diagnostics do not replace a repository's genuine
+failed request or conflicting-outcome state. Stale, unowned outcome artifacts
+also appear in import receipts; owned conflicting outcomes retain their existing
+business handling. Filesystem and SQLite failures remain errors, with claimed
+files retained until the import transaction commits. A failure after commit is
+recoverable from the receipt even if a later directory sync fails after unlink.
+
+Inspect receipts without importing work or initializing the queue:
+
+```bash
+python3 scripts/lib/index_marker.py import-status --limit 20
+```
+
+The JSON reports actual totals, imported/quarantined counts, the display limit
+and truncation. Source names use lossless hexadecimal filesystem bytes; raw
+rejected payloads remain in the private queue database and are not printed.
+An absent queue is explicit; schema 1 reports that receipt diagnostics are
+unavailable. Unsupported schema/journal mode, read and lock failures exit 2.
+The reader uses read-only/query-only SQLite against the supported rollback
+journal format; it never ignores recovery journals with `immutable=1`.
+Converted schema-1 metadata is labeled `legacy-metadata-only`: it proves prior
+processing, not historical content validity. No rejected payload is invented.
+
+Receipt identity includes source bytes, raw digest and exact decimal mtime.
+Prior identities remain retained so a commit-before-unlink replay cannot import
+work twice. Do not clear this history to retry a request. Older queue binaries
+refuse schema 2; rolling back code must not restore an old queue snapshot over
+new writes. This migration does not enable indexing, add resource quarantine,
+or fix the runner's separate list/claim error handling tracked in #2043.
+
 ## Verification
 
 The runner's SQLite contention fixture verifies actual outcome replay: after
@@ -498,9 +533,15 @@ lock-busy no-op does not prove completion. The fixture also bounds its locker
 readiness wait. These tests use an isolated home and fake provider; they do not
 qualify production indexing or explain a separate first-tick timeout.
 
+Permission-denial fixtures first verify the specific denied role with effective
+IDs. If privilege defeats that premise, only that case skips with its role in
+the reason; ordinary refusal assertions and writable positive controls still
+run. The hot-journal positive case performs real SQLite recovery. Copy-source
+configuration retains its mode-bit contract independently of effective execute
+access, so its positive case also runs when privilege permits execution.
+
 The configuration test suite uses synthetic paths and fixtures. Native staging
 acceptance explicitly opts in to the independently pinned release binary:
-
 ```bash
 GENESIS_TEST_CBM_PINNED_BINARY="$HOME/tmp/codebase-memory-mcp" \
   .venv/bin/pytest tests/test_scripts/test_codebase_managed_config.py

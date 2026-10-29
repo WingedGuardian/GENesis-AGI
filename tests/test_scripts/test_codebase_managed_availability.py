@@ -142,16 +142,19 @@ def test_persistence_checks_the_actual_export_directory(availability, tmp_path, 
         artifact.mkdir()
     monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "state"))
     before = sorted(tmp_path.rglob("*"))
+    original_mode = main.stat().st_mode
     main.chmod(0o500)
     try:
         if persistence and not artifact_exists:
+            if os.access(main, os.W_OK, effective_ids=True):
+                pytest.skip("effective persistence-parent write-denial premise defeated")
             with pytest.raises(ValueError, match="ReadWritePaths"):
                 availability.verify_worker_writes(value, persistence)
         else:
             availability.verify_worker_writes(value, persistence)
         assert sorted(tmp_path.rglob("*")) == before  # no locks, queue or probe writes
     finally:
-        main.chmod(0o700)
+        main.chmod(original_mode)
 
 
 @pytest.mark.parametrize("key", ["cache", "runtime", "state", "database", "wal", "shm", "artifact"])
@@ -171,14 +174,17 @@ def test_blocked_writer_is_diagnosed_readonly(availability, tmp_path, monkeypatc
     artifact.mkdir()
     target = {"state": state, "database": database, "wal": wal,
               "shm": shm, "artifact": artifact}.get(key, Path(value.get(key, value["cache"])))
+    original_mode = target.stat().st_mode
     target.chmod(0o500 if target.is_dir() else 0o400)
     try:
+        if os.access(target, os.W_OK, effective_ids=True):
+            pytest.skip(f"effective {key} write-denial premise defeated")
         with pytest.raises(ValueError, match="ReadWritePaths"):
             availability.verify_worker_writes(value, True)
         assert database.read_bytes() == b"retained database"
         assert not (state / "locks").exists()
     finally:
-        target.chmod(0o700 if target.is_dir() else 0o600)
+        target.chmod(original_mode)
 
 
 @pytest.mark.parametrize("fault", ["readonly-mount", "lookup-denied", "not-directory", "broken-link"])
@@ -193,6 +199,7 @@ def test_write_diagnosis_does_not_convert_errors_to_missing(availability, tmp_pa
         parent = tmp_path / "blocked"
         parent.mkdir()
         target = parent / "target"
+        original_mode = parent.stat().st_mode
         parent.chmod(0)
         error = PermissionError
     elif fault == "not-directory":
@@ -202,11 +209,13 @@ def test_write_diagnosis_does_not_convert_errors_to_missing(availability, tmp_pa
         target.symlink_to(tmp_path / "missing")
         error = FileNotFoundError
     try:
+        if fault == "lookup-denied" and os.access(target.parent, os.X_OK, effective_ids=True):
+            pytest.skip("effective parent search-denial premise defeated")
         with pytest.raises(error):
             check(target, directory=True)
     finally:
         if fault == "lookup-denied":
-            target.parent.chmod(0o700)
+            target.parent.chmod(original_mode)
 
 
 @pytest.mark.parametrize("persistence", ["true", "false"])

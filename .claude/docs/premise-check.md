@@ -21,6 +21,62 @@ Every plan and every issue that specifies work answers six questions:
 
 The answers belong in the plan or issue body, not in a reviewer's first round.
 
+**The format, in a plan:** one section, numbered to match the questions. `n/a — <reason>`
+is an answer; a bare `n/a` is not.
+
+```markdown
+## Premise checks
+1. <outside-behaviour claims: measured or cited>
+2. <what was searched, and what was found>
+3. <scope limits, and the shared code they leave reachable>
+4. <the caller, and its tracker or why there is none>
+5. <how each number was measured>
+6. <expected counted lines, and the split or Shape: reason>
+```
+
+`## Premise questions` is accepted as the heading too. A plan that names a
+repo-relative path (`src/`, `scripts/`, `tests/`, `.claude/`, `docs/`, `config/`,
+`.github/`) outside code blocks counts as specifying work, and the ExitPlanMode hook
+`scripts/hooks/plan_premise_gate.py` blocks it while the section is missing or an
+answer is empty. That is all it checks: whether an answer is true stays the
+reviewer's question.
+
+**On an issue,** the same parser applies, through the premise gate Action
+(`scripts/premise_gate.py`). An issue without its answers carries the
+`premises-missing` label until it has them. Issues opened before the gate, and bug
+reports filed through the bug-report form, are not newly labelled.
+
+**A bug report answers different questions.** Its question is whether the bug is
+real, not how to build a change, so an issue labelled `bug` carries a
+`## Verification` section instead, with five numbered answers:
+
+```markdown
+## Verification
+1. <reproduced: how, and on which commit (a fresh main, not a stale checkout)>
+2. <evidence: the exact command and its output>
+3. <reporter-side causes ruled out: misuse, local config, a stale tree, credentials>
+4. <searched: no existing issue, and no fix already on main>
+5. <expected vs actual>
+```
+
+**`devin-ready` always needs the six premise answers,** bug or not, because Devin
+builds a change. Applying it to an issue without them removes it again, with an
+`(aside)` comment naming the missing answers, because that label starts a paid
+Devin session. Devin's own integration watches the label, so a session it has
+already started is not stopped; the label is the visible control. The check runs
+when the label is applied: editing the answers out later leaves `devin-ready` in
+place. `premises-missing` always means the issue's OWN section is incomplete (the
+Verification for a bug report), so a verified bug report that lacks the six loses
+`devin-ready` and gets the comment, but not that label.
+
+**Check before applying the label.** The Action acts only after the label event,
+and on a busy runner queue that can be minutes after Devin has started. So a
+session runs `python3 scripts/premise_gate.py check <issue>` first, and applies
+`devin-ready` only when it exits 0. Exit 1 lists the missing answers: fix the
+issue, never apply the label over them. Exit 2 means the issue could not be read,
+which is not a pass. On a `bug` issue it also lists missing Verification answers;
+those do not change the exit code, because only the six decide the label.
+
 ## Why it exists
 
 Review rounds accumulate for two reasons that the round COUNT cannot tell apart.
@@ -274,9 +330,7 @@ exception: a Devin-built PR is audited before further rounds are spent, and a
 SOUND-BUT-INFERIOR verdict with a better shape that changes the mechanism or the
 files touched IS kicked back to Devin. See the closing-session skill, "Devin-built PRs".)
 
-**The evidence bar is TWO OR MORE independent signals**, the same bar the
-round-2 gate message states, because a doc that set a lower one would be the
-easier surface to read and would quietly undercut it. The signals: findings
+**The evidence bar is TWO OR MORE independent signals.** The signals: findings
 CONCENTRATING in one file or function; a finding landing on a line THIS change
 added in an earlier round; the diff GROWING across rounds instead of shrinking.
 One alone is an ordinary local defect wearing an architectural shape — findings

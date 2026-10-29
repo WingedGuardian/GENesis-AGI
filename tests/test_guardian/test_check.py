@@ -26,6 +26,15 @@ from genesis.guardian.pool import StoragePoolStatus
 from genesis.guardian.state_machine import ConfirmationStateMachine, GuardianState
 
 
+@pytest.fixture(autouse=True)
+def _no_container_cgroup_access(monkeypatch):
+    """``run_check`` runs the container-swap reconciler, which reads (and can
+    write) the container's ``memory.swap.max`` through ``sudo``. That acts on
+    the machine the test runs on, so it is a no-op here; the reconciler has its
+    own tests (``tests/test_guardian/test_swap_watch.py``)."""
+    monkeypatch.setattr("genesis.guardian.check._check_container_swap_and_alert", AsyncMock())
+
+
 @pytest.fixture
 def config(tmp_path: Path) -> GuardianConfig:
     cfg = GuardianConfig()
@@ -1112,6 +1121,10 @@ class TestTwoGateApproval:
                 "genesis.guardian.git_watch.container_git_supports_revert",
                 AsyncMock(return_value=True),
             ),
+            patch(
+                "genesis.guardian.recovery.container_on_live",
+                AsyncMock(return_value=False),
+            ),
         ):
             await _execute_recovery_with_approval(
                 config,
@@ -1123,6 +1136,113 @@ class TestTwoGateApproval:
 
         executed = recovery_engine.execute.await_args.args[0]
         assert executed.recommended_action == RecoveryAction.REVERT_CODE
+
+    @pytest.mark.asyncio
+    async def test_revert_redirected_to_container_restart_on_live(
+        self,
+        config: GuardianConfig,
+    ) -> None:
+        """#3492 D3: on `live` a revert never runs. The PROPOSAL becomes the
+        ladder's next rung, RESTART_CONTAINER, before Gate 2, so the user
+        approves what runs; its server start runs the boot repair."""
+        sm = self._sm(config)
+        channel = _mock_gate_channel(["APPROVE", "APPROVE"])
+        dispatcher = MagicMock()
+        dispatcher.send = AsyncMock()
+        recovery_engine = MagicMock()
+        recovery_engine.execute = AsyncMock()
+
+        with (
+            patch("genesis.guardian.check._find_telegram_channel", return_value=channel),
+            patch(
+                "genesis.guardian.check.collect_all_signals",
+                AsyncMock(return_value=_dead_snapshot()),
+            ),
+            patch("genesis.guardian.check.collect_diagnostics", AsyncMock(return_value={})),
+            patch("genesis.guardian.check.write_diagnosis_result"),
+            patch.object(
+                DiagnosisEngine,
+                "diagnose",
+                AsyncMock(return_value=_proposed_diagnosis(RecoveryAction.REVERT_CODE)),
+            ),
+            patch(
+                "genesis.guardian.git_watch.container_git_supports_revert",
+                AsyncMock(return_value=True),
+            ),
+            patch(
+                "genesis.guardian.recovery.container_on_live",
+                AsyncMock(return_value=True),
+            ),
+        ):
+            await _execute_recovery_with_approval(
+                config,
+                sm,
+                dispatcher,
+                recovery_engine,
+                _proposed_diagnosis(RecoveryAction.REVERT_CODE),
+            )
+
+        executed = recovery_engine.execute.await_args.args[0]
+        assert executed.recommended_action == RecoveryAction.RESTART_CONTAINER
+        assert "`live`" in executed.likely_cause
+        # The probe may only have failed to show otherwise; no heal is claimed.
+        assert "or could not be shown not to be" in executed.likely_cause
+        assert "deploy_candidates drop" in executed.likely_cause
+        assert "runs the boot repair" not in executed.likely_cause
+
+    @pytest.mark.asyncio
+    async def test_live_head_without_manifest_is_still_redirected(
+        self,
+        config: GuardianConfig,
+    ) -> None:
+        """HEAD on `live` with no deploy manifest: the predicate says `other`,
+        but the branch alone keeps the revert from running."""
+        sm = self._sm(config)
+        channel = _mock_gate_channel(["APPROVE", "APPROVE"])
+        dispatcher = MagicMock()
+        dispatcher.send = AsyncMock()
+        recovery_engine = MagicMock()
+        recovery_engine.execute = AsyncMock()
+
+        async def container(*args, **kwargs):
+            if "symbolic-ref" in args[-1]:
+                return (0, "refs/heads/live\n", "")
+            return (1, "other\n", "")  # live_checkout.py, no manifest
+
+        with (
+            patch("genesis.guardian.check._find_telegram_channel", return_value=channel),
+            patch(
+                "genesis.guardian.check.collect_all_signals",
+                AsyncMock(return_value=_dead_snapshot()),
+            ),
+            patch("genesis.guardian.check.collect_diagnostics", AsyncMock(return_value={})),
+            patch("genesis.guardian.check.write_diagnosis_result"),
+            patch.object(
+                DiagnosisEngine,
+                "diagnose",
+                AsyncMock(return_value=_proposed_diagnosis(RecoveryAction.REVERT_CODE)),
+            ),
+            patch(
+                "genesis.guardian.git_watch.container_git_supports_revert",
+                AsyncMock(return_value=True),
+            ),
+            patch("genesis.guardian.recovery._run_subprocess", container),
+        ):
+            await _execute_recovery_with_approval(
+                config,
+                sm,
+                dispatcher,
+                recovery_engine,
+                _proposed_diagnosis(RecoveryAction.REVERT_CODE),
+            )
+
+        executed = recovery_engine.execute.await_args.args[0]
+        assert executed.recommended_action == RecoveryAction.RESTART_CONTAINER
+        gate2 = next(
+            c.args[0] for c in channel.send_text.await_args_list if "Proposed:" in c.args[0]
+        )
+        assert "RESTART_CONTAINER" in gate2
+        assert "REVERT_CODE" not in gate2
 
     @pytest.mark.asyncio
     async def test_deny_at_gate1_does_not_execute(self, config: GuardianConfig) -> None:

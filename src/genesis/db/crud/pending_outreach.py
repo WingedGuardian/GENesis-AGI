@@ -24,6 +24,7 @@ async def enqueue(
     thread_id: str | None = None,
     validated_recipient: str | None = None,
     labeled_surplus: bool = False,
+    email_subject: str | None = None,
     pending_id: str | None = None,
     commit: bool = True,
 ) -> str:
@@ -38,6 +39,11 @@ async def enqueue(
     QUEUED cold-marketing send (the MCP subprocess enqueue path) is rebuilt with
     ``labeled_surplus=True`` and classifies BULK at the autonomy gate — without it
     a queued cold send mis-classifies as IDENTITY.
+
+    ``email_subject`` carries an email's own subject line through the queue. The
+    drain makes it the request topic, which becomes the MIME subject; without it
+    the topic is rebuilt from the message start, so a queued marketing email went
+    out with the start of its body in the subject.
     """
     from datetime import UTC, datetime
 
@@ -46,8 +52,8 @@ async def enqueue(
     await db.execute(
         """INSERT INTO pending_outreach
            (id, message, category, channel, urgency, deliver_after, created_at,
-            thread_id, validated_recipient, labeled_surplus)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            thread_id, validated_recipient, labeled_surplus, email_subject)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             pending_id,
             message,
@@ -59,6 +65,7 @@ async def enqueue(
             thread_id,
             validated_recipient,
             1 if labeled_surplus else 0,
+            email_subject or None,
         ),
     )
     if commit:
@@ -234,6 +241,7 @@ async def ensure_table(db: aiosqlite.Connection) -> None:
             thread_id           TEXT,
             validated_recipient TEXT,
             labeled_surplus     INTEGER NOT NULL DEFAULT 0,
+            email_subject       TEXT,
             cancelled_at        TEXT
         )
     """)
@@ -258,6 +266,7 @@ async def ensure_table(db: aiosqlite.Connection) -> None:
             "ALTER TABLE pending_outreach ADD COLUMN labeled_surplus INTEGER NOT NULL DEFAULT 0",
         ),
         ("cancelled_at", "ALTER TABLE pending_outreach ADD COLUMN cancelled_at TEXT"),
+        ("email_subject", "ALTER TABLE pending_outreach ADD COLUMN email_subject TEXT"),
     ):
         if column in cols:
             continue
