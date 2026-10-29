@@ -487,6 +487,82 @@ async def list_open(db: aiosqlite.Connection, *, limit: int = 500) -> list[dict]
     return [dict(r) for r in await cursor.fetchall()]
 
 
+#: The verdicts a standing validator may pick, and the tier each sorts into. An
+#: open row whose verdict is NULL was never attempted (any attempt sets one).
+#: ``fail-intent`` is absent on purpose: it is the owner's to act on, never the
+#: loop's to retry. A verdict this map does not name is not picked.
+_CANDIDATE_TIERS = {"not-yet-done": 0, None: 1, "cannot-verify": 2}
+
+
+async def list_validation_candidates(
+    db: aiosqlite.Connection, *, now: str, reattempt_days: int = 7
+) -> list[dict]:
+    """Open rows a validator may pick next, best first. Each carries a ``tier``.
+
+    Eligibility (owner ruling, 2026-10-29): ``not-yet-done`` always, with no
+    delay, because the commands that finish it are named and runnable now
+    (tier 0); never attempted (tier 1); ``cannot-verify`` only once its last
+    attempt is at least ``reattempt_days`` old (tier 2), so a precondition gets
+    time to become reachable; ``fail-intent`` never. Within a tier, NEWEST merge
+    first: a standing validator works recent merges while their context is warm,
+    which is the opposite of :func:`list_open`'s backlog order, so this is its
+    own query rather than a flag on that one.
+
+    Deliberately UNLIMITED: the caller ranks across all of it (deploy state and
+    the E2E plan come from GitHub, not this table), so a capped read would rank
+    a subset and call it the answer.
+
+    The re-attempt window compares parsed INSTANTS in Python, not strings in
+    SQL: writers store ISO stamps in more than one spelling (``Z`` and
+    ``+00:00``), and those sort differently as text. A stamp that does not parse
+    leaves the row out, since an unknown age is not "old enough".
+
+    Before the verdict columns exist no attempt could have been recorded, so
+    every open row is never-attempted. Assumes a Row factory. Empty
+    pre-migration.
+    """
+    if reattempt_days < 1:
+        raise ValueError(
+            f"list_validation_candidates: reattempt_days must be >= 1, got {reattempt_days!r}"
+        )
+    from datetime import datetime, timedelta
+
+    cutoff = datetime.fromisoformat(now) - timedelta(days=reattempt_days)
+    if cutoff.tzinfo is None:
+        # A naive `now` cannot be compared with a stored aware stamp; refuse it
+        # here rather than raise TypeError on the first parked row.
+        raise ValueError(f"list_validation_candidates: now must carry a timezone, got {now!r}")
+    if not await _tables_available(db):
+        return []
+    if not await _verdict_columns_available(db):
+        cursor = await db.execute(
+            "SELECT * FROM pr_verifications WHERE status = 'open' ORDER BY merged_at DESC"
+        )
+        return [{**dict(r), "tier": _CANDIDATE_TIERS[None]} for r in await cursor.fetchall()]
+
+    cursor = await db.execute(
+        "SELECT * FROM pr_verifications WHERE status = 'open' AND "
+        "(verdict IS NULL OR verdict IN ('not-yet-done', 'cannot-verify')) "
+        "ORDER BY merged_at DESC"
+    )
+    picked: list[dict] = []
+    for raw in await cursor.fetchall():
+        row = dict(raw)
+        verdict = row.get("verdict")
+        if verdict == "cannot-verify":
+            try:
+                last = datetime.fromisoformat(str(row.get("last_attempt_at")))
+            except ValueError:
+                continue
+            if last.tzinfo is None or last > cutoff:
+                continue
+        row["tier"] = _CANDIDATE_TIERS[verdict]
+        picked.append(row)
+    # Stable sort: newest-merge order from SQL survives inside each tier.
+    picked.sort(key=lambda r: r["tier"])
+    return picked
+
+
 async def counts(db: aiosqlite.Connection) -> dict:
     """Status histogram, e.g. ``{"open": 12, "closed": 40}``. Empty pre-migration."""
     out: dict = {}

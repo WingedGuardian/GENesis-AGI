@@ -2543,7 +2543,13 @@ verified: 477efb7f7 2026-10-05
   `20260906234824_pr_verifications` migration docstring for the full
   New-Store-Gate justification. The CONSUMER is the **validator session**
   (`scripts/pr_verification.py`, with its doctrine in the `validating-merges`
-  skill and its readers on `repo_pulse_worker.py`). The verdict is DERIVED from the
+  skill and its readers on `repo_pulse_worker.py`). Its picker,
+  `repo_pulse_worker.py --next-for-validation`, names the ONE row to work next:
+  not-yet-done, then never-attempted, then a parked row past 7 days, never
+  fail-intent; deployed rows with an `E2E:` plan first, newest merge first. Deploy
+  is merge-commit ancestry of the serving commit, except a stacked PR, which is
+  kept and labelled because ancestry cannot prove it either way. It fails closed
+  (picks nothing) when GitHub or git cannot answer. The verdict is DERIVED from the
   validator's evidence document by `session_awareness/pr_evidence.py` (a strict
   pydantic model plus a total decision tree), never asserted by the caller — a
   caller-asserted design policed by refusal rules produced documents with no legal
