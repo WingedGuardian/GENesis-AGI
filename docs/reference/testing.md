@@ -1,5 +1,12 @@
 # Testing Guide
 
+The shared MCP configuration reader is exercised with real `python -I -S`
+subprocesses and captured deploy source in
+`tests/test_mcp/test_shared_config.py`. Run it with
+`tests/test_scripts/test_mcp_rollout.py` and
+`tests/test_scripts/test_shared_mcp_units.py` to cover the reader's script,
+deploy and import consumers. Their systemd calls use fixture shims.
+
 ## Running Tests
 
 All tests run from the genesis project root using pytest:

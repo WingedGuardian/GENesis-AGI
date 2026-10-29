@@ -20,7 +20,14 @@
 # The helper's code is read when this file is sourced, like the deploy scripts'
 # other helpers: a merge that replaces it mid-run cannot change this run.
 
-_SHARED_MCP_ROLLOUT_PY="$(cat "$(dirname -- "${BASH_SOURCE[0]}")/mcp_rollout.py" 2>/dev/null || true)"
+# Capture the reader too: importing it later could mix pre/post-merge code.
+# Concatenation is only of these two owned stdlib sources, never config data.
+_SHARED_MCP_ROLLOUT_PY="$(
+    _shared_mcp_lib_dir="$(dirname -- "${BASH_SOURCE[0]}")"
+    cat "$_shared_mcp_lib_dir/../../src/genesis/mcp/shared_config.py" 2>/dev/null &&
+        printf '\n_GENESIS_MCP_CONFIG_SNAPSHOT = True\n' &&
+        cat "$_shared_mcp_lib_dir/mcp_rollout.py" 2>/dev/null
+)" || _SHARED_MCP_ROLLOUT_PY=""
 
 genesis_restart_shared_mcp_units() {
     local root="$1" units unit state load enabled active inv_before inv_after rrc rc=0
