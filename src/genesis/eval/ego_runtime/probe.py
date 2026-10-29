@@ -10,6 +10,7 @@ from tempfile import TemporaryDirectory
 
 import aiosqlite
 
+from genesis.db.connection import connect_aiosqlite_rw
 from genesis.db.crud import ego
 from genesis.db.schema import TABLES
 from genesis.eval.ego_runtime.cases import CASES, Case, Step
@@ -70,7 +71,7 @@ def artifacts(root):
 async def run_case(case: Case, root: Path, *, reopen: bool):
     root.mkdir()
     path = root / "fixture.sqlite3"
-    writer = await aiosqlite.connect(path)
+    writer = await connect_aiosqlite_rw(path)
     writer.row_factory = aiosqlite.Row
     rows = []
     try:
@@ -83,7 +84,7 @@ async def run_case(case: Case, root: Path, *, reopen: bool):
         for index, step in enumerate(case.steps, 1):
             if reopen:
                 await writer.close()
-                writer = await aiosqlite.connect(path)
+                writer = await connect_aiosqlite_rw(path)
                 writer.row_factory = aiosqlite.Row
             result = await operate(writer, step)
             state = await snapshot(path)
