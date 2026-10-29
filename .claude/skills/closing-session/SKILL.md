@@ -374,6 +374,16 @@ blocked. An empty result from your own query is "my query found nothing", never
 It prints one line per gate, then a `verdict` line. Read every line — a PR can
 be Codex-clean and still blocked by CI, base branch, or pin receipts.
 
+**A `NOTE: … latest completed … run … is <red>` line on stderr means the PR's
+BASE branch is red** (advisory, owner ruling 2026-10-28; it never moves the
+verdict). The PR's own green CI ran on the base as it was then, so merging now
+lands it on a red base with no fresh signal about it. Weigh it, don't stall on
+it: if the failing jobs the NOTE names test what this PR touches, or this PR is
+their fix, look first; if they are a flake or an infrastructure failure, merging
+an unrelated PR is fine (none of the 14 merges onto a red main measured
+2026-09-28 to 10-28 caused the red). The NOTE shows only in a local
+`--check-pr`: the CI merge-gate's token cannot read Actions runs.
+
 ### 2. Branch on the verdict
 
 **Read every gate's line, and read it by GATE NAME plus pass/block — never by
