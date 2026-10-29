@@ -254,6 +254,19 @@ def _hermetic_squash_body_file(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_stale_base_note(monkeypatch):
+    """Switch off the ``--check-pr`` stale-base NOTE for EVERY hook test.
+
+    The NOTE reads the PR head's CI runs, the base's commits and their files, so
+    without this every test that drives ``check_pr_report`` would make live calls
+    (some as a subprocess, hence an environment variable the children inherit). It
+    is advisory and never moves a verdict. Its own behaviour is tested in
+    tests/test_hooks/test_merge_gate_stale_base_note.py, which clears this per case."""
+    monkeypatch.setenv("_TEST_STALE_BASE_NOTE", "off")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_main_reverts(monkeypatch):
     """Pin the ``--check-pr`` ``main-reverts`` row's commit read for EVERY hook test.
 

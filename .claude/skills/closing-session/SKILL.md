@@ -374,6 +374,21 @@ blocked. An empty result from your own query is "my query found nothing", never
 It prints one line per gate, then a `verdict` line. Read every line — a PR can
 be Codex-clean and still blocked by CI, base branch, or pin receipts.
 
+**A `NOTE: … base commits since its newest … run changed code …` block on
+stderr means base commits since the PR's CI changed CODE this PR also changes**
+(advisory, owner rulings 2026-10-28/29; it never moves the verdict, and prose
+overlaps are not counted). It lists each shared path with the base commits that
+changed it. That CI never ran the two changes together. A `… code path(s) were
+not checked …` NOTE means some paths could not be read, so silence was not
+earned there; treat those paths as unknown. Weigh it: most overlaps
+merge cleanly (MEASURED over 490 merges, 2026-09-29 to 10-29: a code overlap at
+merge time on 57, one real collision). Read the named commits against this PR's
+change; only if they may interact, update the branch (`gh pr update-branch <N>`)
+so CI runs on the current base. That moves the head, so the review gate then
+needs a review of the new head, and on a gate-fix PR past its rounds that
+request needs the owner's approval. `gh run rerun` does not help: a re-run tests
+the same merge commit.
+
 ### 2. Branch on the verdict
 
 **Read every gate's line, and read it by GATE NAME plus pass/block — never by
