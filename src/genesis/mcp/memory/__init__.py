@@ -160,9 +160,10 @@ def _require_init() -> None:
         raise RuntimeError("memory-mcp not initialized — call init() first")
 
     if _process_pending_bookmarks and _PLAN_BOOKMARK_PENDING.exists():
-        from genesis.util.tasks import tracked_task
+        from genesis.db.request_database import spawn_database_task
 
-        tracked_task(
+        spawn_database_task(
+            _db,
             _process_plan_bookmark_pending(_bookmark_mgr, _resolve_session_id),
             name="plan-bookmark-pending",
         )

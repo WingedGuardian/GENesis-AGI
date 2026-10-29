@@ -174,9 +174,9 @@ def _schedule_trace_write(db: Any, trace: dict[str, Any] | None, session_id: str
 
     coro = write_trace(db, trace, session_id=session_id)
     try:
-        from genesis.util.tasks import tracked_task
+        from genesis.db.request_database import spawn_database_task
 
-        tracked_task(coro, name="proactive_recall_trace")
+        spawn_database_task(db, coro, name="proactive_recall_trace")
     except Exception:
         coro.close()
         logger.debug("recall trace scheduling failed", exc_info=True)
@@ -439,12 +439,9 @@ async def _rebuild_procedure_cache(db: Any) -> _ProcedureCache | None:
     return built
 
 
-async def _background_procedure_refresh(db: Any) -> None:
+def _procedure_refresh_finished(_task=None) -> None:
     global _procedure_refresh_in_flight
-    try:
-        await _rebuild_procedure_cache(db)
-    finally:
-        _procedure_refresh_in_flight = False
+    _procedure_refresh_in_flight = False
 
 
 async def _load_procedure_cache(db: Any) -> _ProcedureCache | None:
@@ -462,8 +459,8 @@ async def _load_procedure_cache(db: Any) -> _ProcedureCache | None:
     quarantined since the snapshot is never advised. On a DB/read error the last
     good cache is kept (returns None only when one was never built). The cache
     is process-global and NOT keyed on ``db`` — correct because the runtime
-    passes exactly one process-global connection (``memory_mod._db``) for its
-    whole lifetime.
+    passes one database (``memory_mod._db``) for its whole lifetime, either a
+    legacy connection or a stable request-owned facade for that same database.
     """
     global _procedure_refresh_in_flight
     cache = _procedure_cache
@@ -473,11 +470,12 @@ async def _load_procedure_cache(db: Any) -> _ProcedureCache | None:
         time.monotonic() - cache.built_at
     ) >= _PROCEDURE_CACHE_TTL_S and not _procedure_refresh_in_flight:
         _procedure_refresh_in_flight = True
-        from genesis.util.tasks import tracked_task
+        from genesis.db.request_database import spawn_database_task
 
-        refresh = _background_procedure_refresh(db)
+        refresh = _rebuild_procedure_cache(db)
         try:
-            tracked_task(refresh, name="procedure_cache_refresh")
+            task = spawn_database_task(db, refresh, name="procedure_cache_refresh")
+            task.add_done_callback(_procedure_refresh_finished)
         except Exception:
             refresh.close()  # never scheduled — don't leak an un-awaited coroutine
             _procedure_refresh_in_flight = False
@@ -935,9 +933,9 @@ async def proactive_context(
                     except Exception:
                         logger.debug("surfaced_count bump failed", exc_info=True)
 
-                from genesis.util.tasks import tracked_task
+                from genesis.db.request_database import spawn_database_task
 
-                tracked_task(_bump_surfaced(), name="proactive_surfaced_count")
+                spawn_database_task(db, _bump_surfaced(), name="proactive_surfaced_count")
 
         timings["procedure"] = round((time.monotonic() - t_proc) * 1000, 1)
     except asyncio.CancelledError:

@@ -31,6 +31,12 @@ WAL cursor release and process-death recovery. Four explicit outcome comparisons
 keep the actual legacy middleware as the negative control. Shared MCP service E2E
 qualification is separate from this primitive coverage.
 
+`tests/test_db/test_request_database_tasks.py` exercises detached ownership,
+parent rollback, caller ContextVars, cancellation before start and during work,
+shutdown admission, and real activity/heartbeat persistence on scratch SQLite.
+It also checks deferred-recall and procedure-refresh bookkeeping when a job
+never enters its body. Providers and vector services are not called.
+
 Genesis v3 has **~21,000 test functions** across **~1,345 files** (counted
 2026-09-06 by `grep -rEh "^\s*(async )?def test_" tests/ --include=*.py | wc -l`;
 parametrized cases make the collected item count higher still). The suite runs

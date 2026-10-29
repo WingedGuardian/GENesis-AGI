@@ -24,6 +24,7 @@ from genesis.db.crud._fts import (
     fts5_query_tokens,
     fts5_term,
 )
+from genesis.db.request_database import spawn_database_task
 from genesis.memory.activation import compute_activation
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
 from genesis.memory.intent import (
@@ -38,7 +39,6 @@ from genesis.memory.types import RetrievalResult
 from genesis.observability.call_site_recorder import record_last_run
 from genesis.observability.provider_activity import track_operation
 from genesis.qdrant import collections as qdrant_ops
-from genesis.util.tasks import tracked_task
 
 if TYPE_CHECKING:
     from genesis.routing.circuit_breaker import CircuitBreaker
@@ -62,7 +62,7 @@ def _deferred_side_effects_inflight() -> int:
     return _deferred_side_effects_count
 
 
-def _schedule_deferred_side_effects(coro: Coroutine[Any, Any, None], *, name: str) -> None:
+def _schedule_deferred_side_effects(coro: Coroutine[Any, Any, None], *, name: str, db=None) -> None:
     """Reserve a backstop slot SYNCHRONOUSLY, then schedule ``coro`` as a
     tracked task that releases the slot when it finishes.
 
@@ -71,8 +71,8 @@ def _schedule_deferred_side_effects(coro: Coroutine[Any, Any, None], *, name: st
     tick each increment the counter before yielding, so the (N+1)th correctly
     sees the cap and runs inline instead of queueing an unbounded pile of
     scheduled-but-not-yet-started tasks (Codex P2). A shutdown cancellation
-    before the task starts would skip the release, but that only leaks an
-    in-memory counter on a process that is already exiting — immaterial.
+    before the task starts must release the reservation too; a task completion
+    callback covers that state as well as normal and failed completion.
     """
     global _deferred_side_effects_count  # noqa: PLW0603
     _deferred_side_effects_count += 1
@@ -83,14 +83,17 @@ def _schedule_deferred_side_effects(coro: Coroutine[Any, Any, None], *, name: st
             _DEFERRED_SIDE_EFFECT_CAP,
         )
 
-    async def _runner() -> None:
+    def release(_task=None) -> None:
         global _deferred_side_effects_count  # noqa: PLW0603
-        try:
-            await coro
-        finally:
-            _deferred_side_effects_count -= 1
+        _deferred_side_effects_count -= 1
 
-    tracked_task(_runner(), name=name)
+    try:
+        task = spawn_database_task(db, coro, name=name)
+    except BaseException:
+        coro.close()
+        release()
+        raise
+    task.add_done_callback(release)
 
 
 def _has_temporal_markers(query: str) -> bool:
@@ -987,7 +990,7 @@ class HybridRetriever:
                 and event_id_sink is None
                 and _deferred_side_effects_inflight() < _DEFERRED_SIDE_EFFECT_CAP
             ):
-                _schedule_deferred_side_effects(_zero_hit_shadow, name="recall_zero_hit_shadow")
+                _schedule_deferred_side_effects(_zero_hit_shadow, name="recall_zero_hit_shadow", db=self._db)
             else:
                 await _zero_hit_shadow
             if trace is not None:
@@ -1283,7 +1286,7 @@ class HybridRetriever:
             and event_id_sink is None
             and _deferred_side_effects_inflight() < _DEFERRED_SIDE_EFFECT_CAP
         ):
-            _schedule_deferred_side_effects(_run_side_effects(), name="recall_side_effects")
+            _schedule_deferred_side_effects(_run_side_effects(), name="recall_side_effects", db=self._db)
         else:
             await _run_side_effects()
 
@@ -1310,7 +1313,8 @@ class HybridRetriever:
             # queues behind the whole server's writes under load — is pure
             # latency waste. Nothing reads call_site_last_run synchronously
             # during recall, so a fire-and-forget task is correct here.
-            tracked_task(
+            spawn_database_task(
+                self._db,
                 record_last_run(
                     self._db,
                     "21b_query_embedding",
