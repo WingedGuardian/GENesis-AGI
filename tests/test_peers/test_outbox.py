@@ -355,14 +355,16 @@ async def test_deferred_retry_preserves_typed_identity_and_rechecks_governance(b
         "synthetic", "agent", "Other delayed question", other.request(), "synthetic failure"
     )
     items = await deferred_work.query_pending(bridge.db, work_type="outreach_delivery", limit=10)
-    p.reload_config(replace(p._config, max_daily=0))
+    # Peer messages have their own governance: the per-peer cap (alpha already has one
+    # delivered message) holds the retry, not the owner's max_daily budget.
+    p.reload_config(replace(p._config, max_daily=0, agent_daily_per_peer=1))
     await worker._retry(items[0])
     assert len((await box.poll(bridge.identities["alpha"]))[0]) == 1
     remaining = await deferred_work.query_pending(
         bridge.db, work_type="outreach_delivery", limit=10
     )
     assert len(remaining) == 1 and remaining[0]["id"] == items[0]["id"]
-    p.reload_config(replace(p._config, max_daily=999))
+    p.reload_config(replace(p._config, max_daily=0, agent_daily_per_peer=999))
     await worker._retry(remaining[0])
     assert len((await box.poll(bridge.identities["alpha"]))[0]) == 2
 
@@ -564,6 +566,38 @@ async def test_generic_agent_channel_refused_without_queueing(bridge, monkeypatc
     assert (await (await bridge.db.execute("SELECT count(*) FROM deferred_work_queue")).fetchone())[
         0
     ] == 0
+
+
+async def test_a_peer_message_over_the_daily_cap_stays_queued_for_a_later_drain(
+    bridge, monkeypatch
+):
+    """The per-peer cap is a hold, not a drop: the refused row stays open in the queue
+    and goes out on a later drain once the cap allows it."""
+    from genesis.mcp import outreach_mcp
+
+    p = pipeline(bridge)
+    p.reload_config(replace(p._config, max_daily=0, agent_daily_per_peer=1))
+    monkeypatch.setattr(outreach_mcp, "_db", bridge.db)
+    monkeypatch.setattr(outreach_mcp, "_pipeline", None)
+    first = json.loads(await outreach_mcp.agent_send.fn("alpha", "First question"))
+    second = json.loads(await outreach_mcp.agent_send.fn("alpha", "Second question"))
+    scheduler = OutreachScheduler(p, AsyncMock(), AsyncMock(), p._config, bridge.db)
+    scheduler._record_job_result = AsyncMock()
+    await scheduler._drain_pending_job()
+    assert len((await Outbox(bridge.registry).poll(bridge.identities["alpha"]))[0]) == 1
+    rows = dict(
+        await (
+            await bridge.db.execute(
+                "SELECT id, delivered_at FROM pending_outreach WHERE id IN (?, ?)",
+                (first["pending_id"], second["pending_id"]),
+            )
+        ).fetchall()
+    )
+    assert sum(v is None for v in rows.values()) == 1  # one held by the cap, still queued
+    p.reload_config(replace(p._config, max_daily=0, agent_daily_per_peer=50))
+    scheduler._config = p._config
+    await scheduler._drain_pending_job()
+    assert len((await Outbox(bridge.registry).poll(bridge.identities["alpha"]))[0]) == 2
 
 
 async def test_dedup_after_retained_delivery_closes_pending_row(bridge, monkeypatch):

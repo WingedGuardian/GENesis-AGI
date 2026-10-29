@@ -1533,7 +1533,7 @@ Every surface a human (or host process) talks to Genesis through.
 
 ```yaml subsystem-map
 entry: channels-interfaces
-modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
+modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
 verified: 74c474c0f 2026-10-24
 ```
 
@@ -1864,6 +1864,24 @@ the shared banner is not an assertion about all concurrent sessions.
   restricted `mail`-profile sessions. Sending is NOT here — all sends go
   through the outreach gate (entry 3). Trap: never default a recipient to the
   agent's own address (self-send loop).
+- **live_agent/**: one persistent Claude Code session driven from a program
+  through `claude-agent-sdk` (`LiveAgent`): start-or-steer turns, explicit
+  interrupt, `can_use_tool` permission asks surfaced as approvals that default
+  to deny, and a bounded progress stream (`ProgressSummarizer`, lines ≤500
+  bytes) for a voice front end. It runs the install's pinned `claude`, with
+  Claude Code's own system prompt and every settings source, so it loads hooks,
+  skills and MCP servers like a terminal and registers as an owner foreground
+  session. Phase 0 host: `scripts/live_agent_cli.py`; only the `owner_cli`
+  initiator may call `turn()` until model-initiated turns pass the
+  autonomous-CLI approval gate. Turns the session injects itself
+  (background-task notifications, peer or scheduled messages) still run, as in
+  any terminal session, and each approval line shows the tool input it would
+  run. Traps (measured once each on CLI 2.1.299, 2026-10-22): a
+  `priority: "now"` steer waits for the running tool
+  to finish, then ABORTS the turn (its own result) and runs as the next turn,
+  while `interrupt()` kills the running tool; and a host started inside
+  another Claude Code session must drop that session's identity variables
+  (`PARENT_SESSION_VARS` in the CLI), which the SDK cannot remove.
 - GROUNDWORK: unified-bridge, outreach-pipeline (channels/base.py),
   guardian-dialogue (dashboard health route).
 
@@ -2538,9 +2556,9 @@ verified: 477efb7f7 2026-10-05
   most do, because the docs-path exemption discharges rows a validator never
   looked at. `status` means "obligation discharged"; only `verdict` says a
   validator concluded anything. The verdict vocabulary and column names live with
-  the code (`crud/pr_verifications.py`) rather than here, since a four-value set
-  invented before the tool had run once is the kind of detail this map should not
-  be the second copy of. `doc_paths.is_doc_path`
+  the code (`crud/pr_verifications.py`) rather than here, since a five-value set
+  (`not-yet-done` was the fifth, added after the tool had run) is the kind of
+  detail this map should not be the second copy of. `doc_paths.is_doc_path`
   is a pinned duplicate of the merge gate's `_is_doc_path` (`src/` must not
   import `scripts/`), held in parity by
   `tests/test_session_awareness/test_doc_paths.py`.
@@ -2709,7 +2727,8 @@ verified: 477efb7f7 2026-10-05
   two import-free hooks inline under a parity test) — this sweep is the WRITER
   its GROUNDWORK note named. Levers: settings domain `ledger_escalation` + env
   `GENESIS_LEDGER_ESCALATION_DISABLED`; `escalate_added_by` is a provenance
-  allow-list, foreground-only by default so the ambient extractor's PROPOSALS
+  allow-list, `foreground` + `relayed` (the owner's request written by a
+  dispatched session) by default, so the ambient extractor's PROPOSALS
   cannot ask the owner to dispose of something nobody committed to.
   **Trap: it must never write `session_ledger`** — an evidence write would bump
   `updated_at` and read as a disposition the owner never made, i.e. the sweep
@@ -3660,7 +3679,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py]
-verified: 8a62059720cd 2026-10-22
+verified: 9c2209df8 2026-10-29
 ```
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
@@ -3903,6 +3922,14 @@ tool-disabled CC probe without changing its schedule or routing authority.
   before draining); `DeferredWorkQueue` priorities + staleness policies;
   dead-letter replay. The `dream_synthesis_slice` worklist is deliberately
   excluded from the backlog alarm (drift-guard test pins it).
+  `StatusFileWriter` gathers runtime/DB data on-loop, then publishes immutable
+  JSON through one ordered executor job. Cancellation cannot release publication
+  admission before the actual file worker finishes. Runtime shutdown cancels the
+  minute writer loop and drains its publication before DB teardown, including
+  partial bootstrap. The status timestamp describes the collected snapshot, not
+  delayed publication; this keeps watchdog freshness checks truthful. This
+  protects event-loop responsiveness during slow status-file I/O; it does not
+  establish recovery of an independent SSH transport or shared storage.
   `NetworkSentinel` (`network_sentinel.py`) probes the open internet (DNS+TCP to
   public anchors) on a cadence and publishes a 3-state `network` axis
   (NORMAL/DEGRADED/OFFLINE) with asymmetric hysteresis — it OWNS its hysteresis
@@ -4329,8 +4356,9 @@ tool-disabled CC probe without changing its schedule or routing authority.
   `scripts/deploy_candidates repair-move [--wait N] [--dismiss TS] [--explain]`
   runs the copy bootstrap installs under `~/.genesis/lib/live-repair/current`,
   never the checkout's; installing that kit, and running the repair at every
-  server start, is PR D2, not yet built; `--explain` needs no kit, using the
-  checkout's copy read-only when none is installed) heals a live row's `mixed_tree`
+  server start, is PR D2, not yet built; `--explain` needs no kit: with none
+  installed it runs the module as HEAD committed it, from memory, never the
+  working tree's copy, which may itself be half-written) heals a live row's `mixed_tree`
   with HEAD at the rollback tag, toward the tag, never toward the target (HEAD
   at the target, a rollback killed partway, is refused with exit 1 and nothing
   changed: finishing that rollback is a later PR, D1f): under update.lock and
@@ -4342,8 +4370,9 @@ tool-disabled CC probe without changing its schedule or routing authority.
   30 s old, so a non-git process that cannot be inspected and holds a lock
   longer than that has it judged stale), every path of the two-dot diff, plus
   a symlink or non-directory parent of one (nothing is read or removed through
-  such a parent), plus every index entry under one of those (restoring a path
-  drops them; a directory holding a foreign one is foreign too), that is not
+  such a parent), plus every index entry under one of those and every index
+  entry above one (a file entry `sub` where the tag has `sub/`; restoring a
+  path drops them; a directory holding a foreign one is foreign too), that is not
   at the tag's bytes is COPIED to
   `~/.genesis/deploy-backups/<ts>-live-move-repair/` (with `REPAIR.json`,
   fsynced, and the new directory's entries in `deploy-backups` and the
@@ -4362,7 +4391,10 @@ tool-disabled CC probe without changing its schedule or routing authority.
   before one atomic NUL-delimited `update-index -z --index-info` call; both
   flags of an `s` entry are restored; a FIFO is made again (`mkfifo -m`);
   a socket or device holds nothing to save and is recorded by type and mode
-  and reported as removed. A failure before the checkout itself changes (a
+  and reported as removed. Steps run parents first; a row re-adding an index
+  entry first drops the entries the restore put below it; a row the repair
+  saw beyond a symlinked or non-directory parent (`unreachable_through`) gets
+  only its index state back, so no step acts through a link it restores. A failure before the checkout itself changes (a
   failed backup included) exits 0 at `--boot`. The guard then judges
   again and only its SAFE removes the state (byte-identical re-read); `guards`
   or `holds` (an edit off the move's paths) keeps it, its result naming the
@@ -4503,6 +4535,12 @@ verified: c56a621b5 2026-10-24
   creating a charter, or joining Genesis foreground/background lifecycle
   management. Recall remains read-oriented rather than side-effect-free: its
   normal retrieval-use metadata may still be updated.
+  `file_tracker_issue.py --comment-on` adds privacy-scanned issue/PR timeline
+  comments through the existing tracker/snapshot pipeline. It submits once and
+  reconciles uncertain outcomes by exact-body reads, never an automatic retry.
+  `.agents/skills/validating-merges` links to the canonical skill with explicit
+  Codex MCP mapping, no lifecycle enrollment and no deploy/fix/push/merge rules.
+  Discovery alone does not qualify or activate the dedicated validator.
   The same project configuration exposes 15 explicitly named GitNexus tools
   through `.claude/mcp/run-gitnexus`, reusing the existing installed-version and
   Node pin checks. It adds no Genesis writers or lifecycle integration. GitNexus

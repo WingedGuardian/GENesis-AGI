@@ -404,6 +404,7 @@ async def test_send_standalone_email_resolves_and_enqueues_thread_recipient():
                 category="notification",
                 channel="email",
                 thread_id="t1",
+                subject="Re: Genesis demo",
             )
         assert json.loads(result)["status"] == "queued"
         kwargs = enq.call_args.kwargs
@@ -432,6 +433,7 @@ async def test_send_standalone_email_without_thread_enqueues_no_recipient():
                 message="orphan",
                 category="notification",
                 channel="email",
+                subject="A short note",
             )
         kwargs = enq.call_args.kwargs
         assert kwargs["thread_id"] is None
@@ -539,6 +541,7 @@ async def test_generic_outreach_send_forwards_labeled_surplus(tmp_path):
                 category="content",
                 channel="email",
                 labeled_surplus=True,
+                subject="Genesis update",
             )
         )
         assert out["status"] == "queued"
@@ -878,3 +881,63 @@ class TestPollRefusesUnconfiguredChannel:
         assert "error" in out, f"the reserved name must be refused, got {out}"
         client.post.assert_not_called()
 
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subject", [None, "", "   "])
+async def test_an_email_without_a_subject_from_its_author_is_refused(subject):
+    """Whoever writes the email writes its subject; a send without one is refused
+    before anything is queued or delivered."""
+    from unittest.mock import AsyncMock
+
+    import genesis.mcp.outreach_mcp as mcp_mod
+
+    old = (mcp_mod._pipeline, mcp_mod._db)
+    pipeline = AsyncMock()
+    mcp_mod._pipeline = pipeline
+    mcp_mod._db = None
+    try:
+        out = json.loads(await mcp_mod.outreach_send.fn(
+            message="Hello there", category="notification", channel="email", subject=subject,
+        ))
+    finally:
+        mcp_mod._pipeline, mcp_mod._db = old
+    assert out["status"] == "refused" and out["code"] == "email_subject_required"
+    pipeline.submit.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("thread_subject", "given", "sent"),
+    [
+        ("Genesis demo", None, "Re: Genesis demo"),
+        ("Genesis demo", "A fresh title", "Re: Genesis demo"),  # never splits the thread
+        ("Re: Genesis demo", None, "Re: Genesis demo"),  # no Re: Re:
+        ("​RE: Genesis demo", None, "RE: Genesis demo"),  # hidden prefix
+    ],
+)
+async def test_a_reply_keeps_its_threads_subject(thread_subject, given, sent):
+    old_pipeline, old_db = mcp_mod._pipeline, mcp_mod._db
+    enq = AsyncMock(return_value="pending-xyz")
+    try:
+        mcp_mod._pipeline = None
+        mcp_mod._db = AsyncMock()
+        with (
+            patch("genesis.db.crud.pending_outreach.ensure_table", new_callable=AsyncMock),
+            patch("genesis.db.crud.pending_outreach.enqueue", enq),
+            patch(
+                "genesis.db.crud.email_threads.get_thread",
+                new_callable=AsyncMock,
+                return_value={"recipient": "real@prospect.com", "subject": thread_subject},
+            ),
+        ):
+            tools = await mcp.get_tools()
+            result = await tools["outreach_send"].fn(
+                message="following up", category="notification", channel="email",
+                thread_id="t1", subject=given,
+            )
+        assert json.loads(result)["status"] == "queued"
+        assert enq.call_args.kwargs["email_subject"] == sent
+    finally:
+        mcp_mod._pipeline = old_pipeline
+        mcp_mod._db = old_db

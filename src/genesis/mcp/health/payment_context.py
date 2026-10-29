@@ -92,7 +92,9 @@ _NONCE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # 3DS challenge pages, by host or path. Inferred, not measured: an unknown
 # challenge still ends as "challenge" when the page does not move on in time.
 _CHALLENGE_HOSTS = ("cardinalcommerce.com", "3dsecure.io", "hooks.stripe.com")
-_CHALLENGE_PATH = re.compile(r"3d[-_]?secure|three[-_]?ds|/3ds|/acs\b", re.IGNORECASE)
+_CHALLENGE_PATH = re.compile(
+    r"3d[-_]?secure|three[-_]?d[-_]?secure|three[-_]?ds|/3ds|/acs\b", re.IGNORECASE
+)
 
 # The mask (from the payment-tab guard design): the root element of every
 # document is made fully transparent, so its whole subtree (shadow trees,
@@ -268,6 +270,8 @@ _SESSION_JS = (
     " const k = sessionStorage.key(i); o[k] = sessionStorage.getItem(k); } return o; }"
 )
 _SAME_JS = "(a, b) => a === b"
+_CONNECTED_JS = "(e) => e.isConnected"
+_FOCUSED_JS = "(e) => e.ownerDocument.activeElement === e"
 # Whether clicking ``e`` ticks a box: a checkbox itself, a label whose control is
 # one, or inside a role=checkbox / role=switch element.
 _CHECKBOX_JS = r"""(e) => {
@@ -746,13 +750,32 @@ async def abort(reason: str) -> None:
 
 async def fill_card(args: cf.CardArgs, main_ctx, main_page, hooks: Hooks, report) -> dict:
     """The whole flow; returns a fixed result. ``main_ctx`` and ``main_page``
-    are the Camoufox context and active page, read once by the caller."""
+    are the Camoufox context and active page, read once by the caller. Each
+    result's code is logged once: a one-shot run is read from that line."""
+    held: list = []  # this call's flow: the teardown clears _flow before the line
+    out = await _fill_card(args, main_ctx, main_page, hooks, report, held)
+    flow = held[0] if held else None
+    logger.warning(
+        "payment fill result %s (claimed=%s saved=%s paid=%s typed=%d)",
+        out.get("code"),
+        bool(flow and flow.claimed),
+        bool(flow and flow.saved),
+        bool(flow and flow.paid),
+        len(flow.typed) if flow else 0,
+    )
+    return out
+
+
+async def _fill_card(
+    args: cf.CardArgs, main_ctx, main_page, hooks: Hooks, report, held: list
+) -> dict:
     global _flow
     if in_flight():
         return cf.result("payment_in_flight")
     if _x_input:
         return cf.result("turnstile_in_progress")
     flow = _flow = _Flow(task=asyncio.current_task(), hooks=hooks, report=report)
+    held.append(flow)
     try:
         try:
             return await _run(flow, args, main_ctx, main_page, hooks, report)
@@ -1277,10 +1300,14 @@ async def _tick(consents: list[tuple], filled: list[str]) -> None:
     A label is checked again too: the card fill can change the page under it, so
     it must still be the box's label, and its point is read afresh."""
     for handle, label, (target, position) in consents:
-        info = await _step(handle.evaluate(CONSENT_JS))
-        if not isinstance(info, dict) or info.get("box") is not True or info.get("label") != label:
-            raise _Stop("consent_failed", filled=filled)
         try:
+            info = await _step(handle.evaluate(CONSENT_JS))
+            if (
+                not isinstance(info, dict)
+                or info.get("box") is not True
+                or info.get("label") != label
+            ):
+                raise _Stop("consent_failed", filled=filled)
             if position is None:
                 await _step(target.check(timeout=CLICK_MS))
             else:
@@ -1301,7 +1328,11 @@ async def _tick(consents: list[tuple], filled: list[str]) -> None:
 async def _ticked(consents: list[tuple], filled: list[str]) -> None:
     """Every consent box is ticked and still has the label the tap showed."""
     for handle, label, _click in consents:
-        info = await _step(handle.evaluate(CONSENT_JS))
+        try:
+            info = await _step(handle.evaluate(CONSENT_JS))
+        except Exception as e:  # noqa: BLE001 - never the exception's text
+            logger.warning("payment consent read failed (%s)", type(e).__name__)
+            raise _Stop("consent_failed", filled=filled) from None
         if (
             not isinstance(info, dict)
             or info.get("checked") is not True
@@ -1382,21 +1413,99 @@ async def _extras(
                 raise _Stop("extra_field_not_found")
         seen.append((frame, handle))
         if fill:
+            state = "ok"
             try:
                 if tag == "select":
                     await _select(handle, value)
+                    # A page can revert any selection a script makes (measured on
+                    # a hosted checkout: only a trusted, typed choice held).
+                    if not await _shows_option(handle, value):
+                        others = [f.handle for f in fields.values()]
+                        others += [h for _f, h in seen if h is not handle]
+                        state = await _select_by_keys(ppage, handle, value, others)
                 else:
                     await _step(handle.fill(value, timeout=10000))
-            except Exception:  # noqa: BLE001
-                raise _Stop("extra_field_failed") from None
-    for (_frame, handle), (_name, (_spec, value)) in zip(seen, chosen, strict=True):
-        if not check_values:  # located only (values typed later, after the tap)
-            break
+            except Exception as e:  # noqa: BLE001 - never the exception's text
+                logger.warning("payment extra field %s did not fill (%s)", name, type(e).__name__)
+                raise _Stop(f"extra_field_failed:{name}:fill") from None
+            if state != "ok":
+                logger.warning("payment extra field %s: typed choice failed (%s)", name, state)
+                raise _Stop(f"extra_field_failed:{name}:{state}")
+    if not check_values:  # located only (values typed later, after the tap)
+        return
+    reads = [
+        (name, value, await _extra_reads(frame, sel, handle, value))
+        for (frame, handle), (name, ((_frames, sel), value)) in zip(seen, chosen, strict=True)
+    ]
+    for name, value, (state, lens) in reads:
+        if state != "ok":
+            # Lengths and booleans only: the values are the owner's (an address,
+            # an email). The other fields' state tells a reset (several) from a
+            # rewrite (one).
+            logger.warning(
+                "payment extra field %s %s (typed %d chars; reads %s); others hold: %s",
+                name,
+                {"gone": "is no longer on the page", "unreadable": "could not be read"}.get(
+                    state, "did not hold its value"
+                ),
+                len(value),
+                lens,
+                {n: r[0] == "ok" for n, _v, r in reads if n != name},
+            )
+            raise _Stop(f"extra_field_failed:{name}:{state}")
+
+
+async def _shows_option(handle, value: str) -> bool:
+    """A select now shows ``value`` as its value or its selected option's label."""
+    got = await _step(handle.evaluate(EXTRA_VALUE_JS))
+    want = value.strip().casefold()
+    return isinstance(got, list) and any(
+        isinstance(g, str) and g.strip().casefold() == want for g in got
+    )
+
+
+async def _select_by_keys(ppage, handle, value: str, others: list) -> str:
+    """Choose an extra field's option the way a person does: focus the select,
+    and before each key check it IS the focused element of its document; type
+    the option's text and Tab away. "ok" when it then shows exactly that option
+    (a longer label the typeahead could land on reads differently) and no other
+    field (``others``: the card fields and the extras already filled) changed,
+    which is what shows the keys went nowhere else; else "select" or "keys".
+    For extra fields only, whose values are billing text: it runs before the
+    claim, when no card value exists in the window."""
+    before = [await _step(h.evaluate(EXTRA_VALUE_JS)) for h in others]
+    await _step(handle.focus())  # ElementHandle.focus takes no timeout; _step bounds it
+    for ch in value:
+        if not await _step(handle.evaluate(_FOCUSED_JS)):
+            return "select"
+        await _step(ppage.keyboard.type(ch))
+    await _step(ppage.keyboard.press("Tab"))
+    after = [await _step(h.evaluate(EXTRA_VALUE_JS)) for h in others]
+    if after != before:
+        return "keys"
+    return "ok" if await _shows_option(handle, value) else "select"
+
+
+async def _extra_reads(frame, sel: str, handle, value: str) -> tuple[str, list[int]]:
+    """An extra field read back: "ok", "held" (it shows something else), "gone"
+    (no longer on the page) or "unreadable"; with the read-back's lengths. A
+    field a re-render replaced is found again by its selector and the new
+    element is read: the old one would still show the typed value."""
+    try:
+        if not await _step(handle.evaluate(_CONNECTED_JS)):
+            loc = frame.locator(sel)
+            if await _step(loc.count()) != 1:
+                return "gone", []
+            handle = await _step(loc.element_handle(timeout=5000))
+            if not await _owned_by(handle, frame):
+                return "gone", []
         got = await _step(handle.evaluate(EXTRA_VALUE_JS))
-        if not isinstance(got, list) or value.strip().casefold() not in {
-            g.strip().casefold() for g in got if isinstance(g, str)
-        }:
-            raise _Stop("extra_field_failed")
+    except Exception as e:  # noqa: BLE001 - never the exception's text
+        logger.warning("payment extra field read failed (%s)", type(e).__name__)
+        return "unreadable", []
+    reads = [g for g in got if isinstance(g, str)] if isinstance(got, list) else []
+    ok = value.strip().casefold() in {g.strip().casefold() for g in reads}
+    return ("ok" if ok else "held"), [len(g) for g in reads]
 
 
 async def _title(ppage) -> str:
@@ -1405,40 +1514,50 @@ async def _title(ppage) -> str:
     return (title if isinstance(title, str) else "")[:_TITLE_CHARS]
 
 
-async def _same_page(
+async def _page_change(
     ppage, args, top, seen, label, title, fields, pay, hooks, clicking=False, extras=None
-) -> bool:
-    """Everything the tap showed still holds: the top and frame origins, the
-    page title, Pay (the same label, a button, no GET submit), the mask, the
-    amount, and every extra field's value. Run after the tap, after the claim,
-    and before Pay."""
+) -> str | None:
+    """None when everything the tap showed still holds: the top and frame
+    origins, the page title, Pay (the same label, a button, no GET submit), the
+    mask, the amount, and every extra field's value. Else which check failed (a
+    code suffix). Run after the tap, after the claim, and before Pay."""
     if _moved(ppage, top, fields, pay, seen):
-        return False
+        return "moved"
     if await _title(ppage) != title:  # a same-origin SPA can swap the order under one URL
-        return False
+        return "title"
     if await hooks.interstitial(ppage):  # a bot check over the form takes the input
-        return False
-    if not _pay_ok(await _step(pay.handle.evaluate(PAY_JS)), label, clicking):
-        return False
-    if not await _mask_ok(ppage) or not await _amount_ok(ppage, args.amount):
-        return False
+        return "interstitial"
+    if why := _pay_why(await _step(pay.handle.evaluate(PAY_JS)), label, clicking):
+        return why
+    if not await _mask_ok(ppage):
+        return "mask"
+    if not await _amount_ok(ppage, args.amount):
+        return "amount"
     try:
         await _extras(ppage, args, fields, fill=False, names=extras)
-    except _Stop:
-        return False
-    return True
+    except _Stop as s:
+        return f"extras:{s.code}"
+    return None
+
+
+def _pay_why(info, label: str, clicking: bool) -> str | None:
+    """None when Pay is still the approved control: a button, not a GET submit,
+    the label the tap showed; and, to click it, connected and enabled. Else
+    which of those it fails."""
+    if not isinstance(info, dict) or info.get("button") is not True:
+        return "pay_button"
+    if info.get("get") is not False:
+        return "pay_get"
+    if info.get("label") != label:
+        return "pay_label"
+    if clicking and info.get("live") is not True:
+        return "pay_live"
+    return None
 
 
 def _pay_ok(info, label: str, clicking: bool) -> bool:
-    """Pay is still the approved control: a button, not a GET submit, the label
-    the tap showed; and, to click it, connected and enabled."""
-    return (
-        isinstance(info, dict)
-        and info.get("button") is True
-        and info.get("get") is False
-        and info.get("label") == label
-        and (not clicking or info.get("live") is True)
-    )
+    """Pay is still the approved control (``_pay_why``)."""
+    return _pay_why(info, label, clicking) is None
 
 
 async def _holds(f: _Field, kind: str, value: str) -> bool:
@@ -1521,6 +1640,25 @@ async def _await_grant(flow: _Flow, ppage, hooks: Hooks, report, main_page=None)
                 f"({max(0, round(backstop - loop.time()))} s left)"
             )
         await asyncio.sleep(POLL_S)
+
+
+def _frame_kind(url, top: str, card_origins: frozenset[str]) -> str:
+    """A new frame for a log line, by what it is and never by any name a page
+    chose (a host can be made to carry a card value): a card frame's origin, the
+    checkout's own site, a known challenge, ``about:``/``data:`` by scheme, or
+    "other"."""
+    origin = cf.origin_of(url)
+    if origin is None:
+        scheme = urlsplit(url).scheme if isinstance(url, str) else ""
+        return f"{scheme}:" if scheme in ("about", "data", "blob", "javascript") else "opaque"
+    if origin in card_origins:
+        return "card_frame"
+    if _is_challenge(url):
+        return "challenge"
+    host, top_host = urlsplit(url).hostname, urlsplit(top).hostname
+    if host and top_host and registrable_domain(host) == registrable_domain(top_host):
+        return "checkout_site"
+    return "other"
 
 
 def _is_challenge(url) -> bool:
@@ -1658,11 +1796,22 @@ async def _read_total(ppage, args: cf.CardArgs, pay: _Field, card_frames=frozens
 async def _save_stage(flow, ppage, args, save, top, title, label, pay, hooks, fields, consents):
     """``_save_stage_inner``, with a card value seen in a URL outranking whatever
     it found (the exposure is never hidden behind a total code)."""
+    before = {f.url for f in list(ppage.frames)}
     code = await _save_stage_inner(
         flow, ppage, args, save, top, title, label, pay, hooks, fields, consents
     )
     if flow.url_blocked or flow.url_leaked:
-        return _typing_outcome(flow)
+        code = _typing_outcome(flow)
+    with contextlib.suppress(Exception):  # a log line, never a reason to stop
+        cards = frozenset(f.origin for f in fields.values())
+        new = Counter(
+            _frame_kind(f.url, top, cards) for f in list(ppage.frames) if f.url not in before
+        )
+        logger.warning(
+            "payment save stage ended %s; new frames: %s",
+            code or "ok",
+            dict(sorted(new.items())) or "none",
+        )
     return code
 
 
@@ -1684,7 +1833,7 @@ async def _save_stage_inner(
     try:  # each consent's frame, while its handle can still name it
         consent_frames = [await _step(h.owner_frame()) for h, _lab, _c in consents]
     except Exception:  # noqa: BLE001 - nothing clicked yet
-        return "failed_before_pay"
+        return "failed_before_pay:consent_frame"
     boxes = await _boxes(ppage)  # a box the save ticks was never approved
     flow.saved = True
     try:
@@ -1706,7 +1855,7 @@ async def _save_stage_inner(
         ):
             return "save_challenge"
         if _gone(flow, ppage, hooks) or flow.nav_requests != marks[0]:
-            return "saved_page_changed"
+            return "saved_page_changed:nav"
         read = await _read_total(ppage, args, pay, card_frames)
         if read is None or read != candidate:
             candidate, since = read, loop.time()
@@ -1728,16 +1877,16 @@ async def _save_stage_inner(
         return "total_over_ceiling"
     if total < low:
         return "total_under_subtotal"
-    if not await _saved_page_ok(
+    if why := await _saved_page_changed(
         ppage, args, top, title, label, pay, hooks, total, card_frames, fields
     ):
-        return "saved_page_changed"
+        return f"saved_page_changed:{why}"
     if await _bank_frame_shown(ppage):
         return "save_challenge"
     if not await _consents_kept(consents, consent_frames) or await _newly_ticked(boxes):
-        return "saved_page_changed"
+        return "saved_page_changed:consents"
     if (flow.nav_requests, flow.popups) != marks:  # moved on during the last re-check
-        return "saved_page_changed"
+        return "saved_page_changed:nav"
     if flow.url_blocked or flow.url_leaked:
         return _typing_outcome(flow)
     return None
@@ -1755,46 +1904,52 @@ def _label_price_ok(label, total, price_source: bool) -> bool:
     return cf.money(label) == total
 
 
-async def _saved_page_ok(
+async def _saved_page_changed(
     ppage, args, top, title, label, pay, hooks, total, card_frames, fields
-) -> bool:
-    """The page after the save still shows what the tap approved, and the total
-    the bound was checked against: Pay's price (when its label has one) and the
-    ``total`` element both read that total now."""
+) -> str | None:
+    """None when the page after the save still shows what the tap approved, and
+    the total the bound was checked against: Pay's price (when its label has one)
+    and the ``total`` element both read that total now. Else what changed, the
+    suffix of ``saved_page_changed``."""
     try:
-        if cf.origin_of(ppage.url) != top or await _title(ppage) != title:
-            return False
+        if cf.origin_of(ppage.url) != top:
+            return "origin"
+        if await _title(ppage) != title:
+            return "title"
         # A card frame the save kept is still on the origin the tap showed.
         if any(
             not f.frame.is_detached() and cf.origin_of(f.frame.url) != f.origin
             for f in fields.values()
         ):
-            return False
+            return "card_origin"
         if await hooks.interstitial(ppage):
-            return False
+            return "interstitial"
         info = await _step(pay.handle.evaluate(PAY_JS))
-        if not (
-            isinstance(info, dict)
-            and info.get("button") is True
-            and info.get("get") is False
-            and info.get("live") is True
-            and cf.label_shape(info.get("label")) == cf.label_shape(label)
-            and _label_price_ok(info.get("label"), total, args.total is None)
-        ):
-            return False
+        if not isinstance(info, dict) or info.get("button") is not True:
+            return "pay_button"
+        if info.get("get") is not False:
+            return "pay_get"
+        if info.get("live") is not True:
+            return "pay_live"
+        if cf.label_shape(info.get("label")) != cf.label_shape(label):
+            return "pay_label"
+        if not _label_price_ok(info.get("label"), total, args.total is None):
+            return "pay_price"
         if args.total is not None and await _read_total(ppage, args, pay, card_frames) != total:
-            return False
-        if not await _mask_ok(ppage) or not await _amount_ok(ppage, args.amount):
-            return False
+            return "total"
+        if not await _mask_ok(ppage):
+            return "mask"
+        if not await _amount_ok(ppage, args.amount):
+            return "amount"
         # The card frame may be gone after the save: the top document's extras only.
         top_only = {n for n, (spec, _v) in args.extra.items() if not spec[0]}
         await _extras(ppage, args, {}, fill=False, names=top_only)
     except _Stop:
-        return False
+        return "extras"
     except Exception as e:  # noqa: BLE001 - an unanswerable page is a changed one
         logger.warning("payment re-check after save failed (%s)", type(e).__name__)
-        return False
-    return True
+        return "unreadable"
+    return None
 
 
 async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks, report) -> dict:
@@ -1997,31 +2152,33 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
 
     # Granted: the page must still show what the tap was for, fields re-resolved.
     fields, pay, _label = await _resolve(ppage, args)
-    if not await _same_page(ppage, args, top, seen, label, title, fields, pay, hooks, extras=early):
-        raise _Stop("page_changed")
+    if why := await _page_change(
+        ppage, args, top, seen, label, title, fields, pay, hooks, extras=early
+    ):
+        raise _Stop(f"page_changed:granted:{why}")
     if args.late:  # the billing config's values, now the owner has approved this page
         try:
             await _extras(ppage, args, fields, fill=True, names=args.late)
-        except _Stop:
-            raise _Stop("page_changed") from None
+        except _Stop as s:
+            raise _Stop(f"page_changed:late:{s.code}") from None
         # Before the claim: an address can re-price or re-render the checkout,
         # and nothing may be claimed for a page that no longer shows what the tap did.
         fields, pay, _label = await _resolve(ppage, args)
-        if not await _same_page(ppage, args, top, seen, label, title, fields, pay, hooks):
-            raise _Stop("page_changed")
+        if why := await _page_change(ppage, args, top, seen, label, title, fields, pay, hooks):
+            raise _Stop(f"page_changed:after_late:{why}")
     try:
         consents = await _consents(ppage, args, fields)
-    except _Stop:
-        raise _Stop("page_changed") from None
+    except _Stop as s:
+        raise _Stop(f"page_changed:{s.code}") from None
     if [lab for _h, lab, _c in consents] != consent_labels:
-        raise _Stop("page_changed")
+        raise _Stop("page_changed:consent_label")
     if args.save is not None:
         try:
             save, again = await _resolve_save(ppage, args, fields)
-        except _Stop:
-            raise _Stop("page_changed") from None
+        except _Stop as s:
+            raise _Stop(f"page_changed:{s.code}") from None
         if again != save_label or save.origin != seen["save"]:
-            raise _Stop("page_changed")
+            raise _Stop("page_changed:save_label")
     if why := _gone(flow, ppage, hooks):
         raise _Stop(why)
     flow.claimed = True  # from here the vault may hand the card over: no cancel
@@ -2050,11 +2207,11 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     guard.arm(values)  # before anything is typed
 
     # Typing. Nothing is typed into a page that changed after the tap.
-    if _gone(flow, ppage, hooks) or not await _same_page(
+    if why := _gone(flow, ppage, hooks) or await _page_change(
         ppage, args, top, seen, label, title, fields, pay, hooks
     ):
         values.clear()
-        raise _Stop("claimed_not_filled")
+        raise _Stop(f"claimed_not_filled:{why}")
     # From the first keystroke: a field's input handler can submit the checkout
     # itself, and that is no "nothing paid" stop.
     flow.typing_marks = (flow.nav_requests, flow.popups)
@@ -2064,7 +2221,7 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
             if flow.url_blocked or flow.url_leaked:
                 raise _Stop(_typing_outcome(flow), filled=flow.typed)
             if cf.origin_of(f.frame.url) != origins[kind] or not await _mask_ok(ppage):
-                raise _Stop("failed_before_pay", field=kind, filled=flow.typed)
+                raise _Stop("failed_before_pay:frame", field=kind, filled=flow.typed)
             if f.tag == "select":
                 await _select(f.handle, values[kind], kind)
                 got = await _step(f.handle.evaluate(EXTRA_VALUE_JS))
@@ -2073,7 +2230,7 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
             else:
                 await _step(f.handle.fill(values[kind], timeout=10000))
             if not await _holds(f, kind, values[kind]):
-                raise _Stop("failed_before_pay", field=kind, filled=[*flow.typed, kind])
+                raise _Stop("failed_before_pay:held", field=kind, filled=[*flow.typed, kind])
             flow.typed.append(kind)
         await _tick(consents, flow.typed)  # the approved consent, ticked only now
 
@@ -2083,20 +2240,20 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
         # between this and the click: a script changing what the tap showed in
         # that window is an accepted residual (owner ruling 07a1c756), and where
         # a card value can go in a URL is the network guard's job, not the DOM's.
-        if not await _same_page(
+        if why := await _page_change(
             ppage, args, top, seen, label, title, fields, pay, hooks, clicking=save is None
         ):
-            raise _Stop("failed_before_pay", filled=flow.typed)
+            raise _Stop(f"failed_before_pay:page:{why}", filled=flow.typed)
         if save is not None and (
             cf.origin_of(save.frame.url) != seen["save"]
             or not _pay_ok(await _step(save.handle.evaluate(PAY_JS)), save_label, True)
         ):
-            raise _Stop("failed_before_pay", filled=flow.typed)
+            raise _Stop("failed_before_pay:save", filled=flow.typed)
         for kind, f in fields.items():
             if cf.origin_of(f.frame.url) != origins[kind] or not await _holds(
                 f, kind, values[kind]
             ):
-                raise _Stop("failed_before_pay", field=kind, filled=flow.typed)
+                raise _Stop("failed_before_pay:held_at_pay", field=kind, filled=flow.typed)
         await _ticked(consents, flow.typed)
         # After the last await: nothing below lets a route or page event be handled
         # before the click, so these are final for all the browser has reported.

@@ -43,6 +43,11 @@ format (`src/genesis/identity/TASK_INTAKE.md`).
      the deliverable-builder pipeline; omit for code/data/internal tasks)
    - `## Quality Checks` (achievable in the executor's environment)
    - `## Constraints`
+
+   A plan that names repo files (`src/`, `scripts/`, `tests/`, `.claude/`,
+   `docs/`, `config/`, `.github/`) also needs `## Premise checks`: six numbered
+   answers to the plan-time questions in `.claude/docs/premise-check.md`
+   (`n/a — <reason>` counts). Plan mode cannot be left without it.
 6. After user approves the plan:
    a. Call `intake_complete()` MCP tool to generate a one-time intake token
    b. Call `task_submit(plan_path=<path>, description=<description>, intake_token=<token>)`

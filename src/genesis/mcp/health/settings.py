@@ -468,9 +468,10 @@ _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
             "the row auto-completes that follow-up. BOTH thresholds must pass — a "
             "stale row in a LIVE session is that session's to dispose. WRITES "
             "(creates follow-ups), never to session_ledger. `escalate_added_by` "
-            "is a provenance allow-list, foreground-only by default so the "
-            "ambient extractor's proposals cannot ask the owner to dispose of "
-            "something nobody committed to. off (or env "
+            "is a provenance allow-list of owner commitments — foreground and "
+            "relayed (the owner's request written by a dispatched session) by "
+            "default — so the ambient extractor's proposals cannot ask the "
+            "owner to dispose of something nobody committed to. off (or env "
             "GENESIS_LEDGER_ESCALATION_DISABLED=1) silences it. Read live each "
             "tick — no restart."
         ),
