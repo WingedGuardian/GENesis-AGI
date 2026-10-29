@@ -1143,6 +1143,21 @@ def _strip_trailing_comment(seg: str) -> str:
             prev_ws = False
             i += 1
             continue
+        if seg.startswith("$(", i):
+            # Keep the whole substitution verbatim: a `#` inside it is the
+            # substitution's own comment, not a trailing comment on this segment.
+            # (arithmetic and a `$((`-opening subshell both balance via the same end.)
+            end = _command_sub_end(seg, i, n) or n
+            out.append(seg[i:end])
+            prev_ws = False
+            i = end
+            continue
+        if c == "`":
+            end = _backtick_end(seg, i, n) or n
+            out.append(seg[i:end])
+            prev_ws = False
+            i = end
+            continue
         if c in ("'", '"'):
             quote = c
             out.append(c)
@@ -1232,6 +1247,21 @@ def _has_trailing_override(seg: str, sigil: str = "review-override") -> bool:
                 quote = None
             prev_ws = False
             i += 1
+            continue
+        if seg.startswith("$(", i):
+            # A command substitution is one opaque region: a `#` inside it is the
+            # substitution's OWN comment, never a trailing override on the enclosing
+            # segment. Skip it whole so an inner `# review-override` cannot waive the
+            # gate for the enclosing command or a sibling (the nested commands still
+            # surface via `_substitutions` and are gated on their own). This covers
+            # arithmetic `$((…))` (harmless, no comments) and a subshell that merely
+            # opens `$((` — `_command_sub_end` balances both to the same close.
+            i = _command_sub_end(seg, i, n) or n
+            prev_ws = False
+            continue
+        if c == "`":
+            i = _backtick_end(seg, i, n) or n
+            prev_ws = False
             continue
         if c in ("'", '"'):
             quote = c

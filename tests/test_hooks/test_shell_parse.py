@@ -353,6 +353,44 @@ class TestOverride:
         seg2 = sp.analyze("git commit -m x # depth-ack-nope review-override")[0].raw
         assert not sp.has_trailing_override(seg2, sigil="review-override")
 
+    def test_substitution_local_override_does_not_leak(self):
+        # Codex P2 (fail-open): grouping a `$(…)`/backtick substitution into ONE
+        # segment must not let a `#` INSIDE it read as a trailing override on the
+        # enclosing segment — otherwise the waiver leaks to the enclosing command
+        # and its siblings (`git commit` below), bypassing the review gate.
+        nl = "\n"
+        for cmd in (
+            f"echo $(echo harmless # review-override{nl}git commit -m fixture)",
+            "echo `echo harmless # review-override`",
+            "echo $(printf x # depth-ack)",
+            # `$((` that opens a subshell inside a command substitution, not
+            # arithmetic: the `#` is still substitution-local and must not leak.
+            "gh pr merge 5 $((echo a) # review-override)",
+        ):
+            seg = sp.analyze(cmd)[0].raw
+            assert not sp.has_trailing_override(seg, sigil="review-override"), cmd
+            assert not sp.has_trailing_override(seg, sigil="depth-ack"), cmd
+            assert not sp.analyze(cmd)[0].override, cmd
+        # A GENUINE trailing override AFTER a substitution (incl. arithmetic) counts.
+        assert sp.analyze("echo $(foo) # review-override")[0].override
+        assert sp.analyze("echo $((1+2)) # review-override")[0].override
+
+    def test_strip_trailing_comment_keeps_substitution_and_trailing_tokens(self):
+        # Sibling blind spot in _argv's path: _strip_trailing_comment must not
+        # treat a `#` inside $(…)/backticks as a trailing comment, or it truncates
+        # the segment and a flag AFTER the substitution (e.g. --no-verify) vanishes
+        # from argv — a gated flag going unseen is the fail-open direction.
+        kept = sp._strip_trailing_comment("git commit $(true #x) --no-verify -m foo")
+        assert "--no-verify" in kept
+        assert "$(true #x)" in kept
+        kept_bt = sp._strip_trailing_comment("run `echo #y` --no-verify")
+        assert "--no-verify" in kept_bt
+        # A real trailing comment outside any substitution is still stripped.
+        assert (
+            sp._strip_trailing_comment("git push origin f # real comment").rstrip()
+            == "git push origin f"
+        )
+
 
 # ── commit hook-skip flag detection ─────────────────────────────────────
 
