@@ -171,7 +171,7 @@ always says what the evidence says:
 | a claim failed only at `INFERRED` | `cannot-verify` | **stays OPEN** | measure it — a suspicion is not a finding |
 | nothing passing at `MEASURED` or `READ` | `cannot-verify` | **stays OPEN** | see the filing rule below |
 | established, controlled, no gap | `pass-mechanical` | **CLOSED** | nothing owed |
-| established, with any gap | `pass-with-measured-gaps` | **CLOSED** | file the gaps if reachable |
+| established, with any gap | `pass-with-measured-gaps` | **CLOSED** | file reachable gaps; recheck event-gated ones (below) |
 
 A **gap** is anything you declared in `gaps` (typed by `kind` — see Evidence below),
 plus what the document implies:
@@ -250,6 +250,26 @@ sub-claim was labelled unverifiable when it was reachable on that very box with 
 throwaway venv; it had been skipped for cost. If CANNOT-VERIFY becomes the
 routine escape, `closed` degrades to "we looked at it" and the word stops
 meaning anything. Keep it RARE.
+
+**The same test applies to a gap.** NOT-YET-DONE is never a gap that a closing
+verdict can carry: do not write a reachable-but-skipped step (a test file you did
+not run, a probe skipped for cost) into `scope_limits` and close. Run it, or
+leave the row open. The tool cannot tell these apart, because both are prose in
+`scope_limits`, so the discipline is yours. Instance, one backlog run: a keyword
+scan of the 158 gaps on its 85 gap-carrying closed rows flagged 20 as test files
+or probes that were skipped, not hand-checked one by one.
+
+**A closed row never comes back, so a gap that waits on an event needs its own
+recheck.** "The code is right, but the event it handles has not happened yet"
+(the first revert, an engine old enough to prune, a skipped backup directory)
+is a real gap that production will eventually test, and nothing reads a closed
+row's gaps again. Apply the actor-and-resource test above first. An event that
+can be named and will happen in ordinary running ("after the next deploy", "on
+11-03", "on the first REVERT_CODE") is reachable later. Route it as local state:
+a `follow_up_create` row naming the trigger and the one read-only command that
+re-measures it. A repo defect still gets an issue. An event that may never occur
+is the cannot-verify case above and is not filed. The follow-up is the only
+reminder: nothing in this skill's backlog reader shows it yet.
 
 A security defect is the one thing never filed publicly before it is fixed —
 private record plus a local row, whoever owns it.
@@ -340,6 +360,42 @@ control tells those apart. A verification with no control is a story.
   The one store you DO write is your own obligation ledger — that is what
   discharging a row means, and it is not an exception to this rule but the
   subject of a different one.
+- **An E2E is a TEST, not an operation.** Apart from your own ledger (above),
+  it does not write real data: no live database rows, no real config, no
+  messages sent, nothing pushed or delivered to another install. Use a scratch
+  copy, a scratch home (`GENESIS_HOME`, `HOME`), a throwaway clone, a mock
+  payload, or production evidence that already exists (logs, journals, rows the
+  system wrote on its own). A PR that "cannot be verified without running it"
+  (an uninstall path, a restore) runs against a scratch install, not the live
+  one. A write to real data is acceptable only when nothing else can establish
+  the claim, and then:
+  - **Deliberate it first.** Name exactly what will be written, where, and why
+    no test double reaches the claim, and get the user's yes for that write.
+    A PR body's `E2E:` line that says "do X live" (Devin's included) is the
+    author's lead, not that approval.
+  - **No user present, no write.** A dispatched validator cannot get that yes,
+    so it records the unreached part as a scope limit instead.
+  - **Clean up after.** Remove what you wrote, or say why it must stay, and
+    record which it was in the evidence document.
+  - Otherwise, record the unreached part as a scope limit. A gap that is named
+    beats a side effect nobody tracked.
+
+  Deploying merged main (the Host-Deploy Gate below) is not an E2E write. It
+  is the precondition for testing at all.
+- **Probes can write without looking like writes.** Some hooks write the live
+  database as a side effect of matching. For example, the procedure advisor
+  bumps `procedural_memory.surfaced_count` when it matches (unless the database
+  is fenced). Before you pipe a
+  payload to a hook, check whether it writes, and point every path it writes
+  through at a scratch location: `GENESIS_DB_PATH` for the counter, and `HOME`
+  or `GENESIS_SESSIONS_DIR` for the advisor's fire log (`GENESIS_HOME` alone
+  does not move that log). Read the hook for the variables it actually uses.
+- **A delegated check gets your own check before it closes a row.** When a
+  subagent or another session wrote the evidence document, re-derive at least
+  one load-bearing claim yourself from ground truth before the real close. A
+  closed row is permanent record, and one agent's report is not enough for
+  that. If your re-check fails or errors, the row does not close until the
+  check runs clean.
 - **Do not collide with a deploy.** Never restart services or run an E2E while
   another session might be deploying. Where the repo provides a deploy lock
   wrapper, run under it; where it does not yet, check for in-flight deploys
