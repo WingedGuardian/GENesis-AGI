@@ -1773,7 +1773,49 @@ def test_carryover_recognises_urgent_header_spellings(header):
 
 def test_star_bullets_inside_urgent_are_carried():
     text = "**Urgent**\n* CARRY-STAR\n  - CARRY-SUB\n\n**Yesterday**\n* NOT-CARRIED\n"
-    assert MorningReportGenerator._carryover_lines(text) == ["* CARRY-STAR", "- CARRY-SUB"]
+    assert MorningReportGenerator._carryover_lines(text) == ["* CARRY-STAR\n  - CARRY-SUB"]
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("**Urgent**\n- Storage fault\n  recovery needs approval\n**Next Steps**\n- Routine", [
+        "- Storage fault\n  recovery needs approval",
+    ]),
+    ("**Next Steps**\n- Pending request\n  (still open since 2026-03-10)\n- Routine", [
+        "- Pending request\n  (still open since 2026-03-10)",
+    ]),
+    ("**Next Steps**\n- Pending (still open\n  since 2026-03-10)\n- Routine", [
+        "- Pending (still open\n  since 2026-03-10)",
+    ]),
+    ("**Next Steps**\n- Pending request\n  BLOCKER: owner decision\n  - retained detail", [
+        "- Pending request\n  BLOCKER: owner decision\n  - retained detail",
+    ]),
+    ("**Urgent**\n- Fault\nlazy continuation\n\nOrdinary paragraph\n**Next Steps**\n- Routine", [
+        "- Fault\nlazy continuation",
+    ]),
+    ("**Urgent**\n- Fault\n\n  **Recovery detail**\n  remains needed\n**Next Steps**", [
+        "- Fault\n\n  **Recovery detail**\n  remains needed",
+    ]),
+    ("**Urgent**\n- Fault\n  first cause\n- Fault\n  second cause\n- Fault\n  first cause", [
+        "- Fault\n  first cause", "- Fault\n  second cause",
+    ]),
+    ("**Next Steps**\n- Deploy lag is never a BLOCKER, routine maintenance\n- BLOCKERISH text", []),
+])
+def test_carryover_preserves_logical_bullet_blocks(text, expected):
+    assert MorningReportGenerator._carryover_lines(text) == expected
+
+
+@pytest.mark.parametrize("tag", ["BLOCKER:", "**BLOCKER:**", "**BLOCKER**:"])
+def test_carryover_recognises_explicit_blocker_tags(tag):
+    item = f"- {tag} owner decision\n  before recovery"
+    assert MorningReportGenerator._carryover_lines("**Next Steps**\n" + item) == [item]
+
+
+def test_carryover_retains_the_templates_complete_blocker():
+    template = _mr_mod._PROMPT_PATH.read_text(encoding="utf-8")
+    item = next(line for line in template.splitlines() if line.startswith("- BLOCKER: the champion"))
+    start = template.index(item)
+    block = "\n".join(template[start:].splitlines()[:2])
+    assert block in MorningReportGenerator._carryover_lines("**Next Steps & Blockers**\n" + block)
 
 
 def test_a_bold_bullet_is_an_item_not_a_header():

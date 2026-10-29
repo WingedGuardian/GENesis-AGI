@@ -1396,10 +1396,22 @@ class MorningReportGenerator:
         Whether an item is still urgent today is the drafter's judgment, made
         against today's data; this only hands it what was raised last time.
         """
-        picked: list[str] = []
+        blocks: list[tuple[bool, int, list[str]]] = []
+        current = None
         urgent = False
+        blank = False
         for raw in report_text.splitlines():
             line = raw.strip()
+            if not line:
+                blank = True
+                continue
+            indent = len(raw.expandtabs()) - len(raw.expandtabs().lstrip())
+            # Keep wrapped paragraphs and nested bullets attached to their
+            # parent, including indented bold text that resembles a heading.
+            if current is not None and indent > current[1]:
+                current[2].extend(([""] if blank else []) + [raw.rstrip()])
+                blank = False
+                continue
             # An optional emoji prefix, but never a bullet marker: "- **x**" is
             # an item, not a header.
             header = re.fullmatch(r"(?:[^\w\s*-]+\s*)?\*\*(.+?)\*\*:?|#+\s*(.+)", line)
@@ -1408,15 +1420,29 @@ class MorningReportGenerator:
                 words = re.sub(r"[^\w\s]", " ", header.group(1) or header.group(2) or "")
                 words = words.lower().split()
                 urgent = words[:1] == ["urgent"] or words[:2] == ["the", "urgent"]
-                continue
-            if not line.startswith(("-", "*")):
-                continue
+                current = None
+            elif re.match(r"[-*]\s+", line):
+                current = (urgent, indent, [line])
+                blocks.append(current)
+            elif current is not None and not blank:
+                current[2].append(raw.rstrip())  # Markdown lazy continuation
+            else:
+                current = None
+            blank = False
+
+        picked: list[str] = []
+        for was_urgent, _indent, lines in blocks:
+            item = "\n".join(lines)
             # A demoted item keeps travelling: the template writes it as
             # "(still open since <date>)", and dropping it from the next
             # carry-over would let the report after that re-raise it as new.
-            carried = urgent or "BLOCKER" in line or "still open since" in line.lower()
-            if carried and line not in picked:
-                picked.append(line)
+            carried = (
+                was_urgent
+                or re.search(r"\bBLOCKER(?:\*\*)?\s*:", item)
+                or re.search(r"\bstill\s+open\s+since\b", item, re.IGNORECASE)
+            )
+            if carried and item not in picked:
+                picked.append(item)
         return picked
 
     async def _get_previous_report_carryover(self) -> str | None:
