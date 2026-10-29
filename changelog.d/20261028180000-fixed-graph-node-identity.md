@@ -1,0 +1,1 @@
+- SQL memory-graph traversal now preserves distinct node IDs that contain shared prefixes, wildcard characters, empty strings, or embedded NULs, instead of incorrectly treating them as cycles.
