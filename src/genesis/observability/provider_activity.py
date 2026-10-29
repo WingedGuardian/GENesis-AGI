@@ -90,11 +90,11 @@ class ProviderActivityTracker:
             except RuntimeError:
                 return
         try:
+            from genesis.db.request_database import spawn_database_task
             from genesis.observability.types import Subsystem
-            from genesis.util.tasks import tracked_task
 
-            self._flush_task = tracked_task(
-                self._flush_to_db(),
+            self._flush_task = spawn_database_task(
+                self._db, self._flush_to_db(),
                 name="activity-log-flush",
                 subsystem=Subsystem.OBSERVABILITY,
             )
