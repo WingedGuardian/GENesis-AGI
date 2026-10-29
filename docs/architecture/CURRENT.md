@@ -3679,7 +3679,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py]
-verified: 8a62059720cd 2026-10-22
+verified: 9c2209df8 2026-10-29
 ```
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
@@ -3922,6 +3922,14 @@ tool-disabled CC probe without changing its schedule or routing authority.
   before draining); `DeferredWorkQueue` priorities + staleness policies;
   dead-letter replay. The `dream_synthesis_slice` worklist is deliberately
   excluded from the backlog alarm (drift-guard test pins it).
+  `StatusFileWriter` gathers runtime/DB data on-loop, then publishes immutable
+  JSON through one ordered executor job. Cancellation cannot release publication
+  admission before the actual file worker finishes. Runtime shutdown cancels the
+  minute writer loop and drains its publication before DB teardown, including
+  partial bootstrap. The status timestamp describes the collected snapshot, not
+  delayed publication; this keeps watchdog freshness checks truthful. This
+  protects event-loop responsiveness during slow status-file I/O; it does not
+  establish recovery of an independent SSH transport or shared storage.
   `NetworkSentinel` (`network_sentinel.py`) probes the open internet (DNS+TCP to
   public anchors) on a cadence and publishes a 3-state `network` axis
   (NORMAL/DEGRADED/OFFLINE) with asymmetric hysteresis — it OWNS its hysteresis
