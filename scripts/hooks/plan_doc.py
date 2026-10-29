@@ -196,15 +196,16 @@ def strip_quoted(text: str) -> str:
 #: says "Premise checks".
 _PREMISE_TITLE = re.compile(r"premise\s+(?:checks?|questions?)\b", re.IGNORECASE)
 #: The line-rule fallback, used only without a parser.
-_PREMISE_HEADING_LINE = re.compile(r"^#{1,6}[ \t]+premise[ \t]+(?:checks?|questions?)\b", re.IGNORECASE)
 _ANY_HEADING_LINE = re.compile(r"^#{1,6}[ \t]")
 _ANSWER_LINE = re.compile(r"^ {0,3}([1-9])[.)](?:[ \t]+(.*))?$")
 
 
-def premise_answers(text: str) -> dict[int, str] | None:
+def premise_answers(text: str, title: re.Pattern[str] = _PREMISE_TITLE) -> dict[int, str] | None:
     """The numbered answers under a plan's premise heading, or None without one.
 
-    ``text`` is read as given; callers pass the live, quote-stripped section, so a
+    ``title`` matches the section heading's rendered text; it defaults to the
+    premise section, and the issue gate passes its bug-report "Verification"
+    title to read that section by the same rules. ``text`` is read as given; callers pass the live, quote-stripped section, so a
     heading shown inside an example does not count. Read AS IT RENDERS, like the
     rest of this module: the section runs from the first heading titled "Premise
     check(s)" or "Premise question(s)" to the next heading of the same or a higher
@@ -225,12 +226,12 @@ def premise_answers(text: str) -> dict[int, str] | None:
     """
     parsed = _blocks(text)
     if parsed is None:
-        return _premise_answers_by_line(text)
+        return _premise_answers_by_line(text, title)
     _, _, tokens = parsed
     start = depth = None
     for i, tok in enumerate(tokens):
-        title = _visible_text(tokens[i + 1]).strip() if i + 1 < len(tokens) else ""
-        if tok.type == "heading_open" and tok.level == 0 and _PREMISE_TITLE.match(title):
+        heading = _visible_text(tokens[i + 1]).strip() if i + 1 < len(tokens) else ""
+        if tok.type == "heading_open" and tok.level == 0 and title.match(heading):
             start, depth = i + 1, int(tok.tag[1:])
             break
     if start is None:
@@ -270,10 +271,11 @@ def _rendered_text(inline) -> str:
     return "".join(out).strip()
 
 
-def _premise_answers_by_line(text: str) -> dict[int, str] | None:
+def _premise_answers_by_line(text: str, title: re.Pattern[str] = _PREMISE_TITLE) -> dict[int, str] | None:
     """``premise_answers`` without a parser: line rules, so the check still runs."""
     lines = text.split("\n")
-    start = next((i for i, line in enumerate(lines) if _PREMISE_HEADING_LINE.match(line)), None)
+    heading = re.compile(rf"^#{{1,6}}[ \t]+(?:{title.pattern})", title.flags)
+    start = next((i for i, line in enumerate(lines) if heading.match(line)), None)
     if start is None:
         return None
     answers: dict[int, str] = {}

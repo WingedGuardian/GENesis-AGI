@@ -105,6 +105,7 @@ async def test_happy_path_enqueues_code_resolved_recipient_labeled_bulk(db):
     assert row["validated_recipient"] == "prospect@example.com"  # resolved in CODE
     assert row["labeled_surplus"] == 1  # → classifies BULK downstream
     assert "Try Genesis" in row["message"]
+    assert row["email_subject"] == "Try Genesis"  # the real subject, not the message start
 
 
 @pytest.mark.asyncio

@@ -44,6 +44,63 @@ phase: 10
 skill_type: workflow
 ---
 
+## Running under Codex
+
+This section applies to the separately qualified interactive Codex validator.
+It qualifies the shell-ledger and deploy directions below; the shared evidence,
+risk, control and finding-routing rules still apply. Read
+`.agents/skills/genesis-external-client/SKILL.md` and
+`docs/reference/codex-validator-boundary.md` before using the tools. The ordinary
+Codex external profile retains its health/recall floor and cannot write memories
+or verification records merely because this skill is discoverable.
+
+The dedicated launcher's MCP server keys are `genesis_validator_health` and
+`genesis_validator_memory`. Codex tool names use
+`mcp__<server-key>__<tool-name>`:
+
+| Operation | Server key | Tool |
+|---|---|---|
+| Record or preview evidence | genesis_validator_health | pr_verification_close |
+| Keep private findings | genesis_validator_health | follow_up_create / follow_up_list / follow_up_update |
+| Store an authorized measurement memory | genesis_validator_memory | memory_store |
+
+`pr_verification_close` takes evidence_json and an independent pr, with optional
+park, note, verdict expectation and dry_run. Verdicts are derived from the same
+strict document policy described below. Use that tool, **never the shell
+`pr_verification.py close` writer**. A server-forced preview writes no obligation
+or attempt note and discharges nothing. Actual recording stays locked until
+separately authorized calibration and operator opt-in; no request can clear it.
+After an uncertain real response, re-read stored evidence/count before retrying.
+
+This conversation is not a Genesis session. Do not register its transcript,
+create a charter, use the session ledger or pass its identifiers to session
+tools. Append progress/evidence/uncertainty to
+`~/.genesis/output/validator-runs/<date>.md`. Private follow-up creation uses a
+stable request_key and strategy=user_input_needed, without schedule, pin or
+session provenance. Updates cover eligible private records across clients;
+they cannot promote or dispatch them. Memory writes retain the existing
+collection/supersedes interface and partial-failure limits. Do not write memory
+to manufacture a verification result when that memory store is under test.
+
+**Never deploy, change a service, push, merge or fix code.** The deploy recipes
+and Host-Deploy Gate below describe the Claude operator's responsibilities.
+For Codex, a row waiting on deployment is NOT-YET-DONE: leave it open and note
+the required deploy in the run log/private follow-up. Do not invent deployment
+evidence or mark cannot-verify just because this client cannot deploy.
+
+Public issues and issue/PR timeline comments go through
+`scripts/file_tracker_issue.py`; comments use --comment-on <number> with a
+--body-file. Use body files and the canonical shell restrictions, never raw gh
+or API writes. Privacy/security findings stay local in eligible private
+follow-ups and the owner conversation. A successful scan is not permission to
+publish private content. Validators do not request development reviews or
+trigger paid agents; the filer is not a review-budget gate.
+
+**A native guard denial means stop that action and ask the owner.** Do not
+retry through another command spelling, subprocess, tool or client. Do not
+write stores under test or run migrations on live data. Discovery of this skill
+does not qualify or activate the launcher, and it does not authorize PR6.
+
 ## Load Gate
 
 Three session types touch a PR and they are not phases of one life:
@@ -100,7 +157,7 @@ count says anything about the other.
 
 ---
 
-## The four verdicts
+## The five verdicts
 
 Never pass/fail. Every PR gets exactly one of these (standing ruling) — and **you do
 not choose it: the tool DERIVES it from your evidence document**, so the verdict
@@ -108,14 +165,16 @@ always says what the evidence says:
 
 | derived when | verdict | the row | the route |
 |---|---|---|---|
-| `deploy.established` is false | `cannot-verify` | **stays OPEN** | deploy it and re-run — usually not-yet-done |
+| `deploy.established` is false | `cannot-verify` | **stays OPEN** | deploy it and re-run |
 | a claim FAILED at `MEASURED` or `READ` | `fail-intent` | **stays OPEN** | to the USER, as a conversation |
+| a `not_yet_done` gap | `not-yet-done` | **stays OPEN** | run the named commands, then re-run |
 | a claim failed only at `INFERRED` | `cannot-verify` | **stays OPEN** | measure it — a suspicion is not a finding |
 | nothing passing at `MEASURED` or `READ` | `cannot-verify` | **stays OPEN** | see the filing rule below |
 | established, controlled, no gap | `pass-mechanical` | **CLOSED** | nothing owed |
 | established, with any gap | `pass-with-measured-gaps` | **CLOSED** | file the gaps if reachable |
 
-A **gap** is anything you declared in `scope_limits`, plus what the document implies:
+A **gap** is anything you declared in `gaps` (typed by `kind` — see Evidence below),
+plus what the document implies:
 no negative control, any claim at `NOT_VERIFIABLE_HERE`, any claim at `INFERRED`, and
 a named `SUSPECTED FAILURE (INFERRED)` for each claim that failed only at `INFERRED`.
 A failure is gated by tier exactly as a pass is: only an ESTABLISHED one goes to the
@@ -147,7 +206,10 @@ the work you can actually do.
 
 A closing outcome refuses `--note` rather than silently discarding it — a closed
 row's prose belongs in the evidence document's `findings`, which does not change the
-verdict. (`scope_limits` would: every entry is a gap.)
+verdict. (`gaps` would: every entry is a gap.) `not-yet-done` is the one open
+outcome that needs no `--note`: its NOT YET DONE gaps already say what is left and
+the command that does it, and they lead the row's note; a note you add goes after
+them. `--park` is refused on it — undone work is not a reason it cannot be done.
 
 ---
 
@@ -180,8 +242,10 @@ RESOURCE.**
 
 **The abuse this marking invites, and the test that stops it.** *"I did not get
 to it" is never CANNOT-VERIFY.* Ask: **could I have done this with the access and
-the time I actually had?** If yes, it is NOT-YET-DONE — leave the row open and
-say so. Measured instance, the first validator session's own first PR: a
+the time I actually had?** If yes, it is NOT-YET-DONE — do it, or record each step
+as a `not_yet_done` gap with its `command`, which derives `not-yet-done`: the row
+stays open with the command at the head of its note, where the next validator
+starts. Measured instance, the first validator session's own first PR: a
 sub-claim was labelled unverifiable when it was reachable on that very box with a
 throwaway venv; it had been skipped for cost. If CANNOT-VERIFY becomes the
 routine escape, `closed` degrades to "we looked at it" and the word stops
@@ -208,8 +272,10 @@ different PR number. `git merge-base --is-ancestor <mergeCommit> HEAD` therefore
 returns a false *"not deployed"* while the code is live and behaviourally
 correct. Establish it by **content** (the change is present in the deployed
 artifact) or by **BEHAVIOUR** (the live thing was observed doing it), and check
-`baseRefName` before trusting `mergeCommit` at all. Ancestry is a fast positive
-path and never a negative verdict.
+`baseRefName` before reading anything about DEPLOYMENT into `mergeCommit`. The
+document's `merge_commit` is still that `mergeCommit` (`close` checks it); the
+parent squash you actually exercised goes in `deploy.detail`. Ancestry is a fast
+positive path and never a negative verdict.
 
 Report which copy of the code you actually exercised. A verdict that does not
 say is not a verdict.
@@ -315,8 +381,25 @@ because each pilot broke a field the obvious version would have had:
 - **`controls[]`** — a reader cannot distinguish a non-vacuous verification from
   a vacuous one without them. A document with none can still close, but never as
   `pass-mechanical`: "no negative control" becomes a named gap.
-- **`scope_limits[]`** — what this install could not reach, named. Each one is a
-  gap, so any entry makes the outcome `pass-with-measured-gaps`.
+- **`merge_commit`** — the PR's OWN merge commit, 7+ hex characters. `close` checks
+  it against GitHub (`gh pr view --json mergeCommit`) and refuses a mismatch with
+  exit 3, on `--dry-run` too; if gh cannot resolve it, the close is refused (exit 2)
+  rather than waved through. MEASURED 2026-10-27: 5 of 15 documents in one group
+  named main HEAD or the deployed commit instead. On a stacked PR this is still
+  GitHub's `mergeCommit` (on the parent branch); record the parent squash you
+  actually exercised in `deploy.detail`.
+- **`gaps[]`, each with a `kind`** — what this document leaves unestablished, and
+  the kind decides what it does. MEASURED 2026-10-27 over one evening's 99 closes:
+  of 158 untyped gaps, 35 were reachable work that had not been done, 44 waited on
+  an event, 57 were method limits and 22 belonged to the owner — and the untyped
+  list closed every one of them alike.
+  - `method` (`detail`), `owner_only` (`detail`) and `event_gated` (`detail`,
+    `trigger`: a real `YYYY-MM-DD` or a named event, `recheck`: one read-only
+    command or SQL that re-measures it) — close as `pass-with-measured-gaps` with
+    the gap named.
+  - `not_yet_done` (`detail`, `command`) — keeps the row OPEN as `not-yet-done`.
+  The old untyped `scope_limits` is refused by name, never mapped across: choosing
+  each entry's kind is the judgment the untyped list let a close skip.
 - **`findings[]`, each with a DISPOSITION** — an undispositioned finding is a
   drop wearing a record, and the validator refuses one.
 

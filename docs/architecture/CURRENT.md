@@ -2538,9 +2538,9 @@ verified: 477efb7f7 2026-10-05
   most do, because the docs-path exemption discharges rows a validator never
   looked at. `status` means "obligation discharged"; only `verdict` says a
   validator concluded anything. The verdict vocabulary and column names live with
-  the code (`crud/pr_verifications.py`) rather than here, since a four-value set
-  invented before the tool had run once is the kind of detail this map should not
-  be the second copy of. `doc_paths.is_doc_path`
+  the code (`crud/pr_verifications.py`) rather than here, since a five-value set
+  (`not-yet-done` was the fifth, added after the tool had run) is the kind of
+  detail this map should not be the second copy of. `doc_paths.is_doc_path`
   is a pinned duplicate of the merge gate's `_is_doc_path` (`src/` must not
   import `scripts/`), held in parity by
   `tests/test_session_awareness/test_doc_paths.py`.
@@ -4504,6 +4504,12 @@ verified: 3e27b479 2026-10-23
   creating a charter, or joining Genesis foreground/background lifecycle
   management. Recall remains read-oriented rather than side-effect-free: its
   normal retrieval-use metadata may still be updated.
+  `file_tracker_issue.py --comment-on` adds privacy-scanned issue/PR timeline
+  comments through the existing tracker/snapshot pipeline. It submits once and
+  reconciles uncertain outcomes by exact-body reads, never an automatic retry.
+  `.agents/skills/validating-merges` links to the canonical skill with explicit
+  Codex MCP mapping, no lifecycle enrollment and no deploy/fix/push/merge rules.
+  Discovery alone does not qualify or activate the dedicated validator.
   The same project configuration exposes 15 explicitly named GitNexus tools
   through `.claude/mcp/run-gitnexus`, reusing the existing installed-version and
   Node pin checks. It adds no Genesis writers or lifecycle integration. GitNexus
