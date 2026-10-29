@@ -1,0 +1,53 @@
+name: Shared MCP execution qualification
+
+on:
+  pull_request:
+    paths:
+      - "src/genesis/mcp/shared_execution.py"
+      - "tests/test_mcp/*shared_execution*"
+      - "scripts/genesis_mcp_server.py"
+      - "pyproject.toml"
+      - ".github/workflows/mcp-shared-execution.yml"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shared-execution-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  qualified-stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        fastmcp: ["2.14.6", "2.14.7"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install the exact qualified dependency pair
+        env:
+          FASTMCP_QUALIFIED_VERSION: ${{ matrix.fastmcp }}
+        run: pip install -e ".[test]" "fastmcp==$FASTMCP_QUALIFIED_VERSION" "mcp==1.30.0"
+      - name: Exercise the production execution adapter
+        run: >-
+          python -m pytest -q --junitxml=shared-execution.xml
+          tests/test_mcp/test_shared_execution.py
+      - name: Require every qualification case to execute
+        run: |
+          python - <<'PY'
+          from xml.etree import ElementTree
+          root = ElementTree.parse("shared-execution.xml")
+          assert root.findall(".//testcase"), "qualification collected no cases"
+          http = [case for case in root.findall(".//testcase")
+                  if case.get("name", "").startswith("test_http_session_retirement[")]
+          assert len(http) == 16, "expected 2 modes x 4 triggers x 2 peer states"
+          assert not root.findall(".//skipped"), "qualification skipped cases"
+          assert not root.findall(".//failure") and not root.findall(".//error")
+          PY

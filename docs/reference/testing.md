@@ -1,5 +1,11 @@
 # Testing Guide
 
+Shared execution tests are in `tests/test_mcp/test_shared_execution.py`. Its
+real TCP cases require FastMCP 2.14.6 or 2.14.7 with MCP 1.30.0 and run in fresh subprocesses.
+The dedicated shared-execution workflow pins both pairs and rejects any skipped
+case. An unqualified local dependency pair tests refusal and skips the HTTP
+qualification rather than pretending to qualify another version.
+
 The shared MCP configuration reader is exercised with real `python -I -S`
 subprocesses and captured deploy source in
 `tests/test_mcp/test_shared_config.py`. Run it with

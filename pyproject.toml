@@ -179,6 +179,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"genesis.mcp" = ["fastmcp-LICENSE.txt"]
+
 [tool.ruff]
 target-version = "py312"
 line-length = 100
