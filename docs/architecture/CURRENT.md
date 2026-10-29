@@ -4427,7 +4427,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 3e27b479 2026-10-23
+verified: c56a621b5 2026-10-24
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -4499,8 +4499,12 @@ verified: 3e27b479 2026-10-23
   scratch roots, translates asks
   to denials and preserves advisories. Six source-bound publishing-allowance
   tests retain direct evidence only; separate independent-state controls verify
-  the actual ask/refusal and existing push-cache effects. It has no ordinary configuration wiring
-  or role-specific publishing/store policy yet. See
+  the actual ask/refusal and existing push-cache effects. Its Bash-only role
+  guard independently blocks publication, main checkout moves, named live
+  service/store writes and protected output paths. Canonical optional parser
+  facts retain wrapper, assignment, source-scope and occurrence identity without
+  changing existing Segment consumers. Ordinary configuration and launcher
+  activation remain separate. See
   `docs/reference/codex-validator-boundary.md`.
   Codex has a separate external-client adapter in `.codex/config.toml`: it
   starts the existing standalone health and memory MCP servers through a
