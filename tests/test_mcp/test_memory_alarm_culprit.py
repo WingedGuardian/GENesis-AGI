@@ -8,6 +8,7 @@ while it keeps firing, and taken afresh after it stops and fires again.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -15,6 +16,7 @@ import pytest
 from genesis.mcp import health_mcp
 from genesis.mcp.health import errors
 from genesis.observability import pid_breakdown
+from genesis.observability.pid_breakdown import memory_summary
 from genesis.observability.provider_activity import ProviderActivityTracker
 
 _ALARM = "infra:container_memory_high"
@@ -83,6 +85,52 @@ async def test_breakdown_is_taken_once_per_firing_episode(health):
     third = await _memory_message()
     assert len(calls) == 2  # a new episode takes a fresh breakdown
     assert third.endswith("#2")
+
+
+@pytest.mark.asyncio
+async def test_cached_breakdown_retains_utc_sample_date_across_days(health, monkeypatch):
+    set_pct, _calls = health
+    sampled_at = datetime(2026, 12, 31, 23, 59, tzinfo=UTC)
+    samples = []
+
+    class Clock:
+        @classmethod
+        def now(cls, tz):
+            assert tz is UTC
+            return sampled_at
+
+    def sample(*_a, **_k):
+        samples.append(sampled_at)
+        return {
+            "status": "sampled",
+            "trees": [{"label": "synthetic", "root_pid": 100, "rss_mb": 50, "children": 0}],
+            "rss_unreadable": 0,
+            "processes_seen": 1,
+            "truncated": [],
+        }
+
+    monkeypatch.setattr(pid_breakdown, "datetime", Clock)
+    monkeypatch.setattr(pid_breakdown, "memory_trees", sample)
+    monkeypatch.setattr(pid_breakdown, "memory_summary", memory_summary)
+    monkeypatch.delenv("GENESIS_PID_BREAKDOWN_DISABLED", raising=False)
+    set_pct(87)
+    first = await _memory_message()
+    assert "Top memory trees at 2026-12-31 23:59Z" in first
+
+    sampled_at += timedelta(days=2)
+    set_pct(88)
+    held = await _memory_message()
+    assert held.startswith("Container memory at 88%")
+    assert "Top memory trees at 2026-12-31 23:59Z" in held
+    assert "2027-01-02" not in held
+    assert len(samples) == 1
+
+    set_pct(84)
+    assert await _memory_message() is None
+    set_pct(87)
+    refreshed = await _memory_message()
+    assert "Top memory trees at 2027-01-02 23:59Z" in refreshed
+    assert len(samples) == 2
 
 
 @pytest.mark.asyncio

@@ -591,7 +591,7 @@ def memory_summary(root: str | None = None) -> str:
     alarm whose culprit was looked for and not found. Blocking (one /proc pass):
     call it through ``asyncio.to_thread``.
     """
-    taken = datetime.now(UTC).strftime("%H:%MZ")
+    taken = datetime.now(UTC).strftime("%Y-%m-%d %H:%MZ")
     if os.environ.get(_DISABLE_ENV) == "1":
         return f"Process breakdown unavailable: disabled ({_DISABLE_ENV}=1)."
     try:

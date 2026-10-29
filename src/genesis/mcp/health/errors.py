@@ -216,7 +216,7 @@ _ONGOING_RE = re.compile(rf"\s*{re.escape(_ONGOING_MARK)}[^)]*\)\s*$")
 # runs on every tick and every dashboard poll, and a /proc pass per call would be
 # work nobody reads. Reused text also keeps the message stable, which the
 # `alert_events` row (captured at first fire) already assumes. The line carries
-# its own HH:MMZ, so a held breakdown never reads as current. In memory: a
+# its own UTC date and time, so a held breakdown never reads as current. In memory: a
 # restart while the alarm fires takes one fresh breakdown, stamped with its own
 # time. Cleared on the first call where the alarm is not firing.
 _memory_culprits: str | None = None
