@@ -98,6 +98,7 @@ _ALLOWLIST: dict[str, str] = {
     "entity_cleanup_fake_commits.py": _OPERATOR_ONE_OFF,
     "gen_memory_quality_chart.py": _OPERATOR_ONE_OFF,
     "graph_cutover_report.py": _OPERATOR_ONE_OFF,  # read-only (mode=ro) verdict report
+    "inbox_coverage_report.py": _OPERATOR_ONE_OFF,  # read-only (mode=ro) verdict report
     "ledger_shadow_report.py": _OPERATOR_ONE_OFF,
     "lib/index_marker.py": (
         "opens its OWN code-intel queue database under marker_dir(), never "
