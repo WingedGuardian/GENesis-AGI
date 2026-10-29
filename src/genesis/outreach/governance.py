@@ -315,6 +315,11 @@ class GovernanceGate:
             return False
         window_spec = f"-{window_hours} hours"
 
+        # Older recovery workers recorded morning reports as deferred_retry.
+        # Keep those delivered rows effective if queue completion failed before
+        # an upgrade; topic/category/window remain the same identity boundary.
+        legacy_signal = "deferred_retry" if request.signal_type == "morning_report" else request.signal_type
+
         # Primary key: (signal_type, topic, category) within the window.
         # NB: wrap delivered_at in datetime(). Stored values are ISO-8601 with a
         # 'T' separator (datetime.now(UTC).isoformat()); a raw string compare
@@ -323,10 +328,10 @@ class GovernanceGate:
         # UTC day. datetime() parses both sides before comparing.
         cursor = await self._db.execute(
             "SELECT COUNT(*) FROM outreach_history "
-            "WHERE signal_type = ? AND topic = ? AND category = ? "
+            "WHERE signal_type IN (?, ?) AND topic = ? AND category = ? "
             "AND delivered_at IS NOT NULL "
             "AND datetime(delivered_at) >= datetime('now', ?)",
-            (request.signal_type, request.topic, request.category.value, window_spec),
+            (request.signal_type, legacy_signal, request.topic, request.category.value, window_spec),
         )
         row = await cursor.fetchone()
         if (row[0] if row else 0) > 0:
