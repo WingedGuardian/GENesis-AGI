@@ -16,8 +16,8 @@ unique prefix.
 from __future__ import annotations
 
 import logging
-import os
 
+from genesis.caller_context import caller_context
 from genesis.mcp.health import mcp
 from genesis.session_charter import SESSIONS_DIR as _canonical_sessions_dir
 
@@ -65,13 +65,13 @@ def _default_added_by() -> str:
     """Dispatched sessions write as 'ambient'; interactive foreground as
     'foreground' (same discriminator the PreCompact hook and follow-up tools
     use)."""
-    return "ambient" if os.environ.get("GENESIS_CC_SESSION") == "1" else "foreground"
+    return "ambient" if _is_dispatched() else "foreground"
 
 
 def _is_dispatched() -> bool:
     """True in a Genesis-dispatched session (cc/invoker.py stamps this on every
     ``claude -p`` it spawns — channel conversations included)."""
-    return os.environ.get("GENESIS_CC_SESSION") == "1"
+    return caller_context().dispatched
 
 
 def _own_session_ids() -> set[str]:
@@ -103,8 +103,9 @@ def _own_session_ids() -> set[str]:
     cross-session write.
     """
     ids: set[str] = set()
-    for var in ("CLAUDE_CODE_SESSION_ID", "GENESIS_SESSION_ID"):
-        value = (os.environ.get(var) or "").strip()
+    caller = caller_context()
+    for raw in (caller.transcript_id, caller.session_id):
+        value = (raw or "").strip()
         if value:
             ids.add(value)
     return ids
@@ -512,7 +513,7 @@ async def _impl_session_ledger_add(
         # namespace (it is a session_charters key), so knowing only the Genesis
         # row id still leaves "sid might be my own transcript id" open, and the
         # beneficiary claim would be unsound.
-        _own_transcript = (os.environ.get("CLAUDE_CODE_SESSION_ID") or "").strip()
+        _own_transcript = (caller_context().transcript_id or "").strip()
         _dispatched = _is_dispatched()
         if _dispatched and _own_transcript:
             # Own id known and != sid (equal was refused by the gate above), so
