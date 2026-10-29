@@ -1120,6 +1120,17 @@ async def test_a_sub_one_day_reattempt_window_is_refused(db, bad):
         await verif_crud.list_validation_candidates(db, now=PICK_NOW, reattempt_days=bad)
 
 
+def test_the_picker_accounts_for_every_non_closing_verdict():
+    """The picker's vocabulary must not drift from VERDICTS: a new non-closing
+    verdict either joins the candidate map or is excluded on purpose, never
+    silently left unpicked."""
+    non_closing = set(verif_crud.VERDICTS) - set(verif_crud.PASS_VERDICTS)
+    picked = {v for v in verif_crud._CANDIDATE_TIERS if v is not None}
+    assert picked | verif_crud._NEVER_PICKED == non_closing
+    assert not picked & verif_crud._NEVER_PICKED
+    assert picked >= verif_crud._DELAYED_VERDICTS
+
+
 @pytest.mark.asyncio
 async def test_a_naive_now_is_refused_not_a_type_error(db):
     await _open(db, 265)

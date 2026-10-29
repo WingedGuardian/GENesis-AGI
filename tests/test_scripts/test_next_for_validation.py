@@ -590,6 +590,31 @@ async def _touch_db(path: Path) -> None:
         await conn.commit()
 
 
+def _refusing_runner():
+    async def run(argv):
+        raise AssertionError(f"a quarantined database must not reach gh: {argv}")
+
+    return run
+
+
+@pytest.mark.parametrize("fence", ["fenced", "raises"])
+def test_a_quarantined_database_is_never_ranked(tmp_path, repo, capsys, monkeypatch, fence):
+    """The admission fence: a fenced database, or a fence check that itself fails,
+    stops the pick before any read or GitHub call."""
+    import genesis.db.admission as admission
+
+    def fenced(path):
+        if fence == "raises":
+            raise RuntimeError("fence unreadable")
+        return True
+
+    monkeypatch.setattr(admission, "database_is_fenced", fenced)
+    db = _db(tmp_path, [(1, "2026-10-10T00:00:00Z", None, None)])
+    out = _pick(db, repo, _refusing_runner(), capsys)
+    assert "quarantined" in out
+    assert _picked(out) is None
+
+
 def test_an_absent_database_is_reported_as_itself(tmp_path, repo, capsys):
     out = _pick(tmp_path / "nope.db", repo, _runner([]), capsys)
     assert "no database" in out

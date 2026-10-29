@@ -489,9 +489,17 @@ async def list_open(db: aiosqlite.Connection, *, limit: int = 500) -> list[dict]
 
 #: The verdicts a standing validator may pick, and the tier each sorts into. An
 #: open row whose verdict is NULL was never attempted (any attempt sets one).
-#: ``fail-intent`` is absent on purpose: it is the owner's to act on, never the
-#: loop's to retry. A verdict this map does not name is not picked.
+#: This map is the picker's ONLY copy of the vocabulary: the query and the
+#: re-attempt check below are built from it, and a test pins that every
+#: non-closing verdict in :data:`VERDICTS` is either here or in
+#: :data:`_NEVER_PICKED`, so a new verdict cannot silently go unpicked.
 _CANDIDATE_TIERS = {"not-yet-done": 0, None: 1, "cannot-verify": 2}
+
+#: Picked only once their last attempt is older than the re-attempt window.
+_DELAYED_VERDICTS = frozenset({"cannot-verify"})
+
+#: Never picked: a failure is the owner's to act on, never the loop's to retry.
+_NEVER_PICKED = frozenset({"fail-intent"})
 
 
 async def list_validation_candidates(
@@ -540,16 +548,18 @@ async def list_validation_candidates(
         )
         return [{**dict(r), "tier": _CANDIDATE_TIERS[None]} for r in await cursor.fetchall()]
 
+    named = sorted(v for v in _CANDIDATE_TIERS if v is not None)
     cursor = await db.execute(
         "SELECT * FROM pr_verifications WHERE status = 'open' AND "
-        "(verdict IS NULL OR verdict IN ('not-yet-done', 'cannot-verify')) "
-        "ORDER BY merged_at DESC"
+        f"(verdict IS NULL OR verdict IN ({', '.join('?' for _ in named)})) "
+        "ORDER BY merged_at DESC",
+        named,
     )
     picked: list[dict] = []
     for raw in await cursor.fetchall():
         row = dict(raw)
         verdict = row.get("verdict")
-        if verdict == "cannot-verify":
+        if verdict in _DELAYED_VERDICTS:
             try:
                 last = datetime.fromisoformat(str(row.get("last_attempt_at")))
             except ValueError:
