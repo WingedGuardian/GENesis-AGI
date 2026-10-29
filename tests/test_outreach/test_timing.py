@@ -109,3 +109,33 @@ def test_invalid_clock_raises(bad):
     that would escape outreach_send's error handling."""
     with pytest.raises(TimingParseError):
         resolve_preferred_timing(bad, now=NOW, tz="UTC")
+
+
+def test_bare_clock_dst_rollback_picks_second_occurrence():
+    """On the autumn rollback morning, 01:30 exists twice in Chicago. From the
+    first 01:45 (06:45 UTC), "1:30am" resolves to the still-future SECOND
+    occurrence (07:30 UTC, 45 min away) — not next day's."""
+    now = datetime(2026, 11, 1, 6, 45, 0, tzinfo=UTC)
+    assert _iso(
+        resolve_preferred_timing("1:30am", now=now, tz="America/Chicago")
+    ) == "2026-11-01T07:30:00+00:00"
+
+
+def test_naive_iso_ambiguous_across_dst_raises():
+    """A naive ISO local time that exists twice (rollback) cannot pick a side
+    silently — it is refused like other unresolvable input."""
+    now = datetime(2026, 11, 1, 6, 0, 0, tzinfo=UTC)
+    with pytest.raises(TimingParseError):
+        resolve_preferred_timing(
+            "2026-11-01T01:30:00", now=now, tz="America/Chicago"
+        )
+
+
+def test_bare_clock_in_dst_gap_skips_to_next_day():
+    """02:30 never exists on the 2026-03-08 spring-forward in Chicago, so a
+    "2:30am" asked that morning resolves to the next day's occurrence
+    (07:30 UTC, CDT -5)."""
+    now = datetime(2026, 3, 8, 9, 0, 0, tzinfo=UTC)  # 03:00 CST, post-gap
+    assert _iso(
+        resolve_preferred_timing("2:30am", now=now, tz="America/Chicago")
+    ) == "2026-03-09T07:30:00+00:00"
