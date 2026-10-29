@@ -347,6 +347,13 @@ control tells those apart. A verification with no control is a story.
 - **Separate INSTALL findings from REPO findings.** A failure may be specific to
   one box's configuration rather than a defect in the repo. Say which before
   filing anything, and file a repo issue only for the repo half.
+- **Triage a question before asking it.** A validating session uses the closing
+  session's four buckets: answer it from evidence, follow a standing rule, decide
+  and log a low-stakes reversible call for batch review, or ask the owner a
+  genuine decision (closing-session, "Working the queue", step 5). The triage
+  never moves what this skill already gives the owner: a `fail-intent` goes to
+  them as a conversation (the verdicts table above), and a native guard denial
+  means stop and ask.
 
 ---
 
