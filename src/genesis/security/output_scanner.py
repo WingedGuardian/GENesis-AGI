@@ -168,6 +168,18 @@ def scan_outbound_normalised(content: str) -> set[str]:
     return found
 
 
+def scan_diagnostic_controls(content: str) -> set[str]:
+    """Findings before redaction for diagnostics with changing Cc/Cf controls.
+
+    Ordinary text (including LF/TAB) needs no preflight. Keep the original view:
+    deleting controls can erase a pattern boundary that the raw text preserves.
+    Callers decide whether location-only findings are allowed in their output.
+    """
+    if _invisible_replaced(content, "") == content:
+        return set()
+    return set(scan_outbound(content).detected) | scan_outbound_normalised(content)
+
+
 # Credential shapes a redactor can cut out in place. Location-style patterns
 # (private IPs, home paths, localhost ports) are not secrets and are left as is;
 # card numbers need a checksum, not a regex, so they are never redacted here.

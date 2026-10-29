@@ -19,6 +19,7 @@ from genesis.modules.external.config import IPCConfig
 from genesis.security.output_scanner import (
     LOCATION_FINDINGS,
     redact_credentials,
+    scan_diagnostic_controls,
     scan_outbound_normalised,
 )
 
@@ -59,6 +60,9 @@ def _scrubbed_cut(text: object, *, tail: bool) -> str:
     if not isinstance(text, str) or not text:
         return ""
     try:
+        # Redaction can erase the prefix needed to detect a control-split suffix.
+        if scan_diagnostic_controls(text) - LOCATION_FINDINGS:
+            return "<withheld: unredactable content>"
         scrubbed, _ = redact_credentials(text)
         leftover = scan_outbound_normalised(scrubbed) - LOCATION_FINDINGS
     except Exception:

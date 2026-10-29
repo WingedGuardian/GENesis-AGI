@@ -800,6 +800,45 @@ async def test_codex_tail_shape_never_reaches_the_detail(db, monkeypatch):
     assert "A" * 20 not in detail
 
 
+@pytest.mark.parametrize("output_kind", ["stderr", "stdout", "result", "exit-zero"])
+@pytest.mark.asyncio
+async def test_control_split_suffix_never_reaches_adapter_or_monitor(db, monkeypatch, output_kind):
+    from unittest.mock import AsyncMock, patch
+
+    from genesis.modules.external.config import IPCConfig
+    from genesis.modules.external.ipc import SshIPCAdapter
+
+    secret = "sk-" + "A" * 30 + "\r" + "B" * 40
+    structured = json.dumps({
+        "type": "result", "is_error": True, "result": secret,
+        "api_error_status": 401, "terminal_reason": "api_error",
+    })
+    stdout = secret if output_kind == "stdout" else structured
+    stderr = secret if output_kind == "stderr" else "auth failed"
+    proc = AsyncMock()
+    proc.communicate.return_value = (stdout.encode(), stderr.encode())
+    proc.returncode = 0 if output_kind == "exit-zero" else 1
+    adapter = SshIPCAdapter(IPCConfig(method="ssh", ssh_host="fixture.invalid"))
+    with patch("genesis.modules.external.ipc.asyncio.create_subprocess_exec", return_value=proc):
+        adapter_result = await adapter.send("dispatch", data={"prompt": "fixture"}, method="CC")
+    if output_kind != "exit-zero":
+        assert "B" * 20 not in json.dumps(adapter_result)
+        assert adapter_result["exit_code"] == 1
+        if output_kind != "stdout":
+            assert adapter_result["stdout"] == "<omitted: structured result parsed; see result_text>"
+    _cfg(monkeypatch, mode="observe")
+    mon, _ = _mon(db, _FakeModule(probe_result=adapter_result))
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert result.errors == 1
+    assert "B" * 20 not in detail and "A" * 20 not in detail
+    if output_kind != "stdout":
+        assert "withheld" in detail
+        assert "api_status=401" in detail and "reason=api_error" in detail
+    if output_kind != "exit-zero":
+        assert "exit=1" in detail
+
+
 @pytest.mark.asyncio
 async def test_hidden_credential_crossing_the_adapter_cut_never_reaches_the_detail(
     db, monkeypatch

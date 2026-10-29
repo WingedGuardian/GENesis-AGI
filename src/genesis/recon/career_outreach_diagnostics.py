@@ -15,6 +15,7 @@ import re
 from genesis.security.output_scanner import (
     LOCATION_FINDINGS,
     redact_credentials,
+    scan_diagnostic_controls,
     scan_outbound,
     scan_outbound_normalised,
 )
@@ -50,6 +51,10 @@ def scrubbed_excerpt(
     if not isinstance(raw, str) or not raw.strip():
         return None
     try:
+        # Inspect original context before a redacted prefix hides a split suffix.
+        ambiguous = scan_diagnostic_controls(raw) - LOCATION_FINDINGS
+        if ambiguous:
+            return f"{label} withheld (unredactable content: {', '.join(sorted(ambiguous))})"
         # Scrub BEFORE bounding, so a cut cannot split a credential below the
         # scrubber's length floor. Scrub once on the raw text (an assignment is redacted
         # to the end of its line, so line structure matters), then flatten, then scrub
