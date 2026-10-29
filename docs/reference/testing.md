@@ -209,6 +209,31 @@ guardrail (code in the test process could get around it), not a sandbox.
     where CI raises "not found", and a system-level `systemctl` also gets "Failed
     to connect to bus".
 
+### The live closure: tests run without this machine's live state
+
+`tests/_live_closure.py`, armed right after the live fence, takes live state
+paths and endpoints out of the process environment before any test runs, so a
+test behaves as it does on CI. Child processes inherit it.
+
+- `GENESIS_DB_PATH` is set when the plugin is imported, before pytest imports
+  any `tests/test*/conftest.py`, so a module that resolves the database path at
+  import (or as a default argument) binds the closure's file, never the
+  checkout's `data/genesis.db`. Each test then gets its own file
+  (`_isolate_genesis_db_path` in `tests/conftest.py`), the same one the
+  in-process patch returns. If something changes the variable between import
+  and configure, the run says so on stderr and restores it.
+- `GENESIS_PROACTIVE_HOOK_URL` points at a closed port, so a test running the
+  memory hook as a child never posts to the live server.
+- `GENESIS_MCP_LOG_DIR` names a directory that does not exist, so importing the
+  health MCP opens no log in the shared `~/tmp`.
+- A test that sets its own value with `monkeypatch` still wins.
+  `GENESIS_LIVE_E2E=1` changes none of these.
+- The closure's directory is removed at the end of the run; a child that
+  outlives pytest is left with paths that do not exist.
+- Not covered: a reader that builds its own database path instead of
+  resolving `genesis_db_path()`, and a child started with an environment that
+  does not carry these variables.
+
 ## Integration Tests
 
 Integration tests in `tests/integration/` require running external services
