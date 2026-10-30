@@ -1341,6 +1341,11 @@ verified: a8fa35a358bc 2026-10-23
   (ready/blocked_on_trigger/deferred_cold) and DERIVE the hot(`follow_up`)/
   cold(`tabled`) lane, so priority never picks the lane; `blocked_on_trigger`
   requires a `revisit_condition` (nullable column on `follow_ups`).
+  The validator profile instead routes to eligible private user_input_needed
+  CRUD with fixed codex_interactive/NULL-session provenance, retained-key
+  creation replay and conditional update eligibility. It has no dispatch or
+  promotion authority. Dashboard mine/system partition treats codex_interactive
+  as attended alongside foreground_session.
 - GROUNDWORK: v4-parallel-dispatch, v4-surplus-tasks, v4-rate-tracking.
 
 ## 5. Information intake & research
@@ -1534,7 +1539,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
-verified: 74c474c0f 2026-10-24
+verified: 973a0e6 2026-10-30
 ```
 
 The neural monitor includes the non-routing **Fallback** observation, and the
@@ -2246,7 +2251,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 477efb7f7 2026-10-05
+verified: 973a0e6 2026-10-30
 ```
 
 - **Peer-handoff surface (2026-09-26)**: a SessionStart hook
@@ -2547,8 +2552,13 @@ verified: 477efb7f7 2026-10-05
   validator's evidence document by `session_awareness/pr_evidence.py` (a strict
   pydantic model plus a total decision tree), never asserted by the caller — a
   caller-asserted design policed by refusal rules produced documents with no legal
-  verdict twice. Any second writer (an MCP tool is the anticipated one) must go
-  through that module; it lives in `src/` so it can. Only a PASS verdict discharges
+  verdict twice. The health MCP pr_verification_close tool uses that same policy
+  and shared CLI recording helpers, with independent PR and actual merge-commit
+  checks before previews or writes. CLI and MCP use one empty-safe attempt-note
+  formatter; fixture lookup injection stays outside the public MCP schema. Its
+  server-side calibration gate forces preview until operator opt-in, including
+  attempt notes. Real writes use a separate admitted existing-only connection;
+  preview uses SELECTs on the shared handle. Only a PASS verdict discharges
   an obligation; the other verdicts leave the row OPEN and annotate it, so a PR
   nobody could verify says why instead of looking untouched. The one non-obvious
   invariant, because the obvious one is false: a PASS verdict implies the row is
@@ -3683,13 +3693,26 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py]
-verified: 9c2209df8 2026-10-29
+verified: 973a0e6 2026-10-30
 ```
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
 provider/model/outcome. Failed historical attempts render as a warning, not an
 inferred current provider outage. The readiness worker uses the shared
 tool-disabled CC probe without changing its schedule or routing authority.
+
+Fresh dedicated validator-health trackers disable new activity persistence
+before DB attachment, retaining memory metrics and historical provider SELECTs.
+Health instrumentation then has no transaction DB, so it cannot retire another
+operation's pending transaction. Ordinary/default/external health, memory and
+other tracker construction retain their existing defaults. This is not a
+read-only-server or safe hot-toggle claim: explicit reap and job-health fallback
+behavior remain separate. See `docs/reference/codex-validator-writers.md`.
+
+Validator calibration settings validate the tracked base and prospective strict
+overlay before reporting success or writing. Invalid/unreadable configuration
+refuses with a clear message; no overlay is repaired or discarded implicitly.
+Refusing a proposed update preserves a previously valid opt-in.
 
 - **payments/**: the encrypted card vault, virtual cards only.
   `python -m genesis vault init|add|list|retire|migrate|status` (`payments/cli.py`);
@@ -4518,8 +4541,12 @@ verified: c56a621b5 2026-10-24
   then disables processing of Claude's pending plan-bookmark file. Ordinary
   Genesis memory initialization keeps that processing enabled by default.
   The standalone server enforces the `external` or `validator` tool profile
-  during discovery and direct calls. Both currently admit the same health/recall
-  floor; other tool bodies cannot be entered through those MCP processes.
+  during discovery and direct calls. External retains its health/recall floor;
+  validator additionally admits memory_store, eligible private follow-up CRUD
+  and evidence-derived pr_verification_close, gated to preview until calibration
+  opt-in. Middleware scopes the role to each call and resets it on exit.
+  The existing memory pipeline's partial-write limits remain; these profiles
+  add no session lifecycle authority. Other tool bodies remain inadmissible.
   External health initialization skips the LLM router, dispatch queue setup,
   and campaign wiring. Profiles constrain tools, not an operator's host access.
   The separately launched validator can admit one canonical invocation of
@@ -4529,8 +4556,9 @@ verified: c56a621b5 2026-10-24
   existing deployment status tripwire, with bounded collection and scoped SIGTERM
   cancellation through owned-child cleanup. The request CLI sanitizes cancellation;
   these observations are not functional verdicts. Request creation and retirement
-  use the admitted workspace patch path. Verification recording and publication
-  remain GROUNDWORK, and this boundary has no
+  use the admitted workspace patch path. Verification recording is implemented
+  behind the calibration preview gate; publication remains GROUNDWORK. This
+  boundary has no
   activation wiring in the ordinary project configuration. Its dedicated
   launcher must establish private workspace modes and umask before activation.
   In a linked worktree the launcher sets `GENESIS_REPO_ROOT` to
