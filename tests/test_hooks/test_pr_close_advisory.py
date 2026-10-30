@@ -269,6 +269,15 @@ def test_the_note_judges_supersession_by_the_problem_not_the_code():
     assert "judged by the PROBLEM each part solves, never by whether its code" in note
     assert "Code that cannot be rebased or reused is not a reason to retire" in note
     assert "when the problem is still wanted, the disposition is a send-back" in note
+    # Obsolescence is the owner's call, not the session's (closing-session,
+    # "'Obsolete' is the owner's call, not a reviewer's finding"): a note that
+    # let a session self-declare a requirement moot would license the very close
+    # the rule forbids, so the advisory must gate obsolescence on the owner.
+    assert "is the " in note and "OWNER's decision, never the session's" in note
+    assert (
+        "authorization to supersede does not authorize dropping an uncovered "
+        "requirement as moot" in note
+    )
     skill = (
         Path(__file__).resolve().parents[2]
         / ".claude"
