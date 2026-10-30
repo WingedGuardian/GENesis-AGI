@@ -1022,3 +1022,137 @@ async def test_list_open_puts_not_yet_done_after_fail_intent_and_before_untouche
         )
     rows = await verif_crud.list_open(db)
     assert [r["pr_number"] for r in rows] == [100, 102, 101, 103]
+
+
+# ── list_validation_candidates: what a standing validator may pick next ───────
+#
+# Eligibility (owner ruling 2026-10-29): not-yet-done always, never-attempted
+# always, cannot-verify only once its last attempt is older than the re-attempt
+# window, fail-intent never (it is the owner's, not the loop's). Order: tier
+# (not-yet-done, never-attempted, cannot-verify), then NEWEST merge first.
+
+PICK_NOW = "2026-10-20T12:00:00+00:00"
+
+
+async def _attempt(db, n, verdict, at):
+    await verif_crud.record_attempt(db, repo=REPO, pr_number=n, verdict=verdict, note="n", now=at)
+
+
+@pytest.mark.asyncio
+async def test_candidates_rank_not_yet_done_then_untouched_then_old_parked(db):
+    await _open(db, 200, merged="2026-09-01T00:00:00Z")  # not-yet-done, OLDEST
+    await _open(db, 201, merged="2026-09-10T00:00:00Z")  # untouched, older
+    await _open(db, 202, merged="2026-09-20T00:00:00Z")  # untouched, newer
+    await _open(db, 203, merged="2026-09-25T00:00:00Z")  # parked 8 days ago
+    await _attempt(db, 200, "not-yet-done", "2026-10-20T11:59:00+00:00")
+    await _attempt(db, 203, "cannot-verify", "2026-10-12T12:00:00+00:00")
+    rows = await verif_crud.list_validation_candidates(db, now=PICK_NOW)
+    assert [r["pr_number"] for r in rows] == [200, 202, 201, 203]
+    assert [r["tier"] for r in rows] == [0, 1, 1, 2]
+
+
+@pytest.mark.asyncio
+async def test_a_not_yet_done_row_recorded_a_minute_ago_is_still_eligible(db):
+    """No re-attempt delay: the commands that finish it are named and runnable now."""
+    await _open(db, 210)
+    await _attempt(db, 210, "not-yet-done", "2026-10-20T11:59:00+00:00")
+    rows = await verif_crud.list_validation_candidates(db, now=PICK_NOW)
+    assert [r["pr_number"] for r in rows] == [210]
+
+
+@pytest.mark.asyncio
+async def test_a_recently_parked_row_waits_out_the_window(db):
+    await _open(db, 220)
+    await _attempt(db, 220, "cannot-verify", "2026-10-13T12:00:01+00:00")  # 6d 23:59:59 ago
+    assert await verif_crud.list_validation_candidates(db, now=PICK_NOW) == []
+
+
+@pytest.mark.asyncio
+async def test_a_parked_row_exactly_one_window_old_is_eligible(db):
+    await _open(db, 225)
+    await _attempt(db, 225, "cannot-verify", "2026-10-13T12:00:00+00:00")  # exactly 7d
+    rows = await verif_crud.list_validation_candidates(db, now=PICK_NOW)
+    assert [r["pr_number"] for r in rows] == [225]
+
+
+@pytest.mark.asyncio
+async def test_the_window_compares_INSTANTS_not_strings(db):
+    """A `Z` stamp and a `+00:00` stamp for the same instant sort differently as
+    strings; the cut-off must not depend on which spelling a writer used."""
+    await _open(db, 230)
+    await _attempt(db, 230, "cannot-verify", "2026-10-13T11:00:00Z")  # 7d 1h ago
+    rows = await verif_crud.list_validation_candidates(db, now=PICK_NOW)
+    assert [r["pr_number"] for r in rows] == [230]
+
+
+@pytest.mark.asyncio
+async def test_a_failure_is_never_a_candidate_however_old(db):
+    await _open(db, 240)
+    await _attempt(db, 240, "fail-intent", "2026-01-01T00:00:00+00:00")
+    assert await verif_crud.list_validation_candidates(db, now=PICK_NOW) == []
+
+
+@pytest.mark.asyncio
+async def test_a_closed_row_is_never_a_candidate(db):
+    await _open(db, 250)
+    await verif_crud.close_verification(
+        db, repo=REPO, pr_number=250, verdict="pass-mechanical", reason="r", evidence="{}", now=NOW
+    )
+    assert await verif_crud.list_validation_candidates(db, now=PICK_NOW) == []
+
+
+@pytest.mark.asyncio
+async def test_an_unparseable_attempt_time_makes_a_parked_row_ineligible(db):
+    """Unknown age is not 'old enough': the row stays out rather than looping."""
+    await _open(db, 260)
+    await _attempt(db, 260, "cannot-verify", "2026-01-01T00:00:00+00:00")
+    await db.execute(
+        "UPDATE pr_verifications SET last_attempt_at = 'garbage' WHERE pr_number = 260"
+    )
+    await db.commit()
+    assert await verif_crud.list_validation_candidates(db, now=PICK_NOW) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [0, -1])
+async def test_a_sub_one_day_reattempt_window_is_refused(db, bad):
+    with pytest.raises(ValueError):
+        await verif_crud.list_validation_candidates(db, now=PICK_NOW, reattempt_days=bad)
+
+
+def test_the_picker_accounts_for_every_non_closing_verdict():
+    """The picker's vocabulary must not drift from VERDICTS: a new non-closing
+    verdict either joins the candidate map or is excluded on purpose, never
+    silently left unpicked."""
+    non_closing = set(verif_crud.VERDICTS) - set(verif_crud.PASS_VERDICTS)
+    picked = {v for v in verif_crud._CANDIDATE_TIERS if v is not None}
+    assert picked | verif_crud._NEVER_PICKED == non_closing
+    assert not picked & verif_crud._NEVER_PICKED
+    assert picked >= verif_crud._DELAYED_VERDICTS
+
+
+@pytest.mark.asyncio
+async def test_a_naive_now_is_refused_not_a_type_error(db):
+    await _open(db, 265)
+    await _attempt(db, 265, "cannot-verify", "2026-01-01T00:00:00+00:00")
+    with pytest.raises(ValueError, match="timezone"):
+        await verif_crud.list_validation_candidates(db, now="2026-10-20T12:00:00")
+
+
+@pytest.mark.asyncio
+async def test_candidates_before_the_migration_are_empty_not_an_error(bare_db):
+    assert await verif_crud.list_validation_candidates(bare_db, now=PICK_NOW) == []
+
+
+@pytest.mark.asyncio
+async def test_candidates_before_the_verdict_columns_treat_every_open_row_as_untouched(tmp_path):
+    """The ten-column upgrade window: no verdict column means no attempt was ever
+    recordable, so every open row is never-attempted (tier 1), newest first."""
+    async with aiosqlite.connect(str(tmp_path / "v1.db")) as conn:
+        conn.row_factory = aiosqlite.Row
+        await MIG.up(conn)
+        await conn.commit()
+        await _open(conn, 270, merged="2026-09-01T00:00:00Z")
+        await _open(conn, 271, merged="2026-09-02T00:00:00Z")
+        rows = await verif_crud.list_validation_candidates(conn, now=PICK_NOW)
+    assert [(r["pr_number"], r["tier"]) for r in rows] == [(271, 1), (270, 1)]

@@ -68,6 +68,26 @@ async def test_until_date_bounds_the_search_window():
 
 
 @pytest.mark.asyncio
+async def test_fields_default_to_the_pulse_set():
+    run = _fake_runner({"pr": (0, "[]", "")})
+    await gh.list_merged_prs(since_date="2026-07-09", repo="o/r", runner=run)
+    argv = run.calls[0]
+    assert argv[argv.index("--json") + 1] == gh.PR_FIELDS
+
+
+@pytest.mark.asyncio
+async def test_a_caller_can_ask_for_other_fields():
+    """The validation picker needs mergeCommit, which the pulse set lacks; it asks
+    for it instead of widening every pulse call."""
+    run = _fake_runner({"pr": (0, "[]", "")})
+    await gh.list_merged_prs(
+        since_date="2026-07-09", repo="o/r", fields="number,mergedAt,mergeCommit", runner=run
+    )
+    argv = run.calls[0]
+    assert argv[argv.index("--json") + 1] == "number,mergedAt,mergeCommit"
+
+
+@pytest.mark.asyncio
 async def test_explicit_repo_skips_resolve():
     run = _fake_runner({"pr": (0, "[]", "")})
     out = await gh.list_merged_prs(since_date="2026-07-09", repo="o/r", runner=run)
