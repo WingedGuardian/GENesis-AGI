@@ -1,12 +1,21 @@
 # Codex validator action boundary
 
+Validator role policy refuses every shell command containing literal `<<`,
+including arithmetic shifts and quoted mentions, and commands containing BOTH
+literal `#` and backslash, including harmless quoted examples. Use an
+editor-created data body file and the scanned filer instead. These owner-approved
+restrictions avoid relying on incomplete heredoc/comment extraction for denial;
+ordinary client profiles keep
+their existing behavior. Arbitrary program/file execution remains outside the
+command-string guard boundary.
+
 ## Interactive guard adapter (inactive)
 
 `scripts/hooks/codex-validator-adapter` is a separate adapter for the planned
 interactive validator profile. It does not replace the sealed request boundary
 below, change ordinary Codex configuration, start a session, or admit new MCP
-writers. Role-specific publishing, service and store policy and launcher trust
-preflight are separate dependencies; this adapter alone is not an activated
+writers. It includes the validator-only named-operation policy described below;
+launcher trust preflight remains a separate dependency. This adapter alone is not an activated
 validator.
 
 Every Bash command must begin with this exact foreground opener and a literal
@@ -22,7 +31,7 @@ The former `cd /directory && command` format is refused: a later background
 operator can run that entire AND-list in a subshell, leaving following commands
 in the original directory. The newline completes the directory change before
 the body runs; a failed directory change exits before the body. Later directory
-changes still need the existing guards' handling and the planned role policy.
+changes also receive the role policy's operation-directory checks.
 Single or double quoting of a literal directory is supported, without expansion
 or a `--` option. Parent (`..`) components are refused because Bash's logical
 parent resolution can differ from filesystem resolution through a symlink;
@@ -49,14 +58,14 @@ local pushed-branch cache before asking; denial does not imply that no advisory
 or cache state was written. Six original publishing-allowance tests retain
 direct evidence with zero adapter credit; a separate independent-state proof
 checks the real ask/refusal and cache effects. Existing ask suppression remains
-authoritative. The later role policy owns unconditional validator push denial.
+authoritative. The role policy independently denies every validator Git push.
 
 GraphQL file inputs have a separate accepted limitation: the push guard trusts
 `@query` and `--input` bodies only in a single-step command. The mandatory anchor
 therefore makes even a read-only GraphQL file request refuse, including with an
 absolute filename. Ordinary `gh` read commands and REST GET remain the planned
 read paths where available. An inline `-f query=...` is not a validator-role
-workaround: the planned role policy prohibits those field flags. This restriction
+workaround: the role policy prohibits those field flags. This restriction
 does not affect message body files passed to the authorized scanned filer.
 
 Patches use their native cwd for relative paths; they are never rebased into a
@@ -115,6 +124,82 @@ historical provider reads while disabling new persisted tool metrics and the
 instrumentation transaction boundary on its shared handle. Other clients keep
 their defaults. This does not make the full server read-only; see
 `codex-validator-writers.md` for the owned-writer and remaining fallback limits.
+
+## Validator-only operation policy
+
+Assignment-only shell commands apply their HOME context before redirect checks.
+An actual command or wrapper keeps the shell's pre-command redirect context;
+the canonical parser supplies the distinction without changing ordinary callers.
+
+The interactive adapter invokes `validator_role_guard.py` only for Bash calls.
+Ordinary Codex and Claude configurations do not acquire this policy. Git,
+GitHub and the Genesis CLI use allowlists, so an operation outside them refuses:
+
+- Git: every push-like publication (`push`, `send-pack`, `subtree push`, `svn`,
+  `p4`) refuses everywhere. Named reads (`status`, `log`, `diff`, `show`,
+  `rev-parse`, `ls-files`, `grep`, `blame` and similar, plus the listing forms
+  of `branch`, `tag`, `remote`, `worktree list`, `stash list`/`show` and
+  `config --get`/`--list`) pass anywhere, unless they carry an option that runs
+  a program or writes a file (`--output`, `-O`/`--open-files-in-pager`,
+  `--ext-diff`) or set configuration other than `color.*` through `-c`,
+  `--config-env` or the command's own `GIT_CONFIG_KEY_*`/`GIT_CONFIG_PARAMETERS`,
+  `GIT_EXTERNAL_DIFF` or pager assignments. Every other verb needs a proven
+  operation repository that is not the main checkout; `clone` and `init` are
+  judged by their destination, after any `-C`. A verb that is not a Git
+  command refuses: Git ignores an alias that would hide a command, so no alias
+  from `-c`, `--config-env`, `GIT_CONFIG_*` or a config file reaches Git.
+- GitHub: only reads pass (`pr`/`issue` view, list, status; `pr` diff and checks;
+  `repo` view and list; `run` view, list and watch; `workflow`, `release` and
+  `gist` view and list; `cache list`; `search`; `status`; `auth status`; `api`
+  GET or HEAD with no fields or input).
+- Genesis CLI, as `python -m genesis` or the `genesis` console script: only its
+  read subcommands pass (`db query`, `eval results`/`datasets`, `handoffs list`,
+  `session-address`, `lessons list`/`sample`, `peers list`, `transcripts
+  status`/`verify`; `transcripts sql` can write files and stays out until #3640
+  is fixed). `python -m genesis.<module>` refuses except the resource
+  governor's `status`, `preflight` and a `run` of a pytest batch, optionally
+  under an outer `timeout`.
+
+It also denies deploys, user-service changes, signals to identified Genesis
+processes, and mutating HTTP requests to ports 5000/6333 on any host, or
+through a `-x`/`--proxy` on those ports: loopback has many spellings, names
+resolve to this machine, and a host-side proxy forwards to the stores from an
+address no local check recognises. Proxy environment variables are not read. A
+guarded command that `xargs` completes from input refuses, because its operation
+is not visible. Public findings use the privacy-scanned filer once that
+capability is available.
+
+The guard consumes the canonical parser's optional occurrence, redirection,
+wrapper-assignment and source-origin facts. Existing parser consumers keep their
+historical Segment output. A redirection uses the shell directory before a
+wrapper's `env -C`; the invoked program uses its wrapper directory. Temporary
+environment assignments reach executed child shells, while argument substitutions
+use the pre-command environment. `case`/other embedded bodies can taint their
+containing scope; actual child shells and substitutions have independent state.
+Later `cd`/`pushd`/`popd` invalidate the affected directory proof. An absolute
+Git `-C` can recover a directory only when filesystem/repository selection is
+otherwise known. Ambiguous cwd-sensitive writes refuse; use a new anchored call
+or a proven absolute operation target.
+
+Direct shell output, and a file `curl` (`-o`) or `wget` (`-O`, `-o`, `-P`)
+saves, cannot target tracked main files, the main checkout's `.git`, the
+qualified guard tree, main `data/`, local Genesis config or top-level database
+sidecars, either client's config, `$CODEX_HOME`, or a `secrets.env` basename.
+Both logical target names and canonical destinations retain protection through
+static root or file symlinks.
+Existing scratch-only patch
+checks cover patches. SQLite calls against protected store paths require an exact
+`file:…?mode=ro` URI, and visible write keywords refuse. Keyword-bearing SQL can
+still be conservatively refused; the sanctioned read-only `genesis db query`
+entrypoint avoids that inherited textual limitation.
+
+This remains a bounded command guard. It does not inspect arbitrary programs,
+shell aliases or functions, SQLite dot-command indirection, sourced SQL/config
+contents, other later stdin, or escape filesystem races or
+hardlink writes. Explicit CLI forms outside its option models may refuse.
+Read commands and proven scratch operations have positive controls; this does
+not claim shell or OS containment. The existing client trust/outer-hook failure
+limitations still apply.
 
 ## Sealed request foundation
 

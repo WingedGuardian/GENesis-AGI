@@ -533,9 +533,15 @@ lock-busy no-op does not prove completion. The fixture also bounds its locker
 readiness wait. These tests use an isolated home and fake provider; they do not
 qualify production indexing or explain a separate first-tick timeout.
 
+Permission-denial fixtures first verify the specific denied role with effective
+IDs. If privilege defeats that premise, only that case skips with its role in
+the reason; ordinary refusal assertions and writable positive controls still
+run. The hot-journal positive case performs real SQLite recovery. Copy-source
+configuration retains its mode-bit contract independently of effective execute
+access, so its positive case also runs when privilege permits execution.
+
 The configuration test suite uses synthetic paths and fixtures. Native staging
 acceptance explicitly opts in to the independently pinned release binary:
-
 ```bash
 GENESIS_TEST_CBM_PINNED_BINARY="$HOME/tmp/codebase-memory-mcp" \
   .venv/bin/pytest tests/test_scripts/test_codebase_managed_config.py

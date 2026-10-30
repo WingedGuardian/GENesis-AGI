@@ -107,7 +107,21 @@ location. Git config, refs and remote availability remain unchanged. Real empty
 and generic-deny child controls must fail the expected ask/cause relation;
 they are instrument controls, not unchanged-source qualification. This composed
 proof adds no native-client case and does not override ask suppression. The
-policy-independent validator push prohibition belongs to the later role guard.
+policy-independent validator push prohibition is enforced by the role guard.
+
+`tests/test_hooks/test_codex_validator_role_native.py` adds role-policy
+qualification on the same pinned version. Its source defines 96 opt-in cases:
+72 direct role checks across twelve operation families and twenty-four full-adapter
+code-mode GitHub, heredoc, hash/escape and assignment-only redirection checks. Each family has an allow, a refusal and a matched no-op
+control on both clients. Direct role fixtures supply the independently fixed
+scratch anchor as the child cwd; the full-adapter arm uses the actual native
+input and adapter translation. Commands use absolute harmless fake executables
+and owned redirection/database fixtures, including in every no-op arm. No live
+service, SQLite write or public post is attempted. Stable root/file aliases are
+owned fixtures; source hashes are captured before those fixture additions.
+Interpret these separately
+from the original 76 adapter controls, and retain both source hashes and actual
+action receipts. Declared cases are not a claim that a particular run passed.
 
 The plugin requires fresh, separate absolute base, receipt and sidecar paths
 under the original `HOME/tmp`, outside the checkout. Before collection it gives

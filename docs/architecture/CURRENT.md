@@ -1538,7 +1538,7 @@ Every surface a human (or host process) talks to Genesis through.
 
 ```yaml subsystem-map
 entry: channels-interfaces
-modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
+modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
 verified: 74c474c0f 2026-10-24
 ```
 
@@ -1869,6 +1869,24 @@ the shared banner is not an assertion about all concurrent sessions.
   restricted `mail`-profile sessions. Sending is NOT here — all sends go
   through the outreach gate (entry 3). Trap: never default a recipient to the
   agent's own address (self-send loop).
+- **live_agent/**: one persistent Claude Code session driven from a program
+  through `claude-agent-sdk` (`LiveAgent`): start-or-steer turns, explicit
+  interrupt, `can_use_tool` permission asks surfaced as approvals that default
+  to deny, and a bounded progress stream (`ProgressSummarizer`, lines ≤500
+  bytes) for a voice front end. It runs the install's pinned `claude`, with
+  Claude Code's own system prompt and every settings source, so it loads hooks,
+  skills and MCP servers like a terminal and registers as an owner foreground
+  session. Phase 0 host: `scripts/live_agent_cli.py`; only the `owner_cli`
+  initiator may call `turn()` until model-initiated turns pass the
+  autonomous-CLI approval gate. Turns the session injects itself
+  (background-task notifications, peer or scheduled messages) still run, as in
+  any terminal session, and each approval line shows the tool input it would
+  run. Traps (measured once each on CLI 2.1.299, 2026-10-22): a
+  `priority: "now"` steer waits for the running tool
+  to finish, then ABORTS the turn (its own result) and runs as the next turn,
+  while `interrupt()` kills the running tool; and a host started inside
+  another Claude Code session must drop that session's identity variables
+  (`PARENT_SESSION_VARS` in the CLI), which the SDK cannot remove.
 - GROUNDWORK: unified-bridge, outreach-pipeline (channels/base.py),
   guardian-dialogue (dashboard health route).
 
@@ -2546,9 +2564,9 @@ verified: c56a621b5 2026-10-24
   most do, because the docs-path exemption discharges rows a validator never
   looked at. `status` means "obligation discharged"; only `verdict` says a
   validator concluded anything. The verdict vocabulary and column names live with
-  the code (`crud/pr_verifications.py`) rather than here, since a four-value set
-  invented before the tool had run once is the kind of detail this map should not
-  be the second copy of. `doc_paths.is_doc_path`
+  the code (`crud/pr_verifications.py`) rather than here, since a five-value set
+  (`not-yet-done` was the fifth, added after the tool had run) is the kind of
+  detail this map should not be the second copy of. `doc_paths.is_doc_path`
   is a pinned duplicate of the merge gate's `_is_doc_path` (`src/` must not
   import `scripts/`), held in parity by
   `tests/test_session_awareness/test_doc_paths.py`.
@@ -2717,7 +2735,8 @@ verified: c56a621b5 2026-10-24
   two import-free hooks inline under a parity test) — this sweep is the WRITER
   its GROUNDWORK note named. Levers: settings domain `ledger_escalation` + env
   `GENESIS_LEDGER_ESCALATION_DISABLED`; `escalate_added_by` is a provenance
-  allow-list, foreground-only by default so the ambient extractor's PROPOSALS
+  allow-list, `foreground` + `relayed` (the owner's request written by a
+  dispatched session) by default, so the ambient extractor's PROPOSALS
   cannot ask the owner to dispose of something nobody committed to.
   **Trap: it must never write `session_ledger`** — an evidence write would bump
   `updated_at` and read as a disposition the owner never made, i.e. the sweep
@@ -3266,6 +3285,30 @@ verified: 3e27b4794 2026-10-23
   policy, initiative, or G/H/B/C runtime-parity result. No production entry point
   is added. See `docs/reference/headlong-offline-controls.md`. This stamp refresh
   covers this developer-evaluation slice, not a new audit of the whole subsystem.
+- **Contained native action port**: the same opt-in CI image also qualifies real
+  Claude Code through the public Agent SDK against a loopback scripted backend.
+  Its MCP tool invokes actual canonical proposal claims and a fixed disposable
+  effect. Eleven expected cells and a separate handler-error instrument control
+  require native completion plus independent committed-state/artifact checks.
+  Integrated success requires the actual contained report. No production provider,
+  inference, B/C orchestration or Codex parity is added. See
+  `docs/reference/headlong-native-action-port.md`.
+- **Contained Headlong reference redaction**: a separate B-only derived source
+  preserves controller-issued references through generic card masking while
+  retaining other secret rules and rejecting reference loss/boundary conflicts.
+  Independently runnable contained controls compare pinned/adapted sanitizers;
+  this adds no production provider or native monolith qualification. See
+  `docs/reference/headlong-reference-redaction.md`.
+- **Native monolith probe**: opt-in contained B1 experiment replaces only the
+  pinned monolith invocation, retaining outer context/probe/backoff/wake code.
+  Thirteen cases/fifteen wakes/thirteen native sessions plus reader correlations
+  require actual state, bytes, run attribution, context and pacing evidence.
+  Integration requires its actual post-review CI report. Tiered memory is off,
+  deterministic related context remains on, and only the protected MCP effect is
+  exposed; no full runtime, dispatcher or capability parity follows. See
+  `docs/reference/headlong-native-monolith.md`.
+  The reference-redaction prerequisite retains issued IDs; explicit conflicts
+  stop before SDK execution and preserve existing timer/reactive pacing.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).
@@ -3644,7 +3687,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py]
-verified: c56a621b5 2026-10-24
+verified: 9c2209df8 2026-10-29
 ```
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
@@ -3895,6 +3938,14 @@ behavior remain separate. See `docs/reference/codex-validator-writers.md`.
   before draining); `DeferredWorkQueue` priorities + staleness policies;
   dead-letter replay. The `dream_synthesis_slice` worklist is deliberately
   excluded from the backlog alarm (drift-guard test pins it).
+  `StatusFileWriter` gathers runtime/DB data on-loop, then publishes immutable
+  JSON through one ordered executor job. Cancellation cannot release publication
+  admission before the actual file worker finishes. Runtime shutdown cancels the
+  minute writer loop and drains its publication before DB teardown, including
+  partial bootstrap. The status timestamp describes the collected snapshot, not
+  delayed publication; this keeps watchdog freshness checks truthful. This
+  protects event-loop responsiveness during slow status-file I/O; it does not
+  establish recovery of an independent SSH transport or shared storage.
   `NetworkSentinel` (`network_sentinel.py`) probes the open internet (DNS+TCP to
   public anchors) on a cadence and publishes a 3-state `network` axis
   (NORMAL/DEGRADED/OFFLINE) with asymmetric hysteresis — it OWNS its hysteresis
@@ -4222,10 +4273,12 @@ behavior remain separate. See `docs/reference/codex-validator-writers.md`.
   count there, one anywhere else (the rebuild having moved nothing) `holds`. A "merging"
   row on `live` whose record update.sh already dropped (it adopted the tip,
   own_head is that tip) is judged the same way toward own_head, so a rollback
-  killed partway after adoption is caught too. The remedy follows HEAD: at the
-  tag, put the paths back and Dismiss; at the update's new code (main's merge
-  or the rebuilt tip), put them back and finish with `--post-merge`
-  (Dismissing there leaves code bootstrap never ran on). The dashboard's progress poll returns the guard's remedy
+  killed partway after adoption is caught too. The remedy follows HEAD: on a
+  live row at the tag, the repair (`scripts/deploy_candidates repair-move`,
+  below), then the by-hand steps for when its kit is not installed; at the update's new code (main's merge or the rebuilt tip), put the
+  paths back and finish with `--post-merge` (Dismissing there leaves code
+  bootstrap never ran on); a main row at the tag keeps the by-hand text (save,
+  restore, Dismiss). The dashboard's progress poll returns the guard's remedy
   (`guard_remedy`) and the update card shows it. `deploy_code_only.sh` and the live engine refuse to
   restart or move the checkout while it guards; a plain `update.sh` exits 5
   (before tagging or writing anything), and the dashboard's `/apply` answers
@@ -4315,6 +4368,67 @@ behavior remain separate. See `docs/reference/codex-validator-writers.md`.
   the exit code agree. Otherwise the run exits 1 and leaves no
   `update_refused.json`.
   The rebuilt tip is recorded in the "merging" row as soon as it is adopted.
+  **The live-move repair** (`scripts/lib/live_move_repair.py`, #3492 PR D1;
+  `scripts/deploy_candidates repair-move [--wait N] [--dismiss TS] [--explain]`
+  runs the copy bootstrap installs under `~/.genesis/lib/live-repair/current`,
+  never the checkout's; installing that kit, and running the repair at every
+  server start, is PR D2, not yet built; `--explain` needs no kit: with none
+  installed it runs the module as HEAD committed it, from memory, never the
+  working tree's copy, which may itself be half-written) heals a live row's `mixed_tree`
+  with HEAD at the rollback tag, toward the tag, never toward the target (HEAD
+  at the target, a rollback killed partway, is refused with exit 1 and nothing
+  changed: finishing that rollback is a later PR, D1f): under update.lock and
+  genesis-checkout.lock (every git lock a killed switch leaves, `index.lock`,
+  `HEAD.lock`, the branch's ref lock and `packed-refs.lock`, is waited for while
+  a process holds it, then saved into the backup's `git/` and removed by one
+  step, on every path that ends healed; a same-user process whose open files
+  cannot be read counts as a holder only if it is a git or the lock is under
+  30 s old, so a non-git process that cannot be inspected and holds a lock
+  longer than that has it judged stale), every path of the two-dot diff, plus
+  a symlink or non-directory parent of one (nothing is read or removed through
+  such a parent), plus every index entry under one of those and every index
+  entry above one (a file entry `sub` where the tag has `sub/`; restoring a
+  path drops them; a directory holding a foreign one is foreign too), that is not
+  at the tag's bytes is COPIED to
+  `~/.genesis/deploy-backups/<ts>-live-move-repair/` (with `REPAIR.json`,
+  fsynced, and the new directory's entries in `deploy-backups` and the
+  Genesis home fsynced too; a directory row is copied whole, and a row inside
+  it points into that copy; `.git/index` is copied byte for byte as `git/index`)
+  before anything changes, then restored with `git restore
+  --source=<tag>`. A torn index (its trailing checksum fails: git reads it
+  unchecked, then cannot write it back) is rebuilt from the tag after that
+  copy, and the result says so. Permission bits other than the executable
+  bit are not saved: git does not track them, and a restore gives them the
+  umask's, as any checkout does. A path holding what the update did not write (another
+  edit, a flag, a staged or unmerged entry, a gitlink, a directory symlink
+  inside a target directory, a FIFO, socket or device) is still saved and
+  restored, and reported with its exact re-apply step: a foreign index
+  entry's blob is saved under `index-blobs/` and written back by the step
+  before one atomic NUL-delimited `update-index -z --index-info` call; both
+  flags of an `s` entry are restored; a FIFO is made again (`mkfifo -m`);
+  a socket or device holds nothing to save and is recorded by type and mode
+  and reported as removed. Steps run parents first; a row re-adding an index
+  entry first drops the entries the restore put below it; a row the repair
+  saw beyond a symlinked or non-directory parent (`unreachable_through`) gets
+  only its index state back, so no step acts through a link it restores. A failure before the checkout itself changes (a
+  failed backup included) exits 0 at `--boot`. The guard then judges
+  again and only its SAFE removes the state (byte-identical re-read); `guards`
+  or `holds` (an edit off the move's paths) keeps it, its result naming the
+  restore before what still holds, and exits 0; a kept "partial" record is
+  rewritten "moving" (same byte-identical check), so the guard then reads it
+  `holds`, not `mixed_tree` again; anything
+  else is `unresolved` (exit 1). A target whose objects are
+  gone (its root tree, or any subtree or blob classification reads) is healed
+  by the whole tree against HEAD and cleared by a clean-tree
+  check. A main row is out of scope (exit 3; 0 at `--boot`). The engine
+  writes its merges with `core.fsync=committed`. Each repair prints its report
+  (re-apply steps included) and queues an alert (critical when anything was
+  not the update's, the index was torn, or it did not heal); `REPAIR.json`
+  and `manifests()` are the contract its readers (deploy health, the
+  awareness check, the guardian's diagnosis) read, and those readers arrive
+  in a follow-up PR: until then the command output and the alert carry the
+  report. A run killed after its restore and before its result leaves no
+  result; the next run removes a healed state without a new backup.
   `--post-merge` on `live` never runs the engine. What is recorded and sent to
   the host guardian is the origin/main commit `live` is built on.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;
@@ -4329,7 +4443,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 3e27b479 2026-10-23
+verified: c56a621b5 2026-10-24
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -4401,8 +4515,12 @@ verified: 3e27b479 2026-10-23
   scratch roots, translates asks
   to denials and preserves advisories. Six source-bound publishing-allowance
   tests retain direct evidence only; separate independent-state controls verify
-  the actual ask/refusal and existing push-cache effects. It has no ordinary configuration wiring
-  or role-specific publishing/store policy yet. See
+  the actual ask/refusal and existing push-cache effects. Its Bash-only role
+  guard independently blocks publication, main checkout moves, named live
+  service/store writes and protected output paths. Canonical optional parser
+  facts retain wrapper, assignment, source-scope and occurrence identity without
+  changing existing Segment consumers. Ordinary configuration and launcher
+  activation remain separate. See
   `docs/reference/codex-validator-boundary.md`.
   Codex has a separate external-client adapter in `.codex/config.toml`: it
   starts the existing standalone health and memory MCP servers through a
@@ -4438,6 +4556,12 @@ verified: 3e27b479 2026-10-23
   creating a charter, or joining Genesis foreground/background lifecycle
   management. Recall remains read-oriented rather than side-effect-free: its
   normal retrieval-use metadata may still be updated.
+  `file_tracker_issue.py --comment-on` adds privacy-scanned issue/PR timeline
+  comments through the existing tracker/snapshot pipeline. It submits once and
+  reconciles uncertain outcomes by exact-body reads, never an automatic retry.
+  `.agents/skills/validating-merges` links to the canonical skill with explicit
+  Codex MCP mapping, no lifecycle enrollment and no deploy/fix/push/merge rules.
+  Discovery alone does not qualify or activate the dedicated validator.
   The same project configuration exposes 15 explicitly named GitNexus tools
   through `.claude/mcp/run-gitnexus`, reusing the existing installed-version and
   Node pin checks. It adds no Genesis writers or lifecycle integration. GitNexus

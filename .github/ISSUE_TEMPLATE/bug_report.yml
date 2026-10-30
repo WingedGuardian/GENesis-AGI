@@ -28,6 +28,23 @@ body:
         - Python: 3.12
         - Genesis version: v3.0a2
   - type: textarea
+    id: verification
+    attributes:
+      label: Verification
+      description: |
+        Help us confirm the bug is in Genesis and not in the setup around it. A short line each is enough.
+        1. Reproduced: how, and on which version or commit?
+        2. Evidence: the exact command or action, and what it printed.
+        3. Ruled out on your side: a typo or misuse, local configuration, an out-of-date install, expired credentials.
+        4. Searched: no existing issue for this, and no newer version that already fixes it.
+        5. Expected vs actual.
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+        4. ...
+        5. ...
+  - type: textarea
     id: logs
     attributes:
       label: Relevant logs

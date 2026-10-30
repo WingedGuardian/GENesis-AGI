@@ -56,7 +56,9 @@ different SESSION TYPES, not two phases of one session's life** (user decision,
   surface, as a public issue. The `devin-ready` label hands it over and starts a
   paid session, so a session applies it only after the owner explicitly approves
   that issue in conversation. Once approved, the session applies the label itself;
-  the owner does not apply it by hand.
+  the owner does not apply it by hand. Run `python3 scripts/premise_gate.py check
+  <issue>` first and apply the label only when it exits 0 (premise-check.md,
+  "Check before applying the label").
   Its PRs join the same queue (closing-session, "Devin-built PRs").
 
 The handoff between them is **the PR itself** (why the two are split, and the
