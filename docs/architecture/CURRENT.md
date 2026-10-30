@@ -3315,6 +3315,12 @@ verified: 3e27b4794 2026-10-23
   replacing their predicates. The reused bridge has closed fixture source
   attribution (`monolith` default or `ego-owned-loop`) on all native records;
   this adds no C loop or new proposal authority.
+- **Offline C1 journal state**: `scripts/ci/ego_owned_state.py` reuses Campaign
+  for immutable manifest, intake, prepared/bound attempt and observation records.
+  External cursor, generated timer ordinals, pacing/retry and related-memory
+  pointers replay from that private journal; unresolved attempts stop automatic
+  replay. This is state machinery with host-safe tests, not a runnable/native C
+  qualification or a production runtime. See `docs/reference/ego-owned-loop.md`.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).
