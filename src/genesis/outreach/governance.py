@@ -172,6 +172,11 @@ class GovernanceGate:
                 checks_passed=["morning_report_dedup"],
             )
 
+        # Keyed on the typed envelope, not the channel name: a caller can name the
+        # "agent" channel without being a peer message (delivery refuses that one).
+        if request.peer_envelope is not None:
+            return await self._check_peer(request)
+
         passed: list[str] = []
         failed: list[str] = []
 
@@ -368,11 +373,63 @@ class GovernanceGate:
 
         return False
 
+    async def _check_peer(self, request: OutreachRequest) -> GovernanceResult:
+        """A message to an enrolled peer agent. Salience, quiet hours and the daily
+        budgets ration the OWNER's attention, which a machine-to-machine message
+        does not spend, so none of them apply. Duplicate suppression stays (the
+        scheduler closes a queued retry on a ``dedup`` failure), and a per-peer
+        daily cap stops a loop from flooding the peer."""
+        passed: list[str] = []
+        failed: list[str] = []
+        if await self._is_duplicate(request):
+            failed.append("dedup: similar outreach sent recently")
+        else:
+            passed.append("dedup")
+        peer = request.peer_envelope.peer_id
+        cap = self._config.agent_daily_per_peer
+        sent = await self._peer_sent_today(peer)
+        if sent is None:
+            failed.append("peer_daily_cap: could not count today's messages to this peer")
+        elif sent >= cap:
+            failed.append(f"peer_daily_cap: {cap}/day to this peer reached")
+        else:
+            passed.append("peer_daily_cap")
+        if failed:
+            return GovernanceResult(
+                verdict=GovernanceVerdict.DENY,
+                reason="; ".join(failed),
+                checks_passed=passed,
+                checks_failed=failed,
+            )
+        return GovernanceResult(
+            verdict=GovernanceVerdict.ALLOW,
+            reason="peer message: dedup and per-peer cap passed",
+            checks_passed=passed,
+        )
+
+    async def _peer_sent_today(self, peer: str) -> int | None:
+        """Messages delivered to ``peer`` since UTC midnight, from the peer outbox
+        (one row per delivered message). None when the count cannot be read: the
+        cap then refuses rather than reading an unknown count as zero."""
+        try:
+            cursor = await self._db.execute(
+                "SELECT COUNT(*) FROM peer_outbox WHERE peer_id = ? AND created_at >= date('now')",
+                (peer,),
+            )
+            row = await cursor.fetchone()
+        except aiosqlite.Error:
+            logger.warning("peer outbox count unavailable for %s", peer, exc_info=True)
+            return None
+        return row[0] if row else 0
+
     async def _within_rate_limit(self) -> bool:
+        # Peer (agent-channel) deliveries spend no owner attention: they have
+        # their own per-peer cap and never consume the owner's daily budget.
         cursor = await self._db.execute(
             "SELECT COUNT(*) FROM outreach_history "
             "WHERE delivered_at IS NOT NULL "
             "AND category NOT IN ('blocker', 'alert') "
+            "AND channel IS NOT 'agent' "
             "AND delivered_at >= date('now')",
         )
         row = await cursor.fetchone()
@@ -400,6 +457,7 @@ class GovernanceGate:
         cursor = await self._db.execute(
             "SELECT COUNT(*) FROM outreach_history "
             "WHERE category = 'notification' AND delivered_at IS NOT NULL "
+            "AND channel IS NOT 'agent' "
             "AND delivered_at >= date('now')",
         )
         row = await cursor.fetchone()

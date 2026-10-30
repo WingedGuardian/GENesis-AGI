@@ -1,0 +1,8 @@
+# Opt in privately in ~/.genesis/config/transcript_analytics.local.yaml.
+enabled: false
+scope: all
+ram_pct: 25
+cpu_pct: 25
+ram_bytes: null
+evidence_records: 5
+evidence_bytes: 65536

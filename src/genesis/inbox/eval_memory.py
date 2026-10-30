@@ -57,6 +57,20 @@ class EvalMemory:
     confidence: float
 
 
+@dataclass(frozen=True)
+class EvalMemoryOutcome:
+    """Outcome of one ``extract_and_store_eval_memories`` run.
+
+    ``status`` is "stored" | "empty" | "skipped" | "failed"; ``reason`` is the
+    machine-readable cause ("" for stored/empty without one).
+    """
+
+    status: str
+    reason: str
+    extracted: int  # entries that survived parsing
+    stored: int  # memories actually stored
+
+
 _PROMPT_TEMPLATE = """\
 You are the deterministic knowledge extractor for Genesis's inbox. Below is a \
 COMPLETED inbox-evaluation response (per-item analysis plus a Recommendation \
@@ -98,26 +112,26 @@ def build_eval_memory_prompt(evaluation_text: str, *, source_name: str) -> str:
     )
 
 
-def parse_eval_memory_response(text: str) -> list[EvalMemory]:
-    """Fail-closed parse of the extractor response.
+def _parse_eval_memory_array(text: str) -> list[EvalMemory] | None:
+    """Parse the extractor response.
 
-    Never raises. Returns ``[]`` on any structural deviation; drops individual
-    entries with an invalid kind, empty content, or bad shape; caps the list at
-    ``MAX_EVAL_MEMORIES``.
+    Returns ``None`` on a structural failure (no ``[...]`` array, invalid JSON,
+    top level not a list) so the caller can distinguish "unparseable" from
+    "valid empty"; otherwise returns a list (possibly empty).
     """
     if not text:
-        return []
+        return None
     try:
         cleaned = _FENCE_RE.sub("", text.strip())
         start = cleaned.find("[")
         end = cleaned.rfind("]")
         if start < 0 or end <= start:
-            return []
+            return None
         arr = json.loads(cleaned[start : end + 1])
         if not isinstance(arr, list):
-            return []
+            return None
     except Exception:
-        return []
+        return None
 
     out: list[EvalMemory] = []
     for item in arr[:MAX_EVAL_MEMORIES]:
@@ -150,6 +164,16 @@ def parse_eval_memory_response(text: str) -> list[EvalMemory]:
     return out
 
 
+def parse_eval_memory_response(text: str) -> list[EvalMemory]:
+    """Fail-closed parse of the extractor response.
+
+    Never raises. Returns ``[]`` on any structural deviation; drops individual
+    entries with an invalid kind, empty content, or bad shape; caps the list at
+    ``MAX_EVAL_MEMORIES``.
+    """
+    return _parse_eval_memory_array(text) or []
+
+
 async def extract_and_store_eval_memories(
     *,
     db,
@@ -158,19 +182,20 @@ async def extract_and_store_eval_memories(
     evaluation_text: str,
     source_files: list[str],
     session_id: str | None = None,
-) -> int:
+) -> EvalMemoryOutcome:
     """Extract durable insights from an inbox eval's OUTPUT and store them.
 
-    Returns the number of memories stored. Never raises past itself — the caller
-    runs this as a detached task that must never affect the batch/baseline.
-    Each stored memory carries the eval-specific tag semantics (``user_signal``
-    or ``architecture_insight``), ``source="inbox_evaluation"``, and external-
-    untrusted provenance, mirroring the removed agent Step-4 path.
+    Returns an ``EvalMemoryOutcome`` describing the run. Never raises past
+    itself — the caller runs this as a detached task that must never affect
+    the batch/baseline. Each stored memory carries the eval-specific tag
+    semantics (``user_signal`` or ``architecture_insight``),
+    ``source="inbox_evaluation"``, and external-untrusted provenance, mirroring
+    the removed agent Step-4 path.
     """
     if os.environ.get(_KILL_SWITCH_ENV) == "1":
-        return 0
+        return EvalMemoryOutcome("skipped", "kill_switch", 0, 0)
     if not evaluation_text or not evaluation_text.strip():
-        return 0
+        return EvalMemoryOutcome("skipped", "empty_input", 0, 0)
 
     # Imported lazily to keep the pure functions above import-light and to avoid
     # a heavy import chain when the feature is disabled/unwired.
@@ -187,16 +212,28 @@ async def extract_and_store_eval_memories(
         )
     except Exception:
         logger.warning("Inbox eval-memory extraction routing failed", exc_info=True)
-        return 0
+        return EvalMemoryOutcome("failed", "route_exception", 0, 0)
     if not getattr(response, "success", False):
         logger.info(
             "Inbox eval-memory extraction: router unsuccessful (%s)",
             getattr(response, "error", "unknown"),
         )
-        return 0
+        return EvalMemoryOutcome("failed", "router_unsuccessful", 0, 0)
 
-    memories = parse_eval_memory_response(response.content or "")
+    content = response.content or ""
+    memories = _parse_eval_memory_array(content)
+    if memories is None:
+        # Response length only — never log untrusted model output content.
+        logger.warning(
+            "Inbox eval-memory extraction: unparseable response (%d chars)",
+            len(content),
+        )
+        return EvalMemoryOutcome("failed", "parse", 0, 0)
+    extracted = len(memories)
+    if extracted == 0:
+        return EvalMemoryOutcome("empty", "", 0, 0)
     stored = 0
+    store_errors = 0
     for mem in memories:
         tags = [mem.kind, *mem.tags]
         confidence = mem.confidence
@@ -227,5 +264,10 @@ async def extract_and_store_eval_memories(
             )
             stored += 1
         except Exception:
+            store_errors += 1
             logger.warning("eval-memory store failed", exc_info=True)
-    return stored
+    if stored:
+        return EvalMemoryOutcome("stored", "", extracted, stored)
+    if store_errors:
+        return EvalMemoryOutcome("failed", "store", extracted, 0)
+    return EvalMemoryOutcome("empty", "all_duplicate", extracted, 0)

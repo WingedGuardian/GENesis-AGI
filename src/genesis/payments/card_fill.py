@@ -171,12 +171,22 @@ TEXTS = {
     "release_timed_out": "No decision arrived in time." + _CANCELLED,
     "checkout_closed": "The payment window closed before the hand-over." + _CANCELLED,
     "browser_closed": "The browser closed or restarted before the hand-over." + _CANCELLED,
-    "page_changed": "The checkout changed while waiting for approval." + _CANCELLED,
+    # After the approval: the billing fields may have been typed by then (never
+    # submitted). Only the first re-check, before any typing, filled nothing.
+    "page_changed": "The checkout changed after approval. The request was cancelled; the "
+    "billing fields may have been typed, but the card was not typed and Add Card and Pay "
+    "were not clicked.",
+    "page_changed:granted": "The checkout changed while waiting for approval." + _CANCELLED,
+    # The billing typing after approval failed (the code names the field and how):
+    # not necessarily a page change.
+    "page_changed:late": "Typing the billing fields after approval did not complete (the "
+    "code names the field and how). The request was cancelled; the card was not typed and "
+    "Add Card and Pay were not clicked.",
     "claim_refused": "The vault refused to hand over the card (reason given)." + _NONE,
     "claim_unanswered": "The vault did not answer the hand-over; a single-use card may now "
     "be spent." + _NONE,
-    "claimed_not_filled": "The checkout changed after the hand-over; nothing was typed and "
-    "Pay was not clicked." + _SPENT,
+    "claimed_not_filled": "The checkout changed after the hand-over; the card was not typed "
+    "and Pay was not clicked (billing fields may have been typed)." + _SPENT,
     "failed_before_pay": "Filling stopped part-way; Pay was NOT clicked and the payment "
     "window was closed." + _SPENT,
     "card_url_before_pay": "Pay was NOT clicked: while the card was typed, the checkout sent "
@@ -253,7 +263,9 @@ class CardArgs:
 
 def result(code: str, host: str = "", **extra) -> dict:
     base = code.split(":", 1)[0]
-    out = {"code": code, "status": TEXTS.get(base, TEXTS["internal_error"]), "host": host}
+    # A code's first two parts can have their own text (``page_changed:granted``).
+    status = TEXTS.get(":".join(code.split(":", 2)[:2])) or TEXTS.get(base)
+    out = {"code": code, "status": status or TEXTS["internal_error"], "host": host}
     reason = extra.get("reason")
     if isinstance(reason, str) and _VAULT_REASON.fullmatch(reason):
         out["reason"] = reason

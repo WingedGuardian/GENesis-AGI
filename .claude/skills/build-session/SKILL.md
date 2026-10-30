@@ -56,18 +56,16 @@ different SESSION TYPES, not two phases of one session's life** (user decision,
   surface, as a public issue. The `devin-ready` label hands it over and starts a
   paid session, so a session applies it only after the owner explicitly approves
   that issue in conversation. Once approved, the session applies the label itself;
-  the owner does not apply it by hand.
+  the owner does not apply it by hand. Run `python3 scripts/premise_gate.py check
+  <issue>` first and apply the label only when it exits 0 (premise-check.md,
+  "Check before applying the label").
   Its PRs join the same queue (closing-session, "Devin-built PRs").
 
-The handoff between them is **the PR itself** — a durable artifact that survives
-compaction and session death, so nothing has to be remembered across the
-boundary. It also satisfies the `reviewer ≠ implementer, fresh context` contract
-structurally rather than by discipline.
-
-Why it matters here: fused, the first item's review loop consumes the whole
-session — several compactions deep — while everything else the owner arrived
-with goes untouched. **Finishing the PR is finishing the work.** Handing it to
-the queue is not abandoning it.
+The handoff between them is **the PR itself** (why the two are split, and the
+worktree that passes with it: closing-session, "Why this session type exists"). Why
+it matters here: fused, the first item's review loop consumes the whole session
+while everything else the owner arrived with goes untouched. **Finishing the PR
+is finishing the work.** Handing it to the queue is not abandoning it.
 
 Two consequences worth internalizing:
 

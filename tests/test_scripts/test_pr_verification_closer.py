@@ -42,6 +42,40 @@ _prv = private_module("pr_verification_under_test", _SCRIPT)
 REPO = "owner/repo"
 OTHER = "owner/fork"
 NOW = "2026-09-20T11:00:00+00:00"
+#: The PR's merge commit as the stubbed GitHub lookup reports it. Every document
+#: below names its first 12 characters, the form a validator usually copies.
+MERGE_SHA = "deadbeef1234" + "0" * 28
+
+
+@pytest.fixture(autouse=True)
+def _no_real_github(monkeypatch):
+    """``close`` resolves the PR's merge commit through gh. No test calls gh for real:
+    the lookup is replaced for every test, and the ones about it replace it again."""
+    calls: list[tuple[str, int]] = []
+
+    def fake(repo: str, pr: int) -> str:
+        calls.append((repo, pr))
+        return MERGE_SHA
+
+    monkeypatch.setattr(_prv, "gh_merge_commit", fake)
+    return calls
+
+
+def _gap(detail: str) -> dict:
+    return {"kind": "method", "detail": detail}
+
+
+EVENT_GAP = {
+    "kind": "event_gated",
+    "detail": "the weekly job has not run since the merge",
+    "trigger": "2026-11-02",
+    "recheck": "python3 scripts/job_runs.py --name weekly --since 2026-11-01",
+}
+UNDONE_GAP = {
+    "kind": "not_yet_done",
+    "detail": "the affected test file was not run",
+    "command": "pytest tests/test_example.py",
+}
 
 
 def _doc(**over) -> dict:
@@ -63,7 +97,7 @@ def _doc(**over) -> dict:
             }
         ],
         "controls": ["without the override the armed path is taken instead"],
-        "scope_limits": [],
+        "gaps": [],
         "findings": [],
     }
     doc.update(over)
@@ -166,9 +200,10 @@ def test_print_schema_emits_a_document_its_own_validator_shape_accepts(capsys):
         "deploy",
         "claims",
         "controls",
-        "scope_limits",
+        "gaps",
         "findings",
     }
+    assert "scope_limits" not in tpl, "the template must not teach the refused field"
     assert set(tpl["deploy"]) == {"method", "established", "detail"}
     assert set(tpl["claims"][0]) == {"claim", "verdict", "tier", "measurement"}
     assert "repo" in tpl, (
@@ -176,6 +211,12 @@ def test_print_schema_emits_a_document_its_own_validator_shape_accepts(capsys):
         "a template missing it hands them a document validate_evidence refuses"
     )
     assert set(tpl["findings"][0]) == {"summary", "disposition"}
+    # One example per gap kind, and each example is itself a gap the model accepts.
+    from genesis.session_awareness import pr_evidence as pe
+
+    assert sorted(g["kind"] for g in tpl["gaps"]) == sorted(pe.GAP_KINDS)
+    for gap in tpl["gaps"]:
+        assert _prv.validate_evidence(_doc(gaps=[gap])) is not None
 
 
 # ── evidence shape ───────────────────────────────────────────────────────
@@ -198,7 +239,9 @@ def test_a_well_formed_document_validates():
         ({"claims": []}, "claims"),
         ({"claims": "nope"}, "claims"),
         ({"controls": "nope"}, "controls"),
-        ({"scope_limits": {}}, "scope_limits"),
+        ({"scope_limits": []}, "scope_limits"),
+        ({"gaps": {}}, "gaps"),
+        ({"gaps": ["a plain string"]}, "gaps[0]"),
         ({"findings": "nope"}, "findings"),
     ],
 )
@@ -311,7 +354,7 @@ def test_measured_gaps_closes_when_something_WAS_established(tmp_path):
     ``pass-with-measured-gaps`` means and it still closes the row."""
     db = tmp_path / "genesis.db"
     _seed(db)
-    doc = _doc(scope_limits=["the no-graph-engine path needs another install"])
+    doc = _doc(gaps=[_gap("the no-graph-engine path needs another install")])
     doc["claims"].append(
         {
             "claim": "it degrades cleanly where no graph engine is installed",
@@ -332,7 +375,7 @@ def test_the_floor_rejects_a_tier_that_establishes_nothing(tmp_path, tier):
     enters permanent record in the grammar of a fact, and a discharged obligation is
     permanent record."""
     _seed(tmp_path / "genesis.db")
-    doc = _doc(scope_limits=["named"])
+    doc = _doc(gaps=[_gap("named")])
     doc["claims"][0]["tier"] = tier
     if tier == "NOT_VERIFIABLE_HERE":
         doc["claims"][0]["verdict"] = "unverified"
@@ -413,7 +456,7 @@ def test_non_utf8_evidence_is_refused(tmp_path, capsys):
 
 def test_an_oversized_document_is_REFUSED_not_truncated(tmp_path, capsys):
     """A truncated evidence record still looks complete, which is worse than none."""
-    doc = _doc(scope_limits=["x" * (_prv.MAX_EVIDENCE_BYTES + 100)])
+    doc = _doc(gaps=[_gap("x" * (_prv.MAX_EVIDENCE_BYTES + 100))])
     rc = _run(tmp_path, doc, "--verdict", "pass-mechanical")
     assert rc == 2
     err = capsys.readouterr().err
@@ -428,8 +471,8 @@ def test_a_pass_closes_the_row_with_its_verdict_and_evidence(tmp_path, capsys, v
     db = tmp_path / "genesis.db"
     _seed(db)
     # measured-gaps REQUIRES named gaps; mechanical must not need them.
-    gaps = ["the no-engine path is unreachable here"] if verdict.endswith("gaps") else []
-    assert _run(tmp_path, _doc(scope_limits=gaps), "--verdict", verdict) == 0
+    gaps = [_gap("the no-engine path is unreachable here")] if verdict.endswith("gaps") else []
+    assert _run(tmp_path, _doc(gaps=gaps), "--verdict", verdict) == 0
     assert "CLOSED" in capsys.readouterr().out
     row = _row(db)
     assert row["status"] == "closed"
@@ -509,7 +552,7 @@ def test_an_already_closed_row_cannot_be_rewritten(tmp_path, capsys):
     first = _row(db)
     rc = _run(
         tmp_path,
-        _doc(merge_commit="different", scope_limits=["a gap"]),
+        _doc(merge_commit="different", gaps=[_gap("a gap")]),
         "--verdict",
         "pass-with-measured-gaps",
     )
@@ -641,10 +684,11 @@ def test_a_lost_attempt_race_is_reported_and_exits_1(tmp_path, capsys, monkeypat
     assert "missing" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("gaps", [[""], ["   "]])
-def test_blank_gap_entries_do_not_satisfy_the_floor(tmp_path, gaps):
+@pytest.mark.parametrize("detail", ["", "   "])
+def test_blank_gap_entries_do_not_satisfy_the_floor(tmp_path, detail):
     _seed(tmp_path / "genesis.db")
-    assert _run(tmp_path, _doc(scope_limits=gaps), "--verdict", "pass-with-measured-gaps") == 2
+    doc = _doc(gaps=[_gap(detail)])
+    assert _run(tmp_path, doc, "--verdict", "pass-with-measured-gaps") == 2
 
 
 # ── the document's own contract (round 1, cause A) ───────────────────────
@@ -662,7 +706,7 @@ def test_a_document_that_names_no_repo_is_refused(tmp_path, capsys):
     assert "evidence.repo" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("field", ["controls", "scope_limits"])
+@pytest.mark.parametrize("field", ["controls", "gaps"])
 @pytest.mark.parametrize("bad", [[{}], [None], [""], ["   "], [42]])
 def test_the_prose_lists_reject_anything_that_names_nothing(tmp_path, capsys, field, bad):
     """These two lists are tested by the floors with ``str(x).strip()``, so a nested
@@ -748,7 +792,7 @@ def test_an_INFERRED_only_document_still_cannot_CLOSE_a_row(tmp_path, verdict):
     """The other side of the same boundary — fixing the deadlock must not open the
     floor. INFERRED still establishes nothing for the purpose of discharging."""
     _seed(tmp_path / "genesis.db")
-    doc = _inferred(scope_limits=["a named gap"])
+    doc = _inferred(gaps=[_gap("a named gap")])
     assert _run(tmp_path, doc, "--verdict", verdict) == 2
 
 
@@ -836,7 +880,7 @@ def test_the_formerly_DEAD_document_now_closes_with_its_gap_named(tmp_path):
     pass-with-measured-gaps, and the missing control is the named gap."""
     db = tmp_path / "genesis.db"
     _seed(db)
-    assert _run(tmp_path, _doc(controls=[], scope_limits=[])) == 0
+    assert _run(tmp_path, _doc(controls=[], gaps=[])) == 0
     row = _row(db)
     assert (row["status"], row["verdict"]) == ("closed", "pass-with-measured-gaps")
     assert "no negative control" in row["closed_reason"]
@@ -848,7 +892,7 @@ def test_a_document_that_establishes_NOTHING_cannot_close_a_row(tmp_path, capsys
     mismatch, not a closure."""
     db = tmp_path / "genesis.db"
     _seed(db)
-    doc = _all_nvh(scope_limits=["needs a box with no graph engine"])
+    doc = _all_nvh(gaps=[_gap("needs a box with no graph engine")])
     assert _run(tmp_path, doc, "--verdict", "pass-with-measured-gaps") == 2
     assert "derives cannot-verify" in capsys.readouterr().err
     assert _row(db)["status"] == "open"
@@ -954,7 +998,7 @@ def test_the_cap_is_enforced_on_the_bytes_that_get_STORED(tmp_path, capsys):
     """json.dumps(indent=2) re-serialises, so a document that fits on disk can cross
     the cap on the way into the column the cap exists to bound."""
     _seed(tmp_path / "genesis.db")
-    doc = _doc(scope_limits=["a"] * 40000)
+    doc = _doc(gaps=[_gap("a")] * 7000)
     raw = json.dumps(doc)
     inflated = json.dumps(doc, indent=2, sort_keys=True)
     assert len(raw) < _prv.MAX_EVIDENCE_BYTES < len(inflated.encode()), (
@@ -1141,3 +1185,208 @@ def test_a_failure_AFTER_the_commit_reports_committed_not_nothing_recorded(
     assert "the write COMMITTED (CLOSED owner/repo#7 as pass-mechanical)" in err
     assert "Nothing was recorded" not in err
     assert _row(db)["status"] == "closed"
+
+
+# ── typed gaps, end to end (spec 2026-10-27, PR A) ───────────────────────
+
+
+def test_a_not_yet_done_document_stays_open_with_the_command_as_its_note(tmp_path, capsys):
+    """No --note needed: the NOT YET DONE gap is the note, and leads the backlog line."""
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    assert _run(tmp_path, _doc(gaps=[UNDONE_GAP])) == 0
+    row = _row(db)
+    assert (row["status"], row["verdict"]) == ("open", "not-yet-done")
+    assert row["last_attempt_note"] == (
+        "NOT YET DONE — run: pytest tests/test_example.py (the affected test file was not run)"
+    )
+    out = capsys.readouterr().out
+    assert "STAYS OPEN" in out and "run the commands above" in out
+    assert "None" not in row["last_attempt_note"]
+
+
+def test_a_note_on_not_yet_done_is_appended_after_the_commands(tmp_path):
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    assert _run(tmp_path, _doc(gaps=[UNDONE_GAP]), "--note", "session ended") == 0
+    assert _row(db)["last_attempt_note"].endswith(
+        "(the affected test file was not run) — session ended"
+    )
+
+
+def test_park_on_not_yet_done_is_refused(tmp_path, capsys):
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    doc = _doc(controls=[], gaps=[UNDONE_GAP])
+    assert _run(tmp_path, doc, "--park", "--note", "n") == 2
+    assert "do the commands, then re-run" in capsys.readouterr().err
+    assert _row(db)["verdict"] is None, "nothing recorded"
+
+
+def test_a_dry_run_of_undone_work_leaves_the_row_open(tmp_path, capsys):
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    assert _run(tmp_path, _doc(gaps=[UNDONE_GAP]), "--dry-run") == 0
+    out = capsys.readouterr().out
+    assert "not-yet-done" in out and "STAYS OPEN" in out and "NOT YET DONE" in out
+    assert _row(db)["verdict"] is None
+
+
+def test_an_event_gated_gap_closes_like_any_other_gap_with_its_trigger_named(tmp_path):
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    assert _run(tmp_path, _doc(gaps=[EVENT_GAP])) == 0
+    row = _row(db)
+    assert (row["status"], row["verdict"]) == ("closed", "pass-with-measured-gaps")
+    assert "EVENT-GATED (2026-11-02)" in row["closed_reason"]
+    assert EVENT_GAP["recheck"] in row["closed_reason"]
+
+
+# ── merge_commit is checked, not trusted (spec §4b) ─────────────────────
+
+
+@pytest.mark.parametrize("claimed", ["deadbee", "DEADBEEF1234", MERGE_SHA])
+def test_a_merge_commit_prefix_of_7_or_more_hex_is_accepted(tmp_path, claimed):
+    _seed(tmp_path / "genesis.db")
+    assert _run(tmp_path, _doc(merge_commit=claimed)) == 0
+
+
+@pytest.mark.parametrize("claimed", ["deadbe", "cafef00d1234", "main", "deadbeef1234zz"])
+def test_a_merge_commit_that_is_not_the_PRs_is_a_policy_refusal(tmp_path, capsys, claimed):
+    """MEASURED: 5 of 15 documents in one group named main HEAD or the deployed
+    commit. A wrong artifact named in permanent record is refused, code 3."""
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    assert _run(tmp_path, _doc(merge_commit=claimed)) == 3
+    err = capsys.readouterr().err
+    assert "not the PR's merge commit" in err and MERGE_SHA[:12] in err
+    assert _row(db)["status"] == "open", "nothing written"
+
+
+def test_the_merge_commit_check_runs_on_a_dry_run_too(tmp_path):
+    _seed(tmp_path / "genesis.db")
+    assert _run(tmp_path, _doc(merge_commit="cafef00d"), "--dry-run") == 3
+
+
+def test_an_unresolvable_merge_commit_refuses_and_names_the_cause(tmp_path, capsys, monkeypatch):
+    """A fault never waves the document through."""
+    db = tmp_path / "genesis.db"
+    _seed(db)
+
+    def offline(repo, pr):
+        raise LookupError("gh did not answer within 120 s (offline?)")
+
+    monkeypatch.setattr(_prv, "gh_merge_commit", offline)
+    assert _run(tmp_path, _doc()) == 2
+    err = capsys.readouterr().err
+    assert "cannot check merge_commit" in err and "offline" in err
+    assert _row(db)["status"] == "open"
+
+
+def test_no_open_row_costs_no_merge_commit_lookup(tmp_path, _no_real_github):
+    _seed(tmp_path / "genesis.db")
+    assert _run(tmp_path, _doc(pr=404), pr=404) == 1
+    assert _no_real_github == []
+    assert _run(tmp_path, _doc()) == 0
+    assert _no_real_github == [(REPO, 7)], "looked up for the row the document names"
+
+
+def test_an_injected_resolver_is_used_instead_of_gh(tmp_path):
+    _seed(tmp_path / "genesis.db")
+    ev = tmp_path / "evidence.json"
+    ev.write_text(json.dumps(_doc()))
+    argv = [
+        "close",
+        "--pr",
+        "7",
+        "--evidence-file",
+        str(ev),
+        "--db-path",
+        str(tmp_path / "genesis.db"),
+    ]
+    assert _prv.main(argv, merge_commit_of=lambda r, n: "f" * 40) == 3
+
+
+#: The real lookup, captured before the autouse fixture replaces it on the module.
+_REAL_GH = _prv.gh_merge_commit
+
+
+class _Proc:
+    def __init__(self, rc: int, out: str, err: str = "") -> None:
+        self.returncode, self.stdout, self.stderr = rc, out, err
+
+
+@pytest.mark.parametrize(
+    ("proc", "expect"),
+    [
+        (_Proc(0, json.dumps({"mergeCommit": {"oid": MERGE_SHA}})), MERGE_SHA),
+        (_Proc(0, json.dumps({"mergeCommit": None})), "has no merge commit"),
+        (_Proc(1, "", "HTTP 404"), "gh exited 1: HTTP 404"),
+        (_Proc(0, "not json"), "not the expected JSON"),
+    ],
+)
+def test_gh_merge_commit_parses_or_names_why_not(monkeypatch, proc, expect):
+    """The real lookup, with subprocess stubbed: gh is never run by a test."""
+    import shutil
+    import subprocess
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/gh")
+    seen = []
+
+    def fake_run(argv, **kw):
+        seen.append(argv)
+        return proc
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    if expect == MERGE_SHA:
+        assert _REAL_GH(REPO, 7) == MERGE_SHA
+    else:
+        with pytest.raises(LookupError, match=expect):
+            _REAL_GH(REPO, 7)
+    assert seen[-1] == ["gh", "pr", "view", "7", "--repo", REPO, "--json", "mergeCommit"]
+
+
+def test_gh_merge_commit_names_non_UTF8_output_rather_than_raising(monkeypatch):
+    """text=True decodes inside subprocess.run, so a bad byte raises there; it must
+    reach the caller as a named LookupError (a code-2 refusal), not a traceback."""
+    import shutil
+    import subprocess
+
+    def bad_bytes(argv, **kw):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/gh")
+    monkeypatch.setattr(subprocess, "run", bad_bytes)
+    with pytest.raises(LookupError, match="not UTF-8"):
+        _REAL_GH(REPO, 7)
+
+
+def test_a_non_UTF8_gh_reply_refuses_the_close_with_code_2(tmp_path, capsys, monkeypatch):
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    import shutil
+    import subprocess
+
+    def bad_bytes(argv, **kw):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr(_prv, "gh_merge_commit", _REAL_GH)
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/gh")
+    monkeypatch.setattr(subprocess, "run", bad_bytes)
+    assert _run(tmp_path, _doc()) == 2
+    assert "not UTF-8" in capsys.readouterr().err
+    assert _row(db)["status"] == "open"
+
+
+def test_a_merge_commit_mismatch_names_the_stacked_PR_case(tmp_path, capsys):
+    _seed(tmp_path / "genesis.db")
+    assert _run(tmp_path, _doc(merge_commit="cafef00d")) == 3
+    assert "on a stacked PR: the commit on its base branch" in capsys.readouterr().err
+
+
+def test_gh_merge_commit_without_gh_installed_names_it(monkeypatch):
+    import shutil
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    with pytest.raises(LookupError, match="not installed"):
+        _REAL_GH(REPO, 7)

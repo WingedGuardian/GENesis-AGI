@@ -35,10 +35,10 @@ if str(SRC_DIR) not in sys.path:
 
 def _print_verification_backlog(db_path: str | None) -> None:
     """The pr_verifications day-one reader: open obligations in BACKLOG order —
-    FAILED rows first, then never-attempted, then parked ones, oldest merge first
-    within each (``list_open``'s ORDER BY: an established failure is a finding the user
-    must see, so no cap may hide it; after that a validator should reach an untouched
-    row before one a colleague already tried).
+    FAILED rows first, then not-yet-done, then never-attempted, then parked ones,
+    oldest merge first within each (``list_open``'s ORDER BY: an established failure
+    is a finding the user must see, so no cap may hide it; after that a validator
+    should reach an untouched row before one a colleague already tried).
 
     Read-only, no worker run, no debounce — usable while the Wave-3 validator
     session (the eventual consumer) does not exist yet. Prints one line per
@@ -138,8 +138,8 @@ def _print_verification_backlog(db_path: str | None) -> None:
     if len(rows) < open_total:
         print(
             f"  <listed the first {len(rows)} of {open_total} open row(s) in backlog "
-            f"order — failed first, then never-attempted, then parked, oldest merge first within "
-            f"each; "
+            f"order — failed first, then not-yet-done, then never-attempted, then parked, "
+            f"oldest merge first within each; "
             f"{open_total - len(rows)} not shown — close some, or query "
             f"pr_verifications directly for the full set>"
         )

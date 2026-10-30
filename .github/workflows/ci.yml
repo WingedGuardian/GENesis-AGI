@@ -346,7 +346,7 @@ jobs:
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-10-22: 84 sites, 30 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-10-26: 85 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
     # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
@@ -558,7 +558,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[test,transcript-analytics]"
+          pip install -e ".[test,transcript-analytics]" -c .github/test-tools/requirements.txt
       - name: Run tests
         # The narrator below fires on THIS step's failure, not on the job's.
         id: tests
@@ -713,7 +713,14 @@ jobs:
         # "opt-in native qualification" skips. Two added reason-delivery cases
         # share that module flag. Four legacy-anchor refusal/no-op controls
         # bring the module to 76 new opt-ins, ceiling 344 -> 420.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 420
+        # Shared quote native qualification (#3614) adds twelve opt-in cases,
+        # ceiling 420 -> 432. Confirm the exact new-head set in PR CI.
+        # Scanned comments: eight filer cases and one skill-discovery opt-in.
+        # Main ceiling 432 + 9 = 441; confirm exact identities in PR CI.
+        # Card-fill keyboard selection adds one playwright importorskip browser
+        # test that skips without the browser stack, 441 -> 442.
+        # Validator role: 72 role and 24 adapter-bridge opt-in cases, 442 -> 538.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 538
 
   collected-floor:
     # Tests that stop being collected make the suite SMALLER, not red. This job
@@ -749,13 +756,14 @@ jobs:
         # install lines in step.
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[test,transcript-analytics]"
+          pip install -e ".[test,transcript-analytics]" -c .github/test-tools/requirements.txt
       - name: Resolve the base commit
         id: base
         env:
           # Passed via env, not interpolated into `run`.
           EVENT_NAME: ${{ github.event_name }}
           PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           head="$(git rev-parse HEAD)"
@@ -780,6 +788,15 @@ jobs:
           echo "collected-floor: base $base, head $head"
           echo "base=$base" >> "$GITHUB_OUTPUT"
           echo "head=$head" >> "$GITHUB_OUTPUT"
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            if pr_head="$(git rev-parse 'HEAD^2')" && [[ "$pr_head" =~ ^[0-9a-f]{40}$ ]] \
+               && [[ "$pr_head" == "${PR_HEAD_SHA:-}" ]] \
+               && printf 'pr_head=%s\n' "$pr_head" >> "$GITHUB_OUTPUT"; then
+              :
+            else
+              echo "::warning::collected-floor: optional review evidence unavailable: PR parent identity"
+            fi
+          fi
       - name: Collect test ids on both trees
         env:
           GENESIS_TESTING: "1"
@@ -826,6 +843,9 @@ jobs:
           # from the comparison.
           base_py=python
           deps_differ=0
+          # The test-tool pins come from the PR tree: the base commit may predate
+          # the file, and both trees must collect under the same pytest.
+          cp .github/test-tools/requirements.txt "$RUNNER_TEMP/test-tools.txt"
           git diff --quiet "$BASE" "$HEAD_SHA" -- pyproject.toml || deps_differ=1
           # --force: an untracked file in the way of a base file would
           # otherwise stop the switch (measured, git 2.43).
@@ -834,7 +854,7 @@ jobs:
             echo "collected-floor: pyproject.toml differs; collecting the base in a fresh venv"
             python -m venv "$RUNNER_TEMP/venv-base"
             base_py="$RUNNER_TEMP/venv-base/bin/python"
-            "$base_py" -m pip install --quiet -e ".[test,transcript-analytics]" > "$out/base-install.log" 2>&1 \
+            "$base_py" -m pip install --quiet -e ".[test,transcript-analytics]" -c "$RUNNER_TEMP/test-tools.txt" > "$out/base-install.log" 2>&1 \
               || { tail -n 30 "$out/base-install.log"; echo "::error::collected-floor: installing the base tree's dependencies failed"; exit 2; }
           fi
           collect base "$base_py"
@@ -873,8 +893,13 @@ jobs:
             echo "mode=unreadable" >> "$GITHUB_OUTPUT"
           fi
       - name: Compare the collected ids
+        id: compare
         env:
           MODE: ${{ steps.body.outputs.mode }}
+          COLLECTED_REVIEW_PR_NUMBER: ${{ github.event.pull_request.number }}
+          COLLECTED_REVIEW_BASE_SHA: ${{ steps.base.outputs.base }}
+          COLLECTED_REVIEW_HEAD_SHA: ${{ steps.base.outputs.pr_head }}
+          COLLECTED_REVIEW_COMPARISON_SHA: ${{ steps.base.outputs.head }}
         run: |
           set -euo pipefail
           out="$RUNNER_TEMP/collected-floor"
@@ -883,8 +908,17 @@ jobs:
             none) body=(--no-body) ;;
             *) body=(--body-unreadable) ;;
           esac
+          evidence=()
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" && -n "$COLLECTED_REVIEW_HEAD_SHA" ]]; then
+            if dir="$(mktemp -d "$RUNNER_TEMP/collected-review-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-XXXXXX")" \
+               && printf 'evidence_dir=%s\n' "$dir" >> "$GITHUB_OUTPUT"; then
+              evidence=(--evidence "$dir/review-v1.json")
+            else
+              echo "::warning::collected-floor: optional review evidence unavailable: output setup"
+            fi
+          fi
           python3 scripts/ci/collected_floor.py "$out/base.json" "$out/pr.json" \
-            --changed "$out/changed.txt" "${body[@]}"
+            --changed "$out/changed.txt" "${body[@]}" "${evidence[@]}"
       # The full id sets, the changed-file list and both collection logs: the
       # step summary is budgeted, this is not.
       - name: Preserve the collected ids
@@ -893,5 +927,14 @@ jobs:
         with:
           name: collected-floor
           path: ${{ runner.temp }}/collected-floor/
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Preserve collected review evidence
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && steps.compare.outputs.evidence_dir != '' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@v7
+        with:
+          name: collected-review-v1-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.compare.outputs.evidence_dir }}/review-v1.json
           if-no-files-found: ignore
           retention-days: 14
