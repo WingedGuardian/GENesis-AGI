@@ -631,11 +631,12 @@ def test_the_pick_prints_the_dry_run_close_command(tmp_path, repo, capsys):
 # ── module contract ───────────────────────────────────────────────────────────
 
 
-def test_siblings_load_without_scripts_on_sys_path():
+def test_siblings_load_without_scripts_on_sys_path(monkeypatch):
     """The house pattern keeps scripts/ off sys.path; the helpers load by path
-    under a private name instead."""
+    under a private name instead. Other tests in a full run put scripts/ on
+    sys.path, so remove it here rather than assume a clean interpreter."""
     scripts_dir = str(_SCRIPT.parent)
-    assert scripts_dir not in sys.path
+    monkeypatch.setattr(sys, "path", [p for p in sys.path if p != scripts_dir])
     core = _w._load_sibling("deploy_candidates_core")
     e2e = _w._load_sibling("e2e_declaration")
     assert hasattr(core, "Repo") and hasattr(e2e, "parse_e2e")
