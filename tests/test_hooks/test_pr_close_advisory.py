@@ -215,6 +215,9 @@ _EXCEPTION_PHRASES = (
     "checked against the successor and current main",
     "naming the file:line that now does it",
     "moot (saying why)",
+    "judged by the PROBLEM each part solves, never by whether its code",
+    "Code that cannot be rebased or reused is not a reason to retire",
+    "when the problem is still wanted, the disposition is a send-back",
     "a retired PR keeps its labels",
     "the PR stays open with a comment naming that part",
 )
@@ -252,6 +255,29 @@ def test_the_note_states_the_superseded_pr_exception():
     ).read_text(encoding="utf-8")
     assert "**A superseded PR is the one exception" in skill, (
         "the skill no longer states the exception this note describes"
+    )
+
+
+def test_the_note_judges_supersession_by_the_problem_not_the_code():
+    """Owner rule 2026-10-27 (closing-session, "Superseded is about the problem,
+    never the code"): a PR closes only when the problem it solves is dead, and
+    "covered"/"moot" turn on the guarantee each part delivers, not on whether its
+    code survived. A note whose covered/moot test read as "the code no longer fits
+    main" would license exactly the close that rule forbids, so the advisory must
+    carry the problem-not-code framing — and so must the skill it mirrors."""
+    note = _note(_run("gh pr close 1"))
+    assert "judged by the PROBLEM each part solves, never by whether its code" in note
+    assert "Code that cannot be rebased or reused is not a reason to retire" in note
+    assert "when the problem is still wanted, the disposition is a send-back" in note
+    skill = (
+        Path(__file__).resolve().parents[2]
+        / ".claude"
+        / "skills"
+        / "closing-session"
+        / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert "Superseded is about the problem, never the code" in skill, (
+        "the skill no longer states the problem-not-code rule this note carries"
     )
 
 
