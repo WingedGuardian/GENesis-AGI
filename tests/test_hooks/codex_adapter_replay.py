@@ -6,6 +6,7 @@ control because the mandatory known-cwd anchor changes their old preconditions.
 Commands are guard input only; the instrument never executes the action.
 """
 
+import ast
 import asyncio
 import hashlib
 import inspect
@@ -69,16 +70,72 @@ PUBLISHING_TEST_SHA256 = (
     "4a6b58df"
     "0afa9ef6"
 )
-PUBLISHING_GUARD_SHA256 = (
-    "a1c42887"
-    "bc0fe843"
-    "0115d73e"
-    "4f86633d"
-    "c15b7d3d"
-    "60e9df04"
-    "33ec986b"
-    "89024239"
+#: The guard code the six allowances above actually run, so that an edit elsewhere
+#: in git_push_guard.py does not requalify them. MEASURED 2026-10-30: under a
+#: profile hook, those six tests executed these 51 top-level functions and
+#: classes (of about 280 in the file). Before this, the pin hashed the WHOLE file,
+#: so every guard PR failed these tests until it requalified, and two open guard
+#: PRs always collided on the constant (three bumps in its first five days).
+#: `publishing_guard_digest` hashes their source (decorators included) plus the
+#: module-level code they depend on, followed transitively (its docstring says
+#: which). A function the arm starts calling later is not covered until this list
+#: is re-traced; a listed name that disappears fails closed (the digest names it).
+#: Sibling modules the guard imports (shell_parse, push_allowlist, ...) were never
+#: pinned, before or after this. Issue #3628.
+PUBLISHING_GUARD_FUNCTIONS = (
+    "_DryRunBlock",
+    "_DryRunRef",
+    "_DryRunVerdict",
+    "_ReworkUnreadable",
+    "_allow",
+    "_api_merge_deny",
+    "_check_codex_round_escalation",
+    "_current_branch",
+    "_effective_cwd",
+    "_effective_push_remote",
+    "_flush_overrides",
+    "_get_push_remote_and_branch",
+    "_gh_timeout",
+    "_git_config_get",
+    "_is_dispatched",
+    "_is_sqlite_write",
+    "_is_subagent",
+    "_legacy_remote_file_exists",
+    "_looks_like_url",
+    "_main_with_note",
+    "_neighbours_are_inert",
+    "_open_pr_count_for_branch",
+    "_parse_push_porcelain",
+    "_push_boolean_options",
+    "_push_carries_command_config",
+    "_push_compound_is_inert",
+    "_push_config_is_simple",
+    "_push_dest_urls",
+    "_push_dry_run",
+    "_push_dry_run_verdict",
+    "_push_family_flags",
+    "_push_is_dry_run",
+    "_push_is_force",
+    "_push_named_remote",
+    "_push_positionals",
+    "_push_ref_positionals",
+    "_push_repo_flag",
+    "_push_seg_has_no_prefix",
+    "_push_targets_current_branch",
+    "_push_transport_precheck",
+    "_push_url_matches_probe",
+    "_push_url_transport",
+    "_ref_names_current_branch",
+    "_remote_push_urls",
+    "_repo_selection_env_set",
+    "_resolve_push_remote",
+    "_review_request_triggers",
+    "_run_git_lines",
+    "_run_merge_and_push_gates",
+    "_seg_dash_C",
+    "main",
 )
+PUBLISHING_GUARD_DIGEST = "792ae6126cc55a19194b1b86aab5bf9a3c7ef5b519456efdd50ccd59e3931daa"
 
 
 def direct_publishing_allowance(request, guard):
@@ -89,8 +146,98 @@ def direct_publishing_allowance(request, guard):
             or guard.resolve() != ROOT / "scripts/hooks/git_push_guard.py"):
         return False
     assert (sha(test_source) == PUBLISHING_TEST_SHA256
-            and sha(guard) == PUBLISHING_GUARD_SHA256), "publishing allowance source changed; requalify"
+            and publishing_guard_digest(guard) == PUBLISHING_GUARD_DIGEST), (
+        "publishing allowance source changed; requalify"
+    )
     return True
+
+
+def publishing_guard_digest(guard: Path) -> str:
+    """sha256 over the guard code the six allowances depend on, in file order.
+
+    Definitions: every top-level def or class named in PUBLISHING_GUARD_FUNCTIONS,
+    decorators included. Other top-level statements (constants, imports, try and if
+    blocks, the ``__main__`` block, bare calls such as ``sys.path.insert``): every
+    one that binds or mutates, at any depth, a name the selected code reads, and
+    every one that binds nothing at all (it runs for its side effect on every
+    call). The selection is closed transitively: what a selected statement reads
+    is needed too, including an unlisted def a selected statement calls. Other
+    defs, and statements binding only names nothing selected reads, are left out:
+    that is what lets an unrelated guard edit pass. A listed name missing from the
+    guard yields a digest that names it, which never matches the pin."""
+    src = guard.read_text(encoding="utf-8")
+    lines = src.splitlines(keepends=True)
+    tree = ast.parse(src)
+    defs_ = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    top_defs = [node for node in tree.body if isinstance(node, defs_)]
+    present = {node.name for node in top_defs}
+    missing = [n for n in PUBLISHING_GUARD_FUNCTIONS if n not in present]
+    if missing:
+        return "missing:" + ",".join(missing)
+
+    def _reads(node) -> set[str]:
+        return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+    def _root(target):
+        while isinstance(target, (ast.Attribute, ast.Subscript, ast.Starred)):
+            target = target.value
+        return target.id if isinstance(target, ast.Name) else None
+
+    def _binds(node) -> set[str]:
+        out: set[str] = set()
+        for n in ast.walk(node):
+            if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+                out.add(n.id)
+            elif isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
+                for t in getattr(n, "targets", None) or [n.target]:
+                    if (root := _root(t)) is not None:
+                        out.add(root)
+            elif isinstance(n, (ast.Import, ast.ImportFrom)):
+                out.update((a.asname or a.name).split(".")[0] for a in n.names)
+            elif isinstance(n, defs_ + (ast.Global,)):
+                out.update(getattr(n, "names", None) or [n.name])
+        return out
+
+    chosen = {id(n): n for n in top_defs if n.name in PUBLISHING_GUARD_FUNCTIONS}
+    others = [n for n in tree.body if not isinstance(n, defs_)]
+    def _is_entry(node) -> bool:
+        """``if __name__ == "__main__":``, the entry point the six cases run."""
+        return isinstance(node, ast.If) and "__name__" in _reads(node.test)
+
+    for n in others:
+        if not _binds(n) or _is_entry(n):
+            chosen[id(n)] = n
+    needed = set(PUBLISHING_GUARD_FUNCTIONS).union(*(_reads(n) for n in chosen.values()))
+    grew = True
+    while grew:
+        grew = False
+        for n in others + top_defs:
+            if id(n) in chosen:
+                continue
+            binds = {n.name} if isinstance(n, defs_) else _binds(n)
+            # An unlisted def joins only when a selected NON-def statement needs
+            # it (`_X = _build()`): a listed function merely naming a helper is
+            # not evidence the six cases run it (the trace is that evidence).
+            # The entry block is excluded from that too: it also dispatches the
+            # `--check-pr` report, which the six cases never reach.
+            if isinstance(n, defs_) and not any(
+                n.name in _reads(c)
+                for c in chosen.values()
+                if not isinstance(c, defs_) and not _is_entry(c)
+            ):
+                continue
+            if binds & needed:
+                chosen[id(n)] = n
+                needed |= _reads(n)
+                grew = True
+
+    def _segment(node) -> str:
+        first = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+        return "".join(lines[first - 1 : node.end_lineno])
+
+    nodes = sorted(chosen.values(), key=lambda node: node.lineno)
+    blob = "\n".join(_segment(node) for node in nodes)
+    return hashlib.sha256(blob.encode()).hexdigest()
 
 
 def pytest_addoption(parser):

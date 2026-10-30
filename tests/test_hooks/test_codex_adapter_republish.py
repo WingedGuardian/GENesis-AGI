@@ -1,5 +1,6 @@
 """Separate stateful publishing proof; run without the legacy replay plugin."""
 
+import ast
 import asyncio
 import hashlib
 import json
@@ -115,12 +116,96 @@ def test_publishing_exception_does_not_expand(monkeypatch, tmp_path, publishing_
 
 @pytest.mark.parametrize("changed", ["test", "guard"])
 def test_publishing_exception_requires_reviewed_source(monkeypatch, tmp_path, publishing_fixture, changed):
-    target = Path(original.__file__) if changed == "test" else original._GUARD
-    sha = bridge.sha
-    monkeypatch.setattr(bridge, "sha", lambda path: "changed" if Path(path) == target else sha(path))
+    if changed == "test":
+        target, sha = Path(original.__file__), bridge.sha
+        monkeypatch.setattr(bridge, "sha", lambda path: "changed" if Path(path) == target else sha(path))
+    else:
+        monkeypatch.setattr(bridge, "publishing_guard_digest", lambda path: "changed")
     with pytest.raises(AssertionError, match="publishing allowance source changed"):
         invoke_replay(monkeypatch, tmp_path, publishing_fixture, CASES[0])
     assert not (tmp_path / "direct-home/.genesis/pushed_branches.json").exists()
+
+
+def _guard_with(tmp_path, edit):
+    copy = tmp_path / "git_push_guard.py"
+    copy.write_text(edit(original._GUARD.read_text()))
+    return copy
+
+
+def _insert_in_body(src, name):
+    head = src.index(f"def {name}(")
+    body = src.index(":\n", head) + 2
+    return src[:body] + "    _probe = 1\n" + src[body:]
+
+
+def test_the_guard_digest_is_pinned_to_the_publishing_code():
+    assert bridge.publishing_guard_digest(original._GUARD) == bridge.PUBLISHING_GUARD_DIGEST
+
+
+def test_an_edit_outside_the_publishing_code_does_not_requalify(tmp_path):
+    """The point of the narrowing: guard PRs that never touch the publishing arm
+    no longer fail these tests or collide on the pin."""
+    copy = _guard_with(tmp_path, lambda s: _insert_in_body(s, "check_pr_report") + "\n_NEW = 1\n")
+    assert bridge.publishing_guard_digest(copy) == bridge.PUBLISHING_GUARD_DIGEST
+
+
+@pytest.mark.parametrize("name", ["_push_is_dry_run", "_run_merge_and_push_gates", "main"])
+def test_an_edit_inside_the_publishing_code_requalifies(tmp_path, name):
+    copy = _guard_with(tmp_path, lambda s: _insert_in_body(s, name))
+    assert bridge.publishing_guard_digest(copy) != bridge.PUBLISHING_GUARD_DIGEST
+
+
+def _a_constant_the_listed_code_reads():
+    tree = ast.parse(original._GUARD.read_text())
+    listed = set(bridge.PUBLISHING_GUARD_FUNCTIONS)
+    funcs = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in listed]
+    read = {n.id for f in funcs for n in ast.walk(f) if isinstance(n, ast.Name)}
+    const = next(
+        n for n in tree.body
+        if isinstance(n, ast.Assign) and len(n.targets) == 1
+        and isinstance(n.targets[0], ast.Name) and n.targets[0].id in read
+    )
+    return const.targets[0].id
+
+
+# Each edit below changes what the six cases run without touching a listed body.
+# A fix-review measured every one of them slipping past an earlier digest.
+_RELATED_EDITS = {
+    "a later rebinding of a constant the code reads": lambda s: s + (
+        f"\n{_a_constant_the_listed_code_reads()} = {_a_constant_the_listed_code_reads()}\n"
+    ),
+    "an import inside a top-level try block": lambda s: s.replace(
+        "import push_allowlist", "push_allowlist = None", 1
+    ),
+    "a top-level if block rebinding a listed function": lambda s: s + "\nif True:\n    _allow = None\n",
+    "a decorator on a listed function": lambda s: s.replace(
+        "\ndef _allow(", "\n@staticmethod\ndef _allow(", 1
+    ),
+    "the __main__ entry block": lambda s: s.replace(
+        'if __name__ == "__main__":', 'if __name__ == "__main__":\n    pass', 1
+    ),
+    "a sys.path change at module level": lambda s: s.replace(
+        "sys.path.insert(0", "sys.path.insert(1", 1
+    ),
+    "a constant another selected constant is built from": lambda s: s.replace(
+        "mergePullRequest|", "mergePullRequestX|", 1
+    ),
+}
+
+
+@pytest.mark.parametrize("edit", list(_RELATED_EDITS), ids=list(_RELATED_EDITS))
+def test_module_level_code_the_publishing_path_depends_on_requalifies(tmp_path, edit):
+    src = original._GUARD.read_text()
+    changed = _RELATED_EDITS[edit](src)
+    assert changed != src, "precondition: the edit's anchor exists"
+    copy = _guard_with(tmp_path, lambda s: changed)
+    assert bridge.publishing_guard_digest(copy) != bridge.PUBLISHING_GUARD_DIGEST
+
+
+def test_a_listed_name_that_disappears_fails_closed(tmp_path):
+    copy = _guard_with(tmp_path, lambda s: s.replace("def _push_is_force(", "def _push_is_forced(", 1))
+    digest = bridge.publishing_guard_digest(copy)
+    assert digest.startswith("missing:") and "_push_is_force" in digest
 
 
 def git_state(clone):
