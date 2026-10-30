@@ -1,6 +1,7 @@
 """Tests for the deterministic governance gate."""
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import aiosqlite
 import pytest
@@ -1187,3 +1188,138 @@ async def test_non_identity_type_keeps_content_hash_secondary(db):
         context=_SHARED_HEADER + " b", salience_score=1.0, signal_type="health_alert",
     )
     assert await gate.is_duplicate(req) is True
+
+
+# --- Peer (agent-channel) messages: their own governance ---------------------
+
+
+def _peer_request(peer="peer-a", topic="peer-topic-1", text="status note"):
+    # Governance reads only the envelope's peer_id; the typed envelope itself is
+    # exercised end to end in tests/test_peers/test_outbox.py.
+    return OutreachRequest(
+        category=OutreachCategory.NOTIFICATION,
+        topic=topic,
+        context=text,
+        salience_score=1,
+        signal_type="peer_message",
+        channel="agent",
+        validated_recipient=peer,
+        verbatim=True,
+        peer_envelope=SimpleNamespace(peer_id=peer),
+    )
+
+
+async def _fill_history(db, n, *, channel, category="notification", signal_type="ego_note"):
+    now = datetime.now(UTC).isoformat()
+    for i in range(n):
+        await outreach_crud.create(
+            db,
+            id=f"{channel}-{category}-{i}",
+            signal_type=signal_type,
+            topic=f"{channel} topic {i}",
+            category=category,
+            salience_score=0.9,
+            channel=channel,
+            message_content=f"{channel} message {i}",
+            created_at=now,
+        )
+        await outreach_crud.record_delivery(db, f"{channel}-{category}-{i}", delivered_at=now)
+
+
+async def _fill_peer_outbox(db, peer, n):
+    now = datetime.now(UTC).isoformat()
+    for i in range(n):
+        await db.execute(
+            "INSERT INTO peer_outbox(peer_id, epoch, message_id, context_id, message, created_at) "
+            "VALUES (?, 'e1', ?, 'ctx', '{}', ?)",
+            (peer, f"{peer}-m{i}", now),
+        )
+    await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_a_peer_message_is_not_held_by_the_owner_budget_or_quiet_hours(db, monkeypatch):
+    """The live defect: a note to a peer agent was refused 'rate_limit: exceeded
+    5/day' because the owner's Telegram notifications had spent the shared
+    budget, and would also have waited out the owner's quiet hours."""
+    monkeypatch.setattr("genesis.outreach.governance.GovernanceGate._in_quiet_hours", lambda self: True)
+    await _fill_history(db, 11, channel="telegram")          # owner budget and notification quota spent
+    result = await GovernanceGate(_cfg_no_quiet(), db).check(_peer_request())
+    assert result.verdict == GovernanceVerdict.ALLOW, result.reason
+    assert result.checks_passed == ["dedup", "peer_daily_cap"]
+
+
+@pytest.mark.asyncio
+async def test_peer_deliveries_do_not_spend_the_owner_budget(db):
+    await _fill_history(db, 11, channel="agent")             # more than max_daily and notification_daily
+    req = OutreachRequest(
+        category=OutreachCategory.NOTIFICATION,
+        topic="owner note",
+        context="for the owner",
+        salience_score=0.9,
+        signal_type="ego_note",
+    )
+    result = await GovernanceGate(_cfg_no_quiet(), db).check(req)
+    assert result.verdict == GovernanceVerdict.ALLOW, result.reason
+
+
+@pytest.mark.asyncio
+async def test_the_per_peer_cap_refuses_only_the_peer_that_reached_it(db):
+    gate = GovernanceGate(_cfg_no_quiet(agent_daily_per_peer=3), db)
+    await _fill_peer_outbox(db, "peer-a", 3)
+    capped = await gate.check(_peer_request("peer-a"))
+    assert capped.verdict == GovernanceVerdict.DENY
+    assert capped.checks_failed == ["peer_daily_cap: 3/day to this peer reached"]
+    other = await gate.check(_peer_request("peer-b", topic="peer-topic-2"))
+    assert other.verdict == GovernanceVerdict.ALLOW, other.reason
+
+
+@pytest.mark.asyncio
+async def test_yesterdays_peer_messages_do_not_count_toward_today(db):
+    gate = GovernanceGate(_cfg_no_quiet(agent_daily_per_peer=1), db)
+    yesterday = (datetime.now(UTC) - timedelta(days=1, hours=1)).isoformat()
+    await db.execute(
+        "INSERT INTO peer_outbox(peer_id, epoch, message_id, context_id, message, created_at) "
+        "VALUES ('peer-a', 'e1', 'old', 'ctx', '{}', ?)",
+        (yesterday,),
+    )
+    await db.commit()
+    assert (await gate.check(_peer_request())).verdict == GovernanceVerdict.ALLOW
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_peer_message_is_still_suppressed_as_a_duplicate(db):
+    """The scheduler closes a retained agent retry on a check starting 'dedup'."""
+    await _fill_history(db, 1, channel="agent", signal_type="peer_message")
+    await db.execute("UPDATE outreach_history SET topic = 'peer-topic-1'")
+    await db.commit()
+    result = await GovernanceGate(_cfg_no_quiet(), db).check(_peer_request())
+    assert result.verdict == GovernanceVerdict.DENY
+    assert result.checks_failed[0].startswith("dedup")
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_peer_count_refuses_instead_of_reading_zero(db):
+    await db.execute("DROP TABLE peer_outbox")
+    result = await GovernanceGate(_cfg_no_quiet(), db).check(_peer_request())
+    assert result.verdict == GovernanceVerdict.DENY
+    assert result.checks_failed == ["peer_daily_cap: could not count today's messages to this peer"]
+
+
+@pytest.mark.asyncio
+async def test_naming_the_agent_channel_without_an_envelope_gets_owner_governance(db, monkeypatch):
+    """Only a typed peer envelope earns peer governance: a request that merely names the
+    "agent" channel (the dashboard send route passes the caller's channel through) is
+    still held by quiet hours like any owner notification."""
+    monkeypatch.setattr("genesis.outreach.governance.GovernanceGate._in_quiet_hours", lambda self: True)
+    req = OutreachRequest(
+        category=OutreachCategory.NOTIFICATION,
+        topic="not a peer",
+        context="no envelope",
+        salience_score=1,
+        signal_type="ego_note",
+        channel="agent",
+    )
+    result = await GovernanceGate(_cfg_no_quiet(), db).check(req)
+    assert result.verdict == GovernanceVerdict.DENY
+    assert any(c.startswith("quiet_hours") for c in result.checks_failed)

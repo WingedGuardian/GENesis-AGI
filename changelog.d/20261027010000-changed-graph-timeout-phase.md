@@ -1,0 +1,1 @@
+- **A graph read timeout now says which leg of the read the deadline caught.** The diagnosis keeps the 16 innermost frames with their lines (four could not tell a reconnect's handshake from a query's reply) and records the connection the client's pool was about to hand out; the cutover report prints the phase (`construct`, `connect` or `reply`) and that connection state.

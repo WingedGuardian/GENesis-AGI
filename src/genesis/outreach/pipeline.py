@@ -12,7 +12,7 @@ from pathlib import Path
 import aiosqlite
 
 from genesis.channels.base import ChannelNotConfiguredError
-from genesis.content.drafter import ContentDrafter
+from genesis.content.drafter import ContentDrafter, clean_header
 from genesis.content.egress import gate
 from genesis.content.formatter import ContentFormatter
 from genesis.content.limits import get_limits
@@ -33,6 +33,11 @@ from genesis.outreach.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Safety net only: the author of an email writes its subject (outreach_send
+#: and marketing_send refuse an email without one). The email adapter's own
+#: default, stated here so a held email never shows an empty subject.
+DEFAULT_EMAIL_SUBJECT = "Message from Genesis"
 
 _ALERT_PROMPT_PATH = Path(__file__).resolve().parent.parent / "identity" / "OUTREACH_ALERT.md"
 _URGENT_CATEGORIES = frozenset({OutreachCategory.BLOCKER, OutreachCategory.ALERT})
@@ -161,7 +166,7 @@ class OutreachPipeline:
                 self._db,
                 id=str(uuid.uuid4()),
                 recipient=recipient,
-                subject=request.topic or "",
+                subject=request.email_subject or "",
                 thread_id=getattr(request, "thread_id", None),
                 outreach_id=outreach_id,
                 cell_domain=domain,
@@ -187,7 +192,7 @@ class OutreachPipeline:
         owner = self._recipients.get("telegram")
         if adapter is None or not owner:
             return
-        subject = request.topic or "(no subject)"
+        subject = request.email_subject or "(no subject)"
         try:
             await adapter.send_message(
                 owner,
@@ -612,6 +617,21 @@ class OutreachPipeline:
                 error=f"No recipient for {channel}",
             )
 
+        # The subject is fixed here BEFORE the gate, so the owner approves exactly
+        # the subject that is sent. The resume path (gate_cleared) delivers the
+        # approved subject as it is.
+        if channel == "email" and not gate_cleared:
+            subject = await self._resolve_subject(request)
+            if subject is None:
+                # Refused here, like the body scan, rather than held for an
+                # approval that the scan at delivery would refuse anyway.
+                return OutreachResult(
+                    outreach_id=outreach_id, status=OutreachStatus.FAILED,
+                    channel=channel, message_content=formatted.text,
+                    error="Subject scan quarantine",
+                )
+            request = replace(request, email_subject=subject)
+
         # WS-8 autonomy capability gate — deterministic owner-authorization for
         # outbound email, BELOW the LLM tool call (Tenet 0). This is the sole
         # unbypassable chokepoint: every send path converges on _deliver. A held
@@ -741,11 +761,26 @@ class OutreachPipeline:
                     text = self._formatter.format(text, target).text
                 formatted = replace(formatted, text=text)
 
+        email_subject = None
+        if channel == "email" and request.email_subject:
+            subject_egress = gate(
+                " ".join(request.email_subject.splitlines()),
+                channel=channel, category=request.category.value,
+            )
+            if subject_egress.quarantined:
+                return OutreachResult(
+                    outreach_id=outreach_id, status=OutreachStatus.FAILED,
+                    channel=channel, message_content=formatted.text,
+                    error="Subject scan quarantine",
+                )
+            email_subject = subject_egress.text
+
         try:
             delivery_id = await adapter.send_message(
                 delivery_recipient, formatted.text,
                 message_thread_id=thread_id,
                 reply_markup=reply_markup,
+                **({"subject": email_subject} if email_subject else {}),
                 **({"peer_envelope": request.peer_envelope} if channel == "agent" else {}),
             )
             # Secondary DM copy for "both" mode (no buttons — primary only)
@@ -914,7 +949,7 @@ class OutreachPipeline:
                 await self._thread_tracker.register(
                     message_id=str(delivery_id),
                     recipient=delivery_recipient,
-                    subject=request.topic or "",
+                    subject=request.email_subject or "",
                     context={"signal_type": request.signal_type or request.category.value,
                              "outreach_id": outreach_id},
                 )
@@ -948,6 +983,18 @@ class OutreachPipeline:
             thread_id=thread_id if channel == "telegram" else None,
         )
 
+    async def _resolve_subject(self, request: OutreachRequest) -> str | None:
+        """The subject this email is sent with: the one its author wrote,
+        header-safe and egress-scrubbed. The author (the session or tool that
+        wrote the email) writes the subject with it; the fixed default is only
+        a safety net for a send that arrives without one. None means the egress
+        scan quarantined it."""
+        subject = clean_header(request.email_subject or "") or DEFAULT_EMAIL_SUBJECT
+        scrubbed = gate(subject, channel="email", category=request.category.value)
+        if scrubbed.quarantined:
+            return None
+        return clean_header(scrubbed.text) or DEFAULT_EMAIL_SUBJECT
+
     async def deliver_approved(
         self, pending: dict, *, subject: str | None = None,
     ) -> OutreachResult:
@@ -962,6 +1009,7 @@ class OutreachPipeline:
         req = OutreachRequest(
             category=OutreachCategory(pending["category"]),
             topic=subject or "",
+            email_subject=subject or DEFAULT_EMAIL_SUBJECT,
             context=pending["message"],
             salience_score=0.5,
             signal_type="email_gate_resume",
@@ -1092,6 +1140,8 @@ class OutreachPipeline:
                     "category": request.category.value,
                     "signal_type": request.signal_type,
                     "topic": request.topic,
+                    # A retry keeps the subject the owner saw and the caller gave.
+                    "email_subject": request.email_subject,
                     # Origin-targeted delivery must survive a transient-failure
                     # retry, or a result that failed once lands in the default
                     # surface instead of the exact origin thread it promised.

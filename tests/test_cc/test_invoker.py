@@ -1753,6 +1753,41 @@ async def test_run_streaming_rate_limit_with_empty_response_raises():
         await inv.run_streaming(CCInvocation(prompt="test"))
 
 
+@pytest.mark.asyncio
+async def test_a_synthetic_limit_notice_is_not_an_answer_under_a_rate_limit():
+    """The CLI's own limit notice must not turn an empty rate-limited result
+    into a served answer: it would be delivered and failover would never run."""
+    from genesis.cc.exceptions import CCRateLimitError
+
+    inv = CCInvoker(claude_path="claude")
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected"}},
+        {"type": "assistant", "message": {"model": "<synthetic>", "content": [
+            {"type": "text", "text": "You've hit your 5-hour limit"},
+        ]}},
+        {
+            "type": "result", "subtype": "success", "is_error": False, "result": "",
+            "session_id": "s1", "total_cost_usd": 0.0, "duration_ms": 50,
+            "usage": {"input_tokens": 5, "output_tokens": 0},
+            "modelUsage": {"claude-sonnet-4-6": {}},
+        },
+    ]
+    mock_proc = AsyncMock()
+    mock_proc.stdout = _make_async_stdout(_make_stream_lines(*events))
+    mock_proc.stdin = _make_mock_stdin()
+    mock_proc.stderr = _make_mock_stderr()
+    mock_proc.wait = AsyncMock()
+    mock_proc.terminate = MagicMock()
+    mock_proc.returncode = 0
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+        pytest.raises(CCRateLimitError),
+    ):
+        await inv.run_streaming(CCInvocation(prompt="test"))
+
+
 # --- Error classification tests ---
 
 

@@ -11,6 +11,7 @@ boundary before this profile can cover them.
 from __future__ import annotations
 
 import logging
+from contextvars import ContextVar
 from enum import StrEnum
 
 from fastmcp.exceptions import ToolError
@@ -23,6 +24,9 @@ class ExternalProfile(StrEnum):
 
 
 logger = logging.getLogger(__name__)
+current_external_profile: ContextVar[ExternalProfile | None] = ContextVar(
+    "genesis_external_profile", default=None,
+)
 
 # Recall can update retrieval metadata and invoke corrective retrieval. These
 # sets describe admitted tool capabilities, not side-effect-free operations.
@@ -35,14 +39,17 @@ MEMORY_FLOOR_TOOLS = frozenset({
 })
 _PROFILE_TOOLS = {
     ExternalProfile.EXTERNAL: {"health": HEALTH_FLOOR_TOOLS, "memory": MEMORY_FLOOR_TOOLS},
-    # Owner-approved capability staging: later reviewed writer slices widen only
-    # this explicit role; the ordinary external profile retains its current floor.
-    ExternalProfile.VALIDATOR: {"health": HEALTH_FLOOR_TOOLS, "memory": MEMORY_FLOOR_TOOLS},
+    ExternalProfile.VALIDATOR: {
+        "health": HEALTH_FLOOR_TOOLS | {
+            "pr_verification_close", "follow_up_create", "follow_up_list", "follow_up_update",
+        },
+        "memory": MEMORY_FLOOR_TOOLS | {"memory_store"},
+    },
 }
 
 
 def profile_tools(server: str, profile: ExternalProfile | str) -> frozenset[str]:
-    """Closed roles and servers; validator writers arrive with their own reviews."""
+    """Closed roles and servers; ordinary external clients retain the floor."""
     tools = _PROFILE_TOOLS[ExternalProfile(profile)]
     try:
         return tools[server]
@@ -65,4 +72,8 @@ class ExternalProfileMiddleware(Middleware):
         if context.message.name not in self.allowed:
             logger.warning("External profile %s refused tool %r", self.profile, context.message.name)
             raise ToolError("Tool is unavailable to this external client profile")
-        return await call_next(context)
+        token = current_external_profile.set(self.profile)
+        try:
+            return await call_next(context)
+        finally:
+            current_external_profile.reset(token)

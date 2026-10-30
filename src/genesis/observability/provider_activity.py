@@ -38,6 +38,7 @@ class ProviderActivityTracker:
     """Rolling-window call counters per provider with optional DB persistence."""
 
     def __init__(self, window_seconds: int = 3600) -> None:
+        self.persist_activity = True
         self._window = window_seconds
         self._calls: dict[str, deque[CallRecord]] = defaultdict(deque)
         self._db: aiosqlite.Connection | None = None
@@ -74,7 +75,7 @@ class ProviderActivityTracker:
         self._evict(provider)
 
         # Queue for DB persistence (fire-and-forget)
-        if self._db is not None:
+        if self._db is not None and self.persist_activity:
             self._write_batch.append(
                 (provider, latency_ms, success, cache_hit, error_message),
             )

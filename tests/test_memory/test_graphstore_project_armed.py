@@ -456,3 +456,23 @@ async def test_the_sweep_reaps_dead_pids_and_spares_everything_else(monkeypatch)
     assert deleted == [f"swept_staging_{2**31 - 1}"], (
         f"swept the wrong set: {deleted} — a live or unparseable key was reaped"
     )
+
+
+def test_a_successful_projection_reports_its_warm_up(monkeypatch, socket, capsys):
+    """The hourly unit's journal is the only place a projector run is recorded,
+    so the warm-up's outcome is printed there, not left to a log level the CLI
+    never configures."""
+    monkeypatch.setattr(gp, "falkordb_socket_path", lambda: socket)
+
+    async def _ok(*_a, **_k):
+        return {
+            "nodes": 2,
+            "edges": 1,
+            "hidden": 0,
+            "warm": "warmed in 74 ms (traversal rows [3, 1])",
+        }
+
+    monkeypatch.setattr(gp, "build", _ok)
+
+    assert _run(monkeypatch, ["--if-armed"]) == 0
+    assert "warm-up: warmed in 74 ms (traversal rows [3, 1])" in capsys.readouterr().out
