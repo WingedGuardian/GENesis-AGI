@@ -43,6 +43,10 @@ class SettingsDomain:
 
 
 _DOMAIN_REGISTRY: dict[str, SettingsDomain] = {
+    "codex_validator": SettingsDomain(
+        name="codex_validator", description="Post-calibration validator ledger write gate",
+        config_filename="codex_validator.yaml", readonly=False, needs_restart=False,
+    ),
     "tts": SettingsDomain(
         name="tts",
         description="Text-to-speech voice settings (provider, voice, synthesis params)",
@@ -2232,7 +2236,24 @@ def _validate_provider_outage_notify(changes: dict) -> list[str]:
     return errors
 
 
+def _validate_codex_validator(changes: dict) -> list[str]:
+    from genesis._config_overlay import merge_local_overlay
+    from genesis.session_awareness.codex_validator_config import read_base, valid_gate
+
+    if not valid_gate(changes):
+        return ["Only the boolean dry_run_only field is accepted"]
+    try:
+        path = _CONFIG_DIR / "codex_validator.yaml"
+        current = merge_local_overlay(read_base(path), path, strict=True)
+        if valid_gate(_deep_merge(current, changes)):
+            return []
+    except Exception:
+        return ["Cannot read a valid validator base or retained overlay; repair it before changing the preview-only gate"]
+    return ["Prospective validator settings retain invalid keys or types; repair the selected overlay first"]
+
+
 _DOMAIN_VALIDATORS: dict[str, Any] = {
+    "codex_validator": _validate_codex_validator,
     "graphstore": _validate_graphstore,
     "ego_reconcile": _validate_ego_reconcile,
     "follow_up_watchdog": _validate_follow_up_watchdog,

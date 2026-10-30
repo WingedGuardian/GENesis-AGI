@@ -119,6 +119,12 @@ Multi-file patches share the same overall budget and may need smaller batches.
 A single copied-source probe admitted 50 targets in 9.85 seconds; that is a
 near-budget observation, not a guaranteed supported patch size.
 
+The dedicated validator-health profile retains in-memory activity metrics and
+historical provider reads while disabling new persisted tool metrics and the
+instrumentation transaction boundary on its shared handle. Other clients keep
+their defaults. This does not make the full server read-only; see
+`codex-validator-writers.md` for the owned-writer and remaining fallback limits.
+
 ## Validator-only operation policy
 
 Assignment-only shell commands apply their HOME context before redirect checks.
@@ -255,6 +261,14 @@ must match the activated configuration exactly:
 - Profile servers `health` and `memory` and `ExternalProfile.VALIDATOR` in
   `src/genesis/mcp/external_profiles.py`.
 - Codex tool names `Bash` and `apply_patch`, each carrying `tool_input.command`.
+
+The validator profile admits memory_store, eligible private follow-up CRUD and
+pr_verification_close in addition to its health/recall floor. Verification
+recording defaults to server-forced preview, including attempt notes; clearing
+it requires separately authorized calibration and operator opt-in. These MCP
+writers do not authorize shell writes to stores under test or activate a
+validator session. See `codex-validator-writers.md` for the actual interfaces,
+transaction ownership and uncertain-outcome limits.
 
 Focused checks: `pytest tests/test_hooks/test_codex_validator_guard.py tests/test_hooks/test_codex_validator_patch.py tests/test_hooks/test_codex_validator_shell.py`. Native
 CLI/app checks in the same file require `GENESIS_CODEX_NATIVE_TESTS=1` and use

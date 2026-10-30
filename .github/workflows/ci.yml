@@ -720,7 +720,8 @@ jobs:
         # Card-fill keyboard selection adds one playwright importorskip browser
         # test that skips without the browser stack, 441 -> 442.
         # Validator role: 72 role and 24 adapter-bridge opt-in cases, 442 -> 538.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 538
+        # Validator writers: fourteen opt-in native cases, 538 -> 552.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 552
 
   collected-floor:
     # Tests that stop being collected make the suite SMALLER, not red. This job
