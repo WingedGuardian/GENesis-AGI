@@ -3301,6 +3301,10 @@ verified: 3e27b4794 2026-10-23
   `docs/reference/headlong-native-monolith.md`.
   The reference-redaction prerequisite retains issued IDs; explicit conflicts
   stop before SDK execution and preserve existing timer/reactive pacing.
+  A private shared mechanics inventory describes the same cases without
+  replacing their predicates. The reused bridge has closed fixture source
+  attribution (`monolith` default or `ego-owned-loop`) on all native records;
+  this adds no C loop or new proposal authority.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).

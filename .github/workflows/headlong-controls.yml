@@ -4,7 +4,9 @@ on:
     paths:
       - '.github/workflows/headlong-controls.yml'
       - 'scripts/ci/headlong_*'
+      - 'scripts/ci/ego_runtime_*.py'
       - 'tests/test_scripts/test_headlong_*.py'
+      - 'tests/test_scripts/test_ego_runtime_*.py'
       - 'src/genesis/db/crud/ego.py'
       - 'src/genesis/db/schema/**'
   workflow_dispatch:
@@ -47,6 +49,7 @@ jobs:
           cp scripts/ci/headlong_fixture.py scripts/ci/headlong_controls.py scripts/ci/headlong_native_*.py "$context/"
           cp scripts/ci/headlong_prompt_references.py scripts/ci/headlong_reference_*.py "$context/"
           cp scripts/ci/headlong_monolith_controls.py scripts/ci/headlong_bridge_patch.json "$context/"
+          cp scripts/ci/ego_runtime_cases.py "$context/"
           cp scripts/ci/headlong_controls.Dockerfile "$context/Dockerfile"
           docker build -t headlong-controls "$context"
           docker image inspect headlong-controls > "$RUNNER_TEMP/headlong-image.json"
@@ -144,9 +147,14 @@ jobs:
           assert report['schema'] == 'headlong-native-monolith/v1' and report['status'] == 'pass'
           assert report['cleanup_confirmed'] is True and report['sources_unchanged'] is True
           assert len(report['cases']) == 13 and {case['scenario'] for case in report['cases']} == expected
+          manifest = report['comparison_manifest']
+          assert manifest['schema'] == 'ego-runtime-mechanics/v1'
+          assert len(manifest['cases']) == 13 and {case['name'] for case in manifest['cases']} == expected
+          assert sum(case['wakes'] for case in manifest['cases']) == 15
           assert all(case['control_passed'] is True for case in report['cases'])
           runs = [run for case in report['cases'] for run in case['runs']]
           assert len(runs) == 15 and all(run['control_passed'] is True for run in runs)
+          assert all(run['driver']['outer_source'] == 'monolith' for run in runs)
           native_runs = [run for run in runs if run['driver']['native'] is not None]
           assert len(native_runs) == 13 and report['correlations']['passed'] is True
           assert len({run['driver']['native']['session_id'] for run in native_runs}) == 13
