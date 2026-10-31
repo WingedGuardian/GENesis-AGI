@@ -371,9 +371,6 @@ app login, which is a different string, matched nothing, and 13 real findings
 blocked. An empty result from your own query is "my query found nothing", never
 "no findings exist".
 
-It prints one line per gate, then a `verdict` line. Read every line — a PR can
-be Codex-clean and still blocked by CI, base branch, or pin receipts.
-
 **A `NOTE: … base commits since its newest … run changed code …` block on
 stderr means base commits since the PR's CI changed CODE this PR also changes**
 (advisory, owner rulings 2026-10-28/29; it never moves the verdict, and prose
@@ -388,6 +385,9 @@ so CI runs on the current base. That moves the head, so the review gate then
 needs a review of the new head, and on a gate-fix PR past its rounds that
 request needs the owner's approval. `gh run rerun` does not help: a re-run tests
 the same merge commit.
+
+It prints one line per gate, then a `verdict` line. Read every line — a PR can
+be Codex-clean and still blocked by CI, base branch, or pin receipts.
 
 ### 2. Branch on the verdict
 
