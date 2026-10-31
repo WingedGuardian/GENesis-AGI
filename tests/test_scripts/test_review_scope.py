@@ -1078,7 +1078,7 @@ def test_the_named_exclusions_stay_standard(path):
 _CI_DATA_FILE = re.compile(
     r"""['"]config['"]\s*[/,]\s*((?:['"][\w.-]+['"]\s*[/,]\s*)*)['"]([\w.-]+)['"]"""
     r"""|(?<![\w./-])(config/[\w./-]+\.(?:json|ya?ml|toml|txt))(?![\w.-])"""
-    r"""|(?:^|[\s'"=/(\[])(\.[\w-]+(?:\.(?:toml|ya?ml|json|cfg|ini))?)(?=['"\s),;\]}:]|$)"""
+    r"""|(?:^|[\s'"=/(\[])(\.[\w-]+(?:\.(?:toml|ya?ml|json|cfg|ini))?)(?=['"\s),;\]}:|&]|$)"""
 )
 
 
@@ -1119,6 +1119,7 @@ def _ci_data_names(line: str) -> list[str]:
         ('ALLOW_PATH = ".leak-scan-history-allow.json"', {".leak-scan-history-allow.json"}),
         ("tool -c .gitleaks.toml, --x", {".gitleaks.toml"}),
         ("cfg = [.gitleaks.toml]", {".gitleaks.toml"}),
+        ("cat .gitleaks.toml|grep x && cat .gitleaks.toml&", {".gitleaks.toml"}),
     ],
 )
 def test_the_ci_data_extractor_reads_each_spelling(line, expected):
@@ -1160,7 +1161,12 @@ def test_the_ci_data_extractor_declared_non_goals(line):
 
 def _ci_read_data_files(root: Path) -> dict[str, list[str]]:
     """Tracked data files named in `ci.yml` or in the scripts it invokes (plus
-    every `scripts/ci/` file), mapped to where each is named."""
+    every `scripts/ci/` file), mapped to where each is named.
+
+    ONE level deep: a helper that an invoked script calls in turn, outside
+    `scripts/ci/`, is not read, and neither is a path built in an f-string or
+    with backslash joins. Both are declared gaps of this watchdog test, not of
+    the lane itself; none applies to a tracked data file today."""
     workflow = root / ".github" / "workflows" / "ci.yml"
     tracked = set(
         subprocess.run(

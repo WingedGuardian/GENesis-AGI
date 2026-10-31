@@ -13,4 +13,4 @@
 
   A test re-derives which files CI checks read, so a check that starts reading a
   new one, in a recognised spelling, fails until it is listed. `pyproject.toml`
-  and other config files are unchanged.
+  and the config files not listed here keep their lane.
