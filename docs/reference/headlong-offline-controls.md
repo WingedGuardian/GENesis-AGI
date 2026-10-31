@@ -16,7 +16,9 @@ on manual dispatch once available on the default branch. Source is pinned to
 `eab04ad4097fb2030f27bee6026e24f57289f12d`. The build context contains an archive
 of that source, fixture scripts, committed Genesis source and license; it excludes
 checkout credentials, settings, home data and repository metadata. The stock
-workload does not import Genesis. The base image is digest-pinned and SDK version is pinned.
+workload does not import Genesis. Shared native mechanics metadata is packaged
+from `scripts/ci/ego_runtime_cases.py`; changes to it trigger this same workflow.
+The base image is digest-pinned and SDK version is pinned.
 Package versions and source hashes identify the actual run; package repository
 contents are not frozen across builds.
 
@@ -63,7 +65,7 @@ context limits or multi-turn conversation semantics. Requested token/thinking/
 effort settings are recorded; inference-setting parity is unqualified.
 
 Only the outer CI container executes generated Bash. The CLI adapter itself
-returns text. A native execution bridge is later work. Stock mechanics here
+returns text. The separate native probes qualify the protected SDK path. Stock mechanics here
 have no Genesis proposal authority, and the result cannot establish owner-policy,
 feedback-learning, recovery or initiative parity across G/H/B/C.
 

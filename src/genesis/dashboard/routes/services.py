@@ -113,10 +113,10 @@ async def mcp_tools():
             if mcp_obj is None:
                 result[name] = {"status": "error", "tools": []}
                 continue
-            tools = await _aio.wait_for(mcp_obj.get_tools(), timeout=2.0)
+            tools = await _aio.wait_for(mcp_obj.list_tools(), timeout=2.0)
             result[name] = {
                 "status": "up",
-                "tools": sorted(tools.keys()) if isinstance(tools, dict) else sorted(str(t) for t in tools),
+                "tools": sorted(tool.name for tool in tools),
             }
         except Exception as exc:
             result[name] = {"status": "error", "error": str(exc), "tools": []}

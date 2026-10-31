@@ -175,7 +175,7 @@ async def test_hook_exits_before_injecting_in_dispatched_sessions():
 async def _mcp_tools():
     from genesis.mcp.memory_mcp import mcp
 
-    return await mcp.get_tools()
+    return {tool.name: tool for tool in await mcp.list_tools()}
 
 
 async def test_memory_proactive_drops_external_dispatched_enforce(

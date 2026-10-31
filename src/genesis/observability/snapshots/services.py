@@ -204,21 +204,13 @@ async def mcp_status() -> dict:
             if mcp_obj is None:
                 servers[name] = {"status": "error", "error": "no mcp object"}
                 continue
-            tools = await _aio.wait_for(mcp_obj.get_tools(), timeout=2.0)
+            tools = await _aio.wait_for(mcp_obj.list_tools(), timeout=2.0)
             servers[name] = {
                 "status": "up" if tools else "no_tools",
                 "tool_count": len(tools),
             }
         except Exception as exc:
-            try:
-                tm = getattr(mcp_obj, "_tool_manager", None)
-                if tm:
-                    tool_count = len(getattr(tm, "_tools", {}))
-                    servers[name] = {"status": "registered", "tool_count": tool_count}
-                else:
-                    servers[name] = {"status": "error", "error": str(exc)}
-            except Exception:
-                servers[name] = {"status": "error", "error": str(exc)}
+            servers[name] = {"status": "error", "error": str(exc)}
 
     # Overlay crash file data — process-level crashes the import check can't see
     # Restrict to known server names (match _VALID_SERVERS in genesis_mcp_server.py)

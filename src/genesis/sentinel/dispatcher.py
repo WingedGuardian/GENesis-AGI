@@ -115,6 +115,19 @@ _ALARM_CONFIRMATION_COUNT = 2
 # attempts → alarm recurs → dispatch again (every tick).
 _RESOLVED_COOLDOWN_S = 15 * 60  # 15 minutes
 
+# Clear-side hysteresis for an alarm-backed parked approval. The 2-of-3 ring
+# buffer above debounces the RISE of an alarm; nothing debounced its FALL, so a
+# request parked for an alarm hovering at its threshold was cancelled as
+# ``alarm_cleared`` on the first tick it dipped below. Requiring the alarm to be
+# ABSENT for this many CONSECUTIVE ticks mirrors the rise side's 2-tick
+# confirmation: one dip is a flap, two in a row is a clear. Counted in ticks, not
+# percent: the threshold belongs to the alert producer, not here. Cost: a real
+# clear cancels one tick later. Read from the ring buffer, so it must not exceed
+# _ALARM_RING_SIZE. (READ 2026-10-26: both memory requests that day were
+# cancelled when their episode really ended, so this guards the flapping shape
+# rather than explaining those two.)
+_ALARM_CLEAR_TICKS = 2
+
 # Tools disallowed when a Sentinel session runs DEGRADED (MCP config
 # unavailable). Without the genesis MCP servers the session cannot call
 # outreach_send_and_wait to self-gate its actions, so under skip_permissions it
@@ -1898,11 +1911,35 @@ class SentinelDispatcher:
                 except (json.JSONDecodeError, TypeError):
                     pass
             # Fall back to pending_pattern (single alarm ID) if no list
-            if not pending_ids and self._state.pending_pattern:
-                pending_ids = {self._state.pending_pattern}
+            pattern = self._state.pending_pattern
+            if not pending_ids and pattern:
+                pending_ids = {pattern}
+            # A park from escalate_direct / a Guardian concern has no alarm: its
+            # pattern is "direct:<source>", which no alert id ever equals, so it
+            # reads as "cleared" on every tick. The hysteresis and the cooldown
+            # below are for ALARM-backed parks only; a direct park keeps its
+            # existing behaviour unchanged (cancel on the first tick, no cooldown).
+            alarm_backed = bool(pending_ids) and not pattern.startswith("direct:")
 
-            if pending_ids and not (pending_ids & current_ids):
-                request_id = self._state.pending_request_id
+            request_id = self._state.pending_request_id
+            absent = bool(pending_ids) and not (pending_ids & current_ids)
+            # Clear-side hysteresis, derived rather than counted: the ring buffer
+            # already holds this and the previous ticks' alarm ids (appended above,
+            # including on lock-busy ticks). An empty or short ring (e.g. just
+            # after a restart) keeps the park, so a restart can only delay a
+            # cancel, never cause an early one.
+            recent = list(self._recent_alarm_sets)[-_ALARM_CLEAR_TICKS:]
+            cleared = (
+                len(recent) == _ALARM_CLEAR_TICKS
+                and all(not (pending_ids & ids) for ids in recent)
+            )
+            if absent and alarm_backed and not cleared:
+                logger.info(
+                    "Pending alarms %s absent this tick, not yet %d in a row — "
+                    "keeping sentinel approval %s parked",
+                    pending_ids, _ALARM_CLEAR_TICKS, request_id,
+                )
+            elif absent:
                 if request_id and self._approval_gate is not None:
                     try:
                         await self._approval_gate.resolve_request(
@@ -1911,6 +1948,14 @@ class SentinelDispatcher:
                     except Exception:
                         logger.warning("Failed to cancel sentinel approval %s", request_id, exc_info=True)
                 logger.info("Pending alarms %s cleared — cancelling sentinel approval %s", pending_ids, request_id)
+                # Same re-dispatch cooldown as a resolved dispatch (_backoff_ready
+                # reads it), counted from the CANCEL. The per-pattern backoff is
+                # counted from the attempt, so a park that waited longer than the
+                # next backoff step had no spacing left at all: the alarm's next
+                # rise re-requested approval as soon as the 2-of-3 debounce
+                # confirmed it.
+                if alarm_backed and pattern:
+                    self._resolved_cooldowns[pattern] = time.monotonic()
                 async with self._lock:
                     self._state.clear_pending()
                     self._state.transition(SentinelState.HEALTHY, reason="pending alarms cleared while awaiting approval")

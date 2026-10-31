@@ -85,7 +85,7 @@ async def test_memory_recall_writes_one_row_for_all_its_traversals(mcp_state, mo
         ]
     )
 
-    await core_mod.memory_recall.fn(query="q", compact=False, include_graph=True, corrective=False)
+    await core_mod.memory_recall(query="q", compact=False, include_graph=True, corrective=False)
 
     assert written == [{"caller": "recall", "traversals": 2, "db_path": None}]
 
@@ -107,7 +107,7 @@ async def test_memory_recall_still_writes_when_the_request_is_cancelled(
     )
 
     with pytest.raises(asyncio.CancelledError):
-        await core_mod.memory_recall.fn(
+        await core_mod.memory_recall(
             query="q", compact=False, include_graph=True, corrective=False
         )
 
@@ -133,7 +133,7 @@ async def test_memory_expand_still_writes_when_the_request_is_cancelled(
     )
 
     with pytest.raises(asyncio.CancelledError):
-        await core_mod.memory_expand.fn(memory_ids=[mid])
+        await core_mod.memory_expand(memory_ids=[mid])
 
     assert written == [{"caller": "expand", "traversals": 1, "db_path": None}]
 

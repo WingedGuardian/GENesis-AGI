@@ -29,7 +29,7 @@ from genesis.security import immunity_shadow
 
 
 async def _get_tools():
-    return await mcp.get_tools()
+    return {tool.name: tool for tool in await mcp.list_tools()}
 
 
 @pytest.fixture

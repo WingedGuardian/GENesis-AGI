@@ -558,7 +558,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[test,transcript-analytics]"
+          pip install -e ".[test,transcript-analytics]" -c .github/test-tools/requirements.txt
       - name: Run tests
         # The narrator below fires on THIS step's failure, not on the job's.
         id: tests
@@ -717,7 +717,11 @@ jobs:
         # ceiling 420 -> 432. Confirm the exact new-head set in PR CI.
         # Scanned comments: eight filer cases and one skill-discovery opt-in.
         # Main ceiling 432 + 9 = 441; confirm exact identities in PR CI.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 441
+        # Card-fill keyboard selection adds one playwright importorskip browser
+        # test that skips without the browser stack, 441 -> 442.
+        # Validator role: 72 role and 24 adapter-bridge opt-in cases, 442 -> 538.
+        # Validator writers: fourteen opt-in native cases, 538 -> 552.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 552
 
   collected-floor:
     # Tests that stop being collected make the suite SMALLER, not red. This job
@@ -753,7 +757,7 @@ jobs:
         # install lines in step.
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[test,transcript-analytics]"
+          pip install -e ".[test,transcript-analytics]" -c .github/test-tools/requirements.txt
       - name: Resolve the base commit
         id: base
         env:
@@ -840,6 +844,9 @@ jobs:
           # from the comparison.
           base_py=python
           deps_differ=0
+          # The test-tool pins come from the PR tree: the base commit may predate
+          # the file, and both trees must collect under the same pytest.
+          cp .github/test-tools/requirements.txt "$RUNNER_TEMP/test-tools.txt"
           git diff --quiet "$BASE" "$HEAD_SHA" -- pyproject.toml || deps_differ=1
           # --force: an untracked file in the way of a base file would
           # otherwise stop the switch (measured, git 2.43).
@@ -848,7 +855,7 @@ jobs:
             echo "collected-floor: pyproject.toml differs; collecting the base in a fresh venv"
             python -m venv "$RUNNER_TEMP/venv-base"
             base_py="$RUNNER_TEMP/venv-base/bin/python"
-            "$base_py" -m pip install --quiet -e ".[test,transcript-analytics]" > "$out/base-install.log" 2>&1 \
+            "$base_py" -m pip install --quiet -e ".[test,transcript-analytics]" -c "$RUNNER_TEMP/test-tools.txt" > "$out/base-install.log" 2>&1 \
               || { tail -n 30 "$out/base-install.log"; echo "::error::collected-floor: installing the base tree's dependencies failed"; exit 2; }
           fi
           collect base "$base_py"

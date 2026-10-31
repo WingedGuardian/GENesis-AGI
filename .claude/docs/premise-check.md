@@ -308,7 +308,10 @@ Unforeseen complications are expected, and the section is where they are stated.
 The output is a **judgment about direction**, handed to whoever owns the change. It
 is not permission to rewrite it, not a substitute for the code review (run this
 first, then review the code if the premises hold), and not a reason to close
-anything — a reviewer session retires nothing.
+anything — a reviewer session retires nothing. A premise that fails because
+the code cannot land, while the problem it solves is still wanted, keeps the
+PR open and routes it as below; only a dead problem closes a PR
+(closing-session, "Superseded is about the problem").
 
 **BROKEN routes through the ESTABLISHED disposition, not a new one — and the bar
 is HIGH.** The repo already has a route for a change that is wrong at the premise

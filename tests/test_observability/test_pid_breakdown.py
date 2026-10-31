@@ -552,3 +552,124 @@ def test_accounting_type_change_discards_process_totals(fake, monkeypatch, after
 def test_unknown_options_never_enrich_labels(fake, argv):
     fake.process(60, "fixture", 1, 1, argv)
     assert pb.process_label(60) == argv[0]
+
+
+# ── memory breakdown (container memory alarm) ────────────────────────────────
+
+
+@pytest.fixture()
+def mem(fake, monkeypatch):
+    """The fake /proc, with ``cc_slots._PROC`` repointed too (it reads VmRSS)."""
+    from genesis.observability import cc_slots
+
+    monkeypatch.setattr(cc_slots, "_PROC", str(fake.proc))
+    monkeypatch.delenv("GENESIS_PID_BREAKDOWN_DISABLED", raising=False)
+
+    def rss(pid, mb):
+        (fake.proc / str(pid) / "status").write_text(f"Name:\tx\nVmRSS:\t{int(mb * 1024)} kB\n")
+
+    fake.rss = rss
+    return fake
+
+
+def _incident_shape(mem):
+    """The 2026-10-26 shape: an app-server daemon whose MCP children hold most of
+    the container's memory, beside a claude session and a small service."""
+    # app-server tree, one unit: daemon (parent outside the sample) + 3 MCP children
+    for pid, ppid, comm, argv, mb in [
+        (100, 1, "codex", ["/opt/bin/codex", "app-server"], 200),
+        (101, 100, "python3", ["/v/bin/python3", "server.py", "--token=SECRET"], 4000),
+        (102, 100, "python3", ["/v/bin/python3", "server.py"], 4500),
+        (103, 100, "node", ["node", "/opt/mcp/index.js"], 4600),
+    ]:
+        mem.process(pid, comm, ppid, 1, argv, cgroup="/session-7.scope")
+        mem.rss(pid, mb)
+    # a claude session tree: claude + one child
+    mem.process(
+        200, "claude", 199, 1, ["claude", "--resume", "secret-token"], cgroup="/session-8.scope"
+    )
+    mem.rss(200, 600)
+    mem.process(201, "node", 200, 1, ["node", "/opt/mcp/x.js"], cgroup="/session-8.scope")
+    mem.rss(201, 400)
+    # a small service in its own unit
+    mem.process(300, "sleep", 1, 1, ["sleep", "100"], cgroup="/app.slice/other.service")
+    mem.rss(300, 5)
+    # a fourth, smaller tree that the top-3 cut must drop
+    mem.process(400, "tiny", 1, 1, ["tiny"], cgroup="/app.slice/tiny.service")
+    mem.rss(400, 1)
+
+
+def test_memory_trees_rank_whole_trees_by_summed_rss(mem):
+    _incident_shape(mem)
+    result = pb.memory_trees(str(mem.proc.parent))
+    assert result["status"] == "sampled"
+    trees = result["trees"]
+    assert [t["root_pid"] for t in trees] == [100, 200, 300]  # top 3, largest first
+    assert trees[0]["rss_mb"] == pytest.approx(13300, abs=1)  # children counted IN the tree
+    assert trees[0]["children"] == 3
+    assert trees[0]["label"] == "codex"
+    assert trees[1]["rss_mb"] == pytest.approx(1000, abs=1)
+    assert trees[1]["children"] == 1
+
+
+def test_memory_summary_names_the_culprit_without_argv_secrets(mem):
+    _incident_shape(mem)
+    text = pb.memory_summary(str(mem.proc.parent))
+    assert text.startswith("Top memory trees at ")
+    assert "codex (pid 100): 13.0 GB, 3 children" in text
+    assert "claude (pid 200): 1000 MB, 1 children" in text
+    assert "tiny" not in text
+    assert "SECRET" not in text and "secret-token" not in text
+
+
+def test_memory_summary_label_cannot_carry_markup(mem):
+    # argv[0] is empty, so the label falls back to [comm], which a process sets freely.
+    mem.process(100, "<b>x&y</b>", 1, 1, [""], cgroup="/session-7.scope")
+    mem.rss(100, 50)
+    text = pb.memory_summary(str(mem.proc.parent))
+    assert "<" not in text and "&" not in text and ">" not in text
+    assert "(pid 100): 50 MB" in text
+
+
+def test_memory_summary_keeps_the_exited_marker():
+    assert pb._UNSAFE_LABEL_RE.sub("?", "(exited)") == "(exited)"
+
+
+def test_zombies_are_not_reported_as_unreadable(mem):
+    mem.process(100, "codex", 1, 1, ["codex"], cgroup="/session-7.scope")
+    mem.rss(100, 50)
+    # A zombie child: stat state "Z", and no VmRSS line (as the kernel writes it).
+    mem.process(101, "codex", 100, 1, [""], cgroup="/session-7.scope")
+    stat = mem.proc / "101" / "stat"
+    stat.write_text(stat.read_text().replace(") S ", ") Z ", 1))
+    result = pb.memory_trees(str(mem.proc.parent))
+    assert result["processes_seen"] == 2
+    assert result["rss_unreadable"] == 0
+    assert "unreadable" not in pb.memory_summary(str(mem.proc.parent))
+
+
+def test_memory_summary_is_explicit_when_rss_is_unreadable(mem):
+    mem.process(100, "codex", 1, 1, ["codex"], cgroup="/session-7.scope")  # no status file
+    text = pb.memory_summary(str(mem.proc.parent))
+    assert text == "Process breakdown unavailable: VmRSS unreadable for all 1 processes."
+
+
+def test_memory_summary_is_explicit_when_proc_is_empty(mem):
+    text = pb.memory_summary(str(mem.proc.parent))
+    assert text.startswith("Process breakdown unavailable: no process readable under ")
+
+
+def test_memory_summary_reports_a_crash_as_unavailable(mem, monkeypatch):
+    def boom(*_a, **_k):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(pb, "memory_trees", boom)
+    assert pb.memory_summary() == "Process breakdown unavailable: PermissionError."
+
+
+def test_memory_summary_honours_the_breakdown_kill_switch(mem, monkeypatch):
+    _incident_shape(mem)
+    monkeypatch.setenv("GENESIS_PID_BREAKDOWN_DISABLED", "1")
+    assert pb.memory_summary(str(mem.proc.parent)).startswith(
+        "Process breakdown unavailable: disabled"
+    )

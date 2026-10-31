@@ -44,6 +44,11 @@ VALID_OUTCOMES = ("consume", "consume_full", "restore", "restore_backoff", "rest
 LOCK_WAIT_S = 0.5
 OUTCOME_LOCK_WAIT_S = 5.0
 SCHEMA_VERSION = 2
+# `automatic-ready` reports an incomplete protocol with a dedicated status that
+# neither Python (1 on an uncaught exception) nor bash (1/2/126/127 on its own
+# failures) produces by accident, so the runner never mistakes a crash for the
+# expected pause.
+AUTOMATIC_PROTOCOL_INCOMPLETE = 10
 _HASH_RE = re.compile(r"^[0-9a-f]{16}$")
 _CLAIM_RE = re.compile(r"^[0-9a-f]{32}$")
 
@@ -733,6 +738,7 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("hash")
     p.add_argument("--repo", required=True)
     sub.add_parser("list")
+    sub.add_parser("automatic-ready")
     p = sub.add_parser("import-status")
     p.add_argument("--limit", type=int, default=20)
     for name in (
@@ -757,14 +763,21 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--claim-id", required=True)
     p.add_argument("--attempts-inc", action="store_true")
     args = parser.parse_args(argv)
-    if args.cmd == "import-status":
+    if args.cmd in ("automatic-ready", "import-status"):
         try:
-            result = _legacy.import_status(database_path(), limit=args.limit)
+            result = _legacy.import_status(
+                database_path(),
+                limit=getattr(args, "limit", 0),
+                protocol_only=args.cmd == "automatic-ready",
+            )
         except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:
-            print(json.dumps({"state": "error", "error": str(exc)}, ensure_ascii=True))
+            print(
+                json.dumps({"state": "error", "error": str(exc)}, ensure_ascii=True),
+                file=sys.stderr if args.cmd == "automatic-ready" else sys.stdout,
+            )
             return 2
         print(json.dumps(result, ensure_ascii=True))
-        return 0
+        return AUTOMATIC_PROTOCOL_INCOMPLETE if args.cmd == "automatic-ready" else 0
     if args.cmd == "write":
         print(write_marker(args.repo, args.tools, args.mode))
         return 0
@@ -823,4 +836,10 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception:
+        import traceback
+
+        traceback.print_exc()
+        sys.exit(2)

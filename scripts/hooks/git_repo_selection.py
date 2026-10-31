@@ -53,13 +53,16 @@ REPO_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR")
 REPO_FLAGS = ("--git-dir", "--work-tree")
 
 _VARS_ALT = "|".join(REPO_VARS)
-#: A word that ASSIGNS one of the variables (``NAME=`` / ``NAME+=``).
-_ASSIGN_RE = re.compile(rf"^(?:{_VARS_ALT})\+?=")
-#: A word that NAMES one of them, as ``export NAME`` or ``read NAME`` do.
-_NAME_RE = re.compile(rf"^(?:{_VARS_ALT})$")
-_MENTION_RE = re.compile(rf"\b(?:{_VARS_ALT})\b")
-#: ``${GIT_DIR:=x}`` / ``${GIT_DIR=x}`` — a parameter expansion that ASSIGNS.
-_EXPANSION_ASSIGN_RE = re.compile(rf"\$\{{(?:{_VARS_ALT}):?=")
+
+
+def variable_patterns(names: str):
+    """Compile a trusted variable-name pattern for the same assignment walk."""
+    return (re.compile(rf"^(?:{names})\+?="), re.compile(rf"^(?:{names})$"),
+            re.compile(rf"\b(?:{names})\b"), re.compile(rf"\$\{{(?:{names}):?="))
+
+
+_REPO_PATTERNS = variable_patterns(_VARS_ALT)
+_ASSIGN_RE, _NAME_RE, _MENTION_RE, _EXPANSION_ASSIGN_RE = _REPO_PATTERNS
 #: Any mention of a variable or a flag, for text the parser could not read.
 _ANY_MENTION_RE = re.compile(rf"\b(?:{_VARS_ALT})\b|--git-dir\b|--work-tree\b")
 
@@ -135,13 +138,14 @@ def seg_redirects_repo(seg) -> bool:
     return False
 
 
-def seg_sets_repo_env(seg) -> bool:
-    """Whether this segment leaves a repository variable set for LATER commands.
+def seg_sets_variables(seg, patterns) -> bool:
+    """Whether this segment assigns variables matched by a trusted pattern bundle.
 
     Not the command-scoped form — ``GIT_DIR=x git status && git merge main``
     runs the merge in the ordinary checkout. Not a mere mention either —
     ``echo GIT_DIR``, ``unset GIT_DIR``, ``git commit -m GIT_DIR`` set nothing.
     """
+    _ASSIGN_RE, _NAME_RE, _MENTION_RE, _EXPANSION_ASSIGN_RE = patterns
     argv = getattr(seg, "argv", None) or []
     if any(_EXPANSION_ASSIGN_RE.search(a) for a in argv):
         return True  # `: ${GIT_DIR:=x}` assigns in the current shell
@@ -177,6 +181,11 @@ def seg_sets_repo_env(seg) -> bool:
         # eval re-parses its words; it may assign anything they name or expand to.
         return any(_MENTION_RE.search(a) or "$" in a or "`" in a for a in args)
     return False
+
+
+def seg_sets_repo_env(seg) -> bool:
+    """Preserve the existing repository-variable policy and signature."""
+    return seg_sets_variables(seg, _REPO_PATTERNS)
 
 
 def raw_sets_repo_env(raw: str) -> bool:

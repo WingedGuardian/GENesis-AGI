@@ -949,6 +949,28 @@ neither blocks opening).
    covering three PRs costs the user one decision instead of three.
 4. Re-read the queue at the start of every pass. Never work from a remembered
    list: another session may have opened, closed, or pushed to any of them.
+5. **Triage every question before you ask it** (owner, 2026-10-28). A closing
+   session that asks about everything stalls its queue, and one that guesses
+   makes decisions nobody signed. Put each question in exactly ONE bucket first.
+   An assumption is never an answer.
+   1. **Answerable from evidence:** answer it yourself, citing the evidence
+      (file:line, PR, live query, ruling id).
+   2. **Covered by a standing rule:** do what the rule says, and name it in one
+      line. A rule that says "ask the owner" still means ask.
+   3. **Low-stakes and reversible:** decide, and log the decision for the
+      owner's review in this list's step 3 batch.
+   4. **A genuine owner decision:** ask with `AskUserQuestion`, carrying the
+      facts and the cost of each option, batched per this list's step 3 where
+      several are pending; or record it as a true blocker and move to the next
+      PR.
+
+   **Anything this skill already reserves for the owner is bucket 4, never 3:**
+   the "Always the owner's call" list under "4. The merge gate", a real finding
+   left unfixed, a NEW P1 on the fix-code at round 2, and any design, premise or
+   user-impact question a review raised. When unsure between 3 and 4, it is 4.
+
+   Check the triage by how few bucket-3 decisions the owner reverses: a reversal
+   means that kind of call belongs in bucket 4.
 
 ### Two reviewers pushing opposite values
 
@@ -1646,6 +1668,45 @@ retires a Devin rework's old PR after the same check ("Building a rework", build
 The closing comment carries that per-file mapping and names the successor, so the
 reasoning stays addressable after the close. Short of all three, name the
 successor in a comment and leave the PR open.
+
+**Superseded is about the problem, never the code (standing owner rule,
+2026-10-27).** The question that decides whether a PR may close is "do we still
+intend to get this work done?", not "how similar is this code to the code we now
+want?". A PR closes only when the problem it sets out to solve is dead: already
+solved on `main` or by the successor, obsolete, or dropped by an owner decision,
+with no intention to do that work again in any PR. Code that cannot be rebased,
+reused or saved is not a reason to close. When the problem is still wanted, the
+disposition is a send-back however much code must be redone, by one of the two
+routes in "Sending a PR back": `needs-architecture-session` while the premise
+or design is in question, and a `## Rework spec` with `needs-rework` only once
+the owner has decided the shape. Either way the PR moves to draft and stays
+open. A `## Rework spec` this session writes before the owner decides is not
+the owner's authorization for condition 1. The builder closes the PR when its
+replacements open; for a Devin rework the closing session does, after the same
+check. A PR whose problem is only partly solved stays open on the same terms:
+the parts still wanted are what the send-back carries.
+
+"Obsolete" is the owner's call, not a reviewer's finding. A problem is obsolete
+when the owner has dropped it or ruled the design that needed it settled the
+other way; "main was redesigned" is not obsolete, because the redesign still
+owes the same problem. A reviewer who believes a problem is obsolete asks the
+owner, and a PR whose author has gone silent stays open as a handoff while that
+question is asked.
+
+So in condition 3, "covered" and "moot" are judged by the problem each part
+solved. Covered means that guarantee is delivered on `main` or by the successor;
+name the `file:line` that delivers it, read from the code, not taken from an
+agent's map. Moot means the problem itself is gone: an owner decision dropped it,
+or the reason for it no longer exists. "This file no longer applies to main's
+design" is neither, because a redesign still owes the same problem.
+
+Never propose retiring a PR to the owner on the strength of its code. Before any
+close is suggested, state per PR the problem it solves and whether main already
+solves it, then propose a send-back for every part still wanted. Instance
+(2026-10-27): a stale stack of eight PRs on a replaced storage design was
+proposed for closing because none could be rebased. A per-guarantee check found
+all eight still delivering something main lacks, and the base PR's own closing
+comment said the stack "need[s] re-specifying"; all eight were sent back.
 
 If you believe any other PR should be retired and nobody is picking it up, that
 is a question for the user, not a judgment call for the review station.

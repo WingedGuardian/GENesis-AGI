@@ -147,11 +147,11 @@ async def test_real_http_native_mcp_queue_poll_ack_correlated_reply_restart(
     monkeypatch.setattr(outreach_mcp, "_pipeline", None)  # actual native MCP subprocess path
     mid = str(uuid4())
     response = json.loads(
-        await outreach_mcp.agent_send.fn("alpha", "Genesis asks for an opinion", message_id=mid)
+        await outreach_mcp.agent_send("alpha", "Genesis asks for an opinion", message_id=mid)
     )
     assert response["status"] == "queued_for_governance"
     retry = json.loads(
-        await outreach_mcp.agent_send.fn(
+        await outreach_mcp.agent_send(
             "alpha",
             "Genesis asks for an opinion",
             message_id=mid,
@@ -166,7 +166,7 @@ async def test_real_http_native_mcp_queue_poll_ack_correlated_reply_restart(
         ("alpha", "Genesis asks for an opinion", str(uuid4())),
     ):
         refused = json.loads(
-            await outreach_mcp.agent_send.fn(peer, text, message_id=mid, context_id=context)
+            await outreach_mcp.agent_send(peer, text, message_id=mid, context_id=context)
         )
         assert refused == {"code": "outbound_refused", "status": "refused"}
     assert (await Outbox(b.registry).poll(b.identities["alpha"]))[0] == []
@@ -379,7 +379,7 @@ async def test_live_mcp_and_stale_adapter_respect_pending_anchor(bridge, monkeyp
     monkeypatch.setattr(outreach_mcp, "_pipeline", None)
     mid = str(uuid4())
     first = json.loads(
-        await outreach_mcp.agent_send.fn("alpha", "Original question", message_id=mid)
+        await outreach_mcp.agent_send("alpha", "Original question", message_id=mid)
     )
     env, _ = await box.prepare("alpha", "Original question", first["context_id"], mid)
     if closure == "cancel":
@@ -392,11 +392,11 @@ async def test_live_mcp_and_stale_adapter_respect_pending_anchor(bridge, monkeyp
     live.submit = AsyncMock(wraps=live.submit)
     monkeypatch.setattr(outreach_mcp, "_pipeline", live)
     changed = json.loads(
-        await outreach_mcp.agent_send.fn("alpha", "Changed question", first["context_id"], mid)
+        await outreach_mcp.agent_send("alpha", "Changed question", first["context_id"], mid)
     )
     assert changed == {"code": "outbound_refused", "status": "refused"}
     retry = json.loads(
-        await outreach_mcp.agent_send.fn("alpha", "Original question", first["context_id"], mid)
+        await outreach_mcp.agent_send("alpha", "Original question", first["context_id"], mid)
     )
     assert retry["status"] == ("queued_for_governance" if closure == "open" else "queue_closed")
     assert retry["pending_id"] == first["pending_id"]
@@ -458,7 +458,7 @@ async def test_registered_send_tool_and_native_profile_boundary():
     from genesis.cc.direct_session import PROFILES
     from genesis.mcp.outreach_mcp import mcp
 
-    assert "agent_send" in await mcp.get_tools()
+    assert "agent_send" in {tool.name: tool for tool in await mcp.list_tools()}
     tool = "mcp__genesis-outreach__agent_send"
     assert tool in PROFILES["observe"]
     assert tool in PROFILES["mail"]
@@ -550,11 +550,11 @@ async def test_generic_agent_channel_refused_without_queueing(bridge, monkeypatc
         )
         assert (await p.submit_urgent(untyped)).status.value == "rejected"
     result = json.loads(
-        await outreach_mcp.outreach_send.fn("Untyped text", "notification", "agent")
+        await outreach_mcp.outreach_send("Untyped text", "notification", "agent")
     )
     assert result["status"] == "refused"
     waiting = json.loads(
-        await outreach_mcp.outreach_send_and_wait.fn(
+        await outreach_mcp.outreach_send_and_wait(
             "Untyped text", "notification", "agent", timeout_seconds=1
         )
     )
@@ -579,8 +579,8 @@ async def test_a_peer_message_over_the_daily_cap_stays_queued_for_a_later_drain(
     p.reload_config(replace(p._config, max_daily=0, agent_daily_per_peer=1))
     monkeypatch.setattr(outreach_mcp, "_db", bridge.db)
     monkeypatch.setattr(outreach_mcp, "_pipeline", None)
-    first = json.loads(await outreach_mcp.agent_send.fn("alpha", "First question"))
-    second = json.loads(await outreach_mcp.agent_send.fn("alpha", "Second question"))
+    first = json.loads(await outreach_mcp.agent_send("alpha", "First question"))
+    second = json.loads(await outreach_mcp.agent_send("alpha", "Second question"))
     scheduler = OutreachScheduler(p, AsyncMock(), AsyncMock(), p._config, bridge.db)
     scheduler._record_job_result = AsyncMock()
     await scheduler._drain_pending_job()
@@ -606,7 +606,7 @@ async def test_dedup_after_retained_delivery_closes_pending_row(bridge, monkeypa
     p = pipeline(bridge)
     monkeypatch.setattr(outreach_mcp, "_db", bridge.db)
     monkeypatch.setattr(outreach_mcp, "_pipeline", None)
-    answer = json.loads(await outreach_mcp.agent_send.fn("alpha", "A retained question"))
+    answer = json.loads(await outreach_mcp.agent_send("alpha", "A retained question"))
     scheduler = OutreachScheduler(p, AsyncMock(), AsyncMock(), p._config, bridge.db)
     scheduler._record_job_result = AsyncMock()
     real_mark = scheduler._mark_row_delivered

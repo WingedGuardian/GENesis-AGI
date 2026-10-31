@@ -271,6 +271,7 @@ _SESSION_JS = (
 )
 _SAME_JS = "(a, b) => a === b"
 _CONNECTED_JS = "(e) => e.isConnected"
+_FOCUSED_JS = "(e) => e.ownerDocument.activeElement === e"
 # Whether clicking ``e`` ticks a box: a checkbox itself, a label whose control is
 # one, or inside a role=checkbox / role=switch element.
 _CHECKBOX_JS = r"""(e) => {
@@ -1412,14 +1413,24 @@ async def _extras(
                 raise _Stop("extra_field_not_found")
         seen.append((frame, handle))
         if fill:
+            state = "ok"
             try:
                 if tag == "select":
                     await _select(handle, value)
+                    # A page can revert any selection a script makes (measured on
+                    # a hosted checkout: only a trusted, typed choice held).
+                    if not await _shows_option(handle, value):
+                        others = [f.handle for f in fields.values()]
+                        others += [h for _f, h in seen if h is not handle]
+                        state = await _select_by_keys(ppage, handle, value, others)
                 else:
                     await _step(handle.fill(value, timeout=10000))
             except Exception as e:  # noqa: BLE001 - never the exception's text
                 logger.warning("payment extra field %s did not fill (%s)", name, type(e).__name__)
                 raise _Stop(f"extra_field_failed:{name}:fill") from None
+            if state != "ok":
+                logger.warning("payment extra field %s: typed choice failed (%s)", name, state)
+                raise _Stop(f"extra_field_failed:{name}:{state}")
     if not check_values:  # located only (values typed later, after the tap)
         return
     reads = [
@@ -1442,6 +1453,37 @@ async def _extras(
                 {n: r[0] == "ok" for n, _v, r in reads if n != name},
             )
             raise _Stop(f"extra_field_failed:{name}:{state}")
+
+
+async def _shows_option(handle, value: str) -> bool:
+    """A select now shows ``value`` as its value or its selected option's label."""
+    got = await _step(handle.evaluate(EXTRA_VALUE_JS))
+    want = value.strip().casefold()
+    return isinstance(got, list) and any(
+        isinstance(g, str) and g.strip().casefold() == want for g in got
+    )
+
+
+async def _select_by_keys(ppage, handle, value: str, others: list) -> str:
+    """Choose an extra field's option the way a person does: focus the select,
+    and before each key check it IS the focused element of its document; type
+    the option's text and Tab away. "ok" when it then shows exactly that option
+    (a longer label the typeahead could land on reads differently) and no other
+    field (``others``: the card fields and the extras already filled) changed,
+    which is what shows the keys went nowhere else; else "select" or "keys".
+    For extra fields only, whose values are billing text: it runs before the
+    claim, when no card value exists in the window."""
+    before = [await _step(h.evaluate(EXTRA_VALUE_JS)) for h in others]
+    await _step(handle.focus())  # ElementHandle.focus takes no timeout; _step bounds it
+    for ch in value:
+        if not await _step(handle.evaluate(_FOCUSED_JS)):
+            return "select"
+        await _step(ppage.keyboard.type(ch))
+    await _step(ppage.keyboard.press("Tab"))
+    after = [await _step(h.evaluate(EXTRA_VALUE_JS)) for h in others]
+    if after != before:
+        return "keys"
+    return "ok" if await _shows_option(handle, value) else "select"
 
 
 async def _extra_reads(frame, sel: str, handle, value: str) -> tuple[str, list[int]]:

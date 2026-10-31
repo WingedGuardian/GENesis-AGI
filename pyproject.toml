@@ -56,6 +56,12 @@ dependencies = [
     "pydantic>=2.12,<3",  # strict validation for the decision registry (already pulled in by fastapi, litellm and mcp)
     "pyyaml",
     "a2a-sdk==1.2.2",
+    "claude-agent-sdk==0.2.172",  # live_agent: drives a persistent Claude Code session (query/steer/interrupt/
+                                  # can_use_tool). Pinned exactly: the wire contract it speaks to the CLI moves
+                                  # between releases. The wheel bundles its own CLI (~280 MB); live_agent runs the
+                                  # install's pinned `claude` instead (cli_path), so the bundle is unused.
+                                  # Core, not an extra, so update.sh installs it with no operator step;
+                                  # move it to an extra if the ~280 MB matters before live_agent ships.
     "markdown-it-py>=3",  # the merge gate's rework row reads PR bodies as CommonMark (already pulled in by rich)
     "httpx",
     "diskcache>=5.6",
@@ -65,9 +71,8 @@ dependencies = [
     "flask>=3.0",
     "flask-sock>=0.7",
     "wsproto>=1.2",  # transitive dep of flask-sock; pin to prevent silent uninstall
-    "fastmcp>=2.0,<3.0",  # <3 for API stability (3.x breaks the API). Genesis uses fastmcp stdio
-                         # transport only (no OpenAPIProvider/OAuthProxy), so its OpenAPI/OAuth CVEs
-                         # (CVE-2026-32871/27124/2025-64340, unfixed pre-3.2.0) are not reachable.
+    "fastmcp>=4.1.4,<5",  # Qualified v4 API and security floor; no background-tasks extra.
+    "mcp>=2.3.0,<3",  # Direct SDK floor; FastMCP v4 requires the v2 protocol implementation.
     "detect-secrets>=1.4",  # Phase 6 contribution sanitizer — REQUIRED floor. sanitize.py fails closed if missing.
     "pymupdf>=1.27",  # PDF text extraction for knowledge ingestion pipeline
     "scrapling>=0.4.7",  # Web fetching with TLS fingerprint impersonation
@@ -85,28 +90,8 @@ dependencies = [
                            # defaulting to networkx is a STAGED CUTOVER, not optionality.
                            # Its own pin is redis<9,>=8.0.0, so the line below is not an
                            # independent choice — declaring falkordb mandates redis 8.
-    "redis>=8,<9",  # Was UNDECLARED and purely transitive (fastmcp -> pydocket -> redis>=5,
-                    # no upper bound). Pinned explicitly now that first-party code depends
-                    # on it: observability/health.py's engine probe is the first in-tree
-                    # importer (there were zero before this change).
-                    #
-                    # MEASURED 2026-09-07, isolated venv, control flipping. Genesis
-                    # configures no redis URL, so the surface is the IMPORT chain rather
-                    # than a network connection.
-                    # ⚠ CORRECTED 2026-09-24: an earlier version of this comment added
-                    # "and never uses docket", which was FALSE and cost ~1.58 cores of
-                    # idle CPU before anyone looked. FastMCP instantiates a live Docket
-                    # AND runs a Worker at every server start, over in-process fakeredis
-                    # — it just has an empty queue, because no Genesis tool opts into
-                    # background tasks. `_run_mcp` now suppresses that worker; see
-                    # scripts/genesis_mcp_server.py::_suppress_docket_worker. Under
-                    # fastmcp 2.14.6 + pydocket
-                    # 0.25.0: redis 8.1.0 + fakeredis 2.37.1 import, FastMCP instantiates
-                    # and registers tools, docket._redis loads, fakeredis async round-trips,
-                    # and redis.asyncio's unix-socket client behaves. The same probe passes
-                    # on 7.4.0/2.34.1 and FAILS when asked to assert 8.x against 7.4.0, so
-                    # it is measuring the version it names. The whole graph-engine path
-                    # (12.4s full projection, concurrent-reader swap) also ran on 8.1.0.
+    "redis>=8,<9",  # Required by falkordb and the first-party engine-health probe.
+                    # FastMCP no longer supplies this through its optional task worker.
     # Transitive deps pinned to secure floors (audit #638) so a clean/cached install can't resolve a vulnerable version
     "urllib3>=2.7.0",  # via qdrant-client/requests — CVE-2026-44431/44432 (auth-header leak, decompression DoS)
     "idna>=3.15",  # via httpx/requests — CVE-2026-45409 (quadratic-processing DoS)

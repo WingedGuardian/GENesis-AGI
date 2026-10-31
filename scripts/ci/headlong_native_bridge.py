@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import aiosqlite
 import headlong_native_controls as native
+from ego_runtime_cases import outer_source
 from headlong_controls import preflight
 
 
@@ -73,6 +74,7 @@ async def main(work_root=Path("/work")):
     from headlong_prompt_references import canonical_id, load_config
 
     config = load_config(os.environ, work_root)
+    source = outer_source(config)
     args = parse_request(sys.argv[1:], config)
     root, run_root = Path(config["root"]).resolve(), Path(config["run_root"]).resolve()
     run_id_file = Path(os.environ["SHELLM_RUN_ID_OUT"]).resolve()
@@ -81,7 +83,7 @@ async def main(work_root=Path("/work")):
             or (run_root / "driver.json").exists() or (run_root / "driver.pending").exists() or (run_root / "calls.jsonl").exists()
             or os.environ.get("SHELLM_TRIGGER_STEP_ID") != config["trigger_id"]):
         raise ValueError("invalid or reused native fixture root")
-    header = {"type": "shellm-run", "source": "monolith", "engine": "claude-code-sdk",
+    header = {"type": "shellm-run", "source": source, "engine": "claude-code-sdk",
               "model": args.model, "wake": os.environ["SHELLM_WAKE"], "trigger_step": config["trigger_id"],
               "invocation_id": config["invocation_id"]}
     if config.get("fixture_header_id") is not None:
@@ -102,7 +104,7 @@ async def main(work_root=Path("/work")):
             raise OSError("synthetic observation append failure")
         if (root / "effect.bin").read_bytes() != native.EFFECT:
             raise ValueError("effect bytes differ before observation")
-        observation_id = append_step({"type": "observation", "source": "monolith", "run_id": run_id,
+        observation_id = append_step({"type": "observation", "source": source, "run_id": run_id,
                                       "content": receipt}, args.workdir)
 
     async with aiosqlite.connect(root / "fixture.sqlite3") as db:
@@ -132,7 +134,7 @@ async def main(work_root=Path("/work")):
                 if config.get("fault") == "final":
                     raise OSError("synthetic final append failure")
                 content = (receipt + "\n" if observation_id else "") + result["result"]
-                final_id = append_step({"type": "final", "source": "monolith", "run_id": run_id,
+                final_id = append_step({"type": "final", "source": source, "run_id": run_id,
                                        "content": content, "native_session_id": result["session_id"]}, args.workdir)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -142,7 +144,8 @@ async def main(work_root=Path("/work")):
                   "prompt_status": os.environ.get("HEADLONG_NATIVE_PROMPT_STATUS"),
                   "failure_kind": prompt_failure(os.environ.get("HEADLONG_NATIVE_PROMPT_STATUS")),
                   "calls": port.calls, "error": error, "observation_id": observation_id, "final_id": final_id,
-                  "prompt_sha256": hashlib.sha256(args.prompt.encode()).hexdigest(), "model": args.model}
+                  "prompt_sha256": hashlib.sha256(args.prompt.encode()).hexdigest(), "model": args.model,
+                  "outer_source": source}
     if not complete:
         print(error or "native provider/handler did not complete", file=sys.stderr)
     else:

@@ -374,7 +374,7 @@ class TestExaDomainFilter:
 
         with patch("genesis.providers.exa_adapter.ExaAdapter") as MockAdapter:
             mock_instance = self._mock_adapter(MockAdapter)
-            await web_tools.web_search.fn(
+            await web_tools.web_search(
                 "agent review loop",
                 "exa",
                 5,

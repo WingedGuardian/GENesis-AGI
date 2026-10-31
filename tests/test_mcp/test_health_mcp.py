@@ -13,7 +13,7 @@ from genesis.mcp.health_mcp import (
 
 
 async def test_all_tools_registered():
-    tools = await mcp.get_tools()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
     for name in [
         "health_status", "health_errors", "health_alerts",
         "session_config",
@@ -23,7 +23,7 @@ async def test_all_tools_registered():
 
 async def test_health_status_returns_dict_without_service():
     """Without a service wired, tools return graceful unavailable response."""
-    tools = await mcp.get_tools()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
     result = await tools["health_status"].fn()
     assert result["status"] == "unavailable"
 
@@ -846,8 +846,8 @@ async def test_provider_activity_falls_back_to_the_shared_db_when_memory_is_empt
     from genesis.mcp.health.provider import provider_activity as _tool
     from genesis.observability.provider_activity import ProviderActivityTracker
 
-    # `@mcp.tool()` wraps the coroutine in a FunctionTool; `.fn` is the callable.
-    provider_activity = _tool.fn
+    # v4's decorator keeps the original coroutine directly callable.
+    provider_activity = _tool
 
     tracker = ProviderActivityTracker()  # empty, as in a fresh subprocess
     from_db = [{"provider": "llm.gemini_flash", "calls": 7, "errors": 0}]

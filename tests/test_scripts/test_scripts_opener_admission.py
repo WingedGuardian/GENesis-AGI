@@ -87,6 +87,8 @@ _ALLOWLIST: dict[str, str] = {
     "backfill_session_charters.py": _OPERATOR_ONE_OFF,
     "backfill_session_memories.py": _OPERATOR_ONE_OFF,
     "backfill_source_subsystem.py": _OPERATOR_ONE_OFF,
+    "ci/ego_owned_controls.py": _CI_FIXTURE,
+    "ci/ego_owned_loop.py": _CI_FIXTURE,
     "ci/headlong_monolith_controls.py": _CI_FIXTURE,
     "ci/headlong_native_bridge.py": _CI_FIXTURE,
     "ci/headlong_native_controls.py": _CI_FIXTURE,
@@ -98,6 +100,7 @@ _ALLOWLIST: dict[str, str] = {
     "entity_cleanup_fake_commits.py": _OPERATOR_ONE_OFF,
     "gen_memory_quality_chart.py": _OPERATOR_ONE_OFF,
     "graph_cutover_report.py": _OPERATOR_ONE_OFF,  # read-only (mode=ro) verdict report
+    "inbox_coverage_report.py": _OPERATOR_ONE_OFF,  # read-only (mode=ro) verdict report
     "ledger_shadow_report.py": _OPERATOR_ONE_OFF,
     "lib/index_marker.py": (
         "opens its OWN code-intel queue database under marker_dir(), never "

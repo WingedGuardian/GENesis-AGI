@@ -76,7 +76,10 @@ _FALLBACK_MODELS = [
     # Mirrors the canonical gemini-free provider in model_routing.yaml: the GA
     # gemini-3.5-flash (Google's replacement for the deprecated 3-flash-preview)
     # with thinking suppressed — 3.5 reasons by default, bloating free-tier TPM.
-    ("gemini/gemini-3.5-flash", "google", {"reasoning_effort": "disable"}),
+    # Raw thinkingConfig, as in the config: litellm 1.93.2 turns
+    # reasoning_effort=disable into thinkingLevel=minimal for Gemini 3 flash
+    # models, which Google rejects (#3674).
+    ("gemini/gemini-3.5-flash", "google", {"thinkingConfig": {"thinkingBudget": 0}}),
 ]
 
 # litellm model-string prefix → provider service name where they differ.

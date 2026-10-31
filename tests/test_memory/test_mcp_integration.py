@@ -30,7 +30,7 @@ def _reset_state():
 @pytest.fixture
 async def tools():
     """Get the MCP tool functions."""
-    return await memory_mcp_server.get_tools()
+    return {tool.name: tool for tool in await memory_mcp_server.list_tools()}
 
 
 @pytest.fixture
