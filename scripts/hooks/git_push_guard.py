@@ -201,6 +201,9 @@ try:
         INLINE_P2_RE as _INLINE_P2_RE,
     )
     from review_findings import (
+        INLINE_P3_RE as _INLINE_P3_RE,
+    )
+    from review_findings import (
         cr_header_fields as _cr_header_fields,
     )
     from review_findings import (
@@ -226,7 +229,7 @@ except Exception as _findings_exc:  # noqa: BLE001 — degrade the merge gate on
         f"scripts/review_findings.py is unimportable ({_findings_exc_type}); "
         f"repair the hook tree"
     )
-    _INLINE_P1_RE = _INLINE_P2_RE = None  # type: ignore[assignment]
+    _INLINE_P1_RE = _INLINE_P2_RE = _INLINE_P3_RE = None  # type: ignore[assignment]
     _CR_SEVERITIES = frozenset()  # type: ignore[assignment]
 
     def _cr_header_fields(line, *, skip_partial=False):  # type: ignore[no-redef]
@@ -2198,6 +2201,20 @@ def _is_sqlite_write(cmd: str) -> bool:
     return "sqlite3" in cmd and bool(_DML_KEYWORD_RE.search(cmd))
 
 
+#: Lines each unrecognised-comment NOTE lists before stating how many it left out.
+_UNRECOGNISED_LISTED = 10
+
+
+def _print_listing_rest(total: int) -> None:
+    """State how many entries a bounded NOTE listing left out, if any."""
+    if total > _UNRECOGNISED_LISTED:
+        print(
+            f"  … and {total - _UNRECOGNISED_LISTED} more (listing bounded to "
+            f"{_UNRECOGNISED_LISTED}; the count above is the total)",
+            file=sys.stderr,
+        )
+
+
 def _inline_title(body: str) -> str:
     """First readable line of an inline finding body, SAFE to print.
 
@@ -3489,6 +3506,13 @@ def _check_inline_review_findings(
     cr_unknown: list[str] = []  # a severity header naming a level we don't know
     cr_doc_skipped: list[str] = []  # CodeRabbit Critical/Major on a doc path
     unmatched_bot: list[tuple[str, str]] = []  # (login, title) — read, unrecognised
+    # Which of those carry a P3 badge: informational by design (no parser
+    # scores P3), so they are not format drift. Indices into unmatched_bot.
+    informational: set[int] = set()
+    # Which logins the registry knows at all, and which of them is CodeQL: the
+    # unrecognised bucket is printed in three parts (see the NOTEs below).
+    known_review_logins = frozenset().union(*scanner_sets.values())
+    codeql_logins = scanner_sets.get("codeql", frozenset())
     # Off-diff findings (issue #1728): (title, path) — surfaced, never scored.
     cr_off_diff: list[tuple[str, str]] = []
     off_diff_p1: list[tuple[str, str]] = []
@@ -3586,7 +3610,11 @@ def _check_inline_review_findings(
         #
         # So an unrecognised author skips the matchers entirely and falls to the
         # unrecognised branch: SURFACED, never scored, never blocking.
-        parseable = utype == "Bot" or login in inline_review_logins
+        # CodeQL is surface-only (`review_findings.KNOWN_FORMATS`): its body is
+        # never searched for a severity badge, so it reaches only the CodeQL NOTE.
+        parseable = (
+            utype == "Bot" or login in inline_review_logins
+        ) and login not in codeql_logins
         if login in devin_logins and utype == "Bot":
             # EXCLUSIVE and terminal, and placed BEFORE the badge branches below:
             # Devin quotes guard output and code in its findings, so a body can
@@ -3792,6 +3820,8 @@ def _check_inline_review_findings(
             # protects the CodeRabbit path protects this one on the same terms.
             if c.get("id") in replied_to:
                 continue
+            if parseable and _INLINE_P3_RE.search(body):
+                informational.add(len(unmatched_bot))
             unmatched_bot.append((login, _inline_title(body)))
 
     # ── The SECOND delivery channel: findings CodeRabbit could not post inline ──
@@ -4049,22 +4079,66 @@ def _check_inline_review_findings(
         for label, _p, sev in outside_minor:
             print(f"  [outside-diff {sev.capitalize() or 'Minor'}] {label}", file=sys.stderr)
 
-    if unmatched_bot:
+    # The unrecognised bucket, printed in THREE parts because they ask for
+    # different reads (issue #2417). A CodeQL alert is a security scanner's
+    # finding with its own dismissal workflow: before this split it shared one
+    # NOTE, bounded to 5 lines, with format drift and strangers, so it read as
+    # noise. A known reviewer in a format no parser reads is format drift, which
+    # is a gate bug to fix. An author the registry does not know is a new voice
+    # to read. All three stay surfaced, never scored, never blocking, and the
+    # JSON count (`unrecognised_reviewer`) still totals all three.
+    codeql_found = [t for who, t in unmatched_bot if who in codeql_logins]
+    p3_notes = [
+        (who, t)
+        for i, (who, t) in enumerate(unmatched_bot)
+        if i in informational and who in known_review_logins and who not in codeql_logins
+    ]
+    drift = [
+        (who, t)
+        for i, (who, t) in enumerate(unmatched_bot)
+        if i not in informational and who in known_review_logins and who not in codeql_logins
+    ]
+    strangers = [(who, t) for who, t in unmatched_bot if who not in known_review_logins]
+    if p3_notes:
         print(
-            f"NOTE: PR #{pr_num} — {len(unmatched_bot)} inline review comment(s) in a "
-            f"format this gate does not recognise, or from an author it does not "
-            f"know. NOT scored — read them yourself; listed so a reviewer cannot "
-            f"be silently invisible:",
+            f"NOTE: PR #{pr_num} — {len(p3_notes)} P3 note(s) from a known reviewer. "
+            f"Informational by design: NOT scored and NOT blocking, but read them:",
             file=sys.stderr,
         )
-        for bot_login, title in unmatched_bot[:5]:
-            print(f"  [unrecognised: {bot_login}] {title}", file=sys.stderr)
-        if len(unmatched_bot) > 5:
-            print(
-                f"  … and {len(unmatched_bot) - 5} more (listing bounded to 5; the "
-                f"count above is the total)",
-                file=sys.stderr,
-            )
+        for bot_login, title in p3_notes[:_UNRECOGNISED_LISTED]:
+            print(f"  [P3: {bot_login}] {title}", file=sys.stderr)
+        _print_listing_rest(len(p3_notes))
+    if codeql_found:
+        print(
+            f"NOTE: PR #{pr_num} — {len(codeql_found)} inline CodeQL security finding(s) "
+            f"that no owner, member or collaborator has answered in its thread. NOT scored and NOT blocking (an alert has its "
+            f"own dismissal workflow), but read each one: fix it, or dismiss the "
+            f"alert with a reason and reply in its thread:",
+            file=sys.stderr,
+        )
+        for title in codeql_found[:_UNRECOGNISED_LISTED]:
+            print(f"  [CodeQL] {title}", file=sys.stderr)
+        _print_listing_rest(len(codeql_found))
+    if drift:
+        print(
+            f"NOTE: PR #{pr_num} — {len(drift)} inline comment(s) from a KNOWN "
+            f"reviewer in a format this gate does not parse (format drift, a gate "
+            f"bug). NOT scored — read them yourself:",
+            file=sys.stderr,
+        )
+        for bot_login, title in drift[:_UNRECOGNISED_LISTED]:
+            print(f"  [unrecognised format: {bot_login}] {title}", file=sys.stderr)
+        _print_listing_rest(len(drift))
+    if strangers:
+        print(
+            f"NOTE: PR #{pr_num} — {len(strangers)} inline review comment(s) from an "
+            f"author this gate does not know. NOT scored — read them yourself; "
+            f"listed so a reviewer cannot be silently invisible:",
+            file=sys.stderr,
+        )
+        for bot_login, title in strangers[:_UNRECOGNISED_LISTED]:
+            print(f"  [unrecognised reviewer: {bot_login}] {title}", file=sys.stderr)
+        _print_listing_rest(len(strangers))
     if unclassified_reviews:
         # The SECOND channel's version of the same silent drop. Logins only — no
         # body text: this NOTE's line 0 is not the one `check_pr_report` renders
