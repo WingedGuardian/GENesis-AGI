@@ -5,8 +5,8 @@ and retries via ``OutreachPipeline.submit_raw()``. Exponential backoff
 (1m → 5m → 15m → 1h → 1h), max 5 retries. Creates an observation after
 exhausting all retries so the failure is visible in the health system.
 
-Scoped to outreach only — NOT reflections, morning reports, or memory ops.
-Those have different failure semantics and higher false-positive risk.
+Scoped to queued outreach deliveries, including morning reports; not
+reflection or memory work.
 """
 
 from __future__ import annotations
@@ -143,7 +143,10 @@ class OutreachRecoveryWorker:
                 email_subject=payload.get("email_subject"),
                 context="",  # Original context not stored — delivery is pre-formatted
                 salience_score=0.9,
-                signal_type="deferred_retry",
+                signal_type=(
+                    "morning_report" if payload.get("signal_type") == "morning_report"
+                    else "deferred_retry"
+                ),
                 channel=payload.get("channel"),
                 # Preserve origin-targeted telegram delivery across the retry so a
                 # once-failed background result still reaches its exact origin thread.

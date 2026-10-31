@@ -674,7 +674,9 @@ class ContextGatherer:
                 content = item.get("content", "")
                 if len(content) > 400:
                     content = content[:400] + "\u2026"
-                parts.append(f"- [confidence: {conf:.2f}] {content}")
+                # The id lets the reflection name what it drew on
+                # (``surplus_cited``, the surplus value probe).
+                parts.append(f"- [id: {item['id']}] [confidence: {conf:.2f}] {content}")
             parts.append("")
 
         return "\n".join(parts), ids
