@@ -1857,3 +1857,73 @@ def test_a_manifest_level_field_of_the_wrong_type_is_refused(project, tmp_path, 
     manifest.write_text(json.dumps(doc), encoding="utf-8")
     with pytest.raises(ValueError, match=match):
         ms.main([str(manifest), "--repo", str(project)])
+
+
+# --------------------------------------------------------------------------
+# ROUND 2 (Codex): the copy's two boundaries, filesystem and process.
+# --------------------------------------------------------------------------
+
+
+def _link_back(project):
+    """A committed symlink with an ABSOLUTE target at the caller's own tree:
+    the copy keeps it, so anything reached through it is the caller's file."""
+    (project / "linked").symlink_to(project, target_is_directory=True)
+    _commit_all(project)
+
+
+@pytest.mark.parametrize("absolute", [False, True], ids=["relative", "absolute"])
+def test_a_selector_through_a_link_back_to_the_callers_tree_is_refused(project, absolute):
+    """Codex round 2: `linked/test_guard.py::...` with `linked -> <repo>` ran
+    the caller's test against unmutated source and read SURVIVED for a
+    mutation the test catches."""
+    _link_back(project)
+    test = "linked/test_guard.py::test_blocks_danger"
+    if absolute:
+        test = f"{project}/{test}"
+    with pytest.raises(ValueError, match="leads out of the copy"):
+        _sweep(project, [_case(project, test=test)])
+
+
+def test_an_import_root_through_a_link_back_is_refused(project):
+    _link_back(project)
+    with pytest.raises(ValueError, match="isolated copy"):
+        _sweep(project, [_case(project, env={"PYTHONPATH": "linked"})])
+
+
+def test_a_relative_link_that_stays_inside_is_accepted(project):
+    """A relative link inside the repository is reproduced inside the copy."""
+    (project / "pkg").mkdir()
+    (project / "pkg" / "test_inner.py").write_bytes((project / "test_guard.py").read_bytes())
+    (project / "alias").symlink_to("pkg", target_is_directory=True)
+    _commit_all(project)
+    case = _case(project, test="alias/test_inner.py::test_blocks_danger")
+    result = _sweep(project, [case])
+    assert result.results[0].outcome == ms.BIT, result.results[0].detail
+
+
+_SPAWNER = """\
+import os, subprocess, time
+
+def test_spawns_and_{how}():
+    subprocess.Popen(["sh", "-c", "sleep 2; echo late > " + os.environ["MARK"]])
+    {tail}
+"""
+
+
+@pytest.mark.parametrize(
+    "how,tail,timeout",
+    [("hangs", "time.sleep(60)", 4), ("returns", "pass", 120)],
+)
+def test_no_child_process_outlives_its_run(project, tmp_path_factory, how, tail, timeout):
+    """Codex round 2: on a timeout `subprocess.run` killed only pytest, and a
+    test's own subprocess kept running after the sweep reported and removed
+    the copy. Each child now runs in its own session, and its group is killed
+    when it ends, timed out or not."""
+    import time
+
+    mark = tmp_path_factory.mktemp("mark") / "late"
+    (project / "test_spawner.py").write_text(_SPAWNER.format(how=how, tail=tail), encoding="utf-8")
+    case = _case(project, test=f"test_spawner.py::test_spawns_and_{how}", env={"MARK": str(mark)})
+    ms.sweep([case], repo=project, python=sys.executable, timeout=timeout, check_baseline=False)
+    time.sleep(4)
+    assert not mark.exists(), "a child of the test outlived its run"
