@@ -167,6 +167,11 @@ class SnapshotManager:
         self.last_delete_error: str | None = None
         # Whether the last take() evicted a snapshot before its create.
         self.last_take_evicted = False
+        # Whether the last guardian listing failed, and whether the last
+        # prune() saw a full listing and every delete succeed (the deletion
+        # window's pass stamps "done" only then).
+        self.last_list_failed = False
+        self.last_prune_complete = False
         # Whether mark_healthy() deleted a lifeline first (alerted at once).
         self.last_rotation_deleted = False
         # What mark_healthy() had to do beyond a plain rotation, for alerting.
@@ -382,11 +387,15 @@ class SnapshotManager:
         self,
         label: str = "",
         snapshot_size_history: list[int] | None = None,
+        *,
+        evict: bool = True,
     ) -> str | None:
         """Create a snapshot. Returns the snapshot name or None on failure.
 
         Checks disk space before proceeding. Deletes excess snapshots
-        before creating the new one to stay within retention limit.
+        before creating the new one to stay within retention limit — unless
+        ``evict`` is False (a healthy rotation outside the deletion window:
+        prune enforces the same retention inside it).
         """
         if label and label not in _GENERATED_LABELS:
             # A snapshot this manager could not recognise as its own would never
@@ -422,7 +431,7 @@ class SnapshotManager:
         # mark_healthy()'s to rotate, after a successful create.
         existing = await self.list_snapshots()
         candidates = [n for n in existing if not n.endswith(_HEALTHY_SUFFIX)]
-        if candidates and len(candidates) >= self._retention:
+        if evict and candidates and len(candidates) >= self._retention:
             for old_name in candidates[self._retention - 1:]:
                 ok = await self.delete(old_name)
                 if ok:
@@ -556,8 +565,11 @@ class SnapshotManager:
         Only guardian-GENERATED names (``_owned_re``), never the bare prefix:
         this listing feeds prune, retention eviction, rotation and the rollback
         target, so a hand-made ``guardian-mine-healthy`` must not become any of
-        them. An empty prefix claims nothing.
+        them. An empty prefix claims nothing. A failure returns [] and sets
+        ``last_list_failed`` (the deletion window's pass must not read it as
+        "nothing to delete").
         """
+        self.last_list_failed = True
         if not isinstance(self._prefix, str) or not self._prefix.strip():
             logger.warning("snapshots.prefix is empty — refusing to claim ownership")
             return []
@@ -577,6 +589,7 @@ class SnapshotManager:
 
         if not isinstance(snapshots, list):
             return []
+        self.last_list_failed = False
         result: list[tuple[str, datetime | None]] = [
             (s["name"], _parse_created_at(s.get("created_at")))
             for s in snapshots
@@ -638,8 +651,16 @@ class SnapshotManager:
         """List all guardian snapshots, newest first."""
         return [name for name, _ in await self._list_snapshots_with_meta()]
 
-    async def prune(self) -> int:
+    async def prune(self, *, expires_before: datetime | None = None) -> int:
         """Prune guardian snapshots. Returns count deleted.
+
+        ``expires_before`` (the deletion window's pass): also delete any
+        non-healthy snapshot whose incus ``expires_at`` falls before it. incus
+        deletes expired snapshots itself, on its own minutely task, so without
+        this a snapshot would leave at its creation time of day + expiry —
+        outside the window. Deleting it a little early in the window keeps the
+        daemon expiry as the backstop it is meant to be (a dead guardian) and
+        changes nothing else: the expiry setting itself is untouched.
 
         Only NON-healthy snapshots; two independent rules, unioned:
         - **Retention**: keep the newest ``retention`` non-healthy snapshots;
@@ -658,8 +679,10 @@ class SnapshotManager:
         rotation, relief under pressure, and incus's own expiry where it
         applies.)
         """
+        self.last_prune_complete = False
         meta = await self._list_snapshots_with_meta()
         if not meta:
+            self.last_prune_complete = not self.last_list_failed
             return 0
 
         # Healthy snapshots are never pruned — not even a superseded one: it is
@@ -682,13 +705,68 @@ class SnapshotManager:
             for name, created in meta:
                 if created is not None and created < cutoff:
                     to_delete.add(name)
+        expiry_read = True
+        if expires_before is not None:
+            expiring = await self._expires_at()
+            expiry_read = expiring is not None
+            to_delete |= {
+                n for n in names if n in (expiring or {}) and expiring[n] < expires_before
+            }
 
         deleted = 0
         for name in sorted(to_delete):
             if await self.delete(name):
                 logger.info("Pruned snapshot: %s", name)
                 deleted += 1
+        self.last_prune_complete = expiry_read and deleted == len(to_delete)
+        return deleted
 
+    async def _expires_at(self) -> dict[str, datetime] | None:
+        """incus's per-snapshot ``expires_at`` for snapshots that carry one.
+
+        incus stamps it at creation (``snapshots.expiry``) and reports the zero
+        time (year 1) for "never"; that, and anything unparseable, is omitted.
+        None when the list failed (prune then reports itself incomplete).
+        """
+        rc, stdout, _ = await _run_subprocess(
+            "incus", "snapshot", "list", self._container, "--format", "json",
+            timeout=30.0,
+        )
+        try:
+            rows = json.loads(stdout) if rc == 0 else None
+        except (json.JSONDecodeError, TypeError):
+            rows = None
+        if not isinstance(rows, list):
+            return None
+        out: dict[str, datetime] = {}
+        for s in rows:
+            if not isinstance(s, dict) or not isinstance(s.get("name"), str):
+                continue
+            when = _parse_created_at(s.get("expires_at"))
+            if when is not None and when.year > 1970:
+                out[s["name"]] = when
+        return out
+
+    async def superseded_healthy(self) -> list[str] | None:
+        """Every healthy snapshot except the NEWEST (the lifeline), newest
+        first; None when the list failed."""
+        meta = await self.list_snapshot_meta_strict()
+        if meta is None:
+            return None
+        return [n for n, _ in meta if n.endswith(_HEALTHY_SUFFIX)][1:]
+
+    async def rotate_superseded(self) -> int:
+        """Delete the superseded healthy snapshots a deferred rotation left
+        (the deletion window's pass). The newest healthy snapshot is never a
+        candidate, so the rollback lifeline is never reduced. Returns the count
+        deleted; a failed list deletes nothing."""
+        meta = await self.list_snapshot_meta_strict()
+        healthy = [n for n, _ in meta or [] if n.endswith(_HEALTHY_SUFFIX)]
+        deleted = 0
+        for old_name in healthy[1:]:
+            if await self.delete_healthy(old_name, replaced_by=healthy[0]):
+                logger.info("Rotated superseded healthy snapshot (window): %s", old_name)
+                deleted += 1
         return deleted
 
     async def enforce_expiry_policy(self) -> bool:
@@ -722,8 +800,14 @@ class SnapshotManager:
         delete_first_allowed: bool = False,
         reserve_settle: Callable[[], bool] | None = None,
         healthy_confirmed: bool = False,
+        defer_deletes: bool = False,
     ) -> str | None:
         """Take a 'healthy' snapshot, then rotate superseded healthy ones.
+
+        ``defer_deletes`` (outside the deletion window): the create is made as
+        usual, but the superseded healthy snapshot and take()'s retention
+        eviction are left for the window's pass (:meth:`rotate_superseded`,
+        prune). Delete-first below is pressure-driven and is NOT deferred.
 
         Create-then-delete ordering by default: the new lifeline must exist
         before the old one goes, so an ordinary failed create leaves the
@@ -764,9 +848,22 @@ class SnapshotManager:
         """
         self.last_rotation_note = None
         self.last_rotation_deleted = False
+        evict = not defer_deletes
         name = await self.take(
             label=_HEALTHY_LABEL, snapshot_size_history=snapshot_size_history,
+            evict=evict,
         )
+        if name is None and not evict and self.last_refusal == REFUSED_POOL_SPACE:
+            # LVM refusing the create is pressure, and pressure never waits:
+            # retry with take()'s retention eviction, exactly as without the
+            # window, so expendable snapshots go before delete-first can reach
+            # the lifeline. (A REFUSED_POOL_GATE refusal returns before eviction
+            # in take(), with or without the window, so it needs no retry.)
+            evict = True
+            name = await self.take(
+                label=_HEALTHY_LABEL, snapshot_size_history=snapshot_size_history,
+                evict=evict,
+            )
         if (
             name is None
             and delete_first_allowed
@@ -786,6 +883,7 @@ class SnapshotManager:
                 # licenses deleting the lifeline first.
                 name = await self.take(
                     label=_HEALTHY_LABEL, snapshot_size_history=snapshot_size_history,
+                    evict=evict,
                 )
                 if name is None and self.last_take_evicted:
                     logger.info("delete-first deferred: the retry deleted a snapshot")
@@ -814,6 +912,7 @@ class SnapshotManager:
                 )
                 name = await self.take(
                     label=_HEALTHY_LABEL, snapshot_size_history=snapshot_size_history,
+                    evict=evict,
                 )
                 if name:
                     outcome = f"created {name}"
@@ -832,6 +931,8 @@ class SnapshotManager:
                 )
         if name is None:
             return None
+        if defer_deletes:
+            return name
 
         for old_name in await self.list_snapshots():
             is_superseded = old_name.endswith(_HEALTHY_SUFFIX) and old_name != name

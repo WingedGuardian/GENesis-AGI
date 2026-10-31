@@ -64,6 +64,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from genesis.guardian.deletion_window import resolve_window
 from genesis.guardian.pool import StoragePoolStatus
 from genesis.guardian.pool_runway import (
     HISTORY_FILE,
@@ -349,6 +350,39 @@ def extend_plan(status: StoragePoolStatus, cfg, p: Pressure) -> int | None:
     if early_reason(meta_only, cfg.early_horizon_hours) is not None:
         return None
     return plan_extend(status, cfg.extend_keep_free_mib)
+
+
+def early_waits_for_window(
+    p: Pressure, status: StoragePoolStatus, cfg, window, now: datetime,
+) -> bool:
+    """Whether EARLY relief should leave its delete for the deletion window.
+
+    The rule (deletion_window.py): routine deletions wait for the window, and
+    early relief is routine only while waiting cannot cost the pool. Waiting
+    costs the pool once the RESERVE would be reached before the window opens:
+    reserve relief then deletes outside the window anyway, with more
+    authority. So early relief waits only when, on every measured axis, the
+    hours until that axis reaches its reserve (hours to full, less the reserve
+    at the measured rate) outlast the hours until the window opens. An axis
+    whose size is unknown, a runway that was not measured, or the reserve
+    level itself: act now.
+    """
+    if p.level != LEVEL_EARLY or window.any_time:
+        return False
+    wait = window.hours_until_open(now)
+    axes = (
+        (p.runway.data_rate, p.runway.data_hours, status.pool_size_bytes, cfg.min_reserve_pct),
+        (p.runway.meta_rate, p.runway.meta_hours, status.metadata_size_bytes,
+         cfg.min_meta_reserve_pct),
+    )
+    to_reserve = []
+    for rate, hours, size, reserve_pct in axes:
+        if hours is None:
+            continue
+        if not rate or rate <= 0 or not size:
+            return False
+        to_reserve.append(hours - reserve_pct / 100.0 * size / rate)
+    return wait > 0 and bool(to_reserve) and min(to_reserve) > wait
 
 
 def _numbers(status: StoragePoolStatus) -> str:
@@ -666,6 +700,13 @@ async def _cannot_act(
     return outcome
 
 
+def settled(config, now: datetime | None = None) -> bool:
+    """Whether relief's settle interval since the last guardian delete has
+    passed (the deletion window's pass paces itself on the same stamp)."""
+    state = _load_state(config.state_path / STATE_FILE)
+    return _due(state, "last_action", now or datetime.now(UTC), _SETTLE.total_seconds() / 3600.0)
+
+
 def record_action(config, now: datetime | None = None) -> bool:
     """Start relief's settle after a delete made elsewhere (delete-first
     rotation), so the two never delete back to back. False if unwritable."""
@@ -887,6 +928,22 @@ async def check_pool_relief(
             )
         return "no_target"
 
+    window = resolve_window(config)
+    if early_waits_for_window(p, status, cfg, window, now):
+        wait = window.hours_until_open(now)
+        logger.info("pool relief: early pressure (%s) waits for the deletion window", reason)
+        if _throttled(state_path, state, "early_deferred", now, cfg.realert_hours):
+            await _send(
+                dispatcher,
+                AlertSeverity.WARNING,
+                "Pool filling — early relief waits for the deletion window",
+                f"{reason}. {numbers}. At the measured growth the pool stays above its "
+                f"reserve until the deletion window ({window.describe()}) opens in "
+                f"~{wait:.0f}h, so the guardian frees a snapshot then. Reserve relief "
+                "still acts at once if the pool gets there first.",
+            )
+        return "early_deferred_to_window"
+
     async def recheck(target: str) -> tuple[str | None, str, str, bool]:
         """Re-measure; stop unless ``target`` is still allowed at the fresh level."""
         stop, fresh, fp = await _recheck_before_delete(
@@ -894,9 +951,10 @@ async def check_pool_relief(
         )
         if stop is not None:
             return stop, "", "", False
-        if target not in allowed(fp.level):
+        if target not in allowed(fp.level) or early_waits_for_window(fp, fresh, cfg, window, now):
             # Eased from the reserve to early pressure, and this target (a young
-            # lifeline) is not early relief's to take.
+            # lifeline) is not early relief's to take — or early relief now
+            # waits for the deletion window.
             return "eased", "", "", False
         return None, fp.reason, _describe(fresh, fp), fp.level == LEVEL_EARLY
 

@@ -143,6 +143,17 @@ class SnapshotConfig:
     # which this deliberately does not set (instance-wide; it would expire
     # snapshots the user creates by hand). Empty string disables enforcement.
     expiry: str = "2w"
+    # Maintenance window for ROUTINE deletions (deletion_window.py): the
+    # superseded healthy snapshot after a rotation and prune's retention/age
+    # deletions wait for it. Deleting a large btrfs subvolume can stall
+    # filesystem commits for minutes under quota accounting. "HH:MM-HH:MM" (an
+    # end before the start crosses midnight) or "any" (no window: delete when
+    # due, the behaviour before the window existed). Invalid -> the default.
+    # Pressure-driven deletions (pool relief, delete-first) never wait.
+    deletion_window: str = "05:00-07:00"
+    # IANA zone the window is read in. Empty -> genesis.env.user_timezone()
+    # (genesis.yaml `timezone`, then USER_TIMEZONE, then UTC) on this host.
+    deletion_window_timezone: str = ""
 
 
 @dataclass

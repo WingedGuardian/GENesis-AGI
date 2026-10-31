@@ -2041,6 +2041,14 @@ verified: fbb0b6f19 2026-10-21
   host reconcilers that share its version probe run on any branch).
   Config `~/.genesis/guardian_remote.yaml`; missing → silently
   disabled.
+- **Snapshot deletion window** (`guardian/deletion_window.py`): routine
+  snapshot deletions (the superseded healthy snapshot, prune, and what incus
+  would expire before the next window) wait for `snapshots.deletion_window`,
+  default 05:00-07:00 in the user's timezone, because deleting a large btrfs
+  subvolume can stall filesystem commits for minutes under quota accounting.
+  The healthy snapshot is still created on its cadence. Reserve relief and
+  delete-first never wait; early relief waits only while the pool stays above
+  its reserve until the window opens. `any` restores immediate deletes.
 - **Shared backup decryption (development candidate)**: the standalone
   `guardian/cred_integrity.py` file authenticates one passphrase-encrypted,
   integrity-protected message for credential recovery and backup/restore.
