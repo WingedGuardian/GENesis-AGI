@@ -168,3 +168,15 @@ def test_request_capture_requires_current_complete_transport(route):
         assert not controls.request_verified(route, [original, changed], "current-marker")
         changed = {**captures[-1], "system": "altered system"}
         assert not controls.request_verified(route, [original, changed], "current-marker")
+
+
+def test_a_route_that_fails_before_writing_its_run_id_is_reported_failed(tmp_path, monkeypatch):
+    controls = load("headlong_controls")
+    monkeypatch.setattr(
+        controls.subprocess,
+        "run",
+        lambda *a, **k: subprocess.CompletedProcess(a[0], 1, stdout="", stderr="startup failed"),
+    )
+    report = controls.run_route(tmp_path / "adapter-failure", "adapter", "failure")
+    assert report["run_id"] == "" and report["passed"] is False
+    assert report["stderr"] == "startup failed"

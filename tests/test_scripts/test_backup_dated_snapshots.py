@@ -1072,6 +1072,28 @@ def test_a_directory_restore_would_refuse_members_of_is_kept_as_partial(backup_e
     assert len(list((snap / "extra").glob("work_a-*.tar.gpg"))) == 1
 
 
+def test_extra_restore_diagnostics_preserve_all_long_member_names(backup_env, tmp_path):
+    home = backup_env["home"]
+    directory = home / "work" / "store"
+    deep = directory / ("a" * 160) / ("b" * 160)
+    deep.mkdir(parents=True)
+    (directory / "keep.txt").write_text("retained evidence\n")
+    (deep / "absolute-link").symlink_to("/synthetic/outside")
+    (deep / "escaping-link").symlink_to("../../../../outside")
+    os.mkfifo(deep / "pipe")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/store"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    for name in ("absolute-link", "escaping-link", "pipe"):
+        member = (deep / name).relative_to(home).as_posix()
+        assert f"refused member {member!r}:" in proc.stdout
+    assert "AbsoluteLinkError" in proc.stdout
+    assert "link leaves work/store" in proc.stdout
+    assert "SpecialFileError" in proc.stdout
+    assert _status(backup_env)["extra_dirs_partial"] == 1
+
+
 def test_the_local_manifest_is_rewritten_when_extras_are_unset(backup_env, tmp_path):
     """Codex P2 round 5: a run with the setting unset still writes .extra-manifest, so
     a local restore never reads an earlier run's skipped or extra lines."""

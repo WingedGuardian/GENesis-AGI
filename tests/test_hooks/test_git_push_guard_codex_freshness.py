@@ -1123,6 +1123,56 @@ class TestMainLevelIntegration:
         )
         return _mod.main()
 
+    # ── the shared merge deadline is per-invocation state (#2904) ──
+    def test_main_disarms_the_merge_deadline_it_armed(self, monkeypatch, capsys):
+        """#2904: main() armed `_merge_deadline` and never reset it, so an in-process
+        caller (every test that drives main()) leaked a deadline into the next test.
+        Once it expired, `_gh_timeout` raised and a later direct call such as
+        `_commit_at_prefix` returned None, which failed only in full-file runs slow
+        enough to pass the 45 s budget."""
+        monkeypatch.setattr(_mod, "_merge_deadline", None)
+        seen = {}
+        real = _mod._run_merge_and_push_gates
+
+        def spy():
+            rc = real()
+            seen["armed"] = _mod._merge_deadline
+            return rc
+
+        monkeypatch.setattr(_mod, "_run_merge_and_push_gates", spy)
+        self._drive(monkeypatch, "gh pr merge 5 --squash --admin")
+        assert seen["armed"] is not None, "fixture never reached the arming merge path"
+        assert _mod._merge_deadline is None
+
+    def test_main_disarms_the_deadline_even_when_the_gates_raise(self, monkeypatch):
+        monkeypatch.setattr(_mod, "_merge_deadline", None)
+
+        def crash():
+            _mod._merge_deadline = _mod.time.monotonic() + 45
+            raise RuntimeError("gate crashed")
+
+        monkeypatch.setattr(_mod, "_run_merge_and_push_gates", crash)
+        monkeypatch.setattr(_mod, "_flush_overrides", lambda outcome: None)
+        with pytest.raises(RuntimeError):
+            _mod.main()
+        assert _mod._merge_deadline is None
+
+    def test_a_failing_override_flush_cannot_skip_the_disarm(self, monkeypatch):
+        monkeypatch.setattr(_mod, "_merge_deadline", None)
+
+        def arm():
+            _mod._merge_deadline = _mod.time.monotonic() + 45
+            return 0
+
+        def flush(outcome):
+            raise OSError("override log unwritable")
+
+        monkeypatch.setattr(_mod, "_run_merge_and_push_gates", arm)
+        monkeypatch.setattr(_mod, "_flush_overrides", flush)
+        with pytest.raises(OSError):
+            _mod.main()
+        assert _mod._merge_deadline is None
+
     # ── TOCTOU binding (fresh review at HEAD → binding REQUIRED) ──
     def test_unbound_merge_blocks(self, monkeypatch, capsys):
         rc = self._drive(monkeypatch, "gh pr merge 5 --squash --admin")
@@ -3541,3 +3591,27 @@ class TestCleanSignalAtHead:
         _mod.check_pr_report("1")
         out = capsys.readouterr().out
         assert "clean signal at head" not in out
+
+
+class TestDeadlineIsolationAcrossTests:
+    """#2904, the part main() cannot fix: a gate called DIRECTLY arms the deadline
+    outside main(). The hook-test conftest disarms every guard copy the test module
+    holds, before and after each test. The two `_n_` tests run in definition order
+    (pytest keeps class order and no reordering plugin is installed); run alone,
+    the second passes trivially, which is why the first exists."""
+
+    def test_the_conftest_finds_this_files_unregistered_guard_copy(self, request):
+        import sys
+
+        from tests.test_hooks.conftest import _push_guard_instances
+
+        assert _mod in _push_guard_instances(request.module)
+        assert sys.modules.get("git_push_guard") is not _mod, (
+            "this file's copy is unregistered, so a sys.modules lookup could not find it"
+        )
+
+    def test_1_a_gate_outside_main_leaves_the_deadline_armed(self):
+        _mod._merge_deadline = _mod.time.monotonic() + 45  # what a direct gate call does
+
+    def test_2_the_next_test_starts_disarmed(self):
+        assert _mod._merge_deadline is None

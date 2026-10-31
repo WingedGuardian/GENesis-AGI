@@ -1,12 +1,15 @@
-# Dependabot config — GitHub Actions version updates only.
+# Dependabot config — GitHub Actions, plus the CI test-tool pins.
 #
-# The pip ecosystem is intentionally NOT managed here: Genesis's runtime deps
-# carry deliberate security pins (litellm pinned <1.83 to dodge 1.82.x malware,
+# The pip ecosystem is NOT managed for Genesis's runtime deps: they carry
+# deliberate security pins (litellm pinned <1.83 to dodge 1.82.x malware,
 # fastmcp <3 for API stability, transitive secure floors) that automatic
 # version-update PRs would fight. GitHub's Dependabot *security* alerts are
 # already enabled for the repo and cover the pip CVE side; the pip-audit CI job
 # reports on the resolved tree per-PR without blocking on audit findings.
-# Dependabot version updates here only keep the Actions current.
+#
+# The one pip entry below is scoped to .github/test-tools/ ALONE: the exact
+# pytest/plugin versions CI runs with (never pyproject.toml). Its weekly bump PR
+# runs the full CI, so a breaking test-tool release fails there, not on main.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
@@ -17,4 +20,13 @@ updates:
       prefix: "ci"
     groups:
       github-actions:
+        patterns: ["*"]
+  - package-ecosystem: "pip"
+    directory: "/.github/test-tools"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
+    groups:
+      test-tools:
         patterns: ["*"]

@@ -307,7 +307,14 @@ def trash(path: str | os.PathLike[str], *, reason: str, caller: str) -> Tombston
         size=size,
         reason=reason,
         caller=caller,
-        session_id=os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("GENESIS_SESSION_ID"),
+        # The order scripts/hooks/prepare-commit-msg reads them in; Claude Code
+        # sets CLAUDE_CODE_SESSION_ID, and CLAUDE_SESSION_ID is the legacy name.
+        session_id=(
+            os.environ.get("GENESIS_SESSION_ID")
+            or os.environ.get("CLAUDE_CODE_SESSION_ID")
+            or os.environ.get("CLAUDE_SESSION_ID")
+            or None
+        ),
         trashed_at=datetime.now(UTC).isoformat(timespec="seconds"),
     )
     holder = None

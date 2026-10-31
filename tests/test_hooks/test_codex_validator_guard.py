@@ -72,7 +72,9 @@ def test_dispatch_uses_shared_role_floor_for_every_server_and_refuses_foreign_to
             action = guard.normalize(payload(prefix + tool, arguments))
             assert action.arguments == arguments
             guard.dispatch(action)
-        for tool in ("", "record", "memory_store", "campaign_trigger", "health_status__extra"):
+        foreign = ("", "record", "memory_store__extra", "campaign_trigger", "health_status__extra")
+        foreign += ("memory_store",) if server == "health" else ("health_status",)
+        for tool in foreign:
             with pytest.raises(guard.Refused):
                 guard.dispatch(guard.normalize(payload(prefix + tool, {})))
 

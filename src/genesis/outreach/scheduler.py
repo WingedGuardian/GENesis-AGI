@@ -760,6 +760,7 @@ class OutreachScheduler:
                     req = OutreachRequest(
                         category=cat,
                         topic=row["message"][:100],
+                        email_subject=row.get("email_subject"),
                         context=row["message"],
                         salience_score=0.7,
                         signal_type="pending_queue",

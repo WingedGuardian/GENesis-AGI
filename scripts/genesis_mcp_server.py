@@ -283,6 +283,7 @@ def _bootstrap_health(transport_kwargs: dict, *, external_profile: str | None = 
                 db=db,
             )
             tracker = ProviderActivityTracker()
+            tracker.persist_activity = external_profile != "validator"
             tracker.set_db(db)
             init_health_mcp(svc, activity_tracker=tracker)
 

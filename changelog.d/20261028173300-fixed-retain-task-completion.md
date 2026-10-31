@@ -1,0 +1,1 @@
+- Task completion retains worktrees, Git refs and saved paths; notepad seeding preserves existing entries. Creation and recovery safety remain follow-up work (#3020/#3060).
