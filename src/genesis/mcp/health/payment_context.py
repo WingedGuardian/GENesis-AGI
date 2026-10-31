@@ -2430,8 +2430,8 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
             ):
                 raise _Stop("failed_before_pay:held_at_pay", field=kind, filled=flow.typed)
         await _ticked(consents, flow.typed)
-        # After the last await: nothing below lets a route or page event be handled
-        # before the click, so these are final for all the browser has reported.
+        # Final for typing; the save stage and the pre-click reads below await
+        # again, so the click is preceded by one more check after them.
         if code := _typing_outcome(flow):
             raise _Stop(code, filled=flow.typed)
     except Exception:
@@ -2463,6 +2463,10 @@ async def _run(flow: _Flow, args: cf.CardArgs, main_ctx, main_page, hooks: Hooks
     )  # by identity, to catch a hidden frame revealed at Pay
     # A result marker already showing before Pay proves nothing about Pay.
     marked_before = args.success is not None and await _marker_shown(ppage, args)
+    # After the last await: nothing below lets a route or page event be handled
+    # before the click, so this is final for all the browser has reported.
+    if code := _typing_outcome(flow):
+        return cf.result(code, flow.host, filled=flow.typed)
     flow.paid = True  # set before the click: a click that raised may still have landed
     click_raised = False
     try:
