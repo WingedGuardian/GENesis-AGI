@@ -913,6 +913,67 @@ _LANE_CRITICAL_BASENAME_EXTS = (".py", ".sh")
 _LANE_CRITICAL_BASENAME_SUFFIXES = ("_gate.py",)
 _LANE_CRITICAL_TRUST_BASENAMES = frozenset({"approval.py", "cli_policy.py"})
 
+#: Data files that decide what a CI check enforces, or that arm an approval gate
+#: or an outbound action. Config is ordinary (see `_is_lane_critical_path`), but
+#: a PR editing only one of these can silence the check it feeds, or switch an
+#: action on, while being reviewed below the code that reads it — the same reason
+#: `scripts/ci/` sits beside `.github/`.
+#:
+#: EXACT paths, never `config/` as a prefix: that prefix was measured and dropped
+#: (see `classify_lane`). `test_data_files_read_by_ci_checks_are_critical`
+#: re-derives the CI-read half, so a check that starts reading a new file in a
+#: recognised spelling fails there until the file is named here. The approval and
+#: arming half is a judgement list, locked by the literal test beside it.
+#:
+#: MEASURED when the set was chosen: every first-parent commit on main from
+#: 2026-08-31T00:00Z through f658bb494 (841), each re-classified with and without
+#: this set (hook surface from `git_push_guard._is_hook_surface_path`). It moved
+#: 6 from `standard` to `critical` (44.4% -> 45.1%), under this lane's 50% bar.
+#:
+#: Deliberately NOT here, so the omission is a decision rather than a gap:
+#:   * `pyproject.toml` steers the required lint and test jobs, but routine
+#:     dependency PRs edit it constantly (24 commits in that window, 10 of which
+#:     would have moved); a lint-ignore change is visible in any review, and the
+#:     `collected-floor` job backstops pytest configuration.
+#:   * `config/guardian.yaml` holds its provisioning lever among many ordinary
+#:     settings: of the 4 commits touching it in that window, 2 would have moved,
+#:     both routine feature edits.
+#:   * `config/cc_rate_limit_resume.yaml` resumes work that was already approved.
+_LANE_CRITICAL_CONFIG_PATHS = frozenset(
+    {
+        # ── read by CI checks ────────────────────────────────────────────────
+        # Rules and allowlist of the required leak scan (`scripts/ci/leak_scan.sh`).
+        ".gitleaks.toml",
+        ".leak-scan-history-allow.json",  # `scripts/ci/leak_history_allow.py`
+        # Known-violation baseline of `scripts/check_atomic_writes.py`: one added
+        # row silences that check for a file.
+        "config/atomic_write_baseline.json",
+        # Shipped-hook hash ledger (`check_hook_versions_complete.sh`); a bogus
+        # hash makes `sync-hooks.sh` overwrite a user-modified hook on an install.
+        ".genesis-hook-versions",
+        # The mutation sweep's manifests, neither on main yet: `mutation_gate.json`
+        # is the pass/fail set the sweep's PR adds; `gate_defects.json` is the
+        # planned advisory defect corpus run against the merge gate's test rungs.
+        "config/mutation_gate.json",
+        "config/gate_defects.json",
+        # ── approval gates ───────────────────────────────────────────────────
+        # `manual_approval_required`; the gate's `.py` side is critical through
+        # `_LANE_CRITICAL_TRUST_BASENAMES`.
+        "config/autonomous_cli_policy.yaml",
+        "config/autonomy_rules.yaml",  # `irreversible_propose` and the rule engine
+        "config/autonomy.yaml",  # `approval_policy`, the engine's fallback
+        "config/payments.yaml",  # `card_fill.enabled`, the card-fill kill switch
+        # ── levers that switch an outbound or irreversible action on ─────────
+        "config/board.yaml",  # live mode writes to GitHub
+        "config/contributor_worklog.yaml",  # live mode files public issues
+        "config/marketing_outreach.yaml",  # outer switch for outbound sends
+        "config/career_outreach.yaml",
+        "config/desktop_takeover.yaml",  # live opt-in controls a device
+        "config/entity_adjudication.yaml",  # live mode merges memory entities
+        "config/updates.yaml",  # auto-apply of upstream updates
+    }
+)
+
 #: Prose. `.txt` is NOT prose on its own — `requirements.txt` and
 #: `config/az-pip-constraints.txt` are dependency pins — so it counts only on a
 #: known documentation STEM, the same split `git_push_guard._is_doc_path` makes.
@@ -965,10 +1026,13 @@ def _is_lane_critical_path(path: str) -> bool:
     definition anywhere in this repo, so including them would mean inventing three
     taxonomies inside this change. `config/` was briefly in the prefix list for the
     same impulse and is gone for the same reason — config is ORDINARY, which is
-    what the instruction files this change also edits already say.
+    what the instruction files this change also edits already say. The one
+    exception is `_LANE_CRITICAL_CONFIG_PATHS`: named files, never a prefix.
     """
     if _is_lane_fixture_corpus(path):
         return False  # sample programs, not production surface
+    if path in _LANE_CRITICAL_CONFIG_PATHS:
+        return True
     if any(path.startswith(prefix) for prefix in _LANE_CRITICAL_PREFIXES):
         return True
     base = os.path.basename(path)

@@ -2016,14 +2016,17 @@ The review-findings gate specifically:
 
    | lane | blocks at | what lands there |
    |---|---|---|
-   | `critical` | **1.0** | enforcement-hook surface · `.github/**` AND the implementations behind its required checks (`scripts/ci/**`, `check_*.py`/`.sh`) · schema and data migrations · HTTP surfaces (`dashboard/routes/**`, `hosting/**`, `api.py`/`api_*`, `_blueprint.py`) · secrets and credentials |
+   | `critical` | **1.0** | enforcement-hook surface · `.github/**` AND the implementations behind its required checks (`scripts/ci/**`, `check_*.py`/`.sh`) and, by exact path (`_LANE_CRITICAL_CONFIG_PATHS`), the data files that steer a CI check (leak-scan rules and allowlist, atomic-write baseline, hook-version ledger, and the mutation-sweep manifests once the sweep lands), the approval configs (autonomy rules and policy, autonomous-CLI policy, payments) and the configs that switch an outbound or irreversible action on (board, contributor worklog, marketing and career outreach, desktop takeover, entity adjudication, auto-update) · schema and data migrations · HTTP surfaces (`dashboard/routes/**`, `hosting/**`, `api.py`/`api_*`, `_blueprint.py`) · secrets and credentials |
    | `standard` | **2.0** | ordinary runtime code |
    | `light` | **3.0** | PROSE (including prompt surfaces) / tests / fixtures only, or vendored-only |
 
    **`light` is PROSE, not `docs-config`.** A `.yaml`/`.toml`/`.ini`/`.cfg`
    reaches `_category() == "docs-config"` through the shared classifier, but
-   config is not documentation — `config/desktop_takeover.yaml` arms desktop
-   takeover and `pyproject.toml` pins dependencies, so both are `standard`.
+   config is not documentation, so neither of these is `light`:
+   `config/desktop_takeover.yaml` arms desktop takeover and is `critical` (an
+   exact path in `_LANE_CRITICAL_CONFIG_PATHS`), and `pyproject.toml` pins
+   dependencies and holds the lint and pytest config, and is `standard` (the
+   exclusion and its reason are stated beside that constant).
 
    So on a CRITICAL change two P2s still block exactly as before; on ordinary
    code it now takes four.
