@@ -676,6 +676,7 @@ def _clean(monkeypatch):
         ("TICK_S", 0.01),
         ("ATTACH_S", 0.05),
         ("TOTAL_STABLE_S", 0.02),
+        ("SUCCESS_STABLE_S", 0.02),
         ("STEP_WAIT_S", 0.3),
     ):
         monkeypatch.setattr(pc, name, value)
@@ -1044,7 +1045,7 @@ async def test_the_outcome_ends_at_once_on_a_guard_flag(monkeypatch, blocked, le
     page = Page(SHOP)
     loop = asyncio.get_running_loop()
     t0 = loop.time()
-    got = await pc._outcome(flow, page, SHOP, {SHOP}, 0, "example.com", Hooks().make())
+    got = await pc._outcome(flow, page, SHOP, {SHOP}, {}, 0, "example.com", Hooks().make())
     assert got == code and loop.time() - t0 < 5.0
 
 
@@ -3825,6 +3826,313 @@ async def test_a_late_field_that_cannot_be_filled_says_fill(vault, logs, monkeyp
     assert any("extra field address_line1 did not fill (RuntimeError)" in x for x in logs)
 
 
+# ── a result shown in place after Pay (no page change) ──
+
+
+def _in_place(ns, shown=True, pay_stays=False):
+    """Pay shows the result in the drawer: the URL stays, a #done marker appears
+    and (unless ``pay_stays``) Pay leaves the page."""
+    done = El()
+    done.visible = shown
+    clicks: list[bool] = []
+
+    def pay_click():
+        clicks.append(True)
+        if not pay_stays:
+            ns.ppage.main_frame.elements["#pay"] = []
+        ns.ppage.main_frame.elements["#done"] = [done]
+
+    ns.els["pay"].on_click = pay_click
+    ns.pay_clicks = clicks
+    return done
+
+
+async def test_a_result_shown_in_place_is_submitted_in_place(vault):
+    ns = checkout()
+    _in_place(ns)
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "submitted_in_place" and ns.pay_clicks == [True]
+    assert "Do NOT retry" in out["status"]
+
+
+async def test_without_a_success_marker_an_unmoved_checkout_is_a_challenge(vault):
+    ns = checkout()
+    _in_place(ns)
+    out, _ = await _run(ns)
+    assert out["code"] == "challenge" and "charge may have happened" in out["status"]
+
+
+async def test_a_success_marker_with_pay_still_live_is_a_challenge(vault):
+    ns = checkout()
+    _in_place(ns, pay_stays=True)
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "challenge"
+
+
+async def test_a_hidden_success_marker_is_a_challenge(vault):
+    ns = checkout()
+    _in_place(ns, shown=False)
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "challenge"
+
+
+class _Flash(El):
+    """Shown for its first ``looks`` reads only (a view mid-render)."""
+
+    def __init__(self, looks):
+        super().__init__()
+        self._looks = looks
+
+    @property
+    def visible(self):
+        self._looks -= 1
+        return self._looks >= 0
+
+    @visible.setter
+    def visible(self, _value):
+        pass
+
+
+async def test_a_success_marker_that_flashes_once_is_a_challenge(vault):
+    ns = checkout()
+    flash = _Flash(2)  # one whole look reads it twice (the count, then the element)
+
+    def pay_click():
+        ns.ppage.main_frame.elements["#pay"] = []
+        ns.ppage.main_frame.elements["#done"] = [flash]
+
+    ns.els["pay"].on_click = pay_click
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "challenge"
+
+
+def _reveal_at_pay(ns, frame):
+    """Give the checkout an in-place result marker and reveal ``frame`` at Pay."""
+    _in_place(ns)
+    base = ns.els["pay"].on_click
+
+    def pay_click():
+        base()
+        frame.visible = True  # a preloaded frame revealed at Pay, URL unchanged
+
+    ns.els["pay"].on_click = pay_click
+
+
+async def test_a_hidden_frame_revealed_at_pay_is_a_challenge(vault):
+    # Devin severe / Codex P2: a hidden preloaded iframe on an unknown host,
+    # revealed at Pay with its URL unchanged, is a bank check and must not read
+    # as an in-place success. The URL is already present at the click, so a
+    # URL-keyed check misses it; frame identity + visibility catches it.
+    ns = checkout()
+    bank = Frame("https://verify.example.net/step")
+    bank.visible = False
+    bank.parent_frame = ns.ppage.main_frame
+    ns.ppage.extra.append(bank)
+    _reveal_at_pay(ns, bank)
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "challenge"
+
+
+async def test_an_about_blank_frame_revealed_at_pay_is_a_challenge(vault):
+    # Codex P2: a challenge can render in about:blank/srcdoc; its scheme is not
+    # proof it is empty, so a newly shown opaque frame is still checked.
+    ns = checkout()
+    blank = Frame("about:blank")
+    blank.visible = False
+    blank.parent_frame = ns.ppage.main_frame
+    ns.ppage.extra.append(blank)
+    _reveal_at_pay(ns, blank)
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "challenge"
+
+
+async def test_a_preloaded_frame_already_shown_still_allows_in_place(vault):
+    # Control: a frame visible BEFORE Pay (e.g. the checkout's own UI) that keeps
+    # its URL is not a new reveal, so a genuine in-place result is still accepted.
+    ns = checkout()
+    ui = Frame("https://shop.example.com/widget")
+    ui.visible = True
+    ui.parent_frame = ns.ppage.main_frame
+    ns.ppage.extra.append(ui)
+    _in_place(ns)
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "submitted_in_place"
+
+
+async def test_a_shown_frame_that_navigates_in_place_to_a_challenge_is_a_challenge(vault):
+    # Audit residual: a frame visible BEFORE Pay keeps its identity when it
+    # navigates in place to an unknown-host bank check, so identity alone would
+    # skip it; its URL changed from the one shown at the click, so the per-frame
+    # URL check still catches it.
+    ns = checkout()
+    widget = Frame("https://shop.example.com/widget")
+    widget.visible = True
+    widget.parent_frame = ns.ppage.main_frame
+    ns.ppage.extra.append(widget)
+    _in_place(ns)
+    base = ns.els["pay"].on_click
+
+    def pay_click():
+        base()
+        widget.url = "https://verify.example.net/acs"  # in-place nav to a bank check
+
+    ns.els["pay"].on_click = pay_click
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "challenge"
+
+
+async def test_a_shown_frame_that_renavigates_same_url_is_a_challenge(vault):
+    # Audit Finding A: a frame visible at the click that re-navigates in place to a
+    # challenge WITHOUT changing its URL (a new document at the same URL) fires
+    # framenavigated, so it must not be mistaken for the frame shown at the click.
+    ns = checkout()
+    widget = Frame("https://shop.example.com/widget")
+    widget.visible = True
+    widget.parent_frame = ns.ppage.main_frame
+    ns.ppage.extra.append(widget)
+    _in_place(ns)
+    base = ns.els["pay"].on_click
+
+    def pay_click():
+        base()
+        for fn in ns.ppage.handlers.get("framenavigated", []):
+            fn(widget)  # re-navigates in place, same URL, new document
+
+    ns.els["pay"].on_click = pay_click
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "challenge"
+
+
+async def test_a_success_marker_that_is_pay_itself_is_a_challenge(vault):
+    ns = checkout()
+    pay = ns.els["pay"]
+
+    def pay_click():
+        pay.pay["live"] = False  # Pay disabled, still on the page
+        ns.ppage.main_frame.elements["#done"] = [pay]
+
+    pay.on_click = pay_click
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "challenge"
+
+
+def test_a_success_marker_inside_a_frame_is_refused():
+    ns = checkout()
+    for bad in ({"selector": "#done", "frames": ["iframe#card"]}, {"selector": "#done"}):
+        with pytest.raises(cf.Refused) as e:
+            _args(ns, success=bad)
+        assert e.value.code == "bad_success"
+    assert _args(ns, success="#done").success == "#done"
+
+
+# ── Pay rebuilt by the save is found again and clicked ──
+
+
+def _rebuilt_pay(ns, **pay):
+    """After the save, the page replaces Pay with a new element."""
+    fresh = El(
+        tag="button",
+        pay={"button": True, "get": False, "live": True, "label": "Pay $21.50", **pay},
+    )
+    clicks: list[bool] = []
+    fresh.on_click = lambda: (
+        clicks.append(True),
+        ns.ppage.navigate("https://shop.example.com/done"),
+    )
+
+    def rebuild():
+        ns.els["pay"].connected = False
+        ns.els["pay"].pay["live"] = False
+        ns.ppage.main_frame.elements["#pay"] = [fresh]
+
+    _after_save(ns, rebuild)
+    return fresh, clicks
+
+
+async def test_a_pay_the_save_rebuilt_is_found_again_and_clicked(vault):
+    ns = save_checkout()
+    _fresh, clicks = _rebuilt_pay(ns)
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
+    assert out["code"] == "submitted_unverified"
+    assert clicks == [True] and ns.pay_clicks == []
+
+
+async def test_a_rebuilt_pay_that_submits_by_get_is_refused(vault):
+    ns = save_checkout()
+    _fresh, clicks = _rebuilt_pay(ns, get=True)
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
+    assert out["code"] == "saved_page_changed:pay_get" and clicks == [] and ns.pay_clicks == []
+
+
+async def test_a_rebuilt_pay_with_another_label_is_refused(vault):
+    ns = save_checkout()
+    _fresh, clicks = _rebuilt_pay(ns, label="Donate $21.50")
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
+    assert out["code"] == "saved_page_changed:pay_label" and clicks == []
+
+
+async def test_pay_gone_after_the_save_is_named(vault):
+    ns = save_checkout()
+    _after_save(ns, lambda: ns.ppage.main_frame.elements.__setitem__("#pay", []))
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
+    assert out["code"] == "saved_page_changed:pay_gone" and ns.pay_clicks == []
+
+
+async def test_a_pay_selector_now_matching_a_card_field_is_refused(vault):
+    ns = save_checkout()
+    name = ns.els["name"]
+    name.pay = {"button": True, "get": False, "live": True, "label": "Pay $21.50"}
+    _after_save(ns, lambda: ns.ppage.main_frame.elements.__setitem__("#pay", [name]))
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
+    assert out["code"] == "saved_page_changed:pay_is_other" and ns.pay_clicks == []
+
+
+async def test_a_marker_already_shown_before_pay_proves_nothing(vault):
+    # A panel on screen before Pay; the click only disables Pay (processing).
+    ns = checkout()
+    panel = El()
+    ns.ppage.main_frame.elements["#done"] = [panel]
+    pay = ns.els["pay"]
+    pay.on_click = lambda: pay.pay.__setitem__("live", False)
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "challenge"
+
+
+async def test_a_bank_frame_revealed_in_place_outranks_the_marker(vault):
+    ns = checkout()
+    bank = Frame("https://hooks.stripe.com/3d_secure_2/x")
+    bank.parent_frame = ns.ppage.main_frame
+    ns.ppage.extra.append(bank)
+    _in_place(ns)
+    first = ns.els["pay"].on_click
+    ns.els["pay"].on_click = lambda: (first(), setattr(bank, "visible", True))
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "challenge"
+
+
+async def test_a_new_shown_frame_on_an_unknown_host_outranks_the_marker(vault):
+    ns = checkout()
+    _in_place(ns)
+    late = Frame("https://verify.example.net/step")
+    late.parent_frame = ns.ppage.main_frame
+    late.visible = True
+    first = ns.els["pay"].on_click
+    ns.els["pay"].on_click = lambda: (first(), ns.ppage.extra.append(late))
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "challenge"
+
+
+async def test_a_marker_matching_a_re_rendered_disabled_pay_is_a_challenge(vault):
+    ns = checkout()
+    fresh = El(tag="button", pay={"button": True, "get": False, "live": False, "label": "Pay"})
+
+    def pay_click():
+        ns.ppage.main_frame.elements["#pay"] = [fresh]
+        ns.ppage.main_frame.elements["#done"] = [fresh]
+
+    ns.els["pay"].on_click = pay_click
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "challenge"
 # ── a select that reverts any scripted choice takes it by keyboard ──
 
 
