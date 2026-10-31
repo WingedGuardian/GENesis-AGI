@@ -3365,6 +3365,11 @@ verified: 3e27b4794 2026-10-23
   reducer population have their own contained report, exact ID coverage and
   mutation controls. Actual contained evidence is required; real-process crash/
   timing/recovery and final B/C comparison remain separate qualification work.
+  A separate instrumented recovery controller declares twelve process-kill and
+  seven late-I/O cells, preserving plain-C reopen and existing container-init
+  ownership. Actual native process/cleanup evidence is required; its host tests
+  establish neither abrupt recovery nor actual clock behavior. Timing and final
+  B/C readback remain separate.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).
