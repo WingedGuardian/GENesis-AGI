@@ -2936,7 +2936,7 @@ _CR_INLINE_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 # MEASURED over every CodeRabbit review body carrying the section on the 735 PRs
 # updated 2026-10-01 to 10-31: 49 bodies, the last 19 in the old layout (to
 # 2026-09-14) and 30 in this one, declaring 32 findings that the old reader saw
-# as zero declared and zero parsed, so nothing blocked and nothing warned (16 of
+# as zero declared and zero parsed, so none was shown and nothing warned (18 of
 # the 32 were Major). In this layout:
 #   * the section is a BOLD line, `**⚠️ Outside diff range comments (N)**`, at
 #     <details> depth 0 (30 of 30), usually inside a `> [!CAUTION]` quote;
@@ -2957,9 +2957,9 @@ _CR_SUMMARY_LOCATION = " · <code>"
 # The finding's own location line, `` `src/pkg/mod.py:120-124` ``. MEASURED: 28 of the
 # 32 summaries name only the file's BASENAME (`mod.py:120-124`) and every one of
 # those 28 carries this line with the full path; the other 4 name the full path
-# in the summary. The full path is the finding's identity: it is compared with
-# the PR's files, and a basename matches none, which would route even a Critical
-# to the non-scoring off-diff lane.
+# in the summary. The full path is the finding's identity in this channel: it is
+# the location the report prints and part of the dedupe key across re-reviews, so a
+# basename would name the wrong file, or merge two findings in same-named files.
 _CR_LOCATION_LINE_RE = re.compile(r"^`([^`\s]{1,400}):(\d+(?:-\d+)?)`$")
 _CR_LOCATION_LOOKAHEAD = 15
 
