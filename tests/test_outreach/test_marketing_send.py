@@ -109,6 +109,15 @@ async def test_happy_path_enqueues_code_resolved_recipient_labeled_bulk(db):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("subject", ["", "   ", "\u202e", "\u200b \u2028"])
+async def test_empty_cleaned_subject_refuses_and_enqueues_nothing(db, subject):
+    await mp.create(db, id="p1", email="a@example.com", created_at=_TS, updated_at=_TS)
+    out = await _call("p1", subject=subject)
+    assert out == {"status": "refused", "reason": "subject_required"}
+    assert await po.drain(db, now="2099-01-01T00:00:00") == []
+
+
+@pytest.mark.asyncio
 async def test_empty_store_no_adapter_is_clean_noop(db):
     # Fresh clone: no adapter (pipeline=None) and an empty prospect table.
     out = await _call("anything")
