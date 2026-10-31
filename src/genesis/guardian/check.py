@@ -139,6 +139,7 @@ def _build_dispatcher(config: GuardianConfig) -> AlertDispatcher:
             bot_token=token,
             chat_id=chat_id,
             thread_id=thread_id or None,
+            sent_log_path=config.state_path / "alerts" / "sent_log.jsonl",
         ))
     else:
         logger.warning("No Telegram credentials — alerts will only go to journal")
