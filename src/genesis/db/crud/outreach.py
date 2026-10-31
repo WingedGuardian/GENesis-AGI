@@ -230,21 +230,25 @@ async def find_recent_unengaged(
     return [dict(r) for r in await cursor.fetchall()]
 
 
-async def get_previous_report_time(
+async def get_previous_report(
     db: aiosqlite.Connection,
-) -> str | None:
-    """Get the timestamp of the most recent previous morning report.
+) -> dict | None:
+    """Return the most recent morning report the user was sent, or None.
 
-    Returns the created_at of the second-most-recent morning_report entry
-    (OFFSET 1 skips the current report being generated).
+    ``{"created_at", "message_content"}`` of the newest ``morning_report`` row.
+    The pipeline writes that row only AFTER delivery, so while today's report
+    is being generated the newest row IS the previous report. (An earlier
+    version skipped it with OFFSET 1 and read the report before it.)
     """
     cursor = await db.execute(
-        "SELECT created_at FROM outreach_history "
+        "SELECT created_at, message_content FROM outreach_history "
         "WHERE signal_type = 'morning_report' "
-        "ORDER BY created_at DESC LIMIT 1 OFFSET 1",
+        "ORDER BY created_at DESC LIMIT 1",
     )
     row = await cursor.fetchone()
-    return row[0] if row else None
+    if not row:
+        return None
+    return {"created_at": row[0], "message_content": row[1] or ""}
 
 
 async def count_recent(

@@ -10,7 +10,7 @@ from genesis.mcp.outreach_mcp import mcp
 
 
 async def test_all_tools_registered():
-    tools = await mcp.get_tools()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
     for name in [
         "agent_send",
         "outreach_send",
@@ -31,7 +31,7 @@ async def test_all_tools_registered():
 
 async def test_outreach_send_without_pipeline():
     """Should return error string when pipeline not initialized."""
-    tools = await mcp.get_tools()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
     result = await tools["outreach_send"].fn(message="test", category="alert", channel="whatsapp")
     assert "not initialized" in result.lower() or "error" in result.lower()
 
@@ -52,7 +52,7 @@ async def test_send_and_wait_bridges_to_server_when_no_pipeline():
                 "timed_out": False,
             },
         ) as rpc:
-            tools = await mcp.get_tools()
+            tools = {tool.name: tool for tool in await mcp.list_tools()}
             result = await tools["outreach_send_and_wait"].fn(
                 message="test",
                 timeout_seconds=42,
@@ -77,7 +77,7 @@ async def test_provision_grow_bridges_to_server_when_no_pipeline():
             new_callable=AsyncMock,
             return_value={"ok": True, "stage": "executed"},
         ) as rpc:
-            tools = await mcp.get_tools()
+            tools = {tool.name: tool for tool in await mcp.list_tools()}
             result = await tools["provision_grow"].fn(
                 kind="disk",
                 disk="scsi1",
@@ -126,7 +126,7 @@ async def test_send_and_wait_success():
     old_pipeline = mcp_mod._pipeline
     try:
         mcp_mod._pipeline = mock_pipeline
-        tools = await mcp.get_tools()
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
         result = await tools["outreach_send_and_wait"].fn(
             message="Do you approve?",
             category="blocker",
@@ -158,7 +158,7 @@ async def test_outreach_send_delivers_verbatim(urgency, method):
     old_pipeline = mcp_mod._pipeline
     try:
         mcp_mod._pipeline = mock_pipeline
-        tools = await mcp.get_tools()
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
         await tools["outreach_send"].fn(
             message="Remind me to call the bank at 3pm — do NOT paraphrase this.",
             category="notification",
@@ -187,7 +187,7 @@ async def test_send_and_wait_timeout():
     old_pipeline = mcp_mod._pipeline
     try:
         mcp_mod._pipeline = mock_pipeline
-        tools = await mcp.get_tools()
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
         result = await tools["outreach_send_and_wait"].fn(
             message="Are you there?",
             timeout_seconds=5,
@@ -205,7 +205,7 @@ async def test_send_and_wait_invalid_category():
     old_pipeline = mcp_mod._pipeline
     try:
         mcp_mod._pipeline = mock_pipeline
-        tools = await mcp.get_tools()
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
         result = await tools["outreach_send_and_wait"].fn(
             message="test",
             category="nonexistent",
@@ -221,7 +221,7 @@ async def test_send_and_wait_invalid_category():
 @pytest.mark.asyncio
 async def test_outreach_poll_no_webhook():
     """Should return error when no webhook env var is set."""
-    tools = await mcp.get_tools()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
     with patch.dict("os.environ", {}, clear=True):
         result = await tools["outreach_poll"].fn(
             channel="announcements",
@@ -243,7 +243,7 @@ async def test_outreach_poll_no_webhook():
 @pytest.mark.asyncio
 async def test_outreach_poll_success():
     """Should POST poll payload and return message_id."""
-    tools = await mcp.get_tools()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
 
     # httpx Response is sync — use MagicMock, not AsyncMock
     mock_response = MagicMock()
@@ -288,7 +288,7 @@ async def test_outreach_poll_http_error():
     """Should return error on Discord API failure."""
     import httpx
 
-    tools = await mcp.get_tools()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
 
     # httpx Response is sync — use MagicMock
     mock_response = MagicMock()
@@ -332,7 +332,7 @@ async def test_send_standalone_invalid_category():
     try:
         mcp_mod._pipeline = None
         mcp_mod._db = mock_db
-        tools = await mcp.get_tools()
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
         result = await tools["outreach_send"].fn(
             message="Test",
             category="discord",
@@ -364,7 +364,7 @@ async def test_send_standalone_valid_category():
                 return_value="pending-123",
             ),
         ):
-            tools = await mcp.get_tools()
+            tools = {tool.name: tool for tool in await mcp.list_tools()}
             result = await tools["outreach_send"].fn(
                 message="Test post",
                 category="content",
@@ -398,12 +398,13 @@ async def test_send_standalone_email_resolves_and_enqueues_thread_recipient():
                 return_value={"recipient": "real@prospect.com"},
             ),
         ):
-            tools = await mcp.get_tools()
+            tools = {tool.name: tool for tool in await mcp.list_tools()}
             result = await tools["outreach_send"].fn(
                 message="following up",
                 category="notification",
                 channel="email",
                 thread_id="t1",
+                subject="Re: Genesis demo",
             )
         assert json.loads(result)["status"] == "queued"
         kwargs = enq.call_args.kwargs
@@ -427,11 +428,12 @@ async def test_send_standalone_email_without_thread_enqueues_no_recipient():
             patch("genesis.db.crud.pending_outreach.ensure_table", new_callable=AsyncMock),
             patch("genesis.db.crud.pending_outreach.enqueue", enq),
         ):
-            tools = await mcp.get_tools()
+            tools = {tool.name: tool for tool in await mcp.list_tools()}
             await tools["outreach_send"].fn(
                 message="orphan",
                 category="notification",
                 channel="email",
+                subject="A short note",
             )
         kwargs = enq.call_args.kwargs
         assert kwargs["thread_id"] is None
@@ -495,17 +497,17 @@ async def test_engagement_rejects_lifecycle_and_normalizes_replied(monkeypatch):
     try:
         mcp_mod._db = object()  # truthy stand-in; crud is patched
 
-        assert await mcp_mod.outreach_engagement.fn("o-1", "delivered") is False
-        assert await mcp_mod.outreach_engagement.fn("o-1", "opened") is False
+        assert await mcp_mod.outreach_engagement("o-1", "delivered") is False
+        assert await mcp_mod.outreach_engagement("o-1", "opened") is False
         assert calls == []
 
-        assert await mcp_mod.outreach_engagement.fn("o-1", "replied") is True
+        assert await mcp_mod.outreach_engagement("o-1", "replied") is True
         assert calls[-1] == (
             "o-1",
             {"engagement_outcome": "useful", "engagement_signal": "user_reply"},
         )
 
-        assert await mcp_mod.outreach_engagement.fn("o-2", "acted_on") is True
+        assert await mcp_mod.outreach_engagement("o-2", "acted_on") is True
         assert calls[-1] == (
             "o-2",
             {"engagement_outcome": "acted_on", "engagement_signal": "acted_on"},
@@ -534,11 +536,12 @@ async def test_generic_outreach_send_forwards_labeled_surplus(tmp_path):
         mcp_mod._pipeline = None
         mcp_mod._db = conn
         out = json.loads(
-            await mcp_mod.outreach_send.fn(
+            await mcp_mod.outreach_send(
                 message="bulk note",
                 category="content",
                 channel="email",
                 labeled_surplus=True,
+                subject="Genesis update",
             )
         )
         assert out["status"] == "queued"
@@ -599,7 +602,7 @@ class TestDiscordSubChannelRouting:
         old = mcp_mod._pipeline
         try:
             mcp_mod._pipeline = pipe
-            tools = await mcp.get_tools()
+            tools = {tool.name: tool for tool in await mcp.list_tools()}
             await tools["outreach_send"].fn(
                 message="release notes", category="notification", channel="announcements",
             )
@@ -623,7 +626,7 @@ class TestDiscordSubChannelRouting:
             old = mcp_mod._pipeline
             try:
                 mcp_mod._pipeline = pipe
-                tools = await mcp.get_tools()
+                tools = {tool.name: tool for tool in await mcp.list_tools()}
                 await tools["outreach_send"].fn(
                     message="m", category="notification", channel=name,
                 )
@@ -638,7 +641,7 @@ class TestDiscordSubChannelRouting:
         old = mcp_mod._pipeline
         try:
             mcp_mod._pipeline = pipe
-            tools = await mcp.get_tools()
+            tools = {tool.name: tool for tool in await mcp.list_tools()}
             await tools["outreach_send"].fn(
                 message="m", category="notification", channel="discord",
             )
@@ -655,7 +658,7 @@ class TestDiscordSubChannelRouting:
         old = mcp_mod._pipeline
         try:
             mcp_mod._pipeline = pipe
-            tools = await mcp.get_tools()
+            tools = {tool.name: tool for tool in await mcp.list_tools()}
             await tools["outreach_send"].fn(
                 message="m", category="notification", channel="telegram",
             )
@@ -695,7 +698,7 @@ class TestDiscordSubChannelRouting:
             mcp_mod._db = MagicMock()
             with patch("genesis.db.crud.pending_outreach.ensure_table", new_callable=AsyncMock), \
                  patch("genesis.db.crud.pending_outreach.enqueue", side_effect=_enqueue):
-                tools = await mcp.get_tools()
+                tools = {tool.name: tool for tool in await mcp.list_tools()}
                 await tools["outreach_send"].fn(
                     message="m", category="notification", channel="announcements",
                 )
@@ -733,7 +736,7 @@ async def test_outreach_pending_pages_with_a_denominator(tmp_path):
         try:
             mcp_mod._pipeline = None
             mcp_mod._db = conn
-            tools = await mcp.get_tools()
+            tools = {tool.name: tool for tool in await mcp.list_tools()}
 
             first = await tools["outreach_pending"].fn()
             assert first["total"] == 60, first
@@ -782,7 +785,7 @@ class TestPollRefusesUnconfiguredChannel:
 
     async def test_unconfigured_named_channel_is_refused(self, monkeypatch):
         self._env(monkeypatch, DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/0/default")
-        tools = await mcp.get_tools()
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
         out = json.loads(
             await tools["outreach_poll"].fn(
                 channel="bug-reports", question="Ship it?", answers=["Yes", "No"],
@@ -803,7 +806,7 @@ class TestPollRefusesUnconfiguredChannel:
             DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/0/default",
             DISCORD_WEBHOOK_ANNOUNCEMENTS="https://discord.com/api/webhooks/1/ann",
         )
-        tools = await mcp.get_tools()
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
         with patch("genesis.mcp.outreach_mcp.httpx.AsyncClient") as mock_cls:
             client = AsyncMock()
             client.post.return_value = AsyncMock(
@@ -828,7 +831,7 @@ class TestPollRefusesUnconfiguredChannel:
             DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/0/default",
             OUTREACH_RECIPIENT_DISCORD="dev-discussion",
         )
-        tools = await mcp.get_tools()
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
         with patch("genesis.mcp.outreach_mcp.httpx.AsyncClient") as mock_cls:
             client = AsyncMock()
             client.post.return_value = AsyncMock(
@@ -865,7 +868,7 @@ class TestPollRefusesUnconfiguredChannel:
             DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/0/default",
             OUTREACH_RECIPIENT_DISCORD="dev-discussion",
         )
-        tools = await mcp.get_tools()
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
         with patch("genesis.mcp.outreach_mcp.httpx.AsyncClient") as mock_cls:
             client = AsyncMock()
             mock_cls.return_value.__aenter__ = AsyncMock(return_value=client)
@@ -878,3 +881,64 @@ class TestPollRefusesUnconfiguredChannel:
         assert "error" in out, f"the reserved name must be refused, got {out}"
         client.post.assert_not_called()
 
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subject", [None, "", "   ", "\u202e", "\u200b \u2028"])
+async def test_an_email_without_a_subject_from_its_author_is_refused(subject):
+    """Whoever writes the email writes its subject; a send without one is refused
+    before anything is queued or delivered."""
+    from unittest.mock import AsyncMock
+
+    import genesis.mcp.outreach_mcp as mcp_mod
+
+    old = (mcp_mod._pipeline, mcp_mod._db)
+    pipeline = AsyncMock()
+    pipeline.submit.side_effect = AssertionError("An empty cleaned subject must not reach the pipeline")
+    mcp_mod._pipeline = pipeline
+    mcp_mod._db = None
+    try:
+        out = json.loads(await mcp_mod.outreach_send(
+            message="Hello there", category="notification", channel="email", subject=subject,
+        ))
+    finally:
+        mcp_mod._pipeline, mcp_mod._db = old
+    assert out["status"] == "refused" and out["code"] == "email_subject_required"
+    pipeline.submit.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("thread_subject", "given", "sent"),
+    [
+        ("Genesis demo", None, "Re: Genesis demo"),
+        ("Genesis demo", "A fresh title", "Re: Genesis demo"),  # never splits the thread
+        ("Re: Genesis demo", None, "Re: Genesis demo"),  # no Re: Re:
+        ("​RE: Genesis demo", None, "RE: Genesis demo"),  # hidden prefix
+    ],
+)
+async def test_a_reply_keeps_its_threads_subject(thread_subject, given, sent):
+    old_pipeline, old_db = mcp_mod._pipeline, mcp_mod._db
+    enq = AsyncMock(return_value="pending-xyz")
+    try:
+        mcp_mod._pipeline = None
+        mcp_mod._db = AsyncMock()
+        with (
+            patch("genesis.db.crud.pending_outreach.ensure_table", new_callable=AsyncMock),
+            patch("genesis.db.crud.pending_outreach.enqueue", enq),
+            patch(
+                "genesis.db.crud.email_threads.get_thread",
+                new_callable=AsyncMock,
+                return_value={"recipient": "real@prospect.com", "subject": thread_subject},
+            ),
+        ):
+            tools = {tool.name: tool for tool in await mcp.list_tools()}
+            result = await tools["outreach_send"].fn(
+                message="following up", category="notification", channel="email",
+                thread_id="t1", subject=given,
+            )
+        assert json.loads(result)["status"] == "queued"
+        assert enq.call_args.kwargs["email_subject"] == sent
+    finally:
+        mcp_mod._pipeline = old_pipeline
+        mcp_mod._db = old_db

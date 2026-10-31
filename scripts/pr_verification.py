@@ -18,13 +18,14 @@ USAGE
         --note "needs an install with no graph engine" \\
         --evidence-file ~/.genesis/output/prv-1573.json
 
-THE VERDICT IS DERIVED FROM THE DOCUMENT, not chosen. The four verdicts are the
-owner's standing ruling (2026-09-26); which one a document supports is decided by
-``genesis.session_awareness.pr_evidence.derive``, a decision tree that gives every
-valid document exactly one:
+THE VERDICT IS DERIVED FROM THE DOCUMENT, not chosen. The verdicts are the owner's
+standing ruling (2026-09-26, not-yet-done added 2026-10-27); which one a document
+supports is decided by ``genesis.session_awareness.pr_evidence.derive``, a decision
+tree that gives every valid document exactly one:
 
   deploy.established is false           -> cannot-verify          LEAVES IT OPEN
   a claim failed at MEASURED or READ    -> fail-intent            LEAVES IT OPEN
+  a not_yet_done gap                    -> not-yet-done           LEAVES IT OPEN
   a claim failed at INFERRED            -> cannot-verify          LEAVES IT OPEN
   nothing passing at MEASURED or READ   -> cannot-verify          LEAVES IT OPEN
   no gaps                               -> pass-mechanical        CLOSES the row
@@ -33,9 +34,13 @@ valid document exactly one:
 Deployment comes first: ``deploy.established`` is required, and false derives
 cannot-verify (row OPEN, "DEPLOYMENT NOT ESTABLISHED" named) whatever the claims say.
 
-Gaps are the declared ``scope_limits`` plus the ones the document implies: no
-negative control, any NOT_VERIFIABLE_HERE claim, any INFERRED claim, and a named
-SUSPECTED FAILURE for each claim that failed only at INFERRED.
+Gaps are the declared ``gaps`` plus the ones the document implies: no negative
+control, any NOT_VERIFIABLE_HERE claim, any INFERRED claim, and a named SUSPECTED
+FAILURE for each claim that failed only at INFERRED. A declared gap is typed by its
+``kind``: ``method``, ``owner_only`` and ``event_gated`` (+``trigger``, +``recheck``)
+close with the gap named; ``not_yet_done`` keeps the row OPEN with its command at
+the head of the note. ``scope_limits``, the untyped list this replaced, is refused
+by name rather than mapped across.
 
 EACH CLAIM is ``pass``, ``fail`` or ``unverified``. ``unverified`` goes with tier
 NOT_VERIFIABLE_HERE and only with it; the model refuses either without the other,
@@ -55,17 +60,29 @@ What the caller still decides:
              cannot-verify instead, because something was established but nothing
              MATERIAL was. A failure can never be parked — it goes to the USER as a
              conversation, never an automatic rollback, and the defect gets filed.
-  --note     Required whenever the row stays open (fail-intent, cannot-verify): it
+  --note     Required when the row stays open on fail-intent or cannot-verify: it
              is the whole value of an open row, the thing that stops the next
-             validator re-deriving why. Refused when the row closes.
+             validator re-deriving why. Optional on not-yet-done, whose NOT YET
+             DONE gaps already are the note. Refused when the row closes.
   --verdict  OPTIONAL. An expectation checked for equality with the outcome; a
              mismatch refuses with "document derives X". Worth passing: it catches a
              document that does not say what you think it says.
 
 "I DID NOT GET TO IT" IS NOT ``cannot-verify``. The test is whether you could have
-done it with the access and the time you had. If yes it is not-yet-done: leave the
-row alone. Keep cannot-verify RARE, or the ledger fills with parked rows and the
-backlog stops meaning anything.
+done it with the access and the time you had. If yes it is not-yet-done: do it, or
+record a ``not_yet_done`` gap with the command that does it — the row stays open
+with that command leading its note, and ``--park`` is refused on it. Keep
+cannot-verify RARE, or the ledger fills with parked rows and the backlog stops
+meaning anything.
+
+``merge_commit`` IS CHECKED, NOT TRUSTED. ``close`` resolves the PR's real merge
+commit (``gh pr view --json mergeCommit``; the row stores none) and refuses a
+document whose ``merge_commit`` is not a prefix of it of at least 7 hex characters.
+MEASURED 2026-10-27: an independent re-verification found 5 of 15 documents in one
+group naming main HEAD or the host's deployed commit instead of the PR's merge. If
+the commit cannot be resolved (gh missing, offline, no merge commit) the close is
+refused and says why — a fault never waves a document through. ``--dry-run`` runs
+the check too.
 
 WHERE THE DATABASE IS, and the trap that costs a confusing run: ``genesis_db_path()``
 resolves RELATIVE TO THE REPO ROOT, so running this from a linked worktree points
@@ -93,8 +110,9 @@ negative verdict.
 EXIT CODES. 0 wrote (or dry-ran); 1 the ledger declined (no such open row, a race,
 an absent or quarantined database); 2 the request was malformed (bad evidence, a
 missing or discarded note, a PR mismatch, a --verdict/--park the document does not
-support); 3 refused on policy (a failing claim under any other --verdict, or --park
-on a failure). Deliberately meaningful, which is why this is a separate script
+support, a merge commit that cannot be resolved); 3 refused on policy (a failing
+claim under any other --verdict, --park on a failure, a ``merge_commit`` that is
+not the PR's). Deliberately meaningful, which is why this is a separate script
 rather than a subcommand of ``repo_pulse_worker.py``: that module's documented
 contract is that its exit code is always 0.
 """
@@ -106,6 +124,7 @@ import asyncio
 import json
 import sqlite3
 import sys
+from collections.abc import Callable
 from datetime import UTC
 from pathlib import Path
 
@@ -127,6 +146,14 @@ from genesis.session_awareness.pr_evidence import (  # noqa: E402
     parse_evidence,
     reason_for,
 )
+from genesis.session_awareness.pr_recording import (  # noqa: E402
+    _DuplicateKey,
+    _no_duplicates,
+    attempt_note,
+    check_merge_commit,
+    gh_merge_commit,
+    resolve_repo,
+)
 
 __all__ = [
     "MAX_EVIDENCE_BYTES",
@@ -134,6 +161,8 @@ __all__ = [
     "TIERS",
     "EvidenceError",
     "build_reason",
+    "check_merge_commit",
+    "gh_merge_commit",
     "main",
     "resolve_repo",
     "validate_evidence",
@@ -155,34 +184,16 @@ def build_reason(doc: EvidenceDocument, decision: Decision) -> str:
     return reason_for(doc, decision)
 
 
-def resolve_repo(open_repos: list[str], pr_number: int, repo: str) -> str:
-    """Return *repo* if ``(repo, pr_number)`` is an OPEN obligation, else raise LookupError.
 
-    The document names the repository, so nothing is chosen here — only CHECKED.
-    Before the document named it, a ``--repo`` flag did, unchecked, and it closed a
-    DIFFERENT repository's obligation with this PR's evidence at exit 0, permanently
-    (MEASURED end-to-end on an earlier draft). "Nothing open for this PR" and "that
-    repo is not among the open ones" are different facts, so they read differently.
-    """
-    if not open_repos:
-        raise LookupError(
-            f"no OPEN row for PR #{pr_number} — it may be discharged already, or "
-            f"never opened. Run `python3 scripts/repo_pulse_worker.py "
-            f"--verification-backlog` to see the open set."
-        )
-    if repo not in open_repos:
-        raise LookupError(
-            f"no OPEN row for {repo}#{pr_number} (the repository the evidence document "
-            f"names). Open rows for PR #{pr_number}: {', '.join(open_repos)}. If the "
-            f"document names the wrong repository, correct the document."
-        )
-    return repo
+
+
+
 
 
 SCHEMA_TEMPLATE = {
     "repo": "<owner/name — with 'pr' this is the ledger row's key>",
     "pr": 1234,
-    "merge_commit": "<sha of the artifact you actually verified>",
+    "merge_commit": "<the PR's merge commit sha, 7+ hex chars — close checks it on GitHub>",
     "deploy": {
         "method": "behaviour | content | ancestry",
         "established": True,
@@ -200,7 +211,21 @@ SCHEMA_TEMPLATE = {
         "the arm that had to come out the other way, and did — without one the "
         "document derives pass-with-measured-gaps, never pass-mechanical"
     ],
-    "scope_limits": ["what this install could not reach, named"],
+    "gaps": [
+        {"kind": "method", "detail": "a limit of HOW this was verified, accepted as it is"},
+        {"kind": "owner_only", "detail": "what only the owner can check"},
+        {
+            "kind": "event_gated",
+            "detail": "what cannot be measured until something happens",
+            "trigger": "YYYY-MM-DD, or the named event",
+            "recheck": "one read-only command or SQL that re-measures it",
+        },
+        {
+            "kind": "not_yet_done",
+            "detail": "reachable work you have not done — keeps the row OPEN",
+            "command": "what to run to do it",
+        },
+    ],
     "findings": [{"summary": "what you found", "disposition": "issue #N | note | none"}],
 }
 
@@ -213,6 +238,7 @@ async def _write(
     note: str | None,
     payload: str,
     dry_run: bool,
+    merge_commit_of: Callable[[str, int], str],
 ) -> int:
     import aiosqlite
 
@@ -271,6 +297,22 @@ async def _write(
                 print(f"pr_verification: {exc}", file=sys.stderr)
                 return 1
 
+            # After the row lookup, so a PR with no open row costs no network call.
+            try:
+                actual = merge_commit_of(target, pr_number)
+            except LookupError as exc:
+                print(
+                    f"pr_verification: cannot check merge_commit — the merge commit of "
+                    f"{target}#{pr_number} did not resolve: {exc}. Nothing was written; "
+                    f"retry where gh can reach GitHub.",
+                    file=sys.stderr,
+                )
+                return 2
+            mismatch = check_merge_commit(doc.merge_commit, actual)
+            if mismatch:
+                print(f"pr_verification: {mismatch}", file=sys.stderr)
+                return 3
+
             verdict = decision.verdict
             reason = build_reason(doc, decision)
             # An open row's note is the validator's own words, with two kinds of
@@ -280,15 +322,9 @@ async def _write(
             # stored document would read there exactly like an ordinary precondition.
             # A long prefix can push the validator's words past the backlog's clip;
             # the clip marker names the read that shows them whole. And a park, which
-            # is a judgment the note must own up to.
-            attempt_note = None
-            if not decision.closing:
-                attempt_note = str(note).strip()
-                visible = [g for g in decision.derivation.gaps if g.startswith(NOTE_PREFIXED_GAPS)]
-                if visible:
-                    attempt_note = "; ".join(visible) + " — " + attempt_note
-                if decision.parked:
-                    attempt_note = "PARKED (nothing material established) — " + attempt_note
+            # is a judgment the note must own up to. On not-yet-done the note is
+            # optional, so the prefix may be all there is — never "None" in its place.
+            rendered_note = attempt_note(decision, note)
 
             if dry_run:
                 print("pr_verification: DRY RUN — nothing written.")
@@ -300,7 +336,7 @@ async def _write(
                 if decision.closing:
                     print(f"  reason   : {reason}")
                 else:
-                    print(f"  note     : {attempt_note}")
+                    print(f"  note     : {rendered_note}")
                 print(f"  evidence : {len(payload.encode('utf-8'))} bytes")
                 return 0
 
@@ -336,7 +372,7 @@ async def _write(
                 repo=target,
                 pr_number=pr_number,
                 verdict=verdict,
-                note=attempt_note,
+                note=rendered_note,
                 now=now,
                 evidence=payload,
             )
@@ -366,6 +402,11 @@ async def _write(
                 print(
                     "  Deployment was not established, so nothing measured here is a "
                     "finding about the PR. Deploy the merge and re-run."
+                )
+            elif verdict == "not-yet-done":
+                print(
+                    "  Work the document names is NOT YET DONE: run the commands above, "
+                    "then record the result with a fresh close."
                 )
             elif any(g.startswith(SUSPECTED_FAILURE) for g in gaps):
                 print(
@@ -400,22 +441,8 @@ async def _write(
         return 1
 
 
-class _DuplicateKey(ValueError):
-    pass
 
 
-def _no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    # json.loads keeps the LAST of two equal keys without a word, so a document with
-    # "verdict" twice records whichever the author wrote second. Refuse instead.
-    out: dict[str, object] = {}
-    for key, value in pairs:
-        if key in out:
-            raise _DuplicateKey(
-                f"the evidence document repeats the key {key!r} in one object; JSON "
-                f"would keep only the last one silently, so it is refused"
-            )
-        out[key] = value
-    return out
 
 
 def _refuse(message: str, code: int) -> int:
@@ -423,7 +450,11 @@ def _refuse(message: str, code: int) -> int:
     return code
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    merge_commit_of: Callable[[str, int], str] | None = None,
+) -> int:
     from genesis.db.crud import pr_verifications as crud
 
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
@@ -539,6 +570,7 @@ def main(argv: list[str] | None = None) -> int:
             note=args.note,
             payload=payload,
             dry_run=args.dry_run,
+            merge_commit_of=merge_commit_of or gh_merge_commit,
         )
     )
 

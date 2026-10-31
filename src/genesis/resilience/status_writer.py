@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -28,6 +29,9 @@ class StatusFileWriter:
         self._runtime = runtime
         self._path = Path(path).expanduser()
         self._extra_data: dict = {}
+        self._write_gate = asyncio.Lock()
+        self._publication: asyncio.Future | None = None
+        self._closed = False
 
     def set_extra_data(self, key: str, value) -> None:
         """Merge additional data into the next status write.
@@ -37,7 +41,58 @@ class StatusFileWriter:
         self._extra_data[key] = value
 
     async def write(self) -> None:
-        """Write current system status to JSON file."""
+        """Collect on-loop, then await ordered atomic publication off-loop."""
+        if self._closed:
+            raise RuntimeError("StatusFileWriter is closed")
+        await self._write_gate.acquire()
+        submitted = False
+        try:
+            if self._closed:
+                raise RuntimeError("StatusFileWriter is closed")
+            data = await self._snapshot()
+            try:
+                payload = json.dumps(data, indent=2).encode()
+            except Exception:
+                logger.error("Status file serialization FAILED at %s", self._path, exc_info=True)
+                return
+            future = asyncio.get_running_loop().run_in_executor(
+                None, self._publish, self._path, payload,
+            )
+            self._publication = future
+            future.add_done_callback(self._publication_finished)
+            submitted = True
+            # Cancellation ends this await, not the actual filesystem work.
+            # Only its completion callback may admit the next snapshot/write.
+            await asyncio.shield(future)
+        finally:
+            if not submitted:
+                self._write_gate.release()
+
+    def _publication_finished(self, future: asyncio.Future) -> None:
+        try:
+            exc = future.exception()
+            if exc is not None:
+                logger.error(
+                    "Status publication worker FAILED at %s", self._path,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+        finally:
+            self._publication = None
+            self._write_gate.release()
+
+    async def aclose(self) -> None:
+        """Reject new writes and drain publication, even after a canceled close.
+
+        An already-admitted snapshot may finish. Waiting writers recheck closed
+        before collecting. Do not shield acquire: an abandoned acquisition could
+        otherwise keep this gate locked after its caller has gone away.
+        """
+        self._closed = True
+        async with self._write_gate:
+            pass
+
+    async def _snapshot(self) -> dict:
+        """Read runtime and async database state on their owning event loop."""
         from datetime import UTC, datetime
 
         state = self._state_machine.current
@@ -160,26 +215,34 @@ class StatusFileWriter:
         if self._extra_data:
             data.update(self._extra_data)
 
-        self._path.parent.mkdir(parents=True, exist_ok=True)
+        return data
+
+    @staticmethod
+    def _publish(path: Path, payload: bytes) -> None:
+        """Perform file I/O only; the caller owns ordering and immutable bytes."""
+        # Preserve the existing contract: directory-creation errors propagate;
+        # failures inside temporary-file publication are logged and nonfatal.
+        path.parent.mkdir(parents=True, exist_ok=True)
         try:
             # Atomic write: temp file + os.replace to prevent partial reads
             # by concurrent MCP server processes reading status.json.
             import os
             import tempfile
 
-            content = json.dumps(data, indent=2)
             fd, tmp_path = tempfile.mkstemp(
-                dir=str(self._path.parent),
+                dir=str(path.parent),
                 suffix=".tmp",
             )
-            fd_closed = False
+            handle = None
             try:
-                os.write(fd, content.encode())
-                os.close(fd)
-                fd_closed = True
-                os.replace(tmp_path, str(self._path))
+                handle = os.fdopen(fd, "wb")
+                with handle:
+                    # BufferedWriter writes the whole payload or raises; a raw
+                    # os.write may return a successful but incomplete write.
+                    handle.write(payload)
+                os.replace(tmp_path, str(path))
             except Exception:
-                if not fd_closed:
+                if handle is None:
                     with contextlib.suppress(OSError):
                         os.close(fd)
                 with contextlib.suppress(OSError):
@@ -188,7 +251,7 @@ class StatusFileWriter:
         except Exception:
             logger.error(
                 "Status file write FAILED at %s — external monitoring will see stale data",
-                self._path,
+                path,
                 exc_info=True,
             )
 

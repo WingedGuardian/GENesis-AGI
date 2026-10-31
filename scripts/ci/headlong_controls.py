@@ -179,7 +179,11 @@ def run_route(root, route, kind):
             thread.join()
     captures = http_captures if route == "http" else read_jsonl(capture)
     rows = [row for path in (root / "trajectories").rglob("trajectory.jsonl") for row in read_jsonl(path)]
-    evidence = {"returncode": result.returncode, "run_id": (root / "run-id").read_text().strip(),
+    # A startup failure can exit before shellm writes run-id; an absent id leaves the
+    # control unbound (failed), never the whole report discarded.
+    run_id_file = root / "run-id"
+    run_id = run_id_file.read_text().strip() if run_id_file.exists() else ""
+    evidence = {"returncode": result.returncode, "run_id": run_id,
                 "effect": (root / "effect.txt").read_bytes() if (root / "effect.txt").exists() else None,
                 "trajectory": rows, "capture_verified": request_verified(route, captures, marker)}
     passed = qualify(kind, evidence)

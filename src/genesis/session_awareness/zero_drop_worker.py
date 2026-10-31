@@ -835,6 +835,51 @@ async def _emit_heartbeat(db, *, detail: str) -> None:
         logger.warning("zero_drop heartbeat write failed", exc_info=True)
 
 
+#: Every source whose open alert row describes a condition that persists until
+#: the detector reads it gone. The morning report keeps counting these toward
+#: Standing Items while they stay open (``confirm_delivery``).
+PERSISTENT_ALERT_SOURCES = (ALERT_SOURCE, BLIND_SOURCE)
+
+
+async def _keep_surfacing(
+    db, *, source: str, created: str | None, content_hash: str, content: str, priority: str
+) -> None:
+    """Keep the alert's morning-report history across sweeps.
+
+    Each alert is replaced by a NEW row whenever its text changes, and the
+    report surfaces a row once. Without the carry, the replacement starts at
+    count 0 with no ``surfaced_at``: it is shown as new again, and a fault that
+    lasts weeks never reaches Standing Items. Called after the create and
+    before the supersede, while the predecessor is still open. A critical row
+    carries the count only, so a changed critical state still reaches the
+    pager (``get_unsurfaced``).
+
+    A dedup-skipped create (``created`` is None) re-confirmed the open row, so
+    its TTL restarts and its text is rewritten to ``content`` (the blind
+    alert's hash ignores digits, so its counts would otherwise stay as first
+    written): a row that stays open while the fault persists is what
+    lets the carry trust only OPEN predecessors. Both are logged on failure and
+    never stop the supersede.
+    """
+    from genesis.db.crud import observations
+
+    try:
+        if created:
+            await observations.carry_surfacing(
+                db,
+                source=source,
+                type=ALERT_TYPE,
+                to_id=created,
+                carry_surfaced_at=priority != "critical",
+            )
+        else:
+            await observations.refresh_open_expiry(
+                db, source=source, type=ALERT_TYPE, content_hash=content_hash, content=content
+            )
+    except Exception:
+        logger.warning("zero_drop surfacing carry-over failed (%s)", source, exc_info=True)
+
+
 async def _maintain_alert(db, *, cfg: dict, findings: list[dict], total: int, coverage: str) -> str:
     """Keep exactly ONE observation describing the current board (or none).
 
@@ -925,6 +970,14 @@ async def _maintain_alert(db, *, cfg: dict, findings: list[dict], total: int, co
             created_at=now_iso,
             content_hash=content_hash,
             skip_if_duplicate=True,
+        )
+        await _keep_surfacing(
+            db,
+            source=ALERT_SOURCE,
+            created=created,
+            content_hash=content_hash,
+            content=content,
+            priority=alert_priority(cfg),
         )
         await observations.supersede_except_hash(
             db,
@@ -1023,10 +1076,13 @@ async def _maintain_blind_alert(db, *, degraded: dict, frozen: list[str]) -> str
     # would therefore mint a fresh high-priority row every sweep for a fault
     # that had not changed, which forfeits the dedup this hash exists to
     # provide. What it costs: a fault whose SCALE changes but whose words do
-    # not (1 unreadable -> 47) no longer supersedes, so the open row keeps the
-    # older count. That is the acceptable half — this row is the ALARM ("the
-    # detector is blind on X"), while the live counts are in the run record and
-    # are re-rendered by `zero_drop_status` on every sweep.
+    # not (1 unreadable -> 47) no longer supersedes. The open row's text is
+    # rewritten in place on that sweep instead (`_keep_surfacing`), so it shows
+    # the current numbers while keeping its row and its report history; the
+    # live counts are also in the run record, re-rendered by `zero_drop_status`.
+    # In the morning report's Standing Items such a rewrite still reads
+    # [unchanged]: change is judged by row identity, not digits, the same
+    # trade this hash makes.
     _identity = re.sub(
         r"\d+",
         "#",
@@ -1044,6 +1100,14 @@ async def _maintain_blind_alert(db, *, degraded: dict, frozen: list[str]) -> str
             created_at=now_iso,
             content_hash=content_hash,
             skip_if_duplicate=True,
+        )
+        await _keep_surfacing(
+            db,
+            source=BLIND_SOURCE,
+            created=created,
+            content_hash=content_hash,
+            content=content,
+            priority="high",
         )
         await observations.supersede_except_hash(
             db,

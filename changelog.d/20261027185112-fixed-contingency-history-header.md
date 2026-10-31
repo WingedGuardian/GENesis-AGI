@@ -1,0 +1,1 @@
+- When Claude Code is capped and a Telegram reply falls back to the tool-less backup model, that model now sees the chat's recent messages on resumed turns too, opens with a single `[Contingency mode via <provider>]` label instead of a wrong `[Sonnet / ...]` header, and says plainly when it lacks earlier context instead of promising to look it up later.

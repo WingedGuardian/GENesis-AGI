@@ -111,8 +111,8 @@ _ts_log = _TsLog()
 # below and on the mcp_health.log handler. A logger filter sees only records
 # created on that logger, so each emitting logger is named: this module, the
 # genesis.browser modules it calls, FastMCP's tool and server loggers
-# (tool_manager logs a tool exception with its traceback, server logs call
-# arguments at debug) and the MCP SDK's lowlevel server logger. Logger-level,
+# (server logs tool failures, base logs serialization failures) and the MCP
+# SDK's lowlevel/runner/dispatcher loggers. Logger-level,
 # because FastMCP's configure_logging replaces the fastmcp handlers.
 _REDACTED_LOGGERS = (
     __name__,
@@ -123,10 +123,11 @@ _REDACTED_LOGGERS = (
     "genesis.mcp.health.payment_context",
     "genesis.payments.card_fill",
     "genesis.payments.release_client",
-    "fastmcp.tools.tool_manager",
-    "fastmcp.tools.tool",
+    "fastmcp.tools.base",
     "fastmcp.server.server",
     "mcp.server.lowlevel.server",
+    "mcp.server.runner",
+    "mcp.shared.jsonrpc_dispatcher",
 )
 for _name in _REDACTED_LOGGERS:
     logging.getLogger(_name).addFilter(CARD_FILTER)

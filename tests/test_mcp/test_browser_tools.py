@@ -1736,7 +1736,12 @@ class TestStealthClickLocator:
         lib = pkg / "driver" / "package" / "lib"
         src = "".join(p.read_text(errors="replace") for p in lib.rglob("*.js"))
         assert "`  performing ${actionName} action`" in src
-        assert "${result.hitTargetDescription} " + browser._INTERCEPT_MARK + "`" in src
+        # The driver bundle can rename local variables (result -> result2).
+        # Pin the field and emitted text without depending on that local name.
+        assert re.search(
+            r"\$\{[A-Za-z_$][\w$]*\.hitTargetDescription\} "
+            + re.escape(browser._INTERCEPT_MARK) + "`", src,
+        )
         assert '"- " + line.trim()' in src and "count} \\xD7 `" in src
         # The parser's premise: an element preview never spans two records.
         assert 's.replace(/\\\\n/g, "\\\\u21B5")' in src
@@ -1997,7 +2002,7 @@ class TestStealthClickLocator:
         with patch.object(browser, "_impl_browser_click", new=hung), patch.object(
             browser, "_TOOL_TIMEOUT_S", 0.05
         ):
-            result = await browser.browser_click.fn("#pay")
+            result = await browser.browser_click("#pay")
         assert "timed out" in result["error"]
         assert "may already have been delivered" in result["error"]
         # The timeout reset the active page, so a snapshot cannot check it, and
@@ -4852,14 +4857,14 @@ class TestALayerInUseIsNotReclaimed:
             return {}
 
         with patch.object(browser, "_with_tool_timeout", new=capture):
-            await browser.browser_navigate.fn("https://example.com")
-            await browser.browser_navigate.fn("https://example.com", remote=True)
-            await browser.browser_click.fn("#a")
-            await browser.browser_upload.fn("#a", "/nonexistent")
-            await browser.browser_screenshot.fn()
-            await browser.browser_snapshot.fn()
-            await browser.browser_run_js.fn("1")
-            await browser.browser_press_key.fn("Tab", 1000)
+            await browser.browser_navigate("https://example.com")
+            await browser.browser_navigate("https://example.com", remote=True)
+            await browser.browser_click("#a")
+            await browser.browser_upload("#a", "/nonexistent")
+            await browser.browser_screenshot()
+            await browser.browser_snapshot()
+            await browser.browser_run_js("1")
+            await browser.browser_press_key("Tab", 1000)
         assert len(caps) == 8, caps
         assert all(t <= 300.0 < browser._IDLE_TIMEOUT_S for _, t in caps), caps
 
@@ -7238,6 +7243,29 @@ def test_every_impl_browser_function_is_redacted():
 
 
 class TestLogsAreRedacted:
+    async def test_sdk_dispatcher_redacts_malformed_frame(self, caplog):
+        import json
+        import logging
+
+        import anyio
+        import mcp_types
+        from mcp.shared.jsonrpc_dispatcher import JSONRPCDispatcher
+        from pydantic import ValidationError
+
+        # The stdio transport yields this same parser exception to the SDK
+        # dispatcher. Its repr includes the raw frame, even before a tool runs.
+        with pytest.raises(ValidationError) as caught:
+            mcp_types.jsonrpc_message_adapter.validate_json(json.dumps(_CARD), by_name=False)
+        assert _CARD in str(caught.value), "the probe must carry the synthetic card"
+        send, receive = anyio.create_memory_object_stream(1)
+        async with send, receive:
+            dispatcher = JSONRPCDispatcher(receive, send)
+            with caplog.at_level(logging.DEBUG, logger="mcp.shared.jsonrpc_dispatcher"):
+                await dispatcher._dispatch(caught.value, AsyncMock(), AsyncMock(), None)
+        assert "transport yielded exception" in caplog.text
+        assert _CARD not in caplog.text
+        assert REDACTED in caplog.text
+
     @pytest.mark.asyncio
     async def test_the_log_file_and_turnstile_log_hold_no_card(self, tmp_path):
         import logging
@@ -7341,22 +7369,24 @@ class TestLogsAreRedacted:
         sits on the logger, so a tool exception's traceback is still redacted."""
         import logging
 
-        from fastmcp import FastMCP
+        from fastmcp import Client, FastMCP
+        from fastmcp.exceptions import ToolError
         from fastmcp.utilities.logging import configure_logging
 
         root = logging.getLogger("fastmcp")
         saved = (root.handlers[:], root.level, root.propagate)
         try:
             configure_logging(level="DEBUG")
-            assert CARD_FILTER in logging.getLogger("fastmcp.tools.tool_manager").filters
+            assert CARD_FILTER in logging.getLogger("fastmcp.server.server").filters
             server = FastMCP("redaction-test")
 
             @server.tool()
             def boom() -> str:
                 raise RuntimeError(f"page text {_CARD}")
 
-            with pytest.raises(Exception):  # noqa: B017 - FastMCP's ToolError
-                await server._tool_manager.call_tool("boom", {})
+            async with Client(server) as client:
+                with pytest.raises(ToolError):
+                    await client.call_tool("boom", {})
         finally:
             root.handlers[:] = saved[0]
             root.setLevel(saved[1])

@@ -363,6 +363,7 @@ def build_census(
     include_host: bool = False,
     live_held_by: int | None = None,
     host_home: Path | None = None,
+    prior: dict[tuple[int, str], str] | None = None,
 ) -> dict:
     """One census row's metrics. Blocking (``/proc`` and ``git``): run it in a
     thread. ``host_pid`` is this process, skipped by the scan; with
@@ -467,7 +468,20 @@ def build_census(
         )
         # Each value derived the way THIS server derives it (its own SECRETS_PATH,
         # GENESIS_REPO_ROOT and HOME), never from the census process's state.
-        file_vals = proof.secrets_values(proof.secrets_file(env, main_root=repo), proc["start"])
+        secrets_path = proof.secrets_file(env, main_root=repo)
+        file_vals = proof.secrets_values(secrets_path, proc["start"])
+        carried = False
+        if file_vals is None and prior:
+            # Changed since start: still proven if an earlier row for this same
+            # server proved the same census-relevant values (`carry_secrets`).
+            file_vals = proof.carry_secrets(
+                secrets_path,
+                proc["start"],
+                prior.get((proc["pid"], _iso(proc["start"]))),
+                env=env,
+                main_root=repo,
+            )
+            carried = file_vals is not None
         foreign, db_identity = proof.db_scope(
             proof.db_paths(env, file_vals, main_root=repo),
             live,
@@ -494,6 +508,9 @@ def build_census(
                 "telemetry_off": proof.switch_off(env, file_vals),
                 "foreign": foreign,
                 "db_identity": db_identity,
+                # The proof the next census may carry forward; a digest, never a value.
+                "secrets_digest": proof.secrets_digest(file_vals) if file_vals is not None else None,
+                "carried": carried,
             }
         )
     if include_host and host_pid is not None:
@@ -668,6 +685,39 @@ def _disabled_in_secrets() -> bool:
         return False
 
 
+def prior_digests(metrics: dict | None) -> dict[tuple[int, str], str]:
+    """``{(pid, started_at): secrets_digest}`` from ONE earlier census row's
+    metrics, for `build_census`'s carry-forward. Only a row of the current schema
+    counts; anything malformed counts for nothing (no carry), never for a guess."""
+    if not isinstance(metrics, dict) or metrics.get("v") != CENSUS_SCHEMA:
+        return {}
+    procs = metrics.get("procs")
+    if not isinstance(procs, list):
+        return {}
+    out: dict[tuple[int, str], str] = {}
+    for row in procs:
+        if not isinstance(row, dict):
+            continue
+        pid, started, digest = row.get("pid"), row.get("started_at"), row.get("secrets_digest")
+        if type(pid) is int and isinstance(started, str) and isinstance(digest, str) and digest:
+            out[(pid, started)] = digest
+    return out
+
+
+async def _latest_prior(db: aiosqlite.Connection) -> dict[tuple[int, str], str]:
+    """The carry-forward map from the single latest census row, or empty. Only
+    the latest: a row that cannot be used (unreadable, disabled, another schema)
+    means no carry, never a reach past it to an older one."""
+    from genesis.db.crud import j9_eval
+
+    try:
+        rows = await j9_eval.get_events(db, event_type=CENSUS_EVENT_TYPE, limit=1)
+    except Exception:
+        logger.warning("graph census: the previous row could not be read; no carry", exc_info=True)
+        return {}
+    return prior_digests(rows[0].get("metrics") if rows else None)
+
+
 async def record_census(db: aiosqlite.Connection) -> dict:
     """Write one census row. With the telemetry kill switch on in THIS process,
     the row says so instead of going silent, so the verdict can tell "disabled"
@@ -682,8 +732,11 @@ async def record_census(db: aiosqlite.Connection) -> dict:
             "reasons": ["telemetry_disabled"],
         }
     else:
+        prior = await _latest_prior(db)
         metrics = await asyncio.to_thread(
-            lambda: build_census(host_pid=os.getpid(), include_host=True, live_held_by=os.getpid())
+            lambda: build_census(
+                host_pid=os.getpid(), include_host=True, live_held_by=os.getpid(), prior=prior
+            )
         )
     await j9_eval.insert_event(
         db, dimension="system", event_type=CENSUS_EVENT_TYPE, metrics=metrics

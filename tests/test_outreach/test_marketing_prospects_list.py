@@ -36,7 +36,7 @@ def _wire(db, monkeypatch):
 
 
 async def _list(limit=100):
-    tools = await om.mcp.get_tools()
+    tools = {tool.name: tool for tool in await om.mcp.list_tools()}
     return json.loads(await tools["marketing_prospects_list"].fn(limit=limit))
 
 

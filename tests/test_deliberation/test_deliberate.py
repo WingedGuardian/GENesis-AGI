@@ -549,7 +549,7 @@ async def test_deliberate_default_stakes_is_none(monkeypatch):
 async def test_deliberate_tool_registered():
     from genesis.mcp.health_mcp import mcp
 
-    tools = await mcp.get_tools()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
     assert "deliberate" in tools
 
 

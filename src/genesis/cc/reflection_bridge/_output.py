@@ -68,6 +68,7 @@ Optional (include only when the prose supports it):
 - "surplus_task_requests": [{"task_type": "...", "reason": "...", \
 "priority": 0.0, "drive_alignment": "..."}]
 - "skill_triggers": [string, ...]
+- "surplus_cited": [string, ...] — only surplus insight ids the prose itself names
 - "procedure_quarantines": [{"procedure_id": "...", "reason": "..."}]
 - "user_question": {"text": "...", "context": "...", "options": ["...", "..."]}
 - "contradictions": [ ... ]

@@ -34,9 +34,13 @@ max_per_run: 5
 # Priority of the created follow-up.
 priority: high
 
-# Which session_ledger.added_by values may escalate. foreground-only by default:
+# Which session_ledger.added_by values may escalate. Owner commitments only:
+# `foreground` (agreed in the session) and `relayed` (the owner's request,
+# written by a dispatched session such as a channel conversation).
 # `ambient_ledger_extractor` rows are the detached extractor's PROPOSALS, not
 # agreements a human made, and asking the owner to dispose of something nobody
-# committed to is noise. Widen deliberately.
+# committed to is noise. A list in a .local.yaml overlay REPLACES this one, so
+# an overlay must name `relayed` itself to keep it. Widen deliberately.
 escalate_added_by:
   - foreground
+  - relayed

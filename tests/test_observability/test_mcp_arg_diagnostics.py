@@ -372,14 +372,7 @@ def test_the_original_error_is_kept_as_the_cause():
 
 
 def test_the_feature_depends_on_a_fastmcp_default_that_is_pinned_here():
-    """Reachability rests on a third-party default, so it is asserted, not assumed.
-
-    With `strict_input_validation` True, the MCP lowlevel server runs a
-    jsonschema check BEFORE any middleware, argument binding never reaches this
-    middleware, and this whole feature is dead code with no signal. If this
-    assertion ever fails, the diagnosis is silently gone — that is the finding,
-    not a broken test.
-    """
+    """Pin the default coercion mode independently of the diagnosis adapter."""
     from fastmcp import settings
 
     assert settings.strict_input_validation is False

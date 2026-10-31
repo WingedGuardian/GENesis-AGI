@@ -280,6 +280,7 @@ class _FakeModule:
         probe_error=False,
         probe_empty=False,
         probe_is_error=False,
+        probe_result=None,
     ) -> None:
         self._healthy = healthy
         self._autoruns = list(autoruns or [])
@@ -289,6 +290,7 @@ class _FakeModule:
         self._probe_error = probe_error  # adapter-level {"error"} for the observe probe
         self._probe_empty = probe_empty  # empty-text probe reply
         self._probe_is_error = probe_is_error  # payload {"is_error": True} (dead-auth, exit 0)
+        self._probe_result = probe_result  # an exact probe return dict, verbatim
         self.calls: list[str] = []
         self.param_calls: list[dict] = []  # full params dict per dispatch (max_turns etc.)
 
@@ -300,6 +302,8 @@ class _FakeModule:
         self.calls.append(prompt)
         self.param_calls.append(dict(params or {}))
         if prompt == _PROBE_PROMPT:  # observe-mode reachability probe
+            if self._probe_result is not None:
+                return dict(self._probe_result)
             if self._probe_error:
                 return {"error": "ssh down"}
             if self._probe_is_error:
@@ -308,6 +312,8 @@ class _FakeModule:
                 return {"text": ""}
             return {"text": '{"ok":true}'}
         # auto-run dispatch
+        if isinstance(self._autorun_error, dict):  # an exact adapter return, verbatim
+            return dict(self._autorun_error)
         if self._autorun_error is not None:
             return {"error": self._autorun_error}
         if self._autorun_payload_error is not None:
@@ -563,6 +569,389 @@ async def test_observe_probe_empty_reply_records_failure(db, monkeypatch):
     mon, _ = _mon(db, _FakeModule(probe_empty=True))
     result = await mon.gather()
     assert result.errors == 1
+
+
+_FAKE_KEY = "sk-ant-" + "x" * 40  # synthetic credential shape, not a real key
+
+
+async def _runner_failure_message(mon):
+    """Drive the REAL monitor into the REAL runner; return the job-health error text."""
+    from genesis.surplus.jobs import runners
+
+    calls = []
+
+    class _Sched:
+        _career_outreach_monitor = mon
+        _event_bus = None
+
+    orig_fail, orig_ok = runners.record_failure, runners.record_success
+    runners.record_failure = lambda k, m=None: calls.append((k, m))
+    runners.record_success = lambda k: None
+    try:
+        await runners.run_career_outreach_monitor(_Sched())
+    finally:
+        runners.record_failure, runners.record_success = orig_fail, orig_ok
+    assert calls and calls[0][0] == "career_outreach_monitor"
+    return calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_observe_probe_failure_keeps_exit_code_and_stderr(db, monkeypatch):
+    # The remote's own diagnosis must reach BOTH the result detail and the job-health
+    # error; before, only "Remote claude exited 1" survived. Shape of a real failed
+    # `claude -p --output-format json`: the CAUSE is in stdout's result object (passed on
+    # by the adapter as result_text / api_error_status / terminal_reason) and stderr
+    # carries only a tag.
+    _cfg(monkeypatch, mode="observe")
+    probe = {
+        "error": "Remote claude exited 1",
+        "exit_code": 1,
+        "stderr": '[claude-code:unrecognized_model] {"model":"m"}\n',
+        "stdout": "",
+        "result_text": "There's an issue with the selected model (m).",
+        "api_error_status": 404,
+        "terminal_reason": "api_error",
+    }
+    mon, _ = _mon(db, _FakeModule(probe_result=probe))
+    result = await mon.gather()
+    assert result.errors == 1
+    detail = " ".join(result.details)
+    for part in ("exit=1", "api_status=404", "reason=api_error",
+                 "cause: There's an issue with the selected model (m).",
+                 "stderr: [claude-code:unrecognized_model]"):
+        assert part in detail
+    message = await _runner_failure_message(_mon(db, _FakeModule(probe_result=probe))[0])
+    assert "exit=1" in message and "issue with the selected model" in message
+
+
+@pytest.mark.asyncio
+async def test_observe_probe_is_error_reply_keeps_its_cause(db, monkeypatch):
+    # An exit-0 run reporting is_error carries its cause in the reply text; that must
+    # reach the detail too, not just "claude -p reported is_error".
+    _cfg(monkeypatch, mode="observe")
+    mon, _ = _mon(db, _FakeModule(probe_is_error=True))
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert "cause: Invalid API key / OAuth expired" in detail
+
+
+@pytest.mark.asyncio
+async def test_observe_probe_withholds_key_split_by_invisible_char(db, monkeypatch):
+    # A zero-width character inside a key hides it from the scanner, and flattening only
+    # turns it into a space; the detail must withhold rather than show the two halves.
+    _cfg(monkeypatch, mode="observe")
+    split = "sk-ant-api03-" + "Q" * 5 + "\u200b" + "R" * 40
+    probe = {"error": "Remote claude exited 1", "exit_code": 1,
+             "stderr": f"auth failed key {split}"}
+    mon, _ = _mon(db, _FakeModule(probe_result=probe))
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert "R" * 40 not in detail
+    assert "stderr withheld (unredactable content:" in detail
+
+
+@pytest.mark.asyncio
+async def test_observe_probe_terminal_reason_must_be_a_token(db, monkeypatch):
+    # terminal_reason is a closed CLI vocabulary; free text in that field is dropped.
+    _cfg(monkeypatch, mode="observe")
+    probe = {"error": "Remote claude exited 1", "exit_code": 1,
+             "terminal_reason": "api error; see attached"}
+    mon, _ = _mon(db, _FakeModule(probe_result=probe))
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert "reason=" not in detail and "see attached" not in detail
+
+
+@pytest.mark.asyncio
+async def test_observe_probe_stderr_is_scrubbed(db, monkeypatch):
+    # A credential in the remote's stderr is redacted by the output scrubber before it is
+    # stored; the surrounding diagnosis survives.
+    _cfg(monkeypatch, mode="observe")
+    probe = {"error": "Remote claude exited 1", "exit_code": 1,
+             "stderr": f"auth failed for key {_FAKE_KEY}"}
+    mon, _ = _mon(db, _FakeModule(probe_result=probe))
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert _FAKE_KEY not in detail
+    assert "[redacted:" in detail and "auth failed for key" in detail
+
+
+@pytest.mark.asyncio
+async def test_observe_probe_stderr_withheld_when_scrubber_fails(db, monkeypatch):
+    # Fail closed: if the scrubber raises, the stderr is omitted and the detail says so.
+    import genesis.recon.career_outreach_diagnostics as diag
+
+    def boom(_text):
+        raise RuntimeError("scrubber down")
+
+    monkeypatch.setattr(diag, "redact_credentials", boom)
+    _cfg(monkeypatch, mode="observe")
+    probe = {"error": "Remote claude exited 1", "exit_code": 1,
+             "stderr": f"auth failed for key {_FAKE_KEY}"}
+    mon, _ = _mon(db, _FakeModule(probe_result=probe))
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert _FAKE_KEY not in detail and "auth failed" not in detail
+    assert "stderr withheld" in detail
+    assert "exit=1" in detail  # non-sensitive metadata still kept
+
+
+@pytest.mark.asyncio
+async def test_observe_probe_long_stderr_keeps_tail_with_marker(db, monkeypatch):
+    # A long stderr is bounded with an explicit marker; the TAIL (where the CLI's
+    # final error line sits) is the part kept, not a silent head cut.
+    _cfg(monkeypatch, mode="observe")
+    noise = "warning: noisy preamble line\n" * 40
+    probe = {"error": "Remote claude exited 1", "exit_code": 1,
+             "stderr": noise + "FINAL: OAuth token has expired"}
+    mon, _ = _mon(db, _FakeModule(probe_result=probe))
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert "FINAL: OAuth token has expired" in detail
+    assert "<omitted first " in detail
+    assert len(detail) < len(noise)
+    assert "\n" not in detail  # one line: the detail is rendered into signal lines
+
+
+@pytest.mark.asyncio
+async def test_observe_probe_stderr_withheld_when_unredactable(db, monkeypatch):
+    # Something the scanner flags but cannot redact in place (a card-number shape, the
+    # standard Luhn-valid test number) withholds the stderr whole.
+    _cfg(monkeypatch, mode="observe")
+    probe = {"error": "Remote claude exited 1", "exit_code": 1,
+             "stderr": "charge failed for 4111 1111 1111 1111"}
+    mon, _ = _mon(db, _FakeModule(probe_result=probe))
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert "4111" not in detail
+    assert "stderr withheld (unredactable content: payment_card)" in detail
+
+
+@pytest.mark.parametrize(
+    ("stderr", "secret"),
+    [
+        ("password:\x00hunter2abcdef", "hunter2abcdef"),
+        ("api_key​= abcdefgh12", "abcdefgh12"),
+        ("4111\x001111\x001111\x001111", "4111"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_observe_probe_stderr_scrubbed_after_flattening(db, monkeypatch, stderr, secret):
+    # Flattening turns a NUL / zero-width run into a space, which can JOIN a credential
+    # or card the raw-text scrub never matched. The flattened text must be scrubbed and
+    # scanned too, or the secret lands in job health (review finding).
+    _cfg(monkeypatch, mode="observe")
+    probe = {"error": "Remote claude exited 1", "exit_code": 1, "stderr": stderr}
+    mon, _ = _mon(db, _FakeModule(probe_result=probe))
+    result = await mon.gather()
+    assert secret not in " ".join(result.details)
+
+
+@pytest.mark.asyncio
+async def test_autorun_dispatch_error_keeps_exit_code_and_stderr(db, monkeypatch):
+    # Same instrument on the live auto-run dispatch: its adapter error kept only the
+    # error string too.
+    _cfg(monkeypatch, mode="live")
+    err = {"error": "Remote claude exited 2", "exit_code": 2,
+           "stderr": "Error: not logged in"}
+    mon, _ = _mon(db, _FakeModule(autorun_error=err))
+    result = await mon.gather()
+    assert result.errors >= 1
+    detail = " ".join(result.details)
+    assert "exit=2" in detail and "Error: not logged in" in detail
+
+
+@pytest.mark.asyncio
+async def test_observe_probe_error_string_is_scrubbed(db, monkeypatch):
+    # The top-level error can come from a module's exception text; it goes through the
+    # same scrub as the cause and stderr (review finding).
+    _cfg(monkeypatch, mode="observe")
+    probe = {"error": "Operation failed: token=" + "D" * 30}
+    mon, _ = _mon(db, _FakeModule(probe_result=probe))
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert result.errors == 1
+    assert "D" * 20 not in detail
+    assert "Operation failed" in detail
+
+
+@pytest.mark.asyncio
+async def test_codex_tail_shape_never_reaches_the_detail(db, monkeypatch):
+    # Acceptance replay of the review finding, end to end: the REAL adapter's failure
+    # dict for `OAuth token=` + a 2,240-char value + an auth error, fed into the real
+    # monitor. No run of the credential may reach the detail job health stores.
+    from unittest.mock import AsyncMock, patch
+
+    from genesis.modules.external.config import IPCConfig
+    from genesis.modules.external.ipc import SshIPCAdapter
+
+    adapter = SshIPCAdapter(IPCConfig(method="ssh", ssh_host="user@host"))
+    proc = AsyncMock()
+    proc.communicate.return_value = (b"", b"OAuth token=" + b"A" * 2240 + b" authentication error")
+    proc.returncode = 1
+    with patch("genesis.modules.external.ipc.asyncio.create_subprocess_exec", return_value=proc):
+        adapter_result = await adapter.send("dispatch", data={"prompt": "x"}, method="CC")
+
+    _cfg(monkeypatch, mode="observe")
+    mon, _ = _mon(db, _FakeModule(probe_result=adapter_result))
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert result.errors == 1 and "exit=1" in detail
+    assert "A" * 20 not in detail
+
+
+@pytest.mark.parametrize("output_kind", ["stderr", "stdout", "result", "exit-zero"])
+@pytest.mark.asyncio
+async def test_control_split_suffix_never_reaches_adapter_or_monitor(db, monkeypatch, output_kind):
+    from unittest.mock import AsyncMock, patch
+
+    from genesis.modules.external.config import IPCConfig
+    from genesis.modules.external.ipc import SshIPCAdapter
+
+    secret = "sk-" + "A" * 30 + "\r" + "B" * 40
+    structured = json.dumps({
+        "type": "result", "is_error": True, "result": secret,
+        "api_error_status": 401, "terminal_reason": "api_error",
+    })
+    stdout = secret if output_kind == "stdout" else structured
+    stderr = secret if output_kind == "stderr" else "auth failed"
+    proc = AsyncMock()
+    proc.communicate.return_value = (stdout.encode(), stderr.encode())
+    proc.returncode = 0 if output_kind == "exit-zero" else 1
+    adapter = SshIPCAdapter(IPCConfig(method="ssh", ssh_host="fixture.invalid"))
+    with patch("genesis.modules.external.ipc.asyncio.create_subprocess_exec", return_value=proc):
+        adapter_result = await adapter.send("dispatch", data={"prompt": "fixture"}, method="CC")
+    if output_kind != "exit-zero":
+        assert "B" * 20 not in json.dumps(adapter_result)
+        assert adapter_result["exit_code"] == 1
+        if output_kind != "stdout":
+            assert adapter_result["stdout"] == "<omitted: structured result parsed; see result_text>"
+    _cfg(monkeypatch, mode="observe")
+    mon, _ = _mon(db, _FakeModule(probe_result=adapter_result))
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert result.errors == 1
+    assert "B" * 20 not in detail and "A" * 20 not in detail
+    if output_kind != "stdout":
+        assert "withheld" in detail
+        assert "api_status=401" in detail and "reason=api_error" in detail
+    if output_kind != "exit-zero":
+        assert "exit=1" in detail
+
+
+@pytest.mark.asyncio
+async def test_hidden_credential_crossing_the_adapter_cut_never_reaches_the_detail(
+    db, monkeypatch
+):
+    # Review finding: the adapter's cut dropped a `token=` that a zero-width char had
+    # hidden from its redactor, so the monitor's stronger pass saw a bare value. The
+    # REAL adapter's dict, fed to the real monitor, must not carry the value.
+    from unittest.mock import AsyncMock, patch
+
+    from genesis.modules.external.config import IPCConfig
+    from genesis.modules.external.ipc import SshIPCAdapter
+
+    adapter = SshIPCAdapter(IPCConfig(method="ssh", ssh_host="user@host"))
+    proc = AsyncMock()
+    proc.communicate.return_value = (b"", "token=\u200b".encode() + b"F" * 2300 + b"\nerr")
+    proc.returncode = 1
+    with patch("genesis.modules.external.ipc.asyncio.create_subprocess_exec", return_value=proc):
+        adapter_result = await adapter.send("dispatch", data={"prompt": "x"}, method="CC")
+
+    _cfg(monkeypatch, mode="observe")
+    mon, _ = _mon(db, _FakeModule(probe_result=adapter_result))
+    result = await mon.gather()
+    assert "F" * 20 not in " ".join(result.details)
+
+
+@pytest.mark.asyncio
+async def test_long_error_string_keeps_its_head(db, monkeypatch):
+    # An error string is a message start-first ("Operation failed: ..."); a long one
+    # keeps its head, with a marker, so a short-cut renderer still shows what failed.
+    _cfg(monkeypatch, mode="observe")
+    probe = {"error": "Operation failed: " + "x " * 300}
+    mon, _ = _mon(db, _FakeModule(probe_result=probe))
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert "bridge probe failed: Operation failed:" in detail
+    assert "<rest omitted:" in detail
+
+
+@pytest.mark.asyncio
+async def test_non_string_error_is_rendered_not_replaced(db, monkeypatch):
+    _cfg(monkeypatch, mode="observe")
+    mon, _ = _mon(db, _FakeModule(probe_result={"error": 503}))
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert "bridge probe failed: 503" in detail
+
+
+@pytest.mark.asyncio
+async def test_autorun_module_error_text_is_scrubbed(db, monkeypatch):
+    # The engine's own {"error": ...} text is remote text too: scrubbed whole before
+    # any bound, never cut first (the classifier no longer cuts it).
+    _cfg(monkeypatch, mode="live")
+    secret = "token=" + "G" * 30
+    mon, _ = _mon(db, _FakeModule(autorun_payload_error=f"auth failed {secret}"))
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert result.errors >= 1
+    assert "auth failed" in detail and "G" * 20 not in detail
+
+
+@pytest.mark.asyncio
+async def test_bite_relay_pipeline_error_text_is_scrubbed(db, monkeypatch):
+    _cfg(monkeypatch, mode="off", bite_mode="live")
+    data = _FakeDataModule(error="pipeline query failed token=" + "H" * 30)
+    mon, _ = _mon_bite(db, data)
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert result.errors == 1
+    assert "pipeline query failed" in detail and "H" * 20 not in detail
+
+
+@pytest.mark.asyncio
+async def test_guarded_raise_detail_is_scrubbed(db, monkeypatch):
+    # A sub-capability exception can embed remote text; its detail line is scrubbed
+    # whole, never cut first (review finding).
+    _cfg(monkeypatch, mode="live", bite_mode="live")
+    data = _FakeDataModule(pipeline={})
+    mon, _ = _mon_bite(db, data, reasoning_module=_FakeModule())
+
+    async def _raise(*a, **k):
+        raise RuntimeError("remote said token=" + "J" * 30)
+
+    mon._run_autorun = _raise
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert "auto-run raised: remote said" in detail and "J" * 20 not in detail
+
+
+@pytest.mark.asyncio
+async def test_verify_failed_reason_is_scrubbed(db, monkeypatch):
+    # The engine's verify_failed reason is remote text: scrubbed whole, not cut first.
+    _cfg(monkeypatch, mode="live", cap=2)
+    mod = _FakeModule(autoruns=[{"verify_failed": "bad source token=" + "K" * 30, "company": "A"}])
+    mon, _ = _mon(db, mod)
+    result = await mon.gather()
+    detail = " ".join(result.details)
+    assert "verify_failed: A: bad source" in detail and "K" * 20 not in detail
+
+
+@pytest.mark.asyncio
+async def test_autorun_is_error_reply_is_a_dispatch_error_with_cause(db, monkeypatch):
+    # An exit-0 auto-run reporting is_error (dead auth) is a dispatch failure with its
+    # cause, not a "reply is not a JSON object" protocol failure. Still one error + stop.
+    _cfg(monkeypatch, mode="live")
+    err = {"text": "Invalid API key · Please run /login", "is_error": True}
+    mod = _FakeModule(autorun_error=err)
+    mon, _ = _mon(db, mod)
+    result = await mon.gather()
+    assert result.errors == 1 and _autorun_calls(mod) == 1
+    detail = " ".join(result.details)
+    assert "auto-run dispatch error" in detail
+    assert "cause: Invalid API key" in detail
+    assert "protocol failure" not in detail
 
 
 @pytest.mark.asyncio
