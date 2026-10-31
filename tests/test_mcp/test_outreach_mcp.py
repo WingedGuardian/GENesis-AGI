@@ -1,6 +1,7 @@
 """Tests for outreach-mcp server — verify all tools are registered."""
 
 import json
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -942,3 +943,218 @@ async def test_a_reply_keeps_its_threads_subject(thread_subject, given, sent):
     finally:
         mcp_mod._pipeline = old_pipeline
         mcp_mod._db = old_db
+
+
+
+
+# ---------------------------------------------------------------------------
+# preferred_timing — one scheduling path (in-process and MCP child)
+# ---------------------------------------------------------------------------
+
+_FROZEN_NOW = datetime(2026, 3, 14, 15, 0, 0, tzinfo=UTC)
+
+
+class _FrozenDateTime(datetime):
+    """datetime subclass with a fixed clock for determinism."""
+
+    @classmethod
+    def now(cls, tz=None):
+        base = cls(2026, 3, 14, 15, 0, 0, tzinfo=UTC)
+        return base.astimezone(tz) if tz is not None else base.replace(tzinfo=None)
+
+
+@pytest.fixture
+async def pending_db(tmp_path):
+    import aiosqlite
+
+    from genesis.db.crud import pending_outreach
+
+    async with aiosqlite.connect(str(tmp_path / "p.db")) as conn:
+        conn.row_factory = aiosqlite.Row
+        await pending_outreach.ensure_table(conn)
+        yield conn
+
+
+@pytest.fixture
+def frozen_clock(monkeypatch):
+    """Freeze both clocks the scheduling path reads: the helper's and the
+    tool's future-check."""
+    monkeypatch.setattr("genesis.outreach.timing.datetime", _FrozenDateTime)
+    monkeypatch.setattr("genesis.mcp.outreach_mcp.datetime", _FrozenDateTime)
+    monkeypatch.setattr("genesis.env.user_timezone", lambda: "UTC")
+
+
+@pytest.fixture
+def swap_runtime():
+    """Restore module runtime globals after the test."""
+
+    def _set(pipeline, db):
+        mcp_mod._pipeline = pipeline
+        mcp_mod._db = db
+
+    old_pipeline, old_db = mcp_mod._pipeline, mcp_mod._db
+    yield _set
+    mcp_mod._pipeline, mcp_mod._db = old_pipeline, old_db
+
+
+async def _pending_rows(db):
+    cur = await db.execute(
+        "SELECT * FROM pending_outreach WHERE delivered = 0"
+    )
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def test_in_process_future_timing_enqueues_not_delivers(
+    pending_db, frozen_clock, swap_runtime
+):
+    pipe = AsyncMock()
+    swap_runtime(pipe, pending_db)
+    tools = await mcp.get_tools()
+    out = json.loads(await tools["outreach_send"].fn(
+        message="ping", category="notification", channel="telegram",
+        preferred_timing="in 2 hours",
+    ))
+    assert out["status"] == "queued"
+    pipe.submit.assert_not_awaited()
+    pipe.submit_urgent.assert_not_awaited()
+    rows = await _pending_rows(pending_db)
+    assert len(rows) == 1
+    assert rows[0]["deliver_after"] == "2026-03-14T17:00:00+00:00"
+    assert out["deliver_after"] == rows[0]["deliver_after"]
+
+
+@pytest.mark.parametrize("use_pipeline", [True, False])
+async def test_child_and_in_process_return_same_shape(
+    pending_db, frozen_clock, swap_runtime, tmp_path, use_pipeline
+):
+    """Same call with and without a pipeline → same response fields and same
+    stored deliver_after (in-process runs on its own db file)."""
+    import aiosqlite
+
+    from genesis.db.crud import pending_outreach
+
+    pipe = AsyncMock()
+    async with aiosqlite.connect(str(tmp_path / "s.db")) as conn:
+        conn.row_factory = aiosqlite.Row
+        await pending_outreach.ensure_table(conn)
+        swap_runtime(pipe if use_pipeline else None, conn)
+        tools = await mcp.get_tools()
+        out = json.loads(await tools["outreach_send"].fn(
+            message="ping", category="notification", channel="telegram",
+            preferred_timing="in 2 hours",
+        ))
+        rows = await _pending_rows(conn)
+        assert out["status"] == "queued"
+        assert out["deliver_after"] == "2026-03-14T17:00:00+00:00"
+        assert rows[0]["deliver_after"] == out["deliver_after"]
+        if use_pipeline:
+            pipe.submit.assert_not_awaited()
+
+
+async def test_nl_timing_resolved_not_stored_verbatim(
+    pending_db, frozen_clock, swap_runtime
+):
+    swap_runtime(None, pending_db)
+    tools = await mcp.get_tools()
+    out = json.loads(await tools["outreach_send"].fn(
+        message="ping", category="notification", channel="telegram",
+        preferred_timing="tomorrow 9am",
+    ))
+    assert out["status"] == "queued"
+    rows = await _pending_rows(pending_db)
+    stored = rows[0]["deliver_after"]
+    assert stored != "tomorrow 9am"
+    assert datetime.fromisoformat(stored) == datetime(
+        2026, 3, 15, 9, 0, tzinfo=UTC
+    )
+
+
+@pytest.mark.parametrize("use_pipeline", [True, False])
+async def test_unparseable_timing_rejected(
+    pending_db, frozen_clock, swap_runtime, use_pipeline
+):
+    pipe = AsyncMock()
+    swap_runtime(pipe if use_pipeline else None, pending_db)
+    tools = await mcp.get_tools()
+    out = json.loads(await tools["outreach_send"].fn(
+        message="ping", category="notification", channel="telegram",
+        preferred_timing="banana",
+    ))
+    assert "error" in out
+    assert await _pending_rows(pending_db) == []
+    pipe.submit.assert_not_awaited()
+    pipe.submit_urgent.assert_not_awaited()
+
+
+async def test_no_timing_in_process_still_delivers_now(
+    pending_db, frozen_clock, swap_runtime
+):
+    """Regression guard: no preferred_timing → pipeline delivery as before."""
+    result = MagicMock()
+    result.outreach_id = "o-1"
+    result.status.value = "delivered"
+    result.channel = "telegram"
+    result.error = None
+    pipe = AsyncMock()
+    pipe.submit.return_value = result
+    swap_runtime(pipe, pending_db)
+    tools = await mcp.get_tools()
+    out = json.loads(await tools["outreach_send"].fn(
+        message="ping", category="notification", channel="telegram",
+    ))
+    pipe.submit.assert_awaited_once()
+    assert out["status"] == "delivered"
+    assert await _pending_rows(pending_db) == []
+
+
+async def test_future_timing_without_db_errors(frozen_clock, swap_runtime):
+    pipe = AsyncMock()
+    swap_runtime(pipe, None)
+    tools = await mcp.get_tools()
+    out = json.loads(await tools["outreach_send"].fn(
+        message="ping", category="notification", channel="telegram",
+        preferred_timing="in 2 hours",
+    ))
+    assert "error" in out
+    pipe.submit.assert_not_awaited()
+    pipe.submit_urgent.assert_not_awaited()
+
+
+async def test_drain_picks_up_resolved_row(
+    pending_db, frozen_clock, swap_runtime
+):
+    """The stored UTC deliver_after drives the drain's lexicographic compare:
+    due at resolved+1s, not due at resolved-1s."""
+    from genesis.db.crud import pending_outreach
+
+    swap_runtime(None, pending_db)
+    tools = await mcp.get_tools()
+    out = json.loads(await tools["outreach_send"].fn(
+        message="ping", category="notification", channel="telegram",
+        preferred_timing="in 2 hours",
+    ))
+    resolved = datetime.fromisoformat(out["deliver_after"])
+    before = (resolved - timedelta(seconds=1)).isoformat()
+    after = (resolved + timedelta(seconds=1)).isoformat()
+    assert await pending_outreach.drain(pending_db, now=before) == []
+    rows = await pending_outreach.drain(pending_db, now=after)
+    assert [r["id"] for r in rows] == [out["pending_id"]]
+
+
+async def test_scheduled_critical_queued_as_high(
+    pending_db, frozen_clock, swap_runtime
+):
+    """urgency='critical' + future timing stores 'high': the drain routes only
+    'high' to submit_urgent, so a scheduled critical send must carry the value
+    that keeps its urgent delivery semantics."""
+    pipe = AsyncMock()
+    swap_runtime(pipe, pending_db)
+    tools = await mcp.get_tools()
+    out = json.loads(await tools["outreach_send"].fn(
+        message="ping", category="notification", channel="telegram",
+        urgency="critical", preferred_timing="in 2 hours",
+    ))
+    assert out["status"] == "queued"
+    pipe.submit_urgent.assert_not_awaited()
+    rows = await _pending_rows(pending_db)
+    assert rows[0]["urgency"] == "high"

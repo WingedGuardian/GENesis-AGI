@@ -111,41 +111,39 @@ async def outreach_send(
     thread_id: str | None = None,
     subject: str | None = None,
 ) -> str:
-    """Queue a message for delivery. Returns outreach_id.
+    """Queue a message for delivery. Returns outreach_id or a queued status.
 
     The message is delivered AS-IS — Genesis does not rewrite or rephrase it.
     Compose the exact text you want the recipient to see (this is the tool for
     reminders and literal notifications).
 
     For email, ``subject`` is REQUIRED: you wrote the email, so write its
-    subject too, a short title of 3 to 7 words that says what it is about.
-    If the user gave one, use it exactly. Never reuse the first words of the
-    message. A new email without a subject is refused (code
-    email_subject_required). A reply (``thread_id``) always goes out as
-    Re: <the thread's subject>, so it stays in the same conversation.
+    subject too, a short title that says what it is about. A new email
+    without a subject is refused (code email_subject_required). A reply
+    (``thread_id``) always goes out as Re: <the thread's subject>, so it
+    stays in the same conversation; thread_id also maps to the registered
+    email thread whose recipient is used for delivery.
 
-    For email replies, pass thread_id to route to the correct recipient.
-    The thread_id maps to a registered email thread whose recipient is
-    used for delivery.
+    **Discord:** pass ``channel="announcements"`` (or any name in
+    ``DISCORD_CHANNELS``) to reach that channel; ``channel="discord"`` uses
+    the configured default. A named channel with no configured webhook is
+    REFUSED — permanent until configured, do not retry.
 
-    **Discord: name the CHANNEL, not the adapter.** Pass
-    ``channel="announcements"`` (or any name in ``DISCORD_CHANNELS``) and it is
-    routed to that channel. ``channel="discord"`` still works and goes wherever
-    ``OUTREACH_RECIPIENT_DISCORD`` points, which defaults to ``dev-discussion``.
-
-    That default is why this exists. The pipeline has always supported steering
-    a Discord send (the recipient IS the webhook name), but this tool exposed no
-    way to say which channel — so every caller asking for "Discord" got
-    dev-discussion, silently, including a release announcement that belonged in
-    announcements. A caller could not tell it had been redirected: nothing
-    errored, and the log line recorded the REQUESTED name.
-
-    That fallback is gone. A channel with no configured webhook is now REFUSED
-    with an error naming the setting to add. The refusal is correct, expected
-    behaviour and not a fault to work around: configure the named setting, or
-    send to the default channel. Do not retry it — the condition is permanent
-    until an operator changes configuration.
+    **preferred_timing** schedules delivery: ISO-8601 (naive = user's
+    timezone) or a future natural-language phrase (``"tomorrow 9am"``,
+    ``"in 2 hours"``, ``"next friday 3pm"``). A value resolving to the
+    future enqueues with a UTC ``deliver_after`` — identically in-process
+    and via the MCP child — returning
+    ``{"status": "queued", "pending_id": ..., "deliver_after": <UTC ISO>}``.
+    An unparseable value returns ``{"error": ...}`` and stores/delivers
+    nothing. Note: the drain rebuilds queued sends with its fixed
+    ``salience_score`` (0.7) — a caller-supplied ``salience_score`` is NOT
+    preserved for scheduled sends.
     """
+    # (The long-form rationale for the Discord refusal lives in git history /
+    # the change record — a channel with no configured webhook used to fall
+    # back to the default webhook silently, misrouting sends with no caller
+    # visible error. The refusal is the fix; keep it.)
     # Discord sub-channel → adapter + recipient. `target_chat_id` is the
     # pipeline's existing per-request recipient override (it wins over the
     # configured default in _deliver), so this needs no new plumbing — only a
@@ -203,6 +201,80 @@ async def outreach_send(
             "(IGNORED) by the pipeline self-send guard"
         )
 
+    # -- preferred_timing: ONE scheduling path shared by both branches ------
+    # A preferred_timing that resolves to a future instant enqueues to
+    # pending_outreach with a UTC deliver_after whether _pipeline is set or
+    # not — previously the pipeline branch ignored it and delivered
+    # immediately. Unparseable input is a loud error and is never stored
+    # verbatim: a raw NL string sorts after every ISO "2..." timestamp in the
+    # drain's lexicographic compare and the row would never fire. A resolved
+    # time NOT in the future needs no scheduling; it falls through to normal
+    # handling (immediate in-process delivery, deliver_after=None queued).
+    resolved_dt: datetime | None = None
+    if preferred_timing is not None and preferred_timing.strip():
+        from genesis.outreach.timing import (
+            TimingParseError,
+            resolve_preferred_timing,
+        )
+
+        try:
+            resolved_dt = resolve_preferred_timing(preferred_timing)
+        except TimingParseError:
+            return json.dumps({
+                "error": (
+                    f"Could not interpret preferred_timing "
+                    f"'{preferred_timing}'; use an ISO-8601 time or phrases "
+                    "like 'tomorrow 9am'."
+                ),
+            })
+
+    if resolved_dt is not None and resolved_dt > datetime.now(UTC):
+        if _db is None:
+            return json.dumps({
+                "error": (
+                    "Cannot schedule outreach_send: preferred_timing resolves "
+                    "to a future time but no database is available."
+                ),
+            })
+        # Validate category before enqueuing (same check the pipeline path
+        # does below).
+        from genesis.outreach.types import OutreachCategory
+
+        try:
+            OutreachCategory(category)
+        except ValueError:
+            valid = ", ".join(c.value for c in OutreachCategory)
+            return json.dumps({
+                "error": f"Invalid category '{category}'. Valid categories: {valid}",
+            })
+
+        from genesis.db.crud import pending_outreach
+
+        await pending_outreach.ensure_table(_db)  # idempotent safety net
+        deliver_after = resolved_dt.isoformat()
+        # The drain routes "high" to submit_urgent(); it has no "critical"
+        # case. Normalize here so a scheduled critical send keeps the urgent
+        # delivery semantics an immediate critical send gets (the drain is
+        # out of scope — see issue #3544 scope limits).
+        queued_urgency = "high" if urgency == "critical" else urgency
+        pending_id = await pending_outreach.enqueue(
+            _db,
+            message=message,
+            category=category,
+            channel=channel,
+            urgency=queued_urgency,
+            deliver_after=deliver_after,
+            thread_id=thread_id,
+            validated_recipient=validated_recipient,
+            labeled_surplus=labeled_surplus,
+            email_subject=subject or None,
+        )
+        return json.dumps({
+            "status": "queued",
+            "pending_id": pending_id,
+            "deliver_after": deliver_after,
+        })
+
     if not _pipeline:
         # Validate category before enqueuing (same check the pipeline path does)
         from genesis.outreach.types import OutreachCategory
@@ -215,7 +287,9 @@ async def outreach_send(
                 "error": f"Invalid category '{category}'. Valid categories: {valid}",
             })
 
-        # Queue for genesis-server to pick up on next cycle
+        # Queue for genesis-server to pick up on next cycle. deliver_after is
+        # always the resolved UTC value or None — the raw caller string is
+        # never stored (see the scheduling block above).
         if _db is not None:
             from genesis.db.crud import pending_outreach
 
@@ -226,7 +300,7 @@ async def outreach_send(
                 category=category,
                 channel=channel,
                 urgency=urgency,
-                deliver_after=preferred_timing,
+                deliver_after=None,
                 thread_id=thread_id,
                 validated_recipient=validated_recipient,
                 labeled_surplus=labeled_surplus,
@@ -235,7 +309,7 @@ async def outreach_send(
             return json.dumps({
                 "status": "queued",
                 "pending_id": pending_id,
-                "deliver_after": preferred_timing,
+                "deliver_after": None,
             })
         return "Error: outreach pipeline not initialized and no DB available"
     from genesis.outreach.types import (
