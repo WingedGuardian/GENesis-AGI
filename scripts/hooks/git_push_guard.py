@@ -10031,20 +10031,21 @@ _STALE_BASE_BUDGET_S = 30.0
 #: stating how many it left out.
 _STALE_BASE_PATHS_LISTED = 10
 _STALE_BASE_COMMITS_LISTED = 3
-#: Overlaps on these are not counted (owner ruling 2026-10-29). Prose files many
-#: PRs edit (docs/architecture/CURRENT.md, the skills) overlap constantly and do
-#: not break a build: MEASURED over the 490 PRs merged to main from 2026-09-29 to
-#: 10-29, any overlap would have fired on 136 and a code-file overlap on 57, and
-#: both sets held the one real overlap collision.
-_STALE_BASE_PROSE_SUFFIXES = (".md", ".txt", ".rst")
-_STALE_BASE_PROSE_DIRS = ("changelog.d/",)
-
-
 def _stale_base_counts(path: str) -> bool:
-    """Is an overlap on *path* worth a NOTE? Code and config are; prose is not."""
-    return not path.endswith(_STALE_BASE_PROSE_SUFFIXES) and not path.startswith(
-        _STALE_BASE_PROSE_DIRS
-    )
+    """Is an overlap on *path* worth a NOTE? Code and config are; prose is not.
+
+    Prose overlaps are not counted (owner ruling 2026-10-29): files many PRs edit
+    (docs/architecture/CURRENT.md, the skills) overlap constantly and do not break
+    a build. MEASURED over the 490 PRs merged to main from 2026-09-29 to 10-29, any
+    overlap would have fired on 136 and a code-file overlap on 57, and both sets
+    held the one real overlap collision.
+
+    What counts as prose is :func:`_is_doc_path`'s answer, not a list of its own.
+    A suffix list here once treated every ``.txt`` as prose, which hid a CI
+    dependency manifest (``.github/test-tools/requirements.txt``); ``_is_doc_path``
+    takes ``.txt`` as prose only on a documentation name such as ``README``.
+    """
+    return not _is_doc_path(path)
 
 
 def _stale_base_note(pr_num: str, repo: str | None = None, head: str | None = None) -> str | None:
@@ -10056,8 +10057,8 @@ def _stale_base_note(pr_num: str, repo: str | None = None, head: str | None = No
     cross-PR collisions that turned main red had exactly this shape (a PR's only CI
     run was two days older than a main merge to the same file). A file overlap is a
     lead, not proof: the other collision shared no files, and most overlaps merge
-    cleanly. Only code and config overlaps count; prose (``.md``, ``.txt``,
-    ``.rst``, changelog fragments) does not (``_stale_base_counts``).
+    cleanly. Only code and config overlaps count; prose, as ``_is_doc_path``
+    defines it, does not (``_stale_base_counts``).
 
     GUARD AXIOMS (owner rulings 2026-10-28/29: advisory, never a block):
       * VERDICT: advisory. Report-only; it never counts toward ``failures`` and the

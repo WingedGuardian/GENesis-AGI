@@ -89,10 +89,11 @@ class TestTheNote:
         "prose",
         [
             "docs/architecture/CURRENT.md",
-            "notes.txt",
+            "README.txt",
+            "README.MD",
+            "LICENSE",
             "a/b.rst",
             "changelog.d/x-fixed.md",
-            "changelog.d/x.yaml",
         ],
     )
     def test_a_prose_path_is_never_read(self, monkeypatch, prose):
@@ -109,6 +110,13 @@ class TestTheNote:
             # Round 1 on #3804 (Kimi): the prose-dir match was a substring, so a
             # code file under a directory merely NAMED like it read as prose.
             "src/changelog.d/build.py",
+            # Round 1 on #3804 (Codex P2): a `.txt` dependency manifest is config,
+            # not prose; `_is_doc_path` reads `.txt` as prose only on a doc name.
+            ".github/test-tools/requirements.txt",
+            "requirements.txt",
+            "notes.txt",
+            # A config file is not prose for living in the fragments folder.
+            "changelog.d/x.yaml",
         ],
     )
     def test_code_and_config_paths_count(self, monkeypatch, code):
