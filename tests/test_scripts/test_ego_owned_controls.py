@@ -44,7 +44,9 @@ def oracle(module, name):
         prompts = [""]
     return {"reports": [{"observations": observations, "status": "blocked" if name == "blocked" else "budget",
                          "state": {"cursor": int(name == "reactive"), "timer_done": 0 if name in {"reactive", "blocked"} else 2,
-                                   "wake_at": 115}}], "backends": backends, "prompts": prompts, "groups_closed": True,
+                                   "timer_reserved": 0 if name == "reactive" else 1 if name == "blocked" else 2,
+                                   "level": 0, "attempts": len(outcomes), "wake_at": 115}}],
+            "backends": backends, "prompts": prompts, "groups_closed": True,
             "state": {"status": "executed" if name == "restart_effect" else "pending"},
             "commands": [{"returncode": 2 if name == "blocked" else 0, "timed_out": False}],
             "effect": module.native.EFFECT.hex() if name == "restart_effect" else None}

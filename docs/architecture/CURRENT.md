@@ -3338,6 +3338,10 @@ verified: 3e27b4794 2026-10-23
   four-case native smoke requires actual contained results; state tests alone
   do not establish native C success, full workflow/Codex parity or production
   activation. See `docs/reference/ego-owned-loop.md`.
+  The shared thirteen-case native corpus and a separate sixty-cell synthetic
+  reducer population have their own contained report, exact ID coverage and
+  mutation controls. Actual contained evidence is required; real-process crash/
+  timing/recovery and final B/C comparison remain separate qualification work.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).
