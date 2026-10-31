@@ -28,8 +28,8 @@ GENESIS_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # The last two are NOT location overrides: they change what a diff REPORTS from
 # the right repository, which lands on the same decisions. MEASURED 2026-09-19:
 # GIT_EXTERNAL_DIFF=/bin/true empties `git diff --cached`, so review_state's
-# staged-content hash returns its "nothing staged" sentinel and the escalation
-# cap stops counting rounds.
+# staged-content hash returns its "nothing staged" sentinel, on which the depth
+# gate's content bind refuses clearance (a false block on reviewed work).
 #
 # This array is DUPLICATED as Python lists in scripts/review_state.py
 # (GIT_ENV_UNSET), scripts/review_scope.py and

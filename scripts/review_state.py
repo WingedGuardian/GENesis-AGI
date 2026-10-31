@@ -249,7 +249,7 @@ STRONGLY_DISCOURAGED_REVIEWED_HEADS = 5
 # so an in-flight review from before an upgrade isn't lost mid-session.
 _LEGACY_STATE_FILE = Path.home() / ".genesis" / "review_state.json"
 # Per-worktree review-EVIDENCE (the code-reviewer/genesis-architect audit output the
-# depth gate validates). Per-worktree — like the marker/round — so concurrent
+# depth gate validates). Per-worktree — like the marker — so concurrent
 # sessions don't overwrite each other's evidence (which would validate one session's
 # marker against ANOTHER session's audit). Keyed by the same _worktree_key.
 _EVIDENCE_DIR = Path.home() / ".genesis" / "review_evidence"
@@ -322,7 +322,7 @@ def _worktree_key(cwd: str | None = None, *, deadline: float | None = None) -> s
 def _evidence_file(cwd: str | None = None) -> Path:
     """Per-worktree review-evidence path (``--agent-output`` default).
 
-    Same worktree key as the marker/round so a session's evidence can't be
+    Same worktree key as the marker so a session's evidence can't be
     overwritten by a concurrent session between writing it and marking the review.
     """
     return _EVIDENCE_DIR / f"{_worktree_key(cwd)}.txt"

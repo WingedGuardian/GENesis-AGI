@@ -441,8 +441,8 @@ def test_no_route_to_an_external_diff_can_empty_the_staged_content_hash(
 
     assert review_state._staged_content_hash(cwd=cwd) == clean, (
         f"an external diff driver set through {route} changed the staged content "
-        f'hash — if it reaches the "clean" sentinel the escalation cap stops '
-        f"counting rounds"
+        f'hash — if it reaches the "clean" sentinel the depth gate refuses '
+        f"clearance for reviewed work"
     )
 
 
@@ -526,8 +526,8 @@ def test_a_repo_local_external_diff_cannot_empty_the_staged_content_hash(repos):
 
     assert review_state._staged_content_hash(cwd=cwd) == clean, (
         "a repo-local diff.external emptied the staged diff — the staged content "
-        'hash fell to the "clean" sentinel and the escalation cap would stop '
-        "counting rounds"
+        'hash fell to the "clean" sentinel and the depth gate would refuse '
+        "clearance for reviewed work"
     )
 
 

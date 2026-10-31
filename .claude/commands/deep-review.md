@@ -147,7 +147,7 @@ started, and neither of which the findings list will tell you about:
   whatever it found. No outcome flag is needed. (EXTERNAL is judged by the reviewing MODEL, not the gateway: only a non-Anthropic model —
   Codex, or the install's configured secondary reviewer (`merge_gate.secondary_reviewer`);
   NOT OpenRouter, and never a Genesis internal model — is marked
-  `--source external --defects|--clean`; that alone moves the counter.)
+  `--source external --defects|--clean`, which records the outcome in the marker.)
 - Run `mark` AFTER the final `git add` and BEFORE `git commit`. The evidence must be recent when
   you `mark` (its age is checked at mark time), so write-then-mark promptly. Once marked, an
   unchanged staged diff stays cleared by its diff-hash — if you restage or amend, re-mark.
