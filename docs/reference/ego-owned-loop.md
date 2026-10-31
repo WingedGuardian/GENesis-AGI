@@ -1,10 +1,11 @@
-# Offline owned-loop state
+# Offline owned-loop mechanics
 
 `scripts/ci/ego_owned_state.py` is the private C1 reducer for an offline runtime
 comparison. It uses the existing `Campaign` exclusive writer and append-only
 `answers.jsonl` evidence format. It adds no production store, runtime source,
-provider or approval authority. The runnable adapter and actual contained native
-qualification are separate work; passing state tests does not qualify them.
+provider or approval authority. `ego_owned_loop.py` supplies the contained adapter;
+actual native qualification requires the contained report, independently of
+passing state tests.
 
 The immutable manifest binds the synthetic external feed, response program,
 executor/model, source identities, trajectory references and pacing. External
@@ -40,7 +41,7 @@ A fully observed safe provider error retains the logical event and a retry time;
 new arrivals remain admitted but cannot bypass it. `blocked` and `uncertain`
 outcomes halt automatic scheduling. An unpaired prepared/bound attempt also
 prevents replay on reopening. This reducer does not infer child completion or
-reconcile effects; its future caller must independently collect and validate
+reconcile effects; its caller must independently collect and validate
 that evidence before supplying an observation.
 
 Host-safe state tests cover timers, bursts, ties/preemption, retry order, restart,
@@ -48,3 +49,46 @@ torn journals, writer exclusion, failed append and malformed manifests/transitio
 They use synthetic evidence and never invoke upstream or native executables.
 Full ego workflow, production dispatch, multiple egos/generations, Codex execution
 and useful model behavior remain outside this state component's qualification.
+
+`ego_owned_loop.py` is an explicit finite offline CLI, runnable only inside the
+same preflighted image as the native bridge. `--root` selects a fresh owned
+manifest under `/work`; `--steps` is an attempt budget, not a declaration of
+success. Exhausted response programs stop without waiting for another timer.
+It validates the image source pin and five component hashes before opening the
+journal. No production daemon, source activation or automatic failover is added.
+
+For each selected input/timer it records prepared intent, obtains the actual
+pinned trajectory writer's trigger UUID, publishes a fresh config/nonce, renders
+and redacts context, then records the bound digests before launching the existing
+native bridge. The context wrapper calls only pinned data helpers: identity,
+goals, the fixture skill, current trigger, recent stream and deterministic related
+memory prefilter. It never evaluates model text or loads `.env` defaults. Tiered
+recap and the legacy model shell tools remain unavailable in this profile.
+
+The child uses its own process group. Completion, stop or error reaps that child
+and checks group closure before a cleanup receipt is accepted. Late output/receipt
+failure leaves an unpaired attempt; reopening cannot automatically invoke it.
+Stop interrupts backoff. This is fixture process ownership, not production
+generation fencing or reconciliation after an abruptly killed parent.
+
+Before committing an observation, the adapter independently reads canonical
+proposal state and effect bytes, then checks the child receipt, actual run/header/
+observation/final correlation, trigger/nonce/config/prompt hashes, typed native
+terminal and the closed MCP tool profile. It records requested and resolved model
+identities separately. Required captured artifacts must be present; later
+continuity verifies each retained relative path, size and SHA256 before carrying
+accepted earlier references forward. A provider error is retryable only with
+complete typed no-effect evidence; partial/failed handlers remain uncertain.
+
+`ego_owned_controls.py` adds an early four-case smoke: two actual timer wakes,
+effect plus a separate-process reopen/refused second claim, reactive input and a
+reference conflict with zero SDK requests. The expected population is six
+attempts and five native sessions, scored separately from B's established matrix.
+The controller retains synthetic manifests, journals, prompts, receipts, trajectory
+snapshots, database and effect artifacts in its JSON report before scratch cleanup.
+SDK HOME caches are excluded. The workflow retains this report and Docker settings
+alongside the stock/reference/native/B foundation reports. Source/binary/container,
+physical-effect and cleanup verification of the actual run is still required.
+
+The fuller C mechanics/crash matrix and B/C comparison follow separately. This
+early smoke establishes no full workflow, useful model behavior or Codex parity.

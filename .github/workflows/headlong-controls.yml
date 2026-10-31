@@ -5,10 +5,14 @@ on:
       - '.github/workflows/headlong-controls.yml'
       - 'scripts/ci/headlong_*'
       - 'scripts/ci/ego_runtime_*.py'
+      - 'scripts/ci/ego_owned_*'
       - 'tests/test_scripts/test_headlong_*.py'
       - 'tests/test_scripts/test_ego_runtime_*.py'
+      - 'tests/test_scripts/test_ego_owned_*.py'
       - 'src/genesis/db/crud/ego.py'
       - 'src/genesis/db/schema/**'
+      - 'src/genesis/eval/qualification/evidence.py'
+      - 'src/genesis/util/atomic.py'
   workflow_dispatch:
 
 permissions:
@@ -26,6 +30,7 @@ jobs:
       NATIVE_CONTAINER: headlong-native-${{ github.run_id }}-${{ github.run_attempt }}
       REFERENCE_CONTAINER: headlong-reference-${{ github.run_id }}-${{ github.run_attempt }}
       BRIDGE_CONTAINER: headlong-bridge-${{ github.run_id }}-${{ github.run_attempt }}
+      OWNED_CONTAINER: ego-owned-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -50,6 +55,7 @@ jobs:
           cp scripts/ci/headlong_prompt_references.py scripts/ci/headlong_reference_*.py "$context/"
           cp scripts/ci/headlong_monolith_controls.py scripts/ci/headlong_bridge_patch.json "$context/"
           cp scripts/ci/ego_runtime_cases.py "$context/"
+          cp scripts/ci/ego_owned_*.py scripts/ci/ego_owned_context.sh "$context/"
           cp scripts/ci/headlong_controls.Dockerfile "$context/Dockerfile"
           docker build -t headlong-controls "$context"
           docker image inspect headlong-controls > "$RUNNER_TEMP/headlong-image.json"
@@ -162,9 +168,36 @@ jobs:
           assert all(run['backend']['main_requests'] == 0 and run['driver']['prompt_status'] == '65' for case in report['cases'] if case['scenario'].endswith('reference_conflict') for run in case['runs'])
           print('13 cases / 15 wakes / 13 native sessions plus exact reader correlations verified')
           PY
+      - name: Run early owned-loop native smoke inside disposable containment
+        run: |
+          set -euo pipefail
+          docker create --name "$OWNED_CONTAINER" --init --network none --read-only \
+            --user 65532:65532 --cap-drop ALL --security-opt no-new-privileges \
+            --pids-limit 256 --memory 1g --memory-swap 1g --cpus 1 \
+            --tmpfs /work:rw,exec,nosuid,nodev,size=512m,mode=1777 \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,size=128m,mode=1777 \
+            headlong-controls python3 /fixture/ego_owned_controls.py
+          docker inspect "$OWNED_CONTAINER" > "$RUNNER_TEMP/ego-owned-container.json"
+          timeout 600 docker start -a "$OWNED_CONTAINER" > "$RUNNER_TEMP/ego-owned-report.json"
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$OWNED_CONTAINER")" = 0
+          python3 - "$RUNNER_TEMP/ego-owned-report.json" <<'PY'
+          import json, sys
+          report = json.load(open(sys.argv[1]))
+          assert report['schema'] == 'ego-owned-smoke/v1' and report['status'] == 'pass'
+          assert report['sources_unchanged'] is True and report['cleanup_confirmed'] is True
+          assert len(report['cases']) == 4
+          assert {case['scenario'] for case in report['cases']} == {'timers', 'restart_effect', 'reactive', 'blocked'}
+          assert all(case['control_passed'] is True and case['groups_closed'] is True for case in report['cases'])
+          observations = [case['reports'][-1]['observations'] for case in report['cases']]
+          assert sum(map(len, observations)) == 6
+          sessions = [row['evidence']['driver']['native']['session_id'] for rows in observations for row in rows if row['evidence']['driver']['native'] is not None]
+          assert len(sessions) == len(set(sessions)) == 5
+          assert all(case['artifacts'] for case in report['cases'])
+          print('4 early C smoke cases / 6 attempts / 5 native sessions verified')
+          PY
       - name: Remove only this evaluation container
         if: always()
-        run: docker rm -f "$CONTROL_CONTAINER" "$NATIVE_CONTAINER" "$REFERENCE_CONTAINER" "$BRIDGE_CONTAINER" || true
+        run: docker rm -f "$CONTROL_CONTAINER" "$NATIVE_CONTAINER" "$REFERENCE_CONTAINER" "$BRIDGE_CONTAINER" "$OWNED_CONTAINER" || true
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -179,5 +212,7 @@ jobs:
             ${{ runner.temp }}/headlong-reference-container.json
             ${{ runner.temp }}/headlong-bridge-report.json
             ${{ runner.temp }}/headlong-bridge-container.json
+            ${{ runner.temp }}/ego-owned-report.json
+            ${{ runner.temp }}/ego-owned-container.json
           retention-days: 7
           if-no-files-found: error
