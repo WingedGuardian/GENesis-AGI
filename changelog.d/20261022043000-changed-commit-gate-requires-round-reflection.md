@@ -12,8 +12,7 @@
   `hooks.reflection_gate: advisory` to see the verdicts without enforcing them.
 - **The local review streak's two tiers are retired.** The round-2 mode-switch
   block and the round-3 hard stop no longer exist, and `# audit-ack` and
-  `# escalation-ack` authorize nothing. The streak counter is still recorded and
-  shown on the statusline until a follow-on cleanup removes it.
+  `# escalation-ack` authorize nothing.
 - **Late review findings are owed from the gate's go-live.** Reviews that arrive
   after a round's fix (`review_late`) now count toward what a reflection must
   answer, from the moment the gate started enforcing; PRs that were merge-ready

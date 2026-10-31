@@ -143,9 +143,8 @@ started, and neither of which the findings list will tell you about:
   ladder, though the `file:line` and length requirements above still apply on their own. It
   costs one paragraph.
 - `python3 "$ROOT/scripts/review_state.py" mark --agent-output "$EVID"` — this is an INTERNAL
-  (same-model) audit, so a plain `mark` is correct: it satisfies the commit review-depth gate and
-  never moves the local cross-model streak (which no gate reads any more), whatever it found. No outcome flag is
-  needed. (EXTERNAL is judged by the reviewing MODEL, not the gateway: only a non-Anthropic model —
+  (same-model) audit, so a plain `mark` is correct: it satisfies the commit review-depth gate,
+  whatever it found. No outcome flag is needed. (EXTERNAL is judged by the reviewing MODEL, not the gateway: only a non-Anthropic model —
   Codex, or the install's configured secondary reviewer (`merge_gate.secondary_reviewer`);
   NOT OpenRouter, and never a Genesis internal model — is marked
   `--source external --defects|--clean`; that alone moves the counter.)

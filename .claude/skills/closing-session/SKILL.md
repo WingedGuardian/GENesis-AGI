@@ -566,9 +566,8 @@ still permits round 5+ under per-request approval — aligning it is tracked wor
 so until then this paragraph and the approval prompts are what carry the rule.
 And each budget round owes a ROUND REFLECTION before its fixes: while one is
 owed, the commit gate denies content commits (Rule R, below). The old local
-cross-model streak and its two stops are retired; the counter is still recorded
-and displayed, but no gate acts on it. Only the budget's rounds are numbered as
-rounds.
+cross-model streak, its two stops and its counter are gone. Only the budget's
+rounds are numbered as rounds.
 
 **Bring a premise check to every escalation.** Before putting any of these to
 the owner, run the premise check (a fresh-context agent following
@@ -1194,8 +1193,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   next_round=2`. It had been counting its own passes — the very thing this
   definition excludes — and built a process question on the wrong number. **Never
   state a round number you have not just read out of `review_budget.py`**; your own
-  tally is not a source, and `review_state.py mark` prints "internal review —
-  cross-model streak unchanged" precisely so you cannot mistake one for the other.
+  tally is not a source, and `review_state.py mark` prints no round number at all.
   A locally run reviewer adds no reviewed head, so it opens no budget round.
 
   **The terminal round CONSUMES standing approval.** A prior "proceed", "merge when
@@ -1230,11 +1228,9 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   the count is the prompt to look, not the verdict.
   **Class grouping decides HOW you fix — never whether a round counts.**
   The budget is class-blind: a head that drew findings is a round, including the
-  second instance of a class you have already named. The local `review_state.py
-  mark` counter is class-blind too (`bump_review_round` records only `source`), and
-  its marking rule below is finding-based. No gate acts on that counter any more,
-  but on an external round, passing `--clean` to keep a repeat-class round off it is
-  still a falsified record.
+  second instance of a class you have already named. On an external round, `mark`
+  records the outcome you pass, so passing `--clean` to make a repeat-class round
+  look clean is a falsified record.
 
   A corollary that costs a round if missed: when you delete a duplicated layer,
   verify the class is closed by enumerating the registry for the BEHAVIOUR, not
@@ -1269,8 +1265,8 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   advisory. The owner can set
   `hooks.reflection_gate: advisory` in the install's `~/.genesis/config/genesis.yaml`,
   which prints what would be denied and allows; the default is `enforce`. The local
-  streak's two tiers are retired: the round-2 mode-switch and the round-3 hard stop
-  no longer exist, and `# audit-ack` and `# escalation-ack` authorize nothing.
+  streak and its two tiers are gone: the round-2 mode-switch and the round-3 hard
+  stop no longer exist, and `# audit-ack` and `# escalation-ack` authorize nothing.
 
   Standing authorization is a separate GitHub-backed budget. It counts ROUNDS, not
   local marks: a round is a distinct head that drew FINDINGS from any GitHub App
@@ -1324,22 +1320,18 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   WARNING and will be rejected by that gate — re-write the evidence with concrete
   anchors rather than acking past it.
 
-  `review_state.py` still keeps the local `round` streak and legacy lifetime
-  fields for stale-worktree compatibility, and the statusline still shows the
-  streak. No gate reads it any more; a follow-on cleanup deletes it. Current
-  authorization uses `scripts/review_budget.py`. The old lifetime APIs remain
-  import-compatible but current gates do not consult them. The
+  The local `round` streak `review_state.py` once kept, its statusline field and
+  the dormant cap menu are deleted: no gate read them. Current authorization uses
+  `scripts/review_budget.py` (GitHub-backed review rounds). The
   `final-round-accept` SIGIL is still parsed and authorizes nothing. The commit
   gate and the push guard name it as retired only when they are already asking
   for approval (`review_enforcement_commit.py` `_allow`; `git_push_guard.py`, the
   review-request ask); on an action that needs no approval it passes silently.
 
-  **THE COUNTER IS CROSS-MODEL ONLY.** These are the semantics `mark` still records;
-  the counter no longer gates anything. The streak was built to catch *cross-model
-  non-convergence* — an EXTERNAL reviewer finding NEW defects round after round. It does
-  NOT exist to penalize the free, encouraged act of reviewing your own work. So `mark`
-  takes a `--source {internal,external}` (default `internal`) that records WHO PRODUCED THE
-  FINDINGS, and that is what decides whether the round counts.
+  **`mark --source` RECORDS WHO PRODUCED THE FINDINGS.** `mark` takes a
+  `--source {internal,external}` (default `internal`); the marker records it, with an
+  external review's outcome, for provenance only: no gate reads either field, and
+  nothing counts rounds locally.
 
   **EXTERNAL is judged by the reviewing MODEL, not the gateway/provider — this is the "big
   one".** External = a review by a non-ANTHROPIC model. Anthropic Claude via ANY route
@@ -1378,20 +1370,15 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   keys on this:
   - **`--source internal` (the default)** — a same-model self / genesis-architect /
     genesis-security / any-subagent review. It is free and shares the author-model's
-    blind spots (rubber-stamp risk), so it **NEVER moves the streak** — not an
-    increment, not a reset — whatever it found. No outcome flag is needed (a bare
+    blind spots (rubber-stamp risk). No outcome flag is needed (a bare
     `python3 scripts/review_state.py mark --agent-output <path>` is a valid internal
-    review). Your own audits, including the ones a round reflection cites, never move
-    the counter.
+    review).
   - **`--source external`** — a non-Anthropic cross-model reviewer drove this round.
-    This is the ONLY kind that counts, so it REQUIRES exactly one outcome flag:
+    It REQUIRES exactly one outcome flag, which the marker records:
     - a NEW **BLOCKER / SHOULD-FIX / P1 / P2** → `--defects`
-      (`… mark --agent-output <path> --source external --defects`) — the round counts.
+      (`… mark --agent-output <path> --source external --defects`).
     - **no** new BLOCKER/SHOULD-FIX/P1/P2 → `--clean`
-      (`… --source external --clean`) — RESETS the streak (circuit-breaker
-      reset-on-success). Only an EXTERNAL clean round resets; an internal "looks
-      fine" can never reset a standing cross-model streak (that would be a
-      self-rubber-stamp reset).
+      (`… --source external --clean`).
 
   `--source` describes the REVIEW THAT PRODUCED THE FINDINGS, not who typed the
   evidence file: a mark recording "verified + fixed Codex's (or the secondary's) findings" is
@@ -1399,9 +1386,7 @@ above (full definitions in `.claude/agents/genesis-architect.md`):
   CLEAN iff the external review found no BLOCKER/SHOULD-FIX/P1/P2 (and no security
   CRITICAL/WARNING). NOTEs, nitpicks, and dispositioned optional-hardening do NOT make
   a round defect-bearing. Falsely passing an external `--clean` WITHOUT the honest
-  review result is the same violation as ignoring the prose above. (Supersedes feea3f71/#1446: its unconditional required-outcome only
-  ever bit internal re-audits, which now can't inflate the streak at all; the outcome
-  requirement is kept where it is still load-bearing — on external marks.)
+  review result is the same violation as ignoring the prose above.
   Caveats: **multiple findings in a single pass = one round** (not an
   escalation); the same defect reappearing (an incomplete prior fix) is a
   fix-it-properly issue, not an escalation trigger. This complements the

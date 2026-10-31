@@ -238,9 +238,9 @@ _GIT_ENV_UNSET = frozenset(
         # NOT location variables — they change what a diff REPORTS, which lands
         # in the same place. MEASURED 2026-09-19: `GIT_EXTERNAL_DIFF=/bin/true`
         # empties `git diff --cached`, so `review_state._staged_content_hash`
-        # returns its "clean" (nothing-staged) sentinel and
-        # `bump_review_round` then returns the current round WITHOUT
-        # advancing — the escalation cap stops counting. `GIT_DIFF_OPTS` was
+        # returns its "clean" (nothing-staged) sentinel, on which
+        # `review_state.marker_content_current` refuses clearance: reviewed
+        # work then reads as a false block. `GIT_DIFF_OPTS` was
         # measured INERT here and is carried as its documented sibling only; do
         # not cite it as measured.
         "GIT_EXTERNAL_DIFF",

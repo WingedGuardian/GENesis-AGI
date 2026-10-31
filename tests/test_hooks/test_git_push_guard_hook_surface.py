@@ -119,7 +119,6 @@ class TestHookSurfaceMatcher:
             "scripts/review_budget.py",
             "scripts/review_findings.py",
             "scripts/external_review.py",
-            "scripts/lib/gate_menu.py",
             "config/external_review.yaml",
             "src/genesis/session_awareness/external_review.py",
             "src/genesis/session_awareness/external_review_config.py",

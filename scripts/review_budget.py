@@ -115,7 +115,6 @@ HOOK_SURFACE_FILES = frozenset(
         "scripts/review_late.py",
         "scripts/review_deadline.py",
         "scripts/external_review.py",
-        "scripts/lib/gate_menu.py",
         ".claude/settings.json",
         "scripts/behavioral_linter.py",
         "scripts/check_stale_pending.py",
