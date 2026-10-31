@@ -1248,14 +1248,48 @@ def _str_list(value, what: str) -> tuple[str, ...]:
     return tuple(value)
 
 
+def _str_map(value, what: str) -> dict[str, str]:
+    """A manifest mapping of strings to strings, or ValueError."""
+    if not isinstance(value, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in value.items()
+    ):
+        raise ValueError(f"{what} must map strings to strings, got {value!r}")
+    return value
+
+
 def cases_from_json(doc: dict, repo: Path) -> list[Case]:
+    """Every manifest field, typed before anything runs.
+
+    A value of the wrong type otherwise surfaces late and misleadingly: a bare
+    string list becomes its characters, a non-string reaches ``re`` or
+    ``subprocess`` as a traceback after the copy exists. Each refusal here is a
+    ValueError naming the field.
+    """
+    cases = doc.get("cases") if isinstance(doc, dict) else None
+    if not isinstance(cases, list):
+        raise ValueError("the manifest must be an object with a `cases` list")
     out = []
-    for c in doc["cases"]:
-        env = c.get("env", {})
-        if not isinstance(env, dict) or not all(
-            isinstance(k, str) and isinstance(v, str) for k, v in env.items()
+    for c in cases:
+        if not isinstance(c, dict):
+            raise ValueError(f"each case must be an object, got {c!r}")
+        name = f"case {c.get('label')!r}"
+        for key in ("label", "path", "test", "why", "validator"):
+            if not isinstance(c.get(key), str):
+                raise ValueError(f"{name}: `{key}` must be a string, got {c.get(key)!r}")
+        for key in ("anchor", "replacement", "python"):
+            if c.get(key) is not None and not isinstance(c[key], str):
+                raise ValueError(f"{name}: `{key}` must be a string, got {c[key]!r}")
+        edits = c.get("edits", [])
+        if not isinstance(edits, list) or not all(
+            isinstance(e, dict)
+            and isinstance(e.get("anchor"), str)
+            and isinstance(e.get("replacement"), str)
+            for e in edits
         ):
-            raise ValueError(f"case {c.get('label')!r}: `env` must map strings to strings")
+            raise ValueError(
+                f"{name}: `edits` must be a list of {{anchor: str, replacement: str}} objects"
+            )
+        env = _str_map(c.get("env", {}), f"{name} `env`")
         out.append(
             Case(
                 label=c["label"],
@@ -1265,7 +1299,7 @@ def cases_from_json(doc: dict, repo: Path) -> list[Case]:
                 validator=c["validator"],
                 anchor=c.get("anchor"),
                 replacement=c.get("replacement"),
-                edits=tuple(Edit(e["anchor"], e["replacement"]) for e in c.get("edits", ())),
+                edits=tuple(Edit(e["anchor"], e["replacement"]) for e in edits),
                 python=c.get("python"),
                 pytest_args=_str_list(c.get("pytest_args", []), "`pytest_args`"),
                 env=env,
@@ -1322,12 +1356,14 @@ def main(argv: list[str] | None = None) -> int:
     # must be DECLARED. A manifest-level `env` covers the sweep; a case's own
     # `env` overrides it. `src` is the package root, named repo-relative so it
     # lands on the COPY's PYTHONPATH.
-    available = set(doc.get("available", ())) | set(args.available)
+    available = set(_str_list(doc.get("available", []), "manifest `available`")) | set(
+        args.available
+    )
     result = sweep(
         cases,
         repo=repo,
         python=args.python,
-        env=doc.get("env", {}),
+        env=_str_map(doc.get("env", {}), "manifest `env`"),
         pythonpath=("src",),
         available=available,
         timeout=args.timeout,

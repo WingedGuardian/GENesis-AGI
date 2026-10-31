@@ -1794,3 +1794,66 @@ def test_a_manifest_field_of_the_wrong_type_is_refused(tmp_path, field, value, m
 def test_a_selector_that_reads_as_an_option_is_refused(project):
     with pytest.raises(ValueError, match="pytest option"):
         _sweep(project, [_case(project, test="-p no:cacheprovider")])
+
+
+@pytest.mark.parametrize(
+    "patch,match",
+    [
+        ({"edits": [{"anchor": 1, "replacement": "y"}]}, "`edits` must be a list"),
+        ({"edits": [{"anchor": "x = 1"}]}, "`edits` must be a list"),
+        ({"edits": "x = 1"}, "`edits` must be a list"),
+        ({"label": 3}, "`label` must be a string"),
+        ({"test": ["t.py"]}, "`test` must be a string"),
+        ({"python": 3}, "`python` must be a string"),
+    ],
+)
+def test_every_case_field_of_the_wrong_type_is_refused_up_front(tmp_path, patch, match):
+    """CodeRabbit on this PR: a non-string anchor raised TypeError only after the
+    copy and the baseline had run, and a missing key raised a bare KeyError."""
+    (tmp_path / "guard.py").write_text("x = 1\n", encoding="utf-8")
+    case = {
+        "label": "l",
+        "path": "guard.py",
+        "test": "t.py",
+        "why": "w",
+        "validator": "python",
+        "anchor": "x = 1",
+        "replacement": "x = 2",
+    }
+    case.update(patch)
+    if "edits" in patch:
+        case.pop("anchor"), case.pop("replacement")
+    with pytest.raises(ValueError, match=match):
+        ms.cases_from_json({"cases": [case]}, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "extra,match",
+    [
+        ({"available": "an-engine"}, "manifest `available`"),
+        ({"env": {"X": 1}}, "manifest `env`"),
+    ],
+)
+def test_a_manifest_level_field_of_the_wrong_type_is_refused(project, tmp_path, extra, match):
+    """A bare-string `available` became a set of characters, so a case that
+    required `an-engine` ABORTED as undeclared although it was declared."""
+    import json
+
+    manifest = tmp_path / "m.json"
+    doc = {
+        "cases": [
+            {
+                "label": "l",
+                "path": "guard.py",
+                "test": "test_guard.py",
+                "why": "w",
+                "validator": "python",
+                "anchor": "return True",
+                "replacement": "return bool(1)",
+            }
+        ],
+        **extra,
+    }
+    manifest.write_text(json.dumps(doc), encoding="utf-8")
+    with pytest.raises(ValueError, match=match):
+        ms.main([str(manifest), "--repo", str(project)])
