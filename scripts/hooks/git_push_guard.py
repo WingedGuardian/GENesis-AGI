@@ -215,7 +215,7 @@ try:
         primary_reviewer_login,
     )
     from review_findings import (
-        is_html_comment_line as _is_html_comment_line,
+        is_cr_marker_line as _is_cr_marker_line,
     )
 except Exception as _findings_exc:  # noqa: BLE001 — degrade the merge gate only.
     # Only the exception's TYPE name is rendered, never the exception: even
@@ -250,7 +250,7 @@ except Exception as _findings_exc:  # noqa: BLE001 — degrade the merge gate on
     def _devin_finding(body):  # type: ignore[no-redef]
         raise RuntimeError(_REVIEW_FINDINGS_ERROR)
 
-    def _is_html_comment_line(line):  # type: ignore[no-redef]
+    def _is_cr_marker_line(line):  # type: ignore[no-redef]
         raise RuntimeError(_REVIEW_FINDINGS_ERROR)
 
 # SOFT dependency (mirrors review_enforcement_commit.py's guard for the SAME
@@ -2472,7 +2472,7 @@ def _coderabbit_title(body: str) -> str:
             continue
         # Since 2026-10-17 a marker comment opens the body, ahead of the header;
         # skipped like a blank line so the header is still the line skipped below.
-        if _is_html_comment_line(stripped):
+        if _is_cr_marker_line(stripped):
             continue
         # The header is bold since 2026-10-06 (#2992), so it would be read as the
         # title. Skip it, and only it: the header is always the FIRST line, and a

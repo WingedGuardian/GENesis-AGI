@@ -101,25 +101,48 @@ def test_an_unclosed_icon_never_reads_a_level_it_does_not_name():
     assert rf.cr_severity(_comment(short_src)) == ("major", True)
 
 
+def test_a_pipe_header_whose_field_holds_a_middle_dot_reads_as_before():
+    """Round 1 on #3818 (Kimi): `|` splits whenever present, so a `·` inside a
+    field cannot demote a real level."""
+    bold = "**🔒 Security · Privacy** | **🟠 Major** | **⚡ Quick win**"
+    italic = "_Security · Privacy_ | _🟠 Major_ | _⚡ Quick win_"
+    assert rf.cr_severity(_comment(bold)) == ("major", True)
+    assert rf.cr_severity(_comment(italic)) == ("major", True)
+
+
+@pytest.mark.parametrize("line", ["_init_ · _b Critical_", "**Note** · **b Critical**"])
+def test_a_two_field_middle_dot_line_is_not_a_header(line):
+    """Round 1 on #3818 (Kimi): a `·` split needs the three fields every real
+    header has, so prose cannot read as a level."""
+    assert rf.cr_severity(f"{MARKER}\n{line}\n") == (None, False)
+
+
+def test_only_coderabbits_marker_is_skipped():
+    body = f"<!-- quoted -->\n{MAJOR}\n"
+    assert rf.cr_severity(body) == (None, False)
+
+
 def test_a_comment_line_carrying_text_is_not_skipped():
     body = f"{MARKER} note\n\n{MAJOR}\n"
     assert rf.cr_severity(body) == (None, False)
+
+
+def test_the_marker_alone_is_a_marker_line():
+    assert rf.is_cr_marker_line(MARKER)
 
 
 @pytest.mark.parametrize(
     "line",
     [
         "<!-- a -->",
-        "<!---->",
+        f"{MARKER} b",
+        f"{MARKER}<!-- b -->",
+        "<!-- coderabbit-",
+        "-->",
     ],
 )
-def test_a_lone_comment_is_a_comment_line(line):
-    assert rf.is_html_comment_line(line)
-
-
-@pytest.mark.parametrize("line", ["<!-- a --> b", "<!-- a --><!-- b -->", "<!--", "-->"])
-def test_anything_else_is_not_a_comment_line(line):
-    assert not rf.is_html_comment_line(line)
+def test_anything_else_is_not_a_marker_line(line):
+    assert not rf.is_cr_marker_line(line)
 
 
 def test_a_lone_bold_title_holding_a_middle_dot_is_not_a_header():
@@ -140,4 +163,5 @@ def test_the_icon_strip_is_linear_on_hostile_input(hostile):
     start = time.monotonic()
     rf.cr_severity(hostile)
     rf.cr_header_shaped(hostile)
-    assert time.monotonic() - start < 0.05
+    # Generous for a loaded runner; a quadratic scan of these inputs takes seconds.
+    assert time.monotonic() - start < 0.25
