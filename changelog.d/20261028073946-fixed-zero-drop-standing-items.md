@@ -1,0 +1,1 @@
+- A zero-drop detector alert that stays open across three morning reports now moves to the report's Standing Items instead of reappearing as new each day, and a deploy that is only behind upstream is reported at medium rather than high priority.
