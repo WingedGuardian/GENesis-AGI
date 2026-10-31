@@ -2985,6 +2985,14 @@ modules: [learning, eval, experimentation, feedback, calibration, ledger, transc
 verified: 3e27b4794 2026-10-23
 ```
 
+- **eval/ego_runtime**: opt-in canonical proposal-operation probes using fresh
+  two-table SQLite fixtures, real resolution/revocation/revision/claim helpers,
+  independent committed-state reads and claim-gated artifact checks. Nine fixed
+  cases cross continuous and clean-reopen modes. No approval simulator, model or
+  candidate runtime runs; runtime comparison runners remain unbuilt. See
+  `docs/reference/ego-runtime-offline.md`.
+  This verification refresh covers the probe slice, not a new audit of the
+  whole learning/evaluation entry.
 - Verification refresh is limited to the sampled qualification-runner behavior
   below; other learning and evaluation evidence retains its dated basis.
 - **learning/skills/usage.py**: skill-usage telemetry (issue #3197), read-only
