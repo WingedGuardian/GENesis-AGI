@@ -1975,6 +1975,70 @@ _WRAPPER_REVIEW_BODY_PARTS = (
 _WRAPPER_RESIDUE_MAX_CHARS = 24
 
 
+#: The pieces of Devin's review-report template, removed one at a time to see
+#: whether anything a human would read is left (the `_WRAPPER_REVIEW_BODY_PARTS`
+#: method). MEASURED 2026-10-31: every review body the merge gate surfaced on the
+#: 81 open PRs (57 bodies on 41 PRs) was Devin's, in three shapes: "found N
+#: potential issue(s)" (its findings are posted inline), "No Issues Found", and a
+#: "newer findings are available" marker on a superseded report.
+_DEVIN_REPORT_PARTS = (
+    re.compile(r"<!-- devin-review-badge-begin -->.*?<!-- devin-review-badge-end -->", re.S),
+    re.compile(r"<!-- devin-review-[a-z-]{1,40} -->"),
+    re.compile(r"^#{1,6}[ \t]*\u2705?[ \t]*Devin Review: No Issues Found[ \t]*$", re.M),
+    re.compile(r"Devin Review analyzed this PR and found no bugs or issues to report\.?"),
+    re.compile(r"\*\*Devin Review\*\* found \d{1,4} (?:new )?potential issues?\.?"),
+    re.compile(r"^>[ \t]*\[!NOTE\][ \t]*$", re.M),
+    # The older superseded marker. It can share its line with "N flags not posted
+    # ...", which is not template and so keeps such a body visible.
+    re.compile(
+        r"^>[ \t]*\*\*This report is out of date\.\*\* Scroll down for Devin Review's "
+        r"latest report on this PR\.",
+        re.M,
+    ),
+    re.compile(
+        r"^>[ \t]*\*\*Newer findings are available below\.\*\* Devin Review posted a "
+        r"newer report on this PR, in addition to the findings presented here\.[ \t]*$",
+        re.M,
+    ),
+)
+#: Longer bodies are never quieted, so the template regexes never scan large
+#: third-party text. MEASURED 2026-10-31: the longest of 1,557 real Devin report
+#: bodies (PRs #2100-#3820) was 732 characters.
+_DEVIN_REPORT_MAX_CHARS = 2048
+_DEVIN_FOUND_RE = re.compile(r"\*\*Devin Review\*\* found (\d{1,4}) (?:new )?potential issues?")
+
+
+def _is_settled_devin_report(body: str, posted: int) -> bool:
+    """True when a review body is Devin's report template and nothing else, and its
+    stated count equals the inline comments that same review posted.
+
+    The body is the ONLY place Devin states its count, and findings can go
+    unposted: MEASURED on a past PR, three report bodies said "3 flags not posted
+    on this PR by your GitHub settings". So a body is quiet only when BOTH hold:
+      * nothing is left once the template pieces are removed (the "not posted"
+        sentence is not a template piece, so such a body always stays visible);
+      * the "found N" count (0 for "No Issues Found") equals ``posted``, the
+        top-level inline comments carrying this review's id.
+    MEASURED 2026-10-31: 100 of 100 "found N" reports in the 300 most recent PRs
+    matched their posted count. A body that fails either test is surfaced, as
+    every unparsed body was before; this only removes the ones that add nothing.
+    """
+    if len(body) > _DEVIN_REPORT_MAX_CHARS:
+        return False
+    counts = [int(n) for n in _DEVIN_FOUND_RE.findall(body)]
+    no_issues = "Devin Review: No Issues Found" in body
+    if len(counts) > 1 or (counts and no_issues) or not (counts or no_issues):
+        return False
+    residue = body
+    for part in _DEVIN_REPORT_PARTS:
+        residue = part.sub("", residue)
+    # NOTHING may be left: every real template body leaves 0 characters
+    # (MEASURED, 655 of 655), so any leftover text is something to read.
+    if residue.strip():
+        return False
+    return (counts[0] if counts else 0) == posted
+
+
 def _is_wrapper_review_body(body: str) -> bool:
     """True when a review BODY is a template carrying no findings of its own.
 
@@ -2937,7 +3001,7 @@ def _cr_severity_inline(text: str) -> tuple[str | None, bool]:
 
 
 def _pr_review_bodies(pr_num: str, repo: str | None = None) -> tuple[list[dict] | None, bool]:
-    """Every review's ``{login, body, state}`` for a PR, paginated and fail-closed.
+    """Every review's ``{id, login, body, state}`` for a PR, paginated and fail-closed.
 
     Reuses ``_fetch_comments_paged`` for the hardened parts — page loop, the
     shared merge-deadline check BETWEEN pages, NEL-safe JSONL splitting, and the
@@ -2965,7 +3029,7 @@ def _pr_review_bodies(pr_num: str, repo: str | None = None) -> tuple[list[dict] 
         f"pulls/{pr_num}/reviews",
         pr_num,
         repo,
-        ".[] | {login: .user.login, body: .body, state: .state}",
+        ".[] | {id: .id, login: .user.login, body: .body, state: .state}",
     )
 
 
@@ -3404,7 +3468,8 @@ def _check_inline_review_findings(
         pr_num,
         repo,
         ".[] | {id: .id, reply_to: .in_reply_to_id, login: .user.login, "
-        "type: .user.type, assoc: .author_association, path: .path, body: .body}",
+        "type: .user.type, assoc: .author_association, path: .path, body: .body, "
+        "review_id: .pull_request_review_id}",
     )
     if raw is None:
         return _scan_unreadable("inline review comments")
@@ -3861,6 +3926,13 @@ def _check_inline_review_findings(
     # the one that keeps the obligation. Over-surfacing costs a printed line;
     # under-surfacing is the defect this whole scan exists to remove.
     outside_seen: dict[tuple[str, str, str], str] = {}
+    # Top-level inline comments each review actually POSTED, keyed by (login,
+    # review id): what a report body's "found N" count is checked against.
+    posted_by_review: dict[tuple[str, object], int] = {}
+    for c in raw:
+        if not c.get("reply_to") and c.get("review_id") is not None:
+            key = (c.get("login") or "", c.get("review_id"))
+            posted_by_review[key] = posted_by_review.get(key, 0) + 1
     for review in reviews:
         # Same deadline discipline as the fetch loop this follows: the parse is
         # the one CPU-bound phase here, and a PR with many re-reviews multiplies
@@ -3936,7 +4008,17 @@ def _check_inline_review_findings(
             # findings is a different capability and a different risk (see the
             # filed issue); awareness is the contract here.
             review_body = (review.get("body") or "").strip()
-            if review_body and not _is_wrapper_review_body(review_body):
+            if (
+                review_body
+                and not _is_wrapper_review_body(review_body)
+                and not (
+                    review_login in devin_logins
+                    and _is_settled_devin_report(
+                    review_body,
+                        posted_by_review.get((review_login, review.get("id")), 0),
+                    )
+                )
+            ):
                 unclassified_reviews.append(review_login)
             continue
         parsed, declared, declared_known, depth_drift = _cr_outside_diff_entries(
