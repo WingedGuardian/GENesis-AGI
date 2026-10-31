@@ -9,6 +9,17 @@ import pytest
 from genesis.guardian.config import GuardianConfig
 
 
+@pytest.fixture(autouse=True)
+def _deletion_window_any(monkeypatch):
+    """Guardian suites written before the deletion window characterize the
+    ``any`` behaviour (delete when due), which is exactly main's behaviour
+    before the window existed — and without this they would depend on the
+    wall clock and on the runner's own timezone config. Window tests
+    (test_deletion_window.py) delete this override and set the window
+    explicitly."""
+    monkeypatch.setenv("GUARDIAN_DELETION_WINDOW", "any")
+
+
 @pytest.fixture
 def guardian_config() -> GuardianConfig:
     """Default Guardian config for testing."""
