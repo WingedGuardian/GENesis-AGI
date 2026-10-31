@@ -201,6 +201,9 @@ try:
         INLINE_P2_RE as _INLINE_P2_RE,
     )
     from review_findings import (
+        INLINE_P3_RE as _INLINE_P3_RE,
+    )
+    from review_findings import (
         cr_header_fields as _cr_header_fields,
     )
     from review_findings import (
@@ -226,7 +229,7 @@ except Exception as _findings_exc:  # noqa: BLE001 — degrade the merge gate on
         f"scripts/review_findings.py is unimportable ({_findings_exc_type}); "
         f"repair the hook tree"
     )
-    _INLINE_P1_RE = _INLINE_P2_RE = None  # type: ignore[assignment]
+    _INLINE_P1_RE = _INLINE_P2_RE = _INLINE_P3_RE = None  # type: ignore[assignment]
     _CR_SEVERITIES = frozenset()  # type: ignore[assignment]
 
     def _cr_header_fields(line, *, skip_partial=False):  # type: ignore[no-redef]
@@ -3503,6 +3506,9 @@ def _check_inline_review_findings(
     cr_unknown: list[str] = []  # a severity header naming a level we don't know
     cr_doc_skipped: list[str] = []  # CodeRabbit Critical/Major on a doc path
     unmatched_bot: list[tuple[str, str]] = []  # (login, title) — read, unrecognised
+    # Which of those carry a P3 badge: informational by design (no parser
+    # scores P3), so they are not format drift. Indices into unmatched_bot.
+    informational: set[int] = set()
     # Which logins the registry knows at all, and which of them is CodeQL: the
     # unrecognised bucket is printed in three parts (see the NOTEs below).
     known_review_logins = frozenset().union(*scanner_sets.values())
@@ -3814,6 +3820,8 @@ def _check_inline_review_findings(
             # protects the CodeRabbit path protects this one on the same terms.
             if c.get("id") in replied_to:
                 continue
+            if parseable and _INLINE_P3_RE.search(body):
+                informational.add(len(unmatched_bot))
             unmatched_bot.append((login, _inline_title(body)))
 
     # ── The SECOND delivery channel: findings CodeRabbit could not post inline ──
@@ -4080,12 +4088,30 @@ def _check_inline_review_findings(
     # to read. All three stay surfaced, never scored, never blocking, and the
     # JSON count (`unrecognised_reviewer`) still totals all three.
     codeql_found = [t for who, t in unmatched_bot if who in codeql_logins]
-    drift = [(who, t) for who, t in unmatched_bot if who not in codeql_logins and who in known_review_logins]
+    p3_notes = [
+        (who, t)
+        for i, (who, t) in enumerate(unmatched_bot)
+        if i in informational and who in known_review_logins and who not in codeql_logins
+    ]
+    drift = [
+        (who, t)
+        for i, (who, t) in enumerate(unmatched_bot)
+        if i not in informational and who in known_review_logins and who not in codeql_logins
+    ]
     strangers = [(who, t) for who, t in unmatched_bot if who not in known_review_logins]
+    if p3_notes:
+        print(
+            f"NOTE: PR #{pr_num} — {len(p3_notes)} P3 note(s) from a known reviewer. "
+            f"Informational by design: NOT scored and NOT blocking, but read them:",
+            file=sys.stderr,
+        )
+        for bot_login, title in p3_notes[:_UNRECOGNISED_LISTED]:
+            print(f"  [P3: {bot_login}] {title}", file=sys.stderr)
+        _print_listing_rest(len(p3_notes))
     if codeql_found:
         print(
             f"NOTE: PR #{pr_num} — {len(codeql_found)} inline CodeQL security finding(s) "
-            f"that no maintainer has answered. NOT scored and NOT blocking (an alert has its "
+            f"that no owner, member or collaborator has answered in its thread. NOT scored and NOT blocking (an alert has its "
             f"own dismissal workflow), but read each one: fix it, or dismiss the "
             f"alert with a reason and reply in its thread:",
             file=sys.stderr,

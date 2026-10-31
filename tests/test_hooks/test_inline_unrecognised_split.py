@@ -20,6 +20,8 @@ _GUARD = Path(__file__).resolve().parents[2] / "scripts" / "hooks" / "git_push_g
 
 CODEQL = "github-advanced-security[bot]"
 CODEX = "chatgpt-codex-connector[bot]"
+# A Codex comment carrying no severity badge at all: what format drift looks like.
+DRIFT = "**Keep the pattern inside its word**\n\nDetails."
 P3 = (
     "**<sub><sub>![P3 Badge](https://img.shields.io/badge/P3-lightgrey)"
     "</sub></sub>  Keep the pattern inside its word**\n\nDetails."
@@ -63,14 +65,14 @@ def test_a_codeql_finding_gets_its_own_note_with_a_remedy(guard, capsys):
     block, _ = _scan(guard, [_codeql(1)])
     assert not block, "CodeQL is surfaced, never scored"
     err = capsys.readouterr().err
-    assert "1 inline CodeQL security finding(s) that no maintainer has answered" in err
+    assert "1 inline CodeQL security finding(s) that no owner, member or collaborator has answered in its thread" in err
     assert "fix it, or dismiss the alert with a reason" in err
     assert "  [CodeQL] ## CodeQL / Overly permissive regular expression range" in err
     assert "unrecognised" not in err, "a security finding must not read as format drift"
 
 
 def test_a_known_reviewer_in_an_unparsed_format_is_called_format_drift(guard, capsys):
-    block, _ = _scan(guard, [_c(1, CODEX, P3)])
+    block, _ = _scan(guard, [_c(1, CODEX, DRIFT)])
     assert not block
     err = capsys.readouterr().err
     assert "from a KNOWN reviewer in a format this gate does not parse" in err
@@ -94,7 +96,7 @@ def test_a_human_comment_is_an_unknown_author_never_a_score(guard, capsys):
 
 
 def test_all_three_kinds_print_together_and_the_json_count_totals_them(guard, capsys):
-    rows = [_codeql(1), _c(2, CODEX, P3), _c(3, "some-new-reviewer[bot]", "Hm.")]
+    rows = [_codeql(1), _c(2, CODEX, DRIFT), _c(3, "some-new-reviewer[bot]", "Hm.")]
     _scan(guard, rows)
     err = capsys.readouterr().err
     assert "1 inline CodeQL security finding(s)" in err
@@ -135,7 +137,8 @@ def test_long_listings_are_bounded_with_the_rest_stated(guard, capsys):
 @pytest.mark.parametrize(
     ("login", "body", "tag"),
     [
-        (CODEX, P3, "unrecognised format"),
+        (CODEX, DRIFT, "unrecognised format"),
+        (CODEX, P3, "P3"),
         ("some-new-reviewer[bot]", "Hm.", "unrecognised reviewer"),
     ],
 )
@@ -167,3 +170,29 @@ def test_a_badge_in_a_codeql_body_is_never_scored(guard, capsys):
     block, _ = _scan(guard, [_c(1, CODEQL, "## CodeQL / Some rule\n\n" + p1)])
     assert not block
     assert "1 inline CodeQL security finding(s)" in capsys.readouterr().err
+
+
+def test_a_codex_p3_is_an_informational_note_not_format_drift(guard, capsys):
+    """Round 1 on #3808 (Kimi): no parser scores P3 by design, so a routine Codex
+    P3 note landed in the drift NOTE and was called "format drift, a gate bug"."""
+    block, _ = _scan(guard, [_c(1, CODEX, P3)])
+    assert not block
+    err = capsys.readouterr().err
+    assert "1 P3 note(s) from a known reviewer. Informational by design" in err
+    assert f"  [P3: {CODEX}] " in err
+    assert "format drift" not in err
+
+
+def test_a_codex_p1_still_blocks(guard):
+    """The surface-only exclusion is CodeQL's alone: Codex badges are still believed."""
+    p1 = P3.replace("P3 Badge", "P1 Badge").replace("P3-lightgrey", "P1-red")
+    block, _ = _scan(guard, [_c(1, CODEX, p1)])
+    assert block
+
+
+@pytest.mark.parametrize("assoc", ["OWNER", "MEMBER", "COLLABORATOR"])
+def test_every_maintainer_role_counts_as_answering(guard, capsys, assoc):
+    reply = _c(2, "a-maintainer", "Dismissed: test fixture.", utype="User", reply_to=1,
+               assoc=assoc)
+    _scan(guard, [_codeql(1), reply])
+    assert "CodeQL security finding" not in capsys.readouterr().err
