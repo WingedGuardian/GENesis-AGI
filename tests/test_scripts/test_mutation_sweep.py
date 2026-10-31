@@ -2166,3 +2166,74 @@ def test_no_child_process_outlives_its_run(project, tmp_path_factory, how, tail,
     ms.sweep([case], repo=project, python=sys.executable, timeout=timeout, check_baseline=False)
     time.sleep(4)
     assert not mark.exists(), "a child of the test outlived its run"
+
+
+# --------------------------------------------------------------------------
+# #3802 ROUND 1 (Codex): what each run sees that the copy did not reproduce.
+# --------------------------------------------------------------------------
+
+
+def test_a_permission_only_difference_reaches_the_copy(project):
+    """git records only the executable bit, so a clean tracked file chmodded
+    0644 -> 0600 never showed in `git diff`; the copy got the checkout's mode,
+    and a test pinning the caller's mode ran against a different tree."""
+    notes = project / "notes.txt"
+    notes.write_text("x\n", encoding="utf-8")
+    os.chmod(notes, 0o644)
+    _commit_all(project)
+    os.chmod(notes, 0o600)
+    (project / "test_mode.py").write_text(
+        "import os, guard\n"
+        "def test_mode_and_guard():\n"
+        "    assert os.stat('notes.txt').st_mode & 0o777 == 0o600\n"
+        "    assert guard.is_allowed('dangerous') is False\n",
+        encoding="utf-8",
+    )
+    case = _case(project, test="test_mode.py::test_mode_and_guard")
+    result = _sweep(project, [case], check_baseline=True)
+    assert result.results[0].outcome == ms.BIT, result.results[0].detail
+
+
+def test_a_permission_change_mid_sweep_is_drift(project, monkeypatch):
+    notes = project / "notes.txt"
+    notes.write_text("x\n", encoding="utf-8")
+    os.chmod(notes, 0o644)
+    _commit_all(project)
+    calls = {"n": 0}
+
+    def drift(_cwd):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            os.chmod(notes, 0o600)
+
+    _around_child(monkeypatch, after=drift)
+    result = _sweep(project, [_case(project, label="first"), _case(project, label="second")])
+    assert result.results[1].outcome == ms.ABORTED
+    assert "changed during the sweep" in result.results[1].detail
+
+
+def test_each_run_gets_its_own_bytecode_cache(project):
+    """Codex round 1: one PYTHONPYCACHEPREFIX per copy was shared by a case's
+    three runs. A test that compiles with an unchecked-hash cache (which
+    `py_compile` writes despite PYTHONDONTWRITEBYTECODE) made the mutated run
+    import the unmutated run's code, and a caught mutation read SURVIVED."""
+    (project / "flag.py").write_text("def allowed():\n    return True\n", encoding="utf-8")
+    (project / "test_flag.py").write_text(
+        "import py_compile, flag\n"
+        "def test_allowed():\n"
+        "    py_compile.compile(flag.__file__,\n"
+        "        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)\n"
+        "    assert flag.allowed() is True\n",
+        encoding="utf-8",
+    )
+    _commit_all(project)
+    case = _case(
+        project,
+        path=project / "flag.py",
+        anchor="return True",
+        replacement="return None",
+        test="test_flag.py::test_allowed",
+        why="allowed() must return True",
+    )
+    result = _sweep(project, [case])
+    assert result.results[0].outcome == ms.BIT, result.results[0].detail

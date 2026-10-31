@@ -278,12 +278,16 @@ def _child_env(extra: dict[str, str] | None) -> dict[str, str]:
         # __pycache__; a fresh, never-created path per child means nothing is
         # read and, with writes off, nothing is left behind. The cost is that
         # every child compiles its imports cold.
-        "PYTHONPYCACHEPREFIX": os.path.join(
-            os.environ.get("TMPDIR", str(Path.home() / "tmp")),
-            f"mutation-sweep-nopyc-{uuid.uuid4().hex}",
-        ),
     }
     env.update(extra or {})
+    # Fresh for EVERY child, under the TMPDIR that child actually gets (a
+    # copy's own, when the sweep passes one). One prefix shared by a case's
+    # runs let a cache the unmutated run wrote -- `py_compile` writes despite
+    # DONTWRITEBYTECODE -- be imported by the mutated run.
+    if "PYTHONPYCACHEPREFIX" not in (extra or {}):
+        env["PYTHONPYCACHEPREFIX"] = os.path.join(
+            env["TMPDIR"], f"mutation-sweep-nopyc-{uuid.uuid4().hex}"
+        )
     return env
 
 
@@ -636,6 +640,20 @@ def _overlay(top: Path, tree: Path) -> str:
             # own (sorted after it); HEAD's file must not stay in their way.
             _clear(dst)
             digest.update(b"gone\0")
+    # Permission-only differences on otherwise clean tracked files: git records
+    # only the executable bit (none at all under core.filemode=false), so a
+    # 0644 -> 0600 change never shows in `git diff` and the checkout's mode would
+    # silently replace the caller's. Every tracked regular file is compared.
+    for rel in sorted(_git_paths(top, "ls-files", "-z") - paths):
+        src, dst = top / rel, tree / rel
+        if os.path.islink(src) or not src.is_file() or os.path.islink(dst) or not dst.is_file():
+            continue
+        if not _contained(tree, dst):  # never chmod through a symlinked directory
+            continue
+        mode = src.stat().st_mode & 0o777
+        if dst.stat().st_mode & 0o777 != mode:
+            os.chmod(dst, mode)
+            digest.update(os.fsencode(rel) + b"\0mode\0%o\0" % mode)
     return digest.hexdigest()
 
 
@@ -1260,16 +1278,13 @@ def _copy_env(
     env: dict[str, str] | None, root: Path, holder: Path, pythonpath: tuple[str, ...]
 ) -> dict[str, str]:
     """The sweep env for children running in ONE copy: its import roots on
-    PYTHONPATH, and a TMPDIR (with the bytecode-cache prefix under it) that
-    belongs to this copy alone and is removed with it. A shared TMPDIR let one
-    case's leftovers change the next case's verdict."""
+    PYTHONPATH, and a TMPDIR that belongs to this copy alone and is removed
+    with it. A shared TMPDIR let one case's leftovers change the next case's
+    verdict. The bytecode-cache prefix is NOT set here: `_child_env` makes a
+    fresh one under this TMPDIR for every run."""
     tmp = holder / "tmp"
     tmp.mkdir(mode=0o700, exist_ok=True)
-    out = {
-        "TMPDIR": str(tmp),
-        "PYTHONPYCACHEPREFIX": str(tmp / f"mutation-sweep-nopyc-{uuid.uuid4().hex}"),
-        **(env or {}),
-    }
+    out = {"TMPDIR": str(tmp), **(env or {})}
     if pythonpath:
         out = {"PYTHONPATH": os.pathsep.join(str(root / p) for p in pythonpath), **out}
     return out
