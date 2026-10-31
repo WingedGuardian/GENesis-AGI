@@ -84,6 +84,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -799,6 +800,28 @@ def _repo_relative(repo: Path, path: Path) -> Path:
 _PATH_PIECES = re.compile(r"[\s=,:;]+")
 
 
+def _link_escape(repo: Path, rel: str) -> str | None:
+    """The first symlink on ``rel``'s way through ``repo`` that leads OUT of the
+    copy it is reproduced in, or None.
+
+    The copy keeps the caller's symlinks as they are. A link with an ABSOLUTE
+    target, or a relative one that resolves outside the repository, points
+    the copy back at the caller's tree (or elsewhere), so a selector or import
+    root that goes through it runs the caller's unmutated source -- a test that
+    finds its source from ``__file__`` follows it. A relative link that stays
+    inside the repository stays inside the copy and is fine.
+    """
+    real = Path(os.path.realpath(repo))
+    here = repo
+    for part in Path(rel).parts:
+        here = here / part
+        if os.path.islink(here):
+            target = os.readlink(here)
+            if os.path.isabs(target) or not Path(os.path.realpath(here)).is_relative_to(real):
+                return f"{here.relative_to(repo).as_posix()} -> {target}"
+    return None
+
+
 def _back_pointer(repo: Path, value: str, top: Path | None = None) -> str | None:
     """The part of ``value`` that points a child BACK at the caller's tree, or None.
 
@@ -856,6 +879,8 @@ def _back_pointer(repo: Path, value: str, top: Path | None = None) -> str | None
                 norm = os.path.normpath(piece)
                 if norm == ".." or norm.startswith("../"):
                     return piece
+                if escape := _link_escape(repo, norm):
+                    return f"{piece} (through {escape})"
     return None
 
 
@@ -913,6 +938,7 @@ def _copy_selector(repo: Path, case: Case) -> str:
             f"case {case.label!r} test {case.test!r} would be read as a pytest option, not a test"
         )
     file_part, sep, rest = case.test.partition("::")
+    rewritten = case.test
     if os.path.isabs(file_part):
         file_abs = "/" + file_part.lstrip("/")
         real = Path(os.path.realpath(repo))
@@ -921,17 +947,26 @@ def _copy_selector(repo: Path, case: Case) -> str:
             (Path(os.path.realpath(file_abs)), real),
         ):
             if path.is_relative_to(root):
-                return path.relative_to(root).as_posix() + sep + rest
+                file_part = path.relative_to(root).as_posix()
+                rewritten = file_part + sep + rest
+                break
+        else:
+            raise ValueError(
+                f"case {case.label!r} test {case.test!r} is outside the "
+                f"repository {repo}; the child runs in a copy of it"
+            )
+    # Checked AFTER the rewrite too: `/repo/linked/t.py` becomes `linked/t.py`.
+    if escape := _link_escape(repo, os.path.normpath(file_part)):
         raise ValueError(
-            f"case {case.label!r} test {case.test!r} is outside the "
-            f"repository {repo}; the child runs in a copy of it"
+            f"case {case.label!r} test {case.test!r} goes through a symlink that leads "
+            f"out of the copy ({escape}); name the real path"
         )
     if _back_pointer(repo, file_part):
         raise ValueError(
             f"case {case.label!r} test {case.test!r} climbs out of the "
             "repository; name it repository-relative"
         )
-    return case.test
+    return rewritten
 
 
 # --------------------------------------------------------------------------
@@ -949,14 +984,46 @@ def _pytest(
     UnicodeDecodeError before either verdict could be reached. Replacement
     cannot forge a verdict: U+FFFD is outside the summary grammar, so a damaged
     line can only become unreadable, which ABORTS.
+
+    Each child runs in its OWN session, and its whole process group is killed
+    when it ends -- on a timeout, and after a normal exit too. `subprocess.run`
+    kills only pytest on a timeout, so a test's subprocesses kept running (and
+    holding locks) after the sweep had reported and removed the copy.
     """
-    proc = subprocess.run(cmd, cwd=str(cwd), capture_output=True, env=env, timeout=timeout)
-    return subprocess.CompletedProcess(
-        proc.args,
-        proc.returncode,
-        proc.stdout.decode("utf-8", errors="replace"),
-        proc.stderr.decode("utf-8", errors="replace"),
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(cwd),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
     )
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_group(proc.pid)
+        # Bounded: a descendant that started its OWN session escapes the group
+        # kill and may hold the pipes open; the timeout is reported regardless.
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.communicate(timeout=10)
+        raise
+    finally:
+        _kill_group(proc.pid)
+    return subprocess.CompletedProcess(
+        cmd,
+        proc.returncode,
+        out.decode("utf-8", errors="replace"),
+        err.decode("utf-8", errors="replace"),
+    )
+
+
+def _kill_group(pgid: int) -> None:
+    """SIGKILL every process left in the child's group (it leads its own
+    session, so its pid is the group id). A group already gone is fine."""
+    if pgid <= 1:  # never signal init or every process this user owns
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pgid, signal.SIGKILL)
 
 
 def _pytest_cmd(python: str, test: str, extra: tuple[str, ...]) -> list[str]:
