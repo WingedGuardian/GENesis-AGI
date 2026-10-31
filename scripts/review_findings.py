@@ -175,6 +175,72 @@ CR_SEVERITIES = frozenset({"critical", "major", "minor", "trivial", "info"})
 # through :func:`cr_header_fields`, never by group number.
 CR_HEADER_FIELD_RE = re.compile(r"^(?:_([^_\n]{1,64})_|\*\*([^*\n]{1,64})\*\*)$")
 
+# THIRD layout, in two steps. MEASURED over all 1,162 top-level CodeRabbit inline
+# comments in this repo to 2026-10-31: from 2026-10-17 the body opens with
+# `<!-- coderabbit-ai-generated:v1 -->` ahead of the bold-pipe header (28), and
+# from 2026-10-25 the header draws the level's icon as HTML and joins its fields
+# with a middle dot (63 of 63):
+# `**<picture><img src="…/major-16.svg" …></picture> Major** · **Category** · **Effort**`.
+# The comment line ended the header search, the icon pushed the first field past
+# the 64-character bound, and the dot is not a `|`, so all 91 fell to the
+# unknown-format canary and no Major or Critical among them (1 Critical, 21 Major)
+# reached the always-fix floor. A lone comment line is skipped (cr_severity), the
+# icon is removed before a line is read, and either separator splits.
+_CR_FIELD_SEPARATOR_RE = re.compile("[|\u00b7]")
+
+
+def _strip_icon_markup(line: str) -> str:
+    """``line`` without ``<picture>…</picture>`` spans or bare ``<img …>`` tags.
+
+    Plain ``str.find`` scanning rather than a regex: this runs on third-party text
+    on a hook path, where a backtracking pattern turned quadratic once already
+    (``cr_header_shaped``). Each step jumps to the next ``<picture`` or ``<img``,
+    so other ``<`` characters cost nothing. An unclosed span is left in place, so
+    the field reads only if it still fits the field bound, and then only the
+    level word after it.
+    """
+    if "<picture" not in line and "<img" not in line:
+        return line
+    out: list[str] = []
+    i = 0
+    # Each next position is cached and searched again only once the scan has passed
+    # it; -1 (none left) is never searched again. So every character is scanned a
+    # bounded number of times and the strip stays linear.
+    pic, img = line.find("<picture"), line.find("<img")
+    while True:
+        if 0 <= pic < i:
+            pic = line.find("<picture", i)
+        if 0 <= img < i:
+            img = line.find("<img", i)
+        j = min(pic, img) if pic >= 0 and img >= 0 else max(pic, img)
+        if j < 0:
+            out.append(line[i:])
+            break
+        out.append(line[i:j])
+        if j == pic:
+            end, close = line.find("</picture>", j), len("</picture>")
+        else:
+            end, close = line.find(">", j), 1
+        if end < 0:
+            out.append(line[j:])
+            break
+        i = end + close
+    return "".join(out)
+
+
+def is_html_comment_line(line: str) -> bool:
+    """Whether a stripped ``line`` is exactly one HTML comment (``<!-- … -->``).
+
+    CodeRabbit's third layout opens with one, ahead of the header. Exactly one:
+    a line carrying text outside the comment is not skipped.
+    """
+    return (
+        line.startswith("<!--")
+        and line.endswith("-->")
+        and len(line) >= 7
+        and line.find("-->", 4) == len(line) - 3
+    )
+
 
 # A line that LOOKS like an attempted severity header — field markers and a
 # field separator — used only to tell "not a header" apart from "a header this
@@ -185,14 +251,15 @@ def cr_header_shaped(line: str) -> bool:
     delimiter and has a ``|`` between. Linear on purpose: the regex form
     (``^_.*\\|.*_$``) is quadratic on a long pipe-heavy line of third-party text,
     on a hook path (MEASURED: 3.4 s on a 60k-character line)."""
-    if "|" not in line:
+    line = _strip_icon_markup(line)
+    if "|" not in line and "\u00b7" not in line:
         return False
     if len(line) > 2 and line.startswith("_") and line.endswith("_"):
         return True  # the italic shape, exactly as the regex it replaced read it
     # Bold: the FIRST field must itself be a complete bold span. A bold TITLE that
     # holds a pipe (`**Prefer `str | None` here.**`) opens and closes with `**`
     # too, and reading it as an unreadable header would count a Trivial's round.
-    first = line.split("|", 1)[0].strip()
+    first = _CR_FIELD_SEPARATOR_RE.split(line, maxsplit=1)[0].strip()
     m = CR_HEADER_FIELD_RE.match(first)
     return line.endswith("**") and m is not None and m.group(2) is not None
 
@@ -211,7 +278,7 @@ def cr_header_fields(line: str, *, skip_partial: bool = False) -> list[str] | No
     italic field keeps its old reading, alone or not, so the italic corpus
     parses exactly as before.
     """
-    chunks = line.split("|")
+    chunks = _CR_FIELD_SEPARATOR_RE.split(_strip_icon_markup(line))
     fields: list[str] = []
     for chunk in chunks:
         m = CR_HEADER_FIELD_RE.match(chunk.strip())
@@ -265,8 +332,8 @@ def cr_severity(body: str) -> tuple[str | None, bool]:
     """
     for line in body.split("\n"):
         stripped = line.strip()
-        if not stripped:
-            continue
+        if not stripped or is_html_comment_line(stripped):
+            continue  # the third layout opens with a marker comment
         fields = cr_header_fields(stripped)
         if fields is None:
             # Header-SHAPED but unparseable is a canary, not a clean miss.
