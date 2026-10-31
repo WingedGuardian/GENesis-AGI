@@ -56,7 +56,7 @@ async def test_outreach_poll_records_shadow_and_still_posts(db):
         env = {"DISCORD_WEBHOOK_ANNOUNCEMENTS": "https://discord.com/api/webhooks/1/tok"}
         with patch.dict("os.environ", env, clear=False), \
              patch("genesis.mcp.outreach_mcp.httpx.AsyncClient", return_value=client):
-            tools = await outreach_mcp.get_tools()
+            tools = {tool.name: tool for tool in await outreach_mcp.list_tools()}
             result = await tools["outreach_poll"].fn(
                 channel="announcements", question="What next?", answers=["A", "B"],
             )
@@ -82,7 +82,7 @@ async def test_send_reply_records_shadow_and_still_sends(db):
     try:
         client = _mock_httpx("reply-1")
         with patch("genesis.mcp.discord_bot_mcp.httpx.AsyncClient", return_value=client):
-            tools = await bot_mcp.get_tools()
+            tools = {tool.name: tool for tool in await bot_mcp.list_tools()}
             result = await tools["send_reply"].fn(channel_id="789", content="thanks!")
         assert json.loads(result)["status"] == "sent"
         client.post.assert_called_once()  # the reply still sent
@@ -106,7 +106,7 @@ async def test_send_reply_refuses_a_card_number_before_any_request(db):
         client = _mock_httpx("reply-x")
         test_card = "4242 4242 4242 4242"
         with patch("genesis.mcp.discord_bot_mcp.httpx.AsyncClient", return_value=client):
-            tools = await bot_mcp.get_tools()
+            tools = {tool.name: tool for tool in await bot_mcp.list_tools()}
             result = await tools["send_reply"].fn(channel_id="789", content=f"use {test_card}")
         assert "payment card number" in json.loads(result)["error"]
         assert "4242" not in result
@@ -137,7 +137,7 @@ async def test_send_reply_without_shadow_db_still_sends():
     try:
         client = _mock_httpx("reply-2")
         with patch("genesis.mcp.discord_bot_mcp.httpx.AsyncClient", return_value=client):
-            tools = await bot_mcp.get_tools()
+            tools = {tool.name: tool for tool in await bot_mcp.list_tools()}
             result = await tools["send_reply"].fn(channel_id="789", content="hi")
         assert json.loads(result)["status"] == "sent"
         client.post.assert_called_once()

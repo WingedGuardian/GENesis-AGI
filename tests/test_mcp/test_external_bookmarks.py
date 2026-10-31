@@ -44,7 +44,7 @@ async def test_tool_calls_respect_initialization_policy(pending_memory, external
     )
     memory._store.store = AsyncMock(return_value="fixture-memory")
     memory._qdrant.retrieve.return_value = []
-    tools = await memory.mcp.get_tools()
+    tools = {tool.name: tool for tool in await memory.mcp.list_tools()}
     if tool_name == "memory_store":
         assert await tools[tool_name].fn(content="fixture", source="fixture") == "fixture-memory"
     else:

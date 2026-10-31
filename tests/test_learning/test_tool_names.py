@@ -1,6 +1,7 @@
 """The tool-name normalizer applied to every stored tool_trigger."""
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -83,7 +84,9 @@ def test_the_mcp_short_names_match_the_registered_tools():
         "import json; from genesis.cc.session_config import _registered_mcp_tool_names as r; "
         f"print(json.dumps({{s: r(m) for s, m in {tool_names._MCP_MODULES!r}.items()}}))"
     )
-    out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True)
+    src = str(Path(tool_names.__file__).resolve().parents[3])
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [src, os.environ.get("PYTHONPATH")]))}
+    out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True, env=env)
     registered = {}
     for server, names in json.loads(out.stdout.strip().splitlines()[-1]).items():
         for name in names:

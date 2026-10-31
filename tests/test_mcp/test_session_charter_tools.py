@@ -360,7 +360,7 @@ async def test_every_charter_tool_description_states_the_foreground_limit():
     """
     from genesis.mcp.health import mcp
 
-    tools_by_name = await mcp.get_tools()
+    tools_by_name = {tool.name: tool for tool in await mcp.list_tools()}
     for name in (
         "session_charter",
         "session_charter_update",
@@ -881,4 +881,4 @@ async def test_session_address_reports_a_resolver_failure(monkeypatch):
 async def test_session_address_is_a_registered_tool():
     from genesis.mcp.health import mcp
 
-    assert "session_address" in await mcp.get_tools()
+    assert "session_address" in {tool.name: tool for tool in await mcp.list_tools()}

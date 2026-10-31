@@ -139,7 +139,7 @@ async def test_rejects_invalid_window(home, bad):
 async def test_tool_is_registered():
     from genesis.mcp.health_mcp import mcp
 
-    tools = await mcp.get_tools()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
     assert "skill_usage_status" in tools
 
 

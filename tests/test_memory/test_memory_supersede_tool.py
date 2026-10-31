@@ -309,7 +309,7 @@ async def test_the_tool_reports_the_ids_it_acted_on(db):
         db=db,
         linker=MagicMock(),
     )
-    tools = await core.mcp.get_tools()
+    tools = {tool.name: tool for tool in await core.mcp.list_tools()}
     with pytest.MonkeyPatch.context() as mp:
         mod = MagicMock()
         mod._store = real
@@ -333,7 +333,7 @@ async def test_the_tool_raises_rather_than_reporting_a_failure(db):
         db=db,
         linker=MagicMock(),
     )
-    tools = await core.mcp.get_tools()
+    tools = {tool.name: tool for tool in await core.mcp.list_tools()}
     with pytest.MonkeyPatch.context() as mp:
         mod = MagicMock()
         mod._store = real

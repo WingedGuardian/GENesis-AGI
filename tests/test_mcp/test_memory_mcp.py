@@ -9,7 +9,7 @@ from genesis.mcp.memory_mcp import mcp
 
 
 async def _get_tools():
-    return await mcp.get_tools()
+    return {tool.name: tool for tool in await mcp.list_tools()}
 
 
 async def test_all_tools_registered():
@@ -2239,7 +2239,7 @@ def test_memory_recall_docstring_lists_exactly_the_wing_vocabulary():
     from genesis.mcp.memory import core
     from genesis.memory.taxonomy import WINGS
 
-    doc = core.memory_recall.fn.__doc__
+    doc = core.memory_recall.__doc__
     m = re.search(r"one of: (.*?)\. Enumerated", doc, re.S)
     assert m, "the `wing` docstring entry no longer enumerates the vocabulary"
     listed = {w.strip() for w in m.group(1).replace("\n", " ").split(",")}

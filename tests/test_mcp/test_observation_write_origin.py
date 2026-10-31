@@ -19,7 +19,7 @@ from genesis.mcp.memory_mcp import mcp
 
 
 async def _get_tools():
-    return await mcp.get_tools()
+    return {tool.name: tool for tool in await mcp.list_tools()}
 
 
 async def _write_and_read_origin(monkeypatch, origin_env: str | None) -> str:

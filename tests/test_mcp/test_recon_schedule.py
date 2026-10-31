@@ -25,7 +25,7 @@ def schedule_file(tmp_path, monkeypatch):
 
 @pytest.fixture
 async def tools(schedule_file):
-    return await mcp.get_tools()
+    return {tool.name: tool for tool in await mcp.list_tools()}
 
 
 async def test_view_schedule(tools):
