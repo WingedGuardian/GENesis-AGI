@@ -254,6 +254,18 @@ def _hermetic_squash_body_file(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_main_ci_note(monkeypatch):
+    """Skip the ``--check-pr`` red-base NOTE's reads for EVERY hook test.
+
+    The NOTE reads the PR's base ref and the base branch's CI runs; report tests
+    run as subprocesses too, hence an environment variable. The NOTE is advisory
+    and never moves a verdict. Its own behaviour is tested in
+    tests/test_hooks/test_merge_gate_main_ci_note.py, which clears this per case."""
+    monkeypatch.setenv("_TEST_MAIN_CI_NOTE", "off")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_main_reverts(monkeypatch):
     """Pin the ``--check-pr`` ``main-reverts`` row's commit read for EVERY hook test.
 

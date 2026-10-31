@@ -10422,6 +10422,182 @@ def _check_main_reverts(pr_num: str, repo: str | None = None) -> tuple[str, str]
     return MAIN_REVERTS_FINDINGS, "\n".join(lines)
 
 
+# --- main-ci: the base branch's own CI is red (cross-PR merge collision) ---
+
+#: Conclusions that say nothing about the base's health: a run cancelled because
+#: a newer push superseded it, one that never ran its jobs, or one waiting on an
+#: approval (``action_required``). Passed over.
+_MAIN_CI_NO_SIGNAL = frozenset(
+    {"cancelled", "skipped", "neutral", "stale", "action_required", ""}
+)
+#: Conclusions that mean the base is red.
+_MAIN_CI_RED = frozenset({"failure", "timed_out", "startup_failure"})
+#: How many of the base's newest push runs are read to find a completed one. Many
+#: are cancelled by the next push: MEASURED 2026-10-29 over main's last 500 CI push
+#: runs, the longest streak without a signal was 8 runs, and 43 of the last 100
+#: were cancelled. A longer streak leaves the NOTE silent, never wrong.
+_MAIN_CI_RUN_LIMIT = 30
+
+
+def _main_ci_red_note(pr_num: str, repo: str | None = None) -> str | None:
+    """A NOTE when the PR's base branch's latest completed CI run is red, else None.
+
+    WHY: a PR's own CI ran on its base as it stood then. MEASURED 2026-09-28 to
+    10-28: main's CI went red 15 times in 481 push runs; 14 PRs merged onto an
+    already-red main across 8 of the 11 red windows. None of those merges caused
+    the red, but each landed without a signal about itself, and a red base is when
+    a cross-PR collision would go unnoticed.
+
+    GUARD AXIOMS (owner ruling 2026-10-28: advisory, never a block):
+      * VERDICT: advisory. Report-only; it never counts toward ``failures`` and the
+        merge arm does not call it.
+      * AUDIENCE: the agent driving the merge. The NOTE names the run, its head and
+        the failing jobs, and asks the agent to weigh them; it never says "do not
+        merge" (most red bases in the measurement were flakes or infra, unrelated to
+        the PR merging onto them).
+      * BACKGROUND: none — it runs only in the ``--check-pr`` report.
+
+    Reads, per required CI workflow (``_required_ci_workflows``): the base branch's
+    newest push runs, passing over cancelled and skipped ones, and for a red run its
+    failing job names. Every red workflow gets its own block. A workflow whose runs
+    cannot be read, or with no completed run in reach, is skipped; when none is red
+    the result is None: the NOTE is silent rather than wrong. That includes the CI merge-gate workflows,
+    whose token has no ``actions: read``, so the NOTE appears only in a local
+    ``--check-pr``. "Latest completed" is literal: newer runs not yet completed are
+    counted on a detail line, since one of them may carry the fix. The caller
+    sanitizes every line before printing.
+
+    Tests inject ``_TEST_GH_MAIN_CI_RUNS`` (a JSON array shaped like ``gh run list
+    --json databaseId,status,conclusion,headSha``, used for every workflow, or an
+    object mapping workflow name to such an array, where a name it lacks or the
+    value ``"__error__"`` reads as unreadable) and ``_TEST_GH_RUN_FAILED_JOBS`` (a
+    JSON array of job names, or ``"__error__"``). ``_TEST_MAIN_CI_NOTE=off`` skips every read: the
+    hook-test conftest sets it so report tests make no live call.
+    """
+    if os.environ.get("_TEST_MAIN_CI_NOTE") == "off":
+        return None
+    base = _pr_base_ref(pr_num, repo)
+    if not base:
+        return None
+    blocks = [
+        block
+        for workflow in _required_ci_workflows()
+        if (block := _main_ci_red_block(pr_num, base, workflow, repo))
+    ]
+    return "\n".join(blocks) if blocks else None
+
+
+def _main_ci_runs(base: str, workflow: str, repo: str | None) -> list | None:
+    """The base's newest push runs of *workflow*, newest first; None when unreadable."""
+    raw = os.environ.get("_TEST_GH_MAIN_CI_RUNS")
+    if raw is not None:
+        try:
+            seeded = json.loads(raw)
+        except ValueError:
+            return None
+        if isinstance(seeded, dict):
+            seeded = seeded.get(workflow, "__error__")
+        return seeded if isinstance(seeded, list) else None
+    try:
+        result = subprocess.run(
+            [
+                "gh", "run", "list", *_repo_args(repo),
+                "--workflow", workflow, "--branch", base, "--event", "push",
+                "--limit", str(_MAIN_CI_RUN_LIMIT),
+                "--json", "databaseId,status,conclusion,headSha",
+            ],
+            capture_output=True, text=True, timeout=_gh_timeout(8),
+        )
+    except Exception:  # noqa: BLE001 - advisory: an unreadable workflow is skipped
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        runs = json.loads(result.stdout or "[]")
+    except ValueError:
+        return None
+    return runs if isinstance(runs, list) else None
+
+
+def _main_ci_red_block(pr_num: str, base: str, workflow: str, repo: str | None) -> str | None:
+    """The NOTE lines for one required workflow whose latest completed run is red."""
+    runs = _main_ci_runs(base, workflow, repo)
+    if runs is None:
+        return None
+    latest = next(
+        (
+            r for r in runs
+            if isinstance(r, dict)
+            and r.get("status") == "completed"
+            and (r.get("conclusion") or "") not in _MAIN_CI_NO_SIGNAL
+        ),
+        None,
+    )
+    if latest is None or latest.get("conclusion") not in _MAIN_CI_RED:
+        return None
+    newer_pending = sum(
+        1
+        for r in runs[: runs.index(latest)]
+        if isinstance(r, dict) and r.get("status") != "completed"
+    )
+    run_id = str(latest.get("databaseId") or "")
+    if not run_id.isdigit():
+        return None
+    jobs = _run_failed_jobs(run_id, repo)
+    if jobs is None:
+        listed = "(could not be read)"
+    elif jobs:
+        listed = ", ".join(jobs)
+    else:
+        listed = "none reported as failed or timed out (see the run)"
+    head = str(latest.get("headSha") or "")[:12]
+    view = " ".join(["gh run view", run_id, *_repo_args(repo), "--log-failed"])
+    # One idea per line: the caller's sanitizer cuts any line over
+    # _GATE_TEXT_MAX_CHARS in the middle, which is where the advice would sit.
+    lines = [
+        f"NOTE: PR #{pr_num} — {base}'s latest conclusive {workflow} run {run_id} "
+        f"(head {head}) is {latest.get('conclusion')}.",
+        "Merging lands this PR on a red base, with no signal about it.",
+        "failing jobs: " + listed,
+        "Weigh it before merging: does this PR touch what those jobs test, or fix them?",
+        "A flake or infra failure on the base is no reason to hold an unrelated PR.",
+        f"Details: {view}",
+    ]
+    if newer_pending:
+        lines.append(
+            f"{newer_pending} newer {workflow} run(s) on {base} have not completed yet; "
+            f"one may carry the fix."
+        )
+    return "\n".join(lines)
+
+
+def _run_failed_jobs(run_id: str, repo: str | None = None) -> list[str] | None:
+    """Names of a run's failed or timed-out jobs: ``[]`` when it has none (a
+    workflow-level failure), None when the job list cannot be read."""
+    raw = os.environ.get("_TEST_GH_RUN_FAILED_JOBS")
+    if raw is None:
+        try:
+            result = subprocess.run(
+                [
+                    "gh", "run", "view", run_id, *_repo_args(repo), "--json", "jobs",
+                    "--jq", '[.jobs[] | select(.conclusion=="failure" or .conclusion=="timed_out") | .name]',
+                ],
+                capture_output=True, text=True, timeout=_gh_timeout(8),
+            )
+        except Exception:  # noqa: BLE001 - advisory: an unreadable job list is shown as such
+            return None
+        if result.returncode != 0:
+            return None
+        raw = result.stdout
+    try:
+        names = json.loads(raw or "[]")
+    except ValueError:
+        return None
+    if not isinstance(names, list):
+        return None
+    return [str(n) for n in names if isinstance(n, str)]
+
+
 # --- rework: a rebuild of a sent-back PR carries its contract (owner decision) ---
 
 #: The four states `_check_rework` reports. BLOCK is the only one that blocks.
@@ -16856,6 +17032,18 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     else:
         print(f"main-reverts   : could not check — {mr_head}")
     _print_gate_detail(mr_msg)
+    # A red base branch (cross-PR merge collision; owner ruling 2026-10-28) —
+    # ADVISORY: a stderr NOTE only when the base's latest completed CI run is red,
+    # never a row in the verdict, and never run by the merge arm.
+    try:
+        main_ci_note = _main_ci_red_note(pr_num, repo=repo)
+    except Exception:  # noqa: BLE001 - an advisory NOTE never takes the report down.
+        main_ci_note = None
+    if main_ci_note:
+        first, *rest = _sanitize_gate_text(main_ci_note).split("\n")
+        print(first, file=sys.stderr)
+        for line in rest:
+            print("  " + line, file=sys.stderr)
     # Rework contract (owner decision) — BLOCKING, in the pin-receipts pattern: the
     # merge arm runs the SAME function with the same verified head, so the two agree.
     # `_check_rework` never raises (its deadline/exception mapping is internal).
