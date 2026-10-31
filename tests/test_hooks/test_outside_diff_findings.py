@@ -1087,3 +1087,205 @@ def test_every_surfaced_finding_is_printed(guard_module, monkeypatch, no_inline,
     err = capsys.readouterr().err
     missing = [i for i in range(9) if f"Major finding {i}" not in err]
     assert not missing, f"findings dropped from the only place they appear: {missing}"
+# ── The SECOND outside-diff layout (2026-09-14 on) ──────────────────────────────
+#
+# A bold section line, then one <details> per finding whose <summary> reads
+# `LEVEL · Title · <code>path:lines</code>`. Built from the three summary shapes
+# CodeRabbit used in turn (real bodies on PRs #2008, #3516, #3734); 30 of 30 real
+# bodies of this layout parsed to their declared count.
+
+_ICON = (
+    '<picture><img src="https://storage.googleapis.com/coderabbit_public_assets/'
+    'review-comment-icons-v1/major-16.svg" width="16" height="16" align="absmiddle" '
+    'alt=""></picture>'
+)
+
+
+def _bold_body(findings: list[str], *, declared: int | None = None, tail: str = "") -> str:
+    """A second-layout review body: a caution quote holding the section, then a rule."""
+    n = len(findings) if declared is None else declared
+    inner = "\n\n".join(findings)
+    quoted = "\n".join(
+        "> " + ln
+        for ln in (
+            "[!CAUTION]\nSome comments are outside the diff and can't be posted inline.\n\n"
+            f"**⚠️ Outside diff range comments ({n})**\n\n{inner}"
+        ).split("\n")
+    )
+    return f"<!-- coderabbit-ai-generated:v1 -->\n\n{quoted}\n\n---\n\n{tail}"
+
+
+def _em_finding(path: str, lines: str, level: str, title: str) -> str:
+    """Mid-September: `<em>` level, the FULL path in the summary, an old-style entry line."""
+    return (
+        f"<details>\n<summary><em>{level}</em> · {title} · <code>{path}:{lines}</code>"
+        f"</summary><blockquote>\n\n`{lines}`: _🩺 Stability_ | _{level}_ | _🏗️ Heavy lift_\n\n"
+        f"**{title}**\n\nWhy it matters.\n\n</blockquote></details>"
+    )
+
+
+def _basename_finding(path: str, lines: str, level_html: str, title: str) -> str:
+    """Later: the summary names only the BASENAME; the full path is on its own line."""
+    base = path.rsplit("/", 1)[-1]
+    return (
+        f"<details>\n<summary><strong>{level_html}</strong> · {title} · <code>{base}:{lines}</code>"
+        f"</summary>\n<dl>\n<dd>\n\n`{path}:{lines}`\n**🎯 Functional Correctness** | **🟠 Major** | "
+        f"**⚡ Quick win**\n\n**{title}**\n\nWhy it matters.\n\n</dd>\n</dl>\n</details>"
+    )
+
+
+class TestSecondLayout:
+    def test_each_summary_shape_reads_path_lines_level_and_title(self, guard_module):
+        body = _bold_body(
+            [
+                _em_finding("src/a.py", "10-12", "🟠 Major", "Serialize the reaper."),
+                _basename_finding(
+                    "src/genesis/memory/store.py", "7", "🟡 Minor", "Keep the source."
+                ),
+                _basename_finding("src/b.py", "3-4", f"{_ICON} Critical", "Reject the path."),
+            ]
+        )
+        entries, declared, known, drift = guard_module._cr_outside_diff_entries(body)
+        assert (declared, known, drift) == (3, True, [])
+        assert entries == [
+            ("src/a.py", "10-12", "major", "Serialize the reaper."),
+            ("src/genesis/memory/store.py", "7", "minor", "Keep the source."),
+            ("src/b.py", "3-4", "critical", "Reject the path."),
+        ]
+
+    def test_an_unreadable_summary_is_a_shortfall_not_silence(self, guard_module):
+        odd = "<details>\n<summary>Something new · <code>src/a.py:1</code></summary>\n</details>"
+        body = _bold_body([_em_finding("src/a.py", "1", "🟠 Major", "Read me."), odd])
+        entries, declared, _known, _drift = guard_module._cr_outside_diff_entries(body)
+        assert declared == 2 and len(entries) == 1
+
+    def test_details_after_the_closing_rule_are_not_findings(self, guard_module):
+        furniture = (
+            "<details>\n<summary>🟠 Major · Not a finding · <code>src/a.py:9</code></summary>\n"
+            "</details>"
+        )
+        body = _bold_body([_em_finding("src/a.py", "1", "🟠 Major", "Real.")], tail=furniture)
+        entries, declared, _known, _drift = guard_module._cr_outside_diff_entries(body)
+        assert declared == 1 and [e[3] for e in entries] == ["Real."]
+
+    def test_a_fenced_section_line_is_not_a_section(self, guard_module):
+        body = "```\n**⚠️ Outside diff range comments (4)**\n```\n"
+        assert guard_module._cr_outside_diff_entries(body)[:2] == ([], 0)
+
+    def test_a_section_nested_too_deep_is_drift_not_a_clean_read(self, guard_module):
+        body = (
+            "<details>\n<summary>x</summary>\n\n**⚠️ Outside diff range comments (1)**\n\n</details>"
+        )
+        _entries, declared, _known, drift = guard_module._cr_outside_diff_entries(body)
+        assert declared == 0 and drift
+
+    def test_a_location_line_with_other_lines_keeps_the_summary_path(self, guard_module):
+        finding = _basename_finding("src/genesis/memory/store.py", "7", "🟡 Minor", "T.").replace(
+            "`src/genesis/memory/store.py:7`", "`src/genesis/memory/store.py:8`"
+        )
+        (entry,), _d, _k, _dr = guard_module._cr_outside_diff_entries(_bold_body([finding]))
+        assert entry[0] == "store.py"
+
+    def test_a_major_in_the_second_layout_is_surfaced_and_does_not_block(
+        self, guard_module, monkeypatch, no_inline, capsys
+    ):
+        """VERIFY-RED: main read 0 declared and 0 parsed here and printed nothing."""
+        body = _bold_body(
+            [_basename_finding("src/genesis/memory/store.py", "169-174", "🟠 Major", "Scope it.")]
+        )
+        monkeypatch.setenv("_TEST_GH_PR_REVIEW_BODIES", _review(body))
+        with no_inline:
+            block, _msg = guard_module._check_inline_review_findings("100")
+        assert block is False
+        err = capsys.readouterr().err
+        assert "outside-diff Major" in err and "Scope it." in err
+        assert "src/genesis/memory/store.py:169-174" in err
+
+    # ── guards (round of review: each of these stayed green when its guard was removed) ──
+
+    def test_a_nested_summary_inside_a_finding_is_not_an_entry(self, guard_module):
+        nested = _em_finding("src/a.py", "1", "🟠 Major", "Real.").replace(
+            "Why it matters.",
+            "<details>\n<summary><em>🔴 Critical</em> · Forged · <code>src/b.py:9</code></summary>\n"
+            "</details>",
+        )
+        entries, declared, _k, _d = guard_module._cr_outside_diff_entries(_bold_body([nested]))
+        assert declared == 1 and [e[3] for e in entries] == ["Real."]
+
+    def test_summary_text_in_a_findings_prose_is_not_an_entry(self, guard_module):
+        prose = _em_finding("src/a.py", "1", "🟠 Major", "Real.").replace(
+            "Why it matters.",
+            "Why it matters.\n\n<summary><em>🔴 Critical</em> · Forged · <code>src/b.py:9</code></summary>",
+        )
+        entries, _decl, _k, _d = guard_module._cr_outside_diff_entries(_bold_body([prose]))
+        assert [e[3] for e in entries] == ["Real."]
+
+    def test_a_rule_inside_a_finding_does_not_close_the_section(self, guard_module):
+        first = _em_finding("src/a.py", "1", "🟠 Major", "First.").replace(
+            "Why it matters.", "Why it matters.\n\n---\n"
+        )
+        second = _em_finding("src/b.py", "2", "🟡 Minor", "Second.")
+        entries, declared, _k, _d = guard_module._cr_outside_diff_entries(_bold_body([first, second]))
+        assert declared == 2 and [e[3] for e in entries] == ["First.", "Second."]
+
+    def test_the_path_lookahead_stops_at_the_next_finding(self, guard_module):
+        """A finding with no location line of its own must not adopt the next one's."""
+        first = _basename_finding("a/store.py", "7", "🟡 Minor", "First.").replace(
+            "`a/store.py:7`\n", ""
+        )
+        second = _basename_finding("b/store.py", "7", "🟡 Minor", "Second.")
+        entries, _d, _k, _dr = guard_module._cr_outside_diff_entries(_bold_body([first, second]))
+        assert [e[0] for e in entries] == ["store.py", "b/store.py"]
+
+    def test_the_path_lookahead_needs_a_directory_boundary(self, guard_module):
+        finding = _basename_finding("src/xstore.py", "7", "🟡 Minor", "T.").replace(
+            "<code>xstore.py:7</code>", "<code>store.py:7</code>"
+        )
+        (entry,), _d, _k, _dr = guard_module._cr_outside_diff_entries(_bold_body([finding]))
+        assert entry[0] == "store.py"
+
+    def test_a_full_path_in_the_summary_is_not_replaced(self, guard_module):
+        finding = _em_finding("scripts/x.py", "4", "🟠 Major", "T.").replace(
+            "Why it matters.", "`vendor/scripts/x.py:4`"
+        )
+        (entry,), _d, _k, _dr = guard_module._cr_outside_diff_entries(_bold_body([finding]))
+        assert entry[0] == "scripts/x.py"
+
+    def test_a_section_line_quoted_in_a_finding_is_not_drift(self, guard_module):
+        finding = _em_finding("src/a.py", "1", "🟠 Major", "Real.").replace(
+            "Why it matters.", "**⚠️ Outside diff range comments (3)**"
+        )
+        entries, declared, _k, drift = guard_module._cr_outside_diff_entries(_bold_body([finding]))
+        assert (declared, len(entries), drift) == (1, 1, [])
+
+    def test_a_first_layout_section_after_a_bold_one_is_still_read(self, guard_module):
+        bold = _bold_body([_em_finding("src/a.py", "1", "🟠 Major", "Bold.")]).replace("\n---\n", "\n")
+        old = _section(_entry("src/b.py", "2-3", "🔴 Critical", "Old."))
+        entries, declared, _k, _d = guard_module._cr_outside_diff_entries(bold + "\n" + old)
+        assert declared == 2 and sorted(e[3] for e in entries) == ["Bold.", "Old."]
+
+    def test_a_title_cannot_carry_a_control_character_to_the_terminal(self, guard_module):
+        finding = _em_finding("src/a.py", "1", "🟠 Major", "Bad&#13;title&#x202e;")
+        (entry,), _d, _k, _dr = guard_module._cr_outside_diff_entries(_bold_body([finding]))
+        assert "\r" not in entry[3] and "‮" not in entry[3]
+
+    def test_the_path_lookahead_does_not_leave_its_finding(self, guard_module):
+        """A location line BETWEEN findings (depth 0) belongs to neither."""
+        first = _basename_finding("a/store.py", "7", "🟡 Minor", "First.").replace(
+            "`a/store.py:7`\n", ""
+        )
+        stray = "`a/store.py:7`"
+        second = _em_finding("src/b.py", "2", "🟡 Minor", "Second.")
+        body = _bold_body([first + "\n\n" + stray, second])
+        entries, _d, _k, _dr = guard_module._cr_outside_diff_entries(body)
+        assert [e[0] for e in entries] == ["store.py", "src/b.py"]
+
+    def test_the_path_lookahead_does_not_read_a_nested_block(self, guard_module):
+        """A nested <details> (CodeRabbit's agent-prompt block) quotes text; a path in it
+        is not this finding's location."""
+        finding = _basename_finding("a/store.py", "7", "🟡 Minor", "First.").replace(
+            "`a/store.py:7`\n",
+            "<details>\n<summary>🤖 Prompt for AI Agents</summary>\n\n`vendor/a/store.py:7`\n\n</details>\n",
+        )
+        (entry,), _d, _k, _dr = guard_module._cr_outside_diff_entries(_bold_body([finding]))
+        assert entry[0] == "store.py"

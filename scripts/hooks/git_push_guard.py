@@ -2738,7 +2738,7 @@ def _cr_summary_structural(lines: list[str], fence_mask: list[bool]) -> list[boo
 
 def _cr_outside_diff_entries(
     body: str,
-) -> tuple[list[tuple[str, str, str, str]], int, bool]:
+) -> tuple[list[tuple[str, str, str, str]], int, bool, list[str]]:
     """Findings from the 'Outside diff range comments' sections of ONE review body.
 
     Returns ``(entries, declared, declared_known)`` — the parsed findings, the
@@ -2797,9 +2797,52 @@ def _cr_outside_diff_entries(
     structural = _cr_summary_structural(lines, fence_mask)
     current_file: str | None = None
     in_section = False
+    in_bold_section = False  # the second layout (see _CR_BOLD_SECTION_RE)
     for pos, line in enumerate(lines):
         if fence_mask[pos]:
             continue
+        stripped = line.strip()
+        bold = _CR_BOLD_SECTION_RE.match(stripped)
+        if bold and in_bold_section and depths[pos] >= _CR_BOLD_ENTRY_DEPTH:
+            # Inside a finding this is the finding's PROSE quoting a section
+            # line, not structure: neither a new section nor drift (the old
+            # layout's `structural` check holds the same line for its summaries).
+            bold = None
+        if bold:
+            if depths[pos] != _CR_BOLD_SECTION_DEPTH:
+                if bold.group(1) == "Outside diff range comments":
+                    # Same reasoning as the depth drift below: a section one
+                    # <details> deeper would read as zero declared, zero parsed.
+                    depth_drift.append(
+                        f"outside-diff section (bold) at <details> depth {depths[pos]}"
+                    )
+                continue
+            in_bold_section = bold.group(1) == "Outside diff range comments"
+            in_section = False
+            current_file = None
+            if in_bold_section:
+                declared += int(bold.group(2))
+            continue
+        if in_bold_section:
+            if stripped == "---" and depths[pos] == _CR_BOLD_SECTION_DEPTH:
+                in_bold_section = False  # the rule that closes the caution block
+                continue
+            old_section = _CR_SECTION_RE.search(line)
+            if old_section and structural[pos] and depths[pos] == _CR_SECTION_DEPTH:
+                # A first-layout section after a bold one with no closing rule:
+                # leave bold mode and let the first-layout code below read it,
+                # so its findings and its declared count are not swallowed here.
+                in_bold_section = False
+            elif structural[pos] and depths[pos] == _CR_BOLD_ENTRY_DEPTH:
+                entry = _cr_summary_entry(stripped)
+                if entry is not None:
+                    path, span, severity, title = entry
+                    if "/" not in path:  # a basename: find the finding's full path
+                        path = _cr_full_location(lines, fence_mask, depths, pos, path, span)
+                    out.append((path, span, severity, title))
+                continue
+            else:
+                continue
         # STRUCTURE IS ATTRIBUTED BY POSITION IN THE <details> TREE, never by
         # matching tag text wherever it appears. Both roles were reconstructed
         # from text before, and both were forgeable from content a PR author
@@ -2888,6 +2931,100 @@ def _cr_outside_diff_entries(
 
 
 _CR_INLINE_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+
+# SECOND outside-diff layout, from 2026-09-14 (the first one is read above).
+# MEASURED over every CodeRabbit review body carrying the section on the 735 PRs
+# updated 2026-10-01 to 10-31: 49 bodies, the last 19 in the old layout (to
+# 2026-09-14) and 30 in this one, declaring 32 findings that the old reader saw
+# as zero declared and zero parsed, so nothing blocked and nothing warned (16 of
+# the 32 were Major). In this layout:
+#   * the section is a BOLD line, `**⚠️ Outside diff range comments (N)**`, at
+#     <details> depth 0 (30 of 30), usually inside a `> [!CAUTION]` quote;
+#   * each finding is its own <details> at depth 1 (32 of 32) whose <summary>
+#     reads `LEVEL · Title · <code>path:lines</code>`, where LEVEL has been
+#     `<em>🟠 Major</em>`, `<strong>🟡 Minor</strong>` and
+#     `<strong><picture>…</picture> Minor</strong>` in turn.
+# The summary is the one line all three spellings share, so it is what is read.
+_CR_BOLD_SECTION_RE = re.compile(
+    r"^\*\*[^*\n]{0,16}?(" + "|".join(re.escape(n) for n in _CR_SECTION_NAMES) + r") \((\d+)\)\*\*$"
+)
+_CR_BOLD_SECTION_DEPTH = 0
+_CR_BOLD_ENTRY_DEPTH = 1
+# One HTML tag, bounded so a run of `<` cannot make the strip quadratic.
+_CR_TAG_RE = re.compile(r"<[^<>\n]{0,400}>")
+_CR_LINES_RE = re.compile(r"\d+(?:-\d+)?")
+_CR_SUMMARY_LOCATION = " · <code>"
+# The finding's own location line, `` `src/pkg/mod.py:120-124` ``. MEASURED: 28 of the
+# 32 summaries name only the file's BASENAME (`mod.py:120-124`) and every one of
+# those 28 carries this line with the full path; the other 4 name the full path
+# in the summary. The full path is the finding's identity: it is compared with
+# the PR's files, and a basename matches none, which would route even a Critical
+# to the non-scoring off-diff lane.
+_CR_LOCATION_LINE_RE = re.compile(r"^`([^`\s]{1,400}):(\d+(?:-\d+)?)`$")
+_CR_LOCATION_LOOKAHEAD = 15
+
+
+def _cr_full_location(
+    lines: list[str], fence_mask: list[bool], depths: list[int], pos: int, path: str, span: str
+) -> str:
+    """The full path for a summary that may name only a basename (see above).
+
+    Looks ahead inside the SAME finding (depth at or below the entry's, up to the
+    next summary) for its location line, and takes it only when the line range
+    matches and the full path ends with the summary's path at a ``/`` boundary.
+    Anything else keeps the summary's own path.
+    """
+    for nxt in range(pos + 1, min(pos + 1 + _CR_LOCATION_LOOKAHEAD, len(lines))):
+        if fence_mask[nxt]:
+            continue
+        if depths[nxt] < _CR_BOLD_ENTRY_DEPTH:
+            break  # left the finding's <details>
+        text = lines[nxt].strip()
+        if text.startswith("<summary>"):
+            break
+        found = _CR_LOCATION_LINE_RE.match(text)
+        if found:
+            full = html.unescape(found.group(1))
+            if found.group(2) == span and (full == path or full.endswith("/" + path)):
+                return full
+            break
+    return path
+
+
+def _cr_summary_entry(line: str) -> tuple[str, str, str, str] | None:
+    """``(path, lines, severity, title)`` from one second-layout finding summary.
+
+    String operations only (the text is third-party): the location is the LAST
+    ``· <code>…</code>`` field, the level the last word of the FIRST field once its
+    tags (an icon included) are removed. A summary of another shape returns None;
+    the section's declared count is what notices a finding that was not read. An
+    unknown level is returned as ``""``, the caller's unknown-severity canary.
+    """
+    if not line.startswith("<summary>"):
+        return None
+    end = line.find("</summary>")
+    if end < 0:
+        return None
+    inner = line[len("<summary>"):end]
+    if not inner.endswith("</code>"):
+        return None
+    at = inner.rfind(_CR_SUMMARY_LOCATION)
+    if at < 0:
+        return None
+    head = inner[:at]
+    split = head.find(" · ")
+    if split < 0:
+        return None
+    path, sep, lines = html.unescape(inner[at + len(_CR_SUMMARY_LOCATION):-len("</code>")]).rpartition(":")
+    if not sep or not path.strip() or not _CR_LINES_RE.fullmatch(lines):
+        return None
+    words = _CR_TAG_RE.sub(" ", head[:split]).split()
+    severity = words[-1].casefold() if words and words[-1].casefold() in _CR_SEVERITIES else ""
+    # Unescaped for reading, then defanged: an entity can spell a carriage return
+    # or a bidi override, and this title is printed to the operator's terminal.
+    title = _defang_gate_text(html.unescape(_CR_TAG_RE.sub("", head[split + 3:]))).strip()[:120]
+    return path.strip(), lines, severity, title
+
 # Severity ORDER, for merging one finding restated across several reviews.
 # A dedupe that assigns (`seen[key] = severity`) is last-write-wins, and reviews
 # arrive oldest-first — so a Critical restated later as Minor, or restated with
