@@ -2803,10 +2803,10 @@ def _cr_outside_diff_entries(
             continue
         stripped = line.strip()
         bold = _CR_BOLD_SECTION_RE.match(stripped)
-        if bold and in_bold_section and depths[pos] >= _CR_BOLD_ENTRY_DEPTH:
-            # Inside a finding this is the finding's PROSE quoting a section
-            # line, not structure: neither a new section nor drift (the old
-            # layout's `structural` check holds the same line for its summaries).
+        if bold and (in_bold_section or in_section) and depths[pos] >= _CR_BOLD_ENTRY_DEPTH:
+            # Inside a finding of EITHER layout this is the finding's PROSE quoting
+            # a section line, not structure: neither a new section nor drift (the
+            # first layout's `structural` check holds the same line for its summaries).
             bold = None
         if bold:
             if depths[pos] != _CR_BOLD_SECTION_DEPTH:
@@ -2821,7 +2821,12 @@ def _cr_outside_diff_entries(
             in_section = False
             current_file = None
             if in_bold_section:
-                declared += int(bold.group(2))
+                if bold.group(2) is not None:
+                    declared += int(bold.group(2))
+                else:
+                    # Read the findings anyway; only the count is unknown, as for a
+                    # first-layout header without one (no surplus check then).
+                    declared_known = False
             continue
         if in_bold_section:
             if stripped == "---" and depths[pos] == _CR_BOLD_SECTION_DEPTH:
@@ -2946,7 +2951,10 @@ _CR_INLINE_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
 #     `<strong><picture>…</picture> Minor</strong>` in turn.
 # The summary is the one line all three spellings share, so it is what is read.
 _CR_BOLD_SECTION_RE = re.compile(
-    r"^\*\*[^*\n]{0,16}?(" + "|".join(re.escape(n) for n in _CR_SECTION_NAMES) + r") \((\d+)\)\*\*$"
+    # The count is optional and the prefix (an icon, today `⚠️ `) generous: the count
+    # is what the reconciliation reads, so a header that drops it, or a longer icon,
+    # must still OPEN the section rather than read as zero declared, zero parsed.
+    r"^\*\*[^*\n]{0,40}?(" + "|".join(re.escape(n) for n in _CR_SECTION_NAMES) + r")(?: \((\d+)\))?\*\*$"
 )
 _CR_BOLD_SECTION_DEPTH = 0
 _CR_BOLD_ENTRY_DEPTH = 1
@@ -2980,7 +2988,7 @@ def _cr_full_location(
         if depths[nxt] < _CR_BOLD_ENTRY_DEPTH:
             break  # left the finding's <details>
         text = lines[nxt].strip()
-        if text.startswith("<summary>"):
+        if text.startswith(("<summary>", "<details")):
             break
         found = _CR_LOCATION_LINE_RE.match(text)
         if found:
@@ -3019,7 +3027,14 @@ def _cr_summary_entry(line: str) -> tuple[str, str, str, str] | None:
     if not sep or not path.strip() or not _CR_LINES_RE.fullmatch(lines):
         return None
     words = _CR_TAG_RE.sub(" ", head[:split]).split()
-    severity = words[-1].casefold() if words and words[-1].casefold() in _CR_SEVERITIES else ""
+    # The level field is the level word, after at most an emoji (`🟠 Major`) or an
+    # icon that the tag strip removed. A longer first field is not a level field,
+    # whatever its last word: unknown (the canary), never a guessed level.
+    severity = (
+        words[-1].casefold()
+        if 0 < len(words) <= 2 and words[-1].casefold() in _CR_SEVERITIES
+        else ""
+    )
     # Unescaped for reading, then defanged: an entity can spell a carriage return
     # or a bidi override, and this title is printed to the operator's terminal.
     title = _defang_gate_text(html.unescape(_CR_TAG_RE.sub("", head[split + 3:]))).strip()[:120]
@@ -4142,7 +4157,14 @@ def _check_inline_review_findings(
         # carry ESC, CR or bidi straight into this label. Rendered at display
         # time because the raw value is still needed for the diff-scope match
         # carried alongside it in the tuples below.
-        label = f"{title or '(untitled)'} ({_safe_report_path(path)}:{line_range})"
+        # ONE safe line, made where it is printed: the title and span come from
+        # CodeRabbit's text in either layout, and an unescaped `&#10;` (second
+        # layout) or a raw escape code (first layout) would otherwise print a
+        # forged extra report line (CodeRabbit, PR #3827). The path part is
+        # already made safe by `_safe_report_path`.
+        label = _one_safe_line(
+            f"{title or '(untitled)'} ({_safe_report_path(path)}:{line_range})"
+        )
         if not severity:
             cr_unknown.append(label)
         elif severity == "critical":
@@ -16565,6 +16587,14 @@ _GATE_TEXT_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
 
 def _gate_text_unsafe(char: str) -> bool:
     return unicodedata.category(char) in _GATE_TEXT_UNSAFE_CATEGORIES
+
+
+def _one_safe_line(text: str) -> str:
+    """*text* as ONE report line: every terminal-acting character, line breaks
+    included, becomes a space (``_defang_gate_text`` keeps ``\n`` on purpose,
+    for multi-line messages), and the result is bounded with a stated omission.
+    """
+    return _bound_with_stated_omission("".join(" " if _gate_text_unsafe(ch) else ch for ch in text))
 
 
 def _defang_gate_text(text: str) -> str:

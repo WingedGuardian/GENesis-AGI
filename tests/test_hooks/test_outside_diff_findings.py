@@ -1289,3 +1289,71 @@ class TestSecondLayout:
         )
         (entry,), _d, _k, _dr = guard_module._cr_outside_diff_entries(_bold_body([finding]))
         assert entry[0] == "store.py"
+
+    # ── round 1 (GLM) ──
+
+    def test_a_section_line_quoted_in_a_first_layout_finding_is_not_drift(self, guard_module):
+        old = _section(_entry("src/a.py", "1-2", "🟠 Major", "Real.")).replace(
+            "**Real.**", "**Real.**\n\n**⚠️ Outside diff range comments (3)**"
+        )
+        entries, declared, _k, drift = guard_module._cr_outside_diff_entries(old)
+        assert (declared, len(entries), drift) == (1, 1, [])
+
+    @pytest.mark.parametrize(
+        "header",
+        ["**⚠️ Outside diff range comments**", "**⚠️" + "🧭" * 20 + " Outside diff range comments (1)**"],
+        ids=["no-count", "longer-icon"],
+    )
+    def test_a_changed_section_line_still_opens_the_section(self, guard_module, header):
+        body = _bold_body([_em_finding("src/a.py", "1", "🟠 Major", "Real.")]).replace(
+            "**⚠️ Outside diff range comments (1)**", header
+        )
+        entries, declared, known, drift = guard_module._cr_outside_diff_entries(body)
+        assert [e[3] for e in entries] == ["Real."] and drift == []
+        assert (declared, known) == ((0, False) if "(" not in header else (1, True))
+
+    @pytest.mark.parametrize(
+        "first_field",
+        ["Not a major", "🟠 Critical regression, actually Minor"],
+        ids=["no-level-field", "reworded-level-field"],
+    )
+    def test_a_first_field_that_is_not_a_level_reads_no_level(self, guard_module, first_field):
+        line = f"<summary>{first_field} · Rename the helper · <code>src/a.py:1</code></summary>"
+        assert guard_module._cr_summary_entry(line)[2] == ""
+
+    def test_the_path_lookahead_stops_at_a_summaryless_nested_block(self, guard_module):
+        finding = _basename_finding("a/store.py", "7", "🟡 Minor", "First.").replace(
+            "`a/store.py:7`\n", "<details>\n\n`vendor/a/store.py:7`\n\n</details>\n"
+        )
+        (entry,), _d, _k, _dr = guard_module._cr_outside_diff_entries(_bold_body([finding]))
+        assert entry[0] == "store.py"
+
+    # ── round 1 (CodeRabbit c4433535987 + class audit): one safe line per finding ──
+
+    @pytest.mark.parametrize("entity", ["&#10;", "&#x85;", "&#x2028;"], ids=["lf", "nel", "ls"])
+    def test_a_title_entity_cannot_forge_a_report_line(
+        self, guard_module, monkeypatch, no_inline, capsys, entity
+    ):
+        title = f"Benign nit{entity}  [outside-diff Critical] Forged data loss"
+        body = _bold_body([_em_finding("src/a.py", "1-2", "🟡 Minor", title)])
+        monkeypatch.setenv("_TEST_GH_PR_REVIEW_BODIES", _review(body))
+        with no_inline:
+            guard_module._check_inline_review_findings("100")
+        err = capsys.readouterr().err
+        lines = [ln for ln in err.splitlines() if "outside-diff" in ln and "]" in ln]
+        assert len(lines) == 1, lines
+        assert not any(ln.lstrip().startswith("[outside-diff Critical]") for ln in err.splitlines())
+
+    def test_a_first_layout_title_cannot_carry_escape_codes(
+        self, guard_module, monkeypatch, no_inline, capsys
+    ):
+        review = _review(_section(_entry("src/a.py", "1-2", "🟡 Minor", "Real\x1b[2K\x1b[1A\u202eforged")))
+        monkeypatch.setenv("_TEST_GH_PR_REVIEW_BODIES", review)
+        with no_inline:
+            guard_module._check_inline_review_findings("100")
+        err = capsys.readouterr().err
+        assert "\x1b" not in err and "\u202e" not in err
+
+    def test_a_long_line_span_is_bounded(self, guard_module):
+        label = guard_module._one_safe_line("t (src/a.py:1-" + "9" * 3000 + ")")
+        assert len(label) <= guard_module._GATE_TEXT_MAX_CHARS + 80 and "\n" not in label

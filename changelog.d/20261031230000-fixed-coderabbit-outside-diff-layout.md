@@ -3,5 +3,6 @@
   `Outside diff range comments (N)` section with one collapsible entry per
   finding, and the gate's reader only knew the earlier layout: it read zero
   declared and zero found, so these advisory findings were never shown (32 across
-  30 reviews in October, 18 of them Major). The gate now reads both layouts, and
-  a section whose entries it cannot read still reports the shortfall.
+  30 reviews in October, 18 of them Major). The gate now reads both layouts; a
+  section that states its count and has entries the gate cannot read still
+  reports the shortfall, and a section line without a count is still read.
