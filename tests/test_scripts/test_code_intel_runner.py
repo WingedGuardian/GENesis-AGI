@@ -1,392 +1,364 @@
-"""Tests for scripts/code_intel_runner.sh — the idle-gated marker consumer.
+"""The incomplete automatic protocol refuses before every automatic queue action.
 
-The runner is the ONLY thing that turns a queued index request into an actual
-index, and only when the box is idle. These tests drive it with a FAKE
-entrypoint (CODE_INTEL_ENTRYPOINT seam) that returns a chosen rc, and fake
-pressure readings (CODE_INTEL_FAKE_* seams), so no real indexing, load, or
-systemd is needed. They lock down the rc contract that keeps the host freeze
-safe and the index from being euthanized:
-
-  * idle gate defers when the box is busy (marker kept)
-  * rc 0  -> consume; rc 75 (frozen) / rc 3 (tool missing) -> keep, no penalty
-  * genuine failure -> attempts++ -> .failed at the cap
-  * escalated-full failure -> fall back to fast + back off, no penalty
+Positive provider dispatch belongs to the checked consumer. These transitional
+tests exercise actual refusal, unchanged idle predicates and explicit queue CLI
+replay; explicit replay is not an automatic-runner or native qualification.
 """
 
 from __future__ import annotations
 
+import fcntl
+import hashlib
 import importlib.util
+import json
 import os
 import shlex
+import shutil
 import sqlite3
 import stat
 import subprocess
+import time
 from contextlib import closing
 from pathlib import Path
 
 import pytest
 
-from tests.test_scripts.managed_code_intel_fixture import configured_sentinel, install_manager
-
-_REPO_ROOT = Path(__file__).resolve().parents[2]
-_RUNNER = _REPO_ROOT / "scripts" / "code_intel_runner.sh"
-_MARKER_PY = _REPO_ROOT / "scripts" / "lib" / "index_marker.py"
-
-_spec = importlib.util.spec_from_file_location("index_marker", _MARKER_PY)
+_ROOT = Path(__file__).resolve().parents[2]
+_RUNNER = _ROOT / "scripts/code_intel_runner.sh"
+_MARKER_PY = _ROOT / "scripts/lib/index_marker.py"
+_spec = importlib.util.spec_from_file_location("provider_runner_marker", _MARKER_PY)
 im = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(im)
 
-def _repo(tmp_path: Path) -> str:
-    """A primary checkout owned by the fixture, shared by settings and queue."""
-    main = tmp_path / "primary"
-    (main / ".git").mkdir(parents=True, exist_ok=True)
-    return str(main)
 
-
-def _fake_entrypoint(tmp_path: Path, rc: int) -> Path:
-    """A stand-in entrypoint: log argv (esp. the mode arg) and exit `rc`."""
-    p = tmp_path / "fake_entry.sh"
-    p.write_text(
-        "#!/usr/bin/env bash\n"
-        f'echo "ENTRY repo=$1 tools=$2 mode=$3" >> "{tmp_path}/entry.log"\n'
-        f"exit {rc}\n"
-    )
-    p.chmod(p.stat().st_mode | stat.S_IXUSR)
-    return p
-
-
-def _run_runner(
-    tmp_path: Path, entry_rc: int, *, load="0.1", iowait="0", claude_cpu="0", extra_env=None
-):
-    home = tmp_path / ".genesis"
-    private = tmp_path / "runner"
-    private.mkdir(exist_ok=True)
-    runner = private / "code_intel_runner.sh"
-    runner.write_text(_RUNNER.read_text())
-    if not (private / "lib").exists():
-        (private / "lib").symlink_to(_RUNNER.parent / "lib")
-    binary = private / "accepted-test-backend"
-    binary.touch()
-    install_manager(private / "codebase_managed.py", tmp_path, Path(_repo(tmp_path)), binary)
-    if extra_env and "CODEBASE_MEMORY_MCP_DISABLE_FILE" in extra_env:
-        configured_sentinel(tmp_path, extra_env["CODEBASE_MEMORY_MCP_DISABLE_FILE"])
-    env = {
-        "PATH": "/usr/bin:/bin",
-        "HOME": str(tmp_path),
-        "GENESIS_HOME": str(home),
-        "CODE_INTEL_ENTRYPOINT": str(_fake_entrypoint(tmp_path, entry_rc)),
-        "CODE_INTEL_FAKE_LOADAVG": load,
-        "CODE_INTEL_FAKE_IOWAIT": iowait,
-        "CODE_INTEL_FAKE_CLAUDE_CPU": claude_cpu,
-        **(extra_env or {}),
-    }
+def _cli(tmp_path, *args):
     return subprocess.run(
-        ["bash", str(runner)],
-        env=env,
+        ["python3", str(_MARKER_PY), *args],
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=20,
+        env={**os.environ, "GENESIS_HOME": str(tmp_path / ".genesis")},
     )
 
 
-def _seed_marker(tmp_path, tools="both", mode="fast"):
-    """Write a marker into the runner's GENESIS_HOME and return its hash."""
-    env = {**os.environ, "GENESIS_HOME": str(tmp_path / ".genesis")}
-    subprocess.run(
-        ["python3", str(_MARKER_PY), "write", "--repo", _repo(tmp_path), "--tools", tools, "--mode", mode],
-        env=env,
-        check=True,
+def _seed_marker(tmp_path, *, tools="both", mode="fast"):
+    repo = str(tmp_path / "primary")
+    result = _cli(tmp_path, "write", "--repo", repo, "--tools", tools, "--mode", mode)
+    assert result.returncode == 0, result.stderr
+    return im.marker_hash(repo)
+
+
+def _mdir(tmp_path):
+    return tmp_path / ".genesis/index-requests"
+
+
+def _inventory(tmp_path):
+    directory = _mdir(tmp_path)
+    return (
+        {
+            path.name: (
+                path.stat().st_ino,
+                path.stat().st_mtime_ns,
+                path.stat().st_mode,
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+            for path in directory.iterdir()
+            if path.is_file()
+        }
+        if directory.exists()
+        else {}
+    )
+
+
+def _run_runner(tmp_path, *, runner=_RUNNER, extra_env=None):
+    entry = tmp_path / "fake_entry.sh"
+    entry.write_text(
+        "#!/usr/bin/env bash\nprintf 'ENTRY\\n' >> "
+        + shlex.quote(str(tmp_path / "entry.log"))
+        + "\n"
+    )
+    return subprocess.run(
+        ["bash", str(runner)],
         capture_output=True,
+        text=True,
+        timeout=20,
+        env={
+            **os.environ,
+            "HOME": str(tmp_path),
+            "GENESIS_HOME": str(tmp_path / ".genesis"),
+            "CODE_INTEL_ENTRYPOINT": str(entry),
+            **(extra_env or {}),
+        },
     )
-    return im.marker_hash(_repo(tmp_path))
+
+
+def _runner_log(tmp_path):
+    path = tmp_path / ".genesis/code-intelligence-runner.log"
+    return path.read_text() if path.exists() else ""
 
 
 def test_unopenable_runner_lock_refuses_indexing(tmp_path):
     _seed_marker(tmp_path)
-    lock = tmp_path / ".genesis" / "locks" / "code-intel-runner.lock"
+    lock = tmp_path / ".genesis/locks/code-intel-runner.lock"
     lock.mkdir(parents=True)
-    result = _run_runner(tmp_path, 0)
-    assert result.returncode == 75
-    assert not (tmp_path / "entry.log").exists()
-    assert len(_markers(tmp_path)) == 1
+    before = _inventory(tmp_path)
+    result = _run_runner(tmp_path)
+    assert result.returncode == 75 and not (tmp_path / "entry.log").exists()
+    assert _inventory(tmp_path) == before
 
 
 def test_unavailable_lock_directory_does_not_use_an_alternate_lock(tmp_path):
     _seed_marker(tmp_path)
-    (tmp_path / ".genesis" / "locks").write_text("not a directory")
-    result = _run_runner(tmp_path, 0)
-    assert result.returncode == 75
-    assert not (tmp_path / "entry.log").exists()
-    assert len(_markers(tmp_path)) == 1
+    (tmp_path / ".genesis/locks").write_text("not a directory")
+    before = _inventory(tmp_path)
+    result = _run_runner(tmp_path)
+    assert result.returncode == 75 and not (tmp_path / "entry.log").exists()
+    assert _inventory(tmp_path) == before
 
 
-def _markers(tmp_path):
-    env = {**os.environ, "GENESIS_HOME": str(tmp_path / ".genesis")}
-    out = subprocess.run(
-        ["python3", str(_MARKER_PY), "list"],
-        env=env,
-        capture_output=True,
-        text=True,
-    ).stdout
-    return [ln for ln in out.splitlines() if ln.strip()]
-
-
-def _mdir(tmp_path) -> Path:
-    return tmp_path / ".genesis" / "index-requests"
-
-
-def _db(tmp_path):
-    return sqlite3.connect(_mdir(tmp_path) / "queue.sqlite3")
-
-
-# ── idle gate ──────────────────────────────────────────────────────────────
-
-
-def test_busy_box_defers_no_index(tmp_path):
+def test_busy_canonical_runner_lock_does_not_read_or_change_queue(tmp_path):
     _seed_marker(tmp_path)
-    res = _run_runner(tmp_path, entry_rc=0, load="9.0")
-    assert res.returncode == 0
-    assert not (tmp_path / "entry.log").exists()  # entrypoint never invoked
-    assert len(_markers(tmp_path)) == 1  # marker kept
+    locks = tmp_path / ".genesis/locks"
+    locks.mkdir()
+    before = _inventory(tmp_path)
+    with (locks / "code-intel-runner.lock").open("a") as owner:
+        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = _run_runner(tmp_path)
+    assert result.returncode == 0 and not (tmp_path / "entry.log").exists()
+    assert _inventory(tmp_path) == before
+    assert "another runner tick" in (tmp_path / ".genesis/code-intelligence-runner.log").read_text()
 
 
-def test_high_iowait_defers(tmp_path):
-    _seed_marker(tmp_path)
-    _run_runner(tmp_path, entry_rc=0, iowait="80")
-    assert not (tmp_path / "entry.log").exists()
-    assert len(_markers(tmp_path)) == 1
+@pytest.mark.parametrize(
+    "schema,expected", [(None, 0), (0, 76), (1, 0), (2, 0), (3, 0), (4, 76)]
+)
+def test_actual_readiness_refuses_without_initializing_or_migrating(tmp_path, schema, expected):
+    if schema is not None:
+        _mdir(tmp_path).mkdir(parents=True)
+        with closing(
+            sqlite3.connect(_mdir(tmp_path) / "queue.sqlite3", isolation_level=None)
+        ) as db:
+            db.executescript(im._SCHEMA)
+            db.execute(f"PRAGMA user_version={schema}")
+            if schema == 3:
+                db.execute("INSERT INTO queue_meta VALUES('automatic_protocol_ready','0')")
+    before = _inventory(tmp_path)
+    result = _run_runner(tmp_path)
+    assert result.returncode == expected and not (tmp_path / "entry.log").exists(), result.stderr
+    if expected == 0:
+        # Exit 0 must come from the readiness refusal, not a busy lock or empty tick.
+        assert "automatic queue protocol incomplete" in _runner_log(tmp_path)
+    assert _inventory(tmp_path) == before
+    if schema is None:
+        assert not _mdir(tmp_path).exists()
 
 
-def test_busy_cc_session_defers(tmp_path):
-    _seed_marker(tmp_path)
-    _run_runner(tmp_path, entry_rc=0, claude_cpu="95")
-    assert not (tmp_path / "entry.log").exists()
-    assert len(_markers(tmp_path)) == 1
-
-
-def test_starved_marker_runs_under_relaxed_gate(tmp_path):
+@pytest.mark.parametrize("state", ["flag-enabled", "flag-missing", "corrupt", "busy"])
+def test_readiness_observation_errors_stop_before_queue_actions(tmp_path, state):
     h = _seed_marker(tmp_path)
-    # Backdate requested_at so age > relax window; a moderate load then passes.
-    with _db(tmp_path) as db:
-        db.execute("UPDATE pending SET requested_at=0 WHERE hash=?", (h,))
-    _run_runner(
-        tmp_path,
-        entry_rc=0,
-        load="3.0",  # >2 strict, <6 relaxed
-        extra_env={"CODE_INTEL_RUNNER_RELAX_AFTER_S": "1"},
-    )
-    assert (tmp_path / "entry.log").exists()  # relaxed gate let it run
-    assert _markers(tmp_path) == []  # consumed
-
-
-# ── rc contract ────────────────────────────────────────────────────────────
-
-
-def test_rc0_consumes_marker(tmp_path):
-    _seed_marker(tmp_path)
-    _run_runner(tmp_path, entry_rc=0)
-    assert _markers(tmp_path) == []
-
-
-def test_rc75_frozen_keeps_marker(tmp_path):
-    _seed_marker(tmp_path)
-    _run_runner(tmp_path, entry_rc=75)
-    assert len(_markers(tmp_path)) == 1  # host-frozen: marker survives
-
-
-def test_rc3_tool_missing_keeps_marker_no_penalty(tmp_path):
-    h = _seed_marker(tmp_path)
-    _run_runner(tmp_path, entry_rc=3)
-    listed = _markers(tmp_path)
-    assert len(listed) == 1
-    assert listed[0].split("\t")[4] == "0"  # attempts NOT incremented
-    with _db(tmp_path) as db:
-        assert db.execute("SELECT 1 FROM failed WHERE hash=?", (h,)).fetchone() is None
-
-
-def test_genuine_failure_increments_attempts(tmp_path):
-    h = _seed_marker(tmp_path, mode="fast")
-    # Suppress escalation so rc1 is treated as a genuine fast-run failure.
-    subprocess.run(
-        ["python3", str(_MARKER_PY), "stamp-full", "--hash", h],
-        env={**os.environ, "GENESIS_HOME": str(tmp_path / ".genesis")},
-        check=True,
-        capture_output=True,
-    )
-    _run_runner(tmp_path, entry_rc=1)
-    listed = _markers(tmp_path)
-    assert len(listed) == 1
-    assert listed[0].split("\t")[4] == "1"  # attempts incremented
-
-
-def test_repeated_failures_euthanize(tmp_path):
-    h = _seed_marker(tmp_path, mode="fast")
-    env_home = {**os.environ, "GENESIS_HOME": str(tmp_path / ".genesis")}
-    subprocess.run(
-        ["python3", str(_MARKER_PY), "stamp-full", "--hash", h],
-        env=env_home,
-        check=True,
-        capture_output=True,
-    )
-    for _ in range(im.MAX_ATTEMPTS):
-        _run_runner(tmp_path, entry_rc=1)
-    assert _markers(tmp_path) == []
-    with _db(tmp_path) as db:
-        assert (
-            db.execute("SELECT attempts FROM failed WHERE hash=?", (h,)).fetchone()[0]
-            == im.MAX_ATTEMPTS
+    database = _mdir(tmp_path) / "queue.sqlite3"
+    with closing(sqlite3.connect(database, isolation_level=None)) as db:
+        if state == "flag-enabled":
+            # Only the observational schema3 fixture has this protocol field;
+            # this predecessor's explicit writer still creates schema2.
+            db.execute("PRAGMA user_version=3")
+            db.execute("INSERT INTO queue_meta VALUES('automatic_protocol_ready','1')")
+        elif state == "flag-missing":
+            db.execute("PRAGMA user_version=3")
+            db.execute("DELETE FROM queue_meta WHERE key='automatic_protocol_ready'")
+        if state == "corrupt":
+            database.write_bytes(b"owned corrupt queue")
+        before = _inventory(tmp_path)
+        if state == "busy":
+            # Read/hash before locking: closing any same-process descriptor on
+            # this inode would release SQLite's POSIX locks, invalidating the probe.
+            db.execute("BEGIN EXCLUSIVE")
+            refused = _cli(tmp_path, "automatic-ready")
+            assert refused.returncode == 2 and "locked" in refused.stderr, refused.stderr
+        result = _run_runner(tmp_path)
+        log = (tmp_path / ".genesis/code-intelligence-runner.log").read_text()
+        assert result.returncode == 76 and not (tmp_path / "entry.log").exists(), (
+            log + result.stderr
         )
-
-
-def test_rc4_consumes_cbm_and_requeues_gitnexus_leg(tmp_path):
-    """cbm done + gitnexus leg incomplete: the combined marker must not be
-    discarded whole — cbm's work is consumed AND a gitnexus-only marker is
-    requeued, so the skipped/failed leg survives a cleared condition."""
-    _seed_marker(tmp_path, tools="both", mode="fast")
-    _run_runner(tmp_path, entry_rc=4)
-    listed = _markers(tmp_path)
-    assert len(listed) == 1
-    assert listed[0].split("\t")[2] == "gitnexus"
-    assert listed[0].split("\t")[4] == "0"  # requeue is not a failure penalty
-
-
-def test_rc5_consumes_gitnexus_and_requeues_cbm_leg(tmp_path):
-    """gitnexus done + cbm leg skipped: consume gitnexus, requeue cbm-only —
-    and never stamp the shared full-success clock for cbm work that did not
-    run."""
-    h = _seed_marker(tmp_path, tools="both", mode="fast")
-    _run_runner(tmp_path, entry_rc=5)
-    listed = _markers(tmp_path)
-    assert len(listed) == 1
-    assert listed[0].split("\t")[2] == "cbm"
-    with _db(tmp_path) as db:
-        row = db.execute("SELECT last_full FROM repo_state WHERE hash=?", (h,)).fetchone()
-        assert row is None or row[0] is None  # cbm never ran — no full stamp
-
-
-# ── escalation ─────────────────────────────────────────────────────────────
-
-
-def test_escalates_fast_marker_to_full_when_due(tmp_path):
-    _seed_marker(tmp_path, mode="fast")  # no .last-full → due
-    _run_runner(tmp_path, entry_rc=0)
-    assert "mode=full" in (tmp_path / "entry.log").read_text()
-
-
-def test_escalation_query_error_restores_marker_and_stops_tick(tmp_path):
-    """A real helper exception must not be interpreted as "full not due"."""
-    h = _seed_marker(tmp_path, mode="fast")
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    python_wrapper = bin_dir / "python3"
-    python_wrapper.write_text(
-        "#!/usr/bin/env bash\n"
-        "if [ \"${2:-}\" = should-escalate ]; then\n"
-        "  /usr/bin/python3 -c 'import os,sqlite3,subprocess,sys; "
-        "db=sqlite3.connect(sys.argv[1],isolation_level=None); db.execute(\"BEGIN EXCLUSIVE\"); "
-        "result=subprocess.run([\"/usr/bin/python3\",*sys.argv[2:]],env=os.environ); "
-        "db.rollback(); db.close(); raise SystemExit(result.returncode)' "
-        "\"$GENESIS_HOME/index-requests/queue.sqlite3\" \"$@\"\n"
-        "  exit $?\n"
-        "fi\n"
-        "exec /usr/bin/python3 \"$@\"\n"
-    )
-    python_wrapper.chmod(python_wrapper.stat().st_mode | stat.S_IXUSR)
-
-    result = _run_runner(
-        tmp_path,
-        entry_rc=0,
-        extra_env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+    assert _inventory(tmp_path) == before
+    assert (
+        h
+        and "protocol observation failed"
+        in (tmp_path / ".genesis/code-intelligence-runner.log").read_text()
     )
 
-    assert result.returncode == 76
-    assert not (tmp_path / "entry.log").exists()
-    rows = _markers(tmp_path)
-    assert len(rows) == 1
-    assert rows[0].split("\t")[0] == h
+
+def test_missing_marker_helper_is_explicit_deferral(tmp_path):
+    private = tmp_path / "runner"
+    private.mkdir()
+    runner = private / "code_intel_runner.sh"
+    runner.write_text(_RUNNER.read_text())
+    (private / "lib").mkdir()
+    (private / "lib/proc_pressure.sh").symlink_to(_RUNNER.parent / "lib/proc_pressure.sh")
+    result = _run_runner(tmp_path, runner=runner)
+    assert result.returncode == 75 and not _mdir(tmp_path).exists()
+    assert "helper missing" in (tmp_path / ".genesis/code-intelligence-runner.log").read_text()
 
 
-def test_escalated_full_failure_falls_back_no_penalty(tmp_path):
-    h = _seed_marker(tmp_path, mode="fast")  # escalates to full, then fails
-    _run_runner(tmp_path, entry_rc=1)
-    listed = _markers(tmp_path)
-    assert len(listed) == 1
-    # marker stays fast, attempts NOT burned, and full is backed off
-    assert listed[0].split("\t")[3] == "fast"
-    assert listed[0].split("\t")[4] == "0"
-    with _db(tmp_path) as db:
-        assert db.execute("SELECT full_backoff FROM repo_state WHERE hash=?", (h,)).fetchone()[0]
+def test_cli_exceptions_cannot_look_like_empty_claims(tmp_path):
+    _seed_marker(tmp_path, tools="cbm")
+    empty = _cli(tmp_path, "claim", "--hash", "0" * 16)
+    assert empty.returncode == 1 and not empty.stdout
+    (_mdir(tmp_path) / "queue.sqlite3").write_bytes(b"owned corrupt queue")
+    failed = _cli(tmp_path, "list")
+    assert failed.returncode == 2 and not failed.stdout
+    assert "Traceback" in failed.stderr and "DatabaseError" in failed.stderr
 
 
-def test_gitnexus_only_marker_does_not_escalate_or_stamp(tmp_path):
-    # "full" is cbm-only; a gitnexus-only marker (from the surplus job) must NOT
-    # escalate or stamp .last-full, or it would falsely satisfy cbm's weekly gate.
-    h = _seed_marker(tmp_path, tools="gitnexus", mode="fast")  # due (no .last-full)
-    _run_runner(tmp_path, entry_rc=0)
-    assert "mode=fast" in (tmp_path / "entry.log").read_text()  # NOT escalated
-    with _db(tmp_path) as db:
-        row = db.execute("SELECT last_full FROM repo_state WHERE hash=?", (h,)).fetchone()
-        assert row is None or row[0] is None  # NOT stamped
+@pytest.mark.parametrize("tools", ["cbm", "gitnexus", "both"])
+@pytest.mark.parametrize("state", ["pending", "claimed", "remembered"])
+def test_protocol_fence_preserves_each_durable_queue_state(tmp_path, tools, state):
+    h = _seed_marker(tmp_path, tools=tools)
+    if state != "pending":
+        claim = _cli(tmp_path, "claim", "--hash", h)
+        assert claim.returncode == 0, claim.stderr
+        nonce = claim.stdout.rstrip("\n").split("\t")[4]
+        if state == "remembered":
+            result = _cli(
+                tmp_path,
+                "remember-outcome",
+                "--hash",
+                h,
+                "--claim-id",
+                nonce,
+                "--action",
+                "consume",
+            )
+            assert result.returncode == 0, result.stderr
+    before = _inventory(tmp_path)
+    for _ in range(2):
+        result = _run_runner(tmp_path)
+        assert result.returncode == 0 and not (tmp_path / "entry.log").exists()
+        assert "automatic queue protocol incomplete" in _runner_log(tmp_path)
+        assert _inventory(tmp_path) == before
 
 
-def test_rc3_on_escalated_full_backs_off(tmp_path):
-    # A missing sibling tool (rc3) after an escalated full must back off full so
-    # it doesn't re-escalate a heavy cbm full every idle tick.
-    h = _seed_marker(tmp_path, tools="both", mode="fast")  # escalates to full
-    _run_runner(tmp_path, entry_rc=3)
-    listed = _markers(tmp_path)
-    assert len(listed) == 1
-    assert listed[0].split("\t")[4] == "0"  # no attempts penalty
-    with _db(tmp_path) as db:
-        assert db.execute("SELECT full_backoff FROM repo_state WHERE hash=?", (h,)).fetchone()[0]
-
-
-def test_runner_reconciles_orphaned_inflight(tmp_path):
-    # A marker stranded as .inflight by a dead prior run is re-pended at tick start.
-    h = _seed_marker(tmp_path, tools="both", mode="fast")
-    subprocess.run(
-        ["python3", str(_MARKER_PY), "claim", "--hash", h],
-        env={**os.environ, "GENESIS_HOME": str(tmp_path / ".genesis")},
-        check=True,
+@pytest.mark.parametrize(
+    "age,load,iowait,cpu,expected",
+    [
+        (0, "0.1", "0", "0", 0),
+        (0, "9", "0", "0", 1),
+        (0, "0", "80", "0", 1),
+        (0, "0", "0", "95", 1),
+        (86401, "3", "0", "95", 0),
+        (86401, "7", "0", "0", 1),
+    ],
+)
+def test_existing_idle_predicate_keeps_its_strict_and_relaxed_contract(
+    tmp_path, age, load, iowait, cpu, expected
+):
+    # Exercise the actual unchanged predicate, without its fenced caller.
+    prefix, separator, _ = _RUNNER.read_text().partition("# Runner self-lock:")
+    assert separator
+    script = tmp_path / "idle.sh"
+    script.write_text(prefix + '\n_idle_ok "$1"\n')
+    (tmp_path / "lib").symlink_to(_RUNNER.parent / "lib")
+    result = subprocess.run(
+        ["bash", str(script), str(age)],
         capture_output=True,
-    )
-    assert _markers(tmp_path) == []  # stranded as inflight
-    _run_runner(tmp_path, entry_rc=0, load="9.0")  # busy → defers running, but re-pends
-    assert len(_markers(tmp_path)) == 1
-
-
-def test_persisted_success_outcome_replays_without_reindex(tmp_path):
-    """A terminal result persisted before runner death must never run twice."""
-    h = _seed_marker(tmp_path, tools="gitnexus", mode="fast")
-    env = {**os.environ, "GENESIS_HOME": str(tmp_path / ".genesis")}
-    claimed = subprocess.run(
-        ["python3", str(_MARKER_PY), "claim", "--hash", h],
-        env=env,
-        check=True,
         text=True,
-        capture_output=True,
+        timeout=10,
+        env={
+            **os.environ,
+            "GENESIS_HOME": str(tmp_path / "owned-state"),
+            "CODE_INTEL_FAKE_LOADAVG": load,
+            "CODE_INTEL_FAKE_IOWAIT": iowait,
+            "CODE_INTEL_FAKE_CLAUDE_CPU": cpu,
+        },
     )
-    claim_id = claimed.stdout.strip().split("\t")[4]
-    subprocess.run(
-        [
-            "python3",
-            str(_MARKER_PY),
-            "remember-outcome",
-            "--hash",
-            h,
-            "--action",
-            "consume",
-            "--claim-id",
-            claim_id,
-        ],
-        env=env,
-        check=True,
-    )
+    assert result.returncode == expected, result.stderr
+    assert not _mdir(tmp_path).exists()
 
-    second = _run_runner(tmp_path, entry_rc=0)
-    assert second.returncode == 0
-    assert _markers(tmp_path) == []
-    assert not (tmp_path / "entry.log").exists()
+
+def test_explicit_cli_spools_busy_success_and_replays_without_reindex(tmp_path):
+    """The inherited schema2 CLI still durably completes explicit queue work."""
+    h = _seed_marker(tmp_path, tools="gitnexus")
+    claimed = _cli(tmp_path, "claim", "--hash", h)
+    assert claimed.returncode == 0, claimed.stderr
+    nonce = claimed.stdout.rstrip("\n").split("\t")[4]
+    database = _mdir(tmp_path) / "queue.sqlite3"
+    ready = tmp_path / "blocker.ready"
+    locker = tmp_path / "hold_queue.py"
+    release = tmp_path / "blocker.release"
+    # Hold the write lock until the test says so, not for a fixed time: a timed
+    # hold raced the 5 s outcome wait plus two interpreter starts under load.
+    locker.write_text(
+        "import os,sqlite3,sys,time\n"
+        "db=sqlite3.connect(sys.argv[1],isolation_level=None)\n"
+        "db.execute('BEGIN IMMEDIATE')\n"
+        "open(sys.argv[2],'w').close()\n"
+        f"release={str(release)!r}\n"
+        "deadline=time.monotonic()+60\n"
+        "while not os.path.exists(release) and time.monotonic()<deadline:\n"
+        "    time.sleep(0.05)\n"
+        "db.rollback()\ndb.close()\n"
+    )
+    entry = _contention_entrypoint(tmp_path, locker, database, ready)
+    locks = tmp_path / ".genesis/locks"
+    locks.mkdir()
+    lock = locks / "code-intel-runner.lock"
+    with lock.open("a") as owner, (tmp_path / "provider.stdout").open("w") as output:
+        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        provider = subprocess.run(
+            ["bash", str(entry)],
+            stdout=output,
+            stderr=output,
+            pass_fds=(owner.fileno(),),
+            timeout=10,
+        )
+        try:
+            assert provider.returncode == 0 and ready.exists(), _contention_diagnostics(tmp_path, ready)
+            remembered = _cli(
+                tmp_path, "remember-outcome", "--hash", h, "--claim-id", nonce, "--action", "consume"
+            )
+            assert remembered.returncode == 0, remembered.stderr
+            spools = list(_mdir(tmp_path).glob(f".outcome-spool-{h}-*.spool"))
+            assert len(spools) == 1
+            raw = spools[0].read_bytes()
+            assert json.loads(raw)["claim_id"] == nonce
+            assert _cli(tmp_path, "apply-outcome", "--hash", h).returncode == 2
+        finally:
+            release.touch()
+        _wait_for_write_lock(database)
+    released = subprocess.run(
+        ["flock", "-w", "10", str(lock), "true"], capture_output=True, text=True, timeout=12
+    )
+    assert released.returncode == 0
+    assert _cli(tmp_path, "reconcile-inflight").returncode == 0
+    assert _run_runner(tmp_path).returncode == 0
+    assert "automatic queue protocol incomplete" in _runner_log(tmp_path)
+    assert (tmp_path / "entry.log").read_text().count("ENTRY ") == 1
+    with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as db:
+        db.execute("PRAGMA query_only=ON")
+        remaining = {
+            table: db.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+            for table in ("pending", "inflight", "failed", "failed_outcomes")
+        }
+        receipt = db.execute("SELECT content_sha256,raw_payload FROM legacy_imports").fetchone()
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert remaining == dict(pending=0, inflight=0, failed=0, failed_outcomes=0)
+    assert receipt == (hashlib.sha256(raw).hexdigest(), None)
+    assert not spools[0].exists() and list(_mdir(tmp_path).glob(".outcome-spool-*")) == []
+
+
+def _wait_for_write_lock(database, timeout=30.0):
+    """Poll until the queue database accepts a write transaction again."""
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            with closing(sqlite3.connect(database, timeout=0, isolation_level=None)) as db:
+                db.execute("BEGIN IMMEDIATE")
+                db.execute("ROLLBACK")
+            return
+        except sqlite3.OperationalError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
 
 
 def _contention_entrypoint(tmp_path, locker, db_path, ready):
@@ -395,22 +367,22 @@ def _contention_entrypoint(tmp_path, locker, db_path, ready):
     entry.write_text(
         "#!/usr/bin/env bash\n"
         f'echo "ENTRY repo=$1 tools=$2 mode=$3" >> {shlex.quote(str(tmp_path / "entry.log"))}\n'
-        f'python3 {shlex.quote(str(locker))} {shlex.quote(str(db_path))} {shlex.quote(str(ready))} &\n'
-        'locker_pid=$!\n'
+        f"python3 {shlex.quote(str(locker))} {shlex.quote(str(db_path))} {shlex.quote(str(ready))} &\n"
+        "locker_pid=$!\n"
         f'printf "LOCKER pid=%s ready=%s\\n" "$locker_pid" {shlex.quote(str(ready))} >&2\n'
-        'deadline=$((SECONDS + 5))\n'
-        f'while [ ! -e {shlex.quote(str(ready))} ]; do\n'
+        "deadline=$((SECONDS + 5))\n"
+        f"while [ ! -e {shlex.quote(str(ready))} ]; do\n"
         '  if ! kill -0 "$locker_pid" 2>/dev/null; then\n'
         '    wait "$locker_pid"\n'
         '    printf "locker pid=%s exited rc=%s before ready\\n" "$locker_pid" "$?" >&2\n'
-        '    exit 76\n'
-        '  fi\n'
+        "    exit 76\n"
+        "  fi\n"
         '  if [ "$SECONDS" -ge "$deadline" ]; then\n'
         '    printf "locker pid=%s did not become ready within 5s\\n" "$locker_pid" >&2\n'
-        '    exit 76\n'
-        '  fi\n'
-        '  sleep 0.01\n'
-        'done\n'
+        "    exit 76\n"
+        "  fi\n"
+        "  sleep 0.01\n"
+        "done\n"
         "exit 0\n"
     )
     entry.chmod(entry.stat().st_mode | stat.S_IXUSR)
@@ -424,8 +396,11 @@ def _contention_diagnostics(tmp_path, ready):
     )
 
 
-@pytest.mark.parametrize("locker_source", ["raise SystemExit(23)\n", "import time; time.sleep(6)\n"],
-                         ids=["exits-before-ready", "never-ready"])
+@pytest.mark.parametrize(
+    "locker_source",
+    ["raise SystemExit(23)\n", "import time; time.sleep(6)\n"],
+    ids=["exits-before-ready", "never-ready"],
+)
 def test_contention_fixture_refuses_without_ready(tmp_path, locker_source):
     locker = tmp_path / "not_ready.py"
     locker.write_text(locker_source)
@@ -434,194 +409,97 @@ def test_contention_fixture_refuses_without_ready(tmp_path, locker_source):
     # broken unbounded loop a visible failure, rather than leaving an orphan.
     result = subprocess.run(
         ["timeout", "--kill-after=1", "8", "bash", str(entry)],
-        capture_output=True, text=True, start_new_session=True, timeout=12,
+        capture_output=True,
+        text=True,
+        start_new_session=True,
+        timeout=12,
     )
     assert result.returncode == 76, result.stderr
     assert "locker" in result.stderr and "ready" in result.stderr
 
 
-def test_runner_spools_busy_success_and_replays_without_reindex(tmp_path):
-    """Exercise the exact shell claim/outcome path across a real DB lock."""
-    h = _seed_marker(tmp_path, tools="gitnexus", mode="fast")
-    db_path = _mdir(tmp_path) / "queue.sqlite3"
-    ready = tmp_path / "blocker.ready"
-    locker = tmp_path / "hold_queue.py"
-    locker.write_text(
-        "import sqlite3,sys,time\n"
-        "db=sqlite3.connect(sys.argv[1],isolation_level=None)\n"
-        "db.execute('BEGIN IMMEDIATE')\n"
-        "open(sys.argv[2],'w').close()\n"
-        "time.sleep(7)\n"
-        "db.rollback()\n"
-        "db.close()\n"
+@pytest.mark.parametrize("schema,state", [(None, "absent"), (2, "legacy-schema")])
+def test_automatic_ready_reports_dedicated_incomplete_status(tmp_path, schema, state):
+    if schema is not None:
+        _seed_marker(tmp_path)
+    before = _inventory(tmp_path)
+    result = _cli(tmp_path, "automatic-ready")
+    # 10, not 1: an interpreter crash also exits 1 and must never read as a pause.
+    assert result.returncode == im.AUTOMATIC_PROTOCOL_INCOMPLETE == 10, result.stderr
+    assert json.loads(result.stdout)["state"] == state
+    assert _inventory(tmp_path) == before
+
+
+@pytest.mark.parametrize("fault", ["syntax-error", "missing-helper-module"])
+def test_crashed_readiness_helper_is_a_failure_not_a_pause(tmp_path, fault):
+    _seed_marker(tmp_path)
+    copy = tmp_path / "copy/scripts"
+    shutil.copytree(_RUNNER.parent / "lib", copy / "lib")
+    shutil.copy2(_RUNNER, copy / "code_intel_runner.sh")
+    legacy = copy / "lib/index_marker_legacy.py"
+    if fault == "syntax-error":
+        legacy.write_text("def broken(:\n")
+    else:
+        legacy.unlink()
+    crashed = subprocess.run(
+        ["python3", str(copy / "lib/index_marker.py"), "automatic-ready"],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        env={**os.environ, "GENESIS_HOME": str(tmp_path / ".genesis")},
     )
-    entry = _contention_entrypoint(tmp_path, locker, db_path, ready)
-    env = {
-        "PATH": "/usr/bin:/bin",
-        "HOME": str(tmp_path),
-        "GENESIS_HOME": str(tmp_path / ".genesis"),
-        "CODE_INTEL_ENTRYPOINT": str(entry),
-        "CODE_INTEL_FAKE_LOADAVG": "0.1",
-        "CODE_INTEL_FAKE_IOWAIT": "0",
-        "CODE_INTEL_FAKE_CLAUDE_CPU": "0",
-    }
-
-    try:
-        first = subprocess.run(
-            ["bash", str(_RUNNER)], env=env, capture_output=True, text=True, timeout=20,
-        )
-        assert first.returncode == 76, _contention_diagnostics(tmp_path, ready)
-        spools = list(_mdir(tmp_path).glob(f".outcome-spool-{h}-*.spool"))
-        assert len(spools) == 1
-        with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as db:
-            db.execute("PRAGMA query_only=ON")
-            claim = db.execute("SELECT claim_id,repo_path FROM inflight WHERE hash=?", (h,)).fetchone()
-        assert claim is not None and claim[1] == str(tmp_path / "primary")
-        assert spools[0].name.startswith(f".outcome-spool-{h}-{claim[0]}-")
-        assert (tmp_path / "entry.log").read_text().count("ENTRY ") == 1
-
-        # The locker inherits runner fd8. Wait for its ordinary exit, not a flag
-        # written before it releases that descriptor; a lock-busy tick returns 0.
-        lock = tmp_path / ".genesis" / "locks" / "code-intel-runner.lock"
-        released = subprocess.run(
-            ["flock", "-w", "10", str(lock), "true"],
-            capture_output=True, text=True, timeout=12,
-        )
-        assert released.returncode == 0, _contention_diagnostics(tmp_path, ready)
-        second = _run_runner(tmp_path, entry_rc=0)
-        assert second.returncode == 0, _contention_diagnostics(tmp_path, ready)
-        assert _markers(tmp_path) == []
-        assert (tmp_path / "entry.log").read_text().count("ENTRY ") == 1
-        with closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True)) as db:
-            db.execute("PRAGMA query_only=ON")
-            remaining = {
-                table: db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-                for table in ("pending", "inflight", "failed", "failed_outcomes")
-            }
-        assert remaining == {"pending": 0, "inflight": 0, "failed": 0, "failed_outcomes": 0}
-        assert list(_mdir(tmp_path).glob(".outcome-spool-*")) == []
-    except subprocess.TimeoutExpired as error:
-        error.add_note(_contention_diagnostics(tmp_path, ready))
-        raise
+    # Guard the guard: the injected fault must make the helper exit 1, the
+    # status that used to be read as "incomplete".
+    assert crashed.returncode == 1, crashed.stderr
+    before = _inventory(tmp_path)
+    result = _run_runner(tmp_path, runner=copy / "code_intel_runner.sh")
+    assert result.returncode == 76 and not (tmp_path / "entry.log").exists(), result.stderr
+    log = _runner_log(tmp_path)
+    assert "protocol observation failed" in log and "protocol incomplete" not in log
+    assert _inventory(tmp_path) == before
 
 
-def test_uses_claimed_state_not_stale_list_snapshot(tmp_path):
-    """P2: a commit that coalesces the marker during the idle-sampling window
-    must be honored — the run uses the CLAIMED state, not the list snapshot.
-
-    Seed a gitnexus-only marker, then race a `both`/`full` coalesce into the
-    runner's ~1s real-iowait sampling window; the entrypoint must be invoked
-    with tools=both (the coalesced request), not the stale tools=gitnexus.
-    """
-    import threading
-    import time
-
-    home = tmp_path / ".genesis"
-    _seed_marker(tmp_path, tools="gitnexus", mode="fast")
-
-    def _coalesce():
-        time.sleep(0.4)  # well inside the runner's 1s iowait sample
-        subprocess.run(
-            [
-                "python3",
-                str(_MARKER_PY),
-                "write",
-                "--repo",
-                _repo(tmp_path),
-                "--tools",
-                "cbm",
-                "--mode",
-                "full",
-            ],  # gitnexus ∪ cbm = both; full
-            env={**os.environ, "GENESIS_HOME": str(home)},
-            check=True,
-            capture_output=True,
-        )
-
-    t = threading.Thread(target=_coalesce)
-    env = {
-        "PATH": "/usr/bin:/bin",
-        "HOME": str(tmp_path),
-        "GENESIS_HOME": str(home),
-        "CODE_INTEL_ENTRYPOINT": str(_fake_entrypoint(tmp_path, 0)),
-        "CODE_INTEL_FAKE_LOADAVG": "0",
-        "CODE_INTEL_FAKE_CLAUDE_CPU": "0",
-        # NOT faking iowait → real ~1s /proc/stat sampling = the race window;
-        # a high threshold so real iowait never trips the gate.
-        "CODE_INTEL_RUNNER_IDLE_IOWAIT": "100",
-    }
-    t.start()
-    subprocess.run(["bash", str(_RUNNER)], env=env, capture_output=True, text=True, timeout=60)
-    t.join()
-    log = (tmp_path / "entry.log").read_text()
-    assert "tools=both" in log, f"ran with stale list state, not claimed: {log}"
-    assert "mode=full" in log  # coalesced to full and escalation isn't needed
+def test_import_status_keeps_schema2_contract_on_schema3_queue(tmp_path):
+    _mdir(tmp_path).mkdir(parents=True)
+    with closing(sqlite3.connect(_mdir(tmp_path) / "queue.sqlite3", isolation_level=None)) as db:
+        db.executescript(im._SCHEMA)
+        db.execute("PRAGMA user_version=3")
+        db.execute("INSERT INTO queue_meta VALUES('automatic_protocol_ready','0')")
+    before = _inventory(tmp_path)
+    listed = _cli(tmp_path, "import-status")
+    assert listed.returncode == 2 and "unsupported queue schema 3" in listed.stdout, listed.stdout
+    observed = _cli(tmp_path, "automatic-ready")
+    assert observed.returncode == 10, observed.stderr
+    assert json.loads(observed.stdout)["state"] == "protocol-incomplete"
+    assert _inventory(tmp_path) == before
 
 
-def test_no_markers_is_quiet_noop(tmp_path):
-    res = _run_runner(tmp_path, entry_rc=0)
-    assert res.returncode == 0
-    assert not (tmp_path / "entry.log").exists()
+def test_ready_status_without_a_ready_protocol_stops_the_tick(tmp_path):
+    # This protocol has no ready state; a helper reporting 0 is an anomaly and
+    # must never open the gate to reconcile, claim or launch.
+    _seed_marker(tmp_path)
+    copy = tmp_path / "copy/scripts"
+    shutil.copytree(_RUNNER.parent / "lib", copy / "lib")
+    shutil.copy2(_RUNNER, copy / "code_intel_runner.sh")
+    calls = tmp_path / "helper.calls"
+    (copy / "lib/index_marker.py").write_text(
+        "import sys\n"
+        f"open({str(calls)!r}, 'a').write(sys.argv[1] + '\\n')\n"
+        "sys.exit(0)\n"
+    )
+    before = _inventory(tmp_path)
+    result = _run_runner(tmp_path, runner=copy / "code_intel_runner.sh")
+    assert result.returncode == 76 and not (tmp_path / "entry.log").exists(), result.stderr
+    assert "has no ready state" in _runner_log(tmp_path)
+    assert calls.read_text().split() == ["automatic-ready"]  # no reconcile, list or claim
+    assert _inventory(tmp_path) == before
 
 
-# Disabled providers remain durable work, but do not churn the queue.
-def test_disabled_cbm_repeated_ticks_preserve_generation(tmp_path):
-    h = _seed_marker(tmp_path, tools="cbm")
-    (tmp_path / ".genesis" / "codebase-memory-mcp.disabled").touch()
-    with _db(tmp_path) as db:
-        db.execute("UPDATE pending SET attempts=3 WHERE hash=?", (h,))
-        before = db.execute("SELECT * FROM pending").fetchall()
-        state = db.execute("SELECT * FROM repo_state").fetchall()
-    for _ in range(2):
-        assert _run_runner(tmp_path, 0).returncode == 0
-    assert not (tmp_path / "entry.log").exists()
-    with _db(tmp_path) as db:
-        assert db.execute("SELECT * FROM pending").fetchall() == before
-        assert db.execute("SELECT * FROM repo_state").fetchall() == state
-        assert db.execute("SELECT * FROM inflight").fetchall() == []
-
-
-def test_disabled_combined_runs_once_then_defers_cbm(tmp_path):
-    _seed_marker(tmp_path, tools="both")
-    (tmp_path / ".genesis" / "codebase-memory-mcp.disabled").touch()
-    assert _run_runner(tmp_path, 5).returncode == 0
-    before = (tmp_path / "entry.log").read_text()
-    assert "tools=both" in before
-    assert "\tcbm\t" in _markers(tmp_path)[0]
-    assert _run_runner(tmp_path, 0).returncode == 0
-    assert (tmp_path / "entry.log").read_text() == before
-
-
-def test_disabled_cbm_override_paths_and_gitnexus_are_independent(tmp_path):
-    _seed_marker(tmp_path, tools="cbm")
-    sentinel = tmp_path / "disabled"
-    sentinel.touch()
-    for path in [str(sentinel), "~/disabled", "relative/disabled"]:
-        assert _run_runner(tmp_path, 0, extra_env={"CODEBASE_MEMORY_MCP_DISABLE_FILE": path}).returncode == 0
-        assert not (tmp_path / "entry.log").exists()
-    # Coalescing GitNexus into deferred CBM must allow both on the next tick.
-    _seed_marker(tmp_path, tools="gitnexus")
-    assert _run_runner(tmp_path, 5, extra_env={"CODEBASE_MEMORY_MCP_DISABLE_FILE": str(sentinel)}).returncode == 0
-    assert "tools=both" in (tmp_path / "entry.log").read_text()
-
-
-def test_cbm_disabled_during_idle_sample_restores_claim(tmp_path):
-    # Deterministic pressure seam: the idle sampler arms the sentinel after
-    # the snapshot check but before the authoritative claim check.
-    _seed_marker(tmp_path, tools="cbm")
-    fakebin = tmp_path / "bin"
-    fakebin.mkdir()
-    ps = fakebin / "ps"
-    ps.write_text('#!/bin/sh\ntouch "$HOME/.genesis/codebase-memory-mcp.disabled"\n')
-    ps.chmod(0o755)
-    env = {"PATH": f"{fakebin}:/usr/bin:/bin", "CODE_INTEL_FAKE_CLAUDE_CPU": ""}
-    with _db(tmp_path) as db:
-        before = db.execute("SELECT * FROM pending").fetchall()
-    assert _run_runner(tmp_path, 0, extra_env=env).returncode == 0
-    # Prove the idle sampler was reached: initial availability deferral must
-    # not satisfy this regression merely by leaving the queue unchanged.
-    assert (tmp_path / ".genesis/codebase-memory-mcp.disabled").exists()
-    assert not (tmp_path / "entry.log").exists()
-    with _db(tmp_path) as db:
-        assert db.execute("SELECT * FROM pending").fetchall() == before
-        assert db.execute("SELECT * FROM inflight").fetchall() == []
+def test_unopenable_runner_log_is_a_failure_not_a_pause(tmp_path):
+    _seed_marker(tmp_path)
+    log = tmp_path / ".genesis/code-intelligence-runner.log"
+    log.mkdir(parents=True)  # the redirection into the log fails with status 1
+    before = _inventory(tmp_path)
+    result = _run_runner(tmp_path)
+    assert result.returncode == 76 and not (tmp_path / "entry.log").exists(), result.stderr
+    assert _inventory(tmp_path) == before
