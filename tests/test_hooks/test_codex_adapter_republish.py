@@ -146,13 +146,13 @@ def test_an_edit_outside_the_publishing_code_does_not_requalify(tmp_path):
     """The point of the narrowing: guard PRs that never touch the publishing arm
     no longer fail these tests or collide on the pin."""
     copy = _guard_with(tmp_path, lambda s: _insert_in_body(s, "check_pr_report") + "\n_NEW = 1\n")
-    assert bridge.publishing_guard_digest(copy) == bridge.PUBLISHING_GUARD_DIGEST
+    assert bridge.publishing_guard_digest(copy) == bridge.publishing_guard_digest(original._GUARD)
 
 
 @pytest.mark.parametrize("name", ["_push_is_dry_run", "_run_merge_and_push_gates", "main"])
 def test_an_edit_inside_the_publishing_code_requalifies(tmp_path, name):
     copy = _guard_with(tmp_path, lambda s: _insert_in_body(s, name))
-    assert bridge.publishing_guard_digest(copy) != bridge.PUBLISHING_GUARD_DIGEST
+    assert bridge.publishing_guard_digest(copy) != bridge.publishing_guard_digest(original._GUARD)
 
 
 def _a_constant_the_listed_code_reads():
@@ -190,7 +190,27 @@ _RELATED_EDITS = {
     "a constant another selected constant is built from": lambda s: s.replace(
         "mergePullRequest|", "mergePullRequestX|", 1
     ),
+    # Round 1 on #3788 (Codex, measured): the guard holds NEL, U+2028 and U+2029
+    # literally, and str.splitlines broke on them while AST line numbers do not,
+    # so every segment after them was shifted and this real flip kept the pin.
+    "a listed body after the guard's literal line separators": lambda s: s.replace(
+        "    return any(os.environ.get(v) for v in _REPO_SELECTION_ENV)",
+        "    return not any(os.environ.get(v) for v in _REPO_SELECTION_ENV)",
+        1,
+    ),
+    # Round 1 on #3788 (CodeRabbit): a compound statement that binds an unrelated
+    # name and mutates a selected one through a method call.
+    "a loop mutating a read constant through a method": lambda s: s + (
+        f"\nfor _p in ():\n    {_a_constant_the_listed_code_reads()}.update(_p)\n"
+    ),
 }
+
+
+def test_the_guard_really_holds_the_line_separators_the_digest_must_ignore():
+    """Precondition for the separator case above: without these characters in the
+    guard, that case would pass on a str.splitlines digest too."""
+    src = original._GUARD.read_text(encoding="utf-8")
+    assert any(ch in src for ch in ("\x85", " ", " "))
 
 
 @pytest.mark.parametrize("edit", list(_RELATED_EDITS), ids=list(_RELATED_EDITS))
@@ -199,7 +219,52 @@ def test_module_level_code_the_publishing_path_depends_on_requalifies(tmp_path, 
     changed = _RELATED_EDITS[edit](src)
     assert changed != src, "precondition: the edit's anchor exists"
     copy = _guard_with(tmp_path, lambda s: changed)
-    assert bridge.publishing_guard_digest(copy) != bridge.PUBLISHING_GUARD_DIGEST
+    assert bridge.publishing_guard_digest(copy) != bridge.publishing_guard_digest(original._GUARD)
+
+
+_TRACER = '''
+import atexit, os, sys
+_SEEN = set()
+def _prof(frame, event, arg):
+    if event == "call" and frame.f_code.co_filename.endswith("scripts/hooks/git_push_guard.py"):
+        _SEEN.add(frame.f_code.co_qualname.split(".")[0])
+sys.setprofile(_prof)
+@atexit.register
+def _dump():
+    if _SEEN:
+        fd = os.open(os.environ["GUARD_TRACE_OUT"], os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+        os.write(fd, ("\\n".join(sorted(_SEEN)) + "\\n").encode())
+        os.close(fd)
+'''
+
+
+def test_the_six_cases_run_no_guard_code_outside_the_pin(tmp_path):
+    """The list is a measurement, so it is re-measured here: run the six cases
+    with a profile hook in every Python process they start, and fail if any of
+    them executes a top-level guard function or class the digest does not
+    cover. Without this, a change that routes the publishing path through new
+    code would pass under an allowance nobody re-approved for it."""
+    tracer = tmp_path / "tracer"
+    tracer.mkdir()
+    (tracer / "sitecustomize.py").write_text(_TRACER)
+    out = tmp_path / "seen.txt"
+    env = {**os.environ, "GUARD_TRACE_OUT": str(out)}
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(tracer), env.get("PYTHONPATH")) if p)
+    env.pop("PYTEST_CURRENT_TEST", None)
+    selector = " or ".join(sorted(bridge.DIRECT_PUBLISHING_ALLOWANCES))
+    run = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         str(Path(original.__file__)), "-k", selector],
+        cwd=bridge.ROOT, env=env, capture_output=True, text=True, timeout=900,
+    )
+    assert f"{len(bridge.DIRECT_PUBLISHING_ALLOWANCES)} passed" in run.stdout, run.stdout[-3000:]
+    seen = {ln for ln in out.read_text().split() if ln and not ln.startswith("<")}
+    assert seen, "precondition: the tracer saw the guard run"
+    assert seen <= set(bridge.PUBLISHING_GUARD_FUNCTIONS), (
+        "the publishing cases now run guard code outside PUBLISHING_GUARD_FUNCTIONS: "
+        f"{sorted(seen - set(bridge.PUBLISHING_GUARD_FUNCTIONS))}; add them, re-pin and "
+        "re-review the allowance"
+    )
 
 
 def test_a_listed_name_that_disappears_fails_closed(tmp_path):

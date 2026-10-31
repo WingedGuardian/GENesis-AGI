@@ -10,6 +10,7 @@ import ast
 import asyncio
 import hashlib
 import inspect
+import io
 import json
 import os
 import shlex
@@ -135,7 +136,7 @@ PUBLISHING_GUARD_FUNCTIONS = (
     "_seg_dash_C",
     "main",
 )
-PUBLISHING_GUARD_DIGEST = "792ae6126cc55a19194b1b86aab5bf9a3c7ef5b519456efdd50ccd59e3931daa"
+PUBLISHING_GUARD_DIGEST = "82e6dc6f80254152a248261dbd2440adeeffd95ec7527643c697c3fbbce1d15d"
 
 
 def direct_publishing_allowance(request, guard):
@@ -166,7 +167,10 @@ def publishing_guard_digest(guard: Path) -> str:
     that is what lets an unrelated guard edit pass. A listed name missing from the
     guard yields a digest that names it, which never matches the pin."""
     src = guard.read_text(encoding="utf-8")
-    lines = src.splitlines(keepends=True)
+    # Split ONLY on "\n", the way AST counts lines: str.splitlines also breaks on
+    # NEL, U+2028 and U+2029, which the guard holds literally, and every segment
+    # after them would be shifted (a real edit then kept the pin).
+    lines = io.StringIO(src).readlines()
     tree = ast.parse(src)
     defs_ = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
     top_defs = [node for node in tree.body if isinstance(node, defs_)]
@@ -194,6 +198,16 @@ def publishing_guard_digest(guard: Path) -> str:
                         out.add(root)
             elif isinstance(n, (ast.Import, ast.ImportFrom)):
                 out.update((a.asname or a.name).split(".")[0] for a in n.names)
+            elif (
+                isinstance(n, ast.Expr)
+                and isinstance(n.value, ast.Call)
+                and isinstance(n.value.func, ast.Attribute)
+            ):
+                # A method call as a statement mutates its receiver
+                # (`_ALLOWED.add(p)` in a loop). Only as a statement: a call on
+                # the right of an assignment (`_X = re.compile(...)`) binds _X.
+                if (root := _root(n.value.func.value)) is not None:
+                    out.add(root)
             elif isinstance(n, defs_ + (ast.Global,)):
                 out.update(getattr(n, "names", None) or [n.name])
         return out
