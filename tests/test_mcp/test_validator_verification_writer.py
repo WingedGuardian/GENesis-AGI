@@ -55,7 +55,7 @@ def row(path):
 async def call(doc, **over):
     from genesis.mcp.health import mcp
 
-    tools = await mcp.get_tools()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
     assert "pr_verification_close" in tools, "actual health MCP writer must be registered"
     owned = FastMCP("owned recording")
     owned.add_tool(tools["pr_verification_close"])

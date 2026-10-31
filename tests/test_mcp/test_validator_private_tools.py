@@ -14,7 +14,7 @@ from tests.test_mcp.test_validator_verification_writer import recording as recor
 async def client_server(profile="validator"):
     from genesis.mcp.health import mcp
 
-    source = await mcp.get_tools()
+    source = {tool.name: tool for tool in await mcp.list_tools()}
     server = FastMCP("owned-private-tools")
     for name in ("follow_up_create", "follow_up_list", "follow_up_update"):
         server.add_tool(source[name])
@@ -97,14 +97,20 @@ async def test_validator_update_checks_raw_authority_before_pin_normalization(re
     ("follow_up_update", {"follow_up_id": "0" * 32, "resolution_notes": "Synthetic"}),
 ])
 async def test_task_augmented_calls_cannot_bypass_profile_or_private_routing(recording, name, args):
+    # FastMCP 4 runs background tasks only through the tasks extension, which
+    # Genesis does not install: every tool forbids task mode, and task metadata
+    # on a call starts no task, so the call meets the profile like any other.
+    from genesis.mcp.health import mcp
+
     path, _, _ = recording
-    async with Client(await client_server()) as client:
+    assert (await mcp.get_tool(name)).task_config.mode == "forbidden"
+    async with Client(await client_server("external")) as client:
         result = await client.call_tool_mcp(
             name, args, meta={"modelcontextprotocol.io/task": {"ttl": 60000}},
         )
-        assert result.isError is True
-        assert result.meta["modelcontextprotocol.io/task"]["returned_immediately"] is True
-        assert "does not support task-augmented" in result.content[0].text
+        assert result.is_error is True
+        assert "modelcontextprotocol.io/task" not in (result.meta or {})
+        assert "unavailable to this external client profile" in result.content[0].text
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT COUNT(*) FROM follow_ups").fetchone()[0] == 0
 
