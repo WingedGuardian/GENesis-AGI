@@ -79,7 +79,10 @@ snapshots:
   # Routine deletions (the superseded healthy snapshot, prune) wait for this
   # window: deleting a large btrfs subvolume can stall filesystem commits for
   # minutes under quota accounting. "any" deletes when due (no window).
-  # Pressure-driven deletions (pool relief, delete-first) never wait.
+  # Reserve relief and measured delete-first do not wait for the window.
+  # Early relief waits only if the measured runway outlasts the wait.
+  # Each routine delete rechecks the clock; a failed delete stops the batch.
+  # Skipped DST windows wait for their next real occurrence.
   deletion_window: "05:00-07:00"
   # Empty -> the user's timezone (genesis.yaml `timezone` / USER_TIMEZONE on
   # this host, else UTC). Set an IANA zone here if the host has neither.

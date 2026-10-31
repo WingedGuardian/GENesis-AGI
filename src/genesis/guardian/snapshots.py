@@ -389,13 +389,15 @@ class SnapshotManager:
         snapshot_size_history: list[int] | None = None,
         *,
         evict: bool = True,
+        before_delete: Callable[[], bool] | None = None,
     ) -> str | None:
         """Create a snapshot. Returns the snapshot name or None on failure.
 
         Checks disk space before proceeding. Deletes excess snapshots
         before creating the new one to stay within retention limit — unless
         ``evict`` is False (a healthy rotation outside the deletion window:
-        prune enforces the same retention inside it).
+        prune enforces the same retention inside it). ``before_delete`` checks
+        authority at each deletion boundary; a failed delete ends the batch.
         """
         if label and label not in _GENERATED_LABELS:
             # A snapshot this manager could not recognise as its own would never
@@ -433,6 +435,8 @@ class SnapshotManager:
         candidates = [n for n in existing if not n.endswith(_HEALTHY_SUFFIX)]
         if evict and candidates and len(candidates) >= self._retention:
             for old_name in candidates[self._retention - 1:]:
+                if before_delete is not None and not before_delete():
+                    break
                 ok = await self.delete(old_name)
                 if ok:
                     logger.info("Deleted snapshot before create: %s", old_name)
@@ -442,6 +446,8 @@ class SnapshotManager:
                     # in the daemon): mark_healthy must not delete-first on top
                     # of it in the same attempt (review).
                     self.last_take_evicted = True
+                if not ok:
+                    break  # outcome may be uncertain; never stack deletions
 
         ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         name = f"{self._prefix}{ts}"
@@ -651,7 +657,10 @@ class SnapshotManager:
         """List all guardian snapshots, newest first."""
         return [name for name, _ in await self._list_snapshots_with_meta()]
 
-    async def prune(self, *, expires_before: datetime | None = None) -> int:
+    async def prune(
+        self, *, expires_before: datetime | None = None,
+        before_delete: Callable[[], bool] | None = None,
+    ) -> int:
         """Prune guardian snapshots. Returns count deleted.
 
         ``expires_before`` (the deletion window's pass): also delete any
@@ -715,9 +724,13 @@ class SnapshotManager:
 
         deleted = 0
         for name in sorted(to_delete):
+            if before_delete is not None and not before_delete():
+                break
             if await self.delete(name):
                 logger.info("Pruned snapshot: %s", name)
                 deleted += 1
+            else:
+                break
         self.last_prune_complete = expiry_read and deleted == len(to_delete)
         return deleted
 
@@ -755,7 +768,9 @@ class SnapshotManager:
             return None
         return [n for n, _ in meta if n.endswith(_HEALTHY_SUFFIX)][1:]
 
-    async def rotate_superseded(self) -> int:
+    async def rotate_superseded(
+        self, *, before_delete: Callable[[], bool] | None = None,
+    ) -> int:
         """Delete the superseded healthy snapshots a deferred rotation left
         (the deletion window's pass). The newest healthy snapshot is never a
         candidate, so the rollback lifeline is never reduced. Returns the count
@@ -764,9 +779,13 @@ class SnapshotManager:
         healthy = [n for n, _ in meta or [] if n.endswith(_HEALTHY_SUFFIX)]
         deleted = 0
         for old_name in healthy[1:]:
+            if before_delete is not None and not before_delete():
+                break
             if await self.delete_healthy(old_name, replaced_by=healthy[0]):
                 logger.info("Rotated superseded healthy snapshot (window): %s", old_name)
                 deleted += 1
+            else:
+                break
         return deleted
 
     async def enforce_expiry_policy(self) -> bool:
@@ -801,6 +820,7 @@ class SnapshotManager:
         reserve_settle: Callable[[], bool] | None = None,
         healthy_confirmed: bool = False,
         defer_deletes: bool = False,
+        before_delete: Callable[[], bool] | None = None,
     ) -> str | None:
         """Take a 'healthy' snapshot, then rotate superseded healthy ones.
 
@@ -848,22 +868,34 @@ class SnapshotManager:
         """
         self.last_rotation_note = None
         self.last_rotation_deleted = False
-        evict = not defer_deletes
+        evict = not defer_deletes and self.last_delete_error is None
+        routine = {"before_delete": before_delete} if before_delete is not None else {}
         name = await self.take(
             label=_HEALTHY_LABEL, snapshot_size_history=snapshot_size_history,
-            evict=evict,
+            evict=evict, **routine,
         )
-        if name is None and not evict and self.last_refusal == REFUSED_POOL_SPACE:
-            # LVM refusing the create is pressure, and pressure never waits:
-            # retry with take()'s retention eviction, exactly as without the
-            # window, so expendable snapshots go before delete-first can reach
+        # A failed delete ends this maintenance batch, even if the create
+        # succeeded. Keep its error for the caller; pressure cannot erase it
+        # via a second deletion before the next tick's settle/relist.
+        if self.last_delete_error is not None:
+            return name
+        if (
+            name is None and (not evict or before_delete is not None)
+            and self.last_refusal == REFUSED_POOL_SPACE
+            and not self.last_take_evicted
+        ):
+            # LVM refusing the create licenses pressure eviction outside the
+            # window, but not during settling or after a failed reservation.
+            # Expendable snapshots still go before delete-first can reach
             # the lifeline. (A REFUSED_POOL_GATE refusal returns before eviction
             # in take(), with or without the window, so it needs no retry.)
             evict = True
             name = await self.take(
                 label=_HEALTHY_LABEL, snapshot_size_history=snapshot_size_history,
-                evict=evict,
+                evict=evict, before_delete=reserve_settle,
             )
+            if self.last_delete_error is not None:
+                return name
         if (
             name is None
             and delete_first_allowed
@@ -883,8 +915,10 @@ class SnapshotManager:
                 # licenses deleting the lifeline first.
                 name = await self.take(
                     label=_HEALTHY_LABEL, snapshot_size_history=snapshot_size_history,
-                    evict=evict,
+                    evict=evict, before_delete=reserve_settle,
                 )
+                if self.last_delete_error is not None:
+                    return name
                 if name is None and self.last_take_evicted:
                     logger.info("delete-first deferred: the retry deleted a snapshot")
                 elif (
@@ -912,7 +946,7 @@ class SnapshotManager:
                 )
                 name = await self.take(
                     label=_HEALTHY_LABEL, snapshot_size_history=snapshot_size_history,
-                    evict=evict,
+                    evict=evict, before_delete=reserve_settle,
                 )
                 if name:
                     outcome = f"created {name}"
@@ -931,13 +965,18 @@ class SnapshotManager:
                 )
         if name is None:
             return None
-        if defer_deletes:
+        if defer_deletes or self.last_delete_error is not None:
             return name
 
         for old_name in await self.list_snapshots():
             is_superseded = old_name.endswith(_HEALTHY_SUFFIX) and old_name != name
-            if is_superseded and await self.delete_healthy(old_name, replaced_by=name):
-                logger.info("Rotated superseded healthy snapshot: %s", old_name)
+            if not is_superseded:
+                continue
+            if before_delete is not None and not before_delete():
+                break
+            if not await self.delete_healthy(old_name, replaced_by=name):
+                break
+            logger.info("Rotated superseded healthy snapshot: %s", old_name)
         return name
 
     async def lifeline_holds_space(self) -> float | None:

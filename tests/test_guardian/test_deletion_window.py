@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from genesis.guardian.check import _maintain_snapshots
+from genesis.guardian.check import _maintain_snapshots as _maintain
 from genesis.guardian.config import GuardianConfig
 from genesis.guardian.deletion_window import (
     DEFAULT_WINDOW,
@@ -42,6 +42,19 @@ BERLIN = ZoneInfo("Europe/Berlin")
 def _window_from_config(monkeypatch):
     # The package conftest pins legacy suites to "any"; these set it explicitly.
     monkeypatch.delenv("GUARDIAN_DELETION_WINDOW", raising=False)
+    monkeypatch.setattr("genesis.env._local_config", lambda: {})
+
+
+async def _maintain_snapshots(*args, now, **kwargs):
+    # Initial tick time and boundary checks use the same deterministic clock.
+    # Advancing-clock integration cases live in test_deletion_window_regressions.
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+
+    with patch("genesis.guardian.check.datetime", Clock):
+        return await _maintain(*args, now=now, **kwargs)
 
 
 def _cfg(tmp_path, window: str = "05:00-07:00", tz: str = "UTC") -> GuardianConfig:

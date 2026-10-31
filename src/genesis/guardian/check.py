@@ -707,8 +707,8 @@ async def _maintain_snapshots(
     Routine DELETIONS wait for the deletion window (deletion_window.py): prune
     and the superseded healthy snapshot run once per window occurrence
     (``_window_deletions``), and a rotation outside it creates without
-    deleting. With the window set to "any" every call below is the one made
-    before the window existed.
+    deleting. Setting the window to "any" restores immediate routine
+    scheduling; corrected failure stops and pressure cooldowns still apply.
 
     Runs after every check cycle regardless of guardian state, but the actual
     work (an ``incus config set`` + a list/delete pass) is throttled to once
@@ -733,6 +733,13 @@ async def _maintain_snapshots(
     healthy_marker = config.state_path / ".last_healthy"
     now = now or datetime.now(UTC)
     window = resolve_window(config)
+    # Errors from this maintenance call stop later batches. A later tick
+    # re-lists after the persisted settle interval, even if the manager is reused.
+    from genesis.guardian.pool_relief import settled
+
+    if settled(config, now):
+        snapshots.last_delete_error = None
+    before_delete = _routine_delete_guard(config, snapshots, window)
     # Decided BEFORE the prune step re-stamps its own marker below.
     healthy_due = _marker_due(
         healthy_marker if healthy_marker.exists() else prune_marker, 24,
@@ -754,7 +761,10 @@ async def _maintain_snapshots(
                 logger.warning("Snapshot prune failed", exc_info=True)
         _touch_marker(prune_marker, now)
     if not window.any_time:
-        await _window_deletions(config, snapshots, window, now, is_healthy=is_healthy)
+        await _window_deletions(
+            config, snapshots, window, now, is_healthy=is_healthy,
+            before_delete=before_delete,
+        )
 
     # `is True`: the YAML loader does not coerce, and `healthy_enabled: "false"`
     # is a truthy string (review).
@@ -790,20 +800,23 @@ async def _maintain_snapshots(
         # alert_only stop every automatic delete) and not settling after its
         # own delete. Whether the snapshots actually hold space is
         # mark_healthy's own, LVM-measured, decision.
-        from genesis.guardian.pool_relief import delete_first_allowed, record_action
+        from genesis.guardian.pool_relief import delete_first_allowed
 
         # The settle runs both ways: relief must not delete again 30s after
         # rotation freed space, before a fresh measurement shows the effect.
         # So the settle stamp is persisted BEFORE mark_healthy may delete, and
         # an unwritable stamp forbids the delete (review: stamping after the
         # delete left relief free to delete again when the write failed).
-        # Outside the window the rotation only creates; "any" passes nothing,
-        # exactly the call made before the window existed.
-        defer = {} if window.any_time else {"defer_deletes": not window.contains(now)}
+        # Outside the window ordinary rotation only creates. "any" passes
+        # no routine-window callback; pressure still reserves its cooldown.
+        defer = {} if window.any_time else {
+            "defer_deletes": not window.contains(datetime.now(UTC)),
+            "before_delete": before_delete,
+        }
         name = await snapshots.mark_healthy(
             snapshot_size_history,
             delete_first_allowed=delete_first_allowed(config),
-            reserve_settle=lambda: record_action(config),
+            reserve_settle=lambda: before_delete(pressure=True),
             # _maintain_snapshots only gets here when THIS tick's probe said
             # HEALTHY (is_healthy is the post-cycle state).
             healthy_confirmed=is_healthy,
@@ -855,8 +868,40 @@ async def _maintain_snapshots(
 _SUPERSEDED_ALERT_AT = 2
 
 
+def _routine_delete_guard(config, snapshots, window):
+    """Per-maintenance authorization, checked at each routine delete boundary.
+
+    Pressure bypasses the window, never the settle or a failed reservation.
+    Only a real candidate reserves the shared cooldown. A stamp followed by
+    a closed window leaves a conservative cooldown, just as a killed process
+    after the stamp would. No-op passes never touch it.
+    """
+    from genesis.guardian.pool_relief import record_action, settled
+
+    started = False
+    stopped = False
+
+    def allowed(*, pressure: bool = False) -> bool:
+        nonlocal started, stopped
+        stopped = stopped or isinstance(getattr(snapshots, "last_delete_error", None), str)
+        now = datetime.now(UTC)
+        if stopped or (not pressure and not window.contains(now)):
+            return False
+        if (pressure or not started) and not settled(config, now):
+            return False
+        if not record_action(config, now):
+            stopped = True
+            return False
+        started = True
+        # The stamp itself can block on storage. Do not reuse its start time.
+        return pressure or window.contains(datetime.now(UTC))
+
+    return allowed
+
+
 async def _window_deletions(
     config, snapshots, window, now: datetime, *, is_healthy: bool = False,
+    before_delete=None,
 ) -> None:
     """The deletion window's pass: prune, then the superseded healthy
     snapshots. Prune also takes what incus itself would expire before the next
@@ -881,15 +926,18 @@ async def _window_deletions(
             return  # already done in this occurrence
     except (OSError, ValueError, TypeError):
         pass  # absent or unreadable: due
-    # Paced by pool relief's settle stamp (existing state): an attempt — and
-    # a retry after a failed or timed-out delete — waits the settle interval
-    # after any guardian delete, so retries cannot stack filesystem stalls or
-    # hold every tick (and the heartbeat after it) on 120s delete timeouts,
-    # and relief cannot delete right on top of this pass.
-    from genesis.guardian.pool_relief import record_action, settled
+    # A read-only failed attempt needs retry pacing, but is not evidence of
+    # a deletion and must not delay reserve relief. Keep that timestamp in
+    # the existing per-maintenance marker convention instead of last_action.
+    from genesis.guardian.pool_relief import settled
 
-    if not settled(config, now) or not record_action(config, now):
+    attempt = config.state_path / ".last_window_attempt"
+    if not settled(config, now) or not _marker_due(attempt, 5 / 60, now=now):
         return
+    if not _touch_marker(attempt, now):
+        return
+    if before_delete is None:
+        before_delete = _routine_delete_guard(config, snapshots, window)
     if window.tz_source == "fallback":
         logger.warning(
             "Deletion window runs in UTC: this host names no user timezone — set "
@@ -897,12 +945,20 @@ async def _window_deletions(
         )
     done = False
     try:
-        pruned = await snapshots.prune(expires_before=window.next_open(now))
+        pruned = await snapshots.prune(
+            expires_before=window.next_open(now), before_delete=before_delete,
+        )
         pruned_all = getattr(snapshots, "last_prune_complete", False) is True
         # Stop at a failed prune: its retry comes after the settle interval.
-        rotated = await snapshots.rotate_superseded() if is_healthy and pruned_all else 0
+        rotated = (
+            await snapshots.rotate_superseded(before_delete=before_delete)
+            if is_healthy and pruned_all else 0
+        )
         left = await snapshots.superseded_healthy()
-        done = pruned_all and left == []
+        done = (
+            pruned_all and left == []
+            and not isinstance(getattr(snapshots, "last_delete_error", None), str)
+        )
         logger.info(
             "Deletion window (%s): pruned %d, rotated %d superseded healthy%s",
             window.describe(), pruned, rotated,
@@ -964,12 +1020,12 @@ def _probe_confirmed_healthy(sm, since: datetime) -> bool:
         return False
 
 
-def _marker_due(marker: Path, hours: float) -> bool:
+def _marker_due(marker: Path, hours: float, *, now: datetime | None = None) -> bool:
     """True when ``marker`` (an ISO timestamp file) is absent, unreadable, in
     the future, or older than ``hours``."""
     try:
         last = datetime.fromisoformat(marker.read_text().strip())
-        now = datetime.now(UTC)
+        now = now or datetime.now(UTC)
         return last > now or (now - last) >= timedelta(hours=hours)
     except (OSError, ValueError, TypeError):
         # TypeError: a timezone-less stamp (a hand edit) or a non-numeric

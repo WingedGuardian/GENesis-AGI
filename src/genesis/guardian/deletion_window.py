@@ -19,8 +19,8 @@ pre-recovery snapshot's eviction act at once, and so does a healthy create the
 pool refuses. Early (runway) relief waits only while the pool stays above its
 reserve until the window opens (pool_relief.early_waits_for_window).
 
-``"any"`` disables the window: every deletion runs when it did before the
-window existed. That is the rollback. The env ``GUARDIAN_DELETION_WINDOW``
+``"any"`` disables the window and restores immediate routine scheduling.
+Failed batches still stop; pressure cooldowns still apply. The env ``GUARDIAN_DELETION_WINDOW``
 overrides the config value (same syntax), e.g. ``any`` as an operator lever.
 
 Stdlib only: this runs in the host venv (stdlib + pyyaml).
@@ -119,19 +119,29 @@ class DeletionWindow:
         """Hours until the window next opens; 0 inside it (or any time)."""
         if self.start is None or self.contains(now):
             return 0.0
-        local = now.astimezone(self.tz)
-        for days in (0, 1, 2):
-            cand = datetime.combine(local.date() + timedelta(days=days), self.start, tzinfo=self.tz)
-            if cand > now:
-                return (cand - now).total_seconds() / 3600.0
-        return 24.0  # unreachable for a valid window; a bounded answer anyway
+        return (self.next_open(now) - now.astimezone(UTC)).total_seconds() / 3600.0
 
     def next_open(self, now: datetime) -> datetime:
-        """When the next occurrence opens — after the current one, if inside."""
-        occ = self.occurrence_start(now)
-        if occ is None:
-            return now + timedelta(hours=self.hours_until_open(now))
-        return datetime.combine(occ.date() + timedelta(days=1), self.start, tzinfo=self.tz)
+        """Next real opening, skipping this daily occurrence when inside it.
+
+        Search actual UTC instants at the config's minute precision. Local
+        datetime construction alone invents instants during DST gaps. Four
+        days cover a skipped hour or an entire skipped local date; folds of
+        the current occurrence are skipped together. Modern IANA offsets are
+        minute-aligned; historical sub-minute offsets are not a scheduling API.
+        """
+        if self.any_time:
+            return now.astimezone(UTC)
+        current = self.occurrence_start(now)
+        candidate = now.astimezone(UTC).replace(second=0, microsecond=0)
+        if candidate < now.astimezone(UTC):
+            candidate += timedelta(minutes=1)
+        for _ in range(4 * 24 * 60):
+            occurrence = self.occurrence_start(candidate)
+            if occurrence is not None and occurrence != current:
+                return candidate
+            candidate += timedelta(minutes=1)
+        raise ValueError("no real deletion-window opening within four days")
 
 
 def _zone(name: str) -> tzinfo | None:
@@ -175,7 +185,7 @@ def _resolve_tz(configured: object) -> tuple[tzinfo, str, str]:
         name = user_timezone()
     except Exception:
         logger.warning("could not resolve the user timezone — using UTC", exc_info=True)
-        name = "UTC"
+        return UTC, "UTC", "fallback"
     zone = _zone(name)
     if zone is None:
         logger.warning("timezone %r unavailable on this host — using UTC", name)
