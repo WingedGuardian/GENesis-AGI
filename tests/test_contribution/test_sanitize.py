@@ -241,6 +241,43 @@ def test_fingerprint_missing_file_skips(clean_diff, tmp_path):
 _FP_DIFF = "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n+see tok_private here\n"
 
 
+def _unreadable(fp):
+    """Patch reads of ``fp`` alone to fail, as a file without read permission does."""
+    real = type(fp).read_text
+
+    def read_text(self, *args, **kwargs):
+        if self == fp:
+            raise PermissionError("denied")
+        return real(self, *args, **kwargs)
+
+    return patch.object(type(fp), "read_text", read_text)
+
+
+@pytest.mark.parametrize("scan", ["diff", "prose"])
+def test_an_unreadable_fingerprint_file_blocks_and_is_not_recorded_as_run(tmp_path, scan):
+    """A present file the scan cannot read used to return no findings, so the
+    exact-value scan read as clean and the fingerprint scanner as run. scan_prose
+    is the last guard before a public issue is created."""
+    fp = tmp_path / "fingerprints.txt"
+    fp.write_text("tok_private\n")
+    with _unreadable(fp):
+        if scan == "diff":
+            r = sanitize.scan_diff(_FP_DIFF, fingerprint_file=fp)
+        else:
+            r = sanitize.scan_prose("see tok_private here", fingerprint_file=fp)
+    assert r.ok is False
+    assert [f.detail for f in r.blocking()] == ["unreadable_fingerprint_file"]
+    assert "fingerprint" not in r.scanners_run
+    assert str(tmp_path) not in " ".join(f.message + (f.detail or "") for f in r.findings)
+
+
+def test_a_fingerprint_file_removed_after_the_check_blocks(tmp_path):
+    fp = tmp_path / "fingerprints.txt"
+    parsed = sanitize.parse_diff(_FP_DIFF)
+    hits = sanitize._check_fingerprints(parsed, fp)  # never created: removed in between
+    assert [(h.severity, h.detail) for h in hits] == [(Severity.BLOCK, "unreadable_fingerprint_file")]
+
+
 @pytest.mark.parametrize(
     "bad_line",
     [

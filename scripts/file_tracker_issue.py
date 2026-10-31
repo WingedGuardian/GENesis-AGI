@@ -593,6 +593,7 @@ _INFRASTRUCTURE_DETAILS = frozenset(
         "scan_error",
         "nonzero_exit",
         "missing_fingerprint_file",
+        "unreadable_fingerprint_file",
     }
 )
 

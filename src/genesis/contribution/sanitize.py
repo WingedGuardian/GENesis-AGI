@@ -427,18 +427,42 @@ def _check_emails(parsed: _ParsedDiff) -> list[Finding]:
     return hits
 
 
+#: ``detail`` of the finding an unreadable fingerprint file produces. A sentinel,
+#: not the path, for the reason given on the missing-file WARN in ``scan_diff``.
+_FINGERPRINT_UNREADABLE = "unreadable_fingerprint_file"
+
+
 def _check_fingerprints(
     parsed: _ParsedDiff, fingerprint_file: Path | None
 ) -> list[Finding]:
-    if fingerprint_file is None or not fingerprint_file.is_file():
+    if fingerprint_file is None:
         return []
     # surrogateescape: a byte that is not UTF-8 is kept as itself rather than
     # raising, so one such line (a comment included) cannot stop every other
     # fingerprint being checked. The commit-msg hook reads the file the same way.
+    #
+    # Every caller checks the file exists first, so an OSError here means a file
+    # that is present could not be read (permissions, or removed in between). That
+    # BLOCKS rather than returning no findings: an empty result read as a clean
+    # exact-value scan, so text bound for a public surface passed a privacy check
+    # that never looked at it. A MISSING file stays the WARN in ``scan_diff``.
     try:
         raw = fingerprint_file.read_text(encoding="utf-8", errors="surrogateescape")
     except OSError:
-        return []
+        return [
+            Finding(
+                kind=FindingKind.FINGERPRINT,
+                severity=Severity.BLOCK,
+                message=(
+                    "Release fingerprint file exists but could not be read — this "
+                    "install's exact private identifiers were NOT scanned. Fix its "
+                    "permissions or regenerate it (`python -m "
+                    "genesis.contribution.fingerprints --write`), then scan again."
+                ),
+                scanner="fingerprint",
+                detail="unreadable_fingerprint_file",  # == _FINGERPRINT_UNREADABLE
+            )
+        ]
     patterns: list[re.Pattern[str]] = []
     for line in raw.splitlines():
         stripped = line.strip()
@@ -888,8 +912,16 @@ def scan_diff(
     #    `ok`) rather than silently skipping — run bootstrap to generate it.
     #    (The awareness posture check is the standing-alert companion to this.)
     if fingerprint_file and fingerprint_file.is_file():
-        findings.extend(_check_fingerprints(parsed, fingerprint_file))
-        scanners_run.append("fingerprint")
+        fingerprint_hits = _check_fingerprints(parsed, fingerprint_file)
+        findings.extend(fingerprint_hits)
+        # Recorded only when it actually read the file (scanners_run's contract).
+        # `file is None` as well as the sentinel: a real match always names its
+        # file, so an added line that happens to read like the sentinel cannot
+        # pass for this finding.
+        if not any(
+            f.file is None and f.detail == _FINGERPRINT_UNREADABLE for f in fingerprint_hits
+        ):
+            scanners_run.append("fingerprint")
     else:
         # File absent: the exact-value scan did NOT run, so do NOT record it in
         # scanners_run (whose contract is scanners that actually executed — the
@@ -1003,8 +1035,16 @@ def scan_prose(
     # a runtime `gh issue create` egress — no downstream backstop. So a missing
     # fingerprint file fails CLOSED (BLOCK), not a soft WARN.
     if fingerprint_file and fingerprint_file.is_file():
-        findings.extend(_check_fingerprints(parsed, fingerprint_file))
-        scanners_run.append("fingerprint")
+        fingerprint_hits = _check_fingerprints(parsed, fingerprint_file)
+        findings.extend(fingerprint_hits)
+        # Recorded only when it actually read the file (scanners_run's contract).
+        # `file is None` as well as the sentinel: a real match always names its
+        # file, so an added line that happens to read like the sentinel cannot
+        # pass for this finding.
+        if not any(
+            f.file is None and f.detail == _FINGERPRINT_UNREADABLE for f in fingerprint_hits
+        ):
+            scanners_run.append("fingerprint")
     else:
         findings.append(
             Finding(
