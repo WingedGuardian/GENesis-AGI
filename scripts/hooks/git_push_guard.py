@@ -1981,8 +1981,25 @@ _WRAPPER_RESIDUE_MAX_CHARS = 24
 #: 81 open PRs (57 bodies on 41 PRs) was Devin's, in three shapes: "found N
 #: potential issue(s)" (its findings are posted inline), "No Issues Found", and a
 #: "newer findings are available" marker on a superseded report.
+#:
+#: The badge is matched by its CONTENT, not just its two markers. Every badge read
+#: (33 of 51 Devin bodies on PRs #3680-#3820, MEASURED 2026-10-31) is one review
+#: link wrapping a picture whose only text is the image's `Devin Review` alt.
+#: A marker-to-marker span would also delete a sentence Devin put between the
+#: markers, and the body would then go quiet (CodeRabbit, PR #3810). Any other
+#: shape fails to match, its markers fall to the generic marker strip below, and
+#: the rest stays as residue, so the body stays visible.
 _DEVIN_REPORT_PARTS = (
-    re.compile(r"<!-- devin-review-badge-begin -->.*?<!-- devin-review-badge-end -->", re.S),
+    re.compile(
+        r"<!-- devin-review-badge-begin -->\s{0,8}"
+        r'<a href="https://app\.devin\.ai/review/[A-Za-z0-9._/-]{1,200}" target="_blank">\s{0,8}'
+        r"<picture>\s{0,8}"
+        r'(?:<source media="\([a-z-]{1,40}: [a-z]{1,10}\)" '
+        r'srcset="https://static\.devin\.ai/[A-Za-z0-9._/?=&-]{1,200}">)?\s{0,8}'
+        r'<img src="https://static\.devin\.ai/[A-Za-z0-9._/?=&-]{1,200}" alt="Devin Review">'
+        r"\s{0,8}</picture>\s{0,8}</a>\s{0,8}"
+        r"<!-- devin-review-badge-end -->"
+    ),
     re.compile(r"<!-- devin-review-[a-z-]{1,40} -->"),
     re.compile(r"^#{1,6}[ \t]*\u2705?[ \t]*Devin Review: No Issues Found[ \t]*$", re.M),
     re.compile(r"Devin Review analyzed this PR and found no bugs or issues to report\.?"),

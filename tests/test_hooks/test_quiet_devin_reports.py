@@ -157,6 +157,43 @@ def _posted(cid, rid, login=DEVIN):
     }
 
 
+class TestTheBadgeStripsOnlyTheBadge:
+    """Round 1 on #3810 (CodeRabbit, GLM, class audit): the badge strip once ran
+    from marker to marker, so text Devin placed between the markers was deleted and
+    a matching count quieted the body. Only the badge itself may go."""
+
+    def test_text_between_the_markers_stays_visible(self, guard):
+        body = _found(1).replace("</a>\n", "</a>\n> 3 flags not posted on this PR\n")
+        assert not guard._is_settled_devin_report(body, 1)
+
+    def test_text_after_an_unbalanced_begin_marker_stays_visible(self, guard):
+        body = _found(1) + "<!-- devin-review-badge-begin -->\n2 flags not posted\n" + BADGE
+        assert not guard._is_settled_devin_report(body, 1)
+
+    def test_text_in_the_image_alt_stays_visible(self, guard):
+        body = _found(1).replace('alt="Devin Review"', 'alt="3 flags not posted"')
+        assert not guard._is_settled_devin_report(body, 1)
+
+    def test_the_live_badge_with_its_dark_source_and_line_breaks_is_stripped(self, guard):
+        """Both badge layouts seen live: one line with a dark-mode source, and
+        the older indented one with a line per tag."""
+        one_line = (
+            "<!-- devin-review-badge-begin -->\n"
+            '<a href="https://app.devin.ai/review/o/r/pull/7" target="_blank"><picture>'
+            '<source media="(prefers-color-scheme: dark)" '
+            'srcset="https://static.devin.ai/assets/gh-devin-review-dark.svg?v=4">'
+            '<img src="https://static.devin.ai/assets/gh-devin-review-light.svg?v=4" '
+            'alt="Devin Review"></picture></a>\n'
+            "<!-- devin-review-badge-end -->\n"
+        )
+        indented = one_line.replace("><picture>", ">\n  <picture>\n    ").replace(
+            "</picture></a>", "\n  </picture>\n</a>"
+        )
+        for badge in (one_line, indented):
+            body = "**Devin Review** found 1 potential issue.\n\n" + badge
+            assert guard._is_settled_devin_report(body, 1), badge
+
+
 class TestInTheScan:
     def test_a_settled_report_is_not_surfaced(self, guard, monkeypatch, capsys):
         n = _report(guard, monkeypatch, [_review(9, _found(2))], [_posted(1, 9), _posted(2, 9)])
@@ -167,6 +204,16 @@ class TestInTheScan:
         n = _report(guard, monkeypatch, [_review(9, _found(3))], [_posted(1, 9), _posted(2, 9)])
         assert n == 1
         assert f"[unclassified reviewer: {DEVIN}]" in capsys.readouterr().err
+
+    def test_a_no_issues_report_with_nothing_posted_is_not_surfaced(
+        self, guard, monkeypatch, capsys
+    ):
+        assert _report(guard, monkeypatch, [_review(9, NO_ISSUES)], []) == 0
+        assert "delivered in a review BODY" not in capsys.readouterr().err
+
+    def test_of_two_devin_reports_only_the_unsettled_one_is_surfaced(self, guard, monkeypatch):
+        reviews = [_review(8, _found(1)), _review(9, _found(2))]
+        assert _report(guard, monkeypatch, reviews, [_posted(1, 8), _posted(2, 9)]) == 1
 
     def test_comments_from_another_review_do_not_count(self, guard, monkeypatch):
         assert _report(guard, monkeypatch, [_review(9, _found(1))], [_posted(1, 8)]) == 1
