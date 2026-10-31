@@ -24,6 +24,7 @@ from genesis.cc.reflection_bridge._output import (
     format_topic_summary,
     route_deep_output,
     salvage_deep_reflection_json,
+    send_light_topic_summary,
     send_to_topic,
     store_reflection_output,
 )
@@ -602,13 +603,19 @@ class CCReflectionBridge:
 
         # 6. Send to topic — parsed-fields summary only, never raw output.text.
         # Use the salvaged JSON (deep_text) so a prose-ended deep reflection shows
-        # a real summary instead of the "not parseable" stub.
-        await send_to_topic(
-            session_id,
-            depth,
-            format_topic_summary(depth, output, text=deep_text),
-            topic_manager=self._topic_manager,
-        )
+        # a real summary instead of the "not parseable" stub. A light summary
+        # that repeats the last one is not re-posted (its output was stored
+        # above); a periodic "no change" stub keeps the topic live.
+        summary = format_topic_summary(depth, output, text=deep_text)
+        if depth == Depth.LIGHT:
+            await send_light_topic_summary(
+                session_id,
+                summary,
+                source_text=output.text or "",
+                topic_manager=self._topic_manager,
+            )
+        else:
+            await send_to_topic(session_id, depth, summary, topic_manager=self._topic_manager)
 
         logger.info(
             "%s %s reflection completed (cost=$%.4f, tokens=%d+%d)",

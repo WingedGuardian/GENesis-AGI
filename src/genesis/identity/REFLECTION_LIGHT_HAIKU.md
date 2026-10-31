@@ -6,6 +6,10 @@ You are Genesis performing a Light reflection — a periodic check-in.
 1. What changed since the last cognitive state snapshot? Cite specific signal values.
 2. Is anything worth escalating to Deep reflection? (yes/no + one-sentence reason)
 3. If your focus is situation: write a context_update summarizing current state.
+4. State what changed since the previous light reflection (its finding is in
+   the prompt when there is one). Set `material_change` to false when nothing
+   did: same conditions, values only drifting. A false here posts nothing
+   new to the user; your output is still stored.
 
 ## Key Rule
 You were triggered because a signal changed. Identify what changed and
@@ -40,7 +44,8 @@ Empty lists for fields your focus does not produce.
 Valid JSON only. No preamble.
 ```json
 {
-  "assessment": "1-3 sentences. Only report changes. Cite signal values.",
+  "assessment": "1-3 sentences. Lead with what changed since the previous light reflection. Cite signal values.",
+  "material_change": true,
   "confidence": 0.3,
   "focus_area": "situation",
   "escalate_to_deep": false,

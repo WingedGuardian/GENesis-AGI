@@ -645,6 +645,131 @@ def format_topic_summary(depth, output, *, text: str | None = None) -> str:
     return "\n\n".join(parts)
 
 
+#: A light summary whose terms overlap the last full post's at or above this
+#: Jaccard score (``memory.source_verification.compute_jaccard``: stopwords
+#: dropped, numbers kept, so a moved value lowers the score) counts as "no
+#: material change". MEASURED 2026-10-27 over one install's 85 light posts in
+#: the previous 30 days, consecutive pairs: top scores 0.62, 0.58, then 0.50.
+#: The two above this line were restatements on reading (a sub-point memory
+#: drift; the same persistent job failure restated); the 0.50 pair reported
+#: moved values. Raise it to post more; it is not meant to catch rewordings
+#: that a model judges unchanged (``material_change`` does that).
+LIGHT_NEAR_DUPLICATE_JACCARD = 0.55
+
+#: The model's ``"material_change": false`` is trusted only when the summary
+#: still shares at least this much with the last FULL post. The model compares
+#: against the previous stored finding, which may itself have gone unposted, so
+#: without a floor a chain of small drifts could hide a large change from the
+#: user indefinitely. Over the same 85 posts, 21 of 84 consecutive pairs scored
+#: at least 0.3, so the flag can act on about a quarter of them.
+LIGHT_MODEL_FLAG_MIN_JACCARD = 0.3
+
+#: While nothing changes, at most one "no material change" stub per this many
+#: hours, measured from the topic's last reflection post (full or stub). That keeps the
+#: topic a liveness surface (``format_topic_summary``) at two posts a day at
+#: most, against a measured 1-5 repeat posts a day before this gate.
+LIGHT_NO_CHANGE_STUB_HOURS = 12
+
+#: How many of the topic's newest outbound rows are scanned for the last full
+#: post. A long post is one row per chunk and a stub is one row, so this covers
+#: many intervals; when no full post is found inside it the summary is posted.
+_LIGHT_SCAN_ROWS = 20
+
+#: Opens every stub. Model text is HTML-escaped before it reaches the topic, so
+#: no assessment can contain a literal ``<i>`` and be mistaken for a stub.
+_STUB_MARK = "<i>No material change since"
+
+#: Both fallbacks of ``format_topic_summary`` end with this. They report a
+#: failure to parse, so they are always posted and are never the baseline a
+#: later summary is compared against.
+_STORED_FOR_REVIEW = "stored for review."
+
+
+def _comparable(content: str) -> str:
+    """Topic text reduced to its words: tags and the header line removed."""
+    body = content.split("\n\n", 1)[1] if "\n\n" in content else content
+    return _html.unescape(re.sub(r"<[^>]+>", " ", body))
+
+
+async def send_light_topic_summary(
+    session_id: str,
+    text: str,
+    *,
+    source_text: str,
+    topic_manager,
+    now: datetime | None = None,
+) -> str:
+    """Post a light summary unless it repeats the last full post.
+
+    Returns ``"posted"``, ``"stub"`` or ``"skipped"``. Only the Telegram post is
+    gated; the caller has already stored the reflection's output. A summary is
+    "no change" when it scores at least ``LIGHT_NEAR_DUPLICATE_JACCARD`` against
+    the last full post in the topic, or when the model says so
+    (``"material_change": false``) and it still scores at least
+    ``LIGHT_MODEL_FLAG_MIN_JACCARD``. Then a stub is posted if the topic has been quiet for
+    ``LIGHT_NO_CHANGE_STUB_HOURS``, and nothing otherwise. "Last posted" is read
+    from ``telegram_messages`` (``TopicManager.recent_outbound``), so a restart
+    neither re-posts nor forgets a stub. Anything that cannot be decided
+    (no history, a failed read, a parse-failure fallback) is posted.
+    """
+    from genesis.memory.source_verification import compute_jaccard
+    from genesis.util.tz import fmt, parse_utc_iso
+
+    depth = Depth.LIGHT
+    if not topic_manager or text.endswith(_STORED_FOR_REVIEW):
+        await send_to_topic(session_id, depth, text, topic_manager=topic_manager)
+        return "posted"
+    category = f"reflection_{depth.value.lower()}"
+    try:
+        rows = await topic_manager.recent_outbound(category, limit=_LIGHT_SCAN_ROWS)
+    except Exception:
+        logger.warning("Light topic history unreadable; posting summary", exc_info=True)
+        rows = None
+    header = f"<b>{depth.value} Reflection</b>"
+    reflection_rows = [r for r in rows or [] if r["content"].startswith(header)]
+    last_full = next(
+        (
+            r for r in reflection_rows
+            if not r["content"][len(header):].lstrip().startswith(_STUB_MARK)
+            and not r["content"].endswith(_STORED_FOR_REVIEW)
+        ),
+        None,
+    )
+    if last_full is None:
+        await send_to_topic(session_id, depth, text, topic_manager=topic_manager)
+        return "posted"
+
+    data = _extract_json_obj(source_text) or {}
+    score = compute_jaccard(_comparable(text), _comparable(last_full["content"]))
+    model_unchanged = (
+        data.get("material_change") is False and score >= LIGHT_MODEL_FLAG_MIN_JACCARD
+    )
+    if not model_unchanged and score < LIGHT_NEAR_DUPLICATE_JACCARD:
+        await send_to_topic(session_id, depth, text, topic_manager=topic_manager)
+        return "posted"
+
+    now = now or datetime.now(UTC)
+    # The clock runs from the last reflection post (a reply Genesis made in the
+    # thread is not one). A timestamp that will not parse, or lies in the
+    # future, counts as no history: the stub is posted.
+    last_post = parse_utc_iso(reflection_rows[0]["timestamp"])
+    quiet = (
+        last_post is None
+        or last_post > now
+        or now - last_post >= timedelta(hours=LIGHT_NO_CHANGE_STUB_HOURS)
+    )
+    if not quiet:
+        logger.info(
+            "Light reflection not posted: no material change (model=%s, jaccard=%.2f)",
+            model_unchanged, score,
+        )
+        return "skipped"
+    since = fmt(last_full["timestamp"], "%Y-%m-%d %H:%M %Z")
+    stub = f"{header}\n\n{_STUB_MARK} {_escape(since)}.</i>"
+    await send_to_topic(session_id, depth, stub, topic_manager=topic_manager)
+    return "stub"
+
+
 async def send_to_topic(session_id: str, depth, text: str, *, topic_manager) -> None:
     """Send pre-built topic text (see ``format_topic_summary``) to the
     depth-specific topic. Never receives raw model output."""

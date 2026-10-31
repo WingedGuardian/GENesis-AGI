@@ -156,6 +156,21 @@ class TopicManager:
         """Get the thread_id for a category without creating. Returns None if not created yet."""
         return self._persistent_topics.get(category)
 
+    async def recent_outbound(self, category: str, *, limit: int) -> list[dict] | None:
+        """What this bot last posted in ``category``'s topic, newest first.
+
+        Read back from the outbound rows ``_send_single`` persists, so it
+        survives a restart. ``None`` means it cannot be known (no database, or
+        the topic does not exist yet), which is not the same as "nothing
+        posted". A failed read raises.
+        """
+        thread_id = self.get_thread_id(category)
+        if self._db is None or thread_id is None:
+            return None
+        from genesis.db.crud.telegram_messages import latest_outbound
+
+        return await latest_outbound(self._db, self._chat_id, thread_id, limit=limit)
+
     async def send_to_category(
         self,
         category: str,
