@@ -1,0 +1,22 @@
+{
+  "_comment": [
+    "Shared MCP rollout switch (read by scripts/lib/mcp_rollout.py, stdlib only, so JSON).",
+    "stage: off | memory-floor | health-reads | writes. Each stage shares the servers named",
+    "by STAGE_SERVERS in mcp_rollout.py; per-tool routing inside a stage is the adapter's.",
+    "The code ceiling MAX_STAGE caps any value here: shipping 'off' changes nothing.",
+    "Override per install in ${GENESIS_HOME:-~/.genesis}/config/mcp_shared.json (merged",
+    "per key). The shared service units and the adapter must match these names or set",
+    "their own there. adapter.argv placeholders: {python} {root} {server} {url} {stage};",
+    "an empty argv means no adapter, so every server stays on stdio.",
+    "Ready means LoadState=loaded, UnitFileState=enabled, ActiveState=active and",
+    "SubState=running, so a service unit should be Type=notify (ready after it binds)."
+  ],
+  "stage": "off",
+  "adapter": {"argv": []},
+  "servers": {
+    "health": {"unit": "genesis-mcp-health.service", "url": "http://127.0.0.1:8100/mcp"},
+    "memory": {"unit": "genesis-mcp-memory.service", "url": "http://127.0.0.1:8101/mcp"},
+    "outreach": {"unit": "genesis-mcp-outreach.service", "url": "http://127.0.0.1:8102/mcp"},
+    "recon": {"unit": "genesis-mcp-recon.service", "url": "http://127.0.0.1:8103/mcp"}
+  }
+}

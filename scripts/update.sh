@@ -3932,6 +3932,25 @@ trap - ERR INT TERM
 # deploy must not leave it running the new code.
 systemctl --user daemon-reload 2>/dev/null || true
 _restart_tmp_watchgod_if_stale
+# The shared MCP services (scripts/lib/shared_mcp_units.sh; none installed or
+# enabled by default) load the same src/ the server just restarted on. After the
+# success disarm, so a failure warns and alerts but never rolls back a healthy
+# server.
+if [ -f "$SCRIPT_DIR/lib/shared_mcp_units.sh" ]; then
+    # shellcheck source=lib/shared_mcp_units.sh
+    . "$SCRIPT_DIR/lib/shared_mcp_units.sh"
+    if ! _mcp_out="$(genesis_restart_shared_mcp_units "$GENESIS_ROOT")"; then
+        printf '%s\n' "$_mcp_out"
+        echo "  WARNING: a shared MCP service did not come back after the update."
+        # shellcheck source=lib/alert_queue.sh
+        [ -f "$SCRIPT_DIR/lib/alert_queue.sh" ] && . "$SCRIPT_DIR/lib/alert_queue.sh"
+        declare -F queue_alert >/dev/null && queue_alert critical update \
+            "update: a shared MCP service did not come back" \
+            "genesis-server is healthy, but restarting the shared MCP services failed: $(printf '%s' "$_mcp_out" | paste -sd ' ' -) Sessions attached to them have no tools from those servers, or old code, until each is restarted."
+    else
+        [ -z "$_mcp_out" ] || printf '%s\n' "$_mcp_out"
+    fi
+fi
 
 # Resume the Guardian now — BEFORE the multi-minute host-sync below — not just on
 # EXIT, else it stays stood-down through the whole guardian/CC/Node sync (server

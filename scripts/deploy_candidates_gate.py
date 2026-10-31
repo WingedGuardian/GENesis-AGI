@@ -119,6 +119,10 @@ REFUSAL_FILES = (
     "scripts/lib/deploy_status.sh",
     "scripts/lib/live_system_guard.sh",
     "scripts/lib/checkout_lock.sh",
+    # The shared-MCP unit restarts, sourced at startup, and the helper it reads
+    # with `cat` when sourced.
+    "scripts/lib/shared_mcp_units.sh",
+    "scripts/lib/mcp_rollout.py",
     # Read with `cat` before the branch check and run as python later: the
     # serving read runs inside `deploy_code_only.sh status`, which readiness runs.
     "scripts/lib/serving_commit.py",
