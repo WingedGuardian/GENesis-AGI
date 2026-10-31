@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from genesis.guardian.config import GuardianConfig
+from genesis.guardian.cred_watch import _incus_exec_stdin
 
 logger = logging.getLogger(__name__)
 
@@ -480,19 +481,62 @@ _REPAIR_JOURNAL = (
     "journalctl --user -u genesis-server --since '6 hours ago' --no-pager -o cat"
     " | grep -F 'live-move repair:' | tail -n 20 | cut -c1-400"
 )
-# The newest five reports by directory name (it starts with the run's UTC ts),
-# each followed by a NUL. Not by mtime: dismissing or superseding a report
-# rewrites it, so an old report would read as new. The host buffers whatever
-# this prints, so only a regular, non-symlink file is read, and only its first
-# _REPAIR_REPORT_BYTES (a symlink to /dev/zero, or a huge sparse file, is not).
+# The newest ELIGIBLE report, chosen inside the container, where the files are:
+# every *-live-move-repair dir, newest name first (it starts with the run's UTC
+# ts; never mtime, since dismissing or superseding a report rewrites it), until
+# one is neither dismissed nor superseded and its own ts is in the window (it
+# stops at the first name older than the window: every later one is too). One
+# exec, and at most one file's bytes come back. The host buffers whatever this
+# prints, so a report is read only as a regular file opened without following a
+# symlink (not /dev/zero, not a FIFO), and only its first _REPAIR_REPORT_BYTES.
+# A report over that cap is not skipped (an older one would then read as the
+# newest): in its window it is shown as "report too large", its ts from its dir.
+# Piped to `python3 -I -S -` over stdin, so no quoting reaches a shell. It
+# cannot import the repair's load_report (the container's checkout may be the
+# half-written tree), so it carries the same rules: a dir named as the writer's
+# _backup_dir names it (_REPAIR_NAME, the writer's REPORT_NAME), never a
+# symlinked dir, and the same byte cap (REPORT_BYTES); a parity test holds them
+# equal. It never runs git and shows no step, so the report's repo is not
+# compared with a checkout here.
+_REPAIR_NAME = r"([0-9]{8}T[0-9]{6}Z-[0-9]+)\-live\-move\-repair"
 _REPAIR_REPORT_BYTES = 4 * 1024 * 1024  # D1 writes about 0.5 KB per path
-_REPAIR_REPORT = (
-    "cd ~/.genesis/deploy-backups && ls -1d -- *-live-move-repair 2>/dev/null | tail -n 5"
-    ' | while IFS= read -r d; do f="$d/REPAIR.json";'
-    f' if [ -f "$f" ] && [ ! -L "$f" ]; then head -c {_REPAIR_REPORT_BYTES} -- "$f"; fi;'
-    " printf '\\0'; done"
-)
 _REPAIR_WINDOW_S = 6 * 3600  # the journal read's window
+_REPAIR_MARK = "REPAIR.json\n"  # a login shell may print first
+_REPAIR_PICK = f"""
+import calendar, json, os, re, stat, sys, time
+root = os.path.expanduser("~/.genesis/deploy-backups")
+try:
+    names = sorted((n for n in os.listdir(root) if re.fullmatch({_REPAIR_NAME!r}, n)), reverse=True)
+except OSError:
+    names = []
+for name in names:
+    try:  # newest name first: past the window here, every later one is too
+        if time.time() - calendar.timegm(time.strptime(name[:16], "%Y%m%dT%H%M%SZ")) > {_REPAIR_WINDOW_S}:
+            break
+    except ValueError:
+        pass
+    try:
+        if not stat.S_ISDIR(os.lstat(os.path.join(root, name)).st_mode):
+            continue
+        flags =os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        fd = os.open(os.path.join(root, name, "REPAIR.json"), flags)
+        try:
+            raw = os.read(fd, {_REPAIR_REPORT_BYTES} + 1) if stat.S_ISREG(os.fstat(fd).st_mode) else b""
+        finally:
+            os.close(fd)
+        if len(raw) > {_REPAIR_REPORT_BYTES}:
+            ts_name = name[: -len("-live-move-repair")]
+            raw = json.dumps({{"ts": ts_name, "result": "report too large (over {_REPAIR_REPORT_BYTES} bytes); not read"}}).encode()
+        report = json.loads(raw)
+        ts = calendar.timegm(time.strptime(str(report["ts"])[:16], "%Y%m%dT%H%M%SZ"))
+        if report.get("dismissed_at") or report.get("result") == "superseded":
+            continue
+    except Exception:
+        continue
+    if -300 <= time.time() - ts <= {_REPAIR_WINDOW_S}:
+        sys.stdout.buffer.write({_REPAIR_MARK!r}.encode() + raw)
+        break
+""".encode()
 _REPAIR_FIELD_CAP = 2000
 
 
@@ -501,28 +545,27 @@ def _quoted(value: object, cap: int) -> str:
     return json.dumps(str(value)[:cap])
 
 
-def _newest_report(raw: str) -> dict | None:
-    """The newest report in the window that is neither dismissed nor superseded."""
-    best: tuple[datetime, dict] | None = None
-    for doc in raw.split("\0"):
-        try:
-            report = json.loads(doc)
-            ts = datetime.strptime(str(report["ts"])[:16], "%Y%m%dT%H%M%SZ").replace(tzinfo=UTC)
-        except (ValueError, RecursionError, TypeError, KeyError):
-            continue
-        age = (datetime.now(UTC) - ts).total_seconds()
-        if report.get("dismissed_at") or report.get("result") == "superseded":
-            continue
-        if -300 <= age <= _REPAIR_WINDOW_S and (best is None or ts > best[0]):
-            best = (ts, report)
-    return best[1] if best else None
+async def _read_report(config: GuardianConfig) -> dict | None:
+    """The report _REPAIR_PICK chose, or None (none, unreadable, or no exec).
+    Run as the configured container user: the pick reads that user's ~."""
+    try:
+        rc, out = await _incus_exec_stdin(
+            config.container_name,
+            "python3 -I -S -",
+            _REPAIR_PICK,
+            _INCUS_TIMEOUT,
+            user=config.container_user,
+        )
+        report = json.loads(out.split(_REPAIR_MARK, 1)[1]) if rc == 0 else None
+    except (TimeoutError, OSError, IndexError, ValueError, RecursionError):
+        return None
+    return report if isinstance(report, dict) else None
 
 
 async def _collect_live_repair(config: GuardianConfig) -> str:
     """The repair's newest report and recent journal lines; "" when neither exists."""
     lines, tail = [], []
-    rc, raw = await _incus_exec_user(config.container_name, _REPAIR_REPORT)
-    report = _newest_report(raw) if rc == 0 else None
+    report = await _read_report(config)
     if report is not None:
         rows = report.get("paths")
         rows = [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []

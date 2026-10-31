@@ -894,3 +894,161 @@ async def test_the_unbound_class_has_its_own_wording(db, monkeypatch):
     await loop._check_deploy_staleness(db)
     [row] = await _rows(db)
     assert "no deploy manifest of this repository binds it" in row["content"]
+
+
+async def test_td19_a_live_repair_report_raises_its_own_wording_then_resolves(db, monkeypatch):
+    """T-D19 (#3492 PR D1): the live-move repair's report becomes the deploy
+    observation with the exact re-apply step, no update.sh advice, high (never
+    critical); a later tick without it resolves the observation."""
+    step = "rm -rf -- /x/sub/s1 && cp -a -- /b/tree/sub/s1 /x/sub/s1"
+    snap = _snap(["live_repair_saved:1", "live_repair_unresolved"])
+    snap["live_repairs"] = {"saved": [step], "unresolved": True}
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    rows = await _rows(db)
+    assert len(rows) == 1 and rows[0]["priority"] == "high", rows
+    content = rows[0]["content"]
+    assert step in content and "repair-move --dismiss" in content, content
+    assert "did not finish" in content and "update.sh" not in content, content
+    _patch_snapshot(monkeypatch, _snap([]))
+    await loop._check_deploy_staleness(db)
+    assert await _rows(db) == []
+    assert len(await _rows(db, resolved=1)) == 1
+
+
+async def test_a_live_repair_paragraph_caps_its_steps_and_names_the_ts(db, monkeypatch):
+    """F5: at most five steps inline (the rest counted, with the report named),
+    the actual `--dismiss <ts>`, and the informational line for rows the
+    checkout moved past."""
+    steps = [f"step-{n}" for n in range(8)]
+    snap = _snap(["live_repair_saved:8", "live_repair_moved_on:2"])
+    snap["live_repairs"] = {
+        "saved": steps,
+        "unresolved": False,
+        "dismiss": ["20261027T000000Z-7"],
+        "moved_on": ["2 saved path(s) from repair 20261020T000000Z-3 are no longer re-applicable"],
+    }
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert all(s in content for s in steps[:5]) and "step-5" not in content, content
+    assert "and 3 more" in content and "offered here once" in content, content
+    assert "repair-move --dismiss 20261027T000000Z-7" in content, content
+    assert "20261020T000000Z-3 are no longer re-applicable" in content, content
+    assert row["priority"] == "high"
+
+
+async def test_omitted_repair_steps_name_the_reports_that_hold_them(db, monkeypatch):
+    """Devin c4399914589: two reports of four steps each. The three steps past
+    the fifth come from both reports, so each report holding one is named by
+    its ts (never as a path to its stored list); no placeholder is printed."""
+    first, second = "20261027T000000Z-1", "20261028T000000Z-2"
+    snap = _snap(["live_repair_saved:8"])
+    snap["live_repairs"] = {
+        "saved": [f"step-{n}" for n in range(8)],
+        "saved_from": [first] * 4 + [second] * 4,
+        "dismiss": [first, second],
+    }
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert "<ts>" not in content and "REPAIR.json" not in content, content
+    assert f"(and 3 more, from repair {second}:" in content, content
+    snap["live_repairs"]["saved_from"] = [first] * 6 + [second] * 2  # omitted span both
+    _patch_snapshot(monkeypatch, snap)
+    monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
+    monkeypatch.setattr(loop, "_last_deploy_alert_key", "")
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert "<ts>" not in content and "REPAIR.json" not in content, content
+    assert f"(and 3 more, from repair {first} and {second}:" in content, content
+
+
+async def test_a_later_snapshot_with_other_repair_steps_refreshes_the_alert(db, monkeypatch):
+    """Codex c4399950938: same classes, different steps and report: the
+    standing observation is replaced, never left naming the old commands."""
+    old = _snap(["live_repair_saved:1"])
+    old["live_repairs"] = {"saved": ["old-step"], "dismiss": ["20261027T000000Z-1"]}
+    _patch_snapshot(monkeypatch, old)
+    await loop._check_deploy_staleness(db)
+    new = _snap(["live_repair_saved:1"])
+    new["live_repairs"] = {"saved": ["new-step"], "dismiss": ["20261028T000000Z-2"]}
+    _patch_snapshot(monkeypatch, new)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    assert "new-step" in row["content"] and "old-step" not in row["content"], row["content"]
+    assert "20261028T000000Z-2" in row["content"], row["content"]
+    # The same repair state on the next tick is still deduplicated.
+    _patch_snapshot(monkeypatch, new)
+    await loop._check_deploy_staleness(db)
+    assert len(await _rows(db)) == 1 and len(await _rows(db, resolved=1)) == 1
+
+
+async def test_malformed_repair_rows_have_their_own_wording(db, monkeypatch):
+    """Devin c4399914846: never paging, no update.sh advice, the report named."""
+    snap = _snap(["live_repair_malformed:2"])
+    snap["live_repairs"] = {"malformed": 2, "malformed_in": ["20261027T000000Z-1"]}
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert row["priority"] == "high" and "update.sh" not in content, content
+    assert "2 row(s)" in content and "repair-move --dismiss 20261027T000000Z-1" in content
+
+
+async def test_omitted_repair_steps_never_point_at_the_stored_list(db, monkeypatch):
+    """CodeRabbit c4401473620: the stored reapply list keeps the steps the
+    reader withholds, so the paragraph never sends anyone to it; the omitted
+    steps are offered here once the shown ones are run."""
+    snap = _snap(["live_repair_saved:8"])
+    snap["live_repairs"] = {
+        "saved": [f"step-{n}" for n in range(8)],
+        "saved_from": ["20261027T000000Z-1"] * 8,
+        "dismiss": ["20261027T000000Z-1"],
+    }
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert "and 3 more" in content and "offered here once" in content, content
+    assert "reapply list in" not in content and "REPAIR.json" not in content, content
+
+
+async def test_every_ts_in_a_repair_command_is_shell_quoted(db, monkeypatch):
+    """The loader refuses a report name the writer never makes; the paragraph
+    quotes every ts it prints anyway, so no ts text can end a shown command."""
+    bad = "20260101T000000Z-1; touch MARKER; #"
+    snap = _snap(["live_repair_saved:1", "live_repair_malformed:1"])
+    snap["live_repairs"] = {"saved": ["step"], "dismiss": [bad], "malformed": 1,
+                            "malformed_in": [bad]}  # fmt: skip
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert f"--dismiss {bad}" not in content, content
+    assert f"--dismiss '{bad}'" in content, content
+
+
+async def test_a_report_never_read_is_named_without_a_dismiss_command(db, monkeypatch):
+    snap = _snap(["live_repair_malformed:1"])
+    snap["live_repairs"] = {"malformed": 1, "refused": 1, "malformed_in": []}
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert "1 live-move repair report(s)" in content and "<ts>" not in content, content
+    assert "--dismiss" not in content, content
+
+
+async def test_one_unencodable_field_never_drops_the_deploy_alert(db, monkeypatch):
+    """An unrelated finding (stale_update) and a repair field holding a lone
+    surrogate: the observation is still written, the field escaped."""
+    snap = _snap(["stale_update:9.0d,30behind", "live_repair_saved:1"], age_days=9.0, behind=30)
+    snap["live_repairs"] = {"saved": ["rm -rf -- /x/Z\udcff"], "dismiss": ["20261027T000000Z-1"]}
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    assert "stale_update" in row["content"] and "Z\\udcff" in row["content"], row["content"]

@@ -2105,10 +2105,16 @@ verified: fbb0b6f19 2026-10-21
   `deploy_candidates drop`. The diagnosis snapshot carries the boot repair's
   `live-move repair:` journal lines and a summary of the newest
   `deploy-backups/*-live-move-repair/REPAIR.json` that is neither dismissed
-  nor superseded (6 h window on its own `ts`), JSON-quoted, capped at 2,000
+  nor superseded (6 h window on its own `ts`), chosen inside the container
+  (one `python3 -I -S -` over stdin, as the configured container user, #3627)
+  so newer ineligible reports cannot hide it; JSON-quoted, capped at 2,000
   characters and fenced as untrusted; empty, and the prompt unchanged, when
   there are none. The container reads are bounded where they are produced
-  (regular non-symlink reports, 4 MiB each; journal lines cut to 400), and
+  (only a report dir named as the writer names it and not a symlink; one
+  regular report opened without following a symlink, 4 MiB, the repair
+  loader's own rules, held equal by a parity test; a newer one over that cap
+  is shown as "report too large", never skipped for an older one; journal
+  lines cut to 400), and
   Telegram alert fields are cut before escaping. Residual: a container that
   fakes git's own output can still pass the probe.
 - **Merged ≠ deployed**: guardian code reaches the host ONLY via
@@ -4446,10 +4452,60 @@ Refusing a proposed update preserves a previously valid opt-in.
   (re-apply steps included) and queues an alert (critical when anything was
   not the update's, the index was torn, or it did not heal); `REPAIR.json`
   and `manifests()` are the contract its readers (deploy health, the
-  awareness check, the guardian's diagnosis) read, and those readers arrive
-  in a follow-up PR: until then the command output and the alert carry the
-  report. A run killed after its restore and before its result leaves no
-  result; the next run removes a healed state without a new backup.
+  awareness check, the guardian's diagnosis) read. The deploy-health
+  collector `collect_live_repairs` reads every `REPAIR.json` through the
+  repair's one loader, `load_report(dir, checkout)`: a report dir not named as
+  `_backup_dir` names it, a symlinked dir, a `REPAIR.json` that is not a
+  regular file (opened without following a symlink or blocking on a FIFO) of
+  at most 4 MiB holding a JSON object of at most 20,000 rows, or a report whose
+  `repo` is not the deploy checkout (`repo_root()`) is refused whole, counted in
+  `live_repair_malformed:<n>` and `refused`, and never read further: no git
+  runs in a checkout a report names. It feeds
+  `live_repair_saved:<n>`: each foreign row's re-apply step, OFFERED only
+  while running it destroys nothing nobody saved: the checkout's HEAD is
+  still the report's `tag` commit and each part the step writes (its node,
+  its index entries, its flags) holds what the repair left there, nothing, or
+  already what the step puts back, and every index entry the step drops below
+  its own path (engine rows included) holds what the repair left there or
+  nothing (a row there that cannot be judged withholds it). A row clears once
+  running the step would
+  change nothing (judged part by part as the step is built: its index entries
+  when the step writes them, its flags, and its node by git mode with the
+  executable bit, then size, then bytes in 1 MiB chunks, a directory's saved
+  tree with sockets and devices ignored, a FIFO's mode; never read through a
+  symlinked parent, and an `unreachable_through` row by its index only; a
+  socket or device, which no step can make again, until one of its type is
+  back), or once the report is `--dismiss`ed. A row that is neither (written
+  since, or the checkout moved on) is never offered again:
+  `live_repair_moved_on:<n>` carries one line per report naming the count,
+  its ts and its backup dir, until dismissed. REPAIR.json is user-writable,
+  so untrusted: its stored step text is never shown (each offered step is
+  rebuilt by the repair's own `reapply_step` from the row, the report's own
+  dir and the writer's `below` rule, so reader and writer cannot drift), and
+  a row any field of which is not what the writer writes (a path not plain
+  relative, a copy or blob resolving outside its backup dir, an entry that is
+  not git's, a FIFO mode not octal, a flag not one letter) is skipped as
+  malformed (`live_repair_malformed:<n>`, until its report is dismissed); a
+  malformed report is skipped row by row. Each step's every token goes through
+  one display encoder (`shell_word`: shell quoting, or bash `$'...'` built
+  from the original bytes for anything outside printable ASCII), so a shown
+  step is printable ASCII and runs exactly; rows are indexed by path once per
+  report. It loads the repair's module once per snapshot when any report dir
+  exists (an unloadable module reads every report as refused and blanks
+  nothing), and reads the checkout's index
+  and HEAD once per snapshot. The awareness paragraph quotes at most five
+  steps (the rest are offered there once those are run; it never points at
+  the stored reapply list, which keeps withheld steps), shell-quotes each
+  `--dismiss <ts>`, escapes any text a database column cannot hold rather
+  than losing the alert, and is replaced whenever the steps or reports it
+  names change. `GET /api/genesis/health` reduces `live_repairs` to its counts
+  for a caller without the internal bearer or a verified session. `live_repair_unresolved` needs the newest report to
+  say so (or to have no result after an hour) AND the shared guard, run at
+  read time and only then, to call the update state `mixed_tree`: a run
+  killed after its restore and before its result leaves no result, and only
+  the tree says whether it healed (the next run removes a healed state
+  without a new backup). Both are worded by the awareness check (never
+  paging).
   `--post-merge` on `live` never runs the engine. What is recorded and sent to
   the host guardian is the origin/main commit `live` is built on.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;

@@ -278,6 +278,84 @@ def _load(path: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+#: A report dir's name is its ts (_backup_dir: the UTC time, then the pid)
+#: followed by SUFFIX. ASCII digits only: \d also matches other scripts' digits.
+_TS_FORMAT = "%Y%m%dT%H%M%SZ"
+REPORT_NAME = re.compile(r"([0-9]{8}T[0-9]{6}Z-[0-9]+)" + re.escape(SUFFIX))
+#: The writer stores about 0.5 KB per row, so a report it writes stays well
+#: under both caps; one over either is not read.
+REPORT_BYTES = 4 * 1024 * 1024
+REPORT_ROWS = 20_000
+
+
+class BadReport(Exception):
+    """A report dir or REPAIR.json the writer does not make; never read further."""
+
+
+def report_ts(name: str) -> str | None:
+    """The ts of a report dir named as _backup_dir names it, else None."""
+    m = REPORT_NAME.fullmatch(name)
+    return m.group(1) if m else None
+
+
+def load_report(path: str, repo: str) -> dict | None:
+    """One report, read as untrusted input: the readers' single way in.
+
+    ``path`` is the report dir, ``repo`` the deploy checkout the reader serves.
+    The dir must be a directory (never a symlink) named as _backup_dir names
+    it; REPAIR.json is opened without following a symlink or blocking on a
+    FIFO, must be a regular file of at most REPORT_BYTES holding a JSON
+    object; its ``repo`` must resolve to ``repo`` (no reader runs git in, or
+    shows a step for, a checkout a report names); ``paths`` a list of at most
+    REPORT_ROWS entries. Returns {"ts", "report", "rows" (the dict rows),
+    "by_path" (rows by path), "mtime"}; None when the dir holds no REPAIR.json
+    yet (a run that wrote none, or is writing it); raises BadReport for
+    anything else."""
+    ts = report_ts(os.path.basename(path))
+    if ts is None:
+        raise BadReport("not a name the repair writes")
+    try:
+        if not stat.S_ISDIR(os.lstat(path).st_mode):
+            raise BadReport("not a directory")
+        fd = os.open(os.path.join(path, "REPAIR.json"), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise BadReport(f"cannot be opened ({exc.strerror})") from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise BadReport("REPAIR.json is not a regular file")
+        chunks, size = [], 0
+        while size <= REPORT_BYTES and (chunk := os.read(fd, REPORT_BYTES + 1 - size)):
+            chunks.append(chunk)
+            size += len(chunk)
+    except OSError as exc:
+        raise BadReport(f"cannot be read ({exc.strerror})") from None
+    finally:
+        os.close(fd)
+    if size > REPORT_BYTES:
+        raise BadReport(f"over {REPORT_BYTES} bytes")
+    try:
+        report = json.loads(b"".join(chunks))
+    except (ValueError, RecursionError):
+        raise BadReport("not JSON") from None
+    if not isinstance(report, dict):
+        raise BadReport("not a JSON object")
+    named = report.get("repo")
+    if not isinstance(named, str) or os.path.realpath(named) != os.path.realpath(repo):
+        raise BadReport("not this checkout's report")
+    paths = report.get("paths")
+    if not isinstance(paths, list) or len(paths) > REPORT_ROWS:
+        raise BadReport(f"paths is not a list of at most {REPORT_ROWS} rows")
+    rows = [r for r in paths if isinstance(r, dict)]
+    by_path: dict[str, list[dict]] = {}
+    for r in rows:
+        if isinstance(r.get("path"), str):
+            by_path.setdefault(r["path"], []).append(r)
+    return {"ts": ts, "report": report, "rows": rows, "by_path": by_path, "mtime": st.st_mtime}
+
+
 def manifests(backups: str) -> list[tuple[str, dict]]:
     """(path, REPAIR.json) of every repair, oldest first."""
     try:
@@ -308,7 +386,9 @@ def _load_guard():
     return module
 
 
-def reapply_step(repo: str, backup: str, row: dict, below: list[str] | tuple = ()) -> str:
+def reapply_step(
+    repo: str, backup: str, row: dict, below: list[str] | tuple = (), quote=shlex.quote
+) -> str:
     """The shell step that puts a foreign row back the way the repair found it.
     Its index part runs first, as one `update-index -z --index-info` call (a
     mode-0 record drops the restored entry, the saved entries follow): git
@@ -323,8 +403,9 @@ def reapply_step(repo: str, backup: str, row: dict, below: list[str] | tuple = (
     A row the repair saw beyond a symlinked or non-directory parent
     (``unreachable_through``) gets its index state only: once that parent's
     own step puts it back, the path is not in the checkout, and no step may
-    act through it."""
-    q, path = shlex.quote, row["path"]
+    act through it. Every token goes through ``quote`` (a reader passes one
+    that keeps the shown text printable)."""
+    q, path = quote, row["path"]
     dst = os.path.join(repo, path)
     steps = []
     if [tuple(e) for e in row["index"]] != _as_index(row["tag"]):
@@ -499,7 +580,7 @@ class Repair:
         return self._after(backup, manifest, state, raw, readable, index_lock)
 
     def _backup_dir(self) -> str:
-        ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + f"-{os.getpid()}"
+        ts = time.strftime(_TS_FORMAT, time.gmtime()) + f"-{os.getpid()}"
         return os.path.join(self.backups, ts + SUFFIX)
 
     def _locks(self) -> list[tuple[str, str]]:

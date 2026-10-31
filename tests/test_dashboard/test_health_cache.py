@@ -124,6 +124,17 @@ async def test_per_request_keys_never_reach_the_shared_snapshot():
 # --------------------------------------------------------------------------
 
 _CHECKOUT = {"status": "dirty", "count": 2, "paths": ["a.txt", "b.txt"], "paths_omitted": 0}
+_REPAIRS = {
+    "saved": ["rm -rf -- /srv/install/checkout/private.txt"],
+    "saved_from": ["20260101T000000Z-1"],
+    "dismiss": ["20260101T000000Z-1"],
+    "moved_on": ["1 saved path(s) from repair 20260101T000000Z-2 ... in /srv/install/backups"],
+    "moved_on_paths": 1,
+    "malformed": 2,
+    "refused": 1,
+    "malformed_in": ["20260101T000000Z-3"],
+    "unresolved": False,
+}
 
 
 async def _health_as(remote_addr, headers=None, *, verified=False, monkeypatch):
@@ -137,7 +148,11 @@ async def _health_as(remote_addr, headers=None, *, verified=False, monkeypatch):
     async def _compute():
         return {
             "infrastructure": {"genesis.db": {"status": "healthy"}},
-            "deploy_health": {"status": "attention", "main_checkout": dict(_CHECKOUT)},
+            "deploy_health": {
+                "status": "attention",
+                "main_checkout": dict(_CHECKOUT),
+                "live_repairs": dict(_REPAIRS),
+            },
         }
 
     svc._compute_snapshot = _compute
@@ -222,6 +237,35 @@ async def test_the_internal_bearer_gets_the_checkout_file_names(monkeypatch):
         "198.51.100.7", {"Authorization": "Bearer wrong"}, monkeypatch=monkeypatch
     )
     assert "paths" not in body["deploy_health"]["main_checkout"]
+
+
+@pytest.mark.asyncio
+async def test_an_untrusted_peer_gets_live_repair_counts_only(monkeypatch):
+    """The live-move repair's steps name the checkout, the home directory and
+    file names; its moved-on lines name backup dirs. An untrusted caller gets
+    counts only; the cached snapshot keeps the detail for trusted callers."""
+    body, cached = await _health_as("198.51.100.7", monkeypatch=monkeypatch)
+    repairs = body["deploy_health"]["live_repairs"]
+    assert repairs == {
+        "saved": 1,
+        "moved_on_paths": 1,
+        "malformed": 2,
+        "refused": 1,
+        "unresolved": False,
+    }, repairs
+    assert "/srv/install" not in str(body), body
+    assert cached["deploy_health"]["live_repairs"]["saved"] == _REPAIRS["saved"]
+
+
+@pytest.mark.asyncio
+async def test_the_internal_bearer_gets_the_live_repair_steps(monkeypatch):
+    from genesis.dashboard import auth
+
+    monkeypatch.setattr(auth, "get_or_create_internal_api_token", lambda: "tok")
+    body, _ = await _health_as(
+        "198.51.100.7", {"Authorization": "Bearer tok"}, monkeypatch=monkeypatch
+    )
+    assert body["deploy_health"]["live_repairs"] == _REPAIRS
 
 
 # --------------------------------------------------------------------------

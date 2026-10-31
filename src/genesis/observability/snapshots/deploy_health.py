@@ -28,6 +28,9 @@ This snapshot makes that drift visible:
   the behind-count, tier-2 pending and host drift are measured from the
   commit `live` was built on, never HEAD, so a candidate's own files never
   read as undeployed merges
+- ``live_repairs`` — what the live-move repair (scripts/lib/live_move_repair.py)
+  reported after healing a half-written `live` checkout: paths it saved that
+  were not the update's, an unresolved repair
 
 The awareness tick's ``_check_deploy_staleness`` consumes the same collectors
 to raise a dashboard/morning-report observation. Everything is best-effort:
@@ -38,12 +41,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import importlib.util
 import json
 import logging
 import os
 import re
+import shlex
 import signal
+import stat
 import subprocess
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -919,6 +927,564 @@ def live_findings(live: dict | None) -> list[str]:
     return found
 
 
+#: A repair report with no result yet is a repair still running, or one killed
+#: partway; after this long it is the latter.
+REPAIR_UNFINISHED_S = 3600
+
+
+_REPAIR_SCRIPT = Path(__file__).resolve().parents[4] / "scripts" / "lib" / "live_move_repair.py"
+_GUARD_SCRIPT = Path(__file__).resolve().parents[4] / "scripts" / "lib" / "update_state_guard.py"
+_REPAIR_SUFFIX = "-live-move-repair"
+#: Bytes read at a time when a saved file is compared with the checkout's, or a
+#: file hashed against the tag's blob: never a whole file in memory.
+_CHUNK = 1 << 20
+
+
+def _script(path: Path):
+    """A script of the tree this module ships in, loaded afresh: the repair's
+    own rules, so this reader judges what the writer judged."""
+    spec = importlib.util.spec_from_file_location(f"_deploy_health_{path.stem}", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"{path} cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def shell_word(text: str) -> str:
+    """One shell word for ``text``, shown as printable ASCII: shlex's quoting
+    when every character is printable ASCII (or a tab), else bash ANSI-C
+    quoting ($'...') made from the original bytes (os.fsencode, so a non-UTF-8
+    name's surrogates map back to its bytes): run, it is exactly ``text``.
+    Every token a repair text interpolates goes through it."""
+    if all(c == "\t" or " " <= c <= "~" for c in text):
+        return shlex.quote(text)
+    out = []
+    for byte in os.fsencode(text):
+        if byte in (0x27, 0x5C):  # ' and \\
+            out.append("\\" + chr(byte))
+        elif 0x20 <= byte <= 0x7E:
+            out.append(chr(byte))
+        else:
+            out.append(f"\\x{byte:02x}")
+    return "$'" + "".join(out) + "'"
+
+
+def collect_live_repairs(
+    genesis_home_dir: Path, repo_dir: Path | str, now: float | None = None
+) -> dict:
+    """The live-move repair's REPAIR.json reports (scripts/lib/live_move_repair.py)
+    for the deploy checkout ``repo_dir``.
+
+    Every report is read through the repair's own ``load_report``: a report
+    dir it refuses (a name the writer never makes, a symlinked dir, a
+    REPAIR.json that is not a regular file within the byte cap, not a JSON
+    object, over the row cap, or naming another checkout than ``repo_dir``)
+    is counted in ``malformed`` and ``refused`` and never read further: no
+    git runs in a checkout a report names. The repair's module loads once
+    per call when any report dir exists (unloadable, no report can be read:
+    each counts as refused).
+
+    ``saved``: each foreign row's re-apply step, OFFERED only while running it
+    destroys nothing nobody saved: the checkout is still on the report's
+    ``tag`` commit and each part the step writes (the node, the index entries,
+    the flags) holds what the repair left there, nothing, or already what the
+    step puts back, and every index entry it drops below its own path (the
+    writer's ``below``, engine rows included) holds what the repair left there
+    or nothing: a row there that cannot be judged (malformed) withholds it.
+    Each step is the repair's ``reapply_step`` with every token through
+    :func:`shell_word`, so it is printable ASCII and runs exactly.
+    ``saved_from``: the ts of each offered step's report, in the same order.
+    It clears once the step would change nothing
+    (:func:`_verdict`) or the report is dismissed (a newer report's row for a
+    path replaces an older one's). A row that is neither (someone wrote the
+    path since, or the checkout moved on) is never offered again: ``moved_on``
+    holds one line per report naming how many, its ts and its backup dir, until
+    it is dismissed. ``dismiss``: the ts of each report with an offered step.
+    REPAIR.json is user-writable, so untrusted: its stored step text is never
+    shown, and a row any field of which is not what the writer writes
+    (:func:`_fields_ok`), or that no step can be built for, is skipped and
+    counted in ``malformed`` (``malformed_in``: the ts of each undismissed
+    report holding one). ``unresolved``: the newest repair
+    says so, or has had no result for REPAIR_UNFINISHED_S (killed partway),
+    while the update state's guard still calls the checkout half-written: a
+    repair killed after its restore leaves no result, and only the tree says
+    whether it healed. The guard loads only for a report that reads
+    unresolved; the checkout's index and HEAD are read once per call."""
+    now = time.time() if now is None else now
+    repo = str(repo_dir)
+    offered: dict[str, tuple[str, str]] = {}  # path -> (step, ts)
+    moved: dict[str, tuple[str, str]] = {}  # path -> (ts, backup dir)
+    unresolved, malformed, refused = False, 0, 0
+    malformed_in: set[str] = set()
+    checkouts: dict = {}
+    backups = genesis_home_dir / "deploy-backups"
+    try:
+        names = sorted(n for n in os.listdir(backups) if n.endswith(_REPAIR_SUFFIX))
+    except OSError:
+        names = []
+    repair = None
+    if names:
+        try:
+            repair = _script(_REPAIR_SCRIPT)
+        except Exception:  # noqa: BLE001 - unloadable: no report can be read
+            logger.warning("live-move repair module could not be loaded", exc_info=True)
+    for name in names:
+        d = backups / name
+        if repair is None:
+            malformed, refused = malformed + 1, refused + 1
+            continue
+        try:
+            loaded = repair.load_report(str(d), repo)
+        except repair.BadReport as exc:
+            logger.debug("live-move repair report refused: %s", exc)
+            malformed, refused = malformed + 1, refused + 1
+            continue
+        if loaded is None:
+            continue
+        m, ts, rows, by_path = loaded["report"], loaded["ts"], loaded["rows"], loaded["by_path"]
+        age = now - loaded["mtime"]
+        result, dismissed = m.get("result"), bool(m.get("dismissed_at"))
+        unresolved = (result is None and age > REPAIR_UNFINISHED_S) or str(result).startswith(
+            "unresolved"
+        )
+        unresolved = unresolved and not dismissed
+        tag = m.get("tag") if isinstance(m.get("tag"), str) else None
+        # Parents first, by path components (`a/b` before `a-b`), as the
+        # writer orders its steps.
+        foreign = sorted(
+            (r for r in rows if r.get("class") == "foreign"),
+            key=lambda r: str(r.get("path")).split("/"),
+        )
+        # Each row is checked once; a step's drop list reads these by path.
+        ok = {id(r): _fields_ok(d, r) for r in foreign}
+        judged: list[tuple[str, dict, str]] = []
+        for row in foreign:
+            path = row.get("path")
+            if dismissed:
+                if isinstance(path, str):
+                    offered.pop(path, None)
+                    moved.pop(path, None)
+                continue
+            if not ok[id(row)]:
+                malformed += 1
+                malformed_in.add(ts)
+                continue
+            judged.append((path, row, _verdict(repair, d, repo, tag, row, checkouts)))
+        # A row's step drops the index entries of the rows below it before it
+        # re-adds its own: offered only while none of those moved on, and each
+        # entry it drops still holds what the repair left there, or nothing.
+        gone = {a for p, _, v in judged if v == "moved" for a in repair._parents(p)}
+        below = _below(repair, rows) if judged else {}
+        for path, row, verdict in judged:
+            offered.pop(path, None)
+            moved.pop(path, None)
+            if verdict == "offer" and path in gone:
+                verdict = "moved"
+            if verdict == "offer" and not all(
+                _left_alone(repair, by_path, ok, p, _checkout(repair, repo, checkouts))
+                for p in _drops(repair, row, below.get(path, ()))
+            ):
+                verdict = "moved"
+            if verdict == "offer":
+                # Never the stored text: the repair's own reapply_step, from the
+                # checked row, the report's own dir and the writer's `below`.
+                try:
+                    offered[path] = (
+                        repair.reapply_step(
+                            repo, str(d), row, below.get(path, ()), quote=shell_word
+                        ),
+                        ts,
+                    )
+                except Exception:  # noqa: BLE001 - a row no step can be built for is malformed
+                    malformed += 1
+                    malformed_in.add(ts)
+            elif verdict == "moved":
+                moved[path] = (ts, str(d))
+    counts: dict[tuple[str, str], int] = {}
+    for key in moved.values():
+        counts[key] = counts.get(key, 0) + 1
+    return {
+        "saved": [step for step, _ in offered.values()],
+        "saved_from": [ts for _, ts in offered.values()],
+        "dismiss": sorted({ts for _, ts in offered.values()}),
+        "moved_on": [
+            f"{n} saved path(s) from repair {ts} are no longer re-applicable here (the "
+            f"checkout moved on); their bytes are in {shell_word(backup)}"
+            for (ts, backup), n in sorted(counts.items())
+        ],
+        "moved_on_paths": len(moved),
+        "malformed": malformed,
+        "refused": refused,
+        "malformed_in": sorted(malformed_in),
+        "unresolved": unresolved and _mixed(genesis_home_dir, repo),
+    }
+
+
+def _mixed(genesis_home_dir: Path, repo: str | None) -> bool:
+    """Does the shared restart guard call the checkout half-written? Doubt
+    (no checkout named, a guard that cannot run) keeps the report's word."""
+    try:
+        guard = _script(_GUARD_SCRIPT)
+        verdict, _ = guard.verdict(str(genesis_home_dir / "update_state.json"), repo)
+    except Exception:  # noqa: BLE001 - any failure to decide keeps "unresolved"
+        return True
+    return verdict == guard.MIXED_TREE
+
+
+def _relative(path: object) -> bool:
+    """A plain relative path: no empty, `.` or `..` part, no NUL. Anything else
+    in an untrusted report could leave the checkout (or loop the writer's
+    _parents(), which never ends for an absolute path)."""
+    return (
+        isinstance(path, str)
+        and "\0" not in path
+        and all(part not in ("", ".", "..") for part in path.split("/"))
+    )
+
+
+def _inside(backup: Path, saved: object) -> bool:
+    """No saved copy, or one that resolves inside the report's own backup dir
+    (its parent resolved: the copy itself may be a symlink, never followed)."""
+    if saved is None:
+        return True
+    if not _relative(saved):
+        return False
+    root = os.path.realpath(backup)
+    parent = os.path.realpath(os.path.join(root, os.path.dirname(str(saved))))
+    return parent == root or parent.startswith(root + os.sep)
+
+
+_OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+_GIT_MODES = frozenset({"100644", "100755", "120000", "160000"})
+
+
+def _entry(e: object, stage: bool) -> bool:
+    """A (mode, oid) tree entry or, with ``stage``, a (mode, oid, stage) index entry."""
+    return (
+        isinstance(e, list)
+        and len(e) == (3 if stage else 2)
+        and all(isinstance(x, str) for x in e)
+        and e[0] in _GIT_MODES
+        and _OID.fullmatch(e[1]) is not None
+        and (not stage or e[2] in ("0", "1", "2", "3"))
+    )
+
+
+def _fields_ok(backup: Path, row: dict) -> bool:
+    """Every field reapply_step builds a step from is what the writer writes:
+    paths relative (copies inside the backup), entries git's, a FIFO's mode
+    octal, a flag one `ls-files -v` letter. Anything else is not shown."""
+    special, flag, blobs = row.get("special"), row.get("flag"), row.get("blobs") or []
+    through = row.get("unreachable_through")
+    return (
+        _relative(row.get("path"))
+        and _inside(backup, row.get("saved_as"))
+        and isinstance(row.get("disk_changed"), bool)
+        and (row.get("tag") is None or _entry(row.get("tag"), False))
+        and isinstance(row.get("index"), list)
+        and all(_entry(e, True) for e in row["index"])
+        and isinstance(blobs, list)
+        and all(_relative(b) and _inside(backup, b) for b in blobs)
+        and (through is None or _relative(through))
+        and (
+            flag is None
+            or (isinstance(flag, str) and len(flag) == 1 and flag.isascii() and flag.isalpha())
+        )
+        and (
+            special is None
+            or (
+                isinstance(special, dict)
+                and isinstance(special.get("type"), str)
+                and re.fullmatch(r"[0-7]{4}", str(special.get("mode"))) is not None
+            )
+        )
+    )
+
+
+def _below(repair, paths: list[dict]) -> dict[str, list[str]]:
+    """The writer's `below`: per directory, the row paths under it whose own
+    step re-adds what they held, or that held nothing (never an engine row's
+    entry), in the report's row order."""
+    below: dict[str, list[str]] = {}
+    for r in paths:
+        if not _relative(r.get("path")) or (r.get("class") != "foreign" and r.get("index")):
+            continue
+        for d in repair._parents(r["path"]):
+            below.setdefault(d, []).append(r["path"])
+    return below
+
+
+def _drops(repair, row: dict, below) -> list[str]:
+    """The paths the row's step drops from the index below its own, as
+    ``reapply_step`` builds it: ``below`` when the step writes a stage-0
+    entry, else none (its own path is _verdict's)."""
+    if [tuple(e) for e in row["index"]] == repair._as_index(row.get("tag")):
+        return []
+    return list(below) if any(e[2] == "0" for e in row["index"]) else []
+
+
+def _left_alone(repair, by_path: dict, ok: dict, path: str, state: dict | None) -> bool:
+    """Does every row of ``path`` hold, in the index, what the repair left
+    there, or nothing? An engine row's leftover is the tag's entry (the repair
+    put it back); a foreign row's too (the restore wrote the tag's). A row that
+    cannot be judged (malformed, another class) never reads as left alone.
+    ``by_path``: the report's rows by path; ``ok``: each foreign row's check."""
+    if state is None:
+        return False
+    have = [tuple(e) for e in state["entries"].get(path, [])]
+    for r in by_path.get(path, ()):
+        if r.get("class") == "foreign":
+            good = ok.get(id(r), False)
+        else:
+            good = r.get("class") == "engine" and (
+                r.get("tag") is None or _entry(r.get("tag"), False)
+            )
+        if not good or have not in ([], repair._as_index(r.get("tag"))):
+            return False
+    return True
+
+
+def _checkout(repair, repo: str | None, checkouts: dict) -> dict | None:
+    """The checkout's index entries, flags and HEAD, read once per collect
+    (None, also once, for a checkout that is gone or cannot be read)."""
+    if repo not in checkouts:
+        checkouts[repo] = None
+        if repair is not None and repo and os.path.isabs(repo) and os.path.isdir(repo):
+            try:
+                entries, flags = repair._index_state(repo)
+                head = repair._out(repo, "rev-parse", "--verify", "-q", "HEAD^{commit}")
+                checkouts[repo] = {"entries": entries, "flags": flags, "head": head}
+            except Exception:  # noqa: BLE001 - unreadable: every row reads moved on
+                logger.debug("deploy checkout index unreadable for repair rows", exc_info=True)
+    return checkouts[repo]
+
+
+def _verdict(repair, backup: Path, repo: str | None, tag: str | None, row: dict, checkouts) -> str:
+    """ "reapplied" when running the row's printed step (the repair's
+    ``reapply_step``) would change nothing; "offer" while the checkout is on
+    the report's tag commit and every part the step writes holds what the
+    repair left there (the tag's node, nothing, or a tag directory as the tag
+    has it; the tag's index entries; no flag) or already what the step puts
+    back, so the step destroys nothing nobody saved; else "moved" (someone
+    wrote the path since, the checkout moved on, or it cannot be judged).
+
+    Part by part as the step is built: its index entries, when the step writes
+    them (re-adding them also resets the flags, so the flags must then be
+    exactly the row's); its flags (else the step only sets them); and its node,
+    when the step puts one back, never read through a symlinked parent. A row
+    the repair saw beyond a symlinked or non-directory parent gets its index
+    part only. A socket or device cannot be made again by the step: it reads
+    re-applied once a node of its type is back."""
+    try:
+        state = _checkout(repair, repo, checkouts)
+        if state is None:
+            return "moved"
+        path = row["path"]
+        want = [tuple(e) for e in row["index"]]
+        left = repair._as_index(row.get("tag"))
+        writes_index = want != left
+        have = [tuple(e) for e in state["entries"].get(path, [])]
+        flag, cur = row.get("flag") or "", state["flags"].get(path) or ""
+        need = (flag in ("S", "s"), flag.islower())  # skip-worktree, assume-unchanged
+        got = (cur in ("S", "s"), cur.islower())
+        flags_back = got == need or (
+            not writes_index and all(g or not n for n, g in zip(need, got, strict=True))
+        )
+        index_back = not writes_index or have == want
+        disk = bool(row.get("disk_changed")) and not row.get("unreachable_through")
+        here = _here(repair, repo, path) if disk else None
+        node_back = not disk or _node_back(repair, backup, repo, path, here, row)
+        if index_back and flags_back and node_back:
+            return "reapplied"
+        if state["head"] != tag:
+            return "moved"
+        as_left = (
+            (index_back or have == left)
+            and (flags_back or not cur)
+            and (node_back or _as_left(repair, repo, path, here, row, state))
+        )
+        return "offer" if as_left else "moved"
+    except Exception:  # noqa: BLE001 - a row that cannot be judged is never offered
+        return "moved"
+
+
+def _here(repair, repo: str, path: str):
+    """The checkout node's lstat; None when absent (beyond a non-directory
+    parent too, as git calls it); False beyond a symlinked parent (never read
+    through one: it can point outside the checkout)."""
+    parent = repair._link_parent(repo, path)
+    if parent is not None:
+        return False if os.path.islink(os.path.join(repo, parent)) else None
+    try:
+        return os.lstat(os.path.join(repo, path))
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+
+
+def _holds_nothing(mode: int) -> bool:
+    """A socket or device: no bytes the repair could save, none a step loses."""
+    return stat.S_ISSOCK(mode) or stat.S_ISCHR(mode) or stat.S_ISBLK(mode)
+
+
+def _node_back(repair, backup: Path, repo: str, path: str, here, row: dict) -> bool:
+    """Is the node the step puts back already there?"""
+    saved, special = row.get("saved_as"), row.get("special")
+    if here is False:
+        return False
+    if isinstance(saved, str) and saved:
+        return here is not None and _same_node(str(backup / saved), os.path.join(repo, path))
+    if not isinstance(special, dict):  # nothing to put back: the step only removes
+        return here is None
+    if here is None:
+        return False
+    kind = next((name for test, name in repair._KINDS if test(here.st_mode)), None)
+    if special.get("type") != "fifo":
+        return kind == special.get("type")
+    return kind == "fifo" and f"{stat.S_IMODE(here.st_mode):04o}" == special.get("mode")
+
+
+def _as_left(repair, repo: str, path: str, here, row: dict, state: dict) -> bool:
+    """Does the path hold what the repair left there (or nothing at all)? The
+    tag's blob by git mode and id; a gitlink's empty directory; a directory
+    the tag has, holding exactly the tag's files."""
+    if here is None:
+        return True
+    if here is False:
+        return False
+    full, entry = os.path.join(repo, path), row.get("tag")
+    if entry is None:
+        return stat.S_ISDIR(here.st_mode) and _tag_dir(repair, repo, path, state)
+    mode, oid = entry
+    if mode == "160000":
+        return stat.S_ISDIR(here.st_mode) and not os.listdir(full)
+    return _blob_is(full, here, mode, oid)
+
+
+def _tag_dir(repair, repo: str, path: str, state: dict) -> bool:
+    """The directory holds exactly the tag's entries under it (the tag tree is
+    read once per checkout, and only for such a row; gitlinks are empty)."""
+    if "tree" not in state:
+        state["tree"] = repair._tree(repo, state["head"])
+    want = {p[len(path) + 1 :]: e for p, e in state["tree"].items() if p.startswith(path + "/")}
+    seen: set[str] = set()
+    full = os.path.join(repo, path)
+    for top, dirs, files in os.walk(full):
+        for name in files + dirs:
+            node = os.path.join(top, name)
+            rel, st = os.path.relpath(node, full), os.lstat(node)
+            if stat.S_ISDIR(st.st_mode):
+                if rel in want:  # a gitlink: an empty directory
+                    dirs.remove(name)
+                    if want[rel][0] != "160000" or os.listdir(node):
+                        return False
+                    seen.add(rel)
+                continue
+            if _holds_nothing(st.st_mode):
+                continue
+            if rel not in want or not _blob_is(node, st, *want[rel]):
+                return False
+            seen.add(rel)
+    return bool(want) and seen == set(want)
+
+
+def _open_regular(path: str) -> int:
+    """An fd on a regular file, never following a symlink nor blocking on a FIFO."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError(f"{path} is not a regular file")
+    return fd
+
+
+def _blob_is(full: str, st: os.stat_result, mode: str, oid: str) -> bool:
+    """Is the node the blob ``oid`` at git ``mode`` (the executable bit is the
+    one permission git tracks)? Hashed in _CHUNK reads, never read whole."""
+    h = hashlib.new("sha256" if len(oid) == 64 else "sha1")
+    if mode == "120000":
+        if not stat.S_ISLNK(st.st_mode):
+            return False
+        data = os.fsencode(os.readlink(full))
+        h.update(b"blob %d\0" % len(data) + data)
+    elif mode in ("100644", "100755"):
+        if not stat.S_ISREG(st.st_mode) or bool(st.st_mode & stat.S_IXUSR) != (mode == "100755"):
+            return False
+        fd = _open_regular(full)
+        try:
+            size, read = os.fstat(fd).st_size, 0
+            h.update(b"blob %d\0" % size)
+            while chunk := os.read(fd, _CHUNK):
+                h.update(chunk)
+                read += len(chunk)
+        finally:
+            os.close(fd)
+        if read != size:
+            return False
+    else:
+        return False
+    return h.hexdigest() == oid
+
+
+def _same_bytes(a: str, b: str) -> bool:
+    fa = _open_regular(a)
+    try:  # the first descriptor is closed even when the second open fails
+        fb = _open_regular(b)
+        try:
+            while True:
+                x, y = os.read(fa, _CHUNK), os.read(fb, _CHUNK)
+                if x != y:
+                    return False
+                if not x:
+                    return True
+        finally:
+            os.close(fb)
+    finally:
+        os.close(fa)
+
+
+def _same_node(saved: str, here: str) -> bool:
+    """The saved node against the checkout's, as `cp -a` would put it back,
+    never following a symlink: a file by its executable bit (the one
+    permission git tracks), its size, then its bytes in _CHUNK reads; a symlink
+    by its target; a FIFO by its mode; a directory entry by entry. A socket or
+    device is ignored: the repair cannot save one."""
+    a, b = os.lstat(saved), os.lstat(here)
+    if stat.S_IFMT(a.st_mode) != stat.S_IFMT(b.st_mode):
+        return False
+    if stat.S_ISLNK(a.st_mode):
+        return os.readlink(saved) == os.readlink(here)
+    if stat.S_ISREG(a.st_mode):
+        return (
+            a.st_mode & stat.S_IXUSR == b.st_mode & stat.S_IXUSR
+            and a.st_size == b.st_size
+            and _same_bytes(saved, here)
+        )
+    if stat.S_ISFIFO(a.st_mode):
+        return stat.S_IMODE(a.st_mode) == stat.S_IMODE(b.st_mode)
+    if not stat.S_ISDIR(a.st_mode):
+        return False
+    names, theirs = (
+        sorted(n for n in os.listdir(d) if not _holds_nothing(os.lstat(os.path.join(d, n)).st_mode))
+        for d in (saved, here)
+    )
+    return names == theirs and all(
+        _same_node(os.path.join(saved, n), os.path.join(here, n)) for n in names
+    )
+
+
+def live_repair_findings(repairs: dict | None) -> list[str]:
+    """The ``live_repair_*`` keys of a :func:`collect_live_repairs` dict."""
+    repairs = repairs or {}
+    found = [f"live_repair_saved:{len(repairs['saved'])}"] if repairs.get("saved") else []
+    if repairs.get("moved_on"):
+        found.append(f"live_repair_moved_on:{repairs.get('moved_on_paths') or 0}")
+    if repairs.get("unresolved"):
+        found.append("live_repair_unresolved")
+    if repairs.get("malformed"):
+        found.append(f"live_repair_malformed:{repairs['malformed']}")
+    return found
+
+
 # Sustained-staleness thresholds (the awareness check's paging axis). A
 # finding-CLASS boundary, so they live here beside derive_findings — the
 # single producer of finding keys — not in the awareness layer: an alert
@@ -938,6 +1504,7 @@ def derive_findings(
     behind_threshold: int = 50,
     main_checkout: dict | None = None,
     live: dict | None = None,
+    live_repairs: dict | None = None,
 ) -> list[str]:
     """Stable, order-deterministic finding keys — the alert/dedup contract.
 
@@ -953,7 +1520,8 @@ def derive_findings(
     ``main_checkout_unreadable`` when that could not be read: never nothing, so
     an unreadable tree cannot clear a standing dirty finding. ``clean``,
     ``not_deploy_root`` and ``deploying`` add nothing. ``live``
-    (:func:`collect_live`) adds the ``live_*`` keys of :func:`live_findings`."""
+    (:func:`collect_live`) adds the ``live_*`` keys of :func:`live_findings`, and
+    ``live_repairs`` (:func:`collect_live_repairs`) the ``live_repair_*`` keys."""
     findings: list[str] = []
     if missing_units:
         findings.append("missing_units:" + ",".join(sorted(missing_units)))
@@ -974,6 +1542,7 @@ def derive_findings(
         findings.append(f"behind_upstream:{commits_behind}")
     findings.extend(main_checkout_findings(main_checkout))
     findings.extend(live_findings(live))
+    findings.extend(live_repair_findings(live_repairs))
     return findings
 
 
@@ -1020,6 +1589,7 @@ def _collect_sync(repo: Path, genesis_home_dir: Path) -> dict:
         "main_checkout": main_checkout,
         "live": live,
         "upto": upto,
+        "live_repairs": collect_live_repairs(genesis_home_dir, repo),
     }
 
 
@@ -1042,6 +1612,7 @@ async def deploy_health(db: aiosqlite.Connection | None) -> dict:
             update_age_days=update.get("age_days"),
             main_checkout=collected["main_checkout"],
             live=collected["live"],
+            live_repairs=collected["live_repairs"],
         )
         return {
             "status": "attention" if findings else "healthy",
@@ -1053,6 +1624,7 @@ async def deploy_health(db: aiosqlite.Connection | None) -> dict:
             "host_gateway": collected["host_gateway"],
             "main_checkout": collected["main_checkout"],
             "live": collected["live"],
+            "live_repairs": collected["live_repairs"],
         }
     except Exception:
         logger.error("deploy_health snapshot failed", exc_info=True)

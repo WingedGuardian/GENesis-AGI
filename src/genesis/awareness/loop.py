@@ -1704,6 +1704,11 @@ async def _check_deploy_staleness(db) -> None:
 
         priority = "critical" if critical else "high"
         alert_key = ",".join(classes) + ":" + priority
+        if set(classes) & _DEPLOY_REPAIR_CLASSES:
+            # The repair paragraph quotes commands and report names specific to
+            # this snapshot: other steps or reports are another alert, never
+            # the standing one left naming the old commands.
+            alert_key += ":" + _deploy_repair_identity(snap.get("live_repairs") or {})
         now = time.monotonic()
         if (
             now - _last_deploy_alert_at < _DEPLOY_ALERT_COOLDOWN_S
@@ -1727,10 +1732,12 @@ async def _check_deploy_staleness(db) -> None:
         # The drift paragraph (and its update.sh recovery sentence) only when a
         # drift class is present: update.sh REFUSES a dirty deploy checkout, so
         # telling someone to run it for a dirty-only state is wrong advice.
-        if set(classes) - _DEPLOY_CHECKOUT_CLASSES - _DEPLOY_LIVE_CLASSES:
+        if set(classes) - _DEPLOY_CHECKOUT_CLASSES - _DEPLOY_LIVE_CLASSES - _DEPLOY_REPAIR_CLASSES:
             paragraphs.append(_deploy_drift_paragraph(snap, age_days, behind, git_facts))
         if set(classes) & _DEPLOY_LIVE_CLASSES:
             paragraphs.append(_deploy_live_paragraph(snap, findings))
+        if set(classes) & _DEPLOY_REPAIR_CLASSES:
+            paragraphs.append(_deploy_repair_paragraph(snap.get("live_repairs") or {}))
         if "main_checkout_dirty" in classes:
             paragraph = _deploy_checkout_dirty_paragraph(checkout)
             if carried and checkout.get("count") is not None:
@@ -1749,7 +1756,11 @@ async def _check_deploy_staleness(db) -> None:
             id=str(uuid.uuid4()),
             source="deploy_staleness_monitor",
             type="infrastructure_alert",
-            content=" ".join(paragraphs) + f" [findings: {', '.join(findings)}]",
+            # Text a database column can always hold: one field that is not
+            # valid Unicode (a lone surrogate) is escaped, never the whole alert lost.
+            content=(" ".join(paragraphs) + f" [findings: {', '.join(findings)}]")
+            .encode("utf-8", "backslashreplace")
+            .decode("utf-8"),
             priority=priority,
             created_at=datetime.now(UTC).isoformat(),
             content_hash=content_hash,
@@ -1781,6 +1792,117 @@ _DEPLOY_LIVE_CLASSES = frozenset(
         "live_candidate_tier2",
     }
 )
+
+#: Finding classes from the live-move repair's reports
+#: (deploy_health.live_repair_findings): their own wording, and they never page.
+_DEPLOY_REPAIR_CLASSES = frozenset(
+    {
+        "live_repair_saved",
+        "live_repair_moved_on",
+        "live_repair_unresolved",
+        "live_repair_malformed",
+    }
+)
+#: Re-apply steps quoted inline; the rest are counted, and the report names them.
+_DEPLOY_REPAIR_STEPS_SHOWN = 5
+
+
+def _deploy_repair_identity(repairs: dict) -> str:
+    """What the repair paragraph names (steps, their reports, the moved-on and
+    malformed lines), hashed: the alert's identity changes when they do."""
+    named = {
+        k: repairs.get(k)
+        for k in (
+            "saved",
+            "saved_from",
+            "dismiss",
+            "moved_on",
+            "malformed",
+            "refused",
+            "malformed_in",
+        )
+    }
+    return hashlib.sha256(json.dumps(named, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _deploy_repair_paragraph(repairs: dict) -> str:
+    # Every ts printed into a command goes through the one display encoder.
+    from genesis.observability.snapshots.deploy_health import shell_word
+
+    parts: list[str] = []
+    saved = repairs.get("saved") or []
+    dismiss = repairs.get("dismiss") or []
+    if saved:
+        shown = saved[:_DEPLOY_REPAIR_STEPS_SHOWN]
+        more = len(saved) - len(shown)
+        # The omitted steps are offered here once the shown ones are run (they
+        # then read re-applied, and the alert's identity changes). Never the
+        # report's stored reapply list: it also holds the steps withheld here.
+        source = repairs.get("saved_from") or []
+        rest = ""
+        if more:
+            where = sorted(set(source[len(shown) :])) if len(source) == len(saved) else []
+            rest = f" (and {more} more" + (
+                f", from repair {' and '.join(where)}" if where else ""
+            )
+            rest += (
+                ": each is offered here once the steps above are run; the reapply list "
+                "stored with a repair is not a substitute, as it keeps steps withheld "
+                "here because running them would overwrite newer work)"
+            )
+        clears = (
+            ". Once decided, "
+            + " and ".join(
+                f"scripts/deploy_candidates repair-move --dismiss {shell_word(ts)}"
+                for ts in dismiss
+            )
+            + " clears this."
+            if dismiss
+            else ". Once decided, scripts/deploy_candidates repair-move --dismiss <ts> clears this."
+        )
+        parts.append(
+            f"Genesis put a half-written `live` checkout back to its rollback tag and saved "
+            f"{len(saved)} path(s) that were not the update's (someone's edits). Each "
+            "re-apply step, if they are still wanted, run in this order: "
+            + " && ".join(shown)
+            + rest
+            + clears
+        )
+    if repairs.get("moved_on"):
+        parts.append(
+            " ".join(f"{line}." for line in repairs["moved_on"])
+            + " Their steps are no longer offered: running one would overwrite what is "
+            "there now. repair-move --dismiss <ts> clears each."
+        )
+    refused = repairs.get("refused") or 0
+    rows = (repairs.get("malformed") or 0) - refused
+    if rows > 0:
+        malformed_in = repairs.get("malformed_in") or []
+        parts.append(
+            f"{rows} row(s) of live-move repair reports are not what the "
+            "repair writes, so no step is offered for them (their reports are under "
+            "~/.genesis/deploy-backups/)."
+            + (
+                " "
+                + " and ".join(f"repair-move --dismiss {shell_word(ts)}" for ts in malformed_in)
+                + " clears this."
+                if malformed_in
+                else ""
+            )
+        )
+    if refused > 0:
+        parts.append(
+            f"{refused} live-move repair report(s) under ~/.genesis/deploy-backups/ were "
+            "not read at all (a name, file type, size or checkout the repair never "
+            "writes); moving them out of that directory clears this."
+        )
+    if repairs.get("unresolved"):
+        parts.append(
+            "The last live-move repair did not finish (its REPAIR.json under "
+            "~/.genesis/deploy-backups/ says why); scripts/deploy_candidates repair-move "
+            "runs it again."
+        )
+    return " ".join(parts)
 
 
 def _deploy_drift_paragraph(snap: dict, age_days, behind, git_facts: dict) -> str:
