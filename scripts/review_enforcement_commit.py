@@ -1958,10 +1958,10 @@ def main() -> None:
         # parsed after this import. That includes the commit that would repair
         # review_state, so the gate would wall off its own fix.
         #
-        # The sibling (scripts/hooks/git_push_guard.py, the ESCALATION_ROUND_CAP
-        # import) widened the same handler for the same reason, but its degrade
-        # is NOT the same and the difference matters: it falls back to a default
-        # constant and keeps every gate armed, whereas this one abandons the
+        # The sibling (scripts/hooks/git_push_guard.py, its soft imports) widens
+        # the same handler for the same reason, but its degrade is NOT the same
+        # and the difference matters: each of its imports falls back to a
+        # default and keeps every gate armed, whereas this one abandons the
         # whole gate — the direct-to-main rule, the review-marker requirement and
         # the round rules all stop applying. That is a big loss, chosen over a
         # bigger one, and it is the pre-existing behaviour for the absent case
@@ -2307,8 +2307,7 @@ def main() -> None:
                 "to the per-worktree path from `python3 scripts/review_state.py evidence-path` "
                 "(concurrent sessions don't clobber it), then re-mark:\n"
                 "  python3 scripts/review_state.py mark   # a genesis-architect audit is "
-                "INTERNAL — it satisfies this depth gate and never moves the cross-model "
-                "streak; no outcome flag needed\n"
+                "INTERNAL — it satisfies this depth gate; no outcome flag needed\n"
                 "If the audit genuinely ran but its format isn't recognized, acknowledge with "
                 "a trailing shell comment (outside any quotes):  # depth-ack"
                 + _merge_note(cwd, gate="depth", deadline=hook_deadline)
@@ -2354,8 +2353,8 @@ def main() -> None:
             "plugin is installed, else `/deep-review`, or dispatch the genesis-architect "
             "agent — save it to `python3 scripts/review_state.py evidence-path`, then "
             "re-mark: `python3 scripts/review_state.py mark --agent-output <that file>` "
-            "(a genesis-architect audit is INTERNAL and satisfies this gate; it never "
-            "moves the cross-model streak — no outcome flag needed). Only a "
+            "(a genesis-architect audit is INTERNAL and satisfies this gate — no "
+            "outcome flag needed). Only a "
             "non-Anthropic cross-model review (Codex/Kimi) is marked `--source external "
             "--defects|--clean`.\n"
             "If findings are intentionally accepted, append a trailing shell "

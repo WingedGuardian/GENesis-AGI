@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Authoritative review-round budget from pull-request evidence.
 
-The local review-state counter is deliberately unsuitable for this job: it
-tracks a defect-bearing streak, while this policy counts ROUNDS: distinct commit
-heads that drew findings from a GitHub App reviewer (before
+This policy counts ROUNDS: distinct commit heads that drew findings from a
+GitHub App reviewer (before
 ``ROUND_RULE_CUTOVER_ISO``, heads the primary reviewed).  This module is stdlib-only so the
 PreToolUse and commit hooks, the external-review runner, and maintenance CLIs can
 all ask the same question.
@@ -115,7 +114,6 @@ HOOK_SURFACE_FILES = frozenset(
         "scripts/review_late.py",
         "scripts/review_deadline.py",
         "scripts/external_review.py",
-        "scripts/lib/gate_menu.py",
         ".claude/settings.json",
         "scripts/behavioral_linter.py",
         "scripts/check_stale_pending.py",

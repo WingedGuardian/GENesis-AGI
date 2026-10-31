@@ -83,7 +83,6 @@
 /scripts/surface_pr_updates.py      @WingedGuardian
 /config/external_review.yaml            @WingedGuardian
 /scripts/external_review.py             @WingedGuardian
-/scripts/lib/gate_menu.py               @WingedGuardian
 /scripts/review_budget.py               @WingedGuardian
 /scripts/review_findings.py             @WingedGuardian
 /scripts/review_reflection.py           @WingedGuardian

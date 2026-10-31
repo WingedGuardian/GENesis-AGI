@@ -126,8 +126,8 @@ from typing import Literal, NamedTuple
 # script (sys.path[0] is this dir) AND when it is imported as a module for tests
 # (importlib does not add the file's dir to sys.path).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-# scripts/ (parent dir) for review_state — the shared escalation-cap constant, so
-# the Codex-round gate below and the commit gate's Rule 3 stop at the same N.
+# scripts/ (parent dir) for the shared review modules imported below
+# (review_findings, review_deadline, review_budget, …).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     from hook_input import degraded_exit, field, read_payload, run_guard  # noqa: E402
@@ -247,23 +247,16 @@ except Exception as _findings_exc:  # noqa: BLE001 — degrade the merge gate on
     def _devin_finding(body):  # type: ignore[no-redef]
         raise RuntimeError(_REVIEW_FINDINGS_ERROR)
 
-# SOFT dependency (mirrors review_enforcement_commit.py's guard for the SAME
-# import): an unimportable review_state must degrade ONLY the round-escalation
-# advisory to its documented default — never crash this module at load time.
-# A module-load exception exits 1 BEFORE run_guard's fail-closed wrapper can
-# convert it to a block, and CC treats non-2 as non-blocking → EVERY fail-closed
-# gate in this file (force-push, merge, sqlite) would silently vanish.
-# `ESCALATION_ROUND_CAP` is deliberately NOT imported here. AST-verified 2026-09-25:
-# it had ZERO Load references in this file — an ImportFrom and an except-branch Store
-# and nothing else — so no gate here ever consulted it, and the six-line rationale
-# about "every fail-closed gate in this file" protected a name none of them read. Its
-# real consumers import it from `review_state` directly, each behind its own degrade
-# (`review_enforcement_commit.py`, `ask_gate_menu.py`, `genesis_statusline.py`).
+# This module imports nothing from `review_state`. It once imported the escalation
+# caps (`ESCALATION_ROUND_CAP`, `FINAL_ROUND_CAP`) that no gate here ever read
+# (AST-verified 2026-09-25: an ImportFrom and an except-branch Store, no Load); both
+# constants are now deleted along with the local review streak they capped.
 #
-# That is the same criterion this change applied to the retired `FINAL_ROUND_CAP`,
-# and applying it to one name in a two-name import while leaving its sibling is how
-# the next audit re-finds this. Note grep alone reports the name as live here — it
-# counts a docstring mention and the Store — so the check has to be AST.
+# Every soft import below follows one rule: a module-LOAD exception exits 1 BEFORE
+# run_guard's fail-closed wrapper can convert it to a block, and CC treats non-2 as
+# non-blocking, so EVERY fail-closed gate in this file (force-push, merge, sqlite)
+# would silently vanish. Each one therefore degrades to a documented default and
+# never raises at load time.
 
 try:
     from review_deadline import bounded_timeout as _bounded_timeout  # noqa: E402
@@ -485,8 +478,8 @@ def _mentions_gated_op(command: str) -> bool:
     return mentions(command, _GATED_MENTION) or mentions(command, _GH_MENTION, _CREATE_MENTION)
 
 
-# Local push allowlist (offline re-push cache). SOFT dependency, guarded exactly
-# like the review_state import above: a module-LOAD exception must degrade to
+# Local push allowlist (offline re-push cache). SOFT dependency, guarded by the
+# soft-import rule stated above: a module-LOAD exception must degrade to
 # None (→ the pure live-ls-remote republish path, i.e. today's behavior), NEVER
 # propagate — a raising import exits 1, which CC treats as non-blocking, silently
 # disabling EVERY fail-closed gate in this file. push_allowlist itself is
@@ -5930,14 +5923,13 @@ _HOOK_SURFACE_FILES = (
         {
             "scripts/bash_safety_hook.sh",  # the global Bash chokepoint
             "scripts/review_scope.py",  # substantiality classifier (feeds THIS gate)
-            "scripts/review_state.py",  # escalation counter + review markers
+            "scripts/review_state.py",  # review markers + evidence
             "scripts/review_budget.py",  # distinct-head policy evaluator
             "scripts/review_findings.py",  # reviewer list + severity parsers
             "scripts/review_reflection.py",  # round reflection tool + validator
             "scripts/review_late.py",  # late findings the round reflection owes
             "scripts/review_deadline.py",  # aggregate hook timeout arithmetic
             "scripts/external_review.py",  # autonomous review-request boundary
-            "scripts/lib/gate_menu.py",  # cap decision menu shown to the user
             ".claude/settings.json",  # hook wiring (inline blob + matchers)
             # scripts/-root hooks wired via .claude/hooks/genesis-hook (which
             # resolves bare names as scripts/<name>); scripts/hooks/* wirings are

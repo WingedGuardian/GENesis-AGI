@@ -20,41 +20,33 @@ gates marking — it is not installed on many hosts.
 CLI usage:
     python3 review_state.py status         # prints current review state
     python3 review_state.py evidence-path  # prints this worktree's evidence path
-    python3 review_state.py mark           # an internal (same-model) review — never counts
+    python3 review_state.py mark           # an internal (same-model) review
     python3 review_state.py mark --agent-output <path>                        # internal, explicit path
-    python3 review_state.py mark --source external --defects                  # external defect-bearing round → +1
-    python3 review_state.py mark --source external --clean                    # external clean round → reset streak
+    python3 review_state.py mark --source external --defects                  # records an external review that found defects
+    python3 review_state.py mark --source external --clean                    # records an external review that found none
     python3 review_state.py diff-hash      # prints current diff hash
 
-THE ESCALATION STREAK IS CROSS-MODEL ONLY. ``--source`` records WHO PRODUCED THE
-FINDINGS the mark represents, and it is what decides whether the round counts:
+``--source`` records WHO PRODUCED THE FINDINGS the mark represents:
   * ``--source internal`` (the DEFAULT) — a genesis-architect / genesis-security /
-    any-subagent / self review. Same author-model reviewing its own work: it is free,
-    shares the author's blind spots, and NEVER moves the streak (not an increment, not
-    a reset), whatever its outcome. The outcome flag is optional and ignored here.
-  * ``--source external`` — a review by a non-ANTHROPIC MODEL found (or cleared) the round.
-    EXTERNAL is judged by the reviewing MODEL, not the gateway: Anthropic Claude via any
-    route (incl. an OpenRouter Claude route) is INTERNAL, and a Genesis internal model call
-    is never a reviewer. The approved methods are Codex plus whatever the install names
-    as its secondary reviewer — NOT OpenRouter, and never a Genesis internal model. Which
-    reviewer that is, if any, is install-local: it belongs in local config, not in a file
-    every clone receives.
-    This is the only kind that counts, so it REQUIRES a review-outcome flag:
-    ``--defects`` (a new BLOCKER/SHOULD-FIX/P1/P2 → +1) or ``--clean`` (none → reset the
-    streak, circuit-breaker reset-on-success).
+    any-subagent / self review. The outcome flag is optional and ignored here.
+  * ``--source external`` — a review by a non-ANTHROPIC MODEL. EXTERNAL is judged by
+    the reviewing MODEL, not the gateway: Anthropic Claude via any route (incl. an
+    OpenRouter Claude route) is INTERNAL, and a Genesis internal model call is never a
+    reviewer. It REQUIRES a review-outcome flag, recorded in the marker:
+    ``--defects`` (a new BLOCKER/SHOULD-FIX/P1/P2) or ``--clean`` (none).
 The ``--source`` value describes the review that produced the findings, NOT who typed
 the evidence file: a mark recording "verified + fixed Codex's findings" is external; a
-mark of your own architect/security audit is internal. (supersedes feea3f71 / #1446 —
-the required-outcome trap it closed only ever bit internal re-audits, which now can't
-inflate the streak at all; the requirement is kept where it is still load-bearing, on
-external marks.)
+mark of your own architect/security audit is internal.
+
+NOTHING HERE COUNTS ROUNDS. A local consecutive-defect streak lived here and is
+deleted: no gate read it after the commit gate moved to GitHub-backed review rounds
+(``review_budget``) and the round reflection it requires before each fix.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 import re
 import subprocess
@@ -80,12 +72,12 @@ from pathlib import Path
 #:   GIT_INDEX_FILE     staged hash -> "clean"
 #:   GIT_EXTERNAL_DIFF  _staged_content_hash -> "clean"   (kind 2)
 #:
-#: Every one fails OPEN. `"clean"` is this module's sentinel for NOTHING STAGED,
-#: so unreviewed work becomes invisible to the depth gate; the branch read
-#: defeats the no-commits-to-main check; the key change makes the gate consult a
-#: marker file that does not exist; and via `bump_review_round`, a "clean"
-#: content hash returns the CURRENT round without advancing, so the escalation
-#: cap silently stops counting. `review_scope`'s substantiality classifier moves
+#: Each one corrupts what the gates see. `"clean"` is this module's sentinel for
+#: NOTHING STAGED: `is_review_current` reads it as nothing to review (fail OPEN),
+#: while the depth gate's content bind (`marker_content_current`) refuses clearance
+#: on it (a false block on reviewed work). The branch read defeats the
+#: no-commits-to-main check; the key change makes the gate consult a marker file
+#: that does not exist. `review_scope`'s substantiality classifier moves
 #: `substantial` -> `inline` for the same reason.
 #:
 #: The REMAINING entries were measured to have NO effect in a standalone-repo
@@ -239,18 +231,8 @@ except Exception:  # Reverse-version skew: keep state reads available and bounde
             ) from error
 
 _MARKER_DIR = Path.home() / ".genesis" / "review_markers"
-# Per-worktree review-ROUND counter (escalation cap). Deliberately a SEPARATE store
-# from the marker above: review_invalidate_on_commit clears the marker after every
-# commit, but the round count must SURVIVE commits — a review→fix→re-review loop
-# commits between rounds, and the whole point is to notice when that loop runs long.
-_ROUND_DIR = Path.home() / ".genesis" / "review_rounds"
-# The streak's old hard-stop threshold. No gate reads it any more: the commit
-# gate's streak tiers (and '# escalation-ack') are retired, replaced by the round
-# reflection the gate now enforces. The statusline still shows the streak against
-# it until the follow-on cleanup deletes the counter.
-ESCALATION_ROUND_CAP = 3
-# Standing authorization is measured from GitHub-backed review rounds, not
-# from the local streak/lifetime store below.  Keep these constants here as the
+# Standing authorization is measured from GitHub-backed review rounds, not from
+# any local counter.  Keep these constants here as the
 # compatibility import surface used by hook trees at different revisions.
 STANDING_REVIEWED_HEAD_LIMIT = 4
 GATE_DISCOVERY_ROUND_LIMIT = 2
@@ -267,7 +249,7 @@ STRONGLY_DISCOURAGED_REVIEWED_HEADS = 5
 # so an in-flight review from before an upgrade isn't lost mid-session.
 _LEGACY_STATE_FILE = Path.home() / ".genesis" / "review_state.json"
 # Per-worktree review-EVIDENCE (the code-reviewer/genesis-architect audit output the
-# depth gate validates). Per-worktree — like the marker/round — so concurrent
+# depth gate validates). Per-worktree — like the marker — so concurrent
 # sessions don't overwrite each other's evidence (which would validate one session's
 # marker against ANOTHER session's audit). Keyed by the same _worktree_key.
 _EVIDENCE_DIR = Path.home() / ".genesis" / "review_evidence"
@@ -340,7 +322,7 @@ def _worktree_key(cwd: str | None = None, *, deadline: float | None = None) -> s
 def _evidence_file(cwd: str | None = None) -> Path:
     """Per-worktree review-evidence path (``--agent-output`` default).
 
-    Same worktree key as the marker/round so a session's evidence can't be
+    Same worktree key as the marker so a session's evidence can't be
     overwritten by a concurrent session between writing it and marking the review.
     """
     return _EVIDENCE_DIR / f"{_worktree_key(cwd)}.txt"
@@ -625,17 +607,11 @@ def mark_reviewed(
     (gstack telemetry) is advisory — it annotates the marker but never refuses,
     because gstack is not installed on many hosts (see ``_verify_review_log``).
 
-    ``source`` records WHO PRODUCED THE FINDINGS this mark represents and decides
-    whether it moves the cross-model escalation streak:
-      * ``"internal"`` (the DEFAULT) — a same-model self/subagent review
-        (genesis-architect / genesis-security / any spawned agent). It NEVER moves
-        the streak, so ``clean`` is irrelevant here (see ``bump_review_round``).
-      * ``"external"`` — a non-Anthropic cross-model reviewer (Codex/Kimi/…). Here
-        ``clean`` records the OUTCOME: ``clean=True`` (no new BLOCKER/SHOULD-FIX/P1/P2)
-        resets the streak (circuit-breaker reset-on-success); ``clean=False`` counts
-        the round as defect-bearing.
-    Any value other than ``"external"`` is normalized to ``"internal"`` — the safe
-    direction (an unknown provenance does not inflate the cross-model streak).
+    ``source`` records WHO PRODUCED THE FINDINGS this mark represents:
+    ``"internal"`` (the DEFAULT, a same-model review) or ``"external"`` (a
+    non-Anthropic cross-model reviewer), with ``clean`` recording an external
+    review's OUTCOME. Both are recorded in the marker; nothing counts rounds. Any
+    value other than ``"external"`` is normalized to ``"internal"``.
 
     Returns True if the marker was written, False if the authoritative evidence
     check failed.
@@ -688,7 +664,8 @@ def mark_reviewed(
         "level": level,  # computed substantiality (substantial|inline|unknown)
         "adversarial": adversarial,  # derived: evidence has adversarial-audit structure
         "depth_evidence": depth_msg,
-        "source": source,  # internal (same-model, never counts) | external (cross-model)
+        "source": source,  # internal (same-model) | external (cross-model)
+        "outcome": ("clean" if clean else "defects") if source == "external" else None,
     }
     state_file.write_text(json.dumps(state, indent=2))
     # Loud feedback when a substantial change was marked WITHOUT adversarial-audit
@@ -701,41 +678,11 @@ def mark_reviewed(
             "semantics) and re-mark.",
             file=sys.stderr,
         )
-    # Update the escalation counter (see bump_review_round). A defect-bearing round
-    # on a distinct staged diff advances the streak; a clean round resets it.
-    # Best-effort: marking the review must ALWAYS succeed even if the counter is
-    # unwritable, so a counter problem can never leave the user stuck behind the gate.
-    try:
-        round_n = bump_review_round(cwd=cwd, clean=clean, source=source)
-    except Exception:  # noqa: BLE001 - the counter must never block marking a review
-        round_n = 0
     if source == "internal":
-        label = "internal review — cross-model streak unchanged"
-    elif clean:
-        label = "external clean → streak reset"
+        label = "internal review"
     else:
-        label = f"external round {round_n}"
+        label = "external review, " + ("clean" if clean else "defects found")
     print(f"Review marker written: {state['diff_hash']} ({label})")
-    # Class-sweep reminder (369bbe0e): from the SECOND defect-bearing EXTERNAL round on
-    # this branch you're in a cross-model review→fix loop — the #1 cause of
-    # round-after-round loops is instance-patching the flagged line instead of sweeping
-    # the whole defect CLASS. A print here fires the reminder DETERMINISTICALLY at the
-    # mark-time decision moment (a recall-dependent memory didn't fire during PR #1397's
-    # 3-round Codex loop). Advisory only — never blocks, never touches the return value.
-    # Internal marks never reach round>=2 (they don't count), and a clean external round
-    # (round_n == 0) is not a loop, so both correctly emit nothing.
-    if source == "external" and round_n >= 2:
-        print(
-            f"REMINDER (round {round_n}): you're in a review→fix loop. Before the next "
-            "fix, classify ALL findings into defect CLASSES and sweep every sibling — "
-            "every reader of a shared store; both build-paths of a migration "
-            "(create_all_tables + the numbered migration); both ends of a marker/parser "
-            "spec; every commit-A-then-B writer; every status in a state machine. "
-            "Instance-patching the one flagged line is the #1 cause of review-loop churn. "
-            "That classification belongs in the round reflection, which the commit gate "
-            "requires before the fix (`python3 scripts/review_reflection.py status`).",
-            file=sys.stderr,
-        )
     return True
 
 
@@ -857,30 +804,6 @@ def clear_all_markers() -> tuple[int, list[str]]:
     return cleared, failures
 
 
-# ── Review-round counter (escalation cap) ─────────────────────────────────────
-# Counts CONSECUTIVE defect-bearing review→fix→re-review rounds per change so the
-# commit gate can force a conscious stop after ESCALATION_ROUND_CAP rounds. Kept
-# in a per-worktree file SEPARATE from the marker (the marker is wiped on every
-# commit; the round count must persist across the commits a review loop makes
-# between rounds).
-#
-# A round counts (advances the streak) only when the review it records surfaced a
-# NEW defect — the caller passes clean=False (the default) — AND the staged diff
-# is distinct from the last-counted one on this branch. A CLEAN review round
-# (clean=True: the review found no BLOCKER/SHOULD-FIX/P1/P2 finding) RESETS the
-# streak to 0 — circuit-breaker reset-on-success. This makes the machine
-# implement the SKILL.md cap literally ("3 rounds that each find NEW defects"):
-# honestly-clean multi-commit development (three independent clean reviews) never
-# trips, while a genuine review→fix loop that keeps surfacing defects still stops
-# at round 3. A branch change resets the count; re-marking the same diff does not
-# advance it.
-
-
-def _round_file(cwd: str | None = None, *, deadline: float | None = None) -> Path:
-    """Per-worktree round-counter path (same worktree key as the marker)."""
-    return _ROUND_DIR / f"{_worktree_key(cwd, deadline=deadline)}.json"
-
-
 def _staged_content_hash(cwd: str | None = None, *, deadline: float | None = None) -> str:
     """SHA-256 of the FULL staged patch (``git diff --cached``).
 
@@ -897,7 +820,7 @@ def _staged_content_hash(cwd: str | None = None, *, deadline: float | None = Non
             # --no-ext-diff is LOAD-BEARING, not hygiene. An external diff
             # driver makes this command emit NOTHING, so this hash becomes
             # the "clean" nothing-staged sentinel over real staged work, and
-            # bump_review_round then stops advancing the escalation cap.
+            # the depth gate's content bind then reads it as nothing staged.
             # Scrubbing GIT_EXTERNAL_DIFF alone does NOT close that: MEASURED
             # 2026-09-19, the same driver can be set through GIT_CONFIG_COUNT,
             # GIT_CONFIG_PARAMETERS or GIT_CONFIG_GLOBAL, and through a
@@ -936,323 +859,6 @@ def _staged_content_hash(cwd: str | None = None, *, deadline: float | None = Non
         return "unknown"
     except (FileNotFoundError, OSError):
         return "unknown"
-
-
-def _coerce_finite_int(value: object, default: int = 0) -> int:
-    """Best-effort finite int from a persisted JSON value; ``default`` otherwise.
-
-    Closes the malformed-counter VALUE class at a single point: a valid JSON number
-    like ``1e999`` parses to ``float('inf')``, and ``int(inf)`` raises ``OverflowError``
-    (NOT a subclass of ``TypeError``/``ValueError``), so a plain ``int()`` guard would
-    let it escape and crash the gate — violating the never-raises/fail-open contract.
-    Rejecting non-finite floats and catching ``OverflowError`` here means no persisted
-    round value can ever raise, however corrupt. Never raises.
-    """
-    try:
-        if isinstance(value, float) and not math.isfinite(value):
-            return default
-        return int(value)
-    except (TypeError, ValueError, OverflowError):
-        return default
-
-
-def _load_round(cwd: str | None = None, *, deadline: float | None = None) -> dict:
-    """Read the round-counter file, normalizing shape AND the round VALUE.
-
-    Validating once, here at the single load boundary, is the whole class-fix for
-    malformed counters. Two sub-classes are closed here:
-      - SHAPE: valid JSON that is not an object (``[1,2,3]``, ``42``, ``"str"`` from a
-        manual edit / schema skew) would reach a caller's ``.get()`` and raise
-        ``AttributeError`` — normalized to ``{}``.
-      - VALUE: a well-formed dict whose ``round`` is pathological (``1e999`` → inf →
-        ``int()`` ``OverflowError``; a non-numeric string; null) — coerced to a finite
-        int via ``_coerce_finite_int`` so every caller provably gets a clean ``int``.
-    Every caller therefore receives a dict with a finite-int ``round`` → nothing a
-    corrupt file contains can raise → it collapses to "no/zero counter → fail open".
-    Never raises.
-    """
-    try:
-        p = _round_file(cwd, deadline=deadline)
-        if p.exists():
-            data = json.loads(p.read_text())
-            if isinstance(data, dict):
-                # LEGACY discard: a counter written by the pre-source-axis (reviewer-
-                # agnostic) implementation has a `round` but no `last_source`. Its count
-                # is untrusted — under the old model the local streak only ever counted
-                # INTERNAL self-reviews, so a nonzero legacy count is exactly the
-                # internally-inflated streak this change exists to stop counting. On
-                # upgrade, preserving it would let the commit gate keep mode-switching /
-                # hard-blocking on rounds that were never cross-model. Treat it as no
-                # counter → the next EXTERNAL mark re-establishes a clean streak (and
-                # stamps last_source); an internal mark leaves it at 0. (Self-healing
-                # mechanism — obviates a one-time per-install data repair.)
-                if "round" in data and "last_source" not in data:
-                    return {}
-                if "round" in data:
-                    data["round"] = _coerce_finite_int(data.get("round"))
-                return data
-    except (json.JSONDecodeError, OSError):
-        pass
-    return {}
-
-
-def get_review_round(cwd: str | None = None) -> int:
-    """Review rounds recorded for the CURRENT branch's change.
-
-    Returns 0 when the stored count is for a different branch (a new change starts
-    fresh) or when no count exists. Never raises.
-    """
-    state = _load_round(cwd)
-    if not state or state.get("branch") != get_current_branch(cwd=cwd):
-        return 0
-    return _coerce_finite_int(state.get("round", 0))
-
-
-def _write_round(
-    state: dict, cwd: str | None = None, *, deadline: float | None = None
-) -> None:
-    """Persist the round-counter state (best-effort — never raises)."""
-    try:
-        rf = _round_file(cwd, deadline=deadline)
-        rf.parent.mkdir(parents=True, exist_ok=True)
-        rf.write_text(json.dumps(state, indent=2))
-    except OSError:
-        pass
-
-
-def bump_review_round(
-    cwd: str | None = None, *, clean: bool = False, source: str = "internal"
-) -> int:
-    """Update the CROSS-MODEL defect-bearing-round streak for the current branch.
-
-    ``source`` decides whether the mark counts at all — the streak exists to catch
-    *cross-model non-convergence* (a non-Anthropic reviewer finding new defects
-    round after round), NOT to penalize free same-model self-review:
-      * ``source != "external"`` (the DEFAULT, i.e. an internal same-model review) —
-        NEVER moves the streak: no increment, no reset, no ``last_hash`` write. Returns
-        the current round unchanged. This is the core of the fix — an internal audit
-        (even the one the mode-switch gate itself mandates) can never trip the cap.
-      * ``source == "external"`` — a non-Anthropic cross-model reviewer:
-        - ``clean=True`` RESETS the streak to 0 (circuit-breaker reset-on-success)
-          regardless of whether the staged diff changed.
-        - ``clean=False`` (defect-bearing) increments when the staged diff changed
-          since the last counted mark on this branch; re-marking the SAME diff does
-          not (idempotent); a branch change resets to 1.
-
-    Best-effort — never raises into the caller.
-    """
-    # Internal (same-model) reviews never touch the cross-model streak. Only an
-    # explicit external reviewer counts; any other value is treated as internal (the
-    # safe direction — unknown provenance must not inflate the streak).
-    if source != "external":
-        return get_review_round(cwd=cwd)
-    branch = get_current_branch(cwd=cwd)
-    content_hash = _staged_content_hash(cwd=cwd)
-    # A CLEAN round resets the streak unconditionally — the review declared the
-    # current state defect-free, so no review→fix loop is in progress. Record the
-    # current content hash so the NEXT defect-bearing mark on a distinct diff
-    # correctly reads as a new (round-1) streak.
-    # The lifetime count is carried through EVERY write below. Read once here, from
-    # the same-branch state only — a counter belonging to another branch is a
-    # different change and contributes nothing.
-    _prev = _load_round(cwd)
-    lifetime = (
-        _coerce_finite_int(_prev.get("lifetime", 0))
-        if _prev and _prev.get("branch") == branch
-        else 0
-    )
-    # Carried through every write below for the same reason as `lifetime`: each
-    # branch here REBUILDS the state dict, so a field that is not named again is
-    # dropped. A spent acceptance that vanished on the next marked round would
-    # hand the change a fresh one — reopening the terminal by simply running
-    # another review, which is the loop this tier exists to end.
-    consumed = (
-        bool(_prev.get("final_accept_consumed"))
-        if _prev and _prev.get("branch") == branch
-        else False
-    )
-    if clean:
-        # A clean round resets the STREAK but not the lifetime. A change that
-        # alternates clean and defect-bearing rounds has still consumed every one
-        # of them, and resetting here would hand it an unbounded budget by simply
-        # converging occasionally.
-        _write_round(
-            {
-                "branch": branch,
-                "round": 0,
-                "lifetime": lifetime,
-                "last_hash": content_hash,
-                "last_source": "external",
-                "final_accept_consumed": consumed,
-            },
-            cwd,
-        )
-        return 0
-    # Defect-bearing round. Nothing meaningfully staged ("clean") or a git error
-    # ("unknown") is NOT a review round — counting it would inflate toward a
-    # false-positive cap block (e.g. a mark run before the next fix is staged, or
-    # a transient git timeout).
-    if content_hash in ("clean", "unknown"):
-        return get_review_round(cwd=cwd)
-    state = _prev
-    if not state or state.get("branch") != branch:
-        state = {
-            "branch": branch,
-            "round": 1,
-            "lifetime": 1,
-            "last_hash": content_hash,
-            "last_source": "external",
-        }
-    elif state.get("last_hash") != content_hash:
-        # A distinct staged diff → new defect-bearing round. Coerce the stored
-        # round defensively: a corrupt / partial-write / version-skewed value must
-        # NOT raise here, or it would crash `mark` and leave the user stuck behind
-        # the gate (this counter is best-effort — see the never-raises contract).
-        # _coerce_finite_int also absorbs the `1e999`→inf→OverflowError value class.
-        prev = _coerce_finite_int(state.get("round", 0))
-        state = {
-            "branch": branch,
-            "round": prev + 1,
-            "lifetime": lifetime + 1,
-            "last_hash": content_hash,
-            "last_source": "external",
-            "final_accept_consumed": consumed,
-        }
-    # else: same branch + same staged diff → same round (idempotent re-mark).
-    _write_round(state, cwd)
-    return _coerce_finite_int(state.get("round", 0))
-
-
-def get_final_accept_consumed(cwd: str | None = None) -> bool:
-    """Legacy stale-hook state: whether the branch spent final acceptance.
-
-    Branch-scoped on purpose: a global latch would permanently disarm the sigil
-    for every later change on the install. Never raises — an unreadable or
-    foreign-branch counter reads as "not consumed", which fails toward letting a
-    genuine acceptance through rather than stranding a change behind a gate whose
-    state it cannot see.
-    """
-    state = _load_round(cwd)
-    if not state or state.get("branch") != get_current_branch(cwd=cwd):
-        return False
-    return bool(state.get("final_accept_consumed"))
-
-
-def consume_final_accept(cwd: str | None = None) -> None:
-    """Legacy stale-hook API: spend a branch final acceptance. Never raises.
-
-    Preserves the old one-shot state transition for a stale guard importing this
-    module. Current guards do not call it. No-ops when no same-branch counter
-    exists rather than inventing a lifetime that was never counted.
-
-    ONE-SHOT IS NOT A HARD GUARANTEE, and the limit is worth naming: both this and
-    ``get_final_accept_consumed`` compare against ``get_current_branch``, which
-    returns ``"unknown"`` on a git timeout or read error. A transient git failure
-    therefore makes this a silent no-op and makes the read report "not consumed",
-    refunding the acceptance. That is the correct direction for a best-effort
-    counter that must never raise into a commit — it fails toward letting a real
-    decision through rather than stranding a change behind state it cannot see —
-    but nobody should read "one-shot" as tamper-proof.
-    """
-    branch = get_current_branch(cwd=cwd)
-    state = _load_round(cwd)
-    if not branch or not state or state.get("branch") != branch:
-        return
-    _write_round({**state, "final_accept_consumed": True}, cwd)
-
-
-def get_review_lifetime(cwd: str | None = None) -> int:
-    """Legacy branch-lifetime count retained for stale hook trees. Never raises.
-
-    Differs from ``get_review_round`` in exactly one way that matters: an
-    ``# escalation-ack`` resets the consecutive streak and does NOT reset this.
-    That asymmetry is the feature — the streak measures "is the current loop
-    running long", this measures "has this change consumed more review than it
-    is worth". Returns 0 for a different branch (a new change starts fresh) or
-    a counter written before this field existed.
-    """
-    state = _load_round(cwd)
-    if not state or state.get("branch") != get_current_branch(cwd=cwd):
-        return 0
-    return _coerce_finite_int(state.get("lifetime", 0))
-
-
-def get_review_counters(
-    cwd: str | None = None, *, deadline: float | None = None
-) -> tuple[int, int]:
-    """``(round, lifetime)`` from ONE snapshot of the counter file. Never raises.
-
-    WHY THIS EXISTS RATHER THAN TWO CALLS. Which enforcement tier is live is a
-    function of BOTH counters. A reader that calls ``get_review_round`` and
-    ``get_review_lifetime`` separately performs two independent file reads with two
-    independent branch resolutions, so a concurrent ``mark`` landing between them
-    yields a PAIR THAT NEVER EXISTED -- e.g. the pre-update ``lifetime=6`` with the
-    post-update ``round=3``. A caller deciding a tier from that pair can pick a tier
-    the gate will not be in, which is worse than picking none: the whole point of
-    naming a tier is to show the user the options that tier actually offers.
-
-    Reading once cannot make the pair inconsistent, and it halves the cost besides
-    (one ``git branch --show-current``, not two) -- which matters for the hook-path
-    callers that run on every question a session asks.
-
-    The current commit gate uses this snapshot for the local consecutive-streak
-    rule. The lifetime value remains in the tuple for compatibility but no longer
-    selects a current authorization tier.
-
-    Same branch-scoping contract as the two accessors it replaces: a counter written
-    for a different branch reads as ``(0, 0)``, because a new change starts fresh.
-    """
-    state = _load_round(cwd, deadline=deadline)
-    if not state or state.get("branch") != get_current_branch(cwd=cwd, deadline=deadline):
-        return (0, 0)
-    return (
-        _coerce_finite_int(state.get("round", 0)),
-        _coerce_finite_int(state.get("lifetime", 0)),
-    )
-
-
-def reset_review_round(cwd: str | None = None, *, deadline: float | None = None) -> None:
-    """Reset the CONSECUTIVE streak, PRESERVING the lifetime count. Never raises.
-
-    Deliberately preserves the legacy lifetime fields so stale hook trees remain
-    compatible while clearing the current consecutive-streak rule.
-
-    ``last_hash`` is dropped on purpose. It exists to make a re-mark of the SAME
-    staged diff idempotent within a streak; once the streak is reset, the next
-    defect-bearing mark must be free to count as round 1 whether or not the diff
-    moved in between.
-
-    ``last_source`` MUST be written even though this function does not record a
-    review. ``_load_round`` discards any counter carrying ``round`` without
-    ``last_source`` as a pre-source-axis legacy file — so omitting it here makes
-    the very next read throw the whole counter away, silently taking the lifetime
-    count with it and leaving the terminal unreachable. Only external rounds are
-    ever counted, so a surviving lifetime implies external provenance.
-    """
-    state = _load_round(cwd, deadline=deadline)
-    lifetime = _coerce_finite_int(state.get("lifetime", 0)) if state else 0
-    branch = state.get("branch") if state else None
-    if not lifetime or not branch:
-        # Nothing worth carrying — keep the original delete so a stale/foreign
-        # counter is cleared outright rather than resurrected as an empty shell.
-        import contextlib
-
-        with contextlib.suppress(OSError):
-            _round_file(cwd, deadline=deadline).unlink(missing_ok=True)
-        return
-    _write_round(
-        {
-            "branch": branch,
-            "round": 0,
-            "lifetime": lifetime,
-            "last_source": "external",
-            # Carried for the same reason as `lifetime`: an escalation-ack resets
-            # the streak, and must not also refund a spent final acceptance.
-            "final_accept_consumed": bool(state.get("final_accept_consumed")),
-        },
-        cwd,
-        deadline=deadline,
-    )
 
 
 def get_current_branch(cwd: str | None = None, *, deadline: float | None = None) -> str:
@@ -1305,25 +911,21 @@ def main() -> None:
 
     elif cmd == "mark":
         # Parse --agent-output <path>, --source {internal,external}, and the review
-        # outcome (--clean / --defects). The escalation streak is CROSS-MODEL only, so
-        # --source decides whether the outcome is even consulted:
-        #   * --source internal (the DEFAULT) — a same-model self/subagent review. It
-        #     never moves the streak, so the outcome flag is OPTIONAL and ignored; a
-        #     bare `mark` is a valid internal review (it cannot inflate anything).
-        #   * --source external — a non-Anthropic cross-model reviewer. This is the only
-        #     kind that counts, so it REQUIRES exactly one outcome flag (--clean XOR
-        #     --defects). The requirement is FAIL-CLOSED: a refusal writes NO marker, so
-        #     the commit gate still blocks until the caller re-runs correctly.
-        # (Supersedes feea3f71/#1446 — its unconditional required-outcome only ever
-        # bit internal re-audits, which now can't inflate the streak regardless.)
+        # outcome (--clean / --defects):
+        #   * --source internal (the DEFAULT) — a same-model self/subagent review. The
+        #     outcome flag is OPTIONAL and ignored; a bare `mark` is a valid review.
+        #   * --source external — a non-Anthropic cross-model reviewer. It REQUIRES
+        #     exactly one outcome flag (--clean XOR --defects), recorded in the marker.
+        #     The requirement is FAIL-CLOSED: a refusal writes NO marker, so the
+        #     commit gate still blocks until the caller re-runs correctly.
         agent_path = None
         saw_clean = False
         saw_defects = False
         source = "internal"
         # Normalize `--key=value` into `--key value` first, so the conventional equals form is
         # parsed too. A split-token-only parser silently dropped `--source=external`, recording
-        # a cross-model review as INTERNAL (an external round then wrote a marker without
-        # advancing the cap). dont_hand_roll_cli_parsing_in_hooks — bind atomically. (Codex P2.)
+        # a cross-model review as INTERNAL. dont_hand_roll_cli_parsing_in_hooks — bind
+        # atomically. (Codex P2.)
         norm_args: list[str] = []
         for a in sys.argv[2:]:
             if a.startswith("--") and "=" in a:
@@ -1358,7 +960,7 @@ def main() -> None:
             elif arg.startswith("--"):
                 # FAIL-CLOSED on any unknown option (e.g. a `--soruce` typo). Silently skipping
                 # it would leave the internal default in place → an intended external review is
-                # recorded internal and never advances the cap. Refuse so the caller re-runs
+                # recorded internal. Refuse so the caller re-runs
                 # correctly. (dont_hand_roll_cli_parsing_in_hooks; Codex P2.)
                 print(
                     f"REFUSED: unknown option {arg!r}. Recognized: --agent-output, --source, "
@@ -1370,9 +972,9 @@ def main() -> None:
         if source not in ("internal", "external"):
             print(
                 f"REFUSED: --source must be 'internal' or 'external', got {source!r}. "
-                "Internal = a same-model self/subagent review (never counts); external = "
-                "a non-Anthropic cross-model reviewer (Codex/Kimi/…) whose findings drove "
-                "this round.",
+                "Internal = a same-model self/subagent review; external = a "
+                "non-Anthropic cross-model reviewer (Codex/Kimi/…) whose findings this "
+                "mark records.",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -1387,9 +989,8 @@ def main() -> None:
             print(
                 "REFUSED: an `--source external` mark must state the review OUTCOME — "
                 "pass --clean (the cross-model review found no new BLOCKER/SHOULD-FIX/"
-                "P1/P2 → resets the streak) or --defects (it found one → advances the "
-                "streak). The outcome is what moves the cross-model escalation counter; "
-                "an internal mark doesn't need it.",
+                "P1/P2) or --defects (it found one). The marker records it; an internal "
+                "mark doesn't need it.",
                 file=sys.stderr,
             )
             sys.exit(1)
