@@ -10042,8 +10042,8 @@ _STALE_BASE_PROSE_DIRS = ("changelog.d/",)
 
 def _stale_base_counts(path: str) -> bool:
     """Is an overlap on *path* worth a NOTE? Code and config are; prose is not."""
-    return not path.endswith(_STALE_BASE_PROSE_SUFFIXES) and not any(
-        d in path for d in _STALE_BASE_PROSE_DIRS
+    return not path.endswith(_STALE_BASE_PROSE_SUFFIXES) and not path.startswith(
+        _STALE_BASE_PROSE_DIRS
     )
 
 
@@ -10097,6 +10097,9 @@ def _stale_base_note(pr_num: str, repo: str | None = None, head: str | None = No
     """
     if os.environ.get("_TEST_STALE_BASE_NOTE") == "off":
         return None
+    # No verified head (Codex has not reviewed it yet): read the live one. Only
+    # here, after the off switch, so a switched-off NOTE makes no read at all.
+    head = head or _pr_head_sha(pr_num, repo)
     if not head:
         return None
     base = _pr_base_ref(pr_num, repo)
@@ -17131,8 +17134,7 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     # owner ruling 2026-10-28) — ADVISORY: a stderr NOTE only, never a row in the
     # verdict, and never run by the merge arm.
     try:
-        stale_head = verified_head or _pr_head_sha(pr_num, repo)
-        stale_note = _stale_base_note(pr_num, repo=repo, head=stale_head)
+        stale_note = _stale_base_note(pr_num, repo=repo, head=verified_head)
     except Exception:  # noqa: BLE001 - an advisory NOTE never takes the report down.
         stale_note = None
     if stale_note:

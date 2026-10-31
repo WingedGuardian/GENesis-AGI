@@ -374,8 +374,9 @@ blocked. An empty result from your own query is "my query found nothing", never
 **A `NOTE: … base commits since its newest … run changed code …` block on
 stderr means base commits since the PR's CI changed CODE this PR also changes**
 (advisory, owner rulings 2026-10-28/29; it never moves the verdict, and prose
-overlaps are not counted). It lists each shared path with the base commits that
-changed it. That CI never ran the two changes together. A `… code path(s) were
+overlaps are not counted). It lists up to 10 shared paths, each with up to 3 of
+the base commits that changed it, and states how many it left out. That CI never
+ran the two changes together. A `… code path(s) were
 not checked …` NOTE means some paths could not be read, so silence was not
 earned there; treat those paths as unknown. Weigh it: most overlaps
 merge cleanly (MEASURED over 490 merges, 2026-09-29 to 10-29: a code overlap at

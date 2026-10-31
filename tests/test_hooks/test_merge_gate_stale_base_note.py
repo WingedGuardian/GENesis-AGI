@@ -100,7 +100,16 @@ class TestTheNote:
         assert _note() is None
 
     @pytest.mark.parametrize(
-        "code", ["config/x.yaml", "scripts/a.sh", ".github/workflows/ci.yml", "Makefile"]
+        "code",
+        [
+            "config/x.yaml",
+            "scripts/a.sh",
+            ".github/workflows/ci.yml",
+            "Makefile",
+            # Round 1 on #3804 (Kimi): the prose-dir match was a substring, so a
+            # code file under a directory merely NAMED like it read as prose.
+            "src/changelog.d/build.py",
+        ],
     )
     def test_code_and_config_paths_count(self, monkeypatch, code):
         _seed(monkeypatch, by_path={code: [{"sha": A, "subject": "s"}]}, pr_files=(code,))
@@ -383,17 +392,40 @@ class TestInTheReport:
             gpg, "_check_codex_reviewed_head", lambda n, repo=None: (True, "no review", None)
         )
         _seed(monkeypatch)
-        seen = {}
-        real = gpg._stale_base_note
+        seen = []
+        real = gpg._newest_pr_ci_run
 
-        def _spy(pr, repo=None, head=None):
-            seen["head"] = head
-            return real(pr, repo=repo, head=head)
+        def _spy(head, workflow, repo=None):
+            seen.append(head)
+            return real(head, workflow, repo)
 
-        monkeypatch.setattr(gpg, "_stale_base_note", _spy)
+        monkeypatch.setattr(gpg, "_newest_pr_ci_run", _spy)
         gpg.check_pr_report("7", repo=REPO)
-        assert seen["head"] == HEAD
+        assert seen == [HEAD], "the live head (_TEST_GH_HEAD_SHA) anchors the run read"
         assert "Run 9 was created" in capsys.readouterr().err
+
+    def test_the_off_switch_reads_nothing_even_without_a_verified_head(self, monkeypatch, capsys):
+        """Round 1 on #3804 (Kimi): the live-head fallback used to run in the report
+        BEFORE the off switch, so every report test with no verified head made one
+        live `gh pr view` call the conftest pin claims to prevent."""
+        _report_env(monkeypatch)
+        monkeypatch.setattr(
+            gpg, "_check_codex_reviewed_head", lambda n, repo=None: (True, "no review", None)
+        )
+        monkeypatch.setenv("_TEST_STALE_BASE_NOTE", "off")
+        calls = []
+        real = gpg._pr_head_sha
+        monkeypatch.setattr(gpg, "_pr_head_sha", lambda *a, **k: calls.append(a) or real(*a, **k))
+        gpg.check_pr_report("7", repo=REPO)
+        stale_calls = [c for c in calls if c]
+        before = len(stale_calls)
+        monkeypatch.delenv("_TEST_STALE_BASE_NOTE")
+        _seed(monkeypatch)
+        calls.clear()
+        gpg.check_pr_report("7", repo=REPO)
+        assert len([c for c in calls if c]) == before + 1, (
+            "with the NOTE on, exactly one more head read happens: the NOTE's own"
+        )
 
     def test_a_raising_note_never_takes_the_report_down(self, monkeypatch, capsys):
         _report_env(monkeypatch)
