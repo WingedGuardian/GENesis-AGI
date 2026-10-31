@@ -1418,6 +1418,16 @@ verified: b0867170e 2026-10-02
   operator-only per-item release requires explicit replay acknowledgement and
   an unchanged source, then returns through normal approval/claim handling.
   Recovery procedure and limits: `docs/reference/inbox-replay-safety.md`.
+- **Inbox vault sync** (`scripts/inbox_sync.sh`, run by
+  `genesis-inbox-sync.timer` every 5 minutes; enabled everywhere, a no-op
+  unless `inbox_monitor.sync_remote` names an rclone remote). It mirrors notes
+  vault → inbox and pushes responses back. A local response is removed only
+  when the vault was seen to hold it (`.genesis-seen-in-vault`, scoped to the
+  remote) and no longer does; removal goes to the Genesis trash. Each
+  configured run writes a heartbeat (`~/.genesis/state/inbox_sync.json`), and
+  `inbox/sync_health.py` raises an `infrastructure_alert` from the awareness
+  tick when it goes stale (30 min) or reports responses the trash refused.
+  `inbox/sync_config.py` is the one reader both sides share.
 - **recon/**: scheduled intelligence jobs (release watch, model intelligence
   Sun 8am, models.md synthesis Sun 10am, GitHub discovery, skill-security scan
   via external NVIDIA SkillSpector). Emits findings for triage

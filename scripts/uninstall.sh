@@ -60,7 +60,7 @@ MANAGED_UNINSTALL_FDS=()
 GENESIS_PERSISTENT_TIMERS="genesis-cc-settings-align.timer genesis-cc-align.timer \
 genesis-disk-hygiene.timer genesis-watchdog.timer genesis-graph-project.timer \
 genesis-code-intel.timer genesis-backup.timer genesis-cc-tmp-align.timer \
-genesis-star-milestone.timer genesis-browser-stack.timer"
+genesis-star-milestone.timer genesis-browser-stack.timer genesis-inbox-sync.timer"
 # The ROOT timers scripts/lib/network_resilience.sh installs under
 # /etc/systemd/system, with their scripts and /run files. Both removal paths
 # (direct and via incus) run this one command, so they cannot drift apart. The
@@ -560,6 +560,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     genesis-code-intel.timer genesis-code-intel.service \
                     genesis-star-milestone.timer genesis-star-milestone.service \
                     genesis-browser-stack.timer genesis-browser-stack.service \
+                    genesis-inbox-sync.timer genesis-inbox-sync.service \
                     genesis-serena-claude-code.service genesis-serena-codex.service \
                     genesis-backup.timer genesis-backup.service \
                     genesis-server.service genesis-bridge.service \

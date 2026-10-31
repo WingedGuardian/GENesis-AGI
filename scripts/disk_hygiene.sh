@@ -839,6 +839,11 @@ main() {
     # instead of growing without bound.
     rotate_mcp_logs
 
+    echo "--- Inbox sync log rotation (>10MB, copytruncate, 2 kept) ---"
+    # Appended to every 5 minutes by scripts/inbox_sync.sh and never rotated
+    # before: MEASURED 31.8 MB on a live install. Same bounds as the MCP logs.
+    rotate_log "${GENESIS_INBOX_SYNC_LOG:-$REPO_DIR/logs/inbox_sync.log}" 10000000 2
+
     echo "=== genesis-disk-hygiene done ==="
     return "$disk_reclaim_rc"
 }

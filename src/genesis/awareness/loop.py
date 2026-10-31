@@ -4362,6 +4362,13 @@ class AwarenessLoop:
             # completions (recorded by the invoker) and alerts on a run. Guarded
             # on db internally; a query failure no-ops (never breaks the tick).
             await _check_cc_cap_detection(self._db)
+            # Inbox sync staleness — reads one heartbeat file the timer-run sync
+            # writes; alerts when it stops succeeding (#3183). Every tick, not
+            # the hourly block: the hourly count resets on restart, and a dead
+            # sync went unnoticed for 17 days. Silent when no vault is set.
+            from genesis.inbox.sync_health import check_inbox_sync_health
+
+            await check_inbox_sync_health(self._db)
             # Dead-provider notification sweep — clock-driven ON PURPOSE (the
             # trip-driven version starved when traffic stopped; PR #1573).
             # Guarded on db internally; lever: provider_outage_notify domain +

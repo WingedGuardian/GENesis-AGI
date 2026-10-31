@@ -87,6 +87,10 @@ installs with no graph engine, so it is enabled everywhere; see
 the oneshot bootstrap starts after installing the browser packages: the
 Camoufox engine and Chromium they pin, and their system libraries; see
 `scripts/install_browser_stack.sh`),
+`genesis-inbox-sync.timer` (every 5 minutes, mirrors the vault set in
+`inbox_monitor.sync_remote` into the inbox and pushes responses back; exits at
+once where none is set, and the awareness loop alerts when its heartbeat goes
+stale; see `scripts/inbox_sync.sh`),
 `genesis-code-intel.timer` (idle-gated code-intel
 index-request consumer; see `scripts/code_intel_runner.sh`) with
 `genesis-code-intel-freeze.service` as its on-demand kill-switch (rendered but
