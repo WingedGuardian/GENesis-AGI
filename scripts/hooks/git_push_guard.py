@@ -10009,6 +10009,300 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
     return verdict.blocked, verdict.message
 
 
+# --- stale-base: the PR's CI predates base merges to its files (merge collision) ---
+
+#: Seconds subtracted from the CI run's creation time before reading the base's
+#: commits. A squash merge's committer date sits 0-1 s before its mergedAt
+#: (MEASURED 2026-10-28), and the run's merge ref is built moments before the run
+#: exists, so a merge in that window may be missing from what CI tested. Reading
+#: early can only add a NOTE, never hide one.
+_STALE_BASE_PAD_S = 5
+#: One page of a path's base commits. A full page means older ones went unread,
+#: which the NOTE states.
+_STALE_BASE_COMMITS_PAGE = 100
+#: Counted paths read (one call each). MEASURED 2026-10-29 over 100 merged PRs:
+#: the median PR changes 6 files and the 90th percentile 14, so 40 covers nearly
+#: every PR; the rest are named as not checked, never treated as untouched.
+_STALE_BASE_PATH_READS = 40
+#: Wall-clock budget for those reads; each read's own timeout is clamped to what
+#: is left. MEASURED 2026-10-29: one path read took 0.58 s, so 40 need about 23 s.
+_STALE_BASE_BUDGET_S = 30.0
+#: How many overlapping paths, and commits per path, the NOTE names before
+#: stating how many it left out.
+_STALE_BASE_PATHS_LISTED = 10
+_STALE_BASE_COMMITS_LISTED = 3
+def _stale_base_counts(path: str) -> bool:
+    """Is an overlap on *path* worth a NOTE? Code and config are; prose is not.
+
+    Prose overlaps are not counted (owner ruling 2026-10-29): files many PRs edit
+    (docs/architecture/CURRENT.md, the skills) overlap constantly and do not break
+    a build. MEASURED over the 490 PRs merged to main from 2026-09-29 to 10-29, any
+    overlap would have fired on 136 and a code-file overlap on 57, and both sets
+    held the one real overlap collision.
+
+    What counts as prose is :func:`_is_doc_path`'s answer, not a list of its own.
+    A suffix list here once treated every ``.txt`` as prose, which hid a CI
+    dependency manifest (``.github/test-tools/requirements.txt``); ``_is_doc_path``
+    takes ``.txt`` as prose only on a documentation name such as ``README``.
+    """
+    return not _is_doc_path(path)
+
+
+def _stale_base_note(pr_num: str, repo: str | None = None, head: str | None = None) -> str | None:
+    """A NOTE when the PR's newest CI run predates base commits touching its code.
+
+    WHY: a ``pull_request`` run tests the PR merged onto its base AS IT STOOD when
+    the run was created. A later merge to the base that changes the same files was
+    never tested together with this PR. MEASURED 2026-09-28 to 10-28: one of the two
+    cross-PR collisions that turned main red had exactly this shape (a PR's only CI
+    run was two days older than a main merge to the same file). A file overlap is a
+    lead, not proof: the other collision shared no files, and most overlaps merge
+    cleanly. Only code and config overlaps count; prose, as ``_is_doc_path``
+    defines it, does not (``_stale_base_counts``).
+
+    GUARD AXIOMS (owner rulings 2026-10-28/29: advisory, never a block):
+      * VERDICT: advisory. Report-only; it never counts toward ``failures`` and the
+        merge arm does not call it.
+      * AUDIENCE: the agent driving the merge. The NOTE names the shared paths and
+        the base commits that changed them, and asks the agent to weigh whether
+        they interact with this PR's change; only if they may, update the branch so
+        CI runs on the current base (an update moves the head, which costs a CI run
+        and a review request). A re-run does not help, because a re-run keeps the
+        original event's ``GITHUB_SHA`` (CITED: GitHub docs, "Re-running workflows
+        and jobs", read 2026-10-29), and so keeps the old merge commit.
+      * BACKGROUND: none — it runs only in the ``--check-pr`` report.
+
+    THE ANCHOR is the run's creation time, never the base sha the run's
+    ``pull_requests`` entry carries. MEASURED 2026-10-29: a run created at 13:41Z
+    named a base sha four main commits older than main at 13:41Z; that field is the
+    PR's stored base, not what the run tested. With several required workflows the
+    OLDEST of their newest runs is the anchor. A workflow with no run on the head,
+    or whose runs cannot be read, is skipped; the ``ci`` row speaks for it.
+
+    THE READ is one call per counted path the PR changes: the base's commits to
+    that path since the anchor. That attributes every overlap exactly and has no
+    window over the base's history, so a PR whose CI is weeks old is read as fully
+    as one from an hour ago. Paths past the read cap or the budget, a failed read,
+    and a full page are each stated: when nothing overlaps but something went
+    unread, the NOTE still prints, saying how much was not checked, because
+    silence would read as "nothing to weigh". Any other read failure (base, runs,
+    the PR's files) or no overlap returns None. The caller sanitizes every line.
+
+    Tests inject ``_TEST_GH_PR_CI_RUNS`` (a JSON object mapping workflow name to an
+    array shaped like ``gh run list --json databaseId,createdAt``),
+    ``_TEST_GH_PATH_COMMITS_SINCE`` (a JSON object mapping path to an array of
+    ``{sha, subject}``, or ``"__error__"``; an unnamed path reads as unreadable),
+    and reuse ``_TEST_GH_PR_FILES`` and ``_TEST_GH_BASE_REF``.
+    ``_TEST_STALE_BASE_NOTE=off`` skips every read: the hook-test conftest sets it
+    so report tests make no live call.
+    """
+    if os.environ.get("_TEST_STALE_BASE_NOTE") == "off":
+        return None
+    # No verified head (Codex has not reviewed it yet): read the live one. Only
+    # here, after the off switch, so a switched-off NOTE makes no read at all.
+    head = head or _pr_head_sha(pr_num, repo)
+    if not head:
+        return None
+    base = _pr_base_ref(pr_num, repo)
+    if not base:
+        return None
+    anchor: _dt.datetime | None = None
+    anchor_wf, anchor_run = "", ""
+    for workflow in _required_ci_workflows():
+        run = _newest_pr_ci_run(head, workflow, repo)
+        if not run:  # unreadable (None) or no run of it on this head (())
+            continue
+        created, run_id = run
+        if anchor is None or created < anchor:
+            anchor, anchor_wf, anchor_run = created, workflow, run_id
+    if anchor is None:
+        return None
+    pr_files = _pr_changed_files(pr_num, repo)
+    if pr_files is None:
+        return None
+    paths = sorted({p for p in pr_files if _stale_base_counts(p)})
+    if not paths:
+        return None
+    since = (anchor - _dt.timedelta(seconds=_STALE_BASE_PAD_S)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    deadline = time.monotonic() + _STALE_BASE_BUDGET_S
+    overlaps: list[tuple[str, list[tuple[str, str]]]] = []
+    unread: list[str] = []
+    full: list[str] = []
+    for i, path in enumerate(paths):
+        left = deadline - time.monotonic()
+        if i >= _STALE_BASE_PATH_READS or left <= 0:
+            unread += paths[i:]
+            break
+        commits = _base_commits_to_path(base, path, since, repo, timeout=min(8.0, left))
+        if commits is None:
+            unread.append(path)
+        elif commits:
+            overlaps.append((path, commits))
+            if len(commits) >= _STALE_BASE_COMMITS_PAGE:
+                full.append(path)
+    if not overlaps and not unread:
+        return None
+    when = anchor.strftime("%Y-%m-%d %H:%M:%SZ")
+    # One idea per line: the caller's sanitizer cuts any line over
+    # _GATE_TEXT_MAX_CHARS in the middle, which is where the advice would sit.
+    if overlaps:
+        lines = [
+            f"NOTE: PR #{pr_num} — base commits since its newest {anchor_wf} run changed "
+            f"code this PR also changes.",
+            f"Run {anchor_run} was created {when}; since then {base} changed "
+            f"{len(overlaps)} of this PR's {len(paths)} code path(s), so its CI never "
+            f"ran with them.",
+        ]
+    else:
+        lines = [
+            f"NOTE: PR #{pr_num} — {len(unread)} of this PR's {len(paths)} code path(s) "
+            f"were not checked for {base} commits since its newest {anchor_wf} run.",
+            f"Run {anchor_run} was created {when}; nothing checked overlaps, but the "
+            f"unchecked paths may.",
+        ]
+    for path, commits in overlaps[:_STALE_BASE_PATHS_LISTED]:
+        lines.append(f"{_safe_path(path)}:")
+        for sha, subject in commits[:_STALE_BASE_COMMITS_LISTED]:
+            lines.append(f"  {sha[:12]} {subject}")
+        if len(commits) > _STALE_BASE_COMMITS_LISTED:
+            at_least = "at least " if path in full else ""
+            lines.append(f"  (+{at_least}{len(commits) - _STALE_BASE_COMMITS_LISTED} more)")
+    if len(overlaps) > _STALE_BASE_PATHS_LISTED:
+        lines.append(f"(+{len(overlaps) - _STALE_BASE_PATHS_LISTED} more path(s) not listed)")
+    if unread and overlaps:
+        lines.append(f"{len(unread)} of {len(paths)} code path(s) were not checked.")
+    update = " ".join(["gh pr update-branch", pr_num, *_repo_args(repo)])
+    lines += [
+        "Weigh it before merging: do those changes interact with this PR's? Most "
+        "overlaps merge cleanly.",
+        f"If they may, update the branch ({update}, or a merge or rebase) so CI runs "
+        f"on the current base.",
+        "That moves the head, so the review gate then needs a review of the new head.",
+        "Re-running the old run does not help: a re-run tests the same merge commit.",
+    ]
+    return "\n".join(lines)
+
+
+def _newest_pr_ci_run(
+    head: str, workflow: str, repo: str | None = None
+) -> tuple[_dt.datetime, str] | tuple[()] | None:
+    """``(created_at, run_id)`` of the newest ``pull_request`` run of *workflow* on
+    *head*, ``()`` when that head has none, or None when it cannot be read.
+
+    ``gh run list`` returns runs newest first (MEASURED 2026-10-29). A re-attempt
+    keeps its run's creation time, which is right here: it reuses the same merge
+    commit. Only ``pull_request`` runs count: another event (a manual dispatch)
+    tests the bare head, not a merge with the base.
+    """
+    raw_map = os.environ.get("_TEST_GH_PR_CI_RUNS")
+    if raw_map is not None:
+        try:
+            raw = json.dumps(json.loads(raw_map).get(workflow, []))
+        except (ValueError, AttributeError):
+            return None
+    else:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "run",
+                    "list",
+                    *_repo_args(repo),
+                    "--commit",
+                    head,
+                    "--workflow",
+                    workflow,
+                    "--event",
+                    "pull_request",
+                    "--limit",
+                    "1",
+                    "--json",
+                    "databaseId,createdAt",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_gh_timeout(8),
+            )
+        except Exception:  # noqa: BLE001 - advisory: silent on a failed read
+            return None
+        if result.returncode != 0:
+            return None
+        raw = result.stdout
+    try:
+        runs = json.loads(raw or "[]")
+    except ValueError:
+        return None
+    if not isinstance(runs, list):
+        return None
+    if not runs:
+        return ()
+    run = runs[0]
+    if not isinstance(run, dict):
+        return None
+    run_id = str(run.get("databaseId") or "")
+    try:
+        created = _dt.datetime.strptime(str(run.get("createdAt")), "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+    if not run_id.isdigit():
+        return None
+    return created.replace(tzinfo=_dt.UTC), run_id
+
+
+def _base_commits_to_path(
+    base: str, path: str, since: str, repo: str | None = None, *, timeout: float = 8.0
+) -> list[tuple[str, str]] | None:
+    """``[(sha, subject), ...]``: commits on *base* to *path* since *since* (ISO,
+    UTC), newest first, at most one page of ``_STALE_BASE_COMMITS_PAGE``; None when
+    unreadable.
+
+    ``since`` is inclusive: MEASURED 2026-10-29, a commit whose committer date
+    equals it is returned. The branch and path are URL-encoded into the query.
+    """
+    raw_map = os.environ.get("_TEST_GH_PATH_COMMITS_SINCE")
+    if raw_map is not None:
+        try:
+            rows = json.loads(raw_map).get(path, "__error__")
+        except (ValueError, AttributeError):
+            return None
+    else:
+        from urllib.parse import quote
+
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{repo or ':owner/:repo'}/commits?sha={quote(base, safe='')}"
+                    f"&path={quote(path, safe='')}&since={since}"
+                    f"&per_page={_STALE_BASE_COMMITS_PAGE}",
+                    "--jq",
+                    '[.[] | {sha: .sha, subject: (.commit.message | split("\\n")[0])}]',
+                ],
+                capture_output=True,
+                text=True,
+                timeout=max(0.1, timeout),
+            )
+        except Exception:  # noqa: BLE001 - advisory: an unreadable path is stated
+            return None
+        if result.returncode != 0:
+            return None
+        try:
+            rows = json.loads(result.stdout or "[]")
+        except ValueError:
+            return None
+    if not isinstance(rows, list):
+        return None
+    out: list[tuple[str, str]] = []
+    for r in rows:
+        sha = r.get("sha") if isinstance(r, dict) else None
+        if not isinstance(sha, str) or not sha:
+            return None
+        subject = r.get("subject")
+        out.append((sha, subject if isinstance(subject, str) else ""))
+    return out
+
+
 # --- main-reverts: a merge-from-main that kept the branch's stale copies (#2809) ---
 
 #: The four states `_check_main_reverts` reports (guard failure semantics, rule 1).
@@ -16837,6 +17131,18 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     if blocked:
         _print_gate_detail(msg)
     failures += 1 if blocked else 0
+    # A CI run older than base merges to the PR's files (cross-PR merge collision;
+    # owner ruling 2026-10-28) — ADVISORY: a stderr NOTE only, never a row in the
+    # verdict, and never run by the merge arm.
+    try:
+        stale_note = _stale_base_note(pr_num, repo=repo, head=verified_head)
+    except Exception:  # noqa: BLE001 - an advisory NOTE never takes the report down.
+        stale_note = None
+    if stale_note:
+        first, *rest = _sanitize_gate_text(stale_note).split("\n")
+        print(first, file=sys.stderr)
+        for line in rest:
+            print(f"  {line}", file=sys.stderr)
     # Merge-from-main reverts (#2809) — ADVISORY, like `e2e-plan` and `rounds`: it
     # NEVER touches `failures`, and the merge arm does not run it, so the report and
     # enforcement cannot disagree about it. Four states, rendered distinctly so a
