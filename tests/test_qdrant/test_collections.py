@@ -1,9 +1,12 @@
 """Tests for Qdrant collection management.
 
-These tests use the real Qdrant instance on localhost:6333.
-They create test collections with a unique suffix to avoid polluting production data.
+These tests use the real Qdrant instance on localhost:6333: they create and
+delete a test collection with a unique suffix. That is a live service, so they
+run only when opted in with GENESIS_LIVE_E2E=1; otherwise the module skips, as
+on CI.
 """
 
+import os
 import random
 import uuid
 
@@ -23,6 +26,11 @@ from genesis.qdrant.collections import (
 )
 
 TEST_COLLECTION = "test_genesis_" + uuid.uuid4().hex[:8]
+
+pytestmark = pytest.mark.skipif(
+    os.environ.get("GENESIS_LIVE_E2E") != "1",
+    reason="writes to the live Qdrant; opt in with GENESIS_LIVE_E2E=1",
+)
 
 
 def _uuid():
