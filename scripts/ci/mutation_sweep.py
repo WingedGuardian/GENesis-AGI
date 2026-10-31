@@ -26,7 +26,7 @@ ELSE's work. This module first made it mandatory; review showed the in-place
 shape was itself the defect (per a premise check of its review threads,
 2026-10-03: 15 of 28 findings came from writing the caller's tree and putting it
 back). A check can only narrow a check-then-write window. Not writing closes it:
-a sweep runs in ONE private copy (`isolated_copy`) holding what is on disk, and
+a sweep runs in private copies (`isolated_copy`), one per case, holding what is on disk, and
 the caller's WORKING TREE is never written. (A `git worktree` shares the
 caller's git metadata -- config, hooks, refs -- so a test that runs git
 commands in its cwd can still change those.)
@@ -46,18 +46,19 @@ WHAT A SWEEP GUARANTEES, per case:
      (`parse_pytest_summary`), by exact outcome keyword, and a baseline counts
      as green only when the target PASSED -- never xfailed, xpassed, skipped
      or deselected.
-  4. Each case starts from the PRISTINE target, read once when the copy is
-     made. Whatever a test did to the file -- deleted it, replaced it with a
-     directory, a symlink or a hard link -- the next write removes it and
-     creates a fresh file, so no write follows a link out of the copy. A reset
-     that cannot be verified aborts every later case: their verdicts would come
-     from a copy that is no longer the one under test.
-
-KNOWN GAP, closed by the per-case copy that follows this change: only the
-TARGET is reset between cases. Anything else an earlier case's test wrote --
-in the copy, its TMPDIR or HOME -- persists into later cases and can make an
-irrelevant mutation read as BIT. Until then, give each case a sweep of its own
-when its tests write files.
+  4. Each baseline and each case runs in its OWN copy, with its own TMPDIR,
+     made from the same caller tree: every copy must match the first one's
+     fingerprint (HEAD plus the overlaid files), or its case ABORTS. Whatever a
+     test did to the target -- deleted it, replaced it with a directory, a
+     symlink or a hard link -- the next write removes it and creates a fresh
+     file, so no write follows a link out of the copy.
+  5. A BIT needs PASS, FAIL, PASS in one copy: the unmutated test passes,
+     the mutated one fails, and the unmutated one passes again with the
+     pristine target restored. The first run catches state an earlier case left
+     that already breaks the test; the last catches a failure the mutated run
+     caused through state rather than through the mutation. Either one failing
+     is an ABORT. Not covered: a flaky test, and state that changes between runs
+     for reasons outside the copy.
 
 WHAT IT DELIBERATELY DOES NOT DO. It does not generate mutations. Picking the
 mutation is the thinking part -- a behaviourally-null edit (swapped operands
@@ -76,6 +77,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -591,8 +593,9 @@ def _put(root: Path, path: Path, data: bytes, mode: int) -> None:
         os.fchmod(fh.fileno(), mode)
 
 
-def _overlay(top: Path, tree: Path) -> None:
-    """Make the fresh checkout at ``tree`` match ``top``'s WORKING TREE.
+def _overlay(top: Path, tree: Path) -> str:
+    """Make the fresh checkout at ``tree`` match ``top``'s WORKING TREE, and
+    return a digest of exactly what was copied.
 
     The paths: `git diff HEAD` (staged and unstaged, renames split), untracked
     files that are not ignored, and every entry flagged assume-unchanged or
@@ -600,7 +603,12 @@ def _overlay(top: Path, tree: Path) -> None:
     it is on disk (a symlink as a symlink) or removed from the copy. Ignored
     files and untracked nested repositories (a trailing slash) are not part of
     this repository and are left out.
+
+    The digest covers every overlaid path with what was put there (the bytes
+    and mode copied, the link target, or "gone"), so two copies with the same
+    HEAD and the same digest hold the same tree.
     """
+    digest = hashlib.sha256()
     paths = _git_paths(top, "diff", "--name-only", "--no-renames", "-z", "HEAD")
     paths |= _git_paths(top, "ls-files", "--others", "--exclude-standard", "-z")
     for entry in _git(top, "ls-files", "-v", "-z").split(b"\0"):
@@ -610,17 +618,24 @@ def _overlay(top: Path, tree: Path) -> None:
         src, dst = top / rel, tree / rel
         if not _contained(tree, dst):
             raise RuntimeError(f"{rel} would be copied outside the copy")
+        digest.update(os.fsencode(rel) + b"\0")
         if os.path.islink(src):
+            link = os.readlink(src)
             _clear(dst)
             dst.parent.mkdir(parents=True, exist_ok=True)
-            os.symlink(os.readlink(src), dst)
+            os.symlink(link, dst)
+            digest.update(b"link\0" + os.fsencode(link) + b"\0")
         elif src.is_file():
             # Permission bits only: setuid/setgid have no business in a copy.
-            _put(tree, dst, src.read_bytes(), src.stat().st_mode & 0o777)
+            data, mode = src.read_bytes(), src.stat().st_mode & 0o777
+            _put(tree, dst, data, mode)
+            digest.update(b"file\0%o\0" % mode + hashlib.sha256(data).digest())
         else:
             # Deleted -- or now a DIRECTORY, whose files are entries of their
             # own (sorted after it); HEAD's file must not stay in their way.
             _clear(dst)
+            digest.update(b"gone\0")
+    return digest.hexdigest()
 
 
 #: The calls `shutil.rmtree` (Python 3.12) hands its error handler that mean "I
@@ -679,7 +694,9 @@ def _force_rmtree(path: Path) -> None:
 
 
 @contextlib.contextmanager
-def isolated_copy(repo: Path, tmp_root: Path | None = None) -> Iterator[Path]:
+def isolated_copy(
+    repo: Path, tmp_root: Path | None = None, info: dict | None = None
+) -> Iterator[Path]:
     """Yield ``repo``'s place inside a private copy of its whole repository.
 
     The copy is a detached `git worktree` of HEAD under a fresh directory in
@@ -689,6 +706,11 @@ def isolated_copy(repo: Path, tmp_root: Path | None = None) -> Iterator[Path]:
     -- this copy's only: `git worktree remove` on the path this call created,
     then, if git no longer recognises it (a test deleted the directory), the
     administrative entry recorded at creation.
+
+    ``info``, when given, receives ``holder`` (the private directory the copy
+    sits in, removed with it: the place for this copy's own TMPDIR) and
+    ``fingerprint`` (HEAD plus the overlay digest), which is equal for two
+    copies of the same caller tree.
     """
     try:
         top = Path(os.fsdecode(_git(repo, "rev-parse", "--show-toplevel").strip()))
@@ -710,7 +732,11 @@ def isolated_copy(repo: Path, tmp_root: Path | None = None) -> Iterator[Path]:
     try:
         _git(top, "worktree", "add", "--detach", "--quiet", str(tree), "HEAD")
         admin = Path(os.fsdecode(_git(tree, "rev-parse", "--absolute-git-dir").strip()))
-        _overlay(top, tree)
+        overlay = _overlay(top, tree)
+        if info is not None:
+            head = os.fsdecode(_git(tree, "rev-parse", "HEAD").strip())
+            info["holder"] = holder
+            info["fingerprint"] = f"{head}:{overlay}"
         yield tree / repo.relative_to(top)
     finally:
         with contextlib.suppress(RuntimeError):
@@ -841,6 +867,14 @@ def _refuse_back_pointers(repo: Path, env: dict[str, str] | None, cases: list[Ca
         top: Path | None = Path(os.fsdecode(_git(repo, "rev-parse", "--show-toplevel").strip()))
     except RuntimeError:
         top = None  # `isolated_copy` refuses a tree that is not a git work tree
+    # The copy owns these; a manifest value would quietly share one temp
+    # directory between cases again (`_copy_env`).
+    for scope, mapping in [("sweep", env or {})] + [(f"case {c.label!r}", c.env) for c in cases]:
+        for key in ("TMPDIR", "PYTHONPYCACHEPREFIX"):
+            if key in mapping:
+                raise ValueError(
+                    f"{scope} env sets {key}, which each case's copy sets for itself; leave it out"
+                )
     hint = (
         "The sweep runs in an isolated copy, so a child pointed there tests "
         "the UNMUTATED file; name test files and import roots repo-relative "
@@ -977,11 +1011,22 @@ def run_case(
     available: set[str] | None = None,
     selector: str | None = None,
 ) -> Result:
-    """Mutate ``target`` (a file in the copy, from its pristine bytes) and run
-    the case's test from ``cwd``. Leaves the target mutated: the sweep resets
-    it, because only the sweep knows whether a later case needs the copy.
+    """Run the case's test from ``cwd`` unmutated, then mutated, then unmutated
+    again: a BIT needs PASS, FAIL, PASS in this one copy.
+
+    The first run proves the test passes HERE before the mutation, so state a
+    previous case left (in HOME, or git refs and config shared between copies)
+    that already breaks it is an ABORT, not a catch. The control after a BIT
+    puts the pristine file back and runs the same test again, so a failure the
+    mutated run caused through state rather than through the mutation is an
+    ABORT too. A previous case's leftover that the mutated run USES UP is the
+    case the first run exists for: an after-only control passes once it is
+    gone. Not covered: a flaky test (a flaky failure followed by a passing
+    control reads as BIT) and state that changes between runs for reasons
+    outside the copy. A SURVIVED needs no control: it already fails closed.
     ``selector`` is the case's test rewritten for the copy (`_copy_selector`);
-    it defaults to ``case.test``."""
+    it defaults to ``case.test``.
+    """
     test = selector or case.test
     # A case gated on shared live state ABORTS when that state is absent. It does
     # NOT skip: a skipped case and a killed one look identical in a summary line,
@@ -1015,11 +1060,21 @@ def run_case(
             ABORTED,
             f"the mutation cannot be written in the target's own encoding ({encoding}): {exc}",
         )
+    cmd = _pytest_cmd(case.python or python, test, case.pytest_args)
+    problem = _unmutated_problem(
+        cmd, cwd=cwd, env={**(env or {}), **case.env}, timeout=timeout, test=test
+    )
+    if problem:
+        return Result(
+            case,
+            ABORTED,
+            "before the mutation, the UNMUTATED test does not pass in this copy, so "
+            f"no verdict from it means anything ({problem})",
+        )
     try:
         _put(cwd, target.path, data, target.mode)
     except OSError as exc:
         return Result(case, ABORTED, f"could not write the mutation: {exc}")
-    cmd = _pytest_cmd(case.python or python, test, case.pytest_args)
     try:
         proc = _pytest(cmd, cwd=cwd, env=_child_env({**(env or {}), **case.env}), timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -1030,7 +1085,42 @@ def run_case(
     # -- the one place a mutated run is classified. Only stdout is parsed:
     # pytest writes its summary there, and stderr belongs to whatever else ran.
     outcome, detail = mutation_verdict(proc.returncode, proc.stdout)
-    return Result(case, outcome, detail, proc.stdout + proc.stderr)
+    output = proc.stdout + proc.stderr
+    if outcome != BIT:
+        return Result(case, outcome, detail, output)
+
+    # (4) the control.
+    why = _reset(cwd, target)
+    if why:
+        return Result(
+            case, ABORTED, f"could not restore the target for the control run: {why}", output
+        )
+    problem = _unmutated_problem(
+        cmd, cwd=cwd, env={**(env or {}), **case.env}, timeout=timeout, test=test
+    )
+    if problem:
+        return Result(
+            case,
+            ABORTED,
+            "contaminated: the UNMUTATED test does not pass in this copy either, so the "
+            f"failure need not have come from the mutation ({problem})",
+            output,
+        )
+    return Result(case, BIT, detail, output)
+
+
+def _unmutated_problem(
+    cmd: list[str], *, cwd: Path, env: dict[str, str], timeout: int, test: str
+) -> str | None:
+    """Run the UNMUTATED test once in ``cwd``: None when it passes, else why not
+    (a timeout or a run that could not start count as not passing)."""
+    try:
+        proc = _pytest(cmd, cwd=cwd, env=_child_env(env), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return f"the unmutated run timed out after {timeout}s"
+    except OSError as exc:
+        return f"the unmutated run could not start: {exc}"
+    return baseline_problem(test, proc.returncode, proc.stdout)
 
 
 def _reset(root: Path, target: _Target) -> str | None:
@@ -1099,6 +1189,25 @@ def assert_green_baseline(
     return None
 
 
+def _copy_env(
+    env: dict[str, str] | None, root: Path, holder: Path, pythonpath: tuple[str, ...]
+) -> dict[str, str]:
+    """The sweep env for children running in ONE copy: its import roots on
+    PYTHONPATH, and a TMPDIR (with the bytecode-cache prefix under it) that
+    belongs to this copy alone and is removed with it. A shared TMPDIR let one
+    case's leftovers change the next case's verdict."""
+    tmp = holder / "tmp"
+    tmp.mkdir(mode=0o700, exist_ok=True)
+    out = {
+        "TMPDIR": str(tmp),
+        "PYTHONPYCACHEPREFIX": str(tmp / f"mutation-sweep-nopyc-{uuid.uuid4().hex}"),
+        **(env or {}),
+    }
+    if pythonpath:
+        out = {"PYTHONPATH": os.pathsep.join(str(root / p) for p in pythonpath), **out}
+    return out
+
+
 def sweep(
     cases: list[Case],
     *,
@@ -1111,12 +1220,20 @@ def sweep(
     check_baseline: bool = True,
     tmp_root: Path | None = None,
 ) -> Sweep:
-    """Run every case in ONE isolated copy of ``repo``'s repository.
+    """Run every baseline and every case in its OWN isolated copy of ``repo``.
 
     ``cases`` name files in ``repo`` (the caller's tree); each is mutated at the
-    same relative place in the copy. ``pythonpath`` lists repo-relative import
+    same relative place in its copy. ``pythonpath`` lists repo-relative import
     roots, put on the children's PYTHONPATH as copy paths. ``tmp_root`` is where
-    the copy is made (default ``~/tmp``). The caller's tree is never written.
+    copies are made (default ``~/tmp``). The caller's tree is never written.
+
+    One copy for all cases let a file one test wrote change a later case's
+    verdict. Now nothing is shared between cases except what lives outside a
+    copy (HOME, git's refs and config), and the unmutated runs either side of
+    the mutated one in `run_case` turn most of that into an ABORT. The first copy fixes the targets' pristine bytes and a
+    fingerprint; a later copy with a different fingerprint means the caller's
+    tree changed mid-sweep, and its case ABORTS rather than judging a different
+    tree.
     """
     if not cases:
         raise ValueError("a sweep with no cases proves nothing")
@@ -1132,71 +1249,81 @@ def sweep(
     _refuse_back_pointers(repo, env, cases)
     selectors = {id(c): _copy_selector(repo, c) for c in cases}
 
-    with isolated_copy(repo, tmp_root) as root:
-        child_env = dict(env or {})
-        if pythonpath:
-            child_env = {
-                "PYTHONPATH": os.pathsep.join(str(root / p) for p in pythonpath),
-                **child_env,
-            }
-        # Read ONCE, before any child runs: whatever the baseline or a case does
-        # to a target afterwards, every case starts from this.
+    first: dict = {}
+    with isolated_copy(repo, tmp_root, first) as root:
+        # Read ONCE, before any child runs: every case starts from these bytes.
         targets = {p: _load_target(root, rel) for p, rel in rels.items()}
+    snapshot = first["fingerprint"]
 
-        if check_baseline:
-            # A case gated on state this run does not have CANNOT be baselined:
-            # its test fails without that state, the gate reads that as a RED
-            # baseline, and one unavailable resource would kill every OTHER case.
-            # `run_case` still aborts it, loudly. A refused target is reported
-            # per case below rather than through its baseline.
-            baselineable = [
-                c
-                for c in cases
-                if all(r in (available or set()) for r in c.requires)
-                and isinstance(targets[c.path], _Target)
-            ]
-            if baselineable:
+    if check_baseline:
+        # A case gated on state this run does not have CANNOT be baselined:
+        # its test fails without that state, the gate reads that as a RED
+        # baseline, and one unavailable resource would kill every OTHER case.
+        # `run_case` still aborts it, loudly. A refused target is reported per
+        # case below rather than through its baseline.
+        groups: dict[tuple, Case] = {}
+        for c in cases:
+            if all(r in (available or set()) for r in c.requires) and isinstance(
+                targets[c.path], _Target
+            ):
+                groups.setdefault(_baseline_key(c, selectors), c)
+        for c in groups.values():
+            info: dict = {}
+            with isolated_copy(repo, tmp_root, info) as root:
+                if info["fingerprint"] != snapshot:
+                    raise RuntimeError(
+                        "the caller's tree changed while the sweep ran its "
+                        "baselines; no verdict would be about one tree"
+                    )
                 problem = assert_green_baseline(
-                    baselineable,
+                    [c],
                     cwd=root,
                     python=python,
-                    env=child_env,
+                    env=_copy_env(env, root, info["holder"], pythonpath),
                     timeout=timeout,
                     selectors=selectors,
                 )
-                if problem:
-                    raise RuntimeError(problem)
+            if problem:
+                raise RuntimeError(problem)
 
-        out = Sweep()
-        dirty: str | None = None
-        for case in cases:
-            target = targets[case.path]
-            if isinstance(target, str):
-                out.results.append(Result(case, ABORTED, target))
-            elif dirty:
+    out = Sweep()
+    for case in cases:
+        target = targets[case.path]
+        if isinstance(target, str):
+            out.results.append(Result(case, ABORTED, target))
+            continue
+        info = {}
+        with contextlib.ExitStack() as stack:
+            # A copy that cannot be made (a file vanishing mid-overlay, a full
+            # disk) costs this case, not every result the sweep already has.
+            try:
+                root = stack.enter_context(isolated_copy(repo, tmp_root, info))
+            except (RuntimeError, OSError) as exc:
+                out.results.append(Result(case, ABORTED, f"could not make this case's copy: {exc}"))
+                continue
+            if info["fingerprint"] != snapshot:
                 out.results.append(
                     Result(
                         case,
                         ABORTED,
-                        f"the copy is no longer pristine ({dirty}); "
-                        "a verdict from it would not be about the tree under test",
+                        "the caller's tree changed during the sweep; this copy is not the "
+                        "tree the other cases were judged against",
                     )
                 )
-            else:
-                out.results.append(
-                    run_case(
-                        case,
-                        target,
-                        cwd=root,
-                        python=python,
-                        env=child_env,
-                        timeout=timeout,
-                        available=available,
-                        selector=selectors[id(case)],
-                    )
+                continue
+            out.results.append(
+                run_case(
+                    case,
+                    _Target(root / rels[case.path], target.pristine, target.mode),
+                    cwd=root,
+                    python=python,
+                    env=_copy_env(env, root, info["holder"], pythonpath),
+                    timeout=timeout,
+                    available=available,
+                    selector=selectors[id(case)],
                 )
-                dirty = _reset(root, target)
-        return out
+            )
+    return out
 
 
 def render(result: Sweep) -> str:

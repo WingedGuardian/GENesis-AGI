@@ -344,6 +344,37 @@ jobs:
       - name: External-I/O egress guard
         run: python scripts/check_external_io.py
 
+  mutation-gate:
+    # Verify-RED, reported; to be made a required check once the harness is
+    # stable (it is not in the required-check ruleset, so a red run here does
+    # not block a merge on its own). A guard's test can stop pinning the
+    # property it is named for -- through a refactor, a widened assertion, a
+    # sibling layer that starts masking it -- and nothing goes red, because the
+    # test still passes. This breaks a handful of load-bearing guard decisions
+    # on purpose and fails if the test does NOT notice. An ABORT is a failure
+    # too: a case that could not run has established nothing.
+    # See scripts/ci/mutation_sweep.py.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The job runs repository tests and needs no git credential after
+          # the checkout, so none is left on disk for them to read.
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        # MUST mirror the `test` job, pin file included: the root
+        # tests/conftest.py imports aiosqlite, so a minimal install fails
+        # collection and every case ABORTS, and an unpinned pytest could change
+        # the summary grammar the harness parses.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test,transcript-analytics]" -c .github/test-tools/requirements.txt
+      - name: Mutation gate
+        run: python scripts/ci/mutation_sweep.py config/mutation_gate.json --repo .
+
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
     # into a directory nothing sweeps. MEASURED 2026-10-26: 85 sites, 30 dirty --
