@@ -1803,9 +1803,108 @@ _start_genesis_server() {
 # If the server is killed mid-write during the update, this backup
 # enables recovery without data loss.
 DB_FILE="$GENESIS_ROOT/data/genesis.db"
-MIGRATIONS_RAN=0  # set to 1 once the migration runner is invoked; gates the
-                  # pre-update DB restore in _do_rollback (rollback the schema
-                  # only if this update actually migrated it).
+DB_RESTORE_OWED=0  # set by _measure_db_restore_owed at rollback: 1 when this
+                  # update changed the database's schema or migrations (or that
+                  # cannot be measured); gates the pre-update DB restore in
+                  # _do_rollback. A rollback that owes nothing keeps the database,
+                  # and with it every write made since the snapshot.
+# BEGIN db-restore-owed (extracted by tests/test_scripts/test_update_db_restore_owed.py)
+# Decides DB_RESTORE_OWED by MEASURING, at rollback, whether this update changed
+# what the old code depends on. The restore source ($DB_FILE.pre-update.peer-restore)
+# and the live database are compared on their DDL (sqlite_master), user_version
+# and the set of applied numbered migrations (schema_migrations: a migration can
+# rewrite data without touching DDL). Any difference, or any failure to compare,
+# owes the restore. Identical means the old code is back on its own schema, so
+# the database is kept with the writes made since the snapshot. Predicting this
+# from the merged paths was tried first and measured wrong: the 2026-10-31
+# update changed one comment in db/schema/ and left the schema identical.
+# Not compared: data migrations (d-prefixed; they may also have changed Qdrant,
+# which a DB restore would not undo) and value-only rows create_all_tables rewrites.
+# System python3 with -I -S, because the venv may be what broke. Read-only
+# (mode=ro, which still sees WAL content); the busy timeout bounds a lock wait,
+# and the reads themselves take milliseconds.
+# Usage: _measure_db_restore_owed <code_action> <server_down>, from _do_rollback.
+#   none / untouched: the checkout is at the rollback tag, or this run never
+#     merged and someone else moved it. This update's code never ran, so it owes
+#     nothing; restoring under someone else's code would put that code on an
+#     old schema.
+#   server not confirmed down: a still-running server can change the database
+#     after it is measured, so the restore is owed (and refused, which marks the
+#     rollback incomplete).
+#   no snapshot this run: the snapshot step skips only a database that did not
+#     exist yet (it exits the update on any other failure), so one that exists
+#     now was created by this update and owes a restore that cannot happen.
+_measure_db_restore_owed() {
+    local code_action="$1" server_down="$2" rc=0 out=""
+    if [ "$code_action" = "none" ] || [ "$code_action" = "untouched" ]; then
+        DB_RESTORE_OWED=0
+        return 0
+    fi
+    if [ "$server_down" != "true" ]; then
+        DB_RESTORE_OWED=1
+        echo "  The server is not confirmed down, so the database cannot be measured reliably."
+        return 0
+    fi
+    if [ "${DB_SNAPSHOT_TAKEN:-0}" != "1" ]; then
+        if [ -f "$DB_FILE" ]; then DB_RESTORE_OWED=1; else DB_RESTORE_OWED=0; fi
+        return 0
+    fi
+    out="$(python3 -I -S - "$DB_FILE.pre-update.peer-restore" "$DB_FILE" 2>&1 <<'SCHEMA_PY'
+import sqlite3
+import sys
+from pathlib import Path
+
+
+def shape(path):
+    # as_uri() percent-encodes: a raw "file:{path}" lets a '?' or '#' in the
+    # install path cut the path short and drop mode=ro.
+    con = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
+    try:
+        ddl = set(con.execute("SELECT type, name, tbl_name, sql FROM sqlite_master"))
+        if not ddl:
+            # A Genesis database always has tables; an empty one is a mis-open
+            # or a missing file SQLite created, never something to call identical.
+            raise RuntimeError(f"no schema in {path}")
+        version = con.execute("PRAGMA user_version").fetchone()[0]
+        has = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+        ).fetchone()
+        applied = {r[0] for r in con.execute("SELECT id FROM schema_migrations")} if has else set()
+    finally:
+        con.close()
+    return ddl, version, applied
+
+
+# Exit 0 = identical, 3 = differs, anything else = could not compare (an
+# uncaught error exits 1, so "differs" must not share that code).
+try:
+    before, after = shape(sys.argv[1]), shape(sys.argv[2])
+except Exception as exc:
+    print(f"{type(exc).__name__}: {exc}")
+    sys.exit(2)
+if before == after:
+    sys.exit(0)
+changed = sorted({row[1] for row in before[0] ^ after[0]})
+migrations = before[2] ^ after[2]
+print(
+    f"{len(changed)} schema object(s) differ"
+    + (f" ({', '.join(changed[:5])}{', ...' if len(changed) > 5 else ''})" if changed else "")
+    + (f"; user_version {before[1]} -> {after[1]}" if before[1] != after[1] else "")
+    + (f"; {len(migrations)} applied migration(s) differ" if migrations else "")
+)
+sys.exit(3)
+SCHEMA_PY
+)" || rc=$?
+    case "$rc" in
+        0) DB_RESTORE_OWED=0
+           echo "  Database schema unchanged since the snapshot: the database is kept." ;;
+        3) DB_RESTORE_OWED=1
+           echo "  Database changed since the snapshot: $out" ;;
+        *) DB_RESTORE_OWED=1
+           echo "  Could not compare the database with its snapshot (exit $rc), so it is restored: $(printf '%s' "$out" | tail -1)" ;;
+    esac
+}
+# END db-restore-owed
 DB_SNAPSHOT_TAKEN=0  # set to 1 only when THIS run's verified snapshot succeeds; the
                   # restore trusts this, not mere file existence, so a stale
                   # snapshot from a prior run is never restored as if current.
@@ -2503,25 +2602,27 @@ _do_rollback() {
         pip_ok=false
     fi
 
-    # Restore the pre-update DB — but ONLY if migrations actually ran this update.
-    # Rolling back the code without the DB would leave the old code running
-    # against a migrated (newer) schema. If no migration ran, the DB is untouched.
+    # Restore the pre-update DB — but ONLY if this update may have changed its
+    # schema (DB_RESTORE_OWED). Rolling back the code without the DB would leave
+    # the old code running against a newer schema. Otherwise the DB is kept, with
+    # the writes made since the snapshot, which a restore would discard.
+    _measure_db_restore_owed "$code_action" "$server_down"
     # BEGIN rollback-db-decision (extracted by tests/test_scripts/test_update_checkout_moved.py)
     local db_ok=true
-    if [ "${MIGRATIONS_RAN:-0}" = "1" ]; then
+    if [ "${DB_RESTORE_OWED:-0}" = "1" ]; then
         if [ "$code_action" = "moved" ] || [ "$code_kept" = "true" ]; then
             # The code was left as it is (merged, plus whatever moved it), so the
-            # migrated schema is the one that matches it. Restoring the old DB here
-            # would put the new code on the old schema.
-            echo "  CRITICAL: migrations ran and the code was not rolled back — the migrated database is kept to match it."
+            # database it may have changed is the one that matches it. Restoring
+            # the old DB here would put the new code on the old schema.
+            echo "  CRITICAL: the schema may have changed and the code was not rolled back — the database is kept to match it."
             db_ok=false
         elif [ "${DB_SNAPSHOT_TAKEN:-0}" != "1" ]; then
-            # Migrations ran but THIS run took no valid snapshot (the `.backup`
+            # A restore is owed but THIS run took no valid snapshot (the `.backup`
             # failed, or only a stale prior-run file exists). We cannot roll the
             # schema back, so the rollback is NOT clean — the old code will run
             # against a migrated DB. Flag it loudly for manual intervention rather
             # than report success or restore a stale snapshot.
-            echo "  CRITICAL: migrations ran but no current DB snapshot exists — cannot restore; old code may run against a migrated schema"
+            echo "  CRITICAL: a DB restore is owed but no current DB snapshot exists — cannot restore; old code may run against a changed schema"
             db_ok=false
         elif [ "$server_down" != "true" ]; then
             # Refuse to overwrite a possibly-live database — a cp under a writing
@@ -2598,7 +2699,7 @@ _do_rollback() {
         fi
     fi
     if [ "$rollback_ok" = true ]; then
-        echo "  Rolled back to $ROLLBACK_TAG (code, deps$([ "${MIGRATIONS_RAN:-0}" = "1" ] && echo ", database"))."
+        echo "  Rolled back to $ROLLBACK_TAG (code, deps$([ "${DB_RESTORE_OWED:-0}" = "1" ] && echo ", database"))."
         echo "  NOT reverted: installed systemd units and hooks (self-heal on the next update)."
         _ROLLBACK_CLEAN=1
         _record_update_history "rolled_back" "$reason" "$degraded"
@@ -3528,9 +3629,6 @@ PYEOF
 case "$_mig_probe_rc" in
     0)
         echo "--- Running migrations ---"
-        # Set BEFORE the runner: even a partial failure has altered the schema,
-        # so a rollback must restore the pre-update DB (see _do_rollback).
-        MIGRATIONS_RAN=1
         if ! "$VENV_DIR/bin/python" -m genesis.db.migrations --apply 2>&1 | tail -10; then
             _do_rollback "migration runner failed"
             exit 1
