@@ -1905,6 +1905,158 @@ SCHEMA_PY
     esac
 }
 # END db-restore-owed
+
+# BEGIN db-restore-through-sqlite (extracted by tests/test_scripts/test_update_db_restore_sqlite.py)
+# Restores $DB_FILE.pre-update.peer-restore INTO the live database through
+# SQLite's backup API, never by cp. Long-lived Claude Code MCP servers keep the
+# live database open (a WAL-mode connection holds a SHARED lock for its whole
+# life), so a cp under them left a rollback-journal file nobody could switch back
+# to WAL ("database is locked" at the server's init) and left those readers
+# serving pre-restore pages. Writing through SQLite's own locking instead lands
+# with readers attached: they see the restored data on their next transaction,
+# the file stays WAL, and nothing is terminated (MEASURED with idle readers, a
+# reader mid-transaction, a writer holding the lock, and a 900 MB database).
+# A backup killed before it commits leaves the live database exactly as it was
+# (MEASURED: SIGTERM and SIGKILL mid-copy), so the timeout fails safe.
+# The worker prints COMMITTED the moment the backup has landed, so a failure
+# AFTER that point (verification, checkpoint) is reported as "restored, not
+# verified" rather than "not restored". _DB_RESTORE_LANDED carries that to the
+# rollback summary. The backup gets its own deadline (the bound minus 60 s:
+# quick_check took 3 s on an 890 MB database), enforced through the progress
+# callback, which fires on every BUSY retry.
+_DB_RESTORE_LANDED=0
+_restore_db_snapshot() {
+    local limit="${GENESIS_UPDATE_DB_RESTORE_TIMEOUT_S:-600}" out="" rc=0
+    _DB_RESTORE_LANDED=0
+    if [[ ! "$limit" =~ ^[1-9][0-9]{0,6}$ ]] || [ "$limit" -le 60 ]; then
+        echo "  Invalid GENESIS_UPDATE_DB_RESTORE_TIMEOUT_S (seconds above 60 required): the database is NOT restored."
+        return 1
+    fi
+    out="$(timeout --kill-after=5s "$limit" python3 -I -S - "$DB_FILE.pre-update.peer-restore" "$DB_FILE" "$((limit - 60))" 2>&1 <<'RESTORE_PY'
+import os
+import shutil
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+started = time.monotonic()  # the backup deadline counts from here, not from the copy
+source, live, backup_budget = sys.argv[1], sys.argv[2], int(sys.argv[3])
+
+
+def fail(msg):
+    # One printable line: error text can quote names from the snapshot's own
+    # schema, and a newline there could forge a marker line bash trusts.
+    msg = "".join(c if c.isprintable() else " " for c in str(msg))
+    print(f"FAILED: {msg}", flush=True)
+    sys.exit(2)
+
+
+def shape(con):
+    # Same comparison as the db-restore-owed worker above; keep the two in step.
+    ddl = set(con.execute("SELECT type, name, tbl_name, sql FROM sqlite_master"))
+    has = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'"
+    ).fetchone()
+    applied = {r[0] for r in con.execute("SELECT id FROM schema_migrations")} if has else set()
+    return ddl, con.execute("PRAGMA user_version").fetchone()[0], applied
+
+
+try:
+    # In WAL mode the whole snapshot is written to -wal before a checkpoint folds
+    # it in, so it needs about one database of free space beside the live one.
+    need = os.path.getsize(source) * 11 // 10 + (64 << 20)
+    free = shutil.disk_usage(os.path.dirname(os.path.abspath(live))).free
+    if free < need:
+        fail(f"{free >> 20} MiB free beside the database, {need >> 20} MiB needed")
+    src = sqlite3.connect(Path(source).resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
+    # Check the snapshot BEFORE it overwrites anything: the backup copies pages
+    # as they are, so a damaged snapshot would replace a consistent database.
+    if src.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+        fail("the snapshot failed quick_check")
+    # An empty or zero-byte file passes quick_check, and restoring it would empty
+    # the live database; a Genesis database always has tables.
+    if not shape(src)[0]:
+        fail("the snapshot has no schema")
+    dst = sqlite3.connect(live, timeout=30)
+    for pragma in ("page_size", "encoding"):
+        a = src.execute(f"PRAGMA {pragma}").fetchone()[0]
+        b = dst.execute(f"PRAGMA {pragma}").fetchone()[0]
+        if a != b:
+            fail(f"{pragma} differs (snapshot {a}, live {b})")
+    # WAL first: a rollback-journal live file under a reader's SHARED lock is the
+    # 2026-10-31 lock-out, and a backup into it would retry until the timeout.
+    if dst.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
+        try:
+            switched = dst.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        except sqlite3.OperationalError:
+            switched = False
+        if not switched:
+            fail("the live database could not be switched to WAL (another process holds it)")
+    # busy_timeout 0 for the backup: with a busy handler, one backup step waits
+    # INSIDE SQLite and can then copy and commit, so a deadline checked afterwards
+    # would report a restore that landed as one that did not (MEASURED). At 0 every
+    # wait is a BUSY return to Python's retry loop, which the deadline governs.
+    dst.execute("PRAGMA busy_timeout=0")
+    deadline = started + backup_budget
+
+    def progress(status, remaining, total):
+        # Abort only a step that is WAITING (SQLITE_BUSY 5 / SQLITE_LOCKED 6);
+        # one that returned SQLITE_DONE has committed and must never be reported
+        # as not restored. (remaining is 0 both before the first page and after
+        # the last, so it cannot tell the two apart.)
+        if status in (5, 6) and time.monotonic() > deadline:
+            raise TimeoutError(f"backup still blocked after {backup_budget}s")
+
+    src.backup(dst, pages=-1, progress=progress, sleep=0.25)
+    print("COMMITTED", flush=True)
+    if dst.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+        fail("quick_check of the restored database did not return ok")
+    if shape(dst) != shape(src):
+        fail("the restored schema does not match the snapshot")
+    # From here only the checkpoint remains, which never changes the data: a
+    # stop now is a verified restore whose WAL a later checkpoint folds in.
+    print("VERIFIED", flush=True)
+    # Still at busy_timeout 0 (set before the backup), which matters here too: a
+    # TRUNCATE checkpoint waits for readers WHILE holding the writer lock, so any
+    # wait would block every writer for its length (MEASURED 30 s at the default).
+    # A reader still in a transaction just leaves the WAL to a later checkpoint.
+    busy = dst.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+    print("CHECKPOINT busy" if busy else "CHECKPOINT done", flush=True)
+except SystemExit:
+    raise
+except Exception as exc:
+    fail(f"{type(exc).__name__}: {exc}")
+RESTORE_PY
+)" || rc=$?
+    # Whole-line matches: the output also carries error text, which may quote paths.
+    local verified=0
+    grep -qx COMMITTED <<<"$out" && _DB_RESTORE_LANDED=1
+    grep -qx VERIFIED <<<"$out" && verified=1
+    if [ "$rc" -ne 0 ] && [ "$verified" = 1 ]; then
+        # Stopped during the checkpoint, after verification: the data is restored
+        # and checked; the WAL is folded in by a later checkpoint.
+        echo "  Restored and verified the pre-update database snapshot through SQLite (its WAL checkpoint was cut short; a later one folds it in)."
+        return 0
+    fi
+    if [ "$rc" -eq 0 ]; then
+        case "$out" in
+            *"CHECKPOINT busy"*) echo "  Restored the pre-update database snapshot through SQLite (a reader still in a transaction keeps the WAL until a later checkpoint)." ;;
+            *) echo "  Restored the pre-update database snapshot through SQLite." ;;
+        esac
+        return 0
+    fi
+    local why
+    why="$(printf '%s\n' "$out" | grep '^FAILED: ' | tail -1)"
+    [ -n "$why" ] || why="exit $rc$([ "$rc" -eq 124 ] || [ "$rc" -eq 137 ] && echo ", stopped at the ${limit}s bound")"
+    if [ "$_DB_RESTORE_LANDED" = 1 ]; then
+        echo "  CRITICAL: the pre-update database snapshot WAS restored, but its verification did not complete (${why#FAILED: }) — check the database before starting services."
+    else
+        echo "  CRITICAL: the pre-update database snapshot was NOT restored (${why#FAILED: }); the live database is unchanged — old code may run against a migrated schema."
+    fi
+    return 1
+}
+# END db-restore-through-sqlite
 DB_SNAPSHOT_TAKEN=0  # set to 1 only when THIS run's verified snapshot succeeds; the
                   # restore trusts this, not mere file existence, so a stale
                   # snapshot from a prior run is never restored as if current.
@@ -2625,20 +2777,16 @@ _do_rollback() {
             echo "  CRITICAL: a DB restore is owed but no current DB snapshot exists — cannot restore; old code may run against a changed schema"
             db_ok=false
         elif [ "$server_down" != "true" ]; then
-            # Refuse to overwrite a possibly-live database — a cp under a writing
-            # server corrupts it. Leave the migrated DB in place (schema mismatch,
-            # but recoverable) and flag for manual intervention.
+            # Refuse to replace a possibly-live database: a server still running
+            # the new code would keep writing to the restored one. Leave the
+            # migrated DB in place (schema mismatch, but recoverable) and flag it.
             echo "  WARNING: server not confirmed down — SKIPPING DB restore (won't overwrite a live DB)."
             db_ok=false
-        elif cp "$DB_FILE.pre-update.peer-restore" "$DB_FILE" 2>&1 \
-            && rm -f "$DB_FILE-wal" "$DB_FILE-shm"; then
-            # Drop the stale WAL/SHM: they hold the MIGRATED changes, and SQLite
-            # would replay them over the restored old DB on reopen, resurrecting
-            # the migration. The `.backup` snapshot is self-contained, so removing
-            # them is correct. (server_down guarantees no live handle here.)
-            echo "  Restored pre-migration database snapshot (stale WAL cleared)."
+        elif _restore_db_snapshot; then
+            # Through SQLite, never cp: Claude Code MCP servers hold the live
+            # database open whether or not the server is down (see the block).
+            :
         else
-            echo "  CRITICAL: failed to restore DB snapshot — old code may run against a migrated schema"
             db_ok=false
         fi
     fi
@@ -2706,8 +2854,15 @@ _do_rollback() {
     else
         echo "  ROLLBACK INCOMPLETE — manual intervention required"
         echo "  Last known good state: $OLD_TAG ($OLD_COMMIT) on $ORIGINAL_BRANCH"
-        [ "$db_ok" = "true" ] || [ "$code_action" = "moved" ] || [ "$code_kept" = "true" ] \
-            || echo "  DB restore FAILED — old code may be running against a migrated schema."
+        # BEGIN rollback-db-summary (extracted by tests/test_scripts/test_update_db_restore_sqlite.py)
+        if [ "$db_ok" != "true" ] && [ "$code_action" != "moved" ] && [ "$code_kept" != "true" ]; then
+            if [ "$_DB_RESTORE_LANDED" = 1 ]; then
+                echo "  DB restored but NOT verified — check it before starting services."
+            else
+                echo "  DB restore FAILED — old code may be running against a migrated schema."
+            fi
+        fi
+        # END rollback-db-summary
         _record_update_history "failed" "$reason (rollback incomplete)" "$degraded"
     fi
 

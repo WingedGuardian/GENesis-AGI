@@ -55,21 +55,32 @@ def test_rollback_restores_db_only_when_owed(text: str) -> None:
     assert "a DB restore is owed but no current DB snapshot exists" in rb, (
         "migrated-but-no-snapshot must be a LOUD rollback failure, not a silent success"
     )
-    assert 'cp "$DB_FILE.pre-update.peer-restore" "$DB_FILE"' in rb, (
-        "restore copies the authority-reset pre-update candidate back"
+    assert "elif _restore_db_snapshot; then" in rb, (
+        "restore writes the authority-reset pre-update candidate back through SQLite"
     )
+    restore = text[
+        text.index("# BEGIN db-restore-through-sqlite") : text.index(
+            "# END db-restore-through-sqlite"
+        )
+    ]
+    assert '"$DB_FILE.pre-update.peer-restore" "$DB_FILE"' in restore
     # Current-run authority is granted only after the bounded worker succeeds.
     snap = text[text.index("# BEGIN db-snapshot") : text.index("# END db-snapshot")]
     assert 'exec python3 -I -S - "$1" "$2"' in snap
-    assert 'if timeout --kill-after=5s' in snap
+    assert "if timeout --kill-after=5s" in snap
     assert 'snapshot "$DB_FILE" "$_PEER_RESTORE_PY"; then\n        DB_SNAPSHOT_TAKEN=1' in snap
     # The isolated worker invokes the selected authority source before publishing.
-    assert snap.index('exec(compile(authority,') < snap.index('namespace["reset_peer_authority"](candidate)')
-    assert snap.index('namespace["reset_peer_authority"](candidate)') < snap.index('publish(candidate, guarded)')
-    assert 'if [ "$restart_ok" = "true" ] && [ "$db_ok" = "true" ]; then' in rb
-    assert 'rm -f "$DB_FILE-wal" "$DB_FILE-shm"' in rb, (
-        "restore MUST clear the stale WAL/SHM or SQLite replays the migrated changes"
+    assert snap.index("exec(compile(authority,") < snap.index(
+        'namespace["reset_peer_authority"](candidate)'
     )
+    assert snap.index('namespace["reset_peer_authority"](candidate)') < snap.index(
+        "publish(candidate, guarded)"
+    )
+    assert 'if [ "$restart_ok" = "true" ] && [ "$db_ok" = "true" ]; then' in rb
+    # No sidecar is deleted: the restore is a SQLite transaction on the live file,
+    # so the WAL holds the restored pages, not stale migrated ones, and deleting it
+    # under the readers that stay attached is what corrupted their view.
+    assert 'rm -f "$DB_FILE-wal" "$DB_FILE-shm"' not in rb
     assert '[ "$server_down" != "true" ]' in rb, (
         "DB restore must be skipped if the server is not confirmed down (don't cp a live DB)"
     )

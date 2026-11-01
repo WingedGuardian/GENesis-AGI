@@ -335,10 +335,17 @@ def _decide(db: Path, *, snapshot_taken: bool = True) -> str:
         re.DOTALL,
     )
     assert m
+    restore = re.search(
+        r"# BEGIN db-restore-through-sqlite[^\n]*\n(.*?)# END db-restore-through-sqlite",
+        UPDATE.read_text(),
+        re.DOTALL,
+    )
+    assert restore
     script = (
         "set -Eeuo pipefail\n"
         f'DB_FILE="{db}"\nDB_SNAPSHOT_TAKEN={1 if snapshot_taken else 0}\nDB_RESTORE_OWED=0\n'
         + _block()
+        + restore.group(1)
         + "\nrollback() {\n    local code_action=reset code_kept=false server_down=true\n"
         '    _measure_db_restore_owed "$code_action" "$server_down"\n'
         + m.group(1)
@@ -371,7 +378,9 @@ def test_a_changed_database_is_restored_from_the_snapshot(tmp_path):
     _snapshot(db)
     _exec(db, "ALTER TABLE notes ADD COLUMN tag TEXT", "INSERT INTO notes (body) VALUES ('lost')")
     out = _decide(db)
-    assert "DB_OK=true" in out and "Restored pre-migration database snapshot" in out, out
+    assert (
+        "DB_OK=true" in out and "Restored the pre-update database snapshot through SQLite" in out
+    ), out
     assert _rows(db) == []
 
 

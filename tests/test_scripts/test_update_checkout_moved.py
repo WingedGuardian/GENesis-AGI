@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -132,6 +133,7 @@ def _rollback_guard(
             else "_ephemeral_backup_before_reset() { echo BACKUP-BEFORE-RESET; }\n"
         )
         + extra
+        + (_block("db-restore-through-sqlite") if db_file else "")
         + "guard() {\n"
         + (f'DB_RESTORE_OWED=1\nDB_SNAPSHOT_TAKEN=1\nDB_FILE="{db_file}"\n' if db_file else "")
         + _block("rollback-code-guard")
@@ -644,11 +646,30 @@ def test_an_ephemeral_edit_the_update_changed_is_cleared_only_with_a_backup(
 
 
 def _db(tmp_path: Path) -> Path:
+    """Real SQLite files (the restore goes through SQLite): the live database is
+    marked "migrated", the guarded restore source "guarded-pre-update". The raw
+    `.pre-update` snapshot is never read by the rollback; it stays a text file."""
     db = tmp_path / "genesis.db"
-    db.write_text("migrated\n")
+    for path, mark, mode in (
+        (db, "migrated", "WAL"),
+        (tmp_path / "genesis.db.pre-update.peer-restore", "guarded-pre-update", "DELETE"),
+    ):
+        con = sqlite3.connect(path)
+        con.execute(f"PRAGMA journal_mode={mode}")
+        con.execute("CREATE TABLE mark (v TEXT)")
+        con.execute("INSERT INTO mark VALUES (?)", (mark,))
+        con.commit()
+        con.close()
     (tmp_path / "genesis.db.pre-update").write_text("pre-update\n")
-    (tmp_path / "genesis.db.pre-update.peer-restore").write_text("guarded-pre-update\n")
     return db
+
+
+def _mark(db: Path) -> str:
+    con = sqlite3.connect(db)
+    try:
+        return con.execute("SELECT v FROM mark").fetchone()[0]
+    finally:
+        con.close()
 
 
 @pytest.mark.parametrize(
@@ -691,7 +712,7 @@ def test_the_database_follows_the_code_left_on_disk(repo, tmp_path, case, restor
     db = _db(tmp_path)
     r = _run(_rollback_guard(repo, own_head=merged, db_file=str(db), extra=extra), tmp_path)
     assert r.returncode == 0, r.stderr
-    assert db.read_text() == ("guarded-pre-update\n" if restored else "migrated\n"), r.stdout
+    assert _mark(db) == ("guarded-pre-update" if restored else "migrated"), r.stdout
     assert db.with_name("genesis.db.pre-update").read_text() == "pre-update\n"
     assert ("DB_OK=true" in r.stdout) is restored, r.stdout
     if not restored:
@@ -883,10 +904,10 @@ def test_a_moved_checkout_keeps_the_migrated_database():
     moved = body.index(
         'if [ "$code_action" = "moved" ] || [ "$code_kept" = "true" ]; then', migrated
     )
-    restore = body.index('cp "$DB_FILE.pre-update.peer-restore" "$DB_FILE"', migrated)
+    restore = body.index("elif _restore_db_snapshot; then", migrated)
     assert migrated < moved < restore
     branch = body[moved : body.index("elif", moved)]
-    assert "db_ok=false" in branch and "cp " not in branch
+    assert "db_ok=false" in branch and "_restore_db_snapshot" not in branch
 
 
 def test_reinstall_and_restart_happen_only_on_a_verified_old_tree():

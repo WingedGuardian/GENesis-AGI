@@ -30,7 +30,7 @@ def _seed(path, sql=SCHEMA):
     return path
 
 
-def _assert_reset(path):
+def _assert_reset(path, journal="delete"):
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT mode FROM peer_settings").fetchall() == [("disabled",)]
         assert db.execute("SELECT * FROM peer_grants").fetchall() == []
@@ -46,7 +46,7 @@ def _assert_reset(path):
             "realm",
             "https://peer.example",
         )
-        assert db.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+        assert db.execute("PRAGMA journal_mode").fetchone() == (journal,)
 
 
 @pytest.mark.parametrize("mode", ["disabled", "fallback", "sam"])
@@ -320,6 +320,12 @@ def test_rollback_to_old_code_consumes_only_guarded_candidate(tmp_path, candidat
     decision = source[
         source.index("\n", marker) + 1 : source.index("# END rollback-db-decision", marker)
     ]
+    restore_marker = source.index("# BEGIN db-restore-through-sqlite")
+    restore_fn = source[
+        source.index("\n", restore_marker) + 1 : source.index(
+            "# END db-restore-through-sqlite", restore_marker
+        )
+    ]
     start = source.index("    genesis_checkout_unlock\n", source.index("_do_rollback() {"))
     restart = source[start : source.index('\n    if [ "$checkout_ok"', start)]
     live = _seed(tmp_path / "genesis.db", "CREATE TABLE migrated(x);")
@@ -334,7 +340,9 @@ def test_rollback_to_old_code_consumes_only_guarded_candidate(tmp_path, candidat
         'set -euo pipefail\nDB_FILE="$1"\nDB_RESTORE_OWED=1\nDB_SNAPSHOT_TAKEN=1\n'
         "code_action=none\ncode_kept=false\nserver_down=true\nrestart_ok=true\n"
         "WERE_RUNNING=(genesis-server)\ngenesis_checkout_unlock() { :; }\n"
-        "_start_genesis_server() { echo STARTED; }\nrun() {\n"
+        "_start_genesis_server() { echo STARTED; }\n"
+        + restore_fn
+        + "run() {\n"
         + decision
         + restart
         + '\nprintf "DB_OK=%s\\n" "$db_ok"\n}\nrun\n'
@@ -344,7 +352,9 @@ def test_rollback_to_old_code_consumes_only_guarded_candidate(tmp_path, candidat
     assert ("STARTED" in result.stdout) == candidate_present
     assert f"DB_OK={'true' if candidate_present else 'false'}" in result.stdout
     if candidate_present:
-        _assert_reset(live)
+        # The restore writes into the live file through SQLite, which switches it
+        # to WAL first: a rollback-journal live file is what readers locked out.
+        _assert_reset(live, journal="wal")
     else:
         with sqlite3.connect(live) as db:
             assert db.execute("SELECT name FROM sqlite_schema").fetchall() == [("migrated",)]
