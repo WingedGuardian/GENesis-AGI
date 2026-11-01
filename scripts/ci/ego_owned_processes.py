@@ -116,7 +116,7 @@ def stop(process, groups):
     return {"returncode": process.returncode, "stdout": stdout, "stderr": stderr, "timed_out": False}
 
 
-def init_identity():
+def init_identity(controller="/fixture/ego_owned_recovery.py"):
     init_argv = [v.decode() for v in Path("/proc/1/cmdline").read_bytes().rstrip(b"\0").split(b"\0")]
     controller_argv = [v.decode() for v in Path("/proc/self/cmdline").read_bytes().rstrip(b"\0").split(b"\0")]
     executable = str(Path("/proc/1/exe").readlink())
@@ -127,7 +127,7 @@ def init_identity():
             or Path(init_argv[0]).name not in {"docker-init", "tini"}
             or Path(executable).name != Path(init_argv[0]).name
             or "--" not in init_argv or init_argv[init_argv.index("--") + 1:] != controller_argv
-            or len(controller_argv) != 2 or controller_argv[1] != "/fixture/ego_owned_recovery.py"
+            or len(controller_argv) != 2 or controller_argv[1] != controller
             or Path(controller_exe).resolve() != Path(sys.executable).resolve()
             or Path(controller_argv[0]).name not in {Path(sys.executable).name, Path(controller_exe).name}):
         raise OwnershipError("expected container init/controller topology missing: " + json.dumps(identity))

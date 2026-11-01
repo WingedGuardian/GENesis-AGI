@@ -150,3 +150,22 @@ The seventh container retains this population separately from native13/pure60.
 Actual post-review contained results and independent artifact/process readback
 are required; host exception/stub tests do not establish real crash recovery.
 Actual timer/backoff/arrival/stop cells and final B/C readback follow separately.
+
+`ego_owned_timing.py` adds a separate actual-clock population in an eighth
+contained CI arm. It runs six ordinary no-op timer wakes across two plain-CLI
+processes, retaining the first committed wake and writer bytes before reopen.
+Dispatch starts must honor the actual 5/10/20/40/40-second waits and cursor zero.
+Three fixed arrival offsets (3/5/8 seconds from the immutable manifest start)
+are all retained and classified against the first actual observation/backoff;
+at least one must land during backoff and dispatch before the previous timer
+wake. An inapplicable set is incomplete, never selected down to a passing cell.
+
+The lifecycle cells send SIGTERM after a committed no-op and before its next
+wake, and start a second plain C writer while the first is paused bound. The
+signal must preserve the stored wake without another native attempt; contention
+must fail before SDK work and leave the journal unchanged. The first writer
+then completes one canonical effect. Scoped cleanup and process censuses reject
+survivors. Twenty-four missing-evidence mutants calibrate the actual rows.
+Host tests use injected clocks and native/upstream stubs; actual clock and CLI
+lifecycle claims require post-review contained results plus independent raw
+readback. The final B/C report remains separate work.

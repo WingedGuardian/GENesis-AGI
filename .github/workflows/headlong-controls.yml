@@ -33,6 +33,7 @@ jobs:
       OWNED_CONTAINER: ego-owned-${{ github.run_id }}-${{ github.run_attempt }}
       MATRIX_CONTAINER: ego-matrix-${{ github.run_id }}-${{ github.run_attempt }}
       RECOVERY_CONTAINER: ego-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+      TIMING_CONTAINER: ego-timing-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -265,9 +266,34 @@ jobs:
           assert calibration['no-op-rejected']['passed'] is False
           print('12 process interruptions / 7 late-I/O faults; separate init, effect and no-op controls verified')
           PY
+      - name: Run actual owned-loop clock and lifecycle controls
+        run: |
+          set -euo pipefail
+          docker create --name "$TIMING_CONTAINER" --init --network none --read-only \
+            --user 65532:65532 --cap-drop ALL --security-opt no-new-privileges \
+            --pids-limit 256 --memory 1g --memory-swap 1g --cpus 1 \
+            --tmpfs /work:rw,exec,nosuid,nodev,size=512m,mode=1777 \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,size=128m,mode=1777 \
+            headlong-controls python3 /fixture/ego_owned_timing.py
+          docker inspect "$TIMING_CONTAINER" > "$RUNNER_TEMP/ego-timing-container.json"
+          timeout 600 docker start -a "$TIMING_CONTAINER" > "$RUNNER_TEMP/ego-timing-report.json"
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$TIMING_CONTAINER")" = 0
+          python3 - "$RUNNER_TEMP/ego-timing-report.json" <<'PY'
+          import json, sys
+          report = json.load(open(sys.argv[1]))
+          assert report['schema'] == 'ego-owned-timing/v1' and report['status'] == 'pass'
+          assert report['sources_unchanged'] is True and report['challenge'] is None
+          expected = ['timers', 'reactive-3', 'reactive-5', 'reactive-8', 'sigterm-backoff', 'exclusive-writer']
+          assert [c['scenario'] for c in report['cases']] == expected
+          assert all(c['passed'] is True and c['scopes_closed'] is True for c in report['cases'])
+          assert any(c.get('classification') == 'during-backoff' for c in report['cases'])
+          assert report['declared_population']['timer_waits'] == [5,10,20,40,40]
+          assert len(report['calibration']) == 24 and all(c['rejected'] is True for c in report['calibration'])
+          print('Six actual timer wakes, three fixed arrivals, backoff SIGTERM and exclusive writer verified')
+          PY
       - name: Remove only this evaluation container
         if: always()
-        run: docker rm -f "$CONTROL_CONTAINER" "$NATIVE_CONTAINER" "$REFERENCE_CONTAINER" "$BRIDGE_CONTAINER" "$OWNED_CONTAINER" "$MATRIX_CONTAINER" "$RECOVERY_CONTAINER" || true
+        run: docker rm -f "$CONTROL_CONTAINER" "$NATIVE_CONTAINER" "$REFERENCE_CONTAINER" "$BRIDGE_CONTAINER" "$OWNED_CONTAINER" "$MATRIX_CONTAINER" "$RECOVERY_CONTAINER" "$TIMING_CONTAINER" || true
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -288,5 +314,7 @@ jobs:
             ${{ runner.temp }}/ego-matrix-container.json
             ${{ runner.temp }}/ego-recovery-report.json
             ${{ runner.temp }}/ego-recovery-container.json
+            ${{ runner.temp }}/ego-timing-report.json
+            ${{ runner.temp }}/ego-timing-container.json
           retention-days: 7
           if-no-files-found: error
