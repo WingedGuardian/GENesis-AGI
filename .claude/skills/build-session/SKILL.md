@@ -2173,7 +2173,11 @@ that takes up the rework is the reviving session (closing-session, "Never RETIRE
    round counts. When the LAST one opens, whoever opened it closes the old PR
    with a comment that maps every part of it, file by file, to the `file:line`
    in the replacement
-   that covers it, or says why that part is moot. If any part is neither,
+   that covers it, or says why that part is moot. Judge both by the problem the
+   part solved, never by whether its code survived: covered means the
+   replacement or `main` delivers that guarantee, moot means the problem itself
+   is gone or an owner decision dropped it (closing-session, "Superseded is
+   about the problem"). If any part is neither,
    leave the old PR open with a comment naming that part. Leave its labels on,
    so the rebuild stays traceable to it. If the spec carries a
    `Follow-up: <id>` line, copy it into the body of the replacement that will

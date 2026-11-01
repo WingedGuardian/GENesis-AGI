@@ -274,7 +274,7 @@ async def test_permission_denied_dir_continues(roots):
 async def test_locate_registered_on_memory_server():
     from genesis.mcp.memory_mcp import mcp
 
-    tools = await mcp.get_tools()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
     assert "locate" in tools
 
 

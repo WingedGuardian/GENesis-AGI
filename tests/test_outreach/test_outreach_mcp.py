@@ -7,7 +7,7 @@ from genesis.mcp.outreach_mcp import mcp
 
 @pytest.mark.asyncio
 async def test_tools_registered():
-    tools = await mcp.get_tools()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
     expected = {"outreach_send", "outreach_queue", "outreach_engagement",
                 "outreach_preferences", "outreach_digest"}
     assert expected.issubset(set(tools.keys()))
@@ -15,7 +15,7 @@ async def test_tools_registered():
 
 @pytest.mark.asyncio
 async def test_outreach_send_without_pipeline():
-    tools = await mcp.get_tools()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
     result = await tools["outreach_send"].fn(
         message="Test", category="surplus", channel="telegram",
     )
@@ -41,7 +41,7 @@ async def test_preferences_set_keeps_fields_it_was_not_given(monkeypatch):
     monkeypatch.setattr(m, "_pipeline", None)
     monkeypatch.setattr(c, "save_outreach_config", lambda cfg, path=None: saved.append(cfg))
 
-    tools = await mcp.get_tools()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
     result = await tools["outreach_preferences"].fn(
         action="set", preferences={"quiet_hours": {"start": "23:00", "end": "06:00"}},
     )
@@ -66,7 +66,7 @@ async def test_preferences_set_can_change_the_peer_cap(monkeypatch):
     monkeypatch.setattr(m, "_pipeline", None)
     monkeypatch.setattr(c, "save_outreach_config", lambda cfg, path=None: saved.append(cfg))
 
-    tools = await mcp.get_tools()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
     await tools["outreach_preferences"].fn(
         action="set", preferences={"rate_limits": {"agent_daily_per_peer": 5}},
     )

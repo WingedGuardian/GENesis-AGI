@@ -690,6 +690,21 @@ def _skip_daily_git_deep_scan():
 
 
 @pytest.fixture(autouse=True)
+def _reset_memory_alarm_breakdown():
+    """Drop the memory alarm's held process breakdown (``errors._memory_culprits``)
+    so one test firing the alarm cannot hand its line to the next. Applied only
+    when the module is already loaded, like the deep-scan guard above."""
+    errors = sys.modules.get("genesis.mcp.health.errors")
+    if errors is None:
+        yield
+        return
+    mp = pytest.MonkeyPatch()
+    mp.setattr(errors, "_memory_culprits", None)
+    yield
+    mp.undo()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_checkout_lock_path(tmp_path):
     mp = pytest.MonkeyPatch()
     mp.setattr(

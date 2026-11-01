@@ -61,7 +61,10 @@ not build it. When you build a rework:
   old PR with a comment that maps every part of it, file by file, to the
   `file:line` in a
   replacement covering it (or says why that part is moot), and leave its labels
-  on. If any part is neither, leave the old PR open and name that part on it.
+  on. Judge each part by the problem it solved, never by whether its code
+  survived: covered means a replacement or `main` delivers that guarantee, moot
+  means the problem itself is gone or the owner dropped it. If any part is
+  neither, leave the old PR open and name that part on it.
   If the spec ends with a `Follow-up: <id>` line, copy that line into the body
   of the replacement that will merge into main LAST. A merge into any other
   base completes it too, so never put it on a PR that merges into another PR.
@@ -359,6 +362,7 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 - `open_question_list` — List open questions, one page at a time (newest first, with their blocks). ``total`` is the full count for the filter and ``listed`` what this page holds; ``next_offset`` is set while more remain (default page 50, max 200). Pages are offsets: a question raised or closed between two calls shifts the later pages by one, so if ``total`` changed, re-read from 0 rather than trusting the walk. ``status`` is ``unverified`` / ``resolved`` / ``dropped``, or empty for all. With ``target`` (``ledger:<id>`` / ``follow_up:<id>`` / ``card:owner/repo#N``) it answers instead whether that target is blocked, and by which unverified questions.
 - `open_question_raise` — Park a genuine owner fork as an open question, optionally blocking work.
 - `open_question_resolve` — Close an open question: ``status`` is ``resolved`` (answered) or ``dropped`` (no longer matters). ``resolution`` is required — say what settled it; an assumption is not an answer. Closing releases every block the question held (the edges are kept as history).
+- `pr_verification_close` — Derive a verification result; server calibration policy can force preview.
 - `provider_activity` — Per-provider call metrics: counts, error rates, latency percentiles, cache hits.
 - `session_address` — Which SendMessage name each Claude Code session id answers to.
 - `session_charter` — Read a session's charter: immutable origin, living mission/pointers, and the full ledger with item ids and status counts.
@@ -369,6 +373,7 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 - `settings_get` — Read the current configuration for a settings domain.
 - `settings_list` — List all configurable settings domains.
 - `settings_update` — Update configuration for a settings domain.
+- `skill_usage_status` — Which skills actually fire? Per-skill loads, slash loads, SKILL.md reads, skill-injection nudges, dispatched injections and nudge-to-use conversion, with a state: active / zombie (nudged, never used) / dead (nudgeable, silent) / not_nudgeable (silent, the hook cannot offer it).
 - `subsystem_heartbeats` — Last heartbeat time for each background subsystem. Detects silent deaths.
 - `task_control` — Control a running task: pause, resume, or cancel.
 - `task_detail` — Get full details for a specific task.

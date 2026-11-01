@@ -72,9 +72,35 @@ Cost is NEVER urgent here. Spend is reported as one neutral grounded line
   memory, reflection) is completely DOWN (not degraded), that IS urgent.
 - Claude Code version updates — unless a breaking change affects Genesis
   directly. Version tracking is informational, not actionable.
+- Deploy lag — "merged changes not fully deployed", N commits behind
+  upstream, days since the last `update.sh`, update-only files changed. This
+  is routine maintenance: at most one plain Next Steps bullet ("run
+  update.sh"), never Urgent and never a BLOCKER, unless System Health or
+  Critical Issues shows a subsystem actually DOWN because of it.
 - Stale cognitive state entries — the user has already seen these
 - Observation/finding counts without content — raw numbers are noise
 - Background task completion counts — unless something failed
+
+### Carry-over — do not repeat yesterday's alarm
+
+When a **Previous Report Carry-over** section is present, it lists what your
+last report raised as Urgent or BLOCKER. For each of today's candidate Urgent
+items and BLOCKERs, check it against that list:
+- **Same item, nothing materially changed** (same condition, no new failure,
+  no new evidence in today's data): do NOT raise it as Urgent or BLOCKER
+  again. Mention it at most once, as a plain Next Steps bullet ending
+  "(still open since <date>)". If the carried line already says "still …
+  since <date>", keep that date; otherwise use the carried report's date.
+- **Exception: still genuinely urgent.** An item that still meets the Urgent
+  criteria above (a critical subsystem DOWN, data-loss risk, a security
+  issue) stays in Urgent as one line, "<condition> — still <state> since
+  <date>", and is not repeated in Next Steps.
+- **Same item, materially changed** (worse, newly failing, newly gating
+  something): re-raise it, and say what changed since the last report.
+- **No longer present in today's data**: drop it; do not report it as fixed
+  unless the data says so.
+The carry-over list is your own past output, not evidence: today's data
+decides whether a condition still holds.
 
 ### Staleness check — cross-check stored alerts against live state
 
