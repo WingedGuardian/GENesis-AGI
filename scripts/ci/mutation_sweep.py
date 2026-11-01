@@ -796,6 +796,24 @@ def _link_escape(repo: Path, rel: str) -> str | None:
     return None
 
 
+def _relative_escape(repo: Path, rel: str) -> str | None:
+    """Why the relative path ``rel`` may lead a child out of its copy, or None.
+
+    The ONE check for every relative path a case supplies: the selector's file
+    part, each `pytest_args` and env piece, and each `pythonpath` entry. A `..`
+    component is refused outright, as `_contained_path` refuses it in manifest
+    paths: the operating system follows a symlink BEFORE it applies the `..`
+    after it, so `lk/../src` (with `lk -> <repo>/sub`) is the caller's `src`,
+    and normalizing first judged it as the innocent `src`. Without `..`, the
+    link walk runs on the path as written.
+    """
+    if ".." in Path(rel).parts:
+        return f"{rel} (a `..` component; name it repository-relative without one)"
+    if escape := _link_escape(repo, rel):
+        return f"{rel} (through {escape})"
+    return None
+
+
 def _back_pointer(repo: Path, value: str, top: Path | None = None) -> str | None:
     """The part of ``value`` that points a child BACK at the caller's tree, or None.
 
@@ -806,9 +824,10 @@ def _back_pointer(repo: Path, value: str, top: Path | None = None) -> str | None
       * an absolute path that lands inside the repository, judged both
         lexically (``/x/./repo/src``) and after resolving symlinks (an alias of
         the repository);
-      * a relative path that climbs out (``../../repo/src``): the child runs in
-        the COPY, so climbing out of it can only reach somewhere else, and the
-        caller's tree is one of the places it can reach;
+      * a relative path with a ``..`` component, or one through a symlink that
+        leads out (`_relative_escape`): the child runs in the COPY, so climbing
+        out of it can only reach somewhere else, and the caller's tree is one
+        of the places it can reach;
       * an ``@argfile``, whose contents this check cannot see;
       * the repository's path anywhere in the value (``file://...``).
     A relative path that stays inside (``PYTHONPATH=src``) resolves inside the
@@ -849,12 +868,8 @@ def _back_pointer(repo: Path, value: str, top: Path | None = None) -> str | None
                 resolved = Path(os.path.realpath(piece_abs))
                 if any(p.is_relative_to(r) for p in (lexical, resolved) for r in roots):
                     return piece
-            else:
-                norm = os.path.normpath(piece)
-                if norm == ".." or norm.startswith("../"):
-                    return piece
-                if escape := _link_escape(repo, norm):
-                    return f"{piece} (through {escape})"
+            elif escape := _relative_escape(repo, piece):
+                return escape
     return None
 
 
@@ -922,11 +937,8 @@ def _copy_selector(repo: Path, case: Case) -> str:
                 f"repository {repo}; the child runs in a copy of it"
             )
     # Checked AFTER the rewrite too: `/repo/linked/t.py` becomes `linked/t.py`.
-    if escape := _link_escape(repo, os.path.normpath(file_part)):
-        raise ValueError(
-            f"case {case.label!r} test {case.test!r} goes through a symlink that leads "
-            f"out of the copy ({escape}); name the real path"
-        )
+    if escape := _relative_escape(repo, file_part):
+        raise ValueError(f"case {case.label!r} test {case.test!r} leads out of the copy: {escape}")
     if _back_pointer(repo, file_part):
         raise ValueError(
             f"case {case.label!r} test {case.test!r} climbs out of the "
@@ -1196,6 +1208,8 @@ def sweep(
                 f"pythonpath entry {root!r} must be repository-relative: "
                 "it is put on the children's PYTHONPATH inside the copy"
             )
+        if escape := _relative_escape(repo, root):
+            raise ValueError(f"pythonpath entry {root!r} leads out of the copy: {escape}")
     _refuse_back_pointers(repo, env, cases)
     selectors = {id(c): _copy_selector(repo, c) for c in cases}
 

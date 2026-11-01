@@ -1890,6 +1890,55 @@ def test_an_import_root_through_a_link_back_is_refused(project):
         _sweep(project, [_case(project, env={"PYTHONPATH": "linked"})])
 
 
+def test_a_pythonpath_entry_through_a_link_back_is_refused(project):
+    """Codex round 3: `pythonpath=("linked",)` with `linked -> <repo>/src` put
+    the caller's unmutated source on the children's PYTHONPATH and read
+    SURVIVED for a mutation `pythonpath=("src",)` reports as BIT."""
+    _link_back(project)
+    with pytest.raises(ValueError, match="leads out of the copy"):
+        _sweep(project, [_case(project)], pythonpath=("linked",))
+
+
+def _climb_through_a_link(project, how):
+    """A relative path that NORMALIZES to an innocent one, while the operating
+    system follows the link first and then applies `..`:
+      * absolute: `lk -> <repo>/sub`, so `lk/../src` is the caller's `src`;
+      * inside: `a/b/c/inlink -> ../../..` stays in the repository (accepted on
+        its own), and a `..` after it climbs out of the copy."""
+    if how == "absolute":
+        (project / "sub").mkdir()
+        (project / "sub" / "keep").write_text("", encoding="utf-8")
+        (project / "lk").symlink_to(project / "sub", target_is_directory=True)
+        value = "lk/../src"
+    else:
+        (project / "a" / "b" / "c").mkdir(parents=True)
+        (project / "a" / "b" / "c" / "keep").write_text("", encoding="utf-8")
+        (project / "a" / "b" / "c" / "inlink").symlink_to("../../..", target_is_directory=True)
+        value = f"a/b/c/inlink/../{project.name}/src"
+    _commit_all(project)
+    return value
+
+
+@pytest.mark.parametrize("how", ["absolute", "inside"])
+@pytest.mark.parametrize("channel", ["pytest_arg", "env", "pythonpath", "selector"])
+def test_a_dotdot_after_a_link_is_refused_in_every_channel(project, how, channel):
+    """Round-3 premise check: the paths were normalized BEFORE the link walk, so
+    `lk/../src` was judged as `src`. A `..` component is now refused in every
+    relative path a case supplies, as `_contained_path` refuses it in manifest
+    paths, and the link walk runs on the path as written."""
+    value = _climb_through_a_link(project, how)
+    if channel == "pytest_arg":
+        kwargs = {"cases": [_case(project, pytest_args=(f"-o=pythonpath={value}",))]}
+    elif channel == "env":
+        kwargs = {"cases": [_case(project, env={"PYTHONPATH": value})]}
+    elif channel == "pythonpath":
+        kwargs = {"cases": [_case(project)], "pythonpath": (value,)}
+    else:
+        kwargs = {"cases": [_case(project, test=f"{value}/../test_guard.py::test_blocks_danger")]}
+    with pytest.raises(ValueError, match=r"\.\.|copy|repository"):
+        _sweep(project, **kwargs)
+
+
 def test_a_relative_link_that_stays_inside_is_accepted(project):
     """A relative link inside the repository is reproduced inside the copy."""
     (project / "pkg").mkdir()
@@ -1904,26 +1953,43 @@ def test_a_relative_link_that_stays_inside_is_accepted(project):
 _SPAWNER = """\
 import os, subprocess, time
 
+WAIT_FOR_PARENT = "p=$PPID; while kill -0 $p 2>/dev/null; do sleep 0.1; done; "
+
 def test_spawns_and_{how}():
-    subprocess.Popen(["sh", "-c", "sleep 2; echo late > " + os.environ["MARK"]])
+    # Waits for pytest (its parent) to EXIT, then writes: any mark is proof
+    # that it outlived the run, whatever the runner's speed.
+    subprocess.Popen(["sh", "-c", WAIT_FOR_PARENT + "echo late > " + os.environ["MARK"]])
+    open(os.environ["STARTED"], "w").close()
     {tail}
 """
 
 
 @pytest.mark.parametrize(
     "how,tail,timeout",
-    [("hangs", "time.sleep(60)", 4), ("returns", "pass", 120)],
+    [("hangs", "time.sleep(60)", 15), ("returns", "pass", 120)],
 )
 def test_no_child_process_outlives_its_run(project, tmp_path_factory, how, tail, timeout):
     """Codex round 2: on a timeout `subprocess.run` killed only pytest, and a
     test's own subprocess kept running after the sweep reported and removed
     the copy. Each child now runs in its own session, and its group is killed
-    when it ends, timed out or not."""
+    when it ends, timed out or not.
+
+    The grandchild writes only once its pytest parent has exited, so a mark
+    proves it outlived the run. A fixed `sleep 2` raced a slow CI runner: the
+    mark landed while the run was still alive, and the test failed. The
+    `started` mark proves the grandchild was spawned at all: a timeout that
+    fired before the test body ran would pass whatever the harness did."""
     import time
 
-    mark = tmp_path_factory.mktemp("mark") / "late"
+    marks = tmp_path_factory.mktemp("mark")
+    mark, started = marks / "late", marks / "started"
     (project / "test_spawner.py").write_text(_SPAWNER.format(how=how, tail=tail), encoding="utf-8")
-    case = _case(project, test=f"test_spawner.py::test_spawns_and_{how}", env={"MARK": str(mark)})
+    case = _case(
+        project,
+        test=f"test_spawner.py::test_spawns_and_{how}",
+        env={"MARK": str(mark), "STARTED": str(started)},
+    )
     ms.sweep([case], repo=project, python=sys.executable, timeout=timeout, check_baseline=False)
-    time.sleep(4)
+    time.sleep(3)
+    assert started.exists(), "the test body never ran, so this proves nothing"
     assert not mark.exists(), "a child of the test outlived its run"
