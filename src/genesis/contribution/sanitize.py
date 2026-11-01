@@ -37,7 +37,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fnmatch import fnmatch
 from pathlib import Path
 
@@ -430,6 +430,10 @@ def _check_emails(parsed: _ParsedDiff) -> list[Finding]:
 #: ``detail`` of the finding an unreadable fingerprint file produces. A sentinel,
 #: not the path, for the reason given on the missing-file WARN in ``scan_diff``.
 _FINGERPRINT_UNREADABLE = "unreadable_fingerprint_file"
+#: ``detail`` of the finding a fingerprint file with no patterns produces.
+_FINGERPRINT_EMPTY = "empty_fingerprint_file"
+#: The scanner-state sentinels: the exact-value scan did not run on any pattern.
+_FINGERPRINT_NOT_RUN = frozenset({_FINGERPRINT_UNREADABLE, _FINGERPRINT_EMPTY})
 
 
 def _check_fingerprints(
@@ -477,7 +481,24 @@ def _check_fingerprints(
             # end the scan with every other fingerprint unchecked.
             patterns.append(re.compile(re.escape(stripped)))
     if not patterns:
-        return []
+        # Owner ruling 2026-10-31: a file with no patterns (empty, all comments, a
+        # truncated regeneration) is treated like a MISSING one. The generator always
+        # harvests the install's home path, so a real install never writes one;
+        # this is the broken-file case. A WARN here; scan_prose raises it to BLOCK,
+        # as it does for a missing file.
+        return [
+            Finding(
+                kind=FindingKind.FINGERPRINT,
+                severity=Severity.WARN,
+                message=(
+                    "Release fingerprint file holds no patterns — this install's "
+                    "exact private identifiers are not being scanned. Regenerate it "
+                    "(`python -m genesis.contribution.fingerprints --write`)."
+                ),
+                scanner="fingerprint",
+                detail="empty_fingerprint_file",  # == _FINGERPRINT_EMPTY
+            )
+        ]
 
     hits: list[Finding] = []
     for file, line_no, text in parsed.added_lines:
@@ -919,7 +940,7 @@ def scan_diff(
         # file, so an added line that happens to read like the sentinel cannot
         # pass for this finding.
         if not any(
-            f.file is None and f.detail == _FINGERPRINT_UNREADABLE for f in fingerprint_hits
+            f.file is None and f.detail in _FINGERPRINT_NOT_RUN for f in fingerprint_hits
         ):
             scanners_run.append("fingerprint")
     else:
@@ -1035,14 +1056,19 @@ def scan_prose(
     # a runtime `gh issue create` egress — no downstream backstop. So a missing
     # fingerprint file fails CLOSED (BLOCK), not a soft WARN.
     if fingerprint_file and fingerprint_file.is_file():
-        fingerprint_hits = _check_fingerprints(parsed, fingerprint_file)
+        fingerprint_hits = [
+            replace(f, severity=Severity.BLOCK)
+            if f.file is None and f.detail == _FINGERPRINT_EMPTY
+            else f
+            for f in _check_fingerprints(parsed, fingerprint_file)
+        ]
         findings.extend(fingerprint_hits)
         # Recorded only when it actually read the file (scanners_run's contract).
         # `file is None` as well as the sentinel: a real match always names its
         # file, so an added line that happens to read like the sentinel cannot
         # pass for this finding.
         if not any(
-            f.file is None and f.detail == _FINGERPRINT_UNREADABLE for f in fingerprint_hits
+            f.file is None and f.detail in _FINGERPRINT_NOT_RUN for f in fingerprint_hits
         ):
             scanners_run.append("fingerprint")
     else:

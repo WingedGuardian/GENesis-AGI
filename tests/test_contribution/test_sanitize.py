@@ -789,7 +789,7 @@ def test_scan_prose_clean_ok(tmp_path):
     """Genuinely portable technical prose — the kind a good-first-issue body
     would contain — passes clean."""
     fp = tmp_path / "fp.txt"
-    fp.write_text("")  # present-but-empty: scan_prose fails closed on a MISSING file
+    fp.write_text("zz-no-such-private-token-zz\n")  # one harmless pattern: an EMPTY file now reads as not scanned  # present-but-empty: scan_prose fails closed on a MISSING file
     r = sanitize.scan_prose(
         "In `src/genesis/parser.py` the `chunk()` helper drops the last token "
         "when the input has no trailing newline. Add a test and fix the "
@@ -828,7 +828,7 @@ def test_scan_prose_markdown_dash_lines_not_falsely_blocked(tmp_path, monkeypatc
     a BLOCK. Uses the real binary — the mocked subprocess hides this bug."""
     _use_real_detect_secrets(monkeypatch)
     fp = tmp_path / "fp.txt"
-    fp.write_text("")  # present-but-empty (a MISSING file fails closed)
+    fp.write_text("zz-no-such-private-token-zz\n")  # one harmless pattern: an EMPTY file now reads as not scanned  # present-but-empty (a MISSING file fails closed)
     body = (
         "Add a SQLite fallback to the loader.\n\n"
         "---\n\n"
@@ -850,7 +850,7 @@ def test_scan_prose_secret_on_dash_leading_token_still_detected(tmp_path, monkey
     text); under the fix it passes (AWSKeyDetector genuinely fires)."""
     _use_real_detect_secrets(monkeypatch)
     fp = tmp_path / "fp.txt"
-    fp.write_text("")
+    fp.write_text("zz-no-such-private-token-zz\n")  # one harmless pattern: an EMPTY file now reads as not scanned
     # Leading '-' → one argv token the pre-fix form rejected as an unknown option.
     body = "Example (never paste real keys):\n\n-AKIAIOSFODNN7EXAMPLE\n"
     r = sanitize.scan_prose(body, fingerprint_file=fp)
@@ -933,7 +933,7 @@ def test_scan_prose_detect_secrets_scan_error_fails_closed(tmp_path, monkeypatch
     import subprocess as _sp
 
     fp = tmp_path / "fp.txt"
-    fp.write_text("")
+    fp.write_text("zz-no-such-private-token-zz\n")  # one harmless pattern: an EMPTY file now reads as not scanned
 
     def boom(cmd, *a, **k):
         if cmd and cmd[0] == "detect-secrets":
@@ -953,7 +953,7 @@ def test_scan_prose_skips_diff_structural_scanners(tmp_path):
     scanners (forbidden-path, gitignore, binary, size) are meaningless on prose
     and must not run."""
     fp = tmp_path / "fp.txt"
-    fp.write_text("")  # present-but-empty (missing file fails closed)
+    fp.write_text("zz-no-such-private-token-zz\n")  # one harmless pattern: an EMPTY file now reads as not scanned  # present-but-empty (missing file fails closed)
     r = sanitize.scan_prose(
         "A clean sentence about `parser.py`.", fingerprint_file=fp
     )
@@ -964,3 +964,19 @@ def test_scan_prose_skips_diff_structural_scanners(tmp_path):
     assert "portability" in r.scanners_run
     assert "email_allowlist" in r.scanners_run
     assert "detect-secrets" in r.scanners_run
+
+
+@pytest.mark.parametrize("content", ["", "# only a comment\n\n"], ids=["empty", "all-comments"])
+def test_a_fingerprint_file_with_no_patterns_reads_as_not_scanned(tmp_path, content):
+    """Owner ruling 2026-10-31: like a missing file, a WARN for a PR diff and a BLOCK
+    for an issue body, and never recorded as having run."""
+    fp = tmp_path / "fingerprints.txt"
+    fp.write_text(content)
+    diff = sanitize.scan_diff(_FP_DIFF, fingerprint_file=fp)
+    assert diff.ok is True
+    assert [f.detail for f in diff.findings if f.severity == Severity.WARN] == ["empty_fingerprint_file"]
+    assert "fingerprint" not in diff.scanners_run
+    prose = sanitize.scan_prose("see tok_private here", fingerprint_file=fp)
+    assert prose.ok is False
+    assert [f.detail for f in prose.blocking()] == ["empty_fingerprint_file"]
+    assert "fingerprint" not in prose.scanners_run

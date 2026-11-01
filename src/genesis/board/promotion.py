@@ -351,7 +351,9 @@ def _scan_refusal(scan) -> dict:
 
 
 #: Findings whose ``detail`` describes the scanner's own state, not the draft.
-_SCANNER_STATE_DETAILS = frozenset({"missing_fingerprint_file", "unreadable_fingerprint_file"})
+_SCANNER_STATE_DETAILS = frozenset(
+    {"missing_fingerprint_file", "unreadable_fingerprint_file", "empty_fingerprint_file"}
+)
 
 
 async def propose(
