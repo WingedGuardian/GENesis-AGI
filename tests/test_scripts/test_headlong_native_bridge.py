@@ -450,6 +450,35 @@ async def test_actual_bridge_entrypoint_success_and_blocked_prompts(entrypoint, 
     assert report["failure_kind"] == entry.bridge.prompt_failure(status)
 
 
+@pytest.mark.parametrize("source", ["omitted", "monolith", "ego-owned-loop"])
+async def test_actual_bridge_attributes_all_records_to_bound_outer_source(entrypoint, source):
+    entry = entrypoint
+    config_path = entry.run / "config.json"
+    config = json.loads(config_path.read_text())
+    if source != "omitted":
+        config["outer_source"] = source
+        config_path.write_text(json.dumps(config))
+    assert await entry.invoke() == 0
+    expected = "monolith" if source == "omitted" else source
+    assert [row["source"] for row in entry.records] == [expected] * 3
+    assert json.loads((entry.run / "driver.json").read_text())["outer_source"] == expected
+    assert (entry.root / "effect.bin").read_bytes() == entry.native.EFFECT
+
+
+@pytest.mark.parametrize("source", [None, False, 0, "", "foreign", [], {}])
+async def test_invalid_outer_source_is_rejected_before_trajectory_or_effect(entrypoint, source):
+    entry = entrypoint
+    config_path = entry.run / "config.json"
+    config = json.loads(config_path.read_text())
+    config["outer_source"] = source
+    config_path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="outer source"):
+        await entry.invoke()
+    assert entry.records == entry.calls == []
+    assert not (entry.root / "effect.bin").exists()
+    assert not (entry.run / "driver.json").exists()
+
+
 @pytest.mark.parametrize("phase", ["db_close", "driver_open", "driver_short", "driver_close", "rename", "stdout", "stdout_flush"])
 async def test_late_failure_cannot_publish_success_or_replay(entrypoint, monkeypatch, phase):
     entry = entrypoint

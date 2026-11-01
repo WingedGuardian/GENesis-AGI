@@ -333,7 +333,7 @@ def migrate(
             sync(directory)
 
 
-def import_status(database: Path, *, limit: int) -> dict:
+def import_status(database: Path, *, limit: int, protocol_only=False) -> dict:
     """Observe this rollback-journal queue without initialization or migration."""
     if limit < 0:
         raise ValueError("limit must be nonnegative")
@@ -358,8 +358,27 @@ def import_status(database: Path, *, limit: int) -> dict:
                 "schema_version": version,
                 "receipts_available": False,
             }
-        if version != 2:
+        if version not in (2, 3) or (version == 3 and not protocol_only):
+            # Only the read-only protocol observer understands schema 3;
+            # receipt listing keeps its schema-2 contract.
             raise RuntimeError(f"unsupported queue schema {version}")
+        if protocol_only:
+            if version == 2:
+                return {
+                    "state": "legacy-schema",
+                    "schema_version": version,
+                    "automatic_protocol_ready": 0,
+                }
+            row = db.execute(
+                "SELECT value FROM queue_meta WHERE key='automatic_protocol_ready'"
+            ).fetchone()
+            if row is None or row[0] != "0":
+                raise RuntimeError("unsupported automatic queue protocol")
+            return {
+                "state": "protocol-incomplete",
+                "schema_version": version,
+                "automatic_protocol_ready": 0,
+            }
         counts = dict(
             db.execute("SELECT disposition,count(*) FROM legacy_imports GROUP BY disposition")
         )

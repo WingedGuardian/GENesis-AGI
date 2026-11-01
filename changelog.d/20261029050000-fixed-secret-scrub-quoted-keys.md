@@ -1,0 +1,1 @@
+- The hook secret scrubber now redacts credentials stored under quoted keys, such as a JSON `{"api_key": "..."}` member, a Python dict `{'password': ...}`, or an escaped key inside a serialized string. Before, those values reached session observations and captured terminal output unredacted.

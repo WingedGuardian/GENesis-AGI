@@ -31,7 +31,7 @@ from genesis.eval.qualification.evidence import load_json
 
 OVERALL_BUDGET = 10
 GUARDS = (
-    "destructive_command_guard", "repo_routing_guard", "full_suite_guard",
+    "validator_role_guard", "destructive_command_guard", "repo_routing_guard", "full_suite_guard",
     "tmux_kill_server_guard", "pipe_status_guard", "credential_surface_hook",
     "git_discard_guard", "git_push_guard", "secrets_env_access_guard",
     "protected_paths_guard", "worktree_cwd_guard", "capped_read_advisory",
