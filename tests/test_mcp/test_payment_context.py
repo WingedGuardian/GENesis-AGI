@@ -4098,6 +4098,42 @@ async def test_a_marker_already_shown_before_pay_proves_nothing(vault):
     assert out["code"] == "challenge"
 
 
+async def test_a_card_number_url_during_the_marker_read_stops_before_pay(vault, logs, monkeypatch):
+    # The marker read is the last await before the click: a URL the route sees
+    # while it runs must still stop the payment, not be reported after Pay.
+    ns = checkout()
+    clicked: list = []
+    ns.els["pay"].on_click = lambda: clicked.append(1)
+    real = pc._marker_shown
+
+    async def leak_then_read(ppage, args):
+        await ns.pctx.route_handler(Route(f"https://t.example.org/c?n={PAN}"))
+        return await real(ppage, args)
+
+    monkeypatch.setattr(pc, "_marker_shown", leak_then_read)
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "card_url_before_pay" and clicked == []
+    assert "NOT clicked" in out["status"]
+    _sweep(out, logs)
+
+
+async def test_a_card_value_url_during_the_post_save_frame_read_stops_before_pay(
+    vault, monkeypatch
+):
+    # After a clean save, the frame snapshot taken for the outcome awaits too.
+    ns = save_checkout()
+    real = pc._visible_frames
+
+    async def leak_then_read(ppage):
+        pc._flow.url_blocked = True
+        pc._flow.number_hit = True
+        return await real(ppage)
+
+    monkeypatch.setattr(pc, "_visible_frames", leak_then_read)
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
+    assert out["code"] == "card_url_before_pay" and ns.pay_clicks == []
+
+
 async def test_a_bank_frame_revealed_in_place_outranks_the_marker(vault):
     ns = checkout()
     bank = Frame("https://hooks.stripe.com/3d_secure_2/x")
