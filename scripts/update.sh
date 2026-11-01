@@ -2766,7 +2766,13 @@ _do_rollback() {
     # BEGIN rollback-db-decision (extracted by tests/test_scripts/test_update_checkout_moved.py)
     local db_ok=true
     if [ "${DB_RESTORE_OWED:-0}" = "1" ]; then
-        if [ "$code_action" = "moved" ] || [ "$code_kept" = "true" ]; then
+        if [ "$code_action" = "untouched" ]; then
+            # Someone else moved the checkout and the rollback leaves their code in
+            # place; the change measured may be theirs. Restoring the snapshot
+            # under their code would delete their schema changes and writes.
+            echo "  CRITICAL: the database changed and the checkout belongs to someone else (left in place) — the database is kept."
+            db_ok=false
+        elif [ "$code_action" = "moved" ] || [ "$code_kept" = "true" ]; then
             # The code was left as it is (merged, plus whatever moved it), so the
             # database it may have changed is the one that matches it. Restoring
             # the old DB here would put the new code on the old schema.
@@ -2859,7 +2865,8 @@ _do_rollback() {
         echo "  ROLLBACK INCOMPLETE — manual intervention required"
         echo "  Last known good state: $OLD_TAG ($OLD_COMMIT) on $ORIGINAL_BRANCH"
         # BEGIN rollback-db-summary (extracted by tests/test_scripts/test_update_db_restore_sqlite.py)
-        if [ "$db_ok" != "true" ] && [ "$code_action" != "moved" ] && [ "$code_kept" != "true" ]; then
+        if [ "$db_ok" != "true" ] && [ "$code_action" != "moved" ] \
+            && [ "$code_action" != "untouched" ] && [ "$code_kept" != "true" ]; then
             if [ "$_DB_RESTORE_LANDED" = 1 ]; then
                 echo "  DB restored but NOT verified — check it before starting services."
             else

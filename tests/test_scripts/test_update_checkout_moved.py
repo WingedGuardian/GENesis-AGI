@@ -719,6 +719,22 @@ def test_the_database_follows_the_code_left_on_disk(repo, tmp_path, case, restor
         assert "the database is kept to match it" in r.stdout
 
 
+def test_a_changed_database_under_someone_elses_checkout_is_kept(repo, tmp_path):
+    """This run never merged and someone else committed on top (`untouched`): the
+    rollback leaves their code, and the database change it measured may be
+    theirs. Restoring the snapshot under their code would delete their schema
+    changes and writes, so the database stays and the rollback is incomplete.
+    Run, not read: the guard and the DB decision together, a restore owed."""
+    tag = _git(repo, "rev-parse", "pre-update-test")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "theirs")
+    db = _db(tmp_path)
+    r = _run(_rollback_guard(repo, own_head=tag, db_file=str(db)), tmp_path)
+    assert _verdict(r) == ("untouched", "false")
+    assert _mark(db) == "migrated", r.stdout
+    assert "DB_OK=false" in r.stdout
+    assert "belongs to someone else" in r.stdout
+
+
 def test_a_switched_branch_is_left_exactly_as_it_is(repo, tmp_path):
     """Someone switched to another branch and edited there. The old rollback
     checked main out again and reset it, carrying their edit away and destroying
