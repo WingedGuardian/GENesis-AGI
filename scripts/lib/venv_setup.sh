@@ -67,11 +67,36 @@ editable_install_guarded() {
     fi
 
     "$venv_path/bin/pip" install -e "$target" --quiet 2>&1 | tail -1 || true
-    # Validate pip actually installed Genesis (|| true above masks pip failures)
-    if "$venv_path/bin/python" -c "from genesis.runtime import GenesisRuntime" 2>/dev/null; then
+    reinstall_damaged_distributions "$repo_dir" "$venv_path"
+    # Validate pip actually installed Genesis (|| true above masks pip failures).
+    # genesis.mcp.health too: the server's dashboard and health routes import it,
+    # and it pulls in the MCP stack the runtime alone never imports, so a broken
+    # FastMCP once passed this check while the server could not serve.
+    if "$venv_path/bin/python" -c "from genesis.runtime import GenesisRuntime; import genesis.mcp.health" 2>/dev/null; then
         return 0
     fi
     return 2
+}
+
+# reinstall_damaged_distributions <repo_dir> <venv_path>
+#
+# Reinstalls, at the version already installed and with --no-deps, every
+# distribution whose recorded files an upgrade deleted (lib/venv_missing_files.py
+# names them). pip does this to a package whose modules moved into a second
+# distribution: upgrading FastMCP 2 to 4 in place installs fastmcp-slim's files,
+# then removes fastmcp 2's, which list the same paths, and the server can no
+# longer import FastMCP. Best effort and silent when nothing is damaged; the
+# import check after it is still the verdict.
+reinstall_damaged_distributions() {
+    local repo_dir="$1"
+    local venv_path="$2"
+    local spec
+    "$venv_path/bin/python" -P "$repo_dir/scripts/lib/venv_missing_files.py" 2>/dev/null \
+        | while IFS= read -r spec || [ -n "$spec" ]; do
+            [ -n "$spec" ] || continue
+            echo "    Reinstalling $spec: an upgrade deleted files it owns"
+            "$venv_path/bin/pip" install --quiet --no-deps --force-reinstall "$spec" 2>&1 | tail -1 || true
+        done || true
 }
 
 # install_browser_extra <repo_dir> <venv_path>

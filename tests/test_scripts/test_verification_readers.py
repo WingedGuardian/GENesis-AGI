@@ -596,3 +596,33 @@ def test_the_largest_bindable_pr_is_accepted(tmp_path, monkeypatch, capsys):
     )
     assert _w.main() is None
     assert "no rows for PR" in capsys.readouterr().out
+
+
+# ── not-yet-done in the backlog (spec 2026-10-27, PR A) ──────────────────
+
+
+def test_a_not_yet_done_row_sorts_after_a_failure_and_before_untouched(tmp_path, capsys):
+    db = tmp_path / "genesis.db"
+
+    async def go() -> None:
+        from genesis.db.crud import pr_verifications as crud
+
+        async with aiosqlite.connect(str(db)) as conn:
+            conn.row_factory = aiosqlite.Row
+            await build_pr_verifications(conn)
+            await conn.commit()
+            for n, verdict in ((1, None), (2, "not-yet-done"), (3, "fail-intent")):
+                await crud.open_verification(
+                    conn, repo=REPO, pr_number=n, pr_title="t", merged_at=NOW, now=NOW
+                )
+                if verdict:
+                    await crud.record_attempt(
+                        conn, repo=REPO, pr_number=n, verdict=verdict, note="n", now=NOW
+                    )
+
+    asyncio.run(go())
+    _w._print_verification_backlog(str(db))
+    out = capsys.readouterr().out
+    order = [out.index(f"owner/repo#{n} ") for n in (3, 2, 1)]
+    assert order == sorted(order)
+    assert "ATTEMPTED 1x  not-yet-done" in out
