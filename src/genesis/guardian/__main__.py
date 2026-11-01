@@ -191,11 +191,28 @@ async def _disk_status() -> None:
         for name, created in await snap_mgr._list_snapshots_with_meta()
     ]
 
+    from datetime import UTC, datetime
+
+    from genesis.guardian.deletion_window import resolve_window
+    from genesis.guardian.snapshots import HEALTHY_SUFFIX
+
+    window = resolve_window(config)
+    healthy = [s["name"] for s in snapshots if s["name"].endswith(HEALTHY_SUFFIX)]
     print(json.dumps({
         "ok": True,
         "pool": dataclasses.asdict(status),
         "tier": tier,
         "snapshots": snapshots,
+        # Routine deletions wait for this window; superseded healthy snapshots
+        # are what a deferred rotation left for it (normally at most one).
+        "deletion_window": {
+            "window": window.describe(),
+            # "fallback" = no timezone source on this host, so UTC: set
+            # snapshots.deletion_window_timezone in guardian.yaml.
+            "timezone_source": None if window.any_time else window.tz_source,
+            "open_now": window.contains(datetime.now(UTC)),
+            "superseded_healthy": healthy[1:],
+        },
     }))
 
 
