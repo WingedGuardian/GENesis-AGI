@@ -46,7 +46,7 @@ async def compose(recording, monkeypatch, tmp_path, *, profile="validator", has_
     path, shared, _ = recording
     borrowed = BorrowedConnection(shared)
     wrapper = private_module("owned_validator_health_bootstrap", ROOT / "scripts/genesis_mcp_server.py")
-    source = await health.mcp.get_tools()
+    source = {tool.name: tool for tool in await health.mcp.list_tools()}
     server = FastMCP("owned-bootstrapped-validator")
     for name in ("pr_verification_close", "follow_up_create", "provider_activity"):
         server.add_tool(source[name])

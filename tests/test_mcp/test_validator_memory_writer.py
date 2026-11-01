@@ -49,7 +49,7 @@ async def test_memory_store_persists_and_supersedes_through_actual_tool(recordin
     monkeypatch.setattr(memory_mcp, "_retriever", object())
     monkeypatch.setattr(memory_mcp, "_process_pending_bookmarks", False)
     monkeypatch.delenv("GENESIS_SESSION_ORIGIN", raising=False)
-    tool = (await memory_mcp.mcp.get_tools())["memory_store"]
+    tool = await memory_mcp.mcp.get_tool("memory_store")
 
     def server(profile):
         mcp = FastMCP("owned-memory")
@@ -67,17 +67,21 @@ async def test_memory_store_persists_and_supersedes_through_actual_tool(recordin
             "content": "Synthetic corrected measurement: 4 of 4 controls passed", "supersedes": old,
         })).data
         assert old != new
-        task_result = await client.call_tool_mcp(
-            "memory_store", arguments | {"content": "Must not enter"},
-            meta={"modelcontextprotocol.io/task": {"ttl": 60000}},
-        )
-        assert task_result.isError is True
-        assert task_result.meta["modelcontextprotocol.io/task"]["returned_immediately"] is True
-        assert "does not support task-augmented" in task_result.content[0].text
+    # FastMCP 4 runs background tasks only through the tasks extension, which
+    # Genesis does not install: task metadata starts no task and still meets the
+    # external profile's refusal.
+    assert tool.task_config.mode == "forbidden"
     async with Client(server("external")) as client:
         assert await client.list_tools() == []
         with pytest.raises(ToolError, match="unavailable"):
             await client.call_tool("memory_store", arguments | {"content": "Forbidden external write"})
+        task_result = await client.call_tool_mcp(
+            "memory_store", arguments | {"content": "Must not enter"},
+            meta={"modelcontextprotocol.io/task": {"ttl": 60000}},
+        )
+        assert task_result.is_error is True
+        assert "modelcontextprotocol.io/task" not in (task_result.meta or {})
+        assert "unavailable" in task_result.content[0].text
     # This reader is a fresh physical SQLite connection, not a mocked store response.
     with sqlite3.connect(path) as fresh:
         fresh.row_factory = sqlite3.Row
