@@ -135,7 +135,10 @@ async def test_health_bootstrap_scopes_before_initialization_and_skips_dispatch(
     monkeypatch.setattr("genesis.observability.provider_activity.ProviderActivityTracker", MagicMock())
     server._bootstrap_health({}, external_profile=profile)
     if profile:
-        assert isinstance(mcp.middleware[0], ExternalProfileMiddleware)
+        # FastMCP v4 adds its own dereferencing middleware first. Our profile
+        # must precede all Genesis initialization/instrumentation, not replace
+        # the framework's built-in chain.
+        assert any(isinstance(item, ExternalProfileMiddleware) for item in mcp.middleware)
     async with Client(mcp) as client:
         assert (await client.call_tool("health_status")).data == "fixture"
         if profile:

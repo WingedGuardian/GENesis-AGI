@@ -83,6 +83,22 @@ boundary. Reports and actual image/container metadata are retained for seven day
 Host tests exercise only owned Python helpers, actual disposable CRUD and passive
 evidence. Integrated success requires the exact-head post-review contained run.
 
+The private shared case inventory in `scripts/ci/ego_runtime_cases.py` describes
+these same thirteen cases, their first native response kind, wake count,
+reactive input, injected fault and blocked-prompt status. The B report includes
+it as `comparison_manifest` with schema `ego-runtime-mechanics/v1`. This is
+descriptive mechanics metadata; it supplies no approval, runtime result or
+automatic parity score. The B controller retains its existing qualification
+predicates. A future C report must measure its own observations and counts.
+
+The bridge's bound fixture configuration accepts an optional `outer_source`:
+`monolith` by default, or `ego-owned-loop`. It rejects other types/values before
+trajectory mutation. The selected value appears consistently in the actual
+header, observation, final and driver receipt. This keeps reused bridge records
+attributable when an owned loop invokes it; it does not implement that loop or
+change canonical proposal `ego_source`, tool permissions or approval authority.
+Only the supplied closed fixture controller may publish this configuration.
+
 The pinned redactor can corrupt UUID references; stock H retains that limitation
 as comparison evidence. B registers exact successful controlled writer returns and
 IDs from complete, independently qualified previous native runs. The operational

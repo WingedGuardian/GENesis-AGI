@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -11,6 +12,8 @@ from datetime import UTC, datetime
 
 import httpx
 from fastmcp import FastMCP
+
+from genesis.content.drafter import clean_header
 
 logger = logging.getLogger(__name__)
 
@@ -106,12 +109,20 @@ async def outreach_send(
     salience_score: float = 0.5,
     labeled_surplus: bool = False,
     thread_id: str | None = None,
+    subject: str | None = None,
 ) -> str:
     """Queue a message for delivery. Returns outreach_id.
 
     The message is delivered AS-IS — Genesis does not rewrite or rephrase it.
     Compose the exact text you want the recipient to see (this is the tool for
     reminders and literal notifications).
+
+    For email, ``subject`` is REQUIRED: you wrote the email, so write its
+    subject too, a short title of 3 to 7 words that says what it is about.
+    If the user gave one, use it exactly. Never reuse the first words of the
+    message. A new email without a subject is refused (code
+    email_subject_required). A reply (``thread_id``) always goes out as
+    Re: <the thread's subject>, so it stays in the same conversation.
 
     For email replies, pass thread_id to route to the correct recipient.
     The thread_id maps to a registered email thread whose recipient is
@@ -161,12 +172,31 @@ async def outreach_send(
         thread = await email_threads.get_thread(_db, thread_id)
         if thread:
             validated_recipient = thread.get("recipient")
+            # A reply keeps the thread's subject as Re: <original>: mail clients
+            # group a conversation by it, and this adapter sends no In-Reply-To
+            # header, so a fresh title would split the reply into a new thread.
+            original = clean_header(thread.get("subject") or "", max_chars=None)
+            if original:
+                subject = original if original.lower().startswith("re:") else f"Re: {original}"
             logger.info(
                 "Thread %s resolved recipient: %s", thread_id, validated_recipient,
             )
         else:
             logger.warning("Thread %s not found for recipient lookup", thread_id)
-    elif channel == "email" and not thread_id:
+    if channel == "email" and not clean_header(subject or ""):
+        # Whoever writes the email writes its subject, in the same step. A
+        # reply took its subject from the thread above; this catches a new
+        # email sent without one, and a reply whose thread recorded none.
+        return json.dumps({
+            "status": "refused",
+            "code": "email_subject_required",
+            "message": (
+                "An email needs a subject: pass subject= with a short title of "
+                "3 to 7 words that says what the email is about (for a reply, "
+                "Re: and the original subject)."
+            ),
+        })
+    if channel == "email" and not thread_id:
         logger.warning(
             "outreach_send email without thread_id — recipient will come from "
             "OUTREACH_RECIPIENT_EMAIL if configured, else the send is dropped "
@@ -200,6 +230,7 @@ async def outreach_send(
                 thread_id=thread_id,
                 validated_recipient=validated_recipient,
                 labeled_surplus=labeled_surplus,
+                email_subject=subject or None,
             )
             return json.dumps({
                 "status": "queued",
@@ -236,6 +267,7 @@ async def outreach_send(
         # this steers the send without disturbing any other channel.
         target_chat_id=discord_channel,
         thread_id=thread_id,
+        email_subject=subject or None,
         # The caller composed this message; deliver it exactly — never route an
         # agent-authored message back through the LLM drafter (it once inverted
         # a send_and_wait test message's meaning). The bridge/queue path mirrors
@@ -309,6 +341,8 @@ async def marketing_send(prospect_id: str, subject: str, body: str) -> str:
     from genesis.outreach.types import OutreachCategory
 
     subject = (subject or "").strip()
+    if not clean_header(subject):
+        return json.dumps({"status": "refused", "reason": "subject_required"})
     body = body or ""
     message = f"{subject}\n\n{body}" if subject else body
 
@@ -326,6 +360,7 @@ async def marketing_send(prospect_id: str, subject: str, body: str) -> str:
             channel="email",
             validated_recipient=recipient,
             labeled_surplus=True,
+            email_subject=subject or None,
         )
         return json.dumps({"status": "queued", "pending_id": pending_id})
 
@@ -342,6 +377,7 @@ async def marketing_send(prospect_id: str, subject: str, body: str) -> str:
         channel="email",
         labeled_surplus=True,
         validated_recipient=recipient,
+        email_subject=subject or None,
         verbatim=True,
     )
     result = await _pipeline.submit(req)
@@ -902,6 +938,16 @@ async def outreach_engagement(
     return True
 
 
+def _rate_limits(cfg) -> dict:
+    return {
+        "max_daily": cfg.max_daily,
+        "surplus_daily": cfg.surplus_daily,
+        "content_daily": cfg.content_daily,
+        "notification_daily": cfg.notification_daily,
+        "agent_daily_per_peer": cfg.agent_daily_per_peer,
+    }
+
+
 @mcp.tool()
 async def outreach_preferences(
     action: str = "get",
@@ -918,10 +964,7 @@ async def outreach_preferences(
                     "end": _config.quiet_hours.end,
                 },
                 "thresholds": _config.thresholds,
-                "rate_limits": {
-                    "max_daily": _config.max_daily,
-                    "surplus_daily": _config.surplus_daily,
-                },
+                "rate_limits": _rate_limits(_config),
             }
         # Standalone mode — use config loader which has sensible defaults
         from genesis.outreach.config import load_outreach_config
@@ -934,10 +977,7 @@ async def outreach_preferences(
                 "end": cfg.quiet_hours.end,
             },
             "thresholds": cfg.thresholds,
-            "rate_limits": {
-                "max_daily": cfg.max_daily,
-                "surplus_daily": cfg.surplus_daily,
-            },
+            "rate_limits": _rate_limits(cfg),
             "source": "defaults (standalone mode)",
         }
     if not preferences or not isinstance(preferences, dict):
@@ -962,9 +1002,12 @@ async def outreach_preferences(
     mr = preferences.get("morning_report", {})
     eng = preferences.get("engagement", {})
 
-    from genesis.outreach.config import OutreachConfig, QuietHours
+    from genesis.outreach.config import QuietHours
 
-    merged = OutreachConfig(
+    # replace(), not a fresh OutreachConfig: a field this tool does not set
+    # keeps its current value instead of falling back to the class default.
+    merged = dataclasses.replace(
+        current,
         quiet_hours=QuietHours(
             start=qh.get("start", current.quiet_hours.start),
             end=qh.get("end", current.quiet_hours.end),
@@ -974,10 +1017,11 @@ async def outreach_preferences(
         max_daily=int(rl.get("max_daily", current.max_daily)),
         surplus_daily=int(rl.get("surplus_daily", current.surplus_daily)),
         content_daily=int(rl.get("content_daily", current.content_daily)),
+        notification_daily=int(rl.get("notification_daily", current.notification_daily)),
+        agent_daily_per_peer=int(rl.get("agent_daily_per_peer", current.agent_daily_per_peer)),
         morning_report_time=mr.get("trigger_time", current.morning_report_time),
         engagement_timeout_hours=int(eng.get("timeout_hours", current.engagement_timeout_hours)),
         engagement_poll_minutes=int(eng.get("poll_interval_minutes", current.engagement_poll_minutes)),
-        immediate_escalation_alerts=current.immediate_escalation_alerts,
     )
 
     try:

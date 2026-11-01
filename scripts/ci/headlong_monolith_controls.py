@@ -13,14 +13,11 @@ from tempfile import TemporaryDirectory
 
 import aiosqlite
 import headlong_native_controls as native
+from ego_runtime_cases import CONFLICTS, FAULTS, SCENARIOS, TWO_WAKES, kind_for, manifest
 from headlong_controls import dependency_inventory, environment, preflight, read_jsonl, tree_hash
 from headlong_native_bridge import ReceiptView, wake_matches
 from headlong_native_provider import Backend
 
-SCENARIOS = ("effect", "noop", "refusal", "provider_error", "handler_error", "large_context", "reactive_noop", "restart_duplicate", "reference_continuity")
-FAULTS = ("observation_failure", "final_failure")
-CONFLICTS = ("reference_conflict", "reactive_reference_conflict")
-TWO_WAKES = ("restart_duplicate", "reference_continuity")
 REFERENCE = "aaaaaaaa-1234-4567-8912-bbbbbbbbbbbb"
 CROSSING = "aaaaaaaa-1234-4567-8912-bbbbbbbb4111"
 MARKERS = ("fixture-identity-marker", "fixture-goal-marker", "fixture-skill-marker", "fixture-memory-marker", "fixture-stream-marker")
@@ -36,11 +33,6 @@ def patched_source(source, patch):
                 raise ValueError("expected exactly one pinned adaptation region")
             source = source.replace(before, after)
     return source
-
-
-def kind_for(name, second=False):
-    return ("echo" if name in {"noop", "reactive_noop"} else "pending" if name == "refusal" or second else
-            name if name in {"provider_error", "handler_error"} else "approved")
 
 
 def captured_text(backend):
@@ -349,6 +341,7 @@ async def main():
     unchanged = sources == {name: tree_hash(Path(path)) for name, path in {"headlong": "/headlong", "derived": "/headlong-b", "fixtures": "/fixture", "genesis": "/genesis-src"}.items()}
     passed = unchanged and joins["passed"] and all(case["control_passed"] for case in cases)
     print(json.dumps({"schema": "headlong-native-monolith/v1", "status": "pass" if passed else "incomplete", "cases": cases,
+                      "comparison_manifest": manifest(),
                       "sources": sources, "sources_unchanged": unchanged, "cleanup_confirmed": True, "correlations": joins,
                       "sdk": importlib.metadata.version("claude-agent-sdk"), "dependencies": dependency_inventory(),
                       "native_binary": binary,

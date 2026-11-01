@@ -528,6 +528,17 @@ class Segment:
     verb_unresolved: bool = False
 
 
+@dataclass
+class PolicySegment(Segment):
+    """Opt-in facts from the same scan; never added to the historical view."""
+
+    position: tuple[int, ...] = ()
+    targets: tuple[tuple[str, str | None], ...] = ()
+    contexts: tuple[tuple[str, str | None], ...] = ()
+    ancestors: tuple[tuple[str, str | None], ...] = ()
+    scope_kind: str = "root"
+
+
 def _redirect_operator_len(command: str, i: int) -> int | None:
     """Length of a shell REDIRECT operator starting at ``command[i]``, else None.
 
@@ -850,6 +861,8 @@ def parse_segments(
     _splits: list[int] | None = None,
     _openers: list[int] | None = None,
     _starts: list[int] | None = None,
+    _ranges: list[tuple[int, int, bool]] | None = None,
+    _targets: list[tuple[int, str, str | None]] | None = None,
 ) -> list[_ParsedSegment]:
     """Split a command line into executed segments, returning per segment BOTH the raw
     text and a redirect-STRIPPED argv source (see ``_ParsedSegment``).
@@ -890,6 +903,7 @@ def parse_segments(
     """
     pairs: list[tuple[str, str, list[str]]] = []
     begins: list[int] = []  # where each pair's text began in command
+    ends: list[int] = []
     begin = 0
     raw_buf: list[str] = []
     argv_buf: list[str] = []
@@ -928,6 +942,7 @@ def parse_segments(
         if two in ("&&", "||"):
             pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs)))
             begins.append(begin)
+            ends.append(i)
             raw_buf, argv_buf, redirs = [], [], []
             i += 2
             begin = i
@@ -956,6 +971,8 @@ def parse_segments(
             # metachar the plain consumer would stop on — leave it in BOTH views (it
             # executes, like any substitution); consume only the operator.
             if t in ("<", ">") and tnext == "(":
+                if _targets is not None:
+                    _targets.append((i, command[i : i + op_len], None))
                 raw_buf.append(" ")
                 argv_buf.append(" ")
                 i = j
@@ -964,6 +981,8 @@ def parse_segments(
             if j < n and t not in _TARGET_STOP:
                 j = _redirect_target_end(command, j0, n)
             target = command[j0:j]
+            if _targets is not None:
+                _targets.append((i, command[i : i + op_len], target))
             if "$" in target or "`" in target:
                 # Expansion-carrying target: KEEP in raw (nested command stays visible
                 # to the destructive guard via _substitutions), EXCLUDE from argv_src so
@@ -982,6 +1001,7 @@ def parse_segments(
                 _splits.append(i)
             pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs)))
             begins.append(begin)
+            ends.append(i)
             raw_buf, argv_buf, redirs = [], [], []
             i += 1
             begin = i
@@ -991,6 +1011,9 @@ def parse_segments(
         i += 1
     pairs.append(("".join(raw_buf), "".join(argv_buf), list(redirs)))
     begins.append(begin)
+    ends.append(n)
+    if _ranges is not None:
+        _ranges.extend((b, e, bool(r.strip())) for (r, _, _), b, e in zip(pairs, begins, ends, strict=True))
     if _starts is not None:
         _starts.extend(
             b + len(r) - len(r.lstrip())
@@ -2694,7 +2717,7 @@ def over_nested(command: str) -> bool:
     return _analyze_bounded(command).bound_reason == "depth"
 
 
-def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
+def analyze_checked(command: str, *, _policy=None) -> tuple[list[Segment], BlindSpot | None]:
     """:func:`analyze`, plus the single question a guard must ask: am I blind here?
 
     Returns ``(segments, blind_spot)``. ``blind_spot`` is None when neither of the
@@ -2779,10 +2802,23 @@ def analyze_checked(command: str) -> tuple[list[Segment], BlindSpot | None]:
     flips it causes are exactly the commands moving from "clean parse" to "blind",
     with nothing else shifting underneath them.
     """
-    result = _analyze_bounded(command)
+    result = _analyze_bounded(command, _policy=_policy)
     if result.diagnostic is not None and result.diagnostic.bounds_induced:
         return [], result.diagnostic
     return result.segments, result.diagnostic
+
+
+def analyze_policy(command: str) -> tuple[list[PolicySegment], BlindSpot | None]:
+    """Occurrence/redirect/wrapper facts, withholding every fact on a blind scan.
+
+    Redirects belong to their calling shell, before that command's wrappers.
+    Nested shell bodies inherit wrapper context; argument substitutions do not.
+    Positions are hierarchical source-group boundaries, including empty argv.
+    The ordinary Segment type, values and cardinality remain unchanged.
+    """
+    records: list[PolicySegment] = []
+    _, blind = analyze_checked(command, _policy=records)
+    return ([], blind) if blind else (sorted(records, key=lambda s: s.position), None)
 
 
 def _basename(token: str) -> str:
@@ -3008,7 +3044,24 @@ def _is_prefix_assignment(tok: str) -> bool:
     return name.isidentifier() or bool(_SUBSCRIPT_NAME.match(name))
 
 
-def _strip_wrappers(argv: list[str], carried_open: int = 0) -> list[str]:
+_POLICY_NEUTRAL_WRAPPERS = frozenset({
+    "command", "builtin", "exec", "time", "timeout", "nice", "nohup", "stdbuf", "setsid", "chrt", "ionice", "xargs",
+})
+
+
+def _env_policy_context(option: str, value: str | None) -> tuple[tuple[str, str | None], ...]:
+    if option in {"-C", "--chdir"}:
+        return (("chdir", value),)
+    if option.startswith("--chdir="):
+        return (("chdir", option.partition("=")[2]),)
+    if option.startswith("-C"):
+        return (("chdir", option[2:]),)
+    if option in {"-i", "--ignore-environment", "-0", "--null", "-u", "--unset"} or option.startswith(("--unset=", "-u")):
+        return ()
+    return (("unknown", None),)
+
+
+def _strip_wrappers(argv: list[str], carried_open: int = 0, *, _contexts=None) -> list[str]:
     """Drop leading shell command-position tokens, env-assignments (VAR=x), and
     wrapper commands (sudo/env/…) so the returned argv[0] is the ACTUAL executed
     command, and peel the matching subshell-close `)` off the revealed argv.
@@ -3081,6 +3134,8 @@ def _strip_wrappers(argv: list[str], carried_open: int = 0) -> list[str]:
             and not tok.startswith("-")
             and _is_prefix_assignment(tok)
         ):
+            if _contexts is not None:
+                _contexts.append(("assignment", tok))
             i += 1  # leading VAR=value / VAR+=value assignment
             continue
         if _basename(tok) in _RUN_CARRIERS:
@@ -3088,6 +3143,8 @@ def _strip_wrappers(argv: list[str], carried_open: int = 0) -> list[str]:
             if found is None:
                 break  # not a `run` invocation — the front-end IS the command
             i, tool_run = found
+            if _contexts is not None:
+                _contexts.append(("opaque", None))
             via_uv_tool = via_uv_tool or tool_run
             continue
         spec = _WRAPPER_SPEC.get(_basename(tok))
@@ -3114,6 +3171,11 @@ def _strip_wrappers(argv: list[str], carried_open: int = 0) -> list[str]:
         wrapper_at = i
         argflags, positional = spec
         wrapper_name = _basename(tok)
+        if _contexts is not None and wrapper_name not in _POLICY_NEUTRAL_WRAPPERS | {"env"}:
+            _contexts.append(("opaque", None))
+        if _contexts is not None and wrapper_name == "xargs":
+            # xargs appends words read from stdin, so the parsed argv is a prefix.
+            _contexts.append(("appends", None))
         i += 1
         # `--` ends OPTION parsing only. It does not end the wrapper's positional
         # or assignment operands: `timeout -- 5 git push` still takes `5` as the
@@ -3128,6 +3190,9 @@ def _strip_wrappers(argv: list[str], carried_open: int = 0) -> list[str]:
                 i += 1
                 continue
             if t.startswith("-") and not options_done:
+                if _contexts is not None and wrapper_name == "env":
+                    value = argv[i + 1] if t in argflags and "=" not in t and i + 1 < len(argv) else None
+                    _contexts.extend(_env_policy_context(t, value))
                 if t in argflags and "=" not in t:
                     i += 2  # flag + its separate value token
                 elif recoverable and "=" not in t:
@@ -3159,6 +3224,8 @@ def _strip_wrappers(argv: list[str], carried_open: int = 0) -> list[str]:
                 # `time`, `stdbuf`, `setsid`, `chrt`, `ionice`, `exec` and `xargs`
                 # EXECUTE a word containing `=` — `nohup ./a=b/git push` runs git —
                 # so skipping it landed the resolver on `push` and HID the command.
+                if _contexts is not None:
+                    _contexts.append(("assignment", t))
                 i += 1
                 continue
             if positional > 0:
@@ -3220,6 +3287,8 @@ def _strip_wrappers(argv: list[str], carried_open: int = 0) -> list[str]:
         head, sep, name = result[0].rpartition("/")
         if "@" in name:
             result[0] = head + sep + name.split("@", 1)[0]
+    if _contexts is not None and not result and not after_wrapper:
+        _contexts.append(("assignment_only", None))
     return result
 
 _FUNCTION_DEF = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\(\)$")
@@ -4052,6 +4121,10 @@ def _analyze_bounded(
     command: str, *, _depth: int = 0, _decision_text: str | None = None,
     _origin: tuple[_HeredocLines, int] | None = None,
     _in_substitution: bool = False,
+    _policy=None,
+    _scope: tuple[int, ...] = (),
+    _ancestors: tuple[tuple[str, str | None], ...] = (),
+    _kind: str = "root",
 ) -> _AnalysisResult:
     """Parse once, retaining diagnostics and structural facts from every visited level."""
     # Past the cap, parse NOTHING. Not a prefix: truncating a command mid-string flips
@@ -4081,7 +4154,15 @@ def _analyze_bounded(
     splits: list[int] = []
     openers: list[int] = []
     starts: list[int] = []
-    parsed = parse_segments(command, _splits=splits, _openers=openers, _starts=starts)
+    ranges, targets = ([] if _policy is not None else None), ([] if _policy is not None else None)
+    parsed = parse_segments(command, _splits=splits, _openers=openers, _starts=starts,
+                            _ranges=ranges, _targets=targets)
+    visible_ranges = iter((b, e) for b, e, visible in ranges or [] if visible)
+    for begin, end, visible in ranges or []:
+        redirections = tuple((op, target) for at, op, target in targets if begin <= at < end)
+        if not visible and redirections:
+            _policy.append(PolicySegment("", [], False, "", depth=_depth,
+                position=_scope + (begin,), targets=redirections, ancestors=_ancestors))
     # The text the here-doc check reads bodies in: the outermost text this command is
     # a plain slice of, so a body any extraction cut short is read where it really
     # ends. Indexed only if some opener needs it.
@@ -4113,7 +4194,8 @@ def _analyze_bounded(
         # argv is tokenized from the redirect-STRIPPED source, so a redirect target
         # (incl. an expansion one) can never become argv[1] and spoof the subcommand.
         tokens = _argv(seg.argv_src)
-        argv = _strip_wrappers(tokens, carried_open)
+        contexts = [] if _policy is not None else None
+        argv = _strip_wrappers(tokens, carried_open, _contexts=contexts)
         carried_open = max(0, carried_open + _net_subshell_depth(seg.argv_src))
         exe = _basename(argv[0]) if argv else ""
         out.append(
@@ -4126,17 +4208,23 @@ def _analyze_bounded(
                 verb_unresolved=_verb_unresolved(argv),
             )
         )
+        begin, end = next(visible_ranges) if _policy is not None else (0, 0)
+        if _policy is not None:
+            _policy.append(PolicySegment(**(vars(out[-1]) | {"depth": _depth}),
+                position=_scope + (begin,),
+                targets=tuple((op, target) for at, op, target in targets if begin <= at < end),
+                contexts=tuple(contexts), ancestors=_ancestors, scope_kind=_kind))
         # (script, origin, is a substitution body): a substitution body keeps where it
         # was cut from, so the here-doc check reads a body the cut ended early in the
         # text it came from.
-        nested: list[tuple[str, tuple[_HeredocLines, int] | None, bool]] = []
+        nested: list[tuple[str, tuple[_HeredocLines, int] | None, bool, str]] = []
         if exe in _NESTED:
             script = _nested_script(argv, exe)
             if script:
-                nested.append((script, None, False))
+                nested.append((script, None, False, "shell"))
 
         nested.extend(
-            (script, None, False) for script in _embedded_commands(_argv(seg.argv_src))
+            (script, None, False, "embedded") for script in _embedded_commands(_argv(seg.argv_src))
         )
         spans = _substitution_spans(raw)
         if spans:
@@ -4145,7 +4233,7 @@ def _analyze_bounded(
                 source, offset = here[0], here[1] + start
             else:
                 source, offset = _HeredocLines(raw), 0  # a redirect rewrote raw
-            nested.extend((raw[a:b], (source, offset + a), True) for a, b in spans)
+            nested.extend((raw[a:b], (source, offset + a), True, "substitution") for a, b in spans)
         if not nested:
             continue
         # Past the bound, STOP DESCENDING — and SAY SO. Every scanner below runs
@@ -4158,10 +4246,13 @@ def _analyze_bounded(
         if _depth >= MAX_SUBSTITUTION_DEPTH:
             truncated = True
             continue
-        for script, origin, in_substitution in nested:
+        for nested_index, (script, origin, in_substitution, kind) in enumerate(nested):
             inner = _analyze_bounded(
                 script, _depth=_depth + 1, _decision_text=_decision_text,
                 _origin=origin, _in_substitution=in_substitution,
+                _policy=_policy, _scope=_scope + (begin, nested_index),
+                _ancestors=_ancestors + (() if in_substitution else tuple(contexts or ())),
+                _kind=kind,
             )
             truncated = truncated or inner.bound_reason == "depth"
             heredoc = heredoc or inner.heredoc_incomplete
@@ -4525,7 +4616,9 @@ def _first_operand(
 # ── git-specific helpers ────────────────────────────────────────────────
 
 
-def git_subcommand_index(argv: list[str]) -> int | None:
+def git_subcommand_index(
+    argv: list[str], *, _options: list[tuple[str, str | None]] | None = None,
+) -> int | None:
     """Index of the git subcommand token in ``argv``, or None.
 
     Exposed alongside :func:`git_subcommand` because a caller that needs the
@@ -4573,9 +4666,17 @@ def git_subcommand_index(argv: list[str]) -> int | None:
     while i < len(argv):
         t = argv[i]
         if t in _GIT_OPTS_WITH_ARG:
+            if _options is not None:
+                _options.append((t, argv[i + 1] if i + 1 < len(argv) else None))
             i += 2
             continue
         if t.startswith("-"):
+            if _options is not None:
+                if t.startswith(("-C", "-c")) and not t.startswith("--"):
+                    _options.append((t[:2], t[2:] or None))
+                else:
+                    name, equals, value = t.partition("=")
+                    _options.append((name, value if equals else None))
             i += 1
             continue
         return i
