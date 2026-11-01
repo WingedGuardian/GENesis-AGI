@@ -181,6 +181,21 @@ def test_a_plan_beats_a_newer_pr_without_one(tmp_path, repo, capsys):
     assert "e2e: plan — run the thing and see it work" in out
 
 
+def test_the_record_command_targets_the_database_the_row_came_from(tmp_path, repo, capsys):
+    """Following the printed command must record on the ledger the pick read:
+    without --db-path, close falls back to genesis_db_path(), another file."""
+    import shlex
+
+    _, s = repo
+    spaced = tmp_path / "a ledger dir"
+    spaced.mkdir()
+    db = _db(spaced, [(1, "2026-10-10T00:00:00Z", None, None)])
+    out = _pick(db, repo, _runner([_pr(1, "2026-10-10T00:00:00Z", s["c1"])]), capsys)
+    record = next(line for line in out.splitlines() if line.lstrip().startswith("record:"))
+    argv = shlex.split(record.split("record:", 1)[1].split("(then again")[0])
+    assert argv[argv.index("--db-path") + 1] == str(db), record
+
+
 def test_the_newest_planned_pr_wins(tmp_path, repo, capsys):
     _, s = repo
     db = _db(
@@ -624,7 +639,7 @@ def test_the_pick_prints_the_dry_run_close_command(tmp_path, repo, capsys):
     _, s = repo
     db = _db(tmp_path, [(7, "2026-10-10T00:00:00Z", None, None)])
     out = _pick(db, repo, _runner([_pr(7, "2026-10-10T00:00:00Z", s["c1"])]), capsys)
-    assert "pr_verification.py close --pr 7 --evidence-file" in out
+    assert f"pr_verification.py close --pr 7 --db-path {db} --evidence-file" in out
     assert "--dry-run" in out
 
 

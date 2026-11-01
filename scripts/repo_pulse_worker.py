@@ -25,6 +25,7 @@ import asyncio
 import contextlib
 import json
 import re
+import shlex
 import sqlite3
 import sys
 from pathlib import Path
@@ -642,8 +643,11 @@ def _print_next_for_validation(
     print(
         f"  deploy: {deploy}{' — ' if deploy == 'unproven' else ' ('}{why}{'' if deploy == 'unproven' else ')'}"
     )
+    # The database the row was read from, so recording lands on the same ledger
+    # (without it, close falls back to genesis_db_path(), another file or none).
     print(
         f"  record: python3 scripts/pr_verification.py close --pr {n} "
+        f"--db-path {shlex.quote(resolved)} "
         f"--evidence-file <doc.json> --dry-run   (then again without --dry-run)"
     )
     print(f"picked 1 of {summary.removeprefix('pr_verifications: ')}")
