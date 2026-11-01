@@ -198,3 +198,26 @@ async def test_missing_database_is_not_created(tmp_path, monkeypatch):
     with pytest.raises(sqlite3.OperationalError):
         await update_session_row("actual", "m", False)
     assert not missing.exists()
+
+
+async def test_close_during_registration_still_persists_the_observed_session(tmp_path):
+    # The registration write awaits database I/O (it can sit on a locked SQLite).
+    # A close() that cancels the reader during that await must not lose the id
+    # the child just reported, or the next launch resumes the previous session.
+    import asyncio
+    import json
+
+    blocked = asyncio.Event()
+
+    async def record(sid, model, closed):
+        if not closed:
+            blocked.set()
+            await asyncio.Event().wait()  # never returns: the write is stuck
+
+    h = Harness(tmp_path, session_recorder=record)
+    h.state.write_text('{"session_id": "previous"}')
+    await h.agent.start()
+    await h.feed(SystemMessage("init", {"session_id": "actual", "model": "m"}))
+    await asyncio.wait_for(blocked.wait(), 2)
+    await h.agent.close()
+    assert json.loads(h.state.read_text()) == {"session_id": "actual"}
