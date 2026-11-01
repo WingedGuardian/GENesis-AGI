@@ -279,3 +279,138 @@ def test_the_query_a_timeout_hit_is_named(tmp_path, capsys):
     db = _db(tmp_path, days=20, fallback_at=NOW - timedelta(days=2), event=event)
     assert _run(tmp_path, db) == 1
     assert "marker query" in capsys.readouterr().out
+# ── T2: the phase a timeout's frames name ──────────────────────────────────
+# Real stacks, deepest last, as redis 8.1.0 builds them (counted by reading the
+# client): a query reply, a reconnect handshake, and a retry's reconnect, which
+# ALSO holds `_send_command_parse_response` above the connect frames.
+_READER = ["_read_response", "_readline", "readline", "readuntil", "_wait_for_data"]
+_REPLY = [
+    "execute_command",
+    "call_with_retry",
+    "_send_command_parse_response",
+    "parse_response",
+    "read_response",
+    "_read_response_from_parser",
+    "read_response",
+    *_READER,
+]
+_HANDSHAKE = [
+    "execute_command",
+    "get_connection",
+    "ensure_connection",
+    "connect",
+    "call_with_retry",
+    "connect_check_health",
+    "on_connect_check_health",
+    "read_response",
+    *_READER,
+]
+_RETRY_RECONNECT = [
+    "call_with_retry",
+    "_send_command_parse_response",
+    "send_command",
+    "send_packed_command",
+    "connect_check_health",
+    "_connect",
+    "create_unix_connection",
+]
+
+
+def _cause_of(diag: dict) -> str:
+    return _rep._cause({"outcome": "fallback", "pid": 7, "diag": diag})
+
+
+def test_a_reply_wait_is_named_as_one():
+    assert "phase reply" in _cause_of({"frames": _REPLY[-16:], "conn": "idle_open", "in_use": 1})
+
+
+def test_a_handshake_wait_is_named_as_one():
+    out = _cause_of({"frames": _HANDSHAKE[-16:], "conn": "new", "in_use": 0})
+    assert "phase connect" in out and "conn new" in out and "in_use 0" in out
+
+
+def test_a_retry_reconnect_is_a_connect_not_a_reply():
+    """The retry path reconnects INSIDE the reply call, so its stack names both;
+    the connect frames are checked first."""
+    assert "phase connect" in _cause_of({"frames": _RETRY_RECONNECT, "conn": "idle_open"})
+
+
+def test_a_wait_on_client_construction_is_its_own_phase():
+    assert "phase construct" in _cause_of(
+        {"frames": ["wait_for", "_run", "_graph"], "conn": "no_client"}
+    )
+
+
+def test_a_row_from_before_t2_says_its_frames_cannot_tell():
+    out = _cause_of({"frames": ["_readline", "readline", "readuntil", "_wait_for_data"]})
+    assert "phase unknown (predates the connection capture)" in out
+    assert ", conn " not in out  # no state was recorded, so none is printed
+
+
+def test_every_frame_the_phase_rule_names_exists_in_the_installed_client():
+    """The rule keys on redis-py's own function names. A client upgrade that
+    renames one would turn every such timeout into "unknown" silently."""
+    import redis.asyncio.client as rc
+    import redis.asyncio.connection as rconn
+
+    defined = set()
+    for mod in (rc, rconn):
+        for obj in vars(mod).values():
+            if isinstance(obj, type):
+                defined.update(vars(obj))
+            elif callable(obj):
+                defined.add(getattr(obj, "__name__", ""))
+    for name in sorted(_rep.PHASE_FRAMES["connect"] | _rep.PHASE_FRAMES["reply"]):
+        assert name in defined, name
+    # Two names are shared with other classes; pin them to the owners whose
+    # frames the rule actually sees.
+    assert "connect" in vars(rconn.AbstractConnection)
+    assert "parse_response" in vars(rc.Redis)
+
+
+async def _real_client_frames(tmp_path, *, answer_handshake: bool) -> list[str]:
+    """The frames a REAL redis-py client is cancelled in, against a socket that
+    never answers (the handshake) or answers only the handshake (the reply)."""
+    import asyncio
+
+    import redis.asyncio as ra
+
+    sock = str(tmp_path / "r.sock")
+
+    async def handler(reader, writer):
+        while data := await reader.read(65536):
+            if answer_handshake and (n := data.count(b"SETINFO")):
+                writer.write(b"+OK\r\n" * n)
+                await writer.drain()
+
+    server = await asyncio.start_unix_server(handler, path=sock)
+    # protocol=2, as the falkordb client builds it: its handshake is CLIENT
+    # SETINFO, where redis-py's own default would open with HELLO 3.
+    client = ra.Redis(unix_socket_path=sock, protocol=2)
+    try:
+        await asyncio.wait_for(client.execute_command("GET", "k"), 0.3)
+    except TimeoutError as exc:
+        tb = exc.__cause__.__traceback__
+        names = []
+        while tb is not None:
+            names.append(tb.tb_frame.f_code.co_name)
+            tb = tb.tb_next
+        return names
+    finally:
+        server.close()
+        await client.aclose()
+    raise AssertionError("the read was expected to time out")
+
+
+async def test_a_real_client_stuck_in_its_handshake_reads_as_connect(tmp_path):
+    from genesis.memory import graphstore_falkor as falkor_mod
+
+    names = await _real_client_frames(tmp_path, answer_handshake=False)
+    assert _rep._phase(names[-falkor_mod._DIAG_FRAMES :]) == "connect", names
+
+
+async def test_a_real_client_waiting_on_its_reply_reads_as_reply(tmp_path):
+    from genesis.memory import graphstore_falkor as falkor_mod
+
+    names = await _real_client_frames(tmp_path, answer_handshake=True)
+    assert _rep._phase(names[-falkor_mod._DIAG_FRAMES :]) == "reply", names

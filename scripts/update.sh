@@ -2668,7 +2668,7 @@ with open(sys.argv[11], 'w') as f:
         elif [ "$_kept_rc" -eq 10 ]; then
             echo "  $STATE_FILE is kept, though the restart guard says it guards nothing now (nothing merged is on disk); Dismiss it on the dashboard's update card."
         elif [ "${_LIVE_TREE_SUSPECT:-0}" = 1 ]; then
-            echo "  $STATE_FILE is kept as the restart guard: the rebuild may have left part of its checkout on disk. Put back the paths the rebuild's message above names (save any edits of yours first), then Dismiss it on the dashboard's update card."
+            echo "  $STATE_FILE is kept as the restart guard: the rebuild may have left part of its checkout on disk. scripts/deploy_candidates repair-move puts it back to $ROLLBACK_TAG (it saves every path it changes first, and says when there is nothing to repair); by hand, put back the paths the rebuild's message above names (save any edits of yours first), then Dismiss it on the dashboard's update card."
         else
             echo "  $STATE_FILE is kept as the restart guard; the check that names its remedy could not run. Check the checkout by hand, then Dismiss it on the dashboard's update card."
         fi

@@ -189,6 +189,109 @@ def strip_quoted(text: str) -> str:
     return "\n".join(lines)
 
 
+#: The plan-time premise section's title (``.claude/docs/premise-check.md``, "At
+#: plan and issue time"), matched on a heading's RENDERED text at any level. Real
+#: plans use all four spellings (MEASURED 2026-10-27 over one install's 72 plans:
+#: "Premise check" 8, "Premise questions" 4, "Premise checks" 1); the issue form
+#: says "Premise checks".
+_PREMISE_TITLE = re.compile(r"premise\s+(?:checks?|questions?)\b", re.IGNORECASE)
+#: The line-rule fallback, used only without a parser.
+_ANY_HEADING_LINE = re.compile(r"^#{1,6}[ \t]")
+_ANSWER_LINE = re.compile(r"^ {0,3}([1-9])[.)](?:[ \t]+(.*))?$")
+
+
+def premise_answers(text: str, title: re.Pattern[str] = _PREMISE_TITLE) -> dict[int, str] | None:
+    """The numbered answers under a plan's premise heading, or None without one.
+
+    ``title`` matches the section heading's rendered text; it defaults to the
+    premise section, and the issue gate passes its bug-report "Verification"
+    title to read that section by the same rules. ``text`` is read as given; callers pass the live, quote-stripped section, so a
+    heading shown inside an example does not count. Read AS IT RENDERS, like the
+    rest of this module: the section runs from the first heading titled "Premise
+    check(s)" or "Premise question(s)" to the next heading of the same or a higher
+    level (a deeper subheading stays inside it). Its answers are the items of its
+    top-level ordered lists. Each list is keyed ON ITS OWN, by the numbers written
+    on its items when they are all distinct, or by position when the list is
+    autonumbered ("1. 1. 1.", which CommonMark renders as 1, 2, 3), so one list's
+    numbering never renumbers another's. The keys are then pooled and the FIRST
+    list carrying a number supplies that answer. So answers split into several
+    lists by a paragraph, a rule or a blockquote still all count, a trailing
+    "open items" list cannot replace an answer given earlier, and "1. 2. 4." with
+    nothing else reports answer 3 missing. A list that only supplies a number the
+    answers lack does fill it: this reads structure, not intent. An item nested
+    inside an answer is part of that answer, never an answer of its own. Each
+    answer's text is what the item RENDERS as: emphasis and code markers dropped,
+    inline HTML (a ``<placeholder>`` CommonMark reads as a tag) dropped, link text
+    kept, line breaks as spaces. So ``**N/A**`` reads as ``N/A``.
+    """
+    parsed = _blocks(text)
+    if parsed is None:
+        return _premise_answers_by_line(text, title)
+    _, _, tokens = parsed
+    start = depth = None
+    for i, tok in enumerate(tokens):
+        heading = _visible_text(tokens[i + 1]).strip() if i + 1 < len(tokens) else ""
+        if tok.type == "heading_open" and tok.level == 0 and title.match(heading):
+            start, depth = i + 1, int(tok.tag[1:])
+            break
+    if start is None:
+        return None
+    lists: list[list[tuple[str, list[str]]]] = []
+    current: list[str] | None = None
+    for tok in tokens[start + 1 :]:
+        if tok.type == "heading_open" and tok.level == 0 and int(tok.tag[1:]) <= depth:
+            break
+        if tok.type == "ordered_list_open" and tok.level == 0:
+            lists.append([])
+        elif tok.type == "list_item_open" and tok.level == 1 and lists and tok.markup in (".", ")"):
+            current = []
+            lists[-1].append((tok.info, current))
+        elif tok.type == "list_item_close" and tok.level == 1:
+            current = None
+        elif tok.type == "inline" and current is not None:
+            current.append(_rendered_text(tok))
+    answers: dict[int, str] = {}
+    for items in lists:
+        written = [info for info, _ in items]
+        by_number = all(n.isdigit() for n in written) and len(set(written)) == len(written)
+        for pos, (info, parts) in enumerate(items, start=1):
+            answers.setdefault(int(info) if by_number else pos, " ".join(p for p in parts if p))
+    return answers
+
+
+def _rendered_text(inline) -> str:
+    """An inline token as it reads rendered: text, code and link text kept,
+    emphasis markers and inline HTML dropped, line breaks as spaces."""
+    out = []
+    for child in inline.children or []:
+        if child.type in ("text", "code_inline"):
+            out.append(child.content)
+        elif child.type in ("softbreak", "hardbreak"):
+            out.append(" ")
+    return "".join(out).strip()
+
+
+def _premise_answers_by_line(text: str, title: re.Pattern[str] = _PREMISE_TITLE) -> dict[int, str] | None:
+    """``premise_answers`` without a parser: line rules, so the check still runs."""
+    lines = text.split("\n")
+    heading = re.compile(rf"^#{{1,6}}[ \t]+(?:{title.pattern})", title.flags)
+    start = next((i for i, line in enumerate(lines) if heading.match(line)), None)
+    if start is None:
+        return None
+    answers: dict[int, str] = {}
+    current: int | None = None
+    for line in lines[start + 1 :]:
+        if _ANY_HEADING_LINE.match(line):
+            break
+        item = _ANSWER_LINE.match(line)
+        if item and int(item.group(1)) not in answers:
+            current = int(item.group(1))
+            answers[current] = (item.group(2) or "").strip()
+        elif current is not None and line.strip():
+            answers[current] = f"{answers[current]} {line.strip()}".strip()
+    return answers
+
+
 def live_section(content: str) -> str:
     """The part of a plan above its superseded-content divider.
 

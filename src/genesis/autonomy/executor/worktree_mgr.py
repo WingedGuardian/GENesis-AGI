@@ -27,14 +27,6 @@ _GIT_READ_TIMEOUT_S = 60.0
 # ---------------------------------------------------------------------------
 
 
-def _branch_from_wt_path(wt_path: Path) -> str | None:
-    """Derive branch name from worktree path: task-XXXX → task/XXXX."""
-    name = wt_path.name
-    if name.startswith("task-"):
-        return f"task/{name[5:]}"
-    return None
-
-
 async def _delete_branch(branch: str, repo_root: Path) -> None:
     """Delete a local git branch. Logs result, never raises."""
     proc = await asyncio.create_subprocess_exec(
@@ -407,34 +399,8 @@ async def cleanup_worktree(
     wt_path: Path,
     repo_root: Path,
 ) -> None:
-    """Remove a worktree and its associated branch.
-
-    NO --force per CLAUDE.md worktree rules.
-    """
-    branch = _branch_from_wt_path(wt_path)
-
-    if not wt_path.exists():
-        # Worktree dir gone but branch might linger
-        if branch:
-            await _delete_branch(branch, repo_root)
-        return
-
-    proc = await asyncio.create_subprocess_exec(
-        "git", "worktree", "remove", str(wt_path),
-        cwd=str(repo_root),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=_scrubbed_git_env(),
+    """Leave worktree and Git state unchanged for independent lifecycle management."""
+    logger.info(
+        "Leaving task worktree state untouched at %s; lifecycle cleanup is independent",
+        wt_path,
     )
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        logger.warning(
-            "Worktree cleanup failed for %s: %s",
-            wt_path, stderr.decode(errors="replace"),
-        )
-    else:
-        logger.info("Cleaned up worktree at %s", wt_path)
-
-    # Delete the branch (even if worktree removal failed, try anyway)
-    if branch:
-        await _delete_branch(branch, repo_root)

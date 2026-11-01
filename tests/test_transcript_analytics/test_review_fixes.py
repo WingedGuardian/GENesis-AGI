@@ -301,7 +301,7 @@ def test_n8_hooks_view_dedupes_across_files(env):
     _write(projects / "p" / f"{SID}.jsonl", [hook])
     _write(projects / "p" / "00000000-2222-3333-4444-555555555555.jsonl", [hook])
     store.ingest(projects, data, lock_path=lock)
-    c = connect(data)
+    c = connect(data, live=True)
     assert c.sql("select count(*) from raw_hooks").fetchone() == (2,)
     assert c.sql("select count(*) from hooks").fetchone() == (1,)
 

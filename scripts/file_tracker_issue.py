@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""File a Genesis-repo issue on the SHARED public tracker, safely.
+"""File a Genesis-repo issue or timeline comment on the SHARED public tracker.
 
 Four cross-model review rounds on this procedure — three while it was prose, one
 after it became this script — found the same shape of defect each time: a step
@@ -46,8 +46,14 @@ never publishing an unfixed security defect.
 Usage:
     file_tracker_issue.py --title-file T --body-file B --area area:memory \\
         --difficulty "help wanted" [--dry-run]
+    file_tracker_issue.py --comment-on 123 --body-file B [--dry-run]
 
-Exit codes: 0 filed (or dry-run OK) · 2 refused, nothing posted · 3 duplicate
+The certainty history above describes issue creation. Comment mode performs one
+POST and read-only exact-body reconciliation; even a complete absence after an
+uncertain POST stays INDETERMINATE. It never automatically retries the POST.
+Title, area and difficulty are issue-only arguments.
+
+Exit codes: 0 filed/confirmed (or dry-run OK) · 2 refused, nothing posted · 3 duplicate
 found · 4 INDETERMINATE — a post may or may not exist, reconcile before retrying
 · 1 unexpected error.
 """
@@ -70,6 +76,7 @@ import unicodedata
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # Mirrors of the fail-closed sets enforced server-side by
 # ``src/genesis/mcp/health/contributor_issue.py``. Duplicated deliberately —
@@ -836,20 +843,170 @@ def main(argv: Sequence[str] | None = None, run: Runner = _run) -> int:
         return _run_main(argv, run)
 
 
+def _comment_identity(data: object, slug: str, number: int, *, comment: bool) -> str:
+    """Bind both preflight targets and comment receipts to the resolved tracker."""
+    if not isinstance(data, dict):
+        raise Refused("Comment response is not an object")
+    identifier = data.get("id") if comment else data.get("number")
+    if type(identifier) is not int or identifier <= 0 or (not comment and identifier != number):
+        raise Refused("Comment response has an invalid identity")
+    if comment and not isinstance(data.get("body"), str):
+        raise Refused("Comment response lacks its raw body")
+    raw = data.get("html_url")
+    if not isinstance(raw, str):
+        raise Refused("Comment response lacks its canonical URL")
+    url = urlsplit(raw)
+    paths = {f"/{slug}/issues/{number}".casefold(), f"/{slug}/pull/{number}".casefold()}
+    fragment = f"issuecomment-{identifier}" if comment else ""
+    if (
+        url.scheme != "https"
+        or url.netloc.casefold() != "github.com"
+        or url.path.casefold() not in paths
+        or url.query
+        or url.fragment != fragment
+    ):
+        raise Refused("Comment target moved or has a mismatched URL")
+    return raw
+
+
+def _comment_json(argv: list[str], run: Runner) -> object:
+    """A failed/partial lookup never establishes absence; keep raw errors private."""
+    proc = run(argv)
+    if proc.returncode != 0:
+        raise Refused("Comment lookup did not complete")
+    return json.loads(proc.stdout)
+
+
+def _find_comment(slug: str, number: int, body: str, run: Runner) -> str | None:
+    pages = _comment_json(
+        [
+            "gh",
+            "api",
+            "--paginate",
+            "--slurp",
+            f"repos/{slug}/issues/{number}/comments?per_page=100",
+        ],
+        run,
+    )
+    if not isinstance(pages, list) or not pages:
+        raise Refused("Comment listing has no complete page")
+    matches = []
+    for page in pages:
+        if not isinstance(page, list):
+            raise Refused("Comment listing contains an invalid page")
+        for item in page:
+            url = _comment_identity(item, slug, number, comment=True)
+            if item["body"] == body:
+                matches.append(url)
+    # Validate ALL later pages even after finding a match.
+    return matches[0] if matches else None
+
+
+def _comment_main(args, run: Runner) -> int:
+    """Own the one submission, its uncertain outcome and private snapshot."""
+    attempted, confirmed, snapshot_dir = False, None, None
+    phase = "draft read"
+    try:
+        raw = Path(args.body_file).read_bytes()
+        body = raw.decode("utf-8")
+        if not body.strip():
+            raise Refused("Comment body is empty")
+        phase = "privacy scan"
+        for warning in privacy_scan("", body):
+            _warn(f"privacy scan: {warning}")
+        phase = "private snapshot"
+        snapshot_dir, snapshot_path = _snapshot(raw)
+        phase = "tracker and permission lookup"
+        slug = resolve_tracker(run)
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", slug):
+            raise Refused("Comment tracker identity is invalid")
+        check_permission(slug, run)
+        phase = "target identity or complete comment lookup"
+        with tracker_lock(slug):
+            target = _comment_json(["gh", "api", f"repos/{slug}/issues/{args.comment_on}"], run)
+            _comment_identity(target, slug, args.comment_on, comment=False)
+            duplicate = _find_comment(slug, args.comment_on, body, run)
+            if duplicate:
+                with contextlib.suppress(BaseException):
+                    _warn(f"DUPLICATE: identical comment already exists: {duplicate}")
+                return _finish(3)
+            if args.dry_run:
+                print(_redact_home(f"DRY RUN ok — would comment on {slug}#{args.comment_on}"))
+                return _finish(0)
+            attempted = True
+            try:
+                proc = run(
+                    [
+                        "gh",
+                        "api",
+                        f"repos/{slug}/issues/{args.comment_on}/comments",
+                        "--method",
+                        "POST",
+                        "-F",
+                        "body=@" + snapshot_path,
+                    ]
+                )
+                if proc.returncode != 0:
+                    raise Indeterminate("Comment submission returned no confirmation")
+                data = json.loads(proc.stdout)
+                url = _comment_identity(data, slug, args.comment_on, comment=True)
+                if data["body"] != body:
+                    raise Indeterminate("Returned comment body differs from the scanned bytes")
+                confirmed = url
+            except (Exception, KeyboardInterrupt):
+                # Read only. Even a complete absence is not permission to POST again.
+                confirmed = _find_comment(slug, args.comment_on, body, run)
+                if confirmed is None:
+                    raise Indeterminate(
+                        "No matching comment established after submission"
+                    ) from None
+        print(_redact_home(confirmed))
+        return _finish(0)
+    except BaseException as exc:
+        if confirmed:
+            with contextlib.suppress(BaseException):
+                _warn(f"POSTED (comment reporting failed): {confirmed}")
+            return _finish(0)
+        if attempted:
+            with contextlib.suppress(BaseException):
+                _warn(
+                    "INDETERMINATE: comment may exist. Read the target before retrying; no second POST attempted."
+                )
+            return _finish(4)
+        # Includes reused lookup exceptions: neither their stderr nor paths are safe.
+        with contextlib.suppress(BaseException):
+            _warn(f"REFUSED: comment {phase} failed ({type(exc).__name__}). Nothing submitted.")
+        known = isinstance(
+            exc, (Refused, OSError, ValueError, KeyboardInterrupt, subprocess.SubprocessError)
+        )
+        return _finish(2 if known else 1)
+    finally:
+        if snapshot_dir:
+            with contextlib.suppress(BaseException):
+                shutil.rmtree(snapshot_dir, ignore_errors=True)
+
+
 def _run_main(argv: Sequence[str] | None, run: Runner) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     ap.add_argument(
-        "--title-file", required=True, help="file holding the title (never a shell arg)"
+        "--title-file", help="issue title file (required for issue creation)"
     )
     ap.add_argument("--body-file", required=True)
-    ap.add_argument("--area", required=True, help=f"one of: {', '.join(sorted(AREA_LABELS))}")
+    ap.add_argument("--area", help=f"one of: {', '.join(sorted(AREA_LABELS))}")
     ap.add_argument(
-        "--difficulty", required=True, help=f"one of: {', '.join(sorted(DIFFICULTY_LABELS))}"
+        "--difficulty", help=f"one of: {', '.join(sorted(DIFFICULTY_LABELS))}"
     )
+    ap.add_argument("--comment-on", type=int, help="positive issue or PR number for a scanned timeline comment")
     ap.add_argument("--dry-run", action="store_true", help="run every check, post nothing")
     args = ap.parse_args(argv)
+    if args.comment_on is not None:
+        if args.comment_on <= 0 or any(value is not None for value in (args.title_file, args.area, args.difficulty)):
+            ap.error("--comment-on requires a positive number and cannot use --title-file, --area or --difficulty")
+        return _comment_main(args, run)
+    if any(value is None for value in (args.title_file, args.area, args.difficulty)):
+        ap.error("issue creation requires --title-file, --area and --difficulty")
 
     posted: str | None = None
     snapshot_dir: str | None = None

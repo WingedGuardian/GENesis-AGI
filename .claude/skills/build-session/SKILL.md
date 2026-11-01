@@ -56,18 +56,16 @@ different SESSION TYPES, not two phases of one session's life** (user decision,
   surface, as a public issue. The `devin-ready` label hands it over and starts a
   paid session, so a session applies it only after the owner explicitly approves
   that issue in conversation. Once approved, the session applies the label itself;
-  the owner does not apply it by hand.
+  the owner does not apply it by hand. Run `python3 scripts/premise_gate.py check
+  <issue>` first and apply the label only when it exits 0 (premise-check.md,
+  "Check before applying the label").
   Its PRs join the same queue (closing-session, "Devin-built PRs").
 
-The handoff between them is **the PR itself** — a durable artifact that survives
-compaction and session death, so nothing has to be remembered across the
-boundary. It also satisfies the `reviewer ≠ implementer, fresh context` contract
-structurally rather than by discipline.
-
-Why it matters here: fused, the first item's review loop consumes the whole
-session — several compactions deep — while everything else the owner arrived
-with goes untouched. **Finishing the PR is finishing the work.** Handing it to
-the queue is not abandoning it.
+The handoff between them is **the PR itself** (why the two are split, and the
+worktree that passes with it: closing-session, "Why this session type exists"). Why
+it matters here: fused, the first item's review loop consumes the whole session
+while everything else the owner arrived with goes untouched. **Finishing the PR
+is finishing the work.** Handing it to the queue is not abandoning it.
 
 Two consequences worth internalizing:
 
@@ -2175,7 +2173,11 @@ that takes up the rework is the reviving session (closing-session, "Never RETIRE
    round counts. When the LAST one opens, whoever opened it closes the old PR
    with a comment that maps every part of it, file by file, to the `file:line`
    in the replacement
-   that covers it, or says why that part is moot. If any part is neither,
+   that covers it, or says why that part is moot. Judge both by the problem the
+   part solved, never by whether its code survived: covered means the
+   replacement or `main` delivers that guarantee, moot means the problem itself
+   is gone or an owner decision dropped it (closing-session, "Superseded is
+   about the problem"). If any part is neither,
    leave the old PR open with a comment naming that part. Leave its labels on,
    so the rebuild stays traceable to it. If the spec carries a
    `Follow-up: <id>` line, copy it into the body of the replacement that will

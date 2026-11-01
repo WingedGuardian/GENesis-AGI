@@ -110,7 +110,7 @@ _MAX_MAX_TOKENS = 8192
 # The smallest output budget this endpoint accepts. Below it a turn can come back
 # EMPTY, which the handler must answer as a 502 — a request that cannot succeed,
 # dressed as a server failure the client will retry. MEASURED through the routed
-# path (LiteLLMDelegate, reasoning_effort=disable): the thinking-suppressed
+# path (LiteLLMDelegate, under litellm 1.78.7): the thinking-suppressed
 # gemini lane on desk_fast returned no text at max_tokens 1 and 4 and a single
 # quote character at 5, while 8 and above returned text. 16 is that floor with
 # headroom: an earlier direct-API measurement on the same model saw 12 tokens

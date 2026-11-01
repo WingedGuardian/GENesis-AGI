@@ -12,8 +12,12 @@ from google.protobuf.timestamp_pb2 import Timestamp
 from genesis.cc.managed_session import metadata
 from genesis.peers.disclosure_scan import json_strings_safe
 from genesis.peers.task_cursor import valid_stamp
+from genesis.security.output_scanner import redact_credentials
 
 MAX_RESULT = 2 * 1024 * 1024
+# Location-style findings a same-owner peer may read in a reply. Credentials
+# are redacted in place instead; anything else unsafe still withholds it.
+REPLY_ALLOW = frozenset({"rfc1918_ip", "internal_file_path", "localhost_port"})
 STATES = {
     "submitted": TaskState.TASK_STATE_SUBMITTED,
     "working": TaskState.TASK_STATE_WORKING,
@@ -22,6 +26,12 @@ STATES = {
     "failed": TaskState.TASK_STATE_FAILED,
     "canceled": TaskState.TASK_STATE_CANCELED,
 }
+
+
+def disclosable_reply(text):
+    """The reply with credentials redacted, or None when it still cannot be disclosed."""
+    text, redacted = redact_credentials(text)
+    return (text if json_strings_safe(text, allow=REPLY_ALLOW) else None), redacted
 
 
 def full_result(row):
@@ -51,7 +61,8 @@ def full_result(row):
     except (OSError, ValueError):
         # The saved metadata head is deliberately lossy; never label it full.
         raise ConversationRefusal("result_unavailable", 409) from None
-    if not json_strings_safe(text):
+    text, _ = disclosable_reply(text)
+    if text is None:
         raise ConversationRefusal("disclosure_refused", 409)
     return text
 
@@ -78,8 +89,10 @@ def project(row):
         "resultPartial": bool(meta.get("result_partial")),
     }
     if row["status"] != "active":
-        text = meta.get("output_text") or ""
-        if json_strings_safe(text):
+        text, redacted = disclosable_reply(meta.get("output_text") or "")
+        if text is not None:
+            if redacted:
+                view["replyRedacted"] = redacted
             if text:
                 status.message.CopyFrom(
                     Message(

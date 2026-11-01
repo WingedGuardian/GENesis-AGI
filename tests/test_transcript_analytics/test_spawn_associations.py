@@ -160,7 +160,7 @@ def test_paired_results_preserve_raw_facts_without_supplying_lineage(
     for actor in actors.values():
         assert actor["lineage_status"] == "confirmed"
         assert json.loads(actor["parent_actor_id"]) == ["parent", None]
-    with query.read_connection(tmp_path / "data") as con:
+    with query.read_connection(tmp_path / "data", live=True) as con:
         assert con.sql("SELECT line_no_call,line_no_result,result_agent_ids,has_result "
                        "FROM raw_tool_calls WHERE has_result").fetchall() == [(1, 2, ["A"], True)]
         expected = "confirmed" if companions else "unresolved"

@@ -365,7 +365,8 @@ class Engine(Repo):
         except Exception as exc:  # noqa: BLE001 - any failure to decide refuses
             return (
                 f"{path} could not be checked ({exc}); it is kept. Finish that update with "
-                "scripts/update.sh --post-merge (it refuses a half-written tree), or Dismiss it "
+                "scripts/update.sh --post-merge (it refuses a half-written tree; on `live`, "
+                "scripts/deploy_candidates repair-move puts such a tree back), or Dismiss it "
                 "on the dashboard's update card."
             )
 

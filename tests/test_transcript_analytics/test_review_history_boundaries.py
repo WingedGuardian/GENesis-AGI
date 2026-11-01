@@ -90,7 +90,7 @@ def test_spawn_result_cannot_confirm_lineage_from_conflicting_context(tmp_path, 
     child.parent.mkdir(parents=True)
     child.write_text(json.dumps(result) + "\n")
     store.ingest(projects, data)
-    with query.read_connection(data) as con:
+    with query.read_connection(data, live=True) as con:
         parents = con.sql("SELECT parent_actor_id FROM actor_lineage WHERE actor_id=?",
                           params=['["parent","target"]']).fetchall()
         assert parents == ([] if conflict else [('["parent",null]',)])

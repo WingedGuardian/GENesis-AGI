@@ -75,8 +75,12 @@ VALID_LEDGER_STATUSES = frozenset({"open", "in_progress", "done", "absorbed", "d
 # invariant keys on the extractor value to assert it has written nothing live,
 # and a shared value would make that check unable to tell them apart on the
 # very day it starts mattering. Mirrored by a schema CHECK (the session_ledger_ambient_extractor migration).
+# "relayed" is the OWNER's own request, written by a dispatched session (a
+# channel conversation relaying it onto a foreground charter). "ambient" says
+# only who wrote a row; "relayed" says whose commitment it is, which is what the
+# escalation sweep needs. Added by the session_ledger_relayed_added_by migration.
 VALID_ADDED_BY = frozenset(
-    {"foreground", "ambient", "pulse", "ambient_ledger_extractor"}
+    {"foreground", "ambient", "pulse", "ambient_ledger_extractor", "relayed"}
 )
 # The subset a CALLER may name. `ambient_ledger_extractor` is INTERNAL
 # provenance — the detached worker sets it on its own writes — and it is not an
@@ -88,7 +92,7 @@ VALID_ADDED_BY = frozenset(
 #
 # Two names because they answer two questions — "is this value storable?" and
 # "may this value be asked for?" — and the public surface needs the second.
-CALLER_SETTABLE_ADDED_BY = frozenset({"foreground", "ambient", "pulse"})
+CALLER_SETTABLE_ADDED_BY = frozenset({"foreground", "ambient", "pulse", "relayed"})
 
 # Living-field bounds (enforced here so every writer shares them)
 MAX_POINTERS = 12

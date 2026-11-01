@@ -1,0 +1,3 @@
+# ripwire quality acks v1 — written by --quality-ack; a finding stays suppressed until it worsens past its acked magnitude
+# format: ack <kind> <16-hex-key> <ackNow> [cid=<16-hex-content-id>] [by=<scope that acked it>] <reason to end of line> — one per line, kept SORTED by (kind,key) on every write (merge-friendly)
+ack dead-code:preexisting d1ed81f702ea1436 0 cid=ff0bb781fbfd5623 by=query.py Public run_query list API is intentionally retained and covered by query, lineage and manifest tests. CLI uses the private batched consumer; this production-only crawl omits test callers.

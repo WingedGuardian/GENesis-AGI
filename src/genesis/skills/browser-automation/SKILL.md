@@ -405,10 +405,15 @@ their own Chrome, or, when card fill is on, use `browser_fill_card`:
   checkout", "Add card") takes `steps`: the clicks, in order, each a selector or
   `{"selector", "frames"}`. The payment window replays them after it reopens the
   checkout's URL, before reading or filling anything. Steps are clicks only,
-  never values and never a checkbox.
+  never values and never a checkbox. Each must match exactly one SHOWN
+  element. A refusal names which item failed and why, for example
+  `step_not_found:2:none` (also `several`, `frame`, `owner`); `consent_not_found`
+  and `extra_field_not_found` carry the same detail.
 - A required consent checkbox in the card form (a debit authorization) goes in
   `consent`, never `steps`: the owner's tap shows its label, and the tool ticks
-  it only after the tap.
+  it only after the tap. Pass the checkbox input itself. When a styled box
+  covers it so a click can't land, the tool ticks it through the input's own
+  label (the one label whose control is that input, in the same frame).
 - Billing address fields can omit `"value"`: the tool then reads it from
   `card_fill.billing` in the install's private payments config, so the address
   stays out of tool arguments.
@@ -426,7 +431,15 @@ their own Chrome, or, when card fill is on, use `browser_fill_card`:
 - The tool reopens the checkout in a window no other tool reaches, waits for
   the owner's Telegram tap, fills, clicks Pay itself and closes the window.
   You get a fixed `code` and `status` only.
+- A checkout that shows its result in place after Pay (the page does not
+  change: a drawer or panel swaps to a receipt) takes `success`: a selector in
+  the top document for that result (a container, not a button). Shown, steady
+  and with Pay gone, it gives `submitted_in_place`; without it such a checkout
+  ends as `challenge`. After a save, Pay is found again by its selector (a
+  checkout may rebuild it) and must pass every check it passed at the tap.
 - `submitted_unverified`: check the order page or the merchant account.
+  `submitted_in_place`: most likely paid; do NOT retry; tell the owner to check
+  the merchant account.
   `challenge`, `card_url_blocked`, `card_url_leaked`, `pay_click_unknown`, `moved_while_filling`, `card_url_before_pay`, `card_value_in_request` or `outcome_unknown`: do NOT retry; tell the owner the outcome is
   unknown. `card_url_before_pay`: Pay was not clicked, but a card value was
   sent or nearly sent in a URL; tell the owner the card may be exposed.
@@ -435,6 +448,12 @@ their own Chrome, or, when card fill is on, use `browser_fill_card`:
   other code before Pay (`failed_before_pay`, `claimed_not_filled`, a
   refusal): Pay was not clicked; a single-use card may be spent, so ask the
   owner before trying again.
+- A code after the tap can carry a suffix naming the check that stopped it
+  (`page_changed:granted:title`, `failed_before_pay:held`,
+  `saved_page_changed:pay_price`). What to do follows the part before the first
+  colon; report the whole code to the owner. `page_changed:granted` stopped
+  before anything was typed; any later `page_changed` may follow billing
+  fields being typed (never the card).
 
 **Credentials.**
 - Do not type a password, code or card number the user pasted into chat. Ask
