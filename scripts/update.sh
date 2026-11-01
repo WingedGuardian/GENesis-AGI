@@ -1835,11 +1835,13 @@ DB_RESTORE_OWED=0  # set by _measure_db_restore_owed at rollback: 1 when this
 #     exist yet (it exits the update on any other failure), so one that exists
 #     now was created by this update and owes a restore that cannot happen.
 _measure_db_restore_owed() {
+    # code_action is not consulted: a checkout still at the rollback tag (`none`)
+    # does not mean the database was untouched. A --post-merge with no state file
+    # tags HEAD itself, and a no-delta tier-2 activation runs bootstrap and the
+    # migrations with HEAD at the tag; either can change the schema and fail.
+    # What was done to the database is measured, not inferred from the code.
+    # shellcheck disable=SC2034  # kept in the signature for the callers' reading
     local code_action="$1" server_down="$2" rc=0 out=""
-    if [ "$code_action" = "none" ] || [ "$code_action" = "untouched" ]; then
-        DB_RESTORE_OWED=0
-        return 0
-    fi
     if [ "$server_down" != "true" ]; then
         DB_RESTORE_OWED=1
         echo "  The server is not confirmed down, so the database cannot be measured reliably."

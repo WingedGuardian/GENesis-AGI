@@ -274,17 +274,20 @@ def test_no_snapshot_but_a_database_now_owes_the_restore(tmp_path):
     assert stale.exists()
 
 
-@pytest.mark.parametrize("code_action", ["none", "untouched"])
-def test_a_rollback_this_runs_code_never_ran_owes_nothing(tmp_path, code_action):
-    """`none`: the checkout is at the rollback tag; `untouched`: this run never
-    merged and someone else moved the checkout. Either way this update did not
-    change the database, and a restore under someone else's code would put it on
-    an old schema."""
+@pytest.mark.parametrize("code_action", ["none", "untouched", "reset", "moved"])
+@pytest.mark.parametrize("changed", [True, False])
+def test_the_database_is_measured_whatever_the_code_did(tmp_path, code_action, changed):
+    """A checkout still at the rollback tag (`none`) does not mean the database
+    was untouched: a --post-merge with no state file tags HEAD itself, and a
+    no-delta tier-2 activation runs bootstrap and the migrations with HEAD at the
+    tag. So the restore is owed exactly when the database changed, for every
+    code action (whether it can be restored is the decision block's call)."""
     db = _live(tmp_path)
     _snapshot(db)
-    _exec(db, "ALTER TABLE notes ADD COLUMN tag TEXT")
+    if changed:
+        _exec(db, "ALTER TABLE notes ADD COLUMN tag TEXT")
     owed, out = _measure(db, code_action=code_action)
-    assert owed == "0", out
+    assert owed == ("1" if changed else "0"), out
 
 
 def test_a_server_not_confirmed_down_owes_the_restore(tmp_path):
