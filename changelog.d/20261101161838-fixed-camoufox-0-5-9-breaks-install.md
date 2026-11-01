@@ -1,0 +1,1 @@
+- A fresh install, and the browser step of an update, no longer pull camoufox 0.5.9: that release removed an API the browser provisioning calls and moves the engine to Firefox 158. The browser extra now takes camoufox 0.5.7-0.5.8 until 0.5.9 is adopted deliberately.
