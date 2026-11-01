@@ -67,7 +67,9 @@ recap and the legacy model shell tools remain unavailable in this profile.
 
 The child uses its own process group. Completion, stop or error reaps that child
 and checks group closure before a cleanup receipt is accepted. Late output/receipt
-failure leaves an unpaired attempt; reopening cannot automatically invoke it.
+failure leaves an uncertain attempt: the collector may commit uncertainty, while
+an abrupt interruption may leave unpaired intent. Reopening cannot automatically
+invoke either.
 Stop interrupts backoff. This is fixture process ownership, not production
 generation fencing or reconciliation after an abruptly killed parent.
 
@@ -117,3 +119,34 @@ source/binary/container identities and independent artifact/state/effect readbac
 Real-process interruption, timing/recovery cells and the final B/C comparison
 follow separately. Neither native mechanics nor synthetic state scoring establish
 full workflow, useful model behavior, production or Codex parity.
+
+`ego_owned_recovery.py` adds a separate instrumented process population. The
+trusted `ego_owned_probe.py` wrapper pauses at twelve declared intake/dispatch/
+native/claim/effect/receipt/commit boundaries, or injects seven late-I/O faults
+around the unchanged bridge. Each interrupted campaign reopens through the plain
+C CLI with its original manifest; the fixture never repairs its cursor or journal.
+Uncertain cells retain an unused response slot, so program exhaustion cannot
+explain the absence of replay; this includes all seven late-I/O faults. Raw
+journal/trajectory/config/driver snapshots are captured before the plain reader
+reopens the campaign. Stage predicates check that writer boundary, and later
+journal records must preserve the captured prefix.
+Before dispatch intent, reopen can execute once. Unpaired intent stays uncertain.
+A committed observation restores progress without repeating the effect.
+
+The controller keeps the existing container init. It first calibrates adoption
+and reaping using harmless processes, waits only its own direct Popen, validates
+outer/child ancestry and groups before signalling, and retains barrier/closure
+process snapshots. Detached or unaccounted survivors make the run incomplete and
+require a design decision; no broader fencing is silently introduced.
+
+Late database/output/pending-write/close/rename failures must occur after a real
+typed native result, one canonical effect, observation and final. They leave no
+published driver, preserve the single effect and halt C uncertain without accepted
+progress or replay. Full pending bytes remain evidence, never a repaired receipt.
+The intentional missing-driver error, pending identity and child cleanup must
+match; unrelated collection errors cannot qualify the expected uncertainty.
+
+The seventh container retains this population separately from native13/pure60.
+Actual post-review contained results and independent artifact/process readback
+are required; host exception/stub tests do not establish real crash recovery.
+Actual timer/backoff/arrival/stop cells and final B/C readback follow separately.
