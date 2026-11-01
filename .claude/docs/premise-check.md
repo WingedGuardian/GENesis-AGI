@@ -69,6 +69,14 @@ place. `premises-missing` always means the issue's OWN section is incomplete (th
 Verification for a bug report), so a verified bug report that lacks the six loses
 `devin-ready` and gets the comment, but not that label.
 
+**Check before applying the label.** The Action acts only after the label event,
+and on a busy runner queue that can be minutes after Devin has started. So a
+session runs `python3 scripts/premise_gate.py check <issue>` first, and applies
+`devin-ready` only when it exits 0. Exit 1 lists the missing answers: fix the
+issue, never apply the label over them. Exit 2 means the issue could not be read,
+which is not a pass. On a `bug` issue it also lists missing Verification answers;
+those do not change the exit code, because only the six decide the label.
+
 ## Why it exists
 
 Review rounds accumulate for two reasons that the round COUNT cannot tell apart.
@@ -300,7 +308,10 @@ Unforeseen complications are expected, and the section is where they are stated.
 The output is a **judgment about direction**, handed to whoever owns the change. It
 is not permission to rewrite it, not a substitute for the code review (run this
 first, then review the code if the premises hold), and not a reason to close
-anything — a reviewer session retires nothing.
+anything — a reviewer session retires nothing. A premise that fails because
+the code cannot land, while the problem it solves is still wanted, keeps the
+PR open and routes it as below; only a dead problem closes a PR
+(closing-session, "Superseded is about the problem").
 
 **BROKEN routes through the ESTABLISHED disposition, not a new one — and the bar
 is HIGH.** The repo already has a route for a change that is wrong at the premise

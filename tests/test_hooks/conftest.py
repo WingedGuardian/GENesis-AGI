@@ -6,9 +6,49 @@ import json
 import os
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
+
+
+def _push_guard_instances(test_module) -> list[types.ModuleType]:
+    """Every copy of ``git_push_guard`` the test module holds in its globals.
+
+    Each test file loads its OWN copy, under its own name (``git_push_guard``,
+    ``round_request_guard``, ``gpg_uut`` …) and mostly without registering it in
+    ``sys.modules``, so a ``sys.modules`` lookup misses them. The test module's
+    globals hold the copy it actually calls, whatever it is named."""
+    if test_module is None:
+        return []
+    found = []
+    for value in vars(test_module).values():
+        path = getattr(value, "__file__", None) if isinstance(value, types.ModuleType) else None
+        if (
+            path
+            and os.path.basename(path) == "git_push_guard.py"
+            and hasattr(value, "_merge_deadline")
+        ):
+            found.append(value)
+    return found
+
+
+@pytest.fixture(autouse=True)
+def _disarm_push_guard_deadline(request):
+    """Start and end every hook test with no merge deadline armed (#2904).
+
+    ``git_push_guard`` keeps its shared merge-path deadline in a module global.
+    ``main()`` disarms it on exit, but tests also call gates such as
+    ``_check_codex_round_escalation`` directly, and those arm it outside
+    ``main()``. A deadline left armed expires ~45 s later and makes every later
+    gh-backed call in that file raise, failing whichever test happens to run
+    then. Reads the test module's globals; imports nothing."""
+    guards = _push_guard_instances(getattr(request, "module", None))
+    for guard in guards:
+        guard._merge_deadline = None
+    yield
+    for guard in guards:
+        guard._merge_deadline = None
 
 
 @pytest.fixture(autouse=True)

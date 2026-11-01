@@ -55,6 +55,20 @@
       "type": "Base64 High Entropy String",
       "sha1": "6a8d40a692b07fb6cc5de90574519cfcb250d947",
       "reason": "shell assignment text in a test fixture patch, read as base64 between escaped quotes, not sensitive; current source splits the matched run with a space"
+    },
+    {
+      "commit": "49b6747c581be5045533c8f07e41b9f73733ce0d",
+      "path": "COMMIT_MESSAGE",
+      "type": "Hex High Entropy String",
+      "sha1": "b12fa40b41c15bea39d12c1b8b8c983278120196",
+      "reason": "Public Git commit ID in the main-integration merge message; verified against the referenced main commit."
+    },
+    {
+      "commit": "a1fd9d7aa9ef6132aea7674f3df22044f202a7e9",
+      "path": "scripts/close_check.py",
+      "type": "Hex High Entropy String",
+      "sha1": "2c74b2b5a39b54beae7d7c0e994feb84693a3466",
+      "reason": "git's well-known empty-tree object id (_EMPTY_TREE), identical in every repository, not sensitive; current source carries the inline pragma"
     }
   ]
 }
