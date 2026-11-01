@@ -47,7 +47,7 @@ def _wire(db, monkeypatch):
 
 
 async def _call(prospect_id, subject="Hello", body="World"):
-    tools = await om.mcp.get_tools()
+    tools = {tool.name: tool for tool in await om.mcp.list_tools()}
     return json.loads(
         await tools["marketing_send"].fn(
             prospect_id=prospect_id,
@@ -105,6 +105,16 @@ async def test_happy_path_enqueues_code_resolved_recipient_labeled_bulk(db):
     assert row["validated_recipient"] == "prospect@example.com"  # resolved in CODE
     assert row["labeled_surplus"] == 1  # → classifies BULK downstream
     assert "Try Genesis" in row["message"]
+    assert row["email_subject"] == "Try Genesis"  # the real subject, not the message start
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("subject", ["", "   ", "\u202e", "\u200b \u2028"])
+async def test_empty_cleaned_subject_refuses_and_enqueues_nothing(db, subject):
+    await mp.create(db, id="p1", email="a@example.com", created_at=_TS, updated_at=_TS)
+    out = await _call("p1", subject=subject)
+    assert out == {"status": "refused", "reason": "subject_required"}
+    assert await po.drain(db, now="2099-01-01T00:00:00") == []
 
 
 @pytest.mark.asyncio

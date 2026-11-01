@@ -106,6 +106,7 @@ TEXTS = {
     "(as the page writes prices), and needs save.",
     "bad_save": "save must be the control that stores the card, or {selector, frames}; total "
     "needs save.",
+    "bad_success": "success must be one plain CSS selector in the top document (no frames).",
     "bad_consent": f"consent must be a list of at most {MAX_CONSENTS} checkboxes, each a "
     "selector or {selector, frames}.",
     "no_billing_value": "An extra field gives no value and card_fill.billing in the payments "
@@ -171,12 +172,22 @@ TEXTS = {
     "release_timed_out": "No decision arrived in time." + _CANCELLED,
     "checkout_closed": "The payment window closed before the hand-over." + _CANCELLED,
     "browser_closed": "The browser closed or restarted before the hand-over." + _CANCELLED,
-    "page_changed": "The checkout changed while waiting for approval." + _CANCELLED,
+    # After the approval: the billing fields may have been typed by then (never
+    # submitted). Only the first re-check, before any typing, filled nothing.
+    "page_changed": "The checkout changed after approval. The request was cancelled; the "
+    "billing fields may have been typed, but the card was not typed and Add Card and Pay "
+    "were not clicked.",
+    "page_changed:granted": "The checkout changed while waiting for approval." + _CANCELLED,
+    # The billing typing after approval failed (the code names the field and how):
+    # not necessarily a page change.
+    "page_changed:late": "Typing the billing fields after approval did not complete (the "
+    "code names the field and how). The request was cancelled; the card was not typed and "
+    "Add Card and Pay were not clicked.",
     "claim_refused": "The vault refused to hand over the card (reason given)." + _NONE,
     "claim_unanswered": "The vault did not answer the hand-over; a single-use card may now "
     "be spent." + _NONE,
-    "claimed_not_filled": "The checkout changed after the hand-over; nothing was typed and "
-    "Pay was not clicked." + _SPENT,
+    "claimed_not_filled": "The checkout changed after the hand-over; the card was not typed "
+    "and Pay was not clicked (billing fields may have been typed)." + _SPENT,
     "failed_before_pay": "Filling stopped part-way; Pay was NOT clicked and the payment "
     "window was closed." + _SPENT,
     "card_url_before_pay": "Pay was NOT clicked: while the card was typed, the checkout sent "
@@ -188,8 +199,12 @@ TEXTS = {
     "necessarily exposed. Tell the owner." + _NO_RETRY,
     "submitted_unverified": "Pay was clicked and the checkout moved on. Not verified: "
     "check the order page or the merchant account.",
-    "challenge": "Pay was clicked, then a bank check appeared or the checkout did not move "
-    "on within 60 s; the payment window was closed." + _NO_RETRY,
+    "challenge": "Pay was clicked. Within 60 s the checkout either asked for a bank check or "
+    "showed its result without changing page: the charge may have happened. The payment "
+    "window was closed." + _NO_RETRY,
+    "submitted_in_place": "Pay was clicked, then the checkout showed the success marker in "
+    "place and Pay went away: most likely paid, not verified. Do NOT retry; the owner checks "
+    "the merchant account or statement.",
     "pay_click_unknown": "The Pay click raised an error and the checkout did not move on: "
     "it is unknown whether Pay was clicked; the payment window was closed." + _NO_RETRY,
     "moved_while_filling": "Pay was NOT clicked, but the checkout moved on (navigated or "
@@ -246,6 +261,7 @@ class CardArgs:
     save: Spec | None = None  # the control that stores the card, clicked before Pay
     amount_max: str | None = None  # the ceiling the tap approves ("up to")
     total: Spec | None = None  # where the total shows after the save (default: Pay's label)
+    success: str | None = None  # the top-document marker of an in-place result after Pay
 
     def __repr__(self) -> str:  # never the extra values
         return f"CardArgs({sorted(self.fields)}, extra={list(self.extra)})"
@@ -253,7 +269,9 @@ class CardArgs:
 
 def result(code: str, host: str = "", **extra) -> dict:
     base = code.split(":", 1)[0]
-    out = {"code": code, "status": TEXTS.get(base, TEXTS["internal_error"]), "host": host}
+    # A code's first two parts can have their own text (``page_changed:granted``).
+    status = TEXTS.get(":".join(code.split(":", 2)[:2])) or TEXTS.get(base)
+    out = {"code": code, "status": status or TEXTS["internal_error"], "host": host}
     reason = extra.get("reason")
     if isinstance(reason, str) and _VAULT_REASON.fullmatch(reason):
         out["reason"] = reason
@@ -409,6 +427,7 @@ def validate(
     save=None,
     amount_max=None,
     total=None,
+    success=None,
 ) -> CardArgs:
     """The checked arguments, or Refused with the first failing check's code."""
     if not isinstance(card_ref, str) or not CARD_REF.fullmatch(card_ref):
@@ -421,6 +440,11 @@ def validate(
     total_spec = None if total is None else _spec(total, "bad_save")
     if total_spec is not None and save_spec is None:
         raise Refused("bad_save")
+    if success is not None and not isinstance(success, str):  # one top-document selector
+        raise Refused("bad_success")
+    success_spec = None if success is None else _spec(success, "bad_success")
+    if success_spec is not None and success_spec[0]:  # the top document only
+        raise Refused("bad_success")
     # The total is checked against it, in its currency: one mark, as the page writes it.
     if save_spec is not None and (money(amount) is None or len(currency(amount)) != 1):
         raise Refused("bad_amount")
@@ -483,6 +507,7 @@ def validate(
         save_spec,
         amount_max,
         total_spec,
+        None if success_spec is None else success_spec[1],
     )
 
 

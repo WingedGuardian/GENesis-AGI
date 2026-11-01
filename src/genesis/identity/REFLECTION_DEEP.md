@@ -246,6 +246,8 @@ it illustrates the format, not a live finding.
 
 Respond with valid JSON. Only include non-empty fields. Every field is optional
 except `observations`, `confidence`, and `cognitive_state_update`.
+Exception to both rules above: when the prompt has a "Promoted Surplus Insights"
+section, `surplus_cited` is required, as `[]` when none of them informed your output.
 
 **`cognitive_state_update` is REQUIRED.** Always regenerate the cognitive state
 summary — this is the primary output of deep reflection that every future CC
@@ -267,6 +269,7 @@ the next deep reflection fires.
     {"task_type": "memory_audit", "reason": "50+ unresolved observations older than 72h", "priority": 0.7, "drive_alignment": "competence"}
   ],
   "skill_triggers": ["skill-name-1"],
+  "surplus_cited": ["surplus-insight-id-1"],
   "procedure_quarantines": [
     {"procedure_id": "proc-id-1", "reason": "success rate below 40% after 5 uses"}
   ],

@@ -1,0 +1,1 @@
+- Outreach emails now carry their request topic as the subject, including sends released after owner approval. Subjects receive the existing disclosure checks and text scrubbing; line breaks are unfolded into spaces and an empty topic retains the default subject.

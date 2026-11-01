@@ -1634,3 +1634,203 @@ async def test_health_figures_render_real_values(db, mock_health, mock_drafter):
     assert "ticks_24h=288" in section
     assert "foreground=2, background=1, failed_24h=3" in section
     assert "Embedding queue elevated**: 150 pending" in section
+
+
+# --- Previous-report carry-over -------------------------------------------
+#
+# The report used to receive only the previous report's TIMESTAMP, so the same
+# urgent item could be re-raised as urgent every day with nothing having
+# changed. These pin that the previous report's Urgent and BLOCKER lines reach
+# the drafter, that the newest prior report is the one read (the report row is
+# written only after delivery, so at generate time the newest row IS the
+# previous report), and that a first-ever report is unaffected.
+
+_PREV_REPORT = """```
+**Urgent**
+- CARRY-URGENT-ONE: detector blind on two legs.
+- CARRY-URGENT-TWO: backup failed twice.
+
+**Yesterday**
+- NOT-CARRIED: two sessions on the dashboard.
+
+**Next Steps & Blockers**
+- BLOCKER: CARRY-BLOCKER gating the active goal.
+- NOT-CARRIED-STEP: approve the pending proposal.
+```"""
+
+
+async def _insert_report(db, rid, created_at, text):
+    from genesis.db.crud import outreach as outreach_crud
+
+    await outreach_crud.create(
+        db,
+        id=rid,
+        signal_type="morning_report",
+        topic=f"Morning Report — {created_at[:10]}",
+        category="digest",
+        salience_score=0.0,
+        channel="telegram",
+        message_content=text,
+        created_at=created_at,
+    )
+
+
+@pytest.mark.asyncio
+async def test_previous_urgent_and_blockers_reach_the_prompt(db, mock_health, mock_drafter):
+    await _insert_report(db, "r1", "2026-03-11T11:00:00+00:00", _PREV_REPORT)
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+
+    await gen.generate()
+    context = mock_drafter.draft.call_args.args[0].context
+
+    assert "## Previous Report Carry-over" in context
+    assert "CARRY-URGENT-ONE" in context
+    assert "CARRY-URGENT-TWO" in context
+    assert "BLOCKER: CARRY-BLOCKER" in context
+    # Only the urgent/blocker lines travel, not the whole report.
+    assert "NOT-CARRIED" not in context
+    assert "2026-03-11 11:00" in context
+
+
+@pytest.mark.asyncio
+async def test_carryover_reads_the_newest_prior_report(db, mock_health, mock_drafter):
+    older = _PREV_REPORT.replace("CARRY-", "OLDER-")
+    await _insert_report(db, "r0", "2026-03-10T11:00:00+00:00", older)
+    await _insert_report(db, "r1", "2026-03-11T11:00:00+00:00", _PREV_REPORT)
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+
+    section = await gen._get_previous_report_carryover()
+
+    assert section is not None
+    assert "CARRY-URGENT-ONE" in section
+    assert "OLDER-" not in section
+
+
+@pytest.mark.asyncio
+async def test_standing_items_compare_against_the_newest_prior_report(
+    db, mock_health, mock_drafter
+):
+    # The "(Last report: …)" stamp the [unchanged] tags are computed against
+    # must be the report the user actually saw last, not the one before it.
+    await _insert_report(db, "r0", "2026-03-10T11:00:00+00:00", "older")
+    await _insert_report(db, "r1", "2026-03-11T11:00:00+00:00", "newer")
+    await _insert_obs(db, "standing-1", "bug_identified", "STANDING-MARKER", surfaced_count=3)
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+
+    standing = await gen._get_standing_items()
+
+    assert standing is not None
+    assert "(Last report: 2026-03-11T11:00)" in standing
+
+
+@pytest.mark.asyncio
+async def test_no_previous_report_leaves_prompt_without_carryover(db, mock_health, mock_drafter):
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+
+    assert await gen._get_previous_report_carryover() is None
+    await gen.generate()
+    context = mock_drafter.draft.call_args.args[0].context
+    assert "Previous Report Carry-over" not in context
+
+
+@pytest.mark.asyncio
+async def test_previous_report_with_nothing_urgent_adds_no_section(db, mock_health, mock_drafter):
+    await _insert_report(db, "r1", "2026-03-11T11:00:00+00:00", "**Yesterday**\n- quiet day.\n")
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+
+    assert await gen._get_previous_report_carryover() is None
+
+
+@pytest.mark.asyncio
+async def test_carryover_read_failure_does_not_break_the_report(db, mock_health, mock_drafter):
+    gen = MorningReportGenerator(mock_health, db, mock_drafter)
+    with patch.object(gen, "_get_previous_report_carryover", side_effect=RuntimeError("boom")):
+        await gen.generate()
+    context = mock_drafter.draft.call_args.args[0].context
+    assert "## System Health" in context
+
+
+def test_demoted_item_keeps_travelling_in_the_carryover():
+    # Day N raised it; day N+1 demoted it to a "still open since" bullet. If
+    # day N+2's carry-over dropped that bullet, day N+2 would re-raise it as
+    # new, so the report would alternate raise/demote forever.
+    demoted = (
+        "**Yesterday**\n- quiet.\n\n**Next Steps & Blockers**\n"
+        "- CARRY-DEMOTED detector blind on two legs (still open since 2026-03-10).\n"
+        "- NOT-CARRIED: approve the proposal.\n"
+    )
+    lines = MorningReportGenerator._carryover_lines(demoted)
+    assert lines == ["- CARRY-DEMOTED detector blind on two legs (still open since 2026-03-10)."]
+
+
+@pytest.mark.parametrize(
+    "header", ["**Urgent**", "**Urgent:**", "🚨 **Urgent**", "**The Urgent**", "## Urgent"]
+)
+def test_carryover_recognises_urgent_header_spellings(header):
+    text = f"{header}\n- CARRY-ME\n\n**Yesterday**\n- NOT-CARRIED\n"
+    assert MorningReportGenerator._carryover_lines(text) == ["- CARRY-ME"]
+
+
+def test_star_bullets_inside_urgent_are_carried():
+    text = "**Urgent**\n* CARRY-STAR\n  - CARRY-SUB\n\n**Yesterday**\n* NOT-CARRIED\n"
+    assert MorningReportGenerator._carryover_lines(text) == ["* CARRY-STAR\n  - CARRY-SUB"]
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("**Urgent**\n- Storage fault\n  recovery needs approval\n**Next Steps**\n- Routine", [
+        "- Storage fault\n  recovery needs approval",
+    ]),
+    ("**Next Steps**\n- Pending request\n  (still open since 2026-03-10)\n- Routine", [
+        "- Pending request\n  (still open since 2026-03-10)",
+    ]),
+    ("**Next Steps**\n- Pending (still open\n  since 2026-03-10)\n- Routine", [
+        "- Pending (still open\n  since 2026-03-10)",
+    ]),
+    ("**Next Steps**\n- Pending request\n  BLOCKER: owner decision\n  - retained detail", [
+        "- Pending request\n  BLOCKER: owner decision\n  - retained detail",
+    ]),
+    ("**Urgent**\n- Fault\nlazy continuation\n\nOrdinary paragraph\n**Next Steps**\n- Routine", [
+        "- Fault\nlazy continuation",
+    ]),
+    ("**Urgent**\n- Fault\n\n  **Recovery detail**\n  remains needed\n**Next Steps**", [
+        "- Fault\n\n  **Recovery detail**\n  remains needed",
+    ]),
+    ("**Urgent**\n- Fault\n  first cause\n- Fault\n  second cause\n- Fault\n  first cause", [
+        "- Fault\n  first cause", "- Fault\n  second cause",
+    ]),
+    ("**Next Steps**\n- Deploy lag is never a BLOCKER, routine maintenance\n- BLOCKERISH text", []),
+])
+def test_carryover_preserves_logical_bullet_blocks(text, expected):
+    assert MorningReportGenerator._carryover_lines(text) == expected
+
+
+@pytest.mark.parametrize("tag", ["BLOCKER:", "**BLOCKER:**", "**BLOCKER**:"])
+def test_carryover_recognises_explicit_blocker_tags(tag):
+    item = f"- {tag} owner decision\n  before recovery"
+    assert MorningReportGenerator._carryover_lines("**Next Steps**\n" + item) == [item]
+
+
+def test_carryover_retains_the_templates_complete_blocker():
+    template = _mr_mod._PROMPT_PATH.read_text(encoding="utf-8")
+    item = next(line for line in template.splitlines() if line.startswith("- BLOCKER: the champion"))
+    start = template.index(item)
+    block = "\n".join(template[start:].splitlines()[:2])
+    assert block in MorningReportGenerator._carryover_lines("**Next Steps & Blockers**\n" + block)
+
+
+def test_a_bold_bullet_is_an_item_not_a_header():
+    text = "**Urgent**\n- **Backup failed**\n- CARRY-SECOND\n"
+    assert MorningReportGenerator._carryover_lines(text) == [
+        "- **Backup failed**",
+        "- CARRY-SECOND",
+    ]
+
+
+def test_template_carries_the_carryover_and_deploy_lag_rules():
+    text = _mr_mod._PROMPT_PATH.read_text(encoding="utf-8")
+    assert "Previous Report Carry-over" in text
+    assert "say what changed" in text
+    assert "still genuinely urgent" in text
+    # Deploy lag is routine maintenance, never a lead alarm or BLOCKER by itself.
+    assert "Deploy lag" in text
+    assert "never Urgent and never a BLOCKER" in text
