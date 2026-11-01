@@ -11,7 +11,7 @@ dependencies = [
     "regex",  # procedure_advisor runs author regexes with a per-pattern timeout (re has none)
     "tzlocal>=5",  # transitive dep of apscheduler (ego/cadence uses the local-timezone path); declare so a clean/cached install can't drop it
     "python-telegram-bot>=21.0",
-    "litellm==1.93.2",  # pinned EXACTLY — 1.82.7/1.82.8 contained malware, so never float.
+    "litellm==1.100.4",  # pinned EXACTLY — 1.82.7/1.82.8 contained malware, so never float.
                        # 1.93.2 admits Python 3.14 and fixes PYSEC-2026-4066, which is
                        # present in 1.93.0. pip-audit, 2026-10-13: no known
                        # advisories. Like every current release it caps Requires-Python <3.15,
