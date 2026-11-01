@@ -78,7 +78,7 @@ editable_install_guarded() {
     return 2
 }
 
-# reinstall_damaged_distributions <repo_dir> <venv_path>
+# reinstall_damaged_distributions <repo_dir> <venv_path> [lib_dir]
 #
 # Reinstalls, at the version already installed and with --no-deps, every
 # distribution whose recorded files an upgrade deleted (lib/venv_missing_files.py
@@ -90,13 +90,121 @@ editable_install_guarded() {
 reinstall_damaged_distributions() {
     local repo_dir="$1"
     local venv_path="$2"
+    local lib_dir="${3:-$repo_dir/scripts/lib}"
     local spec
-    "$venv_path/bin/python" -P "$repo_dir/scripts/lib/venv_missing_files.py" 2>/dev/null \
+    "$venv_path/bin/python" -P "$lib_dir/venv_missing_files.py" 2>/dev/null \
         | while IFS= read -r spec || [ -n "$spec" ]; do
             [ -n "$spec" ] || continue
             echo "    Reinstalling $spec: an upgrade deleted files it owns"
             "$venv_path/bin/pip" install --quiet --no-deps --force-reinstall "$spec" 2>&1 | tail -1 || true
         done || true
+}
+
+# with_browser_stack_lock <command> [args...]
+#
+# Runs the command under the browser-stack unit's own lock: pip replacing
+# camoufox, playwright or patchright while a provisioning run uses them can mix
+# pins mid-install. Waits up to GENESIS_BROWSER_STACK_WAIT_S (default 7200, the
+# project's step floor) and returns 75 if the lock is still held. Without flock,
+# or a lock directory it can create, it runs the command unlocked.
+with_browser_stack_lock() {
+    local lock_dir="${GENESIS_HOME:-$HOME/.genesis}/locks"
+    local wait_s="${GENESIS_BROWSER_STACK_WAIT_S:-7200}"
+    if mkdir -p "$lock_dir" 2>/dev/null && command -v flock >/dev/null 2>&1; then
+        (
+            flock -w "$wait_s" 9 || {
+                echo "browser-stack: a provisioning run still holds its lock after ${wait_s}s; packages not changed" >&2
+                exit 75
+            }
+            "$@"
+        ) 9>"$lock_dir/browser-stack.lock"
+    else
+        "$@"
+    fi
+}
+
+# capture_venv_state <repo_dir> <venv_path> <out_file>
+#
+# Records the venv's installed packages (lib/venv_state.py) so a rollback can put
+# back exactly that set. Refuses (returns 1, nothing written) when the venv does
+# not import Genesis and its MCP stack: a broken venv recorded as "pre-update"
+# would be restored as if it worked. The two helpers the restore runs are copied
+# beside the record (<out without .json>.lib/): by the time a rollback restores,
+# the checkout is back at the old tag, which may predate them.
+capture_venv_state() {
+    local repo_dir="$1" venv_path="$2" out="$3" lib="${3%.json}.lib"
+    if ! "$venv_path/bin/python" -c "from genesis.runtime import GenesisRuntime; import genesis.mcp.health" 2>/dev/null; then
+        echo "  The installed packages do not import Genesis; they are not recorded for a rollback."
+        return 1
+    fi
+    if ! { mkdir -p -m 700 "$(dirname "$out")" && rm -rf "$lib" && mkdir -m 700 "$lib" \
+        && cp "$repo_dir/scripts/lib/venv_state.py" "$repo_dir/scripts/lib/venv_missing_files.py" "$lib/" \
+        && "$venv_path/bin/python" -P "$lib/venv_state.py" capture "$out"; }; then
+        rm -rf "$out" "$lib"
+        return 1
+    fi
+}
+
+# restore_venv_state <repo_dir> <venv_path> <record>
+#
+# Puts the venv back to the recorded package set, never to whatever the
+# checkout's version ranges resolve to today. Order, as measured on the
+# FastMCP 2 -> 4 split: remove what the update added (fastmcp-slim among it),
+# install the recorded versions with --no-deps, then reinstall any distribution
+# whose files the removals deleted, then re-point the checkout's editable install.
+# Under the browser-stack lock (it can replace browser packages). Returns 0 only
+# when the installed set equals the record AND Genesis and its MCP stack import;
+# anything else is 1, with what differs printed. Editables other than the
+# checkout are never touched. Versions no longer installed need the package
+# index or pip's cache: offline, that is reported as a failure, not masked.
+restore_venv_state() {
+    with_browser_stack_lock _restore_venv_state_unlocked "$@"
+}
+
+_restore_venv_state_unlocked() {
+    local repo_dir="$1" venv_path="$2" record="$3"
+    local lib="${3%.json}.lib" py="$venv_path/bin/python" helper extras reqs diff
+    # The copy taken with the record; the checkout's own only for a record from
+    # before the copy existed.
+    [ -f "$lib/venv_state.py" ] || lib="$repo_dir/scripts/lib"
+    helper="$lib/venv_state.py"
+    extras="$("$py" -P "$helper" extras "$record")" || { echo "  Could not read the package record $record."; return 1; }
+    if [ -n "$extras" ]; then
+        echo "    Removing packages this update added: $(printf '%s ' $extras)"
+        # shellcheck disable=SC2086  # one distribution name per word
+        "$venv_path/bin/pip" uninstall --quiet -y $extras 2>&1 | tail -1 || true
+    fi
+    reqs="$(mktemp -p "$(dirname "$record")")" || return 1
+    if ! "$py" -P "$helper" requirements "$record" > "$reqs"; then
+        rm -f "$reqs"
+        echo "  Could not read the package record $record."
+        return 1
+    fi
+    # All or nothing: one version no source still carries installs none of them.
+    # verify below names what is missing; pip's own reason is printed here.
+    "$venv_path/bin/pip" install --quiet --no-deps -r "$reqs" 2>&1 | tail -3 || true
+    rm -f "$reqs"
+    reinstall_damaged_distributions "$repo_dir" "$venv_path" "$lib"
+    # Re-point the checkout's own editable install so its metadata (version,
+    # entry points) is the rolled-back checkout's. Build isolation stays on, as in
+    # bootstrap: the venv need not carry setuptools. A failure leaves the previous
+    # editable install in place (pip builds before it uninstalls), and the code is
+    # still imported from the checkout, so it is reported, not fatal.
+    local repoint
+    if ! repoint="$("$venv_path/bin/pip" install --quiet --no-deps -e "$repo_dir" 2>&1)"; then
+        echo "  WARNING: the checkout's install metadata was not refreshed (its version may read as the update's):"
+        printf '%s\n' "$repoint" | tail -3 | sed 's/^/    /'
+    fi
+    if ! diff="$("$py" -P "$helper" verify "$record")"; then
+        echo "  The packages do not match the pre-update record:"
+        printf '%s\n' "$diff" | head -20 | sed 's/^/    /'
+        return 1
+    fi
+    if ! "$py" -c "from genesis.runtime import GenesisRuntime; import genesis.mcp.health" 2>/dev/null; then
+        echo "  The packages match the pre-update record, but Genesis does not import."
+        return 1
+    fi
+    return 0
 }
 
 # install_browser_extra <repo_dir> <venv_path>
@@ -120,21 +228,7 @@ install_browser_extra() {
     # Under the browser-stack unit's own lock: pip replacing camoufox, playwright or
     # patchright while a provisioning run uses them can mix pins mid-install. Waits
     # up to GENESIS_BROWSER_STACK_WAIT_S (default 7200, the project's step floor).
-    local lock_dir="${GENESIS_HOME:-$HOME/.genesis}/locks"
-    local wait_s="${GENESIS_BROWSER_STACK_WAIT_S:-7200}"
-    if mkdir -p "$lock_dir" 2>/dev/null && command -v flock >/dev/null 2>&1; then
-        if ! (
-            flock -w "$wait_s" 9 || {
-                echo "browser-stack: a provisioning run still holds its lock after ${wait_s}s; browser packages not changed" >&2
-                exit 75
-            }
-            editable_install_guarded "$repo_dir" "$venv_path" browser
-        ) 9>"$lock_dir/browser-stack.lock"; then
-            return 1
-        fi
-    else
-        editable_install_guarded "$repo_dir" "$venv_path" browser || return 1
-    fi
+    with_browser_stack_lock editable_install_guarded "$repo_dir" "$venv_path" browser || return 1
     # The checkout's ranges, not the installed metadata a failed pip left behind.
     "$venv_path/bin/python" -m genesis.browser.provision check-packages --pyproject "$repo_dir/pyproject.toml"
 }

@@ -79,6 +79,23 @@ stopping services or changing code, retaining the original `.pre-update` snapsho
 Migration rollback uses the guarded candidate; an incomplete database rollback
 does not explicitly restart services. External watchdog recovery is unchanged.
 
+Update also records the venv's installed packages before it changes anything
+(`~/.genesis/update-deps/<rollback tag>.json`, written only when the venv imports
+Genesis), with a copy of the helper scripts the restore runs beside it
+(`<rollback tag>.lib/`), since by then the checkout is back at the old tag. A rollback restores exactly that set: it removes what the update
+added, reinstalls the recorded versions without resolving, repairs any package
+whose files the removals deleted, and succeeds only when the installed set
+matches the record and Genesis imports. The checkout's own editable install is
+recorded by name only and re-pointed at the rolled-back checkout, never pinned
+to a version. Without a record it falls back to reinstalling the old checkout,
+which must then also import. A version no longer in the package index or pip's
+cache cannot be restored offline: the rollback reports itself incomplete, keeps
+the record (`disk_hygiene.sh` removes it after 30 days) and re-resolves the old
+version ranges as salvage, so the restarted services get the best set
+available. The restore waits at most 600 s for a browser provisioning run's
+lock, since the services are stopped meanwhile. A `--post-merge` run keeps the
+record the conflicted run took before its merge.
+
 Guardian whole-container snapshot rollback is different: its existing second
 approval prompt warns that saved peer permissions, jobs and consent return.
 Approving that specific action explicitly reauthorizes the saved peers. Both

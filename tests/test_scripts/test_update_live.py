@@ -198,6 +198,8 @@ def _engine_script(root: Path, script_dir: Path, base: str, mu: str, pre: str = 
         '_STATE_WRITTEN=0\n_STATE_PHASE=""\n_LIVE_ENGINE_RAN=0\nCALLS="$HOME/calls"\n'
         'VENV_DIR="$HOME/venv"\nmkdir -p "$VENV_DIR/bin" "$HOME/.genesis/locks"\n'
         'printf \'#!/bin/sh\\nexit 0\\n\' > "$VENV_DIR/bin/pip"\nchmod +x "$VENV_DIR/bin/pip"\n'
+        # A healthy venv: the rollback's package step also checks the import.
+        'printf \'#!/bin/sh\\nexit 0\\n\' > "$VENV_DIR/bin/python"\nchmod +x "$VENV_DIR/bin/python"\n'
         'exec {_UPDATE_LOCK_FD}>"$HOME/.genesis/locks/update.lock"\nflock -n "$_UPDATE_LOCK_FD"\n'
         + mu
         + "".join(
