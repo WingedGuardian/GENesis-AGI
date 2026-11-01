@@ -195,7 +195,7 @@
     },
     {
       "name": "browser_fill_card",
-      "description": "Pay with a vault card on the open Camoufox checkout after the owner's\nTelegram tap; fills in a separate window and clicks Pay itself. Card values\nnever reach you. Usage and limits: the browser-automation skill, \"Money\".\n\ncard_ref: card_ + 12 hex. amount: the total as the page shows it, digits\nincluded; with save, the subtotal before the card, one price with its\ncurrency symbol. fields: kind -> CSS selector or {\"selector\", \"frames\":\n[iframe selector, ...]}; kinds number (required), expiry or exp_month +\nexp_year, cvc, name or first_name + last_name, postal_code. pay: the Pay\nbutton, same shape. Selectors: printable plain CSS (no ``>>``, engine=\nprefix, quoted text or XPath), each in the frame its chain names.\nexpiry_format: MM/YY, MM / YY, MM-YY, MMYY, MM/YYYY or MMYYYY.\nextra_fields: name -> {\"selector\", \"value\"} (+ \"frames\": the top document\nor a frame holding a card field); names email, name, phone, address_line1,\naddress_line2, city, region, postal_code, country, company. No \"value\":\nread from card_fill.billing in the payments config.\nsteps: up to 8 clicks, same shape, before anything is read; no checkbox.\nconsent: up to 2 checkboxes, ticked only after the tap.\nsave: the control that stores the card, clicked before Pay. amount_max\n(needs save): the ceiling the tap approves, amount's currency; Pay only if\namount <= total <= amount_max. total (needs save): the total's element;\ndefault Pay's label.\n\nReturns {code, status, host} (+ filled, field, reason where they apply).\nsubmitted_unverified: check the order. challenge, card_url_blocked,\ncard_url_leaked, pay_click_unknown, outcome_unknown, moved_while_filling,\ncard_url_before_pay, card_value_in_request, and any code after a save: do\nNOT retry; tell the owner. Refused while card fill is off or another\npayment runs.",
+      "description": "Pay with a vault card on the open Camoufox checkout after the owner's\nTelegram tap; fills in a separate window and clicks Pay itself. Card values\nnever reach you. Usage and limits: the browser-automation skill, \"Money\".\n\ncard_ref: card_ + 12 hex. amount: the total as the page shows it, digits\nincluded; with save, the subtotal before the card, one price with its\ncurrency symbol. fields: kind -> CSS selector or {\"selector\", \"frames\":\n[iframe selector, ...]}; kinds number (required), expiry or exp_month +\nexp_year, cvc, name or first_name + last_name, postal_code. pay: the Pay\nbutton, same shape. Selectors: printable plain CSS (no ``>>``, engine=\nprefix, quoted text or XPath), each in the frame its chain names.\nexpiry_format: MM/YY, MM / YY, MM-YY, MMYY, MM/YYYY or MMYYYY.\nextra_fields: name -> {\"selector\", \"value\"} (+ \"frames\": the top document\nor a frame holding a card field); names email, name, phone, address_line1,\naddress_line2, city, region, postal_code, country, company. No \"value\":\nread from card_fill.billing in the payments config.\nsteps: up to 8 clicks, same shape, before anything is read; no checkbox.\nconsent: up to 2 checkboxes, ticked only after the tap.\nsave: the control that stores the card, clicked before Pay. amount_max\n(needs save): the ceiling the tap approves, amount's currency; Pay only if\namount <= total <= amount_max. total (needs save): the total's element;\ndefault Pay's label. success: a top-document selector for a result the\ncheckout shows in place after Pay (no page change); shown and steady with\nPay gone, it gives submitted_in_place.\n\nReturns {code, status, host} (+ filled, field, reason where they apply).\nsubmitted_unverified: check the order. submitted_in_place, challenge, card_url_blocked,\ncard_url_leaked, pay_click_unknown, outcome_unknown, moved_while_filling,\ncard_url_before_pay, card_value_in_request, and any code after a save: do\nNOT retry; tell the owner. Refused while card fill is off or another\npayment runs.",
       "inputSchema": {
         "properties": {
           "card_ref": {
@@ -307,6 +307,17 @@
               {
                 "additionalProperties": true,
                 "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "success": {
+            "anyOf": [
+              {
+                "type": "string"
               },
               {
                 "type": "null"
@@ -1429,6 +1440,10 @@
           "source_session": {
             "default": "",
             "type": "string"
+          },
+          "request_key": {
+            "default": "",
+            "type": "string"
           }
         },
         "required": [
@@ -1885,6 +1900,59 @@
         "required": [
           "question_id",
           "resolution"
+        ],
+        "type": "object"
+      },
+      "outputSchema": {
+        "additionalProperties": true,
+        "type": "object"
+      }
+    },
+    {
+      "name": "pr_verification_close",
+      "description": "Derive a verification result; server calibration policy can force preview.\n\nPreview never changes the obligation. After an uncertain real response,\nre-read evidence/attempt_count before retrying: attempts are not idempotent.",
+      "inputSchema": {
+        "properties": {
+          "evidence_json": {
+            "type": "string"
+          },
+          "pr": {
+            "type": "integer"
+          },
+          "park": {
+            "default": false,
+            "type": "boolean"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "verdict": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "dry_run": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "evidence_json",
+          "pr"
         ],
         "type": "object"
       },

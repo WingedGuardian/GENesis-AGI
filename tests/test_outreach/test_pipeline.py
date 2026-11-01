@@ -1589,7 +1589,8 @@ async def test_reply_preserves_full_thread_subject_in_mime(config, db, monkeypat
     monkeypatch.setattr("genesis.db.crud.email_threads.get_thread", AsyncMock(return_value={
         "recipient": "recipient@example.com", "subject": original,
     }))
-    await mcp_mod.outreach_send.fn(
+    send = (await mcp_mod.mcp.get_tool("outreach_send")).fn
+    await send(
         message="Following up.", category="notification", channel="email",
         thread_id="t1", salience_score=1.0,
     )

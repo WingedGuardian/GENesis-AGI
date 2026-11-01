@@ -2038,7 +2038,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: fbb0b6f19 2026-10-21
+verified: 0a6c219a1 2026-10-31
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -2049,6 +2049,26 @@ verified: fbb0b6f19 2026-10-21
   host reconcilers that share its version probe run on any branch).
   Config `~/.genesis/guardian_remote.yaml`; missing → silently
   disabled.
+- **Snapshot deletion window** (`guardian/deletion_window.py`): routine
+  snapshot deletions (the superseded healthy snapshot, prune, and what incus
+  would expire before the next window) wait for `snapshots.deletion_window`,
+  default 05:00-07:00 in the user's timezone, because deleting a large btrfs
+  subvolume can stall filesystem commits for minutes under quota accounting.
+  The healthy snapshot is still created on its cadence. Reserve relief and
+  delete-first never wait; early relief waits only while the pool stays above
+  its reserve until the window opens. `any` restores immediate scheduling.
+  With the window enabled, each routine deletion rechecks the live clock
+  after reserving its cooldown;
+  a failed deletion stops the batch. Read-only attempts use
+  `.last_window_attempt` for retry pacing and do not stamp pool relief's
+  `last_action`; only actual deletion candidates reserve that shared cooldown.
+  A window closing during stamp IO may leave a conservative cooldown without
+  starting a delete. DST opening calculations search real UTC instants, so a
+  wholly skipped window waits for the next real occurrence and a repeated hour
+  remains one daily pass. These are simulated-host contract tests; deployment
+  and live-host validation remain separate. Incus expiry preemption covers
+  owned non-healthy snapshots present at the pass; missed/first windows and
+  snapshots created later with short expiries can still expire outside it.
 - **Shared backup decryption (development candidate)**: the standalone
   `guardian/cred_integrity.py` file authenticates one passphrase-encrypted,
   integrity-protected message for credential recovery and backup/restore.
