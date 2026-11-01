@@ -1,0 +1,14 @@
+# Exact versions of the test tools CI runs with, applied as a pip constraint
+# (`pip install -e ".[test,...]" -c .github/test-tools/requirements.txt`).
+#
+# CI ONLY. User installs keep pyproject.toml's `[test]` ranges. Pinning here means
+# a new pytest release cannot turn main red between a PR's CI run and its merge
+# (pytest 9.2.0 did, 2026-10-27). Dependabot opens a weekly bump PR for this
+# folder alone (.github/dependabot.yml), so a breaking release fails on that PR
+# instead of on main. Two installs float on purpose: ci.yml's dependency-audit
+# job (it audits what a fresh user install resolves) and the dispatch-only
+# runner-benchmark.yml (it measures the floating tree). The test file
+# tests/test_scripts/test_ci_test_tool_pins.py lists them.
+pytest==9.2.0
+pytest-asyncio==1.4.1
+pytest-timeout==2.4.0

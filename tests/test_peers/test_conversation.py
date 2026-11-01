@@ -967,15 +967,37 @@ async def test_a_send_burst_does_identity_work_only_within_capacity(bridge, monk
 async def test_missing_partial_symlink_and_whole_result_scan(bridge):
     row = await settle(bridge, await bridge.service.send(bridge.identities["alpha"], incoming()))
     path = bridge.home / ".genesis/output" / f"bg-session-{row['id']}.md"
-    path.write_text("benign prefix\n" + json.dumps({"password": "syntheticcredential"}))
+    # A plainly keyed credential is redacted in place; a private path passes.
+    path.write_text("see /home/someone/notes\n" + json.dumps({"password": "syntheticcredential"}))
     meta = json.loads(row["metadata"])
     meta["result_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()  # as committed
     row["metadata"] = json.dumps(meta)
-    with pytest.raises(ConversationRefusal, match="disclosure_refused"):
-        full_result(row)
+    text = full_result(row)
+    assert "syntheticcredential" not in text
+    assert '"password": "[redacted:json_credential]"' in text
+    assert "/home/someone/notes" in text
     meta["output_text"] = path.read_text()
     row["metadata"] = json.dumps(meta)
+    view = project(row)
+    assert "syntheticcredential" not in json.dumps(view)
+    assert view["metadata"]["replyRedacted"] == ["json_credential"]
+    # One the redactor cannot see (an escaped key) still withholds the reply.
+    escaped = "".join(f"\\u{ord(c):04x}" for c in "password")
+    path.write_text('benign prefix\n{"' + escaped + '": "syntheticcredential"}')
+    meta["result_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    meta["output_text"] = path.read_text()
+    row["metadata"] = json.dumps(meta)
+    with pytest.raises(ConversationRefusal, match="disclosure_refused"):
+        full_result(row)
     assert "message" not in project(row)["status"]
+    # Withheld despite a redaction: the redacted pattern names are not disclosed.
+    path.write_text(path.read_text() + "\npassword=syntheticsecondvalue")
+    meta["result_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    meta["output_text"] = path.read_text()
+    row["metadata"] = json.dumps(meta)
+    withheld = project(row)
+    assert withheld["metadata"]["replyError"] == "disclosure_refused"
+    assert "replyRedacted" not in withheld["metadata"]
     other = bridge.home / "external-result"
     path.rename(other)
     path.symlink_to(other)

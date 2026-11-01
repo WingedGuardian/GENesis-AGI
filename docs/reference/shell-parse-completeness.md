@@ -1,5 +1,30 @@
 # Shared shell parser completeness
 
+For a scanner call whose input contains no literal `#`, the unquoted scanner
+consumes a backslash and its following non-newline character as word data,
+retaining both source bytes for later shell decoding. Escaped quotes/operators
+then cannot change scanner quote/operator state. Hash-containing calls retain
+the earlier scanner behavior, avoiding a new comment/quote regression. A decoded
+hash-free child may still gain the repair even when its parent contains `#`.
+Backslash-newline retains the existing continuation handling. No input rewriting,
+new tokenizer, larger limit or generic tokenization exemption is added.
+
+This is a partial repair: #3257 and #3264 remain open for their broader
+hash/escape and substitution classes. A separate, later validator change is
+planned to refuse commands containing both literal `#` and backslash before
+parsing; nothing in this tree does so yet, and ordinary clients would not acquire
+that refusal. Use body files for data; the parser does not claim complete Bash
+grammar or process isolation.
+
+One new refusal follows from the repair, in the fail-closed direction. The
+substitution scanner (`_substitution_spans`) has no unquoted-backslash rule, so
+a segment the scanner now keeps whole, such as `echo \`id\``, yields a
+backtick body ending in a backslash that cannot be tokenized, and the call is
+reported blind. Hash-free commands that pair an escaped quote with escaped
+backticks, for example `echo It\'s; echo \`git push\``, parsed before and are
+now refused; `echo \`id\`; curl x` alone was already refused. #3635 tracks
+giving the substitution scanner the same backslash rule.
+
 `analyze_checked` withholds segments when a length/depth bound, continuation,
 built escape, unreadable nested syntax or hidden heredoc suffix makes them
 unreliable. Legacy `analyze` still returns its best-effort segments. Structural
@@ -35,3 +60,10 @@ This is accident prevention, not a complete Bash interpreter or OS containment.
 
 Tests retain both the current heredoc protections and nested-completeness cases,
 plus combined-state recovery and the accepted extra-refusal boundary.
+Real Bash shim tests cover escaped quotes, operators and word characters across
+direct/nested scripts and command separators. The hash-free escaped-word
+property is positive; the broader property retains its strict known hash-case
+failure with an explicit witness. Comment/quote witnesses retain actual owned
+execution receipts. One former escaped-double-quote substitution reproduction
+also now surfaces its suffix; this does not establish that every substitution
+quote case is fixed. The paired opposite-quote gap remains explicitly tracked.

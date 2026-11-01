@@ -226,3 +226,22 @@ def test_the_mask_absent_probe(page):
     page.evaluate("() => document.getElementById('__genesis_payment_mask__').remove()")
     # The observer puts it back before any later task can look.
     assert page.evaluate(pc._MASK_ABSENT_JS) is False
+
+
+def test_the_label_point_is_clicked_where_it_was_checked_on_a_bordered_label(page):
+    # A 100px left border, plain text, then a link: the first point clear of the
+    # border sits on the text 25px in, and measured from the border edge instead
+    # it would be clicked 100px further right, on the link.
+    lab = _el(
+        page,
+        "<input type=checkbox id=c><label id=l for=c style='display:block;width:300px;"
+        "border-left:100px solid #000;padding:0'><span style='display:inline-block;"
+        "width:50px'>I agree</span><a href='#terms' style='display:inline-block;"
+        "width:200px'>to the terms</a></label>",
+        "#l",
+    )
+    point = lab.evaluate(pc._LABEL_POINT_JS)
+    assert point is not None and point["x"] < 50
+    lab.check(position=point, timeout=5000)
+    assert page.evaluate("document.getElementById('c').checked") is True
+    assert page.evaluate("location.hash") == ""

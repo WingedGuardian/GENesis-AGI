@@ -70,7 +70,7 @@ historical observations remain usable.
 
 ## Live queries
 
-`query.connect(data)` binds all raw tables to one captured source selection.
+`query.connect(data, live=True)` binds all raw tables to one captured source selection.
 DuckDB's later lazy reads and query evidence use those same immutable paths and
 metadata. Live and deduplicated views retain the existing reconciliation rules;
 hooks/events aggregate scrub failures over every copy. Recomputed tool latency
@@ -107,4 +107,65 @@ historical identity is unresolved, not attributed to a current executor.
 Each connection uses its own 0700 spill directory under `TA_DUCKDB_TMP` or
 `~/tmp/transcript-analytics/duckdb`; an unowned or symlinked root is rejected.
 The independent storage tests require no query/reconciliation modules.
-Disposable snapshots follow in the dependent B part of #3425.
+
+## Disposable snapshots
+
+`derive.build(data)` holds the same writer flock while capturing the sources
+and writing all thirty shared derived and reconciliation views into `derived/.staging/<stamp>/`.
+It fsyncs every Parquet file, the manifest and the directory, publishes the
+complete `derived/<stamp>/`, then atomically replaces `derived/current`.
+The immediately previous snapshot is retained; older cache directories and
+interrupted staging are disposable. No durable source is removed by a build.
+Rebuilding removes malformed staging and selector entries by their actual type;
+cache symlinks are unlinked without inspecting or deleting their targets.
+
+`query.connect(data)` and `run_query` prefer a snapshot whose manifest matches
+both the current views version and the captured inputs signature. Every table
+is read completely into connection-private DuckDB tables in one transaction,
+with its schema checked against the manifest. A missing, corrupt, unreadable,
+incompatible or stale snapshot rolls back, emits one `snapshot_fallback` event,
+and the derived views are computed live over the same captured source
+selection instead. This also catches damaged data pages with intact Parquet
+footers. A successful connection
+no longer depends on disposable files, so cache cleanup cannot break later
+queries. Full reads trade connection-start work and private spill for catching
+all snapshot read errors before results reach the caller.
+
+Use `run_query(..., live=True)` for raw views. Without it a connection holds
+the derived views only, in both modes: when no snapshot is current, the live
+graph is built on a private connection and each derived view is read in full
+into the returned one. Raw views and reconciliation intermediates therefore
+never reach a `live=False` caller, the SQL text is never inspected, and a reader
+never takes the writer lock or writes the store. A cache miss computes every
+derived view, which costs several times more than a lazy read of one; snapshots
+built on a schedule keep misses rare. The copy uses lossless Arrow conversion,
+so column types match the snapshot's, and the two DuckDB instances share the
+caller's memory limit by halves while it runs. `live=False` is a consistency
+guarantee, not a security boundary: DuckDB file functions such as
+`read_parquet()` still read the per-source records. The private spill rules also
+apply to snapshot materialization. `derive.is_current` checks the complete
+cache, not just file existence.
+
+After backup restore, call `derive.discard_after_restore(data)`: it deletes
+only `derived/` and syncs its parent directory before returning, without changing source records, original stamps, root binding
+or inventory. Live queries work immediately and snapshots rebuild from durable
+records even when their original transcripts are permanently gone. Additional backup and restore command wiring is deferred; it does not gate
+collection, live search or opportunity scanning.
+
+## CLI status and verification
+
+Status captures accepted source records once for marker totals, coverage and the
+snapshot input signature. Concurrent collection can publish newer records while
+that response finishes; the captured metadata remains internally consistent.
+Status uses the same confined snapshot-selector boundary as the reader and does
+not load snapshot pages. SQL previews retain only their display limit, CSV streams
+in batches, and both preserve complete query counts in manifests. Default source
+and data paths honor `CLAUDE_HOME` and `GENESIS_HOME`; explicit paths remain chosen
+paths and the installed configuration is still required.
+An individual source stat or fingerprint failure is reported in `source_errors`
+and counted stale while status continues inspecting other sources. A source that
+vanishes before its initial stat keeps the existing skipped-source behavior.
+`verify` uses the same captured selection for the configured cache reader and
+forced live reader, one connection at a time. It compares schema, row counts and
+row digests for every shared relation. Missing, stale or unreadable caches report
+unavailable rather than passing a comparison of live views with themselves.

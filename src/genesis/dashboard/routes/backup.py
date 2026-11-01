@@ -37,7 +37,6 @@ logger = logging.getLogger(__name__)
 _HOME = Path.home()
 _STATUS_FILE = _HOME / ".genesis" / "backup_status.json"
 _BACKUP_SCRIPT = _HOME / "genesis" / "scripts" / "backup.sh"
-_BACKUP_LOG = _HOME / "genesis" / "logs" / "backup.log"
 _BACKUP_DIR = _HOME / "backups" / "genesis-backups"
 
 # Systemd user units (source of truth for the backup schedule).
@@ -914,12 +913,46 @@ def backup_trigger():
 
 @blueprint.route("/api/genesis/backup/log")
 def backup_log():
-    """Return the last N lines of backup log."""
-    if not _BACKUP_LOG.is_file():
-        return jsonify({"lines": [], "error": "Log file not found"})
+    """Return the latest service invocation's full journal to a verified operator."""
+    if not has_verified_credential():
+        return jsonify({"lines": [], "error": "Authentication required to view backup logs"}), 403
+
+    service = _systemctl("show", _SERVICE_UNIT, "--property=InvocationID", "--value")
+    if service is None or service.returncode != 0:
+        return jsonify({"lines": [], "error": "Could not identify the latest backup run"}), 503
+    invocation = service.stdout.strip()
+    if not re.fullmatch(r"[0-9a-f]{32}", invocation):
+        return jsonify({"lines": [], "error": "No backup service invocation is available"}), 503
 
     try:
-        lines = _BACKUP_LOG.read_text().splitlines()
-        return jsonify({"lines": lines[-50:]})
-    except OSError as exc:
-        return jsonify({"lines": [], "error": str(exc)})
+        journal = subprocess.run(
+            [
+                "journalctl",
+                "--user",
+                "--unit",
+                _SERVICE_UNIT,
+                f"_SYSTEMD_INVOCATION_ID={invocation}",
+                "--no-pager",
+                "--output=cat",
+                "--all",
+                "--quiet",
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=5,
+            env=systemctl_env(),
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return jsonify({"lines": [], "error": "Could not read the backup journal"}), 503
+    if journal.returncode != 0:
+        return jsonify({"lines": [], "error": "Could not read the backup journal"}), 503
+
+    result = {
+        "lines": journal.stdout.splitlines(),
+        "source": "journal",
+        "invocation_id": invocation,
+    }
+    if not result["lines"]:
+        result["error"] = "No journal entries are available for the latest backup run"
+    return jsonify(result)

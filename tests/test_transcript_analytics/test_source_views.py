@@ -42,7 +42,7 @@ def test_real_lazy_reader_survives_two_newer_publications(tmp_path, monkeypatch,
     def table_path(record, table):
         binding = (
             reader_thread and threading.get_ident() == reader_thread[0]
-            and sys._getframe(1).f_code is query.connect.__code__
+            and sys._getframe(1).f_code is query._install_live.__code__
         )
         if binding and pause_point == "between_tables" and table == TABLES[1]:
             paused.set()
@@ -56,7 +56,7 @@ def test_real_lazy_reader_survives_two_newer_publications(tmp_path, monkeypatch,
 
     def read():
         reader_thread.append(threading.get_ident())
-        with query.connect(data) as con:
+        with query.connect(data, live=True) as con:
             captured = query._READS[con]["inputs_signature"]
             if pause_point == "after_connection":
                 paused.set()
@@ -91,7 +91,7 @@ def test_genuine_historical_rows_remain_usable_without_originals(tmp_path, label
     shutil.copytree(Path(__file__).with_name("fixtures") / label, data, symlinks=True)
     assert not list(tmp_path.rglob("*.jsonl"))
     record = store.select_sources(data)[0][0]
-    with query.connect(data) as con:
+    with query.connect(data, live=True) as con:
         assert con.execute(
             "select command,is_error,scrub_failed from tool_calls"
         ).fetchall() == [("echo historical", True, True)]

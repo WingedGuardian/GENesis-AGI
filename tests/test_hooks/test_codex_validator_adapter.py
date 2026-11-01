@@ -109,7 +109,7 @@ def test_foreground_opener_matches_bash_scope(adapter, tmp_path, label, body, ch
 def test_shell_preserves_command_and_native_ids_but_replaces_cwd(adapter, tmp_path, quote):
     command = f"cd {quote}{tmp_path}{quote} || exit\nprintf '$HOME; untouched'"
     calls = adapter.prepare(payload(command, cwd="/not-execution-cwd"))
-    assert len(calls) == 15
+    assert len(calls) == 16
     for argv, data, budget in calls:
         assert data["tool_input"]["command"] == command
         assert data["cwd"] == str(tmp_path)
@@ -119,6 +119,8 @@ def test_shell_preserves_command_and_native_ids_but_replaces_cwd(adapter, tmp_pa
         assert "main_checkout_guard.py" not in " ".join(argv)
     push = [c for c in calls if "git_push_guard.py" in " ".join(c[0])]
     assert len(push) == 1 and push[0][2] == 5
+    role = [c for c in calls if "validator_role_guard.py" in " ".join(c[0])]
+    assert len(role) == 1 and role[0][2] == 8
 
 
 def patch(*paths):
@@ -271,7 +273,7 @@ def test_guards_execute_concurrently_and_whole_call_is_bounded(adapter, monkeypa
 
     monkeypatch.setattr(adapter, "run_guard", child)
     assert "advisory" in asyncio.run(adapter.evaluate(payload()))
-    assert len(started) == 15
+    assert len(started) == 16
     monkeypatch.setattr(adapter, "OVERALL_BUDGET", .02)
     started.clear()
     async def hung(*args):

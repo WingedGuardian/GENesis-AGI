@@ -162,7 +162,7 @@ async def _write(monkeypatch, origin_env, **kwargs):
                 monkeypatch.delenv("GENESIS_SESSION_ORIGIN", raising=False)
             else:
                 monkeypatch.setenv("GENESIS_SESSION_ORIGIN", origin_env)
-            tools = await mcp.get_tools()
+            tools = {tool.name: tool for tool in await mcp.list_tools()}
             obs_id = await tools["observation_write"].fn(content="c", **kwargs)
             cur = await db.execute(
                 "SELECT source, type, category, priority, origin_class FROM observations "

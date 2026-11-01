@@ -11,6 +11,8 @@ on:
       - 'tests/test_scripts/test_ego_owned_*.py'
       - 'src/genesis/db/crud/ego.py'
       - 'src/genesis/db/schema/**'
+      - 'src/genesis/eval/qualification/evidence.py'
+      - 'src/genesis/util/atomic.py'
   workflow_dispatch:
 
 permissions:

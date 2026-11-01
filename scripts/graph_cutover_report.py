@@ -70,6 +70,35 @@ def read_lost_writes(path: Path) -> list[str]:
         return []
 
 
+#: Which leg of a read a timeout's frames put the wait in, by redis-py's own
+#: function names (8.1.0; a test pins each name to the installed client).
+#: Checked in order: a send on a connection that lost its socket reconnects
+#: INSIDE the reply call (`send_packed_command`), so its stack names both and
+#: must read as a connect.
+PHASE_FRAMES: dict[str, frozenset[str]] = {
+    "construct": frozenset({"_graph"}),
+    "connect": frozenset(
+        {
+            "get_connection",
+            "ensure_connection",
+            "connect",
+            "connect_check_health",
+            "_connect",
+            "on_connect_check_health",
+        }
+    ),
+    "reply": frozenset({"_send_command_parse_response", "parse_response"}),
+}
+
+
+def _phase(frames: list) -> str:
+    names = {str(f) for f in frames}
+    for phase, marks in PHASE_FRAMES.items():
+        if names & marks:
+            return phase
+    return "unknown"
+
+
 def _cause(event: dict) -> str:
     """One reset event's own account of itself, written at the moment it broke
     the clock (``graph_telemetry._moment`` plus the store's ``.diag``)."""
@@ -88,6 +117,21 @@ def _cause(event: dict) -> str:
         parts.append(f"{diag['query']} query")
     if isinstance(diag.get("frames"), list):
         parts.append("at " + ">".join(str(f) for f in diag["frames"]))
+        if "conn" in diag:
+            parts.append(f"phase {_phase(diag['frames'])}")
+        else:
+            # Four frames, no connection reading: a handshake and a reply wait
+            # end in the same reader frames, so the phase cannot be told.
+            phase = _phase(diag["frames"])
+            parts.append(
+                f"phase {phase}" if phase != "unknown"
+                else "phase unknown (predates the connection capture)"
+            )
+    if "conn" in diag:
+        # Printed with or without frames: a spent budget has none.
+        parts.append(f"conn {diag['conn'] or 'unknown'}")
+        if diag.get("in_use") is not None:
+            parts.append(f"in_use {diag['in_use']}")
     psi = diag.get("psi_stall_us") if isinstance(diag.get("psi_stall_us"), dict) else {}
     stalls = {k: v for k, v in psi.items() if v}
     if stalls:

@@ -125,3 +125,13 @@ async def test_grow_via_pipeline_limits_passes_mem_and_cpu():
         )
     assert out["ok"] is True
     assert coord.call_args.kwargs == {"mem_mib": 20480, "cpu": 4}
+
+
+@pytest.mark.asyncio
+async def test_send_and_wait_refuses_email():
+    pipe = AsyncMock()
+    out = await send_and_wait_via_pipeline(
+        pipe, message="approve?", category="blocker", channel="email", timeout_s=5,
+    )
+    assert out == {"status": "refused", "code": "use_outreach_send_for_email"}
+    pipe.submit_and_wait.assert_not_called()
