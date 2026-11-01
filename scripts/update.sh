@@ -1972,7 +1972,9 @@ try:
     src = sqlite3.connect(Path(source).resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
     # Check the snapshot BEFORE it overwrites anything: the backup copies pages
     # as they are, so a damaged snapshot would replace a consistent database.
-    if src.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+    # quick_check returns one row, "ok", for a sound file and one row per problem
+    # otherwise: the whole result is compared, not only its first row.
+    if src.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
         fail("the snapshot failed quick_check")
     # An empty or zero-byte file passes quick_check, and restoring it would empty
     # the live database; a Genesis database always has tables.
@@ -2010,7 +2012,7 @@ try:
 
     src.backup(dst, pages=-1, progress=progress, sleep=0.25)
     print("COMMITTED", flush=True)
-    if dst.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+    if dst.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
         fail("quick_check of the restored database did not return ok")
     if shape(dst) != shape(src):
         fail("the restored schema does not match the snapshot")
