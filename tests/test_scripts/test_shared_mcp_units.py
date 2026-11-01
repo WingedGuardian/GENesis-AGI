@@ -192,6 +192,17 @@ def test_same_invocation_after_the_restart_is_a_failure(tmp_path):
     assert r.returncode == 1
 
 
+@pytest.mark.parametrize("spec", ["loaded::active:active", "loaded:enabled::"])
+def test_a_loaded_unit_with_an_empty_state_answer_is_a_failure(tmp_path, spec):
+    # Devin, #3748: a loaded unit whose UnitFileState or ActiveState came back
+    # empty was skipped as if disabled, leaving an enabled service on old code.
+    root, home = _root(tmp_path)
+    r, calls = _run_lib(tmp_path, root, home, {MEM: spec})
+    assert r.returncode == 1
+    assert f"incomplete state for shared MCP unit {MEM}" in r.stdout
+    assert not _restarts(calls)
+
+
 def test_unreadable_unit_state_is_a_failure_not_an_absence(tmp_path):
     root, home = _root(tmp_path)
     r, calls = _run_lib(tmp_path, root, home, {}, unreadable={MEM})
