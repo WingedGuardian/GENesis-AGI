@@ -60,7 +60,7 @@ EXPECT_TIMEOUT_S = 5.0
 SQL_MAX_ROWS = 200
 LOG_MAX = 50
 _SAFE_PATH = "/usr/bin:/bin"
-_EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+_EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"  # pragma: allowlist secret
 
 #: Config that would make a git read run a program, fetch, or page. Each one
 #: was either measured running a program or names a program git can run.
