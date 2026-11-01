@@ -1357,3 +1357,121 @@ class TestSecondLayout:
     def test_a_long_line_span_is_bounded(self, guard_module):
         label = guard_module._one_safe_line("t (src/a.py:1-" + "9" * 3000 + ")")
         assert len(label) <= guard_module._GATE_TEXT_MAX_CHARS + 80 and "\n" not in label
+
+
+def _counted_bold(n: int | None, findings: list[str]) -> str:
+    """One second-layout section, its count stated or omitted, closed by its rule."""
+    header = "**⚠️ Outside diff range comments" + (f" ({n})" if n is not None else "") + "**"
+    return header + "\n\n" + "\n\n".join(findings) + "\n\n---\n"
+
+
+def _unparseable(title: str) -> str:
+    """A finding whose summary has no `· <code>path</code>` field: counted, never read."""
+    return f"<details>\n<summary>🟠 Major — {title}</summary><blockquote>\n\nWhy.\n\n</blockquote></details>"
+
+
+class TestPerSectionReconciliation:
+    """CodeRabbit, round 2 (c4433706819) plus its class audit: each counted
+    section is reconciled against ITS OWN entries. Body-wide totals let one
+    section's disagreement cancel another's, so the note never printed."""
+
+    def _run(self, guard_module, monkeypatch, no_inline, capsys, body):
+        monkeypatch.setenv("_TEST_GH_PR_REVIEW_BODIES", _review(body))
+        with no_inline:
+            block, _msg = guard_module._check_inline_review_findings("100")
+        assert block is False  # advisory either way
+        return capsys.readouterr().err
+
+    def test_a_countless_section_cannot_offset_a_counted_sections_gap(
+        self, guard_module, monkeypatch, no_inline, capsys
+    ):
+        # The reported case: totals 1 declared, 1 parsed, so nothing warned.
+        body = _counted_bold(None, [_em_finding("src/a.py", "1-2", "🟠 Major", "Seen")]) + (
+            "\n" + _counted_bold(1, [_unparseable("Hidden")])
+        )
+        err = self._run(guard_module, monkeypatch, no_inline, capsys, body)
+        assert "declares 1 finding(s), parsed 0" in err
+        assert "[outside-diff Major] Seen" in err
+
+    def test_two_counted_sections_cannot_cancel(self, guard_module, monkeypatch, no_inline, capsys):
+        over = _counted_bold(
+            1,
+            [
+                _em_finding("src/a.py", "1", "🟠 Major", "Real1"),
+                _em_finding("src/b.py", "2", "🔴 Critical", "Extra"),
+            ],
+        )
+        under = _counted_bold(
+            2, [_em_finding("src/b.py", "3", "🟡 Minor", "Real2"), _unparseable("Hidden")]
+        )
+        err = self._run(guard_module, monkeypatch, no_inline, capsys, over + "\n" + under)
+        assert "declares 1 finding(s) but 2 were parsed" in err
+        assert "declares 2 finding(s), parsed 1" in err
+        assert "Extra" not in err and "Real1" not in err  # the over-read section is quarantined
+        assert "[outside-diff Minor] Real2" in err  # the under-read one's entry is real
+
+    def test_a_countless_section_does_not_switch_off_the_surplus_check(
+        self, guard_module, monkeypatch, no_inline, capsys
+    ):
+        body = _counted_bold(None, []) + "\n" + _counted_bold(
+            1,
+            [
+                _em_finding("src/a.py", "1", "🟠 Major", "Real"),
+                _em_finding("src/b.py", "2", "🔴 Critical", "Extra"),
+            ],
+        )
+        err = self._run(guard_module, monkeypatch, no_inline, capsys, body)
+        assert "surplus entries indicate prose" in err
+        assert "Extra" not in err
+
+    def test_a_surplus_quarantines_only_its_own_section(
+        self, guard_module, monkeypatch, no_inline, capsys
+    ):
+        good = _counted_bold(1, [_em_finding("src/a.py", "1", "🟠 Major", "RealMajor")])
+        over = _counted_bold(
+            1,
+            [
+                _em_finding("src/b.py", "2", "🟡 Minor", "M1"),
+                _em_finding("src/b.py", "3", "🟡 Minor", "M2"),
+            ],
+        )
+        err = self._run(guard_module, monkeypatch, no_inline, capsys, good + "\n" + over)
+        assert "[outside-diff Major] RealMajor" in err
+        assert "M1" not in err and "M2" not in err
+
+    def test_the_two_layouts_cannot_cancel(self, guard_module, monkeypatch, no_inline, capsys):
+        bold = _counted_bold(
+            1,
+            [
+                _em_finding("src/a.py", "1", "🟠 Major", "B1"),
+                _em_finding("src/b.py", "2", "🟠 Major", "B2"),
+            ],
+        )
+        old = (
+            "<details>\n<summary>⚠️ Outside diff range comments (2)</summary><blockquote>\n\n"
+            + _entry("src/b.py", "3-3", "🟠 Major", "O1")
+            + "\n\n<details>\n<summary>junk</summary>\n</details>\n\n</blockquote></details>"
+        )
+        entries, declared, known, unreadable = guard_module._cr_outside_diff_entries(
+            bold + "\n" + old
+        )
+        assert (declared, known) == (3, True)
+        assert [e[3] for e in entries] == ["O1"]
+        assert unreadable == [
+            "outside-diff section declares 1 finding(s) but 2 were parsed — surplus entries "
+            "indicate prose mis-read as findings",
+            "outside-diff section declares 2 finding(s), parsed 1",
+        ]
+
+    def test_a_countless_first_layout_section_keeps_its_own_entries(
+        self, guard_module, monkeypatch, no_inline, capsys
+    ):
+        old = (
+            "<details>\n<summary>⚠️ Outside diff range comments</summary><blockquote>\n\n"
+            + _entry("src/a.py", "1-1", "🟠 Major", "OldSeen")
+            + "\n\n</blockquote></details>\n"
+        )
+        body = old + "\n" + _counted_bold(1, [_unparseable("Hidden")])
+        err = self._run(guard_module, monkeypatch, no_inline, capsys, body)
+        assert "[outside-diff Major] OldSeen" in err
+        assert "declares 1 finding(s), parsed 0" in err
