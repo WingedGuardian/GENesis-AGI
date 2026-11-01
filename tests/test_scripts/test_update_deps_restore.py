@@ -439,7 +439,18 @@ def test_verify_names_every_difference(setup):
     assert "changed fakemcp==1.0 -> fakemcp==2.0" in res.stdout, res.stdout
 
 
-@pytest.mark.parametrize("content", ["", "{}", '{"pinned": {}, "editable": []}', "not json"])
+@pytest.mark.parametrize(
+    "content",
+    [
+        "",
+        "{}",
+        '{"pinned": {}, "editable": []}',
+        "not json",
+        '{"pinned": {"a": "a==1.0"}, "editable": []}',
+        '{"pinned": {"a": "a==1.0"}, "editable": [], "versions": {}}',
+        '{"pinned": {"a": "a==1.0"}, "editable": [], "versions": {"a": "1.0 x"}}',
+    ],
+)
 def test_an_unusable_record_is_an_error_not_a_pass(setup, content):
     venv, env, _, record = setup
     record.parent.mkdir(parents=True, exist_ok=True)
@@ -465,7 +476,8 @@ def test_a_record_entry_that_is_not_a_pin_is_refused(setup, pinned):
     venv, env, _, record = setup
     record.parent.mkdir(parents=True, exist_ok=True)
     editable = ["dup"] if "dup" in pinned else []
-    record.write_text(json.dumps({"pinned": pinned, "editable": editable}))
+    versions = {k: "1.0" for k in pinned}
+    record.write_text(json.dumps({"pinned": pinned, "editable": editable, "versions": versions}))
     assert _state(venv, env, "requirements", str(record)).returncode == 2
 
 
@@ -499,6 +511,98 @@ def test_an_extra_whose_name_is_not_plain_is_refused(setup):
     (info / "RECORD").write_text("")
     res = _state(venv, env, "extras", str(record))
     assert res.returncode == 2 and res.stdout == ""
+
+
+def test_a_capture_that_cannot_land_leaves_no_temporary_file(setup):
+    """The record's final path is a directory, so the rename fails: an error
+    (exit 2), and the temporary file is removed rather than left to pile up."""
+    venv, env, _, record = setup
+    record.mkdir(parents=True)
+    res = _state(venv, env, "capture", str(record))
+    assert res.returncode == 2
+    assert sorted(p.name for p in record.parent.iterdir()) == [record.name]
+
+
+def _fake_dist(site: Path, name: str, version: str, direct: dict) -> None:
+    info = site / f"{name}-{version}.dist-info"
+    info.mkdir()
+    (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n")
+    (info / "RECORD").write_text("")
+    (info / "direct_url.json").write_text(json.dumps(direct))
+
+
+def test_a_subdirectory_selector_is_kept(setup):
+    """A package inside a repository or archive: without its selector the
+    restore would try to build the root."""
+    venv, env, _, record = setup
+    site = next((venv / "lib").glob("python3*/site-packages"))
+    _fake_dist(
+        site,
+        "insub",
+        "0.1",
+        {
+            "url": "https://example.invalid/r.git",
+            "subdirectory": "pkg/insub",
+            "vcs_info": {"vcs": "git", "commit_id": "abc123"},
+        },
+    )
+    _fake_dist(
+        site,
+        "arcsub",
+        "0.2",
+        {"url": "https://example.invalid/a.tar.gz", "subdirectory": "py", "archive_info": {}},
+    )
+    assert _state(venv, env, "capture", str(record)).returncode == 0
+    reqs = _state(venv, env, "requirements", str(record)).stdout.splitlines()
+    assert "insub @ git+https://example.invalid/r.git@abc123#subdirectory=pkg/insub" in reqs
+    assert "arcsub @ https://example.invalid/a.tar.gz#subdirectory=py" in reqs
+
+
+@pytest.mark.parametrize(
+    ("version", "direct"),
+    [
+        ("", {"url": "https://example.invalid/n.tar.gz", "archive_info": {}}),
+        (
+            "0.1",
+            {
+                "url": "https://example.invalid/r.git",
+                "subdirectory": "a b",
+                "vcs_info": {"vcs": "git", "commit_id": "abc123"},
+            },
+        ),
+    ],
+)
+def test_a_record_capture_could_not_read_back_is_a_capture_failure(setup, version, direct):
+    """No Version in the metadata, or a selector pip cannot express: capture
+    refuses (the update warns and keeps the old re-resolve) rather than writing
+    a record the rollback would refuse with the services stopped."""
+    venv, env, _, record = setup
+    site = next((venv / "lib").glob("python3*/site-packages"))
+    info = site / "odd-0.dist-info"
+    info.mkdir()
+    meta = "Metadata-Version: 2.1\nName: odd\n" + (f"Version: {version}\n" if version else "")
+    (info / "METADATA").write_text(meta)
+    (info / "RECORD").write_text("")
+    (info / "direct_url.json").write_text(json.dumps(direct))
+    res = _state(venv, env, "capture", str(record))
+    assert res.returncode == 2, res.stdout + res.stderr
+    assert not record.exists()
+    assert not list(record.parent.glob("*.tmp")) if record.parent.exists() else True
+
+
+def test_a_changed_version_behind_the_same_url_is_not_a_match(setup):
+    """A local directory installed without -e: the update rebuilt it at 2.0 from
+    the same path. Same URL, different package: verify must say so."""
+    venv, env, _, record = setup
+    site = next((venv / "lib").glob("python3*/site-packages"))
+    direct = {"url": "file:///src/inhouse", "dir_info": {}}
+    _fake_dist(site, "inhouse", "1.0", direct)
+    assert _state(venv, env, "capture", str(record)).returncode == 0
+    assert _state(venv, env, "verify", str(record)).returncode == 0
+    shutil.rmtree(site / "inhouse-1.0.dist-info")
+    _fake_dist(site, "inhouse", "2.0", direct)
+    res = _state(venv, env, "verify", str(record))
+    assert res.returncode == 1 and "changed inhouse 1.0 -> 2.0" in res.stdout, res.stdout
 
 
 def test_a_vcs_install_is_recorded_with_its_commit(setup):
@@ -606,10 +710,20 @@ def test_capture_sets_the_flag_only_when_the_record_was_written(tmp_path, captur
 @pytest.mark.parametrize(
     ("post_merge", "existing", "captured", "taken"),
     [
-        ("true", '{"pinned": {"a": "a==1.0"}, "editable": []}', False, "1"),
+        (
+            "true",
+            '{"pinned": {"a": "a==1.0"}, "editable": [], "versions": {"a": "1.0"}}',
+            False,
+            "1",
+        ),
         ("true", None, True, "1"),
         ("true", "{}", True, "1"),
-        ("false", '{"pinned": {"a": "a==1.0"}, "editable": []}', True, "1"),
+        (
+            "false",
+            '{"pinned": {"a": "a==1.0"}, "editable": [], "versions": {"a": "1.0"}}',
+            True,
+            "1",
+        ),
     ],
 )
 def test_a_post_merge_keeps_the_record_taken_before_its_merge(

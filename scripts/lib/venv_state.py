@@ -24,6 +24,7 @@ Exit 2 on any error, with the reason on stderr.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -40,28 +41,39 @@ _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _REQUIREMENT = re.compile(rf"({_NAME.pattern})(==[^\s;@]+| @ \S+)")
 
 
-def _installed() -> tuple[dict[str, str], list[str]]:
-    """{normalised name: requirement} for ordinary installs, and editable names."""
+def _installed() -> tuple[dict[str, str], list[str], dict[str, str]]:
+    """{normalised name: requirement} for ordinary installs, editable names, and
+    {normalised name: installed version} for the ordinary installs."""
     pinned: dict[str, str] = {}
     editable: set[str] = set()
+    versions: dict[str, str] = {}
     for dist in metadata.distributions():
         name = dist.metadata["Name"]
         if not name:
             continue
         url_info = dist.read_text("direct_url.json")
         direct = json.loads(url_info) if url_info else {}
+        # A package inside a repository or archive keeps its selector, as pip's
+        # own direct reference does; without it the root would be built instead.
+        sub = f"#subdirectory={direct['subdirectory']}" if direct.get("subdirectory") else ""
         if direct.get("dir_info", {}).get("editable"):
             editable.add(_norm(name))
-        elif direct.get("url") and direct.get("vcs_info"):
+            continue
+        if direct.get("url") and direct.get("vcs_info"):
             vcs = direct["vcs_info"]
-            pinned[_norm(name)] = f"{name} @ {vcs['vcs']}+{direct['url']}@{vcs['commit_id']}"
+            pinned[_norm(name)] = f"{name} @ {vcs['vcs']}+{direct['url']}@{vcs['commit_id']}{sub}"
         elif direct.get("url"):
             # An archive, or a local directory installed without -e: from where it
             # came, never by version from an index, which may carry a different
             # package of that name.
-            pinned[_norm(name)] = f"{name} @ {direct['url']}"
+            pinned[_norm(name)] = f"{name} @ {direct['url']}{sub}"
         else:
             pinned[_norm(name)] = f"{name}=={dist.version}"
+        # Kept for every ordinary install: a URL alone cannot tell version 1.0
+        # of a local directory from the 2.0 it holds after an update. (A version
+        # computed at build time, as setuptools-scm does, can differ for the same
+        # source; verify then reports it, which errs toward incomplete.)
+        versions[_norm(name)] = dist.version
     # An editable checkout is seen twice: its dist-info in site-packages, and the
     # <name>.egg-info setuptools leaves in its source tree, which the editable
     # .pth puts on the path. The egg-info has no direct_url.json, so without this
@@ -70,12 +82,21 @@ def _installed() -> tuple[dict[str, str], list[str]]:
     # stranger's package of that name) after any version bump.
     for name in editable:
         pinned.pop(name, None)
-    return pinned, sorted(editable)
+        versions.pop(name, None)
+    return pinned, sorted(editable), versions
 
 
 def _load(path: str) -> dict:
     with open(path, encoding="utf-8") as fh:
-        record = json.load(fh)
+        return _check(json.load(fh))
+
+
+def _check(record: dict) -> dict:
+    """Raise unless the record is one the restore can use. capture runs it too,
+    so a record it cannot read back is a capture failure (the update then warns
+    and keeps the old re-resolve), never a discovery at rollback time."""
+    if not isinstance(record, dict):
+        raise ValueError("record is not an object")
     if not isinstance(record.get("pinned"), dict) or not record["pinned"]:
         raise ValueError("record has no packages")
     if not isinstance(record.get("editable"), list):
@@ -84,6 +105,13 @@ def _load(path: str) -> dict:
         m = _REQUIREMENT.fullmatch(req) if isinstance(req, str) else None
         if not m or _norm(m.group(1)) != key:
             raise ValueError(f"record entry {key!r} is not a pinned requirement")
+    versions = record.get("versions")
+    if not isinstance(versions, dict) or set(versions) != set(record["pinned"]):
+        raise ValueError("record versions do not cover its packages")
+    if not all(
+        isinstance(v, str) and v and not any(c.isspace() for c in v) for v in versions.values()
+    ):
+        raise ValueError("record has an unusable version")
     both = set(record["pinned"]) & set(record["editable"])
     if both:
         raise ValueError(f"record pins editable installs: {', '.join(sorted(both))}")
@@ -97,21 +125,32 @@ def main(argv: list[str]) -> int:
     cmd, path = argv[1], argv[2]
     try:
         if cmd == "capture":
-            pinned, editable = _installed()
+            pinned, editable, versions = _installed()
             if not pinned:
                 raise ValueError("no installed packages found")
+            record = _check({"pinned": pinned, "editable": editable, "versions": versions})
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             fd, tmp = tempfile.mkstemp(dir=os.path.dirname(os.path.abspath(path)), suffix=".tmp")
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump({"pinned": pinned, "editable": editable}, fh, indent=1, sort_keys=True)
-            os.replace(tmp, path)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(
+                        record,
+                        fh,
+                        indent=1,
+                        sort_keys=True,
+                    )
+                os.replace(tmp, path)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp)
+                raise
             return 0
         record = _load(path)
         if cmd == "requirements":
             for req in sorted(record["pinned"].values()):
                 print(req)
             return 0
-        pinned, editable = _installed()
+        pinned, editable, versions = _installed()
         if cmd == "extras":
             # Printed for an unquoted pip uninstall: a name that is not a plain
             # distribution name (a glob, an option) is refused, never passed on.
@@ -131,6 +170,11 @@ def main(argv: list[str]) -> int:
             f"changed {record['pinned'][n]} -> {pinned[n]}"
             for n in sorted(set(record["pinned"]) & set(pinned))
             if record["pinned"][n] != pinned[n]
+        ]
+        diff += [
+            f"changed {n} {record['versions'][n]} -> {versions[n]}"
+            for n in sorted(set(record["pinned"]) & set(pinned))
+            if record["pinned"][n] == pinned[n] and record["versions"][n] != versions[n]
         ]
         diff += [f"editable missing {n}" for n in record["editable"] if n not in editable]
         for line in diff:
