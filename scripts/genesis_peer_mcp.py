@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["fastmcp>=2.0,<3.0", "httpx"]
+# dependencies = ["fastmcp>=4.1.4,<5", "httpx"]
 # ///
 """Same-owner A2A client for Genesis, as a stdio MCP server.
 

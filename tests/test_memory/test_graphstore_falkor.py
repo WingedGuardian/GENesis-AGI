@@ -1131,11 +1131,17 @@ async def test_the_projector_escapes_a_uri_significant_database_path(monkeypatch
 # the engine is not armed (CI), which is why they supplement the contract tier
 # rather than replacing it.
 
-_ENGINE_ARMED = falkor_mod._FALKOR_AVAILABLE and Path(falkordb_socket_path()).exists()
+# The engine here is the LIVE one (its socket under the real Genesis home), so
+# this tier is opt-in like every other live test: GENESIS_LIVE_E2E=1.
+_ENGINE_ARMED = (
+    os.environ.get("GENESIS_LIVE_E2E") == "1"
+    and falkor_mod._FALKOR_AVAILABLE
+    and Path(falkordb_socket_path()).exists()
+)
 
 engine_gated = pytest.mark.skipif(
     not _ENGINE_ARMED,
-    reason="graph engine not armed here (no falkordb client, or no socket)",
+    reason="live graph engine: opt in with GENESIS_LIVE_E2E=1 (and a client and socket)",
 )
 
 #: Deliberately `test_`-prefixed and never the canonical `genesis_memory`.
@@ -1500,7 +1506,9 @@ async def test_both_projection_reads_see_one_database_snapshot(tmp_path):
 
     reader = await aiosqlite.connect(f"file:{path}?mode=ro", uri=True)
     writer = await aiosqlite.connect(str(path))
-    store = FalkorGraphStore(graph_key="test_snapshot")
+    # A socket that does not exist, as well as the raise below: neither alone
+    # should be what keeps this test off the live engine.
+    store = FalkorGraphStore(socket_path=str(tmp_path / "absent.sock"), graph_key="test_snapshot")
 
     seen = {}
     original = FalkorGraphStore._metadata
@@ -1510,11 +1518,13 @@ async def test_both_projection_reads_see_one_database_snapshot(tmp_path):
         await writer.execute("UPDATE memory_metadata SET deprecated = 1 WHERE memory_id = 'B'")
         await writer.commit()
         seen["meta"] = await original(db)
-        return seen["meta"]
+        # Stop right after the reads, so the projection never reaches an engine:
+        # an unfenced local run used to publish this graph to the live store.
+        raise RuntimeError("stop after the reads")
 
     try:
         store._metadata = _commit_then_read  # type: ignore[method-assign]
-        # Stop after the reads; the engine is not what is under test here.
+        # The engine is not what is under test here.
         with contextlib.suppress(Exception):
             await store._project_locked(reader, None)
 
