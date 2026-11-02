@@ -2038,7 +2038,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: fbb0b6f19 2026-10-21
+verified: 0a6c219a1 2026-10-31
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -2049,6 +2049,26 @@ verified: fbb0b6f19 2026-10-21
   host reconcilers that share its version probe run on any branch).
   Config `~/.genesis/guardian_remote.yaml`; missing → silently
   disabled.
+- **Snapshot deletion window** (`guardian/deletion_window.py`): routine
+  snapshot deletions (the superseded healthy snapshot, prune, and what incus
+  would expire before the next window) wait for `snapshots.deletion_window`,
+  default 05:00-07:00 in the user's timezone, because deleting a large btrfs
+  subvolume can stall filesystem commits for minutes under quota accounting.
+  The healthy snapshot is still created on its cadence. Reserve relief and
+  delete-first never wait; early relief waits only while the pool stays above
+  its reserve until the window opens. `any` restores immediate scheduling.
+  With the window enabled, each routine deletion rechecks the live clock
+  after reserving its cooldown;
+  a failed deletion stops the batch. Read-only attempts use
+  `.last_window_attempt` for retry pacing and do not stamp pool relief's
+  `last_action`; only actual deletion candidates reserve that shared cooldown.
+  A window closing during stamp IO may leave a conservative cooldown without
+  starting a delete. DST opening calculations search real UTC instants, so a
+  wholly skipped window waits for the next real occurrence and a repeated hour
+  remains one daily pass. These are simulated-host contract tests; deployment
+  and live-host validation remain separate. Incus expiry preemption covers
+  owned non-healthy snapshots present at the pass; missed/first windows and
+  snapshots created later with short expiries can still expire outside it.
 - **Shared backup decryption (development candidate)**: the standalone
   `guardian/cred_integrity.py` file authenticates one passphrase-encrypted,
   integrity-protected message for credential recovery and backup/restore.
@@ -2556,7 +2576,13 @@ verified: 973a0e6 2026-10-30
   `20260906234824_pr_verifications` migration docstring for the full
   New-Store-Gate justification. The CONSUMER is the **validator session**
   (`scripts/pr_verification.py`, with its doctrine in the `validating-merges`
-  skill and its readers on `repo_pulse_worker.py`). The verdict is DERIVED from the
+  skill and its readers on `repo_pulse_worker.py`). Its picker,
+  `repo_pulse_worker.py --next-for-validation`, names the ONE row to work next:
+  not-yet-done, then never-attempted, then a parked row past 7 days, never
+  fail-intent; deployed rows with an `E2E:` plan first, newest merge first. Deploy
+  is merge-commit ancestry of the serving commit, except a stacked PR, which is
+  kept and labelled because ancestry cannot prove it either way. It fails closed
+  (picks nothing) when GitHub or git cannot answer. The verdict is DERIVED from the
   validator's evidence document by `session_awareness/pr_evidence.py` (a strict
   pydantic model plus a total decision tree), never asserted by the caller — a
   caller-asserted design policed by refusal rules produced documents with no legal
@@ -3232,7 +3258,9 @@ verified: 3e27b4794 2026-10-23
   is explicitly disabled. Contradictory served identities retain unresolved
   liability, while expense settlement cannot qualify invalid routing evidence.
   Frozen schedule/provider
-  mapping and dedicated nonreset credentials are required; any journal incident
+  mapping and explicit credential identity are required; dedicated mode retains
+  its nonreset-key policy, while shared mode requires a separately approved
+  operating plan. Any journal incident
   pauses new requests and replay until verified recovery. These checks do not
   admit more than reported or exact limit-minus-spend headroom supports. Local
   client setup precedes durable dispatch; recovery metadata uses the shared JSON
@@ -3276,9 +3304,13 @@ verified: 3e27b4794 2026-10-23
   paired population and status rules. Exploratory case and reference-class comparisons do
   not treat repeated responses as independent cases or authorize promotion.
   A credential-scoped lock precedes journal writers and credential reads. The
-  actual pre-dispatch key snapshot must fund the whole selected pending
+  dedicated-mode pre-dispatch key snapshot must fund the whole selected pending
   population, including effective/member headroom; uncertain evidence stops
-  acquisition without resending dispatched coordinates. Observed expenses and
+  acquisition without resending dispatched coordinates. An explicit version-2
+  shared-key policy uses verified experiment receipts and
+  pending allocations, without exclusive account snapshots or attributing
+  unrelated traffic to the experiment. Mode and fingerprint stay frozen across
+  dispatch and GET-only recovery. Observed expenses and
   unresolved liability remain distinct; operating allowances are not guaranteed
   invoice ceilings. Source population/cache checks at admission and completion
   invalidate scoring on detected drift, without a per-request source-integrity
@@ -3345,6 +3377,15 @@ verified: 3e27b4794 2026-10-23
   reducer population have their own contained report, exact ID coverage and
   mutation controls. Actual contained evidence is required; real-process crash/
   timing/recovery and final B/C comparison remain separate qualification work.
+  A separate instrumented recovery controller declares twelve process-kill and
+  seven late-I/O cells, preserving plain-C reopen and existing container-init
+  ownership. Actual native process/cleanup evidence is required; its host tests
+  establish neither abrupt recovery nor actual clock behavior. Timing and final
+  B/C readback remain separate.
+  An additional contained actual-clock controller covers timer waits across
+  plain-CLI reopen, fixed reactive arrivals, backoff shutdown and exclusive
+  writer contention. It requires a genuine during-backoff arrival and retains
+  the complete population; injected-clock tests do not qualify those timings.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).

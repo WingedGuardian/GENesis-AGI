@@ -611,8 +611,12 @@ class LiveAgent:
             # The CLI sends an init frame before EVERY turn; report it once.
             first = self._api_key_source is None
             self._api_key_source = msg.data.get("apiKeySource")
+            # Persist the id BEFORE the registration write: that write awaits
+            # database I/O, and a close() that cancels this reader mid-await
+            # would otherwise leave the previous id saved for the next launch.
+            changed = self._remember_session(msg.data.get("session_id"))
             await self._observe_init(msg.data)
-            if self._remember_session(msg.data.get("session_id")) or first:
+            if changed or first:
                 self._emit("session", f"session {self._session_id}", msg.data)
         elif isinstance(msg, RateLimitEvent):
             info = msg.rate_limit_info

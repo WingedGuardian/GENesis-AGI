@@ -76,8 +76,13 @@ a runtime that started disabled also requires a restart to enable execution.
 
 Update prepares a separate, guarded `.pre-update.peer-restore` candidate before
 stopping services or changing code, retaining the original `.pre-update` snapshot.
-Migration rollback uses the guarded candidate; an incomplete database rollback
-does not explicitly restart services. External watchdog recovery is unchanged.
+A rollback restores from the guarded candidate only when the update changed the
+database: the candidate and the live database are compared on their schema
+(DDL), `user_version` and applied migrations, and any difference, or a
+comparison that cannot run, restores it. When nothing differs the database is
+kept, with the writes made since the snapshot. Data migrations are not part of
+the comparison. An incomplete database rollback does not explicitly restart
+services. External watchdog recovery is unchanged.
 
 Guardian whole-container snapshot rollback is different: its existing second
 approval prompt warns that saved peer permissions, jobs and consent return.

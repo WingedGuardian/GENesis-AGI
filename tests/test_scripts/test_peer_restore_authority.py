@@ -331,7 +331,7 @@ def test_rollback_to_old_code_consumes_only_guarded_candidate(tmp_path, candidat
     # Rolled-back checkout has no helper; the real rollback branch needs none.
     script = tmp_path / "old-code-rollback.sh"
     script.write_text(
-        'set -euo pipefail\nDB_FILE="$1"\nMIGRATIONS_RAN=1\nDB_SNAPSHOT_TAKEN=1\n'
+        'set -euo pipefail\nDB_FILE="$1"\nDB_RESTORE_OWED=1\nDB_SNAPSHOT_TAKEN=1\n'
         "code_action=none\ncode_kept=false\nserver_down=true\nrestart_ok=true\n"
         "WERE_RUNNING=(genesis-server)\ngenesis_checkout_unlock() { :; }\n"
         "_start_genesis_server() { echo STARTED; }\nrun() {\n"
