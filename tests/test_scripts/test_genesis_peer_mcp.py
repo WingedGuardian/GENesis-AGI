@@ -417,3 +417,29 @@ async def test_server_has_no_task_worker_and_keeps_its_tools(peer):
         assert peer.mcp._docket is None
         assert peer.mcp._worker is None
         assert len(await client.list_tools()) == len(tools)
+
+
+def _fastmcp_spec(requirements):
+    for req in requirements:
+        name = req.split(";")[0].strip()
+        if name.startswith("fastmcp") and not name.startswith("fastmcp-"):
+            return name.removeprefix("fastmcp").replace(" ", "")
+    return None
+
+
+def test_inline_script_fastmcp_matches_the_project_floor():
+    # `uv run --script` installs the PEP 723 block, not the project's
+    # dependencies, so a drift here runs the peer on a fastmcp the project
+    # no longer supports (and without the worker guard 2.x needed).
+    import re
+    import tomllib
+
+    block = re.search(r"^# /// script\n(.*?)^# ///$", SCRIPT.read_text(), re.M | re.S)
+    assert block, "genesis_peer_mcp.py lost its inline script metadata"
+    inline = tomllib.loads(
+        "\n".join(line.removeprefix("#").removeprefix(" ") for line in block.group(1).splitlines())
+    )
+    project = tomllib.loads((SCRIPT.parents[1] / "pyproject.toml").read_text())
+    assert _fastmcp_spec(inline["dependencies"]) == _fastmcp_spec(
+        project["project"]["dependencies"]
+    )

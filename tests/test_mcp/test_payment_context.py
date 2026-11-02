@@ -2448,13 +2448,44 @@ def test_a_value_too_short_to_match_safely_is_not_matched():
     assert g.carries(f"{SHOPX}?card={PAN}") is True  # the number is still guarded
 
 
+def _held_texts(value):
+    """Every piece of TEXT the guard's state holds, walked structurally.
+
+    Not the state's repr: the key and the digests are random bytes, and their
+    repr (``\\x12`` then a literal ``5``) or an object address can spell a short
+    value's digits by chance, which failed main's CI on a random CVC. A typed
+    value kept as bytes would decode as printable text; random bytes do not.
+    """
+    if isinstance(value, dict):
+        for k, v in value.items():
+            yield from _held_texts(k)
+            yield from _held_texts(v)
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        for v in value:
+            yield from _held_texts(v)
+    elif isinstance(value, str):
+        yield value
+    elif isinstance(value, bytes):
+        if value.isascii() and value.decode().isprintable():
+            yield value.decode()
+    elif isinstance(value, int):
+        yield str(value)
+    else:  # another object (the flow): its repr, without its address
+        yield re.sub(r"0x[0-9a-f]+", "0x", repr(value))
+
+
 def test_the_guard_keeps_no_typed_value():
     _flow, g = _all_guard()
-    # Object addresses in the repr are not held values, and a random one can
-    # contain a short value's digits (a CVC) by chance.
-    held = re.sub(r"0x[0-9a-f]+", "0x", repr(vars(g)))
+    held = list(_held_texts(vars(g)))
     for s in (PAN, CVC, NAME, POSTAL, NAME.casefold(), POSTAL.casefold(), f"12{YY}"):
-        assert s not in held
+        assert not any(s in text for text in held), s
+
+
+def test_the_held_text_walk_sees_a_value_kept_as_text_or_bytes():
+    # The walk must still catch a value the guard WOULD keep, in either form.
+    assert any(CVC in t for t in _held_texts({"_v": {CVC}}))
+    assert any(CVC in t for t in _held_texts({"_v": (b"x" + CVC.encode(),)}))
+    assert not any("125" in t for t in _held_texts({"_k": b"\x125\x8aT"}))
 
 
 def test_a_url_with_too_many_value_sized_tokens_is_unjudgeable():
@@ -4096,6 +4127,42 @@ async def test_a_marker_already_shown_before_pay_proves_nothing(vault):
     pay.on_click = lambda: pay.pay.__setitem__("live", False)
     out, _ = await _run(ns, success="#done")
     assert out["code"] == "challenge"
+
+
+async def test_a_card_number_url_during_the_marker_read_stops_before_pay(vault, logs, monkeypatch):
+    # The marker read is the last await before the click: a URL the route sees
+    # while it runs must still stop the payment, not be reported after Pay.
+    ns = checkout()
+    clicked: list = []
+    ns.els["pay"].on_click = lambda: clicked.append(1)
+    real = pc._marker_shown
+
+    async def leak_then_read(ppage, args):
+        await ns.pctx.route_handler(Route(f"https://t.example.org/c?n={PAN}"))
+        return await real(ppage, args)
+
+    monkeypatch.setattr(pc, "_marker_shown", leak_then_read)
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "card_url_before_pay" and clicked == []
+    assert "NOT clicked" in out["status"]
+    _sweep(out, logs)
+
+
+async def test_a_card_value_url_during_the_post_save_frame_read_stops_before_pay(
+    vault, monkeypatch
+):
+    # After a clean save, the frame snapshot taken for the outcome awaits too.
+    ns = save_checkout()
+    real = pc._visible_frames
+
+    async def leak_then_read(ppage):
+        pc._flow.url_blocked = True
+        pc._flow.number_hit = True
+        return await real(ppage)
+
+    monkeypatch.setattr(pc, "_visible_frames", leak_then_read)
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
+    assert out["code"] == "card_url_before_pay" and ns.pay_clicks == []
 
 
 async def test_a_bank_frame_revealed_in_place_outranks_the_marker(vault):
