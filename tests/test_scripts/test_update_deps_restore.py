@@ -148,6 +148,8 @@ def setup(tmp_path, wheels):
     """A working pre-update venv: fakemcp 1.0, extra 1.0, fakegenesis 1.0."""
     env = _env(wheels)
     env["GENESIS_HOME"] = str(tmp_path / "gh")
+    env["HOME"] = str(tmp_path / "home")
+    (tmp_path / "home").mkdir()
     venv = tmp_path / "venv"
     subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True, env=env)
     _pip(venv, env, "install", "fakemcp==1.0", "extra==1.0", "fakegenesis==1.0")
@@ -213,7 +215,8 @@ def test_without_the_damage_heal_the_slim_case_stays_broken(setup):
     )
     assert res.returncode == 1, res.stdout
     assert not _imports(venv, env)
-    assert "Genesis does not import" in res.stdout
+    assert "still have missing files after the repair" in res.stdout
+    assert "fakemcp==1.0" in res.stdout
 
 
 def test_a_version_no_longer_available_is_a_refusal_that_changes_nothing(setup, wheels, tmp_path):
@@ -233,6 +236,65 @@ def test_a_version_no_longer_available_is_a_refusal_that_changes_nothing(setup, 
     assert res.returncode == 1
     assert "could not be fetched, so nothing was changed" in res.stdout, res.stdout + res.stderr
     assert _installed(venv, env) == after_update, "the update's set must be left exactly as it was"
+
+
+def test_a_failed_repair_of_a_package_the_import_never_touches_is_not_a_success(setup):
+    """Devin, #3830: verify reads metadata and the import probe covers only the
+    core, so with extra's files gone and the repair failing, the restore reported
+    success and the record was discarded."""
+    venv, env, repo, record = setup
+    assert _sh("capture_venv_state", env, str(repo), str(venv), str(record)).returncode == 0
+    module = next(venv.glob("lib/python*/site-packages/extra_mod/__init__.py"))
+    module.unlink()
+    res = _sh(
+        "reinstall_damaged_distributions() { :; }; _restore_venv_state_unlocked",
+        env,
+        str(repo),
+        str(venv),
+        str(record),
+    )
+    assert _imports(venv, env), "fixture: the core import must still pass"
+    assert res.returncode == 1, res.stdout
+    assert "still have missing files after the repair" in res.stdout
+    assert "extra==1.0" in res.stdout
+
+
+def test_the_download_sits_under_the_swept_tmp_and_is_removed(setup):
+    """Devin and CodeRabbit, #3830: a killed restore left wheels in update-deps,
+    which no sweep reaches. ~/tmp is swept by prune_tmp."""
+    venv, env, repo, record = setup
+    assert _sh("capture_venv_state", env, str(repo), str(venv), str(record)).returncode == 0
+    _break_like_the_incident(venv, env)
+    home = Path(env["HOME"])
+    log = home / "mktemp.log"
+    shim = f'mktemp() {{ echo "$*" >> "{log}"; command mktemp "$@"; }}; restore_venv_state'
+    res = _sh(shim, env, str(repo), str(venv), str(record))
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert f"-d -p {home}/tmp genesis-restore." in log.read_text()
+    assert not list((home / "tmp").glob("genesis-restore.*")), "removed on the normal path"
+    assert not [p for p in record.parent.iterdir() if p.name.startswith("tmp.")]
+
+
+def test_only_what_was_fetched_is_installed(setup):
+    """CodeRabbit, #3830: installing the whole record after the removals could
+    fetch a direct-URL entry that already matched, past the point of refusal."""
+    venv, env, repo, record = setup
+    assert _sh("capture_venv_state", env, str(repo), str(venv), str(record)).returncode == 0
+    _break_like_the_incident(venv, env)
+    # pip's arguments, and the requirements file as it stood when pip ran.
+    real = venv / "bin" / "pip"
+    moved = venv / "bin" / "pip.real"
+    real.rename(moved)
+    log = Path(env["HOME"]) / "pip.log"
+    real.write_text(
+        "#!/bin/bash\n"
+        f'if [ "$1" = install ]; then for a in "$@"; do [ -f "$a" ] && cat "$a" >> "{log}"; done; fi\n'
+        f'exec "{moved}" "$@"\n'
+    )
+    real.chmod(0o755)
+    res = _sh("restore_venv_state", env, str(repo), str(venv), str(record))
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert sorted(log.read_text().split()) == ["extra==1.0", "fakemcp==1.0"]
 
 
 def test_missing_names_only_what_is_not_installed_as_recorded(setup):

@@ -149,62 +149,77 @@ capture_venv_state() {
 #
 # Puts the venv back to the recorded package set, never to whatever the
 # checkout's version ranges resolve to today. Order, as measured on the
-# FastMCP 2 -> 4 split: remove what the update added (fastmcp-slim among it),
-# install the recorded versions with --no-deps, then reinstall any distribution
-# whose files the removals deleted, then re-point the checkout's editable install.
-# Under the browser-stack lock (it can replace browser packages). Returns 0 only
-# when the installed set equals the record AND Genesis and its MCP stack import;
-# anything else is 1, with what differs printed. Editables other than the
-# checkout are never touched. Versions no longer installed need the package
-# index or pip's cache: offline, that is reported as a failure, not masked.
+# FastMCP 2 -> 4 split: fetch the recorded versions not installed as recorded,
+# remove what the update added (fastmcp-slim among it), install what was fetched
+# with --no-deps, then reinstall any distribution whose files the removals
+# deleted, then re-point the checkout's editable install. Under the browser-stack
+# lock (it can replace browser packages). Returns 0 only when the installed set
+# equals the record, no distribution is missing files, AND Genesis and its MCP
+# stack import; anything else is 1, with what differs printed. Editables other
+# than the checkout are never touched. Versions no longer installed need the
+# package index or pip's cache: when they cannot be fetched that is reported as a
+# failure with nothing changed. A repair that cannot fetch a package whose version
+# did not change is still reported after the fact (#3841).
 restore_venv_state() {
     with_browser_stack_lock _restore_venv_state_unlocked "$@"
 }
 
 _restore_venv_state_unlocked() {
     local repo_dir="$1" venv_path="$2" record="$3"
-    local lib="${3%.json}.lib" py="$venv_path/bin/python" helper extras reqs diff
+    local lib="${3%.json}.lib" py="$venv_path/bin/python" helper extras diff
     # The copy taken with the record; the checkout's own only for a record from
     # before the copy existed.
     [ -f "$lib/venv_state.py" ] || lib="$repo_dir/scripts/lib"
     helper="$lib/venv_state.py"
     extras="$("$py" -P "$helper" extras "$record")" || { echo "  Could not read the package record $record."; return 1; }
-    reqs="$(mktemp -p "$(dirname "$record")")" || return 1
-    if ! "$py" -P "$helper" requirements "$record" > "$reqs"; then
-        rm -f "$reqs"
-        echo "  Could not read the package record $record."
-        return 1
-    fi
     # Fetch what the record needs BEFORE removing anything: removing the update's
     # packages first and then failing to fetch the old ones (index unreachable)
-    # would leave neither set installed. A failed fetch changes nothing.
+    # would leave neither set installed. A failed fetch changes nothing. The
+    # download sits under ~/tmp, which prune_tmp sweeps, so a killed restore
+    # cannot strand wheels where nothing looks.
     local missing dl="" fetch
-    missing="$(mktemp -p "$(dirname "$record")")" || { rm -f "$reqs"; return 1; }
+    missing="$(mktemp -p "$(dirname "$record")")" || return 1
     if ! "$py" -P "$helper" missing "$record" > "$missing"; then
-        rm -f "$reqs" "$missing"
+        rm -f "$missing"
         echo "  Could not read the package record $record."
         return 1
     fi
     if [ -s "$missing" ]; then
-        dl="$(mktemp -d -p "$(dirname "$record")")" || { rm -f "$reqs" "$missing"; return 1; }
+        mkdir -p "$HOME/tmp" && dl="$(mktemp -d -p "$HOME/tmp" genesis-restore.XXXXXX)" || { rm -f "$missing"; return 1; }
         if ! fetch="$("$venv_path/bin/pip" download --quiet --no-deps --dest "$dl" -r "$missing" 2>&1)"; then
             echo "  The recorded packages could not be fetched, so nothing was changed:"
             printf '%s\n' "$fetch" | tail -3 | sed 's/^/    /'
-            rm -rf "$reqs" "$missing" "$dl"
+            rm -rf "$missing" "$dl"
             return 1
         fi
     fi
-    rm -f "$missing"
     if [ -n "$extras" ]; then
         echo "    Removing packages this update added: $(printf '%s ' $extras)"
         # shellcheck disable=SC2086  # one distribution name per word
         "$venv_path/bin/pip" uninstall --quiet -y $extras 2>&1 | tail -1 || true
     fi
-    # All or nothing: one version no source still carries installs none of them.
-    # verify below names what is missing; pip's own reason is printed here.
-    "$venv_path/bin/pip" install --quiet --no-deps ${dl:+--find-links "$dl"} -r "$reqs" 2>&1 | tail -3 || true
-    rm -rf "$reqs" ${dl:+"$dl"}
+    # Only what was just fetched, from that download: a recorded direct-URL entry
+    # that already matches is not re-fetched after the removals above. All or
+    # nothing, and verify below names what is missing; pip's reason is printed here.
+    if [ -n "$dl" ]; then
+        "$venv_path/bin/pip" install --quiet --no-deps --find-links "$dl" -r "$missing" 2>&1 | tail -3 || true
+    fi
+    rm -rf "$missing" ${dl:+"$dl"}
     reinstall_damaged_distributions "$repo_dir" "$venv_path" "$lib"
+    # The repair is best effort and verify reads metadata, so a package the import
+    # below never touches could keep matching metadata with its files gone. Report
+    # that as an incomplete restore, keeping the record, rather than as a success.
+    local damaged
+    if ! damaged="$("$py" -P "$lib/venv_missing_files.py" 2>&1)"; then
+        echo "  Could not check the restored packages for missing files:"
+        printf '%s\n' "$damaged" | tail -3 | sed 's/^/    /'
+        return 1
+    fi
+    if [ -n "$damaged" ]; then
+        echo "  Packages still have missing files after the repair:"
+        printf '%s\n' "$damaged" | head -20 | sed 's/^/    /'
+        return 1
+    fi
     # Re-point the checkout's own editable install so its metadata (version,
     # entry points) is the rolled-back checkout's. Build isolation stays on, as in
     # bootstrap: the venv need not carry setuptools. A failure leaves the previous
