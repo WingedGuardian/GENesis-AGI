@@ -356,7 +356,7 @@ async def test_llm_gather_context_db_error():
 @pytest.mark.asyncio
 async def test_llm_post_to_telegram():
     router = _make_router(content="test <b>output</b> & result")
-    executor = _make_llm_executor(router=router)
+    executor = SurplusLLMExecutor(router, db=AsyncMock(), post_to_telegram=True)
     topic_manager = AsyncMock()
     topic_manager.send_to_category = AsyncMock()
     executor.set_topic_manager(topic_manager)
@@ -378,7 +378,7 @@ async def test_llm_post_to_telegram():
 @pytest.mark.asyncio
 async def test_llm_post_to_telegram_error_swallowed():
     router = _make_router(content="good result")
-    executor = _make_llm_executor(router=router)
+    executor = SurplusLLMExecutor(router, db=AsyncMock(), post_to_telegram=True)
     topic_manager = AsyncMock()
     topic_manager.send_to_category = AsyncMock(side_effect=RuntimeError("telegram down"))
     executor.set_topic_manager(topic_manager)
@@ -390,6 +390,68 @@ async def test_llm_post_to_telegram_error_swallowed():
     # Should still succeed despite Telegram failure
     assert result.success is True
     assert result.content == "good result"
+
+
+# 12b. Default: surplus output is NOT posted to the supergroup, and the
+# stored insight is exactly what the opt-in path stores.
+@pytest.mark.asyncio
+async def test_llm_default_does_not_post_but_keeps_insight():
+    task = _make_task(task_type=TaskType.BRAINSTORM_USER)
+    results = {}
+    managers = {}
+    for post in (False, True):
+        router = _make_router(content="an idea worth keeping", model_id="m-1")
+        if post:
+            executor = SurplusLLMExecutor(router, db=AsyncMock(), post_to_telegram=True)
+        else:
+            executor = _make_llm_executor(router=router)
+        topic_manager = AsyncMock()
+        executor.set_topic_manager(topic_manager)
+        with patch("genesis.surplus.executor.observations.query",
+                   new_callable=AsyncMock, return_value=[]):
+            results[post] = await executor.execute(task)
+        managers[post] = topic_manager
+
+    managers[False].send_to_category.assert_not_called()
+    managers[True].send_to_category.assert_called_once()  # control: opt-in still posts
+    assert results[False].success is True
+    assert results[False].content == "an idea worth keeping"
+    assert results[False].insights == results[True].insights
+    assert len(results[False].insights) == 1
+
+
+def test_posting_enabled_reads_only_a_true_bool():
+    from genesis.surplus.executor import surplus_posting_enabled
+
+    assert surplus_posting_enabled({}) is False
+    assert surplus_posting_enabled({"telegram": {}}) is False
+    assert surplus_posting_enabled({"telegram": {"post_insights": False}}) is False
+    assert surplus_posting_enabled({"telegram": {"post_insights": True}}) is True
+    # A damaged value degrades to NOT posting.
+    assert surplus_posting_enabled({"telegram": {"post_insights": "yes"}}) is False
+    assert surplus_posting_enabled({"telegram": "on"}) is False
+    assert surplus_posting_enabled(None) is False
+
+
+def test_shipped_surplus_config_does_not_post():
+    from pathlib import Path
+
+    import yaml
+
+    from genesis.surplus.executor import surplus_posting_enabled
+
+    cfg_path = Path(__file__).resolve().parents[2] / "config" / "surplus.yaml"
+    cfg = yaml.safe_load(cfg_path.read_text())
+    assert cfg["telegram"]["post_insights"] is False
+    assert surplus_posting_enabled(cfg) is False
+
+
+def test_surplus_settings_validator_rejects_non_bool_post_flag():
+    from genesis.mcp.health.settings import _validate_surplus
+
+    assert _validate_surplus({"telegram": {"post_insights": True}}) == []
+    assert _validate_surplus({"telegram": {"post_insights": "no"}})
+    assert _validate_surplus({"telegram": {"bogus": True}})
 
 
 # 13. Insight dict structure

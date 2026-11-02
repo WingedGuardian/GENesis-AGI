@@ -133,7 +133,7 @@ def _rollback_guard(
         )
         + extra
         + "guard() {\n"
-        + (f'MIGRATIONS_RAN=1\nDB_SNAPSHOT_TAKEN=1\nDB_FILE="{db_file}"\n' if db_file else "")
+        + (f'DB_RESTORE_OWED=1\nDB_SNAPSHOT_TAKEN=1\nDB_FILE="{db_file}"\n' if db_file else "")
         + _block("rollback-code-guard")
         + (
             "    local server_down=true\n"
@@ -695,7 +695,23 @@ def test_the_database_follows_the_code_left_on_disk(repo, tmp_path, case, restor
     assert db.with_name("genesis.db.pre-update").read_text() == "pre-update\n"
     assert ("DB_OK=true" in r.stdout) is restored, r.stdout
     if not restored:
-        assert "migrated database is kept" in r.stdout
+        assert "the database is kept to match it" in r.stdout
+
+
+def test_a_changed_database_under_someone_elses_checkout_is_kept(repo, tmp_path):
+    """This run never merged and someone else committed on top (`untouched`): the
+    rollback leaves their code, and the database change it measured may be
+    theirs. Restoring the snapshot under their code would delete their schema
+    changes and writes, so the database stays and the rollback is incomplete.
+    Run, not read: the guard and the DB decision together, a restore owed."""
+    tag = _git(repo, "rev-parse", "pre-update-test")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "theirs")
+    db = _db(tmp_path)
+    r = _run(_rollback_guard(repo, own_head=tag, db_file=str(db)), tmp_path)
+    assert _verdict(r) == ("untouched", "false")
+    assert db.read_text() == "migrated\n", r.stdout
+    assert "DB_OK=false" in r.stdout
+    assert "belongs to someone else" in r.stdout
 
 
 def test_a_switched_branch_is_left_exactly_as_it_is(repo, tmp_path):
@@ -879,7 +895,7 @@ def test_a_moved_checkout_keeps_the_migrated_database():
     text = _text()
     start = text.index("_do_rollback() {")
     body = text[start : text.index("\n_on_err() {", start)]  # the heredoc holds a column-0 }
-    migrated = body.index('if [ "${MIGRATIONS_RAN:-0}" = "1" ]; then')
+    migrated = body.index('if [ "${DB_RESTORE_OWED:-0}" = "1" ]; then')
     moved = body.index(
         'if [ "$code_action" = "moved" ] || [ "$code_kept" = "true" ]; then', migrated
     )

@@ -76,6 +76,17 @@ snapshots:
   # applying it to manual (guardian) snapshots too; newer releases limit it to
   # scheduled ones.
   expiry: "2w"
+  # Routine deletions (the superseded healthy snapshot, prune) wait for this
+  # window: deleting a large btrfs subvolume can stall filesystem commits for
+  # minutes under quota accounting. "any" deletes when due (no window).
+  # Reserve relief and measured delete-first do not wait for the window.
+  # Early relief waits only if the measured runway outlasts the wait.
+  # Each routine delete rechecks the clock; a failed delete stops the batch.
+  # Skipped DST windows wait for their next real occurrence.
+  deletion_window: "05:00-07:00"
+  # Empty -> the user's timezone (genesis.yaml `timezone` / USER_TIMEZONE on
+  # this host, else UTC). Set an IANA zone here if the host has neither.
+  deletion_window_timezone: ""
 
 # Host storage-pool monitoring (LVM-thin data% + metadata% + VG headroom;
 # non-LVM backends like btrfs tier on the backend-agnostic pool-used% fallback).

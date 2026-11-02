@@ -114,6 +114,7 @@ class Harness:
             state_path=self.state,
             client_factory=factory,
             cost_recorder=recorder,
+            session_recorder=agent_kw.pop("session_recorder", None),
             cli_path="/usr/local/bin/claude",
             environ={},
             **agent_kw,

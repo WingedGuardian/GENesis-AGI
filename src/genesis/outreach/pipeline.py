@@ -12,7 +12,7 @@ from pathlib import Path
 import aiosqlite
 
 from genesis.channels.base import ChannelNotConfiguredError
-from genesis.content.drafter import ContentDrafter, clean_header
+from genesis.content.drafter import SUBJECT_MAX_CHARS, ContentDrafter, clean_header
 from genesis.content.egress import gate
 from genesis.content.formatter import ContentFormatter
 from genesis.content.limits import get_limits
@@ -989,11 +989,13 @@ class OutreachPipeline:
         wrote the email) writes the subject with it; the fixed default is only
         a safety net for a send that arrives without one. None means the egress
         scan quarantined it."""
-        subject = clean_header(request.email_subject or "") or DEFAULT_EMAIL_SUBJECT
+        subject = clean_header(request.email_subject or "", max_chars=None) or DEFAULT_EMAIL_SUBJECT
         scrubbed = gate(subject, channel="email", category=request.category.value)
         if scrubbed.quarantined:
             return None
-        return clean_header(scrubbed.text) or DEFAULT_EMAIL_SUBJECT
+        # Cap only new subjects: adding Re: must never cut a thread's title.
+        max_chars = None if request.thread_id else SUBJECT_MAX_CHARS
+        return clean_header(scrubbed.text, max_chars=max_chars) or DEFAULT_EMAIL_SUBJECT
 
     async def deliver_approved(
         self, pending: dict, *, subject: str | None = None,
