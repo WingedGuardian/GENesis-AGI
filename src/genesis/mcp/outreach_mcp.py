@@ -13,6 +13,8 @@ from datetime import UTC, datetime
 import httpx
 from fastmcp import FastMCP
 
+from genesis.content.drafter import clean_header
+
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP("genesis-outreach")
@@ -173,9 +175,7 @@ async def outreach_send(
             # A reply keeps the thread's subject as Re: <original>: mail clients
             # group a conversation by it, and this adapter sends no In-Reply-To
             # header, so a fresh title would split the reply into a new thread.
-            from genesis.content.drafter import clean_header
-
-            original = clean_header(thread.get("subject") or "")
+            original = clean_header(thread.get("subject") or "", max_chars=None)
             if original:
                 subject = original if original.lower().startswith("re:") else f"Re: {original}"
             logger.info(
@@ -183,7 +183,7 @@ async def outreach_send(
             )
         else:
             logger.warning("Thread %s not found for recipient lookup", thread_id)
-    if channel == "email" and not (subject or "").strip():
+    if channel == "email" and not clean_header(subject or ""):
         # Whoever writes the email writes its subject, in the same step. A
         # reply took its subject from the thread above; this catches a new
         # email sent without one, and a reply whose thread recorded none.
@@ -341,7 +341,7 @@ async def marketing_send(prospect_id: str, subject: str, body: str) -> str:
     from genesis.outreach.types import OutreachCategory
 
     subject = (subject or "").strip()
-    if not subject:
+    if not clean_header(subject):
         return json.dumps({"status": "refused", "reason": "subject_required"})
     body = body or ""
     message = f"{subject}\n\n{body}" if subject else body

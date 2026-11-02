@@ -39,12 +39,11 @@ worse than a missing one, especially where a recovered value picks a lane
 (``work_state``) or truncates prose. The remedy is to re-send the call
 correctly, which a caller who is told the real cause does on the first retry.
 
-REACHABILITY DEPENDS ON A LIBRARY DEFAULT, so it is recorded rather than
-assumed: FastMCP's ``strict_input_validation`` defaults to False, which is why
-argument binding raises inside the tool call and this middleware sees it. With
-``FASTMCP_STRICT_INPUT_VALIDATION=true`` the MCP lowlevel server runs a
-jsonschema check BEFORE any middleware, and this diagnosis never runs at all.
-That dependency is pinned by a test rather than left to be rediscovered.
+FastMCP v4 wraps argument-binding failures in its own ValidationError. The
+instrumentation middleware unwraps only that typed wrapper's Pydantic cause
+before calling this module. It does not infer error entries from prose, and
+body errors keep their existing treatment. Argument coercion remains governed
+by FastMCP's strict_input_validation setting (False by default).
 
 This recognises ONE client's serialization syntax — the ``<parameter name="…">``
 form. That is deliberate: it diagnoses a specific known emitter, not tool calls

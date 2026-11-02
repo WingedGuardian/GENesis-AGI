@@ -13,22 +13,22 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("genesis.content.drafter")
 
-#: Longest subject accepted; anything longer is cut.
+#: Longest new subject; replies preserve the original thread title.
 SUBJECT_MAX_CHARS = 200
 
 
-def clean_header(text: str) -> str:
+def clean_header(text: str, *, max_chars: int | None = SUBJECT_MAX_CHARS) -> str:
     """``text`` as a one-line header value: control, format and other
     non-printing characters (NUL, ESC, bidi overrides, line breaks) become
     spaces, whitespace collapses, and the result is capped at
-    ``SUBJECT_MAX_CHARS``."""
+    ``max_chars`` (None disables truncation)."""
     import unicodedata
 
     kept = "".join(
         " " if unicodedata.category(ch).startswith(("C", "Z")) else ch
         for ch in (text or "")
     )
-    return " ".join(kept.split())[:SUBJECT_MAX_CHARS].strip()
+    return " ".join(kept.split())[:max_chars].strip()
 
 
 class ContentDrafter:

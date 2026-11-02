@@ -113,7 +113,7 @@ class TestEgoDirectiveUserOnly:
         with patch(
             "genesis.mcp.health.ego_tools._get_db_path", return_value=db_path
         ):
-            result = await ego_directive.fn(
+            result = await ego_directive(
                 "test directive", priority="high", ego_target="genesis_ego"
             )
         assert result["status"] == "refused"
@@ -132,7 +132,7 @@ class TestEgoDirectiveUserOnly:
         with patch(
             "genesis.mcp.health.ego_tools._get_db_path", return_value=db_path
         ):
-            result = await ego_directive.fn(
+            result = await ego_directive(
                 "test directive", priority="high", ego_target="user_ego"
             )
         assert result["status"] == "created"
@@ -147,7 +147,7 @@ class TestEgoDirectiveUserOnly:
         with patch(
             "genesis.mcp.health.ego_tools._get_db_path", return_value=db_path
         ):
-            result = await ego_directive.fn(
+            result = await ego_directive(
                 "test directive", priority="normal", ego_target="user_ego"
             )
         assert result["status"] == "created"
@@ -169,7 +169,7 @@ class TestEgoProposalResolveUserOnly:
             "genesis.mcp.health.ego_tools._get_db_path",
             return_value=tmp_path / "empty.db",
         ):
-            result = await ego_proposal_resolve.fn("reject", proposal_ids="whatever")
+            result = await ego_proposal_resolve("reject", proposal_ids="whatever")
         assert result["status"] == "refused"
 
     async def test_allowed_when_no_cc_session_reaches_logic(self, tmp_path, monkeypatch):
@@ -188,7 +188,7 @@ class TestEgoProposalResolveUserOnly:
         with patch(
             "genesis.mcp.health.ego_tools._get_db_path", return_value=db_path
         ):
-            result = await ego_proposal_resolve.fn("reject", proposal_ids="none-such")
+            result = await ego_proposal_resolve("reject", proposal_ids="none-such")
         # Passed the gate -> normal handling (no such proposal), NOT "refused".
         assert result["status"] != "refused"
 
@@ -217,7 +217,7 @@ class TestEgoDecisionRecord:
     async def _record(self, content, *, ego_target="user_ego"):
         from genesis.mcp.health.ego_tools import ego_decision
 
-        return await ego_decision.fn(
+        return await ego_decision(
             action="record",
             content=content,
             ego_target=ego_target,
@@ -226,7 +226,7 @@ class TestEgoDecisionRecord:
     async def _list(self, *, ego_target="user_ego"):
         from genesis.mcp.health.ego_tools import ego_decision
 
-        return await ego_decision.fn(action="list", ego_target=ego_target)
+        return await ego_decision(action="list", ego_target=ego_target)
 
     async def test_distinct_same_tag_rulings_are_recorded(self, decision_db):
         first = await self._record("[dev/x] do not-A, ever")
@@ -341,7 +341,7 @@ class TestEgoDecisionRecord:
         from genesis.mcp.health.ego_tools import ego_decision
 
         first = await self._record("[dev/x] ruling A")
-        retired = await ego_decision.fn(
+        retired = await ego_decision(
             action="supersede",
             decision_id=first["decision_id"],
             reason="replaced",

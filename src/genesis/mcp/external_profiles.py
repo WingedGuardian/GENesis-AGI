@@ -3,9 +3,8 @@
 Profiles constrain MCP requests in these standalone processes. They are not
 authentication or isolation from an operator with full host access.
 
-FastMCP task-augmented calls bypass ordinary tool middleware. Genesis tools
-currently forbid that mode; enabling tasks requires a separate admission
-boundary before this profile can cover them.
+Genesis installs no FastMCP tasks extension. Enabling background tasks requires
+a separate capability review, including admission before task execution.
 """
 
 from __future__ import annotations
@@ -66,7 +65,7 @@ class ExternalProfileMiddleware(Middleware):
 
     async def on_list_tools(self, context, call_next):
         tools = await call_next(context)
-        return [tool for tool in tools if tool.key in self.allowed]
+        return [tool for tool in tools if tool.name in self.allowed]
 
     async def on_call_tool(self, context, call_next):
         if context.message.name not in self.allowed:

@@ -14,7 +14,9 @@ import time
 from typing import Any
 
 from fastmcp.exceptions import ToolError
+from fastmcp.exceptions import ValidationError as ToolValidationError
 from fastmcp.server.middleware import Middleware
+from pydantic import ValidationError as PydanticValidationError
 
 from genesis.observability.commit_identity import is_stale
 from genesis.observability.commit_identity import (
@@ -128,8 +130,14 @@ class InstrumentationMiddleware(Middleware):
             # slightly wrong explanation on a call that was refused regardless.
             hint = None
             try:
+                # v4 wraps binding errors in its own ValidationError. Keep the
+                # structured Pydantic error for the diagnosis; never unwrap a
+                # body exception or infer missing names from rendered prose.
+                diagnosis_error = exc
+                if isinstance(exc, ToolValidationError) and isinstance(exc.__cause__, PydanticValidationError):
+                    diagnosis_error = exc.__cause__
                 hint = absorbed_parameter_hint(
-                    exc,
+                    diagnosis_error,
                     getattr(context.message, "arguments", None) or {},
                     tool_name,
                 )

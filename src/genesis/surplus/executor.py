@@ -520,16 +520,38 @@ _TASK_PROMPTS: dict[TaskType, str] = {
 }
 
 
+def surplus_posting_enabled(cfg: dict | None) -> bool:
+    """Whether surplus output is posted to the supergroup's Surplus topic.
+
+    Reads ``telegram.post_insights`` from the merged ``surplus.yaml``. Only a
+    literal ``true`` enables posting; a missing or damaged value means no post,
+    the direction with less outward behaviour. Storage of the output is not
+    affected either way.
+    """
+    if not isinstance(cfg, dict):
+        return False
+    telegram = cfg.get("telegram")
+    if not isinstance(telegram, dict):
+        return False
+    return telegram.get("post_insights") is True
+
+
 class SurplusLLMExecutor:
     """Executes surplus analytical tasks via direct Router calls.
 
     Surplus tasks produce surplus insights (stored in surplus_staging),
     NOT reflection observations.  The reflection engine is not involved.
+
+    ``post_to_telegram`` (default off) also posts each output to the Surplus
+    topic; the returned insights are identical either way.
     """
 
-    def __init__(self, router: Router, *, db: aiosqlite.Connection) -> None:
+    def __init__(
+        self, router: Router, *, db: aiosqlite.Connection, post_to_telegram: bool = False,
+    ) -> None:
         self._router = router
         self._db = db
+        self._post_to_telegram_enabled = post_to_telegram
         self._topic_manager = None
 
     def set_topic_manager(self, manager) -> None:
@@ -567,8 +589,8 @@ class SurplusLLMExecutor:
             logger.info("Surplus task %s produced low-information output — skipping", task.task_type)
             return ExecutorResult(success=True, content="", insights=[])
 
-        # Post to Telegram surplus topic
-        if self._topic_manager and content:
+        # Post to Telegram surplus topic (opt-in: telegram.post_insights)
+        if self._post_to_telegram_enabled and self._topic_manager and content:
             await self._post_to_telegram(task, content)
 
         model = result.model_id or result.provider_used or "unknown"
