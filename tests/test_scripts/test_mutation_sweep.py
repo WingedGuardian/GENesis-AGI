@@ -24,10 +24,10 @@ import pytest
 from tests.conftest import private_module
 
 _REPO = Path(__file__).resolve().parent.parent.parent
-# Under `scripts/ci/` because a CI job invokes it (the job lands with the
-# per-case isolation change that follows this one): `scripts/ci/` sits in the
-# critical review lane whether or not a workflow names it yet. The job reports;
-# it joins the required-check ruleset once the harness is stable.
+# Under `scripts/ci/` because a CI job invokes it: every script ci.yml invokes
+# sits in the critical review lane, and
+# `test_required_check_implementations_are_critical` derives that from ci.yml.
+# (The job reports; it joins the required-check ruleset once it is stable.)
 _MOD = _REPO / "scripts" / "ci" / "mutation_sweep.py"
 
 # Via conftest so the module name is restored after loading rather than left
@@ -226,7 +226,8 @@ def test_the_child_imports_the_COPY_and_the_shared_file_is_never_written(
     _around_child(monkeypatch, before=lambda cwd: seen.append(target.read_bytes()))
     case = _case(project, test="test_where.py::test_blocks_danger", env={"RECORD": str(record)})
     result = _sweep(project, [case])
-    assert seen == [before], "the caller's file was written while the child ran"
+    # Three children: unmutated, mutated, and (after the BIT) the control.
+    assert seen == [before] * 3, "the caller's file was written while a child ran"
     imported = record.read_text(encoding="utf-8").split()
     assert imported and all(not Path(p).is_relative_to(project) for p in imported), imported
     assert all(Path(p).is_relative_to(Path.home() / "tmp") for p in imported), imported
@@ -284,8 +285,9 @@ def test_a_crash_still_removes_the_copy_and_its_registration(project, monkeypatc
     monkeypatch.setattr(ms, "_pytest", boom)
     target = project / "guard.py"
     before = target.read_bytes()
-    with pytest.raises(RuntimeError, match="injected"):
-        _sweep(project, [_case(project)])
+    result = _sweep(project, [_case(project)])
+    assert result.results[0].outcome == ms.ABORTED
+    assert "injected" in result.results[0].detail
     assert target.read_bytes() == before
     assert _worktrees(project) == [str(project)]
     assert _copies_left() == []
@@ -430,9 +432,10 @@ def test_a_target_whose_directory_resolves_outside_the_repository_is_refused(
 def test_the_reset_undoes_what_a_test_did_to_the_target(
     project, monkeypatch, tmp_path_factory, damage
 ):
-    """The next case must see the pristine file, and no reset may write
-    THROUGH what the test left: a symlink or a hard link to a file outside the
-    copy would otherwise carry the write out of it."""
+    """Whatever the first run did to the target, the mutation and the control
+    restore are written as FRESH files: no write may go THROUGH what the test
+    left, because a symlink or a hard link to a file outside the copy would
+    otherwise carry it out of the copy."""
     import os as _os
     import stat as _stat
 
@@ -462,13 +465,14 @@ def test_the_reset_undoes_what_a_test_did_to_the_target(
     assert [r.outcome for r in result.results] == [ms.BIT, ms.BIT], [
         r.detail for r in result.results
     ]
-    assert modes == [0o755, 0o755], "the mutation was written at the wrong mode"
+    # Unmutated, mutated and control run, for each of the two cases.
+    assert modes == [0o755] * 6, "a write used the wrong mode"
 
 
 def test_damage_done_by_the_baseline_run_is_undone_before_the_case(project, monkeypatch):
     """A baseline test (or its fixture) that deletes the target used to leave
-    the shared file gone. In the copy, the case writes its mutation over
-    whatever is there."""
+    the shared file gone. The baseline now runs in a copy of its own, so this
+    pins that a case's copy still holds the pristine target."""
     calls = {"n": 0}
 
     def delete_after_baseline(cwd):
@@ -501,23 +505,25 @@ def test_a_failed_mutation_write_aborts_and_the_next_case_still_runs(project, mo
     assert result.results[1].outcome == ms.BIT, result.results[1].detail
 
 
-def test_a_reset_that_cannot_be_verified_aborts_every_later_case(project, monkeypatch):
-    """A copy that is no longer pristine makes every later verdict suspect --
-    the next case's test may import the half-reset file."""
+def test_a_control_whose_target_cannot_be_restored_aborts_only_its_case(project, monkeypatch):
+    """The control must run against the PRISTINE file; if it cannot be put back,
+    the BIT is unproven and that case ABORTS. Each case has its own copy, so the
+    next one is unaffected (with one shared copy it had to abort every later
+    case)."""
     real_put = ms._put
     calls = {"n": 0}
 
-    def fail_reset(*a, **k):
+    def fail_restore(*a, **k):
         calls["n"] += 1
-        if calls["n"] == 2:  # 1 = first mutation, 2 = its reset
-            raise OSError("injected reset failure")
+        if calls["n"] == 2:  # 1 = first mutation, 2 = its restore for the control
+            raise OSError("injected restore failure")
         return real_put(*a, **k)
 
-    monkeypatch.setattr(ms, "_put", fail_reset)
+    monkeypatch.setattr(ms, "_put", fail_restore)
     result = _sweep(project, [_case(project, label="first"), _case(project, label="second")])
-    assert result.results[0].outcome == ms.BIT
-    assert result.results[1].outcome == ms.ABORTED
-    assert "pristine" in result.results[1].detail
+    assert result.results[0].outcome == ms.ABORTED
+    assert "control run" in result.results[0].detail
+    assert result.results[1].outcome == ms.BIT, result.results[1].detail
 
 
 def test_a_hard_linked_shared_target_is_swept_and_its_other_link_untouched(project):
@@ -557,8 +563,10 @@ def test_a_run_that_produced_no_result_line_aborts(project):
     # Either guard may catch it -- the exit code fires first and reports a more
     # precise cause. The PROPERTY is that a run which did not happen never reads
     # as a verdict; pinning one specific message would make the test brittle
-    # about which of two correct mechanisms got there first.
-    assert "the run did not happen" in result.results[0].detail
+    # about which of the correct mechanisms got there first. Since the run
+    # before the mutation, that is usually the unmutated run finding nothing.
+    detail = result.results[0].detail
+    assert "the run did not happen" in detail or "ran nothing" in detail, detail
 
 
 def test_aborts_are_not_counted_as_clean(project):
@@ -591,6 +599,23 @@ class _Ran:
         self.returncode = rc
         self.stdout = stdout
         self.stderr = ""
+
+
+def _scripted(monkeypatch, rc: int, stdout: str) -> list[str]:
+    """Fake every pytest child: the MUTATED run answers ``(rc, stdout)``; the
+    unmutated runs either side of it answer a pass, as the unmutated test does.
+    Returns a log of "before" / "mutated" / "control" per call. For a ONE-case
+    sweep with no baseline: it tells the runs apart by their order."""
+    log: list[str] = []
+    order = ("before", "mutated", "control")
+
+    def run(cmd, *, cwd, env, timeout):
+        kind = order[len(log)]
+        log.append(kind)
+        return _Ran(rc, stdout) if kind == "mutated" else _Ran(0, "1 passed in 0.01s")
+
+    monkeypatch.setattr(ms, "_pytest", run)
+    return log
 
 
 @pytest.mark.parametrize(
@@ -698,10 +723,12 @@ def test_the_summary_parser_reads_exact_outcome_keywords(stdout, counts):
     ],
 )
 def test_the_mutation_run_verdict_table(project, monkeypatch, rc, stdout, outcome, detail):
-    monkeypatch.setattr(ms, "_pytest", lambda *a, **k: _Ran(rc, stdout))
+    log = _scripted(monkeypatch, rc, stdout)
     result = _sweep(project, [_case(project)]).results[0]
     assert result.outcome == outcome, result.detail
     assert detail in result.detail
+    # A control runs after a BIT, and only then.
+    assert log == (["before", "mutated", "control"] if outcome == ms.BIT else ["before", "mutated"])
 
 
 # The BASELINE: (exit code, real summary) -> None (green) or a refusal naming
@@ -893,14 +920,15 @@ def test_a_multi_edit_case_applies_all_edits_together(project, monkeypatch):
         why="w",
         validator="python",
     )
-    seen = {}
+    texts = []
     _around_child(
-        monkeypatch,
-        before=lambda cwd: seen.setdefault("text", (cwd / "guard.py").read_text(encoding="utf-8")),
+        monkeypatch, before=lambda cwd: texts.append((cwd / "guard.py").read_text(encoding="utf-8"))
     )
     result = _sweep(project, [case])
     # The MUTATED text, read where the child runs, is what proves both edits
-    # landed. Edit 1 bites on its own, so the verdict alone cannot.
+    # landed. Edit 1 bites on its own, so the verdict alone cannot. Children
+    # run unmutated, mutated, unmutated: the second is the mutated one.
+    seen = {"text": texts[1]}
     assert "if False:" in seen["text"]
     assert "# touched" in seen["text"]
     assert result.results[0].outcome == ms.BIT
@@ -1088,12 +1116,7 @@ def test_only_pytest_exit_0_and_1_mean_the_tests_ran(project, monkeypatch, rc, e
     never emits (it prints no zero counts), and under rc=0 it is a disagreement.
     """
 
-    class Fake:
-        returncode = rc
-        stdout = "1 failed in 0.10s" if rc == 1 else "1 passed in 0.10s"
-        stderr = ""
-
-    monkeypatch.setattr(ms, "_pytest", lambda *a, **k: Fake())
+    _scripted(monkeypatch, rc, "1 failed in 0.10s" if rc == 1 else "1 passed in 0.10s")
     result = _sweep(project, [_case(project)])
     assert result.results[0].outcome == expected
 
@@ -1526,6 +1549,79 @@ def test_the_per_case_timeout_defaults_to_the_house_floor():
 # --------------------------------------------------------------------------
 
 
+_MARKER_TESTS = """\
+import os, guard
+from pathlib import Path
+
+WHERE = {where}
+
+def test_writes_marker_and_pins_guard():
+    Path(WHERE, "MARKER").write_text("x")
+    assert guard.is_allowed("dangerous") is False
+
+def test_fails_if_marker():
+    assert not Path(WHERE, "MARKER").exists()
+"""
+
+
+def _marker_cases(project, where: str):
+    """Case A catches a real mutation and leaves a MARKER behind; case B makes a
+    behaviourally NULL mutation whose test fails only if a marker exists. A B
+    that reads BIT was faked by A's leftovers."""
+    (project / "test_marker.py").write_text(_MARKER_TESTS.format(where=where), encoding="utf-8")
+    a = _case(project, label="A", test="test_marker.py::test_writes_marker_and_pins_guard")
+    b = _case(
+        project,
+        label="B (null mutation)",
+        anchor="return True",
+        replacement="return bool(1)",
+        test="test_marker.py::test_fails_if_marker",
+        why="a null mutation: nothing should notice it",
+    )
+    return [a, b]
+
+
+@pytest.mark.parametrize(
+    "where,b_outcome",
+    [
+        ("'.'", ms.SURVIVED),  # the copy's own tree
+        ("os.environ['TMPDIR']", ms.SURVIVED),  # the child's temp directory
+        ("os.environ['HOME']", ms.ABORTED),  # shared by every copy
+    ],
+    ids=["repo-tree", "tmpdir", "home"],
+)
+def test_a_previous_cases_leftovers_never_fake_a_BIT(project, where, b_outcome):
+    """Codex P1 on #1851 (`:880`): one copy for every case, and a file case A's
+    test wrote made case B's irrelevant mutation read as caught. A fresh copy
+    and TMPDIR per case remove the first two channels; HOME is shared by
+    design, and the control run turns that leftover into an ABORT."""
+    result = _sweep(project, _marker_cases(project, where))
+    a, b = result.results
+    assert a.outcome == ms.BIT, a.detail
+    assert b.outcome == b_outcome, b.detail
+    if b_outcome == ms.ABORTED:
+        assert "UNMUTATED" in b.detail
+    assert not result.clean
+
+
+def test_a_caller_tree_that_changes_mid_sweep_aborts_the_later_case(project, monkeypatch):
+    """Copies are made one per case, so a peer edit to the caller's tree between
+    two of them would put different trees under different cases. The snapshot
+    fingerprint refuses that rather than judging a second tree."""
+    calls = {"n": 0}
+
+    def edit_caller(_cwd):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            (project / "peer.txt").write_text("a peer wrote this\n", encoding="utf-8")
+
+    _around_child(monkeypatch, after=edit_caller)
+    result = _sweep(project, [_case(project, label="first"), _case(project, label="second")])
+    assert result.results[0].outcome == ms.BIT, result.results[0].detail
+    assert result.results[1].outcome == ms.ABORTED
+    assert "changed during the sweep" in result.results[1].detail
+
+
 def test_an_absolute_selector_runs_the_COPYS_test(project):
     """Codex P2 on #1851 (`:697`): an absolute node id collected the caller's
     test file, which imported the caller's unmutated source and read SURVIVED
@@ -1859,6 +1955,228 @@ def test_a_manifest_level_field_of_the_wrong_type_is_refused(project, tmp_path, 
         ms.main([str(manifest), "--repo", str(project)])
 
 
+def test_the_mutation_job_does_not_persist_checkout_credentials():
+    """The job runs repository tests and needs no git credential afterwards."""
+    import yaml
+
+    doc = yaml.safe_load((_REPO / ".github" / "workflows" / "ci.yml").read_text())
+    steps = doc["jobs"]["mutation-gate"]["steps"]
+    checkout = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout")]
+    assert checkout, "precondition: the job checks out the repository"
+    assert all(s.get("with", {}).get("persist-credentials") is False for s in checkout)
+
+
+# --------------------------------------------------------------------------
+# FROM THE PRE-PR REVIEW of the per-case copy. Each failed before its fix.
+# --------------------------------------------------------------------------
+
+_CONSUMED_TESTS = """\
+import os, guard
+from pathlib import Path
+
+M = Path(os.environ["HOME"], "MARKER")
+
+def test_leaves_debris_when_failing():
+    ok = guard.is_allowed("dangerous") is False
+    if not ok:
+        M.write_text("x")   # cleanup skipped because the test failed
+    assert ok
+
+def test_consumes_marker():
+    existed = M.exists()
+    M.unlink(missing_ok=True)   # a stale-lock style fixture
+    assert not existed
+"""
+
+
+def test_leftover_state_the_mutated_run_uses_up_never_fakes_a_BIT(project):
+    """Review repro: case A's mutated run leaves a marker in HOME; case B makes
+    a NULL mutation, and its test deletes the marker while failing on it. An
+    after-only control then passed and B scored a clean BIT. The unmutated run
+    BEFORE the mutation sees the marker and ABORTS instead."""
+    (project / "test_consumed.py").write_text(_CONSUMED_TESTS, encoding="utf-8")
+    a = _case(project, label="A", test="test_consumed.py::test_leaves_debris_when_failing")
+    b = _case(
+        project,
+        label="B (null mutation)",
+        anchor="return True",
+        replacement="return bool(1)",
+        test="test_consumed.py::test_consumes_marker",
+        why="a null mutation: nothing should notice it",
+    )
+    result = _sweep(project, [a, b], check_baseline=True)
+    assert result.results[0].outcome == ms.BIT, result.results[0].detail
+    assert result.results[1].outcome == ms.ABORTED, result.results[1].detail
+    assert "UNMUTATED" in result.results[1].detail
+    assert not result.clean
+
+
+def _prepare_overlay(project, kind: str):
+    """Put one path into the overlay BEFORE the sweep, and return the peer edit
+    that changes only the property `kind` names (the path set stays the same)."""
+    notes = project / "notes.txt"
+    if kind == "symlink-target":
+        (project / "ln").symlink_to("guard.py")
+
+        def edit():
+            (project / "ln").unlink()
+            (project / "ln").symlink_to("test_guard.py")
+
+        return edit
+    notes.write_text("v0\n", encoding="utf-8")
+    _commit_all(project)
+    if kind == "assume-unchanged":
+        _git(project, "update-index", "--assume-unchanged", "notes.txt")
+    notes.write_text("v1\n", encoding="utf-8")
+    if kind == "mode":
+        return lambda: os.chmod(notes, 0o755)
+    return lambda: notes.write_text("v2\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("kind", ["content", "mode", "symlink-target", "assume-unchanged"])
+def test_every_part_of_the_fingerprint_catches_mid_sweep_drift(project, monkeypatch, kind):
+    """Review mutants: dropping the content hash, the mode or the link target
+    from the fingerprint survived, because the only drift test changed the PATH
+    set. Each edit here changes one property of a path already overlaid."""
+    edit = _prepare_overlay(project, kind)
+    calls = {"n": 0}
+
+    def drift(_cwd):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            edit()
+
+    _around_child(monkeypatch, after=drift)
+    result = _sweep(project, [_case(project, label="first"), _case(project, label="second")])
+    assert result.results[0].outcome == ms.BIT, result.results[0].detail
+    assert result.results[1].outcome == ms.ABORTED
+    assert "changed during the sweep" in result.results[1].detail
+
+
+def test_drift_during_the_baselines_stops_the_sweep(project, monkeypatch):
+    """Review mutant: turning off the baseline-phase drift check survived."""
+    edit = _prepare_overlay(project, "content")
+    calls = {"n": 0}
+
+    def drift(_cwd):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            edit()
+
+    _around_child(monkeypatch, after=drift)
+    other = _case(project, label="other baseline", test="test_guard.py::test_allows_ordinary")
+    with pytest.raises(RuntimeError, match="while the sweep ran its baselines"):
+        _sweep(project, [_case(project), other], check_baseline=True)
+
+
+def test_a_case_whose_copy_cannot_be_made_aborts_alone(project, monkeypatch):
+    """A file vanishing mid-overlay, or a full disk, raised out of the sweep and
+    lost every earlier result; now only that case ABORTS."""
+    real = ms._overlay
+    calls = {"n": 0}
+
+    def overlay(top, tree):
+        calls["n"] += 1
+        if calls["n"] == 3:  # 1 = snapshot copy, 2 = first case, 3 = second case
+            raise RuntimeError("injected: a file vanished mid-overlay")
+        return real(top, tree)
+
+    monkeypatch.setattr(ms, "_overlay", overlay)
+    result = _sweep(project, [_case(project, label="first"), _case(project, label="second")])
+    assert result.results[0].outcome == ms.BIT, result.results[0].detail
+    assert result.results[1].outcome == ms.ABORTED
+    assert "a file vanished mid-overlay" in result.results[1].detail
+    assert _copies_left() == []
+
+
+@pytest.mark.parametrize(
+    "seam,exc",
+    [
+        ("_copy_env", OSError("injected: no space left on device")),
+        ("_copy_env", RuntimeError("injected")),
+        ("run_case", ValueError("injected: surrogates not allowed")),
+        ("run_case", MemoryError("injected")),
+    ],
+    ids=["env-oserror", "env-runtimeerror", "run-valueerror", "run-memoryerror"],
+)
+def test_an_exception_in_one_case_costs_only_that_case(project, monkeypatch, seam, exc):
+    """CodeRabbit round 3 on #3802: only the copy's creation was guarded, so any
+    other exception lost every result the sweep already had. An independent
+    audit counted 17 such paths; one boundary per case closes them all."""
+    real = getattr(ms, seam)
+    calls = {"n": 0}
+
+    def fails_on_the_first_call(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise exc
+        return real(*a, **kw)
+
+    monkeypatch.setattr(ms, seam, fails_on_the_first_call)
+    result = _sweep(project, [_case(project, label="first"), _case(project, label="second")])
+    assert [r.case.label for r in result.results] == ["first", "second"]
+    assert result.results[0].outcome == ms.ABORTED
+    assert type(exc).__name__ in result.results[0].detail
+    assert result.results[1].outcome == ms.BIT, result.results[1].detail
+    assert _copies_left() == []
+
+
+def test_a_label_the_stream_cannot_encode_does_not_lose_the_report(project, tmp_path, monkeypatch):
+    """A lone surrogate in one label made the final print raise, after every
+    case had run, and the whole report was lost."""
+    import io
+    import json
+
+    case = _case(project, label="bad\ud800label")
+    swept = ms.Sweep(results=[ms.Result(case, ms.BIT, "")])
+    monkeypatch.setattr(ms, "sweep", lambda *a, **kw: swept)
+    raw = io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(raw, encoding="utf-8", errors="strict"))
+    manifest = tmp_path / "m.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "cases": [
+                    {
+                        "label": "l",
+                        "path": "guard.py",
+                        "test": "test_guard.py",
+                        "why": "w",
+                        "validator": "python",
+                        "edits": [{"anchor": "return True", "replacement": "return bool(1)"}],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert ms.main([str(manifest), "--repo", str(project)]) == 0
+    sys.stdout.flush()
+    assert b"1 bit, 0 SURVIVED, 0 ABORTED" in raw.getvalue()
+
+
+def test_reading_a_runs_output_leaves_the_shared_offset_alone(tmp_path):
+    """The file's offset is shared with any descendant still holding it. A
+    `seek(0)` here made a surviving writer overwrite the summary from byte 0,
+    which read as a damaged run and ABORTED."""
+    with open(tmp_path / "out", "wb+") as fh:
+        fh.write(b"line one\nsummary\n")
+        fh.flush()
+        at = fh.tell()
+        assert ms._whole(fh) == b"line one\nsummary\n"
+        assert os.lseek(fh.fileno(), 0, os.SEEK_CUR) == at
+
+
+@pytest.mark.parametrize("key", ["TMPDIR", "PYTHONPYCACHEPREFIX"])
+@pytest.mark.parametrize("scope", ["sweep", "case"])
+def test_env_may_not_override_what_each_copy_owns(project, key, scope):
+    """A manifest TMPDIR would quietly share one temp directory between cases."""
+    env = {key: "/somewhere/shared"}
+    case = _case(project, env=env if scope == "case" else {})
+    with pytest.raises(ValueError, match="sets for itself"):
+        _sweep(project, [case], env=env if scope == "sweep" else None)
+
+
 # --------------------------------------------------------------------------
 # ROUND 2 (Codex): the copy's two boundaries, filesystem and process.
 # --------------------------------------------------------------------------
@@ -1939,6 +2257,117 @@ def test_a_dotdot_after_a_link_is_refused_in_every_channel(project, how, channel
         _sweep(project, **kwargs)
 
 
+def _link_that_only_the_copy_shows_leaving(project, how):
+    """Each resolves INSIDE the caller's repository, so judging it there passes
+    it, and OUTSIDE the copy, back at the caller's tree:
+      * chain: `alias -> inner`, `inner -> <repo>/sub`, an absolute link one
+        step on from the first target;
+      * surplus: one relative link whose `..`s reach the root from any depth
+        and name the caller's absolute path."""
+    (project / "sub").mkdir()
+    (project / "sub" / "keep").write_text("", encoding="utf-8")
+    if how == "chain":
+        (project / "inner").symlink_to(project / "sub", target_is_directory=True)
+        (project / "alias").symlink_to("inner", target_is_directory=True)
+    else:
+        target = "../" * 40 + str(project / "sub").lstrip("/")
+        (project / "alias").symlink_to(target, target_is_directory=True)
+    _commit_all(project)
+
+
+@pytest.mark.parametrize("how", ["chain", "surplus"])
+@pytest.mark.parametrize("channel", ["pytest_arg", "env", "pythonpath", "selector"])
+def test_a_named_path_is_judged_in_the_copy_it_runs_in(project, how, channel):
+    """Codex round 2 on #3802: the link walk resolved paths in the CALLER's
+    tree, while the child runs in the copy, so both links below passed it and
+    read SURVIVED for a mutation the test catches."""
+    _link_that_only_the_copy_shows_leaving(project, how)
+    if channel == "pytest_arg":
+        kwargs = {"cases": [_case(project, pytest_args=("-o=pythonpath=alias",))]}
+    elif channel == "env":
+        kwargs = {"cases": [_case(project, env={"PYTHONPATH": "alias"})]}
+    elif channel == "pythonpath":
+        kwargs = {"cases": [_case(project)], "pythonpath": ("alias",)}
+    else:
+        kwargs = {"cases": [_case(project, test="alias/test_x.py::test_blocks_danger")]}
+    with pytest.raises(ValueError, match="out of the copy"):
+        _sweep(project, **kwargs)
+
+
+_LEAVES_A_WORKER = (
+    "import subprocess\n"
+    "subprocess.Popen(['sleep', '20'], start_new_session={own})\n"
+    "print('finished')\n"
+)
+
+
+@pytest.mark.parametrize("own", [False, True], ids=["same-session", "own-session"])
+def test_a_run_ends_when_its_process_does_not_when_its_output_closes(tmp_path, own):
+    """Codex round 2 on #3802: a descendant that inherited stdout held the pipe
+    open, so a run that had finished waited out the whole timeout and aborted
+    a passing baseline. A descendant in its own session escapes the group kill,
+    so killing first and then draining a pipe would still hang on it."""
+    import time
+
+    started = time.monotonic()
+    proc = ms._pytest(
+        [sys.executable, "-c", _LEAVES_A_WORKER.format(own=own)],
+        cwd=tmp_path,
+        env=dict(os.environ),
+        timeout=15,
+    )
+    assert time.monotonic() - started < 10
+    assert proc.returncode == 0
+    assert "finished" in proc.stdout
+
+
+@pytest.mark.parametrize("capture", ["-s", "--capture=sys"])
+def test_a_run_without_fd_capture_still_reports(tmp_path, capture):
+    """The two pytest settings that let a test's subprocess inherit the run's
+    own stdout: the real shape of the hang."""
+    (tmp_path / "test_w.py").write_text(
+        "import subprocess\n\ndef test_w():\n    subprocess.Popen(['sleep', '20'])\n",
+        encoding="utf-8",
+    )
+    proc = ms._pytest(
+        [sys.executable, "-m", "pytest", "test_w.py", "-q", "-p", "no:cacheprovider", capture],
+        cwd=tmp_path,
+        env=dict(os.environ),
+        timeout=15,
+    )
+    assert proc.returncode == 0
+    assert "1 passed" in proc.stdout
+
+
+def test_a_git_timeout_costs_a_case_not_the_sweep(project, monkeypatch):
+    """`git worktree add` can wait on a hook's daemon. `sweep` turns a copy that
+    could not be made into a per-case ABORT by catching RuntimeError and OSError,
+    so a raw TimeoutExpired escaped it and lost every result so far."""
+
+    def timed_out(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, 1)
+
+    monkeypatch.setattr(ms.subprocess, "run", timed_out)
+    with pytest.raises(RuntimeError, match="timed out"):
+        ms._git(project, "status")
+
+
+def test_a_validator_timeout_is_a_reason_not_a_crash(project, monkeypatch):
+    def timed_out(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, 1)
+
+    case = ms.Case(
+        label="b",
+        path=str(project / "guard.sh"),
+        test="t",
+        edits=(ms.Edit("a", "b"),),
+        validator="bash",
+        why="a timeout is reported",
+    )
+    monkeypatch.setattr(ms.subprocess, "run", timed_out)
+    assert "timed out" in ms._validate(case, "true\n")
+
+
 def test_a_relative_link_that_stays_inside_is_accepted(project):
     """A relative link inside the repository is reproduced inside the copy."""
     (project / "pkg").mkdir()
@@ -1993,3 +2422,74 @@ def test_no_child_process_outlives_its_run(project, tmp_path_factory, how, tail,
     time.sleep(3)
     assert started.exists(), "the test body never ran, so this proves nothing"
     assert not mark.exists(), "a child of the test outlived its run"
+
+
+# --------------------------------------------------------------------------
+# #3802 ROUND 1 (Codex): what each run sees that the copy did not reproduce.
+# --------------------------------------------------------------------------
+
+
+def test_a_permission_only_difference_reaches_the_copy(project):
+    """git records only the executable bit, so a clean tracked file chmodded
+    0644 -> 0600 never showed in `git diff`; the copy got the checkout's mode,
+    and a test pinning the caller's mode ran against a different tree."""
+    notes = project / "notes.txt"
+    notes.write_text("x\n", encoding="utf-8")
+    os.chmod(notes, 0o644)
+    _commit_all(project)
+    os.chmod(notes, 0o600)
+    (project / "test_mode.py").write_text(
+        "import os, guard\n"
+        "def test_mode_and_guard():\n"
+        "    assert os.stat('notes.txt').st_mode & 0o777 == 0o600\n"
+        "    assert guard.is_allowed('dangerous') is False\n",
+        encoding="utf-8",
+    )
+    case = _case(project, test="test_mode.py::test_mode_and_guard")
+    result = _sweep(project, [case], check_baseline=True)
+    assert result.results[0].outcome == ms.BIT, result.results[0].detail
+
+
+def test_a_permission_change_mid_sweep_is_drift(project, monkeypatch):
+    notes = project / "notes.txt"
+    notes.write_text("x\n", encoding="utf-8")
+    os.chmod(notes, 0o644)
+    _commit_all(project)
+    calls = {"n": 0}
+
+    def drift(_cwd):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            os.chmod(notes, 0o600)
+
+    _around_child(monkeypatch, after=drift)
+    result = _sweep(project, [_case(project, label="first"), _case(project, label="second")])
+    assert result.results[1].outcome == ms.ABORTED
+    assert "changed during the sweep" in result.results[1].detail
+
+
+def test_each_run_gets_its_own_bytecode_cache(project):
+    """Codex round 1: one PYTHONPYCACHEPREFIX per copy was shared by a case's
+    three runs. A test that compiles with an unchecked-hash cache (which
+    `py_compile` writes despite PYTHONDONTWRITEBYTECODE) made the mutated run
+    import the unmutated run's code, and a caught mutation read SURVIVED."""
+    (project / "flag.py").write_text("def allowed():\n    return True\n", encoding="utf-8")
+    (project / "test_flag.py").write_text(
+        "import py_compile, flag\n"
+        "def test_allowed():\n"
+        "    py_compile.compile(flag.__file__,\n"
+        "        invalidation_mode=py_compile.PycInvalidationMode.UNCHECKED_HASH)\n"
+        "    assert flag.allowed() is True\n",
+        encoding="utf-8",
+    )
+    _commit_all(project)
+    case = _case(
+        project,
+        path=project / "flag.py",
+        anchor="return True",
+        replacement="return None",
+        test="test_flag.py::test_allowed",
+        why="allowed() must return True",
+    )
+    result = _sweep(project, [case])
+    assert result.results[0].outcome == ms.BIT, result.results[0].detail
