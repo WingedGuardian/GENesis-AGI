@@ -254,6 +254,18 @@ def _hermetic_squash_body_file(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_main_ci_note(monkeypatch):
+    """Skip the ``--check-pr`` red-base NOTE's reads for EVERY hook test.
+
+    The NOTE reads the PR's base ref and the base branch's CI runs; report tests
+    run as subprocesses too, hence an environment variable. The NOTE is advisory
+    and never moves a verdict. Its own behaviour is tested in
+    tests/test_hooks/test_merge_gate_main_ci_note.py, which clears this per case."""
+    monkeypatch.setenv("_TEST_MAIN_CI_NOTE", "off")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_main_reverts(monkeypatch):
     """Pin the ``--check-pr`` ``main-reverts`` row's commit read for EVERY hook test.
 
@@ -265,6 +277,19 @@ def _hermetic_main_reverts(monkeypatch):
     own behaviour is tested in tests/test_hooks/test_merge_gate_main_reverts.py,
     which overrides this per case."""
     monkeypatch.setenv("_TEST_GH_PR_COMMITS", '{"sha": "' + "0" * 40 + '", "parents": 1}')
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_stale_base_note(monkeypatch):
+    """Switch off the ``--check-pr`` stale-base NOTE for EVERY hook test.
+
+    The NOTE reads the PR head's CI runs, the base's commits and their files, so
+    without this every test that drives ``check_pr_report`` would make live calls
+    (some as a subprocess, hence an environment variable the children inherit). It
+    is advisory and never moves a verdict. Its own behaviour is tested in
+    tests/test_hooks/test_merge_gate_stale_base_note.py, which clears this per case."""
+    monkeypatch.setenv("_TEST_STALE_BASE_NOTE", "off")
     yield
 
 

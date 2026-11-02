@@ -732,17 +732,7 @@ When a new CC version is released, run through this:
    safety guard a real payload, so it catches a changed hook payload shape that
    would otherwise silently disable the guards (see the hook input contract
    under "Actively Used" above).
-8. **Re-probe the `AskUserQuestion` rewrite path.** The gate-menu substitution
-   (`scripts/hooks/ask_gate_menu.py`) rests on `updatedInput` rewriting an
-   `AskUserQuestion` call, and on it working ONLY without a `permissionDecision` field.
-   Both are documented or measured, but the docs carry no version contract and do not
-   enumerate the contexts where the field degrades. Make one real ask at the cap and
-   confirm the appended question renders.
-   **Failure here is QUIET, and quiet in the direction that does not announce itself:**
-   the session simply relays the gate's options in its own words again — the
-   pre-2026-09 behaviour, and the exact thing the mechanism exists to stop. Nothing
-   blocks and nothing errors, because by design no gate reads this back.
-9. **Re-run the WebSearch override against the candidate** (`plugins/genesis-web-override`,
+8. **Re-run the WebSearch override against the candidate** (`plugins/genesis-web-override`,
    a function-hook plugin; early access, so its API can move in any release). In a
    scratch cwd: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude -p --model haiku
    --plugin-dir <repo>/plugins/genesis-web-override --debug-file <f> "Use WebSearch once …"`
@@ -750,7 +740,7 @@ When a new CC version is released, run through this:
    `resolved by a hooks module (result)` and no `does not match its output shape`.
    A shape Claude Code stops accepting reaches the model as a tool error, not as
    the built-in search, so this is the one place the regression shows.
-10. **Update this document** with findings.
+9. **Update this document** with findings.
 
 ---
 
@@ -1328,8 +1318,9 @@ difference and send a real turn.
 A PreToolUse hook returning `updatedInput` under `hookSpecificOutput` rewrites the
 tool input before the tool runs. It is **documented** (hooks reference), it is
 **documented as applying to `AskUserQuestion`**, and it is what lets a gate put its own
-question in front of the user instead of the session's retelling
-(`scripts/hooks/ask_gate_menu.py`).
+question in front of the user instead of the session's retelling. (The
+gate-menu hook that used it was removed with the retired local review streak;
+the measured behaviour below still holds.)
 
 | shape | payload | result |
 |---|---|---|

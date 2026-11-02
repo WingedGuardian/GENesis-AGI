@@ -81,7 +81,15 @@ database: the candidate and the live database are compared on their schema
 (DDL), `user_version` and applied migrations, and any difference, or a
 comparison that cannot run, restores it. When nothing differs the database is
 kept, with the writes made since the snapshot. Data migrations are not part of
-the comparison. An incomplete database rollback does not explicitly restart
+the comparison. The restore itself goes through SQLite's backup API into the
+live file, never a file copy: Claude Code MCP servers keep the database open
+while services are down, and a copy underneath them leaves a file the restarted
+server cannot open for writing. Readers stay attached and see the restored data
+on their next transaction; nothing is terminated. It is bounded (600 s,
+`GENESIS_UPDATE_DB_RESTORE_TIMEOUT_S`), refuses without enough free disk for a
+WAL the size of the database, and a restore stopped before it commits leaves the
+live database unchanged. The rollback report says which happened: not restored,
+restored, or restored but not verified. An incomplete database rollback does not explicitly restart
 services. External watchdog recovery is unchanged.
 
 Guardian whole-container snapshot rollback is different: its existing second

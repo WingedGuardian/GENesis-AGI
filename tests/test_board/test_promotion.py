@@ -202,6 +202,24 @@ async def test_already_linked_source_is_refused(db):
     assert out["status"] == "duplicate" and out["issue"] == "owner/repo#5"
 
 
+async def test_a_scanner_state_refusal_names_the_state_not_a_rewrite(db, monkeypatch):
+    finding = Finding(
+        kind=FindingKind.FINGERPRINT,
+        severity=Severity.BLOCK,
+        message="Release fingerprint file exists but could not be read",
+        scanner="fingerprint",
+        detail="unreadable_fingerprint_file",
+    )
+    monkeypatch.setattr(
+        "genesis.contribution.scan_prose",
+        lambda _text, **_k: SanitizerResult(ok=False, findings=[finding], scanners_run=[]),
+    )
+    out = await _propose(db)
+    assert out["status"] == "blocked"
+    assert out["environment"] == ["unreadable_fingerprint_file"]
+    assert "rewrite" not in out["reason"]
+
+
 async def test_scan_refusal_reports_line_and_scanner_only(db, monkeypatch):
     secret = "SECRET-MATCHED-TEXT"
     finding = Finding(
