@@ -285,8 +285,9 @@ def test_a_crash_still_removes_the_copy_and_its_registration(project, monkeypatc
     monkeypatch.setattr(ms, "_pytest", boom)
     target = project / "guard.py"
     before = target.read_bytes()
-    with pytest.raises(RuntimeError, match="injected"):
-        _sweep(project, [_case(project)])
+    result = _sweep(project, [_case(project)])
+    assert result.results[0].outcome == ms.ABORTED
+    assert "injected" in result.results[0].detail
     assert target.read_bytes() == before
     assert _worktrees(project) == [str(project)]
     assert _copies_left() == []
@@ -2084,8 +2085,86 @@ def test_a_case_whose_copy_cannot_be_made_aborts_alone(project, monkeypatch):
     result = _sweep(project, [_case(project, label="first"), _case(project, label="second")])
     assert result.results[0].outcome == ms.BIT, result.results[0].detail
     assert result.results[1].outcome == ms.ABORTED
-    assert "could not make this case's copy" in result.results[1].detail
+    assert "a file vanished mid-overlay" in result.results[1].detail
     assert _copies_left() == []
+
+
+@pytest.mark.parametrize(
+    "seam,exc",
+    [
+        ("_copy_env", OSError("injected: no space left on device")),
+        ("_copy_env", RuntimeError("injected")),
+        ("run_case", ValueError("injected: surrogates not allowed")),
+        ("run_case", MemoryError("injected")),
+    ],
+    ids=["env-oserror", "env-runtimeerror", "run-valueerror", "run-memoryerror"],
+)
+def test_an_exception_in_one_case_costs_only_that_case(project, monkeypatch, seam, exc):
+    """CodeRabbit round 3 on #3802: only the copy's creation was guarded, so any
+    other exception lost every result the sweep already had. An independent
+    audit counted 17 such paths; one boundary per case closes them all."""
+    real = getattr(ms, seam)
+    calls = {"n": 0}
+
+    def fails_on_the_first_call(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise exc
+        return real(*a, **kw)
+
+    monkeypatch.setattr(ms, seam, fails_on_the_first_call)
+    result = _sweep(project, [_case(project, label="first"), _case(project, label="second")])
+    assert [r.case.label for r in result.results] == ["first", "second"]
+    assert result.results[0].outcome == ms.ABORTED
+    assert type(exc).__name__ in result.results[0].detail
+    assert result.results[1].outcome == ms.BIT, result.results[1].detail
+    assert _copies_left() == []
+
+
+def test_a_label_the_stream_cannot_encode_does_not_lose_the_report(project, tmp_path, monkeypatch):
+    """A lone surrogate in one label made the final print raise, after every
+    case had run, and the whole report was lost."""
+    import io
+    import json
+
+    case = _case(project, label="bad\ud800label")
+    swept = ms.Sweep(results=[ms.Result(case, ms.BIT, "")])
+    monkeypatch.setattr(ms, "sweep", lambda *a, **kw: swept)
+    raw = io.BytesIO()
+    monkeypatch.setattr(sys, "stdout", io.TextIOWrapper(raw, encoding="utf-8", errors="strict"))
+    manifest = tmp_path / "m.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "cases": [
+                    {
+                        "label": "l",
+                        "path": "guard.py",
+                        "test": "test_guard.py",
+                        "why": "w",
+                        "validator": "python",
+                        "edits": [{"anchor": "return True", "replacement": "return bool(1)"}],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert ms.main([str(manifest), "--repo", str(project)]) == 0
+    sys.stdout.flush()
+    assert b"1 bit, 0 SURVIVED, 0 ABORTED" in raw.getvalue()
+
+
+def test_reading_a_runs_output_leaves_the_shared_offset_alone(tmp_path):
+    """The file's offset is shared with any descendant still holding it. A
+    `seek(0)` here made a surviving writer overwrite the summary from byte 0,
+    which read as a damaged run and ABORTED."""
+    with open(tmp_path / "out", "wb+") as fh:
+        fh.write(b"line one\nsummary\n")
+        fh.flush()
+        at = fh.tell()
+        assert ms._whole(fh) == b"line one\nsummary\n"
+        assert os.lseek(fh.fileno(), 0, os.SEEK_CUR) == at
 
 
 @pytest.mark.parametrize("key", ["TMPDIR", "PYTHONPYCACHEPREFIX"])

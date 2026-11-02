@@ -90,6 +90,7 @@ import subprocess
 import sys
 import tempfile
 import tokenize
+import traceback
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -1081,14 +1082,24 @@ def _pytest(
             raise
         finally:
             _kill_group(proc.pid)
-        out.seek(0)
-        err.seek(0)
         return subprocess.CompletedProcess(
             cmd,
             proc.returncode,
-            out.read().decode("utf-8", errors="replace"),
-            err.read().decode("utf-8", errors="replace"),
+            _whole(out).decode("utf-8", errors="replace"),
+            _whole(err).decode("utf-8", errors="replace"),
         )
+
+
+def _whole(fh) -> bytes:
+    """What ``fh`` holds now, read by position. Its offset is shared with any
+    descendant still holding the file (one in its own session escapes the group
+    kill), so a `seek(0)` here would make that writer overwrite the summary."""
+    fd, got, at = fh.fileno(), [], 0
+    size = os.fstat(fd).st_size
+    while at < size and (chunk := os.pread(fd, min(1 << 20, size - at), at)):
+        got.append(chunk)
+        at += len(chunk)
+    return b"".join(got)
 
 
 def _kill_group(pgid: int) -> None:
@@ -1434,42 +1445,43 @@ def sweep(
             if problem:
                 raise RuntimeError(problem)
 
+    def one(case: Case, target: _Target) -> Result:
+        info: dict = {}
+        with isolated_copy(repo, tmp_root, info) as root:
+            if info["fingerprint"] != snapshot:
+                return Result(
+                    case,
+                    ABORTED,
+                    "the caller's tree changed during the sweep; this copy is not the "
+                    "tree the other cases were judged against",
+                )
+            return run_case(
+                case,
+                _Target(root / rels[case.path], target.pristine, target.mode),
+                cwd=root,
+                python=python,
+                env=_copy_env(env, root, info["holder"], pythonpath),
+                timeout=timeout,
+                available=available,
+                selector=selectors[id(case)],
+            )
+
     out = Sweep()
     for case in cases:
         target = targets[case.path]
         if isinstance(target, str):
             out.results.append(Result(case, ABORTED, target))
             continue
-        info = {}
-        with contextlib.ExitStack() as stack:
-            # A copy that cannot be made (a file vanishing mid-overlay, a full
-            # disk) costs this case, not every result the sweep already has.
-            try:
-                root = stack.enter_context(isolated_copy(repo, tmp_root, info))
-            except (RuntimeError, OSError) as exc:
-                out.results.append(Result(case, ABORTED, f"could not make this case's copy: {exc}"))
-                continue
-            if info["fingerprint"] != snapshot:
-                out.results.append(
-                    Result(
-                        case,
-                        ABORTED,
-                        "the caller's tree changed during the sweep; this copy is not the "
-                        "tree the other cases were judged against",
-                    )
-                )
-                continue
+        # The ONE error boundary per case: results live only in `out` until the
+        # final print, so anything escaping here would lose every earlier one.
+        # Deliberately broad: a list of types missed MemoryError and
+        # RecursionError. An abort is never a pass, and the traceback is kept.
+        try:
+            out.results.append(one(case, target))
+        except Exception as exc:
+            traceback.print_exc()
             out.results.append(
-                run_case(
-                    case,
-                    _Target(root / rels[case.path], target.pristine, target.mode),
-                    cwd=root,
-                    python=python,
-                    env=_copy_env(env, root, info["holder"], pythonpath),
-                    timeout=timeout,
-                    available=available,
-                    selector=selectors[id(case)],
-                )
+                Result(case, ABORTED, f"this case could not finish: {type(exc).__name__}: {exc}")
             )
     return out
 
@@ -1619,6 +1631,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # A label the stream cannot encode must not lose the report at the last step.
+    sys.stdout.reconfigure(errors="backslashreplace")
     args = build_parser().parse_args(argv)
     # Resolved ONCE, before anything is derived from it. A relative --repo once
     # reached the child as a relative PYTHONPATH, resolved against the child's
