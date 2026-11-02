@@ -1,9 +1,10 @@
 """Rollback + recovery correctness for scripts/update.sh (deploy-audit P6, #6/#7).
 
-#7 — a rollback that runs AFTER migrations applied must restore the pre-update DB
-     (else the rolled-back old code runs against a migrated schema). Gated on a
-     MIGRATIONS_RAN flag set BEFORE the runner (a partial failure still altered
-     the schema); the server is stopped during rollback so the DB is quiescent.
+#7 — a rollback after the update changed the database (its DDL, user_version or
+     applied migrations) must restore the pre-update DB (else the rolled-back old
+     code runs against a changed schema), and one that changed none of them keeps
+     it with its writes. DB_RESTORE_OWED is measured at rollback by comparing the
+     snapshot with the live DB; the server is stopped during rollback.
 #6 — the restart+health block is skipped when WERE_RUNNING is empty, so a
      recovery re-run (a prior failed update left the server stopped) recorded
      "success" with the server down and no health check. Detect a recovery run
@@ -33,39 +34,53 @@ def text() -> str:
     return UPDATE_SH.read_text()
 
 
-# ── #7 — DB restore on rollback when migrated ──────────────────────────────
-def test_migrations_ran_flag_set_before_runner(text: str) -> None:
-    runner = text.find("-m genesis.db.migrations --apply")
-    flag = text.find("MIGRATIONS_RAN=1")
-    assert -1 < flag < runner, "MIGRATIONS_RAN=1 must be set BEFORE the migration runner"
-    assert "MIGRATIONS_RAN=0" in text, "the flag must be initialized to 0"
-
-
-def test_rollback_restores_db_only_when_migrated(text: str) -> None:
+# ── #7 — DB restore on rollback when the update changed the database ────────
+def test_restore_owed_is_measured_at_rollback(text: str) -> None:
+    """Whether the update changed the database is measured when the rollback
+    decides (test_update_db_restore_owed.py covers the measurement)."""
+    assert "DB_RESTORE_OWED=0" in text, "the flag must be initialized to 0"
     rb = text[text.find("_do_rollback() {") : text.find("To diagnose")]
-    assert '[ "${MIGRATIONS_RAN:-0}" = "1" ]' in rb, "DB restore must be gated on MIGRATIONS_RAN"
+    assert rb.index('_measure_db_restore_owed "$code_action" "$server_down"') < rb.index(
+        "# BEGIN rollback-db-decision"
+    )
+
+
+def test_rollback_restores_db_only_when_owed(text: str) -> None:
+    rb = text[text.find("_do_rollback() {") : text.find("To diagnose")]
+    assert '[ "${DB_RESTORE_OWED:-0}" = "1" ]' in rb, "DB restore must be gated on DB_RESTORE_OWED"
     assert '[ "${DB_SNAPSHOT_TAKEN:-0}" != "1" ]' in rb, (
         "restore must trust the THIS-RUN snapshot flag, not mere file existence "
         "(a stale prior-run snapshot must not be restored as if current)"
     )
-    assert "migrations ran but no current DB snapshot exists" in rb, (
+    assert "a DB restore is owed but no current DB snapshot exists" in rb, (
         "migrated-but-no-snapshot must be a LOUD rollback failure, not a silent success"
     )
-    assert 'cp "$DB_FILE.pre-update.peer-restore" "$DB_FILE"' in rb, (
-        "restore copies the authority-reset pre-update candidate back"
+    assert "elif _restore_db_snapshot; then" in rb, (
+        "restore writes the authority-reset pre-update candidate back through SQLite"
     )
+    restore = text[
+        text.index("# BEGIN db-restore-through-sqlite") : text.index(
+            "# END db-restore-through-sqlite"
+        )
+    ]
+    assert '"$DB_FILE.pre-update.peer-restore" "$DB_FILE"' in restore
     # Current-run authority is granted only after the bounded worker succeeds.
     snap = text[text.index("# BEGIN db-snapshot") : text.index("# END db-snapshot")]
     assert 'exec python3 -I -S - "$1" "$2"' in snap
-    assert 'if timeout --kill-after=5s' in snap
+    assert "if timeout --kill-after=5s" in snap
     assert 'snapshot "$DB_FILE" "$_PEER_RESTORE_PY"; then\n        DB_SNAPSHOT_TAKEN=1' in snap
     # The isolated worker invokes the selected authority source before publishing.
-    assert snap.index('exec(compile(authority,') < snap.index('namespace["reset_peer_authority"](candidate)')
-    assert snap.index('namespace["reset_peer_authority"](candidate)') < snap.index('publish(candidate, guarded)')
-    assert 'if [ "$restart_ok" = "true" ] && [ "$db_ok" = "true" ]; then' in rb
-    assert 'rm -f "$DB_FILE-wal" "$DB_FILE-shm"' in rb, (
-        "restore MUST clear the stale WAL/SHM or SQLite replays the migrated changes"
+    assert snap.index("exec(compile(authority,") < snap.index(
+        'namespace["reset_peer_authority"](candidate)'
     )
+    assert snap.index('namespace["reset_peer_authority"](candidate)') < snap.index(
+        "publish(candidate, guarded)"
+    )
+    assert 'if [ "$restart_ok" = "true" ] && [ "$db_ok" = "true" ]; then' in rb
+    # No sidecar is deleted: the restore is a SQLite transaction on the live file,
+    # so the WAL holds the restored pages, not stale migrated ones, and deleting it
+    # under the readers that stay attached is what corrupted their view.
+    assert 'rm -f "$DB_FILE-wal" "$DB_FILE-shm"' not in rb
     assert '[ "$server_down" != "true" ]' in rb, (
         "DB restore must be skipped if the server is not confirmed down (don't cp a live DB)"
     )

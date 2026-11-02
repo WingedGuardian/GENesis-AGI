@@ -192,7 +192,7 @@ def _engine_script(root: Path, script_dir: Path, base: str, mu: str, pre: str = 
         'UPDATE_OWN_HEAD="$VALIDATED_HEAD"\n'
         f'_LIVE_BASE="{base}"\nDEPLOY_HEAD="$_LIVE_BASE"\n'
         'OLD_TAG=untagged\nOLD_COMMIT=old\nNEW_TAG=""\nNEW_COMMIT=""\nSTARTED_AT=now\n'
-        'MERGE_ATTEMPTED=0\nMIGRATIONS_RAN=0\nDB_FILE="$HOME/none.db"\n'
+        'MERGE_ATTEMPTED=0\nDB_RESTORE_OWED=0\nDB_FILE="$HOME/none.db"\n'
         'GENESIS_TAKE_TEMPLATES=""\nREFUSED_FILE="$HOME/.genesis/update_refused.json"\n'
         'STATE_FILE="$HOME/.genesis/update_state.json"\nWERE_RUNNING=(genesis-server)\n'
         '_STATE_WRITTEN=0\n_STATE_PHASE=""\n_LIVE_ENGINE_RAN=0\nCALLS="$HOME/calls"\n'
@@ -210,6 +210,8 @@ def _engine_script(root: Path, script_dir: Path, base: str, mu: str, pre: str = 
         )
         # The restart record (#3451) the stop and _do_rollback write.
         + _block("restart-owed")
+        # The DB-restore measurement _do_rollback runs (no snapshot here: it keeps the DB).
+        + _block("db-restore-owed")
         + _function("_write_state")
         + _function("_clear_deploy_marker")
         + _block("live-helpers")

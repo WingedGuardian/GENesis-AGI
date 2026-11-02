@@ -1882,7 +1882,8 @@ class TestCheckInlineReviewFindings:
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block, "an unrecognised format must not be guessed at"
         err = capsys.readouterr().err
-        assert "unrecognised" in err
+        # A P3 is now named as an informational P3 note (#3808), still surfaced.
+        assert "[P3: " in err
         assert "Keep extglob parentheses" in err
 
     def test_coderabbit_title_ignores_bold_inside_quoted_code(self, guard_module):

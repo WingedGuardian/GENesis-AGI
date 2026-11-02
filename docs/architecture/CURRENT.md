@@ -2576,7 +2576,13 @@ verified: 973a0e6 2026-10-30
   `20260906234824_pr_verifications` migration docstring for the full
   New-Store-Gate justification. The CONSUMER is the **validator session**
   (`scripts/pr_verification.py`, with its doctrine in the `validating-merges`
-  skill and its readers on `repo_pulse_worker.py`). The verdict is DERIVED from the
+  skill and its readers on `repo_pulse_worker.py`). Its picker,
+  `repo_pulse_worker.py --next-for-validation`, names the ONE row to work next:
+  not-yet-done, then never-attempted, then a parked row past 7 days, never
+  fail-intent; deployed rows with an `E2E:` plan first, newest merge first. Deploy
+  is merge-commit ancestry of the serving commit, except a stacked PR, which is
+  kept and labelled because ancestry cannot prove it either way. It fails closed
+  (picks nothing) when GitHub or git cannot answer. The verdict is DERIVED from the
   validator's evidence document by `session_awareness/pr_evidence.py` (a strict
   pydantic model plus a total decision tree), never asserted by the caller — a
   caller-asserted design policed by refusal rules produced documents with no legal
@@ -3252,7 +3258,9 @@ verified: 3e27b4794 2026-10-23
   is explicitly disabled. Contradictory served identities retain unresolved
   liability, while expense settlement cannot qualify invalid routing evidence.
   Frozen schedule/provider
-  mapping and dedicated nonreset credentials are required; any journal incident
+  mapping and explicit credential identity are required; dedicated mode retains
+  its nonreset-key policy, while shared mode requires a separately approved
+  operating plan. Any journal incident
   pauses new requests and replay until verified recovery. These checks do not
   admit more than reported or exact limit-minus-spend headroom supports. Local
   client setup precedes durable dispatch; recovery metadata uses the shared JSON
@@ -3296,9 +3304,13 @@ verified: 3e27b4794 2026-10-23
   paired population and status rules. Exploratory case and reference-class comparisons do
   not treat repeated responses as independent cases or authorize promotion.
   A credential-scoped lock precedes journal writers and credential reads. The
-  actual pre-dispatch key snapshot must fund the whole selected pending
+  dedicated-mode pre-dispatch key snapshot must fund the whole selected pending
   population, including effective/member headroom; uncertain evidence stops
-  acquisition without resending dispatched coordinates. Observed expenses and
+  acquisition without resending dispatched coordinates. An explicit version-2
+  shared-key policy uses verified experiment receipts and
+  pending allocations, without exclusive account snapshots or attributing
+  unrelated traffic to the experiment. Mode and fingerprint stay frozen across
+  dispatch and GET-only recovery. Observed expenses and
   unresolved liability remain distinct; operating allowances are not guaranteed
   invoice ceilings. Source population/cache checks at admission and completion
   invalidate scoring on detected drift, without a per-request source-integrity
