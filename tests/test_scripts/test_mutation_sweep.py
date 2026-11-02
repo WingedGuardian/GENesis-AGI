@@ -2178,6 +2178,117 @@ def test_a_dotdot_after_a_link_is_refused_in_every_channel(project, how, channel
         _sweep(project, **kwargs)
 
 
+def _link_that_only_the_copy_shows_leaving(project, how):
+    """Each resolves INSIDE the caller's repository, so judging it there passes
+    it, and OUTSIDE the copy, back at the caller's tree:
+      * chain: `alias -> inner`, `inner -> <repo>/sub`, an absolute link one
+        step on from the first target;
+      * surplus: one relative link whose `..`s reach the root from any depth
+        and name the caller's absolute path."""
+    (project / "sub").mkdir()
+    (project / "sub" / "keep").write_text("", encoding="utf-8")
+    if how == "chain":
+        (project / "inner").symlink_to(project / "sub", target_is_directory=True)
+        (project / "alias").symlink_to("inner", target_is_directory=True)
+    else:
+        target = "../" * 40 + str(project / "sub").lstrip("/")
+        (project / "alias").symlink_to(target, target_is_directory=True)
+    _commit_all(project)
+
+
+@pytest.mark.parametrize("how", ["chain", "surplus"])
+@pytest.mark.parametrize("channel", ["pytest_arg", "env", "pythonpath", "selector"])
+def test_a_named_path_is_judged_in_the_copy_it_runs_in(project, how, channel):
+    """Codex round 2 on #3802: the link walk resolved paths in the CALLER's
+    tree, while the child runs in the copy, so both links below passed it and
+    read SURVIVED for a mutation the test catches."""
+    _link_that_only_the_copy_shows_leaving(project, how)
+    if channel == "pytest_arg":
+        kwargs = {"cases": [_case(project, pytest_args=("-o=pythonpath=alias",))]}
+    elif channel == "env":
+        kwargs = {"cases": [_case(project, env={"PYTHONPATH": "alias"})]}
+    elif channel == "pythonpath":
+        kwargs = {"cases": [_case(project)], "pythonpath": ("alias",)}
+    else:
+        kwargs = {"cases": [_case(project, test="alias/test_x.py::test_blocks_danger")]}
+    with pytest.raises(ValueError, match="out of the copy"):
+        _sweep(project, **kwargs)
+
+
+_LEAVES_A_WORKER = (
+    "import subprocess\n"
+    "subprocess.Popen(['sleep', '20'], start_new_session={own})\n"
+    "print('finished')\n"
+)
+
+
+@pytest.mark.parametrize("own", [False, True], ids=["same-session", "own-session"])
+def test_a_run_ends_when_its_process_does_not_when_its_output_closes(tmp_path, own):
+    """Codex round 2 on #3802: a descendant that inherited stdout held the pipe
+    open, so a run that had finished waited out the whole timeout and aborted
+    a passing baseline. A descendant in its own session escapes the group kill,
+    so killing first and then draining a pipe would still hang on it."""
+    import time
+
+    started = time.monotonic()
+    proc = ms._pytest(
+        [sys.executable, "-c", _LEAVES_A_WORKER.format(own=own)],
+        cwd=tmp_path,
+        env=dict(os.environ),
+        timeout=15,
+    )
+    assert time.monotonic() - started < 10
+    assert proc.returncode == 0
+    assert "finished" in proc.stdout
+
+
+@pytest.mark.parametrize("capture", ["-s", "--capture=sys"])
+def test_a_run_without_fd_capture_still_reports(tmp_path, capture):
+    """The two pytest settings that let a test's subprocess inherit the run's
+    own stdout: the real shape of the hang."""
+    (tmp_path / "test_w.py").write_text(
+        "import subprocess\n\ndef test_w():\n    subprocess.Popen(['sleep', '20'])\n",
+        encoding="utf-8",
+    )
+    proc = ms._pytest(
+        [sys.executable, "-m", "pytest", "test_w.py", "-q", "-p", "no:cacheprovider", capture],
+        cwd=tmp_path,
+        env=dict(os.environ),
+        timeout=15,
+    )
+    assert proc.returncode == 0
+    assert "1 passed" in proc.stdout
+
+
+def test_a_git_timeout_costs_a_case_not_the_sweep(project, monkeypatch):
+    """`git worktree add` can wait on a hook's daemon. `sweep` turns a copy that
+    could not be made into a per-case ABORT by catching RuntimeError and OSError,
+    so a raw TimeoutExpired escaped it and lost every result so far."""
+
+    def timed_out(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, 1)
+
+    monkeypatch.setattr(ms.subprocess, "run", timed_out)
+    with pytest.raises(RuntimeError, match="timed out"):
+        ms._git(project, "status")
+
+
+def test_a_validator_timeout_is_a_reason_not_a_crash(project, monkeypatch):
+    def timed_out(cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, 1)
+
+    case = ms.Case(
+        label="b",
+        path=str(project / "guard.sh"),
+        test="t",
+        edits=(ms.Edit("a", "b"),),
+        validator="bash",
+        why="a timeout is reported",
+    )
+    monkeypatch.setattr(ms.subprocess, "run", timed_out)
+    assert "timed out" in ms._validate(case, "true\n")
+
+
 def test_a_relative_link_that_stays_inside_is_accepted(project):
     """A relative link inside the repository is reproduced inside the copy."""
     (project / "pkg").mkdir()

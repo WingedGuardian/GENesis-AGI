@@ -499,9 +499,12 @@ def _validate(case: Case, text: str) -> str | None:
             return f"mutation is not valid python: {exc}"
         return None
     if kind == "bash":
-        proc = subprocess.run(
-            ["bash", "-n"], input=text, capture_output=True, text=True, timeout=60
-        )
+        try:
+            proc = subprocess.run(
+                ["bash", "-n"], input=text, capture_output=True, text=True, timeout=60
+            )
+        except subprocess.TimeoutExpired:
+            return "could not validate the mutation: bash -n timed out after 60s"
         if proc.returncode != 0:
             return f"mutation is not valid bash: {proc.stderr.strip()[:200]}"
         return None
@@ -549,9 +552,12 @@ def _git(repo: Path, *args: str) -> bytes:
     is a filename, and filenames need not be valid UTF-8.
     """
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    proc = subprocess.run(
-        ["git", "-C", str(repo), *args], capture_output=True, env=env, timeout=7200
-    )
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo), *args], capture_output=True, env=env, timeout=7200
+        )
+    except subprocess.TimeoutExpired as exc:  # a hook's daemon can hold git's pipes
+        raise RuntimeError(f"git {' '.join(args)} in {repo} timed out") from exc
     if proc.returncode != 0:
         raise RuntimeError(
             f"git {' '.join(args)} in {repo} failed: {os.fsdecode(proc.stderr).strip()}"
@@ -818,44 +824,43 @@ def _repo_relative(repo: Path, path: Path) -> Path:
 _PATH_PIECES = re.compile(r"[\s=,:;]+")
 
 
-def _link_escape(repo: Path, rel: str) -> str | None:
-    """The first symlink on ``rel``'s way through ``repo`` that leads OUT of the
-    copy it is reproduced in, or None.
+def _climbs(rel: str) -> str | None:
+    """Why the relative path ``rel`` is refused before any copy exists, or None.
 
-    The copy keeps the caller's symlinks as they are. A link with an ABSOLUTE
-    target, or a relative one that resolves outside the repository, points
-    the copy back at the caller's tree (or elsewhere), so a selector or import
-    root that goes through it runs the caller's unmutated source -- a test that
-    finds its source from ``__file__`` follows it. A relative link that stays
-    inside the repository stays inside the copy and is fine.
-    """
-    real = Path(os.path.realpath(repo))
-    here = repo
-    for part in Path(rel).parts:
-        here = here / part
-        if os.path.islink(here):
-            target = os.readlink(here)
-            if os.path.isabs(target) or not Path(os.path.realpath(here)).is_relative_to(real):
-                return f"{here.relative_to(repo).as_posix()} -> {target}"
-    return None
-
-
-def _relative_escape(repo: Path, rel: str) -> str | None:
-    """Why the relative path ``rel`` may lead a child out of its copy, or None.
-
-    The ONE check for every relative path a case supplies: the selector's file
-    part, each `pytest_args` and env piece, and each `pythonpath` entry. A `..`
-    component is refused outright, as `_contained_path` refuses it in manifest
-    paths: the operating system follows a symlink BEFORE it applies the `..`
-    after it, so `lk/../src` (with `lk -> <repo>/sub`) is the caller's `src`,
-    and normalizing first judged it as the innocent `src`. Without `..`, the
-    link walk runs on the path as written.
+    A `..` component is refused outright, as `_contained_path` refuses it in
+    manifest paths: the operating system follows a symlink BEFORE it applies
+    the `..` after it, so `lk/../src` (with `lk -> <repo>/sub`) is the caller's
+    `src`, and normalizing first judged it as the innocent `src`.
     """
     if ".." in Path(rel).parts:
         return f"{rel} (a `..` component; name it repository-relative without one)"
-    if escape := _link_escape(repo, rel):
-        return f"{rel} (through {escape})"
     return None
+
+
+def _copy_escape(root: Path, holder: Path, rel: str) -> str | None:
+    """Where ``rel`` lands if the child at ``root`` follows it out of its copy,
+    or None. Judged IN THE COPY, because that is where the child resolves it:
+    the copy keeps the caller's symlinks, so an absolute link anywhere in a
+    chain, or a relative one whose `..`s reach the filesystem root, resolves
+    INSIDE the caller's repository and OUTSIDE the copy. Walking links in the
+    caller's tree passed both.
+    """
+    where = Path(os.path.realpath(root / rel))
+    if where.is_relative_to(os.path.realpath(holder)):
+        return None
+    return f"{rel} -> {where}"
+
+
+def _pieces(value: str) -> Iterator[str]:
+    """The path-like parts of ``value``, split the way its consumer splits it:
+    shell words first (pytest runs ``shlex.split`` on an ``-o`` value, so a
+    quoted path is still a path), then the separators in `_PATH_PIECES`."""
+    try:
+        words = shlex.split(value)
+    except ValueError:
+        words = [value]
+    for word in words:
+        yield from (piece for piece in _PATH_PIECES.split(word) if piece)
 
 
 def _back_pointer(repo: Path, value: str, top: Path | None = None) -> str | None:
@@ -868,14 +873,13 @@ def _back_pointer(repo: Path, value: str, top: Path | None = None) -> str | None
       * an absolute path that lands inside the repository, judged both
         lexically (``/x/./repo/src``) and after resolving symlinks (an alias of
         the repository);
-      * a relative path with a ``..`` component, or one through a symlink that
-        leads out (`_relative_escape`): the child runs in the COPY, so climbing
-        out of it can only reach somewhere else, and the caller's tree is one
-        of the places it can reach;
+      * a relative path with a ``..`` component (`_climbs`): the child runs in
+        the COPY, so climbing out of it can only reach somewhere else, and the
+        caller's tree is one of the places it can reach;
       * an ``@argfile``, whose contents this check cannot see;
       * the repository's path anywhere in the value (``file://...``).
     A relative path that stays inside (``PYTHONPATH=src``) resolves inside the
-    copy and is fine.
+    copy and is fine; `_refuse_copy_escapes` follows its links once a copy exists.
 
     A value is split the way its consumer splits it -- shell words first
     (pytest runs ``shlex.split`` on an ``-o`` value, so a quoted path is still
@@ -896,25 +900,25 @@ def _back_pointer(repo: Path, value: str, top: Path | None = None) -> str | None
         # The path itself, not a sibling that merely starts with it (`repo-data`).
         if re.search(re.escape(str(root)) + r"(?![\w.-])", value):
             return value
-    try:
-        words = shlex.split(value)
-    except ValueError:
-        words = [value]
-    for word in words:
-        for piece in _PATH_PIECES.split(word):
-            if not piece:
-                continue
-            if piece.startswith("@"):
+    for piece in _pieces(value):
+        if piece.startswith("@"):
+            return piece
+        if os.path.isabs(piece):
+            piece_abs = "/" + piece.lstrip("/")
+            lexical = Path(os.path.normpath(piece_abs))
+            resolved = Path(os.path.realpath(piece_abs))
+            if any(p.is_relative_to(r) for p in (lexical, resolved) for r in roots):
                 return piece
-            if os.path.isabs(piece):
-                piece_abs = "/" + piece.lstrip("/")
-                lexical = Path(os.path.normpath(piece_abs))
-                resolved = Path(os.path.realpath(piece_abs))
-                if any(p.is_relative_to(r) for p in (lexical, resolved) for r in roots):
-                    return piece
-            elif escape := _relative_escape(repo, piece):
-                return escape
+        elif escape := _climbs(piece):
+            return escape
     return None
+
+
+_POINTER_HINT = (
+    "The sweep runs in an isolated copy, so a child pointed there tests "
+    "the UNMUTATED file; name test files and import roots repo-relative "
+    "(`pythonpath`) instead"
+)
 
 
 def _refuse_back_pointers(repo: Path, env: dict[str, str] | None, cases: list[Case]) -> None:
@@ -933,11 +937,7 @@ def _refuse_back_pointers(repo: Path, env: dict[str, str] | None, cases: list[Ca
                 raise ValueError(
                     f"{scope} env sets {key}, which each case's copy sets for itself; leave it out"
                 )
-    hint = (
-        "The sweep runs in an isolated copy, so a child pointed there tests "
-        "the UNMUTATED file; name test files and import roots repo-relative "
-        "(`pythonpath`) instead"
-    )
+    hint = _POINTER_HINT
     for key, value in (env or {}).items():
         if bad := _back_pointer(repo, value, top):
             raise ValueError(
@@ -956,6 +956,46 @@ def _refuse_back_pointers(repo: Path, env: dict[str, str] | None, cases: list[Ca
                     f"case {c.label!r} pytest arg {arg!r} points into "
                     f"the tree under test ({bad!r}). {hint}"
                 )
+
+
+def _refuse_copy_escapes(
+    root: Path,
+    holder: Path,
+    *,
+    env: dict[str, str] | None,
+    cases: list[Case],
+    pythonpath: tuple[str, ...],
+    selectors: dict[int, str],
+) -> None:
+    """Raise ValueError naming the first relative path a case NAMES that leaves
+    the copy, judged in the sweep's first copy, before any child runs.
+
+    It covers names only. A tracked `pytest.ini`, a conftest's `sys.path` edit
+    or a plain import through a link name nothing this can see, and they still
+    read SURVIVED. Such a miss fails closed, because SURVIVED and ABORTED both
+    exit 1, so this buys an accurate verdict rather than a safe gate.
+    """
+
+    def named(value: str) -> str | None:
+        for piece in _pieces(value):
+            if not os.path.isabs(piece) and (where := _copy_escape(root, holder, piece)):
+                return where
+        return None
+
+    for entry in pythonpath:
+        if where := _copy_escape(root, holder, entry):
+            raise ValueError(f"pythonpath entry {entry!r} leads out of the copy: {where}")
+    channels = [(f"sweep env {k}={v!r}", v) for k, v in (env or {}).items()]
+    for c in cases:
+        channels += [(f"case {c.label!r} env {k}={v!r}", v) for k, v in c.env.items()]
+        channels += [(f"case {c.label!r} pytest arg {a!r}", a) for a in c.pytest_args]
+    for what, value in channels:
+        if where := named(value):
+            raise ValueError(f"{what} leads out of the copy: {where}. {_POINTER_HINT}")
+    for c in cases:
+        file_part = selectors[id(c)].partition("::")[0]
+        if where := _copy_escape(root, holder, file_part):
+            raise ValueError(f"case {c.label!r} test {c.test!r} leads out of the copy: {where}")
 
 
 def _copy_selector(repo: Path, case: Case) -> str:
@@ -989,7 +1029,7 @@ def _copy_selector(repo: Path, case: Case) -> str:
                 f"repository {repo}; the child runs in a copy of it"
             )
     # Checked AFTER the rewrite too: `/repo/linked/t.py` becomes `linked/t.py`.
-    if escape := _relative_escape(repo, file_part):
+    if escape := _climbs(file_part):
         raise ValueError(f"case {case.label!r} test {case.test!r} leads out of the copy: {escape}")
     if _back_pointer(repo, file_part):
         raise ValueError(
@@ -1019,32 +1059,36 @@ def _pytest(
     when it ends -- on a timeout, and after a normal exit too. `subprocess.run`
     kills only pytest on a timeout, so a test's subprocesses kept running (and
     holding locks) after the sweep had reported and removed the copy.
+
+    Output goes to unlinked files, not pipes, so the run ends when its PROCESS
+    does. Under `-s` or `--capture=sys` a test's subprocess inherits the
+    stream, and a pipe would stay open until that subprocess exits: a finished
+    run then waited out the timeout. One in its own session escapes the group
+    kill, so killing first and then draining a pipe would still hang on it.
     """
-    proc = subprocess.Popen(
-        cmd,
-        cwd=str(cwd),
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-    try:
-        out, err = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _kill_group(proc.pid)
-        # Bounded: a descendant that started its OWN session escapes the group
-        # kill and may hold the pipes open; the timeout is reported regardless.
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.communicate(timeout=10)
-        raise
-    finally:
-        _kill_group(proc.pid)
-    return subprocess.CompletedProcess(
-        cmd,
-        proc.returncode,
-        out.decode("utf-8", errors="replace"),
-        err.decode("utf-8", errors="replace"),
-    )
+    tmp = env.get("TMPDIR")
+    where = tmp if tmp and os.path.isdir(tmp) else None  # a test may have removed it
+    with tempfile.TemporaryFile(dir=where) as out, tempfile.TemporaryFile(dir=where) as err:
+        proc = subprocess.Popen(
+            cmd, cwd=str(cwd), env=env, stdout=out, stderr=err, start_new_session=True
+        )
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_group(proc.pid)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=10)
+            raise
+        finally:
+            _kill_group(proc.pid)
+        out.seek(0)
+        err.seek(0)
+        return subprocess.CompletedProcess(
+            cmd,
+            proc.returncode,
+            out.read().decode("utf-8", errors="replace"),
+            err.read().decode("utf-8", errors="replace"),
+        )
 
 
 def _kill_group(pgid: int) -> None:
@@ -1340,13 +1384,21 @@ def sweep(
                 f"pythonpath entry {root!r} must be repository-relative: "
                 "it is put on the children's PYTHONPATH inside the copy"
             )
-        if escape := _relative_escape(repo, root):
+        if escape := _climbs(root):
             raise ValueError(f"pythonpath entry {root!r} leads out of the copy: {escape}")
     _refuse_back_pointers(repo, env, cases)
     selectors = {id(c): _copy_selector(repo, c) for c in cases}
 
     first: dict = {}
     with isolated_copy(repo, tmp_root, first) as root:
+        _refuse_copy_escapes(
+            root,
+            first["holder"],
+            env=env,
+            cases=cases,
+            pythonpath=pythonpath,
+            selectors=selectors,
+        )
         # Read ONCE, before any child runs: every case starts from these bytes.
         targets = {p: _load_target(root, rel) for p, rel in rels.items()}
     snapshot = first["fingerprint"]
