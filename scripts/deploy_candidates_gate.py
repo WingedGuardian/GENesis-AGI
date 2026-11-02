@@ -123,6 +123,8 @@ REFUSAL_FILES = (
     # with `cat` when sourced.
     "scripts/lib/shared_mcp_units.sh",
     "scripts/lib/mcp_rollout.py",
+    # The package record and restore helpers, sourced by update.sh at startup.
+    "scripts/lib/venv_setup.sh",
     # Read with `cat` before the branch check and run as python later: the
     # serving read runs inside `deploy_code_only.sh status`, which readiness runs.
     "scripts/lib/serving_commit.py",

@@ -169,21 +169,41 @@ _restore_venv_state_unlocked() {
     [ -f "$lib/venv_state.py" ] || lib="$repo_dir/scripts/lib"
     helper="$lib/venv_state.py"
     extras="$("$py" -P "$helper" extras "$record")" || { echo "  Could not read the package record $record."; return 1; }
-    if [ -n "$extras" ]; then
-        echo "    Removing packages this update added: $(printf '%s ' $extras)"
-        # shellcheck disable=SC2086  # one distribution name per word
-        "$venv_path/bin/pip" uninstall --quiet -y $extras 2>&1 | tail -1 || true
-    fi
     reqs="$(mktemp -p "$(dirname "$record")")" || return 1
     if ! "$py" -P "$helper" requirements "$record" > "$reqs"; then
         rm -f "$reqs"
         echo "  Could not read the package record $record."
         return 1
     fi
+    # Fetch what the record needs BEFORE removing anything: removing the update's
+    # packages first and then failing to fetch the old ones (index unreachable)
+    # would leave neither set installed. A failed fetch changes nothing.
+    local missing dl="" fetch
+    missing="$(mktemp -p "$(dirname "$record")")" || { rm -f "$reqs"; return 1; }
+    if ! "$py" -P "$helper" missing "$record" > "$missing"; then
+        rm -f "$reqs" "$missing"
+        echo "  Could not read the package record $record."
+        return 1
+    fi
+    if [ -s "$missing" ]; then
+        dl="$(mktemp -d -p "$(dirname "$record")")" || { rm -f "$reqs" "$missing"; return 1; }
+        if ! fetch="$("$venv_path/bin/pip" download --quiet --no-deps --dest "$dl" -r "$missing" 2>&1)"; then
+            echo "  The recorded packages could not be fetched, so nothing was changed:"
+            printf '%s\n' "$fetch" | tail -3 | sed 's/^/    /'
+            rm -rf "$reqs" "$missing" "$dl"
+            return 1
+        fi
+    fi
+    rm -f "$missing"
+    if [ -n "$extras" ]; then
+        echo "    Removing packages this update added: $(printf '%s ' $extras)"
+        # shellcheck disable=SC2086  # one distribution name per word
+        "$venv_path/bin/pip" uninstall --quiet -y $extras 2>&1 | tail -1 || true
+    fi
     # All or nothing: one version no source still carries installs none of them.
     # verify below names what is missing; pip's own reason is printed here.
-    "$venv_path/bin/pip" install --quiet --no-deps -r "$reqs" 2>&1 | tail -3 || true
-    rm -f "$reqs"
+    "$venv_path/bin/pip" install --quiet --no-deps ${dl:+--find-links "$dl"} -r "$reqs" 2>&1 | tail -3 || true
+    rm -rf "$reqs" ${dl:+"$dl"}
     reinstall_damaged_distributions "$repo_dir" "$venv_path" "$lib"
     # Re-point the checkout's own editable install so its metadata (version,
     # entry points) is the rolled-back checkout's. Build isolation stays on, as in

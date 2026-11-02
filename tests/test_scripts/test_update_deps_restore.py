@@ -216,11 +216,14 @@ def test_without_the_damage_heal_the_slim_case_stays_broken(setup):
     assert "Genesis does not import" in res.stdout
 
 
-def test_a_version_no_longer_available_is_a_refusal_not_a_pass(setup, wheels, tmp_path):
-    """Offline with the old version gone from every source: reported, not masked."""
+def test_a_version_no_longer_available_is_a_refusal_that_changes_nothing(setup, wheels, tmp_path):
+    """Offline with the old version gone from every source: reported, not masked,
+    and refused BEFORE anything is removed. Removing the update's packages and
+    then failing to fetch the old ones would leave neither set (round-3 audit)."""
     venv, env, repo, record = setup
     assert _sh("capture_venv_state", env, str(repo), str(venv), str(record)).returncode == 0
     _break_like_the_incident(venv, env)
+    after_update = _installed(venv, env)
     partial = tmp_path / "partial-wheels"
     shutil.copytree(wheels, partial)
     for whl in partial.glob("extra-1.0-*"):
@@ -228,7 +231,18 @@ def test_a_version_no_longer_available_is_a_refusal_not_a_pass(setup, wheels, tm
     env = dict(env, PIP_FIND_LINKS=str(partial))
     res = _sh("restore_venv_state", env, str(repo), str(venv), str(record))
     assert res.returncode == 1
-    assert "do not match the pre-update record" in res.stdout and "missing extra==1.0" in res.stdout
+    assert "could not be fetched, so nothing was changed" in res.stdout, res.stdout + res.stderr
+    assert _installed(venv, env) == after_update, "the update's set must be left exactly as it was"
+
+
+def test_missing_names_only_what_is_not_installed_as_recorded(setup):
+    venv, env, repo, record = setup
+    assert _sh("capture_venv_state", env, str(repo), str(venv), str(record)).returncode == 0
+    assert _state(venv, env, "missing", str(record)).stdout == ""
+    _break_like_the_incident(venv, env)
+    res = _state(venv, env, "missing", str(record))
+    assert res.returncode == 0, res.stderr
+    assert sorted(res.stdout.split()) == ["extra==1.0", "fakemcp==1.0"]
 
 
 def test_the_restore_runs_the_helpers_copied_with_the_record(setup):

@@ -12,6 +12,8 @@ importlib.metadata must see that venv's site-packages.
     capture OUT      write the record (JSON) to OUT, atomically
     requirements IN  print one pip requirement per recorded package
     extras IN        print installed distributions the record does not name
+    missing IN       print each recorded requirement not installed exactly as
+                     recorded: what a restore must fetch
     verify IN        exit 0 when the installed set equals the record, else
                      print what differs and exit 1
 
@@ -119,7 +121,7 @@ def _check(record: dict) -> dict:
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 3 or argv[1] not in ("capture", "requirements", "extras", "verify"):
+    if len(argv) != 3 or argv[1] not in ("capture", "requirements", "extras", "missing", "verify"):
         print(__doc__.split("\n\n")[2], file=sys.stderr)
         return 2
     cmd, path = argv[1], argv[2]
@@ -159,6 +161,15 @@ def main(argv: list[str]) -> int:
                 if not _NAME.fullmatch(name):
                     raise ValueError(f"installed distribution name {name!r} is not a plain name")
                 print(name)
+            return 0
+        if cmd == "missing":
+            # The same test verify applies, per recorded package: anything not
+            # installed as recorded is what the restore has to fetch.
+            for n in sorted(record["pinned"]):
+                if pinned.get(n) != record["pinned"][n] or versions.get(n) != record[
+                    "versions"
+                ].get(n):
+                    print(record["pinned"][n])
             return 0
         # verify: the ordinary installs must match exactly; editables recorded
         # must still be present (the caller re-points the checkout's own).
