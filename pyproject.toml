@@ -132,7 +132,10 @@ test = [
 # camoufox < 0.5 engine the browser step has not replaced yet (measured:
 # "Protocol error (Browser.setDefaultViewport)").
 browser = [
-    "camoufox>=0.5.7,<0.6",  # engine pinned by the package's browser-pin.json (Firefox 156).
+    "camoufox>=0.5.7,<0.5.9",  # engine pinned by the package's browser-pin.json (Firefox 156).
+                             # <0.5.9: 0.5.9 removed camoufox.addons.maybe_download_addons,
+                             # which provision.py's addon step calls, and moves the engine to
+                             # Firefox 158; adopt it deliberately, not through a range.
                              # Upper bound: 0.4 -> 0.5 shipped no migration guide and changed
                              # the engine layout; take the next minor deliberately.
     "playwright>=1.62,<1.63",  # camoufox 0.5.7 and 0.5.8 declare playwright<1.63.

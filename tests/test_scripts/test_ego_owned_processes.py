@@ -115,8 +115,9 @@ def test_owned_separate_group_writer_closes_before_pipe_drain(module, monkeypatc
 
 
 @pytest.mark.parametrize("defect", [None, "init_exe", "init_missing", "tail", "controller_exe", "controller_missing", "script", "parent"])
-def test_init_controller_identity_is_complete_and_consistent(module, monkeypatch, defect):
-    controller = [sys.executable, "/fixture/ego_owned_recovery.py"]
+@pytest.mark.parametrize("script", ["/fixture/ego_owned_recovery.py", "/fixture/ego_owned_timing.py"])
+def test_init_controller_identity_is_complete_and_consistent(module, monkeypatch, defect, script):
+    controller = [sys.executable, script]
     init = ["/sbin/docker-init", "--", *controller]
     raw = {"/proc/1/cmdline": b"\0".join(v.encode() for v in init) + b"\0",
            "/proc/self/cmdline": b"\0".join(v.encode() for v in controller) + b"\0"}
@@ -139,8 +140,8 @@ def test_init_controller_identity_is_complete_and_consistent(module, monkeypatch
     monkeypatch.setattr(module.Path, "readlink", lambda path: links[str(path)])
     if defect:
         with pytest.raises((module.OwnershipError, ValueError)):
-            module.init_identity()
+            module.init_identity(script)
     else:
-        result = module.init_identity()
+        result = module.init_identity(script)
         assert result["init_argv"] == init and result["controller_argv"] == controller
         assert result["controller_executable"] == str(Path(sys.executable).resolve())
