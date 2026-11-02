@@ -933,8 +933,8 @@ def test_reinstall_and_restart_happen_only_on_a_verified_old_tree():
     start = text.index("_do_rollback() {")
     body = text[start : text.index("\n_on_err() {", start)]  # the heredoc holds a column-0 }
     guard_end = body.index("# END rollback-code-guard")
-    pip = body.index('"$VENV_DIR/bin/pip" install', guard_end)
-    assert 'if [ "$restart_ok" = "true" ] \\\n' in body[guard_end:pip]
+    pip = body.index("restore_venv_state", guard_end)
+    assert 'if [ "$restart_ok" = "true" ]; then\n' in body[guard_end:pip]
     loop = body.index('for svc in "${WERE_RUNNING[@]}"; do', guard_end)
     gate = body.rindex('if [ "$restart_ok" = "true" ] && [ "$db_ok" = "true" ]; then', guard_end, loop)
     assert "\n    fi\n" not in body[gate:loop]

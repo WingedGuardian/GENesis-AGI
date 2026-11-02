@@ -244,6 +244,9 @@ _PEER_RESTORE_PY="$(cat "$GENESIS_ROOT/src/genesis/db/crud/peer_restore.py")"
 # Mutating, printing recovery helpers shared with deploy_code_only.sh.
 # shellcheck source=lib/deploy_recovery.sh
 . "$SCRIPT_DIR/lib/deploy_recovery.sh"
+# Package record and restore (capture_venv_state / restore_venv_state).
+# shellcheck source=lib/venv_setup.sh
+. "$SCRIPT_DIR/lib/venv_setup.sh"
 
 # ── Update state file helper ────────────────────────────
 # Written at each phase boundary so crash recovery knows where we stopped.
@@ -2178,6 +2181,31 @@ _take_db_snapshot() {
 # A failure here exits with nothing moved and nothing stopped.
 _take_db_snapshot || exit 1
 
+# BEGIN deps-capture (extracted by tests/test_scripts/test_update_deps_restore.py)
+# Record the installed packages before anything can change them, so a rollback
+# puts back exactly this set instead of re-resolving the old checkout's version
+# ranges (which picked an incompatible pair on 2026-10-31). A venv that does not
+# import Genesis is not recorded: the rollback then falls back to the
+# re-resolve, as before, and says so. _record_update_history retires the record
+# when the update or its rollback completes; one kept after a failed rollback is
+# the recovery material, aged out by disk_hygiene.sh. A --post-merge reuses the
+# rollback tag of the run that stopped on conflicts, and that run recorded the
+# packages before its merge: that record is kept, not replaced by one taken
+# against the merged code.
+DEPS_STATE_TAKEN=0
+DEPS_STATE_FILE="${GENESIS_HOME:-$HOME/.genesis}/update-deps/$ROLLBACK_TAG.json"
+if [[ "${POST_MERGE:-false}" == "true" ]] \
+    && "$VENV_DIR/bin/python" -P "$GENESIS_ROOT/scripts/lib/venv_state.py" requirements "$DEPS_STATE_FILE" >/dev/null 2>&1; then
+    DEPS_STATE_TAKEN=1
+    echo "  Using the package record the run that started this update took."
+elif capture_venv_state "$GENESIS_ROOT" "$VENV_DIR" "$DEPS_STATE_FILE"; then
+    DEPS_STATE_TAKEN=1
+    echo "  Recorded the installed packages for a rollback."
+else
+    echo "  WARNING: the installed packages were not recorded; a rollback would re-resolve the old version ranges."
+fi
+# END deps-capture
+
 # The staged-path guard again, as the last step before the stop: the backups and
 # the database snapshot above can take minutes.
 # BEGIN staged-excused-prestop
@@ -2351,6 +2379,14 @@ _record_update_history() {
     if [ -n "${PRE_UPDATE_DEGRADED:-}" ]; then
         degraded="${degraded:+$degraded,}$PRE_UPDATE_DEGRADED"
     fi
+    # The pre-update package record is retired once the update or its rollback
+    # has completed; one a failed rollback leaves is recovery material.
+    case "$status" in
+        success | rolled_back)
+            if [ "${DEPS_STATE_TAKEN:-0}" = 1 ] && [ -n "${DEPS_STATE_FILE:-}" ]; then
+                rm -rf "$DEPS_STATE_FILE" "${DEPS_STATE_FILE%.json}.lib"
+            fi ;;
+    esac
     local db_path="$GENESIS_ROOT/data/genesis.db"
     [ -f "$db_path" ] || return 0
     # The insert imports genesis (and through it aiosqlite), so ONLY the venv can
@@ -2750,13 +2786,43 @@ _do_rollback() {
     fi
     # END rollback-code-guard
 
-    # Re-sync dependencies against the rolled-back code
-    local pip_ok=true
-    if [ "$restart_ok" = "true" ] \
-        && ! "$VENV_DIR/bin/pip" install -e "$GENESIS_ROOT" --quiet 2>&1 | tail -1; then
-        echo "  CRITICAL: pip install failed during rollback"
-        pip_ok=false
+    # BEGIN rollback-deps (extracted by tests/test_scripts/test_update_deps_restore.py)
+    # Put the packages back to the pre-update record when one was taken: the
+    # exact set, not a fresh resolve of the old checkout's ranges. Without a
+    # record, the old re-resolve, now with an import check, since pip's status
+    # alone once reported success over a server that could not import FastMCP.
+    # A failed exact restore has already removed what the update added, so it is
+    # followed by that re-resolve as salvage (the rollback still reports
+    # incomplete): the services restart onto the best set available, not a
+    # half-restored one. The browser-stack lock is waited on for 10 minutes here,
+    # not bootstrap's 2 hours: the services are stopped while it waits.
+    local pip_ok=true _deps_rc=0
+    if [ "$restart_ok" = "true" ]; then
+        if [ "${DEPS_STATE_TAKEN:-0}" = 1 ]; then
+            GENESIS_BROWSER_STACK_WAIT_S=600 \
+                restore_venv_state "$GENESIS_ROOT" "$VENV_DIR" "$DEPS_STATE_FILE" || _deps_rc=$?
+            if [ "$_deps_rc" = 0 ]; then
+                echo "  Restored the pre-update packages."
+            elif [ "$_deps_rc" = 75 ]; then
+                echo "  CRITICAL: packages not restored: a browser provisioning run held its lock for 600 s; nothing was changed (record kept: $DEPS_STATE_FILE)"
+                pip_ok=false
+            else
+                echo "  CRITICAL: the pre-update packages were not restored (record kept: $DEPS_STATE_FILE)"
+                pip_ok=false
+                if "$VENV_DIR/bin/pip" install -e "$GENESIS_ROOT" --quiet 2>&1 | tail -1 \
+                    && "$VENV_DIR/bin/python" -c "from genesis.runtime import GenesisRuntime; import genesis.mcp.health" 2>/dev/null; then
+                    echo "  Salvage: re-resolved the old version ranges; Genesis imports, but the set is not the recorded one."
+                else
+                    echo "  Salvage: re-resolving the old version ranges did not give an importable set either."
+                fi
+            fi
+        elif ! "$VENV_DIR/bin/pip" install -e "$GENESIS_ROOT" --quiet 2>&1 | tail -1 \
+            || ! "$VENV_DIR/bin/python" -c "from genesis.runtime import GenesisRuntime; import genesis.mcp.health" 2>/dev/null; then
+            echo "  CRITICAL: the packages could not be reinstalled for the rolled-back code"
+            pip_ok=false
+        fi
     fi
+    # END rollback-deps
 
     # Restore the pre-update DB — but ONLY if this update may have changed its
     # schema (DB_RESTORE_OWED). Rolling back the code without the DB would leave

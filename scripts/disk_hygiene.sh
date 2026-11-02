@@ -689,6 +689,19 @@ maintenance_main() {
     echo "--- mcp-spawn identity prune (dead-pid slots) ---"
     prune_mcp_spawn "$HOME/.genesis/mcp-spawn"
 
+    # update.sh records the venv's packages before each update
+    # (update-deps/<rollback tag>.json) and removes the record when the update or
+    # its rollback completes. One a failed rollback left is recovery material for
+    # a while, then only disk: the record, the helper copy beside it
+    # (<tag>.lib/, two flat files), and any temporary file a killed run left.
+    # Files only, then the emptied copy directories: nothing recursive.
+    echo "--- update package-record prune (>30d) ---"
+    local deps_dir="${GENESIS_HOME:-$HOME/.genesis}/update-deps"
+    find "$deps_dir" -mindepth 1 -maxdepth 1 -type f \
+        \( -name '*.json' -o -name '*.tmp' -o -name 'tmp.*' \) -mtime +30 -delete 2>/dev/null || true
+    find "$deps_dir" -mindepth 2 -maxdepth 2 -type f -path '*.lib/*' -mtime +30 -delete 2>/dev/null || true
+    find "$deps_dir" -mindepth 1 -maxdepth 1 -type d -name '*.lib' -empty -delete 2>/dev/null || true
+
     echo "--- attention snapshot GC (label-aware) ---"
     "$VENV_PY" "$REPO_DIR/scripts/attention_snapshot_gc.py" --home-days 60 --omi-days 14 \
         || echo "attention_snapshot_gc exited $?"

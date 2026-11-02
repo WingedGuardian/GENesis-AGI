@@ -281,6 +281,9 @@ def test_update_prepares_guarded_snapshot_before_stop(tmp_path, compatible):
         # The window also holds the staged-excused pre-stop guard (normal,
         # non --post-merge path); it reads git state and has its own tests.
         'POST_MERGE=false\n_staged_excused_divergence_guard() { :; }\n'
+        # The window also records the venv's packages (tested in
+        # test_update_deps_restore.py); no venv exists here.
+        "ROLLBACK_TAG=pre-update-test\nVENV_DIR=/nonexistent\ncapture_venv_state() { return 1; }\n"
         # update.sh reads the authority check's source at its start.
         + f'_PEER_RESTORE_PY="$(cat "{ROOT / "src/genesis/db/crud/peer_restore.py"}")"\n'
         + block
