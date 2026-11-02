@@ -2846,16 +2846,27 @@ def _cr_summary_structural(lines: list[str], fence_mask: list[bool]) -> list[boo
 
 def _cr_outside_diff_entries(
     body: str,
-) -> tuple[list[tuple[str, str, str, str]], int, bool]:
+) -> tuple[list[tuple[str, str, str, str]], int, bool, list[str]]:
     """Findings from the 'Outside diff range comments' sections of ONE review body.
 
-    Returns ``(entries, declared, declared_known)`` — the parsed findings, the
-    total this body's own section headers SAY it carries, and whether EVERY
-    matched section header actually stated a count. ``declared_known`` is what
-    licenses the SURPLUS comparison: with any count absent, ``declared`` is an
-    underestimate, so parsed-exceeds-declared would fire on well-formed input.
-    The shortfall comparison needs no such licence — an underestimate can only
-    make it more lenient, never false-positive. The format states its own counts
+    Returns ``(entries, declared, declared_known, unreadable)`` — the findings
+    kept, the total this body's own section headers SAY it carries, whether
+    EVERY matched section header stated a count, and the reasons the read is
+    incomplete or unreliable (depth drift, and each section's count mismatch).
+
+    EACH COUNTED SECTION IS RECONCILED AGAINST ITS OWN ENTRIES, never against
+    body-wide totals (CodeRabbit, round 2 of #3827): with totals, a section
+    that over-reads by one cancels a section that under-reads by one, and a
+    section with no count adds entries that offset a counted section's missing
+    one, so the note that should name the gap never prints. A section that
+    over-reads is quarantined alone — its entries are dropped, because which
+    of them is the phantom is unknowable — while the other sections' entries,
+    which reconciled, are kept. A section with no count is read but cannot be
+    checked, and it no longer switches off the check for any other section.
+    What no count can catch is netting INSIDE one section (one phantom plus
+    one unread finding in the same section), so that remains a limit of the
+    canary. ``declared`` and ``declared_known`` describe the body and are no
+    longer what the caller compares. The format states its own counts
     ("Outside diff range comments (3)"), which is the one closed-set fact
     available about a third-party document nobody controls: it turns "did I
     parse everything?" from an unanswerable question into a comparison. Reading
@@ -2863,8 +2874,7 @@ def _cr_outside_diff_entries(
     CodeRabbit helper here carries a canary for what it read but did not
     recognise (``cr_unknown``, ``unmatched_bot``, ``header_seen``); without the
     declared count this one would have none. ``declared`` is 0 when a header
-    omits its count — absent, not zero findings, and the caller only ever acts
-    on a SHORTFALL.
+    omits its count — absent, not zero findings.
 
     Each entry is ``(path, lines, severity, title)``, severity lower-cased
     and drawn from the SAME vocabulary as the inline path (``_CR_SEVERITIES``)
@@ -2893,6 +2903,10 @@ def _cr_outside_diff_entries(
     declared = 0
     declared_known = True
     depth_drift: list[str] = []
+    # One (stated count or None, index of its first entry in `out`) per
+    # outside-diff section, in order. Entries are only ever appended while an
+    # outside-diff section is open, so each belongs to the latest one opened.
+    sections: list[tuple[int | None, int]] = []
     body, bq_depths = _cr_normalize_review_body(body)
     lines = body.split("\n")
     # FENCE half only. A review body is a code-bearing document: it quotes diffs
@@ -2905,9 +2919,59 @@ def _cr_outside_diff_entries(
     structural = _cr_summary_structural(lines, fence_mask)
     current_file: str | None = None
     in_section = False
+    in_bold_section = False  # the second layout (see _CR_BOLD_SECTION_RE)
     for pos, line in enumerate(lines):
         if fence_mask[pos]:
             continue
+        stripped = line.strip()
+        bold = _CR_BOLD_SECTION_RE.match(stripped)
+        if bold and (in_bold_section or in_section) and depths[pos] >= _CR_BOLD_ENTRY_DEPTH:
+            # Inside a finding of EITHER layout this is the finding's PROSE quoting
+            # a section line, not structure: neither a new section nor drift (the
+            # first layout's `structural` check holds the same line for its summaries).
+            bold = None
+        if bold:
+            if depths[pos] != _CR_BOLD_SECTION_DEPTH:
+                if bold.group(1) == "Outside diff range comments":
+                    # Same reasoning as the depth drift below: a section one
+                    # <details> deeper would read as zero declared, zero parsed.
+                    depth_drift.append(
+                        f"outside-diff section (bold) at <details> depth {depths[pos]}"
+                    )
+                continue
+            in_bold_section = bold.group(1) == "Outside diff range comments"
+            in_section = False
+            current_file = None
+            if in_bold_section:
+                if bold.group(2) is not None:
+                    declared += int(bold.group(2))
+                    sections.append((int(bold.group(2)), len(out)))
+                else:
+                    # Read the findings anyway; only the count is unknown, as for a
+                    # first-layout header without one (this section goes unchecked).
+                    declared_known = False
+                    sections.append((None, len(out)))
+            continue
+        if in_bold_section:
+            if stripped == "---" and depths[pos] == _CR_BOLD_SECTION_DEPTH:
+                in_bold_section = False  # the rule that closes the caution block
+                continue
+            old_section = _CR_SECTION_RE.search(line)
+            if old_section and structural[pos] and depths[pos] == _CR_SECTION_DEPTH:
+                # A first-layout section after a bold one with no closing rule:
+                # leave bold mode and let the first-layout code below read it,
+                # so its findings and its declared count are not swallowed here.
+                in_bold_section = False
+            elif structural[pos] and depths[pos] == _CR_BOLD_ENTRY_DEPTH:
+                entry = _cr_summary_entry(stripped)
+                if entry is not None:
+                    path, span, severity, title = entry
+                    if "/" not in path:  # a basename: find the finding's full path
+                        path = _cr_full_location(lines, fence_mask, depths, pos, path, span)
+                    out.append((path, span, severity, title))
+                continue
+            else:
+                continue
         # STRUCTURE IS ATTRIBUTED BY POSITION IN THE <details> TREE, never by
         # matching tag text wherever it appears. Both roles were reconstructed
         # from text before, and both were forgeable from content a PR author
@@ -2949,8 +3013,10 @@ def _cr_outside_diff_entries(
                 count = _CR_SECTION_COUNT_RE.search(section.group(0))
                 if count:
                     declared += int(count.group(1))
+                    sections.append((int(count.group(1)), len(out)))
                 else:
                     declared_known = False
+                    sections.append((None, len(out)))
             continue
         if not in_section:
             continue
@@ -2992,10 +3058,140 @@ def _cr_outside_diff_entries(
                     title = bold.group(1).strip()[:120]
                     break
             out.append((current_file, entry.group(1), severity or "", title))
-    return out, declared, declared_known, depth_drift
+    kept: list[tuple[str, str, str, str]] = []
+    unreadable = list(depth_drift)
+    for idx, (count, start) in enumerate(sections):
+        end = sections[idx + 1][1] if idx + 1 < len(sections) else len(out)
+        mine = out[start:end]
+        if count is not None and len(mine) > count:
+            # More entries than this section's own header declares: prose was
+            # mis-read as a finding (the phantom-Critical shape, Codex P2 on
+            # #1847), and which entry is the phantom is unknowable, so this
+            # section's batch is QUARANTINED rather than printed as findings.
+            unreadable.append(
+                f"outside-diff section declares {count} finding(s) but "
+                f"{len(mine)} were parsed — surplus entries indicate prose "
+                f"mis-read as findings"
+            )
+            continue
+        if count is not None and len(mine) < count:
+            # Fewer than declared: the read is INCOMPLETE. The entries that were
+            # read are still real and are kept. This is also the backstop for
+            # the one suppression shape the fence mask cannot judge: a BALANCED
+            # fence spanning a real finding reads as quoted content, and the
+            # count is what notices it went missing.
+            unreadable.append(
+                f"outside-diff section declares {count} finding(s), parsed {len(mine)}"
+            )
+        kept.extend(mine)
+    return kept, declared, declared_known, unreadable
 
 
 _CR_INLINE_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+
+# SECOND outside-diff layout, from 2026-09-14 (the first one is read above).
+# MEASURED over every CodeRabbit review body carrying the section on the 735 PRs
+# updated 2026-10-01 to 10-31: 49 bodies, the last 19 in the old layout (to
+# 2026-09-14) and 30 in this one, declaring 32 findings that the old reader saw
+# as zero declared and zero parsed, so none was shown and nothing warned (18 of
+# the 32 were Major). In this layout:
+#   * the section is a BOLD line, `**⚠️ Outside diff range comments (N)**`, at
+#     <details> depth 0 (30 of 30), usually inside a `> [!CAUTION]` quote;
+#   * each finding is its own <details> at depth 1 (32 of 32) whose <summary>
+#     reads `LEVEL · Title · <code>path:lines</code>`, where LEVEL has been
+#     `<em>🟠 Major</em>`, `<strong>🟡 Minor</strong>` and
+#     `<strong><picture>…</picture> Minor</strong>` in turn.
+# The summary is the one line all three spellings share, so it is what is read.
+_CR_BOLD_SECTION_RE = re.compile(
+    # The count is optional and the prefix (an icon, today `⚠️ `) generous: the count
+    # is what the reconciliation reads, so a header that drops it, or a longer icon,
+    # must still OPEN the section rather than read as zero declared, zero parsed.
+    r"^\*\*[^*\n]{0,40}?(" + "|".join(re.escape(n) for n in _CR_SECTION_NAMES) + r")(?: \((\d+)\))?\*\*$"
+)
+_CR_BOLD_SECTION_DEPTH = 0
+_CR_BOLD_ENTRY_DEPTH = 1
+# One HTML tag, bounded so a run of `<` cannot make the strip quadratic.
+_CR_TAG_RE = re.compile(r"<[^<>\n]{0,400}>")
+_CR_LINES_RE = re.compile(r"\d+(?:-\d+)?")
+_CR_SUMMARY_LOCATION = " · <code>"
+# The finding's own location line, `` `src/pkg/mod.py:120-124` ``. MEASURED: 28 of the
+# 32 summaries name only the file's BASENAME (`mod.py:120-124`) and every one of
+# those 28 carries this line with the full path; the other 4 name the full path
+# in the summary. The full path is the finding's identity in this channel: it is
+# the location the report prints and part of the dedupe key across re-reviews, so a
+# basename would name the wrong file, or merge two findings in same-named files.
+_CR_LOCATION_LINE_RE = re.compile(r"^`([^`\s]{1,400}):(\d+(?:-\d+)?)`$")
+_CR_LOCATION_LOOKAHEAD = 15
+
+
+def _cr_full_location(
+    lines: list[str], fence_mask: list[bool], depths: list[int], pos: int, path: str, span: str
+) -> str:
+    """The full path for a summary that may name only a basename (see above).
+
+    Looks ahead inside the SAME finding (depth at or below the entry's, up to the
+    next summary) for its location line, and takes it only when the line range
+    matches and the full path ends with the summary's path at a ``/`` boundary.
+    Anything else keeps the summary's own path.
+    """
+    for nxt in range(pos + 1, min(pos + 1 + _CR_LOCATION_LOOKAHEAD, len(lines))):
+        if fence_mask[nxt]:
+            continue
+        if depths[nxt] < _CR_BOLD_ENTRY_DEPTH:
+            break  # left the finding's <details>
+        text = lines[nxt].strip()
+        if text.startswith(("<summary>", "<details")):
+            break
+        found = _CR_LOCATION_LINE_RE.match(text)
+        if found:
+            full = html.unescape(found.group(1))
+            if found.group(2) == span and (full == path or full.endswith("/" + path)):
+                return full
+            break
+    return path
+
+
+def _cr_summary_entry(line: str) -> tuple[str, str, str, str] | None:
+    """``(path, lines, severity, title)`` from one second-layout finding summary.
+
+    String operations only (the text is third-party): the location is the LAST
+    ``· <code>…</code>`` field, the level the last word of the FIRST field once its
+    tags (an icon included) are removed. A summary of another shape returns None;
+    the section's declared count is what notices a finding that was not read. An
+    unknown level is returned as ``""``, the caller's unknown-severity canary.
+    """
+    if not line.startswith("<summary>"):
+        return None
+    end = line.find("</summary>")
+    if end < 0:
+        return None
+    inner = line[len("<summary>"):end]
+    if not inner.endswith("</code>"):
+        return None
+    at = inner.rfind(_CR_SUMMARY_LOCATION)
+    if at < 0:
+        return None
+    head = inner[:at]
+    split = head.find(" · ")
+    if split < 0:
+        return None
+    path, sep, lines = html.unescape(inner[at + len(_CR_SUMMARY_LOCATION):-len("</code>")]).rpartition(":")
+    if not sep or not path.strip() or not _CR_LINES_RE.fullmatch(lines):
+        return None
+    words = _CR_TAG_RE.sub(" ", head[:split]).split()
+    # The level field is the level word, after at most an emoji (`🟠 Major`) or an
+    # icon that the tag strip removed. A longer first field is not a level field,
+    # whatever its last word: unknown (the canary), never a guessed level.
+    severity = (
+        words[-1].casefold()
+        if 0 < len(words) <= 2 and words[-1].casefold() in _CR_SEVERITIES
+        else ""
+    )
+    # Unescaped for reading, then defanged: an entity can spell a carriage return
+    # or a bidi override, and this title is printed to the operator's terminal.
+    title = _defang_gate_text(html.unescape(_CR_TAG_RE.sub("", head[split + 3:]))).strip()[:120]
+    return path.strip(), lines, severity, title
+
 # Severity ORDER, for merging one finding restated across several reviews.
 # A dedupe that assigns (`seen[key] = severity`) is last-write-wins, and reviews
 # arrive oldest-first — so a Critical restated later as Minor, or restated with
@@ -3921,22 +4117,23 @@ def _check_inline_review_findings(
     # folded into THIS scan's accumulators rather than given a blocking path of
     # their own — the one-score-one-threshold policy at `_CR_BLOCKING_WEIGHT`.
     #
-    # SEVERITY POLICY, and it deliberately differs from the inline path: only
-    # Critical scores. A Major here is surfaced loudly and does NOT block, because
-    # an undelivered finding has NO COMMENT THREAD — the maintainer-reply
+    # SEVERITY POLICY, and it deliberately differs from the inline path: NOTHING
+    # here scores, Critical included (owner ruling 2026-09-09; the channel was
+    # Critical-only before). Every finding is surfaced as a NOTE, because an
+    # undelivered finding has NO COMMENT THREAD — the maintainer-reply
     # engagement route that clears every other finding in this function does not
     # exist for it. Making it block would create findings satisfiable only by
     # fixing, never by disagreeing, on PRs anchored to lines they never touched.
-    # The floor (Critical) still binds, so the safety direction is kept while the
-    # disposition mechanism is built. MEASURED across the live queue when this
-    # shipped: 15 Major, 12 Minor, 0 Critical.
+    # MEASURED across the live queue when the channel first shipped: 15 Major,
+    # 12 Minor, 0 Critical.
     outside_critical: list[tuple[str, str]] = []  # surfaced, NEVER scored
     outside_major: list[tuple[str, str]] = []  # Major — surfaced loudly, 0.0
     # (label, path, severity) — the severity is carried so the report can
     # name the level the reviewer gave rather than one bucket for all of them.
     outside_minor: list[tuple[str, str, str]] = []  # below Major — surfaced, 0.0
-    # A body that declares more findings than this parser read: an INCOMPLETE
-    # scan, which blocks like any other incomplete read.
+    # Why a body's read is incomplete or unreliable (a section whose own count
+    # disagrees with its own entries, or a section at an unexpected depth). It
+    # prints the UNDER-REPORTING note; like the rest of this channel it never blocks.
     outside_shortfall: list[str] = []
     # Review bodies from an author this scan does not recognise — another bot, or
     # a human collaborator. Until this existed the loop below dropped them with a
@@ -4078,57 +4275,21 @@ def _check_inline_review_findings(
             ):
                 unclassified_reviews.append(review_login)
             continue
-        parsed, declared, declared_known, depth_drift = _cr_outside_diff_entries(
+        parsed, _declared, _declared_known, unreadable = _cr_outside_diff_entries(
             review.get("body") or ""
         )
-        # A section found as REAL STRUCTURE at an unexpected <details> depth is
-        # a layout change in a document we do not control. Nothing else can see
-        # it — the count reconciliation reads its numbers from the very match
-        # this drift prevents — so it blocks as unreadable rather than letting
-        # the scan report clean.
-        outside_shortfall.extend(depth_drift)
-        if declared_known and len(parsed) > declared:
-            # The OTHER direction of the same reconciliation: more entries than
-            # the body's own headers declare means prose was mis-parsed as a
-            # finding — the phantom-Critical shape (Codex P2, PR #1847). We
-            # cannot tell WHICH entries are phantoms, so the read is unreliable
-            # rather than merely noisy, and it blocks as unreadable exactly
-            # like the shortfall — an explained stop beats a false block that
-            # names a finding nobody wrote. Only licensed when every section
-            # header stated its count (`declared_known`).
-            outside_shortfall.append(
-                f"outside-diff section declares {declared} finding(s) but "
-                f"{len(parsed)} were parsed — surplus entries indicate prose "
-                f"mis-read as findings"
-            )
-            # QUARANTINE the batch rather than merging it. Without this the
-            # entries still reached the score, and a phantom Critical among
-            # them returned the ordinary block message NAMING it as a real
-            # finding — the score branch returns before the shortfall check —
-            # so this check's own explained stop never surfaced in exactly the
-            # case it was written for. Both directions still block; what this
-            # buys is that the message is true. The asymmetry with the
-            # shortfall branch below is deliberate: an UNDER-parse's entries
-            # were read correctly and should still block on their own terms,
-            # while a SURPLUS means some entry in this batch is fictional and
-            # nothing here can say which.
-            continue
-        if declared > len(parsed):
-            # The body's own header says it carries more than this parser found,
-            # so the read is INCOMPLETE — and an incomplete finding scan blocks
-            # here exactly as `_scan_unreadable` does, rather than degrading to
-            # a note. Under-parsing is the fail-OPEN direction: a format shift,
-            # or content crafted to hide a finding from the parser, both surface
-            # as a quiet reduction in findings that looks just like a cleaner PR.
-            #
-            # This is also the backstop for the one suppression shape the fence
-            # mask cannot judge: a BALANCED fence spanning a real finding is
-            # indistinguishable from legitimately quoted content, so the mask
-            # correctly hides it — and the count is what notices it went missing.
-            outside_shortfall.append(
-                f"outside-diff section declares {declared} finding(s), parsed "
-                f"{len(parsed)}"
-            )
+        # Every reason this body's read is incomplete or unreliable: a section at
+        # an unexpected <details> depth (a layout change nothing else can see,
+        # because the count is read from the very match the drift prevents), and
+        # each counted section whose own entries disagree with its own count.
+        # The reconciliation is PER SECTION inside the reader, never body-wide
+        # here: with totals, one section's surplus cancels another's shortfall
+        # and a countless section offsets a counted one's missing finding
+        # (CodeRabbit, round 2 of #3827). A section that over-reads is already
+        # quarantined there, so what arrives in `parsed` is only what reconciled
+        # or was read short (real entries), plus countless sections' entries.
+        # Advisory: each reason becomes the UNDER-REPORTING note, never a block.
+        outside_shortfall.extend(unreadable)
         for path, line_range, severity, title in parsed:
             key = (path, line_range, title)
             prev = outside_seen.get(key)
@@ -4144,7 +4305,14 @@ def _check_inline_review_findings(
         # carry ESC, CR or bidi straight into this label. Rendered at display
         # time because the raw value is still needed for the diff-scope match
         # carried alongside it in the tuples below.
-        label = f"{title or '(untitled)'} ({_safe_report_path(path)}:{line_range})"
+        # ONE safe line, made where it is printed: the title and span come from
+        # CodeRabbit's text in either layout, and an unescaped `&#10;` (second
+        # layout) or a raw escape code (first layout) would otherwise print a
+        # forged extra report line (CodeRabbit, PR #3827). The path part is
+        # already made safe by `_safe_report_path`.
+        label = _one_safe_line(
+            f"{title or '(untitled)'} ({_safe_report_path(path)}:{line_range})"
+        )
         if not severity:
             cr_unknown.append(label)
         elif severity == "critical":
@@ -16905,6 +17073,14 @@ _GATE_TEXT_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
 
 def _gate_text_unsafe(char: str) -> bool:
     return unicodedata.category(char) in _GATE_TEXT_UNSAFE_CATEGORIES
+
+
+def _one_safe_line(text: str) -> str:
+    """*text* as ONE report line: every terminal-acting character, line breaks
+    included, becomes a space (``_defang_gate_text`` keeps ``\n`` on purpose,
+    for multi-line messages), and the result is bounded with a stated omission.
+    """
+    return _bound_with_stated_omission("".join(" " if _gate_text_unsafe(ch) else ch for ch in text))
 
 
 def _defang_gate_text(text: str) -> str:
