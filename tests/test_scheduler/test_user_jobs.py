@@ -311,7 +311,7 @@ async def test_create_retains_saved_id_when_registration_fails(db, monkeypatch, 
 
     monkeypatch.setattr(scheduler, "add_job", register)
     try:
-        result = await tools.user_job_create.fn(
+        result = await tools.user_job_create(
             title="Saved schedule", cron_expression="0 9 * * *", dispatch_prompt="test"
         )
         assert result["success"] is False
@@ -319,10 +319,10 @@ async def test_create_retains_saved_id_when_registration_fails(db, monkeypatch, 
         assert result["job_id"] in result["error"]
         saved = await crud.get_job(db, result["job_id"])
         assert saved["status"] == "active" and saved["dispatch_prompt"] == "test"
-        listed = await tools.user_job_list.fn()
+        listed = await tools.user_job_list()
         assert listed["jobs"][0]["registered"] is False
         monkeypatch.setattr(scheduler, "add_job", original_add)
-        retried = await tools.user_job_control.fn(result["job_id"], "resume")
+        retried = await tools.user_job_control(result["job_id"], "resume")
         assert retried["success"] is True and retried["registered"] is True
         assert len(await crud.list_jobs(db)) == 1
     finally:
@@ -349,7 +349,7 @@ async def test_resume_reports_failed_attempt_without_erasing_old_registration(db
     monkeypatch.setattr(tools, "_scheduler", scheduler)
     monkeypatch.setattr(scheduler, "_register_job", lambda _: False)
     try:
-        result = await tools.user_job_control.fn(job_id, "resume")
+        result = await tools.user_job_control(job_id, "resume")
         assert result["success"] is False
         assert result["registered"] is True
         assert scheduler._scheduler.get_job(f"user_job:{job_id}") is not None
@@ -399,11 +399,11 @@ async def test_registration_membership_is_current_and_not_persisted(db, monkeypa
     monkeypatch.setattr(tools, "_scheduler", scheduler)
     try:
         assert scheduler.is_registered(job_id)
-        assert (await tools.user_job_list.fn())["jobs"][0]["registered"] is True
+        assert (await tools.user_job_list())["jobs"][0]["registered"] is True
     finally:
         await scheduler.stop()
     assert not scheduler.is_registered(job_id)
-    assert (await tools.user_job_list.fn())["jobs"][0]["registered"] is False
+    assert (await tools.user_job_list())["jobs"][0]["registered"] is False
     assert (await crud.get_job(db, job_id))["status"] == "active"
 
 
@@ -519,21 +519,21 @@ async def test_failed_replacement_recovery_stays_single_after_restart(db, monkey
     monkeypatch.setattr(tools, "_db", db)
     monkeypatch.setattr(tools, "_scheduler", scheduler)
     try:
-        assert (await tools.user_job_control.fn(old_id, "pause"))["success"]
+        assert (await tools.user_job_control(old_id, "pause"))["success"]
         register = scheduler._register_job
         monkeypatch.setattr(scheduler, "_register_job", lambda _: False)
-        replacement = await tools.user_job_create.fn(
+        replacement = await tools.user_job_create(
             title="Replacement", cron_expression="0 10 * * *", dispatch_prompt="new"
         )
         assert replacement["success"] is False and replacement["saved"] is True
         # Retire the failed replacement's active intent BEFORE restoring old.
-        assert (await tools.user_job_control.fn(replacement["job_id"], "pause"))["success"]
+        assert (await tools.user_job_control(replacement["job_id"], "pause"))["success"]
         assert (await crud.get_job(db, replacement["job_id"]))["status"] == "paused"
         assert not scheduler.is_registered(replacement["job_id"])
         # A failed restore remains a failure, and both definitions survive.
-        assert (await tools.user_job_control.fn(old_id, "resume"))["success"] is False
+        assert (await tools.user_job_control(old_id, "resume"))["success"] is False
         monkeypatch.setattr(scheduler, "_register_job", register)
-        assert (await tools.user_job_control.fn(old_id, "resume"))["success"] is True
+        assert (await tools.user_job_control(old_id, "resume"))["success"] is True
     finally:
         await scheduler.stop()
     restarted = UserJobScheduler(db=db)

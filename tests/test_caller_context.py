@@ -305,6 +305,7 @@ _ENV_WRITERS = {
     "experimentation/cc_router.py": "builds an experiment child's env",
     "session_awareness/headless.py": "builds a headless child's env",
     "runtime/_core.py": "clears a stale origin from the server process",
+    "live_agent/agent.py": "owner_environ removes a parent session's identity from a child's env",
 }
 
 

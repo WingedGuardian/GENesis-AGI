@@ -224,7 +224,13 @@ def test_trash_tombstone_session_id(tmp_path, monkeypatch, legacy, genesis_sid):
     from genesis.trash import trash
 
     _apply(monkeypatch, CLAUDE_SESSION_ID=legacy, GENESIS_SESSION_ID=genesis_sid)
-    expected = os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("GENESIS_SESSION_ID")
+    # The order #3696 gave main: Genesis id, then transcript id, then the legacy name.
+    expected = (
+        os.environ.get("GENESIS_SESSION_ID")
+        or os.environ.get("CLAUDE_CODE_SESSION_ID")
+        or os.environ.get("CLAUDE_SESSION_ID")
+        or None
+    )
     item = tmp_path / "victim.txt"
     item.write_text("x")
     stone = trash(item, reason="characterization", caller="test")
