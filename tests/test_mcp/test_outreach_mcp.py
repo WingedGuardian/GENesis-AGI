@@ -242,8 +242,29 @@ async def test_outreach_poll_no_webhook():
     # unconfigured channel is refused rather than posted somewhere else — is
     # unchanged and is asserted more strictly than before.
     assert "announcements" in data["error"], data["error"]
-    assert _discord_webhook_env("announcements") in data["error"], data["error"]
+    # With NOTHING set, the missing piece is DISCORD_WEBHOOK_URL — the adapter
+    # registers from it, so a named webhook alone never clears the refusal
+    # and the message must say so.
+    assert "DISCORD_WEBHOOK_URL" in data["error"], data["error"]
     assert data.get("status") != "created"
+
+
+@pytest.mark.asyncio
+async def test_outreach_poll_refusal_names_named_var_when_default_set():
+    """Default webhook set but the named channel's missing: the message
+    names the channel's own env var, not the one already configured."""
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    with patch.dict(
+        "os.environ", {"DISCORD_WEBHOOK_URL": "https://x"}, clear=True
+    ):
+        result = await tools["outreach_poll"].fn(
+            channel="announcements",
+            question="Test?",
+            answers=["A", "B"],
+        )
+    data = json.loads(result)
+    assert "error" in data
+    assert _discord_webhook_env("announcements") in data["error"], data["error"]
 
 
 @pytest.mark.asyncio

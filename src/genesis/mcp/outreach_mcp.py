@@ -51,13 +51,21 @@ def _discord_enqueue_refusal(channel: str) -> str | None:
     if discord_webhook_configured(channel):
         return None
     default_channel = os.environ.get("OUTREACH_RECIPIENT_DISCORD") or "dev-discussion"
+    # The predicate needs DISCORD_WEBHOOK_URL before any named webhook counts
+    # (the adapter registers from it) — when THAT is the missing piece the
+    # message must name it, or following the advice leaves the send refused.
+    configure = (
+        _discord_webhook_env(channel)
+        if os.environ.get("DISCORD_WEBHOOK_URL")
+        else "DISCORD_WEBHOOK_URL"
+    )
     return json.dumps({
         "status": "refused",
         "code": "discord_webhook_unconfigured",
         "message": (
             f"No Discord webhook configured for channel {channel!r} — refusing "
             f"to send to the default channel instead. Configure "
-            f"{_discord_webhook_env(channel)}, or send to {default_channel}. "
+            f"{configure}, or send to {default_channel}. "
             "Permanent until configured; do not retry."
         ),
     })
@@ -605,11 +613,16 @@ async def outreach_poll(
     env_key = _discord_webhook_env(channel)
     if not discord_webhook_configured(channel):
         default_channel = os.environ.get("OUTREACH_RECIPIENT_DISCORD") or "dev-discussion"
+        configure = (
+            env_key
+            if os.environ.get("DISCORD_WEBHOOK_URL")
+            else "DISCORD_WEBHOOK_URL"
+        )
         return json.dumps({
             "error": (
                 f"No Discord webhook configured for channel {channel!r} — "
                 f"refusing to post to the default channel instead. Configure "
-                f"{env_key}, or send to {default_channel}."
+                f"{configure}, or send to {default_channel}."
             )
         })
     # Configured: the channel's own var wins, else the default webhook (the

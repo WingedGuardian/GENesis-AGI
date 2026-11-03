@@ -320,3 +320,26 @@ def test_abbreviated_zone_refused():
     """CST is four different offsets worldwide — refuse rather than guess."""
     with pytest.raises(TimingParseError):
         resolve_preferred_timing("tomorrow 9am CST", now=SPEC_NOW, tz=CHICAGO)
+
+
+def test_and_connector_is_case_insensitive():
+    assert resolve_preferred_timing(
+        "in 2 hours AND 30 minutes", now=NOW, tz="UTC"
+    ) == NOW + timedelta(hours=2, minutes=30)
+
+
+def test_short_hour_offset_is_hours_not_minutes():
+    """'+5' names +05:00, not +00:05 — the offset reads as whole hours."""
+    got = resolve_preferred_timing("tomorrow 9am +5", now=SPEC_NOW, tz=CHICAGO)
+    # SPEC_NOW is Wednesday 2026-06-10 15:00Z → tomorrow 09:00 at +05:00 = 04:00Z.
+    assert got == datetime(2026, 6, 11, 4, 0, tzinfo=UTC)
+
+
+def test_zone_offset_digits_are_not_a_clock():
+    """'tomorrow +05:30' names no clock — the offset's 05:30 must not
+    override the wall time; the parsed day/time is kept."""
+    got = resolve_preferred_timing("tomorrow +05:30", now=SPEC_NOW, tz=CHICAGO)
+    # The named zone's "now" is 20:30 +05:30; "tomorrow" keeps that clock on
+    # the next day: 2026-06-11 20:30 +05:30 = 15:00 UTC. A 05:30 clock
+    # override would give a different instant entirely.
+    assert got == datetime(2026, 6, 11, 15, 0, tzinfo=UTC)

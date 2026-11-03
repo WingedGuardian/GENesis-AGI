@@ -145,7 +145,7 @@ def _elapsed_delta(text: str) -> timedelta | None:
     # dangling "in 2 hours and" refuses instead of silently scheduling.
     for i, match in enumerate(matches):
         seg = s[matches[i - 1].end() if i else 0 : match.start()].strip(" ,")
-        if seg != "" and (seg != "and" or i == 0):
+        if seg != "" and (seg.lower() != "and" or i == 0):
             return None
     if s[matches[-1].end() :].strip(" ,") != "":
         return None
@@ -293,7 +293,11 @@ def resolve_preferred_timing(
                     named_tz = UTC
                 elif token[0] in "+-":
                     off = token[1:].replace(":", "")
-                    hours, mins = int(off[:-2] or 0), int(off[-2:] or 0)
+                    if len(off) <= 2:
+                        # "+5"/"-05" name whole hours, not minutes.
+                        hours, mins = int(off), 0
+                    else:
+                        hours, mins = int(off[:-2]), int(off[-2:])
                     named_tz = timezone(
                         timedelta(hours=hours, minutes=mins)
                         * (1 if token[0] == "+" else -1)
@@ -317,12 +321,15 @@ def resolve_preferred_timing(
                 },
             )
             if parsed is not None and parsed.tzinfo is not None:
+                # The clock the phrase names is searched in parse_raw, NOT
+                # raw — a zone token's digits ("tomorrow +05:30") would
+                # otherwise read as a 05:30 clock and override the wall time.
                 meridiem = None
-                clock = _PHRASE_CLOCK_MERIDIEM_RE.search(raw)
+                clock = _PHRASE_CLOCK_MERIDIEM_RE.search(parse_raw)
                 if clock:
                     meridiem = clock.group(3).lower()
                 else:
-                    clock = _PHRASE_CLOCK_24_RE.search(raw)
+                    clock = _PHRASE_CLOCK_24_RE.search(parse_raw)
                 if clock:
                     h = int(clock.group(1))
                     minute = int(clock.group(2) or 0)
