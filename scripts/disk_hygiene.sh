@@ -693,7 +693,7 @@ maintenance_main() {
     # (update-deps/<rollback tag>.json) and removes the record when the update or
     # its rollback completes. One a failed rollback left is recovery material for
     # a while, then only disk: the record, the helper copy beside it
-    # (<tag>.lib/, two flat files), and any temporary file a killed run left.
+    # (<tag>.lib/, flat files), and any temporary file a killed run left.
     # Files only, then the emptied copy directories: nothing recursive.
     echo "--- update package-record prune (>30d) ---"
     local deps_dir="${GENESIS_HOME:-$HOME/.genesis}/update-deps"
