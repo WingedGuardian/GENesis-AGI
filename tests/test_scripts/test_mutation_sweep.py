@@ -14,6 +14,7 @@ Install-agnostic: every case operates on a throwaway git repository under
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -398,16 +399,6 @@ def test_a_tree_that_is_not_a_git_work_tree_is_refused(tmp_path):
         ms.sweep([case], repo=tmp_path, python=sys.executable, timeout=60)
 
 
-@pytest.mark.parametrize("scope", ["sweep", "case"])
-def test_an_env_pointing_into_the_shared_tree_is_refused(project, scope):
-    """A child pointed back at the caller's tree would import the UNMUTATED file
-    and report SURVIVED. The copy's import roots are named repo-relative."""
-    env = {"PYTHONPATH": str(project / "src")}
-    case = _case(project, env=env if scope == "case" else {})
-    with pytest.raises(ValueError, match="isolated copy"):
-        _sweep(project, [case], env=env if scope == "sweep" else None)
-
-
 def test_a_target_whose_directory_resolves_outside_the_repository_is_refused(
     project, tmp_path_factory
 ):
@@ -612,6 +603,7 @@ def _scripted(monkeypatch, rc: int, stdout: str) -> list[str]:
     def run(cmd, *, cwd, env, timeout):
         kind = order[len(log)]
         log.append(kind)
+        (Path(cwd) / "guard.py").read_bytes()  # as the real test does: the watch sees it
         return _Ran(rc, stdout) if kind == "mutated" else _Ran(0, "1 passed in 0.01s")
 
     monkeypatch.setattr(ms, "_pytest", run)
@@ -978,7 +970,7 @@ def test_a_cases_own_env_reaches_the_child(project):
     an `env` nothing observed. Deleting BOTH forwarding sites left it green. The
     property is now observed from inside the child process."""
     (project / "test_env.py").write_text(
-        'import os\ndef test_flag():\n    assert os.environ["EXTRA"] == "1"\n',
+        'import os, guard\ndef test_flag():\n    assert os.environ["EXTRA"] == "1"\n',
         encoding="utf-8",
     )
     case = _case(
@@ -1131,7 +1123,7 @@ def test_the_green_baseline_uses_the_cases_own_env(project):
     carrying its own env -- and it raises rather than degrading, so per-case env
     and the baseline gate were mutually exclusive."""
     (project / "test_env.py").write_text(
-        'import os\ndef test_flag():\n    assert os.environ["EXTRA"] == "1"\n',
+        'import os, guard\ndef test_flag():\n    assert os.environ["EXTRA"] == "1"\n',
         encoding="utf-8",
     )
     case = _case(
@@ -1631,8 +1623,8 @@ def test_an_absolute_selector_runs_the_COPYS_test(project):
     assert result.results[0].outcome == ms.BIT, result.results[0].detail
 
 
-@pytest.mark.parametrize("test", ["/elsewhere/test_x.py::t", "../outside/test_x.py::t"])
-def test_a_selector_outside_the_repository_is_refused(project, test):
+def test_a_selector_outside_the_repository_is_refused(project):
+    test = "/elsewhere/test_x.py::t"
     with pytest.raises(ValueError, match="repository"):
         _sweep(project, [_case(project, test=test)])
 
@@ -1641,37 +1633,6 @@ def _alias(project, tmp_path_factory) -> Path:
     link = tmp_path_factory.mktemp("alias") / "repo"
     link.symlink_to(project, target_is_directory=True)
     return link
-
-
-@pytest.mark.parametrize(
-    "spelling", ["dot-segment", "symlink-alias", "relative-escape", "addopts-rootdir"]
-)
-def test_every_spelling_of_the_callers_tree_in_env_is_refused(project, tmp_path_factory, spelling):
-    """Codex P2 on #1851 (`:677`): the lexical substring check missed
-    `/x/./repo/src` and a symlink alias, and the child imported the caller's
-    unmutated source. One rule now judges every path-like piece of a value."""
-    value = {
-        "dot-segment": f"{project.parent}/./{project.name}/src",
-        "symlink-alias": f"{_alias(project, tmp_path_factory)}/src",
-        "relative-escape": "../../../" + project.name + "/src",
-        "addopts-rootdir": f"--rootdir={_alias(project, tmp_path_factory)}",
-    }[spelling]
-    key = "PYTEST_ADDOPTS" if spelling == "addopts-rootdir" else "PYTHONPATH"
-    with pytest.raises(ValueError, match="isolated copy"):
-        _sweep(project, [_case(project, env={key: value})])
-
-
-def test_a_relative_import_root_inside_the_copy_is_accepted(project):
-    """`PYTHONPATH=src` resolves inside the COPY (the child's cwd), which is the
-    correct way to name an import root; the rule must not refuse it."""
-    result = _sweep(project, [_case(project, env={"PYTHONPATH": "src"})])
-    assert result.results[0].outcome == ms.BIT, result.results[0].detail
-
-
-@pytest.mark.parametrize("arg", ["@args.txt", "--rootdir=REPO", "-o=pythonpath=REPO/src"])
-def test_a_pytest_arg_pointing_back_is_refused(project, arg):
-    with pytest.raises(ValueError, match="isolated copy"):
-        _sweep(project, [_case(project, pytest_args=(arg.replace("REPO", str(project)),))])
 
 
 @pytest.mark.parametrize("mode", [0o000, 0o300, 0o400, 0o500, 0o600])
@@ -1780,46 +1741,11 @@ def test_a_real_all_passing_subtest_baseline_is_green():
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("spelling", ["quoted-o", "double-slash"])
-def test_a_quoted_or_doubled_spelling_of_the_callers_tree_is_refused(
-    project, tmp_path_factory, spelling
-):
-    """pytest runs `shlex.split` on an `-o` value and puts it at the front of
-    `sys.path`, so a QUOTED path is still a path; `//repo` is `/repo`."""
-    alias = _alias(project, tmp_path_factory)
-    arg = {
-        "quoted-o": f"-o=pythonpath='{alias}/src'",
-        "double-slash": f"-o=pythonpath={project.parent}//{project.name}/src",
-    }[spelling]
-    with pytest.raises(ValueError, match="isolated copy"):
-        _sweep(project, [_case(project, pytest_args=(arg,))])
-
-
-@pytest.mark.parametrize("root", ["/abs/src", "../src"])
-def test_a_pythonpath_entry_that_is_not_repository_relative_is_refused(project, root):
+def test_an_absolute_pythonpath_entry_is_refused(project):
     """`root / p` with an absolute `p` REPLACES the copy's path, which pointed
     the children back at wherever `p` named."""
     with pytest.raises(ValueError, match="repository-relative"):
-        _sweep(project, [_case(project)], pythonpath=(root,))
-
-
-def test_a_sweep_of_a_subdirectory_still_refuses_the_toplevel(project):
-    """Paths are judged against the git toplevel as well as `--repo`, so a
-    sweep pointed at a subdirectory cannot be steered at the rest of the tree."""
-    sub = project / "pkg"
-    sub.mkdir()
-    (sub / "guard.py").write_bytes((project / "guard.py").read_bytes())
-    (sub / "test_guard.py").write_bytes((project / "test_guard.py").read_bytes())
-    _commit_all(project)
-    case = _case(sub, env={"PYTHONPATH": f"{project}/vendored"})
-    with pytest.raises(ValueError, match="isolated copy"):
-        ms.sweep([case], repo=sub, python=sys.executable, timeout=120, check_baseline=False)
-
-
-def test_a_sibling_that_merely_starts_with_the_repo_path_is_accepted(project):
-    """`repo-data` is not `repo`: the substring check is bounded."""
-    assert ms._back_pointer(project, f"{project}-data/x") is None
-    assert ms._back_pointer(project, f"{project}/x") is not None
+        _sweep(project, [_case(project)], pythonpath=("/abs/src",))
 
 
 def test_a_symlinked_absolute_selector_is_rewritten_into_the_copy(project, tmp_path_factory):
@@ -2182,118 +2108,6 @@ def test_env_may_not_override_what_each_copy_owns(project, key, scope):
 # --------------------------------------------------------------------------
 
 
-def _link_back(project):
-    """A committed symlink with an ABSOLUTE target at the caller's own tree:
-    the copy keeps it, so anything reached through it is the caller's file."""
-    (project / "linked").symlink_to(project, target_is_directory=True)
-    _commit_all(project)
-
-
-@pytest.mark.parametrize("absolute", [False, True], ids=["relative", "absolute"])
-def test_a_selector_through_a_link_back_to_the_callers_tree_is_refused(project, absolute):
-    """Codex round 2: `linked/test_guard.py::...` with `linked -> <repo>` ran
-    the caller's test against unmutated source and read SURVIVED for a
-    mutation the test catches."""
-    _link_back(project)
-    test = "linked/test_guard.py::test_blocks_danger"
-    if absolute:
-        test = f"{project}/{test}"
-    with pytest.raises(ValueError, match="leads out of the copy"):
-        _sweep(project, [_case(project, test=test)])
-
-
-def test_an_import_root_through_a_link_back_is_refused(project):
-    _link_back(project)
-    with pytest.raises(ValueError, match="isolated copy"):
-        _sweep(project, [_case(project, env={"PYTHONPATH": "linked"})])
-
-
-def test_a_pythonpath_entry_through_a_link_back_is_refused(project):
-    """Codex round 3: `pythonpath=("linked",)` with `linked -> <repo>/src` put
-    the caller's unmutated source on the children's PYTHONPATH and read
-    SURVIVED for a mutation `pythonpath=("src",)` reports as BIT."""
-    _link_back(project)
-    with pytest.raises(ValueError, match="leads out of the copy"):
-        _sweep(project, [_case(project)], pythonpath=("linked",))
-
-
-def _climb_through_a_link(project, how):
-    """A relative path that NORMALIZES to an innocent one, while the operating
-    system follows the link first and then applies `..`:
-      * absolute: `lk -> <repo>/sub`, so `lk/../src` is the caller's `src`;
-      * inside: `a/b/c/inlink -> ../../..` stays in the repository (accepted on
-        its own), and a `..` after it climbs out of the copy."""
-    if how == "absolute":
-        (project / "sub").mkdir()
-        (project / "sub" / "keep").write_text("", encoding="utf-8")
-        (project / "lk").symlink_to(project / "sub", target_is_directory=True)
-        value = "lk/../src"
-    else:
-        (project / "a" / "b" / "c").mkdir(parents=True)
-        (project / "a" / "b" / "c" / "keep").write_text("", encoding="utf-8")
-        (project / "a" / "b" / "c" / "inlink").symlink_to("../../..", target_is_directory=True)
-        value = f"a/b/c/inlink/../{project.name}/src"
-    _commit_all(project)
-    return value
-
-
-@pytest.mark.parametrize("how", ["absolute", "inside"])
-@pytest.mark.parametrize("channel", ["pytest_arg", "env", "pythonpath", "selector"])
-def test_a_dotdot_after_a_link_is_refused_in_every_channel(project, how, channel):
-    """Round-3 premise check: the paths were normalized BEFORE the link walk, so
-    `lk/../src` was judged as `src`. A `..` component is now refused in every
-    relative path a case supplies, as `_contained_path` refuses it in manifest
-    paths, and the link walk runs on the path as written."""
-    value = _climb_through_a_link(project, how)
-    if channel == "pytest_arg":
-        kwargs = {"cases": [_case(project, pytest_args=(f"-o=pythonpath={value}",))]}
-    elif channel == "env":
-        kwargs = {"cases": [_case(project, env={"PYTHONPATH": value})]}
-    elif channel == "pythonpath":
-        kwargs = {"cases": [_case(project)], "pythonpath": (value,)}
-    else:
-        kwargs = {"cases": [_case(project, test=f"{value}/../test_guard.py::test_blocks_danger")]}
-    with pytest.raises(ValueError, match=r"\.\.|copy|repository"):
-        _sweep(project, **kwargs)
-
-
-def _link_that_only_the_copy_shows_leaving(project, how):
-    """Each resolves INSIDE the caller's repository, so judging it there passes
-    it, and OUTSIDE the copy, back at the caller's tree:
-      * chain: `alias -> inner`, `inner -> <repo>/sub`, an absolute link one
-        step on from the first target;
-      * surplus: one relative link whose `..`s reach the root from any depth
-        and name the caller's absolute path."""
-    (project / "sub").mkdir()
-    (project / "sub" / "keep").write_text("", encoding="utf-8")
-    if how == "chain":
-        (project / "inner").symlink_to(project / "sub", target_is_directory=True)
-        (project / "alias").symlink_to("inner", target_is_directory=True)
-    else:
-        target = "../" * 40 + str(project / "sub").lstrip("/")
-        (project / "alias").symlink_to(target, target_is_directory=True)
-    _commit_all(project)
-
-
-@pytest.mark.parametrize("how", ["chain", "surplus"])
-@pytest.mark.parametrize("channel", ["pytest_arg", "env", "pythonpath", "selector"])
-def test_a_named_path_is_judged_in_the_copy_it_runs_in(project, how, channel):
-    """Codex round 2 on #3802: the link walk resolved paths in the CALLER's
-    tree, while the child runs in the copy, so both links below passed it and
-    read SURVIVED for a mutation the test catches."""
-    _link_that_only_the_copy_shows_leaving(project, how)
-    if channel == "pytest_arg":
-        kwargs = {"cases": [_case(project, pytest_args=("-o=pythonpath=alias",))]}
-    elif channel == "env":
-        kwargs = {"cases": [_case(project, env={"PYTHONPATH": "alias"})]}
-    elif channel == "pythonpath":
-        kwargs = {"cases": [_case(project)], "pythonpath": ("alias",)}
-    else:
-        kwargs = {"cases": [_case(project, test="alias/test_x.py::test_blocks_danger")]}
-    with pytest.raises(ValueError, match="out of the copy"):
-        _sweep(project, **kwargs)
-
-
 _LEAVES_A_WORKER = (
     "import subprocess\n"
     "subprocess.Popen(['sleep', '20'], start_new_session={own})\n"
@@ -2493,3 +2307,370 @@ def test_each_run_gets_its_own_bytecode_cache(project):
     )
     result = _sweep(project, [case])
     assert result.results[0].outcome == ms.BIT, result.results[0].detail
+
+
+# --------------------------------------------------------------------------
+# #3805: a mutated run that never opened the mutated file decided nothing.
+# --------------------------------------------------------------------------
+
+
+def _test_in_a_subdirectory(project, conftest=""):
+    """The same test one directory down, so pytest puts `sub/`, not the root, on
+    `sys.path`, and whatever else is on it decides which `guard` loads."""
+    (project / "sub").mkdir()
+    shutil.copy(project / "test_guard.py", project / "sub" / "test_guard.py")
+    if conftest:
+        (project / "sub" / "conftest.py").write_text(conftest, encoding="utf-8")
+    return "sub/test_guard.py::test_blocks_danger"
+
+
+_COUNTS_ITS_RUNS = """\
+import os
+from pathlib import Path
+
+def test_counts():
+    runs = Path(os.environ["COUNTER"])
+    n = int(runs.read_text()) + 1 if runs.exists() else 1
+    runs.write_text(str(n))
+    assert n != 2
+"""
+
+
+def test_a_failure_from_a_run_that_never_opened_the_target_is_not_a_catch(
+    project, tmp_path_factory
+):
+    """The fail-open: the test fails only on its second run and never touches
+    the target, so pass, fail, pass is satisfied and it read BIT."""
+    (project / "test_counts.py").write_text(_COUNTS_ITS_RUNS, encoding="utf-8")
+    _commit_all(project)
+    counter = tmp_path_factory.mktemp("counter") / "runs"
+    case = _case(project, test="test_counts.py::test_counts", env={"COUNTER": str(counter)})
+    result = _sweep(project, [case]).results[0]
+    assert result.outcome == ms.ABORTED, result.detail
+    assert result.never_opened
+    assert "never opened" in result.detail
+
+
+def test_a_test_that_ignores_the_target_is_not_a_survivor(project):
+    """It says nothing about the test's strength, so it must not read SURVIVED."""
+    (project / "test_other.py").write_text("def test_o():\n    pass\n", encoding="utf-8")
+    _commit_all(project)
+    result = _sweep(project, [_case(project, test="test_other.py::test_o")]).results[0]
+    assert result.outcome == ms.ABORTED, result.detail
+    assert result.never_opened
+
+
+@pytest.mark.parametrize("how", ["conftest-sys-path", "tracked-ini"])
+def test_a_run_that_loaded_the_callers_code_aborts(project, how):
+    """No input check can see these: nothing a case names points anywhere. Each
+    read SURVIVED, for a mutation the same test catches."""
+    conftest = f"import sys\nsys.path.insert(0, {str(project)!r})\n"
+    if how == "conftest-sys-path":
+        test = _test_in_a_subdirectory(project, conftest)
+    else:
+        test = _test_in_a_subdirectory(project)
+        (project / "pytest.ini").write_text(f"[pytest]\npythonpath = {project}\n", encoding="utf-8")
+    _commit_all(project)
+    result = _sweep(project, [_case(project, test=test)]).results[0]
+    assert result.outcome == ms.ABORTED, result.detail
+    assert result.never_opened
+
+
+def test_a_target_a_test_runs_as_a_subprocess_is_a_true_catch(project):
+    """The shape a sys.modules check cannot see: the guard never enters the
+    pytest process."""
+    (project / "test_sub.py").write_text(
+        "import subprocess, sys\n"
+        "def test_s():\n"
+        "    code = \"import guard; raise SystemExit(guard.is_allowed('dangerous'))\"\n"
+        "    assert subprocess.run([sys.executable, '-c', code]).returncode == 0\n",
+        encoding="utf-8",
+    )
+    _commit_all(project)
+    result = _sweep(project, [_case(project, test="test_sub.py::test_s")]).results[0]
+    assert result.outcome == ms.BIT, result.detail
+
+
+def test_a_bash_target_is_a_true_catch(project):
+    (project / "guard.sh").write_text("exit 0\n", encoding="utf-8")
+    (project / "test_sh.py").write_text(
+        "import subprocess\n"
+        "def test_b():\n"
+        "    assert subprocess.run(['bash', 'guard.sh']).returncode == 0\n",
+        encoding="utf-8",
+    )
+    _commit_all(project)
+    case = _case(
+        project,
+        path=project / "guard.sh",
+        anchor="exit 0",
+        replacement="exit 1",
+        test="test_sh.py::test_b",
+        validator="bash",
+    )
+    result = _sweep(project, [case]).results[0]
+    assert result.outcome == ms.BIT, result.detail
+
+
+def test_opened_is_not_exercised(project, tmp_path_factory):
+    """The limit, pinned: a module-level import counts as opened, so a test that
+    never calls the target and fails for its own reason still reads BIT. Only
+    pass, fail, pass stands against this shape, and it cannot here."""
+    (project / "test_lazy.py").write_text(
+        "import guard  # opened at collection, never called\n\n" + _COUNTS_ITS_RUNS,
+        encoding="utf-8",
+    )
+    _commit_all(project)
+    counter = tmp_path_factory.mktemp("counter") / "runs"
+    case = _case(project, test="test_lazy.py::test_counts", env={"COUNTER": str(counter)})
+    result = _sweep(project, [case]).results[0]
+    assert result.outcome == ms.BIT, result.detail
+    assert not result.never_opened
+
+
+def test_a_watch_that_cannot_start_is_an_abort_not_a_pass(project, monkeypatch):
+    def unavailable(path):
+        raise OSError("injected: no inotify here")
+
+    monkeypatch.setattr(ms, "_watch_opens", unavailable)
+    result = _sweep(project, [_case(project)]).results[0]
+    assert result.outcome == ms.ABORTED
+    assert "no inotify here" in result.detail
+    assert not result.never_opened
+
+
+def test_a_run_that_could_not_decide_keeps_its_own_reason(project, monkeypatch):
+    """A usage error also opens nothing. "Never opened" would hide what happened."""
+    real = ms._pytest
+    calls = {"n": 0}
+
+    def usage_error_on_the_mutated_run(cmd, *, cwd, env, timeout):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            return subprocess.CompletedProcess(cmd, 4, "ERROR: usage\n", "")
+        return real(cmd, cwd=cwd, env=env, timeout=timeout)
+
+    monkeypatch.setattr(ms, "_pytest", usage_error_on_the_mutated_run)
+    result = _sweep(project, [_case(project)]).results[0]
+    assert result.outcome == ms.ABORTED
+    assert "never opened" not in result.detail
+    assert not result.never_opened
+
+
+@pytest.mark.parametrize(
+    "opens,removes,want",
+    [(True, False, True), (False, False, False), (False, True, False), (True, True, True)],
+    ids=["opened", "untouched", "unlinked-unopened", "opened-then-unlinked"],
+)
+def test_the_watch_reports_only_an_open(tmp_path, opens, removes, want):
+    """An unlink delivers IN_IGNORED, which must not read as an open."""
+    target = tmp_path / "t"
+    target.write_text("x", encoding="utf-8")
+    watch = ms._watch_opens(target)
+    try:
+        if opens:
+            target.read_text(encoding="utf-8")
+        if removes:
+            target.unlink()
+        assert watch.opened() is want
+    finally:
+        watch.close()
+
+
+def _victim(tmp_path_factory):
+    victim = tmp_path_factory.mktemp("callers-tree")
+    (victim / "precious").write_text("keep", encoding="utf-8")
+    return victim
+
+
+_USES_TMP_PATH = (
+    "import guard\ndef test_t(tmp_path):\n    assert guard.is_allowed('dangerous') is False\n"
+)
+
+
+@pytest.mark.parametrize(
+    "spelling", ["direct", "argfile", "o-addopts", "tracked-ini", "env-addopts", "after-dashes"]
+)
+def test_no_spelling_aims_pytests_temp_directory_outside_the_copy(
+    project, tmp_path_factory, spelling
+):
+    """`--basetemp` at a directory EMPTIES it when a test uses `tmp_path`, and
+    the caller's tree is one such directory. A list of refused spellings could
+    not be complete, so the harness passes its own, last, and pytest takes the
+    last one."""
+    victim = _victim(tmp_path_factory)
+    (project / "test_tmp.py").write_text(_USES_TMP_PATH, encoding="utf-8")
+    flag = f"--basetemp={victim}"
+    kw = {}
+    if spelling == "direct":
+        kw["pytest_args"] = (flag,)
+    elif spelling == "argfile":
+        (project / "args.txt").write_text(flag + "\n", encoding="utf-8")
+        kw["pytest_args"] = ("@args.txt",)
+    elif spelling == "o-addopts":
+        kw["pytest_args"] = ("-o", f"addopts={flag}")
+    elif spelling == "tracked-ini":
+        (project / "pytest.ini").write_text(f"[pytest]\naddopts = {flag}\n", encoding="utf-8")
+    elif spelling == "env-addopts":
+        kw["env"] = {"PYTEST_ADDOPTS": flag}
+    else:
+        kw["pytest_args"] = (flag, "--")
+    _commit_all(project)
+    _sweep(project, [_case(project, test="test_tmp.py::test_t", **kw)])
+    assert (victim / "precious").exists(), "pytest emptied a directory outside the copy"
+
+
+def _links_to_the_callers_root(project, spelling):
+    """A relative path that reaches the caller's tree through what the copy
+    keeps. Each has been a review finding against a list of refused spellings."""
+    if spelling == "link":
+        (project / "alias").symlink_to(project, target_is_directory=True)
+    elif spelling == "chain":
+        (project / "inner").symlink_to(project, target_is_directory=True)
+        (project / "alias").symlink_to("inner", target_is_directory=True)
+    elif spelling == "surplus":
+        (project / "alias").symlink_to(
+            "../" * 40 + str(project).lstrip("/"), target_is_directory=True
+        )
+    else:
+        (project / "other").mkdir()
+        (project / "other" / "keep").write_text("", encoding="utf-8")
+        (project / "lk").symlink_to(project / "other", target_is_directory=True)
+        return "lk/.."
+    return "alias"
+
+
+def _climb_from_the_copy(path):
+    """``path`` as a relative one from where a child runs: the copy's root, two
+    levels below the private temp root (`isolated_copy`)."""
+    return os.path.relpath(path, Path.home() / "tmp" / "holder" / "copy")
+
+
+def _guard_under_lib(project):
+    """The real repository's layout: the code sits under an import root, and the
+    test elsewhere. `python -m pytest` puts the child's cwd first on `sys.path`,
+    so a guard at the root would load from the copy whatever else is named."""
+    (project / "lib").mkdir()
+    (project / "guard.py").rename(project / "lib" / "guard.py")
+    (project / "sub").mkdir()
+    (project / "test_guard.py").rename(project / "sub" / "test_guard.py")
+    return project / "lib" / "guard.py", "sub/test_guard.py::test_blocks_danger"
+
+
+@pytest.mark.parametrize(
+    "spelling,channel",
+    [
+        ("absolute", "env"),
+        ("dot-segment", "env"),
+        ("double-slash", "env"),
+        ("outside-alias", "env"),
+        ("relative-climb", "env"),
+        ("link", "env"),
+        ("chain", "env"),
+        ("surplus", "env"),
+        ("dotdot-after-link", "pytest-arg"),  # PYTHONPATH entries are normalized first
+        ("absolute", "pytest-arg"),
+        ("quoted", "pytest-arg"),
+        ("link", "pythonpath"),
+        ("chain", "pythonpath"),
+        ("surplus", "pythonpath"),
+    ],
+)
+def test_a_path_to_the_callers_code_never_reads_as_a_verdict(
+    project, tmp_path_factory, spelling, channel
+):
+    """What the refusal list was for, with no list. However a case names a way
+    back to the caller's tree, the run cannot be a verdict about the mutation:
+    that path decides which `guard` loads."""
+    guard, test = _guard_under_lib(project)
+    if spelling in ("link", "chain", "surplus", "dotdot-after-link"):
+        value = _links_to_the_callers_root(project, spelling) + "/lib"
+    elif spelling == "outside-alias":
+        alias = tmp_path_factory.mktemp("alias") / "repo"
+        alias.symlink_to(project, target_is_directory=True)
+        value = f"{alias}/lib"
+    else:
+        value = {
+            "absolute": f"{project}/lib",
+            "dot-segment": f"{project.parent}/./{project.name}/lib",
+            "double-slash": f"{project.parent}//{project.name}/lib",
+            "relative-climb": _climb_from_the_copy(project / "lib"),
+            "quoted": f"'{project}/lib'",
+        }[spelling]
+    kw = {}
+    if channel == "env":
+        case = _case(project, path=guard, test=test, env={"PYTHONPATH": value})
+    elif channel == "pytest-arg":
+        case = _case(project, path=guard, test=test, pytest_args=(f"-o=pythonpath={value}",))
+    else:
+        case = _case(project, path=guard, test=test)
+        kw["pythonpath"] = (value,)
+    _commit_all(project)
+    result = _sweep(project, [case], **kw).results[0]
+    assert result.outcome == ms.ABORTED, result.detail
+    assert result.never_opened, result.detail  # not merely some other abort
+
+
+@pytest.mark.parametrize("channel", ["env", "pythonpath"])
+def test_a_path_inside_the_copy_is_still_a_true_verdict(project, channel):
+    """The control for the table above: same layout, a root that stays here."""
+    guard, test = _guard_under_lib(project)
+    kw = {}
+    if channel == "env":
+        case = _case(project, path=guard, test=test, env={"PYTHONPATH": "lib"})
+    else:
+        case = _case(project, path=guard, test=test)
+        kw["pythonpath"] = ("lib",)
+    _commit_all(project)
+    result = _sweep(project, [case], **kw).results[0]
+    assert result.outcome == ms.BIT, result.detail
+
+
+def test_a_selector_through_a_link_to_the_callers_tree_is_not_a_verdict(project):
+    (project / "linked").symlink_to(project, target_is_directory=True)
+    _commit_all(project)
+    case = _case(project, test="linked/test_guard.py::test_blocks_danger")
+    result = _sweep(project, [case]).results[0]
+    assert result.outcome == ms.ABORTED, result.detail
+    assert result.never_opened, result.detail
+
+
+def test_a_selector_that_climbs_to_the_callers_tree_is_not_a_verdict(project):
+    climb = _climb_from_the_copy(project / "test_guard.py")
+    case = _case(project, test=f"{climb}::test_blocks_danger")
+    result = _sweep(project, [case]).results[0]
+    assert result.outcome == ms.ABORTED, result.detail
+    assert result.never_opened, result.detail
+
+
+def test_a_mixed_run_reads_as_its_verdict(project):
+    """The limit, pinned: this run loads the caller's `guard` and also reads the
+    copy's as text, so the watch sees an open. It reads SURVIVED, for a test that
+    would catch this mutation, and that exits 1."""
+    guard, test = _guard_under_lib(project)
+    (project / "sub" / "conftest.py").write_text(
+        "from pathlib import Path\nPath('lib/guard.py').read_text()\n", encoding="utf-8"
+    )
+    _commit_all(project)
+    case = _case(project, path=guard, test=test, env={"PYTHONPATH": f"{project}/lib"})
+    result = _sweep(project, [case]).results[0]
+    assert result.outcome == ms.SURVIVED, result.detail
+    assert not result.never_opened
+
+
+def test_a_sweep_of_a_subdirectory_judges_the_right_file(project):
+    """`--repo` may name a directory below the toplevel: the copy is of the whole
+    repository, and the watch must be on the file at the same place in it."""
+    (project / "pkg").mkdir()
+    (project / "guard.py").rename(project / "pkg" / "guard.py")
+    (project / "test_guard.py").rename(project / "pkg" / "test_guard.py")
+    _commit_all(project)
+    case = _case(project / "pkg", path=project / "pkg" / "guard.py")
+    result = _sweep(project / "pkg", [case]).results[0]
+    assert result.outcome == ms.BIT, result.detail
+
+
+def test_a_file_the_watch_cannot_reach_raises_rather_than_reading_as_unopened(tmp_path):
+    """A failed watch must not become "never opened", which would blame the test."""
+    with pytest.raises(OSError, match="inotify_add_watch"):
+        ms._watch_opens(tmp_path / "missing")
