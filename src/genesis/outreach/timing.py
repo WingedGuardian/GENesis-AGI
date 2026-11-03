@@ -35,9 +35,11 @@ def _fold_instants(naive: datetime, local_tz) -> list[datetime]:
     instants: list[datetime] = []
     for fold in (0, 1):
         instant = naive.replace(tzinfo=local_tz, fold=fold).astimezone(UTC)
-        if instant.astimezone(local_tz).replace(tzinfo=None) == naive:
-            if instant not in instants:
-                instants.append(instant)
+        if (
+            instant.astimezone(local_tz).replace(tzinfo=None) == naive
+            and instant not in instants
+        ):
+            instants.append(instant)
     return sorted(instants)
 
 
