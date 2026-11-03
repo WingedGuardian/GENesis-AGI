@@ -4393,9 +4393,18 @@ Refusing a proposed update preserves a previously valid opt-in.
 - **`update.sh`'s rollback lives in `scripts/lib/update_rollback.sh`** (#3844):
   `_do_rollback` and the service, database and history helpers it needs, sourced
   at startup with the other libs. The lib holds definitions, plus two lines safe to
-  run twice, so it can be sourced again; `_on_err` and `_on_signal` stay in
-  `update.sh` with the traps. A run still uses the copy on disk at launch, so a
-  rollback fix does not yet protect the update that delivers it.
+  run twice, so it can be sourced again; `_on_err`, `_on_signal` and the thin
+  `_do_rollback` stay in `update.sh`, which keeps its own functions for the whole
+  run. So that a rollback fix protects the update delivering it, a plain merge
+  update stages the merged `scripts/lib` under `~/tmp` before the stop and checks
+  it; after the merge is verified, a failure loads that copy and runs it with `set
+  +eu`, because with the traps off a stop would leave the server down. Anything
+  wrong falls back to the launched rollback: a file that will not parse or load, a
+  different `update_rollback_abi`, a global the lib declares and the launching
+  script does not set, nothing merged, or local commits to `scripts/lib`. Activation
+  stays on what it launched with, as do `live` and `--post-merge`.
+  `~/.genesis/last_rollback_source.json` says which rollback last ran and why
+  (a diagnostic, overwritten each time; nothing reads it).
 - **`update.sh` on `live`** (#2978, #3370): the merge's place, after the stop,
   is taken by the deploy-candidates engine's rebuild (`scripts/deploy_candidates.py
   rebuild`, the `live-engine` block). Everything else is main's path: one DB

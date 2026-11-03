@@ -41,14 +41,14 @@ def test_restore_owed_is_measured_at_rollback(text: str) -> None:
     """Whether the update changed the database is measured when the rollback
     decides (test_update_db_restore_owed.py covers the measurement)."""
     assert "DB_RESTORE_OWED=0" in text, "the flag must be initialized to 0"
-    rb = text[text.find("_do_rollback() {") : text.find("To diagnose")]
+    rb = text[text.find("_rollback_body() {") : text.find("To diagnose")]
     assert rb.index('_measure_db_restore_owed "$code_action" "$server_down"') < rb.index(
         "# BEGIN rollback-db-decision"
     )
 
 
 def test_rollback_restores_db_only_when_owed(text: str) -> None:
-    rb = text[text.find("_do_rollback() {") : text.find("To diagnose")]
+    rb = text[text.find("_rollback_body() {") : text.find("To diagnose")]
     assert '[ "${DB_RESTORE_OWED:-0}" = "1" ]' in rb, "DB restore must be gated on DB_RESTORE_OWED"
     assert '[ "${DB_SNAPSHOT_TAKEN:-0}" != "1" ]' in rb, (
         "restore must trust the THIS-RUN snapshot flag, not mere file existence "

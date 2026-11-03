@@ -155,7 +155,7 @@ _drop_own_prestop_state() {
         && rm -f "${STATE_FILE:-}" 2>/dev/null
     return 0
 }
-trap 'rm -f "$_SELF_COPY" 2>/dev/null; _drop_own_prestop_state; _flush_deploy_summary' EXIT
+trap 'rm -f "$_SELF_COPY" 2>/dev/null; _drop_own_prestop_state; [ -z "${_STAGED_ROLLBACK:-}" ] || rm -rf -- "$_STAGED_ROLLBACK" 2>/dev/null; _flush_deploy_summary' EXIT
 # The copy handshake is spent. Nothing this run starts (bootstrap, a nohup'd
 # server, a later dashboard update) may inherit it.
 unset GENESIS_UPDATE_FROM_TEMP GENESIS_UPDATE_SELF_COPY
@@ -249,6 +249,143 @@ _PEER_RESTORE_PY="$(cat "$GENESIS_ROOT/src/genesis/db/crud/peer_restore.py")"
 . "$SCRIPT_DIR/lib/venv_setup.sh"
 # shellcheck source=lib/update_rollback.sh
 . "$SCRIPT_DIR/lib/update_rollback.sh"
+
+# BEGIN merged-rollback (extracted by tests/test_scripts/test_update_merged_rollback.py)
+# ── The merged rollback (#3844) ──────────────────────────
+# This run's functions are the copy on disk when it started, so a rollback fix
+# would not protect the update delivering it. So, before the stop, the merged
+# scripts/lib is staged outside the checkout and checked. Once the merge is verified
+# (armed below) a failure runs that rollback, and anything wrong with it falls back
+# to the one this run launched with. Only the rollback: activation stays as it is.
+_STAGED_ROLLBACK=""
+_ROLLBACK_ABI=1
+_ROLLBACK_RELOAD="checkout_lock.sh deploy_marker.sh deploy_checkout.sh deploy_recovery.sh venv_setup.sh update_rollback.sh"
+_ROLLBACK_ARMED=0
+_ROLLBACK_LAUNCH_WHY=""
+
+# Can <staged root> be loaded? In a subshell, so a bad file changes nothing here. The
+# launched definitions go first, or they would satisfy the checks for an empty lib.
+# --needs also runs its own check against this run's variables, which exist only by
+# the time a rollback starts. Prints the reason and returns 1. Success is the last line
+# printed, not the status: a lib that runs `exit 0` when sourced would end the subshell
+# with 0, and then end this script when it is loaded for real.
+_staged_rollback_usable() {
+    local out=""
+    out="$(_staged_rollback_check "$@" 2>&1)" || true
+    [ "$(printf '%s\n' "$out" | tail -1)" = "staged-rollback-usable" ] && return 0
+    printf '%s\n' "${out:-a staged lib ended the check early}"
+    return 1
+}
+_staged_rollback_check() {
+    (
+        trap - ERR INT TERM
+        unset -f _rollback_body update_rollback_abi update_rollback_enter update_rollback_needs_met
+        d="$1/scripts/lib"
+        for f in $_ROLLBACK_RELOAD; do
+            [ -f "$d/$f" ] || { echo "it has no $f"; exit 1; }
+            bash -n "$d/$f" 2>&1 || { echo "cannot parse $f"; exit 1; }
+        done
+        for f in $_ROLLBACK_RELOAD; do
+            # shellcheck disable=SC1090
+            . "$d/$f" || { echo "cannot load $f"; exit 1; }
+        done
+        got="$(update_rollback_abi 2>/dev/null)" || got=""
+        [ "$got" = "$_ROLLBACK_ABI" ] || { echo "its rollback contract is '${got:-none}', not $_ROLLBACK_ABI"; exit 1; }
+        declare -F _rollback_body >/dev/null || { echo "it has no rollback"; exit 1; }
+        declare -F update_rollback_enter >/dev/null || { echo "it has no rollback entry"; exit 1; }
+        declare -F update_rollback_needs_met >/dev/null || { echo "it has no needs check"; exit 1; }
+        if [ "${2:-}" = --needs ]; then
+            update_rollback_needs_met || exit 1
+        fi
+        echo staged-rollback-usable
+    )
+}
+
+# Put the merged scripts/lib beside this run. Never fatal: a failure leaves the
+# launched rollback in place, and says so before anything has stopped.
+_stage_merged_rollback() {
+    local dir why
+    if ! dir="$(mktemp -d -p "$HOME/tmp" genesis-rollback-stage.XXXXXX 2>/dev/null)"; then
+        _ROLLBACK_LAUNCH_WHY="could not create a directory to stage it in"
+    else
+        _STAGED_ROLLBACK="$dir"
+        if ! git -C "$GENESIS_ROOT" archive "$DEPLOY_HEAD" scripts/lib 2>/dev/null | tar -x -m -C "$dir" 2>/dev/null; then
+            _ROLLBACK_LAUNCH_WHY="could not unpack scripts/lib from ${DEPLOY_HEAD:0:12}"
+        elif ! why="$(_staged_rollback_usable "$dir" 2>&1)"; then
+            _ROLLBACK_LAUNCH_WHY="$(printf '%s' "$why" | tail -1)"
+        else
+            echo "  Staged the merged rollback from ${DEPLOY_HEAD:0:12}."
+            return 0
+        fi
+        _STAGED_ROLLBACK=""
+        rm -rf -- "$dir" 2>/dev/null || true
+    fi
+    echo "  WARNING: a failure in this update will use the rollback it launched with: $_ROLLBACK_LAUNCH_WHY."
+}
+
+# Which rollback ran, and why, for whoever reads this after a rollback the log of
+# which may be gone. Best effort.
+_note_rollback_source() {
+    python3 -I -S - "$HOME/.genesis/last_rollback_source.json" "$1" "${2:-}" \
+        "${OLD_COMMIT:-}" "${DEPLOY_HEAD:-}" "${_ROLLBACK_ABI:-}" 2>/dev/null <<'PY' || true
+import datetime
+import json
+import os
+import sys
+
+path, source, why, launched_from, target, abi = sys.argv[1:]
+tmp = path + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(
+        {
+            "source": source,
+            "why_launched": why,
+            "launched_from": launched_from,
+            "target": target,
+            "abi": abi,
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        },
+        fh,
+    )
+os.replace(tmp, path)
+PY
+}
+
+# Every failure comes here. Not armed: the launched rollback, exactly as before.
+# Armed: traps off and -eu off FIRST, because with the traps off any stop now would
+# leave the server down. A fault the merged code holds then costs that step, not the
+# rollback, and its verdict variables still report the step as failed.
+_do_rollback() {
+    if [ "${_ROLLBACK_ARMED:-0}" != 1 ]; then
+        _note_rollback_source launched "${_ROLLBACK_LAUNCH_WHY:-no merged rollback was armed}"
+        _rollback_body "$@"
+        return
+    fi
+    trap - ERR INT TERM
+    set +eu
+    local why keep_backup="$EPHEMERAL_BACKUP_ROOT" keep_dir="$SCRIPT_DIR" f
+    if ! why="$(_staged_rollback_usable "$_STAGED_ROLLBACK" --needs 2>&1)"; then
+        why="$(printf '%s' "$why" | tail -1)"
+        echo "  WARNING: using the rollback this update launched with: $why."
+        _note_rollback_source launched "$why"
+        set -eu
+        _rollback_body "$@"
+        return
+    fi
+    echo "  Using the rollback from ${DEPLOY_HEAD:0:12}."
+    _note_rollback_source merged ""
+    for f in $_ROLLBACK_RELOAD; do
+        # shellcheck disable=SC1090
+        . "$_STAGED_ROLLBACK/scripts/lib/$f"
+    done
+    # A run-scoped path deploy_recovery.sh computes when sourced: the rollback must
+    # keep the one this run has backed files up under.
+    EPHEMERAL_BACKUP_ROOT="$keep_backup"
+    update_rollback_enter "$_STAGED_ROLLBACK" "$@"
+    SCRIPT_DIR="$keep_dir"
+    set -eu
+}
+# END merged-rollback
 
 # ── Update state file helper ────────────────────────────
 # Written at each phase boundary so crash recovery knows where we stopped.
@@ -1657,6 +1794,9 @@ else
     echo "  WARNING: the installed packages were not recorded; a rollback would re-resolve the old version ranges."
 fi
 # END deps-capture
+if [[ "$POST_MERGE" == "false" ]] && [ "${ON_LIVE:-0}" != 1 ] && [ -n "${DEPLOY_HEAD:-}" ]; then
+    _stage_merged_rollback
+fi
 
 # The staged-path guard again, as the last step before the stop: the backups and
 # the database snapshot above can take minutes.
@@ -1739,7 +1879,7 @@ if [[ " ${WERE_RUNNING[*]} " == *" genesis-server "* ]]; then
     # deploy). It is armed BEFORE the pause, so no signal can land between an
     # accepted pause and its resume; _guardian_resume no-ops until a pause is
     # accepted.
-    trap '_guardian_resume; rm -f "$_SELF_COPY" 2>/dev/null; _drop_own_prestop_state; _flush_deploy_summary' EXIT
+    trap '_guardian_resume; rm -f "$_SELF_COPY" 2>/dev/null; _drop_own_prestop_state; [ -z "${_STAGED_ROLLBACK:-}" ] || rm -rf -- "$_STAGED_ROLLBACK" 2>/dev/null; _flush_deploy_summary' EXIT
     _guardian_pause
     _stop_genesis_server
     # Disarm systemd's on-failure auto-restart so a stale-code instance can't come
@@ -1839,7 +1979,7 @@ _success_degraded_subsystems() {
 # END success-degraded-subsystems
 
 
-# _do_rollback is in lib/update_rollback.sh.
+# The rollback's body is in lib/update_rollback.sh.
 
 # ── Install ERR trap — catches any unhandled failure after this point ─
 # Uses $BASH_COMMAND to report which command failed.
@@ -2176,6 +2316,20 @@ if ! git -C "$GENESIS_ROOT" merge-base --is-ancestor "$DEPLOY_HEAD" HEAD 2>/dev/
     _do_rollback "merge did not bring in the fetched $UPDATE_REMOTE/$DEPLOY_BRANCH head ${DEPLOY_HEAD:0:12}"
     exit 1
 fi
+# BEGIN arm-merged-rollback (extracted by tests/test_scripts/test_update_merged_rollback.py)
+# Nothing merged (the head was adopted as it stood, possibly ahead of the target), or
+# local commits changed scripts/lib, so what was staged is not this tree's rollback.
+if [ -n "${_STAGED_ROLLBACK:-}" ]; then
+    if [ "$_merged_head" = "$VALIDATED_HEAD" ]; then
+        _ROLLBACK_LAUNCH_WHY="this update merged nothing"
+    elif ! git -C "$GENESIS_ROOT" diff --quiet "$DEPLOY_HEAD" HEAD -- scripts/lib 2>/dev/null; then
+        _ROLLBACK_LAUNCH_WHY="scripts/lib here differs from ${DEPLOY_HEAD:0:12}, which was staged"
+        echo "  WARNING: a failure in this update will use the rollback it launched with: $_ROLLBACK_LAUNCH_WHY."
+    else
+        _ROLLBACK_ARMED=1
+    fi
+fi
+# END arm-merged-rollback
 else
 # BEGIN live-engine (extracted by tests/test_scripts/test_update_live.py)
 # On `live` the merge is the engine's rebuild (scripts/deploy_candidates.py

@@ -90,6 +90,7 @@ def test_a_summary_path_inherited_from_the_caller_is_never_printed_or_removed(tm
         "\n",
         text.index(
             'trap \'rm -f "$_SELF_COPY" 2>/dev/null; _drop_own_prestop_state; '
+            '[ -z "${_STAGED_ROLLBACK:-}" ] || rm -rf -- "$_STAGED_ROLLBACK" 2>/dev/null; '
             "_flush_deploy_summary' EXIT"
         ),
     )
