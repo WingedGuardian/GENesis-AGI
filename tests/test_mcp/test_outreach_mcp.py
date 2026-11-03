@@ -1009,7 +1009,7 @@ async def test_in_process_future_timing_enqueues_not_delivers(
 ):
     pipe = AsyncMock()
     swap_runtime(pipe, pending_db)
-    tools = await mcp.get_tools()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
     out = json.loads(await tools["outreach_send"].fn(
         message="ping", category="notification", channel="telegram",
         preferred_timing="in 2 hours",
@@ -1038,7 +1038,7 @@ async def test_child_and_in_process_return_same_shape(
         conn.row_factory = aiosqlite.Row
         await pending_outreach.ensure_table(conn)
         swap_runtime(pipe if use_pipeline else None, conn)
-        tools = await mcp.get_tools()
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
         out = json.loads(await tools["outreach_send"].fn(
             message="ping", category="notification", channel="telegram",
             preferred_timing="in 2 hours",
@@ -1055,7 +1055,7 @@ async def test_nl_timing_resolved_not_stored_verbatim(
     pending_db, frozen_clock, swap_runtime
 ):
     swap_runtime(None, pending_db)
-    tools = await mcp.get_tools()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
     out = json.loads(await tools["outreach_send"].fn(
         message="ping", category="notification", channel="telegram",
         preferred_timing="tomorrow 9am",
@@ -1075,7 +1075,7 @@ async def test_unparseable_timing_rejected(
 ):
     pipe = AsyncMock()
     swap_runtime(pipe if use_pipeline else None, pending_db)
-    tools = await mcp.get_tools()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
     out = json.loads(await tools["outreach_send"].fn(
         message="ping", category="notification", channel="telegram",
         preferred_timing="banana",
@@ -1098,9 +1098,33 @@ async def test_no_timing_in_process_still_delivers_now(
     pipe = AsyncMock()
     pipe.submit.return_value = result
     swap_runtime(pipe, pending_db)
-    tools = await mcp.get_tools()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
     out = json.loads(await tools["outreach_send"].fn(
         message="ping", category="notification", channel="telegram",
+    ))
+    pipe.submit.assert_awaited_once()
+    assert out["status"] == "delivered"
+    assert await _pending_rows(pending_db) == []
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+async def test_blank_timing_is_no_timing(
+    blank, pending_db, frozen_clock, swap_runtime
+):
+    """A client that fills an optional field with an empty string asked for no
+    schedule: it delivers now, rather than being refused or queued."""
+    result = MagicMock()
+    result.outreach_id = "o-1"
+    result.status.value = "delivered"
+    result.channel = "telegram"
+    result.error = None
+    pipe = AsyncMock()
+    pipe.submit.return_value = result
+    swap_runtime(pipe, pending_db)
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    out = json.loads(await tools["outreach_send"].fn(
+        message="ping", category="notification", channel="telegram",
+        preferred_timing=blank,
     ))
     pipe.submit.assert_awaited_once()
     assert out["status"] == "delivered"
@@ -1110,7 +1134,7 @@ async def test_no_timing_in_process_still_delivers_now(
 async def test_future_timing_without_db_errors(frozen_clock, swap_runtime):
     pipe = AsyncMock()
     swap_runtime(pipe, None)
-    tools = await mcp.get_tools()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
     out = json.loads(await tools["outreach_send"].fn(
         message="ping", category="notification", channel="telegram",
         preferred_timing="in 2 hours",
@@ -1128,7 +1152,7 @@ async def test_drain_picks_up_resolved_row(
     from genesis.db.crud import pending_outreach
 
     swap_runtime(None, pending_db)
-    tools = await mcp.get_tools()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
     out = json.loads(await tools["outreach_send"].fn(
         message="ping", category="notification", channel="telegram",
         preferred_timing="in 2 hours",
@@ -1149,7 +1173,7 @@ async def test_scheduled_critical_queued_as_high(
     that keeps its urgent delivery semantics."""
     pipe = AsyncMock()
     swap_runtime(pipe, pending_db)
-    tools = await mcp.get_tools()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
     out = json.loads(await tools["outreach_send"].fn(
         message="ping", category="notification", channel="telegram",
         urgency="critical", preferred_timing="in 2 hours",
