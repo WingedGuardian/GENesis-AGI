@@ -108,6 +108,26 @@ def test_a_summary_path_inherited_from_the_caller_is_never_printed_or_removed(tm
     assert "the caller's line" not in r.stdout
 
 
+def test_an_inherited_staged_rollback_is_not_deleted_on_an_early_exit(tmp_path):
+    """The EXIT trap removes the directory _STAGED_ROLLBACK names, and it is armed
+    long before the run stages one, so an inherited value is forgotten first."""
+    text = UPDATE.read_text()
+    start = text.index("unset GENESIS_DEPLOY_SUMMARY")
+    end = text.index("\n", text.index('rm -rf -- "$_STAGED_ROLLBACK" 2>/dev/null; _flush', start))
+    theirs = tmp_path / "theirs"
+    theirs.mkdir()
+    (theirs / "keep").write_text("kept\n")
+    script = "_SELF_COPY=/nonexistent\n" + text[start:end] + "\nexit 1\n"
+    r = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "_STAGED_ROLLBACK": str(theirs)},
+    )
+    assert r.returncode == 1
+    assert (theirs / "keep").read_text() == "kept\n"
+
+
 def test_the_summary_exists_before_the_no_change_path_realigns_pins():
     """The no-change path runs _sync_deploy_targets (Claude Code pin realignment
     and shadow removal write summary lines) without bootstrap, so the summary

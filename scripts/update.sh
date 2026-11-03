@@ -133,6 +133,8 @@ readonly _SELF_COPY="${BASH_SOURCE[0]}"
 # A GENESIS_DEPLOY_SUMMARY inherited from the caller names the caller's file, not
 # one this run created: forget it, so no exit path prints or deletes it.
 unset GENESIS_DEPLOY_SUMMARY
+# Likewise an inherited _STAGED_ROLLBACK: the EXIT trap below deletes what it names.
+unset _STAGED_ROLLBACK
 _flush_deploy_summary() {
     local heading="${1:-Changed outside the checkout before this run stopped (not undone):}"
     if [ -n "${GENESIS_DEPLOY_SUMMARY:-}" ] && [ -s "$GENESIS_DEPLOY_SUMMARY" ]; then
