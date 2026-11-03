@@ -69,6 +69,11 @@ dependencies = [
     "html2text",
     "lxml",
     "flask>=3.0",
+    "dateparser>=1.4.1,<2",  # natural-language `preferred_timing` resolution for
+                           # scheduled outreach (genesis.outreach.timing): "tomorrow
+                           # 9am", "in 2 hours" → UTC. Without it a raw NL string
+                           # was stored verbatim in pending_outreach.deliver_after
+                           # and never fired (lexicographic compare vs UTC ISO now).
     "flask-sock>=0.7",
     "wsproto>=1.2",  # transitive dep of flask-sock; pin to prevent silent uninstall
     "fastmcp>=4.1.4,<5",  # Qualified v4 API and security floor; no background-tasks extra.

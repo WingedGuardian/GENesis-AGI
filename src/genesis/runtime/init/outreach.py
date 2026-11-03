@@ -53,6 +53,28 @@ def _is_reserved_discord_channel(channel: str) -> bool:
     return _discord_webhook_env(channel) == _DISCORD_DEFAULT_ENV
 
 
+def discord_webhook_configured(channel: str) -> bool:
+    """True when a Discord send to ``channel`` can reach a webhook at all.
+
+    Two conditions: ``DISCORD_WEBHOOK_URL`` is set (the adapter is registered
+    only when it is, so nothing is reachable without it), AND the channel
+    either has its own ``DISCORD_WEBHOOK_<NAME>`` var or IS the configured
+    default channel, which legitimately resolves to the default webhook.
+    ``"discord"`` means "the default channel". The reserved name (``url``)
+    never qualifies — its env lookup inverts onto the default webhook, and
+    honouring it would post there while reporting a channel that does not
+    exist.
+    """
+    if not os.environ.get(_DISCORD_DEFAULT_ENV):
+        return False
+    default_channel = os.environ.get("OUTREACH_RECIPIENT_DISCORD") or "dev-discussion"
+    if channel in ("discord", default_channel):
+        return True
+    if _is_reserved_discord_channel(channel):
+        return False
+    return bool(os.environ.get(_discord_webhook_env(channel)))
+
+
 def _discord_channel_from_env(key: str) -> str:
     """Channel name for a ``DISCORD_WEBHOOK_<NAME>`` env var — the FORWARD rule.
 

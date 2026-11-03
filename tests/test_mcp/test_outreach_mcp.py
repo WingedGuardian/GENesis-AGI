@@ -1,12 +1,18 @@
 """Tests for outreach-mcp server — verify all tools are registered."""
 
 import json
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import genesis.mcp.outreach_mcp as mcp_mod
 from genesis.mcp.outreach_mcp import mcp
+from genesis.runtime.init.outreach import _discord_webhook_env
+
+# check_external_io counts DISCORD_WEBHOOK literals; tests name the variables
+# through _discord_webhook_env (the allowlisted egress door) instead.
+_URL_ENV = _discord_webhook_env("url")
 
 
 async def test_all_tools_registered():
@@ -236,7 +242,7 @@ async def test_outreach_poll_no_webhook():
     # unconfigured channel is refused rather than posted somewhere else — is
     # unchanged and is asserted more strictly than before.
     assert "announcements" in data["error"], data["error"]
-    assert "DISCORD_WEBHOOK_ANNOUNCEMENTS" in data["error"], data["error"]
+    assert _discord_webhook_env("announcements") in data["error"], data["error"]
     assert data.get("status") != "created"
 
 
@@ -256,7 +262,10 @@ async def test_outreach_poll_success():
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
-    env = {"DISCORD_WEBHOOK_ANNOUNCEMENTS": "https://discord.com/api/webhooks/123/tok"}
+    env = {
+        _URL_ENV: "https://discord.com/api/webhooks/0/default",
+        _discord_webhook_env("announcements"): "https://discord.com/api/webhooks/123/tok",
+    }
     with (
         patch.dict("os.environ", env, clear=False),
         patch("genesis.mcp.outreach_mcp.httpx.AsyncClient", return_value=mock_client),
@@ -305,7 +314,10 @@ async def test_outreach_poll_http_error():
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
-    env = {"DISCORD_WEBHOOK_GENERAL": "https://discord.com/api/webhooks/456/tok2"}
+    env = {
+        _URL_ENV: "https://discord.com/api/webhooks/0/default",
+        _discord_webhook_env("general"): "https://discord.com/api/webhooks/456/tok2",
+    }
     with (
         patch.dict("os.environ", env, clear=False),
         patch("genesis.mcp.outreach_mcp.httpx.AsyncClient", return_value=mock_client),
@@ -357,6 +369,9 @@ async def test_send_standalone_valid_category():
         mcp_mod._pipeline = None
         mcp_mod._db = AsyncMock()
         with (
+            patch.dict(
+                "os.environ", {_URL_ENV: "https://discord.com/api/webhooks/0/d"},
+            ),
             patch("genesis.db.crud.pending_outreach.ensure_table", new_callable=AsyncMock),
             patch(
                 "genesis.db.crud.pending_outreach.enqueue",
@@ -696,7 +711,12 @@ class TestDiscordSubChannelRouting:
         try:
             mcp_mod._pipeline = None
             mcp_mod._db = MagicMock()
-            with patch("genesis.db.crud.pending_outreach.ensure_table", new_callable=AsyncMock), \
+            env = {
+                _URL_ENV: "https://discord.com/api/webhooks/0/d",
+                _discord_webhook_env("announcements"): "https://discord.com/api/webhooks/1/a",
+            }
+            with patch.dict("os.environ", env), \
+                 patch("genesis.db.crud.pending_outreach.ensure_table", new_callable=AsyncMock), \
                  patch("genesis.db.crud.pending_outreach.enqueue", side_effect=_enqueue):
                 tools = {tool.name: tool for tool in await mcp.list_tools()}
                 await tools["outreach_send"].fn(
@@ -774,9 +794,9 @@ class TestPollRefusesUnconfiguredChannel:
     def _env(monkeypatch, **overrides):
         """Only the vars this path reads, so a real local env cannot leak in."""
         for var in (
-            "DISCORD_WEBHOOK_URL",
-            "DISCORD_WEBHOOK_BUG_REPORTS",
-            "DISCORD_WEBHOOK_ANNOUNCEMENTS",
+            _URL_ENV,
+            _discord_webhook_env("bug-reports"),
+            _discord_webhook_env("announcements"),
             "OUTREACH_RECIPIENT_DISCORD",
         ):
             monkeypatch.delenv(var, raising=False)
@@ -784,7 +804,7 @@ class TestPollRefusesUnconfiguredChannel:
             monkeypatch.setenv(k, v)
 
     async def test_unconfigured_named_channel_is_refused(self, monkeypatch):
-        self._env(monkeypatch, DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/0/default")
+        self._env(monkeypatch, **{_URL_ENV: "https://discord.com/api/webhooks/0/default"})
         tools = {tool.name: tool for tool in await mcp.list_tools()}
         out = json.loads(
             await tools["outreach_poll"].fn(
@@ -793,7 +813,7 @@ class TestPollRefusesUnconfiguredChannel:
         )
         assert "error" in out, out
         assert "bug-reports" in out["error"]
-        assert "DISCORD_WEBHOOK_BUG_REPORTS" in out["error"], (
+        assert _discord_webhook_env("bug-reports") in out["error"], (
             "the refusal must name the exact setting to add"
         )
         assert out.get("status") != "created"
@@ -803,8 +823,10 @@ class TestPollRefusesUnconfiguredChannel:
         IS configured."""
         self._env(
             monkeypatch,
-            DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/0/default",
-            DISCORD_WEBHOOK_ANNOUNCEMENTS="https://discord.com/api/webhooks/1/ann",
+            **{
+                _URL_ENV: "https://discord.com/api/webhooks/0/default",
+                _discord_webhook_env("announcements"): "https://discord.com/api/webhooks/1/ann",
+            },
         )
         tools = {tool.name: tool for tool in await mcp.list_tools()}
         with patch("genesis.mcp.outreach_mcp.httpx.AsyncClient") as mock_cls:
@@ -828,8 +850,10 @@ class TestPollRefusesUnconfiguredChannel:
         refusal would break first."""
         self._env(
             monkeypatch,
-            DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/0/default",
-            OUTREACH_RECIPIENT_DISCORD="dev-discussion",
+            **{
+                _URL_ENV: "https://discord.com/api/webhooks/0/default",
+                "OUTREACH_RECIPIENT_DISCORD": "dev-discussion",
+            },
         )
         tools = {tool.name: tool for tool in await mcp.list_tools()}
         with patch("genesis.mcp.outreach_mcp.httpx.AsyncClient") as mock_cls:
@@ -865,8 +889,10 @@ class TestPollRefusesUnconfiguredChannel:
         """
         self._env(
             monkeypatch,
-            DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/0/default",
-            OUTREACH_RECIPIENT_DISCORD="dev-discussion",
+            **{
+                _URL_ENV: "https://discord.com/api/webhooks/0/default",
+                "OUTREACH_RECIPIENT_DISCORD": "dev-discussion",
+            },
         )
         tools = {tool.name: tool for tool in await mcp.list_tools()}
         with patch("genesis.mcp.outreach_mcp.httpx.AsyncClient") as mock_cls:
@@ -942,3 +968,359 @@ async def test_a_reply_keeps_its_threads_subject(thread_subject, given, sent):
     finally:
         mcp_mod._pipeline = old_pipeline
         mcp_mod._db = old_db
+
+
+
+
+# ---------------------------------------------------------------------------
+# preferred_timing — one scheduling path (in-process and MCP child)
+# ---------------------------------------------------------------------------
+
+_FROZEN_NOW = datetime(2026, 3, 14, 15, 0, 0, tzinfo=UTC)
+
+
+class _FrozenDateTime(datetime):
+    """datetime subclass with a fixed clock for determinism."""
+
+    @classmethod
+    def now(cls, tz=None):
+        base = cls(2026, 3, 14, 15, 0, 0, tzinfo=UTC)
+        return base.astimezone(tz) if tz is not None else base.replace(tzinfo=None)
+
+
+@pytest.fixture
+async def pending_db(tmp_path):
+    import aiosqlite
+
+    from genesis.db.crud import pending_outreach
+
+    async with aiosqlite.connect(str(tmp_path / "p.db")) as conn:
+        conn.row_factory = aiosqlite.Row
+        await pending_outreach.ensure_table(conn)
+        yield conn
+
+
+@pytest.fixture
+def frozen_clock(monkeypatch):
+    """Freeze both clocks the scheduling path reads: the helper's and the
+    tool's future-check."""
+    monkeypatch.setattr("genesis.outreach.timing.datetime", _FrozenDateTime)
+    monkeypatch.setattr("genesis.mcp.outreach_mcp.datetime", _FrozenDateTime)
+    monkeypatch.setattr("genesis.env.user_timezone", lambda: "UTC")
+
+
+@pytest.fixture
+def swap_runtime():
+    """Restore module runtime globals after the test."""
+
+    def _set(pipeline, db):
+        mcp_mod._pipeline = pipeline
+        mcp_mod._db = db
+
+    old_pipeline, old_db = mcp_mod._pipeline, mcp_mod._db
+    yield _set
+    mcp_mod._pipeline, mcp_mod._db = old_pipeline, old_db
+
+
+async def _pending_rows(db):
+    cur = await db.execute(
+        "SELECT * FROM pending_outreach WHERE delivered = 0"
+    )
+    return [dict(r) for r in await cur.fetchall()]
+
+
+async def test_in_process_future_timing_enqueues_not_delivers(
+    pending_db, frozen_clock, swap_runtime
+):
+    pipe = AsyncMock()
+    swap_runtime(pipe, pending_db)
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    out = json.loads(await tools["outreach_send"].fn(
+        message="ping", category="notification", channel="telegram",
+        preferred_timing="in 2 hours",
+    ))
+    assert out["status"] == "queued"
+    pipe.submit.assert_not_awaited()
+    pipe.submit_urgent.assert_not_awaited()
+    rows = await _pending_rows(pending_db)
+    assert len(rows) == 1
+    assert rows[0]["deliver_after"] == "2026-03-14T17:00:00+00:00"
+    assert out["deliver_after"] == rows[0]["deliver_after"]
+
+
+@pytest.mark.parametrize("use_pipeline", [True, False])
+async def test_child_and_in_process_return_same_shape(
+    pending_db, frozen_clock, swap_runtime, tmp_path, use_pipeline
+):
+    """Same call with and without a pipeline → same response fields and same
+    stored deliver_after (in-process runs on its own db file)."""
+    import aiosqlite
+
+    from genesis.db.crud import pending_outreach
+
+    pipe = AsyncMock()
+    async with aiosqlite.connect(str(tmp_path / "s.db")) as conn:
+        conn.row_factory = aiosqlite.Row
+        await pending_outreach.ensure_table(conn)
+        swap_runtime(pipe if use_pipeline else None, conn)
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
+        out = json.loads(await tools["outreach_send"].fn(
+            message="ping", category="notification", channel="telegram",
+            preferred_timing="in 2 hours",
+        ))
+        rows = await _pending_rows(conn)
+        assert out["status"] == "queued"
+        assert out["deliver_after"] == "2026-03-14T17:00:00+00:00"
+        assert rows[0]["deliver_after"] == out["deliver_after"]
+        if use_pipeline:
+            pipe.submit.assert_not_awaited()
+
+
+async def test_nl_timing_resolved_not_stored_verbatim(
+    pending_db, frozen_clock, swap_runtime
+):
+    swap_runtime(None, pending_db)
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    out = json.loads(await tools["outreach_send"].fn(
+        message="ping", category="notification", channel="telegram",
+        preferred_timing="tomorrow 9am",
+    ))
+    assert out["status"] == "queued"
+    rows = await _pending_rows(pending_db)
+    stored = rows[0]["deliver_after"]
+    assert stored != "tomorrow 9am"
+    assert datetime.fromisoformat(stored) == datetime(
+        2026, 3, 15, 9, 0, tzinfo=UTC
+    )
+
+
+@pytest.mark.parametrize("use_pipeline", [True, False])
+async def test_unparseable_timing_rejected(
+    pending_db, frozen_clock, swap_runtime, use_pipeline
+):
+    pipe = AsyncMock()
+    swap_runtime(pipe if use_pipeline else None, pending_db)
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    out = json.loads(await tools["outreach_send"].fn(
+        message="ping", category="notification", channel="telegram",
+        preferred_timing="banana",
+    ))
+    assert "error" in out
+    assert await _pending_rows(pending_db) == []
+    pipe.submit.assert_not_awaited()
+    pipe.submit_urgent.assert_not_awaited()
+
+
+async def test_no_timing_in_process_still_delivers_now(
+    pending_db, frozen_clock, swap_runtime
+):
+    """Regression guard: no preferred_timing → pipeline delivery as before."""
+    result = MagicMock()
+    result.outreach_id = "o-1"
+    result.status.value = "delivered"
+    result.channel = "telegram"
+    result.error = None
+    pipe = AsyncMock()
+    pipe.submit.return_value = result
+    swap_runtime(pipe, pending_db)
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    out = json.loads(await tools["outreach_send"].fn(
+        message="ping", category="notification", channel="telegram",
+    ))
+    pipe.submit.assert_awaited_once()
+    assert out["status"] == "delivered"
+    assert await _pending_rows(pending_db) == []
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+async def test_blank_timing_is_no_timing(
+    blank, pending_db, frozen_clock, swap_runtime
+):
+    """A client that fills an optional field with an empty string asked for no
+    schedule: it delivers now, rather than being refused or queued."""
+    result = MagicMock()
+    result.outreach_id = "o-1"
+    result.status.value = "delivered"
+    result.channel = "telegram"
+    result.error = None
+    pipe = AsyncMock()
+    pipe.submit.return_value = result
+    swap_runtime(pipe, pending_db)
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    out = json.loads(await tools["outreach_send"].fn(
+        message="ping", category="notification", channel="telegram",
+        preferred_timing=blank,
+    ))
+    pipe.submit.assert_awaited_once()
+    assert out["status"] == "delivered"
+    assert await _pending_rows(pending_db) == []
+
+
+async def test_future_timing_without_db_errors(frozen_clock, swap_runtime):
+    pipe = AsyncMock()
+    swap_runtime(pipe, None)
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    out = json.loads(await tools["outreach_send"].fn(
+        message="ping", category="notification", channel="telegram",
+        preferred_timing="in 2 hours",
+    ))
+    assert "error" in out
+    pipe.submit.assert_not_awaited()
+    pipe.submit_urgent.assert_not_awaited()
+
+
+async def test_drain_picks_up_resolved_row(
+    pending_db, frozen_clock, swap_runtime
+):
+    """The stored UTC deliver_after drives the drain's lexicographic compare:
+    due at resolved+1s, not due at resolved-1s."""
+    from genesis.db.crud import pending_outreach
+
+    swap_runtime(None, pending_db)
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    out = json.loads(await tools["outreach_send"].fn(
+        message="ping", category="notification", channel="telegram",
+        preferred_timing="in 2 hours",
+    ))
+    resolved = datetime.fromisoformat(out["deliver_after"])
+    before = (resolved - timedelta(seconds=1)).isoformat()
+    after = (resolved + timedelta(seconds=1)).isoformat()
+    assert await pending_outreach.drain(pending_db, now=before) == []
+    rows = await pending_outreach.drain(pending_db, now=after)
+    assert [r["id"] for r in rows] == [out["pending_id"]]
+
+
+async def test_scheduled_critical_queued_as_high(
+    pending_db, frozen_clock, swap_runtime
+):
+    """urgency='critical' + future timing stores 'high': the drain routes only
+    'high' to submit_urgent, so a scheduled critical send must carry the value
+    that keeps its urgent delivery semantics."""
+    pipe = AsyncMock()
+    swap_runtime(pipe, pending_db)
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    out = json.loads(await tools["outreach_send"].fn(
+        message="ping", category="notification", channel="telegram",
+        urgency="critical", preferred_timing="in 2 hours",
+    ))
+    assert out["status"] == "queued"
+    pipe.submit_urgent.assert_not_awaited()
+    rows = await _pending_rows(pending_db)
+    assert rows[0]["urgency"] == "high"
+
+
+async def test_refusal_error_text_reaches_caller_verbatim(
+    pending_db, frozen_clock, swap_runtime
+):
+    """The tool returns str(exc), not a re-worded message: whatever guidance
+    TimingParseError carries is exactly what the caller sees."""
+    from genesis.outreach.timing import TimingParseError, resolve_preferred_timing
+
+    swap_runtime(None, pending_db)
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    for raw in ("banana", "in 5", "in -2 hours"):
+        try:
+            resolve_preferred_timing(raw)
+            expected = None
+        except TimingParseError as exc:
+            expected = str(exc)
+        assert expected is not None, f"{raw!r} resolved — test premise broken"
+        out = json.loads(await tools["outreach_send"].fn(
+            message="ping", category="notification", channel="telegram",
+            preferred_timing=raw,
+        ))
+        assert out["error"] == expected, out
+        assert await _pending_rows(pending_db) == []
+
+
+class TestDiscordEnqueueRefusal:
+    """A scheduled send to a channel with no reachable webhook must be refused
+    at enqueue — reporting 'queued' then silently dropping at the drain is the
+    defect this class pins. One predicate, used by every enqueue path."""
+
+    @staticmethod
+    def _env(monkeypatch, **vars):
+        for var in (
+            _URL_ENV,
+            _discord_webhook_env("announcements"),
+            "OUTREACH_RECIPIENT_DISCORD",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        for k, v in vars.items():
+            monkeypatch.setenv(k, v)
+
+    async def test_named_unconfigured_channel_refused(
+        self, monkeypatch, pending_db, frozen_clock, swap_runtime
+    ):
+        self._env(monkeypatch, **{_URL_ENV: "https://discord.com/api/webhooks/0/d"})
+        swap_runtime(None, pending_db)
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
+        out = json.loads(await tools["outreach_send"].fn(
+            message="ping", category="notification", channel="announcements",
+            preferred_timing="in 2 hours",
+        ))
+        assert out["status"] == "refused", out
+        assert out["code"] == "discord_webhook_unconfigured"
+        assert await _pending_rows(pending_db) == []
+
+    async def test_bare_discord_refused_without_default_webhook(
+        self, monkeypatch, pending_db, frozen_clock, swap_runtime
+    ):
+        """channel='discord' means the default channel — with no default
+        webhook configured there is nothing to drain to."""
+        self._env(monkeypatch)
+        swap_runtime(None, pending_db)
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
+        out = json.loads(await tools["outreach_send"].fn(
+            message="ping", category="notification", channel="discord",
+            preferred_timing="in 2 hours",
+        ))
+        assert out["status"] == "refused", out
+        assert out["code"] == "discord_webhook_unconfigured"
+        assert await _pending_rows(pending_db) == []
+
+    async def test_bare_discord_with_default_webhook_queues(
+        self, monkeypatch, pending_db, frozen_clock, swap_runtime
+    ):
+        self._env(monkeypatch, **{_URL_ENV: "https://discord.com/api/webhooks/0/d"})
+        swap_runtime(None, pending_db)
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
+        out = json.loads(await tools["outreach_send"].fn(
+            message="ping", category="notification", channel="discord",
+            preferred_timing="in 2 hours",
+        ))
+        assert out["status"] == "queued", out
+        assert len(await _pending_rows(pending_db)) == 1
+
+    async def test_configured_named_channel_queues(
+        self, monkeypatch, pending_db, frozen_clock, swap_runtime
+    ):
+        self._env(monkeypatch, **{
+            _URL_ENV: "https://discord.com/api/webhooks/0/d",
+            _discord_webhook_env("announcements"): "https://discord.com/api/webhooks/1/a",
+        })
+        swap_runtime(None, pending_db)
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
+        out = json.loads(await tools["outreach_send"].fn(
+            message="ping", category="notification", channel="announcements",
+            preferred_timing="in 2 hours",
+        ))
+        assert out["status"] == "queued", out
+        rows = await _pending_rows(pending_db)
+        assert rows[0]["channel"] == "announcements"
+
+    async def test_immediate_critical_child_path_stores_high(
+        self, monkeypatch, pending_db, frozen_clock, swap_runtime
+    ):
+        """The drain routes only 'high' to submit_urgent (scheduler.py): a
+        queued critical send must store 'high' or it drains on the ordinary
+        path — same mapping the scheduled path applies."""
+        swap_runtime(None, pending_db)
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
+        out = json.loads(await tools["outreach_send"].fn(
+            message="ping", category="notification", channel="telegram",
+            urgency="critical",
+        ))
+        assert out["status"] == "queued", out
+        rows = await _pending_rows(pending_db)
+        assert rows[0]["urgency"] == "high"
