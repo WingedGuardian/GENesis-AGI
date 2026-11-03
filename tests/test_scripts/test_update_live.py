@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_scripts._update_source import update_text
 from tests.test_scripts.test_bootstrap_guards import (
     _assert_recovery_refused,
     _recover,
@@ -55,7 +56,7 @@ _GIT_ENV = {
 
 
 def _text() -> str:
-    return UPDATE.read_text()
+    return update_text()
 
 
 def _block(marker: str) -> str:

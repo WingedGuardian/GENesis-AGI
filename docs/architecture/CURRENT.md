@@ -4390,6 +4390,12 @@ Refusing a proposed update preserves a previously valid opt-in.
   rebuild (its pid named in `DEPLOY_CANDIDATES_OWN_STATE_PID`, equal to the
   engine's parent, update.lock handed over, a plain run) is neither refused nor
   retired; a run that names a pid whose row is not that run's own refuses.
+- **`update.sh`'s rollback lives in `scripts/lib/update_rollback.sh`** (#3844):
+  `_do_rollback` and the service, database and history helpers it needs, sourced
+  at startup with the other libs. The lib holds definitions, plus two lines safe to
+  run twice, so it can be sourced again; `_on_err` and `_on_signal` stay in
+  `update.sh` with the traps. A run still uses the copy on disk at launch, so a
+  rollback fix does not yet protect the update that delivers it.
 - **`update.sh` on `live`** (#2978, #3370): the merge's place, after the stop,
   is taken by the deploy-candidates engine's rebuild (`scripts/deploy_candidates.py
   rebuild`, the `live-engine` block). Everything else is main's path: one DB
