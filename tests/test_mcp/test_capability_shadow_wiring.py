@@ -53,7 +53,12 @@ async def test_outreach_poll_records_shadow_and_still_posts(db):
     outreach_mod._db = db
     try:
         client = _mock_httpx("poll-1")
-        env = {"DISCORD_WEBHOOK_ANNOUNCEMENTS": "https://discord.com/api/webhooks/1/tok"}
+        env = {
+            # discord_webhook_configured requires the default webhook before a
+            # named one counts — the adapter is registered from DISCORD_WEBHOOK_URL.
+            "DISCORD_WEBHOOK_URL": "https://discord.com/api/webhooks/0/tok",
+            "DISCORD_WEBHOOK_ANNOUNCEMENTS": "https://discord.com/api/webhooks/1/tok",
+        }
         with patch.dict("os.environ", env, clear=False), \
              patch("genesis.mcp.outreach_mcp.httpx.AsyncClient", return_value=client):
             tools = {tool.name: tool for tool in await outreach_mcp.list_tools()}

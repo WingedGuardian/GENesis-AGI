@@ -138,7 +138,7 @@ BASELINE: dict[tuple[str, str], tuple[int, str]] = {
     ("tests/test_hooks/test_inline_hooks.py", "provider"): (1, "inline-hook fixtures"),
     ("tests/test_hooks/test_secret_scrub.py", "egress"): (6, "scrub fixtures"),
     ("tests/test_learning/test_procedure_extraction.py", "provider"): (1, "extraction fixture"),
-    ("tests/test_mcp/test_capability_shadow_wiring.py", "egress"): (2, "shadow wiring fixture"),
+    ("tests/test_mcp/test_capability_shadow_wiring.py", "egress"): (5, "shadow wiring fixture"),
     ("tests/test_mcp/test_mcp_env_declarations.py", "egress"): (2, "env-var names, not egress"),
     ("tests/test_mcp/test_outreach_mcp.py", "egress"): (21, "webhook environment fixtures"),
     ("tests/test_memory/test_reranker.py", "provider"): (1, "reranker fixture"),
