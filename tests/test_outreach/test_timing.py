@@ -293,3 +293,30 @@ def test_result_is_utc_iso_and_lexicographically_comparable():
     a, b = _iso(earlier), _iso(later)
     assert a.endswith("+00:00") and b.endswith("+00:00")
     assert a < b  # lexicographic order == chronological order for UTC ISO
+
+
+def test_dangling_and_refused():
+    """'in 2 hours and' is an unfinished conjunction — a queued receipt for a
+    truncated duration is exactly the guess this contract refuses."""
+    for bad in ("in 2 hours and", "and 2 hours", "in and 2 hours"):
+        with pytest.raises(TimingParseError):
+            resolve_preferred_timing(bad, now=NOW, tz="UTC")
+    # The connector is still valid between two durations.
+    assert resolve_preferred_timing(
+        "in 2 hours and 30 minutes", now=NOW, tz="UTC"
+    ) == NOW + timedelta(hours=2, minutes=30)
+
+
+def test_named_zone_phrase_resolves_in_that_zone():
+    """'next friday 3pm UTC' from a Chicago user must land at 15:00 UTC —
+    the named zone governs; the local fold check does not second-guess it."""
+    got = resolve_preferred_timing("next friday 3pm UTC", now=SPEC_NOW, tz=CHICAGO)
+    assert got == datetime(2026, 6, 19, 15, 0, tzinfo=UTC)
+    got = resolve_preferred_timing("friday 3pm +0530", now=SPEC_NOW, tz=CHICAGO)
+    assert got == datetime(2026, 6, 12, 9, 30, tzinfo=UTC)
+
+
+def test_abbreviated_zone_refused():
+    """CST is four different offsets worldwide — refuse rather than guess."""
+    with pytest.raises(TimingParseError):
+        resolve_preferred_timing("tomorrow 9am CST", now=SPEC_NOW, tz=CHICAGO)

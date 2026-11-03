@@ -67,7 +67,9 @@ def discord_webhook_configured(channel: str) -> bool:
     """
     if not os.environ.get(_DISCORD_DEFAULT_ENV):
         return False
-    default_channel = os.environ.get("OUTREACH_RECIPIENT_DISCORD") or "dev-discussion"
+    default_channel = (
+        os.environ.get("OUTREACH_RECIPIENT_DISCORD") or "dev-discussion"
+    ).strip()
     if channel in ("discord", default_channel):
         return True
     if _is_reserved_discord_channel(channel):

@@ -140,7 +140,7 @@ BASELINE: dict[tuple[str, str], tuple[int, str]] = {
     ("tests/test_learning/test_procedure_extraction.py", "provider"): (1, "extraction fixture"),
     ("tests/test_mcp/test_capability_shadow_wiring.py", "egress"): (2, "shadow wiring fixture"),
     ("tests/test_mcp/test_mcp_env_declarations.py", "egress"): (2, "env-var names, not egress"),
-    ("tests/test_mcp/test_outreach_mcp.py", "egress"): (20, "webhook environment fixtures"),
+    ("tests/test_mcp/test_outreach_mcp.py", "egress"): (21, "webhook environment fixtures"),
     ("tests/test_memory/test_reranker.py", "provider"): (1, "reranker fixture"),
     ("tests/test_observability/test_key_validator.py", "provider"): (3, "key-validator fixtures"),
     ("tests/test_outreach/test_pipeline.py", "egress"): (1, "pipeline fixture"),

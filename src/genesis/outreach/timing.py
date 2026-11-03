@@ -19,7 +19,7 @@ refusal it can correct beats a guess it cannot see.
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 # "9am", "9:30pm", "9a", "9p", "9a.m." — meridiem REQUIRED.
 _CLOCK_MERIDIEM_RE = re.compile(
@@ -64,10 +64,16 @@ _PHRASE_CLOCK_24_RE = re.compile(r"\b(\d{1,2}):(\d{2})\b")
 _NEXT_WEEKDAY_RE = re.compile(
     r"\bnext\s+(?=(?:mon|tues|wednes|thurs|fri|satur|sun)day\b)", re.IGNORECASE
 )
+# "in N days/weeks" keeps the local CLOCK time (calendar days, not +48h
+# absolute — across a DST change the wall time is what the caller meant).
+_IN_DAYS_RE = re.compile(
+    r"^in\s+(\d+(?:\.\d+)?)\s+(days?|weeks?)\.?$", re.IGNORECASE
+)
 # A phrase that names its own zone is resolved in that zone — the local
 # wall-time fold check must not second-guess it.
 _ZONE_TOKEN_RE = re.compile(
-    r"\b(?:utc|gmt|[acehmp][sd]t|ak[sd]t|[+-]\d{1,2}(?::?\d{2})?)\b", re.IGNORECASE
+    r"(?:\b(?:utc|gmt|[acehmp][sd]t|ak[sd]t)\b|[+-]\d{1,2}(?::?\d{2})?\b)",
+    re.IGNORECASE,
 )
 
 _GUIDANCE = (
@@ -131,11 +137,20 @@ def _elapsed_delta(text: str) -> timedelta | None:
         s = s[:-1].strip()
     s = _ELAPSED_HEAD_RE.sub("", s, count=1)
     s = _ELAPSED_TAIL_RE.sub("", s, count=1)
-    parts = _ELAPSED_PART_RE.findall(s)
-    if not parts or _ELAPSED_PART_RE.sub("", s).strip(" ,and"):
+    matches = list(_ELAPSED_PART_RE.finditer(s))
+    if not matches:
+        return None
+    # Text between matched durations may be separators or the connector
+    # "and"; the leading and trailing segments may only be separators, so a
+    # dangling "in 2 hours and" refuses instead of silently scheduling.
+    for i, match in enumerate(matches):
+        seg = s[matches[i - 1].end() if i else 0 : match.start()].strip(" ,")
+        if seg != "" and (seg != "and" or i == 0):
+            return None
+    if s[matches[-1].end() :].strip(" ,") != "":
         return None
     seconds = 0.0
-    for num, unit in parts:
+    for num, unit in _ELAPSED_PART_RE.findall(s):
         n = 1.0 if num.lower() in ("a", "an") else float(num)
         u = unit.lower()
         if u.startswith("h"):
@@ -237,6 +252,22 @@ def resolve_preferred_timing(
 
         # 4. Calendar phrase → dateparser, but only when the phrase holds a
         #    calendar word, and only with the fold/horizon checks below.
+        #    "in N days/weeks" is calendar arithmetic on the local clock — a
+        #    DST change inside the window must not move the wall time.
+        in_days = _IN_DAYS_RE.match(raw)
+        if in_days:
+            n = float(in_days.group(1))
+            days = n * (7 if in_days.group(2).lower().startswith("w") else 1)
+            wall = base_utc.astimezone(local_tz).replace(tzinfo=None) + timedelta(
+                days=days
+            )
+            instant = _one_local_instant(wall, local_tz, tzname, raw)
+            if instant > base_utc + timedelta(days=366):
+                raise TimingParseError(
+                    f"preferred_timing '{raw}' resolves more than a year "
+                    f"out — {_GUIDANCE}"
+                )
+            return instant
         if _CALENDAR_WORD_RE.search(raw):
             try:
                 import dateparser
@@ -248,37 +279,44 @@ def resolve_preferred_timing(
             parse_raw = raw
             if _NEXT_WEEKDAY_RE.search(raw):
                 parse_raw = _NEXT_WEEKDAY_RE.sub("", raw, count=1)
+            # A phrase naming its own zone resolves in that zone — dateparser
+            # ignores zone tokens under the TIMEZONE setting, so the token is
+            # stripped, the remainder is parsed naive relative to now in the
+            # named zone, and that zone is attached back via _fold_instants.
+            # Abbreviated zones are ambiguous everywhere (CST is four
+            # different offsets); only utc/gmt and numeric offsets qualify.
+            zone_m = _ZONE_TOKEN_RE.search(raw)
+            named_tz = None
+            if zone_m:
+                token = zone_m.group(0).lower()
+                if token in ("utc", "gmt"):
+                    named_tz = UTC
+                elif token[0] in "+-":
+                    off = token[1:].replace(":", "")
+                    hours, mins = int(off[:-2] or 0), int(off[-2:] or 0)
+                    named_tz = timezone(
+                        timedelta(hours=hours, minutes=mins)
+                        * (1 if token[0] == "+" else -1)
+                    )
+                else:
+                    raise TimingParseError(
+                        f"preferred_timing '{raw}' names the ambiguous zone "
+                        f"'{zone_m.group(0)}' — use a numeric UTC offset"
+                    )
+                parse_raw = _ZONE_TOKEN_RE.sub("", parse_raw).strip()
             parsed = dateparser.parse(
                 parse_raw,
                 settings={
                     "PREFER_DATES_FROM": "future",
-                    "RELATIVE_BASE": base_utc.astimezone(local_tz),
+                    "RELATIVE_BASE": base_utc.astimezone(
+                        named_tz or local_tz
+                    ).replace(tzinfo=None),
                     "TIMEZONE": tzname,
                     "RETURN_AS_TIMEZONE_AWARE": True,
                     "PREFER_DAY_OF_MONTH": "first",
                 },
             )
             if parsed is not None and parsed.tzinfo is not None:
-                instant = parsed.astimezone(UTC)
-                if instant <= base_utc:
-                    raise TimingParseError(
-                        f"preferred_timing '{raw}' resolves to the past — "
-                        f"{_GUIDANCE}"
-                    )
-                if instant > base_utc + timedelta(days=366):
-                    raise TimingParseError(
-                        f"preferred_timing '{raw}' resolves more than a year "
-                        f"out — {_GUIDANCE}"
-                    )
-                if _ZONE_TOKEN_RE.search(raw) and parse_raw == raw:
-                    return instant
-                # The fold check runs on the wall time the PHRASE named, not
-                # on dateparser's result — the parser silently shifts a
-                # gap/fold wall time to the nearest real one, and that shift
-                # is exactly the guess this check exists to refuse.
-                naive = parsed.astimezone(local_tz).replace(tzinfo=None)
-                if parse_raw != raw:
-                    naive += timedelta(days=7)
                 meridiem = None
                 clock = _PHRASE_CLOCK_MERIDIEM_RE.search(raw)
                 if clock:
@@ -300,12 +338,46 @@ def resolve_preferred_timing(
                             f"could not interpret preferred_timing "
                             f"'{raw}'; {_GUIDANCE}"
                         )
-                    wall = naive.replace(
-                        hour=h, minute=minute, second=0, microsecond=0
+                if named_tz is not None:
+                    # The parsed wall fields are relative to now in the named
+                    # zone; a "next <weekday>" rewrite adds seven days on that
+                    # zone's wall clock before the instant is taken.
+                    wall = parsed.replace(tzinfo=None)
+                    if _NEXT_WEEKDAY_RE.search(raw):
+                        wall += timedelta(days=7)
+                    if clock:
+                        wall = wall.replace(
+                            hour=h, minute=minute, second=0, microsecond=0
+                        )
+                    instant = _one_local_instant(
+                        wall, named_tz, zone_m.group(0), raw
                     )
                 else:
-                    wall = naive
-                return _one_local_instant(wall, local_tz, tzname, raw)
+                    # The fold check runs on the wall time the PHRASE named,
+                    # not on dateparser's result — the parser silently shifts
+                    # a gap/fold wall time to the nearest real one, and that
+                    # shift is exactly the guess this check exists to refuse.
+                    naive = parsed.astimezone(local_tz).replace(tzinfo=None)
+                    if parse_raw != raw:
+                        naive += timedelta(days=7)
+                    if clock:
+                        wall = naive.replace(
+                            hour=h, minute=minute, second=0, microsecond=0
+                        )
+                    else:
+                        wall = naive
+                    instant = _one_local_instant(wall, local_tz, tzname, raw)
+                if instant <= base_utc:
+                    raise TimingParseError(
+                        f"preferred_timing '{raw}' resolves to the past — "
+                        f"{_GUIDANCE}"
+                    )
+                if instant > base_utc + timedelta(days=366):
+                    raise TimingParseError(
+                        f"preferred_timing '{raw}' resolves more than a year "
+                        f"out — {_GUIDANCE}"
+                    )
+                return instant
     except OverflowError as exc:
         raise TimingParseError(
             f"preferred_timing '{raw}' resolves out of range — {_GUIDANCE}"

@@ -1324,3 +1324,16 @@ class TestDiscordEnqueueRefusal:
         assert out["status"] == "queued", out
         rows = await _pending_rows(pending_db)
         assert rows[0]["urgency"] == "high"
+
+
+async def test_padded_default_channel_env_still_configured(monkeypatch):
+    """Adapter registration strips OUTREACH_RECIPIENT_DISCORD before storing
+    it; the predicate must strip too, or a padded value refuses the default
+    channel the adapter would happily deliver to."""
+    from genesis.runtime.init.outreach import discord_webhook_configured
+
+    monkeypatch.setenv(_URL_ENV, "https://discord.com/api/webhooks/0/d")
+    monkeypatch.setenv("OUTREACH_RECIPIENT_DISCORD", " dev-discussion ")
+    assert discord_webhook_configured("dev-discussion")
+    assert discord_webhook_configured("discord")
+    assert not discord_webhook_configured("announcements")
