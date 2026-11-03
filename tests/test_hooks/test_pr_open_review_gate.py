@@ -7,6 +7,7 @@ the fields Claude Code writes (measured on 2.1.299).
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -945,6 +946,7 @@ class TestSecurityReview:
             "gh pr $(echo create) --title t --body b",
             'gh pr "$SUB" --title t --body b create',
             'eval "gh pr create --title t --body b"',
+            "gh pr create --title t --body " + "x" * 50_000,
         ],
     )
     def test_each_form_left_to_the_push_guard_is_refused_by_it(self, box, cmd):
@@ -1148,3 +1150,287 @@ class TestRefusalsSayWhatWorks:
             cwd=box.wt,
         )
         assert _could_not_verify(done)
+
+
+class TestPromptTiesAreWholeWords:
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "archive/feat/x",
+            "../feat/x",
+            "x.feat/x",
+            "feat/x.py",
+            "feat/x.bak",
+            "feat/x+1",
+        ],
+    )
+    def test_text_that_only_contains_the_branch_does_not_tie_it(self, box, text):
+        _agent(box, branch="main", prompt=f"Review {text} please.")
+        assert _run(box).returncode == 2
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "feat/x",
+            "`feat/x`",
+            "'feat/x',",
+            "feat/x.",
+            "origin/feat/x",
+            "refs/heads/feat/x",
+            "main...feat/x",
+            "origin/main..origin/feat/x",
+            "feat/x~1",
+        ],
+    )
+    def test_each_way_of_naming_the_branch_ties_it(self, box, text):
+        _agent(box, branch="main", prompt=f"Review {text} now")
+        assert _run(box).returncode == 0
+
+    def test_a_longer_version_does_not_tie_the_shorter_branch(self, box):
+        _git(box.main, "branch", "release/1.2")
+        _agent(box, branch="main", prompt="Review release/1.2.1 please.")
+        assert _run(box, f"{CREATE} --head release/1.2").returncode == 2
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "/other/gate-work/a.py",
+            "/other/gate-work",
+            "~/other/gate-work",
+            "gate-work.bak",
+            "pre/gate-work",
+            "../gate-work",
+        ],
+    )
+    def test_another_directory_of_the_same_name_does_not_tie_the_worktree(self, box, text):
+        _agent(box, branch="main", prompt=f"Review {text} please.")
+        assert _run(box).returncode == 2
+
+    def test_a_relative_path_ending_in_this_checkout_ties_it(self, box):
+        _agent(box, branch="main", prompt="Review worktrees/gate-work/a.py please.")
+        assert _run(box).returncode == 0
+
+    @pytest.mark.parametrize("text", ["/review", "src/genesis/review.py", "/elsewhere/review"])
+    def test_a_path_that_only_contains_a_plain_word_name_does_not_tie_it(self, box, text):
+        wt = box.tmp / "worktrees" / "review"
+        _git(box.main, "worktree", "add", "-q", "-b", "feat/y", str(wt))
+        _agent(box, branch="main", prompt=f"Read {text} please.")
+        assert _run(box, cwd=wt).returncode == 2
+
+
+class TestAReusedWorktree:
+    def test_a_review_of_the_branch_it_held_before_does_not_carry_over(self, box):
+        _agent(box, branch="feat/old", cwd=box.wt)
+        assert _run(box).returncode == 2
+
+    def test_a_session_on_the_default_branch_still_ties_a_reviewer_run_there(self, box):
+        _agent(box, branch="main", cwd=box.wt)
+        assert _run(box).returncode == 0
+
+
+class TestOneFlagTable:
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "gh --title --repo=acme/elsewhere pr create --body b",
+            "gh --body --repo=acme/elsewhere pr create --title t",
+            "gh -t --repo=acme/elsewhere pr create --body b",
+            "gh -tRacme/elsewhere pr create --body b",
+            "gh -t -Racme/elsewhere pr create --body b",
+            "gh pr --title --repo=acme/elsewhere create --body b",
+            "gh pr -tRacme/elsewhere create --body b",
+        ],
+    )
+    def test_a_value_taken_before_the_command_path_is_not_a_repo(self, box, cmd):
+        assert _run(box, cmd).returncode == 2
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "gh --head feat/x pr create --title t --body b",
+            "gh -Hfeat/x pr create --title t --body b",
+            "gh pr --head=feat/x create --title t --body b",
+        ],
+    )
+    def test_a_head_named_before_the_command_path_is_read(self, box, cmd):
+        _agent(box, branch="feat/x")
+        assert _run(box, cmd).returncode == 0
+
+    def test_dry_run_before_the_command_path_is_read(self, box):
+        assert _run(box, "gh --dry-run pr create --title t --body b").returncode == 0
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            f"{CREATE} --brand-new --repo=acme/elsewhere",
+            "gh --future -Racme/elsewhere pr create --title t --body b",
+        ],
+    )
+    def test_an_unknown_option_cannot_be_trusted_about_the_repo_after_it(self, box, cmd):
+        assert _could_not_verify(_run(box, cmd))
+
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "gh pr create $ARGS --title t --body b",
+            'gh pr create "${A[@]}" --title t --body b',
+            "gh pr create $(cat args) --title t --body b",
+            "gh $G pr create --title t --body b",
+        ],
+    )
+    def test_a_word_a_create_takes_no_operand_for_cannot_be_judged(self, box, cmd):
+        _agent(box)
+        done = _run(box, cmd)
+        assert done.returncode == 2
+
+    def test_a_body_the_parser_split_into_loose_words_is_still_judged(self, box):
+        _agent(box)
+        cmd = "gh pr create --title t --body \"$(cat <<'EOF'\nA `quoted` word: it's fine\nEOF\n)\""
+        assert _run(box, cmd).returncode == 0
+
+    def test_a_create_with_only_known_options_is_judged(self, box):
+        _agent(box)
+        cmd = f"{CREATE} --base main --draft --label x --reviewer y --body-file f"
+        assert _run(box, cmd).returncode == 0
+
+
+class TestWhereGhWillSendIt:
+    def _remote(self, box, name, repo, default=None):
+        _git(box.main, "remote", "add", name, f"https://github.com/{repo}.git")
+        if default:
+            _git(box.main, "config", f"remote.{name}.gh-resolved", default)
+
+    def test_a_stored_default_on_a_fork_is_out_of_scope(self, box):
+        _git(box.main, "remote", "set-url", "origin", "https://github.com/me/fork.git")
+        _git(box.main, "config", "remote.origin.gh-resolved", "base")
+        self._remote(box, "upstream", PUBLIC)
+        assert _run(box).returncode == 0
+
+    def test_a_stored_default_naming_a_fork_from_the_public_remote_is_out_of_scope(self, box):
+        _git(box.main, "config", "remote.origin.gh-resolved", "me/fork")
+        assert _run(box).returncode == 0
+
+    def test_a_stored_default_naming_the_public_repo_is_in_scope(self, box):
+        _git(box.main, "remote", "set-url", "origin", "https://github.com/me/fork.git")
+        _git(box.main, "config", "remote.origin.gh-resolved", PUBLIC)
+        assert _run(box).returncode == 2
+
+    def test_a_stored_base_on_the_public_remote_is_in_scope(self, box):
+        _git(box.main, "config", "remote.origin.gh-resolved", "base")
+        self._remote(box, "fork", "me/fork")
+        assert _run(box).returncode == 2
+
+    def test_no_stored_default_still_asks_whether_any_remote_names_it(self, box):
+        _git(box.main, "remote", "set-url", "origin", "https://github.com/me/fork.git")
+        self._remote(box, "upstream", PUBLIC)
+        assert _run(box).returncode == 2
+
+    def test_a_default_on_a_host_gh_may_skip_leaves_it_to_the_remotes(self, box):
+        _git(box.main, "remote", "set-url", "origin", "https://ghe.example.org/me/fork.git")
+        _git(box.main, "config", "remote.origin.gh-resolved", "base")
+        self._remote(box, "upstream", PUBLIC)
+        assert _run(box).returncode == 2
+
+    def test_a_default_set_earlier_in_the_command_cannot_be_trusted(self, box):
+        _git(box.main, "remote", "set-url", "origin", "https://github.com/me/fork.git")
+        _git(box.main, "config", "remote.origin.gh-resolved", "base")
+        assert _could_not_verify(_run(box, f"gh repo set-default {PUBLIC} && {CREATE}"))
+
+
+class TestACdThatMayNotHaveRun:
+    @pytest.mark.parametrize(
+        "cmd",
+        [
+            "cat > f <<'EOF'\ncd {plain}\nEOF\n{c}",
+            "false && cd {plain}; {c}",
+            '[ -n "" ] && cd {plain}; {c}',
+        ],
+    )
+    def test_it_cannot_put_a_create_out_of_scope(self, box, cmd):
+        plain = box.tmp / "plain"
+        plain.mkdir()
+        assert _could_not_verify(_run(box, cmd.format(plain=plain, c=CREATE)))
+
+    def test_a_cd_that_opens_the_command_still_can(self, box):
+        plain = box.tmp / "plain"
+        plain.mkdir()
+        assert _run(box, f"cd {plain} && {CREATE}").returncode == 0
+
+    def test_it_does_not_matter_when_the_repo_is_named(self, box):
+        plain = box.tmp / "plain"
+        plain.mkdir()
+        assert _run(box, f"false && cd {plain}; {CREATE} --repo acme/elsewhere").returncode == 0
+
+
+class TestSecondModelNotes:
+    def test_a_waiver_tells_the_session_on_a_channel_it_can_read(self, box):
+        done = _run(box, f"{CREATE} {SIGIL}")
+        assert done.returncode == 0
+        note = json.loads(done.stdout)["hookSpecificOutput"]["additionalContext"]
+        assert "unreviewed" in note and "permissionDecision" not in done.stdout
+
+    def test_the_superpowers_reviewer_counts(self, box):
+        _agent(box, agent_type="superpowers:code-reviewer")
+        assert _run(box).returncode == 0
+
+    def test_a_refusal_for_an_unresolved_directory_names_the_write_tool(self, box):
+        _agent(box)
+        done = _run(box, 'cd "$W" && gh pr create --title t --body b')
+        assert _could_not_verify(done) and "Write tool" in done.stderr
+
+
+class TestFixReviewNotes:
+    def test_a_push_url_does_not_decide_the_stored_default(self, box):
+        _git(box.main, "remote", "set-url", "--push", "origin", "git@github.com:me/fork.git")
+        _git(box.main, "config", "remote.origin.gh-resolved", "base")
+        assert _run(box).returncode == 2
+
+    def test_a_push_url_alone_does_not_put_it_in_scope(self, box):
+        _git(box.main, "remote", "set-url", "origin", "https://github.com/me/fork.git")
+        _git(box.main, "remote", "set-url", "--push", "origin", f"git@github.com:{PUBLIC}.git")
+        assert _run(box).returncode == 0
+
+    def test_an_empty_stored_default_is_none(self, box):
+        _git(box.main, "config", "remote.origin.gh-resolved", "")
+        assert _run(box).returncode == 2
+
+    def test_a_loose_expansion_in_a_heredoc_body_is_text(self, box):
+        _agent(box)
+        cmd = (
+            "gh pr create --title t --body \"$(cat <<'EOF'\n"
+            '`auth` is "set" and it\'s $ok `here\nEOF\n)"'
+        )
+        assert _run(box, cmd).returncode == 0
+
+    def test_the_reused_worktree_refusal_says_how_to_clear_it(self, box):
+        _agent(box, branch="feat/old", cwd=box.wt)
+        assert "another feature branch" in _run(box).stderr
+
+    @pytest.mark.parametrize(
+        "text", ["gate-work/a.py", "./gate-work/a.py", "**feat/x**", "feat/x@{u}"]
+    )
+    def test_these_namings_tie_it(self, box, text):
+        _agent(box, branch="main", prompt=f"Review {text} now")
+        assert _run(box).returncode == 0
+
+    def test_origin_head_names_the_default_branch(self, box):
+        _git(box.main, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        _git(box.main, "switch", "-q", "-c", "feat/m")
+        _agent(box, branch="main", cwd=box.wt)
+        assert _run(box).returncode == 0
+        _agent(box, branch="feat/m", cwd=box.wt)
+        assert _run(box).returncode == 2
+
+
+class TestLastSurvivors:
+    def test_a_bare_hyphenated_worktree_name_ties_it(self, box):
+        _agent(box, branch="main", prompt="Review gate-work now.")
+        assert _run(box).returncode == 0
+
+    def test_an_expansion_shaped_word_is_text_only_where_a_heredoc_can_split_a_body(self):
+        spec = importlib.util.spec_from_file_location("gate_under_test", HOOK)
+        gate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gate)
+        argv = ["gh", "pr", "create", "--title", "t", "`auth_env`"]
+        assert gate._create_flags(argv).unknown is True
+        assert gate._create_flags(argv, has_heredoc=True).unknown is False

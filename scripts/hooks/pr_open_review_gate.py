@@ -22,12 +22,14 @@ this adds no marker, no receipt and nothing to retire. The threat model is autop
 not an adversary: hooks run as the session's user, so a session could forge a file.
 
 SCOPE. Only where ``genesis.yaml`` declares a public repo and the create targets it (an
-explicit ``--repo`` or ``GH_REPO``, else any remote of the checkout). No declared repo
+explicit ``--repo`` or ``GH_REPO``, else what `gh repo set-default` stored, else any remote of
+the checkout). No declared repo
 means out of scope, as for ``_no_pr_block_applies`` and for its reason: a clone that
 declares nothing must not be refused. An unreadable ``genesis.yaml`` looks the same, so it
 turns this off too, and the session is told. The wiring ships to every clone; this
-predicate is what confines it. OUT OF SCOPE IS A POSITIVE ANSWER: another repo named,
-every remote naming another repo, or git saying this directory is no repository or has no
+predicate is what confines it. OUT OF SCOPE IS A POSITIVE ANSWER: another repo named by a
+command this can read in full, the stored default or every remote naming another repo, or git
+saying this directory is no repository or has no
 remote. A target that could not be established is "could not verify", never out of scope.
 
 FAIL DIRECTION. Evidence that cannot be read blocks and says "could not verify", since
@@ -37,8 +39,12 @@ path is the override. A module that cannot load blocks through ``degraded_exit``
 NOT COVERED: Codex (it does not run these hooks), the server-side openers (they run
 ``gh`` as a subprocess), spellings the parser cannot resolve to ``gh`` (a program held
 in a variable, an alias, a shell function, a script, a command piped to ``bash``, process
-substitution, ``ssh``, ``gh api``, ``hub``), and a script earlier in the command that
-changes the branch. A command the parser cannot read at all (over its length bound, a
+substitution, ``find -exec``, ``flock``, ``watch``, ``script -c``, ``ssh``, ``gh api``,
+``hub``), a script earlier in the command that changes the branch, and environment or
+config spellings of a repo beyond the plain ones (``source ./e.sh``, ``GIT_CONFIG_GLOBAL``).
+These need a deliberate spelling, which the threat model excludes. With no stored default
+and more than one remote, any remote naming the public repo puts a create in scope;
+`gh repo set-default` or ``--repo`` settles it. A command the parser cannot read at all (over its length bound, a
 subcommand built by expansion, ``eval``) is not judged here: the push guard's blind-spot
 net refuses it, and a test pins that.
 
@@ -49,6 +55,7 @@ what it was asked: a finished reviewer tied to the branch counts, even one asked
 question, and a branch with no commits passes the same way. The tie is loose on purpose: a
 record's ``gitBranch`` is the SESSION's branch when the reviewer started, not the reviewer's
 own (equal in 940 of 943 reviewers), so a session on a branch ties any reviewer it runs.
+A word-like branch or worktree name (`follow-up`) is tied by the word in a prompt.
 """
 
 from __future__ import annotations
@@ -89,7 +96,6 @@ try:
         _GH_FLAG_TABLE,
         _gh_option,
         analyze_checked,
-        gh_command,
         gh_pr_subcommand,
         gh_requests_help,
         git_subcommand,
@@ -120,6 +126,7 @@ _REVIEWER_TYPES = frozenset(
         "pr-review-toolkit:pr-test-analyzer",
         "pr-review-toolkit:type-design-analyzer",
         "pr-review-toolkit:comment-analyzer",
+        "superpowers:code-reviewer",
     }
 )
 #: The built-in /code-review leaves no reviewer type: it runs as `general-purpose` with
@@ -151,6 +158,10 @@ _STILL_ON_BRANCH_GIT = frozenset(
 )
 #: Earlier steps that may change which repository the directory is, or points at.
 _RETARGETING_GIT = frozenset({"clone", "config", "init", "remote", "worktree"})
+#: How a prompt's words are cut. A branch or path is compared to a whole word.
+_WORD_BREAK = re.compile(r"[\s`'\"(),;<>\[\]{}=|*]+")
+_RANGE = re.compile(r"\.{2,3}")
+_REV_SUFFIX = re.compile(r"[~^]")
 #: Quoted text, blanked before looking for an assignment: a PR title may mention one.
 _QUOTED = re.compile("'[^']*'|\"[^\"]*\"")
 _SETS_GH_REPO = re.compile(
@@ -186,7 +197,10 @@ class _Unverifiable(Exception):
 
     remedy = (
         "A review alone does not clear this. Where you can, run one plain `gh pr create` on "
-        "its own, with literal --repo and --head values, and retry."
+        "its own, with literal --repo and --head values and --body-file, and retry. If this "
+        "command only "
+        "writes text that mentions a create, use the Write tool: a heredoc body reads as "
+        "commands here."
     )
 
 
@@ -242,13 +256,34 @@ def _remotes(cwd: str | None) -> str:
     raise _Unverifiable("git could not read this directory's remotes")
 
 
-def _names(text: str, name: str, *, path_tail_ok: bool = False) -> bool:
-    """Whether ``text`` names ``name`` as a whole token, not inside a longer word.
+def _prompt_words(prompt: str) -> set[str]:
+    """The prompt's words, a diff range split and sentence punctuation dropped."""
+    words: set[str] = set()
+    for raw in _WORD_BREAK.split(prompt):
+        for part in _RANGE.split(raw):
+            word = part.rstrip(".,:;!?@")
+            if word:
+                words.add(word)
+    return words
 
-    A branch is not named by ``feat/x/other``. A worktree is named by ``<wt>/a.py``.
+
+def _branch_named(words: set[str], head: str, remotes: frozenset[str]) -> bool:
+    """A whole word is the branch, or that branch under a real remote, ref prefix or owner.
+
+    Compared whole, because a boundary pattern ties `feat/x` to `archive/feat/x`, and
+    `release/1.2` to `release/1.2.1`.
     """
-    after = r"[\w-]" if path_tail_ok else r"[\w/-]"
-    return re.search(rf"(?<![\w-]){re.escape(name)}(?!{after})", text) is not None
+    for word in words:
+        bare = _REV_SUFFIX.split(word, maxsplit=1)[0]
+        left, _, right = bare.partition(":")
+        for spelling in (bare, left, right):
+            ref = spelling.removeprefix("refs/heads/").removeprefix("refs/remotes/")
+            if ref == head:
+                return True
+            remote, _, rest = ref.partition("/")
+            if rest == head and remote in remotes:
+                return True
+    return False
 
 
 def _branch_is_distinctive(head: str) -> bool:
@@ -256,11 +291,30 @@ def _branch_is_distinctive(head: str) -> bool:
     return "/" in head or "-" in head
 
 
-def _worktree_named(prompt: str, worktree: str) -> bool:
-    if "-" in worktree:
-        return _names(prompt, worktree, path_tail_ok=True)
-    # A directory called `review` is not named by "please review this": only by a path.
-    return re.search(rf"/{re.escape(worktree)}(?![\w-])", prompt) is not None
+def _worktree_named(words: set[str], checkout: str, worktree: str) -> bool:
+    """A path into this checkout, or its bare name when that name is not a plain word.
+
+    Another directory of the same name is another worktree, and a directory called `review`
+    is not named by "please review this" or by `src/review.py`.
+    """
+    for word in words:
+        if "/" not in word:
+            if "-" in worktree and word == worktree:
+                return True
+            continue
+        path = os.path.expanduser(word).rstrip("/")
+        if path.startswith("/"):
+            if _is_inside(path, checkout):
+                return True
+            continue
+        parts = path.removeprefix("./").split("/")
+        if worktree in parts:
+            upto = parts[: parts.index(worktree) + 1]
+            if len(upto) == 1 and "-" in worktree:
+                return True
+            if len(upto) > 1 and checkout.endswith("/" + "/".join(upto)):
+                return True
+    return False
 
 
 def _require_regular(path: Path) -> None:
@@ -331,7 +385,12 @@ def _is_reviewer(agent_type: str, prompt: str) -> bool:
 
 
 def has_reviewer_evidence(
-    transcript_path: str, head: str, checkout: str | None, worktree: str | None
+    transcript_path: str,
+    head: str,
+    checkout: str | None,
+    worktree: str | None,
+    remotes: frozenset[str] = frozenset(),
+    base_branch: str | None = None,
 ) -> bool:
     """Whether a reviewer of this session finished a run tied to ``head``.
 
@@ -375,11 +434,17 @@ def has_reviewer_evidence(
             prompt = _prompt_text(first)
             if not _is_reviewer(agent_type, prompt):
                 continue
+            words = _prompt_words(prompt)
+            recorded = first.get("gitBranch")
+            # A directory ties only a session that was on this branch or the default one: a
+            # session on another feature branch may have reviewed that work here, before this
+            # worktree moved on. Naming the branch or worktree in the prompt still ties it.
+            held_then = recorded in (head, base_branch, "HEAD", None, "")
             tied = (
-                first.get("gitBranch") == head
-                or (checkout and _is_inside(first.get("cwd"), checkout))
-                or (_branch_is_distinctive(head) and _names(prompt, head))
-                or (worktree is not None and _worktree_named(prompt, worktree))
+                recorded == head
+                or (checkout and held_then and _is_inside(first.get("cwd"), checkout))
+                or (_branch_is_distinctive(head) and _branch_named(words, head, remotes))
+                or (checkout and worktree and _worktree_named(words, checkout, worktree))
             )
             if not tied:
                 continue
@@ -404,7 +469,7 @@ class _CreateFlags(NamedTuple):
     repo: str | None
     head: str | None
     dry_run: bool
-    unknown: bool  # a dashed token no table knows: it may have taken the next word
+    unknown: bool  # a token no table knows, or an expansion: nothing read after it holds
 
 
 def _option_parts(tok: str, values: frozenset[str]) -> list[tuple[str, str | None]]:
@@ -428,31 +493,33 @@ def _option_parts(tok: str, values: frozenset[str]) -> list[tuple[str, str | Non
     return parts
 
 
-def _create_flags(argv: list[str]) -> _CreateFlags:
+def _create_flags(argv: list[str], *, has_heredoc: bool = False) -> _CreateFlags:
     """The options of a create, read as gh reads them: a flag's VALUE is not a flag.
 
-    ``--title "-Ra/b"`` names no repo and ``--body --dry-run`` is a body, so these come
-    from the table ``gh_requests_help`` walks, in one pass, last value winning. Before the
-    command path gh accepts only ``-R``/``--repo`` here; after it, the ``pr create`` row.
+    ``--title "-Ra/b"`` names no repo and ``--body --dry-run`` is a body. gh applies the
+    leaf command's table at every position (measured with `gh --search --repo=x pr list`),
+    so one table covers the whole command, last value winning. A bare word is skipped unless
+    it is an expansion, which may carry options. A literal one is gh's own error, and the
+    parser splits a body like `--body "$(cat <<'EOF' ...)"` into loose words whenever the text
+    holds quotes (18 of 348 real creates), so refusing those would stop ordinary PRs. For the
+    same reason a word in a command with a heredoc is not read as an expansion.
     """
-    inv = gh_command(argv)
     row_values, row_bools = _GH_FLAG_TABLE[("pr", "create")]
-    before_path = frozenset({"-R", "--repo"})
     repo = head = None
     dry_run = unknown = False
     i = 1
     while i < len(argv):
         tok = argv[i]
         if tok == "--":
+            unknown = True
             break
         if not tok.startswith("-") or tok == "-":
+            unknown = unknown or (not has_heredoc and tok[:1] in ("$", "`"))
             i += 1
             continue
-        pre = inv is not None and i < inv.path_end
-        values = before_path if pre else row_values
         step = 1
-        for name, glued in _option_parts(tok, values):
-            if name in values:
+        for name, glued in _option_parts(tok, row_values):
+            if name in row_values:
                 value = glued
                 if value is None:
                     value = argv[i + 1] if i + 1 < len(argv) else ""
@@ -461,7 +528,7 @@ def _create_flags(argv: list[str]) -> _CreateFlags:
                     repo = value
                 elif name in ("-H", "--head"):
                     head = value
-            elif not pre and name in row_bools:
+            elif name in row_bools:
                 # pflag: `--dry-run=false` is a real create, and only a true value skips it.
                 if name == "--dry-run":
                     dry_run = glued is None or glued.casefold() in ("true", "t", "1")
@@ -502,6 +569,37 @@ def _repo_is_public(guard, value: str, canonical: str) -> bool:
     return normalized.casefold() == canonical.casefold()
 
 
+def _fetch_rows(listing: str) -> list[list[str]]:
+    """`git remote -v` rows gh reads: the fetch URL (measured with a differing push URL)."""
+    return [w for w in map(str.split, listing.splitlines()) if w[2:3] == ["(fetch)"]]
+
+
+def _stored_default(guard, listing: str, cwd) -> list[tuple[str, str]] | None:
+    """What `gh repo set-default` stored, which gh prefers over every remote; None if nothing.
+
+    ``remote.<name>.gh-resolved`` is `base` (that remote's own repo) or `owner/repo` on that
+    remote's host (measured). gh skips a remote on a host it has no login for, so a row it
+    might skip leaves the answer to the remotes. gh's order among unset remotes is not
+    modelled, for the same reason: a local sort would fail open.
+    """
+    urls = {w[0]: w[1] for w in _fetch_rows(listing)}
+    rows = (_git(cwd, "config", "--get-regexp", r"^remote\..*\.gh-resolved$") or "").splitlines()
+    found = []
+    for row in rows:
+        key, _, value = row.partition(" ")
+        remote = key.removeprefix("remote.").removesuffix(".gh-resolved")
+        identity = guard._repo_identity_from_url(urls.get(remote, ""))
+        if identity is None or not (
+            identity[0] == "github.com" or identity[0].endswith(".github.com")
+        ):
+            return None
+        stored = value.strip()
+        if not stored:
+            continue
+        found.append(identity if stored == "base" else (identity[0], stored.casefold()))
+    return found or None
+
+
 def _targets_public_repo(
     guard, flags: _CreateFlags, cmd: str, cwd, canonical: str, *, retargeted: bool
 ) -> bool:
@@ -513,8 +611,12 @@ def _targets_public_repo(
         return _repo_is_public(guard, os.environ["GH_REPO"], canonical)
     if cwd is guard._CWD_UNKNOWN or cwd is None:
         raise _Unverifiable("the directory this command runs in could not be resolved")
+    listing = _remotes(cwd)
+    default = _stored_default(guard, listing, cwd)
+    if default is not None and not retargeted:
+        return any(_identity_is_public(i, canonical) for i in default)
     # By URL: a remote configured with none (say in global config) lists its name alone.
-    urls = [w[1] for w in map(str.split, _remotes(cwd).splitlines()) if len(w) >= 2]
+    urls = [w[1] for w in _fetch_rows(listing)]
     identities = [i for i in map(guard._repo_identity_from_url, urls) if i is not None]
     if any(_identity_is_public(i, canonical) for i in identities):
         return True
@@ -554,6 +656,19 @@ def _directory_untracked(guard, segs: list, seg) -> bool:
         if earlier is seg:
             return False
         if earlier.exe in _DIRECTORY_STEPS and guard._cd_target(earlier.raw) is None:
+            return True
+    return False
+
+
+def _cd_may_not_have_run(segs: list, seg) -> bool:
+    """A `cd` after any other step may be conditional, or text in a heredoc body."""
+    opening = True
+    for earlier in segs:
+        if earlier is seg:
+            return False
+        if earlier.exe != "cd":
+            opening = False
+        elif not opening:
             return True
     return False
 
@@ -603,6 +718,18 @@ def _linked_worktree_holding(cwd, head: str) -> str | None:
     return None
 
 
+def _default_branch(cwd) -> str | None:
+    """origin's default branch, else what the main checkout holds: the first worktree."""
+    remote_head = _git(cwd, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+    if remote_head:
+        return remote_head.removeprefix("origin/")
+    listing = _git(cwd, "worktree", "list", "--porcelain") or ""
+    for line in listing.split("\n\n")[0].splitlines():
+        if line.startswith("branch refs/heads/"):
+            return line.removeprefix("branch refs/heads/")
+    return None
+
+
 def _branch_context(flags: _CreateFlags, cwd) -> tuple[str, str | None, str | None]:
     """``(head branch, directory that identifies it, linked worktree name)``; raises when unknowable."""
     raw_head = flags.head
@@ -637,8 +764,8 @@ def _refusal(head: str, reason: str | None) -> str:
             f"BLOCKED: no independent review of '{head}' found in this session, so its PR does "
             "not open.\nRun /deep-review, or a code-reviewer agent or /code-review from this "
             "branch's checkout, wait for it to finish, then retry. A reviewer started from "
-            "elsewhere must name this branch or worktree in its prompt. A self-review does not "
-            "count. If this command only writes text that mentions a create, use the Write tool: "
+            "elsewhere, or while this session was on another feature branch, must name this "
+            "branch or worktree in its prompt. A self-review does not count. If this command only writes text that mentions a create, use the Write tool: "
             "a heredoc body reads as commands here."
         )
     return (
@@ -652,9 +779,11 @@ def _judge(
     guard, segs: list, seg, cmd: str, payload: dict, canonical: str
 ) -> tuple[bool, str, str | None]:
     """``(needs a yes, head to name, why it could not be verified)`` for one create."""
-    flags = _create_flags(seg.argv)
+    flags = _create_flags(seg.argv, has_heredoc="<<" in seg.raw)
     head = (flags.head or "").rsplit(":", 1)[-1] or "this branch"
     try:
+        if flags.unknown:  # it may have taken the next word, so nothing read after it holds
+            raise _Unverifiable("the command has a word or option this check does not know")
         cwd = guard._effective_cwd(cmd, payload, seg)
         _time_left()
         untracked = _directory_untracked(guard, segs, seg)
@@ -662,9 +791,10 @@ def _judge(
             raise _Unverifiable("a step changes directory in a way this cannot follow")
         retargeted = _retargeted_before(segs, seg)
         if not _targets_public_repo(guard, flags, cmd, cwd, canonical, retargeted=retargeted):
+            named = flags.repo is not None or os.environ.get("GH_REPO")
+            if not named and _cd_may_not_have_run(segs, seg):
+                raise _Unverifiable("a `cd` after another step may not have run; use --repo")
             return False, head, None
-        if flags.unknown:
-            raise _Unverifiable("the command has an option this check does not know")
         if flags.head is None and (untracked or _moved_before(segs, seg)):
             raise _Unverifiable("an earlier step may change the branch; name it with --head")
         if sum(s.raw == seg.raw for s in segs) > 1:  # `_effective_cwd` stops at the first
@@ -673,7 +803,10 @@ def _judge(
             raise _Unverifiable("the directory this command runs in could not be resolved")
         head, tied_dir, worktree = _branch_context(flags, cwd)
         transcript = payload.get("transcript_path") if isinstance(payload, dict) else None
-        if has_reviewer_evidence(str(transcript or ""), head, tied_dir, worktree):
+        remotes = frozenset((_git(cwd, "remote") or "").split())
+        if has_reviewer_evidence(
+            str(transcript or ""), head, tied_dir, worktree, remotes, _default_branch(cwd)
+        ):
             return False, head, None
     except _Unverifiable as exc:
         return True, head, f"{exc}.\n{exc.remedy}"
@@ -694,6 +827,14 @@ def _head_sha(guard, cmd: str, payload: dict, seg) -> str | None:
         return None
 
 
+def _tell_session(text: str) -> None:
+    """stderr is discarded on exit 0, so a note the session should see goes here."""
+    print_json_bounded(
+        {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": text}},
+        text_keys=("additionalContext",),
+    )
+
+
 def _note_gate_is_off() -> None:
     """Tell the session when a config that exists declares no public repo.
 
@@ -701,18 +842,10 @@ def _note_gate_is_off() -> None:
     """
     if not os.path.exists(os.path.expanduser("~/.genesis/config/genesis.yaml")):
         return
-    print_json_bounded(
-        {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "additionalContext": (
-                    "NOTE: genesis.yaml exists but declares no readable github.user and "
-                    "github.public_repo, so the check that a PR has had a review is OFF "
-                    "for this create. If this install has a public repo, fix that file."
-                ),
-            }
-        },
-        text_keys=("additionalContext",),
+    _tell_session(
+        "NOTE: genesis.yaml exists but declares no readable github.user and "
+        "github.public_repo, so the check that a PR has had a review is OFF "
+        "for this create. If this install has a public repo, fix that file."
     )
 
 
@@ -762,11 +895,12 @@ def main() -> int:
             return 2
         waived.append((head, _head_sha(guard, cmd, payload, seg)))
     # Logged only now: a later create in the same command can still refuse the whole of it.
-    for head, sha in waived:
+    for _head, sha in waived:
         guard._note_override(SIGIL, waived="pr-open-review", head=sha)
-        print(f"NOTE: opening '{head}' unreviewed on the owner's yes (logged).", file=sys.stderr)
     if waived:
         guard._flush_overrides("allowed")
+        names = ", ".join(f"'{head}'" for head, _sha in waived)
+        _tell_session(f"NOTE: opening {names} unreviewed on the owner's yes (logged).")
     return 0
 
 
