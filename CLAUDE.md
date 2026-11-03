@@ -596,6 +596,10 @@ gate works, its exemption categories, and the unit rules for size bounds:
   score; under the shipped `doc_findings: skip`, documentation findings do not
   score either. `codex-at-head: ok` is not "review is clear": read the
   `inline-findings` row, not just the Codex row.
+  **A review also comes before the PR.** `gh pr create` on the public repo is refused
+  until a reviewer agent or `/code-review` of the branch has finished in this session;
+  `# pr-review-waived` records the owner's yes given in chat (build-session). Codex CLI
+  sessions and normal dispatched sessions do not run this hook.
   A self-authored PR merges through the maintainer's admin bypass of GitHub's
   one-approval rule, because a sole maintainer cannot approve their own pull
   request (`.github/rulesets/README.md`; closing-session skill, "Honest

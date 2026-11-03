@@ -127,6 +127,8 @@ _CASES = [
         "gated",
     ),
     ("git_push_guard", "hooks/git_push_guard.py", "git log --oneline -5", 0, "benign"),
+    ("pr_open_review_gate", "hooks/pr_open_review_gate.py", 'gh pr create --title t --body b', 2, "gated"),
+    ("pr_open_review_gate", "hooks/pr_open_review_gate.py", "git status", 0, "benign"),
     (
         "review_enforcement_commit",
         "review_enforcement_commit.py",

@@ -99,7 +99,7 @@ git add <files>                                   # STAGE FIRST — mark hashes 
 python3 scripts/review_state.py mark              # INTERNAL genesis-architect audit — plain mark, never counts
 git commit -F <msg-file>                          # bare, not piped (see below)
 # (a non-Anthropic cross-model round would instead be: mark --source external --defects|--clean)
-git push -u origin HEAD && gh pr create --title "..." --body-file <file>   # first push: ONE command (approve the dialog)
+git push -u origin HEAD && gh pr create --title "..." --body-file <file>   # first push: ONE command (approve the dialog); needs a finished reviewer of this branch in this session (build-session, "a PR opens only after an independent review")
 gh pr comment <N> --body "@codex review"          # after EVERY subsequent push
 python3 scripts/hooks/git_push_guard.py --check-pr <N>
 gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --check-pr
