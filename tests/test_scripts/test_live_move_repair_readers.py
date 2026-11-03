@@ -838,6 +838,60 @@ def test_a_row_field_a_step_would_interpolate_is_validated(tmp_path, over):
     assert found["saved"] == [] and found["malformed"] == 1, found
 
 
+@pytest.mark.parametrize(
+    "path",
+    [".git/hooks/post-merge", ".git/config", "sub/.git/hooks/pre-commit"],
+)
+def test_a_row_inside_git_is_malformed(tmp_path, path):
+    """Git never records such a path, and a step writing there could plant a hook."""
+    repo, head = _git_repo(tmp_path)
+    _report_at(tmp_path, "20260101T000000Z-1", result="healed", repo=str(repo), tag=head,
+               paths=[_row(path=path, disk="absent")], reapply=[])  # fmt: skip
+    found = _collect_bounded(tmp_path)
+    assert found["saved"] == [] and found["malformed"] == 1, found
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [{"repo": "/x/\ud800"}, {"repo": "/x\0y"}, {"saved_as": "\ud800/x"}, {"blobs": ["\ud800/x"]}],
+    ids=["repo-surrogate", "repo-nul", "saved-as-surrogate", "blob-surrogate"],
+)
+def test_one_bad_report_costs_that_report_and_keeps_the_next(tmp_path, bad):
+    """Each of these raised out of the reader and blanked deploy health. A later
+    good report is still read."""
+    repo, head = _git_repo(tmp_path)
+    row = {k: v for k, v in bad.items() if k != "repo"}
+    report = {"result": "healed", "repo": bad.get("repo", str(repo)), "tag": head}
+    _report_at(tmp_path, "20260101T000000Z-1", **report,
+               paths=[_row(path="A", disk="absent", **row)], reapply=[])  # fmt: skip
+    # A known-bad row in the later report: counting it proves that report was read.
+    _report_at(tmp_path, "20260102T000000Z-2", result="healed", repo=str(repo), tag=head,
+               paths=[_row(path="Z", disk="absent", flag="xx")], reapply=[])  # fmt: skip
+    found = _collect_bounded(tmp_path)
+    assert found["malformed"] == 2 and found["refused"] == 1, found
+    assert "20260102T000000Z-2" in found["malformed_in"], found
+
+
+def test_an_unforeseen_failure_costs_only_that_report(tmp_path, monkeypatch):
+    """The boundary holds for a fault no field check foresaw."""
+    dh = _dh()
+    repo, head = _git_repo(tmp_path)
+    for ts in ("20260101T000000Z-1", "20260102T000000Z-2"):
+        _report_at(tmp_path, ts, result="healed", repo=str(repo), tag=head,
+                   paths=[_row(path=ts[:8], disk="absent", flag="xx")], reapply=[])  # fmt: skip
+    real = dh._fields_ok
+
+    def flaky(backup, row):
+        if row.get("path") == "20260101":
+            raise RuntimeError("boom")
+        return real(backup, row)
+
+    monkeypatch.setattr(dh, "_fields_ok", flaky)
+    found = dh.collect_live_repairs(tmp_path, repo)
+    assert (found["malformed"], found["refused"]) == (2, 1), found
+    assert "20260102T000000Z-2" in found["malformed_in"], found
+
+
 # -- every index entry a step drops is checked before it is offered --
 
 

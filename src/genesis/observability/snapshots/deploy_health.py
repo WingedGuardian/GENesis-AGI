@@ -1034,73 +1034,79 @@ def collect_live_repairs(
         if repair is None:
             malformed, refused = malformed + 1, refused + 1
             continue
+        # One boundary per report: a field no check foresaw costs that report, never
+        # the rest of the snapshot.
         try:
-            loaded = repair.load_report(str(d), repo)
-        except repair.BadReport as exc:
-            logger.debug("live-move repair report refused: %s", exc)
-            malformed, refused = malformed + 1, refused + 1
-            continue
-        if loaded is None:
-            continue
-        m, ts, rows, by_path = loaded["report"], loaded["ts"], loaded["rows"], loaded["by_path"]
-        age = now - loaded["mtime"]
-        result, dismissed = m.get("result"), bool(m.get("dismissed_at"))
-        unresolved = (result is None and age > REPAIR_UNFINISHED_S) or str(result).startswith(
-            "unresolved"
-        )
-        unresolved = unresolved and not dismissed
-        tag = m.get("tag") if isinstance(m.get("tag"), str) else None
-        # Parents first, by path components (`a/b` before `a-b`), as the
-        # writer orders its steps.
-        foreign = sorted(
-            (r for r in rows if r.get("class") == "foreign"),
-            key=lambda r: str(r.get("path")).split("/"),
-        )
-        # Each row is checked once; a step's drop list reads these by path.
-        ok = {id(r): _fields_ok(d, r) for r in foreign}
-        judged: list[tuple[str, dict, str]] = []
-        for row in foreign:
-            path = row.get("path")
-            if dismissed:
-                if isinstance(path, str):
-                    offered.pop(path, None)
-                    moved.pop(path, None)
+            try:
+                loaded = repair.load_report(str(d), repo)
+            except repair.BadReport as exc:
+                logger.debug("live-move repair report refused: %s", exc)
+                malformed, refused = malformed + 1, refused + 1
                 continue
-            if not ok[id(row)]:
-                malformed += 1
-                malformed_in.add(ts)
+            if loaded is None:
                 continue
-            judged.append((path, row, _verdict(repair, d, repo, tag, row, checkouts)))
-        # A row's step drops the index entries of the rows below it before it
-        # re-adds its own: offered only while none of those moved on, and each
-        # entry it drops still holds what the repair left there, or nothing.
-        gone = {a for p, _, v in judged if v == "moved" for a in repair._parents(p)}
-        below = _below(repair, rows) if judged else {}
-        for path, row, verdict in judged:
-            offered.pop(path, None)
-            moved.pop(path, None)
-            if verdict == "offer" and path in gone:
-                verdict = "moved"
-            if verdict == "offer" and not all(
-                _left_alone(repair, by_path, ok, p, _checkout(repair, repo, checkouts))
-                for p in _drops(repair, row, below.get(path, ()))
-            ):
-                verdict = "moved"
-            if verdict == "offer":
-                # Never the stored text: the repair's own reapply_step, from the
-                # checked row, the report's own dir and the writer's `below`.
-                try:
-                    offered[path] = (
-                        repair.reapply_step(
-                            repo, str(d), row, below.get(path, ()), quote=shell_word
-                        ),
-                        ts,
-                    )
-                except Exception:  # noqa: BLE001 - a row no step can be built for is malformed
+            m, ts, rows, by_path = loaded["report"], loaded["ts"], loaded["rows"], loaded["by_path"]
+            age = now - loaded["mtime"]
+            result, dismissed = m.get("result"), bool(m.get("dismissed_at"))
+            unresolved = (result is None and age > REPAIR_UNFINISHED_S) or str(result).startswith(
+                "unresolved"
+            )
+            unresolved = unresolved and not dismissed
+            tag = m.get("tag") if isinstance(m.get("tag"), str) else None
+            # Parents first, by path components (`a/b` before `a-b`), as the
+            # writer orders its steps.
+            foreign = sorted(
+                (r for r in rows if r.get("class") == "foreign"),
+                key=lambda r: str(r.get("path")).split("/"),
+            )
+            # Each row is checked once; a step's drop list reads these by path.
+            ok = {id(r): _fields_ok(d, r) for r in foreign}
+            judged: list[tuple[str, dict, str]] = []
+            for row in foreign:
+                path = row.get("path")
+                if dismissed:
+                    if isinstance(path, str):
+                        offered.pop(path, None)
+                        moved.pop(path, None)
+                    continue
+                if not ok[id(row)]:
                     malformed += 1
                     malformed_in.add(ts)
-            elif verdict == "moved":
-                moved[path] = (ts, str(d))
+                    continue
+                judged.append((path, row, _verdict(repair, d, repo, tag, row, checkouts)))
+            # A row's step drops the index entries of the rows below it before it
+            # re-adds its own: offered only while none of those moved on, and each
+            # entry it drops still holds what the repair left there, or nothing.
+            gone = {a for p, _, v in judged if v == "moved" for a in repair._parents(p)}
+            below = _below(repair, rows) if judged else {}
+            for path, row, verdict in judged:
+                offered.pop(path, None)
+                moved.pop(path, None)
+                if verdict == "offer" and path in gone:
+                    verdict = "moved"
+                if verdict == "offer" and not all(
+                    _left_alone(repair, by_path, ok, p, _checkout(repair, repo, checkouts))
+                    for p in _drops(repair, row, below.get(path, ()))
+                ):
+                    verdict = "moved"
+                if verdict == "offer":
+                    # Never the stored text: the repair's own reapply_step, from the
+                    # checked row, the report's own dir and the writer's `below`.
+                    try:
+                        offered[path] = (
+                            repair.reapply_step(
+                                repo, str(d), row, below.get(path, ()), quote=shell_word
+                            ),
+                            ts,
+                        )
+                    except Exception:  # noqa: BLE001 - a row no step can be built for is malformed
+                        malformed += 1
+                        malformed_in.add(ts)
+                elif verdict == "moved":
+                    moved[path] = (ts, str(d))
+        except Exception:  # noqa: BLE001 - see the boundary comment above
+            logger.warning("live-move repair report unreadable: %s", name, exc_info=True)
+            malformed, refused = malformed + 1, refused + 1
     counts: dict[tuple[str, str], int] = {}
     for key in moved.values():
         counts[key] = counts.get(key, 0) + 1
@@ -1143,6 +1149,12 @@ def _relative(path: object) -> bool:
     )
 
 
+def _worktree_path(path: object) -> bool:
+    """A plain relative path outside `.git`: git never records one inside it, and
+    a step writing there could plant a hook or rewrite config."""
+    return _relative(path) and ".git" not in str(path).split("/")
+
+
 def _inside(backup: Path, saved: object) -> bool:
     """No saved copy, or one that resolves inside the report's own backup dir
     (its parent resolved: the copy itself may be a symlink, never followed)."""
@@ -1178,7 +1190,7 @@ def _fields_ok(backup: Path, row: dict) -> bool:
     special, flag, blobs = row.get("special"), row.get("flag"), row.get("blobs") or []
     through = row.get("unreachable_through")
     return (
-        _relative(row.get("path"))
+        _worktree_path(row.get("path"))
         and _inside(backup, row.get("saved_as"))
         and isinstance(row.get("disk_changed"), bool)
         and (row.get("tag") is None or _entry(row.get("tag"), False))
