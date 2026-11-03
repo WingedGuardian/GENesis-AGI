@@ -1882,7 +1882,8 @@ class TestCheckInlineReviewFindings:
             block, _ = guard_module._check_inline_review_findings("100")
         assert not block, "an unrecognised format must not be guessed at"
         err = capsys.readouterr().err
-        assert "unrecognised" in err
+        # A P3 is now named as an informational P3 note (#3808), still surfaced.
+        assert "[P3: " in err
         assert "Keep extglob parentheses" in err
 
     def test_coderabbit_title_ignores_bold_inside_quoted_code(self, guard_module):
@@ -5557,17 +5558,16 @@ class TestPerLaneThreshold:
         assert "under the 2.0 threshold for a STANDARD change" in capsys.readouterr().err
 
     def test_config_only_change_is_NOT_light(self, guard_module, monkeypatch):
-        """`config/desktop_takeover.yaml` arms desktop takeover; `pyproject.toml`
-        pins dependencies. Both reach `_category() == "docs-config"`, and the
-        first cut of the light lane handed them a 3.0 budget. Prose is light;
-        config is not."""
-        self._files(monkeypatch, guard_module, "config/desktop_takeover.yaml")
+        """`pyproject.toml` pins dependencies and holds the lint and pytest
+        config; it reaches `_category() == "docs-config"`, and the first cut of
+        the light lane handed config a 3.0 budget. Prose is light; config is
+        not. (`config/desktop_takeover.yaml`, this test's first example, arms
+        desktop takeover and is now `critical` by exact path, so it can no
+        longer stand for ordinary config.)"""
+        self._files(monkeypatch, guard_module, "pyproject.toml")
         with self._mock(
             guard_module,
-            [
-                self._codex(i, _P2_BODY, "config/desktop_takeover.yaml")
-                for i in range(1, 5)
-            ],
+            [self._codex(i, _P2_BODY, "pyproject.toml") for i in range(1, 5)],
         ):
             block, msg = guard_module._check_inline_review_findings("100")
         assert block, "4 P2s = 2.0 must block a config change at the STANDARD threshold"

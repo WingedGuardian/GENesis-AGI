@@ -1,6 +1,7 @@
 [Unit]
-Description=Genesis Disk Hygiene — reap merged worktrees + reclaim regenerable caches
+Description=Genesis Disk Hygiene — reclaim caches and run retention maintenance
 After=genesis-server.service
+Wants=genesis-worktree-reaper.service
 
 [Service]
 Type=oneshot
@@ -15,10 +16,10 @@ WorkingDirectory=__REPO_DIR__
 # every provider key and the backup passphrase to a oneshot that runs `rm -rf`.
 # `scripts/disk_hygiene.sh` reads the two store knobs by name instead, where the
 # ordering is under our control.
-ExecStart=/bin/bash __REPO_DIR__/scripts/disk_hygiene.sh
-# Reaping ~dozens of worktrees (gh/git calls each) + a multi-GB rmtree can run
-# well past the 90s default TimeoutStartSec, which would SIGTERM mid-trash-move.
-TimeoutStartSec=1200
+ExecStart=/bin/bash __REPO_DIR__/scripts/disk_hygiene.sh --maintenance-only
+# Large directory removals can exceed a short startup timeout. Reaping has its
+# own unit: its failure or timeout cannot interrupt these maintenance steps.
+TimeoutStartSec=7200
 # `gh` (squash-merge detection) + `git` may live in /usr/bin, CC_BIN_DIR, or
 # npm-global — list all so the reaper doesn't silently fall back to git-only.
 Environment=PATH=__VENV__/bin:__CC_BIN_DIR__:__HOME__/.npm-global/bin:/usr/local/bin:/usr/bin:/bin

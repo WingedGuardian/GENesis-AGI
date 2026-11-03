@@ -1439,7 +1439,8 @@ async def _resolve_memory_integrity_posture(db) -> None:
 # the host guardian a week behind, with zero signal anywhere. The collectors
 # live in observability/snapshots/deploy_health.py (shared with the health
 # snapshot); this check is the alerting layer. Hybrid severity: any drift is
-# a non-paging 'high' (dashboard); 'critical' (pages Telegram) only when
+# a non-paging 'high' (dashboard), except commits-behind-upstream alone, which
+# is 'medium' (routine maintenance); 'critical' (pages Telegram) only when
 # SUSTAINED — the 'stale_update' finding class (last successful update ≥7
 # days old AND ≥20 commits behind; thresholds live beside derive_findings in
 # deploy_health.py, the single producer of finding keys), or a missing
@@ -1702,7 +1703,15 @@ async def _check_deploy_staleness(db) -> None:
                 except ValueError:
                     pass
 
-        priority = "critical" if critical else "high"
+        # Being behind upstream and nothing else is routine maintenance: medium,
+        # so the morning report does not raise it as a blocker every day. Any
+        # other drift class beside it keeps the row at high.
+        if critical:
+            priority = "critical"
+        elif classes == ["behind_upstream"]:
+            priority = "medium"
+        else:
+            priority = "high"
         alert_key = ",".join(classes) + ":" + priority
         now = time.monotonic()
         if (

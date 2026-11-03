@@ -423,7 +423,7 @@ done = {
         "and left them as they are"
     ),
 }[action]
-# The keys and value types of update.sh's writer (its _do_rollback).
+# The keys and value types of update.sh's writer (_do_rollback, in lib/update_rollback.sh).
 data = {
     "old_tag": state.get("old_tag", ""),
     "new_tag": new_tag,

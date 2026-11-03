@@ -164,9 +164,13 @@ primary conversation channel is unavailable.
 
 ### 8.1 Local Status File
 
-Write a JSON status file to `~/.genesis/status.json` on every state transition.
-Any local tool can read this. Fields: current state, transition history,
-deferred work count, pending embeddings count, timestamp.
+The runtime writes `~/.genesis/status.json` at startup and on its independent
+60-second status loop. Runtime/async DB data is collected on-loop; immutable JSON
+is published atomically by an ordered executor worker. Cancellation preserves
+publication ownership until the worker completes, and graceful shutdown drains
+it before dependency teardown. Local readers see the previous complete file or
+the new complete file. Fields include current resilience axes, queue depths,
+human summary, optional health data, and the original snapshot timestamp.
 
 ### 8.2 Webhook (Optional)
 

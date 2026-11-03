@@ -25,7 +25,7 @@ def _fingerprints_present(tmp_path, monkeypatch):
     present (empty) one — the propose path then depends only on the input, not
     on the ambient install."""
     fp = tmp_path / "fingerprints.txt"
-    fp.write_text("")
+    fp.write_text("zz-no-such-private-token-zz\n")  # one harmless pattern: an EMPTY file now reads as not scanned
     monkeypatch.setenv("GENESIS_RELEASE_FINGERPRINTS", str(fp))
 
 
