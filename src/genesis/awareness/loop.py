@@ -582,10 +582,19 @@ _INFRA_POSTURE_DETAIL = {
         "guardian health on the host, or re-run scripts/host-setup.sh"
     ),
     "oomd_pressure_kill_off": (
-        "systemd-oomd pressure-kill is not enforced for user.slice — nothing "
+        "systemd-oomd monitors neither the user manager nor user.slice — nothing "
         "gracefully kills the memory hog before a hard OOM wedge. Re-run "
-        "scripts/bootstrap.sh (installs systemd-oomd and lays the user.slice "
-        "drop-in via lib/memory_resilience.sh)"
+        "scripts/bootstrap.sh as the Genesis user (lib/memory_resilience.sh "
+        "installs systemd-oomd, lays the user-manager and user.slice drop-ins, "
+        "and says which monitor it could not verify)"
+    ),
+    "oomd_user_manager_unmonitored": (
+        "systemd-oomd does not monitor the user manager, so a memory-pressure "
+        "kill is chosen under the root-owned user.slice backstop, where "
+        "genesis-server's kill-me-last preference is ignored. Re-run "
+        "scripts/bootstrap.sh as the Genesis user: lib/memory_resilience.sh "
+        "lays the user-manager root-slice drop-in (it survives `systemctl --user "
+        "daemon-reload`, systemd issue #43174) and names the check that failed"
     ),
     "pid_ceiling_unprovisioned": (
         "the per-user systemd slice PID/task ceiling is still on systemd's stock "
@@ -820,8 +829,20 @@ def _infra_missing_protections(profile: dict) -> list[str]:
         missing.append("container_swap_disabled")
     # Gated on a readable cgroup swap knob (a cgroup-v2 proxy): on v1 the
     # pressure-kill policy cannot work, so False there is not actionable.
-    if swap_max is not None and memory.get("oomd_user_slice_kill") is False:
+    # Either monitor is protection: the user manager (live, the operative one)
+    # or user.slice (the backstop, configured). Neither is the alarm; an
+    # unknown user-manager state with user.slice off is treated as neither.
+    if (
+        swap_max is not None
+        and memory.get("oomd_user_slice_kill") is False
+        and memory.get("oomd_user_manager_monitored") is not True
+    ):
         missing.append("oomd_pressure_kill_off")
+    # The user-manager monitor explicitly not live: protection degrades to the
+    # backstop, where kill-me-last is ignored. Explicit False only (None means
+    # oomctl or a user manager is absent: nothing to act on).
+    if swap_max is not None and memory.get("oomd_user_manager_monitored") is False:
+        missing.append("oomd_user_manager_unmonitored")
     # PID/task ceiling still on systemd's stock 33% default. Explicit False only
     # (the collector reports the EFFECTIVE cap vs the container root budget);
     # None/absent (unreadable / no container cap) stays silent.

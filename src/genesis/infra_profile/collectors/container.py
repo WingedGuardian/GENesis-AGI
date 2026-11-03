@@ -611,6 +611,68 @@ async def collect_cpu(
 # ── memory ───────────────────────────────────────────────────────────────
 
 
+def _oomd_lists(oomctl_out: str, cgroup: str) -> bool:
+    """Whether `oomctl` output lists ``cgroup`` under "Memory Pressure
+    Monitored CGroups" (headers are unindented; entries are `<TAB>Path: <cg>`)."""
+    inside = False
+    for line in oomctl_out.splitlines():
+        if line and not line[0].isspace():
+            inside = line.startswith("Memory Pressure Monitored CGroups:")
+            continue
+        parts = line.split()
+        if inside and len(parts) == 2 and parts[0] == "Path:" and parts[1] == cgroup:
+            return True
+    return False
+
+
+async def _oomd_user_manager_monitored() -> bool | None:
+    """Whether systemd-oomd LIVE-monitors this user's manager cgroup.
+
+    Live, not config-plane: the per-user manager is configured `kill` on most
+    distros yet a `systemctl --user daemon-reload` silently drops PID 1's report
+    of it (systemd issue #43174), so a config read answers "configured", which
+    is the wrong question. scripts/lib/memory_resilience.sh makes the user
+    manager report it itself.
+
+    None when this cannot be asked (no `oomctl`, no user manager); False when
+    oomd answers and does not list it, or when neither oomd unit is active
+    (then `oomctl` exits nonzero as an ANSWER, and nothing monitors anything).
+    Every read here is strict, so a hiccup keeps the prior hashed facts instead
+    of recording a phantom None or False (the `_run_cmd` contract):
+    `systemctl show` exits 0 even for a unit that does not exist (MEASURED,
+    systemd 255), and the user-bus read re-raises only while a user manager is
+    present, as `collect_systemd_units` does."""
+    try:
+        cgroup = await _run_cmd(
+            "systemctl", "--user", "show", "-p", "ControlGroup", "--value", "--", "-.slice",
+            strict=True,
+        )
+    except ProbeFailed:
+        if user_manager_present():
+            raise
+        return None
+    if not cgroup or shutil.which("oomctl") is None:
+        return None
+    states = await _run_cmd(
+        "systemctl", "show", "-p", "ActiveState", "--value",
+        "systemd-oomd.service", "systemd-oomd.socket", strict=True,
+    )
+    service_state, _, socket_state = (states or "").partition("\n\n")
+    if service_state.strip() == "active":
+        out = await _run_cmd("oomctl", strict=True)
+    elif socket_state.strip() == "active":
+        # Socket only: oomctl reaches oomd over D-Bus, whose activation alias
+        # exists only while the service is enabled, so a disabled service can
+        # leave oomctl failing as an ANSWER (nothing runs to monitor anything).
+        try:
+            out = await _run_cmd("oomctl", strict=True)
+        except ProbeFailed:
+            return False
+    else:
+        return False
+    return _oomd_lists(out or "", cgroup)
+
+
 async def collect_memory(
     proc_root: Path = Path("/proc"),
     sys_root: Path = Path("/sys"),
@@ -623,6 +685,7 @@ async def collect_memory(
     facts["cgroup_memory_max"] = _read_cgroup_memory_max(sys_root)
     facts["cgroup_memory_swap_max"] = _read_cgroup_memory_swap_max(sys_root)
     facts["oomd_user_slice_kill"] = _oomd_user_slice_kill(etc_root)
+    facts["oomd_user_manager_monitored"] = await _oomd_user_manager_monitored()
     facts["pid_ceiling_effective_ok"] = _pid_ceiling_effective_ok(sys_root)
     facts["oom_score_adj_declared_ok"] = await _oom_score_adj_declared_ok(proc_root)
 

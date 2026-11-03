@@ -54,6 +54,7 @@ def _profile(
     *,
     swap_max: object = "max",
     oomd: object = True,
+    oomd_um: object = None,
     tasksmax_ok: object = True,
     oom_adj_ok: object = True,
     host_swap_kb: object = 8_000_000,
@@ -82,6 +83,7 @@ def _profile(
                 "facts": {
                     "cgroup_memory_swap_max": swap_max,
                     "oomd_user_slice_kill": oomd,
+                    "oomd_user_manager_monitored": oomd_um,
                     "pid_ceiling_effective_ok": tasksmax_ok,
                     "oom_score_adj_declared_ok": oom_adj_ok,
                     # meminfo swap is NOT virtualized: 0 here on a HEALTHY
@@ -153,6 +155,7 @@ def _reset_cooldown():
 _ALL_DEFECTS = dict(
     swap_max=0,
     oomd=False,
+    oomd_um=False,
     tasksmax_ok=False,
     oom_adj_ok=False,
     host_swap_kb=0,
@@ -179,6 +182,7 @@ def test_all_defects_detected():
         "networkd_keepconfig_missing",
         "oom_adj_declaration_not_applied",
         "oomd_pressure_kill_off",
+        "oomd_user_manager_unmonitored",
         "pid_ceiling_unprovisioned",
         "tailscale_watchdog_absent",
     ]
@@ -831,6 +835,7 @@ def test_resilience_facts_are_covered():
     for fact in (
         "cgroup_memory_swap_max",
         "oomd_user_slice_kill",
+        "oomd_user_manager_monitored",
         "pid_ceiling_effective_ok",
         "oom_score_adj_declared_ok",
         "swap_total_kb",
@@ -976,3 +981,25 @@ async def test_codebase_opt_out_is_silent(monkeypatch):
         assert await _alerts(db) == []
     finally:
         await db.close()
+
+
+@pytest.mark.parametrize(
+    ("slice_kill", "um", "alarm"),
+    [
+        (True, None, False),   # user.slice backstop configured
+        (True, False, False),
+        (False, True, False),  # the operative user-manager monitor is live
+        (False, False, True),  # neither monitor
+        (False, None, True),   # user.slice off and the user manager unknown
+    ],
+)
+def test_oomd_alarm_fires_only_when_no_monitor_is_in_effect(slice_kill, um, alarm):
+    missing = _infra_missing_protections(_profile(oomd=slice_kill, oomd_um=um))
+    assert ("oomd_pressure_kill_off" in missing) is alarm
+
+
+@pytest.mark.parametrize(("um", "alarm"), [(True, False), (None, False), (False, True)])
+def test_user_manager_unmonitored_alarm_on_explicit_false_only(um, alarm):
+    missing = _infra_missing_protections(_profile(oomd=True, oomd_um=um))
+    assert ("oomd_user_manager_unmonitored" in missing) is alarm
+

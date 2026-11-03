@@ -29,19 +29,72 @@ installs retrofit automatically. It is idempotent and **adaptive — every thres
 pressure percentage, never an absolute byte value**, so the same config
 right-sizes from a small VPS to a large workstation:
 
-- `/etc/systemd/system/user.slice.d/genesis-oomd.conf` —
-  `ManagedOOMMemoryPressure=kill` at **60%** memory-pressure (PSI) on the
-  user slice: the backstop monitor.
-- `/etc/systemd/system/user@.service.d/genesis-oomd.conf` — `kill` for the
-  per-user manager. In practice this is the operative monitor (many distros
-  ship a 50% default limit for it; ours guarantees `kill` where the distro
-  ships `auto` or nothing).
-- `/etc/systemd/oomd.conf.d/genesis.conf` — swap-use limit 90%, default
+**Where oomd watches decides what it may kill.** Only leaf cgroups below a
+monitored unit are candidates, one per action, ranked first by preference
+(`omit` never, `avoid` last) and then by reclaim rate. The preference marks are
+honoured only when the candidate and the monitored cgroup have the same owner
+(systemd.resource-control(5), `ManagedOOMPreference=`). So the monitor that
+matters is the per-user manager, `user@<uid>.service`, which the user owns:
+under it, `genesis-server`'s `avoid` holds. Under the root-owned `user.slice`
+every mark is ignored, which is how genesis-server was killed in a 2026-11
+incident despite `avoid`.
+
+- `/etc/systemd/system/user@.service.d/genesis-oomd.conf`: `kill` at **60%**
+  for the per-user manager, reported by PID 1. Never removed: after a boot it
+  is the monitor until the first user reload. It overrides the distro's own
+  50% for that unit (Ubuntu's `10-oomd-user-service-defaults.conf`).
+- `~/.config/systemd/user/-.slice.d/genesis-oomd.conf`: the same policy on the
+  user manager's own root slice. This is what keeps the per-user monitor alive.
+  The root slice has the same cgroup path as `user@<uid>.service`, and on every
+  `systemctl --user daemon-reload` the user manager reports it; left at the
+  default `auto`, that report silently erases PID 1's `kill` (systemd issue
+  #43174). Reporting `kill` itself, with the same limit, makes the monitor
+  survive reloads. Genesis reloads the user manager on every bootstrap and
+  deploy, so without this the per-user monitor was effectively never on.
+- `~/.config/systemd/user/init.scope.d/` and `dbus.service.d/`
+  `genesis-oomd.conf`: the user manager itself is `omit` and its D-Bus is
+  `avoid`. Killing either would take every session and unit with it.
+- `/etc/systemd/system/user.slice.d/genesis-oomd.conf`: the backstop, `kill`
+  at **80%**, never switched off. The per-user monitor at 60% acts first and
+  honours `avoid`; the backstop acts only once pressure passes 80%, i.e. on
+  pressure the first monitor could not relieve. Under it `avoid` is ignored and
+  the victim is chosen by reclaim rate, which favours the hog itself. Because
+  the backstop is always on, no state of this setup leaves oomd monitoring
+  nothing.
+- **What the thresholds measure, and how sure they are.** oomd compares the
+  cgroup's PSI `full` 10-second average: the share of time in which every task
+  in it was stalled on memory, not a share of RAM. 60% held for 20s means the
+  tree made almost no progress for 12 of every 20 seconds. A share of time
+  self-calibrates across box sizes. 60% is upstream systemd's
+  `DefaultMemoryPressureLimit`; 80% sits above it so the monitor that honours
+  `avoid` always acts first. Neither is validated against this workload yet:
+  Genesis records no pressure history, so both are to be re-set from sampled
+  data.
+- **Known residuals.** Each of these lets the 60% monitor kill sessions or
+  background runs that are not the cause:
+  - a hog outside the user manager: a command run in an SSH login scope, a
+    system service (Qdrant runs in `system.slice`), another user. Global
+    pressure stalls tasks under the user manager too, so its leaves are killed
+    while the hog is out of reach until the backstop (login scope, other users)
+    or neither monitor (`system.slice`);
+  - a runaway genesis-server: `avoid` ranks it last, so every other leaf under
+    the user manager goes first, one per oomd action, before it is chosen;
+    the backstop chooses by reclaim rate, but only above 80%.
+  Attributing pressure to its source, so the cause and not a bystander is acted
+  on, is planned work beyond this policy.
+- Every run verifies the per-user monitor live (the user manager reports
+  `kill` for its root slice, and `oomctl` lists its cgroup on two reads) and
+  says which monitors are in force; the infra profile's
+  `oomd_user_manager_monitored` fact carries it to the awareness posture check.
+- `/etc/systemd/oomd.conf.d/genesis.conf`: swap-use limit 90%, default
   pressure limit 60%, 20s duration.
-- `genesis-server.service` carries `ManagedOOMPreference=avoid`, so oomd prefers
-  killing the greedy session tree over the cognitive core. `avoid` is honored by
-  the per-user monitor (same-UID cgroup ownership) — see
-  systemd.resource-control(5).
+- `genesis-server.service` carries `ManagedOOMPreference=avoid`: oomd chooses
+  it only when no other candidate is left. The shared Serena units and the
+  disk guardian carry `avoid` too; a shared service killed for one session's
+  pressure would hurt every session.
+- The user half needs no sudo and runs as the Genesis user; run as root (the
+  manual `sudo bash -c …` path) it is skipped and says so, and `user.slice`
+  then stays monitored.
 - Its kernel-side `OOMScoreAdjust` is **`100`, not a negative value**, and that
   is a constraint rather than a preference. A user manager cannot lower
   `oom_score_adj` below the `oom_score_adj_min` of 0 it inherits from init;
@@ -179,6 +232,7 @@ flags unprotected installs:
 |---|---|---|---|
 | `cgroup_memory_swap_max` | container | `"max"` (or an int) | `0` |
 | `oomd_user_slice_kill` | container | `true` | `false` |
+| `oomd_user_manager_monitored` | container | `true` (live `oomctl` listing) | `false`: not listed (degraded to the backstop, where `avoid` is ignored), or no oomd unit active (nothing monitors) |
 | `pid_ceiling_effective_ok` | container | `true` | `false` |
 | `swap_total_kb` | host | > 0 | `0` |
 | `container_limits["limits.memory.swap"]` | host_virt | `"true"`/absent | `"false"` |
