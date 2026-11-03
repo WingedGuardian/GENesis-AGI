@@ -625,6 +625,8 @@ def test_the_script_and_update_sh_share_one_excused_path_list():
         text = script.read_text()
         assert not re.search(r"^\s*EPHEMERAL_DIRTY_RE=", text, re.MULTILINE), script.name
         assert re.search(r'^\s*\. "\$\w+/lib/deploy_marker\.sh"$', text, re.MULTILINE), script.name
+    rollback = (UPDATE_SH.parent / "lib" / "update_rollback.sh").read_text()
+    assert not re.search(r"^\s*EPHEMERAL_DIRTY_RE=", rollback, re.MULTILINE)
 
 
 def test_both_callers_name_the_lock_fd_the_way_the_lib_expects():

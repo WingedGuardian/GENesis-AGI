@@ -142,8 +142,12 @@ def test_disk_hygiene_actually_invokes_the_pruner():
     """
     body = _HYGIENE.read_text()
     assert "prune_hook_audit_logs.py" in body, "the groom does not invoke the pruner"
-    main_body = body.split("\nmain() {", 1)[-1] if "\nmain() {" in body else body
-    assert "prune_hook_audit_logs.py" in main_body, "the invocation is outside main()"
+    # The daily steps live in maintenance_main(); main() runs it as a stage.
+    start = body.index("\nmaintenance_main() {")
+    maintenance = body[start:body.index("\n}\n", start)]
+    assert "prune_hook_audit_logs.py" in maintenance, "the invocation is outside maintenance_main()"
+    main_body = body[body.index("\nmain() {"):]
+    assert "hygiene_stage maintenance maintenance_main" in main_body, "main() never runs maintenance_main"
 
 
 def test_a_recently_written_file_is_not_trimmed(tmp_path):

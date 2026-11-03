@@ -71,10 +71,10 @@ async def generate_deterministic(db: aiosqlite.Connection) -> str:
             parts.append(f"- {topic}")
 
     # Key insights: meaningful observations from last 7 days
-    decisions = await _recent_decisions(db, days=7)
+    decisions = await _recent_decisions(db, days=7, limit=5)
     if decisions:
         parts.append("\n### Key Insights (7d)")
-        for decision in decisions[:5]:
+        for decision in decisions:
             parts.append(f"- {decision}")
 
     # Upcoming events: user-world events from the SVO calendar
@@ -293,8 +293,17 @@ async def _recent_session_topics(db: aiosqlite.Connection, days: int = 7) -> lis
         return []
 
 
-async def _recent_decisions(db: aiosqlite.Connection, days: int = 7) -> list[str]:
-    """Get recent meaningful observations (exclusion-based to capture future types)."""
+async def _recent_decisions(
+    db: aiosqlite.Connection, days: int = 7, limit: int = 10,
+) -> list[str]:
+    """Get recent meaningful observations (exclusion-based to capture future types).
+
+    Newest first, at most ``limit`` entries, with repeats collapsed to their
+    newest copy (see ``_insight_dedup_key``).
+    """
+    if limit <= 0:
+        return []
+
     # Exclude noisy/mechanical types; everything else surfaces.
     _EXCLUDED_TYPES = (
         # Mechanical / tick-level
@@ -334,24 +343,66 @@ async def _recent_decisions(db: aiosqlite.Connection, days: int = 7) -> list[str
         # Autonomy gate data — must never surface to ego context (opacity)
         "autonomy_audit",
         "autonomy_gate_decision",
+        # Scheduled-job run reports: a job's log, not an insight. The
+        # observations are still stored for their own readers (the morning
+        # report shows entity_adjudication's). Measured over one install's
+        # 7-day window, these four types were 240 of 362 candidate rows.
+        # - JSON run payloads. The reaper writes one each tick that finds
+        #   candidates, so a candidate that persists repeats it (164 rows,
+        #   2 distinct texts). Entity adjudication writes one per run that
+        #   proposed or merged anything (68 rows).
+        "process_reaper_would_kill",
+        "entity_adjudication",
+        # - Written on every run, whether or not anything changed.
+        "dream_cycle_report",
+        "dream_synthesis_drain_report",
     )
     placeholders = ",".join("?" * len(_EXCLUDED_TYPES))
     try:
-        cursor = await db.execute(
-            "SELECT content FROM observations "  # noqa: S608 - literal SQL fragments; values bound as parameters
+        # No SQL LIMIT: repeats are dropped below, so a fixed window of rows
+        # could be all one text. The scan stops once ``limit`` distinct
+        # entries are collected, which bounds the work instead.
+        results: list[str] = []
+        seen: set[str] = set()
+        # The 250-char display slice is taken in SQL, so a long row never
+        # crosses into Python whole, and the dedup key is computed on exactly
+        # the text that would be shown.
+        async with db.execute(
+            "SELECT substr(content, 1, 250) FROM observations "  # noqa: S608 - literal SQL fragments; values bound as parameters
             f"WHERE type NOT IN ({placeholders}) "
             "AND resolved = 0 "
             # WS-3: exclude external/unknown-origin content from the L1 file
             # (fail-closed; NULL excluded post-backfill).
             f"AND {SAFE_ORIGIN_SQL} "
             "AND created_at > datetime('now', ?) "
-            "ORDER BY created_at DESC LIMIT 10",
+            "ORDER BY created_at DESC",
             (*_EXCLUDED_TYPES, f"-{days} days"),
-        )
-        rows = await cursor.fetchall()
-        return [row[0][:250] for row in rows if row[0]]
+        ) as cursor:
+            async for row in cursor:
+                shown = row[0]
+                if not shown:
+                    continue
+                key = _insight_dedup_key(shown)
+                if key in seen:
+                    continue
+                seen.add(key)
+                results.append(shown)
+                if len(results) >= limit:
+                    break
+        return results
     except Exception:
+        logger.warning("Key Insights query failed", exc_info=True)
         return []
+
+
+def _insight_dedup_key(text: str) -> str:
+    """Whitespace- and case-insensitive identity for an insight line.
+
+    Digits are deliberately kept: a count that moved ("3 failing" -> "9
+    failing") is a real change, not a repeat. Masking them collapsed no
+    additional rows on the measured window anyway.
+    """
+    return " ".join(text.split()).casefold()
 
 
 # Behavioral focus patterns — ego should describe a topic, not a behavioral

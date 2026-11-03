@@ -730,8 +730,13 @@ async def session_ledger_add(
             prefix ok).
         text: the agreement/TODO, one line, concrete enough to act on later.
         source_ref: optional provenance (plan file path, PR number, quote).
-        added_by: origin of the write — foreground | ambient | pulse
-            (default: auto-detected).
+        added_by: origin of the write — foreground | ambient | pulse |
+            relayed (default: auto-detected; a dispatched session defaults to
+            ambient). A dispatched or channel session (e.g. a Telegram
+            conversation) writing down something THE OWNER asked for MUST
+            pass added_by="relayed": it marks the row as the owner's own
+            commitment, so the undisposed-ledger escalation sweep covers it.
+            Leave the default for the session's own notes and TODOs.
     """
     return await _impl_session_ledger_add(
         session_id,
