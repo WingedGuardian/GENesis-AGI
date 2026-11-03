@@ -75,6 +75,14 @@ WHAT A SWEEP GUARANTEES, per case:
      `--basetemp` last, because pytest empties that directory when a test uses
      `tmp_path`, and the last one wins however a case's own is spelled. Options
      that name one output file (`--junitxml`) can still overwrite that file.
+  8. A sweep that is stopped keeps what it learned. Each result is printed as its
+     case finishes. A signal unwinds the sweep, which removes the copy and kills
+     the child's group, and it waits for the steps a raise would damage (`_hold`):
+     git's part in making a copy, removing one, starting a child. A stop ends
+     non-zero, and a case that has reached its result still reports it.
+     SIGKILL cannot be handled, and a test's descendant in its own session escapes
+     the group kill. In CI the job must `exec` the sweep, or the signal stops at
+     the step's shell.
 
 WHAT IT DELIBERATELY DOES NOT DO. It does not generate mutations. Picking the
 mutation is the thinking part -- a behaviourally-null edit (swapped operands
@@ -110,7 +118,7 @@ import tempfile
 import tokenize
 import traceback
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -562,6 +570,36 @@ def _decode(case: Case, raw: bytes) -> tuple[str, str]:
 # --------------------------------------------------------------------------
 
 
+#: The signal that stopped this sweep, if any: a fact, checked between cases and
+#: before the tally, because a raise is not enough. Python discards an exception
+#: raised inside a `__del__`, so a signal landing in one would otherwise read as a
+#: clean sweep at exit 0.
+_stop_signal: int | None = None
+_held = 0
+
+
+def _raise_if_stopped() -> None:
+    if _stop_signal is not None:
+        raise SystemExit(128 + _stop_signal)
+
+
+@contextlib.contextmanager
+def _hold(*, then_stop: bool = True) -> Iterator[None]:
+    """A signal arriving inside this waits for its end, however long the step
+    takes. For a step a raise would damage: one part way through `git worktree add`
+    leaves an entry locked "initializing" in the caller's repository, one in cleanup
+    abandons it. ``then_stop=False`` leaves the stop to the next check: a raise out
+    of a copy's cleanup would discard the result its case has just reached."""
+    global _held
+    _held += 1
+    try:
+        yield
+    finally:
+        _held -= 1
+        if then_stop and not _held:
+            _raise_if_stopped()
+
+
 def _git(repo: Path, *args: str) -> bytes:
     """``git -C repo <args>`` -> stdout bytes; RuntimeError naming git's stderr.
 
@@ -775,8 +813,9 @@ def isolated_copy(
     tree = holder / holder.name  # the basename names git's admin entry too
     admin: Path | None = None
     try:
-        _git(top, "worktree", "add", "--detach", "--quiet", str(tree), "HEAD")
-        admin = Path(os.fsdecode(_git(tree, "rev-parse", "--absolute-git-dir").strip()))
+        with _hold():
+            _git(top, "worktree", "add", "--detach", "--quiet", str(tree), "HEAD")
+            admin = Path(os.fsdecode(_git(tree, "rev-parse", "--absolute-git-dir").strip()))
         overlay = _overlay(top, tree)
         if info is not None:
             head = os.fsdecode(_git(tree, "rev-parse", "HEAD").strip())
@@ -784,14 +823,18 @@ def isolated_copy(
             info["fingerprint"] = f"{head}:{overlay}"
         yield tree / repo.relative_to(top)
     finally:
-        with contextlib.suppress(RuntimeError):
-            _git(top, "worktree", "remove", "--force", str(tree))
-        if os.path.lexists(holder):
-            _force_rmtree(holder)
-        if admin is not None and admin.parent.name == "worktrees" and admin.exists():
-            shutil.rmtree(admin, ignore_errors=True)
-        if os.path.lexists(holder) or (admin is not None and admin.exists()):
-            print(f"mutation-sweep: could not fully remove the copy at {holder}", file=sys.stderr)
+        with _hold(then_stop=False):
+            # Twice: one --force refuses a locked working tree.
+            with contextlib.suppress(RuntimeError):
+                _git(top, "worktree", "remove", "--force", "--force", str(tree))
+            if os.path.lexists(holder):
+                _force_rmtree(holder)
+            if admin is not None and admin.parent.name == "worktrees" and admin.exists():
+                shutil.rmtree(admin, ignore_errors=True)
+            if os.path.lexists(holder) or (admin is not None and admin.exists()):
+                print(
+                    f"mutation-sweep: could not fully remove the copy at {holder}", file=sys.stderr
+                )
 
 
 @dataclass(frozen=True)
@@ -917,10 +960,14 @@ def _pytest(
     tmp = env.get("TMPDIR")
     where = tmp if tmp and os.path.isdir(tmp) else None  # a test may have removed it
     with tempfile.TemporaryFile(dir=where) as out, tempfile.TemporaryFile(dir=where) as err:
-        proc = subprocess.Popen(
-            cmd, cwd=str(cwd), env=env, stdout=out, stderr=err, start_new_session=True
-        )
+        proc = None
         try:
+            # Held: a raise between the child starting and this name being bound
+            # would leave nothing that could kill it.
+            with _hold():
+                proc = subprocess.Popen(
+                    cmd, cwd=str(cwd), env=env, stdout=out, stderr=err, start_new_session=True
+                )
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             _kill_group(proc.pid)
@@ -928,7 +975,8 @@ def _pytest(
                 proc.wait(timeout=10)
             raise
         finally:
-            _kill_group(proc.pid)
+            if proc is not None:
+                _kill_group(proc.pid)
         return subprocess.CompletedProcess(
             cmd,
             proc.returncode,
@@ -1307,6 +1355,8 @@ def sweep(
     available: set[str] | None = None,
     check_baseline: bool = True,
     tmp_root: Path | None = None,
+    on_start: Callable[[Case], None] | None = None,
+    on_result: Callable[[Result], None] | None = None,
 ) -> Sweep:
     """Run every baseline and every case in its OWN isolated copy of ``repo``.
 
@@ -1356,6 +1406,8 @@ def sweep(
             ):
                 groups.setdefault(_baseline_key(c, selectors), c)
         for c in groups.values():
+            if on_start:
+                on_start(c)
             info: dict = {}
             with isolated_copy(repo, tmp_root, info) as root:
                 if info["fingerprint"] != snapshot:
@@ -1397,37 +1449,47 @@ def sweep(
 
     out = Sweep()
     for case in cases:
+        _raise_if_stopped()
+        if on_start:
+            on_start(case)
         target = targets[case.path]
         if isinstance(target, str):
-            out.results.append(Result(case, ABORTED, target))
-            continue
-        # The ONE error boundary per case: results live only in `out` until the
-        # final print, so anything escaping here would lose every earlier one.
-        # Deliberately broad: a list of types missed MemoryError and
-        # RecursionError. An abort is never a pass, and the traceback is kept.
-        try:
-            out.results.append(one(case, target))
-        except Exception as exc:
-            traceback.print_exc()
-            out.results.append(
-                Result(case, ABORTED, f"this case could not finish: {type(exc).__name__}: {exc}")
-            )
+            result = Result(case, ABORTED, target)
+        else:
+            # The ONE error boundary per case: anything escaping here would end
+            # the sweep with its remaining cases unjudged and no tally. Deliberately
+            # broad: a list of types missed MemoryError and RecursionError. An abort
+            # is never a pass, and the traceback is kept. A signal's SystemExit is
+            # not an Exception, so it passes through and still cleans up.
+            try:
+                result = one(case, target)
+            except Exception as exc:
+                traceback.print_exc()
+                result = Result(
+                    case, ABORTED, f"this case could not finish: {type(exc).__name__}: {exc}"
+                )
+        out.results.append(result)
+        if on_result:
+            on_result(result)
+    _raise_if_stopped()
     return out
 
 
-def render(result: Sweep) -> str:
-    lines = []
-    for r in result.results:
-        mark = {BIT: "BIT     ", SURVIVED: "SURVIVED", ABORTED: "ABORTED "}[r.outcome]
-        lines.append(f"  {mark}  {r.case.label}")
-        if r.detail:
-            lines.append(f"            {r.detail}")
-        if r.outcome == SURVIVED:
-            lines.append(f"            expected to break: {r.case.why}")
-    lines.append("")
-    lines.append(
-        f"  {len(result.bit)} bit, {len(result.survived)} SURVIVED, {len(result.aborted)} ABORTED"
-    )
+def _render_result(r: Result) -> str:
+    mark = {BIT: "BIT     ", SURVIVED: "SURVIVED", ABORTED: "ABORTED "}[r.outcome]
+    lines = [f"  {mark}  {r.case.label}"]
+    if r.detail:
+        lines.append(f"            {r.detail}")
+    if r.outcome == SURVIVED:
+        lines.append(f"            expected to break: {r.case.why}")
+    return "\n".join(lines)
+
+
+def _render_tally(result: Sweep) -> str:
+    lines = [
+        "",
+        f"  {len(result.bit)} bit, {len(result.survived)} SURVIVED, {len(result.aborted)} ABORTED",
+    ]
     if result.survived:
         lines.append(
             "  A survivor means the test does not pin the property its "
@@ -1559,6 +1621,38 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def _stopped(signum: int, _frame: object) -> None:
+    """Record the stop, say so once, and unwind unless a held step is running. The
+    unwinding is what kills the child's group and removes the copy. SystemExit,
+    because the per-case boundary must not catch it. Raw `os.write`: a signal can
+    land inside a `print`, which is not reentrant. A closed stream must not turn
+    the stop into an error at whatever it interrupted."""
+    global _stop_signal
+    if _stop_signal is None:
+        _stop_signal = signum
+        with contextlib.suppress(OSError, ValueError):
+            os.write(
+                sys.stdout.fileno(),
+                f"  mutation-sweep: stopped by signal {signum}. Only the results printed "
+                "are verdicts; the other cases have none.\n".encode(),
+            )
+    if not _held:
+        _raise_if_stopped()
+
+
+_STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+
+
+def _catch_stop_signals() -> dict:
+    """Install `_stopped`, leaving alone a signal the caller ignored (`nohup`).
+    Returns the handlers it replaced."""
+    return {
+        each: signal.signal(each, _stopped)
+        for each in _STOP_SIGNALS
+        if signal.getsignal(each) != signal.SIG_IGN
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     # A label the stream cannot encode must not lose the report at the last step.
     sys.stdout.reconfigure(errors="backslashreplace")
@@ -1577,17 +1671,26 @@ def main(argv: list[str] | None = None) -> int:
     available = set(_str_list(doc.get("available", []), "manifest `available`")) | set(
         args.available
     )
-    result = sweep(
-        cases,
-        repo=repo,
-        python=args.python,
-        env=_str_map(doc.get("env", {}), "manifest `env`"),
-        pythonpath=("src",),
-        available=available,
-        timeout=args.timeout,
-        tmp_root=args.tmp_root,
-    )
-    print(render(result))
+    previous = _catch_stop_signals()
+    try:
+        result = sweep(
+            cases,
+            repo=repo,
+            python=args.python,
+            env=_str_map(doc.get("env", {}), "manifest `env`"),
+            pythonpath=("src",),
+            available=available,
+            timeout=args.timeout,
+            tmp_root=args.tmp_root,
+            # stderr, so the report on stdout is the same as it ever was.
+            on_start=lambda c: print(f"running: {c.label}", file=sys.stderr, flush=True),
+            on_result=lambda r: print(_render_result(r), flush=True),
+        )
+    finally:
+        for each, handler in previous.items():
+            signal.signal(each, handler)
+    _raise_if_stopped()  # a raise swallowed in a `__del__` must not reach a clean tally
+    print(_render_tally(result))
     return 0 if result.clean else 1
 
 
