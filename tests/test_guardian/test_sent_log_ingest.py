@@ -46,6 +46,7 @@ def _response(*entries, count: int | None = None, raw_lines=()) -> str:
 @pytest.fixture(autouse=True)
 def _reset_drift_flag(monkeypatch):
     monkeypatch.setattr("genesis.guardian.sent_log_ingest._drift_warned", False)
+    monkeypatch.setattr("genesis.guardian.sent_log_ingest._store_warned", False)
 
 
 class FakeRemote:
@@ -93,7 +94,7 @@ class TestIngest:
         assert await ingest_guardian_sent_log(db, remote=remote) == 2
         # Only the genuinely new row counts; the repeat is skipped, not re-offered.
         assert await ingest_guardian_sent_log(db, remote=remote) == 1
-        assert remote.since == [0.0, 1761600002.25]
+        assert remote.since == [0.0, pytest.approx(1761600002.25 - 1e-6, abs=1e-7)]
         assert [r["message_id"] for r in await _rows(db)] == [11, 12, 13]
 
     @pytest.mark.asyncio
@@ -126,7 +127,7 @@ class TestIngest:
         remote = FakeRemote((True, _response(_entry(11, ts=1761600000.5))), (True, _response()))
         await ingest_guardian_sent_log(db, remote=remote)
         await ingest_guardian_sent_log(db, remote=remote)
-        assert remote.since == [0.0, 1761600000.5]
+        assert remote.since == [0.0, pytest.approx(1761600000.5 - 1e-6, abs=1e-7)]
 
     @pytest.mark.asyncio
     async def test_future_entry_is_refused(self, db) -> None:
@@ -150,7 +151,9 @@ class TestIngest:
         assert [r["message_id"] for r in await _rows(db)] == [11, 13]
 
     @pytest.mark.asyncio
-    async def test_store_failure_skips_only_that_row(self, db) -> None:
+    async def test_store_failure_ends_the_page_and_the_next_tick_recovers(self, db) -> None:
+        """A later success would move the cursor past the failed alert, and the
+        host filters by that cursor, so the alert would be lost for good."""
         from genesis.db.crud import telegram_messages
 
         real = telegram_messages.store
@@ -160,9 +163,98 @@ class TestIngest:
                 raise RuntimeError("boom")
             await real(db_, **kw)
 
-        reply = (True, _response(_entry(11), _entry(12), _entry(13)))
+        first = _entry(11, ts=1761600001.0)
+        failing = _entry(12, ts=1761600002.0)
+        later = _entry(13, ts=1761600003.0)
+        reply = (True, _response(first, failing, later))
         with patch.object(telegram_messages, "store", side_effect=flaky):
-            assert await ingest_guardian_sent_log(db, remote=FakeRemote(reply)) == 2
+            assert await ingest_guardian_sent_log(db, remote=FakeRemote(reply)) == 1
+        assert [r["message_id"] for r in await _rows(db)] == [11]
+
+        remote = FakeRemote(reply)
+        assert await ingest_guardian_sent_log(db, remote=remote) == 2
+        assert [r["message_id"] for r in await _rows(db)] == [11, 12, 13]
+        assert remote.since == [pytest.approx(1761600001.0 - 1e-6, abs=1e-7)]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("separator", ["\u2028", "\u2029", "\u0085"])
+    async def test_unicode_line_separator_in_text_keeps_the_page(self, db, separator) -> None:
+        """The host's JSON leaves these raw. Splitting on them failed the count
+        check and refused the page on every tick."""
+        odd = json.dumps(_entry(12, text=f"cause{separator}detail"), ensure_ascii=False)
+        reply = (True, _response(_entry(11), _entry(13), raw_lines=[odd]))
+        assert await ingest_guardian_sent_log(db, remote=FakeRemote(reply)) == 3
+        assert sorted(r["message_id"] for r in await _rows(db)) == [11, 12, 13]
+
+    @pytest.mark.asyncio
+    async def test_cursor_never_rounds_past_a_shared_stamp(self, db) -> None:
+        """This stamp rounds up in microseconds, which asked past an entry sharing
+        it, so a failed store of that entry was never served again."""
+        from genesis.db.crud import telegram_messages
+
+        real = telegram_messages.store
+
+        async def flaky(db_, **kw):
+            if kw["message_id"] == 22:
+                raise RuntimeError("boom")
+            await real(db_, **kw)
+
+        ts = 1793000000.9105985
+        reply = (True, _response(_entry(21, ts=ts), _entry(22, ts=ts)))
+        with (
+            patch.object(telegram_messages, "store", side_effect=flaky),
+            patch("time.time", return_value=ts + 60),
+        ):
+            await ingest_guardian_sent_log(db, remote=FakeRemote(reply))
+        remote = FakeRemote(reply)
+        with patch("time.time", return_value=ts + 60):
+            await ingest_guardian_sent_log(db, remote=remote)
+        assert remote.since[0] <= ts
+        assert sorted(r["message_id"] for r in await _rows(db)) == [21, 22]
+
+    @pytest.mark.asyncio
+    async def test_each_store_stall_warns_again(self, db, caplog) -> None:
+        """Stored rows clear the flag, so a second stall in one process is visible."""
+        from genesis.db.crud import telegram_messages
+
+        real = telegram_messages.store
+        failing = {12}
+
+        async def flaky(db_, **kw):
+            if kw["message_id"] in failing:
+                raise RuntimeError("boom")
+            await real(db_, **kw)
+
+        with patch.object(telegram_messages, "store", side_effect=flaky):
+            await ingest_guardian_sent_log(db, remote=FakeRemote((True, _response(_entry(12)))))
+            failing.clear()
+            await ingest_guardian_sent_log(db, remote=FakeRemote((True, _response(_entry(12)))))
+            failing.add(13)
+            await ingest_guardian_sent_log(db, remote=FakeRemote((True, _response(_entry(13)))))
+        warnings = [r for r in caplog.records if "not stored" in r.getMessage() and r.levelname == "WARNING"]
+        assert len(warnings) == 2
+
+    @pytest.mark.asyncio
+    async def test_read_error_mid_page_still_reports_what_was_stored(self, db) -> None:
+        import genesis.guardian.sent_log_ingest as ingest
+
+        real = ingest._already_stored
+
+        async def flaky(db_, fields):
+            if fields["message_id"] == 12:
+                raise RuntimeError("boom")
+            return await real(db_, fields)
+
+        reply = (True, _response(_entry(11), _entry(12)))
+        with patch.object(ingest, "_already_stored", side_effect=flaky):
+            assert await ingest_guardian_sent_log(db, remote=FakeRemote(reply)) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("kind", [[], {}, 7, None, "other"])
+    async def test_bad_kind_skips_only_that_entry(self, db, kind) -> None:
+        """An unhashable kind raised out of the set test and lost the whole page."""
+        reply = (True, _response(_entry(11), _entry(12, kind=kind), _entry(13)))
+        assert await ingest_guardian_sent_log(db, remote=FakeRemote(reply)) == 2
         assert [r["message_id"] for r in await _rows(db)] == [11, 13]
 
     @pytest.mark.asyncio

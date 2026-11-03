@@ -12,6 +12,8 @@ rows already stored. The host bound is inclusive and UNIQUE(chat_id, message_id,
 direction) makes re-reading an entry a no-op, so a repeat is harmless and no
 entry at the cursor's timestamp is skipped. First run (no guardian rows) asks
 from 0; the host's own 14-day age bound and per-call page limit bound that read.
+Entries arrive oldest first, so a failed store ends the page: a later success
+would move the cursor past the failed alert and lose it for good.
 
 Tolerant of an old or broken Guardian: an unknown verb, a skew error, a timeout
 or a malformed entry is a debug-level no-op. A reachable Guardian whose response
@@ -60,6 +62,9 @@ _MAX_OUTPUT_CHARS = _MAX_LINES * (_MAX_TEXT_CHARS + 512)
 _MAX_FUTURE_S = 300.0
 # One WARNING per process when a reachable Guardian answers off-protocol.
 _drift_warned = False
+# One WARNING per process when a store fails, because the page then stops at that
+# entry until it succeeds.
+_store_warned = False
 
 
 def _is_int(value: Any) -> bool:
@@ -94,7 +99,8 @@ def _valid_entry(entry: Any) -> dict[str, Any] | None:
         text.encode("utf-8")  # a lone surrogate would fail at the SQLite bind
     except UnicodeEncodeError:
         return None
-    if entry.get("kind") not in _KINDS:
+    kind = entry.get("kind")
+    if not isinstance(kind, str) or kind not in _KINDS:
         return None
     return {
         "chat_id": chat_id,
@@ -110,7 +116,10 @@ def _parse_response(output: str) -> list[Any] | None:
     complete response (no terminal ok line, a count mismatch, oversized)."""
     if len(output) > _MAX_OUTPUT_CHARS:
         return None
-    lines = [ln for ln in output.splitlines() if ln.strip()]
+    # Only newline ends a line. splitlines() also splits on U+2028, U+2029 and
+    # U+0085, which the host's JSON leaves raw in alert text, and the count check
+    # would then refuse the whole page on every tick.
+    lines = [ln for ln in output.split("\n") if ln.strip()]
     if not lines or len(lines) > _MAX_LINES:
         return None
     try:
@@ -157,7 +166,9 @@ async def _cursor(db) -> float:
         return 0.0
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
-    return max(0.0, parsed.timestamp())
+    # One microsecond back: the stored stamp is rounded, and rounding up would
+    # ask past an entry sharing it. A repeat is deduplicated.
+    return max(0.0, parsed.timestamp() - 1e-6)
 
 
 async def _already_stored(db, fields: dict[str, Any]) -> bool:
@@ -174,9 +185,10 @@ async def ingest_guardian_sent_log(db, *, remote) -> int:
 
     Never raises: the awareness tick calls this every cycle.
     """
-    global _drift_warned
+    global _drift_warned, _store_warned
     if os.environ.get(_DISABLE_ENV) == "1":
         return 0
+    stored = 0
     try:
         since = await _cursor(db)
         ok, output = await remote.sent_log(since)
@@ -198,7 +210,6 @@ async def ingest_guardian_sent_log(db, *, remote) -> int:
 
         from genesis.db.crud import telegram_messages
 
-        stored = 0
         for raw in entries:
             fields = _valid_entry(raw)
             if fields is None:
@@ -216,12 +227,21 @@ async def ingest_guardian_sent_log(db, *, remote) -> int:
                     **fields,
                 )
             except Exception:
-                # One bad row must not abort the page: the rest still land,
-                # and the cursor moves past it with them.
-                logger.debug("Guardian sent-log entry not stored; skipped", exc_info=True)
-                continue
+                # Stop here and retry this entry next tick. Storing a later one
+                # would move the cursor past it, and the host would never serve
+                # it again.
+                if not _store_warned:
+                    _store_warned = True
+                    logger.warning(
+                        "Guardian sent-log entry not stored; retrying next tick",
+                        exc_info=True,
+                    )
+                else:
+                    logger.debug("Guardian sent-log entry not stored", exc_info=True)
+                break
             stored += 1
+            _store_warned = False  # a later stall gets its own warning
         return stored
     except Exception:
         logger.warning("Guardian sent-log ingest failed", exc_info=True)
-        return 0
+        return stored
