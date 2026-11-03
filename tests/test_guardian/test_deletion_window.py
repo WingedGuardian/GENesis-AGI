@@ -375,9 +375,17 @@ async def test_an_incomplete_window_pass_retries_after_the_settle(tmp_path) -> N
     # retries cannot stack filesystem stalls or hold every tick on timeouts.
     cfg, s = _cfg(tmp_path), _mock_snaps()
     s.last_prune_complete = False
+    s.last_delete_stuck = None
+
+    async def prune_times_out(**_kw):
+        s.last_delete_error = "timeout"
+        return 0
+
+    s.prune.side_effect = prune_times_out
     await _maintain_snapshots(cfg, s, is_healthy=True, now=INSIDE)
-    s.rotate_superseded.assert_not_called()  # stops at the failed prune
+    s.rotate_superseded.assert_not_called()  # stops at an uncertain prune failure
     s.last_prune_complete = True
+    s.prune.side_effect = None
     await _maintain_snapshots(cfg, s, is_healthy=True, now=INSIDE + timedelta(minutes=2))
     assert s.prune.await_count == 1  # still settling
     s.superseded_healthy = AsyncMock(return_value=None)  # the check listing failed
