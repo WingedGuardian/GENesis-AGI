@@ -92,6 +92,67 @@ remediation for the detected vantage — because the knob is never local:
   GiB turns the OOM cliff into a ramp. **On guardian hosts this is now
   mechanical** — see the zram layer below.
 
+## Each interactive session in its own scope (the slot door)
+
+systemd-oomd kills a whole cgroup, so what shares a cgroup dies together. Every
+interactive Claude Code session therefore starts in a systemd user scope of its
+own, `genesis-slot-<slot>-<hex>.scope` under `genesis-slots.slice`, through
+`scripts/slot_exec.sh`. The scope holds claude and everything it spawns (its MCP
+servers, subagents, tool commands), so an oomd action, or any later per-session
+limit, takes one session and nothing else.
+
+Why a wrapper is needed: a pane's claude used to inherit the cgroup of the tmux
+SERVER, and the server lives wherever its first client ran (a login session
+scope from SSH, or `genesis-server.service` when the dashboard terminal started
+it). tmux 3.4 does move each pane into a `tmux-spawn-*.scope`, but it sends the
+request without waiting for the move, so the pane shell has usually forked
+claude already and claude stays behind. Measured on a live install: every
+foreground slot's claude sat in one login scope, so the smallest thing oomd
+could kill there was every slot at once.
+
+How it works and what it changes:
+
+- `slot_exec.sh` probes that systemd will create a scope (one throwaway
+  `systemd-run --scope … true`, about 40 ms), then `exec`s `systemd-run
+  --scope`, which registers the scope and execs the command in place. The pid,
+  the terminal, the process group and the exit status are claude's own, so the
+  slot's exit capture is unchanged. The environment is unchanged too: the
+  wrapper removes the `INVOCATION_ID` systemd adds (a caller's own is kept), and supplies
+  `XDG_RUNTIME_DIR` to `systemd-run` alone when the caller lacks it.
+- If no scope can be made (no systemd user manager, no `systemd-run`, a refused
+  property), it prints one line saying so and runs the command unscoped,
+  which is the behaviour before the wrapper.
+- Launch paths that use it: every `cc-slot.sh` slot (SSH slot hostnames, manual
+  SSH, the dashboard terminal); the bashrc `claude()` wrapper when claude runs
+  interactively without taking a slot (inside tmux, or with
+  `GENESIS_NO_TMUX_WRAP=1`); an interactive `gmodel` launch; and the
+  `genesis` command a fresh `install.sh` writes to `/usr/local/bin` (written
+  once, so an existing install keeps its old copy until it is regenerated; #2116). A non-tty
+  `claude` call (a session's Bash tool running `claude mcp …`), `-p` and
+  headless runs are not wrapped: they stay in their caller's scope.
+  Background `claude -p` runs started by the server already get their own scope
+  from the invoker.
+- When `cc-slot.sh` or `lobby-door.sh` starts the tmux server (no server was
+  running), the server
+  gets `genesis-tmux-server-<hex>.scope` in `app.slice`, marked
+  `ManagedOOMPreference=omit`. Every slot's terminal belongs to the server, so
+  killing it would end every slot. A server restart can no longer end it, since
+  it is out of `genesis-server.service`'s cgroup. The omit mark takes effect
+  only once oomd monitors a cgroup the user owns (the user manager): oomd
+  ignores the mark under a root-owned monitor such as `user.slice`, per
+  systemd.resource-control(5). A running server is joined
+  as before. Panes then get tmux's own scopes in `app.slice`. A process forked
+  before tmux's late move (the pane shell's first child) lands in the server's
+  scope and shares its omit mark; that is why the slot door wraps claude even
+  when it starts in that scope.
+- Check a session: `cat /proc/<claude pid>/cgroup` ends in
+  `genesis-slots.slice/genesis-slot-<slot>-<hex>.scope`. A slot started before
+  this change keeps its old cgroup until it is relaunched.
+- The scope adds no task cap (`TasksMax=infinity`; the per-user slice budget
+  still applies) and its systemd description is the slot label, never the
+  command line. No memory limit is set on a slot scope yet. Per-slot throttle and ceiling
+  values arm only after measured per-session footprints exist.
+
 ## The zram layer (guardian hosts)
 
 `scripts/lib/host_swap.sh` gives guardian host VMs a **compressed-RAM-first

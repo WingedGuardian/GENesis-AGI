@@ -1424,6 +1424,13 @@ claude() {
         && [ -x "$genesis_root/scripts/cc-slot.sh" ] \
         && command -v tmux >/dev/null 2>&1; then
         "$genesis_root/scripts/cc-slot.sh" manual "$@"
+    elif [ -t 0 ] && [ -t 1 ] && [ -x "$genesis_root/scripts/slot_exec.sh" ]; then
+        # Interactive but not taking a slot (already inside tmux, or opted out):
+        # still give this claude a systemd scope of its own, so it is never left
+        # in a login scope that systemd-oomd would kill whole. Non-tty calls (a
+        # session's Bash tool runs `claude mcp ...` here) stay in their caller's
+        # scope.
+        "$genesis_root/scripts/slot_exec.sh" "${GENESIS_SLOT:-bare}" -- claude "$@"
     else
         command claude "$@"
     fi

@@ -125,8 +125,18 @@ _session_exists() {
 }
 
 WORKSPACE="lobby"
+# This create can be the call that STARTS the tmux server, and every slot's
+# terminal then belongs to that server. Started from an SSH door it would live in
+# the login scope; give it a scope of its own instead, exactly as cc-slot.sh does
+# (scripts/slot_exec.sh). A running server is joined unwrapped.
+_server_scope=()
+_lobby_dir=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd -P) || _lobby_dir=""
+if [ -n "$_lobby_dir" ] && [ -x "$_lobby_dir/slot_exec.sh" ] \
+        && ! tmux -u list-sessions >/dev/null 2>&1; then
+    _server_scope=("$_lobby_dir/slot_exec.sh" --unit-prefix genesis-tmux --slice app.slice --omit server --)
+fi
 _session_exists "$WORKSPACE" \
-    || tmux new-session -d -s "$WORKSPACE" 2>/dev/null
+    || "${_server_scope[@]}" tmux new-session -d -s "$WORKSPACE" 2>/dev/null
 
 # The PICKER is per-connection, so two live windows can never meet: one pid
 # cannot open two doors. Concurrency is not the only way a name can be taken,

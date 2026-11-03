@@ -829,6 +829,19 @@ verified: a8fa35a35 2026-10-23
   Recovering a slot that is alive but running no claude — detecting it, and
   rebuilding it on consent — is a SEPARATE layer and is not shipped here.
 
+- **Each interactive session in its own systemd scope** (`scripts/slot_exec.sh`,
+  called by `cc-slot.sh`, the bashrc `claude()` wrapper and interactive
+  `gmodel`). LIVE once deployed. A slot's claude runs in
+  `genesis-slots.slice/genesis-slot-<slot>-<hex>.scope`, so systemd-oomd's unit
+  of action is one session. Without it every slot's claude sat in the tmux
+  server's cgroup (tmux 3.4 moves panes into scopes without waiting, so claude
+  is forked first; MEASURED on a live install, all slots in one login scope). A
+  tmux server the door starts gets its own `app.slice` scope (out of the
+  server's cgroup; its omit mark binds once oomd monitors the user manager). No
+  per-slot memory limit yet. Falls back to an unscoped launch, loudly, without
+  a user manager. Detail: `docs/reference/memory-resilience.md`, "Each
+  interactive session in its own scope".
+
 - **Subagent-spawn lockdown — one source of truth across the restricted sessions**
   (`cc/types.SPAWN_TOOL_NAMES = ("Agent", "Task", "Workflow", "Skill")`). A restricted
   session escapes its tool restrictions if it can spawn a child that inherits a fresh,

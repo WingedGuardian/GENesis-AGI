@@ -1653,6 +1653,11 @@ if [ ! -f /usr/local/bin/genesis ]; then
 #!/bin/bash
 repo=$_repo_q
 cd "\$repo" 2>/dev/null || { echo "Genesis repo not found at \$repo"; exit 1; }
+# An interactive session gets a systemd scope of its own (scripts/slot_exec.sh),
+# so a memory-pressure kill takes this session and not the login it runs in.
+if [ -t 0 ] && [ -t 1 ] && [ "\$(id -u)" != 0 ] && [ -x "\$repo/scripts/slot_exec.sh" ]; then
+    exec "\$repo/scripts/slot_exec.sh" bare -- claude "\$@"
+fi
 exec claude "\$@"
 WRAPPER
     sudo chmod +x /usr/local/bin/genesis

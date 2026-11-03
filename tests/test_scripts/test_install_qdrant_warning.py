@@ -604,3 +604,62 @@ def test_every_sed_replacement_uses_an_ESCAPED_variable():
         "so either corrupts the rendered unit or aborts the install:\n  "
         + "\n  ".join(raw)
     )
+
+
+def _render_genesis_wrapper(repo_dir: str) -> str:
+    text = INSTALL.read_text()
+    quote_line = re.search(r"^(\s*_repo_q=.*)$", text, re.MULTILINE).group(1).strip()
+    body = re.search(
+        r"sudo tee /usr/local/bin/genesis >/dev/null <<WRAPPER\n(.*?)\nWRAPPER", text, re.DOTALL
+    ).group(1)
+    gen = subprocess.run(
+        ["bash", "-c", f'REPO_DIR="$1"\n{quote_line}\ncat <<WRAPPER\n{body}\nWRAPPER\n', "_", repo_dir],
+        capture_output=True, text=True, check=True,
+    )
+    return gen.stdout
+
+
+def test_generated_genesis_wrapper_scopes_only_an_interactive_launch(tmp_path):
+    """`genesis` on a terminal starts claude through scripts/slot_exec.sh (a
+    systemd scope of its own); a non-terminal call execs claude directly."""
+    import os
+    import pty
+    import select
+
+    repo = tmp_path / "repo"
+    (repo / "scripts").mkdir(parents=True)
+    calls = tmp_path / "calls.log"
+    stub = repo / "scripts" / "slot_exec.sh"
+    stub.write_text(f'#!/bin/bash\necho "slot_exec $*" >> {str(calls)!r}\n')
+    stub.chmod(0o755)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "claude").write_text(f'#!/bin/bash\necho "claude $*" >> {str(calls)!r}\n')
+    (bindir / "claude").chmod(0o755)
+    wrapper = tmp_path / "genesis"
+    wrapper.write_text(_render_genesis_wrapper(str(repo)))
+    wrapper.chmod(0o755)
+    env = {"PATH": f"{bindir}:/usr/bin:/bin", "HOME": str(tmp_path)}
+
+    subprocess.run([str(wrapper), "--resume", "x"], env=env, stdin=subprocess.DEVNULL,
+                   capture_output=True, timeout=10, check=False)
+    assert calls.read_text().splitlines() == ["claude --resume x"]
+
+    calls.unlink()
+    pid, fd = pty.fork()
+    if pid == 0:
+        try:
+            os.execve(str(wrapper), [str(wrapper), "--resume", "x"], env)  # noqa: S606
+        except Exception:  # noqa: BLE001
+            os._exit(127)
+    while True:
+        r, _, _ = select.select([fd], [], [], 10)
+        if not r:
+            break
+        try:
+            if not os.read(fd, 4096):
+                break
+        except OSError:
+            break
+    os.waitpid(pid, 0)
+    assert calls.read_text().splitlines() == ["slot_exec bare -- claude --resume x"]
