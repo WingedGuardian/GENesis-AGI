@@ -1341,6 +1341,11 @@ verified: a8fa35a358bc 2026-10-23
   (ready/blocked_on_trigger/deferred_cold) and DERIVE the hot(`follow_up`)/
   cold(`tabled`) lane, so priority never picks the lane; `blocked_on_trigger`
   requires a `revisit_condition` (nullable column on `follow_ups`).
+  The validator profile instead routes to eligible private user_input_needed
+  CRUD with fixed codex_interactive/NULL-session provenance, retained-key
+  creation replay and conditional update eligibility. It has no dispatch or
+  promotion authority. Dashboard mine/system partition treats codex_interactive
+  as attended alongside foreground_session.
 - GROUNDWORK: v4-parallel-dispatch, v4-surplus-tasks, v4-rate-tracking.
 
 ## 5. Information intake & research
@@ -1533,8 +1538,8 @@ Every surface a human (or host process) talks to Genesis through.
 
 ```yaml subsystem-map
 entry: channels-interfaces
-modules: [channels, dashboard, mcp, hosting, browser, mail, peers]
-verified: 74c474c0f 2026-10-24
+modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
+verified: 973a0e6 2026-10-30
 ```
 
 The neural monitor includes the non-routing **Fallback** observation, and the
@@ -1684,6 +1689,11 @@ the shared banner is not an assertion about all concurrent sessions.
   observes receipt totals without initialization or migration. This does not
   implement persistent resource quarantine or the runner's separate list/claim
   error propagation.
+  A read-only protocol observer now fences automatic consumption before any
+  reconciliation, list, claim or provider call. Explicit queue APIs still write
+  schema 2; observing known schema-3 metadata does not upgrade it. The observer
+  exposes no positive readiness result or setter; later protocol work and the
+  separate activation gates remain required.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
   deletions; native query/client cgroup proof and orphan-scope checks precede
@@ -1864,6 +1874,27 @@ the shared banner is not an assertion about all concurrent sessions.
   restricted `mail`-profile sessions. Sending is NOT here — all sends go
   through the outreach gate (entry 3). Trap: never default a recipient to the
   agent's own address (self-send loop).
+- **live_agent/**: one persistent Claude Code session driven from a program
+  through `claude-agent-sdk` (`LiveAgent`): start-or-steer turns, explicit
+  interrupt, `can_use_tool` permission asks surfaced as approvals that default
+  to deny, and a bounded progress stream (`ProgressSummarizer`, lines ≤500
+  bytes) for a voice front end. It runs the install's pinned `claude`, with
+  Claude Code's own system prompt and every settings source, so it loads hooks,
+  skills and MCP servers like a terminal and registers as an owner foreground
+  session. The host updates its initialized model and checkpoints existing rows
+  after disconnect only when the recorded child is confirmed dead; failures
+  remain visible and leave the existing reaper as fallback. Phase 0 host:
+  `scripts/live_agent_cli.py`; only the `owner_cli`
+  initiator may call `turn()` until model-initiated turns pass the
+  autonomous-CLI approval gate. Turns the session injects itself
+  (background-task notifications, peer or scheduled messages) still run, as in
+  any terminal session, and each approval line shows the tool input it would
+  run. Traps (measured once each on CLI 2.1.299, 2026-10-22): a
+  `priority: "now"` steer waits for the running tool
+  to finish, then ABORTS the turn (its own result) and runs as the next turn,
+  while `interrupt()` kills the running tool; and a host started inside
+  another Claude Code session must drop that session's identity variables
+  (`PARENT_SESSION_VARS` in the CLI), which the SDK cannot remove.
 - GROUNDWORK: unified-bridge, outreach-pipeline (channels/base.py),
   guardian-dialogue (dashboard health route).
 
@@ -2007,7 +2038,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: fbb0b6f19 2026-10-21
+verified: 0a6c219a1 2026-10-31
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -2018,6 +2049,26 @@ verified: fbb0b6f19 2026-10-21
   host reconcilers that share its version probe run on any branch).
   Config `~/.genesis/guardian_remote.yaml`; missing → silently
   disabled.
+- **Snapshot deletion window** (`guardian/deletion_window.py`): routine
+  snapshot deletions (the superseded healthy snapshot, prune, and what incus
+  would expire before the next window) wait for `snapshots.deletion_window`,
+  default 05:00-07:00 in the user's timezone, because deleting a large btrfs
+  subvolume can stall filesystem commits for minutes under quota accounting.
+  The healthy snapshot is still created on its cadence. Reserve relief and
+  delete-first never wait; early relief waits only while the pool stays above
+  its reserve until the window opens. `any` restores immediate scheduling.
+  With the window enabled, each routine deletion rechecks the live clock
+  after reserving its cooldown;
+  a failed deletion stops the batch. Read-only attempts use
+  `.last_window_attempt` for retry pacing and do not stamp pool relief's
+  `last_action`; only actual deletion candidates reserve that shared cooldown.
+  A window closing during stamp IO may leave a conservative cooldown without
+  starting a delete. DST opening calculations search real UTC instants, so a
+  wholly skipped window waits for the next real occurrence and a repeated hour
+  remains one daily pass. These are simulated-host contract tests; deployment
+  and live-host validation remain separate. Incus expiry preemption covers
+  owned non-healthy snapshots present at the pass; missed/first windows and
+  snapshots created later with short expiries can still expire outside it.
 - **Shared backup decryption (development candidate)**: the standalone
   `guardian/cred_integrity.py` file authenticates one passphrase-encrypted,
   integrity-protected message for credential recovery and backup/restore.
@@ -2228,7 +2279,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 477efb7f7 2026-10-05
+verified: 973a0e6 2026-10-30
 ```
 
 - **Peer-handoff surface (2026-09-26)**: a SessionStart hook
@@ -2525,12 +2576,23 @@ verified: 477efb7f7 2026-10-05
   `20260906234824_pr_verifications` migration docstring for the full
   New-Store-Gate justification. The CONSUMER is the **validator session**
   (`scripts/pr_verification.py`, with its doctrine in the `validating-merges`
-  skill and its readers on `repo_pulse_worker.py`). The verdict is DERIVED from the
+  skill and its readers on `repo_pulse_worker.py`). Its picker,
+  `repo_pulse_worker.py --next-for-validation`, names the ONE row to work next:
+  not-yet-done, then never-attempted, then a parked row past 7 days, never
+  fail-intent; deployed rows with an `E2E:` plan first, newest merge first. Deploy
+  is merge-commit ancestry of the serving commit, except a stacked PR, which is
+  kept and labelled because ancestry cannot prove it either way. It fails closed
+  (picks nothing) when GitHub or git cannot answer. The verdict is DERIVED from the
   validator's evidence document by `session_awareness/pr_evidence.py` (a strict
   pydantic model plus a total decision tree), never asserted by the caller — a
   caller-asserted design policed by refusal rules produced documents with no legal
-  verdict twice. Any second writer (an MCP tool is the anticipated one) must go
-  through that module; it lives in `src/` so it can. Only a PASS verdict discharges
+  verdict twice. The health MCP pr_verification_close tool uses that same policy
+  and shared CLI recording helpers, with independent PR and actual merge-commit
+  checks before previews or writes. CLI and MCP use one empty-safe attempt-note
+  formatter; fixture lookup injection stays outside the public MCP schema. Its
+  server-side calibration gate forces preview until operator opt-in, including
+  attempt notes. Real writes use a separate admitted existing-only connection;
+  preview uses SELECTs on the shared handle. Only a PASS verdict discharges
   an obligation; the other verdicts leave the row OPEN and annotate it, so a PR
   nobody could verify says why instead of looking untouched. The one non-obvious
   invariant, because the obvious one is false: a PASS verdict implies the row is
@@ -2709,7 +2771,8 @@ verified: 477efb7f7 2026-10-05
   two import-free hooks inline under a parity test) — this sweep is the WRITER
   its GROUNDWORK note named. Levers: settings domain `ledger_escalation` + env
   `GENESIS_LEDGER_ESCALATION_DISABLED`; `escalate_added_by` is a provenance
-  allow-list, foreground-only by default so the ambient extractor's PROPOSALS
+  allow-list, `foreground` + `relayed` (the owner's request written by a
+  dispatched session) by default, so the ambient extractor's PROPOSALS
   cannot ask the owner to dispose of something nobody committed to.
   **Trap: it must never write `session_ledger`** — an evidence write would bump
   `updated_at` and read as a disposition the owner never made, i.e. the sweep
@@ -2956,6 +3019,14 @@ modules: [learning, eval, experimentation, feedback, calibration, ledger, transc
 verified: 3e27b4794 2026-10-23
 ```
 
+- **eval/ego_runtime**: opt-in canonical proposal-operation probes using fresh
+  two-table SQLite fixtures, real resolution/revocation/revision/claim helpers,
+  independent committed-state reads and claim-gated artifact checks. Nine fixed
+  cases cross continuous and clean-reopen modes. No approval simulator, model or
+  candidate runtime runs; runtime comparison runners remain unbuilt. See
+  `docs/reference/ego-runtime-offline.md`.
+  This verification refresh covers the probe slice, not a new audit of the
+  whole learning/evaluation entry.
 - Verification refresh is limited to the sampled qualification-runner behavior
   below; other learning and evaluation evidence retains its dated basis.
 - **learning/skills/usage.py**: skill-usage telemetry (issue #3197), read-only
@@ -3187,7 +3258,9 @@ verified: 3e27b4794 2026-10-23
   is explicitly disabled. Contradictory served identities retain unresolved
   liability, while expense settlement cannot qualify invalid routing evidence.
   Frozen schedule/provider
-  mapping and dedicated nonreset credentials are required; any journal incident
+  mapping and explicit credential identity are required; dedicated mode retains
+  its nonreset-key policy, while shared mode requires a separately approved
+  operating plan. Any journal incident
   pauses new requests and replay until verified recovery. These checks do not
   admit more than reported or exact limit-minus-spend headroom supports. Local
   client setup precedes durable dispatch; recovery metadata uses the shared JSON
@@ -3231,9 +3304,13 @@ verified: 3e27b4794 2026-10-23
   paired population and status rules. Exploratory case and reference-class comparisons do
   not treat repeated responses as independent cases or authorize promotion.
   A credential-scoped lock precedes journal writers and credential reads. The
-  actual pre-dispatch key snapshot must fund the whole selected pending
+  dedicated-mode pre-dispatch key snapshot must fund the whole selected pending
   population, including effective/member headroom; uncertain evidence stops
-  acquisition without resending dispatched coordinates. Observed expenses and
+  acquisition without resending dispatched coordinates. An explicit version-2
+  shared-key policy uses verified experiment receipts and
+  pending allocations, without exclusive account snapshots or attributing
+  unrelated traffic to the experiment. Mode and fingerprint stay frozen across
+  dispatch and GET-only recovery. Observed expenses and
   unresolved liability remain distinct; operating allowances are not guaranteed
   invoice ceilings. Source population/cache checks at admission and completion
   invalidate scoring on detected drift, without a per-request source-integrity
@@ -3282,6 +3359,33 @@ verified: 3e27b4794 2026-10-23
   `docs/reference/headlong-native-monolith.md`.
   The reference-redaction prerequisite retains issued IDs; explicit conflicts
   stop before SDK execution and preserve existing timer/reactive pacing.
+  A private shared mechanics inventory describes the same cases without
+  replacing their predicates. The reused bridge has closed fixture source
+  attribution (`monolith` default or `ego-owned-loop`) on all native records;
+  this adds no C loop or new proposal authority.
+- **Offline C1 journal state**: `scripts/ci/ego_owned_state.py` reuses Campaign
+  for immutable manifest, intake, prepared/bound attempt and observation records.
+  External cursor, generated timer ordinals, pacing/retry and related-memory
+  pointers replay from that private journal; unresolved attempts stop automatic
+  replay. `ego_owned_loop.py` adds a finite contained adapter using the existing
+  native bridge and pinned data-only context helpers; it verifies independent
+  proposal/effect and retained child evidence before logical commit. A separate
+  four-case native smoke requires actual contained results; state tests alone
+  do not establish native C success, full workflow/Codex parity or production
+  activation. See `docs/reference/ego-owned-loop.md`.
+  The shared thirteen-case native corpus and a separate sixty-cell synthetic
+  reducer population have their own contained report, exact ID coverage and
+  mutation controls. Actual contained evidence is required; real-process crash/
+  timing/recovery and final B/C comparison remain separate qualification work.
+  A separate instrumented recovery controller declares twelve process-kill and
+  seven late-I/O cells, preserving plain-C reopen and existing container-init
+  ownership. Actual native process/cleanup evidence is required; its host tests
+  establish neither abrupt recovery nor actual clock behavior. Timing and final
+  B/C readback remain separate.
+  An additional contained actual-clock controller covers timer waits across
+  plain-CLI reopen, fixed reactive arrivals, backoff shutdown and exclusive
+  writer contention. It requires a genuine during-backoff arrival and retains
+  the complete population; injected-clock tests do not qualify those timings.
 - **experimentation/**: Crucible A/B + Evo fan-out — on-demand via MCP tools
   only; **recommend-only is the safety invariant** (no autonomous promotion,
   no live-cognition writes; Bonferroni + held-out re-validation).
@@ -3660,13 +3764,26 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py]
-verified: 8a62059720cd 2026-10-22
+verified: 973a0e6 2026-10-30
 ```
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
 provider/model/outcome. Failed historical attempts render as a warning, not an
 inferred current provider outage. The readiness worker uses the shared
 tool-disabled CC probe without changing its schedule or routing authority.
+
+Fresh dedicated validator-health trackers disable new activity persistence
+before DB attachment, retaining memory metrics and historical provider SELECTs.
+Health instrumentation then has no transaction DB, so it cannot retire another
+operation's pending transaction. Ordinary/default/external health, memory and
+other tracker construction retain their existing defaults. This is not a
+read-only-server or safe hot-toggle claim: explicit reap and job-health fallback
+behavior remain separate. See `docs/reference/codex-validator-writers.md`.
+
+Validator calibration settings validate the tracked base and prospective strict
+overlay before reporting success or writing. Invalid/unreadable configuration
+refuses with a clear message; no overlay is repaired or discarded implicitly.
+Refusing a proposed update preserves a previously valid opt-in.
 
 - **payments/**: the encrypted card vault, virtual cards only.
   `python -m genesis vault init|add|list|retire|migrate|status` (`payments/cli.py`);
@@ -3903,6 +4020,14 @@ tool-disabled CC probe without changing its schedule or routing authority.
   before draining); `DeferredWorkQueue` priorities + staleness policies;
   dead-letter replay. The `dream_synthesis_slice` worklist is deliberately
   excluded from the backlog alarm (drift-guard test pins it).
+  `StatusFileWriter` gathers runtime/DB data on-loop, then publishes immutable
+  JSON through one ordered executor job. Cancellation cannot release publication
+  admission before the actual file worker finishes. Runtime shutdown cancels the
+  minute writer loop and drains its publication before DB teardown, including
+  partial bootstrap. The status timestamp describes the collected snapshot, not
+  delayed publication; this keeps watchdog freshness checks truthful. This
+  protects event-loop responsiveness during slow status-file I/O; it does not
+  establish recovery of an independent SSH transport or shared storage.
   `NetworkSentinel` (`network_sentinel.py`) probes the open internet (DNS+TCP to
   public anchors) on a cadence and publishes a 3-state `network` axis
   (NORMAL/DEGRADED/OFFLINE) with asymmetric hysteresis — it OWNS its hysteresis
@@ -4265,6 +4390,12 @@ tool-disabled CC probe without changing its schedule or routing authority.
   rebuild (its pid named in `DEPLOY_CANDIDATES_OWN_STATE_PID`, equal to the
   engine's parent, update.lock handed over, a plain run) is neither refused nor
   retired; a run that names a pid whose row is not that run's own refuses.
+- **`update.sh`'s rollback lives in `scripts/lib/update_rollback.sh`** (#3844):
+  `_do_rollback` and the service, database and history helpers it needs, sourced
+  at startup with the other libs. The lib holds definitions, plus two lines safe to
+  run twice, so it can be sourced again; `_on_err` and `_on_signal` stay in
+  `update.sh` with the traps. A run still uses the copy on disk at launch, so a
+  rollback fix does not yet protect the update that delivers it.
 - **`update.sh` on `live`** (#2978, #3370): the merge's place, after the stop,
   is taken by the deploy-candidates engine's rebuild (`scripts/deploy_candidates.py
   rebuild`, the `live-engine` block). Everything else is main's path: one DB
@@ -4400,7 +4531,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 3e27b479 2026-10-23
+verified: c56a621b5 2026-10-24
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -4472,8 +4603,12 @@ verified: 3e27b479 2026-10-23
   scratch roots, translates asks
   to denials and preserves advisories. Six source-bound publishing-allowance
   tests retain direct evidence only; separate independent-state controls verify
-  the actual ask/refusal and existing push-cache effects. It has no ordinary configuration wiring
-  or role-specific publishing/store policy yet. See
+  the actual ask/refusal and existing push-cache effects. Its Bash-only role
+  guard independently blocks publication, main checkout moves, named live
+  service/store writes and protected output paths. Canonical optional parser
+  facts retain wrapper, assignment, source-scope and occurrence identity without
+  changing existing Segment consumers. Ordinary configuration and launcher
+  activation remain separate. See
   `docs/reference/codex-validator-boundary.md`.
   Codex has a separate external-client adapter in `.codex/config.toml`: it
   starts the existing standalone health and memory MCP servers through a
@@ -4483,8 +4618,12 @@ verified: 3e27b479 2026-10-23
   then disables processing of Claude's pending plan-bookmark file. Ordinary
   Genesis memory initialization keeps that processing enabled by default.
   The standalone server enforces the `external` or `validator` tool profile
-  during discovery and direct calls. Both currently admit the same health/recall
-  floor; other tool bodies cannot be entered through those MCP processes.
+  during discovery and direct calls. External retains its health/recall floor;
+  validator additionally admits memory_store, eligible private follow-up CRUD
+  and evidence-derived pr_verification_close, gated to preview until calibration
+  opt-in. Middleware scopes the role to each call and resets it on exit.
+  The existing memory pipeline's partial-write limits remain; these profiles
+  add no session lifecycle authority. Other tool bodies remain inadmissible.
   External health initialization skips the LLM router, dispatch queue setup,
   and campaign wiring. Profiles constrain tools, not an operator's host access.
   The separately launched validator can admit one canonical invocation of
@@ -4494,8 +4633,9 @@ verified: 3e27b479 2026-10-23
   existing deployment status tripwire, with bounded collection and scoped SIGTERM
   cancellation through owned-child cleanup. The request CLI sanitizes cancellation;
   these observations are not functional verdicts. Request creation and retirement
-  use the admitted workspace patch path. Verification recording and publication
-  remain GROUNDWORK, and this boundary has no
+  use the admitted workspace patch path. Verification recording is implemented
+  behind the calibration preview gate; publication remains GROUNDWORK. This
+  boundary has no
   activation wiring in the ordinary project configuration. Its dedicated
   launcher must establish private workspace modes and umask before activation.
   In a linked worktree the launcher sets `GENESIS_REPO_ROOT` to

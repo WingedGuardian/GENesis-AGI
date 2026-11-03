@@ -334,7 +334,7 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             validated_recipient TEXT,
             labeled_surplus     INTEGER NOT NULL DEFAULT 0,
             -- An email's own subject line, when the sender gave one. NULL = none;
-            -- the drain then falls back to the message start, as before.
+            -- the drain falls back to DEFAULT_EMAIL_SUBJECT ("Message from Genesis").
             email_subject       TEXT,
             -- NULL = live; non-NULL = cancelled at that time. Deliberately ONE
             -- column rather than a flag + timestamp like `delivered` above: this
@@ -1992,7 +1992,7 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             source_ref  TEXT,
             added_by    TEXT NOT NULL DEFAULT 'foreground'
                         CHECK(added_by IN ('foreground','ambient','pulse',
-                                           'ambient_ledger_extractor')),
+                                           'ambient_ledger_extractor','relayed')),
             evidence    TEXT,
             source_quote TEXT,   -- provenance; resolvers write `evidence`, never this
             created_at  TEXT NOT NULL,

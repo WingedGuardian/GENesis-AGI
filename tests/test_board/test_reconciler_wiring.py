@@ -61,7 +61,7 @@ def test_board_tools_are_in_the_reflection_read_allowlist():
 async def test_both_read_tools_are_registered_on_the_health_server():
     from genesis.mcp.health import mcp
 
-    registered = await mcp.get_tools()
+    registered = {tool.name: tool for tool in await mcp.list_tools()}
     assert {"board_status", "board_item", "board_promote"} <= set(registered)
 
 

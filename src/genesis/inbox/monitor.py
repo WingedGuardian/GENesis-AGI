@@ -2407,12 +2407,14 @@ class InboxMonitor:
         """Fire-and-forget deterministic memory persistence over the eval output.
 
         Whole body guarded — this runs detached and must NEVER crash or affect
-        the batch. Emits a ``memory.persisted`` event when anything is stored.
+        the batch. Emits exactly one outcome event per run (when an event bus
+        is wired): ``memory.persisted`` on stored, ``memory.extraction_outcome``
+        otherwise, WARNING on failure.
         """
         try:
             from genesis.inbox.eval_memory import extract_and_store_eval_memories
 
-            count = await extract_and_store_eval_memories(
+            outcome = await extract_and_store_eval_memories(
                 db=self._db,
                 store=self._memory_store,
                 router=self._router,
@@ -2420,16 +2422,23 @@ class InboxMonitor:
                 source_files=source_files,
                 session_id=session_id,
             )
-            if count and self._event_bus:
+            if self._event_bus:
                 from genesis.observability.types import Severity, Subsystem
 
+                failed = outcome.status == "failed"
                 await self._event_bus.emit(
                     Subsystem.INBOX,
-                    Severity.INFO,
-                    "memory.persisted",
-                    f"Stored {count} memory(ies) from inbox eval {batch_id[:8]}",
+                    Severity.WARNING if failed else Severity.INFO,
+                    "memory.persisted" if outcome.status == "stored" else "memory.extraction_outcome",
+                    f"Inbox eval-memory extraction {outcome.status}"
+                    f"{f' ({outcome.reason})' if outcome.reason else ''}"
+                    f" for batch {batch_id[:8]}",
                     batch_id=batch_id,
-                    count=count,
+                    status=outcome.status,
+                    reason=outcome.reason,
+                    extracted=outcome.extracted,
+                    stored=outcome.stored,
+                    count=outcome.stored,
                 )
         except Exception:
             logger.warning(

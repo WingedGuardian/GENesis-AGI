@@ -141,9 +141,27 @@ elif [ "$lock_rc" -ne 0 ]; then
 fi
 
 if [ ! -f "$ENTRYPOINT" ] || [ ! -f "$MARKER_PY" ]; then
-    _log "entrypoint or marker helper missing — nothing to do"
-    exit 0
+    _log "entrypoint or marker helper missing — deferring without reading the queue"
+    exit 75
 fi
+
+# Partial protocol upgrades may enqueue and expose status, but never reconcile,
+# claim, or launch automatically. Only the later strict cutover can enable this.
+# An incomplete protocol (the helper's dedicated status 10) is the expected
+# steady state until then, so it exits 0 like a busy tick. Any other status,
+# including 1 from a Python import crash or a failed log redirection, is a real
+# failure and exits 76 so the unit shows failed. This protocol has no ready
+# state yet, so status 0 is an anomaly too: it stops the tick rather than
+# proceeding, until the strict cutover defines what ready means. The helper's
+# per-tick JSON goes to /dev/null so the pause adds one log line per tick, not
+# two; its errors still reach the log.
+protocol_rc=0
+_marker automatic-ready > /dev/null 2>> "$LOG_FILE" || protocol_rc=$?
+case "$protocol_rc" in
+    0) _log "readiness helper reported ready, but this protocol has no ready state — stopping tick"; exit 76 ;;
+    10) _log "automatic queue protocol incomplete — deferring"; exit 0 ;;
+    *) _log "automatic queue protocol observation failed — stopping tick"; exit 76 ;;
+esac
 
 # Re-pend any orphaned in-flight markers from a previous run that died mid-index
 # (OOM / host stop / unit timeout). Safe here: we hold the runner flock, so no

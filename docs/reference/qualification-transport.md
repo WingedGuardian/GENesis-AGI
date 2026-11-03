@@ -16,12 +16,18 @@ The display name needs verified mapping to the pinned endpoint variant; a
 routing tag is not automatically a generation receipt's provider name.
 Other aliases, duplicate coordinates, implicit routing defaults, changed
 requests and unfunded schedules refuse before credential access.
+An explicit shared operating plan also freezes `credential_mode: "shared_existing"`
+in both the transport and every attempt; omitted mode retains the dedicated
+default. Unknown or contradictory modes refuse. The validated operating
+controller supplies the explicit dispatch mode. Read-only replay derives the
+frozen mode without reading a key.
 
 Run in a fresh isolated process with serialized judgments. Global LiteLLM
 observers and any nonempty `LITELLM_PRINT_STANDARD_LOGGING_PAYLOAD` refuse live
 execution and GET reconciliation before credential access. Even `0` and `false`
 enable that SDK printer; an empty or unset value is required. Offline retained
-answer replay does not use the SDK and remains available. The dedicated key must differ from all visible
+answer replay does not use the SDK and remains available. In the default mode,
+the dedicated key must differ from all visible
 production OpenRouter credentials and match the frozen fingerprint. Each new
 completion reads its finite nonreset limit, remaining credit and usage; explicit
 `limit_reset: null` is required. Available credit is the least of reported
@@ -35,6 +41,17 @@ in-flight overshoot, billable reasoning/framing or fees. `max_price` filters
 rates; it is not a per-request dollar cap. The later runner must still require complete admission and concrete owner
 approval of the frozen operating parameters and allowance. An approved operating
 allowance with disclosed overrun risk does not establish a hard invoice ceiling.
+
+The separately approved shared-existing mode uses only the specifically supplied
+qualification key and its frozen fingerprint, permitting that key to match a
+production credential. It retains callback isolation, credential redaction and
+temporary SDK alias restoration. It performs no key-status GET or exclusive
+account-usage claim: dispatch evidence records only the shared mode, and the
+operating controller uses experiment receipts and pending allocations. Ordinary
+account traffic is outside those receipts. GET-only recovery verifies the same
+frozen mode and fingerprint; a lost answer still requires its existing explicit
+acknowledgement and is never resent. See the version-2 plan in
+`docs/reference/qualification-runner.md`.
 
 Local HTTP client construction precedes reservation/dispatch. Failed setup
 therefore leaves no durable dispatch, and an initialized client is closed even

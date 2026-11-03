@@ -1419,6 +1419,101 @@ async def mark_surfaced(
     return cursor.rowcount
 
 
+async def carry_surfacing(
+    db: aiosqlite.Connection,
+    *,
+    source: str,
+    type: str,
+    to_id: str,
+    carry_surfaced_at: bool = True,
+) -> bool:
+    """Copy the surfacing history of the open row ``to_id`` replaces onto ``to_id``.
+
+    For writers that keep one open row per condition and replace it with a new
+    row when its text changes. Without this, every replacement starts at
+    ``surfaced_count`` 0 with ``surfaced_at`` NULL: it is shown as new again and
+    never reaches :func:`get_standing`'s threshold.
+
+    The predecessor is the newest other OPEN row of the same ``source`` and
+    ``type``, so the caller calls this after creating ``to_id`` and before
+    superseding the old row. A resolved row never carries, whatever closed it:
+    a writer whose condition persists keeps its open row's TTL running with
+    :func:`refresh_open_expiry`, so an expired row means nothing confirmed the
+    condition. ``carry_surfaced_at=False`` carries the count only and leaves the
+    new row unsurfaced (a critical row must still reach the pager). Returns
+    whether anything was carried.
+    """
+    cursor = await db.execute(
+        "SELECT surfaced_count, surfaced_at FROM observations "
+        "WHERE source = ? AND type = ? AND id != ? AND resolved = 0 "
+        "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        (source, type, to_id),
+    )
+    row = await cursor.fetchone()
+    if row is None or (not row[0] and row[1] is None):
+        return False
+    await db.execute(
+        "UPDATE observations SET surfaced_count = MAX(surfaced_count, ?), "
+        "surfaced_at = COALESCE(surfaced_at, ?) WHERE id = ?",
+        (row[0] or 0, row[1] if carry_surfaced_at else None, to_id),
+    )
+    await db.commit()
+    return True
+
+
+async def refresh_open_expiry(
+    db: aiosqlite.Connection,
+    *,
+    source: str,
+    type: str,
+    content_hash: str,
+    content: str | None = None,
+) -> int:
+    """Restart the type's TTL on the open row for this exact state.
+
+    For a writer that has just re-confirmed a condition whose create was
+    dedup-skipped: the row stays open while the condition keeps being
+    confirmed, and expires one TTL after the last confirmation rather than one
+    TTL after it was first written. ``content``, when given, replaces the row's
+    text too, for a writer whose hash deliberately ignores part of the text (a
+    count): the row then shows current numbers instead of its first ones.
+    Returns the number of rows changed (0 for a type without a TTL).
+    """
+    ttl = _compute_ttl(type)
+    if not ttl:
+        return 0
+    cursor = await db.execute(
+        "UPDATE observations SET expires_at = ?, content = COALESCE(?, content) "
+        "WHERE source = ? AND type = ? AND content_hash = ? AND resolved = 0",
+        ((datetime.now(UTC) + ttl).isoformat(), content, source, type, content_hash),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
+async def open_surfaced_ids(
+    db: aiosqlite.Connection,
+    *,
+    sources: Collection[str],
+    type: str,
+) -> list[str]:
+    """Ids of open rows of ``type`` from ``sources`` that were surfaced before.
+
+    :func:`get_unsurfaced` never returns these again, so a report that wants a
+    persisting condition to keep counting toward :func:`get_standing` passes
+    these ids to :func:`mark_surfaced` itself.
+    """
+    if not sources:
+        return []
+    placeholders = ",".join("?" for _ in sources)
+    rows = await db.execute_fetchall(
+        "SELECT id FROM observations WHERE resolved = 0 AND surfaced_at IS NOT NULL "
+        f"AND type = ? AND source IN ({placeholders})",
+        [type, *sources],
+    )
+    return [r[0] for r in rows]
+
+
 async def get_standing(
     db: aiosqlite.Connection,
     *,

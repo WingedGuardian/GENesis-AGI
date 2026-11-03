@@ -3,7 +3,7 @@
 
 Renders one line of session state that otherwise lives a command away:
 
-    <branch> · ledger:<open rows> · streak:<n>/<cap> · PR#<n>:<review state>
+    <branch> · ledger:<open rows> · PR#<n>:<review state>
 
 Wire it in user settings (``~/.claude/settings.json``), pointing at the MAIN
 checkout — run from a linked worktree the database resolves to that worktree's
@@ -29,11 +29,6 @@ cancellation, and every one of those proved to be its own source of defects.
 Sources — each read through the module that owns it, never re-implemented here:
 
 - branch: ``review_state.get_current_branch``.
-- streak: ``review_state.get_review_counters`` — the LOCAL cross-model review
-  streak the commit gate's round-2 / round-3 interventions read (branch-scoped,
-  legacy-counter aware). It is NOT the GitHub reviewed-heads budget the merge
-  and review-request gates also enforce; that needs a GitHub read and is not
-  shown here.
 - ledger: the canonical ``session_ledger`` table, read-only (WAL-aware URI,
   admission fence honoured). Deliberately NOT the ``charter.md`` mirror: writers
   outside the ledger MCP tools change the DB without refreshing it, and a
@@ -68,12 +63,11 @@ def _db_path() -> Path:
     return genesis_db_path()
 
 
-def _review_state(cwd: str | None) -> tuple[int, str, int]:
-    """(streak, branch, cap) — branch is ``"unknown"`` outside a git checkout."""
+def _branch(cwd: str | None) -> str:
+    """The current branch — ``"unknown"`` outside a git checkout."""
     import review_state
 
-    streak, _lifetime = review_state.get_review_counters(cwd)
-    return streak, review_state.get_current_branch(cwd=cwd), review_state.ESCALATION_ROUND_CAP
+    return review_state.get_current_branch(cwd=cwd)
 
 
 def _open_ledger_rows(session_id: object) -> int | None:
@@ -128,13 +122,11 @@ def render(data: dict) -> str:
         ws = data.get("workspace")
         cwd = ws.get("current_dir") if isinstance(ws, dict) else None
 
-    branch, streak = _ABSENT, f"streak:{_ABSENT}"
+    branch = _ABSENT
     try:
-        n_streak, current, cap = _review_state(cwd)
-        # "unknown" means no branch could be resolved — a 0 streak there would
-        # be a claim about a checkout that does not exist.
+        current = _branch(cwd)
         if current and current != "unknown":
-            branch, streak = current, f"streak:{n_streak}/{cap}"
+            branch = current
     except Exception:  # noqa: BLE001 — advisory display; a field degrades, the line survives
         pass
 
@@ -144,7 +136,7 @@ def render(data: dict) -> str:
         n = None
     ledger = f"ledger:{_ABSENT if n is None else n}"
 
-    return _SEP.join((branch, ledger, streak, _pr_field(data)))
+    return _SEP.join((branch, ledger, _pr_field(data)))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -166,7 +158,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         line = render(data)
     except Exception:  # noqa: BLE001 — last resort: an empty line blanks the whole status line
-        line = _SEP.join((_ABSENT, f"ledger:{_ABSENT}", f"streak:{_ABSENT}", f"PR:{_ABSENT}"))
+        line = _SEP.join((_ABSENT, f"ledger:{_ABSENT}", f"PR:{_ABSENT}"))
     print(line, flush=True)
     return 0
 

@@ -154,6 +154,9 @@ class DeepReflectionOutput:
     confidence_defaulted: bool = False
     separability: float | None = None
     alternative_assessment: str | None = None
+    # Surplus value probe: ids of the gathered surplus insights the model says
+    # it drew on. None = the model did not report the field; [] = it cited none.
+    surplus_cited: list[str] | None = None
     parse_failed: bool = False
 
 
