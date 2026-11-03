@@ -4915,6 +4915,20 @@ _GH_FLAG_TABLE: dict[tuple[str, str], tuple[frozenset[str], frozenset[str]]] = {
         frozenset({'--all', '--help', '-a'})),
 }
 
+#: ``gh issue new`` is an alias of ``gh issue create`` (``gh help issue new`` prints
+#: the create help), so it shares the row rather than falling back to the union.
+_GH_FLAG_TABLE[("issue", "new")] = _GH_FLAG_TABLE[("issue", "create")]
+
+#: The subcommands that file a new issue, and the tokens that make one open the
+#: browser instead (pflag's true spellings of ``--web``). Shared by the hooks that
+#: read an issue create, so they agree on what files one.
+GH_ISSUE_CREATE_SUBCOMMANDS = frozenset({"create", "new"})
+GH_WEB_FLAGS = frozenset({"--web", "-w"}) | frozenset(
+    f"{flag}={value}"
+    for flag in ("--web", "-w")
+    for value in ("1", "t", "T", "TRUE", "true", "True")
+)
+
 #: The UNION across every modeled row, used while the command path is still
 #: unresolved — which is exactly where gh itself applies it. MEASURED against
 #: the real CLI: ``gh -X PATCH api --help`` resolves to ``gh api`` and
@@ -5178,6 +5192,41 @@ def gh_api_request(argv: list[str]) -> GhApiRequest | None:
         has_input,
         inv.unmodelled,
     )
+
+
+def gh_option_values(argv: list[str], names: frozenset[str]) -> list[tuple[str, str | None]]:
+    """Every option in ``names`` that a ``gh`` argv carries, in argv order.
+
+    Each is ``(name, value)``: a value flag's argument (glued, ``=``-attached or the
+    next token, the last of which may start with a dash: ``-b --help`` is a body),
+    or a boolean's ``=``-attached value, or None for a bare boolean. Names are
+    matched as spelled (``-R`` and ``--repo`` are separate entries). The walk is
+    :func:`gh_api_request`'s two-phase grammar: the union of every row before the
+    command path, the resolved row after it. Returns [] for a non-``gh`` argv.
+    """
+    inv = gh_command(argv)
+    if inv is None:
+        return []
+    row = _GH_FLAG_TABLE.get((inv.group, inv.subcommand or ""))
+    post_values = row[0] if row is not None else _GH_ALL_VALUE_FLAGS
+    out: list[tuple[str, str | None]] = []
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            break
+        if not tok.startswith("-") or tok == "-":
+            i += 1
+            continue
+        flags = _GH_ALL_VALUE_FLAGS if i < inv.path_end else post_values
+        name, value = _gh_option(tok, flags)
+        if name in flags and value is None:
+            i += 1
+            value = argv[i] if i < len(argv) else ""
+        if name in names:
+            out.append((name, value))
+        i += 1
+    return out
 
 
 _GH_HELP_FLAGS = frozenset({"-h", "--help"})

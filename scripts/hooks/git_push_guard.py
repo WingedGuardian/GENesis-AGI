@@ -6281,6 +6281,7 @@ _HOOK_SURFACE_FILES = (
             "scripts/review_late.py",  # late findings the round reflection owes
             "scripts/review_deadline.py",  # aggregate hook timeout arithmetic
             "scripts/external_review.py",  # autonomous review-request boundary
+            "scripts/premise_gate.py",  # issue premise rule issue_premise_gate imports
             ".claude/settings.json",  # hook wiring (inline blob + matchers)
             # scripts/-root hooks wired via .claude/hooks/genesis-hook (which
             # resolves bare names as scripts/<name>); scripts/hooks/* wirings are
