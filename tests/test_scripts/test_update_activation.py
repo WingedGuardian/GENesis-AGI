@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_scripts._update_source import update_text
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE = REPO_ROOT / "scripts" / "update.sh"
 HYGIENE = REPO_ROOT / "scripts" / "disk_hygiene.sh"
@@ -55,7 +57,7 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 def _block(marker: str) -> str:
-    text = UPDATE.read_text()
+    text = update_text()
     match = re.search(
         rf"# BEGIN {re.escape(marker)}[^\n]*\n(.*?)# END {re.escape(marker)}", text, re.DOTALL
     )
@@ -66,7 +68,7 @@ def _block(marker: str) -> str:
 def _fetch_block() -> str:
     """From `DEPLOY_HEAD=""` to the first column-0 `fi` after it: the whole
     fetch-and-pin step, verbatim."""
-    text = UPDATE.read_text()
+    text = update_text()
     start = text.index('DEPLOY_HEAD=""\n')
     return text[start : text.index("\nfi\n", start) + 4]
 
@@ -74,7 +76,7 @@ def _fetch_block() -> str:
 def _merge_assertion_block() -> str:
     """From the merge-result capture through the assertion: the capture decides
     UPDATE_OWN_HEAD, which the assertion compares against."""
-    text = UPDATE.read_text()
+    text = update_text()
     start = text.index('_merged_head="$(git -C "$GENESIS_ROOT" rev-parse')
     check = text.index('if ! git -C "$GENESIS_ROOT" merge-base --is-ancestor "$DEPLOY_HEAD" HEAD')
     return (
@@ -281,7 +283,7 @@ def test_the_late_scan_lets_a_clean_range_through(ignored_collision, tmp_path):
 
 
 def test_the_late_scan_sits_between_the_clear_and_the_merge():
-    text = UPDATE.read_text()
+    text = update_text()
     clear = text.index("# END ephemeral-clear")
     scan = text.index("# BEGIN late-collision-scan")
     merge = text.index('merge --no-overwrite-ignore "$DEPLOY_HEAD" --no-edit')
@@ -293,7 +295,7 @@ def test_the_real_merge_line_refuses_an_ignored_file_on_a_fast_forward(tmp_path)
     appeared locally, ignored, after the scan: git refuses and the file is kept.
     The control strips only the flag and shows git overwriting it, so the flag is
     what bites."""
-    text = UPDATE.read_text()
+    text = update_text()
     line = next(
         ln
         for ln in text.splitlines()
@@ -333,7 +335,7 @@ def test_the_real_merge_line_refuses_an_ignored_file_on_a_fast_forward(tmp_path)
 
 
 def test_the_merge_takes_the_pinned_commit_and_nothing_names_the_moving_ref():
-    text = UPDATE.read_text()
+    text = update_text()
     code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
     assert 'merge --no-overwrite-ignore "$DEPLOY_HEAD" --no-edit' in code
     assert not re.search(r'merge "\$UPDATE_REMOTE/', code), "merge must not name the moving ref"
@@ -365,7 +367,7 @@ def test_a_merge_that_did_not_bring_the_pin_in_is_rolled_back(upstream_and_clone
 
 
 def test_the_merge_assertion_sits_between_the_merge_and_the_new_head_record():
-    text = UPDATE.read_text()
+    text = update_text()
     merge = text.index('merge --no-overwrite-ignore "$DEPLOY_HEAD" --no-edit')
     check = text.index('merge-base --is-ancestor "$DEPLOY_HEAD" HEAD', merge)
     # Column 0: the recompute after the merge, not the `live` helper that sets it.
@@ -599,7 +601,7 @@ def test_a_branch_switched_before_the_merge_is_rolled_back(upstream_and_clone, t
 
 
 def test_backup_runs_before_the_stop_and_the_clear_after_it():
-    text = UPDATE.read_text()
+    text = update_text()
     fetch = text.index('timeout 120 git -C "$GENESIS_ROOT" fetch')
     backup = text.index("# BEGIN ephemeral-prestop-backup")
     marker = text.index('\n_write_state "fetching"')
@@ -677,7 +679,7 @@ def test_an_unchanged_edit_is_not_backed_up_twice(dirty_checkout, tmp_path):
 
 
 def test_the_rollback_saves_edits_before_its_reset():
-    text = UPDATE.read_text()
+    text = update_text()
     start = text.index("_do_rollback() {")
     body = text[start : text.index("\n}\n", start)]
     body = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("#"))

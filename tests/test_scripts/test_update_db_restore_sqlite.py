@@ -24,6 +24,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_scripts._update_source import update_text
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE = REPO_ROOT / "scripts" / "update.sh"
 
@@ -47,7 +49,7 @@ READER = (
 def _block() -> str:
     m = re.search(
         r"# BEGIN db-restore-through-sqlite[^\n]*\n(.*?)# END db-restore-through-sqlite",
-        UPDATE.read_text(),
+        update_text(),
         re.DOTALL,
     )
     assert m, "db-restore-through-sqlite block not found"
@@ -336,7 +338,7 @@ def test_each_stopping_point_is_reported_as_what_happened(
 def _summary(landed: str) -> str:
     m = re.search(
         r"# BEGIN rollback-db-summary[^\n]*\n(.*?)        # END rollback-db-summary",
-        UPDATE.read_text(),
+        update_text(),
         re.DOTALL,
     )
     assert m
@@ -419,7 +421,7 @@ def test_an_invalid_bound_restores_nothing(tmp_path):
 
 
 def test_the_decision_restores_through_sqlite_and_never_copies():
-    text = UPDATE.read_text()
+    text = update_text()
     m = re.search(
         r"# BEGIN rollback-db-decision[^\n]*\n(.*?)# END rollback-db-decision", text, re.DOTALL
     )

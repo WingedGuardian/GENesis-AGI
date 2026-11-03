@@ -46,8 +46,8 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.test_scripts._update_source import update_text
 from tests.test_scripts.test_bootstrap_guards import (
-    UPDATE,
     _assert_recovered,
     _history,
     _migrated_genesis_root,
@@ -67,7 +67,7 @@ def _failure_file(tmp_path: Path) -> Path:
 
 def _update_sh_failure_keys() -> set[str]:
     """The keys update.sh's own writer puts in last_update_failure.json."""
-    text = UPDATE.read_text()
+    text = update_text()
     start = text.index("data = {", text.index("# Write failure context for CC to pick up."))
     block = text[start : text.index("}", start)]
     keys = set(re.findall(r"'(\w+)':\s+sys\.argv", block))
@@ -114,7 +114,7 @@ def _update_detects_recovery(tmp_path: Path, root: Path) -> bool:
     harness = (
         "#!/bin/bash\nset -Eeuo pipefail\nWERE_RUNNING=()\n"
         f'GENESIS_ROOT="{root}"\nVENV_DIR="{tmp_path / "missing-venv"}"\n'
-        + _extract_recovery_block(UPDATE.read_text())
+        + _extract_recovery_block(update_text())
         + '\nprintf "%s\\n" "${WERE_RUNNING[@]:-}"\n'
     )
     out = subprocess.run(
@@ -347,7 +347,7 @@ def _run_update_until_stop(
     afterwards is exactly what a power loss at the stop leaves. With nothing to
     stop the slice runs to its end, and the run is taken to die later (so its
     EXIT-trap cleanup never ran either)."""
-    text = UPDATE.read_text()
+    text = update_text()
     script = (
         "set -Eeuo pipefail\n"
         'STATE_FILE="$HOME/.genesis/update_state.json"\n'
@@ -386,7 +386,7 @@ def _detect(
         "set -Eeuo pipefail\n"
         f"WERE_RUNNING=({' '.join(were_running)})\n"
         f'GENESIS_ROOT="{root}"\nVENV_DIR="{tmp_path / "missing-venv"}"\n'
-        + _extract_recovery_block(UPDATE.read_text())
+        + _extract_recovery_block(update_text())
         + '\necho "WERE=${WERE_RUNNING[*]:-}"\necho "OPSTOP=$_OPERATOR_STOP"\n'
     )
     r = _sh(tmp_path, home, script, active_enter=active_enter)
@@ -514,7 +514,7 @@ def test_a_bridge_alone_with_nothing_owed_is_an_operator_stop(tmp_path):
 
 
 def _verify_loop() -> str:
-    text = UPDATE.read_text()
+    text = update_text()
     start = text.index("    # Verify services are active\n")
     return text[start : text.index("    if [[ ${#SVC_FAILED[@]} -gt 0 ]]; then", start)]
 
@@ -545,7 +545,7 @@ def _no_delta_route(
 ) -> tuple[str, list[str]]:
     """update.sh's nothing-new dispatch with nothing new, then (if it falls
     through to the full activation) its recovery detection."""
-    text = UPDATE.read_text()
+    text = update_text()
     full = _extract_recovery_block(text)
     seg = text[text.find("_OPERATOR_STOP=false") : text.find("# ── Restart services")]
     defs = full[: len(full) - len(seg)]
@@ -602,7 +602,7 @@ def _with_owed(home: Path) -> None:
 
 
 def test_the_no_delta_path_retires_it_only_when_the_server_answers_health(tmp_path):
-    text = UPDATE.read_text()
+    text = update_text()
     home = tmp_path / "home"
     for running, healthy, kept in ((True, True, False), (True, False, True), (False, True, True)):
         _with_owed(home)
@@ -624,7 +624,7 @@ def test_the_prestop_handler_never_retires_it(tmp_path):
     """The interrupt handler restarts what it stopped but checks no health, so
     even a unit that reads active pays nothing: the next update restarts and
     health-checks the server."""
-    text = UPDATE.read_text()
+    text = update_text()
     home = tmp_path / "home"
     for active in ("genesis-server", ""):
         _with_owed(home)
@@ -778,7 +778,7 @@ def test_update_sh_makes_the_restart_record_durable_before_it_counts(monkeypatch
     """Codex P1 (4316956958): a rename alone is atomic, not durable. The record is
     fsynced before the rename and its directory after it, so a power loss after
     the stop cannot lose it."""
-    source = _owed_writer_source(UPDATE.read_text(), "_owe_server_restart() {")
+    source = _owed_writer_source(update_text(), "_owe_server_restart() {")
     (tmp_path / "g").mkdir()
     path = tmp_path / "g" / "server_restart_owed.json"
     events = _run_writer(monkeypatch, tmp_path, source, [str(path), "123", "s"])
@@ -787,7 +787,7 @@ def test_update_sh_makes_the_restart_record_durable_before_it_counts(monkeypatch
 
 
 def test_a_record_that_cannot_be_synced_refuses_the_stop(monkeypatch, tmp_path):
-    source = _owed_writer_source(UPDATE.read_text(), "_owe_server_restart() {")
+    source = _owed_writer_source(update_text(), "_owe_server_restart() {")
     (tmp_path / "g").mkdir()
     path = tmp_path / "g" / "server_restart_owed.json"
 
@@ -893,7 +893,7 @@ def test_bootstraps_record_is_not_paid_by_an_activation_after_the_crash(tmp_path
 
 
 def _p6_health_loop() -> str:
-    text = UPDATE.read_text()
+    text = update_text()
     start = text.index("    # ── Health verification with retry (FATAL on failure) ─")
     return text[start : text.index('    if [ "$HEALTH_OK" = "true" ]; then', start)]
 
@@ -903,7 +903,7 @@ def test_only_a_passing_p6_health_check_retires_the_debt_at_the_check(tmp_path):
     a kill right after it (the direct-start fallback has no unit for anything to
     read) leaves no debt for a server that is up and answering. A unit that reads
     active but never answers keeps it: active is not healthy."""
-    text = UPDATE.read_text()
+    text = update_text()
     for active, healthy, kept in (
         ("genesis-server", "1", False),
         ("genesis-server", "", True),
@@ -934,7 +934,7 @@ def test_only_a_passing_p6_health_check_retires_the_debt_at_the_check(tmp_path):
 def test_the_success_path_has_no_later_retirement():
     """The late success-path removal is gone: P6's check is the one place on the
     full activation, so nothing after it can pay a debt the check did not."""
-    text = UPDATE.read_text()
+    text = update_text()
     start = text.index("# ── Clear update failure file on success")
     block = text[start : text.index("# ── Record success in update_history", start)]
     assert "SERVER_RESTART_OWED" not in block
@@ -1001,7 +1001,7 @@ def test_a_rollback_records_the_restart_before_it_stops_the_server(tmp_path):
     rolls back (a service that failed to start). The rollback stops the server
     again, so it owes the restart first: a kill at its stop leaves the record. A
     server this run never restarted gets none."""
-    text = UPDATE.read_text()
+    text = update_text()
     for were, owed in (("genesis-server genesis-bridge", True), ("genesis-bridge", False)):
         home = tmp_path / f"home-{owed}"
         (home / ".genesis").mkdir(parents=True)
@@ -1093,7 +1093,7 @@ def test_update_sh_turns_a_crashed_stop_into_the_record_before_overwriting_it(
     """The prior-state guard passed a crashed run's state, which this run's own
     state write would overwrite. When it says that run stopped genesis-server,
     the record is written first, so the evidence is never consumed unsaved."""
-    text = UPDATE.read_text()
+    text = update_text()
     home = tmp_path / "home"
     (home / ".genesis").mkdir(parents=True)
     (home / ".genesis" / "update_state.json").write_text(json.dumps(state))
@@ -1110,7 +1110,7 @@ def test_update_sh_turns_a_crashed_stop_into_the_record_before_overwriting_it(
 
 
 def test_update_sh_refuses_when_a_crashed_stop_cannot_be_recorded(tmp_path):
-    text = UPDATE.read_text()
+    text = update_text()
     home = tmp_path / "home"
     (home / ".genesis" / "server_restart_owed.json.tmp").mkdir(parents=True)
     state_path = home / ".genesis" / "update_state.json"
