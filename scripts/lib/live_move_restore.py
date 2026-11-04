@@ -150,6 +150,78 @@ def _row_problem(row: dict, parents) -> str | None:
     return None
 
 
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+_MODE = re.compile(r"[0-7]{4}")
+
+
+def _record(r: object) -> bool:
+    """One SAVED.json record, exactly as the writer's _copy_node writes it."""
+    if not isinstance(r, dict):
+        return False
+    kind = r.get("type")
+    if kind == "file":
+        sha = r.get("sha256")
+        return (
+            set(r) == {"type", "mode", "sha256"}
+            and isinstance(r["mode"], str)
+            and _MODE.fullmatch(r["mode"]) is not None
+            and (sha is None or (isinstance(sha, str) and _SHA256.fullmatch(sha) is not None))
+        )
+    if kind == "fifo":
+        mode = r.get("mode")
+        return set(r) == {"type", "mode"} and isinstance(mode, str) and bool(_MODE.fullmatch(mode))
+    if kind == "symlink":
+        t = r.get("target")
+        if set(r) != {"type", "target"} or not isinstance(t, str) or not t or "\0" in t:
+            return False
+        try:
+            return len(os.fsencode(t)) <= PATH_BYTES
+        except UnicodeError:
+            return False
+    return False
+
+
+def saved_problem(rp, backup: str) -> str | None:
+    """Why the report's SAVED.json (the integrity record REPAIR.json names) is
+    not one the writer wrote, else None. Opened as load_report opens
+    REPAIR.json: no symlink followed, no FIFO blocked on, a regular file of at
+    most SAVED_BYTES, holding exactly {files, complete}: `tree/<path>` keys
+    and the writer's three record shapes. Only the shape: whether a copy still
+    matches its record is the restore's to check (B2b)."""
+    try:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        fd = os.open(os.path.join(backup, "SAVED.json"), flags)
+    except OSError as exc:
+        return f"cannot be opened ({exc.strerror})"
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return "not a regular file"
+        chunks, size = [], 0
+        while size <= rp.SAVED_BYTES and (chunk := os.read(fd, rp.SAVED_BYTES + 1 - size)):
+            chunks.append(chunk)
+            size += len(chunk)
+    except OSError as exc:
+        return f"cannot be read ({exc.strerror})"
+    finally:
+        os.close(fd)
+    if size > rp.SAVED_BYTES:
+        return f"over {rp.SAVED_BYTES} bytes"
+    try:
+        saved = json.loads(b"".join(chunks))
+    except (ValueError, RecursionError):
+        return "not JSON"
+    if not isinstance(saved, dict) or set(saved) != {"files", "complete"}:
+        return "not {files, complete}"
+    if not isinstance(saved["complete"], bool) or not isinstance(saved["files"], dict):
+        return "files or complete"
+    if len(saved["files"]) > ENTRIES:
+        return f"over {ENTRIES} records"
+    for key, r in saved["files"].items():
+        if not (key.startswith("tree/") and _path(key[len("tree/") :])) or not _record(r):
+            return f"record {json.dumps(key)[:200]}"
+    return None
+
+
 def problem(loaded: dict, budget: int, parents) -> str | None:
     """Why a loaded report is not one the writer wrote, else None. Paths are
     bounded first, Σ len(path) x depth over the rows at most ``budget``, so the
@@ -572,6 +644,14 @@ def check(rp, repo: str, backup: str, say) -> int:
     if why := problem(loaded, rp.REPORT_BYTES, rp._parents):
         say(f"report {ts} other:bad-report ({why}); nothing judged")
         return 1
+    # A report written before the integrity record existed names none: it is
+    # judged as before (the restore refuses its node parts `no-hash`).
+    if "integrity" in loaded["report"]:
+        named = loaded["report"]["integrity"]
+        why = saved_problem(rp, backup) if named == "SAVED.json" else "integrity names another file"
+        if why:
+            say(f"report {ts} other:bad-report (SAVED.json: {why}); nothing judged")
+            return 1
     newer, why = _newer_paths(rp, repo, os.path.dirname(backup), ts)
     if newer is None:
         say(f"report {ts} other:newer-report-unreadable ({why}); nothing judged")
