@@ -10,6 +10,7 @@ CLI output, one ``key=value`` per line::
     remote=<rclone remote, or empty when the sync is off>
     watch_path=<inbox directory>
     heartbeat=<heartbeat file path>
+    genesis_home=<the Genesis home the script's children must use>
 
 Exit codes: 0 ok (including "off"), 2 the configured remote is invalid, 1 the
 config could not be read. The script refuses to run on anything but 0, so a
@@ -18,11 +19,12 @@ broken config stops the sync loudly instead of reading as "off".
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
 
-from genesis.env import genesis_home, repo_root
+from genesis.env import genesis_home, repo_root, secrets_path
 
 # Characters no config value handed to the script may contain: C0 and C1
 # controls (a newline would inject a second ``key=`` line into the output the
@@ -33,6 +35,7 @@ _UNSAFE_CHARS = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029\u200e\u200f\u202a-\u
 # An rclone remote: a remote name (not starting with "-", so it can never be
 # read as an option), a colon, then a path.
 _REMOTE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*:.*$", re.DOTALL)
+_SECRET_OVERRIDES = ("GENESIS_INBOX_PATH", "GENESIS_HOME")
 
 
 def remote_is_valid(remote: str) -> bool:
@@ -78,6 +81,27 @@ def heartbeat_path() -> Path:
     return genesis_home() / "state" / "inbox_sync.json"
 
 
+def apply_secret_overrides() -> None:
+    """Take the path overrides the server gets from ``secrets.env``, and only those.
+
+    The server loads that file into its environment, so without this the sync
+    could mirror one inbox while the server watches another, and write a
+    heartbeat the health check never reads. Only these keys are read, because
+    this process's children (rclone) have no use for the rest of the file. The
+    file wins over the process environment, as it does for the server.
+    """
+    from dotenv import dotenv_values
+
+    secrets = secrets_path()
+    if not secrets.is_file():
+        return
+    values = dotenv_values(secrets)
+    for key in _SECRET_OVERRIDES:
+        value = values.get(key)
+        if value:
+            os.environ[key] = value
+
+
 def load_sync_settings() -> tuple[str, Path]:
     """Return ``(sync_remote, watch_path)`` from the inbox config and overlay.
 
@@ -92,6 +116,7 @@ def load_sync_settings() -> tuple[str, Path]:
 
 def main() -> int:
     try:
+        apply_secret_overrides()
         remote, watch_path = load_sync_settings()
     except Exception as exc:  # noqa: BLE001 — reported, and the script refuses to run
         print(f"inbox sync config could not be read: {type(exc).__name__}: {exc}", file=sys.stderr)
@@ -110,12 +135,14 @@ def main() -> int:
             )
             return 2
     heartbeat = heartbeat_path()
-    if _UNSAFE_CHARS.search(str(heartbeat)):
-        print("the heartbeat path contains control characters", file=sys.stderr)
+    home = genesis_home()
+    if _UNSAFE_CHARS.search(str(heartbeat)) or _UNSAFE_CHARS.search(str(home)):
+        print("the Genesis home path contains control characters", file=sys.stderr)
         return 2
     print(f"remote={remote}")
     print(f"watch_path={watch_path}")
     print(f"heartbeat={heartbeat}")
+    print(f"genesis_home={home}")
     return 0
 
 

@@ -786,6 +786,118 @@ def test_failed_pull_is_not_an_ok_cycle(tmp_path):
     assert "Pull failed (rc=3)" in log.read_text()
 
 
+def test_failed_post_push_listing_is_not_an_ok_cycle(tmp_path):
+    """What the cycle uploaded is off the record, so last_ok must not advance."""
+    env, inbox, log, _ = _setup(tmp_path)
+    _use_vault_dir(env, tmp_path)
+    _old_response_file(inbox, "New-1.genesis.md")
+    _set_record(inbox, [])
+    env["RCLONE_LSF_FAIL_ON"] = "2"
+
+    assert _run(env).returncode == 0
+    assert _heartbeat(env)["last_ok"] == ""
+    assert "record failed" in log.read_text()
+
+
+def test_held_response_stays_out_across_a_failed_listing(tmp_path):
+    """The age gate lets a young file through, so a held one needs its name."""
+    env, inbox, _, _ = _setup(tmp_path)
+    vault = _use_vault_dir(env, tmp_path)
+    _refuse_the_trash(env, tmp_path)
+    held = _old_response_file(inbox, "Held [draft]-1.genesis.md")
+    _set_record(inbox, [held.name])
+
+    assert _run(env).returncode == 0
+    os.utime(held)  # now young enough to pass --max-age
+    env["RCLONE_LSF_RC"] = "1"
+
+    assert _run(env).returncode == 0
+    assert not (vault / held.name).exists(), "a held response was re-uploaded"
+    assert "--max-age" in _copy_calls(Path(env["RCLONE_CALL_LOG"]))[-1]
+
+
+def test_failed_listing_keeps_recorded_responses_out_and_ships_new_ones(tmp_path):
+    """A young recorded response may be a vault deletion. A never-seen one is not."""
+    env, inbox, _, _ = _setup(tmp_path)
+    vault = _use_vault_dir(env, tmp_path)
+    recorded = _old_response_file(inbox, "Recorded-1.genesis.md")
+    fresh = _old_response_file(inbox, "Fresh-1.genesis.md")
+    _set_record(inbox, [recorded.name])
+    os.utime(recorded)
+    os.utime(fresh)
+    env["RCLONE_LSF_RC"] = "1"
+
+    assert _run(env).returncode == 0
+    assert not (vault / recorded.name).exists(), "a vault deletion was re-uploaded"
+    assert (vault / fresh.name).exists(), "a never-seen response stopped shipping"
+
+
+def test_a_record_for_another_remote_excludes_nothing(tmp_path):
+    env, inbox, _, _ = _setup(tmp_path)
+    vault = _use_vault_dir(env, tmp_path)
+    fresh = _old_response_file(inbox, "Fresh-1.genesis.md")
+    _set_record(inbox, [fresh.name], remote="other:vault")
+    os.utime(fresh)
+    env["RCLONE_LSF_RC"] = "1"
+
+    assert _run(env).returncode == 0
+    assert (vault / fresh.name).exists()
+
+
+def test_an_unreadable_record_on_a_failed_listing_says_so(tmp_path):
+    env, inbox, log, _ = _setup(tmp_path)
+    record = _set_record(inbox, [])
+    record.chmod(0o000)
+    env["RCLONE_LSF_RC"] = "1"
+    try:
+        assert _run(env).returncode == 0
+    finally:
+        record.chmod(0o600)
+    assert "could not read the vault record" in log.read_text()
+
+
+def test_a_directory_at_the_record_path_is_not_an_ok_cycle(tmp_path):
+    """Plain mv would move the record inside it and report success."""
+    env, inbox, log, _ = _setup(tmp_path)
+    _use_vault_dir(env, tmp_path)
+    (inbox / ".genesis-seen-in-vault").mkdir()
+
+    assert _run(env).returncode == 0
+    assert _heartbeat(env)["last_ok"] == ""
+    assert "could not write the vault record" in log.read_text()
+
+
+def test_a_directory_at_the_filter_path_stops_the_push(tmp_path):
+    env, inbox, log, call_log = _setup(tmp_path)
+    _use_vault_dir(env, tmp_path)
+    (inbox / ".genesis-push-filter").mkdir()
+
+    assert _run(env).returncode == 0
+    assert not _copy_calls(call_log)
+    assert "Push skipped: could not write the push filter" in log.read_text()
+    assert _heartbeat(env)["last_ok"] == ""
+
+
+def test_secrets_env_overrides_reach_the_sync(tmp_path):
+    env, inbox, _, _ = _setup(tmp_path)
+    other = tmp_path / "other-home"
+    other.mkdir()
+    (Path(env["GENESIS_REPO_ROOT"]) / "secrets.env").write_text(
+        f"GENESIS_HOME={other}\nUNRELATED_SECRET=abc\n"
+    )
+    default = Path(env.pop("GENESIS_HOME"))
+    env["HOME"] = str(default.parent)
+    _use_vault_dir(env, tmp_path)
+    deleted = _old_response_file(inbox, "Deleted-1.genesis.md")
+    _set_record(inbox, [deleted.name])
+
+    assert _run(env).returncode == 0
+    assert (other / "state" / "inbox_sync.json").exists()
+    # The trash runs in a child, so it needs the same home.
+    assert not deleted.exists()
+    assert list((other / "trash").glob("*/tombstone.json"))
+
+
 def test_failed_push_is_not_an_ok_cycle(tmp_path):
     env, inbox, _, _ = _setup(tmp_path)
     _use_vault_dir(env, tmp_path)

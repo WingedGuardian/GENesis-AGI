@@ -68,6 +68,16 @@ def test_empty_last_ok_is_stale():
     assert p.key == "stale" and "ever" in p.message
 
 
+def test_a_naive_last_ok_is_stale_and_does_not_raise():
+    [p] = assess(_REMOTE, _hb("2026-10-28T18:00:00"), _NOW)
+    assert p.key == "stale"
+
+
+def test_an_impossible_held_count_is_unreadable_and_does_not_raise():
+    [p] = assess(_REMOTE, '{"last_ok": "2026-10-28T18:00:00Z", "held": Infinity}', _NOW)
+    assert p.key == "unreadable"
+
+
 def test_unreadable_heartbeat_is_reported_not_ignored():
     for text in ("not json", "[1, 2]", '{"held": "x"}'):
         [p] = assess(_REMOTE, text, _NOW)

@@ -49,6 +49,7 @@ fi
 REMOTE=$(printf '%s\n' "$CFG" | sed -n 's/^remote=//p')
 LOCAL_PATH=$(printf '%s\n' "$CFG" | sed -n 's/^watch_path=//p')
 HEARTBEAT=$(printf '%s\n' "$CFG" | sed -n 's/^heartbeat=//p')
+CFG_HOME=$(printf '%s\n' "$CFG" | sed -n 's/^genesis_home=//p')
 if [ -z "$REMOTE" ]; then
     # Off on this install: nothing to sync, nothing to watch, nothing logged
     # (the timer fires every 5 minutes on every install). Except one case: a
@@ -64,13 +65,13 @@ fi
 # Exactly one line per key, or nothing is trusted: a value carrying a newline
 # would otherwise smuggle a second key= line in (sync_config refuses control
 # characters too; this is the script's own check of what it was handed).
-for key in remote watch_path heartbeat; do
+for key in remote watch_path heartbeat genesis_home; do
     if [ "$(printf '%s\n' "$CFG" | grep -c "^$key=")" -ne 1 ]; then
         echo "--- $(_stamp) REFUSED: inbox sync config output does not carry exactly one $key= line ---" >> "$LOG"
         exit 1
     fi
 done
-if [ -z "$LOCAL_PATH" ] || [ -z "$HEARTBEAT" ]; then
+if [ -z "$LOCAL_PATH" ] || [ -z "$HEARTBEAT" ] || [ -z "$CFG_HOME" ]; then
     echo "--- $(_stamp) REFUSED: inbox sync config incomplete: $(printf '%s' "$CFG" | tr -d '[:cntrl:]') ---" >> "$LOG"
     exit 1
 fi
@@ -79,6 +80,8 @@ fi
 [ "$LOCAL_PATH" != "/" ] && LOCAL_PATH="${LOCAL_PATH%/}"
 
 mkdir -p "$LOCAL_PATH"
+# genesis.trash below must use the home the config reader resolved.
+export GENESIS_HOME="$CFG_HOME"
 
 # Single-flight: an API outage can stretch a cycle past the 5-min cron period
 # (rclone retries); overlapping runs would interleave deletions and log lines.
@@ -161,12 +164,13 @@ _shown() {
     PUSH_MAX_AGE=""
     LISTING_OK=""
     HELD=""
+    PUSH_EXCLUDE=""
     # A state path that is not a regular file (a directory left by an older
     # mirror, say) would make the record unreadable and every cycle a silent
     # "seed": say so on every cycle until someone removes it.
     for state in "$SEEN" "$FILTER" "$LSF_ERR"; do
         if [ -e "$state" ] && { [ -d "$state" ] || [ ! -f "$state" ]; } && [ ! -L "$state" ]; then
-            echo "WARNING: state path is not a regular file, so cleanup cannot run: $(_shown "$state")"
+            echo "WARNING: state path is not a regular file, so this cycle cannot complete: $(_shown "$state")"
         fi
     done
     # Never write state through a pre-planted symlink (defense-in-depth;
@@ -236,6 +240,18 @@ _shown() {
         # responses (<10min) still ship promptly.
         PUSH_MAX_AGE="10m"
         echo "SKIP cleanup: vault listing failed (rc=$lsf_rc) — refusing to treat an empty listing as mass deletion; holding back push of >${PUSH_MAX_AGE} files. rclone stderr: $(tr -d '[:cntrl:]' < "$LSF_ERR" 2>/dev/null)"
+        # The age gate alone does not protect a young file: a response the
+        # vault has been seen to hold may have been deleted there, and
+        # --max-age also hides an older vault copy from --ignore-existing, so
+        # the push could overwrite it. Everything on record stays out by name
+        # (held responses are on record too); a never-seen young one still ships.
+        if [ -f "$SEEN" ] && [ ! -L "$SEEN" ]; then
+            if ! record_lines=$(cat -- "$SEEN" 2>&1); then
+                echo "WARNING: could not read the vault record ($SEEN), so only the age gate protects this push: $(_shown "$record_lines")"
+            elif [ "$(printf '%s\n' "$record_lines" | head -n 1)" = "$RECORD_HEADER" ]; then
+                PUSH_EXCLUDE=$(printf '%s\n' "$record_lines" | tail -n +2)
+            fi
+        fi
     fi
 
     # 3. Push: local .genesis.md files → Dropbox (responses back to vault).
@@ -244,29 +260,33 @@ _shown() {
     #    a local file that happens to reuse its path).
     #    On a failed-listing cycle PUSH_MAX_AGE gates this to fresh files only
     #    (see step 2) so a not-yet-cleaned deletion can't be re-uploaded.
-    #    On a healthy cycle, exclude HELD and already-listed responses by
-    #    name. Responses are write-once; a deletion after the initial listing
-    #    must not turn into a new upload before the next cleanup cycle.
-    if [ -n "$PUSH_MAX_AGE" ]; then
-        rclone copy "$LOCAL_PATH" "$REMOTE" \
-            --include "*.genesis.md" \
-            --ignore-existing \
-            --max-age "$PUSH_MAX_AGE" \
-            --verbose 2>&1
-        push_rc=$?
-    else
-        {
-            while IFS= read -r h; do
-                [ -n "$h" ] && printf -- '- %s\n' "$(_filter_literal "$h")"
-            done <<< "$HELD
-$REMOTE_GENESIS"
-            printf '%s\n' '+ *.genesis.md' '- **'
-        } > "$FILTER"
+    #    Every cycle excludes HELD and already-listed responses by name, and a
+    #    failed-listing cycle excludes everything on record (see step 2).
+    #    Responses are write-once; a deletion after the initial listing must
+    #    not turn into a new upload before the next cleanup cycle. An empty or
+    #    partial filter would ship the whole inbox, so the filter must be
+    #    complete before it is used, or nothing is pushed.
+    push_age=()
+    [ -n "$PUSH_MAX_AGE" ] && push_age=(--max-age "$PUSH_MAX_AGE")
+    rm -f -- "$FILTER.tmp"
+    if {
+        while IFS= read -r h; do
+            [ -n "$h" ] && printf -- '- %s\n' "$(_filter_literal "$h")"
+        done <<< "$HELD
+${REMOTE_GENESIS:-}
+$PUSH_EXCLUDE"
+        printf '%s\n' '+ *.genesis.md' '- **'
+    } > "$FILTER.tmp" && [ "$(tail -n 1 -- "$FILTER.tmp")" = '- **' ] && mv -fT -- "$FILTER.tmp" "$FILTER"; then
         rclone copy "$LOCAL_PATH" "$REMOTE" \
             --filter-from "$FILTER" \
             --ignore-existing \
+            "${push_age[@]}" \
             --verbose 2>&1
         push_rc=$?
+    else
+        rm -f -- "$FILTER.tmp"
+        push_rc=1
+        echo "Push skipped: could not write the push filter ($FILTER)"
     fi
     [ "$push_rc" -ne 0 ] && echo "Push failed (rc=$push_rc); unlanded responses stay unseen and are retried next cycle"
 
@@ -284,23 +304,32 @@ $REMOTE_GENESIS"
     #    deleted before the next healthy one is re-uploaded once). Written
     #    atomically: a cycle killed mid-write leaves the previous record, never
     #    a truncated one.
+    RECORD_OK=""
     if [ -n "$LISTING_OK" ]; then
+        RECORD_OK=1
         if ! AFTER_PUSH=$(rclone lsf -R --files-only "$REMOTE" --include "*.genesis.md" 2>>"$LSF_ERR"); then
             echo "Record: post-push listing failed; recording the pre-push listing"
             AFTER_PUSH=""
+            # What this cycle uploaded is not on record, so a deletion of it
+            # would be re-uploaded: the cycle is not ok.
+            RECORD_OK=""
         fi
         rm -f -- "$SEEN.tmp"
+        # mv -T: plain mv moves the file INTO a directory left at this path and
+        # returns 0, which would read as a written record.
         if { printf '%s\n' "$RECORD_HEADER"
-             printf '%s\n%s\n%s' "$REMOTE_GENESIS" "$AFTER_PUSH" "$HELD" | sed '/^$/d' | sort -u; } > "$SEEN.tmp"; then
-            mv -f -- "$SEEN.tmp" "$SEEN"
+             printf '%s\n%s\n%s' "$REMOTE_GENESIS" "$AFTER_PUSH" "$HELD" | sed '/^$/d' | sort -u; } > "$SEEN.tmp" \
+            && mv -fT -- "$SEEN.tmp" "$SEEN"; then
+            :
         else
             rm -f -- "$SEEN.tmp"
             echo "WARNING: could not write the vault record ($SEEN); the previous record is kept"
+            RECORD_OK=""
         fi
     fi
 
     # 5. Heartbeat. "Ok" means the whole cycle worked: the pull, a healthy
-    #    listing and the push. last_ok keeps its previous value when this cycle
+    #    listing, the push and the record. last_ok keeps its previous value when this cycle
     #    was not ok, so a sync that runs but keeps failing goes stale too.
     #    held = responses the trash refused this cycle (alerted on while
     #    non-zero: a deletion that cannot apply). Written atomically.
@@ -314,16 +343,20 @@ $REMOTE_GENESIS"
     # held is measured only on a healthy listing; a failed-listing cycle keeps
     # the previous count, so the held alert does not clear and re-fire.
     [ -n "$LISTING_OK" ] || held="${prev_held:-0}"
-    if [ "$pull_rc" -eq 0 ] && [ -n "$LISTING_OK" ] && [ "$push_rc" -eq 0 ]; then
+    if [ "$pull_rc" -eq 0 ] && [ -n "$LISTING_OK" ] && [ "$push_rc" -eq 0 ] && [ -n "$RECORD_OK" ]; then
         last_ok="$now"
     else
         listing_state="failed"
         [ -n "$LISTING_OK" ] && listing_state="ok"
-        echo "Heartbeat: cycle not ok (pull rc=$pull_rc, listing $listing_state, push rc=$push_rc)"
+        record_state="failed"
+        [ -n "$RECORD_OK" ] && record_state="ok"
+        [ -n "$LISTING_OK" ] || record_state="not written"
+        echo "Heartbeat: cycle not ok (pull rc=$pull_rc, listing $listing_state, push rc=$push_rc, record $record_state)"
     fi
     mkdir -p "$(dirname "$HEARTBEAT")"
-    if printf '{"last_run": "%s", "last_ok": "%s", "held": %d}\n' "$now" "$last_ok" "${held:-0}" > "$HEARTBEAT.tmp"; then
-        mv -f -- "$HEARTBEAT.tmp" "$HEARTBEAT"
+    if printf '{"last_run": "%s", "last_ok": "%s", "held": %d}\n' "$now" "$last_ok" "${held:-0}" > "$HEARTBEAT.tmp" \
+        && mv -fT -- "$HEARTBEAT.tmp" "$HEARTBEAT"; then
+        :
     else
         rm -f -- "$HEARTBEAT.tmp"
         echo "WARNING: could not write the heartbeat ($HEARTBEAT)"

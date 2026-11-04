@@ -3,6 +3,7 @@ staleness check share (#3183)."""
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,47 @@ def test_sync_remote_defaults_to_off():
     assert cfg.sync_remote == ""
 
 
+_real_overrides = sync_config.apply_secret_overrides
+
+
+@pytest.fixture(autouse=True)
+def _no_real_secrets(monkeypatch):
+    """main() must not read this checkout's own secrets.env into the test process."""
+    monkeypatch.setattr(sync_config, "apply_secret_overrides", lambda: None)
+
+
+@pytest.mark.parametrize("value, kept", [("false", "False"), ("0", "0")])
+def test_a_falsy_sync_remote_stays_set_and_is_refused(value, kept):
+    cfg = load_inbox_config_from_string(
+        f"inbox_monitor:\n  watch_path: /tmp/inbox\n  sync_remote: {value}\n"
+    )
+    assert cfg.sync_remote == kept
+    assert not sync_config.remote_is_valid(cfg.sync_remote)
+
+
+def test_secret_overrides_take_only_their_own_keys(monkeypatch, tmp_path):
+    monkeypatch.setenv("SECRETS_PATH", str(tmp_path / "named-by-the-resolver.env"))
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "loses"))
+    # setenv first so the teardown removes what the override writes: delenv
+    # records nothing for an absent variable.
+    monkeypatch.setenv("GENESIS_INBOX_PATH", "placeholder")
+    monkeypatch.delenv("GENESIS_INBOX_PATH")
+    monkeypatch.delenv("UNRELATED_SECRET", raising=False)
+    (tmp_path / "named-by-the-resolver.env").write_text(
+        "GENESIS_HOME=/from/secrets\nGENESIS_INBOX_PATH=/from/secrets\nUNRELATED_SECRET=abc\n"
+    )
+    _real_overrides()
+    assert os.environ["GENESIS_HOME"] == "/from/secrets"  # as for the server
+    assert os.environ["GENESIS_INBOX_PATH"] == "/from/secrets"
+    assert "UNRELATED_SECRET" not in os.environ
+
+
+def test_an_empty_inbox_override_is_unset(monkeypatch):
+    monkeypatch.setenv("GENESIS_INBOX_PATH", "")
+    cfg = load_inbox_config_from_string("inbox_monitor:\n  watch_path: /tmp/inbox\n")
+    assert str(cfg.watch_path) == "/tmp/inbox"
+
+
 def test_sync_remote_is_kept_verbatim_even_when_invalid():
     """An invalid value must stay SET (so the sync refuses it and the alert
     fires), never degrade to "off"."""
@@ -41,7 +83,7 @@ def test_sync_remote_is_kept_verbatim_even_when_invalid():
     assert cfg.sync_remote == "not a remote"
 
 
-def test_cli_prints_the_three_keys(monkeypatch, tmp_path, capsys):
+def test_cli_prints_its_keys(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv("HOME", str(tmp_path))  # the target must sit inside home
     monkeypatch.setattr(sync_config, "load_sync_settings", lambda: ("dropbox:v", tmp_path / "in"))
     monkeypatch.setattr(sync_config, "heartbeat_path", lambda: tmp_path / "hb.json")
@@ -51,6 +93,7 @@ def test_cli_prints_the_three_keys(monkeypatch, tmp_path, capsys):
         "remote=dropbox:v",
         f"watch_path={tmp_path / 'in'}",
         f"heartbeat={tmp_path / 'hb.json'}",
+        f"genesis_home={sync_config.genesis_home()}",
     ]
 
 

@@ -63,7 +63,7 @@ def assess(remote: str, heartbeat_text: str | None, now: datetime) -> list[Probl
         data = json.loads(heartbeat_text)
         last_ok_raw = str(data.get("last_ok") or "")
         held = int(data.get("held") or 0)
-    except (ValueError, TypeError, AttributeError):
+    except (ValueError, TypeError, AttributeError, OverflowError):
         return [
             Problem(
                 "unreadable",
@@ -79,6 +79,8 @@ def assess(remote: str, heartbeat_text: str | None, now: datetime) -> list[Probl
             last_ok = datetime.fromisoformat(last_ok_raw)
         except ValueError:
             last_ok = None
+        if last_ok is not None and last_ok.utcoffset() is None:
+            last_ok = None  # cannot be compared to an aware now, and the sync never writes one
     if last_ok is None or now - last_ok > STALE_AFTER:
         since = f"since {last_ok_raw}" if last_ok_raw else "ever"
         problems.append(
@@ -87,8 +89,9 @@ def assess(remote: str, heartbeat_text: str | None, now: datetime) -> list[Probl
                 "high",
                 f"Inbox sync: no fully successful cycle {since} (expected every 5 minutes). "
                 "Either the timer stopped (`systemctl --user list-timers | grep inbox-sync`) "
-                "or every run fails (read logs/inbox_sync.log). New vault notes are not "
-                "reaching Genesis, and responses are not reaching the vault. Before "
+                "or every run fails (read the `Heartbeat: cycle not ok` line in "
+                "logs/inbox_sync.log). New vault notes may not be reaching Genesis, and "
+                "responses may not be reaching the vault. Before "
                 "restarting a long-stopped sync, check that the version running keeps a "
                 "vault record (.genesis-seen-in-vault): an older script deletes every "
                 "response written while it was stopped.",

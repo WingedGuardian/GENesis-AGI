@@ -107,7 +107,7 @@ def _parse(raw: dict) -> InboxConfig:
 
     return InboxConfig(
         watch_path=Path(
-            os.environ.get("GENESIS_INBOX_PATH", section["watch_path"]),
+            os.environ.get("GENESIS_INBOX_PATH") or section["watch_path"],
         ).expanduser(),
         response_dir=section.get("response_dir", defaults["response_dir"]),
         check_interval_seconds=_positive_int("check_interval_seconds"),
@@ -127,5 +127,9 @@ def _parse(raw: dict) -> InboxConfig:
         # Kept verbatim (stripped): an invalid value must stay visibly SET so
         # the sync refuses it and the staleness alert fires, rather than
         # degrading to "off", which raises no alert at all.
-        sync_remote=str(section.get("sync_remote") or defaults["sync_remote"]).strip(),
+        sync_remote=str(
+            section["sync_remote"]
+            if section.get("sync_remote") is not None
+            else defaults["sync_remote"]
+        ).strip(),
     )
