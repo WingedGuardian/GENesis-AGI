@@ -172,6 +172,9 @@ class SnapshotManager:
         # without a settle. ``stuck_deletes`` keeps every one, for the alert.
         self.last_delete_stuck: str | None = None
         self.stuck_deletes: list[str] = []
+        # Whether the last prune() read its full listing (and the expiry read
+        # it asked for). False means "could not see", never "nothing to do".
+        self.last_prune_read = False
         # Whether the last take() evicted a snapshot before its create.
         self.last_take_evicted = False
         # Whether the last guardian listing failed, and whether the last
@@ -696,9 +699,11 @@ class SnapshotManager:
         applies.)
         """
         self.last_prune_complete = False
+        self.last_prune_read = False
         meta = await self._list_snapshots_with_meta()
         if not meta:
-            self.last_prune_complete = not self.last_list_failed
+            self.last_prune_read = not self.last_list_failed
+            self.last_prune_complete = self.last_prune_read
             return 0
 
         # Healthy snapshots are never pruned — not even a superseded one: it is
@@ -735,23 +740,29 @@ class SnapshotManager:
                 break
             self.last_delete_stuck = None
             outcome = "deleted" if await self.delete(name) else await self._failed_delete(name)
-            if outcome == "uncertain":
-                break  # it may still be deleting: never stack deletions
-            if outcome == "deleted":
+            if outcome in ("deleted", "settling"):
                 logger.info("Pruned snapshot: %s", name)
                 deleted += 1
+            if outcome in ("uncertain", "settling"):
+                break  # it may still be deleting: never stack deletions
+        self.last_prune_read = expiry_read
         self.last_prune_complete = expiry_read and deleted == len(to_delete)
         return deleted
 
     async def _failed_delete(self, name: str) -> str:
-        """Classify a failed routine delete: ``deleted`` (a re-list shows it
-        went after all), ``stuck`` (no timeout and still listed: nothing was
-        deleted, so the batch may go on to the next candidate), or
-        ``uncertain`` (the client timed out or the re-list failed: the daemon
-        may still be deleting, so the batch stops). Mirrors pool relief."""
+        """Classify a failed routine delete: ``deleted`` (no timeout, and a
+        re-list shows it went after all), ``settling`` (the client timed out
+        but it is gone from the re-list: it counts, but its space may still be
+        coming back, so the batch stops), ``stuck`` (no timeout and still
+        listed: nothing was deleted, so the batch may go on to the next
+        candidate), or ``uncertain`` (a timeout, or a failed re-list: the
+        daemon may still be deleting, so the batch stops). Mirrors pool relief,
+        which frees one snapshot per pass and so never stacks either way."""
         err = self.last_delete_error
         after = await self.list_snapshot_meta_strict()
         if after is not None and name not in {n for n, _ in after}:
+            if err == "timeout":
+                return "settling"  # last_delete_error stays: this tick stops
             self.last_delete_error = None
             return "deleted"
         if after is None or err == "timeout":
@@ -812,11 +823,11 @@ class SnapshotManager:
             self.last_delete_stuck = None
             ok = await self.delete_healthy(old_name, replaced_by=healthy[0])
             outcome = "deleted" if ok else await self._failed_delete(old_name)
-            if outcome == "uncertain":
-                break
-            if outcome == "deleted":
+            if outcome in ("deleted", "settling"):
                 logger.info("Rotated superseded healthy snapshot (window): %s", old_name)
                 deleted += 1
+            if outcome in ("uncertain", "settling"):
+                break
         return deleted
 
     async def enforce_expiry_policy(self) -> bool:

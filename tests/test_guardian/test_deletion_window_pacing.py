@@ -199,6 +199,83 @@ async def test_an_unwritable_stuck_record_never_aborts_the_tick(tmp_path):
         await host.tick(cfg, dispatcher=_dispatcher())  # must not raise
 
 
+# --- Round 2: each outcome the pass branches on is recorded, not inferred -----------
+
+
+class SlowHost(StuckHost):
+    """A Host whose ``slow`` snapshots time out in the client yet are gone from
+    the next listing: the daemon finished, or is still freeing their space."""
+
+    def __init__(self, names=()):
+        super().__init__(names)
+        self.slow: set[str] = set()
+
+    async def run(self, *args, **kwargs):
+        if args[:3] == ("incus", "snapshot", "delete") and args[4] in self.slow:
+            self.deletes.append((args[4], self.now))
+            self.names.remove(args[4])
+            return -1, "", "timeout"
+        return await super().run(*args, **kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["prune", "rotate_superseded"])
+async def test_a_timed_out_delete_stops_the_batch_even_when_the_snapshot_went(tmp_path, method):
+    cfg = _cfg(tmp_path)
+    names = PREVIOUS if method == "prune" else HEALTHY
+    host = SlowHost(names)
+    host.slow = set(names)
+    mgr, deleted = await _direct(host, cfg, method)
+    assert len(host.deletes) == 1  # unguarded too: never delete on top of a slow one
+    assert deleted == 1  # it did go, so it counts
+    assert mgr.stuck_deletes == []
+    assert mgr.last_delete_error == "timeout"  # the rest of the tick stops too
+
+
+@pytest.mark.asyncio
+async def test_a_timed_out_any_time_prune_stops_the_whole_tick(tmp_path):
+    # With no window, nothing paces the tick's later deletes: the kept timeout
+    # error is what stops the refresh's eviction stacking on the slow delete.
+    cfg = _cfg(tmp_path, window="any")
+    cfg.snapshots.retention = 1
+    host = SlowHost(PREVIOUS)
+    host.slow = {PREVIOUS[0]}
+    await host.tick(cfg, healthy=True)
+    assert len(host.deletes) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_prune_listing_holds_back_the_rotation(tmp_path):
+    cfg = _cfg(tmp_path)
+    cfg.snapshots.healthy_enabled = False  # isolate the window pass from the refresh
+    host = StuckHost(HEALTHY)
+    host.now = OPEN
+
+    async def failed_listing(self):
+        self.last_list_failed = True
+        return []
+
+    with patch.object(SnapshotManager, "_list_snapshots_with_meta", failed_listing):
+        mgr = await host.tick(cfg, healthy=True)
+    assert mgr.last_prune_complete is False and mgr.last_delete_error is None
+    assert host.deletes == []  # prune could not read: no rotation behind it
+    assert not (cfg.state_path / ".last_window_deletes").exists()
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_inside_the_window_leaves_its_rotation_to_a_later_pass(tmp_path):
+    cfg = _cfg(tmp_path)
+    host = StuckHost([PREVIOUS[0], HEALTHY[2]])
+    host.now = OPEN
+    while host.now < T0:
+        await host.tick(cfg, healthy=True)
+        host.now += timedelta(minutes=1)
+    healthy_left = [n for n in host.names if n.endswith("-healthy")]
+    assert healthy_left == host.creates[-1:]  # the superseded one went in this window
+    times = [at for _, at in host.deletes]
+    assert all(b - a >= SETTLE for a, b in zip(times, times[1:], strict=False))
+
+
 # --- F2: routine deletes are spaced by the settle interval --------------------------
 
 

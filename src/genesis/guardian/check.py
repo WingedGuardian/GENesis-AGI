@@ -830,6 +830,8 @@ async def _maintain_snapshots(
         )
         if name and defer.get("defer_deletes"):
             await _alert_superseded_surplus(config, snapshots, dispatcher, now)
+        elif name and defer:
+            await _reopen_window_pass(config, snapshots)
         note = getattr(snapshots, "last_rotation_note", None)
         if name:
             logger.info("Healthy snapshot refreshed: %s", name)
@@ -926,6 +928,8 @@ async def _window_deletions(
     listing shows no superseded healthy snapshot left. A failed list or delete
     is retried on the next tick inside the window rather than read as "nothing
     to delete"; a window the guardian missed is caught up by the next one.
+    An in-window healthy refresh that leaves a superseded snapshot clears the
+    stamp (``_reopen_window_pass``), so a later pass rotates it.
     Superseded healthy snapshots are rotated only on a probe-confirmed healthy
     tick: deleting one mid-incident would start a long filesystem stall while
     recovery runs (recovery only ever restores the newest).
@@ -963,11 +967,13 @@ async def _window_deletions(
             expires_before=window.next_open(now), before_delete=before_delete,
         )
         pruned_all = getattr(snapshots, "last_prune_complete", False) is True
-        # Stop only at an UNCERTAIN prune failure (a timeout or failed re-list:
-        # the daemon may still be deleting); its retry comes after the settle.
-        # A snapshot that definitely failed must not hold the rotation back.
-        uncertain = isinstance(getattr(snapshots, "last_delete_error", None), str) and not (
-            isinstance(getattr(snapshots, "last_delete_stuck", None), str)
+        # Stop at a prune that could not read its listing, or at an UNCERTAIN
+        # prune failure (a timeout or failed re-list: the daemon may still be
+        # deleting); the retry comes after the settle. A snapshot that
+        # definitely failed must not hold the rotation back.
+        uncertain = getattr(snapshots, "last_prune_read", False) is not True or (
+            isinstance(getattr(snapshots, "last_delete_error", None), str)
+            and not isinstance(getattr(snapshots, "last_delete_stuck", None), str)
         )
         rotated = (
             await snapshots.rotate_superseded(before_delete=before_delete)
@@ -991,6 +997,28 @@ async def _window_deletions(
         logger.warning("deletion-window pass failed", exc_info=True)
     if done:
         _touch_marker(marker, now)
+
+
+async def _reopen_window_pass(config, snapshots) -> None:
+    """A refresh inside the open window can leave the snapshot it superseded
+    (its rotation waits the settle after the window pass's own delete). That
+    pass may already be stamped done, which would leave the superseded one for
+    the next day: clear the stamp so a later pass, after the settle, rotates
+    it. A failed listing clears it too; the pass re-reads and decides."""
+    try:
+        left = await snapshots.superseded_healthy()
+    except Exception:
+        logger.warning(
+            "could not list superseded healthy snapshots; re-opening the window pass",
+            exc_info=True,
+        )
+        left = None
+    if left == []:
+        return
+    try:
+        (config.state_path / ".last_window_deletes").unlink(missing_ok=True)
+    except OSError:
+        logger.warning("could not re-open the deletion window's pass", exc_info=True)
 
 
 # Snapshots whose delete definitely failed in the open window, one per line.
@@ -1045,7 +1073,8 @@ async def _alert_window_stuck(config, snapshots, dispatcher, window, now: dateti
             body=(
                 f"The deletion window ({window.describe()}) ended with "
                 f"{', '.join(still)} still present: each delete failed with a definite "
-                "error, so the window skipped it and deleted the rest. It is retried in "
+                "error, so the window skipped it and deleted the rest. It was retried "
+                "after each settle interval while the window was open, and is retried in "
                 "the next window; pool relief still frees space under pressure."
             ),
         ))

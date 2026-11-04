@@ -322,7 +322,7 @@ async def test_prune_is_incomplete_when_the_expiry_read_fails(tmp_path) -> None:
     mgr._expires_at = AsyncMock(return_value=None)
     with patch("genesis.guardian.snapshots._run_subprocess", _take_env_mock(existing, [], [])):
         await mgr.prune(expires_before=datetime.now(UTC))
-    assert mgr.last_prune_complete is False
+    assert mgr.last_prune_complete is False and mgr.last_prune_read is False
 
 
 # --- _maintain_snapshots --------------------------------------------------------------
@@ -339,6 +339,7 @@ def _mock_snaps(superseded: list[str] | None = None) -> MagicMock:
     s.last_rotation_note = None
     s.last_rotation_deleted = False
     s.last_prune_complete = True
+    s.last_prune_read = True
     return s
 
 
