@@ -995,6 +995,8 @@ fi
 # listener, because the server is not installed yet at this step.
 # shellcheck source=lib/dashboard_proxy.sh
 . "$(unset CDPATH; cd "$(dirname "$0")" && pwd)/lib/dashboard_proxy.sh"
+# shellcheck source=scripts/lib/gnu_timeout.sh
+. "$(unset CDPATH; cd "$(dirname "$0")" && pwd)/lib/gnu_timeout.sh"
 PROXY_OK=0
 _proxy_report=""
 if _proxy_report=$(dashboard_proxy_check "$CONTAINER_NAME" 5000); then
