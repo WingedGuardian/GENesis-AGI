@@ -130,11 +130,11 @@ class RequestDatabase:
             raise ValueError("max_units must be a positive integer")
         if not math.isfinite(checkout_timeout_s) or checkout_timeout_s <= 0:
             raise ValueError("checkout_timeout_s must be finite and positive")
-        self.path = Path(path)
+        self.path = Path(path).expanduser().resolve()
         self._slots = asyncio.BoundedSemaphore(max_units)
         self._timeout = checkout_timeout_s
         self._current: ContextVar[_Lease | None] = ContextVar("database_lease", default=None)
-        self._owners: set[asyncio.Task] = set()
+        self._owners: dict[asyncio.Task, asyncio.Future[None]] = {}
         self._workers: set[asyncio.Task] = set()
         self._closing = False
         self._close_task: asyncio.Task | None = None
@@ -200,7 +200,8 @@ class RequestDatabase:
             raise DatabaseScopeError("A unit of work requires an asyncio task")
         if owner in self._owners:
             raise DatabaseScopeError("Independent work must run in a separate task")
-        self._owners.add(owner)
+        finished: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self._owners[owner] = finished
         acquired = False
         opening = None
         token = None
@@ -218,7 +219,11 @@ class RequestDatabase:
         finally:
             lease.active = False
             if token is not None:
-                self._current.reset(token)
+                try:
+                    self._current.reset(token)
+                except ValueError:
+                    # Left from another task or a finalizer. Cleanup must still run.
+                    logger.warning("Database unit of work ended outside its owning context")
             try:
                 if opening is not None:
                     cleanup = self._worker(self._finish(opening, lease, success))
@@ -230,16 +235,26 @@ class RequestDatabase:
                     else:
                         self._unclosed.add(lease)
                         logger.error("Database connection closure could not be confirmed")
-                self._owners.discard(owner)
+                del self._owners[owner]
+                finished.set_result(None)
 
     async def _shutdown(self) -> None:
-        owners = tuple(self._owners)
-        for task in owners:
+        owners = tuple(self._owners.items())
+        for task, _finished in owners:
             task.cancel()
-        await asyncio.gather(*owners, return_exceptions=True)
+        # Wait for the unit, not the task: a task that has left its unit may be
+        # awaiting this shutdown in its own close().
+        await asyncio.gather(
+            *(
+                asyncio.wait({task, finished}, return_when=asyncio.FIRST_COMPLETED)
+                for task, finished in owners
+            ),
+            return_exceptions=True,
+        )
         while self._workers:
             await asyncio.gather(*tuple(self._workers), return_exceptions=True)
-        if self._unclosed:
+        # A pending unit belongs to a task that finished without leaving it.
+        if self._unclosed or any(not finished.done() for _task, finished in owners):
             raise DatabaseScopeError("Database shutdown has unconfirmed connection closures")
 
     async def close(self) -> None:
@@ -249,7 +264,9 @@ class RequestDatabase:
         if self._close_task is None:
             self._closing = True
             self._close_task = asyncio.create_task(self._shutdown())
-        await _settle(self._close_task)
+        # Shutdown keeps running if this caller is cancelled, and the caller can
+        # still bound its own wait or be cancelled by a task it is waiting on.
+        await asyncio.shield(self._close_task)
 
     def _cursor_operation(self, method: str, *args, **kwargs):
         lease = self._lease()
