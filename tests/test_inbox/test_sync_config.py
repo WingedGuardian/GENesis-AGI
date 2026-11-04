@@ -68,6 +68,20 @@ def test_secret_overrides_take_only_their_own_keys(monkeypatch, tmp_path):
     assert "UNRELATED_SECRET" not in os.environ
 
 
+def test_an_empty_secret_override_clears_the_inherited_value(monkeypatch, tmp_path):
+    monkeypatch.setenv("SECRETS_PATH", str(tmp_path / "s.env"))
+    monkeypatch.setenv("GENESIS_HOME", "/inherited")
+    (tmp_path / "s.env").write_text("GENESIS_HOME=\n")
+    _real_overrides()
+    assert os.environ["GENESIS_HOME"] == ""
+
+
+def test_a_refused_remote_is_not_printed(monkeypatch, capsys):
+    monkeypatch.setattr(sync_config, "load_sync_settings", lambda: ("-tok3n:x", Path("/tmp/i")))
+    assert sync_config.main() == 2
+    assert "tok3n" not in capsys.readouterr().err
+
+
 def test_an_empty_inbox_override_is_unset(monkeypatch):
     monkeypatch.setenv("GENESIS_INBOX_PATH", "")
     cfg = load_inbox_config_from_string("inbox_monitor:\n  watch_path: /tmp/inbox\n")

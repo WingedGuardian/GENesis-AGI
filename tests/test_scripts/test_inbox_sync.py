@@ -845,15 +845,30 @@ def test_a_record_for_another_remote_excludes_nothing(tmp_path):
 
 
 def test_an_unreadable_record_on_a_failed_listing_says_so(tmp_path):
-    env, inbox, log, _ = _setup(tmp_path)
+    env, inbox, log, call_log = _setup(tmp_path)
     record = _set_record(inbox, [])
     record.chmod(0o000)
+    _old_response_file(inbox, "Fresh-1.genesis.md")
     env["RCLONE_LSF_RC"] = "1"
     try:
         assert _run(env).returncode == 0
     finally:
         record.chmod(0o600)
     assert "could not read the vault record" in log.read_text()
+    assert not _copy_calls(call_log), "a push ran with no way to tell a deletion from a new file"
+
+
+def test_the_pull_stays_on_the_inboxs_filesystem(tmp_path):
+    env, _, _, call_log = _setup(tmp_path)
+    assert _run(env).returncode == 0
+    pull = next(ln for ln in call_log.read_text().splitlines() if ln.startswith("rclone sync"))
+    assert "--one-file-system" in pull
+
+
+def test_the_service_names_the_installed_interpreter():
+    repo = Path(__file__).resolve().parents[2]
+    unit = (repo / "scripts/systemd/genesis-inbox-sync.service.template").read_text()
+    assert "Environment=GENESIS_PYTHON=__VENV__/bin/python" in unit
 
 
 def test_a_directory_at_the_record_path_is_not_an_ok_cycle(tmp_path):

@@ -112,7 +112,10 @@ _shown() {
     #    The second ".genesis-*" exclude covers DIRECTORIES of that name: the
     #    first matches files only, so a vault folder named like a state file
     #    would otherwise be mirrored over it (MEASURED, rclone 1.60).
+    #    --one-file-system: a directory mounted under the inbox is not part of
+    #    the mirror, and without this its files are deleted (MEASURED, 1.60).
     rclone sync "$REMOTE" "$LOCAL_PATH" \
+        --one-file-system \
         --exclude "*.genesis.md" \
         --exclude ".genesis-*" \
         --exclude ".genesis-*/**" \
@@ -165,6 +168,7 @@ _shown() {
     LISTING_OK=""
     HELD=""
     PUSH_EXCLUDE=""
+    PUSH_HOLD=""
     # A state path that is not a regular file (a directory left by an older
     # mirror, say) would make the record unreadable and every cycle a silent
     # "seed": say so on every cycle until someone removes it.
@@ -247,7 +251,8 @@ _shown() {
         # (held responses are on record too); a never-seen young one still ships.
         if [ -f "$SEEN" ] && [ ! -L "$SEEN" ]; then
             if ! record_lines=$(cat -- "$SEEN" 2>&1); then
-                echo "WARNING: could not read the vault record ($SEEN), so only the age gate protects this push: $(_shown "$record_lines")"
+                PUSH_HOLD=1
+                echo "WARNING: could not read the vault record ($SEEN), so nothing can tell a vault deletion from a new response: holding the push this cycle: $(_shown "$record_lines")"
             elif [ "$(printf '%s\n' "$record_lines" | head -n 1)" = "$RECORD_HEADER" ]; then
                 PUSH_EXCLUDE=$(printf '%s\n' "$record_lines" | tail -n +2)
             fi
@@ -269,7 +274,9 @@ _shown() {
     push_age=()
     [ -n "$PUSH_MAX_AGE" ] && push_age=(--max-age "$PUSH_MAX_AGE")
     rm -f -- "$FILTER.tmp"
-    if {
+    if [ -n "$PUSH_HOLD" ]; then
+        push_rc=1
+    elif {
         while IFS= read -r h; do
             [ -n "$h" ] && printf -- '- %s\n' "$(_filter_literal "$h")"
         done <<< "$HELD

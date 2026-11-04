@@ -73,9 +73,33 @@ def test_a_naive_last_ok_is_stale_and_does_not_raise():
     assert p.key == "stale"
 
 
-def test_an_impossible_held_count_is_unreadable_and_does_not_raise():
-    [p] = assess(_REMOTE, '{"last_ok": "2026-10-28T18:00:00Z", "held": Infinity}', _NOW)
+@pytest.mark.parametrize("held", ["Infinity", "-1", "0.5", "true", '"3"'])
+def test_an_impossible_held_count_is_unreadable_and_does_not_raise(held):
+    [p] = assess(_REMOTE, f'{{"last_ok": "2026-10-28T18:00:00Z", "held": {held}}}', _NOW)
     assert p.key == "unreadable"
+
+
+def test_a_future_last_ok_is_stale():
+    [p] = assess(_REMOTE, _hb(_iso(_NOW + timedelta(minutes=5))), _NOW)
+    assert p.key == "stale"
+
+
+def test_a_heartbeat_that_exists_but_cannot_be_read_is_unreadable(tmp_path):
+    directory = tmp_path / "hb.json"
+    directory.mkdir()
+    [p] = assess(_REMOTE, sync_health._read_heartbeat(directory), _NOW)
+    assert p.key == "unreadable"
+    assert sync_health._read_heartbeat(tmp_path / "absent.json") is None
+
+
+def test_a_heartbeat_the_process_may_not_read_is_unreadable(tmp_path):
+    denied = tmp_path / "hb.json"
+    denied.write_text(_hb("2026-10-28T18:00:00Z"))
+    denied.chmod(0o000)
+    try:
+        assert sync_health._read_heartbeat(denied) == ""
+    finally:
+        denied.chmod(0o600)
 
 
 def test_unreadable_heartbeat_is_reported_not_ignored():

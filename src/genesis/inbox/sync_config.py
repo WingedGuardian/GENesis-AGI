@@ -98,7 +98,7 @@ def apply_secret_overrides() -> None:
     values = dotenv_values(secrets)
     for key in _SECRET_OVERRIDES:
         value = values.get(key)
-        if value:
+        if value is not None:  # an empty value clears it, as for the server
             os.environ[key] = value
 
 
@@ -123,7 +123,9 @@ def main() -> int:
         return 1
     if remote and not remote_is_valid(remote):
         print(
-            f"inbox_monitor.sync_remote is not a valid rclone remote: {remote!r}", file=sys.stderr
+            # No value: a remote can embed a credential, and this reaches the log.
+            "inbox_monitor.sync_remote is not a valid rclone remote",
+            file=sys.stderr,
         )
         return 2
     if remote:

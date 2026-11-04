@@ -62,8 +62,12 @@ def assess(remote: str, heartbeat_text: str | None, now: datetime) -> list[Probl
     try:
         data = json.loads(heartbeat_text)
         last_ok_raw = str(data.get("last_ok") or "")
-        held = int(data.get("held") or 0)
-    except (ValueError, TypeError, AttributeError, OverflowError):
+        held = data.get("held")
+        held = 0 if held is None else held
+        # The script writes a non-negative int: anything else must not read as healthy.
+        if type(held) is not int or held < 0:
+            raise ValueError("held")
+    except (ValueError, TypeError, AttributeError):
         return [
             Problem(
                 "unreadable",
@@ -81,7 +85,8 @@ def assess(remote: str, heartbeat_text: str | None, now: datetime) -> list[Probl
             last_ok = None
         if last_ok is not None and last_ok.utcoffset() is None:
             last_ok = None  # cannot be compared to an aware now, and the sync never writes one
-    if last_ok is None or now - last_ok > STALE_AFTER:
+    # A future stamp would stay silent until it passed: not evidence of a recent cycle.
+    if last_ok is None or not timedelta(0) <= now - last_ok <= STALE_AFTER:
         since = f"since {last_ok_raw}" if last_ok_raw else "ever"
         problems.append(
             Problem(
@@ -122,13 +127,19 @@ def _read_heartbeat(path) -> str | None:
 
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    except OSError:
+    except FileNotFoundError:
         return None
+    except OSError as exc:
+        import errno
+
+        # A symlink is not a heartbeat the sync wrote, so it reads as none. Any
+        # other failure is present but unreadable, which assess reports as such.
+        return None if exc.errno == errno.ELOOP else ""
     try:
         import stat
 
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return None
+            return ""
         data = os.read(fd, _HEARTBEAT_MAX_BYTES + 1)
     finally:
         os.close(fd)
