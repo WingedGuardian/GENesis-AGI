@@ -49,8 +49,9 @@ reports filed through the bug-report form, are not newly labelled.
 **Before it is filed,** a foreground session's `gh issue create` is checked against
 that same rule: the PreToolUse hook `scripts/hooks/issue_premise_gate.py` blocks a
 create whose body would be labelled, and names the missing answers. It judges only
-a body it can read in full (a `--body` literal, a `--body-file`, or the heredoc in
-`-F - <<'EOF'`) bound for the configured public repo, and passes everything else.
+a body it can read in full (a `--body` literal with no `$` or backtick, a
+`--body-file` read by the command's first step, or the heredoc in `-F - <<'EOF'`)
+bound for the configured public repo, and passes everything else.
 Dispatched sessions are never blocked.
 
 **A bug report answers different questions.** Its question is whether the bug is

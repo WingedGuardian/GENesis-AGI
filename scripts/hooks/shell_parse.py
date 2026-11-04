@@ -4923,11 +4923,32 @@ _GH_FLAG_TABLE[("issue", "new")] = _GH_FLAG_TABLE[("issue", "create")]
 #: browser instead (pflag's true spellings of ``--web``). Shared by the hooks that
 #: read an issue create, so they agree on what files one.
 GH_ISSUE_CREATE_SUBCOMMANDS = frozenset({"create", "new"})
+#: pflag's boolean value set (``strconv.ParseBool``): gh rejects any other value.
+GH_TRUE_VALUES = frozenset({"1", "t", "T", "TRUE", "true", "True"})
+GH_FALSE_VALUES = frozenset({"0", "f", "F", "FALSE", "false", "False"})
 GH_WEB_FLAGS = frozenset({"--web", "-w"}) | frozenset(
-    f"{flag}={value}"
-    for flag in ("--web", "-w")
-    for value in ("1", "t", "T", "TRUE", "true", "True")
+    f"{flag}={value}" for flag in ("--web", "-w") for value in GH_TRUE_VALUES
 )
+
+
+def gh_bool(opts: list[tuple[str, str | None]], names: frozenset[str]) -> bool | None:
+    """The value gh gives a boolean option, from :func:`gh_option_values` pairs.
+
+    The last spelling wins, as in pflag; a bare flag is true; absent is false. None
+    when any value is outside pflag's boolean set (``--web=yes``, ``--web=``): gh
+    refuses the command, so a caller must not read it as false."""
+    state = False
+    for name, value in opts:
+        if name not in names:
+            continue
+        if value is None or value in GH_TRUE_VALUES:
+            state = True
+        elif value in GH_FALSE_VALUES:
+            state = False
+        else:
+            return None
+    return state
+
 
 #: The UNION across every modeled row, used while the command path is still
 #: unresolved — which is exactly where gh itself applies it. MEASURED against

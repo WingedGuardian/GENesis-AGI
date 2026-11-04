@@ -6,8 +6,9 @@ What the design promises, and so what is tested:
   and whose target is the configured public repo, when
   ``premise_gate.owed_answers`` (the server gate's own rule) says answers are owed;
 * every shape it cannot read passes in silence: a heredoc it did not excise, a
-  substitution, an earlier ``cd``, a body file an earlier step writes, an unknown
-  flag, another repo, an unreadable file;
+  substitution or any ``$``/backtick in a ``--body``, an earlier ``cd``, a body file
+  behind any earlier step, an unknown flag, another repo, an unreadable file, a
+  create with no title, a boolean flag gh would refuse;
 * a dispatched session (``GENESIS_CC_SESSION=1``) is never blocked;
 * it agrees with ``premise_gate.decide`` on an ``opened`` event, cell for cell;
 * a command with no issue create never pays for the parser import.
@@ -350,8 +351,10 @@ def test_3_a_complete_body_passes_silently(monkeypatch, capsys):
     "labels",
     [("--label", "bug"), ("-l", "docs,bug"), ("-l", "docs", "-l", "bug"), ("--label=bug",)],
 )
-def test_4_a_bug_label_owes_the_verification_section(monkeypatch, capsys, labels):
-    code, _, err = _call(monkeypatch, capsys, _create(*labels, _b(SIX)))
+def test_4_a_bug_label_owes_the_verification_section(monkeypatch, capsys, tmp_path, labels):
+    # SIX carries code spans; a backtick in a --body value is unknown, so read it from a file
+    six = _file(tmp_path, SIX, "six.md")
+    code, _, err = _call(monkeypatch, capsys, _create(*labels, "-F", str(six)))
     assert code == 2 and "## Verification" in err
     assert _call(monkeypatch, capsys, _create(*labels, _b(VERIFIED)))[0] == 0
 
@@ -466,11 +469,13 @@ def test_8c_a_phantom_identical_to_an_earlier_quoted_mention_is_not_judged(monke
     assert _call(monkeypatch, capsys, cmd)[0] == 0
 
 
-def test_9_substitutions_pass_and_single_quoted_literals_are_judged(monkeypatch, capsys):
+def test_9_substitutions_and_any_expansion_character_pass(monkeypatch, capsys):
     assert _call(monkeypatch, capsys, _create('--body "cost $(date)"'))[0] == 0
     assert _call(monkeypatch, capsys, _create('--body "cost `date`"'))[0] == 0
     assert _call(monkeypatch, capsys, _create('--body "$BODY"'))[0] == 0
-    assert _call(monkeypatch, capsys, _create("--body 'has `code` and $HOME'"))[0] == 2
+    # the argv is past quote removal: single quotes cannot be told from double ones
+    assert _call(monkeypatch, capsys, _create("--body 'has `code` and $HOME'"))[0] == 0
+    assert _call(monkeypatch, capsys, _create("--body 'a plain literal'"))[0] == 2
 
 
 @pytest.mark.parametrize(
@@ -615,8 +620,7 @@ def test_14e_a_redefined_gh_is_never_judged(monkeypatch, capsys, prefix):
 def test_15_an_earlier_write_to_the_body_file_makes_it_unreadable(monkeypatch, capsys, tmp_path):
     f = _file(tmp_path, MISSING)
     create = _create("-F", str(f))
-    assert _call(monkeypatch, capsys, f"grep -c x {f} && {create}")[0] == 2
-    assert _call(monkeypatch, capsys, f"wc -l {f}; {create}")[0] == 2
+    assert _call(monkeypatch, capsys, create)[0] == 2  # control: the create runs first
     for writer in (
         f"sed -i s/a/b/ {f}",
         f"echo more >> {f}",
@@ -629,16 +633,16 @@ def test_15_an_earlier_write_to_the_body_file_makes_it_unreadable(monkeypatch, c
         assert _call(monkeypatch, capsys, f"{writer} && {create}")[0] == 0, writer
 
 
-def test_15b_any_earlier_step_that_is_not_read_only_makes_the_file_unknown(
-    monkeypatch, capsys, tmp_path
-):
-    """LOW-1: a writer need not name the file (`make body`, a checkout)."""
+def test_15b_any_earlier_step_makes_the_file_unknown(monkeypatch, capsys, tmp_path):
+    """LOW-1: a writer need not name the file (`make body`, a checkout). Round 1: nor
+    need it look like one (`rg --pre`, a process substitution), so no earlier step is
+    trusted, read-only or not."""
     f = _file(tmp_path, MISSING)
     create = _create("-F", str(f))
     for step in ("make body", "git checkout other", "python3 gen.py"):
         assert _call(monkeypatch, capsys, f"{step} && {create}")[0] == 0, step
-    for step in ("true", "echo starting", "ls", f"test -f {f}"):
-        assert _call(monkeypatch, capsys, f"{step} && {create}")[0] == 2, step
+    for step in ("true", "echo starting", "ls", f"test -f {f}", f"grep -c x {f}", f"wc -l {f}"):
+        assert _call(monkeypatch, capsys, f"{step} && {create}")[0] == 0, step
 
 
 def test_16_compound_and_nested_creates(monkeypatch, capsys):
@@ -754,16 +758,137 @@ def test_19c_a_normal_body_is_judged_under_the_limit_and_the_timer_is_cancelled(
     assert signal.getsignal(signal.SIGALRM) is before
 
 
-def test_19d_the_hook_parses_each_text_once(monkeypatch, capsys):
+def test_19d_the_hook_parses_each_text_once(monkeypatch, capsys, tmp_path):
     """cProfile MEASURED owed_message parsing the same body 4 times."""
     texts = _parse_counter(monkeypatch)
     assert _call(monkeypatch, capsys, _create(_b(MISSING)))[0] == 2
     assert len(texts) == 1
     texts.clear()
-    fenced = PARTIAL + "\n```\n## Premise checks\n1. quoted\n```\n"
-    assert _call(monkeypatch, capsys, _create(_b(fenced)))[0] == 2
+    fenced = _file(tmp_path, PARTIAL + "\n```\n## Premise checks\n1. quoted\n```\n")
+    assert _call(monkeypatch, capsys, _create("-F", str(fenced)))[0] == 2
     # The body, and its quote-stripped copy (a different text), each once.
     assert len(texts) == len(set(texts)) == 2
+
+
+# -- round 1: what the hook inferred instead of reading ---------------------------
+
+
+def test_r1_a_body_value_with_any_expansion_character_is_unknown(monkeypatch, capsys):
+    """Devin c4461473825: quoting was inferred from the raw text, so a single-quoted
+    `$BODY` elsewhere in the command made a double-quoted `"$BODY"` read as literal."""
+    cmd = shlex.join(["gh", "issue", "create", "-R", CANON, "-t", "$BODY"]) + ' -b "$BODY"'
+    assert _call(monkeypatch, capsys, cmd)[0] == 0
+    # an empty backtick pair is a substitution the parser shows no segment for
+    assert _call(monkeypatch, capsys, _create('-b "' + MISSING + ' `` here"'))[0] == 0
+    assert _call(monkeypatch, capsys, _create(_b(MISSING)))[0] == 2  # control
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ([], False),
+        ([None], True),
+        (["true"], True),
+        (["T"], True),
+        (["1"], True),
+        (["false"], False),
+        (["F"], False),
+        (["0"], False),
+        ([None, "false"], False),
+        (["false", None], True),
+        (["yes"], None),
+        ([""], None),
+        (["false", "yes"], None),
+    ],
+)
+def test_r1_gh_bool_reads_the_last_value_in_three_states(value, expected):
+    """Codex c4461486234: a boolean gh flag is read by its parsed value, last wins,
+    and a value pflag would reject is unknown, not false."""
+    opts = [("--web", v) for v in value] + [("-t", "x")]
+    assert sp.gh_bool(opts, frozenset({"--web", "-w"})) is expected
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected"),
+    [
+        (("--web", "--web=false"), 2),
+        (("--web=false", "--web"), 0),
+        (("--web=yes",), 0),
+        (("--web=",), 0),
+        (("--editor=false",), 2),
+        (("--editor=0",), 2),
+        (("--editor", "--editor=f"), 2),
+        (("-e=false",), 0),  # an unmodelled token: passes unread (a stated residual)
+        (("--editor",), 0),
+        (("--editor=true",), 0),
+        (("-e",), 0),
+        (("--editor=maybe",), 0),
+    ],
+)
+def test_r1_web_and_editor_are_read_by_their_value(monkeypatch, capsys, flags, expected):
+    assert _call(monkeypatch, capsys, _create(*flags, _b(MISSING)))[0] == expected
+
+
+def test_r1_a_label_names_bug_in_any_case(monkeypatch, capsys):
+    """gh resolves `-l Bug` to the repo's `bug` label (EqualFold), so the opened event
+    carries `bug` and the server owes the verification section."""
+    assert _call(monkeypatch, capsys, _create("-l", "Bug", _b(VERIFIED)))[0] == 0
+    code, _, err = _call(monkeypatch, capsys, _create("-l", "docs,BUG", _b(MISSING)))
+    assert code == 2 and "## Verification" in err
+
+
+@pytest.mark.parametrize("spelling", ["bug", "Bug", "BUG", "docs,Bug"])
+@pytest.mark.parametrize("body", ["MISSING", "SIX", "VERIFIED"])
+def test_r1_the_hook_and_the_server_agree_on_a_label_in_any_case(
+    monkeypatch, capsys, tmp_path, spelling, body
+):
+    """Parity through the label resolution: the hook sees what was typed, the server
+    sees the repo's own label name, which gh matched case-insensitively."""
+    text = {"MISSING": MISSING, "SIX": SIX, "VERIFIED": VERIFIED}[body]
+    resolved = [{"name": "docs" if x.lower() == "docs" else "bug"} for x in spelling.split(",")]
+    issue = {"number": 1, "body": text, "labels": resolved, "created_at": NOW}
+    server_adds = "premises-missing" in gate.decide({"action": "opened", "issue": issue}).add
+    f = _file(tmp_path, text)
+    code = _call(monkeypatch, capsys, _create("-l", spelling, "-F", str(f)))[0]
+    assert (code == 2) == server_adds, (spelling, body, code)
+
+
+def test_r1_the_heredoc_idiom_is_matched_whole(monkeypatch, capsys):
+    """A tail concatenated after the idiom's `)"` is part of the body gh receives."""
+    section = SIX[SIX.index("## Premise checks") :].replace("`", "")
+    idiom = _create("--body \"$(cat <<'EOF'") + "\nintro\nEOF\n)\"'\n" + section + "'"
+    assert _call(monkeypatch, capsys, idiom)[0] == 0
+    plain = _create("--body \"$(cat <<'EOF'") + "\n" + MISSING + '\nEOF\n)"'
+    assert _call(monkeypatch, capsys, plain)[0] == 2  # control: the whole idiom
+
+
+def test_r1_a_body_file_is_read_only_when_the_create_runs_first(monkeypatch, capsys, tmp_path):
+    """An earlier step can write the file without looking like a writer: `rg --pre`
+    runs a program, and a process substitution has no segment of its own."""
+    six = _file(tmp_path, SIX, "six.md")
+    f = _file(tmp_path, MISSING)
+    create = _create("-F", str(f))
+    assert _call(monkeypatch, capsys, create)[0] == 2  # control
+    assert _call(monkeypatch, capsys, f"cat <(cp {six} {f}) ; {create}")[0] == 0
+    assert _call(monkeypatch, capsys, f"rg --pre ./w.sh x {six} ; {create}")[0] == 0
+    assert _call(monkeypatch, capsys, f"{create} | cat <(cp {six} {f})")[0] == 0
+    assert _call(monkeypatch, capsys, f"{create} > >(cat)")[0] == 0
+
+
+def test_r1_a_resolved_default_other_than_base_is_unknown(monkeypatch, capsys, tmp_path):
+    """`gh repo set-default` may record OWNER/REPO, which gh then files in."""
+    canon = _repo(tmp_path, "https://github.com/acme/widget.git", "canon")
+    _git("-C", str(canon), "config", "remote.origin.gh-resolved", "someone/elsewhere")
+    assert _call(monkeypatch, capsys, _create(_b(MISSING), repo=None), cwd=canon)[0] == 0
+    _git("-C", str(canon), "config", "remote.origin.gh-resolved", "base")
+    assert _call(monkeypatch, capsys, _create(_b(MISSING), repo=None), cwd=canon)[0] == 2
+
+
+def test_r1_a_create_without_a_title_passes(monkeypatch, capsys):
+    """Without a terminal gh refuses a create that lacks a title."""
+    bare = shlex.join(["gh", "issue", "create", "-R", CANON]) + " " + _b(MISSING)
+    assert _call(monkeypatch, capsys, bare)[0] == 0
+    assert _call(monkeypatch, capsys, bare + " --title=x")[0] == 2
 
 
 def test_unrelated_commands_pass_silently(monkeypatch, capsys):
@@ -905,6 +1030,8 @@ def _judged(sub, shape, rpos, wrap):
     if shape in ("-F -", "idiom"):
         # Only a first-line `gh issue create … <<'EOF'` is excised by the parser.
         return wrap == "single" and rpos != "before" and sub == "create"
+    if shape == "-F file":
+        return wrap == "single"  # a file is read only when the create is the first step
     return True
 
 

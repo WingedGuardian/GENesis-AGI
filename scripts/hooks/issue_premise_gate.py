@@ -31,13 +31,16 @@ of these hold:
   segments, so a line reading ``gh issue create …`` inside a file being written
   would otherwise be judged as a command (MEASURED: ``cat > f <<'EOF'``, ``gh -R
   o/r issue create -F - <<'EOF'`` and ``python3 - <<'EOF'`` bodies all do);
-* it files something: not ``--help``, ``--web``, ``--editor``, ``--template`` or
-  ``--recover`` (gh files nothing for those without a terminal), and it carries a
-  body flag;
+* it files something: not ``--help``, ``--template`` or ``--recover``, and
+  ``--web``/``--editor`` read FALSE by their last value in pflag's boolean set (a
+  value outside it, ``--web=yes``, is unknown; gh refuses it). gh files nothing for
+  those without a terminal, nor for a create with no ``-t``/``--title``, so it must
+  carry a title and a body flag;
 * its target is the configured public repo (``github.user``/``github.public_repo``
   in ``~/.genesis/config/genesis.yaml``; none configured enforces nothing): an
   explicit ``-R``/``--repo``, or with none, the payload cwd's git remotes, read
-  locally: the ``gh repo set-default`` choice, else EVERY remote must name it.
+  locally: the ``gh repo set-default`` choice (only the value ``base``; an
+  ``OWNER/REPO`` value is unknown), else EVERY remote must name it.
   ``GH_HOST`` anywhere, and for an implicit target ``GH_REPO`` or an in-command
   ``GIT_*=``/``GH_*=`` assignment, an earlier ``cd``/``pushd``/``popd`` or ``git
   remote``/``git config``/``gh repo`` step, or a wrapper before ``gh`` each make
@@ -45,11 +48,16 @@ of these hold:
   unknown;
 * the body is known: ``--body-file`` beats ``--body`` and the last of each wins (as
   gh reads them). A file is read only if it is regular, at most 256 KB (a bound on
-  the READ; GitHub's own body limit fits) and UTF-8, and every EARLIER step is
-  read-only (``grep``, ``cat``, ``wc``, ``echo``, ``true``, … with no ``>`` and no
-  ``tee``): any other step may write it. ``-F -`` and the ``"$(cat <<'EOF'`` idiom
-  are read from the heredoc the parser excised. A ``--body`` value with a ``$(``, a
-  substitution step, or a ``$NAME`` expansion not shown single-quoted is unknown;
+  the READ; GitHub's own body limit fits) and UTF-8, the create is the command's
+  FIRST step, and the text has no ``<(``/``>(``: any earlier step may write it
+  without looking like a writer (``rg --pre``, a process substitution). ``-F -`` and
+  the ``"$(cat <<'EOF'`` idiom (matched whole, so a concatenated tail is never
+  dropped) are read from the heredoc the parser excised. A ``--body`` value with any
+  ``$`` or backtick, or with a substitution step, is unknown: the argv is past quote
+  removal, so a single-quoted literal cannot be told from an expansion;
+* every ``-l``/``--label`` value is literal, and is read as gh resolves it: a name
+  equal to ``bug`` in any case counts as ``bug`` (gh matches label names
+  case-insensitively, so ``-l Bug`` files the repo's ``bug``);
 * ``markdown-it`` is importable, so the answers are read as the server reads them;
 * the answers are read within ``_PARSE_LIMIT_S``. markdown-it is super-linear on
   hostile input and no size cap keeps it inside the hook's budget, so the read has
@@ -71,6 +79,23 @@ parity test proves agreement at one commit.
 NOT COVERED: ``gh issue edit`` and ``gh api`` filings, creates in a dispatched
 session, and every shape above that passes unread. The planned after-call
 read-back in ``issue_dup_advisory`` reports on those.
+
+KNOWN RESIDUALS (round-1 class audit; each is rare, and most err toward passing):
+
+* a quoted tilde (``-F "~/x"``) is expanded here, while gh opens the literal path
+  and fails, so this blocks a create gh would refuse anyway;
+* a LATER step that runs concurrently (a pipeline sibling, a ``&`` job) or the
+  create's own ``> f`` can change the file after this read;
+* an unquoted glob in a ``-b`` word: the argv is past expansion;
+* short ``=value`` booleans (``-e=false``, ``-w=false``) are tokens the gh table
+  does not model, so the create passes unread;
+* ``GH_HOST``/``GH_REPO`` set only in the Bash tool's shell, not this hook's
+  environment, are not seen;
+* ``--attach`` appends to the body gh sends; ``prefer_editor_prompt`` makes gh
+  refuse every create without a terminal; a ``url.<x>.insteadOf`` rewrite changes
+  the remote gh sees but not the ``remote.*.url`` read here;
+* label whitespace: ``-l ' bug'`` is stripped here, while gh looks up the name as
+  typed and fails.
 """
 
 from __future__ import annotations
@@ -131,8 +156,9 @@ _PREFILTER = (
 _DEGRADED_GATED = r"\bissue\s+(?:create|new)\b"
 #: A heredoc opener (`<<`, `<<-`), never a here-string (`<<<`).
 _HEREDOC_OPENER = re.compile(r"(?<!<)<<(?!<)")
-#: A parameter expansion bash performs outside single quotes.
-_EXPANSION = re.compile(r"\$[A-Za-z_{0-9@*#?!$-]")
+#: The `"$(cat <<'EOF'` idiom's value as the parser leaves it once the heredoc is
+#: excised. Matched whole, so text concatenated after its `)"` is never dropped.
+_IDIOM_VALUE = re.compile(r"\$\(cat <<'[A-Za-z_][A-Za-z0-9_]*'\n\)")
 _CWD_CHANGERS = frozenset({"cd", "pushd", "popd"})
 #: The most of a body file this hook reads. GitHub refuses an issue body over 65,536
 #: characters, which is at most 262,144 bytes of UTF-8, so a real body fits, and
@@ -157,31 +183,18 @@ _GIT_CONFIG_TIMEOUT_S = 3
 _REDEFINERS = frozenset({"alias", "unalias", "function", "hash", "enable"})
 #: An in-command assignment that can move gh's target (GIT_DIR, GH_REPO, GH_HOST, …).
 _TARGET_ASSIGNMENT = re.compile(r"\b(?:GIT|GH)_\w*=")
-_READ_ONLY = frozenset(
-    {
-        "grep",
-        "egrep",
-        "fgrep",
-        "rg",
-        "cat",
-        "head",
-        "tail",
-        "wc",
-        "ls",
-        "stat",
-        "test",
-        "[",
-        "diff",
-        "file",
-    }
-)
-#: Earlier steps that leave a body file as it is now: the read-only list, plus the
-#: no-ops a compound commonly opens with. Any other earlier step may write it.
-_LEAVES_FILES = _READ_ONLY | {"cd", "echo", "true", "printf", ":"}
-_NO_FILING = frozenset({"--editor", "-e", "--template", "-T", "--recover"})
+_WEB = frozenset({"--web", "-w"})
+_EDITOR = frozenset({"--editor", "-e"})
+#: String flags gh refuses here, in any spelling: ``--template`` beside a body, and
+#: ``--recover`` without a terminal (MEASURED, gh 2.100).
+_NO_FILING = frozenset({"--template", "-T", "--recover"})
+_TITLE = frozenset({"-t", "--title"})
 _OPTIONS = (
-    frozenset({"-R", "--repo", "-l", "--label", "-b", "--body", "-F", "--body-file", "--web", "-w"})
+    frozenset({"-R", "--repo", "-l", "--label", "-b", "--body", "-F", "--body-file"})
+    | _WEB
+    | _EDITOR
     | _NO_FILING
+    | _TITLE
 )
 
 sp = pg = plan_doc = discarded_write = None  # bound by _load()
@@ -311,6 +324,8 @@ def _cwd_targets(cwd: str, canonical: str) -> bool:
         if attr == "url":
             urls[name] = value
         elif attr == "gh-resolved":
+            if value != "base":
+                return False  # an OWNER/REPO value is where gh files; not read here
             chosen.append(name)
     names = chosen or list(urls)
     return bool(names) and all(_slug(urls.get(n, "")) == canonical for n in names)
@@ -386,15 +401,7 @@ def _read_body(path: str) -> str | None:
         os.close(fd)
 
 
-def _span(text: str, positions, j: int, seg) -> str:
-    start = positions[j]
-    if start is None:
-        return seg.raw
-    later = [p for p in positions[j + 1 :] if p is not None and p > start]
-    return text[start : min(later)] if later else text[start:]
-
-
-def _body_file(value, k, seg, segments, positions, text, cwd_known, cwd, heredoc):
+def _body_file(value, k, seg, text, cwd_known, cwd, heredoc):
     """(body, where it was read from), or None when the body cannot be known."""
     if value == "-":
         if heredoc is not None and k == 0 and seg.depth == 0:
@@ -402,25 +409,18 @@ def _body_file(value, k, seg, segments, positions, text, cwd_known, cwd, heredoc
         return None
     if not value or "$" in value or "`" in value or any(c in value for c in "*?["):
         return None
+    if k != 0 or "<(" in text or ">(" in text:
+        return None  # an earlier or concurrent step may write it: the file now is stale
     path = os.path.expanduser(value)
     if not os.path.isabs(path):
         if not cwd_known or not cwd:
             return None
         path = os.path.join(cwd, path)
-    skip = _ancestors(segments, k)
-    for j in range(k):
-        if j in skip:
-            continue
-        span = _span(text, positions, j, segments[j])
-        argv = segments[j].argv
-        prog = os.path.basename(argv[0]) if argv else ""
-        if prog not in _LEAVES_FILES or ">" in span or "tee" in span:
-            return None  # an earlier step may write it: the file read now is stale
     body = _read_body(path)
     return None if body is None else (body, path)
 
 
-def _body(opts, k, seg, segments, positions, text, cwd_known, cwd, heredoc):
+def _body(opts, k, seg, segments, text, cwd_known, cwd, heredoc):
     # A substitution inside the create runs before gh reads the body, and may write
     # its file or build its text: unknown, except the `$(cat <<'EOF'` idiom's own cat.
     children = _children(segments, k)
@@ -428,16 +428,16 @@ def _body(opts, k, seg, segments, positions, text, cwd_known, cwd, heredoc):
     if files:
         if children:
             return None
-        return _body_file(files[-1], k, seg, segments, positions, text, cwd_known, cwd, heredoc)
+        return _body_file(files[-1], k, seg, text, cwd_known, cwd, heredoc)
     bodies = [v for n, v in opts if n in ("-b", "--body")]
     if not bodies:
         return None  # gh needs a terminal to ask for one
     value = bodies[-1] or ""
-    if heredoc is not None and k == 0 and seg.depth == 0 and value.startswith("$(cat <<"):
+    if heredoc is not None and k == 0 and seg.depth == 0 and _IDIOM_VALUE.fullmatch(value):
         return heredoc, "the heredoc"
-    if "$(" in value or children:
-        return None
-    if _EXPANSION.search(value) and f"'{value}'" not in seg.raw:
+    # The argv is past quote removal, so whether bash expanded a `$` or a backtick
+    # cannot be read from it: any one makes the body unknown, as for a -F path.
+    if "$" in value or "`" in value or children:
         return None
     return value, "the --body argument"
 
@@ -452,11 +452,10 @@ def _judge_create(k, seg, inv, segments, positions, text, openers, heredoc, cwd)
         return None
     opts = sp.gh_option_values(argv, _OPTIONS)
     names = {n for n, _ in opts}
-    web = any(
-        n in ("--web", "-w") and (v is None or f"{n}={v}" in sp.GH_WEB_FLAGS) for n, v in opts
-    )
-    if web or names & _NO_FILING:
-        return None
+    if sp.gh_bool(opts, _WEB) is not False or sp.gh_bool(opts, _EDITOR) is not False:
+        return None  # a browser or an editor files nothing here; a non-bool value fails
+    if names & _NO_FILING or not names & _TITLE:
+        return None  # without a terminal gh refuses these, and a create with no title
     canonical = _canonical()
     if not canonical or "GH_HOST" in os.environ or "GH_HOST" in text:
         return None
@@ -484,7 +483,7 @@ def _judge_create(k, seg, inv, segments, positions, text, openers, heredoc, cwd)
             return None
         if not _cwd_targets(cwd, canonical):
             return None
-    found = _body(opts, k, seg, segments, positions, text, cwd_known, cwd, heredoc)
+    found = _body(opts, k, seg, segments, text, cwd_known, cwd, heredoc)
     if found is None:
         return None
     labels: list[str] = []
@@ -492,7 +491,12 @@ def _judge_create(k, seg, inv, segments, positions, text, openers, heredoc, cwd)
         if n in ("-l", "--label"):
             if v is None or "$" in v or "`" in v:
                 return None
-            labels += [x.strip() for row in csv.reader(io.StringIO(v)) for x in row]
+            # gh matches a name to the repo's label case-insensitively: `Bug` files `bug`
+            labels += [
+                pg.BUG_LABEL if x.strip().casefold() == pg.BUG_LABEL else x.strip()
+                for row in csv.reader(io.StringIO(v))
+                for x in row
+            ]
     if plan_doc._parser() is None:
         return None  # the server reads the answers with markdown-it; line rules can differ
     issue = {
