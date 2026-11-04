@@ -6,6 +6,7 @@ out of the facade so that module stays about choosing and calling a store.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import fcntl
 import json
@@ -14,7 +15,7 @@ import os
 import sys
 import time
 from collections import Counter
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -191,14 +192,34 @@ _RETRY: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "graph_store_retry",
     default=None,
 )
+#: Registered by ``traverse`` for its own context: writes the ``retried`` break
+#: row the moment a retry starts, the way a fallback is written before it runs,
+#: so a process killed during the retry cannot take the dropped connection with
+#: it (PR #3888 review).
+_ON_RETRY: contextvars.ContextVar[Callable[[str], Awaitable[None]] | None] = contextvars.ContextVar(
+    "graph_store_on_retry", default=None
+)
 
 
-def reset_retry() -> None:
+def reset_retry(on_retry: Callable[[str], Awaitable[None]] | None = None) -> None:
     _RETRY.set(None)
+    _ON_RETRY.set(on_retry)
 
 
-def note_retry(reason: str) -> None:
+async def note_retry(reason: str) -> None:
+    """Record that the store is about to retry a dropped connection. Awaits the
+    traversal's hook, which writes the break row now; a failure to write never
+    stops the retry, but a cancellation propagates as cancellations must."""
     _RETRY.set(reason)
+    hook = _ON_RETRY.get()
+    if hook is None:
+        return
+    try:
+        await hook(reason)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("could not record the graph read retry", exc_info=True)
 
 
 def read_retry() -> str | None:

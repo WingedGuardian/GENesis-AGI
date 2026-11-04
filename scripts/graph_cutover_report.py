@@ -109,10 +109,11 @@ def _cause(event: dict) -> str:
         parts[0] += f", age {event['proc_age_s']}s"
     diag = event.get("diag") if isinstance(event.get("diag"), dict) else {}
     if event.get("outcome") == "retried":
-        # Answered, but only after the engine dropped a pooled connection
-        # (#3035): typically an engine restart. No timeout, so no diag.
+        # The engine dropped a pooled connection (#3035), typically on an engine
+        # restart, and the read was retried. The row is written when the retry
+        # STARTS, so it cannot say whether the retry answered.
         reason = event.get("primary_reason") or "unknown"
-        parts.append(f"answered after one retry of a dropped connection ({reason})")
+        parts.append(f"retried a dropped connection ({reason}); the retry's own outcome is not in this row")
     if diag.get("budget_spent"):
         parts.append("budget spent before the second query")
     for key in ("budget_ms", "elapsed_ms", "late_ms", "cancel_ms"):

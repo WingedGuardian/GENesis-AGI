@@ -280,6 +280,18 @@ async def traverse(
         )
 
     track.on_break = _record_break
+
+    async def _record_retry(reason: str) -> None:
+        # The store is retrying a connection the engine dropped (#3035): the
+        # clock-breaking row is written NOW, before the retry is awaited, so a
+        # process killed mid-retry cannot lose it. One traversal, one row: a
+        # fallback after a failed retry finds the row already written.
+        if track.recorded:
+            return
+        track.primary_reason = reason
+        await _record_break("retried")
+
+    reset_retry(_record_retry)
     try:
         if selection_error:
             await _record_break("selection_failed")
@@ -329,6 +341,9 @@ async def traverse(
             primary_ms = result.query_ms
         return result
     finally:
+        # The retry hook closes over THIS traversal's track and db: clear it so
+        # a later store read in the same task cannot write through it.
+        reset_retry()
         # Only a classified outcome is recorded: anything else escaping
         # (interpreter shutdown) must not trigger a database write. A traversal
         # whose break was already recorded has its row.

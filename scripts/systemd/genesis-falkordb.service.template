@@ -100,7 +100,10 @@ ExecStart="__REDIS_SERVER__" \
 #   `-`: a failed trigger never fails the engine's own start.
 #   `+`: outside the sandbox below, like the mkdir, so the call reaches the
 #     user manager's bus whatever namespacing the sandbox ends up applying.
-ExecStartPost=-+/usr/bin/systemctl --user restart --no-block genesis-graph-project.service
+#   One retry after 2 s, so a transient bus hiccup does not leave the engine
+#   empty until the hourly timer (which stays the bound if both attempts fail;
+#   systemd logs the failed command either way).
+ExecStartPost=-+/bin/sh -c '/usr/bin/systemctl --user restart --no-block genesis-graph-project.service || { sleep 2; /usr/bin/systemctl --user restart --no-block genesis-graph-project.service; }'
 Restart=always
 RestartSec=5
 # Budgeted on RSS, not on the allocator figure. Note this only bites where the

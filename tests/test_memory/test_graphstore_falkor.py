@@ -2480,3 +2480,72 @@ async def test_an_auth_refusal_is_not_retried(tmp_path):
             await store.traverse(None, "root", max_depth=1, min_strength=0.5)
 
     assert graph.calls == 1
+
+
+async def test_the_retry_gets_only_the_budget_left_after_recording_it(tmp_path):
+    """The hook writes the telemetry row on the read's own budget. A write that
+    uses up the rest leaves nothing for the retry, which is then skipped
+    rather than run past the caller's deadline."""
+    import asyncio as _asyncio
+    import time as _time
+
+    from genesis.memory import graph_telemetry as telemetry
+
+    async def _slow_write(_reason):
+        await _asyncio.sleep(0.2)
+
+    graph = _FlakyGraph([])
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _client_for(graph)),
+    ):
+        await _warmed(store)
+        telemetry.reset_retry(_slow_write)
+        graph.fail = [_lost()]
+        graph.calls = 0
+        try:
+            with pytest.raises(GraphUnavailableError, match="Connection lost"):
+                await store._read(
+                    "RETURN 1", {}, timeout=1.0, deadline=_time.monotonic() + 0.1
+                )
+        finally:
+            telemetry.reset_retry()
+
+    assert graph.calls == 1
+
+
+async def test_the_retry_log_names_the_failure_it_retried(tmp_path, caplog):
+    import logging
+
+    graph = _FlakyGraph([])
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _client_for(graph)),
+    ):
+        await _warmed(store)
+        graph.fail = [_lost()]
+        with caplog.at_level(logging.INFO, logger=falkor_mod.logger.name):
+            await store.traverse(None, "root", max_depth=1, min_strength=0.5)
+
+    [line] = [r.getMessage() for r in caplog.records if "retrying once" in r.getMessage()]
+    assert "ConnectionError" in line
+
+
+async def test_the_marker_read_keeps_the_traversal_deadline(tmp_path):
+    """The marker query's retry budget is the TRAVERSAL's deadline, not a
+    fresh one taken after the budget check."""
+    import time as _time
+
+    seen = {}
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+
+    async def _fake_read(cypher, params, *, timeout, deadline):
+        seen["deadline"] = deadline
+        return _Result([[1]])
+
+    store._read = _fake_read
+    target = _time.monotonic() + 0.3
+    await store._assert_projection_exists(deadline=target)
+    assert seen["deadline"] == target

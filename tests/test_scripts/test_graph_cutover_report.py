@@ -422,10 +422,26 @@ def test_a_retried_reset_says_what_the_retry_recovered_from():
     out = _rep._cause(
         {"outcome": "retried", "pid": 7, "primary_reason": "ConnectionError", "diag": None}
     )
-    assert "answered after one retry of a dropped connection (ConnectionError)" in out
+    assert "retried a dropped connection (ConnectionError)" in out
 
 
 def test_a_fallback_reset_never_claims_a_retry():
     # redis-py's own frames include `call_with_retry`, so test the phrase, not the word.
-    phrase = "answered after one retry"
+    phrase = "retried a dropped connection"
     assert phrase not in _cause_of({"frames": _REPLY[-16:], "conn": "idle_open"})
+
+
+def test_a_cancelled_retry_is_never_called_answered():
+    """A cancelled read records `retried` with served_by none: the line must
+    not report an answer that was never returned."""
+    out = _rep._cause(
+        {
+            "outcome": "retried",
+            "served_by": "none",
+            "pid": 7,
+            "primary_reason": "ConnectionError",
+            "diag": None,
+        }
+    )
+    assert "answered" not in out
+    assert "retried a dropped connection (ConnectionError)" in out

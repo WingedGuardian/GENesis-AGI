@@ -695,8 +695,10 @@ class FalkorGraphStore:
         - ONCE, inside what is left of the caller's ``deadline``. ``timeout`` is
           the first attempt's budget exactly as the caller would have passed it
           to ``_query``, so a first-attempt timeout diagnoses as before.
-        - NEVER invisibly: ``note_retry`` makes the traversal row say
-          ``retried``, which breaks the cutover clock like any other failure.
+        - NEVER invisibly: ``note_retry`` writes the traversal's ``retried`` row
+          BEFORE the second attempt is awaited (a process killed mid-retry still
+          leaves it), and ``retried`` breaks the cutover clock like any other
+          failure.
         """
         had_client = self._db is not None
         try:
@@ -707,8 +709,14 @@ class FalkorGraphStore:
                 raise
             from genesis.memory.graph_telemetry import note_retry
 
-            note_retry(type(exc.__cause__).__name__)
-            logger.info("graph engine dropped a pooled connection; retrying the read once")
+            reason = type(exc.__cause__).__name__
+            logger.info("graph read failed with %s on an existing client; retrying once", reason)
+            await note_retry(reason)
+            # The log line and the hook's telemetry write run on this same
+            # budget; what they spent is not the retry's to spend again.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
             return await self._query(cypher, params, timeout=remaining)
 
     async def _key_op(self, op: str, *args: Any, timeout: float, **kwargs: Any) -> Any:
@@ -1094,7 +1102,9 @@ class FalkorGraphStore:
                 _PROJECTION_MARKER_COUNT,
                 {},
                 timeout=timeout,
-                deadline=time.monotonic() + timeout,
+                # The traversal's own deadline when it passed one, so a stall
+                # between the budget check above and here cannot extend it.
+                deadline=deadline if deadline is not None else time.monotonic() + timeout,
             )
         rows = result.result_set or []
         if not (rows and rows[0] and rows[0][0]):
