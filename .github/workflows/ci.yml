@@ -560,7 +560,14 @@ jobs:
           python scripts/check_cc_pin_receipts.py --advisory --base-sha "$base"
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, python: "3.12" }
+          - { os: ubuntu-26.04, python: "3.12" }
+          - { os: ubuntu-26.04, python: "3.14" }
     # CI is blocking — local full-suite runs are banned. See procedure
     # test_verification and CLAUDE.md "Targeted tests during development."
     #
@@ -581,7 +588,7 @@ jobs:
     # would pre-empt the per-test timeout and make it dead code. 180 leaves
     # ~139 min of growth headroom and still halves the default.
     # Revisit as the suite grows — the --durations output below is the data.
-    timeout-minutes: 180
+    timeout-minutes: 300
     # fetch-depth: 0 because measurement tests derive a rate from this
     # repository's own commit history and SKIP on a shallow clone rather than
     # lie. A skipped gate is an unevaluated gate: the commit-msg framing
@@ -594,7 +601,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -640,6 +647,8 @@ jobs:
           # settles it in the log instead of leaving the next reader to
           # re-derive it.
           echo "TERM=[${TERM-UNSET}]"
+          findmnt -T /tmp || true
+          findmnt -T "$HOME" || true
           pytest -rfE --durations=25 \
             --ignore-glob='**/test_*az*.py' \
             --ignore-glob='**/test_*shim*.py' \
@@ -694,7 +703,7 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
-          name: junit-test-report
+          name: junit-test-report-${{ matrix.os }}-${{ matrix.python }}
           path: junit.xml
           # pytest can die before writing any report (collection crash); the
           # failure-summary step already names that case in the summary, so a
@@ -764,6 +773,72 @@ jobs:
         # Native MCP client qualification (#3656): eleven installed-client and
         # mocked-turn opt-in cases, measured on the PR's runner, 552 -> 563.
         run: python scripts/check_skip_ceiling.py junit.xml --ceiling 563
+
+  image-facts:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test,transcript-analytics]" -c .github/test-tools/requirements.txt
+      - name: Print the image's toolchain
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: |
+          set +e
+          sudo --version
+          sudo -n /bin/echo sudo-ran
+          for t in sudo sleep timeout stat; do echo "$t -> $(readlink -f "$(command -v "$t")")"; done
+          command -v gnutimeout sudo.ws
+          timeout --version
+          gnutimeout --version
+          findmnt -T /tmp
+          findmnt -T "$HOME"
+          bash --version
+          /usr/bin/python3 -V
+          systemd-run --version
+          sudo loginctl enable-linger "$(id -un)"
+          echo "enable-linger rc=$?"
+          for _ in 1 2 3 4 5 6 7 8 9 10; do [ -S "/run/user/$(id -u)/bus" ] && break; sleep 2; done
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+          systemctl --user show-environment >/dev/null; echo "user manager rc=$?"
+          systemd-run --user --scope --quiet --expand-environment=no -- /usr/bin/printf '[%s]\n' 'literal'
+          echo "scope rc=$?"
+      - name: Affected tests, home temp
+        run: >-
+          pytest -rfEs --basetemp="$HOME/pytest-home"
+          tests/test_scripts/test_gnu_timeout.py
+          tests/test_hooks/test_wrapper_option_arity.py
+          tests/test_hooks/test_shell_parse.py::test_quoted_message_idiom_exemption_needs_the_opener_at_the_top_of_it
+          tests/test_scripts/test_disk_hygiene_browser_engines.py
+          tests/test_scripts/test_pytest_lock_wait.py
+          tests/test_scripts/test_systemctl_fence.py
+          tests/test_payments/test_payments_test_vault.py
+          tests/test_scripts/test_watchgod_disk_guardian.py
+          tests/test_scripts/test_backup_backends.py
+          tests/test_scripts/test_cc_updater_suppression.py
+        env:
+          GENESIS_TESTING: "1"
+      - name: Affected tests, tmpfs temp
+        if: ${{ !cancelled() }}
+        run: |
+          sudo mkdir -p /mnt/tmpfs-test
+          sudo mount -t tmpfs -o size=6g,mode=1777 tmpfs /mnt/tmpfs-test
+          pytest -rfEs --basetemp=/mnt/tmpfs-test/bt \
+            tests/test_payments/test_payments_test_vault.py \
+            tests/test_scripts/test_watchgod_disk_guardian.py \
+            tests/test_scripts/test_disk_hygiene_browser_engines.py \
+            tests/test_scripts/test_gnu_timeout.py
+        env:
+          GENESIS_TESTING: "1"
 
   collected-floor:
     # Tests that stop being collected make the suite SMALLER, not red. This job
