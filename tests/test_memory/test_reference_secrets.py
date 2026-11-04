@@ -498,3 +498,170 @@ def test_a_labelled_all_letter_password_is_redacted_even_glued():
                                           description="old: xsunshinefakes"))
     assert "sunshinefake" not in held
     assert "inactive" in ro.scrub("inactive", ["active"])
+
+
+# ── Round 2: every captured secret, every reference kind, checks before any store ──
+
+
+def test_a_second_password_in_a_description_is_redacted_too():
+    """split_secret holds out the VALUE; another secret the description names
+    ("backup password: ...") is just as indexed and goes too."""
+    held, value, _, _ = ro.split_secret(
+        _body(description="Router admin. backup password: Second!Fake8"),
+    )
+    assert value == _VALUE
+    assert "Second!Fake8" not in held and _PASSWORD not in held
+
+
+async def test_an_extraction_naming_two_passwords_stores_neither(db):
+    from genesis.memory.extraction import Extraction
+    from genesis.memory.reference_extraction import ingest_reference_from_extraction
+
+    ex = Extraction(
+        content="Lab router login: username: admin7, password: First!Fake9; backup password: Second!Fake8",
+        extraction_type="entity", confidence=0.9, entities=["Lab router"],
+    )
+    unit = await ingest_reference_from_extraction(ex, store=_store(), db=db, source_session_id="s")
+    body = (await kc.get(db, unit))["body"]
+    assert "First!Fake9" not in body and "Second!Fake8" not in body
+    assert "admin7" in body  # the login stays searchable
+    assert await _secret(db, unit) == "admin7 / First!Fake9"
+
+
+def test_a_declined_credential_never_falls_through_to_a_url_reference():
+    """The user-text gate declines a password Genesis wrote itself; the url
+    branch below would have stored the same text, password and all."""
+    from genesis.memory.extraction import Extraction
+    from genesis.memory.reference_extraction import classify_as_reference
+
+    ex = Extraction(
+        content="Signed in at https://forum.example.org/login with password: Gen!Fake42 for the bot",
+        extraction_type="entity", confidence=0.9,
+    )
+    assert classify_as_reference(ex, user_text="please sign the bot in to the forum") is None
+
+
+async def test_an_identifier_kind_loses_a_password_its_description_names(db):
+    body = fmt_mcp(kind="url", identifier="Forum login page",
+                   description="Login page; the password: Gen!Fake42 is the bot's",
+                   value="https://forum.example.org/login", tags=["forum"], source=None)
+    unit = await _ingest(db, _store(), body, domain="reference.url")
+    stored = (await kc.get(db, unit))["body"]
+    assert "Gen!Fake42" not in stored
+    assert "https://forum.example.org/login" in stored  # the value stays
+
+
+@pytest.mark.parametrize("text, secret", [
+    ("Set NODE_ENV=production before deploy", None),
+    ("MODEL_NAME=qwen3-embedding:0.6b-fp16 is the embedder", None),
+    ("AUTHOR=someone CAPITAL_CITY=Lisbonfake API_BASE=v2alpha-fake", None),
+    ("Put API_KEY=abcd1234efgh5678 in the env file", "abcd1234efgh5678"),
+    ("the password is Hunt3r!fake for now", "Hunt3r!fake"),
+    ("the password is sunshinefake for now", "sunshinefake"),
+    ("my pin is 48151623 at the desk", "48151623"),
+    ("the api key is abcdefghijklmnopqrstuv here", "abcdefghijklmnopqrstuv"),
+    ("DATABASE_URL=postgres://app:Pw9fakesecret@db.example.org/app", "Pw9fakesecret"),
+    ("cache at redis://:s3cretfake@cache:6379/0 for jobs", "s3cretfake"),
+])
+def test_only_credential_shaped_captures_are_scrubbed(text, secret):
+    from genesis.memory.extraction import Extraction
+    from genesis.memory.reference_extraction import scrub_credential_extraction
+
+    ex = Extraction(content=text, extraction_type="entity", confidence=0.9)
+    assert scrub_credential_extraction(ex) is (secret is not None)
+    if secret is None:
+        assert ex.content == text
+    else:
+        assert secret not in ex.content
+
+
+def test_an_all_letter_secret_is_not_cut_out_of_longer_words_in_extractions():
+    from genesis.memory.extraction import Extraction
+    from genesis.memory.reference_extraction import scrub_credential_extraction
+
+    ex = Extraction(content="password: sunflower; we planted sunflowers by the sunflower bed",
+                    extraction_type="entity", confidence=0.9)
+    assert scrub_credential_extraction(ex) is True
+    assert "sunflowers" in ex.content  # a longer word stays whole
+    assert f"by the {ro.REDACTED} bed" in ex.content  # the word itself goes
+
+
+async def test_a_refused_credential_stores_no_vector(db):
+    """The refusal runs before store.store, so no orphaned point or memory_fts
+    row names a unit that was never written."""
+    store = _store()
+    held = _body().replace(f"Value: {_VALUE}", f"Value: {kc.SECRET_PLACEHOLDER}")
+    with pytest.raises(ValueError, match="no value to hold"):
+        await ingest_knowledge_unit(
+            store=store, db=db, content=held, project=ro.REFERENCE_PROJECT,
+            domain="reference.credentials", concept="brand new",
+        )
+    store.store.assert_not_awaited()
+
+
+def test_the_project_is_case_folded_like_the_domain():
+    assert kc.holds_secret("Reference", "reference.credentials")
+    assert kc.holds_secret(" reference ", "Reference.Credentials")
+    assert not kc.holds_secret("references", "reference.credentials")
+
+
+def test_a_prose_capture_in_the_scrub_costs_only_that_whole_word():
+    """The scrub counts "the password is stored" as a capture (a miss would
+    leak), and pays for it with the standalone word only."""
+    from genesis.memory.extraction import Extraction
+    from genesis.memory.reference_extraction import scrub_credential_extraction
+
+    ex = Extraction(content="the password is stored in the vault, restored nightly",
+                    extraction_type="entity", confidence=0.9)
+    scrub_credential_extraction(ex)
+    assert "restored nightly" in ex.content
+    assert "vault" in ex.content
+
+
+@pytest.mark.parametrize("phrase", ["password is sunshinefake", "pin is 48151623"])
+def test_an_unshaped_password_never_falls_through_to_a_weaker_kind(phrase):
+    from genesis.memory.extraction import Extraction
+    from genesis.memory.reference_extraction import classify_as_reference
+
+    content = f"Forum at https://forum.example.org for the bot, username bob, {phrase}"
+    ex = Extraction(content=content, extraction_type="entity", confidence=0.9)
+    ref = classify_as_reference(ex, user_text="https://forum.example.org")
+    assert ref is None or ref["kind"] == "credentials"
+
+
+def test_a_secret_in_the_last_json_tag_is_redacted():
+    body = fmt_mcp(kind="url", identifier="Forum", description="the forum",
+                   value="https://forum.example.org", tags=None, source=None)
+    _, tags, _ = ro.scrub_reference(body, json.dumps(["forum", "login password: sunflowerfake"]))
+    assert "sunflowerfake" not in tags
+    held, _, tags2, _ = ro.split_secret(_body(), json.dumps(["backup password: sunflowerfake"]))
+    assert "sunflowerfake" not in tags2
+
+
+async def test_a_reference_project_in_another_case_is_stored_canonically(db):
+    unit = await ingest_knowledge_unit(
+        store=_store(), db=db, content=_body(), project="Reference",
+        domain="reference.credentials", concept="Lab router admin",
+    )
+    row = await kc.get(db, unit)
+    assert row["project_type"] == "reference"
+    assert _PASSWORD not in row["body"]
+
+
+def test_a_classified_password_keeps_its_trailing_symbol():
+    from genesis.memory.extraction import Extraction
+    from genesis.memory.reference_extraction import classify_as_reference
+
+    ex = Extraction(content="Lab NAS login: username: nasadmin password: Pw9fake!",
+                    extraction_type="entity", confidence=0.9, entities=["Lab NAS"])
+    assert classify_as_reference(ex)["value"] == "nasadmin / Pw9fake!"
+
+
+@pytest.mark.parametrize("raw, value", [
+    ("Pw9fake)", "Pw9fake)"), ("(Pw9fake!)", "Pw9fake!"), ('"Pw9fake"', "Pw9fake"),
+    ("[Pw9fake]", "Pw9fake"), ("(Pw9fake", "Pw9fake"),
+])
+def test_a_capture_loses_only_wrapping_never_its_own_characters(raw, value):
+    from genesis.memory.reference_extraction import _unwrap
+
+    assert _unwrap(raw) == value

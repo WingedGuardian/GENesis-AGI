@@ -24,7 +24,60 @@ _TRAILER_PREFIXES = ("Tags: ", "Captured: ")
 
 def holds_secret(project_type: str | None, domain: str | None) -> bool:
     """True for a reference whose value is held out of the indexed body."""
-    return project_type == "reference" and (domain or "").strip().lower() == CREDENTIAL_DOMAIN
+    return (
+        (project_type or "").strip().lower() == "reference"
+        and (domain or "").strip().lower() == CREDENTIAL_DOMAIN
+    )
+
+
+async def check_credential_write(
+    db: aiosqlite.Connection,
+    *,
+    project_type: str,
+    domain: str,
+    concept: str,
+    secret_value: str | None,
+) -> None:
+    """Raise ValueError when a credential row could not commit with its value.
+
+    ``ingest_knowledge_unit`` runs this BEFORE it stores the vector, and
+    ``upsert`` runs it again before its first write, so a refused credential
+    leaves nothing behind in any store. The statement touches
+    ``reference_secrets``, so a database whose schema init has not created the
+    table fails here too. A no-op for every other row.
+    """
+    if not holds_secret(project_type, domain):
+        return
+    existing = await db.execute_fetchall(
+        "SELECT k.id, (SELECT 1 FROM reference_secrets s WHERE s.unit_id = k.id) "
+        "FROM knowledge_units k WHERE k.project_type = ? AND k.domain = ? "
+        "AND k.concept = ?",
+        (project_type, domain, concept),
+    )
+    if secret_value is None and not (existing and existing[0][1]):
+        raise ValueError(
+            "refusing a credential reference with no value to hold: its body "
+            "carries the placeholder and no secret is stored for it (#2426)"
+        )
+
+
+async def get_reference_secret(db: aiosqlite.Connection, unit_id: str) -> str | None:
+    """The held-out value stored for ``unit_id``, or None when there is none."""
+    rows = await db.execute_fetchall(
+        "SELECT value FROM reference_secrets WHERE unit_id = ?", (unit_id,),
+    )
+    return rows[0][0] if rows else None
+
+
+async def qdrant_point_named_elsewhere(
+    db: aiosqlite.Connection, qdrant_id: str, *, exclude_id: str,
+) -> bool:
+    """True when a unit other than ``exclude_id`` still names ``qdrant_id``."""
+    rows = await db.execute_fetchall(
+        "SELECT 1 FROM knowledge_units WHERE qdrant_id = ? AND id != ? LIMIT 1",
+        (qdrant_id, exclude_id),
+    )
+    return bool(rows)
 
 
 def refuse_inline_secret(project_type: str, domain: str, body: str) -> None:
@@ -326,17 +379,10 @@ async def upsert(
         # rolled back safely nor left pending for another writer's commit. The
         # first statement touches reference_secrets, so a database whose schema
         # init has not created it fails here, with nothing written.
-        existing = await db.execute_fetchall(
-            "SELECT k.id, (SELECT 1 FROM reference_secrets s WHERE s.unit_id = k.id) "
-            "FROM knowledge_units k WHERE k.project_type = ? AND k.domain = ? "
-            "AND k.concept = ?",
-            (project_type, domain, concept),
+        await check_credential_write(
+            db, project_type=project_type, domain=domain, concept=concept,
+            secret_value=secret_value,
         )
-        if secret_value is None and not (existing and existing[0][1]):
-            raise ValueError(
-                "refusing a credential reference with no value to hold: its body "
-                "carries the placeholder and no secret is stored for it (#2426)"
-            )
     actual_id, inserted = await _write()
     if secret_value is not None:
         # Under the id the row ACTUALLY has once the unique-key conflict

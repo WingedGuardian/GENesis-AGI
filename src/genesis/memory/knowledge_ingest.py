@@ -80,16 +80,32 @@ async def ingest_knowledge_unit(
     # redactions, and the value travels only to knowledge_crud.upsert, which
     # writes it to reference_secrets in the unit's own transaction. Refuses
     # (ValueError) a credential whose value cannot be located, before anything
-    # is written.
+    # is written. Every other reference kind keeps its value, but loses any
+    # credential-pattern secret its description, tags or identifier carry.
     from genesis.memory import reference_ops
 
+    # One spelling for the reference project, so every reader (lookup, delete,
+    # the dashboard), which compares it exactly, sees what the gate saw.
+    if (project or "").strip().lower() == reference_ops.REFERENCE_PROJECT:
+        project = reference_ops.REFERENCE_PROJECT
     secret_value: str | None = None
     if reference_ops.holds_secret(project, domain):
         content, secret_value, tags_json, concept = reference_ops.split_secret(
             content, tags_json, concept,
         )
+    elif project == reference_ops.REFERENCE_PROJECT:
+        content, tags_json, concept = reference_ops.scrub_reference(
+            content, tags_json, concept,
+        )
 
     resolved_concept = concept if concept is not None else content[:200]
+    # A credential write that upsert would refuse (no value to hold, or no
+    # reference_secrets table) is refused HERE, before store.store puts a
+    # vector and a memory_fts row in place that no unit would name.
+    await knowledge_crud.check_credential_write(
+        db, project_type=project, domain=domain, concept=resolved_concept,
+        secret_value=secret_value,
+    )
 
     # Injection-pattern scan (detect-and-log, fail-open). This is the second
     # ingestion chokepoint — covering the knowledge_ingest MCP tool (allow-listed
@@ -189,10 +205,9 @@ async def ingest_knowledge_unit(
     # store.store dedups by exact content, so two units can share one point
     # (credentials more often now, with the value held out of both bodies):
     # never delete a point another unit still names.
-    still_named = bool(old_qdrant_id) and bool(await db.execute_fetchall(
-        "SELECT 1 FROM knowledge_units WHERE qdrant_id = ? AND id != ? LIMIT 1",
-        (old_qdrant_id, actual_id),
-    ))
+    still_named = bool(old_qdrant_id) and await knowledge_crud.qdrant_point_named_elsewhere(
+        db, old_qdrant_id, exclude_id=actual_id,
+    )
     if old_qdrant_id and old_qdrant_id != qdrant_memory_id and not still_named:
         try:
             res = await store.delete(old_qdrant_id)

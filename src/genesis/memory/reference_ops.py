@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Any
 from genesis.db.crud.knowledge import CREDENTIAL_DOMAIN as _CREDENTIAL_DOMAIN
 from genesis.db.crud.knowledge import SECRET_PLACEHOLDER as _CRUD_PLACEHOLDER
 from genesis.db.crud.knowledge import (
+    get_reference_secret,
     holds_secret,  # noqa: F401 - one rule, shared with the db layer
 )
 
@@ -160,10 +161,9 @@ def secret_fragments(value: str) -> list[str]:
     first: the whole value, each segment that is not an identifier, and every
     secret-looking token inside them.
 
-    MEASURED (a live install, 2026-11-04): over 4 in 10 credential bodies
-    repeated a segment of their value in the description or tags, most often
-    the one labelled ``password``; none repeated the whole value. Holding out only the
-    ``Value:`` line would have left them indexed. Tokens count too, because a
+    A credential body often repeats a segment of its value in the description
+    or tags, most often the one labelled ``password``, and rarely the whole
+    value, so holding out only the ``Value:`` line is not enough. Tokens count too, because a
     prose value ("log in as x with password y") is one segment whose repeat in
     the description is usually just the password.
     """
@@ -176,7 +176,7 @@ def _fragments(value: str) -> tuple[list[str], frozenset[str]]:
     whole = value.strip()
     fragments = {whole} if whole else set()
     glued: set[str] = set()
-    # "login / secret" (a common shape on a live install): by convention the
+    # "login / secret" (a common value shape): by convention the
     # first part is the login, an identifier the description legitimately
     # names, and the second part is the secret, however short.
     pair = [part.strip() for part in whole.split(" / ")] if whole.count(" / ") == 1 else []
@@ -247,7 +247,7 @@ def scrub(text: str, fragments: list[str], glued: frozenset[str] = frozenset()) 
 
 def _scrub_tag(tag: str, fragments: list[str]) -> str:
     # A tag is a label, not prose: any occurrence goes, even inside a longer
-    # word (MEASURED: one live credential's tag carries its password that way),
+    # word (a tag can carry a password that way),
     # since over-redacting a tag costs nothing a lookup needs.
     for fragment in fragments:
         tag = tag.replace(fragment, REDACTED)
@@ -312,6 +312,11 @@ def split_secret(
     trailer: list[str] = []
     while lines and lines[-1].startswith(_TRAILER_PREFIXES):
         trailer.insert(0, lines.pop())
+    # Any OTHER secret the row carries ("backup password: ..." in the
+    # description) is just as indexed as the held-out one.
+    fragments = _merge(
+        fragments, _captured_fragments([body[:idx], concept, *_tag_texts(tags_json), *trailer]),
+    )
     held = scrub(body[:idx], fragments, glued) + _VALUE_MARKER + SECRET_PLACEHOLDER
     if trailer:
         held += "\n" + "\n".join(
@@ -321,6 +326,62 @@ def split_secret(
     return (
         held, value, _scrub_tags(tags_json, fragments),
         scrub(concept, fragments, glued) if concept is not None else None,
+    )
+
+
+def _captured_fragments(texts: list[str | None]) -> list[str]:
+    """Fragments of every secret a credential pattern captures in ``texts``
+    (the rule ``reference_extraction`` stores and redacts by)."""
+    from genesis.memory.reference_extraction import captured_secrets
+
+    secrets = captured_secrets([t for t in texts if t])
+    return [f for secret in secrets for f in secret_fragments(secret)]
+
+
+def _tag_texts(tags_json: str | None) -> list[str]:
+    """Each tag as its own text, so a capture never runs into JSON quoting."""
+    if not tags_json:
+        return []
+    try:
+        tags = json.loads(tags_json)
+    except ValueError:
+        return [tags_json]
+    if not isinstance(tags, list):
+        return [tags_json]
+    return [t for t in tags if isinstance(t, str)]
+
+
+def _merge(*groups: list[str]) -> list[str]:
+    return sorted({f for group in groups for f in group if f}, key=len, reverse=True)
+
+
+def scrub_reference(
+    body: str, tags_json: str | None = None, concept: str | None = None,
+) -> tuple[str, str | None, str | None]:
+    """(body, tags, concept) of a NON-credential reference with every
+    credential-pattern secret redacted outside its ``Value:`` line.
+
+    An identifier kind (url, network, account, fact) keeps its value, which is
+    what its lookups search for; its description, tags and identifier are free
+    text that can carry a password all the same, and are indexed exactly as a
+    credential's are.
+    """
+    idx = body.find(_VALUE_MARKER)
+    head, tail = (body, "") if idx == -1 else (body[:idx], body[idx:])
+    trailer = [line for line in tail.split("\n") if line.startswith(_TRAILER_PREFIXES)]
+    fragments = _captured_fragments([head, concept, *_tag_texts(tags_json), *trailer])
+    if not fragments:
+        return body, tags_json, concept
+    tail_lines = [
+        _scrub_tag(line, fragments) if line.startswith("Tags: ")
+        else scrub(line, fragments) if line.startswith("Captured: ")
+        else line
+        for line in tail.split("\n")
+    ] if tail else []
+    return (
+        scrub(head, fragments) + "\n".join(tail_lines),
+        _scrub_tags(tags_json, fragments),
+        scrub(concept, fragments) if concept is not None else None,
     )
 
 
@@ -336,13 +397,10 @@ async def resolve_value(db: aiosqlite.Connection, row: dict) -> str | None:
     value = parse_reference_body(row.get("body"))["value"]
     if value != SECRET_PLACEHOLDER or not holds_secret(row.get("project_type"), row.get("domain")):
         return value or None
-    rows = await db.execute_fetchall(
-        "SELECT value FROM reference_secrets WHERE unit_id = ?", (row["id"],),
-    )
-    if not rows:
+    secret = await get_reference_secret(db, row["id"])
+    if secret is None:
         logger.error("reference %s holds its value out, but no secret is stored for it", row["id"])
-        return None
-    return rows[0][0]
+    return secret
 
 
 async def compose_body(db: aiosqlite.Connection, row: dict) -> tuple[str, bool]:
