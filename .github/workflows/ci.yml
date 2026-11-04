@@ -355,6 +355,10 @@ jobs:
     # too: a case that could not run has established nothing.
     # See scripts/ci/mutation_sweep.py.
     runs-on: ubuntu-latest
+    # The project's floor, not a measured bound: without it a hung case holds a
+    # runner for GitHub's default six hours. Results print as cases finish, so a
+    # job stopped here still reports the cases that ran.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
         with:
@@ -373,7 +377,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[test,transcript-analytics]" -c .github/test-tools/requirements.txt
       - name: Mutation gate
-        run: python scripts/ci/mutation_sweep.py config/mutation_gate.json --repo .
+        # exec: the runner signals only the step's entry process, so under bash the
+        # sweep would never hear a cancel (from the runner's source, not measured on
+        # a hosted run). --timeout: a run's bound must be shorter than the job's, or a
+        # hang ends the job with no reason given and later cases unjudged. Four hung
+        # runs fit; the owner accepted going below the 2-hour floor for this command.
+        run: exec python scripts/ci/mutation_sweep.py config/mutation_gate.json --repo . --timeout 1500
 
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
