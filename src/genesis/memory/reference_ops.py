@@ -114,9 +114,9 @@ def parse_reference_body(body: str | None) -> dict[str, str]:
 # ─── Credential values live outside the indexed body (#2426) ──────────────────
 #
 # A credential's VALUE is the one part of a reference no recall surface needs:
-# lookup goes by identifier and description (MEASURED 2026-11-04 on a live
-# install: with the value dropped, top-1 identifier recall IMPROVED on both the
-# vector and the keyword path). Every store that indexes a body
+# lookup goes by identifier and description, and leaving the value out of the
+# indexed text does not cost identifier recall on either the vector or the
+# keyword path. Every store that indexes a body
 # (knowledge_units + knowledge_fts, memory_fts, the Qdrant payload and its
 # embedding) therefore gets the body with the value replaced by
 # SECRET_PLACEHOLDER, and the value goes to ``reference_secrets``, a table no
