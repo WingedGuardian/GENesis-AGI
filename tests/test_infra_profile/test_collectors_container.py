@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import tempfile
 from pathlib import Path
 
@@ -1239,26 +1240,48 @@ def test_user_manager_cgroup_falls_back_to_the_standard_path(tmp_path, monkeypat
     assert _container._user_manager_cgroup() == f"/user.slice/user-{uid}.slice/user@{uid}.service"
 
 
-@pytest.mark.parametrize(("state", "expected"), [
-    ("active", True), ("inactive", False), ("failed", False),
-    ("activating", None), ("deactivating", None), ("reloading", None), (None, None),
+def _oomd_rig(tmp_path, monkeypatch, events, *, booted=True, unified=True):
+    """A cgroup mount with oomd's unit cgroup holding `events` (None: absent).
+    Any subprocess is a failure: the probe reads files only."""
+    mount = tmp_path / "cgroup"
+    mount.mkdir()
+    if unified:
+        (mount / "cgroup.controllers").write_text("cpu memory pids\n")
+    if events is not None:
+        unit = mount / "system.slice" / "systemd-oomd.service"
+        unit.mkdir(parents=True)
+        (unit / "cgroup.events").write_text(events)
+    booted_dir = tmp_path / "run-systemd-system"
+    if booted:
+        booted_dir.mkdir()
+    pid1 = tmp_path / "pid1-cgroup"
+    pid1.write_text("0::/init.scope\n")
+    monkeypatch.setattr(_container, "_CGROUP_MOUNT", mount)
+    monkeypatch.setattr(_container, "_SYSTEMD_BOOTED", booted_dir)
+    monkeypatch.setattr(_container, "_PID1_CGROUP", pid1)
+    return pid1
+
+    async def no_cmd(*argv, timeout=None, strict=False):
+        raise AssertionError(f"the oomd probe runs no command: {argv}")
+    monkeypatch.setattr(_container, "_run_cmd", no_cmd)
+
+
+@pytest.mark.parametrize(("events", "expected"), [
+    ("populated 1\nfrozen 0\n", True),
+    ("populated 0\nfrozen 0\n", False),
+    (None, False),
 ])
-async def test_oomd_active_reads_the_service_state(monkeypatch, tmp_path, state, expected):
-    monkeypatch.setattr(_container, "_SYSTEMD_BOOTED", tmp_path)
-    async def fake(*argv, timeout=None, strict=False):
-        assert strict and argv[-1] == "systemd-oomd.service"
-        return state
-    monkeypatch.setattr(_container, "_run_cmd", fake)
+async def test_oomd_active_reads_its_cgroup(monkeypatch, tmp_path, events, expected):
+    """A running unit has a populated cgroup; a stopped one has none."""
+    _oomd_rig(tmp_path, monkeypatch, events)
     assert await _REAL_OOMD_ACTIVE() is expected
 
 
-async def test_oomd_active_is_unknown_without_a_systemd_manager(monkeypatch, tmp_path):
-    """No /run/systemd/system: structural, so never a strict call that would
-    error the memory section on every refresh."""
-    monkeypatch.setattr(_container, "_SYSTEMD_BOOTED", tmp_path / "absent")
-    async def fake(*argv, timeout=None, strict=False):
-        raise AssertionError("systemctl must not be asked without a systemd manager")
-    monkeypatch.setattr(_container, "_run_cmd", fake)
+@pytest.mark.parametrize(("booted", "unified"), [(False, True), (True, False)])
+async def test_oomd_active_is_unknown_where_it_cannot_be_asked(monkeypatch, tmp_path, booted, unified):
+    """No systemd manager, or no unified hierarchy for oomd to run on:
+    structural, so None rather than an answer or an errored section."""
+    _oomd_rig(tmp_path, monkeypatch, "populated 1\n", booted=booted, unified=unified)
     assert await _REAL_OOMD_ACTIVE() is None
 
 
@@ -1309,5 +1332,77 @@ async def test_any_oomctl_failure_raises_so_the_prior_facts_are_kept(tmp_path, m
     """An uncertain oomctl result is never recorded as an answer: facts are
     hashed, and a hiccup would cost two drift observations and a false alarm."""
     _um_rig(tmp_path, monkeypatch, oomctl_out=ProbeFailed("oomctl exited 1"))
+    monkeypatch.setattr(_container, "_system_bus_reachable", lambda: True)
     with pytest.raises(ProbeFailed):
         await _REAL_UM_PROBE(True)
+
+
+async def test_an_unreachable_system_bus_is_structural_not_an_error(tmp_path, monkeypatch):
+    """A process that cannot reach the system bus (a sandboxed unit, a CI
+    runner) fails oomctl the same way on every refresh: None, never an errored
+    memory section."""
+    _um_rig(tmp_path, monkeypatch, oomctl_out=ProbeFailed("oomctl exited 1"))
+    monkeypatch.setattr(_container, "_system_bus_reachable", lambda: False)
+    assert await _REAL_UM_PROBE(True) is None
+
+
+@pytest.mark.parametrize(("line", "expected"), [
+    ("0::/init.scope", ""),
+    ("0::/lxc/box/init.scope", "lxc/box"),
+    ("0::/../../init.scope", None),
+    ("0::/system.slice/foo.service", None),
+    ("12:pids:/init.scope", None),
+])
+def test_systemd_cgroup_root_comes_from_pid1(tmp_path, monkeypatch, line, expected):
+    """Own namespace: root ""; a shared host tree: the prefix; a private
+    namespace (PID 1 above the root) or an odd line: None, never a guess."""
+    pid1 = tmp_path / "pid1"
+    pid1.write_text(line + "\n")
+    monkeypatch.setattr(_container, "_PID1_CGROUP", pid1)
+    assert _container._systemd_cgroup_root() == expected
+
+
+async def test_oomd_active_reads_under_the_systemd_root(tmp_path, monkeypatch):
+    """A container sharing the host's tree finds its own oomd under its prefix,
+    not the host's at the mount root."""
+    pid1 = _oomd_rig(tmp_path, monkeypatch, "populated 1\n")  # host's oomd at the root
+    pid1.write_text("0::/lxc/box/init.scope\n")
+    assert await _REAL_OOMD_ACTIVE() is False  # this container's oomd: absent
+    unit = tmp_path / "cgroup/lxc/box/system.slice/systemd-oomd.service"
+    unit.mkdir(parents=True)
+    (unit / "cgroup.events").write_text("populated 1\n")
+    assert await _REAL_OOMD_ACTIVE() is True
+    pid1.write_text("0::/../init.scope\n")
+    assert await _REAL_OOMD_ACTIVE() is None
+
+
+def test_system_bus_reachable_follows_the_address(monkeypatch):
+    """Only a permission error bars the bus. A listening socket is reachable,
+    and so are a refused connect and a missing path: transient, never a
+    structural "barred" that would record None for a hiccup."""
+    import shutil
+    import socket
+
+    short = Path(tempfile.mkdtemp(prefix="bus"))  # sun_path is ~108 bytes
+    try:
+        live = short / "live"
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
+            server.bind(str(live))
+            server.listen(1)
+            monkeypatch.setenv("DBUS_SYSTEM_BUS_ADDRESS", f"unix:path={live},guid=x")
+            assert _container._system_bus_reachable() is True
+        dead = bind_unix_socket(short / "dead")
+        monkeypatch.setenv("DBUS_SYSTEM_BUS_ADDRESS", f"unix:path={dead};tcp:host=x")
+        assert _container._system_bus_reachable() is True
+        monkeypatch.setenv("DBUS_SYSTEM_BUS_ADDRESS", f"unix:path={short / 'absent'}")
+        assert _container._system_bus_reachable() is True
+        barred = short / "barred"
+        barred.mkdir()
+        bind_unix_socket(barred / "s")
+        barred.chmod(0)
+        monkeypatch.setenv("DBUS_SYSTEM_BUS_ADDRESS", f"unix:path={barred / 's'}")
+        if os.geteuid() != 0:  # root ignores the mode
+            assert _container._system_bus_reachable() is False
+        barred.chmod(0o700)
+    finally:
+        shutil.rmtree(short, ignore_errors=True)

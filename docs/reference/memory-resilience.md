@@ -252,8 +252,8 @@ flags unprotected installs:
 |---|---|---|---|
 | `cgroup_memory_swap_max` | container | `"max"` (or an int) | `0` |
 | `oomd_user_slice_kill` | container | `true` | `false` |
-| `oomd_active` | container | `true` (`systemd-oomd.service` active) | `false`: oomd is not running, so nothing monitors whatever is configured |
-| `oomd_user_manager_monitored` | container | `true` (live `oomctl` listing) | `false`: oomd runs and does not list it (degraded to the backstop, where `avoid` is ignored). `null` when oomd is not running or `oomctl` is absent; a failing `oomctl` keeps the prior value |
+| `oomd_active` | container | `true` (`systemd-oomd.service` running: its cgroup is populated) | `false`: oomd is not running, so nothing monitors whatever is configured. `null` when it cannot be read: not booted with systemd, no unified hierarchy, or systemd's cgroup root not locatable |
+| `oomd_user_manager_monitored` | container | `true` (live `oomctl` listing) | `false`: oomd runs and does not list it (degraded to the backstop, where `avoid` is ignored). `null` when oomd is not running, `oomctl` is absent, or this process is barred from the system bus; any other failing `oomctl` keeps the prior value |
 | `pid_ceiling_effective_ok` | container | `true` | `false` |
 | `swap_total_kb` | host | > 0 | `0` |
 | `container_limits["limits.memory.swap"]` | host_virt | `"true"`/absent | `"false"` |

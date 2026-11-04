@@ -649,29 +649,90 @@ def _user_manager_cgroup() -> str | None:
 
 
 _SYSTEMD_BOOTED = Path("/run/systemd/system")
+_PID1_CGROUP = Path("/proc/1/cgroup")
+_OOMD_CGROUP = "system.slice/systemd-oomd.service"
+
+
+def _systemd_cgroup_root() -> str | None:
+    """systemd's cgroup root as this process sees it, from PID 1's own line.
+
+    PID 1 sits in `<root>/init.scope`. With its own cgroup namespace (a host,
+    or a container like this box: `0::/init.scope`) the root is "", but a
+    container sharing the host's tree sees a prefix, and a process in a private
+    cgroup namespace sees PID 1 above its root (`..`). None when the line is
+    unreadable or not shaped that way, so the read is never aimed at the wrong
+    manager's units."""
+    try:
+        lines = _PID1_CGROUP.read_text().splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        if line.startswith("0::"):
+            path = line[3:]
+            if path.endswith("/init.scope") and ".." not in path.split("/"):
+                return path[: -len("/init.scope")].lstrip("/")
+    return None
 
 
 async def _oomd_active() -> bool | None:
-    """Whether systemd-oomd.service is running.
+    """Whether systemd-oomd.service is running, read from its own cgroup.
 
-    None when it cannot be asked (no systemctl, or not booted with systemd:
-    the sd_booted() test, so a box without a system manager never errors the
-    memory section) and while the unit is mid-transition (activating,
-    deactivating, reloading), so a refresh that lands inside a restart does
-    not record a phantom "not running". `systemctl show` exits 0 for any unit,
-    existing or not (MEASURED, systemd 255), so a nonzero exit is a failure
-    and strict raises, keeping the prior facts."""
-    if not _SYSTEMD_BOOTED.is_dir():
+    systemd removes a unit's cgroup when the unit stops (MEASURED, systemd
+    255: an inactive unit shows an empty ControlGroup and no directory), so a
+    populated cgroup means oomd runs and a missing one means it does not.
+    Reading the cgroup needs no bus and no subprocess. `systemctl show` was
+    used here first, and on a box whose system bus this user cannot reach (a
+    CI runner, a sandboxed service) it exits 1 on every refresh, which errored
+    the whole memory section permanently.
+
+    None when it cannot be asked: not booted with systemd (the sd_booted()
+    test), no unified cgroup hierarchy (which oomd requires), systemd's root
+    not locatable from PID 1's cgroup, or a read error other than the cgroup
+    being absent.
+
+    Accepted residual: inside a restart (`systemctl restart`, or the 100 ms
+    Restart=on-failure gap) the unit has no cgroup for a moment, so a refresh
+    landing exactly there reads False once."""
+    if not _SYSTEMD_BOOTED.is_dir() or not (_CGROUP_MOUNT / "cgroup.controllers").is_file():
         return None
-    state = await _run_cmd(
-        "systemctl", "show", "-p", "ActiveState", "--value", "systemd-oomd.service", strict=True
-    )
-    if state is None:
+    root = _systemd_cgroup_root()
+    if root is None:
         return None
-    state = state.strip()
-    if state in ("activating", "deactivating", "reloading"):
+    try:
+        events = (_CGROUP_MOUNT / root / _OOMD_CGROUP / "cgroup.events").read_text()
+    except FileNotFoundError:
+        return False
+    except OSError:
         return None
-    return state == "active"
+    return "populated 1" in events.splitlines()
+
+
+def _system_bus_reachable() -> bool:
+    """Is the system D-Bus socket reachable, or barred from this process?
+
+    Structural, like user_manager_present(): `oomctl` asks oomd over the system
+    bus, and a process barred from the bus (a sandboxed unit with the socket
+    made inaccessible) gets the same "Permission denied" on every refresh, so
+    its failure is a standing property, not a hiccup. Only a permission error
+    reads as barred: a refused or timed-out connect (dbus-daemon restarting, a
+    full backlog) is transient, and oomd itself needs the bus, so a missing
+    socket while oomd runs is not structural either. A plain connect answers
+    without parsing oomctl's stderr text."""
+    addr = os.environ.get("DBUS_SYSTEM_BUS_ADDRESS", "").split(";", 1)[0]
+    path = "/run/dbus/system_bus_socket"
+    if addr.startswith("unix:path="):
+        path = addr[len("unix:path="):].split(",", 1)[0]
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(1)
+        s.connect(path)
+    except PermissionError:
+        return False
+    except OSError:
+        return True
+    finally:
+        s.close()
+    return True
 
 
 async def _oomd_user_manager_monitored(oomd_active: bool | None) -> bool | None:
@@ -686,7 +747,8 @@ async def _oomd_user_manager_monitored(oomd_active: bool | None) -> bool | None:
     One question only: does `oomctl` list the cgroup? True or False from the
     listing. None when it cannot be asked: no `oomctl`, no user-manager cgroup,
     or oomd not running (that is its own fact, `oomd_active`, and asking would
-    only socket-activate it). Any nonzero `oomctl` exit raises ProbeFailed
+    only socket-activate it), or a system bus this process is barred from,
+    which is structural. Any other nonzero `oomctl` exit raises ProbeFailed
     (strict), so an uncertain result keeps the prior hashed facts and is never
     recorded as an answer."""
     if oomd_active is not True or shutil.which("oomctl") is None:
@@ -694,7 +756,12 @@ async def _oomd_user_manager_monitored(oomd_active: bool | None) -> bool | None:
     cgroup = _user_manager_cgroup()
     if cgroup is None:
         return None
-    out = await _run_cmd("oomctl", strict=True)
+    try:
+        out = await _run_cmd("oomctl", strict=True)
+    except ProbeFailed:
+        if _system_bus_reachable():
+            raise
+        return None
     return _oomd_lists(out or "", cgroup)
 
 
