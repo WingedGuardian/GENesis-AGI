@@ -25,6 +25,9 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   why. BIT means pass, fail, pass
   on a run that opened the target. A module-level import counts as opened, so a
   BIT still does not prove the test exercised the code.
+  `config/gate_defects.json` is the merge gate's own defect corpus, run with
+  `--rung-report`, which says which rung of the gate's tests noticed each break.
+  There a miss is a finding, not a failure.
 - **Verify-RED of a safety fence runs the test UNFENCED.** Removing a guard,
   stub or sandbox to watch its test fail means whatever the test executes
   reaches the real system for that run. Read the test first and make its probe

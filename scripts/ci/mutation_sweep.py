@@ -33,7 +33,8 @@ shares the caller's git metadata -- config, hooks, refs -- so a test that runs
 git commands in its cwd can change those.)
 
 THE FILES. This one drives a sweep. `mutation_case.py` holds what a sweep judges,
-`mutation_copy.py` the disposable copy, `mutation_stop.py` how a sweep stops.
+`mutation_copy.py` the disposable copy, `mutation_stop.py` how a sweep stops, and
+`mutation_rungs.py` the report mode for the gate's defect corpus.
 To import this as a library, put this directory on `sys.path` first: the siblings
 are imported by bare name.
 
@@ -153,6 +154,7 @@ from mutation_copy import (
     _put,
     isolated_copy,
 )
+from mutation_rungs import check_anchors, rung_cases
 from mutation_stop import (
     _catch_stop_signals,
     _hold,
@@ -846,6 +848,18 @@ def build_parser() -> argparse.ArgumentParser:
         "(default ~/tmp). A full checkout: put it on a real disk, never a "
         "RAM-backed or quota-capped temp directory.",
     )
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--rung-report",
+        action="store_true",
+        help="the manifest is a defect corpus: run every rung for every defect and "
+        "report which noticed. An escape exits 0; an untrusted run exits 1.",
+    )
+    mode.add_argument(
+        "--check-anchors",
+        action="store_true",
+        help="the manifest is a defect corpus: check every defect still applies, and run no tests.",
+    )
     return ap
 
 
@@ -859,7 +873,24 @@ def main(argv: list[str] | None = None) -> int:
     repo = args.repo.resolve()
 
     doc = json.loads(args.manifest.read_text(encoding="utf-8"))
-    cases = cases_from_json(doc, repo)
+    if args.check_anchors:
+        return check_anchors(doc, repo)
+    report = None
+    if args.rung_report:
+        cases, report = rung_cases(doc, repo)
+    else:
+        cases = cases_from_json(doc, repo)
+
+    def started(case: Case) -> None:
+        print(f"running: {case.label}", file=sys.stderr, flush=True)
+        if report:
+            report.start(case)
+
+    def reported(result: Result) -> None:
+        print(_render_result(result), flush=True)
+        if report:
+            report.add(result)
+
     # The child env is an ALLOWLIST (see _child_env), so anything the tests need
     # must be DECLARED. A manifest-level `env` covers the sweep; a case's own
     # `env` overrides it. `src` is the package root, named repo-relative so it
@@ -879,13 +910,21 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.timeout,
             tmp_root=args.tmp_root,
             # stderr, so the report on stdout is the same as it ever was.
-            on_start=lambda c: print(f"running: {c.label}", file=sys.stderr, flush=True),
-            on_result=lambda r: print(_render_result(r), flush=True),
+            on_start=started,
+            on_result=reported,
         )
+    except RuntimeError as exc:  # a red baseline: its reason is the traceback's
+        if report:
+            report.refused = str(exc)
+        raise
     finally:
         for each, handler in previous.items():
             signal.signal(each, handler)
+        if report:
+            report.publish()  # here, so a stop or a red baseline still shows what ran
     _raise_if_stopped()  # a raise swallowed in a `__del__` must not reach a clean tally
+    if report:
+        return report.exit_code()
     print(_render_tally(result))
     return 0 if result.clean else 1
 
