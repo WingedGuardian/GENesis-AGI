@@ -203,7 +203,10 @@ class TestLastResortTier:
             self._run(["--apply", "--last-resort-above", "95"], disk_pct=96.0, home=home)
         assert not lr.path.exists()  # cleared at 96%
         with sqlite3.connect(home / "index-requests" / "queue.sqlite3") as db:
-            assert db.execute("SELECT count(*) FROM pending").fetchone()[0] == 1
+            assert db.execute("SELECT provider FROM pending ORDER BY provider").fetchall() == [
+                ("cbm",),
+                ("gitnexus",),
+            ]
 
     def test_empty_last_resort_cache_does_not_drop_rebuild_marker(self, tmp_path):
         empty = _mod.CacheTarget("empty index", tmp_path / "empty-index", "last_resort")
@@ -241,7 +244,7 @@ class TestLastResortTier:
         with patch.dict(_mod.os.environ, {"GENESIS_HOME": str(home)}):
             import index_marker
 
-            assert len(index_marker.list_markers()) == 1
+            assert {row["provider"] for row in index_marker.list_markers()} == {"cbm", "gitnexus"}
         assert not spools[0].exists()
 
     def test_runner_cannot_consume_marker_during_last_resort_deletion(self, tmp_path):
@@ -267,7 +270,10 @@ class TestLastResortTier:
             self._run(["--apply", "--last-resort-above", "95"], disk_pct=96.0, home=home)
         assert runner_acquired == [False]
         with sqlite3.connect(home / "index-requests" / "queue.sqlite3") as db:
-            assert db.execute("SELECT count(*) FROM pending").fetchone()[0] == 1
+            assert db.execute("SELECT provider FROM pending ORDER BY provider").fetchall() == [
+                ("cbm",),
+                ("gitnexus",),
+            ]
 
     def test_active_runner_at_critical_threshold_returns_failure_signal(self, tmp_path):
         lr = _make_cache(tmp_path, "lr-active", "last_resort")
@@ -329,7 +335,6 @@ class TestMountRefusal:
             assert _mod._is_safe_target(cache) is True
 
 
-
 def test_an_unreadable_mount_table_refuses_the_target(tmp_path):
     """Review of #2570: nothing else guards these rmtree targets, so a table
     that cannot be read must refuse, never read as "no mounts"."""
@@ -354,20 +359,29 @@ _PY_RELATIONS = [
 ]
 
 
-@pytest.mark.parametrize(("relation", "mount", "allowed"), _PY_RELATIONS, ids=[r[0] for r in _PY_RELATIONS])
+@pytest.mark.parametrize(
+    ("relation", "mount", "allowed"), _PY_RELATIONS, ids=[r[0] for r in _PY_RELATIONS]
+)
 def test_is_safe_target_covers_every_relation(tmp_path, relation, mount, allowed):
     cache = tmp_path / "cache"
     cache.mkdir()
     info = tmp_path / "mountinfo"
     entries = ["/", str(tmp_path / mount) if mount else str(tmp_path)]
-    info.write_text("".join(f"{i} 1 0:{i} / {m.replace(' ', chr(92) + '040')} rw - x x rw\n"
-                            for i, m in enumerate(entries, 20)))
+    info.write_text(
+        "".join(
+            f"{i} 1 0:{i} / {m.replace(' ', chr(92) + '040')} rw - x x rw\n"
+            for i, m in enumerate(entries, 20)
+        )
+    )
     with patch.object(_mod, "_mount_points", lambda: _READ_MOUNTS(info)):
         assert _mod._is_safe_target(cache) is allowed, relation
 
 
-@pytest.mark.parametrize("text", ["", "\n", "36 35 98:0 / /home/x rw - btrfs /dev/x rw\n", "garbage\n"],
-                         ids=["empty", "blank", "truncated-no-root", "malformed"])
+@pytest.mark.parametrize(
+    "text",
+    ["", "\n", "36 35 98:0 / /home/x rw - btrfs /dev/x rw\n", "garbage\n"],
+    ids=["empty", "blank", "truncated-no-root", "malformed"],
+)
 def test_a_table_without_the_root_entry_is_unreadable(tmp_path, text):
     """Review of #2570 round 3: an empty or truncated read must refuse, like
     the shell guard, never read as "no mounts"."""
