@@ -543,7 +543,8 @@ You are supervising a Genesis update. Your role is WATCH AND ESCALATE.
    the user's decision. Write to {summary_file}: "refused: <the units it names>".
    Do not write {escalation_file}. Done.
 
-7. If exit 5 (refused, an earlier update unfinished):
+7. If exit 5 (refused: an earlier update unfinished, or this OS below the
+   supported floor, which update.sh names in one line):
    Exit 5 means update.sh REFUSED, before changing anything, because an earlier
    update's ~/.genesis/update_state.json still guards code it merged and never
    activated, merge conflicts it is waiting on, or a checkout it left half-written
