@@ -278,6 +278,101 @@ def _load(path: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
+#: A report dir's name is its ts (_backup_dir: the UTC time, then the pid)
+#: followed by SUFFIX. ASCII digits only: \d also matches other scripts' digits.
+_TS_FORMAT = "%Y%m%dT%H%M%SZ"
+REPORT_NAME = re.compile(r"([0-9]{8}T[0-9]{6}Z-[0-9]+)" + re.escape(SUFFIX))
+#: A report over either cap is not read. The writer stores about 615 bytes per
+#: engine row and 954 per foreign row (indent 2, its reapply step included;
+#: MEASURED), so REPORT_BYTES binds first, at about 4,400-6,800 rows;
+#: REPORT_ROWS is a backstop for a report the writer did not make.
+REPORT_BYTES = 4 * 1024 * 1024
+REPORT_ROWS = 20_000
+
+
+class BadReport(Exception):
+    """A report dir or REPAIR.json the writer does not make; never read further."""
+
+
+def report_ts(name: str) -> str | None:
+    """The ts of a report dir named as _backup_dir names it, else None."""
+    m = REPORT_NAME.fullmatch(name)
+    return m.group(1) if m else None
+
+
+def load_report(path: str, repo: str) -> dict | None:
+    """One report, read as untrusted input: the readers' single way in.
+
+    ``path`` is the report dir, ``repo`` the deploy checkout the reader serves.
+    The dir must be a directory (never a symlink) named as _backup_dir names
+    it; REPAIR.json is opened without following a symlink or blocking on a
+    FIFO, must be a regular file of at most REPORT_BYTES holding a JSON
+    object; its ``repo`` must name ``repo`` (see same_repo: no reader runs git
+    in, or reports for, a checkout a report names); ``paths`` a list of at
+    most REPORT_ROWS entries. Returns {"ts", "report", "rows" (the dict rows),
+    "mtime"}; None when the dir holds no REPAIR.json yet (a run that wrote
+    none, or is writing it); raises BadReport for anything else."""
+    ts = report_ts(os.path.basename(path))
+    if ts is None:
+        raise BadReport("not a name the repair writes")
+    try:
+        if not stat.S_ISDIR(os.lstat(path).st_mode):
+            raise BadReport("not a directory")
+        fd = os.open(os.path.join(path, "REPAIR.json"), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise BadReport(f"cannot be opened ({exc.strerror})") from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise BadReport("REPAIR.json is not a regular file")
+        chunks, size = [], 0
+        while size <= REPORT_BYTES and (chunk := os.read(fd, REPORT_BYTES + 1 - size)):
+            chunks.append(chunk)
+            size += len(chunk)
+    except OSError as exc:
+        raise BadReport(f"cannot be read ({exc.strerror})") from None
+    finally:
+        os.close(fd)
+    if size > REPORT_BYTES:
+        raise BadReport(f"over {REPORT_BYTES} bytes")
+    try:
+        report = json.loads(b"".join(chunks))
+    except (ValueError, RecursionError):
+        raise BadReport("not JSON") from None
+    if not isinstance(report, dict):
+        raise BadReport("not a JSON object")
+    if not same_repo(report.get("repo"), repo):
+        raise BadReport("not this checkout's report")
+    paths = report.get("paths")
+    if not isinstance(paths, list) or len(paths) > REPORT_ROWS:
+        raise BadReport(f"paths is not a list of at most {REPORT_ROWS} rows")
+    rows = [r for r in paths if isinstance(r, dict)]
+    return {"ts": ts, "report": report, "rows": rows, "mtime": st.st_mtime}
+
+
+#: Longest ``repo`` a report may name (PATH_MAX); a longer one is refused
+#: before realpath walks it.
+REPO_BYTES = 4096
+
+
+def same_repo(named, repo: str) -> bool:
+    """Whether a report's ``repo`` field names ``repo``. The field is untrusted:
+    it must be a str with no NUL whose file-system bytes (os.fsencode: a
+    non-UTF-8 path the writer stored round-trips as surrogate escapes; any
+    other lone surrogate cannot encode and is refused) number at most
+    REPO_BYTES, checked before realpath runs; a realpath error is a refusal."""
+    if not isinstance(named, str) or "\0" in named:
+        return False
+    try:
+        if len(os.fsencode(named)) > REPO_BYTES:
+            return False
+        return os.path.realpath(named) == os.path.realpath(repo)
+    except (UnicodeError, ValueError, OSError):
+        return False
+
+
 def manifests(backups: str) -> list[tuple[str, dict]]:
     """(path, REPAIR.json) of every repair, oldest first."""
     try:
@@ -499,7 +594,7 @@ class Repair:
         return self._after(backup, manifest, state, raw, readable, index_lock)
 
     def _backup_dir(self) -> str:
-        ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + f"-{os.getpid()}"
+        ts = time.strftime(_TS_FORMAT, time.gmtime()) + f"-{os.getpid()}"
         return os.path.join(self.backups, ts + SUFFIX)
 
     def _locks(self) -> list[tuple[str, str]]:

@@ -2038,7 +2038,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 0a6c219a1 2026-10-31
+verified: 25f3ad876 2026-11-03
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -2133,10 +2133,19 @@ verified: 0a6c219a1 2026-10-31
   `deploy_candidates drop`. The diagnosis snapshot carries the boot repair's
   `live-move repair:` journal lines and a summary of the newest
   `deploy-backups/*-live-move-repair/REPAIR.json` that is neither dismissed
-  nor superseded (6 h window on its own `ts`), JSON-quoted, capped at 2,000
-  characters and fenced as untrusted; empty, and the prompt unchanged, when
-  there are none. The container reads are bounded where they are produced
-  (regular non-symlink reports, 4 MiB each; journal lines cut to 400), and
+  nor superseded and names `~/genesis` (6 h window on the ts in its dir name,
+  never the stored one), chosen inside the container (one `python3 -I -S -`
+  over stdin, as the configured container user, #3627) so newer ineligible
+  reports cannot hide it; JSON-quoted, capped at 2,000 characters and fenced
+  as untrusted; empty, and the prompt unchanged, when there are none. The
+  container reads are bounded where they are produced (only a report dir
+  named as the writer names it and not a symlink; one regular report opened
+  without following a symlink, 4 MiB; the repo compared as the repair loader
+  compares it; those rules held equal to the loader's by a parity test; a
+  newer one over that cap is shown as "report too large", never skipped for
+  an older one, unless the top-level repo, result or dismissed_at read from
+  the writer's indent-2 layout makes it ineligible; journal lines cut to
+  400), and
   Telegram alert fields are cut before escaping. Residual: a container that
   fakes git's own output can still pass the probe.
 - **Merged ≠ deployed**: guardian code reaches the host ONLY via
@@ -3764,7 +3773,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py]
-verified: 973a0e6 2026-10-30
+verified: 25f3ad876 2026-11-03
 ```
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
@@ -4522,10 +4531,45 @@ Refusing a proposed update preserves a previously valid opt-in.
   (re-apply steps included) and queues an alert (critical when anything was
   not the update's, the index was torn, or it did not heal); `REPAIR.json`
   and `manifests()` are the contract its readers (deploy health, the
-  awareness check, the guardian's diagnosis) read, and those readers arrive
-  in a follow-up PR: until then the command output and the alert carry the
-  report. A run killed after its restore and before its result leaves no
-  result; the next run removes a healed state without a new backup.
+  awareness check, the guardian's diagnosis) read. The readers REPORT and
+  never judge a path; putting saved paths back is the repair's own job when
+  it writes. The deploy-health collector `collect_live_repairs` reads every
+  `REPAIR.json` through the repair's one loader, `load_report(dir, checkout)`:
+  a report dir not named as `_backup_dir` names it, a symlinked dir, a
+  `REPAIR.json` that is not a regular file (opened without following a
+  symlink or blocking on a FIFO) of at most 4 MiB holding a JSON object of at
+  most 20,000 rows, or a report whose `repo` is not the deploy checkout
+  (`repo_root()`; the field must be a string with no NUL whose file-system
+  bytes, `os.fsencode`, number at most 4,096, so a non-UTF-8 checkout path the
+  writer stored still matches; checked before realpath, and a realpath error
+  is a refusal) is refused whole, counted in `live_repair_refused:<n>` and named
+  once in the server log; no git runs in a checkout a report names. Only the
+  newest eight report dirs by the ts in their name are read; older ones are
+  counted in `live_repair_unread_older:<n>`, an informational class (medium
+  when alone). Per report the snapshot carries its ts, its backup folder, how
+  many paths the update did not write were recorded there (every foreign row
+  counts, flag-only and deleted ones too; no other row field is read), a result enum (`healed`,
+  `healed-kept`, `unresolved`, `superseded`, `unfinished`, else `unknown`: no
+  report string reaches the snapshot, the alert text or the alert key),
+  `dismissed` and `unresolved`; `live_repair_saved:<n>` sums the reports not
+  `--dismiss`ed. It loads the repair's module once per snapshot when any
+  report dir exists (a module that cannot load, or lacks a name the reader
+  uses, reads every report as refused and blanks nothing), and a linked worktree reads none. The awareness paragraph
+  names, per undismissed report with saved paths, its backup folder,
+  `scripts/deploy_candidates repair-move --restore <ts>` (once both the
+  installed repair kit and `scripts/deploy_candidates` include it) and `--dismiss <ts>`, says a restore leaves
+  uncommitted edits the deploy scripts refuse, and that backups are pruned 90
+  days after the last write to their folder; it escapes any text a database
+  column cannot hold rather than losing the alert, and is replaced whenever
+  the reports it names change. `GET /api/genesis/health` reduces
+  `live_repairs` to an allow-list of its counts for a caller without the
+  internal bearer or a verified session. `live_repair_unresolved` needs the
+  newest report to say so (or to have no result after an hour) AND the
+  shared guard, run at read time and only then, to call the update state
+  `mixed_tree`: a run killed after its restore and before its result leaves
+  no result, and only the tree says whether it healed (the next run removes
+  a healed state without a new backup). The awareness check words every
+  class (never paging).
   `--post-merge` on `live` never runs the engine. What is recorded and sent to
   the host guardian is the origin/main commit `live` is built on.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;
