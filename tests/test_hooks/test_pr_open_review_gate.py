@@ -1434,3 +1434,13 @@ class TestLastSurvivors:
         argv = ["gh", "pr", "create", "--title", "t", "`auth_env`"]
         assert gate._create_flags(argv).unknown is True
         assert gate._create_flags(argv, has_heredoc=True).unknown is False
+
+
+class TestABlockDiscardsTheWholeCommand:
+    def test_a_refused_compound_says_so(self, box):
+        done = _run(box, f"echo hi > note.txt && {CREATE}")
+        assert done.returncode == 2 and "ENTIRE command was discarded" in done.stderr
+
+    def test_a_refused_create_alone_does_not(self, box):
+        done = _run(box)
+        assert done.returncode == 2 and "ENTIRE command was discarded" not in done.stderr

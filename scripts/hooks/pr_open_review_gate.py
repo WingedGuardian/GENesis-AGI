@@ -108,6 +108,11 @@ except Exception as _exc:  # noqa: BLE001 — exit 1 is NON-blocking; see degrad
         raise
     degraded_exit("pr_open_review_gate", gated=_DEGRADED_GATED, exc=_exc)
 
+try:
+    import discarded_write  # noqa: E402
+except Exception:  # noqa: BLE001 — the note is cosmetic; a failed import must not exit 1
+    discarded_write = None  # type: ignore[assignment]
+
 SIGIL = "pr-review-waived"
 
 #: The whole word pair, read through `mentions` as `git_push_guard` reads it: a word split
@@ -849,11 +854,21 @@ def _note_gate_is_off() -> None:
     )
 
 
+def _refuse(text: str) -> int:
+    """Refuse, and say that a block discards the whole command, as every Bash blocker does."""
+    print(text, file=sys.stderr)
+    if discarded_write is not None:
+        discarded_write.warn()
+    return 2
+
+
 def main() -> int:
     global _deadline
     _deadline = time.monotonic() + _BUDGET_S
     payload = read_payload()
     cmd = field(payload, "command")
+    if discarded_write is not None:
+        discarded_write.remember(cmd)
     if not cmd or not mentions(cmd, _MENTION_GH, _MENTION_CREATE):
         return 0
     segs, blind = analyze_checked(cmd)
@@ -872,27 +887,22 @@ def main() -> int:
         _note_gate_is_off()
         return 0  # no declared public repo: see SCOPE in the module docstring
     if len(creates) > _MAX_CREATES:
-        print(
+        return _refuse(
             f"BLOCKED: could not verify this command: it holds more than {_MAX_CREATES} PR "
-            "creates, too many to judge in time. Run them separately.",
-            file=sys.stderr,
+            "creates, too many to judge in time. Run them separately."
         )
-        return 2
     waived: list[tuple[str, str | None]] = []
     for seg in creates:
         needed, head, reason = _judge(guard, segs, seg, cmd, payload, canonical)
         if not needed:
             continue
         if not has_trailing_override(seg.raw, SIGIL):
-            print(_refusal(head, reason), file=sys.stderr)
-            return 2
+            return _refuse(_refusal(head, reason))
         if guard._is_dispatched():
-            print(
+            return _refuse(
                 f"BLOCKED: `# {SIGIL}` records the owner's yes in chat, and a dispatched "
-                "session has nobody present to give it. Run a reviewer agent instead.",
-                file=sys.stderr,
+                "session has nobody present to give it. Run a reviewer agent instead."
             )
-            return 2
         waived.append((head, _head_sha(guard, cmd, payload, seg)))
     # Logged only now: a later create in the same command can still refuse the whole of it.
     for _head, sha in waived:
