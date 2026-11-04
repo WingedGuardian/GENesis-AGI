@@ -110,9 +110,9 @@ def parse_reference_body(body: str | None) -> dict[str, str]:
 # ─── Credential values live outside the indexed body (#2426) ──────────────────
 #
 # A credential's VALUE is the one part of a reference no recall surface needs:
-# lookup goes by identifier and description (MEASURED 2026-11-04, the live
-# store: with the value dropped, identifier recall IMPROVED, vector top-1 from
-# 31 to 34 of 53 and FTS top-1 from 47 to 48). Every store that indexes a body
+# lookup goes by identifier and description (MEASURED 2026-11-04 on a live
+# install: with the value dropped, top-1 identifier recall IMPROVED on both the
+# vector and the keyword path). Every store that indexes a body
 # (knowledge_units + knowledge_fts, memory_fts, the Qdrant payload and its
 # embedding) therefore gets the body with the value replaced by
 # SECRET_PLACEHOLDER, and the value goes to ``reference_secrets``, a table no
@@ -164,16 +164,16 @@ def secret_fragments(value: str) -> list[str]:
     first: the whole value, each segment that is not an identifier, and every
     secret-looking token inside them.
 
-    MEASURED (live store, 2026-11-04): 23 of 53 credential bodies repeated a
-    segment of their value in the description or tags, 13 of those segments
-    labelled ``password``; none repeated the whole value. Holding out only the
+    MEASURED (a live install, 2026-11-04): over 4 in 10 credential bodies
+    repeated a segment of their value in the description or tags, most often
+    the one labelled ``password``; none repeated the whole value. Holding out only the
     ``Value:`` line would have left them indexed. Tokens count too, because a
     prose value ("log in as x with password y") is one segment whose repeat in
     the description is usually just the password.
     """
     whole = value.strip()
     fragments = {whole} if whole else set()
-    # "login / secret" (6 of the 53 measured values): by that convention the
+    # "login / secret" (a common shape on a live install): by convention the
     # first part is the login, an identifier the description legitimately
     # names, and the second part is the secret, however short.
     pair = [part.strip() for part in whole.split(" / ")] if whole.count(" / ") == 1 else []
