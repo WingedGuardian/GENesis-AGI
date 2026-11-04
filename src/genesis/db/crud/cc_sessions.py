@@ -111,12 +111,25 @@ async def get_active_foreground(
     return dict(row) if row else None
 
 
+#: How a session ENDED. ``unreported`` = it exited cleanly and nothing said
+#: whether it did its job; ``parked`` = stopped for a rate limit, resumed later.
+OUTCOMES = frozenset(
+    {"finished", "blocked", "failed", "partial", "unreported", "expired", "parked"}
+)
+#: The outcome a terminal status implies when the writer judged nothing, so a
+#: terminal row can never be left unjudged by a writer that forgot the field.
+_DEFAULT_OUTCOME = {"completed": "unreported", "failed": "failed", "expired": "expired"}
+
+
 async def update_status(
     db: aiosqlite.Connection,
     id: str,
     *,
     status: str,
     ts: str | None = None,
+    outcome: str | None = None,
+    outcome_reason: str | None = None,
+    only_if_active: bool = False,
 ) -> bool:
     """Single status writer, with terminal-timestamp discipline.
 
@@ -134,26 +147,49 @@ async def update_status(
     - ``active`` (reopen) clears ``completed_at`` — the pair
       (active, completed_at set) lies in both directions.
       ``checkpointed_at`` is left as history, deliberately.
+
+    The same single-writer argument carries the OUTCOME (how it ended): every
+    terminal write through here records ``outcome`` and ``outcome_reason`` in
+    the same UPDATE, defaulting from the status when the caller judged nothing,
+    so the background writers that bypass SessionManager (spawn failure, boot
+    orphan reconcile, peers) are recorded too, and no crash can land between
+    status and outcome. (Foreground adoption and voice sweeps write their own
+    SQL and leave it NULL; readers of outcome scope to background rows.)
+    A later terminal write overwrites the outcome (the real result wins) but
+    never ``outcome_paged_at``: a stop already reported is not reported again.
+    Reopening (``active``) clears all three, so the next end is judged afresh.
+    An unknown outcome is logged and replaced by the default rather than
+    raised: the outcome only adds information, and it must never veto the
+    status write (two callers retry status writes in a loop).
+    ``only_if_active`` makes the write conditional on the row still being
+    active, for a writer that decided from an earlier read (the idle reaper).
     """
     stamp = ts or datetime.now(UTC).isoformat()
+    if outcome is not None and outcome not in OUTCOMES:
+        _logger.error("unknown session outcome %r for %s; using the status default", outcome, id)
+        outcome_reason = outcome_reason or f"invalid_outcome:{outcome}"
+        outcome = None
+    guard = " AND status = 'active'" if only_if_active else ""
     if status in ("completed", "failed", "expired"):
         cursor = await db.execute(
-            "UPDATE cc_sessions SET status = ?, completed_at = ? WHERE id = ?",
-            (status, stamp, id),
+            "UPDATE cc_sessions SET status = ?, completed_at = ?, outcome = ?,"
+            " outcome_reason = ? WHERE id = ?" + guard,
+            (status, stamp, outcome or _DEFAULT_OUTCOME[status], outcome_reason, id),
         )
     elif status == "checkpointed":
         cursor = await db.execute(
-            "UPDATE cc_sessions SET status = ?, checkpointed_at = ? WHERE id = ?",
+            "UPDATE cc_sessions SET status = ?, checkpointed_at = ? WHERE id = ?" + guard,
             (status, stamp, id),
         )
     elif status == "active":
         cursor = await db.execute(
-            "UPDATE cc_sessions SET status = ?, completed_at = NULL WHERE id = ?",
+            "UPDATE cc_sessions SET status = ?, completed_at = NULL, outcome = NULL,"
+            " outcome_reason = NULL, outcome_paged_at = NULL WHERE id = ?" + guard,
             (status, id),
         )
     else:
         cursor = await db.execute(
-            "UPDATE cc_sessions SET status = ? WHERE id = ?",
+            "UPDATE cc_sessions SET status = ? WHERE id = ?" + guard,
             (status, id),
         )
     await db.commit()

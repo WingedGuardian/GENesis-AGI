@@ -128,7 +128,9 @@ async def reconcile_orphans(db) -> int:
             await cc_sessions.update_status(db, row["id"], status=finished)
             continue
         await update_state(db, row["id"], "failed", error="outcome_unknown")
-        await cc_sessions.update_status(db, row["id"], status="failed")
+        await cc_sessions.update_status(
+            db, row["id"], status="failed", outcome_reason="outcome_unknown"
+        )
     return len(orphaned)
 
 
@@ -304,6 +306,15 @@ async def _finalize(runner, request, result, state):
                     cost_usd=result.cost_usd,
                     input_tokens=result.input_tokens,
                     output_tokens=result.output_tokens,
+                )
+            elif result.partial and result.error == "execution_failed":
+                # A clean exit that was truncated or never sent its result:
+                # _execute turned it into a failure (error "execution_failed"),
+                # but it is a partial run. A cancel, deadline or artifact-write
+                # failure keeps its own reason (else branch), even on a result
+                # that was also partial.
+                await runner._session_manager.fail(
+                    result.session_id, reason="partial_result", outcome="partial"
                 )
             else:
                 await runner._session_manager.fail(result.session_id, reason=result.error)

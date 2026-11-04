@@ -305,6 +305,8 @@ async def test_incomplete_output_never_claims_success(db, native, returned):
     row = await cc_sessions.get_by_id(db, sid)
     assert row["status"] == "failed"
     assert json.loads(row["metadata"])["result_partial"] is True
+    # Recorded as a partial run, not a bare failure with no reason.
+    assert (row["outcome"], row["outcome_reason"]) == ("partial", "partial_result")
 
 
 async def test_deadline_includes_start_hook_wait(db, native):

@@ -1171,7 +1171,12 @@ class DirectSessionRunner:
                 "failed",
                 error="not_started",
             )
-            await cc_sessions.update_status(self._session_manager.db, session_id, status="failed")
+            await cc_sessions.update_status(
+                self._session_manager.db,
+                session_id,
+                status="failed",
+                outcome_reason="not_started",
+            )
             raise
         self._active[session_id] = task
         self._managed_cancel[session_id] = signal
@@ -1439,11 +1444,20 @@ class DirectSessionRunner:
                         exc_info=True,
                     )
 
+            # A truncated run, or one with no result event, did not finish, even
+            # though it exited cleanly: record it as such (managed runs already
+            # fail on the same condition, managed_session.py).
             await self._session_manager.complete(
                 session_id,
                 cost_usd=output.cost_usd,
                 input_tokens=output.input_tokens,
                 output_tokens=output.output_tokens,
+                outcome="partial" if result.partial else None,
+                outcome_reason=(
+                    ("bg_truncated" if output.bg_truncated else "no_result_event")
+                    if result.partial
+                    else None
+                ),
             )
 
             # RESULT-mode: deliver the finished outcome back to the origin
@@ -1552,6 +1566,7 @@ class DirectSessionRunner:
                     await self._session_manager.fail(
                         session_id,
                         reason="rate_limited_parked",
+                        outcome="parked",
                     )
                 except Exception:
                     logger.error(
