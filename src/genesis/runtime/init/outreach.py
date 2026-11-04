@@ -65,16 +65,26 @@ def discord_webhook_configured(channel: str) -> bool:
     honouring it would post there while reporting a channel that does not
     exist.
     """
-    if not os.environ.get(_DISCORD_DEFAULT_ENV):
+    return bool(os.environ.get(_DISCORD_DEFAULT_ENV)) and discord_channel_has_webhook(channel)
+
+
+def discord_channel_has_webhook(channel: str) -> bool:
+    """True when ``channel`` itself resolves to a webhook, adapter or not.
+
+    A poll posts straight to the webhook, so it needs only this. A queued send
+    goes through the adapter and needs ``discord_webhook_configured``.
+    """
+    name = discord_default_channel() if channel == "discord" else channel
+    if _is_reserved_discord_channel(name):
         return False
-    default_channel = (
-        os.environ.get("OUTREACH_RECIPIENT_DISCORD") or "dev-discussion"
-    ).strip()
-    if channel in ("discord", default_channel):
+    if os.environ.get(_discord_webhook_env(name)):
         return True
-    if _is_reserved_discord_channel(channel):
-        return False
-    return bool(os.environ.get(_discord_webhook_env(channel)))
+    return name == discord_default_channel() and bool(os.environ.get(_DISCORD_DEFAULT_ENV))
+
+
+def discord_default_channel() -> str:
+    """The channel a bare ``discord`` send reaches: blank counts as unset, padded trims."""
+    return (os.environ.get("OUTREACH_RECIPIENT_DISCORD") or "").strip() or "dev-discussion"
 
 
 def _discord_channel_from_env(key: str) -> str:
@@ -175,10 +185,8 @@ async def init(rt: GenesisRuntime) -> None:
             # channel nobody configured a webhook for" (which it must refuse
             # rather than silently redirect). Same value either way — an
             # explicit recipients entry still wins.
-            if "discord" not in recipients:
-                recipients["discord"] = os.environ.get(
-                    "OUTREACH_RECIPIENT_DISCORD", "dev-discussion"
-                )
+            if not recipients.get("discord"):
+                recipients["discord"] = discord_default_channel()
             channels["discord"] = DiscordWebhookAdapter(
                 webhooks=discord_webhooks,
                 default_webhook=discord_webhook,

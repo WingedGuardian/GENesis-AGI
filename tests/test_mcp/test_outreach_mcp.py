@@ -242,10 +242,9 @@ async def test_outreach_poll_no_webhook():
     # unconfigured channel is refused rather than posted somewhere else — is
     # unchanged and is asserted more strictly than before.
     assert "announcements" in data["error"], data["error"]
-    # With NOTHING set, the missing piece is DISCORD_WEBHOOK_URL — the adapter
-    # registers from it, so a named webhook alone never clears the refusal
-    # and the message must say so.
-    assert "DISCORD_WEBHOOK_URL" in data["error"], data["error"]
+    # A poll posts straight to the webhook, so the channel's own setting is the
+    # one that clears this refusal.
+    assert _discord_webhook_env("announcements") in data["error"], data["error"]
     assert data.get("status") != "created"
 
 
@@ -311,6 +310,89 @@ async def test_outreach_poll_success():
     assert payload["poll"]["question"]["text"] == "What do you think?"
     assert len(payload["poll"]["answers"]) == 3
     assert payload["poll"]["duration"] == 48
+
+
+@pytest.mark.asyncio
+async def test_outreach_poll_uses_a_named_webhook_with_no_default():
+    """A poll posts straight to the webhook, so it needs no registered adapter."""
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {"id": "poll-msg-1"}
+    mock_response.raise_for_status = MagicMock()
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_response
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    url = "https://example.invalid/hook"
+    with (
+        patch.dict("os.environ", {_discord_webhook_env("announcements"): url}, clear=True),
+        patch("genesis.mcp.outreach_mcp.httpx.AsyncClient", return_value=mock_client),
+    ):
+        result = json.loads(await tools["outreach_poll"].fn(
+            question="q", answers=["a", "b"], channel="announcements",
+        ))
+    assert "error" not in result, result
+    assert mock_client.post.await_args.args[0].startswith(url)
+
+
+@pytest.mark.parametrize(
+    ("env_names", "channel", "reachable"),
+    [
+        # The default channel's own webhook is enough, with no default URL.
+        ((_discord_webhook_env("dev-discussion"),), "dev-discussion", True),
+        ((_discord_webhook_env("dev-discussion"),), "discord", True),
+        ((_URL_ENV,), "dev-discussion", True),
+        ((_URL_ENV,), "discord", True),
+        ((_URL_ENV,), "announcements", False),
+        ((), "dev-discussion", False),
+        ((), "announcements", False),
+        ((_URL_ENV, _discord_webhook_env("url")), "url", False),
+    ],
+)
+def test_a_channel_has_a_webhook_when_a_poll_can_reach_it(env_names, channel, reachable):
+    from genesis.runtime.init.outreach import discord_channel_has_webhook
+
+    env = dict.fromkeys(env_names, "https://example.invalid/hook")
+    with patch.dict("os.environ", env, clear=True):
+        assert discord_channel_has_webhook(channel) is reachable
+
+
+@pytest.mark.parametrize(
+    ("recipient", "expected"),
+    [(None, "dev-discussion"), ("", "dev-discussion"), ("   ", "dev-discussion"), (" lobby ", "lobby")],
+)
+def test_the_default_channel_has_one_reading(recipient, expected):
+    from genesis.runtime.init.outreach import discord_default_channel
+
+    env = {} if recipient is None else {"OUTREACH_RECIPIENT_DISCORD": recipient}
+    with patch.dict("os.environ", env, clear=True):
+        assert discord_default_channel() == expected
+
+
+@pytest.mark.asyncio
+async def test_a_poll_to_discord_reaches_the_channel_a_send_would():
+    """Both webhooks set: a bare "discord" means the default channel for both."""
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {"id": "poll-msg-2"}
+    mock_response.raise_for_status = MagicMock()
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_response
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=False)
+    named = "https://example.invalid/named"
+    env = {_URL_ENV: "https://example.invalid/default", _discord_webhook_env("dev-discussion"): named}
+    with (
+        patch.dict("os.environ", env, clear=True),
+        patch("genesis.mcp.outreach_mcp.httpx.AsyncClient", return_value=mock_client),
+    ):
+        result = json.loads(await tools["outreach_poll"].fn(
+            question="q", answers=["a", "b"], channel="discord",
+        ))
+    assert "error" not in result, result
+    assert mock_client.post.await_args.args[0].startswith(named)
 
 
 @pytest.mark.asyncio

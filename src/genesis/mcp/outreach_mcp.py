@@ -50,7 +50,6 @@ def _discord_enqueue_refusal(channel: str) -> str | None:
         return None
     if discord_webhook_configured(channel):
         return None
-    default_channel = os.environ.get("OUTREACH_RECIPIENT_DISCORD") or "dev-discussion"
     # The predicate needs DISCORD_WEBHOOK_URL before any named webhook counts
     # (the adapter registers from it) — when THAT is the missing piece the
     # message must name it, or following the advice leaves the send refused.
@@ -59,14 +58,19 @@ def _discord_enqueue_refusal(channel: str) -> str | None:
         if os.environ.get("DISCORD_WEBHOOK_URL")
         else "DISCORD_WEBHOOK_URL"
     )
+    # Only an alternative that would actually go through is offered.
+    alternative = (
+        ", or send to channel 'discord'"
+        if channel != "discord" and discord_webhook_configured("discord")
+        else ""
+    )
     return json.dumps({
         "status": "refused",
         "code": "discord_webhook_unconfigured",
         "message": (
             f"No Discord webhook configured for channel {channel!r} — refusing "
-            f"to send to the default channel instead. Configure "
-            f"{configure}, or send to {default_channel}. "
-            "Permanent until configured; do not retry."
+            f"to send to the default channel instead. Configure {configure}"
+            f"{alternative}. Permanent until configured; do not retry."
         ),
     })
 
@@ -172,8 +176,9 @@ async def outreach_send(
 
     **preferred_timing** schedules delivery: ISO-8601 (naive = user's
     timezone), a clock time (``"9am"``, ``"at 9"``, ``"14:00"``), an
-    elapsed time (``"in 2 hours"``, ``"1h30m"``), or a calendar phrase
-    (``"tomorrow 9am"``, ``"next friday 3pm"``). A value resolving to
+    elapsed time (``"in 2 hours"``, ``"1h30m"``), or a day and clock
+    (``"tomorrow 9am"``, ``"next friday 3pm"``, ``"june 20 3pm UTC"``,
+    ``"tomorrow noon"``, ``"in 2 days"``). A value resolving to
     the future enqueues with a UTC ``deliver_after`` — identically
     in-process and via the MCP child — returning
     ``{"status": "queued", "pending_id": ..., "deliver_after": <UTC ISO>}``.
@@ -602,27 +607,25 @@ async def outreach_poll(
     # `_discord_webhook_env` is imported rather than re-derived: this was the
     # THIRD copy of the env-naming rule, and a copy is what lets a refusal
     # message name a variable that would not actually configure the channel.
-    # The reachability question itself is now ONE predicate shared with
-    # outreach_send's enqueue check (this used to be a fourth copy).
+    # A queued send also needs the adapter, which registers only with the default
+    # webhook. A poll posts straight to the webhook, so it asks only whether this
+    # channel has one, and "discord" means the same channel it does for a send.
     from genesis.runtime.init.outreach import (
         _discord_webhook_env,
         _is_reserved_discord_channel,
-        discord_webhook_configured,
+        discord_channel_has_webhook,
+        discord_default_channel,
     )
 
-    env_key = _discord_webhook_env(channel)
-    if not discord_webhook_configured(channel):
-        default_channel = os.environ.get("OUTREACH_RECIPIENT_DISCORD") or "dev-discussion"
-        configure = (
-            env_key
-            if os.environ.get("DISCORD_WEBHOOK_URL")
-            else "DISCORD_WEBHOOK_URL"
-        )
+    default_channel = discord_default_channel()
+    target = default_channel if channel == "discord" else channel
+    env_key = _discord_webhook_env(target)
+    if not discord_channel_has_webhook(channel):
         return json.dumps({
             "error": (
                 f"No Discord webhook configured for channel {channel!r} — "
                 f"refusing to post to the default channel instead. Configure "
-                f"{configure}, or send to {default_channel}."
+                f"{env_key}, or send to {default_channel}."
             )
         })
     # Configured: the channel's own var wins, else the default webhook (the
@@ -630,7 +633,7 @@ async def outreach_poll(
     # must NOT — its lookup would find the default webhook and report the `url`
     # "channel" back).
     webhook_url = (
-        None if _is_reserved_discord_channel(channel) else os.environ.get(env_key)
+        None if _is_reserved_discord_channel(target) else os.environ.get(env_key)
     ) or os.environ.get("DISCORD_WEBHOOK_URL")
 
     # ── Dedup check: skip if same poll posted within 7 days ──

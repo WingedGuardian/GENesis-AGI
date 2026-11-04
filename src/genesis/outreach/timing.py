@@ -10,75 +10,87 @@ undeliverable until the 24h age-out drops it.
 
 Resolution is an ALLOWLIST, tried in order — ISO-8601, a clock time, an
 elapsed time, then a calendar phrase — and anything unmatched is refused.
-There is no "hand whatever is left to dateparser" stage: the parser guesses
-at inputs like ``9p`` or ``in 5``, and a confident wrong answer delivers at
-the wrong time (or the year 1430). The caller is an LLM that can retry, so a
-refusal it can correct beats a guess it cannot see.
+Each stage matches the WHOLE string against a grammar, and there is no parser
+behind them to guess: a general date parser read ``at 9`` as a month, ``9a`` as
+a year and ``UTC+5`` as UTC, each reported as success. The caller is an LLM that
+can retry, so a refusal it can correct beats a guess it cannot see.
 """
 
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, time, timedelta, timezone, tzinfo
 
 # "9am", "9:30pm", "9a", "9p", "9a.m." — meridiem REQUIRED.
 _CLOCK_MERIDIEM_RE = re.compile(
-    r"^(?:at\s+)?(\d{1,2})(?::(\d{1,2}))?\s*([ap])(?:\.?m\.?)?$", re.IGNORECASE
+    r"^(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*([ap])(?:\.?m\.?)?$", re.IGNORECASE | re.ASCII
 )
 # "14:00", "9:30", "at 9" — 24-hour clock, meridiem absent.
-_CLOCK_24_RE = re.compile(r"^(?:at\s+)?(\d{1,2})(?::(\d{2}))?$", re.IGNORECASE)
+_CLOCK_24_RE = re.compile(r"^(?:at\s+)?(\d{1,2})(?::(\d{2}))?$", re.IGNORECASE | re.ASCII)
 
 # One <amount><unit> pair inside an elapsed phrase: "2 hours", "120m", "an hour",
 # the "1h" and "30m" halves of "1h30m". "days"/"weeks" are deliberately NOT
 # units: an elapsed duration is added to the UTC clock, while a calendar day
 # keeps the local clock time — `in 2 days` is resolved by the calendar stage.
 _ELAPSED_PART_RE = re.compile(
-    r"(\d+(?:\.\d+)?|an?)\s*"
-    r"(h(?:ours?|rs?)?|m(?:in(?:ute)?s?)?|s(?:ec(?:ond)?s?)?)",
-    re.IGNORECASE,
+    r"(\d+(?:\.\d+)?\s*|\ban?\s+(?=hour|hr|min|sec))"
+    r"(h(?:ours?|rs?)?|m(?:in(?:ute)?s?)?|s(?:ec(?:ond)?s?)?)(?![a-z])",
+    re.IGNORECASE | re.ASCII,
 )
-_ELAPSED_HEAD_RE = re.compile(r"^(?:in|after)\s+", re.IGNORECASE)
-_ELAPSED_TAIL_RE = re.compile(r"\s*(?:later|from\s+now)$", re.IGNORECASE)
+_ELAPSED_HEAD_RE = re.compile(r"^(?:in|after)\s+", re.IGNORECASE | re.ASCII)
+_ELAPSED_TAIL_RE = re.compile(r"\s*(?:later|from\s+now)$", re.IGNORECASE | re.ASCII)
 
-# A word that makes a phrase CALENDAR-shaped: only these reach dateparser.
-# Anything the parser would guess at instead — "at 9", "9a", "in 5", "1430" —
-# contains none of them and is refused before it gets there.
-_CALENDAR_WORD_RE = re.compile(
-    r"\b(today|tomorrow|tonight|days?|weeks?|"
-    r"(?:mon|tues|wednes|thurs|fri|satur|sun)day|"
-    r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|"
-    r"aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|"
-    r"dec(?:ember)?)\b",
-    re.IGNORECASE,
+# The calendar grammar, matched whole:
+#   [on] <day> [[at] <clock>] [<zone>]     "tomorrow 9am", "next friday at 3pm UTC"
+#   [at] <clock> [on] <day> [<zone>]       "3pm tomorrow", "noon on friday"
+#   [at] <clock> <zone>                    "9am UTC"
+#   in N days/weeks, N days from now/later "in 2 days", "a week from now"
+_WEEKDAYS = {
+    "monday": 0, "mon": 0, "tuesday": 1, "tue": 1, "tues": 1, "wednesday": 2, "wed": 2,
+    "thursday": 3, "thu": 3, "thur": 3, "thurs": 3, "friday": 4, "fri": 4,
+    "saturday": 5, "sat": 5, "sunday": 6, "sun": 6,
+}  # fmt: skip
+_MONTHS = {
+    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3, "april": 4,
+    "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7, "august": 8, "aug": 8,
+    "september": 9, "sep": 9, "sept": 9, "october": 10, "oct": 10, "november": 11,
+    "nov": 11, "december": 12, "dec": 12,
+}  # fmt: skip
+_WEEKDAY = "|".join(sorted(_WEEKDAYS, key=len, reverse=True))
+_MONTH = "|".join(sorted(_MONTHS, key=len, reverse=True))
+_DOM = r"\d{1,2}(?:st|nd|rd|th)?"
+_DAY = (
+    r"(?:today|tonight|tomorrow|(?:the\s+)?day\s+after\s+tomorrow"
+    rf"|(?:(?:next|this)\s+)?(?:{_WEEKDAY})"
+    rf"|(?:{_MONTH})\s+{_DOM}(?:,?\s+\d{{4}})?"
+    rf"|{_DOM}\s+(?:of\s+)?(?:{_MONTH})(?:,?\s+\d{{4}})?)"
 )
-# The clock a calendar phrase itself names ("tomorrow 9am" → 09:00) — the
-# fold check runs on THAT wall time, not on whatever dateparser returned,
-# because dateparser silently shifts a gap/fold wall time to the nearest
-# real one.
-_PHRASE_CLOCK_MERIDIEM_RE = re.compile(
-    r"\b(\d{1,2})(?::(\d{2}))?\s*([ap])\.?m?\.?\b", re.IGNORECASE
+_CLOCK = r"(?:noon|midnight|\d{1,2}(?::\d{2})?(?:\s*[ap](?:\.?m\.?)?)?)"
+_ZONE = r"(?:(?:utc|gmt)(?:\s*[+-]\d{1,2}(?::?\d{2})?)?|[+-]\d{1,2}(?::?\d{2})?)"
+_CAL_DAY_FIRST_RE = re.compile(
+    rf"^(?:on\s+)?(?P<day>{_DAY})(?:\s+(?:at\s+)?(?P<clock>{_CLOCK}))?(?:\s+(?P<zone>{_ZONE}))?$",
+    re.IGNORECASE | re.ASCII,
 )
-_PHRASE_CLOCK_24_RE = re.compile(r"\b(\d{1,2}):(\d{2})\b")
-# dateparser cannot read "next <weekday>": it is parsed as the bare weekday
-# (the upcoming occurrence) plus seven days.
-_NEXT_WEEKDAY_RE = re.compile(
-    r"\bnext\s+(?=(?:mon|tues|wednes|thurs|fri|satur|sun)day\b)", re.IGNORECASE
+_CAL_CLOCK_FIRST_RE = re.compile(
+    rf"^(?:at\s+)?(?P<clock>{_CLOCK})\s+(?:on\s+)?(?P<day>{_DAY})(?:\s+(?P<zone>{_ZONE}))?$",
+    re.IGNORECASE | re.ASCII,
 )
-# "in N days/weeks" keeps the local CLOCK time (calendar days, not +48h
-# absolute — across a DST change the wall time is what the caller meant).
-_IN_DAYS_RE = re.compile(
-    r"^in\s+(\d+(?:\.\d+)?)\s+(days?|weeks?)\.?$", re.IGNORECASE
+_CAL_CLOCK_ZONE_RE = re.compile(
+    rf"^(?:at\s+)?(?P<clock>{_CLOCK})\s+(?P<zone>{_ZONE})$", re.IGNORECASE | re.ASCII
 )
-# A phrase that names its own zone is resolved in that zone — the local
-# wall-time fold check must not second-guess it.
-_ZONE_TOKEN_RE = re.compile(
-    r"(?:\b(?:utc|gmt|[acehmp][sd]t|ak[sd]t)\b|[+-]\d{1,2}(?::?\d{2})?\b)",
-    re.IGNORECASE,
+_CAL_SPAN_RE = re.compile(
+    r"^(?:in\s+(?P<a>\d+|an?)\s+(?P<u>days?|weeks?)"
+    r"|(?P<b>\d+|an?)\s+(?P<v>days?|weeks?)\s+(?:from\s+now|later))$",
+    re.IGNORECASE | re.ASCII,
 )
+_HORIZON = timedelta(days=366)
+_MAX_CHARS = 64
+_EVENING_HOUR = 17  # "tonight" below this is not tonight
 
 _GUIDANCE = (
     "use an ISO-8601 time, a clock time like '9am', an elapsed time like "
-    "'in 2 hours', or a calendar phrase like 'tomorrow 9am'"
+    "'in 2 hours', or a day and clock like 'tomorrow 9am', 'next friday at 3pm', "
+    "'june 20 3pm UTC' or 'tomorrow noon'"
 )
 
 
@@ -149,8 +161,12 @@ def _elapsed_delta(text: str) -> timedelta | None:
             return None
     if s[matches[-1].end() :].strip(" ,") != "":
         return None
+    parts = _ELAPSED_PART_RE.findall(s)
+    if len({unit[0].lower() for _, unit in parts}) != len(parts):
+        return None
     seconds = 0.0
-    for num, unit in _ELAPSED_PART_RE.findall(s):
+    for num, unit in parts:
+        num = num.strip()
         n = 1.0 if num.lower() in ("a", "an") else float(num)
         u = unit.lower()
         if u.startswith("h"):
@@ -160,6 +176,159 @@ def _elapsed_delta(text: str) -> timedelta | None:
         else:
             seconds += n
     return timedelta(seconds=seconds)
+
+
+def _refuse(raw: str) -> TimingParseError:
+    return TimingParseError(f"could not interpret preferred_timing '{raw}'; {_GUIDANCE}")
+
+
+def _parse_clock(text: str, raw: str) -> tuple[int, int]:
+    """(hour, minute) of a grammar clock. A bare number reads as the 24-hour hour."""
+    s = text.strip().lower()
+    if s == "noon":
+        return 12, 0
+    if s == "midnight":
+        return 0, 0
+    m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?\s*(?:([ap])(?:\.?m\.?)?)?", s, re.ASCII)
+    if not m:
+        raise _refuse(raw)
+    hour, minute = int(m.group(1)), int(m.group(2) or 0)
+    if m.group(3):
+        if not 1 <= hour <= 12:
+            raise _refuse(raw)
+        hour = hour % 12 + (12 if m.group(3) == "p" else 0)
+    if hour > 23 or minute > 59:
+        raise _refuse(raw)
+    return hour, minute
+
+
+def _parse_zone(text: str, raw: str) -> tzinfo:
+    """A fixed zone: UTC, GMT, either with an offset, or a bare offset."""
+    s = re.sub(r"\s+", "", text.lower(), flags=re.ASCII).removeprefix("utc").removeprefix("gmt")
+    if not s:
+        return UTC
+    digits = s[1:].replace(":", "")
+    hours, minutes = (int(digits), 0) if len(digits) <= 2 else (int(digits[:-2]), int(digits[-2:]))
+    if hours > 14 or minutes > 59:
+        raise TimingParseError(f"preferred_timing '{raw}' has an impossible UTC offset")
+    return timezone(timedelta(hours=hours, minutes=minutes) * (1 if s[0] == "+" else -1))
+
+
+def _date_in_grammar(day: str, today: date, raw: str) -> date | None:
+    """The date a <day> names, or None when it is a weekday, which needs the clock."""
+    s = re.sub(r"\s+", " ", day.strip().lower())
+    if s in ("today", "tonight"):
+        return today
+    if s == "tomorrow":
+        return today + timedelta(days=1)
+    if s.endswith("after tomorrow"):
+        return today + timedelta(days=2)
+    m = re.fullmatch(rf"(?:(?P<mon1>{_MONTH}) (?P<d1>\d+)|(?P<d2>\d+)(?:st|nd|rd|th)? (?:of )?(?P<mon2>{_MONTH}))"
+                     r"(?:st|nd|rd|th)?(?:,? (?P<y>\d{4}))?", s, re.ASCII)  # fmt: skip
+    if not m:
+        return None
+    month = _MONTHS[m.group("mon1") or m.group("mon2")]
+    number = int(m.group("d1") or m.group("d2"))
+    try:
+        if m.group("y"):
+            return date(int(m.group("y")), month, number)
+        named = date(today.year, month, number)
+        return named if named >= today else date(today.year + 1, month, number)
+    except ValueError as exc:
+        raise _refuse(raw) from exc
+
+
+def _calendar_instant(raw: str, base_utc: datetime, local_tz: tzinfo, tzname: str) -> datetime | None:
+    """The instant a calendar phrase names, or None when the grammar does not match."""
+    text = raw.strip().removesuffix(".").strip()
+
+    span = _CAL_SPAN_RE.match(text)
+    if span:
+        count, unit = (span.group("a") or span.group("b")), (span.group("u") or span.group("v"))
+        n = 1 if count.lower() in ("a", "an") else int(count)
+        if n < 1:
+            raise _refuse(raw)
+        days = n * (7 if unit.lower().startswith("w") else 1)
+        wall = base_utc.astimezone(local_tz).replace(tzinfo=None) + timedelta(days=days)
+        return _one_local_instant(wall, local_tz, tzname, raw)
+
+    m = _CAL_DAY_FIRST_RE.match(text)
+    if not m:
+        m = _CAL_CLOCK_FIRST_RE.match(text) or _CAL_CLOCK_ZONE_RE.match(text)
+        # Leading a phrase, a bare number needs "at": "3 friday" could be a date.
+        if m and m.group("clock").isdigit() and not text.lower().startswith("at"):
+            return None
+    if not m:
+        return None
+    groups = m.groupdict()
+    day, clock, zone = groups.get("day"), groups.get("clock"), groups.get("zone")
+
+    zone_tz = _parse_zone(zone, raw) if zone else local_tz
+    zone_name = zone.strip() if zone else tzname
+    local_now = base_utc.astimezone(zone_tz)
+    today = local_now.date()
+    hm = _parse_clock(clock, raw) if clock else None
+
+    if day is None:  # "<clock> <zone>": the next occurrence in that zone.
+        for extra in (0, 1, 2):
+            wall = datetime.combine(today + timedelta(days=extra), time(*hm))
+            future = [u for u in _fold_instants(wall, zone_tz) if u > base_utc]
+            if future:
+                return future[0]
+        raise _refuse(raw)
+
+    key = re.sub(r"\s+", " ", day.strip().lower())
+    bare = bool(clock) and clock.strip().isdigit()
+    # Which night "tomorrow midnight" means is a day's difference.
+    if clock and clock.strip().lower() == "midnight":
+        raise _refuse(raw)
+    # A clockless day with a zone reads like arithmetic: "tomorrow -5".
+    if zone and hm is None:
+        raise _refuse(raw)
+    if key == "tonight":
+        if hm is None:
+            raise _refuse(raw)
+        if bare and 1 <= hm[0] <= 11:
+            hm = (hm[0] + 12, hm[1])  # "tonight at 9" is 21:00
+        if hm[0] < _EVENING_HOUR:
+            raise _refuse(raw)
+    elif bare and 1 <= hm[0] <= 12:
+        # "friday at 5" is a guess between 05:00 and 17:00.
+        raise _refuse(raw)
+
+    named = _date_in_grammar(day, today, raw)
+    if named is not None:
+        if hm is None:
+            # Only a relative day has an obvious clock: this time tomorrow.
+            if key == "today" or key == "tonight" or _MONTHS.get(key.split()[0]) or key[0].isdigit():
+                raise _refuse(raw)
+            hm = (local_now.hour, local_now.minute)
+        return _one_local_instant(datetime.combine(named, time(*hm)), zone_tz, zone_name, raw)
+
+    # A weekday needs its clock: on its own it names a whole day.
+    if hm is None:
+        raise _refuse(raw)
+    words = key.split()
+    weekday = _WEEKDAYS[words[-1]]
+    if words[0] == "next":
+        # The named day of the next calendar week, Monday first.
+        monday = today - timedelta(days=today.weekday()) + timedelta(days=7)
+        return _one_local_instant(
+            datetime.combine(monday + timedelta(days=weekday), time(*hm)), zone_tz, zone_name, raw
+        )
+    if words[0] == "this" and weekday < today.weekday():
+        raise _refuse(raw)  # this week's has gone, and next week's is not "this"
+    ahead = (weekday - today.weekday()) % 7
+    instant = _one_local_instant(
+        datetime.combine(today + timedelta(days=ahead), time(*hm)), zone_tz, zone_name, raw
+    )
+    if instant <= base_utc:  # later today has passed
+        if words[0] == "this":  # "this monday" cannot mean next week's
+            raise _refuse(raw)
+        instant = _one_local_instant(
+            datetime.combine(today + timedelta(days=ahead + 7), time(*hm)), zone_tz, zone_name, raw
+        )
+    return instant
 
 
 def resolve_preferred_timing(
@@ -178,6 +347,10 @@ def resolve_preferred_timing(
     raw = (value or "").strip()
     if not raw:
         raise TimingParseError("preferred_timing is empty")
+    if len(raw) > _MAX_CHARS:
+        raise TimingParseError(
+            f"preferred_timing is longer than {_MAX_CHARS} characters; {_GUIDANCE}"
+        )
 
     tzname = tz
     if tzname is None:
@@ -186,7 +359,7 @@ def resolve_preferred_timing(
         tzname = user_timezone()
     try:
         local_tz = zoneinfo.ZoneInfo(tzname)
-    except (zoneinfo.ZoneInfoNotFoundError, KeyError, ValueError) as exc:
+    except (zoneinfo.ZoneInfoNotFoundError, KeyError, ValueError, OSError) as exc:
         raise TimingParseError(
             f"preferred_timing '{raw}': unusable timezone {tzname!r}"
         ) from exc
@@ -201,7 +374,7 @@ def resolve_preferred_timing(
         #    caller treats it as deliver-now, unchanged). Naive: the user's
         #    timezone, but only when the wall time maps to exactly one instant.
         try:
-            dt = datetime.fromisoformat(raw)
+            dt = datetime.fromisoformat(raw) if re.match(r"^\d{4}-.*[T ]", raw, re.ASCII) else None
         except (ValueError, TypeError):
             dt = None
         if dt is not None:
@@ -213,25 +386,9 @@ def resolve_preferred_timing(
         #    forms; a bare number reads as the hour. The search runs three
         #    days because a wall time inside tomorrow's DST gap produces no
         #    instant that day and must land on the day after instead.
-        m = _CLOCK_MERIDIEM_RE.match(raw)
+        m = _CLOCK_MERIDIEM_RE.match(raw) or _CLOCK_24_RE.match(raw)
         if m:
-            meridiem = (m.group(3) or "").lower()
-        else:
-            m = _CLOCK_24_RE.match(raw)
-            meridiem = ""
-        if m:
-            hour = int(m.group(1))
-            minute = int(m.group(2) or 0)
-            if meridiem:
-                if not 1 <= hour <= 12:
-                    raise TimingParseError(
-                        f"could not interpret preferred_timing '{raw}'; {_GUIDANCE}"
-                    )
-                hour = hour % 12 + (12 if meridiem == "p" else 0)
-            if hour > 23 or minute > 59:
-                raise TimingParseError(
-                    f"could not interpret preferred_timing '{raw}'; {_GUIDANCE}"
-                )
+            hour, minute = _parse_clock(re.sub(r"^at\s+", "", raw, flags=re.IGNORECASE), raw)
             local_now = base_utc.astimezone(local_tz)
             for extra_days in (0, 1, 2):
                 day = (local_now + timedelta(days=extra_days)).date()
@@ -248,143 +405,28 @@ def resolve_preferred_timing(
         #    whenever a clock change falls inside the window.
         delta = _elapsed_delta(raw)
         if delta is not None:
+            if delta <= timedelta(0):
+                raise _refuse(raw)
+            if delta > _HORIZON:
+                raise TimingParseError(
+                    f"preferred_timing '{raw}' resolves more than a year out — {_GUIDANCE}"
+                )
             return base_utc + delta
 
-        # 4. Calendar phrase → dateparser, but only when the phrase holds a
-        #    calendar word, and only with the fold/horizon checks below.
-        #    "in N days/weeks" is calendar arithmetic on the local clock — a
-        #    DST change inside the window must not move the wall time.
-        in_days = _IN_DAYS_RE.match(raw)
-        if in_days:
-            n = float(in_days.group(1))
-            days = n * (7 if in_days.group(2).lower().startswith("w") else 1)
-            wall = base_utc.astimezone(local_tz).replace(tzinfo=None) + timedelta(
-                days=days
-            )
-            instant = _one_local_instant(wall, local_tz, tzname, raw)
-            if instant > base_utc + timedelta(days=366):
+        # 4. Calendar phrase, matched whole against the grammar above. A day
+        #    keeps the local clock across a DST change, and a wall time in a
+        #    gap or fold is refused rather than moved.
+        instant = _calendar_instant(raw, base_utc, local_tz, tzname)
+        if instant is not None:
+            if instant <= base_utc:
                 raise TimingParseError(
-                    f"preferred_timing '{raw}' resolves more than a year "
-                    f"out — {_GUIDANCE}"
+                    f"preferred_timing '{raw}' resolves to the past — {_GUIDANCE}"
+                )
+            if instant > base_utc + _HORIZON:
+                raise TimingParseError(
+                    f"preferred_timing '{raw}' resolves more than a year out — {_GUIDANCE}"
                 )
             return instant
-        if _CALENDAR_WORD_RE.search(raw):
-            try:
-                import dateparser
-            except ImportError as exc:
-                raise TimingParseError(
-                    "preferred_timing: natural-language resolution needs the "
-                    "dateparser package, which is not installed"
-                ) from exc
-            parse_raw = raw
-            if _NEXT_WEEKDAY_RE.search(raw):
-                parse_raw = _NEXT_WEEKDAY_RE.sub("", raw, count=1)
-            # A phrase naming its own zone resolves in that zone — dateparser
-            # ignores zone tokens under the TIMEZONE setting, so the token is
-            # stripped, the remainder is parsed naive relative to now in the
-            # named zone, and that zone is attached back via _fold_instants.
-            # Abbreviated zones are ambiguous everywhere (CST is four
-            # different offsets); only utc/gmt and numeric offsets qualify.
-            zone_m = _ZONE_TOKEN_RE.search(raw)
-            named_tz = None
-            if zone_m:
-                token = zone_m.group(0).lower()
-                if token in ("utc", "gmt"):
-                    named_tz = UTC
-                elif token[0] in "+-":
-                    off = token[1:].replace(":", "")
-                    if len(off) <= 2:
-                        # "+5"/"-05" name whole hours, not minutes.
-                        hours, mins = int(off), 0
-                    else:
-                        hours, mins = int(off[:-2]), int(off[-2:])
-                    named_tz = timezone(
-                        timedelta(hours=hours, minutes=mins)
-                        * (1 if token[0] == "+" else -1)
-                    )
-                else:
-                    raise TimingParseError(
-                        f"preferred_timing '{raw}' names the ambiguous zone "
-                        f"'{zone_m.group(0)}' — use a numeric UTC offset"
-                    )
-                parse_raw = _ZONE_TOKEN_RE.sub("", parse_raw).strip()
-            parsed = dateparser.parse(
-                parse_raw,
-                settings={
-                    "PREFER_DATES_FROM": "future",
-                    "RELATIVE_BASE": base_utc.astimezone(
-                        named_tz or local_tz
-                    ).replace(tzinfo=None),
-                    "TIMEZONE": tzname,
-                    "RETURN_AS_TIMEZONE_AWARE": True,
-                    "PREFER_DAY_OF_MONTH": "first",
-                },
-            )
-            if parsed is not None and parsed.tzinfo is not None:
-                # The clock the phrase names is searched in parse_raw, NOT
-                # raw — a zone token's digits ("tomorrow +05:30") would
-                # otherwise read as a 05:30 clock and override the wall time.
-                meridiem = None
-                clock = _PHRASE_CLOCK_MERIDIEM_RE.search(parse_raw)
-                if clock:
-                    meridiem = clock.group(3).lower()
-                else:
-                    clock = _PHRASE_CLOCK_24_RE.search(parse_raw)
-                if clock:
-                    h = int(clock.group(1))
-                    minute = int(clock.group(2) or 0)
-                    if meridiem is not None:
-                        if not 1 <= h <= 12:
-                            raise TimingParseError(
-                                f"could not interpret preferred_timing "
-                                f"'{raw}'; {_GUIDANCE}"
-                            )
-                        h = h % 12 + (12 if meridiem == "p" else 0)
-                    if h > 23 or minute > 59:
-                        raise TimingParseError(
-                            f"could not interpret preferred_timing "
-                            f"'{raw}'; {_GUIDANCE}"
-                        )
-                if named_tz is not None:
-                    # The parsed wall fields are relative to now in the named
-                    # zone; a "next <weekday>" rewrite adds seven days on that
-                    # zone's wall clock before the instant is taken.
-                    wall = parsed.replace(tzinfo=None)
-                    if _NEXT_WEEKDAY_RE.search(raw):
-                        wall += timedelta(days=7)
-                    if clock:
-                        wall = wall.replace(
-                            hour=h, minute=minute, second=0, microsecond=0
-                        )
-                    instant = _one_local_instant(
-                        wall, named_tz, zone_m.group(0), raw
-                    )
-                else:
-                    # The fold check runs on the wall time the PHRASE named,
-                    # not on dateparser's result — the parser silently shifts
-                    # a gap/fold wall time to the nearest real one, and that
-                    # shift is exactly the guess this check exists to refuse.
-                    naive = parsed.astimezone(local_tz).replace(tzinfo=None)
-                    if parse_raw != raw:
-                        naive += timedelta(days=7)
-                    if clock:
-                        wall = naive.replace(
-                            hour=h, minute=minute, second=0, microsecond=0
-                        )
-                    else:
-                        wall = naive
-                    instant = _one_local_instant(wall, local_tz, tzname, raw)
-                if instant <= base_utc:
-                    raise TimingParseError(
-                        f"preferred_timing '{raw}' resolves to the past — "
-                        f"{_GUIDANCE}"
-                    )
-                if instant > base_utc + timedelta(days=366):
-                    raise TimingParseError(
-                        f"preferred_timing '{raw}' resolves more than a year "
-                        f"out — {_GUIDANCE}"
-                    )
-                return instant
     except OverflowError as exc:
         raise TimingParseError(
             f"preferred_timing '{raw}' resolves out of range — {_GUIDANCE}"

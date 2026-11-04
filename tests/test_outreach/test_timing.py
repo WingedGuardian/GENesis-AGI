@@ -210,12 +210,12 @@ def test_elapsed_decimal_hours():
 )
 def test_elapsed_garbage_refused(bad):
     """Bare counts, number words, negatives, ambiguous HHMM, and overflow all
-    refuse — dateparser must never guess at them."""
+    refuse — nothing guesses at them."""
     with pytest.raises(TimingParseError):
         resolve_preferred_timing(bad, now=SPEC_NOW, tz=CHICAGO)
 
 
-# ── Calendar phrases (dateparser, gated) ─────────────────────────────────
+# ── Calendar phrases (anchored grammar) ─────────────────────────────────
 
 
 @pytest.mark.parametrize(
@@ -322,6 +322,31 @@ def test_abbreviated_zone_refused():
         resolve_preferred_timing("tomorrow 9am CST", now=SPEC_NOW, tz=CHICAGO)
 
 
+@pytest.mark.parametrize(
+    "raw",
+    ["tomorrow 9am IST", "tomorrow 9am cet", "tomorrow morning", "friday 3pm sharp", "tomorrow 9am please"],
+)
+def test_a_word_it_cannot_read_is_refused_not_ignored(raw):
+    """A date parser drops what it cannot read: 'tomorrow 9am IST' meant 9am here."""
+    with pytest.raises(TimingParseError):
+        resolve_preferred_timing(raw, now=SPEC_NOW, tz=CHICAGO)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("tomorrow 9am", datetime(2026, 6, 11, 14, 0, tzinfo=UTC)),
+        ("tomorrow at 9am", datetime(2026, 6, 11, 14, 0, tzinfo=UTC)),
+        ("friday 3pm", datetime(2026, 6, 12, 20, 0, tzinfo=UTC)),
+        ("next friday 3pm", datetime(2026, 6, 19, 20, 0, tzinfo=UTC)),
+        ("next friday 3pm UTC", datetime(2026, 6, 19, 15, 0, tzinfo=UTC)),
+        ("june 20th 3pm", datetime(2026, 6, 20, 20, 0, tzinfo=UTC)),
+    ],
+)
+def test_ordinary_calendar_phrases_still_resolve(raw, expected):
+    assert resolve_preferred_timing(raw, now=SPEC_NOW, tz=CHICAGO) == expected
+
+
 def test_and_connector_is_case_insensitive():
     assert resolve_preferred_timing(
         "in 2 hours AND 30 minutes", now=NOW, tz="UTC"
@@ -336,10 +361,135 @@ def test_short_hour_offset_is_hours_not_minutes():
 
 
 def test_zone_offset_digits_are_not_a_clock():
-    """'tomorrow +05:30' names no clock — the offset's 05:30 must not
-    override the wall time; the parsed day/time is kept."""
-    got = resolve_preferred_timing("tomorrow +05:30", now=SPEC_NOW, tz=CHICAGO)
-    # The named zone's "now" is 20:30 +05:30; "tomorrow" keeps that clock on
-    # the next day: 2026-06-11 20:30 +05:30 = 15:00 UTC. A 05:30 clock
-    # override would give a different instant entirely.
-    assert got == datetime(2026, 6, 11, 15, 0, tzinfo=UTC)
+    """A zone needs a clock: "+05:30" on its own must not read as 05:30."""
+    with pytest.raises(TimingParseError):
+        resolve_preferred_timing("tomorrow +05:30", now=SPEC_NOW, tz=CHICAGO)
+
+
+# ── The grammar, from an audit of the guessing parser it replaced ──
+# SPEC_NOW is Wednesday 2026-06-10 15:00Z, 10:00 in Chicago (CDT, UTC-5).
+_Z = lambda month, day, hour, minute=0: datetime(2026, month, day, hour, minute, tzinfo=UTC)  # noqa: E731
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("friday 13", _Z(6, 12, 18)),
+        ("friday at 9:00", _Z(6, 12, 14)),
+        ("next friday at 9am", _Z(6, 19, 14)),
+        ("tonight 17:30", _Z(6, 10, 22, 30)),
+        ("this friday 9pm", _Z(6, 13, 2)),
+        ("tomorrow 14", _Z(6, 11, 19)),
+        ("tomorrow at 21", _Z(6, 12, 2)),
+        ("tomorrow 9am UTC", _Z(6, 11, 9)),
+        ("tomorrow 9am UTC+5", _Z(6, 11, 4)),
+        ("tomorrow 9am GMT+05:30", _Z(6, 11, 3, 30)),
+        ("tomorrow 9am +05:30", _Z(6, 11, 3, 30)),
+        ("tomorrow 9am -5", _Z(6, 11, 14)),
+        ("9am UTC", _Z(6, 11, 9)),
+        ("june 20 3pm", _Z(6, 20, 20)),
+        ("june 20, 2026 3pm", _Z(6, 20, 20)),
+        ("20 june 3pm", _Z(6, 20, 20)),
+        ("20th of june 3pm", _Z(6, 20, 20)),
+        ("jun 20 at 3pm", _Z(6, 20, 20)),
+        ("wednesday 3pm", _Z(6, 10, 20)),
+        ("wednesday 9am", _Z(6, 17, 14)),
+        ("next wednesday 3pm", _Z(6, 17, 20)),
+        ("next monday 3pm", _Z(6, 15, 20)),
+        ("this friday 3pm", _Z(6, 12, 20)),
+        ("TOMORROW 9AM", _Z(6, 11, 14)),
+        ("on friday at 3pm", _Z(6, 12, 20)),
+        ("tomorrow noon", _Z(6, 11, 17)),
+        ("noon tomorrow", _Z(6, 11, 17)),
+        ("friday noon", _Z(6, 12, 17)),
+        ("3pm tomorrow", _Z(6, 11, 20)),
+        ("9am on friday", _Z(6, 12, 14)),
+        ("tonight 9pm", _Z(6, 11, 2)),
+        ("tonight at 9", _Z(6, 11, 2)),
+        ("today 3pm", _Z(6, 10, 20)),
+        ("tomorrow", _Z(6, 11, 15)),
+        ("day after tomorrow 9am", _Z(6, 12, 14)),
+        ("2 days from now", _Z(6, 12, 15)),
+        ("a week from now", _Z(6, 17, 15)),
+        ("2 days later", _Z(6, 12, 15)),
+        ("in a week", _Z(6, 17, 15)),
+        ("in 1 week", _Z(6, 17, 15)),
+    ],
+)
+def test_the_grammar_resolves(raw, expected):
+    assert resolve_preferred_timing(raw, now=SPEC_NOW, tz=CHICAGO) == expected
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "friday at 25", "3 friday", "9 UTC", "friday 9-5", "friday", "next friday",
+        "on friday", "may", "sept", "in june", "june 2027", "may 5", "june 20th",
+        "tomorrow 99", "tomorrow 1430", "tomorrow 9am1", "tomorrow 9:5am", "tomorrow 14:30:45",
+        "june-20 3pm", "june-20-2026 3pm", "june 5-6 3pm", "may 5-10 3pm", "june 31 3pm",
+        "june 20 -2026", "monday june 20 3pm", "friday the 13th", "tomorrow 9am 5pm",
+        "tomorrow 9am-5pm", "today 3pm tomorrow 4pm", "today tomorrow", "tomorrow tomorrow",
+        "the tomorrow", "tomorrow a", "tomorrow 9am +25", "tomorrow 9am +24", "tomorrow 9am -24:00",
+        "tomorrow 9am +05:99", "tomorrow 9am +5:3", "tomorrow 9am UTC PST", "tomorrow 9am +5 UTC",
+        "tomorrow 9am +5 -3", "tomorrow 9am IST", "tomorrow 9am Z", "tomorrow 9am \u00e0",
+        "am", "in am", "am from now", "as", "ah", "in 0 days", "0h", "in 0 hours", "in -1 days",
+        "in 999999 hours", "8760000h", "in 400 days", "14300101", "today 9am", "tonight 9am",
+        "tonight", "today", "yesterday", "by friday", "tomorrow morning",
+        "january 1 2020 3pm", "june 20 2028 3pm",
+        "friday at 9", "friday 9", "next friday at 9", "tomorrow at 9", "june 20 3",
+        "tonight midnight", "midnight tonight", "tonight at 0", "tonight 00:00", "tonight 0:30",
+        "tonight at 12", "tonight 12:30", "tonight at noon", "tonight 12pm", "tonight at 1:00",
+        "tonight 14:00", "tonight 3pm", "tomorrow midnight", "wednesday midnight",
+        "friday midnight", "midnight today", "this wednesday 9am", "this monday 8am",
+        "tomorrow -5", "friday +5", "2026-11-05", "2026-W45-4", "a m", "an h", "a s", "1h 1h",
+        "\u017fat 9am", "fr\u0131day 9am", "\u017fep 3 9am", "june 1\u017ft 9am",
+        "\u0669am", "\uff19:\uff13\uff10pm", "tomorrow 9am utc+\u0665",
+    ],
+)
+def test_the_grammar_refuses(raw):
+    with pytest.raises(TimingParseError):
+        resolve_preferred_timing(raw, now=SPEC_NOW, tz=CHICAGO)
+
+
+@pytest.mark.parametrize(
+    ("raw", "now", "expected"),
+    [
+        # A calendar day keeps the local clock across a clock change.
+        ("tomorrow", datetime(2026, 3, 7, 16, 0, tzinfo=UTC), datetime(2026, 3, 8, 15, 0, tzinfo=UTC)),
+        ("in a week", datetime(2026, 3, 7, 16, 0, tzinfo=UTC), datetime(2026, 3, 14, 15, 0, tzinfo=UTC)),
+        ("in a week", datetime(2026, 10, 31, 15, 0, tzinfo=UTC), datetime(2026, 11, 7, 16, 0, tzinfo=UTC)),
+    ],
+)
+def test_a_calendar_day_keeps_the_clock_across_dst(raw, now, expected):
+    assert resolve_preferred_timing(raw, now=now, tz=CHICAGO) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "now"),
+    [
+        ("tomorrow", datetime(2026, 3, 7, 8, 30, tzinfo=UTC)),  # 02:30 is in the gap
+        ("in a day", datetime(2026, 3, 7, 8, 30, tzinfo=UTC)),
+        ("tomorrow 2:30am", datetime(2026, 3, 7, 16, 0, tzinfo=UTC)),
+        ("tomorrow 1:30am", datetime(2026, 10, 31, 15, 0, tzinfo=UTC)),  # exists twice
+    ],
+)
+def test_a_wall_time_in_a_gap_or_fold_is_refused(raw, now):
+    with pytest.raises(TimingParseError):
+        resolve_preferred_timing(raw, now=now, tz=CHICAGO)
+
+
+def test_a_zone_name_that_is_a_directory_is_refused():
+    with pytest.raises(TimingParseError):
+        resolve_preferred_timing("9am", now=SPEC_NOW, tz="America")
+
+
+@pytest.mark.parametrize(
+    "raw", ["1" * 65, "1" * 100_000, "tomorrow" + " " * 100_000 + "x", "in " + "9" * 5000 + " days"]
+)
+def test_a_long_string_is_refused_before_any_regex_runs(raw):
+    with pytest.raises(TimingParseError, match="longer than"):
+        resolve_preferred_timing(raw, now=SPEC_NOW, tz=CHICAGO)
+
+
+def test_tonight_with_a_bare_hour_is_the_evening():
+    assert resolve_preferred_timing("tonight at 9", now=SPEC_NOW, tz=CHICAGO) == _Z(6, 11, 2)
