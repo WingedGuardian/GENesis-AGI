@@ -715,17 +715,27 @@ def _parse_counter(monkeypatch):
 
 
 def test_19b_a_parse_that_outlasts_the_hook_limit_passes_with_a_could_not_check_note(
-    monkeypatch, capsys, tmp_path
+    monkeypatch, capsys
 ):
     """Owner ruling 2026-11-03: no size cap keeps markdown-it inside the 10 s budget
-    (64 KB of `*a ` MEASURED 9.7 s), so the parse has its own limit and, past it, the
-    create passes and says it was not checked."""
+    (64 KB of `*a ` MEASURED 9.7 s here), so the parse has its own limit and, past it,
+    the create passes and says it was not checked. The slow parse is a pure-Python
+    loop standing in for markdown-it, so the result never depends on how fast the
+    library or the machine is (a CI runner parsed that body inside 0.2 s)."""
     import signal
 
     monkeypatch.setattr(hook, "_PARSE_LIMIT_S", 0.2)
-    hostile = _file(tmp_path, "*a " * (65536 // 3), "hostile.md")
+    hook._load()
+
+    def slow(issue):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:  # bytecodes, as markdown-it runs
+            pass
+        return None
+
+    monkeypatch.setattr(hook.pg, "owed_message", slow)
     started = time.monotonic()
-    code, out, err = _call(monkeypatch, capsys, _create("-F", str(hostile)))
+    code, out, err = _call(monkeypatch, capsys, _create(_b(MISSING)))
     elapsed = time.monotonic() - started
     assert (code, err) == (0, "")
     assert elapsed < 2, elapsed
@@ -734,6 +744,22 @@ def test_19b_a_parse_that_outlasts_the_hook_limit_passes_with_a_could_not_check_
     assert "did not run" in context["additionalContext"]
     assert "premise_gate.py check" in context["additionalContext"]
     assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+
+
+def test_19b_a_hostile_body_is_answered_within_the_limit(monkeypatch, capsys, tmp_path):
+    """The real super-linear body: however fast the parse runs on this machine, the
+    hook answers inside the limit, either judging it (no premise section: blocked)
+    or saying it could not check it."""
+    monkeypatch.setattr(hook, "_PARSE_LIMIT_S", 0.2)
+    hostile = _file(tmp_path, "*a " * (65536 // 3), "hostile.md")
+    started = time.monotonic()
+    code, out, err = _call(monkeypatch, capsys, _create("-F", str(hostile)))
+    elapsed = time.monotonic() - started
+    assert elapsed < 2, elapsed
+    if code == 0:
+        assert err == "" and "did not run" in out
+    else:
+        assert code == 2 and "no `## Premise checks` section" in err and out == ""
 
 
 def test_19c_a_normal_body_is_judged_under_the_limit_and_the_timer_is_cancelled(
