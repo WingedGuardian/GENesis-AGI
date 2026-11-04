@@ -95,11 +95,13 @@ def observed_charge(row):
 def validate(plan, consent, checked, *, cases=None):
     from . import run
 
+    shared = isinstance(plan, dict) and type(plan.get("version")) is int and plan["version"] == 2
     keys = {"version", "financial_promise", "stop_semantics", "combined_allowance",
-            "expected_limit", "baseline_usage", "credential_fingerprint", "price_snapshot",
-            "models"}
+            "credential_fingerprint", "price_snapshot", "models"}
+    keys |= {"credential_mode"} if shared else {"expected_limit", "baseline_usage"}
     if (not isinstance(plan, dict) or set(plan) != keys
-            or type(plan["version"]) is not int or plan["version"] != 1
+            or type(plan["version"]) is not int or plan["version"] != (2 if shared else 1)
+            or (shared and plan["credential_mode"] != "shared_existing")
             or plan["financial_promise"] != PROMISE):
         raise Incomplete("operating_plan_invalid")
     aliases = selected_aliases(plan["models"])
@@ -118,9 +120,10 @@ def validate(plan, consent, checked, *, cases=None):
     if (not isinstance(fingerprint, str) or len(fingerprint) != 64
             or any(c not in "0123456789abcdef" for c in fingerprint)):
         raise Incomplete("operating_identity_invalid")
-    combined, limit, baseline = (currency(plan[k]) for k in (
-        "combined_allowance", "expected_limit", "baseline_usage"
-    ))
+    combined = currency(plan["combined_allowance"])
+    envelope = combined if shared else total([
+        currency(plan["expected_limit"]), currency(plan["baseline_usage"]).copy_negate()
+    ])
     snapshot = plan["price_snapshot"]
     if (not isinstance(snapshot, dict) or set(snapshot) != {"observed_at", "evidence"}
             or any(not isinstance(v, str) or not v.strip() for v in snapshot.values())):
@@ -135,8 +138,11 @@ def validate(plan, consent, checked, *, cases=None):
         if sampled and aliases != PRO_COMPARISON:
             raise Incomplete("incumbent_sample_population_invalid")
         run.validate_campaign(manifest, checked, alias, cases=cases)
+        transport = manifest["binding"]["transports"][alias]
+        mode = "shared_existing" if shared else "dedicated"
         if ((not sampled and len(manifest["attempts"]) != 2250)
-                or manifest["binding"]["transports"][alias]["credential_fingerprint"] != fingerprint
+                or pinned.frozen_credential_mode(transport) != mode
+                or transport["credential_fingerprint"] != fingerprint
                 or any(currency(row["max_charge"]) <= 0 for row in manifest["attempts"])):
             raise Incomplete("operating_schedule_invalid")
         budgets.append(currency(manifest["budget"]))
@@ -146,7 +152,6 @@ def validate(plan, consent, checked, *, cases=None):
         manifests[alias] = manifest
     if consent["scope"] != f"{sum(len(m['attempts']) for m in manifests.values())}_requests":
         raise Incomplete("spending_approval_missing_or_changed")
-    envelope = total([limit, baseline.copy_negate()])
     if combined <= 0 or total(budgets) > combined or not total(allocations) <= envelope <= combined:
         raise Incomplete("operating_allowance_invalid")
     return manifests
@@ -217,6 +222,11 @@ class Operating:
                 error.add_note("operating failure evidence append failed: " + type(append_error).__name__)
 
     def predicate(self, info):
+        if self.plan.get("credential_mode") == "shared_existing":
+            if (info != {"credential_mode": "shared_existing"}
+                    or total([self.observed, self.pending]) > currency(self.plan["combined_allowance"])):
+                raise Incomplete("operating_allowance_invalid")
+            return
         if (info.get("limit_reset", "missing") is not None
                 or currency(info["limit"]) != currency(self.plan["expected_limit"])
                 or currency(info["usage"]) != total([
@@ -289,7 +299,8 @@ def cost_report(states):
 
 class OperatingRouter(pinned.PinnedRouter):
     def __init__(self, campaign, *, operating, **kwargs):
-        super().__init__(campaign, dispatch_admission=operating.admission_hook, **kwargs)
+        super().__init__(campaign, dispatch_admission=operating.admission_hook,
+                         credential_mode=operating.plan.get("credential_mode", "dedicated"), **kwargs)
         self.operating = operating
 
     async def _send(self, attempt, expected):
@@ -303,10 +314,11 @@ class OperatingRouter(pinned.PinnedRouter):
                 self.operating.pending, currency(row["spec"]["max_charge"]).copy_negate()
             ])
             self.operating.update(self.alias, attempt, row)
-            secret = pinned.dedicated_key()
+            secret = pinned.credential(self.credential_mode)
             if hashlib.sha256(secret.encode()).hexdigest() != self.fingerprint:
                 raise Incomplete("operating_credential_changed")
-            info = await pinned.key_status(secret, self.transport)
+            info = (await pinned.key_status(secret, self.transport)
+                    if self.credential_mode == "dedicated" else {"credential_mode": "shared_existing"})
             await self.operating.admission_hook(self, attempt, info)
             return answer
         except BaseException as exc:

@@ -61,10 +61,11 @@ REPO = "owner/repo"
 
 @pytest.fixture(autouse=True)
 def _reset_merge_deadline():
-    """``main()`` arms the module-global ``_merge_deadline`` once and never resets
-    it to ``None``; without this a prior test's (now-expired) deadline leaks into
-    the next and skews ``_gh_timeout``. The router ignores timeouts, but reset to
-    keep each case hermetic."""
+    """Start and end every case with no ``_merge_deadline`` armed. Since #2904,
+    ``main()`` disarms it on exit, so this no longer repairs a leak from this file;
+    it stays because ``test_rework_gate`` imports it, and because a case that arms
+    the deadline some other way would otherwise leak it. The router ignores
+    timeouts; the reset only keeps each case hermetic."""
     _mod._merge_deadline = None
     yield
     _mod._merge_deadline = None

@@ -554,6 +554,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     "${PRESSURE_UNIT}@standard.service" \
                     "${PRESSURE_UNIT}@last-resort.service" \
                     genesis-disk-hygiene.timer genesis-disk-hygiene.service \
+                    genesis-worktree-reaper.service \
                     genesis-cc-tmp-align.timer genesis-cc-tmp-align.service \
                     genesis-cc-settings-align.timer genesis-cc-settings-align.service \
                     genesis-graph-project.timer genesis-graph-project.service \

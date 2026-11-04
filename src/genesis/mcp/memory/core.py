@@ -1035,7 +1035,7 @@ def _validate_wing(wing: str | None) -> None:
         )
 
 
-@mcp.tool()
+@mcp.tool(task=False)
 async def memory_store(
     content: str,
     source: str,

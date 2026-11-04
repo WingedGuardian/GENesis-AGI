@@ -672,6 +672,10 @@ _NOT_WIRED = {
     # launcher. Missing/crashing sibling imports and a healthy allow control
     # are measured by test_codex_validator_adapter's launcher import test.
     "codex_validator_adapter.py": "Codex shell launcher converts every sibling import crash to exit 2",
+    # An inactive adapter child, not a directly configured Claude/Codex hook.
+    # test_validator_role_guard::test_actual_adapter_denies_every_role_import_failure
+    # measures missing/crashing imports for every bare sibling plus healthy allow.
+    "validator_role_guard.py": "Validator adapter converts child import failures to an explicit deny",
     # Its remaining bare import is `shell_parse`, and its only usable degraded token
     # would be the pipe character — 52,220 of 74,282 commands (70.30%). Wiring it would
     # not make the broken state safe, it would make it UNREPAIRABLE, and a degraded

@@ -777,7 +777,7 @@ def test_update_state_persists_the_recovery_ownership_inputs(
 ):
     text = UPDATE.read_text()
     start = text.index("_write_state() {")
-    end = text.index("\n}\n\n# Clear this run's deploy state files", start) + 2
+    end = text.index("\n}\n", start) + 2
     state_path = tmp_path / "home" / ".genesis" / "update_state.json"
     script = (
         'set -euo pipefail; STATE_FILE="$1"; STARTED_AT="2026-01-01T00:00:00Z"; '
