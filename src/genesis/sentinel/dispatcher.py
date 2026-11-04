@@ -1409,6 +1409,9 @@ class SentinelDispatcher:
         session_id = session.get("id", "")
         self._active_session_id = session_id
 
+        # How the row ends: a failure reason, else the session's own report.
+        stop_reason: str | None = None
+        outcome = outcome_reason = None
         try:
             # Build MCP config so the CC session has health + outreach tools.
             # build_mcp_config can FAIL (import/other error → except below) OR
@@ -1447,18 +1450,36 @@ class SentinelDispatcher:
                 output_format="text",
                 mcp_config=mcp_path,
                 working_dir=background_session_dir(),
+                report_status=True,
             )
 
             output = await self._invoker.run(invocation)
+            if output.is_error:
+                stop_reason = output.error_message or "cc_error"
+            else:
+                from genesis.cc import final_status
+
+                outcome, outcome_reason = final_status.outcome_of(output.final_status)
 
             # Parse output (degraded → don't trust self-reported resolution)
             result = self._parse_output(output, session_id, degraded=degraded)
             return result
+        except BaseException as exc:
+            # A raise (or a cancel) used to end the row as completed below.
+            stop_reason = "cancelled" if isinstance(exc, asyncio.CancelledError) else (
+                type(exc).__name__
+            )
+            raise
         finally:
             self._active_session_id = None
             # End session
             try:
-                await self._session_manager.complete(session_id)
+                if stop_reason is not None:
+                    await self._session_manager.fail(session_id, reason=stop_reason)
+                else:
+                    await self._session_manager.complete(
+                        session_id, outcome=outcome, outcome_reason=outcome_reason
+                    )
             except Exception:
                 logger.debug("Failed to end sentinel session", exc_info=True)
 

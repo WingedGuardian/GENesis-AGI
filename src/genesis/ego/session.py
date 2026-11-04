@@ -356,6 +356,7 @@ class EgoSession:
             mcp_config=self._mcp_config_path,
             disallowed_tools=list(_EGO_CYCLE_DISALLOWED_TOOLS),
             caller_tag=self._cc_caller_tag("cycle"),
+            report_status=True,
         )
 
         # Autonomous dispatch check
@@ -982,11 +983,21 @@ class EgoSession:
         await self._compaction.store_cycle(cycle)
 
         if session_id is not None:
+            # Output the cycle could not read is a failed cycle, whatever the
+            # session reported; otherwise its own report decides.
+            from genesis.cc import final_status
+
+            if parsed is None:
+                outcome, reason = "failed", "unparseable_output"
+            else:
+                outcome, reason = final_status.outcome_of(output.final_status)
             await self._session_manager.complete(
                 session_id,
                 cost_usd=output.cost_usd,
                 input_tokens=output.input_tokens,
                 output_tokens=output.output_tokens,
+                outcome=outcome,
+                outcome_reason=reason,
             )
 
             # 8. Record last run for neural monitor

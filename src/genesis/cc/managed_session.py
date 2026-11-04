@@ -306,6 +306,9 @@ async def _finalize(runner, request, result, state):
                     cost_usd=result.cost_usd,
                     input_tokens=result.input_tokens,
                     output_tokens=result.output_tokens,
+                    # The session's own report (cc/final_status.py), via _result.
+                    outcome=result.outcome,
+                    outcome_reason=result.outcome_reason,
                 )
             elif result.partial and result.error == "execution_failed":
                 # A clean exit that was truncated or never sent its result:

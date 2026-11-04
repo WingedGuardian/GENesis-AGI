@@ -355,6 +355,7 @@ class CCReflectionBridge:
             mcp_config=_lockdown["mcp_config"],
             strict_mcp_config=_lockdown["strict_mcp_config"],
             working_dir=background_session_dir(),
+            report_status=True,
             stream_idle_timeout_ms=(
                 _DEPTH_TIMEOUT_S.get(depth, 300) * 1000
                 if depth in (Depth.DEEP, Depth.STRATEGIC)
@@ -507,12 +508,7 @@ class CCReflectionBridge:
             return ReflectionResult(success=False, reason=output.error_message)
 
         if used_cli:
-            await self._session_manager.complete(
-                session_id,
-                cost_usd=output.cost_usd,
-                input_tokens=output.input_tokens,
-                output_tokens=output.output_tokens,
-            )
+            await self._complete(session_id, output)
 
             await record_last_run(
                 db,
@@ -685,6 +681,7 @@ class CCReflectionBridge:
             mcp_config=_lockdown["mcp_config"],
             strict_mcp_config=_lockdown["strict_mcp_config"],
             working_dir=background_session_dir(),
+            report_status=True,
         )
         output = await self._invoker.run(invocation)
 
@@ -692,11 +689,20 @@ class CCReflectionBridge:
             await self._session_manager.fail(sess["id"], reason=output.error_message)
             return ReflectionResult(success=False, reason=output.error_message)
 
-        await self._session_manager.complete(
-            sess["id"],
-            cost_usd=output.cost_usd,
-            input_tokens=output.input_tokens,
-            output_tokens=output.output_tokens,
+        parsed = None
+        parse_raised = False
+        if self._output_router:
+            from genesis.reflection.output_router import parse_weekly_assessment_output
+
+            try:
+                parsed = parse_weekly_assessment_output(output.text)
+            except Exception:
+                # Parsed before the row is ended, so a raise must not strand it.
+                logger.error("Weekly assessment output parser raised", exc_info=True)
+                parsed = None
+                parse_raised = True
+        await self._complete(
+            sess["id"], output, parse_failed=parse_raised or bool(parsed and parsed.parse_failed)
         )
 
         await record_last_run(
@@ -709,11 +715,8 @@ class CCReflectionBridge:
             output_tokens=output.output_tokens,
         )
 
-        if self._output_router:
-            from genesis.reflection.output_router import parse_weekly_assessment_output
-
-            parsed = parse_weekly_assessment_output(output.text)
-            if parsed.parse_failed:
+        if parse_raised or parsed is not None:
+            if parse_raised or parsed.parse_failed:
                 logger.error("Weekly assessment output could not be parsed")
                 return ReflectionResult(
                     success=False,
@@ -777,6 +780,7 @@ class CCReflectionBridge:
             mcp_config=_lockdown["mcp_config"],
             strict_mcp_config=_lockdown["strict_mcp_config"],
             working_dir=background_session_dir(),
+            report_status=True,
         )
         output = await self._invoker.run(invocation)
 
@@ -784,11 +788,20 @@ class CCReflectionBridge:
             await self._session_manager.fail(sess["id"], reason=output.error_message)
             return ReflectionResult(success=False, reason=output.error_message)
 
-        await self._session_manager.complete(
-            sess["id"],
-            cost_usd=output.cost_usd,
-            input_tokens=output.input_tokens,
-            output_tokens=output.output_tokens,
+        parsed = None
+        parse_raised = False
+        if self._output_router:
+            from genesis.reflection.output_router import parse_quality_calibration_output
+
+            try:
+                parsed = parse_quality_calibration_output(output.text)
+            except Exception:
+                # Parsed before the row is ended, so a raise must not strand it.
+                logger.error("Quality calibration output parser raised", exc_info=True)
+                parsed = None
+                parse_raised = True
+        await self._complete(
+            sess["id"], output, parse_failed=parse_raised or bool(parsed and parsed.parse_failed)
         )
 
         await record_last_run(
@@ -801,11 +814,8 @@ class CCReflectionBridge:
             output_tokens=output.output_tokens,
         )
 
-        if self._output_router:
-            from genesis.reflection.output_router import parse_quality_calibration_output
-
-            parsed = parse_quality_calibration_output(output.text)
-            if parsed.parse_failed:
+        if parse_raised or parsed is not None:
+            if parse_raised or parsed.parse_failed:
                 logger.error("Quality calibration output could not be parsed")
                 return ReflectionResult(
                     success=False,
@@ -815,6 +825,27 @@ class CCReflectionBridge:
 
         logger.info("Quality calibration completed")
         return ReflectionResult(success=True, reason="Quality calibration completed")
+
+    async def _complete(self, session_id: str, output, *, parse_failed: bool = False) -> None:
+        """End a reflection's session row with its outcome.
+
+        Output the router cannot read is a failed run, whatever the session
+        reported; otherwise the session's own report decides (cc/final_status.py).
+        """
+        from genesis.cc import final_status
+
+        if parse_failed:
+            outcome, reason = "failed", "unparseable_output"
+        else:
+            outcome, reason = final_status.outcome_of(output.final_status)
+        await self._session_manager.complete(
+            session_id,
+            cost_usd=output.cost_usd,
+            input_tokens=output.input_tokens,
+            output_tokens=output.output_tokens,
+            outcome=outcome,
+            outcome_reason=reason,
+        )
 
     # ── Prompt delegation ─────────────────────────────────────────────
 
