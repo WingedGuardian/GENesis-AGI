@@ -78,14 +78,34 @@ incident despite `avoid`.
     while the hog is out of reach until the backstop (login scope, other users)
     or neither monitor (`system.slice`);
   - a runaway genesis-server: `avoid` ranks it last, so every other leaf under
-    the user manager goes first, one per oomd action, before it is chosen;
-    the backstop chooses by reclaim rate, but only above 80%.
+    the user manager goes first before it is chosen; the backstop chooses by
+    reclaim rate, but only above 80%.
+  - **one action can kill several cgroups (systemd 255).** After killing a
+    cgroup, oomd makes a second pass over `cgroup.threads`; on this systemd it
+    opens a pidfd for each thread id, which fails with EINVAL for any
+    non-leader thread, so oomd counts the kill as failed and moves on to the
+    next candidate until one kill returns cleanly (a single-threaded or
+    fast-exiting cgroup). Under the 60% monitor `omit` cgroups are excluded
+    before ranking and small single-threaded services sit between the
+    sessions and the `avoid` units, so the cascade stops early. Under the 80%
+    backstop marks are ignored, and the first clean kill can be the tmux
+    server or `init.scope` (both single-threaded). systemd 256 fixed this
+    (`CGROUP_NO_PIDFD` in `cg_kill`); #3874 tracks it here. The per-session
+    memory cap (the slot scope's `MemoryMax`) keeps a runaway session on the
+    kernel's single-victim path, away from oomd.
   Attributing pressure to its source, so the cause and not a bystander is acted
   on, is planned work beyond this policy.
-- Every run verifies the per-user monitor live (the user manager reports
-  `kill` for its root slice, and `oomctl` lists its cgroup on two reads) and
-  says which monitors are in force; the infra profile's
-  `oomd_user_manager_monitored` fact carries it to the awareness posture check.
+- Every run verifies the per-user monitor live before saying so: all three
+  user drop-ins are the Genesis ones, the user manager reports `kill` at 60%
+  for its root slice, `omit` for `init.scope` and `avoid` for `dbus.service`,
+  and `oomctl` lists its cgroup on two reads. The summary line names only what
+  those reads confirmed: the backstop as PID 1 reports `user.slice` now (so a
+  reload that failed on an earlier run is not reported as in force), and
+  neither monitor when systemd-oomd is not running. The infra profile's
+  `oomd_active` and `oomd_user_manager_monitored` facts carry it to the
+  awareness posture check.
+- Uninstall removes the three user drop-ins, which sit on non-Genesis unit
+  names; left behind, oomd would keep monitoring the user's other services.
 - `/etc/systemd/oomd.conf.d/genesis.conf`: swap-use limit 90%, default
   pressure limit 60%, 20s duration.
 - `genesis-server.service` carries `ManagedOOMPreference=avoid`: oomd chooses
@@ -232,7 +252,8 @@ flags unprotected installs:
 |---|---|---|---|
 | `cgroup_memory_swap_max` | container | `"max"` (or an int) | `0` |
 | `oomd_user_slice_kill` | container | `true` | `false` |
-| `oomd_user_manager_monitored` | container | `true` (live `oomctl` listing) | `false`: not listed (degraded to the backstop, where `avoid` is ignored), or no oomd unit active (nothing monitors) |
+| `oomd_active` | container | `true` (`systemd-oomd.service` active) | `false`: oomd is not running, so nothing monitors whatever is configured |
+| `oomd_user_manager_monitored` | container | `true` (live `oomctl` listing) | `false`: oomd runs and does not list it (degraded to the backstop, where `avoid` is ignored). `null` when oomd is not running or `oomctl` is absent; a failing `oomctl` keeps the prior value |
 | `pid_ceiling_effective_ok` | container | `true` | `false` |
 | `swap_total_kb` | host | > 0 | `0` |
 | `container_limits["limits.memory.swap"]` | host_virt | `"true"`/absent | `"false"` |

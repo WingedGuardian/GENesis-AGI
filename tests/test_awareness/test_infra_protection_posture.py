@@ -55,6 +55,7 @@ def _profile(
     swap_max: object = "max",
     oomd: object = True,
     oomd_um: object = None,
+    oomd_active: object = True,
     tasksmax_ok: object = True,
     oom_adj_ok: object = True,
     host_swap_kb: object = 8_000_000,
@@ -84,6 +85,7 @@ def _profile(
                     "cgroup_memory_swap_max": swap_max,
                     "oomd_user_slice_kill": oomd,
                     "oomd_user_manager_monitored": oomd_um,
+                    "oomd_active": oomd_active,
                     "pid_ceiling_effective_ok": tasksmax_ok,
                     "oom_score_adj_declared_ok": oom_adj_ok,
                     # meminfo swap is NOT virtualized: 0 here on a HEALTHY
@@ -836,6 +838,7 @@ def test_resilience_facts_are_covered():
         "cgroup_memory_swap_max",
         "oomd_user_slice_kill",
         "oomd_user_manager_monitored",
+        "oomd_active",
         "pid_ceiling_effective_ok",
         "oom_score_adj_declared_ok",
         "swap_total_kb",
@@ -995,6 +998,20 @@ async def test_codebase_opt_out_is_silent(monkeypatch):
 )
 def test_oomd_alarm_fires_only_when_no_monitor_is_in_effect(slice_kill, um, alarm):
     missing = _infra_missing_protections(_profile(oomd=slice_kill, oomd_um=um))
+    assert ("oomd_pressure_kill_off" in missing) is alarm
+
+
+@pytest.mark.parametrize(
+    ("active", "slice_kill", "um", "alarm"),
+    [
+        (False, True, True, True),   # oomd not running: nothing monitors, whatever is configured
+        (False, False, None, True),
+        (None, True, None, False),   # unknown (no systemctl): fall back to the monitor facts
+        (True, True, None, False),
+    ],
+)
+def test_oomd_not_running_is_the_alarm_whatever_is_configured(active, slice_kill, um, alarm):
+    missing = _infra_missing_protections(_profile(oomd=slice_kill, oomd_um=um, oomd_active=active))
     assert ("oomd_pressure_kill_off" in missing) is alarm
 
 

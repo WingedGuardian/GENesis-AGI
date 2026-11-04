@@ -27,15 +27,18 @@ from genesis.infra_profile.types import STATUS_OK
 from tests.test_infra_profile._unix_socket import bind_unix_socket
 
 _REAL_UM_PROBE = _container._oomd_user_manager_monitored
+_REAL_OOMD_ACTIVE = _container._oomd_active
 
 
 @pytest.fixture(autouse=True)
 def _hermetic_um_probe(monkeypatch):
-    """collect_memory's live oomd probe runs real commands; keep the module's
-    tests off the host's oomd and user bus. Probe tests call _REAL_UM_PROBE."""
-    async def _none():
+    """collect_memory's live oomd probes run real commands; keep the module's
+    tests off the host's oomd. Probe tests call _REAL_UM_PROBE and
+    _REAL_OOMD_ACTIVE."""
+    async def _none(*_a, **_k):
         return None
     monkeypatch.setattr(_container, "_oomd_user_manager_monitored", _none)
+    monkeypatch.setattr(_container, "_oomd_active", _none)
 
 
 @pytest.fixture
@@ -1206,97 +1209,105 @@ def test_oomd_lists_only_the_memory_pressure_section():
     assert _container._oomd_lists("", _UM) is False
 
 
-def _fake_um_cmd(cgroup, oomctl_out, oomd_states="active\n\nactive"):
-    async def fake(*argv, timeout=None, strict=False):
-        assert strict, f"every read in this probe is strict: {argv}"
-        if argv[:2] == ("systemctl", "--user"):
-            return cgroup
-        if argv[0] == "systemctl":
-            return oomd_states
-        if argv[0] == "oomctl":
-            return oomctl_out
-        return None
-    return fake
+def _self_cgroup(tmp_path, monkeypatch, line):
+    f = tmp_path / "self-cgroup"
+    f.write_text(line + "\n")
+    monkeypatch.setattr(_container, "_SELF_CGROUP", f)
+    monkeypatch.setattr(_container, "_CGROUP_MOUNT", tmp_path / "no-mount")
 
 
 @pytest.mark.parametrize(
-    ("cgroup", "oomctl_present", "oomctl_out", "expected"),
+    ("line", "expected"),
     [
-        (_UM, True, _OOMCTL_OUT, True),
-        (_UM, True, "Memory Pressure Monitored CGroups:\n\tPath: /user.slice\n", False),
-        (_UM, False, None, None),     # oomctl not installed: cannot be asked
-        (None, True, _OOMCTL_OUT, None),  # no user manager
+        ("0::/user.slice/user-1000.slice/user@1000.service/app.slice/genesis-server.service", _UM),
+        ("0::/user.slice/user-1000.slice/user@1000.service/init.scope", _UM),
+        ("0::/user.slice/user-1000.slice/session-c1.scope", None),
+        ("0::/system.slice/qdrant.service", None),
     ],
 )
-async def test_oomd_user_manager_monitored_tri_state(monkeypatch, cgroup, oomctl_present, oomctl_out, expected):
-    monkeypatch.setattr(_container, "_run_cmd", _fake_um_cmd(cgroup, oomctl_out))
+def test_user_manager_cgroup_is_read_locally(tmp_path, monkeypatch, line, expected):
+    _self_cgroup(tmp_path, monkeypatch, line)
+    assert _container._user_manager_cgroup() == expected
+
+
+def test_user_manager_cgroup_falls_back_to_the_standard_path(tmp_path, monkeypatch):
+    _self_cgroup(tmp_path, monkeypatch, "0::/user.slice/user-1000.slice/session-c1.scope")
+    uid = _container.os.getuid()
+    std = tmp_path / "mount" / f"user.slice/user-{uid}.slice/user@{uid}.service"
+    std.mkdir(parents=True)
+    monkeypatch.setattr(_container, "_CGROUP_MOUNT", tmp_path / "mount")
+    assert _container._user_manager_cgroup() == f"/user.slice/user-{uid}.slice/user@{uid}.service"
+
+
+@pytest.mark.parametrize(("state", "expected"), [
+    ("active", True), ("inactive", False), ("failed", False),
+    ("activating", None), ("deactivating", None), ("reloading", None), (None, None),
+])
+async def test_oomd_active_reads_the_service_state(monkeypatch, tmp_path, state, expected):
+    monkeypatch.setattr(_container, "_SYSTEMD_BOOTED", tmp_path)
+    async def fake(*argv, timeout=None, strict=False):
+        assert strict and argv[-1] == "systemd-oomd.service"
+        return state
+    monkeypatch.setattr(_container, "_run_cmd", fake)
+    assert await _REAL_OOMD_ACTIVE() is expected
+
+
+async def test_oomd_active_is_unknown_without_a_systemd_manager(monkeypatch, tmp_path):
+    """No /run/systemd/system: structural, so never a strict call that would
+    error the memory section on every refresh."""
+    monkeypatch.setattr(_container, "_SYSTEMD_BOOTED", tmp_path / "absent")
+    async def fake(*argv, timeout=None, strict=False):
+        raise AssertionError("systemctl must not be asked without a systemd manager")
+    monkeypatch.setattr(_container, "_run_cmd", fake)
+    assert await _REAL_OOMD_ACTIVE() is None
+
+
+def _um_rig(tmp_path, monkeypatch, oomctl_out=_OOMCTL_OUT, oomctl_present=True):
+    _self_cgroup(tmp_path, monkeypatch, "0::" + _UM + "/app.slice/genesis-server.service")
+    calls = []
+
+    async def fake(*argv, timeout=None, strict=False):
+        calls.append(argv)
+        assert strict, f"every read in this probe is strict: {argv}"
+        assert argv[0] == "oomctl", f"the probe asks oomctl only: {argv}"
+        if isinstance(oomctl_out, Exception):
+            raise oomctl_out
+        return oomctl_out
+    monkeypatch.setattr(_container, "_run_cmd", fake)
     real_which = _container.shutil.which
     monkeypatch.setattr(
         _container.shutil, "which",
         lambda name: ("/usr/bin/oomctl" if oomctl_present else None) if name == "oomctl" else real_which(name),
     )
-    assert await _REAL_UM_PROBE() is expected
+    return calls
 
 
-@pytest.mark.parametrize("states", ["inactive\n\ninactive", "failed\n\ninactive"])
-async def test_stopped_oomd_is_an_answer_not_a_failure(monkeypatch, states):
-    """Both oomd units down: nothing monitors the manager, and oomctl (which
-    would exit nonzero as an answer) is never asked."""
-    fake = _fake_um_cmd(_UM, None, oomd_states=states)
-    async def guarded(*argv, timeout=None, strict=False):
-        assert argv[0] != "oomctl", "oomctl must not run while oomd is down"
-        return await fake(*argv, timeout=timeout, strict=strict)
-    monkeypatch.setattr(_container, "_run_cmd", guarded)
-    monkeypatch.setattr(_container.shutil, "which", lambda name: "/usr/bin/" + name)
-    assert await _REAL_UM_PROBE() is False
+async def test_listed_and_unlisted_are_answers(tmp_path, monkeypatch):
+    _um_rig(tmp_path, monkeypatch)
+    assert await _REAL_UM_PROBE(True) is True
+    _um_rig(tmp_path, monkeypatch, oomctl_out="Memory Pressure Monitored CGroups:\n\tPath: /user.slice\n")
+    assert await _REAL_UM_PROBE(True) is False
 
 
-async def test_socket_only_oomd_failing_oomctl_is_an_answer(monkeypatch):
-    """Service disabled, socket active: oomctl failing means nothing monitors."""
-    async def fake(*argv, timeout=None, strict=False):
-        assert strict
-        if argv[:2] == ("systemctl", "--user"):
-            return _UM
-        if argv[0] == "systemctl":
-            return "inactive\n\nactive"
-        raise ProbeFailed("oomctl exited 1")
-    monkeypatch.setattr(_container, "_run_cmd", fake)
-    monkeypatch.setattr(_container.shutil, "which", lambda name: "/usr/bin/" + name)
-    assert await _REAL_UM_PROBE() is False
+@pytest.mark.parametrize("active", [False, None])
+async def test_oomd_not_running_is_not_asked(tmp_path, monkeypatch, active):
+    """oomd down is its own fact; asking oomctl would only socket-activate it."""
+    calls = _um_rig(tmp_path, monkeypatch)
+    assert await _REAL_UM_PROBE(active) is None
+    assert calls == []
 
 
-async def test_socket_only_oomd_is_still_asked(monkeypatch):
-    """A socket-activated oomd (service inactive, socket active) answers oomctl."""
-    monkeypatch.setattr(_container, "_run_cmd", _fake_um_cmd(_UM, _OOMCTL_OUT, "inactive\n\nactive"))
-    monkeypatch.setattr(_container.shutil, "which", lambda name: "/usr/bin/" + name)
-    assert await _REAL_UM_PROBE() is True
+async def test_no_oomctl_or_no_user_manager_cannot_be_asked(tmp_path, monkeypatch):
+    _um_rig(tmp_path, monkeypatch, oomctl_present=False)
+    assert await _REAL_UM_PROBE(True) is None
+    _um_rig(tmp_path, monkeypatch)
+    _self_cgroup(tmp_path, monkeypatch, "0::/system.slice/x.service")
+    assert await _REAL_UM_PROBE(True) is None
 
 
-@pytest.mark.parametrize(("present", "raises"), [(True, True), (False, False)])
-async def test_user_bus_failure_raises_only_while_a_manager_exists(monkeypatch, present, raises):
-    async def fake(*argv, timeout=None, strict=False):
-        assert strict
-        raise ProbeFailed("bus hiccup")
-    monkeypatch.setattr(_container, "_run_cmd", fake)
-    monkeypatch.setattr(_container, "user_manager_present", lambda: present)
-    if raises:
-        with pytest.raises(ProbeFailed):
-            await _REAL_UM_PROBE()
-    else:
-        assert await _REAL_UM_PROBE() is None
-
-
-async def test_failed_oomctl_raises_so_the_prior_facts_are_kept(monkeypatch):
-    """A failing oomctl must not be recorded as "not monitored": facts are
+async def test_any_oomctl_failure_raises_so_the_prior_facts_are_kept(tmp_path, monkeypatch):
+    """An uncertain oomctl result is never recorded as an answer: facts are
     hashed, and a hiccup would cost two drift observations and a false alarm."""
-    async def fake(*argv, timeout=None, strict=False):
-        if argv[:2] == ("systemctl", "--user"):
-            return _UM
-        if argv[0] == "systemctl":
-            return "active\n\nactive"
-        assert strict, "oomctl must be called strict"
-        raise ProbeFailed("oomctl exited 1")
-    monkeypatch.setattr(_container, "_run_cmd", fake)
-    monkeypatch.setattr(_container.shutil, "which", lambda name: "/usr/bin/" + name)
+    _um_rig(tmp_path, monkeypatch, oomctl_out=ProbeFailed("oomctl exited 1"))
     with pytest.raises(ProbeFailed):
-        await _REAL_UM_PROBE()
+        await _REAL_UM_PROBE(True)

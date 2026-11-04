@@ -582,16 +582,19 @@ _INFRA_POSTURE_DETAIL = {
         "guardian health on the host, or re-run scripts/host-setup.sh"
     ),
     "oomd_pressure_kill_off": (
-        "systemd-oomd monitors neither the user manager nor user.slice — nothing "
-        "gracefully kills the memory hog before a hard OOM wedge. Re-run "
+        "no systemd-oomd pressure-kill monitor is confirmed in force: either "
+        "systemd-oomd is not running, or the user.slice backstop is not "
+        "configured and the user-manager monitor is not confirmed live. Nothing "
+        "may gracefully kill a memory hog before a hard OOM wedge. Re-run "
         "scripts/bootstrap.sh as the Genesis user (lib/memory_resilience.sh "
         "installs systemd-oomd, lays the user-manager and user.slice drop-ins, "
         "and says which monitor it could not verify)"
     ),
     "oomd_user_manager_unmonitored": (
-        "systemd-oomd does not monitor the user manager, so a memory-pressure "
-        "kill is chosen under the root-owned user.slice backstop, where "
-        "genesis-server's kill-me-last preference is ignored. Re-run "
+        "systemd-oomd is running but does not list the user manager, so no "
+        "monitor honours genesis-server's kill-me-last preference: a "
+        "memory-pressure kill can come only from the root-owned user.slice "
+        "backstop, where configured, which ignores it. Re-run "
         "scripts/bootstrap.sh as the Genesis user: lib/memory_resilience.sh "
         "lays the user-manager root-slice drop-in (it survives `systemctl --user "
         "daemon-reload`, systemd issue #43174) and names the check that failed"
@@ -829,13 +832,16 @@ def _infra_missing_protections(profile: dict) -> list[str]:
         missing.append("container_swap_disabled")
     # Gated on a readable cgroup swap knob (a cgroup-v2 proxy): on v1 the
     # pressure-kill policy cannot work, so False there is not actionable.
-    # Either monitor is protection: the user manager (live, the operative one)
-    # or user.slice (the backstop, configured). Neither is the alarm; an
-    # unknown user-manager state with user.slice off is treated as neither.
-    if (
-        swap_max is not None
-        and memory.get("oomd_user_slice_kill") is False
-        and memory.get("oomd_user_manager_monitored") is not True
+    # oomd not running is the alarm whatever is configured. Otherwise either
+    # monitor is protection: the user manager (live, the operative one) or
+    # user.slice (the backstop, configured). Neither is the alarm; an unknown
+    # user-manager state with user.slice off is treated as neither.
+    if swap_max is not None and (
+        memory.get("oomd_active") is False
+        or (
+            memory.get("oomd_user_slice_kill") is False
+            and memory.get("oomd_user_manager_monitored") is not True
+        )
     ):
         missing.append("oomd_pressure_kill_off")
     # The user-manager monitor explicitly not live: protection degrades to the

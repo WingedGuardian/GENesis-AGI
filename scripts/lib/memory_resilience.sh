@@ -191,23 +191,25 @@ _memres_user_monitor_apply() {
         echo "  Skipped the user-manager monitor: $_MEMRES_UM_NOTE."
         return 0
     fi
-    local root_result changed=0 reload_rc=0 r cg mode i
+    local root_result init_result dbus_result changed=0 reload_rc=0 cg mode limit pref i r
     _memres_user_put "$MEMRES_USER_UNIT_DIR/-.slice.d/genesis-oomd.conf" "$_MEMRES_UM_ROOT_CONF"
     root_result="$_MEMRES_USER_RESULT"
-    case "$root_result" in written|migrated) changed=1 ;; esac
-    for r in "init.scope.d/genesis-oomd.conf|$_MEMRES_UM_INIT_CONF" "dbus.service.d/genesis-oomd.conf|$_MEMRES_UM_DBUS_CONF"; do
-        _memres_user_put "$MEMRES_USER_UNIT_DIR/${r%%|*}" "${r#*|}"
-        case "$_MEMRES_USER_RESULT" in written|migrated) changed=1 ;; esac
-    done
+    _memres_user_put "$MEMRES_USER_UNIT_DIR/init.scope.d/genesis-oomd.conf" "$_MEMRES_UM_INIT_CONF"
+    init_result="$_MEMRES_USER_RESULT"
+    _memres_user_put "$MEMRES_USER_UNIT_DIR/dbus.service.d/genesis-oomd.conf" "$_MEMRES_UM_DBUS_CONF"
+    dbus_result="$_MEMRES_USER_RESULT"
+    case "$root_result $init_result $dbus_result" in *written*|*migrated*) changed=1 ;; esac
     if [ "$changed" = 1 ]; then
         systemctl --user daemon-reload >/dev/null 2>&1 || reload_rc=$?
     fi
-    case "$root_result" in
-        written|migrated|unchanged) ;;
-        *) _MEMRES_UM_NOTE="its root-slice drop-in was $root_result"
-           echo "  User-manager monitor not verified: $_MEMRES_UM_NOTE."
-           return 0 ;;
-    esac
+    for r in "root-slice:$root_result" "init.scope:$init_result" "dbus.service:$dbus_result"; do
+        case "${r#*:}" in
+            written|migrated|unchanged) ;;
+            *) _MEMRES_UM_NOTE="its ${r%%:*} drop-in was ${r#*:}"
+               echo "  User-manager monitor not verified: $_MEMRES_UM_NOTE."
+               return 0 ;;
+        esac
+    done
     if [ "$reload_rc" != 0 ]; then
         _MEMRES_UM_NOTE="systemctl --user daemon-reload failed (exit $reload_rc)"
         echo "  User-manager monitor not verified: $_MEMRES_UM_NOTE."
@@ -226,6 +228,24 @@ _memres_user_monitor_apply() {
         echo "  User-manager monitor not verified: $_MEMRES_UM_NOTE."
         return 0
     fi
+    # The limit as the manager holds it: a fraction of 2^32 (60% is 2576980377,
+    # MEASURED systemd 255). Anything else, including a build that prints a
+    # percentage, reads as not verified: an honest miss, never a false live.
+    limit="$(systemctl --user show -p ManagedOOMMemoryPressureLimit --value -- -.slice 2>/dev/null)" || limit=""
+    case "$limit" in
+        2576980377) ;;
+        *) _MEMRES_UM_NOTE="the user manager reports limit '${limit:-nothing}' for its root slice, not 60%"
+           echo "  User-manager monitor not verified: $_MEMRES_UM_NOTE."
+           return 0 ;;
+    esac
+    for r in "init.scope:omit" "dbus.service:avoid"; do
+        pref="$(systemctl --user show -p ManagedOOMPreference --value -- "${r%%:*}" 2>/dev/null)" || pref=""
+        if [ "$pref" != "${r#*:}" ]; then
+            _MEMRES_UM_NOTE="the user manager reports '${pref:-nothing}' for ${r%%:*}, not ${r#*:}"
+            echo "  User-manager monitor not verified: $_MEMRES_UM_NOTE."
+            return 0
+        fi
+    done
     # The report reaches oomd asynchronously after the reload: poll, then
     # confirm on a second read so a report about to be erased is not trusted.
     for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -282,12 +302,27 @@ _memres_swap_check() {
 }
 
 # _memres_policy_summary — one line naming the monitors this run left in force.
+# Both halves come from reads made now: the user half from
+# _memres_user_monitor_apply, the backstop from PID 1's own view of
+# user.slice (80% is 3435973836 as a fraction of 2^32, MEASURED systemd 255),
+# so a reload that failed on an earlier run is not reported as in force.
 _memres_policy_summary() {
+    local um bs backstop
     if [ "$_MEMRES_UM_OK" = 1 ]; then
-        echo "user manager kill @60% PSI, verified live; user.slice backstop kill @80% PSI"
+        um="user manager kill @60% PSI, init.scope omit, dbus avoid, verified live"
     else
-        echo "user manager NOT verified (${_MEMRES_UM_NOTE:-see above}); user.slice backstop kill @80% PSI"
+        um="user manager NOT verified (${_MEMRES_UM_NOTE:-see above})"
     fi
+    bs="$(systemctl show -p ManagedOOMMemoryPressure -p ManagedOOMMemoryPressureLimit --value user.slice 2>/dev/null | paste -sd' ')" || bs=""
+    case "$bs" in
+        "kill 3435973836") backstop="user.slice backstop kill @80% PSI" ;;
+        *) backstop="user.slice backstop NOT confirmed (systemd reports '${bs:-nothing}')" ;;
+    esac
+    if ! systemctl is-active --quiet systemd-oomd 2>/dev/null; then
+        backstop="systemd-oomd is not running, so no monitor is in force"
+        um=""
+    fi
+    echo "${um:+$um; }$backstop"
 }
 
 # memory_resilience_apply — the entrypoint. Always returns 0.
