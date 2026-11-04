@@ -386,6 +386,17 @@ async def run_extraction_cycle(
                     session_id, chunk_start, chunk_end, exc_info=True,
                 )
 
+            # #2426: the reference above holds a credential's value out of every
+            # index; scrub it from the extractions too, before anything below
+            # logs, stores, dedups, links or embeds their text.
+            from genesis.memory.reference_extraction import (
+                scrub_credential_extraction,
+            )
+
+            for extraction in result.extractions:
+                if scrub_credential_extraction(extraction):
+                    summary["credentials_scrubbed"] = summary.get("credentials_scrubbed", 0) + 1
+
             # Stream 2: procedure candidate flagging (C2b — flag-only). The SLM
             # flags procedure_candidate extractions; we classify them and
             # ACCUMULATE them as a session-level signal. No Judge call and no

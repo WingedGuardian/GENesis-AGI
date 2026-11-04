@@ -655,8 +655,48 @@ async def extract_references_from_chunk(
     return count
 
 
+def scrub_credential_extraction(extraction: Extraction) -> bool:
+    """Redact a credential's value from the extraction itself, in place.
+
+    The extraction job stores each extraction as an episodic memory, logs it,
+    dedups and links it, and embeds it in the connection pass, AFTER it may have
+    been promoted to a reference. The reference holds the value out (#2426);
+    without this the same text would put it straight back into memory_fts, the
+    vector store, entity mentions and the journal. The classifier runs ungated
+    here (``user_text=None``), so text that names a credential is scrubbed even
+    when auto-capture declined to store it: redacting more is the safe side.
+    Returns True when anything was redacted.
+    """
+    from genesis.memory.reference_ops import scrub, secret_fragments
+
+    try:
+        ref = classify_as_reference(extraction)
+    except Exception:
+        logger.warning("credential scrub: classification failed", exc_info=True)
+        return False
+    if ref is None or ref["kind"] != "credentials":
+        return False
+    fragments = secret_fragments(ref["value"])
+    if not fragments:
+        return False
+
+    def _clean(value: object) -> object:
+        return scrub(value, fragments) if isinstance(value, str) else value
+
+    extraction.content = scrub(extraction.content, fragments)
+    extraction.entities = [_clean(e) for e in extraction.entities]
+    extraction.relationships = [
+        {k: _clean(v) for k, v in rel.items()} if isinstance(rel, dict) else rel
+        for rel in extraction.relationships
+    ]
+    for name in ("event_subject", "event_object", "scenario"):
+        setattr(extraction, name, _clean(getattr(extraction, name)))
+    return True
+
+
 __all__ = [
     "classify_as_reference",
     "ingest_reference_from_extraction",
     "extract_references_from_chunk",
+    "scrub_credential_extraction",
 ]

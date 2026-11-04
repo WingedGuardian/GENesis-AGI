@@ -73,6 +73,20 @@ async def ingest_knowledge_unit(
     ``tags_json`` overrides the default tags array. Pass a pre-built JSON
     string when the caller needs reference-specific tag layout.
     """
+    # A credential's value is held out of every indexed store (#2426) HERE, at the
+    # chokepoint every writer passes through (the reference_store and
+    # knowledge_ingest MCP tools, the extraction job, migrate_reference_data):
+    # from this line on, `content` and `tags_json` carry a placeholder and
+    # redactions, and the value travels only to knowledge_crud.upsert, which
+    # writes it to reference_secrets in the unit's own transaction. Refuses
+    # (ValueError) a credential whose value cannot be located, before anything
+    # is written.
+    from genesis.memory import reference_ops
+
+    secret_value: str | None = None
+    if reference_ops.holds_secret(project, domain):
+        content, secret_value, tags_json = reference_ops.split_secret(content, tags_json)
+
     resolved_concept = concept if concept is not None else content[:200]
 
     # Injection-pattern scan (detect-and-log, fail-open). This is the second
@@ -135,32 +149,6 @@ async def ingest_knowledge_unit(
         origin_class=resolved_origin,
     )
 
-    # If we replaced an existing entry whose Qdrant point ID differs from
-    # the new one, the old point is now orphaned — delete it so Qdrant
-    # stays in sync with the knowledge_units row of record. store.delete()
-    # handles metadata, FTS5, Qdrant, links, and pending_embeddings cascade.
-    if old_qdrant_id and old_qdrant_id != qdrant_memory_id:
-        try:
-            res = await store.delete(old_qdrant_id)
-            if res.get("deferred"):
-                # Vector store unavailable → store.delete() touched nothing, so
-                # the replaced memory is still fully alive (point + metadata +
-                # FTS) alongside its successor — and unlike a ghost, no cleanup
-                # can classify it as an offender (it has a metadata row). No
-                # sweep retries this delete either, so log LOUDLY: this is the
-                # knowledge-unit stale-pair case for a cross-store reconcile.
-                logger.error(
-                    "Stale-point cleanup deferred for %s while upserting "
-                    "knowledge unit %s: vector store unavailable — the replaced "
-                    "memory remains recallable alongside its successor until "
-                    "reconciled", old_qdrant_id, unit_id,
-                )
-        except Exception:
-            logger.error(
-                "Failed to clean up stale Qdrant point %s while upserting "
-                "knowledge unit %s", old_qdrant_id, unit_id, exc_info=True,
-            )
-
     embedding_model = getattr(store._embeddings, "model_name", "qwen3-embedding:0.6b-fp16")
     resolved_tags = tags_json or json.dumps([domain, project, authority])
     actual_id, inserted = await knowledge_crud.upsert(
@@ -186,7 +174,37 @@ async def ingest_knowledge_unit(
         purpose=json.dumps(purpose) if purpose else None,
         ingestion_source=ingestion_source,
         origin_class=resolved_origin,
+        secret_value=secret_value,
     )
+
+    # AFTER the upsert, so a failed upsert (a refused credential write, a
+    # missing reference_secrets table) never leaves the row pointing at a
+    # point already deleted: the old point stays until its replacement row commits.
+    # If we replaced an existing entry whose Qdrant point ID differs from
+    # the new one, the old point is now orphaned — delete it so Qdrant
+    # stays in sync with the knowledge_units row of record. store.delete()
+    # handles metadata, FTS5, Qdrant, links, and pending_embeddings cascade.
+    if old_qdrant_id and old_qdrant_id != qdrant_memory_id:
+        try:
+            res = await store.delete(old_qdrant_id)
+            if res.get("deferred"):
+                # Vector store unavailable → store.delete() touched nothing, so
+                # the replaced memory is still fully alive (point + metadata +
+                # FTS) alongside its successor — and unlike a ghost, no cleanup
+                # can classify it as an offender (it has a metadata row). No
+                # sweep retries this delete either, so log LOUDLY: this is the
+                # knowledge-unit stale-pair case for a cross-store reconcile.
+                logger.error(
+                    "Stale-point cleanup deferred for %s while upserting "
+                    "knowledge unit %s: vector store unavailable — the replaced "
+                    "memory remains recallable alongside its successor until "
+                    "reconciled", old_qdrant_id, unit_id,
+                )
+        except Exception:
+            logger.error(
+                "Failed to clean up stale Qdrant point %s while upserting "
+                "knowledge unit %s", old_qdrant_id, unit_id, exc_info=True,
+            )
 
     logger.info(
         "Knowledge unit %s (project=%s, domain=%s)",

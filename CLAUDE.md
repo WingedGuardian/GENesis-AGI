@@ -439,8 +439,9 @@ recall taxonomy, health debugging escalation).
 ## Reference Capture
 
 Credentials, URLs, IPs, and identifiers shared in conversation are
-auto-stored via `reference_store`. Retrieve with `reference_lookup` or
-`knowledge_recall(domain='reference.*')`. Human view: the dashboard
+auto-stored via `reference_store`. Retrieve with `reference_lookup`: a
+credential's value is held out of every search index, so `knowledge_recall`
+and memory recall show only a placeholder for it. Human view: the dashboard
 **References** tab (browse/search/reveal/delete, live against the store).
 
 **Real-time capture is your responsibility.** When you create an account,

@@ -10,6 +10,31 @@ import aiosqlite
 
 from genesis.db.crud._fts import fetch_fts
 
+# #2426: a credential reference's value is held out of knowledge_units.body
+# (memory/reference_ops.split_secret, run by ingest_knowledge_unit). These are
+# the shared contract; reference_ops imports them from here so the db layer
+# never imports memory/.
+CREDENTIAL_DOMAIN = "reference.credentials"
+SECRET_PLACEHOLDER = "[held in the reference secret store; read it with reference_lookup]"  # noqa: S105 - a marker, not a secret
+
+
+def refuse_inline_secret(project_type: str, domain: str, body: str) -> None:
+    """Fail closed on a credential reference whose body still carries its value.
+
+    Every writer of knowledge_units passes here (insert and upsert), so a path
+    that bypasses ingest_knowledge_unit (the orchestrator, an upload, a script)
+    cannot put a credential value into the indexed body.
+    """
+    if (
+        project_type == "reference"
+        and (domain or "").strip().lower() == CREDENTIAL_DOMAIN
+        and f"\n\nValue: {SECRET_PLACEHOLDER}" not in (body or "")
+    ):
+        raise ValueError(
+            "refusing a credential reference whose body carries its value: write "
+            "it through ingest_knowledge_unit, which holds the value out (#2426)"
+        )
+
 
 def _prepare_fts5(query: str) -> str | None:
     """Prepare a query string for FTS5 MATCH.
@@ -54,6 +79,7 @@ async def insert(
 
     Pass _commit=False for batch operations where the caller manages the transaction.
     """
+    refuse_inline_secret(project_type, domain, body)
     unit_id = id or str(uuid.uuid4())
     now_iso = ingested_at or datetime.now(UTC).isoformat()
 
@@ -178,9 +204,16 @@ async def upsert(
     purpose: str | None = None,
     ingestion_source: str | None = None,
     origin_class: str | None = None,
+    secret_value: str | None = None,
     _commit: bool = True,
 ) -> tuple[str, bool]:
     """Insert or update a knowledge unit keyed on (project_type, domain, concept).
+
+    ``secret_value`` is a credential reference's value, held out of ``body``
+    (#2426, ``reference_ops.split_secret``). It is written to
+    ``reference_secrets`` under the row's actual id in this same transaction, so
+    a unit whose body carries the placeholder never commits without its secret.
+    None leaves any stored secret as it is.
 
     Returns (unit_id, inserted) where ``inserted=True`` means a new row was
     created and ``inserted=False`` means an existing row was updated.
@@ -206,8 +239,27 @@ async def upsert(
     (from the pre-existing row) won't match the caller-supplied id.
     ``ingest_knowledge_unit`` enforces this correctly.
     """
+    refuse_inline_secret(project_type, domain, body)
     unit_id = id or str(uuid.uuid4())
     now_iso = ingested_at or datetime.now(UTC).isoformat()
+
+    if secret_value is not None:
+        # FIRST, under the id the row will end up with: if this write fails (a
+        # process on new code against a database whose schema init has not run
+        # yet has no reference_secrets table), nothing of this call is pending
+        # on the shared connection for another writer's commit to carry, so a
+        # placeholder body can never commit without its secret.
+        existing = await db.execute_fetchall(
+            "SELECT id FROM knowledge_units WHERE project_type = ? "
+            "AND domain = ? AND concept = ?",
+            (project_type, domain, concept),
+        )
+        await db.execute(
+            "INSERT INTO reference_secrets (unit_id, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(unit_id) DO UPDATE SET value = excluded.value, "
+            "updated_at = excluded.updated_at",
+            (existing[0][0] if existing else unit_id, secret_value, now_iso),
+        )
 
     await db.execute(
         """INSERT INTO knowledge_units
@@ -476,12 +528,16 @@ async def increment_retrieved_batch(
 
 
 async def delete(db: aiosqlite.Connection, unit_id: str) -> bool:
-    """Delete a knowledge unit from both knowledge_units and knowledge_fts."""
+    """Delete a knowledge unit from knowledge_units and knowledge_fts, and its
+    held-out credential value (``reference_secrets``), in one transaction."""
     cursor = await db.execute(
         "DELETE FROM knowledge_units WHERE id = ?", (unit_id,)
     )
     await db.execute(
         "DELETE FROM knowledge_fts WHERE unit_id = ?", (unit_id,)
+    )
+    await db.execute(
+        "DELETE FROM reference_secrets WHERE unit_id = ?", (unit_id,)
     )
     await db.commit()
     return cursor.rowcount > 0
