@@ -126,6 +126,56 @@ async def test_unresolvable_commit_is_not_absence(repo, monkeypatch, result):
         await mgr.branch_tip("task/unreadable", repo)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", ["not a sha\n", ""], ids=["garbage", "empty"])
+@pytest.mark.parametrize(
+    ("helper", "folder"), [("branch_tip", "heads"), ("_tag_conflict", "tags")],
+)
+async def test_a_corrupt_ref_is_not_absence_on_real_git(repo, helper, folder, content):
+    """git's own exit codes: a mock of them proved nothing about these states."""
+    (repo / ".git" / "refs" / folder / "corrupt").write_text(content)
+    with pytest.raises(mgr.StaleWorktreeError, match="could not be read"):
+        await getattr(mgr, helper)("corrupt", repo)
+
+
+@pytest.mark.asyncio
+async def test_a_dangling_branch_ref_is_not_absence_on_real_git(repo):
+    (repo / ".git" / "refs" / "heads" / "dangling").write_text("ref: refs/heads/nowhere\n")
+    with pytest.raises(mgr.StaleWorktreeError):
+        await mgr.branch_tip("dangling", repo)
+
+
+@pytest.mark.asyncio
+async def test_a_truly_missing_ref_is_absence_on_real_git(repo):
+    assert await mgr.branch_tip("nothing-here", repo) is None
+    assert await mgr._tag_conflict("nothing-here", repo) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["clone", "symlink", "copied_git"])
+async def test_a_stand_in_on_the_same_branch_and_tip_is_refused(repo, state):
+    """Only the reciprocal registration check can catch these: the branch and the
+    tip both match, so the HEAD comparison passes."""
+    branch, wt = mgr.task_locator("validation-task", repo / "worktrees")
+    _git(repo, "worktree", "add", "-b", branch, str(wt))
+    tip = _git(wt, "rev-parse", "HEAD")
+    sibling = wt.parent / "sibling"
+    if state == "clone":
+        shutil.rmtree(wt)
+        _git(repo, "clone", "-q", "-b", branch, str(repo), str(wt))
+    else:
+        _git(repo, "worktree", "add", "--force", str(sibling), branch)
+        if state == "symlink":
+            shutil.rmtree(wt)
+            wt.symlink_to(sibling)
+        else:
+            (wt / ".git").write_bytes((sibling / ".git").read_bytes())
+    records = await mgr._worktree_records(repo)
+    assert records is not None
+    with pytest.raises(mgr.StaleWorktreeError, match="not safely registered"):
+        await mgr._validate_live_worktree(wt, repo, branch, tip, records)
+
+
 def test_stale_message_identifies_state_for_manual_inspection(tmp_path):
     branch, wt = mgr.task_locator("validation-task", tmp_path)
     error = mgr._task_stale("validation-task", branch, wt, "ref changed")

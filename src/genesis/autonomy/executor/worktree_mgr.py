@@ -250,8 +250,11 @@ def task_locator(task_id: str, worktree_base: Path) -> tuple[str, Path]:
 async def branch_tip(branch: str, repo_root: Path) -> str | None:
     """Return a local task branch tip, or None when it is absent."""
     ref = f"refs/heads/{branch}"
-    rc, _ = await _git_read(repo_root, "show-ref", "--verify", "--quiet", ref)
-    if rc == 1:
+    # --exists, not --verify --quiet: that exits 1 for a corrupt ref as well as a
+    # missing one. Here 2 alone means missing (git 2.43; older git rejects the
+    # flag, which reads as unreadable).
+    rc, _ = await _git_read(repo_root, "show-ref", "--exists", ref)
+    if rc == 2:
         return None
     if rc != 0:
         raise StaleWorktreeError(f"local branch {branch} could not be read")
@@ -264,12 +267,10 @@ async def branch_tip(branch: str, repo_root: Path) -> str | None:
 
 
 async def _tag_conflict(branch: str, repo_root: Path) -> bool:
-    rc, _ = await _git_read(
-        repo_root, "show-ref", "--verify", "--quiet", f"refs/tags/{branch}",
-    )
+    rc, _ = await _git_read(repo_root, "show-ref", "--exists", f"refs/tags/{branch}")
     if rc == 0:
         return True
-    if rc == 1:
+    if rc == 2:
         return False
     raise StaleWorktreeError(f"tag {branch} could not be read")
 
