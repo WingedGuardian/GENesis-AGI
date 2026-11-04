@@ -263,6 +263,32 @@ async def test_drain_reconstructs_request_with_thread_and_recipient(config, db):
     assert req.verbatim is True
 
 
+@pytest.mark.parametrize("subject", ["Try Genesis", None])
+@pytest.mark.asyncio
+async def test_drain_carries_a_queued_emails_own_subject(config, db, subject):
+    """A queued email's subject rides the queue into the rebuilt request. With
+    none, the request has none, and the pipeline writes one; the subject is
+    never rebuilt from the message text."""
+    from genesis.db.crud import pending_outreach
+
+    await pending_outreach.enqueue(
+        db,
+        message="Try Genesis\n\nIt remembers everything.",
+        category="notification",
+        channel="email",
+        validated_recipient="real@prospect.com",
+        email_subject=subject,
+    )
+    pipeline = _drain_pipeline(OutreachStatus.DELIVERED)
+    scheduler = OutreachScheduler(pipeline, AsyncMock(), AsyncMock(), config, db)
+
+    await scheduler._drain_pending_job()
+
+    req = pipeline.submit.call_args[0][0]
+    assert req.email_subject == subject
+    assert req.context == "Try Genesis\n\nIt remembers everything."
+
+
 @pytest.mark.asyncio
 async def test_drain_carries_the_discord_subchannel_as_recipient(config, db):
     """A queued Discord SUB-CHANNEL row must reach the pipeline as the discord

@@ -60,7 +60,6 @@ gate-surface:
           - 'scripts/surface_pr_updates.py'
           - 'config/external_review.yaml'
           - 'scripts/external_review.py'
-          - 'scripts/lib/gate_menu.py'
           - 'scripts/review_budget.py'
           - 'scripts/review_findings.py'
           - 'scripts/review_reflection.py'

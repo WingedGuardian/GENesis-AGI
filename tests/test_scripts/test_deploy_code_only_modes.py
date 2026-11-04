@@ -101,6 +101,8 @@ _SCRIPT_FILES = (
     "lib/deploy_status.sh",
     "lib/deploy_checkout.sh",
     "lib/server_session_refusal.sh",
+    "lib/shared_mcp_units.sh",
+    "lib/mcp_rollout.py",
     "lib/checkout_lock.sh",
     "lib/deploy_recovery.sh",
     "lib/port_owned_by.py",

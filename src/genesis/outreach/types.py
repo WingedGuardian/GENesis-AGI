@@ -157,6 +157,11 @@ class OutreachRequest:
     # _deliver so the WS-8 autonomy gate can classify reply-vs-cold for the
     # capability matrix. None for non-thread / cold sends.
     thread_id: str | None = None
+    # An email's subject line: a short title, never derived from the body.
+    # Set by the caller when it has one; otherwise the pipeline writes one
+    # from the email before the autonomy gate, so the owner approves the
+    # subject that is sent. Ignored on every other channel.
+    email_subject: str | None = None
     # When True, `submit()` skips the LLM ContentDrafter and delivers
     # `context` verbatim (still governed, deduped, formatted). Use for
     # machine-generated FACTUAL notifications (task status, health) that must

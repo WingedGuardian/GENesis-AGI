@@ -75,6 +75,7 @@ import aiosqlite
 from genesis.db.crud import observations
 from genesis.db.crud import outreach as outreach_history
 from genesis.recon import career_outreach_config as cfg
+from genesis.recon.career_outreach_diagnostics import dispatch_failure_detail, remote_text
 from genesis.security.sanitizer import strip_control_chars
 
 logger = logging.getLogger(__name__)
@@ -397,7 +398,9 @@ def classify_autorun_reply(reply_text: str) -> AutorunOutcome:
         detail = detail.strip() if isinstance(detail, str) else ""
         if not detail:
             return ProtocolError("'error' outcome with empty/non-string detail")
-        return ModuleError(detail[:200])
+        # Kept whole: it is remote text, scrubbed and bounded where it is rendered
+        # (a cut here could split a credential before the scrubber sees it).
+        return ModuleError(detail)
 
     if present == ["verify_failed"]:
         if not company:
@@ -405,7 +408,8 @@ def classify_autorun_reply(reply_text: str) -> AutorunOutcome:
         raw = payload.get("verify_failed")
         # None/blank/whitespace → "unspecified"; any other value renders as-is.
         reason = ("" if raw is None else str(raw).strip()) or "unspecified"
-        return VerifyFailed(company, reason[:100])
+        # Kept whole: remote text, scrubbed and bounded where it is rendered.
+        return VerifyFailed(company, reason)
 
     # No outcome signal key → the reply must be a Staged shape (company required).
     if not company:
@@ -551,7 +555,7 @@ class CareerOutreachMonitor:
                 **result_kwargs,
                 errors=1,
                 raised=exc,
-                details=[f"{label} raised: {str(exc)[:120]}"],
+                details=[f"{label} raised: {remote_text(exc)}"],
             )
 
     @staticmethod
@@ -710,14 +714,14 @@ class CareerOutreachMonitor:
             return CareerOutreachResult(
                 bite_mode=bite_mode,
                 errors=1,
-                details=[f"bite-relay: pipeline read raised: {str(exc)[:120]}"],
+                details=[f"bite-relay: pipeline read raised: {remote_text(exc)}"],
             )
         if not isinstance(result, dict) or result.get("error"):
             detail = result.get("error") if isinstance(result, dict) else "non-dict reply"
             return CareerOutreachResult(
                 bite_mode=bite_mode,
                 errors=1,
-                details=[f"bite-relay: pipeline read failed: {str(detail)[:120]}"],
+                details=[f"bite-relay: pipeline read failed: {remote_text(detail)}"],
             )
         pipeline_by_stage = result.get("pipeline")
         if not isinstance(pipeline_by_stage, dict):
@@ -970,11 +974,13 @@ class CareerOutreachMonitor:
         # that dead bridge as reachable, the exact silent failure this probe exists to
         # catch. (A `parse_fallback` reply is still reachable — the hop answered.)
         if isinstance(result, dict) and (result.get("error") or result.get("is_error")):
-            detail = result.get("error") or "claude -p reported is_error"
+            # Keep the remote's own diagnosis (exit code + scrubbed stderr), so the next
+            # failure names its cause instead of only "Remote claude exited 1".
+            detail = dispatch_failure_detail(result, "claude -p reported is_error")
             return CareerOutreachResult(
                 mode="observe",
                 errors=1,
-                details=[f"observe: bridge probe failed: {str(detail)[:120]}"],
+                details=[f"observe: bridge probe failed: {detail}"],
             )
         if not _reply_text(result).strip():
             return CareerOutreachResult(
@@ -1012,9 +1018,13 @@ class CareerOutreachMonitor:
             # Adapter-level failure (disabled / unhealthy / IPC error / timeout)
             # comes back as an error DICT — it does NOT raise. Surface it so the
             # runner records a job-health FAILURE, and stop the loop.
-            if isinstance(result, dict) and result.get("error"):
+            # An exit-0 run that reports `is_error` (dead model auth) is the same failure
+            # as a top-level `error`; classifying its reply text would mislabel it a
+            # protocol failure and drop its cause. Either way it is one error and a stop.
+            if isinstance(result, dict) and (result.get("error") or result.get("is_error")):
                 errors += 1
-                details.append(f"auto-run dispatch error: {str(result.get('error'))[:120]}")
+                detail = dispatch_failure_detail(result, "claude -p reported is_error")
+                details.append(f"auto-run dispatch error: {detail}")
                 break
             # Classify the reply ONCE into a closed outcome; match on TYPE. Every
             # malformed shape is a ProtocolError decided inside classify_autorun_reply,
@@ -1030,7 +1040,7 @@ class CareerOutreachMonitor:
             if isinstance(outcome, ModuleError):
                 # Engine-reported hard failure (auth/drafting) — a job-health failure.
                 errors += 1
-                details.append(f"auto-run: module error: {outcome.detail}")
+                details.append(f"auto-run: module error: {remote_text(outcome.detail)}")
                 break
             if isinstance(outcome, (Staged, VerifyFailed)):
                 # Both name a (classifier-validated non-empty) company and share the
@@ -1045,7 +1055,9 @@ class CareerOutreachMonitor:
                     # Engine drafted but its OWN accuracy gate refused this target — the
                     # gate WORKING, NOT a job-health failure. Note it, try the next target.
                     verify_failed_n += 1
-                    details.append(f"verify_failed: {outcome.company}: {outcome.reason}")
+                    details.append(
+                        f"verify_failed: {outcome.company}: {remote_text(outcome.reason)}"
+                    )
                     continue
                 # Staged: a verified draft was staged for this target. Record it as the
                 # deterministic nudge source (the engine's own reply is ground truth for

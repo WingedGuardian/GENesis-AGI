@@ -28,8 +28,16 @@ Queue closure/refusal is reported instead of successful delivery. The adapter
 rechecks retained queue payload and closure before insertion, so canceled or
 dequeued unsent rows cannot be resurrected by a stale delivery or retry.
 
-Existing outbound quiet-hours, salience and spend policy still apply. This is
-not a new incoming task quota. Identity-keyed peer_message dedup distinguishes
+Governance for a peer message is its own: quiet hours, salience and the owner's
+daily outreach budgets ration the owner's attention, which a machine-to-machine
+message does not spend, so none of them apply, and peer deliveries do not count
+toward those budgets. Duplicate suppression applies, and a per-peer daily cap
+(`rate_limits.agent_daily_per_peer` in `config/outreach.yaml`, default 50,
+counted from the peer outbox since UTC midnight) stops a loop from flooding one
+peer; a count that cannot be read refuses. A capped message stays queued and is
+retried each drain cycle; one still undelivered when its queue row ages out
+(24 h) is dropped with a warning in the log. The envelope, enrolment and
+disclosure checks still apply. This is not a new incoming task quota. Identity-keyed peer_message dedup distinguishes
 different peers and different logical sends sharing the same text. The canonical
 typed message survives formatting and retry intact. Complete outgoing messages
 use the same bounded disclosure policy as incoming-task results, including

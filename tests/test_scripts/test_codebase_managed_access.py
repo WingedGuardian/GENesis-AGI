@@ -34,9 +34,13 @@ def test_delete_journal_recovery_observes_real_read_permissions(tmp_path, mode):
     subprocess.run([sys.executable, "-I", "-c", child, str(database)], check=True, timeout=20)
     journal = Path(str(database) + "-journal")
     assert journal.stat().st_size > 512 and any(journal.read_bytes()[:8])
+    original_mode = journal.stat().st_mode
     journal.chmod(mode)
     try:
         if mode != 0o600:
+            denied = os.W_OK if mode == 0o400 else os.R_OK
+            if os.access(journal, denied, effective_ids=True):
+                pytest.skip(f"effective journal {'write' if denied == os.W_OK else 'read'}-denial premise defeated")
             with pytest.raises(sqlite3.OperationalError), sqlite3.connect(database) as db:
                 db.execute("SELECT value FROM records").fetchall()
             assert journal.exists()
@@ -46,7 +50,7 @@ def test_delete_journal_recovery_observes_real_read_permissions(tmp_path, mode):
             assert not journal.exists()
     finally:
         if journal.exists():
-            journal.chmod(0o600)
+            journal.chmod(original_mode)
 
 
 @pytest.mark.parametrize("mode", [0o200, 0o400])
@@ -74,6 +78,9 @@ def test_inaccessible_mutable_state_refuses_without_writes(managed, tmp_path, mo
     original_mode = target.stat().st_mode
     target.chmod(mode | 0o100 if target.is_dir() else mode)
     try:
+        denied = os.R_OK if mode == 0o200 else os.W_OK
+        if os.access(target, denied, effective_ids=True):
+            pytest.skip(f"effective {role} {'read' if denied == os.R_OK else 'write'}-denial premise defeated")
         with pytest.raises(ValueError, match="path unavailable"):
             managed.verify_worker_writes(value, False)
     finally:
@@ -88,29 +95,45 @@ def test_verified_binary_requires_effective_execute_access(managed, tmp_path, mo
     binary = tmp_path / "owned-binary"
     binary.write_bytes(b"owned fixture bytes")
     monkeypatch.setitem(managed.verified_binary.__globals__, "BUILD", hashlib.sha256(binary.read_bytes()).hexdigest())
+    original_mode = binary.stat().st_mode
     binary.chmod(0o401)  # owner can read; only other users can execute
-    assert not os.access(binary, os.X_OK, effective_ids=True)
-    with pytest.raises(ValueError, match="executable"), managed.verified_binary(binary):
-        pass
+    try:
+        if os.access(binary, os.X_OK, effective_ids=True):
+            pytest.skip("effective accepted-binary execute-denial premise defeated")
+        with pytest.raises(ValueError, match="executable"), managed.verified_binary(binary):
+            pass
+    finally:
+        binary.chmod(original_mode)
 
 
 @pytest.mark.parametrize("mode", [0o401, 0o400])
 def test_configure_copy_source_preserves_existing_mode_contract(managed, staged_configuration, mode):
     args, settings, state = staged_configuration
     source = Path(args.binary)
+    original_mode = source.stat().st_mode
     source.chmod(mode)
-    assert not os.access(source, os.X_OK, effective_ids=True)
-    if mode == 0o400:
-        with pytest.raises(ValueError, match="executable"):
+    try:
+        assert source.stat().st_mode & 0o777 == mode
+        if mode == 0o400:
+            with pytest.raises(ValueError, match="executable"):
+                managed.configure(args, settings)
+            assert not settings.exists() and not state.exists()
+        else:
+            # Copy-source validation uses mode bits, not effective execute access.
+            # The case only discriminates that contract while effective execute
+            # is denied to this process; under privilege it still runs, then
+            # says it proved less.
+            discriminating = not os.access(source, os.X_OK, effective_ids=True)
             managed.configure(args, settings)
-        assert not settings.exists() and not state.exists()
-    else:
-        managed.configure(args, settings)
-        destination = state / "bin/codebase-memory-mcp"
-        assert destination.read_bytes() == source.read_bytes()
-        assert destination.stat().st_mode & 0o777 == 0o500
-        assert os.access(destination, os.X_OK, effective_ids=True)
-        assert managed.read_settings(settings)["binary"] == str(destination)
+            destination = state / "bin/codebase-memory-mcp"
+            assert destination.read_bytes() == source.read_bytes()
+            assert destination.stat().st_mode & 0o777 == 0o500
+            assert os.access(destination, os.X_OK, effective_ids=True)
+            assert managed.read_settings(settings)["binary"] == str(destination)
+            if not discriminating:
+                pytest.skip("copy-source mode-bit independence not discriminated: effective execute granted")
+    finally:
+        source.chmod(original_mode)
 
 
 def test_append_log_and_non_enumerated_directories_do_not_require_read(managed, tmp_path, monkeypatch):

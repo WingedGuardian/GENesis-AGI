@@ -7,6 +7,12 @@ from pathlib import Path
 
 from genesis.db.crud import cognitive_state
 
+#: First part of an assembled prompt when model/effort/session are given.
+#: Shared with the contingency lane, which strips it: it names the HOME model.
+SESSION_CONFIG_HEADING = "## Your Session Configuration"
+#: Separator between assembled parts.
+PART_SEPARATOR = "\n\n---\n\n"
+
 
 class SystemPromptAssembler:
     """Assembles the Genesis system prompt from identity files + cognitive state."""
@@ -57,7 +63,7 @@ class SystemPromptAssembler:
         if protection_block:
             parts.append(protection_block)
 
-        return "\n\n---\n\n".join(parts)
+        return PART_SEPARATOR.join(parts)
 
     @staticmethod
     def _build_protection_block() -> str | None:
@@ -85,7 +91,7 @@ class SystemPromptAssembler:
         # identity/conversation content.  This lets it answer meta-questions
         # like "what model are you?" or "what's your thinking effort?"
         if model or effort or session_id:
-            meta_lines = ["## Your Session Configuration"]
+            meta_lines = [SESSION_CONFIG_HEADING]
             meta_lines.append(
                 "You KNOW the following about your own session. "
                 "When asked, state these facts directly."
@@ -104,4 +110,4 @@ class SystemPromptAssembler:
         if cog:
             parts.append("## Current Cognitive State\n\n" + cog)
 
-        return "\n\n---\n\n".join(parts)
+        return PART_SEPARATOR.join(parts)
