@@ -146,8 +146,11 @@ def test_shared_service_fallback_fails_closed_on_a_bare_thread(monkeypatch):
     from genesis import caller_context as module
     from genesis.security.immunity_shadow import DispatchGateRefused, guard_human_gate
 
+    # setenv first: delenv records nothing for an absent variable, and
+    # enter_shared_service writes these, so the teardown must restore them.
     for name in module.IDENTITY_ENV_VARS:
-        monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv(name, "stale")
+        monkeypatch.delenv(name)
     monkeypatch.setenv(module.TRANSCRIPT_ID_ENV, "service-env")
     monkeypatch.setattr(module, "_shared_service", False)
     guard_human_gate("probe")  # stdio: no dispatch marker means a foreground human
