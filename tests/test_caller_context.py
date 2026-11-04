@@ -139,6 +139,90 @@ async def test_concurrent_requests_see_their_own_caller():
     assert seen == {"a": "a", "b": "b"}
 
 
+def test_shared_service_fallback_fails_closed_on_a_bare_thread(monkeypatch):
+    """Work that lost its request scope never takes the service's environment as its caller."""
+    import threading
+
+    from genesis import caller_context as module
+    from genesis.security.immunity_shadow import DispatchGateRefused, guard_human_gate
+
+    for name in module.IDENTITY_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(module.TRANSCRIPT_ID_ENV, "service-env")
+    monkeypatch.setattr(module, "_shared_service", False)
+    guard_human_gate("probe")  # stdio: no dispatch marker means a foreground human
+
+    module.enter_shared_service()
+    assert module._shared_service is True
+    seen = {}
+
+    def work():
+        seen["caller"] = module.caller_context()
+        try:
+            guard_human_gate("probe")
+        except DispatchGateRefused as exc:
+            seen["refused"] = exc
+
+    with module.request_caller(module.CallerContext(dispatched=False, supervised=True)):
+        assert module.caller_context().dispatched is False  # a request's own caller still wins
+        thread = threading.Thread(target=work)
+        thread.start()
+        thread.join()
+    assert seen["caller"] == module._LOST_SCOPE_CALLER
+    assert seen["caller"].transcript_id is None
+    assert "refused" in seen
+
+
+@pytest.fixture
+def shared_service(monkeypatch):
+    from genesis import caller_context as module
+
+    for name in module.IDENTITY_ENV_VARS:
+        monkeypatch.setenv(name, "stale")
+    monkeypatch.setenv(module.SUPERVISED_ENV, "1")
+    monkeypatch.setattr(module, "_shared_service", False)
+    monkeypatch.setattr(module, "_warned_sites", set())
+    module.enter_shared_service()
+    return module
+
+
+def test_lost_scope_work_is_untrusted_at_the_memory_writers(shared_service):
+    from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED, session_origin_from_env
+
+    assert shared_service._LOST_SCOPE_CALLER.origin == ORIGIN_EXTERNAL_UNTRUSTED
+    assert session_origin_from_env() == ORIGIN_EXTERNAL_UNTRUSTED
+
+
+def test_a_child_of_a_shared_service_is_refused_at_the_human_gate(shared_service):
+    import os
+    import subprocess
+    import sys
+
+    probe = (
+        "from genesis.caller_context import caller_context as c;"
+        "from genesis.memory.provenance import session_origin_from_env as o;"
+        "from genesis.security.immunity_shadow import DispatchGateRefused, guard_human_gate;"
+        "x = c();"
+        "print(x.dispatched, x.supervised, x.session_id, x.transcript_id, o());\n"
+        "try:\n guard_human_gate('probe'); print('passed')\n"
+        "except DispatchGateRefused: print('refused')"
+    )
+    env = {**os.environ, "PYTHONPATH": str(_SRC.parent)}
+    out = subprocess.run(
+        [sys.executable, "-c", probe], env=env, capture_output=True, text=True, check=True
+    ).stdout.split("\n")
+    assert out[:2] == ["True False None None external_untrusted", "refused"]
+
+
+def test_a_lost_scope_read_names_its_site_once(shared_service, caplog):
+    with caplog.at_level("WARNING", logger="genesis.caller_context"):
+        for _ in range(3):
+            shared_service.caller_context()
+    lines = [r.getMessage() for r in caplog.records if "outside a request" in r.getMessage()]
+    assert len(lines) == 1
+    assert __file__ in lines[0]
+
+
 def test_a_partly_built_context_fails_closed_at_the_human_gate():
     """A field left out must not grant authority: the defaults are least privileged."""
     from genesis.security.immunity_shadow import DispatchGateRefused, guard_human_gate

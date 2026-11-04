@@ -52,7 +52,7 @@ from pathlib import Path
 from types import MappingProxyType
 
 from genesis.caller_context import CallerContext
-from genesis.memory.provenance import ORIGIN_CLASSES
+from genesis.memory.provenance import ORIGIN_CLASSES, ORIGIN_OWNER
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +128,8 @@ def _default_dir() -> Path:
 def _secure_dir(directory: Path, *, create: bool) -> None:
     """Require *directory* to be a real 0700 directory this uid owns.
 
-    With *create*, make it if absent and tighten a looser mode on one we own.
+    With *create*, make it if absent and set 0700 on one we own, which tightens a
+    loose mode and restores owner write. A mode that denies this open still raises.
     """
     try:
         if create:
@@ -144,11 +145,19 @@ def _secure_dir(directory: Path, *, create: bool) -> None:
         info = os.fstat(fd)
         if info.st_uid != os.getuid():
             raise CredentialStoreError(f"{directory} is not owned by this user")
-        if stat.S_IMODE(info.st_mode) & 0o077:
-            if not create:
-                raise CredentialStoreError(f"{directory} is readable by other users")
-            os.fchmod(fd, 0o700)  # through the held handle: a swapped-in symlink is never followed
-            logger.warning("Tightened %s to mode 0700", directory)
+        mode = stat.S_IMODE(info.st_mode)
+        if not create and mode & 0o077:
+            raise CredentialStoreError(f"{directory} is readable by other users")
+        # A store left owner-read-only must still take a new credential's temporary file.
+        if create and mode != 0o700:
+            try:
+                # Through the held handle: a swapped-in symlink is never followed.
+                os.fchmod(fd, 0o700)
+            except OSError as exc:
+                raise CredentialStoreError(
+                    f"{directory} cannot be set to mode 0700 ({exc.strerror})"
+                ) from None
+            logger.warning("Set %s to mode 0700", directory)
     finally:
         os.close(fd)
 
@@ -186,7 +195,12 @@ def _read_token(path: Path, *, repair_mode: bool) -> str:
             # this must not change on that name's behalf.
             if not repair_mode or info.st_nlink != 1:
                 raise CredentialStoreError(f"{path} is readable by other users")
-            os.fchmod(fd, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError as exc:
+                raise CredentialStoreError(
+                    f"{path} cannot be set to mode 0600 ({exc.strerror})"
+                ) from None
             logger.warning("Tightened %s to mode 0600", path)
     finally:
         os.close(fd)
@@ -279,6 +293,10 @@ def _validated_identity(fields: object) -> CallerContext | None:
     if origin is not None and (
         type(origin) is not str or (origin and origin not in ORIGIN_CLASSES)
     ):
+        return None
+    # No invoker path stamps owner today, and an unsupervised dispatched session
+    # has no owner present, so this pair is a misforward and never gains owner trust.
+    if origin == ORIGIN_OWNER and fields["dispatched"] and not fields["supervised"]:
         return None
     return CallerContext(
         dispatched=fields["dispatched"],

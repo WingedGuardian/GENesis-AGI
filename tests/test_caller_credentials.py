@@ -84,6 +84,38 @@ def test_ensure_tightens_loose_modes_without_rewriting(store: Path) -> None:
     assert _token(store / "forwarder") == before
 
 
+def test_ensure_repairs_an_owner_read_only_store(store: Path) -> None:
+    cc.ensure_caller_credentials(directory=store)
+    before = _token(store / "forwarder")
+    os.chmod(store, 0o500)
+    assert cc.ensure_caller_credentials(directory=store)["forwarder"] == "present"
+    assert _mode(store) == 0o700
+    assert _token(store / "forwarder") == before
+
+
+def test_a_refused_mode_repair_is_a_store_error(store: Path) -> None:
+    cc.ensure_caller_credentials(directory=store)
+    os.chmod(store, 0o500)
+    try:
+        with (
+            mock.patch.object(cc.os, "fchmod", side_effect=OSError(30, "read-only")),
+            pytest.raises(cc.CredentialStoreError, match="cannot be set"),
+        ):
+            cc.ensure_caller_credentials(directory=store)
+    finally:
+        os.chmod(store, 0o700)
+
+
+def test_load_does_not_change_an_owner_read_only_store(store: Path) -> None:
+    cc.ensure_caller_credentials(directory=store)
+    os.chmod(store, 0o500)
+    try:
+        assert isinstance(cc.CallerResolver.load(store), cc.CallerResolver)
+        assert _mode(store) == 0o500
+    finally:
+        os.chmod(store, 0o700)
+
+
 @pytest.mark.parametrize("content", ["", "short", "x" * 43 + "!", "é" * 43])
 def test_ensure_refuses_a_malformed_file_and_keeps_it(store: Path, content: str) -> None:
     store.mkdir(mode=0o700)
@@ -214,6 +246,24 @@ def test_forwarder_accepts_validated_identity(resolver: cc.CallerResolver, store
     )
 
 
+@pytest.mark.parametrize(
+    ("dispatched", "supervised", "origin"),
+    [
+        (False, False, "owner"),
+        (True, True, "owner"),
+        (True, False, "first_party"),
+        (True, False, "external_untrusted"),
+    ],
+)
+def test_forwarder_accepts_consistent_origin(
+    resolver: cc.CallerResolver, store: Path, dispatched: bool, supervised: bool, origin: str
+) -> None:
+    fields = {"dispatched": dispatched, "supervised": supervised, "origin": origin}
+    result = resolver.resolve(_token(store / "forwarder"), fields)
+    assert isinstance(result, CallerContext)
+    assert result.origin == origin
+
+
 def test_two_foreground_sessions_resolve_to_distinct_callers(
     resolver: cc.CallerResolver, store: Path
 ) -> None:
@@ -247,6 +297,7 @@ def test_two_foreground_sessions_resolve_to_distinct_callers(
         {**FOREGROUND, "transcript_id": "é"},
         {**FOREGROUND, "origin": "root"},
         {**FOREGROUND, "origin": 1},
+        {"dispatched": True, "supervised": False, "origin": "owner"},
     ],
 )
 def test_forwarder_refuses_malformed_identity(
