@@ -638,6 +638,19 @@ def _isolate_alert_queue(tmp_path):
     mp.undo()
 
 
+# ── Determinism: a launcher's systemd-run option probe is not a process to count ─
+@pytest.fixture(autouse=True)
+def _no_systemd_run_option_probe():
+    """``literal_scope_args`` asks ``systemd-run`` for every scope a launcher builds,
+    which tests counting that launcher's processes would see, and it would make what
+    they build depend on the machine. Answers as an older systemd would, so no option is
+    added. Its own tests call the real function. Fixture-owned ``MonkeyPatch``, as above."""
+    mp = pytest.MonkeyPatch()
+    mp.setattr("genesis.util.systemd._systemd_run_refuses_literal_arguments", lambda: True)
+    yield
+    mp.undo()
+
+
 # ── Safety: prevent tests from moving files into the REAL trash ─────────────
 @pytest.fixture(autouse=True)
 def _isolate_trash_root(tmp_path):
