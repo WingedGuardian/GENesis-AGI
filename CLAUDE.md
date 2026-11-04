@@ -608,7 +608,8 @@ gate works, its exemption categories, and the unit rules for size bounds:
   consequence class computed from the diff, not chosen by the author. Two P2s
   block a `critical` change (enforcement hooks, `.github/**`, api/migration
   paths); ordinary code takes four; prose-and-tests-only takes six — config is
-  NOT prose, so a `.yaml`/`.toml` change is ordinary. The gate prints the
+  NOT prose, so a `.yaml`/`.toml` change is ordinary, except a short list of
+  files that steer a check or arm an action, which is critical. The gate prints the
   lane and its threshold whenever a non-zero score passes under one, so "it did
   not block" never has to be guessed at. Table and rationale: closing-session
   skill, Pre-Merge Gate.

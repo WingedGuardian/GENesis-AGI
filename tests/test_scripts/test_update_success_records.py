@@ -22,6 +22,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from tests.test_scripts._update_source import update_text
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE = REPO_ROOT / "scripts" / "update.sh"
 
@@ -98,7 +100,7 @@ def test_every_success_record_uses_marker_capable_variable() -> None:
     Enumeration is by the HELPER NAME and spelling-agnostic: any quoting, any
     arity. A gate whose denominator is one spelling is a denylist.
     """
-    text = UPDATE.read_text()
+    text = update_text()
 
     invocations = re.findall(r"^[ \t]*_record_update_history[ \t]+(\S.*)$", text, re.M)
     assert len(invocations) >= 3, f"found only {len(invocations)}: {invocations}"
@@ -150,7 +152,7 @@ def test_p6_treats_an_unreadable_status_as_a_recovery() -> None:
     live failure. Allowlist: exactly these three statuses recover, nothing else.
     """
     # P6 (and the no-delta dispatch) read it in the shared _server_recovery_pending.
-    pending = _block(UPDATE.read_text(), "restart-owed")
+    pending = _block(update_text(), "restart-owed")
     case_start = pending.index('case "$(_latest_update_status)" in')
     case = pending[case_start : pending.index("esac", case_start)]
     arms = _case_arms(case)
@@ -166,7 +168,7 @@ def test_no_delta_path_never_records_success_over_an_unresolved_failure() -> Non
     P6's recovery detection reads only the NEWEST update_history status, and when
     last_update_failure.json was never written that row is the only signal it has.
     """
-    text = UPDATE.read_text()
+    text = update_text()
     start = text.index('elif [ -n "$_nd_base_degraded" ]; then')
     branch = text[start : text.index("Nothing to do.", start)]
     assert '_nd_last_status="$(_latest_update_status)"' in branch
@@ -187,7 +189,7 @@ def test_no_delta_path_never_records_success_over_an_unresolved_failure() -> Non
 
 def test_noop_history_does_not_duplicate_pre_update_degraded() -> None:
     """The writer appends PRE_UPDATE_DEGRADED itself; the no-delta value must not."""
-    text = UPDATE.read_text()
+    text = update_text()
     assert '"${HOST_CC_DEGRADED:-}" "$_nd_server_not_restarted"' in text
 
 
@@ -197,7 +199,7 @@ def test_noop_history_does_not_duplicate_pre_update_degraded() -> None:
 def test_success_degraded_helper_marks_server_not_restarted() -> None:
     script = (
         "set -euo pipefail\n"
-        + _block(UPDATE.read_text(), "success-degraded-subsystems")
+        + _block(update_text(), "success-degraded-subsystems")
         + '\n_success_degraded_subsystems "container_cc_sync" true\n'
         + '_success_degraded_subsystems "container_cc_sync" false\n'
         + '_success_degraded_subsystems "" true\n'
@@ -218,7 +220,7 @@ def test_deploy_outcome_probes_behave(tmp_path: Path) -> None:
     unit in any other state is not; and `_latest_update_status` against a real
     SQLite fixture: absent is "", unreadable says so, the newest row wins, and the
     database read is $GENESIS_ROOT's, never a fixed home path."""
-    block = _block(UPDATE.read_text(), "deploy-outcome-probes")
+    block = _block(update_text(), "deploy-outcome-probes")
     shim_dir = tmp_path / "bin"
     shim_dir.mkdir()
     calls = tmp_path / "curl_calls"
@@ -320,7 +322,7 @@ def test_deploy_outcome_probes_behave(tmp_path: Path) -> None:
     # history WRITER cannot run then (it imports genesis) and says so; the
     # READER is stdlib-only, so it must still read the row a previous run left.
     missing_venv = tmp_path / "missing-venv"
-    metadata_python = _function(UPDATE.read_text(), "_metadata_python")
+    metadata_python = _function(update_text(), "_metadata_python")
 
     def latest(path: str | None = None) -> str:
         env = _clean_env(HOME=str(home))
@@ -401,7 +403,7 @@ def test_metadata_python_honors_a_per_writer_version_floor(tmp_path: Path) -> No
     script = (
         "set -u\n"
         f'VENV_DIR="{tmp_path / "missing-venv"}"\n'
-        + _function(UPDATE.read_text(), "_metadata_python")
+        + _function(update_text(), "_metadata_python")
         + "\n"
         "if _metadata_python 12 >/dev/null; then echo unexpected-312; fi\n"
         "_metadata_python 11\n"
@@ -429,7 +431,7 @@ def _run_writer(tmp_path: Path, venv_dir: Path) -> tuple[subprocess.CompletedPro
         f'VENV_DIR="{venv_dir}"\n'
         "OLD_TAG=old\nOLD_COMMIT=oldsha\nNEW_TAG=new\nNEW_COMMIT=newsha\n"
         'ROLLBACK_TAG=rollback\nSTARTED_AT=started\nPRE_UPDATE_DEGRADED="backup:process_exit"\n'
-        + _function(UPDATE.read_text(), "_record_update_history")
+        + _function(update_text(), "_record_update_history")
         + '\n_record_update_history "success" "" "container_cc_sync"\n'
     )
     result = subprocess.run(
@@ -501,7 +503,7 @@ def test_no_change_decision_matrix(tmp_path: Path) -> None:
     - every row written with the server not back carries the marker, and no
       other row does.
     """
-    text = UPDATE.read_text()
+    text = update_text()
     block = _no_delta_block(text)
     helper = _block(text, "success-degraded-subsystems")
     home = tmp_path / "home"

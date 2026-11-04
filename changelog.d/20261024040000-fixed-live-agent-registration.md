@@ -1,0 +1,1 @@
+- Live-agent sessions report their initialized model and checkpoint their existing session row after shutdown when the child is confirmed dead, preserving recorded usage.

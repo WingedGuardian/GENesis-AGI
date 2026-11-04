@@ -202,7 +202,10 @@ def _held_regions(text):
     return lines, spans
 
 
-@pytest.mark.parametrize("script", ["update.sh", "deploy_code_only.sh", "lib/deploy_recovery.sh"])
+@pytest.mark.parametrize(
+    "script",
+    ["update.sh", "deploy_code_only.sh", "lib/deploy_recovery.sh", "lib/update_rollback.sh"],
+)
 def test_every_hook_running_git_call_is_wrapped(script):
     """checkout and merge run git hooks (post-checkout, post-merge). Each must go
     through genesis_without_checkout_lock, or run with hooks disabled, so a hook's

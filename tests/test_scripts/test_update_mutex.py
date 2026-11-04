@@ -17,13 +17,15 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_scripts._update_source import update_text
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE_SH = REPO_ROOT / "scripts" / "update.sh"
 
 
 @pytest.fixture(scope="module")
 def text() -> str:
-    return UPDATE_SH.read_text()
+    return update_text()
 
 
 def test_flock_guard_present(text: str) -> None:

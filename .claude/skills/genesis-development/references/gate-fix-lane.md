@@ -71,12 +71,9 @@ Applies to any PR whose diff touches the enforcement-hook surface (`scripts/revi
      local mark ONCE with combined evidence. That single mark is `--defects` if EITHER
      reviewer raised a new BLOCKER/SHOULD-FIX/P1/P2 — a clean secondary does not launder
      a defect-bearing Codex round.
-     **Two separate marks falsify the record.** `bump_review_round` increments only on
-     a DISTINCT staged hash, so a second defect mark on the same diff is idempotent. But
-     `--clean` resets the streak to 0 whether or not the staged diff changed, and an
-     idempotent same-hash `--defects` cannot restore the round it just erased. So on
-     one staged diff, in EITHER order, a mixed clean/defect pair records as CLEAN (Codex
-     P2, #1903). No gate acts on the streak now, but the one-mark rule keeps the record
+     **Two separate marks falsify the record.** The marker keeps only the LAST mark's
+     outcome, so a clean mark after a defect mark on the same staged diff records the
+     round as clean. One mark per round, carrying its true outcome, keeps the record
      honest.
   2. **Triage before touching code — and here it OUTRANKS the cheap-fix habit.**
      That rule (closing-session, "'Not blocking' describes the GATE, not the finding", and right for ordinary PRs) weighs what a fix costs before the owner

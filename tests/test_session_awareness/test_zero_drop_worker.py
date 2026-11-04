@@ -1756,3 +1756,220 @@ async def test_a_sweep_that_MEASURED_NOTHING_cannot_publish_a_CLEAN_BOARD(
     # accounting that makes suppression auditable.
     terminal = record["stages"]["branches"]["terminal"]
     assert sum(v for k, v in terminal.items() if k != "refs_total") == terminal["refs_total"]
+
+
+# -- Surfacing carry-over (a replaced alert keeps its report history) ---------
+
+
+async def _surfacing(conn, source):
+    cursor = await conn.execute(
+        "SELECT surfaced_count, surfaced_at, resolved FROM observations "
+        "WHERE source = ? ORDER BY created_at",
+        (source,),
+    )
+    return [dict(r) for r in await cursor.fetchall()]
+
+
+async def test_a_replaced_blind_alert_carries_its_surfacing(db_path):
+    """A changed cause mints a NEW row. Without the carry-over the new row
+    started at surfaced_count 0, so a fault that persisted for weeks never
+    climbed to the morning report's Standing Items (threshold 3)."""
+    import aiosqlite
+
+    from genesis.db.crud import observations
+
+    conn = await aiosqlite.connect(db_path)
+    conn.row_factory = aiosqlite.Row
+    try:
+        await w._maintain_blind_alert(conn, degraded={"prs": "gh auth expired"}, frozen=[])
+        cursor = await conn.execute(
+            "SELECT id FROM observations WHERE source = ?", (w.BLIND_SOURCE,)
+        )
+        first_id = (await cursor.fetchone())["id"]
+        await observations.mark_surfaced(conn, [first_id], "2026-03-10T11:00:00+00:00")
+        await observations.mark_surfaced(conn, [first_id], "2026-03-11T11:00:00+00:00")
+
+        out = await w._maintain_blind_alert(conn, degraded={"prs": "gh rate limited"}, frozen=[])
+        assert out == "created"
+        rows = await _surfacing(conn, w.BLIND_SOURCE)
+        live = [r for r in rows if not r["resolved"]]
+        assert len(live) == 1
+        assert live[0]["surfaced_count"] == 2, "the replacement reset the surfacing count"
+        assert live[0]["surfaced_at"] == "2026-03-10T11:00:00+00:00", (
+            "the replacement lost its first-surfaced time, so it would be shown as NEW"
+        )
+    finally:
+        await conn.close()
+
+
+async def test_a_recovered_blind_alert_does_not_carry(db_path):
+    """Recovery ends the chain: a fault that returns later is a new problem."""
+    import aiosqlite
+
+    from genesis.db.crud import observations
+
+    conn = await aiosqlite.connect(db_path)
+    conn.row_factory = aiosqlite.Row
+    try:
+        await w._maintain_blind_alert(conn, degraded={"prs": "gh auth expired"}, frozen=[])
+        cursor = await conn.execute(
+            "SELECT id FROM observations WHERE source = ?", (w.BLIND_SOURCE,)
+        )
+        first_id = (await cursor.fetchone())["id"]
+        await observations.mark_surfaced(conn, [first_id], "2026-03-10T11:00:00+00:00")
+
+        assert await w._maintain_blind_alert(conn, degraded={}, frozen=[]) == "resolved"
+        await w._maintain_blind_alert(conn, degraded={"prs": "gh rate limited"}, frozen=[])
+        live = [r for r in await _surfacing(conn, w.BLIND_SOURCE) if not r["resolved"]]
+        assert live == [{"surfaced_count": 0, "surfaced_at": None, "resolved": 0}]
+    finally:
+        await conn.close()
+
+
+async def test_a_reconfirmed_blind_alert_does_not_expire(db_path):
+    """A sweep that re-confirms the open row restarts its TTL. Before, the row
+    expired three days after it was first written however often the fault was
+    confirmed, so a fault that lasted longer restarted from zero."""
+    import aiosqlite
+
+    from genesis.db.crud import observations
+
+    conn = await aiosqlite.connect(db_path)
+    conn.row_factory = aiosqlite.Row
+    try:
+        degraded = {"prs": "gh auth expired"}
+        await w._maintain_blind_alert(conn, degraded=degraded, frozen=[])
+        await conn.execute(
+            "UPDATE observations SET expires_at = '2000-01-01T00:00:00+00:00' WHERE source = ?",
+            (w.BLIND_SOURCE,),
+        )
+        await conn.commit()
+        assert await w._maintain_blind_alert(conn, degraded=degraded, frozen=[]) == "unchanged"
+        await observations.resolve_expired(conn)
+        rows = await _surfacing(conn, w.BLIND_SOURCE)
+        assert [r["resolved"] for r in rows] == [0], "a re-confirmed fault expired"
+    finally:
+        await conn.close()
+
+
+async def test_a_reconfirmed_blind_alert_shows_current_counts(db_path):
+    """The identity ignores digits, so a changed count re-confirms the same
+    row. Now that such a row no longer re-mints after its TTL, its text must
+    be rewritten or it would show its first numbers for as long as it stands."""
+    import aiosqlite
+
+    conn = await aiosqlite.connect(db_path)
+    conn.row_factory = aiosqlite.Row
+    try:
+        await w._maintain_blind_alert(
+            conn, degraded={"worktrees": "1 of 161 worktrees unreadable: /w/a"}, frozen=[]
+        )
+        out = await w._maintain_blind_alert(
+            conn, degraded={"worktrees": "47 of 161 worktrees unreadable: /w/a"}, frozen=[]
+        )
+        assert out == "unchanged"
+        cursor = await conn.execute(
+            "SELECT content FROM observations WHERE source = ? AND resolved = 0 "
+            "AND content LIKE '%worktrees%'",
+            (w.BLIND_SOURCE,),
+        )
+        assert "47 of 161" in (await cursor.fetchone())["content"], "the open row kept stale counts"
+    finally:
+        await conn.close()
+
+
+async def test_a_ttl_expired_blind_alert_does_not_carry(db_path):
+    """An expired row means no sweep confirmed the fault for a whole TTL (the
+    detector was down, or the fault cleared unseen), so it never carries."""
+    import aiosqlite
+
+    from genesis.db.crud import observations
+
+    conn = await aiosqlite.connect(db_path)
+    conn.row_factory = aiosqlite.Row
+    try:
+        degraded = {"prs": "gh auth expired"}
+        await w._maintain_blind_alert(conn, degraded=degraded, frozen=[])
+        cursor = await conn.execute(
+            "SELECT id FROM observations WHERE source = ?", (w.BLIND_SOURCE,)
+        )
+        first_id = (await cursor.fetchone())["id"]
+        await observations.mark_surfaced(conn, [first_id], "2026-03-10T11:00:00+00:00")
+        await conn.execute(
+            "UPDATE observations SET expires_at = '2000-01-01T00:00:00+00:00' WHERE id = ?",
+            (first_id,),
+        )
+        await conn.commit()
+        await observations.resolve_expired(conn)
+
+        assert await w._maintain_blind_alert(conn, degraded=degraded, frozen=[]) == "created"
+        live = [r for r in await _surfacing(conn, w.BLIND_SOURCE) if not r["resolved"]]
+        assert live == [{"surfaced_count": 0, "surfaced_at": None, "resolved": 0}], (
+            "an expired row carried into a new chain"
+        )
+    finally:
+        await conn.close()
+
+
+async def test_a_critical_findings_replacement_carries_the_count_only(db_path):
+    """A critical row must still reach the pager, which reads unsurfaced rows:
+    the count carries, the surfaced time does not."""
+    import aiosqlite
+
+    from genesis.db.crud import observations
+
+    conn = await aiosqlite.connect(db_path)
+    conn.row_factory = aiosqlite.Row
+    try:
+        cfg = {"max_listed": 10, "alert_priority": "critical"}
+        one = [
+            {"class": "unpushed_branch", "branch": "feat/x", "ahead_count": 2, "escalated": False}
+        ]
+        two = [*one, {"class": "pushed_no_pr", "branch": "feat/y", "escalated": False}]
+        await w._maintain_alert(conn, cfg=cfg, findings=one, total=1, coverage="all classes swept")
+        cursor = await conn.execute(
+            "SELECT id FROM observations WHERE source = ?", (w.ALERT_SOURCE,)
+        )
+        first_id = (await cursor.fetchone())["id"]
+        await observations.mark_surfaced(conn, [first_id], "2026-03-10T11:00:00+00:00")
+
+        await w._maintain_alert(conn, cfg=cfg, findings=two, total=2, coverage="all classes swept")
+        live = [r for r in await _surfacing(conn, w.ALERT_SOURCE) if not r["resolved"]]
+        assert live == [{"surfaced_count": 1, "surfaced_at": None, "resolved": 0}]
+        pager = await observations.get_unsurfaced(conn, priority_filter=("critical",))
+        assert [r["source"] for r in pager] == [w.ALERT_SOURCE], "the pager lost the new state"
+    finally:
+        await conn.close()
+
+
+async def test_a_replaced_findings_alert_carries_its_surfacing(db_path):
+    """The findings alert has the same replace-on-change shape and the same carry."""
+    import aiosqlite
+
+    from genesis.db.crud import observations
+
+    conn = await aiosqlite.connect(db_path)
+    conn.row_factory = aiosqlite.Row
+    try:
+        cfg = {"max_listed": 10, "alert_priority": "high"}
+        one = [
+            {"class": "unpushed_branch", "branch": "feat/x", "ahead_count": 2, "escalated": False}
+        ]
+        two = [*one, {"class": "pushed_no_pr", "branch": "feat/y", "escalated": False}]
+        await w._maintain_alert(conn, cfg=cfg, findings=one, total=1, coverage="all classes swept")
+        cursor = await conn.execute(
+            "SELECT id FROM observations WHERE source = ?", (w.ALERT_SOURCE,)
+        )
+        first_id = (await cursor.fetchone())["id"]
+        await observations.mark_surfaced(conn, [first_id], "2026-03-10T11:00:00+00:00")
+
+        out = await w._maintain_alert(
+            conn, cfg=cfg, findings=two, total=2, coverage="all classes swept"
+        )
+        assert out == "created"
+        live = [r for r in await _surfacing(conn, w.ALERT_SOURCE) if not r["resolved"]]
+        assert live == [
+            {"surfaced_count": 1, "surfaced_at": "2026-03-10T11:00:00+00:00", "resolved": 0}
+        ]
+    finally:
+        await conn.close()
