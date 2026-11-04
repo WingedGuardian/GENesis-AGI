@@ -344,9 +344,49 @@ jobs:
       - name: External-I/O egress guard
         run: python scripts/check_external_io.py
 
+  mutation-gate:
+    # Verify-RED, reported; to be made a required check once the harness is
+    # stable (it is not in the required-check ruleset, so a red run here does
+    # not block a merge on its own). A guard's test can stop pinning the
+    # property it is named for -- through a refactor, a widened assertion, a
+    # sibling layer that starts masking it -- and nothing goes red, because the
+    # test still passes. This breaks a handful of load-bearing guard decisions
+    # on purpose and fails if the test does NOT notice. An ABORT is a failure
+    # too: a case that could not run has established nothing.
+    # See scripts/ci/mutation_sweep.py.
+    runs-on: ubuntu-latest
+    # The project's floor, not a measured bound: without it a hung case holds a
+    # runner for GitHub's default six hours. Results print as cases finish, so a
+    # job stopped here still reports the cases that ran.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The job runs repository tests and needs no git credential after
+          # the checkout, so none is left on disk for them to read.
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        # MUST mirror the `test` job, pin file included: the root
+        # tests/conftest.py imports aiosqlite, so a minimal install fails
+        # collection and every case ABORTS, and an unpinned pytest could change
+        # the summary grammar the harness parses.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test,transcript-analytics]" -c .github/test-tools/requirements.txt
+      - name: Mutation gate
+        # exec: the runner signals only the step's entry process, so under bash the
+        # sweep would never hear a cancel (from the runner's source, not measured on
+        # a hosted run). --timeout: a run's bound must be shorter than the job's, or a
+        # hang ends the job with no reason given and later cases unjudged. Four hung
+        # runs fit; the owner accepted going below the 2-hour floor for this command.
+        run: exec python scripts/ci/mutation_sweep.py config/mutation_gate.json --repo . --timeout 1500
+
   atomic-write-check:
     # An atomic write that orphans its temp on the exception path leaks a file
-    # into a directory nothing sweeps. MEASURED 2026-10-26: 85 sites, 30 dirty --
+    # into a directory nothing sweeps. MEASURED 2026-11-01: 86 sites, 30 dirty --
     # and a 0-byte temp had sat in ~/.genesis for 3.5 months, a root no reaper
     # covers. ALLOWLIST polarity against a shrinking debt ledger, so instance 31
     # cannot arrive silently FROM A NEW FUNCTION while the existing 30 are fixed
@@ -721,7 +761,9 @@ jobs:
         # test that skips without the browser stack, 441 -> 442.
         # Validator role: 72 role and 24 adapter-bridge opt-in cases, 442 -> 538.
         # Validator writers: fourteen opt-in native cases, 538 -> 552.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 552
+        # Native MCP client qualification (#3656): eleven installed-client and
+        # mocked-turn opt-in cases, measured on the PR's runner, 552 -> 563.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 563
 
   collected-floor:
     # Tests that stop being collected make the suite SMALLER, not red. This job

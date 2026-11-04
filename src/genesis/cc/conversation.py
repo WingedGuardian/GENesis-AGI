@@ -55,6 +55,22 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _speaker_label(sender: str | None) -> str:
+    """Who said a stored Telegram message, as the recap renders it. Alerts the
+    host Guardian sent (sender="guardian") are labelled as the Guardian's, not
+    as Genesis's own earlier words."""
+    return {"user": "User", "guardian": "Guardian"}.get(sender or "", "Genesis")
+
+
+def _recap_body(sender: str | None, content: str) -> str:
+    """A stored message's text as the recap renders it. Guardian text is
+    host-supplied, so its continuation lines are indented: a line of it that
+    reads "User: ..." can never pass for a turn of its own."""
+    if sender == "guardian":
+        return content.replace("\r", "").replace("\n", "\n    ")
+    return content
+
 # Appended to a delivered reply when the CLI truncated dispatched background work
 # at its wait ceiling (CCOutput.bg_truncated). Surfaces the 2026-07-20 silent-death
 # class to the user instead of shipping a partial answer as if it were complete.
@@ -2076,7 +2092,7 @@ class ConversationLoop:
                     # proposal digests and their numbered items
                     if len(content) > 800:
                         content = content[:800] + "…"
-                    prefix = "User" if sender == "user" else "Genesis"
+                    prefix = _speaker_label(sender)
                     # Defanged of the end marker's bracket text (without its
                     # newline, which the line format below supplies) so the
                     # backup lane's lift of this section (`_lift_spans`) ends
@@ -2085,7 +2101,7 @@ class ConversationLoop:
                     content = content.replace(
                         _TOPIC_THREAD_END_TEXT, "[end of thread messages_]",
                     )
-                    lines.append(f"**{prefix}**: {content}\n")
+                    lines.append(f"**{prefix}**: {_recap_body(sender, content)}\n")
                 lines.append(_TOPIC_THREAD_END)
 
             # ── Pending proposals board ─────────────────────────────────
@@ -2299,7 +2315,8 @@ class ConversationLoop:
                 content = str(m.get("content") or "")
                 if not content:
                     continue
-                prefix = "User" if m.get("sender") == "user" else "Genesis"
+                prefix = _speaker_label(m.get("sender"))
+                content = _recap_body(m.get("sender"), content)
                 line = f"{prefix}: {content}"
                 # Charge the "\n" that "\n".join will insert before this line
                 # (one per line after the first) so the budget is enforced on the

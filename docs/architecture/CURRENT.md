@@ -2576,7 +2576,13 @@ verified: 973a0e6 2026-10-30
   `20260906234824_pr_verifications` migration docstring for the full
   New-Store-Gate justification. The CONSUMER is the **validator session**
   (`scripts/pr_verification.py`, with its doctrine in the `validating-merges`
-  skill and its readers on `repo_pulse_worker.py`). The verdict is DERIVED from the
+  skill and its readers on `repo_pulse_worker.py`). Its picker,
+  `repo_pulse_worker.py --next-for-validation`, names the ONE row to work next:
+  not-yet-done, then never-attempted, then a parked row past 7 days, never
+  fail-intent; deployed rows with an `E2E:` plan first, newest merge first. Deploy
+  is merge-commit ancestry of the serving commit, except a stacked PR, which is
+  kept and labelled because ancestry cannot prove it either way. It fails closed
+  (picks nothing) when GitHub or git cannot answer. The verdict is DERIVED from the
   validator's evidence document by `session_awareness/pr_evidence.py` (a strict
   pydantic model plus a total decision tree), never asserted by the caller — a
   caller-asserted design policed by refusal rules produced documents with no legal
@@ -3252,7 +3258,9 @@ verified: 3e27b4794 2026-10-23
   is explicitly disabled. Contradictory served identities retain unresolved
   liability, while expense settlement cannot qualify invalid routing evidence.
   Frozen schedule/provider
-  mapping and dedicated nonreset credentials are required; any journal incident
+  mapping and explicit credential identity are required; dedicated mode retains
+  its nonreset-key policy, while shared mode requires a separately approved
+  operating plan. Any journal incident
   pauses new requests and replay until verified recovery. These checks do not
   admit more than reported or exact limit-minus-spend headroom supports. Local
   client setup precedes durable dispatch; recovery metadata uses the shared JSON
@@ -3296,9 +3304,13 @@ verified: 3e27b4794 2026-10-23
   paired population and status rules. Exploratory case and reference-class comparisons do
   not treat repeated responses as independent cases or authorize promotion.
   A credential-scoped lock precedes journal writers and credential reads. The
-  actual pre-dispatch key snapshot must fund the whole selected pending
+  dedicated-mode pre-dispatch key snapshot must fund the whole selected pending
   population, including effective/member headroom; uncertain evidence stops
-  acquisition without resending dispatched coordinates. Observed expenses and
+  acquisition without resending dispatched coordinates. An explicit version-2
+  shared-key policy uses verified experiment receipts and
+  pending allocations, without exclusive account snapshots or attributing
+  unrelated traffic to the experiment. Mode and fingerprint stay frozen across
+  dispatch and GET-only recovery. Observed expenses and
   unresolved liability remain distinct; operating allowances are not guaranteed
   invoice ceilings. Source population/cache checks at admission and completion
   invalidate scoring on detected drift, without a per-request source-integrity
@@ -3751,7 +3763,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
-          env.py, _config_overlay.py]
+          env.py, _config_overlay.py, caller_context.py]
 verified: 973a0e6 2026-10-30
 ```
 
@@ -4378,6 +4390,21 @@ Refusing a proposed update preserves a previously valid opt-in.
   rebuild (its pid named in `DEPLOY_CANDIDATES_OWN_STATE_PID`, equal to the
   engine's parent, update.lock handed over, a plain run) is neither refused nor
   retired; a run that names a pid whose row is not that run's own refuses.
+- **`update.sh`'s rollback lives in `scripts/lib/update_rollback.sh`** (#3844):
+  `_do_rollback` and the service, database and history helpers it needs, sourced
+  at startup with the other libs. The lib holds definitions, plus two lines safe to
+  run twice, so it can be sourced again; `_on_err`, `_on_signal` and the thin
+  `_do_rollback` stay in `update.sh`, which keeps its own functions for the whole
+  run. So that a rollback fix protects the update delivering it, a plain merge
+  update stages the merged `scripts/lib` under `~/tmp` before the stop and checks
+  it; after the merge is verified, a failure loads that copy and runs it with `set
+  +eu`, because with the traps off a stop would leave the server down. Anything
+  wrong falls back to the launched rollback: a file that will not parse or load, a
+  different `update_rollback_abi`, a global the lib declares and the launching
+  script does not set, nothing merged, or local commits to `scripts/lib`. Activation
+  stays on what it launched with, as do `live` and `--post-merge`.
+  `~/.genesis/last_rollback_source.json` says which rollback last ran and why
+  (a diagnostic, overwritten each time; nothing reads it).
 - **`update.sh` on `live`** (#2978, #3370): the merge's place, after the stop,
   is taken by the deploy-candidates engine's rebuild (`scripts/deploy_candidates.py
   rebuild`, the `live-engine` block). Everything else is main's path: one DB

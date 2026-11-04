@@ -211,6 +211,8 @@ export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNT
 . "$_SELF_DIR/lib/deploy_recovery.sh"
 # shellcheck source=lib/server_session_refusal.sh
 . "$_SELF_DIR/lib/server_session_refusal.sh"
+# shellcheck source=lib/shared_mcp_units.sh
+. "$_SELF_DIR/lib/shared_mcp_units.sh"
 # The helpers that run AFTER the merge are read now, like the libs above: the
 # merge may replace them on disk, and this run must use the versions it started
 # with (`python3 -c "$CODE" args…` sees the same sys.argv as running the file).
@@ -1060,6 +1062,20 @@ if [ "$_healthy" = true ]; then
         echo "  NOTE: the reflog does not confirm the restarted server booted from $SHA (${SERVING:-unknown: $SERVING_WHY})."
     fi
     echo "  Healthy — deployed $SHA (genesis-server pid $_SERVER_PID)"
+    # The shared MCP services load the same src/: restart each one installed and
+    # enabled (none by default), still under the lock. One that does not come back
+    # leaves every attached session without those tools, so it pages, like a
+    # server that fails its health check, and the tree is not reverted.
+    _PHASE="shared-mcp"
+    if ! _mcp_out="$(genesis_restart_shared_mcp_units "$GENESIS_ROOT")"; then
+        printf '%s\n' "$_mcp_out"
+        _ALERTED=1
+        queue_alert critical deploy-code-only \
+            "code-only deploy at $SHA: a shared MCP service did not come back" \
+            "genesis-server is healthy at $SHA, but restarting the shared MCP services failed: $(printf '%s' "$_mcp_out" | paste -sd ' ' -) Sessions attached to them have no tools from those servers, or old code, until it is fixed.${_UNVERIFIED:+ The server was also restarted on a tree this run did not check ($_CHECKED was checked): $_UNVERIFIED. Converge: find what changed the checkout, then scripts/deploy_code_only.sh restart.}"
+        die "a shared MCP service did not come back after the restart — alert queued."
+    fi
+    [ -z "$_mcp_out" ] || printf '%s\n' "$_mcp_out"
     if [ -n "$_UNVERIFIED" ]; then
         _ALERTED=1
         queue_alert critical deploy-code-only \

@@ -32,6 +32,7 @@ SHARED_LIBS = [
     REPO_ROOT / "scripts" / "lib" / "deploy_marker.sh",
     REPO_ROOT / "scripts" / "lib" / "deploy_checkout.sh",
     REPO_ROOT / "scripts" / "lib" / "deploy_recovery.sh",
+    REPO_ROOT / "scripts" / "lib" / "update_rollback.sh",
 ]
 _PRELUDE = "#!/usr/bin/env bash\nset -Eeuo pipefail\n"
 

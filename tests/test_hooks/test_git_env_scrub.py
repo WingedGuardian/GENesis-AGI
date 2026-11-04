@@ -403,10 +403,10 @@ def test_no_route_to_an_external_diff_can_empty_the_staged_content_hash(
     """An external diff driver empties ``git diff --cached``, whichever door it
     arrives through — and that lands on the ``"clean"`` NOTHING-STAGED sentinel.
 
-    Why that sentinel is the worst one to reach: ``bump_review_round`` treats
-    a ``"clean"`` content hash as "not a review round" and returns the CURRENT
-    round without advancing, so an ambient value here does not merely mis-size a
-    review — it stops the escalation cap counting rounds at all.
+    Why that sentinel matters: the depth gate binds the review marker to this
+    content hash (``marker_content_current``) and refuses clearance on a
+    ``"clean"`` hash, so an ambient value here turns reviewed work into a false
+    block; the same emptied diff also misleads the substantiality classifier.
 
     FOUR routes, because this is the finding that proved a name denylist is the
     wrong instrument for the class. Scrubbing ``GIT_EXTERNAL_DIFF`` closes
@@ -441,8 +441,8 @@ def test_no_route_to_an_external_diff_can_empty_the_staged_content_hash(
 
     assert review_state._staged_content_hash(cwd=cwd) == clean, (
         f"an external diff driver set through {route} changed the staged content "
-        f'hash — if it reaches the "clean" sentinel the escalation cap stops '
-        f"counting rounds"
+        f'hash — if it reaches the "clean" sentinel the depth gate refuses '
+        f"clearance for reviewed work"
     )
 
 
@@ -526,8 +526,8 @@ def test_a_repo_local_external_diff_cannot_empty_the_staged_content_hash(repos):
 
     assert review_state._staged_content_hash(cwd=cwd) == clean, (
         "a repo-local diff.external emptied the staged diff — the staged content "
-        'hash fell to the "clean" sentinel and the escalation cap would stop '
-        "counting rounds"
+        'hash fell to the "clean" sentinel and the depth gate would refuse '
+        "clearance for reviewed work"
     )
 
 
@@ -604,15 +604,15 @@ def test_a_replace_ref_cannot_empty_the_gates_reads(repos, monkeypatch):
     )
     # The SECOND diff site in this module, and the one with the worse consequence.
     # `get_current_diff_hash` reads `--raw`; `_staged_content_hash` reads the PLAIN
-    # diff, and `bump_review_round` treats its "clean" sentinel as "this was not a
-    # review round" — so emptying THIS one disarms the escalation cap silently.
+    # diff, and the depth gate's content bind refuses clearance on its "clean"
+    # sentinel — so emptying THIS one turns reviewed work into a false block.
     # Locked separately because a per-site deletion is what a future edit does:
     # MEASURED 2026-09-20, deleting --no-replace-objects from only this site left
     # all 31 tests in this file green while the plain staged diff went 4476B -> 0B
     # at rc=0. One hardened site does not lock its sibling.
     assert review_state._staged_content_hash(cwd=cwd) == base_staged, (
         "a replace ref emptied the PLAIN staged diff — _staged_content_hash would "
-        "return 'clean', and bump_review_round would stop counting the round"
+        "return 'clean', and the depth gate would refuse clearance for reviewed work"
     )
     assert review_scope.classify_change_substantiality(cwd=cwd) == base_level, (
         "a replace ref downgraded the substantiality classification"

@@ -175,43 +175,134 @@ CR_SEVERITIES = frozenset({"critical", "major", "minor", "trivial", "info"})
 # through :func:`cr_header_fields`, never by group number.
 CR_HEADER_FIELD_RE = re.compile(r"^(?:_([^_\n]{1,64})_|\*\*([^*\n]{1,64})\*\*)$")
 
+# THIRD layout, in two steps. MEASURED over all 1,162 top-level CodeRabbit inline
+# comments in this repo to 2026-10-31: from 2026-10-17 the body opens with
+# `<!-- coderabbit-ai-generated:v1 -->` ahead of the bold-pipe header (28), and
+# from 2026-10-25 the header draws the level's icon as HTML and joins its fields
+# with a middle dot (63 of 63):
+# `**<picture><img src="…/major-16.svg" …></picture> Major** · **Category** · **Effort**`.
+# The comment line ended the header search, the icon pushed the first field past
+# the 64-character bound, and the dot is not a `|`, so all 91 fell to the
+# unknown-format canary and no Major or Critical among them (1 Critical, 21 Major)
+# reached the always-fix floor. A lone comment line is skipped (cr_severity), the
+# icon is removed before a line is read, and `_cr_field_chunks` splits.
+_CR_MIDDLE_DOT = "\u00b7"
+#: Every real middle-dot header has three fields (level, category, effort).
+_CR_MIDDLE_DOT_MIN_FIELDS = 3
+#: CodeRabbit's own marker comment; the only comment line skipped before a header.
+_CR_MARKER_PREFIX = "<!-- coderabbit-"
+
+
+def _strip_icon_markup(line: str) -> str:
+    """``line`` without ``<picture>…</picture>`` spans or bare ``<img …>`` tags.
+
+    Plain ``str.find`` scanning rather than a regex: this runs on third-party text
+    on a hook path, where a backtracking pattern turned quadratic once already
+    (``cr_header_shaped``). Each step jumps to the next ``<picture`` or ``<img``,
+    so other ``<`` characters cost nothing. An unclosed span is left in place, so
+    the field reads only if it still fits the field bound, and then only the
+    level word after it.
+    """
+    if "<picture" not in line and "<img" not in line:
+        return line
+    out: list[str] = []
+    i = 0
+    # Each next position is cached and searched again only once the scan has passed
+    # it; -1 (none left) is never searched again. So every character is scanned a
+    # bounded number of times and the strip stays linear.
+    pic, img = line.find("<picture"), line.find("<img")
+    while True:
+        if 0 <= pic < i:
+            pic = line.find("<picture", i)
+        if 0 <= img < i:
+            img = line.find("<img", i)
+        j = min(pic, img) if pic >= 0 and img >= 0 else max(pic, img)
+        if j < 0:
+            out.append(line[i:])
+            break
+        out.append(line[i:j])
+        if j == pic:
+            end, close = line.find("</picture>", j), len("</picture>")
+        else:
+            end, close = line.find(">", j), 1
+        if end < 0:
+            out.append(line[j:])
+            break
+        i = end + close
+    return "".join(out)
+
+
+def is_cr_marker_line(line: str) -> bool:
+    """Whether a stripped ``line`` is CodeRabbit's marker comment and nothing else
+    (``<!-- coderabbit-ai-generated:v1 -->``).
+
+    The third layout opens with it, ahead of the header. Only CodeRabbit's own
+    marker is skipped, and only when it is the whole line: any other comment, or
+    text beside this one, ends the header search exactly as it did before.
+    """
+    return (
+        line.startswith(_CR_MARKER_PREFIX)
+        and line.endswith("-->")
+        and len(line) >= 7
+        and line.find("-->", 4) == len(line) - 3
+    )
+
 
 # A line that LOOKS like an attempted severity header — field markers and a
 # field separator — used only to tell "not a header" apart from "a header this
 # code failed to parse". Conflating those two makes an unparsed finding print
 # as "below Major", a false statement about a level that was never read.
+def _cr_field_chunks(line: str) -> list[str]:
+    """A header line split into its fields, icons removed.
+
+    ``|`` splits whenever the line has one, so a pipe header whose field holds a
+    middle dot (`**Security · Privacy** | **🟠 Major** | …`) reads exactly as it
+    always did. Only a line with no ``|`` splits on the middle dot, and only into
+    three or more fields, the shape every real third-layout header has: a
+    shorter split is prose and is returned whole, so it is not a header.
+    """
+    line = _strip_icon_markup(line)
+    if "|" in line:
+        return line.split("|")
+    chunks = line.split(_CR_MIDDLE_DOT)
+    return chunks if len(chunks) >= _CR_MIDDLE_DOT_MIN_FIELDS else [line]
+
+
 def cr_header_shaped(line: str) -> bool:
     """Whether ``line`` LOOKS like a header: opens and closes with one field
-    delimiter and has a ``|`` between. Linear on purpose: the regex form
+    delimiter and has a field separator between (``|``, or the third layout's
+    middle dot, see ``_cr_field_chunks``). Linear on purpose: the regex form
     (``^_.*\\|.*_$``) is quadratic on a long pipe-heavy line of third-party text,
     on a hook path (MEASURED: 3.4 s on a 60k-character line)."""
-    if "|" not in line:
+    chunks = _cr_field_chunks(line)
+    if len(chunks) < 2:
         return False
+    line = _strip_icon_markup(line)
     if len(line) > 2 and line.startswith("_") and line.endswith("_"):
         return True  # the italic shape, exactly as the regex it replaced read it
     # Bold: the FIRST field must itself be a complete bold span. A bold TITLE that
     # holds a pipe (`**Prefer `str | None` here.**`) opens and closes with `**`
     # too, and reading it as an unreadable header would count a Trivial's round.
-    first = line.split("|", 1)[0].strip()
+    first = chunks[0].strip()
     m = CR_HEADER_FIELD_RE.match(first)
     return line.endswith("**") and m is not None and m.group(2) is not None
 
 
 def cr_header_fields(line: str, *, skip_partial: bool = False) -> list[str] | None:
-    """The text of each ``|``-separated header field on ``line``, or None.
+    """The text of each header field on ``line`` (``_cr_field_chunks``), or None.
 
     A field is a COMPLETE italic or bold span (``CR_HEADER_FIELD_RE``). With
     ``skip_partial`` a chunk that is not one is dropped (the review-body reader,
     whose header can share a line with prose); without it, any such chunk means
-    the line is not a header. A BOLD field counts only on a line with a ``|``:
-    CodeRabbit's finding TITLE is a lone bold line, and reading it as a one-field
-    header would make every finding's title an unreadable header. Every real
-    bold header has three or more fields. The price: a bold header of ONE field
-    (never observed) reads as no header rather than as unknown format. An
-    italic field keeps its old reading, alone or not, so the italic corpus
-    parses exactly as before.
+    the line is not a header. A BOLD field counts only on a line with a field
+    separator: CodeRabbit's finding TITLE is a lone bold line, and reading it as a
+    one-field header would make every finding's title an unreadable header. Every
+    real bold header has three or more fields. The price: a bold header of ONE
+    field (never observed) reads as no header rather than as unknown format. An
+    italic field keeps its old reading, alone or not; a line with a ``|`` splits
+    only on ``|``, so every pipe header, italic or bold, parses exactly as before.
     """
-    chunks = line.split("|")
+    chunks = _cr_field_chunks(line)
     fields: list[str] = []
     for chunk in chunks:
         m = CR_HEADER_FIELD_RE.match(chunk.strip())
@@ -262,11 +353,15 @@ def cr_severity(body: str) -> tuple[str | None, bool]:
     first is a canary worth printing. A line that LOOKS like a header but does
     not fully parse counts as SEEN — reporting it as "below Major" would be a
     false statement about a level this code never actually read.
+
+    The header is the first non-blank line, except that CodeRabbit's own marker
+    comment ahead of it is skipped (``is_cr_marker_line``); a line's icon markup
+    is removed and its fields split as ``_cr_field_chunks`` describes.
     """
     for line in body.split("\n"):
         stripped = line.strip()
-        if not stripped:
-            continue
+        if not stripped or is_cr_marker_line(stripped):
+            continue  # the third layout opens with a marker comment
         fields = cr_header_fields(stripped)
         if fields is None:
             # Header-SHAPED but unparseable is a canary, not a clean miss.
