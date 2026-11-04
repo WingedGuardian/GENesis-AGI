@@ -1654,7 +1654,14 @@ if [ ! -f /usr/local/bin/genesis ]; then
 repo=$_repo_q
 cd "\$repo" 2>/dev/null || { echo "Genesis repo not found at \$repo"; exit 1; }
 # An interactive session gets a systemd scope of its own (scripts/slot_exec.sh),
-# so a memory-pressure kill takes this session and not the login it runs in.
+# with a memory cap, so a runaway session is contained inside its own scope.
+# Print mode and the informational flags stay in the caller's scope, as at the
+# bashrc door: a headless child must die with the session that started it.
+for arg in "\$@"; do
+    case "\$arg" in
+        -p|--print|--version|-v|--help|-h) exec claude "\$@" ;;
+    esac
+done
 if [ -t 0 ] && [ -t 1 ] && [ "\$(id -u)" != 0 ] && [ -x "\$repo/scripts/slot_exec.sh" ]; then
     exec "\$repo/scripts/slot_exec.sh" bare -- claude "\$@"
 fi

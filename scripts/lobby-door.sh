@@ -135,8 +135,12 @@ if [ -n "$_lobby_dir" ] && [ -x "$_lobby_dir/slot_exec.sh" ] \
         && ! tmux -u list-sessions >/dev/null 2>&1; then
     _server_scope=("$_lobby_dir/slot_exec.sh" --unit-prefix genesis-tmux --slice app.slice --omit server --)
 fi
+# A create that loses a race to a second door fails with "duplicate session"
+# while the session exists, so only a session that is still missing is reported.
 _session_exists "$WORKSPACE" \
-    || "${_server_scope[@]}" tmux new-session -d -s "$WORKSPACE" 2>/dev/null
+    || "${_server_scope[@]}" tmux new-session -d -s "$WORKSPACE" 2>/dev/null \
+    || _session_exists "$WORKSPACE" \
+    || printf 'lobby: could not create the lobby session (%s).\n' "$WORKSPACE" >&2
 
 # The PICKER is per-connection, so two live windows can never meet: one pid
 # cannot open two doors. Concurrency is not the only way a name can be taken,

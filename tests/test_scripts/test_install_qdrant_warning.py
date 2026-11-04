@@ -619,13 +619,12 @@ def _render_genesis_wrapper(repo_dir: str) -> str:
     return gen.stdout
 
 
-def test_generated_genesis_wrapper_scopes_only_an_interactive_launch(tmp_path):
-    """`genesis` on a terminal starts claude through scripts/slot_exec.sh (a
-    systemd scope of its own); a non-terminal call execs claude directly."""
-    import os
-    import pty
-    import select
+def _genesis_wrapper_rig(tmp_path):
+    """A rendered `genesis` launcher with claude, slot_exec.sh and id stubbed.
 
+    `id` is stubbed so the result never depends on the uid pytest runs as: the
+    launcher skips the scope for root, and a root CI runner must still exercise
+    the user branch. FAKE_UID picks the uid the launcher sees."""
     repo = tmp_path / "repo"
     (repo / "scripts").mkdir(parents=True)
     calls = tmp_path / "calls.log"
@@ -636,20 +635,24 @@ def test_generated_genesis_wrapper_scopes_only_an_interactive_launch(tmp_path):
     bindir.mkdir()
     (bindir / "claude").write_text(f'#!/bin/bash\necho "claude $*" >> {str(calls)!r}\n')
     (bindir / "claude").chmod(0o755)
+    (bindir / "id").write_text('#!/bin/bash\necho "${FAKE_UID:-1000}"\n')
+    (bindir / "id").chmod(0o755)
     wrapper = tmp_path / "genesis"
     wrapper.write_text(_render_genesis_wrapper(str(repo)))
     wrapper.chmod(0o755)
     env = {"PATH": f"{bindir}:/usr/bin:/bin", "HOME": str(tmp_path)}
+    return wrapper, calls, env
 
-    subprocess.run([str(wrapper), "--resume", "x"], env=env, stdin=subprocess.DEVNULL,
-                   capture_output=True, timeout=10, check=False)
-    assert calls.read_text().splitlines() == ["claude --resume x"]
 
-    calls.unlink()
+def _run_on_a_terminal(wrapper, args, env):
+    import os
+    import pty
+    import select
+
     pid, fd = pty.fork()
     if pid == 0:
         try:
-            os.execve(str(wrapper), [str(wrapper), "--resume", "x"], env)  # noqa: S606
+            os.execve(str(wrapper), [str(wrapper), *args], env)  # noqa: S606
         except Exception:  # noqa: BLE001
             os._exit(127)
     while True:
@@ -662,4 +665,32 @@ def test_generated_genesis_wrapper_scopes_only_an_interactive_launch(tmp_path):
         except OSError:
             break
     os.waitpid(pid, 0)
+
+
+def test_generated_genesis_wrapper_scopes_only_an_interactive_launch(tmp_path):
+    """`genesis` on a terminal starts claude through scripts/slot_exec.sh (a
+    systemd scope of its own); a non-terminal call execs claude directly."""
+    wrapper, calls, env = _genesis_wrapper_rig(tmp_path)
+
+    subprocess.run([str(wrapper), "--resume", "x"], env=env, stdin=subprocess.DEVNULL,
+                   capture_output=True, timeout=10, check=False)
+    assert calls.read_text().splitlines() == ["claude --resume x"]
+
+    calls.unlink()
+    _run_on_a_terminal(wrapper, ["--resume", "x"], env)
     assert calls.read_text().splitlines() == ["slot_exec bare -- claude --resume x"]
+
+
+@pytest.mark.parametrize("args", [["-p", "hi"], ["--print", "hi"], ["--version"], ["--resume", "x", "-h"]])
+def test_generated_genesis_wrapper_keeps_print_mode_in_its_callers_scope(tmp_path, args):
+    """Print mode and informational flags never get a scope, even on a
+    terminal: a headless child must die with the session that started it."""
+    wrapper, calls, env = _genesis_wrapper_rig(tmp_path)
+    _run_on_a_terminal(wrapper, args, env)
+    assert calls.read_text().splitlines() == ["claude " + " ".join(args)]
+
+
+def test_generated_genesis_wrapper_skips_the_scope_for_root(tmp_path):
+    wrapper, calls, env = _genesis_wrapper_rig(tmp_path)
+    _run_on_a_terminal(wrapper, ["--resume", "x"], {**env, "FAKE_UID": "0"})
+    assert calls.read_text().splitlines() == ["claude --resume x"]

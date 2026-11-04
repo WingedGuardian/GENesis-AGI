@@ -13,6 +13,17 @@
 #   slice budget the session had before (a new user-manager scope would
 #   otherwise get DefaultTasksMax). Its description is the label, never the
 #   command line: an argv can carry a prompt, and systemd logs the description.
+#   A slot scope (the default prefix, no --omit) also gets a memory cap,
+#   MemoryMax=55% of what systemd sees as the machine (SLOT_EXEC_MEMORY_MAX
+#   overrides) and MemorySwapMax=5% (SLOT_EXEC_SWAP_MAX), with
+#   OOMPolicy=continue. A session whose tree outgrows both loses its largest
+#   process to the kernel's OOM killer (and the next largest, if it is still
+#   over), only inside this scope, and the scope keeps running. The swap cap is what makes the memory cap bite:
+#   measured, with swap uncapped a scope over MemoryMax just swaps and nothing
+#   is killed, so a runaway would thrash the shared swap instead. oomd is not that containment: on
+#   systemd 255 one oomd action can kill several cgroups (a cgroup.threads pass
+#   fails with EINVAL and oomd moves on to the next candidate), so a slot that
+#   reaches the box-wide pressure line takes others with it.
 #
 # Why: every interactive Claude Code process used to inherit the cgroup of the
 # tmux SERVER that started its pane, and the tmux server lives wherever its
@@ -74,15 +85,19 @@ case "$slice" in
     *) slice="genesis-slots.slice" ;;
 esac
 
-# Already inside one of our slot scopes (a claude started from a shell that is
-# itself a slot's child): never nest. Only slot scopes count. The tmux server's
-# scope does not: a claude left in it by tmux's late pane move must still get a
-# scope of its own, or it would inherit the server's omit.
+# A slot request from inside one of our slot scopes (a claude started from a
+# shell that is itself a slot's child) never nests. Only slot scopes count. The
+# tmux server's scope does not: a claude left in it by tmux's late pane move
+# must still get a scope of its own, or it would inherit the server's omit. A
+# request for a DIFFERENT scope (a tmux server, --omit) always gets it: a tmux
+# server started from a slot shell must not live, and die, with that slot.
 # (SLOT_EXEC_CGROUP_FILE is a test seam; it defaults to the real file.)
+_slot_request=0
+[ "$prefix" = "genesis-slot" ] && [ "$omit" = "0" ] && _slot_request=1
 _cg=""
 read -r _cg < "${SLOT_EXEC_CGROUP_FILE:-/proc/self/cgroup}" 2>/dev/null || _cg=""
 case "$_cg" in
-    */genesis-slot-*.scope) exec "$@" ;;
+    */genesis-slot-*.scope) [ "$_slot_request" = "1" ] && exec "$@" ;;
 esac
 
 if ! command -v systemd-run >/dev/null 2>&1; then
@@ -103,8 +118,17 @@ if [ -z "${XDG_RUNTIME_DIR:-}" ] && [ -d "$_rt" ]; then
     _unset_xdg=(-u XDG_RUNTIME_DIR)
 fi
 
-_props=(-p TasksMax=infinity)
-[ "$omit" = "1" ] && _props+=(-p ManagedOOMPreference=omit)
+_base=(-p TasksMax=infinity)
+[ "$omit" = "1" ] && _base+=(-p ManagedOOMPreference=omit)
+_caps=()
+if [ "$_slot_request" = "1" ]; then
+    _mem="${SLOT_EXEC_MEMORY_MAX:-55%}"
+    _swap="${SLOT_EXEC_SWAP_MAX:-5%}"
+    # A malformed override falls back to the default, never to no cap.
+    [[ "$_mem" =~ ^(infinity|[1-9][0-9]?%|[1-9][0-9]*[KMGT])$ ]] || _mem="55%"
+    [[ "$_swap" =~ ^(infinity|0|[1-9][0-9]?%|[1-9][0-9]*[KMGT])$ ]] || _swap="5%"
+    _caps=(-p "MemoryMax=$_mem" -p "MemorySwapMax=$_swap")
+fi
 
 # systemd-run adds INVOCATION_ID for the new scope. Remove it unless the caller
 # already had one, which is restored as it was. (`env` reads its -u options
@@ -117,9 +141,55 @@ if [ -n "${INVOCATION_ID+x}" ]; then _inv=("INVOCATION_ID=$INVOCATION_ID"); fi
 # inside systemd-run. 15 s matches the invoker's probe of the same call
 # (src/genesis/cc/invoker.py): a user manager that cannot answer that fast would
 # also hang the launch, and an interactive launch has a person waiting on it.
+#
+# A slot's properties degrade one step at a time, never straight to no scope:
+#   1. caps + OOMPolicy=continue;
+#   2. caps alone, only when systemd refused OOMPolicy itself (a systemd that
+#      does not know the property on a scope; there a scope does not stop on
+#      an OOM kill);
+#   3. no caps, only when systemd refused a Memory property — said aloud;
+#   4. no scope at all — said aloud, today's behaviour before this wrapper.
+# A step down happens only when systemd-run's refusal NAMES the property
+# ("Unknown assignment: OOMPolicy=…", "Invalid OOMPolicy setting: …"). Any
+# other failure (a bus hiccup, a timeout) ends the ladder: dropping
+# OOMPolicy=continue where systemd does support it would let the first OOM
+# kill stop the whole scope, claude included.
 _err=""
-if ! _err=$(env "${_run_env[@]}" timeout -k 2 15 systemd-run --user --scope --quiet --collect \
-        --slice="$slice" "${_props[@]}" true 2>&1 >/dev/null); then
+_probe() {
+    _err=$(env "${_run_env[@]}" timeout -k 2 15 systemd-run --user --scope --quiet --collect \
+        --slice="$slice" "$@" true 2>&1 >/dev/null)
+}
+_tiers=()
+if [ "${#_caps[@]}" -gt 0 ]; then
+    _tiers=("caps-oom" "caps" "base")
+else
+    _tiers=("base")
+fi
+_props=()
+_cap_err=""
+for _tier in "${_tiers[@]}"; do
+    case "$_tier" in
+        caps-oom) _try=("${_base[@]}" "${_caps[@]}" -p OOMPolicy=continue) ;;
+        caps) _try=("${_base[@]}" "${_caps[@]}") ;;
+        base) _try=("${_base[@]}") ;;
+    esac
+    _probe "${_try[@]}"
+    _rc=$?
+    if [ "$_rc" = 0 ]; then
+        _props=("${_try[@]}")
+        if [ "$_tier" = "base" ] && [ "${#_caps[@]}" -gt 0 ]; then
+            echo "slot_exec: systemd refused the session memory cap (${_cap_err:-no detail}); starting in a scope without it." >&2
+        fi
+        break
+    fi
+    case "$_rc" in 124|137) _err="timed out after 15 s"; break ;; esac
+    case "$_tier:$_err" in
+        caps-oom:*OOMPolicy*) continue ;;
+        caps-oom:*Memory*|caps:*Memory*) _cap_err="${_err//$'\n'/ }"; continue ;;
+    esac
+    break
+done
+if [ "${#_props[@]}" = 0 ]; then
     _err="${_err//$'\n'/ }"
     echo "slot_exec: could not create a systemd scope (${_err:-no detail}); starting without one." >&2
     exec "$@"

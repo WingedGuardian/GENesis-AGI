@@ -98,8 +98,37 @@ systemd-oomd kills a whole cgroup, so what shares a cgroup dies together. Every
 interactive Claude Code session therefore starts in a systemd user scope of its
 own, `genesis-slot-<slot>-<hex>.scope` under `genesis-slots.slice`, through
 `scripts/slot_exec.sh`. The scope holds claude and everything it spawns (its MCP
-servers, subagents, tool commands), so an oomd action, or any later per-session
-limit, takes one session and nothing else.
+servers, subagents, tool commands). Two things follow:
+
+- **A per-session memory cap.** A slot scope carries `MemoryMax=55%` of what
+  systemd sees as the machine (its container limit when there is one; for
+  example about 17.6 GiB on a 32 GiB machine) and `MemorySwapMax=5%` of the
+  same, with `OOMPolicy=continue`. A session whose tree outgrows both loses
+  its largest process to the kernel's OOM killer, inside that scope only, and
+  the next largest if it is still over; the scope and its claude keep running
+  unless claude itself is chosen. No `MemoryHigh` is set: near the cap it would
+  throttle the session instead of ending the runaway. The swap cap is what makes the
+  memory cap bite: measured, with swap uncapped a scope over `MemoryMax`
+  swaps and nothing is killed, so a runaway would thrash the shared swap.
+  `SLOT_EXEC_MEMORY_MAX` and `SLOT_EXEC_SWAP_MAX` override the values (`20G`,
+  `40%`, `infinity`); a malformed value falls back to the default, never to
+  no cap. This is the containment a runaway session meets first. The value is
+  set so that one runaway session, with the rest of a typical workload, stays
+  below the box-wide pressure line where oomd acts; two runaway sessions at
+  once can still reach it. If systemd refuses the cap (older versions lack
+  `OOMPolicy=` on scopes, which is then dropped silently; a manager that
+  refuses the memory properties gets a scope without them, said aloud), the
+  session still gets its scope. It is an interim value, set ahead
+  of measured per-session footprints; the learned per-slot limit replaces it.
+- **A smaller oomd action.** An oomd kill no longer takes every slot at once.
+  It is not one session per action on systemd 255, though: after killing a
+  cgroup, oomd's second pass over `cgroup.threads` fails with EINVAL for any
+  non-leader thread (pidfd_open without `PIDFD_THREAD`), oomd counts the kill
+  as failed and moves on to the next candidate, until one kill returns
+  cleanly (a single-threaded or fast-exiting cgroup). So one action takes the
+  top candidate plus every cgroup ranked above the first clean kill. systemd
+  256 fixed this (`CGROUP_NO_PIDFD` in `cg_kill`); Ubuntu 24.04's 255 does not
+  have it (#3874).
 
 Why a wrapper is needed: a pane's claude used to inherit the cgroup of the tmux
 SERVER, and the server lives wherever its first client ran (a login session
@@ -150,8 +179,11 @@ How it works and what it changes:
   this change keeps its old cgroup until it is relaunched.
 - The scope adds no task cap (`TasksMax=infinity`; the per-user slice budget
   still applies) and its systemd description is the slot label, never the
-  command line. No memory limit is set on a slot scope yet. Per-slot throttle and ceiling
-  values arm only after measured per-session footprints exist.
+  command line. The memory cap above is the interim value; learned per-slot
+  throttle and ceiling values arm only after measured per-session footprints
+  exist. A cap kill shows up as a "cgroup OOM kill(s) detected" alert from the
+  disk guardian, on purpose: a session lost work.
+- The tmux server's scope has no memory cap: it holds only the server.
 
 ## The zram layer (guardian hosts)
 

@@ -832,13 +832,17 @@ verified: a8fa35a35 2026-10-23
 - **Each interactive session in its own systemd scope** (`scripts/slot_exec.sh`,
   called by `cc-slot.sh`, the bashrc `claude()` wrapper and interactive
   `gmodel`). LIVE once deployed. A slot's claude runs in
-  `genesis-slots.slice/genesis-slot-<slot>-<hex>.scope`, so systemd-oomd's unit
-  of action is one session. Without it every slot's claude sat in the tmux
+  `genesis-slots.slice/genesis-slot-<slot>-<hex>.scope` with an interim memory
+  cap (`MemoryMax=55%`, `OOMPolicy=continue`), so a runaway session loses its
+  largest process to the kernel inside its own scope. An oomd action no longer
+  takes every slot, but on systemd 255 it can take more than one cgroup (#3874).
+  Without it every slot's claude sat in the tmux
   server's cgroup (tmux 3.4 moves panes into scopes without waiting, so claude
   is forked first; MEASURED on a live install, all slots in one login scope). A
   tmux server the door starts gets its own `app.slice` scope (out of the
-  server's cgroup; its omit mark binds once oomd monitors the user manager). No
-  per-slot memory limit yet. Falls back to an unscoped launch, loudly, without
+  server's cgroup; its omit mark binds once oomd monitors the user manager). The
+  learned per-slot limit is not built yet. Degrades a step at a time: no
+  `OOMPolicy` on systemd before 253, then no cap, then (loudly) an unscoped launch without
   a user manager. Detail: `docs/reference/memory-resilience.md`, "Each
   interactive session in its own scope".
 

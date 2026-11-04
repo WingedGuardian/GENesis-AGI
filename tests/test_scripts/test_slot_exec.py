@@ -41,8 +41,12 @@ def shim(tmp_path):
     def run(*args: str, env_extra: dict | None = None):
         neutral = tmp_path / "cgroup-neutral"
         neutral.write_text("0::/user.slice/user-1000.slice/session-1.scope\n")
+        # Pin the runtime-dir seam to an absent path so no test depends on whether
+        # the host has /run/user/<uid> (CI runners do, the local sandbox hides it);
+        # the XDG tests pass their own.
         env = {"PATH": f"{bindir}:/usr/bin:/bin", "HOME": str(tmp_path), "SHIM_LOG": str(log),
-               "SLOT_EXEC_CGROUP_FILE": str(neutral)}
+               "SLOT_EXEC_CGROUP_FILE": str(neutral),
+               "SLOT_EXEC_RUNTIME_DIR": str(tmp_path / "no-runtime-dir")}
         env.update(env_extra or {})
         return subprocess.run(
             ["bash", str(_SCRIPT), *args], env=env, capture_output=True, text=True, timeout=30
@@ -120,7 +124,10 @@ def test_refused_probe_runs_the_command_unscoped_once(shim):
     assert r.returncode == 5
     assert r.stdout.count("ran") == 1
     assert "could not create a systemd scope (Failed to connect to bus)" in r.stderr
-    assert len(_calls(shim.log)) == 1, "a refused probe must not be followed by a scoped launch"
+    # A failure that names no property ends the ladder at the first probe,
+    # and is never followed by a scoped launch.
+    calls = _calls(shim.log)
+    assert len(calls) == 1 and calls[0].endswith(" true"), calls
 
 
 def test_no_systemd_run_runs_the_command_unscoped(tmp_path):
@@ -178,6 +185,52 @@ def test_nested_call_inside_a_slot_scope_does_not_wrap_again(shim, tmp_path):
     assert len(_calls(shim.log)) == 2, _calls(shim.log)
 
 
+def test_a_tmux_server_request_from_inside_a_slot_still_gets_its_own_scope(shim, tmp_path):
+    """The nesting skip covers slot requests only. A tmux server started from a
+    slot shell must not live, and die, with that slot."""
+    cg = tmp_path / "cgroup"
+    cg.write_text("0::/user.slice/user-1000.slice/user@1000.service/genesis.slice/genesis-slots.slice/genesis-slot-3-ab.scope\n")
+    r = shim("--unit-prefix", "genesis-tmux", "--slice", "app.slice", "--omit", "server", "--",
+             "bash", "-c", "echo ran", env_extra={"SLOT_EXEC_CGROUP_FILE": str(cg)})
+    assert r.stdout.strip() == "ran", r.stderr
+    calls = _calls(shim.log)
+    assert len(calls) == 2 and "--unit=genesis-tmux-server-" in calls[1], calls
+
+
+def test_a_slot_scope_asks_for_the_memory_and_swap_cap(shim):
+    r = shim("5", "--", "true")
+    assert r.returncode == 0, r.stderr
+    probe, launch = _calls(shim.log)
+    for call in (probe, launch):  # the probe proves systemd accepts both properties
+        assert "-p MemoryMax=55% -p MemorySwapMax=5% -p OOMPolicy=continue" in call, call
+
+
+def test_the_tmux_server_scope_has_no_memory_cap(shim):
+    shim("--unit-prefix", "genesis-tmux", "--slice", "app.slice", "--omit", "server", "--", "true")
+    assert not any("MemoryMax" in c or "MemorySwapMax" in c or "OOMPolicy" in c
+                   for c in _calls(shim.log))
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    ("20G", "20G"), ("40%", "40%"), ("infinity", "infinity"),
+    ("0%", "55%"), ("100%", "55%"), ("20g", "55%"), ("1G;x", "55%"), ("", "55%"),
+])
+def test_memory_cap_override_is_validated(shim, value, expected):
+    shim("5", "--", "true", env_extra={"SLOT_EXEC_MEMORY_MAX": value})
+    assert len(_calls(shim.log)) == 2, _calls(shim.log)
+    assert all(f"-p MemoryMax={expected} " in c for c in _calls(shim.log)), _calls(shim.log)
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    ("2G", "2G"), ("0", "0"), ("10%", "10%"), ("infinity", "infinity"),
+    ("-1", "5%"), ("2g", "5%"), ("1G x", "5%"), ("", "5%"),
+])
+def test_swap_cap_override_is_validated(shim, value, expected):
+    shim("5", "--", "true", env_extra={"SLOT_EXEC_SWAP_MAX": value})
+    assert len(_calls(shim.log)) == 2, _calls(shim.log)
+    assert all(f"-p MemorySwapMax={expected} " in c for c in _calls(shim.log)), _calls(shim.log)
+
+
 def test_no_task_cap_and_no_argv_in_the_description(shim):
     r = shim("4", "--", "bash", "-c", "echo secret-prompt-text")
     assert r.returncode == 0, r.stderr
@@ -218,3 +271,90 @@ def test_unsafe_slice_falls_back_to_the_default(shim, bad):
     assert r.returncode == 0, r.stderr
     assert all("--slice=genesis-slots.slice" in c for c in _calls(shim.log)), _calls(shim.log)
 
+
+
+_REFUSING_SHIM = """#!/usr/bin/env bash
+echo "ARGS=$*" >> "$SHIM_LOG"
+for a in "$@"; do
+    for bad in ${SHIM_REFUSE:-}; do
+        case "$a" in "$bad"*) echo "Unknown assignment: $a" >&2; exit 1 ;; esac
+    done
+done
+[ "${SHIM_TIMEOUT:-}" = 1 ] && exit 124
+if [ -n "${SHIM_FAIL_FIRST:-}" ] && [ ! -e "$SHIM_FAIL_FIRST" ]; then
+    : > "$SHIM_FAIL_FIRST"
+    echo "Failed to connect to bus: Resource temporarily unavailable" >&2
+    exit 1
+fi
+last=""
+for a in "$@"; do last="$a"; done
+[ "$last" = "true" ] && exit 0
+while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
+shift
+exec "$@"
+"""
+
+
+@pytest.fixture()
+def refusing(tmp_path):
+    bindir = tmp_path / "rbin"
+    bindir.mkdir()
+    s = bindir / "systemd-run"
+    s.write_text(_REFUSING_SHIM)
+    s.chmod(0o755)
+    log = tmp_path / "refusing.log"
+    neutral = tmp_path / "cg"
+    neutral.write_text("0::/user.slice/user-1000.slice/session-1.scope\n")
+
+    def run(refuse: str, **extra):
+        env = {"PATH": f"{bindir}:/usr/bin:/bin", "HOME": str(tmp_path), "SHIM_LOG": str(log),
+               "SLOT_EXEC_CGROUP_FILE": str(neutral), "SLOT_EXEC_RUNTIME_DIR": str(tmp_path / "none"),
+               "SHIM_REFUSE": refuse, **extra}
+        return subprocess.run(["bash", str(_SCRIPT), "5", "--", "bash", "-c", "echo ran"],
+                              env=env, capture_output=True, text=True, timeout=30)
+
+    run.log = log
+    return run
+
+
+def test_older_systemd_without_scope_oompolicy_keeps_the_scope_and_the_caps(refusing):
+    """systemd before 253 refuses OOMPolicy on a scope: the slot must still get
+    its scope and its caps, silently (the property was a no-op there)."""
+    r = refusing("OOMPolicy=")
+    assert r.stdout.strip() == "ran" and r.stderr == "", r.stderr
+    launch = _calls(refusing.log)[-1]
+    assert "--unit=genesis-slot-5-" in launch
+    assert "MemoryMax=55%" in launch and "OOMPolicy" not in launch
+
+
+def test_a_refused_memory_cap_keeps_the_scope_and_says_so(refusing):
+    r = refusing("OOMPolicy= MemoryMax=")
+    assert r.stdout.strip() == "ran"
+    assert "refused the session memory cap (" in r.stderr
+    assert "); starting in a scope without it" in r.stderr
+    launch = _calls(refusing.log)[-1]
+    assert "--unit=genesis-slot-5-" in launch and "MemoryMax" not in launch
+
+
+def test_a_failure_that_names_no_property_never_drops_oompolicy(refusing, tmp_path):
+    """A bus hiccup is not a refusal: stepping down would silently drop
+    OOMPolicy=continue on a systemd that supports it, so the first OOM kill
+    would stop the whole session. Such a failure ends the ladder."""
+    first = tmp_path / "first-call-done"
+    r = refusing("", SHIM_FAIL_FIRST=str(first))
+    assert r.stdout.strip() == "ran"
+    calls = _calls(refusing.log)
+    assert len(calls) == 1, calls
+    assert "could not create a systemd scope (Failed to connect to bus" in r.stderr, r.stderr
+
+
+def test_a_refused_cap_names_systemds_reason(refusing):
+    r = refusing("OOMPolicy= MemoryMax=")
+    assert "refused the session memory cap (Unknown assignment: MemoryMax=" in r.stderr, r.stderr
+
+
+def test_a_probe_timeout_is_not_retried(refusing):
+    r = refusing("", SHIM_TIMEOUT="1")
+    assert r.stdout.strip() == "ran"
+    assert "could not create a systemd scope (timed out after 15 s)" in r.stderr
+    assert len(_calls(refusing.log)) == 1, _calls(refusing.log)
