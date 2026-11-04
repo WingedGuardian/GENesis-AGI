@@ -48,9 +48,18 @@ of these hold:
   unknown;
 * the body is known: ``--body-file`` beats ``--body`` and the last of each wins (as
   gh reads them). A file is read only if it is regular, at most 256 KB (a bound on
-  the READ; GitHub's own body limit fits) and UTF-8, the create is the command's
-  FIRST step, and the text has no ``<(``/``>(``: any earlier step may write it
-  without looking like a writer (``rg --pre``, a process substitution). ``-F -`` and
+  the READ; GitHub's own body limit fits) and UTF-8, the raw command has no
+  ``<(``/``>(``, and either the create is the command's FIRST step or every earlier
+  step is proven unable to write it. An earlier step may write a file without
+  looking like a writer (``rg --pre``, a process substitution), so the proof is a
+  CLOSED allow-list (``_INERT``): every earlier segment runs ``cd``, ``echo``,
+  ``grep``, ``true``, ``test`` or ``[`` as its first raw word (no ``NAME=value``
+  before it, no wrapper such as ``env`` or ``command``, a substitution's own
+  segment counted too), no grep word starts ``--pre``, and the raw command
+  contains no ``tee`` and no ``>`` character, quoted or not, except in a token
+  (delimited by whitespace, ``;``, ``&&`` or ``||``) that is exactly ``2>&1`` or
+  ``2>/dev/null``. A relative
+  path behind a ``cd`` stays unknown (the cwd is). ``-F -`` and
   the ``"$(cat <<'EOF'`` idiom (matched whole, so a concatenated tail is never
   dropped) are read from the heredoc the parser excised. A ``--body`` value with any
   ``$`` or backtick, or with a substitution step, is unknown: the argv is past quote
@@ -90,7 +99,8 @@ KNOWN RESIDUALS (round-1 class audit; each is rare, and most err toward passing)
 * short ``=value`` booleans (``-e=false``, ``-w=false``) are tokens the gh table
   does not model, so the create passes unread;
 * ``GH_HOST``/``GH_REPO`` set only in the Bash tool's shell, not this hook's
-  environment, are not seen;
+  environment, are not seen; nor is a function or alias that shell defines for an
+  allow-listed name (``grep``), which the in-command redefinition check cannot see;
 * ``--attach`` appends to the body gh sends; ``prefer_editor_prompt`` makes gh
   refuse every create without a terminal; a ``url.<x>.insteadOf`` rewrite changes
   the remote gh sees but not the ``remote.*.url`` read here;
@@ -179,6 +189,19 @@ _PARSE_LIMIT_S = 4.0
 #: blocks it forever (MEASURED in review). 3 s bounds that well inside the hook's 10 s
 #: registration timeout, so a hung read costs 3 s and passes, not the full 10 s.
 _GIT_CONFIG_TIMEOUT_S = 3
+#: The CLOSED allow-list of programs an earlier step may run and still leave a body
+#: file readable (owner ruling): none of them can write a file. Deliberately not `rg`
+#: or `ag` (`--pre` runs a program), nor any other read-only tool: unlisted passes.
+_INERT = frozenset({"cd", "echo", "grep", "true", "test", "["})
+_TEE = re.compile(r"(?<![\w-])tee(?![\w-])")
+#: The only `>` spellings the rule above exempts, each matched as a WHOLE
+#: whitespace-delimited token of the raw command: neither can write the body file.
+#: Any other token with a `>` (`2>f`, `2>/dev/nullx`, `>/dev/null`, `&>`, `2>>`) counts.
+_STDERR_TOKENS = frozenset({"2>&1", "2>/dev/null"})
+#: Tokens end at whitespace and at the list separators `;`, `&&` and `||`, so
+#: `2>&1;` is the exempt token followed by a separator. Never `|` or `&` alone:
+#: `2>|f` writes, and `&` is part of `2>&1`.
+_TOKEN_SPLIT = re.compile(r"\s+|;|&&|\|\|")
 #: Steps that can make `gh` mean something else later in the same command.
 _REDEFINERS = frozenset({"alias", "unalias", "function", "hash", "enable"})
 #: An in-command assignment that can move gh's target (GIT_DIR, GH_REPO, GH_HOST, …).
@@ -401,7 +424,31 @@ def _read_body(path: str) -> str | None:
         os.close(fd)
 
 
-def _body_file(value, k, seg, text, cwd_known, cwd, heredoc):
+def _inert(seg) -> bool:
+    """The segment runs a program on ``_INERT`` directly: its first raw word is that
+    program (no ``NAME=value`` before it, no wrapper), and a grep has no ``--pre*``."""
+    if seg.exe not in _INERT:
+        return False
+    try:
+        words = shlex.split(seg.raw.lstrip("({! \t"), comments=True)
+    except ValueError:
+        return False
+    if not words or os.path.basename(words[0]) != seg.exe:
+        return False
+    return not (seg.exe == "grep" and any(w.startswith("--pre") for w in seg.argv[1:]))
+
+
+def _writes_nothing_before(earlier, raw: str) -> bool:
+    """No earlier step can have written the body file: each runs an ``_INERT``
+    program, and the raw command has no ``>`` (quoted or not) outside the two exempt
+    whole tokens in ``_STDERR_TOKENS``, and no ``tee``."""
+    words = _TOKEN_SPLIT.split(raw)
+    if any(">" in w and w not in _STDERR_TOKENS for w in words) or _TEE.search(raw):
+        return False
+    return all(_inert(s) for s in earlier)
+
+
+def _body_file(value, k, seg, segments, raw, cwd_known, cwd, heredoc):
     """(body, where it was read from), or None when the body cannot be known."""
     if value == "-":
         if heredoc is not None and k == 0 and seg.depth == 0:
@@ -409,8 +456,10 @@ def _body_file(value, k, seg, text, cwd_known, cwd, heredoc):
         return None
     if not value or "$" in value or "`" in value or any(c in value for c in "*?["):
         return None
-    if k != 0 or "<(" in text or ">(" in text:
-        return None  # an earlier or concurrent step may write it: the file now is stale
+    if "<(" in raw or ">(" in raw:
+        return None  # a process substitution runs with no segment of its own
+    if k and not _writes_nothing_before(segments[:k], raw):
+        return None  # an earlier step may write it: the file now is stale
     path = os.path.expanduser(value)
     if not os.path.isabs(path):
         if not cwd_known or not cwd:
@@ -420,7 +469,7 @@ def _body_file(value, k, seg, text, cwd_known, cwd, heredoc):
     return None if body is None else (body, path)
 
 
-def _body(opts, k, seg, segments, text, cwd_known, cwd, heredoc):
+def _body(opts, k, seg, segments, raw, cwd_known, cwd, heredoc):
     # A substitution inside the create runs before gh reads the body, and may write
     # its file or build its text: unknown, except the `$(cat <<'EOF'` idiom's own cat.
     children = _children(segments, k)
@@ -428,7 +477,7 @@ def _body(opts, k, seg, segments, text, cwd_known, cwd, heredoc):
     if files:
         if children:
             return None
-        return _body_file(files[-1], k, seg, text, cwd_known, cwd, heredoc)
+        return _body_file(files[-1], k, seg, segments, raw, cwd_known, cwd, heredoc)
     bodies = [v for n, v in opts if n in ("-b", "--body")]
     if not bodies:
         return None  # gh needs a terminal to ask for one
@@ -442,7 +491,7 @@ def _body(opts, k, seg, segments, text, cwd_known, cwd, heredoc):
     return value, "the --body argument"
 
 
-def _judge_create(k, seg, inv, segments, positions, text, openers, heredoc, cwd):
+def _judge_create(k, seg, inv, segments, positions, text, openers, heredoc, cwd, raw):
     """The block reason for one create segment, or None (pass)."""
     pos = positions[k]
     if openers and (pos is None or any(o < pos for o in openers)):
@@ -483,7 +532,7 @@ def _judge_create(k, seg, inv, segments, positions, text, openers, heredoc, cwd)
             return None
         if not _cwd_targets(cwd, canonical):
             return None
-    found = _body(opts, k, seg, segments, text, cwd_known, cwd, heredoc)
+    found = _body(opts, k, seg, segments, raw, cwd_known, cwd, heredoc)
     if found is None:
         return None
     labels: list[str] = []
@@ -548,7 +597,9 @@ def _judge(command: str, cwd) -> list[str]:
             or inv.subcommand not in sp.GH_ISSUE_CREATE_SUBCOMMANDS
         ):
             continue
-        reason = _judge_create(k, seg, inv, segments, positions, text, openers, heredoc, cwd)
+        reason = _judge_create(
+            k, seg, inv, segments, positions, text, openers, heredoc, cwd, command
+        )
         if reason:
             reasons.append(reason)
     return reasons

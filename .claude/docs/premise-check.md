@@ -50,7 +50,12 @@ reports filed through the bug-report form, are not newly labelled.
 that same rule: the PreToolUse hook `scripts/hooks/issue_premise_gate.py` blocks a
 create whose body would be labelled, and names the missing answers. It judges only
 a body it can read in full (a `--body` literal with no `$` or backtick, a
-`--body-file` read by the command's first step, or the heredoc in `-F - <<'EOF'`)
+`--body-file` that no earlier step can have written, or the heredoc in
+`-F - <<'EOF'`). Earlier steps are trusted only from a closed list of programs
+that cannot write a file (`cd`, `echo`, `grep`, `true`, `test`, `[`), run directly,
+in a command with no `<(`, no `tee` and no `>` anywhere except the whole tokens
+`2>&1` and `2>/dev/null`; a relative path after a
+`cd` is never read.
 bound for the configured public repo, and passes everything else.
 Dispatched sessions are never blocked.
 

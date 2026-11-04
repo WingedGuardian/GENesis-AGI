@@ -6,8 +6,9 @@ What the design promises, and so what is tested:
   and whose target is the configured public repo, when
   ``premise_gate.owed_answers`` (the server gate's own rule) says answers are owed;
 * every shape it cannot read passes in silence: a heredoc it did not excise, a
-  substitution or any ``$``/backtick in a ``--body``, an earlier ``cd``, a body file
-  behind any earlier step, an unknown flag, another repo, an unreadable file, a
+  substitution or any ``$``/backtick in a ``--body``, an earlier ``cd`` (for an
+  implicit target or a relative body file), a body file behind any earlier step off
+  the closed allow-list or in a command with a ``>`` or ``tee``, an unknown flag, another repo, an unreadable file, a
   create with no title, a boolean flag gh would refuse;
 * a dispatched session (``GENESIS_CC_SESSION=1``) is never blocked;
 * it agrees with ``premise_gate.decide`` on an ``opened`` event, cell for cell;
@@ -633,15 +634,15 @@ def test_15_an_earlier_write_to_the_body_file_makes_it_unreadable(monkeypatch, c
         assert _call(monkeypatch, capsys, f"{writer} && {create}")[0] == 0, writer
 
 
-def test_15b_any_earlier_step_makes_the_file_unknown(monkeypatch, capsys, tmp_path):
+def test_15b_an_earlier_step_outside_the_allow_list_makes_the_file_unknown(
+    monkeypatch, capsys, tmp_path
+):
     """LOW-1: a writer need not name the file (`make body`, a checkout). Round 1: nor
-    need it look like one (`rg --pre`, a process substitution), so no earlier step is
-    trusted, read-only or not."""
+    need it look like one (`rg --pre`, a process substitution), so only the closed
+    allow-list of programs that cannot write is trusted; read-only is not enough."""
     f = _file(tmp_path, MISSING)
     create = _create("-F", str(f))
-    for step in ("make body", "git checkout other", "python3 gen.py"):
-        assert _call(monkeypatch, capsys, f"{step} && {create}")[0] == 0, step
-    for step in ("true", "echo starting", "ls", f"test -f {f}", f"grep -c x {f}", f"wc -l {f}"):
+    for step in ("make body", "git checkout other", "python3 gen.py", "ls", f"wc -l {f}"):
         assert _call(monkeypatch, capsys, f"{step} && {create}")[0] == 0, step
 
 
@@ -862,7 +863,9 @@ def test_r1_the_heredoc_idiom_is_matched_whole(monkeypatch, capsys):
     assert _call(monkeypatch, capsys, plain)[0] == 2  # control: the whole idiom
 
 
-def test_r1_a_body_file_is_read_only_when_the_create_runs_first(monkeypatch, capsys, tmp_path):
+def test_r1_a_writer_that_does_not_look_like_one_makes_the_file_unknown(
+    monkeypatch, capsys, tmp_path
+):
     """An earlier step can write the file without looking like a writer: `rg --pre`
     runs a program, and a process substitution has no segment of its own."""
     six = _file(tmp_path, SIX, "six.md")
@@ -873,6 +876,101 @@ def test_r1_a_body_file_is_read_only_when_the_create_runs_first(monkeypatch, cap
     assert _call(monkeypatch, capsys, f"rg --pre ./w.sh x {six} ; {create}")[0] == 0
     assert _call(monkeypatch, capsys, f"{create} | cat <(cp {six} {f})")[0] == 0
     assert _call(monkeypatch, capsys, f"{create} > >(cat)")[0] == 0
+
+
+def test_r2_earlier_steps_on_the_allow_list_let_a_body_file_be_read(monkeypatch, capsys, tmp_path):
+    """Round 2 (owner ruling): `cd`, `echo`, `grep`, `true`, `test` and `[` cannot
+    write a file, so a body file behind them is read. MEASURED over 776 real creates:
+    217 literal-path `-F` creates went unread, 133 behind only a `cd`."""
+    f = _file(tmp_path, MISSING, "missing.md")
+    six = _file(tmp_path, SIX, "six.md")
+    for step in (
+        f"cd {tmp_path}",
+        f"grep -nE 'premise|Summary' {f}",
+        "echo hi",
+        "true",
+        f"test -f {f}",
+        f"[ -f {f} ]",
+        f"cd {tmp_path} && grep -c x {f}",
+    ):
+        for sep in (" && ", "; "):
+            code, _, err = _call(monkeypatch, capsys, step + sep + _create("-F", str(f)))
+            assert code == 2, (step, sep)
+            assert f"body read from {f}" in err
+            # control: the same shape with a complete body passes
+            assert _call(monkeypatch, capsys, step + sep + _create("-F", str(six)))[0] == 0
+
+
+@pytest.mark.parametrize(
+    "step",
+    [
+        "python3 x.py && ",  # a program off the list
+        "cat > {f} <<'EOF'\n## Premise checks\nEOF\n",  # a writer, with a heredoc
+        "grep x a.md > {f}; ",  # an allowed program, redirected
+        "echo 'a>b' && ",  # any `>` in the text, even a quoted one
+        "echo x | tee {f}; ",  # tee is off the list
+        "grep tee a.md && ",  # and its name anywhere in the text
+        "rg --pre ./w.sh x a.md; ",  # rg is off the list
+        "grep --pre ./w.sh x a.md && ",  # a grep option spelled --pre*
+        "grep --pre=./w.sh x a.md && ",
+        "cat <(cp a.md {f}); ",  # a process substitution, off-list program
+        "echo <(cp a.md {f}); ",  # a process substitution, allowed program
+        "sed -i s/a/b/ {f} && ",
+        "echo $(cp a.md {f}) && ",  # a substitution's own segment is off the list
+        "FOO=1 grep x a.md && ",  # an assignment before an allowed program
+        "env grep x a.md && ",  # a wrapper before it
+        "command grep x a.md && ",
+        "grep() { cp a.md {f}; }; grep x a.md && ",  # a redefinition
+        "pushd /tmp && ",
+    ],
+)
+def test_r2_anything_not_proven_inert_keeps_the_body_file_unknown(
+    monkeypatch, capsys, tmp_path, step
+):
+    f = _file(tmp_path, MISSING)
+    create = _create("-F", str(f))
+    assert _call(monkeypatch, capsys, create)[0] == 2  # control: the create alone
+    assert _call(monkeypatch, capsys, step.replace("{f}", str(f)) + create)[0] == 0
+
+
+def test_r2_two_stderr_spellings_are_exempt_from_the_no_redirection_rule(
+    monkeypatch, capsys, tmp_path
+):
+    """`2>&1` and `2>/dev/null`, as whole whitespace-delimited tokens, cannot write the
+    body file. MEASURED: 43 of the creates the strict rule left unread carried one."""
+    f = _file(tmp_path, MISSING)
+    create = _create("-F", str(f))
+    for step in (
+        f"grep x {f} 2>/dev/null && ",
+        f"grep x {f} 2>&1; ",
+        f"cd {tmp_path} 2>/dev/null && grep -c x {f} 2>&1 && ",
+    ):
+        assert _call(monkeypatch, capsys, step + create)[0] == 2, step
+    for step in (
+        f"grep x a.md 2>{f} && ",
+        "grep x a.md 2>/dev/nullx && ",
+        "grep x a.md >/dev/null && ",
+        "grep x a.md &>/dev/null && ",
+        "grep x a.md 2>>/dev/null && ",
+        "grep x a.md 1>&2 && ",
+        f"grep x a.md 2>|{f} && ",  # a noclobber override, split at no `|`
+        f"grep x a.md 2>&1|tee {f}; ",
+        "grep x a.md 2> /dev/null && ",
+        f"echo '2>/dev/null'>{f} && ",
+        f"grep x a.md 2>/dev/null >{f} && ",
+    ):
+        assert _call(monkeypatch, capsys, step + create)[0] == 0, step
+
+
+def test_r2_a_relative_body_file_after_a_cd_stays_unknown(monkeypatch, capsys, tmp_path):
+    _file(tmp_path, MISSING)
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    _file(sub, MISSING)
+    rel = _create("-F", "issue.md")
+    assert _call(monkeypatch, capsys, "echo hi && " + rel, cwd=tmp_path)[0] == 2  # control
+    assert _call(monkeypatch, capsys, "cd sub && " + rel, cwd=tmp_path)[0] == 0
+    assert _call(monkeypatch, capsys, f"cd {sub} && " + rel, cwd=tmp_path)[0] == 0
 
 
 def test_r1_a_resolved_default_other_than_base_is_unknown(monkeypatch, capsys, tmp_path):
@@ -1031,7 +1129,8 @@ def _judged(sub, shape, rpos, wrap):
         # Only a first-line `gh issue create … <<'EOF'` is excised by the parser.
         return wrap == "single" and rpos != "before" and sub == "create"
     if shape == "-F file":
-        return wrap == "single"  # a file is read only when the create is the first step
+        # read when every earlier step is on the allow-list (`true` is); `bash -c` is not
+        return wrap in ("single", "&&", ";")
     return True
 
 
