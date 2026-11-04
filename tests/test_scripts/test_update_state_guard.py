@@ -1256,3 +1256,17 @@ def test_r4_a_runtime_rewrite_of_an_ephemeral_path_is_not_a_forward_mixed_tree(
     (root / path).write_text("regenerated at runtime\n")
     got, reason = _live_verdict(guard, live, {**_adopted_row(live), "own_head": tip})
     assert got == verdict, reason
+
+
+def test_the_residue_read_never_rewrites_the_index(guard, repo):
+    """Codex c4463433358: deploy health asks this guard while a deploy may be
+    running, so its ``git status`` must not refresh the index (it takes
+    index.lock, which fails a concurrent writer). A stale cached stat is the
+    case that makes plain ``git status`` rewrite the index."""
+    root = repo["root"]
+    time.sleep(1.1)
+    os.utime(root / "a.txt")  # same bytes, newer mtime: the cached stat is stale
+    index = root / ".git" / "index"
+    before = index.read_bytes()
+    assert guard._merge_residue(str(root), repo["base"], repo["base"], True) == []
+    assert index.read_bytes() == before

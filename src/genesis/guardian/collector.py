@@ -505,6 +505,10 @@ _REPAIR_JOURNAL = (
 _REPAIR_NAME = r"([0-9]{8}T[0-9]{6}Z-[0-9]+)\-live\-move\-repair"
 _REPAIR_REPORT_BYTES = 4 * 1024 * 1024  # D1 writes about 0.5 KB per path
 _REPAIR_REPO_BYTES = 4096
+# The longest repo value the pick reads: the writer's json.dump escapes each
+# non-UTF-8 byte of the path as six characters (\udcXX), plus the quotes and
+# the trailing comma. A longer `result` reads as None, so the report is shown.
+_REPAIR_TOP_CHARS = 6 * _REPAIR_REPO_BYTES + 3
 _REPAIR_WINDOW_S = 6 * 3600  # the journal read's window
 _REPAIR_MARK = "REPAIR.json\n"  # a login shell may print first
 _REPAIR_PICK = (
@@ -523,7 +527,7 @@ def same_repo(named):  # the loader's same_repo
         return False
 
 def top(raw, key):  # a top-level scalar of the writer's indent-2 JSON, or None
-    m = re.search(rb'\n  "' + key + rb'": ([^\n]{0,20000})\n', raw)
+    m = re.search(rb'\n  "' + key + rb'": ([^\n]{0,@TOP@})\n', raw)
     return json.loads(m.group(1).rstrip(b",")) if m else None
 
 try:
@@ -566,6 +570,7 @@ for name in names:
     break
 """.replace("@CAP@", str(_REPAIR_REPORT_BYTES))
     .replace("@REPO@", str(_REPAIR_REPO_BYTES))
+    .replace("@TOP@", str(_REPAIR_TOP_CHARS))
     .replace("@NAME@", repr(_REPAIR_NAME))
     .replace("@WINDOW@", str(_REPAIR_WINDOW_S))
     .replace("@MARK@", repr(_REPAIR_MARK))

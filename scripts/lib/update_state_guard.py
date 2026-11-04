@@ -140,7 +140,12 @@ _TIMEOUT_S = 120
 
 def _env() -> dict[str, str]:
     # Local reads only; GIT_* from the caller would point git elsewhere.
-    return {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    # GIT_OPTIONAL_LOCKS=0: deploy health asks while a deploy may be running,
+    # and `git status` would otherwise refresh the index under index.lock,
+    # failing a concurrent writer (MEASURED: a stale cached stat rewrites it).
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    return env
 
 
 def _rev(repo: str, rev: str) -> str:

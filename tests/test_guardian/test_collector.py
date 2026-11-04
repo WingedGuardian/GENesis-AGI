@@ -442,6 +442,30 @@ def test_report_pick_surfaces_an_over_cap_report_instead_of_an_older_one(tmp_pat
     assert len(out) <= len(gc._REPAIR_MARK) + gc._REPAIR_REPORT_BYTES
 
 
+def test_report_pick_reads_the_repo_of_a_long_non_utf8_checkout(tmp_path):
+    """Codex c4463433353: the writer escapes each non-UTF-8 byte of the repo
+    path as six characters, so a path the loader accepts (4096 bytes) can run
+    past a fixed 20,000-character field bound; the over-cap report must still
+    be shown, not skipped as if it named another checkout."""
+    import os
+
+    import genesis.guardian.collector as gc
+
+    home = tmp_path
+    for _ in range(17):  # 17 x 200 non-UTF-8 bytes: over 20,000 characters escaped
+        home = home / os.fsdecode(b"\xff" * 200)
+    home.mkdir(parents=True)
+    report = _mine(home)
+    assert len(json.dumps(report["repo"])) > 20_000
+    assert len(os.fsencode(report["repo"])) <= gc._REPAIR_REPO_BYTES
+    ts = _ts()
+    big = _writer_bytes(_mine(home, ts=ts), pad_rows=25_000)
+    assert len(big) > gc._REPAIR_REPORT_BYTES
+    (_backup_dir(home, ts) / "REPAIR.json").write_bytes(big)
+    out = _pick(home)
+    assert b"report too large" in out, out[:300]
+
+
 def test_report_pick_never_follows_a_symlinked_report(tmp_path):
     """A report symlinked to a file elsewhere is not read: only the repair's own
     files are the repair's report."""
