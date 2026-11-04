@@ -680,7 +680,7 @@ def test_an_unchanged_edit_is_not_backed_up_twice(dirty_checkout, tmp_path):
 
 def test_the_rollback_saves_edits_before_its_reset():
     text = update_text()
-    start = text.index("_do_rollback() {")
+    start = text.index("_rollback_body() {")
     body = text[start : text.index("\n}\n", start)]
     body = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("#"))
     assert 'genesis_rollback_checkout "$GENESIS_ROOT" "$ROLLBACK_TAG" "$ORIGINAL_BRANCH"' in body

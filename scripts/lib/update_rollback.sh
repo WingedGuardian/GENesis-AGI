@@ -8,6 +8,13 @@
 # update.sh.
 #
 # Reads update.sh's globals when called, never when sourced.
+#
+# A failed update runs the copy of this file its own merge brought in, under the
+# update.sh that launched the run: update_rollback_abi is the contract between
+# them. Change what this file needs from that script, or what it expects update.sh
+# to have written, and bump the number: that update then falls back to the rollback
+# it launched with. After a checkout restore this runs over the OLD tree, so reach
+# helpers through $SCRIPT_DIR/lib, never through $GENESIS_ROOT.
 # BEGIN restart-owed (extracted by tests/test_scripts/test_bootstrap_crash_restart.py)
 # The restart an update owes genesis-server (#3451). update.sh writes it
 # immediately before it stops the server (and refuses to stop the server when it
@@ -769,7 +776,7 @@ _server_health_ok() {
 }
 # END deploy-outcome-probes
 
-_do_rollback() {
+_rollback_body() {
     local reason="$1"
     local degraded="${2:-}"
     # 1 = a restarted genesis-server must also answer its health endpoint before
@@ -1197,4 +1204,67 @@ with open(sys.argv[11], 'w') as f:
         echo "  NOT fully rolled back — see CRITICAL above. Pre-update state: $OLD_TAG ($OLD_COMMIT) on $ORIGINAL_BRANCH"
     fi
     echo ""
+}
+
+# The contract with the update.sh that launched the run.
+update_rollback_abi() { echo 1; }
+
+# What this file and the libs loaded with it need from that update.sh, checked before
+# any of it is loaded for real. Prints what is missing and returns 1.
+update_rollback_needs_met() {
+    local name missing=""
+    for name in _metadata_python; do
+        declare -F "$name" >/dev/null 2>&1 || missing+=" $name()"
+    done
+    for name in DB_FILE DB_RESTORE_OWED DB_SNAPSHOT_TAKEN DEPLOY_HEAD DEPS_STATE_FILE DEPS_STATE_TAKEN \
+        GENESIS_ROOT MERGE_ATTEMPTED NEW_COMMIT NEW_TAG OLD_COMMIT OLD_TAG ORIGINAL_BRANCH \
+        PRE_UPDATE_DEGRADED ROLLBACK_TAG STARTED_AT STATE_FILE UPDATE_OWN_HEAD VENV_DIR \
+        WERE_RUNNING _CHECKOUT_LOCK_BUSY _LIVE_CHECKOUT_PY _SERVER_DIRECT_PID _UPDATE_LOCK_FD; do
+        declare -p "$name" >/dev/null 2>&1 || missing+=" $name"
+    done
+    [ -z "$missing" ] && return 0
+    echo "the launching update.sh does not set:$missing"
+    return 1
+}
+
+# Entered by update.sh's _do_rollback, with this file loaded, in place of the
+# launched rollback. <staged root> holds the merged scripts/lib, kept out of the
+# checkout because the rollback moves the checkout back.
+update_rollback_enter() {
+    local staged="$1"
+    shift
+    SCRIPT_DIR="$staged/scripts"
+    _use_merged_package_helpers
+    _rollback_body "$@"
+}
+
+# The package restore runs the helpers copied beside its record, taken before the
+# merge. Use the merged ones only if they can do what the restore asks of them. Copied
+# beside the record first and renamed into place: this may be running on a full disk,
+# and a failed copy over the working helpers would leave neither.
+_use_merged_package_helpers() {
+    local record="${DEPS_STATE_FILE:-}" lib trial sub ok=1 f
+    [ "${DEPS_STATE_TAKEN:-0}" = 1 ] || return 0
+    lib="${record%.json}.lib"
+    [ -d "$lib" ] || return 0
+    # Named *.lib, so disk hygiene sweeps one a killed run leaves.
+    trial="${record%.json}.merged.lib"
+    rm -rf -- "$trial" 2>/dev/null
+    if ! mkdir -m 700 "$trial" 2>/dev/null || ! cp "$SCRIPT_DIR"/lib/venv_*.py "$trial/" 2>/dev/null; then
+        echo "  WARNING: could not copy the merged package helpers; using the ones taken before the merge."
+        rm -rf -- "$trial" 2>/dev/null
+        return 0
+    fi
+    for sub in extras requirements missing; do
+        "$VENV_DIR/bin/python" -P "$trial/venv_state.py" "$sub" "$record" >/dev/null 2>&1 || ok=0
+    done
+    "$VENV_DIR/bin/python" -P "$trial/venv_missing_files.py" >/dev/null 2>&1 || ok=0
+    if [ "$ok" = 1 ]; then
+        for f in "$trial"/*; do
+            mv -f -- "$f" "$lib/" 2>/dev/null || ok=0
+        done
+    else
+        echo "  The merged package helpers cannot read the package record; using the ones taken before the merge."
+    fi
+    rm -rf -- "$trial" 2>/dev/null
 }

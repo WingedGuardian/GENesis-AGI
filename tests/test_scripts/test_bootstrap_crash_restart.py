@@ -991,7 +991,7 @@ def test_a_refused_stop_removes_the_record_its_failed_write_left(tmp_path, prior
 
 
 def _rollback_until_its_stop(text: str) -> str:
-    start = text.index("_do_rollback() {\n")
+    start = text.index("_rollback_body() {\n")
     end = text.index("    _stop_genesis_server\n", start) + len("    _stop_genesis_server\n")
     return text[start:end] + "}\n"
 
@@ -1012,7 +1012,7 @@ def test_a_rollback_records_the_restart_before_it_stops_the_server(tmp_path):
             + f"WERE_RUNNING=({were})\n"
             + _rollback_until_its_stop(text)
             + "_stop_genesis_server() { kill -KILL $$; }\n"
-            + '_do_rollback "1 service(s) failed to start: genesis-bridge"\n'
+            + '_rollback_body "1 service(s) failed to start: genesis-bridge"\n'
         )
         r = _sh(tmp_path, home, script)
         assert r.returncode == -9, r.stdout + r.stderr

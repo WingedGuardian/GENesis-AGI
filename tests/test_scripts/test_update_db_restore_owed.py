@@ -310,7 +310,7 @@ def test_the_comparison_runs_on_system_python_not_the_venv():
 
 def test_the_rollback_measures_immediately_before_deciding():
     text = update_text()
-    body = text[text.index("_do_rollback() {") :]
+    body = text[text.index("_rollback_body() {") :]
     measure = body.index('    _measure_db_restore_owed "$code_action" "$server_down"\n')
     decide = body.index("# BEGIN rollback-db-decision")
     assert measure < decide
