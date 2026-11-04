@@ -186,13 +186,15 @@ def test_bound():
     print("GIT_EFFECTIVE=" + _git("config", "--list", "--show-origin", "--name-only"))
     print("GIT_HELPER=" + _git("config", "--get", "credential.helper"))
     # Guard-the-guard: without the closure's git variables the same child does
-    # read the fixture's helpers, so the fixture really plants them.
-    closed = ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_SYSTEM")
-    unclosed = {k: v for k, v in os.environ.items() if k not in closed}
+    # read the fixture's helpers, so the fixture really plants them. Only under
+    # that fixture: anywhere else these would read this machine's real config,
+    # and _subrun prints this output when a run fails.
     if os.environ.get("CLOSURE_PROBE_SYSTEM_CFG"):
+        closed = ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_SYSTEM")
+        unclosed = {k: v for k, v in os.environ.items() if k not in closed}
         unclosed["GIT_CONFIG_SYSTEM"] = os.environ["CLOSURE_PROBE_SYSTEM_CFG"]
-    print("GIT_HELPER_UNCLOSED=" + _git("config", "--get", "credential.helper", env=unclosed))
-    print("GIT_SYSTEM_UNCLOSED=" + _git("config", "--system", "--list", env=unclosed))
+        print("GIT_HELPER_UNCLOSED=" + _git("config", "--get", "credential.helper", env=unclosed))
+        print("GIT_SYSTEM_UNCLOSED=" + _git("config", "--system", "--list", env=unclosed))
 """
 
 
