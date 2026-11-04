@@ -556,6 +556,7 @@ def test_the_scan_sees_each_shape_it_claims(tmp_path):
 _RELOAD = (
     "scripts/lib/index_marker.py",
     "scripts/lib/index_marker_legacy.py",
+    "scripts/lib/index_marker_legs.py",
     "scripts/hooks/worktree_claim.py",
     "scripts/hooks/secret_scrub.py",
 )

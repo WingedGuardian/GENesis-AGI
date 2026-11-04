@@ -1,4 +1,4 @@
-"""The incomplete automatic protocol refuses before every automatic queue action.
+"""The incomplete provider protocol refuses before every automatic queue action.
 
 Positive provider dispatch belongs to the checked consumer. These transitional
 tests exercise actual refusal, unchanged idle predicates and explicit queue CLI
@@ -159,12 +159,8 @@ def test_readiness_observation_errors_stop_before_queue_actions(tmp_path, state)
     database = _mdir(tmp_path) / "queue.sqlite3"
     with closing(sqlite3.connect(database, isolation_level=None)) as db:
         if state == "flag-enabled":
-            # Only the observational schema3 fixture has this protocol field;
-            # this predecessor's explicit writer still creates schema2.
-            db.execute("PRAGMA user_version=3")
-            db.execute("INSERT INTO queue_meta VALUES('automatic_protocol_ready','1')")
+            db.execute("UPDATE queue_meta SET value='1' WHERE key='automatic_protocol_ready'")
         elif state == "flag-missing":
-            db.execute("PRAGMA user_version=3")
             db.execute("DELETE FROM queue_meta WHERE key='automatic_protocol_ready'")
         if state == "corrupt":
             database.write_bytes(b"owned corrupt queue")
@@ -200,32 +196,21 @@ def test_missing_marker_helper_is_explicit_deferral(tmp_path):
     assert "helper missing" in (tmp_path / ".genesis/code-intelligence-runner.log").read_text()
 
 
-def test_cli_exceptions_cannot_look_like_empty_claims(tmp_path):
-    _seed_marker(tmp_path, tools="cbm")
-    empty = _cli(tmp_path, "claim", "--hash", "0" * 16)
-    assert empty.returncode == 1 and not empty.stdout
-    (_mdir(tmp_path) / "queue.sqlite3").write_bytes(b"owned corrupt queue")
-    failed = _cli(tmp_path, "list")
-    assert failed.returncode == 2 and not failed.stdout
-    assert "Traceback" in failed.stderr and "DatabaseError" in failed.stderr
-
-
 @pytest.mark.parametrize("tools", ["cbm", "gitnexus", "both"])
 @pytest.mark.parametrize("state", ["pending", "claimed", "remembered"])
 def test_protocol_fence_preserves_each_durable_queue_state(tmp_path, tools, state):
     h = _seed_marker(tmp_path, tools=tools)
+    provider = "gitnexus" if tools == "gitnexus" else "cbm"
     if state != "pending":
-        claim = _cli(tmp_path, "claim", "--hash", h)
+        claim = _cli(tmp_path, "claim", "--hash", h, "--provider", provider)
         assert claim.returncode == 0, claim.stderr
-        nonce = claim.stdout.rstrip("\n").split("\t")[4]
+        context = json.loads(claim.stdout)["context"]
         if state == "remembered":
             result = _cli(
                 tmp_path,
                 "remember-outcome",
-                "--hash",
-                h,
-                "--claim-id",
-                nonce,
+                "--context",
+                json.dumps(context),
                 "--action",
                 "consume",
             )
@@ -276,11 +261,11 @@ def test_existing_idle_predicate_keeps_its_strict_and_relaxed_contract(
 
 
 def test_explicit_cli_spools_busy_success_and_replays_without_reindex(tmp_path):
-    """The inherited schema2 CLI still durably completes explicit queue work."""
+    """Real fake-provider/lock/CLI replay while automatic consumption is fenced."""
     h = _seed_marker(tmp_path, tools="gitnexus")
-    claimed = _cli(tmp_path, "claim", "--hash", h)
+    claimed = _cli(tmp_path, "claim", "--hash", h, "--provider", "gitnexus")
     assert claimed.returncode == 0, claimed.stderr
-    nonce = claimed.stdout.rstrip("\n").split("\t")[4]
+    context = json.loads(claimed.stdout)["context"]
     database = _mdir(tmp_path) / "queue.sqlite3"
     ready = tmp_path / "blocker.ready"
     locker = tmp_path / "hold_queue.py"
@@ -314,14 +299,12 @@ def test_explicit_cli_spools_busy_success_and_replays_without_reindex(tmp_path):
         try:
             assert provider.returncode == 0 and ready.exists(), _contention_diagnostics(tmp_path, ready)
             remembered = _cli(
-                tmp_path, "remember-outcome", "--hash", h, "--claim-id", nonce, "--action", "consume"
+                tmp_path, "remember-outcome", "--context", json.dumps(context), "--action", "consume"
             )
             assert remembered.returncode == 0, remembered.stderr
             spools = list(_mdir(tmp_path).glob(f".outcome-spool-{h}-*.spool"))
             assert len(spools) == 1
-            raw = spools[0].read_bytes()
-            assert json.loads(raw)["claim_id"] == nonce
-            assert _cli(tmp_path, "apply-outcome", "--hash", h).returncode == 2
+            assert _cli(tmp_path, "apply-outcome", "--context", json.dumps(context)).returncode == 2
         finally:
             release.touch()
         _wait_for_write_lock(database)
@@ -339,10 +322,13 @@ def test_explicit_cli_spools_busy_success_and_replays_without_reindex(tmp_path):
             table: db.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
             for table in ("pending", "inflight", "failed", "failed_outcomes")
         }
-        receipt = db.execute("SELECT content_sha256,raw_payload FROM legacy_imports").fetchone()
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+        completed = db.execute("SELECT applied_state FROM executions").fetchall()
+        raw = db.execute("SELECT raw_payload FROM legacy_imports").fetchone()[0]
     assert remaining == dict(pending=0, inflight=0, failed=0, failed_outcomes=0)
-    assert receipt == (hashlib.sha256(raw).hexdigest(), None)
+    assert (
+        completed == [("consumed",)]
+        and json.loads(raw)["execution_seq"] == context["execution_seq"]
+    )
     assert not spools[0].exists() and list(_mdir(tmp_path).glob(".outcome-spool-*")) == []
 
 
@@ -418,9 +404,16 @@ def test_contention_fixture_refuses_without_ready(tmp_path, locker_source):
     assert "locker" in result.stderr and "ready" in result.stderr
 
 
-@pytest.mark.parametrize("schema,state", [(None, "absent"), (2, "legacy-schema")])
+@pytest.mark.parametrize(
+    "schema,state", [(None, "absent"), (2, "legacy-schema"), (3, "protocol-incomplete")]
+)
 def test_automatic_ready_reports_dedicated_incomplete_status(tmp_path, schema, state):
-    if schema is not None:
+    if schema == 2:
+        _mdir(tmp_path).mkdir(parents=True)
+        with closing(sqlite3.connect(_mdir(tmp_path) / "queue.sqlite3", isolation_level=None)) as db:
+            db.executescript(im._SCHEMA)
+            db.execute("PRAGMA user_version=2")
+    elif schema == 3:
         _seed_marker(tmp_path)
     before = _inventory(tmp_path)
     result = _cli(tmp_path, "automatic-ready")
@@ -459,19 +452,20 @@ def test_crashed_readiness_helper_is_a_failure_not_a_pause(tmp_path, fault):
     assert _inventory(tmp_path) == before
 
 
-def test_import_status_keeps_schema2_contract_on_schema3_queue(tmp_path):
-    _mdir(tmp_path).mkdir(parents=True)
-    with closing(sqlite3.connect(_mdir(tmp_path) / "queue.sqlite3", isolation_level=None)) as db:
-        db.executescript(im._SCHEMA)
-        db.execute("PRAGMA user_version=3")
-        db.execute("INSERT INTO queue_meta VALUES('automatic_protocol_ready','0')")
+def test_import_status_lists_current_schema_and_refuses_newer(tmp_path):
+    _seed_marker(tmp_path)
     before = _inventory(tmp_path)
     listed = _cli(tmp_path, "import-status")
-    assert listed.returncode == 2 and "unsupported queue schema 3" in listed.stdout, listed.stdout
+    assert listed.returncode == 0, listed.stdout
+    assert json.loads(listed.stdout)["schema_version"] == 3
     observed = _cli(tmp_path, "automatic-ready")
     assert observed.returncode == 10, observed.stderr
     assert json.loads(observed.stdout)["state"] == "protocol-incomplete"
     assert _inventory(tmp_path) == before
+    with closing(sqlite3.connect(_mdir(tmp_path) / "queue.sqlite3", isolation_level=None)) as db:
+        db.execute("PRAGMA user_version=4")
+    newer = _cli(tmp_path, "import-status")
+    assert newer.returncode == 2 and "unsupported queue schema 4" in newer.stdout, newer.stdout
 
 
 def test_ready_status_without_a_ready_protocol_stops_the_tick(tmp_path):
@@ -503,3 +497,13 @@ def test_unopenable_runner_log_is_a_failure_not_a_pause(tmp_path):
     result = _run_runner(tmp_path)
     assert result.returncode == 76 and not (tmp_path / "entry.log").exists(), result.stderr
     assert _inventory(tmp_path) == before
+
+
+def test_cli_exceptions_cannot_look_like_empty_claims(tmp_path):
+    _seed_marker(tmp_path, tools="cbm")
+    empty = _cli(tmp_path, "claim", "--hash", "0" * 16, "--provider", "cbm")
+    assert empty.returncode == 1 and not empty.stdout
+    (_mdir(tmp_path) / "queue.sqlite3").write_bytes(b"owned corrupt queue")
+    failed = _cli(tmp_path, "list")
+    assert failed.returncode == 2 and not failed.stdout
+    assert "Traceback" in failed.stderr and "DatabaseError" in failed.stderr
