@@ -375,6 +375,7 @@ async def test_an_abandoned_unit_fails_shutdown_and_can_still_be_closed(tmp_path
     await unit.__aexit__(None, None, None)  # from another task: cleanup still runs
     assert not manager._owners
     assert manager._slots._value == 1
+    await asyncio.wait_for(manager.close(), 10)  # a retry looks again, and succeeds
 
 
 async def test_close_can_be_bounded_while_an_owner_swallows_cancellation(tmp_path):

@@ -261,7 +261,11 @@ class RequestDatabase:
         lease = self._current.get()
         if asyncio.current_task() in self._owners or (lease is not None and lease.active):
             raise DatabaseScopeError("Close the manager outside a unit of work")
-        if self._close_task is None:
+        previous = self._close_task
+        # A failed shutdown described its moment, so a later close looks again.
+        if previous is None or (
+            previous.done() and (previous.cancelled() or previous.exception() is not None)
+        ):
             self._closing = True
             self._close_task = asyncio.create_task(self._shutdown())
         # Shutdown keeps running if this caller is cancelled, and the caller can

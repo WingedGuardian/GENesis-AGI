@@ -780,12 +780,11 @@ async def get_db(
         await conn.execute("PRAGMA synchronous=NORMAL")
         await conn.execute(f"PRAGMA cache_size={CACHE_SIZE_KIB}")  # 256 MiB page cache
 
-    async def _connect() -> aiosqlite.Connection:
-        if existing_only:
-            return await connect_aiosqlite_rw(path, existing_only=True, owned=not reconnect)
-        return await aiosqlite.connect(str(path))
-
-    db = await _connect()
+    db = (
+        await connect_aiosqlite_rw(path, existing_only=True, owned=not reconnect)
+        if existing_only
+        else await aiosqlite.connect(str(path))
+    )
     try:
         await _configure(db)
     except BaseException as open_error:
@@ -802,7 +801,11 @@ async def get_db(
     # Build reconnect closure (SQLite-specific; replace for PostgreSQL)
     async def _reconnect() -> aiosqlite.Connection:
         assert_admitted(path)
-        conn = await _connect()
+        conn = (
+            await connect_aiosqlite_rw(path, existing_only=True)
+            if existing_only
+            else await aiosqlite.connect(str(path))
+        )
         await _configure(conn)
         return conn
 
