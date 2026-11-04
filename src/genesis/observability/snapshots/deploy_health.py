@@ -40,7 +40,6 @@ collectors degrade to ``None``/empty and never raise into the caller.
 from __future__ import annotations
 
 import asyncio
-import calendar
 import contextlib
 import importlib.util
 import json
@@ -982,12 +981,6 @@ def _repair_result(raw: object) -> str:
     return "unknown"
 
 
-def _report_order(ts: str) -> tuple[int, int]:
-    """A report ts (``YYYYmmddTHHMMSSZ-<pid>``) as a sort key; ValueError if no date."""
-    stamp, pid = ts.split("-", 1)
-    return calendar.timegm(time.strptime(stamp, "%Y%m%dT%H%M%SZ")), int(pid)
-
-
 def collect_live_repairs(
     genesis_home_dir: Path, repo_dir: Path | str, now: float | None = None
 ) -> dict:
@@ -997,8 +990,12 @@ def collect_live_repairs(
     path when it writes.
 
     A dir ending in the repair's suffix whose name is not one the writer makes
-    (``report_ts``), or whose ts is no date, is refused unread. Of the rest, the
-    newest REPAIR_REPORTS_READ by their parsed ts are read through the repair's
+    (``report_ts``), whose ts is no date, or whose ts is more than the loader's
+    REPORT_FUTURE_S ahead of ``now`` (a write while the clock ran ahead; the
+    guardian's pick skips it too, so neither reader takes it as the newest), is
+    refused unread. Of the rest, the newest REPAIR_REPORTS_READ by the loader's
+    ``report_order`` (seconds, then pid; the guardian's pick sorts by the same
+    key) are read through the repair's
     own ``load_report`` (its module loads once per call, only when such a dir
     exists); older ones count in ``unread_older``. A report load_report refuses
     (a symlinked dir, a REPAIR.json that is not a regular file within the byte
@@ -1012,7 +1009,9 @@ def collect_live_repairs(
     healed-kept, unresolved, superseded, unfinished, else unknown),
     ``dismissed``, and ``unresolved`` (the report says so, or has had no result
     for REPAIR_UNFINISHED_S, and is not dismissed). ``saved``: the sum over
-    reports not dismissed. ``unresolved``: the newest read report is, while the
+    reports not dismissed. ``unresolved``: the newest READ report is (a
+    dismissed or superseded newest one included: by design this differs from
+    the guardian's pick, which shows the newest ELIGIBLE report), while the
     update state's guard still calls the checkout half-written (a repair
     killed after its restore leaves no result; only the tree says whether it
     healed). The guard loads only then; nothing else runs in the checkout."""
@@ -1030,6 +1029,7 @@ def collect_live_repairs(
         # one (renamed by a later pull) is unloadable, never a blank snapshot
         repair = _script(_REPAIR_SCRIPT)
         report_ts, load_report, bad = repair.report_ts, repair.load_report, repair.BadReport
+        report_order, future_s = repair.report_order, repair.REPORT_FUTURE_S
     except Exception:  # noqa: BLE001 - unloadable: no report can be read
         logger.warning("live-move repair module could not be loaded", exc_info=True)
         out["refused"] = len(names)
@@ -1040,7 +1040,10 @@ def collect_live_repairs(
         try:
             if ts is None:
                 raise ValueError("not a name the repair writes")
-            named.append((_report_order(ts), ts, name))
+            order = report_order(ts)
+            if order[0] - now > future_s:
+                raise ValueError(f"named more than {future_s} s ahead of this clock")
+            named.append((order, ts, name))
         except ValueError as exc:
             _refused(name, str(exc))
             out["refused"] += 1

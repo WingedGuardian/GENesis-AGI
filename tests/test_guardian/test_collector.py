@@ -619,6 +619,80 @@ def test_report_pick_skips_an_ineligible_over_cap_report(tmp_path, over):
     assert b"too large" in _pick(tmp_path)
 
 
+def test_report_pick_orders_same_second_reports_by_pid_as_a_number(tmp_path):
+    """Codex c4464516280: pids 9999 and 10000 in the same second sort the
+    wrong way as text; the pick orders by the loader's report_order (seconds,
+    then pid), as deploy health does."""
+    stamp = _ts()[:-3]
+    for pid, result in ((9999, "healed, pid 9999"), (10000, "healed, pid 10000")):
+        name = f"{stamp}-{pid}"
+        (_backup_dir(tmp_path, name) / "REPAIR.json").write_text(
+            json.dumps(_mine(tmp_path, ts=name, result=result))
+        )
+    assert b"pid 10000" in _pick(tmp_path)
+
+
+def test_report_pick_reads_at_most_the_readers_count_of_reports(tmp_path):
+    """R2 premise LOW-1: the pick reads at most _REPAIR_READS report dirs (deploy
+    health's REPAIR_REPORTS_READ). An eligible report behind that many newer
+    ineligible ones is not read, and the pick takes its none-found path (prints
+    nothing); one fewer ineligible and it is shown."""
+    import genesis.guardian.collector as gc
+
+    (_backup_dir(tmp_path, _ts(3)) / "REPAIR.json").write_text(
+        json.dumps(_mine(tmp_path, ts=_ts(3), result="healed, the older one"))
+    )
+    dismissed = [_ts(2 - i * 0.1) for i in range(gc._REPAIR_READS)]
+    for ts in dismissed:
+        report = _mine(tmp_path, ts=ts, dismissed_at="2026-10-21T00:00:00Z")
+        (_backup_dir(tmp_path, ts) / "REPAIR.json").write_text(json.dumps(report))
+    assert _pick(tmp_path) == b""
+    import shutil
+
+    shutil.rmtree(tmp_path / ".genesis" / "deploy-backups" / f"{dismissed[0]}-live-move-repair")
+    assert b"healed, the older one" in _pick(tmp_path)
+
+
+@pytest.mark.parametrize("case", ["not-json", "not-an-object", "unreadable"])
+def test_report_pick_shows_a_malformed_newest_report_instead_of_an_older_one(tmp_path, case):
+    """R2 premise LOW-3: a newest report that cannot be parsed is shown as
+    unreadable, its ts from its dir, never skipped so an older report reads as
+    the newest (deploy health counts it as refused)."""
+    import os
+
+    older = _mine(tmp_path, ts=_ts(1), result="healed, the older one")
+    (_backup_dir(tmp_path, _ts(1)) / "REPAIR.json").write_text(json.dumps(older))
+    ts = _ts()
+    path = _backup_dir(tmp_path, ts) / "REPAIR.json"
+    path.write_text({"not-json": "{not json", "not-an-object": "[1, 2]"}.get(case, "{}"))
+    if case == "unreadable":
+        os.chmod(path, 0)
+        if os.access(path, os.R_OK):
+            pytest.skip("running as a user that reads mode-0 files")
+    out = _pick(tmp_path)
+    assert json.loads(out.split(b"\n", 1)[1]) == {
+        "ts": ts,
+        "result": "report unreadable; not read",
+    }, out[:300]
+
+
+@pytest.mark.parametrize(
+    "over",
+    [{"dismissed_at": "2026-10-21T00:00:00Z"}, {"result": "superseded"}, {"repo": "/elsewhere"}],
+    ids=["dismissed", "superseded", "other-checkout"],
+)
+def test_report_pick_skips_a_malformed_report_its_top_fields_make_ineligible(tmp_path, over):
+    """The over-cap branch's rule, for a malformed report: top-level fields
+    read from the writer's layout that make it ineligible skip it."""
+    older = _mine(tmp_path, ts=_ts(1), result="healed, the older one")
+    (_backup_dir(tmp_path, _ts(1)) / "REPAIR.json").write_text(json.dumps(older))
+    ts = _ts()
+    broken = _writer_bytes({**_mine(tmp_path, ts=ts), **over})[:-2]  # cut: not JSON
+    (_backup_dir(tmp_path, ts) / "REPAIR.json").write_bytes(broken)
+    out = _pick(tmp_path)
+    assert b"healed, the older one" in out and b"unreadable" not in out, out[:300]
+
+
 def test_report_pick_takes_the_window_from_the_directory_name(tmp_path):
     """CodeRabbit c4461224334: the stored ts is user-writable; the dir name is
     the writer's (and what the loader reads). A recent dir whose stored ts

@@ -19,6 +19,7 @@ at boot."""
 from __future__ import annotations
 
 import argparse
+import calendar
 import contextlib
 import fcntl
 import functools
@@ -298,6 +299,21 @@ def report_ts(name: str) -> str | None:
     """The ts of a report dir named as _backup_dir names it, else None."""
     m = REPORT_NAME.fullmatch(name)
     return m.group(1) if m else None
+
+
+#: A report dir named more than this many seconds ahead of the reader's clock
+#: is not a report (written while the clock ran ahead, as at a boot before NTP
+#: sync): no reader takes it as the newest. Deploy health refuses it; the
+#: guardian's pick skips it (collector._REPAIR_FUTURE_S, held equal by a test).
+REPORT_FUTURE_S = 300
+
+
+def report_order(ts: str) -> tuple[int, int]:
+    """A report ts (``YYYYmmddTHHMMSSZ-<pid>``) as the readers' one sort key:
+    its UTC seconds, then its pid as a number (so pid 10000 is newer than 9999
+    in the same second). ValueError if the ts names no date or pid."""
+    stamp, pid = ts.split("-", 1)
+    return calendar.timegm(time.strptime(stamp, _TS_FORMAT)), int(pid)
 
 
 def load_report(path: str, repo: str) -> dict | None:

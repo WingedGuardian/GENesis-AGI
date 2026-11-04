@@ -362,6 +362,88 @@ def test_reports_are_ordered_by_their_parsed_ts_not_by_name(tmp_path):
     assert found["refused"] == 1, found
 
 
+def test_the_report_order_is_the_loaders_seconds_then_pid(mod):
+    """R2 (Codex c4464516280): one order for every reader, defined in the
+    loader: the parsed seconds, then the pid as a number."""
+    import calendar
+
+    secs = calendar.timegm(time.strptime("20260101T000000Z", "%Y%m%dT%H%M%SZ"))
+    assert mod.report_order("20260101T000000Z-10000") == (secs, 10000)
+    assert mod.report_order("20260101T000000Z-10000") > mod.report_order("20260101T000000Z-9999")
+    for bad in ("20261399T000000Z-1", "20260101T000000Z", "20260101T000000Z-x"):
+        with pytest.raises(ValueError):
+            mod.report_order(bad)
+    assert not hasattr(_dh(), "_report_order"), "deploy health keeps a private copy of the order"
+
+
+def test_a_name_far_in_the_future_is_refused_and_never_the_newest(tmp_path):
+    """R2 premise P4: a report dir named more than REPORT_FUTURE_S ahead of the
+    reader's clock (a write while the clock ran ahead) is not a report: it is
+    refused, takes no read slot, and never governs ``unresolved``."""
+    now = time.time()
+    current = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now)) + "-2"
+    _report_at(tmp_path, "29991231T000000Z-1", result="healed", repo=str(tmp_path), paths=[])
+    _report_at(tmp_path, current, result="unresolved: x", repo=str(tmp_path), paths=[])
+    found = _dh().collect_live_repairs(tmp_path, tmp_path, now=now)
+    assert [r["ts"] for r in found["reports"]] == [current], found
+    assert found["refused"] == 1 and found["reports"][0]["unresolved"] is True, found
+    # Inside the skew allowance it is a report like any other, and the newest.
+    near = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now + 200)) + "-3"
+    _report_at(tmp_path, near, result="healed", repo=str(tmp_path), paths=[])
+    found = _dh().collect_live_repairs(tmp_path, tmp_path, now=now)
+    assert [r["ts"] for r in found["reports"]] == [near, current], found
+
+
+def test_both_readers_agree_on_the_newest_report(tmp_path, mod):
+    """R2 premise SHOULD-FIX-1: one crafted backups dir set, both readers.
+    They share the order (seconds, then pid) and the future-skew rule, so they
+    agree on which report is newest. The one intended difference: deploy
+    health's ``unresolved`` reads the newest READ report (dismissed included),
+    while the guardian pick shows the newest ELIGIBLE one, and shows a newest
+    report it cannot parse as unreadable rather than an older one."""
+    home = tmp_path
+    gen = home / ".genesis"
+    checkout = home / "genesis"
+    checkout.mkdir()
+    now = time.time()
+
+    def at(seconds_ago: float, pid: int) -> str:
+        return time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now - seconds_ago)) + f"-{pid}"
+
+    def put(ts: str, **over) -> Path:
+        report = {"ts": ts, "repo": str(checkout), "paths": [], "result": "healed", **over}
+        return _report_at(gen, ts, **report)
+
+    def both() -> tuple[str | None, str | None, bool]:
+        found = _dh().collect_live_repairs(gen, checkout, now=now)
+        picked = _guardian_pick(home)
+        first = found["reports"][0] if found["reports"] else {}
+        return first.get("ts"), (picked or {}).get("ts"), first.get("unresolved")
+
+    # 1. Same second, pids 9999 and 10000: 10000 is the newer in both.
+    put(at(600, 9999), result="healed")
+    put(at(600, 10000), result="unresolved: x")
+    assert both() == (at(600, 10000), at(600, 10000), True)
+    # 2. A far-future name next to a current unresolved report: neither reader
+    # takes it as a report.
+    put("29991231T000000Z-1", result="healed")
+    assert both() == (at(600, 10000), at(600, 10000), True)
+    # 3. A dismissed newest: deploy health reads it as the newest, so its
+    # ``unresolved`` reads that (dismissed) report; the pick shows the newest
+    # eligible one. Intended.
+    put(at(300, 5), result="unresolved: y", dismissed_at="2026-01-01T00:00:00Z")
+    assert both() == (at(300, 5), at(600, 10000), False)
+    # 4. A malformed newest: deploy health refuses it (its newest read report
+    # stays the dismissed one); the pick shows it as unreadable, ts from its dir.
+    bad = at(60, 7)
+    (gen / "deploy-backups" / f"{bad}{SUFFIX}").mkdir()
+    (gen / "deploy-backups" / f"{bad}{SUFFIX}" / "REPAIR.json").write_text("{not json")
+    found = _dh().collect_live_repairs(gen, checkout, now=now)
+    assert found["reports"][0]["ts"] == at(300, 5) and found["refused"] == 2, found
+    picked = _guardian_pick(home)
+    assert picked == {"ts": bad, "result": "report unreadable; not read"}, picked
+
+
 def test_a_name_the_writer_never_makes_takes_no_slot(tmp_path):
     """A name that is not the writer's sorts newest as text, yet the eight read
     are still the eight newest valid reports; it counts as refused, unread."""
@@ -435,7 +517,10 @@ def test_an_unforeseen_failure_costs_only_that_report(tmp_path, monkeypatch):
     assert (found["refused"], found["saved"]) == (1, 1), found
 
 
-@pytest.mark.parametrize("missing", ["report_ts", "BadReport", "load_report"])
+_REPAIR_API = ("report_ts", "report_order", "REPORT_FUTURE_S", "BadReport", "load_report")
+
+
+@pytest.mark.parametrize("missing", _REPAIR_API)
 def test_a_repair_module_missing_its_api_keeps_every_other_finding(tmp_path, monkeypatch, missing):
     """Architect SHOULD-FIX-1: a repair module on disk that loads but lacks a
     name the reader uses (an API renamed by a later pull, a server not yet
@@ -458,7 +543,7 @@ def test_a_repair_module_missing_its_api_keeps_every_other_finding(tmp_path, mon
         if path.name != "live_move_repair.py":
             return module
         stub = types.ModuleType("stub_repair")
-        for name in ("report_ts", "BadReport", "load_report"):
+        for name in _REPAIR_API:
             if name != missing:
                 setattr(stub, name, getattr(module, name))
         if missing != "load_report":
@@ -928,6 +1013,8 @@ def test_the_guardian_pick_shares_the_loaders_name_rule_and_caps(mod):
     assert mod.REPORT_NAME.pattern == gc._REPAIR_NAME
     assert gc._REPAIR_REPORT_BYTES == mod.REPORT_BYTES
     assert gc._REPAIR_REPO_BYTES == mod.REPO_BYTES
+    assert gc._REPAIR_FUTURE_S == mod.REPORT_FUTURE_S
+    assert gc._REPAIR_READS == _dh().REPAIR_REPORTS_READ
 
 
 @pytest.mark.parametrize("case", ["bad-name", "linked-dir", "nul-repo", "long-repo"])

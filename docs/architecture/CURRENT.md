@@ -2141,11 +2141,15 @@ verified: 25f3ad876 2026-11-03
   container reads are bounded where they are produced (only a report dir
   named as the writer names it and not a symlink; one regular report opened
   without following a symlink, 4 MiB; the repo compared as the repair loader
-  compares it; those rules held equal to the loader's by a parity test; a
-  newer one over that cap is shown as "report too large", never skipped for
-  an older one, unless the top-level repo, result or dismissed_at read from
-  the writer's indent-2 layout makes it ineligible; journal lines cut to
-  400), and
+  compares it; dirs ordered by the loader's `report_order`, seconds then
+  pid, a name over 300 s ahead skipped and at most 8 dirs read, as deploy
+  health does; those rules held equal to the loader's by a parity test and a
+  cross-reader test; a newer one over that cap, unreadable or not a JSON
+  object is shown as "report too large" or "report unreadable", never skipped
+  for an older one, unless the top-level repo, result or dismissed_at read
+  from the writer's indent-2 layout makes it ineligible; journal lines cut to
+  400). It shows the newest ELIGIBLE report, by design, where deploy health's
+  `live_repair_unresolved` reads the newest READ one, and
   Telegram alert fields are cut before escaping. Residual: a container that
   fakes git's own output can still pass the probe.
 - **Merged ≠ deployed**: guardian code reaches the host ONLY via
@@ -4543,8 +4547,11 @@ Refusing a proposed update preserves a previously valid opt-in.
   bytes, `os.fsencode`, number at most 4,096, so a non-UTF-8 checkout path the
   writer stored still matches; checked before realpath, and a realpath error
   is a refusal) is refused whole, counted in `live_repair_refused:<n>` and named
-  once in the server log; no git runs in a checkout a report names. Only the
-  newest eight report dirs by the ts in their name are read; older ones are
+  once in the server log; no git runs in a checkout a report names. A dir
+  named more than 300 s ahead of the reader's clock (`REPORT_FUTURE_S`) is
+  refused too. Only the newest eight report dirs by the loader's
+  `report_order` (the ts in their name, then the pid as a number) are read;
+  older ones are
   counted in `live_repair_unread_older:<n>`, an informational class (medium
   when alone). Per report the snapshot carries its ts, its backup folder, how
   many paths the update did not write were recorded there (every foreign row
