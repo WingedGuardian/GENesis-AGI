@@ -450,7 +450,8 @@ def test_t4a_an_added_file_written_by_a_killed_switch_is_a_mixed_tree(guard, liv
     assert verdict == "mixed_tree", reason
     r = _cli(live, live["home"] / "update_state.json")
     assert r.returncode == 4, r.stdout + r.stderr
-    assert "  ?? Z" in r.stdout and "save any you want to keep" in r.stdout, r.stdout
+    # A live row's remedy is the repair, which saves before it restores (#3492 PR D1).
+    assert "  ?? Z" in r.stdout and "scripts/deploy_candidates repair-move" in r.stdout, r.stdout
 
 
 def test_t4g_a_path_a_dropped_candidate_had_deleted_is_seen(guard, live):
@@ -633,7 +634,8 @@ def test_sf1_a_tag_side_mixed_tree_never_recommends_post_merge(guard, live):
     r = _cli(live, _state(live, live_row(live)))
     assert r.returncode == 4
     assert not post_merge_advice(r.stdout), r.stdout
-    assert "Dismiss" in r.stdout and "bootstrap never ran on" not in r.stdout, r.stdout
+    assert "scripts/deploy_candidates repair-move" in r.stdout, r.stdout
+    assert "bootstrap never ran on" not in r.stdout, r.stdout
 
 
 @pytest.mark.parametrize("at", ["tag", "target"])

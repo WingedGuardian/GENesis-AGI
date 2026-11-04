@@ -25,6 +25,7 @@ from genesis.cc.exceptions import (
     CCNetworkOfflineError,
     CCOverloadedError,
     CCProcessError,
+    CCQuotaExhaustedError,
     CCRateLimitError,
     CCReplayUnsafeError,
     CCStreamTruncatedError,
@@ -1027,6 +1028,7 @@ async def test_contingency_preserves_resume_fragments_beside_identity(loop):
         "approve this proposal",
         "## Pending proposals\n- P1: adopt-first demo",
         ChannelType.TELEGRAM, session_id="cc-live", was_resume=True,
+        chat_ref=None, thread_id=None,
     )
 
     assert "ok" in out  # reply text (contingency preamble is prefixed by the caller)
@@ -1338,6 +1340,8 @@ async def test_the_contingency_router_is_not_told_it_can_change_its_model(loop):
         ChannelType.TELEGRAM,
         session_id="cc-live",
         was_resume=True,
+        chat_ref=None,
+        thread_id=None,
     )
 
     assert "ok" in out
@@ -1347,3 +1351,235 @@ async def test_the_contingency_router_is_not_told_it_can_change_its_model(loop):
     # The fragments it DOES need are untouched.
     assert "P1: adopt-first demo" in sent, "topic context was stripped too"
     assert "You are Genesis." in sent, "the identity rebuild was lost"
+
+
+# --- CC's own limit notice is not answer text --------------------------------
+#
+# Shape MEASURED from a capped streaming turn's transcript: the CLI writes the
+# limit notice as an assistant line with one text block, model "<synthetic>",
+# then the run ends with a quota error. Counting that line as streamed answer
+# text skipped the full-tools failover and sent the turn to contingency.
+
+
+def _limit_notice_raw(**extra):
+    raw = {
+        "type": "assistant",
+        "message": {
+            "model": "<synthetic>",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "You've hit your weekly limit · resets 5pm (UTC)"}],
+        },
+    }
+    raw.update(extra)
+    return raw
+
+
+def test_the_cli_limit_notice_parses_as_synthetic_text():
+    ev = StreamEvent.from_raw(_limit_notice_raw())
+    assert ev.event_type == "text"
+    assert ev.is_synthetic
+
+
+def test_api_error_flags_alone_mark_a_line_synthetic():
+    raw = _limit_notice_raw(isApiErrorMessage=True)
+    raw["message"]["model"] = "some-model"
+    assert StreamEvent.from_raw(raw).is_synthetic
+    raw = _limit_notice_raw(error="rate_limit")
+    raw["message"]["model"] = "some-model"
+    assert StreamEvent.from_raw(raw).is_synthetic
+
+
+def test_model_text_and_non_assistant_events_are_not_synthetic():
+    model_line = {
+        "type": "assistant",
+        "message": {"model": "claude-x", "content": [{"type": "text", "text": "an answer"}]},
+    }
+    assert not StreamEvent.from_raw(model_line).is_synthetic
+    assert not StreamEvent(event_type="text", text="no raw").is_synthetic
+    assert not StreamEvent.from_raw({"type": "result", "is_error": True}).is_synthetic
+
+
+@pytest.mark.asyncio
+async def test_the_cli_limit_notice_does_not_block_failover(loop, invoker):
+    """The measured capped-turn shape: notice line, then the quota error. The
+    peer must run and answer, because nothing the model wrote reached the user."""
+    calls = {"n": 0}
+
+    async def _stream(inv, on_event=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            await on_event(StreamEvent.from_raw(_limit_notice_raw()))
+            raise CCQuotaExhaustedError("You've hit your weekly limit")
+        await on_event(StreamEvent(event_type="text", text="peer answer"))
+        return _output(text="peer answer", session_id="glm-3")
+
+    invoker.run_streaming = AsyncMock(side_effect=_stream)
+    loop._try_contingency = AsyncMock(return_value="[Contingency mode] tool-less")
+    result = await loop.handle_message_streaming(
+        "what did we decide on Friday?", user_id="u1",
+        channel=ChannelType.TERMINAL, on_event=AsyncMock(),
+    )
+    assert "peer answer" in result
+    assert calls["n"] == 2, "the failover peer was never invoked"
+    loop._try_contingency.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_skipped_failover_names_itself_in_the_log(loop, invoker, monkeypatch, caplog):
+    fi = MagicMock(return_value=[("glm-5.2", _PEER_INV)])
+    monkeypatch.setattr(roster, "failover_invocations", fi)
+
+    async def _stream(inv, on_event=None):
+        await on_event(StreamEvent(event_type="text", text="partial answer"))
+        raise CCRateLimitError("limit")
+
+    invoker.run_streaming = AsyncMock(side_effect=_stream)
+    with caplog.at_level("WARNING", logger="genesis.cc.conversation"):
+        await loop.handle_message_streaming(
+            "hi", user_id="u1", channel=ChannelType.TERMINAL, on_event=AsyncMock(),
+        )
+    fi.assert_not_called()
+    assert any("CC failover skipped" in r.getMessage() for r in caplog.records)
+
+
+
+def _tool_then_cap(calls, first=None):
+    async def _stream(inv, on_event=None):
+        calls["n"] += 1
+        await on_event(first or StreamEvent(
+            event_type="tool_use", tool_name="outreach_send",
+            tool_input={"message": "weekly update"},
+        ))
+        await on_event(StreamEvent.from_raw(_limit_notice_raw()))
+        raise CCQuotaExhaustedError("You've hit your 5-hour limit")
+    return _stream
+
+
+def _park_mock(monkeypatch, parked=True):
+    from genesis.cc import rate_limit_park
+
+    park = AsyncMock(return_value=rate_limit_park.ParkOutcome(
+        parked, "p1" if parked else None, None, "live", "[parked copy]",
+    ))
+    monkeypatch.setattr(rate_limit_park, "park_conversation", park)
+    return park
+
+
+@pytest.mark.asyncio
+async def test_a_capped_turn_that_ran_tools_parks_with_them_listed(loop, invoker, monkeypatch):
+    """Tools ran, then the cap hit: no peer re-runs the prompt blind; the turn
+    parks, and the parked prompt names the call already made."""
+    calls = {"n": 0}
+    fi = MagicMock(return_value=[("glm-5.2", _PEER_INV)])
+    monkeypatch.setattr(roster, "failover_invocations", fi)
+    park = _park_mock(monkeypatch)
+    invoker.run_streaming = AsyncMock(side_effect=_tool_then_cap(calls))
+    loop._try_contingency = AsyncMock(return_value="[Contingency mode] tool-less")
+    result = await loop.handle_message_streaming(
+        "send the update", user_id="u1",
+        channel=ChannelType.TERMINAL, on_event=AsyncMock(),
+    )
+    assert result.startswith("[parked copy]") and "may already have run" in result
+    assert calls["n"] == 1, "a peer re-ran a prompt whose tools already ran"
+    fi.assert_not_called()
+    loop._try_contingency.assert_not_awaited()
+    kwargs = park.await_args.kwargs
+    assert kwargs["prompt"] == "send the update", "the park must store the bare prompt"
+    assert kwargs["ran"] == [("outreach_send", {"message": "weekly update"})]
+
+
+@pytest.mark.asyncio
+async def test_a_tool_call_inside_a_text_line_still_counts(loop, invoker, monkeypatch):
+    """from_raw stops at the first block, so `text + tool_use` parses as text.
+    The call must still be seen, or the turn is replayed on a peer."""
+    mixed = StreamEvent.from_raw({
+        "type": "assistant",
+        "message": {"model": "m", "content": [
+            {"type": "text", "text": "Sending it now."},
+            {"type": "tool_use", "name": "outreach_send", "input": {"message": "x"}},
+        ]},
+    })
+    assert mixed.event_type == "text"
+    calls = {"n": 0}
+    fi = MagicMock(return_value=[("glm-5.2", _PEER_INV)])
+    monkeypatch.setattr(roster, "failover_invocations", fi)
+    park = _park_mock(monkeypatch)
+    invoker.run_streaming = AsyncMock(side_effect=_tool_then_cap(calls, first=mixed))
+    await loop.handle_message_streaming(
+        "send it", user_id="u1", channel=ChannelType.TERMINAL, on_event=AsyncMock(),
+    )
+    fi.assert_not_called()
+    assert [n for n, _ in park.await_args.kwargs["ran"]] == ["outreach_send"]
+
+
+@pytest.mark.asyncio
+async def test_a_capped_turn_that_ran_tools_falls_back_when_it_cannot_park(loop, invoker, monkeypatch):
+    calls = {"n": 0}
+    _park_mock(monkeypatch, parked=False)
+    invoker.run_streaming = AsyncMock(side_effect=_tool_then_cap(calls))
+    loop._try_contingency = AsyncMock(return_value=None)
+    result = await loop.handle_message_streaming(
+        "send the update", user_id="u1",
+        channel=ChannelType.TERMINAL, on_event=AsyncMock(),
+    )
+    loop._try_contingency.assert_awaited_once()
+    assert "usage limit" in result and "would run again" in result
+
+
+def test_the_park_copy_warns_only_when_calls_ran():
+    from genesis.cc.rate_limit_park import with_already_ran_copy
+
+    assert with_already_ran_copy("parked", []) == "parked"
+    assert "may already have run" in with_already_ran_copy("parked", [("t", {})])
+
+
+@pytest.mark.asyncio
+async def test_the_last_resort_park_carries_a_peers_tool_calls(loop, invoker, monkeypatch):
+    """Home caps before any tool; the PEER issues a call, then caps too. The
+    chain is exhausted, so the bottom park must still list the peer's call."""
+    fi = MagicMock(return_value=[("glm-5.2", _PEER_INV)])
+    monkeypatch.setattr(roster, "failover_invocations", fi)
+    park = _park_mock(monkeypatch)
+    calls = {"n": 0}
+
+    async def _stream(inv, on_event=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise CCQuotaExhaustedError("You've hit your weekly limit")
+        await on_event(StreamEvent(
+            event_type="tool_use", tool_name="memory_store", tool_input={"content": "c"},
+        ))
+        raise CCQuotaExhaustedError("peer limit")
+
+    invoker.run_streaming = AsyncMock(side_effect=_stream)
+    loop._try_contingency = AsyncMock(return_value=None)
+    result = await loop.handle_message_streaming(
+        "remember this", user_id="u1", channel=ChannelType.TERMINAL, on_event=AsyncMock(),
+    )
+    assert calls["n"] == 2
+    assert [n for n, _ in park.await_args.kwargs["ran"]] == ["memory_store"]
+    assert "may already have run" in result
+
+
+@pytest.mark.asyncio
+async def test_a_tool_call_after_thinking_in_one_line_still_counts(loop, invoker, monkeypatch):
+    """The reviewers' shape: `thinking + tool_use` parses as "thinking"."""
+    line = StreamEvent.from_raw({
+        "type": "assistant",
+        "message": {"model": "m", "content": [
+            {"type": "thinking", "thinking": "plan"},
+            {"type": "tool_use", "name": "outreach_send", "input": {"message": "x"}},
+        ]},
+    })
+    assert line.event_type == "thinking"
+    calls = {"n": 0}
+    fi = MagicMock(return_value=[("glm-5.2", _PEER_INV)])
+    monkeypatch.setattr(roster, "failover_invocations", fi)
+    park = _park_mock(monkeypatch)
+    invoker.run_streaming = AsyncMock(side_effect=_tool_then_cap(calls, first=line))
+    await loop.handle_message_streaming(
+        "send it", user_id="u1", channel=ChannelType.TERMINAL, on_event=AsyncMock(),
+    )
+    fi.assert_not_called()
+    assert calls["n"] == 1
+    assert [n for n, _ in park.await_args.kwargs["ran"]] == ["outreach_send"]

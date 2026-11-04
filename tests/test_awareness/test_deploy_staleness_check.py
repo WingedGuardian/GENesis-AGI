@@ -163,12 +163,13 @@ async def test_recent_update_below_behind_threshold_is_quiet(db, monkeypatch):
     assert await _rows(db) == []
 
 
-async def test_escalation_supersedes_high_row(db, monkeypatch):
+async def test_escalation_supersedes_the_drift_row(db, monkeypatch):
     _patch_snapshot(
         monkeypatch, _snap(_real_findings(age_days=1.0, behind=60), age_days=1.0, behind=60)
     )
     await loop._check_deploy_staleness(db)
-    assert (await _rows(db))[0]["priority"] == "high"
+    # behind_upstream alone is written at medium (routine maintenance).
+    assert (await _rows(db))[0]["priority"] == "medium"
     monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
     _patch_snapshot(
         monkeypatch, _snap(_real_findings(age_days=8.0, behind=60), age_days=8.0, behind=60)
@@ -894,3 +895,30 @@ async def test_the_unbound_class_has_its_own_wording(db, monkeypatch):
     await loop._check_deploy_staleness(db)
     [row] = await _rows(db)
     assert "no deploy manifest of this repository binds it" in row["content"]
+
+
+async def test_commits_behind_alone_is_written_medium(db, monkeypatch):
+    """Being N commits behind upstream is routine maintenance, not an alarm.
+
+    Written at high it reached the morning report as a BLOCKER every day. The
+    priority is set where the row is written, so every reader sees the same one.
+    """
+    _patch_snapshot(monkeypatch, _snap(["behind_upstream:12"], age_days=1.0, behind=12))
+    await loop._check_deploy_staleness(db)
+    assert [r["priority"] for r in await _rows(db)] == ["medium"]
+
+
+async def test_commits_behind_with_another_drift_class_stays_high(db, monkeypatch):
+    """Control: only the bare commits-behind state is lowered. Pending tier-2
+    work beside it is a different finding and keeps its priority."""
+    _patch_snapshot(
+        monkeypatch,
+        _snap(
+            ["behind_upstream:12", "tier2_pending:2"],
+            age_days=1.0,
+            behind=12,
+            tier2=["a", "b"],
+        ),
+    )
+    await loop._check_deploy_staleness(db)
+    assert [r["priority"] for r in await _rows(db)] == ["high"]

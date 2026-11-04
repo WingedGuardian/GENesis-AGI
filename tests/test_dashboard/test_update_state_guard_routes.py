@@ -324,3 +324,19 @@ def test_the_card_shows_the_guards_remedy_and_a_true_dismiss_warning():
     dismiss = js[js.index("async dismissUpdate()") :][:900]
     assert "merged code it has not activated (or its record cannot be read)" not in dismiss
     assert "half-written" in dismiss, dismiss
+
+
+def test_td20_a_guard_that_cannot_be_loaded_names_the_live_repair(w, monkeypatch):
+    """T-D20 (#3492 PR D1): when the guard itself cannot be loaded, the kept
+    state's remedy still names the repair for a half-written live checkout,
+    beside the --post-merge it keeps (which refuses such a tree)."""
+    _write(w, CONFLICT_EXIT)
+
+    def broken():
+        raise ImportError("no guard")
+
+    monkeypatch.setattr(updates, "_load_state_guard", broken)
+    verdict, _reason, remedy = updates._state_guard_verdict()
+    assert verdict == "guards", remedy
+    assert "scripts/deploy_candidates repair-move" in remedy, remedy
+    assert "it refuses a half-written tree" in remedy, remedy

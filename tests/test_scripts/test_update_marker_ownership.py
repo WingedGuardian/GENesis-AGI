@@ -22,6 +22,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_scripts._update_source import update_text
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE_SH = REPO_ROOT / "scripts" / "update.sh"
 # update.sh sources this before defining _clear_deploy_state.
@@ -30,7 +32,7 @@ MARKER_LIB = REPO_ROOT / "scripts" / "lib" / "deploy_marker.sh"
 
 @pytest.fixture(scope="module")
 def text() -> str:
-    return UPDATE_SH.read_text()
+    return update_text()
 
 
 def _extract_func(text: str, name: str) -> str:
@@ -260,6 +262,13 @@ def test_update_sources_the_holder_check_before_its_cleanup_can_run(text: str) -
     calls = [m.start() for m in re.finditer(r"^\s+_clear_deploy_state\s*$", text, re.M)]
     assert calls, "no call of _clear_deploy_state found; update this test"
     assert source_at < min(calls), "the lib must be sourced before the cleanup can run"
+    # The cleanup calls _clear_deploy_marker, which lives in the rollback lib, so
+    # update.sh must source that too. Read from update.sh alone: `text` includes the lib.
+    alone = UPDATE_SH.read_text()
+    lib_at = alone.find('. "$SCRIPT_DIR/lib/update_rollback.sh"')
+    assert lib_at != -1, "update.sh no longer sources scripts/lib/update_rollback.sh"
+    own_calls = [m.start() for m in re.finditer(r"^\s+_clear_deploy_state\s*$", alone, re.M)]
+    assert own_calls and lib_at < min(own_calls)
     assert "_deploy_marker_holder_live()" in MARKER_LIB.read_text()
 
 

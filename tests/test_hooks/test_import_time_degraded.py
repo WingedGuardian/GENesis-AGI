@@ -672,6 +672,10 @@ _NOT_WIRED = {
     # launcher. Missing/crashing sibling imports and a healthy allow control
     # are measured by test_codex_validator_adapter's launcher import test.
     "codex_validator_adapter.py": "Codex shell launcher converts every sibling import crash to exit 2",
+    # An inactive adapter child, not a directly configured Claude/Codex hook.
+    # test_validator_role_guard::test_actual_adapter_denies_every_role_import_failure
+    # measures missing/crashing imports for every bare sibling plus healthy allow.
+    "validator_role_guard.py": "Validator adapter converts child import failures to an explicit deny",
     # Its remaining bare import is `shell_parse`, and its only usable degraded token
     # would be the pipe character — 52,220 of 74,282 commands (70.30%). Wiring it would
     # not make the broken state safe, it would make it UNREPAIRABLE, and a degraded
@@ -689,12 +693,21 @@ _NOT_WIRED = {
     # direction for a gate whose whole measured design property is that it must
     # never become the thing that wedges the work.
     "adopt_first_gate.py": "fail-open by contract — refusing would wedge every edit and plan exit",
+    # plan_premise_gate shares that contract and that matcher: a broken import that
+    # refused would stop every ExitPlanMode until repair, for a check whose worst miss
+    # is a plan presented without its premise answers.
+    "plan_premise_gate.py": "fail-open by contract — refusing would wedge every plan exit",
     # Not a hook at all: the deploy-candidates engine is a command-line program run
     # through scripts/deploy_candidates. Its "return 2" is argparse's usage error,
     # and a failed import exiting 1 is the correct CLI answer ("failed"), not a
     # vanished guard. MEASURED 2026-10-01: 0 references to it in .claude/settings.json,
     # .claude/ or scripts/hooks/, so Claude Code never runs it as a hook.
     "deploy_candidates.py": "a CLI, not a hook: wired nowhere in .claude/settings.json",
+    # Not a hook either: the issue premise gate runs only in the GitHub Action
+    # .github/workflows/premise-gate.yml. Its `return 2` is "no event file", a usage
+    # error, and a failed import there fails the Actions job loudly. MEASURED
+    # 2026-10-28: 0 references to it in .claude/settings.json or scripts/hooks/.
+    "premise_gate.py": "an Actions script, not a hook: wired nowhere in .claude/settings.json",
     # Not a hook either: the validator's sealed shell command RUNS this program;
     # the PreToolUse decision is codex_validator_guard.py's. A failed import exits
     # 1 before any request is read, so nothing is served and the caller sees a

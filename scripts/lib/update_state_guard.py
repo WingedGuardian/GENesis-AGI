@@ -61,8 +61,9 @@ Verdicts, in order:
    two-dot residue back toward the tag is non-empty, else GUARDS (moved, not
    bootstrapped). Anywhere else, or a record of any other shape, or one under
    any phase but "merging": HOLD. The MIXED_TREE remedy follows HEAD: at the
-   tag, put the paths back and Dismiss; at the update's new code, put them back
-   and finish with --post-merge;
+   tag, scripts/deploy_candidates repair-move (live_move_repair.py) puts the
+   paths back, saving what it changes (#3492 PR D1); at the update's new code,
+   put them back and finish with --post-merge;
 7a. a "merging" row on `live` with no record and an own_head other than the
    tag (update.sh adopted the tip, and its row no longer carries the record)
    is judged the same way toward own_head, and that verdict is final (main's
@@ -75,7 +76,9 @@ The pid is not an input: callers answer liveness first (update.lock in the
 shell, env.update_in_progress() in the dashboard). Anything this module cannot
 decide guards. Retiring a guarding file on purpose is the job of that update's
 ``--post-merge`` (GUARDS only: a resolved conflict reads GUARDS, a pending one
-merged nothing), bootstrap's crash recovery, or the dashboard's Dismiss.
+merged nothing), bootstrap's crash recovery, the dashboard's Dismiss, or (a
+half-written `live` checkout at the tag) the repair once this rule calls the
+tree SAFE.
 
 Command line (``python3 -I -S``, standard library only)::
 
@@ -258,6 +261,10 @@ def _conflict_recorded(conflicts_path: str, deploy_head: str) -> bool:
 #: HEAD then puts the FORWARD tree back, which --post-merge finishes (message()
 #: reads it to give that remedy).
 _FORWARD = "the checkout is at the update's new code"
+#: ... and how one starts on a `live` row with HEAD at the rollback tag, which
+#: the live-move repair heals (scripts/lib/live_move_repair.py, #3492 PR D1):
+#: message() names that command instead of the by-hand steps.
+_LIVE = "the live checkout is half-written"
 
 #: HOLD remedies, one per kind of state. None recommends --post-merge: it
 #: refuses every one of them.
@@ -337,16 +344,20 @@ def _shown(record: str) -> str:
     return record[:3] + _shell_token(record[3:])
 
 
-def _mixed(tag: str, to: str, residue: list[str], *, forward: bool = False) -> tuple[str, str]:
+def _mixed(
+    tag: str, to: str, residue: list[str], *, forward: bool = False, live: bool = False
+) -> tuple[str, str]:
     """MIXED_TREE, its reason naming the two commits and listing every path.
-    ``forward``: HEAD is at ``to``, not the tag, so the remedy finishes forward."""
+    ``forward``: HEAD is at ``to``, not the tag, so the remedy finishes forward.
+    ``live``: a `live` row with HEAD at the tag, which the repair heals."""
     lines = [_shown(r) for r in residue] or [
         "(the rebuild recorded that git wrote part of the tree)"
     ]
     where = (
         f"{_FORWARD} ({to[:12]}), half-written back toward {tag[:12]}"
         if forward
-        else f"the checkout is half-written between {tag[:12]} and {to[:12] or 'its merge'}"
+        else f"{_LIVE if live else 'the checkout is half-written'} between {tag[:12]} and "
+        f"{to[:12] or 'its merge'}"
     )
     return MIXED_TREE, where + ":\n" + "\n".join("  " + ln for ln in lines)
 
@@ -386,7 +397,7 @@ def _live_verdict(state: dict, repo: str, to: str, move_phase: str) -> tuple[str
         if move_phase != "clean":
             residue = _merge_residue(repo, tag, to, two_dot=True)
             if residue or move_phase == "partial":
-                return _mixed(tag, to, residue)
+                return _mixed(tag, to, residue, live=True)
         if _merge_residue(repo, tag, ""):
             return _hold("tracked files changed that the move does not write", _NOT_MOVED)
         return SAFE, "the rebuild moved nothing"
@@ -602,16 +613,32 @@ def message(state_path: str, verdict_: str, reason: str) -> str:
     """What every refusing caller says, so the remedy reads the same everywhere."""
     if verdict_ == MIXED_TREE:
         # The one place the paths are printed from (#3492): callers print this.
-        # Restoring to HEAD gives back whichever tree HEAD is: the code that ran
-        # before at the tag, the rebuilt tip at it, so the last step differs.
-        head = (
-            f"{state_path} records an update that stopped partway: {reason}\n"
+        by_hand = (
             "These paths hold part of an update's checkout. They may also include another "
             "session's edits: save any you want to keep (copy them aside) before restoring "
             "anything. Then restore tracked paths to HEAD with git restore --source=HEAD "
             "--staged --worktree -- <path>, delete the listed untracked files, and remove a "
             "stale .git/index.lock if no git process is running. "
         )
+        head = f"{state_path} records an update that stopped partway: {reason}\n"
+        if reason.startswith(_LIVE):
+            # The repair first; the by-hand steps too, because the kit repair-move
+            # runs is installed by a later change (#3492 PR D2), and with no kit
+            # the command refuses: the message must be actionable without it.
+            return head + (
+                "Put it back with scripts/deploy_candidates repair-move. It returns these "
+                "paths to the rollback tag (HEAD), saves every path it changes under "
+                "~/.genesis/deploy-backups/ first, and reports any that were not the "
+                "update's with the step that re-applies them; repair-move --explain prints "
+                "its steps. If it cannot run (it says when its kit is not installed), do it "
+                "by hand. " + by_hand + "HEAD is the code that ran before the update, so the "
+                "checkout is then that code again: Dismiss the update on the dashboard's "
+                "update card (or remove update_state.json). Do NOT run scripts/update.sh "
+                "--post-merge: it refuses a half-written tree."
+            )
+        head += by_hand
+        # Restoring to HEAD gives back whichever tree HEAD is: the code that ran
+        # before at the tag, the rebuilt tip at it, so the last step differs.
         if reason.startswith(_FORWARD):
             return head + (
                 "HEAD is the update's new code, so the checkout then holds that tree: finish with "

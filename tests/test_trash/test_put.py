@@ -7,6 +7,7 @@ module: a name imported before the fixture runs is the REAL path.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -14,7 +15,7 @@ from pathlib import Path
 import pytest
 
 import genesis.env as env
-from genesis.trash import ITEM, TrashRefused, list_entries, trash
+from genesis.trash import ITEM, TOMBSTONE, TrashRefused, list_entries, trash
 from genesis.trash.__main__ import EXIT_REFUSED, EXIT_USAGE, main
 
 
@@ -51,6 +52,66 @@ def test_put_needs_a_reason(tmp_path):
         main(["put", str(a)])
     assert exc.value.code == EXIT_USAGE
     assert a.exists()
+
+
+_SESSION_VARS = ("GENESIS_SESSION_ID", "CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID")
+
+
+def test_the_claude_code_session_id_is_recorded(tmp_path, monkeypatch):
+    # The shape a put from a Claude Code session has: CC sets only this one.
+    for var in _SESSION_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "cc-session")
+    stone = trash(_touch(tmp_path / "a.txt"), reason="r", caller="c")
+    assert stone.session_id == "cc-session"
+
+
+@pytest.mark.parametrize(
+    "present, expected",
+    [
+        (_SESSION_VARS, "GENESIS_SESSION_ID"),
+        (_SESSION_VARS[1:], "CLAUDE_CODE_SESSION_ID"),
+        (_SESSION_VARS[2:], "CLAUDE_SESSION_ID"),
+        ((), None),
+    ],
+)
+def test_the_session_id_follows_the_commit_hooks_order(tmp_path, monkeypatch, present, expected):
+    # The order scripts/hooks/prepare-commit-msg reads them in.
+    for var in _SESSION_VARS:
+        monkeypatch.delenv(var, raising=False)
+    for var in present:
+        monkeypatch.setenv(var, var)
+    stone = trash(_touch(tmp_path / "a.txt"), reason="r", caller="c")
+    assert stone.session_id == expected
+
+
+def test_an_empty_session_variable_falls_through(tmp_path, monkeypatch):
+    # As the hook's ${VAR:-...} does: set-but-empty counts as unset.
+    for var in _SESSION_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("GENESIS_SESSION_ID", "")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "cc-session")
+    stone = trash(_touch(tmp_path / "a.txt"), reason="r", caller="c")
+    assert stone.session_id == "cc-session"
+
+
+@pytest.mark.parametrize("genesis_id", [None, "", "genesis-session"])
+@pytest.mark.parametrize("cc_id", [None, "", "cc-session"])
+@pytest.mark.parametrize("legacy_id", [None, "", "legacy-session"])
+def test_session_id_absent_empty_and_nonempty_states(
+    tmp_path, monkeypatch, genesis_id, cc_id, legacy_id,
+):
+    values = (genesis_id, cc_id, legacy_id)
+    for name, value in zip(_SESSION_VARS, values, strict=True):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    expected = next((value for value in values if value), None)
+    stone = trash(_touch(tmp_path / "item.txt"), reason="r", caller="c")
+    assert stone.session_id == expected
+    stored = json.loads((Path(stone.root) / stone.entry_id / TOMBSTONE).read_text())
+    assert stored["session_id"] == expected
 
 
 @pytest.mark.parametrize("which", ["file", "wal", "shm", "dir"])
