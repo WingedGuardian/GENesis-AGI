@@ -18,18 +18,35 @@ CREDENTIAL_DOMAIN = "reference.credentials"
 SECRET_PLACEHOLDER = "[held in the reference secret store; read it with reference_lookup]"  # noqa: S105 - a marker, not a secret
 
 
+_VALUE_MARKER = "\n\nValue: "
+_TRAILER_PREFIXES = ("Tags: ", "Captured: ")
+
+
+def holds_secret(project_type: str | None, domain: str | None) -> bool:
+    """True for a reference whose value is held out of the indexed body."""
+    return project_type == "reference" and (domain or "").strip().lower() == CREDENTIAL_DOMAIN
+
+
 def refuse_inline_secret(project_type: str, domain: str, body: str) -> None:
-    """Fail closed on a credential reference whose body still carries its value.
+    """Fail closed on a credential reference whose body could carry its value.
 
     Every writer of knowledge_units passes here (insert and upsert), so a path
     that bypasses ingest_knowledge_unit (the orchestrator, an upload, a script)
-    cannot put a credential value into the indexed body.
+    cannot put a credential value into the indexed body. Accepted only: exactly
+    one ``Value:`` marker, and the value after it (trailing Tags/Captured lines
+    aside) is the placeholder itself, so neither a second Value line nor text
+    after the placeholder can carry the secret.
     """
-    if (
-        project_type == "reference"
-        and (domain or "").strip().lower() == CREDENTIAL_DOMAIN
-        and f"\n\nValue: {SECRET_PLACEHOLDER}" not in (body or "")
-    ):
+    if not holds_secret(project_type, domain):
+        return
+    text = body or ""
+    held = text.count(_VALUE_MARKER) == 1
+    if held:
+        lines = text.split(_VALUE_MARKER, 1)[1].split("\n")
+        while lines and lines[-1].startswith(_TRAILER_PREFIXES):
+            lines.pop()
+        held = "\n".join(lines).strip() == SECRET_PLACEHOLDER
+    if not held:
         raise ValueError(
             "refusing a credential reference whose body carries its value: write "
             "it through ingest_knowledge_unit, which holds the value out (#2426)"
@@ -243,79 +260,95 @@ async def upsert(
     unit_id = id or str(uuid.uuid4())
     now_iso = ingested_at or datetime.now(UTC).isoformat()
 
-    if secret_value is not None:
-        # FIRST, under the id the row will end up with: if this write fails (a
-        # process on new code against a database whose schema init has not run
-        # yet has no reference_secrets table), nothing of this call is pending
-        # on the shared connection for another writer's commit to carry, so a
-        # placeholder body can never commit without its secret.
-        existing = await db.execute_fetchall(
+    async def _write() -> tuple[str, bool]:
+        await db.execute(
+            """INSERT INTO knowledge_units
+               (id, project_type, domain, source_doc, source_platform, section_title,
+                concept, body, relationships, caveats, tags, confidence,
+                source_date, ingested_at, qdrant_id, embedding_model,
+                source_pipeline, purpose, ingestion_source, origin_class)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(project_type, domain, concept) DO UPDATE SET
+                   source_doc      = excluded.source_doc,
+                   source_platform = excluded.source_platform,
+                   section_title   = excluded.section_title,
+                   body            = excluded.body,
+                   relationships   = excluded.relationships,
+                   caveats         = excluded.caveats,
+                   tags            = excluded.tags,
+                   confidence      = excluded.confidence,
+                   source_date     = excluded.source_date,
+                   ingested_at     = excluded.ingested_at,
+                   qdrant_id       = excluded.qdrant_id,
+                   embedding_model = excluded.embedding_model,
+                   source_pipeline = excluded.source_pipeline,
+                   purpose         = excluded.purpose,
+                   ingestion_source = excluded.ingestion_source,
+                   origin_class    = excluded.origin_class""",
+            (unit_id, project_type, domain, source_doc, source_platform, section_title,
+             concept, body, relationships, caveats, tags, confidence,
+             source_date, now_iso, qdrant_id, embedding_model,
+             source_pipeline, purpose, ingestion_source, origin_class),
+        )
+
+        # Find the row that actually lives in the table — either the one we
+        # just inserted (same unit_id) or a pre-existing row with the same
+        # unique key (different id).  This matters because callers passing
+        # id=None on an UPSERT conflict would otherwise get back a brand-new
+        # UUID that points at nothing.
+        rows = await db.execute_fetchall(
             "SELECT id FROM knowledge_units WHERE project_type = ? "
             "AND domain = ? AND concept = ?",
             (project_type, domain, concept),
         )
+        row = rows[0] if rows else None
+        actual_id = row[0] if row else unit_id
+        inserted = actual_id == unit_id
+
+        # Replace FTS5 shadow row so full-text search stays consistent with body.
+        # FTS5 has no ON CONFLICT so we delete + re-insert under the actual id.
+        await db.execute(
+            "DELETE FROM knowledge_fts WHERE unit_id = ?", (actual_id,)
+        )
+        await db.execute(
+            """INSERT INTO knowledge_fts
+               (unit_id, concept, body, tags, domain, project_type)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (actual_id, concept, body, tags or "", domain, project_type),
+        )
+        return actual_id, inserted
+
+    if holds_secret(project_type, domain):
+        # #2426: a credential row commits only with its held-out value. Every
+        # check runs BEFORE the first write, because this shared connection
+        # interleaves other coroutines' statements between ours (it serializes
+        # statements, not transactions), so a failure midway can be neither
+        # rolled back safely nor left pending for another writer's commit. The
+        # first statement touches reference_secrets, so a database whose schema
+        # init has not created it fails here, with nothing written.
+        existing = await db.execute_fetchall(
+            "SELECT k.id, (SELECT 1 FROM reference_secrets s WHERE s.unit_id = k.id) "
+            "FROM knowledge_units k WHERE k.project_type = ? AND k.domain = ? "
+            "AND k.concept = ?",
+            (project_type, domain, concept),
+        )
+        if secret_value is None and not (existing and existing[0][1]):
+            raise ValueError(
+                "refusing a credential reference with no value to hold: its body "
+                "carries the placeholder and no secret is stored for it (#2426)"
+            )
+    actual_id, inserted = await _write()
+    if secret_value is not None:
+        # Under the id the row ACTUALLY has once the unique-key conflict
+        # resolved, never one read before it: two writers racing on one key
+        # both land on the surviving row, and its secret is the last one written,
+        # exactly as its body is.
         await db.execute(
             "INSERT INTO reference_secrets (unit_id, value, updated_at) VALUES (?, ?, ?) "
             "ON CONFLICT(unit_id) DO UPDATE SET value = excluded.value, "
             "updated_at = excluded.updated_at",
-            (existing[0][0] if existing else unit_id, secret_value, now_iso),
+            (actual_id, secret_value, now_iso),
         )
-
-    await db.execute(
-        """INSERT INTO knowledge_units
-           (id, project_type, domain, source_doc, source_platform, section_title,
-            concept, body, relationships, caveats, tags, confidence,
-            source_date, ingested_at, qdrant_id, embedding_model,
-            source_pipeline, purpose, ingestion_source, origin_class)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(project_type, domain, concept) DO UPDATE SET
-               source_doc      = excluded.source_doc,
-               source_platform = excluded.source_platform,
-               section_title   = excluded.section_title,
-               body            = excluded.body,
-               relationships   = excluded.relationships,
-               caveats         = excluded.caveats,
-               tags            = excluded.tags,
-               confidence      = excluded.confidence,
-               source_date     = excluded.source_date,
-               ingested_at     = excluded.ingested_at,
-               qdrant_id       = excluded.qdrant_id,
-               embedding_model = excluded.embedding_model,
-               source_pipeline = excluded.source_pipeline,
-               purpose         = excluded.purpose,
-               ingestion_source = excluded.ingestion_source,
-               origin_class    = excluded.origin_class""",
-        (unit_id, project_type, domain, source_doc, source_platform, section_title,
-         concept, body, relationships, caveats, tags, confidence,
-         source_date, now_iso, qdrant_id, embedding_model,
-         source_pipeline, purpose, ingestion_source, origin_class),
-    )
-
-    # Find the row that actually lives in the table — either the one we
-    # just inserted (same unit_id) or a pre-existing row with the same
-    # unique key (different id).  This matters because callers passing
-    # id=None on an UPSERT conflict would otherwise get back a brand-new
-    # UUID that points at nothing.
-    rows = await db.execute_fetchall(
-        "SELECT id FROM knowledge_units WHERE project_type = ? "
-        "AND domain = ? AND concept = ?",
-        (project_type, domain, concept),
-    )
-    row = rows[0] if rows else None
-    actual_id = row[0] if row else unit_id
-    inserted = actual_id == unit_id
-
-    # Replace FTS5 shadow row so full-text search stays consistent with body.
-    # FTS5 has no ON CONFLICT so we delete + re-insert under the actual id.
-    await db.execute(
-        "DELETE FROM knowledge_fts WHERE unit_id = ?", (actual_id,)
-    )
-    await db.execute(
-        """INSERT INTO knowledge_fts
-           (unit_id, concept, body, tags, domain, project_type)
-           VALUES (?, ?, ?, ?, ?, ?)""",
-        (actual_id, concept, body, tags or "", domain, project_type),
-    )
 
     if _commit:
         await db.commit()

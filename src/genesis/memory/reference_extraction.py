@@ -655,43 +655,79 @@ async def extract_references_from_chunk(
     return count
 
 
+#: Every pattern above that captures a SECRET, with the group holding it. The
+#: scrub runs all of them over every text field and collects every match,
+#: because the classifier stops at the first credential and one extraction can
+#: name several ("password: X; backup password: Y").
+_SECRET_GROUPS = (
+    (_CREDENTIAL_PAIR_PATTERN, "pass"),
+    (_EMAIL_PASSWORD_PATTERN, "pass"),
+    (_ACCOUNT_LIFECYCLE_PATTERN, "pass"),
+    (_SINGLE_CREDENTIAL_PATTERN, "value"),
+    (_KNOWN_KEY_PREFIX_PATTERN, "token"),
+    (_CREDENTIAL_TOKEN_PATTERN, "token"),
+    (_ENV_ASSIGNMENT_PATTERN, "val"),
+)
+_TEXT_FIELDS = ("content", "event_subject", "event_verb", "event_object", "scenario", "temporal")
+
+
+def _extraction_texts(extraction: Extraction) -> list[str]:
+    texts = [getattr(extraction, name) for name in _TEXT_FIELDS]
+    texts += list(extraction.entities)
+    for rel in extraction.relationships:
+        if isinstance(rel, dict):
+            texts += list(rel.values())
+    return [t for t in texts if isinstance(t, str) and t]
+
+
 def scrub_credential_extraction(extraction: Extraction) -> bool:
-    """Redact a credential's value from the extraction itself, in place.
+    """Redact every credential secret an extraction carries, in place.
 
     The extraction job stores each extraction as an episodic memory, logs it,
     dedups and links it, and embeds it in the connection pass, AFTER it may have
     been promoted to a reference. The reference holds the value out (#2426);
     without this the same text would put it straight back into memory_fts, the
-    vector store, entity mentions and the journal. The classifier runs ungated
-    here (``user_text=None``), so text that names a credential is scrubbed even
-    when auto-capture declined to store it: redacting more is the safe side.
-    Returns True when anything was redacted.
+    vector store, entity mentions, memory_events and the journal. Every secret
+    any credential pattern captures, in any text field, is redacted from every
+    text field (with the fragment rules ``reference_ops.secret_fragments``
+    applies to a stored value), whether or not auto-capture stored a reference:
+    redacting more is the safe side. Returns True when anything was redacted.
     """
     from genesis.memory.reference_ops import scrub, secret_fragments
 
+    secrets: set[str] = set()
     try:
-        ref = classify_as_reference(extraction)
+        for text in _extraction_texts(extraction):
+            for pattern, group in _SECRET_GROUPS:
+                for match in pattern.finditer(text):
+                    value = (match.group(group) or "").strip()
+                    if value:
+                        secrets.add(value)
     except Exception:
-        logger.warning("credential scrub: classification failed", exc_info=True)
+        logger.warning("credential scrub: matching failed", exc_info=True)
         return False
-    if ref is None or ref["kind"] != "credentials":
+    if not secrets:
         return False
-    fragments = secret_fragments(ref["value"])
-    if not fragments:
-        return False
+    fragments = sorted(
+        {f for value in secrets for f in secret_fragments(value)}, key=len, reverse=True,
+    )
+
+    # Every fragment here came out of a password/token capture, so each is a
+    # secret by label: redact it even glued to other text.
+    glued = frozenset(fragments)
 
     def _clean(value: object) -> object:
-        return scrub(value, fragments) if isinstance(value, str) else value
+        return scrub(value, fragments, glued) if isinstance(value, str) else value
 
-    extraction.content = scrub(extraction.content, fragments)
+    before = _extraction_texts(extraction)
+    for name in _TEXT_FIELDS:
+        setattr(extraction, name, _clean(getattr(extraction, name)))
     extraction.entities = [_clean(e) for e in extraction.entities]
     extraction.relationships = [
         {k: _clean(v) for k, v in rel.items()} if isinstance(rel, dict) else rel
         for rel in extraction.relationships
     ]
-    for name in ("event_subject", "event_object", "scenario"):
-        setattr(extraction, name, _clean(getattr(extraction, name)))
-    return True
+    return _extraction_texts(extraction) != before
 
 
 __all__ = [

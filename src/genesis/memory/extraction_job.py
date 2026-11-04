@@ -393,6 +393,15 @@ async def run_extraction_cycle(
                 scrub_credential_extraction,
             )
 
+            # Source overlap is judged on the text as extracted: the scrub below
+            # replaces the credential with a marker the transcript does not
+            # contain, which would count as ungrounded words.
+            source_text = format_chunk_for_extraction(chunk)
+            overlap_by_extraction = {
+                id(extraction): verify_source_overlap(extraction.content, source_text)
+                for extraction in result.extractions
+                if extraction.extraction_type != "procedure_candidate"
+            }
             for extraction in result.extractions:
                 if scrub_credential_extraction(extraction):
                     summary["credentials_scrubbed"] = summary.get("credentials_scrubbed", 0) + 1
@@ -425,9 +434,6 @@ async def run_extraction_cycle(
                 # episodic memory rows that already exist from prior cycles.
                 continue
 
-            # Build source text once per chunk for overlap verification
-            source_text = format_chunk_for_extraction(chunk)
-
             # Store each extraction with provenance
             for extraction in result.extractions:
                 # procedure_candidate extractions are routed to the Judge
@@ -439,9 +445,7 @@ async def run_extraction_cycle(
                 # Check that extraction content actually appears in the
                 # source transcript chunk. Demote confidence for ungrounded
                 # extractions. See memory-immune-system-design.md §1.1.
-                overlap_result = verify_source_overlap(
-                    extraction.content, source_text,
-                )
+                overlap_result = overlap_by_extraction[id(extraction)]
                 if not overlap_result.verified:
                     extraction.confidence = max(
                         extraction.confidence - 0.3, 0.1,

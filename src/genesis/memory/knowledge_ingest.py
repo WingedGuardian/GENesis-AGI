@@ -85,7 +85,9 @@ async def ingest_knowledge_unit(
 
     secret_value: str | None = None
     if reference_ops.holds_secret(project, domain):
-        content, secret_value, tags_json = reference_ops.split_secret(content, tags_json)
+        content, secret_value, tags_json, concept = reference_ops.split_secret(
+            content, tags_json, concept,
+        )
 
     resolved_concept = concept if concept is not None else content[:200]
 
@@ -184,7 +186,14 @@ async def ingest_knowledge_unit(
     # the new one, the old point is now orphaned — delete it so Qdrant
     # stays in sync with the knowledge_units row of record. store.delete()
     # handles metadata, FTS5, Qdrant, links, and pending_embeddings cascade.
-    if old_qdrant_id and old_qdrant_id != qdrant_memory_id:
+    # store.store dedups by exact content, so two units can share one point
+    # (credentials more often now, with the value held out of both bodies):
+    # never delete a point another unit still names.
+    still_named = bool(old_qdrant_id) and bool(await db.execute_fetchall(
+        "SELECT 1 FROM knowledge_units WHERE qdrant_id = ? AND id != ? LIMIT 1",
+        (old_qdrant_id, actual_id),
+    ))
+    if old_qdrant_id and old_qdrant_id != qdrant_memory_id and not still_named:
         try:
             res = await store.delete(old_qdrant_id)
             if res.get("deferred"):

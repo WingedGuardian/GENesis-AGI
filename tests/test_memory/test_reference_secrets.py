@@ -169,7 +169,7 @@ def test_identifiers_inside_a_value_stay_searchable():
 
 def test_a_short_unlabelled_token_is_not_scrubbed_from_prose():
     """'admin / Hunter2!xyz': redacting 'admin' would redact 'router admin panel'."""
-    held, value, _ = ro.split_secret(
+    held, value, _, _ = ro.split_secret(
         _body(value="admin / Hunter2!xyz", description="Router admin panel")
     )
     assert value == "admin / Hunter2!xyz"
@@ -288,7 +288,7 @@ async def test_no_recall_row_carries_the_value(db):
 
 
 def test_a_password_inside_a_prose_value_is_redacted_from_the_description():
-    held, _, _ = ro.split_secret(
+    held, _, _, _ = ro.split_secret(
         _body(value="log in as example-admin with password k9!Lp-fake",
               description="Router login; the password k9!Lp-fake was rotated")
     )
@@ -367,8 +367,134 @@ def test_an_extraction_without_a_credential_is_untouched():
 def test_a_tag_loses_the_value_even_inside_a_longer_word():
     """Prose keeps word boundaries; a tag does not need them (a live tag carried
     its password that way)."""
-    held, _, tags = ro.split_secret(
+    held, _, tags, _ = ro.split_secret(
         _body(tags=[f"pw{_PASSWORD}x"]), json.dumps([f"pw{_PASSWORD}x"]),
     )
     assert _PASSWORD not in tags
     assert _PASSWORD not in held
+
+
+# ─── review round 1 (#3898) ──────────────────────────────────────────────────
+
+
+async def test_the_concept_loses_the_value_too(db):
+    """An extraction with no entities derives the identifier from its own text,
+    which can carry the password; the concept is indexed in knowledge_fts."""
+    store = _store()
+    unit_id = await ingest_knowledge_unit(
+        store=store, db=db, content=_body(), project=ro.REFERENCE_PROJECT,
+        domain="reference.credentials", concept=f"router login {_PASSWORD}",
+    )
+    row = await kc.get(db, unit_id)
+    fts = await db.execute_fetchall("SELECT concept FROM knowledge_fts WHERE unit_id = ?", (unit_id,))
+    assert _PASSWORD not in row["concept"] and _PASSWORD not in fts[0][0]
+    assert await _secret(db, unit_id) == _VALUE
+
+
+async def test_the_db_layer_refuses_a_second_value_line_after_the_placeholder(db):
+    body = f"[reference.credentials] X\n\nd\n\nValue: {kc.SECRET_PLACEHOLDER}\n\nValue: {_PASSWORD}"
+    with pytest.raises(ValueError, match="carries its value"):
+        await kc.upsert(db, project_type="reference", domain="reference.credentials",
+                        source_doc="x", concept="c", body=body)
+    body = f"[reference.credentials] X\n\nd\n\nValue: {kc.SECRET_PLACEHOLDER}\n{_PASSWORD}"
+    with pytest.raises(ValueError, match="carries its value"):
+        await kc.upsert(db, project_type="reference", domain="reference.credentials",
+                        source_doc="x", concept="c", body=body)
+
+
+def test_a_description_carrying_the_value_marker_is_refused():
+    with pytest.raises(ValueError, match="exactly one"):
+        ro.split_secret(_body(description="note\n\nValue: tail-fake"))
+
+
+async def test_a_new_credential_with_no_value_to_hold_is_refused(db):
+    """A held-out body under a NEW identifier (or a value equal to the
+    placeholder) brings no secret: refused, nothing written."""
+    held = _body().replace(f"Value: {_VALUE}", f"Value: {kc.SECRET_PLACEHOLDER}")
+    with pytest.raises(ValueError, match="no value to hold"):
+        await ingest_knowledge_unit(
+            store=_store(), db=db, content=held, project=ro.REFERENCE_PROJECT,
+            domain="reference.credentials", concept="brand new",
+        )
+    assert await db.execute_fetchall("SELECT 1 FROM knowledge_units") == []
+
+
+async def test_the_secret_lands_on_the_row_that_survives_the_key_conflict(db):
+    """A caller passing a fresh id for an existing key: the row keeps its
+    original id, and the secret must be written under THAT id."""
+    first = await _ingest(db, _store(), _body())
+    actual, inserted = await kc.upsert(
+        db, id="some-other-id", project_type="reference", domain="reference.credentials",
+        source_doc="x", concept="Lab router admin",
+        body=(await kc.get(db, first))["body"], secret_value="user: example-admin, password: New!Fake-3",
+    )
+    assert actual == first and inserted is False
+    assert await _secret(db, first) == "user: example-admin, password: New!Fake-3"
+    assert await _secret(db, "some-other-id") is None
+
+
+async def test_a_refused_write_leaves_nothing_for_another_commit(db):
+    held = _body().replace(f"Value: {_VALUE}", f"Value: {kc.SECRET_PLACEHOLDER}")
+    with pytest.raises(ValueError):
+        await kc.upsert(db, project_type="reference", domain="reference.credentials",
+                        source_doc="x", concept="new", body=held, _commit=False)
+    await db.commit()
+    assert await db.execute_fetchall("SELECT 1 FROM knowledge_units") == []
+    assert await db.execute_fetchall("SELECT 1 FROM knowledge_fts") == []
+
+
+def test_every_password_in_one_extraction_is_scrubbed():
+    from genesis.memory.extraction import Extraction
+    from genesis.memory.reference_extraction import scrub_credential_extraction
+
+    ex = Extraction(
+        content="Lab router login: username: admin, password: First!Fake9; backup password: Second!Fake8",
+        extraction_type="entity", confidence=0.9,
+        event_verb="set password: First!Fake9", temporal="Second!Fake8",
+    )
+    assert scrub_credential_extraction(ex) is True
+    for text in (ex.content, ex.event_verb, ex.temporal):
+        assert "First!Fake9" not in text and "Second!Fake8" not in text, text
+
+
+def test_glued_short_and_multiword_secrets_are_all_held():
+    assert "xy" in ro.secret_fragments("operator / xy")
+    assert ro.scrub("prefixHunter2!xyzsuffix", ["Hunter2!xyz"]) == f"prefix{ro.REDACTED}suffix"
+    frags = ro.secret_fragments("password: blue moon river")
+    assert {"blue", "moon", "river"} <= set(frags)
+    held, _, _, _ = ro.split_secret(_body(value="password: blue moon river",
+                                          description="the blue moon one"))
+    assert "blue moon" not in held
+
+
+async def test_a_point_another_unit_still_names_is_not_deleted(db):
+    store = _store()
+    a = await ingest_knowledge_unit(store=store, db=db, content="shared text", project="p",
+                                    domain="d", concept="a")
+    await ingest_knowledge_unit(store=store, db=db, content="shared text", project="p",
+                                domain="d", concept="b")
+    store.store = AsyncMock(return_value="qid-2")
+    await ingest_knowledge_unit(store=store, db=db, content="changed", project="p",
+                                domain="d", concept="a")
+    store.delete.assert_not_awaited()
+    assert (await kc.get(db, a))["qdrant_id"] == "qid-2"
+
+
+def test_distillation_and_uploads_refuse_credential_units_before_any_vector():
+    import inspect
+
+    from genesis.knowledge import ingest_upload, orchestrator
+
+    for module, before in ((orchestrator, "qdrant_ids: list[str] = []"),
+                           (ingest_upload, "qdrant_id = await memory_mod._store.store(")):
+        src = inspect.getsource(module)
+        assert src.index("holds_secret(") < src.index(before), module.__name__
+
+
+def test_a_labelled_all_letter_password_is_redacted_even_glued():
+    """A labelled secret IS the secret: word boundaries protect prose words
+    ("inactive"), never a password run into other text."""
+    held, _, _, _ = ro.split_secret(_body(value="password: sunshinefake",
+                                          description="old: xsunshinefakes"))
+    assert "sunshinefake" not in held
+    assert "inactive" in ro.scrub("inactive", ["active"])
