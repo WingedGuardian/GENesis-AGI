@@ -44,6 +44,9 @@ SCHEMA_VERSION = 3
 # failures) produces by accident, so the runner never mistakes a crash for the
 # expected pause.
 AUTOMATIC_PROTOCOL_INCOMPLETE = 10
+# A busy queue is transient contention. The CLI reports it as 75 and the runner
+# logs it and exits 0, like an overlapping tick, so the unit never reads failed.
+BUSY_STATUS = 75
 
 
 def _load_sibling(name, spec):
@@ -573,7 +576,7 @@ def list_markers() -> list[dict]:
                 **dict(row),
                 "tools": row["provider"],
                 "legacy_shared_attempts": _legs.shared_debts(row["legacy_shared_attempts"]),
-                "age_s": min(_legs.INTEGER_MAX, max(0, int(now - row["requested_at"]))),
+                "age_s": int(min(_legs.INTEGER_MAX, max(0, now - row["requested_at"]))),
             }
             for row in db.execute("SELECT * FROM pending ORDER BY hash,provider")
         ]
@@ -729,6 +732,62 @@ def _cli_context(args):
     return context
 
 
+def _machine_hash(value: str) -> str:
+    if len(value) != 16 or any(char not in "0123456789abcdef" for char in value):
+        raise ValueError("invalid machine repository hash")
+    return value
+
+
+def _pending_record(row: dict) -> tuple[str, ...]:
+    h = _machine_hash(row["hash"])
+    repo, provider, age = row["repo_path"], row["provider"], row["age_s"]
+    if (
+        not _legs.stored_repo(repo)
+        or _legs.stored_hash(repo) != h
+        or provider not in _legs.PROVIDERS
+        or type(age) is not int
+        or not 0 <= age <= _legs.INTEGER_MAX
+    ):
+        raise ValueError("invalid machine pending snapshot")
+    return "1", "pending", h, repo, provider, str(age)
+
+
+def _claim_record(row: dict, h: str, provider: str) -> tuple[str, ...]:
+    context = _legs.validate_context(row["context"], marker_hash)
+    if (
+        context["hash"] != h
+        or context["provider"] != provider
+        or any(
+            row.get(key) != context[key] for key in ("hash", "repo_path", "provider", "claim_id")
+        )
+        or row.get("tools") != provider
+        or row.get("mode") not in VALID_MODES
+    ):
+        raise ValueError("invalid machine claim snapshot")
+    return (
+        "1",
+        "claim",
+        context["hash"],
+        context["repo_path"],
+        context["provider"],
+        row["mode"],
+        json.dumps(context, ensure_ascii=True, separators=(",", ":")),
+    )
+
+
+def _write_machine(records) -> None:
+    # Render/validate the complete population before emitting any byte. The
+    # consumer checks both actual process status and complete NUL framing.
+    encoded = []
+    for record in records:
+        for field in record:
+            if not isinstance(field, str) or "\0" in field:
+                raise ValueError("invalid machine field")
+            encoded.append(field.encode("utf-8") + b"\0")
+    sys.stdout.buffer.write(b"".join(encoded))
+    sys.stdout.buffer.flush()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Code-intel provider-leg queue")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -739,13 +798,15 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("hash")
     p.add_argument("--repo", required=True)
     sub.add_parser("list")
-    sub.add_parser("list-legs")
+    p = sub.add_parser("list-legs")
+    p.add_argument("--nul", action="store_true")
     sub.add_parser("automatic-ready")
     p = sub.add_parser("import-status")
     p.add_argument("--limit", type=int, default=20)
     p = sub.add_parser("claim")
     p.add_argument("--hash", required=True)
     p.add_argument("--provider", choices=_legs.PROVIDERS, required=True)
+    p.add_argument("--nul", action="store_true")
     for name in ("consume", "restore", "remember-outcome", "apply-outcome"):
         p = sub.add_parser(name)
         p.add_argument("--context", required=True)
@@ -756,8 +817,13 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("should-escalate", "stamp-full", "mark-full-backoff"):
         p = sub.add_parser(name)
         p.add_argument("--hash", required=True)
+        if name == "should-escalate":
+            p.add_argument("--nul", action="store_true")
     sub.add_parser("reconcile-inflight")
     args = parser.parse_args(argv)
+    machine = getattr(args, "nul", False)
+    if machine and args.cmd in ("claim", "should-escalate"):
+        _machine_hash(args.hash)
     if args.cmd in ("automatic-ready", "import-status"):
         try:
             result = _legacy.import_status(
@@ -770,7 +836,11 @@ def main(argv: list[str] | None = None) -> int:
                 json.dumps({"state": "error", "error": str(exc)}, ensure_ascii=True),
                 file=sys.stderr if args.cmd == "automatic-ready" else sys.stdout,
             )
-            return 2
+            # Only the runner's observer reports busy apart; import-status keeps 2.
+            busy = isinstance(exc, TimeoutError) or (
+                isinstance(exc, sqlite3.OperationalError) and _is_busy(exc)
+            )
+            return BUSY_STATUS if busy and args.cmd == "automatic-ready" else 2
         print(json.dumps(result, ensure_ascii=True))
         return AUTOMATIC_PROTOCOL_INCOMPLETE if args.cmd == "automatic-ready" else 0
     if args.cmd == "write":
@@ -781,7 +851,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd in ("list", "list-legs"):
         rows = list_markers()
-        if args.cmd == "list":
+        if machine:
+            _write_machine([_pending_record(row) for row in rows])
+        elif args.cmd == "list":
             # Legacy human view only; list-legs is lossless JSON per line.
             for row in rows:
                 print(
@@ -794,8 +866,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "claim":
         row = claim(args.hash, provider=args.provider)
         if row is None:
+            if machine:
+                _write_machine([("1", "unclaimed", args.hash, args.provider)])
             return 1
-        print(json.dumps(row, ensure_ascii=True))
+        if machine:
+            _write_machine([_claim_record(row, args.hash, args.provider)])
+        else:
+            print(json.dumps(row, ensure_ascii=True))
         return 0
     if args.cmd == "consume":
         consume(_cli_context(args))
@@ -813,7 +890,13 @@ def main(argv: list[str] | None = None) -> int:
         print(state)
         return 0
     if args.cmd == "should-escalate":
-        return 0 if should_escalate_full(args.hash) else 1
+        due = should_escalate_full(args.hash)
+        if machine:
+            if type(due) is not bool:
+                raise ValueError("invalid machine escalation answer")
+            _write_machine([("1", "escalation", args.hash, "1" if due else "0")])
+            return 0
+        return 0 if due else 1
     if args.cmd == "stamp-full":
         stamp_full(args.hash)
         return 0
@@ -834,6 +917,18 @@ if __name__ == "__main__":
     except QueueConversionDeferred as exc:
         print(f"index_marker: {exc}", file=sys.stderr)
         sys.exit(2)
+    except TimeoutError as exc:
+        # A busy queue is transient: BUSY_STATUS lets the runner defer the tick.
+        print(f"index_marker: {exc}", file=sys.stderr)
+        sys.exit(BUSY_STATUS)
+    except sqlite3.OperationalError as exc:
+        if not _is_busy(exc):
+            import traceback
+
+            traceback.print_exc()
+            sys.exit(2)
+        print(f"index_marker: queue busy: {exc}", file=sys.stderr)
+        sys.exit(BUSY_STATUS)
     except Exception:
         import traceback
 

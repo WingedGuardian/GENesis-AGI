@@ -1694,8 +1694,14 @@ the shared banner is not an assertion about all concurrent sessions.
   complete provider/protocol/sequence/nonce/repository context. `import-status`
   observes receipt totals without initialization or migration; `automatic-ready`
   fences every automatic reconciliation/claim/launch until the later protocol
-  completes. There is no readiness setter. This does not implement persistent
-  resource quarantine or the checked consumer's list/claim error propagation.
+  completes. There is no readiness setter. Behind that fence, the checked
+  consumer validates complete NUL list/claim/escalation acknowledgements and
+  actual child status, dispatches one provider from its authoritative claim and
+  settles the complete context. Entrypoint and freeze repository normalization
+  preserve trailing newlines and collapse Linux root aliases before lock hashing.
+  Retained terminal decisions replay without
+  resending known completions; missing terminal evidence, native intent/scope
+  cleanup and persistent resource quarantine remain separate activation gates.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
   deletions; native query/client cgroup proof and orphan-scope checks precede
