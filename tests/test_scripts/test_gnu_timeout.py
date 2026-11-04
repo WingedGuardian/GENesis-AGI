@@ -24,7 +24,7 @@ _SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
 _HELPER = _SCRIPTS / "lib" / "gnu_timeout.sh"
 # Options may come first, and the upstream defect covers a KILL sent as the main signal too.
 _KILL_AFTER = re.compile(
-    r"(?<![\w-])timeout\s+(?:--?[\w-]+(?:=\S+)?\s+)*(-k\b|--kill-after\b|-s\s*(?:SIG)?KILL\b|--signal[= ](?:SIG)?KILL\b)"
+    r"(?<![\w-])timeout\s+(?:-\S*\s+)*?(-k\b|--kill-after\b|-s\s*(?:SIG)?KILL\b|--signal[= ](?:SIG)?KILL\b)"
 )
 #: Scripts with no sourcing of their own, and the script that gives them the helper.
 _LOADED_THROUGH = {

@@ -123,22 +123,6 @@ def _home_dev(box) -> str:
     return str(os.stat(box["home"]).st_dev)
 
 
-def _home_domain_path(box) -> str:
-    """The watched path a poll measures $HOME's domain through.
-
-    A domain is measured once, through the first watched path in it, and `/` comes
-    first. So that is `/` when the test's home sits on the root mount, and the home
-    itself when the test temp is its own filesystem (a separate /tmp).
-    """
-    mount = subprocess.run(
-        ["stat", "-c", "%m", "--", str(box["home"])],
-        capture_output=True,
-        text=True,
-        check=True,
-    ).stdout.strip()
-    return "/" if mount == "/" else str(box["home"])
-
-
 # handle_fs args: path dev tier free total eta writers fstype
 def _handle(box, tier, *, dev=None, free=1000, total=100_000, eta="-", writers="", act=1):
     dev = dev or _home_dev(box)
@@ -872,12 +856,19 @@ def test_the_domain_key_ignores_which_wall_binds(box):
     different sides between two reads. The key comes from the mount and the
     RAW statvfs sizes, which a btrfs qgroup never changes.
 
-    Read through $HOME's domain and its downloads directory, which share a mount
-    on every layout; `/` and $HOME do not when the test temp is its own filesystem."""
-    first = _home_domain_path(box)
-    st = _poll(box, {first: "5000 267000 1 - - btrfs", str(box["dl"]): "5000 357000 0 - - btrfs"})
-    home_like = [p for p in st["disk"] if p in (first, str(box["home"]), str(box["dl"]))]
-    assert home_like == [first], st["disk"].keys()
+    Read through $HOME and its downloads directory, which share a domain on every
+    layout, while `/` is outside it when the test temp is its own filesystem. Neither
+    may be reported beside the other, whichever path speaks for the domain."""
+    home, dl = str(box["home"]), str(box["dl"])
+    st = _poll(
+        box,
+        {
+            "/": "5000 267000 1 - - btrfs",
+            home: "5000 357000 0 - - btrfs",
+            dl: "5000 447000 0 - - btrfs",
+        },
+    )
+    assert len({home, dl} & set(st["disk"])) <= 1, st["disk"].keys()
 
 
 def test_episode_markers_of_a_vanished_domain_are_dropped(box):
@@ -1353,5 +1344,8 @@ def test_a_fault_in_the_runaway_response_never_costs_the_home_levers(box):
     reserve.write_bytes(b"x")
     crash = 'wg_runaway_check() { local x="$__never_set_anywhere__"; }'
     with pytest.raises(AssertionError):
-        _poll(box, {_home_domain_path(box): "100 100000 0 - - ext4"}, extra=crash)
+        # A domain is measured through its first watched path, and which one that is
+        # depends on the layout, so both answer RED.
+        red = "100 100000 0 - - ext4"
+        _poll(box, {"/": red, str(box["home"]): red}, extra=crash)
     assert not reserve.exists(), "the home RED released its reserve before the response ran"
