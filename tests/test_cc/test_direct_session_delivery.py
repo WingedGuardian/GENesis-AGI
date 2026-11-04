@@ -323,11 +323,25 @@ class TestRunSessionDeliveryWiring:
         runner._record_proposal_outcome = AsyncMock()
         runner._session_manager.fail = AsyncMock()
         runner._deliver_result_to_origin = AsyncMock()
-        runner._notify = AsyncMock()
+        runner._notify = AsyncMock(return_value="sent")
+        runner._mark_paged = AsyncMock()
 
-        # Legacy caller (notify=True → FAILURE_ONLY): broadcast, not origin.
-        req = DirectSessionRequest(prompt="x", notify=True)
+        # Owner-requested legacy caller (notify=True → FAILURE_ONLY): broadcast,
+        # not origin.
+        req = DirectSessionRequest(prompt="x", notify=True, caller_context="mcp_tool")
         with pytest.raises(RuntimeError):
             await runner._run_session(req, "sess-3")
         runner._notify.assert_awaited_once()
+        # The broadcast's own result decides whether the stop counts as paged.
+        runner._mark_paged.assert_awaited_once_with("sess-3", "sent")
         runner._deliver_result_to_origin.assert_not_awaited()
+
+        # Any other caller's failure waits for the hourly stopped-session page.
+        runner._notify.reset_mock()
+        req = DirectSessionRequest(
+            prompt="x", notify=True, source_tag="models_md_synthesis",
+            caller_context="schedule:models_md_synthesis",
+        )
+        with pytest.raises(RuntimeError):
+            await runner._run_session(req, "sess-4")
+        runner._notify.assert_not_awaited()
