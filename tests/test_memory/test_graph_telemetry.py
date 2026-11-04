@@ -731,3 +731,70 @@ async def test_a_fallback_row_carries_no_primary_timing(db, monkeypatch):
 
     [row] = await _rows(db)
     assert "primary_ms" not in row
+
+
+class _RetriedStore(_OkStore):
+    """Answers, but only after retrying a stale pooled socket, as
+    ``graphstore_falkor`` does after an engine restart (#3035)."""
+
+    async def traverse(self, db, root_id, *, max_depth, min_strength, include_deprecated=False):
+        self.calls += 1
+        telemetry.note_retry("ConnectionError")
+        return []
+
+
+@pytest.mark.asyncio
+async def test_a_retried_read_is_recorded_as_retried_never_as_primary(db, monkeypatch):
+    """The retry spares the caller a NetworkX rebuild, but the engine DID drop
+    the connection, so the row says so: a primary answer it was not."""
+    monkeypatch.setattr(graph_mod, "_traversal_store", lambda: _RetriedStore())
+
+    await graph_mod.traverse(db, "root")
+
+    [row] = await _rows(db)
+    assert row["outcomes"] == {"retried": 1}
+    assert row["served"] == {"falkordb": 1}
+    [event] = row["events"]
+    assert event["outcome"] == "retried"
+    assert event["primary_reason"] == "ConnectionError"
+
+
+@pytest.mark.asyncio
+async def test_a_retry_noted_by_one_traversal_never_marks_the_next(db, monkeypatch):
+    stores = iter([_RetriedStore(), _OkStore()])
+    monkeypatch.setattr(graph_mod, "_traversal_store", lambda: next(stores))
+
+    async with telemetry.traversal_tally(db, caller="recall"):
+        await graph_mod.traverse(db, "a")
+        await graph_mod.traverse(db, "b")
+
+    # The retried call is clock-breaking, so it is written as its own row the
+    # moment it happens; the clean call after it closes with the tally.
+    rows = await _rows(db)
+    assert [r["outcomes"] for r in rows] == [{"retried": 1}, {"primary": 1}]
+
+
+class _RetriedThenSlowStore(_OkStore):
+    """Retries a dropped connection, then is still working when the caller's
+    own deadline fires (a slow marker query after the retry, say)."""
+
+    async def traverse(self, db, root_id, *, max_depth, min_strength, include_deprecated=False):
+        self.calls += 1
+        telemetry.note_retry("ConnectionError")
+        await asyncio.sleep(5)
+        return []
+
+
+@pytest.mark.asyncio
+async def test_a_cancellation_after_a_retry_still_records_the_retry(db, monkeypatch):
+    """The engine dropped a connection before the caller gave up, so the row
+    must say so: a neutral `cancelled` here would hide a restart from the clock."""
+    monkeypatch.setattr(graph_mod, "_traversal_store", lambda: _RetriedThenSlowStore())
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(graph_mod.traverse(db, "root"), timeout=0.05)
+
+    [row] = await _rows(db)
+    assert row["outcomes"] == {"retried": 1}
+    [event] = row["events"]
+    assert event["primary_reason"] == "ConnectionError"

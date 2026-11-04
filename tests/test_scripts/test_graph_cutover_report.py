@@ -414,3 +414,18 @@ async def test_a_real_client_waiting_on_its_reply_reads_as_reply(tmp_path):
 
     names = await _real_client_frames(tmp_path, answer_handshake=True)
     assert _rep._phase(names[-falkor_mod._DIAG_FRAMES :]) == "reply", names
+
+
+def test_a_retried_reset_says_what_the_retry_recovered_from():
+    """#3035: a retried read has no timeout diag, so without this the reset line
+    would name a pid and nothing else."""
+    out = _rep._cause(
+        {"outcome": "retried", "pid": 7, "primary_reason": "ConnectionError", "diag": None}
+    )
+    assert "answered after one retry of a dropped connection (ConnectionError)" in out
+
+
+def test_a_fallback_reset_never_claims_a_retry():
+    # redis-py's own frames include `call_with_retry`, so test the phrase, not the word.
+    phrase = "answered after one retry"
+    assert phrase not in _cause_of({"frames": _REPLY[-16:], "conn": "idle_open"})

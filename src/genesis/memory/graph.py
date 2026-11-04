@@ -44,7 +44,9 @@ from genesis.memory.graph_telemetry import (
     exception_reason,
     note_traversal,
     publish_selection,
+    read_retry,
     read_selection,
+    reset_retry,
     reset_selection,
 )
 from genesis.memory.graphstore import (
@@ -253,6 +255,7 @@ async def traverse(
     start = time.monotonic()
 
     reset_selection()
+    reset_retry()
     active = _traversal_store()
     configured, selection_error = read_selection()
     track = _TraversalTrack(served_by=getattr(active, "name", "?"))
@@ -294,6 +297,13 @@ async def traverse(
             outcome = "selection_failed"
         elif track.fell_back:
             outcome = "fallback"
+        elif (retried_after := read_retry()) is not None:
+            # The engine had already dropped a connection when the caller gave
+            # up (during the retry, or during the marker query after it). That
+            # drop is the event the clock exists to see; a cancellation must not
+            # turn it into a neutral row.
+            outcome = "retried"
+            track.primary_reason = retried_after
         else:
             outcome = "cancelled"
         track.served_by = "none"
@@ -308,6 +318,12 @@ async def traverse(
             outcome = "fallback"
         elif track.declined:
             outcome = "mode_unsupported"
+        elif (retried_after := read_retry()) is not None:
+            # The selected store answered, but only by retrying a connection the
+            # engine had dropped (#3035). Clock-breaking by design: a successful
+            # retry must never let a restarting engine read as a clean one.
+            outcome = "retried"
+            track.primary_reason = retried_after
         else:
             outcome = "primary"
             primary_ms = result.query_ms

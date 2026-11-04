@@ -207,6 +207,21 @@ def _timeout_diag(
     return diag
 
 
+def _is_stale_socket(cause: BaseException | None) -> bool:
+    """A pooled connection the engine closed: redis-py's ``ConnectionError``,
+    minus the subclasses an immediate retry would hit identically:
+    ``BusyLoadingError`` (the engine is still loading) and the auth refusals.
+    ``MaxConnectionsError`` and a refused connect while the engine is down stay
+    in: the retry costs one fast attempt, and the row still ends as a fallback,
+    so neither can hide a failure."""
+    try:
+        import redis.exceptions as rex
+    except ImportError:
+        return False
+    refused_alike = (rex.BusyLoadingError, rex.AuthenticationError, rex.AuthorizationError)
+    return isinstance(cause, rex.ConnectionError) and not isinstance(cause, refused_alike)
+
+
 @contextlib.contextmanager
 def _labelled(query: str):
     """Name which of a traversal's two queries a timeout's ``.diag`` belongs to.
@@ -657,6 +672,45 @@ class FalkorGraphStore:
 
         return await self._bounded(_run, timeout=timeout, what="graph query")
 
+    async def _read(
+        self, cypher: str, params: dict[str, Any], *, timeout: float, deadline: float
+    ) -> Any:
+        """A READ query that survives ONE stale pooled connection (issue #3035).
+
+        After the engine restarts, or closes an idle client, the next read on a
+        pooled connection fails at once with ``ConnectionError`` ("Connection
+        lost") and the read after it reconnects and succeeds. MEASURED
+        2026-11-03 on redis-py 8.1.0 under both the pure-Python and the hiredis
+        parser: 0.9-1.5 ms to fail, 4 of 4 next reads answered. Without this,
+        every process's first traversal after a restart fell back to a
+        multi-second NetworkX rebuild.
+
+        Narrow on purpose:
+        - READS only. ``_key_op`` and the projection writes never come here:
+          replaying a write whose connection dropped mid-flight is not safe.
+        - ONLY when a client existed before the call. With no client there was
+          no pooled socket to go stale, so the failure is the engine itself.
+        - NOT ``BusyLoadingError`` (a ``ConnectionError`` subclass): an engine
+          still loading refuses the retry too.
+        - ONCE, inside what is left of the caller's ``deadline``. ``timeout`` is
+          the first attempt's budget exactly as the caller would have passed it
+          to ``_query``, so a first-attempt timeout diagnoses as before.
+        - NEVER invisibly: ``note_retry`` makes the traversal row say
+          ``retried``, which breaks the cutover clock like any other failure.
+        """
+        had_client = self._db is not None
+        try:
+            return await self._query(cypher, params, timeout=timeout)
+        except GraphUnavailableError as exc:
+            remaining = deadline - time.monotonic()
+            if not (had_client and remaining > 0 and _is_stale_socket(exc.__cause__)):
+                raise
+            from genesis.memory.graph_telemetry import note_retry
+
+            note_retry(type(exc.__cause__).__name__)
+            logger.info("graph engine dropped a pooled connection; retrying the read once")
+            return await self._query(cypher, params, timeout=remaining)
+
     async def _key_op(self, op: str, *args: Any, timeout: float, **kwargs: Any) -> Any:
         """A raw key operation (`delete`, `rename`, `set`, `eval`), under a deadline.
 
@@ -916,7 +970,7 @@ class FalkorGraphStore:
         # TRAVERSAL, so it is stamped once here and spent down.
         deadline = time.monotonic() + _READ_TIMEOUT_S
         with _labelled("traverse"):
-            result = await self._query(
+            result = await self._read(
                 _TRAVERSE.replace("{depth}", str(int(max_depth))),
                 {
                     "root": root_id,
@@ -931,6 +985,8 @@ class FalkorGraphStore:
                     "now": time.time(),
                     "include_deprecated": bool(include_deprecated),
                 },
+                timeout=_READ_TIMEOUT_S,
+                deadline=deadline,
             )
         nodes = [
             GraphNode(
@@ -1034,7 +1090,12 @@ class FalkorGraphStore:
                 }
                 raise err
         with _labelled("marker"):
-            result = await self._query(_PROJECTION_MARKER_COUNT, {}, timeout=timeout)
+            result = await self._read(
+                _PROJECTION_MARKER_COUNT,
+                {},
+                timeout=timeout,
+                deadline=time.monotonic() + timeout,
+            )
         rows = result.result_set or []
         if not (rows and rows[0] and rows[0][0]):
             raise GraphUnavailableError(

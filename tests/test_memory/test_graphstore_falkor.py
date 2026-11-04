@@ -2273,3 +2273,210 @@ async def test_a_text_strength_never_costs_the_projection_its_warm_up(tmp_path):
     )
     assert (staging, "SWAP") in calls
     assert {p["root"] for p in params} == {"c"}, params
+
+
+# ─── #3035: a read survives ONE stale pooled socket ─────────────────────────
+#
+# MEASURED (2026-11-03, redis-py 8.1.0, both the pure-Python and the hiredis
+# parser): after the engine restarts, or closes an idle client, the next read on
+# a pooled connection fails in ~1 ms with ConnectionError "Connection lost", and
+# the read after it reconnects and succeeds (4 of 4). These pin the retry to
+# exactly that case: a READ, on a client that already existed, once, inside the
+# same deadline, and never invisibly.
+
+
+class _Result:
+    def __init__(self, rows):
+        self.result_set = rows
+
+
+class _FlakyGraph:
+    """Answers, except for the errors queued in ``fail`` (popped in order)."""
+
+    def __init__(self, fail):
+        self.fail = list(fail)
+        self.calls = 0
+
+    async def query(self, cypher, params):
+        self.calls += 1
+        if self.fail:
+            raise self.fail.pop(0)
+        return _Result([["n1", 1, 0.9, "related"]])
+
+
+def _client_for(graph):
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        def select_graph(self, _key):
+            return graph
+
+    return _Client
+
+
+def _lost():
+    import redis.exceptions
+
+    return redis.exceptions.ConnectionError("Error UNKNOWN while writing to socket. Connection lost.")
+
+
+async def _warmed(store):
+    """One clean read first, so the client (and its pool) exists."""
+    nodes = await store.traverse(None, "root", max_depth=1, min_strength=0.5)
+    assert [n.memory_id for n in nodes] == ["n1"]
+
+
+async def test_a_stale_pooled_socket_is_retried_once_and_answers(tmp_path):
+    from genesis.memory import graph_telemetry as telemetry
+
+    graph = _FlakyGraph([])
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _client_for(graph)),
+    ):
+        await _warmed(store)
+        telemetry.reset_retry()
+        graph.fail = [_lost()]
+        graph.calls = 0
+        nodes = await store.traverse(None, "root", max_depth=1, min_strength=0.5)
+
+    assert [n.memory_id for n in nodes] == ["n1"]
+    assert graph.calls == 2
+    # Never invisible: the traversal facade reads this and records `retried`.
+    assert telemetry.read_retry() == "ConnectionError"
+
+
+async def test_a_second_lost_connection_is_not_retried_again(tmp_path):
+    graph = _FlakyGraph([])
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _client_for(graph)),
+    ):
+        await _warmed(store)
+        graph.fail = [_lost(), _lost(), _lost()]
+        graph.calls = 0
+        with pytest.raises(GraphUnavailableError, match="Connection lost"):
+            await store.traverse(None, "root", max_depth=1, min_strength=0.5)
+
+    assert graph.calls == 2
+
+
+async def test_a_lost_connection_on_the_first_read_is_not_retried(tmp_path):
+    """No client existed before the call, so there was no stale POOLED socket:
+    the failure is the engine itself, and retrying would only repeat it."""
+    graph = _FlakyGraph([_lost()])
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _client_for(graph)),
+        pytest.raises(GraphUnavailableError),
+    ):
+        await store.traverse(None, "root", max_depth=1, min_strength=0.5)
+
+    assert graph.calls == 1
+
+
+async def test_an_engine_still_loading_is_not_retried(tmp_path):
+    """BusyLoadingError subclasses ConnectionError, but an immediate retry
+    lands in the same ~0.9 s loading window: it is unavailability, not a stale
+    socket."""
+    import redis.exceptions
+
+    graph = _FlakyGraph([])
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _client_for(graph)),
+    ):
+        await _warmed(store)
+        graph.fail = [redis.exceptions.BusyLoadingError("LOADING")]
+        graph.calls = 0
+        with pytest.raises(GraphUnavailableError):
+            await store.traverse(None, "root", max_depth=1, min_strength=0.5)
+
+    assert graph.calls == 1
+
+
+async def test_a_retry_spends_the_traversal_budget_not_a_fresh_one(tmp_path):
+    """The retry gets only what is LEFT of the caller's deadline. When the first
+    attempt's failure lands after that deadline (its own timeout was longer),
+    there is nothing to retry with: the original failure stands, and no retry
+    is recorded. An attempt made anyway would surface as a timeout instead and
+    mark the row `retried`."""
+    import time as _time
+
+    from genesis.memory import graph_telemetry as telemetry
+
+    graph = _FlakyGraph([])
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _client_for(graph)),
+    ):
+        await _warmed(store)
+        telemetry.reset_retry()
+        graph.fail = [_lost()]
+        graph.calls = 0
+        with pytest.raises(GraphUnavailableError, match="Connection lost"):
+            await store._read(
+                "RETURN 1", {}, timeout=1.0, deadline=_time.monotonic() - 0.01
+            )
+
+    assert graph.calls == 1
+    assert telemetry.read_retry() is None
+
+
+async def test_a_write_is_never_retried(tmp_path):
+    """Only the two READS retry. A key operation (rename, delete, the publish
+    lock) that loses its connection fails as it always did: replaying a write
+    is not safe."""
+    import redis.exceptions
+
+    class _Conn:
+        calls = 0
+
+        async def rename(self, *a, **k):
+            _Conn.calls += 1
+            raise redis.exceptions.ConnectionError("Connection lost")
+
+    class _Client:
+        def __init__(self, *a, **k):
+            self.connection = _Conn()
+
+        def select_graph(self, _key):
+            return _FlakyGraph([])
+
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _Client),
+    ):
+        # A client exists first, exactly the state a stale-socket READ retries in.
+        await _warmed(store)
+        with pytest.raises(GraphUnavailableError, match="Connection lost"):
+            await store._key_op("rename", "a", "b", timeout=1.0)
+
+    assert _Conn.calls == 1
+
+
+async def test_an_auth_refusal_is_not_retried(tmp_path):
+    """AuthenticationError subclasses ConnectionError, but the engine would
+    refuse the retry identically: it is not a stale socket."""
+    import redis.exceptions
+
+    graph = _FlakyGraph([])
+    store = FalkorGraphStore(socket_path=str(tmp_path / "s.sock"))
+    with (
+        patch.object(falkor_mod, "_FALKOR_AVAILABLE", True),
+        patch.object(falkor_mod, "_FalkorDB", _client_for(graph)),
+    ):
+        await _warmed(store)
+        graph.fail = [redis.exceptions.AuthenticationError("NOAUTH")]
+        graph.calls = 0
+        with pytest.raises(GraphUnavailableError):
+            await store.traverse(None, "root", max_depth=1, min_strength=0.5)
+
+    assert graph.calls == 1

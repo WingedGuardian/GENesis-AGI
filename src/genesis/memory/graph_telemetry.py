@@ -58,7 +58,7 @@ TELEMETRY_RETENTION_DAYS = 30
 #: Operator kill switch: ``1`` records nothing.
 _TELEMETRY_OFF_ENV = "GENESIS_GRAPH_TELEMETRY_DISABLED"
 #: Outcomes that break the cutover clock: written at once, with an event entry.
-_CLOCK_BREAKING = frozenset({"fallback", "selection_failed", "error"})
+_CLOCK_BREAKING = frozenset({"fallback", "selection_failed", "error", "retried"})
 #: One JSON line per telemetry row that failed to write, under ``genesis_home()``.
 LOST_WRITES_FILE = "telemetry/graph_traverse_lost_writes.jsonl"
 #: Interpreter options that consume the next argument (``python -X dev script``).
@@ -179,6 +179,31 @@ def read_selection() -> tuple[str, str | None]:
     """``(effective_mode, selection_error_class)`` for the current traversal;
     ``("unknown", None)`` when the store was chosen without the lever (tests)."""
     return _SELECTION.get() or ("unknown", None)
+
+
+#: Set by a store that answered only after retrying a stale pooled connection
+#: (``graphstore_falkor``, issue #3035), so ``traverse`` records ``retried``
+#: rather than ``primary``. A retry spares the caller the fallback, but the
+#: engine DID drop the connection, which is exactly what the cutover clock
+#: exists to see (owner ruling 2026-11-04). Reset per traversal like the
+#: selection.
+_RETRY: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "graph_store_retry",
+    default=None,
+)
+
+
+def reset_retry() -> None:
+    _RETRY.set(None)
+
+
+def note_retry(reason: str) -> None:
+    _RETRY.set(reason)
+
+
+def read_retry() -> str | None:
+    """The class name of the failure a retry recovered from, or ``None``."""
+    return _RETRY.get()
 
 
 def _telemetry_off() -> bool:

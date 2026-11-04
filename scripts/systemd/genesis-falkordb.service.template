@@ -83,6 +83,24 @@ ExecStart="__REDIS_SERVER__" \
     --slowlog-max-len 4096 \
     --latency-monitor-threshold 100 \
     --supervised systemd
+# Re-project on EVERY start, restarts included (issue #3035). The engine keeps
+# no persistence, so a restarted engine holds no graph, and every traversal
+# fell back until the hourly timer next fired: up to an hour, with the first
+# fallback in each process costing a multi-second NetworkX rebuild. The timer's
+# Persistent=true does not help: it catches up runs missed while the TIMER was
+# inactive, not an engine that lost its data.
+#   restart, not start: if the hourly projection is mid-run when the engine
+#     dies, that run is writing into the engine that just lost everything, and
+#     a `start` of an already-activating oneshot merges into it and runs
+#     nothing new (MEASURED on a scratch oneshot, 2026-11-04). `restart` stops
+#     it (the projector unwinds on SIGTERM, graphstore_project.py) and runs a
+#     fresh projection; on an idle projector it is a plain start.
+#   --no-block: the projector unit orders After= this one, so it is queued and
+#     runs once this start completes; waiting for it here would deadlock.
+#   `-`: a failed trigger never fails the engine's own start.
+#   `+`: outside the sandbox below, like the mkdir, so the call reaches the
+#     user manager's bus whatever namespacing the sandbox ends up applying.
+ExecStartPost=-+/usr/bin/systemctl --user restart --no-block genesis-graph-project.service
 Restart=always
 RestartSec=5
 # Budgeted on RSS, not on the allocator figure. Note this only bites where the
