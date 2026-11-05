@@ -11,8 +11,12 @@ The block itself is correct and deliberate: a background session must not reach
 into credentials or any other user-gated surface unattended. What is NOT
 acceptable is that it happens QUIETLY. A dispatched session dying against a wall
 it can never pass is, by construction, a catch-22 — there is no such thing as a
-legitimate instance — so it earns a ``critical`` observation, which reaches the
-owner's alerts channel.
+legitimate instance — so it earns an observation, ``critical`` by default, which
+reaches the owner's alerts channel. A caller may pass a lower ``priority`` when a
+deny on its own is not page-worthy: the verdict is identical and the record
+still lands, only the page is dropped. The secrets guard does (#3848): a
+background session denied that file can still continue with other work, and
+most recorded denials were matcher false positives (#3789).
 
 **Why a helper rather than a convention.** Every hook that asks would otherwise
 have to remember to record the unattended case, and a convention is exactly what
@@ -30,8 +34,8 @@ an adversarial review caught the hand-rolled versions:
   atomic ``INSERT … WHERE NOT EXISTS`` — the SELECT-then-INSERT this module
   originally planned is the exact cross-process race that path warns against.
 * **The recorded detail is scrubbed** (``secret_scrub.scrub``). The excerpt is a
-  command line, it lands in a ``critical`` row that reaches the owner's alerts
-  channel, and a command like ``export API_KEY_X=… ; cat secrets.env`` would
+  command line, it lands in an observation the owner reads (a ``critical`` one
+  pages; any priority appears in the morning report and dashboard), and a command like ``export API_KEY_X=… ; cat secrets.env`` would
   otherwise broadcast the value. A credentials guard that leaks credentials is
   worse than none.
 
@@ -82,6 +86,11 @@ _SOURCE = "hook.needs_user"
 _TYPE = "background_session_blocked_needs_user"
 _CATEGORY = "system_health"
 _PRIORITY = "critical"
+#: Priorities a caller may pick. ``critical`` pages the owner (the
+#: critical-observations job sends it to Telegram); the others are recorded
+#: without a page. Anything else falls back to ``critical``: a typo
+#: must never make a block quieter.
+_PRIORITIES = frozenset({"low", "medium", "high", "critical"})
 
 
 def is_dispatched() -> bool:
@@ -89,8 +98,19 @@ def is_dispatched() -> bool:
     return os.environ.get(_DISPATCH_ENV) == "1"
 
 
-def _record(action: str, detail: str, session: str) -> bool:
-    """Write the critical observation via the CRUD sync path. Never raises.
+#: Longest command excerpt a record keeps, AFTER scrubbing.
+_EXCERPT_CHARS = 240
+
+
+def _excerpt(detail: str) -> str:
+    """Scrub first, then cut: a cut first can split a credential so the scrub
+    patterns no longer match it, and the fragment would be stored."""
+    clean = scrub(detail)
+    return clean[:_EXCERPT_CHARS] + " …" if len(clean) > _EXCERPT_CHARS else clean
+
+
+def _record(action: str, detail: str, session: str, priority: str = _PRIORITY) -> bool:
+    """Write the observation via the CRUD sync path. Never raises.
 
     Every failure is swallowed on purpose: this exists to make a block LOUD, and
     a loud-failure that broke the block would invert the safety property it was
@@ -112,14 +132,20 @@ def _record(action: str, detail: str, session: str) -> bool:
             f"A background (Genesis-dispatched) session was BLOCKED because "
             f"'{action}' requires the user, and a dispatched session has nobody to "
             f"ask. The block is correct — background sessions must not take "
-            f"user-gated actions unattended — but the session cannot make progress "
-            f"past it and will not recover on its own. "
-            f"Session: {session}. Detail: {scrub(detail) if detail else '(none)'}"
+            f"user-gated actions unattended — and no retry will clear it: the "
+            f"session must finish without it or stop. "
+            f"Session: {session}. Detail: {_excerpt(detail) if detail else '(none)'}"
         )
         # Identity is (action, session): the same wall hit twice in one session is
         # one finding. A different session hitting the same wall IS news again,
         # because it means the dispatch keeps being sent into a dead end.
-        digest = hashlib.sha256(f"{_TYPE}|{action}|{session}".encode()).hexdigest()
+        # A non-default priority joins the identity, so a session first recorded
+        # lower that then hits the same wall at ``critical`` still pages;
+        # the ``critical`` hash is unchanged so existing rows keep deduping.
+        key = f"{_TYPE}|{action}|{session}"
+        if priority != _PRIORITY:
+            key += f"|{priority}"
+        digest = hashlib.sha256(key.encode()).hexdigest()
 
         db_path = os.environ.get("GENESIS_DB_PATH") or str(genesis_db_path())
         return create_sync(
@@ -127,7 +153,7 @@ def _record(action: str, detail: str, session: str) -> bool:
             source=_SOURCE,
             type=_TYPE,
             content=content,
-            priority=_PRIORITY,
+            priority=priority,
             category=_CATEGORY,
             content_hash=digest,
             origin_class="first_party",
@@ -137,9 +163,7 @@ def _record(action: str, detail: str, session: str) -> bool:
         # operator unable to tell "no new signal" from "the audit row never
         # landed". stderr only — the hook's verdict is unchanged either way.
         with contextlib.suppress(Exception):
-            sys.stderr.write(
-                f"needs_user: critical observation write failed ({type(_obs_exc).__name__})\n"
-            )
+            sys.stderr.write(f"needs_user: observation write failed ({type(_obs_exc).__name__})\n")
         return False
 
 
@@ -150,6 +174,7 @@ def decide(
     payload: dict | None = None,
     *,
     ask_key: str | None = None,
+    priority: str = _PRIORITY,
 ) -> dict:
     """Verdict for an action that requires the user, plus the record when unattended.
 
@@ -167,6 +192,9 @@ def decide(
                 this function, after the dispatched branch, for the same reason
                 the recording does: a caller cannot honour the policy and forget
                 the ordering, and no local config can reach the dispatched deny.
+        priority: the observation priority for the DISPATCHED deny, ``critical``
+                (default, pages the owner) or a lower one (recorded, no page). It
+                changes only how loudly the block is reported, never the verdict.
         payload: the full CC hook payload. ALWAYS pass it. The session id is the
                 other half of the dedupe identity, and it arrives on the payload
                 under the current contract — an earlier revision read
@@ -178,7 +206,7 @@ def decide(
                 would have been invisible: fewer alerts looks like fewer problems.
 
     Returns a PreToolUse payload:
-      * dispatched              -> ``deny``   AND a critical observation first
+      * dispatched              -> ``deny``   AND an observation first (``priority``)
       * foreground, ask_key off -> NO decision, only ``additionalContext``
                                    naming the local policy
       * foreground              -> ``ask``    (a person can answer)
@@ -216,7 +244,9 @@ def decide(
             }
         }
 
-    _record(action, detail, _payload_session_id(payload or {}))
+    if priority not in _PRIORITIES:
+        priority = _PRIORITY
+    _record(action, detail, _payload_session_id(payload or {}), priority)
     return {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -227,7 +257,7 @@ def decide(
                 f"transient failure: no retry, model change, or rephrasing will "
                 f"clear it. Stop attempting it and report the block in your "
                 f"handoff so a foreground session can pick it up. It has also "
-                f"been raised as a critical observation — but say it in the "
+                f"been raised as an observation for the owner — but say it in the "
                 f"handoff regardless, in case that record did not land."
             ),
         }

@@ -1,0 +1,1 @@
+- A background session that is denied access to `secrets.env` no longer pages you on Telegram. The access is still denied and still recorded (it shows in the morning report and the dashboard); what pages you now is a background session that actually stopped because of it, through the hourly stopped-session page.
