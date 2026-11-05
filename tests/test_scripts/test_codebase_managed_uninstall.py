@@ -234,6 +234,19 @@ def test_retention_alias_and_lock_actions(guard, transaction, monkeypatch, capsy
     assert (f"Preserved configured cache: {resolved}" in capsys.readouterr().out) == retained
 
 
+def test_retained_diagnostics_only_treat_a_loop_as_unclassifiable(guard, tmp_path, monkeypatch, capsys):
+    """A path under a regular file cannot be stat'd, but it classifies as it always
+    has. Inside a deletion root that means no false "Preserved" line."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    root = tmp_path / "genesis"
+    root.mkdir()
+    (root / "file").write_text("x")
+    config = dict.fromkeys(("binary", "cache", "runtime"), str(root / "file" / "below"))
+    monkeypatch.setitem(guard.report_retained_state.__globals__, "read_settings", lambda *a, **kw: config)
+    guard.report_retained_state()
+    assert "path classification failed" not in capsys.readouterr().out
+
+
 @pytest.mark.parametrize("key", ["binary", "cache", "runtime"])
 def test_retained_diagnostics_tolerate_each_symlink_loop(guard, tmp_path, monkeypatch, capsys, key):
     loop = tmp_path / "loop"
