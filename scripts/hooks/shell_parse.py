@@ -869,7 +869,8 @@ def _excised_text(command: str) -> str:
 #: Characters after which an unquoted ``#`` starts a word, so bash reads a
 #: comment at the top level (MEASURED with bash 5: after whitespace, ``;``, ``|``,
 #: ``&&``, ``<`` and ``>``; not mid-word, not after ``{``, ``$`` or an escaped
-#: space). ``(`` and ``)`` are left out on purpose: with ``extglob`` on, ``+(a)#b``
+#: space). After ``<`` or ``>`` the redirect scan runs first and takes the ``#``
+#: as its target, so ``>#f`` keeps the old reading (bash errors; nothing runs). ``(`` and ``)`` are left out on purpose: with ``extglob`` on, ``+(a)#b``
 #: and ``@(#x)`` are one pattern word whose ``#`` is literal, and a hook cannot know
 #: a script turned it on. Inside ``${…}`` or a backtick the same ``#`` is NOT a
 #: comment (``${x:- #}``); ``_TopLevel`` skips only where nothing is open.

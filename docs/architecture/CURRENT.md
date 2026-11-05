@@ -4695,8 +4695,10 @@ verified: c56a621b5 2026-10-24
   fragments retain narrow relief; complex valid heredoc forms can still be
   refused. See `docs/reference/shell-parse-completeness.md` for the boundary.
   For hash-free scanner inputs, its unquoted scanner consumes backslash/non-newline
-  pairs as word data. Hash-containing calls retain their earlier scanner behavior
+  pairs as word data. Hash-containing calls keep the earlier backslash handling
   to avoid a comment/quote regression; generic #3257/#3264 remain partial/open.
+  A `#` that starts a word at bash's top level opens a comment the scanner skips
+  (#3473), except in commands containing `<<`.
   Existing continuation, heredoc proof, size bounds and nested refusals remain.
   Codex's local CLI also has a budget-only shell action hook in
   `.codex/config.toml` (`scripts/hooks/codex-review-stop`). It consumes the

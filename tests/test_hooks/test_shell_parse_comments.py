@@ -77,10 +77,12 @@ def test_a_trailing_backslash_does_not_continue_a_comment(owned_oracle):  # noqa
 
 
 def test_a_comment_inside_a_nested_bash_c_script_is_skipped_there(owned_oracle):  # noqa: F811
-    body = "f() {  # a|b, curl __genesis_oracle_7__ x\n  ls __genesis_oracle_1__\n}\nf"
-    command = "bash -c '" + body + "'"
+    command = "bash -c 'ls __genesis_oracle_1__ # ; curl __genesis_oracle_7__ x\nls b'"
     assert _CURL not in owned_oracle.run(command)
-    assert not _reported(command)
+    segments, blind = sp.analyze_checked(command)
+    assert blind is None
+    assert not any("curl" in s.argv for s in segments), [s.argv for s in segments]
+    assert ("ls", "b") in [tuple(s.argv) for s in segments]
 
 
 @pytest.mark.parametrize(
@@ -117,6 +119,13 @@ def test_override_sigils_in_a_comment_stay_in_raw():
 
 
 def test_a_command_with_a_heredoc_keeps_the_legacy_scan():
-    """Comment skipping is off when ``<<`` appears (here-doc bodies are data)."""
-    command = "cat <<EOF\n# it's\nEOF\ncurl __genesis_oracle_7__ x"
-    assert _seen(command)
+    """Comment skipping is off when ``<<`` appears (here-doc bodies are data).
+
+    The same comment that is skipped without a here-doc is still scanned with
+    one, so its text is reported (the over-report the old scan always made)."""
+    tail = "ls a # ; curl __genesis_oracle_7__ x"
+    assert not _reported(tail)
+    command = "cat <<EOF\nx\nEOF\n" + tail
+    segments, blind = sp.analyze_checked(command)
+    assert blind is None
+    assert _CURL in [tuple(s.argv) for s in segments]
