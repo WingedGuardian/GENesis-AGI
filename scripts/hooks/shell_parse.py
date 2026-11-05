@@ -1914,6 +1914,35 @@ _BLIND_BUILT_ESCAPE = BlindSpot(
     ),
 )
 
+_BLIND_BASH53_SUBSTITUTION = BlindSpot(
+    bounds_induced=True,
+    cause=(
+        "contains the text `${` followed by a space, tab, newline or `|`, which bash 5.3 "
+        "runs as a command and this parser does not model"
+    ),
+    hint=(
+        "use $(...), or if it is only text (a message, a script body), write that text to "
+        "a file instead"
+    ),
+)
+
+#: bash 5.3's ``${ cmd; }`` and ``${| cmd; }``, which an older bash refuses. REPORTED,
+#: NOT MODELLED, for the reason :data:`_BLIND_CONTINUATION` is. Reading one takes knowing
+#: where it closes, which depends on comments and here-docs in its body, and what follows
+#: it still runs: a body that expands to nothing leaves the rest as the command. So this
+#: reads the text alone, in quotes or not, which means a mention in single quotes or a
+#: comment is refused too. MEASURED: 24 of 158,389 distinct Bash commands across one
+#: install's session transcripts held such text at all, and of 127 bytes tried after
+#: `${` on real bash 5.3, exactly these 4 ran a command. A here-doc whose body is proven
+#: data was excised before this sees it.
+_BASH53_SUBSTITUTION = re.compile(r"\$\{[ \t\n|]")
+
+
+def has_bash53_substitution(command: str) -> bool:
+    """True when :data:`_BLIND_BASH53_SUBSTITUTION` applies to this text."""
+    return _BASH53_SUBSTITUTION.search(command) is not None
+
+
 _BLIND_STRUCTURAL = BlindSpot(
     bounds_induced=True,
     cause=(
@@ -2529,6 +2558,7 @@ def rewrites_before_running(command: str) -> bool:
     return (
         has_continuation(command)
         or has_built_escape(command)
+        or has_bash53_substitution(command)
         or _heredoc_hides_suffix(command)
     )
 
@@ -2696,6 +2726,7 @@ _ALL_BLIND_SPOTS = (
     _BLIND_UNCLASSIFIED_OPTION,
     _BLIND_CONTINUATION,
     _BLIND_BUILT_ESCAPE,
+    _BLIND_BASH53_SUBSTITUTION,
     _BLIND_STRUCTURAL,
     _BLIND_HEREDOC_BODY,
 )
@@ -4193,6 +4224,7 @@ def _analyze_bounded(
     structural_incomplete = _depth > 0 and _raw_untokenizable(command)
     continuation = has_continuation(command)
     built_escape = has_built_escape(command)
+    bash53_substitution = has_bash53_substitution(command)
     # The newlines this parse split on, from the SAME parse, so the here-doc check
     # compares bash's body boundary against this parse rather than a second model.
     splits: list[int] = []
@@ -4304,6 +4336,7 @@ def _analyze_bounded(
             structural_message = structural_message or inner.diagnostic is _BLIND_STRUCTURAL
             continuation = continuation or inner.diagnostic is _BLIND_CONTINUATION
             built_escape = built_escape or inner.diagnostic is _BLIND_BUILT_ESCAPE
+            bash53_substitution = bash53_substitution or inner.diagnostic is _BLIND_BASH53_SUBSTITUTION
             for inner_segment in inner.segments:
                 out.append(
                     Segment(
@@ -4327,6 +4360,8 @@ def _analyze_bounded(
         diagnostic = _BLIND_CONTINUATION
     elif built_escape:
         diagnostic = _BLIND_BUILT_ESCAPE
+    elif bash53_substitution:
+        diagnostic = _BLIND_BASH53_SUBSTITUTION
     elif structural_message:
         diagnostic = _BLIND_STRUCTURAL
     elif root_untokenizable:
