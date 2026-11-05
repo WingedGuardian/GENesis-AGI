@@ -102,18 +102,16 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from hook_input import read_payload, tool_input, tool_response  # noqa: E402
 from hook_output import print_json_bounded  # noqa: E402
+
+# Shared with `issue_premise_gate`, so both hooks agree on what files an issue.
+from shell_parse import GH_ISSUE_CREATE_SUBCOMMANDS as _CREATE_SUBCOMMANDS  # noqa: E402
+from shell_parse import GH_WEB_FLAGS as _WEB_FLAGS  # noqa: E402
 from shell_parse import analyze_checked, gh_command, gh_requests_help, mentions  # noqa: E402
 
 #: Cheap prefilter, as in `pr_close_advisory._GH_WORD`: this hook runs on every Bash call.
 _GH_WORD = re.compile(r"(?<![\w-])gh(?![\w-])")
 #: For a command the parser could not read: raw text only, never a re-parse.
 _CREATE_WORDS = re.compile(r"\bissue\s+(?:create|new)\b")
-_CREATE_SUBCOMMANDS = frozenset({"create", "new"})
-_WEB_FLAGS = frozenset({"--web", "-w"}) | frozenset(
-    f"{flag}={value}"
-    for flag in ("--web", "-w")
-    for value in ("1", "t", "T", "TRUE", "true", "True")
-)
 #: gh prints the new issue's URL alone on a line of stdout. Only a WHOLE-line
 #: github.com URL is a candidate: an issue link inside prose does not even cost a
 #: lookup, and no other host is ever contacted (see the module docstring).
