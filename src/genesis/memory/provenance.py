@@ -449,6 +449,7 @@ _FIRST_PARTY_OBS_SOURCES: frozenset[str] = frozenset(
         "duplicate_session_monitor",
         "user_model_staleness_monitor",
         "cc_login_monitor",
+        "inbox_sync_monitor",
         "architect_triage",
         "surplus_promotion",
         "star_milestone_check",
