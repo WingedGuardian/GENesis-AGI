@@ -2061,12 +2061,37 @@ _checkout_unmoved_or_roll_back
 # On `live` the engine's rebuild takes the merge's place (the live-engine block,
 # after the `else` below). Not re-indented, so the blocks the tests extract keep
 # their text.
+# BEGIN stale-index-lock (#3792)
+# A git process that died mid-write leaves .git/index.lock behind, and every
+# index write after it (the excused-edit resets, the merge, the live engine's
+# clears) then fails. Called right after genesis-checkout.lock is taken, with
+# update.lock held, so no Genesis mover can be writing: it retires the lock only
+# when no process holds it (scripts/lib/stale_index_lock.py), and alerts.
+_retire_stale_index_lock() {
+    local rc=0 out
+    out="$(python3 -I -S "$SCRIPT_DIR/lib/stale_index_lock.py" "$GENESIS_ROOT" 2>&1)" || rc=$?
+    case "$rc" in
+        0) ;;
+        3)
+            echo "  $out"
+            if [ -f "$SCRIPT_DIR/lib/alert_queue.sh" ]; then
+                # shellcheck source=lib/alert_queue.sh
+                . "$SCRIPT_DIR/lib/alert_queue.sh"
+                queue_alert warning update "update: cleared a stale .git/index.lock" "$out"
+            fi
+            ;;
+        *) echo "  WARNING: ${out:-stale-index-lock check failed (exit $rc)}" ;;
+    esac
+    return 0
+}
+# END stale-index-lock
 if [ "${ON_LIVE:-0}" != 1 ]; then
 if ! genesis_checkout_lock "$GENESIS_ROOT"; then
     _CHECKOUT_LOCK_BUSY=1
     _do_rollback "checkout lock busy: a Claude launch holds genesis-checkout.lock"
     exit 1
 fi
+_retire_stale_index_lock
 
 # Clear local edits to known-ephemeral tracked files (EPHEMERAL_DIRTY_RE) before
 # merging. They are rewritten in place at runtime and regenerate themselves
@@ -2358,6 +2383,7 @@ if ! genesis_checkout_lock "$GENESIS_ROOT"; then
     _do_rollback "checkout lock busy: a Claude launch holds genesis-checkout.lock"
     exit 1
 fi
+_retire_stale_index_lock
 # Every tracked path the dirty-tree gate excused is saved, then put back to HEAD:
 # a switch that writes one would otherwise refuse over the local edit.
 if ! _live_status="$(git -C "$GENESIS_ROOT" status --porcelain --no-renames)"; then

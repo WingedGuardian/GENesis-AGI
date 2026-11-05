@@ -1,0 +1,1 @@
+- A stale `.git/index.lock` left by a git process that died no longer freezes updates and code deploys until someone removes it by hand. When no running process holds the lock and it is more than ten minutes old, the update or deploy saves a copy under `~/.genesis/deploy-backups/`, removes it, carries on, and alerts you that it did.

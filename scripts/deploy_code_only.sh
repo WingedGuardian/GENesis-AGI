@@ -783,6 +783,19 @@ _pull() {
     if ! genesis_checkout_lock "$GENESIS_ROOT"; then
         die "checkout busy (a Claude launch holds genesis-checkout.lock); nothing changed"
     fi
+    # BEGIN stale-index-lock (#3792): a dead git's .git/index.lock would make
+    # every index write below fail; retire it when no process holds it.
+    _sil_rc=0
+    _sil_out="$(python3 -I -S "$_SELF_DIR/lib/stale_index_lock.py" "$GENESIS_ROOT" 2>&1)" || _sil_rc=$?
+    case "$_sil_rc" in
+        0) ;;
+        3)
+            echo "  $_sil_out"
+            queue_alert warning deploy-code-only "code-only deploy: cleared a stale .git/index.lock" "$_sil_out"
+            ;;
+        *) echo "  WARNING: ${_sil_out:-stale-index-lock check failed (exit $_sil_rc)}" ;;
+    esac
+    # END stale-index-lock
     if [ "$MODE" = deploy ]; then
         _read_baseline
         if [ -n "$SERVING" ] && _runtime_held "$_upstream"; then
