@@ -1745,3 +1745,30 @@ async def test_without_the_lock_two_writers_cross(db):
     so the test above observes the lock, not a race that never happens."""
     [(body_writer, secret_writer)] = await _race_two_writers(db, kc._upsert)
     assert body_writer != secret_writer
+
+
+async def test_a_sibling_reference_loses_a_password_labelled_elsewhere(db):
+    """4483059471: one extraction labels a password, a sibling url extraction
+    repeats it bare. With the chunk's secret set, the url reference's stored
+    body does not index it, and the credential still holds it."""
+    from genesis.memory.extraction import Extraction
+    from genesis.memory.reference_extraction import chunk_secrets, extract_references_from_chunk
+
+    extractions = [
+        Extraction(content="Lab router login: username: admin7, password: First!Fake9 today",
+                   extraction_type="entity", confidence=0.9, entities=["Lab router"]),
+        Extraction(content="Status page https://status.example.org shows code First!Fake9 for the bench",
+                   extraction_type="entity", confidence=0.9),
+    ]
+    count = await extract_references_from_chunk(
+        extractions, store=_store(), db=db, source_session_id="s",
+        extra_secrets=chunk_secrets(extractions),
+    )
+    assert count == 2
+    rows = await db.execute_fetchall(
+        "SELECT id, domain, body FROM knowledge_units WHERE project_type = 'reference'",
+    )
+    by_domain = {r[1]: r for r in rows}
+    assert "First!Fake9" not in by_domain["reference.url"][2]
+    assert "https://status.example.org" in by_domain["reference.url"][2]
+    assert await _secret(db, by_domain["reference.credentials"][0]) == "admin7 / First!Fake9"

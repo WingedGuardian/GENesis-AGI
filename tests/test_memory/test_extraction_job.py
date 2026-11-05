@@ -530,6 +530,65 @@ class TestCredentialScrubWiring:
                 "SELECT topic FROM cc_sessions WHERE id = 's-two'"))[0]
             assert "First!Fake9" not in row["topic"]
 
+    @pytest.mark.asyncio
+    async def test_an_earlier_keyword_loses_a_password_labelled_later(self, tmp_path):
+        """4483059485: chunk 1 emits the password bare as a keyword and topic;
+        chunk 2 labels it. The session index is scrubbed with the FINAL set."""
+        import json as _json
+
+        import aiosqlite
+
+        from genesis.db.schema import create_all_tables
+
+        lines = [
+            "the bench code is First!Fake9 for now",
+            "router login: password: First!Fake9 for the bench",
+        ]
+        jsonl = tmp_path / "late-label.jsonl"
+        jsonl.write_text("".join(_json.dumps({
+            "type": "user", "uuid": f"u{i}", "timestamp": "2026-04-11T12:00:00Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+        }) + "\n" for i, text in enumerate(lines)))
+
+        def _result(content: str, topic: str, keywords: list[str]) -> FakeRoutingResult:
+            return FakeRoutingResult(success=True, content="```json\n" + _json.dumps({
+                "extractions": [{"content": content, "type": "entity", "confidence": 0.9}],
+                "session_keywords": keywords, "session_topic": topic,
+            }) + "\n```")
+
+        async with aiosqlite.connect(":memory:") as real_db:
+            real_db.row_factory = aiosqlite.Row
+            await create_all_tables(real_db)
+            await real_db.execute(
+                "INSERT INTO cc_sessions (id, session_type, model, cc_session_id, "
+                "source_tag, started_at, last_activity_at, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("s-late", "foreground", "m", "late-label", "foreground",
+                 "2026-04-11T12:00:00+00:00", "2026-04-11T12:00:00+00:00", "active"),
+            )
+            await real_db.commit()
+            router = AsyncMock()
+            router.route_call = AsyncMock(side_effect=[
+                _result("The bench code is First!Fake9 for now",
+                        "bench code First!Fake9", ["bench", "First!Fake9"]),
+                _result(f"Lab {lines[1]}", "", []),
+            ])
+            store = AsyncMock()
+            store.store = AsyncMock(return_value="mem-1")
+            store._embeddings = MagicMock()
+            store._embeddings.model_name = "m"
+
+            await run_extraction_cycle(
+                db=real_db, store=store, router=router, transcript_dir=tmp_path,
+                start_line_override=0, chunk_size=1,
+            )
+
+            row = (await real_db.execute_fetchall(
+                "SELECT topic, keywords FROM cc_sessions WHERE id = 's-late'"))[0]
+            assert "First!Fake9" not in (row["topic"] or "")
+            assert "First!Fake9" not in (row["keywords"] or "")
+            assert "bench" in (row["keywords"] or "")
+
 
 class TestHonestAdoption:
     """Filesystem adoption must record LIVE sessions as active (measured

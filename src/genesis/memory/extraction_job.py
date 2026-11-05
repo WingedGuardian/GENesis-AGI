@@ -398,6 +398,7 @@ async def run_extraction_cycle(
                     force_fts5_only=not reference_only_mode,
                     user_text=chunk_user_text,
                     failed=failed_refs,
+                    extra_secrets=chunk_secret_set,
                 )
                 summary["references_captured"] += ref_count
                 if failed_refs:
@@ -642,6 +643,14 @@ async def run_extraction_cycle(
                 db, session_id, max_line,
                 last_extracted_byte=last_chunk_end_byte,
             )
+            if all_keywords or latest_topic:
+                # Scrubbed again with the session's FINAL secret set: a keyword
+                # or topic an earlier chunk emitted can be a password that only
+                # a later chunk labelled.
+                latest_topic, final_keywords = scrub_session_index(
+                    latest_topic, sorted(all_keywords), session_secret_set,
+                )
+                all_keywords = set(final_keywords)
             if all_keywords or latest_topic:
                 await _update_session_index(
                     db, session_id,

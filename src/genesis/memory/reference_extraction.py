@@ -839,8 +839,13 @@ async def ingest_references_from_extraction(
     force_fts5_only: bool = False,
     user_text: str | None = None,
     failed: list[str] | None = None,
+    extra_secrets: set[str] | None = None,
 ) -> list[str]:
     """Ingest every reference entry an Extraction carries; the unit_ids stored.
+
+    ``extra_secrets`` is every secret the caller already knows from the rest of
+    the chunk and session: a sibling extraction can label a password that this
+    one repeats bare, and the reference stored here must not index it.
 
     Each entry's identifier and tags come from the extraction, and can repeat
     ANOTHER entry's secret bare, which that entry's own value hold-out never
@@ -851,7 +856,7 @@ async def ingest_references_from_extraction(
     """
     try:
         refs = classify_references(extraction, user_text=user_text)
-        secrets = chunk_secrets([extraction]) if refs else set()
+        secrets = (chunk_secrets([extraction]) | set(extra_secrets or ())) if refs else set()
     except Exception:
         logger.warning(
             "reference extractor classification failed", exc_info=True,
@@ -866,7 +871,12 @@ async def ingest_references_from_extraction(
             identifier = clean(ref["identifier"])
             if identifier != ref["identifier"]:
                 identifier = f"{identifier} #{secrets_token_hex(3)}"
-            ref = {**ref, "identifier": identifier, "tags": [clean(t) for t in ref["tags"]]}
+            # The value is never scrubbed: it is what this reference holds.
+            ref = {
+                **ref, "identifier": identifier,
+                "description": clean(ref["description"]),
+                "tags": [clean(t) for t in ref["tags"]],
+            }
         if ref["kind"] == "credentials":
             try:
                 ref = {**ref, "identifier": await _free_key(db, ref["identifier"], ref["value"])}
@@ -990,8 +1000,12 @@ async def extract_references_from_chunk(
     force_fts5_only: bool = False,
     user_text: str | None = None,
     failed: list[str] | None = None,
+    extra_secrets: set[str] | None = None,
 ) -> int:
     """Run the classifier over a chunk of extractions, ingesting references.
+
+    ``extra_secrets`` (the chunk's and session's secret set) scrubs every
+    reference's description, identifier and tags before it is stored.
 
     Returns the count of entries promoted to the reference store. Used by
     ``run_extraction_cycle`` as a post-processing step after each LLM
@@ -1007,6 +1021,7 @@ async def extract_references_from_chunk(
             force_fts5_only=force_fts5_only,
             user_text=user_text,
             failed=failed,
+            extra_secrets=extra_secrets,
         )
         count += len(unit_ids)
     return count
