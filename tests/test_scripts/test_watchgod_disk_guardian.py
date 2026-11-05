@@ -854,11 +854,21 @@ def test_the_domain_key_ignores_which_wall_binds(box):
     """Review finding: grouping by dg_measure's EFFECTIVE total split / and
     $HOME into two domains whenever a btrfs quota's crossover put them on
     different sides between two reads. The key comes from the mount and the
-    RAW statvfs sizes, which a btrfs qgroup never changes."""
-    assert os.stat("/").st_dev == os.stat(box["home"]).st_dev or pytest.skip("needs one device")
-    st = _poll(box, {"/": "5000 267000 1 - - btrfs", str(box["home"]): "5000 357000 0 - - btrfs"})
-    home_like = [p for p in st["disk"] if p in ("/", str(box["home"]))]
-    assert home_like == ["/"], st["disk"].keys()
+    RAW statvfs sizes, which a btrfs qgroup never changes.
+
+    Read through $HOME and its downloads directory, which share a domain on every
+    layout, while `/` is outside it when the test temp is its own filesystem. Neither
+    may be reported beside the other, whichever path speaks for the domain."""
+    home, dl = str(box["home"]), str(box["dl"])
+    st = _poll(
+        box,
+        {
+            "/": "5000 267000 1 - - btrfs",
+            home: "5000 357000 0 - - btrfs",
+            dl: "5000 447000 0 - - btrfs",
+        },
+    )
+    assert len({home, dl} & set(st["disk"])) <= 1, st["disk"].keys()
 
 
 def test_episode_markers_of_a_vanished_domain_are_dropped(box):
@@ -1334,5 +1344,8 @@ def test_a_fault_in_the_runaway_response_never_costs_the_home_levers(box):
     reserve.write_bytes(b"x")
     crash = 'wg_runaway_check() { local x="$__never_set_anywhere__"; }'
     with pytest.raises(AssertionError):
-        _poll(box, {"/": "100 100000 0 - - ext4"}, extra=crash)  # the HOME domain is measured as its mount
+        # A domain is measured through its first watched path, and which one that is
+        # depends on the layout, so both answer RED.
+        red = "100 100000 0 - - ext4"
+        _poll(box, {"/": red, str(box["home"]): red}, extra=crash)
     assert not reserve.exists(), "the home RED released its reserve before the response ran"
