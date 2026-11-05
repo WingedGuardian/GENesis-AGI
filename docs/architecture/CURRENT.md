@@ -1684,16 +1684,18 @@ the shared banner is not an assertion about all concurrent sessions.
   `docs/reference/codebase-managed.md`.
   The queue's `scripts/lib/index_marker_legacy.py` isolates malformed legacy
   artifacts in retained import receipts without replacing business failures;
-  real filesystem/SQLite errors remain visible. Schema 2 upgrades metadata
-  atomically and older writers refuse it. The marker CLI `import-status`
-  observes receipt totals without initialization or migration. This does not
-  implement persistent resource quarantine or the runner's separate list/claim
-  error propagation.
-  A read-only protocol observer now fences automatic consumption before any
-  reconciliation, list, claim or provider call. Explicit queue APIs still write
-  schema 2; observing known schema-3 metadata does not upgrade it. The observer
-  exposes no positive readiness result or setter; later protocol work and the
-  separate activation gates remain required.
+  real filesystem/SQLite errors remain visible. Schema 3 atomically fans requests
+  into independent provider legs, preserving legacy shared debt, claim history
+  and raw import evidence; older writers refuse it. No ordinary command converts
+  an existing queue (a rollback would strand it): on an older queue `write`
+  spools in the schema-2 format and other commands exit 2, and a missing queue
+  is not created while an update runs. Only the strict cutover converts, and that
+  is not built yet. New scalar settlement uses
+  complete provider/protocol/sequence/nonce/repository context. `import-status`
+  observes receipt totals without initialization or migration; `automatic-ready`
+  fences every automatic reconciliation/claim/launch until the later protocol
+  completes. There is no readiness setter. This does not implement persistent
+  resource quarantine or the checked consumer's list/claim error propagation.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
   deletions; native query/client cgroup proof and orphan-scope checks precede
