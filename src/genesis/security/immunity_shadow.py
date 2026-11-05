@@ -121,12 +121,14 @@ def is_dispatched_session_env() -> bool:
     (fail-open); a new foreground path missing the supervised flag drops
     pushed external there (autoimmune direction — visible in the enforce
     ledger + auto-demote).
-    """
-    import os
 
-    return os.environ.get("GENESIS_CC_SESSION") == "1" and (
-        os.environ.get("GENESIS_SESSION_SUPERVISED") != "1"
-    )
+    Read through :func:`genesis.caller_context.caller_context`, which returns
+    these markers from the environment in stdio and in-process mode, and a
+    request-scoped caller where one is set.
+    """
+    from genesis.caller_context import caller_context
+
+    return caller_context().unsupervised_dispatched
 
 
 class DispatchGateRefused(PermissionError):

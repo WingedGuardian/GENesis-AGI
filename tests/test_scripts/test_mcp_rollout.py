@@ -347,3 +347,37 @@ def test_launcher_bypasses_the_helper_for_codex_and_the_kill_switch(tmp_path, ar
     _overlay(tmp_path)
     _run_launcher(root, tmp_path, *args, env_extra=env_extra)
     assert "mcp_rollout" not in log.read_text()
+
+
+def test_launcher_without_home_finds_the_overlay_in_the_passwd_home(tmp_path):
+    # Devin, #3748: with HOME and GENESIS_HOME both unset the launcher looked in
+    # /.genesis, while the helper's Path.home() reads the passwd entry.
+    root, log = _launcher_tree(tmp_path)
+    passwd_home = tmp_path / "passwd-home"
+    (passwd_home / ".genesis" / "config").mkdir(parents=True)
+    (passwd_home / ".genesis" / "config" / "mcp_shared.json").write_text('{"stage": "off"}\n')
+    shims = tmp_path / "shims"
+    shims.mkdir()
+    getent = shims / "getent"
+    getent.write_text(f'#!/bin/bash\necho "u:x:$(id -u):$(id -g)::{passwd_home}:/bin/bash"\n')
+    getent.chmod(getent.stat().st_mode | stat.S_IXUSR)
+    subprocess.run(
+        [str(root / ".claude" / "mcp" / "run-mcp-server"), "--server", "memory"],
+        env={"PATH": f"{shims}:{os.environ['PATH']}"},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "mcp_rollout.py launch" in log.read_text()
+
+
+def test_an_empty_kill_switch_is_off_in_the_launcher_and_the_helper(tmp_path):
+    # Devin, #3748, measured wrong: `${VAR:-0}` substitutes 0 for an empty value
+    # too, so both sides read an empty kill switch as off. Pinned here.
+    assert rollout.kill_switch_on({"GENESIS_MCP_SHARED_DISABLED": ""}) is False
+    root, log = _launcher_tree(tmp_path)
+    _overlay(tmp_path)
+    _run_launcher(
+        root, tmp_path, "--server", "memory", env_extra={"GENESIS_MCP_SHARED_DISABLED": ""}
+    )
+    assert "mcp_rollout.py launch" in log.read_text()

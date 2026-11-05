@@ -38,7 +38,13 @@ fi
 # server exactly as before. GENESIS_MCP_SHARED_DISABLED set to anything but 0
 # turns it off.
 ROLLOUT="$GENESIS_ROOT/scripts/lib/mcp_rollout.py"
-_rollout_home="${GENESIS_HOME:-${HOME:-}/.genesis}"
+# With HOME unset, take the account's passwd home, as the helper's
+# Path.home() does, so an overlay-only opt-in is found either way.
+_rollout_user_home="${HOME:-}"
+if [[ -z "${GENESIS_HOME:-}" && -z "$_rollout_user_home" ]]; then
+    _rollout_user_home="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)"
+fi
+_rollout_home="${GENESIS_HOME:-$_rollout_user_home/.genesis}"
 if [[ $# -eq 2 && "$1" == --server && "${GENESIS_MCP_SHARED_DISABLED:-0}" == 0 && -f "$ROLLOUT" ]] \
     && [[ -n "${GENESIS_MCP_SHARED_STAGE+set}" || -e "$_rollout_home/config/mcp_shared.json" ]]; then
     exec "$PYTHON" -I -S "$ROLLOUT" launch --root "$GENESIS_ROOT" -- "$PYTHON" "$MCP_SCRIPT" "$@"

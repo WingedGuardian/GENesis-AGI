@@ -17,7 +17,17 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   broken assertion — before its green is trusted. A test that has only ever
   passed may be testing nothing; a whole suite passing every review round
   while a reviewer keeps finding real spec bugs is the tell that the tests
-  encode the same wrong spec as the code.
+  encode the same wrong spec as the code. `scripts/ci/mutation_sweep.py` does
+  this as a library: it mutates a private copy, so the sweep never writes your
+  working tree (a test it runs still can), and the `mutation-gate` CI job runs `config/mutation_gate.json`. To
+  pin a guard, add a case there: a label, the target, an anchor that matches
+  once, the replacement, the file's validator, the test that must catch it, and
+  why. BIT means pass, fail, pass
+  on a run that opened the target. A module-level import counts as opened, so a
+  BIT still does not prove the test exercised the code.
+  `config/gate_defects.json` is the merge gate's own defect corpus, run with
+  `--rung-report`, which says which rung of the gate's tests noticed each break.
+  There a miss is a finding, not a failure.
 - **Verify-RED of a safety fence runs the test UNFENCED.** Removing a guard,
   stub or sandbox to watch its test fail means whatever the test executes
   reaches the real system for that run. Read the test first and make its probe
@@ -99,7 +109,7 @@ git add <files>                                   # STAGE FIRST — mark hashes 
 python3 scripts/review_state.py mark              # INTERNAL genesis-architect audit — plain mark, never counts
 git commit -F <msg-file>                          # bare, not piped (see below)
 # (a non-Anthropic cross-model round would instead be: mark --source external --defects|--clean)
-git push -u origin HEAD && gh pr create --title "..." --body-file <file>   # first push: ONE command (approve the dialog)
+git push -u origin HEAD && gh pr create --title "..." --body-file <file>   # first push: ONE command (approve the dialog); needs a finished reviewer of this branch in this session (build-session, "a PR opens only after an independent review")
 gh pr comment <N> --body "@codex review"          # after EVERY subsequent push
 python3 scripts/hooks/git_push_guard.py --check-pr <N>
 gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --check-pr

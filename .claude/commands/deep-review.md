@@ -43,6 +43,11 @@ this command does not tell you to wait for a review it never triggers.
 Use the Agent tool. Do NOT self-review — a self-review is anchored to your own blind spots,
 which is exactly what lets Round-1 bugs through.
 
+**Name the branch or worktree in each reviewer's prompt.** `gh pr create` is refused until a
+finished reviewer is tied to the branch, and when this session runs from another directory the
+prompt is the only thing that ties it (build-session, "a PR opens only after an independent
+review"). Naming them anchors nothing: it says where the diff is, not what to think of it.
+
 - **`genesis-architect`** over the full diff — follow its protocol
   (`.claude/agents/genesis-architect.md`): scope-drift check first, then the **premise check**
   (Step 0.6 — is this the right change at all, and is it the best available shape?), then the
@@ -143,12 +148,11 @@ started, and neither of which the findings list will tell you about:
   ladder, though the `file:line` and length requirements above still apply on their own. It
   costs one paragraph.
 - `python3 "$ROOT/scripts/review_state.py" mark --agent-output "$EVID"` — this is an INTERNAL
-  (same-model) audit, so a plain `mark` is correct: it satisfies the commit review-depth gate and
-  never moves the local cross-model streak (which no gate reads any more), whatever it found. No outcome flag is
-  needed. (EXTERNAL is judged by the reviewing MODEL, not the gateway: only a non-Anthropic model —
+  (same-model) audit, so a plain `mark` is correct: it satisfies the commit review-depth gate,
+  whatever it found. No outcome flag is needed. (EXTERNAL is judged by the reviewing MODEL, not the gateway: only a non-Anthropic model —
   Codex, or the install's configured secondary reviewer (`merge_gate.secondary_reviewer`);
   NOT OpenRouter, and never a Genesis internal model — is marked
-  `--source external --defects|--clean`; that alone moves the counter.)
+  `--source external --defects|--clean`, which records the outcome in the marker.)
 - Run `mark` AFTER the final `git add` and BEFORE `git commit`. The evidence must be recent when
   you `mark` (its age is checked at mark time), so write-then-mark promptly. Once marked, an
   unchanged staged diff stays cleared by its diff-hash — if you restage or amend, re-mark.

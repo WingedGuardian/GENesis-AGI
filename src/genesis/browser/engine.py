@@ -442,7 +442,7 @@ def _pinned_engine(version: str) -> EngineStatus:
         return EngineStatus(
             INVALID,
             f"camoufox {version} carries no browser pin; tell the user; "
-            "operator step: install camoufox>=0.5.7,<0.6",
+            "operator step: install camoufox>=0.5.7,<0.5.9",
         )
     try:
         installed = list(multiversion.list_installed())
@@ -569,7 +569,7 @@ def _resolve() -> EngineStatus:
         return EngineStatus(
             INVALID,
             f"camoufox {version} predates the browser pin (0.5.7); "
-            f"tell the user; operator step: install camoufox>=0.5.7,<0.6 or <0.5",
+            f"tell the user; operator step: install camoufox>=0.5.7,<0.5.9 or <0.5",
         )
     override = os.environ.get("CAMOUFOX_EXECUTABLE_PATH", "").strip()
     if override:

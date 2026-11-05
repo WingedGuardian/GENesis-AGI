@@ -55,6 +55,14 @@ genesis_restart_shared_mcp_units() {
             continue
         fi
         [ "$load" = loaded ] || continue
+        # systemd prints every requested property, empty when it has none, so a
+        # loaded unit with no enablement or activity answer is a partial read:
+        # treating it as disabled would leave an enabled service on old code.
+        if [ -z "$enabled" ] || [ -z "$active" ]; then
+            echo "  WARNING: incomplete state for shared MCP unit $unit (UnitFileState='$enabled' ActiveState='$active'); it was not restarted."
+            rc=1
+            continue
+        fi
         case "$enabled" in enabled|enabled-runtime) ;; *) continue ;; esac
         # A unit someone stopped stays stopped: restart would start it again.
         if [ "$active" = inactive ]; then

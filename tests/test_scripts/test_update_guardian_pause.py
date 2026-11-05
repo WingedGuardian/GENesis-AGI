@@ -38,10 +38,13 @@ GUARDIAN_LIB = REPO_ROOT / "scripts" / "lib" / "guardian_pause.sh"
 # ${BASH_SOURCE[0]} (test_update_self_copy_trap.py has the reason).
 # _drop_own_prestop_state: a plain run's own "fetching" state goes on every exit (#3139).
 SELF_DELETE = (
-    "trap 'rm -f \"$_SELF_COPY\" 2>/dev/null; _drop_own_prestop_state; _flush_deploy_summary' EXIT"
+    'trap \'rm -f "$_SELF_COPY" 2>/dev/null; _drop_own_prestop_state; '
+    '[ -z "${_STAGED_ROLLBACK:-}" ] || rm -rf -- "$_STAGED_ROLLBACK" 2>/dev/null; '
+    "_flush_deploy_summary' EXIT"
 )
 EXIT_REARM = (
     'trap \'_guardian_resume; rm -f "$_SELF_COPY" 2>/dev/null; _drop_own_prestop_state; '
+    '[ -z "${_STAGED_ROLLBACK:-}" ] || rm -rf -- "$_STAGED_ROLLBACK" 2>/dev/null; '
     "_flush_deploy_summary' EXIT"
 )
 STOP_CALL = "\n    _stop_genesis_server\n"

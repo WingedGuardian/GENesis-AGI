@@ -263,7 +263,10 @@ def test_the_daily_groom_takes_the_same_lock_around_its_deleting_steps():
     """The daily unit deletes the same trees; it must hold the lock across
     cache reclamation, sandbox reaping and the ~/tmp prune."""
     text = _HYGIENE.read_text()
-    main = text[text.index("\nmain() {"):]
+    # The daily groom's steps live in maintenance_main(), which main() runs
+    # through hygiene_stage; the pressure path has its own function.
+    start = text.index("\nmaintenance_main() {")
+    main = text[start:text.index("\n}\n", start)]
     lock_at = main.index("if ! reclaim_lock ")
     assert lock_at < main.index("disk_reclaim.py") < main.index('prune_tmp "$HOME/tmp"') < main.index("reclaim_unlock")
 
@@ -587,7 +590,8 @@ def test_the_daily_groom_leaves_the_indexes_to_the_guardians_red_pass():
     last-resort threshold explicitly rather than relying on the script's
     default (95 % until #2567 made it 101)."""
     text = _HYGIENE.read_text()
-    main = text[text.index("\nmain() {"):]
+    start = text.index("\nmaintenance_main() {")
+    main = text[start:text.index("\n}\n", start)]
     call = main[main.index("disk_reclaim.py"):main.index("disk_reclaim_rc=$?")]
     assert "--last-resort-above 101" in call
 

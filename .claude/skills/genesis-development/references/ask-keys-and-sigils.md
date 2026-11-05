@@ -1,5 +1,10 @@
 # Ask keys, blocked calls and `secrets.env`
 
+- **`# pr-review-waived` opens a PR with no independent review, on the owner's yes in
+  chat.** It is a sigil, not an ask key: `pr_open_review_gate.py` blocks, and no
+  `hooks.asks` setting changes that. It is logged and refused in a dispatched session.
+  What satisfies the gate without it: build-session, "a PR opens only after an
+  independent review".
 - **A BLOCKED Bash call runs NOTHING** — including earlier `&&` segments and
   heredocs. If `mark && commit` is blocked, the `mark` did not happen either.
   Run gate-adjacent steps as separate calls.

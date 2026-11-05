@@ -53,6 +53,40 @@ def _is_reserved_discord_channel(channel: str) -> bool:
     return _discord_webhook_env(channel) == _DISCORD_DEFAULT_ENV
 
 
+def discord_webhook_configured(channel: str) -> bool:
+    """True when a Discord send to ``channel`` can reach a webhook at all.
+
+    Two conditions: ``DISCORD_WEBHOOK_URL`` is set (the adapter is registered
+    only when it is, so nothing is reachable without it), AND the channel
+    either has its own ``DISCORD_WEBHOOK_<NAME>`` var or IS the configured
+    default channel, which legitimately resolves to the default webhook.
+    ``"discord"`` means "the default channel". The reserved name (``url``)
+    never qualifies — its env lookup inverts onto the default webhook, and
+    honouring it would post there while reporting a channel that does not
+    exist.
+    """
+    return bool(os.environ.get(_DISCORD_DEFAULT_ENV)) and discord_channel_has_webhook(channel)
+
+
+def discord_channel_has_webhook(channel: str) -> bool:
+    """True when ``channel`` itself resolves to a webhook, adapter or not.
+
+    A poll posts straight to the webhook, so it needs only this. A queued send
+    goes through the adapter and needs ``discord_webhook_configured``.
+    """
+    name = discord_default_channel() if channel == "discord" else channel
+    if _is_reserved_discord_channel(name):
+        return False
+    if os.environ.get(_discord_webhook_env(name)):
+        return True
+    return name == discord_default_channel() and bool(os.environ.get(_DISCORD_DEFAULT_ENV))
+
+
+def discord_default_channel() -> str:
+    """The channel a bare ``discord`` send reaches: blank counts as unset, padded trims."""
+    return (os.environ.get("OUTREACH_RECIPIENT_DISCORD") or "").strip() or "dev-discussion"
+
+
 def _discord_channel_from_env(key: str) -> str:
     """Channel name for a ``DISCORD_WEBHOOK_<NAME>`` env var — the FORWARD rule.
 
@@ -151,10 +185,8 @@ async def init(rt: GenesisRuntime) -> None:
             # channel nobody configured a webhook for" (which it must refuse
             # rather than silently redirect). Same value either way — an
             # explicit recipients entry still wins.
-            if "discord" not in recipients:
-                recipients["discord"] = os.environ.get(
-                    "OUTREACH_RECIPIENT_DISCORD", "dev-discussion"
-                )
+            if not recipients.get("discord"):
+                recipients["discord"] = discord_default_channel()
             channels["discord"] = DiscordWebhookAdapter(
                 webhooks=discord_webhooks,
                 default_webhook=discord_webhook,

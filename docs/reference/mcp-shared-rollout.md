@@ -68,10 +68,9 @@ Direct script execution works with `python -I -S` and imports no MCP/provider or
 runtime modules. The deploy helper captures both reader and CLI source when it
 is sourced, so a merge cannot change either part of that run's reader.
 
-Package floors are FastMCP 2.14.6 and MCP 1.30, retaining their current major API
-lines. This prepares the inert shared core; a dependency range does not qualify
-every later release or activate shared routing. No shared-service launcher or
-service unit is added by the reader extraction.
+The existing package floors remain FastMCP 4.1.4 and MCP 2.3.0. A dependency
+range does not qualify every later release or activate shared routing. No
+shared-service launcher or service unit is added by the reader extraction.
 
 A session decides once, when Claude Code spawns its MCP servers. Changing the stage
 affects new sessions; running ones keep the command they started with.
@@ -113,6 +112,10 @@ Read-only: the requested stage, the ceiling, the kill switch, and per server the
 state and what a new session would launch, with the reason.
 
 ## Qualification checklist (when the shared service and adapter exist)
+
+Before any of these: the service calls `genesis.caller_context.enter_shared_service()`
+before its first request, or work that loses its request scope reads the service's own
+environment as its caller and passes human-only gates.
 
 Each step runs on one session first (`GENESIS_MCP_SHARED_STAGE=<stage>` in that
 session's environment), then for the install (the overlay).

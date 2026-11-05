@@ -34,6 +34,10 @@ async def send_and_wait_via_pipeline(
     timeout_s: float,
 ) -> dict:
     """Send a message and block for the owner's reply. Returns a JSON-able dict."""
+    if channel == "email":
+        # An email needs a subject written by its author, and the reply this
+        # waits for is a chat reply: email goes through outreach_send.
+        return {"status": "refused", "code": "use_outreach_send_for_email"}
     try:
         cat = OutreachCategory(category)
     except ValueError:

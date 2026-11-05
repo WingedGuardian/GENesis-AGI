@@ -154,6 +154,7 @@ MemoryMax=4G
 MemorySwapMax=0
 CPUQuota=200%
 OOMScoreAdjust=500
+ManagedOOMPreference=avoid
 KillMode=control-group
 Restart=on-failure
 RestartSec=5

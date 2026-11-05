@@ -128,6 +128,7 @@ def restore_sandbox(tmp_path):
     backup = tmp_path / "backup"
     backup.mkdir()
     env = dict(os.environ)
+    env.pop("SECRETS_PATH", None)  # GENESIS_DIR names the secrets file, as on CI
     env.update(
         HOME=str(home),
         GENESIS_DIR=str(home / "genesis"),

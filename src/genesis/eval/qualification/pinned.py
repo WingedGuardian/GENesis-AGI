@@ -619,7 +619,7 @@ def production_credentials() -> set[str]:
 
 @contextmanager
 def scoped_credential(key: str):
-    """The delegate reads its key from the environment; lend it the dedicated one."""
+    """The delegate reads its key from the environment; lend it the approved one."""
     saved = {name: os.environ.get(name) for name in PRODUCTION_KEY_NAMES}
     token = _SCOPED_SECRETS.set(_redaction_values())
     try:
@@ -751,7 +751,28 @@ def dedicated_key() -> str:
     return key
 
 
-async def reconcile(journal, attempt: str, *, transport=None, association=None):
+def frozen_credential_mode(value):
+    if not isinstance(value, dict):
+        raise LocalFailure("invalid qualification credential identity")
+    mode = value.get("credential_mode", "dedicated")
+    if mode not in ("dedicated", "shared_existing"):
+        raise LocalFailure("unknown qualification credential mode")
+    return mode
+
+
+def credential(mode="dedicated") -> str:
+    if mode == "dedicated":
+        return dedicated_key()
+    if mode != "shared_existing":
+        raise LocalFailure("unknown qualification credential mode")
+    check_callback_isolation()
+    key = os.environ.get(KEY_ENV, "")
+    if not key:
+        raise LocalFailure(f"{KEY_ENV} must hold the approved existing key")
+    return key
+
+
+async def reconcile(journal, attempt: str, *, transport=None, association=None, credential_mode=None):
     """Append GET evidence without sending a completion, including on recovery.
 
     Frozen schedule rows carry ``receipt_provider`` and
@@ -761,6 +782,11 @@ async def reconcile(journal, attempt: str, *, transport=None, association=None):
     """
     row = journal.attempt(attempt)
     spec = row["spec"]
+    binding = journal.expected_manifest["binding"].get("transports", {}).get(spec["alias"], {})
+    mode = frozen_credential_mode(spec)
+    if (mode != frozen_credential_mode(binding)
+            or (credential_mode is not None and credential_mode != mode)):
+        raise LocalFailure("reconciliation credential mode differs from frozen identity")
     display = spec.get("receipt_provider")
     identity = spec.get("provider_identity_evidence")
     if (
@@ -801,7 +827,7 @@ async def reconcile(journal, attempt: str, *, transport=None, association=None):
         generation = association["generation_id"]
     # Validate the serializer's whole input domain before doing any GET work.
     association_evidence = safe_association(association)
-    key = dedicated_key()
+    key = credential(mode)
     if hashlib.sha256(key.encode()).hexdigest() != spec.get("credential_fingerprint"):
         raise LocalFailure("reconciliation credential differs from frozen identity")
     with private_logs():
@@ -957,7 +983,7 @@ class PinnedRouter:
     """
 
     def __init__(self, campaign, *, alias, params, dispatch, transport=None, config=None,
-                 dispatch_admission=None):
+                 dispatch_admission=None, credential_mode=None):
         self.campaign, self.alias = campaign, alias
         self.config = config or routing()
         self.cfg = resolve(alias, self.config)
@@ -981,13 +1007,20 @@ class PinnedRouter:
             canonical(binding.get(k)) != canonical(v) for k, v in expected.items()
         ):
             raise LocalFailure("transport differs from the frozen campaign binding")
+        mode = frozen_credential_mode(binding)
+        selected_mode = credential_mode if credential_mode is not None else ("dedicated" if dispatch else mode)
+        if selected_mode != mode:
+            raise LocalFailure("credential mode differs from the explicit transport policy")
+        if dispatch and mode == "shared_existing" and not callable(dispatch_admission):
+            raise LocalFailure("shared dispatch requires an operating admission controller")
+        self.credential_mode = mode
         fingerprint = binding.get("credential_fingerprint")
         if (
             not isinstance(fingerprint, str)
             or len(fingerprint) != 64
             or any(c not in "0123456789abcdef" for c in fingerprint)
         ):
-            raise LocalFailure("campaign must freeze a dedicated credential fingerprint")
+            raise LocalFailure("campaign must freeze a qualification credential fingerprint")
         self.fingerprint = fingerprint
         self.schedule = {}
         maxima = []
@@ -1000,6 +1033,7 @@ class PinnedRouter:
                 or spec["endpoint"] != ENDPOINT + "/chat/completions"
                 or spec["generation_namespace"] != "openrouter"
                 or spec.get("credential_fingerprint") != self.fingerprint
+                or frozen_credential_mode(spec) != mode
                 or not isinstance(spec.get("receipt_provider"), str)
                 or not spec["receipt_provider"].strip()
                 or not isinstance(spec.get("provider_identity_evidence"), str)
@@ -1125,10 +1159,11 @@ class PinnedRouter:
             error.add_note("failure evidence append failed: " + exception_name(append_error))
 
     async def _send(self, attempt, expected):
-        secret = dedicated_key()
+        secret = credential(self.credential_mode)
         if hashlib.sha256(secret.encode()).hexdigest() != self.fingerprint:
-            raise LocalFailure("dedicated credential differs from frozen identity")
-        info = await key_status(secret, self.transport, required=str(self.required))
+            raise LocalFailure("qualification credential differs from frozen identity")
+        info = (await key_status(secret, self.transport, required=str(self.required))
+                if self.credential_mode == "dedicated" else {"credential_mode": "shared_existing"})
         if self.dispatch_admission is not None:
             # Check the exact validated observation before owning a client or
             # reserving/dispatching. Nested metadata remains detached evidence.
@@ -1209,7 +1244,8 @@ class PinnedRouter:
                 if active is None or not isinstance(cleanup, Exception):
                     raise
         try:
-            await reconcile(self.campaign, attempt, transport=self.transport)
+            await reconcile(self.campaign, attempt, transport=self.transport,
+                            credential_mode=self.credential_mode)
         except BaseException as exc:
             self._failure(attempt, exc)
             raise
