@@ -11,6 +11,11 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 
 ### Changed
 
+- Added an internal, opt-in shared-MCP execution adapter that retires handlers
+  when their protocol session ends. It preserves the original FastMCP server
+  and restricts shared execution to qualified dependency pairs; launchers
+  still do not select it.
+
 - Shared MCP rollout and future service startup use one stdlib configuration
   reader, preserving overlay merges and per-deploy source snapshots. Reader
   import failures preserve the supplied stdio launch; incomplete captured source
