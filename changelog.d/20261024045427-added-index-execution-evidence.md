@@ -1,0 +1,1 @@
+- Add an explicit internal indexing execution-evidence helper that refuses missing scope proof and preserves uncertain completion separately from command exit codes. Automatic queue quarantine and provider activation remain separate work.
