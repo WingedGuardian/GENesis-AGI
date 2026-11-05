@@ -871,6 +871,19 @@ def test_the_domain_key_ignores_which_wall_binds(box):
     assert len({home, dl} & set(st["disk"])) <= 1, st["disk"].keys()
 
 
+def test_the_domain_key_ignores_the_quota_flag(box):
+    """The flag only picks which binding sets a domain's rate and tier. Only these
+    two paths are watched: `/` shares the domain on some layouts, and would take the
+    report for one of the two flags and hide a split between them."""
+    home, dl = str(box["home"]), str(box["dl"])
+    st = _poll(
+        box,
+        {home: "5000 357000 0 - - btrfs", dl: "5000 357000 1 - - btrfs"},
+        extra=f"    watched_paths() {{ printf '%s\\n' '{home}' '{dl}'; }}",
+    )
+    assert len({home, dl} & set(st["disk"])) == 1, st["disk"].keys()
+
+
 def test_episode_markers_of_a_vanished_domain_are_dropped(box):
     """Review NOTE: a marker left by a domain that no longer exists (a quota
     resized away) must not suppress that domain's page if it comes back."""
