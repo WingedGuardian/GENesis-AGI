@@ -49,6 +49,13 @@
 
 set -u
 
+# Optional: without it the slot still opens, with the system's weaker kill.
+_SLOT_EXEC_DIR="$(unset CDPATH; cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -r "$_SLOT_EXEC_DIR/lib/gnu_timeout.sh" ]; then
+    # shellcheck source=scripts/lib/gnu_timeout.sh
+    . "$_SLOT_EXEC_DIR/lib/gnu_timeout.sh"
+fi
+
 prefix="genesis-slot"
 slice="genesis-slots.slice"
 omit=0
@@ -118,6 +125,16 @@ if [ -z "${XDG_RUNTIME_DIR:-}" ] && [ -d "$_rt" ]; then
     _unset_xdg=(-u XDG_RUNTIME_DIR)
 fi
 
+# The command gets its arguments as written. Systemd older than 254 refuses this
+# option (exit 1, before it reaches --version), and only that drops it: anything
+# else keeps it, and the probe below then decides.
+_SD_LITERAL=(--expand-environment=no)
+_sd_literal_rc=0
+systemd-run "${_SD_LITERAL[@]}" --version >/dev/null 2>&1 || _sd_literal_rc=$?
+if [ "$_sd_literal_rc" -eq 1 ]; then
+    _SD_LITERAL=()
+fi
+
 _base=(-p TasksMax=infinity)
 [ "$omit" = "1" ] && _base+=(-p ManagedOOMPreference=omit)
 _caps=()
@@ -155,9 +172,10 @@ if [ -n "${INVOCATION_ID+x}" ]; then _inv=("INVOCATION_ID=$INVOCATION_ID"); fi
 # OOMPolicy=continue where systemd does support it would let the first OOM
 # kill stop the whole scope, claude included.
 _err=""
+# `timeout` comes first: gnu_timeout.sh defines a function, which `env` could not run.
 _probe() {
-    _err=$(env "${_run_env[@]}" timeout -k 2 15 systemd-run --user --scope --quiet --collect \
-        --slice="$slice" "$@" true 2>&1 >/dev/null)
+    _err=$(timeout -k 2 15 env "${_run_env[@]}" systemd-run --user --scope --quiet --collect \
+        "${_SD_LITERAL[@]}" --slice="$slice" "$@" true 2>&1 >/dev/null)
 }
 _tiers=()
 if [ "${#_caps[@]}" -gt 0 ]; then
@@ -199,7 +217,7 @@ fi
 # as an assignment: callers pass a program name or an absolute path.
 _hex=$(od -An -N4 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
 [ -n "$_hex" ] || _hex="$$"
-exec env "${_run_env[@]}" systemd-run --user --scope --quiet --collect \
+exec env "${_run_env[@]}" systemd-run --user --scope --quiet --collect "${_SD_LITERAL[@]}" \
     --slice="$slice" --unit="${prefix}-${label}-${_hex}" \
     --description="Genesis ${prefix} ${label}" "${_props[@]}" \
     -- env "${_unset_xdg[@]}" "${_inv[@]}" "$@"

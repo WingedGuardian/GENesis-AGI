@@ -16,6 +16,7 @@ import pytest
 _SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "slot_exec.sh"
 
 _SHIM = """#!/usr/bin/env bash
+case " $* " in *" --version "*) exit "${SHIM_LITERAL_RC:-0}" ;; esac
 echo "XDG=${XDG_RUNTIME_DIR:-unset} ARGS=$*" >> "$SHIM_LOG"
 last=""
 for a in "$@"; do last="$a"; done
@@ -69,6 +70,39 @@ def test_probe_then_scoped_launch(shim):
     assert "--slice=genesis-slots.slice" in calls[0] and calls[0].endswith(" true")
     assert "--unit=genesis-slot-7-" in calls[1]
     assert "-- env -u INVOCATION_ID" in calls[1]
+
+
+@pytest.mark.parametrize(
+    ("answer", "kept"),
+    [("0", True), ("1", False), ("2", True), ("127", True)],
+)
+def test_only_a_definite_refusal_drops_the_literal_option(shim, answer, kept):
+    r = shim("7", "--", "bash", "-c", "echo ran", env_extra={"SHIM_LITERAL_RC": answer})
+    assert r.stdout.strip() == "ran", r.stderr
+    calls = _calls(shim.log)
+    assert len(calls) == 2, calls
+    for call in calls:
+        head = call.split(" -- ", 1)[0]
+        assert ("--expand-environment=no" in head) is kept, call
+
+
+def test_the_probe_runs_under_gnu_timeout_where_the_system_one_is_uutils(shim, tmp_path):
+    """uutils' kill reaches the direct child alone, and a function cannot run under env."""
+    bindir = tmp_path / "bin"
+    log = tmp_path / "gnu.log"
+    (bindir / "timeout").write_text(
+        '#!/bin/sh\n[ "$1" = --version ] && { echo "timeout (uutils coreutils) 0.8.0"; exit 0; }\n'
+        'echo "system timeout $*" >> "$GNU_LOG"\nshift 3\nexec "$@"\n'
+    )
+    (bindir / "gnutimeout").write_text(
+        '#!/bin/sh\necho "gnutimeout $*" >> "$GNU_LOG"\nshift 3\nexec "$@"\n'
+    )
+    (bindir / "timeout").chmod(0o755)
+    (bindir / "gnutimeout").chmod(0o755)
+    r = shim("7", "--", "bash", "-c", "echo ran", env_extra={"GNU_LOG": str(log)})
+    assert r.stdout.strip() == "ran", r.stderr
+    lines = log.read_text().splitlines()
+    assert len(lines) == 1 and lines[0].startswith("gnutimeout -k 2 15 env "), lines
 
 
 @pytest.mark.parametrize("code", [0, 3, 137])
@@ -274,6 +308,7 @@ def test_unsafe_slice_falls_back_to_the_default(shim, bad):
 
 
 _REFUSING_SHIM = """#!/usr/bin/env bash
+case " $* " in *" --version "*) exit "${SHIM_LITERAL_RC:-0}" ;; esac
 echo "ARGS=$*" >> "$SHIM_LOG"
 for a in "$@"; do
     for bad in ${SHIM_REFUSE:-}; do
