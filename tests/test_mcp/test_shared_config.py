@@ -118,3 +118,45 @@ def test_deploy_snapshot_keeps_reader_and_cli_after_files_change(tmp_path):
         capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == ["genesis-mcp-fixture.service"]
+
+
+@pytest.mark.parametrize("component", ["reader", "cli"])
+@pytest.mark.parametrize("state", ["missing", "empty", "invalid", "blank", "comments", "truncated"])
+def test_deploy_refuses_incomplete_source_capture(tmp_path, component, state):
+    root = tmp_path / "checkout"
+    reader = root / "src/genesis/mcp/shared_config.py"
+    reader.parent.mkdir(parents=True)
+    lib = root / "scripts/lib/shared_mcp_units.sh"
+    lib.parent.mkdir(parents=True)
+    cli = lib.with_name("mcp_rollout.py")
+    shutil.copy(READER, reader)
+    shutil.copy(SCRIPT, cli)
+    shutil.copy(LIB, lib)
+    damaged = reader if component == "reader" else cli
+    if state == "missing":
+        damaged.unlink()
+    else:
+        damaged.write_text({
+            "empty": "", "invalid": "def broken syntax\n", "blank": " \n\t\n",
+            "comments": "# incomplete captured source\n",
+            "truncated": "def main():\n    pass\n",
+        }[state])
+    (root / "config").mkdir()
+    (root / "config/mcp_shared.json").write_text(json.dumps({
+        "servers": {"memory": {"unit": "genesis-mcp-fixture.service"}},
+    }))
+    shims = tmp_path / "bin"
+    shims.mkdir()
+    calls = tmp_path / "systemctl-called"
+    shim = shims / "systemctl"
+    shim.write_text(f"#!/bin/sh\nprintf 'called\\n' >> '{calls}'\nexit 98\n")
+    shim.chmod(0o755)
+    result = subprocess.run(
+        ["bash", "-c", '. "$1"; genesis_restart_shared_mcp_units "$2"',
+         "fixture", str(lib), str(root)],
+        env={**os.environ, "PATH": str(shims) + os.pathsep + os.environ["PATH"],
+             "GENESIS_HOME": str(tmp_path / "private-home")},
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert not calls.exists(), "incomplete source capture reached systemctl"

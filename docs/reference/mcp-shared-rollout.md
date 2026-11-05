@@ -64,9 +64,19 @@ service and the adapter own them and set their own where they differ.
 The stdlib reader is `genesis.mcp.shared_config.load_config`; the rollout helper
 re-exports it and its configuration error. The merge stays shallow: an overlay's
 server key replaces that key, including a complete nested `service` object.
-Direct script execution works with `python -I -S` and imports no MCP/provider or
-runtime modules. The deploy helper captures both reader and CLI source when it
-is sourced, so a merge cannot change either part of that run's reader.
+JSON is read as UTF-8 even under an ASCII process locale. Direct script execution
+works with `python -I -S` and imports no MCP/provider or runtime modules. A reader
+import failure during `launch` uses the ordinary argument parser and execs the
+supplied stdio command; `units`, `status` and importing callers still fail.
+
+The deploy helper captures both reader and CLI source when it is sourced. A
+nonempty snapshot stays fixed even if the checkout changes or executing that
+snapshot fails. If startup capture was missing or empty, the restart invocation
+can capture both sources from its supplied synchronized checkout. Each deploy
+path calls this helper once. Captured code must explicitly run the CLI entry
+point and return an integer exit status: incomplete source cannot silently
+report that no units need checking. A capture/configuration failure returns
+nonzero before any shared-unit action.
 
 The existing package floors remain FastMCP 4.1.4 and MCP 2.3.0. A dependency
 range does not qualify every later release or activate shared routing. No

@@ -22,17 +22,36 @@
 
 # Capture the reader too: importing it later could mix pre/post-merge code.
 # Concatenation is only of these two owned stdlib sources, never config data.
-_SHARED_MCP_ROLLOUT_PY="$(
-    _shared_mcp_lib_dir="$(dirname -- "${BASH_SOURCE[0]}")"
-    cat "$_shared_mcp_lib_dir/../../src/genesis/mcp/shared_config.py" 2>/dev/null &&
-        printf '\n_GENESIS_MCP_CONFIG_SNAPSHOT = True\n' &&
-        cat "$_shared_mcp_lib_dir/mcp_rollout.py" 2>/dev/null
-)" || _SHARED_MCP_ROLLOUT_PY=""
+_genesis_capture_shared_mcp_source() {
+    local root="$1" _shared_mcp_reader _shared_mcp_cli
+    _shared_mcp_reader="$(cat "$root/src/genesis/mcp/shared_config.py" 2>/dev/null)" &&
+        _shared_mcp_cli="$(cat "$root/scripts/lib/mcp_rollout.py" 2>/dev/null)" &&
+        [ -n "$_shared_mcp_reader" ] && [ -n "$_shared_mcp_cli" ] &&
+        printf '%s\n_GENESIS_MCP_CONFIG_SNAPSHOT = True\n__name__ = "_genesis_mcp_snapshot"\n%s\n' "$_shared_mcp_reader" "$_shared_mcp_cli" &&
+        cat <<'PY'
+try:
+    _shared_mcp_status = main()
+    if type(_shared_mcp_status) is not int:
+        raise RuntimeError("captured rollout main did not return an exit status")
+except RolloutError as exc:
+    _say(str(exc))
+    raise SystemExit(1)
+raise SystemExit(_shared_mcp_status)
+PY
+}
+_SHARED_MCP_ROLLOUT_PY="$(_genesis_capture_shared_mcp_source "$(dirname -- "${BASH_SOURCE[0]}")/../..")" || _SHARED_MCP_ROLLOUT_PY=""
+_SHARED_MCP_CAPTURE_RECOVERY_ATTEMPTED=0
 
 genesis_restart_shared_mcp_units() {
     local root="$1" units unit state load enabled active inv_before inv_after rrc rc=0
+    if [ -z "$_SHARED_MCP_ROLLOUT_PY" ] && [ "$_SHARED_MCP_CAPTURE_RECOVERY_ATTEMPTED" -eq 0 ]; then
+        # An absent startup source may arrive with the synchronized checkout.
+        # Never replace a nonempty snapshot, even if executing it later fails.
+        _SHARED_MCP_CAPTURE_RECOVERY_ATTEMPTED=1
+        _SHARED_MCP_ROLLOUT_PY="$(_genesis_capture_shared_mcp_source "$root")" || _SHARED_MCP_ROLLOUT_PY=""
+    fi
     if [ -z "$_SHARED_MCP_ROLLOUT_PY" ]; then
-        echo "  NOTE: scripts/lib/mcp_rollout.py is missing; shared MCP units were not checked."
+        echo "  NOTE: shared MCP reader/CLI source capture is missing or empty; shared MCP units were not checked."
         return 1
     fi
     # stderr stays apart: on success stdout is the unit list and nothing else.

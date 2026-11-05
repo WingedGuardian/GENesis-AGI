@@ -33,19 +33,47 @@ import sys
 from pathlib import Path
 from typing import NamedTuple
 
+
+def _parse_args(argv=None):
+    """One command contract for normal dispatch and reader-import recovery."""
+    parser = argparse.ArgumentParser(prog="mcp_rollout")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    for name in ("launch", "units", "status"):
+        sub.add_parser(name).add_argument("--root", required=True)
+    args, rest = parser.parse_known_args(argv)
+    if args.cmd == "launch":
+        if not rest or rest[0] != "--" or len(rest) < 2:
+            parser.error("launch needs -- <stdio command>")
+        rest = rest[1:]
+    elif rest:
+        parser.error(f"unexpected arguments: {rest}")
+    return args, rest
+
+
 # The deploy helper captures this file AND the stdlib reader before a merge.
 # Its private prefix already defines these names; ordinary script/import callers
 # load the same module from this checkout, including under python -I -S.
 if not globals().get("_GENESIS_MCP_CONFIG_SNAPSHOT", False):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-    from genesis.mcp.shared_config import (
-        CONFIG_NAME,
-        SharedConfigError,
-        load_config,
-    )
-    from genesis.mcp.shared_config import (
-        overlay_path as overlay_path,
-    )
+    try:
+        from genesis.mcp.shared_config import (
+            CONFIG_NAME,
+            SharedConfigError,
+            load_config,
+        )
+        from genesis.mcp.shared_config import (
+            overlay_path as overlay_path,
+        )
+    except Exception as exc:
+        # Only a direct launch owns a supplied stdio fallback. Other commands
+        # and ordinary importing callers must still fail on a broken reader.
+        if __name__ != "__main__":
+            raise
+        args, stdio = _parse_args()
+        if args.cmd != "launch":
+            raise
+        print(f"genesis mcp rollout: {exc}; launching the per-session server", file=sys.stderr)
+        os.execv(stdio[0], stdio)  # noqa: S606 - the launcher's original stdio argv
 
 RolloutError = SharedConfigError
 
@@ -282,18 +310,10 @@ def status(root):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(prog="mcp_rollout")
-    sub = parser.add_subparsers(dest="cmd", required=True)
-    for name in ("launch", "units", "status"):
-        sub.add_parser(name).add_argument("--root", required=True)
-    args, rest = parser.parse_known_args(argv)
+    args, stdio = _parse_args(argv)
     root = Path(args.root)
     if args.cmd == "launch":
-        if not rest or rest[0] != "--" or len(rest) < 2:
-            parser.error("launch needs -- <stdio command>")
-        launch(root, rest[1:])
-    elif rest:
-        parser.error(f"unexpected arguments: {rest}")
+        launch(root, stdio)
     elif args.cmd == "units":
         for unit in units(load_config(root, dict(os.environ))):
             print(unit)

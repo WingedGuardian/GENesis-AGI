@@ -123,6 +123,9 @@ def _install_the_script(st) -> None:
     """Put this script and its libs into the fixture's own tree, committed, so
     the script resolves its paths from where it sits (no GENESIS_DEPLOY_ROOT)."""
     files = {f"scripts/{f}": (SCRIPT.parent / f).read_text() for f in _SCRIPT_FILES}
+    files["src/genesis/mcp/shared_config.py"] = (
+        SCRIPT.parent.parent / "src/genesis/mcp/shared_config.py"
+    ).read_text(encoding="utf-8")
     _advance_upstream(st, "the deploy script", files)
     # Real clock, deliberately: a later deploy merges on the real clock too, and a
     # pull stamped ahead of it reads as the clock stepping back.

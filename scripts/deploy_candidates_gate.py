@@ -123,6 +123,7 @@ REFUSAL_FILES = (
     # with `cat` when sourced.
     "scripts/lib/shared_mcp_units.sh",
     "scripts/lib/mcp_rollout.py",
+    "src/genesis/mcp/shared_config.py",
     # The package record and restore helpers, sourced by update.sh at startup.
     "scripts/lib/venv_setup.sh",
     # The rollback and the service helpers it needs, also sourced at startup.

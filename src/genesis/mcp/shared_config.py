@@ -24,7 +24,7 @@ def overlay_path(env):
 
 def _read(path):
     try:
-        data = json.loads(path.read_text())
+        data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return None
     except (OSError, ValueError) as exc:

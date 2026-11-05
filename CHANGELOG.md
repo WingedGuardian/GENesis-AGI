@@ -12,8 +12,10 @@ Versioning follows Genesis release stages (v3.0a → v3.0b → v3.1 → v4.0a…
 ### Changed
 
 - Shared MCP rollout and future service startup use one stdlib configuration
-  reader, preserving overlay merges and per-deploy source snapshots. Dependency
-  floors advance to FastMCP 2.14.6 and MCP 1.30; shared routing remains off.
+  reader, preserving overlay merges and per-deploy source snapshots. Reader
+  import failures preserve the supplied stdio launch; incomplete captured source
+  fails before shared-unit actions. JSON reads use UTF-8. Existing dependency
+  floors remain FastMCP 4.1.4 and MCP 2.3.0; shared routing remains off.
 
 ## [v3.0b19] - 2026-10-24
 
