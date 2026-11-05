@@ -3768,7 +3768,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
-          env.py, _config_overlay.py, caller_context.py]
+          env.py, _config_overlay.py, caller_context.py, caller_credentials.py]
 verified: 973a0e6 2026-10-30
 ```
 
