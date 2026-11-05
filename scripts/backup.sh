@@ -507,8 +507,9 @@ if [ -f "$DB_FILE" ]; then
         # The dump streams straight into encryption, so the plaintext dump is
         # never written to a file before it is encrypted. (The round-trip below
         # still decrypts one temporary copy to verify the artifact.) awk passes
-        # the bytes through unchanged and records the line count and the last
-        # line. A failing stage leaves a truncated artifact behind, so the stage
+        # the bytes through unchanged and records the line count and whether the
+        # last line is COMMIT; (a flag, never the line: on a killed dump that line
+        # can be an INSERT holding a credential). A failing stage leaves a truncated artifact behind, so the stage
         # is read from PIPESTATUS and the artifact discarded: a partial dump is
         # never encrypted and promoted as if complete.
         _SQL_COUNT=$(mktemp -p "$GENESIS_BIG_TMP")
@@ -517,7 +518,7 @@ if [ -f "$DB_FILE" ]; then
         _sql_enc_rc=0
         _sql_dump_why=""
         if sqlite3 "$DB_FILE" .dump 2>/dev/null \
-            | awk -v out="$_SQL_COUNT" '{ print; last = $0 } END { print NR > out; print last > out }' \
+            | awk -v out="$_SQL_COUNT" '{ print; done = ($0 == "COMMIT;") } END { print NR > out; print done + 0 > out }' \
             | encrypt_stream "$_SQL_ARTIFACT_TMP"; then
             :
         else
@@ -534,7 +535,7 @@ if [ -f "$DB_FILE" ]; then
         # sqlite3 exits 0 on a corrupt or locked DB and ends the dump with
         # "ROLLBACK; -- due to errors"; a complete dump ends with COMMIT;.
         if [ "$_sql_dump_rc" -eq 0 ] && [ "$_sql_enc_rc" -eq 0 ] \
-            && [ "$(sed -n 2p "$_SQL_COUNT" 2>/dev/null)" != "COMMIT;" ]; then
+            && [ "$(sed -n 2p "$_SQL_COUNT" 2>/dev/null)" != "1" ]; then
             _sql_dump_rc=1
             _sql_dump_why=" (dump did not end in COMMIT)"
         fi

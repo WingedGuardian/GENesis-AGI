@@ -24,6 +24,7 @@ against a tmp dir so upload assertions are actual files.
 import fcntl
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -837,3 +838,24 @@ def test_sql_stream_encrypt_failure_reported_as_encrypt(sandbox):
     data = sandbox["clone"] / "data"
     assert not (data / "genesis.sql.gpg").exists()
     assert not list(data.glob(".genesis.sql.gpg.partial.*"))
+
+
+@pytest.mark.parametrize(
+    ("dump", "flag"),
+    [
+        ("BEGIN TRANSACTION;\nCOMMIT;\n", "1"),
+        (f"BEGIN TRANSACTION;\nINSERT INTO t VALUES('{_SENTINEL}');\n", "0"),
+        ("BEGIN TRANSACTION;\nROLLBACK; -- due to errors\n", "0"),
+        ("", "0"),
+    ],
+)
+def test_the_dump_side_file_holds_a_flag_never_a_line_of_the_dump(tmp_path, dump, flag):
+    """It sits in plain text beside the encrypted stream until cleanup."""
+    script = (Path(__file__).parents[2] / "scripts" / "backup.sh").read_text()
+    program = re.search(r"""awk -v out="\$_SQL_COUNT" '([^']+)'""", script).group(1)
+    side = tmp_path / "count"
+    out = subprocess.run(
+        ["awk", "-v", f"out={side}", program], input=dump, capture_output=True, text=True, check=True
+    )
+    assert out.stdout == dump, "the stream must pass through unchanged"
+    assert side.read_text().splitlines() == [str(dump.count("\n")), flag]
