@@ -66,7 +66,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
 from plan_doc import premise_answers, strip_quoted  # noqa: E402
-from plan_premise_gate import _QUESTIONS, _empty  # noqa: E402
+from plan_premise_gate import _QUESTIONS, _empty, _problem  # noqa: E402
 
 MISSING_LABEL = "premises-missing"
 DEVIN_LABEL = "devin-ready"
@@ -181,6 +181,54 @@ def _may_add(issue: dict) -> bool:
     use, so they never disagree about an exempt issue."""
     new = (issue.get("created_at") or "") >= GATE_EPOCH
     return new and not is_bug_form(issue.get("body") or "")
+
+
+def owed_answers(issue: dict) -> tuple[str, list[int]]:
+    """What the label job would hold against ``issue`` were it opened now.
+
+    Returns ``("premise" | "verification", missing)`` when an ``opened`` event would
+    add ``premises-missing``, else ``("", [])``: the issue is complete or exempt.
+    Built only from ``_may_add``, ``_label_names`` and ``missing_answers``, the
+    pieces ``decide`` uses, so a check run before filing (the
+    ``hooks/issue_premise_gate.py`` PreToolUse hook) agrees with the gate that runs
+    after it. A test pins that agreement cell by cell, at one commit: the hook runs
+    the local copy, the Action the default branch's.
+
+    It adds no import, deliberately: the Action sparse-checks out exactly five
+    files, so a new module here would fail every run there. ``issue`` needs
+    ``body``, ``labels`` and ``created_at``; a caller filing a new issue passes the
+    current UTC time.
+    """
+    if not _may_add(issue):
+        return "", []
+    bug = BUG_LABEL in _label_names(issue)
+    missing = missing_answers(issue.get("body") or "", bug=bug)
+    return ("verification" if bug else "premise", missing) if missing else ("", [])
+
+
+def owed_message(issue: dict) -> str:
+    """The fix for what ``owed_answers`` reports, written for the agent, or ""."""
+    section, missing = owed_answers(issue)
+    if not section:
+        return ""
+    bug = section == "verification"
+    heading = "## Verification" if bug else "## Premise checks"
+    questions = VERIFICATION_QUESTIONS if bug else _QUESTIONS
+    body = strip_quoted(issue.get("body") or "")
+    answers = premise_answers(body, VERIFICATION_TITLE) if bug else premise_answers(body)
+    if answers is None:
+        why = " (the issue is labelled `bug`)" if bug else ""
+        problems = [f"the body has no `{heading}` section{why}"]
+    else:
+        problems = [_problem(n, questions[n - 1], answers.get(n, "")) for n in missing]
+    return (
+        "".join(f"  - {p}\n" for p in problems)
+        + "\nAdd or complete this section in the body, then run the command again:\n"
+        + f"\n  {heading}\n"
+        + "".join(f"  {n}. <{q}>\n" for n, q in enumerate(questions, start=1))
+        + "\n`n/a — <reason>` is a valid answer; a bare `n/a`, `TBD` or `<placeholder>` "
+        'is not. Questions: .claude/docs/premise-check.md, "At plan and issue time".\n'
+    )
 
 
 def decide(event: dict) -> Plan:

@@ -561,3 +561,47 @@ def test_strip_route_env_without_a_route_marker_only_drops_routing():
     env = {"ANTHROPIC_BASE_URL": "https://x", "CLAUDE_CODE_EFFORT_LEVEL": "low", "PATH": "/b"}
     gmodel_routes.strip_route_env(env)
     assert env == {"CLAUDE_CODE_EFFORT_LEVEL": "low", "PATH": "/b"}
+
+
+def _as_terminal(launcher, monkeypatch):
+    monkeypatch.setattr(launcher["sys"].stdin, "isatty", lambda: True)
+    monkeypatch.setattr(launcher["sys"].stdout, "isatty", lambda: True)
+
+
+def test_interactive_launch_starts_claude_in_its_own_scope(launcher, monkeypatch):
+    """An interactive gmodel session goes through scripts/slot_exec.sh, so it
+    never stays in a login scope; claude's argv and env reach it unchanged."""
+    _as_terminal(launcher, monkeypatch)
+    captured = _capture_exec(launcher, monkeypatch)
+    with pytest.raises(_ExecCaptured):
+        launcher["main"](["opus", "--resume", "old"])
+    assert captured["path"] == str(_REPO_ROOT / "scripts" / "slot_exec.sh")
+    assert captured["args"][1:4] == ["gm", "--", "/fake/claude"]
+    assert captured["args"][-2:] == ["--resume", "old"]
+    assert "ANTHROPIC_API_KEY" not in captured["env"]
+
+
+def test_interactive_launch_inside_a_slot_uses_the_slot_label(launcher, monkeypatch):
+    _as_terminal(launcher, monkeypatch)
+    monkeypatch.setenv("GENESIS_SLOT", "5")
+    captured = _capture_exec(launcher, monkeypatch)
+    with pytest.raises(_ExecCaptured):
+        launcher["main"](["opus"])
+    assert captured["args"][1:3] == ["5", "--"]
+
+
+@pytest.mark.parametrize("extra", [["-p", "hi"], ["--bg"]])
+def test_headless_launch_is_not_wrapped(launcher, monkeypatch, extra):
+    _as_terminal(launcher, monkeypatch)
+    captured = _capture_exec(launcher, monkeypatch)
+    with pytest.raises(_ExecCaptured):
+        launcher["main"](["opus", *extra])
+    assert captured["path"] == "/fake/claude"
+
+
+def test_piped_launch_is_not_wrapped(launcher, monkeypatch):
+    monkeypatch.setattr(launcher["sys"].stdin, "isatty", lambda: False)
+    captured = _capture_exec(launcher, monkeypatch)
+    with pytest.raises(_ExecCaptured):
+        launcher["main"](["opus"])
+    assert captured["path"] == "/fake/claude"

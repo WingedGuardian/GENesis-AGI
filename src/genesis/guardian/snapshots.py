@@ -165,6 +165,16 @@ class SnapshotManager:
         # Why the last delete() failed (the runner's "timeout" = outcome
         # unknown), or None after a success.
         self.last_delete_error: str | None = None
+        # The snapshot whose delete in a routine batch (prune, rotate_superseded)
+        # DEFINITELY failed — no timeout, and a re-list still shows it — when
+        # that was the batch's latest attempt; None otherwise. Such a failure
+        # deleted nothing, so the window's guard lets the next candidate go
+        # without a settle. ``stuck_deletes`` keeps every one, for the alert.
+        self.last_delete_stuck: str | None = None
+        self.stuck_deletes: list[str] = []
+        # Whether the last prune() read its full listing (and the expiry read
+        # it asked for). False means "could not see", never "nothing to do".
+        self.last_prune_read = False
         # Whether the last take() evicted a snapshot before its create.
         self.last_take_evicted = False
         # Whether the last guardian listing failed, and whether the last
@@ -689,9 +699,11 @@ class SnapshotManager:
         applies.)
         """
         self.last_prune_complete = False
+        self.last_prune_read = False
         meta = await self._list_snapshots_with_meta()
         if not meta:
-            self.last_prune_complete = not self.last_list_failed
+            self.last_prune_read = not self.last_list_failed
+            self.last_prune_complete = self.last_prune_read
             return 0
 
         # Healthy snapshots are never pruned — not even a superseded one: it is
@@ -726,13 +738,39 @@ class SnapshotManager:
         for name in sorted(to_delete):
             if before_delete is not None and not before_delete():
                 break
-            if await self.delete(name):
+            self.last_delete_stuck = None
+            outcome = "deleted" if await self.delete(name) else await self._failed_delete(name)
+            if outcome in ("deleted", "settling"):
                 logger.info("Pruned snapshot: %s", name)
                 deleted += 1
-            else:
-                break
+            if outcome in ("uncertain", "settling"):
+                break  # it may still be deleting: never stack deletions
+        self.last_prune_read = expiry_read
         self.last_prune_complete = expiry_read and deleted == len(to_delete)
         return deleted
+
+    async def _failed_delete(self, name: str) -> str:
+        """Classify a failed routine delete: ``deleted`` (no timeout, and a
+        re-list shows it went after all), ``settling`` (the client timed out
+        but it is gone from the re-list: it counts, but its space may still be
+        coming back, so the batch stops), ``stuck`` (no timeout and still
+        listed: nothing was deleted, so the batch may go on to the next
+        candidate), or ``uncertain`` (a timeout, or a failed re-list: the
+        daemon may still be deleting, so the batch stops). Mirrors pool relief,
+        which frees one snapshot per pass and so never stacks either way."""
+        err = self.last_delete_error
+        after = await self.list_snapshot_meta_strict()
+        if after is not None and name not in {n for n, _ in after}:
+            if err == "timeout":
+                return "settling"  # last_delete_error stays: this tick stops
+            self.last_delete_error = None
+            return "deleted"
+        if after is None or err == "timeout":
+            return "uncertain"
+        logger.warning("Snapshot %s did not delete (%s) — skipping it this pass", name, err)
+        self.last_delete_stuck = name
+        self.stuck_deletes.append(name)
+        return "stuck"
 
     async def _expires_at(self) -> dict[str, datetime] | None:
         """incus's per-snapshot ``expires_at`` for snapshots that carry one.
@@ -774,17 +812,21 @@ class SnapshotManager:
         """Delete the superseded healthy snapshots a deferred rotation left
         (the deletion window's pass). The newest healthy snapshot is never a
         candidate, so the rollback lifeline is never reduced. Returns the count
-        deleted; a failed list deletes nothing."""
+        deleted; a failed list deletes nothing. A snapshot that definitely
+        fails to delete is skipped, as in prune."""
         meta = await self.list_snapshot_meta_strict()
         healthy = [n for n, _ in meta or [] if n.endswith(_HEALTHY_SUFFIX)]
         deleted = 0
         for old_name in healthy[1:]:
             if before_delete is not None and not before_delete():
                 break
-            if await self.delete_healthy(old_name, replaced_by=healthy[0]):
+            self.last_delete_stuck = None
+            ok = await self.delete_healthy(old_name, replaced_by=healthy[0])
+            outcome = "deleted" if ok else await self._failed_delete(old_name)
+            if outcome in ("deleted", "settling"):
                 logger.info("Rotated superseded healthy snapshot (window): %s", old_name)
                 deleted += 1
-            else:
+            if outcome in ("uncertain", "settling"):
                 break
         return deleted
 

@@ -375,6 +375,9 @@ async def test_error_reporting_failure_does_not_strand_admission(monkeypatch, tm
             patch.setattr("genesis.resilience.status_writer.logger.error", fail)
             with pytest.raises(OSError, match="reporting unavailable"):
                 await writer.write()
+            # From Python 3.13 the awaiter can resume before this future's raising
+            # callback has run, so give it one turn while the patches still hold.
+            await asyncio.sleep(0)
         assert callback_errors
         assert StatusFileWriter._publish is publish
         await asyncio.wait_for(writer.write(), 2)

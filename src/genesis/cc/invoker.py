@@ -61,6 +61,7 @@ from genesis.util.proc_kill import (
     reap_bounded,
     spawn_owned,
 )
+from genesis.util.systemd import literal_scope_args
 
 logger = logging.getLogger(__name__)
 
@@ -211,6 +212,7 @@ def set_oom_score_adj(pid: int, score: int = 500) -> None:
 # scripts/lib/code_intel_index.sh) already set their own properties at probe
 # time for this reason; this was the one that did not.
 _SCOPE_PROPERTIES = ("IOWeight=100", "MemoryHigh=62%", "MemoryMax=75%")
+_SCOPE_DESCRIPTION = "Genesis CC session"
 
 
 def _scope_argv(*trailing: str) -> list[str]:
@@ -220,7 +222,8 @@ def _scope_argv(*trailing: str) -> list[str]:
     with `/bin/true` it is the probe. Sharing the builder is what keeps the two
     from drifting apart again.
     """
-    argv = ["systemd-run", "--user", "--scope", "--quiet"]
+    argv = ["systemd-run", "--user", "--scope", "--quiet", *literal_scope_args()]
+    argv.append(f"--description={_SCOPE_DESCRIPTION}")
     for prop in _SCOPE_PROPERTIES:
         argv += ["-p", prop]
     argv.append("--")

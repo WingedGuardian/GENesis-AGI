@@ -25,6 +25,19 @@ INSERT INTO peer_tasks VALUES('muse','old-epoch','running');
 """
 
 
+def _contents(db):
+    """Every schema row and every row of each plain table. Not ``iterdump``: on
+    Python 3.13 and 3.14 it runs a foreign key check, which a virtual table standing
+    in for a referenced one fails with a mismatch."""
+    schema = db.execute("SELECT type,name,sql FROM sqlite_master ORDER BY type,name").fetchall()
+    rows = {
+        name: db.execute(f'SELECT * FROM "{name}"').fetchall()  # noqa: S608 - names from sqlite_master
+        for kind, name, sql in schema
+        if kind == "table"
+    }
+    return schema, rows
+
+
 def _seed(path, sql=SCHEMA):
     with sqlite3.connect(path) as db:
         db.executescript(sql)
@@ -94,11 +107,11 @@ def test_legacy_and_uri_path_and_missing_file(tmp_path):
 def test_incompatible_or_failed_reset_rolls_back(tmp_path, mutation):
     path = _seed(tmp_path / "candidate.db", SCHEMA + mutation)
     with sqlite3.connect(path) as db:
-        before = list(db.iterdump())
+        before = _contents(db)
     with pytest.raises((RestoreAuthorityError, sqlite3.Error)):
         reset_peer_authority(path)
     with sqlite3.connect(path) as db:
-        assert list(db.iterdump()) == before
+        assert _contents(db) == before
 
 
 @pytest.mark.parametrize(
@@ -135,11 +148,11 @@ def test_collateral_effects_refuse_without_changing_any_rows(tmp_path, mutation)
         "INSERT INTO unrelated VALUES(42);" + mutation,
     )
     with sqlite3.connect(path) as db:
-        before = list(db.iterdump())
+        before = _contents(db)
     with pytest.raises(sqlite3.DatabaseError):
         reset_peer_authority(path)
     with sqlite3.connect(path) as db:
-        assert list(db.iterdump()) == before
+        assert _contents(db) == before
 
 
 @pytest.mark.parametrize(
@@ -152,11 +165,11 @@ def test_required_virtual_tables_are_refused(tmp_path, table, columns):
         SCHEMA + f"DROP TABLE {table}; CREATE VIRTUAL TABLE {table} USING fts5({columns});",
     )
     with sqlite3.connect(path) as db:
-        before = list(db.iterdump())
+        before = _contents(db)
     with pytest.raises(RestoreAuthorityError):
         reset_peer_authority(path)
     with sqlite3.connect(path) as db:
-        assert list(db.iterdump()) == before
+        assert _contents(db) == before
 
 
 def test_unrelated_triggers_and_foreign_keys_remain_compatible(tmp_path):

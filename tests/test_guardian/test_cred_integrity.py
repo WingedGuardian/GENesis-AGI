@@ -385,3 +385,70 @@ def test_secrets_env_is_backed_up_by_its_own_section():
     target = next(t for t in DEFAULT_TARGETS if t.name == "secrets_env")
     assert target.backup_rel == "secrets/secrets.env.gpg"
     assert "secrets/secrets.env.gpg" in spec
+
+
+# ── decrypt-backup-stream CLI (real gpg) ────────────────────────────────────
+
+_CI_SCRIPT = Path(ci.__file__)
+
+
+@pytest.mark.skipif(not _HAS_GPG, reason="gpg not available")
+@pytest.mark.parametrize(
+    ("passphrase", "rc", "out"),
+    [(_PASS, 0, b"line one\nline two\n"), ("not-the-passphrase", 1, b"")],
+)
+def test_decrypt_backup_stream_cli(tmp_path, passphrase, rc, out):
+    """Plaintext goes to stdout and the exit status is 0 only once GPG has
+    authenticated the whole message; a wrong passphrase prints nothing."""
+    (tmp_path / ".gnupg").mkdir(mode=0o700)  # as on any install; gpg fails without it
+    art = tmp_path / "a.gpg"
+    _encrypt(b"line one\nline two\n", art, _PASS)
+    proc = subprocess.run(
+        [sys.executable, str(_CI_SCRIPT), "decrypt-backup-stream", str(art)],
+        input=passphrase.encode(),
+        capture_output=True,
+        env={"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path)},
+    )
+    assert proc.returncode == rc, proc.stderr
+    assert proc.stdout == out
+    names = sorted(p.name for p in tmp_path.iterdir() if p.name not in ("tmp", ".gnupg"))
+    assert names == ["a.gpg"]
+
+
+@pytest.mark.skipif(not _HAS_GPG, reason="gpg not available")
+def test_decrypt_backup_stream_cli_rejects_a_tampered_artifact(tmp_path):
+    """The contract's centre: bytes may already have been written, but a
+    message that fails authentication at the end exits non-zero."""
+    (tmp_path / ".gnupg").mkdir(mode=0o700)
+    art = tmp_path / "t.gpg"
+    _encrypt(os.urandom(1 << 20), art, _PASS)
+    raw = bytearray(art.read_bytes())
+    raw[-30] ^= 0xFF  # inside the final packet / MDC
+    art.write_bytes(bytes(raw))
+    proc = subprocess.run(
+        [sys.executable, str(_CI_SCRIPT), "decrypt-backup-stream", str(art)],
+        input=_PASS.encode(),
+        capture_output=True,
+        env={"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path)},
+    )
+    assert proc.returncode == 1, (proc.returncode, proc.stderr)
+
+
+@pytest.mark.skipif(not _HAS_GPG, reason="gpg not available")
+def test_decrypt_backup_stream_cli_fails_when_reader_stops(tmp_path):
+    """A consumer that stops reading early (sqlite3 bailing on an error) must
+    not leave the stream reading as a success."""
+    (tmp_path / ".gnupg").mkdir(mode=0o700)
+    art = tmp_path / "big.gpg"
+    _encrypt(os.urandom(4 << 20), art, _PASS)
+    script = (
+        f'"{sys.executable}" "{_CI_SCRIPT}" decrypt-backup-stream "{art}" '
+        '| head -c 10 > /dev/null; echo "${PIPESTATUS[0]}"'
+    )
+    proc = subprocess.run(
+        ["bash", "-c", script],
+        input=_PASS.encode(),
+        capture_output=True,
+        env={"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path)},
+    )
+    assert proc.stdout.strip() not in (b"0", b""), proc

@@ -137,7 +137,7 @@ def test_traffic_older_than_fourteen_days_does_not_count():
 
 
 @pytest.mark.parametrize(
-    "outcome", ["fallback", "selection_failed", "error", "mode_unsupported", "brand_new"]
+    "outcome", ["fallback", "selection_failed", "error", "mode_unsupported", "retried", "brand_new"]
 )
 def test_every_outcome_but_primary_and_cancelled_restarts_the_clock(outcome):
     trav, census = _passing_inputs(clock_days=20)

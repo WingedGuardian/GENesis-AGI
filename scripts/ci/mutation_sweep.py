@@ -32,6 +32,12 @@ option that names an output path, runs as the same user. (A `git worktree` also
 shares the caller's git metadata -- config, hooks, refs -- so a test that runs
 git commands in its cwd can change those.)
 
+THE FILES. This one drives a sweep. `mutation_case.py` holds what a sweep judges,
+`mutation_copy.py` the disposable copy, `mutation_stop.py` how a sweep stops, and
+`mutation_rungs.py` the report mode for the gate's defect corpus.
+To import this as a library, put this directory on `sys.path` first: the siblings
+are imported by bare name.
+
 WHAT A SWEEP GUARANTEES, per case:
   1. The anchor matches exactly once. With two or more edits, a whole-file
      "did it change" test stays true while a later anchor silently misses, so
@@ -103,161 +109,57 @@ import argparse
 import contextlib
 import ctypes
 import errno
-import hashlib
-import io
 import json
 import os
-import re
-import shutil
 import signal
 import stat
 import struct
 import subprocess
 import sys
 import tempfile
-import tokenize
 import traceback
 import uuid
-from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
-#: Outcomes. `ABORTED` is deliberately NOT a synonym for "survived" -- conflating
-#: them is how a sweep that never ran reports a clean bill of health.
-BIT = "BIT"
-SURVIVED = "SURVIVED"
-ABORTED = "ABORTED"
+# Run as a script, the sweep imports these siblings from the caller's tree, and
+# it does not write that tree: their bytecode stays out of `__pycache__` too.
+# This stops writes, not reads, so a `.pyc` a test run left there is still used
+# when it looks current. A fresh checkout has none.
+if __name__ == "__main__":
+    sys.dont_write_bytecode = True
 
-
-@dataclass(frozen=True)
-class Edit:
-    """One anchored replacement. A case may carry several, applied together."""
-
-    anchor: str
-    replacement: str
-
-    def __post_init__(self) -> None:
-        if not self.anchor:
-            raise ValueError("edit has an empty anchor, which matches everywhere")
-        if self.anchor == self.replacement:
-            raise ValueError("edit is a no-op")
-
-
-#: How a mutated file proves it is still valid. REQUIRED per case, and `none`
-#: must carry a reason. Silently skipping the check for a file type we cannot
-#: parse is the trap: an invalid mutation breaks pytest COLLECTION, and the
-#: nonzero exit then reads as a successful RED -- the exact false positive the
-#: postcondition exists to prevent. Raised by the session that mutates systemd
-#: `.service.template` files, for which no validator exists at all (
-#: `systemd-analyze verify` needs a rendered unit, not one carrying placeholders).
-VALIDATORS = {
-    "python": lambda text, path: compile(text, str(path), "exec"),
-    "bash": None,  # handled out-of-process; see _validate
-    "none": None,  # requires a reason
-}
-
-
-@dataclass(frozen=True)
-class Case:
-    """One mutation and the test that must notice it.
-
-    ``why`` is required, not decorative: a case whose author cannot say which
-    property it breaks is usually a behaviourally-null edit, and that is the
-    failure mode a GREEN result cannot distinguish from a vacuous test.
-
-    The runner fields are PER CASE, not module-global. That is the measured
-    reason sessions forked their harnesses rather than adding cases to them: one
-    sweep can need a probe venv with `--noconftest` for an engine-backed test and
-    the production interpreter for a test that needs the full import tree, and a
-    single global runner cannot express both.
-    """
-
-    label: str
-    path: Path
-    test: str
-    why: str
-    validator: str
-    anchor: str | None = None
-    replacement: str | None = None
-    edits: tuple[Edit, ...] = ()
-    #: Overrides the sweep default when set.
-    python: str | None = None
-    pytest_args: tuple[str, ...] = ()
-    env: dict[str, str] = field(default_factory=dict)
-    #: Shared live state this case touches (a running engine, a real socket).
-    #: The pytest lock does not model these -- two sessions mutating against the
-    #: same live engine stomp each other and nothing notices. Declared here so a
-    #: reader can serialise on it; a case that names a resource ABORTS LOUDLY
-    #: when it is absent rather than being skipped, because a skipped case and a
-    #: killed one look identical in a summary line.
-    requires: tuple[str, ...] = ()
-
-    def __post_init__(self) -> None:
-        if not self.why.strip():
-            raise ValueError(f"case {self.label!r}: `why` is required")
-        if not self.validator.strip():
-            raise ValueError(
-                f"case {self.label!r}: `validator` is required -- one of "
-                f"{sorted(VALIDATORS)}, and `none` must carry a reason "
-                f"(e.g. 'none: a systemd template has no validator')"
-            )
-        kind, _, reason = self.validator.partition(":")
-        kind = kind.strip()
-        if kind not in VALIDATORS:
-            raise ValueError(f"case {self.label!r}: unknown validator {kind!r}")
-        # The reason is the point, so an empty one ("none:", "none:   ") is the
-        # same omission as no colon at all.
-        if kind == "none" and not reason.strip():
-            raise ValueError(f"case {self.label!r}: `none` must say WHY there is no validator")
-        # The single-edit shorthand is a PAIR. Half of it is a malformed case,
-        # never a weaker one: a `replacement` with no `anchor` used to be dropped
-        # silently (a multi-edit case then ran with one edit missing), and an
-        # `anchor` with no `replacement` became a deletion via `or ""`. An
-        # explicit empty replacement is still a deliberate deletion.
-        if (self.anchor is None) != (self.replacement is None):
-            raise ValueError(
-                f"case {self.label!r}: `anchor` and `replacement` must be given "
-                "together (use `edits` for more than one)"
-            )
-        if self.anchor is not None:
-            object.__setattr__(self, "edits", (Edit(self.anchor, self.replacement),) + self.edits)
-        if not self.edits:
-            raise ValueError(f"case {self.label!r}: no edits")
-
-
-@dataclass
-class Result:
-    case: Case
-    outcome: str
-    detail: str = ""
-    stdout: str = ""
-    never_opened: bool = False
-
-
-@dataclass
-class Sweep:
-    results: list[Result] = field(default_factory=list)
-
-    @property
-    def bit(self) -> list[Result]:
-        return [r for r in self.results if r.outcome == BIT]
-
-    @property
-    def survived(self) -> list[Result]:
-        return [r for r in self.results if r.outcome == SURVIVED]
-
-    @property
-    def aborted(self) -> list[Result]:
-        return [r for r in self.results if r.outcome == ABORTED]
-
-    @property
-    def clean(self) -> bool:
-        """Every case bit, and nothing aborted.
-
-        An abort is NOT a pass. A sweep that could not run half its cases has
-        established nothing about them.
-        """
-        return bool(self.results) and not self.survived and not self.aborted
+from mutation_case import (
+    ABORTED,
+    BIT,
+    SURVIVED,
+    Case,
+    Result,
+    Sweep,
+    _decode,
+    _render_result,
+    _render_tally,
+    _str_list,
+    _str_map,
+    _validate,
+    apply_edits,
+    baseline_problem,
+    cases_from_json,
+    mutation_verdict,
+)
+from mutation_case import Edit as Edit  # re-exported: a `Case` needs one
+from mutation_copy import (
+    _contained,
+    _put,
+    isolated_copy,
+)
+from mutation_rungs import check_anchors, rung_cases
+from mutation_stop import (
+    _catch_stop_signals,
+    _hold,
+    _raise_if_stopped,
+)
 
 
 def _child_env(extra: dict[str, str] | None) -> dict[str, str]:
@@ -317,524 +219,6 @@ def _child_env(extra: dict[str, str] | None) -> dict[str, str]:
             env["TMPDIR"], f"mutation-sweep-nopyc-{uuid.uuid4().hex}"
         )
     return env
-
-
-#: READING PYTEST'S SUMMARY. Every verdict this module reaches about a test run
-#: goes through `parse_pytest_summary` and nothing else. The reader it replaced
-#: classified the summary by SUBSTRING, and that one generator produced two
-#: review findings: a case-sensitive "error" let "1 Error" through, and
-#: "1 xfailed" CONTAINS "failed" -- so a strict-xfail target baselined as a
-#: result, the mutation made it pass, pytest reported the strict XPASS as
-#: "1 failed", and the sweep scored BIT on a test that never passed. A grammar
-#: closes the class; a longer word list would not.
-#:
-#: The grammar is pytest's own, READ from `_pytest/terminal.py` (pytest 9.0.3; unchanged
-#: in 9.2.0, the version CI pins in .github/test-tools/requirements.txt):
-#: `summary_stats` joins the parts with ", " and appends
-#: " in {format_session_duration}" ("0.12s", or "75.00s (0:01:15)" past a
-#: minute); `_build_normal_summary_stats_line` renders each part as
-#: "%d %s" % pluralize(count, key) over KNOWN_TYPES plus any plugin's own key,
-#: or the single part "no tests ran"; `pluralize` changes exactly two keys,
-#: error -> errors and warnings -> warning/warnings. At verbosity >= 0 the line
-#: is centred in "=" separators; with --color=yes it carries SGR codes; at -qq
-#: (verbosity < -1) `summary_stats` returns before writing it at all.
-_ANSI_SGR = re.compile(r"\x1b\[[0-9;]*m")
-_PART = r"\d+ [a-z]+(?: [a-z]+)*"
-_SUMMARY_LINE = re.compile(
-    r"(?:=+ )?"
-    rf"(?P<body>no tests ran|{_PART}(?:, {_PART})*)"
-    r" in \d+(?:\.\d+)?s(?: \([^()]+\))?"
-    r"(?: =+)?"
-)
-#: pytest's two pluralised keys, folded back to one name each.
-_KEY_ALIASES = {"errors": "error", "warning": "warnings"}
-#: Keys that ride along with a verdict without changing it: a sibling the
-#: selection excluded, a warning, a subtest that passed.
-_INCIDENTAL = frozenset({"deselected", "warnings", "subtests passed"})
-
-
-def parse_pytest_summary(stdout: str) -> dict[str, int] | None:
-    """The outcome counts from pytest's FINAL summary line, by exact keyword.
-
-    Returns ``{}`` for "no tests ran" -- readable, and empty -- and None when no
-    line in ``stdout`` is a whole summary line. None is never scored: every
-    caller ABORTS on it. The last matching line wins, because the summary is the
-    last thing pytest writes and a run prints plenty above it (a short-summary
-    "FAILED t.py::x - ..." line, an "ERROR <nodeid>" report) that must not be
-    read as one. A line must match the grammar end to end: "1 Error in 0.2s" is
-    not a line pytest can write, so it is unreadable rather than a near miss. A
-    repeated key is refused the same way -- pytest renders each key once.
-    """
-    for raw in reversed(_ANSI_SGR.sub("", stdout).splitlines()):
-        m = _SUMMARY_LINE.fullmatch(raw.strip())
-        if not m:
-            continue
-        if m["body"] == "no tests ran":
-            return {}
-        counts: dict[str, int] = {}
-        for part in m["body"].split(", "):
-            n, key = part.split(" ", 1)
-            key = _KEY_ALIASES.get(key, key)
-            if key in counts:
-                return None
-            counts[key] = int(n)
-        return counts
-    return None
-
-
-def _render_counts(counts: dict[str, int]) -> str:
-    return ", ".join(f"{n} {k}" for k, n in counts.items()) or "no tests ran"
-
-
-def baseline_problem(test: str, returncode: int, stdout: str) -> str | None:
-    """None when the baseline run proves the TARGET PASSED; otherwise why not.
-
-    Valid ONLY as "N passed" (N >= 1) with exit 0, plus incidental parts
-    (deselected siblings, warnings, passing subtests). Everything else refuses:
-
-      unreadable summary               -> refused, never scored
-      any `failed` or `error`          -> RED (a strict XPASS is reported as
-                                          `failed`, so it lands here too)
-      xfailed / xpassed / skipped, or
-      a plugin's own key               -> refused, naming the outcome
-      nothing passed (no tests ran,
-      only deselected)                 -> refused, naming the summary
-      exit code other than 0           -> refused: code and summary disagree
-
-    This gate is where a strict xfail MUST be stopped: once a mutation makes it
-    pass, pytest reports "1 failed" with exit 1, which no later reading can tell
-    apart from a caught mutation.
-    """
-    counts = parse_pytest_summary(stdout)
-    if counts is None:
-        return (
-            f"baseline run of {test} produced no readable pytest summary "
-            f"line (exit {returncode}) -- it cannot be established as green"
-        )
-    shown = _render_counts(counts)
-    if counts.get("failed") or counts.get("error"):
-        return (
-            f"baseline is RED: {test} already fails before any mutation "
-            f"({shown}), so every 'BIT' from it would be meaningless"
-        )
-    other = {k: n for k, n in counts.items() if k != "passed" and k not in _INCIDENTAL}
-    if other:
-        return (
-            f"baseline of {test} did not PASS its target ({shown}): "
-            f"{_render_counts(other)} is not a green baseline. A strict "
-            "xfail that a mutation makes pass is reported as `failed`, and a "
-            "skipped target never runs, so either would score a BIT or a "
-            "SURVIVED that means nothing"
-        )
-    if not counts.get("passed"):
-        return (
-            f"baseline of {test} ran nothing ({shown}, exit {returncode}) "
-            "-- a target that did not run cannot be established as green"
-        )
-    if returncode != 0:
-        return (
-            f"baseline of {test}: exit {returncode} disagrees with the "
-            f"summary ({shown}) -- neither alone establishes a green run"
-        )
-    return None
-
-
-def mutation_verdict(returncode: int, stdout: str) -> tuple[str, str]:
-    """(outcome, detail) for one mutated run of a target whose baseline PASSED.
-
-    THE EXIT CODE AND THE SUMMARY MUST AGREE. pytest's codes are an enumerated
-    contract (pytest.ExitCode): 0 OK, 1 TESTS_FAILED, 2 INTERRUPTED,
-    3 INTERNAL_ERROR, 4 USAGE_ERROR, 5 NO_TESTS_COLLECTED; only 0 and 1 mean the
-    tests ran. MEASURED, a live false GREEN: a mutation that COMPILES but raises
-    at import time gives rc=2 with "1 error in 0.26s", which the old
-    has-a-result-line-and-rc!=0 rule called BIT. `destructive_command_guard.py`
-    carries a module-level re.compile, so that is reachable from the shipped gate.
-
-      exit not 0/1                     -> ABORTED
-      unreadable summary               -> ABORTED, never scored
-      any `error` (setup, teardown)    -> ABORTED: the body may never have run
-      xfailed / xpassed / skipped, or
-      a plugin's own key               -> ABORTED, naming it: the baseline had
-                                          none, so the mutation changed WHICH
-                                          tests ran, not how they judged it
-      nothing passed or failed         -> ABORTED
-      exit 1 and >= 1 failed           -> BIT
-      exit 0, 0 failed, >= 1 passed    -> SURVIVED
-      anything else                    -> ABORTED: code and summary disagree
-    """
-    if returncode not in (0, 1):
-        return ABORTED, (
-            f"pytest exit {returncode}: the run did not happen "
-            "(collection error, usage error, or nothing collected)"
-        )
-    counts = parse_pytest_summary(stdout)
-    if counts is None:
-        return ABORTED, (
-            "no readable pytest summary line -- the run did not "
-            "happen (lock, guard, collection error?)"
-        )
-    shown = _render_counts(counts)
-    if counts.get("error"):
-        return ABORTED, (
-            f"{shown}: an error is not a result -- a setup, "
-            "teardown or collection failure, and the test body may "
-            "never have run"
-        )
-    failed, passed = counts.get("failed", 0), counts.get("passed", 0)
-    # `subtests failed` rides along with a BIT only when pytest ALSO reports a
-    # failed test at exit 1 (CodeRabbit's rule on the prior PR). Not added to
-    # `_INCIDENTAL`, so the baseline stays strict. MEASURED on pytest 9.0.3: one
-    # failing subtest prints "2 failed, 2 subtests passed" at exit 1 (the
-    # subtest plus its parent); the built-in support never writes this key, and
-    # review read the same in 9.2.0's source, so it comes from a plugin if it
-    # appears at all.
-    other = {
-        k: n
-        for k, n in counts.items()
-        if k not in ("passed", "failed")
-        and k not in _INCIDENTAL
-        and not (k == "subtests failed" and n > 0 and returncode == 1 and failed >= 1)
-    }
-    if other:
-        return ABORTED, (
-            f"{shown}: {_render_counts(other)} is not a verdict on "
-            "the target -- its baseline had none, so the mutation "
-            "changed which tests ran"
-        )
-    if not failed and not passed:
-        return ABORTED, f"{shown}: nothing passed or failed -- the run did not happen"
-    if returncode == 1 and failed:
-        return BIT, ""
-    if returncode == 0 and not failed:
-        return SURVIVED, ""
-    return ABORTED, (
-        f"exit {returncode} disagrees with the summary ({shown}) -- neither alone is a verdict"
-    )
-
-
-def _validate(case: Case, text: str) -> str | None:
-    """Prove the mutated file is still valid, or say why that cannot be proven.
-
-    Returns an error string, or None when the mutation is valid / deliberately
-    unvalidated. NEVER silently skips: an unvalidatable target must have SAID so
-    in its `validator` field, which `Case.__post_init__` enforces.
-    """
-    kind = case.validator.split(":", 1)[0].strip()
-    if kind == "python":
-        try:
-            compile(text, str(case.path), "exec")
-        except SyntaxError as exc:
-            return f"mutation is not valid python: {exc}"
-        return None
-    if kind == "bash":
-        try:
-            proc = subprocess.run(
-                ["bash", "-n"], input=text, capture_output=True, text=True, timeout=60
-            )
-        except subprocess.TimeoutExpired:
-            return "could not validate the mutation: bash -n timed out after 60s"
-        if proc.returncode != 0:
-            return f"mutation is not valid bash: {proc.stderr.strip()[:200]}"
-        return None
-    # `none: <reason>` -- declared unvalidatable. The reason travels with the
-    # case so a reader knows the postcondition is absent BY DECISION.
-    return None
-
-
-def _decode(case: Case, raw: bytes) -> tuple[str, str]:
-    """Decode a target in ITS OWN encoding, and prove that is lossless.
-
-    Python sources honour a BOM or a PEP 263 cookie -- the same rule CPython
-    applies when it imports them -- so a valid latin-1 or UTF-8-BOM target is
-    sweepable, and is written back in that encoding (``utf-8-sig`` re-adds the
-    BOM). Everything else is UTF-8. The round-trip check refuses a source whose
-    bytes would not survive decode/encode unchanged, because rewriting such a
-    file would alter lines the case never named. Raises ``ValueError``.
-    """
-    kind = case.validator.split(":", 1)[0].strip()
-    try:
-        enc = tokenize.detect_encoding(io.BytesIO(raw).readline)[0] if kind == "python" else "utf-8"
-        text = raw.decode(enc)
-    except (SyntaxError, LookupError, UnicodeDecodeError) as exc:
-        raise ValueError(f"cannot decode the target: {exc}") from exc
-    if text.encode(enc) != raw:
-        raise ValueError(
-            f"the target does not round-trip through {enc}; "
-            "rewriting it would change bytes the case never named"
-        )
-    return text, enc
-
-
-# --------------------------------------------------------------------------
-# THE ISOLATED COPY.
-# --------------------------------------------------------------------------
-
-
-#: The signal that stopped this sweep, if any: a fact, checked between cases and
-#: before the tally, because a raise is not enough. Python discards an exception
-#: raised inside a `__del__`, so a signal landing in one would otherwise read as a
-#: clean sweep at exit 0.
-_stop_signal: int | None = None
-_held = 0
-
-
-def _raise_if_stopped() -> None:
-    if _stop_signal is not None:
-        raise SystemExit(128 + _stop_signal)
-
-
-@contextlib.contextmanager
-def _hold(*, then_stop: bool = True) -> Iterator[None]:
-    """A signal arriving inside this waits for its end, however long the step
-    takes. For a step a raise would damage: one part way through `git worktree add`
-    leaves an entry locked "initializing" in the caller's repository, one in cleanup
-    abandons it. ``then_stop=False`` leaves the stop to the next check: a raise out
-    of a copy's cleanup would discard the result its case has just reached."""
-    global _held
-    _held += 1
-    try:
-        yield
-    finally:
-        _held -= 1
-        if then_stop and not _held:
-            _raise_if_stopped()
-
-
-def _git(repo: Path, *args: str) -> bytes:
-    """``git -C repo <args>`` -> stdout bytes; RuntimeError naming git's stderr.
-
-    GIT_* is dropped from the environment. Run from inside a git hook (a
-    pre-commit that runs the suite), an inherited GIT_DIR / GIT_WORK_TREE /
-    GIT_INDEX_FILE aims every call at the HOOK's repository instead of ``repo``,
-    and the copy would be of the wrong tree. Bytes, not text: a path git prints
-    is a filename, and filenames need not be valid UTF-8.
-    """
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(repo), *args], capture_output=True, env=env, timeout=7200
-        )
-    except subprocess.TimeoutExpired as exc:  # a hook's daemon can hold git's pipes
-        raise RuntimeError(f"git {' '.join(args)} in {repo} timed out") from exc
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"git {' '.join(args)} in {repo} failed: {os.fsdecode(proc.stderr).strip()}"
-        )
-    return proc.stdout
-
-
-def _git_paths(repo: Path, *args: str) -> set[str]:
-    return {os.fsdecode(p) for p in _git(repo, *args).split(b"\0") if p}
-
-
-def _contained(root: Path, path: Path) -> bool:
-    """``path`` lies inside ``root`` once every symlinked DIRECTORY on the way
-    is followed. The final component is not followed: it is what gets written,
-    and every writer here removes whatever sits there first."""
-    return path.parent.resolve().is_relative_to(root)
-
-
-def _clear(path: Path) -> None:
-    """Remove whatever sits at ``path`` -- a file, a link, a directory -- without
-    following a link."""
-    if os.path.isdir(path) and not os.path.islink(path):
-        shutil.rmtree(path)
-    elif os.path.lexists(path):
-        os.unlink(path)
-
-
-def _put(root: Path, path: Path, data: bytes, mode: int) -> None:
-    """Make ``path`` a FRESH regular file holding ``data``, inside the copy.
-
-    Fresh is the point: removing what is there and creating with O_EXCL |
-    O_NOFOLLOW means no write ever lands in an inode or through a link that a
-    test left behind -- a symlink or hard link to a file outside the copy would
-    otherwise carry the write out of it. Refuses a directory that resolves
-    outside ``root``. Raises ``OSError``.
-    """
-    if not _contained(root, path):
-        raise OSError(f"{path} resolves outside the copy; refusing to write it")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _clear(path)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(data)
-        os.fchmod(fh.fileno(), mode)
-
-
-def _overlay(top: Path, tree: Path) -> str:
-    """Make the fresh checkout at ``tree`` match ``top``'s WORKING TREE, and
-    return a digest of exactly what was copied.
-
-    The paths: `git diff HEAD` (staged and unstaged, renames split), untracked
-    files that are not ignored, and every entry flagged assume-unchanged or
-    skip-worktree, whose changes `git diff` does not report. Each is copied as
-    it is on disk (a symlink as a symlink) or removed from the copy. Ignored
-    files and untracked nested repositories (a trailing slash) are not part of
-    this repository and are left out.
-
-    The digest covers every overlaid path with what was put there (the bytes
-    and mode copied, the link target, or "gone"), so two copies with the same
-    HEAD and the same digest hold the same tree.
-    """
-    digest = hashlib.sha256()
-    paths = _git_paths(top, "diff", "--name-only", "--no-renames", "-z", "HEAD")
-    paths |= _git_paths(top, "ls-files", "--others", "--exclude-standard", "-z")
-    for entry in _git(top, "ls-files", "-v", "-z").split(b"\0"):
-        if entry[:1].islower() or entry[:1] == b"S":
-            paths.add(os.fsdecode(entry[2:]))
-    for rel in sorted(p for p in paths if not p.endswith("/")):
-        src, dst = top / rel, tree / rel
-        if not _contained(tree, dst):
-            raise RuntimeError(f"{rel} would be copied outside the copy")
-        digest.update(os.fsencode(rel) + b"\0")
-        if os.path.islink(src):
-            link = os.readlink(src)
-            _clear(dst)
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            os.symlink(link, dst)
-            digest.update(b"link\0" + os.fsencode(link) + b"\0")
-        elif src.is_file():
-            # Permission bits only: setuid/setgid have no business in a copy.
-            data, mode = src.read_bytes(), src.stat().st_mode & 0o777
-            _put(tree, dst, data, mode)
-            digest.update(b"file\0%o\0" % mode + hashlib.sha256(data).digest())
-        else:
-            # Deleted -- or now a DIRECTORY, whose files are entries of their
-            # own (sorted after it); HEAD's file must not stay in their way.
-            _clear(dst)
-            digest.update(b"gone\0")
-    # Permission-only differences on otherwise clean tracked files: git records
-    # only the executable bit (none at all under core.filemode=false), so a
-    # 0644 -> 0600 change never shows in `git diff` and the checkout's mode would
-    # silently replace the caller's. Every tracked regular file is compared.
-    for rel in sorted(_git_paths(top, "ls-files", "-z") - paths):
-        src, dst = top / rel, tree / rel
-        if os.path.islink(src) or not src.is_file() or os.path.islink(dst) or not dst.is_file():
-            continue
-        if not _contained(tree, dst):  # never chmod through a symlinked directory
-            continue
-        mode = src.stat().st_mode & 0o777
-        if dst.stat().st_mode & 0o777 != mode:
-            os.chmod(dst, mode)
-            digest.update(os.fsencode(rel) + b"\0mode\0%o\0" % mode)
-    return digest.hexdigest()
-
-
-#: The calls `shutil.rmtree` (Python 3.12) hands its error handler that mean "I
-#: could not LIST or ENTER this directory" -- as opposed to "I could not remove
-#: this entry". `os.lstat` is here because rmtree calls the handler with it when
-#: `entry.stat()` fails, which happens when the PARENT has lost search
-#: permission (READ from shutil's source, 3.12.3).
-_RMTREE_LISTING = (os.open, os.scandir, os.lstat)
-
-
-def _force_rmtree(path: Path) -> None:
-    """rmtree that first makes whatever a test left unreadable writable again.
-
-    A removal failure (`unlink`, `rmdir`) is fixed by making the PARENT
-    writable and retrying the same call. A listing failure (`open`, `scandir`,
-    `lstat`) is fixed by making the parent AND the path itself searchable, then
-    removing the path's whole subtree again -- retrying `os.open(p)` alone would
-    raise TypeError (it needs flags) and remove nothing. A path that has gone in
-    the meantime counts as removed. Anything still failing is left for the
-    caller's "could not fully remove" report; each path is retried as a listing
-    failure at most once, so a mode that cannot be changed cannot loop.
-
-    Nothing ABOVE ``path`` is ever chmodded: when the failing entry is ``path``
-    itself, its parent is the caller's temp root, which the sweep does not own.
-    `os.close` failing leaves nothing to retry, and a failed `os.path.islink`
-    check is retried as the unlink it was guarding.
-    """
-    top = os.fspath(path)
-    tried: set[str] = set()
-
-    def retry(func, p, _exc):
-        if func is os.close:
-            return
-        if func is os.path.islink:
-            func = os.unlink
-        if os.fspath(p) != top:
-            with contextlib.suppress(OSError):
-                os.chmod(os.path.dirname(p), 0o700)
-        if func in _RMTREE_LISTING:
-            if os.fspath(p) in tried:
-                return
-            tried.add(os.fspath(p))
-            with contextlib.suppress(OSError):
-                if not os.path.islink(p):  # never chmod THROUGH a link
-                    os.chmod(p, 0o700)
-            with contextlib.suppress(OSError):
-                if os.path.isdir(p) and not os.path.islink(p):
-                    shutil.rmtree(p, onexc=retry)
-                else:
-                    os.unlink(p)
-            return
-        with contextlib.suppress(OSError):
-            func(p)
-
-    shutil.rmtree(path, onexc=retry)
-
-
-@contextlib.contextmanager
-def isolated_copy(
-    repo: Path, tmp_root: Path | None = None, info: dict | None = None
-) -> Iterator[Path]:
-    """Yield ``repo``'s place inside a private copy of its whole repository.
-
-    The copy is a detached `git worktree` of HEAD under a fresh directory in
-    ``tmp_root`` (default ``~/tmp``: a real disk, never the session's TMPDIR,
-    because a checkout is large temp), overlaid with the caller's working-tree
-    changes (`_overlay`). On ANY exit the copy and its registration are removed
-    -- this copy's only: `git worktree remove` on the path this call created,
-    then, if git no longer recognises it (a test deleted the directory), the
-    administrative entry recorded at creation.
-
-    ``info``, when given, receives ``holder`` (the private directory the copy
-    sits in, removed with it: the place for this copy's own TMPDIR) and
-    ``fingerprint`` (HEAD plus the overlay digest), which is equal for two
-    copies of the same caller tree.
-    """
-    try:
-        top = Path(os.fsdecode(_git(repo, "rev-parse", "--show-toplevel").strip()))
-    except RuntimeError as exc:
-        raise RuntimeError(
-            f"the sweep copies the tree with git, and {repo} is not inside a git work tree ({exc})"
-        ) from exc
-    top, repo = top.resolve(), repo.resolve()
-    parent = Path(tmp_root) if tmp_root is not None else Path.home() / "tmp"
-    if parent.resolve().is_relative_to(top):
-        raise ValueError(
-            f"tmp_root {parent} is inside the repository {top}; the "
-            "copy would be written into the tree it must not touch"
-        )
-    parent.mkdir(parents=True, exist_ok=True)
-    holder = Path(tempfile.mkdtemp(prefix="mutation-sweep-", dir=str(parent))).resolve()
-    tree = holder / holder.name  # the basename names git's admin entry too
-    admin: Path | None = None
-    try:
-        with _hold():
-            _git(top, "worktree", "add", "--detach", "--quiet", str(tree), "HEAD")
-            admin = Path(os.fsdecode(_git(tree, "rev-parse", "--absolute-git-dir").strip()))
-        overlay = _overlay(top, tree)
-        if info is not None:
-            head = os.fsdecode(_git(tree, "rev-parse", "HEAD").strip())
-            info["holder"] = holder
-            info["fingerprint"] = f"{head}:{overlay}"
-        yield tree / repo.relative_to(top)
-    finally:
-        with _hold(then_stop=False):
-            # Twice: one --force refuses a locked working tree.
-            with contextlib.suppress(RuntimeError):
-                _git(top, "worktree", "remove", "--force", "--force", str(tree))
-            if os.path.lexists(holder):
-                _force_rmtree(holder)
-            if admin is not None and admin.parent.name == "worktrees" and admin.exists():
-                shutil.rmtree(admin, ignore_errors=True)
-            if os.path.lexists(holder) or (admin is not None and admin.exists()):
-                print(
-                    f"mutation-sweep: could not fully remove the copy at {holder}", file=sys.stderr
-                )
 
 
 @dataclass(frozen=True)
@@ -928,11 +312,6 @@ def _copy_selector(repo: Path, case: Case) -> str:
                 f"repository {repo}; the child runs in a copy of it"
             )
     return rewritten
-
-
-# --------------------------------------------------------------------------
-# RUNNING.
-# --------------------------------------------------------------------------
 
 
 def _pytest(
@@ -1075,43 +454,6 @@ def _watch_opens(path: Path) -> _OpenWatch:
         os.close(fd)
         raise OSError(code, f"inotify_add_watch {path}: {os.strerror(code)}")
     return _OpenWatch(fd)
-
-
-def apply_edits(text: str, edits: tuple[Edit, ...]) -> tuple[str, str | None]:
-    """``(mutated, None)``, or ``(text, why not)`` -- every edit judged against
-    the PRISTINE text, never against an earlier edit's output.
-
-    Counting on the progressively mutated text let edit 1's replacement
-    MANUFACTURE edit 2's anchor (a reviewer reproduced a clean "1 bit" from an
-    anchor that was never in the file) or destroy it. So each anchor must occur
-    exactly once in the original: found once, and not found again from the next
-    character on, because ``str.count`` counts non-overlapping matches and
-    ``'aaa'.count('aa') == 1`` although it matches at two places. Two edits may
-    not overlap (identical starts included). The replacements are then applied
-    by offset, last first, so earlier offsets stay valid.
-    """
-    spans: list[tuple[int, int, int]] = []
-    for i, edit in enumerate(edits):
-        first = text.find(edit.anchor)
-        where = f"edit {i + 1}/{len(edits)}"
-        if first < 0:
-            return text, f"{where}: anchor matched 0x, expected exactly 1"
-        if text.find(edit.anchor, first + 1) >= 0:
-            return text, f"{where}: anchor matched 2x or more, expected exactly 1"
-        spans.append((first, first + len(edit.anchor), i))
-    spans.sort()
-    for (s1, e1, i1), (s2, _e2, i2) in zip(spans, spans[1:], strict=False):
-        if s2 < e1 or s2 == s1:
-            return text, (
-                f"edits {i1 + 1} and {i2 + 1} overlap in the original text; "
-                "each edit must replace its own span"
-            )
-    out = text
-    for start, end, i in reversed(spans):
-        out = out[:start] + edits[i].replacement + out[end:]
-    if out == text:
-        return text, "the edits cancel out: the mutated text equals the original"
-    return out, None
 
 
 def run_case(
@@ -1475,118 +817,6 @@ def sweep(
     return out
 
 
-def _render_result(r: Result) -> str:
-    mark = {BIT: "BIT     ", SURVIVED: "SURVIVED", ABORTED: "ABORTED "}[r.outcome]
-    lines = [f"  {mark}  {r.case.label}"]
-    if r.detail:
-        lines.append(f"            {r.detail}")
-    if r.outcome == SURVIVED:
-        lines.append(f"            expected to break: {r.case.why}")
-    return "\n".join(lines)
-
-
-def _render_tally(result: Sweep) -> str:
-    lines = [
-        "",
-        f"  {len(result.bit)} bit, {len(result.survived)} SURVIVED, {len(result.aborted)} ABORTED",
-    ]
-    if result.survived:
-        lines.append(
-            "  A survivor means the test does not pin the property its "
-            "case names -- or the mutation was behaviourally null."
-        )
-    if result.aborted:
-        lines.append("  An abort is NOT a pass: those cases established nothing.")
-    return "\n".join(lines)
-
-
-def _contained_path(repo: Path, rel: str) -> Path:
-    """``repo / rel``, refused when it would point outside the repository.
-
-    The DIRECTORY part is resolved (so a symlinked directory cannot carry the
-    target out of the tree); the final component is not, because a symlinked
-    target must still reach `_load_target` AS a symlink to be refused there.
-    """
-    p = Path(rel)
-    root = repo.resolve()
-    if p.is_absolute() or ".." in p.parts or not ((repo / p).parent.resolve().is_relative_to(root)):
-        raise ValueError(
-            f"case path {rel!r} points outside the repository {root} -- an "
-            "absolute path or a `..` component is refused even when it would "
-            "land inside, because a manifest path is repository-relative"
-        )
-    return repo / p
-
-
-def _str_list(value, what: str) -> tuple[str, ...]:
-    """A manifest list of strings, or ValueError. A bare string would otherwise
-    become a tuple of its characters."""
-    if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
-        raise ValueError(f"{what} must be a list of strings, got {value!r}")
-    return tuple(value)
-
-
-def _str_map(value, what: str) -> dict[str, str]:
-    """A manifest mapping of strings to strings, or ValueError."""
-    if not isinstance(value, dict) or not all(
-        isinstance(k, str) and isinstance(v, str) for k, v in value.items()
-    ):
-        raise ValueError(f"{what} must map strings to strings, got {value!r}")
-    return value
-
-
-def cases_from_json(doc: dict, repo: Path) -> list[Case]:
-    """Every manifest field, typed before anything runs.
-
-    A value of the wrong type otherwise surfaces late and misleadingly: a bare
-    string list becomes its characters, a non-string reaches ``re`` or
-    ``subprocess`` as a traceback after the copy exists. Each refusal here is a
-    ValueError naming the field.
-    """
-    cases = doc.get("cases") if isinstance(doc, dict) else None
-    if not isinstance(cases, list):
-        raise ValueError("the manifest must be an object with a `cases` list")
-    out = []
-    for c in cases:
-        if not isinstance(c, dict):
-            raise ValueError(f"each case must be an object, got {c!r}")
-        name = f"case {c.get('label')!r}"
-        for key in ("label", "path", "test", "why", "validator"):
-            if not isinstance(c.get(key), str):
-                raise ValueError(f"{name}: `{key}` must be a string, got {c.get(key)!r}")
-        for key in ("anchor", "replacement", "python"):
-            if c.get(key) is not None and not isinstance(c[key], str):
-                raise ValueError(f"{name}: `{key}` must be a string, got {c[key]!r}")
-        edits = c.get("edits", [])
-        if not isinstance(edits, list) or not all(
-            isinstance(e, dict)
-            and isinstance(e.get("anchor"), str)
-            and isinstance(e.get("replacement"), str)
-            for e in edits
-        ):
-            raise ValueError(
-                f"{name}: `edits` must be a list of {{anchor: str, replacement: str}} objects"
-            )
-        env = _str_map(c.get("env", {}), f"{name} `env`")
-        out.append(
-            Case(
-                label=c["label"],
-                path=_contained_path(repo, c["path"]),
-                test=c["test"],
-                why=c["why"],
-                validator=c["validator"],
-                anchor=c.get("anchor"),
-                replacement=c.get("replacement"),
-                edits=tuple(Edit(e["anchor"], e["replacement"]) for e in edits),
-                python=c.get("python"),
-                pytest_args=_str_list(c.get("pytest_args", []), "`pytest_args`"),
-                env=env,
-                requires=_str_list(c.get("requires", []), "`requires`"),
-            )
-        )
-    return out
-
-
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("manifest", type=Path, help="JSON file with a `cases` list")
@@ -1618,39 +848,19 @@ def build_parser() -> argparse.ArgumentParser:
         "(default ~/tmp). A full checkout: put it on a real disk, never a "
         "RAM-backed or quota-capped temp directory.",
     )
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--rung-report",
+        action="store_true",
+        help="the manifest is a defect corpus: run every rung for every defect and "
+        "report which noticed. An escape exits 0; an untrusted run exits 1.",
+    )
+    mode.add_argument(
+        "--check-anchors",
+        action="store_true",
+        help="the manifest is a defect corpus: check every defect still applies, and run no tests.",
+    )
     return ap
-
-
-def _stopped(signum: int, _frame: object) -> None:
-    """Record the stop, say so once, and unwind unless a held step is running. The
-    unwinding is what kills the child's group and removes the copy. SystemExit,
-    because the per-case boundary must not catch it. Raw `os.write`: a signal can
-    land inside a `print`, which is not reentrant. A closed stream must not turn
-    the stop into an error at whatever it interrupted."""
-    global _stop_signal
-    if _stop_signal is None:
-        _stop_signal = signum
-        with contextlib.suppress(OSError, ValueError):
-            os.write(
-                sys.stdout.fileno(),
-                f"  mutation-sweep: stopped by signal {signum}. Only the results printed "
-                "are verdicts; the other cases have none.\n".encode(),
-            )
-    if not _held:
-        _raise_if_stopped()
-
-
-_STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
-
-
-def _catch_stop_signals() -> dict:
-    """Install `_stopped`, leaving alone a signal the caller ignored (`nohup`).
-    Returns the handlers it replaced."""
-    return {
-        each: signal.signal(each, _stopped)
-        for each in _STOP_SIGNALS
-        if signal.getsignal(each) != signal.SIG_IGN
-    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1663,7 +873,24 @@ def main(argv: list[str] | None = None) -> int:
     repo = args.repo.resolve()
 
     doc = json.loads(args.manifest.read_text(encoding="utf-8"))
-    cases = cases_from_json(doc, repo)
+    if args.check_anchors:
+        return check_anchors(doc, repo)
+    report = None
+    if args.rung_report:
+        cases, report = rung_cases(doc, repo)
+    else:
+        cases = cases_from_json(doc, repo)
+
+    def started(case: Case) -> None:
+        print(f"running: {case.label}", file=sys.stderr, flush=True)
+        if report:
+            report.start(case)
+
+    def reported(result: Result) -> None:
+        print(_render_result(result), flush=True)
+        if report:
+            report.add(result)
+
     # The child env is an ALLOWLIST (see _child_env), so anything the tests need
     # must be DECLARED. A manifest-level `env` covers the sweep; a case's own
     # `env` overrides it. `src` is the package root, named repo-relative so it
@@ -1683,13 +910,21 @@ def main(argv: list[str] | None = None) -> int:
             timeout=args.timeout,
             tmp_root=args.tmp_root,
             # stderr, so the report on stdout is the same as it ever was.
-            on_start=lambda c: print(f"running: {c.label}", file=sys.stderr, flush=True),
-            on_result=lambda r: print(_render_result(r), flush=True),
+            on_start=started,
+            on_result=reported,
         )
+    except RuntimeError as exc:  # a red baseline: its reason is the traceback's
+        if report:
+            report.refused = str(exc)
+        raise
     finally:
         for each, handler in previous.items():
             signal.signal(each, handler)
+        if report:
+            report.publish()  # here, so a stop or a red baseline still shows what ran
     _raise_if_stopped()  # a raise swallowed in a `__del__` must not reach a clean tally
+    if report:
+        return report.exit_code()
     print(_render_tally(result))
     return 0 if result.clean else 1
 

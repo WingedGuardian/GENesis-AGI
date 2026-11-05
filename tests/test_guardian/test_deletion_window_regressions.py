@@ -243,7 +243,12 @@ async def test_timeout_retries_with_fresh_listing_after_settle(tmp_path):
     host.now += timedelta(minutes=4)
     host.timeout = False
     await host.maintain(cfg, manager=manager)
-    assert host.list_calls > lists and len(host.deletes) == 4
+    # A fresh listing, and one delete: routine deletes are spaced by the settle.
+    assert host.list_calls > lists and len(host.deletes) == 2
+    while host.now < T0:
+        host.now += timedelta(minutes=1)
+        await host.maintain(cfg, manager=manager)
+    assert len(host.deletes) == 4
     assert (cfg.state_path / ".last_window_deletes").exists()
 
 

@@ -24,6 +24,8 @@ against a tmp dir so upload assertions are actual files.
 import fcntl
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -155,6 +157,7 @@ def _env(sb, **extra):
         "GENESIS_BACKUP_TIER2_BACKEND",
         "GENESIS_BACKUP_LOCAL_PATH",
         "GENESIS_PASSPHRASE_ESCROW",
+        "SECRETS_PATH",  # GENESIS_DIR names the secrets file, as on CI
     ):
         env.pop(k, None)
     env.update(
@@ -714,3 +717,527 @@ def test_escrow_lib_contract(sandbox):
     assert proc.returncode == 0 and "[]" in proc.stdout and "ok" in proc.stdout, (
         f"{proc.stdout}\n{proc.stderr}"
     )
+
+
+# ── Round-trip: streamed decrypt into an in-memory DB, no plaintext file ──
+
+_MEM_OK = {"GENESIS_BACKUP_VERIFY_RAM_FLOOR_PCT": "0"}  # independent of the host's free memory
+_SENTINEL = "plaintext-sentinel-4b8e21"
+
+
+def _seed_sentinel(sb) -> None:
+    subprocess.run(
+        ["sqlite3", str(sb["gd"] / "data" / "genesis.db"), f"INSERT INTO t VALUES('{_SENTINEL}');"],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _seed_realistic(sb) -> None:
+    """Give the sandbox DB the shapes a live Genesis DB has and a one-table DB
+    does not: an FTS5 virtual table (its .dump uses writable_schema inserts,
+    which sqlite3 -safe's DEFENSIVE flag refuses), an index, a view, and
+    enough rows (~400 KB) that the dump outruns a pipe buffer."""
+    subprocess.run(
+        [
+            "sqlite3",
+            str(sb["gd"] / "data" / "genesis.db"),
+            "CREATE VIRTUAL TABLE docs USING fts5(body);"
+            "INSERT INTO docs VALUES ('alpha beta'), ('gamma delta');"
+            "CREATE TABLE big(id INTEGER PRIMARY KEY, v TEXT);"
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 4000) "
+            "INSERT INTO big SELECT i, printf('%0100d', i) FROM n;"
+            "CREATE INDEX big_v ON big(v);"
+            "CREATE VIEW big_view AS SELECT id FROM big WHERE id > 10;",
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _install_decrypt_spy(sb) -> Path:
+    """Wrap gpg. Around the real gpg's DECRYPT of the artifact, list the sandbox
+    files holding the DB's plaintext before it starts and after all of its
+    plaintext has gone into the pipe, and record only the files that appeared
+    in between: those belong to the round-trip (the dump step's own temp, which
+    a separate change removes, already exists before). Each is tagged with its
+    first bytes, so a database file reads "SQLite format 3" and a text dump
+    reads as SQL. The live DB files and this stub are skipped."""
+    real = shutil.which("gpg")
+    log = sb["tmp"] / "decrypt_spy.log"
+    log.write_text("")
+    before = sb["tmp"] / "decrypt_spy.before"
+    db = sb["gd"] / "data" / "genesis.db"
+    stub = sb["bind"] / "gpg"
+    skip = " ".join(
+        f'-e "{p}"' for p in (db, f"{db}-wal", f"{db}-shm", f"{db}-journal", stub, log, before)
+    )
+    scan = f'grep -rlF "{_SENTINEL}" "{sb["home"]}" "{sb["tmp"]}" 2>/dev/null | grep -vxF {skip} | sort'
+    _make_stub(
+        stub,
+        "#!/usr/bin/env bash\n"
+        'case " $* " in *" --decrypt "*)\n'
+        f'  {scan} > "{before}"\n'
+        f'  "{real}" "$@"; rc=$?; echo DECRYPTED >> "{log}"\n'
+        f'  {scan} | comm -13 "{before}" - '
+        '| while read -r f; do printf "%s %s\\n" "$(head -c 15 "$f")" "$f"; done'
+        f' >> "{log}"\n'
+        "  exit $rc ;;\n"
+        "esac\n"
+        f'exec "{real}" "$@"\n',
+    )
+    return log
+
+
+@pytest.mark.parametrize(
+    ("extra", "mode"),
+    [(_MEM_OK, "in memory"), ({"GENESIS_BACKUP_VERIFY_MEMORY": "off"}, "on disk")],
+)
+def test_roundtrip_never_writes_the_decrypted_dump(sandbox, extra, mode):
+    """The round-trip decrypts the whole dump, but never to a file: in memory
+    mode no plaintext file exists at all, and in disk mode the only one is the
+    rebuilt database (never the text dump the old code decrypted to). The spy
+    sees named files only; sqlite's unlinked sort temps are covered by
+    temp_store=MEMORY / SQLITE_TMPDIR in the code."""
+    _seed_sentinel(sandbox)
+    _seed_realistic(sandbox)
+    _install_curl(sandbox, _CURL_ABSENT)
+    log = _install_decrypt_spy(sandbox)
+    proc, status = _run_backup(sandbox, **extra)
+    assert status["success"] is True, (status, proc.stdout)
+    assert f"round-trip verify {mode}" in proc.stdout, proc.stdout
+    assert "round-trip decrypt verified" in proc.stdout, proc.stdout
+    lines = log.read_text().splitlines()
+    assert "DECRYPTED" in lines, lines
+    found = [line for line in lines if line != "DECRYPTED"]
+    if mode == "in memory":
+        assert found == [], f"plaintext file during the round-trip: {found}"
+    else:
+        assert all(line.startswith("SQLite format 3") for line in found), found
+
+
+def _fake_cgroup(sb, inactive_file: int) -> dict:
+    """A cgroup v2 tree whose root cap leaves 1 MiB beyond memory.current."""
+    root = sb["tmp"] / "cgfs"
+    leaf = root / "a" / "b"
+    leaf.mkdir(parents=True)
+    (root / "memory.max").write_text(f"{1 << 30}\n")
+    (root / "memory.current").write_text(f"{(1 << 30) - (1 << 20)}\n")
+    (root / "memory.stat").write_text(f"anon 1\ninactive_file {inactive_file}\nactive_file 5\n")
+    for d in (leaf.parent, leaf):
+        (d / "memory.max").write_text("max\n")
+        (d / "memory.current").write_text("1\n")
+    proc_cg = sb["tmp"] / "proc-cgroup"
+    proc_cg.write_text("0::/a/b\n")
+    return {
+        "GENESIS_BACKUP_CGROUP_FS": str(root),
+        "GENESIS_BACKUP_PROC_CGROUP": str(proc_cg),
+        # The sandbox DB is a few KB; this factor makes it need ~10 MiB.
+        "GENESIS_BACKUP_VERIFY_RAM_FACTOR": "999",
+        **_MEM_OK,
+    }
+
+
+@pytest.mark.parametrize(
+    ("inactive_file", "want"),
+    [(0, "memory short"), (512 << 20, "round-trip verify in memory")],
+)
+def test_roundtrip_cgroup_cap_counts_reclaimable_cache(sandbox, inactive_file, want):
+    """A capped cgroup bounds the memory choice, and its cold page cache
+    (inactive_file) counts as available: max - current alone reads near zero
+    on any long-running box, which would refuse memory every time."""
+    _install_curl(sandbox, _CURL_ABSENT)
+    proc, status = _run_backup(sandbox, **_fake_cgroup(sandbox, inactive_file))
+    assert status["success"] is True, status
+    assert want in proc.stdout, proc.stdout
+
+
+@pytest.mark.parametrize(
+    ("extra", "why"),
+    [
+        ({"GENESIS_BACKUP_VERIFY_MEMORY": "off"}, "GENESIS_BACKUP_VERIFY_MEMORY=off"),
+        # The floor alone refuses memory: a tiny DB fits, but keeping all of
+        # MemTotal free after the check is impossible.
+        ({"GENESIS_BACKUP_VERIFY_RAM_FLOOR_PCT": "100"}, "memory short"),
+    ],
+)
+def test_roundtrip_falls_back_to_disk(sandbox, extra, why):
+    """Memory forced off or short: rebuild the DB on disk and still pass; the
+    log says which and why."""
+    _install_curl(sandbox, _CURL_ABSENT)
+    proc, status = _run_backup(sandbox, **extra)
+    assert status["success"] is True, status
+    assert "round-trip verify on disk" in proc.stdout, proc.stdout
+    assert why in proc.stdout, proc.stdout
+    assert "round-trip decrypt verified" in proc.stdout, proc.stdout
+
+
+def test_roundtrip_memory_failure_retries_on_disk(sandbox):
+    """An authenticated artifact whose in-memory rebuild fails (memory charged
+    elsewhere since the start-time check) is re-checked on disk; it never
+    becomes a CORRUPT verdict by itself."""
+    _seed_realistic(sandbox)
+    _install_curl(sandbox, _CURL_ABSENT)
+    real = shutil.which("sqlite3")
+    # Like a real out-of-memory death: stop reading part-way, so the decrypt
+    # hits a broken pipe and exits non-zero too.
+    _make_stub(
+        sandbox["bind"] / "sqlite3",
+        "#!/usr/bin/env bash\n"
+        'for a in "$@"; do [ "$a" = ":memory:" ] && { head -c 65536 > /dev/null; exit 7; }; done\n'
+        f'exec "{real}" "$@"\n',
+    )
+    proc, status = _run_backup(sandbox, **_MEM_OK)
+    assert "round-trip failed in memory (sqlite3 exit 7); retrying on disk" in proc.stdout, (
+        proc.stdout
+    )
+    assert "round-trip decrypt verified" in proc.stdout, proc.stdout
+    assert status["success"] is True, status
+
+
+def _dump_stub(sb, body: str) -> None:
+    """`sqlite3 <db> .dump` prints body and exits 0; other calls run sqlite3."""
+    real = shutil.which("sqlite3")
+    _make_stub(
+        sb["bind"] / "sqlite3",
+        "#!/usr/bin/env bash\n"
+        f'if [ "${{2:-}}" = ".dump" ]; then printf "%b" "{body}"; exit 0; fi\n'
+        f'exec "{real}" "$@"\n',
+    )
+
+
+def _forge_complete_flag(sb) -> None:
+    """The dump's own check would stop a cut dump before encryption. Forge its flag,
+    so the round trip, the layer behind it, is what has to catch the dump."""
+    real = shutil.which("awk")
+    _make_stub(
+        sb["bind"] / "awk",
+        "#!/usr/bin/env bash\n"
+        'if [ "${1:-}" = "-v" ] && [[ "${2:-}" == out=* ]]; then\n'
+        '    cat; printf "3\\n1\\n" > "${2#out=}"; exit 0\n'
+        "fi\n"
+        f'exec "{real}" "$@"\n',
+    )
+
+
+@pytest.mark.parametrize("extra", [_MEM_OK, {"GENESIS_BACKUP_VERIFY_MEMORY": "off"}])
+def test_roundtrip_rejects_a_dump_that_never_commits(sandbox, extra):
+    """A dump cut before COMMIT still encrypts to an authentic artifact. Checked
+    in the same session that imported it, its open transaction would look
+    complete; the check must fail it, in memory and on disk."""
+    _install_curl(sandbox, _CURL_ABSENT)
+    _dump_stub(sandbox, "BEGIN TRANSACTION;\\nCREATE TABLE t(x);\\nINSERT INTO t VALUES(1);\\n")
+    _forge_complete_flag(sandbox)
+    proc, status = _run_backup(sandbox, **extra)
+    assert status["failure_stage"] == "sqlite_roundtrip", status
+    assert "round-trip decrypt verified" not in proc.stdout, proc.stdout
+    assert not (sandbox["clone"] / "data" / "genesis.sql.gpg").exists()
+
+
+def test_roundtrip_dump_cannot_run_shell_commands(sandbox):
+    """The SQL runs before GPG has authenticated the whole stream, so it runs
+    in sqlite3 safe mode: a dot-command in the dump is refused and the check
+    fails rather than executing it."""
+    _install_curl(sandbox, _CURL_ABSENT)
+    marker = sandbox["tmp"] / "PWNED"
+    _dump_stub(
+        sandbox,
+        f"BEGIN TRANSACTION;\\nCREATE TABLE t(x);\\n.shell touch {marker}\\nCOMMIT;\\n",
+    )
+    proc, status = _run_backup(sandbox, **_MEM_OK)
+    assert not marker.exists()
+    assert status["failure_stage"] == "sqlite_roundtrip", status
+
+
+@pytest.mark.parametrize(
+    "knob", ["GENESIS_BACKUP_VERIFY_RAM_FACTOR", "GENESIS_BACKUP_VERIFY_RAM_FLOOR_PCT"]
+)
+@pytest.mark.parametrize("value", ["3x", "08", "99999999999999999999"])
+def test_roundtrip_bad_ram_knob_does_not_abort(sandbox, knob, value):
+    """A non-integer, a leading-zero value (read as decimal, never as a bad
+    octal that kills the run under set -e) or an overlong knob never aborts."""
+    _install_curl(sandbox, _CURL_ABSENT)
+    proc, status = _run_backup(sandbox, **{**_MEM_OK, knob: value})
+    assert status["success"] is True, (status, proc.stderr)
+    assert "round-trip decrypt verified" in proc.stdout, proc.stdout
+
+
+@pytest.mark.parametrize(
+    ("extra", "mode"),
+    [(_MEM_OK, "in memory"), ({"GENESIS_BACKUP_VERIFY_MEMORY": "off"}, "on disk")],
+)
+def test_roundtrip_passes_a_realistic_schema(sandbox, extra, mode):
+    """FTS5, an index, a view and a dump larger than a pipe buffer all replay
+    and pass, in memory and on disk (sqlite3 -safe alone refuses the FTS5
+    part, which would fail every live backup)."""
+    _seed_realistic(sandbox)
+    _install_curl(sandbox, _CURL_ABSENT)
+    proc, status = _run_backup(sandbox, **extra)
+    assert f"round-trip verify {mode}" in proc.stdout, proc.stdout
+    assert "round-trip decrypt verified" in proc.stdout, proc.stdout
+    assert status["success"] is True, status
+
+
+def test_roundtrip_rejects_a_dump_cut_inside_a_view(sandbox):
+    """A dump cut inside a final CREATE VIEW, with no terminator, would turn
+    the check's BEGIN into a column alias and pass inside the dump's open
+    transaction; the check closes the statement first, so it fails."""
+    _install_curl(sandbox, _CURL_ABSENT)
+    _dump_stub(
+        sandbox, "BEGIN TRANSACTION;\\nCREATE TABLE t(x);\\nCREATE VIEW v AS SELECT x FROM t"
+    )
+    _forge_complete_flag(sandbox)
+    proc, status = _run_backup(sandbox, **_MEM_OK)
+    assert status["failure_stage"] == "sqlite_roundtrip", status
+    assert "round-trip decrypt verified" not in proc.stdout, proc.stdout
+
+
+@pytest.mark.parametrize("filler_rows", [0, 6000])
+def test_roundtrip_failure_detail_never_quotes_database_content(sandbox, filler_rows):
+    """sqlite3's error messages quote the failing SQL line, which is database
+    content; the failure reason (status file, alerts) must not carry it. With
+    ~500 KB after the bad line, sqlite3 stops reading part-way and the decrypt
+    hits a broken pipe: the reason must still name the rebuild, never a failed
+    authentication."""
+    _install_curl(sandbox, _CURL_ABSENT)
+    filler = "INSERT INTO t VALUES('" + "x" * 80 + "');\\n"
+    _dump_stub(
+        sandbox,
+        f"BEGIN TRANSACTION;\\nCREATE TABLE t(x);\\nINSERT INTO t VALUES('{_SENTINEL}') garbage;\\n"
+        + filler * filler_rows
+        + "COMMIT;\\n",
+    )
+    proc, status = _run_backup(sandbox, **_MEM_OK)
+    assert "authentication" not in status["failure_reason"], status
+    assert status["failure_stage"] == "sqlite_roundtrip", status
+    assert _SENTINEL not in status["failure_reason"], status
+    assert "database rebuild or checks failed" in status["failure_reason"], status
+
+
+_V1_UNLIMITED = 9223372036854771712  # what an uncapped v1 memory cgroup reports
+
+
+def _fake_cgroup_v1(sb, *, cap_on: str, inactive_file: int, hybrid: bool) -> dict:
+    """A cgroup v1 memory controller with the process in /ct/svc. The 1 GiB
+    cap sits on the leaf ("leaf") or on its parent ("parent"), with 1 MiB free
+    at that level; the leaf itself uses only 10 MiB. A hybrid host's proc file
+    also carries a "0::" line."""
+    gib, mib = 1 << 30, 1 << 20
+    root = sb["tmp"] / "cgfs1"
+    levels = {
+        root / "memory": (_V1_UNLIMITED, 5, 0),
+        root / "memory" / "ct": (gib, gib - mib, inactive_file)
+        if cap_on == "parent"
+        else (_V1_UNLIMITED, 20 * mib, 0),
+        root / "memory" / "ct" / "svc": (gib, gib - mib, inactive_file)
+        if cap_on == "leaf"
+        else (_V1_UNLIMITED, 10 * mib, 0),
+    }
+    for d, (limit, usage, inactive) in levels.items():
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "memory.limit_in_bytes").write_text(f"{limit}\n")
+        (d / "memory.usage_in_bytes").write_text(f"{usage}\n")
+        (d / "memory.stat").write_text(f"cache 1\ntotal_inactive_file {inactive}\n")
+    proc_cg = sb["tmp"] / "proc-cgroup-v1"
+    proc_cg.write_text(
+        "12:cpuset:/ct/svc\n7:memory:/ct/svc\n1:name=systemd:/ct/svc\n"
+        + ("0::/ct/svc\n" if hybrid else "")
+    )
+    return {
+        "GENESIS_BACKUP_CGROUP_FS": str(root),
+        "GENESIS_BACKUP_PROC_CGROUP": str(proc_cg),
+        "GENESIS_BACKUP_VERIFY_RAM_FACTOR": "999",
+        **_MEM_OK,
+    }
+
+
+@pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize(
+    ("cap_on", "inactive_file", "want"),
+    [
+        ("leaf", 0, "memory short"),
+        ("leaf", 512 << 20, "round-trip verify in memory"),
+        # A cap on an ancestor counts everything under it, not the leaf's usage.
+        ("parent", 0, "memory short"),
+        ("none", 0, "round-trip verify in memory"),
+    ],
+)
+def test_roundtrip_cgroup_v1_cap_is_read(sandbox, cap_on, inactive_file, want, hybrid):
+    """On a cgroup v1 or hybrid host the memory controller's caps bound the
+    memory choice, level by level up the tree. A hybrid host also has a "0::"
+    line, which must not hide the v1 cap."""
+    _install_curl(sandbox, _CURL_ABSENT)
+    extra = _fake_cgroup_v1(sandbox, cap_on=cap_on, inactive_file=inactive_file, hybrid=hybrid)
+    proc, status = _run_backup(sandbox, **extra)
+    assert status["success"] is True, status
+    assert want in proc.stdout, proc.stdout
+
+
+def test_roundtrip_memory_budget_counts_the_wal(sandbox):
+    """Committed data still in the WAL is in the dump and the rebuilt DB but
+    not in the main file's size, so the budget adds the -wal file: a DB whose
+    main file fits the cap but whose WAL does not is checked on disk."""
+    import sqlite3 as sqlite
+
+    db = sandbox["gd"] / "data" / "genesis.db"
+    con = sqlite.connect(db)
+    try:
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA wal_autocheckpoint=0")
+        con.execute("CREATE TABLE w(v)")
+        con.executemany("INSERT INTO w VALUES (?)", [("y" * 1000,)] * 3000)
+        con.commit()
+        assert (db.parent / "genesis.db-wal").stat().st_size > (2 << 20)
+        assert db.stat().st_size < (1 << 20)
+        _install_curl(sandbox, _CURL_ABSENT)
+        # Headroom 1 MiB + 1 MiB of cold cache: the main file x2 fits, the WAL x2 does not.
+        extra = _fake_cgroup(sandbox, 1 << 20)
+        extra["GENESIS_BACKUP_VERIFY_RAM_FACTOR"] = "2"
+        proc, status = _run_backup(sandbox, **extra)
+    finally:
+        con.close()
+    assert "memory short" in proc.stdout, proc.stdout
+    assert status["success"] is True, status
+
+
+# ── The SQL dump streams into encryption: no plaintext file ──────────
+
+_STREAM_SENTINEL = "plaintext-sentinel-7f3a9c"
+
+
+def _seed_stream_sentinel(sb) -> None:
+    subprocess.run(
+        ["sqlite3", str(sb["gd"] / "data" / "genesis.db"), f"INSERT INTO t VALUES('{_STREAM_SENTINEL}');"],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _install_gpg_spy(sb, *, fail_stream: bool = False) -> Path:
+    """Wrap gpg. For the SQL stream encryption (passphrase on fd 3), run the
+    real gpg FIRST so the whole dump has flowed, then record every file in the
+    sandbox that holds the DB's plaintext at that moment, except the live DB
+    files themselves and this stub (whose script carries the sentinel).
+    Optionally fail that one encryption instead."""
+    real = shutil.which("gpg")
+    log = sb["tmp"] / "gpg_spy.log"
+    log.write_text("")
+    db = sb["gd"] / "data" / "genesis.db"
+    stub = sb["bind"] / "gpg"
+    skip = " ".join(f'-e "{p}"' for p in (db, f"{db}-wal", f"{db}-shm", f"{db}-journal", stub, log))
+    if fail_stream:
+        on_stream = f'echo STREAM >> "{log}"; cat > /dev/null; exit 2'
+    else:
+        on_stream = (
+            f'"{real}" "$@"; rc=$?; echo STREAM >> "{log}"; '
+            f'grep -rlF "{_STREAM_SENTINEL}" "{sb["home"]}" "{sb["tmp"]}" 2>/dev/null '
+            f'| grep -vxF {skip} >> "{log}"; exit $rc'
+        )
+    _make_stub(
+        stub,
+        "#!/usr/bin/env bash\n"
+        f'case " $* " in *" --passphrase-fd 3 "*) {on_stream} ;; esac\n'
+        f'exec "{real}" "$@"\n',
+    )
+    return log
+
+
+def test_sql_dump_never_written_as_plaintext(sandbox):
+    """By the time the dump has been fully encrypted, no file in the sandbox
+    holds the database's plaintext (the old code wrote the whole dump to the
+    big-temp dir first, then encrypted that file), and the line count still
+    matches a real dump."""
+    _seed_stream_sentinel(sandbox)
+    _install_curl(sandbox, _CURL_ABSENT)
+    log = _install_gpg_spy(sandbox)
+    proc, status = _run_backup(sandbox)
+    assert status["success"] is True, (status, proc.stdout)
+    assert "round-trip decrypt verified" in proc.stdout, proc.stdout
+    seen = log.read_text().splitlines()
+    assert seen[:1] == ["STREAM"], seen
+    assert seen[1:] == [], f"plaintext found during encryption: {seen[1:]}"
+    want = subprocess.run(
+        ["sqlite3", str(sandbox["gd"] / "data" / "genesis.db"), ".dump"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.count("\n")
+    assert status["sqlite_lines"] == want, status
+
+
+def _sqlite_dump_stub(sb, dump_body: str, rc: int) -> None:
+    """Make `sqlite3 <db> .dump` print dump_body and exit rc; every other
+    sqlite3 call (integrity check, round-trip) runs the real binary."""
+    real = shutil.which("sqlite3")
+    _make_stub(
+        sb["bind"] / "sqlite3",
+        "#!/usr/bin/env bash\n"
+        f'if [ "${{2:-}}" = ".dump" ]; then printf "{dump_body}"; exit {rc}; fi\n'
+        f'exec "{real}" "$@"\n',
+    )
+
+
+@pytest.mark.parametrize(
+    ("dump_body", "rc", "why"),
+    [
+        # Dies after part of the database: non-zero exit.
+        ("BEGIN TRANSACTION;\\nCREATE TABLE t(x);\\n", 1, ""),
+        # Corrupt or locked DB: sqlite3 exits 0 but ends the dump in ROLLBACK.
+        (
+            "BEGIN TRANSACTION;\\nCREATE TABLE t(x);\\nROLLBACK; -- due to errors\\n",
+            0,
+            "did not end in COMMIT",
+        ),
+    ],
+)
+def test_sql_dump_failure_is_never_promoted(sandbox, dump_body, rc, why):
+    """A partial dump still encrypts to a VALID ciphertext. It must be
+    discarded and reported as a dump failure, and the previous good backup in
+    the clone must survive untouched."""
+    _install_curl(sandbox, _CURL_ABSENT)
+    proc, status = _run_backup(sandbox)
+    assert status["success"] is True, status
+    good = sandbox["clone"] / "data" / "genesis.sql.gpg"
+    before = good.read_bytes()
+    _sqlite_dump_stub(sandbox, dump_body, rc)
+    proc, status = _run_backup(sandbox)
+    assert status["failure_stage"] == "sqlite_dump", status
+    assert status["sqlite_lines"] == 0, status
+    assert "sqlite3 dump failed" in proc.stdout, proc.stdout
+    assert why in proc.stdout, proc.stdout
+    assert good.read_bytes() == before
+    assert not list((sandbox["clone"] / "data").glob(".genesis.sql.gpg.partial.*"))
+
+
+def test_sql_stream_encrypt_failure_reported_as_encrypt(sandbox):
+    """gpg failing on the stream makes the dump stages fail too; the stage
+    must still read as an encryption failure, and nothing partial is left."""
+    _install_curl(sandbox, _CURL_ABSENT)
+    _install_gpg_spy(sandbox, fail_stream=True)
+    proc, status = _run_backup(sandbox)
+    assert status["failure_stage"] == "sqlite_encrypt", status
+    assert "SQLite encryption failed" in proc.stdout, proc.stdout
+    data = sandbox["clone"] / "data"
+    assert not (data / "genesis.sql.gpg").exists()
+    assert not list(data.glob(".genesis.sql.gpg.partial.*"))
+
+
+@pytest.mark.parametrize(
+    ("dump", "flag"),
+    [
+        ("BEGIN TRANSACTION;\nCOMMIT;\n", "1"),
+        (f"BEGIN TRANSACTION;\nINSERT INTO t VALUES('{_STREAM_SENTINEL}');\n", "0"),
+        ("BEGIN TRANSACTION;\nROLLBACK; -- due to errors\n", "0"),
+        ("", "0"),
+    ],
+)
+def test_the_dump_side_file_holds_a_flag_never_a_line_of_the_dump(tmp_path, dump, flag):
+    """It sits in plain text beside the encrypted stream until cleanup."""
+    script = (Path(__file__).parents[2] / "scripts" / "backup.sh").read_text()
+    program = re.search(r"""awk -v out="\$_SQL_COUNT" '([^']+)'""", script).group(1)
+    side = tmp_path / "count"
+    out = subprocess.run(
+        ["awk", "-v", f"out={side}", program], input=dump, capture_output=True, text=True, check=True
+    )
+    assert out.stdout == dump, "the stream must pass through unchanged"
+    assert side.read_text().splitlines() == [str(dump.count("\n")), flag]

@@ -271,9 +271,15 @@ engine has NO temporal types despite its own documentation listing them, and a
 loading engine answers `BusyLoadingError` — which is unavailable, never empty.
 Acceptance: 400 live roots replayed through both stores, 0 node-set differences.
 The FalkorDB projection is rebuilt hourly by `genesis-graph-project.timer`
-(`memory/graphstore_project.py`); that schedule is its staleness bound, and an
-engine restart leaves no projection until the next run (the engine keeps no data
-on disk). Before the swap, the projector runs the callers' own traversal and
+(`memory/graphstore_project.py`); that schedule is its staleness bound. The
+engine keeps no data on disk, so its unit also (re)starts the projector on
+every start, restarts included; a projection already running against the
+engine that just died is stopped and run again (`ExecStartPost`, issue #3035): a restarted engine is
+re-projected at once instead of serving fallbacks until the next hourly run.
+After a restart each process's next read finds its pooled connection closed;
+`graphstore_falkor._read` retries that one READ once inside the same deadline
+(MEASURED: the failure takes about 1 ms and the retry answers), and the row
+records `retried`, which breaks the cutover clock like any other failure. Before the swap, the projector runs the callers' own traversal and
 marker queries on the new graph (`graphstore_falkor._WARM_TRAVERSALS`) and prints
 the outcome (`warm-up: ...`) in the unit's journal. Engine time for the first
 read of a freshly projected graph was 52-358 ms where later reads took 1-3.5 ms,
@@ -305,7 +311,7 @@ frames put the wait in (`construct`, `connect` or `reply`; a row from before the
 connection reading prints `unknown` unless its frames alone name the leg). Rows carry `primary_ms`, a latency spread of answered traversals per store, and
 the report prints each reset's cause. The engine unit keeps its own record of
 slow moments (`--slowlog-max-len 4096`, `--latency-monitor-threshold 100`).
-A call's first fallback, selection failure or error is also written as
+A call's first fallback, retry, selection failure or error is also written as
 its own row the moment it happens, so a process killed mid-request cannot lose the
 evidence that the clock broke. A row that fails to write is carried as
 `prior_write_failures` on the next row and appended to
@@ -828,6 +834,23 @@ verified: a8fa35a35 2026-10-23
   pin; an argv built at run time is outside what it can see.
   Recovering a slot that is alive but running no claude — detecting it, and
   rebuilding it on consent — is a SEPARATE layer and is not shipped here.
+
+- **Each interactive session in its own systemd scope** (`scripts/slot_exec.sh`,
+  called by `cc-slot.sh`, the bashrc `claude()` wrapper and interactive
+  `gmodel`). LIVE once deployed. A slot's claude runs in
+  `genesis-slots.slice/genesis-slot-<slot>-<hex>.scope` with an interim memory
+  cap (`MemoryMax=55%`, `OOMPolicy=continue`), so a runaway session loses its
+  largest process to the kernel inside its own scope. An oomd action no longer
+  takes every slot, but on systemd 255 it can take more than one cgroup (#3874).
+  Without it every slot's claude sat in the tmux
+  server's cgroup (tmux 3.4 moves panes into scopes without waiting, so claude
+  is forked first; MEASURED on a live install, all slots in one login scope). A
+  tmux server the door starts gets its own `app.slice` scope (out of the
+  server's cgroup; its omit mark binds once oomd monitors the user manager). The
+  learned per-slot limit is not built yet. Degrades a step at a time: no
+  `OOMPolicy` on systemd before 253, then no cap, then (loudly) an unscoped launch without
+  a user manager. Detail: `docs/reference/memory-resilience.md`, "Each
+  interactive session in its own scope".
 
 - **Subagent-spawn lockdown — one source of truth across the restricted sessions**
   (`cc/types.SPAWN_TOOL_NAMES = ("Agent", "Task", "Workflow", "Skill")`). A restricted
@@ -1418,6 +1441,19 @@ verified: b0867170e 2026-10-02
   operator-only per-item release requires explicit replay acknowledgement and
   an unchanged source, then returns through normal approval/claim handling.
   Recovery procedure and limits: `docs/reference/inbox-replay-safety.md`.
+- **Inbox vault sync** (`scripts/inbox_sync.sh`, run by
+  `genesis-inbox-sync.timer` every 5 minutes; enabled everywhere, a no-op
+  unless `inbox_monitor.sync_remote` names an rclone remote). It mirrors notes
+  vault → inbox and pushes responses back. A local response is removed only
+  when the vault was seen to hold it (`.genesis-seen-in-vault`, scoped to the
+  remote) and no longer does; removal goes to the Genesis trash. What a pull
+  replaces or removes goes there too, through `--backup-dir`. Each
+  configured run writes a heartbeat (`~/.genesis/state/inbox_sync.json`), and
+  `inbox/sync_health.py` raises one `infrastructure_alert` per outage from the
+  awareness tick when the heartbeat goes stale (30 min) or cannot be read, the
+  config is unusable, responses are held because the trash refused them, or a
+  caller other than the timer runs the sync with no remote set.
+  `inbox/sync_config.py` is the one reader both sides share.
 - **recon/**: scheduled intelligence jobs (release watch, model intelligence
   Sun 8am, models.md synthesis Sun 10am, GitHub discovery, skill-security scan
   via external NVIDIA SkillSpector). Emits findings for triage
@@ -1694,8 +1730,14 @@ the shared banner is not an assertion about all concurrent sessions.
   complete provider/protocol/sequence/nonce/repository context. `import-status`
   observes receipt totals without initialization or migration; `automatic-ready`
   fences every automatic reconciliation/claim/launch until the later protocol
-  completes. There is no readiness setter. This does not implement persistent
-  resource quarantine or the checked consumer's list/claim error propagation.
+  completes. There is no readiness setter. Behind that fence, the checked
+  consumer validates complete NUL list/claim/escalation acknowledgements and
+  actual child status, dispatches one provider from its authoritative claim and
+  settles the complete context. Entrypoint and freeze repository normalization
+  preserve trailing newlines and collapse Linux root aliases before lock hashing.
+  Retained terminal decisions replay without
+  resending known completions; missing terminal evidence, native intent/scope
+  cleanup and persistent resource quarantine remain separate activation gates.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
   deletions; native query/client cgroup proof and orphan-scope checks precede
@@ -2040,7 +2082,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 0a6c219a1 2026-10-31
+verified: 25f3ad876 2026-11-03
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -2060,8 +2102,11 @@ verified: 0a6c219a1 2026-10-31
   delete-first never wait; early relief waits only while the pool stays above
   its reserve until the window opens. `any` restores immediate scheduling.
   With the window enabled, each routine deletion rechecks the live clock
-  after reserving its cooldown;
-  a failed deletion stops the batch. Read-only attempts use
+  after reserving its cooldown and waits the 5-minute settle since the last
+  action, so a window pass deletes one snapshot and the next pass continues.
+  A deletion whose outcome is uncertain (timeout, failed re-list) stops the
+  batch; one that definitely failed is skipped (the next candidate goes
+  without a settle) and is named in a warning after the window. Read-only attempts use
   `.last_window_attempt` for retry pacing and do not stamp pool relief's
   `last_action`; only actual deletion candidates reserve that shared cooldown.
   A window closing during stamp IO may leave a conservative cooldown without
@@ -2135,10 +2180,23 @@ verified: 0a6c219a1 2026-10-31
   `deploy_candidates drop`. The diagnosis snapshot carries the boot repair's
   `live-move repair:` journal lines and a summary of the newest
   `deploy-backups/*-live-move-repair/REPAIR.json` that is neither dismissed
-  nor superseded (6 h window on its own `ts`), JSON-quoted, capped at 2,000
-  characters and fenced as untrusted; empty, and the prompt unchanged, when
-  there are none. The container reads are bounded where they are produced
-  (regular non-symlink reports, 4 MiB each; journal lines cut to 400), and
+  nor superseded and names `~/genesis` (6 h window on the ts in its dir name,
+  never the stored one), chosen inside the container (one `python3 -I -S -`
+  over stdin, as the configured container user, #3627) so newer ineligible
+  reports cannot hide it; JSON-quoted, capped at 2,000 characters and fenced
+  as untrusted; empty, and the prompt unchanged, when there are none. The
+  container reads are bounded where they are produced (only a report dir
+  named as the writer names it and not a symlink; one regular report opened
+  without following a symlink, 4 MiB; the repo compared as the repair loader
+  compares it; dirs ordered by the loader's `report_order`, seconds then
+  pid, a name over 300 s ahead skipped and at most 8 dirs read, as deploy
+  health does; those rules held equal to the loader's by a parity test and a
+  cross-reader test; a newer one over that cap, unreadable or not a JSON
+  object is shown as "report too large" or "report unreadable", never skipped
+  for an older one, unless the top-level repo, result or dismissed_at read
+  from the writer's indent-2 layout makes it ineligible; journal lines cut to
+  400). It shows the newest ELIGIBLE report, by design, where deploy health's
+  `live_repair_unresolved` reads the newest READ one, and
   Telegram alert fields are cut before escaping. Residual: a container that
   fakes git's own output can still pass the probe.
 - **Merged ≠ deployed**: guardian code reaches the host ONLY via
@@ -3765,7 +3823,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
-          env.py, _config_overlay.py, caller_context.py]
+          env.py, _config_overlay.py, caller_context.py, caller_credentials.py]
 verified: 973a0e6 2026-10-30
 ```
 
@@ -3928,6 +3986,14 @@ Refusing a proposed update preserves a previously valid opt-in.
   is declared only at startup — a live server meeting `SQLITE_CORRUPT` does
   not trip it (the 2026-09-18 log-storm class). Both land with the runtime
   corruption trip.
+- **db/ request ownership (internal prerequisite, not activated):**
+  `RequestDatabase` supplies a stable facade with one fresh physical connection
+  per independent unit, bounded admission, retained cancellation cleanup and
+  cursor closure. It preserves explicit CRUD commits and refuses expired scopes;
+  it does not provide whole-tool atomicity. Existing MCP initialization still
+  uses its legacy connection. Service integration and detached-writer ownership
+  are separate prerequisites before shared activation. See
+  `docs/reference/request-database.md` for lifecycle and failure semantics.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Every
   statement through a `SerializedConnection` (its cursors' row fetches too),
@@ -4219,7 +4285,12 @@ Refusing a proposed update preserves a previously valid opt-in.
   don't merge them. Memory-resilience invariants are first-class facts:
   container `cgroup_memory_swap_max` (tri-state — "0" IS the 2026-07 wedge
   state) + `oomd_user_slice_kill` (config-plane scan of user.slice.d drop-ins,
-  laid down by `scripts/lib/memory_resilience.sh` from install/bootstrap/update) and
+  laid down by `scripts/lib/memory_resilience.sh` from install/bootstrap/update) +
+  `oomd_active` (`systemd-oomd.service` running) +
+  `oomd_user_manager_monitored` (LIVE: `oomctl` lists the user manager's cgroup,
+  asked only while oomd runs; a failing `oomctl` keeps the prior facts;
+  a config read cannot answer it, since a user daemon-reload silently drops
+  PID 1's report, systemd #43174) and
   host-plane `swap_total_kb`, so the annotation layer flags unprotected
   installs (see docs/reference/memory-resilience.md). Default-disabled
   `CODE_INTEL_WORKLOAD_SLICE=1` routes only indexing batch scopes into the dormant
@@ -4524,10 +4595,48 @@ Refusing a proposed update preserves a previously valid opt-in.
   (re-apply steps included) and queues an alert (critical when anything was
   not the update's, the index was torn, or it did not heal); `REPAIR.json`
   and `manifests()` are the contract its readers (deploy health, the
-  awareness check, the guardian's diagnosis) read, and those readers arrive
-  in a follow-up PR: until then the command output and the alert carry the
-  report. A run killed after its restore and before its result leaves no
-  result; the next run removes a healed state without a new backup.
+  awareness check, the guardian's diagnosis) read. The readers REPORT and
+  never judge a path; putting saved paths back is the repair's own job when
+  it writes. The deploy-health collector `collect_live_repairs` reads every
+  `REPAIR.json` through the repair's one loader, `load_report(dir, checkout)`:
+  a report dir not named as `_backup_dir` names it, a symlinked dir, a
+  `REPAIR.json` that is not a regular file (opened without following a
+  symlink or blocking on a FIFO) of at most 4 MiB holding a JSON object of at
+  most 20,000 rows, or a report whose `repo` is not the deploy checkout
+  (`repo_root()`; the field must be a string with no NUL whose file-system
+  bytes, `os.fsencode`, number at most 4,096, so a non-UTF-8 checkout path the
+  writer stored still matches; checked before realpath, and a realpath error
+  is a refusal) is refused whole, counted in `live_repair_refused:<n>` and named
+  once in the server log; no git runs in a checkout a report names. A dir
+  named more than 300 s ahead of the reader's clock (`REPORT_FUTURE_S`) is
+  refused too. Only the newest eight report dirs by the loader's
+  `report_order` (the ts in their name, then the pid as a number) are read;
+  older ones are
+  counted in `live_repair_unread_older:<n>`, an informational class (medium
+  when alone). Per report the snapshot carries its ts, its backup folder, how
+  many paths the update did not write were recorded there (every foreign row
+  counts, flag-only and deleted ones too; no other row field is read), a result enum (`healed`,
+  `healed-kept`, `unresolved`, `superseded`, `unfinished`, else `unknown`: no
+  report string reaches the snapshot, the alert text or the alert key),
+  `dismissed` and `unresolved`; `live_repair_saved:<n>` sums the reports not
+  `--dismiss`ed. It loads the repair's module once per snapshot when any
+  report dir exists (a module that cannot load, or lacks a name the reader
+  uses, reads every report as refused and blanks nothing), and a linked worktree reads none. The awareness paragraph
+  names, per undismissed report with saved paths, its backup folder,
+  `scripts/deploy_candidates repair-move --restore <ts>` (once both the
+  installed repair kit and `scripts/deploy_candidates` include it) and `--dismiss <ts>`, says a restore leaves
+  uncommitted edits the deploy scripts refuse, and that backups are pruned 90
+  days after the last write to their folder; it escapes any text a database
+  column cannot hold rather than losing the alert, and is replaced whenever
+  the reports it names change. `GET /api/genesis/health` reduces
+  `live_repairs` to an allow-list of its counts for a caller without the
+  internal bearer or a verified session. `live_repair_unresolved` needs the
+  newest report to say so (or to have no result after an hour) AND the
+  shared guard, run at read time and only then, to call the update state
+  `mixed_tree`: a run killed after its restore and before its result leaves
+  no result, and only the tree says whether it healed (the next run removes
+  a healed state without a new backup). The awareness check words every
+  class (never paging).
   `--post-merge` on `live` never runs the engine. What is recorded and sent to
   the host guardian is the origin/main commit `live` is built on.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;

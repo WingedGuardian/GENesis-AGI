@@ -12,6 +12,8 @@ import fcntl
 import subprocess
 from pathlib import Path
 
+from tests.conftest import process_running_as
+
 _HYGIENE = Path(__file__).resolve().parents[2] / "scripts" / "disk_hygiene.sh"
 
 
@@ -153,38 +155,12 @@ def test_a_directory_in_a_dot_repo_is_refused(tmp_path):
 def test_an_engine_launched_after_the_decision_is_spared(tmp_path):
     """The decision is a snapshot; each path is re-checked against /proc just
     before it is moved or removed."""
-    import shutil
-    import time
-
     root = tmp_path / "camoufox"
     made = _tree(root)
     binary = made["version"] / "camoufox-bin"
-    shutil.copy2(shutil.which("sleep"), binary)
-    proc = subprocess.Popen([str(binary), "30"])
-    try:
-        for _ in range(100):
-            if Path(f"/proc/{proc.pid}/exe").exists():
-                break
-            time.sleep(0.05)
+    with process_running_as(binary):
         r = _prune(root, _stub(tmp_path, [made["version"]]))
-    finally:
-        proc.kill()
-        proc.wait()
     assert "spared" in r.stdout and binary.exists()
-
-
-def _running(binary: Path):
-    """A process executing ``binary`` (a copy of sleep), once /proc shows it."""
-    import shutil
-    import time
-
-    shutil.copy2(shutil.which("sleep"), binary)
-    proc = subprocess.Popen([str(binary), "30"])
-    for _ in range(100):
-        if Path(f"/proc/{proc.pid}/exe").exists():
-            break
-        time.sleep(0.05)
-    return proc
 
 
 def test_a_legacy_browser_started_after_the_decision_spares_the_whole_root(tmp_path):
@@ -195,12 +171,8 @@ def test_a_legacy_browser_started_after_the_decision_spares_the_whole_root(tmp_p
     made = _tree(root)
     version_json = root / "version.json"
     version_json.write_text("{}")
-    proc = _running(root / "camoufox-bin")
-    try:
+    with process_running_as(root / "camoufox-bin"):
         r = _prune(root, _stub(tmp_path, [version_json, made["legacy_file"], made["legacy_dir"]]))
-    finally:
-        proc.kill()
-        proc.wait()
     assert version_json.exists() and made["legacy_file"].exists() and made["legacy_dir"].is_dir()
     assert r.stdout.count("spared") == 3
 
@@ -209,12 +181,8 @@ def test_an_engine_browser_does_not_spare_the_legacy_root(tmp_path):
     """A 0.5 engine running from browsers/ is not the root engine."""
     root = tmp_path / "camoufox"
     made = _tree(root)
-    proc = _running(made["version"] / "camoufox-bin")
-    try:
+    with process_running_as(made["version"] / "camoufox-bin"):
         r = _prune(root, _stub(tmp_path, [made["legacy_file"]]))
-    finally:
-        proc.kill()
-        proc.wait()
     assert not made["legacy_file"].exists(), r.stdout
 
 
@@ -301,7 +269,7 @@ def test_the_step_prunes_the_cache_secrets_env_names(tmp_path):
         f'XDG_CACHE_HOME="{cache}"\nCAMOUFOX_EXECUTABLE_PATH=/opt/cf/camoufox-bin\nAPI_KEY=nope\n'
     )
     script = (
-        f"source '{_HYGIENE}'\nREPO_DIR='{repo}'\nunset XDG_CACHE_HOME CAMOUFOX_EXECUTABLE_PATH\n"
+        f"source '{_HYGIENE}'\nREPO_DIR='{repo}'\nunset XDG_CACHE_HOME CAMOUFOX_EXECUTABLE_PATH SECRETS_PATH\n"
         'prune_browser_engines() { echo "root=$1 xdg=$XDG_CACHE_HOME ov=${CAMOUFOX_EXECUTABLE_PATH-} key=${API_KEY-}"; }\n'
         "prune_camoufox_engines_step\n"
         'echo "after=${XDG_CACHE_HOME-unset}"'
@@ -316,7 +284,7 @@ def test_the_step_defaults_to_the_home_cache(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     script = (
-        f"source '{_HYGIENE}'\nREPO_DIR='{repo}'\nHOME='{tmp_path}'\nunset XDG_CACHE_HOME\n"
+        f"source '{_HYGIENE}'\nREPO_DIR='{repo}'\nHOME='{tmp_path}'\nunset XDG_CACHE_HOME SECRETS_PATH\n"
         'prune_browser_engines() { echo "root=$1"; }\n'
         "prune_camoufox_engines_step"
     )
