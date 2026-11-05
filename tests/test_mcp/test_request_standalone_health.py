@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from fastmcp import Client
+from fastmcp.server.dependencies import get_context
 
 from genesis.db.crud import cost_events
 from genesis.db.request_database import RequestDatabase
@@ -99,10 +100,12 @@ async def test_standalone_requests_keep_independent_ownership(health_db, standal
     module, service = standalone
     entered, second_entered, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
     leases = []
+    request_ids = []
     original = service._enrich_from_db
 
     async def enrich(result):
         leases.append(db._current.get())
+        request_ids.append(get_context().request_context.request_id)
         if len(leases) == 1:
             entered.set()
             await release.wait()
@@ -117,7 +120,6 @@ async def test_standalone_requests_keep_independent_ownership(health_db, standal
     server.add_tool(module.status.health_status)
     server.add_tool(module.errors.health_alerts)
     async with Client(server) as first, Client(server) as second:
-        request_id = first.session._request_id
         caller = asyncio.create_task(first.call_tool(tool))
         peer = None
         try:
@@ -126,12 +128,15 @@ async def test_standalone_requests_keep_independent_ownership(health_db, standal
             if capacity > 1:
                 await second_entered.wait()
             if outcome == "cancel":
-                await first.cancel(request_id, reason="synthetic cancellation")
+                await first.cancel(request_ids[0], reason="synthetic cancellation")
+                # Local abandonment also emits cancellation in SDK 2. Require
+                # explicit wire cancellation to close the lease first.
+                async with asyncio.timeout(5):
+                    while not leases[0].closed:
+                        await asyncio.sleep(0)
                 caller.cancel()
                 with pytest.raises(asyncio.CancelledError):
                     await caller
-                while leases[0].active:
-                    await asyncio.sleep(0)
             elif outcome == "shutdown":
                 await db.close()
                 # Manager shutdown owns DB work, not transport reply completion.

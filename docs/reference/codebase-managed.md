@@ -460,18 +460,109 @@ runtime. Current-install tests are not a separate Python 3.10 runtime qualificat
 
 ## Queued indexing
 
-The existing idle-gated runner probes managed availability before and after
-claiming a Codebase-only request. Unavailability leaves the pending generation
-uncharged; a post-claim refusal durably restores it. A combined request can
-complete GitNexus and requeue its unfinished Codebase leg before consuming the
-combined request. Partial-success outcomes (rc 4/5) use the ordinary request
-writer: a new pending row starts at zero attempts; coalescing with an existing
-pending row retains that row's higher count. The original inflight attempt
-count is not carried into the split request. Operators must not manually reset
-attempts to force retries. Retry-budget continuity across splits and commit
-generations remains part of the resource-failure quarantine work.
-The runner records availability errors in its log; the index entry point includes
-the final refusal line in its skip diagnostic.
+Schema 3 stores Codebase and GitNexus requests as separate provider legs in the
+existing SQLite queue. A `both` enqueue creates both legs in one transaction.
+Coalescing keeps each leg's strongest requested mode, earliest request time and
+higher debt. Claiming one leg leaves its sibling pending; only one claim per
+repository can be inflight. A completed older claim cannot delete a newer
+pending request. A failure charges only its claimed provider and is applied once.
+
+Automatic consumption is paused while the queue protocol is incomplete. The
+runner holds its ordinary lock, then observes readiness before reconciliation,
+listing, claiming or invoking a provider. Missing, legacy and incomplete queues
+defer with exit 0, logged as a paused tick, so the unit does not read as failed
+while the pause is expected. Unsupported metadata, observation failures and a
+crashed or unreadable readiness helper stop with exit 76, as does a helper that
+reports ready (this protocol has no ready state yet); lock failures and a
+missing entrypoint or helper file still defer with exit 75. This binary never reports automatic readiness, including if
+a readiness value is manually changed. There is no setter or environment bypass.
+
+`python3 scripts/lib/index_marker.py automatic-ready` is read-only and returns
+the dedicated status 10 for an incomplete protocol or status 2 for an
+observation error. Queue-operation exceptions raised from `main()` also return
+2; a busy queue makes `automatic-ready` return 75, which the runner logs as a
+busy tick and exits 0. Status 10 is reserved so that an interpreter crash (status 1) is never
+mistaken for the expected pause; the runner treats any other status as a
+failure. The runner discards the observer's JSON, so read the current state
+with `python3 scripts/lib/index_marker.py automatic-ready`. `import-status`
+lists receipts for schemas 2 and 3 and refuses a newer schema. The checked
+consumer is prepared behind this fence; native evidence and durable
+resource-failure quarantine must complete before automatic work can resume.
+That readiness does not authorize lifting a freeze or disable sentinel.
+
+No ordinary command converts an existing queue. Converting on connect is unsafe
+across code rollbacks: a failed update restores older code but not the queue,
+and older code refuses a newer schema. On an older queue (schema 1 or 2, or an
+unversioned file that already has tables), `write` durably spools the request
+in the plain format schema-2 code writes and imports, so a rolled-back install
+still consumes it; `automatic-ready` and `import-status` read schemas 1 and 2
+as before, and report an unversioned file that has tables as an observation
+error (so the runner stops with 76 until the cutover); every other command
+exits 2 with one line naming the schema and the cutover. A busy queue whose
+schema was not yet confirmed also spools the plain format. A missing queue is created at schema 3, unless an update is running
+(`locks/update.lock` held exclusively, or `update_state.json` present under the
+state directory), in which case `write` spools and nothing is created. Only the
+explicit strict cutover converts an older queue and imports those spools.
+
+`write --repo ... --tools cbm|gitnexus|both --mode fast|moderate|full` and `hash`
+retain their interfaces. `list-legs` emits one JSON object per leg. `claim`
+requires `--hash` and `--provider` and returns a JSON snapshot with a `context`
+object. Settlement commands require that whole object as `--context`, including
+canonical repository, hash, provider, protocol, execution sequence and nonce.
+JSON preserves whitespace and Unicode paths; duplicate context fields are
+rejected. An ordinary no-eligible claim returns 1. Queue-operation exceptions
+raised from `main()` return 2 with diagnostics; a busy queue returns 75. At readiness,
+reconciliation, listing, claim and escalation the runner logs a busy queue and
+exits 0, as for an overlapping tick, so routine contention never fails the unit. Earlier startup failures remain
+visible and can still return 1. The checked consumer requires a complete matching
+machine acknowledgement before accepting no eligibility. No hash-only settlement alias selects a new provider claim.
+
+`list-legs`, `claim` and `should-escalate` also accept `--nul`. Every machine
+field ends in NUL, preserving literal whitespace and trailing newlines. Lists
+contain six-field `1,pending,hash,repo,provider,age` records; claims contain
+seven-field `1,claim,hash,repo,provider,mode,context_json` records. No eligibility
+is a four-field `1,unclaimed,hash,provider` record with status 1. Escalation is
+`1,escalation,hash,0|1` with status 0 for either answer. Wire version 1 is
+independent of queue schema 3 and claim protocol 2. Other interfaces are unchanged.
+Listed and claimed repository spellings are validated as stored, never
+re-resolved against the live filesystem, so a queued repository that later moves
+(or gains a symlink) cannot stop the list. A request spooled while the queue was
+busy is still resolved when it is imported.
+
+The consumer checks actual child status, framing and every listed row before
+claiming anything. It dispatches only the claimed provider, using that claim's
+mode and opaque context, and rechecks Codebase disablement after claiming.
+GitNexus full requests do not change Codebase full-index clocks. A malformed
+or failed queue observation stops the tick with 76. The headerless list trusts
+the same-install producer to include the complete population; it cannot detect
+a successful response shortened exactly at a record boundary.
+
+The entrypoint and freeze use the same checked physical repository path before
+lock hashing, including trailing newlines and relative leading-dash spellings.
+Failed resolution stops before taking a repository lock; the freeze's default
+repository selection follows the same normalization.
+Leading slash aliases also collapse to the queue's Python-canonical Linux
+spelling, so `/repo` and `//repo` cannot select different repository locks.
+
+Terminal scalar decisions are retained before application. A busy database can
+leave a durable outcome spool; a later tick replays a retained decision before
+claiming work. This prevents resending a known completed execution. Completion
+with no durable terminal decision has no such guarantee here: native intent,
+uncertainty reconciliation and scope cleanup remain prerequisites for activation.
+The ephemeral transport file is private, removed on ordinary exit and never
+used as recovery evidence. Production readiness remains unqualified by owned
+future-capability simulations with a harmless provider.
+
+Migrated shared debt retains its original values and explicit legacy provenance,
+separately from the effective per-leg count. Old combined inflight work keeps one
+protocol-1 history record and is never represented as two proven native runs.
+Old inflight work and conflicting scalar evidence remain for supervised
+reconciliation. A retained failed-row snapshot preserves original fields and
+failure time after the latest failure is replaced; exact raw bytes stay separate. Protocol-2 claims have no automatic native-intent path; explicit
+reconciliation can neutrally restore an unstarted claim, or apply its remembered
+scalar outcome. Neither is proof about a legacy or future native scope. Operators
+must not reset attempts or erase history to force retries. Persistent resource
+quarantine across commit generations remains a separate work package.
 
 The adapter executes the accepted native inode inside the admitted 8 GiB,
 zero-swap scope with a 6 GiB native budget. Its supervisor retains a nonmaximum
@@ -490,13 +581,14 @@ Follow the supervised production acceptance and resource gates in
 
 ### Legacy queue import evidence
 
-The queue upgrades its import metadata atomically to schema 2. Each legacy
+The queue upgrades schemas 0, 1 and 2 atomically to schema 3. Each legacy
 artifact is isolated by a savepoint: malformed content produces a retained
 receipt containing its exact raw bytes and a reason, while unrelated valid
 requests continue. These diagnostics do not replace a repository's genuine
 failed request or conflicting-outcome state. Stale, unowned outcome artifacts
-also appear in import receipts; owned conflicting outcomes retain their existing
-business handling. Filesystem and SQLite failures remain errors, with claimed
+also appear in import receipts. Conflicting outcomes retain the first action and
+conflict evidence against their exact execution; they do not trigger an automatic
+failure retry. Filesystem and SQLite failures remain errors, with claimed
 files retained until the import transaction commits. A failure after commit is
 recoverable from the receipt even if a later directory sync fails after unlink.
 
@@ -507,8 +599,9 @@ python3 scripts/lib/index_marker.py import-status --limit 20
 ```
 
 The JSON reports actual totals, imported/quarantined counts, the display limit
-and truncation. Source names use lossless hexadecimal filesystem bytes; raw
-rejected payloads remain in the private queue database and are not printed.
+and truncation. Source names use lossless hexadecimal filesystem bytes. Schema 3
+retains exact raw bytes for every newly imported artifact, including valid and
+duplicate old claims; raw payloads remain private and are not printed.
 An absent queue is explicit; schema 1 reports that receipt diagnostics are
 unavailable. Unsupported schema/journal mode, read and lock failures exit 2.
 The reader uses read-only/query-only SQLite against the supported rollback
@@ -519,23 +612,38 @@ processing, not historical content validity. No rejected payload is invented.
 Receipt identity includes source bytes, raw digest and exact decimal mtime.
 Prior identities remain retained so a commit-before-unlink replay cannot import
 work twice. Do not clear this history to retry a request. Older queue binaries
-refuse schema 2; rolling back code must not restore an old queue snapshot over
-new writes. This migration does not enable indexing, add resource quarantine,
-or fix the runner's separate list/claim error handling tracked in #2043.
+refuse schema 3; rolling back code must not restore an old queue snapshot over
+new writes. Receipt and execution history are retained for idempotence and
+reconciliation; no implicit history prune or new backup service is installed.
+Before a supervised live upgrade, stop automatic consumption, verify no writer,
+preserve a consistent SQLite backup with its owned spool inventory, and verify
+restoration in disposable storage. Do not assume the install's optional backup
+configuration covers this queue. The migration does not enable indexing, add
+resource quarantine, or implement the checked consumer's list/claim propagation
+tracked in #2043.
 
 ## Verification
 
-The runner's SQLite contention fixture verifies actual outcome replay: after
-the fixture locker releases the ordinary runner lock, a real recovery tick
-must retire pending, inflight and failure records and the outcome spool while
-calling the fake provider only once. An empty pending list or a successful
-lock-busy no-op does not prove completion. The fixture also bounds its locker
-readiness wait. These tests use an isolated home and fake provider; they do not
-qualify production indexing or explain a separate first-tick timeout.
+The transitional SQLite contention fixture explicitly drives real claim,
+fake-provider, outcome-spool and CLI reconciliation paths. After the fixture
+locker releases the ordinary runner lock, reconciliation must retire pending,
+inflight, failure and spool state, retain the completed execution, and show
+only one provider call. Actual automatic ticks separately prove refusal without
+changing queue bytes. Explicit CLI replay is not automatic-dispatch acceptance.
+An empty pending list or a successful lock-busy no-op does not prove completion.
+The fixture bounds its locker readiness wait. These tests use an isolated home
+and fake provider; they do not qualify production indexing or explain a separate
+first-tick timeout.
+
+Permission-denial fixtures first verify the specific denied role with effective
+IDs. If privilege defeats that premise, only that case skips with its role in
+the reason; ordinary refusal assertions and writable positive controls still
+run. The hot-journal positive case performs real SQLite recovery. Copy-source
+configuration retains its mode-bit contract independently of effective execute
+access, so its positive case also runs when privilege permits execution.
 
 The configuration test suite uses synthetic paths and fixtures. Native staging
 acceptance explicitly opts in to the independently pinned release binary:
-
 ```bash
 GENESIS_TEST_CBM_PINNED_BINARY="$HOME/tmp/codebase-memory-mcp" \
   .venv/bin/pytest tests/test_scripts/test_codebase_managed_config.py

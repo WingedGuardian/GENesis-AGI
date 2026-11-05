@@ -128,5 +128,5 @@ jobs:
             -f status=completed \
             -f conclusion="$concl" \
             -f "output[title]=$title" \
-            -f "output[summary]=Merge-gate re-evaluation of PR #${PR_NUMBER} via the trusted publisher (fork review events cannot write check runs). The full gate report is in this run's 'Re-evaluate the merge gate' step log." \
+            -f "output[summary]=Merge-gate re-evaluation of PR #${PR_NUMBER} via the trusted publisher (fork-PR and Dependabot runs cannot write check runs). The full gate report is in this run's 'Re-evaluate the merge gate' step log." \
             -f "details_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"

@@ -211,6 +211,7 @@ async def test_reinitialization_to_legacy_removes_scoped_boundary(database, monk
     unrelated = [Middleware(), Middleware()]
     for middleware in unrelated:
         module.mcp.add_middleware(middleware)
+    retained = list(module.mcp.middleware)
     dependencies = {}
     if name == "memory":
         dependencies = dict(embedding_provider=object(), qdrant_client=object(), process_pending_bookmarks=False)
@@ -235,8 +236,11 @@ async def test_reinitialization_to_legacy_removes_scoped_boundary(database, monk
 
         async with Client(server) as client:
             assert (await client.call_tool("legacy_read")).data == 1
-        assert server.middleware[:2] == unrelated
-        assert len(server.middleware) == 2 + int(metrics)
+        assert [m for m in server.middleware if not isinstance(m, InstrumentationMiddleware)] == retained
+        boundaries = [m for m in server.middleware if isinstance(m, InstrumentationMiddleware)]
+        assert len(boundaries) == int(metrics)
+        if metrics:
+            assert boundaries[0]._db is legacy
     finally:
         await legacy.close()
 
@@ -267,13 +271,14 @@ async def test_legacy_health_implementations_stay_supported(database, monkeypatc
     from genesis.observability.health_data import HealthDataService
 
     module = isolate_module(monkeypatch, "health")
+    retained = list(module.mcp.middleware)
     legacy = await get_db(database.path) if has_db else None
     try:
         service = (HealthDataService(db=legacy) if kind == "runtime" else
                    StandaloneHealthDataService(status_path=database.path.parent / "status.json", db=legacy))
         module.init_health_mcp(service)
         assert module._service is service
-        assert module.mcp.middleware == []
+        assert module.mcp.middleware == retained
     finally:
         if legacy is not None:
             await legacy.close()
@@ -313,7 +318,8 @@ async def test_registration_preserves_pending_tracker_flush(database, monkeypatc
         await entered.wait()
         for _ in range(2):
             await initialize_request_service("recon", db=database, activity_tracker=tracker)
-        assert module.mcp.middleware[0]._tracker is tracker
+        boundaries = [m for m in module.mcp.middleware if isinstance(m, InstrumentationMiddleware)]
+        assert len(boundaries) == 1 and boundaries[0]._tracker is tracker
         assert tracker._db is database and tracker._flush_task is task
         assert tracker.summary("synthetic-pending")["calls"] == 1
     finally:

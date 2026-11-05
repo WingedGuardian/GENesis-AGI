@@ -4,8 +4,9 @@ import asyncio
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-from fastmcp import Client, FastMCP
+from fastmcp import Client, Context, FastMCP
 from fastmcp.exceptions import ToolError
+from mcp.shared.exceptions import MCPError
 
 from genesis.db.connection import get_db
 from genesis.db.request_database import RequestDatabase
@@ -62,29 +63,34 @@ async def test_service_commits_success_and_rolls_back_failure_without_tracker(se
 async def test_two_clients_do_not_share_pending_writes(service, cancel):
     server, db = service
     entered, release = asyncio.Event(), asyncio.Event()
+    requests = []
 
     @server.tool()
-    async def interrupted() -> str:
+    async def interrupted(ctx: Context) -> str:
         await db.execute("INSERT INTO samples VALUES ('partial')")
+        requests.append((ctx.request_context.request_id, db._current.get()))
         entered.set()
         await release.wait()
         raise ValueError("interrupted write")
 
     async with Client(server) as first, Client(server) as second:
-        request_id = first.session._request_id
         task = asyncio.create_task(first.call_tool("interrupted"))
         await entered.wait()
         assert (await second.call_tool("read")).data == []
         if cancel:
+            request_id, lease = requests[0]
             await first.cancel(request_id, reason="synthetic cancellation")
+            # Observe protocol-driven finalization before abandoning the local
+            # waiter: SDK 2 also sends cancellation when that waiter is cancelled.
+            async with asyncio.timeout(5):
+                while not lease.closed:
+                    await asyncio.sleep(0)
             task.cancel()
         else:
             release.set()
         with pytest.raises(asyncio.CancelledError if cancel else ToolError):
             await task
-        # A subsequent write waits for rollback if the cancellation notification
-        # was accepted before the server finished cleanup. Local task.cancel()
-        # alone sends no MCP cancellation and is only a lost-reply simulation.
+        # A peer write must not expose the interrupted request's pending prefix.
         await second.call_tool("save", {"value": "peer"})
         assert (await second.call_tool("read")).data == ["peer"]
 
@@ -92,7 +98,9 @@ async def test_two_clients_do_not_share_pending_writes(service, cancel):
 async def test_finalization_error_cannot_report_success(service, monkeypatch):
     server, db = service
     tracker = Mock()
-    server.middleware[0]._tracker = tracker
+    boundaries = [m for m in server.middleware if isinstance(m, InstrumentationMiddleware)]
+    assert len(boundaries) == 1
+    boundaries[0]._tracker = tracker
     original = db._open
 
     async def broken_commit(lease):
@@ -101,8 +109,11 @@ async def test_finalization_error_cannot_report_success(service, monkeypatch):
 
     monkeypatch.setattr(db, "_open", broken_commit)
     async with Client(server) as client:
-        with pytest.raises(ToolError, match="commit rejected"):
+        # SDK 2 maps an uncaught finalization failure to a generic protocol
+        # error. It must never become a successful tool result or leak internals.
+        with pytest.raises(MCPError, match="Internal server error") as failure:
             await client.call_tool("save", {"value": "not-durable"})
+        assert failure.value.code == -32603
     tracker.record.assert_called_once()
     assert tracker.record.call_args.kwargs["success"] is False
     monkeypatch.setattr(db, "_open", original)

@@ -1,0 +1,48 @@
+name: gate-corpus
+
+# Break the merge gate on purpose and report which rung of its tests notices. An
+# escape is a finding and exits 0. The job goes red only when the run could not be
+# trusted: a red baseline, an anchor that stopped matching, a timeout. On main, an
+# ESCAPED case or a rung that caught nothing means a test is owed, filed as an issue.
+#
+# Weekly, and on changes to the corpus or the harness. See `gate-corpus-anchors.yml`
+# for why PRs to the gate itself do not run this.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - config/gate_defects.json
+      - .github/workflows/gate-corpus.yml
+      - scripts/ci/mutation_*.py
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gate-corpus-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    # The project's floor, as for `mutation-gate`: without it a hung case holds a
+    # runner for GitHub's six-hour default.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test,transcript-analytics]" -c .github/test-tools/requirements.txt
+      - name: Rung report
+        # exec and --timeout: the same reasons as the `mutation-gate` job in ci.yml.
+        run: exec python scripts/ci/mutation_sweep.py config/gate_defects.json --repo . --rung-report --timeout 1500

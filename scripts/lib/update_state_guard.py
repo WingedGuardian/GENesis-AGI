@@ -97,10 +97,13 @@ finishes only 0. Only exit 10 lets a caller go on.
 
 from __future__ import annotations
 
+import contextlib
+import glob
 import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 
@@ -140,7 +143,12 @@ _TIMEOUT_S = 120
 
 def _env() -> dict[str, str]:
     # Local reads only; GIT_* from the caller would point git elsewhere.
-    return {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    # GIT_OPTIONAL_LOCKS=0: deploy health asks while a deploy may be running,
+    # and `git status` would otherwise refresh the index under index.lock,
+    # failing a concurrent writer (MEASURED: a stale cached stat rewrites it).
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    return env
 
 
 def _rev(repo: str, rev: str) -> str:
@@ -216,8 +224,14 @@ def _merge_residue(
     legal file name arrives exactly; bytes that are not UTF-8 are kept as
     surrogates); any failure to run it is residue. ``ephemeral_ok`` leaves out
     the known-ephemeral paths. Read as bytes and decoded here: text mode would
-    turn a carriage return in a name into a newline, naming another file."""
-    proc = subprocess.run(
+    turn a carriage return in a name into a newline, naming another file.
+
+    Run in its own session: on a timeout the whole group is killed (git
+    included, which would otherwise outlive bash) and the scratch index the
+    hidden-entry pass names after its shell's pid ($$, this child's pid) is
+    removed, as deploy_health's checkout probe does; TimeoutExpired is then
+    raised to the caller as before."""
+    proc = subprocess.Popen(
         [
             "bash",
             "-c",
@@ -230,14 +244,55 @@ def _merge_residue(
             "--two-dot" if two_dot else "",
             "1" if ephemeral_ok else "",
         ],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         env=_env(),
-        timeout=_TIMEOUT_S,
+        start_new_session=True,
     )
+    try:
+        stdout, _ = proc.communicate(timeout=_TIMEOUT_S)
+    except BaseException:  # the timeout, or an interrupt that its own session never sees
+        _kill_residue_check(proc, repo)
+        raise
     if proc.returncode != 0:
         return [f"(the merge residue check failed: exit {proc.returncode})"]
-    out = proc.stdout.decode("utf-8", "surrogateescape")
+    out = stdout.decode("utf-8", "surrogateescape")
     return [rec for rec in out.split("\0") if rec]
+
+
+def _git_dir_of(repo: str) -> str | None:
+    """``repo``'s git directory without running git (a hung git is why we are
+    here): ``.git`` itself, or the directory a ``gitdir:`` file names."""
+    dot_git = os.path.join(repo, ".git")
+    if os.path.isdir(dot_git):
+        return dot_git
+    try:
+        with open(dot_git, encoding="utf-8") as fh:
+            line = fh.read().strip()
+    except (OSError, ValueError):
+        return None
+    if not line.startswith("gitdir:"):
+        return None
+    return os.path.join(repo, line.removeprefix("gitdir:").strip())
+
+
+def _kill_residue_check(proc: subprocess.Popen, repo: str) -> None:
+    """Kill a timed-out or interrupted residue check's group and remove its scratch index."""
+    if proc.pid > 1:  # its own group leader (start_new_session); killpg(1) is everything
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        # Before the reap: until then the pid cannot name another process's copy.
+        git_dir = _git_dir_of(repo)
+        if git_dir is not None:
+            for leftover in glob.glob(
+                os.path.join(glob.escape(git_dir), f"genesis-hidden-index.{proc.pid}.*")
+            ):
+                with contextlib.suppress(OSError):
+                    os.unlink(leftover)
+    # Bounded: SIGKILL stays pending in uninterruptible I/O, the failure the
+    # timeout contains; Popen reaps a process left this way when collected.
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.communicate(timeout=5)
 
 
 def _conflict_recorded(conflicts_path: str, deploy_head: str) -> bool:

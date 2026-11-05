@@ -91,7 +91,7 @@ class _GuardedAiosqliteConnector:
 
     def __init__(
         self, db_path: Path, kwargs: dict[str, Any], admission_path: Path | None = None,
-        *, existing_only: bool = False,
+        *, existing_only: bool = False, owned: bool = False,
     ) -> None:
         self._db_path = db_path
         # The caller's ORIGINAL spelling, kept for admission checks only, so
@@ -100,6 +100,7 @@ class _GuardedAiosqliteConnector:
         self._admission_path = admission_path if admission_path is not None else db_path
         self._kwargs = kwargs
         self._existing_only = existing_only
+        self._owned = owned
         self._connection: aiosqlite.Connection | None = None
         # Who asked for this connection, for a lock-holder snapshot; taken now,
         # while the requesting code is still on the stack.
@@ -115,13 +116,13 @@ class _GuardedAiosqliteConnector:
             self._db_path.as_uri() + "?mode=rw"
             if self._existing_only else str(self._db_path)
         )
-        connection = aiosqlite.connect(target, **self._kwargs)
+        connector = aiosqlite.connect(target, **self._kwargs)
         try:
-            await connection
+            connection = await connector
         except BaseException as open_error:
-            if self._existing_only:
+            if self._owned:
                 try:
-                    await drain_connection_worker(connection)
+                    await drain_connection_worker(connector)
                 except BaseException as drain_error:
                     open_error.add_note(f"worker drain failed: {drain_error!r}")
                     raise ConnectionCleanupError("Could not drain failed open") from open_error
@@ -133,11 +134,11 @@ class _GuardedAiosqliteConnector:
         except BaseException as open_error:
             try:
                 await connection.close()
-                if self._existing_only:
+                if self._owned:
                     await drain_connection_worker(connection)
             except BaseException as close_error:
                 open_error.add_note(f"connection cleanup failed: {close_error!r}")
-                if self._existing_only:
+                if self._owned:
                     raise ConnectionCleanupError("Could not close rejected connection") from open_error
             raise
         self._connection = connection
@@ -156,7 +157,11 @@ class _GuardedAiosqliteConnector:
 
 
 def connect_aiosqlite_rw(
-    path: str | Path = DEFAULT_DB_PATH, *, existing_only: bool = False, **kwargs: Any
+    path: str | Path = DEFAULT_DB_PATH,
+    *,
+    existing_only: bool = False,
+    owned: bool = False,
+    **kwargs: Any,
 ) -> _GuardedAiosqliteConnector:
     """Return an awaitable/context-manager guarded through actual DB open.
 
@@ -164,6 +169,10 @@ def connect_aiosqlite_rw(
     file URI in SQLite's ``mode=rw`` so a missing database cannot be created,
     while retaining the same pre/post-open quarantine checks. This option
     requires URI handling; explicitly disabling it is an error.
+
+    ``owned=True`` is for a caller that counts its connections: a failed open
+    joins the driver's worker before returning, and a failed cleanup raises
+    :class:`ConnectionCleanupError` so the caller keeps that capacity held.
     """
     from genesis.db.admission import assert_admitted
 
@@ -175,7 +184,7 @@ def connect_aiosqlite_rw(
     assert_admitted(admission_path)
     db_path = admission_path.resolve()
     return _GuardedAiosqliteConnector(
-        db_path, kwargs, admission_path=admission_path, existing_only=existing_only,
+        db_path, kwargs, admission_path=admission_path, existing_only=existing_only, owned=owned,
     )
 
 
@@ -743,7 +752,9 @@ async def get_db(
     deliberate, separate decision).
 
     ``existing_only`` refuses to create a missing database. ``reconnect=False``
-    keeps a unit of work on its original connection even after lock errors.
+    is for a caller that owns the connection's capacity: a unit of work stays on
+    its original connection even after lock errors, a failed open joins the
+    driver's worker, and a failed cleanup raises :class:`ConnectionCleanupError`.
     """
     path = Path(path)
     from genesis.db.admission import assert_admitted
@@ -770,8 +781,9 @@ async def get_db(
         await conn.execute(f"PRAGMA cache_size={CACHE_SIZE_KIB}")  # 256 MiB page cache
 
     db = (
-        await connect_aiosqlite_rw(path, existing_only=True)
-        if existing_only else await aiosqlite.connect(str(path))
+        await connect_aiosqlite_rw(path, existing_only=True, owned=not reconnect)
+        if existing_only
+        else await aiosqlite.connect(str(path))
     )
     try:
         await _configure(db)
@@ -782,13 +794,18 @@ async def get_db(
                 await drain_connection_worker(db)
         except BaseException as close_error:
             open_error.add_note(f"connection cleanup failed: {close_error!r}")
-            raise ConnectionCleanupError("Could not close unconfigured connection") from open_error
+            if not reconnect:
+                raise ConnectionCleanupError("Could not close unconfigured connection") from open_error
         raise
 
     # Build reconnect closure (SQLite-specific; replace for PostgreSQL)
     async def _reconnect() -> aiosqlite.Connection:
         assert_admitted(path)
-        conn = await aiosqlite.connect(str(path))
+        conn = (
+            await connect_aiosqlite_rw(path, existing_only=True)
+            if existing_only
+            else await aiosqlite.connect(str(path))
+        )
         await _configure(conn)
         return conn
 

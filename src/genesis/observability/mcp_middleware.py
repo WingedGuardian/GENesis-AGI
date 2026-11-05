@@ -14,7 +14,9 @@ import time
 from typing import Any
 
 from fastmcp.exceptions import ToolError
+from fastmcp.exceptions import ValidationError as ToolValidationError
 from fastmcp.server.middleware import Middleware
+from pydantic import ValidationError as PydanticValidationError
 
 from genesis.db.request_database import RequestDatabase
 from genesis.observability.commit_identity import is_stale
@@ -39,6 +41,10 @@ def install_instrumentation(server, tracker, server_name: str, db) -> None:
     ]
     if not isinstance(db, RequestDatabase) and tracker is None:
         return
+    # External read-only instrumentation already declines legacy transaction
+    # finalization. Scoped unit ownership remains mandatory even without metrics.
+    if not isinstance(db, RequestDatabase) and not getattr(tracker, "persist_activity", True):
+        db = None
     server.add_middleware(InstrumentationMiddleware(tracker, server_name, db=db))
 
 # Staleness verdict (`is_stale`) + the prefix-tolerant compare (`same_commit`) live
@@ -77,8 +83,8 @@ class InstrumentationMiddleware(Middleware):
 
     Most writes already commit at the CRUD layer before the tool returns, so the
     commit here only flushes a write the tool left uncommitted (it can never
-    discard a tool's own write); any non-clean exit — a raised ``Exception``, or a ``BaseException`` no
-    clause catches (``asyncio.CancelledError``, ``SystemExit``, …) — rolls back the
+    discard a tool's own write); any non-clean exit — a raised ``Exception``,
+    or a ``BaseException`` no clause catches (``asyncio.CancelledError``, ``SystemExit``, …) — rolls back the
     possibly-partial write instead of committing it, but only when no other call
     is in flight on the shared connection (a rollback then would discard a
     concurrent call's uncommitted write; see ``on_call_tool``). The boundary swallows
@@ -174,8 +180,14 @@ class InstrumentationMiddleware(Middleware):
             # slightly wrong explanation on a call that was refused regardless.
             hint = None
             try:
+                # v4 wraps binding errors in its own ValidationError. Keep the
+                # structured Pydantic error for the diagnosis; never unwrap a
+                # body exception or infer missing names from rendered prose.
+                diagnosis_error = exc
+                if isinstance(exc, ToolValidationError) and isinstance(exc.__cause__, PydanticValidationError):
+                    diagnosis_error = exc.__cause__
                 hint = absorbed_parameter_hint(
-                    exc,
+                    diagnosis_error,
                     getattr(context.message, "arguments", None) or {},
                     tool_name,
                 )

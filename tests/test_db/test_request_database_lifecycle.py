@@ -12,7 +12,7 @@ import anyio
 import pytest
 
 from genesis.db import request_database
-from genesis.db.connection import ConnectionCleanupError, get_db
+from genesis.db.connection import ConnectionCleanupError, drain_connection_worker, get_db
 from genesis.db.request_database import DatabaseScopeError, RequestDatabase
 
 pytestmark = pytest.mark.asyncio
@@ -231,6 +231,182 @@ async def test_failed_partial_open_does_not_claim_capacity_recovered(tmp_path, m
             pass
     with pytest.raises(DatabaseScopeError, match="unconfirmed"):
         await manager.close()
+
+
+async def test_owner_closing_after_its_unit_does_not_deadlock_shutdown(db):
+    entered = asyncio.Event()
+
+    async def owner():
+        try:
+            async with db.unit_of_work():
+                entered.set()
+                await asyncio.Event().wait()
+        finally:
+            await db.close()
+
+    task = asyncio.create_task(owner())
+    await entered.wait()
+    closer = asyncio.create_task(db.close())
+    done, _pending = await asyncio.wait({task, closer}, timeout=10)
+    if len(done) != 2:
+        db._close_task.cancel()  # break the cycle before asserting
+    assert done == {task, closer}
+    assert task.cancelled()
+    assert closer.exception() is None
+
+
+async def test_reconnect_never_creates_a_missing_existing_only_database(tmp_path):
+    path = tmp_path / "scratch.db"
+    sqlite3.connect(path).close()
+    conn = await get_db(path, existing_only=True)
+    try:
+        path.unlink()
+        with pytest.raises(sqlite3.OperationalError):
+            await conn._reconnect_fn()
+        assert not path.exists()
+    finally:
+        await conn.close()
+
+
+async def test_only_an_owned_open_joins_the_worker_on_failure(
+    tmp_path, monkeypatch
+):
+    from genesis.db import connection
+
+    path = tmp_path / "scratch.db"
+    sqlite3.connect(path).close()
+    joined = []
+
+    async def record(conn):
+        joined.append(conn)
+
+    monkeypatch.setattr(connection, "drain_connection_worker", record)
+    with pytest.raises(sqlite3.OperationalError):
+        await connection.connect_aiosqlite_rw(tmp_path / "absent.db", existing_only=True)
+    assert joined == []
+    with pytest.raises(sqlite3.OperationalError):
+        await connection.connect_aiosqlite_rw(
+            tmp_path / "absent.db", existing_only=True, owned=True
+        )
+    assert len(joined) == 1
+    with pytest.raises(sqlite3.OperationalError):
+        await get_db(tmp_path / "absent.db", existing_only=True)
+    assert len(joined) == 1
+    with pytest.raises(sqlite3.OperationalError):
+        await get_db(tmp_path / "absent.db", existing_only=True, reconnect=False)
+    assert len(joined) == 2
+
+
+@pytest.fixture
+def unconfigurable(tmp_path):
+    path = tmp_path / "garbage.db"
+    path.write_bytes(b"not a database, long enough to be read as a header" * 40)
+    return path
+
+
+async def test_a_failed_configure_joins_the_worker_only_when_owned(unconfigurable, monkeypatch):
+    from genesis.db import connection
+
+    joined = []
+    real = connection.drain_connection_worker
+
+    async def record(conn):
+        joined.append(conn)
+        await real(conn)
+
+    monkeypatch.setattr(connection, "drain_connection_worker", record)
+    with pytest.raises(sqlite3.DatabaseError):
+        await get_db(unconfigurable)
+    assert joined == []
+    with pytest.raises(sqlite3.DatabaseError):
+        await get_db(unconfigurable, existing_only=True, reconnect=False)
+    assert len(joined) == 1
+
+
+async def test_a_default_open_keeps_its_own_error_when_cleanup_also_fails(
+    unconfigurable, monkeypatch
+):
+    real_close = aiosqlite.Connection.close
+
+    async def close_then_fail(self):
+        await real_close(self)
+        raise RuntimeError("close failed")
+
+    monkeypatch.setattr(aiosqlite.Connection, "close", close_then_fail)
+    with pytest.raises(sqlite3.DatabaseError) as raised:
+        await get_db(unconfigurable)
+    assert any("close failed" in note for note in raised.value.__notes__)
+    with pytest.raises(ConnectionCleanupError):
+        await get_db(unconfigurable, existing_only=True, reconnect=False)
+
+
+async def test_cancelling_a_default_open_stays_a_cancellation(tmp_path, monkeypatch):
+    path = tmp_path / "scratch.db"
+    sqlite3.connect(path).close()
+    real_execute = aiosqlite.Connection.execute
+
+    opened = []
+
+    def cancel_first_pragma(self, sql, *args, **kwargs):
+        opened.append(self)
+        scope.cancel()
+        return real_execute(self, sql, *args, **kwargs)
+
+    monkeypatch.setattr(aiosqlite.Connection, "execute", cancel_first_pragma)
+    with anyio.CancelScope() as scope:
+        await get_db(path)
+    assert scope.cancelled_caught
+    # The cancelled cleanup queued its stop without waiting, so join the worker here.
+    await drain_connection_worker(opened[0])
+
+
+async def test_an_abandoned_unit_fails_shutdown_and_can_still_be_closed(tmp_path):
+    path = tmp_path / "scratch.db"
+    sqlite3.connect(path).close()
+    manager = RequestDatabase(path, max_units=1)
+    unit = manager.unit_of_work()
+
+    async def enter_and_finish():
+        await unit.__aenter__()
+
+    await asyncio.create_task(enter_and_finish())
+    with pytest.raises(DatabaseScopeError, match="unconfirmed"):
+        await asyncio.wait_for(manager.close(), 10)
+    await unit.__aexit__(None, None, None)  # from another task: cleanup still runs
+    assert not manager._owners
+    assert manager._slots._value == 1
+    await asyncio.wait_for(manager.close(), 10)  # a retry looks again, and succeeds
+
+
+async def test_close_can_be_bounded_while_an_owner_swallows_cancellation(tmp_path):
+    path = tmp_path / "scratch.db"
+    sqlite3.connect(path).close()
+    manager = RequestDatabase(path, max_units=1)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def stubborn():
+        async with manager.unit_of_work():
+            entered.set()
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+
+    owner = asyncio.create_task(stubborn())
+    await entered.wait()
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(manager.close(), 0.2)
+    release.set()
+    await owner
+    await asyncio.wait_for(manager.close(), 10)
+    assert manager._slots._value == 1
+
+
+async def test_the_manager_resolves_its_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert RequestDatabase("~/x.db", max_units=1).path == (tmp_path / "x.db").resolve()
 
 
 async def test_missing_database_never_created(tmp_path):

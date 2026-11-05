@@ -158,6 +158,32 @@ def _visible_text(inline) -> str:
     )
 
 
+#: The tokens parsed while a ``reuse_parses()`` block is open, keyed by the exact
+#: text parsed; None (the default) keeps nothing.
+_REUSED: dict[str, list] | None = None
+
+
+@contextlib.contextmanager
+def reuse_parses():
+    """Parse each distinct text once inside this block, not once per reader.
+
+    ``premise_gate.owed_message`` reaches ``_blocks`` four times for one body
+    (strip, then read, twice over), and markdown-it is super-linear on hostile
+    input, so a caller with a time budget wraps the call in this. What is parsed,
+    and how, does not change: each call still gets fresh ``lines``; the tokens are
+    shared, which is safe because no reader here mutates them. Outside the block
+    nothing is kept, so the server gate and the plan hooks behave as before.
+    """
+    global _REUSED  # noqa: PLW0603
+    outer = _REUSED
+    if outer is None:
+        _REUSED = {}
+    try:
+        yield
+    finally:
+        _REUSED = outer
+
+
 def _blocks(text: str):
     """``(lines, offset, tokens)`` for ``text``, or None without a parser.
 
@@ -170,7 +196,13 @@ def _blocks(text: str):
         return None
     lines = text.replace("\r\n", "\n").split("\n")
     offset = _frontmatter_end(lines)
-    return lines, offset, md.parse("\n".join(lines[offset:]))
+    source = "\n".join(lines[offset:])
+    reused = _REUSED
+    if reused is None:
+        return lines, offset, md.parse(source)
+    if source not in reused:
+        reused[source] = md.parse(source)
+    return lines, offset, reused[source]
 
 
 def strip_quoted(text: str) -> str:
@@ -196,15 +228,16 @@ def strip_quoted(text: str) -> str:
 #: says "Premise checks".
 _PREMISE_TITLE = re.compile(r"premise\s+(?:checks?|questions?)\b", re.IGNORECASE)
 #: The line-rule fallback, used only without a parser.
-_PREMISE_HEADING_LINE = re.compile(r"^#{1,6}[ \t]+premise[ \t]+(?:checks?|questions?)\b", re.IGNORECASE)
 _ANY_HEADING_LINE = re.compile(r"^#{1,6}[ \t]")
 _ANSWER_LINE = re.compile(r"^ {0,3}([1-9])[.)](?:[ \t]+(.*))?$")
 
 
-def premise_answers(text: str) -> dict[int, str] | None:
+def premise_answers(text: str, title: re.Pattern[str] = _PREMISE_TITLE) -> dict[int, str] | None:
     """The numbered answers under a plan's premise heading, or None without one.
 
-    ``text`` is read as given; callers pass the live, quote-stripped section, so a
+    ``title`` matches the section heading's rendered text; it defaults to the
+    premise section, and the issue gate passes its bug-report "Verification"
+    title to read that section by the same rules. ``text`` is read as given; callers pass the live, quote-stripped section, so a
     heading shown inside an example does not count. Read AS IT RENDERS, like the
     rest of this module: the section runs from the first heading titled "Premise
     check(s)" or "Premise question(s)" to the next heading of the same or a higher
@@ -225,12 +258,12 @@ def premise_answers(text: str) -> dict[int, str] | None:
     """
     parsed = _blocks(text)
     if parsed is None:
-        return _premise_answers_by_line(text)
+        return _premise_answers_by_line(text, title)
     _, _, tokens = parsed
     start = depth = None
     for i, tok in enumerate(tokens):
-        title = _visible_text(tokens[i + 1]).strip() if i + 1 < len(tokens) else ""
-        if tok.type == "heading_open" and tok.level == 0 and _PREMISE_TITLE.match(title):
+        heading = _visible_text(tokens[i + 1]).strip() if i + 1 < len(tokens) else ""
+        if tok.type == "heading_open" and tok.level == 0 and title.match(heading):
             start, depth = i + 1, int(tok.tag[1:])
             break
     if start is None:
@@ -270,10 +303,11 @@ def _rendered_text(inline) -> str:
     return "".join(out).strip()
 
 
-def _premise_answers_by_line(text: str) -> dict[int, str] | None:
+def _premise_answers_by_line(text: str, title: re.Pattern[str] = _PREMISE_TITLE) -> dict[int, str] | None:
     """``premise_answers`` without a parser: line rules, so the check still runs."""
     lines = text.split("\n")
-    start = next((i for i, line in enumerate(lines) if _PREMISE_HEADING_LINE.match(line)), None)
+    heading = re.compile(rf"^#{{1,6}}[ \t]+(?:{title.pattern})", title.flags)
+    start = next((i for i, line in enumerate(lines) if heading.match(line)), None)
     if start is None:
         return None
     answers: dict[int, str] = {}
