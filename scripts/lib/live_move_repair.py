@@ -613,9 +613,9 @@ class Repair:
         else:
             print(msg, flush=True)
 
-    def run(self, restore: str | None = None) -> int:
+    def run(self, restore: str | None = None, write: bool = False) -> int:
         try:
-            return self._check_restore(restore) if restore is not None else self._run()
+            return self._restore(restore, write) if restore is not None else self._run()
         finally:
             for fd in self._fds:
                 os.close(fd)
@@ -661,26 +661,29 @@ class Repair:
             _sleep(_POLL_S)
         return locks
 
-    def _check_restore(self, ts: str) -> int:
-        """--restore TS --check, under the repair's own locks in its order (a
-        short wait): what a restore of that report would write, judged now;
-        writes nothing."""
+    def _restore(self, ts: str, write: bool) -> int:
+        """--restore TS [--check], under the repair's own locks in its order (a
+        short wait); never while the guard calls the checkout half-written or
+        its update unfinished (MIXED_TREE, GUARDS: review LOW-1). --check
+        judges what a restore would write and writes nothing; without it the
+        restore writes (live_move_restore.restore)."""
+        nothing = "nothing was written" if write else "nothing was judged"
         deadline = _now() + self.wait
         if self._hold(self._update_lock(), deadline) is None:
-            self._say(
-                "update.lock is still held after the wait (an update runs); nothing was judged"
-            )
+            pid = (_load(self.state_path) or {}).get("pid")
+            who = f"; the update state names pid {pid}" if isinstance(pid, int) else ""
+            self._say(f"update.lock is still held after the wait (an update runs{who}); {nothing}")
             return 1
         if self._checkout_locks(deadline) is None:
             return 1
         verdict, reason = self.guard.verdict(self.state_path, self.repo)
-        if verdict == self.guard.MIXED_TREE:
-            self._say(
-                f"the checkout is half-written ({reason}); repair it first, nothing was judged"
-            )
+        if verdict in (self.guard.MIXED_TREE, self.guard.GUARDS):
+            what = "half-written" if verdict == self.guard.MIXED_TREE else "mid-update"
+            self._say(f"the checkout is {what} ({reason}); repair or finish it first, {nothing}")
             return 1
         kit = _load_kit("live_move_restore.py")
-        return kit.check(types.SimpleNamespace(**globals()), self.repo, self.home, ts, self._say)
+        act = kit.restore if write else kit.check
+        return act(types.SimpleNamespace(**globals()), self.repo, self.home, ts, self._say)
 
     def _judge_state(self, index_lock: str) -> int:
         with open(self.state_path, "rb") as fh:
@@ -931,7 +934,9 @@ class Repair:
         a gc would then delete them), and the new directory's entries up to
         the Genesis home."""
         for older, m in manifests(self.backups):
-            if m.get("result") is None and os.path.dirname(older) != backup:
+            # A report a restore holds in flight is never superseded (B2b §7).
+            flying = isinstance(m.get("restore"), dict) and m["restore"].get("inflight")
+            if m.get("result") is None and not flying and os.path.dirname(older) != backup:
                 write_json(older, {**m, "result": "superseded"}, private=True)  # killed partway
         # A directory row is copied whole; a row inside it is saved by that copy.
         whole = {r["path"] for r in manifest["paths"] if r["disk"] == "dir" and r["disk_changed"]}
@@ -1226,19 +1231,20 @@ def main(argv: list[str]) -> int:
     if ts is not None and report_ts(ts + SUFFIX) != ts:  # #3733: never a path from an unchecked ts
         _log(f"{ts!r} is not a repair report's ts")
         return 2
-    if args.restore is not None and not args.check:
-        _log("restoring is not available yet; --restore TS --check judges what it would restore")
-        return 2
     repo = os.path.abspath(args.repo)
     if args.dismiss is not None:  # REPAIR.json's readers stop reporting a dismissed repair's saves
         return _dismiss(args.state, repo, args.dismiss, 30 if args.wait is None else args.wait)
     wait = args.wait if args.wait is not None else 30 if args.restore is not None else 7200
     try:
-        return Repair(args.state, repo, args.boot, wait).run(args.restore)
+        return Repair(args.state, repo, args.boot, wait).run(args.restore, not args.check)
     except Exception as exc:  # noqa: BLE001 - every failure is named; at boot it sets the exit
         if args.boot and not _changed:  # a failed backup changed nothing in the checkout
             _log(f"skipped; nothing was changed ({type(exc).__name__}: {exc})")
             return 0
+        if args.restore is not None and not args.check:
+            _log(f"the restore failed ({type(exc).__name__}: {exc}); REPAIR.json's `restore`"
+                 " block names any part in flight, and a re-run finishes it")  # fmt: skip
+            return 1
         _log(f"failed ({type(exc).__name__}: {exc}); the update state is kept")
         return 1
 

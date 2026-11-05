@@ -1854,7 +1854,8 @@ def _deploy_repair_identity(repairs: dict) -> str:
     report inside the cooldown is another alert, never the standing one."""
     named = {
         "reports": [
-            [r.get("ts"), r.get("saved"), r.get("dismissed"), r.get("unresolved")]
+            [r.get("ts"), r.get("saved"), r.get("dismissed"), r.get("unresolved"),
+             r.get("restore_refused")]
             for r in repairs.get("reports") or []
             if isinstance(r, dict)
         ],
@@ -1862,6 +1863,19 @@ def _deploy_repair_identity(repairs: dict) -> str:
         "unread_older": repairs.get("unread_older"),
     }
     return hashlib.sha256(json.dumps(named, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _deploy_restore_refused(r: dict) -> str:
+    """The sentence for a report whose last restore refused parts (#3492 B2b)."""
+    n = r.get("restore_refused")
+    if type(n) is not int or n <= 0:
+        return ""
+    return (
+        f" Its last restore refused {n} part(s): its output names each, and where any newer "
+        "content it found was kept; a part it can never write (a socket, a file too large to "
+        f"hash, one with no record) goes back by hand from {r['backup_dir']}/tree, then "
+        f"--dismiss {r['ts']}."
+    )
 
 
 def _deploy_repair_paragraph(repairs: dict) -> str:
@@ -1878,18 +1892,21 @@ def _deploy_repair_paragraph(repairs: dict) -> str:
             f"Repair {r['ts']}: {r['saved']} path(s) the update did not write were recorded "
             f"(their files, index entries or flags are in {r['backup_dir']}). To put them back: "
             f"scripts/deploy_candidates repair-move --restore {r['ts']} (once both the installed "
-            "repair kit and scripts/deploy_candidates include --restore); to keep the checkout "
-            f"as it is: scripts/deploy_candidates repair-move --dismiss {r['ts']}."
+            "repair kit and scripts/deploy_candidates include --restore; an exit 2 saying "
+            "restoring is not available yet means the installed kit is older than that); to "
+            f"keep the checkout as it is: scripts/deploy_candidates repair-move --dismiss {r['ts']}."
+            + _deploy_restore_refused(r)
             for r in shown
         ]
         parts.append(
             "A repair of a half-written `live` checkout, moving it back to its rollback "
             "tag, saved what it found there that was not the update's (someone's edits). "
             + " ".join(each)
-            + " Restoring puts the saved files back as uncommitted edits, so "
+            + " Restoring puts the saved files back as uncommitted edits: tracked ones make "
             "deploy_code_only.sh and update.sh refuse to deploy until they are committed "
-            "(on a branch, as a PR), moved out, or removed. Backups are pruned 90 days "
-            "after the last write to their folder."
+            "(on a branch, as a PR), moved out, or removed; untracked ones block "
+            "deploy_code_only.sh only under src/, config/ or pyproject.toml. Backups are "
+            "pruned 90 days after the last write to their folder."
         )
     refused = repairs.get("refused") or 0
     if refused:

@@ -6,8 +6,8 @@ Every case is a REAL repair in the scratch world (tests/test_scripts/
 _live_repair_world.py), judged afterwards. A part is `as-left` (the path holds
 what the repair left: the tag's), `already-restored` (it holds what the repair
 saved) or `other:<reason>`; only a run where every part is one of the first two
-exits 0. Restoring "by hand" below runs the test oracle's re-apply steps
-(_live_repair_world.reapply_step, the writer's old shell steps, #3868).
+exits 0. Restoring below runs the real restore (`--restore TS`, #3492 B2b;
+its own suite is test_live_move_restore_write.py).
 """
 
 from __future__ import annotations
@@ -46,10 +46,9 @@ from tests.test_scripts._live_repair_world import (
     _git,
     _hash,
     _lock_aside,
-    _run_steps,
     age_locks,
     killed_tag_side,
-    reapply_steps,
+    restore_all,
 )
 
 pytestmark = pytest.mark.skipif(sys.platform.startswith("win"), reason="git + bash")
@@ -138,16 +137,16 @@ def _newer_dir(w, ts: str) -> Path:
 
 
 @pytest.mark.parametrize("make", KINDS)
-def test_a_fresh_repair_is_as_left_then_already_restored_by_hand(w, make):
+def test_a_fresh_repair_is_as_left_then_already_restored(w, make):
     """Right after the repair every foreign part holds what the repair left;
-    once the writer's own steps put the saved state back, every part holds
-    what was saved."""
+    once the restore puts the saved state back, every part holds what was
+    saved."""
     ts = _repaired(w, make)
     r = _check(w, ts)
     parts = _parts(r)
     assert r.returncode == 0, r.stdout + r.stderr
     assert parts and set(parts.values()) == {"as-left"}, parts
-    _run_steps(w)
+    restore_all(w)
     r = _check(w, ts)
     parts = _parts(r)
     assert r.returncode == 0, r.stdout + r.stderr
@@ -449,15 +448,6 @@ def test_dismiss_reads_through_the_loader(w):
     assert r.returncode == 1 and json.loads(path.read_text())["dismissed_at"] is None
 
 
-def test_restore_without_check_is_not_available_yet(w):
-    ts = _repaired(w, _foreign_edit)
-    r = subprocess.run(
-        ["python3", "-I", "-S", str(MODULE), "--restore", ts, str(w.state), str(w.root)],
-        capture_output=True, text=True, env=w.env(),
-    )  # fmt: skip
-    assert r.returncode == 2 and "not available yet" in r.stderr, r.stderr
-
-
 def test_an_unreadable_tag_refuses_the_whole_report(w):
     ts = _repaired(w, _foreign_edit)
     _edit_report(w, lambda m: m.update(tag="f" * 40))
@@ -611,26 +601,33 @@ def _ancestor_file_child_edit(w):
 )
 def test_a_parent_this_report_restored_does_not_refuse_its_own_child(w, make, child, blocked):
     """Review SF4 (MEASURED with the real writer): a report holds a parent and
-    a child that both need a write, and once the parent is back (the writer's
-    own steps run parents first) the parent itself is a non-directory or an
-    index entry above the child. A restore killed between the two must still
-    converge: that parent does not refuse this report's own child."""
+    a child that both need a write, and once the parent is back (put back by
+    hand here, parent first) the parent itself is a non-directory or an index
+    entry above the child. A restore stopped between the two must still
+    converge: that parent does not refuse this report's own child, and the
+    real restore then finishes."""
     ts = _repaired(w, make)
     report = w.report()
     assert sorted(r["path"] for r in report["paths"] if r["class"] == "foreign")[:2] == [
         "sub",
         "sub/s1",
     ], "control: the report holds the parent and the child"
-    first, *rest = reapply_steps(w)  # the parent's step: parents first
-    subprocess.run(["bash", "-c", first], check=True, capture_output=True, env=w.env())
+    parent = next(r for r in report["paths"] if r["path"] == "sub")
+    if make is _staged_child_type_change:  # the parent's node: the file `sub`
+        shutil.rmtree(w.root / "sub")
+        shutil.copy2(w.backups()[-1] / parent["saved_as"], w.root / "sub")
+        (w.root / "sub").chmod(0o644)
+    else:  # the parent's index entry: the file `sub` over sub/
+        _git(w.root, "update-index", "--force-remove", "sub/s1", "sub/t")
+        mode, oid, _ = parent["index"][0]
+        _git(w.root, "update-index", "--add", "--cacheinfo", f"{mode},{oid},sub")
     r = _check(w, ts)
     parts = _parts(r)
     assert parts[("sub", "node" if make is _staged_child_type_change else "index")] == (
         "already-restored"
     ), parts
     assert parts[child] == "as-left", f"{child} would read {blocked} forever: {parts}"
-    for step in rest:
-        subprocess.run(["bash", "-c", step], check=True, capture_output=True, env=w.env())
+    restore_all(w)
     r = _check(w, ts)
     assert r.returncode == 0 and set(_parts(r).values()) == {"already-restored"}, r.stdout
 
