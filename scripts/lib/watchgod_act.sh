@@ -4,7 +4,10 @@
 # paused is confirmed stopped. Detection, and the decision to call this, live in
 # scripts/lib/watchgod_runaway.sh (wg_runaway_check); this file only acts.
 # Sourced after watchgod_signal.sh, watchgod_records.sh and
-# watchgod_runaway.sh. Pure functions; nothing runs at source time.
+# watchgod_runaway.sh. Pure functions; at source time it only loads gnu_timeout.sh.
+
+# shellcheck source=scripts/lib/gnu_timeout.sh
+. "$(dirname "${BASH_SOURCE[0]}")/gnu_timeout.sh"
 
 # A command the guardian paused and nobody resumed is paged again every this
 # many hours while it stays paused: nothing resumes it on its own, and a
