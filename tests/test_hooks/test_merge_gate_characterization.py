@@ -404,6 +404,22 @@ _CASES: list[tuple[str, object, int, str]] = [
         "CI is RED",
     ),
     (
+        # Each sigil waives its own gate. Found by the defect corpus: nothing failed
+        # when `# review-override` also waived a red CI.
+        "ci_red_with_review_override_still_blocks",
+        lambda mp: _run(mp, _merge_cmd(trailer="# review-override"), ci=_ci("FAILURE")),
+        2,
+        "CI is RED",
+    ),
+    (
+        # Found by the defect corpus too: this rung did not notice a conclusion
+        # GitHub adds later reading as green.
+        "ci_unrecognized_conclusion_blocks",
+        lambda mp: _run(mp, _merge_cmd(), ci=_ci("SOME_FUTURE_CONCLUSION")),
+        2,
+        "CI is RED",
+    ),
+    (
         "ci_red_with_ci_override_continues",
         lambda mp: _run(mp, _merge_cmd(trailer="# ci-override"), ci=_ci("FAILURE")),
         0,
