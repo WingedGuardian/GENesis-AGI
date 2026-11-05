@@ -17,6 +17,25 @@ from tests.test_scripts.codex_validator_git import fixture_git_environment
 
 ROOT = Path(__file__).resolve().parents[2]
 
+_IMPORT_PROBE = """
+import json, os, runpy, subprocess, sys
+from pathlib import Path
+root = Path(sys.argv[1]).resolve()
+tracked = {os.fsdecode(path) for path in subprocess.check_output([
+    'git', '--no-replace-objects', '-c', 'core.fsmonitor=false', '-C', str(root),
+    'ls-files', '--cached', '-z',
+]).split(bytes([0])) if path}
+runpy.run_path(str(root / 'scripts/codex_validator_launcher.py'), run_name='owned_import_probe')
+paths = set()
+for module in tuple(sys.modules.values()):
+    filename = getattr(module, '__file__', None)
+    if filename and Path(filename).resolve().is_relative_to(root):
+        relative = Path(filename).resolve().relative_to(root).as_posix()
+        if relative in tracked:
+            paths.add(relative)
+print(json.dumps(sorted(paths)))
+"""
+
 
 @pytest.mark.parametrize("sibling", ["codex_external_mcp", "codex_validator_adapter"])
 def test_launcher_sibling_import_failure_stops_before_startup(tmp_path, sibling):
@@ -52,20 +71,8 @@ def launcher(monkeypatch):
 
 def test_imported_repository_sources_are_qualified(launcher):
     # A fresh process excludes pytest's unrelated imports from this inventory.
-    script = """
-import json, runpy, sys
-from pathlib import Path
-root = Path(sys.argv[1]).resolve()
-runpy.run_path(str(root / 'scripts/codex_validator_launcher.py'), run_name='owned_import_probe')
-paths = set()
-for module in tuple(sys.modules.values()):
-    filename = getattr(module, '__file__', None)
-    if filename and Path(filename).resolve().is_relative_to(root):
-        paths.add(Path(filename).resolve().relative_to(root).as_posix())
-print(json.dumps(sorted(paths)))
-"""
     result = subprocess.run(
-        [sys.executable, "-c", script, str(ROOT)],
+        [sys.executable, "-c", _IMPORT_PROBE, str(ROOT)],
         cwd=ROOT, env=fixture_git_environment(), capture_output=True, text=True,
         check=True, timeout=30,
     )
@@ -76,6 +83,34 @@ print(json.dumps(sorted(paths)))
         and not any(path.startswith(tree + "/") for tree in launcher.HOOK_TREES)
     }
     assert not uncovered, sorted(uncovered)
+
+
+@pytest.mark.parametrize("layout", ["inside-untracked", "outside", "inside-tracked"])
+def test_import_probe_respects_repository_ownership(tmp_path, layout):
+    root = tmp_path / "repository"
+    (root / "scripts").mkdir(parents=True)
+    (root / "src").mkdir()
+    dependency = (tmp_path / "installed" if layout == "outside" else
+                  root / ("vendor" if layout == "inside-tracked" else ".venv/lib/site-packages"))
+    dependency.mkdir(parents=True)
+    (root / "src/owned_firstparty.py").write_text("VALUE = 1\n")
+    (dependency / "owned_foreign.py").write_text("VALUE = 2\n")
+    (root / "scripts/codex_validator_launcher.py").write_text(
+        "import sys\n" + f"sys.path[:0] = {[str(root / 'src'), str(dependency)]!r}\n"
+        "import owned_firstparty, owned_foreign\n"
+    )
+    env = fixture_git_environment()
+    subprocess.run(["git", "init", "-q", str(root)], env=env, check=True)
+    paths = ["scripts", "src"] + (["vendor"] if layout == "inside-tracked" else [])
+    subprocess.run(["git", "-C", str(root), "add", *paths], env=env, check=True)
+    result = subprocess.run(
+        [sys.executable, "-c", _IMPORT_PROBE, str(root)],
+        env=env, capture_output=True, text=True, check=True, timeout=30,
+    )
+    expected = ["src/owned_firstparty.py"]
+    if layout == "inside-tracked":
+        expected.append("vendor/owned_foreign.py")
+    assert json.loads(result.stdout) == expected
 
 
 def test_generated_profile_is_role_scoped_and_project_untrusted(launcher, tmp_path):
