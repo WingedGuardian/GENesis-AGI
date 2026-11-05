@@ -597,7 +597,18 @@ esac
 
 # Physical path (-P): the single-flight lock is keyed on this, and a symlinked
 # spelling of the same repo must not get a second lock (= second concurrent index).
-REPO_PATH="$(unset CDPATH; cd "$REPO_PATH" && pwd -P)"
+# A bare "-" is a directory name here, not cd's $OLDPWD shorthand.
+[ "$REPO_PATH" = - ] && REPO_PATH=./-
+if ! _repo_physical="$(unset CDPATH; cd -P -- "$REPO_PATH" && printf '%s.' "$PWD")"; then
+    _log "ERROR: cannot resolve physical repository path"
+    exit 1
+fi
+# A non-newline sentinel preserves legal trailing newlines through substitution.
+REPO_PATH="${_repo_physical%.}"
+# Match Linux/Python's single-root spelling before choosing a lock.
+while [[ "$REPO_PATH" == //* ]]; do
+    REPO_PATH="${REPO_PATH#/}"
+done
 
 # ── 1. Worktree skip ────────────────────────────────────────────────────
 # In a linked worktree, <root>/.git is a FILE (gitdir pointer), not a dir.

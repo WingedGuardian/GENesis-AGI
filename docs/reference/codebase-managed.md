@@ -480,13 +480,15 @@ a readiness value is manually changed. There is no setter or environment bypass.
 `python3 scripts/lib/index_marker.py automatic-ready` is read-only and returns
 the dedicated status 10 for an incomplete protocol or status 2 for an
 observation error. Queue-operation exceptions raised from `main()` also return
-2. Status 10 is reserved so that an interpreter crash (status 1) is never
+2; a busy queue makes `automatic-ready` return 75, which the runner logs as a
+busy tick and exits 0. Status 10 is reserved so that an interpreter crash (status 1) is never
 mistaken for the expected pause; the runner treats any other status as a
 failure. The runner discards the observer's JSON, so read the current state
 with `python3 scripts/lib/index_marker.py automatic-ready`. `import-status`
 lists receipts for schemas 2 and 3 and refuses a newer schema. The checked
-consumer and resource-failure safeguards must land before automatic work can
-resume; that readiness does not authorize lifting a freeze or disable sentinel.
+consumer is prepared behind this fence; native evidence and durable
+resource-failure quarantine must complete before automatic work can resume.
+That readiness does not authorize lifting a freeze or disable sentinel.
 
 No ordinary command converts an existing queue. Converting on connect is unsafe
 across code rollbacks: a failed update restores older code but not the queue,
@@ -509,9 +511,47 @@ object. Settlement commands require that whole object as `--context`, including
 canonical repository, hash, provider, protocol, execution sequence and nonce.
 JSON preserves whitespace and Unicode paths; duplicate context fields are
 rejected. An ordinary no-eligible claim returns 1. Queue-operation exceptions
-raised from `main()` return 2 with diagnostics. Earlier startup failures remain
-visible and can still return 1; the later checked consumer must require a closed
-machine acknowledgement before accepting empty eligibility. No hash-only settlement alias selects a new provider claim.
+raised from `main()` return 2 with diagnostics; a busy queue returns 75. At readiness,
+reconciliation, listing, claim and escalation the runner logs a busy queue and
+exits 0, as for an overlapping tick, so routine contention never fails the unit. Earlier startup failures remain
+visible and can still return 1. The checked consumer requires a complete matching
+machine acknowledgement before accepting no eligibility. No hash-only settlement alias selects a new provider claim.
+
+`list-legs`, `claim` and `should-escalate` also accept `--nul`. Every machine
+field ends in NUL, preserving literal whitespace and trailing newlines. Lists
+contain six-field `1,pending,hash,repo,provider,age` records; claims contain
+seven-field `1,claim,hash,repo,provider,mode,context_json` records. No eligibility
+is a four-field `1,unclaimed,hash,provider` record with status 1. Escalation is
+`1,escalation,hash,0|1` with status 0 for either answer. Wire version 1 is
+independent of queue schema 3 and claim protocol 2. Other interfaces are unchanged.
+Listed and claimed repository spellings are validated as stored, never
+re-resolved against the live filesystem, so a queued repository that later moves
+(or gains a symlink) cannot stop the list. A request spooled while the queue was
+busy is still resolved when it is imported.
+
+The consumer checks actual child status, framing and every listed row before
+claiming anything. It dispatches only the claimed provider, using that claim's
+mode and opaque context, and rechecks Codebase disablement after claiming.
+GitNexus full requests do not change Codebase full-index clocks. A malformed
+or failed queue observation stops the tick with 76. The headerless list trusts
+the same-install producer to include the complete population; it cannot detect
+a successful response shortened exactly at a record boundary.
+
+The entrypoint and freeze use the same checked physical repository path before
+lock hashing, including trailing newlines and relative leading-dash spellings.
+Failed resolution stops before taking a repository lock; the freeze's default
+repository selection follows the same normalization.
+Leading slash aliases also collapse to the queue's Python-canonical Linux
+spelling, so `/repo` and `//repo` cannot select different repository locks.
+
+Terminal scalar decisions are retained before application. A busy database can
+leave a durable outcome spool; a later tick replays a retained decision before
+claiming work. This prevents resending a known completed execution. Completion
+with no durable terminal decision has no such guarantee here: native intent,
+uncertainty reconciliation and scope cleanup remain prerequisites for activation.
+The ephemeral transport file is private, removed on ordinary exit and never
+used as recovery evidence. Production readiness remains unqualified by owned
+future-capability simulations with a harmless provider.
 
 Migrated shared debt retains its original values and explicit legacy provenance,
 separately from the effective per-leg count. Old combined inflight work keeps one
