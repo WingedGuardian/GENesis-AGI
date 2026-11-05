@@ -71,6 +71,9 @@ _WRAPPER_SPEC = {
             "-R",
             "-h",
             "-t",
+            "-D",
+            "-r",
+            "-T",
             "--user",
             "--group",
             "--prompt",
@@ -78,6 +81,10 @@ _WRAPPER_SPEC = {
             "--close-from",
             "--role",
             "--type",
+            "--host",
+            "--other-user",
+            "--command-timeout",
+            "--chroot",
         },
         0,
     ),
@@ -105,6 +112,10 @@ _WRAPPER_SPEC = {
     # carrier is revealed and the carrier arm catches it — rather than listing
     # `builtin` itself as a carrier, which would over-block `builtin cd`.
     "builtin": (set(), 0),
+    # uutils' multicall binary, the default on Ubuntu 26.04: `coreutils <tool> ...`
+    # runs the tool. GNU's own multicall form, `--coreutils-prog=<tool>`, is not
+    # modelled: no Ubuntu or Debian package ships that build (read, not measured).
+    "coreutils": (set(), 0),
     "exec": ({"-a"}, 0),
     # `-e/--eof` and `-i/--replace` are NOT here, and their absence is the point.
     # xargs gives them OPTIONAL values (`--eof[=END]`, `--replace[=R]`), so as a
@@ -513,7 +524,7 @@ _COMMIT_ARG_FLAGS = "mFCc"
 class Segment:
     """One executed command segment."""
 
-    exe: str  # resolved executable basename (e.g. "git", "gh"), "" if unknown
+    exe: str  # resolved executable's usual name (e.g. "git", "gh"), "" if unknown
     argv: list[str]  # argv with wrappers/env-assignments stripped
     override: bool  # a trailing `# review-override` shell comment on this segment
     raw: str  # the raw segment text (for messages)
@@ -2821,9 +2832,39 @@ def analyze_policy(command: str) -> tuple[list[PolicySegment], BlindSpot | None]
     return ([], blind) if blind else (sorted(records, key=lambda s: s.position), None)
 
 
+#: Ubuntu 26.04 keeps GNU coreutils and classic sudo beside their replacements, under
+#: other names, and every rule keyed on the usual name has to see them. `gnu<tool>` is a
+#: program from the `gnu-coreutils` package. The list is that package's file list (105,
+#: including the one in sbin), not a pattern, so `gnuplot` stays itself.
+_GNU_COREUTILS = frozenset("""
+    [ arch b2sum base32 base64 basename basenc cat chcon chgrp chmod chown chroot cksum comm
+    cp csplit cut date dd df dir dircolors dirname du echo env expand expr factor false
+    fmt fold groups head hostid id install join link ln logname ls md5sum mkdir mkfifo
+    mknod mktemp mv nice nl nohup nproc numfmt od paste pathchk pinky pr printenv
+    printf ptx pwd readlink realpath rm rmdir runcon seq sha1sum sha224sum sha256sum
+    sha384sum sha512sum shred shuf sleep sort split stat stdbuf stty sum sync tac tail
+    tee test timeout touch tr true truncate tsort tty uname unexpand uniq unlink users
+    vdir wc who whoami yes
+""".split())  # noqa: SIM905 - the package's file list, one edit away from a re-measure
+#: From `sudo-ws` and `sudo-rs`. Their other programs (`visudo.ws`, `sudoedit-rs`, ...)
+#: run no command.
+_RENAMED_TOOLS = {"sudo.ws": "sudo", "sudo-rs": "sudo", "su-rs": "su"}
+
+
 def _basename(token: str) -> str:
-    """Executable basename: /usr/bin/git → git, ./foo → foo."""
-    return token.rsplit("/", 1)[-1]
+    """Executable basename under its usual name: /usr/bin/git → git, ./foo → foo,
+    gnurm → rm."""
+    name = token.rsplit("/", 1)[-1]
+    if name in _RENAMED_TOOLS:
+        return _RENAMED_TOOLS[name]
+    if name.startswith("gnu") and name[3:] in _GNU_COREUTILS:
+        return name[3:]
+    return name
+
+
+def tool_name(token: str) -> str:
+    """The name a guard should match this command word by. See `_basename`."""
+    return _basename(token)
 
 
 def _is_hatch_selector(token: str) -> bool:
@@ -3045,7 +3086,7 @@ def _is_prefix_assignment(tok: str) -> bool:
 
 
 _POLICY_NEUTRAL_WRAPPERS = frozenset({
-    "command", "builtin", "exec", "time", "timeout", "nice", "nohup", "stdbuf", "setsid", "chrt", "ionice", "xargs",
+    "command", "builtin", "coreutils", "exec", "time", "timeout", "nice", "nohup", "stdbuf", "setsid", "chrt", "ionice", "xargs",
 })
 
 
