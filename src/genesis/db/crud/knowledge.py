@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import uuid
+import weakref
 from datetime import UTC, datetime
 
 import aiosqlite
@@ -312,7 +314,36 @@ async def find_by_unique_key(
         return dict(zip(columns, row, strict=False))
 
 
-async def upsert(
+#: One lock per credential key, held for a whole credential upsert. A process
+#: shares one connection, which serializes statements, not operations: two
+#: upserts of one key could otherwise interleave so that one writer's body
+#: commits beside the other's secret (#2426). Another process writes through its
+#: own connection, and SQLite's write lock serializes it. Weak values: a lock
+#: lives only while an upsert of its key is in flight.
+_CREDENTIAL_KEY_LOCKS: weakref.WeakValueDictionary[tuple[str, str, str], asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
+async def upsert(db: aiosqlite.Connection, **kwargs) -> tuple[str, bool]:
+    """Insert or update a knowledge unit; see ``_upsert`` for the contract.
+
+    A credential reference's upsert runs under its key's lock, from the
+    pre-check to the last secret write, so its body and its secret are always
+    one writer's pair.
+    """
+    if not holds_secret(kwargs.get("project_type"), kwargs.get("domain")):
+        return await _upsert(db, **kwargs)
+    project_type, domain = _canonical_key(kwargs["project_type"], kwargs["domain"])
+    key = (project_type, domain, kwargs["concept"])
+    lock = _CREDENTIAL_KEY_LOCKS.get(key)
+    if lock is None:
+        lock = _CREDENTIAL_KEY_LOCKS[key] = asyncio.Lock()
+    async with lock:
+        return await _upsert(db, **kwargs)
+
+
+async def _upsert(
     db: aiosqlite.Connection,
     *,
     project_type: str,
