@@ -627,13 +627,36 @@ def _sparse(path: Path, size: int) -> None:
         fh.truncate(size)
 
 
+def _run_alone(argv: list[str], env: dict, scratch: Path, timeout: float):
+    """Run argv and return (result, the max RSS in KiB of THIS child alone).
+
+    `getrusage(RUSAGE_CHILDREN).ru_maxrss` is the largest child the whole
+    process ever reaped, and CI runs the suite in one process, so it reports
+    an earlier test's peak. `os.wait4` returns the rusage of this one child."""
+    out, err = scratch / "run.out", scratch / "run.err"
+    with open(out, "wb") as o, open(err, "wb") as e:
+        p = subprocess.Popen(argv, stdout=o, stderr=e, env=env)
+    deadline = time.monotonic() + timeout
+    while True:
+        pid, status, ru = os.wait4(p.pid, os.WNOHANG)
+        if pid:
+            break
+        if time.monotonic() > deadline:
+            p.kill()
+            os.wait4(p.pid, 0)
+            raise AssertionError(f"{argv[4:]} ran past {timeout} s")
+        time.sleep(0.05)
+    p.returncode = os.waitstatus_to_exitcode(status)
+    r = subprocess.CompletedProcess(argv, p.returncode, out.read_text(), err.read_text())
+    return r, ru.ru_maxrss
+
+
 @pytest.mark.parametrize("where", ["checkout", "backup"])
-def test_a_huge_file_is_too_large_promptly_never_read_whole(w, where):
+def test_a_huge_file_is_too_large_promptly_never_read_whole(w, where, tmp_path):
     """Security S1 (the review's 3 GiB case, a sparse file): a node the judge
     would hash is over the per-file budget, in the checkout (a gitlink's
     directory, walked) or in the backup (a saved copy). It answers promptly
     as `other:too-large`, holding little memory, never reading the file whole."""
-    import resource
 
     ts = _repaired(w, _foreign_gitlink if where == "checkout" else _foreign_edit)
     if where == "checkout":
@@ -645,12 +668,11 @@ def test_a_huge_file_is_too_large_promptly_never_read_whole(w, where):
         _sparse(saved, 3 * GIB)
         part = ("sub/s1", "node")
     start = time.monotonic()
-    r = subprocess.run(
+    r, rss_kib = _run_alone(
         ["python3", "-I", "-S", str(MODULE), "--restore", ts, "--check", str(w.state), str(w.root)],
-        capture_output=True, text=True, env=w.env(), timeout=120,
+        w.env(), tmp_path, 120,
     )  # fmt: skip
     took = time.monotonic() - start
-    rss_kib = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
     assert _parts(r).get(part) == "other:too-large", r.stdout + r.stderr
     assert r.returncode == 1 and took < 60, took
     assert rss_kib < 512 * 1024, f"a child held {rss_kib} KiB"
