@@ -3928,6 +3928,14 @@ Refusing a proposed update preserves a previously valid opt-in.
   is declared only at startup — a live server meeting `SQLITE_CORRUPT` does
   not trip it (the 2026-09-18 log-storm class). Both land with the runtime
   corruption trip.
+- **db/ request ownership (internal prerequisite, not activated):**
+  `RequestDatabase` supplies a stable facade with one fresh physical connection
+  per independent unit, bounded admission, retained cancellation cleanup and
+  cursor closure. It preserves explicit CRUD commits and refuses expired scopes;
+  it does not provide whole-tool atomicity. Existing MCP initialization still
+  uses its legacy connection. Service integration and detached-writer ownership
+  are separate prerequisites before shared activation. See
+  `docs/reference/request-database.md` for lifecycle and failure semantics.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Every
   statement through a `SerializedConnection` (its cursors' row fetches too),
