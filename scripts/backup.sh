@@ -163,7 +163,6 @@ _QDRANT_FRESH=""    # space-separated collections snapshotted+encrypted this run
 _QDRANT_FAILED=""   # collections that EXIST (HTTP 200) but failed to snapshot this run
 _SQL_TMP=""         # plaintext ~269MB dump temp — trap-cleaned (N2, credential-bearing)
 _SQL_ARTIFACT_TMP="" # encrypted candidate — promoted only after round-trip verification
-_SQL_VERIFY_TMP=""   # decrypted candidate used for exact restore validation
 _VERIFY_DB=""         # imported verification DB and sidecars — trap-cleaned
 # Tier-1 replication: true once the local repo is in sync with the GitHub remote.
 _TIER1_PUSHED=false
@@ -231,12 +230,11 @@ _on_exit() {
     backend_cleanup || true
     # N2: the credential-bearing plaintext SQL dump must not outlive the script
     # if it died mid-section (before its inline rm).
-    rm -f "${_SQL_TMP:-}" "${_SQL_ARTIFACT_TMP:-}" "${_SQL_VERIFY_TMP:-}" 2>/dev/null || true
+    rm -f "${_SQL_TMP:-}" "${_SQL_ARTIFACT_TMP:-}" 2>/dev/null || true
     rm -f "${_EXTRA_TAR_TMP:-}" "${_EXTRA_TAR_ERR:-}" 2>/dev/null || true  # §6f plaintext tar + its file-name diagnostics
     if [ -n "${_VERIFY_DB:-}" ]; then
         rm -f "$_VERIFY_DB" "$_VERIFY_DB-journal" "$_VERIFY_DB-wal" "$_VERIFY_DB-shm" 2>/dev/null || true
     fi
-    if declare -F _release_verify_dir >/dev/null 2>&1; then _release_verify_dir || true; fi
     return 0
 }
 trap _on_exit EXIT
@@ -301,31 +299,16 @@ GENESIS_BIG_TMP="${GENESIS_BACKUP_TMPDIR:-$HOME/tmp}"
 mkdir -p "$GENESIS_BIG_TMP"
 log "big-temp dir: $GENESIS_BIG_TMP"
 
-# The SF4 round-trip below writes a decrypted copy of the dump AND rebuilds the
-# whole database from it (together ~2x the live DB), then deletes both. On a
-# btrfs root that write-and-free every 6h was MEASURED to coincide with 18-58 s
-# filesystem commit stalls, so those two files go to a RAM-backed tmpfs when it
-# has room, and to the on-disk big-temp dir otherwise. This is a deliberate
-# exception to "large temp files stay off RAM": it is bounded by the checks in
-# _pick_verify_dir and lasts ~2 min.
-#
-# A tmpfs such as /dev/shm is shared by every local user, while the on-disk dir
-# sits under a $HOME other users cannot traverse. umask 077 above already makes
-# each file 0600; the files also go in a private 0700 directory per run, so no
-# other user can race the names, and a later umask change cannot expose them.
-# The directory's prefix carries a hash of this install's backup lock, so the
-# next run of the SAME install (which holds that lock) can sweep one a SIGKILL
-# left behind (the EXIT trap cannot run then; nothing else clears a tmpfs before
-# reboot), and never touches another install's or a test sandbox's dir.
-GENESIS_VERIFY_RAM_DIR="${GENESIS_BACKUP_VERIFY_TMPDIR:-/dev/shm}"
-while [ "${#GENESIS_VERIFY_RAM_DIR}" -gt 1 ] && [ "${GENESIS_VERIFY_RAM_DIR%/}" != "$GENESIS_VERIFY_RAM_DIR" ]; do
-    GENESIS_VERIFY_RAM_DIR="${GENESIS_VERIFY_RAM_DIR%/}"
-done
-_VERIFY_PREFIX="genesis-backup-verify-$(printf '%s' "$DR_LOCK_FILE" | sha256sum | cut -c1-12)."
+# The SF4 round-trip below proves the fresh artifact restores: it decrypts the
+# dump and rebuilds the whole database from it. The decrypted dump is never
+# written to a file: it streams from the decrypt tool straight into sqlite3.
+# The rebuilt database goes in memory when there is room, and to a temp file
+# in the on-disk big-temp dir otherwise. On a btrfs root the old
+# write-a-plaintext-dump-and-a-DB-then-free-them every 6h was MEASURED to
+# coincide with 18-58 s filesystem commit stalls.
+_VERIFY_MODE=""  # memory | disk, set by _pick_verify_mode
 _CGROUP_FS="${GENESIS_BACKUP_CGROUP_FS:-/sys/fs/cgroup}"   # overridable for tests
 _PROC_CGROUP="${GENESIS_BACKUP_PROC_CGROUP:-/proc/self/cgroup}"
-_VERIFY_DIR=""   # where _roundtrip_ok creates its files
-_VERIFY_PRIV=""  # the private RAM dir, when one is in use — trap-cleaned
 
 # _num <value> <default> — a decimal integer of at most 6 digits, else the
 # default. 10# stops "08" aborting the run as a bad octal under set -e, and the
@@ -334,102 +317,92 @@ _num() {
     case "$1" in ''|*[!0-9]*) echo "$2" ;; *) [ "${#1}" -le 6 ] && echo $((10#$1)) || echo "$2" ;; esac
 }
 
-# _cgroup_headroom_kb — the smallest (memory.max - memory.current +
-# inactive_file) over this process's cgroup and its ancestors, in KB; empty when
-# no ancestor is capped. memory.current includes page cache, which fills toward
-# the cap on any long-running box, so the cold part of it (inactive_file) counts
-# as available, the way MemAvailable counts it. /proc/meminfo reports the
-# host's memory under a capped Docker/systemd cgroup without lxcfs, so it alone
-# could approve RAM a cap does not have. cgroup v1/hybrid hosts have no
-# "0::" line: no cap is found and MemAvailable alone decides.
+# _cgroup_headroom_kb — the smallest (limit - usage + inactive_file) over this
+# process's cgroup and its ancestors, in KB; empty when no level is capped.
+# Usage includes page cache, which fills toward the cap on any long-running
+# box, so the cold part of it (inactive_file) counts as available, the way
+# MemAvailable counts it. /proc/meminfo reports the host's memory under a capped
+# Docker/systemd cgroup without lxcfs, so it alone could approve memory a cap
+# does not have. A v1 memory-controller line wins over "0::": a hybrid host has
+# both, and its cap lives on the v1 side. Each level is read on its own (its own
+# limit against its own usage), so a cap on an ancestor counts everything under
+# it. A level with a cap but unreadable usage counts as no headroom.
 _cgroup_headroom_kb() {
-    local _p _d _m _c _i _h _best=""
-    _p=$(awk -F: '$1 == "0" {print $3}' "$_PROC_CGROUP" 2>/dev/null) || _p=""
-    [ -n "$_p" ] || return 0
-    _d="$_CGROUP_FS${_p%/}"
+    local _p _d _root _m _c _i _h _best="" _v1=false
+    _p=$(awk -F: '$2 ~ /(^|,)memory(,|$)/ {print $3; exit}' "$_PROC_CGROUP" 2>/dev/null) || _p=""
+    if [ -n "$_p" ]; then
+        _v1=true
+        _root="$_CGROUP_FS/memory"
+    else
+        _p=$(awk -F: '$1 == "0" {print $3; exit}' "$_PROC_CGROUP" 2>/dev/null) || _p=""
+        [ -n "$_p" ] || return 0
+        _root="$_CGROUP_FS"
+    fi
+    _d="$_root${_p%/}"
     while :; do
-        if [ -r "$_d/memory.max" ] && [ -r "$_d/memory.current" ]; then
-            _m=$(cat "$_d/memory.max" 2>/dev/null) || _m=max
+        if $_v1; then
+            _m=$(cat "$_d/memory.limit_in_bytes" 2>/dev/null) || _m=""
+            _c=$(cat "$_d/memory.usage_in_bytes" 2>/dev/null) || _c=""
+            _i=$(awk '$1 == "total_inactive_file" {print $2}' "$_d/memory.stat" 2>/dev/null) || _i=""
+        else
+            _m=$(cat "$_d/memory.max" 2>/dev/null) || _m=""
             _c=$(cat "$_d/memory.current" 2>/dev/null) || _c=""
             _i=$(awk '$1 == "inactive_file" {print $2}' "$_d/memory.stat" 2>/dev/null) || _i=""
-            case "$_i" in ''|*[!0-9]*) _i=0 ;; esac
-            case "$_m$_c" in *[!0-9]*|'') ;; *)
-                _h=$(( (_m - _c + _i) / 1024 ))
-                [ "$_h" -ge 0 ] || _h=0
-                if [ -z "$_best" ] || [ "$_h" -lt "$_best" ]; then _best=$_h; fi ;;
-            esac
         fi
-        [ "$_d" = "$_CGROUP_FS" ] && break
+        case "$_i" in ''|*[!0-9]*) _i=0 ;; esac
+        # A cap is a decimal below 2^60: v2 writes "max" for none, and v1 a
+        # value near 2^63 (19 digits), which is also kept out of the arithmetic.
+        case "$_m" in ''|*[!0-9]*) _m="" ;; esac
+        if [ -n "$_m" ] && [ "${#_m}" -le 18 ] && [ "$_m" -lt 1152921504606846976 ]; then
+            case "$_c" in
+                ''|*[!0-9]*) _h=0 ;;
+                *) [ "${#_c}" -le 18 ] && _h=$(( (_m - _c + _i) / 1024 )) || _h=0 ;;
+            esac
+            [ "$_h" -ge 0 ] || _h=0
+            if [ -z "$_best" ] || [ "$_h" -lt "$_best" ]; then _best=$_h; fi
+        fi
+        [ "$_d" = "$_root" ] && break
         _d="${_d%/*}"
-        case "$_d" in "$_CGROUP_FS"*) ;; *) break ;; esac
+        case "$_d" in "$_root"*) ;; *) break ;; esac
     done
     echo "$_best"
 }
 
-# _pick_verify_dir — set _VERIFY_DIR (and _VERIFY_PRIV when it is RAM). RAM
-# needs a tmpfs with free space for VERIFY_RAM_FACTOR x the live DB size
-# (decrypted dump + rebuilt DB + one DB of headroom), AND available memory of
-# that much PLUS a floor of VERIFY_RAM_FLOOR_PCT of MemTotal. Available is the
-# lower of MemAvailable and the cgroup headroom. The floor is there because
-# tmpfs pages cannot be reclaimed without swap, and systemd-oomd kills sessions
-# on sustained reclaim pressure: the check only takes RAM when memory would stay
-# well clear of that afterwards. It is a start-time snapshot; memory that fills
-# during the ~2 min check is not covered.
-_pick_verify_dir() {
-    local _factor _floor_pct _db_bytes _need_kb _free_kb _avail_kb _total_kb _floor_kb _cg _uid _old
-    _factor=$(_num "${GENESIS_BACKUP_VERIFY_RAM_FACTOR:-}" 3)
-    [ "$_factor" -ge 2 ] || _factor=2  # the dump and the rebuilt DB at least
+# _pick_verify_mode — set _VERIFY_MODE. Memory needs available memory of
+# VERIFY_RAM_FACTOR x the live DB size (the rebuilt DB plus sqlite's working
+# set) PLUS a floor of VERIFY_RAM_FLOOR_PCT of MemTotal. Available is the lower
+# of MemAvailable and the cgroup headroom. The floor is there because
+# systemd-oomd kills sessions on sustained reclaim pressure: the check only
+# takes memory when it would stay well clear of that afterwards. It is a
+# start-time snapshot; a check that then fails in memory is re-run on disk.
+# GENESIS_BACKUP_VERIFY_MEMORY=off forces disk.
+_pick_verify_mode() {
+    local _factor _floor_pct _db_bytes _wal_bytes _need_kb _avail_kb _total_kb _floor_kb _cg
+    _VERIFY_MODE=disk
+    if [ "${GENESIS_BACKUP_VERIFY_MEMORY:-on}" = off ]; then
+        log "SQLite: round-trip verify on disk: GENESIS_BACKUP_VERIFY_MEMORY=off"
+        return 0
+    fi
+    _factor=$(_num "${GENESIS_BACKUP_VERIFY_RAM_FACTOR:-}" 2)
+    [ "$_factor" -ge 2 ] || _factor=2  # the rebuilt DB plus its index sorts
     _floor_pct=$(_num "${GENESIS_BACKUP_VERIFY_RAM_FLOOR_PCT:-}" 20)
-    _VERIFY_DIR="$GENESIS_BIG_TMP"
-    _VERIFY_PRIV=""
-    if ! [ -d "$GENESIS_VERIFY_RAM_DIR" ] || ! [ -w "$GENESIS_VERIFY_RAM_DIR" ]; then
-        log "SQLite: round-trip verify on disk ($_VERIFY_DIR): $GENESIS_VERIFY_RAM_DIR is not a writable dir"
-        return 0
-    fi
-    if [ "$(stat -f -c %T "$GENESIS_VERIFY_RAM_DIR" 2>/dev/null)" != tmpfs ]; then
-        log "SQLite: round-trip verify on disk ($_VERIFY_DIR): $GENESIS_VERIFY_RAM_DIR is not a tmpfs"
-        return 0
-    fi
-    # The backup lock is held, so any earlier private dir of ours is stale.
-    _uid=$(id -u)
-    for _old in "$GENESIS_VERIFY_RAM_DIR/$_VERIFY_PREFIX"*; do
-        [ -d "$_old" ] && [ ! -L "$_old" ] && [ "$(stat -c %u "$_old" 2>/dev/null)" = "$_uid" ] || continue
-        if rm -rf -- "$_old" 2>/dev/null; then
-            log "SQLite: removed a stale verify dir left by a killed run"
-        else
-            log "WARNING: could not remove a stale verify dir: $_old"
-        fi
-    done
     _db_bytes=$(stat -c %s "$DB_FILE" 2>/dev/null) || _db_bytes=0
+    # Committed data still in the WAL is part of the dump, and so of the
+    # rebuilt DB, but not of the main file's size.
+    _wal_bytes=$(stat -c %s "$DB_FILE-wal" 2>/dev/null) || _wal_bytes=0
+    _db_bytes=$(( _db_bytes + _wal_bytes ))
     _need_kb=$(( (_db_bytes / 1024 + 1) * _factor ))
-    _free_kb=$(df -Pk "$GENESIS_VERIFY_RAM_DIR" 2>/dev/null | awk 'NR==2 {print $4}') || _free_kb=0
     _avail_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo 2>/dev/null) || _avail_kb=0
     _total_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo 2>/dev/null) || _total_kb=0
     _cg=$(_cgroup_headroom_kb) || _cg=""
     if [ -n "$_cg" ] && [ "$_cg" -lt "${_avail_kb:-0}" ]; then _avail_kb=$_cg; fi
     _floor_kb=$(( ${_total_kb:-0} * _floor_pct / 100 ))
-    if [ "${_free_kb:-0}" -lt "$_need_kb" ] || [ "${_avail_kb:-0}" -lt $(( _need_kb + _floor_kb )) ]; then
-        log "SQLite: round-trip verify on disk ($_VERIFY_DIR): RAM short (need ${_need_kb} KB + floor ${_floor_kb} KB, tmpfs free ${_free_kb:-0} KB, available ${_avail_kb:-0} KB)"
+    if [ "${_avail_kb:-0}" -lt $(( _need_kb + _floor_kb )) ]; then
+        log "SQLite: round-trip verify on disk: memory short (need ${_need_kb} KB + floor ${_floor_kb} KB, available ${_avail_kb:-0} KB)"
         return 0
     fi
-    if ! _VERIFY_PRIV=$(mktemp -d -p "$GENESIS_VERIFY_RAM_DIR" "${_VERIFY_PREFIX}XXXXXX" 2>/dev/null); then
-        _VERIFY_PRIV=""
-        log "SQLite: round-trip verify on disk ($_VERIFY_DIR): cannot create a private dir in $GENESIS_VERIFY_RAM_DIR"
-        return 0
-    fi
-    chmod 700 "$_VERIFY_PRIV" 2>/dev/null || true  # mktemp -d already made it 0700
-    _VERIFY_DIR="$_VERIFY_PRIV"
-    log "SQLite: round-trip verify in RAM ($GENESIS_VERIFY_RAM_DIR, need ${_need_kb} KB)"
-}
-
-# _release_verify_dir — remove the private RAM dir (its files are already gone
-# on every _roundtrip_ok path; rm -rf covers a sidecar sqlite left).
-_release_verify_dir() {
-    if [ -n "${_VERIFY_PRIV:-}" ]; then
-        case "$_VERIFY_PRIV" in "$GENESIS_VERIFY_RAM_DIR/$_VERIFY_PREFIX"*) rm -rf -- "$_VERIFY_PRIV" 2>/dev/null || true ;; esac
-    fi
-    _VERIFY_PRIV=""
-    _VERIFY_DIR=""
+    _VERIFY_MODE=memory
+    log "SQLite: round-trip verify in memory (need ${_need_kb} KB)"
 }
 
 # ── Encryption helpers ───────────────────────────────────────────────
@@ -470,34 +443,88 @@ _git_net() { timeout -k 10 "$_GIT_NET_TIMEOUT" git "$@"; }
 # integrity, foreign-key, and non-empty-schema checks.  Checking only the live
 # source before `.dump` leaves a race; checking only the dump's COMMIT trailer
 # misses broken UNIQUE indexes and other logical inconsistencies.
-_roundtrip_ok() {
-    local _pass="$1" _art="$2" _errf="${3:-/dev/null}" _gpg_rc _sqlite_rc _ic _fk _schema
-    backup_passphrase_valid "$_pass" || return 1
-    _VERIFY_DB=$(mktemp -p "${_VERIFY_DIR:-$GENESIS_BIG_TMP}")
-    rm -f "$_VERIFY_DB"
-    _SQL_VERIFY_TMP=$(mktemp -p "${_VERIFY_DIR:-$GENESIS_BIG_TMP}")
-    printf '%s' "$_pass" | python3 \
-        "$_SCRIPT_DIR/../src/genesis/guardian/cred_integrity.py" decrypt-backup "$_art" "$_SQL_VERIFY_TMP" 2>"$_errf"
-    _gpg_rc=${PIPESTATUS[1]}
-    if [ "$_gpg_rc" -eq 0 ]; then
-        sqlite3 "$_VERIFY_DB" ".bail on" ".read $_SQL_VERIFY_TMP" 2>>"$_errf"
-        _sqlite_rc=$?
+# The checks run in the same sqlite3 session that imported the dump. A lone
+# ";" line first closes any statement the dump left unterminated (a dump cut
+# inside a final CREATE VIEW would otherwise swallow the next word). Then
+# BEGIN: a dump that left its transaction open (cut before COMMIT) would
+# otherwise be checked as if complete, and BEGIN inside an open transaction is
+# an error that -bail turns into a failure. One line, read back as the LAST
+# "RT:" line of output.
+_RT_CHECKS="BEGIN; SELECT 'RT:' || (SELECT group_concat(integrity_check, ';') FROM pragma_integrity_check) || '|' || (SELECT count(*) FROM pragma_foreign_key_check) || '|' || (SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'); ROLLBACK;"
+_RT_DECRYPT_RC=""  # the last round-trip's decrypt status: 0 = authenticated
+_RT_SQLITE_RC=""   # the last round-trip's sqlite3 status
+
+# _roundtrip_once <passphrase> <artifact.gpg> <stderr_file> <memory|disk>
+_roundtrip_once() {
+    local _pass="$1" _art="$2" _errf="$3" _mode="$4" _target _out _st _line _n
+    local -a _sq=(sqlite3 -safe -bail)
+    _RT_DECRYPT_RC=""
+    _RT_SQLITE_RC=""
+    # -safe also turns on DEFENSIVE, which refuses the writable_schema inserts
+    # .dump emits for virtual tables (FTS5): turn that one flag back off, as
+    # the plain shell does when it reads a dump header. -safe still refuses
+    # .shell/.output/.open/.read, ATTACH and extensions.
+    _sq+=(-cmd ".dbconfig defensive off")
+    if [ "$_mode" = memory ]; then
+        _target=":memory:"
+        _sq+=(-cmd "PRAGMA temp_store=MEMORY")  # index sorts stay off the disk too
     else
-        _sqlite_rc=1
+        _VERIFY_DB=$(mktemp -p "$GENESIS_BIG_TMP")
+        rm -f "$_VERIFY_DB"
+        _target="$_VERIFY_DB"
     fi
-    if [ "$_gpg_rc" -ne 0 ] || [ "$_sqlite_rc" -ne 0 ]; then
-        rm -f "$_SQL_VERIFY_TMP" "$_VERIFY_DB" "$_VERIFY_DB-journal" "$_VERIFY_DB-wal" "$_VERIFY_DB-shm"
-        _SQL_VERIFY_TMP=""
+    # The decrypted bytes are tentative until the decrypt tool exits 0 (GPG has
+    # authenticated the whole message), so the result counts only on that exit
+    # 0. The brace group exits with the decrypt status. sqlite3's own stderr is
+    # discarded: its messages quote the failing SQL line, which is database
+    # content, and ROUNDTRIP_DETAIL reaches backup_status.json and alerts. So
+    # the cause of a sqlite3 failure (memory, a constraint, a parse error, a
+    # full disk) is not recorded; only its exit status is.
+    _out=$( {
+            printf '%s' "$_pass" | python3 \
+                "$_SCRIPT_DIR/../src/genesis/guardian/cred_integrity.py" decrypt-backup-stream "$_art" 2>>"$_errf"
+            _st=${PIPESTATUS[1]}
+            printf '\n;\n%s\n' "$_RT_CHECKS"
+            exit "$_st"
+        } | SQLITE_TMPDIR="$GENESIS_BIG_TMP" "${_sq[@]}" "$_target" 2>/dev/null
+        _st="${PIPESTATUS[0]} ${PIPESTATUS[1]}"  # before any other command resets it
+        echo
+        echo "RT_STATUS=$_st" )
+    if [ -n "${_VERIFY_DB:-}" ]; then
+        rm -f "$_VERIFY_DB" "$_VERIFY_DB-journal" "$_VERIFY_DB-wal" "$_VERIFY_DB-shm"
         _VERIFY_DB=""
-        return 1
     fi
-    _ic=$(sqlite3 "$_VERIFY_DB" "PRAGMA integrity_check;" 2>>"$_errf") || _ic=""
-    _fk=$(sqlite3 "$_VERIFY_DB" "PRAGMA foreign_key_check;" 2>>"$_errf") || _fk="CHECK_FAILED"
-    _schema=$(sqlite3 "$_VERIFY_DB" "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%';" 2>>"$_errf") || _schema=0
-    rm -f "$_SQL_VERIFY_TMP" "$_VERIFY_DB" "$_VERIFY_DB-journal" "$_VERIFY_DB-wal" "$_VERIFY_DB-shm"
-    _SQL_VERIFY_TMP=""
-    _VERIFY_DB=""
-    [ "$_ic" = "ok" ] && [ -z "$_fk" ] && [ "${_schema:-0}" -gt 0 ]
+    _st=$(printf '%s\n' "$_out" | sed -n 's/^RT_STATUS=//p' | tail -n 1)
+    _RT_DECRYPT_RC=${_st%% *}
+    _RT_SQLITE_RC=${_st##* }
+    _line=$(printf '%s\n' "$_out" | grep '^RT:' | tail -n 1) || _line=""
+    [ "$_RT_DECRYPT_RC" = 0 ] && [ "$_RT_SQLITE_RC" = 0 ] || return 1
+    # RT:ok|<foreign-key violations: 0>|<user schema objects: > 0, digits only>
+    case "$_line" in RT:ok\|0\|*) _n=${_line#RT:ok|0|} ;; *) return 1 ;; esac
+    case "$_n" in ''|*[!0-9]*|0) return 1 ;; esac
+    return 0
+}
+
+# _roundtrip_ok <passphrase> <artifact.gpg> [stderr_file] — prove the exact
+# encrypted candidate decrypts, rebuilds and passes the checks. When the
+# in-memory rebuild fails (sqlite3 non-zero: memory exhausted or killed since
+# the start-time check, which also breaks the decrypt's pipe), re-run once on
+# disk before any verdict. A wrong passphrase leaves sqlite3 at 0 (it imports
+# nothing), so it never causes a retry.
+_roundtrip_ok() {
+    local _pass="$1" _art="$2" _errf="${3:-/dev/null}"
+    backup_passphrase_valid "$_pass" || return 1
+    if _roundtrip_once "$_pass" "$_art" "$_errf" "${_VERIFY_MODE:-disk}"; then
+        return 0
+    fi
+    if [ "${_VERIFY_MODE:-disk}" = memory ] && [ "$_RT_SQLITE_RC" != 0 ]; then
+        log "SQLite: round-trip failed in memory (sqlite3 exit ${_RT_SQLITE_RC:-?}); retrying on disk"
+        [ "$_errf" = /dev/null ] || : > "$_errf"
+        _VERIFY_MODE=disk  # memory just ran short: later calls (escrow drift) stay on disk
+        _roundtrip_once "$_pass" "$_art" "$_errf" disk
+        return
+    fi
+    return 1
 }
 
 # _verify_sql_roundtrip <artifact.gpg> — classify the freshly-encrypted SQL
@@ -517,36 +544,19 @@ _roundtrip_ok() {
 _verify_sql_roundtrip() {
     local _art="$1" _errf
     _errf=$(mktemp -p "$GENESIS_BIG_TMP")
-    _pick_verify_dir
+    _pick_verify_mode
     passphrase_escrow_lookup
     local _primary="$_BACKUP_PASSPHRASE" _have_escrow=false
     if [ -n "$ESCROW_PASSPHRASE" ]; then _primary="$ESCROW_PASSPHRASE"; _have_escrow=true; fi
     if _roundtrip_ok "$_primary" "$_art" "$_errf"; then
         rm -f "$_errf"
-        _release_verify_dir
         ROUNDTRIP_VERDICT=RESTORABLE
         return 0
-    fi
-    # A failure in RAM may be the shared tmpfs (full, or memory charged
-    # elsewhere since the start-time check), not the artifact: never let it
-    # decide the verdict alone. Re-run on disk, where the old code ran.
-    if [ -n "${_VERIFY_PRIV:-}" ]; then
-        _release_verify_dir
-        _VERIFY_DIR="$GENESIS_BIG_TMP"
-        log "SQLite: round-trip failed in RAM; retrying on disk ($_VERIFY_DIR)"
-        : > "$_errf"
-        if _roundtrip_ok "$_primary" "$_art" "$_errf"; then
-            rm -f "$_errf"
-            _release_verify_dir
-            ROUNDTRIP_VERDICT=RESTORABLE
-            return 0
-        fi
     fi
     # Primary failed. If the primary WAS escrow, an env-passphrase success means
     # drift (artifact good, escrow stale); env failure means genuine corruption.
     if $_have_escrow && _roundtrip_ok "$_BACKUP_PASSPHRASE" "$_art" /dev/null; then
         rm -f "$_errf"
-        _release_verify_dir
         ROUNDTRIP_VERDICT=DRIFT
         return 0
     fi
@@ -556,8 +566,14 @@ _verify_sql_roundtrip() {
     # json.loads would then throw UnicodeDecodeError (uncaught → crashes health)
     # or JSONDecodeError (swallowed → suppresses the very CRITICAL this raises).
     ROUNDTRIP_DETAIL=$(LC_ALL=C tr -cd '[:print:]' < "$_errf" | cut -c1-200)
+    # When sqlite3 failed, the decrypt usually fails too only because sqlite3
+    # stopped reading (a broken pipe), so name the rebuild, never "authentication".
+    if [ -n "$_RT_SQLITE_RC" ] && [ "$_RT_SQLITE_RC" != 0 ]; then
+        ROUNDTRIP_DETAIL="database rebuild or checks failed (sqlite3 exit $_RT_SQLITE_RC, decrypt exit ${_RT_DECRYPT_RC:-?})"
+    elif [ "$_RT_DECRYPT_RC" = 0 ]; then
+        ROUNDTRIP_DETAIL="decrypt authenticated; database checks failed"
+    fi
     rm -f "$_errf"
-    _release_verify_dir
     ROUNDTRIP_VERDICT=CORRUPT
     return 0
 }
@@ -686,7 +702,7 @@ if [ -f "$DB_FILE" ]; then
                         _SQL_RESTORABLE=false
                         _FAILURE_CLASS="db_backup"
                         _FAILURE_STAGE="sqlite_roundtrip"
-                        _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }SQL archive failed round-trip decrypt with its own env passphrase (${ROUNDTRIP_DETAIL:-no gpg output}) — corrupt/unrestorable, withheld from off-site"
+                        _FAILURE_REASON="${_FAILURE_REASON:+$_FAILURE_REASON; }SQL archive failed its round-trip with its own env passphrase (${ROUNDTRIP_DETAIL:-no gpg output}) — corrupt/unrestorable, withheld from off-site"
                         log "WARNING: $_FAILURE_REASON"
                         _SQLITE_LINES=0
                         rm -f "$_SQL_ARTIFACT_TMP"
