@@ -177,6 +177,13 @@ if ! command -v timeout >/dev/null 2>&1; then
 fi
 
 T="timeout -k 1 3"
+# uutils' -k kills the direct child only (scripts/lib/gnu_timeout.sh). This script runs
+# as `bash -s` in the container and loads no lib, so it makes the same choice here.
+if command -v gnutimeout >/dev/null 2>&1; then
+  case "$(timeout --version 2>/dev/null)" in
+    *uutils*) T="gnutimeout -k 1 3" ;;
+  esac
+fi
 
 # 1. The LAUNCHER. This is what Claude Code actually invokes, and it covers what
 #    a venv check alone cannot: a missing or non-executable script, a broken
