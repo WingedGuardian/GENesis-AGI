@@ -104,24 +104,25 @@ _S = _State()
 _busy = threading.local()
 
 
-def _proc_lines(path: str) -> list[str]:
+def _read_lines(path: str) -> list[str]:
+    """A missing file means this machine has no such table. Any other failed read
+    is a fault: this runs before any connect, so it is counted here."""
     try:
         with open(path) as f:
-            return f.read().splitlines()[1:]
-    except OSError:
+            return f.read().splitlines()
+    except FileNotFoundError:
+        return []
+    except OSError as fault:
+        _S.faults[type(fault).__name__] += 1
         return []
 
 
 def _local_addresses() -> frozenset[str]:
     out: set[str] = set()
-    for line in _proc_lines("/proc/net/if_inet6"):
+    for line in _read_lines("/proc/net/if_inet6"):  # no header line
         with contextlib.suppress(ValueError, IndexError):
-            out.add(str(ipaddress.ip_address(int(line.split()[0], 16))))
-    try:
-        with open("/proc/net/fib_trie") as f:
-            lines = f.read().splitlines()
-    except OSError:
-        lines = []
+            out.add(str(ipaddress.IPv6Address(int(line.split()[0], 16))))
+    lines = _read_lines("/proc/net/fib_trie")
     for i, line in enumerate(lines):
         if "/32 host LOCAL" in line and i:
             out.add(lines[i - 1].split()[-1])
@@ -157,7 +158,16 @@ def _tcp_listen_inodes(port: int, dest) -> set[str]:
     dest = _unmapped(dest)
     inodes = set()
     for path in ("/proc/net/tcp", "/proc/net/tcp6"):
-        for line in _proc_lines(path):
+        # A failed read reaches _hook, which allows the connect and counts it. A
+        # missing tcp6 only means IPv6 is off.
+        try:
+            with open(path) as f:
+                lines = f.read().splitlines()[1:]
+        except FileNotFoundError:
+            if path.endswith("6"):
+                continue
+            raise
+        for line in lines:
             parts = line.split()
             if len(parts) <= 9 or parts[3] != _LISTEN:
                 continue
@@ -175,16 +185,21 @@ def _tcp_listen_inodes(port: int, dest) -> set[str]:
 def _unix_listen_inodes(path: bytes) -> set[str]:
     """Inodes of sockets listening at ``path``. Read as bytes and split at most 7
     times: the eighth field is the whole bound path, spaces and non-UTF-8 bytes
-    included."""
-    try:
-        with open("/proc/net/unix", "rb") as f:
-            lines = f.read().split(b"\n")[1:]
-    except OSError:
-        return set()
+    included. A failed read reaches _hook, which allows the connect and counts it.
+
+    A server that bound a relative name is recorded under that name, with no
+    directory to compare. It matches any absolute path ending in it, which can only
+    over-refuse, and only under the live directories."""
+    with open("/proc/net/unix", "rb") as f:
+        lines = f.read().split(b"\n")[1:]
     inodes = set()
     for line in lines:
         parts = line.split(None, 7)
-        if len(parts) == 8 and parts[7] == path and int(parts[3], 16) & _UNIX_ACCEPTING:
+        if len(parts) != 8 or not int(parts[3], 16) & _UNIX_ACCEPTING:
+            continue
+        bound = parts[7]
+        relative = not bound.startswith((b"/", b"@")) and path.endswith(b"/" + bound)
+        if bound == path or relative:
             inodes.add(os.fsdecode(parts[6]))
     return inodes
 
