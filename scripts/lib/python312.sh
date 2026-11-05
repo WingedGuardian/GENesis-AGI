@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# Sourced by install.sh and bootstrap.sh. Defines functions only.
+# Sourced by install.sh and bootstrap.sh. Defines functions and settings only.
 #
 # CI tests Genesis on Python 3.12. pyproject allows newer, and an existing venv
 # on one keeps working, but a new venv should get the version that is tested.
@@ -10,6 +10,9 @@
 # moved by a PR. uv only knows the Python patches released before its own build, so an
 # aged pin holds patches back. Bump these together; an update's summary says when
 # it has aged past the limit.
+# shellcheck source=scripts/lib/gnu_timeout.sh
+. "${BASH_SOURCE[0]%/*}/gnu_timeout.sh"
+
 GENESIS_UV_VERSION="0.13.7"
 GENESIS_UV_PINNED_ON="2026-11-05"
 GENESIS_UV_PIN_MAX_AGE_DAYS=120
@@ -107,6 +110,11 @@ genesis_upgrade_uv_python() {
     [ -x "$venv/bin/python" ] || return 0
     uv_bin="$(command -v uv 2>/dev/null || echo "$HOME/.local/bin/uv")"
     [ -x "$uv_bin" ] || return 0
+    # Before the question of which Python this venv runs: whoever moves the pin may well
+    # run a host on a packaged one.
+    if [ "$(( ($(date +%s) - $(date -d "$GENESIS_UV_PINNED_ON" +%s)) / 86400 ))" -gt "$GENESIS_UV_PIN_MAX_AGE_DAYS" ]; then
+        GENESIS_UV_PIN_STALE=1
+    fi
     if ! managed="$("$uv_bin" python dir 2>/dev/null)"; then
         GENESIS_UV_PYTHON_ERROR="uv python dir failed, so this could not tell whether the venv runs on uv's Python"
         return 1
@@ -125,16 +133,19 @@ genesis_upgrade_uv_python() {
         return 1
     fi
     _genesis_uv_to_pin "$uv_bin"
-    if [ "$(( ($(date +%s) - $(date -d "$GENESIS_UV_PINNED_ON" +%s)) / 86400 ))" -gt "$GENESIS_UV_PIN_MAX_AGE_DAYS" ]; then
-        GENESIS_UV_PIN_STALE=1
-    fi
-    if ! out="$(timeout -k 10 "$GENESIS_UV_TIMEOUT_S" "$uv_bin" python upgrade "$minor" 2>&1)"; then
-        GENESIS_UV_PYTHON_ERROR="$(printf '%s\n' "$out" | tail -n 1)"
+    if out="$(timeout -k 10 "$GENESIS_UV_TIMEOUT_S" "$uv_bin" python upgrade "$minor" 2>&1)"; then
+        :
+    else
+        case "$?" in
+            124 | 137) GENESIS_UV_PYTHON_ERROR="uv python upgrade passed its ${GENESIS_UV_TIMEOUT_S} s limit" ;;
+            *) GENESIS_UV_PYTHON_ERROR="$(printf '%s\n' "$out" | tail -n 1)" ;;
+        esac
         return 1
     fi
     # --managed-python: a uv.toml can otherwise make this answer with the system's.
-    if ! target="$("$uv_bin" python find --managed-python --system "$minor" 2>&1)"; then
-        GENESIS_UV_PYTHON_ERROR="$(printf '%s\n' "$target" | tail -n 1)"
+    # stdout alone: a warning from uv is not part of the path it names.
+    if ! target="$("$uv_bin" python find --managed-python --system "$minor" 2>/dev/null)"; then
+        GENESIS_UV_PYTHON_ERROR="$("$uv_bin" python find --managed-python --system "$minor" 2>&1 >/dev/null | tail -n 1)"
         return 1
     fi
     target_real="$(readlink -f "$target")"

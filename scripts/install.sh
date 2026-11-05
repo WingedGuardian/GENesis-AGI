@@ -710,7 +710,7 @@ else
 fi
 
 if ! command -v uv &>/dev/null; then
-    curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh 2>/dev/null || true
+    curl -LsSf "https://astral.sh/uv/$GENESIS_UV_VERSION/install.sh" 2>/dev/null | sh 2>/dev/null || true
     export PATH="$HOME/.local/bin:$PATH"
 fi
 # shellcheck source=lib/serena_install.sh

@@ -898,7 +898,7 @@ if ! command -v uv &>/dev/null; then
     # truncated installer if the transfer drops mid-stream.
     _uv_installer=$(mktemp 2>/dev/null) || _uv_installer=""
     if [[ -n "$_uv_installer" ]] \
-        && curl -LsSf https://astral.sh/uv/install.sh -o "$_uv_installer" 2>/dev/null; then
+        && curl -LsSf "https://astral.sh/uv/$GENESIS_UV_VERSION/install.sh" -o "$_uv_installer" 2>/dev/null; then
         sh "$_uv_installer" 2>/dev/null || echo "  WARNING: uv install failed (non-critical)"
     else
         echo "  WARNING: uv installer download failed (non-critical)"
@@ -1015,7 +1015,7 @@ fi
 if ! genesis_upgrade_uv_python "$VENV_DIR"; then
     echo "  WARNING: could not finish upgrading uv's Python: ${GENESIS_UV_PYTHON_ERROR:-no reason given}"
     # These survive update.sh's tail of this output.
-    echo "uv's Python could not be fully upgraded (${GENESIS_UV_PYTHON_ERROR:-no reason given}); the next update tries again." >> "$GENESIS_DEPLOY_SUMMARY" || true
+    echo "uv's Python could not be fully upgraded (${GENESIS_UV_PYTHON_ERROR:-no reason given}); the next update that applies a change tries again." >> "$GENESIS_DEPLOY_SUMMARY" || true
 fi
 if [ -n "${GENESIS_UV_PYTHON_MOVED:-}" ]; then
     echo "  uv's Python: $GENESIS_UV_PYTHON_MOVED"
@@ -1028,7 +1028,7 @@ if [ -n "${GENESIS_UV_BEHIND:-}" ]; then
     echo "uv is at $GENESIS_UV_BEHIND, below the pinned $GENESIS_UV_VERSION, and could not update itself, so its Python may lag." >> "$GENESIS_DEPLOY_SUMMARY" || true
 fi
 if [ -n "${GENESIS_UV_PIN_STALE:-}" ]; then
-    echo "The pinned uv ($GENESIS_UV_VERSION) is over $GENESIS_UV_PIN_MAX_AGE_DAYS days old, so newer Python patches may exist. Bump it in scripts/lib/python312.sh." >> "$GENESIS_DEPLOY_SUMMARY" || true
+    echo "The pinned uv ($GENESIS_UV_VERSION) is over $GENESIS_UV_PIN_MAX_AGE_DAYS days old, so hosts on uv's Python may lag on patches. It moves by a reviewed change to scripts/lib/python312.sh; an edit on this host would stop the next update." >> "$GENESIS_DEPLOY_SUMMARY" || true
 fi
 echo "  Syncing dependencies..."
 # Worktree guard + editable install + import verification — shared with

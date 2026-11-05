@@ -651,7 +651,70 @@ def test_uv_calls_that_download_are_bounded(host, tmp_path):
     (host.bin / "sleep").symlink_to("/usr/bin/sleep")
     done = _upgrade(host, _uv_venv(host, tmp_path / "venv"), setup="GENESIS_UV_TIMEOUT_S=1")
     assert done.returncode != 0
-    assert "GENESIS_UV_PYTHON_ERROR=" in done.stdout
+    assert "GENESIS_UV_PYTHON_ERROR=uv python upgrade passed its 1 s limit\n" in done.stdout
+
+
+def test_a_self_update_that_stalls_is_bounded_and_reported(host, tmp_path):
+    uv = host.fake_uv(host.bin / "uv", version="0.1.0")
+    uv.write_text(uv.read_text().replace('[ "$1" = self ] && {', '[ "$1" = self ] && { sleep 30;'))
+    (host.bin / "sleep").symlink_to("/usr/bin/sleep")
+    done = _upgrade(host, _uv_venv(host, tmp_path / "venv"), setup="GENESIS_UV_TIMEOUT_S=1")
+    assert done.returncode == 0, done.stderr
+    assert "GENESIS_UV_BEHIND=0.1.0\n" in done.stdout
+
+
+def test_the_limit_uses_a_timeout_that_kills_the_whole_group(host, tmp_path):
+    """uutils' sends its KILL to the direct child alone, so a stalled uv's children
+    would keep the server down past the limit. The helper swaps in GNU's."""
+    _stub(host.bin / "timeout", '[ "$1" = --version ] && echo "timeout (uutils coreutils) 0.8.0"\nexit 3')
+    _stub(host.bin / "gnutimeout", f'echo "gnutimeout $*" >> {host.calls}\nshift 3\nexec "$@"')
+    host.fake_uv(host.bin / "uv")
+    done = _upgrade(host, _uv_venv(host, tmp_path / "venv"))
+    assert done.returncode == 0, done.stderr
+    assert "gnutimeout -k 10 600" in host.logged()
+
+
+def test_a_warning_from_uv_is_not_part_of_the_path(host, tmp_path):
+    """It would have read as a Python uv does not manage, on every update."""
+    uv = host.fake_uv(host.bin / "uv")
+    uv.write_text(uv.read_text().replace('find) echo', 'find) echo "warning: something" >&2; echo'))
+    done = _upgrade(host, _uv_venv(host, tmp_path / "venv"))
+    assert done.returncode == 0, done.stdout
+    assert "GENESIS_UV_PYTHON_ERROR=\n" in done.stdout
+
+
+def test_a_failed_find_gives_uvs_own_reason(host, tmp_path):
+    uv = host.fake_uv(host.bin / "uv")
+    uv.write_text(uv.read_text().replace('find) echo', 'find) echo "error: no Python" >&2; exit 2; echo'))
+    done = _upgrade(host, _uv_venv(host, tmp_path / "venv"))
+    assert done.returncode != 0
+    assert "GENESIS_UV_PYTHON_ERROR=error: no Python\n" in done.stdout
+
+
+def test_an_aged_pin_is_flagged_on_a_host_on_a_packaged_python_too(host, tmp_path):
+    """Otherwise whoever moves the pin may never see the line."""
+    host.fake_uv(host.bin / "uv")
+    done = _upgrade(host, _packaged_venv(tmp_path), setup="GENESIS_UV_PINNED_ON=2000-01-01")
+    assert done.returncode == 0, done.stderr
+    assert "GENESIS_UV_PIN_STALE=1\n" in done.stdout
+    assert "uv python upgrade" not in host.logged()
+
+
+def test_no_uv_install_is_left_unpinned():
+    """The latest uv on a fresh host would make the pin mean nothing there."""
+    root = Path(LIB).resolve().parents[2]
+    for script in ("scripts/install.sh", "scripts/bootstrap.sh", "scripts/lib/python312.sh"):
+        assert "astral.sh/uv/install.sh" not in (root / script).read_text(), script
+
+
+def test_a_stale_executable_line_alone_is_rewritten(host, tmp_path):
+    """The graph census compares that line with what a process runs, and a version
+    line that is right says nothing about it."""
+    venv = _uv_venv(host, tmp_path / "venv", recorded=host.managed / "p0" / "bin" / "python3.12")
+    host.fake_uv(host.bin / "uv")
+    done = _upgrade(host, venv)
+    assert done.returncode == 0, done.stderr
+    assert f"executable = {host.uv_python.resolve()}" in (venv / "pyvenv.cfg").read_text()
 
 
 def test_a_venv_python_that_cannot_run_is_reported(host, tmp_path):
@@ -811,7 +874,7 @@ def test_bootstrap_says_when_the_pin_has_aged(host, tmp_path):
         f'. "{LIB}"\nGENESIS_UV_PINNED_ON=2000-01-01\nPYTHON_BIN=/nonexistent\n' + text
     )
     assert host.run(script).returncode == 0
-    assert "Bump it in scripts/lib/python312.sh" in (host.home / "summary").read_text()
+    assert "It moves by a reviewed change to scripts/lib/python312.sh" in (host.home / "summary").read_text()
 
 
 def test_bootstrap_stays_quiet_when_nothing_moved(host, tmp_path):
@@ -831,7 +894,7 @@ def test_a_failed_upgrade_does_not_stop_the_update(host, tmp_path):
     assert "REACHED THE INSTALL" in done.stdout
     summary = (host.home / "summary").read_text()
     assert "error: network down" in summary
-    assert "the next update tries again" in summary
+    assert "the next update that applies a change tries again" in summary
 
 
 @pytest.mark.parametrize("failure", ["upgrade fails", "patch moved", "uv moved", "uv behind"])
