@@ -96,6 +96,7 @@ _SCRIPT_FILES = (
     "deploy_code_only.sh",
     "lib/guardian_pause.sh",
     "lib/deploy_marker.sh",
+    "lib/gnu_timeout.sh",
     "lib/live_system_guard.sh",
     "lib/alert_queue.sh",
     "lib/deploy_status.sh",

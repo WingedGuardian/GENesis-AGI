@@ -74,6 +74,19 @@ version was a string matcher wearing an inode matcher's clothes — it gated on 
 word ``secrets.env`` appearing anywhere, including in this module's own commit
 message. Re-derive by replaying the corpus through ``touches_secrets``.
 
+One exemption narrows the glob arm (#3789): a ``*`` inside a wholly quoted
+argument of ``python -m genesis db query`` is SQL, not a pattern, so from a
+checkout root holding the file a read-only query no longer reads as a secrets
+access. It is an exact-form allowlist (``_db_query_literals``), not a shell
+model. MEASURED 2026-11-03, replaying 58,014 wildcard-bearing Bash commands from
+30 days of one install's transcripts: 6 commands stop gating, every one a
+``genesis db query`` with ``*`` in its SQL, and none start. (An earlier replay
+showed a single transient difference; it was the glob walk's time budget under
+load, identical on ten re-runs, on a command this exemption never touches.) The
+exemption does NOT address the rest of the glob arm's false positives: most of
+the ~1,700 commands it gates in that corpus are scripts or SQL with a ``*`` the
+shell never expands. That class needs the boundary rebuild, #2230.
+
 Stdlib only, no ``genesis`` import, and every path operation is wrapped: a
 resolution failure must never crash the hook it guards — including
 ``ValueError``, which ``Path.stat()`` (not ``OSError``) raises on an embedded NUL,
@@ -85,6 +98,7 @@ from __future__ import annotations
 import glob
 import os
 import re
+import shlex
 import sys
 import time
 from pathlib import Path
@@ -320,6 +334,122 @@ _EXEC_RECEIVERS = frozenset(
 )
 
 
+#: Characters that end the db-query exemption anywhere in the command, quoted or
+#: not. With these absent, nothing inside a quoted span is expanded or
+#: substituted (single quotes have no escapes; double quotes lose their only
+#: specials), and the line is one physical line.
+_DBQ_COMMAND_BAN = frozenset("$`\\\n\r")
+#: Characters a BARE (unquoted) word may not carry: globs, grouping and process
+#: substitution, redirects, separators, comments, and quotes (a half-quoted
+#: word such as `q"` or `s*"".env` is where a quote-keeping tokenizer and bash
+#: disagree, so it is refused rather than modelled).
+_DBQ_BARE_BAN = frozenset("*?[]{}()<>;|&#'\"")
+_DBQ_VERB = ["-m", "genesis", "db", "query"]
+_DBQ_TAILS = frozenset({"head", "tail", "cut"})
+_PYTHON = re.compile(r"python[0-9.]*")
+_DIGITS = re.compile(r"[0-9]+")
+#: Longest line the exemption will parse. The canonical parse is quadratic in
+#: pipe stages: MEASURED 0.05s at 2 KB, 8.3s at 131 KB of `| cut ` stages, and a
+#: hook that overruns its 10s timeout ALLOWS the command. A real query line is
+#: far shorter; a longer one simply gets main's behaviour.
+_DBQ_MAX_CHARS = 4096
+
+
+def _whole_quoted(tok: str) -> bool:
+    """A token wrapped in one quote pair whose quote char does not recur inside.
+
+    MEASURED (CPython shlex, posix=False): a token that opens with a quote ends
+    at its closing quote, so `"a""b"` arrives as two tokens and `"s"*".env"` as
+    `"s"` plus the bare `*".env"` (refused). The recurrence test is therefore
+    defense in depth. Bash joins `"a""b"` into one word, but that word is wholly
+    quoted to bash too, so nothing in it expands.
+    """
+    return len(tok) >= 2 and tok[0] in "'\"" and tok[-1] == tok[0] and tok[0] not in tok[1:-1]
+
+
+def _bare(tok: str) -> bool:
+    return not any(ch in _DBQ_BARE_BAN for ch in tok)
+
+
+def _db_query_literals(command: str) -> set[str]:
+    """Glob-looking pieces that are literal text inside a `genesis db query` argument.
+
+    #3789: from a checkout root holding `secrets.env`, the glob arm read the `*`
+    in `python -m genesis db query "select * from t"` as a pattern matching the
+    file, so a read-only query denied a dispatched session and raised a false
+    CRITICAL. The program is safe by construction: `run_readonly_query` opens
+    the database read-only, its authorizer denies `readfile`, `writefile`,
+    `edit` and `load_extension`, and nothing in `db/query_cli.py` globs or
+    reaches a shell (`--db` only expands `~`).
+
+    The exemption is a tiny closed GRAMMAR over the whole line, not a shell
+    model. Four review rounds against wider designs each found a new shape
+    (eval, `$(…)` in quotes, quote/comment desync, a printed literal piped to
+    `sh`, `> >(sh)`, `| xargs head`), so the accepted line is exactly:
+
+        [timeout N] <dir/>python* -m genesis db query WORD... [2>&1] [| head|tail|cut WORD...]...
+
+    where each query WORD is either wholly quoted (one quote pair, delimiter not
+    recurring) or bare without `_DBQ_BARE_BAN`, and every word after a pipe is
+    bare. No other command, wrapper, redirect, subshell or substitution can
+    appear, so nothing on the line can execute the program's output or expand a
+    wildcard: only the quoted query words contribute pieces. With
+    `_DBQ_COMMAND_BAN` absent, `shlex.split(posix=False)` pairs quotes as bash
+    does for every line this accepts, because a word containing a quote is
+    either wholly quoted or refused. The canonical parser must also read the
+    line with no blind spot. Anything else returns the empty set: the old
+    behaviour, which gates.
+
+    Trust, stated: a `python*` binary is taken to be the interpreter running the
+    real `genesis` package. A session able to plant a fake one can already read
+    the file without tripping this guard, so that gains nothing new.
+    """
+    # Cheap pre-filter: the parse below costs as much as the guard's own, and a
+    # hook that overruns its timeout ALLOWS the command.
+    if len(command) > _DBQ_MAX_CHARS:
+        return set()
+    if "genesis" not in command or "query" not in command:
+        return set()
+    if any(ch in _DBQ_COMMAND_BAN for ch in command):
+        return set()
+    try:
+        toks = shlex.split(command, posix=False)
+    except ValueError:
+        return set()
+    i = 2 if len(toks) >= 2 and toks[0] == "timeout" and _DIGITS.fullmatch(toks[1]) else 0
+    if len(toks) < i + 5 or not _bare(toks[i]) or not _PYTHON.fullmatch(os.path.basename(toks[i])):
+        return set()
+    if toks[i + 1 : i + 5] != _DBQ_VERB:
+        return set()
+    query, rest = toks[i + 5 :], []
+    if "2>&1" in query:
+        cut = query.index("2>&1")
+        query, rest = query[:cut], query[cut + 1 :]
+    elif "|" in query:
+        cut = query.index("|")
+        query, rest = query[:cut], query[cut:]
+    if not all(_whole_quoted(t) or _bare(t) for t in query):
+        return set()
+    while rest:
+        if len(rest) < 2 or rest[0] != "|" or rest[1] not in _DBQ_TAILS:
+            return set()
+        nxt = rest.index("|", 2) if "|" in rest[2:] else len(rest)
+        if not all(_bare(t) for t in rest[2:nxt]):
+            return set()
+        rest = rest[nxt:]
+    try:
+        _segments, blind = shell_parse.analyze_checked(command)
+    except Exception:  # noqa: BLE001 - unparseable: no exemption
+        return set()
+    if blind is not None:
+        return set()
+    pieces: set[str] = set()
+    for t in query:
+        if _whole_quoted(t):
+            pieces.update(p for p in _tokens(t[1:-1]) if any(ch in p for ch in "*?["))
+    return pieces
+
+
 def _heredoc_feeds_an_executor(command: str) -> bool:
     """Does any segment of this command EXECUTE what a heredoc gives it?
 
@@ -514,6 +644,8 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "") -> boo
         # `open("secrets.env")` reads the file — not prose. Every token counts.
         unquoted.update(_tokens(scan))
 
+    literal_globs = _db_query_literals(command)
+
     for raw_tok in _tokens(scan):
         if not _PATHY.search(raw_tok):
             continue
@@ -530,7 +662,12 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "") -> boo
                 return True
             # Expand globs against the real filesystem — this is what catches
             # `secrets.*`, `secrets.e*`, `s*.env` without enumerating spellings.
-            if any(ch in tok for ch in "*?[") and _glob_hits_secret(tok, inodes):
+            # A query argument's literal `*` is not a pattern (#3789).
+            if (
+                any(ch in tok for ch in "*?[")
+                and raw_tok not in literal_globs
+                and _glob_hits_secret(tok, inodes)
+            ):
                 return True
             # Unresolvable shape next to secrets wording -> gate rather than guess.
             if secretish and _SUSPICIOUS.search(tok):

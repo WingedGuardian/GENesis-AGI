@@ -40,8 +40,11 @@ def test_load_secrets_reads_keyvalue_and_skips_comments(monkeypatch, tmp_path):
     secrets.write_text(
         '# a comment\nAPI_KEY_OPENROUTER=abc123\n\nQUOTED_KEY="q-value"\nNOT_A_PAIR_LINE\n',
     )
-    monkeypatch.delenv("API_KEY_OPENROUTER", raising=False)
-    monkeypatch.delenv("QUOTED_KEY", raising=False)
+    # setenv first, so teardown restores ABSENCE: a bare delenv of an absent key
+    # records nothing, and the values load_secrets() writes would leak on.
+    for name in ("API_KEY_OPENROUTER", "QUOTED_KEY"):
+        monkeypatch.setenv(name, "x")
+        monkeypatch.delenv(name)
     monkeypatch.setattr(client_mod, "_candidate_secret_paths", lambda: [secrets])
     load_secrets(force=True)
     import os

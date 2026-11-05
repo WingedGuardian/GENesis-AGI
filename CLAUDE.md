@@ -87,6 +87,10 @@ installs with no graph engine, so it is enabled everywhere; see
 the oneshot bootstrap starts after installing the browser packages: the
 Camoufox engine and Chromium they pin, and their system libraries; see
 `scripts/install_browser_stack.sh`),
+`genesis-inbox-sync.timer` (every 5 minutes, mirrors the vault set in
+`inbox_monitor.sync_remote` into the inbox and pushes responses back; exits at
+once where none is set, and the awareness loop alerts when its heartbeat goes
+stale; see `scripts/inbox_sync.sh`),
 `genesis-code-intel.timer` (idle-gated code-intel
 index-request consumer; see `scripts/code_intel_runner.sh`) with
 `genesis-code-intel-freeze.service` as its on-demand kill-switch (rendered but
@@ -596,6 +600,10 @@ gate works, its exemption categories, and the unit rules for size bounds:
   score; under the shipped `doc_findings: skip`, documentation findings do not
   score either. `codex-at-head: ok` is not "review is clear": read the
   `inline-findings` row, not just the Codex row.
+  **A review also comes before the PR.** `gh pr create` on the public repo is refused
+  until a reviewer agent or `/code-review` of the branch has finished in this session;
+  `# pr-review-waived` records the owner's yes given in chat (build-session). Codex CLI
+  sessions and normal dispatched sessions do not run this hook.
   A self-authored PR merges through the maintainer's admin bypass of GitHub's
   one-approval rule, because a sole maintainer cannot approve their own pull
   request (`.github/rulesets/README.md`; closing-session skill, "Honest

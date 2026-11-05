@@ -44,7 +44,9 @@ from genesis.memory.graph_telemetry import (
     exception_reason,
     note_traversal,
     publish_selection,
+    read_retry,
     read_selection,
+    reset_retry,
     reset_selection,
 )
 from genesis.memory.graphstore import (
@@ -253,6 +255,7 @@ async def traverse(
     start = time.monotonic()
 
     reset_selection()
+    reset_retry()
     active = _traversal_store()
     configured, selection_error = read_selection()
     track = _TraversalTrack(served_by=getattr(active, "name", "?"))
@@ -277,6 +280,18 @@ async def traverse(
         )
 
     track.on_break = _record_break
+
+    async def _record_retry(reason: str) -> None:
+        # The store is retrying a connection the engine dropped (#3035): the
+        # clock-breaking row is written NOW, before the retry is awaited, so a
+        # process killed mid-retry cannot lose it. One traversal, one row: a
+        # fallback after a failed retry finds the row already written.
+        if track.recorded:
+            return
+        track.primary_reason = reason
+        await _record_break("retried")
+
+    reset_retry(_record_retry)
     try:
         if selection_error:
             await _record_break("selection_failed")
@@ -294,6 +309,13 @@ async def traverse(
             outcome = "selection_failed"
         elif track.fell_back:
             outcome = "fallback"
+        elif (retried_after := read_retry()) is not None:
+            # The engine had already dropped a connection when the caller gave
+            # up (during the retry, or during the marker query after it). That
+            # drop is the event the clock exists to see; a cancellation must not
+            # turn it into a neutral row.
+            outcome = "retried"
+            track.primary_reason = retried_after
         else:
             outcome = "cancelled"
         track.served_by = "none"
@@ -308,11 +330,20 @@ async def traverse(
             outcome = "fallback"
         elif track.declined:
             outcome = "mode_unsupported"
+        elif (retried_after := read_retry()) is not None:
+            # The selected store answered, but only by retrying a connection the
+            # engine had dropped (#3035). Clock-breaking by design: a successful
+            # retry must never let a restarting engine read as a clean one.
+            outcome = "retried"
+            track.primary_reason = retried_after
         else:
             outcome = "primary"
             primary_ms = result.query_ms
         return result
     finally:
+        # The retry hook closes over THIS traversal's track and db: clear it so
+        # a later store read in the same task cannot write through it.
+        reset_retry()
         # Only a classified outcome is recorded: anything else escaping
         # (interpreter shutdown) must not trigger a database write. A traversal
         # whose break was already recorded has its row.
