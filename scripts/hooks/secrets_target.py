@@ -660,6 +660,13 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "") -> boo
         for tok in expansions:
             if _is_secret_path(tok, inodes, allow_bare=raw_tok in unquoted):
                 return True
+            # A name joined to a prefix (`--files0-from=secrets.env`): the program
+            # opens the part after the joint. The name/path test only: bash globs
+            # and expands the WHOLE word, never a piece of it, so the glob and
+            # suspicion arms below stay on `tok`.
+            for piece in _operand_spellings(tok)[1:]:
+                if _is_secret_path(piece, inodes, allow_bare=raw_tok in unquoted):
+                    return True
             # Expand globs against the real filesystem — this is what catches
             # `secrets.*`, `secrets.e*`, `s*.env` without enumerating spellings.
             # A query argument's literal `*` is not a pattern (#3789).
@@ -674,6 +681,23 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "") -> boo
                 return True
 
     return False
+
+
+#: Characters that join an operand onto a prefix inside one shell word:
+#: ``--files0-from=NAME``, ``-Dk=NAME``, ``@NAME`` (curl, gcc and others read the
+#: file a leading ``@`` names), ``a:NAME`` (path lists). Programs open the part
+#: after the joint, so each part is checked as an operand of its own.
+_JOINTS = re.compile(r"[=:]")
+
+
+def _operand_spellings(tok: str) -> list[str]:
+    """``tok`` itself, then each piece a joint or a leading ``@`` separates."""
+    out = [tok]
+    for piece in _JOINTS.split(tok):
+        for cand in (piece, piece[1:] if piece.startswith("@") else ""):
+            if cand and cand not in out:
+                out.append(cand)
+    return out
 
 
 def _tokens(text: str) -> list[str]:
