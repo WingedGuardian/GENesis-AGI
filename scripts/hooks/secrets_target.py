@@ -684,19 +684,19 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "") -> boo
 
 
 #: Characters that join an operand onto a prefix inside one shell word:
-#: ``--files0-from=NAME``, ``-Dk=NAME``, ``@NAME`` (curl, gcc and others read the
-#: file a leading ``@`` names), ``a:NAME`` (path lists). Programs open the part
-#: after the joint, so each part is checked as an operand of its own.
-_JOINTS = re.compile(r"[=:]")
+#: ``--files0-from=NAME``, ``-Dk=NAME``, ``@NAME`` and ``-d@NAME`` (curl, gcc and
+#: others read the file an ``@`` names, and a short option takes its value
+#: attached), ``a:NAME`` (path lists). Programs open the part after the joint, so
+#: each part is checked as an operand of its own.
+_JOINTS = re.compile(r"[=:@]")
 
 
 def _operand_spellings(tok: str) -> list[str]:
-    """``tok`` itself, then each piece a joint or a leading ``@`` separates."""
+    """``tok`` itself, then each non-empty piece a joint separates."""
     out = [tok]
     for piece in _JOINTS.split(tok):
-        for cand in (piece, piece[1:] if piece.startswith("@") else ""):
-            if cand and cand not in out:
-                out.append(cand)
+        if piece and piece not in out:
+            out.append(piece)
     return out
 
 
