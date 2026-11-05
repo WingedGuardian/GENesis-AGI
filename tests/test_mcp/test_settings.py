@@ -475,7 +475,7 @@ def test_atomic_write_overwrites(config_dir: Path):
 
 
 async def test_settings_tools_registered():
-    tools = await mcp.get_tools()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
     for name in ["settings_list", "settings_get", "settings_update"]:
         assert name in tools, f"Missing tool: {name}"
 

@@ -54,7 +54,8 @@ def test_a_script_seeding_its_own_bus_default_still_cannot_connect():
     proc = subprocess.run(
         ["bash", "-c", script], env=dict(os.environ), capture_output=True, text=True
     )
-    assert "Failed to connect to bus" in proc.stderr, proc
+    # systemd 255 ends this "to bus", 259 "to user scope bus via local transport".
+    assert "Failed to connect to" in proc.stderr, proc
 
 
 def test_a_script_calling_systemctl_reaches_the_stub_and_is_answered():

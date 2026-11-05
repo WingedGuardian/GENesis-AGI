@@ -33,8 +33,47 @@ if [ "$1" = "list-unit-files" ]; then
     printf '%s' "${OOMD_UNIT_LINE-systemd-oomd.service enabled enabled}"
     exit 0
 fi
+# Reads of the user manager's root slice: answered from the environment, never
+# logged (a read is not systemd churn).
+if [ "$1" = "--user" ] && [ "$2" = "show" ]; then
+    case "$*" in
+        *ManagedOOMMemoryPressureLimit*) printf '%s\\n' "${UM_ROOT_LIMIT-2576980377}" ;;
+        *ManagedOOMMemoryPressure*) printf '%s\\n' "${UM_ROOT_MODE-}" ;;
+        *ManagedOOMPreference*init.scope*) printf '%s\\n' "${UM_INIT_PREF-omit}" ;;
+        *ManagedOOMPreference*dbus.service*) printf '%s\\n' "${UM_DBUS_PREF-avoid}" ;;
+        *ControlGroup*) printf '%s\\n' "${UM_ROOT_CG-/user.slice/user-1000.slice/user@1000.service}" ;;
+    esac
+    exit 0
+fi
+# PID 1's view of user.slice and oomd's state: reads, answered from the
+# environment and never logged.
+if [ "$1" = "show" ] && [ "${*: -1}" = "user.slice" ]; then
+    printf '%s\\n%s\\n' "${SYS_SLICE_MODE-kill}" "${SYS_SLICE_LIMIT-3435973836}"
+    exit 0
+fi
+if [ "$1" = "is-active" ]; then exit "${OOMD_ACTIVE_RC:-0}"; fi
 echo "$@" >> "$SYSTEMCTL_LOG"
+if [ "$1" = "--user" ] && [ "$2" = "daemon-reload" ]; then exit "${USER_RELOAD_RC:-0}"; fi
 exit 0
+"""
+
+# oomctl: prints a Memory Pressure Monitored list naming $OOMCTL_PATHS
+# (space-separated); OOMCTL_RC makes it fail; OOMCTL_FLAP_FILE lists the paths
+# on the first call only (a report that is erased right after).
+_OOMCTL_STUB = """#!/bin/bash
+[ -n "${OOMCTL_RC:-}" ] && exit "$OOMCTL_RC"
+if [ -n "${OOMCTL_FLAP_FILE:-}" ]; then
+    if [ -e "$OOMCTL_FLAP_FILE" ]; then OOMCTL_PATHS=/user.slice; else : > "$OOMCTL_FLAP_FILE"; fi
+fi
+echo "Dry Run: no"
+echo "Swap Monitored CGroups:"
+echo "Memory Pressure Monitored CGroups:"
+for p in ${OOMCTL_PATHS-/user.slice}; do printf '\\tPath: %s\\n' "$p"; done
+"""
+
+_ID_STUB = """#!/bin/bash
+if [ "$1" = "-u" ]; then echo "${FAKE_UID:-1000}"; exit 0; fi
+exec /usr/bin/id "$@"
 """
 
 _DETECT_VIRT_STUB = """#!/bin/bash
@@ -62,6 +101,8 @@ def _stage(tmp_path: Path) -> dict:
         ("systemctl", _SYSTEMCTL_STUB),
         ("systemd-detect-virt", _DETECT_VIRT_STUB),
         ("swapon", _SWAPON_STUB),
+        ("oomctl", _OOMCTL_STUB),
+        ("id", _ID_STUB),
     ):
         stub = bin_dir / name
         stub.write_text(body)
@@ -83,6 +124,10 @@ def _stage(tmp_path: Path) -> dict:
         "MEMRES_SYSTEMD_RUNTIME_DIR": "/run/systemd/system",
         "MEMRES_PSI_FILE": str(psi),
         "MEMRES_CGROUP_SWAP_MAX": str(swap_max),
+        "MEMRES_USER_UNIT_DIR": str(tmp_path / "user-units"),
+        "MEMRES_OOMCTL_POLL_S": "0",
+        "UM_ROOT_MODE": "kill",
+        "MEMRES_OOMCTL_CONFIRM_S": "0",
     }
 
 
@@ -138,10 +183,10 @@ def test_fresh_apply_writes_dropins_and_reloads(tmp_path):
 
     files = _dropins(env)
     assert files["user_slice"].read_text() == _stamped(
-        "[Slice]\nManagedOOMMemoryPressure=kill\nManagedOOMMemoryPressureLimit=60%\n"
+        "[Slice]\nManagedOOMMemoryPressure=kill\nManagedOOMMemoryPressureLimit=80%\n"
     )
     assert files["user_service"].read_text() == _stamped(
-        "[Service]\nManagedOOMMemoryPressure=kill\n"
+        "[Service]\nManagedOOMMemoryPressure=kill\nManagedOOMMemoryPressureLimit=60%\n"
     )
     assert files["oomd_conf"].read_text() == _stamped(
         "[OOM]\nSwapUsedLimit=90%\nDefaultMemoryPressureLimit=60%\n"
@@ -157,6 +202,8 @@ def test_fresh_apply_writes_dropins_and_reloads(tmp_path):
     assert "daemon-reload" in calls
     assert "enable systemd-oomd" in calls  # no --now: restart below does the single start
     assert "restart systemd-oomd" in calls
+    # The user half verifies AFTER the /etc half's oomd restart.
+    assert calls.index("restart systemd-oomd") < calls.index("--user daemon-reload")
 
 
 def test_second_run_is_a_noop(tmp_path):
@@ -414,14 +461,16 @@ def test_bootstrap_and_update_wire_pid_budget_apply():
 # ── Hand edits are kept, not overwritten (scripts/lib/managed_etc.sh) ────────
 
 
-_SLICE = "[Slice]\nManagedOOMMemoryPressure=kill\nManagedOOMMemoryPressureLimit=60%\n"
+_SLICE = "[Slice]\nManagedOOMMemoryPressure=kill\nManagedOOMMemoryPressureLimit=80%\n"
+_SLICE_V1 = "[Slice]\nManagedOOMMemoryPressure=kill\nManagedOOMMemoryPressureLimit=60%\n"
+_SERVICE = "[Service]\nManagedOOMMemoryPressure=kill\nManagedOOMMemoryPressureLimit=60%\n"
 
 
 def test_a_drop_in_edited_by_hand_is_kept_and_named(tmp_path):
     env = _stage(tmp_path)
     files = _dropins(env)
     files["user_slice"].parent.mkdir(parents=True)
-    edited = "[Slice]\nManagedOOMMemoryPressure=kill\nManagedOOMMemoryPressureLimit=80%\n"
+    edited = "[Slice]\nManagedOOMMemoryPressure=kill\nManagedOOMMemoryPressureLimit=70%\n"
     files["user_slice"].write_text(edited)
     result = _run(env)
     assert result.returncode == 0, result.stderr
@@ -439,7 +488,7 @@ def test_an_unstamped_genesis_drop_in_is_stamped_without_restarting_oomd(tmp_pat
     env = _stage(tmp_path)
     bare = {
         "user_slice": _SLICE,
-        "user_service": "[Service]\nManagedOOMMemoryPressure=kill\n",
+        "user_service": _SERVICE,
         "oomd_conf": "[OOM]\nSwapUsedLimit=90%\nDefaultMemoryPressureLimit=60%\n"
         "DefaultMemoryPressureDurationSec=20s\n",
     }
@@ -522,3 +571,218 @@ def test_the_run_summary_names_a_kept_file_without_counting_it_as_a_unit(tmp_pat
     lines = summary.read_text().splitlines()
     assert any(line.startswith(f"kept-etc {path}: edited by hand") for line in lines)
     assert not any(line.startswith("kept ") for line in lines)  # bootstrap's unit count
+
+
+# --- the user-manager monitor and the user.slice decision (systemd #43174) ---
+
+_UM_CG = "/user.slice/user-1000.slice/user@1000.service"
+_UM_ROOT = "[Slice]\nManagedOOMMemoryPressure=kill\nManagedOOMMemoryPressureLimit=60%\n"
+_UM_INIT = "[Scope]\nManagedOOMPreference=omit\n"
+_UM_DBUS = "[Service]\nManagedOOMPreference=avoid\n"
+
+
+def _user_dropins(env: dict) -> dict[str, Path]:
+    d = Path(env["MEMRES_USER_UNIT_DIR"])
+    return {
+        "root": d / "-.slice.d/genesis-oomd.conf",
+        "init": d / "init.scope.d/genesis-oomd.conf",
+        "dbus": d / "dbus.service.d/genesis-oomd.conf",
+    }
+
+
+def _live(env: dict) -> dict:
+    """The user manager reports kill for its root slice and oomd lists it."""
+    env.update({"UM_ROOT_MODE": "kill", "OOMCTL_PATHS": f"/user.slice {_UM_CG}"})
+    return env
+
+
+def _slice_text(env: dict) -> str:
+    return _dropins(env)["user_slice"].read_text()
+
+
+def test_user_half_writes_the_three_drop_ins_and_reloads_once(tmp_path):
+    env = _stage(tmp_path)
+    result = _run(env)
+    assert result.returncode == 0, result.stderr
+    files = _user_dropins(env)
+    assert files["root"].read_text() == _stamped(_UM_ROOT)
+    assert files["init"].read_text() == _stamped(_UM_INIT)
+    assert files["dbus"].read_text() == _stamped(_UM_DBUS)
+    assert Path(env["SYSTEMCTL_LOG"]).read_text().count("--user daemon-reload") == 1
+
+    Path(env["SYSTEMCTL_LOG"]).write_text("")
+    _run(env)
+    assert "--user daemon-reload" not in Path(env["SYSTEMCTL_LOG"]).read_text()
+
+
+def test_backstop_is_kill_at_80_whatever_the_user_monitor_reports(tmp_path):
+    """user.slice is never switched off: it is the backstop at 80%, above the
+    user-manager monitor's 60%, verified or not."""
+    for live in (True, False):
+        (tmp_path / str(live)).mkdir()
+        env = _stage(tmp_path / str(live))
+        if live:
+            _live(env)
+        result = _run(env)
+        assert result.returncode == 0, result.stderr
+        assert _slice_text(env) == _stamped(_SLICE)
+        assert "user.slice backstop kill @80% PSI" in result.stdout
+        assert ("verified live" in result.stdout) is live
+
+
+@pytest.mark.parametrize("breakage", ["reload_fails", "root_mode_auto", "root_dropin_edited",
+                                      "oomctl_missing_path", "oomctl_fails", "oomctl_flaps"])
+def test_each_failed_check_reports_the_user_monitor_unverified(tmp_path, breakage):
+    env = _live(_stage(tmp_path))
+    if breakage == "reload_fails":
+        env["USER_RELOAD_RC"] = "1"
+    elif breakage == "root_mode_auto":
+        env["UM_ROOT_MODE"] = "auto"
+    elif breakage == "root_dropin_edited":
+        root = _user_dropins(env)["root"]
+        root.parent.mkdir(parents=True)
+        root.write_text("[Slice]\nManagedOOMMemoryPressure=kill\nManagedOOMMemoryPressureLimit=40%\n")
+    elif breakage == "oomctl_missing_path":
+        env["OOMCTL_PATHS"] = "/user.slice"
+    elif breakage == "oomctl_fails":
+        env["OOMCTL_RC"] = "1"
+    elif breakage == "oomctl_flaps":
+        env["OOMCTL_FLAP_FILE"] = str(tmp_path / "flap")
+    result = _run(env)
+    assert result.returncode == 0, result.stderr
+    assert "User-manager monitor not verified" in result.stdout
+    assert "user manager NOT verified" in result.stdout
+    assert _slice_text(env) == _stamped(_SLICE)
+
+
+def test_unreported_drop_in_gets_a_retry_reload(tmp_path):
+    """The drop-in is already in place (no change this run) but the manager
+    does not report kill: an earlier reload failed. The run reloads again."""
+    env = _stage(tmp_path)
+    _run(env)  # writes the user drop-ins
+    Path(env["SYSTEMCTL_LOG"]).write_text("")
+    env["UM_ROOT_MODE"] = "auto"
+    _run(env)
+    assert Path(env["SYSTEMCTL_LOG"]).read_text().count("--user daemon-reload") == 1
+
+
+def test_running_as_root_skips_the_user_half(tmp_path):
+    env = _live(_stage(tmp_path))
+    env["FAKE_UID"] = "0"
+    result = _run(env)
+    assert result.returncode == 0, result.stderr
+    assert "running as root" in result.stdout
+    assert not _user_dropins(env)["root"].exists()
+    assert _slice_text(env) == _stamped(_SLICE)
+
+
+def test_user_half_runs_even_without_sudo(tmp_path):
+    env = _live(_stage(tmp_path))
+    env["SUDO_N_RC"] = "1"
+    result = _run(env)
+    assert result.returncode == 0, result.stderr
+    assert _user_dropins(env)["root"].read_text() == _stamped(_UM_ROOT)
+    assert "sudo unavailable" in result.stdout
+    assert not _dropins(env)["user_slice"].exists()
+
+
+@pytest.mark.parametrize(("key", "old", "new"), [
+    ("user_service", "[Service]\nManagedOOMMemoryPressure=kill\n", _SERVICE),
+    ("user_slice", _SLICE_V1, _SLICE),
+])
+def test_legacy_unstamped_genesis_content_is_replaced_not_kept(tmp_path, key, old, new):
+    """An install that never updated since stamps holds an earlier Genesis
+    content bare; it is Genesis's, so it is replaced, not kept as an edit."""
+    env = _stage(tmp_path)
+    path = _dropins(env)[key]
+    path.parent.mkdir(parents=True)
+    path.write_text(old)
+    result = _run(env)
+    assert result.returncode == 0, result.stderr
+    assert path.read_text() == _stamped(new)
+    assert "edited by hand" not in result.stdout
+
+
+def test_stamped_older_slice_limit_is_rewritten_to_80(tmp_path):
+    env = _stage(tmp_path)
+    path = _dropins(env)["user_slice"]
+    path.parent.mkdir(parents=True)
+    path.write_text(_stamped(_SLICE_V1))
+    _run(env)
+    assert _slice_text(env) == _stamped(_SLICE)
+
+
+
+# --- round 1: every claim in the summary comes from a read ---------------------
+
+
+@pytest.mark.parametrize(
+    ("env_extra", "why"),
+    [
+        ({"UM_ROOT_LIMIT": "3006477107"}, "limit '3006477107'"),
+        ({"UM_INIT_PREF": "none"}, "'none' for init.scope, not omit"),
+        ({"UM_DBUS_PREF": ""}, "'nothing' for dbus.service, not avoid"),
+    ],
+)
+def test_monitor_is_not_live_until_limit_and_marks_read_back(tmp_path, env_extra, why):
+    env = _stage(tmp_path)
+    env.update(env_extra)
+    result = _run(env)
+    assert result.returncode == 0, result.stderr
+    assert "User-manager monitor not verified" in result.stdout and why in result.stdout, result.stdout
+    assert "verified live" not in result.stdout
+
+
+@pytest.mark.parametrize("which", ["init", "dbus"])
+def test_a_hand_edited_mark_drop_in_blocks_live(tmp_path, which):
+    env = _stage(tmp_path)
+    path = _user_dropins(env)[which]
+    path.parent.mkdir(parents=True)
+    path.write_text("[Service]\nManagedOOMPreference=none\n")
+    result = _run(env)
+    assert result.returncode == 0, result.stderr
+    unit = {"init": "init.scope", "dbus": "dbus.service"}[which]
+    assert f"its {unit} drop-in was kept-edited" in result.stdout, result.stdout
+    assert "verified live" not in result.stdout
+
+
+@pytest.mark.parametrize("second_run", [False, True])
+def test_a_backstop_systemd_does_not_report_is_never_called_in_force(tmp_path, second_run):
+    """The summary reads PID 1's view of user.slice. A reload that failed on an
+    earlier run leaves the old limit in systemd; the 'already in place' run
+    that follows must say so, not repeat the drop-in's 80%."""
+    env = _live(_stage(tmp_path))
+    if second_run:
+        _run(env)
+    env["SYS_SLICE_LIMIT"] = "2576980377"
+    result = _run(env)
+    assert result.returncode == 0, result.stderr
+    assert "user.slice backstop NOT confirmed (systemd reports 'kill 2576980377')" in result.stdout, result.stdout
+    assert "backstop kill @80% PSI" not in result.stdout
+
+
+def test_oomd_not_running_overrides_every_claim(tmp_path):
+    env = _live(_stage(tmp_path))
+    env["OOMD_ACTIVE_RC"] = "3"
+    result = _run(env)
+    assert "systemd-oomd is not running, so no monitor is in force" in result.stdout, result.stdout
+    assert "verified live;" not in result.stdout and "kill @80% PSI" not in result.stdout
+
+
+def test_the_healthy_summary_names_every_read(tmp_path):
+    env = _live(_stage(tmp_path))
+    result = _run(env)
+    assert (
+        "user manager kill @60% PSI, init.scope omit, dbus avoid, verified live; "
+        "user.slice backstop kill @80% PSI" in result.stdout
+    ), result.stdout
+
+
+def test_uninstall_removes_the_user_manager_drop_ins():
+    """The drop-ins sit on non-Genesis unit names, so the genesis-* glob in
+    uninstall.sh misses them; each must be named."""
+    text = (Path(__file__).resolve().parents[2] / "scripts" / "uninstall.sh").read_text()
+    loop = text[text.index("for d in -.slice.d init.scope.d dbus.service.d; do"):]
+    # The same root the writer uses (MEMRES_USER_UNIT_DIR follows XDG_CONFIG_HOME).
+    assert 'f="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$d/genesis-oomd.conf"' in loop.split("done", 1)[0]
+    assert "safe_remove" in loop.split("done", 1)[0]

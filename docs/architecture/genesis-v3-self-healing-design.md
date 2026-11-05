@@ -30,7 +30,8 @@ to the repository root.
 
 `src/genesis/autonomy/watchdog.py` — `WatchdogChecker`
 
-- Reads `~/.genesis/status.json` (written every awareness tick by `StatusFileWriter`)
+- Reads `~/.genesis/status.json` (written at startup and by the independent
+  60-second `status_writer_loop`)
 - Staleness threshold: 300s (configurable via `config/autonomy.yaml` `watchdog.staleness_threshold_seconds`)
 - Exponential backoff: 10s initial, doubles per failure, capped at 300s
 - Max 5 consecutive restart attempts before `WatchdogAction.NOTIFY`
@@ -68,10 +69,18 @@ to the repository root.
 
 `src/genesis/resilience/status_writer.py` — `StatusFileWriter`
 
-- Writes `~/.genesis/status.json` every awareness tick
+- Writes `~/.genesis/status.json` at startup and on an independent 60-second loop
 - Atomic write via `tempfile.mkstemp()` + `os.replace()` to prevent partial reads
-- Contains: timestamp, 4-axis resilience state, queue depths (deferred, dead letter, pending embeddings), human summary
+- Collects runtime/async DB state on-loop and passes immutable JSON bytes to an
+  ordered executor worker for directory/temp-file creation, writing and rename.
+  The admission gate remains held until the worker finishes even if its caller
+  is canceled. `aclose()` rejects new writes and drains an admitted write; runtime
+  shutdown calls it before dependency teardown, including partial bootstrap.
+- Contains: snapshot timestamp, resilience axes, queue depths (deferred, dead
+  letter, pending embeddings), human summary, and optional health fields
 - Watchdog uses staleness of this file as the primary bridge liveness signal
+- A delayed write retains its collected timestamp; offloading does not make
+  stalled storage healthy or establish that a concurrent SSH outage is fixed.
 
 ### 2.4 Recovery Orchestrator
 
@@ -276,7 +285,6 @@ genesis-watchdog.timer (systemd, 300s)
 Awareness tick fires
   → Run health probes: probe_db(), probe_qdrant(), probe_ollama(), probe_scheduler()
   → Run filesystem probes: probe_disk()
-  → StatusFileWriter.write()              # Existing: updates status.json
   → RemediationRegistry.check_and_remediate(probe_results)
     → For each registered action:
       → action.condition(probe_results)?  # Does this signal fire?

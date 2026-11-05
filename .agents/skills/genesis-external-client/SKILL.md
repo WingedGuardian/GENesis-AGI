@@ -15,17 +15,31 @@ state through the main checkout rather than creating worktree-local state.
 Codex defers MCP schemas until requested. Before calling a Genesis tool that is
 not already visible, use MCP tool discovery for its exact `server.tool` name.
 
-The initial Codex surface provides approved health and recall tools only. It
-does not expose persistent memory writes, task dispatch, browser control,
-outreach, Discord, recon, campaign management, or session controls. Do not
-work around this allowlist; expanding it needs a separate capability review.
+The ordinary Codex profile provides the approved health and recall floor.
+The separately qualified validator profile also admits memory_store, private
+follow_up_create/list/update and pr_verification_close. It has no session ledger,
+charter, dispatch, browser, outreach, campaign or settings authority. Do not work
+around either allowlist; another expansion needs its own capability review.
 
 The standalone launcher enforces `--external-client` on the server as well as
 the client allowlist. Both the `external` default and explicit `validator`
-profile currently expose the same health and recall floor. Direct calls to
-other tools are rejected before their bodies run; the health bootstrap also
+profile have separate closed tool sets: external retains5health/8memory tools;
+validator admits9health/9memory. Direct calls to other tools are rejected before
+their bodies run; the health bootstrap also
 skips dispatch queue and campaign initialization. These tool profiles are not
 authentication or isolation from an operator with full host access.
+
+Validator follow-ups require user_input_needed, a stable request_key for creation
+and no schedule, pin or session provenance; updates may touch eligible private
+records from other clients. A public link or pending publication makes a row
+ineligible. Memory writes retain the existing collection/supersedes interface and
+its existing partial-failure limits. Use these writes only for authorized work.
+Verification results are derived from strict evidence and an independent PR
+number; the server forces preview until post-calibration operator opt-in. A
+preview discharges nothing. After an uncertain real response, read stored state
+before retrying; verification attempt counters are not idempotency keys. See
+`docs/reference/codex-validator-writers.md`. This skill does not activate the
+dedicated validator launcher or authorize deployment/calibration.
 
 Do not pass a Codex thread or session identifier to `session_charter`,
 `session_ledger_*`, or other session-bound tools. Those tools operate only on an

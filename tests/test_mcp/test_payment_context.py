@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import inspect
 import json
 import logging
 import re
@@ -78,6 +79,9 @@ class El:
         self.on_click = None
         self.owner = None  # the frame the element really lives in (None: the one it was found in)
         self.labels: dict = {}  # a select's option value -> label, where the two differ
+        self.reverts = False  # a select that undoes any choice a script makes
+        self.focusable = True  # takes focus when asked
+        self.keys_to = None  # another element that really gets the keys (a focus race)
         self.checkbox = False  # an input type=checkbox
         self.checked = False
         self.label = ""  # its <label> text
@@ -101,6 +105,9 @@ class El:
         self.positions: list = []  # where each check() aimed
         self.ticked_at: list = []  # where each real (not trial) check() aimed
         self.on_fill = None  # called after this element is filled
+
+
+_FOCUS: dict = {}  # the element a Handle.focus() last focused
 
 
 class Handle:
@@ -139,6 +146,8 @@ class Handle:
             return self.el.checkbox
         if js is pc._CONNECTED_JS:
             return self.el.connected
+        if js is pc._FOCUSED_JS:
+            return _FOCUS.get("el") is self.el
         if js is pc.CONSENT_JS and self.el.control is not None:
             # As the real script: the box's state, but `connected` is the label's own.
             info = await Handle(self.el.control, self.frame).evaluate(js, arg)
@@ -215,7 +224,12 @@ class Handle:
             want = value
         if want not in self.el.options:
             raise RuntimeError("no option")
-        self.el.value = want
+        if not self.el.reverts:
+            self.el.value = want
+
+    async def focus(self):
+        _FOCUS["el"] = self.el if self.el.focusable else None
+        _FOCUS["keys"] = self.el.keys_to or self.el  # where typed keys really land
 
     async def input_value(self, timeout=None):
         return self.el.value
@@ -345,6 +359,9 @@ class Page:
         self.handlers: dict = {}
         self.goto_to: str | None = None  # where goto lands (a redirect)
         self.moves: list = []  # mouse moves (the keepalive)
+        _FOCUS.clear()  # a fresh page has nothing focused
+        self.typed: list = []  # keyboard text not yet ended by a Tab
+        self.keys_sent: list = []  # every keyboard text, ever
         self.context = None
 
     @property
@@ -353,6 +370,33 @@ class Page:
 
     def on(self, event, fn):
         self.handlers.setdefault(event, []).append(fn)
+
+    @property
+    def keyboard(self):
+        page = self
+
+        class Keyboard:
+            async def type(self, text, delay=None):
+                page.keys_sent.append(text)
+                target = _FOCUS.get("keys")
+                if target is not None and target.tag != "select":
+                    target.value += text  # typed into an input
+                else:
+                    page.typed.append(text)
+
+            async def press(self, key):
+                # Tab ends the typeahead: the focused select takes the first
+                # option whose label starts with what was typed.
+                el, typed = _FOCUS.pop("keys", None), "".join(page.typed).casefold()
+                _FOCUS.pop("el", None)
+                page.typed.clear()
+                if key == "Tab" and el is not None and el.tag == "select":
+                    for v in el.options:
+                        if el.labels.get(v, v).casefold().startswith(typed):
+                            el.value = v
+                            break
+
+        return Keyboard()
 
     @property
     def mouse(self):
@@ -632,6 +676,7 @@ def _clean(monkeypatch):
         ("TICK_S", 0.01),
         ("ATTACH_S", 0.05),
         ("TOTAL_STABLE_S", 0.02),
+        ("SUCCESS_STABLE_S", 0.02),
         ("STEP_WAIT_S", 0.3),
     ):
         monkeypatch.setattr(pc, name, value)
@@ -1000,7 +1045,7 @@ async def test_the_outcome_ends_at_once_on_a_guard_flag(monkeypatch, blocked, le
     page = Page(SHOP)
     loop = asyncio.get_running_loop()
     t0 = loop.time()
-    got = await pc._outcome(flow, page, SHOP, {SHOP}, 0, "example.com", Hooks().make())
+    got = await pc._outcome(flow, page, SHOP, {SHOP}, {}, 0, "example.com", Hooks().make())
     assert got == code and loop.time() - t0 < 5.0
 
 
@@ -2403,13 +2448,44 @@ def test_a_value_too_short_to_match_safely_is_not_matched():
     assert g.carries(f"{SHOPX}?card={PAN}") is True  # the number is still guarded
 
 
+def _held_texts(value):
+    """Every piece of TEXT the guard's state holds, walked structurally.
+
+    Not the state's repr: the key and the digests are random bytes, and their
+    repr (``\\x12`` then a literal ``5``) or an object address can spell a short
+    value's digits by chance, which failed main's CI on a random CVC. A typed
+    value kept as bytes would decode as printable text; random bytes do not.
+    """
+    if isinstance(value, dict):
+        for k, v in value.items():
+            yield from _held_texts(k)
+            yield from _held_texts(v)
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        for v in value:
+            yield from _held_texts(v)
+    elif isinstance(value, str):
+        yield value
+    elif isinstance(value, bytes):
+        if value.isascii() and value.decode().isprintable():
+            yield value.decode()
+    elif isinstance(value, int):
+        yield str(value)
+    else:  # another object (the flow): its repr, without its address
+        yield re.sub(r"0x[0-9a-f]+", "0x", repr(value))
+
+
 def test_the_guard_keeps_no_typed_value():
     _flow, g = _all_guard()
-    # Object addresses in the repr are not held values, and a random one can
-    # contain a short value's digits (a CVC) by chance.
-    held = re.sub(r"0x[0-9a-f]+", "0x", repr(vars(g)))
+    held = list(_held_texts(vars(g)))
     for s in (PAN, CVC, NAME, POSTAL, NAME.casefold(), POSTAL.casefold(), f"12{YY}"):
-        assert s not in held
+        assert not any(s in text for text in held), s
+
+
+def test_the_held_text_walk_sees_a_value_kept_as_text_or_bytes():
+    # The walk must still catch a value the guard WOULD keep, in either form.
+    assert any(CVC in t for t in _held_texts({"_v": {CVC}}))
+    assert any(CVC in t for t in _held_texts({"_v": (b"x" + CVC.encode(),)}))
+    assert not any("125" in t for t in _held_texts({"_k": b"\x125\x8aT"}))
 
 
 def test_a_url_with_too_many_value_sized_tokens_is_unjudgeable():
@@ -3779,3 +3855,444 @@ async def test_a_late_field_that_cannot_be_filled_says_fill(vault, logs, monkeyp
     out, _ = await _run(ns, extra_fields=extra)
     assert out["code"] == "page_changed:late:extra_field_failed:address_line1:fill"
     assert any("extra field address_line1 did not fill (RuntimeError)" in x for x in logs)
+
+
+# ── a result shown in place after Pay (no page change) ──
+
+
+def _in_place(ns, shown=True, pay_stays=False):
+    """Pay shows the result in the drawer: the URL stays, a #done marker appears
+    and (unless ``pay_stays``) Pay leaves the page."""
+    done = El()
+    done.visible = shown
+    clicks: list[bool] = []
+
+    def pay_click():
+        clicks.append(True)
+        if not pay_stays:
+            ns.ppage.main_frame.elements["#pay"] = []
+        ns.ppage.main_frame.elements["#done"] = [done]
+
+    ns.els["pay"].on_click = pay_click
+    ns.pay_clicks = clicks
+    return done
+
+
+async def test_a_result_shown_in_place_is_submitted_in_place(vault):
+    ns = checkout()
+    _in_place(ns)
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "submitted_in_place" and ns.pay_clicks == [True]
+    assert "Do NOT retry" in out["status"]
+
+
+async def test_without_a_success_marker_an_unmoved_checkout_is_a_challenge(vault):
+    ns = checkout()
+    _in_place(ns)
+    out, _ = await _run(ns)
+    assert out["code"] == "challenge" and "charge may have happened" in out["status"]
+
+
+async def test_a_success_marker_with_pay_still_live_is_a_challenge(vault):
+    ns = checkout()
+    _in_place(ns, pay_stays=True)
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "challenge"
+
+
+async def test_a_hidden_success_marker_is_a_challenge(vault):
+    ns = checkout()
+    _in_place(ns, shown=False)
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "challenge"
+
+
+class _Flash(El):
+    """Shown for its first ``looks`` reads only (a view mid-render)."""
+
+    def __init__(self, looks):
+        super().__init__()
+        self._looks = looks
+
+    @property
+    def visible(self):
+        self._looks -= 1
+        return self._looks >= 0
+
+    @visible.setter
+    def visible(self, _value):
+        pass
+
+
+async def test_a_success_marker_that_flashes_once_is_a_challenge(vault):
+    ns = checkout()
+    flash = _Flash(2)  # one whole look reads it twice (the count, then the element)
+
+    def pay_click():
+        ns.ppage.main_frame.elements["#pay"] = []
+        ns.ppage.main_frame.elements["#done"] = [flash]
+
+    ns.els["pay"].on_click = pay_click
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "challenge"
+
+
+def _reveal_at_pay(ns, frame):
+    """Give the checkout an in-place result marker and reveal ``frame`` at Pay."""
+    _in_place(ns)
+    base = ns.els["pay"].on_click
+
+    def pay_click():
+        base()
+        frame.visible = True  # a preloaded frame revealed at Pay, URL unchanged
+
+    ns.els["pay"].on_click = pay_click
+
+
+async def test_a_hidden_frame_revealed_at_pay_is_a_challenge(vault):
+    # Devin severe / Codex P2: a hidden preloaded iframe on an unknown host,
+    # revealed at Pay with its URL unchanged, is a bank check and must not read
+    # as an in-place success. The URL is already present at the click, so a
+    # URL-keyed check misses it; frame identity + visibility catches it.
+    ns = checkout()
+    bank = Frame("https://verify.example.net/step")
+    bank.visible = False
+    bank.parent_frame = ns.ppage.main_frame
+    ns.ppage.extra.append(bank)
+    _reveal_at_pay(ns, bank)
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "challenge"
+
+
+async def test_an_about_blank_frame_revealed_at_pay_is_a_challenge(vault):
+    # Codex P2: a challenge can render in about:blank/srcdoc; its scheme is not
+    # proof it is empty, so a newly shown opaque frame is still checked.
+    ns = checkout()
+    blank = Frame("about:blank")
+    blank.visible = False
+    blank.parent_frame = ns.ppage.main_frame
+    ns.ppage.extra.append(blank)
+    _reveal_at_pay(ns, blank)
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "challenge"
+
+
+async def test_a_preloaded_frame_already_shown_still_allows_in_place(vault):
+    # Control: a frame visible BEFORE Pay (e.g. the checkout's own UI) that keeps
+    # its URL is not a new reveal, so a genuine in-place result is still accepted.
+    ns = checkout()
+    ui = Frame("https://shop.example.com/widget")
+    ui.visible = True
+    ui.parent_frame = ns.ppage.main_frame
+    ns.ppage.extra.append(ui)
+    _in_place(ns)
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "submitted_in_place"
+
+
+async def test_a_shown_frame_that_navigates_in_place_to_a_challenge_is_a_challenge(vault):
+    # Audit residual: a frame visible BEFORE Pay keeps its identity when it
+    # navigates in place to an unknown-host bank check, so identity alone would
+    # skip it; its URL changed from the one shown at the click, so the per-frame
+    # URL check still catches it.
+    ns = checkout()
+    widget = Frame("https://shop.example.com/widget")
+    widget.visible = True
+    widget.parent_frame = ns.ppage.main_frame
+    ns.ppage.extra.append(widget)
+    _in_place(ns)
+    base = ns.els["pay"].on_click
+
+    def pay_click():
+        base()
+        widget.url = "https://verify.example.net/acs"  # in-place nav to a bank check
+
+    ns.els["pay"].on_click = pay_click
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "challenge"
+
+
+async def test_a_shown_frame_that_renavigates_same_url_is_a_challenge(vault):
+    # Audit Finding A: a frame visible at the click that re-navigates in place to a
+    # challenge WITHOUT changing its URL (a new document at the same URL) fires
+    # framenavigated, so it must not be mistaken for the frame shown at the click.
+    ns = checkout()
+    widget = Frame("https://shop.example.com/widget")
+    widget.visible = True
+    widget.parent_frame = ns.ppage.main_frame
+    ns.ppage.extra.append(widget)
+    _in_place(ns)
+    base = ns.els["pay"].on_click
+
+    def pay_click():
+        base()
+        for fn in ns.ppage.handlers.get("framenavigated", []):
+            fn(widget)  # re-navigates in place, same URL, new document
+
+    ns.els["pay"].on_click = pay_click
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "challenge"
+
+
+async def test_a_success_marker_that_is_pay_itself_is_a_challenge(vault):
+    ns = checkout()
+    pay = ns.els["pay"]
+
+    def pay_click():
+        pay.pay["live"] = False  # Pay disabled, still on the page
+        ns.ppage.main_frame.elements["#done"] = [pay]
+
+    pay.on_click = pay_click
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "challenge"
+
+
+def test_a_success_marker_inside_a_frame_is_refused():
+    ns = checkout()
+    for bad in ({"selector": "#done", "frames": ["iframe#card"]}, {"selector": "#done"}):
+        with pytest.raises(cf.Refused) as e:
+            _args(ns, success=bad)
+        assert e.value.code == "bad_success"
+    assert _args(ns, success="#done").success == "#done"
+
+
+# ── Pay rebuilt by the save is found again and clicked ──
+
+
+def _rebuilt_pay(ns, **pay):
+    """After the save, the page replaces Pay with a new element."""
+    fresh = El(
+        tag="button",
+        pay={"button": True, "get": False, "live": True, "label": "Pay $21.50", **pay},
+    )
+    clicks: list[bool] = []
+    fresh.on_click = lambda: (
+        clicks.append(True),
+        ns.ppage.navigate("https://shop.example.com/done"),
+    )
+
+    def rebuild():
+        ns.els["pay"].connected = False
+        ns.els["pay"].pay["live"] = False
+        ns.ppage.main_frame.elements["#pay"] = [fresh]
+
+    _after_save(ns, rebuild)
+    return fresh, clicks
+
+
+async def test_a_pay_the_save_rebuilt_is_found_again_and_clicked(vault):
+    ns = save_checkout()
+    _fresh, clicks = _rebuilt_pay(ns)
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
+    assert out["code"] == "submitted_unverified"
+    assert clicks == [True] and ns.pay_clicks == []
+
+
+async def test_a_rebuilt_pay_that_submits_by_get_is_refused(vault):
+    ns = save_checkout()
+    _fresh, clicks = _rebuilt_pay(ns, get=True)
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
+    assert out["code"] == "saved_page_changed:pay_get" and clicks == [] and ns.pay_clicks == []
+
+
+async def test_a_rebuilt_pay_with_another_label_is_refused(vault):
+    ns = save_checkout()
+    _fresh, clicks = _rebuilt_pay(ns, label="Donate $21.50")
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
+    assert out["code"] == "saved_page_changed:pay_label" and clicks == []
+
+
+async def test_pay_gone_after_the_save_is_named(vault):
+    ns = save_checkout()
+    _after_save(ns, lambda: ns.ppage.main_frame.elements.__setitem__("#pay", []))
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
+    assert out["code"] == "saved_page_changed:pay_gone" and ns.pay_clicks == []
+
+
+async def test_a_pay_selector_now_matching_a_card_field_is_refused(vault):
+    ns = save_checkout()
+    name = ns.els["name"]
+    name.pay = {"button": True, "get": False, "live": True, "label": "Pay $21.50"}
+    _after_save(ns, lambda: ns.ppage.main_frame.elements.__setitem__("#pay", [name]))
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
+    assert out["code"] == "saved_page_changed:pay_is_other" and ns.pay_clicks == []
+
+
+async def test_a_marker_already_shown_before_pay_proves_nothing(vault):
+    # A panel on screen before Pay; the click only disables Pay (processing).
+    ns = checkout()
+    panel = El()
+    ns.ppage.main_frame.elements["#done"] = [panel]
+    pay = ns.els["pay"]
+    pay.on_click = lambda: pay.pay.__setitem__("live", False)
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "challenge"
+
+
+async def test_a_card_number_url_during_the_marker_read_stops_before_pay(vault, logs, monkeypatch):
+    # The marker read is the last await before the click: a URL the route sees
+    # while it runs must still stop the payment, not be reported after Pay.
+    ns = checkout()
+    clicked: list = []
+    ns.els["pay"].on_click = lambda: clicked.append(1)
+    real = pc._marker_shown
+
+    async def leak_then_read(ppage, args):
+        await ns.pctx.route_handler(Route(f"https://t.example.org/c?n={PAN}"))
+        return await real(ppage, args)
+
+    monkeypatch.setattr(pc, "_marker_shown", leak_then_read)
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "card_url_before_pay" and clicked == []
+    assert "NOT clicked" in out["status"]
+    _sweep(out, logs)
+
+
+async def test_a_card_value_url_during_the_post_save_frame_read_stops_before_pay(
+    vault, monkeypatch
+):
+    # After a clean save, the frame snapshot taken for the outcome awaits too.
+    ns = save_checkout()
+    real = pc._visible_frames
+
+    async def leak_then_read(ppage):
+        pc._flow.url_blocked = True
+        pc._flow.number_hit = True
+        return await real(ppage)
+
+    monkeypatch.setattr(pc, "_visible_frames", leak_then_read)
+    out, _ = await _run(ns, save=SAVE, amount_max="$25.00")
+    assert out["code"] == "card_url_before_pay" and ns.pay_clicks == []
+
+
+async def test_a_bank_frame_revealed_in_place_outranks_the_marker(vault):
+    ns = checkout()
+    bank = Frame("https://hooks.stripe.com/3d_secure_2/x")
+    bank.parent_frame = ns.ppage.main_frame
+    ns.ppage.extra.append(bank)
+    _in_place(ns)
+    first = ns.els["pay"].on_click
+    ns.els["pay"].on_click = lambda: (first(), setattr(bank, "visible", True))
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "challenge"
+
+
+async def test_a_new_shown_frame_on_an_unknown_host_outranks_the_marker(vault):
+    ns = checkout()
+    _in_place(ns)
+    late = Frame("https://verify.example.net/step")
+    late.parent_frame = ns.ppage.main_frame
+    late.visible = True
+    first = ns.els["pay"].on_click
+    ns.els["pay"].on_click = lambda: (first(), ns.ppage.extra.append(late))
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "challenge"
+
+
+async def test_a_marker_matching_a_re_rendered_disabled_pay_is_a_challenge(vault):
+    ns = checkout()
+    fresh = El(tag="button", pay={"button": True, "get": False, "live": False, "label": "Pay"})
+
+    def pay_click():
+        ns.ppage.main_frame.elements["#pay"] = [fresh]
+        ns.ppage.main_frame.elements["#done"] = [fresh]
+
+    ns.els["pay"].on_click = pay_click
+    out, _ = await _run(ns, success="#done")
+    assert out["code"] == "challenge"
+# ── a select that reverts any scripted choice takes it by keyboard ──
+
+
+def _country_select(ns, monkeypatch, **el):
+    frame = ns.ppage.main_frame.elements["iframe#card"][0].child
+    country = El(tag="select", options=["-1", "235", "236", "237"])
+    country.labels = {
+        "-1": "",
+        "235": "United Kingdom",
+        "236": "United States",
+        "237": "United States Minor Outlying Islands",
+    }
+    country.value = "-1"
+    for k, v in el.items():
+        setattr(country, k, v)
+    frame.elements["#country"] = [country]
+    monkeypatch.setattr(cf, "billing_value", lambda name: "United States")
+    extra = {
+        "email": {"selector": "#email", "value": EMAIL},
+        "country": {"selector": "#country", "frames": ["iframe#card"]},
+    }
+    return country, extra
+
+
+async def test_a_select_that_reverts_scripted_choices_takes_one_typed(vault, monkeypatch):
+    ns = checkout()
+    country, extra = _country_select(ns, monkeypatch, reverts=True)
+    out, _ = await _run(ns, extra_fields=extra)
+    assert out["code"] == "submitted_unverified" and country.value == "236"
+    assert "".join(ns.ppage.keys_sent) == "United States"
+
+
+async def test_a_select_that_takes_a_scripted_choice_is_never_typed_into(vault, monkeypatch):
+    ns = checkout()
+    country, extra = _country_select(ns, monkeypatch)
+    out, _ = await _run(ns, extra_fields=extra)
+    assert out["code"] == "submitted_unverified" and country.value == "236"
+    assert ns.ppage.keys_sent == []  # no keyboard used
+
+
+async def test_a_select_that_will_not_take_focus_is_never_typed_into(vault, monkeypatch):
+    ns = checkout()
+    country, extra = _country_select(ns, monkeypatch, reverts=True, focusable=False)
+    out, _ = await _run(ns, extra_fields=extra)
+    assert out["code"] == "page_changed:late:extra_field_failed:country:select"
+    assert ns.ppage.keys_sent == [] and vault.ops("release_claim") == []
+
+
+async def test_a_typeahead_that_lands_on_a_longer_label_is_refused(vault, monkeypatch):
+    ns = checkout()
+    country, extra = _country_select(ns, monkeypatch, reverts=True)
+    country.options = ["-1", "237", "236"]  # the longer label comes first
+    out, _ = await _run(ns, extra_fields=extra)
+    assert out["code"] == "page_changed:late:extra_field_failed:country:select"
+    assert country.value == "237" and vault.ops("release_claim") == []
+
+
+async def test_keys_that_land_in_another_field_stop_the_flow(vault, monkeypatch):
+    # The select reads as focused, but the keys go into the card number field.
+    ns = checkout()
+    country, extra = _country_select(ns, monkeypatch, reverts=True)
+    country.keys_to = ns.els["number"]
+    out, _ = await _run(ns, extra_fields=extra)
+    assert out["code"] == "page_changed:late:extra_field_failed:country:keys"
+    assert vault.ops("release_claim") == []
+
+
+async def test_a_card_select_that_reverts_is_never_typed_into(vault):
+    ns = checkout(select_expiry=True)
+    ns.els["exp_month"].reverts = True
+    out, _ = await _run(ns, fields={**ns.fields, "exp_month": "#mm", "exp_year": "#yy"})
+    assert out["code"].startswith("failed_before_pay") and ns.ppage.keys_sent == []
+
+
+def test_the_fakes_take_only_what_playwright_takes():
+    # A fake that accepts a keyword the real method lacks hides a TypeError the
+    # live run raises (measured: ElementHandle.focus has no timeout).
+    pw = pytest.importorskip("playwright.async_api")
+    keyboard = type(Page("https://shop.example.com").keyboard)
+    pairs = [
+        (Handle, pw.ElementHandle),
+        (Loc, pw.Locator),
+        (Frame, pw.Frame),
+        (Page, pw.Page),
+        (keyboard, pw.Keyboard),
+    ]
+    bad = []
+    for fake, real in pairs:
+        for name, fn in vars(fake).items():
+            if name.startswith("_") or not callable(fn) or not hasattr(real, name):
+                continue
+            real_params = set(inspect.signature(getattr(real, name)).parameters)
+            for pname, param in inspect.signature(fn).parameters.items():
+                if param.default is not inspect.Parameter.empty and pname not in real_params:
+                    bad.append(f"{fake.__name__}.{name}({pname})")
+    assert bad == []

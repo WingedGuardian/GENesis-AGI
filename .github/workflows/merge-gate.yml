@@ -14,6 +14,17 @@ name: merge-gate
 # gate drops entries for ITS OWN workflow/job (GITHUB_WORKFLOW/GITHUB_JOB) from
 # the rollup so the check can never vouch for or block on itself. Keeping the
 # names distinct keeps the required-CI check AND the self-exclusion exact.
+#
+# ONE `genesis-merge-gate` check per head (#2409). The job runs under its own
+# check name, `merge-gate-run`, and ALWAYS exits 0; every event, `pull_request`
+# included, publishes the verdict as an explicit `genesis-merge-gate` check run
+# on the PR head. Before this the `pull_request` job carried that name itself,
+# and concurrency cancels it whenever a review event follows within seconds:
+# MEASURED 2026-10-31, 74 of 85 open PRs listed `genesis-merge-gate` twice, and
+# 31 of 34 sampled `pull_request` entries were `cancelled`, beside the real
+# verdict. A cancelled run now leaves only a `merge-gate-run` entry, and the
+# verdict a reader (or a future required check) matches by name is the newest
+# published one.
 
 on:
   pull_request:
@@ -44,11 +55,10 @@ on:
 
 # Almost-read-only by construction: the gate classifies GitHub state (checks,
 # reviews, comments, mergeability) and never writes to the repository. The
-# single write scope is `checks` — events other than `pull_request` run on the
-# DEFAULT branch, so their ambient job check attaches to the base SHA and the
-# PR never sees the re-evaluated verdict. Those runs publish the verdict as an
+# single write scope is `checks`: every run publishes its verdict as an
 # explicit check run on the PR head via the check-runs API, which is exactly
-# what the scope exists for.
+# what the scope exists for. (Events other than `pull_request` run on the
+# DEFAULT branch, so their ambient job check would not even reach the head.)
 permissions:
   contents: read
   pull-requests: read
@@ -64,6 +74,10 @@ concurrency:
 
 jobs:
   genesis-merge-gate:
+    # The job's CHECK name, deliberately not `genesis-merge-gate`: that name is
+    # the published verdict's alone (see the header). The job id is unchanged,
+    # so GITHUB_JOB, and the gate's self-exclusion that reads it, stay as they were.
+    name: merge-gate-run
     # issue_comment fires on issues too — only run when it's a PR comment.
     # workflow_run fires for CI completions on ANY ref — only run when the
     # completed run is associated with at least one pull request.
@@ -134,36 +148,31 @@ jobs:
             --repo "$GITHUB_REPOSITORY"
           rc=$?
           echo "rc=${rc}" >> "$GITHUB_OUTPUT"
-          # Only `pull_request` attaches its ambient job check to the PR merge
-          # ref — exit with the gate's rc so THAT check is the verdict.
-          # pull_request_review*/issue_comment/workflow_run/workflow_dispatch
-          # attach to the synthetic merge SHA or the default-branch SHA —
-          # neither is the PR head a consumer reads. A nonzero exit here would
-          # only paint red onto an unrelated SHA; the real verdict is
-          # published onto the PR head in the next step instead.
-          [ "$GITHUB_EVENT_NAME" = "pull_request" ] && exit "$rc"
+          # Always 0: the verdict is the `genesis-merge-gate` check the next
+          # step publishes on the PR head, for every event. A nonzero exit here
+          # would paint the same verdict a second time under the job's name
+          # (or onto an unrelated SHA, for the non-`pull_request` events).
           exit 0
 
       - name: Publish the verdict on the PR head
         id: publish
-        # Every event except `pull_request` attaches its ambient check to a
-        # SHA that is NOT the PR head (default-branch SHA for comments,
-        # dispatch and workflow_run; the synthetic merge SHA for review
-        # events) — publish the verdict explicitly on the head so head-SHA
-        # consumers (the local gate, a future required check) always read the
-        # newest evaluation on the SHA they inspect. `pull_request` skips
-        # this: its ambient check already sits on the merge ref.
-        if: github.event_name != 'pull_request'
+        # EVERY event publishes, `pull_request` included, so head-SHA consumers
+        # (the local gate, a future required check) read one
+        # `genesis-merge-gate` check whose newest entry is the newest
+        # evaluation. The ambient job check is `merge-gate-run` and carries no
+        # verdict.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GATE_RC: ${{ steps.gate.outputs.rc }}
           HEAD_SHA: ${{ steps.pr.outputs.head }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           IS_FORK: ${{ steps.pr.outputs.fork }}
+          ACTOR: ${{ github.actor }}
         run: |
           set -euo pipefail
-          # GitHub downgrades GITHUB_TOKEN to read-only for
-          # pull_request_review[_comment] events on FORK PRs, so the
+          # GitHub downgrades GITHUB_TOKEN to read-only for pull_request and
+          # pull_request_review[_comment] events on FORK PRs, and for every
+          # event Dependabot triggers, even on a branch of this repository; the
           # check-runs write below would 403. Hand off instead: emit a
           # `merge-gate-verdict` artifact carrying the PR number, which the
           # trusted `merge-gate-publish` workflow (workflow_run on this
@@ -172,9 +181,9 @@ jobs:
           # publisher re-evaluates the gate itself, so untrusted-context
           # output never writes to the head directly.
           case "$GITHUB_EVENT_NAME" in
-            pull_request_review|pull_request_review_comment)
-              if [ "$IS_FORK" = "true" ]; then
-                echo "::notice::Fork-PR $GITHUB_EVENT_NAME runs under a read-only token; handing off to merge-gate-publish."
+            pull_request|pull_request_review|pull_request_review_comment)
+              if [ "$IS_FORK" = "true" ] || [ "$ACTOR" = "dependabot[bot]" ]; then
+                echo "::notice::$GITHUB_EVENT_NAME by $ACTOR runs under a read-only token; handing off to merge-gate-publish."
                 mkdir -p verdict
                 printf '{"pr":%s}\n' "$PR_NUMBER" > verdict/merge-gate-verdict.json
                 # The artifact NAME also carries the PR so the trusted
@@ -191,18 +200,28 @@ jobs:
           fi
           # Check runs are addressed to a SHA: comment/review-triggered runs
           # execute on the default branch, so the only way a refreshed verdict
-          # reaches the PR is an explicit check run on its head. The name
-          # matches the job name, keeping one check identity (`genesis-merge-
-          # gate`) across every event — that is the context a future ruleset
-          # promotion will require.
-          gh api "repos/$GITHUB_REPOSITORY/check-runs" \
-            -f name="genesis-merge-gate" \
-            -f head_sha="$HEAD_SHA" \
-            -f status=completed \
-            -f conclusion="$concl" \
-            -f "output[title]=$title" \
-            -f "output[summary]=Advisory merge-gate re-evaluation of PR #${PR_NUMBER}, triggered by ${GITHUB_EVENT_NAME}. The full gate report is in this run's 'Run the merge gate' step log." \
-            -f "details_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          # reaches the PR is an explicit check run on its head. Every event
+          # publishes under this one name and the job runs under another, so
+          # `genesis-merge-gate` is one check identity on the head; that is
+          # the context a future ruleset promotion will require.
+          # Retried: with the job no longer carrying the verdict, a failed
+          # publish would leave the head's previous verdict standing as the
+          # newest. The step still fails (and the run shows red) if every
+          # attempt does.
+          for attempt in 1 2 3; do
+            if gh api "repos/$GITHUB_REPOSITORY/check-runs" \
+              -f name="genesis-merge-gate" \
+              -f head_sha="$HEAD_SHA" \
+              -f status=completed \
+              -f conclusion="$concl" \
+              -f "output[title]=$title" \
+              -f "output[summary]=Advisory merge-gate re-evaluation of PR #${PR_NUMBER}, triggered by ${GITHUB_EVENT_NAME}. The full gate report is in this run's 'Run the merge gate' step log." \
+              -f "details_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"; then
+              exit 0
+            fi
+            [ "$attempt" = 3 ] && exit 1
+            sleep $((attempt * 5))
+          done
 
       # Only present for fork review events. upload-artifact uses
       # ACTIONS_RUNTIME_TOKEN, which is unaffected by the read-only
