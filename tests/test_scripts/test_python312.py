@@ -18,6 +18,7 @@ LIB = REPO_ROOT / "scripts" / "lib" / "python312.sh"
 INSTALL = REPO_ROOT / "scripts" / "install.sh"
 BOOTSTRAP = REPO_ROOT / "scripts" / "bootstrap.sh"
 _REAL_PYTHON = sys.executable
+PIN = re.search(r'^GENESIS_UV_VERSION="(.+)"$', LIB.read_text(), re.M).group(1)
 
 
 def _stub(path: Path, body: str) -> Path:
@@ -27,13 +28,20 @@ def _stub(path: Path, body: str) -> Path:
     return path
 
 
-def _fake_python(path: Path, minor: int) -> Path:
-    """An interpreter reporting 3.<minor> that still runs the caller's own check."""
+def _fake_python(path: Path, minor: int, patch: int = 0) -> Path:
+    """An interpreter reporting 3.<minor>.<patch> that still runs the caller's own check,
+    and writes pyvenv.cfg for `-m venv --upgrade` the way a real one does."""
     return _stub(
         path,
         f"""case "$1" in
-    --version) echo "Python 3.{minor}.0" ;;
+    --version) echo "Python 3.{minor}.{patch}" ;;
     -c) exec {_REAL_PYTHON} -c "${{2//'sys.version_info[:2]'/(3, {minor})}}" ;;
+    -m)
+        echo "$0 $*" >> "$GENESIS_TEST_CALLS"
+        [ -z "${{GENESIS_TEST_VENV_RC:-}}" ] || {{ echo "venv failed here"; exit "$GENESIS_TEST_VENV_RC"; }}
+        for venv; do :; done
+        printf 'version = 3.{minor}.{patch}\\nexecutable = %s\\n' "$(readlink -f "$0")" > "$venv/pyvenv.cfg"
+        ;;
 esac""",
     )
 
@@ -47,23 +55,40 @@ class _Host:
         self.calls = tmp_path / "calls.log"
         self.home.mkdir()
         self.bin.mkdir()
-        self.uv_python = tmp_path / "uv-managed" / "bin" / "python3.12"
-        _fake_python(self.uv_python, 12)
+        # Laid out as uv does: a minor-version link to the patch installed now.
+        self.managed = tmp_path / "uv-managed"
+        for number, patch in enumerate(("p1", "p2"), start=1):
+            _fake_python(self.managed / patch / "bin" / "python3.12", 12, number)
+        (self.managed / "minor").symlink_to("p1")
+        self.uv_python = self.managed / "minor" / "bin" / "python3.12"
 
     def fake_uv(
         self,
         path: Path,
         *,
         install_rc: int = 0,
+        upgrade_rc: int = 0,
+        upgrade_moves: bool = False,
         find: str | None = None,
+        managed: str | None = None,
+        version: str = PIN,
+        self_rc: int = 0,
     ) -> Path:
         answer = self.uv_python if find is None else find
+        dir_answer = self.managed if managed is None else managed
         return _stub(
             path,
-            f"""echo "uv $*" >> {self.calls}
+            f"""[ "$1" = --version ] && {{ echo "uv {version} (x86_64-unknown-linux-gnu)"; exit 0; }}
+echo "uv $*" >> {self.calls}
+[ "$1" = self ] && {{ echo "self update env UV_NO_MODIFY_PATH=${{UV_NO_MODIFY_PATH:-}}" >> {self.calls}; exit {self_rc}; }}
 case "$2" in
     install) exit {install_rc} ;;
     find) echo "{answer}" ;;
+    dir) echo "{dir_answer}" ;;
+    upgrade)
+        {f'ln -sfn p2 "{self.managed}/minor"' if upgrade_moves else ":"}
+        [ {upgrade_rc} = 0 ] || echo "error: network down"
+        exit {upgrade_rc} ;;
 esac""",
         )
 
@@ -90,8 +115,8 @@ done""",
     def fake_sudo(self, *, works: bool) -> None:
         _stub(self.bin / "sudo", f'echo "sudo $*" >> {self.calls}\n[ "{works}" = True ]')
 
-    def run(self, script: str) -> subprocess.CompletedProcess[str]:
-        for tool in ("ln", "rm", "mkdir", "mktemp", "cat", "chmod", "grep", "sh", "readlink"):
+    def run(self, script: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        for tool in ("ln", "rm", "mkdir", "mktemp", "cat", "chmod", "grep", "sh", "readlink", "sed", "sort", "head", "tail", "date"):
             link = self.bin / tool
             if not link.exists():
                 link.symlink_to(f"/usr/bin/{tool}")
@@ -104,6 +129,8 @@ done""",
                 "HOME": str(self.home),
                 "PATH": str(self.bin),
                 "TMPDIR": str(self.home),
+                "GENESIS_TEST_CALLS": str(self.calls),
+                **(env or {}),
             },
         )
 
@@ -436,3 +463,311 @@ def test_every_python_choice_in_install_goes_through_the_helper():
     assert "command -v python3.12 || command -v python3)" not in re.sub(
         r"\(python3\.12 --version.*", "", INSTALL.read_text()
     )
+
+
+def _uv_venv(host: _Host, venv: Path, *, through: Path | None = None, recorded: Path | None = None) -> Path:
+    """A venv on uv's Python, laid out as a real one is: bin/python links to
+    bin/python3.12, which links to the interpreter, and pyvenv.cfg names the patch."""
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python3.12").symlink_to(through or host.uv_python)
+    (venv / "bin" / "python").symlink_to("python3.12")
+    (venv / "pyvenv.cfg").write_text(f"version = 3.12.1\nexecutable = {recorded or host.uv_python.resolve()}\n")
+    return venv
+
+
+def _packaged_venv(tmp_path: Path) -> Path:
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").symlink_to(_fake_python(tmp_path / "sys" / "python3.12", 12))
+    return venv
+
+
+_REPORT = "; ".join(
+    f'echo "{name}=${name}"'
+    for name in (
+        "GENESIS_UV_PYTHON_MOVED",
+        "GENESIS_UV_MOVED",
+        "GENESIS_UV_BEHIND",
+        "GENESIS_UV_PIN_STALE",
+        "GENESIS_UV_PYTHON_ERROR",
+    )
+)
+
+
+def _upgrade(host: _Host, venv: Path, *, setup: str = ":", **env: str) -> subprocess.CompletedProcess[str]:
+    return host.run(f'. "{LIB}"; {setup}; genesis_upgrade_uv_python "{venv}"; rc=$?; {_REPORT}; exit $rc', env=env)
+
+
+def test_a_venv_on_uvs_python_is_upgraded_within_its_minor(host, tmp_path):
+    host.fake_uv(host.bin / "uv")
+    done = _upgrade(host, _uv_venv(host, tmp_path / "venv"))
+    assert done.returncode == 0, done.stderr
+    assert "uv python upgrade 3.12" in host.logged()
+    assert "GENESIS_UV_PYTHON_MOVED=\n" in done.stdout
+
+
+def test_uv_below_the_pin_comes_up_to_it_first(host, tmp_path):
+    """uv only knows patches released before its own build."""
+    host.fake_uv(host.bin / "uv", version="0.1.0")
+    done = _upgrade(host, _uv_venv(host, tmp_path / "venv"))
+    log = host.logged()
+    assert log.index(f"uv self update {PIN}") < log.index("uv python upgrade")
+    assert f"GENESIS_UV_MOVED=0.1.0 to {PIN}\n" in done.stdout
+
+
+def test_bringing_uv_to_the_pin_leaves_shell_files_alone(host, tmp_path):
+    """On a default install's receipt uv re-adds its PATH lines to .bashrc and .profile
+    when it updates itself, unless told not to (measured). An update has no business
+    editing those."""
+    host.fake_uv(host.bin / "uv", version="0.1.0")
+    _upgrade(host, _uv_venv(host, tmp_path / "venv"))
+    assert "UV_NO_MODIFY_PATH=1" in host.logged()
+
+
+@pytest.mark.parametrize("version", [PIN, "99.0.0"])
+def test_uv_at_or_above_the_pin_is_left_alone(host, tmp_path, version):
+    """Never down: a newer uv may have been installed for something else."""
+    host.fake_uv(host.bin / "uv", version=version)
+    done = _upgrade(host, _uv_venv(host, tmp_path / "venv"))
+    assert "self update" not in host.logged()
+    assert "GENESIS_UV_MOVED=\n" in done.stdout
+
+
+def test_versions_compare_as_versions_and_not_as_text(host, tmp_path):
+    host.fake_uv(host.bin / "uv", version="0.9.0")
+    _upgrade(host, _uv_venv(host, tmp_path / "venv"), setup='GENESIS_UV_VERSION=0.13.7')
+    assert "self update 0.13.7" in host.logged()
+
+
+def test_a_uv_that_cannot_update_itself_is_reported_and_still_upgrades(host, tmp_path):
+    host.fake_uv(host.bin / "uv", version="0.1.0", self_rc=1)
+    done = _upgrade(host, _uv_venv(host, tmp_path / "venv"))
+    assert done.returncode == 0, done.stderr
+    assert "uv python upgrade" in host.logged()
+    assert "GENESIS_UV_BEHIND=0.1.0\n" in done.stdout
+    assert "GENESIS_UV_MOVED=\n" in done.stdout
+
+
+def test_a_pin_past_its_age_says_so(host, tmp_path):
+    host.fake_uv(host.bin / "uv")
+    venv = _uv_venv(host, tmp_path / "venv")
+    assert "GENESIS_UV_PIN_STALE=\n" in _upgrade(host, venv).stdout
+    assert "GENESIS_UV_PIN_STALE=1\n" in _upgrade(host, venv, setup="GENESIS_UV_PINNED_ON=2000-01-01").stdout
+
+
+def test_a_new_install_fetches_the_pinned_uv(host):
+    host.fake_sudo(works=False)
+    host.fake_curl()
+    assert _install_uv(host).returncode == 0
+    assert f"https://astral.sh/uv/{PIN}/install.sh" in host.logged()
+
+
+def test_a_patch_that_moved_is_recorded_without_touching_pip(host, tmp_path):
+    """Without the record pyvenv.cfg names the old patch and the graph census reads
+    every process as exe_mismatch. Moving pip would leave a rollback fetching one."""
+    host.fake_uv(host.bin / "uv", upgrade_moves=True)
+    venv = _uv_venv(host, tmp_path / "venv")
+    done = _upgrade(host, venv)
+    assert done.returncode == 0, done.stderr
+    assert f"{host.uv_python} -m venv --upgrade --without-pip {venv}" in host.logged()
+    assert "version = 3.12.2\n" in (venv / "pyvenv.cfg").read_text()
+    assert "GENESIS_UV_PYTHON_MOVED=Python 3.12.1 to Python 3.12.2\n" in done.stdout
+
+
+def test_a_venv_built_on_a_versioned_path_is_moved_too(host, tmp_path):
+    """It does not follow uv's upgrade, and --upgrade alone rewrites the record while
+    the venv keeps running the old binary (measured on real uv)."""
+    host.fake_uv(host.bin / "uv", upgrade_moves=True)
+    venv = _uv_venv(host, tmp_path / "venv", through=host.managed / "p1" / "bin" / "python3.12")
+    done = _upgrade(host, venv)
+    assert done.returncode == 0, done.stderr
+    assert (venv / "bin" / "python").resolve() == host.managed / "p2" / "bin" / "python3.12"
+    assert "GENESIS_UV_PYTHON_MOVED=Python 3.12.1 to Python 3.12.2\n" in done.stdout
+
+
+def test_a_venv_with_a_copied_interpreter_is_reported_and_not_rewritten(host, tmp_path):
+    host.fake_uv(host.bin / "uv", upgrade_moves=True)
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").symlink_to(host.managed / "p1" / "bin" / "python3.12")
+    (venv / "pyvenv.cfg").write_text("version = 3.12.1\n")
+    done = _upgrade(host, venv)
+    assert done.returncode != 0
+    assert "is not a symlink" in done.stdout
+    assert "-m venv" not in host.logged()
+
+
+def test_a_record_left_stale_is_repaired_and_the_move_still_reported(host, tmp_path):
+    """Say the last run moved the patch and then failed to write the record. This run
+    moves nothing itself, and still has to repair it and tell the reader."""
+    host.fake_uv(host.bin / "uv")
+    venv = _uv_venv(host, tmp_path / "venv", recorded=host.managed / "p0" / "bin" / "python3.12")
+    (venv / "pyvenv.cfg").write_text(
+        f"version = 3.12.0\nexecutable = {host.managed / 'p0' / 'bin' / 'python3.12'}\n"
+    )
+    done = _upgrade(host, venv)
+    assert done.returncode == 0, done.stderr
+    assert "-m venv --upgrade" in host.logged()
+    assert "GENESIS_UV_PYTHON_MOVED=Python 3.12.0 to Python 3.12.1\n" in done.stdout
+
+
+def test_a_current_record_is_left_alone(host, tmp_path):
+    """The usual update: pyvenv.cfg is not rewritten under processes starting up."""
+    host.fake_uv(host.bin / "uv")
+    assert _upgrade(host, _uv_venv(host, tmp_path / "venv")).returncode == 0
+    assert "-m venv" not in host.logged()
+
+
+def test_a_failed_repair_names_the_reason_and_is_not_called_a_move(host, tmp_path):
+    host.fake_uv(host.bin / "uv", upgrade_moves=True)
+    done = _upgrade(host, _uv_venv(host, tmp_path / "venv"), GENESIS_TEST_VENV_RC="1")
+    assert done.returncode != 0
+    assert "GENESIS_UV_PYTHON_ERROR=venv failed here\n" in done.stdout
+    assert "GENESIS_UV_PYTHON_MOVED=\n" in done.stdout
+
+
+def test_find_asks_for_a_python_uv_manages(host, tmp_path):
+    """A uv.toml preferring the system makes plain `find --system` answer with it, and
+    `upgrade` still moved the venv: a refusal here would stay permanent (measured)."""
+    host.fake_uv(host.bin / "uv")
+    _upgrade(host, _uv_venv(host, tmp_path / "venv"))
+    assert "uv python find --managed-python --system 3.12" in host.logged()
+
+
+def test_a_python_uv_does_not_manage_is_never_written_into_the_record(host, tmp_path):
+    system = _fake_python(tmp_path / "usr" / "python3.12", 12)
+    host.fake_uv(host.bin / "uv", upgrade_moves=True, find=str(system))
+    done = _upgrade(host, _uv_venv(host, tmp_path / "venv"))
+    assert done.returncode != 0
+    assert "does not manage" in done.stdout
+    assert "-m venv" not in host.logged()
+
+
+def test_a_venv_on_a_packaged_python_is_not_touched(host, tmp_path):
+    """On those hosts the package manager patches it, so uv changes nothing."""
+    host.fake_uv(host.bin / "uv", version="0.1.0")
+    assert _upgrade(host, _packaged_venv(tmp_path)).returncode == 0
+    assert "self update" not in host.logged()
+    assert "upgrade" not in host.logged()
+
+
+@pytest.mark.parametrize("answer", ["", "/nonexistent/parent/uv/python"])
+def test_a_managed_directory_that_resolves_to_nothing_touches_nothing(host, tmp_path, answer):
+    """Either answer canonicalises to empty, which would make every path look managed.
+    Measured on real uv: this installed a Python on a host with a packaged one."""
+    host.fake_uv(host.bin / "uv", managed=answer)
+    assert _upgrade(host, _packaged_venv(tmp_path)).returncode == 0
+    assert "upgrade" not in host.logged()
+
+
+def test_a_home_reached_through_a_symlink_still_counts_as_managed(host, tmp_path):
+    """uv does not canonicalise its answer, and readlink -f does."""
+    alias = tmp_path / "managed-alias"
+    alias.symlink_to(host.managed)
+    host.fake_uv(host.bin / "uv", managed=str(alias))
+    assert _upgrade(host, _uv_venv(host, tmp_path / "venv")).returncode == 0
+    assert "uv python upgrade" in host.logged()
+
+
+def test_no_venv_or_no_uv_is_nothing_to_do(host, tmp_path):
+    host.fake_uv(tmp_path / "not-on-path" / "uv")
+    assert _upgrade(host, _uv_venv(host, tmp_path / "venv")).returncode == 0
+    host.fake_uv(host.bin / "uv")
+    assert _upgrade(host, tmp_path / "absent").returncode == 0
+    assert host.logged() == ""
+
+
+def test_a_failed_upgrade_names_uvs_reason(host, tmp_path):
+    host.fake_uv(host.bin / "uv", upgrade_rc=1)
+    done = _upgrade(host, _uv_venv(host, tmp_path / "venv"))
+    assert done.returncode != 0
+    assert "GENESIS_UV_PYTHON_ERROR=error: network down\n" in done.stdout
+
+
+def _run_bootstrap_venv_block(host: _Host, root: Path, summary: str = "") -> subprocess.CompletedProcess[str]:
+    script = (
+        "set -euo pipefail\n"
+        f'GENESIS_ROOT="{root}"\n'
+        f'GENESIS_DEPLOY_SUMMARY="{summary or host.home / "summary"}"\n'
+        f'. "{LIB}"\n'
+        "PYTHON_BIN=/nonexistent\n"
+        + _block(BOOTSTRAP, "# --- Python venv ---", "# Worktree guard + editable install")
+        + 'echo "REACHED THE INSTALL"\n'
+    )
+    return host.run(script)
+
+
+def _running_venv(host: _Host, root: Path) -> None:
+    _stub(_uv_venv(host, root / ".venv") / "bin" / "pip", "")
+
+
+def test_bootstrap_says_so_past_updates_tail_when_the_patch_moved(host, tmp_path):
+    _running_venv(host, tmp_path / "root")
+    host.fake_uv(host.bin / "uv", upgrade_moves=True)
+    done = _run_bootstrap_venv_block(host, tmp_path / "root")
+    assert done.returncode == 0, done.stderr
+    assert "REACHED THE INSTALL" in done.stdout
+    summary = (host.home / "summary").read_text()
+    assert "Python 3.12.1 to Python 3.12.2" in summary
+    assert "cannot use the payment vault" in summary
+
+
+def test_bootstrap_says_when_uv_moved_or_could_not(host, tmp_path):
+    _running_venv(host, tmp_path / "root")
+    host.fake_uv(host.bin / "uv", version="0.1.0")
+    assert _run_bootstrap_venv_block(host, tmp_path / "root").returncode == 0
+    assert "uv moved to the pinned version" in (host.home / "summary").read_text()
+    (host.home / "summary").unlink()
+    host.fake_uv(host.bin / "uv", version="0.1.0", self_rc=1)
+    assert _run_bootstrap_venv_block(host, tmp_path / "root").returncode == 0
+    assert "could not update itself" in (host.home / "summary").read_text()
+
+
+def test_bootstrap_says_when_the_pin_has_aged(host, tmp_path):
+    _running_venv(host, tmp_path / "root")
+    host.fake_uv(host.bin / "uv")
+    text = _block(BOOTSTRAP, "# --- Python venv ---", "# Worktree guard + editable install")
+    script = (
+        "set -euo pipefail\n"
+        f'GENESIS_ROOT="{tmp_path / "root"}"\n'
+        f'GENESIS_DEPLOY_SUMMARY="{host.home / "summary"}"\n'
+        f'. "{LIB}"\nGENESIS_UV_PINNED_ON=2000-01-01\nPYTHON_BIN=/nonexistent\n' + text
+    )
+    assert host.run(script).returncode == 0
+    assert "Bump it in scripts/lib/python312.sh" in (host.home / "summary").read_text()
+
+
+def test_bootstrap_stays_quiet_when_nothing_moved(host, tmp_path):
+    _running_venv(host, tmp_path / "root")
+    host.fake_uv(host.bin / "uv")
+    done = _run_bootstrap_venv_block(host, tmp_path / "root")
+    assert done.returncode == 0, done.stderr
+    assert not (host.home / "summary").exists()
+
+
+def test_a_failed_upgrade_does_not_stop_the_update(host, tmp_path):
+    """An old patch still works; an update stopped here applies nothing else."""
+    _running_venv(host, tmp_path / "root")
+    host.fake_uv(host.bin / "uv", upgrade_rc=1)
+    done = _run_bootstrap_venv_block(host, tmp_path / "root")
+    assert done.returncode == 0, done.stderr
+    assert "REACHED THE INSTALL" in done.stdout
+    summary = (host.home / "summary").read_text()
+    assert "error: network down" in summary
+    assert "the next update tries again" in summary
+
+
+@pytest.mark.parametrize("failure", ["upgrade fails", "patch moved", "uv moved", "uv behind"])
+def test_a_full_disk_writing_the_summary_does_not_stop_the_update(host, tmp_path, failure):
+    """A full disk is also a likely reason for the upgrade to have failed."""
+    _running_venv(host, tmp_path / "root")
+    host.fake_uv(
+        host.bin / "uv",
+        upgrade_rc=int(failure == "upgrade fails"),
+        upgrade_moves=failure == "patch moved",
+        version="0.1.0" if failure.startswith("uv") else PIN,
+        self_rc=int(failure == "uv behind"),
+    )
+    done = _run_bootstrap_venv_block(host, tmp_path / "root", summary="/dev/full")
+    assert done.returncode == 0, done.stderr
+    assert "REACHED THE INSTALL" in done.stdout

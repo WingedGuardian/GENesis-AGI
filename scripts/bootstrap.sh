@@ -1012,6 +1012,24 @@ if [[ ! -d "$VENV_DIR" ]] || [[ ! -x "$VENV_DIR/bin/python" ]] || [[ ! -x "$VENV
     echo "  Creating venv (using $PYTHON_BIN)..."
     "$PYTHON_BIN" -m venv "$VENV_DIR"
 fi
+if ! genesis_upgrade_uv_python "$VENV_DIR"; then
+    echo "  WARNING: could not finish upgrading uv's Python: ${GENESIS_UV_PYTHON_ERROR:-no reason given}"
+    # These survive update.sh's tail of this output.
+    echo "uv's Python could not be fully upgraded (${GENESIS_UV_PYTHON_ERROR:-no reason given}); the next update tries again." >> "$GENESIS_DEPLOY_SUMMARY" || true
+fi
+if [ -n "${GENESIS_UV_PYTHON_MOVED:-}" ]; then
+    echo "  uv's Python: $GENESIS_UV_PYTHON_MOVED"
+    echo "uv's Python moved: $GENESIS_UV_PYTHON_MOVED. Until they restart, a Claude Code session started before this cannot use the payment vault, and the graph census cannot prove its memory servers." >> "$GENESIS_DEPLOY_SUMMARY" || true
+fi
+if [ -n "${GENESIS_UV_MOVED:-}" ]; then
+    echo "uv moved to the pinned version: $GENESIS_UV_MOVED." >> "$GENESIS_DEPLOY_SUMMARY" || true
+fi
+if [ -n "${GENESIS_UV_BEHIND:-}" ]; then
+    echo "uv is at $GENESIS_UV_BEHIND, below the pinned $GENESIS_UV_VERSION, and could not update itself, so its Python may lag." >> "$GENESIS_DEPLOY_SUMMARY" || true
+fi
+if [ -n "${GENESIS_UV_PIN_STALE:-}" ]; then
+    echo "The pinned uv ($GENESIS_UV_VERSION) is over $GENESIS_UV_PIN_MAX_AGE_DAYS days old, so newer Python patches may exist. Bump it in scripts/lib/python312.sh." >> "$GENESIS_DEPLOY_SUMMARY" || true
+fi
 echo "  Syncing dependencies..."
 # Worktree guard + editable install + import verification — shared with
 # install.sh so the guard can't drift between the two entry points.
