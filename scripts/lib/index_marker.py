@@ -765,10 +765,11 @@ def remember_native_event(context: dict, kind: str, data: dict, *, recorded_at=N
                 with _transaction(db):
                     state = _native.record(db, context, event, _legs, _proof)
             except TimeoutError:
-                pass
+                return spool()
             except sqlite3.OperationalError as exc:
                 if not _is_busy(exc):
                     raise
+                return spool()
         if state in ("waiting", "retained"):
             path = spool()
             if state == "retained":

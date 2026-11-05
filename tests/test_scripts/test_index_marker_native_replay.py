@@ -61,6 +61,84 @@ def _apply(queue, claimed):
     return operation(claimed["context"])
 
 
+@pytest.mark.parametrize("kind,slot", [
+    ("stop", "first_stop"), ("terminal", "terminal"),
+    ("cleanup", "cleanup_proof"), ("cleanup-disproof", "cleanup_first_failure"),
+])
+@pytest.mark.parametrize("sync_failure", [False, True])
+def test_commit_busy_retains_native_event_after_transaction_rollback(
+    queue, tmp_path, monkeypatch, kind, slot, sync_failure
+):
+    claimed = _started(queue, tmp_path)
+    if kind in ("cleanup", "cleanup-disproof"):
+        _event(queue, claimed, "terminal", _terminal(claimed))
+        assert _apply(queue, claimed) == "consumed"
+    if kind == "cleanup-disproof":
+        _event(queue, claimed, "cleanup", _cleanup(queue, claimed))
+        assert _apply(queue, claimed) == "consumed"
+    data = {
+        "stop": {"reason": "pressure_stop", "observed_ns": 200,
+                 "boot_id": _reservation(claimed)["owner"]["boot_id"],
+                 "unit": _reservation(claimed)["unit"]},
+        "terminal": _terminal(claimed),
+        "cleanup": _cleanup(queue, claimed),
+        "cleanup-disproof": {**_cleanup(queue, claimed), "state": "unresolved",
+                             "populated": 1, "owned_wait": False, "observed_ns": 400},
+    }[kind]
+    recorded = []
+    original = queue._native.record
+
+    def record(db, *args):
+        result = original(db, *args)
+        # Prove BEGIN and the UPDATE succeeded: only COMMIT is denied below.
+        row = db.execute("SELECT * FROM executions WHERE execution_seq=?",
+                         (claimed["context"]["execution_seq"],)).fetchone()
+        assert row[slot] is not None
+        recorded.append(result)
+        return result
+
+    monkeypatch.setattr(queue._native, "record", record)
+    # The reader is held until the call returns, so no timing race is involved.
+    api = queue.remember_native_event.__globals__
+    monkeypatch.setitem(api, "OUTCOME_LOCK_WAIT_S", 0.1)
+    real_sync = api["_fsync_dir"]
+
+    def failed_sync(_directory):
+        raise OSError("fixture spool directory sync failed")
+
+    if sync_failure:
+        monkeypatch.setitem(api, "_fsync_dir", failed_sync)
+    with closing(sqlite3.connect(queue.database_path(), isolation_level=None)) as reader:
+        reader.execute("BEGIN")
+        reader.execute("SELECT * FROM executions").fetchall()
+        try:
+            if sync_failure:
+                with pytest.raises(OSError, match="fixture spool directory sync failed"):
+                    _event(queue, claimed, kind, data)
+                evidence = list(queue.marker_dir().glob(".execution-spool-*.spool"))
+                assert len(evidence) == 1  # The complete renamed artifact is retained.
+                retained = evidence[0]
+            else:
+                retained = _event(queue, claimed, kind, data)
+        finally:
+            reader.rollback()
+    assert recorded == ["recorded"]
+    assert queue.execution_status(claimed["context"])[slot] is None
+    assert retained.name.startswith(".execution-spool-") and retained.suffix == ".spool"
+    assert json.loads(retained.read_bytes())["kind"] == kind
+    # Restore only this seam; undo() would also remove fixture GENESIS_HOME.
+    monkeypatch.setitem(api, "_fsync_dir", real_sync)
+    assert _apply(queue, claimed) == ("pending" if kind == "stop" else "consumed")
+    status = queue.execution_status(claimed["context"])
+    assert status[slot]["kind"] == kind
+    assert _apply(queue, claimed) == status["typed_applied_state"]
+    if kind == "stop":
+        assert status["safety_kind"] == "resource" and status["typed_charged_attempts"] == 1
+    if kind == "cleanup-disproof":
+        assert status["cleanup_invalidated"] == 1
+        assert queue.claim_native(claimed["context"]["hash"], provider="gitnexus") is None
+
+
 def test_success_applies_once_but_keeps_writer_pointer_until_cleanup(queue, tmp_path):
     claimed = _started(queue, tmp_path, mode="full")
     queue.write_marker(claimed["repo_path"], "cbm", "full")
@@ -76,6 +154,28 @@ def test_success_applies_once_but_keeps_writer_pointer_until_cleanup(queue, tmp_
     assert queue.get_inflight(claimed["context"]["hash"]) is None
     assert {r["provider"] for r in queue.list_markers()} == {"cbm", "gitnexus"}
     assert {r["attempts"] for r in queue.list_markers()} == {0}
+
+
+def test_commit_busy_preserves_a_conflicting_terminal_as_raw_evidence(queue, tmp_path, monkeypatch):
+    claimed = _started(queue, tmp_path)
+    _event(queue, claimed, "terminal", _terminal(claimed))
+    assert _apply(queue, claimed) == "consumed"
+    monkeypatch.setitem(queue.remember_native_event.__globals__, "OUTCOME_LOCK_WAIT_S", 0.1)
+    with closing(sqlite3.connect(queue.database_path(), isolation_level=None)) as reader:
+        reader.execute("BEGIN")
+        reader.execute("SELECT * FROM executions").fetchall()
+        try:
+            retained = _event(queue, claimed, "terminal", _terminal(claimed, rc=1))
+        finally:
+            reader.rollback()
+    status = queue.execution_status(claimed["context"])
+    assert status["first_typed_conflict"] is None
+    assert retained.name.startswith(".execution-spool-")
+    assert _apply(queue, claimed) == "consumed"
+    status = queue.execution_status(claimed["context"])
+    assert status["terminal"]["data"]["report"]["payload_returncode"] == 0
+    assert status["first_typed_conflict"]["data"]["report"]["payload_returncode"] == 1
+    assert status["safety_kind"] == "conflict" and status["typed_charged_attempts"] == 0
 
 
 @pytest.mark.parametrize("rc,oom,expected,safety", [(0, 1, "pending", "resource"), (1, 0, "pending", None), (0, 0, "consumed", None)])

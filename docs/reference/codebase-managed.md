@@ -485,21 +485,22 @@ busy tick and exits 0. Status 10 is reserved so that an interpreter crash (statu
 mistaken for the expected pause; the runner treats any other status as a
 failure. The runner discards the observer's JSON, so read the current state
 with `python3 scripts/lib/index_marker.py automatic-ready`. `import-status`
-lists receipts for schemas 2 and 3 and refuses a newer schema. The checked
+lists receipts for schemas 2, 3 and 4 and refuses a newer schema. The checked
 consumer is prepared behind this fence; native evidence and durable
 resource-failure quarantine must complete before automatic work can resume.
 That readiness does not authorize lifting a freeze or disable sentinel.
 
 No ordinary command converts an existing queue. Converting on connect is unsafe
 across code rollbacks: a failed update restores older code but not the queue,
-and older code refuses a newer schema. On an older queue (schema 1 or 2, or an
+and older code refuses a newer schema. On an older queue (schema 1, 2 or 3, or an
 unversioned file that already has tables), `write` durably spools the request
 in the plain format schema-2 code writes and imports, so a rolled-back install
 still consumes it; `automatic-ready` and `import-status` read schemas 1 and 2
 as before, and report an unversioned file that has tables as an observation
-error (so the runner stops with 76 until the cutover); every other command
-exits 2 with one line naming the schema and the cutover. A busy queue whose
-schema was not yet confirmed also spools the plain format. A missing queue is created at schema 3, unless an update is running
+error (so the runner stops with 76 until the cutover); other operations that
+require a current-schema connection exit 2 with one line naming the schema
+and the cutover. A busy queue whose schema was not yet confirmed also spools
+the plain format. A missing queue is created at schema 4, unless an update is known to be running before creation
 (`locks/update.lock` held exclusively, or `update_state.json` present under the
 state directory), in which case `write` spools and nothing is created. Only the
 explicit strict cutover converts an older queue and imports those spools.
@@ -716,6 +717,9 @@ a database-only snapshot that overlooks them. Duplicate evidence ignores its
 receipt timestamp, while original retained facts remain unchanged. Further
 distinct conflicts stay in their spools if the first conflict slot is occupied.
 Filesystem, SQLite, malformed-record and synchronization failures remain visible.
+If a reader blocks SQLite commit, the rolled-back native event is synchronized
+to a spool before acknowledgement. An in-memory record result is not retention;
+a failed spool synchronization reports failure and preserves the artifact.
 Never unlink the lock or discard those spools to force work through.
 An exact-context event missing its required reservation, registration or intent
 is retained as an explicit `unbound` conflict. It cannot establish completion,
