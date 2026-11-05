@@ -9,6 +9,7 @@ Configuration is published once. Native enablement owns operational state.
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import hashlib
 import json
@@ -433,6 +434,13 @@ def report_retained_state() -> None:
         for key in ("binary", "cache", "runtime"):
             try:
                 path = absolute(config[key]).resolve()
+                # Python 3.13+ non-strict resolve leaves a symlink loop unresolved,
+                # so ask the kernel. Any other failure to stat is still classified.
+                try:
+                    path.stat()
+                except OSError as error:
+                    if error.errno == errno.ELOOP:
+                        raise
                 # A final root symlink is unlinked, never recursively followed.
                 # Runtime pruning keeps its addressed locks child; another real
                 # deletion root may still cover the candidate independently.

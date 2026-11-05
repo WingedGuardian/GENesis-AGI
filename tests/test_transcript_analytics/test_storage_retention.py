@@ -10,6 +10,7 @@ import pytest
 
 from genesis.transcript_analytics import store
 from genesis.transcript_analytics.extract import TABLES
+from tests.conftest import require_access_denied
 
 FIXTURES = Path(__file__).with_name("fixtures")
 
@@ -329,6 +330,51 @@ def test_source_replaced_by_directory_closes_failed_reader_descriptor(tmp_path, 
         for descriptor in opened:
             with contextlib.suppress(OSError):
                 os.close(descriptor)
+
+
+def test_prune_retains_a_source_it_cannot_reach(tmp_path, capsys):
+    """Still on disk, behind a directory that cannot be searched. From Python 3.14
+    Path.exists() answers False for it."""
+    projects = tmp_path / "projects"
+    source = projects / "sub" / "source.jsonl"
+    source.parent.mkdir(parents=True)
+    _write(source, "2025-01-01T00:00:00Z")
+    data = tmp_path / "data"
+    assert store.ingest(projects, data)["rebuilt"] == 1
+    source.parent.chmod(0)
+    try:
+        require_access_denied(source.parent)
+        assert store.prune(data, before="2026-01-01", projects=projects) == 0
+    finally:
+        source.parent.chmod(0o700)
+    assert store.select_sources(data)[0][0].path("fragments").exists()
+    assert "unreadable source retained" in capsys.readouterr().err
+
+
+def test_prune_still_removes_a_source_that_is_gone(tmp_path):
+    projects = tmp_path / "projects"
+    source = projects / "source.jsonl"
+    projects.mkdir()
+    _write(source, "2025-01-01T00:00:00Z")
+    data = tmp_path / "data"
+    assert store.ingest(projects, data)["rebuilt"] == 1
+    source.unlink()
+    assert store.prune(data, before="2026-01-01", projects=projects) == 1
+
+
+def test_prune_retains_a_source_that_became_a_symlink_loop(tmp_path, capsys):
+    """A loop cannot be read, which is not the same as the source being gone."""
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    source = projects / "source.jsonl"
+    _write(source, "2025-01-01T00:00:00Z")
+    data = tmp_path / "data"
+    assert store.ingest(projects, data)["rebuilt"] == 1
+    source.unlink()
+    source.symlink_to(source)
+    assert store.prune(data, before="2026-01-01", projects=projects) == 0
+    assert store.select_sources(data)[0][0].path("fragments").exists()
+    assert "unreadable marker retained" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("link_level", ["root", "ancestor"])
