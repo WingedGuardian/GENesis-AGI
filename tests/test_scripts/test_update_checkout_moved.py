@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_scripts._update_source import rollback_body_text, update_text
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE = REPO_ROOT / "scripts" / "update.sh"
 LIB = REPO_ROOT / "scripts" / "lib" / "deploy_checkout.sh"
@@ -55,7 +57,7 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 def _text() -> str:
-    return UPDATE.read_text()
+    return update_text()
 
 
 def _block(marker: str) -> str:
@@ -913,9 +915,7 @@ def test_an_interrupted_merge_that_left_tracked_changes_is_reported_not_reset(re
 def test_a_moved_checkout_keeps_the_migrated_database():
     """Code left as it is (merged plus their change) must keep the schema that
     matches it; restoring the pre-update DB would put new code on an old schema."""
-    text = _text()
-    start = text.index("_do_rollback() {")
-    body = text[start : text.index("\n_on_err() {", start)]  # the heredoc holds a column-0 }
+    body = rollback_body_text()
     migrated = body.index('if [ "${DB_RESTORE_OWED:-0}" = "1" ]; then')
     moved = body.index(
         'if [ "$code_action" = "moved" ] || [ "$code_kept" = "true" ]; then', migrated
@@ -929,9 +929,7 @@ def test_a_moved_checkout_keeps_the_migrated_database():
 def test_reinstall_and_restart_happen_only_on_a_verified_old_tree():
     """The guard's verdict must actually gate the two steps that would boot the
     checkout: the dependency reinstall and the service restarts."""
-    text = _text()
-    start = text.index("_do_rollback() {")
-    body = text[start : text.index("\n_on_err() {", start)]  # the heredoc holds a column-0 }
+    body = rollback_body_text()
     guard_end = body.index("# END rollback-code-guard")
     pip = body.index("restore_venv_state", guard_end)
     assert 'if [ "$restart_ok" = "true" ]; then\n' in body[guard_end:pip]
@@ -942,9 +940,7 @@ def test_reinstall_and_restart_happen_only_on_a_verified_old_tree():
 
 
 def test_the_closing_banner_does_not_claim_a_rollback_that_did_not_happen():
-    text = _text()
-    start = text.index("_do_rollback() {")
-    body = text[start : text.index("\n_on_err() {", start)]  # the heredoc holds a column-0 }
+    body = rollback_body_text()
     banner = body.index('echo "  Rolled back: $OLD_TAG ($OLD_COMMIT) on $ORIGINAL_BRANCH"')
     gate = body.rindex('if [ "$rollback_ok" = true ]', 0, banner)
     assert "\n    fi\n" not in body[gate:banner]
@@ -1009,7 +1005,7 @@ def test_the_rollback_moves_only_the_original_branch_with_a_non_forced_checkout(
     reset arm only; never a reset of the tree."""
     text = _text()
     body = text[
-        text.index("_do_rollback() {") : text.index("\n}\n", text.index("_do_rollback() {"))
+        text.index("_rollback_body() {") : text.index("\n}\n", text.index("_rollback_body() {"))
     ]
     assert 'checkout "$ORIGINAL_BRANCH"' not in body
     code = _code(_block("rollback-code-guard"))

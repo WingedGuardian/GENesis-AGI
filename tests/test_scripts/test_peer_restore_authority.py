@@ -9,6 +9,7 @@ import pytest
 
 from genesis.db.crud.peer_restore import RestoreAuthorityError, reset_peer_authority
 from tests.test_scripts import test_restore_safety as restore
+from tests.test_scripts._update_source import update_text
 
 ROOT = Path(__file__).resolve().parents[2]
 sandbox = restore.sandbox
@@ -263,7 +264,7 @@ def test_refusal_or_dry_run_preserves_live_and_does_not_stop(sandbox, monkeypatc
 
 @pytest.mark.parametrize("compatible", [True, False])
 def test_update_prepares_guarded_snapshot_before_stop(tmp_path, compatible):
-    source = (ROOT / "scripts/update.sh").read_text()
+    source = update_text()
     block = source[
         source.index('DB_FILE="$GENESIS_ROOT/data/genesis.db"') : source.index(
             "# ── Stop services for update"
@@ -318,7 +319,7 @@ def test_cli_refusal_has_fixed_diagnostics(tmp_path):
 
 @pytest.mark.parametrize("candidate_present", [True, False])
 def test_rollback_to_old_code_consumes_only_guarded_candidate(tmp_path, candidate_present):
-    source = (ROOT / "scripts/update.sh").read_text()
+    source = update_text()
     marker = source.index("# BEGIN rollback-db-decision")
     decision = source[
         source.index("\n", marker) + 1 : source.index("# END rollback-db-decision", marker)
@@ -329,7 +330,7 @@ def test_rollback_to_old_code_consumes_only_guarded_candidate(tmp_path, candidat
             "# END db-restore-through-sqlite", restore_marker
         )
     ]
-    start = source.index("    genesis_checkout_unlock\n", source.index("_do_rollback() {"))
+    start = source.index("    genesis_checkout_unlock\n", source.index("_rollback_body() {"))
     restart = source[start : source.index('\n    if [ "$checkout_ok"', start)]
     live = _seed(tmp_path / "genesis.db", "CREATE TABLE migrated(x);")
     raw = _seed(tmp_path / "genesis.db.pre-update")

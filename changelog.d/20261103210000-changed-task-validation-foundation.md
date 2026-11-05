@@ -1,0 +1,1 @@
+- Added read-only exact task-branch and linked-worktree validation helpers with preservation tests; creation and recovery activation remain separate follow-ups for #3020/#3060.

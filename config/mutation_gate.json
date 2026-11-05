@@ -4,6 +4,8 @@
     "the test that must notice. CI fails if any case SURVIVES -- that test no",
     "longer pins the property it is named for -- or ABORTS, because a case that",
     "could not run has established nothing.",
+    "A case whose mutated run never opened its target ABORTS too: the test does",
+    "not load the file, or loaded a copy from outside the sweep's.",
     "",
     "Deliberately SMALL. This is not coverage tooling; it is a handful of",
     "load-bearing decisions whose tests must never rot silently.",

@@ -17,7 +17,14 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   broken assertion — before its green is trusted. A test that has only ever
   passed may be testing nothing; a whole suite passing every review round
   while a reviewer keeps finding real spec bugs is the tell that the tests
-  encode the same wrong spec as the code.
+  encode the same wrong spec as the code. `scripts/ci/mutation_sweep.py` does
+  this as a library: it mutates a private copy, so the sweep never writes your
+  working tree (a test it runs still can), and the `mutation-gate` CI job runs `config/mutation_gate.json`. To
+  pin a guard, add a case there: a label, the target, an anchor that matches
+  once, the replacement, the file's validator, the test that must catch it, and
+  why. BIT means pass, fail, pass
+  on a run that opened the target. A module-level import counts as opened, so a
+  BIT still does not prove the test exercised the code.
 - **Verify-RED of a safety fence runs the test UNFENCED.** Removing a guard,
   stub or sandbox to watch its test fail means whatever the test executes
   reaches the real system for that run. Read the test first and make its probe
