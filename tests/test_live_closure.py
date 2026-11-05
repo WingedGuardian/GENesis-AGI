@@ -173,11 +173,14 @@ def test_bound():
     print("DB_DEFAULT=" + str(inspect.signature(connection.init_db).parameters["path"].default))
     print("TASK_DB=" + str(task_tools._DB_PATH))
     print("HOOK_URL=" + os.environ["GENESIS_PROACTIVE_HOOK_URL"])
+    print("CLOSURE_PROBE_API_KEY=" + os.environ.get("CLOSURE_PROBE_API_KEY", "<absent>"))
+    # Presence only: a live-mode child keeps real credentials, and _subrun prints
+    # this output when a run fails. The probe above holds a value the test made up.
     for name in (
-        "CLOSURE_PROBE_API_KEY", "API_KEY", "DOCKER_AUTH_CONFIG", "GIT_ASKPASS",
-        "SSH_ASKPASS", "VSCODE_GIT_IPC_HANDLE", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+        "API_KEY", "DOCKER_AUTH_CONFIG", "GIT_ASKPASS", "SSH_ASKPASS",
+        "VSCODE_GIT_IPC_HANDLE", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
     ):  # fmt: skip
-        print(name + "=" + os.environ.get(name, "<absent>"))
+        print(name + "=" + ("<present>" if name in os.environ else "<absent>"))
     print("GIT_CONFIG_GLOBAL=" + os.environ.get("GIT_CONFIG_GLOBAL", "<unset>"))
     print("GIT_GLOBAL=" + _git("config", "--global", "--list"))
     print("GIT_SYSTEM=" + _git("config", "--system", "--list"))
@@ -253,11 +256,20 @@ def test_an_opt_in_live_run_keeps_the_state_closures(tmp_path):
     """GENESIS_LIVE_E2E=1 needs real credentials, never the live database or the
     live memory hook or this machine's git configuration: the credential half
     is skipped, and the summary says so; the other closures stay on."""
-    out = _subrun(tmp_path, {"GENESIS_LIVE_E2E": "1", "CLOSURE_PROBE_API_KEY": "probe-value"})
+    out = _subrun(
+        tmp_path,
+        {"GENESIS_LIVE_E2E": "1", "CLOSURE_PROBE_API_KEY": "probe-value",
+         "API_KEY": "made-up-live-key", "DOCKER_AUTH_CONFIG": "made-up-docker-auth"},
+    )  # fmt: skip
     expected = str(Path(_value(out.stdout, "BASE")) / "import-time-genesis.db")
     assert _value(out.stdout, "DB_CONST") == expected, out.stdout
     assert _value(out.stdout, "HOOK_URL") == "http://127.0.0.1:9"
     assert _value(out.stdout, "CLOSURE_PROBE_API_KEY") == "probe-value"
+    # Kept, and never printed: _subrun shows this output when a run fails.
+    assert _value(out.stdout, "API_KEY") == "<present>"
+    assert _value(out.stdout, "DOCKER_AUTH_CONFIG") == "<present>"
+    assert "made-up-live-key" not in out.stdout
+    assert "made-up-docker-auth" not in out.stdout
     assert "GENESIS_LIVE_E2E=1, secrets left in place" in out.stdout
     assert _value(out.stdout, "GIT_CONFIG_GLOBAL") == os.devnull
 
