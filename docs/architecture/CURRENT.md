@@ -4253,7 +4253,12 @@ Refusing a proposed update preserves a previously valid opt-in.
   don't merge them. Memory-resilience invariants are first-class facts:
   container `cgroup_memory_swap_max` (tri-state — "0" IS the 2026-07 wedge
   state) + `oomd_user_slice_kill` (config-plane scan of user.slice.d drop-ins,
-  laid down by `scripts/lib/memory_resilience.sh` from install/bootstrap/update) and
+  laid down by `scripts/lib/memory_resilience.sh` from install/bootstrap/update) +
+  `oomd_active` (`systemd-oomd.service` running) +
+  `oomd_user_manager_monitored` (LIVE: `oomctl` lists the user manager's cgroup,
+  asked only while oomd runs; a failing `oomctl` keeps the prior facts;
+  a config read cannot answer it, since a user daemon-reload silently drops
+  PID 1's report, systemd #43174) and
   host-plane `swap_total_kb`, so the annotation layer flags unprotected
   installs (see docs/reference/memory-resilience.md). Default-disabled
   `CODE_INTEL_WORKLOAD_SLICE=1` routes only indexing batch scopes into the dormant

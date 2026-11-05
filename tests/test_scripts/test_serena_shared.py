@@ -133,6 +133,8 @@ def test_unit_preserves_literal_path_and_resource_ownership(tmp_path):
     assert "ExecStart=:" in text
     assert f"WorkingDirectory={str(project).replace('%', '%%')}\n" in text
     assert "MemoryMax=4G" in text and "MemorySwapMax=0" in text
+    # Shared by every session: systemd-oomd chooses it last, never ahead of one session.
+    assert "ManagedOOMPreference=avoid" in text
     assert "KillMode=control-group" in text and "StartLimitBurst=3" in text
 
 
