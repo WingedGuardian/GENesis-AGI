@@ -619,10 +619,22 @@ elif [[ "$PKG_MGR" == "dnf" || "$PKG_MGR" == "yum" ]]; then
 fi
 
 # Python 3.12-3.14 required (upper bound mirrors pyproject's requires-python)
+# shellcheck source=lib/python312.sh
+. "$SCRIPT_DIR/lib/python312.sh"
 if command -v python3.12 &>/dev/null; then
     echo "  Python: $(python3.12 --version)"
 elif command -v python3 &>/dev/null && python3 -c "import sys; sys.exit(0 if (3, 12) <= sys.version_info[:2] < (3, 15) else 1)" 2>/dev/null; then
-    echo "  Python: $(python3 --version)"
+    if genesis_new_venv_wants_python312 "$GENESIS_ROOT/.venv" python3; then
+        echo "  $(python3 --version) found, but Genesis is tested on 3.12 — installing python3.12..."
+        # Installed further down for everything else, too late for this venv.
+        command -v curl &>/dev/null || install_pkg curl || true
+        if ! genesis_install_python312_uv; then
+            echo "  WARNING: could not install python3.12; continuing on $(python3 --version), which CI does not test"
+            # Survives update.sh's tail of this output.
+            echo "python3.12 could not be installed; a new venv uses $(python3 --version). To retry, delete $GENESIS_ROOT/.venv and re-run." >> "$GENESIS_DEPLOY_SUMMARY"
+        fi
+    fi
+    echo "  Python: $( (command -v python3.12 >/dev/null && python3.12 --version) || python3 --version)"
 else
     _found_ver=$(python3 --version 2>/dev/null || echo "not found")
     echo "  Python 3.12-3.14 required (found: $_found_ver) — run install.sh to install it"

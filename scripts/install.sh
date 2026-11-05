@@ -244,6 +244,8 @@ else
 fi
 
 # Python 3.12-3.14 — prefer explicit python3.12 binary
+# shellcheck source=lib/python312.sh
+. "$SCRIPT_DIR/lib/python312.sh"
 _install_python312() {
     # Attempt to install Python 3.12 using the available package manager and OS-specific sources.
     if command -v apt-get &>/dev/null; then
@@ -272,23 +274,9 @@ _install_python312() {
     elif command -v yum &>/dev/null; then
         sudo yum install -y python3.12 2>/dev/null && return 0
     fi
-    # Universal fallback: uv downloads a pre-built Python 3.12 binary (no compilation).
+    # Universal fallback.
     # Works on Debian 12, RHEL, and any Linux where the package manager lacks python3.12.
-    echo "    Trying uv (pre-built Python 3.12 binary — no compilation needed)..."
-    if curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh 2>/dev/null; then
-        local uv_bin="${HOME}/.local/bin/uv"
-        if [[ -x "$uv_bin" ]] && "$uv_bin" python install 3.12 --quiet 2>/dev/null; then
-            local py_path
-            py_path=$("$uv_bin" python find 3.12 2>/dev/null) || true
-            if [[ -n "$py_path" && -x "$py_path" ]]; then
-                # Symlink into /usr/local/bin so 'python3.12' is discoverable system-wide
-                sudo ln -sf "$py_path" /usr/local/bin/python3.12 2>/dev/null || \
-                    ln -sf "$py_path" "${HOME}/.local/bin/python3.12" 2>/dev/null || true
-                export PATH="${HOME}/.local/bin:$PATH"
-                command -v python3.12 &>/dev/null && return 0
-            fi
-        fi
-    fi
+    genesis_install_python312_uv && return 0
     return 1
 }
 
@@ -299,7 +287,18 @@ elif command -v python3 &>/dev/null; then
     py_version=$(python3 --version 2>&1 | grep -oP '\d+\.\d+' || echo "0.0")
     # Upper bound mirrors pyproject's requires-python (litellm caps Python <3.15).
     if python3 -c "import sys; sys.exit(0 if (3, 12) <= sys.version_info[:2] < (3, 15) else 1)" 2>/dev/null; then
-        echo "    OK    Python $py_version"
+        if [ "$PREFLIGHT_OK" = 1 ] && genesis_new_venv_wants_python312 "$VENV_PATH" python3; then
+            echo "    Python $py_version found, but Genesis is tested on 3.12 — installing python3.12..."
+            if genesis_install_python312_uv; then
+                py_version=$(python3.12 --version 2>&1 | grep -oP '\d+\.\d+' || echo "3.12")
+                echo "    OK    Python $py_version (installed)"
+            else
+                echo "    WARN  Could not install python3.12; continuing on Python $py_version, which CI does not test. To retry, delete $VENV_PATH and re-run."
+                setup_warn "python3.12 could not be installed; the venv uses Python $py_version, which CI does not test"
+            fi
+        else
+            echo "    OK    Python $py_version"
+        fi
     else
         # Try to install Python 3.12 explicitly
         echo "    Python $py_version found but 3.12-3.14 required — installing python3.12..."
