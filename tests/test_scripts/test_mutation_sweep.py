@@ -13,14 +13,18 @@ Install-agnostic: every case operates on a throwaway git repository under
 
 from __future__ import annotations
 
+import contextlib
+import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import textwrap
 from pathlib import Path
 
 import pytest
+import yaml
 
 from tests.conftest import private_module
 
@@ -2674,3 +2678,400 @@ def test_a_file_the_watch_cannot_reach_raises_rather_than_reading_as_unopened(tm
     """A failed watch must not become "never opened", which would blame the test."""
     with pytest.raises(OSError, match="inotify_add_watch"):
         ms._watch_opens(tmp_path / "missing")
+
+
+# --------------------------------------------------------------------------
+# #3805: a sweep that dies keeps what it learned, and leaves nothing behind.
+# --------------------------------------------------------------------------
+
+
+_HANGS_ONLY_WHEN_MUTATED = """\
+import os, subprocess, sys, time
+from pathlib import Path
+import guard
+
+def test_hang():
+    if guard.is_allowed("dangerous"):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+        Path(os.environ["HANGING"]).write_text(f"{child.pid} {os.getpid()}")
+        time.sleep(600)
+"""
+
+
+def _sweep_that_hangs_on_its_second_case(project, tmp_path_factory):
+    """The first case finishes; the second's mutated run hangs, so a signal lands
+    with one result known and a copy and a child alive."""
+    (project / "test_hang.py").write_text(_HANGS_ONLY_WHEN_MUTATED, encoding="utf-8")
+    _commit_all(project)
+    scratch = tmp_path_factory.mktemp("sweep")
+    hanging = scratch / "hanging"
+    edit = {"anchor": 'if name.startswith("danger"):', "replacement": "if False:"}
+    common = {"path": "guard.py", "validator": "python", "why": "w", "edits": [edit]}
+    manifest = scratch / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "cases": [
+                    {"label": "finishes", "test": "test_guard.py::test_blocks_danger", **common},
+                    {
+                        "label": "hangs",
+                        "test": "test_hang.py::test_hang",
+                        "env": {"HANGING": str(hanging)},
+                        **common,
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    tmp_root = scratch / "copies"
+    # To a file, read with a deadline: a blocking read on a pipe would hang this
+    # test on the very defect it is here to catch.
+    report = scratch / "report"
+    with report.open("w") as out:
+        proc = subprocess.Popen(
+            [sys.executable, str(_MOD), str(manifest), "--repo", str(project)]
+            + ["--tmp-root", str(tmp_root)],
+            stdout=out,
+            stderr=subprocess.STDOUT,
+            env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
+            start_new_session=True,
+            # A signal the caller ignored stays ignored (`nohup`), and a background
+            # job of a non-interactive shell has SIGINT ignored.
+            preexec_fn=lambda: [signal.signal(each, signal.SIG_DFL) for each in ms._STOP_SIGNALS],
+        )
+    return proc, hanging, tmp_root, report
+
+
+def _stop(proc, hanging):
+    """Whatever the harness under test did, leave nothing running: the sweep's
+    session, and the child the hanging test recorded (its own session's group)."""
+    if proc.poll() is None:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+    if hanging.exists() and hanging.read_text():
+        for pid in map(int, hanging.read_text().split()):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+
+
+def _alive(pid):
+    """Running, as opposed to gone or a zombie awaiting its reaper."""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+def _wait_for(condition, seconds=180):
+    import time
+
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.2)
+    return False
+
+
+@pytest.mark.parametrize(
+    "signum", [signal.SIGTERM, signal.SIGHUP, signal.SIGINT], ids=["sigterm", "sighup", "sigint"]
+)
+def test_a_sweep_stopped_by_a_signal_reports_and_cleans_up(project, tmp_path_factory, signum):
+    """A stopped sweep gets a signal, not a chance to finish. Results
+    printed only at the end were lost, and SIGTERM skipped every `finally`: the
+    copy stayed registered and its pytest kept running."""
+    proc, hanging, tmp_root, report = _sweep_that_hangs_on_its_second_case(
+        project, tmp_path_factory
+    )
+    try:
+        assert _wait_for(lambda: hanging.exists() and hanging.read_text()), (
+            "the second case never started hanging"
+        )
+        child_pid, pytest_pid = map(int, hanging.read_text().split())
+        assert _alive(child_pid), "the fixture's child is already gone"
+        copies = list(tmp_root.iterdir())
+        assert copies, "the fixture has no copy for the signal to clean up"
+        proc.send_signal(signum)
+        proc.wait(timeout=120)
+    finally:
+        _stop(proc, hanging)
+    out = report.read_text()
+    assert proc.returncode == 128 + signum
+    assert "finishes" in out, out
+    assert "BIT" in out, out
+    assert "stopped by signal" in out, out
+    assert list(tmp_root.iterdir()) == [], "the copy was left on disk"
+    assert _worktrees(project) == [str(project)], "the copy stayed registered"
+    assert _wait_for(lambda: not _alive(child_pid), 30), "the test's child outlived the sweep"
+    assert _wait_for(lambda: not _alive(pytest_pid), 30), "the pytest run outlived the sweep"
+
+
+def test_a_result_is_reported_as_soon_as_its_case_finishes(project, tmp_path_factory):
+    """Read while the second case is still hanging, so this cannot be the report
+    at the end."""
+    proc, hanging, _, report = _sweep_that_hangs_on_its_second_case(project, tmp_path_factory)
+    try:
+        assert _wait_for(lambda: hanging.exists() and hanging.read_text())
+        assert proc.poll() is None, "the sweep had already ended"
+        assert _wait_for(lambda: "finishes" in report.read_text(), 20), report.read_text()
+        assert "BIT" in report.read_text()
+        assert "running: hangs" in report.read_text(), "a hang must name its case"
+    finally:
+        _stop(proc, hanging)
+
+
+def test_the_callback_sees_every_result_in_order(project):
+    seen = []
+    cases = [_case(project, label="first"), _case(project, label="second")]
+    result = _sweep(project, cases, on_result=seen.append)
+    assert seen == result.results
+    assert [r.case.label for r in seen] == ["first", "second"]
+
+
+def test_each_result_prints_once_then_the_tally(project, capsys, monkeypatch):
+    """Every result once, then the tally."""
+    (project / "m.json").write_text(
+        json.dumps(
+            {
+                "cases": [
+                    {
+                        "label": "only",
+                        "path": "guard.py",
+                        "test": "test_guard.py::test_blocks_danger",
+                        "why": "w",
+                        "validator": "python",
+                        "edits": [
+                            {"anchor": 'if name.startswith("danger"):', "replacement": "if False:"}
+                        ],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    _commit_all(project)
+    assert ms.main([str(project / "m.json"), "--repo", str(project)]) == 0
+    out = capsys.readouterr().out
+    assert out.count("only") == 1
+    assert out.rstrip().endswith("1 bit, 0 SURVIVED, 0 ABORTED")
+
+
+def test_the_mutation_job_has_a_bound():
+    """Without one, a hung case holds a runner for GitHub's six-hour default."""
+    ci = yaml.safe_load(
+        (Path(__file__).parents[2] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    )
+    assert ci["jobs"]["mutation-gate"]["timeout-minutes"] == 120
+
+
+@pytest.fixture
+def _stoppable(monkeypatch):
+    """The handler `main` installs, in this process, with its state restored."""
+    monkeypatch.setattr(ms, "_stop_signal", None)
+    saved = {each: signal.getsignal(each) for each in ms._STOP_SIGNALS}
+    signal.signal(signal.SIGTERM, ms._stopped)
+    yield
+    for each, handler in saved.items():
+        signal.signal(each, handler)
+
+
+def _signal_me_before(monkeypatch, *git_args, skip=0):
+    """SIGTERM this process just before the git command named, after letting
+    ``skip`` of them pass, then run it."""
+    real = ms._git
+    ran = []
+    seen = []
+
+    def git(repo, *args):
+        if args[: len(git_args)] == git_args:
+            seen.append(args)
+            if len(seen) <= skip:
+                return real(repo, *args)
+            os.kill(os.getpid(), signal.SIGTERM)
+            out = real(repo, *args)
+            ran.append(args)
+            return out
+        return real(repo, *args)
+
+    monkeypatch.setattr(ms, "_git", git)
+    return ran
+
+
+def test_a_signal_during_worktree_add_waits_for_it(project, monkeypatch, _stoppable):
+    """Measured: killing the sweep part way through `git worktree add` left the copy,
+    a stray `git reset --hard` still writing, and an entry locked "initializing"
+    that `git worktree prune` does not clear, in the caller's own repository."""
+    ran = _signal_me_before(monkeypatch, "worktree", "add")
+    with pytest.raises(SystemExit) as stopped:
+        _sweep(project, [_case(project)])
+    assert stopped.value.code == 128 + signal.SIGTERM
+    assert ran, "the signal interrupted the add"
+    assert _copies_left() == []
+    assert _worktrees(project) == [str(project)]
+
+
+def test_a_signal_during_cleanup_does_not_abandon_it(project, monkeypatch, _stoppable):
+    """`suppress(RuntimeError)` does not catch SystemExit, so a raise here skipped
+    the rest of the `finally`, and the copy stayed on disk and registered."""
+    # skip=1: the first removal is the snapshot copy's, before any case has run.
+    ran = _signal_me_before(monkeypatch, "worktree", "remove", skip=1)
+    reported = []
+    with pytest.raises(SystemExit):
+        _sweep(project, [_case(project)], on_result=reported.append)
+    assert ran, "the signal interrupted the cleanup"
+    assert [r.outcome for r in reported] == [ms.BIT], "a result it had reached was lost"
+    assert _copies_left() == []
+    assert _worktrees(project) == [str(project)]
+
+
+def test_a_signal_just_after_the_child_starts_cannot_orphan_it(tmp_path, monkeypatch, _stoppable):
+    """Between `Popen` returning and the assignment, nothing could kill the child."""
+    real = subprocess.Popen
+    started = []
+
+    def popen(*a, **kw):
+        proc = real(*a, **kw)
+        started.append(proc.pid)
+        os.kill(os.getpid(), signal.SIGTERM)
+        return proc
+
+    monkeypatch.setattr(ms.subprocess, "Popen", popen)
+    with pytest.raises(SystemExit):
+        ms._pytest(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            cwd=tmp_path,
+            env=dict(os.environ),
+            timeout=30,
+        )
+    assert started
+    assert _wait_for(lambda: not _alive(started[0]), 10), "the child outlived the stop"
+
+
+def test_a_stop_the_interpreter_swallowed_still_ends_the_sweep(project, monkeypatch, _stoppable):
+    """Python discards an exception raised inside a `__del__`. Measured: a signal
+    landing in `Popen.__del__` printed the stop line, then exit 0 and a clean tally.
+    The stop is a recorded fact, checked between cases and before the tally."""
+    ran = []
+    real = ms.isolated_copy
+    copies = []
+
+    def counted(*a, **kw):
+        copies.append(a)
+        return real(*a, **kw)
+
+    def stop_after_the_first(result):
+        ran.append(result)
+        monkeypatch.setattr(ms, "_stop_signal", signal.SIGTERM)
+
+    monkeypatch.setattr(ms, "isolated_copy", counted)
+    cases = [_case(project, label="first"), _case(project, label="second")]
+    with pytest.raises(SystemExit) as stopped:
+        _sweep(project, cases, on_result=stop_after_the_first)
+    assert stopped.value.code == 128 + signal.SIGTERM
+    assert len(ran) == 1
+    assert len(copies) == 2, "the snapshot and the first case: no copy after the stop"
+
+
+def test_a_signal_during_the_snapshots_cleanup_runs_no_case(project, monkeypatch, _stoppable):
+    ran = _signal_me_before(monkeypatch, "worktree", "remove")
+    reported = []
+    with pytest.raises(SystemExit):
+        _sweep(project, [_case(project)], on_result=reported.append)
+    assert ran
+    assert reported == []
+    assert _copies_left() == []
+
+
+def test_a_baseline_run_names_its_case_too(project):
+    """A hang or a queue for the test lock in the baseline is where a sweep can sit
+    longest, so it must not be silent."""
+    started = []
+    _sweep(project, [_case(project)], check_baseline=True, on_start=started.append)
+    assert [c.label for c in started] == ["guard removed", "guard removed"]
+
+
+def test_a_stop_as_the_last_case_ends_is_still_a_stop(project, monkeypatch, _stoppable):
+    """Otherwise the swallowed stop above reads as a clean sweep, at exit 0."""
+
+    def stop(result):
+        monkeypatch.setattr(ms, "_stop_signal", signal.SIGTERM)
+
+    with pytest.raises(SystemExit):
+        _sweep(project, [_case(project)], on_result=stop)
+
+
+def test_a_stop_after_the_sweep_returns_is_not_a_clean_tally(
+    project, monkeypatch, capsys, _stoppable
+):
+    """The gap between the sweep's last check and the tally: measured, a raise
+    swallowed there read as the stop line, then exit 0 and a clean tally."""
+
+    def stopped_late(*a, **kw):
+        monkeypatch.setattr(ms, "_stop_signal", signal.SIGTERM)
+        return ms.Sweep()
+
+    monkeypatch.setattr(ms, "sweep", stopped_late)
+    manifest = project / "m.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "cases": [
+                    {
+                        "label": "only",
+                        "path": "guard.py",
+                        "test": "test_guard.py::test_blocks_danger",
+                        "why": "w",
+                        "validator": "python",
+                        "edits": [{"anchor": "return True", "replacement": "return bool(1)"}],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit) as stopped:
+        ms.main([str(manifest), "--repo", str(project)])
+    assert stopped.value.code == 128 + signal.SIGTERM
+    assert " bit, " not in capsys.readouterr().out
+
+
+def test_a_closed_stream_does_not_turn_a_stop_into_a_case_failure(monkeypatch, _stoppable):
+    """The report is the handler's courtesy. An OSError from it would be caught by
+    the handlers around the signal's landing point, and read as that step failing."""
+
+    def broken(*a):
+        raise OSError("closed")
+
+    monkeypatch.setattr(ms.os, "write", broken)
+    with pytest.raises(SystemExit) as stopped:
+        ms._stopped(signal.SIGTERM, None)
+    assert stopped.value.code == 128 + signal.SIGTERM
+
+
+def test_a_signal_the_caller_ignored_stays_ignored(project, monkeypatch):
+    """`nohup` means SIGHUP should not stop this run."""
+    saved = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        monkeypatch.setattr(ms, "_stop_signal", None)
+        previous = ms._catch_stop_signals()
+        assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
+        assert signal.getsignal(signal.SIGTERM) == ms._stopped
+        for each, handler in previous.items():
+            signal.signal(each, handler)
+    finally:
+        signal.signal(signal.SIGHUP, saved)
+
+
+def test_the_job_lets_the_sweep_hear_a_signal_and_report_a_hang():
+    """The runner signals only the step's entry process, which would be bash, so
+    the sweep must replace it. And a per-run bound equal to the job's could never
+    fire: the job would always end first, with no reason given for the hang."""
+    ci = yaml.safe_load(
+        (Path(__file__).parents[2] / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    )
+    steps = ci["jobs"]["mutation-gate"]["steps"]
+    run = next(s["run"] for s in steps if "mutation_sweep.py" in s.get("run", ""))
+    assert run.startswith("exec python scripts/ci/mutation_sweep.py")
+    assert "--timeout 1500" in run

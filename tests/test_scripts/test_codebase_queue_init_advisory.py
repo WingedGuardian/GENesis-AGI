@@ -208,7 +208,10 @@ def test_init_lock_warning_does_not_redefine_actual_queue_operations(
         lock.chmod(0o600)
     assert (result.returncode != 0) is old_schema
     if old_schema:
-        assert "PermissionError" in result.stderr and str(lock) in result.stderr
+        # An ordinary command refuses an older queue before it touches the init
+        # lock; only the explicit cutover conversion takes that lock.
+        assert "conversion happens only via strict cutover" in result.stderr
+        assert "Traceback" not in result.stderr
     else:
         assert result.stdout.strip().split("\t")[4] == "0"
 
