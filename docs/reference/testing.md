@@ -24,6 +24,13 @@ ruff check . && pytest -v
 
 ## Test Suite Overview
 
+For the opt-in request-owned database primitive, run
+`pytest -q tests/test_db/test_request_database.py tests/test_db/test_request_database_lifecycle.py`.
+These use scratch SQLite databases, including independent readers, cancellation,
+WAL cursor release and process-death recovery. Four explicit outcome comparisons
+keep the actual legacy middleware as the negative control. Shared MCP service E2E
+qualification is separate from this primitive coverage.
+
 Genesis v3 has **~21,000 test functions** across **~1,345 files** (counted
 2026-09-06 by `grep -rEh "^\s*(async )?def test_" tests/ --include=*.py | wc -l`;
 parametrized cases make the collected item count higher still). The suite runs

@@ -22,7 +22,8 @@ still consulted it would see "no dispatch marker" and pass human-only gates for
 everyone. Routing every read through one function gives a request-scoped value
 a single place to take precedence.
 
-Contract for the shared-service work that follows (not implemented here):
+Contract for the shared-service work that follows (the service itself is not
+implemented here):
 
 - A request-scoped context is set with :func:`request_caller`, per request, and
   is reset in ``finally``, so cancellation resets it too.
@@ -30,12 +31,13 @@ Contract for the shared-service work that follows (not implemented here):
   shared service selects that by its server MODE, never by a credential being
   absent, and rejects a request whose credential is missing or invalid rather
   than letting it fall through to the environment.
-- The MODE check belongs INSIDE :func:`caller_context`'s fallback branch, not
-  only in request middleware. A context variable does not follow work handed
-  to ``threading.Thread`` or ``loop.run_in_executor`` (``asyncio.to_thread``
-  does copy it), so such work reaches the fallback. In a shared service that
-  fallback must fail closed, never read the shared process's environment. A
-  subprocess a tool spawns inherits the service's environment, not the
+- The MODE check is INSIDE :func:`caller_context`'s fallback branch, not only
+  in request middleware. A context variable does not follow work handed to
+  ``threading.Thread`` or ``loop.run_in_executor`` (``asyncio.to_thread`` does
+  copy it), so such work reaches the fallback. A shared service calls
+  :func:`enter_shared_service` after its runtime is initialised and before it
+  serves its first request; from then on that fallback fails closed and never
+  reads the shared process's environment. A subprocess a tool spawns inherits the service's environment, not the
   caller's, and needs the caller passed to it explicitly.
 - An external client's profile is carried in :attr:`CallerContext.profile`, so
   profile and identity are one value and one context variable.
@@ -53,11 +55,15 @@ keeps its own normalisation unchanged.
 
 from __future__ import annotations
 
+import logging
 import os
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 CC_SESSION_ENV = "GENESIS_CC_SESSION"
 SUPERVISED_ENV = "GENESIS_SESSION_SUPERVISED"
@@ -89,8 +95,9 @@ class CallerContext:
     The defaults are the LEAST privileged caller (dispatched, unsupervised), so
     a context built with a field left out fails closed at the human-only gates.
     ``dispatched=False`` asserts a foreground human caller; a shared service
-    sets it only for a credential that stands for one. The environment
-    fallback sets every field explicitly, so these defaults never reach it.
+    sets it only for a credential that stands for one. ``origin`` defaults to
+    ``None``, which memory writers read as first-party, so a caller of unknown
+    trust must set it (see :data:`_LOST_SCOPE_CALLER`).
     """
 
     dispatched: bool = True
@@ -110,6 +117,27 @@ class CallerContext:
 _REQUEST_CALLER: ContextVar[CallerContext | None] = ContextVar(
     "genesis_request_caller", default=None
 )
+_shared_service = False
+#: Work that lost its request scope. The literal is provenance's
+#: ``ORIGIN_EXTERNAL_UNTRUSTED``; provenance imports this module, so a test pins it.
+_LOST_SCOPE_CALLER = CallerContext(origin="external_untrusted")
+_warned_sites: set[tuple[str, int]] = set()
+
+
+def enter_shared_service() -> None:
+    """Mark this process as a shared service, for good: its environment names no caller.
+
+    Rewrites the identity variables as well, so a child process, which inherits
+    the environment and not this flag, reads the lost-scope caller too unless a
+    tool passes it the real caller. Bootstrap clears the origin variable, so
+    call this after the runtime is initialised.
+    """
+    global _shared_service
+    _shared_service = True
+    for name in IDENTITY_ENV_VARS:
+        os.environ.pop(name, None)
+    os.environ[CC_SESSION_ENV] = "1"
+    os.environ[SESSION_ORIGIN_ENV] = _LOST_SCOPE_CALLER.origin
 
 
 def caller_context_from_env() -> CallerContext:
@@ -126,10 +154,21 @@ def caller_context_from_env() -> CallerContext:
 
 
 def caller_context() -> CallerContext:
-    """The current caller: the request-scoped value if one is set, else the environment."""
+    """The current caller: the request-scoped value if set, else the environment.
+
+    In a shared service there is no environment to fall back on, so work that
+    lost its request scope is the least privileged caller.
+    """
     request = _REQUEST_CALLER.get()
     if request is not None:
         return request
+    if _shared_service:
+        frame = sys._getframe(1)
+        site = (frame.f_code.co_filename, frame.f_lineno)
+        if site not in _warned_sites:  # bounded by source lines, for a log nothing rotates
+            _warned_sites.add(site)
+            logger.warning("Caller identity read outside a request at %s:%d", *site)
+        return _LOST_SCOPE_CALLER
     return caller_context_from_env()
 
 

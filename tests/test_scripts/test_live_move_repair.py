@@ -230,6 +230,7 @@ def kill_switch(root: Path, target: str, victim: str) -> None:
     assert r.returncode != 0, "the switch was not killed"
     (info / "attributes").unlink()
     _git(root, "config", "--remove-section", "filter.killer")
+    _age_locks(root)
 
 
 def kill_prepared(root: Path, target: str) -> None:
@@ -246,6 +247,7 @@ def kill_prepared(root: Path, target: str) -> None:
     )
     hook.unlink()
     assert r.returncode != 0, "the switch was not killed"
+    _age_locks(root)
 
 
 def killed_tag_side(w: World, victim: str) -> None:
@@ -716,11 +718,18 @@ def _hold(path: Path) -> int:
     return fd
 
 
+def _age_locks(root: Path) -> None:
+    """Every lock a kill left is an earlier kill's. Without this, each test that
+    repairs one waits out LOCK_FRESH_S in real time wherever a fresh lock counts as
+    held (see `_aged`): about 30 s per test and 30 minutes of a CI run."""
+    for lock in (root / ".git").rglob("*.lock"):
+        _aged(lock)
+
+
 def _aged(path: Path) -> None:
     """A lock left by an EARLIER kill: older than LOCK_FRESH_S. A lock made a
     moment ago is fresh, and wherever this user runs a process whose fds cannot
-    be read (a CI runner, a systemd-user install; pytest's PID namespace hides
-    them locally) a fresh lock counts as held."""
+    be read (a CI runner, a systemd-user install) a fresh lock counts as held."""
     if path.exists():
         old = time.time() - 3600
         os.utime(path, (old, old))
@@ -1824,11 +1833,14 @@ def test_r4_a_fresh_ref_lock_is_waited_for_never_left_behind(w, mod, tmp_path, m
     monkeypatch.setattr(mod, "_now", clock.now)
     monkeypatch.setattr(mod, "_sleep", clock.sleep)
     head_lock = w.root / ".git" / "HEAD.lock"
+    ref_lock = w.root / ".git" / "refs" / "heads" / "live.lock"
+    for lock in (head_lock, ref_lock):
+        os.utime(lock)  # this test is about a fresh lock; the kill helper ages them
     try:
         assert mod.Repair(str(w.state), str(w.root), True, 0).run() == 1
         assert w.state.exists() and head_lock.exists() and w.backups() == []
         old = time.time() - 2 * mod.LOCK_FRESH_S
-        for lock in (head_lock, w.root / ".git" / "refs" / "heads" / "live.lock"):
+        for lock in (head_lock, ref_lock):
             os.utime(lock, (old, old))
         assert mod.Repair(str(w.state), str(w.root), True, 0).run() == 0
     finally:

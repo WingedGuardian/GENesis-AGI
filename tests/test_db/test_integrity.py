@@ -407,6 +407,66 @@ async def test_connect_aiosqlite_rw_preserves_guard_error_if_cleanup_fails(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_an_owned_open_refused_after_opening_joins_the_worker(tmp_path, monkeypatch):
+    from genesis.db import connection
+
+    db = tmp_path / "genesis.db"
+    _healthy_db(db)
+    real_connect = aiosqlite.connect
+    joined = []
+    real_drain = connection.drain_connection_worker
+
+    async def record(conn):
+        joined.append(conn)
+        await real_drain(conn)
+
+    class QuarantineAfterOpen:
+        def __init__(self, connector):
+            self._connector = connector
+
+        def __await__(self):
+            async def open_then_quarantine():
+                opened = await self._connector
+                integrity.quarantine_database(db, source="test", detail="became bad during open")
+                return opened
+
+            return open_then_quarantine().__await__()
+
+    monkeypatch.setattr(connection, "drain_connection_worker", record)
+    monkeypatch.setattr(
+        aiosqlite, "connect", lambda *a, **k: QuarantineAfterOpen(real_connect(*a, **k))
+    )
+    with pytest.raises(integrity.DatabaseIntegrityError):
+        await connection.connect_aiosqlite_rw(db, existing_only=True, owned=True)
+    assert len(joined) == 1
+
+
+@pytest.mark.asyncio
+async def test_an_owned_open_reports_a_failed_cleanup(tmp_path, monkeypatch):
+    from genesis.db.connection import ConnectionCleanupError, connect_aiosqlite_rw
+
+    db = tmp_path / "genesis.db"
+    _healthy_db(db)
+
+    class FakeConnection:
+        async def close(self):
+            raise RuntimeError("close failed")
+
+    class QuarantineDuringOpen:
+        def __await__(self):
+            async def open_then_quarantine():
+                integrity.quarantine_database(db, source="test", detail="became bad during open")
+                return FakeConnection()
+
+            return open_then_quarantine().__await__()
+
+    monkeypatch.setattr(aiosqlite, "connect", lambda *_a, **_k: QuarantineDuringOpen())
+    with pytest.raises(ConnectionCleanupError) as raised:
+        await connect_aiosqlite_rw(db, existing_only=True, owned=True)
+    assert isinstance(raised.value.__cause__, integrity.DatabaseIntegrityError)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("context_api", [False, True])
 async def test_existing_only_connector_never_creates_missing_db(tmp_path, context_api):
     from genesis.db.connection import connect_aiosqlite_rw

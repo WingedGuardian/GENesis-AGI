@@ -72,7 +72,7 @@ def test_no_token_leak_via_tmux_e(script_text):
 
 def test_pane_command_interpolates_oauth_prefix(script_text):
     # The token-prep prefix runs BEFORE cd, leaving the `cd && claude` guard intact.
-    assert "${_OAUTH_SRC}cd ${_GENESIS_ROOT_Q} && ${_TMPDIR_UNSET:-}${_FUNCTION_HOOKS_UNSET:-}claude " in script_text
+    assert "${_OAUTH_SRC}cd ${_GENESIS_ROOT_Q} && ${_TMPDIR_UNSET:-}${_FUNCTION_HOOKS_UNSET:-}${_SLOT_EXEC_PREFIX:-}claude " in script_text
 
 
 def test_claude_stays_under_cd_guard(script_text):
@@ -89,7 +89,7 @@ def test_claude_stays_under_cd_guard(script_text):
     # below, where a bare ${_TMPDIR_UNSET} would be unbound.
     # `${_FUNCTION_HOOKS_UNSET:-}` follows it on the same terms: an `unset` joined
     # with `&&`, present unless the web-override lever pins the flag on.
-    assert "${_OAUTH_SRC}cd ${_GENESIS_ROOT_Q} && ${_TMPDIR_UNSET:-}${_FUNCTION_HOOKS_UNSET:-}claude " in script_text
+    assert "${_OAUTH_SRC}cd ${_GENESIS_ROOT_Q} && ${_TMPDIR_UNSET:-}${_FUNCTION_HOOKS_UNSET:-}${_SLOT_EXEC_PREFIX:-}claude " in script_text
     assert "&& { ${_OAUTH_SRC}claude" not in script_text  # not the brace-group shape
 
 
@@ -165,7 +165,7 @@ def _extract_launch_line(script_text: str) -> str:
     raise AssertionError("could not find the exec-tmux pane command in cc-slot.sh")
 
 
-def _run_cd_guard(script_text: str, root: str, canary: Path, fakebin: Path):
+def _run_cd_guard(script_text: str, root: str, canary: Path, fakebin: Path, slot_exec_prefix: str = ""):
     """Run the REAL pane launch string with a fake `claude` (touches the canary)
     and a `;`-terminated _OAUTH_SRC (mimics the real prefix). Returns
     (process, claude_canary_exists, capture_canary_exists).
@@ -190,6 +190,7 @@ _OAUTH_SRC="export CDGUARD_PREFIX_RAN=1; "
 CC_PERM_FLAG=""
 CLAUDE_ARGS_Q=""
 SLOT="test"
+_SLOT_EXEC_PREFIX={slot_exec_prefix!r}
 pane_cmd={launch}
 bash -c "$pane_cmd"
 echo "PANE_EXIT=$?"
@@ -260,3 +261,39 @@ printf 'TOKEN=[%s]\\n' "${{CLAUDE_CODE_OAUTH_TOKEN:-}}"
     proc = _run_pane(harness, home)
     assert not canary.exists(), "notice text injected a shell command (canary created)"
     assert "TOKEN=[sk-ant-oat-DYNTOKEN]" in proc.stdout, proc.stdout
+
+
+def test_slot_exec_prefix_keeps_cd_guard_and_exit_code(tmp_path, script_text):
+    """The slot-scope prefix sits inside the `cd &&` chain, so a failed cd runs
+    neither the wrapper nor claude, and a good cd runs claude THROUGH the wrapper
+    with claude's own exit code reaching the pane (the exit capture reads it)."""
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    fake_claude = fakebin / "claude"
+    fake_claude.write_text('#!/usr/bin/env bash\ntouch "$CDGUARD_CANARY"\nexit 7\n')
+    fake_claude.chmod(0o755)
+    wrapper_canary = tmp_path / "WRAPPER_RAN"
+    wrapper = tmp_path / "slot exec.sh"
+    wrapper.write_text(
+        '#!/usr/bin/env bash\n'
+        f'echo "$1 $2" > {str(wrapper_canary)!r}\n'
+        'shift 2\nexec "$@"\n'
+    )
+    wrapper.chmod(0o755)
+    prefix = f"'{wrapper}' test -- "
+
+    proc_bad, ran_bad, _ = _run_cd_guard(
+        script_text, str(tmp_path / "does-not-exist"), tmp_path / "BAD", fakebin, prefix
+    )
+    assert not ran_bad, proc_bad.stdout + proc_bad.stderr
+    assert not wrapper_canary.exists(), "the scope wrapper ran for a checkout that could not be entered"
+
+    good_root = tmp_path / "good"
+    good_root.mkdir()
+    proc_good, ran_good, captured_good = _run_cd_guard(
+        script_text, str(good_root), tmp_path / "GOOD", fakebin, prefix
+    )
+    assert ran_good, proc_good.stdout + proc_good.stderr
+    assert wrapper_canary.read_text().strip() == "test --", "claude did not start through the wrapper"
+    assert captured_good
+    assert "PANE_EXIT=7" in proc_good.stdout, proc_good.stdout
