@@ -1725,6 +1725,12 @@ the shared banner is not an assertion about all concurrent sessions.
   Retained terminal decisions replay without
   resending known completions; missing terminal evidence, native intent/scope
   cleanup and persistent resource quarantine remain separate activation gates.
+  `scripts/lib/code_intel_execution.py` adds an explicit stdlib scope-evidence
+  observer with private bounded pipe transport and complete-subtree task/counter
+  checks. It has no automatic queue caller, stop authority or quarantine state.
+  The existing foreground watchdog lacks a post-return scope-quiescence barrier;
+  strict queue integration must retain unresolved cleanup ownership separately.
+  Synthetic/descriptor fixtures do not qualify native OOM or production indexing.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
   deletions; native query/client cgroup proof and orphan-scope checks precede
