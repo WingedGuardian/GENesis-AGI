@@ -949,6 +949,10 @@ _REPAIR_REFUSALS_LOGGED: set[tuple[str, str]] = set()
 _REPAIR_REFUSALS_LOG_CAP = 256
 
 
+# Per git call. A real residue check took about 1 s on a clone (measured).
+_GUARD_GIT_TIMEOUT_S = 5
+
+
 def _script(path: Path):
     """A script of the tree this module ships in, loaded afresh: the repair's
     own rules, so this reader judges what the writer judged."""
@@ -1021,8 +1025,14 @@ def collect_live_repairs(
     out: dict = {"reports": [], "saved": 0, "refused": 0, "unread_older": 0, "unresolved": False}
     try:
         names = [n for n in os.listdir(backups) if n.endswith(_REPAIR_SUFFIX)]
-    except OSError:
+    except FileNotFoundError:
         names = []
+    except OSError as exc:
+        # A folder that cannot be read saw nothing. Reading it as "no reports" would
+        # close a standing alert about a report still there.
+        _refused(backups.name, type(exc).__name__)
+        out["refused"] = 1
+        return out
     if not names:
         return out
     try:  # the module and every name used from it: a module on disk lacking
@@ -1044,7 +1054,7 @@ def collect_live_repairs(
             if order[0] - now > future_s:
                 raise ValueError(f"named more than {future_s} s ahead of this clock")
             named.append((order, ts, name))
-        except ValueError as exc:
+        except Exception as exc:  # noqa: BLE001 - a later module's rules must not blank the section
             _refused(name, str(exc))
             out["refused"] += 1
     named.sort(reverse=True)
@@ -1082,9 +1092,13 @@ def collect_live_repairs(
 
 def _mixed(genesis_home_dir: Path, repo: str | None) -> bool:
     """Does the shared restart guard call the checkout half-written? Doubt
-    (no checkout named, a guard that cannot run) keeps the report's word."""
+    (no checkout named, a guard that cannot run, a git that stalls) keeps the
+    report's word."""
     try:
         guard = _script(_GUARD_SCRIPT)
+        # The guard's own limit suits a deploy holding a lock, not this read: the
+        # health route gives up at 15 s. This copy of the module is ours alone.
+        guard._TIMEOUT_S = _GUARD_GIT_TIMEOUT_S
         verdict, _ = guard.verdict(str(genesis_home_dir / "update_state.json"), repo)
     except Exception:  # noqa: BLE001 - any failure to decide keeps "unresolved"
         return True

@@ -1852,8 +1852,8 @@ def _deploy_repair_paragraph(repairs: dict) -> str:
             for r in shown
         ]
         parts.append(
-            "Genesis put a half-written `live` checkout back to its rollback tag and saved "
-            "what it found there that was not the update's (someone's edits). "
+            "A repair of a half-written `live` checkout, moving it back to its rollback "
+            "tag, saved what it found there that was not the update's (someone's edits). "
             + " ".join(each)
             + " Restoring puts the saved files back as uncommitted edits, so "
             "deploy_code_only.sh and update.sh refuse to deploy until they are committed "

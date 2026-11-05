@@ -325,10 +325,11 @@ async def test_live_repair_shows_at_most_ten_paths(monkeypatch):
     assert '"p9"' in text and '"p10"' not in text and "(+40 more)" in text
 
 
-async def test_live_repair_non_list_paths_count_as_none(monkeypatch):
+async def test_live_repair_non_list_paths_claim_no_counts(monkeypatch):
     for paths in ("abc", None, 7):
         text = await _collect(monkeypatch, "", _reports(_report(paths=paths)))
-        assert "0 path(s)" in text
+        assert "its restored paths could not be read" in text
+        assert "path(s) restored" not in text
 
 
 def test_prompt_fences_the_repair_section_only_when_present() -> None:

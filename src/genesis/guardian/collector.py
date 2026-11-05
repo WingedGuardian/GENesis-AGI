@@ -658,15 +658,21 @@ async def _collect_live_repair(config: GuardianConfig) -> str:
     report = await _read_report(config)
     if report is not None:
         rows = report.get("paths")
-        rows = [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+        # No list: nothing was read, which is not the same as nothing restored.
+        counted = isinstance(rows, list)
+        rows = [r for r in rows if isinstance(r, dict)] if counted else []
         foreign = [r.get("path") for r in rows if r.get("class") == "foreign"]
         shown = ", ".join(_quoted(p, 200) for p in foreign[:10])
         steps = report.get("reapply")
         lines.append(
             f"newest report: ts {_quoted(report.get('ts'), 40)}, result "
-            f"{_quoted(report.get('result') or 'not finished', 200)}; {len(rows)} path(s) "
-            f"restored, {len(foreign)} not the update's; "
-            f"{len(steps) if isinstance(steps, list) else 0} re-apply step(s) in its REPAIR.json"
+            f"{_quoted(report.get('result') or 'not finished', 200)}; "
+            + (
+                f"{len(rows)} path(s) restored, {len(foreign)} not the update's; "
+                if counted
+                else "its restored paths could not be read; "
+            )
+            + f"{len(steps) if isinstance(steps, list) else 0} re-apply step(s) in its REPAIR.json"
         )
         if foreign:  # last, so the field cap cuts paths before anything else
             more = f" (+{len(foreign) - 10} more)" if len(foreign) > 10 else ""

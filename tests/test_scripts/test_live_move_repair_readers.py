@@ -1055,3 +1055,80 @@ def test_the_refusal_log_set_is_bounded(monkeypatch, caplog):
     assert len(dh._REPAIR_REFUSALS_LOGGED) == dh._REPAIR_REFUSALS_LOG_CAP
     logged = [r for r in caplog.records if "crafted-" in r.getMessage()]
     assert len(logged) == dh._REPAIR_REFUSALS_LOG_CAP
+
+
+def _guard_spy(monkeypatch, verdict):
+    """The real guard module, loaded the way the reader loads it, with verdict replaced."""
+    dh = _dh()
+    real_script = dh._script
+    seen = []
+
+    def spying(path):
+        module = real_script(path)
+        if path == dh._GUARD_SCRIPT:
+            seen.append(module)
+            module.verdict = verdict(module)
+        return module
+
+    monkeypatch.setattr(dh, "_script", spying)
+    return dh, seen
+
+
+def test_the_guard_runs_on_the_health_routes_budget(tmp_path, monkeypatch):
+    budgets = []
+
+    def verdict(module):
+        def run(*_args):
+            budgets.append(module._TIMEOUT_S)
+            return module.SAFE, ""
+
+        return run
+
+    dh, seen = _guard_spy(monkeypatch, verdict)
+    assert dh._mixed(tmp_path, str(tmp_path)) is False
+    assert budgets == [dh._GUARD_GIT_TIMEOUT_S]
+    assert dh._GUARD_GIT_TIMEOUT_S < 15  # /api/genesis/health gives up at 15 s
+
+
+def test_a_git_that_stalls_keeps_the_reports_word(tmp_path, monkeypatch):
+    def verdict(_module):
+        def run(*_args):
+            raise subprocess.TimeoutExpired(cmd="git", timeout=5)
+
+        return run
+
+    dh, _ = _guard_spy(monkeypatch, verdict)
+    assert dh._mixed(tmp_path, str(tmp_path)) is True
+
+
+def test_a_backups_folder_that_cannot_be_read_is_refused_not_empty(tmp_path):
+    (tmp_path / "deploy-backups").write_text("a file where the folder should be")
+    found = _dh().collect_live_repairs(tmp_path, tmp_path)
+    assert found["refused"] == 1
+    assert found["reports"] == []
+
+
+def test_no_backups_folder_is_simply_no_reports(tmp_path):
+    found = _dh().collect_live_repairs(tmp_path, tmp_path)
+    assert found["refused"] == 0
+
+
+def test_a_name_rule_that_raises_anything_is_a_refusal(tmp_path, monkeypatch):
+    backups = tmp_path / "deploy-backups"
+    (backups / f"20260101T000000Z-1{SUFFIX}").mkdir(parents=True)
+    dh = _dh()
+    real_script = dh._script
+
+    def changed(path):
+        module = real_script(path)
+        if path == dh._REPAIR_SCRIPT:
+
+            def bad_order(_ts):
+                raise TypeError("a later module changed this signature")
+
+            module.report_order = bad_order
+        return module
+
+    monkeypatch.setattr(dh, "_script", changed)
+    found = dh.collect_live_repairs(tmp_path, tmp_path)
+    assert found["refused"] == 1
