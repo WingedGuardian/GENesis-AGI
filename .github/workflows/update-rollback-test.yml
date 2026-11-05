@@ -79,8 +79,7 @@ jobs:
       - name: Install Genesis (non-interactive, strict)
         env:
           GENESIS_INSTALL_STRICT: "1"
-        working-directory: /home/runner/genesis
-        run: ./scripts/install.sh --non-interactive
+        run: cd ~/genesis && ./scripts/install.sh --non-interactive
 
       - name: Set up the local origin and backups remote
         run: ~/genesis/scripts/ci/update_rollback_e2e.sh setup
