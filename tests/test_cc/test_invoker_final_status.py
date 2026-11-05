@@ -136,10 +136,15 @@ async def test_no_block_leaves_the_text_and_no_report(invoker, run):
 
 
 @pytest.mark.parametrize("run", [_run, _run_streaming])
-async def test_a_session_reading_outside_content_keeps_its_status_not_its_words(invoker, run):
-    """Its reason reaches the owner's alert pages, and outside text can steer it."""
+async def test_a_session_reading_outside_content_has_its_reason_labeled(invoker, run):
+    """Outside text can steer it, so the owner sees it as the session's words."""
     output = await run(
         invoker, ANSWER + "\n\n" + BLOCK, report_status=True, origin="external_untrusted"
     )
-    assert output.final_status == FinalStatus("blocked", "")
+    assert output.final_status == FinalStatus("blocked", "the session says: a tool was denied")
     assert output.text == ANSWER
+
+
+async def test_a_first_party_session_reason_is_not_labeled(invoker):
+    output = await _run(invoker, ANSWER + "\n\n" + BLOCK, report_status=True)
+    assert output.final_status.reason == "a tool was denied"

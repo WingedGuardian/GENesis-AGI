@@ -164,6 +164,10 @@ def parse_cc_version(text: str) -> tuple[int, int, int] | None:
     return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
 
 
+#: Prefix on a reason reported by a session that reads outside content.
+EXTERNAL_REASON_LABEL = "the session says: "
+
+
 def _split_final_status(invocation: CCInvocation, output: CCOutput) -> CCOutput:
     """Move a trailing ``final_status`` block off ``output.text`` (see cc/final_status.py).
 
@@ -179,9 +183,9 @@ def _split_final_status(invocation: CCInvocation, output: CCOutput) -> CCOutput:
     text, report = final_status.split(output.text)
     if report is not None and report.reason and invocation.origin == ORIGIN_EXTERNAL_UNTRUSTED:
         # A session reading outside content can be steered into writing its
-        # reason, and the reason reaches the owner's alert pages: keep the
-        # status, drop the words.
-        report = replace(report, reason="")
+        # reason, and the reason reaches the owner's alert pages. Owner ruling:
+        # show it, labeled as the session's words, never as Genesis's own.
+        report = replace(report, reason=EXTERNAL_REASON_LABEL + report.reason)
     return replace(output, text=text, final_status=report)
 
 
