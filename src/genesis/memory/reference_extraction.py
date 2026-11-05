@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from secrets import token_hex as secrets_token_hex
 from typing import TYPE_CHECKING
 
 from genesis.memory.knowledge_ingest import ingest_knowledge_unit
@@ -259,10 +260,9 @@ def _derive_identifier(extraction: Extraction, *, default_prefix: str) -> str:
     if not content:
         return f"{default_prefix} (empty)"
     # The identifier is the unit's unique key and is indexed in knowledge_fts. A
-    # secret the text carries never becomes part of it: the key then stays the
-    # same when the value is rotated, so a re-capture updates the one unit
-    # instead of creating a second one keyed on the old password (#2426).
-    for secret in sorted(captured_secrets([content]), key=len, reverse=True):
+    # secret the text carries never becomes part of it (#2426).
+    secrets = captured_secrets([content])
+    for secret in sorted(secrets, key=len, reverse=True):
         content = content.replace(secret, REDACTED)
     # Take up to the first period or newline
     for stop in (".", "\n", ";"):
@@ -270,7 +270,17 @@ def _derive_identifier(extraction: Extraction, *, default_prefix: str) -> str:
         if 0 < idx < 80:
             content = content[:idx]
             break
-    return content[:80].strip() or default_prefix
+    identifier = content[:80].strip() or default_prefix
+    if secrets:
+        # With its secret redacted, this text no longer tells two credentials
+        # apart ("username: admin, password: [redacted]"), and a shared key
+        # would let the second capture replace the first. Each capture is kept
+        # under its own key instead (owner ruling: a rotated password adds an
+        # entry rather than risking a lost one). The tag is random, never
+        # derived from the value: a short hash of a password, indexed in the
+        # key, could be brute-forced back to a weak one.
+        identifier = f"{identifier} #{secrets_token_hex(3)}"
+    return identifier
 
 
 def _user_shared(token: str | None, user_text: str | None) -> bool:

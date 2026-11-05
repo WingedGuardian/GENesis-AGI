@@ -999,8 +999,12 @@ async def test_a_credential_domain_in_another_case_is_stored_canonically(db):
 
 
 def test_an_auto_captured_identifier_never_keys_on_the_password():
-    """4476130356: with no entities the identifier comes from the text; the
-    password is redacted from it, so a rotation keys the same unit."""
+    """4476130356: with no entities the identifier comes from the text, with
+    the password redacted. Two captures that read alike once redacted get
+    distinct keys (owner ruling: never overwrite), and the tag that keeps them
+    apart is not derived from the value."""
+    import hashlib
+
     from genesis.memory.extraction import Extraction
     from genesis.memory.reference_extraction import classify_as_reference
 
@@ -1012,8 +1016,27 @@ def test_an_auto_captured_identifier_never_keys_on_the_password():
         )
         return classify_as_reference(ex)["identifier"]
 
-    assert "Old!Fake1x" not in ident("Old!Fake1x")
-    assert ident("Old!Fake1x") == ident("New!Fake2y")
+    first, second = ident("Old!Fake1x"), ident("New!Fake2y")
+    assert "Old!Fake1x" not in first
+    assert first != second
+    assert first.rsplit(" #", 1)[0] == second.rsplit(" #", 1)[0]
+    tag = first.rsplit(" #", 1)[1]
+    assert tag not in hashlib.sha256(b"Old!Fake1x").hexdigest()
+
+
+async def test_two_auto_captures_that_read_alike_are_both_kept(db):
+    from genesis.memory.extraction import Extraction
+    from genesis.memory.reference_extraction import ingest_reference_from_extraction
+
+    units = []
+    for password in ("Old!Fake1x", "New!Fake2y"):
+        ex = Extraction(content=f"Forum bot password: {password} for the weekly job",
+                        extraction_type="entity", confidence=0.9)
+        units.append(await ingest_reference_from_extraction(
+            ex, store=_store(), db=db, source_session_id="s",
+        ))
+    assert units[0] != units[1]
+    assert {await _secret(db, u) for u in units} == {"password: Old!Fake1x", "password: New!Fake2y"}
 
 
 async def test_deleting_a_reference_keeps_a_point_another_unit_names(db):
