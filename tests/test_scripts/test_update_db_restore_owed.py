@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_scripts._update_source import update_text
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE = REPO_ROOT / "scripts" / "update.sh"
 
@@ -30,7 +32,7 @@ UPDATE = REPO_ROOT / "scripts" / "update.sh"
 def _block() -> str:
     m = re.search(
         r"# BEGIN db-restore-owed[^\n]*\n(.*?)# END db-restore-owed",
-        UPDATE.read_text(),
+        update_text(),
         re.DOTALL,
     )
     assert m, "db-restore-owed block not found in update.sh"
@@ -307,8 +309,8 @@ def test_the_comparison_runs_on_system_python_not_the_venv():
 
 
 def test_the_rollback_measures_immediately_before_deciding():
-    text = UPDATE.read_text()
-    body = text[text.index("_do_rollback() {") :]
+    text = update_text()
+    body = text[text.index("_rollback_body() {") :]
     measure = body.index('    _measure_db_restore_owed "$code_action" "$server_down"\n')
     decide = body.index("# BEGIN rollback-db-decision")
     assert measure < decide
@@ -316,7 +318,7 @@ def test_the_rollback_measures_immediately_before_deciding():
 
 
 def test_no_step_sets_the_flag_outside_the_measurement():
-    text = UPDATE.read_text()
+    text = update_text()
     block = _block()
     outside = text.replace(block, "")
     assignments = re.findall(r"^\s*DB_RESTORE_OWED=\S*", outside, re.M)
@@ -334,13 +336,13 @@ def _decide(db: Path, *, snapshot_taken: bool = True) -> str:
     them for a run whose code was rolled back with the server down."""
     m = re.search(
         r"# BEGIN rollback-db-decision[^\n]*\n(.*?)    # END rollback-db-decision",
-        UPDATE.read_text(),
+        update_text(),
         re.DOTALL,
     )
     assert m
     restore = re.search(
         r"# BEGIN db-restore-through-sqlite[^\n]*\n(.*?)# END db-restore-through-sqlite",
-        UPDATE.read_text(),
+        update_text(),
         re.DOTALL,
     )
     assert restore

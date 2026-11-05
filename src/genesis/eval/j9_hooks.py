@@ -8,7 +8,6 @@ code paths.
 from __future__ import annotations
 
 import logging
-import os
 
 import aiosqlite
 
@@ -32,7 +31,9 @@ def _resolve_session_id(explicit: str | None) -> str | None:
             return ctx_sid
     except ImportError:
         pass  # MCP servers may not have session_context available
-    return os.environ.get("GENESIS_SESSION_ID")
+    from genesis.caller_context import caller_context
+
+    return caller_context().session_id
 
 
 async def emit_recall_fired(

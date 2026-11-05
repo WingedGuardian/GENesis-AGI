@@ -21,13 +21,14 @@ from __future__ import annotations
 import errno
 import importlib.util
 import os
-import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 import pytest
+
+from tests.conftest import process_running_as
 
 _WORKTREE = Path(__file__).resolve().parent.parent.parent
 _SCRIPT = _WORKTREE / "scripts" / "pytest_lock_wait.py"
@@ -661,12 +662,7 @@ def test_the_deleted_concurrency_oracle_stays_gone():
 
 def test_scan_reports_pid_command_and_age(tmp_path):
     """The scan's one remaining job: naming holders."""
-    sleep_bin = shutil.which("sleep")
-    assert sleep_bin, "sleep binary required"
-    decoy = tmp_path / "pytest"
-    shutil.copy(sleep_bin, decoy)
-    proc = subprocess.Popen([str(decoy), "30"], stdout=subprocess.DEVNULL)
-    try:
+    with process_running_as(tmp_path / "pytest") as proc:
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             match = [e for e in scan_pytest_processes() if e[0] == proc.pid]
@@ -677,9 +673,6 @@ def test_scan_reports_pid_command_and_age(tmp_path):
                 return
             time.sleep(0.02)
         raise AssertionError("decoy pytest never appeared in the scan")
-    finally:
-        proc.kill()
-        proc.wait(timeout=5)
 
 
 class TestOneParserNotTwo:

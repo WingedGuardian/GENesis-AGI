@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_scripts._update_source import update_text
 from tests.test_scripts.test_bootstrap_guards import (
     _assert_recovery_refused,
     _recover,
@@ -55,7 +56,7 @@ _GIT_ENV = {
 
 
 def _text() -> str:
-    return UPDATE.read_text()
+    return update_text()
 
 
 def _block(marker: str) -> str:
@@ -162,10 +163,10 @@ def _live_world(dc, w, capsys, files: dict | None = None) -> str:
 
 
 def _do_rollback_fn() -> str:
-    """update.sh's _do_rollback, whole (its body holds a column-0 `}` in an
+    """The rollback body, whole (it holds a column-0 `}` in an
     embedded python program, so _function cannot cut it)."""
     text = _text()
-    start = text.index("_do_rollback() {\n")
+    start = text.index("_rollback_body() {\n")
     end = text.index("\n}\n", text.index("# END rollback-state-clear", start)) + len("\n}\n")
     return text[start:end]
 
@@ -216,6 +217,8 @@ def _engine_script(root: Path, script_dir: Path, base: str, mu: str, pre: str = 
         + _function("_clear_deploy_marker")
         + _block("live-helpers")
         + _SERVICE_STUBS
+        + _function("_note_rollback_source")
+        + _function("_do_rollback")
         + _do_rollback_fn()
         + _function("_on_err")
         + _function("_on_signal")
