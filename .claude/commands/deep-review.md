@@ -43,6 +43,11 @@ this command does not tell you to wait for a review it never triggers.
 Use the Agent tool. Do NOT self-review — a self-review is anchored to your own blind spots,
 which is exactly what lets Round-1 bugs through.
 
+**Name the branch or worktree in each reviewer's prompt.** `gh pr create` is refused until a
+finished reviewer is tied to the branch, and when this session runs from another directory the
+prompt is the only thing that ties it (build-session, "a PR opens only after an independent
+review"). Naming them anchors nothing: it says where the diff is, not what to think of it.
+
 - **`genesis-architect`** over the full diff — follow its protocol
   (`.claude/agents/genesis-architect.md`): scope-drift check first, then the **premise check**
   (Step 0.6 — is this the right change at all, and is it the best available shape?), then the

@@ -1170,6 +1170,9 @@ _KNOWN_SIGILS = (
     # acknowledgement or `## Rework` section. Needs the owner's yes; logged.
     "rework-override",
     "discard-override",
+    # pr_open_review_gate: open a PR with no independent review, on the owner's yes in
+    # conversation. Refused in a dispatched session; logged.
+    "pr-review-waived",
     # Both were passed to has_trailing_override from the day they shipped but never
     # listed here, so the "kept in sync" claim above was false. The consequence is
     # silent and asymmetric: the sigil queried FOR ITSELF still matches, so nothing
