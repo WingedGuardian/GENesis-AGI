@@ -560,7 +560,7 @@ jobs:
           python scripts/check_cc_pin_receipts.py --advisory --base-sha "$base"
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # CI is blocking — local full-suite runs are banned. See procedure
     # test_verification and CLAUDE.md "Targeted tests during development."
     #
@@ -581,7 +581,7 @@ jobs:
     # would pre-empt the per-test timeout and make it dead code. 180 leaves
     # ~139 min of growth headroom and still halves the default.
     # Revisit as the suite grows — the --durations output below is the data.
-    timeout-minutes: 180
+    timeout-minutes: 300
     # fetch-depth: 0 because measurement tests derive a rate from this
     # repository's own commit history and SKIP on a shallow clone rather than
     # lie. A skipped gate is an unevaluated gate: the commit-msg framing
@@ -594,7 +594,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: "3.14"
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
