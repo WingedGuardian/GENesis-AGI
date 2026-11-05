@@ -138,19 +138,36 @@ def _redact_checkout_paths(snapshot: dict) -> None:
     outside caller arrives from a trusted address. Rebuilt as new dicts:
     ``snapshot`` is a shallow copy, so its nested dicts are the cached
     snapshot other callers read.
+
+    The live-move repair's reports (``live_repairs``: report names and backup
+    folders under the home directory) are reduced the same way to an
+    allow-list of counts (_REPAIR_COUNTS): a key added later stays private.
     """
     from genesis.dashboard.auth import has_internal_bearer, has_verified_credential
 
     deploy = snapshot.get("deploy_health")
-    checkout = deploy.get("main_checkout") if isinstance(deploy, dict) else None
-    if not isinstance(checkout, dict) or not ({"paths", "reason"} & checkout.keys()):
+    if not isinstance(deploy, dict):
+        return
+    checkout, repairs = deploy.get("main_checkout"), deploy.get("live_repairs")
+    names = isinstance(checkout, dict) and bool({"paths", "reason"} & checkout.keys())
+    if not (names or repairs is not None):
         return
     if has_internal_bearer() or has_verified_credential():
         return
-    snapshot["deploy_health"] = {
-        **deploy,
-        "main_checkout": {k: v for k, v in checkout.items() if k not in ("paths", "reason")},
-    }
+    redacted = dict(deploy)
+    if names:
+        redacted["main_checkout"] = {
+            k: v for k, v in checkout.items() if k not in ("paths", "reason")
+        }
+    if repairs is not None:  # anything but the collector's dict shows as nothing (fails closed)
+        redacted["live_repairs"] = (
+            {k: repairs.get(k) for k in _REPAIR_COUNTS} if isinstance(repairs, dict) else None
+        )
+    snapshot["deploy_health"] = redacted
+
+
+#: The live_repairs keys an untrusted caller sees (deploy_health.collect_live_repairs).
+_REPAIR_COUNTS = ("saved", "refused", "unread_older", "unresolved")
 
 
 @blueprint.route("/api/genesis/health")

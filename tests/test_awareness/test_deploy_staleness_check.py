@@ -897,6 +897,156 @@ async def test_the_unbound_class_has_its_own_wording(db, monkeypatch):
     assert "no deploy manifest of this repository binds it" in row["content"]
 
 
+def _repair(ts: str, saved: int, *, dismissed=False, unresolved=False, result="healed"):
+    """One collect_live_repairs report entry."""
+    return {
+        "ts": ts,
+        "backup_dir": f"/home/u/.genesis/deploy-backups/{ts}-live-move-repair",
+        "saved": saved,
+        "result": result,
+        "dismissed": dismissed,
+        "unresolved": unresolved,
+    }
+
+
+def _repairs(*reports, refused=0, unread_older=0, unresolved=False):
+    saved = sum(r["saved"] for r in reports if not r["dismissed"])
+    return {
+        "reports": list(reports),
+        "saved": saved,
+        "refused": refused,
+        "unread_older": unread_older,
+        "unresolved": unresolved,
+    }
+
+
+async def test_td19_a_live_repair_report_raises_its_own_wording_then_resolves(db, monkeypatch):
+    """T-D19 (#3492 PR D1): the repair's report becomes the deploy observation:
+    per report its ts, its backup folder, the count saved there, the fixed
+    --restore and --dismiss commands, the 90-day prune; no update.sh advice,
+    high (never critical); a later tick without it resolves it."""
+    ts = "20261027T000000Z-7"
+    snap = _snap(["live_repair_saved:2", "live_repair_unresolved"])
+    snap["live_repairs"] = _repairs(_repair(ts, 2, unresolved=True), unresolved=True)
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    rows = await _rows(db)
+    assert len(rows) == 1 and rows[0]["priority"] == "high", rows
+    content = rows[0]["content"]
+    assert f"/home/u/.genesis/deploy-backups/{ts}-live-move-repair" in content, content
+    assert "2 path(s) the update did not write were recorded" in content, content
+    assert "were saved there" not in content, content  # a flag-only or deleted row has no file
+    assert f"scripts/deploy_candidates repair-move --restore {ts}" in content, content
+    assert (
+        "once both the installed repair kit and scripts/deploy_candidates include --restore"
+        in content
+    ), content
+    assert f"scripts/deploy_candidates repair-move --dismiss {ts}" in content, content
+    assert "puts the saved files back as uncommitted edits" in content, content
+    assert "deploy_code_only.sh and update.sh refuse to deploy" in content, content
+    assert "committed (on a branch, as a PR), moved out, or removed" in content, content
+    assert "90 days after the last write" in content, content
+    assert "did not finish" in content and "run scripts/update.sh" not in content, content
+    assert "says why" not in content, content  # a run killed partway wrote no reason
+    _patch_snapshot(monkeypatch, _snap([]))
+    await loop._check_deploy_staleness(db)
+    assert await _rows(db) == []
+    assert len(await _rows(db, resolved=1)) == 1
+
+
+async def test_only_undismissed_reports_with_saved_paths_are_named(db, monkeypatch):
+    shown, dismissed, empty = "20261028T000000Z-3", "20261027T000000Z-2", "20261026T000000Z-1"
+    snap = _snap(["live_repair_saved:1"])
+    snap["live_repairs"] = _repairs(
+        _repair(shown, 1), _repair(dismissed, 4, dismissed=True), _repair(empty, 0)
+    )
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert f"--restore {shown}" in content and "1 path(s)" in content, content
+    assert dismissed not in content and empty not in content, content
+
+
+async def test_a_new_report_refreshes_the_alert(db, monkeypatch):
+    """A5: same classes, a new report inside the cooldown: the standing
+    observation is replaced, never left naming only the old report; the same
+    state on the next tick is still deduplicated."""
+    old, new = "20261027T000000Z-1", "20261028T000000Z-2"
+    first = _snap(["live_repair_saved:1"])
+    first["live_repairs"] = _repairs(_repair(old, 1))
+    _patch_snapshot(monkeypatch, first)
+    await loop._check_deploy_staleness(db)
+    second = _snap(["live_repair_saved:2"])
+    second["live_repairs"] = _repairs(_repair(new, 1), _repair(old, 1))
+    _patch_snapshot(monkeypatch, second)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    assert new in row["content"] and old in row["content"], row["content"]
+    _patch_snapshot(monkeypatch, second)
+    await loop._check_deploy_staleness(db)
+    assert len(await _rows(db)) == 1 and len(await _rows(db, resolved=1)) == 1
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda r: r["reports"][0].update(dismissed=True),
+        lambda r: r["reports"][0].update(saved=5),
+        lambda r: r.update(refused=1),
+        lambda r: r.update(unread_older=3),
+    ],
+    ids=["dismissed", "saved", "refused", "unread_older"],
+)
+def test_the_alert_identity_follows_every_named_field(change):
+    import copy
+
+    base = _repairs(_repair("20261027T000000Z-1", 1), _repair("20261026T000000Z-1", 2))
+    changed = copy.deepcopy(base)
+    change(changed)
+    assert loop._deploy_repair_identity(base) != loop._deploy_repair_identity(changed)
+    assert loop._deploy_repair_identity(base) == loop._deploy_repair_identity(copy.deepcopy(base))
+
+
+async def test_refused_reports_have_their_own_wording(db, monkeypatch):
+    snap = _snap(["live_repair_refused:2"])
+    snap["live_repairs"] = _repairs(refused=2)
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert row["priority"] == "high" and "update.sh" not in content, content
+    assert "2 live-move repair report(s)" in content and "could not be read" in content
+    assert "named in the server log" in content and "--dismiss" not in content, content
+
+
+async def test_unread_older_reports_are_informational(db, monkeypatch):
+    """A3: reports past the newest eight are counted, never refused, and alone
+    they never raise more than a medium (informational) observation."""
+    snap = _snap(["live_repair_unread_older:3"])
+    snap["live_repairs"] = _repairs(unread_older=3)
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert row["priority"] == "medium", row["priority"]
+    assert "3 older live-move repair report(s)" in content and "informational" in content
+    assert "could not be read" not in content, content
+
+
+async def test_one_unencodable_field_never_drops_the_deploy_alert(db, monkeypatch):
+    """An unrelated finding (stale_update) and a repair field holding a lone
+    surrogate: the observation is still written, the field escaped."""
+    snap = _snap(["stale_update:9.0d,30behind", "live_repair_saved:1"], age_days=9.0, behind=30)
+    report = _repair("20261027T000000Z-1", 1)
+    report["backup_dir"] = "/home/\udcff/x"
+    snap["live_repairs"] = _repairs(report)
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    assert "stale_update" in row["content"] and "\\udcff" in row["content"], row["content"]
+
+
 async def test_commits_behind_alone_is_written_medium(db, monkeypatch):
     """Being N commits behind upstream is routine maintenance, not an alarm.
 
