@@ -1754,6 +1754,27 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         END
     """)
 
+    # #2426: a credential reference's held-out value dies with its unit, however
+    # the unit is deleted. knowledge_crud.delete removes it explicitly too, but
+    # a process still on pre-#2426 code, a raw SQL delete, or a cleanup script
+    # would otherwise leave the old secret behind with nothing pointing at it.
+    # A trigger, not a foreign key: MCP connections run with foreign_keys off.
+    await db.execute("""
+        CREATE TRIGGER IF NOT EXISTS reference_secrets_retire
+        AFTER DELETE ON knowledge_units
+        BEGIN
+            DELETE FROM reference_secrets WHERE unit_id = OLD.id;
+        END
+    """)
+    # #2426: and a credential body that carries its value is refused by the
+    # database itself, so a writer that runs no current code (a process started
+    # before this change, a script, raw SQL) cannot index it. The same DDL ships
+    # in migration 20261105043443_reference_secrets; tests pin the two in parity.
+    from genesis.db.crud.knowledge import credential_body_trigger_ddl
+
+    for ddl in credential_body_trigger_ddl():
+        await db.execute(ddl)
+
     # Fix: user_goal_staleness was seeded with ["Micro","Light"] but is a
     # strategic-level signal that generates noise at Micro depth (72 identical
     # anomaly observations in 7 days).  Scope to Light only.
