@@ -86,6 +86,15 @@ that commit for both hook trees and the closed launcher/import source inventory
 in `EXTRA_SOURCES`. Index hints cannot hide a physical byte change. Extra hook
 inputs are refused except Python bytecode-cache contents. This is a client and
 guard source check, not a fingerprint of the entire interpreter or installation.
+The utility inventory covers `process_lock.py`, `systemd.py` and `tasks.py`
+loaded by `genesis.util`, plus the launcher's direct `proc_kill.py` import.
+
+The launcher assumes a trusted Python startup environment: inherited `PYTHONPATH`
+and `PYTHONHOME` remain available to child processes. This is not protection
+against deliberate environment substitution. Refusals use one fixed operator
+message. A symlinked default home requires an explicit canonical `--home`;
+deployment detection can also refuse an unrelated process whose arguments
+mention an updater script. These are bounded startup limitations.
 
 Tracked main files must be clean; existing untracked runtime directories are
 permitted. Linked worktrees cannot launch the production validator. Active

@@ -52,6 +52,8 @@ EXTRA_SOURCES = (
     "src/genesis/eval/qualification/evidence.py",
     "src/genesis/util/__init__.py",
     "src/genesis/util/proc_kill.py",
+    "src/genesis/util/process_lock.py",
+    "src/genesis/util/systemd.py",
     "src/genesis/util/tasks.py",
 )
 DEPLOY_PATTERN = r"(^|/)(deploy_code_only|update|genesis-update-[[:alnum:]]{6})[.]sh([[:space:]]|$)"

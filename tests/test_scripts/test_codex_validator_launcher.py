@@ -50,6 +50,34 @@ def launcher(monkeypatch):
     return private_module("validator_launcher_test", ROOT / "scripts/codex_validator_launcher.py")
 
 
+def test_imported_repository_sources_are_qualified(launcher):
+    # A fresh process excludes pytest's unrelated imports from this inventory.
+    script = """
+import json, runpy, sys
+from pathlib import Path
+root = Path(sys.argv[1]).resolve()
+runpy.run_path(str(root / 'scripts/codex_validator_launcher.py'), run_name='owned_import_probe')
+paths = set()
+for module in tuple(sys.modules.values()):
+    filename = getattr(module, '__file__', None)
+    if filename and Path(filename).resolve().is_relative_to(root):
+        paths.add(Path(filename).resolve().relative_to(root).as_posix())
+print(json.dumps(sorted(paths)))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(ROOT)],
+        cwd=ROOT, env=fixture_git_environment(), capture_output=True, text=True,
+        check=True, timeout=30,
+    )
+    loaded = set(json.loads(result.stdout))
+    assert "src/genesis/util/tasks.py" in loaded  # The probe reached Genesis.
+    uncovered = {
+        path for path in loaded if path not in launcher.EXTRA_SOURCES
+        and not any(path.startswith(tree + "/") for tree in launcher.HOOK_TREES)
+    }
+    assert not uncovered, sorted(uncovered)
+
+
 def test_generated_profile_is_role_scoped_and_project_untrusted(launcher, tmp_path):
     value = tomllib.loads(launcher.policy(tmp_path, "owner-chosen-model"))
     assert value["model"] == "owner-chosen-model"
@@ -104,7 +132,11 @@ def qualified_tree(launcher, tmp_path):
     runtime = tmp_path / "runtime"
     runtime.mkdir()
     subprocess.run(["git", "init", "-q", str(runtime)], check=True, env=fixture_git_environment())
-    for rel in launcher.EXTRA_SOURCES:
+    # These imports existed at qualification even when the inventory omitted them.
+    sources = sorted(set(launcher.EXTRA_SOURCES) | {
+        "src/genesis/util/process_lock.py", "src/genesis/util/systemd.py",
+    })
+    for rel in sources:
         path = runtime / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"qualified\n")
@@ -121,7 +153,7 @@ def qualified_tree(launcher, tmp_path):
             "-C",
             str(runtime),
             "add",
-            *launcher.EXTRA_SOURCES,
+            *sources,
             "scripts/hooks/probe.py",
             ".claude/hooks/genesis-hook",
         ],
@@ -155,6 +187,29 @@ def test_qualified_source_allows_only_runtime_untracked_directories(launcher, qu
     (runtime / "tmp").mkdir()
     (runtime / "tmp/runtime").write_bytes(b"owned")
     launcher.check_sources(runtime, head)
+
+
+@pytest.mark.parametrize("relative", [
+    "src/genesis/util/process_lock.py",
+    "src/genesis/util/systemd.py",
+    "src/genesis/util/tasks.py",
+])
+def test_committed_import_drift_requires_requalification(launcher, qualified_tree, relative):
+    runtime, head, _ = qualified_tree
+    path = runtime / relative
+    path.write_bytes(b"changed imported source\n")
+    subprocess.run(
+        ["git", "-C", str(runtime), "add", relative],
+        check=True, env=fixture_git_environment(),
+    )
+    subprocess.run(
+        ["git", "-C", str(runtime), "-c", "user.name=Owned fixture",
+         "-c", "user.email=fixture@example.com", "commit", "-qm", "Owned import drift"],
+        check=True, env=fixture_git_environment(),
+    )
+    assert not launcher.git(runtime, "status", "--porcelain", "--untracked-files=no")
+    with pytest.raises(ValueError, match="Qualified physical source changed"):
+        launcher.check_sources(runtime, head)
 
 
 @pytest.mark.parametrize("flag", [None, "--assume-unchanged", "--skip-worktree"])
