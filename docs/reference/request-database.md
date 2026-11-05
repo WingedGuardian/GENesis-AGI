@@ -47,6 +47,9 @@ failure as a failed call. A normal result containing an `error` field remains
 a normal return. Reinitializing replaces this service's instrumentation in either
 database mode, removing an obsolete scoped boundary when returning to a legacy
 connection. Other services' middleware and unrelated middleware are retained.
+Legacy trackers with `persist_activity=False` leave borrowed transaction
+finalization to its owner. Request-owned units still finalize every call with
+that tracker setting.
 
 No CLI or transport currently selects this bootstrap. Shared activation must
 also supply caller identity, resolve the pending-bookmark policy explicitly,
