@@ -31,6 +31,15 @@ logger = logging.getLogger(__name__)
 #: scrubbed from them (#2426).
 _FREE_TEXT_PROVENANCE = frozenset({"source_doc", "platform", "section_title", "source_date"})
 
+
+def _free_texts(authority: str, provenance: dict | None) -> list[str]:
+    """The authority and the free-text provenance fields of a write."""
+    return [authority, *(
+        val for key, val in (provenance or {}).items()
+        if key in _FREE_TEXT_PROVENANCE and isinstance(val, str)
+    )]
+
+
 # Module-level singleton (load_default_patterns() does filesystem I/O).
 _SANITIZER = ContentSanitizer()
 
@@ -84,7 +93,8 @@ async def ingest_knowledge_unit(
     # redactions, and the value travels only to knowledge_crud.upsert, which
     # writes it to reference_secrets before the unit's own row. Refuses
     # (ValueError) a credential whose value cannot be located, before anything
-    # is written. Every other reference kind keeps its value in the body.
+    # is written. Every other reference kind keeps its value in the body, and
+    # loses any credential-pattern secret its free text carries.
     from genesis.memory import reference_ops
 
     # One spelling for the reference project, so every reader (lookup, delete,
@@ -114,6 +124,33 @@ async def ingest_knowledge_unit(
                     if key in _FREE_TEXT_PROVENANCE and isinstance(val, str) else val
                     for key, val in provenance.items()
                 }
+        # And any OTHER secret those fields name, by the capture rule.
+        frags = reference_ops.captured_fragments(_free_texts(authority, provenance))
+    elif project == reference_ops.REFERENCE_PROJECT:
+        # Every other reference kind keeps its value (what its lookups search
+        # for), but its description, tags, identifier and the free text stored
+        # beside them lose any credential-pattern secret they carry.
+        content, tags_json, concept, frags = reference_ops.scrub_reference(
+            content, tags_json, concept, also=tuple(_free_texts(authority, provenance)),
+        )
+        if frags.all:
+            # Redacted, not held: only a credential reference holds a secret.
+            # Static text only, so nothing about the secret reaches the log.
+            logger.warning(
+                "a non-credential reference carried a credential-shaped secret in "
+                "its free text; it was redacted and is not kept (store it as a "
+                "credential reference to keep it)"
+            )
+    else:
+        frags = None
+    if frags is not None and frags.all:
+        authority = reference_ops.scrub_with(authority, frags)
+        if provenance:
+            provenance = {
+                key: reference_ops.scrub_with(val, frags)
+                if key in _FREE_TEXT_PROVENANCE and isinstance(val, str) else val
+                for key, val in provenance.items()
+            }
 
     resolved_concept = concept if concept is not None else content[:200]
     # A credential write that upsert would refuse (no value to hold, or no

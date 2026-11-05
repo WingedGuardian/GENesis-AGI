@@ -121,6 +121,18 @@ def refuse_inline_secret(project_type: str, domain: str, body: str) -> None:
             "refusing a credential reference whose body carries its value: write "
             "it through ingest_knowledge_unit, which holds the value out (#2426)"
         )
+    # Defence in depth behind the chokepoint scrub, which redacts every secret
+    # the capture rule finds: a body that still carries one outside its value
+    # line was written past that scrub.
+    from genesis.memory.reference_extraction import captured_secrets
+
+    head, after = text.split(_VALUE_MARKER, 1)
+    if captured_secrets([head, *after.split("\n")[1:]]):
+        raise ValueError(
+            "refusing a credential reference whose body carries a secret outside "
+            "its value line: write it through ingest_knowledge_unit, which "
+            "redacts it (#2426)"
+        )
 
 
 #: The SQL twin of ``refuse_inline_secret``, for the writers that run none of

@@ -11,6 +11,8 @@ Supports two modes:
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
 import logging
 import shutil
@@ -190,6 +192,22 @@ async def _store_as_is(
             "refusing to store an upload as a credential reference: use "
             "reference_store, which holds the value out (#2426)"
         )
+    # Any other reference unit loses every credential-pattern secret its free
+    # text carries, as one written through ingest_knowledge_unit does.
+    from genesis.memory.reference_ops import REFERENCE_PROJECT, scrub_reference, scrub_with
+
+    if (project_type or "").strip().lower() == REFERENCE_PROJECT:
+        # A whole file: off the event loop, since the scrub is one pass per
+        # secret fragment over the text.
+        file_content, tags_scrubbed, concept, frags = await asyncio.to_thread(
+            functools.partial(
+                scrub_reference, file_content, json.dumps(tags), concept,
+                also=(context,), formatted=False,
+            ),
+        )
+        tags = json.loads(tags_scrubbed) if tags_scrubbed else tags
+        if context and frags.all:
+            context = scrub_with(context, frags)
 
     # Store to Qdrant
     # WS-3: curated ingest is external_untrusted (authority tier, not

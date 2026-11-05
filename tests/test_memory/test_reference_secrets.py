@@ -1270,3 +1270,414 @@ def test_the_userinfo_scheme_scan_is_bounded():
     of scheme characters. The scheme is bounded, so a long run never matches."""
     assert ro.URL_USERINFO_PATTERN.search("a" * 40 + "://u:pw9fake@h") is None
     assert ro.URL_USERINFO_PATTERN.search("postgres://u:pw9fake@h").group("pw") == "pw9fake"
+
+
+# ─── #3909 review: the scrub half (split PR 2) ───────────────────────────────
+
+
+def _ex(content: str, **kw):
+    from genesis.memory.extraction import Extraction
+
+    return Extraction(content=content, extraction_type="entity", confidence=0.9, **kw)
+
+
+_TWO = "Lab router login: username: admin7, password: First!Fake9; backup password: Second!Fake8"
+
+
+def test_every_password_in_one_extraction_is_classified():
+    """4476047425: the scrub takes every captured secret out of memory, so the
+    classifier keeps every one the user typed, each under its own key."""
+    from genesis.memory.reference_extraction import classify_as_reference, classify_references
+
+    refs = classify_references(_ex(_TWO, entities=["Lab router"]), user_text=_TWO)
+    assert [r["value"] for r in refs] == ["admin7 / First!Fake9", "password: Second!Fake8"]
+    assert [r["identifier"] for r in refs] == ["Lab router", "Lab router (2)"]
+    assert all(r["kind"] == "credentials" and "_secret" not in r for r in refs)
+    # The single-reference API still returns the first.
+    assert classify_as_reference(_ex(_TWO), user_text=_TWO)["value"] == "admin7 / First!Fake9"
+
+
+def test_a_further_secret_the_user_did_not_type_is_not_kept():
+    from genesis.memory.reference_extraction import classify_references
+
+    typed = "username: admin7, password: First!Fake9"
+    refs = classify_references(_ex(_TWO), user_text=typed)
+    assert [r["value"] for r in refs] == ["admin7 / First!Fake9"]
+
+
+def test_a_user_typed_secret_behind_a_declined_one_is_kept():
+    """The first pattern's secret was not the user's; a later one was."""
+    from genesis.memory.reference_extraction import classify_references
+
+    refs = classify_references(_ex(_TWO), user_text="the backup is Second!Fake8")
+    assert [r["value"] for r in refs] == ["password: Second!Fake8"]
+
+
+def test_an_entityless_second_credential_gets_its_own_key():
+    from genesis.memory.reference_extraction import classify_references
+
+    refs = classify_references(_ex(_TWO), user_text=_TWO)
+    assert len(refs) == 2 and refs[0]["identifier"] != refs[1]["identifier"]
+    for ref in refs:
+        assert "First!Fake9" not in ref["identifier"] and "Second!Fake8" not in ref["identifier"]
+
+
+async def test_both_passwords_are_held_before_the_scrub(db):
+    from genesis.memory.reference_extraction import (
+        ingest_references_from_extraction,
+        scrub_credential_extraction,
+    )
+
+    ex = _ex(_TWO, entities=["Lab router", "Second!Fake8"])
+    units = await ingest_references_from_extraction(
+        ex, store=_store(), db=db, source_session_id="s", user_text=_TWO,
+    )
+    assert len(units) == 2
+    assert {await _secret(db, u) for u in units} == {"admin7 / First!Fake9", "password: Second!Fake8"}
+    for unit in units:
+        row = await kc.get(db, unit)
+        for field in ("body", "concept", "tags"):
+            assert "Second!Fake8" not in (row[field] or "") and "First!Fake9" not in (row[field] or "")
+    assert scrub_credential_extraction(ex) is True
+    assert "First!Fake9" not in ex.content and "Second!Fake8" not in ex.content
+    assert "Second!Fake8" not in ex.entities
+
+
+def test_an_extraction_naming_a_credential_is_scrubbed_before_it_is_stored():
+    from genesis.memory.reference_extraction import scrub_credential_extraction
+
+    ex = _ex(
+        "Lab router login: username: example-admin, password: Hunter2!xyz-fake",
+        entities=["lab router", "Hunter2!xyz-fake"],
+        relationships=[{"from": "router", "to": "Hunter2!xyz-fake", "type": "has"}],
+    )
+    assert scrub_credential_extraction(ex) is True
+    for text in (ex.content, *ex.entities, *ex.relationships[0].values()):
+        assert "Hunter2!xyz-fake" not in text, text
+    assert "example-admin" in ex.content
+
+
+def test_an_extraction_without_a_credential_is_untouched():
+    from genesis.memory.reference_extraction import scrub_credential_extraction
+
+    ex = _ex("The lab router lives at 203.0.113.10 on the bench network")
+    assert scrub_credential_extraction(ex) is False
+    assert ex.content == "The lab router lives at 203.0.113.10 on the bench network"
+
+
+def test_every_password_in_one_extraction_is_scrubbed():
+    from genesis.memory.reference_extraction import scrub_credential_extraction
+
+    ex = _ex(_TWO, event_verb="set password: First!Fake9", temporal="Second!Fake8")
+    assert scrub_credential_extraction(ex) is True
+    for text in (ex.content, ex.event_verb, ex.temporal):
+        assert "First!Fake9" not in text and "Second!Fake8" not in text, text
+
+
+def test_a_bare_repeat_in_a_sibling_extraction_is_redacted():
+    """4476130336: the secret set is the whole chunk's."""
+    from genesis.memory.reference_extraction import chunk_secrets, scrub_credential_extraction
+
+    labelled = _ex("Lab router login: password: First!Fake9 for the bench")
+    sibling = _ex("Rotated the bench router to First!Fake9 yesterday", entities=["First!Fake9"])
+    secrets = chunk_secrets([labelled, sibling])
+    assert scrub_credential_extraction(sibling) is False  # its own texts name no label
+    assert scrub_credential_extraction(sibling, secrets) is True
+    assert "First!Fake9" not in sibling.content and sibling.entities == [ro.REDACTED]
+
+
+def test_the_session_topic_and_keywords_lose_the_chunk_secrets():
+    """4476130342: they reach cc_sessions, so they are scrubbed before they
+    accumulate; a keyword that carried a secret is dropped."""
+    from genesis.memory.reference_extraction import chunk_secrets, scrub_session_index
+
+    secrets = chunk_secrets([_ex(_TWO)], "set password: Third!Fake7 on the router")
+    topic, keywords = scrub_session_index(
+        "router password First!Fake9 rotated to third!fake7",
+        ["router", "first!fake9", "second!fake8"], secrets,
+    )
+    assert "First!Fake9" not in topic and "third!fake7" not in topic.lower()
+    assert keywords == ["router"]
+
+
+@pytest.mark.parametrize("domain", ["First!Fake9", "FIRST!FAKE9 accounts"])
+def test_a_preference_domain_that_held_a_secret_is_dropped(domain):
+    """4476130386: normalisation lowercases the domain, so the scrub matches it
+    case-insensitively, and drops it rather than store a redaction."""
+    from genesis.memory.reference_extraction import scrub_credential_extraction
+
+    ex = _ex(_TWO, preference_domain=domain.lower())
+    assert scrub_credential_extraction(ex) is True
+    assert ex.preference_domain is None
+
+
+def test_a_clean_preference_domain_is_kept():
+    from genesis.memory.reference_extraction import scrub_credential_extraction
+
+    ex = _ex(_TWO, preference_domain="work")
+    scrub_credential_extraction(ex)
+    assert ex.preference_domain == "work"
+
+
+def test_a_held_out_body_loses_another_secret_on_re_ingest():
+    """4476130407: the placeholder path runs the capture merge too."""
+    body = _body(value=ro.SECRET_PLACEHOLDER, description="Router admin. backup password: Second!Fake8")
+    held, value, tags, concept = ro.split_secret(
+        body, json.dumps(["router", "pin: 48151623"]), "Lab router, password: Second!Fake8",
+    )
+    assert value is None
+    assert ro.SECRET_PLACEHOLDER in held
+    for text in (held, tags, concept):
+        assert "Second!Fake8" not in text and "48151623" not in text, text
+
+
+def test_a_labelled_all_letter_secret_glued_to_text_is_redacted():
+    """4476130412: a secret captured after an explicit label is glued."""
+    held, _, _, concept = ro.split_secret(
+        _body(description="backup password: sunflowerfake; see xsunflowerfakex"),
+        None, "router xsunflowerfakex",
+    )
+    assert "sunflowerfake" not in held and "sunflowerfake" not in concept
+
+
+def test_a_second_password_in_a_description_is_redacted_too():
+    held, value, _, _ = ro.split_secret(
+        _body(description="Router admin. backup password: Second!Fake8"),
+    )
+    assert value == _VALUE
+    assert "Second!Fake8" not in held and _PASSWORD not in held
+
+
+def test_a_secret_in_the_last_json_tag_is_redacted():
+    body = fmt_mcp(kind="url", identifier="Forum", description="the forum",
+                   value="https://forum.example.org", tags=None, source=None)
+    _, tags, _, _ = ro.scrub_reference(body, json.dumps(["forum", "login password: sunflowerfake"]))
+    assert "sunflowerfake" not in tags
+    _, _, tags2, _ = ro.split_secret(_body(), json.dumps(["backup password: sunflowerfake"]))
+    assert "sunflowerfake" not in tags2
+
+
+async def test_an_identifier_kind_loses_a_password_its_description_names(db):
+    body = fmt_mcp(kind="url", identifier="Forum login page",
+                   description="Login page; the password: Gen!Fake42 is the bot's",
+                   value="https://forum.example.org/login", tags=["forum"], source=None)
+    unit = await ingest_knowledge_unit(
+        store=_store(), db=db, content=body, project=ro.REFERENCE_PROJECT,
+        domain="reference.url", concept="Forum login page",
+        authority="via password: Gen!Fake42", collection="episodic_memory",
+        memory_type="episodic",
+    )
+    row = await kc.get(db, unit)
+    assert "Gen!Fake42" not in row["body"]
+    assert "https://forum.example.org/login" in row["body"]  # the value stays
+    assert "Gen!Fake42" not in (row["tags"] or "")
+
+
+async def test_a_distilled_reference_unit_is_scrubbed_before_any_vector(
+    memory_mcp_store, tmp_path, monkeypatch,
+):
+    """f14e7f69: distillation writes reference units through scrub_reference."""
+    import genesis.db.connection as connection
+    from genesis.knowledge.distillation import KnowledgeUnit
+    from genesis.knowledge.manifest import ManifestManager
+    from genesis.knowledge.orchestrator import KnowledgeOrchestrator
+
+    memory_mcp_store.store_reporting_creation = AsyncMock(return_value=("qid-1", True))
+
+    def _no_db(_path):
+        raise RuntimeError("the database write is not under test")
+
+    monkeypatch.setattr(connection, "get_raw_db", _no_db)
+
+    orch = KnowledgeOrchestrator(
+        registry=MagicMock(), distillation=MagicMock(),
+        manifest=ManifestManager(root=tmp_path / "knowledge"),
+    )
+    unit = KnowledgeUnit(
+        concept="Forum, password: Gen!Fake42", body="The forum bot; its password: Gen!Fake42",
+        domain="reference.url", tags=["pwd: Gen!Fake42"], caveats=["password is Gen!Fake42"],
+    )
+    with pytest.raises(RuntimeError, match="not under test"):
+        await orch._store_units(
+            [unit], project_type="reference", source="notes.md", content=MagicMock(), purpose=None,
+        )
+    stored = memory_mcp_store.store_reporting_creation.await_args
+    assert stored is not None
+    assert "Gen!Fake42" not in json.dumps([stored.args, stored.kwargs], default=str)
+
+
+async def test_an_uploaded_reference_is_scrubbed_before_any_vector(memory_mcp_store, tmp_path):
+    from genesis.knowledge.ingest_upload import _store_as_is
+
+    upload = tmp_path / "forum.txt"
+    upload.write_text("Forum notes. The bot password: Gen!Fake42 is rotated monthly.")
+    with pytest.raises(TypeError):  # the MagicMock db: the row write is not under test
+        await _store_as_is(
+            str(upload), "forum.txt", project_type="reference", domain="reference.url",
+            purpose=None, context="the password: Gen!Fake42 one",
+        )
+    stored = memory_mcp_store.store.await_args
+    assert "Gen!Fake42" not in json.dumps([stored.args, stored.kwargs], default=str)
+
+
+async def test_the_db_layer_refuses_a_secret_outside_the_value_line(db):
+    """c8cd29b2: defence in depth behind the chokepoint scrub."""
+    raw = _body(value=ro.SECRET_PLACEHOLDER, description="Router admin. backup password: Second!Fake8")
+    with pytest.raises(ValueError, match="outside its value line"):
+        kc.refuse_inline_secret("reference", "reference.credentials", raw)
+    # The chokepoint's own output passes, a secret-shaped login included.
+    held, _, _, _ = ro.split_secret(raw)
+    kc.refuse_inline_secret("reference", "reference.credentials", held)
+    login = _body(value="Adm1n!x9 / Pw9fakeword", description="Login Adm1n!x9. Router admin")
+    held, _, _, _ = ro.split_secret(login)
+    assert "Adm1n!x9" in held
+    kc.refuse_inline_secret("reference", "reference.credentials", held)
+
+
+async def test_every_auto_captured_body_passes_the_db_check(db):
+    """The fixed descriptions the classifier writes never trip the check."""
+    from genesis.memory.reference_extraction import ingest_references_from_extraction
+
+    for content in (
+        _TWO,
+        "Put API_KEY=abcd1234efgh5678 in the env file for the bench",
+        "DATABASE_URL=postgres://app:Pw9fakesecret@db.example.org/app is the store",
+        "Old forum account: the password is sunshinefake for the bot",
+    ):
+        units = await ingest_references_from_extraction(
+            _ex(content, entities=["Bench"]), store=_store(), db=db, user_text=content,
+        )
+        assert units, content
+
+
+async def test_two_extractions_naming_one_entity_keep_both_secrets(db):
+    """Review finding: a shared entity key must never let a second secret
+    replace the first, in this chunk or a later cycle."""
+    from genesis.memory.reference_extraction import extract_references_from_chunk
+
+    first = "Lab router login: password: First!Fake9 for the bench"
+    second = "Lab router backup password: Second!Fake8 for the bench"
+    count = await extract_references_from_chunk(
+        [_ex(first, entities=["Lab router"]), _ex(second, entities=["Lab router"])],
+        store=_store(), db=db, user_text=first + second,
+    )
+    assert count == 2
+    rows = await db.execute_fetchall(
+        "SELECT k.concept, s.value FROM knowledge_units k JOIN reference_secrets s "
+        "ON s.unit_id = k.id ORDER BY k.concept",
+    )
+    assert [tuple(r) for r in rows] == [
+        ("Lab router", "password: First!Fake9"), ("Lab router (2)", "password: Second!Fake8"),
+    ]
+    # The same secret captured again reuses its own entry.
+    await extract_references_from_chunk(
+        [_ex(second, entities=["Lab router"])], store=_store(), db=db, user_text=second,
+    )
+    assert len(await db.execute_fetchall("SELECT 1 FROM reference_secrets")) == 2
+
+
+async def test_a_reference_that_fails_to_store_is_reported(db):
+    """Review finding: the scrub runs regardless, so a failed hold is named."""
+    from genesis.memory.reference_extraction import extract_references_from_chunk
+
+    store = _store()
+    store.store = AsyncMock(side_effect=RuntimeError("store down"))
+    failed: list[str] = []
+    text = "Lab router login: password: First!Fake9 for the bench"
+    count = await extract_references_from_chunk(
+        [_ex(text, entities=["Lab router"])], store=store, db=db, user_text=text, failed=failed,
+    )
+    assert count == 0 and failed == ["credentials"]
+
+
+def test_a_typed_secret_in_short_text_is_still_kept():
+    """Review finding: the content-length floor stops invented url/network
+    entries; it never drops a credential the user typed, which the scrub
+    then removes. Example text stays uncaptured: it is not the user's."""
+    from genesis.memory.reference_extraction import classify_references
+
+    short = "password: Hunter2xyz9"  # under the classifier's 30-character floor
+    refs = classify_references(_ex(short), user_text=f"my {short}")
+    assert [r["value"] for r in refs] == ["password: Hunter2xyz9"]
+    example = "For example, the router password is Hunter2xyz9 for the lab network."
+    assert classify_references(_ex(example), user_text=example) == []
+
+
+def test_a_password_that_starts_another_is_its_own():
+    from genesis.memory.reference_extraction import classify_references
+
+    text = "The password is hunter2backup and the old one password: hunter2 was retired"
+    refs = classify_references(_ex(text), user_text=text)
+    assert sorted(r["value"] for r in refs) == ["password: hunter2", "password: hunter2backup"]
+
+
+def test_an_unformatted_body_is_scrubbed_past_a_value_like_paragraph():
+    body = "Notes.\n\nValue: see below\nthe bot password: Gen!Fake42 lives here"
+    held, _, _, _ = ro.scrub_reference(body, None, "Notes", formatted=False)
+    assert "Gen!Fake42" not in held
+
+
+def test_an_all_letter_secret_is_not_cut_out_of_longer_words_in_extractions():
+    from genesis.memory.reference_extraction import scrub_credential_extraction
+
+    ex = _ex("password: sunflower; we planted sunflowers by the sunflower bed")
+    assert scrub_credential_extraction(ex) is True
+    assert "sunflowers" in ex.content
+    assert f"by the {ro.REDACTED} bed" in ex.content
+
+
+def test_an_empty_quoted_password_never_stops_the_scrub():
+    from genesis.memory.reference_extraction import (
+        classify_as_reference,
+        scrub_credential_extraction,
+    )
+
+    text = 'u: bob password: "" and later API_TOKEN=Fake9wordZ1xyz in the env file here'
+    classify_as_reference(_ex(text))
+    ex = _ex(text)
+    assert scrub_credential_extraction(ex) is True
+    assert "Fake9wordZ1xyz" not in ex.content
+
+
+def test_a_prose_capture_in_the_scrub_costs_only_that_whole_word():
+    from genesis.memory.reference_extraction import scrub_credential_extraction
+
+    ex = _ex("the password is stored in the vault, restored nightly")
+    scrub_credential_extraction(ex)
+    assert "restored nightly" in ex.content
+    assert "vault" in ex.content
+
+
+@pytest.mark.parametrize("text, secret", [
+    ("Set NODE_ENV=production before deploy", None),
+    ("MODEL_NAME=qwen3-embedding:0.6b-fp16 is the embedder", None),
+    ("AUTHOR=someone CAPITAL_CITY=Lisbonfake API_BASE=v2alpha-fake", None),
+    ("Put API_KEY=abcd1234efgh5678 in the env file", "abcd1234efgh5678"),
+    ("the password is Hunt3r!fake for now", "Hunt3r!fake"),
+    ("the password is sunshinefake for now", "sunshinefake"),
+    ("my pin is 48151623 at the desk", "48151623"),
+    ("the api key is abcdefghijklmnopqrstuv here", "abcdefghijklmnopqrstuv"),
+    ("DATABASE_URL=postgres://app:Pw9fakesecret@db.example.org/app", "Pw9fakesecret"),
+    ("cache at redis://:s3cretfake@cache:6379/0 for jobs", "s3cretfake"),
+])
+def test_only_credential_shaped_captures_are_scrubbed(text, secret):
+    from genesis.memory.reference_extraction import scrub_credential_extraction
+
+    ex = _ex(text)
+    assert scrub_credential_extraction(ex) is (secret is not None)
+    if secret is None:
+        assert ex.content == text
+    else:
+        assert secret not in ex.content
+
+
+@pytest.mark.parametrize("content, value", [
+    ("The lab door keypad: the pin is 48151623 for the bench room", "password: 48151623"),
+    ("Old forum account: the password is sunshinefake for the bot", "password: sunshinefake"),
+])
+def test_what_the_scrub_removes_the_classifier_keeps(content, value):
+    from genesis.memory.reference_extraction import classify_as_reference
+
+    ref = classify_as_reference(_ex(content), user_text=content)
+    assert ref is not None and ref["kind"] == "credentials"
+    assert ref["value"] == value

@@ -244,13 +244,18 @@ def _looks_ephemeral(content: str) -> bool:
     return bool(_EPHEMERAL_PATTERN.search(content))
 
 
-def _derive_identifier(extraction: Extraction, *, default_prefix: str) -> str:
+def _derive_identifier(
+    extraction: Extraction, *, default_prefix: str, unique: bool = False,
+) -> str:
     """Build a human-readable identifier for the entry.
 
     Preference order:
     1. First named entity from the extraction
     2. First 80 chars of content trimmed to a sentence
     3. Default prefix with a short hash of the content
+
+    ``unique`` gives a content-derived identifier its random tag even when the
+    content carries no secret (a further credential found in another field).
     """
     if extraction.entities:
         first = extraction.entities[0].strip()
@@ -271,7 +276,7 @@ def _derive_identifier(extraction: Extraction, *, default_prefix: str) -> str:
             content = content[:idx]
             break
     identifier = content[:80].strip() or default_prefix
-    if secrets:
+    if secrets or unique:
         # With its secret redacted, this text no longer tells two credentials
         # apart ("username: admin, password: [redacted]"), and a shared key
         # would let the second capture replace the first. Each capture is kept
@@ -422,12 +427,102 @@ def classify_as_reference(
     Returns a dict shaped like the ``reference_store`` input
     (``kind``, ``identifier``, ``value``, ``description``, ``tags``) if
     the extraction looks like persistent reference data, otherwise None.
+    It is the first of ``classify_references``; an extraction naming several
+    credentials has the rest there.
 
     When ``user_text`` is provided (the chunk's user-authored content), a match
     is only returned if its raw value appears in the user's own words — so the
     auto-capture path doesn't fabricate references from Genesis's analysis
     prose. ``user_text=None`` disables the gate (direct callers / unit tests).
     """
+    refs = classify_references(extraction, user_text=user_text)
+    return refs[0] if refs else None
+
+
+def classify_references(
+    extraction: Extraction, user_text: str | None = None,
+) -> list[dict]:
+    """Every reference entry an Extraction carries, first the one
+    ``classify_as_reference`` returns, then one credential per further secret
+    a credential pattern captures in any of its text fields that the user typed.
+
+    The episodic copy of the extraction is scrubbed of every captured secret
+    afterwards (``scrub_credential_extraction``), so a credential the user
+    shared that this did not return would be lost. A captured secret the user
+    did not type is not kept: it was never the user's. Each entry has its own
+    identifier: an entity-named one gains `` (2)``, `` (3)`` and so on.
+    """
+    first = _classify_first(extraction, user_text)
+    content = extraction.content or ""
+    # The content-length floor keeps the classifier from inventing a url or
+    # network entry from a fragment; it never drops a credential the user typed,
+    # which the scrub would otherwise remove from memory with no copy kept.
+    # Example text is still never captured (it is not the user's secret), nor
+    # is a card number, nor a password shorter than the branches' floor.
+    if first is None and (_looks_ephemeral(content) or contains_card_number(content)):
+        return []
+    refs = [first] if first else []
+    held = {first.pop("_secret")} if first and "_secret" in first else set()
+    used = {r["identifier"] for r in refs}
+    tags = [e for e in extraction.entities if e and e.strip()]
+    for text in _extraction_texts(extraction):
+        for secret, pattern, match, _labelled in _captures(text):
+            if (
+                any(_holds(h, secret) for h in held)
+                or not _user_shared(secret, user_text)
+                or contains_card_number(secret)
+                or (len(secret) < _MIN_PASSWORD and pattern is not _URL_USERINFO_PATTERN)
+            ):
+                continue
+            identifier = _derive_identifier(extraction, default_prefix="credential", unique=True)
+            if identifier in used:
+                identifier = f"{identifier} ({len(refs) + 1})"
+            value, login = _capture_value(pattern, match, secret)
+            refs.append({
+                "kind": "credentials",
+                "identifier": identifier,
+                "value": value,
+                "description": _credential_description(login),
+                "tags": tags,
+            })
+            held.add(secret)
+            used.add(identifier)
+    return refs
+
+
+#: The shortest password a credential branch keeps (``len(password) >= 4``).
+_MIN_PASSWORD = 4
+
+
+def _holds(held: str, secret: str) -> bool:
+    """True when ``held`` already carries ``secret`` as a whole token (the
+    password inside a held connection string), never as part of a longer one:
+    a password that is the start of another is a password of its own."""
+    return held == secret or re.search(
+        r"(?<![A-Za-z0-9])" + re.escape(secret) + r"(?![A-Za-z0-9])", held,
+    ) is not None
+
+
+def _capture_value(
+    pattern: re.Pattern[str], match: re.Match[str], secret: str,
+) -> tuple[str, str | None]:
+    """(the reference value for one captured secret, its login or None), in the
+    shape the matching classifier branch stores."""
+    if pattern is _ENV_ASSIGNMENT_PATTERN:
+        return f"{match.group('key')}={secret}", None
+    if pattern is _URL_USERINFO_PATTERN:
+        value = _connection_string(match.string, match.start(), match.end())
+        return value, match.group("user") or None
+    if pattern in (_KNOWN_KEY_PREFIX_PATTERN, _CREDENTIAL_TOKEN_PATTERN):
+        return f"token: {secret}", None
+    groups = match.groupdict()
+    login = next((groups[g] for g in ("user", "email", "account") if groups.get(g)), None)
+    return (f"{login} / {secret}" if login else f"password: {secret}"), login
+
+
+def _classify_first(extraction: Extraction, user_text: str | None) -> dict | None:
+    """The first reference entry, with its secret under ``_secret`` for a
+    credential (``classify_references`` pops it)."""
     content = extraction.content or ""
     if len(content) < _MIN_CONTENT_LENGTH:
         return None
@@ -462,7 +557,7 @@ def classify_as_reference(
                 ),
                 "value": f"{user} / {password}",
                 "description": _credential_description(user),
-                "tags": tags,
+                "tags": tags, "_secret": password,
             }
 
     # 1b. Email + password pattern (catches "email X and password Y")
@@ -482,7 +577,7 @@ def classify_as_reference(
                 ),
                 "value": f"{email} / {password}",
                 "description": _credential_description(email),
-                "tags": tags,
+                "tags": tags, "_secret": password,
             }
 
     # 1c. Account lifecycle (catches "created account X with password Y")
@@ -502,7 +597,7 @@ def classify_as_reference(
                 ),
                 "value": f"{account} / {password}",
                 "description": _credential_description(account),
-                "tags": tags,
+                "tags": tags, "_secret": password,
             }
 
     # 1d. Single password mention (no user required)
@@ -521,7 +616,7 @@ def classify_as_reference(
                 ),
                 "value": f"password: {password}",
                 "description": _credential_description(),
-                "tags": tags,
+                "tags": tags, "_secret": password,
             }
 
     # 2. Known key prefixes — format-only, near-zero false positive rate
@@ -537,7 +632,7 @@ def classify_as_reference(
                 ),
                 "value": f"token: {tok_value}",
                 "description": _credential_description(),
-                "tags": tags,
+                "tags": tags, "_secret": tok_value,
             }
 
     # 3. Standalone token / API key (labeled)
@@ -553,7 +648,7 @@ def classify_as_reference(
                 ),
                 "value": f"token: {tok_value}",
                 "description": _credential_description(),
-                "tags": tags,
+                "tags": tags, "_secret": tok_value,
             }
 
     # 3b. .env format — UPPER_SNAKE=value
@@ -575,7 +670,7 @@ def classify_as_reference(
                 ),
                 "value": f"{key}={val}",
                 "description": _credential_description(),
-                "tags": tags,
+                "tags": tags, "_secret": _capture(_ENV_ASSIGNMENT_PATTERN, env, "val"),
             }
 
     # 3d. A connection string (a URL whose userinfo carries a password): kept as
@@ -590,7 +685,7 @@ def classify_as_reference(
                 "identifier": _derive_identifier(extraction, default_prefix="connection"),
                 "value": _connection_string(content, userinfo.start(), userinfo.end()),
                 "description": _credential_description(userinfo.group("user") or None),
-                "tags": tags,
+                "tags": tags, "_secret": pw,
             }
 
     # Also when only ``captured_secrets``' wider rule sees a secret ("the
@@ -723,21 +818,106 @@ async def ingest_reference_from_extraction(
     values the USER actually shared; auto-captured entries are marked with the
     ``auto_captured`` tag and a lower confidence (0.60 vs reference_store 0.85).
 
-    Returns the unit_id on success, or None if the extraction was not
-    classified as persistent reference data. Never raises — a classifier
-    or ingestion failure logs a warning and returns None.
+    Every entry ``classify_references`` returns is ingested; the return value
+    is the first one's unit_id (``ingest_references_from_extraction`` returns
+    them all), or None if none was stored. Never raises — a classifier or
+    ingestion failure logs a warning and returns None.
+    """
+    unit_ids = await ingest_references_from_extraction(
+        extraction, store=store, db=db, source_session_id=source_session_id,
+        force_fts5_only=force_fts5_only, user_text=user_text,
+    )
+    return unit_ids[0] if unit_ids else None
+
+
+async def ingest_references_from_extraction(
+    extraction: Extraction,
+    *,
+    store: MemoryStore,
+    db: aiosqlite.Connection,
+    source_session_id: str | None = None,
+    force_fts5_only: bool = False,
+    user_text: str | None = None,
+    failed: list[str] | None = None,
+) -> list[str]:
+    """Ingest every reference entry an Extraction carries; the unit_ids stored.
+
+    Each entry's identifier and tags come from the extraction, and can repeat
+    ANOTHER entry's secret bare, which that entry's own value hold-out never
+    sees: they lose every secret the extraction carries. An identifier that
+    lost one gains a random tag, so two never share a key. Never raises: an
+    entry that could not be stored is logged, and named in ``failed`` when
+    the caller passes a list, since the caller's scrub will still run.
     """
     try:
-        ref = classify_as_reference(extraction, user_text=user_text)
+        refs = classify_references(extraction, user_text=user_text)
+        secrets = chunk_secrets([extraction]) if refs else set()
     except Exception:
         logger.warning(
             "reference extractor classification failed", exc_info=True,
         )
-        return None
+        if failed is not None:
+            failed.append("classification")
+        return []
+    clean = _scrubber(secrets) if secrets else None
+    unit_ids: list[str] = []
+    for ref in refs:
+        if clean is not None:
+            identifier = clean(ref["identifier"])
+            if identifier != ref["identifier"]:
+                identifier = f"{identifier} #{secrets_token_hex(3)}"
+            ref = {**ref, "identifier": identifier, "tags": [clean(t) for t in ref["tags"]]}
+        if ref["kind"] == "credentials":
+            try:
+                ref = {**ref, "identifier": await _free_key(db, ref["identifier"], ref["value"])}
+            except Exception:
+                logger.warning("reference extractor key lookup failed", exc_info=True)
+                if failed is not None:
+                    failed.append(ref["kind"])
+                continue
+        unit_id = await _ingest_reference(
+            ref, store=store, db=db, source_session_id=source_session_id,
+            force_fts5_only=force_fts5_only, failed=failed,
+        )
+        if unit_id:
+            unit_ids.append(unit_id)
+    return unit_ids
 
-    if ref is None:
-        return None
 
+#: How many `` (n)`` suffixes a key is tried with before a random tag is used.
+_MAX_KEY_SUFFIX = 50
+
+
+async def _free_key(db: aiosqlite.Connection, identifier: str, value: str) -> str:
+    """``identifier``, or the first `` (n)`` variant of it, whose credential
+    entry is absent or already holds ``value``. An entity-named key is shared
+    by every extraction naming that entity, in this chunk and in later cycles;
+    writing a different secret under it would replace the one stored there,
+    and the scrub would then leave that one nowhere (owner ruling: a rotated
+    password adds an entry rather than risking a lost one)."""
+    from genesis.db.crud import knowledge as knowledge_crud
+
+    base = re.sub(r" \(\d+\)$", "", identifier)
+    candidates = [identifier] + [f"{base} ({n})" for n in range(2, _MAX_KEY_SUFFIX + 1)]
+    for candidate in dict.fromkeys(candidates):
+        row = await knowledge_crud.find_by_unique_key(
+            db, project_type="reference", domain=knowledge_crud.CREDENTIAL_DOMAIN,
+            concept=candidate,
+        )
+        if row is None or await knowledge_crud.get_reference_secret(db, row["id"]) == value:
+            return candidate
+    return f"{base} #{secrets_token_hex(3)}"
+
+
+async def _ingest_reference(
+    ref: dict,
+    *,
+    store: MemoryStore,
+    db: aiosqlite.Connection,
+    source_session_id: str | None,
+    force_fts5_only: bool,
+    failed: list[str] | None = None,
+) -> str | None:
     kind = ref["kind"]
     identifier = ref["identifier"]
     value = ref["value"]
@@ -790,6 +970,8 @@ async def ingest_reference_from_extraction(
             "reference extractor ingest failed for kind=%s identifier=<redacted>",
             kind, exc_info=True,
         )
+        if failed is not None:
+            failed.append(kind)
         return None
 
     logger.info(
@@ -807,25 +989,26 @@ async def extract_references_from_chunk(
     source_session_id: str | None = None,
     force_fts5_only: bool = False,
     user_text: str | None = None,
+    failed: list[str] | None = None,
 ) -> int:
     """Run the classifier over a chunk of extractions, ingesting references.
 
     Returns the count of entries promoted to the reference store. Used by
     ``run_extraction_cycle`` as a post-processing step after each LLM
-    extraction call.
+    extraction call. ``failed`` collects the entries that could not be stored.
     """
     count = 0
     for extraction in extractions:
-        unit_id = await ingest_reference_from_extraction(
+        unit_ids = await ingest_references_from_extraction(
             extraction,
             store=store,
             db=db,
             source_session_id=source_session_id,
             force_fts5_only=force_fts5_only,
             user_text=user_text,
+            failed=failed,
         )
-        if unit_id:
-            count += 1
+        count += len(unit_ids)
     return count
 
 
@@ -845,28 +1028,140 @@ _SECRET_GROUPS = (
 )
 
 
-def captured_secrets(texts: list[str]) -> set[str]:
+def _captures(text: str) -> list[tuple[str, re.Pattern[str], re.Match[str], bool]]:
+    """(secret, pattern, match, labelled) for every capture in ``text``, in the
+    order the secrets appear. ``labelled`` is True when an explicit colon or
+    equals sign stands before the secret: such a secret is secret by its label,
+    whatever it spells."""
+    found: list[tuple[int, str, re.Pattern[str], re.Match[str], bool]] = []
+    for pattern, group in _SECRET_GROUPS:
+        for match in pattern.finditer(text):
+            try:
+                value = _capture(pattern, match, group)
+            except Exception:
+                # Redact the whole raw capture rather than skip it.
+                value = (match.group(group) or "").strip()
+            # A label followed by an earlier redaction marker is not a new
+            # secret.
+            if value and REDACTED not in value and value != REDACTED.strip("[]"):
+                lead = text[match.start():match.start(group)].rstrip()
+                found.append((match.start(group), value, pattern, match, lead.endswith((":", "="))))
+    found.sort(key=lambda item: item[0])
+    return [item[1:] for item in found]
+
+
+def captured_secrets(texts: list[str], labelled: set[str] | None = None) -> set[str]:
     """Every secret a credential pattern captures in ``texts`` (``_capture``'s
-    rule), across every match of every pattern."""
+    rule), across every match of every pattern. When ``labelled`` is given, the
+    secrets that stood after an explicit label separator are added to it."""
     secrets: set[str] = set()
     for text in texts:
         if not isinstance(text, str) or not text:
             continue
-        for pattern, group in _SECRET_GROUPS:
-            for match in pattern.finditer(text):
-                try:
-                    value = _capture(pattern, match, group)
-                except Exception:
-                    # Redact the whole raw capture rather than skip it.
-                    value = (match.group(group) or "").strip()
-                if value:
-                    secrets.add(value)
+        for value, _pattern, _match, is_labelled in _captures(text):
+            secrets.add(value)
+            if is_labelled and labelled is not None:
+                labelled.add(value)
     return secrets
+
+
+# ─── The episodic copy: scrubbed after the references are held ───────────────
+
+#: The free-text fields of an Extraction that are stored, logged or indexed.
+_TEXT_FIELDS = ("content", "event_subject", "event_verb", "event_object", "scenario", "temporal")
+#: Fields holding a short structured value (a lowercased domain, a date): one
+#: that held a secret is dropped rather than stored with a redaction in it.
+_DROP_FIELDS = ("preference_domain", "expires_at")
+
+
+def _extraction_texts(extraction: Extraction) -> list[str]:
+    texts = [getattr(extraction, name, None) for name in (*_TEXT_FIELDS, *_DROP_FIELDS)]
+    texts += list(extraction.entities)
+    for rel in extraction.relationships:
+        if isinstance(rel, dict):
+            texts += list(rel.values())
+    return [t for t in texts if isinstance(t, str) and t]
+
+
+def chunk_secrets(extractions: list[Extraction], *texts: str | None) -> set[str]:
+    """Every secret a credential pattern captures in a chunk: in every text
+    field of every extraction, and in ``texts`` (the session topic and
+    keywords). A secret one extraction labels can recur bare in a sibling, so
+    each extraction is scrubbed with the whole chunk's set. Never raises: a
+    matching failure returns an empty set and is logged."""
+    try:
+        found = [t for e in extractions for t in _extraction_texts(e)]
+        return captured_secrets(found + [t for t in texts if isinstance(t, str) and t])
+    except Exception:
+        logger.warning("credential scrub: matching failed", exc_info=True)
+        return set()
+
+
+def _scrubber(secrets: set[str]):
+    """The scrub for episodic text: every fragment of every secret, an
+    all-letter one only where it stands as a word (this runs on every
+    extraction, and inside a longer word such a fragment is that word)."""
+    from genesis.memory.reference_ops import scrub, secret_set_fragments
+
+    frags = secret_set_fragments(secrets)
+
+    def _clean(value: object) -> object:
+        return scrub(value, frags.all, frozenset(), frags.bounded) if isinstance(value, str) else value
+
+    return _clean
+
+
+def scrub_credential_extraction(extraction: Extraction, secrets: set[str] | None = None) -> bool:
+    """Redact every credential secret from an extraction, in place.
+
+    The extraction job stores each extraction as an episodic memory, logs it,
+    dedups and links it, and embeds it in the connection pass, AFTER the
+    reference capture has held its credentials (#2426); without this the same
+    text would put the value straight back into memory_fts, the vector store,
+    entity mentions, memory_events and the journal. ``secrets`` is the chunk's
+    set (``chunk_secrets``); None scrubs with the extraction's own. A redacted
+    preference domain or expiry is dropped. Returns True when anything changed.
+    """
+    if secrets is None:
+        secrets = chunk_secrets([extraction])
+    if not secrets:
+        return False
+    clean = _scrubber(secrets)
+    before = _extraction_texts(extraction)
+    for name in _TEXT_FIELDS:
+        setattr(extraction, name, clean(getattr(extraction, name)))
+    for name in _DROP_FIELDS:
+        value = getattr(extraction, name, None)
+        if isinstance(value, str) and clean(value) != value:
+            setattr(extraction, name, None)
+    extraction.entities = [clean(e) for e in extraction.entities]
+    extraction.relationships = [
+        {k: clean(v) for k, v in rel.items()} if isinstance(rel, dict) else rel
+        for rel in extraction.relationships
+    ]
+    return _extraction_texts(extraction) != before
+
+
+def scrub_session_index(
+    topic: str, keywords: list[str], secrets: set[str],
+) -> tuple[str, list[str]]:
+    """(topic, keywords) with every secret in ``secrets`` redacted, before they
+    accumulate into the session index. A keyword is one term, so one that
+    carried a secret is dropped rather than kept as a redaction."""
+    if not secrets:
+        return topic, keywords
+    clean = _scrubber(secrets)
+    return clean(topic) if topic else topic, [k for k in keywords if clean(k) == k]
 
 
 __all__ = [
     "classify_as_reference",
+    "classify_references",
     "ingest_reference_from_extraction",
+    "ingest_references_from_extraction",
     "extract_references_from_chunk",
     "captured_secrets",
+    "chunk_secrets",
+    "scrub_credential_extraction",
+    "scrub_session_index",
 ]

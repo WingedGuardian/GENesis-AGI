@@ -408,14 +408,21 @@ def split_secret(
             "refusing a body whose description contains one too"
         )
     trailer = _trailer(body[idx + len(_VALUE_MARKER):])
+    # Any OTHER secret the row carries (a backup password in the description,
+    # in a tag or in the identifier) is just as indexed as the held-out one,
+    # on a re-ingest of a held-out body too.
+    extra = captured_fragments([body[:idx], concept, *_tag_texts(tags_json), *trailer])
+    held_value: str | None = None
     if value == SECRET_PLACEHOLDER:
-        return _held_body(body[:idx], trailer), None, tags_json, concept
-    if contains_card_number(value):
-        raise ValueError(
-            "a credential reference carries a payment card number; cards are "
-            "never stored as references"
-        )
-    frags = _fragments(value)
+        frags = extra
+    else:
+        if contains_card_number(value):
+            raise ValueError(
+                "a credential reference carries a payment card number; cards are "
+                "never stored as references"
+            )
+        held_value = value
+        frags = _merge(_fragments(value), extra)
     fragments, glued, bounded = frags.all, frags.glued, frags.bounded
     trailer = [
         _scrub_tag(line, fragments, bounded) if line.startswith("Tags: ")
@@ -424,9 +431,99 @@ def split_secret(
     ]
     held = _held_body(scrub(body[:idx], fragments, glued, bounded), trailer)
     return (
-        held, value, _scrub_tags(tags_json, fragments, bounded),
+        held, held_value, _scrub_tags(tags_json, fragments, bounded),
         scrub(concept, fragments, glued, bounded) if concept is not None else None,
     )
+
+
+def secret_set_fragments(
+    secrets: set[str] | frozenset[str], glued_secrets: set[str] | frozenset[str] = frozenset(),
+) -> _Fragments:
+    """The fragments of every secret in ``secrets``, by ``secret_fragments``'
+    rules. A secret in ``glued_secrets`` (secret by its label) and its words are
+    redacted even glued to other text."""
+    groups = []
+    for secret in secrets:
+        frags = _fragments(secret)
+        if secret in glued_secrets:
+            words = {w for w in secret.split() if len(w) >= _MIN_LABELLED}
+            frags = frags._replace(glued=frags.glued | words | {secret.strip()})
+        groups.append(frags)
+    return _merge(*groups)
+
+
+def captured_fragments(texts: list[str | None]) -> _Fragments:
+    """The fragments of every secret a credential pattern captures in ``texts``
+    (the rule ``reference_extraction`` holds and redacts by). One that stood
+    after an explicit label is glued: secret by its label, all-letter or not."""
+    from genesis.memory.reference_extraction import captured_secrets
+
+    labelled: set[str] = set()
+    secrets = captured_secrets([t for t in texts if t], labelled)
+    return secret_set_fragments(secrets, labelled)
+
+
+def _merge(*groups: _Fragments) -> _Fragments:
+    fragments = {f for group in groups for f in group.all if f}
+    glued = frozenset().union(*(group.glued for group in groups))
+    # A fragment counts as too short to redact inside a word only when no group
+    # holds it as a glued fragment.
+    bounded = frozenset().union(*(group.bounded for group in groups)) - glued
+    return _Fragments(sorted(fragments, key=len, reverse=True), glued, bounded)
+
+
+def _tag_texts(tags_json: str | None) -> list[str]:
+    """Each tag as its own text, so a capture never runs into JSON quoting."""
+    if not tags_json:
+        return []
+    try:
+        tags = json.loads(tags_json)
+    except ValueError:
+        return [tags_json]
+    if not isinstance(tags, list):
+        return [tags_json]
+    return [t for t in tags if isinstance(t, str)]
+
+
+def scrub_reference(
+    body: str, tags_json: str | None = None, concept: str | None = None,
+    *, also: tuple[str | None, ...] = (), formatted: bool = True,
+) -> tuple[str, str | None, str | None, _Fragments]:
+    """(body, tags, concept, the fragments) of a NON-credential reference with
+    every credential-pattern secret redacted outside its ``Value:`` line.
+
+    An identifier kind (url, network, account, fact) keeps its value, which is
+    what its lookups search for; its description, tags and identifier are free
+    text that can carry a password all the same, and are indexed exactly as a
+    credential's are. ``also`` (other free text stored beside the row) adds to
+    the secrets found; the caller scrubs it with the returned fragments
+    (``scrub_with``). ``formatted=False`` is for a body no reference formatter
+    wrote (an upload, a distilled unit): it has no value line, so all of it is
+    scrubbed, whatever paragraph happens to start like one.
+    """
+    idx = body.find(_VALUE_MARKER) if formatted else -1
+    head, tail = (body, "") if idx == -1 else (body[:idx], body[idx:])
+    trailer = [line for line in tail.split("\n") if line.startswith(_TRAILER_PREFIXES)]
+    frags = captured_fragments([head, concept, *_tag_texts(tags_json), *trailer, *also])
+    if not frags.all:
+        return body, tags_json, concept, frags
+    tail_lines = [
+        _scrub_tag(line, frags.all, frags.bounded) if line.startswith("Tags: ")
+        else scrub_with(line, frags) if line.startswith("Captured: ")
+        else line
+        for line in tail.split("\n")
+    ] if tail else []
+    return (
+        scrub_with(head, frags) + "\n".join(tail_lines),
+        _scrub_tags(tags_json, frags.all, frags.bounded),
+        scrub_with(concept, frags) if concept is not None else None,
+        frags,
+    )
+
+
+def scrub_with(text: str, frags: _Fragments) -> str:
+    """``text`` with every fragment in ``frags`` redacted."""
+    return scrub(text, frags.all, frags.glued, frags.bounded)
 
 
 def _trailer(after_marker: str) -> list[str]:

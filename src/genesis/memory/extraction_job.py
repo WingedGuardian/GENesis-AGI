@@ -41,7 +41,12 @@ from genesis.memory.extraction import (
     extractions_to_store_kwargs,
     parse_extraction_response_full,
 )
-from genesis.memory.reference_extraction import extract_references_from_chunk
+from genesis.memory.reference_extraction import (
+    chunk_secrets,
+    extract_references_from_chunk,
+    scrub_credential_extraction,
+    scrub_session_index,
+)
 from genesis.memory.source_verification import compute_jaccard, verify_source_overlap
 from genesis.util.jsonl import (
     chunk_messages,
@@ -315,6 +320,7 @@ async def run_extraction_cycle(
         # hundreds of conf≈0 candidates that never get validated.
         session_procs = 0
         session_candidates: list[dict] = []  # flag-only chunk signal (C2b)
+        session_secret_set: set[str] = set()  # #2426: every chunk secret so far
 
         for chunk in chunks:
             chunk_start = chunk[0].line_number
@@ -340,11 +346,25 @@ async def run_extraction_cycle(
                 )
                 continue
 
+            # #2426: every credential secret the chunk carries, in any
+            # extraction or in the session topic and keywords. The references
+            # below hold the user's; then every copy of every one is scrubbed
+            # before anything logs, stores, dedups, links or embeds it.
+            # Accumulated over the session's chunks, so a secret labelled in an
+            # earlier chunk is scrubbed where a later one repeats it bare.
+            session_secret_set |= chunk_secrets(
+                result.extractions, result.session_topic, *result.session_keywords,
+            )
+            chunk_secret_set = session_secret_set
+            topic, keywords = scrub_session_index(
+                result.session_topic, list(result.session_keywords), chunk_secret_set,
+            )
+
             # Accumulate session-level keywords and topic from each chunk
-            if result.session_keywords:
-                all_keywords.update(result.session_keywords)
-            if result.session_topic:
-                latest_topic = result.session_topic
+            if keywords:
+                all_keywords.update(keywords)
+            if topic:
+                latest_topic = topic
 
             if not result.extractions:
                 summary["zero_entity_chunks"] += 1
@@ -367,6 +387,7 @@ async def run_extraction_cycle(
                 chunk_user_text = "\n".join(
                     m.text for m in chunk if m.role == "user"
                 )
+                failed_refs: list[str] = []
                 ref_count = await extract_references_from_chunk(
                     result.extractions,
                     store=store,
@@ -376,8 +397,21 @@ async def run_extraction_cycle(
                     # inline (one-shot CLI won't have recovery worker running)
                     force_fts5_only=not reference_only_mode,
                     user_text=chunk_user_text,
+                    failed=failed_refs,
                 )
                 summary["references_captured"] += ref_count
+                if failed_refs:
+                    # The scrub below still runs (memory never keeps the
+                    # value), so a reference that failed to store is left only
+                    # in the transcript, where reference-only mining recovers it.
+                    summary["references_failed"] = (
+                        summary.get("references_failed", 0) + len(failed_refs)
+                    )
+                    logger.warning(
+                        "%d auto-captured reference(s) failed to store for session %s "
+                        "chunk %d-%d; the transcript still holds them",
+                        len(failed_refs), session_id, chunk_start, chunk_end,
+                    )
             except Exception:
                 # Reference extraction must never break the main extraction
                 # pipeline — log and continue.
@@ -385,6 +419,24 @@ async def run_extraction_cycle(
                     "Reference extractor failed on session %s chunk %d-%d",
                     session_id, chunk_start, chunk_end, exc_info=True,
                 )
+
+            # Source overlap is judged on the text as extracted: the scrub below
+            # replaces a credential with a marker the transcript does not
+            # contain, which would count as ungrounded words.
+            overlap_by_extraction = {}
+            if not reference_only_mode:
+                source_text = format_chunk_for_extraction(chunk)
+                overlap_by_extraction = {
+                    id(extraction): verify_source_overlap(extraction.content, source_text)
+                    for extraction in result.extractions
+                    if extraction.extraction_type != "procedure_candidate"
+                }
+            if chunk_secret_set:
+                for extraction in result.extractions:
+                    if scrub_credential_extraction(extraction, chunk_secret_set):
+                        summary["credentials_scrubbed"] = (
+                            summary.get("credentials_scrubbed", 0) + 1
+                        )
 
             # Stream 2: procedure candidate flagging (C2b — flag-only). The SLM
             # flags procedure_candidate extractions; we classify them and
@@ -414,9 +466,6 @@ async def run_extraction_cycle(
                 # episodic memory rows that already exist from prior cycles.
                 continue
 
-            # Build source text once per chunk for overlap verification
-            source_text = format_chunk_for_extraction(chunk)
-
             # Store each extraction with provenance
             for extraction in result.extractions:
                 # procedure_candidate extractions are routed to the Judge
@@ -428,9 +477,7 @@ async def run_extraction_cycle(
                 # Check that extraction content actually appears in the
                 # source transcript chunk. Demote confidence for ungrounded
                 # extractions. See memory-immune-system-design.md §1.1.
-                overlap_result = verify_source_overlap(
-                    extraction.content, source_text,
-                )
+                overlap_result = overlap_by_extraction[id(extraction)]
                 if not overlap_result.verified:
                     extraction.confidence = max(
                         extraction.confidence - 0.3, 0.1,
