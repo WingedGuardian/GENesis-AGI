@@ -92,6 +92,99 @@ remediation for the detected vantage — because the knob is never local:
   GiB turns the OOM cliff into a ramp. **On guardian hosts this is now
   mechanical** — see the zram layer below.
 
+## Each interactive session in its own scope (the slot door)
+
+systemd-oomd kills a whole cgroup, so what shares a cgroup dies together. Every
+interactive Claude Code session therefore starts in a systemd user scope of its
+own, `genesis-slot-<slot>-<hex>.scope` under `genesis-slots.slice`, through
+`scripts/slot_exec.sh`. The scope holds claude and everything it spawns (its MCP
+servers, subagents, tool commands). Two things follow:
+
+- **A per-session memory cap.** A slot scope carries `MemoryMax=55%` of what
+  systemd sees as the machine (its container limit when there is one; for
+  example about 17.6 GiB on a 32 GiB machine) and `MemorySwapMax=5%` of the
+  same, with `OOMPolicy=continue`. A session whose tree outgrows both loses
+  its largest process to the kernel's OOM killer, inside that scope only, and
+  the next largest if it is still over; the scope and its claude keep running
+  unless claude itself is chosen. No `MemoryHigh` is set: near the cap it would
+  throttle the session instead of ending the runaway. The swap cap is what makes the
+  memory cap bite: measured, with swap uncapped a scope over `MemoryMax`
+  swaps and nothing is killed, so a runaway would thrash the shared swap.
+  `SLOT_EXEC_MEMORY_MAX` and `SLOT_EXEC_SWAP_MAX` override the values (`20G`,
+  `40%`, `infinity`); a malformed value falls back to the default, never to
+  no cap. This is the containment a runaway session meets first. The value is
+  set so that one runaway session, with the rest of a typical workload, stays
+  below the box-wide pressure line where oomd acts; two runaway sessions at
+  once can still reach it. If systemd refuses the cap (older versions lack
+  `OOMPolicy=` on scopes, which is then dropped silently; a manager that
+  refuses the memory properties gets a scope without them, said aloud), the
+  session still gets its scope. It is an interim value, set ahead
+  of measured per-session footprints; the learned per-slot limit replaces it.
+- **A smaller oomd action.** An oomd kill no longer takes every slot at once.
+  It is not one session per action on systemd 255, though: after killing a
+  cgroup, oomd's second pass over `cgroup.threads` fails with EINVAL for any
+  non-leader thread (pidfd_open without `PIDFD_THREAD`), oomd counts the kill
+  as failed and moves on to the next candidate, until one kill returns
+  cleanly (a single-threaded or fast-exiting cgroup). So one action takes the
+  top candidate plus every cgroup ranked above the first clean kill. systemd
+  256 fixed this (`CGROUP_NO_PIDFD` in `cg_kill`); Ubuntu 24.04's 255 does not
+  have it (#3874).
+
+Why a wrapper is needed: a pane's claude used to inherit the cgroup of the tmux
+SERVER, and the server lives wherever its first client ran (a login session
+scope from SSH, or `genesis-server.service` when the dashboard terminal started
+it). tmux 3.4 does move each pane into a `tmux-spawn-*.scope`, but it sends the
+request without waiting for the move, so the pane shell has usually forked
+claude already and claude stays behind. Measured on a live install: every
+foreground slot's claude sat in one login scope, so the smallest thing oomd
+could kill there was every slot at once.
+
+How it works and what it changes:
+
+- `slot_exec.sh` probes that systemd will create a scope (one throwaway
+  `systemd-run --scope … true`, about 40 ms), then `exec`s `systemd-run
+  --scope`, which registers the scope and execs the command in place. The pid,
+  the terminal, the process group and the exit status are claude's own, so the
+  slot's exit capture is unchanged. The environment is unchanged too: the
+  wrapper removes the `INVOCATION_ID` systemd adds (a caller's own is kept), and supplies
+  `XDG_RUNTIME_DIR` to `systemd-run` alone when the caller lacks it.
+- If no scope can be made (no systemd user manager, no `systemd-run`, a refused
+  property), it prints one line saying so and runs the command unscoped,
+  which is the behaviour before the wrapper.
+- Launch paths that use it: every `cc-slot.sh` slot (SSH slot hostnames, manual
+  SSH, the dashboard terminal); the bashrc `claude()` wrapper when claude runs
+  interactively without taking a slot (inside tmux, or with
+  `GENESIS_NO_TMUX_WRAP=1`); an interactive `gmodel` launch; and the
+  `genesis` command a fresh `install.sh` writes to `/usr/local/bin` (written
+  once, so an existing install keeps its old copy until it is regenerated; #2116). A non-tty
+  `claude` call (a session's Bash tool running `claude mcp …`), `-p` and
+  headless runs are not wrapped: they stay in their caller's scope.
+  Background `claude -p` runs started by the server already get their own scope
+  from the invoker.
+- When `cc-slot.sh` or `lobby-door.sh` starts the tmux server (no server was
+  running), the server
+  gets `genesis-tmux-server-<hex>.scope` in `app.slice`, marked
+  `ManagedOOMPreference=omit`. Every slot's terminal belongs to the server, so
+  killing it would end every slot. A server restart can no longer end it, since
+  it is out of `genesis-server.service`'s cgroup. The omit mark takes effect
+  only once oomd monitors a cgroup the user owns (the user manager): oomd
+  ignores the mark under a root-owned monitor such as `user.slice`, per
+  systemd.resource-control(5). A running server is joined
+  as before. Panes then get tmux's own scopes in `app.slice`. A process forked
+  before tmux's late move (the pane shell's first child) lands in the server's
+  scope and shares its omit mark; that is why the slot door wraps claude even
+  when it starts in that scope.
+- Check a session: `cat /proc/<claude pid>/cgroup` ends in
+  `genesis-slots.slice/genesis-slot-<slot>-<hex>.scope`. A slot started before
+  this change keeps its old cgroup until it is relaunched.
+- The scope adds no task cap (`TasksMax=infinity`; the per-user slice budget
+  still applies) and its systemd description is the slot label, never the
+  command line. The memory cap above is the interim value; learned per-slot
+  throttle and ceiling values arm only after measured per-session footprints
+  exist. A cap kill shows up as a "cgroup OOM kill(s) detected" alert from the
+  disk guardian, on purpose: a session lost work.
+- The tmux server's scope has no memory cap: it holds only the server.
+
 ## The zram layer (guardian hosts)
 
 `scripts/lib/host_swap.sh` gives guardian host VMs a **compressed-RAM-first
