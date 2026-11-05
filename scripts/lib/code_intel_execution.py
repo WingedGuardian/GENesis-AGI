@@ -517,6 +517,11 @@ def read_report(fd: int) -> dict:
         report = json.loads(data, object_pairs_hook=_unique)
     except (RecursionError, UnicodeError) as exc:
         raise ValueError("malformed report") from exc
+    return validate_report(report)
+
+
+def validate_report(report: dict) -> dict:
+    """Validate the unchanged wire1 contract for pipe and durable consumers."""
     if (
         not isinstance(report, dict)
         or set(report) != _REPORT_KEYS

@@ -1756,6 +1756,16 @@ the shared banner is not an assertion about all concurrent sessions.
   The existing foreground watchdog lacks a post-return scope-quiescence barrier;
   strict queue integration must retain unresolved cleanup ownership separately.
   Synthetic/descriptor fixtures do not qualify native OOM or production indexing.
+  Schema 4 adds explicit protocol-3 journal APIs in
+  `scripts/lib/index_marker_execution.py` on the same admitted connection:
+  unique reservation, actual scope registration, single-use committed native
+  intent, retained typed report/stop/cleanup facts and exact-once application.
+  Shared publishers and exclusive replay/admission reuse `.queue.lock`, including
+  busy spools. Completion is independent from safety and cleanup; late disproof
+  retains repo-wide exclusion without restoring old accounting or overwriting a
+  newer inflight pointer. This is transaction storage/interpretation only:
+  automatic readiness stays fenced, actual queued native production and lifetime
+  reconciliation remain unwired, and kernel/production acceptance is unqualified.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
   deletions; native query/client cgroup proof and orphan-scope checks precede
