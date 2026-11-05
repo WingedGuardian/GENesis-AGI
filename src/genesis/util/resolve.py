@@ -7,8 +7,8 @@ import os
 from pathlib import Path
 
 
-def resolve_refusing_loops(path: str | os.PathLike[str]) -> Path:
-    """``Path(path).resolve()``, raising when the path is a symlink loop.
+def resolve_refusing_loops(path: Path) -> Path:
+    """``path.resolve()``, raising when the path is a symlink loop.
 
     Python 3.12 raises RuntimeError from a non-strict ``resolve()`` on a loop,
     while 3.13 and later return the looping path as if it were fine (measured on
@@ -16,7 +16,7 @@ def resolve_refusing_loops(path: str | os.PathLike[str]) -> Path:
     refusal calls this, and catches ``(OSError, RuntimeError)``. A missing path,
     or any other failure to stat it, resolves as it always has.
     """
-    resolved = Path(path).resolve()
+    resolved = path.resolve()
     try:
         os.stat(resolved)
     except OSError as exc:

@@ -10,6 +10,7 @@ import pytest
 
 from genesis.transcript_analytics import store
 from genesis.transcript_analytics.extract import TABLES
+from tests.conftest import require_access_denied
 
 FIXTURES = Path(__file__).with_name("fixtures")
 
@@ -342,6 +343,7 @@ def test_prune_retains_a_source_it_cannot_reach(tmp_path, capsys):
     assert store.ingest(projects, data)["rebuilt"] == 1
     source.parent.chmod(0)
     try:
+        require_access_denied(source.parent)
         assert store.prune(data, before="2026-01-01", projects=projects) == 0
     finally:
         source.parent.chmod(0o700)

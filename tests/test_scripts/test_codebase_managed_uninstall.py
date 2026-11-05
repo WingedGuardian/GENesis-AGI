@@ -244,7 +244,7 @@ def test_retained_diagnostics_only_treat_a_loop_as_unclassifiable(guard, tmp_pat
     config = dict.fromkeys(("binary", "cache", "runtime"), str(root / "file" / "below"))
     monkeypatch.setitem(guard.report_retained_state.__globals__, "read_settings", lambda *a, **kw: config)
     guard.report_retained_state()
-    assert "path classification failed" not in capsys.readouterr().out
+    assert "Preserved configured" not in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("key", ["binary", "cache", "runtime"])

@@ -9,6 +9,7 @@ import aiosqlite
 import pytest
 
 from genesis.db import integrity
+from tests.conftest import require_access_denied
 
 
 @pytest.fixture(autouse=True)
@@ -490,6 +491,7 @@ def test_a_marker_that_cannot_be_reached_fails_closed(tmp_path, isolated_genesis
     integrity.quarantine_database(db, source="test", detail="test")
     isolated_genesis_home.chmod(0)
     try:
+        require_access_denied(isolated_genesis_home)
         assert integrity.database_is_quarantined(db) is True
     finally:
         isolated_genesis_home.chmod(0o700)
