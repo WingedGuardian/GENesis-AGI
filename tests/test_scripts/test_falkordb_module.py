@@ -523,6 +523,25 @@ def test_unit_is_socket_only_and_bounded():
     assert "MemoryMax=1G" in unit
 
 
+def test_every_engine_start_restarts_the_projector_and_retries_once():
+    """#3035: the engine keeps no data, so each start (restarts included)
+    re-projects. `restart`, not `start`: a `start` of a projection already
+    running against the engine that just died merges into it and runs nothing
+    new. `--no-block` (the projector orders After= this unit), `-` (a failed
+    trigger never fails the engine start), one retry so a transient bus error
+    does not leave the graph empty until the hourly timer."""
+    posts = [
+        line.split("=", 1)[1]
+        for line in UNIT_TEMPLATE.read_text().splitlines()
+        if line.startswith("ExecStartPost=")
+    ]
+    [trigger] = [p for p in posts if "genesis-graph-project.service" in p]
+    assert trigger.startswith("-+")
+    assert trigger.count("systemctl --user restart --no-block genesis-graph-project.service") == 2
+    assert " start " not in trigger
+    assert "||" in trigger
+
+
 def test_unit_keeps_the_engines_own_record_of_slow_moments():
     """A read that times out client-side is otherwise news with no cause: the
     engine's slowlog (deep enough to outlast the hourly projection's batches)

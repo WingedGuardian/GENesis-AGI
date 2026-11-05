@@ -1877,6 +1877,47 @@ three protocol steps also apply: `.claude/skills/closing-session/SKILL.md`,
   self-check.
   A PR whose diff touches the enforcement-hook surface runs the gate-fix lane: round 1 is DUAL, Codex plus `merge_gate.secondary_reviewer` run together at PR open (Codex-only when none is configured, and the PR says so). Read `.claude/skills/genesis-development/references/gate-fix-lane.md` before opening it.
 
+### Publishing: a PR opens only after an independent review
+
+**`gh pr create` on the configured public repo is refused until a reviewer has read
+the branch (`scripts/hooks/pr_open_review_gate.py`, owner ruling 2026-11-02).** This
+sits on top of the review table above, whose "None" rows govern a COMMIT: a docs or
+one-line PR still needs a reviewer, or the owner's yes, to open. It reads Claude Code's
+own records of this session's subagents, so writing an evidence file does not satisfy
+it. What counts: a finished `genesis-architect`, `genesis-security-reviewer`,
+`feature-dev:code-reviewer` or `pr-review-toolkit` review agent (`_REVIEWER_TYPES` is the
+closed list), or the built-in `/code-review`, tied to the branch. Tied means the reviewer ran
+in the branch's linked worktree, the session itself was on the branch when it started (Claude
+Code records the session's branch, not the reviewer's), or its prompt names the branch or
+worktree as a whole word or a path into it, so **a reviewer dispatched from another directory
+must name them**. A reviewer that ran in a reused worktree while the session was on another
+feature branch does not carry over to the next branch; one run while the session was on the
+default branch does, since its record cannot say which branch the worktree held. A reviewer still running, one
+stopped by a usage limit, a general-purpose builder, a Kimi or GLM run, and a review
+from another session do not count.
+
+The override is `# pr-review-waived` on the create command, and it records the owner's
+yes given in conversation: ask first, every time. It is logged, and a dispatched session
+cannot use it. A create on that repo it cannot judge says "could not verify": an option it
+does not know, an unreadable selector, an earlier git step that may change the branch (name
+the branch with `--head`), a directory the command has yet to create, or subagent records it
+cannot read. Out of scope means another repo was named by a command it can read in full, the
+`gh repo set-default` value or
+every remote names another repo, or git said the directory is no repository or has no remote; a target it could not establish is
+"could not verify". The override is the way through. A heredoc body reads as commands here, so
+text that mentions a create goes through the Write tool.
+
+**Not covered:** Codex CLI sessions (they do not run these hooks), a normal dispatched
+session (it runs outside any repo, so repo hooks never load), the server-side openers
+(`autonomy/executor/pr_open.py`, `contribution/pr_opener.py`), spellings the parser cannot
+resolve to `gh` (a program in a variable, an alias, a shell function, a script, a command piped
+to `bash`, process substitution, `find -exec`, `gh api`, `hub`) and a script earlier in the
+command that changes the branch. A review counts for the branch, not a commit, so later commits do not void
+it. What the reviewer concluded is not read, and neither is what it was asked, so one asked a
+design question counts. A clone that declares no public repo is out of scope, and an unreadable
+`genesis.yaml` looks the same. It depends on Claude Code's subagent record format
+(`docs/reference/cc-compatibility.md`).
+
 ### Publishing: the first push opens the PR
 
 A blocked call, `secrets.env` and ask keys:

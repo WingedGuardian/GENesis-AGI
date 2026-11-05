@@ -90,7 +90,7 @@ except Exception as _helper_exc:  # noqa: BLE001 — a missing NEW helper must b
 # Deliberately the same two verbs as `_RM_PATTERN` further down — kept as a separate
 # literal rather than shared, because sharing would put the constant after the import
 # it has to survive.
-_DEGRADED_GATED = r"\brm\b|\brmdir\b"
+_DEGRADED_GATED = r"\b(?:gnu)?rm\b|\b(?:gnu)?rmdir\b"
 
 try:
     from shell_parse import _REPARSE_CARRIERS, analyze_checked, mentions  # noqa: E402
@@ -129,7 +129,7 @@ _PROTECTED_FILES_RELATIVE = [
 ]
 
 # Matches rm or rmdir as a word boundary (fast path + legacy fallback trigger)
-_RM_PATTERN = re.compile(r"\brm\b|\brmdir\b")
+_RM_PATTERN = re.compile(r"\b(?:gnu)?rm\b|\b(?:gnu)?rmdir\b")
 
 # Glob metacharacters an rm operand may carry (bash expands these before rm
 # runs, so the guard must reason about what they COULD match).

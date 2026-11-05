@@ -1,0 +1,1 @@
+- **Corrected the Kimi labels in the model docs.** The routing registry now says it is a design record and points at `config/model_routing.yaml`, the model columns and purpose of its rows 17 and 20 match that config, and `docs/reference/models.md` gains a Kimi K3 entry and the right Kimi K2.6 API id.

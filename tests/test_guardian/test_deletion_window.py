@@ -322,7 +322,7 @@ async def test_prune_is_incomplete_when_the_expiry_read_fails(tmp_path) -> None:
     mgr._expires_at = AsyncMock(return_value=None)
     with patch("genesis.guardian.snapshots._run_subprocess", _take_env_mock(existing, [], [])):
         await mgr.prune(expires_before=datetime.now(UTC))
-    assert mgr.last_prune_complete is False
+    assert mgr.last_prune_complete is False and mgr.last_prune_read is False
 
 
 # --- _maintain_snapshots --------------------------------------------------------------
@@ -339,6 +339,7 @@ def _mock_snaps(superseded: list[str] | None = None) -> MagicMock:
     s.last_rotation_note = None
     s.last_rotation_deleted = False
     s.last_prune_complete = True
+    s.last_prune_read = True
     return s
 
 
@@ -375,9 +376,17 @@ async def test_an_incomplete_window_pass_retries_after_the_settle(tmp_path) -> N
     # retries cannot stack filesystem stalls or hold every tick on timeouts.
     cfg, s = _cfg(tmp_path), _mock_snaps()
     s.last_prune_complete = False
+    s.last_delete_stuck = None
+
+    async def prune_times_out(**_kw):
+        s.last_delete_error = "timeout"
+        return 0
+
+    s.prune.side_effect = prune_times_out
     await _maintain_snapshots(cfg, s, is_healthy=True, now=INSIDE)
-    s.rotate_superseded.assert_not_called()  # stops at the failed prune
+    s.rotate_superseded.assert_not_called()  # stops at an uncertain prune failure
     s.last_prune_complete = True
+    s.prune.side_effect = None
     await _maintain_snapshots(cfg, s, is_healthy=True, now=INSIDE + timedelta(minutes=2))
     assert s.prune.await_count == 1  # still settling
     s.superseded_healthy = AsyncMock(return_value=None)  # the check listing failed
