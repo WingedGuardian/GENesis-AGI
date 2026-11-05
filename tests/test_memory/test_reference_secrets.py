@@ -1681,3 +1681,67 @@ def test_what_the_scrub_removes_the_classifier_keeps(content, value):
     ref = classify_as_reference(_ex(content), user_text=content)
     assert ref is not None and ref["kind"] == "credentials"
     assert ref["value"] == value
+
+async def _race_two_writers(db, upsert_fn) -> list[tuple[str, str]]:
+    """Codex's interleave, forced: writer A's FINAL secret write waits (up to
+    0.5 s) until writer B's whole upsert has finished. Without the per-key lock
+    B runs inside that window and the surviving row pairs B's body with A's
+    secret; with it B cannot start, the wait times out, and the pair stays
+    whole. Returns (body writer, secret writer) for the surviving row."""
+    import asyncio
+    import contextlib
+
+    b_done = asyncio.Event()
+    a_secret_writes = 0
+
+    class Pausing:
+        def __getattr__(self, name):
+            return getattr(db, name)
+
+        async def execute(self, sql, params=()):
+            nonlocal a_secret_writes
+            if sql.lstrip().startswith("INSERT INTO reference_secrets") and any(
+                isinstance(p, str) and "A-Fake9x" in p for p in params
+            ):
+                a_secret_writes += 1
+                if a_secret_writes == 2:
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(b_done.wait(), 0.5)
+            return await db.execute(sql, params)
+
+    held = _body().replace(f"Value: {_VALUE}", f"Value: {kc.SECRET_PLACEHOLDER}")
+
+    async def write(marker: str):
+        await upsert_fn(
+            Pausing(), project_type="reference", domain="reference.credentials",
+            source_doc=f"writer-{marker}", concept="Lab router admin",
+            body=held, secret_value=f"password: {marker}-Fake9x",
+        )
+        if marker == "B":
+            b_done.set()
+
+    async def b_after_a_started():
+        while a_secret_writes == 0:
+            await asyncio.sleep(0)
+        await write("B")
+
+    await asyncio.gather(write("A"), b_after_a_started())
+    row = (await db.execute_fetchall(
+        "SELECT id, source_doc FROM knowledge_units WHERE concept = 'Lab router admin'",
+    ))[0]
+    secret = await kc.get_reference_secret(db, row[0])
+    return [(row[1].removeprefix("writer-"), secret.split(": ")[1][0])]
+
+
+async def test_two_writers_on_one_key_never_cross_body_and_secret(db):
+    """4482018636: under the per-key lock, the surviving row's secret is always
+    the one written by the writer whose body survived."""
+    [(body_writer, secret_writer)] = await _race_two_writers(db, kc.upsert)
+    assert body_writer == secret_writer
+
+
+async def test_without_the_lock_two_writers_cross(db):
+    """Control: the same forced interleave through the unlocked body crosses,
+    so the test above observes the lock, not a race that never happens."""
+    [(body_writer, secret_writer)] = await _race_two_writers(db, kc._upsert)
+    assert body_writer != secret_writer
