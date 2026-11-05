@@ -1,9 +1,11 @@
 name: Python 3.14 tests
 
-# The full suite on the system Python of Ubuntu 26.04. Genesis installs on 3.12 there,
-# but scripts run by the system's `python3` already run on 3.14, and a move of the venv
-# depends on knowing this stays clean. Weekly rather than on every PR: this job takes
-# over two hours, and a red run here must not hold up a PR that did not cause it.
+# The full suite on Python 3.14, the line Ubuntu 26.04's system Python belongs to. This
+# is the toolcache build, so it is the same minor version and not always the same patch.
+# Genesis installs on 3.12 there, but scripts run by the system's `python3` already run
+# on 3.14, and a move of the venv depends on knowing this stays clean. Weekly rather than
+# on every PR: this job takes about two hours, and a red run here must not hold up a PR
+# that did not cause it.
 #
 # A green run says less than it seems to: on 3.14 a directory that denies search reads
 # as absent, and few tests make a path unreadable. See #3936.
@@ -33,7 +35,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[test,transcript-analytics]" -c .github/test-tools/requirements.txt
-      # The same selection as `test` in ci.yml, so a difference between the two is Python's.
+      # The same selection as `test` in ci.yml.
       - name: Run tests
         id: tests
         run: |
@@ -55,5 +57,15 @@ jobs:
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v7
         with:
-          name: junit-test-report-python-314
+          # failure_summary.py names this artifact in the step summary.
+          name: junit-test-report
           path: junit.xml
+      # A package that fails to import on 3.14 skips rather than fails, so a green run
+      # with its tests gone would read as clean. The ceiling is read from ci.yml, which
+      # raises it in the commit that adds a skip.
+      - name: Suite dormancy guard
+        if: ${{ !cancelled() }}
+        run: |
+          ceiling="$(sed -n 's/.*check_skip_ceiling\.py junit\.xml --ceiling \([0-9][0-9]*\).*/\1/p' .github/workflows/ci.yml)"
+          [ -n "$ceiling" ] || { echo "could not read the skip ceiling from ci.yml"; exit 1; }
+          python scripts/check_skip_ceiling.py junit.xml --ceiling "$ceiling"
