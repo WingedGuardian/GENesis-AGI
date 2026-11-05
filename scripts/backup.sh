@@ -161,7 +161,7 @@ _SQL_RESTORABLE=false   # AND round-trip-verified → eligible for off-site COMP
 _SQL_ESCROW_DRIFT=false # env-decryptable but escrow stale → off-site DR degraded
 _QDRANT_FRESH=""    # space-separated collections snapshotted+encrypted this run
 _QDRANT_FAILED=""   # collections that EXIST (HTTP 200) but failed to snapshot this run
-_SQL_TMP=""         # plaintext ~269MB dump temp — trap-cleaned (N2, credential-bearing)
+_SQL_COUNT=""       # line count of the dump (a number, no data) — trap-cleaned
 _SQL_ARTIFACT_TMP="" # encrypted candidate — promoted only after round-trip verification
 _SQL_VERIFY_TMP=""   # decrypted candidate used for exact restore validation
 _VERIFY_DB=""         # imported verification DB and sidecars — trap-cleaned
@@ -229,9 +229,10 @@ _on_exit() {
     _alert_backup_failed || true
     _write_status || true
     backend_cleanup || true
-    # N2: the credential-bearing plaintext SQL dump must not outlive the script
-    # if it died mid-section (before its inline rm).
-    rm -f "${_SQL_TMP:-}" "${_SQL_ARTIFACT_TMP:-}" "${_SQL_VERIFY_TMP:-}" 2>/dev/null || true
+    # N2: the SQL section's temps (the dump's line-count file, the encrypted
+    # candidate, and the round-trip's decrypted copy, which is credential-bearing
+    # plaintext) must not outlive the script if it died mid-section.
+    rm -f "${_SQL_COUNT:-}" "${_SQL_ARTIFACT_TMP:-}" "${_SQL_VERIFY_TMP:-}" 2>/dev/null || true
     rm -f "${_EXTRA_TAR_TMP:-}" "${_EXTRA_TAR_ERR:-}" 2>/dev/null || true  # §6f plaintext tar + its file-name diagnostics
     if [ -n "${_VERIFY_DB:-}" ]; then
         rm -f "$_VERIFY_DB" "$_VERIFY_DB-journal" "$_VERIFY_DB-wal" "$_VERIFY_DB-shm" 2>/dev/null || true
@@ -323,6 +324,17 @@ encrypt_file() {
     backup_passphrase_valid "$_BACKUP_PASSPHRASE" || return 1
     printf '%s' "$_BACKUP_PASSPHRASE" | gpg --batch --yes --no-symkey-cache --passphrase-fd 0 \
         --symmetric --cipher-algo AES256 -o "$dst" "$src" 2>/dev/null
+}
+
+# encrypt_stream <dst> — encrypt stdin to <dst>, same cipher and passphrase as
+# encrypt_file. stdin carries the data, so the passphrase arrives on fd 3 from a
+# pipe (never argv, never a file).
+encrypt_stream() {
+    local dst="$1"
+    backup_passphrase_valid "$_BACKUP_PASSPHRASE" || return 1
+    gpg --batch --yes --no-symkey-cache --passphrase-fd 3 \
+        --symmetric --cipher-algo AES256 -o "$dst" 2>/dev/null \
+        3< <(printf '%s' "$_BACKUP_PASSPHRASE")
 }
 
 # Git network ops run while the backup↔restore lock is held for the whole run,
@@ -492,11 +504,42 @@ if [ -f "$DB_FILE" ]; then
     if ! $_ENCRYPT_READY; then
         log "WARNING: GENESIS_BACKUP_PASSPHRASE not set — skipping SQLite backup (refusing plaintext)"
     else
-        _SQL_TMP=$(mktemp -p "$GENESIS_BIG_TMP")  # ~269MB dump — keep off cc-tmp/RAM
-        if sqlite3 "$DB_FILE" .dump > "$_SQL_TMP" 2>/dev/null; then
-            _SQLITE_LINES=$(wc -l < "$_SQL_TMP")
-            _SQL_ARTIFACT_TMP="data/.genesis.sql.gpg.partial.$$"
-            if encrypt_file "$_SQL_TMP" "$_SQL_ARTIFACT_TMP"; then
+        # The dump streams straight into encryption, so the plaintext dump is
+        # never written to a file before it is encrypted. (The round-trip below
+        # still decrypts one temporary copy to verify the artifact.) awk passes
+        # the bytes through unchanged and records the line count and the last
+        # line. A failing stage leaves a truncated artifact behind, so the stage
+        # is read from PIPESTATUS and the artifact discarded: a partial dump is
+        # never encrypted and promoted as if complete.
+        _SQL_COUNT=$(mktemp -p "$GENESIS_BIG_TMP")
+        _SQL_ARTIFACT_TMP="data/.genesis.sql.gpg.partial.$$"
+        _sql_dump_rc=0
+        _sql_enc_rc=0
+        _sql_dump_why=""
+        if sqlite3 "$DB_FILE" .dump 2>/dev/null \
+            | awk -v out="$_SQL_COUNT" '{ print; last = $0 } END { print NR > out; print last > out }' \
+            | encrypt_stream "$_SQL_ARTIFACT_TMP"; then
+            :
+        else
+            _sql_ps=("${PIPESTATUS[@]}")
+            _sql_dump_rc=$(( ${_sql_ps[0]:-1} | ${_sql_ps[1]:-1} ))
+            _sql_enc_rc=${_sql_ps[2]:-1}
+            # A failed gpg makes the stages before it fail too (SIGPIPE, or a
+            # write error where SIGPIPE is ignored, as under systemd): report the
+            # encryption failure, not a dump failure.
+            [ "$_sql_enc_rc" -eq 0 ] || _sql_dump_rc=0
+        fi
+        _SQLITE_LINES=$(sed -n 1p "$_SQL_COUNT" 2>/dev/null) || _SQLITE_LINES=0
+        case "$_SQLITE_LINES" in ''|*[!0-9]*) _SQLITE_LINES=0 ;; esac
+        # sqlite3 exits 0 on a corrupt or locked DB and ends the dump with
+        # "ROLLBACK; -- due to errors"; a complete dump ends with COMMIT;.
+        if [ "$_sql_dump_rc" -eq 0 ] && [ "$_sql_enc_rc" -eq 0 ] \
+            && [ "$(sed -n 2p "$_SQL_COUNT" 2>/dev/null)" != "COMMIT;" ]; then
+            _sql_dump_rc=1
+            _sql_dump_why=" (dump did not end in COMMIT)"
+        fi
+        if [ "$_sql_dump_rc" -eq 0 ]; then
+            if [ "$_sql_enc_rc" -eq 0 ]; then
                 log "SQLite: $_SQLITE_LINES lines (encrypted)"
                 # SF4 round-trip: classify the fresh artifact's restorability
                 # (see _verify_sql_roundtrip). ROUNDTRIP_DETAIL is set (sanitized)
@@ -553,9 +596,13 @@ if [ -f "$DB_FILE" ]; then
         else
             _FAILURE_CLASS="db_backup"
             _FAILURE_STAGE="sqlite_dump"
-            log "WARNING: sqlite3 dump failed"
+            _SQLITE_LINES=0
+            log "WARNING: sqlite3 dump failed$_sql_dump_why"
+            rm -f "$_SQL_ARTIFACT_TMP"
+            _SQL_ARTIFACT_TMP=""
         fi
-        rm -f "$_SQL_TMP"
+        rm -f "$_SQL_COUNT"
+        _SQL_COUNT=""
     fi
 else
     log "WARNING: genesis.db not found at $DB_FILE"

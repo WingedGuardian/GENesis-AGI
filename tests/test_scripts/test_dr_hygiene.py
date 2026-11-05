@@ -67,13 +67,16 @@ def test_backup_alert_fires_from_exit_trap():
     assert on_exit.count("|| true") >= 3  # alert / write_status / backend_cleanup
 
 
-def test_backup_sql_tmp_trap_cleaned():
-    """N2: the plaintext SQL dump temp is removed in the EXIT trap, guarded for
-    the not-yet-assigned case."""
+def test_backup_sql_dump_has_no_plaintext_file():
+    """N2: the SQL dump streams straight into encryption, so there is no
+    plaintext dump file for the EXIT trap to miss; the line-count temp it does
+    create is trap-cleaned, guarded for the not-yet-assigned case."""
     text = _BACKUP.read_text()
+    assert ".dump >" not in text  # the dump is never redirected into a file
+    assert "| encrypt_stream" in text
     on_exit = text.split("_on_exit()", 1)[1].split("trap _on_exit", 1)[0]
-    assert 'rm -f "${_SQL_TMP:-}"' in on_exit
-    assert '_SQL_TMP=""' in text  # initialized before the trap can fire
+    assert 'rm -f "${_SQL_COUNT:-}"' in on_exit
+    assert '_SQL_COUNT=""' in text  # initialized before the trap can fire
 
 
 def test_restore_offsite_pull_warns_on_failure():

@@ -24,6 +24,7 @@ against a tmp dir so upload assertions are actual files.
 import fcntl
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -714,3 +715,125 @@ def test_escrow_lib_contract(sandbox):
     assert proc.returncode == 0 and "[]" in proc.stdout and "ok" in proc.stdout, (
         f"{proc.stdout}\n{proc.stderr}"
     )
+
+
+# ── The SQL dump streams into encryption: no plaintext file ──────────
+
+_SENTINEL = "plaintext-sentinel-7f3a9c"
+
+
+def _seed_sentinel(sb) -> None:
+    subprocess.run(
+        ["sqlite3", str(sb["gd"] / "data" / "genesis.db"), f"INSERT INTO t VALUES('{_SENTINEL}');"],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _install_gpg_spy(sb, *, fail_stream: bool = False) -> Path:
+    """Wrap gpg. For the SQL stream encryption (passphrase on fd 3), run the
+    real gpg FIRST so the whole dump has flowed, then record every file in the
+    sandbox that holds the DB's plaintext at that moment, except the live DB
+    files themselves and this stub (whose script carries the sentinel).
+    Optionally fail that one encryption instead."""
+    real = shutil.which("gpg")
+    log = sb["tmp"] / "gpg_spy.log"
+    log.write_text("")
+    db = sb["gd"] / "data" / "genesis.db"
+    stub = sb["bind"] / "gpg"
+    skip = " ".join(f'-e "{p}"' for p in (db, f"{db}-wal", f"{db}-shm", f"{db}-journal", stub, log))
+    if fail_stream:
+        on_stream = f'echo STREAM >> "{log}"; cat > /dev/null; exit 2'
+    else:
+        on_stream = (
+            f'"{real}" "$@"; rc=$?; echo STREAM >> "{log}"; '
+            f'grep -rlF "{_SENTINEL}" "{sb["home"]}" "{sb["tmp"]}" 2>/dev/null '
+            f'| grep -vxF {skip} >> "{log}"; exit $rc'
+        )
+    _make_stub(
+        stub,
+        "#!/usr/bin/env bash\n"
+        f'case " $* " in *" --passphrase-fd 3 "*) {on_stream} ;; esac\n'
+        f'exec "{real}" "$@"\n',
+    )
+    return log
+
+
+def test_sql_dump_never_written_as_plaintext(sandbox):
+    """By the time the dump has been fully encrypted, no file in the sandbox
+    holds the database's plaintext (the old code wrote the whole dump to the
+    big-temp dir first, then encrypted that file), and the line count still
+    matches a real dump."""
+    _seed_sentinel(sandbox)
+    _install_curl(sandbox, _CURL_ABSENT)
+    log = _install_gpg_spy(sandbox)
+    proc, status = _run_backup(sandbox)
+    assert status["success"] is True, (status, proc.stdout)
+    assert "round-trip decrypt verified" in proc.stdout, proc.stdout
+    seen = log.read_text().splitlines()
+    assert seen[:1] == ["STREAM"], seen
+    assert seen[1:] == [], f"plaintext found during encryption: {seen[1:]}"
+    want = subprocess.run(
+        ["sqlite3", str(sandbox["gd"] / "data" / "genesis.db"), ".dump"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.count("\n")
+    assert status["sqlite_lines"] == want, status
+
+
+def _sqlite_dump_stub(sb, dump_body: str, rc: int) -> None:
+    """Make `sqlite3 <db> .dump` print dump_body and exit rc; every other
+    sqlite3 call (integrity check, round-trip) runs the real binary."""
+    real = shutil.which("sqlite3")
+    _make_stub(
+        sb["bind"] / "sqlite3",
+        "#!/usr/bin/env bash\n"
+        f'if [ "${{2:-}}" = ".dump" ]; then printf "{dump_body}"; exit {rc}; fi\n'
+        f'exec "{real}" "$@"\n',
+    )
+
+
+@pytest.mark.parametrize(
+    ("dump_body", "rc", "why"),
+    [
+        # Dies after part of the database: non-zero exit.
+        ("BEGIN TRANSACTION;\\nCREATE TABLE t(x);\\n", 1, ""),
+        # Corrupt or locked DB: sqlite3 exits 0 but ends the dump in ROLLBACK.
+        (
+            "BEGIN TRANSACTION;\\nCREATE TABLE t(x);\\nROLLBACK; -- due to errors\\n",
+            0,
+            "did not end in COMMIT",
+        ),
+    ],
+)
+def test_sql_dump_failure_is_never_promoted(sandbox, dump_body, rc, why):
+    """A partial dump still encrypts to a VALID ciphertext. It must be
+    discarded and reported as a dump failure, and the previous good backup in
+    the clone must survive untouched."""
+    _install_curl(sandbox, _CURL_ABSENT)
+    proc, status = _run_backup(sandbox)
+    assert status["success"] is True, status
+    good = sandbox["clone"] / "data" / "genesis.sql.gpg"
+    before = good.read_bytes()
+    _sqlite_dump_stub(sandbox, dump_body, rc)
+    proc, status = _run_backup(sandbox)
+    assert status["failure_stage"] == "sqlite_dump", status
+    assert status["sqlite_lines"] == 0, status
+    assert "sqlite3 dump failed" in proc.stdout, proc.stdout
+    assert why in proc.stdout, proc.stdout
+    assert good.read_bytes() == before
+    assert not list((sandbox["clone"] / "data").glob(".genesis.sql.gpg.partial.*"))
+
+
+def test_sql_stream_encrypt_failure_reported_as_encrypt(sandbox):
+    """gpg failing on the stream makes the dump stages fail too; the stage
+    must still read as an encryption failure, and nothing partial is left."""
+    _install_curl(sandbox, _CURL_ABSENT)
+    _install_gpg_spy(sandbox, fail_stream=True)
+    proc, status = _run_backup(sandbox)
+    assert status["failure_stage"] == "sqlite_encrypt", status
+    assert "SQLite encryption failed" in proc.stdout, proc.stdout
+    data = sandbox["clone"] / "data"
+    assert not (data / "genesis.sql.gpg").exists()
+    assert not list(data.glob(".genesis.sql.gpg.partial.*"))
