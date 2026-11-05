@@ -188,6 +188,31 @@ _AMBIGUOUS = "ambiguous"
 #: so `_parser_arity` cannot read its getopt spec either.
 _KNOWN_AMBIGUOUS: dict[str, frozenset[str]] = {"sudo": frozenset({"-h"})}
 
+#: `sudo` is sudo-rs by default on Ubuntu 26.04, and `_WRAPPER_SPEC["sudo"]`
+#: describes classic sudo, which stays installed there as `sudo.ws`. sudo-rs stops
+#: at these options before running anything, so each is harmless in the table: a
+#: command written after one never runs. `test_sudo_rs_refuses_what_it_is_excused_from`
+#: measures that, rather than trusting this list.
+_SUDO_RS_REFUSED = frozenset({"-C", "-R", "-t", "--close-from", "--role", "--type"})
+#: Its help prints `-h, --help` alone, while its parser takes a value for `-h` and
+#: then errors, so the help cannot grade it. Kept apart because the help does document
+#: it, which would otherwise read as a stale exception.
+_SUDO_RS_HELP_ONLY = frozenset({"-h"})
+
+
+def _is_sudo_rs() -> bool:
+    if not shutil.which("sudo"):
+        return False
+    proc = subprocess.run(["sudo", "--version"], capture_output=True, text=True, timeout=10)
+    return "sudo-rs" in proc.stdout + proc.stderr
+
+
+def _ungraded_options(tool: str) -> frozenset[str]:
+    """Table entries the installed ``tool`` cannot grade, each measured elsewhere."""
+    if tool == "sudo" and _is_sudo_rs():
+        return _SUDO_RS_REFUSED | _SUDO_RS_HELP_ONLY
+    return frozenset()
+
 
 def _unexpected_ambiguities(tool: str, arity: dict[str, str], listed) -> list[str]:
     """Listed options this help declares two ways that are NOT a reviewed exception.
@@ -395,7 +420,9 @@ def _parser_arity(tool: str) -> dict[str, str]:
     return _getopt_arity(head)
 
 
-@pytest.mark.real_tool("sudo")  # reads each installed wrapper's own --help
+# Reads each installed wrapper's own --help. On sudo-rs one test also runs /bin/echo
+# under `sudo -n`, to measure what the exception list claims.
+@pytest.mark.real_tool("sudo")
 class TestTableAgreesWithTheToolsThemselves:
     """Re-derive arity from each installed tool and fail on the FAIL-OPEN direction.
 
@@ -423,12 +450,17 @@ class TestTableAgreesWithTheToolsThemselves:
         # entirely (see `_parser_arity`). Empty for every binary and builtin, so
         # this narrows nothing for the tools that have no spec to read.
         arity.update(_parser_arity(tool))
+        self._assert_table_agrees(
+            tool, arity, set(sp._WRAPPER_SPEC[tool][0]) - _ungraded_options(tool)
+        )
+
+    def _assert_table_agrees(self, tool: str, arity: dict[str, str], listed: set[str]) -> None:
         # A spelling the help declares two ways cannot be graded here — the
         # parser reading above has already resolved it wherever a parser could be
         # read, so what remains is genuinely unsettleable from prose. That makes
         # it a DECLARED exception or a failure, never a silent exclusion: see
         # `_KNOWN_AMBIGUOUS` for why printing it instead reached nobody.
-        surprises = _unexpected_ambiguities(tool, arity, sp._WRAPPER_SPEC[tool][0])
+        surprises = _unexpected_ambiguities(tool, arity, listed)
         assert not surprises, (
             f"{tool}: {surprises} — the help declares each of these two ways and no "
             f"parser was readable, so the lock cannot grade them. Settle the arity "
@@ -443,7 +475,7 @@ class TestTableAgreesWithTheToolsThemselves:
         # exact regression this test exists to prevent, hidden by the test.
         wrong = sorted(
             (opt, arity.get(opt, "NOT FOUND in --help or the tool's own getopt spec"))
-            for opt in sp._WRAPPER_SPEC[tool][0]
+            for opt in listed
             if arity.get(opt) != "required" and arity.get(opt) != _AMBIGUOUS
         )
         assert not wrong, (
@@ -451,6 +483,36 @@ class TestTableAgreesWithTheToolsThemselves:
             f"REQUIRED value — the resolver will consume a token the tool does not, "
             f"and that token is the wrapped command"
         )
+
+    def test_sudo_rs_refuses_what_it_is_excused_from(self):
+        """The exception list is a claim about sudo-rs, so it is run, not believed.
+
+        Each entry goes through twice, because an option that is really a boolean
+        would run the first form and one that takes a value would run the second.
+        A later sudo-rs that adds one of them fails here as well as below.
+        """
+        if not _is_sudo_rs():
+            assert _ungraded_options("sudo") == frozenset()
+            return
+        # These two need no sudo to run, so they come before the control can skip.
+        documented = _documented_arity(_help_text("sudo") or "")
+        stale = sorted(opt for opt in _SUDO_RS_REFUSED if opt in documented)
+        assert not stale, f"sudo-rs now documents {stale}: grade them, and drop them from _SUDO_RS_REFUSED"
+        if shutil.which("sudo.ws"):  # classic sudo, still what the table describes
+            classic = _help_text("sudo.ws")
+            assert classic is not None
+            self._assert_table_agrees("sudo", _documented_arity(classic), set(sp._WRAPPER_SPEC["sudo"][0]))
+        control = subprocess.run(
+            ["sudo", "-n", "/bin/echo", "RAN"], capture_output=True, text=True, timeout=30
+        )
+        if "RAN" not in control.stdout:
+            pytest.skip(f"sudo cannot run a command here, so a refusal proves nothing: {control.stderr}")
+        for opt in sorted(_SUDO_RS_REFUSED | _SUDO_RS_HELP_ONLY):
+            for form in (["sudo", "-n", opt, "/bin/echo", "RAN"], ["sudo", "-n", opt, "x", "/bin/echo", "RAN"]):
+                proc = subprocess.run(form, capture_output=True, text=True, timeout=30)
+                assert "RAN" not in proc.stdout, f"{form} ran the command: the table entry eats it"
+                if opt in _SUDO_RS_REFUSED:
+                    assert "invalid option provided" in proc.stderr, (form, proc.stderr)
 
     def test_the_lock_can_see_a_short_form(self):
         """Guard the guard: the defect this was written for was a SHORT option.
@@ -677,11 +739,20 @@ class TestTableAgreesWithTheToolsThemselves:
         help declares both bare and as `=list` — into the table and drive the
         actual check. This is the acceptance bar kept as a test rather than run
         once: before the fix the same injection produced a green, silent build.
+
+        The help is classic sudo's, fixed here: the defect is in its text, and sudo-rs
+        documents `--preserve-env=list` alone, so it would not show there.
         """
-        if _help_text("sudo") is None:
-            pytest.skip(
-                "sudo is not installed here, or refused to run (no_new_privs) — the ambiguity cannot be measured"
-            )
+        monkeypatch.setitem(
+            globals(),
+            "_help_text",
+            lambda _tool: (
+                "  -E, --preserve-env            preserve user environment when running command\n"
+                "      --preserve-env=list       preserve specific environment variables\n"
+                "  -h, --help                    display help message and exit\n"
+                "  -h, --host=host               run command on host (if supported by plugin)\n"
+            ),
+        )
         opts, *rest = sp._WRAPPER_SPEC["sudo"]
         monkeypatch.setitem(sp._WRAPPER_SPEC, "sudo", ({*opts, "--preserve-env"}, *rest))
         with pytest.raises(AssertionError) as caught:
