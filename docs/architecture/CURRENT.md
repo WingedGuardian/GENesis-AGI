@@ -2060,8 +2060,11 @@ verified: 0a6c219a1 2026-10-31
   delete-first never wait; early relief waits only while the pool stays above
   its reserve until the window opens. `any` restores immediate scheduling.
   With the window enabled, each routine deletion rechecks the live clock
-  after reserving its cooldown;
-  a failed deletion stops the batch. Read-only attempts use
+  after reserving its cooldown and waits the 5-minute settle since the last
+  action, so a window pass deletes one snapshot and the next pass continues.
+  A deletion whose outcome is uncertain (timeout, failed re-list) stops the
+  batch; one that definitely failed is skipped (the next candidate goes
+  without a settle) and is named in a warning after the window. Read-only attempts use
   `.last_window_attempt` for retry pacing and do not stamp pool relief's
   `last_action`; only actual deletion candidates reserve that shared cooldown.
   A window closing during stamp IO may leave a conservative cooldown without
