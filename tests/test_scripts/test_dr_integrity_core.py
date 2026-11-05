@@ -22,10 +22,13 @@ against a tmp dir so upload assertions are actual files.
 """
 
 import fcntl
+import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -39,6 +42,17 @@ _BACKENDS = _SCRIPTS / "lib" / "backup_backends.sh"
 def _make_stub(path: Path, body: str) -> None:
     path.write_text(body)
     path.chmod(0o755)
+
+
+_SHM = "/dev/shm"
+_SHM_IS_TMPFS = (
+    os.path.isdir(_SHM)
+    and subprocess.run(
+        ["stat", "-f", "-c", "%T", _SHM], capture_output=True, text=True
+    ).stdout.strip()
+    == "tmpfs"
+)
+_needs_tmpfs = pytest.mark.skipif(not _SHM_IS_TMPFS, reason="needs a tmpfs at /dev/shm")
 
 
 def _git(*args: str, cwd: Path) -> None:
@@ -134,7 +148,10 @@ def sandbox(tmp_path):
         f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{systemctl_calls}"\nexit 0\n',
     )
     tg = tmp_path / "telegram_calls.log"
-    return {
+    # The round-trip's RAM dir must be a real tmpfs (backup.sh refuses any
+    # other), so each test gets its own dir under /dev/shm.
+    ram = Path(tempfile.mkdtemp(prefix="dr-core-ram-", dir=_SHM)) if _SHM_IS_TMPFS else None
+    yield {
         "home": home,
         "gd": gd,
         "bind": bind,
@@ -143,7 +160,10 @@ def sandbox(tmp_path):
         "clone": clone,
         "tmp": tmp_path,
         "systemctl_calls": systemctl_calls,
+        "ram": ram,
     }
+    if ram is not None:
+        shutil.rmtree(ram, ignore_errors=True)
 
 
 def _env(sb, **extra):
@@ -162,6 +182,7 @@ def _env(sb, **extra):
         GENESIS_DIR=str(sb["gd"]),
         GENESIS_BACKUP_PASSPHRASE="testpass",
         GENESIS_BACKUP_TMPDIR=str(sb["home"] / "tmp"),
+        GENESIS_BACKUP_VERIFY_TMPDIR=str(sb["ram"] or sb["home"] / "no-tmpfs"),
         QDRANT_URL="http://127.0.0.1:1",
         TELEGRAM_BOT_TOKEN="bot-x",
         TELEGRAM_FORUM_CHAT_ID="chat-y",
@@ -319,6 +340,185 @@ def test_roundtrip_env_passphrase_verified(sandbox):
     proc, status = _run_backup(sandbox)
     assert "round-trip decrypt verified" in proc.stdout, proc.stdout
     assert status["success"] is True, status
+
+
+def _install_sqlite_spy(sb) -> Path:
+    """Wrap sqlite3 so each call logs its first and third arguments and the mode
+    of the first argument's directory; the round-trip import is the call whose
+    third argument is `.read <dump>`."""
+    real = shutil.which("sqlite3")
+    log = sb["tmp"] / "sqlite_calls.log"
+    _make_stub(
+        sb["bind"] / "sqlite3",
+        "#!/usr/bin/env bash\n"
+        f'printf "%s|%s|%s\\n" "$1" "${{3:-}}" "$(stat -c %a "$(dirname "$1")")" >> "{log}"\n'
+        f'exec "{real}" "$@"\n',
+    )
+    return log
+
+
+def _verify_calls(log: Path) -> list[tuple[str, str, str]]:
+    """(verify db, decrypted dump, mode of the db's dir) per round-trip import."""
+    calls = []
+    for line in log.read_text().splitlines():
+        db, third, mode = line.split("|", 2)
+        if third.startswith(".read "):
+            calls.append((db, third[len(".read ") :], mode))
+    return calls
+
+
+_RAM_OK = {"GENESIS_BACKUP_VERIFY_RAM_FLOOR_PCT": "0"}  # independent of the host's free memory
+
+
+def _verify_prefix(sb) -> str:
+    """The private-dir prefix backup.sh derives from this install's lock file."""
+    lock = f"{sb['home']}/.genesis/locks/backup-restore.lock"
+    return f"genesis-backup-verify-{hashlib.sha256(lock.encode()).hexdigest()[:12]}."
+
+
+@_needs_tmpfs
+def test_roundtrip_verify_files_go_to_private_ram_dir(sandbox):
+    """With room on the tmpfs, the decrypted dump and the rebuilt database are
+    both created in a private 0700 dir there (a tmpfs is shared by every local
+    user), not in the on-disk big-temp dir, and nothing is left behind."""
+    _install_curl(sandbox, _CURL_ABSENT)
+    log = _install_sqlite_spy(sandbox)
+    proc, status = _run_backup(sandbox, **_RAM_OK)
+    assert status["success"] is True, status
+    assert "round-trip verify in RAM" in proc.stdout, proc.stdout
+    calls = _verify_calls(log)
+    assert len(calls) == 1, log.read_text()
+    db, dump, mode = calls[0]
+    priv = os.path.dirname(db)
+    assert os.path.dirname(dump) == priv, calls
+    assert os.path.dirname(priv) == str(sandbox["ram"]), calls
+    assert os.path.basename(priv).startswith(_verify_prefix(sandbox)), calls
+    assert mode == "700", calls
+    assert list(sandbox["ram"].iterdir()) == []
+
+
+@_needs_tmpfs
+def test_roundtrip_sweeps_a_stale_private_dir(sandbox):
+    """A private dir a SIGKILLed run of THIS install left behind (the trap never
+    ran) is removed by the next run. Another install's dir (a different lock,
+    e.g. a test sandbox, possibly mid-run) and unrelated entries are left alone."""
+    _install_curl(sandbox, _CURL_ABSENT)
+    stale = sandbox["ram"] / (_verify_prefix(sandbox) + "dead01")
+    stale.mkdir(mode=0o700)
+    (stale / "tmp.plain").write_text("leftover plaintext")
+    other_install = sandbox["ram"] / "genesis-backup-verify-000000000000.live01"
+    other_install.mkdir(mode=0o700)
+    other = sandbox["ram"] / "someone-else"
+    other.mkdir()
+    proc, status = _run_backup(sandbox, **_RAM_OK)
+    assert status["success"] is True, status
+    assert "removed a stale verify dir" in proc.stdout, proc.stdout
+    assert sorted(p.name for p in sandbox["ram"].iterdir()) == sorted(
+        [other_install.name, "someone-else"]
+    )
+
+
+def _fake_cgroup(sb, inactive_file: int) -> dict:
+    """A cgroup v2 tree whose root cap leaves 1 MiB beyond memory.current."""
+    root = sb["tmp"] / "cgfs"
+    leaf = root / "a" / "b"
+    leaf.mkdir(parents=True)
+    (root / "memory.max").write_text(f"{1 << 30}\n")
+    (root / "memory.current").write_text(f"{(1 << 30) - (1 << 20)}\n")
+    (root / "memory.stat").write_text(f"anon 1\ninactive_file {inactive_file}\nactive_file 5\n")
+    for d in (leaf.parent, leaf):
+        (d / "memory.max").write_text("max\n")
+        (d / "memory.current").write_text("1\n")
+    proc_cg = sb["tmp"] / "proc-cgroup"
+    proc_cg.write_text("0::/a/b\n")
+    return {
+        "GENESIS_BACKUP_CGROUP_FS": str(root),
+        "GENESIS_BACKUP_PROC_CGROUP": str(proc_cg),
+        # The sandbox DB is a few KB; this factor makes it need ~10 MiB.
+        "GENESIS_BACKUP_VERIFY_RAM_FACTOR": "999",
+        **_RAM_OK,
+    }
+
+
+@_needs_tmpfs
+@pytest.mark.parametrize(
+    ("inactive_file", "want"),
+    [(0, "RAM short"), (512 << 20, "round-trip verify in RAM")],
+)
+def test_roundtrip_cgroup_cap_counts_reclaimable_cache(sandbox, inactive_file, want):
+    """A capped cgroup bounds the RAM choice, and its cold page cache
+    (inactive_file) counts as available: max - current alone reads near zero on
+    any long-running box, which would refuse RAM every time."""
+    _install_curl(sandbox, _CURL_ABSENT)
+    proc, status = _run_backup(sandbox, **_fake_cgroup(sandbox, inactive_file))
+    assert status["success"] is True, status
+    assert want in proc.stdout, proc.stdout
+
+
+@_needs_tmpfs
+def test_roundtrip_ram_failure_retries_on_disk(sandbox):
+    """A failure on the shared tmpfs (full, memory charged elsewhere) must not
+    become a CORRUPT verdict by itself: the check re-runs on disk."""
+    _install_curl(sandbox, _CURL_ABSENT)
+    real = shutil.which("sqlite3")
+    ram = str(sandbox["ram"])
+    _make_stub(
+        sandbox["bind"] / "sqlite3",
+        "#!/usr/bin/env bash\n"
+        f'case "$1" in "{ram}"/*) [ "${{3:-}}" != "${{3#.read }}" ] && exit 13 ;; esac\n'
+        f'exec "{real}" "$@"\n',
+    )
+    proc, status = _run_backup(sandbox, **_RAM_OK)
+    assert "round-trip failed in RAM; retrying on disk" in proc.stdout, proc.stdout
+    assert "round-trip decrypt verified" in proc.stdout, proc.stdout
+    assert status["success"] is True, status
+    assert list(sandbox["ram"].iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("extra", "why"),
+    [
+        ({"GENESIS_BACKUP_VERIFY_TMPDIR": "/nonexistent/ram"}, "is not a writable dir"),
+        ("DISK_DIR", "is not a tmpfs"),
+        ({"GENESIS_BACKUP_VERIFY_RAM_FACTOR": "999999"}, "RAM short"),
+        # The memory floor alone refuses RAM: a tiny DB fits, but keeping all of
+        # MemTotal free after the check is impossible.
+        ({"GENESIS_BACKUP_VERIFY_RAM_FLOOR_PCT": "100"}, "RAM short"),
+    ],
+)
+def test_roundtrip_falls_back_to_disk(sandbox, extra, why):
+    """No usable tmpfs, or not enough room: verify on the big-temp dir and still
+    pass; the log says which and why."""
+    if extra == "DISK_DIR":
+        disk_dir = sandbox["tmp"] / "plain-dir"
+        disk_dir.mkdir()
+        extra = {"GENESIS_BACKUP_VERIFY_TMPDIR": str(disk_dir)}
+    elif not _SHM_IS_TMPFS and why == "RAM short":
+        pytest.skip("needs a tmpfs at /dev/shm")
+    _install_curl(sandbox, _CURL_ABSENT)
+    log = _install_sqlite_spy(sandbox)
+    proc, status = _run_backup(sandbox, **extra)
+    assert status["success"] is True, status
+    assert "round-trip decrypt verified" in proc.stdout, proc.stdout
+    assert why in proc.stdout, proc.stdout
+    calls = _verify_calls(log)
+    disk = str(sandbox["home"] / "tmp")
+    assert len(calls) == 1, calls
+    assert all(os.path.dirname(p) == disk for p in calls[0][:2]), calls
+
+
+@_needs_tmpfs
+@pytest.mark.parametrize(
+    "knob", ["GENESIS_BACKUP_VERIFY_RAM_FACTOR", "GENESIS_BACKUP_VERIFY_RAM_FLOOR_PCT"]
+)
+@pytest.mark.parametrize("value", ["3x", "08", "99999999999999999999"])
+def test_roundtrip_bad_ram_knob_does_not_abort(sandbox, knob, value):
+    """A non-integer, a leading-zero value (read as decimal, never as a bad
+    octal that kills the run under set -e) or an overlong knob never aborts."""
+    _install_curl(sandbox, _CURL_ABSENT)
+    proc, status = _run_backup(sandbox, **{**_RAM_OK, knob: value})
+    assert status["success"] is True, (status, proc.stderr)
+    assert "round-trip decrypt verified" in proc.stdout, proc.stdout
 
 
 def test_escrow_drift_degrades_offsite_not_critical(sandbox):
