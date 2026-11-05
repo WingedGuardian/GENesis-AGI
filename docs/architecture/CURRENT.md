@@ -271,9 +271,15 @@ engine has NO temporal types despite its own documentation listing them, and a
 loading engine answers `BusyLoadingError` — which is unavailable, never empty.
 Acceptance: 400 live roots replayed through both stores, 0 node-set differences.
 The FalkorDB projection is rebuilt hourly by `genesis-graph-project.timer`
-(`memory/graphstore_project.py`); that schedule is its staleness bound, and an
-engine restart leaves no projection until the next run (the engine keeps no data
-on disk). Before the swap, the projector runs the callers' own traversal and
+(`memory/graphstore_project.py`); that schedule is its staleness bound. The
+engine keeps no data on disk, so its unit also (re)starts the projector on
+every start, restarts included; a projection already running against the
+engine that just died is stopped and run again (`ExecStartPost`, issue #3035): a restarted engine is
+re-projected at once instead of serving fallbacks until the next hourly run.
+After a restart each process's next read finds its pooled connection closed;
+`graphstore_falkor._read` retries that one READ once inside the same deadline
+(MEASURED: the failure takes about 1 ms and the retry answers), and the row
+records `retried`, which breaks the cutover clock like any other failure. Before the swap, the projector runs the callers' own traversal and
 marker queries on the new graph (`graphstore_falkor._WARM_TRAVERSALS`) and prints
 the outcome (`warm-up: ...`) in the unit's journal. Engine time for the first
 read of a freshly projected graph was 52-358 ms where later reads took 1-3.5 ms,
@@ -305,7 +311,7 @@ frames put the wait in (`construct`, `connect` or `reply`; a row from before the
 connection reading prints `unknown` unless its frames alone name the leg). Rows carry `primary_ms`, a latency spread of answered traversals per store, and
 the report prints each reset's cause. The engine unit keeps its own record of
 slow moments (`--slowlog-max-len 4096`, `--latency-monitor-threshold 100`).
-A call's first fallback, selection failure or error is also written as
+A call's first fallback, retry, selection failure or error is also written as
 its own row the moment it happens, so a process killed mid-request cannot lose the
 evidence that the clock broke. A row that fails to write is carried as
 `prior_write_failures` on the next row and appended to
