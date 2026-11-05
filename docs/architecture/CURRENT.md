@@ -4679,6 +4679,17 @@ Refusing a proposed update preserves a previously valid opt-in.
   from the kit's own directory like the guard. It takes the repair's locks in
   the repair's order with a short wait (30 s; `--wait` honoured) and exits 1
   while any is held, or while the guard calls the checkout `mixed_tree`. It
+  reaches `deploy-backups` by an fd opened from the resolved home without following
+  a link and reads everything after through that fd; that folder and every
+  node of the report dir (at most 200,000, never through a link) must be
+  this user's, and every one but a symlink without group or world write,
+  else the whole report is `other:not-owned <path>`, before `REPAIR.json` is
+  parsed (a writer with this user's uid is out of scope: it can already edit
+  the checkout). A report with a node part below another (the writer never
+  writes one) is `other:bad-report`, and one with no integrity record is
+  judged with a note that a restore refuses it. Every git call of the repair
+  and the check runs with `core.fsmonitor=false` and
+  `core.hooksPath=/dev/null`. It
   first refuses the whole report if a row is not exactly what the writer
   writes (relative paths outside `.git`, at most 4,096 bytes, the sum of
   length x depth over the rows within the report byte cap; git modes and

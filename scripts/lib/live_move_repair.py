@@ -59,9 +59,13 @@ def _log(msg: str) -> None:
     print(f"live-move repair: {msg}", file=sys.stderr, flush=True)
 
 
+#: Every git call's options: no fsmonitor program and no hook from the repository's config.
+GIT_C = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
+
+
 def _git(repo: str, *args: str, check: bool = True, data: bytes | None = None):
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    p = subprocess.run(["git", "-C", repo, *args], capture_output=True, input=data, env=env)
+    p = subprocess.run(["git", *GIT_C, "-C", repo, *args], capture_output=True, input=data, env=env)
     if check and p.returncode != 0:
         why = p.stderr.decode(errors="replace").strip()
         raise RepairError(f"git {args[0]} failed (exit {p.returncode}): {why}")
@@ -674,9 +678,8 @@ class Repair:
                 f"the checkout is half-written ({reason}); repair it first, nothing was judged"
             )
             return 1
-        backup = os.path.join(self.backups, ts + SUFFIX)
-        restore = _load_kit("live_move_restore.py")
-        return restore.check(types.SimpleNamespace(**globals()), self.repo, backup, self._say)
+        kit = _load_kit("live_move_restore.py")
+        return kit.check(types.SimpleNamespace(**globals()), self.repo, self.home, ts, self._say)
 
     def _judge_state(self, index_lock: str) -> int:
         with open(self.state_path, "rb") as fh:

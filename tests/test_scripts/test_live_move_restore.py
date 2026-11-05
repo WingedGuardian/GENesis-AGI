@@ -15,6 +15,7 @@ from __future__ import annotations
 import calendar
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -27,6 +28,7 @@ from pathlib import Path
 import pytest
 
 from tests.test_scripts._live_repair_world import (
+    LIB,
     MODULE,
     _ancestor_file,
     _dir_becomes_file,
@@ -102,12 +104,13 @@ def _check(w, ts: str, *extra: str) -> subprocess.CompletedProcess:
 
 
 def _parts(r: subprocess.CompletedProcess) -> dict[tuple[str, str], str]:
-    """(path, part) -> verdict, from every per-part line `<json path> <part> <verdict>`."""
+    """(path, part) -> verdict, from every per-part line `<json path> <part> <verdict>`
+    (a note in parentheses may follow the verdict)."""
     out = {}
     for line in r.stdout.splitlines():
         if line.startswith('"'):
             path, end = json.JSONDecoder().raw_decode(line)
-            part, verdict = line[end:].split()
+            part, verdict = line[end:].split()[:2]
             out[(path, part)] = verdict
     return out
 
@@ -780,8 +783,8 @@ def test_newer_reports_together_are_held_to_one_reports_caps(w):
 
 def test_an_old_report_without_the_integrity_record_is_judged_as_before(w):
     """A report written before SAVED.json existed names none: --check judges it
-    exactly as one that does (the restore, B2b, refuses its node parts
-    `no-hash`; the check only reads)."""
+    exactly as one that does, and says a restore refuses it whole (review N-3;
+    the check only reads)."""
     ts = _repaired(w, _foreign_inside_dir)
     with_record = _check(w, ts)
     assert with_record.returncode == 0, with_record.stdout
@@ -789,6 +792,7 @@ def test_an_old_report_without_the_integrity_record_is_judged_as_before(w):
     (w.backups()[-1] / "SAVED.json").unlink()
     old = _check(w, ts)
     assert old.returncode == 0 and _parts(old) == _parts(with_record), old.stdout
+    assert "a restore refuses it" in old.stdout, old.stdout
 
 
 def _saved_path(w) -> Path:
@@ -892,3 +896,96 @@ def test_dismiss_takes_update_lock_and_keeps_the_report_private(w):
     assert r.returncode == 0, r.stderr
     assert json.loads(path.read_text())["dismissed_at"]
     assert stat.S_IMODE(os.lstat(path).st_mode) == 0o600
+
+
+# ── #3492 B2b: the gates --check applies before it judges ───────────────────
+
+
+def _group_write(w, where: str) -> Path:
+    backup = w.backups()[-1]
+    return {
+        "deploy-backups": backup.parent,
+        "report-dir": backup,
+        "REPAIR.json": backup / "REPAIR.json",
+        "SAVED.json": backup / "SAVED.json",
+        "tree-file": backup / "tree" / "sub" / "s1",
+        "tree-dir": backup / "tree" / "sub",
+        "index-blob": next((backup / "index-blobs").iterdir()),
+    }[where]
+
+
+@pytest.mark.parametrize(
+    "where",
+    ["deploy-backups", "report-dir", "REPAIR.json", "SAVED.json", "tree-file", "tree-dir",
+     "index-blob"],
+)  # fmt: skip
+def test_a_group_writable_node_anywhere_in_the_report_refuses_it_whole(w, where):
+    """Origin rule (owner rulings ced82b49, 73b6285d): deploy-backups and every
+    node of the report dir down are this user's with no group or world write;
+    anything else refuses the whole report `other:not-owned <path>`, before
+    REPAIR.json is parsed."""
+    ts = _repaired(w, lambda w: (_foreign_staged(w), _foreign_edit(w))[1])
+    assert _check(w, ts).returncode == 0, "control: the report judges clean"
+    node = _group_write(w, where)
+    node.chmod(stat.S_IMODE(os.lstat(node).st_mode) | 0o020)
+    r = _check(w, ts)
+    assert r.returncode == 1 and "other:not-owned" in r.stdout and _parts(r) == {}, r.stdout
+
+
+def test_a_symlinked_deploy_backups_is_refused(w, tmp_path):
+    ts = _repaired(w, _foreign_edit)
+    real = tmp_path / "elsewhere"
+    shutil.move(w.gen / "deploy-backups", real)
+    os.symlink(real, w.gen / "deploy-backups")
+    r = _check(w, ts)
+    assert r.returncode == 1 and "other:not-owned" in r.stdout and _parts(r) == {}, r.stdout
+
+
+def test_a_report_another_user_owns_is_refused(w, mod, monkeypatch, capsys):
+    """Every node not the effective uid's refuses (the uid itself faked: a
+    test cannot chown)."""
+    ts = _repaired(w, _foreign_edit)
+    spec = importlib.util.spec_from_file_location("_restore_kit", LIB / "live_move_restore.py")
+    kit = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(kit)
+    monkeypatch.setattr(kit.os, "geteuid", lambda: os.getuid() + 1)
+    load = mod._load_kit
+    monkeypatch.setattr(mod, "_load_kit", lambda n: kit if n == "live_move_restore.py" else load(n))
+    capsys.readouterr()
+    rc = mod.main(["--restore", ts, "--check", str(w.state), str(w.root)])
+    out = capsys.readouterr().out
+    assert rc == 1 and "other:not-owned" in out, out
+
+
+def test_a_node_part_below_another_refuses_the_report(w):
+    """Review LOW-2: the writer never writes a node part below another (a
+    directory row covers its children; a non-directory parent makes them
+    unreachable), so a report holding one is refused whole."""
+    ts = _repaired(w, _foreign_edit)
+
+    def nest(m):
+        row = next(r for r in m["paths"] if r["path"] == "sub/s1")
+        m["paths"].append({**row, "path": "sub/s1/deeper", "saved_as": "tree/sub/s1/deeper"})
+
+    _edit_report(w, nest)
+    r = _check(w, ts)
+    assert r.returncode == 1 and "a node part below another" in r.stdout, r.stdout
+    assert _parts(r) == {}, r.stdout
+
+
+def test_the_check_never_runs_the_repositorys_fsmonitor(w, tmp_path):
+    """Security W3: every git call on the restore path runs with
+    core.fsmonitor=false and core.hooksPath=/dev/null, so a repository config
+    naming an fsmonitor program (here, one that leaves a marker) never runs
+    it. Control: plain git in the same checkout does run it."""
+    ts = _repaired(w, _foreign_edit)
+    marker, hook = tmp_path / "fsmonitor-ran", tmp_path / "fsmonitor.sh"
+    hook.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n")
+    hook.chmod(0o755)
+    _git(w.root, "config", "core.fsmonitor", str(hook))
+    _git(w.root, "update-index", "-q", "--refresh", check=False)
+    assert marker.exists(), "control: git runs the configured fsmonitor"
+    marker.unlink()
+    r = _check(w, ts)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not marker.exists(), "the check ran the repository's fsmonitor"
