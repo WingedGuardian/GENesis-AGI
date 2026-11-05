@@ -765,6 +765,77 @@ jobs:
         # mocked-turn opt-in cases, measured on the PR's runner, 552 -> 563.
         run: python scripts/check_skip_ceiling.py junit.xml --ceiling 563
 
+  test-ubuntu-2404:
+    # ubuntu-latest is moving to 26.04, so `test` alone stops showing a break on
+    # 24.04, the OS the README recommends. These are the files that broke in that
+    # move (coreutils, sudo, bash, the system Python, systemd's wording, /tmp on
+    # its own filesystem) plus the kill-after helper's own tests.
+    #
+    # GitHub does not require this job, but the local merge gate reads every check
+    # in the rollup, so red or pending here blocks a gated merge. That is intended:
+    # a real 24.04 break should stop a merge. For a change in the image itself,
+    # `# ci-override` clears it.
+    runs-on: ubuntu-24.04
+    # About 3 minutes on 26.04 with one test of test_shell_parse.py (run 41915594640,
+    # image-facts); its other tests add seconds. The failure mode bounded here is a
+    # hung test burning the 6h default job budget.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test,transcript-analytics]" -c .github/test-tools/requirements.txt
+      - name: Print the image's toolchain
+        # Settles from the log which tools a failure ran on, including after the
+        # image changes under this job.
+        run: |
+          set +e
+          sudo --version | head -1
+          for t in sudo sleep timeout stat; do echo "$t -> $(readlink -f "$(command -v "$t")")"; done
+          timeout --version | head -1
+          findmnt -T /tmp
+          findmnt -T "$HOME"
+          bash --version | head -1
+          /usr/bin/python3 -V
+          systemd-run --version | head -1
+      - name: Image-sensitive tests, temp on the home volume
+        run: >-
+          pytest -rfEs --basetemp="$HOME/pytest-home"
+          tests/test_scripts/test_gnu_timeout.py
+          tests/test_hooks/test_wrapper_option_arity.py
+          tests/test_hooks/test_shell_parse.py
+          tests/test_scripts/test_disk_hygiene_browser_engines.py
+          tests/test_scripts/test_pytest_lock_wait.py
+          tests/test_scripts/test_systemctl_fence.py
+          tests/test_payments/test_payments_test_vault.py
+          tests/test_scripts/test_watchgod_disk_guardian.py
+          tests/test_scripts/test_backup_backends.py
+          tests/test_scripts/test_cc_updater_suppression.py
+        env:
+          GENESIS_TESTING: "1"
+      - name: Temp on its own filesystem
+        # AWS runners and real hosts can give /tmp its own filesystem, which these
+        # files once assumed away. No job here can request an AWS runner, so this
+        # moves pytest's temp, a partial stand-in: /tmp itself stays on the root disk.
+        if: ${{ !cancelled() }}
+        run: |
+          sudo mkdir -p /mnt/tmpfs-test
+          sudo mount -t tmpfs -o size=6g,mode=1777 tmpfs /mnt/tmpfs-test
+          pytest -rfEs --basetemp=/mnt/tmpfs-test/bt \
+            tests/test_payments/test_payments_test_vault.py \
+            tests/test_scripts/test_watchgod_disk_guardian.py \
+            tests/test_scripts/test_disk_hygiene_browser_engines.py \
+            tests/test_scripts/test_gnu_timeout.py
+        env:
+          GENESIS_TESTING: "1"
+
   collected-floor:
     # Tests that stop being collected make the suite SMALLER, not red. This job
     # collects test ids twice in the same workspace, the PR tree and then the
