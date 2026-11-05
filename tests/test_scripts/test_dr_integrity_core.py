@@ -155,6 +155,7 @@ def _env(sb, **extra):
         "GENESIS_BACKUP_TIER2_BACKEND",
         "GENESIS_BACKUP_LOCAL_PATH",
         "GENESIS_PASSPHRASE_ESCROW",
+        "SECRETS_PATH",  # GENESIS_DIR names the secrets file, as on CI
     ):
         env.pop(k, None)
     env.update(
