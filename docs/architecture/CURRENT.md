@@ -271,9 +271,15 @@ engine has NO temporal types despite its own documentation listing them, and a
 loading engine answers `BusyLoadingError` — which is unavailable, never empty.
 Acceptance: 400 live roots replayed through both stores, 0 node-set differences.
 The FalkorDB projection is rebuilt hourly by `genesis-graph-project.timer`
-(`memory/graphstore_project.py`); that schedule is its staleness bound, and an
-engine restart leaves no projection until the next run (the engine keeps no data
-on disk). Before the swap, the projector runs the callers' own traversal and
+(`memory/graphstore_project.py`); that schedule is its staleness bound. The
+engine keeps no data on disk, so its unit also (re)starts the projector on
+every start, restarts included; a projection already running against the
+engine that just died is stopped and run again (`ExecStartPost`, issue #3035): a restarted engine is
+re-projected at once instead of serving fallbacks until the next hourly run.
+After a restart each process's next read finds its pooled connection closed;
+`graphstore_falkor._read` retries that one READ once inside the same deadline
+(MEASURED: the failure takes about 1 ms and the retry answers), and the row
+records `retried`, which breaks the cutover clock like any other failure. Before the swap, the projector runs the callers' own traversal and
 marker queries on the new graph (`graphstore_falkor._WARM_TRAVERSALS`) and prints
 the outcome (`warm-up: ...`) in the unit's journal. Engine time for the first
 read of a freshly projected graph was 52-358 ms where later reads took 1-3.5 ms,
@@ -305,7 +311,7 @@ frames put the wait in (`construct`, `connect` or `reply`; a row from before the
 connection reading prints `unknown` unless its frames alone name the leg). Rows carry `primary_ms`, a latency spread of answered traversals per store, and
 the report prints each reset's cause. The engine unit keeps its own record of
 slow moments (`--slowlog-max-len 4096`, `--latency-monitor-threshold 100`).
-A call's first fallback, selection failure or error is also written as
+A call's first fallback, retry, selection failure or error is also written as
 its own row the moment it happens, so a process killed mid-request cannot lose the
 evidence that the clock broke. A row that fails to write is carried as
 `prior_write_failures` on the next row and appended to
@@ -2060,8 +2066,11 @@ verified: 25f3ad876 2026-11-03
   delete-first never wait; early relief waits only while the pool stays above
   its reserve until the window opens. `any` restores immediate scheduling.
   With the window enabled, each routine deletion rechecks the live clock
-  after reserving its cooldown;
-  a failed deletion stops the batch. Read-only attempts use
+  after reserving its cooldown and waits the 5-minute settle since the last
+  action, so a window pass deletes one snapshot and the next pass continues.
+  A deletion whose outcome is uncertain (timeout, failed re-list) stops the
+  batch; one that definitely failed is skipped (the next candidate goes
+  without a settle) and is named in a warning after the window. Read-only attempts use
   `.last_window_attempt` for retry pacing and do not stamp pool relief's
   `last_action`; only actual deletion candidates reserve that shared cooldown.
   A window closing during stamp IO may leave a conservative cooldown without
@@ -3778,7 +3787,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
-          env.py, _config_overlay.py, caller_context.py]
+          env.py, _config_overlay.py, caller_context.py, caller_credentials.py]
 verified: 973a0e6 2026-10-30
 ```
 
@@ -3941,6 +3950,14 @@ Refusing a proposed update preserves a previously valid opt-in.
   is declared only at startup — a live server meeting `SQLITE_CORRUPT` does
   not trip it (the 2026-09-18 log-storm class). Both land with the runtime
   corruption trip.
+- **db/ request ownership (internal prerequisite, not activated):**
+  `RequestDatabase` supplies a stable facade with one fresh physical connection
+  per independent unit, bounded admission, retained cancellation cleanup and
+  cursor closure. It preserves explicit CRUD commits and refuses expired scopes;
+  it does not provide whole-tool atomicity. Existing MCP initialization still
+  uses its legacy connection. Service integration and detached-writer ownership
+  are separate prerequisites before shared activation. See
+  `docs/reference/request-database.md` for lifecycle and failure semantics.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Every
   statement through a `SerializedConnection` (its cursors' row fetches too),

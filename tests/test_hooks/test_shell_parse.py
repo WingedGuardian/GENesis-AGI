@@ -2491,7 +2491,8 @@ def test_quoted_message_idiom_exemption_needs_the_opener_at_the_top_of_it(
              "GIT_CEILING_DIRECTORIES": str(sandbox)},
         cwd=str(sandbox / "work"), capture_output=True, text=True, timeout=30,
     ).stdout
-    assert "\nEOF\n ) " + _HD_G in out  # bash runs it after the subshell
+    # bash runs it after the subshell; 5.3 prints that separator as `);`, 5.2 as `)`
+    assert "\nEOF\n ) " + _HD_G in out or "\nEOF\n ); " + _HD_G in out
 
 
 @pytest.mark.parametrize(

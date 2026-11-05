@@ -32,6 +32,7 @@ from tests.test_scripts._live_repair_world import (
     TO_FILES,
     Killed,
     World,
+    _aged,
     _ancestor_file,
     _deep_desc,
     _dir_becomes_file,
@@ -381,16 +382,6 @@ def _hold(path: Path) -> int:
     fd = os.open(path, os.O_RDWR | os.O_CREAT)
     fcntl.flock(fd, fcntl.LOCK_EX)
     return fd
-
-
-def _aged(path: Path) -> None:
-    """A lock left by an EARLIER kill: older than LOCK_FRESH_S. A lock made a
-    moment ago is fresh, and wherever this user runs a process whose fds cannot
-    be read (a CI runner, a systemd-user install; pytest's PID namespace hides
-    them locally) a fresh lock counts as held."""
-    if path.exists():
-        old = time.time() - 3600
-        os.utime(path, (old, old))
 
 
 def _no_git(monkeypatch):
@@ -1399,11 +1390,14 @@ def test_r4_a_fresh_ref_lock_is_waited_for_never_left_behind(w, mod, tmp_path, m
     monkeypatch.setattr(mod, "_now", clock.now)
     monkeypatch.setattr(mod, "_sleep", clock.sleep)
     head_lock = w.root / ".git" / "HEAD.lock"
+    ref_lock = w.root / ".git" / "refs" / "heads" / "live.lock"
+    for lock in (head_lock, ref_lock):
+        os.utime(lock)  # this test is about a fresh lock; the kill helper ages them
     try:
         assert mod.Repair(str(w.state), str(w.root), True, 0).run() == 1
         assert w.state.exists() and head_lock.exists() and w.backups() == []
         old = time.time() - 2 * mod.LOCK_FRESH_S
-        for lock in (head_lock, w.root / ".git" / "refs" / "heads" / "live.lock"):
+        for lock in (head_lock, ref_lock):
             os.utime(lock, (old, old))
         assert mod.Repair(str(w.state), str(w.root), True, 0).run() == 0
     finally:

@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -206,6 +207,23 @@ def tag_snapshot() -> dict[str, bytes | str]:
     return nodes
 
 
+def _age_locks(root: Path) -> None:
+    """Every lock a kill left is an earlier kill's. Without this, each test that
+    repairs one waits out LOCK_FRESH_S in real time wherever a fresh lock counts as
+    held (see `_aged`): about 30 s per test and 30 minutes of a CI run."""
+    for lock in (root / ".git").rglob("*.lock"):
+        _aged(lock)
+
+
+def _aged(path: Path) -> None:
+    """A lock left by an EARLIER kill: older than LOCK_FRESH_S. A lock made a
+    moment ago is fresh, and wherever this user runs a process whose fds cannot
+    be read (a CI runner, a systemd-user install) a fresh lock counts as held."""
+    if path.exists():
+        old = time.time() - 3600
+        os.utime(path, (old, old))
+
+
 def kill_switch(root: Path, target: str, victim: str) -> None:
     """A real `git switch -C live <target>`, SIGKILLed by a smudge filter while it
     writes ``victim``: what git wrote before it is on disk, HEAD, `live` and the
@@ -224,6 +242,7 @@ def kill_switch(root: Path, target: str, victim: str) -> None:
     assert r.returncode != 0, "the switch was not killed"
     (info / "attributes").unlink()
     _git(root, "config", "--remove-section", "filter.killer")
+    _age_locks(root)
 
 
 def kill_prepared(root: Path, target: str) -> None:
@@ -240,6 +259,7 @@ def kill_prepared(root: Path, target: str) -> None:
     )
     hook.unlink()
     assert r.returncode != 0, "the switch was not killed"
+    _age_locks(root)
 
 
 def killed_tag_side(w: World, victim: str) -> None:
