@@ -114,6 +114,9 @@ HOOK_SURFACE_FILES = frozenset(
         "scripts/review_late.py",
         "scripts/review_deadline.py",
         "scripts/external_review.py",
+        # The issue premise gate: an Action script that hooks/issue_premise_gate.py
+        # imports, so its rule decides a block.
+        "scripts/premise_gate.py",
         ".claude/settings.json",
         "scripts/behavioral_linter.py",
         "scripts/check_stale_pending.py",

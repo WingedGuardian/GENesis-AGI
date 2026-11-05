@@ -40,6 +40,8 @@ if _WORKTREE_SRC.is_dir():
 
 import contextlib  # noqa: E402
 import os  # noqa: E402
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
 
 import aiosqlite  # noqa: E402
 import pytest  # noqa: E402
@@ -638,6 +640,19 @@ def _isolate_alert_queue(tmp_path):
     mp.undo()
 
 
+# ── Determinism: a launcher's systemd-run option probe is not a process to count ─
+@pytest.fixture(autouse=True)
+def _no_systemd_run_option_probe():
+    """``literal_scope_args`` asks ``systemd-run`` for every scope a launcher builds,
+    which tests counting that launcher's processes would see, and it would make what
+    they build depend on the machine. Answers as an older systemd would, so no option is
+    added. Its own tests call the real function. Fixture-owned ``MonkeyPatch``, as above."""
+    mp = pytest.MonkeyPatch()
+    mp.setattr("genesis.util.systemd._systemd_run_refuses_literal_arguments", lambda: True)
+    yield
+    mp.undo()
+
+
 # ── Safety: prevent tests from moving files into the REAL trash ─────────────
 @pytest.fixture(autouse=True)
 def _isolate_trash_root(tmp_path):
@@ -947,6 +962,30 @@ def _guard_db_crud_not_mocked():
             "or `with patch(...)` so the patch is restored, or set the mock on a "
             "local mock object — never assign to the real module attribute."
         )
+
+
+@contextlib.contextmanager
+def process_running_as(path):
+    """A live process whose ``/proc/<pid>/exe`` is ``path``, killed on exit.
+
+    The stand-in is a copy of bash, never of a coreutil: on Ubuntu 26.04 those are
+    one multicall binary that picks its applet from the executable's name, so a
+    copy of ``sleep`` under another name exits at once and a test watching for it
+    passes or fails on a process that is already gone. The handshake is the proof
+    that this one got as far as running.
+    """
+    shutil.copy2(shutil.which("bash"), path)
+    with subprocess.Popen(
+        [str(path), "-c", "echo ready; read -t 30"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    ) as proc:
+        try:
+            assert proc.stdout.readline() == b"ready\n", f"{path} did not stay running"
+            assert os.path.realpath(f"/proc/{proc.pid}/exe") == os.path.realpath(path)
+            yield proc
+        finally:
+            proc.kill()
 
 
 def private_module(name: str, path):
