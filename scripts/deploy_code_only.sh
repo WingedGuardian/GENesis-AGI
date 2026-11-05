@@ -420,6 +420,10 @@ case "$_live_rc" in
         die "cannot tell whether $GENESIS_ROOT is on the live branch the deploy manifest builds (the manifest or git could not be read). Nothing was deployed."
         ;;
 esac
+# After the branch check, on purpose: anything sourced before it runs first, so a
+# candidate editing it could switch the refusal off.
+# shellcheck source=scripts/lib/gnu_timeout.sh
+. "$_SELF_DIR/lib/gnu_timeout.sh"
 # Unreadable refuses (see genesis_tracked_dirty_paths for why it is read apart).
 _dirty="$(genesis_tracked_dirty_paths "$GENESIS_ROOT")" \
     || die "cannot read the working tree's status — nothing was deployed."

@@ -31,6 +31,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_scripts._update_source import update_text
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE = REPO_ROOT / "scripts" / "update.sh"
 VENV_SETUP = REPO_ROOT / "scripts" / "lib" / "venv_setup.sh"
@@ -705,7 +707,7 @@ def test_a_vcs_install_is_recorded_with_its_commit(setup):
 
 
 def _block(marker: str) -> str:
-    m = re.search(rf"# BEGIN {marker}[^\n]*\n(.*?)# END {marker}", UPDATE.read_text(), re.DOTALL)
+    m = re.search(rf"# BEGIN {marker}[^\n]*\n(.*?)# END {marker}", update_text(), re.DOTALL)
     assert m, marker
     return m.group(1)
 
@@ -860,7 +862,7 @@ def test_disk_hygiene_ages_out_records_helper_copies_and_leftovers(tmp_path):
 
 
 def _record_fn() -> str:
-    text = UPDATE.read_text()
+    text = update_text()
     start = text.index("_record_update_history() {")
     return text[start : text.index("\n}\n", start) + 3]
 

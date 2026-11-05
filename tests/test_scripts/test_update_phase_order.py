@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_scripts._update_source import update_text
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE_SH = REPO_ROOT / "scripts" / "update.sh"
 
@@ -46,7 +48,7 @@ FETCHING_MARKER = '\n_write_state "fetching"'
 
 @pytest.fixture(scope="module")
 def text() -> str:
-    return UPDATE_SH.read_text()
+    return update_text()
 
 
 def _idx(text: str, marker: str) -> int:
@@ -159,5 +161,6 @@ def test_sync_deploy_targets_still_two_bare_calls(text):
 
 def test_update_sh_syntax_ok():
     """bash -n must pass after the reorder."""
-    r = subprocess.run(["bash", "-n", str(UPDATE_SH)], capture_output=True, text=True, timeout=30)
-    assert r.returncode == 0, r.stderr
+    for script in (UPDATE_SH, UPDATE_SH.parent / "lib" / "update_rollback.sh"):
+        r = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True, timeout=30)
+        assert r.returncode == 0, r.stderr

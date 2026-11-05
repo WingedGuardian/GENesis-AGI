@@ -139,7 +139,7 @@ the procedure (step 5).
 
    `cc_shadow_scan` matters here because a second nvm/native/user-prefix copy on a different
    interactive PATH has bitten this project repeatedly — without it the whole soak can exercise a
-   stale shadow binary while the same-shell version check passes. (`update.sh:477-488` pairs the
+   stale shadow binary while the same-shell version check passes. (`update.sh`, beside its `cc_align_host_sync` call, pairs the
    two the same way, but `unset`s `CC_VERSION` first so both run on the pin.)
    `cc_ensure_local` is **container-only**, so the host stays on the pin — a live rollback path.
 
@@ -153,7 +153,7 @@ the procedure (step 5).
      `node -v`. **If the floor rises above the container's Node, STOP: there is no container-side
      Node transition tool today.** Every `NODE_MAJOR` consumer is either a CI assertion
      (`check_cc_node_lockstep.py`) or a dispatch to the **host** via the guardian `update-node` op
-     (`update.sh:441`, `cc_align_host.sh`); the only container-side Node installer
+     (`cc_align_host_sync` in `scripts/lib/cc_version.sh`, called by `update.sh` and `cc_align_host.sh`); the only container-side Node installer
      (`install.sh:473-477` `_node_version_ok`) gates on a hardcoded `>= 20` and never reads
      `NODE_MAJOR`. Treat a rising floor as prerequisite work, not something to improvise here.
    - **A failed align is NOT a clean no-op.** `cc_ensure_local` runs `npm install -g` and only
