@@ -104,8 +104,11 @@
 # or if the read does not finish, the holders are the ones the stat above
 # found, with unknown identity and control bytes removed from their names.
 #
-# Pure functions; nothing runs at source time. DG_PROC (default /proc) lets the
-# tests point the walk at a fake process table.
+# Pure functions; at source time it only loads gnu_timeout.sh. DG_PROC (default
+# /proc) lets the tests point the walk at a fake process table.
+
+# shellcheck source=scripts/lib/gnu_timeout.sh
+. "$(dirname "${BASH_SOURCE[0]}")/gnu_timeout.sh"
 
 DG_RUNAWAY_PCT=25
 DG_RUNAWAY_RATE_PCT=5
