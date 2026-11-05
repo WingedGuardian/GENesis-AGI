@@ -116,7 +116,7 @@ done""",
         _stub(self.bin / "sudo", f'echo "sudo $*" >> {self.calls}\n[ "{works}" = True ]')
 
     def run(self, script: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-        for tool in ("ln", "rm", "mkdir", "mktemp", "cat", "chmod", "grep", "sh", "readlink", "sed", "sort", "head", "tail", "date"):
+        for tool in ("ln", "rm", "mkdir", "mktemp", "cat", "chmod", "grep", "sh", "readlink", "sed", "sort", "head", "tail", "date", "timeout"):
             link = self.bin / tool
             if not link.exists():
                 link.symlink_to(f"/usr/bin/{tool}")
@@ -585,15 +585,92 @@ def test_a_venv_built_on_a_versioned_path_is_moved_too(host, tmp_path):
     assert "GENESIS_UV_PYTHON_MOVED=Python 3.12.1 to Python 3.12.2\n" in done.stdout
 
 
-def test_a_venv_with_a_copied_interpreter_is_reported_and_not_rewritten(host, tmp_path):
+def test_a_venv_made_through_python3_is_moved_too(host, tmp_path):
+    """`python3 -m venv` puts the absolute link on python3, with python and python3.12
+    pointing at it, so re-pointing only python3.12 would change nothing that runs."""
     host.fake_uv(host.bin / "uv", upgrade_moves=True)
     venv = tmp_path / "venv"
     (venv / "bin").mkdir(parents=True)
-    (venv / "bin" / "python").symlink_to(host.managed / "p1" / "bin" / "python3.12")
+    (venv / "bin" / "python3").symlink_to(host.managed / "p1" / "bin" / "python3.12")
+    (venv / "bin" / "python").symlink_to("python3")
+    (venv / "bin" / "python3.12").symlink_to("python3")
+    (venv / "pyvenv.cfg").write_text(f"version = 3.12.1\nexecutable = {host.managed / 'p1' / 'bin' / 'python3.12'}\n")
+    done = _upgrade(host, venv)
+    assert done.returncode == 0, done.stderr
+    assert (venv / "bin" / "python").resolve() == host.managed / "p2" / "bin" / "python3.12"
+    assert "GENESIS_UV_PYTHON_MOVED=Python 3.12.1 to Python 3.12.2\n" in done.stdout
+
+
+def test_a_venv_that_cannot_be_re_pointed_is_reported_and_its_record_left_true(host, tmp_path):
+    """A relative link out of the venv is not one this rewrites. Writing the new patch
+    into the record while the old one runs would be worse than doing nothing."""
+    host.fake_uv(host.bin / "uv", upgrade_moves=True)
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").symlink_to("../../uv-managed/p1/bin/python3.12")
     (venv / "pyvenv.cfg").write_text("version = 3.12.1\n")
     done = _upgrade(host, venv)
     assert done.returncode != 0
-    assert "is not a symlink" in done.stdout
+    assert "still runs" in done.stdout
+    assert "-m venv" not in host.logged()
+    assert (venv / "pyvenv.cfg").read_text() == "version = 3.12.1\n"
+
+
+def test_a_stale_version_alone_is_repaired(host, tmp_path):
+    """Otherwise the same move is reported on every update."""
+    host.fake_uv(host.bin / "uv")
+    venv = _uv_venv(host, tmp_path / "venv")
+    (venv / "pyvenv.cfg").write_text(f"version = 3.12.0\nexecutable = {host.uv_python.resolve()}\n")
+    assert _upgrade(host, venv).returncode == 0
+    assert "-m venv --upgrade" in host.logged()
+    assert "GENESIS_UV_PYTHON_MOVED=\n" in _upgrade(host, venv).stdout
+
+
+def test_a_system_site_setting_survives_the_repair(host, tmp_path):
+    host.fake_uv(host.bin / "uv", upgrade_moves=True)
+    venv = _uv_venv(host, tmp_path / "venv")
+    cfg = venv / "pyvenv.cfg"
+    cfg.write_text(cfg.read_text() + "include-system-site-packages = true\n")
+    assert _upgrade(host, venv).returncode == 0
+    assert "--upgrade --without-pip --system-site-packages" in host.logged()
+
+
+def test_a_uv_that_cannot_name_its_directory_is_reported(host, tmp_path):
+    """Doubt, not "nothing to do": on a uv Python this would stop patching silently."""
+    uv = host.fake_uv(host.bin / "uv")
+    uv.write_text(uv.read_text().replace('case "$2" in', '[ "$2" = dir ] && exit 3\ncase "$2" in'))
+    done = _upgrade(host, _uv_venv(host, tmp_path / "venv"))
+    assert done.returncode != 0
+    assert "uv python dir failed" in done.stdout
+
+
+def test_uv_calls_that_download_are_bounded(host, tmp_path):
+    """The server is stopped while this runs, so a stalled call is an outage."""
+    uv = host.fake_uv(host.bin / "uv", version="0.1.0")
+    uv.write_text(uv.read_text().replace('case "$2" in', '[ "$2" = upgrade ] && sleep 30\ncase "$2" in'))
+    (host.bin / "sleep").symlink_to("/usr/bin/sleep")
+    done = _upgrade(host, _uv_venv(host, tmp_path / "venv"), setup="GENESIS_UV_TIMEOUT_S=1")
+    assert done.returncode != 0
+    assert "GENESIS_UV_PYTHON_ERROR=" in done.stdout
+
+
+def test_a_venv_python_that_cannot_run_is_reported(host, tmp_path):
+    host.fake_uv(host.bin / "uv")
+    _stub(host.managed / "broken" / "bin" / "python3.12", "exit 1")
+    done = _upgrade(host, _uv_venv(host, tmp_path / "venv", through=host.managed / "broken" / "bin" / "python3.12"))
+    assert done.returncode != 0
+    assert "could not report its version" in done.stdout
+    assert "upgrade" not in host.logged()
+
+
+def test_a_link_that_cannot_be_rewritten_is_reported(host, tmp_path):
+    host.fake_uv(host.bin / "uv", upgrade_moves=True)
+    # Only the venv's links: the fake uv moves its patch with ln too.
+    _stub(host.bin / "ln", 'case "$3" in */venv/*) exit 1 ;; esac\nexec /usr/bin/ln "$@"')
+    venv = _uv_venv(host, tmp_path / "venv", through=host.managed / "p1" / "bin" / "python3.12")
+    done = _upgrade(host, venv)
+    assert done.returncode != 0
+    assert "could not re-point" in done.stdout
     assert "-m venv" not in host.logged()
 
 

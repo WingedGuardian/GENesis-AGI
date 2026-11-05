@@ -13,6 +13,10 @@
 GENESIS_UV_VERSION="0.13.7"
 GENESIS_UV_PINNED_ON="2026-11-05"
 GENESIS_UV_PIN_MAX_AGE_DAYS=120
+# update.sh has the server stopped while bootstrap runs, and uv's own timeout only
+# bounds the gap between reads, so a download that keeps trickling would otherwise
+# hold the server down. A patch is about 30 MB. On timeout the update carries on.
+GENESIS_UV_TIMEOUT_S=600
 
 # True when a venv is about to be created and $2 is newer than what CI tests.
 # Mirrors the "create or recreate" test both callers apply to the venv, so a
@@ -79,7 +83,7 @@ _genesis_uv_to_pin() {
     have="${have%% *}"
     [ -n "$have" ] && [ "$have" != "$GENESIS_UV_VERSION" ] || return 0
     [ "$(printf '%s\n%s\n' "$have" "$GENESIS_UV_VERSION" | sort -V | head -n 1)" = "$have" ] || return 0
-    if UV_NO_MODIFY_PATH=1 "$uv_bin" self update "$GENESIS_UV_VERSION" --quiet >/dev/null 2>&1; then
+    if UV_NO_MODIFY_PATH=1 timeout -k 10 "$GENESIS_UV_TIMEOUT_S" "$uv_bin" self update "$GENESIS_UV_VERSION" --quiet >/dev/null 2>&1; then
         GENESIS_UV_MOVED="$have to $GENESIS_UV_VERSION"
     else
         GENESIS_UV_BEHIND="$have"
@@ -97,11 +101,16 @@ _genesis_uv_to_pin() {
 #   GENESIS_UV_PIN_STALE     1, when the pin has aged past GENESIS_UV_PIN_MAX_AGE_DAYS
 #   GENESIS_UV_PYTHON_ERROR  uv's last line, when this returns non-zero
 genesis_upgrade_uv_python() {
-    local venv="$1" uv_bin managed real was minor out target target_real now
+    local venv="$1" uv_bin managed real was minor out target target_real now name
+    local -a upgrade=(--upgrade --without-pip)
     GENESIS_UV_PYTHON_MOVED="" GENESIS_UV_MOVED="" GENESIS_UV_BEHIND="" GENESIS_UV_PIN_STALE="" GENESIS_UV_PYTHON_ERROR=""
     [ -x "$venv/bin/python" ] || return 0
     uv_bin="$(command -v uv 2>/dev/null || echo "$HOME/.local/bin/uv")"
-    managed="$("$uv_bin" python dir 2>/dev/null)" || return 0
+    [ -x "$uv_bin" ] || return 0
+    if ! managed="$("$uv_bin" python dir 2>/dev/null)"; then
+        GENESIS_UV_PYTHON_ERROR="uv python dir failed, so this could not tell whether the venv runs on uv's Python"
+        return 1
+    fi
     # Checked after canonicalising: readlink answers nothing for a missing parent, and
     # an empty directory here would make every path below look managed.
     managed="$(readlink -f "$managed")"
@@ -111,12 +120,15 @@ genesis_upgrade_uv_python() {
         "$managed"/*) ;;
         *) return 0 ;;
     esac
-    minor="$("$venv/bin/python" -c "import sys; print('.'.join(map(str, sys.version_info[:2])))")" || return 1
+    if ! minor="$("$venv/bin/python" -c "import sys; print('.'.join(map(str, sys.version_info[:2])))")"; then
+        GENESIS_UV_PYTHON_ERROR="$venv/bin/python could not report its version"
+        return 1
+    fi
     _genesis_uv_to_pin "$uv_bin"
     if [ "$(( ($(date +%s) - $(date -d "$GENESIS_UV_PINNED_ON" +%s)) / 86400 ))" -gt "$GENESIS_UV_PIN_MAX_AGE_DAYS" ]; then
         GENESIS_UV_PIN_STALE=1
     fi
-    if ! out="$("$uv_bin" python upgrade "$minor" 2>&1)"; then
+    if ! out="$(timeout -k 10 "$GENESIS_UV_TIMEOUT_S" "$uv_bin" python upgrade "$minor" 2>&1)"; then
         GENESIS_UV_PYTHON_ERROR="$(printf '%s\n' "$out" | tail -n 1)"
         return 1
     fi
@@ -137,19 +149,34 @@ genesis_upgrade_uv_python() {
     # process runs. Compared on every run, so a repair that failed last time is retried.
     was="$(sed -n 's/^version = //p' "$venv/pyvenv.cfg" 2>/dev/null)"
     if [ "$(readlink -f "$venv/bin/python")" != "$target_real" ] \
-        || [ "$(readlink -f "$(sed -n 's/^executable = //p' "$venv/pyvenv.cfg" 2>/dev/null)")" != "$target_real" ]; then
+        || [ "$(readlink -f "$(sed -n 's/^executable = //p' "$venv/pyvenv.cfg" 2>/dev/null)")" != "$target_real" ] \
+        || [ "Python $was" != "$("$venv/bin/python" --version 2>&1)" ]; then
         # A venv built on a versioned path does not follow uv's upgrade, and --upgrade
-        # rewrites the record without re-pointing it (measured). So re-point it first.
-        if [ "$(readlink -f "$venv/bin/python")" != "$target_real" ]; then
-            if [ ! -L "$venv/bin/python$minor" ]; then
-                GENESIS_UV_PYTHON_ERROR="$venv/bin/python$minor is not a symlink"
-                return 1
+        # rewrites the record without re-pointing it (measured). Which name holds the
+        # absolute link depends on how the venv was made, so check all three.
+        for name in python python3 "python$minor"; do
+            if [ -L "$venv/bin/$name" ]; then
+                case "$(readlink "$venv/bin/$name")" in
+                    /*)
+                        if ! ln -sfn "$target" "$venv/bin/$name"; then
+                            GENESIS_UV_PYTHON_ERROR="could not re-point $venv/bin/$name"
+                            return 1
+                        fi
+                        ;;
+                esac
             fi
-            ln -sfn "$target" "$venv/bin/python$minor" || return 1
+        done
+        if [ "$(readlink -f "$venv/bin/python")" != "$target_real" ]; then
+            GENESIS_UV_PYTHON_ERROR="$venv/bin/python still runs $(readlink -f "$venv/bin/python")"
+            return 1
         fi
         # --without-pip: otherwise this also moves pip, which a rollback then has to
-        # fetch, and an outage is a likely reason for the rollback.
-        if ! out="$("$target" -m venv --upgrade --without-pip "$venv" 2>&1)"; then
+        # fetch, and an outage is a likely reason for the rollback. --upgrade resets
+        # this setting unless it is passed again.
+        if grep -q '^include-system-site-packages = true' "$venv/pyvenv.cfg" 2>/dev/null; then
+            upgrade+=(--system-site-packages)
+        fi
+        if ! out="$("$target" -m venv "${upgrade[@]}" "$venv" 2>&1)"; then
             GENESIS_UV_PYTHON_ERROR="$(printf '%s\n' "$out" | tail -n 1)"
             return 1
         fi
