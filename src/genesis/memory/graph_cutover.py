@@ -17,6 +17,8 @@ fallback, on a live install, where every traversal was on record. Concretely:
 Counting is an ALLOWLIST: ``primary`` is traffic, ``cancelled`` is neutral (the
 caller gave up; its count and share are always reported), and every other
 outcome, including one this module has never heard of, restarts the clock.
+``retried`` (a read that answered only after retrying a connection the engine
+dropped, #3035) is one of those: a retry spares the caller, not the clock.
 
 Pure: no I/O. ``scripts/graph_cutover_report.py`` reads the rows and prints this.
 """
