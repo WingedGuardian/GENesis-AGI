@@ -5,6 +5,9 @@
 # inbox_monitor.sync_remote (config/inbox_monitor.yaml + the local overlay);
 # when it is empty the sync is off and each run exits at once.
 #
+# What a pull replaces or removes goes to the Genesis trash, so a wrong watch_path
+# or an emptied vault can be undone.
+#
 # Every configured run writes a heartbeat ($GENESIS_HOME/state/inbox_sync.json:
 # last_run, last_ok, held). The awareness loop alerts when last_ok goes stale,
 # so a sync that stops running, or keeps failing, is noticed.
@@ -56,9 +59,16 @@ if [ -z "$REMOTE" ]; then
     # caller that is NOT the systemd timer (no INVOCATION_ID, e.g. an old
     # crontab line) means someone expects this to sync. That happens when an
     # install that synced from cron updates before setting sync_remote, and
-    # it would otherwise stop syncing in silence.
+    # it would otherwise stop syncing in silence: the log line is for the reader,
+    # and the heartbeat marker raises an alert (inbox/sync_health.py).
     if [ -z "${INVOCATION_ID:-}" ]; then
         echo "--- $(_stamp) NOT SYNCING: inbox_monitor.sync_remote is empty, but this run did not come from genesis-inbox-sync.timer (a crontab line?). Set sync_remote in ~/.genesis/config/inbox_monitor.local.yaml to resume the sync. ---" >> "$LOG"
+        if [ -n "$HEARTBEAT" ]; then
+            mkdir -p "$(dirname "$HEARTBEAT")"
+            rm -f -- "$HEARTBEAT.tmp"
+            printf '{"unconfigured_caller": "%s"}\n' "$(_stamp)" > "$HEARTBEAT.tmp" \
+                && mv -fT -- "$HEARTBEAT.tmp" "$HEARTBEAT"
+        fi
     fi
     exit 0
 fi
@@ -83,7 +93,7 @@ mkdir -p "$LOCAL_PATH"
 # genesis.trash below must use the home the config reader resolved.
 export GENESIS_HOME="$CFG_HOME"
 
-# Single-flight: an API outage can stretch a cycle past the 5-min cron period
+# Single-flight: an API outage can stretch a cycle past the 5-min timer period
 # (rclone retries); overlapping runs would interleave deletions and log lines.
 exec 9>"$LOG.lock"
 if ! flock -n 9; then
@@ -114,14 +124,30 @@ _shown() {
     #    would otherwise be mirrored over it (MEASURED, rclone 1.60).
     #    --one-file-system: a directory mounted under the inbox is not part of
     #    the mirror, and without this its files are deleted (MEASURED, 1.60).
+    #    --backup-dir: what the mirror replaces or removes is saved, then moved to
+    #    the Genesis trash below. A mirror deletes whatever the vault lacks, so
+    #    this is what makes a wrong watch_path or an emptied vault recoverable.
+    SAVE_ROOT="$CFG_HOME/state/inbox-pull-saved"
     rclone sync "$REMOTE" "$LOCAL_PATH" \
         --one-file-system \
+        --backup-dir "$SAVE_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-$$" \
         --exclude "*.genesis.md" \
         --exclude ".genesis-*" \
         --exclude ".genesis-*/**" \
         --verbose 2>&1
     pull_rc=$?
     [ "$pull_rc" -ne 0 ] && echo "Pull failed (rc=$pull_rc); new notes did not arrive this cycle"
+    # Every saved folder, so one the trash refused last cycle is retried. A refusal
+    # leaves it in place, still recoverable, and the cycle reads not ok.
+    SAVE_OK=1
+    while IFS= read -r -d '' saved; do
+        if trash_out=$("$PYTHON" -m genesis.trash put --reason "inbox_sync: a vault pull replaced or removed these files" -- "$saved" 2>&1); then
+            echo "Pull replaced or removed local files; the old copies are in the Genesis trash ($(_shown "${saved##*/}"))"
+        else
+            SAVE_OK=""
+            echo "WARNING: the trash refused what the pull saved; kept at $(_shown "$saved") and retried next cycle: $(_shown "$trash_out")"
+        fi
+    done < <(find "$SAVE_ROOT" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
 
     # 2. Detect user-deleted .genesis.md files, at any depth.
     #    A local response is a USER DELETION only if a previous healthy listing
@@ -229,7 +255,7 @@ _shown() {
             # -H: follow the inbox root itself when it is a symlink (find does
             # not by default, and the walk would then see nothing), but no
             # symlink below it.
-            done < <(find -H "$LOCAL_PATH" -mindepth 1 -name '.*' -prune -o -type f -name '*.genesis.md' -print0)
+            done < <(find -H "$LOCAL_PATH" -xdev -mindepth 1 -name '.*' -prune -o -type f -name '*.genesis.md' -print0)
             echo "Cleanup pass: vault listing $remote_count response file(s), cleaned $cleaned, held $held, kept $kept_unseen never-listed (will push)"
         else
             echo "Cleanup pass: no usable vault record yet — seeding it from this listing ($remote_count response file(s)); nothing cleaned this cycle"
@@ -256,13 +282,18 @@ _shown() {
             elif [ "$(printf '%s\n' "$record_lines" | head -n 1)" = "$RECORD_HEADER" ]; then
                 PUSH_EXCLUDE=$(printf '%s\n' "$record_lines" | tail -n +2)
             fi
+        elif [ -e "$SEEN" ] || [ -L "$SEEN" ]; then
+            PUSH_HOLD=1
+            echo "WARNING: the vault record is not a regular file ($(_shown "$SEEN")), so nothing can tell a vault deletion from a new response: holding the push this cycle"
         fi
     fi
 
     # 3. Push: local .genesis.md files → Dropbox (responses back to vault).
-    #    --ignore-existing: responses are write-once, so a vault copy is never
+    #    --ignore-existing: responses are write-once, so a vault copy is not
     #    overwritten (a response the user moved or kept in the vault wins over
-    #    a local file that happens to reuse its path).
+    #    a local file that happens to reuse its path). The exception is a
+    #    failed-listing cycle, where --max-age hides an older vault copy from
+    #    this check: a never-recorded young response at that path replaces it.
     #    On a failed-listing cycle PUSH_MAX_AGE gates this to fresh files only
     #    (see step 2) so a not-yet-cleaned deletion can't be re-uploaded.
     #    Every cycle excludes HELD and already-listed responses by name, and a
@@ -278,13 +309,13 @@ _shown() {
         push_rc=1
     elif {
         while IFS= read -r h; do
-            [ -n "$h" ] && printf -- '- %s\n' "$(_filter_literal "$h")"
+            [ -z "$h" ] || printf -- '- %s\n' "$(_filter_literal "$h")"
         done <<< "$HELD
 ${REMOTE_GENESIS:-}
-$PUSH_EXCLUDE"
-        printf '%s\n' '+ *.genesis.md' '- **'
+$PUSH_EXCLUDE" && printf '%s\n' '+ *.genesis.md' '- **'
     } > "$FILTER.tmp" && [ "$(tail -n 1 -- "$FILTER.tmp")" = '- **' ] && mv -fT -- "$FILTER.tmp" "$FILTER"; then
         rclone copy "$LOCAL_PATH" "$REMOTE" \
+            --one-file-system \
             --filter-from "$FILTER" \
             --ignore-existing \
             "${push_age[@]}" \
@@ -336,7 +367,7 @@ $PUSH_EXCLUDE"
     fi
 
     # 5. Heartbeat. "Ok" means the whole cycle worked: the pull, a healthy
-    #    listing, the push and the record. last_ok keeps its previous value when this cycle
+    #    trash move of what it saved, a healthy listing, the push and the record. last_ok keeps its previous value when this cycle
     #    was not ok, so a sync that runs but keeps failing goes stale too.
     #    held = responses the trash refused this cycle (alerted on while
     #    non-zero: a deletion that cannot apply). Written atomically.
@@ -350,7 +381,7 @@ $PUSH_EXCLUDE"
     # held is measured only on a healthy listing; a failed-listing cycle keeps
     # the previous count, so the held alert does not clear and re-fire.
     [ -n "$LISTING_OK" ] || held="${prev_held:-0}"
-    if [ "$pull_rc" -eq 0 ] && [ -n "$LISTING_OK" ] && [ "$push_rc" -eq 0 ] && [ -n "$RECORD_OK" ]; then
+    if [ "$pull_rc" -eq 0 ] && [ -n "$SAVE_OK" ] && [ -n "$LISTING_OK" ] && [ "$push_rc" -eq 0 ] && [ -n "$RECORD_OK" ]; then
         last_ok="$now"
     else
         listing_state="failed"
@@ -358,9 +389,12 @@ $PUSH_EXCLUDE"
         record_state="failed"
         [ -n "$RECORD_OK" ] && record_state="ok"
         [ -n "$LISTING_OK" ] || record_state="not written"
-        echo "Heartbeat: cycle not ok (pull rc=$pull_rc, listing $listing_state, push rc=$push_rc, record $record_state)"
+        save_state="ok"
+        [ -n "$SAVE_OK" ] || save_state="refused by the trash"
+        echo "Heartbeat: cycle not ok (pull rc=$pull_rc, saved files $save_state, listing $listing_state, push rc=$push_rc, record $record_state)"
     fi
     mkdir -p "$(dirname "$HEARTBEAT")"
+    rm -f -- "$HEARTBEAT.tmp"
     if printf '{"last_run": "%s", "last_ok": "%s", "held": %d}\n' "$now" "$last_ok" "${held:-0}" > "$HEARTBEAT.tmp" \
         && mv -fT -- "$HEARTBEAT.tmp" "$HEARTBEAT"; then
         :

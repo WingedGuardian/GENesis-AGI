@@ -241,3 +241,35 @@ def test_settings_validator_refuses_a_catastrophic_watch_path(fake_home):
     assert any("watch_path" in e for e in _validate_inbox_monitor({"watch_path": str(fake_home)}))
     assert any("watch_path" in e for e in _validate_inbox_monitor({"watch_path": "/"}))
     assert any("watch_path" in e for e in _validate_inbox_monitor({"watch_path": ""}))
+
+
+@pytest.mark.parametrize("rel", [".ssh", ".config/rclone", ".claude", "Documents/.private/inbox"])
+def test_hidden_folders_under_home_are_refused(fake_home, rel):
+    problem = sync_config.mirror_target_problem(fake_home / rel)
+    assert problem and "hidden" in problem
+    assert sync_config.mirror_target_problem(fake_home / rel, require_inside_home=False)
+
+
+@pytest.mark.parametrize("raw", ["inbox", "dropbox:foo", "-foo", "./inbox"])
+def test_a_relative_target_is_refused_from_any_directory(fake_home, monkeypatch, raw):
+    monkeypatch.chdir(fake_home)
+    assert sync_config.mirror_target_problem(Path(raw)) == "must be an absolute path"
+
+
+def test_cli_hands_the_script_the_resolved_inbox(monkeypatch, tmp_path, capsys):
+    """rclone measures --one-file-system from the path it is given."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    real = tmp_path / "real"
+    real.mkdir()
+    (tmp_path / "link").symlink_to(real)
+    monkeypatch.setattr(sync_config, "load_sync_settings", lambda: ("dropbox:v", tmp_path / "link"))
+    monkeypatch.setattr(sync_config, "heartbeat_path", lambda: tmp_path / "hb.json")
+    assert sync_config.main() == 0
+    assert f"watch_path={real.resolve()}" in capsys.readouterr().out.splitlines()
+
+
+def test_the_settings_validator_does_not_echo_a_refused_remote():
+    from genesis.mcp.health.settings import _validate_inbox_monitor
+
+    errors = _validate_inbox_monitor({"inbox_monitor": {"sync_remote": "bad remote tok3n"}})
+    assert errors and "tok3n" not in " ".join(errors)

@@ -1423,10 +1423,13 @@ verified: b0867170e 2026-10-02
   unless `inbox_monitor.sync_remote` names an rclone remote). It mirrors notes
   vault → inbox and pushes responses back. A local response is removed only
   when the vault was seen to hold it (`.genesis-seen-in-vault`, scoped to the
-  remote) and no longer does; removal goes to the Genesis trash. Each
+  remote) and no longer does; removal goes to the Genesis trash. What a pull
+  replaces or removes goes there too, through `--backup-dir`. Each
   configured run writes a heartbeat (`~/.genesis/state/inbox_sync.json`), and
-  `inbox/sync_health.py` raises an `infrastructure_alert` from the awareness
-  tick when it goes stale (30 min) or reports responses the trash refused.
+  `inbox/sync_health.py` raises one `infrastructure_alert` per outage from the
+  awareness tick when the heartbeat goes stale (30 min) or cannot be read, the
+  config is unusable, responses are held because the trash refused them, or a
+  caller other than the timer runs the sync with no remote set.
   `inbox/sync_config.py` is the one reader both sides share.
 - **recon/**: scheduled intelligence jobs (release watch, model intelligence
   Sun 8am, models.md synthesis Sun 10am, GitHub discovery, skill-security scan

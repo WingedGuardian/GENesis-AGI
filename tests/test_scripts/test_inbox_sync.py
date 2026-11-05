@@ -103,6 +103,16 @@ case "$1" in
     exit 0
     ;;
   sync)
+    # Stands in for rclone's --backup-dir: what the mirror would have removed.
+    if [ -n "${RCLONE_SYNC_SAVES:-}" ]; then
+      prev=""
+      for a in "$@"; do
+        if [ "$prev" = "--backup-dir" ]; then
+          mkdir -p "$a" && printf 'old\n' > "$a/$RCLONE_SYNC_SAVES"
+        fi
+        prev="$a"
+      done
+    fi
     exit "${RCLONE_SYNC_RC:-0}"
     ;;
 esac
@@ -968,3 +978,77 @@ def test_duplicate_config_keys_are_refused(tmp_path):
     assert _run(env).returncode == 1
     assert call_log.read_text() == ""
     assert "does not carry exactly one heartbeat= line" in log.read_text()
+
+
+def _saved_folders(env: dict) -> list[Path]:
+    root = Path(env["GENESIS_HOME"]) / "state" / "inbox-pull-saved"
+    return sorted(root.iterdir()) if root.exists() else []
+
+
+def _vault_config(env: dict, inbox: Path) -> None:
+    _write_config(env, inbox, _REMOTE)
+
+
+def test_what_the_pull_saves_goes_to_the_trash(tmp_path):
+    env, inbox, log, call_log = _setup(tmp_path)
+    _vault_config(env, inbox)
+    env["RCLONE_SYNC_SAVES"] = "note.md"
+
+    assert _run(env).returncode == 0
+    sync = next(c for c in call_log.read_text().splitlines() if c.startswith("rclone sync"))
+    assert "--backup-dir " + str(Path(env["GENESIS_HOME"]) / "state" / "inbox-pull-saved") in sync
+    assert "--one-file-system" in sync
+    assert _saved_folders(env) == []
+    assert len(_trash_entries(env)) == 1
+    assert "the old copies are in the Genesis trash" in log.read_text()
+    assert _heartbeat(env)["last_ok"]
+
+
+def test_a_refused_trash_keeps_what_the_pull_saved_and_the_cycle_is_not_ok(tmp_path):
+    env, inbox, log, call_log = _setup(tmp_path)
+    _vault_config(env, inbox)
+    env["RCLONE_SYNC_SAVES"] = "note.md"
+    _refuse_the_trash(env, tmp_path)
+
+    assert _run(env).returncode == 0
+    saved = _saved_folders(env)
+    assert len(saved) == 1 and (saved[0] / "note.md").read_text() == "old\n"
+    body = log.read_text()
+    assert "the trash refused what the pull saved" in body
+    assert "saved files refused by the trash" in body
+    assert not _heartbeat(env)["last_ok"]
+
+
+def test_a_record_that_is_not_a_regular_file_holds_the_push_on_a_failed_listing(tmp_path):
+    env, inbox, log, call_log = _setup(tmp_path)
+    _vault_config(env, inbox)
+    env["RCLONE_LSF_RC"] = "1"
+    _record_path(inbox).symlink_to(tmp_path / "elsewhere")
+
+    assert _run(env).returncode == 0
+    assert _copy_calls(call_log) == []
+    assert "the vault record is not a regular file" in log.read_text()
+
+
+def test_a_crontab_caller_with_no_remote_leaves_the_marker_the_alert_reads(tmp_path):
+    env, inbox, log, call_log = _setup(tmp_path)
+    _write_config(env, inbox, "")
+    env.pop("INVOCATION_ID", None)
+
+    assert _run(env).returncode == 0
+    assert _heartbeat(env)["unconfigured_caller"]
+    assert call_log.read_text() == ""
+
+
+def test_the_heartbeat_is_not_written_through_a_planted_temp_link(tmp_path):
+    env, inbox, log, call_log = _setup(tmp_path)
+    _vault_config(env, inbox)
+    state = Path(env["GENESIS_HOME"]) / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    victim = tmp_path / "victim"
+    victim.write_text("keep\n")
+    (state / "inbox_sync.json.tmp").symlink_to(victim)
+
+    assert _run(env).returncode == 0
+    assert victim.read_text() == "keep\n"
+    assert _heartbeat(env)["last_ok"]

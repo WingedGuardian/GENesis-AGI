@@ -254,3 +254,94 @@ async def test_oversized_heartbeat_reads_as_unreadable(obs_db, monkeypatch, tmp_
     await sync_health.check_inbox_sync_health(obs_db)
     [alert] = await _open_alerts(obs_db)
     assert "unreadable" in alert["content"]
+
+
+def test_a_recent_caller_with_no_remote_raises_an_alert():
+    text = json.dumps({"unconfigured_caller": _NOW.isoformat()})
+    [p] = assess("", text, _NOW)
+    assert p.key == "unconfigured"
+    assert "sync_remote" in p.message
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        None,
+        "",
+        "[1]",
+        '{"last_ok": "2026-10-28T17:59:00Z"}',
+        '{"unconfigured_caller": 5}',
+        '{"unconfigured_caller": "not a date"}',
+        '{"unconfigured_caller": "2026-10-28T17:59:00"}',
+        '{"unconfigured_caller": "2026-10-28T18:30:00+00:00"}',
+        '{"unconfigured_caller": "2026-10-28T10:00:00+00:00"}',
+        "[" * 60000,
+    ],
+)
+def test_no_alert_without_a_recent_caller_when_the_sync_is_off(text):
+    assert assess("", text, _NOW) == []
+
+
+def test_a_very_deeply_nested_heartbeat_is_unreadable_and_does_not_raise():
+    [p] = assess(_REMOTE, "[" * 60000, _NOW)
+    assert p.key == "unreadable"
+
+
+def test_a_fifo_at_the_heartbeat_path_does_not_block(tmp_path):
+    import os
+    import threading
+
+    fifo = tmp_path / "heartbeat"
+    os.mkfifo(fifo)
+    out = []
+    reader = threading.Thread(target=lambda: out.append(sync_health._read_heartbeat(fifo)), daemon=True)
+    reader.start()
+    reader.join(5)
+    if reader.is_alive():
+        # Release the blocked open so the thread can finish, then fail.
+        os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        pytest.fail("reading a FIFO blocked")
+    assert out == [""]
+
+
+async def test_an_alert_outlives_the_three_day_expiry_so_an_outage_raises_one(
+    obs_db, monkeypatch, tmp_path
+):
+    hb = _patch(monkeypatch, tmp_path, _REMOTE)
+    hb.write_text(_hb("2026-01-01T00:00:00Z"))
+    await sync_health.check_inbox_sync_health(obs_db)
+
+    cur = await obs_db.execute(
+        "SELECT expires_at FROM observations WHERE source = ?", (sync_health.SOURCE,)
+    )
+    [row] = await cur.fetchall()
+    assert datetime.fromisoformat(row["expires_at"]) > datetime.now(UTC) + timedelta(days=365)
+    await obs.resolve_expired(obs_db)
+    await sync_health.check_inbox_sync_health(obs_db)
+    assert len(await _open_alerts(obs_db)) == 1
+
+
+async def test_a_config_problem_leaves_the_other_alerts_open(obs_db, monkeypatch, tmp_path):
+    """The heartbeat was not read, so nothing shows the sync recovered."""
+    hb = _patch(monkeypatch, tmp_path, _REMOTE)
+    hb.write_text(_hb("2026-01-01T00:00:00Z"))
+    await sync_health.check_inbox_sync_health(obs_db)
+
+    def broken():
+        raise ValueError("overlay is not valid YAML")
+
+    monkeypatch.setattr("genesis.inbox.sync_config.load_sync_settings", broken)
+    await sync_health.check_inbox_sync_health(obs_db)
+    assert len(await _open_alerts(obs_db)) == 2
+
+
+async def test_a_caller_with_no_remote_alerts_and_clears(obs_db, monkeypatch, tmp_path):
+    hb = _patch(monkeypatch, tmp_path, "")
+    hb.write_text(json.dumps({"unconfigured_caller": datetime.now(UTC).isoformat()}))
+    await sync_health.check_inbox_sync_health(obs_db)
+    [alert] = await _open_alerts(obs_db)
+    assert "sync_remote" in alert["content"]
+
+    hb.write_text(json.dumps({"unconfigured_caller": "2026-01-01T00:00:00+00:00"}))
+    await sync_health.check_inbox_sync_health(obs_db)
+    assert await _open_alerts(obs_db) == []

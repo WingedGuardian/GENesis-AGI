@@ -1075,8 +1075,8 @@ def _validate_inbox_monitor(changes: dict) -> list[str]:
             sync_remote.strip() and not remote_is_valid(sync_remote.strip())
         ):
             errors.append(
-                "inbox_monitor.sync_remote must be empty or an rclone remote "
-                f"like 'name:path', got {sync_remote!r}"
+                # No value: a remote can embed a credential.
+                "inbox_monitor.sync_remote must be empty or an rclone remote like 'name:path'"
             )
 
     return errors

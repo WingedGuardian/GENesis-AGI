@@ -27,6 +27,10 @@ _TYPE = "infrastructure_alert"
 # Six missed 5-minute cycles. Long enough that one slow or failed cycle does
 # not page; short enough that a dead scheduler is noticed within the hour.
 STALE_AFTER = timedelta(minutes=30)
+# infrastructure_alert rows expire after 3 days, and the dedup only sees open rows,
+# so a long outage would otherwise raise a new alert every 3 days. Each stays open
+# until the check itself resolves it: one alert per outage.
+_OPEN_UNTIL_RESOLVED = timedelta(days=3650)
 
 
 @dataclass(frozen=True)
@@ -40,13 +44,35 @@ def _hash(key: str) -> str:
     return hashlib.sha256(f"inbox_sync:{key}".encode()).hexdigest()
 
 
+def _caller_without_a_remote(heartbeat_text: str | None, now: datetime) -> list[Problem]:
+    """An alert when something other than the timer (an old crontab line) ran the
+    sync recently with no remote set: someone expects a sync that is not happening."""
+    try:
+        stamp = datetime.fromisoformat(json.loads(heartbeat_text)["unconfigured_caller"])
+        recent = timedelta(0) <= now - stamp <= STALE_AFTER
+    except (TypeError, ValueError, KeyError, RecursionError):
+        return []
+    if not recent:
+        return []
+    return [
+        Problem(
+            "unconfigured",
+            "high",
+            "Inbox sync: something other than genesis-inbox-sync.timer (a crontab line?) "
+            "is running the sync, but inbox_monitor.sync_remote is empty, so nothing is "
+            "syncing. Set sync_remote in ~/.genesis/config/inbox_monitor.local.yaml, then "
+            "remove the crontab line.",
+        )
+    ]
+
+
 def assess(remote: str, heartbeat_text: str | None, now: datetime) -> list[Problem]:
     """Problems the heartbeat shows. Pure: no I/O.
 
     ``heartbeat_text`` is the heartbeat file's content, or None when missing.
     """
     if not remote:
-        return []
+        return _caller_without_a_remote(heartbeat_text, now)
     if heartbeat_text is None:
         return [
             Problem(
@@ -67,7 +93,7 @@ def assess(remote: str, heartbeat_text: str | None, now: datetime) -> list[Probl
         # The script writes a non-negative int: anything else must not read as healthy.
         if type(held) is not int or held < 0:
             raise ValueError("held")
-    except (ValueError, TypeError, AttributeError):
+    except (ValueError, TypeError, AttributeError, RecursionError):
         return [
             Problem(
                 "unreadable",
@@ -126,7 +152,9 @@ def _read_heartbeat(path) -> str | None:
     import os
 
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        # O_NONBLOCK: a FIFO with no writer would otherwise block this open on the
+        # event loop, before the regular-file check below can refuse it.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         return None
     except OSError as exc:
@@ -203,10 +231,14 @@ async def check_inbox_sync_health(db) -> None:
                 content=p.message,
                 priority=p.priority,
                 created_at=now.isoformat(),
+                expires_at=(now + _OPEN_UNTIL_RESOLVED).isoformat(),
                 content_hash=_hash(p.key),
                 skip_if_duplicate=True,
             )
-        cleared = [_hash(k) for k in ("config", "stale", "unreadable", "held") if k not in active]
+        # A config problem means the heartbeat was not read, so it proves nothing
+        # about the other alerts: they stay open rather than closing and re-opening.
+        checked = () if config_problem else ("config", "stale", "unreadable", "held", "unconfigured")
+        cleared = [_hash(k) for k in checked if k not in active]
         if cleared:
             await observations.resolve_by_source_and_type(
                 db,
@@ -217,4 +249,4 @@ async def check_inbox_sync_health(db) -> None:
                 content_hashes=cleared,
             )
     except Exception:
-        logger.debug("inbox sync health check failed", exc_info=True)
+        logger.warning("inbox sync health check failed", exc_info=True)

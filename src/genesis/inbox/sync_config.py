@@ -12,8 +12,8 @@ CLI output, one ``key=value`` per line::
     heartbeat=<heartbeat file path>
     genesis_home=<the Genesis home the script's children must use>
 
-Exit codes: 0 ok (including "off"), 2 the configured remote is invalid, 1 the
-config could not be read. The script refuses to run on anything but 0, so a
+Exit codes: 0 ok (including "off"), 2 a configured value is refused (the remote,
+the mirror target or the home path), 1 the config could not be read. The script refuses to run on anything but 0, so a
 broken config stops the sync loudly instead of reading as "off".
 """
 
@@ -49,8 +49,10 @@ def mirror_target_problem(watch_path: Path, *, require_inside_home: bool = True)
     ``rclone sync`` makes the target match the vault, DELETING everything in
     it the vault lacks, every 5 minutes. ``watch_path`` is a setting (the
     settings tool can write it), so the target is confined: strictly inside
-    the home directory, and neither inside nor around Genesis's home or the
-    repository. Checked on the resolved path, so a symlink cannot point it out.
+    the home directory, absolute, not a hidden folder, and neither inside nor
+    around Genesis's home or the repository. Checked on the resolved path, so a
+    symlink cannot point it out. This refuses the worst targets only: what makes
+    a wrong target recoverable is the sync's --backup-dir.
 
     ``require_inside_home=False`` keeps only the catastrophic cases (the home
     directory itself, a filesystem root, Genesis's home or the repository and
@@ -61,6 +63,10 @@ def mirror_target_problem(watch_path: Path, *, require_inside_home: bool = True)
     if _UNSAFE_CHARS.search(raw):
         return "contains control characters"
     try:
+        # resolve() would read a relative path against whichever directory the
+        # caller runs in, so the script and the server could disagree about it.
+        if not watch_path.expanduser().is_absolute():
+            return "must be an absolute path"
         target = watch_path.expanduser().resolve()
         home = Path.home().resolve()
         protected = [genesis_home().expanduser().resolve(), repo_root().resolve()]
@@ -73,6 +79,11 @@ def mirror_target_problem(watch_path: Path, *, require_inside_home: bool = True)
     for p in protected:
         if target == p or p in target.parents or target in p.parents:
             return f"must not be, contain or sit inside {p}"
+    # Hidden folders under home hold keys and credentials (~/.ssh, ~/.config/rclone).
+    if home in target.parents and any(
+        part.startswith(".") for part in target.relative_to(home).parts
+    ):
+        return "must not be a hidden folder or sit inside one"
     return None
 
 
@@ -136,6 +147,9 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 2
+        # rclone measures --one-file-system from the path it is given: handed a
+        # symlink onto another filesystem, it skips every subfolder (MEASURED, 1.60).
+        watch_path = watch_path.expanduser().resolve()
     heartbeat = heartbeat_path()
     home = genesis_home()
     if _UNSAFE_CHARS.search(str(heartbeat)) or _UNSAFE_CHARS.search(str(home)):
