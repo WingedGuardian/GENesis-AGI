@@ -351,6 +351,97 @@ def test_a_hung_git_guards_and_returns(guard, repo, tmp_path, monkeypatch):
     assert time.monotonic() - started < 10, "the git call was not bounded"
 
 
+def _gone(pid: int) -> bool:
+    """No such process, or only its zombie (killed, not yet reaped)."""
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            return fh.read().rsplit(")", 1)[1].split()[0] == "Z"
+    except FileNotFoundError:
+        return True
+
+
+def test_a_residue_check_killed_mid_hidden_pass_leaves_no_scratch_index(
+    guard, repo, tmp_path, monkeypatch
+):
+    """R2 premise LOW-2: the hidden-entry pass copies the index to a scratch
+    file in the git directory, named after its shell's pid, and removes it at
+    its end. A residue check timed out mid-pass used to kill only bash: git
+    kept running and the scratch index stayed. Now the whole process group is
+    killed, that shell's scratch index removed, and the timeout still raised."""
+    root = repo["root"]
+    _git(root, "update-index", "--assume-unchanged", "a.txt")
+    real = shutil.which("git")
+    bin_ = tmp_path / "hang-bin"
+    bin_.mkdir()
+    pids = tmp_path / "hung.pids"
+    # Hang only in the scratch-index pass (GIT_INDEX_FILE set), after the copy.
+    (bin_ / "git").write_text(
+        "#!/bin/sh\n"
+        f'if [ -n "$GIT_INDEX_FILE" ]; then echo $$ >> "{pids}"; exec sleep 60; fi\n'
+        f'exec "{real}" "$@"\n'
+    )
+    (bin_ / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_}:{os.environ['PATH']}")
+    monkeypatch.setattr(guard, "_TIMEOUT_S", 3)
+    with pytest.raises(subprocess.TimeoutExpired):
+        guard._merge_residue(str(root), repo["base"], "")
+    assert pids.exists(), "control: the scratch-index pass never ran"
+    assert list((root / ".git").glob("genesis-hidden-index.*")) == []
+    deadline = time.monotonic() + 10
+    hung = [int(p) for p in pids.read_text().split()]
+    while not all(_gone(p) for p in hung) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert all(_gone(p) for p in hung), f"a hung git survived the timeout: {hung}"
+
+
+def test_an_interrupted_residue_check_leaves_no_child_and_no_scratch_index(
+    guard, repo, tmp_path, monkeypatch
+):
+    """Round-2 audit: the child runs in its own session, so a Ctrl-C (or any
+    other exception) in the caller never reaches it. Every exception, not only
+    the timeout, kills the group and removes the scratch index, then re-raises,
+    as deploy health's own probe does."""
+
+    class Interrupted(BaseException):
+        pass
+
+    root = repo["root"]
+    _git(root, "update-index", "--assume-unchanged", "a.txt")
+    real = shutil.which("git")
+    bin_ = tmp_path / "hang-bin"
+    bin_.mkdir()
+    pids = tmp_path / "hung.pids"
+    (bin_ / "git").write_text(
+        "#!/bin/sh\n"
+        f'if [ -n "$GIT_INDEX_FILE" ]; then echo $$ >> "{pids}"; exec sleep 60; fi\n'
+        f'exec "{real}" "$@"\n'
+    )
+    (bin_ / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_}:{os.environ['PATH']}")
+    real_communicate = subprocess.Popen.communicate
+    first = [True]
+
+    def communicate(self, input=None, timeout=None):
+        if first[0]:
+            first[0] = False
+            deadline = time.monotonic() + 20
+            while not pids.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            raise Interrupted
+        return real_communicate(self, input, timeout)
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", communicate)
+    with pytest.raises(Interrupted):
+        guard._merge_residue(str(root), repo["base"], "")
+    assert pids.exists(), "control: the scratch-index pass never ran"
+    assert list((root / ".git").glob("genesis-hidden-index.*")) == []
+    deadline = time.monotonic() + 10
+    hung = [int(p) for p in pids.read_text().split()]
+    while not all(_gone(p) for p in hung) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert all(_gone(p) for p in hung), f"a hung git survived the interrupt: {hung}"
+
+
 # ── a live row: the engine's move record in update.sh's own row (#3492 gap 4) ──
 
 LIB = REPO / "scripts" / "lib"
@@ -450,7 +541,8 @@ def test_t4a_an_added_file_written_by_a_killed_switch_is_a_mixed_tree(guard, liv
     assert verdict == "mixed_tree", reason
     r = _cli(live, live["home"] / "update_state.json")
     assert r.returncode == 4, r.stdout + r.stderr
-    assert "  ?? Z" in r.stdout and "save any you want to keep" in r.stdout, r.stdout
+    # A live row's remedy is the repair, which saves before it restores (#3492 PR D1).
+    assert "  ?? Z" in r.stdout and "scripts/deploy_candidates repair-move" in r.stdout, r.stdout
 
 
 def test_t4g_a_path_a_dropped_candidate_had_deleted_is_seen(guard, live):
@@ -633,7 +725,8 @@ def test_sf1_a_tag_side_mixed_tree_never_recommends_post_merge(guard, live):
     r = _cli(live, _state(live, live_row(live)))
     assert r.returncode == 4
     assert not post_merge_advice(r.stdout), r.stdout
-    assert "Dismiss" in r.stdout and "bootstrap never ran on" not in r.stdout, r.stdout
+    assert "scripts/deploy_candidates repair-move" in r.stdout, r.stdout
+    assert "bootstrap never ran on" not in r.stdout, r.stdout
 
 
 @pytest.mark.parametrize("at", ["tag", "target"])
@@ -1254,3 +1347,17 @@ def test_r4_a_runtime_rewrite_of_an_ephemeral_path_is_not_a_forward_mixed_tree(
     (root / path).write_text("regenerated at runtime\n")
     got, reason = _live_verdict(guard, live, {**_adopted_row(live), "own_head": tip})
     assert got == verdict, reason
+
+
+def test_the_residue_read_never_rewrites_the_index(guard, repo):
+    """Codex c4463433358: deploy health asks this guard while a deploy may be
+    running, so its ``git status`` must not refresh the index (it takes
+    index.lock, which fails a concurrent writer). A stale cached stat is the
+    case that makes plain ``git status`` rewrite the index."""
+    root = repo["root"]
+    time.sleep(1.1)
+    os.utime(root / "a.txt")  # same bytes, newer mtime: the cached stat is stale
+    index = root / ".git" / "index"
+    before = index.read_bytes()
+    assert guard._merge_residue(str(root), repo["base"], repo["base"], True) == []
+    assert index.read_bytes() == before

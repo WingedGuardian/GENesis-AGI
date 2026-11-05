@@ -133,7 +133,9 @@ by construction. That is a real rough edge, not a clean exception, and it will
 read as archaeology to anyone scrolling.
 
 A plan doc's body answers the six plan-time premise questions in
-`.claude/docs/premise-check.md`, "At plan and issue time".
+`.claude/docs/premise-check.md`, "At plan and issue time", in its
+`## Premise checks` section format. A plan that names repo paths cannot leave plan
+mode without that section and six non-empty answers.
 
 ## What each field is for
 

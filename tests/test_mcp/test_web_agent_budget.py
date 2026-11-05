@@ -46,7 +46,7 @@ async def test_web_agent_proceeds_when_budget_exceeded(monkeypatch):
         patch("genesis.routing.cost_tracker.CostTracker", _ExceededTracker),
         patch("genesis.providers.tinyfish_agent.TinyFishAgentAdapter", _AdapterReached),
     ):
-        result = await web_agent.fn(url="https://example.com", goal="do a thing")
+        result = await web_agent(url="https://example.com", goal="do a thing")
 
     # Reached the adapter (proceeded) — NOT the old budget short-circuit.
     assert result["error"] == "ADAPTER_REACHED"

@@ -12,6 +12,7 @@ Install-agnostic: pure functions, synthetic slugs, no database.
 from __future__ import annotations
 
 import itertools
+import math
 
 import pytest
 
@@ -23,7 +24,7 @@ REPO = "owner/repo"
 def _raw(
     claims=(("pass", "MEASURED"),),
     controls=("a control",),
-    scope_limits=(),
+    gaps=(),
     established=True,
     **over,
 ):
@@ -41,7 +42,7 @@ def _raw(
             for i, (v, t) in enumerate(claims)
         ],
         "controls": list(controls),
-        "scope_limits": list(scope_limits),
+        "gaps": [dict(g) for g in gaps],
         "findings": [],
     }
     doc.update(over)
@@ -62,13 +63,40 @@ _ATOMS = [
 ]
 
 
+#: One declared gap of each kind — the gap axis of the enumeration.
+GAP = {
+    "method": {"kind": "method", "detail": "rollback path not exercised"},
+    "owner_only": {"kind": "owner_only", "detail": "only the owner's phone shows it"},
+    "event_gated": {
+        "kind": "event_gated",
+        "detail": "the weekly job has not run since the merge",
+        "trigger": "2026-11-02",
+        "recheck": "python3 scripts/job_runs.py --name weekly --since 2026-11-01",
+    },
+    "not_yet_done": {
+        "kind": "not_yet_done",
+        "detail": "the affected test file was not run",
+        "command": "pytest tests/test_example.py",
+    },
+}
+METHOD = GAP["method"]
+NOT_YET_DONE = GAP["not_yet_done"]
+EVENT = GAP["event_gated"]
+
+
 def _enumerate():
     atoms = _ATOMS
     for k in (1, 2, 3):
         for claims in itertools.combinations_with_replacement(atoms, k):
             for controls in ((), ("a control",)):
-                for scope in ((), ("a named gap",)):
-                    yield claims, controls, scope
+                for gaps in ((), *((GAP[kind],) for kind in pe.GAP_KINDS)):
+                    yield claims, controls, gaps
+
+
+#: The enumeration's size, computed from its axes rather than retyped: claim
+#: multisets of size 1-3, times with/without a control, times no gap or one of each
+#: kind. A number typed by hand cannot notice an axis that silently lost a value.
+_EXPECTED = sum(math.comb(len(_ATOMS) + k - 1, k) for k in (1, 2, 3)) * 2 * (1 + len(pe.GAP_KINDS))
 
 
 def _enumerate_deployed():
@@ -83,30 +111,38 @@ def _enumerate_deployed():
 def test_EVERY_document_derives_exactly_one_verdict_the_writer_accepts():
     n = 0
     seen: dict[str, int] = {}
-    for claims, controls, scope in _enumerate():
-        doc = _doc(claims=claims, controls=controls, scope_limits=scope)
+    for claims, controls, gaps in _enumerate():
+        doc = _doc(claims=claims, controls=controls, gaps=gaps)
         d = pe.derive(doc)
         assert d.verdict in pe.VERDICTS
         closing = d.verdict in pe.PASS_VERDICTS
         decision = pe.decide(doc, note=None if closing else "why")
-        assert isinstance(decision, pe.Decision), (claims, controls, scope, decision)
+        assert isinstance(decision, pe.Decision), (claims, controls, gaps, decision)
         assert decision.verdict == d.verdict
         seen[d.verdict] = seen.get(d.verdict, 0) + 1
         n += 1
-    assert n == 476, "the enumeration itself must not shrink silently"
+    assert n == _EXPECTED, "the enumeration itself must not shrink silently"
+    assert {g["kind"] for g in GAP.values()} == set(pe.GAP_KINDS), "one sample per kind"
     assert set(seen) == set(pe.VERDICTS), f"every verdict must be reachable: {seen}"
 
 
 def test_the_derivation_invariants_hold_on_every_document():
-    for claims, controls, scope in _enumerate():
-        d = pe.derive(_doc(claims=claims, controls=controls, scope_limits=scope))
+    for claims, controls, gaps in _enumerate():
+        doc = _doc(claims=claims, controls=controls, gaps=gaps)
+        d = pe.derive(doc)
         failed = any(v == "fail" and t in pe.ESTABLISHING_TIERS for v, t in claims)
         suspected = any(v == "fail" and t == "INFERRED" for v, t in claims)
         established = any(v == "pass" and t in pe.ESTABLISHING_TIERS for v, t in claims)
+        undone = any(g["kind"] == "not_yet_done" for g in gaps)
         assert (d.verdict == "fail-intent") == failed
         assert bool(d.failed) == failed
-        if not failed:
+        # not-yet-done is exactly "a not_yet_done gap and no established failure":
+        # it outranks every cannot-verify, and a MEASURED failure outranks it.
+        assert (d.verdict == "not-yet-done") == (undone and not failed)
+        if not failed and not undone:
             assert (d.verdict == "cannot-verify") == (suspected or not established)
+        if d.verdict == "not-yet-done":
+            assert any(g.startswith(pe.NOT_YET_DONE) for g in d.gaps), "the command is named"
         # An inferred failure is never lost and never closes a row.
         if suspected and not failed:
             assert any(g.startswith(pe.SUSPECTED_FAILURE) for g in d.gaps)
@@ -114,7 +150,7 @@ def test_the_derivation_invariants_hold_on_every_document():
         if d.verdict == "pass-with-measured-gaps":
             assert d.gaps, "a gaps verdict with no named gap is the old defect"
         if d.verdict == "pass-mechanical":
-            assert not scope and controls, "a clean pass carries no gap of any kind"
+            assert not gaps and controls, "a clean pass carries no gap of any kind"
             assert all(t in pe.ESTABLISHING_TIERS for _, t in claims)
 
 
@@ -136,8 +172,8 @@ def test_the_two_formerly_DEAD_documents_each_have_their_verdict():
 
 
 def test_park_is_legal_EXACTLY_where_the_document_derives_measured_gaps():
-    for claims, controls, scope in _enumerate():
-        doc = _doc(claims=claims, controls=controls, scope_limits=scope)
+    for claims, controls, gaps in _enumerate():
+        doc = _doc(claims=claims, controls=controls, gaps=gaps)
         d = pe.derive(doc)
         r = pe.decide(doc, park=True, note="n")
         if d.verdict == "pass-with-measured-gaps":
@@ -146,11 +182,13 @@ def test_park_is_legal_EXACTLY_where_the_document_derives_measured_gaps():
             assert isinstance(r, pe.Refusal), (d.verdict, r)
         if d.verdict == "fail-intent":
             assert r.code == 3, "parking a failure is a policy refusal"
+        if d.verdict == "not-yet-done":
+            assert r.code == 2 and "do the commands, then re-run" in r.message
 
 
 def test_an_asserted_verdict_is_only_ever_an_equality_check():
-    for claims, controls, scope in _enumerate():
-        doc = _doc(claims=claims, controls=controls, scope_limits=scope)
+    for claims, controls, gaps in _enumerate():
+        doc = _doc(claims=claims, controls=controls, gaps=gaps)
         d = pe.derive(doc)
         for asserted in pe.VERDICTS:
             note = None if asserted in pe.PASS_VERDICTS else "n"
@@ -250,13 +288,13 @@ def _followed(doc, kwargs, r):
 
 def test_NO_refusal_recommends_an_action_the_tool_then_refuses():
     """Audit round 3: three refusal messages recommended a move the tool refused
-    next (put a note in scope_limits, which changes the verdict; walk away from a
+    next (put a note in a gap list, which changes the verdict; walk away from a
     failure; restate a parked outcome as derived). Every piece of advice is now
     FOLLOWED over the whole enumeration, and must lead to a Decision — or to a
     refusal whose advice is again followable, never to a dead end."""
     followed = 0
-    for claims, controls, scope in _enumerate():
-        doc = _doc(claims=claims, controls=controls, scope_limits=scope)
+    for claims, controls, gaps in _enumerate():
+        doc = _doc(claims=claims, controls=controls, gaps=gaps)
         for park in (False, True):
             for asserted in (None, *pe.VERDICTS):
                 for note in (None, "n"):
@@ -265,8 +303,8 @@ def test_NO_refusal_recommends_an_action_the_tool_then_refuses():
                     for _ in range(3):
                         if not isinstance(r, pe.Refusal):
                             break
-                        # EVERY refusal, followed or not: prose moved into scope_limits
-                        # changes the verdict, so no advice may point there.
+                        # EVERY refusal, followed or not: no advice may point at the
+                        # field the model now refuses.
                         assert "scope_limits" not in r.message, r.message
                         nxt = _followed(doc, kwargs, r)
                         if nxt is None:
@@ -294,7 +332,6 @@ _PROSE_PATHS = [
     ("claims", 0, "claim"),
     ("claims", 0, "measurement"),
     ("controls", 0),
-    ("scope_limits", 0),
     ("findings", 0, "summary"),
     ("findings", 0, "disposition"),
 ]
@@ -317,7 +354,7 @@ def test_every_prose_field_refuses_every_non_prose_value(path, value):
     prose field, not a sample — a sample is how two of six fields got fixed last time."""
     # Every list the paths index into must be non-empty, or the fixture — not the
     # model — raises, and a green run would prove nothing about that field.
-    raw = _raw(scope_limits=("a gap",), findings=[{"summary": "s", "disposition": "d"}])
+    raw = _raw(gaps=(METHOD,), findings=[{"summary": "s", "disposition": "d"}])
     with pytest.raises(pe.EvidenceError) as exc:
         pe.parse_evidence(_set(raw, path, value))
     rendered = "evidence" + "".join(f"[{p}]" if isinstance(p, int) else f".{p}" for p in path)
@@ -352,11 +389,11 @@ def test_a_padded_repo_is_refused_BY_NAME(bad):
 
 
 def test_an_unknown_field_is_refused_rather_than_dropped():
-    """``scope_limit`` for ``scope_limits`` — dropping it silently would lose exactly
-    the gap the writer meant to name."""
+    """``control`` for ``controls`` — dropping it silently would lose exactly the arm
+    the writer meant to name."""
     with pytest.raises(pe.EvidenceError) as exc:
-        pe.parse_evidence(_raw(scope_limit=["the gap"]))
-    assert "evidence.scope_limit" in str(exc.value)
+        pe.parse_evidence(_raw(control=["the arm"]))
+    assert "evidence.control" in str(exc.value)
 
 
 @pytest.mark.parametrize("tier", ["measured", "Measured", "VERIFIED"])
@@ -389,7 +426,7 @@ def test_a_non_object_document_is_refused():
         # P1: refuse to close when every claim is unverifiable
         (
             "4111877391",
-            _raw(claims=(("unverified", "NOT_VERIFIABLE_HERE"),), scope_limits=("g",)),
+            _raw(claims=(("unverified", "NOT_VERIFIABLE_HERE"),), gaps=(METHOD,)),
             {"asserted": "pass-with-measured-gaps"},
             "refused",
         ),
@@ -407,7 +444,7 @@ def test_a_non_object_document_is_refused():
         # P2 round 2: reject scope limits on a clean mechanical pass
         (
             "4139340593",
-            _raw(scope_limits=("rollback path not exercised",)),
+            _raw(gaps=(METHOD,)),
             {"asserted": "pass-mechanical"},
             "refused",
         ),
@@ -477,18 +514,21 @@ def test_an_UNDEPLOYED_document_never_closes_and_never_accuses():
     cannot-verify with the deployment gap FIRST, each failure is kept as a named
     gap rather than dropped or escalated, and the writer accepts it with a note."""
     n = 0
-    for claims, controls, scope in _enumerate_deployed():
-        doc = _doc(claims=claims, controls=controls, scope_limits=scope, established=False)
+    for claims, controls, gaps in _enumerate_deployed():
+        doc = _doc(claims=claims, controls=controls, gaps=gaps, established=False)
         d = pe.derive(doc)
         assert d.verdict == "cannot-verify" and d.failed == ()
         assert d.gaps[0].startswith(pe.NOT_DEPLOYED)
         fails = sum(1 for v, _ in claims if v == "fail")
         assert sum(g.startswith(pe.UNDEPLOYED_FAILURE) for g in d.gaps) == fails
+        # Deployment outranks not-yet-done, but the undone work is still named.
+        undone = sum(g["kind"] == "not_yet_done" for g in gaps)
+        assert sum(g.startswith(pe.NOT_YET_DONE) for g in d.gaps) == undone
         assert isinstance(pe.decide(doc, note="deploy first"), pe.Decision)
         for asserted in pe.PASS_VERDICTS:
             assert isinstance(pe.decide(doc, asserted=asserted), pe.Refusal)
         n += 1
-    assert n == 476
+    assert n == _EXPECTED
 
 
 def test_deploy_established_is_REQUIRED_and_strictly_boolean():
@@ -557,3 +597,147 @@ def test_no_refusal_listing_renders_an_empty_label():
     ):
         r = pe.decide(doc)
         assert isinstance(r, pe.Refusal) and "\n  : " not in r.message
+
+
+# ── typed gaps (spec 2026-10-27, PR A) ──────────────────────────────────────
+
+
+def test_each_gap_kind_renders_with_its_kind_named():
+    d = pe.derive(_doc(gaps=(METHOD, GAP["owner_only"], EVENT)))
+    assert d.verdict == "pass-with-measured-gaps"
+    assert d.gaps == (
+        "rollback path not exercised",
+        "OWNER ONLY: only the owner's phone shows it",
+        "EVENT-GATED (2026-11-02): the weekly job has not run since the merge — recheck: "
+        "python3 scripts/job_runs.py --name weekly --since 2026-11-01",
+    )
+
+
+def test_a_not_yet_done_gap_keeps_the_row_open_with_the_command_named():
+    d = pe.derive(_doc(gaps=(METHOD, NOT_YET_DONE)))
+    assert d.verdict == "not-yet-done" and d.verdict not in pe.PASS_VERDICTS
+    assert (
+        "NOT YET DONE — run: pytest tests/test_example.py (the affected test file was not run)"
+        in (d.gaps)
+    )
+    assert pe.NOT_YET_DONE in pe.NOTE_PREFIXED_GAPS, "the command leads the backlog note"
+
+
+@pytest.mark.parametrize(
+    ("claims", "expect"),
+    [
+        ((("fail", "MEASURED"),), "fail-intent"),  # a failure outranks undone work
+        ((("pass", "MEASURED"), ("fail", "INFERRED")), "not-yet-done"),  # beats a suspicion
+        ((("unverified", "NOT_VERIFIABLE_HERE"),), "not-yet-done"),  # beats nothing-established
+        ((("pass", "INFERRED"),), "not-yet-done"),
+    ],
+)
+def test_not_yet_done_sits_after_fail_intent_and_before_cannot_verify(claims, expect):
+    assert pe.derive(_doc(claims=claims, gaps=(NOT_YET_DONE,))).verdict == expect
+
+
+def test_not_yet_done_needs_no_note_and_accepts_one():
+    """The NOT YET DONE gaps already say what is left and how to do it."""
+    doc = _doc(gaps=(NOT_YET_DONE,))
+    assert isinstance(pe.decide(doc), pe.Decision)
+    assert isinstance(pe.decide(doc, note="ran out of session"), pe.Decision)
+
+
+def test_asserting_another_verdict_on_undone_work_says_run_the_commands():
+    doc = _doc(gaps=(NOT_YET_DONE,))
+    for asserted in ("pass-with-measured-gaps", "cannot-verify"):
+        r = pe.decide(doc, asserted=asserted, note="n")
+        assert isinstance(r, pe.Refusal) and r.code == 2
+        assert "run the listed commands" in r.message
+        assert "Never change a gap's kind" in r.message
+
+
+def test_park_on_undone_work_is_refused_with_code_2():
+    r = pe.decide(_doc(gaps=(NOT_YET_DONE,)), park=True, note="n")
+    assert isinstance(r, pe.Refusal) and r.code == 2
+    assert "do the commands, then re-run" in r.message
+
+
+def test_a_scope_limits_document_is_refused_with_a_hint_naming_gaps():
+    """The untyped list is never mapped across: the kind decides the verdict, so a
+    silent mapping would pick it for the writer."""
+    raw = _raw()
+    raw["scope_limits"] = ["what this install could not reach"]
+    with pytest.raises(pe.EvidenceError) as exc:
+        pe.parse_evidence(raw)
+    msg = str(exc.value)
+    assert "evidence.scope_limits" in msg and "replaced by 'gaps'" in msg
+    assert all(kind in msg for kind in pe.GAP_KINDS) and "never mapped" in msg
+
+
+@pytest.mark.parametrize(
+    ("gap", "field"),
+    [
+        ({"kind": "event_gated", "detail": "d", "recheck": "r"}, "trigger"),
+        ({"kind": "event_gated", "detail": "d", "trigger": "next deploy"}, "recheck"),
+        ({"kind": "not_yet_done", "detail": "d"}, "command"),
+        ({"kind": "method"}, "detail"),
+        ({"kind": "method", "detail": "d", "command": "x"}, "command"),  # extra=forbid
+        ({"kind": "owner_only", "detail": "d", "trigger": "2026-11-02"}, "trigger"),
+    ],
+)
+def test_each_gap_kind_requires_its_own_fields_and_no_others(gap, field):
+    with pytest.raises(pe.EvidenceError) as exc:
+        pe.parse_evidence(_raw(gaps=(gap,)))
+    assert "evidence.gaps[0]" in str(exc.value) and field in str(exc.value)
+
+
+@pytest.mark.parametrize("bad", [{}, {"kind": "scope"}, "a plain string", None, 42])
+def test_a_gap_without_a_known_kind_is_refused_by_path(bad):
+    raw = _raw()
+    raw["gaps"] = [bad]
+    with pytest.raises(pe.EvidenceError) as exc:
+        pe.parse_evidence(raw)
+    assert "evidence.gaps[0]" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("kind", "field"),
+    [(k, f) for k, g in GAP.items() for f in g if f != "kind"],
+)
+@pytest.mark.parametrize("value", _HOSTILE, ids=repr)
+def test_every_gap_prose_field_refuses_every_non_prose_value(kind, field, value):
+    gap = {**GAP[kind], field: value}
+    with pytest.raises(pe.EvidenceError) as exc:
+        pe.parse_evidence(_raw(gaps=(gap,)))
+    assert f"evidence.gaps[0].{kind}.{field}" in str(exc.value)
+
+
+@pytest.mark.parametrize("trigger", ["2026-11-02", "the next weekly run", "next deploy"])
+def test_a_trigger_is_a_real_date_or_a_named_event(trigger):
+    pe.parse_evidence(_raw(gaps=({**EVENT, "trigger": trigger},)))
+
+
+@pytest.mark.parametrize(
+    "trigger", ["2026-13-45", "2026-02-30", "2026-1-5", "2026-11-02T00:00", "20261028", "2026-1102"]
+)
+def test_a_date_shaped_trigger_that_is_not_a_real_date_is_refused(trigger):
+    """Read as a named event, a mistyped date would mean something the writer did
+    not write, and nothing downstream could tell."""
+    with pytest.raises(pe.EvidenceError) as exc:
+        pe.parse_evidence(_raw(gaps=({**EVENT, "trigger": trigger},)))
+    assert "looks like a date" in str(exc.value)
+
+
+def test_the_undone_command_survives_the_backlogs_120_character_clip():
+    """The note is clipped at 120 characters on the backlog line; the command is the
+    part the next validator needs, so it comes before the detail."""
+    long_detail = "x" * 200
+    d = pe.derive(_doc(gaps=({**NOT_YET_DONE, "detail": long_detail},)))
+    (gap,) = [g for g in d.gaps if g.startswith(pe.NOT_YET_DONE)]
+    assert NOT_YET_DONE["command"] in gap[:120]
+
+
+def test_the_merge_commit_hint_says_it_is_the_PRs_own_merge():
+    raw = _raw()
+    raw["merge_commit"] = ""
+    with pytest.raises(pe.EvidenceError) as exc:
+        pe.parse_evidence(raw)
+    msg = str(exc.value)
+    assert "the PR's OWN merge commit" in msg and "deploy.detail" in msg
+    assert "WHICH artifact" not in msg

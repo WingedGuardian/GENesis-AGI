@@ -99,7 +99,7 @@ class EmailAutonomyGate:
             is_reply=is_reply,
             recipient_known=recipient_known,
             is_bulk=is_bulk,
-            subject=getattr(request, "topic", "") or "",
+            subject=getattr(request, "email_subject", None) or "",
             body=message_text,
         )
         domain, verb, risk = classification.cell_key
@@ -287,7 +287,7 @@ class EmailAutonomyGate:
                 "cell": [domain, verb, risk],
                 "validated_recipient": recipient,
                 "thread_id": thread_id,
-                "subject": getattr(request, "topic", "") or "",
+                "subject": getattr(request, "email_subject", None) or "",
                 "category": category_val,
             }
         )

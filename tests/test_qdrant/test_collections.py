@@ -1,9 +1,13 @@
 """Tests for Qdrant collection management.
 
-These tests use the real Qdrant instance on localhost:6333: they create and
-delete a test collection with a unique suffix. That is a live service, so they
-run only when opted in with GENESIS_LIVE_E2E=1; otherwise the module skips, as
-on CI.
+The tests that take the ``qdrant`` fixture use a real Qdrant server, the one
+``genesis.env.qdrant_url()`` names (localhost:6333 unless QDRANT_URL selects
+another). They create and delete a test collection with a unique suffix, and
+``test_ensure_collections`` also creates or indexes the production
+``episodic_memory`` and ``knowledge_base`` collections there. That is a live
+service, so they run only when opted in with GENESIS_LIVE_E2E=1; otherwise the
+fixture skips them, as on CI. ``TestPayloadIndexes`` uses a mock client and
+always runs.
 """
 
 import os
@@ -27,13 +31,9 @@ from genesis.qdrant.collections import (
 
 TEST_COLLECTION = "test_genesis_" + uuid.uuid4().hex[:8]
 
-pytestmark = [
-    pytest.mark.skipif(
-        os.environ.get("GENESIS_LIVE_E2E") != "1",
-        reason="writes to the live Qdrant; opt in with GENESIS_LIVE_E2E=1",
-    ),
-    pytest.mark.live_service,
-]
+# Opens the outbound fence for the module. The opt-in is the qdrant fixture's own
+# skip, not a module mark, so the mock-only TestPayloadIndexes still runs.
+pytestmark = pytest.mark.live_service
 
 
 def _uuid():
@@ -46,6 +46,11 @@ def _random_vector():
 
 @pytest.fixture(scope="module")
 def qdrant():
+    # Checked before any connection, so a run that has not opted in never
+    # reaches the server. A module-level mark would also skip the mock-only
+    # TestPayloadIndexes, which needs no server.
+    if os.environ.get("GENESIS_LIVE_E2E") != "1":
+        pytest.skip("writes to the live Qdrant; opt in with GENESIS_LIVE_E2E=1")
     # Qdrant isn't guaranteed to be running in every environment (e.g., CI
     # without a Qdrant service). Skip the whole module gracefully instead of
     # failing with a connection error.

@@ -24,6 +24,11 @@ from genesis.db.schema._tables import TABLES
 M90 = importlib.import_module(
     "genesis.db.migrations.20260904231054_session_ledger_ambient_extractor"
 )
+# The later widening (``relayed``). A MIGRATED install runs the whole chain, so
+# the drift tests below compare the chain's output, not M90's alone.
+M_RELAYED = importlib.import_module(
+    "genesis.db.migrations.20261028041420_session_ledger_relayed_added_by"
+)
 
 EXTRACTOR = "ambient_ledger_extractor"
 
@@ -213,6 +218,7 @@ class TestTheThreeSitesCannotDrift:
     async def test_migrated_schema_matches_the_python_allow_list(self, db):
         await _seed_old(db)
         await M90.up(db)
+        await M_RELAYED.up(db)
         allowed = _allowed_from_ddl(await _ddl(db))
         assert allowed == set(VALID_ADDED_BY), (
             "a MIGRATED install and VALID_ADDED_BY disagree: "
@@ -225,6 +231,7 @@ class TestTheThreeSitesCannotDrift:
         """The two paths must converge on the same constraint."""
         await _seed_old(db)
         await M90.up(db)
+        await M_RELAYED.up(db)
         assert _allowed_from_ddl(await _ddl(db)) == _allowed_from_ddl(TABLES["session_ledger"])
 
     def test_the_extractor_value_is_distinct_from_ambient(self):

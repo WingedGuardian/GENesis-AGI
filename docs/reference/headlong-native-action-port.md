@@ -55,9 +55,11 @@ quality. Those require the remaining comparison matrix. Canonical source binding
 here is tested on immutable fixture rows; concurrent source mutation and
 generation fencing remain unqualified.
 
-The workflow reruns all stock controls before native qualification, retains both
-reports and actual container/image metadata for seven days, and removes the two
-named containers even on failure. A timeout/killed job cannot produce a passing
+The workflow reruns all stock controls before native qualification, retains
+reports and actual container/image metadata for seven days, and removes only the
+run's named containers even on failure. A separate
+[monolith/native probe](headlong-native-monolith.md) follows this phase.
+A timeout/killed job cannot produce a passing
 report. Host-safe tests cover actual CRUD and evaluator faults without executing
 native code; native execution is exclusively in disposable CI. Full integration
 is unqualified until the exact-head contained report is observed after review.

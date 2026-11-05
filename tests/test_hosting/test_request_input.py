@@ -2,6 +2,7 @@
 
 import contextlib
 import hashlib
+import io
 import json
 import queue
 import socket
@@ -182,7 +183,10 @@ def test_body_budget_begins_after_authentication(server):
 
 def test_chunk_metadata_has_wire_byte_limit(server, monkeypatch):
     monkeypatch.setattr(bounded, "_MAX_WIRE_BYTES", 1024)
-    response, _ = exchange(server, headers(framing="Transfer-Encoding: chunked") + b"a" * 16384)
+    # Past the reader's buffer, which fills while the headers are read, before
+    # the count starts. Python 3.14's is 128 KiB where 3.12's is 8 KiB.
+    metadata = b"a" * (2 * io.DEFAULT_BUFFER_SIZE)
+    response, _ = exchange(server, headers(framing="Transfer-Encoding: chunked") + metadata)
     assert b"413" in response.split(b"\r\n", 1)[0]
 
 

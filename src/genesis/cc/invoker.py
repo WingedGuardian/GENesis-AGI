@@ -61,6 +61,7 @@ from genesis.util.proc_kill import (
     reap_bounded,
     spawn_owned,
 )
+from genesis.util.systemd import literal_scope_args
 
 logger = logging.getLogger(__name__)
 
@@ -220,7 +221,7 @@ def _scope_argv(*trailing: str) -> list[str]:
     with `/bin/true` it is the probe. Sharing the builder is what keeps the two
     from drifting apart again.
     """
-    argv = ["systemd-run", "--user", "--scope", "--quiet"]
+    argv = ["systemd-run", "--user", "--scope", "--quiet", *literal_scope_args()]
     for prop in _SCOPE_PROPERTIES:
         argv += ["-p", prop]
     argv.append("--")
@@ -3582,7 +3583,10 @@ class CCInvoker:
                         cc_version = event_raw.get("version", "unknown")
                         logger.info("CC version: %s", cc_version)
 
-                    if event.event_type == "text" and event.text:
+                    # Not CC's own synthetic line (a usage-limit notice): it is
+                    # not an answer, and collected as one it made an empty
+                    # rate-limited result read as served instead of raising.
+                    if event.event_type == "text" and event.text and not event.is_synthetic:
                         collected_text.append(event.text)
                     if etype == "assistant":
                         # Read off the RAW content array, not the parsed

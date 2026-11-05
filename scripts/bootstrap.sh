@@ -51,7 +51,10 @@ bootstrap_refuse_if_server_live "$@" || exit 3
 UPDATE_STATE="$HOME/.genesis/update_state.json"
 # A second argument "guard": the shared guard's message, printed just before,
 # is the remedy (a half-written checkout, which --post-merge refuses), so the
-# generic one is not added to it.
+# generic one is not added to it. "at-tag": the checkout is at the rollback tag,
+# so on live the repair (scripts/deploy_candidates repair-move) is named too;
+# every other refusal (a merge in progress, the forward "finish with
+# --post-merge" case) is not one the repair heals.
 _crash_recovery_refuse() {
     local _reason="$1" _current_branch _current_head
     _current_branch="$(git -C "$GENESIS_ROOT" symbolic-ref --short -q HEAD 2>/dev/null || true)"
@@ -60,6 +63,9 @@ _crash_recovery_refuse() {
     echo "  Current branch/HEAD: ${_current_branch:-<detached>} @ ${_current_head:-<unreadable>}; rollback tag: ${ROLLBACK_TAG:-<missing>} @ ${rb_commit:-<unresolved>}." >&2
     if [ "${2:-}" != guard ]; then
         echo "  Resolve the checkout, then re-run scripts/bootstrap.sh; or finish forward with scripts/update.sh --post-merge (it refuses a half-written tree; then follow its message); or remove ~/.genesis/update_state.json once decided." >&2
+        if [ "${2:-}" = at-tag ] && [ "${ORIGINAL_BRANCH:-}" = live ]; then
+            echo "  On live, scripts/deploy_candidates repair-move puts a half-written checkout back to the rollback tag (it saves every path it changes first, and says when there is nothing to repair)." >&2
+        fi
     fi
     exit 1
 }
@@ -254,7 +260,7 @@ PY
                     if [ "$_guard_rc" -eq 6 ]; then
                         _crash_recovery_refuse "the update state cannot be finished forward (see above)" guard
                     fi
-                    _crash_recovery_refuse "the update state guard did not clear this state (exit $_guard_rc)"
+                    _crash_recovery_refuse "the update state guard did not clear this state (exit $_guard_rc)" at-tag
                 fi
             fi
             dirty_paths=""
@@ -417,7 +423,7 @@ done = {
         "and left them as they are"
     ),
 }[action]
-# The keys and value types of update.sh's writer (its _do_rollback).
+# The keys and value types of update.sh's writer (_do_rollback, in lib/update_rollback.sh).
 data = {
     "old_tag": state.get("old_tag", ""),
     "new_tag": new_tag,
@@ -613,17 +619,29 @@ elif [[ "$PKG_MGR" == "dnf" || "$PKG_MGR" == "yum" ]]; then
 fi
 
 # Python 3.12-3.14 required (upper bound mirrors pyproject's requires-python)
+# shellcheck source=lib/python312.sh
+. "$SCRIPT_DIR/lib/python312.sh"
 if command -v python3.12 &>/dev/null; then
     echo "  Python: $(python3.12 --version)"
 elif command -v python3 &>/dev/null && python3 -c "import sys; sys.exit(0 if (3, 12) <= sys.version_info[:2] < (3, 15) else 1)" 2>/dev/null; then
-    echo "  Python: $(python3 --version)"
+    if genesis_new_venv_wants_python312 "$GENESIS_ROOT/.venv" python3; then
+        echo "  $(python3 --version) found, but Genesis is tested on 3.12 — installing python3.12..."
+        # Installed further down for everything else, too late for this venv.
+        command -v curl &>/dev/null || install_pkg curl || true
+        if ! genesis_install_python312_uv; then
+            echo "  WARNING: could not install python3.12; continuing on $(python3 --version), which CI does not test"
+            # Survives update.sh's tail of this output.
+            echo "python3.12 could not be installed; a new venv uses $(python3 --version). To retry, delete $GENESIS_ROOT/.venv and re-run." >> "$GENESIS_DEPLOY_SUMMARY" || true
+        fi
+    fi
+    echo "  Python: $("$(genesis_python_bin)" --version)"
 else
     _found_ver=$(python3 --version 2>/dev/null || echo "not found")
     echo "  Python 3.12-3.14 required (found: $_found_ver) — run install.sh to install it"
     echo "  Or install manually and re-run bootstrap."
     exit 1
 fi
-PYTHON_BIN=$(command -v python3.12 || command -v python3)
+PYTHON_BIN=$(genesis_python_bin)
 PYTHON_VERSION=$("$PYTHON_BIN" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
 
 # python3-venv (needed for venv creation on Debian/Ubuntu)
@@ -1418,6 +1436,13 @@ claude() {
         && [ -x "$genesis_root/scripts/cc-slot.sh" ] \
         && command -v tmux >/dev/null 2>&1; then
         "$genesis_root/scripts/cc-slot.sh" manual "$@"
+    elif [ -t 0 ] && [ -t 1 ] && [ -x "$genesis_root/scripts/slot_exec.sh" ]; then
+        # Interactive but not taking a slot (already inside tmux, or opted out):
+        # still give this claude a systemd scope of its own, so it is never left
+        # in a login scope that systemd-oomd would kill whole. Non-tty calls (a
+        # session's Bash tool runs `claude mcp ...` here) stay in their caller's
+        # scope.
+        "$genesis_root/scripts/slot_exec.sh" "${GENESIS_SLOT:-bare}" -- claude "$@"
     else
         command claude "$@"
     fi

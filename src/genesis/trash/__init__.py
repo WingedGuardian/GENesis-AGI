@@ -27,8 +27,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from genesis import env as _env
+from genesis.caller_context import caller_context
 from genesis.env import genesis_home
 from genesis.util.atomic import atomic_write_text
+from genesis.util.resolve import resolve_refusing_loops
 
 TOMBSTONE = "tombstone.json"
 ITEM = "item"
@@ -73,7 +75,8 @@ def _root() -> Path:
     # The parent resolved, so a symlinked GENESIS_HOME compares equal to
     # resolved items; the root itself not, so _ensure_root still refuses a
     # trash directory that is a symlink.
-    # Raises on a symlink loop; trash() and list_entries() handle that.
+    # A symlink loop raises here on Python 3.12 and at the first stat of the
+    # root on later versions; trash() and list_entries() handle both.
     root = home_trash_root()
     return root.parent.resolve() / root.name
 
@@ -222,7 +225,7 @@ def _database_paths() -> set[Path]:
     open). It reads only this process's configuration; see ``_holder_of`` for
     why the server's own reading is not re-derived here."""
     paths = {_env.genesis_db_path(), _env.repo_root() / "data" / "genesis.db"}
-    return {form for p in paths for form in (p.absolute(), p.resolve())}
+    return {form for p in paths for form in (p.absolute(), resolve_refusing_loops(p))}
 
 
 def _is_live_database(item: Path) -> bool:
@@ -298,6 +301,7 @@ def trash(path: str | os.PathLike[str], *, reason: str, caller: str) -> Tombston
     kind, size = _kind(st), _size(item, st)
     _ensure_root(root)
     entry = _claim_entry(root, item.name)
+    _caller = caller_context()
     stone = Tombstone(
         entry_id=entry.name,
         root=str(root),
@@ -307,7 +311,11 @@ def trash(path: str | os.PathLike[str], *, reason: str, caller: str) -> Tombston
         size=size,
         reason=reason,
         caller=caller,
-        session_id=os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("GENESIS_SESSION_ID"),
+        # The order scripts/hooks/prepare-commit-msg reads them in; Claude Code
+        # sets the transcript id, and the legacy id is the older name.
+        session_id=(
+            _caller.session_id or _caller.transcript_id or _caller.legacy_session_id or None
+        ),
         trashed_at=datetime.now(UTC).isoformat(timespec="seconds"),
     )
     holder = None

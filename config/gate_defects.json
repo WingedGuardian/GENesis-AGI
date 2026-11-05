@@ -1,0 +1,34 @@
+{
+  "_README": [
+    "The defect corpus: deliberate breaks in the merge gate's own code, each run",
+    "against every rung of the gate's tests, to show which rung notices. Run by",
+    "`scripts/ci/mutation_sweep.py --rung-report`. An escape is a finding, not a",
+    "failure: it exits 0, and on main it means a test is owed, filed as an issue.",
+    "This is not `config/mutation_gate.json`, whose cases must all be caught.",
+    "",
+    "`why` is written before running the case. `aim` is the rung that should catch",
+    "it. An anchor that stops matching fails `--check-anchors` on the PR that moved",
+    "it: update the case in that change."
+  ],
+  "rungs": {
+    "unit": [
+      "tests/test_hooks/test_merge_review_gate.py",
+      "tests/test_hooks/test_git_push_guard_codex_freshness.py",
+      "tests/test_hooks/test_scored_bot_reviewers.py"
+    ],
+    "characterization": [
+      "tests/test_hooks/test_merge_gate_characterization.py"
+    ]
+  },
+  "cases": [
+    {
+      "label": "critical lane blocks on three P2s instead of two",
+      "why": "the lane table decides how many P2s block a critical change. Raising it lets a change to the gate itself merge past findings that should stop it.",
+      "aim": "unit",
+      "path": "scripts/hooks/git_push_guard.py",
+      "validator": "python",
+      "anchor": "_INLINE_SCORE_BLOCK_THRESHOLDS = {\"critical\": 1.0,",
+      "replacement": "_INLINE_SCORE_BLOCK_THRESHOLDS = {\"critical\": 1.5,"
+    }
+  ]
+}

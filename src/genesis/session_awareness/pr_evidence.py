@@ -25,7 +25,9 @@ anticipated one) would otherwise bypass every rule here.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+from datetime import date
 from typing import Annotated, Any, Literal
 
 from pydantic import (
@@ -47,10 +49,14 @@ __all__ = [
     "CLAIM_VERDICTS",
     "DEPLOY_METHODS",
     "ESTABLISHING_TIERS",
+    "EVENT_GATED",
+    "GAP_KINDS",
     "MAX_EVIDENCE_BYTES",
     "NOTE_PREFIXED_GAPS",
     "NOT_DEPLOYED",
+    "NOT_YET_DONE",
     "NO_CONTROL_GAP",
+    "OWNER_ONLY",
     "SUSPECTED_FAILURE",
     "UNDEPLOYED_FAILURE",
     "TIERS",
@@ -80,7 +86,7 @@ ESTABLISHING_TIERS = ("MEASURED", "READ")
 #: never a negative verdict (a stacked PR lands inside its parent's squash).
 DEPLOY_METHODS = ("behaviour", "content", "ancestry")
 
-#: Per-CLAIM verdicts — whether that one claim held. Distinct from the four SESSION
+#: Per-CLAIM verdicts — whether that one claim held. Distinct from the SESSION
 #: verdicts, which :func:`derive` computes across claims. ``unverified`` exists so a
 #: claim nobody could check is not forced into ``pass`` (a falsification) or ``fail``
 #: (an accusation that escalates to the user); it pairs with ``NOT_VERIFIABLE_HERE``
@@ -106,9 +112,21 @@ NOT_DEPLOYED = "DEPLOYMENT NOT ESTABLISHED"
 #: Not fail-intent — the failure may be the stale tree's — but never dropped either.
 UNDEPLOYED_FAILURE = "FAILED WHERE DEPLOYMENT WAS NOT ESTABLISHED"
 
+#: The four kinds a declared gap can be. The kind, not the prose, decides what the
+#: gap does: ``not_yet_done`` keeps the row OPEN, and the other three close it with
+#: the gap named. (``event_gated`` carries its trigger and re-measuring command so
+#: the owed measurement is recorded in a shape a later recheck can act on.)
+GAP_KINDS = ("method", "event_gated", "owner_only", "not_yet_done")
+
+#: Rendered-gap prefixes for the kinds that are not plain method limits.
+OWNER_ONLY = "OWNER ONLY"
+EVENT_GATED = "EVENT-GATED"
+NOT_YET_DONE = "NOT YET DONE"
+
 #: Gaps that keep a row open AND must be visible on the backlog's one line, so the
 #: CLI writes them ahead of the validator's note rather than only into the document.
-NOTE_PREFIXED_GAPS = (NOT_DEPLOYED, UNDEPLOYED_FAILURE, SUSPECTED_FAILURE)
+#: NOT YET DONE is here so the commands that finish the row lead its note.
+NOTE_PREFIXED_GAPS = (NOT_DEPLOYED, UNDEPLOYED_FAILURE, SUSPECTED_FAILURE, NOT_YET_DONE)
 
 #: Prose: any non-blank string, whitespace-trimmed. Never a coerced number, bool,
 #: null or object — the exact values ``str(x).strip()`` used to wave through.
@@ -167,10 +185,82 @@ class Finding(BaseModel):
     disposition: Text
 
 
+class MethodGap(BaseModel):
+    """A limit of HOW this was verified, accepted as it stands."""
+
+    model_config = _CONFIG
+
+    kind: Literal["method"]
+    detail: Text
+
+
+class OwnerGap(BaseModel):
+    """Only the owner can check it: their account, their device, their judgment."""
+
+    model_config = _CONFIG
+
+    kind: Literal["owner_only"]
+    detail: Text
+
+
+#: An event-gated trigger that is a DATE. Anything else is a named event.
+TRIGGER_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+#: A string that LOOKS like a date. Matching it while failing to be a real
+#: ``YYYY-MM-DD`` is refused: a mistyped date read as a named event would mean a
+#: different thing than the writer wrote, and nothing downstream could tell.
+_DATE_LIKE = re.compile(r"^\d{4}-?\d{1,2}-?\d{1,2}")
+
+
+class EventGatedGap(BaseModel):
+    """Measurable only after something happens: a date, or a named event."""
+
+    model_config = _CONFIG
+
+    kind: Literal["event_gated"]
+    detail: Text
+    #: ``YYYY-MM-DD``, or a named event (a job's next run, the next deploy).
+    trigger: Text
+    #: One read-only command or SQL that re-measures it once the trigger passes.
+    recheck: Text
+
+    @field_validator("trigger")
+    @classmethod
+    def _a_date_is_a_real_date(cls, value: str) -> str:
+        if not _DATE_LIKE.match(value):
+            return value
+        try:
+            real = bool(TRIGGER_DATE.match(value)) and bool(date.fromisoformat(value))
+        except ValueError:
+            real = False
+        if not real:
+            raise ValueError(
+                f"{value!r} looks like a date but is not a real YYYY-MM-DD; write the "
+                f"date exactly, or name the event in words"
+            )
+        return value
+
+
+class NotYetDoneGap(BaseModel):
+    """Reachable work the validator has not done. Keeps the row OPEN."""
+
+    model_config = _CONFIG
+
+    kind: Literal["not_yet_done"]
+    detail: Text
+    #: What to run to do it — it leads the row's note on the backlog.
+    command: Text
+
+
+Gap = Annotated[MethodGap | OwnerGap | EventGatedGap | NotYetDoneGap, Field(discriminator="kind")]
+
+
 class EvidenceDocument(BaseModel):
     """The whole evidence document. ``extra="forbid"``: an unknown key is almost
-    always a typo of a real one (``scope_limit`` for ``scope_limits``), and dropping
-    it silently would lose exactly the field the writer meant to fill."""
+    always a typo of a real one (``control`` for ``controls``), and dropping it
+    silently would lose exactly the field the writer meant to fill. It is also what
+    refuses a document still carrying ``scope_limits``, the untyped list ``gaps``
+    replaced — see its hint."""
 
     model_config = _CONFIG
 
@@ -182,7 +272,7 @@ class EvidenceDocument(BaseModel):
     deploy: Deploy
     claims: list[Claim] = Field(min_length=1)
     controls: list[Text] = []
-    scope_limits: list[Text] = []
+    gaps: list[Gap] = []
     findings: list[Finding] = []
 
     @field_validator("repo", mode="before")
@@ -211,9 +301,16 @@ _HINTS = {
     "document naming the wrong row would be permanent",
     "pr": "repo + pr ARE the ledger row's key; a closed row cannot be amended, so a "
     "document naming the wrong row would be permanent",
-    "merge_commit": "it names WHICH artifact was checked — deploy.method alone cannot",
+    "merge_commit": "the PR's OWN merge commit (gh pr view --json mergeCommit), 7+ hex "
+    "chars — close checks it; name the deployed artifact in deploy.detail",
     "controls": "each entry names an arm that had to come out the other way, and did",
-    "scope_limits": "each entry names a gap this install could not reach",
+    "gaps": "each gap is an object whose 'kind' decides what it does: 'method' or "
+    "'owner_only' (+detail), and 'event_gated' (+detail, +trigger, +recheck) close the "
+    "row with the gap named; 'not_yet_done' (+detail, +command) keeps it OPEN until "
+    "you run the command",
+    "scope_limits": "replaced by 'gaps', a list of objects each with a 'kind' "
+    "(method, event_gated, owner_only, not_yet_done). It is never mapped across: the "
+    "kind decides the verdict, so each entry needs its kind chosen by you",
 }
 
 
@@ -243,11 +340,23 @@ class Derivation:
     """What the document itself establishes, before any caller judgment."""
 
     verdict: str
-    #: Named gaps — the declared ``scope_limits`` plus the ones the document implies.
+    #: Named gaps — the declared ``gaps``, rendered, plus the ones the document implies.
     gaps: tuple[str, ...]
     #: Claim texts that FAILED at an ESTABLISHING tier (non-empty exactly when
     #: ``verdict == "fail-intent"``). An INFERRED failure is a gap, not this.
     failed: tuple[str, ...]
+
+
+def _render(gap: MethodGap | OwnerGap | EventGatedGap | NotYetDoneGap) -> str:
+    if isinstance(gap, NotYetDoneGap):
+        # Command first: the backlog clips a note at 120 characters, and the
+        # command is the part the next validator needs.
+        return f"{NOT_YET_DONE} — run: {gap.command} ({gap.detail})"
+    if isinstance(gap, EventGatedGap):
+        return f"{EVENT_GATED} ({gap.trigger}): {gap.detail} — recheck: {gap.recheck}"
+    if isinstance(gap, OwnerGap):
+        return f"{OWNER_ONLY}: {gap.detail}"
+    return gap.detail
 
 
 def derive(doc: EvidenceDocument) -> Derivation:
@@ -257,6 +366,7 @@ def derive(doc: EvidenceDocument) -> Derivation:
 
         deploy.established is false                   -> cannot-verify          (open)
         a claim failed at MEASURED or READ            -> fail-intent            (open)
+        a not_yet_done gap                            -> not-yet-done           (open)
         a claim failed at INFERRED                    -> cannot-verify          (open)
         no claim passing at MEASURED or READ          -> cannot-verify          (open)
         no gaps                                       -> pass-mechanical        (closes)
@@ -272,7 +382,14 @@ def derive(doc: EvidenceDocument) -> Derivation:
     becomes a named :data:`SUSPECTED_FAILURE` gap and keeps the row open — never a
     closure, and never reported as measured.
 
-    ``gaps`` is DERIVED as well as declared: the declared ``scope_limits``, plus
+    ``not-yet-done`` sits after a failure and before every cannot-verify: work the
+    validator could still do is not a reason the row cannot be verified, and an
+    ESTABLISHED failure outranks it because that goes to the user whatever else is
+    owed. Deployment still comes first — a not_yet_done gap on an undeployed tree is
+    listed among its gaps, but there the deploy is the next step.
+
+    ``gaps`` is DERIVED as well as declared: the declared ``gaps`` rendered with their
+    kind, plus
     :data:`NO_CONTROL_GAP` when there are no controls, plus every claim at
     ``NOT_VERIFIABLE_HERE`` or ``INFERRED`` (an inferred FAILURE as its
     :data:`SUSPECTED_FAILURE` gap, listed once). Deriving them is what makes the tree
@@ -286,7 +403,7 @@ def derive(doc: EvidenceDocument) -> Derivation:
             f"{UNDEPLOYED_FAILURE} ({c.tier}): {c.claim}" for c in doc.claims if c.verdict == "fail"
         ]
         gaps = [f"{NOT_DEPLOYED} ({doc.deploy.method}): {doc.deploy.detail}", *undeployed]
-        gaps += list(doc.scope_limits)
+        gaps += [_render(g) for g in doc.gaps]
         return Derivation("cannot-verify", gaps=tuple(gaps), failed=())
 
     failed = tuple(
@@ -300,7 +417,7 @@ def derive(doc: EvidenceDocument) -> Derivation:
         for c in doc.claims
         if c.verdict == "fail" and c.tier == "INFERRED"
     ]
-    gaps: list[str] = suspected + list(doc.scope_limits)
+    gaps: list[str] = suspected + [_render(g) for g in doc.gaps]
     if not doc.controls:
         gaps.append(NO_CONTROL_GAP)
     gaps += [
@@ -310,6 +427,8 @@ def derive(doc: EvidenceDocument) -> Derivation:
         f"INFERRED: {c.claim}" for c in doc.claims if c.tier == "INFERRED" and c.verdict == "pass"
     ]
 
+    if any(isinstance(g, NotYetDoneGap) for g in doc.gaps):
+        return Derivation("not-yet-done", gaps=tuple(gaps), failed=())
     established = any(c.verdict == "pass" and c.tier in ESTABLISHING_TIERS for c in doc.claims)
     if suspected or not established:
         return Derivation("cannot-verify", gaps=tuple(gaps), failed=())
@@ -358,7 +477,8 @@ def decide(
     * ``park`` turns a derived ``pass-with-measured-gaps`` into ``cannot-verify``:
       something was established, but nothing MATERIAL was. Refused on any other
       derivation — ``pass-mechanical`` has no gaps to park on, ``cannot-verify`` is
-      already parked, and a FAILURE may never be parked: it goes to the owner as a
+      already parked, ``not-yet-done`` names work to do rather than a reason it
+      cannot be done, and a FAILURE may never be parked: it goes to the owner as a
       conversation, never quietly into the backlog (standing ruling).
     * ``asserted`` is an optional expectation, checked for EQUALITY with the outcome.
       One comparison, so it cannot contradict anything. Kept because a validator who
@@ -367,9 +487,11 @@ def decide(
       failing claim is exit 3 (policy); every other mismatch is exit 2, and the one
       a caller's judgment can resolve (``cannot-verify`` on a measured-gaps document)
       names ``--park``.
-    * ``note`` is required exactly when the outcome leaves the row open — it is the
-      whole value of an open row — and refused on a closing outcome, where nothing
-      would record it.
+    * ``note`` is required when the outcome leaves the row open — it is the whole
+      value of an open row — and refused on a closing outcome, where nothing would
+      record it. ``not-yet-done`` is the exception: its NOT YET DONE gaps already
+      say what is left and what to run, so they ARE the note, and a ``note`` given
+      anyway is appended after them.
     """
     if asserted is not None and asserted not in VERDICTS:
         return Refusal(2, f"--verdict must be one of {list(VERDICTS)}, got {asserted!r}")
@@ -390,6 +512,7 @@ def decide(
             why = {
                 "pass-mechanical": "it has no gaps to park on — it is a clean pass",
                 "cannot-verify": "it already derives cannot-verify; --park adds nothing",
+                "not-yet-done": "it names work still to do: do the commands, then re-run",
             }[d.verdict]
             return Refusal(2, f"--park refused: this document derives {d.verdict}, and {why}.")
         verdict = "cannot-verify"
@@ -421,10 +544,16 @@ def decide(
                 "record MEASURED only if the measurement shows it. Never relabel a tier "
                 "to reach a verdict."
             )
+        elif d.verdict == "not-yet-done":
+            # The tempting wrong fix is relabelling the gap's kind; name the right one.
+            advice = (
+                " A NOT YET DONE gap is work you can still do: run the listed commands, "
+                "then re-measure. Never change a gap's kind to reach a verdict."
+            )
         else:
             advice = (
-                " The verdict follows from the claims, controls and scope limits, so "
-                "change the document if it is wrong, not the verdict."
+                " The verdict follows from the claims, controls and gaps, so change the "
+                "document if it is wrong, not the verdict."
             )
         return Refusal(
             code,
@@ -441,7 +570,7 @@ def decide(
     )
     suspected = tuple(g for g in d.gaps if g.startswith(SUSPECTED_FAILURE))
     undeployed = tuple(g for g in d.gaps if g.startswith((NOT_DEPLOYED, UNDEPLOYED_FAILURE)))
-    if not closing and not note_text:
+    if not closing and not note_text and verdict != "not-yet-done":
         if verdict == "fail-intent":
             why = (
                 "record what failed and what the user needs to know — this row is the "
@@ -457,8 +586,8 @@ def decide(
         elif undeployed:
             why = (
                 "say what stands between this tree and the merge. If you can deploy it "
-                "and re-run, that is not cannot-verify — it is not-yet-done: leave the "
-                "row alone." + _listing("gap", undeployed)
+                "and re-run, that is not cannot-verify — it is not-yet-done work: do it "
+                "rather than record this." + _listing("gap", undeployed)
             )
         elif suspected:
             why = (
@@ -471,7 +600,8 @@ def decide(
                 "it is what stops the next validator re-deriving why this could not be "
                 "finished.\n"
                 "  And if you COULD have finished it with the access and time you had, "
-                "this is not cannot-verify — it is not-yet-done. Leave the row alone."
+                "this is not cannot-verify — it is not-yet-done: do it, or name each "
+                "step as a not_yet_done gap with the command that does it."
             )
         return Refusal(2, f"{outcome}, which leaves the row OPEN, so --note is required: {why}")
     if closing and note_text:

@@ -8,7 +8,7 @@ import json
 import os
 import sqlite3
 import subprocess
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 import pytest
@@ -57,6 +57,8 @@ def _rows(table):
                     "pending": "SELECT * FROM pending",
                     "failed": "SELECT * FROM failed",
                     "failed_outcomes": "SELECT * FROM failed_outcomes",
+                    "executions": "SELECT * FROM executions",
+                    "repo_state": "SELECT * FROM repo_state",
                 }[table]
             )
         ]
@@ -115,11 +117,13 @@ def test_poison_cannot_replace_existing_business_failure():
     h = im.marker_hash("/tmp")
     im.write_marker("/tmp", "cbm", "fast")
     for _ in range(im.MAX_ATTEMPTS):
-        claim = im.claim(h)
-        im.restore(h, claim_id=claim["claim_id"], attempts_inc=True)
+        claim = im.claim(h, provider="cbm")
+        im.restore(claim["context"], attempts_inc=True)
     before = im.get_failed(h)
     with im._write_db() as db:
-        im._record_failed_outcome(db, h, "owned conflict", b"original")
+        db.execute(
+            "INSERT INTO failed_outcomes VALUES(?,?,?,?)", (h, "old owned conflict", b"original", 1)
+        )
     before_outcome = _rows("failed_outcomes")
     _artifact(h + ".failed.json", b"{invalid")
     _artifact(".outcome-" + h, b"{invalid")
@@ -146,11 +150,12 @@ def test_legacy_failed_outcome_is_receipt_only():
 def test_legacy_failed_outcome_cannot_erase_claim_conflict(late_kind):
     h = im.marker_hash("/tmp")
     im.write_marker("/tmp", "cbm", "fast")
-    nonce = im.claim(h)["claim_id"]
-    with im._write_db() as db:
-        assert im._record_outcome_db(db, h, nonce, "consume", 1, b"first") == "recorded"
-        assert im._record_outcome_db(db, h, nonce, "restore", 2, b"conflict") == "conflict"
-    before = _rows("failed_outcomes")
+    context = im.claim(h, provider="cbm")["context"]
+    nonce = context["claim_id"]
+    im.remember_outcome(context, "consume")
+    with pytest.raises(RuntimeError, match="conflicting durable queue outcomes"):
+        im.remember_outcome(context, "restore")
+    before = _rows("executions")
     raw = b"{historical malformed outcome"
     _artifact(".failed-outcome-" + h, raw)
     if late_kind == "sidecar":
@@ -161,14 +166,17 @@ def test_legacy_failed_outcome_cannot_erase_claim_conflict(late_kind):
             ).encode(),
         )
     else:
-        im._write_outcome_spool(h, nonce, "consume")
+        event = im._legs.scalar_event(context, "consume", 3, im.marker_hash)
+        im._write_outcome_spool(context, event)
     assert im.list_markers() == []
-    assert _rows("failed_outcomes") == before
-    assert im.apply_remembered_outcome(h) is None
+    assert _rows("executions") == before
+    with pytest.raises(RuntimeError, match="requires reconciliation"):
+        im.apply_remembered_outcome(context)
     receipt = [r for r in _rows("legacy_imports") if r["reason"] == "legacy-failed-outcome"]
     assert len(receipt) == 1 and bytes(receipt[0]["raw_payload"]) == raw
-    assert im.repend_stale_inflight() == [h]
-    assert im.list_markers()[0]["attempts"] == 1
+    with pytest.raises(RuntimeError, match="requires reconciliation"):
+        im.repend_stale_inflight()
+    assert im.get_inflight(h)["attempts"] == 0 and im.list_markers() == []
 
 
 @pytest.mark.parametrize("name", [b"\xff.json", b"line\nbreak.json"])
@@ -194,15 +202,16 @@ def test_savepoint_removes_partial_sql_then_imports_sibling(monkeypatch):
     _artifact(im.marker_hash("/tmp") + ".json", json.dumps(_payload()).encode())
     original = im._import_one
 
-    def partial(db, source, raw):
+    def partial(db, source, raw, artifact_identity=None):
         if source.name == bad_hash + ".json":
             im._coalesce_pending(db, bad_hash, _payload(repo_path="/tmp/partial"))
             raise im._legacy.LegacyArtifactInvalid("injected-after-insert")
-        return original(db, source, raw)
+        return original(db, source, raw, artifact_identity)
 
     monkeypatch.setattr(im, "_import_one", partial)
     assert [r["hash"] for r in im.list_markers()] == [im.marker_hash("/tmp")]
     assert len(_rows("pending")) == 1
+    assert all(row["hash"] != bad_hash for row in _rows("repo_state"))
     assert len(_rows("legacy_imports")) == 2
 
 
@@ -218,7 +227,7 @@ def test_non_content_errors_abort_batch_without_receipt_or_retirement(monkeypatc
     h = im.marker_hash("/tmp")
     source = _artifact(h + ".json", json.dumps(_payload()).encode())
 
-    def broken(db, path, raw):
+    def broken(db, path, raw, artifact_identity=None):
         im._coalesce_pending(db, h, _payload())
         raise error
 
@@ -344,6 +353,7 @@ def _schema_one(*, corrupt=False):
 
 def test_schema_upgrade_retains_history_and_old_reader_refuses(monkeypatch):
     _schema_one()
+    im.convert_queue()
     assert im.list_markers() == []
     receipt = _rows("legacy_imports")[0]
     assert bytes(receipt["source_name_bytes"]) == b"legacy.json"
@@ -368,8 +378,8 @@ def test_failed_upgrade_keeps_original_schema_and_metadata(monkeypatch, fault):
     if fault == "mid-copy":
         monkeypatch.setattr(im._legacy, "upgrade_receipts", interrupted)
     with pytest.raises(RuntimeError, match="invalid legacy import metadata|injected interruption"):
-        im.list_markers()
-    with sqlite3.connect(im.database_path()) as db:
+        im.convert_queue()
+    with closing(sqlite3.connect(im.database_path())) as db:
         assert db.execute("PRAGMA user_version").fetchone()[0] == 1
         assert (
             db.execute("SELECT value FROM queue_meta WHERE key='schema_version'").fetchone()[0]
@@ -389,7 +399,7 @@ def test_same_source_changed_bytes_and_metadata_retain_every_identity():
     im.list_markers()
     source = _artifact(h + ".json", json.dumps(_payload(tools="gitnexus")).encode())
     os.utime(source, ns=(first_mtime, first_mtime))
-    assert im.list_markers()[0]["tools"] == "both"
+    assert {row["provider"] for row in im.list_markers()} == {"cbm", "gitnexus"}
     source = _artifact(h + ".json", json.dumps(_payload(tools="gitnexus")).encode())
     os.utime(source, ns=(first_mtime + 1000, first_mtime + 1000))
     im.list_markers()
@@ -411,7 +421,7 @@ def test_import_status_absent_old_supported_and_truncated_are_readonly(monkeypat
     }
     assert im.database_path().read_bytes() == before
     assert sorted(p.name for p in im.marker_dir().iterdir()) == files
-    im.list_markers()
+    im.convert_queue()
     _artifact("bad.json", b"{invalid")
     im.list_markers()
     before = im.database_path().read_bytes()
@@ -491,11 +501,17 @@ def test_cli_poison_and_valid_request_ownership_roundtrip():
     replay = _cli("reconcile-inflight")
     assert replay.returncode == 0, replay.stderr
     listed = _cli("list")
-    assert listed.returncode == 0 and listed.stdout.split("\t")[4] == "2"
-    claimed = _cli("claim", "--hash", h)
+    assert listed.returncode == 0 and listed.stdout == ""
+    old = im.get_inflight(h)
+    assert old["protocol"] == 1 and old["attempts"] == 2 and old["outcome_action"] == "restore"
+    assert _cli("claim", "--hash", h, "--provider", "cbm").returncode == 1
+    assert _cli("write", "--repo", "/tmp/current", "--tools", "cbm").returncode == 0
+    current_hash = im.marker_hash("/tmp/current")
+    claimed = _cli("claim", "--hash", current_hash, "--provider", "cbm")
     assert claimed.returncode == 0
-    nonce = claimed.stdout.rstrip("\n").split("\t")[-1]
-    assert _cli("consume", "--hash", h, "--claim-id", nonce).returncode == 0
+    context = json.loads(claimed.stdout)["context"]
+    assert _cli("consume", "--context", json.dumps(context)).returncode == 0
     assert _cli("list").stdout == ""
+    assert im.get_inflight(h) == old and im.get_inflight(current_hash) is None
     status = json.loads(_cli("import-status").stdout)
     assert status["counts"] == {"imported": 2, "quarantined": 1}
