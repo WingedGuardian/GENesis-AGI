@@ -24,6 +24,7 @@ import importlib.util
 import json
 import os
 import shlex
+import site
 import sqlite3
 import subprocess
 import sys
@@ -359,7 +360,16 @@ class TestBackgroundAlertLevel:
     @staticmethod
     def _run_in(home: Path, command: str, db: str, session: str = "s") -> str:
         """Run the guard dispatched with HOME and cwd at a stub checkout."""
-        env = {**os.environ, "GENESIS_DB_PATH": db, "GENESIS_CC_SESSION": "1", "HOME": str(home)}
+        env = {
+            **os.environ,
+            "GENESIS_DB_PATH": db,
+            "GENESIS_CC_SESSION": "1",
+            "HOME": str(home),
+            # Moving HOME moves Python's user site; keep the real one, or an
+            # install whose dependencies live there cannot import them and the
+            # record is silently not written.
+            "PYTHONUSERBASE": site.getuserbase(),
+        }
         proc = subprocess.run(
             [sys.executable, str(_GUARD)],
             input=json.dumps(
@@ -396,7 +406,16 @@ class TestBackgroundAlertLevel:
         assert "ghp_" not in content
 
     def test_the_deny_reason_no_longer_promises_a_critical(self, home: Path, db: str) -> None:
-        env = {**os.environ, "GENESIS_DB_PATH": db, "GENESIS_CC_SESSION": "1", "HOME": str(home)}
+        env = {
+            **os.environ,
+            "GENESIS_DB_PATH": db,
+            "GENESIS_CC_SESSION": "1",
+            "HOME": str(home),
+            # Moving HOME moves Python's user site; keep the real one, or an
+            # install whose dependencies live there cannot import them and the
+            # record is silently not written.
+            "PYTHONUSERBASE": site.getuserbase(),
+        }
         proc = subprocess.run(
             [sys.executable, str(_GUARD)],
             input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "cat secrets.env"}}),

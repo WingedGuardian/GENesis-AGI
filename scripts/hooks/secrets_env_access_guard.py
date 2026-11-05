@@ -146,10 +146,10 @@ def main() -> int:
     # that gets clicked through, and the full text is in the transcript anyway.
     whole = " ".join((command or " ".join(paths)).split())
     subject = whole[:240] + " …" if len(whole) > 240 else whole
-    # The RECORD gets the command whole (bounded far past what it shows), so
-    # needs_user scrubs it before cutting it: a credential split by the cut
-    # above would no longer match the scrub's patterns and would be stored.
-    record_detail = whole[:4000]
+    # The RECORD gets the command whole, so needs_user scrubs it before cutting
+    # it: a credential split by the cut above would no longer match the scrub's
+    # patterns and would be stored. needs_user owns the bound (_excerpt).
+    record_detail = whole
 
     reason = (
         "GENESIS CREDENTIALS — this is not a routine approval.\n\n"

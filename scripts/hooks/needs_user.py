@@ -100,12 +100,16 @@ def is_dispatched() -> bool:
 
 #: Longest command excerpt a record keeps, AFTER scrubbing.
 _EXCERPT_CHARS = 240
+#: How much of the detail is scrubbed at all (a command can be very long). It
+#: must stay well past _EXCERPT_CHARS: text cut here, before the scrub, is
+#: never kept, so a credential split at this bound cannot reach the record.
+_SCRUB_CHARS = 16 * _EXCERPT_CHARS
 
 
 def _excerpt(detail: str) -> str:
     """Scrub first, then cut: a cut first can split a credential so the scrub
     patterns no longer match it, and the fragment would be stored."""
-    clean = scrub(detail)
+    clean = scrub(detail[:_SCRUB_CHARS])
     return clean[:_EXCERPT_CHARS] + " …" if len(clean) > _EXCERPT_CHARS else clean
 
 
