@@ -631,17 +631,17 @@ elif command -v python3 &>/dev/null && python3 -c "import sys; sys.exit(0 if (3,
         if ! genesis_install_python312_uv; then
             echo "  WARNING: could not install python3.12; continuing on $(python3 --version), which CI does not test"
             # Survives update.sh's tail of this output.
-            echo "python3.12 could not be installed; a new venv uses $(python3 --version). To retry, delete $GENESIS_ROOT/.venv and re-run." >> "$GENESIS_DEPLOY_SUMMARY"
+            echo "python3.12 could not be installed; a new venv uses $(python3 --version). To retry, delete $GENESIS_ROOT/.venv and re-run." >> "$GENESIS_DEPLOY_SUMMARY" || true
         fi
     fi
-    echo "  Python: $( (command -v python3.12 >/dev/null && python3.12 --version) || python3 --version)"
+    echo "  Python: $("$(genesis_python_bin)" --version)"
 else
     _found_ver=$(python3 --version 2>/dev/null || echo "not found")
     echo "  Python 3.12-3.14 required (found: $_found_ver) — run install.sh to install it"
     echo "  Or install manually and re-run bootstrap."
     exit 1
 fi
-PYTHON_BIN=$(command -v python3.12 || command -v python3)
+PYTHON_BIN=$(genesis_python_bin)
 PYTHON_VERSION=$("$PYTHON_BIN" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
 
 # python3-venv (needed for venv creation on Debian/Ubuntu)

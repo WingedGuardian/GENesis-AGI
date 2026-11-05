@@ -50,7 +50,13 @@ class _Host:
         self.uv_python = tmp_path / "uv-managed" / "bin" / "python3.12"
         _fake_python(self.uv_python, 12)
 
-    def fake_uv(self, path: Path, *, install_rc: int = 0, find: str | None = None) -> Path:
+    def fake_uv(
+        self,
+        path: Path,
+        *,
+        install_rc: int = 0,
+        find: str | None = None,
+    ) -> Path:
         answer = self.uv_python if find is None else find
         return _stub(
             path,
@@ -85,7 +91,7 @@ done""",
         _stub(self.bin / "sudo", f'echo "sudo $*" >> {self.calls}\n[ "{works}" = True ]')
 
     def run(self, script: str) -> subprocess.CompletedProcess[str]:
-        for tool in ("ln", "rm", "mkdir", "mktemp", "cat", "chmod", "grep", "sh"):
+        for tool in ("ln", "rm", "mkdir", "mktemp", "cat", "chmod", "grep", "sh", "readlink"):
             link = self.bin / tool
             if not link.exists():
                 link.symlink_to(f"/usr/bin/{tool}")
@@ -94,7 +100,11 @@ done""",
             capture_output=True,
             text=True,
             timeout=30,
-            env={"HOME": str(self.home), "PATH": str(self.bin), "TMPDIR": str(self.home)},
+            env={
+                "HOME": str(self.home),
+                "PATH": str(self.bin),
+                "TMPDIR": str(self.home),
+            },
         )
 
     def logged(self) -> str:
@@ -179,7 +189,7 @@ def test_a_host_without_sudo_links_it_in_the_users_bin(host):
     host.fake_uv(host.bin / "uv")
     host.fake_sudo(works=False)
     assert _install_uv(host).returncode == 0
-    assert (host.home / ".local/bin/python3.12").resolve() == host.uv_python
+    assert (host.home / ".local/bin/python3.12").resolve() == host.uv_python.resolve()
 
 
 def test_a_failed_download_is_not_run(host):
@@ -237,6 +247,19 @@ def test_sudo_is_asked_without_a_prompt_and_links_the_uv_python(host):
     assert f"sudo -n ln -sf {host.uv_python} /usr/local/bin/python3.12" in host.logged()
 
 
+def test_a_host_where_no_link_can_be_made_still_builds_on_312(entry, host):
+    """uv's own path is what the venv is built from, so a link that cannot be
+    made is no reason to warn about, or fall back to, the newer Python."""
+    _fake_python(host.bin / "python3", 14)
+    host.fake_uv(host.bin / "uv")
+    host.fake_sudo(works=False)
+    _stub(host.bin / "ln", "exit 1")
+    done = entry()
+    assert done.returncode == 0, done.stderr
+    assert "which CI does not test" not in done.stdout
+    assert f"CHOSE {host.uv_python}\n" in done.stdout
+
+
 def test_a_failed_uv_install_links_nothing(host):
     host.fake_uv(host.bin / "uv", install_rc=1)
     host.fake_sudo(works=True)
@@ -276,7 +299,8 @@ def _run_install_block(
         f'VENV_PATH="{venv}"\n'
         f"PREFLIGHT_OK={preflight_ok}\n"
         'setup_warn() { echo "SETUP_WARN: $1"; }\n' + _install_block() + "fi\n"
-        'echo "CHOSE $(command -v python3.12 || command -v python3)"\n'
+        + re.search(r"^PYTHON_BIN=.*\n", INSTALL.read_text(), re.M).group()
+        + 'echo "CHOSE $PYTHON_BIN"\n'
     )
     return host.run(script)
 
@@ -312,7 +336,7 @@ def test_a_host_on_314_gets_312(entry, host):
     host.fake_sudo(works=False)
     done = entry()
     assert done.returncode == 0, done.stderr
-    assert re.search(r"CHOSE .*python3\.12$", done.stdout, re.M), done.stdout
+    assert f"CHOSE {host.uv_python}\n" in done.stdout
 
 
 def test_an_update_on_a_running_venv_installs_nothing(entry, host, tmp_path):
@@ -405,3 +429,10 @@ def test_a_system_python312_is_taken_without_uv(entry, host):
 def test_the_lib_defines_functions_and_runs_nothing(host):
     assert host.run(f'. "{LIB}"').returncode == 0
     assert host.logged() == ""
+
+
+def test_every_python_choice_in_install_goes_through_the_helper():
+    """A second spelling would build the venv through the link again."""
+    assert "command -v python3.12 || command -v python3)" not in re.sub(
+        r"\(python3\.12 --version.*", "", INSTALL.read_text()
+    )

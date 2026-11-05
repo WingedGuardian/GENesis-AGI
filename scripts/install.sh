@@ -421,7 +421,7 @@ elif [[ "$_PKG_MGR" == "yum" ]]; then
 fi
 
 # pip — check on python3.12 first (installed in pre-flight), then fall back to python3
-_PIP_BIN=$(command -v python3.12 || command -v python3)
+_PIP_BIN=$(genesis_python_bin)
 if ! "$_PIP_BIN" -m pip --version &>/dev/null; then
     echo "    pip not found — installing..."
     if [[ "$_PKG_MGR" == "apt" ]]; then
@@ -443,7 +443,7 @@ fi
 
 # venv module — check ensurepip, not just "import venv" (the venv module ships
 # with base Python but ensurepip requires the python3.XX-venv package on apt systems)
-_CHECK_PY=$(command -v python3.12 || command -v python3)
+_CHECK_PY=$(genesis_python_bin)
 _PY_MINOR=$("$_CHECK_PY" -c 'import sys; print(sys.version_info.minor)')
 if ! "$_CHECK_PY" -c "import ensurepip" &>/dev/null; then
     echo "    python3.${_PY_MINOR}-venv not found — installing..."
@@ -720,7 +720,7 @@ if command -v uv &>/dev/null; then
 fi
 
 # Python venv — prefer python3.12 for venv creation
-PYTHON_BIN=$(command -v python3.12 || command -v python3)
+PYTHON_BIN=$(genesis_python_bin)
 if [ ! -d "$VENV_PATH" ] || [ ! -x "$VENV_PATH/bin/python" ] || [ ! -x "$VENV_PATH/bin/pip" ]; then
     # Remove broken venv before recreating
     if [ -d "$VENV_PATH" ]; then

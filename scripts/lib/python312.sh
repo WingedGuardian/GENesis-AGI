@@ -19,7 +19,8 @@ genesis_new_venv_wants_python312() {
 }
 
 # Installs uv's pre-built Python 3.12 (no compilation) and puts python3.12 on
-# PATH. Returns non-zero, having changed no package source, when it cannot.
+# PATH where it can. Returns non-zero, having changed no package source, when
+# there is no such Python to use.
 genesis_install_python312_uv() {
     echo "    Trying uv (pre-built Python 3.12 binary — no compilation needed)..."
     local uv_bin installer py_path
@@ -42,10 +43,21 @@ genesis_install_python312_uv() {
     # --system: without it, uv answers with a .venv in the working directory.
     py_path="$("$uv_bin" python find --system 3.12)" || return 1
     [ -n "$py_path" ] && [ -x "$py_path" ] || return 1
+    GENESIS_PYTHON312="$py_path"
     # So 'python3.12' is discoverable system-wide
     sudo -n ln -sf "$py_path" /usr/local/bin/python3.12 2>/dev/null \
         || { mkdir -p "$HOME/.local/bin" && ln -sf "$py_path" "$HOME/.local/bin/python3.12"; } 2>/dev/null \
         || true
     export PATH="$HOME/.local/bin:$PATH"
-    command -v python3.12 >/dev/null 2>&1
+}
+
+# The interpreter to build a venv from. Prefer uv's own path over a link to it:
+# a venv built through a link in another directory fails to start on some builds
+# (measured on 3.12.10, not 3.12.15).
+genesis_python_bin() {
+    if [ -n "${GENESIS_PYTHON312:-}" ]; then
+        echo "$GENESIS_PYTHON312"
+    else
+        command -v python3.12 || command -v python3
+    fi
 }
