@@ -554,6 +554,7 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
                     "${PRESSURE_UNIT}@standard.service" \
                     "${PRESSURE_UNIT}@last-resort.service" \
                     genesis-disk-hygiene.timer genesis-disk-hygiene.service \
+                    genesis-worktree-reaper.service \
                     genesis-cc-tmp-align.timer genesis-cc-tmp-align.service \
                     genesis-cc-settings-align.timer genesis-cc-settings-align.service \
                     genesis-graph-project.timer genesis-graph-project.service \
@@ -607,6 +608,13 @@ if [ "$MODE" != "guardian-only" ] && [ "$HAS_GENESIS" = true ]; then
         SYSTEMD_DIR="$HOME/.config/systemd/user"
         for f in "$SYSTEMD_DIR"/genesis-*.service "$SYSTEMD_DIR"/genesis-*.timer "$SYSTEMD_DIR/genesis-workload.slice" "$SYSTEMD_DIR/qdrant.service"; do
             { [ -e "$f" ] || [ -L "$f" ]; } && safe_remove "$f" "systemd/$(basename "$f")"
+        done
+        # The user-manager oomd drop-ins (lib/memory_resilience.sh) sit on
+        # non-Genesis unit names, so the glob above misses them; left behind,
+        # oomd keeps monitoring the user's remaining services at 60%.
+        for d in -.slice.d init.scope.d dbus.service.d; do
+            f="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$d/genesis-oomd.conf"
+            { [ -e "$f" ] || [ -L "$f" ]; } && safe_remove "$f" "systemd/$d/genesis-oomd.conf"
         done
         systemctl --user daemon-reload 2>/dev/null || true
 

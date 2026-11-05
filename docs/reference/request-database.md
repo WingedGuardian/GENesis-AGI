@@ -30,9 +30,11 @@ commit semantics.
 
 Opening and cleanup tasks are retained through cancellation. Capacity is released
 only after confirmed closure. A close failure propagates and retains that capacity;
-manager shutdown reports unconfirmed closures. `close()` stops admission, cancels
-active/waiting units and joins cleanup. It must run outside a unit. It cannot force
-a stuck SQLite worker thread to terminate.
+manager shutdown reports unconfirmed closures, including a unit whose task finished
+without leaving it. `close()` stops admission, cancels active/waiting units and joins
+cleanup. It must run outside a unit, and the caller may bound its wait. It cannot
+force a stuck SQLite worker thread to terminate, and it waits on a unit whose task
+swallows cancellation; a unit that swallows cancellation and exits normally commits.
 
 SQL without a live unit and saved cursor operations after scope exit raise
 `DatabaseScopeError`. Cursors are closed at scope exit because a partially fetched

@@ -431,7 +431,15 @@ their own Chrome, or, when card fill is on, use `browser_fill_card`:
 - The tool reopens the checkout in a window no other tool reaches, waits for
   the owner's Telegram tap, fills, clicks Pay itself and closes the window.
   You get a fixed `code` and `status` only.
+- A checkout that shows its result in place after Pay (the page does not
+  change: a drawer or panel swaps to a receipt) takes `success`: a selector in
+  the top document for that result (a container, not a button). Shown, steady
+  and with Pay gone, it gives `submitted_in_place`; without it such a checkout
+  ends as `challenge`. After a save, Pay is found again by its selector (a
+  checkout may rebuild it) and must pass every check it passed at the tap.
 - `submitted_unverified`: check the order page or the merchant account.
+  `submitted_in_place`: most likely paid; do NOT retry; tell the owner to check
+  the merchant account.
   `challenge`, `card_url_blocked`, `card_url_leaked`, `pay_click_unknown`, `moved_while_filling`, `card_url_before_pay`, `card_value_in_request` or `outcome_unknown`: do NOT retry; tell the owner the outcome is
   unknown. `card_url_before_pay`: Pay was not clicked, but a card value was
   sent or nearly sent in a URL; tell the owner the card may be exposed.

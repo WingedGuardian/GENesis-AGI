@@ -27,6 +27,7 @@ from genesis.dashboard.update_marker import (
 from genesis.db.connection import connect_sqlite_rw
 from genesis.env import genesis_home, update_in_progress
 from genesis.observability.deploy_record import row_facts
+from genesis.util.systemd import literal_scope_args
 
 logger = logging.getLogger(__name__)
 
@@ -437,7 +438,7 @@ def _systemd_run_scope_available(env: dict) -> bool:
     """
     try:
         r = subprocess.run(
-            ["systemd-run", "--user", "--scope", "--", "true"],
+            ["systemd-run", "--user", "--scope", *literal_scope_args(), "--", "true"],
             capture_output=True, timeout=10, env=env,
         )
         return r.returncode == 0
@@ -465,7 +466,7 @@ def _apply_direct(pid_file: Path) -> tuple:
         env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus")
         if _systemd_run_scope_available(env):
             proc = subprocess.Popen(
-                ["systemd-run", "--user", "--scope", "--", "bash", str(_UPDATE_SCRIPT)],
+                ["systemd-run", "--user", "--scope", *literal_scope_args(), "--", "bash", str(_UPDATE_SCRIPT)],
                 stdout=log_fh,
                 stderr=subprocess.STDOUT,
                 env=env,
@@ -823,7 +824,7 @@ def _apply_supervised(pid_file: Path) -> tuple:
             "DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus"
         )
         proc = subprocess.Popen(
-            ["systemd-run", "--user", "--scope", "--", python, script_path],
+            ["systemd-run", "--user", "--scope", *literal_scope_args(), "--", python, script_path],
             stdout=log_fh,
             stderr=subprocess.STDOUT,
             env=env,

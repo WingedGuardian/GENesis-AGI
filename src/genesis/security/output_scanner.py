@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
+import unicodedata
 from dataclasses import dataclass
 
 from genesis.security.card_shapes import contains_card_number
@@ -135,6 +136,48 @@ def scan_outbound(content: str) -> ScanResult:
     )
 
     return ScanResult(safe=False, detected=detected, risk_level=risk_level)
+
+
+# Location-style findings (private IPs, home paths, localhost ports): not secrets. A
+# reader that keeps text for its owner may leave these in; anything else flagged is a
+# reason to withhold.
+LOCATION_FINDINGS = frozenset({"rfc1918_ip", "internal_file_path", "localhost_port"})
+
+
+def _invisible_replaced(content: str, repl: str) -> str:
+    return "".join(
+        ch if ch in "\n\t" or unicodedata.category(ch) not in ("Cc", "Cf") else repl
+        for ch in content
+    )
+
+
+def scan_outbound_normalised(content: str) -> set[str]:
+    """``scan_outbound`` findings on two normalisations of ``content``: Unicode
+    control / format characters (categories Cc and Cf: NUL, zero-width, bidi) deleted,
+    and replaced by a space. A credential such a character splits or hides from the
+    pattern set is visible in one of them. Other invisible-looking characters (combining
+    joiners, fillers) are not covered."""
+    # Fast path: ``isprintable`` (C speed) is True only when no Cc/Cf character is
+    # present (newline and tab are allowed by removing them first), and then both
+    # normalisations equal ``content``: one scan answers it.
+    if content.replace("\n", "").replace("\t", "").isprintable():
+        return set(scan_outbound(content).detected)
+    found: set[str] = set()
+    for repl in ("", " "):
+        found.update(scan_outbound(_invisible_replaced(content, repl)).detected)
+    return found
+
+
+def scan_diagnostic_controls(content: str) -> set[str]:
+    """Findings before redaction for diagnostics with changing Cc/Cf controls.
+
+    Ordinary text (including LF/TAB) needs no preflight. Keep the original view:
+    deleting controls can erase a pattern boundary that the raw text preserves.
+    Callers decide whether location-only findings are allowed in their output.
+    """
+    if _invisible_replaced(content, "") == content:
+        return set()
+    return set(scan_outbound(content).detected) | scan_outbound_normalised(content)
 
 
 # Credential shapes a redactor can cut out in place. Location-style patterns

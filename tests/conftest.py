@@ -40,6 +40,8 @@ if _WORKTREE_SRC.is_dir():
 
 import contextlib  # noqa: E402
 import os  # noqa: E402
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
 
 import aiosqlite  # noqa: E402
 import pytest  # noqa: E402
@@ -391,16 +393,19 @@ def _is_introspection_only(config) -> bool:
     )
 
 
-pytest_plugins = ["tests._live_fence"]
+pytest_plugins = ["tests._live_fence", "tests._live_closure"]
 
 
 def pytest_configure(config):
     _configure_lock_and_basetemp(config)
     # Armed AFTER the lock (a run refused by it exits above) and after basetemp is
     # placed (the fence allows fakes under it). See tests/_live_fence.py.
-    from tests import _live_fence
+    from tests import _live_closure, _live_fence
 
     _live_fence.install(config)
+    # Live state paths and endpoints out of the environment, before any test runs
+    # (a test's own monkeypatch still wins). See tests/_live_closure.py.
+    _live_closure.install(config)
 
 
 def _configure_lock_and_basetemp(config):
@@ -505,9 +510,10 @@ def pytest_unconfigure(config):
     produces."""
     target = getattr(config, "_genesis_basetemp_cleanup", None)
     try:
-        from tests import _live_fence
+        from tests import _live_closure, _live_fence
 
         _live_fence.uninstall_files(config)
+        _live_closure.uninstall_files(config)
         if target:
             # BROAD for the same reason as pytest_configure's fallback: a hook that
             # raises turns a passing suite into exit 1, and cleanup is best-effort.
@@ -634,6 +640,19 @@ def _isolate_alert_queue(tmp_path):
     mp.undo()
 
 
+# ── Determinism: a launcher's systemd-run option probe is not a process to count ─
+@pytest.fixture(autouse=True)
+def _no_systemd_run_option_probe():
+    """``literal_scope_args`` asks ``systemd-run`` for every scope a launcher builds,
+    which tests counting that launcher's processes would see, and it would make what
+    they build depend on the machine. Answers as an older systemd would, so no option is
+    added. Its own tests call the real function. Fixture-owned ``MonkeyPatch``, as above."""
+    mp = pytest.MonkeyPatch()
+    mp.setattr("genesis.util.systemd._systemd_run_refuses_literal_arguments", lambda: True)
+    yield
+    mp.undo()
+
+
 # ── Safety: prevent tests from moving files into the REAL trash ─────────────
 @pytest.fixture(autouse=True)
 def _isolate_trash_root(tmp_path):
@@ -681,6 +700,21 @@ def _skip_daily_git_deep_scan():
     mp.setattr(awareness_loop, "_last_git_deep_run_at", time.monotonic())
     mp.setattr(awareness_loop, "_git_deep_task", None)
     mp.setattr(awareness_loop, "_git_deep_stopped", False)
+    yield
+    mp.undo()
+
+
+@pytest.fixture(autouse=True)
+def _reset_memory_alarm_breakdown():
+    """Drop the memory alarm's held process breakdown (``errors._memory_culprits``)
+    so one test firing the alarm cannot hand its line to the next. Applied only
+    when the module is already loaded, like the deep-scan guard above."""
+    errors = sys.modules.get("genesis.mcp.health.errors")
+    if errors is None:
+        yield
+        return
+    mp = pytest.MonkeyPatch()
+    mp.setattr(errors, "_memory_culprits", None)
     yield
     mp.undo()
 
@@ -755,6 +789,9 @@ def _isolate_genesis_db_path(tmp_path):
         "genesis.env.genesis_db_path",
         lambda: tmp_path / "isolated-genesis.db",
     )
+    # The same file for child processes, and for modules that bound the name
+    # before this patch (``from genesis.env import genesis_db_path``).
+    mp.setenv("GENESIS_DB_PATH", str(tmp_path / "isolated-genesis.db"))
     yield
     mp.undo()
 
@@ -925,6 +962,30 @@ def _guard_db_crud_not_mocked():
             "or `with patch(...)` so the patch is restored, or set the mock on a "
             "local mock object — never assign to the real module attribute."
         )
+
+
+@contextlib.contextmanager
+def process_running_as(path):
+    """A live process whose ``/proc/<pid>/exe`` is ``path``, killed on exit.
+
+    The stand-in is a copy of bash, never of a coreutil: on Ubuntu 26.04 those are
+    one multicall binary that picks its applet from the executable's name, so a
+    copy of ``sleep`` under another name exits at once and a test watching for it
+    passes or fails on a process that is already gone. The handshake is the proof
+    that this one got as far as running.
+    """
+    shutil.copy2(shutil.which("bash"), path)
+    with subprocess.Popen(
+        [str(path), "-c", "echo ready; read -t 30"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    ) as proc:
+        try:
+            assert proc.stdout.readline() == b"ready\n", f"{path} did not stay running"
+            assert os.path.realpath(f"/proc/{proc.pid}/exe") == os.path.realpath(path)
+            yield proc
+        finally:
+            proc.kill()
 
 
 def private_module(name: str, path):

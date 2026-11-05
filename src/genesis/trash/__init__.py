@@ -27,6 +27,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from genesis import env as _env
+from genesis.caller_context import caller_context
 from genesis.env import genesis_home
 from genesis.util.atomic import atomic_write_text
 
@@ -298,6 +299,7 @@ def trash(path: str | os.PathLike[str], *, reason: str, caller: str) -> Tombston
     kind, size = _kind(st), _size(item, st)
     _ensure_root(root)
     entry = _claim_entry(root, item.name)
+    _caller = caller_context()
     stone = Tombstone(
         entry_id=entry.name,
         root=str(root),
@@ -307,7 +309,11 @@ def trash(path: str | os.PathLike[str], *, reason: str, caller: str) -> Tombston
         size=size,
         reason=reason,
         caller=caller,
-        session_id=os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("GENESIS_SESSION_ID"),
+        # The order scripts/hooks/prepare-commit-msg reads them in; Claude Code
+        # sets the transcript id, and the legacy id is the older name.
+        session_id=(
+            _caller.session_id or _caller.transcript_id or _caller.legacy_session_id or None
+        ),
         trashed_at=datetime.now(UTC).isoformat(timespec="seconds"),
     )
     holder = None

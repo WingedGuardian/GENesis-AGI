@@ -582,10 +582,22 @@ _INFRA_POSTURE_DETAIL = {
         "guardian health on the host, or re-run scripts/host-setup.sh"
     ),
     "oomd_pressure_kill_off": (
-        "systemd-oomd pressure-kill is not enforced for user.slice — nothing "
-        "gracefully kills the memory hog before a hard OOM wedge. Re-run "
-        "scripts/bootstrap.sh (installs systemd-oomd and lays the user.slice "
-        "drop-in via lib/memory_resilience.sh)"
+        "no systemd-oomd pressure-kill monitor is confirmed in force: either "
+        "systemd-oomd is not running, or the user.slice backstop is not "
+        "configured and the user-manager monitor is not confirmed live. Nothing "
+        "may gracefully kill a memory hog before a hard OOM wedge. Re-run "
+        "scripts/bootstrap.sh as the Genesis user (lib/memory_resilience.sh "
+        "installs systemd-oomd, lays the user-manager and user.slice drop-ins, "
+        "and says which monitor it could not verify)"
+    ),
+    "oomd_user_manager_unmonitored": (
+        "systemd-oomd is running but does not list the user manager, so no "
+        "monitor honours genesis-server's kill-me-last preference: a "
+        "memory-pressure kill can come only from the root-owned user.slice "
+        "backstop, where configured, which ignores it. Re-run "
+        "scripts/bootstrap.sh as the Genesis user: lib/memory_resilience.sh "
+        "lays the user-manager root-slice drop-in (it survives `systemctl --user "
+        "daemon-reload`, systemd issue #43174) and names the check that failed"
     ),
     "pid_ceiling_unprovisioned": (
         "the per-user systemd slice PID/task ceiling is still on systemd's stock "
@@ -820,8 +832,23 @@ def _infra_missing_protections(profile: dict) -> list[str]:
         missing.append("container_swap_disabled")
     # Gated on a readable cgroup swap knob (a cgroup-v2 proxy): on v1 the
     # pressure-kill policy cannot work, so False there is not actionable.
-    if swap_max is not None and memory.get("oomd_user_slice_kill") is False:
+    # oomd not running is the alarm whatever is configured. Otherwise either
+    # monitor is protection: the user manager (live, the operative one) or
+    # user.slice (the backstop, configured). Neither is the alarm; an unknown
+    # user-manager state with user.slice off is treated as neither.
+    if swap_max is not None and (
+        memory.get("oomd_active") is False
+        or (
+            memory.get("oomd_user_slice_kill") is False
+            and memory.get("oomd_user_manager_monitored") is not True
+        )
+    ):
         missing.append("oomd_pressure_kill_off")
+    # The user-manager monitor explicitly not live: protection degrades to the
+    # backstop, where kill-me-last is ignored. Explicit False only (None means
+    # oomctl or a user manager is absent: nothing to act on).
+    if swap_max is not None and memory.get("oomd_user_manager_monitored") is False:
+        missing.append("oomd_user_manager_unmonitored")
     # PID/task ceiling still on systemd's stock 33% default. Explicit False only
     # (the collector reports the EFFECTIVE cap vs the container root budget);
     # None/absent (unreadable / no container cap) stays silent.
@@ -1439,7 +1466,8 @@ async def _resolve_memory_integrity_posture(db) -> None:
 # the host guardian a week behind, with zero signal anywhere. The collectors
 # live in observability/snapshots/deploy_health.py (shared with the health
 # snapshot); this check is the alerting layer. Hybrid severity: any drift is
-# a non-paging 'high' (dashboard); 'critical' (pages Telegram) only when
+# a non-paging 'high' (dashboard), except commits-behind-upstream alone, which
+# is 'medium' (routine maintenance); 'critical' (pages Telegram) only when
 # SUSTAINED — the 'stale_update' finding class (last successful update ≥7
 # days old AND ≥20 commits behind; thresholds live beside derive_findings in
 # deploy_health.py, the single producer of finding keys), or a missing
@@ -1702,7 +1730,15 @@ async def _check_deploy_staleness(db) -> None:
                 except ValueError:
                     pass
 
-        priority = "critical" if critical else "high"
+        # Being behind upstream and nothing else is routine maintenance: medium,
+        # so the morning report does not raise it as a blocker every day. Any
+        # other drift class beside it keeps the row at high.
+        if critical:
+            priority = "critical"
+        elif classes == ["behind_upstream"]:
+            priority = "medium"
+        else:
+            priority = "high"
         alert_key = ",".join(classes) + ":" + priority
         now = time.monotonic()
         if (
@@ -4027,6 +4063,7 @@ class AwarenessLoop:
         self._autonomous_cli_policy_export_fn = None
         self._briefing_writer_fn = None
         self._findings_ingest_fn = None
+        self._guardian_sent_log_ingest_fn = None
         self._session_observer_fn = None
         self._stopping: bool = False
         self._tick_count: int = 0
@@ -4524,6 +4561,16 @@ class AwarenessLoop:
                         logger.info("Ingested %d Guardian findings", count)
                 except Exception:
                     logger.error("Guardian findings ingest failed", exc_info=True)
+
+            # Record the alerts the host Guardian sent to Telegram (it posts
+            # outside the channel adapter, so nothing else stores them).
+            if self._guardian_sent_log_ingest_fn:
+                try:
+                    count = await self._guardian_sent_log_ingest_fn(self._db)
+                    if count:
+                        logger.info("Recorded %d Guardian-sent alerts", count)
+                except Exception:
+                    logger.warning("Guardian sent-log ingest failed", exc_info=True)
 
             # Sentinel fire alarm check — evaluate conditions and dispatch if needed
             if self._sentinel:
@@ -5145,6 +5192,10 @@ class AwarenessLoop:
     def set_findings_ingest(self, fn) -> None:
         """Inject Guardian findings ingest for reading diagnosis results."""
         self._findings_ingest_fn = fn
+
+    def set_guardian_sent_log_ingest(self, fn) -> None:
+        """Inject the per-tick pull of Guardian-sent alerts into telegram_messages."""
+        self._guardian_sent_log_ingest_fn = fn
 
     def set_session_observer(self, fn) -> None:
         """Inject session observer processor for tool activity notes."""

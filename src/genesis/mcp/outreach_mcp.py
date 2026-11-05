@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -11,6 +12,8 @@ from datetime import UTC, datetime
 
 import httpx
 from fastmcp import FastMCP
+
+from genesis.content.drafter import clean_header
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +28,51 @@ _EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 
 def _is_valid_email(addr: str) -> bool:
     return bool(_EMAIL_RE.match(addr)) and ".." not in addr and len(addr) <= 254
+
+
+def _discord_enqueue_refusal(channel: str) -> str | None:
+    """Refusal JSON when a queued Discord send could never reach a webhook.
+
+    A QUEUED Discord send bypasses the adapter's own named-channel refusal —
+    it is written to pending_outreach, reported to the caller as queued, and
+    only later dropped at the drain (without DISCORD_WEBHOOK_URL the adapter
+    is not even registered). Check reachability BEFORE every enqueue instead,
+    through the one predicate in runtime/init/outreach.py so this rule cannot
+    drift from the adapter-registration rule. Returns None when deliverable.
+    """
+    from genesis.outreach.types import DISCORD_CHANNELS
+    from genesis.runtime.init.outreach import (
+        _discord_webhook_env,
+        discord_webhook_configured,
+    )
+
+    if channel != "discord" and channel not in DISCORD_CHANNELS:
+        return None
+    if discord_webhook_configured(channel):
+        return None
+    # The predicate needs DISCORD_WEBHOOK_URL before any named webhook counts
+    # (the adapter registers from it) — when THAT is the missing piece the
+    # message must name it, or following the advice leaves the send refused.
+    configure = (
+        _discord_webhook_env(channel)
+        if os.environ.get("DISCORD_WEBHOOK_URL")
+        else "DISCORD_WEBHOOK_URL"
+    )
+    # Only an alternative that would actually go through is offered.
+    alternative = (
+        ", or send to channel 'discord'"
+        if channel != "discord" and discord_webhook_configured("discord")
+        else ""
+    )
+    return json.dumps({
+        "status": "refused",
+        "code": "discord_webhook_unconfigured",
+        "message": (
+            f"No Discord webhook configured for channel {channel!r} — refusing "
+            f"to send to the default channel instead. Configure {configure}"
+            f"{alternative}. Permanent until configured; do not retry."
+        ),
+    })
 
 _pipeline = None
 _engagement = None
@@ -106,35 +154,43 @@ async def outreach_send(
     salience_score: float = 0.5,
     labeled_surplus: bool = False,
     thread_id: str | None = None,
+    subject: str | None = None,
 ) -> str:
-    """Queue a message for delivery. Returns outreach_id.
+    """Queue a message for delivery. Returns outreach_id or a queued status.
 
     The message is delivered AS-IS — Genesis does not rewrite or rephrase it.
     Compose the exact text you want the recipient to see (this is the tool for
     reminders and literal notifications).
 
-    For email replies, pass thread_id to route to the correct recipient.
-    The thread_id maps to a registered email thread whose recipient is
-    used for delivery.
+    For email, ``subject`` is REQUIRED: you wrote the email, so write its
+    subject too, a short title that says what it is about. A new email
+    without a subject is refused (code email_subject_required). A reply
+    (``thread_id``) always goes out as Re: <the thread's subject>, so it
+    stays in the same conversation; thread_id also maps to the registered
+    email thread whose recipient is used for delivery.
 
-    **Discord: name the CHANNEL, not the adapter.** Pass
-    ``channel="announcements"`` (or any name in ``DISCORD_CHANNELS``) and it is
-    routed to that channel. ``channel="discord"`` still works and goes wherever
-    ``OUTREACH_RECIPIENT_DISCORD`` points, which defaults to ``dev-discussion``.
+    **Discord:** pass ``channel="announcements"`` (or any name in
+    ``DISCORD_CHANNELS``) to reach that channel; ``channel="discord"`` uses
+    the configured default. A named channel with no configured webhook is
+    REFUSED — permanent until configured, do not retry.
 
-    That default is why this exists. The pipeline has always supported steering
-    a Discord send (the recipient IS the webhook name), but this tool exposed no
-    way to say which channel — so every caller asking for "Discord" got
-    dev-discussion, silently, including a release announcement that belonged in
-    announcements. A caller could not tell it had been redirected: nothing
-    errored, and the log line recorded the REQUESTED name.
-
-    That fallback is gone. A channel with no configured webhook is now REFUSED
-    with an error naming the setting to add. The refusal is correct, expected
-    behaviour and not a fault to work around: configure the named setting, or
-    send to the default channel. Do not retry it — the condition is permanent
-    until an operator changes configuration.
+    **preferred_timing** schedules delivery: ISO-8601 (naive = user's
+    timezone), a clock time (``"9am"``, ``"at 9"``, ``"14:00"``), an
+    elapsed time (``"in 2 hours"``, ``"1h30m"``), or a day and clock
+    (``"tomorrow 9am"``, ``"next friday 3pm"``, ``"june 20 3pm UTC"``,
+    ``"tomorrow noon"``, ``"in 2 days"``). A value resolving to
+    the future enqueues with a UTC ``deliver_after`` — identically
+    in-process and via the MCP child — returning
+    ``{"status": "queued", "pending_id": ..., "deliver_after": <UTC ISO>}``.
+    An unparseable value returns ``{"error": ...}`` and stores/delivers
+    nothing. Note: the drain rebuilds queued sends with its fixed
+    ``salience_score`` (0.7) — a caller-supplied ``salience_score`` is NOT
+    preserved for scheduled sends.
     """
+    # (The long-form rationale for the Discord refusal lives in git history /
+    # the change record — a channel with no configured webhook used to fall
+    # back to the default webhook silently, misrouting sends with no caller
+    # visible error. The refusal is the fix; keep it.)
     # Discord sub-channel → adapter + recipient. `target_chat_id` is the
     # pipeline's existing per-request recipient override (it wins over the
     # configured default in _deliver), so this needs no new plumbing — only a
@@ -161,17 +217,108 @@ async def outreach_send(
         thread = await email_threads.get_thread(_db, thread_id)
         if thread:
             validated_recipient = thread.get("recipient")
+            # A reply keeps the thread's subject as Re: <original>: mail clients
+            # group a conversation by it, and this adapter sends no In-Reply-To
+            # header, so a fresh title would split the reply into a new thread.
+            original = clean_header(thread.get("subject") or "", max_chars=None)
+            if original:
+                subject = original if original.lower().startswith("re:") else f"Re: {original}"
             logger.info(
                 "Thread %s resolved recipient: %s", thread_id, validated_recipient,
             )
         else:
             logger.warning("Thread %s not found for recipient lookup", thread_id)
-    elif channel == "email" and not thread_id:
+    if channel == "email" and not clean_header(subject or ""):
+        # Whoever writes the email writes its subject, in the same step. A
+        # reply took its subject from the thread above; this catches a new
+        # email sent without one, and a reply whose thread recorded none.
+        return json.dumps({
+            "status": "refused",
+            "code": "email_subject_required",
+            "message": (
+                "An email needs a subject: pass subject= with a short title of "
+                "3 to 7 words that says what the email is about (for a reply, "
+                "Re: and the original subject)."
+            ),
+        })
+    if channel == "email" and not thread_id:
         logger.warning(
             "outreach_send email without thread_id — recipient will come from "
             "OUTREACH_RECIPIENT_EMAIL if configured, else the send is dropped "
             "(IGNORED) by the pipeline self-send guard"
         )
+
+    # -- preferred_timing: ONE scheduling path shared by both branches ------
+    # A preferred_timing that resolves to a future instant enqueues to
+    # pending_outreach with a UTC deliver_after whether _pipeline is set or
+    # not — previously the pipeline branch ignored it and delivered
+    # immediately. Unparseable input is a loud error and is never stored
+    # verbatim: a raw NL string sorts after every ISO "2..." timestamp in the
+    # drain's lexicographic compare and the row would never fire. A resolved
+    # time NOT in the future needs no scheduling; it falls through to normal
+    # handling (immediate in-process delivery, deliver_after=None queued).
+    resolved_dt: datetime | None = None
+    if preferred_timing is not None and preferred_timing.strip():
+        from genesis.outreach.timing import (
+            TimingParseError,
+            resolve_preferred_timing,
+        )
+
+        try:
+            resolved_dt = resolve_preferred_timing(preferred_timing)
+        except TimingParseError as exc:
+            # The resolver's own message names WHY it refused (gap, fold,
+            # out of range, unknown phrase) — str(exc) IS the error contract.
+            return json.dumps({"error": str(exc)})
+
+    if resolved_dt is not None and resolved_dt > datetime.now(UTC):
+        if _db is None:
+            return json.dumps({
+                "error": (
+                    "Cannot schedule outreach_send: preferred_timing resolves "
+                    "to a future time but no database is available."
+                ),
+            })
+        # Validate category before enqueuing (same check the pipeline path
+        # does below).
+        from genesis.outreach.types import OutreachCategory
+
+        try:
+            OutreachCategory(category)
+        except ValueError:
+            valid = ", ".join(c.value for c in OutreachCategory)
+            return json.dumps({
+                "error": f"Invalid category '{category}'. Valid categories: {valid}",
+            })
+
+        if refusal := _discord_enqueue_refusal(channel):
+            return refusal
+        from genesis.db.crud import pending_outreach
+
+        await pending_outreach.ensure_table(_db)  # idempotent safety net
+        deliver_after = resolved_dt.isoformat()
+        # The drain routes "high" to submit_urgent(); it has no "critical"
+        # case. Normalize here so a scheduled critical send keeps the urgent
+        # delivery semantics an immediate critical send gets (the drain is
+        # out of scope — see issue #3544 scope limits).
+        queued_urgency = "high" if urgency == "critical" else urgency
+        pending_id = await pending_outreach.enqueue(
+            _db,
+            message=message,
+            category=category,
+            channel=channel,
+            urgency=queued_urgency,
+            deliver_after=deliver_after,
+            thread_id=thread_id,
+            validated_recipient=validated_recipient,
+            labeled_surplus=labeled_surplus,
+            email_subject=subject or None,
+        )
+        return json.dumps({
+            "status": "queued",
+            "pending_id": pending_id,
+            "deliver_after": deliver_after,
+        })
 
     if not _pipeline:
         # Validate category before enqueuing (same check the pipeline path does)
@@ -185,26 +332,35 @@ async def outreach_send(
                 "error": f"Invalid category '{category}'. Valid categories: {valid}",
             })
 
-        # Queue for genesis-server to pick up on next cycle
+        # Queue for genesis-server to pick up on next cycle. deliver_after is
+        # always the resolved UTC value or None — the raw caller string is
+        # never stored (see the scheduling block above).
         if _db is not None:
+            if refusal := _discord_enqueue_refusal(channel):
+                return refusal
             from genesis.db.crud import pending_outreach
 
             await pending_outreach.ensure_table(_db)  # idempotent safety net
+            # Same critical→high normalization as the scheduled enqueue
+            # above: the drain routes only "high" to submit_urgent, so a
+            # stored "critical" would drain through submit() and lose the
+            # urgent semantics the caller asked for.
             pending_id = await pending_outreach.enqueue(
                 _db,
                 message=message,
                 category=category,
                 channel=channel,
-                urgency=urgency,
-                deliver_after=preferred_timing,
+                urgency="high" if urgency == "critical" else urgency,
+                deliver_after=None,
                 thread_id=thread_id,
                 validated_recipient=validated_recipient,
                 labeled_surplus=labeled_surplus,
+                email_subject=subject or None,
             )
             return json.dumps({
                 "status": "queued",
                 "pending_id": pending_id,
-                "deliver_after": preferred_timing,
+                "deliver_after": None,
             })
         return "Error: outreach pipeline not initialized and no DB available"
     from genesis.outreach.types import (
@@ -236,6 +392,7 @@ async def outreach_send(
         # this steers the send without disturbing any other channel.
         target_chat_id=discord_channel,
         thread_id=thread_id,
+        email_subject=subject or None,
         # The caller composed this message; deliver it exactly — never route an
         # agent-authored message back through the LLM drafter (it once inverted
         # a send_and_wait test message's meaning). The bridge/queue path mirrors
@@ -309,6 +466,8 @@ async def marketing_send(prospect_id: str, subject: str, body: str) -> str:
     from genesis.outreach.types import OutreachCategory
 
     subject = (subject or "").strip()
+    if not clean_header(subject):
+        return json.dumps({"status": "refused", "reason": "subject_required"})
     body = body or ""
     message = f"{subject}\n\n{body}" if subject else body
 
@@ -326,6 +485,7 @@ async def marketing_send(prospect_id: str, subject: str, body: str) -> str:
             channel="email",
             validated_recipient=recipient,
             labeled_surplus=True,
+            email_subject=subject or None,
         )
         return json.dumps({"status": "queued", "pending_id": pending_id})
 
@@ -342,6 +502,7 @@ async def marketing_send(prospect_id: str, subject: str, body: str) -> str:
         channel="email",
         labeled_surplus=True,
         validated_recipient=recipient,
+        email_subject=subject or None,
         verbatim=True,
     )
     result = await _pipeline.submit(req)
@@ -446,34 +607,34 @@ async def outreach_poll(
     # `_discord_webhook_env` is imported rather than re-derived: this was the
     # THIRD copy of the env-naming rule, and a copy is what lets a refusal
     # message name a variable that would not actually configure the channel.
+    # A queued send also needs the adapter, which registers only with the default
+    # webhook. A poll posts straight to the webhook, so it asks only whether this
+    # channel has one, and "discord" means the same channel it does for a send.
     from genesis.runtime.init.outreach import (
         _discord_webhook_env,
         _is_reserved_discord_channel,
+        discord_channel_has_webhook,
+        discord_default_channel,
     )
 
-    env_key = _discord_webhook_env(channel)
-    # The RESERVED name is checked BEFORE the lookup, not after. `url` (in any
-    # case) inverts onto DISCORD_WEBHOOK_URL — the default webhook — so a direct
-    # lookup SUCCEEDS, short-circuits the default-channel test below, and posts
-    # the poll to the default channel while reporting the `url` channel back.
-    # That is the redirect this whole change removes, arriving through the one
-    # channel name that is not a channel.
-    webhook_url = None if _is_reserved_discord_channel(channel) else os.environ.get(env_key)
-    if not webhook_url:
-        # The DEFAULT channel legitimately resolves to DISCORD_WEBHOOK_URL — it
-        # need not also appear in the per-channel map. Any OTHER unconfigured
-        # name is refused.
-        default_channel = os.environ.get("OUTREACH_RECIPIENT_DISCORD") or "dev-discussion"
-        if not channel or channel == default_channel:
-            webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
-        if not webhook_url:
-            return json.dumps({
-                "error": (
-                    f"No Discord webhook configured for channel {channel!r} — "
-                    f"refusing to post to the default channel instead. Configure "
-                    f"{env_key}, or send to {default_channel}."
-                )
-            })
+    default_channel = discord_default_channel()
+    target = default_channel if channel == "discord" else channel
+    env_key = _discord_webhook_env(target)
+    if not discord_channel_has_webhook(channel):
+        return json.dumps({
+            "error": (
+                f"No Discord webhook configured for channel {channel!r} — "
+                f"refusing to post to the default channel instead. Configure "
+                f"{env_key}, or send to {default_channel}."
+            )
+        })
+    # Configured: the channel's own var wins, else the default webhook (the
+    # default channel legitimately resolves to it; a reserved name like `url`
+    # must NOT — its lookup would find the default webhook and report the `url`
+    # "channel" back).
+    webhook_url = (
+        None if _is_reserved_discord_channel(target) else os.environ.get(env_key)
+    ) or os.environ.get("DISCORD_WEBHOOK_URL")
 
     # ── Dedup check: skip if same poll posted within 7 days ──
     if _db is not None:
@@ -902,6 +1063,16 @@ async def outreach_engagement(
     return True
 
 
+def _rate_limits(cfg) -> dict:
+    return {
+        "max_daily": cfg.max_daily,
+        "surplus_daily": cfg.surplus_daily,
+        "content_daily": cfg.content_daily,
+        "notification_daily": cfg.notification_daily,
+        "agent_daily_per_peer": cfg.agent_daily_per_peer,
+    }
+
+
 @mcp.tool()
 async def outreach_preferences(
     action: str = "get",
@@ -918,10 +1089,7 @@ async def outreach_preferences(
                     "end": _config.quiet_hours.end,
                 },
                 "thresholds": _config.thresholds,
-                "rate_limits": {
-                    "max_daily": _config.max_daily,
-                    "surplus_daily": _config.surplus_daily,
-                },
+                "rate_limits": _rate_limits(_config),
             }
         # Standalone mode — use config loader which has sensible defaults
         from genesis.outreach.config import load_outreach_config
@@ -934,10 +1102,7 @@ async def outreach_preferences(
                 "end": cfg.quiet_hours.end,
             },
             "thresholds": cfg.thresholds,
-            "rate_limits": {
-                "max_daily": cfg.max_daily,
-                "surplus_daily": cfg.surplus_daily,
-            },
+            "rate_limits": _rate_limits(cfg),
             "source": "defaults (standalone mode)",
         }
     if not preferences or not isinstance(preferences, dict):
@@ -962,9 +1127,12 @@ async def outreach_preferences(
     mr = preferences.get("morning_report", {})
     eng = preferences.get("engagement", {})
 
-    from genesis.outreach.config import OutreachConfig, QuietHours
+    from genesis.outreach.config import QuietHours
 
-    merged = OutreachConfig(
+    # replace(), not a fresh OutreachConfig: a field this tool does not set
+    # keeps its current value instead of falling back to the class default.
+    merged = dataclasses.replace(
+        current,
         quiet_hours=QuietHours(
             start=qh.get("start", current.quiet_hours.start),
             end=qh.get("end", current.quiet_hours.end),
@@ -974,10 +1142,11 @@ async def outreach_preferences(
         max_daily=int(rl.get("max_daily", current.max_daily)),
         surplus_daily=int(rl.get("surplus_daily", current.surplus_daily)),
         content_daily=int(rl.get("content_daily", current.content_daily)),
+        notification_daily=int(rl.get("notification_daily", current.notification_daily)),
+        agent_daily_per_peer=int(rl.get("agent_daily_per_peer", current.agent_daily_per_peer)),
         morning_report_time=mr.get("trigger_time", current.morning_report_time),
         engagement_timeout_hours=int(eng.get("timeout_hours", current.engagement_timeout_hours)),
         engagement_poll_minutes=int(eng.get("poll_interval_minutes", current.engagement_poll_minutes)),
-        immediate_escalation_alerts=current.immediate_escalation_alerts,
     )
 
     try:
