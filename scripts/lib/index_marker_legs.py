@@ -88,8 +88,17 @@ def _shared(values) -> str:
     return encoded
 
 
+def _settled_repo(h: str, repo: str) -> str:
+    # A spelling already stored under this hash is kept as written (see
+    # stored_repo), so a later move cannot change it or fail it. Anything else
+    # (a raw incoming path) is canonicalized.
+    if stored_repo(repo) and stored_hash(repo) == h:
+        return repo
+    return os.path.realpath(repo)
+
+
 def _identity(db: sqlite3.Connection, h: str, repo: str) -> str:
-    repo = os.path.realpath(repo)
+    repo = _settled_repo(h, repo)
     row = db.execute("SELECT repo_path FROM repo_state WHERE hash=?", (h,)).fetchone()
     if row and row["repo_path"] is not None and row["repo_path"] != repo:
         raise IdentityConflict("queue hash has another canonical repository")
@@ -136,7 +145,7 @@ def _conflict(db, sequence, reason, raw):
 
 
 def _legacy_execution(db, h, data, nonce, origin, kind, raw=None):
-    repo = os.path.realpath(data["repo_path"])
+    repo = _settled_repo(h, data["repo_path"])
     fields = {
         "repo_path": repo,
         "original_tools": data["tools"],
@@ -355,18 +364,38 @@ def upgrade(db: sqlite3.Connection):
     )
 
 
-def validate_context(context: dict, hash_repo) -> dict:
+def stored_repo(repo: object) -> bool:
+    """A stored spelling is canonical by construction; never re-resolve it.
+
+    Writers store ``realpath`` once. Re-resolving later would reject a row
+    whose repository moved or gained a symlink, and a whole-population
+    check would then stop every tick. The entrypoint resolves the live path.
+    """
+    return (
+        isinstance(repo, str)
+        and repo.startswith("/")
+        and not repo.startswith("//")
+        and "\0" not in repo
+        and os.path.normpath(repo) == repo
+    )
+
+
+def stored_hash(repo: str) -> str:
+    # Compatibility, not security: the hash of the stored canonical spelling.
+    return hashlib.sha1(repo.encode()).hexdigest()[:16]  # noqa: S324
+
+
+def validate_context(context: dict, _hash_repo=None) -> dict:
+    # _hash_repo is accepted for call compatibility and deliberately unused: the
+    # hash is checked against the stored spelling, never a live resolution.
     if not isinstance(context, dict) or set(context) != CONTEXT:
         raise ValueError("complete queue claim context is required")
     repo = context["repo_path"]
     if (
-        not isinstance(repo, str)
-        or not repo
-        or "\0" in repo
-        or os.path.realpath(repo) != repo
+        not stored_repo(repo)
         or not isinstance(context["hash"], str)
         or re.fullmatch(r"[0-9a-f]{16}", context["hash"]) is None
-        or context["hash"] != hash_repo(repo)
+        or context["hash"] != stored_hash(repo)
         or context["provider"] not in PROVIDERS
         or type(context["protocol"]) is not int
         or context["protocol"] != 2
@@ -379,8 +408,8 @@ def validate_context(context: dict, hash_repo) -> dict:
     return dict(context)
 
 
-def scalar_event(context, action, recorded_at, hash_repo):
-    context = validate_context(context, hash_repo)
+def scalar_event(context, action, recorded_at, _hash_repo=None):
+    context = validate_context(context)
     if action not in OUTCOMES or (
         action in ("consume_full", "restore_backoff") and context["provider"] != "cbm"
     ):

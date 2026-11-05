@@ -3,7 +3,8 @@
 
 main_checkout_guard is file-only (no unmatched Bash snapshots). Excluded:
 background_pipe_guard (no run_in_background), review_enforcement_commit,
-pre_push_privacy_review, adopt_first_gate, plan_premise_gate, plan_confidence_reminder,
+pre_push_privacy_review, pr_open_review_gate, adopt_first_gate, plan_premise_gate,
+plan_confidence_reminder,
 behavioral_linter, procedure_advisor, cbm-discovery-gate, deploy_timeout_advisory
 (commit/plan/lifecycle), pretool_check (autonomous admission). Hosted web tools
 do not reach hooks. Existing guards' internal fail-open paths remain theirs;

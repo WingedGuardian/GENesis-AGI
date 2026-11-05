@@ -61,6 +61,7 @@ from genesis.util.proc_kill import (
     reap_bounded,
     spawn_owned,
 )
+from genesis.util.systemd import literal_scope_args
 
 logger = logging.getLogger(__name__)
 
@@ -221,7 +222,7 @@ def _scope_argv(*trailing: str) -> list[str]:
     with `/bin/true` it is the probe. Sharing the builder is what keeps the two
     from drifting apart again.
     """
-    argv = ["systemd-run", "--user", "--scope", "--quiet"]
+    argv = ["systemd-run", "--user", "--scope", "--quiet", *literal_scope_args()]
     argv.append(f"--description={_SCOPE_DESCRIPTION}")
     for prop in _SCOPE_PROPERTIES:
         argv += ["-p", prop]
