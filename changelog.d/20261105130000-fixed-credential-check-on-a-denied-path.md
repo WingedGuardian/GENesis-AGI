@@ -1,0 +1,1 @@
+- **The credential check no longer reads a denied directory as a missing file.** On Python 3.14, which a 26.04 host's system `python3` is, it would have restored a backup over a key still on disk. A path it cannot check is now reported as unreadable, which alerts and never restores, on every Python version.

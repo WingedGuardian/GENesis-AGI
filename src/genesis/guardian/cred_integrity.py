@@ -225,6 +225,17 @@ def validate_bytes(
     return ValidationResult(False, "parse_error", f"unknown kind {kind!r}")
 
 
+def _exists(path: Path) -> bool:
+    """Only "no such file" means absent. From Python 3.14 ``Path.exists`` also answers
+    False for a directory that denies search, which would read as a missing file and
+    restore over a live one. This runs on the system's ``python3``, whichever that is."""
+    try:
+        os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    return True
+
+
 def validate_file(
     target: CredTarget, home: Path, backup_dir: Path | None
 ) -> ValidationResult:
@@ -233,8 +244,14 @@ def validate_file(
     never provisioned ("absent", healthy — the clean degradation for installs
     without backups or without an optional file like genesis.yaml)."""
     path = home / target.path
-    if not path.exists():
-        has_backup = backup_dir is not None and (backup_dir / target.backup_rel).exists()
+    try:
+        present = _exists(path)
+        has_backup = (
+            not present and backup_dir is not None and _exists(backup_dir / target.backup_rel)
+        )
+    except OSError as exc:
+        return ValidationResult(False, "unreadable", f"could not check: {exc}")
+    if not present:
         if has_backup:
             return ValidationResult(False, "missing", f"{path} absent but backup exists")
         return ValidationResult(True, "absent", f"{path} never provisioned")

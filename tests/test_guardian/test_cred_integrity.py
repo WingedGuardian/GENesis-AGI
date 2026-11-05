@@ -245,6 +245,63 @@ def test_allowed_restore():
     assert allowed_restore([], now, 0) is False
 
 
+def _denied(directory):
+    """The file's parent, with search taken away. Returns the callback that restores it."""
+    directory.chmod(0o000)
+    return lambda: directory.chmod(0o700)
+
+
+@pytest.mark.parametrize("backed_up", [True, False])
+def test_a_parent_that_denies_search_is_unreadable_not_missing(tmp_path, request, backed_up):
+    """Either answer would act on a key still on disk: "missing" restores over it, and
+    "absent" reports a healthy host. Python 3.14's Path.exists answers False here."""
+    home = tmp_path / "home"
+    target = home / ".ssh" / "id_ed25519"
+    target.parent.mkdir(parents=True)
+    target.write_text("key")
+    backup = tmp_path / "backup"
+    entry = next(t for t in DEFAULT_TARGETS if t.name == "ssh_id_ed25519")
+    if backed_up:
+        (backup / entry.backup_rel).parent.mkdir(parents=True)
+        (backup / entry.backup_rel).write_text("backup")
+    request.addfinalizer(_denied(target.parent))
+    r = validate_file(entry, home, backup if backed_up else None)
+    assert (r.ok, r.status) == (False, "unreadable")
+    assert r.status not in RESTORABLE_STATUSES
+
+
+def test_a_backup_that_denies_search_is_unreadable_not_absent(tmp_path, request):
+    """No file and no way to tell whether a backup exists: not proof of "never provisioned"."""
+    home = tmp_path / "home"
+    home.mkdir()
+    backup = tmp_path / "backup"
+    entry = next(t for t in DEFAULT_TARGETS if t.name == "ssh_id_ed25519")
+    (backup / entry.backup_rel).parent.mkdir(parents=True)
+    (backup / entry.backup_rel).write_text("backup")
+    request.addfinalizer(_denied(backup))
+    r = validate_file(entry, home, backup)
+    assert (r.ok, r.status) == (False, "unreadable")
+
+
+def test_one_denied_target_leaves_the_others_checked(tmp_path, request):
+    """It used to raise on 3.12, so one denied file left every other target unchecked."""
+    home = tmp_path / "home"
+    (home / ".ssh").mkdir(parents=True)
+    request.addfinalizer(_denied(home / ".ssh"))
+    results = check_all(None, home, None)
+    assert results["ssh_id_ed25519"].status == "unreadable"
+    assert results["gh_hosts"].status == "absent"
+
+
+def test_a_file_under_a_file_is_absent(tmp_path):
+    """ENOTDIR is no such file, as it always was: a path can't exist below a file."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".ssh").write_text("not a directory")
+    entry = next(t for t in DEFAULT_TARGETS if t.name == "ssh_id_ed25519")
+    assert validate_file(entry, home, None).status == "absent"
+
+
 def test_restorable_statuses_exclude_unreadable():
     assert "unreadable" not in RESTORABLE_STATUSES
     assert "absent" not in RESTORABLE_STATUSES
