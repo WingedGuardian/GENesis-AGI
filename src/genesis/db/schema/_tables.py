@@ -980,6 +980,21 @@ CREATE TABLE IF NOT EXISTS peer_grants (
     # outlive the entries they describe — deleting a reference entry (e.g.
     # password rotation: delete + re-store) must not cascade away the
     # access history.  The unit_id is a soft reference only.
+    "reference_secrets": """
+        CREATE TABLE IF NOT EXISTS reference_secrets (
+            unit_id    TEXT PRIMARY KEY,
+            value      TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """,
+    # The value of a credential reference (#2426), held OUT of every indexed
+    # store: knowledge_units.body carries a placeholder instead, so neither
+    # knowledge_fts, memory_fts, the Qdrant payload nor the embedding sees it.
+    # Its own table rather than a knowledge_units column because recall reads
+    # knowledge_units with SELECT *, so a column would ride into every recall
+    # row. Written and deleted in the same transaction as its knowledge_units
+    # row (crud/knowledge.py upsert and delete); read only through
+    # memory/reference_ops.resolve_value. Backed up with the rest of genesis.db.
     "knowledge_uploads": """
         CREATE TABLE IF NOT EXISTS knowledge_uploads (
             id            TEXT PRIMARY KEY,

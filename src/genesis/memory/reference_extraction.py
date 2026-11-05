@@ -62,9 +62,12 @@ logger = logging.getLogger(__name__)
 # A. Credential pair — broadened. Any credential-label word near a value.
 # Doesn't require BOTH user+pass — a single "password: X" is enough.
 _LABEL_WORDS = r"(?:user(?:name)?|login|pass(?:word)?|pwd|email|handle|account)"
+# "login for the X persona": a preposition or article after the label is prose,
+# never the login, so the match moves on to the labelled "username: X".
+_FILLER_WORDS = r"(?:for|of|to|the|a|an|with|at|on|in|as|via|and|or)"
 _CREDENTIAL_PAIR_PATTERN = re.compile(
     r"\b(?:username|user|login)\s*(?:is\s+|[:=]\s*|\s+)"
-    rf"(?P<user>(?!{_LABEL_WORDS}\b)[^\s,;]+)"
+    rf"(?P<user>(?!{_LABEL_WORDS}\b)(?!{_FILLER_WORDS}(?=[\s,;]))[^\s,;]+)"
     r".{0,200}?"
     r"\b(?:password|pass|pwd)\s*(?:is\s+|[:=]\s*)"
     rf"(?P<pass>(?!{_LABEL_WORDS}\b)[^\s,;]+)",
@@ -274,6 +277,76 @@ def _user_shared(token: str | None, user_text: str | None) -> bool:
     return token.lower() in user_text.lower()
 
 
+#: The description an auto-captured credential carries instead of the
+#: extraction's own text. That text is already stored, scrubbed, as the
+#: episodic memory beside it; copied into the reference it is free text the
+#: value scrub must chase shape by shape, and nothing a lookup needs.
+_CREDENTIAL_DESCRIPTION = "Credential captured automatically from a conversation."
+
+
+def _credential_description(login: str | None = None) -> str:
+    """The fixed description, naming the login when there is one: a login is an
+    identifier a lookup searches by, and split_secret keeps it searchable."""
+    return f"Login {login}. {_CREDENTIAL_DESCRIPTION}" if login else _CREDENTIAL_DESCRIPTION
+
+#: An UPPER_SNAKE=value assignment counts as a credential only when a
+#: ``_``-separated part of its key names one; MODEL_NAME=... or NODE_ENV=... is
+#: configuration, and API_BASE or AUTHOR is not a key (whole parts, never
+#: substrings: CAPITAL contains API).
+_CRED_ENV_KEY_WORDS = frozenset({
+    "KEY", "APIKEY", "SECRET", "TOKEN", "PASSWORD", "PASSWD", "PASS", "PWD", "AUTH",
+    "CREDENTIAL", "CREDENTIALS",
+})
+
+#: The password in a URL's userinfo (scheme, then user, a colon, the password,
+#: an at-sign, the host): the shape a connection string carries its secret in.
+_URL_USERINFO_PATTERN = re.compile(
+    r"\b[A-Za-z][A-Za-z0-9+.\-]*://(?P<user>[^\s/:@]*):(?P<pw>[^\s@/]+)@",
+)
+
+#: Quoting around a capture is never part of it; a trailing "!" or "." can be,
+#: and the classifier stores what ``_unwrap`` returns as the value.
+_CAPTURE_PAIRS = {"(": ")", "[": "]", "{": "}", "<": ">", '"': '"', "'": "'", "`": "`"}
+_CAPTURE_OPENERS = "([{<"
+
+
+def _unwrap(value: str) -> str:
+    """``value`` without the matched quote or bracket pairs around it. An
+    unmatched quote or closing bracket is kept ("Pw9)" and "Fake9word'" are
+    passwords); only an unmatched OPENING bracket ("(Pw9 ...") is an aside."""
+    value = value.strip()
+    while len(value) > 1 and _CAPTURE_PAIRS.get(value[0]) == value[-1]:
+        value = value[1:-1].strip()
+    if value and value[0] in _CAPTURE_OPENERS and _CAPTURE_PAIRS[value[0]] not in value:
+        value = value[1:]
+    return value
+
+
+def _env_key_is_credential(key: str) -> bool:
+    parts = [p for p in key.upper().split("_") if p]
+    return any(p in _CRED_ENV_KEY_WORDS or p.endswith("KEY") for p in parts)
+
+
+def _capture(pattern: re.Pattern[str], match: re.Match[str], group: str) -> str | None:
+    """The secret a credential-pattern match captured, or None when the match
+    is ordinary text rather than a credential.
+
+    The one rule the classifier, the extraction scrub and the ingest
+    chokepoint share, so whatever a scrub removes from memory is exactly what
+    the classifier can keep as a reference: nothing the user shared is lost.
+    The classifier's own guard against invented references is the user-text
+    gate (``_user_shared``), not this rule. An environment assignment needs a
+    credential word in its key; the value loses matched quotes or brackets
+    around it.
+    """
+    value = _unwrap(match.group(group) or "")
+    if not value:
+        return None
+    if pattern is _ENV_ASSIGNMENT_PATTERN:
+        return value if _env_key_is_credential(match.group("key")) else None
+    return value
+
+
 def classify_as_reference(
     extraction: Extraction, user_text: str | None = None,
 ) -> dict | None:
@@ -301,12 +374,18 @@ def classify_as_reference(
     tags = [e for e in extraction.entities if e and e.strip()]
 
     # 1. Credential pair — highest priority (user + password together)
+    # A credential pattern that matched but whose user-text gate declined it
+    # must not fall through to the url/network branches below: those store the
+    # extraction text as the description, password and all.
+    declined = False
+
     pair = _CREDENTIAL_PAIR_PATTERN.search(content)
-    if pair:
+    password = _capture(_CREDENTIAL_PAIR_PATTERN, pair, "pass") if pair else None
+    if pair and password:
         user = pair.group("user")
-        password = pair.group("pass")
+        declined = True
         if (
-            user and password and len(password) >= 4
+            user and len(password) >= 4
             and _user_shared(password, user_text)
         ):
             return {
@@ -315,17 +394,18 @@ def classify_as_reference(
                     extraction, default_prefix="login",
                 ),
                 "value": f"{user} / {password}",
-                "description": content,
+                "description": _credential_description(user),
                 "tags": tags,
             }
 
     # 1b. Email + password pattern (catches "email X and password Y")
     email_pass = _EMAIL_PASSWORD_PATTERN.search(content)
-    if email_pass:
+    password = _capture(_EMAIL_PASSWORD_PATTERN, email_pass, "pass") if email_pass else None
+    if email_pass and password:
         email = email_pass.group("email")
-        password = email_pass.group("pass")
+        declined = True
         if (
-            email and password and len(password) >= 4
+            email and len(password) >= 4
             and _user_shared(password, user_text)
         ):
             return {
@@ -334,17 +414,18 @@ def classify_as_reference(
                     extraction, default_prefix="login",
                 ),
                 "value": f"{email} / {password}",
-                "description": content,
+                "description": _credential_description(email),
                 "tags": tags,
             }
 
     # 1c. Account lifecycle (catches "created account X with password Y")
     acct = _ACCOUNT_LIFECYCLE_PATTERN.search(content)
-    if acct:
+    password = _capture(_ACCOUNT_LIFECYCLE_PATTERN, acct, "pass") if acct else None
+    if acct and password:
         account = acct.group("account")
-        password = acct.group("pass")
+        declined = True
         if (
-            account and password and len(password) >= 4
+            account and len(password) >= 4
             and _user_shared(password, user_text)
         ):
             return {
@@ -353,16 +434,17 @@ def classify_as_reference(
                     extraction, default_prefix="account",
                 ),
                 "value": f"{account} / {password}",
-                "description": content,
+                "description": _credential_description(account),
                 "tags": tags,
             }
 
     # 1d. Single password mention (no user required)
     single = _SINGLE_CREDENTIAL_PATTERN.search(content)
-    if single:
-        password = single.group("value")
+    password = _capture(_SINGLE_CREDENTIAL_PATTERN, single, "value") if single else None
+    if single and password:
+        declined = True
         if (
-            password and len(password) >= 4
+            len(password) >= 4
             and _user_shared(password, user_text)
         ):
             return {
@@ -371,7 +453,7 @@ def classify_as_reference(
                     extraction, default_prefix="credential",
                 ),
                 "value": f"password: {password}",
-                "description": content,
+                "description": _credential_description(),
                 "tags": tags,
             }
 
@@ -379,6 +461,7 @@ def classify_as_reference(
     known_key = _KNOWN_KEY_PREFIX_PATTERN.search(content)
     if known_key:
         tok_value = known_key.group("token")
+        declined = True
         if _user_shared(tok_value, user_text):
             return {
                 "kind": "credentials",
@@ -386,14 +469,15 @@ def classify_as_reference(
                     extraction, default_prefix="api_key",
                 ),
                 "value": f"token: {tok_value}",
-                "description": content,
+                "description": _credential_description(),
                 "tags": tags,
             }
 
     # 3. Standalone token / API key (labeled)
     token = _CREDENTIAL_TOKEN_PATTERN.search(content)
-    if token:
-        tok_value = token.group("token")
+    tok_value = _capture(_CREDENTIAL_TOKEN_PATTERN, token, "token") if token else None
+    if token and tok_value:
+        declined = True
         if _user_shared(tok_value, user_text):
             return {
                 "kind": "credentials",
@@ -401,29 +485,54 @@ def classify_as_reference(
                     extraction, default_prefix="token",
                 ),
                 "value": f"token: {tok_value}",
-                "description": content,
+                "description": _credential_description(),
                 "tags": tags,
             }
 
     # 3b. .env format — UPPER_SNAKE=value
-    env = _ENV_ASSIGNMENT_PATTERN.search(content)
+    # The first credential-keyed assignment, not merely the first assignment.
+    env = next(
+        (m for m in _ENV_ASSIGNMENT_PATTERN.finditer(content)
+         if _capture(_ENV_ASSIGNMENT_PATTERN, m, "val")),
+        None,
+    )
     if env:
         key = env.group("key")
         val = env.group("val")
-        # Only capture if the key name suggests a credential
-        _CRED_KEY_WORDS = {"KEY", "SECRET", "TOKEN", "PASSWORD", "PASS", "AUTH", "API"}
-        if any(w in key.upper() for w in _CRED_KEY_WORDS) and _user_shared(
-            val, user_text,
-        ):
+        declined = True
+        if _user_shared(val, user_text):
             return {
                 "kind": "credentials",
                 "identifier": _derive_identifier(
                     extraction, default_prefix=key,
                 ),
                 "value": f"{key}={val}",
-                "description": content,
+                "description": _credential_description(),
                 "tags": tags,
             }
+
+    # 3d. A connection string (scheme://user:password@host/...): the scrub
+    # removes its password from memory, so the reference keeps the whole URL.
+    userinfo = _URL_USERINFO_PATTERN.search(content)
+    pw = _capture(_URL_USERINFO_PATTERN, userinfo, "pw") if userinfo else None
+    if userinfo and pw:
+        declined = True
+        if _user_shared(pw, user_text):
+            end = userinfo.end()
+            while end < len(content) and not content[end].isspace():
+                end += 1
+            return {
+                "kind": "credentials",
+                "identifier": _derive_identifier(extraction, default_prefix="connection"),
+                "value": content[userinfo.start():end].rstrip(".,;"),
+                "description": _credential_description(userinfo.group("user") or None),
+                "tags": tags,
+            }
+
+    # Also when only the scrub's wider rule sees a secret ("the password is
+    # sunshine"): the branches below store this text as the description.
+    if declined or captured_secrets([content]):
+        return None
 
     # 3c. SSH user@host
     ssh = _SSH_PATTERN.search(content)
@@ -655,8 +764,98 @@ async def extract_references_from_chunk(
     return count
 
 
+#: Every pattern above that captures a SECRET, with the group holding it. The
+#: scrub runs all of them over every text field and collects every match,
+#: because the classifier stops at the first credential and one extraction can
+#: name several ("password: X; backup password: Y").
+_SECRET_GROUPS = (
+    (_CREDENTIAL_PAIR_PATTERN, "pass"),
+    (_EMAIL_PASSWORD_PATTERN, "pass"),
+    (_ACCOUNT_LIFECYCLE_PATTERN, "pass"),
+    (_SINGLE_CREDENTIAL_PATTERN, "value"),
+    (_KNOWN_KEY_PREFIX_PATTERN, "token"),
+    (_CREDENTIAL_TOKEN_PATTERN, "token"),
+    (_ENV_ASSIGNMENT_PATTERN, "val"),
+    (_URL_USERINFO_PATTERN, "pw"),
+)
+_TEXT_FIELDS = ("content", "event_subject", "event_verb", "event_object", "scenario", "temporal")
+
+
+def _extraction_texts(extraction: Extraction) -> list[str]:
+    texts = [getattr(extraction, name) for name in _TEXT_FIELDS]
+    texts += list(extraction.entities)
+    for rel in extraction.relationships:
+        if isinstance(rel, dict):
+            texts += list(rel.values())
+    return [t for t in texts if isinstance(t, str) and t]
+
+
+def captured_secrets(texts: list[str]) -> set[str]:
+    """Every secret a credential pattern captures in ``texts`` (``_capture``'s
+    rule), across every match of every pattern."""
+    secrets: set[str] = set()
+    for text in texts:
+        if not isinstance(text, str) or not text:
+            continue
+        for pattern, group in _SECRET_GROUPS:
+            for match in pattern.finditer(text):
+                try:
+                    value = _capture(pattern, match, group)
+                except Exception:
+                    # Redact the whole raw capture rather than skip it.
+                    value = (match.group(group) or "").strip()
+                if value:
+                    secrets.add(value)
+    return secrets
+
+
+def scrub_credential_extraction(extraction: Extraction) -> bool:
+    """Redact every credential secret an extraction carries, in place.
+
+    The extraction job stores each extraction as an episodic memory, logs it,
+    dedups and links it, and embeds it in the connection pass, AFTER it may have
+    been promoted to a reference. The reference holds the value out (#2426);
+    without this the same text would put it straight back into memory_fts, the
+    vector store, entity mentions, memory_events and the journal. Every secret
+    any credential pattern captures, in any text field, is redacted from every
+    text field (with the fragment rules ``reference_ops.secret_fragments``
+    applies to a stored value), whether or not auto-capture stored a reference:
+    redacting more is the safe side. Returns True when anything was redacted.
+    """
+    from genesis.memory.reference_ops import scrub, secret_fragments
+
+    try:
+        secrets = captured_secrets(_extraction_texts(extraction))
+    except Exception:
+        logger.warning("credential scrub: matching failed", exc_info=True)
+        return False
+    if not secrets:
+        return False
+    fragments = sorted(
+        {f for value in secrets for f in secret_fragments(value)}, key=len, reverse=True,
+    )
+
+    # A fragment with a digit or a symbol is replaced wherever it occurs; an
+    # all-letter one only where it stands as a word, because this scrub runs on
+    # every extraction and inside a longer word it is that word ("re-stored").
+    def _clean(value: object) -> object:
+        return scrub(value, fragments) if isinstance(value, str) else value
+
+    before = _extraction_texts(extraction)
+    for name in _TEXT_FIELDS:
+        setattr(extraction, name, _clean(getattr(extraction, name)))
+    extraction.entities = [_clean(e) for e in extraction.entities]
+    extraction.relationships = [
+        {k: _clean(v) for k, v in rel.items()} if isinstance(rel, dict) else rel
+        for rel in extraction.relationships
+    ]
+    return _extraction_texts(extraction) != before
+
+
 __all__ = [
     "classify_as_reference",
     "ingest_reference_from_extraction",
     "extract_references_from_chunk",
+    "captured_secrets",
+    "scrub_credential_extraction",
 ]

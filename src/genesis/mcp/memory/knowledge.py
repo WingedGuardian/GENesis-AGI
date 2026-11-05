@@ -15,6 +15,7 @@ from genesis.memory.reference_ops import (
     REFERENCE_PROJECT as _REFERENCE_PROJECT,
 )
 from genesis.memory.reference_ops import (
+    compose_body,
     delete_reference_entry,
 )
 from genesis.security import immunity_shadow
@@ -515,7 +516,7 @@ async def reference_store(
     identifier across re-stores to get upsert semantics.
 
     ``value`` is the raw value (password, URL string, IP address, file path,
-    etc.). Stored plaintext in the knowledge_units table, so an entry holding
+    etc.). Stored plaintext (a credential's value outside the search index), so an entry holding
     a payment card number in any field is refused (the planned card vault
     is tracked in #3172).
 
@@ -777,19 +778,23 @@ async def reference_lookup(
             continue
         if domain_filter and row.get("domain") != domain_filter:
             continue
-        full_rows.append(
-            {
-                "unit_id": row["id"],
-                "concept": row["concept"],
-                "body": row["body"],
-                "domain": row["domain"],
-                "tags": row["tags"],
-                "confidence": row["confidence"],
-                "source_doc": row["source_doc"],
-                "ingested_at": row["ingested_at"],
-                "origin": info["origin"],
-            }
-        )
+        # A credential's value is held out of the indexed body (#2426); this
+        # tool is where it is put back, behind the audit log below.
+        body, value_missing = await compose_body(memory_mod._db, row)
+        entry = {
+            "unit_id": row["id"],
+            "concept": row["concept"],
+            "body": body,
+            "domain": row["domain"],
+            "tags": row["tags"],
+            "confidence": row["confidence"],
+            "source_doc": row["source_doc"],
+            "ingested_at": row["ingested_at"],
+            "origin": info["origin"],
+        }
+        if value_missing:
+            entry["value_missing"] = True
+        full_rows.append(entry)
         if len(full_rows) >= limit:
             break
 
