@@ -2558,6 +2558,7 @@ def rewrites_before_running(command: str) -> bool:
     return (
         has_continuation(command)
         or has_built_escape(command)
+        or has_bash53_substitution(command)
         or _heredoc_hides_suffix(command)
     )
 

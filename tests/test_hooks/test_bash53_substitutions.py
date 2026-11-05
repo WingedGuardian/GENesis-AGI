@@ -45,8 +45,7 @@ RUN_FORMS = {
     "the command after an empty one": "${{ :; }} {c}",
     "the command glued to an empty one": "${{ :; }}{c}",
     "an assignment before the command": "x=${{ :; }} {c}",
-    # An apostrophe upsets a scan of quotes, which is why this reads the text alone.
-    "after an apostrophe in double quotes": 'echo "don\'t" ${{ {c}; }}',
+    "after a quoted word": 'echo "don\'t" ${{ {c}; }}',
     "in a case arm": "echo $(echo ${{ case x in x) {c};; esac; }})",
     "backslash before the dollar in backticks": "echo `echo \\${{ {c}; }}`",
 }
@@ -69,6 +68,12 @@ def test_the_report_says_what_to_do():
     assert blind is sp._BLIND_BASH53_SUBSTITUTION
     assert blind.bounds_induced
     assert "$(...)" in blind.hint
+
+
+def test_a_consumer_is_told_this_is_not_a_size_bound():
+    """Such a consumer gives its note per command, not once per session."""
+    assert sp.rewrites_before_running(f"echo ${{ {PROBE}; }}")
+    assert not sp.rewrites_before_running("echo ${HOME}")
 
 
 def test_a_script_given_to_a_shell_is_read_too():
@@ -109,9 +114,9 @@ def test_a_proven_data_here_doc_stays_readable():
     ],
 )
 def test_a_mention_of_the_text_is_refused_as_the_accepted_cost(command):
-    """bash runs none of these. Telling them apart takes the quote scan that an apostrophe
-    defeats, and such text is rare. If this starts to cost real commands, it can be
-    weighed again against what that scan would need."""
+    """bash runs none of these. Telling them apart needs a model of quoting this rule does
+    without, and such text is rare. If this starts to cost real commands, it can be
+    weighed again against what that model would take."""
     assert _blind(command) is sp._BLIND_BASH53_SUBSTITUTION
 
 
@@ -144,7 +149,7 @@ _GUARD_FORMS = [
     "value",
     "in backticks",
     "the command after an empty one",
-    "after an apostrophe in double quotes",
+    "after a quoted word",
 ]
 
 
