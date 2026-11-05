@@ -716,6 +716,10 @@ _NOT_WIRED = {
     # .claude/; its only scripts/hooks/ mention is codex_validator_shell.py naming
     # it as the admitted runner.
     "codex_validator_request.py": "a sealed-command CLI, not a hook: wired nowhere in .claude/",
+    # Standalone CLI: settings and its generated hook invoke the adapter, not
+    # this launcher. test_launcher_sibling_import_failure_stops_before_startup
+    # measures both sibling failures aborting before profile/session startup.
+    "codex_validator_launcher.py": "a standalone CLI; import failure aborts startup, not a hook decision",
 }
 
 
