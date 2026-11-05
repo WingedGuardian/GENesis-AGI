@@ -1701,16 +1701,18 @@ the shared banner is not an assertion about all concurrent sessions.
   `docs/reference/codebase-managed.md`.
   The queue's `scripts/lib/index_marker_legacy.py` isolates malformed legacy
   artifacts in retained import receipts without replacing business failures;
-  real filesystem/SQLite errors remain visible. Schema 2 upgrades metadata
-  atomically and older writers refuse it. The marker CLI `import-status`
-  observes receipt totals without initialization or migration. This does not
-  implement persistent resource quarantine or the runner's separate list/claim
-  error propagation.
-  A read-only protocol observer now fences automatic consumption before any
-  reconciliation, list, claim or provider call. Explicit queue APIs still write
-  schema 2; observing known schema-3 metadata does not upgrade it. The observer
-  exposes no positive readiness result or setter; later protocol work and the
-  separate activation gates remain required.
+  real filesystem/SQLite errors remain visible. Schema 3 atomically fans requests
+  into independent provider legs, preserving legacy shared debt, claim history
+  and raw import evidence; older writers refuse it. No ordinary command converts
+  an existing queue (a rollback would strand it): on an older queue `write`
+  spools in the schema-2 format and other commands exit 2, and a missing queue
+  is not created while an update runs. Only the strict cutover converts, and that
+  is not built yet. New scalar settlement uses
+  complete provider/protocol/sequence/nonce/repository context. `import-status`
+  observes receipt totals without initialization or migration; `automatic-ready`
+  fences every automatic reconciliation/claim/launch until the later protocol
+  completes. There is no readiness setter. This does not implement persistent
+  resource quarantine or the checked consumer's list/claim error propagation.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
   deletions; native query/client cgroup proof and orphan-scope checks precede
@@ -3780,7 +3782,7 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
-          env.py, _config_overlay.py]
+          env.py, _config_overlay.py, caller_context.py]
 verified: 973a0e6 2026-10-30
 ```
 
@@ -4410,9 +4412,18 @@ Refusing a proposed update preserves a previously valid opt-in.
 - **`update.sh`'s rollback lives in `scripts/lib/update_rollback.sh`** (#3844):
   `_do_rollback` and the service, database and history helpers it needs, sourced
   at startup with the other libs. The lib holds definitions, plus two lines safe to
-  run twice, so it can be sourced again; `_on_err` and `_on_signal` stay in
-  `update.sh` with the traps. A run still uses the copy on disk at launch, so a
-  rollback fix does not yet protect the update that delivers it.
+  run twice, so it can be sourced again; `_on_err`, `_on_signal` and the thin
+  `_do_rollback` stay in `update.sh`, which keeps its own functions for the whole
+  run. So that a rollback fix protects the update delivering it, a plain merge
+  update stages the merged `scripts/lib` under `~/tmp` before the stop and checks
+  it; after the merge is verified, a failure loads that copy and runs it with `set
+  +eu`, because with the traps off a stop would leave the server down. Anything
+  wrong falls back to the launched rollback: a file that will not parse or load, a
+  different `update_rollback_abi`, a global the lib declares and the launching
+  script does not set, nothing merged, or local commits to `scripts/lib`. Activation
+  stays on what it launched with, as do `live` and `--post-merge`.
+  `~/.genesis/last_rollback_source.json` says which rollback last ran and why
+  (a diagnostic, overwritten each time; nothing reads it).
 - **`update.sh` on `live`** (#2978, #3370): the merge's place, after the stop,
   is taken by the deploy-candidates engine's rebuild (`scripts/deploy_candidates.py
   rebuild`, the `live-engine` block). Everything else is main's path: one DB

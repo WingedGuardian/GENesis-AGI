@@ -138,7 +138,12 @@ def _setup(tmp: Path, checkouts, merchant: str = MERCHANT):
 @pytest.fixture(scope="module")
 def built(tmp_path_factory, checkouts):
     tmp = tmp_path_factory.mktemp("built")
-    layout, state = _setup(tmp, checkouts)
+    # Module scope runs before the autouse function-scoped _isolate_trash_root, and
+    # check_trashable needs the trash on this directory's volume, which the real
+    # one is not when the test temp is its own filesystem (a separate /tmp).
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("genesis.trash.home_trash_root", lambda: tmp / "genesis-trash")
+        layout, state = _setup(tmp, checkouts)
     yield layout, state
     Path(state["overlay"]).unlink(missing_ok=True)
 

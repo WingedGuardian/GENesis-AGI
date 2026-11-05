@@ -17,9 +17,9 @@ def update_text() -> str:
 
 
 def rollback_body_text() -> str:
-    """_do_rollback, whole. Its body holds a column-0 `}` in an embedded python
+    """The rollback body, whole. It holds a column-0 `}` in an embedded python
     program, so a cut at the first one stops early."""
     text = ROLLBACK_LIB.read_text()
-    start = text.index("_do_rollback() {\n")
+    start = text.index("_rollback_body() {\n")
     end = text.index("\n}\n", text.index("# END rollback-state-clear", start)) + len("\n}\n")
     return text[start:end]

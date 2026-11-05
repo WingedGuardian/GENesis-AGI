@@ -330,7 +330,7 @@ def test_rollback_to_old_code_consumes_only_guarded_candidate(tmp_path, candidat
             "# END db-restore-through-sqlite", restore_marker
         )
     ]
-    start = source.index("    genesis_checkout_unlock\n", source.index("_do_rollback() {"))
+    start = source.index("    genesis_checkout_unlock\n", source.index("_rollback_body() {"))
     restart = source[start : source.index('\n    if [ "$checkout_ok"', start)]
     live = _seed(tmp_path / "genesis.db", "CREATE TABLE migrated(x);")
     raw = _seed(tmp_path / "genesis.db.pre-update")
