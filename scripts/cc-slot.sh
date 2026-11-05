@@ -125,6 +125,11 @@ while [ -L "$_CC_SLOT_SCRIPT" ]; do
 done
 _CC_SLOT_DIR="$(unset CDPATH; cd -P "$(dirname "$_CC_SLOT_SCRIPT")" && pwd)"
 GENESIS_ROOT="$(cd "$_CC_SLOT_DIR/.." 2>/dev/null && pwd)"
+# Optional: without it the door still opens, with the system's weaker kill.
+if [ -r "$_CC_SLOT_DIR/lib/gnu_timeout.sh" ]; then
+    # shellcheck source=scripts/lib/gnu_timeout.sh
+    . "$_CC_SLOT_DIR/lib/gnu_timeout.sh"
+fi
 unset _CC_SLOT_SCRIPT _CC_SLOT_DIR _CC_SLOT_TARGET
 SESSION_PREFIX="cc"
 
