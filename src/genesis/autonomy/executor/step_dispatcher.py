@@ -36,12 +36,12 @@ def _step_status(parsed: dict, output) -> tuple[str, str | None, str | None]:
     A blocked step reaches the owner through the engine's existing blocker
     notification. Nothing reported anywhere stays ``completed``, as before.
 
-    When the JSON explicitly said ``completed`` and the report says ``failed``,
-    the step is ``blocked``, not failed: ``failed`` starts automatic re-runs
-    (workaround, research, exit gate) of a step that may already have done its
-    work, which is not safe to repeat; the owner decides instead. The third
-    value is the reason, for a stop the report decided with no JSON ``result``
-    (the failed path reads ``result``, and a transcript's start is not the why).
+    A reported ``failed`` is ``blocked`` too, never ``failed`` (owner ruling
+    2026-11-05): ``failed`` starts automatic re-runs (workaround, research, up
+    to 10 exit-gate retries) of a step that may already have done its work,
+    which is not safe to repeat on the model's word alone; the owner decides.
+    Revisit once the self-report's accuracy is measured. The third value is
+    the reason, for a stop the report decided with no JSON ``result``.
     """
     status = parsed.get("status", "completed")
     blocker = parsed.get("blocker_description")
@@ -49,7 +49,7 @@ def _step_status(parsed: dict, output) -> tuple[str, str | None, str | None]:
     reported = report.status if isinstance(report, FinalStatus) else None
     if status != "completed" or reported not in ("blocked", "failed"):
         return status, blocker, None
-    status = "blocked" if (reported == "failed" and "status" in parsed) else reported
+    status = "blocked"
     reason = report.reason or f"Step reported {reported}"
     return status, blocker or reason, None if "result" in parsed else reason
 

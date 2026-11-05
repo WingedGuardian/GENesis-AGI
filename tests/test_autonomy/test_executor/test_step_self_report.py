@@ -2,10 +2,10 @@
 
 A step denied what it needed usually exits cleanly and claims nothing, so
 ``parse_step_output`` defaulted it to completed. Now a reported ``blocked`` or
-``failed`` wins over that default; the engine's existing blocker notification
-then reaches the owner. A reported ``failed`` that contradicts an explicit JSON
-``completed`` is ``blocked``, never ``failed``: failed starts automatic re-runs
-of a step that may already have done its work.
+``failed`` wins over that default as ``blocked``; the engine's existing
+blocker notification then reaches the owner. A self-report never makes a step
+``failed`` (owner ruling): failed starts automatic re-runs of a step that may
+already have done its work.
 """
 
 from __future__ import annotations
@@ -40,16 +40,15 @@ DENIED = FinalStatus("blocked", "secrets.env denied")
 @pytest.mark.parametrize(
     ("parsed", "report", "expected"),
     [
-        # No JSON at all: the report decides a stop, and its reason is the result.
+        # No JSON at all: a reported stop is a block, and its reason is the result.
         ({}, DENIED, ("blocked", "secrets.env denied", "secrets.env denied")),
-        ({}, FinalStatus("failed", "tests fail"), ("failed", "tests fail", "tests fail")),
+        ({}, FinalStatus("failed", "tests fail"), ("blocked", "tests fail", "tests fail")),
         ({}, FinalStatus("blocked"), ("blocked", "Step reported blocked", "Step reported blocked")),
         # Nothing to stop on: the old default, untouched.
         ({}, FinalStatus("completed", "done"), ("completed", None, None)),
         ({}, None, ("completed", None, None)),
         ({}, FinalStatus("malformed"), ("completed", None, None)),
-        # An explicit JSON "completed": a reported block wins; a reported failure
-        # becomes a block (the owner decides, nothing re-runs automatically).
+        # An explicit JSON "completed": a reported stop wins, always as a block.
         ({"status": "completed"}, DENIED, ("blocked", "secrets.env denied", "secrets.env denied")),
         ({"status": "completed"}, FinalStatus("failed", "x"), ("blocked", "x", "x")),
         # The step's own result text is kept when it gave one.
