@@ -16,7 +16,6 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-import os
 
 from genesis.mcp.health import mcp
 
@@ -106,7 +105,9 @@ async def _impl_direct_session_run(
     origin_session_id = None
     delivery_mode = None
     if deliver_to_origin:
-        origin_session_id = os.environ.get("GENESIS_SESSION_ID") or None
+        from genesis.caller_context import caller_context
+
+        origin_session_id = caller_context().session_id or None
         if origin_session_id:
             delivery_mode = "result"
         else:

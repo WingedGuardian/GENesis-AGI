@@ -1005,7 +1005,7 @@ def test_the_rollback_moves_only_the_original_branch_with_a_non_forced_checkout(
     reset arm only; never a reset of the tree."""
     text = _text()
     body = text[
-        text.index("_do_rollback() {") : text.index("\n}\n", text.index("_do_rollback() {"))
+        text.index("_rollback_body() {") : text.index("\n}\n", text.index("_rollback_body() {"))
     ]
     assert 'checkout "$ORIGINAL_BRANCH"' not in body
     code = _code(_block("rollback-code-guard"))

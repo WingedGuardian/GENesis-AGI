@@ -27,9 +27,10 @@ shape was itself the defect (per a premise check of its review threads,
 2026-10-03: 15 of 28 findings came from writing the caller's tree and putting it
 back). A check can only narrow a check-then-write window. Not writing closes it:
 a sweep runs in private copies (`isolated_copy`), one per case, holding what is on disk, and
-the caller's WORKING TREE is never written. (A `git worktree` shares the
-caller's git metadata -- config, hooks, refs -- so a test that runs git
-commands in its cwd can still change those.)
+the sweep never writes the caller's WORKING TREE. A child can: a test body, or an
+option that names an output path, runs as the same user. (A `git worktree` also
+shares the caller's git metadata -- config, hooks, refs -- so a test that runs
+git commands in its cwd can change those.)
 
 WHAT A SWEEP GUARANTEES, per case:
   1. The anchor matches exactly once. With two or more edits, a whole-file
@@ -59,6 +60,29 @@ WHAT A SWEEP GUARANTEES, per case:
      caused through state rather than through the mutation. Either one failing
      is an ABORT. Not covered: a flaky test, and state that changes between runs
      for reasons outside the copy.
+  6. The mutated run OPENED the mutated file (`_watch_opens`), or its verdict is
+     an ABORT with `never_opened` set. A run that loaded the file from somewhere
+     else, through a path in pytest config, a conftest or the env, or that never
+     loaded it at all, says nothing about the mutation. OPENED IS NOT EXERCISED:
+     a module-level import counts, so a test that never calls the target and
+     fails for its own reason still reads BIT, and only guarantee 5 stands
+     against that shape. A target a test runs as a subprocess or through another
+     interpreter is seen like any other, which a check inside the child could
+     not do. A MIXED run, which opens the copy's target and also loads the
+     caller's code, is not caught: it reads as its verdict, and SURVIVED at worst,
+     which exits 1.
+  7. pytest's temp directory stays in the copy. The harness passes its own
+     `--basetemp` last, because pytest empties that directory when a test uses
+     `tmp_path`, and the last one wins however a case's own is spelled. Options
+     that name one output file (`--junitxml`) can still overwrite that file.
+  8. A sweep that is stopped keeps what it learned. Each result is printed as its
+     case finishes. A signal unwinds the sweep, which removes the copy and kills
+     the child's group, and it waits for the steps a raise would damage (`_hold`):
+     git's part in making a copy, removing one, starting a child. A stop ends
+     non-zero, and a case that has reached its result still reports it.
+     SIGKILL cannot be handled, and a test's descendant in its own session escapes
+     the group kill. In CI the job must `exec` the sweep, or the signal stops at
+     the step's shell.
 
 WHAT IT DELIBERATELY DOES NOT DO. It does not generate mutations. Picking the
 mutation is the thinking part -- a behaviourally-null edit (swapped operands
@@ -77,22 +101,24 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import ctypes
+import errno
 import hashlib
 import io
 import json
 import os
 import re
-import shlex
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import tokenize
 import traceback
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -205,6 +231,7 @@ class Result:
     outcome: str
     detail: str = ""
     stdout: str = ""
+    never_opened: bool = False
 
 
 @dataclass
@@ -543,6 +570,36 @@ def _decode(case: Case, raw: bytes) -> tuple[str, str]:
 # --------------------------------------------------------------------------
 
 
+#: The signal that stopped this sweep, if any: a fact, checked between cases and
+#: before the tally, because a raise is not enough. Python discards an exception
+#: raised inside a `__del__`, so a signal landing in one would otherwise read as a
+#: clean sweep at exit 0.
+_stop_signal: int | None = None
+_held = 0
+
+
+def _raise_if_stopped() -> None:
+    if _stop_signal is not None:
+        raise SystemExit(128 + _stop_signal)
+
+
+@contextlib.contextmanager
+def _hold(*, then_stop: bool = True) -> Iterator[None]:
+    """A signal arriving inside this waits for its end, however long the step
+    takes. For a step a raise would damage: one part way through `git worktree add`
+    leaves an entry locked "initializing" in the caller's repository, one in cleanup
+    abandons it. ``then_stop=False`` leaves the stop to the next check: a raise out
+    of a copy's cleanup would discard the result its case has just reached."""
+    global _held
+    _held += 1
+    try:
+        yield
+    finally:
+        _held -= 1
+        if then_stop and not _held:
+            _raise_if_stopped()
+
+
 def _git(repo: Path, *args: str) -> bytes:
     """``git -C repo <args>`` -> stdout bytes; RuntimeError naming git's stderr.
 
@@ -756,8 +813,9 @@ def isolated_copy(
     tree = holder / holder.name  # the basename names git's admin entry too
     admin: Path | None = None
     try:
-        _git(top, "worktree", "add", "--detach", "--quiet", str(tree), "HEAD")
-        admin = Path(os.fsdecode(_git(tree, "rev-parse", "--absolute-git-dir").strip()))
+        with _hold():
+            _git(top, "worktree", "add", "--detach", "--quiet", str(tree), "HEAD")
+            admin = Path(os.fsdecode(_git(tree, "rev-parse", "--absolute-git-dir").strip()))
         overlay = _overlay(top, tree)
         if info is not None:
             head = os.fsdecode(_git(tree, "rev-parse", "HEAD").strip())
@@ -765,14 +823,18 @@ def isolated_copy(
             info["fingerprint"] = f"{head}:{overlay}"
         yield tree / repo.relative_to(top)
     finally:
-        with contextlib.suppress(RuntimeError):
-            _git(top, "worktree", "remove", "--force", str(tree))
-        if os.path.lexists(holder):
-            _force_rmtree(holder)
-        if admin is not None and admin.parent.name == "worktrees" and admin.exists():
-            shutil.rmtree(admin, ignore_errors=True)
-        if os.path.lexists(holder) or (admin is not None and admin.exists()):
-            print(f"mutation-sweep: could not fully remove the copy at {holder}", file=sys.stderr)
+        with _hold(then_stop=False):
+            # Twice: one --force refuses a locked working tree.
+            with contextlib.suppress(RuntimeError):
+                _git(top, "worktree", "remove", "--force", "--force", str(tree))
+            if os.path.lexists(holder):
+                _force_rmtree(holder)
+            if admin is not None and admin.parent.name == "worktrees" and admin.exists():
+                shutil.rmtree(admin, ignore_errors=True)
+            if os.path.lexists(holder) or (admin is not None and admin.exists()):
+                print(
+                    f"mutation-sweep: could not fully remove the copy at {holder}", file=sys.stderr
+                )
 
 
 @dataclass(frozen=True)
@@ -820,192 +882,28 @@ def _repo_relative(repo: Path, path: Path) -> Path:
     return p.relative_to(repo)
 
 
-#: Where a path can hide inside one value: words, `--opt=value`, `a:b` path
-#: lists (`os.pathsep`), `a,b` lists.
-_PATH_PIECES = re.compile(r"[\s=,:;]+")
-
-
-def _climbs(rel: str) -> str | None:
-    """Why the relative path ``rel`` is refused before any copy exists, or None.
-
-    A `..` component is refused outright, as `_contained_path` refuses it in
-    manifest paths: the operating system follows a symlink BEFORE it applies
-    the `..` after it, so `lk/../src` (with `lk -> <repo>/sub`) is the caller's
-    `src`, and normalizing first judged it as the innocent `src`.
-    """
-    if ".." in Path(rel).parts:
-        return f"{rel} (a `..` component; name it repository-relative without one)"
-    return None
-
-
-def _copy_escape(root: Path, holder: Path, rel: str) -> str | None:
-    """Where ``rel`` lands if the child at ``root`` follows it out of its copy,
-    or None. Judged IN THE COPY, because that is where the child resolves it:
-    the copy keeps the caller's symlinks, so an absolute link anywhere in a
-    chain, or a relative one whose `..`s reach the filesystem root, resolves
-    INSIDE the caller's repository and OUTSIDE the copy. Walking links in the
-    caller's tree passed both.
-    """
-    where = Path(os.path.realpath(root / rel))
-    if where.is_relative_to(os.path.realpath(holder)):
-        return None
-    return f"{rel} -> {where}"
-
-
-def _pieces(value: str) -> Iterator[str]:
-    """The path-like parts of ``value``, split the way its consumer splits it:
-    shell words first (pytest runs ``shlex.split`` on an ``-o`` value, so a
-    quoted path is still a path), then the separators in `_PATH_PIECES`."""
-    try:
-        words = shlex.split(value)
-    except ValueError:
-        words = [value]
-    for word in words:
-        yield from (piece for piece in _PATH_PIECES.split(word) if piece)
-
-
-def _back_pointer(repo: Path, value: str, top: Path | None = None) -> str | None:
-    """The part of ``value`` that points a child BACK at the caller's tree, or None.
-
-    ONE rule for every channel a case controls -- the selector, each
-    `pytest_args` token, each env value -- because a child pointed back at the
-    caller's tree imports the UNMUTATED file and reports SURVIVED for a mutation
-    its test would catch. Refused:
-      * an absolute path that lands inside the repository, judged both
-        lexically (``/x/./repo/src``) and after resolving symlinks (an alias of
-        the repository);
-      * a relative path with a ``..`` component (`_climbs`): the child runs in
-        the COPY, so climbing out of it can only reach somewhere else, and the
-        caller's tree is one of the places it can reach;
-      * an ``@argfile``, whose contents this check cannot see;
-      * the repository's path anywhere in the value (``file://...``).
-    A relative path that stays inside (``PYTHONPATH=src``) resolves inside the
-    copy and is fine; `_refuse_copy_escapes` follows its links once a copy exists.
-
-    A value is split the way its consumer splits it -- shell words first
-    (pytest runs ``shlex.split`` on an ``-o`` value, so a quoted path is still
-    a path), then the separators above -- and judged against the repository
-    AND its git toplevel (``top``), since a sweep may be pointed at a
-    subdirectory. Leading slashes are collapsed (``//repo`` is ``/repo``).
-
-    NOT covered: paths a test derives from HOME, the interpreter a case names,
-    and an editable install's ``.pth``, which sits after PYTHONPATH on
-    ``sys.path``. Each of these usually yields a false SURVIVED; with someone
-    editing the caller's tree DURING the sweep, a run could read it red, so the
-    rule is to name everything repository-relative.
-    """
-    roots = {repo, Path(os.path.realpath(repo))}
-    if top is not None:
-        roots |= {top, Path(os.path.realpath(top))}
-    for root in roots:
-        # The path itself, not a sibling that merely starts with it (`repo-data`).
-        if re.search(re.escape(str(root)) + r"(?![\w.-])", value):
-            return value
-    for piece in _pieces(value):
-        if piece.startswith("@"):
-            return piece
-        if os.path.isabs(piece):
-            piece_abs = "/" + piece.lstrip("/")
-            lexical = Path(os.path.normpath(piece_abs))
-            resolved = Path(os.path.realpath(piece_abs))
-            if any(p.is_relative_to(r) for p in (lexical, resolved) for r in roots):
-                return piece
-        elif escape := _climbs(piece):
-            return escape
-    return None
-
-
-_POINTER_HINT = (
-    "The sweep runs in an isolated copy, so a child pointed there tests "
-    "the UNMUTATED file; name test files and import roots repo-relative "
-    "(`pythonpath`) instead"
-)
-
-
-def _refuse_back_pointers(repo: Path, env: dict[str, str] | None, cases: list[Case]) -> None:
-    """Raise ValueError naming the first selector, pytest arg or env value that
-    `_back_pointer` refuses. Runs before any copy is made, so a bad case fails
-    the whole sweep loudly rather than producing a meaningless verdict."""
-    try:
-        top: Path | None = Path(os.fsdecode(_git(repo, "rev-parse", "--show-toplevel").strip()))
-    except RuntimeError:
-        top = None  # `isolated_copy` refuses a tree that is not a git work tree
-    # The copy owns these; a manifest value would quietly share one temp
-    # directory between cases again (`_copy_env`).
+def _refuse_owned_env(env: dict[str, str] | None, cases: list[Case]) -> None:
+    """Raise ValueError when a manifest sets what each copy owns. A shared TMPDIR
+    let one case's leftovers change the next case's verdict. The fresh bytecode
+    prefix is what makes an honest import open its source, so the watch depends
+    on it: with a precompiled unchecked `.pyc` and no prefix, an import opens
+    nothing."""
     for scope, mapping in [("sweep", env or {})] + [(f"case {c.label!r}", c.env) for c in cases]:
         for key in ("TMPDIR", "PYTHONPYCACHEPREFIX"):
             if key in mapping:
                 raise ValueError(
                     f"{scope} env sets {key}, which each case's copy sets for itself; leave it out"
                 )
-    hint = _POINTER_HINT
-    for key, value in (env or {}).items():
-        if bad := _back_pointer(repo, value, top):
-            raise ValueError(
-                f"sweep env {key}={value!r} points into the tree under test ({bad!r}). {hint}"
-            )
-    for c in cases:
-        for key, value in c.env.items():
-            if bad := _back_pointer(repo, value, top):
-                raise ValueError(
-                    f"case {c.label!r} env {key}={value!r} points into "
-                    f"the tree under test ({bad!r}). {hint}"
-                )
-        for arg in c.pytest_args:
-            if bad := _back_pointer(repo, arg, top):
-                raise ValueError(
-                    f"case {c.label!r} pytest arg {arg!r} points into "
-                    f"the tree under test ({bad!r}). {hint}"
-                )
-
-
-def _refuse_copy_escapes(
-    root: Path,
-    holder: Path,
-    *,
-    env: dict[str, str] | None,
-    cases: list[Case],
-    pythonpath: tuple[str, ...],
-    selectors: dict[int, str],
-) -> None:
-    """Raise ValueError naming the first relative path a case NAMES that leaves
-    the copy, judged in the sweep's first copy, before any child runs.
-
-    It covers names only. A tracked `pytest.ini`, a conftest's `sys.path` edit
-    or a plain import through a link name nothing this can see, and they still
-    read SURVIVED. Such a miss fails closed, because SURVIVED and ABORTED both
-    exit 1, so this buys an accurate verdict rather than a safe gate.
-    """
-
-    def named(value: str) -> str | None:
-        for piece in _pieces(value):
-            if not os.path.isabs(piece) and (where := _copy_escape(root, holder, piece)):
-                return where
-        return None
-
-    for entry in pythonpath:
-        if where := _copy_escape(root, holder, entry):
-            raise ValueError(f"pythonpath entry {entry!r} leads out of the copy: {where}")
-    channels = [(f"sweep env {k}={v!r}", v) for k, v in (env or {}).items()]
-    for c in cases:
-        channels += [(f"case {c.label!r} env {k}={v!r}", v) for k, v in c.env.items()]
-        channels += [(f"case {c.label!r} pytest arg {a!r}", a) for a in c.pytest_args]
-    for what, value in channels:
-        if where := named(value):
-            raise ValueError(f"{what} leads out of the copy: {where}. {_POINTER_HINT}")
-    for c in cases:
-        file_part = selectors[id(c)].partition("::")[0]
-        if where := _copy_escape(root, holder, file_part):
-            raise ValueError(f"case {c.label!r} test {c.test!r} leads out of the copy: {where}")
 
 
 def _copy_selector(repo: Path, case: Case) -> str:
     """The case's pytest selector, with its FILE part made repository-relative,
     so it names the copy's file when the child runs in the copy.
 
-    An absolute file inside the repository is rewritten; one outside it, or a
-    relative one that climbs out, is refused (ValueError) -- either would
-    collect a test, and import source, from outside the copy.
+    An absolute file inside the repository is rewritten, so the case tests the
+    copy; one outside it is refused (ValueError). Anything else that leads away
+    from the copy is the watch's job (guarantee 6): no list of spellings could
+    be complete, because a tracked `pytest.ini` names nothing a check could see.
     """
     if case.test.startswith("-"):
         raise ValueError(
@@ -1029,14 +927,6 @@ def _copy_selector(repo: Path, case: Case) -> str:
                 f"case {case.label!r} test {case.test!r} is outside the "
                 f"repository {repo}; the child runs in a copy of it"
             )
-    # Checked AFTER the rewrite too: `/repo/linked/t.py` becomes `linked/t.py`.
-    if escape := _climbs(file_part):
-        raise ValueError(f"case {case.label!r} test {case.test!r} leads out of the copy: {escape}")
-    if _back_pointer(repo, file_part):
-        raise ValueError(
-            f"case {case.label!r} test {case.test!r} climbs out of the "
-            "repository; name it repository-relative"
-        )
     return rewritten
 
 
@@ -1070,10 +960,14 @@ def _pytest(
     tmp = env.get("TMPDIR")
     where = tmp if tmp and os.path.isdir(tmp) else None  # a test may have removed it
     with tempfile.TemporaryFile(dir=where) as out, tempfile.TemporaryFile(dir=where) as err:
-        proc = subprocess.Popen(
-            cmd, cwd=str(cwd), env=env, stdout=out, stderr=err, start_new_session=True
-        )
+        proc = None
         try:
+            # Held: a raise between the child starting and this name being bound
+            # would leave nothing that could kill it.
+            with _hold():
+                proc = subprocess.Popen(
+                    cmd, cwd=str(cwd), env=env, stdout=out, stderr=err, start_new_session=True
+                )
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             _kill_group(proc.pid)
@@ -1081,7 +975,8 @@ def _pytest(
                 proc.wait(timeout=10)
             raise
         finally:
-            _kill_group(proc.pid)
+            if proc is not None:
+                _kill_group(proc.pid)
         return subprocess.CompletedProcess(
             cmd,
             proc.returncode,
@@ -1111,8 +1006,75 @@ def _kill_group(pgid: int) -> None:
         os.killpg(pgid, signal.SIGKILL)
 
 
-def _pytest_cmd(python: str, test: str, extra: tuple[str, ...]) -> list[str]:
-    return [python, "-m", "pytest", test, "-q", "--no-header", "-p", "no:cacheprovider", *extra]
+def _pytest_cmd(
+    python: str, test: str, extra: tuple[str, ...], env: dict[str, str] | None = None
+) -> list[str]:
+    """The child's command. Its `--basetemp` comes LAST, so it wins over any a
+    case passes, however spelled: pytest empties that directory when a test uses
+    `tmp_path`, and a case aiming it at the caller's tree would delete the tree.
+    After a case's `--`, this reads as a missing file and the run stops before
+    any test. A sweep always passes a TMPDIR (`_copy_env`), which each copy owns.
+    """
+    cmd = [python, "-m", "pytest", test, "-q", "--no-header", "-p", "no:cacheprovider", *extra]
+    if tmp := (env or {}).get("TMPDIR"):
+        cmd.append(f"--basetemp={os.path.join(tmp, 'pytest')}")
+    return cmd
+
+
+_IN_OPEN = 0x20
+_IN_Q_OVERFLOW = 0x4000
+_INOTIFY_EVENT = struct.Struct("iIII")
+
+
+class _OpenWatch:
+    """Whether a file was opened since the watch started, by anyone: inotify
+    carries no pid, so an outside process's open counts too."""
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+        self._opened = False
+
+    def opened(self) -> bool:
+        """Yes or no, never a count: the kernel merges identical queued events.
+        An unlink delivers IN_IGNORED, which is not an open. An overflow means
+        events were lost, and only an open is being watched for."""
+        while not self._opened:
+            try:
+                data = os.read(self._fd, 65536)
+            except BlockingIOError:
+                break
+            at = 0
+            while at < len(data):
+                _wd, mask, _cookie, name_len = _INOTIFY_EVENT.unpack_from(data, at)
+                at += _INOTIFY_EVENT.size + name_len
+                if mask & (_IN_OPEN | _IN_Q_OVERFLOW):
+                    self._opened = True
+        return self._opened
+
+    def close(self) -> None:
+        os.close(self._fd)
+
+
+def _watch_opens(path: Path) -> _OpenWatch:
+    """Start watching ``path``, or raise OSError. Set it AFTER the file is
+    written: `_put` makes a new inode, and a watch follows the inode. Close-on-exec,
+    so no child holds it."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        init, add = libc.inotify_init1, libc.inotify_add_watch
+    except AttributeError as exc:
+        raise OSError(errno.ENOSYS, "this platform has no inotify") from exc
+    add.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32)
+    # <linux/inotify.h> defines IN_CLOEXEC and IN_NONBLOCK as these two.
+    fd = init(os.O_CLOEXEC | os.O_NONBLOCK)
+    if fd < 0:
+        code = ctypes.get_errno()
+        raise OSError(code, f"inotify_init1: {os.strerror(code)}")
+    if add(fd, os.fsencode(path), _IN_OPEN) < 0:
+        code = ctypes.get_errno()
+        os.close(fd)
+        raise OSError(code, f"inotify_add_watch {path}: {os.strerror(code)}")
+    return _OpenWatch(fd)
 
 
 def apply_edits(text: str, edits: tuple[Edit, ...]) -> tuple[str, str | None]:
@@ -1212,7 +1174,7 @@ def run_case(
             ABORTED,
             f"the mutation cannot be written in the target's own encoding ({encoding}): {exc}",
         )
-    cmd = _pytest_cmd(case.python or python, test, case.pytest_args)
+    cmd = _pytest_cmd(case.python or python, test, case.pytest_args, {**(env or {}), **case.env})
     problem = _unmutated_problem(
         cmd, cwd=cwd, env={**(env or {}), **case.env}, timeout=timeout, test=test
     )
@@ -1228,16 +1190,41 @@ def run_case(
     except OSError as exc:
         return Result(case, ABORTED, f"could not write the mutation: {exc}")
     try:
-        proc = _pytest(cmd, cwd=cwd, env=_child_env({**(env or {}), **case.env}), timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return Result(case, ABORTED, f"test timed out after {timeout}s")
-    except OSError as exc:  # e.g. a `python` the case names that does not exist
-        return Result(case, ABORTED, f"could not start the test run: {exc}")
+        watch = _watch_opens(target.path)
+    except OSError as exc:
+        return Result(
+            case,
+            ABORTED,
+            f"could not watch whether the mutated run opens its target, so no verdict: {exc}",
+        )
+    with contextlib.closing(watch):
+        try:
+            proc = _pytest(
+                cmd, cwd=cwd, env=_child_env({**(env or {}), **case.env}), timeout=timeout
+            )
+        except subprocess.TimeoutExpired:
+            return Result(case, ABORTED, f"test timed out after {timeout}s")
+        except OSError as exc:  # e.g. a `python` the case names that does not exist
+            return Result(case, ABORTED, f"could not start the test run: {exc}")
+        opened = watch.opened()
     # (3) the exit code AND the summary decide, together, in `mutation_verdict`
     # -- the one place a mutated run is classified. Only stdout is parsed:
     # pytest writes its summary there, and stderr belongs to whatever else ran.
     outcome, detail = mutation_verdict(proc.returncode, proc.stdout)
     output = proc.stdout + proc.stderr
+    # Only a verdict needs overriding: a run that could not decide (a usage
+    # error, a lock refusal) also opens nothing, and keeps its own reason.
+    if outcome in (BIT, SURVIVED) and not opened:
+        return Result(
+            case,
+            ABORTED,
+            f"the mutated run never opened {target.path.name}, so its result (it would have "
+            f"read {outcome}) says nothing about the mutation: the test does not load this "
+            "file, or it loaded a copy from outside this sweep's, through a path in pytest "
+            "config, a conftest or the env",
+            output,
+            never_opened=True,
+        )
     if outcome != BIT:
         return Result(case, outcome, detail, output)
 
@@ -1321,7 +1308,7 @@ def assert_green_baseline(
     for test, py, extra, case_env in seen:
         try:
             proc = _pytest(
-                _pytest_cmd(py or python, test, extra),
+                _pytest_cmd(py or python, test, extra, {**(env or {}), **dict(case_env)}),
                 cwd=cwd,
                 env=_child_env({**(env or {}), **dict(case_env)}),
                 timeout=timeout,
@@ -1368,13 +1355,15 @@ def sweep(
     available: set[str] | None = None,
     check_baseline: bool = True,
     tmp_root: Path | None = None,
+    on_start: Callable[[Case], None] | None = None,
+    on_result: Callable[[Result], None] | None = None,
 ) -> Sweep:
     """Run every baseline and every case in its OWN isolated copy of ``repo``.
 
     ``cases`` name files in ``repo`` (the caller's tree); each is mutated at the
     same relative place in its copy. ``pythonpath`` lists repo-relative import
     roots, put on the children's PYTHONPATH as copy paths. ``tmp_root`` is where
-    copies are made (default ``~/tmp``). The caller's tree is never written.
+    copies are made (default ``~/tmp``). The sweep never writes the caller's tree.
 
     One copy for all cases let a file one test wrote change a later case's
     verdict. Now nothing is shared between cases except what lives outside a
@@ -1390,26 +1379,16 @@ def sweep(
     rels = {c.path: _repo_relative(repo, Path(c.path)) for c in cases}
     for root in pythonpath:
         # `root / p` with an absolute `p` would REPLACE the copy's path.
-        if os.path.isabs(root) or os.path.normpath(root).split(os.sep)[0] == "..":
+        if os.path.isabs(root):
             raise ValueError(
                 f"pythonpath entry {root!r} must be repository-relative: "
                 "it is put on the children's PYTHONPATH inside the copy"
             )
-        if escape := _climbs(root):
-            raise ValueError(f"pythonpath entry {root!r} leads out of the copy: {escape}")
-    _refuse_back_pointers(repo, env, cases)
+    _refuse_owned_env(env, cases)
     selectors = {id(c): _copy_selector(repo, c) for c in cases}
 
     first: dict = {}
     with isolated_copy(repo, tmp_root, first) as root:
-        _refuse_copy_escapes(
-            root,
-            first["holder"],
-            env=env,
-            cases=cases,
-            pythonpath=pythonpath,
-            selectors=selectors,
-        )
         # Read ONCE, before any child runs: every case starts from these bytes.
         targets = {p: _load_target(root, rel) for p, rel in rels.items()}
     snapshot = first["fingerprint"]
@@ -1427,6 +1406,8 @@ def sweep(
             ):
                 groups.setdefault(_baseline_key(c, selectors), c)
         for c in groups.values():
+            if on_start:
+                on_start(c)
             info: dict = {}
             with isolated_copy(repo, tmp_root, info) as root:
                 if info["fingerprint"] != snapshot:
@@ -1468,37 +1449,47 @@ def sweep(
 
     out = Sweep()
     for case in cases:
+        _raise_if_stopped()
+        if on_start:
+            on_start(case)
         target = targets[case.path]
         if isinstance(target, str):
-            out.results.append(Result(case, ABORTED, target))
-            continue
-        # The ONE error boundary per case: results live only in `out` until the
-        # final print, so anything escaping here would lose every earlier one.
-        # Deliberately broad: a list of types missed MemoryError and
-        # RecursionError. An abort is never a pass, and the traceback is kept.
-        try:
-            out.results.append(one(case, target))
-        except Exception as exc:
-            traceback.print_exc()
-            out.results.append(
-                Result(case, ABORTED, f"this case could not finish: {type(exc).__name__}: {exc}")
-            )
+            result = Result(case, ABORTED, target)
+        else:
+            # The ONE error boundary per case: anything escaping here would end
+            # the sweep with its remaining cases unjudged and no tally. Deliberately
+            # broad: a list of types missed MemoryError and RecursionError. An abort
+            # is never a pass, and the traceback is kept. A signal's SystemExit is
+            # not an Exception, so it passes through and still cleans up.
+            try:
+                result = one(case, target)
+            except Exception as exc:
+                traceback.print_exc()
+                result = Result(
+                    case, ABORTED, f"this case could not finish: {type(exc).__name__}: {exc}"
+                )
+        out.results.append(result)
+        if on_result:
+            on_result(result)
+    _raise_if_stopped()
     return out
 
 
-def render(result: Sweep) -> str:
-    lines = []
-    for r in result.results:
-        mark = {BIT: "BIT     ", SURVIVED: "SURVIVED", ABORTED: "ABORTED "}[r.outcome]
-        lines.append(f"  {mark}  {r.case.label}")
-        if r.detail:
-            lines.append(f"            {r.detail}")
-        if r.outcome == SURVIVED:
-            lines.append(f"            expected to break: {r.case.why}")
-    lines.append("")
-    lines.append(
-        f"  {len(result.bit)} bit, {len(result.survived)} SURVIVED, {len(result.aborted)} ABORTED"
-    )
+def _render_result(r: Result) -> str:
+    mark = {BIT: "BIT     ", SURVIVED: "SURVIVED", ABORTED: "ABORTED "}[r.outcome]
+    lines = [f"  {mark}  {r.case.label}"]
+    if r.detail:
+        lines.append(f"            {r.detail}")
+    if r.outcome == SURVIVED:
+        lines.append(f"            expected to break: {r.case.why}")
+    return "\n".join(lines)
+
+
+def _render_tally(result: Sweep) -> str:
+    lines = [
+        "",
+        f"  {len(result.bit)} bit, {len(result.survived)} SURVIVED, {len(result.aborted)} ABORTED",
+    ]
     if result.survived:
         lines.append(
             "  A survivor means the test does not pin the property its "
@@ -1630,6 +1621,38 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def _stopped(signum: int, _frame: object) -> None:
+    """Record the stop, say so once, and unwind unless a held step is running. The
+    unwinding is what kills the child's group and removes the copy. SystemExit,
+    because the per-case boundary must not catch it. Raw `os.write`: a signal can
+    land inside a `print`, which is not reentrant. A closed stream must not turn
+    the stop into an error at whatever it interrupted."""
+    global _stop_signal
+    if _stop_signal is None:
+        _stop_signal = signum
+        with contextlib.suppress(OSError, ValueError):
+            os.write(
+                sys.stdout.fileno(),
+                f"  mutation-sweep: stopped by signal {signum}. Only the results printed "
+                "are verdicts; the other cases have none.\n".encode(),
+            )
+    if not _held:
+        _raise_if_stopped()
+
+
+_STOP_SIGNALS = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+
+
+def _catch_stop_signals() -> dict:
+    """Install `_stopped`, leaving alone a signal the caller ignored (`nohup`).
+    Returns the handlers it replaced."""
+    return {
+        each: signal.signal(each, _stopped)
+        for each in _STOP_SIGNALS
+        if signal.getsignal(each) != signal.SIG_IGN
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     # A label the stream cannot encode must not lose the report at the last step.
     sys.stdout.reconfigure(errors="backslashreplace")
@@ -1648,17 +1671,26 @@ def main(argv: list[str] | None = None) -> int:
     available = set(_str_list(doc.get("available", []), "manifest `available`")) | set(
         args.available
     )
-    result = sweep(
-        cases,
-        repo=repo,
-        python=args.python,
-        env=_str_map(doc.get("env", {}), "manifest `env`"),
-        pythonpath=("src",),
-        available=available,
-        timeout=args.timeout,
-        tmp_root=args.tmp_root,
-    )
-    print(render(result))
+    previous = _catch_stop_signals()
+    try:
+        result = sweep(
+            cases,
+            repo=repo,
+            python=args.python,
+            env=_str_map(doc.get("env", {}), "manifest `env`"),
+            pythonpath=("src",),
+            available=available,
+            timeout=args.timeout,
+            tmp_root=args.tmp_root,
+            # stderr, so the report on stdout is the same as it ever was.
+            on_start=lambda c: print(f"running: {c.label}", file=sys.stderr, flush=True),
+            on_result=lambda r: print(_render_result(r), flush=True),
+        )
+    finally:
+        for each, handler in previous.items():
+            signal.signal(each, handler)
+    _raise_if_stopped()  # a raise swallowed in a `__del__` must not reach a clean tally
+    print(_render_tally(result))
     return 0 if result.clean else 1
 
 

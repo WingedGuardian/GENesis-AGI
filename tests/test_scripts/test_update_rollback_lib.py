@@ -81,7 +81,7 @@ def test_nothing_uses_the_lib_before_it_is_sourced():
 
 def test_update_sh_keeps_no_copy_of_what_moved():
     lib = _moved_functions()
-    assert "_do_rollback" in lib
+    assert "_rollback_body" in lib
     kept = {m.group(1) for ln in UPDATE_SH.read_text().splitlines() if (m := _FUNCTION.match(ln))}
     assert not lib & kept
 
