@@ -1,0 +1,59 @@
+name: Python 3.14 tests
+
+# The full suite on the system Python of Ubuntu 26.04. Genesis installs on 3.12 there,
+# but scripts run by the system's `python3` already run on 3.14, and a move of the venv
+# depends on knowing this stays clean. Weekly rather than on every PR: this job takes
+# over two hours, and a red run here must not hold up a PR that did not cause it.
+#
+# A green run says less than it seems to: on 3.14 a directory that denies search reads
+# as absent, and few tests make a path unreadable. See #3936.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "37 7 * * 1"  # weekly Mon 07:37 UTC, after the other weekly runs start
+
+permissions:
+  contents: read
+
+jobs:
+  test-python-314:
+    runs-on: ubuntu-26.04
+    # As for `test` in ci.yml: 180 leaves room for its slowest healthy run on 26.04.
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Measurement tests read this repository's history and skip on a shallow clone.
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test,transcript-analytics]" -c .github/test-tools/requirements.txt
+      # The same selection as `test` in ci.yml, so a difference between the two is Python's.
+      - name: Run tests
+        id: tests
+        run: |
+          rm -f junit.xml
+          pytest -rfE --durations=25 \
+            --ignore-glob='**/test_*az*.py' \
+            --ignore-glob='**/test_*shim*.py' \
+            --ignore=tests/test_ui/ \
+            --junit-xml=junit.xml
+        env:
+          GENESIS_TESTING: "1"
+          GENESIS_ACTIVE_TEST_FILE: active-test.txt
+      - name: Name the failures where truncation cannot reach
+        if: ${{ !cancelled() && steps.tests.outcome == 'failure' }}
+        run: python scripts/ci/failure_summary.py junit.xml >> "$GITHUB_STEP_SUMMARY"
+        env:
+          GENESIS_ACTIVE_TEST_FILE: active-test.txt
+      - name: Preserve the test report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-test-report-python-314
+          path: junit.xml
