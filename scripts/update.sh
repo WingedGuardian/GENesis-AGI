@@ -533,6 +533,10 @@ elif [ "$_branch" != "$DEPLOY_BRANCH" ]; then
     echo "  WARNING: updating branch '$_branch', not $DEPLOY_BRANCH (GENESIS_ALLOW_NON_DEPLOY_BRANCH=1)."
 fi
 # END branch-admission
+# After the branch check, on purpose: anything sourced before it runs first, so a
+# candidate editing it could switch the refusal off.
+# shellcheck source=scripts/lib/gnu_timeout.sh
+. "$SCRIPT_DIR/lib/gnu_timeout.sh"
 
 # ── Suppression-outcome channel, CONSUMED (cleared) BEFORE anything in this
 # deploy can repair the keys.
