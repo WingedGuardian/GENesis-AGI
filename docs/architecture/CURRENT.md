@@ -2708,7 +2708,12 @@ verified: c712f1bde 2026-11-06
   verdict twice. The health MCP pr_verification_close tool uses that same policy
   and shared CLI recording helpers, with independent PR and actual merge-commit
   checks before previews or writes. CLI and MCP use one empty-safe attempt-note
-  formatter; fixture lookup injection stays outside the public MCP schema. Its
+  formatter and require explicit `e2e` claim/gap mappings for every declared plan
+  before a closing result. Both fetch the PR body with its merge SHA and refuse
+  uncovered or stale declarations, including previews; old evidence still parses
+  and reasoned `E2E: none` declarations need no mapping. The shared source parser
+  also supplies the existing script facade (verified: 2026-11-06).
+  Fixture lookup injection stays outside the public MCP schema. Its
   server-side calibration gate forces preview until operator opt-in, including
   attempt notes. Real writes use a separate admitted existing-only connection;
   preview uses SELECTs on the shared handle. Event-gated gaps are captured by

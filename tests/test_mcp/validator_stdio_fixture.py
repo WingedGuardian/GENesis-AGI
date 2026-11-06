@@ -117,16 +117,17 @@ def serve(server_name, root, profile):
 
         from genesis.mcp.health import validator_writes
 
-        def merge_commit_of(repo, pr):
+        def pr_metadata_of(repo, pr):
+            from genesis.session_awareness.pr_recording import PrMetadata
             with (root / "merge-lookups.jsonl").open("a") as handle:
                 handle.write(json.dumps([repo, pr]) + "\n")
             answer = json.loads((root / "merge-answer.json").read_text())
             if "error" in answer:
                 raise LookupError(answer["error"])
-            return answer["merge_commit"]
+            return PrMetadata(answer["merge_commit"], answer.get("body", ""))
 
         validator_writes.record_verification = partial(
-            validator_writes.record_verification, merge_commit_of=merge_commit_of
+            validator_writes.record_verification, pr_metadata_of=pr_metadata_of
         )
         path = ROOT / "scripts/genesis_mcp_server.py"
         spec = importlib.util.spec_from_file_location("owned_stdio_health", path)
