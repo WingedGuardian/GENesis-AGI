@@ -5,7 +5,6 @@ import json
 import os
 import shlex
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -18,6 +17,7 @@ from tests.test_hooks.native_codex import (
     run_native,
     trust_fixture_hook,
 )
+from tests.test_hooks.test_codex_native import native_binaries as native_binaries
 
 ROOT = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.skipif(os.environ.get("GENESIS_CODEX_NATIVE_TESTS") != "1", reason="opt-in native qualification")
@@ -44,15 +44,13 @@ DENY_CASES = ["deny", "ask", "crash", "missing", "malformed", "timeout", "patch-
 
 @pytest.mark.parametrize("client", ["cli", "app"])
 @pytest.mark.parametrize("case,instrument", [(c, "adapter") for c in ALLOW_CASES + DENY_CASES] + [(c, "noop") for c in DENY_CASES])
-def test_native_adapter_controls_sink(tmp_path, monkeypatch, client, case, instrument):
+def test_native_adapter_controls_sink(tmp_path, monkeypatch, native_binaries, client, case, instrument):
     monkeypatch.syspath_prepend(str(ROOT / "scripts/hooks"))
     definition = private_module("native_adapter_definition", ROOT / "scripts/hooks/codex_validator_adapter.py")
-    cli = os.environ.get("GENESIS_CODEX_CLI_BIN") or shutil.which("codex")
-    app = os.environ.get("GENESIS_CODEX_APP_SERVER_BIN") or cli
-    binary = cli if client == "cli" else app
-    assert binary
-    version = subprocess.check_output([binary, "--version"], text=True, timeout=5).strip()
-    assert version == "codex-cli 0.163.0"
+    binaries, versions = native_binaries
+    assert set(versions.values()) == {"codex-cli 0.166.0"}
+    binary, app = binaries[client], binaries["app"]
+    version = versions[client]
     runtime = source_copy(tmp_path)
     scratch = tmp_path / "tmp/validator"
     scratch.mkdir(parents=True)
@@ -117,6 +115,9 @@ def test_native_adapter_controls_sink(tmp_path, monkeypatch, client, case, instr
         wrapper.write_text(f"printf started > {shlex.quote(str(tmp_path / 'outer-started'))}\n"
                            "sleep 2\nprintf deny >&3\necho fixture-late-denial >&2\nexit 2\n")
     evidence = {"client": client, "case": case, "instrument": instrument, "version": version,
+                "versions": versions, "binary": binary,
+                "binary_hashes": {name: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                                  for name, path in binaries.items()},
                 "runtime": str(runtime), "receipt": str(receipt), "command": command,
                 "hashes": {str(p.relative_to(runtime)): hashlib.sha256(p.read_bytes()).hexdigest()
                            for p in sorted(runtime.rglob("*")) if p.is_file()}}

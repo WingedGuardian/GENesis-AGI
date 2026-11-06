@@ -4657,7 +4657,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: c56a621b5 2026-10-24
+verified: 702274dfe 2026-11-05
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -4736,6 +4736,27 @@ verified: c56a621b5 2026-10-24
   changing existing Segment consumers. Ordinary configuration and launcher
   activation remain separate. See
   `docs/reference/codex-validator-boundary.md`.
+  The owner-run `scripts/codex-validator` entry prepares a dedicated private
+  Codex home, keeps the project layer untrusted and verifies the enabled trusted
+  adapter plus exactly two validator MCP servers through fresh native discovery.
+  Check/run compare physical hook and launcher import bytes/types/Git modes to
+  an explicit qualified commit, require clean tracked main files and no detected
+  deployment, and retire their inspection process group before continuing.
+  An explicit owner branch-test mode runs the branch entry with main-root
+  policy, guards, MCP servers and cwd. It checks both physical source trees;
+  only the two new launcher files are omitted from main's comparison. Flagged
+  prepare/login require that same qualification before state changes. Normal
+  linked-worktree refusal remains. The model-turn smoke check is owner-run.
+  Explicit login accepts `--device-auth` for headless authentication.
+  Inspection/run disable account-connected Apps through fixed CLI arguments
+  and verify that effective setting, retaining the exact two-server boundary.
+  Interactive native qualification records a Codex0.166.0 reference binary.
+  The launcher warns on other recognizable versions and retains its startup
+  inspection/refusal checks; those inspect state, not actual tool denial.
+  Release-time native allow/deny controls do not certify future clients.
+  It supplies no service/timer wiring, copied credentials, deploy authority or
+  lifecycle enrollment. See `docs/reference/codex-validator-launcher.md` for
+  operator commands, source inventory, permitted MCP startup effects and races.
   Codex has a separate external-client adapter in `.codex/config.toml`: it
   starts the existing standalone health and memory MCP servers through a
   launcher that scrubs inherited Genesis session identity, provenance,
