@@ -114,8 +114,9 @@ _PATTERN_IS_PATH_TOOLS = ("Glob",)
 #: background session merely denied this file is not page-worthy, true access or
 #: false positive; what pages is a background session that is STOPPED, which is
 #: reported with the session's outcome (a denied session that cannot finish
-#: reports itself blocked, cc/final_status.py, and the hourly stopped-session
-#: page lists it, outreach/stopped_sessions.py). MEASURED 2026-11-04 on one live
+#: reports itself blocked, cc/final_status.py from #3932, and the hourly
+#: stopped-session page lists it, outreach/stopped_sessions.py from #3902; ``low``
+#: depends on both, so it must not ship without them). MEASURED 2026-11-04 on one live
 #: install, all 4 recorded background denials: 3 were matcher false positives
 #: (#3789). ``low`` keeps the record for forensics without a page.
 _DISPATCHED_PRIORITY = "low"

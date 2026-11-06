@@ -405,6 +405,20 @@ class TestBackgroundAlertLevel:
         (content,) = sqlite3.connect(db).execute("SELECT content FROM observations").fetchone()
         assert "ghp_" not in content
 
+    def test_a_credential_cut_at_the_scrub_bound_never_reaches_the_record(
+        self, home: Path, db: str
+    ) -> None:
+        """A command longer than the scrub bound keeps no excerpt. An earlier
+        secret that shrinks to a redaction marker would otherwise pull text from
+        past the cut, a credential split there that no pattern still matches,
+        into the stored excerpt."""
+        command = "cat secrets.env; API_KEY=" + "a" * 3790 + "; echo ghp_" + "b" * 36
+        assert self._run_in(home, command, db) == "deny"
+        (content,) = sqlite3.connect(db).execute("SELECT content FROM observations").fetchone()
+        assert "ghp_" not in content
+        assert "bbbb" not in content
+        assert "excerpt withheld" in content
+
     def test_the_deny_reason_no_longer_promises_a_critical(self, home: Path, db: str) -> None:
         env = {
             **os.environ,
