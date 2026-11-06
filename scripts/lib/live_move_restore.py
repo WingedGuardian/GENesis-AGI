@@ -69,12 +69,17 @@ READ_BYTES = 2 * 1024 * 1024 * 1024
 ENTRIES = 200_000
 
 
-def _path(p: object) -> bool:
+def _path(p: object, *, nested_git: bool = False) -> bool:
     """A plain relative path outside `.git`, as git records one: no empty, `.`
-    or `..` part, no NUL, at most PATH_BYTES file-system bytes."""
+    or `..` part, no NUL, at most PATH_BYTES file-system bytes. ``nested_git``:
+    a saved copy's path below a row, where a nested checkout's `.git` is
+    saved data (#3974 item 1); only a first part `.git`, the checkout's own,
+    is refused."""
     if not isinstance(p, str) or "\0" in p:
         return False
-    if any(part in ("", ".", "..", ".git") for part in p.split("/")):
+    parts = p.split("/")
+    banned = ("", ".", "..") if nested_git else ("", ".", "..", ".git")
+    if parts[0] == ".git" or any(part in banned for part in parts):
         return False
     try:
         return len(os.fsencode(p)) <= PATH_BYTES
@@ -152,7 +157,8 @@ def _row_problem(row: dict, parents) -> str | None:
         return "special"
     unsaved = row.get("unsaved")
     if not isinstance(unsaved, list) or not all(
-        isinstance(u, dict) and _path(u.get("path")) and u["path"].startswith(p + "/")
+        isinstance(u, dict) and _path(u.get("path"), nested_git=True)
+        and u["path"].startswith(p + "/")
         and _special({k: u.get(k) for k in ("type", "mode")}) and len(u) == 3
         for u in unsaved
     ):  # fmt: skip
@@ -232,7 +238,9 @@ def _saved(rp, backup: str) -> tuple[str | None, dict | None]:
     if len(saved["files"]) > ENTRIES:
         return f"over {ENTRIES} records", None
     for key, r in saved["files"].items():
-        if not (key.startswith("tree/") and _path(key[len("tree/") :])) or not _record(r):
+        if not (
+            key.startswith("tree/") and _path(key[len("tree/") :], nested_git=True)
+        ) or not _record(r):
             return f"record {json.dumps(key)[:200]}", None
     return None, saved
 

@@ -760,6 +760,21 @@ def test_td10_repair_move_runs_the_kit_never_the_checkouts_copy(w):
     )
     assert c.returncode == 0, c.stdout + c.stderr
     assert f"report {ts}:" in c.stdout and "nothing was written" in c.stdout, c.stdout
+    # #3974 item 4: --wait may come first; the mode is found wherever it is.
+    c = subprocess.run(
+        ["bash", str(entry), "repair-move", "--wait", "5", "--restore", ts, "--check"],
+        capture_output=True,
+        text=True,
+        env=w.env(),
+    )
+    assert c.returncode == 0 and f"report {ts}:" in c.stdout, c.stdout + c.stderr
+    # Two modes are refused before the kit runs: never the last one silently.
+    for two in (["--restore", ts, "--dismiss", ts], ["--dismiss", ts, "--restore", ts, "--check"]):
+        c = subprocess.run(
+            ["bash", str(entry), "repair-move", *two], capture_output=True, text=True, env=w.env()
+        )
+        assert c.returncode == 1 and "one of --dismiss TS or --restore TS" in c.stderr, two
+    assert w.report()["dismissed_at"] is None
     assert not w.state.exists()
     d = subprocess.run(
         ["bash", str(entry), "repair-move", "--dismiss", ts],

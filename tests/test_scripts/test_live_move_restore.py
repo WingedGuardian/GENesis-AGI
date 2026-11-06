@@ -162,6 +162,61 @@ def test_a_directory_row_lists_only_the_entries_the_update_did_not_write(w):
     assert ("P/mine.txt", "entry") in parts and ("P/inner", "entry") not in parts, parts
 
 
+def _foreign_dir_with_nested_repo(w):
+    (w.root / "P" / "mine.txt").write_text("notes\n")
+    nested = w.root / "P" / "nested"
+    nested.mkdir()
+    subprocess.run(["git", "init", "-q", str(nested)], check=True, env=w.env())
+    return "P"
+
+
+def test_a_saved_directory_holding_a_nested_repository_is_judged(w):
+    """#3974 item 1: the writer saves a foreign directory whole, a nested
+    checkout's .git files with it; their SAVED.json keys hold a `.git` part
+    below the row's path, which the check accepts (only a key whose first part
+    is `.git`, the checkout's own, is refused)."""
+    ts = _repaired(w, _foreign_dir_with_nested_repo)
+    saved = json.loads((w.backups()[-1] / "SAVED.json").read_text())["files"]
+    assert any("/.git/" in k for k in saved), "control: no nested .git key was saved"
+    r = _check(w, ts)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "bad-report" not in r.stdout and _parts(r).get(("P", "node")) == "as-left", r.stdout
+
+
+def _foreign_dir_with_socket_in_nested_git(w):
+    import socket
+
+    _foreign_dir_with_nested_repo(w)
+    sock = socket.socket(socket.AF_UNIX)
+    sock.bind(str(w.root / "P" / "nested" / ".git" / "s"))
+    sock.close()
+    return "P"
+
+
+def test_an_unsaved_node_inside_a_nested_repository_is_judged(w):
+    """#3974 item 1, the same rule for the writer's `unsaved` entries: a socket
+    inside a nested checkout's .git (it cannot be copied) is named on its row,
+    and the report is still judged rather than refused whole."""
+    ts = _repaired(w, _foreign_dir_with_socket_in_nested_git)
+    rows = [r for r in w.report()["paths"] if r["path"] == "P"]
+    assert rows and any(u["path"] == "P/nested/.git/s" for u in rows[0]["unsaved"]), rows
+    r = _check(w, ts)
+    assert "bad-report" not in r.stdout, r.stdout
+    assert _parts(r).get(("P/nested/.git/s", "entry")) == "other:cannot-make", r.stdout
+
+
+def test_a_saved_key_into_the_checkouts_own_git_dir_is_refused(w):
+    """The other side of #3974 item 1: `tree/.git/...` would name the
+    checkout's own .git, which the writer never saves."""
+    ts = _repaired(w, _foreign_inside_dir)
+    path = w.backups()[-1] / "SAVED.json"
+    saved = json.loads(path.read_text())
+    saved["files"]["tree/.git/config"] = {"type": "file", "mode": "0644", "sha256": "0" * 64}
+    path.write_text(json.dumps(saved))
+    r = _check(w, ts)
+    assert r.returncode == 1 and "bad-report" in r.stdout, r.stdout
+
+
 def test_the_check_writes_nothing(w):
     ts = _repaired(w, _foreign_staged)
 

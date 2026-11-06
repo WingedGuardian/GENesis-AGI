@@ -4601,7 +4601,8 @@ Refusing a proposed update preserves a previously valid opt-in.
   (which names it as `integrity`): a regular file's sha256 (computed while
   copying; `null` over 256 MiB, the restore check's per-file budget) and the
   mode the checkout had, a symlink's target, a FIFO's mode; bounded at
-  32 MiB, past which it records no more and says `complete: false`. The
+  32 MiB, past which it records no more and says `complete: false`. A saved file keeps its
+  extended attributes. The
   folders are this user's alone: `deploy-backups` is made (an existing one
   of this user's is set) 0700, each report dir 0700, `REPAIR.json` and
   `SAVED.json` 0600, and every saved copy, blob and directory below loses its
@@ -4698,7 +4699,8 @@ Refusing a proposed update preserves a previously valid opt-in.
   `tree/<path>`; the writer's flag letters, classes and special shapes; an
   `integrity` other than `SAVED.json`, or a `SAVED.json` that is not a regular
   file of at most 32 MiB holding exactly `{files, complete}` with `tree/<path>`
-  keys and the writer's three record shapes; a report naming none, written
+  keys (a nested checkout's `.git` below a row's path is saved data; a first
+  part `.git` is refused) and the writer's three record shapes; a report naming none, written
   before the record existed, is judged as before), or
   if a newer report of this checkout (by its ts, dismissed ones too; one
   naming another checkout is skipped) cannot be read, the newer reports
