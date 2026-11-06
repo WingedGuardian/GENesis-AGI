@@ -143,6 +143,24 @@ Read back what was decided, and on what evidence, with
 python3 scripts/repo_pulse_worker.py --verification-log [--pr <N>]
 ```
 
+A closed row can still owe an event-gated recheck. The backlog's **Rechecks due**
+section lists dates on or before today (UTC) and every named event for the
+validator to judge. It prints the stored `--index` and a recording command bound
+to the database it read. After running the named read-only measurement, write
+`{"repo": "owner/name", "result": "done" | "failed", "note": "what it showed"}`
+to a result file outside the repository and record it with:
+
+```bash
+python3 scripts/pr_verification.py recheck --pr <N> --index <I> \
+    --result-file ~/.genesis/output/prv-<N>-recheck.json [--dry-run] [--db-path <DB>]
+```
+
+`done` finishes the recheck; `failed` appends the result and leaves it due. Bring
+a failed measurement to the owner as fail-intent; recording files nothing and
+never reopens the row. `raced` means nothing was appended by this attempt: re-read
+before retrying. A malformed stored entry/history is listed once for inspection
+with `--verification-log`, retained, and refused as an append target.
+
 Two mechanics worth knowing before your first run. **`--dry-run` resolves the
 target and renders the record without writing** — use it, because a closed row
 cannot be amended through this tool. And **`genesis_db_path()` is repo-root
@@ -456,10 +474,14 @@ because each pilot broke a field the obvious version would have had:
   of 158 untyped gaps, 35 were reachable work that had not been done, 44 waited on
   an event, 57 were method limits and 22 belonged to the owner — and the untyped
   list closed every one of them alike.
-  - `method` (`detail`), `owner_only` (`detail`) and `event_gated` (`detail`,
-    `trigger`: a real `YYYY-MM-DD` or a named event, `recheck`: one read-only
-    command or SQL that re-measures it) — close as `pass-with-measured-gaps` with
-    the gap named.
+  - `method` (`detail`) and `owner_only` (`detail`) — close as
+    `pass-with-measured-gaps` with the gap named.
+  - `event_gated` (`detail`, `trigger`: a real `YYYY-MM-DD` or a named event,
+    `recheck`: one read-only command or SQL that re-measures it) — closes with
+    the gap named and stores a recheck on the closed row. The backlog lists it
+    under **Rechecks due** until a result marks it done. The close is refused
+    before the rechecks column exists, including previews, so the measurement
+    cannot disappear during an upgrade.
   - `not_yet_done` (`detail`, `command`) — keeps the row OPEN as `not-yet-done`.
   The old untyped `scope_limits` is refused by name, never mapped across: choosing
   each entry's kind is the judgment the untyped list let a close skip.

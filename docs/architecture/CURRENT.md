@@ -2351,7 +2351,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 973a0e6 2026-10-30
+verified: 98153e000 2026-11-05
 ```
 
 - **Peer-handoff surface (2026-09-26)**: a SessionStart hook
@@ -2664,7 +2664,13 @@ verified: 973a0e6 2026-10-30
   formatter; fixture lookup injection stays outside the public MCP schema. Its
   server-side calibration gate forces preview until operator opt-in, including
   attempt notes. Real writes use a separate admitted existing-only connection;
-  preview uses SELECTs on the shared handle. Only a PASS verdict discharges
+  preview uses SELECTs on the shared handle. Event-gated gaps are captured by
+  the shared close CRUD as structured rechecks on the closed row. The backlog
+  lists due dates and named events, with result commands bound to its database;
+  the recheck CLI appends failed/done measurements without reopening the row.
+  Unfinished or malformed rechecks survive retention; malformed histories are
+  surfaced for inspection rather than hiding later rows. Owed rechecks refuse
+  closes before migration, including CLI/MCP previews. Only a PASS verdict discharges
   an obligation; the other verdicts leave the row OPEN and annotate it, so a PR
   nobody could verify says why instead of looking untouched. The one non-obvious
   invariant, because the obvious one is false: a PASS verdict implies the row is
