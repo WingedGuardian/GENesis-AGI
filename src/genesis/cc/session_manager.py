@@ -181,8 +181,18 @@ class SessionManager:
         cost_usd: float = 0.0,
         input_tokens: int = 0,
         output_tokens: int = 0,
+        outcome: str | None = None,
+        outcome_reason: str | None = None,
     ) -> None:
-        await cc_sessions.update_status(self._db, session_id, status="completed")
+        """Clean exit. ``outcome`` says whether it did its job; omitted, the
+        writer records ``unreported`` (it exited, nothing said how it went)."""
+        await cc_sessions.update_status(
+            self._db,
+            session_id,
+            status="completed",
+            outcome=outcome,
+            outcome_reason=outcome_reason,
+        )
         if cost_usd > 0 or input_tokens > 0:
             try:
                 await self._db.execute(
@@ -196,8 +206,23 @@ class SessionManager:
                 logger.error("Failed to record CC session cost data", exc_info=True)
         await self._fire_end_hooks(session_id)
 
-    async def fail(self, session_id: str, *, reason: str | None = None) -> None:
-        await cc_sessions.update_status(self._db, session_id, status="failed")
+    async def fail(
+        self, session_id: str, *, reason: str | None = None, outcome: str = "failed"
+    ) -> None:
+        """Record the failure AND its reason, which this used to discard.
+
+        ``outcome`` refines what kind of non-success it was: ``parked`` for
+        work that resumes on its own (a rate-limit park, or an inbox item
+        deferred to its retry lane), so it is not a stop to report; ``partial``
+        for a run that exited cleanly without finishing.
+        """
+        await cc_sessions.update_status(
+            self._db,
+            session_id,
+            status="failed",
+            outcome=outcome,
+            outcome_reason=reason,
+        )
         await self._fire_end_hooks(session_id)
 
     async def _fire_end_hooks(self, session_id: str) -> None:
@@ -283,7 +308,19 @@ class SessionManager:
                 or session_type == "background_task"
                 or session_type != "foreground"
             ):
-                await cc_sessions.update_status(self._db, row["id"], status="expired")
+                # Conditional on the row still being active: a session that
+                # finished between the read above and this write keeps its
+                # real outcome instead of being stamped expired.
+                expired = await cc_sessions.update_status(
+                    self._db,
+                    row["id"],
+                    status="expired",
+                    outcome="expired",
+                    outcome_reason="expired_idle",
+                    only_if_active=True,
+                )
+                if not expired:
+                    continue
                 await self._fire_end_hooks(row["id"])
                 count += 1
 

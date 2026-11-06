@@ -763,7 +763,9 @@ jobs:
         # Validator writers: fourteen opt-in native cases, 538 -> 552.
         # Native MCP client qualification (#3656): eleven installed-client and
         # mocked-turn opt-in cases, measured on the PR's runner, 552 -> 563.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 563
+        # Launcher discovery: two opt-in native cases; Git destinations: eighteen.
+        # Inherit the current runner ceiling and add exactly twenty identities.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 583
 
   test-ubuntu-2404:
     # ubuntu-latest is moving to 26.04, so `test` alone stops showing a break on

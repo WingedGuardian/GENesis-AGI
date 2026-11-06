@@ -189,6 +189,48 @@ async def test_unreadable_past_grace_alerts_but_never_restores(cfg, monkeypatch)
                for a in disp.alerts)
 
 
+async def test_an_unreadable_episode_does_not_use_up_the_restore(cfg, monkeypatch):
+    """It was recorded as a step-in, so when the file then proved corrupt, the guardian
+    only re-alerted, naming a restore attempt that never happened."""
+    old = (datetime.now(UTC) - timedelta(minutes=40)).isoformat()
+    cfg.state_path.mkdir(parents=True, exist_ok=True)
+    _seed_state(cfg, {"secrets_env": {
+        "first_seen": old, "warned_at": old, "stepped_in_at": None,
+        "last_alert_at": old, "restore_attempts": [],
+    }})
+    called = {"restore": 0}
+
+    async def fake_restore(config, name):
+        called["restore"] += 1
+        return {"ok": True, "action": "restored"}
+
+    monkeypatch.setattr(cred_watch, "run_container_restore", fake_restore)
+    disp = _Dispatcher()
+    monkeypatch.setattr(cred_watch, "run_container_check", _async(_report(secrets_env="unreadable")))
+    await check_credential_integrity_and_alert(cfg, disp)
+    assert called["restore"] == 0
+    monkeypatch.setattr(cred_watch, "run_container_check", _async(_report(secrets_env="empty")))
+    await check_credential_integrity_and_alert(cfg, disp)
+    assert called["restore"] == 1
+
+
+async def test_an_unreadable_episode_alerts_once_per_cadence(cfg, monkeypatch):
+    """Past grace it stays eligible for a step-in on every tick, so the alert needs a
+    cadence of its own."""
+    old = (datetime.now(UTC) - timedelta(minutes=40)).isoformat()
+    cfg.state_path.mkdir(parents=True, exist_ok=True)
+    _seed_state(cfg, {"secrets_env": {
+        "first_seen": old, "warned_at": old, "stepped_in_at": None,
+        "last_alert_at": old, "restore_attempts": [],
+    }})
+    monkeypatch.setattr(cred_watch, "run_container_check", _async(_report(secrets_env="unreadable")))
+    disp = _Dispatcher()
+    await check_credential_integrity_and_alert(cfg, disp)
+    await check_credential_integrity_and_alert(cfg, disp)
+    await check_credential_integrity_and_alert(cfg, disp)
+    assert len([a for a in disp.alerts if "unreadable" in a.title.lower()]) == 1
+
+
 async def test_run_container_restore_rejects_unknown_target(cfg):
     result = await cred_watch.run_container_restore(cfg, "totally_bogus_target")
     assert result is None

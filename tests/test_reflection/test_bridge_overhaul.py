@@ -31,6 +31,7 @@ class FakeCCOutput:
     model_requested: str = ""
     downgraded: bool = False
     session_id: str = "fake-cc-session"
+    final_status: object = None  # CCOutput.final_status: no self-report
 
 
 @pytest.fixture
@@ -225,6 +226,38 @@ class TestWeeklyAssessment:
         )
         result = await bridge.run_weekly_assessment(db)
         assert result.success
+
+    @pytest.mark.asyncio
+    async def test_unparseable_assessment_fails_its_session_row(
+        self, db, mock_session_manager, mock_invoker, tmp_path
+    ):
+        mock_invoker.run.return_value = FakeCCOutput(text="prose, not the JSON asked for")
+        bridge = CCReflectionBridge(
+            session_manager=mock_session_manager, invoker=mock_invoker, db=db,
+            context_gatherer=ContextGatherer(),
+            output_router=OutputRouter(reflections_dir=tmp_path / "reflections"),
+        )
+        result = await bridge.run_weekly_assessment(db)
+        assert not result.success
+        kwargs = mock_session_manager.complete.await_args.kwargs
+        assert (kwargs["outcome"], kwargs["outcome_reason"]) == ("failed", "unparseable_output")
+        assert mock_invoker.run.await_args.args[0].report_status is True
+
+    @pytest.mark.asyncio
+    async def test_a_parser_that_raises_still_ends_the_row(
+        self, db, mock_session_manager, mock_invoker, tmp_path
+    ):
+        # parse_weekly_assessment_output raises TypeError on a null list.
+        mock_invoker.run.return_value = FakeCCOutput(text='{"dimensions": null}')
+        bridge = CCReflectionBridge(
+            session_manager=mock_session_manager, invoker=mock_invoker, db=db,
+            context_gatherer=ContextGatherer(),
+            output_router=OutputRouter(reflections_dir=tmp_path / "reflections"),
+        )
+        result = await bridge.run_weekly_assessment(db)
+        assert not result.success
+        kwargs = mock_session_manager.complete.await_args.kwargs
+        assert (kwargs["outcome"], kwargs["outcome_reason"]) == ("failed", "unparseable_output")
 
     @pytest.mark.asyncio
     async def test_assessment_cc_failure(self, db, mock_session_manager):

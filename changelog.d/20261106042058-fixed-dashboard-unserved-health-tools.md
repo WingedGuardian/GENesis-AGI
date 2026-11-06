@@ -1,0 +1,1 @@
+- The dashboard's MCP tool list and the status snapshot no longer list or count the four `user_job_*` tools under health (the count drops from 96 to 92). No MCP server serves them, so no session could call them. They now register on an object of their own, so health lists only the tools it serves.

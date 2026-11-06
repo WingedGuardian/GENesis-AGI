@@ -66,6 +66,21 @@ async def call(doc, **over):
         ) | over)).data
 
 
+async def test_existing_mcp_close_stores_rechecks_without_a_new_caller_argument(recording):
+    path, _, config = recording
+    config.with_suffix(".local.yaml").write_text("dry_run_only: false")
+    gap = {"kind": "event_gated", "detail": "Synthetic future run",
+           "trigger": "2030-01-02", "recheck": "echo synthetic"}
+    result = await call(_doc(gaps=[gap]))
+    assert result["recorded"] is True
+    stored = row(path)
+    assert stored["status"] == "closed"
+    assert json.loads(stored["rechecks"]) == [
+        {**{k: gap[k] for k in ("trigger", "recheck", "detail")},
+         "results": [], "done_at": None}
+    ]
+
+
 @pytest.mark.parametrize("verdict", ["pass-mechanical", "fail-intent", "cannot-verify"])
 async def test_server_gate_previews_every_mutation(recording, verdict):
     path, shared, config = recording
