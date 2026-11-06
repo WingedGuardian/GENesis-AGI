@@ -46,7 +46,7 @@ result() { # phase name verdict detail...
     shift 3
     echo "RESULT $phase $name $verdict $*" | tee -a "$CI_EV/summary.txt"
     case "$verdict $*" in
-        "INFO LEAK"* | "INFO INCONCLUSIVE"* | "INFO INVALID"* | "INFO NO:"*) echo "::warning title=update-rollback $phase::$name: $*" ;;
+        "INFO INVALID"* | "INFO NO:"*) echo "::warning title=update-rollback $phase::$name: $*" ;;
         "INFO "*) echo "::notice title=update-rollback $phase::$name: $*" ;;
         FAIL*) echo "::error title=update-rollback $phase::$name: $*" ;;
     esac
@@ -148,26 +148,16 @@ PY
 noop)
     # Nothing new on origin. #3830 says the package record is retired when "the
     # update or its rollback completes"; a no-op takes the record before its
-    # branch and retires it only on a failure marker or a degradation.
+    # branch, and that branch retires it on every path.
     P=noop
     rm -rf "$DEPS_DIR"
-    pre_failure=no
-    [ -e "$HOME/.genesis/last_update_failure.json" ] && pre_failure=yes
     run_update noop
     check $P exit0 "a no-op update succeeds" -- test "$UPD_RC" -eq 0
-    degraded=no
-    grep -qE 'UPDATE CONTINUING IN DEGRADED MODE|recording degraded subsystem' "$CI_EV/update-noop.log" && degraded=yes
+    # Controls: without them, a record never taken or a full update would pass the check below.
+    check $P record_taken "the run took a package record (control)" -- grep -q 'Recorded the installed packages for a rollback.' "$CI_EV/update-noop.log"
+    check $P noop_branch "the no-op branch ran (control)" -- grep -q '  Already up to date (' "$CI_EV/update-noop.log"
     left="$(find "$DEPS_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l)" || left=0
-    if [ "$pre_failure" = no ] && [ "$degraded" = no ]; then
-        if [ "$left" -eq 0 ]; then
-            result $P record_retired PASS "no package record left after a clean no-op update"
-        else
-            # Measured, not asserted: reported for the owner's decision.
-            result $P record_retired INFO "LEAK: $left file(s) left in update-deps after a clean no-op update"
-        fi
-    else
-        result $P record_retired INFO "INCONCLUSIVE: failure marker=$pre_failure degraded=$degraded (either retires the record)"
-    fi
+    check $P record_retired "no package record left after a no-op update ($left file(s) left)" -- test "$left" -eq 0
     mkdir -p "$CI_EV/noop-leftover"
     find "$DEPS_DIR" -maxdepth 1 -type f -exec mv {} "$CI_EV/noop-leftover/" \; 2>/dev/null || true
     finish noop
@@ -182,6 +172,7 @@ clean)
     push_commit "ci: harmless update"
     run_update clean
     check $P exit0 "a clean update succeeds" -- test "$UPD_RC" -eq 0
+    check $P record_taken "the run took a package record (control)" -- grep -q 'Recorded the installed packages for a rollback.' "$CI_EV/update-clean.log"
     check $P updated_line "update.sh reports the move" -- grep -qE '^  Updated: .+ → ' "$CI_EV/update-clean.log"
     check $P head_moved "HEAD is the pushed commit" -- test "$(git -C "$G" rev-parse HEAD)" = "$(git -C "$CI_ROOT/work" rev-parse HEAD)"
     check $P record_retired "no package record left after a successful update" -- \
@@ -254,6 +245,10 @@ PY
     fi
     rm -rf "$DEPS_DIR"
     check $P no_prior_state "no update in progress blocking a new run" -- test ! -e "$HOME/.genesis/update_state.json"
+    # A failed earlier restore can leave the probe table behind; the mutant's
+    # verdict would then measure that leftover, not its own restore.
+    probe_before="$(db_ro "SELECT count(*) FROM sqlite_master WHERE name='$PROBE'" 2>/dev/null || echo ERR)"
+    check $P probe_absent_before "the probe table is absent before the update (control: $probe_before)" -- test "$probe_before" = 0
     freeze >"$CI_EV/$P-freeze-before.txt"
     check $P tomli_w_absent_before "tomli-w is not installed before (so its removal is a real change)" -- \
         bash -c "! grep -qi '^tomli[-_]w==' '$CI_EV/$P-freeze-before.txt'"
@@ -391,10 +386,10 @@ PY
     else
         # The mutant: report whether it was told apart; never fail the job on it.
         tells="locked=$locked reader_gone_after=$gone_after reader_rolled=$saw_rolled reader_errors=$post_errors server_writes=$wrote integrity=${integrity:-?} fresh=$fresh_ok"
-        if [ "$reader_ready" != yes ] || [ "$saw_during" != 1 ] || [ "$migrated_during" != yes ] || [ "$journal_ok" != yes ] \
+        if [ "$probe_before" != 0 ] || [ "$reader_ready" != yes ] || [ "$saw_during" != 1 ] || [ "$migrated_during" != yes ] || [ "$journal_ok" != yes ] \
             || ! grep -q 'health endpoint did not respond after' "$L" || ! grep -q 'Using the rollback from' "$L" \
             || ! grep -q 'CI mutant: pre-#3829 cp' "$L"; then
-            result $P distinguished INFO "INVALID: the mutant run did not reach a comparable state (reader_ready=$reader_ready saw_during=$saw_during migrated=$migrated_during journal=$journal_ok; $tells)"
+            result $P distinguished INFO "INVALID: the mutant run did not reach a comparable state (probe_before=$probe_before reader_ready=$reader_ready saw_during=$saw_during migrated=$migrated_during journal=$journal_ok; $tells)"
         elif [ "$locked" != 0 ] || [ "$gone_after" != 1 ] || [ "$saw_rolled" != 1 ] || [ "$post_errors" != 0 ] \
             || [ "$wrote" != yes ] || [ "${integrity:-}" != ok ] || [ "$fresh_ok" != yes ]; then
             result $P distinguished INFO "YES: the pre-#3829 cp restore is told apart ($tells)"

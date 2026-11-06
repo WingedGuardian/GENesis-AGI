@@ -82,18 +82,25 @@ jobs:
         run: cd ~/genesis && ./scripts/install.sh --non-interactive
 
       - name: Set up the local origin and backups remote
+        id: setup
         run: ~/genesis/scripts/ci/update_rollback_e2e.sh setup
 
       - name: No-op update (is the package record retired?)
+        # A failing phase must not hide the later phases' results (each reports
+        # its own checks, and the job still fails); all of them need setup.
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: ~/genesis/scripts/ci/update_rollback_e2e.sh noop
 
       - name: Clean update (control - no record left)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: ~/genesis/scripts/ci/update_rollback_e2e.sh clean
 
       - name: Forced failed update - exact packages, SQLite restore, MCP reader
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: ~/genesis/scripts/ci/update_rollback_e2e.sh fault
 
       - name: Same failure with the old cp restore (does the check tell them apart?)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: ~/genesis/scripts/ci/update_rollback_e2e.sh mutant
 
       - name: Summary
