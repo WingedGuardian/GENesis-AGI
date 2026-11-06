@@ -149,6 +149,24 @@ Read back what was decided, and on what evidence, with
 python3 scripts/repo_pulse_worker.py --verification-log [--pr <N>]
 ```
 
+A closed row can still owe an event-gated recheck. The backlog's **Rechecks due**
+section lists dates on or before today (UTC) and every named event for the
+validator to judge. It prints the stored `--index` and a recording command bound
+to the database it read. After running the named read-only measurement, write
+`{"repo": "owner/name", "result": "done" | "failed", "note": "what it showed"}`
+to a result file outside the repository and record it with:
+
+```bash
+python3 scripts/pr_verification.py recheck --pr <N> --index <I> \
+    --result-file ~/.genesis/output/prv-<N>-recheck.json [--dry-run] [--db-path <DB>]
+```
+
+`done` finishes the recheck; `failed` appends the result and leaves it due. Bring
+a failed measurement to the owner as fail-intent; recording files nothing and
+never reopens the row. `raced` means nothing was appended by this attempt: re-read
+before retrying. A malformed stored entry/history is listed once for inspection
+with `--verification-log`, retained, and refused as an append target.
+
 Two mechanics worth knowing before your first run. **`--dry-run` resolves the
 target and renders the record without writing** — use it, because a closed row
 cannot be amended through this tool. And **`genesis_db_path()` is repo-root
@@ -265,17 +283,17 @@ not run, a probe skipped for cost) as a `method` gap and close. Record it as a
 scan of the 158 gaps on its 85 gap-carrying closed rows flagged 20 as test files
 or probes that were skipped, not hand-checked one by one.
 
-**A closed row never comes back, so a gap that waits on an event needs its own
-recheck.** "The code is right, but the event it handles has not happened yet"
+**A closed row keeps event-gated rechecks.** "The code is right, but the event
+it handles has not happened yet"
 (the first revert, an engine old enough to prune, a skipped backup directory)
-is a real gap that production will eventually test, and nothing reads a closed
-row's gaps again. Apply the actor-and-resource test above first. An event that
+is a real gap that production will eventually test. Apply the actor-and-resource
+test above first. An event that
 can be named and will happen in ordinary running ("after the next deploy", "on
-11-03", "on the first REVERT_CODE") is reachable later. Route it as local state:
-a `follow_up_create` row naming the trigger and the one read-only command that
-re-measures it. A repo defect still gets an issue. An event that may never occur
-is the cannot-verify case above and is not filed. The follow-up is the only
-reminder: nothing in this skill's backlog reader shows it yet.
+11-03", "on the first REVERT_CODE") is reachable later. Record a typed
+`event_gated` gap naming its trigger and one read-only `recheck` command.
+Closing stores it on the same row, and **Rechecks due** surfaces it for later
+measurement without reopening the row. A repo defect still gets an issue. An
+event that may never occur is the cannot-verify case above and is not filed.
 
 A security defect is the one thing never filed publicly before it is fixed —
 private record plus a local row, whoever owns it.
@@ -468,10 +486,14 @@ because each pilot broke a field the obvious version would have had:
   of 158 untyped gaps, 35 were reachable work that had not been done, 44 waited on
   an event, 57 were method limits and 22 belonged to the owner — and the untyped
   list closed every one of them alike.
-  - `method` (`detail`), `owner_only` (`detail`) and `event_gated` (`detail`,
-    `trigger`: a real `YYYY-MM-DD` or a named event, `recheck`: one read-only
-    command or SQL that re-measures it) — close as `pass-with-measured-gaps` with
-    the gap named.
+  - `method` (`detail`) and `owner_only` (`detail`) — close as
+    `pass-with-measured-gaps` with the gap named.
+  - `event_gated` (`detail`, `trigger`: a real `YYYY-MM-DD` or a named event,
+    `recheck`: one read-only command or SQL that re-measures it) — closes with
+    the gap named and stores a recheck on the closed row. The backlog lists it
+    under **Rechecks due** until a result marks it done. The close is refused
+    before the rechecks column exists, including previews, so the measurement
+    cannot disappear during an upgrade.
   - `not_yet_done` (`detail`, `command`) — keeps the row OPEN as `not-yet-done`.
   The old untyped `scope_limits` is refused by name, never mapped across: choosing
   each entry's kind is the judgment the untyped list let a close skip.
