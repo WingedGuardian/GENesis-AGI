@@ -726,7 +726,7 @@ else
 fi
 
 if ! command -v uv &>/dev/null; then
-    curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh 2>/dev/null || true
+    curl -LsSf "https://astral.sh/uv/$GENESIS_UV_VERSION/install.sh" 2>/dev/null | sh 2>/dev/null || true
     export PATH="$HOME/.local/bin:$PATH"
 fi
 # shellcheck source=lib/serena_install.sh
@@ -2106,12 +2106,13 @@ echo "    journalctl --user -u genesis-server -f   # live logs"
 echo ""
 echo "  Dashboard: http://localhost:5000"
 echo "    (Access from your browser via host IP — see host setup output)"
-# Show a note on non-Ubuntu-24 systems — Genesis is developed on Ubuntu 24.04;
-# install works on other distros but runtime behaviour is not guaranteed.
+# Show a note on releases CI does not test: CI's default runner (now 26.04) runs the
+# suite and a fresh install, and a pinned 24.04 job runs the OS-sensitive tests.
+# Install works on other distros, but runtime behaviour is not guaranteed.
 _os_name=$(grep -oP '^PRETTY_NAME="\K[^"]+' /etc/os-release 2>/dev/null || echo "")
-if ! echo "$_os_name" | grep -qi 'ubuntu 24'; then
+if ! echo "$_os_name" | grep -qiE 'ubuntu (24|26)\.04'; then
     echo ""
-    echo "  OS note: Genesis is developed and tested on Ubuntu 24.04."
+    echo "  OS note: Genesis is tested on Ubuntu 24.04 and 26.04."
     echo "  This install ran on: $_os_name"
     echo "  Installation completed but runtime behaviour may vary on this OS."
     echo "  Report issues: https://github.com/WingedGuardian/GENesis-AGI/issues"

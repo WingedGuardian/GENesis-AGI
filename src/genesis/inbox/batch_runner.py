@@ -198,7 +198,8 @@ async def run_one_batch(
         err = f"CC invocation deferred, {reason}: {exc}"
         errors.append(err)
         logger.warning(err)
-        await monitor._session_manager.fail(session_id, reason=err)
+        # The retry lane re-runs it, so it is parked work, not a stop to page.
+        await monitor._session_manager.fail(session_id, reason=err, outcome="parked")
         # retriable_below: an approved row resumed from a parked approval
         # can carry a count from an older, higher cap; an outage must not
         # land it at the current one (#2447 review).

@@ -73,7 +73,7 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: cd784816 2026-09-09
+verified: 2ece179f9ebc 2026-10-28
 ```
 
 **Cross-store integrity is detect + repair.** SQLite (`memory_metadata`/
@@ -235,6 +235,12 @@ a real bridge-node population; `centrality_cache` gains its first reader.
 run through a `GraphStore` protocol with two implementations: the default
 `NetworkxGraphStore` (the in-process MultiDiGraph projection of `memory_links`)
 and `FalkorGraphStore` (below);
+opt-in `RequestDatabase` traversal declines NetworkX before projection and uses
+the existing SQL tier on its owning connection, including pending writes. Healthy
+selected FalkorDB retains projected-data semantics; its scoped fallback uses SQL.
+Legacy NetworkX and centrality behavior are unchanged. The shared SQL traversal
+uses exact delimited hex-ID cycle membership, so substrings, LIKE wildcards,
+empty IDs and NULs cannot hide distinct TEXT nodes.
 `memory/graph.py` is a facade that owns the single production instance and the
 backend choice. The contract, and the reason the seam exists: a read that cannot
 REACH its store RAISES `GraphUnavailableError` and never returns empty — empty
@@ -1462,6 +1468,19 @@ verified: b0867170e 2026-10-02
   operator-only per-item release requires explicit replay acknowledgement and
   an unchanged source, then returns through normal approval/claim handling.
   Recovery procedure and limits: `docs/reference/inbox-replay-safety.md`.
+- **Inbox vault sync** (`scripts/inbox_sync.sh`, run by
+  `genesis-inbox-sync.timer` every 5 minutes; enabled everywhere, a no-op
+  unless `inbox_monitor.sync_remote` names an rclone remote). It mirrors notes
+  vault → inbox and pushes responses back. A local response is removed only
+  when the vault was seen to hold it (`.genesis-seen-in-vault`, scoped to the
+  remote) and no longer does; removal goes to the Genesis trash. What a pull
+  replaces or removes goes there too, through `--backup-dir`. Each
+  configured run writes a heartbeat (`~/.genesis/state/inbox_sync.json`), and
+  `inbox/sync_health.py` raises one `infrastructure_alert` per outage from the
+  awareness tick when the heartbeat goes stale (30 min) or cannot be read, the
+  config is unusable, responses are held because the trash refused them, or a
+  caller other than the timer runs the sync with no remote set.
+  `inbox/sync_config.py` is the one reader both sides share.
 - **recon/**: scheduled intelligence jobs (release watch, model intelligence
   Sun 8am, models.md synthesis Sun 10am, GitHub discovery, skill-security scan
   via external NVIDIA SkillSpector). Emits findings for triage
@@ -1714,6 +1733,12 @@ the shared banner is not an assertion about all concurrent sessions.
   `cc/session_config._MCP_PROFILES`. `genesis-health` is the big one (~35 tool
   modules). `standalone_health.py` serves from `~/.genesis/status.json` when no
   live runtime (stale-but-functional).
+  The optional fixed-main Serena services qualify provider 2.1.0 and MCP 2.2
+  readiness; they select classic tools and reject switching or REPL capability.
+  Their existing locking, per-profile limits and native stdio worktree routing
+  remain in place. Provider upgrades require a drained, disabled sharing window;
+  this code does not upgrade or restart an enabled service. See
+  `docs/reference/serena-shared-main.md`.
   External Codebase has pinned configuration staging/diagnostics and bounded
   native query unit entry points in `scripts/codebase_managed.py`.
   Status separately observes conditional queue initialization-lock prerequisites
@@ -1738,8 +1763,20 @@ the shared banner is not an assertion about all concurrent sessions.
   complete provider/protocol/sequence/nonce/repository context. `import-status`
   observes receipt totals without initialization or migration; `automatic-ready`
   fences every automatic reconciliation/claim/launch until the later protocol
-  completes. There is no readiness setter. This does not implement persistent
-  resource quarantine or the checked consumer's list/claim error propagation.
+  completes. There is no readiness setter. Behind that fence, the checked
+  consumer validates complete NUL list/claim/escalation acknowledgements and
+  actual child status, dispatches one provider from its authoritative claim and
+  settles the complete context. Entrypoint and freeze repository normalization
+  preserve trailing newlines and collapse Linux root aliases before lock hashing.
+  Retained terminal decisions replay without
+  resending known completions; missing terminal evidence, native intent/scope
+  cleanup and persistent resource quarantine remain separate activation gates.
+  `scripts/lib/code_intel_execution.py` adds an explicit stdlib scope-evidence
+  observer with private bounded pipe transport and complete-subtree task/counter
+  checks. It has no automatic queue caller, stop authority or quarantine state.
+  The existing foreground watchdog lacks a post-return scope-quiescence barrier;
+  strict queue integration must retain unresolved cleanup ownership separately.
+  Synthetic/descriptor fixtures do not qualify native OOM or production indexing.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
   deletions; native query/client cgroup proof and orphan-scope checks precede
@@ -2084,7 +2121,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 0a6c219a1 2026-10-31
+verified: 25f3ad876 2026-11-03
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -2182,10 +2219,23 @@ verified: 0a6c219a1 2026-10-31
   `deploy_candidates drop`. The diagnosis snapshot carries the boot repair's
   `live-move repair:` journal lines and a summary of the newest
   `deploy-backups/*-live-move-repair/REPAIR.json` that is neither dismissed
-  nor superseded (6 h window on its own `ts`), JSON-quoted, capped at 2,000
-  characters and fenced as untrusted; empty, and the prompt unchanged, when
-  there are none. The container reads are bounded where they are produced
-  (regular non-symlink reports, 4 MiB each; journal lines cut to 400), and
+  nor superseded and names `~/genesis` (6 h window on the ts in its dir name,
+  never the stored one), chosen inside the container (one `python3 -I -S -`
+  over stdin, as the configured container user, #3627) so newer ineligible
+  reports cannot hide it; JSON-quoted, capped at 2,000 characters and fenced
+  as untrusted; empty, and the prompt unchanged, when there are none. The
+  container reads are bounded where they are produced (only a report dir
+  named as the writer names it and not a symlink; one regular report opened
+  without following a symlink, 4 MiB; the repo compared as the repair loader
+  compares it; dirs ordered by the loader's `report_order`, seconds then
+  pid, a name over 300 s ahead skipped and at most 8 dirs read, as deploy
+  health does; those rules held equal to the loader's by a parity test and a
+  cross-reader test; a newer one over that cap, unreadable or not a JSON
+  object is shown as "report too large" or "report unreadable", never skipped
+  for an older one, unless the top-level repo, result or dismissed_at read
+  from the writer's indent-2 layout makes it ineligible; journal lines cut to
+  400). It shows the newest ELIGIBLE report, by design, where deploy health's
+  `live_repair_unresolved` reads the newest READ one, and
   Telegram alert fields are cut before escaping. Residual: a container that
   fakes git's own output can still pass the probe.
 - **Merged ≠ deployed**: guardian code reaches the host ONLY via
@@ -4528,7 +4578,8 @@ Refusing a proposed update preserves a previously valid opt-in.
   `update_refused.json`.
   The rebuilt tip is recorded in the "merging" row as soon as it is adopted.
   **The live-move repair** (`scripts/lib/live_move_repair.py`, #3492 PR D1;
-  `scripts/deploy_candidates repair-move [--wait N] [--dismiss TS] [--explain]`
+  `scripts/deploy_candidates repair-move [--wait N] [--dismiss TS] [--explain]`;
+  the module itself also takes `--restore TS --check`, below
   runs the copy bootstrap installs under `~/.genesis/lib/live-repair/current`,
   never the checkout's; installing that kit, and running the repair at every
   server start, is PR D2, not yet built; `--explain` needs no kit: with none
@@ -4584,10 +4635,96 @@ Refusing a proposed update preserves a previously valid opt-in.
   (re-apply steps included) and queues an alert (critical when anything was
   not the update's, the index was torn, or it did not heal); `REPAIR.json`
   and `manifests()` are the contract its readers (deploy health, the
-  awareness check, the guardian's diagnosis) read, and those readers arrive
-  in a follow-up PR: until then the command output and the alert carry the
-  report. A run killed after its restore and before its result leaves no
-  result; the next run removes a healed state without a new backup.
+  awareness check, the guardian's diagnosis) read. The readers REPORT and
+  never judge a path; putting saved paths back is the repair's own job when
+  it writes. The deploy-health collector `collect_live_repairs` reads every
+  `REPAIR.json` through the repair's one loader, `load_report(dir, checkout)`:
+  a report dir not named as `_backup_dir` names it, a symlinked dir, a
+  `REPAIR.json` that is not a regular file (opened without following a
+  symlink or blocking on a FIFO) of at most 4 MiB holding a JSON object of at
+  most 20,000 rows, or a report whose `repo` is not the deploy checkout
+  (`repo_root()`; the field must be a string with no NUL whose file-system
+  bytes, `os.fsencode`, number at most 4,096, so a non-UTF-8 checkout path the
+  writer stored still matches; checked before realpath, and a realpath error
+  is a refusal) is refused whole, counted in `live_repair_refused:<n>` and named
+  once in the server log; no git runs in a checkout a report names. A dir
+  named more than 300 s ahead of the reader's clock (`REPORT_FUTURE_S`) is
+  refused too. Only the newest eight report dirs by the loader's
+  `report_order` (the ts in their name, then the pid as a number) are read;
+  older ones are
+  counted in `live_repair_unread_older:<n>`, an informational class (medium
+  when alone). Per report the snapshot carries its ts, its backup folder, how
+  many paths the update did not write were recorded there (every foreign row
+  counts, flag-only and deleted ones too; no other row field is read), a result enum (`healed`,
+  `healed-kept`, `unresolved`, `superseded`, `unfinished`, else `unknown`: no
+  report string reaches the snapshot, the alert text or the alert key),
+  `dismissed` and `unresolved`; `live_repair_saved:<n>` sums the reports not
+  `--dismiss`ed. It loads the repair's module once per snapshot when any
+  report dir exists (a module that cannot load, or lacks a name the reader
+  uses, reads every report as refused and blanks nothing), and a linked worktree reads none. The awareness paragraph
+  names, per undismissed report with saved paths, its backup folder,
+  `scripts/deploy_candidates repair-move --restore <ts>` (once both the
+  installed repair kit and `scripts/deploy_candidates` include it) and `--dismiss <ts>`, says a restore leaves
+  uncommitted edits the deploy scripts refuse, and that backups are pruned 90
+  days after the last write to their folder; it escapes any text a database
+  column cannot hold rather than losing the alert, and is replaced whenever
+  the reports it names change. `GET /api/genesis/health` reduces
+  `live_repairs` to an allow-list of its counts for a caller without the
+  internal bearer or a verified session. `live_repair_unresolved` needs the
+  newest report to say so (or to have no result after an hour) AND the
+  shared guard, run at read time and only then, to call the update state
+  `mixed_tree`: a run killed after its restore and before its result leaves
+  no result, and only the tree says whether it healed (the next run removes
+  a healed state without a new backup). The awareness check words every
+  class (never paging).
+  `--dismiss TS` and `--restore TS` take only a ts the writer's report name
+  rule accepts (`report_ts`; anything else exits 2 before a path is built) and
+  read the report through `load_report`. `live_move_repair.py --restore TS
+  --check` (#3492 PR B1; restoring itself is PR B2, and until then `--restore`
+  without `--check` exits 2) is the read-only judge of what a restore would
+  write, in a second kit source, `scripts/lib/live_move_restore.py`, loaded
+  from the kit's own directory like the guard. It takes the repair's locks in
+  the repair's order with a short wait (30 s; `--wait` honoured) and exits 1
+  while any is held, or while the guard calls the checkout `mixed_tree`. It
+  first refuses the whole report if a row is not exactly what the writer
+  writes (relative paths outside `.git`, at most 4,096 bytes, the sum of
+  length x depth over the rows within the report byte cap; git modes and
+  object ids; one stage-0 index entry or stages 1-3 once each; blobs only
+  `index-blobs/<oid>` of the row's own entries; `saved_as` only
+  `tree/<path>`; the writer's flag letters, classes and special shapes), or
+  if a newer report of this checkout (by its ts, dismissed ones too; one
+  naming another checkout is skipped) cannot be read, the newer reports
+  together exceed one report's caps (4 MiB of REPAIR.json, 20,000 rows), or
+  a ts names no date; the refusal names the newer report. Then, with
+  HEAD's tree, the tag's tree and the index read once each, every part of
+  every foreign row (its node, only where the repair changed and could reach
+  it; its index entries, only where they differ from the tag's; its flag) is
+  printed as `as-left` (the tag's state: the repair's), `already-restored`
+  (the saved state) or `other:<reason>`. An as-left part counts as restorable
+  only while HEAD's entries at, below and above the path equal the tag's
+  (`changed-upstream`), the index there equals the tag's except at rows
+  already restored (`index-changed`), no index entry sits at a parent, no
+  parent is a symlink or a non-directory, and no newer report holds an
+  overlapping path. A parent that is this report's own row, already put
+  back, refuses none of these for its child (the writer's steps run parents
+  first, so a restore killed between them still converges). A symlinked or
+  non-directory parent is decided before anything below it is read, and no
+  directory, in the checkout or the backup, is walked through a link. A tag
+  directory is compared on the tag's own paths only (an untracked cache in it
+  changes no part), and only for a node part. An index part whose blob is
+  neither saved (a regular `index-blobs/<oid>` hashing to it) nor in the
+  object store is `other:not-saved`. Every file is hashed in 1 MiB chunks
+  from an fd opened without following a link or blocking on a FIFO, and only
+  while it is still the file its lstat saw. One check hashes no file over
+  256 MiB, at most 2 GiB in all, and looks at most at 200,000 nodes; a part
+  that would read past that is `other:too-large`. A symlinked or non-regular
+  lock file is refused by name, never followed. A directory row is never restored whole:
+  its `entry` parts are the saved files whose bytes are not the move target's
+  (only the foreign rows themselves when the target cannot be read); sockets
+  and devices are `other:cannot-make`. Exit 0 only when every part is as-left
+  or already-restored. It writes no report and no backup; like the repair, it
+  creates `locks/update.lock` and `.git/genesis-checkout.lock` when they are
+  missing.
   `--post-merge` on `live` never runs the engine. What is recorded and sent to
   the host guardian is the origin/main commit `live` is built on.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;
@@ -4602,7 +4739,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: c56a621b5 2026-10-24
+verified: 702274dfe 2026-11-05
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -4681,6 +4818,27 @@ verified: c56a621b5 2026-10-24
   changing existing Segment consumers. Ordinary configuration and launcher
   activation remain separate. See
   `docs/reference/codex-validator-boundary.md`.
+  The owner-run `scripts/codex-validator` entry prepares a dedicated private
+  Codex home, keeps the project layer untrusted and verifies the enabled trusted
+  adapter plus exactly two validator MCP servers through fresh native discovery.
+  Check/run compare physical hook and launcher import bytes/types/Git modes to
+  an explicit qualified commit, require clean tracked main files and no detected
+  deployment, and retire their inspection process group before continuing.
+  An explicit owner branch-test mode runs the branch entry with main-root
+  policy, guards, MCP servers and cwd. It checks both physical source trees;
+  only the two new launcher files are omitted from main's comparison. Flagged
+  prepare/login require that same qualification before state changes. Normal
+  linked-worktree refusal remains. The model-turn smoke check is owner-run.
+  Explicit login accepts `--device-auth` for headless authentication.
+  Inspection/run disable account-connected Apps through fixed CLI arguments
+  and verify that effective setting, retaining the exact two-server boundary.
+  Interactive native qualification records a Codex0.166.0 reference binary.
+  The launcher warns on other recognizable versions and retains its startup
+  inspection/refusal checks; those inspect state, not actual tool denial.
+  Release-time native allow/deny controls do not certify future clients.
+  It supplies no service/timer wiring, copied credentials, deploy authority or
+  lifecycle enrollment. See `docs/reference/codex-validator-launcher.md` for
+  operator commands, source inventory, permitted MCP startup effects and races.
   Codex has a separate external-client adapter in `.codex/config.toml`: it
   starts the existing standalone health and memory MCP servers through a
   launcher that scrubs inherited Genesis session identity, provenance,

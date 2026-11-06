@@ -3,10 +3,14 @@
 ## Prerequisites
 
 - **OS**: Ubuntu 24.04+ (glibc 2.38 or newer) on x86_64 or aarch64; the graph
-  engine's wheels are built for nothing else
+  engine's wheels are built for nothing else. Tested on 24.04 and 26.04: CI's default
+  runner, now 26.04, runs the full suite and a fresh install, and a pinned 24.04 job runs
+  the OS-sensitive tests. The container `host-setup.sh` creates is 24.04, whatever the
+  host runs.
 - **Python**: 3.12. A host whose only `python3` is 3.13 or 3.14 (Ubuntu 26.04 ships 3.14)
   gets 3.12 from [uv](https://docs.astral.sh/uv/) during setup, with no package
-  source added. An existing venv on a newer Python stays as it is.
+  source added, and each update that applies a change moves it to the latest patch the
+  pinned uv knows. An existing venv on a newer Python stays as it is.
 - **Node**: 20.x+
 - **Claude Code**: Installed globally (`npm i -g @anthropic-ai/claude-code`)
 

@@ -20,6 +20,11 @@ Credential entry points and a shared authenticated backup-decryption facility:
 - **decrypt-backup**: authenticate one encrypted message and atomically publish
   its plaintext. ``decrypt_backup_file`` and ``decrypt_backup_stream`` share
   this boundary with backup, restore and transcript-evidence callers.
+- **decrypt-backup-stream**: write one encrypted message's plaintext to stdout
+  as it decrypts, and exit 0 only once GPG has authenticated all of it. The
+  bytes are tentative until then: the consumer (backup.sh's restore check
+  feeding an in-memory database) may examine them locally but must trust its
+  result only on exit 0. No plaintext file is written.
 
 Trigger policy (locked): restore fires STRICTLY on observed corruption
 (missing-with-backup / empty / NUL-zeroed / unparseable / missing structural
@@ -36,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import json
 import os
 import subprocess
@@ -220,6 +226,40 @@ def validate_bytes(
     return ValidationResult(False, "parse_error", f"unknown kind {kind!r}")
 
 
+def _exists(path: Path) -> bool:
+    """Only "no such file" means absent, and anything else raises. From Python 3.14
+    ``Path.exists`` also answers False for a directory that denies search, which would
+    read as a missing file and restore over a live one. This runs on the system's
+    ``python3``, whichever that is. A symlink loop counts as absent, as it always has:
+    nothing can be read through one, and a restore heals it."""
+    try:
+        os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            return False
+        raise
+    return True
+
+
+def _backup_dir_if_present(candidate: Path) -> Path | None:
+    """The directory if it exists, else None. One that can't be checked is kept, so
+    :func:`validate_file` reports that for each target rather than reading "no backup"."""
+    try:
+        return candidate if _exists(candidate) else None
+    except OSError:
+        return candidate
+
+
+def _known_present(path: Path) -> bool:
+    """For a report, where "can't tell" is not "yes"."""
+    try:
+        return _exists(path)
+    except OSError:
+        return False
+
+
 def validate_file(
     target: CredTarget, home: Path, backup_dir: Path | None
 ) -> ValidationResult:
@@ -228,8 +268,14 @@ def validate_file(
     never provisioned ("absent", healthy — the clean degradation for installs
     without backups or without an optional file like genesis.yaml)."""
     path = home / target.path
-    if not path.exists():
-        has_backup = backup_dir is not None and (backup_dir / target.backup_rel).exists()
+    try:
+        present = _exists(path)
+        has_backup = (
+            not present and backup_dir is not None and _exists(backup_dir / target.backup_rel)
+        )
+    except OSError as exc:
+        return ValidationResult(False, "unreadable", f"could not check: {exc}")
+    if not present:
         if has_backup:
             return ValidationResult(False, "missing", f"{path} absent but backup exists")
         return ValidationResult(True, "absent", f"{path} never provisioned")
@@ -519,25 +565,23 @@ def resolve_passphrase(home: Path) -> str | None:
         return env_pass
 
     secrets = home / "genesis/secrets.env"
-    if secrets.exists():
-        try:
-            raw = secrets.read_bytes()
-        except OSError:
-            raw = b""
-        # Only trust secrets.env for the passphrase if it is NOT itself corrupt.
-        if validate_bytes("dotenv", raw, min_keys=1).ok:
-            val = _backup_passphrase_value(raw)
-            if val:
-                return val
+    try:
+        raw = secrets.read_bytes()
+    except OSError:
+        raw = b""
+    # Only trust secrets.env for the passphrase if it is NOT itself corrupt.
+    if validate_bytes("dotenv", raw, min_keys=1).ok:
+        val = _backup_passphrase_value(raw)
+        if val:
+            return val
 
     escrow = home / ".genesis/shared/guardian/backup_passphrase.env"
-    if escrow.exists():
-        try:
-            val = _backup_passphrase_value(escrow.read_bytes(), escrow=True)
-            if val:
-                return val
-        except (OSError, ValueError):
-            pass
+    try:
+        val = _backup_passphrase_value(escrow.read_bytes(), escrow=True)
+        if val:
+            return val
+    except (OSError, ValueError):
+        pass
     return None
 
 
@@ -576,6 +620,33 @@ def _targets_by_name() -> dict[str, CredTarget]:
     return {t.name: t for t in DEFAULT_TARGETS}
 
 
+def _stream_to_stdout(source: Path, passphrase: bytes) -> int:
+    """decrypt-backup-stream: 0 only when every byte was written AND GPG
+    authenticated the whole message. A consumer that stops reading (a broken
+    pipe) makes this fail too, so a partial read never reads as success."""
+    out = sys.stdout.buffer
+    try:
+        with decrypt_backup_stream(source, passphrase) as stream:
+            while True:
+                chunk = stream.read(65536)
+                if not chunk:
+                    break
+                out.write(chunk)
+            out.flush()
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        # Point stdout at /dev/null so interpreter shutdown cannot raise again
+        # flushing into a pipe the consumer already closed.
+        with contextlib.suppress(OSError):
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        if isinstance(exc, BrokenPipeError):
+            print("consumer closed the pipe (not an authentication result)", file=sys.stderr)
+        else:
+            print("encrypted backup authentication failed", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="cred_integrity", add_help=True)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -595,6 +666,9 @@ def main(argv: list[str] | None = None) -> int:
     p_decrypt.add_argument("source", type=Path)
     p_decrypt.add_argument("target", type=Path)
 
+    p_stream = sub.add_parser("decrypt-backup-stream")
+    p_stream.add_argument("source", type=Path)
+
     args = parser.parse_args(argv)
     if args.cmd == "decrypt-backup":
         try:
@@ -603,12 +677,14 @@ def main(argv: list[str] | None = None) -> int:
             print("encrypted backup authentication failed", file=sys.stderr)
             return 1
         return 0
+    if args.cmd == "decrypt-backup-stream":
+        return _stream_to_stdout(args.source, sys.stdin.buffer.read())
     home = Path(args.home).expanduser() if args.home else _default_home()
     backup_dir = (
         Path(args.backup_dir).expanduser() if args.backup_dir
         else _default_backup_dir(home)
     )
-    backup_arg = backup_dir if backup_dir.exists() else None
+    backup_arg = _backup_dir_if_present(backup_dir)
 
     if args.cmd == "check":
         results = check_all(None, home, backup_arg)
@@ -621,7 +697,7 @@ def main(argv: list[str] | None = None) -> int:
                     "detail": r.detail,
                     "path": str(home / _targets_by_name()[name].path),
                     "backup_exists": backup_arg is not None
-                    and (backup_dir / _targets_by_name()[name].backup_rel).exists(),
+                    and _known_present(backup_dir / _targets_by_name()[name].backup_rel),
                 }
                 for name, r in results.items()
             },

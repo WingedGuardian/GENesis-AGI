@@ -144,6 +144,16 @@ def test_the_live_database_is_never_trashed(which):
     assert target.exists()
 
 
+def test_a_database_path_that_cannot_be_resolved_refuses_rather_than_guesses(tmp_path, monkeypatch):
+    loop = tmp_path / "loop.db"
+    loop.symlink_to(loop)
+    monkeypatch.setattr(env, "genesis_db_path", lambda: loop)
+    unrelated = _touch(tmp_path / "unrelated.txt")
+    with pytest.raises(TrashRefused):
+        trash(unrelated, reason="r", caller="c")
+    assert unrelated.exists()
+
+
 def test_an_old_database_copy_beside_it_can_be_trashed():
     db = env.genesis_db_path()
     _touch(db, "db")

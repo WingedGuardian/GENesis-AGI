@@ -1676,6 +1676,10 @@ async def _check_deploy_staleness(db) -> None:
             _last_actionable_base_findings = [
                 f for f in findings if f.split(":", 1)[0] in _BASE_DEPENDENT_CLASSES
             ]
+        # Older repair report dirs not read (dismissed ones included) are named
+        # beside another finding, never an alert of their own.
+        if {f.split(":", 1)[0] for f in findings} == {"live_repair_unread_older"}:
+            findings = []
         if not findings:
             await _resolve_deploy_staleness(db)
             return
@@ -1730,16 +1734,22 @@ async def _check_deploy_staleness(db) -> None:
                 except ValueError:
                     pass
 
-        # Being behind upstream and nothing else is routine maintenance: medium,
-        # so the morning report does not raise it as a blocker every day. Any
-        # other drift class beside it keeps the row at high.
+        # Being behind upstream (or holding live-move repair reports older than
+        # the newest read) and nothing else is routine: medium, so the morning
+        # report does not raise it as a blocker every day. Any other drift class
+        # beside it keeps the row at high.
         if critical:
             priority = "critical"
-        elif classes == ["behind_upstream"]:
+        elif set(classes) <= _DEPLOY_INFORMATIONAL_CLASSES:
             priority = "medium"
         else:
             priority = "high"
         alert_key = ",".join(classes) + ":" + priority
+        if set(classes) & _DEPLOY_REPAIR_CLASSES:
+            # The repair paragraph names reports specific to this snapshot: a
+            # new report is another alert, never the standing one left naming
+            # only the old.
+            alert_key += ":" + _deploy_repair_identity(snap.get("live_repairs") or {})
         now = time.monotonic()
         if (
             now - _last_deploy_alert_at < _DEPLOY_ALERT_COOLDOWN_S
@@ -1763,10 +1773,12 @@ async def _check_deploy_staleness(db) -> None:
         # The drift paragraph (and its update.sh recovery sentence) only when a
         # drift class is present: update.sh REFUSES a dirty deploy checkout, so
         # telling someone to run it for a dirty-only state is wrong advice.
-        if set(classes) - _DEPLOY_CHECKOUT_CLASSES - _DEPLOY_LIVE_CLASSES:
+        if set(classes) - _DEPLOY_CHECKOUT_CLASSES - _DEPLOY_LIVE_CLASSES - _DEPLOY_REPAIR_CLASSES:
             paragraphs.append(_deploy_drift_paragraph(snap, age_days, behind, git_facts))
         if set(classes) & _DEPLOY_LIVE_CLASSES:
             paragraphs.append(_deploy_live_paragraph(snap, findings))
+        if set(classes) & _DEPLOY_REPAIR_CLASSES:
+            paragraphs.append(_deploy_repair_paragraph(snap.get("live_repairs") or {}))
         if "main_checkout_dirty" in classes:
             paragraph = _deploy_checkout_dirty_paragraph(checkout)
             if carried and checkout.get("count") is not None:
@@ -1785,7 +1797,11 @@ async def _check_deploy_staleness(db) -> None:
             id=str(uuid.uuid4()),
             source="deploy_staleness_monitor",
             type="infrastructure_alert",
-            content=" ".join(paragraphs) + f" [findings: {', '.join(findings)}]",
+            # Text a database column can always hold: one field that is not
+            # valid Unicode (a lone surrogate) is escaped, never the whole alert lost.
+            content=(" ".join(paragraphs) + f" [findings: {', '.join(findings)}]")
+            .encode("utf-8", "backslashreplace")
+            .decode("utf-8"),
             priority=priority,
             created_at=datetime.now(UTC).isoformat(),
             content_hash=content_hash,
@@ -1817,6 +1833,84 @@ _DEPLOY_LIVE_CLASSES = frozenset(
         "live_candidate_tier2",
     }
 )
+
+#: Finding classes from the live-move repair's reports
+#: (deploy_health.live_repair_findings): their own wording, and they never page.
+_DEPLOY_REPAIR_CLASSES = frozenset(
+    {
+        "live_repair_saved",
+        "live_repair_unread_older",
+        "live_repair_unresolved",
+        "live_repair_refused",
+    }
+)
+#: Classes that alone are routine (a medium observation, not a blocker).
+_DEPLOY_INFORMATIONAL_CLASSES = frozenset({"behind_upstream", "live_repair_unread_older"})
+
+
+def _deploy_repair_identity(repairs: dict) -> str:
+    """What the repair paragraph names, hashed: per report its ts, saved count,
+    dismissal and unresolved flag, then the refused and unread counts. A new
+    report inside the cooldown is another alert, never the standing one."""
+    named = {
+        "reports": [
+            [r.get("ts"), r.get("saved"), r.get("dismissed"), r.get("unresolved")]
+            for r in repairs.get("reports") or []
+            if isinstance(r, dict)
+        ],
+        "refused": repairs.get("refused"),
+        "unread_older": repairs.get("unread_older"),
+    }
+    return hashlib.sha256(json.dumps(named, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _deploy_repair_paragraph(repairs: dict) -> str:
+    # Each ts is the writer's dir-name format (load_report's report_ts:
+    # digits, T, Z and -), so it needs no quoting in a command.
+    parts: list[str] = []
+    shown = [
+        r
+        for r in repairs.get("reports") or []
+        if isinstance(r, dict) and not r.get("dismissed") and r.get("saved")
+    ]
+    if shown:
+        each = [
+            f"Repair {r['ts']}: {r['saved']} path(s) the update did not write were recorded "
+            f"(their files, index entries or flags are in {r['backup_dir']}). To put them back: "
+            f"scripts/deploy_candidates repair-move --restore {r['ts']} (once both the installed "
+            "repair kit and scripts/deploy_candidates include --restore); to keep the checkout "
+            f"as it is: scripts/deploy_candidates repair-move --dismiss {r['ts']}."
+            for r in shown
+        ]
+        parts.append(
+            "A repair of a half-written `live` checkout, moving it back to its rollback "
+            "tag, saved what it found there that was not the update's (someone's edits). "
+            + " ".join(each)
+            + " Restoring puts the saved files back as uncommitted edits, so "
+            "deploy_code_only.sh and update.sh refuse to deploy until they are committed "
+            "(on a branch, as a PR), moved out, or removed. Backups are pruned 90 days "
+            "after the last write to their folder."
+        )
+    refused = repairs.get("refused") or 0
+    if refused:
+        parts.append(
+            f"{refused} live-move repair report(s) under ~/.genesis/deploy-backups/ could "
+            "not be read; they are named in the server log."
+        )
+    unread = repairs.get("unread_older") or 0
+    if unread:
+        parts.append(
+            f"{unread} older live-move repair report dir(s) not read, dismissed ones included "
+            "(only the newest are read); this is informational, and they are pruned with "
+            "their backups."
+        )
+    if repairs.get("unresolved"):
+        parts.append(
+            "The last live-move repair did not finish (it was killed partway, or its "
+            "REPAIR.json under ~/.genesis/deploy-backups/ names the reason); "
+            "scripts/deploy_candidates repair-move runs it again."
+        )
+    return " ".join(parts)
 
 
 def _deploy_drift_paragraph(snap: dict, age_days, behind, git_facts: dict) -> str:
@@ -4399,6 +4493,13 @@ class AwarenessLoop:
             # completions (recorded by the invoker) and alerts on a run. Guarded
             # on db internally; a query failure no-ops (never breaks the tick).
             await _check_cc_cap_detection(self._db)
+            # Inbox sync staleness — reads one heartbeat file the timer-run sync
+            # writes; alerts when it stops succeeding (#3183). Every tick, not
+            # the hourly block: the hourly count resets on restart, and a dead
+            # sync went unnoticed for 17 days. Silent when no vault is set.
+            from genesis.inbox.sync_health import check_inbox_sync_health
+
+            await check_inbox_sync_health(self._db)
             # Dead-provider notification sweep — clock-driven ON PURPOSE (the
             # trip-driven version starved when traffic stopped; PR #1573).
             # Guarded on db internally; lever: provider_outage_notify domain +
