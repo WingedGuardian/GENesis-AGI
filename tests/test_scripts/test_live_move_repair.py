@@ -12,10 +12,12 @@ scratch HOME's ~/.genesis/lib/live-repair/current.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -59,9 +61,11 @@ from tests.test_scripts._live_repair_world import (
     _run_steps,
     _skip_worktree_desc,
     _staged_desc,
+    age_locks,
     assert_healed,
     killed_rollback,
     killed_tag_side,
+    reapply_steps,
     tag_snapshot,
 )
 
@@ -90,7 +94,7 @@ def test_td1_a_switch_killed_on_the_tag_side_is_healed_and_saved(w, victim):
     assert_healed(w, before)
     assert _git(w.root, "rev-parse", "HEAD") == w.tag
     assert (w.backups()[-1] / "git" / "index.lock").exists() is lock_left
-    assert w.report()["reapply"] == [], "the update's own files were reported as foreign"
+    assert reapply_steps(w) == [], "the update's own files were reported as foreign"
 
 
 def test_td2_a_rollback_killed_partway_is_left_to_the_forward_repair(w):
@@ -148,10 +152,13 @@ def test_td3_a_foreign_path_is_saved_healed_and_reported(w, make):
     assert_healed(w, before)
     rows = {row["path"]: row for row in w.report()["paths"]}
     assert rows[path]["class"] == "foreign", rows[path]
-    steps = w.report()["reapply"]
+    steps = reapply_steps(w)
     assert len(steps) == 1, steps
-    assert steps[0] in r.stdout, "the re-apply step was not reported"
-    assert any(steps[0] in a["body"] for a in w.alerts()), "no alert carries the step"
+    ts = w.report()["ts"]
+    assert w.report()["reapply"] == [], "the writer stored a shell step (#3868)"
+    assert f"scripts/deploy_candidates repair-move --restore {ts} --check" in r.stdout, r.stdout
+    assert w.alerts() and all(f"repair-move --restore {ts}" in a["body"] for a in w.alerts())
+    assert "rm -rf" not in r.stdout and not any("rm -rf" in a["body"] for a in w.alerts())
     assert all(a["severity"] == "critical" for a in w.alerts())
     subprocess.run(["bash", "-c", steps[0]], check=True, env=w.env())
     after = w.snapshot()
@@ -182,7 +189,7 @@ def test_r1_a_foreign_staged_blob_survives_gc_and_is_reapplied(w):
         subprocess.run(["git", "-C", str(w.root), "cat-file", "-e", oid], env=_git_env()).returncode
         != 0
     ), "control: gc pruned the staged blob"
-    step = w.report()["reapply"][0]
+    step = reapply_steps(w)[0]
     subprocess.run(["bash", "-c", step], check=True, env=w.env())
     assert _git(w.root, "ls-files", "-s", "--", "A") == index_before
     assert _git(w.root, "cat-file", "blob", oid) == "staged by someone"
@@ -207,7 +214,7 @@ def test_r1_a_name_with_a_newline_reapplies_its_index_entry(tmp_path, monkeypatc
     assert w.repair().returncode == 0
     rows = {row["path"]: row for row in w.report()["paths"]}
     assert rows[name]["class"] == "foreign"
-    [step] = w.report()["reapply"]
+    [step] = reapply_steps(w)
     r = subprocess.run(["bash", "-c", step], capture_output=True, text=True, env=w.env())
     assert r.returncode == 0, r.stderr
     assert _git(w.root, "ls-files", "-s", "-z") == index_before
@@ -240,8 +247,8 @@ def test_r1_a_fifo_or_socket_on_a_move_path_is_recorded(w, monkeypatch, kind):
     assert row["special"]["type"] == kind, row
     if kind == "fifo":
         assert row["special"]["mode"] == "0640", row
-    [step] = w.report()["reapply"]
-    assert step in r.stdout
+    [step] = reapply_steps(w)
+    assert f"--restore {w.report()['ts']}" in r.stdout and "mkfifo" not in r.stdout, r.stdout
     subprocess.run(["bash", "-c", step], check=True, env=w.env())
     import stat as st
 
@@ -353,7 +360,7 @@ def test_td4_empty_prefix_and_ephemeral_paths_are_the_updates(w):
     assert_healed(w, before)
     rows = {row["path"]: row["class"] for row in w.report()["paths"]}
     assert rows["Z5"] == rows["sub/s1"] == rows["AGENTS.md"] == "engine", rows
-    assert w.report()["reapply"] == []
+    assert reapply_steps(w) == []
     assert [a["severity"] for a in w.alerts()] == ["warning"]
 
 
@@ -842,9 +849,9 @@ def test_r2_a_row_inside_a_saved_directory_is_saved_by_it(w, make):
     for row in w.report()["paths"]:
         if row["disk_changed"] and row["disk"] not in ("absent", "other"):
             assert os.path.lexists(backup / row["saved_as"]), row
-    for step in w.report()["reapply"]:
+    for step in reapply_steps(w):
         subprocess.run(["bash", "-c", step], check=True, env=w.env())
-    if w.report()["reapply"]:
+    if reapply_steps(w):
         assert {k: v for k, v in w.snapshot().items() if k.startswith("P")} == {
             k: v for k, v in before.items() if k.startswith("P")
         }
@@ -893,7 +900,7 @@ def test_r2_a_mode_only_edit_reapplies_its_mode(w):
     (w.root / "sub" / "s1").chmod(0o755)
     assert w.repair().returncode == 0
     assert not os.access(w.root / "sub" / "s1", os.X_OK)
-    [step] = w.report()["reapply"]
+    [step] = reapply_steps(w)
     subprocess.run(["bash", "-c", step], check=True, env=w.env())
     assert os.access(w.root / "sub" / "s1", os.X_OK)
 
@@ -1216,7 +1223,7 @@ def test_reapply_never_stages_a_deletion_of_an_engine_row(w):
     _lock_aside_if_any(w, plant)
     r = w.repair()
     assert r.returncode == 0, r.stdout + r.stderr
-    for step in w.report()["reapply"]:
+    for step in reapply_steps(w):
         s = subprocess.run(["bash", "-c", step], capture_output=True, text=True, env=w.env())
         assert s.returncode == 0, s.stderr
     st = _git(w.root, "status", "--porcelain")
@@ -1284,7 +1291,7 @@ def test_r4_an_index_entry_under_a_row_path_is_its_own_row(w, make):
         assert (w.backups()[-1] / "index-blobs" / oid).is_file(), "the staged blob was not saved"
     _git(w.root, "-c", "gc.reflogExpire=now", "-c", "gc.reflogExpireUnreachable=now", "gc", "-q",
          "--prune=now")  # fmt: skip
-    for step in w.report()["reapply"]:
+    for step in reapply_steps(w):
         r = subprocess.run(["bash", "-c", step], capture_output=True, text=True, env=w.env())
         assert r.returncode == 0, step + "\n" + r.stderr
     assert _git(w.root, "ls-files", "-s", "--", path) == entry
@@ -1370,7 +1377,7 @@ def test_r4_ephemeral_paths_match_whole_like_the_guard(tmp_path, monkeypatch):
     assert r.returncode == 0, r.stdout + r.stderr
     rows = {row["path"]: row for row in w.report()["paths"]}
     assert rows["notes AGENTS.md"]["class"] == "foreign", rows["notes AGENTS.md"]
-    [step] = w.report()["reapply"]
+    [step] = reapply_steps(w)
     subprocess.run(["bash", "-c", step], check=True, env=w.env())
     assert (w.root / "notes AGENTS.md").read_text() == "FOREIGN EDIT\n"
 
@@ -1462,7 +1469,7 @@ def test_r5_no_reapply_step_reaches_through_a_restored_symlink(w, tmp_path, ance
     if not ancestor:
         assert rows["sub/s1"]["class"] == "foreign", rows["sub/s1"]
         assert rows["sub/s1"].get("unreachable_through") == "sub", rows["sub/s1"]
-        [child] = [s for s in w.report()["reapply"] if "sub/s1" in s]
+        [child] = [s for s in reapply_steps(w) if "sub/s1" in s]
         assert "rm -rf" not in child and "cp -a" not in child, child
         assert "not reachable through" in child, child
     _gc(w)
@@ -1472,3 +1479,365 @@ def test_r5_no_reapply_step_reaches_through_a_restored_symlink(w, tmp_path, ance
     assert sorted(p.name for p in outside.iterdir()) == ["s1"], "a step wrote outside"
     assert os.readlink(w.root / "sub") == str(outside)
     assert _git(w.root, "ls-files", "-s", "-z") == index_before
+
+
+# ── #3492 B2a: no generated shell (#3868, #3869), the integrity record, modes ──
+
+
+def _many_foreign(w: World, n: int) -> list[str]:
+    """#3869: ``n`` target-only files the switch wrote whole (killed at
+    "prepared"), each then overwritten with a person's own bytes: ``n``
+    foreign rows. Long names make the old shell steps outgrow one argv string."""
+    names = [f"many/{i:03d}-" + "n" * 80 for i in range(n)]
+
+    def add(w):
+        (w.root / "many").mkdir()
+        for p in names:
+            (w.root / p).write_text("theirs\n")
+
+    _retarget(w, add)
+    killed_tag_side(w, "prepared")
+
+    def mine():
+        for p in names:
+            (w.root / p).write_text("mine\n")
+
+    _lock_aside_if_any(w, mine)
+    age_locks(w)
+    return names
+
+
+def test_3869_boot_with_300_foreign_rows_exits_0_and_queues_its_alert(w):
+    """#3869: the tree is healed and the state cleared, so the start must
+    proceed (rc 0) and the alert must queue. The old writer passed every
+    stored step to bash in one argv string: E2BIG, rc 1, the alert lost."""
+    _many_foreign(w, 300)
+    r = w.repair(mode="--boot")
+    assert r.returncode == 0, r.stderr[-3000:]
+    assert not w.state.exists(), "control: the repair healed and cleared"
+    report = w.report()
+    assert sum(1 for row in report["paths"] if row["class"] == "foreign") == 300
+    assert report["reapply"] == []
+    [alert] = w.alerts()
+    assert alert["severity"] == "critical", alert
+    assert f"repair-move --restore {report['ts']}" in alert["body"], alert["body"][:500]
+    assert "rm -rf" not in alert["body"]
+
+
+def test_3868_the_writer_keeps_no_shell_step(w, mod):
+    """#3868: a printed `rm -rf` + `cp -a` step destroyed newer work when run
+    late. The writer generates none: the report's `reapply` stays [] for older
+    readers, and what it prints and alerts is the restore command."""
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: _foreign_edit(w))
+    age_locks(w)
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    report = w.report()
+    assert any(row["class"] == "foreign" for row in report["paths"]), "control: a foreign row"
+    assert report["reapply"] == []
+    ts = report["ts"]
+    texts = [r.stdout, *(a["body"] for a in w.alerts())]
+    assert len(texts) == 2, texts
+    for text in texts:
+        assert f"scripts/deploy_candidates repair-move --restore {ts} --check" in text, text
+        assert f"scripts/deploy_candidates repair-move --restore {ts}." in text, text
+        assert "rm -rf" not in text and "cp -a" not in text and "update-index" not in text
+    assert not hasattr(mod, "reapply_step"), "the step generator is still in the writer"
+
+
+def _finished(w, mod):
+    """A real repair with a foreign row, its queue emptied; (Repair, backup, manifest)."""
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: _foreign_edit(w))
+    age_locks(w)
+    assert w.repair().returncode == 0
+    shutil.rmtree(w.gen / "alerts")  # the same dedupe key would not queue again
+    return mod.Repair(str(w.state), str(w.root), True, 0), str(w.backups()[-1]), w.report()
+
+
+@pytest.mark.parametrize("rc", [0, 1])
+def test_a_result_of_any_size_is_alerted_under_the_argv_bound(w, mod, rc):
+    """Review SF-8: MIXED_TREE's reason lists every residue path, and the body
+    goes to bash as one argv string and on as ALERT_BODY. MEASURED here: one
+    string of 131,072 bytes or more is E2BIG (getconf ARG_MAX: 2,097,152 for
+    argv and env together). The body is cut, says so, and the alert queues;
+    the full result stays in REPAIR.json; the exit code is the caller's."""
+    repair, backup, manifest = _finished(w, mod)
+    huge = "unresolved: mixed_tree: " + " ".join(f"residue/{i:05d}" for i in range(20_000))
+    assert len(huge.encode()) > 131_072, "control: one argv string over the limit"
+    assert repair._finish(backup, manifest, huge, rc) == rc
+    [alert] = w.alerts()
+    body = alert["body"].encode()
+    assert len(body) <= mod.ALERT_BYTES < 131_072, len(body)
+    assert b"more bytes" in body and b"REPAIR.json" in body, body[-300:]
+    assert w.report()["result"] == huge
+
+
+@pytest.mark.parametrize("rc", [0, 1])
+def test_a_failed_alert_never_changes_the_exit_code(w, mod, monkeypatch, rc):
+    """The module header: exit 1 only where a start would run a half-written
+    tree. An alert that cannot be queued (here: bash cannot be started) is
+    logged, never raised."""
+    repair, backup, manifest = _finished(w, mod)
+
+    def cannot(*a, **k):
+        raise OSError(7, "Argument list too long")
+
+    monkeypatch.setattr(mod.subprocess, "run", cannot)
+    assert repair._finish(backup, manifest, "healed", rc) == rc
+    assert w.report()["result"] == "healed"
+
+
+@pytest.mark.parametrize(
+    "backup, body",
+    [
+        ("/x/100%done", "y" * 20_000),  # the cut note was a %-format holding the path
+        ("/x", "a\0b"),  # an argv string cannot hold a NUL
+        ("/x", "lone \ud800 surrogate " * 2_000),  # not a surrogateescape byte
+    ],
+    ids=["percent-in-path", "nul", "lone-surrogate"],
+)
+def test_no_alert_text_can_raise_out_of_the_alert(w, mod, backup, body):
+    """Security review W2: each of these raised past the alert's try (TypeError,
+    ValueError, UnicodeEncodeError), so a healed boot exited 1 again. However
+    the text looks, the alert logs and returns."""
+    repair, _backup, _manifest = _finished(w, mod)
+    repair._alert("critical", body, "live_move_repair:x", backup)
+    if "%" in backup:
+        [alert] = w.alerts()
+        assert len(alert["body"].encode()) <= mod.ALERT_BYTES, len(alert["body"])
+        assert "more bytes" in alert["body"] and backup in alert["body"]
+
+
+def test_the_report_dir_is_never_one_it_did_not_make(w, mod):
+    """Security review W1: a node already at the report's name (a symlink, or a
+    directory others can write) was adopted, and _sync's chmod walk followed
+    the link. The writer makes the dir itself, or finds the one it made this
+    run (0700, this user's); anything else refuses before a byte is saved."""
+    repair = mod.Repair(str(w.state), str(w.root), True, 0)
+    os.makedirs(repair.backups, exist_ok=True)
+    victim = w.gen / "victim"
+    victim.mkdir()
+    (victim / "f").write_text("x")
+    os.chmod(victim / "f", 0o666)
+    os.chmod(victim, 0o777)
+    link = Path(repair.backups) / f"20991231T000000Z-1{mod.SUFFIX}"
+    link.symlink_to(victim)
+    loose = Path(repair.backups) / f"20991231T000000Z-2{mod.SUFFIX}"
+    loose.mkdir()
+    os.chmod(loose, 0o775)
+    for planted in (link, loose):
+        with pytest.raises(mod.RepairError):
+            repair._report_dir(str(planted))
+    assert stat.S_IMODE(os.lstat(victim).st_mode) == 0o777
+    assert stat.S_IMODE(os.lstat(victim / "f").st_mode) == 0o666
+    own = Path(repair.backups) / f"20991231T000000Z-3{mod.SUFFIX}"
+    repair._report_dir(str(own))
+    repair._report_dir(str(own))  # again in the same run: its own dir
+    assert stat.S_IMODE(os.lstat(own).st_mode) == 0o700
+
+
+def test_write_json_never_writes_through_a_planted_temp(mod, tmp_path):
+    """Security review W1: the temp name is guessable (`<path>.<pid>.tmp`);
+    a link planted there had the JSON written into its target and was then
+    renamed over the report. The temp is created fresh, never followed."""
+    victim = tmp_path / "victim"
+    victim.write_text("keep")
+    path = tmp_path / "REPAIR.json"
+    os.symlink(victim, f"{path}.{os.getpid()}.tmp")
+    mod.write_json(str(path), {"a": 1}, private=True)
+    assert victim.read_text() == "keep"
+    assert not path.is_symlink() and json.loads(path.read_text()) == {"a": 1}
+    assert stat.S_IMODE(os.lstat(path).st_mode) == 0o600
+
+
+def _modes(root: Path) -> dict[str, int]:
+    """Every node below ``root`` (outside .git) by relative path: its lstat st_mode."""
+    out = {}
+    for top, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if not (top == str(root) and d == ".git")]
+        for name in dirs + files:
+            full = os.path.join(top, name)
+            out[os.path.relpath(full, root)] = os.lstat(full).st_mode
+    return out
+
+
+def _foreign_exec_edit(w):
+    (w.root / "sub" / "s1").write_text("mine, executable\n")
+    os.chmod(w.root / "sub" / "s1", 0o775)
+    return "sub/s1"
+
+
+def _group_writable(w, make):
+    """``make``'s foreign path, every non-executable regular file at or below
+    it made 0664: the copy loses the group-write bit, the record keeps the mode."""
+    path = make(w)
+    full = w.root / path
+    nodes = [full, *full.rglob("*")] if full.is_dir() and not full.is_symlink() else [full]
+    for node in nodes:
+        st = os.lstat(node)
+        if stat.S_ISREG(st.st_mode) and not st.st_mode & stat.S_IXUSR:
+            os.chmod(node, 0o664)
+    return path
+
+
+@pytest.mark.parametrize(
+    "make",
+    [_foreign_edit, _foreign_exec_edit, _foreign_untracked, _foreign_inside_dir, _foreign_symlink,
+     _foreign_fifo_inside_dir, _foreign_dir_symlink_inside_dir],
+)  # fmt: skip
+def test_saved_json_records_every_saved_copy(w, make):
+    """Rev 2 item 3 (owner ruling ced82b49: sha256): for every saved regular
+    file under tree/, its sha256 and the mode the checkout had (st_mode &
+    0o7777); a symlink, its target; a FIFO, its mode. In SAVED.json beside
+    REPAIR.json (which names it), so a large directory row cannot push
+    REPAIR.json over REPORT_BYTES."""
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: _group_writable(w, make))
+    age_locks(w)
+    before = _modes(w.root)
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    backup = w.backups()[-1]
+    report = w.report()
+    assert report.get("integrity") == "SAVED.json", sorted(report)
+    assert list(report)[-2:] == ["index_rebuilt", "integrity"], list(report)
+    saved = json.loads((backup / "SAVED.json").read_text())
+    assert set(saved) == {"files", "complete"} and saved["complete"] is True
+    tree, seen = backup / "tree", {}
+    for rel, mode in _modes(tree).items():
+        if stat.S_ISDIR(mode):
+            continue
+        full, key = tree / rel, f"tree/{rel}"
+        orig = stat.S_IMODE(before[rel])
+        if stat.S_ISLNK(mode):
+            seen[key] = {"type": "symlink", "target": os.readlink(full)}
+        elif stat.S_ISFIFO(mode):
+            seen[key] = {"type": "fifo", "mode": f"{orig:04o}"}
+        else:
+            sha = hashlib.sha256(full.read_bytes()).hexdigest()
+            seen[key] = {"type": "file", "mode": f"{orig:04o}", "sha256": sha}
+    assert seen and saved["files"] == seen
+    if make is not _foreign_symlink:  # it saves a link, no regular file of its own
+        modes = {v.get("mode") for v in seen.values()}
+        assert modes & {"0664", "0775"}, f"control: the planted modes: {modes}"
+
+
+@pytest.mark.parametrize("make", [_foreign_edit, _foreign_inside_dir])
+def test_a_saved_file_keeps_its_extended_attributes(w, make):
+    """The repair deletes the original after saving it, so the copy is the only
+    record: a foreign file's user.* extended attributes are copied with it, as
+    copy2 copied them before the hashing copier replaced it (#3973 review)."""
+    killed_tag_side(w, "Z3")
+    rel = make(w)
+    src = w.root / rel
+    files = [src] if src.is_file() else [p for p in src.rglob("*") if p.is_file()]
+    try:
+        for f in files:
+            os.setxattr(f, "user.genesis-test", f.name.encode())
+    except OSError as exc:  # tmpfs before 6.6, some overlay setups
+        pytest.skip(f"no user xattrs on this file system: {exc}")
+    age_locks(w)
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    tree = w.backups()[-1] / "tree"
+    copies = [tree / f.relative_to(w.root) for f in files]
+    assert copies and all(c.is_file() for c in copies), copies
+    for c in copies:
+        assert os.getxattr(c, "user.genesis-test") == c.name.encode(), c
+
+
+def test_a_file_over_the_hash_budget_is_recorded_without_a_hash(w, mod, monkeypatch):
+    """B1's per-file budget (FILE_BYTES): a bigger saved file is recorded with
+    sha256 null, which a restore then refuses (`too-large`), never guesses."""
+    monkeypatch.setattr(mod, "HASH_BYTES", 3, raising=False)
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: _foreign_edit(w))
+    age_locks(w)
+    assert mod.Repair(str(w.state), str(w.root), False, 0).run() == 0
+    backup = w.backups()[-1]
+    files = json.loads((backup / "SAVED.json").read_text())["files"]
+    sizes = {k: (backup / k).stat().st_size for k, v in files.items() if v["type"] == "file"}
+    assert {k for k, n in sizes.items() if n > 3} == {
+        k for k, v in files.items() if v["type"] == "file" and v["sha256"] is None
+    }
+    assert any(n > 3 for n in sizes.values()) and any(n <= 3 for n in sizes.values()), sizes
+
+
+def test_saved_json_stays_under_its_cap(w, mod, monkeypatch):
+    """SAVED.json is bounded like REPAIR.json: past SAVED_BYTES the writer
+    records no more and says so (`complete` false); a record left out is a
+    copy with no hash, which a restore refuses."""
+    monkeypatch.setattr(mod, "SAVED_BYTES", 400, raising=False)
+    killed_tag_side(w, "prepared")
+    age_locks(w)
+    assert mod.Repair(str(w.state), str(w.root), False, 0).run() == 0
+    raw = (w.backups()[-1] / "SAVED.json").read_bytes()
+    saved = json.loads(raw)
+    assert len(raw) <= 400 and saved["complete"] is False and saved["files"], raw
+
+
+def test_the_budgets_match_the_restore_and_the_argv_bound():
+    spec = importlib.util.spec_from_file_location("_restore", LIB / "live_move_restore.py")
+    restore = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(restore)
+    spec = importlib.util.spec_from_file_location("_writer", MODULE)
+    writer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(writer)
+    assert writer.HASH_BYTES == restore.FILE_BYTES
+    assert writer.ALERT_BYTES * 2 < 131_072  # argv $4 and ALERT_BODY: one string each
+
+
+def test_the_report_folder_is_this_users_alone(w):
+    """Rev 2 item 4 (owner ruling 73b6285d): deploy-backups 0700 (an existing
+    one of this user's is set to it), the report dir 0700, REPAIR.json and
+    SAVED.json 0600, and nothing below with a group or world write bit, under
+    a umask that grants group write (genesis-server's UMask=0002)."""
+    (w.gen / "deploy-backups").mkdir()
+    os.chmod(w.gen / "deploy-backups", 0o775)
+    killed_tag_side(w, "Z3")
+
+    def plant():
+        _group_writable(w, _foreign_inside_dir)
+        os.mkfifo(w.root / "P" / "pipe")
+        os.chmod(w.root / "P" / "pipe", 0o662)
+        _foreign_staged(w)  # its blob is written to index-blobs/ under the umask
+
+    _lock_aside(w, plant)
+    age_locks(w)
+    old = os.umask(0o002)
+    try:
+        r = w.repair()
+    finally:
+        os.umask(old)
+    assert r.returncode == 0, r.stdout + r.stderr
+    backup = w.backups()[-1]
+    assert stat.S_IMODE(os.lstat(w.gen / "deploy-backups").st_mode) == 0o700
+    assert stat.S_IMODE(os.lstat(backup).st_mode) == 0o700
+    for name in ("REPAIR.json", "SAVED.json"):
+        assert stat.S_IMODE(os.lstat(backup / name).st_mode) == 0o600, name
+    loose = {rel: f"{stat.S_IMODE(m):04o}" for rel, m in _modes(backup).items()
+             if not stat.S_ISLNK(m) and m & 0o022}  # fmt: skip
+    assert loose == {}, loose
+    assert (backup / "tree" / "P" / "pipe").exists(), "control: the FIFO was saved"
+    assert (backup / "tree" / "P" / "mine.txt").exists(), "control: the file was saved"
+    assert any((backup / "index-blobs").iterdir()), "control: a blob was saved"
+
+
+def test_repair_move_restore_reaches_the_kit(w):
+    """The command the writer prints, `scripts/deploy_candidates repair-move
+    --restore TS --check`, goes through the wrapper to the kit."""
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: _foreign_edit(w))
+    age_locks(w)
+    entry = _entry_checkout(w)
+    w.kit()
+    assert w.repair().returncode == 0
+    ts = w.report()["ts"]
+    r = subprocess.run(
+        ["bash", str(entry), "repair-move", "--restore", ts, "--check"],
+        capture_output=True, text=True, env=w.env(),
+    )  # fmt: skip
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert f"report {ts}: " in r.stdout and '"sub/s1" node as-left' in r.stdout, r.stdout

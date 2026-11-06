@@ -6,7 +6,8 @@ Every case is a REAL repair in the scratch world (tests/test_scripts/
 _live_repair_world.py), judged afterwards. A part is `as-left` (the path holds
 what the repair left: the tag's), `already-restored` (it holds what the repair
 saved) or `other:<reason>`; only a run where every part is one of the first two
-exits 0. Restoring "by hand" below runs the writer's own stored re-apply steps.
+exits 0. Restoring "by hand" below runs the test oracle's re-apply steps
+(_live_repair_world.reapply_step, the writer's old shell steps, #3868).
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -43,7 +45,9 @@ from tests.test_scripts._live_repair_world import (
     _hash,
     _lock_aside,
     _run_steps,
+    age_locks,
     killed_tag_side,
+    reapply_steps,
 )
 
 pytestmark = pytest.mark.skipif(sys.platform.startswith("win"), reason="git + bash")
@@ -65,22 +69,11 @@ KINDS = [
 ]
 
 
-def _age_locks(w) -> None:
-    """The killed switch's locks, aged past LOCK_FRESH_S: a lock left by an
-    earlier kill. Wherever this user runs a process whose fds cannot be read
-    (a CI runner, a systemd-user install) a FRESH lock counts as held, and the
-    repair waits it out in real time: about 30 s per test (MEASURED here, 30.7 s
-    fresh against 0.6 s aged). No test in this file is about a fresh git lock."""
-    old = time.time() - 3600
-    for lock in (w.root / ".git").rglob("*.lock"):
-        os.utime(lock, (old, old))
-
-
 def _repaired(w, make) -> str:
     """A real repair of a killed switch with ``make``'s foreign path; its ts."""
     killed_tag_side(w, "Z3")
     _lock_aside(w, lambda: make(w))
-    _age_locks(w)
+    age_locks(w)
     r = w.repair()
     assert r.returncode == 0, r.stdout + r.stderr
     assert any(row["class"] == "foreign" for row in w.report()["paths"]), "control: none foreign"
@@ -546,7 +539,7 @@ def test_a_parent_this_report_restored_does_not_refuse_its_own_child(w, make, ch
         "sub",
         "sub/s1",
     ], "control: the report holds the parent and the child"
-    first, *rest = report["reapply"]  # the parent's step: parents first
+    first, *rest = reapply_steps(w)  # the parent's step: parents first
     subprocess.run(["bash", "-c", first], check=True, capture_output=True, env=w.env())
     r = _check(w, ts)
     parts = _parts(r)
@@ -780,3 +773,122 @@ def test_newer_reports_together_are_held_to_one_reports_caps(w):
     r = _check(w, ts)
     assert r.returncode == 1 and "other:newer-report-unreadable" in r.stdout, r.stdout
     assert first.name[: -len(SUFFIX)] in r.stdout or second.name[: -len(SUFFIX)] in r.stdout
+
+
+# ── #3492 B2a: the integrity record (SAVED.json) and --dismiss under the lock ──
+
+
+def test_an_old_report_without_the_integrity_record_is_judged_as_before(w):
+    """A report written before SAVED.json existed names none: --check judges it
+    exactly as one that does (the restore, B2b, refuses its node parts
+    `no-hash`; the check only reads)."""
+    ts = _repaired(w, _foreign_inside_dir)
+    with_record = _check(w, ts)
+    assert with_record.returncode == 0, with_record.stdout
+    _edit_report(w, lambda report: report.pop("integrity"))
+    (w.backups()[-1] / "SAVED.json").unlink()
+    old = _check(w, ts)
+    assert old.returncode == 0 and _parts(old) == _parts(with_record), old.stdout
+
+
+def _saved_path(w) -> Path:
+    return w.backups()[-1] / "SAVED.json"
+
+
+def _rewrite_saved(change):
+    def edit(w):
+        data = json.loads(_saved_path(w).read_text())
+        change(data)
+        _saved_path(w).write_text(json.dumps(data))
+
+    return edit
+
+
+def _saved_link(w):
+    real = w.backups()[-1] / "elsewhere.json"
+    _saved_path(w).rename(real)
+    os.symlink(real.name, _saved_path(w))
+
+
+def _saved_over_cap(w):
+    data = _saved_path(w).read_bytes()
+    _saved_path(w).write_bytes(data + b" " * (32 * 1024 * 1024))  # still valid JSON
+
+
+def _first_record(change):
+    def edit(data):
+        key = next(iter(data["files"]))
+        data["files"][key] = change(dict(data["files"][key]))
+
+    return edit
+
+
+_BAD_SAVED = {
+    "named-elsewhere": lambda w: _edit_report(w, lambda r: r.update(integrity="../x.json")),
+    "named-not-a-str": lambda w: _edit_report(w, lambda r: r.update(integrity=["SAVED.json"])),
+    "missing": lambda w: _saved_path(w).unlink(),
+    "symlink": _saved_link,
+    "over-the-cap": _saved_over_cap,
+    "not-json": lambda w: _saved_path(w).write_text("{"),
+    "not-an-object": lambda w: _saved_path(w).write_text("[]"),
+    "extra-key": _rewrite_saved(lambda d: d.update(more=1)),
+    "complete-not-bool": _rewrite_saved(lambda d: d.update(complete="yes")),
+    "key-outside-tree": _rewrite_saved(
+        lambda d: d["files"].update({"../x": d["files"].popitem()[1]})
+    ),
+    "key-with-dotdot": _rewrite_saved(
+        lambda d: d["files"].update({"tree/../x": d["files"].popitem()[1]})
+    ),
+    "bad-type": _rewrite_saved(_first_record(lambda r: {**r, "type": "socket"})),
+    "bad-mode": _rewrite_saved(_first_record(lambda r: {**r, "mode": "644"})),
+    "bad-sha256": _rewrite_saved(_first_record(lambda r: {**r, "sha256": "ab" * 31})),
+    "file-extra-field": _rewrite_saved(_first_record(lambda r: {**r, "target": "x"})),
+    "symlink-target-nul": _rewrite_saved(
+        _first_record(lambda r: {"type": "symlink", "target": "a\u0000b"})
+    ),
+    # Security review N1: more records than a check may look at (ENTRIES).
+    "more-records-than-entries": _rewrite_saved(
+        lambda d: d["files"].update(
+            {f"tree/n{i}": next(iter(d["files"].values())) for i in range(200_001)}
+        )
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_BAD_SAVED))
+def test_a_bad_integrity_record_is_a_bad_report(w, case):
+    """B1's validators shape-check the new fields: REPAIR.json's `integrity`
+    names exactly SAVED.json, opened as REPAIR.json is (no symlink, no FIFO,
+    at most SAVED_BYTES), holding {files, complete} and records of the three
+    kinds the writer writes. Anything else refuses the whole report."""
+    ts = _repaired(w, _foreign_inside_dir)
+    assert _check(w, ts).returncode == 0, "control: the real record is accepted"
+    _BAD_SAVED[case](w)
+    r = _check(w, ts)
+    assert r.returncode == 1 and "other:bad-report" in r.stdout, r.stdout
+    assert "SAVED.json" in r.stdout and _parts(r) == {}, r.stdout
+
+
+def test_dismiss_takes_update_lock_and_keeps_the_report_private(w):
+    """Review SF-7: --dismiss rewrites REPAIR.json, as the restore will; it
+    waits for update.lock (the short wait) and, still held, changes nothing.
+    Its rewrite is 0600 like the writer's."""
+    ts = _repaired(w, _foreign_edit)
+    path = w.backups()[-1] / "REPAIR.json"
+    before = path.read_bytes()
+    lock = w.gen / "locks" / "update.lock"
+    lock.parent.mkdir(exist_ok=True)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    dismiss = ["python3", "-I", "-S", str(MODULE), "--dismiss", ts, "--wait", "0",
+               str(w.state), str(w.root)]  # fmt: skip
+    try:
+        r = subprocess.run(dismiss, capture_output=True, text=True, env=w.env())
+        assert r.returncode == 1 and "update.lock" in r.stderr, r.stderr
+        assert path.read_bytes() == before, "dismissed while update.lock was held"
+    finally:
+        os.close(fd)
+    r = subprocess.run(dismiss, capture_output=True, text=True, env=w.env())
+    assert r.returncode == 0, r.stderr
+    assert json.loads(path.read_text())["dismissed_at"]
+    assert stat.S_IMODE(os.lstat(path).st_mode) == 0o600
