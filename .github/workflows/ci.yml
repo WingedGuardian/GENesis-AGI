@@ -581,6 +581,8 @@ jobs:
     # would pre-empt the per-test timeout and make it dead code. 180 leaves
     # ~139 min of growth headroom and still halves the default.
     # Revisit as the suite grows — the --durations output below is the data.
+    # Since 2026-11 the suite runs on four workers (see the pytest step), so
+    # the step takes about a third of the serial time and this limit has room.
     timeout-minutes: 180
     # fetch-depth: 0 because measurement tests derive a rate from this
     # repository's own commit history and SKIP on a shallow clone rather than
@@ -640,7 +642,18 @@ jobs:
           # settles it in the log instead of leaving the next reader to
           # re-derive it.
           echo "TERM=[${TERM-UNSET}]"
+          # Four workers, one per runner CPU (GitHub's public-repo standard
+          # runner: 4 CPU, 16 GB). MEASURED 2026-11-05 over 6 dispatch-only runs
+          # of this exact command: `Run tests` median 33.35 min against 117.0
+          # serial, the same 62,766 test ids, peak memory 7.8 GB.
+          # --dist=loadfile keeps each file's tests together and in order on
+          # one worker. --max-worker-restart=0: a crashed worker stops the run
+          # rather than being replaced over and over (a hang under the thread
+          # timeout kills its worker); scripts/ci/failure_summary.py names the
+          # crash and says the undispatched tests never ran. The `=` forms are
+          # what full_suite_guard.py reads.
           pytest -rfE --durations=25 \
+            -n 4 --dist=loadfile --max-worker-restart=0 \
             --ignore-glob='**/test_*az*.py' \
             --ignore-glob='**/test_*shim*.py' \
             --ignore=tests/test_ui/ \
