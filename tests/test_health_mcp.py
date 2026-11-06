@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from genesis.mcp import health_mcp
+from genesis.mcp.health import manifest as manifest_mod
 from genesis.mcp.health_mcp import (
     _impl_health_alerts,
     _impl_health_errors,
@@ -107,6 +108,14 @@ class TestHealthErrors:
 
 
 class TestHealthAlerts:
+    @pytest.fixture(autouse=True)
+    def _no_persisted_manifest(self, tmp_path, monkeypatch):
+        # health_alerts also reads the bootstrap manifest genesis-server persists
+        # (manifest._MANIFEST_FILE, bound to the real home at import). These tests
+        # judge only the service they build, so that file must not be whatever an
+        # earlier test or the live install left there.
+        monkeypatch.setattr(manifest_mod, "_MANIFEST_FILE", tmp_path / "absent.json")
+
     @pytest.mark.asyncio
     async def test_unavailable_without_service(self):
         result = await _impl_health_alerts()
