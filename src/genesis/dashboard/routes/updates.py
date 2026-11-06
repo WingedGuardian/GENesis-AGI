@@ -25,7 +25,7 @@ from genesis.dashboard.update_marker import (
     release_marker,
 )
 from genesis.db.connection import connect_sqlite_rw
-from genesis.env import genesis_home, update_in_progress
+from genesis.env import genesis_home, read_update_state, update_in_progress
 from genesis.observability.deploy_record import row_facts
 from genesis.util.systemd import literal_scope_args
 
@@ -1158,8 +1158,8 @@ def update_progress():
     state_data = None
     state_exists = _STATE_FILE.exists() or _STATE_FILE.is_symlink()
     if state_exists:
-        with contextlib.suppress(ValueError, OSError):
-            state_data = json.loads(_STATE_FILE.read_text())
+        with contextlib.suppress(ValueError, OSError, RecursionError):
+            state_data = json.loads(read_update_state(_STATE_FILE).decode("utf-8"))
         if isinstance(state_data, dict) and isinstance(state_data.get("phase"), str):
             phase = state_data["phase"]
     state_unreadable = state_exists and not isinstance(state_data, dict)
