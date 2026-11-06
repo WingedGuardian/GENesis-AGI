@@ -1724,6 +1724,30 @@ def test_saved_json_records_every_saved_copy(w, make):
         assert modes & {"0664", "0775"}, f"control: the planted modes: {modes}"
 
 
+@pytest.mark.parametrize("make", [_foreign_edit, _foreign_inside_dir])
+def test_a_saved_file_keeps_its_extended_attributes(w, make):
+    """The repair deletes the original after saving it, so the copy is the only
+    record: a foreign file's user.* extended attributes are copied with it, as
+    copy2 copied them before the hashing copier replaced it (#3973 review)."""
+    killed_tag_side(w, "Z3")
+    rel = make(w)
+    src = w.root / rel
+    files = [src] if src.is_file() else [p for p in src.rglob("*") if p.is_file()]
+    try:
+        for f in files:
+            os.setxattr(f, "user.genesis-test", f.name.encode())
+    except OSError as exc:  # tmpfs before 6.6, some overlay setups
+        pytest.skip(f"no user xattrs on this file system: {exc}")
+    age_locks(w)
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    tree = w.backups()[-1] / "tree"
+    copies = [tree / f.relative_to(w.root) for f in files]
+    assert copies and all(c.is_file() for c in copies), copies
+    for c in copies:
+        assert os.getxattr(c, "user.genesis-test") == c.name.encode(), c
+
+
 def test_a_file_over_the_hash_budget_is_recorded_without_a_hash(w, mod, monkeypatch):
     """B1's per-file budget (FILE_BYTES): a bigger saved file is recorded with
     sha256 null, which a restore then refuses (`too-large`), never guesses."""

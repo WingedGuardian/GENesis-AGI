@@ -222,6 +222,33 @@ class _Saved:
         return {"files": self.files, "complete": self.complete}
 
 
+#: What shutil.copy2 skips when copying extended attributes (shutil._copyxattr,
+#: Python 3.12): listing on a file system that has none, and setting one this
+#: user may not set or the target file system does not take.
+_XATTR_LIST_SKIP = frozenset({errno.ENOTSUP, errno.ENODATA, errno.EINVAL})
+_XATTR_SET_SKIP = _XATTR_LIST_SKIP | {errno.EPERM, errno.EACCES}
+
+
+def _copy_xattrs(src_fd: int, dst_fd: int) -> None:
+    """The extended attributes copy2 copied, from fd to fd. The repair deletes
+    the original, so what the copy lacks is gone; one this user may not set
+    (security.*, trusted.*) is skipped, as copy2 skips it."""
+    if not hasattr(os, "listxattr"):
+        return
+    try:
+        names = os.listxattr(src_fd)
+    except OSError as exc:
+        if exc.errno in _XATTR_LIST_SKIP:
+            return
+        raise
+    for name in names:
+        try:
+            os.setxattr(dst_fd, name, os.getxattr(src_fd, name))
+        except OSError as exc:
+            if exc.errno not in _XATTR_SET_SKIP:
+                raise
+
+
 def _copy_file(src: str, dst: str) -> dict:
     """Copy the regular file ``src`` to a new ``dst``, hashing the bytes as they
     are written (one read: a boot repair runs inside BOOT_BUDGET_S), from an fd
@@ -242,6 +269,7 @@ def _copy_file(src: str, dst: str) -> dict:
                 view = memoryview(chunk)
                 while view:
                     view = view[os.write(out, view) :]
+            _copy_xattrs(fd, out)
         finally:
             os.close(out)
     finally:
