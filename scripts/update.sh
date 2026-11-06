@@ -2071,7 +2071,7 @@ _retire_stale_index_lock() {
     local rc=0 out
     out="$(python3 -I -S "$SCRIPT_DIR/lib/stale_index_lock.py" "$GENESIS_ROOT" 2>&1)" || rc=$?
     case "$rc" in
-        0) ;;
+        0) case "$out" in *"left "*) echo "  $out" ;; esac ;;
         3)
             echo "  $out"
             if [ -f "$SCRIPT_DIR/lib/alert_queue.sh" ]; then

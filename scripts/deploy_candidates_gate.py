@@ -144,6 +144,9 @@ REFUSAL_FILES = (
     # engine loads for its own move refusal, and the dashboard loads (#3139).
     "scripts/lib/update_state_guard.py",
     "src/genesis/dashboard/routes/updates.py",
+    # The stale index.lock retirement both scripts run by path before they
+    # write the index (#3792).
+    "scripts/lib/stale_index_lock.py",
     # PR C's file: readiness reads it from the server's base, and it will hold
     # bootstrap's crash-recovery branch guard.
     PR_C_MARKER,

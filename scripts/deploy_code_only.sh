@@ -788,7 +788,7 @@ _pull() {
     _sil_rc=0
     _sil_out="$(python3 -I -S "$_SELF_DIR/lib/stale_index_lock.py" "$GENESIS_ROOT" 2>&1)" || _sil_rc=$?
     case "$_sil_rc" in
-        0) ;;
+        0) case "$_sil_out" in *"left "*) echo "  $_sil_out" ;; esac ;;
         3)
             echo "  $_sil_out"
             queue_alert warning deploy-code-only "code-only deploy: cleared a stale .git/index.lock" "$_sil_out"

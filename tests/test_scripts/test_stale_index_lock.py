@@ -109,9 +109,11 @@ def test_an_old_lock_a_process_holds_is_never_touched(repo, home):
     assert lock.exists()
 
 
-def _fake_git(tmp_path: Path, cwd: Path, *args: str, env: dict | None = None) -> subprocess.Popen:
-    """A process whose comm is ``git`` (a symlink to python), parked in ``cwd``."""
-    exe = tmp_path / "fakebin" / "git"
+def _fake_git(
+    tmp_path: Path, cwd: Path, *args: str, env: dict | None = None, name: str = "git"
+) -> subprocess.Popen:
+    """A process whose comm is ``name`` (a symlink to python), parked in ``cwd``."""
+    exe = tmp_path / "fakebin" / name
     exe.parent.mkdir(exist_ok=True)
     if not exe.exists():
         exe.symlink_to(sys.executable)
@@ -123,7 +125,7 @@ def _fake_git(tmp_path: Path, cwd: Path, *args: str, env: dict | None = None) ->
     deadline = time.time() + 10
     while time.time() < deadline:
         try:
-            if Path(f"/proc/{proc.pid}/comm").read_text().strip() == "git":
+            if Path(f"/proc/{proc.pid}/comm").read_text().strip() == name[:15]:
                 return proc
         except OSError:
             pass
@@ -300,3 +302,134 @@ def test_a_failed_save_leaves_no_partial_backup(repo, home, monkeypatch):
     assert rc == 1 and "could not save" in line
     assert lock.exists()
     assert not any((home / "deploy-backups").iterdir())
+
+
+def test_a_dashed_git_entry_point_in_the_checkout_counts(tmp_path, repo, home):
+    """``git-commit -a`` waiting on its editor is named git-commit, not git."""
+    lock = _lock(repo, age=OLD)
+    holder = _fake_git(tmp_path, repo, name="git-commit")
+    try:
+        rc, line = sil.heal(str(repo), str(home))
+    finally:
+        holder.kill()
+        holder.wait()
+    assert rc == 0 and "is working in" in line
+    assert lock.exists()
+
+
+def test_a_git_daemon_in_the_checkout_does_not_count(tmp_path, repo, home):
+    """A daemon never writes the index; its comm is cut to 15 characters."""
+    lock = _lock(repo, age=OLD)
+    holder = _fake_git(tmp_path, repo, name="git-credential-cache--daemon")
+    try:
+        rc, _line = sil.heal(str(repo), str(home))
+    finally:
+        holder.kill()
+        holder.wait()
+    assert rc == sil.RETIRED
+    assert not lock.exists()
+
+
+@pytest.mark.parametrize(
+    ("argv", "daemon"),
+    [
+        (["git", "daemon", "--base-path=/x"], True),
+        (["git", "fsmonitor--daemon", "run"], True),
+        (["git", "-C", "/x", "-c", "a=b", "--no-pager", "fsmonitor--daemon", "run"], True),
+        (["git", "-C", "/daemon", "commit"], False),
+        (["git", "--work-tree", "/srv/gitdaemon", "commit"], False),
+        (["git", "--git-dir", "/x", "fsmonitor--daemon", "run"], True),
+        (["/usr/local/bin/git-lfs-daemon"], False),
+        (["/usr/lib/git-core/git-credential-cache--daemon", "/s"], True),
+        (["git", "commit", "-a"], False),
+        (["git-commit", "-a"], False),
+        (["git"], False),
+    ],
+)
+def test_daemon_names(argv, daemon):
+    assert sil._is_daemon(argv) is daemon
+
+
+def _separate(tmp_path: Path, *, linked: bool = False) -> tuple[Path, Path]:
+    """A checkout whose .git is a file naming its git directory."""
+    gd = tmp_path / "gd"
+    gd.mkdir()
+    if linked:
+        (gd / "commondir").write_text("../..\n")
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    (wt / ".git").write_text(f"gitdir: {gd}\n")
+    return wt, gd
+
+
+def test_a_separate_git_dir_checkout_retires_the_lock_in_its_git_dir(tmp_path, home):
+    wt, gd = _separate(tmp_path)
+    lock = gd / "index.lock"
+    lock.write_bytes(b"")
+    t = time.time() - OLD
+    os.utime(lock, (t, t))
+    rc, line = sil.heal(str(wt), str(home))
+    assert rc == sil.RETIRED and str(lock) in line
+    assert not lock.exists()
+
+
+def test_a_git_in_a_separate_git_dir_checkout_counts(tmp_path, home):
+    wt, gd = _separate(tmp_path)
+    lock = gd / "index.lock"
+    lock.write_bytes(b"")
+    t = time.time() - OLD
+    os.utime(lock, (t, t))
+    holder = _fake_git(tmp_path, wt)
+    try:
+        rc, line = sil.heal(str(wt), str(home))
+    finally:
+        holder.kill()
+        holder.wait()
+    assert rc == 0 and "is working in" in line
+    assert lock.exists()
+
+
+def test_a_git_dir_holding_commondir_is_a_linked_worktree(tmp_path, home):
+    wt, gd = _separate(tmp_path, linked=True)
+    lock = gd / "index.lock"
+    lock.write_bytes(b"")
+    rc, line = sil.heal(str(wt), str(home))
+    assert rc == 0 and "skipped" in line
+    assert lock.exists()
+
+
+def test_a_copy_that_cannot_be_synced_keeps_the_lock(repo, home, monkeypatch):
+    lock = _lock(repo, age=OLD)
+    real = os.fsync
+
+    def fsync(fd):
+        if os.readlink(f"/proc/self/fd/{fd}").endswith("index.lock"):
+            raise OSError("EIO")
+        return real(fd)
+
+    monkeypatch.setattr(sil.os, "fsync", fsync)
+    rc, line = sil.heal(str(repo), str(home))
+    assert rc == 1 and "could not save" in line
+    assert lock.exists()
+    assert not any((home / "deploy-backups").iterdir())
+
+
+def test_a_zombie_git_does_not_block_the_heal(tmp_path, repo, home):
+    """A killed git its parent never reaped is a zombie: it holds nothing."""
+    lock = _lock(repo, age=OLD)
+    zombie = _fake_git(tmp_path, repo)
+    zombie.kill()
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        stat = Path(f"/proc/{zombie.pid}/stat").read_text()
+        if stat.rsplit(") ", 1)[-1][:1] == "Z":
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("never became a zombie")
+    try:
+        rc, _line = sil.heal(str(repo), str(home))
+    finally:
+        zombie.wait()
+    assert rc == sil.RETIRED
+    assert not lock.exists()
