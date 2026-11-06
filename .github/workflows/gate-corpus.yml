@@ -3,7 +3,8 @@ name: gate-corpus
 # Break the merge gate on purpose and report which rung of its tests notices. An
 # escape is a finding and exits 0. The job goes red only when the run could not be
 # trusted: a red baseline, an anchor that stopped matching, a timeout. On main, an
-# ESCAPED case or a rung that caught nothing means a test is owed, filed as an issue.
+# ESCAPED case, an off-aim catch or a rung that caught nothing means a test is owed,
+# and the second job opens or updates one issue for it.
 #
 # Weekly, and on changes to the corpus or the harness. See `gate-corpus-anchors.yml`
 # for why PRs to the gate itself do not run this.
@@ -24,7 +25,8 @@ permissions:
 
 concurrency:
   group: gate-corpus-${{ github.head_ref || github.ref }}
-  cancel-in-progress: true
+  # Not on main: a later push must not cancel a run before it files what it found.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   report:
@@ -45,4 +47,42 @@ jobs:
           pip install -e ".[test,transcript-analytics]" -c .github/test-tools/requirements.txt
       - name: Rung report
         # exec and --timeout: the same reasons as the `mutation-gate` job in ci.yml.
-        run: exec python scripts/ci/mutation_sweep.py config/gate_defects.json --repo . --rung-report --timeout 1500
+        run: exec python scripts/ci/mutation_sweep.py config/gate_defects.json --repo . --rung-report --timeout 1500 --findings-file findings.json
+      # Even when the step above went red: one aborted case must not hide the other
+      # cases' findings. The file says whether the run finished.
+      - name: Keep the findings for the issue job
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: gate-corpus-findings
+          path: findings.json
+          if-no-files-found: warn
+
+  # An escape exits 0 and notifies nobody, so on main it opens or updates one issue.
+  # Its own job, because only this step needs to write, and the report job runs the
+  # test suite. It runs after a red report too: findings leave out any case a rung
+  # aborted on, and a run that did not finish writes none.
+  file-issue:
+    needs: report
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    # Far above the few calls this makes: only a wedged runner reaches it.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Fetch the findings
+        uses: actions/download-artifact@v8
+        with:
+          name: gate-corpus-findings
+      - name: Open or update the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/ci/gate_corpus_issue.py findings.json
