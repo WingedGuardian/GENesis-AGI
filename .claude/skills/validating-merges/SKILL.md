@@ -283,17 +283,17 @@ not run, a probe skipped for cost) as a `method` gap and close. Record it as a
 scan of the 158 gaps on its 85 gap-carrying closed rows flagged 20 as test files
 or probes that were skipped, not hand-checked one by one.
 
-**A closed row never comes back, so a gap that waits on an event needs its own
-recheck.** "The code is right, but the event it handles has not happened yet"
+**A closed row keeps event-gated rechecks.** "The code is right, but the event
+it handles has not happened yet"
 (the first revert, an engine old enough to prune, a skipped backup directory)
-is a real gap that production will eventually test, and nothing reads a closed
-row's gaps again. Apply the actor-and-resource test above first. An event that
+is a real gap that production will eventually test. Apply the actor-and-resource
+test above first. An event that
 can be named and will happen in ordinary running ("after the next deploy", "on
-11-03", "on the first REVERT_CODE") is reachable later. Route it as local state:
-a `follow_up_create` row naming the trigger and the one read-only command that
-re-measures it. A repo defect still gets an issue. An event that may never occur
-is the cannot-verify case above and is not filed. The follow-up is the only
-reminder: nothing in this skill's backlog reader shows it yet.
+11-03", "on the first REVERT_CODE") is reachable later. Record a typed
+`event_gated` gap naming its trigger and one read-only `recheck` command.
+Closing stores it on the same row, and **Rechecks due** surfaces it for later
+measurement without reopening the row. A repo defect still gets an issue. An
+event that may never occur is the cannot-verify case above and is not filed.
 
 A security defect is the one thing never filed publicly before it is fixed —
 private record plus a local row, whoever owns it.
