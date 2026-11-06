@@ -61,26 +61,27 @@ in the overlay. Adapter argv placeholders: `{python}` `{root}` `{server}` `{url}
 `{stage}`. These names and the adapter contract are provisional: the shared
 service and the adapter own them and set their own where they differ.
 
-The stdlib reader is `genesis.mcp.shared_config.load_config`; the rollout helper
-re-exports it and its configuration error. The merge stays shallow: an overlay's
-server key replaces that key, including a complete nested `service` object.
-JSON is read as UTF-8 even under an ASCII process locale. Direct script execution
-works with `python -I -S` and imports no MCP/provider or runtime modules. A reader
-import failure during `launch` uses the ordinary argument parser and execs the
-supplied stdio command; `units`, `status` and importing callers still fail.
+The configuration reader remains inside the self-contained stdlib CLI,
+`scripts/lib/mcp_rollout.py`. Extraction into `src/` waits for the first actual
+runtime consumer. Overlay merges stay shallow: a server key replaces that key,
+including a complete nested `service` object. JSON is read as UTF-8 even under
+an ASCII process locale. Direct execution works with `python -I -S` and imports
+no Genesis, MCP, or provider modules. A truthy non-object `servers` value reports
+a configuration error; legacy falsy values still mean no server overrides.
 
-The deploy helper captures both reader and CLI source when it is sourced. A
-nonempty snapshot stays fixed even if the checkout changes or executing that
-snapshot fails. If startup capture was missing or empty, the restart invocation
-can capture both sources from its supplied synchronized checkout. Each deploy
-path calls this helper once. Captured code must explicitly run the CLI entry
-point and return an integer exit status: incomplete source cannot silently
-report that no units need checking. A capture/configuration failure returns
-nonzero before any shared-unit action.
+The deploy helper captures the complete CLI source when sourced, then compiles
+it in its own namespace and invokes its real entry point from a fixed bootstrap.
+Future imports remain legal and CLI names cannot overwrite bootstrap dispatch.
+A nonempty snapshot stays fixed through source replacement or removal, including
+when executing the snapshot fails. If startup capture was missing or empty, the
+restart invocation can capture the CLI from its supplied synchronized checkout.
+The code-only deploy sources this helper before synchronization; the full update
+sources it after pulling. Each path invokes it once. Missing entry points,
+non-integer exit status, and capture/configuration failures return nonzero before
+shared-unit actions. Systemd failures retain their existing per-unit reporting.
 
-The existing package floors remain FastMCP 4.1.4 and MCP 2.3.0. A dependency
-range does not qualify every later release or activate shared routing. No
-shared-service launcher or service unit is added by the reader extraction.
+Package floors remain FastMCP 4.1.4 and MCP 2.3.0. A dependency range does not
+qualify every later release. No service is activated or routing stage advanced.
 
 A session decides once, when Claude Code spawns its MCP servers. Changing the stage
 affects new sessions; running ones keep the command they started with.

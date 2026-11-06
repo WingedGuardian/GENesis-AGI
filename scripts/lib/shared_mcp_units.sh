@@ -20,42 +20,46 @@
 # The helper's code is read when this file is sourced, like the deploy scripts'
 # other helpers: a merge that replaces it mid-run cannot change this run.
 
-# Capture the reader too: importing it later could mix pre/post-merge code.
-# Concatenation is only of these two owned stdlib sources, never config data.
+# Capture the self-contained CLI. Its namespace stays separate from this fixed
+# bootstrap, so future imports and CLI names cannot change bootstrap dispatch.
 _genesis_capture_shared_mcp_source() {
-    local root="$1" _shared_mcp_reader _shared_mcp_cli
-    _shared_mcp_reader="$(cat "$root/src/genesis/mcp/shared_config.py" 2>/dev/null)" &&
-        _shared_mcp_cli="$(cat "$root/scripts/lib/mcp_rollout.py" 2>/dev/null)" &&
-        [ -n "$_shared_mcp_reader" ] && [ -n "$_shared_mcp_cli" ] &&
-        printf '%s\n_GENESIS_MCP_CONFIG_SNAPSHOT = True\n__name__ = "_genesis_mcp_snapshot"\n%s\n' "$_shared_mcp_reader" "$_shared_mcp_cli" &&
-        cat <<'PY'
-try:
-    _shared_mcp_status = main()
-    if type(_shared_mcp_status) is not int:
-        raise RuntimeError("captured rollout main did not return an exit status")
-except RolloutError as exc:
-    _say(str(exc))
-    raise SystemExit(1)
-raise SystemExit(_shared_mcp_status)
-PY
+    local root="$1" _shared_mcp_cli
+    _shared_mcp_cli="$(cat "$root/scripts/lib/mcp_rollout.py" 2>/dev/null)" &&
+        [ -n "$_shared_mcp_cli" ] && printf '%s\n' "$_shared_mcp_cli"
 }
 _SHARED_MCP_ROLLOUT_PY="$(_genesis_capture_shared_mcp_source "$(dirname -- "${BASH_SOURCE[0]}")/../..")" || _SHARED_MCP_ROLLOUT_PY=""
-_SHARED_MCP_CAPTURE_RECOVERY_ATTEMPTED=0
+_SHARED_MCP_BOOTSTRAP_PY="$(cat <<'PY'
+import sys
+
+scope = {"__name__": "_captured_mcp_rollout", "__file__": sys.argv[2] + "/scripts/lib/mcp_rollout.py"}
+exec(compile(sys.argv[1], "<captured mcp_rollout.py>", "exec"), scope)
+main, error_type, say = (scope.get(name) for name in ("main", "RolloutError", "_say"))
+if not (callable(main) and isinstance(error_type, type) and issubclass(error_type, Exception) and callable(say)):
+    raise RuntimeError("captured rollout lacks its required entry points")
+try:
+    status = main(["units", "--root", sys.argv[2]])
+except error_type as exc:
+    say(str(exc))
+    raise SystemExit(1)
+if type(status) is not int:
+    raise RuntimeError("captured rollout main did not return an exit status")
+raise SystemExit(status)
+PY
+)"
 
 genesis_restart_shared_mcp_units() {
     local root="$1" units unit state load enabled active inv_before inv_after rrc rc=0
-    if [ -z "$_SHARED_MCP_ROLLOUT_PY" ] && [ "$_SHARED_MCP_CAPTURE_RECOVERY_ATTEMPTED" -eq 0 ]; then
+    if [ -z "$_SHARED_MCP_ROLLOUT_PY" ]; then
         # An absent startup source may arrive with the synchronized checkout.
         # Never replace a nonempty snapshot, even if executing it later fails.
-        _SHARED_MCP_CAPTURE_RECOVERY_ATTEMPTED=1
         _SHARED_MCP_ROLLOUT_PY="$(_genesis_capture_shared_mcp_source "$root")" || _SHARED_MCP_ROLLOUT_PY=""
     fi
     if [ -z "$_SHARED_MCP_ROLLOUT_PY" ]; then
-        echo "  NOTE: shared MCP reader/CLI source capture is missing or empty; shared MCP units were not checked."
+        echo "  NOTE: shared MCP CLI source capture is missing or empty; shared MCP units were not checked."
         return 1
     fi
     # stderr stays apart: on success stdout is the unit list and nothing else.
-    if ! units="$(python3 -I -S -c "$_SHARED_MCP_ROLLOUT_PY" units --root "$root")"; then
+    if ! units="$(python3 -I -S -c "$_SHARED_MCP_BOOTSTRAP_PY" "$_SHARED_MCP_ROLLOUT_PY" "$root")"; then
         echo "  WARNING: cannot read the shared MCP configuration (mcp_shared.json, reason above); no shared MCP unit was restarted."
         return 1
     fi

@@ -1,4 +1,4 @@
-"""One stdlib configuration reader for script, captured deploy and service callers."""
+"""Self-contained stdlib configuration and captured rollout CLI behavior."""
 
 import importlib.util
 import json
@@ -12,7 +12,6 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 SCRIPT = REPO / "scripts/lib/mcp_rollout.py"
-READER = REPO / "src/genesis/mcp/shared_config.py"
 LIB = REPO / "scripts/lib/shared_mcp_units.sh"
 
 
@@ -23,17 +22,8 @@ def rollout_module():
     return module
 
 
-def test_rollout_reexports_the_same_reader_and_error():
-    from genesis.mcp import shared_config
-
-    rollout = rollout_module()
-    assert rollout.load_config is shared_config.load_config
-    assert rollout.overlay_path is shared_config.overlay_path
-    assert rollout.RolloutError is shared_config.SharedConfigError
-
-
 def test_loader_preserves_per_key_not_recursive_overlay_merge(tmp_path):
-    from genesis.mcp.shared_config import load_config
+    load_config = rollout_module().load_config
 
     root, home = tmp_path / "checkout", tmp_path / "home"
     for path in (root, home):
@@ -54,22 +44,20 @@ def test_loader_preserves_per_key_not_recursive_overlay_merge(tmp_path):
     }
 
 
-@pytest.mark.parametrize("layer,error", [
-    ("[]", None), ("{broken", None),
-    ('{"servers":{"memory":false}}', None),
-    ('{"servers":[1]}', AttributeError),
+@pytest.mark.parametrize("layer", [
+    "[]", "{broken", '{"servers":{"memory":false}}', '{"servers":[1]}',
 ])
-def test_loader_retains_existing_invalid_layer_behavior(tmp_path, layer, error):
-    from genesis.mcp.shared_config import SharedConfigError, load_config
-
+def test_invalid_layers_report_config_errors(tmp_path, layer):
+    rollout = rollout_module()
     (tmp_path / "config").mkdir()
     (tmp_path / "config/mcp_shared.json").write_text(layer)
-    with pytest.raises(error or SharedConfigError):
-        load_config(tmp_path, {"GENESIS_HOME": str(tmp_path / "missing")})
+    with pytest.raises(rollout.RolloutError):
+        rollout.load_config(tmp_path, {"GENESIS_HOME": str(tmp_path / "missing")})
 
 
 def test_absent_files_and_home_resolution(tmp_path, monkeypatch):
-    from genesis.mcp.shared_config import SharedConfigError, load_config, overlay_path
+    rollout = rollout_module()
+    load_config, overlay_path = rollout.load_config, rollout.overlay_path
 
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     assert overlay_path({}) == tmp_path / ".genesis/config/mcp_shared.json"
@@ -77,7 +65,7 @@ def test_absent_files_and_home_resolution(tmp_path, monkeypatch):
     assert load_config(tmp_path, {"GENESIS_HOME": str(tmp_path / "missing")}) == {
         "stage": "off", "adapter": {"argv": []}, "servers": {},
     }
-    with pytest.raises(SharedConfigError):
+    with pytest.raises(rollout.RolloutError):
         overlay_path({"GENESIS_HOME": "relative"})
 
 
@@ -86,53 +74,53 @@ def test_script_import_with_isolated_no_site_uses_only_stdlib(tmp_path):
 import runpy, sys
 scope = runpy.run_path(sys.argv[1], run_name='fixture_import')
 assert scope['load_config'](sys.argv[2], {'GENESIS_HOME': sys.argv[2]})['stage'] == 'off'
-assert 'genesis.mcp.shared_config' in sys.modules
-assert not any(name.startswith(('fastmcp', 'mcp', 'genesis.memory', 'genesis.runtime')) for name in sys.modules)
+assert not any(name == 'genesis' or name.startswith(('genesis.', 'fastmcp', 'mcp')) for name in sys.modules)
 """
     result = subprocess.run([sys.executable, "-I", "-S", "-c", code, str(SCRIPT), str(tmp_path)],
                             capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
 
 
-def test_deploy_snapshot_keeps_reader_and_cli_after_files_change(tmp_path):
+@pytest.mark.parametrize("replacement", ["replace", "delete"])
+def test_deploy_snapshot_keeps_cli_after_file_changes(tmp_path, replacement):
     root = tmp_path / "checkout"
-    reader = root / "src/genesis/mcp/shared_config.py"
-    reader.parent.mkdir(parents=True)
     lib = root / "scripts/lib/shared_mcp_units.sh"
     lib.parent.mkdir(parents=True)
-    shutil.copy(READER, reader)
-    shutil.copy(SCRIPT, lib.with_name("mcp_rollout.py"))
+    cli = lib.with_name("mcp_rollout.py")
+    shutil.copy(SCRIPT, cli)
     shutil.copy(LIB, lib)
-    result = subprocess.run(["bash", "-c", '. "$1"; printf "%s" "$_SHARED_MCP_ROLLOUT_PY"',
-                             "fixture", str(lib)], capture_output=True, text=True, timeout=10)
-    assert result.returncode == 0, result.stderr
-    captured = result.stdout
-    reader.write_text("raise RuntimeError('new reader must not run')\n")
-    lib.with_name("mcp_rollout.py").write_text("raise RuntimeError('new CLI must not run')\n")
     (root / "config").mkdir()
     (root / "config/mcp_shared.json").write_text(json.dumps({
         "servers": {"memory": {"unit": "genesis-mcp-fixture.service"}},
     }))
-    result = subprocess.run([sys.executable, "-I", "-S", "-c", captured, "units", "--root", str(root)],
-        env={**os.environ, "GENESIS_HOME": str(tmp_path / "private-home")},
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    calls = tmp_path / "unit-calls"
+    shim = binary / "systemctl"
+    shim.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$FIXTURE_CALLS"\nprintf "LoadState=not-found\\n"\n')
+    shim.chmod(0o755)
+    result = subprocess.run(["bash", "-c", '''
+. "$1"
+if [ "$4" = delete ]; then unlink "$2"; else printf '%s\\n' "$5" > "$2"; fi
+genesis_restart_shared_mcp_units "$3"
+''', "fixture", str(lib), str(cli), str(root), replacement,
+        "raise RuntimeError('new CLI must not run')"],
+        env={**os.environ, "GENESIS_HOME": str(tmp_path / "private-home"),
+             "PATH": str(binary) + os.pathsep + os.environ["PATH"], "FIXTURE_CALLS": str(calls)},
         capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["genesis-mcp-fixture.service"]
+    assert calls.read_text().splitlines()[-1].endswith("genesis-mcp-fixture.service")
 
 
-@pytest.mark.parametrize("component", ["reader", "cli"])
 @pytest.mark.parametrize("state", ["missing", "empty", "invalid", "blank", "comments", "truncated"])
-def test_deploy_refuses_incomplete_source_capture(tmp_path, component, state):
+def test_deploy_refuses_incomplete_source_capture(tmp_path, state):
     root = tmp_path / "checkout"
-    reader = root / "src/genesis/mcp/shared_config.py"
-    reader.parent.mkdir(parents=True)
     lib = root / "scripts/lib/shared_mcp_units.sh"
     lib.parent.mkdir(parents=True)
     cli = lib.with_name("mcp_rollout.py")
-    shutil.copy(READER, reader)
     shutil.copy(SCRIPT, cli)
     shutil.copy(LIB, lib)
-    damaged = reader if component == "reader" else cli
+    damaged = cli
     if state == "missing":
         damaged.unlink()
     else:

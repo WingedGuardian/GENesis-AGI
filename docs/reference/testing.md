@@ -1,16 +1,15 @@
 # Testing Guide
 
-The shared MCP configuration reader is exercised with real `python -I -S`
-subprocesses and captured deploy source in
-`tests/test_mcp/test_shared_config.py` and
-`tests/test_mcp/test_shared_config_failures.py`. Run them with
-`tests/test_scripts/test_mcp_rollout.py`,
-`tests/test_scripts/test_shared_mcp_units.py` and
-`tests/test_scripts/test_deploy_code_only_modes.py` to cover the reader's script,
-deploy and import consumers. Their systemd calls use fixture shims. Failure
-coverage includes incomplete captured source, exact stdio argv on import
-failure, an actual ASCII-locale subprocess, post-sync source arrival and the
-candidate gate's pure path classifier; it never runs the candidate operator.
+The standalone rollout CLI and captured deploy source are exercised with real
+`python -I -S` subprocesses in `tests/test_scripts/test_mcp_rollout_config.py`,
+`test_mcp_rollout_failures.py`, and `test_mcp_rollout_repair.py`. Run them with
+`tests/test_scripts/test_mcp_rollout.py`, `test_shared_mcp_units.py`, and
+`test_deploy_code_only_modes.py` (all under `tests/test_scripts/`). Systemd
+calls use fixture shims. Coverage includes missing/incomplete captured source,
+future imports and namespace isolation, source replacement, exact launch argv,
+UTF-8 under an ASCII locale when available, post-sync CLI arrival, and the
+candidate gate's pure classifier. It never executes the candidate operator.
+No unused `src/` configuration reader is installed by this change.
 
 ## Running Tests
 

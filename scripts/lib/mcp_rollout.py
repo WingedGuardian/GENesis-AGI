@@ -35,7 +35,7 @@ from typing import NamedTuple
 
 
 def _parse_args(argv=None):
-    """One command contract for normal dispatch and reader-import recovery."""
+    """One argument contract for launch and inspection commands."""
     parser = argparse.ArgumentParser(prog="mcp_rollout")
     sub = parser.add_subparsers(dest="cmd", required=True)
     for name in ("launch", "units", "status"):
@@ -50,32 +50,51 @@ def _parse_args(argv=None):
     return args, rest
 
 
-# The deploy helper captures this file AND the stdlib reader before a merge.
-# Its private prefix already defines these names; ordinary script/import callers
-# load the same module from this checkout, including under python -I -S.
-if not globals().get("_GENESIS_MCP_CONFIG_SNAPSHOT", False):
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
-    try:
-        from genesis.mcp.shared_config import (
-            CONFIG_NAME,
-            SharedConfigError,
-            load_config,
-        )
-        from genesis.mcp.shared_config import (
-            overlay_path as overlay_path,
-        )
-    except Exception as exc:
-        # Only a direct launch owns a supplied stdio fallback. Other commands
-        # and ordinary importing callers must still fail on a broken reader.
-        if __name__ != "__main__":
-            raise
-        args, stdio = _parse_args()
-        if args.cmd != "launch":
-            raise
-        print(f"genesis mcp rollout: {exc}; launching the per-session server", file=sys.stderr)
-        os.execv(stdio[0], stdio)  # noqa: S606 - the launcher's original stdio argv
+CONFIG_NAME = "mcp_shared.json"
 
-RolloutError = SharedConfigError
+
+class RolloutError(Exception):
+    """The shared-MCP configuration cannot be read as written."""
+
+
+def overlay_path(env):
+    home = env.get("GENESIS_HOME") or str(Path(env.get("HOME") or Path.home()) / ".genesis")
+    path = Path(home).expanduser()
+    if not path.is_absolute():
+        raise RolloutError(f"GENESIS_HOME must be an absolute path (got {home!r})")
+    return path / "config" / CONFIG_NAME
+
+
+def _read(path):
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise RolloutError(f"cannot read {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RolloutError(f"{path}: expected a JSON object")
+    return data
+
+
+def load_config(root, env):
+    """Tracked defaults plus the install overlay, merged shallowly per key."""
+    config = {"stage": "off", "adapter": {"argv": []}, "servers": {}}
+    for layer in (_read(Path(root) / "config" / CONFIG_NAME), _read(overlay_path(env))):
+        if not layer:
+            continue
+        if "stage" in layer:
+            config["stage"] = layer["stage"]
+        if isinstance(layer.get("adapter"), dict):
+            config["adapter"] = {**config["adapter"], **layer["adapter"]}
+        servers = layer.get("servers") or {}
+        if not isinstance(servers, dict):
+            raise RolloutError("servers: expected a JSON object")
+        for name, spec in servers.items():
+            if not isinstance(spec, dict):
+                raise RolloutError(f"servers.{name}: expected an object")
+            config["servers"][name] = {**config["servers"].get(name, {}), **spec}
+    return config
 
 STAGES = ("off", "memory-floor", "health-reads", "writes")
 STAGE_SERVERS = {
