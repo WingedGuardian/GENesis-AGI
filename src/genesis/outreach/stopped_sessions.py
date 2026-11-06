@@ -16,8 +16,10 @@ that give up (``needs_user``) and, in ``propose_only``, the ones ready to run.
 Parks left waiting while the owner has switched auto-resume ``off`` are not
 paged here (a deviation from the plan's count line, owner may override):
 repeating that line every hour would need state to throttle it, for a
-condition the owner chose. A count of ``unreported`` sessions (clean exits with
-no verdict) arrives with the self-report PR, when that number means something.
+condition the owner chose. A page that goes out also counts the background
+sessions of the past hour that ended cleanly without reporting a status
+(``unreported``, see ``cc.final_status``): it measures how often the self-report
+is missing, and never sends a page on its own.
 
 Kill switch: ``GENESIS_STOPPED_SESSION_PAGES=off`` (the reader then sends
 nothing and stamps nothing, so stops page once it is turned back on, within the
@@ -66,7 +68,9 @@ def _preview(text: str | None) -> str:
     return text[:_REASON_PREVIEW].rstrip() + " … (full reason on the session row)"
 
 
-def format_page(stops: list[dict], *, total: int) -> tuple[str, list[str]] | None:
+def format_page(
+    stops: list[dict], *, total: int, unreported: int = 0
+) -> tuple[str, list[str]] | None:
     """The page text and the ids it actually lists, or None when there is nothing.
 
     Lines are added only while the page stays under ``PAGE_BUDGET``: the
@@ -93,6 +97,12 @@ def format_page(stops: list[dict], *, total: int) -> tuple[str, list[str]] | Non
         listed.append(row["id"])
     if total > len(listed):
         lines.append(f"• … and {total - len(listed)} more, listed in the next hourly page")
+    if unreported:
+        noun = "session" if unreported == 1 else "sessions"
+        lines += [
+            "",
+            f"{unreported} other background {noun} in the last hour ended without reporting a status.",
+        ]
     return "\n".join(lines), listed
 
 
@@ -104,7 +114,12 @@ async def run_page(db, pipeline, *, now: datetime | None = None) -> int:
     stops, total = await cc_sessions.list_unpaged_stops(
         db, since=(now - LOOKBACK).isoformat(), until=(now - GRACE).isoformat(), limit=MAX_LISTED
     )
-    page = format_page(stops, total=total)
+    if not stops:
+        return 0
+    unreported = await cc_sessions.count_unreported(
+        db, since=(now - GRACE - timedelta(hours=1)).isoformat(), until=(now - GRACE).isoformat()
+    )
+    page = format_page(stops, total=total, unreported=unreported)
     if page is None:
         return 0
     text, ids = page

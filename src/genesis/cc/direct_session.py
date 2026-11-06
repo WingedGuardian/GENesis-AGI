@@ -31,7 +31,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from genesis.cc import rate_limit_park, roster
+from genesis.cc import final_status, rate_limit_park, roster
 from genesis.cc.exceptions import CCQuotaExhaustedError, CCRateLimitError
 from genesis.cc.session_config import _USER_SCOPED_MCP_WILDCARDS
 from genesis.cc.types import (
@@ -918,6 +918,13 @@ class DirectSessionRequest:
             )
 
 
+def _is_stop(result: DirectSessionResult) -> bool:
+    """A run recorded as a stop (crud.cc_sessions.STOP_OUTCOMES), clean exit or not."""
+    from genesis.db.crud.cc_sessions import STOP_OUTCOMES
+
+    return result.outcome in STOP_OUTCOMES
+
+
 def pages_immediately(request: DirectSessionRequest) -> bool:
     """Whether a failure of this session pages the owner at once.
 
@@ -956,6 +963,11 @@ class DirectSessionResult:
     roster_model: str = ""  # roster NAME the chokepoint selected (peer name or "claude")
     stream_lines_dropped: int = 0
     partial: bool = False
+    # How the run was recorded on its cc_sessions row (crud.cc_sessions.OUTCOMES).
+    # A clean exit can still be a stop (partial, or self-reported blocked or
+    # failed), so the messages below read this, not ``success``.
+    outcome: str | None = None
+    outcome_reason: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -1328,6 +1340,17 @@ class DirectSessionRunner:
 
     @staticmethod
     def _result(session_id, output: CCOutput, telemetry, elapsed) -> DirectSessionResult:
+        # A truncated run, or one with no result event, did not finish even
+        # though it exited cleanly. Otherwise a clean exit is judged by the
+        # session's own report (cc/final_status.py); an error stays a failure.
+        partial = output.bg_truncated or not output.result_received
+        outcome = reason = None
+        if partial:
+            outcome = "partial"
+            reason = "bg_truncated" if output.bg_truncated else "no_result_event"
+        elif not output.is_error:
+            outcome, reason = final_status.outcome_of(output.final_status)
+            outcome = outcome or "unreported"
         return DirectSessionResult(
             session_id=session_id,
             cc_session_id=output.session_id,
@@ -1344,7 +1367,9 @@ class DirectSessionRunner:
             model_used=output.model_used,
             roster_model=output.roster_model,
             stream_lines_dropped=output.stream_lines_dropped,
-            partial=output.bg_truncated or not output.result_received,
+            partial=partial,
+            outcome=outcome,
+            outcome_reason=reason,
         )
 
     async def _run_session(
@@ -1475,23 +1500,29 @@ class DirectSessionRunner:
             # A truncated run, or one with no result event, did not finish, even
             # though it exited cleanly: record it as such (managed runs already
             # fail on the same condition, managed_session.py).
+            # Otherwise the session's own report decides (see _result).
             await self._session_manager.complete(
                 session_id,
                 cost_usd=output.cost_usd,
                 input_tokens=output.input_tokens,
                 output_tokens=output.output_tokens,
-                outcome="partial" if result.partial else None,
-                outcome_reason=(
-                    ("bg_truncated" if output.bg_truncated else "no_result_event")
-                    if result.partial
-                    else None
-                ),
+                outcome=result.outcome,
+                outcome_reason=result.outcome_reason,
             )
 
             # RESULT-mode: deliver the finished outcome back to the origin
             # conversation. Best-effort (own try/except) — never fails the run.
             if request.delivery_mode == DeliveryMode.RESULT:
                 await self._deliver_result_to_origin(request, result)
+            elif request.notify and pages_immediately(request) and _is_stop(result):
+                # A clean exit that stopped short pages like a failure would.
+                try:
+                    sent = await self._notify(request, result, success=False)
+                    await self._mark_paged(session_id, sent)
+                except Exception:
+                    logger.error(
+                        "Failed to send stop notification for %s", session_id[:8], exc_info=True
+                    )
 
             # If this session was a rate-limit resume, close its park now that the
             # result is delivered (no-op unless caller_context carries a park id).
@@ -1743,7 +1774,11 @@ class DirectSessionRunner:
             # empty files are hard failures; size/content misses are advisories
             # that KEEP the proposal executed — a real deliverable was produced,
             # and a string/size miss is a failure of the proxy, not the work.
-            if result.success:
+            # A clean exit that stopped short (partial, or a self-reported
+            # blocked/failed) did not do the job: it must not enter the
+            # track record as a success.
+            succeeded = result.success and not _is_stop(result)
+            if succeeded:
                 vres = await self._verify_proposal_outputs(db, proposal_id)
                 if vres is not None and vres.missing_files:
                     # Deliverable not produced → hard fail + observation.
@@ -1784,6 +1819,9 @@ class DirectSessionRunner:
                     advisories = list(vres.advisories)
 
             base = result.output_text or result.error or ""
+            if result.success and not succeeded:
+                why = f": {result.outcome_reason}" if result.outcome_reason else ""
+                base = f"[stopped: {result.outcome}{why}] {base}"
             if advisories:
                 # Informational only — never changes the |completed: polarity
                 # the feedback harvester reads from this suffix. Budget the note
@@ -1796,7 +1834,7 @@ class DirectSessionRunner:
             await update_proposal_outcome(
                 db,
                 proposal_id,
-                success=result.success,
+                success=succeeded,
                 summary=summary,
             )
             # Record the dispatch outcome (BOTH polarities) as a retrievable
@@ -1820,7 +1858,7 @@ class DirectSessionRunner:
                     except Exception:
                         logger.debug("Failed to fetch proposal subject", exc_info=True)
                     _subj_tag = f" ({_subj})" if _subj else ""
-                    if result.success:
+                    if succeeded:
                         content = (
                             f"Ego dispatch SUCCEEDED for proposal "
                             f"{proposal_id}{_subj_tag}: {summary}"
@@ -1904,7 +1942,12 @@ class DirectSessionRunner:
             if tm is None:
                 return
 
-            status = "✓ Completed" if result.success else "✗ Failed"
+            if not result.success:
+                status = "✗ Failed"
+            elif _is_stop(result):
+                status = f"⚠ {result.outcome.capitalize()}"
+            else:
+                status = "✓ Completed"
             outcome = (result.output_text or result.error or "no output")[:400]
             outcome_escaped = html_mod.escape(outcome)
 
@@ -2069,6 +2112,7 @@ class DirectSessionRunner:
             effort=request.effort,
             system_prompt=system_prompt,
             append_system_prompt=True,
+            report_status=True,
             timeout_s=request.timeout_s,
             # Background lane may legitimately own long dispatched Workflow work
             # (e.g. deep-research, 100+ agents). Let the CLI wait for bg tasks up
@@ -2206,13 +2250,17 @@ class DirectSessionRunner:
             or "none"
         )
 
+        import html as html_mod
+
+        what = (result.outcome or "failed").upper()
+        why = result.error or result.outcome_reason or "unknown"
         body = (
-            f"<b>Direct Session FAILED</b>\n\n"
+            f"<b>Direct Session {what}</b>\n\n"
             f"Profile: {request.profile} | "
             f"Model: {result.model_used or request.model} | "
             f"Duration: {result.duration_s:.0f}s\n\n"
-            f"Error: {result.error or 'unknown'}\n\n"
-            f"Tools before failure: {tools_str}"
+            f"{'Error' if result.error else 'Reason'}: {html_mod.escape(why)}\n\n"
+            f"Tools before it stopped: {tools_str}"
         )
 
         try:
@@ -2356,15 +2404,19 @@ class DirectSessionRunner:
                 if result.success
                 else f"Task did not complete: {result.error or 'unknown error'}"
             )
+            # A stop reads as a stop, never as a clean finish: this send is
+            # stamped paged below, so the hourly page will not report it.
             if not result.success:
                 header = "<b>✗ Background task complete</b>\n\n"
             elif result.partial:
-                # A partial run reads as a stop, never as a clean finish: this
-                # send is stamped paged below, so the hourly page will not
-                # report it. Only a truncated run carries its own notice.
+                # Only a truncated run carries its own notice.
                 header = "<b>⚠ Background task stopped early</b>\n\n"
                 if _BG_TRUNCATION_NOTICE not in raw:
                     raw += _NO_RESULT_NOTICE
+            elif _is_stop(result):
+                why = f": {result.outcome_reason}" if result.outcome_reason else ""
+                header = f"<b>⚠ Background task stopped ({result.outcome})</b>\n\n"
+                raw = f"{result.outcome.capitalize()}{why}\n\n{raw}"
             else:
                 header = "<b>✓ Background task complete</b>\n\n"
             escaped = html_mod.escape(raw)
