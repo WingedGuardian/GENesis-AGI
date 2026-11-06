@@ -393,19 +393,22 @@ def _is_introspection_only(config) -> bool:
     )
 
 
-pytest_plugins = ["tests._live_fence", "tests._live_closure"]
+pytest_plugins = ["tests._live_fence", "tests._live_closure", "tests._live_outbound"]
 
 
 def pytest_configure(config):
     _configure_lock_and_basetemp(config)
     # Armed AFTER the lock (a run refused by it exits above) and after basetemp is
     # placed (the fence allows fakes under it). See tests/_live_fence.py.
-    from tests import _live_closure, _live_fence
+    from tests import _live_closure, _live_fence, _live_outbound
 
     _live_fence.install(config)
     # Live state paths and endpoints out of the environment, before any test runs
     # (a test's own monkeypatch still wins). See tests/_live_closure.py.
     _live_closure.install(config)
+    # In-process connects to live services on this machine, refused as on CI
+    # (reads the real home the live fence resolved). See tests/_live_outbound.py.
+    _live_outbound.install(config)
 
 
 def _configure_lock_and_basetemp(config):

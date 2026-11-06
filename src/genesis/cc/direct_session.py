@@ -68,6 +68,14 @@ _BG_TRUNCATION_NOTICE = (
     "cut off before finishing, so the results below may be incomplete."
 )
 
+# Appended to a delivered result when the session exited without sending its
+# final result event (CCOutput.result_received False): what arrived is the text
+# it produced along the way, not its answer.
+_NO_RESULT_NOTICE = (
+    "\n\n⚠️ Note: this session ended before sending its final result, so this is "
+    "the text it produced along the way and may be incomplete."
+)
+
 # Soft cap for a single Telegram delivery of a RESULT-mode outcome. Below the
 # 4096-char hard limit, leaving room for the header + HTML entity expansion.
 # Larger output is written to a file and delivered as a head + pointer.
@@ -910,6 +918,26 @@ class DirectSessionRequest:
             )
 
 
+def pages_immediately(request: DirectSessionRequest) -> bool:
+    """Whether a failure of this session pages the owner at once.
+
+    Owner-requested work does: an MCP request, an ego dispatch, and a job the
+    owner scheduled (owner rulings 2026-11-04). Every other background stop
+    reaches the owner in the hourly page (``outreach.stopped_sessions``), so a
+    recurring job no longer pages on each failure. A resumed park is classed by
+    the context it was parked under.
+    """
+    ctx = rate_limit_park.effective_caller_context(
+        request.caller_context, request.origin_caller_context
+    )
+    return (
+        ctx == "mcp_tool"
+        or (ctx or "").startswith(("ego_proposal:", "user_job:"))
+        or (request.source_tag or "") == "ego_dispatch"
+        or (request.source_tag or "").startswith("user_job:")
+    )
+
+
 @dataclass
 class DirectSessionResult:
     """What the background session produced."""
@@ -1652,9 +1680,12 @@ class DirectSessionRunner:
         # swallows its own errors, so no extra guard is needed here.
         if request.delivery_mode == DeliveryMode.RESULT:
             await self._deliver_result_to_origin(request, error_result)
-        elif request.notify:
+        elif request.notify and pages_immediately(request):
+            # Owner-requested work pages at once; every other stop reaches the
+            # owner in the hourly page (outreach.stopped_sessions).
             try:
-                await self._notify(request, error_result, success=False)
+                sent = await self._notify(request, error_result, success=False)
+                await self._mark_paged(session_id, sent)
             except Exception:
                 logger.error(
                     "Failed to send failure notification for %s",
@@ -2147,8 +2178,8 @@ class DirectSessionRunner:
         result: DirectSessionResult,
         *,
         success: bool,
-    ) -> None:
-        """Send Telegram notification via outreach pipeline.
+    ) -> object | None:
+        """Send Telegram notification via outreach pipeline; return its result.
 
         Only failures are sent — successes are logged to the DB and visible
         via direct_session_list MCP tool and the dashboard.  Sending success
@@ -2187,17 +2218,45 @@ class DirectSessionRunner:
         try:
             from genesis.outreach.types import OutreachCategory, OutreachRequest
 
-            await pipeline.submit(
+            return await pipeline.submit(
                 OutreachRequest(
                     category=OutreachCategory.ALERT,
-                    topic="direct_session_fail",
+                    # Per session: governance dedups on (signal, topic,
+                    # category) for 24h, so a fixed topic let only the first
+                    # owner-requested failure of the day page at once.
+                    topic=f"direct_session_fail:{result.session_id}",
+                    signal_type="direct_session_fail",
                     context=body,
                     salience_score=0.9,
                     verbatim=True,  # composed failure detail — never reword
+                    # An undelivered alert stays unstamped and the hourly
+                    # stopped-session page carries it; a deferred retry would
+                    # deliver it a second time.
+                    defer_retry=False,
                 )
             )
         except Exception:
             logger.error("Outreach submit failed", exc_info=True)
+
+    async def _mark_paged(self, session_id: str, sent: object | None) -> None:
+        """Stamp ``outcome_paged_at`` when an immediate send was DELIVERED.
+
+        Anything short of delivered (deduped, held, failed, no pipeline) leaves
+        the row unstamped, so the hourly page still reports the stop.
+        """
+        from datetime import UTC, datetime
+
+        from genesis.db.crud import cc_sessions
+        from genesis.outreach.types import OutreachStatus
+
+        if getattr(sent, "status", None) != OutreachStatus.DELIVERED:
+            return
+        try:
+            await cc_sessions.mark_outcome_paged(
+                self._session_manager.db, [session_id], ts=datetime.now(UTC).isoformat()
+            )
+        except Exception:
+            logger.warning("Could not stamp %s as paged", session_id[:8], exc_info=True)
 
     @staticmethod
     def _resolve_origin_target(
@@ -2292,13 +2351,22 @@ class DirectSessionRunner:
                 getattr(pipeline, "_forum_chat_id", None),
             )
 
-            status = "✓" if result.success else "✗"
             raw = (
                 (result.output_text or "(no output)")
                 if result.success
                 else f"Task did not complete: {result.error or 'unknown error'}"
             )
-            header = f"<b>{status} Background task complete</b>\n\n"
+            if not result.success:
+                header = "<b>✗ Background task complete</b>\n\n"
+            elif result.partial:
+                # A partial run reads as a stop, never as a clean finish: this
+                # send is stamped paged below, so the hourly page will not
+                # report it. Only a truncated run carries its own notice.
+                header = "<b>⚠ Background task stopped early</b>\n\n"
+                if _BG_TRUNCATION_NOTICE not in raw:
+                    raw += _NO_RESULT_NOTICE
+            else:
+                header = "<b>✓ Background task complete</b>\n\n"
             escaped = html_mod.escape(raw)
             text = header + escaped
             if len(text) > _TG_MSG_CAP:
@@ -2323,7 +2391,7 @@ class DirectSessionRunner:
 
             from genesis.outreach.types import OutreachCategory, OutreachRequest
 
-            await pipeline.submit_urgent(
+            sent = await pipeline.submit_urgent(
                 OutreachRequest(
                     category=OutreachCategory.ALERT,
                     # Unique per session so governance dedup never collides with
@@ -2337,6 +2405,9 @@ class DirectSessionRunner:
                     target_thread_id=thread_id,
                 )
             )
+            # The owner now has this session's result (a partial run is sent
+            # as stopped early, with a notice), so the hourly page skips it.
+            await self._mark_paged(result.session_id, sent)
         except Exception:
             logger.error(
                 "Failed to deliver RESULT to origin for session %s",

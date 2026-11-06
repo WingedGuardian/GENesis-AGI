@@ -323,11 +323,63 @@ class TestRunSessionDeliveryWiring:
         runner._record_proposal_outcome = AsyncMock()
         runner._session_manager.fail = AsyncMock()
         runner._deliver_result_to_origin = AsyncMock()
-        runner._notify = AsyncMock()
+        runner._notify = AsyncMock(return_value="sent")
+        runner._mark_paged = AsyncMock()
 
-        # Legacy caller (notify=True → FAILURE_ONLY): broadcast, not origin.
-        req = DirectSessionRequest(prompt="x", notify=True)
+        # Owner-requested legacy caller (notify=True → FAILURE_ONLY): broadcast,
+        # not origin.
+        req = DirectSessionRequest(prompt="x", notify=True, caller_context="mcp_tool")
         with pytest.raises(RuntimeError):
             await runner._run_session(req, "sess-3")
         runner._notify.assert_awaited_once()
+        # The broadcast's own result decides whether the stop counts as paged.
+        runner._mark_paged.assert_awaited_once_with("sess-3", "sent")
         runner._deliver_result_to_origin.assert_not_awaited()
+
+        # Any other caller's failure waits for the hourly stopped-session page.
+        runner._notify.reset_mock()
+        req = DirectSessionRequest(
+            prompt="x", notify=True, source_tag="models_md_synthesis",
+            caller_context="schedule:models_md_synthesis",
+        )
+        with pytest.raises(RuntimeError):
+            await runner._run_session(req, "sess-4")
+        runner._notify.assert_not_awaited()
+
+
+class TestPartialRunsAreDeliveredAsStops:
+    """A delivered RESULT is stamped paged, so the hourly stop page skips it:
+    a partial run must therefore read as a stop in the message itself."""
+
+    async def _send(self, db, sid, res):
+        await _make_origin(db, session_id=f"o-{sid}", channel="telegram", user_id="tg-1")
+        runner, pipeline = _runner_with_pipeline(db)
+        req = DirectSessionRequest(
+            prompt="x", delivery_mode=DeliveryMode.RESULT, origin_session_id=f"o-{sid}"
+        )
+        await runner._deliver_result_to_origin(req, res)
+        return pipeline.submit_urgent.call_args.args[0].context
+
+    async def test_missing_result_is_disclosed(self, db):
+        res = DirectSessionResult(session_id="p1", success=True, output_text="half", partial=True)
+        text = await self._send(db, "p1", res)
+        assert "Background task stopped early" in text
+        assert "ended before sending its final result" in text
+        assert "✓" not in text
+
+    async def test_truncated_run_carries_one_notice(self, db):
+        from genesis.cc.direct_session import _BG_TRUNCATION_NOTICE
+
+        res = DirectSessionResult(
+            session_id="p2", success=True, output_text="half" + _BG_TRUNCATION_NOTICE, partial=True
+        )
+        text = await self._send(db, "p2", res)
+        assert "Background task stopped early" in text
+        assert "reached its time budget" in text
+        assert "ended before sending its final result" not in text
+
+    async def test_clean_finish_is_unchanged(self, db):
+        res = DirectSessionResult(session_id="p3", success=True, output_text="done")
+        text = await self._send(db, "p3", res)
+        assert "✓ Background task complete" in text
+        assert "stopped early" not in text

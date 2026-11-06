@@ -1001,7 +1001,7 @@ def collect_live_repairs(
     ``report_order`` (seconds, then pid; the guardian's pick sorts by the same
     key) are read through the repair's
     own ``load_report`` (its module loads once per call, only when such a dir
-    exists); older ones count in ``unread_older``. A report load_report refuses
+    exists); older ones count in ``unread_older`` (dismissed ones included). A report load_report refuses
     (a symlinked dir, a REPAIR.json that is not a regular file within the byte
     cap, not a JSON object, over the row cap, or naming another checkout), or
     one that fails in any other way, counts in ``refused`` and is named once in

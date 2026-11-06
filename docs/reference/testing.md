@@ -31,6 +31,13 @@ WAL cursor release and process-death recovery. Four explicit outcome comparisons
 keep the actual legacy middleware as the negative control. Shared MCP service E2E
 qualification is separate from this primitive coverage.
 
+Scoped graph selection and SQL identity parity are covered by
+`tests/test_memory/test_graph_request_database.py` and
+`tests/test_memory/test_graph_path_identity.py`. They use scratch SQLite with
+production table definitions, compare ordered traversal fields against NetworkX,
+and check own pending writes and selected-backend fallback. The FalkorDB boundary
+is simulated; these tests do not claim a live-engine or shared-service E2E run.
+
 Genesis v3 has **~21,000 test functions** across **~1,345 files** (counted
 2026-09-06 by `grep -rEh "^\s*(async )?def test_" tests/ --include=*.py | wc -l`;
 parametrized cases make the collected item count higher still). The suite runs
@@ -273,6 +280,64 @@ inherit it.
     including tests that strip every `GIT_*` variable from a child (its git
     then reads the home's user config again);
   - a repository-local `core.askPass` or `credential.helper`.
+
+### The outbound fence: tests never connect to a live service
+
+`tests/_live_outbound.py`, armed after the live fence, refuses a test's
+connection to a live service on this machine (any TCP listener; unix sockets
+under the real home and the user and dbus run directories), the way CI refuses
+it because nothing listens there. A PEP 578 audit hook judges every in-process
+`socket.connect`:
+
+- **TCP to this machine** (loopback, `0.0.0.0`/`::`, or one of its own
+  addresses): refused when a socket is listening NOW on that port at that
+  destination (the same address, or a wildcard on either side) and at least one
+  of those sockets does not belong to the pytest process or one of its
+  children. Decided at connect time, so a test's own server (in a thread or a
+  child) is reachable, a service that started mid-run is still fenced, a test's
+  own listener on one address does not vouch for someone else's on another, and
+  a port nobody listens on fails on its own.
+- **TCP to a private address that is not this machine** (the RFC 1918, CGNAT,
+  link-local and ULA ranges in `genesis.util.netclass`): refused on any port.
+- Port 53 (DNS) is exempt everywhere.
+- **Unix sockets** under the real home, `/run/user/<uid>/` or `/run/dbus/`
+  that are listening and not owned by the pytest tree: refused with
+  `FileNotFoundError`, which is what CI gives for a socket that does not exist.
+  Paths are matched as bytes, so spaces and non-UTF-8 bytes are fine. Without a
+  resolvable real home only the two `/run` directories are judged.
+- Public addresses are untouched.
+
+A refusal raises `ConnectionRefusedError` (or `FileNotFoundError`) to the
+caller, so the code under test takes its CI path. The test is NOT failed; each
+refusal is listed in the run summary under "live fence: live connections
+refused", and `GENESIS_LIVE_OUTBOUND_REPORT=<file>` writes them per test (an
+empty file on a clean run). `connect_ex` raises the refusal instead of
+returning `ECONNREFUSED`.
+
+Judging a TCP connect to this machine reads `/proc/net/tcp` and `tcp6`, about
+9 ms per connect measured here, even when nothing listens on the port. A test
+that polls a local port in a tight loop pays it on every attempt.
+
+A fault inside the judgement never breaks a connect: it is allowed, counted by
+exception type, and the summary prints `outbound fence: N judgments failed and
+were allowed (...)`.
+
+A test that must reach a live service is marked `live_service` and gated on
+`GENESIS_LIVE_E2E=1` (the Qdrant collection, retriever and FalkorDB engine
+tests are); the fence lets it connect for its whole run, setup and teardown
+included, and the summary lists it. Mark the whole module when its fixtures
+connect. A test whose own server daemonizes (double fork, `setsid`) leaves the
+pytest tree, so it reads as someone else's: mark it `live_service`.
+
+Known gaps, by design (the OS-level sandbox is the boundary): connections made
+by child processes, connects done in C (curl_cffi), UDP and unix datagram
+sockets; unix sockets outside the three directories above (`/run/systemd`, a
+VPN daemon's socket); a thread an earlier unmarked test left running, while a
+`live_service` test runs; a unix socket path
+containing a newline (it cannot be represented in `/proc/net/unix`); and an
+IPv6 link-local scope id, which `/proc/net/tcp6` does not record, so two
+listeners with the same link-local address on different interfaces are judged
+as one.
 
 ## Integration Tests
 

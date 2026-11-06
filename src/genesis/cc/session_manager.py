@@ -211,9 +211,10 @@ class SessionManager:
     ) -> None:
         """Record the failure AND its reason, which this used to discard.
 
-        ``outcome`` refines what kind of non-success it was: ``parked`` for a
-        rate-limit park (it resumes on its own, so it is not a stop to report),
-        ``partial`` for a run that exited cleanly without finishing.
+        ``outcome`` refines what kind of non-success it was: ``parked`` for
+        work that resumes on its own (a rate-limit park, or an inbox item
+        deferred to its retry lane), so it is not a stop to report; ``partial``
+        for a run that exited cleanly without finishing.
         """
         await cc_sessions.update_status(
             self._db,

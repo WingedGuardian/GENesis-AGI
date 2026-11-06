@@ -132,6 +132,19 @@ class OutreachScheduler:
             id="outreach_ambient_health",
             replace_existing=True,
         )
+        # Stopped background sessions — at most one page an hour. Cron, not an
+        # interval (an interval resets on restart); state is per row, so a
+        # coalesced or missed fire neither skips nor repeats a stop.
+        self._scheduler.add_job(
+            self._stopped_sessions_job,
+            "cron",
+            minute=5,
+            timezone=tz,
+            id="outreach_stopped_sessions",
+            replace_existing=True,
+            coalesce=True,
+            misfire_grace_time=3000,
+        )
         self._scheduler.start()
         logger.info(
             "OutreachScheduler started (morning=%s:%s %s, engagement=%dm, health=30m, drain=5m, critical_obs=5m)",
@@ -508,6 +521,23 @@ class OutreachScheduler:
         except Exception as exc:
             logger.exception("Critical observations outreach job failed")
             await self._record_job_result("critical_observations", error=str(exc), exc=exc)
+
+    async def _stopped_sessions_job(self) -> None:
+        """Page the owner once about background sessions that stopped.
+
+        Runs even when paused, like the critical-observations job: it reports,
+        it never dispatches. See ``outreach.stopped_sessions``.
+        """
+        try:
+            from genesis.outreach.stopped_sessions import run_page
+
+            paged = await run_page(self._db, self._pipeline)
+            if paged:
+                logger.info("Stopped-session page sent (%d stop(s))", paged)
+            await self._record_job_result("stopped_sessions")
+        except Exception as exc:
+            logger.exception("Stopped-session page job failed")
+            await self._record_job_result("stopped_sessions", error=str(exc), exc=exc)
 
     async def _ambient_health_job(self) -> None:
         """Alert when the edge ambient-capture bridge goes dark or regresses.

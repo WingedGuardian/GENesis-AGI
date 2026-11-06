@@ -1,0 +1,1 @@
+- **Ubuntu 26.04 is now a tested OS for installing Genesis, alongside 24.04.** The installer no longer warns that runtime behaviour may vary there, and the setup guide says so. The README's recommendation for the host stays 24.04, which is the release its container uses.
