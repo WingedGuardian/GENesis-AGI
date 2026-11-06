@@ -288,7 +288,11 @@ tag>/`, re-checks the copy and writes its `engine.sha256`, which the unit
 re-checks on every start (a drift check; the sandbox is best-effort, so the
 provision-time re-verify is the integrity check that holds). The
 version-tag directory means a pin bump never replaces a running engine's files;
-`bootstrap.sh` removes copies no unit loads. It needs glibc 2.38+ (Ubuntu 24.04)
+`bootstrap.sh` removes copies no unit loads (none while the unit has a drop-in),
+and a copy another account could write is rebuilt, never reused. If the
+hash-pinned package does not install, `bootstrap.sh` stops before the package
+install and `install.sh` skips it, so the engine is never fetched without its
+hashes. It needs glibc 2.38+ (Ubuntu 24.04)
 on x86_64 or aarch64, and `install.sh` and `bootstrap.sh` refuse anything else
 before installing it; `update.sh` refuses before fetching once it runs code that
 carries this check (the first update to it runs the old `update.sh`, which merges,

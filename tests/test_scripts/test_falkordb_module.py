@@ -159,14 +159,31 @@ def test_a_libc_that_is_not_glibc_is_below_the_floor(tmp_path):
     assert pip_calls(env) == []
 
 
-def test_a_failed_pip_run_warns_and_never_aborts(tmp_path):
+def test_a_failed_pip_run_warns_returns_zero_and_flags_the_refusal(tmp_path):
+    """rc 0 stays the contract; the flag is what keeps the installers from the
+    editable install, which would fetch the same wheel with no hash check."""
     env = _stage(tmp_path)
     env["PIP_RC"] = "1"
-    result = _run(_provisioned(_report()), env)
+    result = _run(_provisioned(_report() + '; echo "REFUSED=$FALKORDB_PIP_REFUSED"'), env)
     assert result.returncode == 0, result.stderr
     assert "did not install (pip rc=1)" in result.stdout
     assert _results(result.stdout)["OK"] == ""
+    assert "REFUSED=1" in result.stdout.splitlines()
     assert not engine_dir(env).exists()
+
+
+def test_only_a_failed_pip_run_flags_the_refusal(tmp_path):
+    """A verified engine, and a check that fails AFTER pip installed the hashed
+    wheel, leave the flag empty: the editable install then finds it satisfied."""
+    env = _stage(tmp_path)
+    result = _run(_provisioned('echo "REFUSED=$FALKORDB_PIP_REFUSED"'), env)
+    assert result.returncode == 0, result.stderr
+    assert "REFUSED=" in result.stdout.splitlines()
+    module = site_file(env, "redislite/bin/falkordb.so")
+    module.write_bytes(b"tampered")
+    result = _run(_provisioned('echo "REFUSED=$FALKORDB_PIP_REFUSED"'), env)
+    assert "NOT verified" in result.stdout
+    assert "REFUSED=" in result.stdout.splitlines()
 
 
 def test_a_tampered_engine_file_fails_and_places_no_copy(tmp_path):
@@ -460,6 +477,31 @@ def test_bootstrap_refuses_below_the_floor_before_installing_anything(tmp_path):
     result = _run_block(block, env, prelude=f'VENV_DIR="{env["VENV"]}"')
     assert result.returncode == 0, result.stdout + result.stderr
     assert len(pip_calls(env)) == 1
+
+
+def test_bootstrap_stops_when_the_hash_pinned_wheel_did_not_install(tmp_path):
+    """The editable install would fetch the same mandatory wheel unverified."""
+    block = _block(
+        BOOTSTRAP, 'echo "--- Graph engine (optional) ---"', 'echo "  Syncing dependencies..."'
+    )
+    env = _stage(tmp_path)
+    env["PIP_RC"] = "1"
+    result = _run_block(
+        block + 'echo "REACHED THE INSTALL"\n', env, prelude=f'VENV_DIR="{env["VENV"]}"'
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "Stopping before the package install, which would fetch it unverified" in result.stderr
+    assert "REACHED THE INSTALL" not in result.stdout
+
+
+def test_install_skips_the_editable_install_when_the_wheel_was_refused():
+    text = INSTALL.read_text()
+    guard = text.index('if [ "${FALKORDB_PIP_REFUSED:-}" = "1" ]; then')
+    editable = text.index('editable_install_guarded "$REPO_DIR" "$VENV_PATH"')
+    assert text.index('falkordb_provision "$VENV_PATH"') < guard < editable
+    branch = text[guard:editable]
+    assert "_ei_rc=3" in branch and "else" in branch
+    assert "        3)\n" in text[editable:]
 
 
 def test_bootstrap_checks_the_floor_before_the_provision_and_the_package_install():
@@ -1043,6 +1085,26 @@ def test_the_switch_run_keeps_the_copy_the_engine_still_runs(tmp_path):
     assert "4.20.4" not in _names(deps)
 
 
+def test_prune_keeps_everything_when_a_drop_in_can_change_what_runs(tmp_path):
+    """A drop-in's ExecStart replaces the base unit's, so the base unit no longer
+    says which copy runs: the copy the override loads must survive."""
+    env = _stage(tmp_path)
+    deps = _deps(env)
+    base = _engine_copy(deps, "0.10.0-cp312-cp312-manylinux_2_38_x86_64")
+    _engine_copy(deps, "4.20.4", legacy=True)
+    unit = tmp_path / "genesis-falkordb.service"
+    unit.write_text(f'    --loadmodule "{base}" \\\n')
+    dropin = tmp_path / "genesis-falkordb.service.d"
+    dropin.mkdir()
+    (dropin / "override.conf").write_text("[Service]\nExecStart=\nExecStart=/x --loadmodule old\n")
+    _prune(env, unit)
+    assert "4.20.4" in _names(deps)
+    # Negative control: a drop-in dir with no .conf in it is not a drop-in.
+    (dropin / "override.conf").rename(dropin / "override.conf.disabled")
+    _prune(env, unit)
+    assert "4.20.4" not in _names(deps)
+
+
 def test_prune_reads_a_percent_h_unit(tmp_path):
     env = _stage(tmp_path)
     deps = _deps(env)
@@ -1181,14 +1243,17 @@ def test_a_tampered_wheel_keeps_the_old_unit_and_the_dir_it_loads(tmp_path):
     assert _names(_deps(env)) == [old]
 
 
-def test_bootstrap_prunes_once_after_the_render_loop():
+def test_bootstrap_prunes_once_after_the_render_loop_and_the_reload():
+    """After daemon-reload: systemd then already reads the unit the prune
+    decided from, so no restart can find a pre-reload unit naming a pruned copy."""
     text = BOOTSTRAP.read_text()
     call = 'falkordb_prune_engines "$SYSTEMD_USER_DIR/genesis-falkordb.service"'
     assert text.count(call) == 1
     loop_end = text.index(_bootstrap_render_loop()) + len(_bootstrap_render_loop())
     at = text.index(call)
-    assert loop_end < at < text.index("systemctl --user daemon-reload", loop_end)
-    assert "declare -F falkordb_prune_engines" in text[loop_end:at]
+    reload = text.index("systemctl --user daemon-reload", loop_end)
+    assert loop_end < reload < at
+    assert "declare -F falkordb_prune_engines" in text[reload:at]
 
 
 def _xdg_block() -> str:
@@ -1272,7 +1337,10 @@ def test_a_rebuilt_tampered_copy_is_reported_not_silent(tmp_path):
     cli.write_bytes(cli.read_bytes() + b"x")
     second = _run(_provisioned(), env)
     assert second.returncode == 0, second.stderr
-    assert "did not match the committed digests and was rebuilt" in second.stdout
+    assert (
+        "did not match the committed digests, or another account could write it, and was rebuilt"
+        in second.stdout
+    )
     assert "restart it" in second.stdout
     third = _run(_provisioned(), env)
     assert "WARNING: the graph engine copy" not in third.stdout, "a matching copy is reused quietly"

@@ -23,8 +23,10 @@ script closes both:
    and given an ``engine.sha256`` (``sha256sum -c`` format, absolute paths)
    that the unit's ``ExecStartPre`` re-checks on every start. An existing copy
    whose every file matches is reused untouched; anything else is rebuilt in a
-   dotted temp dir and renamed into place, so the target is either the old
-   copy or a complete verified new one;
+   dotted temp dir and renamed into place, so the target is the old copy or a
+   complete verified new one, except in the instant between the two renames. A
+   run killed there leaves it absent; the next run puts the finished copy back
+   (``recover_interrupted``) before deleting leftovers;
 4. it prints ``KEY=value`` lines (the copy's dir, its three binaries and its
    digest file) for the shell to read.
 
@@ -233,11 +235,24 @@ def digest_body(target: Path, rows: dict[str, str]) -> str:
     return "".join(f"{rows[rel]}  {target / rel}\n" for rel in sorted(rows))
 
 
+def _others_can_write(path: Path) -> bool:
+    """True when ``path`` is not this user's, or its group or others may write it.
+    Such a copy could be changed after this check, digest file and all."""
+    st = path.lstat()
+    return st.st_uid != os.geteuid() or bool(st.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+
+
 def copy_matches(target: Path, rows: dict[str, str]) -> bool:
     """True when ``target`` holds exactly the committed files, each matching,
-    plus the exact digest file: the copy can be reused untouched."""
+    plus the exact digest file: the copy can be reused untouched. A copy with any
+    entry another account could write is never reused: it is rebuilt, with this
+    run's own modes (0755 dirs and binaries, 0644 files, whatever the umask). The
+    deps dir above it is not checked: a umask of 002 makes it group-writable on
+    an ordinary install, and the copy's own entries are what the unit runs."""
     try:
         if target.is_symlink() or not target.is_dir():
+            return False
+        if _others_can_write(target):
             return False
         files: set[str] = set()
         dirs: set[str] = set()
@@ -245,10 +260,12 @@ def copy_matches(target: Path, rows: dict[str, str]) -> bool:
             base = Path(root).relative_to(target)
             for name in dirnames:
                 rel = (base / name).as_posix()
-                if (Path(root) / name).is_symlink():
+                if (Path(root) / name).is_symlink() or _others_can_write(Path(root) / name):
                     return False
                 dirs.add(rel)
             for name in filenames:
+                if _others_can_write(Path(root) / name):
+                    return False
                 files.add((base / name).as_posix())
         if dirs != _COPY_DIRS or files != set(rows) | {DIGEST_NAME}:
             return False
@@ -321,6 +338,44 @@ def remove_leftovers(deps_root: Path) -> None:
             _remove(entry)
 
 
+def recover_interrupted(deps_root: Path, name: str, rows: dict[str, str]) -> None:
+    """A run killed between ``place_copy``'s two renames leaves ``<name>`` absent,
+    with its finished replacement (``.tmp-``) and the copy it replaced
+    (``.stale-``) beside it. Before ``remove_leftovers`` deletes them, put back
+    the first that still verifies, the replacement first: otherwise a rebuild
+    that also fails leaves the unit's path empty."""
+    target = deps_root / name
+    if os.path.lexists(target):
+        return
+    found: dict[str, list[Path]] = {"tmp": [], "stale": []}
+    try:
+        entries = sorted(deps_root.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        match = _LEFTOVER.fullmatch(entry.name)
+        if not match or match.group("name") != name:
+            continue
+        pid = int(match.group("pid"))
+        if pid == os.getpid() or _pid_alive(pid):
+            continue
+        found["tmp" if ".tmp-" in entry.name[len(name) + 1 :] else "stale"].append(entry)
+    for entry in found["tmp"] + found["stale"]:
+        try:
+            os.rename(entry, target)
+        except OSError:
+            continue
+        if copy_matches(target, rows):
+            with contextlib.suppress(OSError):
+                _fsync_dir(deps_root)
+            return
+        # Not a good copy: back to its leftover name, for remove_leftovers.
+        with contextlib.suppress(OSError):
+            os.rename(target, entry)
+        if os.path.lexists(target):
+            return
+
+
 def place_copy(
     site: Path, deps_root: Path, name: str, rows: dict[str, str],
 ) -> tuple[Path, bool]:
@@ -332,6 +387,7 @@ def place_copy(
     if _UNSAFE.search(str(target)):
         raise CheckFailed(f"{str(target)!r} contains characters the unit cannot carry")
     deps_root.mkdir(parents=True, exist_ok=True)
+    recover_interrupted(deps_root, name, rows)
     remove_leftovers(deps_root)
     if copy_matches(target, rows):
         return target, False

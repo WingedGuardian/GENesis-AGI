@@ -42,8 +42,9 @@
 #
 # Degrades gracefully everywhere: an OS below the floor, a missing venv, a
 # failed pip run or a failed check each produce a short note and rc=0. Like the
-# other lib fragments, this must never abort install.sh/bootstrap.sh/update.sh
-# under `set -e`.
+# other lib fragments, nothing here aborts install.sh/bootstrap.sh/update.sh
+# under `set -e`; the callers decide, and they stop on two results only: the OS
+# floor, and FALKORDB_PIP_REFUSED (the hashed wheel did not install).
 #
 # Test seams (defaults are the real paths; the test harness overrides these and
 # stubs tools on PATH):
@@ -78,6 +79,7 @@ FALKORDB_REDIS_CLI=""
 FALKORDB_MODULE=""
 FALKORDB_REPLACED=""
 FALKORDB_DIGESTS=""
+FALKORDB_PIP_REFUSED=""
 
 # _falkordb_glibc_ok — rc 0 when this machine's glibc meets the wheels' floor.
 # `getconf GNU_LIBC_VERSION` prints "glibc 2.39"; a non-glibc libc prints
@@ -259,6 +261,7 @@ _falkordb_clear_results() {
     FALKORDB_MODULE=""
     FALKORDB_REPLACED=""
     FALKORDB_DIGESTS=""
+    FALKORDB_PIP_REFUSED=""
     export FALKORDB_ENGINE_OK FALKORDB_ENGINE_DIR FALKORDB_REDIS_SERVER \
         FALKORDB_REDIS_CLI FALKORDB_MODULE FALKORDB_DIGESTS
 }
@@ -266,7 +269,10 @@ _falkordb_clear_results() {
 # falkordb_provision <venv dir> — the single entry point the installers call,
 # before the editable install. Installs the hash-pinned wheel, verifies it
 # against the committed digests, places the version-tag copy the unit runs, and
-# exports its paths for the render step. Always rc 0.
+# exports its paths for the render step. Always rc 0. When the hash-pinned pip
+# run itself fails it sets FALKORDB_PIP_REFUSED=1: the editable install that
+# follows would fetch the same mandatory wheel with no hash check, so the
+# installers must not run it (bootstrap stops; install.sh skips it and warns).
 falkordb_provision() {
     local venv="${1:-}" py out rc
     _falkordb_clear_results
@@ -297,6 +303,8 @@ falkordb_provision() {
     if [ "$rc" -ne 0 ]; then
         echo "  WARNING: graph engine wheel did not install (pip rc=$rc) — graph engine NOT installed."
         [ -z "$out" ] || printf '%s\n' "$out" | tail -n 3 | sed 's/^/           /' || true
+        # shellcheck disable=SC2034  # read by bootstrap.sh and install.sh
+        FALKORDB_PIP_REFUSED=1
         return 0
     fi
 
@@ -320,7 +328,7 @@ falkordb_provision() {
     FALKORDB_ENGINE_OK=1
     echo "  OK: graph engine verified ($FALKORDB_ENGINE_DIR)"
     if [ "$FALKORDB_REPLACED" = "1" ]; then
-        echo "  WARNING: the graph engine copy at $FALKORDB_ENGINE_DIR did not match the committed digests and was rebuilt."
+        echo "  WARNING: the graph engine copy at $FALKORDB_ENGINE_DIR did not match the committed digests, or another account could write it, and was rebuilt."
         echo "           A running genesis-falkordb still runs the old bytes: restart it (systemctl --user restart genesis-falkordb)."
     fi
     return 0
@@ -332,7 +340,8 @@ falkordb_provision() {
 #   - the top-level directory the unit's --loadmodule resolves into, which a
 #     kept unit (an active engine, a failed provision) still runs. This is
 #     also what retires the legacy <deps>/4.20.4/ once no unit loads it.
-# Never prunes when the unit file exists but its module cannot be read: what
+# Never prunes when a drop-in (<unit>.d/*.conf) exists, which can replace
+# ExecStart, or when the unit file exists but its module cannot be read: what
 # it runs is unknown, so everything stays. Skips files, symlinks, dotted
 # names (an in-flight copy belongs to the engine check), and any name holding
 # `/` or `..`; never touches anything outside FALKORDB_DEPS_DIR. Always rc 0.
@@ -351,6 +360,12 @@ falkordb_prune_engines() {
     # with a trailing slash, //, a symlinked home), and a raw string compare
     # would then miss the copy the unit runs and delete it.
     root="$(realpath -m -- "$root" 2>/dev/null)" || return 0
+    # A drop-in (<unit>.d/*.conf, the supported place for local changes; see
+    # managed_units.sh) can replace ExecStart, and then the base unit no longer
+    # says what runs: prune nothing.
+    if [ -n "$unit" ] && compgen -G "${unit}.d/*.conf" >/dev/null 2>&1; then
+        return 0
+    fi
     if [ -n "$unit" ] && [ -e "$unit" ]; then
         loaded="$(falkordb_unit_loaded_module "$unit" 2>/dev/null || true)"
         [ -n "$loaded" ] || return 0

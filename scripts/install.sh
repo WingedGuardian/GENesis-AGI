@@ -901,8 +901,9 @@ if [ -d "$VENV_PATH" ]; then
     # The graph engine's hash-pinned wheel, BEFORE the editable install:
     # pyproject.toml declares the same falkordblite pin, and installed first it is
     # what the editable install finds satisfied, rather than a copy fetched on
-    # TLS alone. Never fatal (rc 0 by contract); the resolved engine paths it
-    # exports feed the unit render in step 7. bootstrap.sh runs the same call.
+    # TLS alone. Never fatal (rc 0 by contract), but a refused wheel skips the
+    # editable install below; the resolved engine paths it exports feed the unit
+    # render in step 7. bootstrap.sh runs the same call.
     if [[ -f "$SCRIPT_DIR/lib/falkordb_install.sh" ]]; then
         # shellcheck source=lib/falkordb_install.sh
         source "$SCRIPT_DIR/lib/falkordb_install.sh"
@@ -914,7 +915,13 @@ if [ -d "$VENV_PATH" ]; then
     # shellcheck source=lib/venv_setup.sh
     . "$SCRIPT_DIR/lib/venv_setup.sh"
     _ei_rc=0
-    editable_install_guarded "$REPO_DIR" "$VENV_PATH" || _ei_rc=$?
+    if [ "${FALKORDB_PIP_REFUSED:-}" = "1" ]; then
+        # The hash-pinned wheel was refused: the editable install would fetch the
+        # same mandatory wheel with no hash check, so it does not run.
+        _ei_rc=3
+    else
+        editable_install_guarded "$REPO_DIR" "$VENV_PATH" || _ei_rc=$?
+    fi
     case $_ei_rc in
         0)
             echo "    + Genesis installed in editable mode"
@@ -936,6 +943,11 @@ if [ -d "$VENV_PATH" ]; then
         1)
             # Blocked (worktree) — guard already printed the reason; the
             # install continues, matching the previous inline behavior.
+            ;;
+        3)
+            echo "    FAIL  the graph engine's hash-pinned wheel did not install (see above);"
+            echo "          Genesis was not installed, so nothing fetched it unverified."
+            setup_warn "Genesis not installed: the graph engine's hash-pinned wheel did not install (re-run scripts/install.sh)"
             ;;
         *)
             echo "    FAIL  pip install completed but Genesis is not importable."

@@ -1035,14 +1035,16 @@ fi
 # BEFORE the editable install: pyproject.toml declares the same falkordblite
 # pin, so installing the hash-pinned wheel first is what makes the editable
 # install find it satisfied instead of fetching it on TLS alone. Except for the
-# OS-floor refusal below, the same guarded-source contract as the resilience
-# libs: provisioning never aborts bootstrap. The engine (redis-server,
+# two refusals below (the OS floor, and a hash-pinned wheel that did not
+# install), the same guarded-source contract as the resilience libs:
+# provisioning itself never aborts bootstrap. The engine (redis-server,
 # redis-cli and the module) lands in the venv, is verified against the digests
 # committed in lib/falkordb-engine-digests.txt, and is copied to the
 # version-tag dir under ~/.genesis/deps/falkordb that the unit runs; nothing
 # about the system changes. The unit rendered below is
-# left DISABLED, so a box where provisioning fails is fully functional — the
-# memory graph keeps using its in-process NetworkX projection.
+# left DISABLED, so a box where the engine check fails (after the hashed wheel
+# installed) is fully functional — the memory graph keeps using its in-process
+# NetworkX projection.
 echo "--- Graph engine (optional) ---"
 if [[ -f "$SCRIPT_DIR/lib/falkordb_install.sh" ]]; then
     # shellcheck source=lib/falkordb_install.sh
@@ -1057,6 +1059,14 @@ if [[ -f "$SCRIPT_DIR/lib/falkordb_install.sh" ]]; then
         exit 1
     fi
     falkordb_provision "$VENV_DIR"
+    # The second hard stop (owner ruling): the hash-pinned wheel was refused, and
+    # the editable install below would fetch the same mandatory wheel with no
+    # hash check. A network failure stops here exactly as that install would.
+    if [[ "${FALKORDB_PIP_REFUSED:-}" == "1" ]]; then
+        echo "  ERROR: the graph engine's hash-pinned wheel did not install (see above)." >&2
+        echo "         Stopping before the package install, which would fetch it unverified." >&2
+        exit 1
+    fi
 else
     echo "  WARNING: lib/falkordb_install.sh missing — skipping graph-engine provisioning"
     # Nothing could be verified, so the unit is neither rendered nor rewritten.
@@ -1768,12 +1778,6 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
         genesis_install_managed_unit "scripts/systemd/$svc_name.template" "$_mu_render" "$target"
     done
     rm -rf "$_mu_dir"
-    # Retire graph engine copies no unit runs: everything under the deps dir
-    # except this run's verified copy and the one the unit (as it now stands,
-    # rendered or kept) loads. Never prunes when the unit's module is unreadable.
-    if declare -F falkordb_prune_engines >/dev/null; then
-        falkordb_prune_engines "$SYSTEMD_USER_DIR/genesis-falkordb.service"
-    fi
     if [[ "$GENESIS_MU_CHANGED" = "1" ]]; then SERVICES_UPDATED=1; fi
     # Always reload before enabling — cheap + idempotent, and covers a prior run
     # that wrote a unit then crashed before reloading (files unchanged this run,
@@ -1781,6 +1785,13 @@ if [[ -d "$SYSTEMD_TEMPLATE_DIR" ]]; then
     systemctl --user daemon-reload 2>/dev/null || true
     if [[ "$SERVICES_UPDATED" = "1" ]]; then
         echo "  systemd daemon reloaded (units changed)"
+    fi
+    # Retire graph engine copies no unit runs: everything under the deps dir
+    # except this run's verified copy and the one the unit (as it now stands,
+    # rendered or kept) loads. Never prunes when the unit's module is unreadable.
+    # After daemon-reload, so systemd already reads the unit this decided from.
+    if declare -F falkordb_prune_engines >/dev/null; then
+        falkordb_prune_engines "$SYSTEMD_USER_DIR/genesis-falkordb.service"
     fi
 
     # A user manager stops at logout without lingering, taking every enabled

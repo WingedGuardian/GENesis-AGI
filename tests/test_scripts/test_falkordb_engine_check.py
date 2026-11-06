@@ -438,6 +438,73 @@ def test_a_crash_mid_copy_leaves_a_dotted_dir_the_next_run_removes(staged):
     assert sorted(p.name for p in deps.iterdir()) == [name]
 
 
+_MARK = 1_000_000_000  # an mtime no file this run writes can have
+
+
+def _mark(path: Path) -> None:
+    """Tag the copy's file so a put-back copy is told from a rebuilt one (an
+    inode number cannot tell them apart: a freed one is reused at once)."""
+    os.utime(path, (_MARK, _MARK))
+
+
+def _marked(path: Path) -> bool:
+    return path.lstat().st_mtime == _MARK
+
+
+@pytest.mark.parametrize("kind", ["tmp", "stale"])
+def test_a_run_killed_between_the_renames_gets_its_copy_back(staged, kind):
+    """Killed after moving the old copy aside and before installing the new one:
+    <name> is absent. The finished copy is put back, not deleted and rebuilt, so
+    a rebuild that also failed could not leave the unit's path empty."""
+    site, deps, digests = staged
+    assert _check(site, deps, digests).returncode == 0
+    target = copy_dir(deps)
+    module = target / "redislite/bin/falkordb.so"
+    _mark(module)
+    target.rename(deps / f".{target.name}.{kind}-{_dead_pid()}")
+    result = _check(site, deps, digests)
+    assert result.returncode == 0, result.stderr
+    assert "FALKORDB_REPLACED" not in result.stdout
+    assert _marked(module), "deleted and rebuilt instead of put back"
+    assert sorted(p.name for p in deps.iterdir()) == [target.name]
+
+
+def test_a_half_written_replacement_is_not_put_back_and_the_old_copy_is(staged):
+    site, deps, digests = staged
+    assert _check(site, deps, digests).returncode == 0
+    target = copy_dir(deps)
+    dead = _dead_pid()
+    target.rename(deps / f".{target.name}.stale-{dead}")
+    half = deps / f".{target.name}.tmp-{dead}"
+    (half / "redislite/bin").mkdir(parents=True)
+    (half / "redislite/bin/redis-se").write_bytes(b"half")
+    stale_module = deps / f".{target.name}.stale-{dead}" / "redislite/bin/falkordb.so"
+    _mark(stale_module)
+    result = _check(site, deps, digests)
+    assert result.returncode == 0, result.stderr
+    assert _marked(target / "redislite/bin/falkordb.so")
+    assert sorted(p.name for p in deps.iterdir()) == [target.name]
+
+
+@pytest.mark.parametrize(
+    "rel", ["redislite/bin/falkordb.so", "engine.sha256", "redislite/bin", "."]
+)
+def test_a_copy_another_account_could_write_is_rebuilt(staged, rel):
+    """Writable by group or others, its files and digest could be changed
+    together after this check, so it is not reused: rebuilt with exact modes."""
+    site, deps, digests = staged
+    assert _check(site, deps, digests).returncode == 0
+    entry = copy_dir(deps) / rel
+    entry.chmod(entry.stat().st_mode | 0o020)
+    result = _check(site, deps, digests)
+    assert result.returncode == 0, result.stderr
+    assert "FALKORDB_REPLACED=1" in result.stdout.splitlines()
+    assert not (copy_dir(deps) / rel).stat().st_mode & 0o022
+    # Negative control: the rebuilt copy is reused as it stands.
+    again = _check(site, deps, digests)
+    assert "FALKORDB_REPLACED" not in again.stdout
+
+
 def test_only_dead_leftovers_of_the_two_patterns_are_removed(staged):
     """A live process's temp dir is its own; other dotted names are not ours."""
     site, deps, digests = staged
