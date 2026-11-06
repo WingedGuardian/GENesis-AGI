@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import calendar
 import contextlib
+import errno
 import fcntl
 import functools
 import hashlib
@@ -34,6 +35,7 @@ import stat
 import subprocess
 import sys
 import time
+import types
 
 _LIB = os.path.dirname(os.path.abspath(__file__))
 BOOT_BUDGET_S = 60  # every wait at boot, inside systemd's default 90 s start timeout
@@ -43,6 +45,10 @@ _PROC = "/proc"
 SUFFIX = "-live-move-repair"
 _now, _sleep = time.monotonic, time.sleep  # a test's fake clock replaces both
 _changed = False  # set when the checkout itself starts to change (_apply)
+
+
+class TooLarge(Exception):
+    """A node over a reader's byte or entry budget (the restore check's)."""
 
 
 class RepairError(Exception):
@@ -104,9 +110,34 @@ def _beyond_link(repo: str, p: str) -> bool:
     return _link_parent(repo, p) is not None
 
 
-def _node(repo: str, p: str, fmt: str) -> tuple[str, str] | None:
+def _blob_id(full: str, st: os.stat_result, fmt: str, budget=None) -> str:
+    """The blob id of the regular file ``st`` (its lstat) is, read in 1 MiB
+    chunks from an fd opened without following a link or blocking on a FIFO,
+    and only while it is still that file: a node swapped after the lstat (a
+    FIFO, a link, another file) or changed while read raises OSError, never
+    blocks or reads something else. ``budget(size)`` may refuse it first."""
+    fd = os.open(full, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        now = os.fstat(fd)
+        if not stat.S_ISREG(now.st_mode) or (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
+            raise OSError(errno.ESTALE, "replaced after it was looked at", full)
+        if budget is not None:
+            budget(now.st_size)
+        h, left = hashlib.new(fmt, b"blob %d\0" % now.st_size), now.st_size
+        while left > 0 and (chunk := os.read(fd, min(1 << 20, left))):
+            h.update(chunk)
+            left -= len(chunk)
+        if left or os.read(fd, 1):
+            raise OSError(errno.ESTALE, "changed while it was read", full)
+        return h.hexdigest()
+    finally:
+        os.close(fd)
+
+
+def _node(repo: str, p: str, fmt: str, budget=None) -> tuple[str, str] | None:
     """(mode, blob id) of the disk node, ("dir", "") or ("other", ""); None if absent,
-    or beyond a symlinked or non-directory parent (never read through one)."""
+    or beyond a symlinked or non-directory parent (never read through one).
+    A regular file is read as _blob_id reads it, under ``budget`` if given."""
     full = os.path.join(repo, p)
     if _beyond_link(repo, p):
         return None
@@ -121,8 +152,7 @@ def _node(repo: str, p: str, fmt: str) -> tuple[str, str] | None:
         # unchanged to `git status`, MEASURED git 2.43): a restore gives other bits
         # the umask's, as any checkout does, and only to the tag's own bytes.
         mode = "100755" if st.st_mode & stat.S_IXUSR else "100644"
-        with open(full, "rb") as fh:
-            data = fh.read()
+        return mode, _blob_id(full, st, fmt, budget)
     else:
         return ("dir" if stat.S_ISDIR(st.st_mode) else "other", "")
     return mode, hashlib.new(fmt, b"blob %d\0" % len(data) + data).hexdigest()
@@ -194,8 +224,17 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _flock(path: str, deadline: float) -> int | None:
-    """flock, as every other holder of update.lock takes it; None if still held at ``deadline``."""
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    """flock, as every other holder of update.lock takes it; None if still held at ``deadline``.
+    A lock path that is a symlink (never followed) or not a regular file is refused."""
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        if exc.errno != errno.ELOOP:
+            raise
+        raise RepairError(f"{path} is a symlink; it is not taken as a lock") from None
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise RepairError(f"{path} is not a regular file; it is not taken as a lock")
     while True:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -295,6 +334,10 @@ class BadReport(Exception):
     """A report dir or REPAIR.json the writer does not make; never read further."""
 
 
+class NotThisCheckout(BadReport):
+    """A report whose ``repo`` names another checkout (or none)."""
+
+
 def report_ts(name: str) -> str | None:
     """The ts of a report dir named as _backup_dir names it, else None."""
     m = REPORT_NAME.fullmatch(name)
@@ -360,7 +403,7 @@ def load_report(path: str, repo: str) -> dict | None:
     if not isinstance(report, dict):
         raise BadReport("not a JSON object")
     if not same_repo(report.get("repo"), repo):
-        raise BadReport("not this checkout's report")
+        raise NotThisCheckout("not this checkout's report")
     paths = report.get("paths")
     if not isinstance(paths, list) or len(paths) > REPORT_ROWS:
         raise BadReport(f"paths is not a list of at most {REPORT_ROWS} rows")
@@ -410,8 +453,13 @@ def _ephemeral() -> str:
 
 
 def _load_guard():
-    path = os.path.join(_LIB, "update_state_guard.py")
-    spec = importlib.util.spec_from_file_location("_live_repair_guard", path)
+    return _load_kit("update_state_guard.py")
+
+
+def _load_kit(name: str):
+    """A kit source beside this one (the guard; live_move_restore.py)."""
+    path = os.path.join(_LIB, name)
+    spec = importlib.util.spec_from_file_location(f"_live_repair_{name[:-3]}", path)
     if spec is None or spec.loader is None:
         raise ImportError(f"{path} cannot be loaded")
     module = importlib.util.module_from_spec(spec)
@@ -502,9 +550,9 @@ class Repair:
         else:
             print(msg, flush=True)
 
-    def run(self) -> int:
+    def run(self, restore: str | None = None) -> int:
         try:
-            return self._run()
+            return self._check_restore(restore) if restore is not None else self._run()
         finally:
             for fd in self._fds:
                 os.close(fd)
@@ -531,10 +579,16 @@ class Repair:
                 verdict, _ = self.guard.verdict(self.state_path, self.repo)
                 self._say(f"update.lock is still held after the wait; the checkout is {verdict}")
                 return 1 if verdict == self.guard.MIXED_TREE else 0
+        locks = self._checkout_locks(deadline)
+        return self._judge_state(locks[0]) if locks else 1
+
+    def _checkout_locks(self, deadline: float) -> list[str] | None:
+        """genesis-checkout.lock, then no process holding a git lock; the git
+        locks' paths (index.lock first), or None (said why) at ``deadline``."""
         common = _out(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
         if self._hold(os.path.join(common, "genesis-checkout.lock"), deadline) is None:
             self._say("the checkout lock (genesis-checkout.lock) is still held after the wait")
-            return 1
+            return None
         locks = [path for _name, path in self._locks()]  # index.lock first
         while held := [p for p in locks if os.path.lexists(p) and _held_open(p)]:
             if _now() >= deadline:
@@ -542,9 +596,31 @@ class Repair:
                     f"{held[0]} is still held, or too recent to call stale (under"
                     f" {LOCK_FRESH_S} s old), after the wait; run the repair again"
                 )
-                return 1
+                return None
             _sleep(_POLL_S)
-        return self._judge_state(locks[0])
+        return locks
+
+    def _check_restore(self, ts: str) -> int:
+        """--restore TS --check, under the repair's own locks in its order (a
+        short wait): what a restore of that report would write, judged now;
+        writes nothing."""
+        deadline = _now() + self.wait
+        if self._hold(self._update_lock(), deadline) is None:
+            self._say(
+                "update.lock is still held after the wait (an update runs); nothing was judged"
+            )
+            return 1
+        if self._checkout_locks(deadline) is None:
+            return 1
+        verdict, reason = self.guard.verdict(self.state_path, self.repo)
+        if verdict == self.guard.MIXED_TREE:
+            self._say(
+                f"the checkout is half-written ({reason}); repair it first, nothing was judged"
+            )
+            return 1
+        backup = os.path.join(self.backups, ts + SUFFIX)
+        restore = _load_kit("live_move_restore.py")
+        return restore.check(types.SimpleNamespace(**globals()), self.repo, backup, self._say)
 
     def _judge_state(self, index_lock: str) -> int:
         with open(self.state_path, "rb") as fh:
@@ -969,10 +1045,12 @@ def main(argv: list[str]) -> int:
     mode.add_argument("--boot", action="store_true")
     mode.add_argument("--command", action="store_true")
     mode.add_argument("--dismiss", metavar="TS")
+    mode.add_argument("--restore", metavar="TS")
     mode.add_argument("--explain", action="store_true")
     ap.add_argument("state", nargs="?")
     ap.add_argument("repo", nargs="?")
-    ap.add_argument("--wait", type=int, default=7200)
+    ap.add_argument("--check", action="store_true")  # with --restore: judge only
+    ap.add_argument("--wait", type=int)  # 7200 s; 30 s with --restore
     try:
         args = ap.parse_args(argv)
     except SystemExit:
@@ -980,18 +1058,33 @@ def main(argv: list[str]) -> int:
     if args.explain:
         print(EXPLAIN)
         return 0
-    if not (args.state and args.repo):
+    ts = args.dismiss if args.dismiss is not None else args.restore
+    if not (args.state and args.repo) or (args.check and args.restore is None):
         return 2
-    if args.dismiss:  # REPAIR.json's readers stop reporting a dismissed repair's saves
+    if ts is not None and report_ts(ts + SUFFIX) != ts:  # #3733: never a path from an unchecked ts
+        _log(f"{ts!r} is not a repair report's ts")
+        return 2
+    if args.restore is not None and not args.check:
+        _log("restoring is not available yet; --restore TS --check judges what it would restore")
+        return 2
+    repo = os.path.abspath(args.repo)
+    if args.dismiss is not None:  # REPAIR.json's readers stop reporting a dismissed repair's saves
         home = os.path.dirname(os.path.abspath(args.state))
-        path = os.path.join(home, "deploy-backups", args.dismiss + SUFFIX, "REPAIR.json")
-        if (manifest := _load(path)) is None:
-            _log(f"no repair report at {path}")
+        backup = os.path.join(home, "deploy-backups", args.dismiss + SUFFIX)
+        try:
+            loaded = load_report(backup, repo)
+        except BadReport as exc:
+            _log(f"the repair report in {backup} is not read: {exc}")
             return 1
-        write_json(path, {**manifest, "dismissed_at": time.strftime("%FT%TZ", time.gmtime())})
+        if loaded is None:
+            _log(f"no repair report in {backup}")
+            return 1
+        stamp = time.strftime("%FT%TZ", time.gmtime())
+        write_json(os.path.join(backup, "REPAIR.json"), {**loaded["report"], "dismissed_at": stamp})
         return 0
+    wait = args.wait if args.wait is not None else 30 if args.restore is not None else 7200
     try:
-        return Repair(args.state, os.path.abspath(args.repo), args.boot, args.wait).run()
+        return Repair(args.state, repo, args.boot, wait).run(args.restore)
     except Exception as exc:  # noqa: BLE001 - every failure is named; at boot it sets the exit
         if args.boot and not _changed:  # a failed backup changed nothing in the checkout
             _log(f"skipped; nothing was changed ({type(exc).__name__}: {exc})")

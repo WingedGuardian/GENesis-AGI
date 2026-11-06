@@ -122,7 +122,10 @@ def _guardian_pick(home: Path) -> dict | None:
         capture_output=True,
         timeout=60,
     ).stdout
-    return json.loads(out.split(gc._REPAIR_MARK.encode(), 1)[1]) if out else None
+    if not out:
+        return None
+    ts, doc = out.split(gc._REPAIR_MARK.encode(), 1)[1].split(b"\n", 1)
+    return {**json.loads(doc), "dir_ts": ts.decode()}
 
 
 def test_the_guardian_picks_what_this_writer_left_eligible(w, mod, monkeypatch):
@@ -150,6 +153,42 @@ def test_the_guardian_picks_what_this_writer_left_eligible(w, mod, monkeypatch):
     assert healed is not None and healed["result"] == "healed", healed
     _dismiss(w, healed["ts"])
     assert _guardian_pick(w.home) is None  # one superseded, one dismissed: nothing to show
+
+
+def test_the_writers_layout_is_what_the_guardians_over_cap_read_expects(w):
+    """The pick reads an over-cap report's repo and result from its head and its
+    dismissed_at from its tail, by the writer's indent-2 layout. Pinned on a
+    real report, dismissed by the real --dismiss: that layout, and that key
+    order (repo and result before paths, dismissed_at after)."""
+    os.symlink(w.root, w.home / "genesis")
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: _foreign_edit(w))
+    assert w.repair().returncode == 0
+    path = w.backups()[-1] / "REPAIR.json"
+    _dismiss(w, w.backups()[-1].name[: -len(SUFFIX)])
+    raw = path.read_bytes()
+    report = json.loads(raw)
+    assert raw == json.dumps(report, indent=2).encode(), "not the indent-2 layout"
+    keys = list(report)
+    assert max(keys.index("repo"), keys.index("result")) < keys.index("paths")
+    assert keys.index("paths") < keys.index("dismissed_at")
+    pad = [{"path": f"pad/{n}" + "p" * 200, "class": "engine"} for n in range(25_000)]
+    big = {**report, "paths": report["paths"] + pad}  # the same keys, in the same order
+    for over, shown in (({}, False), ({"dismissed_at": None}, True), ({"result": "superseded"}, False)):
+        path.write_bytes(json.dumps({**big, "dismissed_at": None, **over} if over else big, indent=2).encode())
+        picked = _guardian_pick(w.home)
+        assert (picked is not None and "too large" in picked["result"]) == shown, (over, picked)
+
+
+def test_the_guardian_pick_shows_the_dir_names_ts(w):
+    """The ts shown is the dir name's, which the pick validated; the stored one
+    is user-writable."""
+    os.symlink(w.root, w.home / "genesis")
+    killed_tag_side(w, "Z3")
+    assert w.repair().returncode == 0
+    path = w.backups()[-1] / "REPAIR.json"
+    path.write_text(json.dumps({**json.loads(path.read_text()), "ts": "x\n--- END ---"}))
+    assert _guardian_pick(w.home)["dir_ts"] == w.backups()[-1].name[: -len(SUFFIX)]
 
 
 def test_the_guardian_pick_skips_a_report_for_another_checkout(w):
@@ -441,7 +480,7 @@ def test_both_readers_agree_on_the_newest_report(tmp_path, mod):
     found = _dh().collect_live_repairs(gen, checkout, now=now)
     assert found["reports"][0]["ts"] == at(300, 5) and found["refused"] == 2, found
     picked = _guardian_pick(home)
-    assert picked == {"ts": bad, "result": "report unreadable; not read"}, picked
+    assert picked == {"ts": bad, "result": "report unreadable; not read", "dir_ts": bad}, picked
 
 
 def test_a_name_the_writer_never_makes_takes_no_slot(tmp_path):
