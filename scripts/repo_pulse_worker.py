@@ -183,10 +183,13 @@ def _print_rechecks_due(due: list[dict] | None, *, db_path: Path | str | None = 
     print(f"Rechecks due: {len(due)}")
     for r in due:
         key = f"{r['repo']}#{r['pr_number']}"
+        target_db = (
+            f" --db-path {quote(str(Path(db_path).resolve()))}" if db_path is not None else ""
+        )
         if r.get("malformed"):
             print(
                 f"RECHECK  {key}  malformed rechecks or result history — read it with "
-                f"--verification-log --pr {r['pr_number']}"
+                f"--verification-log --pr {r['pr_number']}{target_db}"
             )
             continue
         latest = r.get("latest") or {}
@@ -202,9 +205,6 @@ def _print_rechecks_due(due: list[dict] | None, *, db_path: Path | str | None = 
         )
         print(f"      {r.get('detail')}")
         print(f"      recheck: {r.get('recheck')}")
-        target_db = (
-            f" --db-path {quote(str(Path(db_path).resolve()))}" if db_path is not None else ""
-        )
         print(
             f"      record : python3 scripts/pr_verification.py recheck --pr {r['pr_number']} "
             f"--index {r['index']} --result-file <result.json>{target_db}"

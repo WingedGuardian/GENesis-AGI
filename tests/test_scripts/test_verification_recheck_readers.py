@@ -113,6 +113,39 @@ def test_log_preserves_unreadable_and_ambiguous_rechecks_verbatim(tmp_path, caps
     assert record["rechecks"] == raw
 
 
+@pytest.mark.parametrize("folder_name", ["ledger", "ledger with spaces", "ledger's [quoted]"])
+def test_malformed_hint_preserves_the_selected_database_path(tmp_path, capsys, folder_name):
+    folder = tmp_path / folder_name
+    folder.mkdir()
+    db = folder / "synthetic.db"
+    _build_rechecks(db, [_EVENT])
+
+    async def corrupt():
+        async with aiosqlite.connect(db) as conn:
+            await conn.execute("UPDATE pr_verifications SET rechecks = ?", ("not-json",))
+            await conn.commit()
+
+    asyncio.run(corrupt())
+    _w._print_verification_backlog(str(db))
+    line = next(
+        line for line in capsys.readouterr().out.splitlines() if "malformed rechecks" in line
+    )
+    args = shlex.split(line.split("read it with ", 1)[1])
+    assert "--db-path" in args, "inspection must retain the selected database"
+    assert args[args.index("--db-path") + 1] == str(db.resolve())
+    pr = int(args[args.index("--pr") + 1])
+    _w._print_verification_log(args[args.index("--db-path") + 1], pr)
+    (record,) = _scoped_records(capsys.readouterr().out)
+    assert record["repo"] == REPO and record["pr_number"] == 40
+    assert record["rechecks"] == "not-json"
+
+
+def test_malformed_hint_without_a_selected_database_keeps_the_default(capsys):
+    _w._print_rechecks_due([{"repo": REPO, "pr_number": 40, "malformed": True}])
+    hint = capsys.readouterr().out.split("read it with ", 1)[1]
+    assert shlex.split(hint) == ["--verification-log", "--pr", "40"]
+
+
 def test_record_command_preserves_the_selected_database_path(tmp_path, capsys):
     folder = tmp_path / "ledger with spaces"
     folder.mkdir()
