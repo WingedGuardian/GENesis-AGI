@@ -793,12 +793,18 @@ esac
 
 
 def test_the_real_file_heals_with_stub_binaries(tmp_path):
-    # tailscaled must look started well over a rate-limit window ago on the
-    # SAME clock the helper reads. A freshly booted machine (a CI runner)
-    # cannot show that, and there the watchdog rightly declines to restart.
+    # tailscaled must look started over a rate-limit window ago on the SAME
+    # clock the helper reads. The stub says it started at boot (1 us: the helper
+    # refuses 0), and the rate limit cannot go below 300 s, so this needs that
+    # much uptime. A freshly booted machine (a CI runner) may not have it, and
+    # there the watchdog rightly declines to restart; the skip states the uptime.
+    min_uptime_s = 330  # the rate-limit floor (300 s), with a margin
     mono = time.clock_gettime(time.CLOCK_MONOTONIC)
-    if mono < 900:
-        pytest.skip("this machine booted too recently to show a daemon that started long ago")
+    if mono < min_uptime_s:
+        pytest.skip(
+            f"this machine booted too recently ({mono:.0f}s < {min_uptime_s}s) to show a daemon "
+            "that started long ago"
+        )
     for name, body in (("tailscale", _TAILSCALE_STUB), ("systemctl", _SYSTEMCTL_STUB)):
         stub = tmp_path / name
         stub.write_text(body)
@@ -810,7 +816,7 @@ def test_the_real_file_heals_with_stub_binaries(tmp_path):
     env = {
         "PATH": "/usr/bin:/bin",
         "STUB_DIR": str(tmp_path),
-        "STUB_START_US": str(int((mono - 600) * 1e6)),
+        "STUB_START_US": "1",
         "NETWD_TS_RATE_LIMIT_SEC": "300",
         "NETWD_TAILSCALE_BIN": str(tmp_path / "tailscale"),
         "NETWD_SYSTEMCTL": str(tmp_path / "systemctl"),

@@ -1,0 +1,5 @@
+#!/bin/bash
+# Explicit operator entry point; no install, login or activation on import.
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+exec "$root/.venv/bin/python" "$root/scripts/codex_validator_launcher.py" "$@"

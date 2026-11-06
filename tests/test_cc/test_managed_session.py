@@ -305,6 +305,8 @@ async def test_incomplete_output_never_claims_success(db, native, returned):
     row = await cc_sessions.get_by_id(db, sid)
     assert row["status"] == "failed"
     assert json.loads(row["metadata"])["result_partial"] is True
+    # Recorded as a partial run, not a bare failure with no reason.
+    assert (row["outcome"], row["outcome_reason"]) == ("partial", "partial_result")
 
 
 async def test_deadline_includes_start_hook_wait(db, native):
@@ -921,6 +923,35 @@ async def test_orphan_with_committed_outcome_is_finished_not_overwritten(
     assert meta["native_state"] == native_state
     assert meta["result_committed"] is True
     assert "error" not in meta
+
+
+@pytest.mark.parametrize(
+    ("native_state", "partial", "error", "outcome", "reason"),
+    [
+        ("failed", True, "execution_failed", "partial", "partial_result"),
+        ("cancelled", True, "cancelled", "failed", "cancelled"),
+        ("failed", False, "deadline_exceeded", "failed", "deadline_exceeded"),
+        ("succeeded", False, None, "unreported", None),
+    ],
+)
+async def test_orphan_with_committed_outcome_keeps_its_outcome(
+    db, native_state, partial, error, outcome, reason
+):
+    """A restart between _finalize's metadata write and its status write: boot
+    records the outcome _finalize would have, not a bare failure."""
+    req = request()
+    sid = await prepare(
+        db,
+        req,
+        native_state=native_state,
+        result_committed=True,
+        result_path="/synthetic/result.md",
+        result_partial=partial,
+        error=error,
+    )
+    assert await reconcile_orphans(db) == 1
+    row = await cc_sessions.get_by_id(db, sid)
+    assert (row["outcome"], row["outcome_reason"]) == (outcome, reason)
 
 
 async def test_successful_managed_run_lets_the_child_flush_before_the_group_kill(

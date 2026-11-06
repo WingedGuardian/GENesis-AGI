@@ -5,7 +5,8 @@ Recovery must not wait for a person and must never start code bootstrap did
 not run on, so the repair only goes back toward the rollback tag, and loses
 nothing: every node it changes is copied to deploy-backups/<ts>-live-move-repair/
 first. A node the update did not write is restored too (leaving it would leave
-the tree mixed) and reported with the step that puts it back. The path set,
+the tree mixed) and reported, with the restore command that puts it back
+(never a shell step: #3868). The path set,
 the two-dot diff a switch writes, contains everything the guard counts as
 residue, and only the guard's SAFE afterwards clears the state; a target whose
 objects a power loss took cannot be judged, so the whole tree is restored to
@@ -19,7 +20,9 @@ at boot."""
 from __future__ import annotations
 
 import argparse
+import calendar
 import contextlib
+import errno
 import fcntl
 import functools
 import hashlib
@@ -27,12 +30,12 @@ import importlib.util
 import json
 import os
 import re
-import shlex
 import shutil
 import stat
 import subprocess
 import sys
 import time
+import types
 
 _LIB = os.path.dirname(os.path.abspath(__file__))
 BOOT_BUDGET_S = 60  # every wait at boot, inside systemd's default 90 s start timeout
@@ -44,6 +47,10 @@ _now, _sleep = time.monotonic, time.sleep  # a test's fake clock replaces both
 _changed = False  # set when the checkout itself starts to change (_apply)
 
 
+class TooLarge(Exception):
+    """A node over a reader's byte or entry budget (the restore check's)."""
+
+
 class RepairError(Exception):
     pass
 
@@ -52,9 +59,13 @@ def _log(msg: str) -> None:
     print(f"live-move repair: {msg}", file=sys.stderr, flush=True)
 
 
+#: Every git call's options: no fsmonitor program and no hook from the repository's config.
+GIT_C = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
+
+
 def _git(repo: str, *args: str, check: bool = True, data: bytes | None = None):
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    p = subprocess.run(["git", "-C", repo, *args], capture_output=True, input=data, env=env)
+    p = subprocess.run(["git", *GIT_C, "-C", repo, *args], capture_output=True, input=data, env=env)
     if check and p.returncode != 0:
         why = p.stderr.decode(errors="replace").strip()
         raise RepairError(f"git {args[0]} failed (exit {p.returncode}): {why}")
@@ -103,9 +114,34 @@ def _beyond_link(repo: str, p: str) -> bool:
     return _link_parent(repo, p) is not None
 
 
-def _node(repo: str, p: str, fmt: str) -> tuple[str, str] | None:
+def _blob_id(full: str, st: os.stat_result, fmt: str, budget=None) -> str:
+    """The blob id of the regular file ``st`` (its lstat) is, read in 1 MiB
+    chunks from an fd opened without following a link or blocking on a FIFO,
+    and only while it is still that file: a node swapped after the lstat (a
+    FIFO, a link, another file) or changed while read raises OSError, never
+    blocks or reads something else. ``budget(size)`` may refuse it first."""
+    fd = os.open(full, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        now = os.fstat(fd)
+        if not stat.S_ISREG(now.st_mode) or (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
+            raise OSError(errno.ESTALE, "replaced after it was looked at", full)
+        if budget is not None:
+            budget(now.st_size)
+        h, left = hashlib.new(fmt, b"blob %d\0" % now.st_size), now.st_size
+        while left > 0 and (chunk := os.read(fd, min(1 << 20, left))):
+            h.update(chunk)
+            left -= len(chunk)
+        if left or os.read(fd, 1):
+            raise OSError(errno.ESTALE, "changed while it was read", full)
+        return h.hexdigest()
+    finally:
+        os.close(fd)
+
+
+def _node(repo: str, p: str, fmt: str, budget=None) -> tuple[str, str] | None:
     """(mode, blob id) of the disk node, ("dir", "") or ("other", ""); None if absent,
-    or beyond a symlinked or non-directory parent (never read through one)."""
+    or beyond a symlinked or non-directory parent (never read through one).
+    A regular file is read as _blob_id reads it, under ``budget`` if given."""
     full = os.path.join(repo, p)
     if _beyond_link(repo, p):
         return None
@@ -120,8 +156,7 @@ def _node(repo: str, p: str, fmt: str) -> tuple[str, str] | None:
         # unchanged to `git status`, MEASURED git 2.43): a restore gives other bits
         # the umask's, as any checkout does, and only to the tag's own bytes.
         mode = "100755" if st.st_mode & stat.S_IXUSR else "100644"
-        with open(full, "rb") as fh:
-            data = fh.read()
+        return mode, _blob_id(full, st, fmt, budget)
     else:
         return ("dir" if stat.S_ISDIR(st.st_mode) else "other", "")
     return mode, hashlib.new(fmt, b"blob %d\0" % len(data) + data).hexdigest()
@@ -150,16 +185,122 @@ def _special(full: str) -> dict:
     return {"type": kind, "mode": f"{stat.S_IMODE(st.st_mode):04o}"}
 
 
-def _copy_node(src: str, dst: str, unsaved: list[dict], root: str) -> None:
-    """copytree's copy function: a FIFO is made again (it holds no bytes); a
-    socket or a device cannot be, so it is recorded instead of failing the
-    whole copy (copy2 raises on both)."""
+#: A saved file over the restore check's per-file budget (live_move_restore's
+#: FILE_BYTES; a test holds them equal) is recorded with no hash: the restore
+#: refuses it (`too-large`) rather than read it.
+HASH_BYTES = 256 * 1024 * 1024
+#: SAVED.json's cap, as REPORT_BYTES is REPAIR.json's. A file's record is
+#: about 110 bytes plus its path (MEASURED: 207 per record with 96-byte paths),
+#: so this holds the restore check's ENTRIES (200,000) records of paths up to
+#: about 55 bytes; past it a copy goes unrecorded, which the restore refuses.
+SAVED_BYTES = 32 * 1024 * 1024
+#: The alert body's cap. queue_alert gets it as one argv string and passes it
+#: on as one environment string, and one of 131,072 bytes or more is E2BIG
+#: (MEASURED, Linux MAX_ARG_STRLEN; `getconf ARG_MAX`, 2,097,152, bounds all of
+#: them together): 16 KiB each leaves room for any environment. The full text
+#: is in REPAIR.json.
+ALERT_BYTES = 16 * 1024
+
+
+class _Saved:
+    """SAVED.json, the integrity record of a report's saved copies: per path
+    under the backup dir, a regular file's sha256 (null over HASH_BYTES) and
+    the mode the checkout had, a symlink's target, a FIFO's mode. Past
+    SAVED_BYTES nothing more is recorded and `complete` says so: a copy with
+    no record has no hash, which a restore refuses."""
+
+    def __init__(self, backup: str) -> None:
+        self.backup, self.files, self.complete = backup, {}, True
+        self.left = SAVED_BYTES - len('{"files": {}, "complete": false}')
+
+    def add(self, dst: str, record: dict) -> None:
+        key = os.path.relpath(dst, self.backup)
+        cost = len(json.dumps(key)) + len(json.dumps(record)) + 4  # ": " and ", "
+        if cost > self.left:
+            self.complete = False
+            return
+        self.left -= cost
+        self.files[key] = record
+
+    def data(self) -> dict:
+        return {"files": self.files, "complete": self.complete}
+
+
+#: What shutil.copy2 skips when copying extended attributes (shutil._copyxattr,
+#: Python 3.12): listing on a file system that has none, and setting one this
+#: user may not set or the target file system does not take.
+_XATTR_LIST_SKIP = frozenset({errno.ENOTSUP, errno.ENODATA, errno.EINVAL})
+_XATTR_SET_SKIP = _XATTR_LIST_SKIP | {errno.EPERM, errno.EACCES}
+
+
+def _copy_xattrs(src_fd: int, dst_fd: int) -> None:
+    """The extended attributes copy2 copied, from fd to fd. The repair deletes
+    the original, so what the copy lacks is gone; one this user may not set
+    (security.*, trusted.*) is skipped, as copy2 skips it."""
+    if not hasattr(os, "listxattr"):
+        return
+    try:
+        names = os.listxattr(src_fd)
+    except OSError as exc:
+        if exc.errno in _XATTR_LIST_SKIP:
+            return
+        raise
+    for name in names:
+        try:
+            os.setxattr(dst_fd, name, os.getxattr(src_fd, name))
+        except OSError as exc:
+            if exc.errno not in _XATTR_SET_SKIP:
+                raise
+
+
+def _copy_file(src: str, dst: str) -> dict:
+    """Copy the regular file ``src`` to a new ``dst``, hashing the bytes as they
+    are written (one read: a boot repair runs inside BOOT_BUDGET_S), from an fd
+    opened without following a link or blocking on a FIFO; times kept as copy2
+    keeps them, the mode without group or world write. Returns its record."""
+    fd = os.open(src, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError(errno.ESTALE, "no longer a regular file", src)
+        h, size = hashlib.sha256(), 0
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        out = os.open(dst, flags, 0o600)
+        try:
+            while chunk := os.read(fd, 1 << 20):
+                size += len(chunk)
+                h.update(chunk)
+                view = memoryview(chunk)
+                while view:
+                    view = view[os.write(out, view) :]
+            _copy_xattrs(fd, out)
+        finally:
+            os.close(out)
+    finally:
+        os.close(fd)
+    os.utime(dst, ns=(st.st_atime_ns, st.st_mtime_ns))
+    mode = stat.S_IMODE(st.st_mode)
+    os.chmod(dst, mode & ~0o022)
+    sha = h.hexdigest() if size <= HASH_BYTES else None
+    return {"type": "file", "mode": f"{mode:04o}", "sha256": sha}
+
+
+def _copy_node(src: str, dst: str, unsaved: list[dict], root: str, saved: _Saved) -> None:
+    """copytree's copy function, and every saved node's: a file is copied and
+    hashed, a symlink and a FIFO (it holds no bytes) made again, each recorded
+    in ``saved``; a socket or a device cannot be, so it is recorded in
+    ``unsaved`` instead of failing the whole copy (copy2 raises on both)."""
     st = os.lstat(src)
-    if stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
-        shutil.copy2(src, dst, follow_symlinks=False)
+    if stat.S_ISREG(st.st_mode):
+        saved.add(dst, _copy_file(src, dst))
+    elif stat.S_ISLNK(st.st_mode):
+        os.symlink(os.readlink(src), dst)
+        saved.add(dst, {"type": "symlink", "target": os.readlink(dst)})
     elif stat.S_ISFIFO(st.st_mode):
+        mode = stat.S_IMODE(st.st_mode)
         os.mkfifo(dst)
-        os.chmod(dst, stat.S_IMODE(st.st_mode))
+        os.chmod(dst, mode & ~0o022)
+        saved.add(dst, {"type": "fifo", "mode": f"{mode:04o}"})
     else:
         unsaved.append({"path": os.path.relpath(src, root), **_special(src)})
 
@@ -193,8 +334,17 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _flock(path: str, deadline: float) -> int | None:
-    """flock, as every other holder of update.lock takes it; None if still held at ``deadline``."""
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    """flock, as every other holder of update.lock takes it; None if still held at ``deadline``.
+    A lock path that is a symlink (never followed) or not a regular file is refused."""
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+    except OSError as exc:
+        if exc.errno != errno.ELOOP:
+            raise
+        raise RepairError(f"{path} is a symlink; it is not taken as a lock") from None
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise RepairError(f"{path} is not a regular file; it is not taken as a lock")
     while True:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -254,11 +404,18 @@ def _fsync_dir(path: str) -> None:
         os.close(fd)
 
 
-def write_json(path: str, data: dict) -> None:
+def write_json(path: str, data: dict, private: bool = False, indent: int | None = 2) -> None:
+    """Atomically and durably; ``private``: mode 0600 (a report's files), the
+    temp file's mode from its creation."""
     tmp = f"{path}.{os.getpid()}.tmp"
+    # The temp name is guessable: a node left or planted there is removed (a
+    # link, not its target) and the temp made fresh, never followed.
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(tmp)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
     try:
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2)
+        with open(os.open(tmp, flags, 0o600 if private else 0o666), "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=indent)
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
@@ -276,6 +433,122 @@ def _load(path: str) -> dict | None:
     except (OSError, ValueError, RecursionError):
         return None
     return data if isinstance(data, dict) else None
+
+
+#: A report dir's name is its ts (_backup_dir: the UTC time, then the pid)
+#: followed by SUFFIX. ASCII digits only: \d also matches other scripts' digits.
+_TS_FORMAT = "%Y%m%dT%H%M%SZ"
+REPORT_NAME = re.compile(r"([0-9]{8}T[0-9]{6}Z-[0-9]+)" + re.escape(SUFFIX))
+#: A report over either cap is not read. The writer stored about 615 bytes per
+#: engine row and 954 per foreign row while it kept a reapply step per foreign
+#: row (indent 2, MEASURED); without it (#3868) a whole report measured 740
+#: bytes per row with 96-byte paths (231,778 for 313 rows), so REPORT_BYTES
+#: still binds first, at roughly 5,000-6,800 rows; REPORT_ROWS is a backstop
+#: for a report the writer did not make.
+REPORT_BYTES = 4 * 1024 * 1024
+REPORT_ROWS = 20_000
+
+
+class BadReport(Exception):
+    """A report dir or REPAIR.json the writer does not make; never read further."""
+
+
+class NotThisCheckout(BadReport):
+    """A report whose ``repo`` names another checkout (or none)."""
+
+
+def report_ts(name: str) -> str | None:
+    """The ts of a report dir named as _backup_dir names it, else None."""
+    m = REPORT_NAME.fullmatch(name)
+    return m.group(1) if m else None
+
+
+#: A report dir named more than this many seconds ahead of the reader's clock
+#: is not a report (written while the clock ran ahead, as at a boot before NTP
+#: sync): no reader takes it as the newest. Deploy health refuses it; the
+#: guardian's pick skips it (collector._REPAIR_FUTURE_S, held equal by a test).
+REPORT_FUTURE_S = 300
+
+
+def report_order(ts: str) -> tuple[int, int]:
+    """A report ts (``YYYYmmddTHHMMSSZ-<pid>``) as the readers' one sort key:
+    its UTC seconds, then its pid as a number (so pid 10000 is newer than 9999
+    in the same second). ValueError if the ts names no date or pid."""
+    stamp, pid = ts.split("-", 1)
+    return calendar.timegm(time.strptime(stamp, _TS_FORMAT)), int(pid)
+
+
+def load_report(path: str, repo: str) -> dict | None:
+    """One report, read as untrusted input: the readers' single way in.
+
+    ``path`` is the report dir, ``repo`` the deploy checkout the reader serves.
+    The dir must be a directory (never a symlink) named as _backup_dir names
+    it; REPAIR.json is opened without following a symlink or blocking on a
+    FIFO, must be a regular file of at most REPORT_BYTES holding a JSON
+    object; its ``repo`` must name ``repo`` (see same_repo: no reader runs git
+    in, or reports for, a checkout a report names); ``paths`` a list of at
+    most REPORT_ROWS entries. Returns {"ts", "report", "rows" (the dict rows),
+    "mtime"}; None when the dir holds no REPAIR.json yet (a run that wrote
+    none, or is writing it); raises BadReport for anything else."""
+    ts = report_ts(os.path.basename(path))
+    if ts is None:
+        raise BadReport("not a name the repair writes")
+    try:
+        if not stat.S_ISDIR(os.lstat(path).st_mode):
+            raise BadReport("not a directory")
+        fd = os.open(os.path.join(path, "REPAIR.json"), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise BadReport(f"cannot be opened ({exc.strerror})") from None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise BadReport("REPAIR.json is not a regular file")
+        chunks, size = [], 0
+        while size <= REPORT_BYTES and (chunk := os.read(fd, REPORT_BYTES + 1 - size)):
+            chunks.append(chunk)
+            size += len(chunk)
+    except OSError as exc:
+        raise BadReport(f"cannot be read ({exc.strerror})") from None
+    finally:
+        os.close(fd)
+    if size > REPORT_BYTES:
+        raise BadReport(f"over {REPORT_BYTES} bytes")
+    try:
+        report = json.loads(b"".join(chunks))
+    except (ValueError, RecursionError):
+        raise BadReport("not JSON") from None
+    if not isinstance(report, dict):
+        raise BadReport("not a JSON object")
+    if not same_repo(report.get("repo"), repo):
+        raise NotThisCheckout("not this checkout's report")
+    paths = report.get("paths")
+    if not isinstance(paths, list) or len(paths) > REPORT_ROWS:
+        raise BadReport(f"paths is not a list of at most {REPORT_ROWS} rows")
+    rows = [r for r in paths if isinstance(r, dict)]
+    return {"ts": ts, "report": report, "rows": rows, "mtime": st.st_mtime}
+
+
+#: Longest ``repo`` a report may name (PATH_MAX); a longer one is refused
+#: before realpath walks it.
+REPO_BYTES = 4096
+
+
+def same_repo(named, repo: str) -> bool:
+    """Whether a report's ``repo`` field names ``repo``. The field is untrusted:
+    it must be a str with no NUL whose file-system bytes (os.fsencode: a
+    non-UTF-8 path the writer stored round-trips as surrogate escapes; any
+    other lone surrogate cannot encode and is refused) number at most
+    REPO_BYTES, checked before realpath runs; a realpath error is a refusal."""
+    if not isinstance(named, str) or "\0" in named:
+        return False
+    try:
+        if len(os.fsencode(named)) > REPO_BYTES:
+            return False
+        return os.path.realpath(named) == os.path.realpath(repo)
+    except (UnicodeError, ValueError, OSError):
+        return False
 
 
 def manifests(backups: str) -> list[tuple[str, dict]]:
@@ -299,8 +572,13 @@ def _ephemeral() -> str:
 
 
 def _load_guard():
-    path = os.path.join(_LIB, "update_state_guard.py")
-    spec = importlib.util.spec_from_file_location("_live_repair_guard", path)
+    return _load_kit("update_state_guard.py")
+
+
+def _load_kit(name: str):
+    """A kit source beside this one (the guard; live_move_restore.py)."""
+    path = os.path.join(_LIB, name)
+    spec = importlib.util.spec_from_file_location(f"_live_repair_{name[:-3]}", path)
     if spec is None or spec.loader is None:
         raise ImportError(f"{path} cannot be loaded")
     module = importlib.util.module_from_spec(spec)
@@ -308,67 +586,10 @@ def _load_guard():
     return module
 
 
-def reapply_step(repo: str, backup: str, row: dict, below: list[str] | tuple = ()) -> str:
-    """The shell step that puts a foreign row back the way the repair found it.
-    Its index part runs first, as one `update-index -z --index-info` call (a
-    mode-0 record drops the restored entry, the saved entries follow): git
-    applies that stream whole or not at all (MEASURED, git 2.43), and the saved
-    blobs are written back to the object store before it, so nothing is
-    removed before the step that can fail. Records are NUL-terminated: a path
-    may hold a newline. ``below`` are the row paths under this one: the restore
-    put their entries in the index, and git silently skips a file entry added
-    above one (MEASURED, git 2.43), so a row that re-adds an entry drops them
-    first (only rows whose own steps run after, parents first, and re-add what
-    they held, or that held nothing).
-    A row the repair saw beyond a symlinked or non-directory parent
-    (``unreachable_through``) gets its index state only: once that parent's
-    own step puts it back, the path is not in the checkout, and no step may
-    act through it."""
-    q, path = shlex.quote, row["path"]
-    dst = os.path.join(repo, path)
-    steps = []
-    if [tuple(e) for e in row["index"]] != _as_index(row["tag"]):
-        for rel in row.get("blobs") or []:
-            blob = q(os.path.join(backup, rel))
-            steps.append(f"git -C {q(repo)} hash-object -w --no-filters -- {blob} >/dev/null")
-        null = "0" * len((row["index"] or [row["tag"]])[0][1])
-        # Only a stage-0 file entry conflicts with entries below it; an unmerged
-        # one (stages 1-3) sits beside them, so dropping them would only stage
-        # deletions nothing puts back.
-        stage0 = any(s == "0" for _m, _o, s in row["index"])
-        drops = [*below, path] if stage0 else [path]
-        recs = [f"0 {null}\t{d}" for d in drops]
-        recs += [f"{m} {o} {s}\t{path}" for m, o, s in row["index"]]
-        fields = " ".join(q(r) for r in recs)
-        steps.append(f"printf '%s\\0' {fields} | git -C {q(repo)} update-index -z --index-info")
-    parent = row.get("unreachable_through")
-    if parent and row["disk_changed"]:
-        note = (
-            f"{path} was not reachable through {parent} (a symlink or non-directory);"
-            " only its index state is re-applied"
-        )
-        steps.append(f"echo {q(note)} >&2")
-    elif row["disk_changed"]:
-        steps.append(f"rm -rf -- {q(dst)}")
-        special = row.get("special")
-        if row["saved_as"]:
-            src = os.path.join(backup, row["saved_as"])
-            steps += [f"mkdir -p -- {q(os.path.dirname(dst))}", f"cp -a -- {q(src)} {q(dst)}"]
-        elif special and special["type"] == "fifo":
-            steps.append(f"mkdir -p -- {q(os.path.dirname(dst))}")
-            steps.append(f"mkfifo -m {special['mode']} -- {q(dst)}")
-        elif special:
-            gone = (
-                f"{path} was a {special['type']} (mode {special['mode']}); it held nothing"
-                " to save, so whatever made it must make it again"
-            )
-            steps.append(f"echo {q(gone)} >&2")
-    flag = row["flag"]
-    if flag and flag in "Ss":
-        steps.append(f"git -C {q(repo)} update-index --skip-worktree -- {q(path)}")
-    if flag and flag.islower():  # `s` is both (git-ls-files(1) -v and -t)
-        steps.append(f"git -C {q(repo)} update-index --assume-unchanged -- {q(path)}")
-    return " && ".join(steps)
+def _update_lock(home: str) -> str:
+    locks = os.path.join(os.environ.get("GENESIS_HOME") or home, "locks")
+    os.makedirs(locks, exist_ok=True)
+    return os.path.join(locks, "update.lock")
 
 
 class Repair:
@@ -376,6 +597,7 @@ class Repair:
         self.state_path, self.repo, self.boot, self.wait = state_path, repo, boot, wait
         self.home = os.path.dirname(os.path.abspath(state_path))
         self.backups = os.path.join(self.home, "deploy-backups")
+        self.backups_warning: str | None = None
         self.guard = _load_guard()
         self._fds: list[int] = []
 
@@ -391,17 +613,15 @@ class Repair:
         else:
             print(msg, flush=True)
 
-    def run(self) -> int:
+    def run(self, restore: str | None = None) -> int:
         try:
-            return self._run()
+            return self._check_restore(restore) if restore is not None else self._run()
         finally:
             for fd in self._fds:
                 os.close(fd)
 
     def _update_lock(self) -> str:
-        locks = os.path.join(os.environ.get("GENESIS_HOME") or self.home, "locks")
-        os.makedirs(locks, exist_ok=True)
-        return os.path.join(locks, "update.lock")
+        return _update_lock(self.home)
 
     def _run(self) -> int:
         if not os.path.lexists(self.state_path):
@@ -420,10 +640,16 @@ class Repair:
                 verdict, _ = self.guard.verdict(self.state_path, self.repo)
                 self._say(f"update.lock is still held after the wait; the checkout is {verdict}")
                 return 1 if verdict == self.guard.MIXED_TREE else 0
+        locks = self._checkout_locks(deadline)
+        return self._judge_state(locks[0]) if locks else 1
+
+    def _checkout_locks(self, deadline: float) -> list[str] | None:
+        """genesis-checkout.lock, then no process holding a git lock; the git
+        locks' paths (index.lock first), or None (said why) at ``deadline``."""
         common = _out(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
         if self._hold(os.path.join(common, "genesis-checkout.lock"), deadline) is None:
             self._say("the checkout lock (genesis-checkout.lock) is still held after the wait")
-            return 1
+            return None
         locks = [path for _name, path in self._locks()]  # index.lock first
         while held := [p for p in locks if os.path.lexists(p) and _held_open(p)]:
             if _now() >= deadline:
@@ -431,9 +657,30 @@ class Repair:
                     f"{held[0]} is still held, or too recent to call stale (under"
                     f" {LOCK_FRESH_S} s old), after the wait; run the repair again"
                 )
-                return 1
+                return None
             _sleep(_POLL_S)
-        return self._judge_state(locks[0])
+        return locks
+
+    def _check_restore(self, ts: str) -> int:
+        """--restore TS --check, under the repair's own locks in its order (a
+        short wait): what a restore of that report would write, judged now;
+        writes nothing."""
+        deadline = _now() + self.wait
+        if self._hold(self._update_lock(), deadline) is None:
+            self._say(
+                "update.lock is still held after the wait (an update runs); nothing was judged"
+            )
+            return 1
+        if self._checkout_locks(deadline) is None:
+            return 1
+        verdict, reason = self.guard.verdict(self.state_path, self.repo)
+        if verdict == self.guard.MIXED_TREE:
+            self._say(
+                f"the checkout is half-written ({reason}); repair it first, nothing was judged"
+            )
+            return 1
+        kit = _load_kit("live_move_restore.py")
+        return kit.check(types.SimpleNamespace(**globals()), self.repo, self.home, ts, self._say)
 
     def _judge_state(self, index_lock: str) -> int:
         with open(self.state_path, "rb") as fh:
@@ -492,14 +739,16 @@ class Repair:
         readable = rows is not None
         rows = rows if readable else self._rows(None, index, flags)
         manifest = {"ts": ts, "repo": repo, "state_row": state, "tag": tag, "other": to}
+        # `reapply` stays [] (#3868: no generated shell) so older readers stay valid.
         manifest.update(result=None, paths=rows, reapply=[], dismissed_at=None, index_rebuilt=torn)
+        manifest["integrity"] = "SAVED.json"
         self._save(backup, manifest)
         self._apply(rows, index)
         _git(repo, "update-index", "-q", "--refresh", check=False)
         return self._after(backup, manifest, state, raw, readable, index_lock)
 
     def _backup_dir(self) -> str:
-        ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()) + f"-{os.getpid()}"
+        ts = time.strftime(_TS_FORMAT, time.gmtime()) + f"-{os.getpid()}"
         return os.path.join(self.backups, ts + SUFFIX)
 
     def _locks(self) -> list[tuple[str, str]]:
@@ -519,12 +768,45 @@ class Repair:
         restores (the restore needs index.lock gone)."""
         stale = [(n, p) for n, p in self._locks() if os.path.lexists(p) and not _held_open(p)]
         for name, path in stale:
+            self._report_dir(backup)
             os.makedirs(os.path.dirname(os.path.join(backup, "git", name)), exist_ok=True)
             shutil.copy2(path, os.path.join(backup, "git", name), follow_symlinks=False)
         if stale:
             self._sync(backup)
         for _name, path in stale:
             os.unlink(path)
+
+    def _report_dir(self, backup: str) -> None:
+        """deploy-backups and the report dir, this user's alone (owner ruling
+        73b6285d): made 0700, and an existing deploy-backups of this user's set
+        to 0700 (a symlink or another user's is left for the restore's origin
+        check to refuse). The report dir is one this run made: a node already at
+        its name that is not a 0700 directory of this user's (a planted link or
+        a dir others can write) refuses before a byte is saved, and _sync's
+        walk never follows one. What is put below loses group and world write
+        in _sync."""
+        os.makedirs(self.backups, mode=0o700, exist_ok=True)
+        st = os.lstat(self.backups)
+        if stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and st.st_mode & 0o077:
+            os.chmod(self.backups, 0o700)
+            st = os.lstat(self.backups)
+        # The restore's origin rule (live_move_restore._anchor) refuses such a
+        # root. The repair still saves into it and heals, since refusing would
+        # leave the checkout half-written, and says so (owner ruling, #3974 item 6).
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022:
+            self.backups_warning = (
+                f"{self.backups} is not a folder of this user's alone (a link, another"
+                " user's, or writable by others): the backup was saved there, but the"
+                " restore check refuses reports under it; move the report into a 0700"
+                " deploy-backups of this user's to restore it"
+            )
+        with contextlib.suppress(FileExistsError):
+            os.mkdir(backup, 0o700)
+        st = os.lstat(backup)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+            raise RepairError(
+                f"{backup} is not a directory of this user's alone; nothing was saved"
+            )
 
     def _keep_index(self, backup: str) -> bool:
         """Copy .git/index byte for byte into the backup before anything
@@ -533,7 +815,8 @@ class Repair:
         from HEAD, the tag; its staged entries cannot be read, so its bytes are
         the record. Returns whether it was rebuilt."""
         index = _out(self.repo, "rev-parse", "--path-format=absolute", "--git-path", "index")
-        os.makedirs(os.path.join(backup, "git"))
+        self._report_dir(backup)
+        os.mkdir(os.path.join(backup, "git"))
         if not os.path.lexists(index):
             return False
         shutil.copy2(index, os.path.join(backup, "git", "index"))
@@ -649,9 +932,10 @@ class Repair:
         the Genesis home."""
         for older, m in manifests(self.backups):
             if m.get("result") is None and os.path.dirname(older) != backup:
-                write_json(older, {**m, "result": "superseded"})  # a run killed partway
+                write_json(older, {**m, "result": "superseded"}, private=True)  # killed partway
         # A directory row is copied whole; a row inside it is saved by that copy.
         whole = {r["path"] for r in manifest["paths"] if r["disk"] == "dir" and r["disk_changed"]}
+        saved = _Saved(backup)
         for row in manifest["paths"]:
             if row["class"] == "foreign" and [tuple(e) for e in row["index"]] != _as_index(
                 row["tag"]
@@ -664,40 +948,41 @@ class Repair:
                 continue
             src, dst = os.path.join(self.repo, row["path"]), os.path.join(backup, row["saved_as"])
             os.makedirs(os.path.dirname(dst), exist_ok=True)
+            copy = functools.partial(
+                _copy_node, unsaved=row["unsaved"], root=self.repo, saved=saved
+            )
             if row["disk"] == "dir":
-                copy = functools.partial(_copy_node, unsaved=row["unsaved"], root=self.repo)
                 shutil.copytree(src, dst, symlinks=True, copy_function=copy)
+                # copytree makes every symlink itself, never through copy_function.
+                for top, dirs, files in os.walk(dst):
+                    for name in dirs + files:
+                        if os.path.islink(link := os.path.join(top, name)):
+                            saved.add(link, {"type": "symlink", "target": os.readlink(link)})
             else:
-                shutil.copy2(src, dst, follow_symlinks=False)
-        below: dict[str, list[str]] = {}
-        for r in manifest["paths"]:
-            # Only rows whose own step re-adds what they held, or that held
-            # nothing: dropping an engine row's entry would leave a staged
-            # deletion nothing puts back.
-            if r["class"] != "foreign" and r["index"]:
-                continue
-            for d in _parents(r["path"]):
-                below.setdefault(d, []).append(r["path"])
-        # Parents first: a parent's step puts back the node its children sit under.
-        foreign = sorted(
-            (r for r in manifest["paths"] if r["class"] == "foreign"),
-            key=lambda r: r["path"].split("/"),
-        )
-        manifest["reapply"] = [
-            reapply_step(self.repo, backup, r, below.get(r["path"], ())) for r in foreign
-        ]
+                copy(src, dst)
+        write_json(os.path.join(backup, "SAVED.json"), saved.data(), private=True, indent=None)
         self._sync(backup)
-        write_json(os.path.join(backup, "REPAIR.json"), manifest)
+        write_json(os.path.join(backup, "REPAIR.json"), manifest, private=True)
         self._retire_locks(backup)
 
     def _sync(self, backup: str) -> None:
         """Make the backup durable: its files and directories, then its own
-        entry and deploy-backups' (it may be new)."""
+        entry and deploy-backups' (it may be new). On the way, every node below
+        the report dir but a symlink (its mode means nothing) loses its group
+        and world write bits: copytree's directories and the index and lock
+        copies keep the checkout's or the umask's."""
         for top, _subdirs, files in os.walk(backup, topdown=False):
             for f in files:
-                if stat.S_ISREG(os.lstat(os.path.join(top, f)).st_mode):  # a FIFO would block
-                    with open(os.path.join(top, f), "rb") as fh:
+                full = os.path.join(top, f)
+                st = os.lstat(full)
+                if not stat.S_ISLNK(st.st_mode) and st.st_mode & 0o022:
+                    os.chmod(full, stat.S_IMODE(st.st_mode) & ~0o022)
+                if stat.S_ISREG(st.st_mode):  # a FIFO would block
+                    with open(full, "rb") as fh:
                         os.fsync(fh.fileno())
+            mode = os.lstat(top).st_mode
+            if mode & 0o022:
+                os.chmod(top, stat.S_IMODE(mode) & ~0o022)
             _fsync_dir(top)
         _fsync_dir(self.backups)
         _fsync_dir(self.home)
@@ -827,21 +1112,51 @@ class Repair:
         if manifest["index_rebuilt"]:
             result += "; the index was torn: rebuilt from the tag, its bytes saved as git/index"
         manifest["result"] = result
-        write_json(os.path.join(backup, "REPAIR.json"), manifest)
+        write_json(os.path.join(backup, "REPAIR.json"), manifest, private=True)
         body = f"{result}. The checkout went back to {manifest['tag'][:12]}; what changed is saved in {backup}."
-        if manifest["reapply"]:
-            body += " These paths were not the update's; to re-apply them:\n"
-            body += "\n".join(manifest["reapply"])
+        foreign = sum(1 for r in manifest["paths"] if r["class"] == "foreign")
+        if foreign:
+            cmd = f"scripts/deploy_candidates repair-move --restore {manifest['ts']}"
+            body += (
+                f" {foreign} path(s) were not the update's. To see what putting them back"
+                f" would write: {cmd} --check. To put them back: {cmd}."
+            )
+        if self.backups_warning:
+            body += f" WARNING: {self.backups_warning}."
         self._say(body)
-        loud = manifest["reapply"] or manifest["index_rebuilt"] or rc
-        severity = "critical" if loud else "warning"
-        key = f"live_move_repair:{manifest['ts']}"
-        subprocess.run(
-            ["bash", "-c", '. "$1/alert_queue.sh" && queue_alert "$2" live_move_repair "$3" "$4" "$5"',
-             "alert", _LIB, severity, "Genesis repaired a half-written live checkout", body, key],
-            capture_output=True,
-        )  # fmt: skip
+        severity = (
+            "critical"
+            if foreign or manifest["index_rebuilt"] or rc or self.backups_warning
+            else "warning"
+        )
+        self._alert(severity, body, f"live_move_repair:{manifest['ts']}", backup)
         return rc
+
+    def _alert(self, severity: str, body: str, key: str, backup: str) -> None:
+        """Queue the alert, its body cut to ALERT_BYTES (saying how much was
+        left out and where the full text is). A failure is logged, never
+        raised: it must not change the exit code. Whatever the text holds (a
+        `%`, a NUL, a lone surrogate), nothing here raises past the except."""
+        try:
+            data = body.encode("utf-8", "replace")
+            if len(data) > ALERT_BYTES:
+                tail = " more bytes; the full text is in " + backup + "/REPAIR.json)"
+                room = ALERT_BYTES - len(
+                    (" ... (" + str(len(data)) + tail).encode("utf-8", "replace")
+                )
+                kept = data[: max(room, 0)].decode("utf-8", "ignore")
+                body = kept + " ... (" + str(len(data) - len(kept.encode())) + tail
+            body = body.encode("utf-8", "replace").decode("utf-8").replace("\0", " ")
+            p = subprocess.run(
+                ["bash", "-c", '. "$1/alert_queue.sh" && queue_alert "$2" live_move_repair "$3" "$4" "$5"',
+                 "alert", _LIB, severity, "Genesis repaired a half-written live checkout", body, key],
+                capture_output=True,
+            )  # fmt: skip
+        except Exception as exc:  # noqa: BLE001 - an alert never changes the exit code
+            _log(f"the alert was not queued ({exc!r})")
+            return
+        if p.returncode != 0:
+            _log(f"the alert was not queued (exit {p.returncode})")
 
 
 EXPLAIN = """The repair's steps, by hand, for when it cannot run:
@@ -852,16 +1167,52 @@ EXPLAIN = """The repair's steps, by hand, for when it cannot run:
 3. Once scripts/lib/update_state_guard.py <state> <repo> exits 10, remove the state."""
 
 
+def _dismiss(state: str, repo: str, ts: str, wait: int) -> int:
+    """--dismiss TS: rewrite REPAIR.json with dismissed_at, only under
+    update.lock (review SF-7: a restore rewrites it too, and an unlocked
+    load-then-write would lose the other's field); still held after ``wait``,
+    nothing is written."""
+    home = os.path.dirname(os.path.abspath(state))
+    backup = os.path.join(home, "deploy-backups", ts + SUFFIX)
+    try:
+        fd = _flock(_update_lock(home), _now() + wait)
+    except (OSError, RepairError) as exc:
+        _log(f"update.lock cannot be taken ({exc}); nothing was dismissed")
+        return 1
+    if fd is None:
+        _log(
+            "update.lock is still held after the wait (an update or a restore runs); nothing was dismissed"
+        )
+        return 1
+    try:
+        try:
+            loaded = load_report(backup, repo)
+        except BadReport as exc:
+            _log(f"the repair report in {backup} is not read: {exc}")
+            return 1
+        if loaded is None:
+            _log(f"no repair report in {backup}")
+            return 1
+        stamp = time.strftime("%FT%TZ", time.gmtime())
+        report = {**loaded["report"], "dismissed_at": stamp}
+        write_json(os.path.join(backup, "REPAIR.json"), report, private=True)
+        return 0
+    finally:
+        os.close(fd)
+
+
 def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(prog="live_move_repair.py")
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--boot", action="store_true")
     mode.add_argument("--command", action="store_true")
     mode.add_argument("--dismiss", metavar="TS")
+    mode.add_argument("--restore", metavar="TS")
     mode.add_argument("--explain", action="store_true")
     ap.add_argument("state", nargs="?")
     ap.add_argument("repo", nargs="?")
-    ap.add_argument("--wait", type=int, default=7200)
+    ap.add_argument("--check", action="store_true")  # with --restore: judge only
+    ap.add_argument("--wait", type=int)  # 7200 s; 30 s with --restore
     try:
         args = ap.parse_args(argv)
     except SystemExit:
@@ -869,18 +1220,21 @@ def main(argv: list[str]) -> int:
     if args.explain:
         print(EXPLAIN)
         return 0
-    if not (args.state and args.repo):
+    ts = args.dismiss if args.dismiss is not None else args.restore
+    if not (args.state and args.repo) or (args.check and args.restore is None):
         return 2
-    if args.dismiss:  # REPAIR.json's readers stop reporting a dismissed repair's saves
-        home = os.path.dirname(os.path.abspath(args.state))
-        path = os.path.join(home, "deploy-backups", args.dismiss + SUFFIX, "REPAIR.json")
-        if (manifest := _load(path)) is None:
-            _log(f"no repair report at {path}")
-            return 1
-        write_json(path, {**manifest, "dismissed_at": time.strftime("%FT%TZ", time.gmtime())})
-        return 0
+    if ts is not None and report_ts(ts + SUFFIX) != ts:  # #3733: never a path from an unchecked ts
+        _log(f"{ts!r} is not a repair report's ts")
+        return 2
+    if args.restore is not None and not args.check:
+        _log("restoring is not available yet; --restore TS --check judges what it would restore")
+        return 2
+    repo = os.path.abspath(args.repo)
+    if args.dismiss is not None:  # REPAIR.json's readers stop reporting a dismissed repair's saves
+        return _dismiss(args.state, repo, args.dismiss, 30 if args.wait is None else args.wait)
+    wait = args.wait if args.wait is not None else 30 if args.restore is not None else 7200
     try:
-        return Repair(args.state, os.path.abspath(args.repo), args.boot, args.wait).run()
+        return Repair(args.state, repo, args.boot, wait).run(args.restore)
     except Exception as exc:  # noqa: BLE001 - every failure is named; at boot it sets the exit
         if args.boot and not _changed:  # a failed backup changed nothing in the checkout
             _log(f"skipped; nothing was changed ({type(exc).__name__}: {exc})")

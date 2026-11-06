@@ -129,9 +129,7 @@ def test_busy_canonical_runner_lock_does_not_read_or_change_queue(tmp_path):
     assert "another runner tick" in (tmp_path / ".genesis/code-intelligence-runner.log").read_text()
 
 
-@pytest.mark.parametrize(
-    "schema,expected", [(None, 0), (0, 76), (1, 0), (2, 0), (3, 0), (4, 76)]
-)
+@pytest.mark.parametrize("schema,expected", [(None, 0), (0, 76), (1, 0), (2, 0), (3, 0), (4, 76)])
 def test_actual_readiness_refuses_without_initializing_or_migrating(tmp_path, schema, expected):
     if schema is not None:
         _mdir(tmp_path).mkdir(parents=True)
@@ -170,18 +168,17 @@ def test_readiness_observation_errors_stop_before_queue_actions(tmp_path, state)
             # this inode would release SQLite's POSIX locks, invalidating the probe.
             db.execute("BEGIN EXCLUSIVE")
             refused = _cli(tmp_path, "automatic-ready")
-            assert refused.returncode == 2 and "locked" in refused.stderr, refused.stderr
+            # Busy is transient contention: a distinct status the runner defers on.
+            assert refused.returncode == 75 and "locked" in refused.stderr, refused.stderr
         result = _run_runner(tmp_path)
         log = (tmp_path / ".genesis/code-intelligence-runner.log").read_text()
-        assert result.returncode == 76 and not (tmp_path / "entry.log").exists(), (
+        expected = 0 if state == "busy" else 76
+        assert result.returncode == expected and not (tmp_path / "entry.log").exists(), (
             log + result.stderr
         )
     assert _inventory(tmp_path) == before
-    assert (
-        h
-        and "protocol observation failed"
-        in (tmp_path / ".genesis/code-intelligence-runner.log").read_text()
-    )
+    reason = "queue busy at readiness" if state == "busy" else "protocol observation failed"
+    assert h and reason in (tmp_path / ".genesis/code-intelligence-runner.log").read_text()
 
 
 def test_missing_marker_helper_is_explicit_deferral(tmp_path):
@@ -297,14 +294,23 @@ def test_explicit_cli_spools_busy_success_and_replays_without_reindex(tmp_path):
             timeout=10,
         )
         try:
-            assert provider.returncode == 0 and ready.exists(), _contention_diagnostics(tmp_path, ready)
+            assert provider.returncode == 0 and ready.exists(), _contention_diagnostics(
+                tmp_path, ready
+            )
             remembered = _cli(
-                tmp_path, "remember-outcome", "--context", json.dumps(context), "--action", "consume"
+                tmp_path,
+                "remember-outcome",
+                "--context",
+                json.dumps(context),
+                "--action",
+                "consume",
             )
             assert remembered.returncode == 0, remembered.stderr
             spools = list(_mdir(tmp_path).glob(f".outcome-spool-{h}-*.spool"))
             assert len(spools) == 1
-            assert _cli(tmp_path, "apply-outcome", "--context", json.dumps(context)).returncode == 2
+            assert (
+                _cli(tmp_path, "apply-outcome", "--context", json.dumps(context)).returncode == 75
+            )
         finally:
             release.touch()
         _wait_for_write_lock(database)
@@ -410,7 +416,9 @@ def test_contention_fixture_refuses_without_ready(tmp_path, locker_source):
 def test_automatic_ready_reports_dedicated_incomplete_status(tmp_path, schema, state):
     if schema == 2:
         _mdir(tmp_path).mkdir(parents=True)
-        with closing(sqlite3.connect(_mdir(tmp_path) / "queue.sqlite3", isolation_level=None)) as db:
+        with closing(
+            sqlite3.connect(_mdir(tmp_path) / "queue.sqlite3", isolation_level=None)
+        ) as db:
             db.executescript(im._SCHEMA)
             db.execute("PRAGMA user_version=2")
     elif schema == 3:
@@ -457,15 +465,15 @@ def test_import_status_lists_current_schema_and_refuses_newer(tmp_path):
     before = _inventory(tmp_path)
     listed = _cli(tmp_path, "import-status")
     assert listed.returncode == 0, listed.stdout
-    assert json.loads(listed.stdout)["schema_version"] == 3
+    assert json.loads(listed.stdout)["schema_version"] == 4
     observed = _cli(tmp_path, "automatic-ready")
     assert observed.returncode == 10, observed.stderr
     assert json.loads(observed.stdout)["state"] == "protocol-incomplete"
     assert _inventory(tmp_path) == before
     with closing(sqlite3.connect(_mdir(tmp_path) / "queue.sqlite3", isolation_level=None)) as db:
-        db.execute("PRAGMA user_version=4")
+        db.execute("PRAGMA user_version=5")
     newer = _cli(tmp_path, "import-status")
-    assert newer.returncode == 2 and "unsupported queue schema 4" in newer.stdout, newer.stdout
+    assert newer.returncode == 2 and "unsupported queue schema 5" in newer.stdout, newer.stdout
 
 
 def test_ready_status_without_a_ready_protocol_stops_the_tick(tmp_path):
@@ -477,15 +485,30 @@ def test_ready_status_without_a_ready_protocol_stops_the_tick(tmp_path):
     shutil.copy2(_RUNNER, copy / "code_intel_runner.sh")
     calls = tmp_path / "helper.calls"
     (copy / "lib/index_marker.py").write_text(
-        "import sys\n"
-        f"open({str(calls)!r}, 'a').write(sys.argv[1] + '\\n')\n"
-        "sys.exit(0)\n"
+        f"import sys\nopen({str(calls)!r}, 'a').write(sys.argv[1] + '\\n')\nsys.exit(0)\n"
     )
     before = _inventory(tmp_path)
     result = _run_runner(tmp_path, runner=copy / "code_intel_runner.sh")
     assert result.returncode == 76 and not (tmp_path / "entry.log").exists(), result.stderr
     assert "has no ready state" in _runner_log(tmp_path)
     assert calls.read_text().split() == ["automatic-ready"]  # no reconcile, list or claim
+    assert _inventory(tmp_path) == before
+
+
+def test_busy_readiness_defers_the_tick_without_failing_the_unit(tmp_path):
+    _seed_marker(tmp_path)
+    copy = tmp_path / "copy/scripts"
+    shutil.copytree(_RUNNER.parent / "lib", copy / "lib")
+    shutil.copy2(_RUNNER, copy / "code_intel_runner.sh")
+    calls = tmp_path / "helper.calls"
+    (copy / "lib/index_marker.py").write_text(
+        f"import sys\nopen({str(calls)!r}, 'a').write(sys.argv[1] + '\\n')\nsys.exit(75)\n"
+    )
+    before = _inventory(tmp_path)
+    result = _run_runner(tmp_path, runner=copy / "code_intel_runner.sh")
+    assert result.returncode == 0 and not (tmp_path / "entry.log").exists(), result.stderr
+    assert "queue busy at readiness" in _runner_log(tmp_path)
+    assert calls.read_text().split() == ["automatic-ready"]
     assert _inventory(tmp_path) == before
 
 

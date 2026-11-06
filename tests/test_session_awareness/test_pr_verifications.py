@@ -686,13 +686,14 @@ async def test_both_build_paths_agree_on_the_effective_column_shape(tmp_path):
 
     assert fresh_cols == migrated_cols
     # Guard-the-guard: the comparison is only meaningful if it actually saw the
-    # four new columns in their appended positions. Without this the test would
+    # appended columns in their positions. Without this the test would
     # pass just as happily against two identical PRE-migration tables.
-    assert [c[1] for c in fresh_cols][-4:] == [
+    assert [c[1] for c in fresh_cols][-5:] == [
         "verdict",
         "attempt_count",
         "last_attempt_at",
         "last_attempt_note",
+        "rechecks",
     ]
     by_name = {c[1]: c for c in fresh_cols}
     assert by_name["attempt_count"][3] == 1, "attempt_count must be NOT NULL"

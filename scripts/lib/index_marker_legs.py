@@ -88,8 +88,17 @@ def _shared(values) -> str:
     return encoded
 
 
+def _settled_repo(h: str, repo: str) -> str:
+    # A spelling already stored under this hash is kept as written (see
+    # stored_repo), so a later move cannot change it or fail it. Anything else
+    # (a raw incoming path) is canonicalized.
+    if stored_repo(repo) and stored_hash(repo) == h:
+        return repo
+    return os.path.realpath(repo)
+
+
 def _identity(db: sqlite3.Connection, h: str, repo: str) -> str:
-    repo = os.path.realpath(repo)
+    repo = _settled_repo(h, repo)
     row = db.execute("SELECT repo_path FROM repo_state WHERE hash=?", (h,)).fetchone()
     if row and row["repo_path"] is not None and row["repo_path"] != repo:
         raise IdentityConflict("queue hash has another canonical repository")
@@ -136,7 +145,7 @@ def _conflict(db, sequence, reason, raw):
 
 
 def _legacy_execution(db, h, data, nonce, origin, kind, raw=None):
-    repo = os.path.realpath(data["repo_path"])
+    repo = _settled_repo(h, data["repo_path"])
     fields = {
         "repo_path": repo,
         "original_tools": data["tools"],
@@ -355,21 +364,43 @@ def upgrade(db: sqlite3.Connection):
     )
 
 
-def validate_context(context: dict, hash_repo) -> dict:
+def stored_repo(repo: object) -> bool:
+    """A stored spelling is canonical by construction; never re-resolve it.
+
+    Writers store ``realpath`` once. Re-resolving later would reject a row
+    whose repository moved or gained a symlink, and a whole-population
+    check would then stop every tick. The entrypoint resolves the live path.
+    """
+    return (
+        isinstance(repo, str)
+        and repo.startswith("/")
+        and not repo.startswith("//")
+        and "\0" not in repo
+        and os.path.normpath(repo) == repo
+    )
+
+
+def stored_hash(repo: str) -> str:
+    # Compatibility, not security: the hash of the stored canonical spelling.
+    return hashlib.sha1(repo.encode()).hexdigest()[:16]  # noqa: S324
+
+
+def validate_context(context: dict, _hash_repo=None, *, protocol: int = 2) -> dict:
+    # _hash_repo is accepted for call compatibility and deliberately unused: the
+    # hash is checked against the stored spelling, never a live resolution.
+    if type(protocol) is not int or protocol not in (2, 3):
+        raise ValueError("unsupported claim protocol")
     if not isinstance(context, dict) or set(context) != CONTEXT:
         raise ValueError("complete queue claim context is required")
     repo = context["repo_path"]
     if (
-        not isinstance(repo, str)
-        or not repo
-        or "\0" in repo
-        or os.path.realpath(repo) != repo
+        not stored_repo(repo)
         or not isinstance(context["hash"], str)
         or re.fullmatch(r"[0-9a-f]{16}", context["hash"]) is None
-        or context["hash"] != hash_repo(repo)
+        or context["hash"] != stored_hash(repo)
         or context["provider"] not in PROVIDERS
         or type(context["protocol"]) is not int
-        or context["protocol"] != 2
+        or context["protocol"] != protocol
         or type(context["execution_seq"]) is not int
         or not 1 <= context["execution_seq"] <= INTEGER_MAX
         or not isinstance(context["claim_id"], str)
@@ -379,8 +410,8 @@ def validate_context(context: dict, hash_repo) -> dict:
     return dict(context)
 
 
-def scalar_event(context, action, recorded_at, hash_repo):
-    context = validate_context(context, hash_repo)
+def scalar_event(context, action, recorded_at, _hash_repo=None):
+    context = validate_context(context)
     if action not in OUTCOMES or (
         action in ("consume_full", "restore_backoff") and context["provider"] != "cbm"
     ):
@@ -403,7 +434,9 @@ def _execution(db, context):
     return dict(row)
 
 
-def claim(db, h, provider):
+def claim(db, h, provider, *, protocol=2):
+    if type(protocol) is not int or protocol not in (2, 3):
+        raise ValueError("unsupported claim protocol")
     if provider not in PROVIDERS:
         raise ValueError("provider must be cbm or gitnexus")
     if db.execute("SELECT 1 FROM inflight WHERE hash=?", (h,)).fetchone():
@@ -416,11 +449,12 @@ def claim(db, h, provider):
     cursor = db.execute(
         "INSERT INTO executions(hash,repo_path,provider,protocol,entry_kind,claim_id,original_tools,"
         "mode,requested_at,attempts,legacy_unqualified,legacy_shared_attempts,nonce_origin) "
-        "VALUES(?,?,?,2,'claim',?,?,?,?,?,?,?,'generated')",
+        "VALUES(?,?,?,?,'claim',?,?,?,?,?,?,?,'generated')",
         (
             h,
             row["repo_path"],
             provider,
+            protocol,
             nonce,
             provider,
             row["mode"],
@@ -433,12 +467,13 @@ def claim(db, h, provider):
     sequence = cursor.lastrowid
     db.execute(
         "INSERT INTO inflight(hash,repo_path,tools,provider,protocol,mode,requested_at,attempts,"
-        "claim_id,execution_seq,legacy_unqualified,legacy_shared_attempts) VALUES(?,?,?,?,2,?,?,?,?,?,?,?)",
+        "claim_id,execution_seq,legacy_unqualified,legacy_shared_attempts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             h,
             row["repo_path"],
             provider,
             provider,
+            protocol,
             row["mode"],
             row["requested_at"],
             row["attempts"],
@@ -453,7 +488,7 @@ def claim(db, h, provider):
         hash=h,
         repo_path=row["repo_path"],
         provider=provider,
-        protocol=2,
+        protocol=protocol,
         execution_seq=sequence,
         claim_id=nonce,
     )
