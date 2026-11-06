@@ -253,7 +253,30 @@ def main(argv: list[str]) -> int:
     trailer = "\nFull tracebacks: the `junit-test-report` artifact on this run."
 
     lines: list[str] = []
-    spent = len(header.encode()) + len(trailer.encode()) + _OMISSION_RESERVE
+    # pytest-xdist reports a dead worker as an ERROR on the test it was running
+    # ("failed on setup with ... crashed while running", whichever phase it died
+    # in). MEASURED with xdist 3.8.0: with restarts disabled
+    # (--max-worker-restart=0) the whole run stops and every test not yet
+    # dispatched to ANY worker never runs; with restarts, the dead worker's queue
+    # goes to the others and every test runs. Built before the rows, so its bytes
+    # are reserved and it can never push a full summary past the cap.
+    crashed = [test_id for _, test_id, message in rows if _WORKER_CRASH.search(message)]
+    crash_note = (
+        f"\n> **{len(crashed)} pytest-xdist worker crash(es).** A worker died "
+        "while running the test(s) whose error above says \"crashed while "
+        "running\". If the run does not restart workers "
+        "(`--max-worker-restart=0`), it stopped there, and every test not yet "
+        "handed to a worker never ran: compare the run's "
+        "passed/failed/skipped total with the number collected."
+        if crashed
+        else ""
+    )
+    spent = (
+        len(header.encode())
+        + len(trailer.encode())
+        + _OMISSION_RESERVE
+        + (len(crash_note.encode()) + 1 if crash_note else 0)
+    )
     omitted = 0
     for kind, test_id, message in rows:
         # The ID and the MESSAGE are budgeted SEPARATELY, because they are not
@@ -295,25 +318,11 @@ def main(argv: list[str]) -> int:
             f"{len(rows)} is in the artifact below."
         )
 
-    crashed = [test_id for _, test_id, message in rows if _WORKER_CRASH.search(message)]
     print(header)
     for line in lines:
         print(line)
-    if crashed:
-        # pytest-xdist reports a dead worker as an ERROR on the test it was
-        # running ("failed on setup with ... crashed while running", whichever
-        # phase it died in). MEASURED with xdist 3.8.0: with restarts disabled
-        # (--max-worker-restart=0) the whole run stops and every test not yet
-        # dispatched to ANY worker never runs; with restarts, the dead worker's
-        # queue goes to the others and every test runs.
-        print(
-            f"\n> **{len(crashed)} pytest-xdist worker crash(es).** A worker died "
-            "while running the test(s) whose error above says \"crashed while "
-            "running\". If the run does not restart workers "
-            "(`--max-worker-restart=0`), it stopped there, and every test not yet "
-            "handed to a worker never ran: compare the run's "
-            "passed/failed/skipped total with the number collected."
-        )
+    if crash_note:
+        print(crash_note)
     print(trailer)
     return 0
 

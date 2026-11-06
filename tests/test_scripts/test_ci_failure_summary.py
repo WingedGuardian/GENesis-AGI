@@ -692,3 +692,23 @@ def test_a_failure_quoting_the_phrase_is_not_a_worker_crash(tmp_path):
     out = _run(str(report))
     assert "tests.test_h::test_hangs" in out.stdout
     assert "worker crash" not in out.stdout
+
+
+def test_a_full_summary_with_a_worker_crash_stays_under_the_cap(tmp_path):
+    # The crash note is printed after the rows, so its bytes must be reserved
+    # before rows are chosen, or a summary filled to the cap goes over it and
+    # GitHub renders nothing.
+    crash = (
+        '<testcase classname="tests.test_h" name="test_hangs"><error message="failed on '
+        "setup with &quot;worker 'gw0' crashed while running 'tests/test_h.py::test_hangs'"
+        '&quot;">x</error></testcase>'
+    )
+    report = tmp_path / "junit.xml"
+    report.write_text(
+        _report_with(12000).replace("<testsuite>", "<testsuite>" + crash, 1), encoding="utf-8"
+    )
+    out = _run(str(report))
+    assert out.returncode == 0
+    assert len(out.stdout.encode()) <= 1024 * 1024
+    assert "pytest-xdist worker crash(es)" in out.stdout
+    assert out.stdout.rstrip().endswith("artifact on this run.")
