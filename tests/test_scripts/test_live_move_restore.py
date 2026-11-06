@@ -153,6 +153,30 @@ def test_a_fresh_repair_is_as_left_then_already_restored(w, make):
     assert set(parts.values()) == {"already-restored"}, parts
 
 
+def _foreign_group_writable_fifo_inside_dir(w):
+    os.mkfifo(w.root / "P" / "pipe")
+    os.chmod(w.root / "P" / "pipe", 0o662)
+    return "P"
+
+
+def test_a_saved_fifo_is_judged_by_its_recorded_mode(w):
+    """#3974 item 3: the saved FIFO loses group/world write (0662 is saved as
+    0640), so an entry is judged against the mode SAVED.json records: the
+    restore puts it back at 0662 and the check then reads already-restored;
+    left at the copy's 0640 it would not."""
+    ts = _repaired(w, _foreign_group_writable_fifo_inside_dir)
+    saved = json.loads((w.backups()[-1] / "SAVED.json").read_text())["files"]
+    assert saved["tree/P/pipe"] == {"type": "fifo", "mode": "0662"}, saved
+    restore_all(w)
+    pipe = w.root / "P" / "pipe"
+    assert stat.S_IMODE(os.lstat(pipe).st_mode) == 0o662
+    r = _check(w, ts)
+    assert r.returncode == 0 and set(_parts(r).values()) == {"already-restored"}, r.stdout
+    os.chmod(pipe, 0o640)
+    r = _check(w, ts)
+    assert _parts(r).get(("P/pipe", "entry")) != "already-restored", r.stdout
+
+
 def test_a_directory_row_lists_only_the_entries_the_update_did_not_write(w):
     """P was saved whole (P/inner the update's bytes, P/mine.txt not): only
     P/mine.txt is an entry to restore."""
