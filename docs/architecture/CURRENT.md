@@ -73,7 +73,7 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: cd784816 2026-09-09
+verified: 2ece179f9ebc 2026-10-28
 ```
 
 **Cross-store integrity is detect + repair.** SQLite (`memory_metadata`/
@@ -235,6 +235,12 @@ a real bridge-node population; `centrality_cache` gains its first reader.
 run through a `GraphStore` protocol with two implementations: the default
 `NetworkxGraphStore` (the in-process MultiDiGraph projection of `memory_links`)
 and `FalkorGraphStore` (below);
+opt-in `RequestDatabase` traversal declines NetworkX before projection and uses
+the existing SQL tier on its owning connection, including pending writes. Healthy
+selected FalkorDB retains projected-data semantics; its scoped fallback uses SQL.
+Legacy NetworkX and centrality behavior are unchanged. The shared SQL traversal
+uses exact delimited hex-ID cycle membership, so substrings, LIKE wildcards,
+empty IDs and NULs cannot hide distinct TEXT nodes.
 `memory/graph.py` is a facade that owns the single production instance and the
 backend choice. The contract, and the reason the seam exists: a read that cannot
 REACH its store RAISES `GraphUnavailableError` and never returns empty — empty
@@ -1706,6 +1712,12 @@ the shared banner is not an assertion about all concurrent sessions.
   `cc/session_config._MCP_PROFILES`. `genesis-health` is the big one (~35 tool
   modules). `standalone_health.py` serves from `~/.genesis/status.json` when no
   live runtime (stale-but-functional).
+  The optional fixed-main Serena services qualify provider 2.1.0 and MCP 2.2
+  readiness; they select classic tools and reject switching or REPL capability.
+  Their existing locking, per-profile limits and native stdio worktree routing
+  remain in place. Provider upgrades require a drained, disabled sharing window;
+  this code does not upgrade or restart an enabled service. See
+  `docs/reference/serena-shared-main.md`.
   External Codebase has pinned configuration staging/diagnostics and bounded
   native query unit entry points in `scripts/codebase_managed.py`.
   Status separately observes conditional queue initialization-lock prerequisites
@@ -1738,6 +1750,12 @@ the shared banner is not an assertion about all concurrent sessions.
   Retained terminal decisions replay without
   resending known completions; missing terminal evidence, native intent/scope
   cleanup and persistent resource quarantine remain separate activation gates.
+  `scripts/lib/code_intel_execution.py` adds an explicit stdlib scope-evidence
+  observer with private bounded pipe transport and complete-subtree task/counter
+  checks. It has no automatic queue caller, stop authority or quarantine state.
+  The existing foreground watchdog lacks a post-return scope-quiescence barrier;
+  strict queue integration must retain unresolved cleanup ownership separately.
+  Synthetic/descriptor fixtures do not qualify native OOM or production indexing.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
   deletions; native query/client cgroup proof and orphan-scope checks precede
@@ -4651,7 +4669,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: c56a621b5 2026-10-24
+verified: 702274dfe 2026-11-05
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -4730,6 +4748,27 @@ verified: c56a621b5 2026-10-24
   changing existing Segment consumers. Ordinary configuration and launcher
   activation remain separate. See
   `docs/reference/codex-validator-boundary.md`.
+  The owner-run `scripts/codex-validator` entry prepares a dedicated private
+  Codex home, keeps the project layer untrusted and verifies the enabled trusted
+  adapter plus exactly two validator MCP servers through fresh native discovery.
+  Check/run compare physical hook and launcher import bytes/types/Git modes to
+  an explicit qualified commit, require clean tracked main files and no detected
+  deployment, and retire their inspection process group before continuing.
+  An explicit owner branch-test mode runs the branch entry with main-root
+  policy, guards, MCP servers and cwd. It checks both physical source trees;
+  only the two new launcher files are omitted from main's comparison. Flagged
+  prepare/login require that same qualification before state changes. Normal
+  linked-worktree refusal remains. The model-turn smoke check is owner-run.
+  Explicit login accepts `--device-auth` for headless authentication.
+  Inspection/run disable account-connected Apps through fixed CLI arguments
+  and verify that effective setting, retaining the exact two-server boundary.
+  Interactive native qualification records a Codex0.166.0 reference binary.
+  The launcher warns on other recognizable versions and retains its startup
+  inspection/refusal checks; those inspect state, not actual tool denial.
+  Release-time native allow/deny controls do not certify future clients.
+  It supplies no service/timer wiring, copied credentials, deploy authority or
+  lifecycle enrollment. See `docs/reference/codex-validator-launcher.md` for
+  operator commands, source inventory, permitted MCP startup effects and races.
   Codex has a separate external-client adapter in `.codex/config.toml`: it
   starts the existing standalone health and memory MCP servers through a
   launcher that scrubs inherited Genesis session identity, provenance,

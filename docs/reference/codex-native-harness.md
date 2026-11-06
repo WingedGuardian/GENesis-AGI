@@ -25,7 +25,7 @@ The app-server path drives initialization, an ephemeral thread, and a turn over 
 
 The separate opt-in `tests/test_hooks/test_codex_validator_adapter_native.py`
 provides the qualification harness for the inactive interactive adapter on
-Codex 0.163.0. It copies the guard
+Codex 0.166.0. It copies the guard
 source and records its hashes, reuses the installed Python interpreter without
 changing it, and exercises actual scratch receipts on both clients. It adds
 child ask, crash, missing-script, malformed-output and timeout cases, advisory
@@ -42,8 +42,30 @@ hook is safe. Keep the unique base directory and retention options above when
 running this file too. No production validator profile is activated.
 
 This file refuses a binary reporting a different version. If the default Codex
-has moved on, use both binary overrides above to select the qualified 0.163.0
+has moved on, use both binary overrides above to select the reference 0.166.0
 runtime; do not relax the assertion to turn version drift into a passing run.
+Earlier 0.163.0 and 0.165.0 receipts remain historical evidence; a version change requires
+fresh qualification. The launcher-discovery, role, constructor and shared-quote
+tests use this same reference. Both selected client versions are checked; the
+shared-quote test also binds both binary SHA-256 values explicitly. This is a
+reproducibility requirement for qualification, not the launcher's admission
+policy: recognizable non-reference versions warn and face the same startup
+inspection. Those inspections do not prove actual tool denial on future clients.
+
+On 0.166.0, an owned copy of the reference executable also needs the bundled
+`codex-code-mode-host` beside it for `functions.exec` dispatch. Preserve that
+layout from the same verified package and record both hashes. A lone executable
+can pass version and discovery checks while failing to start its tool host.
+
+The inherited `tests/test_mcp/test_validator_writers_native.py` also binds this
+reference version and digest. Its fourteen cells exercise real tool dispatch
+against owned SQLite/vector fixtures, including external-profile exclusion,
+preview-only close and explicitly enabled fixture recording. No live store runs.
+
+`tests/test_scripts/test_codex_validator_constructor_native.py` adds composed
+adapter checks using actual Git in owned directories. Separate-value template
+and depth options have denial, explicit external-destination and no-op controls
+on both clients. These are exec/app-server fixtures, not terminal trials.
 
 The direct-shell positive case reads a real scratch body file containing prose
 that mentions worktree removal. It requires that content to appear in the next

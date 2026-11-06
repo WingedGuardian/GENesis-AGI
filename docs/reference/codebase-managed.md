@@ -570,10 +570,11 @@ OOM adjustment; only the native child receives 1000. The validated physical main
 path supplies both the native payload and working directory. Final admission
 rechecks managed settings, cache, native readiness and enablement under the
 lifecycle lock, which closes after child creation. Repository/runner locks and
-the scope watchdog retain execution ownership. Missing canonical repository
+the scope watchdog retain foreground execution ownership. The current watchdog
+does not verify scope quiescence after that foreground exits. Missing canonical repository
 locks refuse Codebase; GitNexus retains its independent handling.
 
-This wiring merged in #3012. Read-only availability/access repairs remain tracked
+This wiring merged in #3012. Read-only availability/access repairs merged
 in #3464. Neither fixture acceptance nor a successful probe grants permission to
 clear the sentinel, release the freeze or retry unattended after resource failures.
 Follow the supervised production acceptance and resource gates in
@@ -621,6 +622,49 @@ restoration in disposable storage. Do not assume the install's optional backup
 configuration covers this queue. The migration does not enable indexing, add
 resource quarantine, or implement the checked consumer's list/claim propagation
 tracked in #2043.
+
+### Explicit execution-evidence primitive
+
+`scripts/lib/code_intel_execution.py` is an internal stdlib helper with no
+automatic queue caller. It receives a private report-pipe descriptor, expected
+workload unit, exact cap, existing run bound and an argv vector. It does not
+enable a provider, change admission/limits, stop a scope or settle queue work.
+The caller must supply the existing native/supervisor launcher so maximum OOM
+preference remains confined to its native child. The reporter itself refuses
+maximum OOM preference. Its zero exit status means report delivery only. The
+run bound ends observation, not the payload: a payload still running at the
+deadline is neither signalled nor reaped, so the caller's launcher must stop and
+clean it up, and should pass an absolute executable path.
+
+The helper requires validated cgroup v2 routing, the requested finite memory
+cap, zero swap, hierarchical memory events and same-subtree task accounting.
+Unsupported v1/local-only events or unavailable proof refuse before payload.
+After launch, lost proof or an expired run bound yields uncertainty. It waits
+past foreground exit until only verified reporter tasks remain, including
+recursive descendant checks and the aggregate `pids.current` count, then samples
+and rechecks identity/counters. Owned `oom_kill` counts identify workload victims;
+they do not establish which cap caused the OOM. `high`/`max` and ancestor events
+remain diagnostic, with unavailable ancestor counters explicitly labeled. A final
+sample whose identity, counter population, ancestor availability or reporter
+thread count differs from the first is not retained, and the run stays uncertain:
+the pre-launch report-size bound assumes that shape.
+
+Reports use one bounded atomic JSON pipe write, separate from provider stdout
+and closed in the payload. Standard-descriptor aliases are rejected. Identical
+scope/ancestor identities are encoded once with an explicit shared reference;
+the reader restores all sampled facts. Oversized records refuse rather than
+truncate. The reader accumulates through EOF and rejects malformed, duplicate
+or trailing records. A received record and the reporter's later exit status are
+separate facts; a raw signal is not OOM proof.
+
+Future strict queue wiring must retain ownership through an actual bounded
+stop/quiescence/reap barrier and preserve an unresolved claim if cleanup cannot
+be proved. The existing foreground watchdog is insufficient for that contract.
+Durable intent, interpretation, provider quarantine and supervised recovery are
+separate work; this helper does not implement them. Local synthetic cgroup and
+real descriptor/subprocess fixtures do not establish native kernel OOM behavior
+or production capacity. Keep existing disablement and supervised acceptance
+requirements in force.
 
 ## Verification
 
