@@ -188,6 +188,17 @@ def _run(tmp_path: Path, doc: dict, *extra: str, pr: int = 7) -> int:
 # ── print-schema ─────────────────────────────────────────────────────────
 
 
+def test_existing_cli_close_stores_rechecks_without_a_new_caller_argument(tmp_path):
+    _seed(tmp_path / "genesis.db")
+    assert _run(tmp_path, _doc(gaps=[EVENT_GAP])) == 0
+    stored = _row(tmp_path / "genesis.db")
+    assert stored["status"] == "closed"
+    assert json.loads(stored["rechecks"]) == [
+        {**{k: EVENT_GAP[k] for k in ("trigger", "recheck", "detail")},
+         "results": [], "done_at": None}
+    ]
+
+
 def test_print_schema_emits_a_document_its_own_validator_shape_accepts(capsys):
     """The template is what an LLM caller will fill in, so its FIELD SET must match
     what the validator requires — otherwise the documented path leads straight to a
