@@ -533,6 +533,10 @@ elif [ "$_branch" != "$DEPLOY_BRANCH" ]; then
     echo "  WARNING: updating branch '$_branch', not $DEPLOY_BRANCH (GENESIS_ALLOW_NON_DEPLOY_BRANCH=1)."
 fi
 # END branch-admission
+# After the branch check, on purpose: anything sourced before it runs first, so a
+# candidate editing it could switch the refusal off.
+# shellcheck source=scripts/lib/gnu_timeout.sh
+. "$SCRIPT_DIR/lib/gnu_timeout.sh"
 
 # ── Suppression-outcome channel, CONSUMED (cleared) BEFORE anything in this
 # deploy can repair the keys.
@@ -2595,6 +2599,10 @@ elif _nothing_new; then
     # Nothing changed and no --post-merge continuation follows, so clear the
     # in-progress signals (like the success path) — a leftover must never linger.
     _clear_deploy_state
+    # Nothing was installed, so the package record taken for a rollback is
+    # unused. The rows below are written only for a stale marker or a
+    # degradation, so retiring it is not left to _record_update_history.
+    _retire_deps_record
     # Transitional: the pre-merge step may have cleared live settings.local.json
     # or .serena/project.yml edits — put them back even though no merge landed.
     if [ -f "$SETTINGS_LOCAL_BAK" ]; then

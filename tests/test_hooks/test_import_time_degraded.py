@@ -127,6 +127,8 @@ _CASES = [
         "gated",
     ),
     ("git_push_guard", "hooks/git_push_guard.py", "git log --oneline -5", 0, "benign"),
+    ("pr_open_review_gate", "hooks/pr_open_review_gate.py", 'gh pr create --title t --body b', 2, "gated"),
+    ("pr_open_review_gate", "hooks/pr_open_review_gate.py", "git status", 0, "benign"),
     (
         "review_enforcement_commit",
         "review_enforcement_commit.py",
@@ -703,11 +705,12 @@ _NOT_WIRED = {
     # vanished guard. MEASURED 2026-10-01: 0 references to it in .claude/settings.json,
     # .claude/ or scripts/hooks/, so Claude Code never runs it as a hook.
     "deploy_candidates.py": "a CLI, not a hook: wired nowhere in .claude/settings.json",
-    # Not a hook either: the issue premise gate runs only in the GitHub Action
-    # .github/workflows/premise-gate.yml. Its `return 2` is "no event file", a usage
-    # error, and a failed import there fails the Actions job loudly. MEASURED
-    # 2026-10-28: 0 references to it in .claude/settings.json or scripts/hooks/.
-    "premise_gate.py": "an Actions script, not a hook: wired nowhere in .claude/settings.json",
+    # Not wired as a hook: the issue premise gate is the GitHub Action
+    # .github/workflows/premise-gate.yml's script. Its `return 2` is "no event file",
+    # a usage error, and a failed import there fails the Actions job loudly. It IS
+    # imported by hooks/issue_premise_gate.py, lazily and under that hook's
+    # degraded_exit, so a broken import of it blocks the create there instead.
+    "premise_gate.py": "an Actions script, not wired as a hook: issue_premise_gate imports it under degraded_exit",
     # Not a hook either: the validator's sealed shell command RUNS this program;
     # the PreToolUse decision is codex_validator_guard.py's. A failed import exits
     # 1 before any request is read, so nothing is served and the caller sees a
@@ -715,6 +718,10 @@ _NOT_WIRED = {
     # .claude/; its only scripts/hooks/ mention is codex_validator_shell.py naming
     # it as the admitted runner.
     "codex_validator_request.py": "a sealed-command CLI, not a hook: wired nowhere in .claude/",
+    # Standalone CLI: settings and its generated hook invoke the adapter, not
+    # this launcher. test_launcher_sibling_import_failure_stops_before_startup
+    # measures both sibling failures aborting before profile/session startup.
+    "codex_validator_launcher.py": "a standalone CLI; import failure aborts startup, not a hook decision",
 }
 
 
@@ -1539,13 +1546,17 @@ def test_every_bash_hook_declares_its_degrade_direction(tmp_path, display, rel, 
         return
 
     root, home = _broken_hook_input(tmp_path, f"home_contract_{abs(hash(display)) % 10**8}")
+    # The dispatched stamp is SCRUBBED: a hook that passes dispatched sessions first
+    # (issue_premise_gate) would otherwise exit 0 here whenever this suite itself runs
+    # inside a dispatched session, and the foreground contract would go untested.
+    env = {k: v for k, v in os.environ.items() if k != "GENESIS_CC_SESSION"}
     res = subprocess.run(
         [sys.executable, str(root / "scripts" / rel), *argv],
         input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "echo hello"}}),
         capture_output=True,
         text=True,
         cwd=str(root),
-        env={**os.environ, "HOME": str(home)},
+        env={**env, "HOME": str(home)},
         timeout=90,
     )
 

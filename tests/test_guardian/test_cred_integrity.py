@@ -245,6 +245,133 @@ def test_allowed_restore():
     assert allowed_restore([], now, 0) is False
 
 
+def _denied(directory):
+    """The file's parent, with search taken away. Returns the callback that restores it."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores mode 000")
+    directory.chmod(0o000)
+    return lambda: directory.chmod(0o700)
+
+
+@pytest.fixture
+def exists_as_on_314(monkeypatch):
+    """Python 3.14's Path.exists on every interpreter, so the suite on 3.12 still catches
+    a check going back to it: there it raises, and a handler hides the difference."""
+    monkeypatch.setattr(pathlib.Path, "exists", lambda self, **_: os.path.exists(self))
+
+
+@pytest.mark.parametrize("backed_up", [True, False])
+def test_a_parent_that_denies_search_is_unreadable_not_missing(
+    tmp_path, request, backed_up, exists_as_on_314
+):
+    """Either answer would act on a key still on disk: "missing" restores over it, and
+    "absent" reports a healthy host. Python 3.14's Path.exists answers False here."""
+    home = tmp_path / "home"
+    target = home / ".ssh" / "id_ed25519"
+    target.parent.mkdir(parents=True)
+    target.write_text("key")
+    backup = tmp_path / "backup"
+    entry = next(t for t in DEFAULT_TARGETS if t.name == "ssh_id_ed25519")
+    if backed_up:
+        (backup / entry.backup_rel).parent.mkdir(parents=True)
+        (backup / entry.backup_rel).write_text("backup")
+    request.addfinalizer(_denied(target.parent))
+    r = validate_file(entry, home, backup if backed_up else None)
+    assert (r.ok, r.status) == (False, "unreadable")
+    assert r.status not in RESTORABLE_STATUSES
+
+
+def test_a_backup_that_denies_search_is_unreadable_not_absent(tmp_path, request, exists_as_on_314):
+    """No file and no way to tell whether a backup exists: not proof of "never provisioned"."""
+    home = tmp_path / "home"
+    home.mkdir()
+    backup = tmp_path / "backup"
+    entry = next(t for t in DEFAULT_TARGETS if t.name == "ssh_id_ed25519")
+    (backup / entry.backup_rel).parent.mkdir(parents=True)
+    (backup / entry.backup_rel).write_text("backup")
+    request.addfinalizer(_denied(backup))
+    r = validate_file(entry, home, backup)
+    assert (r.ok, r.status) == (False, "unreadable")
+
+
+def test_one_denied_target_leaves_the_others_checked(tmp_path, request, exists_as_on_314):
+    """It used to raise on 3.12, so one denied file left every other target unchecked."""
+    home = tmp_path / "home"
+    (home / ".ssh").mkdir(parents=True)
+    request.addfinalizer(_denied(home / ".ssh"))
+    results = check_all(None, home, None)
+    assert results["ssh_id_ed25519"].status == "unreadable"
+    assert results["gh_hosts"].status == "absent"
+
+
+def test_a_good_file_stays_ok_when_its_backup_cannot_be_checked(tmp_path, request):
+    home = tmp_path / "home"
+    entry = next(t for t in DEFAULT_TARGETS if t.name == "gh_hosts")
+    (home / entry.path).parent.mkdir(parents=True)
+    (home / entry.path).write_text("github.com:\n  user: x\n")
+    backup = tmp_path / "backup"
+    backup.mkdir()
+    request.addfinalizer(_denied(backup))
+    assert validate_file(entry, home, backup).status == "ok"
+
+
+def test_a_symlink_loop_is_absent_or_restorable_as_it_always_was(tmp_path):
+    """Nothing can be read through one, and a restore heals it."""
+    home = tmp_path / "home"
+    entry = next(t for t in DEFAULT_TARGETS if t.name == "ssh_id_ed25519")
+    (home / ".ssh").mkdir(parents=True)
+    (home / entry.path).symlink_to(home / entry.path)
+    assert validate_file(entry, home, None).status == "absent"
+    backup = tmp_path / "backup"
+    (backup / entry.backup_rel).parent.mkdir(parents=True)
+    (backup / entry.backup_rel).write_text("backup")
+    assert validate_file(entry, home, backup).status == "missing"
+
+
+@pytest.mark.parametrize("denied", ["backups", "backups/genesis-backups", ".ssh"])
+def test_the_piped_check_reports_rather_than_crashes(tmp_path, request, denied):
+    """The route the guardian runs: on 3.12 this crashed and the whole tick was lost, a
+    corrupt file included. On 3.14 a denied backups directory read as no backup."""
+    home = tmp_path / "home"
+    (home / "backups" / "genesis-backups").mkdir(parents=True)
+    (home / ".ssh").mkdir()
+    (home / "genesis").mkdir()
+    (home / "genesis" / "secrets.env").write_text("")  # corrupt, and must still be seen
+    request.addfinalizer(_denied(home / denied))
+    proc = subprocess.run(
+        [sys.executable, "-", "check", "--json", "--home", str(home)],
+        input=Path(ci.__file__).read_text(),
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+        env={"PATH": os.environ.get("PATH", ""), "HOME": str(home)},
+    )
+    assert proc.returncode == 0, proc.stderr
+    results = json.loads(proc.stdout)["results"]
+    assert results["secrets_env"]["ok"] is False
+    assert results["ssh_id_ed25519"]["status"] == "unreadable"
+
+
+def test_passphrase_lookup_survives_a_denied_directory(tmp_path, request, monkeypatch):
+    """Self-heal runs it outside any handler, and raising here loses the status file
+    that carries the alert."""
+    monkeypatch.delenv("GENESIS_BACKUP_PASSPHRASE", raising=False)
+    (tmp_path / "genesis").mkdir()
+    (tmp_path / ".genesis").mkdir()
+    request.addfinalizer(_denied(tmp_path / "genesis"))
+    request.addfinalizer(_denied(tmp_path / ".genesis"))
+    assert ci.resolve_passphrase(tmp_path) is None
+
+
+def test_a_file_under_a_file_is_absent(tmp_path):
+    """ENOTDIR is no such file, as it always was: a path can't exist below a file."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".ssh").write_text("not a directory")
+    entry = next(t for t in DEFAULT_TARGETS if t.name == "ssh_id_ed25519")
+    assert validate_file(entry, home, None).status == "absent"
+
+
 def test_restorable_statuses_exclude_unreadable():
     assert "unreadable" not in RESTORABLE_STATUSES
     assert "absent" not in RESTORABLE_STATUSES
@@ -385,3 +512,70 @@ def test_secrets_env_is_backed_up_by_its_own_section():
     target = next(t for t in DEFAULT_TARGETS if t.name == "secrets_env")
     assert target.backup_rel == "secrets/secrets.env.gpg"
     assert "secrets/secrets.env.gpg" in spec
+
+
+# ── decrypt-backup-stream CLI (real gpg) ────────────────────────────────────
+
+_CI_SCRIPT = Path(ci.__file__)
+
+
+@pytest.mark.skipif(not _HAS_GPG, reason="gpg not available")
+@pytest.mark.parametrize(
+    ("passphrase", "rc", "out"),
+    [(_PASS, 0, b"line one\nline two\n"), ("not-the-passphrase", 1, b"")],
+)
+def test_decrypt_backup_stream_cli(tmp_path, passphrase, rc, out):
+    """Plaintext goes to stdout and the exit status is 0 only once GPG has
+    authenticated the whole message; a wrong passphrase prints nothing."""
+    (tmp_path / ".gnupg").mkdir(mode=0o700)  # as on any install; gpg fails without it
+    art = tmp_path / "a.gpg"
+    _encrypt(b"line one\nline two\n", art, _PASS)
+    proc = subprocess.run(
+        [sys.executable, str(_CI_SCRIPT), "decrypt-backup-stream", str(art)],
+        input=passphrase.encode(),
+        capture_output=True,
+        env={"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path)},
+    )
+    assert proc.returncode == rc, proc.stderr
+    assert proc.stdout == out
+    names = sorted(p.name for p in tmp_path.iterdir() if p.name not in ("tmp", ".gnupg"))
+    assert names == ["a.gpg"]
+
+
+@pytest.mark.skipif(not _HAS_GPG, reason="gpg not available")
+def test_decrypt_backup_stream_cli_rejects_a_tampered_artifact(tmp_path):
+    """The contract's centre: bytes may already have been written, but a
+    message that fails authentication at the end exits non-zero."""
+    (tmp_path / ".gnupg").mkdir(mode=0o700)
+    art = tmp_path / "t.gpg"
+    _encrypt(os.urandom(1 << 20), art, _PASS)
+    raw = bytearray(art.read_bytes())
+    raw[-30] ^= 0xFF  # inside the final packet / MDC
+    art.write_bytes(bytes(raw))
+    proc = subprocess.run(
+        [sys.executable, str(_CI_SCRIPT), "decrypt-backup-stream", str(art)],
+        input=_PASS.encode(),
+        capture_output=True,
+        env={"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path)},
+    )
+    assert proc.returncode == 1, (proc.returncode, proc.stderr)
+
+
+@pytest.mark.skipif(not _HAS_GPG, reason="gpg not available")
+def test_decrypt_backup_stream_cli_fails_when_reader_stops(tmp_path):
+    """A consumer that stops reading early (sqlite3 bailing on an error) must
+    not leave the stream reading as a success."""
+    (tmp_path / ".gnupg").mkdir(mode=0o700)
+    art = tmp_path / "big.gpg"
+    _encrypt(os.urandom(4 << 20), art, _PASS)
+    script = (
+        f'"{sys.executable}" "{_CI_SCRIPT}" decrypt-backup-stream "{art}" '
+        '| head -c 10 > /dev/null; echo "${PIPESTATUS[0]}"'
+    )
+    proc = subprocess.run(
+        ["bash", "-c", script],
+        input=_PASS.encode(),
+        capture_output=True,
+        env={"PATH": os.environ.get("PATH", ""), "HOME": str(tmp_path)},
+    )
+    assert proc.stdout.strip() not in (b"0", b""), proc

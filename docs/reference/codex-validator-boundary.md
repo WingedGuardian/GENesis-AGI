@@ -9,6 +9,13 @@ ordinary client profiles keep
 their existing behavior. Arbitrary program/file execution remains outside the
 command-string guard boundary.
 
+The owner-supervised interactive entry point is documented in
+[the launcher guide](codex-validator-launcher.md). Its isolated home and native
+trust/source preflight are separate from the sealed request foundation below;
+neither path establishes OS containment or activates an unattended validator.
+The explicit owner branch-test exception keeps runtime policy and protected
+roots in main, with dual source checks; it performs no deployment itself.
+
 ## Interactive guard adapter (inactive)
 
 `scripts/hooks/codex-validator-adapter` is a separate adapter for the planned
