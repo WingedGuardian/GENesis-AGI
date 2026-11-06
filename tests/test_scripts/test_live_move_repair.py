@@ -1888,3 +1888,19 @@ def test_repair_move_restore_reaches_the_kit(w):
     )  # fmt: skip
     assert r.returncode == 0, r.stdout + r.stderr
     assert f"report {ts}: " in r.stdout and '"sub/s1" node as-left' in r.stdout, r.stdout
+
+
+@pytest.mark.parametrize("mode", ["--boot", "--command"])
+def test_a_fifo_at_the_state_path_never_stalls_the_repair(w, mode):
+    """#3964: the repair reads the state file under update.lock and the
+    checkout lock; a FIFO there (open blocks with no writer) would hold both
+    for every update and deploy. Read through the guard's bounded reader, it
+    is an unreadable state: nothing to repair, at once."""
+    os.mkfifo(w.state)
+    r = subprocess.run(
+        ["python3", "-I", "-S", str(MODULE), mode, str(w.state), str(w.root)],
+        capture_output=True, text=True, env=w.env(), timeout=30,
+    )  # fmt: skip
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "cannot be read" in r.stdout + r.stderr, r.stdout + r.stderr
+    assert stat.S_ISFIFO(os.lstat(w.state).st_mode), "the repair left the state path alone"

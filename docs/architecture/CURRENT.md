@@ -4430,7 +4430,16 @@ Refusing a proposed update preserves a previously valid opt-in.
   is every state where finishing forward is wrong or unknown (the update never
   changed the checkout, it is not where the update left it, the record cannot be
   trusted or read, a merge is in progress), whose message names the remedy
-  (usually: save any edit, Dismiss, run the update again). HEAD at the update's
+  (usually: save any edit, Dismiss, run the update again). The state file is
+  read only through the guard's `read_state` (#3964): never through a final
+  symlink, never blocking on a FIFO, a regular file of at most 1 MiB; anything
+  else is "it cannot be read" (`holds`). The live-move repair reads it the same
+  way while it holds its locks, and the runtime's readers (`genesis.env`
+  `update_in_progress`, which the dashboard's Dismiss asks under update.lock,
+  and the update progress route) use `genesis.env.read_update_state`, a mirror
+  pinned to the guard's by a parity test. The guard's git calls run with
+  `core.fsmonitor=false` and `core.hooksPath=/dev/null` (through
+  `GIT_CONFIG_COUNT`), so a repository config naming a program never runs it. HEAD at the update's
   own new code (`own_head`) in any phase is checked for a rollback checkout
   killed partway back to the tag (the two-dot residue back toward the tag),
   main and `live` alike. Merge residue at the tag is `mixed_tree` (exit 4): a half-written
