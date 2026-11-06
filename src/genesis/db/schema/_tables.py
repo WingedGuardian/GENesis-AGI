@@ -561,7 +561,12 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             -- job advances even when it writes no topic.
             topic_updated_at TEXT,
             a2a_state        TEXT,
-            a2a_status_at    TEXT
+            a2a_status_at    TEXT,
+            -- how the session ENDED (crud.cc_sessions.update_status); NULL on
+            -- rows older than the column = not judged, never paged.
+            outcome          TEXT,
+            outcome_reason   TEXT,
+            outcome_paged_at TEXT
         )
     """,
     "inbox_items": """
