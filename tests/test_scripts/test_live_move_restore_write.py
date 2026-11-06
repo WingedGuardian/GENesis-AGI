@@ -933,6 +933,35 @@ def test_flags_survive_the_index_call(w):
     assert _state_of(w, path) == before
 
 
+def test_a_flag_already_back_is_set_again_on_a_re_created_entry(w):
+    """#3986 review (Codex 4492621582): the flag part already reads restored
+    (someone set skip-worktree again by hand) while the index part still
+    needs writing; the index call re-creates the entry without the flag, so
+    the restore sets it again rather than counting it done."""
+    ts, path, before = _fresh(
+        w, lambda w: (_foreign_staged(w), _git(w.root, "update-index", "--skip-worktree", "A"))[0]
+    )
+    _git(w.root, "update-index", "--skip-worktree", "A")  # the flag back by hand, the index not
+    r = _restore(w, ts)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _git(w.root, "ls-files", "-v", "--", "A").startswith("S "), "the flag was lost"
+    assert _state_of(w, path) == before
+
+
+def test_a_saved_directory_missing_a_recorded_entry_is_refused(w):
+    """#3986 review (Codex 4492621571): a file SAVED.json records that is gone
+    from the saved directory refuses the directory's node, never a restore
+    that writes the rest and clears the report."""
+    ts = _repaired(w, _foreign_inside_dir)
+    saved = w.backups()[-1] / "tree" / "P" / "mine.txt"
+    assert saved.is_file(), "control: the file was saved"
+    saved.unlink()
+    r = _restore(w, ts)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert _parts_of(r.stdout)[("P", "node")].startswith("refused:"), r.stdout
+    assert w.report()["restore"]["restored_at"] is None
+
+
 def test_a_disagreeing_post_write_judge_counts_as_refused(w, mod, monkeypatch, capsys):
     """Review N-4: the judge run after the writes must read already-restored
     for every part written; one that does not is refused, and the report is

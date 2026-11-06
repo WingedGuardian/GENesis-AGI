@@ -388,6 +388,7 @@ class Judge:
         self.budget, self.blockers = _Budget(rp), set()
         report, self.rows = loaded["report"], loaded["rows"]
         self.records, self.runs, self.shown, self.strict = records or {}, runs, shown, strict
+        self.record_keys = sorted(self.records)  # _dir's per-row range, by bisect
         block = restore_block(report)
         self.inflight = block["inflight"] if block else None
         self.notes, self.dirs, self.entry_of, self.resumed = {}, {}, {}, None
@@ -680,7 +681,16 @@ class Judge:
         if not self._real_dir(self.backup, row["saved_as"]):
             return [(p, "node", "other:not-saved")]
         restore, kept, unread = {}, {}, []
-        for q, s in self._walk(self.backup, row["saved_as"]).items():
+        saved = self._walk(self.backup, row["saved_as"])
+        # #3986 review: every copy SAVED.json records below the row must still
+        # be there, or the restore would write the rest and clear the report.
+        prefix, keys = row["saved_as"] + "/", self.record_keys
+        i = bisect.bisect_left(keys, prefix)
+        while i < len(keys) and keys[i].startswith(prefix):
+            if keys[i][len(prefix) :] not in saved:
+                return [(p, "node", "other:not-saved")]
+            i += 1
+        for q, s in saved.items():
             rec = self.records.get(f"{row['saved_as']}/{q}")
             if s and s[0] == "fifo" and rec and rec["type"] == "fifo":
                 s = _fifo(rec["mode"])  # what the restore makes: the record's mode

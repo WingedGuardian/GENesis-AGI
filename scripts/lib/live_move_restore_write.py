@@ -548,7 +548,10 @@ class _Writer:
         """Flags after the index call (it re-creates entries). Review N-1: S
         skip-worktree, a lowercase tag assume-unchanged, s both."""
         for (p, k), v in sorted(self.verdict.items()):
-            if k != "flag" or v != "as-left":
+            # A flag already back is set again when the index call re-created
+            # its entry this run (#3986 review: it re-creates it unflagged).
+            again = v == "already-restored" and self.out.get((p, "index")) == "restored"
+            if k != "flag" or (v != "as-left" and not again):
                 continue
             if not self._back(p, "index"):
                 self._refuse(p, "flag", "row-refused")
