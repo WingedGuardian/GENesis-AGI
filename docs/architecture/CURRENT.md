@@ -4601,7 +4601,11 @@ Refusing a proposed update preserves a previously valid opt-in.
   (which names it as `integrity`): a regular file's sha256 (computed while
   copying; `null` over 256 MiB, the restore check's per-file budget) and the
   mode the checkout had, a symlink's target, a FIFO's mode; bounded at
-  32 MiB, past which it records no more and says `complete: false`. The
+  32 MiB, past which it records no more and says `complete: false`. A saved file keeps its
+  extended attributes. A `deploy-backups` that is a link, another user's or
+  writable by others is still saved into (refusing would leave the checkout
+  half-written), and the output and the critical alert say the restore check
+  refuses reports there. The
   folders are this user's alone: `deploy-backups` is made (an existing one
   of this user's is set) 0700, each report dir 0700, `REPAIR.json` and
   `SAVED.json` 0600, and every saved copy, blob and directory below loses its
@@ -4679,6 +4683,17 @@ Refusing a proposed update preserves a previously valid opt-in.
   from the kit's own directory like the guard. It takes the repair's locks in
   the repair's order with a short wait (30 s; `--wait` honoured) and exits 1
   while any is held, or while the guard calls the checkout `mixed_tree`. It
+  reaches `deploy-backups` by an fd opened from the resolved home without following
+  a link and reads everything after through that fd; that folder and every
+  node of the report dir (at most 200,000, never through a link) must be
+  this user's, and every one but a symlink without group or world write,
+  else the whole report is `other:not-owned <path>`, before `REPAIR.json` is
+  parsed (a writer with this user's uid is out of scope: it can already edit
+  the checkout). A report with a node part below another (the writer never
+  writes one) is `other:bad-report`, and one with no integrity record is
+  judged with a note that a restore refuses it. Every git call of the repair
+  and the check runs with `core.fsmonitor=false` and
+  `core.hooksPath=/dev/null`. It
   first refuses the whole report if a row is not exactly what the writer
   writes (relative paths outside `.git`, at most 4,096 bytes, the sum of
   length x depth over the rows within the report byte cap; git modes and
@@ -4687,7 +4702,8 @@ Refusing a proposed update preserves a previously valid opt-in.
   `tree/<path>`; the writer's flag letters, classes and special shapes; an
   `integrity` other than `SAVED.json`, or a `SAVED.json` that is not a regular
   file of at most 32 MiB holding exactly `{files, complete}` with `tree/<path>`
-  keys and the writer's three record shapes; a report naming none, written
+  keys (a nested checkout's `.git` below a row's path is saved data; a first
+  part `.git` is refused) and the writer's three record shapes; a report naming none, written
   before the record existed, is judged as before), or
   if a newer report of this checkout (by its ts, dismissed ones too; one
   naming another checkout is skipped) cannot be read, the newer reports

@@ -750,6 +750,32 @@ def test_td10_repair_move_runs_the_kit_never_the_checkouts_copy(w):
     outside = {k: v for k, v in w.snapshot().items() if k.split("/")[0] != "scripts"}
     assert outside == {k: v for k, v in tag_snapshot().items() if k.split("/")[0] != "scripts"}
     ts = w.report()["ts"]
+    # The wrapper forwards --restore TS like --dismiss TS, and --check rides after it
+    # (#3966 item 2): without the forward, argparse refuses --command with --restore.
+    c = subprocess.run(
+        ["bash", str(entry), "repair-move", "--restore", ts, "--check"],
+        capture_output=True,
+        text=True,
+        env=w.env(),
+    )
+    assert c.returncode == 0, c.stdout + c.stderr
+    assert f"report {ts}:" in c.stdout and "nothing was written" in c.stdout, c.stdout
+    # #3974 item 4: --wait may come first; the mode is found wherever it is.
+    c = subprocess.run(
+        ["bash", str(entry), "repair-move", "--wait", "5", "--restore", ts, "--check"],
+        capture_output=True,
+        text=True,
+        env=w.env(),
+    )
+    assert c.returncode == 0 and f"report {ts}:" in c.stdout, c.stdout + c.stderr
+    # Two modes are refused before the kit runs: never the last one silently.
+    for two in (["--restore", ts, "--dismiss", ts], ["--dismiss", ts, "--restore", ts, "--check"]):
+        c = subprocess.run(
+            ["bash", str(entry), "repair-move", *two], capture_output=True, text=True, env=w.env()
+        )
+        assert c.returncode == 1 and "one of --dismiss TS or --restore TS" in c.stderr, two
+    assert w.report()["dismissed_at"] is None
+    assert not w.state.exists()
     d = subprocess.run(
         ["bash", str(entry), "repair-move", "--dismiss", ts],
         capture_output=True,
@@ -1823,6 +1849,27 @@ def test_the_report_folder_is_this_users_alone(w):
     assert (backup / "tree" / "P" / "pipe").exists(), "control: the FIFO was saved"
     assert (backup / "tree" / "P" / "mine.txt").exists(), "control: the file was saved"
     assert any((backup / "index-blobs").iterdir()), "control: a blob was saved"
+
+
+def test_a_linked_backup_root_still_heals_and_warns(w):
+    """#3974 item 6 (owner ruling 2026-11-06: heal and warn): a deploy-backups
+    that is a link (or another user's, or writable by others) is still saved
+    into, since refusing would leave the checkout half-written, but the output
+    and the alert say the restore check refuses reports there."""
+    elsewhere = w.home / "elsewhere"
+    elsewhere.mkdir(mode=0o700)
+    (w.gen / "deploy-backups").symlink_to(elsewhere)
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: _foreign_inside_dir(w))
+    age_locks(w)
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert any(elsewhere.iterdir()), "control: the report was saved through the link"
+    assert w.report()["result"].startswith("healed"), w.report()["result"]
+    warning = "is not a folder of this user's alone"
+    assert warning in r.stdout, r.stdout
+    alerts = w.alerts()
+    assert alerts and alerts[-1]["severity"] == "critical" and warning in alerts[-1]["body"], alerts
 
 
 def test_repair_move_restore_reaches_the_kit(w):

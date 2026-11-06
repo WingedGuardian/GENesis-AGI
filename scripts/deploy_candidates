@@ -82,12 +82,19 @@ exec(compile(src, sys.argv[0], "exec"), {"__name__": "__main__", "__file__": sys
         fi
     done
     [ -f "$kit" ] || die "the live-move repair kit is not installed ($kit). The manual steps: scripts/deploy_candidates repair-move --explain"
-    mode=(--command)
-    case "${1:-}" in
-        --dismiss) mode=(--dismiss "${2:?--dismiss needs the repair timestamp}"); shift 2 ;;
-        --restore) mode=(--restore "${2:?--restore needs the repair timestamp}"); shift 2 ;;
-    esac
-    exec python3 -I -S "$kit" "${mode[@]}" "$HOME/.genesis/update_state.json" "$(dirname "$_SELF_DIR")" "$@"
+    # The mode may follow --wait N (#3974 item 4); every other argument is passed
+    # on. A second mode is refused, never silently preferred (the kit's argparse
+    # refused both together before the mode moved here).
+    mode=(--command) rest=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dismiss | --restore)
+                [ "${mode[0]}" = --command ] || die "repair-move takes one of --dismiss TS or --restore TS"
+                mode=("$1" "${2:?$1 needs the repair timestamp}"); shift 2 ;;
+            *) rest+=("$1"); shift ;;
+        esac
+    done
+    exec python3 -I -S "$kit" "${mode[@]}" "$HOME/.genesis/update_state.json" "$(dirname "$_SELF_DIR")" "${rest[@]}"
 fi
 
 # Test fence first (sourced): the engine only ever acts on the checkout this

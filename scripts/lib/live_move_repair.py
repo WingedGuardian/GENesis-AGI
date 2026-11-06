@@ -59,9 +59,13 @@ def _log(msg: str) -> None:
     print(f"live-move repair: {msg}", file=sys.stderr, flush=True)
 
 
+#: Every git call's options: no fsmonitor program and no hook from the repository's config.
+GIT_C = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
+
+
 def _git(repo: str, *args: str, check: bool = True, data: bytes | None = None):
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
-    p = subprocess.run(["git", "-C", repo, *args], capture_output=True, input=data, env=env)
+    p = subprocess.run(["git", *GIT_C, "-C", repo, *args], capture_output=True, input=data, env=env)
     if check and p.returncode != 0:
         why = p.stderr.decode(errors="replace").strip()
         raise RepairError(f"git {args[0]} failed (exit {p.returncode}): {why}")
@@ -593,6 +597,7 @@ class Repair:
         self.state_path, self.repo, self.boot, self.wait = state_path, repo, boot, wait
         self.home = os.path.dirname(os.path.abspath(state_path))
         self.backups = os.path.join(self.home, "deploy-backups")
+        self.backups_warning: str | None = None
         self.guard = _load_guard()
         self._fds: list[int] = []
 
@@ -674,9 +679,8 @@ class Repair:
                 f"the checkout is half-written ({reason}); repair it first, nothing was judged"
             )
             return 1
-        backup = os.path.join(self.backups, ts + SUFFIX)
-        restore = _load_kit("live_move_restore.py")
-        return restore.check(types.SimpleNamespace(**globals()), self.repo, backup, self._say)
+        kit = _load_kit("live_move_restore.py")
+        return kit.check(types.SimpleNamespace(**globals()), self.repo, self.home, ts, self._say)
 
     def _judge_state(self, index_lock: str) -> int:
         with open(self.state_path, "rb") as fh:
@@ -785,6 +789,17 @@ class Repair:
         st = os.lstat(self.backups)
         if stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and st.st_mode & 0o077:
             os.chmod(self.backups, 0o700)
+            st = os.lstat(self.backups)
+        # The restore's origin rule (live_move_restore._anchor) refuses such a
+        # root. The repair still saves into it and heals, since refusing would
+        # leave the checkout half-written, and says so (owner ruling, #3974 item 6).
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o022:
+            self.backups_warning = (
+                f"{self.backups} is not a folder of this user's alone (a link, another"
+                " user's, or writable by others): the backup was saved there, but the"
+                " restore check refuses reports under it; move the report into a 0700"
+                " deploy-backups of this user's to restore it"
+            )
         with contextlib.suppress(FileExistsError):
             os.mkdir(backup, 0o700)
         st = os.lstat(backup)
@@ -1106,8 +1121,14 @@ class Repair:
                 f" {foreign} path(s) were not the update's. To see what putting them back"
                 f" would write: {cmd} --check. To put them back: {cmd}."
             )
+        if self.backups_warning:
+            body += f" WARNING: {self.backups_warning}."
         self._say(body)
-        severity = "critical" if foreign or manifest["index_rebuilt"] or rc else "warning"
+        severity = (
+            "critical"
+            if foreign or manifest["index_rebuilt"] or rc or self.backups_warning
+            else "warning"
+        )
         self._alert(severity, body, f"live_move_repair:{manifest['ts']}", backup)
         return rc
 

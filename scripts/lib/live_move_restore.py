@@ -41,6 +41,7 @@ import re
 import stat
 import subprocess
 import time
+import types
 
 _OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _MODES = frozenset({"100644", "100755", "120000", "160000"})
@@ -68,12 +69,17 @@ READ_BYTES = 2 * 1024 * 1024 * 1024
 ENTRIES = 200_000
 
 
-def _path(p: object) -> bool:
+def _path(p: object, *, nested_git: bool = False) -> bool:
     """A plain relative path outside `.git`, as git records one: no empty, `.`
-    or `..` part, no NUL, at most PATH_BYTES file-system bytes."""
+    or `..` part, no NUL, at most PATH_BYTES file-system bytes. ``nested_git``:
+    a saved copy's path below a row, where a nested checkout's `.git` is
+    saved data (#3974 item 1); only a first part `.git`, the checkout's own,
+    is refused."""
     if not isinstance(p, str) or "\0" in p:
         return False
-    if any(part in ("", ".", "..", ".git") for part in p.split("/")):
+    parts = p.split("/")
+    banned = ("", ".", "..") if nested_git else ("", ".", "..", ".git")
+    if parts[0] == ".git" or any(part in banned for part in parts):
         return False
     try:
         return len(os.fsencode(p)) <= PATH_BYTES
@@ -95,6 +101,7 @@ def _special(s: object) -> bool:
     return (
         isinstance(s, dict)
         and set(s) == {"type", "mode"}
+        and isinstance(s["type"], str)
         and s["type"] in _SPECIALS
         and isinstance(s["mode"], str)
         and re.fullmatch(r"[0-7]{4}", s["mode"]) is not None
@@ -106,7 +113,13 @@ def _row_problem(row: dict, parents) -> str | None:
     if missing := ROW_KEYS - row.keys():
         return "missing " + ", ".join(sorted(missing))
     p, index = row["path"], row.get("index")
-    if row.get("class") not in ("foreign", "engine") or row.get("disk") not in _DISKS:
+    # isinstance first: a list or object here is unhashable (#3965 item 3).
+    disk = row.get("disk")
+    if (
+        row.get("class") not in ("foreign", "engine")
+        or not isinstance(disk, str)
+        or disk not in _DISKS
+    ):
         return "class or disk"
     if not isinstance(row.get("disk_changed"), bool):
         return "disk_changed"
@@ -134,7 +147,9 @@ def _row_problem(row: dict, parents) -> str | None:
     through = row.get("unreachable_through")
     if through is not None and through not in parents(p):
         return "unreachable_through"
-    if row.get("flag") is not None and row["flag"] not in _FLAGS:
+    if row.get("flag") is not None and (
+        not isinstance(row["flag"], str) or row["flag"] not in _FLAGS
+    ):
         return "flag"
     if (row["disk"] == "other") != (row.get("special") is not None) or (
         row.get("special") is not None and not _special(row["special"])
@@ -142,7 +157,8 @@ def _row_problem(row: dict, parents) -> str | None:
         return "special"
     unsaved = row.get("unsaved")
     if not isinstance(unsaved, list) or not all(
-        isinstance(u, dict) and _path(u.get("path")) and u["path"].startswith(p + "/")
+        isinstance(u, dict) and _path(u.get("path"), nested_git=True)
+        and u["path"].startswith(p + "/")
         and _special({k: u.get(k) for k in ("type", "mode")}) and len(u) == 3
         for u in unsaved
     ):  # fmt: skip
@@ -182,44 +198,51 @@ def _record(r: object) -> bool:
 
 
 def saved_problem(rp, backup: str) -> str | None:
-    """Why the report's SAVED.json (the integrity record REPAIR.json names) is
-    not one the writer wrote, else None. Opened as load_report opens
-    REPAIR.json: no symlink followed, no FIFO blocked on, a regular file of at
-    most SAVED_BYTES, holding exactly {files, complete}: `tree/<path>` keys
-    and the writer's three record shapes. Only the shape: whether a copy still
-    matches its record is the restore's to check (B2b)."""
+    """Why the report's SAVED.json is not one the writer wrote, else None."""
+    return _saved(rp, backup)[0]
+
+
+def _saved(rp, backup: str) -> tuple[str | None, dict | None]:
+    """(why, None), or (None, SAVED.json) when it is the integrity record the
+    writer wrote. Opened as load_report opens REPAIR.json: no symlink followed,
+    no FIFO blocked on, a regular file of at most SAVED_BYTES, holding exactly
+    {files, complete}: `tree/<path>` keys and the writer's three record
+    shapes. Only the shape: whether a copy still matches its record the
+    restore checks as it copies it."""
     try:
         flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
         fd = os.open(os.path.join(backup, "SAVED.json"), flags)
     except OSError as exc:
-        return f"cannot be opened ({exc.strerror})"
+        return f"cannot be opened ({exc.strerror})", None
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return "not a regular file"
+            return "not a regular file", None
         chunks, size = [], 0
         while size <= rp.SAVED_BYTES and (chunk := os.read(fd, rp.SAVED_BYTES + 1 - size)):
             chunks.append(chunk)
             size += len(chunk)
     except OSError as exc:
-        return f"cannot be read ({exc.strerror})"
+        return f"cannot be read ({exc.strerror})", None
     finally:
         os.close(fd)
     if size > rp.SAVED_BYTES:
-        return f"over {rp.SAVED_BYTES} bytes"
+        return f"over {rp.SAVED_BYTES} bytes", None
     try:
         saved = json.loads(b"".join(chunks))
     except (ValueError, RecursionError):
-        return "not JSON"
+        return "not JSON", None
     if not isinstance(saved, dict) or set(saved) != {"files", "complete"}:
-        return "not {files, complete}"
+        return "not {files, complete}", None
     if not isinstance(saved["complete"], bool) or not isinstance(saved["files"], dict):
-        return "files or complete"
+        return "files or complete", None
     if len(saved["files"]) > ENTRIES:
-        return f"over {ENTRIES} records"
+        return f"over {ENTRIES} records", None
     for key, r in saved["files"].items():
-        if not (key.startswith("tree/") and _path(key[len("tree/") :])) or not _record(r):
-            return f"record {json.dumps(key)[:200]}"
-    return None
+        if not (
+            key.startswith("tree/") and _path(key[len("tree/") :], nested_git=True)
+        ) or not _record(r):
+            return f"record {json.dumps(key)[:200]}", None
+    return None, saved
 
 
 def problem(loaded: dict, budget: int, parents) -> str | None:
@@ -310,9 +333,14 @@ def _newer_paths(rp, repo: str, backups: str, ts: str) -> tuple[dict | None, str
         rows += len(found)
         if rows > rp.REPORT_ROWS:
             return None, f"{other}: the newer reports hold over {rp.REPORT_ROWS} rows together"
+        # Every row must name a plain path: one that does not could hide an
+        # overlap (#3966 item 1). load_report drops a row that is not an object.
+        if loaded and len(found) != len(loaded["report"].get("paths", ())):
+            return None, f"{other}: a row is not an object"
         for r in found:
-            if isinstance(r.get("path"), str):
-                paths.setdefault(r["path"], other)
+            if not _path(r.get("path")):
+                return None, f"{other}: a row names no plain path"
+            paths.setdefault(r["path"], other)
     return paths, ""
 
 
@@ -348,6 +376,7 @@ class Judge:
     def __init__(self, rp, repo: str, backup: str, loaded: dict, newer: dict) -> None:
         self.rp, self.repo, self.backup = rp, repo, backup
         self.budget, self.blockers = _Budget(rp), set()
+        self.notes = {}
         report, self.rows = loaded["report"], loaded["rows"]
         self.fmt = rp._out(repo, "rev-parse", "--show-object-format")
         self.head = rp._tree(repo, "HEAD")
@@ -392,7 +421,7 @@ class Judge:
         if not want:
             return set()
         p = subprocess.run(
-            ["git", "-C", self.repo, "cat-file", "--batch-check"],
+            ["git", *self.rp.GIT_C, "-C", self.repo, "cat-file", "--batch-check"],
             input="".join(f"{o}\n" for o in want).encode(),
             capture_output=True,
             env=_git_env(),
@@ -625,49 +654,162 @@ class Judge:
         return out
 
 
-def check(rp, repo: str, backup: str, say) -> int:
-    """``--restore TS --check``: judge the report in ``backup``, print one line
-    per part and a summary; 0 if every part is as-left or already-restored."""
-    ts = rp.report_ts(os.path.basename(backup))
+_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+class _Whole(Exception):
+    """The whole report refused, by name, before anything is judged."""
+
+
+def _mine(st: os.stat_result, link: bool = False) -> bool:
+    return st.st_uid == os.geteuid() and (link or not st.st_mode & 0o022)
+
+
+def _anchor(home: str) -> int:
+    """deploy-backups, opened without following a link from the resolved home
+    (review L-6), and this user's with no group or world write; its fd. Every
+    later read goes through it (/proc/self/fd), never through a path someone
+    who can write the home could swap."""
+    hfd = os.open(os.path.realpath(home), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        fd = os.open("deploy-backups", _DIR, dir_fd=hfd)
+    except FileNotFoundError:
+        raise
+    except OSError as exc:
+        raise _Whole(f'other:not-owned "deploy-backups" ({exc.strerror})') from None
+    finally:
+        os.close(hfd)
+    if not _mine(os.fstat(fd)):
+        os.close(fd)
+        raise _Whole('other:not-owned "deploy-backups"')
+    return fd
+
+
+def _origin(root: str, name: str) -> None:
+    """The origin rule (owner rulings ced82b49, 73b6285d), before REPAIR.json
+    is parsed: the report dir and every node below it (never following a
+    link, at most ENTRIES of them, review N-5) are this user's, and every one
+    but a symlink (its mode means nothing) has no group or world write.
+    deploy-backups passed the same test (_anchor), so whoever can write the
+    home could only swap in a folder that fails it, or a 0700 one of this
+    user's they can never fill. A writer with this user's uid is out of scope:
+    it can already edit the checkout."""
+    top, left = os.path.join(root, name), ENTRIES
+    try:
+        st = os.lstat(top)
+    except FileNotFoundError:
+        raise _Whole("other:unreadable (no such report)") from None
+    if not stat.S_ISDIR(st.st_mode) or not _mine(st):
+        raise _Whole(f"other:not-owned {json.dumps(name)}")
+    for d, dirs, files in os.walk(top, onerror=_raise):
+        for n in dirs + files:
+            left -= 1
+            if left < 0:
+                raise _Whole(f"other:too-large (the report holds over {ENTRIES} nodes)")
+            st = os.lstat(os.path.join(d, n))
+            if not _mine(st, link=stat.S_ISLNK(st.st_mode)):
+                rel = os.path.relpath(os.path.join(d, n), root)
+                raise _Whole(f"other:not-owned {json.dumps(rel)[:200]}")
+
+
+def _open(rp, repo: str, home: str, ts: str, say):
+    """Every gate a --restore TS --check run passes before it judges: the ts,
+    the origin rule, the loader, the validators, the integrity record (a
+    restore refuses a report without one whole, review N-3), no node part
+    below another (review LOW-2: the writer never writes one), the newer
+    reports, then B1's judge. (judge, parts, loaded, ctx), or an exit code
+    once it has said why."""
+    nothing = "nothing judged"
+    shown = os.path.join(home, "deploy-backups")
     try:
         _order(ts)
+        bfd = _anchor(home)
+    except ValueError:
+        say(f"report {ts} other:unreadable (its ts names no date); {nothing}")
+        return 1
+    except FileNotFoundError:
+        say(f"report {ts} other:unreadable (no such report); {nothing}")
+        return 1
+    except _Whole as exc:
+        say(f"report {ts} {exc}; {nothing}")
+        return 1
+    root = f"/proc/self/fd/{bfd}"
+    ctx = types.SimpleNamespace(bfd=bfd, root=root, shown=shown, ts=ts, name=ts + rp.SUFFIX)
+    ctx.backup = os.path.join(root, ctx.name)
+    try:
+        got = _judged(rp, repo, ctx, say)
+    except BaseException:
+        os.close(bfd)
+        raise
+    if isinstance(got, str):
+        os.close(bfd)
+        say(f"report {ts} {got}; {nothing}")
+        return 1
+    return got
+
+
+def _judged(rp, repo: str, ctx, say):
+    """_open's gates past the anchor: (judge, parts, loaded, ctx), or why not."""
+    ts, backup = ctx.ts, ctx.backup
+
+    def unreadable(exc: OSError) -> str:
+        return f"other:unreadable (a path cannot be read: {str(exc).replace(ctx.root, ctx.shown)})"
+
+    try:
+        _origin(ctx.root, ctx.name)
         loaded = rp.load_report(backup, repo)
         if loaded is None:
-            gone = not os.path.lexists(backup)
-            raise rp.BadReport("no such report" if gone else "it holds no REPAIR.json")
-    except ValueError:
-        say(f"report {ts} other:unreadable (its ts names no date); nothing judged")
-        return 1
+            raise rp.BadReport("it holds no REPAIR.json")
+    except _Whole as exc:
+        return str(exc)
+    except OSError as exc:
+        return unreadable(exc)
     except rp.BadReport as exc:
-        say(f"report {ts} other:unreadable ({exc}); nothing judged")
-        return 1
+        return f"other:unreadable ({exc})"
     if why := problem(loaded, rp.REPORT_BYTES, rp._parents):
-        say(f"report {ts} other:bad-report ({why}); nothing judged")
-        return 1
-    # A report written before the integrity record existed names none: it is
-    # judged as before (the restore refuses its node parts `no-hash`).
-    if "integrity" in loaded["report"]:
-        named = loaded["report"]["integrity"]
+        return f"other:bad-report ({why})"
+    report = loaded["report"]
+    if "integrity" not in report:
+        say(f"report {ts}: no integrity record (written before SAVED.json); a restore refuses it")
+    else:
+        named = report["integrity"]
         why = saved_problem(rp, backup) if named == "SAVED.json" else "integrity names another file"
         if why:
-            say(f"report {ts} other:bad-report (SAVED.json: {why}); nothing judged")
-            return 1
-    newer, why = _newer_paths(rp, repo, os.path.dirname(backup), ts)
+            return f"other:bad-report (SAVED.json: {why})"
+    nodes = {r["path"] for r in loaded["rows"] if r["class"] == "foreign"
+             and r["disk_changed"] and not r["unreachable_through"]}  # fmt: skip
+    whole = {r["path"] for r in loaded["rows"] if r["disk"] == "dir" and r["disk_changed"]}
+    for p in nodes:
+        if whole.isdisjoint(rp._parents(p)) and not nodes.isdisjoint(rp._parents(p)):
+            return f"other:bad-report (a node part below another: {json.dumps(p)[:200]})"
+    newer, why = _newer_paths(rp, repo, ctx.root, ts)
     if newer is None:
-        say(f"report {ts} other:newer-report-unreadable ({why}); nothing judged")
-        return 1
+        return f"other:newer-report-unreadable ({why})"
     try:
         judge = Judge(rp, repo, backup, loaded, newer)
     except rp.RepairError as exc:
-        say(f"report {ts} other:tree-unreadable (HEAD's or the tag's tree: {exc}); nothing judged")
-        return 1
+        return f"other:tree-unreadable (HEAD's or the tag's tree: {exc})"
     try:
         parts = [part for row in judge.rows if row["class"] == "foreign" for part in judge.row(row)]
     except OSError as exc:
-        say(f"report {ts} other:unreadable (a path cannot be read: {exc}); nothing judged")
-        return 1
+        return unreadable(exc)
+    return judge, parts, loaded, ctx
+
+
+def _line(path: str, part: str, outcome: str, note: str | None) -> str:
+    return f"{json.dumps(path)} {part} {outcome}" + (f" ({note})" if note else "")
+
+
+def check(rp, repo: str, home: str, ts: str, say) -> int:
+    """``--restore TS --check``: judge the report ``ts`` names, print one line
+    per part and a summary; 0 if every part is as-left or already-restored."""
+    got = _open(rp, repo, home, ts, say)
+    if isinstance(got, int):
+        return got
+    judge, parts, loaded, ctx = got
+    os.close(ctx.bfd)
     for path, part, verdict in parts:
-        say(f"{json.dumps(path)} {part} {verdict}")
+        say(_line(path, part, verdict, judge.notes.get((path, part))))
     counts = {k: sum(1 for *_, v in parts if v == k) for k in ("as-left", "already-restored")}
     other = len(parts) - sum(counts.values())
     say(
