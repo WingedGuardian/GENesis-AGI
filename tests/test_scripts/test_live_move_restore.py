@@ -627,36 +627,38 @@ def _sparse(path: Path, size: int) -> None:
         fh.truncate(size)
 
 
-def _run_alone(argv: list[str], env: dict, scratch: Path, timeout: float):
-    """Run argv and return (result, the max RSS in KiB of THIS child alone).
+#: The address space the check may use: far under the 3 GiB file, far over
+#: what it needs (it hashes in 1 MiB chunks; FILE_BYTES is 256 MiB).
+_AS_CAP = 1 << 30
 
-    `getrusage(RUSAGE_CHILDREN).ru_maxrss` is the largest child the whole
-    process ever reaped, and CI runs the suite in one process, so it reports
-    an earlier test's peak. `os.wait4` returns the rusage of this one child."""
-    out, err = scratch / "run.out", scratch / "run.err"
-    with open(out, "wb") as o, open(err, "wb") as e:
-        p = subprocess.Popen(argv, stdout=o, stderr=e, env=env)
-    deadline = time.monotonic() + timeout
-    while True:
-        pid, status, ru = os.wait4(p.pid, os.WNOHANG)
-        if pid:
-            break
-        if time.monotonic() > deadline:
-            p.kill()
-            os.wait4(p.pid, 0)
-            raise AssertionError(f"{argv[4:]} ran past {timeout} s")
-        time.sleep(0.05)
-    p.returncode = os.waitstatus_to_exitcode(status)
-    r = subprocess.CompletedProcess(argv, p.returncode, out.read_text(), err.read_text())
-    return r, ru.ru_maxrss
+#: Sets RLIMIT_AS in a fresh small process, then execs the command under it.
+_CAPPED = (
+    "import os, resource, sys; c = int(sys.argv[1]); "
+    "resource.setrlimit(resource.RLIMIT_AS, (c, c)); os.execvp(sys.argv[2], sys.argv[2:])"
+)
+
+
+def _run_capped(argv: list[str], env: dict, timeout: float):
+    """Run argv with its address space capped at _AS_CAP, so reading the
+    file whole fails (MemoryError) instead of passing.
+
+    A child's ru_maxrss cannot be measured from the suite: it starts from the
+    parent's resident set at fork (a `pass` child of an 800 MiB parent reads
+    830,752 KiB), and CI runs the whole suite in one process. A limit set
+    after the fork, in the small wrapper, does not depend on the parent."""
+    return subprocess.run(
+        ["python3", "-I", "-S", "-c", _CAPPED, str(_AS_CAP), *argv],
+        env=env, capture_output=True, text=True, timeout=timeout,
+    )  # fmt: skip
 
 
 @pytest.mark.parametrize("where", ["checkout", "backup"])
-def test_a_huge_file_is_too_large_promptly_never_read_whole(w, where, tmp_path):
+def test_a_huge_file_is_too_large_promptly_never_read_whole(w, where):
     """Security S1 (the review's 3 GiB case, a sparse file): a node the judge
     would hash is over the per-file budget, in the checkout (a gitlink's
     directory, walked) or in the backup (a saved copy). It answers promptly
-    as `other:too-large`, holding little memory, never reading the file whole."""
+    as `other:too-large` under a 1 GiB address-space cap, so it never read the
+    file whole."""
 
     ts = _repaired(w, _foreign_gitlink if where == "checkout" else _foreign_edit)
     if where == "checkout":
@@ -668,14 +670,13 @@ def test_a_huge_file_is_too_large_promptly_never_read_whole(w, where, tmp_path):
         _sparse(saved, 3 * GIB)
         part = ("sub/s1", "node")
     start = time.monotonic()
-    r, rss_kib = _run_alone(
+    r = _run_capped(
         ["python3", "-I", "-S", str(MODULE), "--restore", ts, "--check", str(w.state), str(w.root)],
-        w.env(), tmp_path, 120,
+        w.env(), 120,
     )  # fmt: skip
     took = time.monotonic() - start
     assert _parts(r).get(part) == "other:too-large", r.stdout + r.stderr
     assert r.returncode == 1 and took < 60, took
-    assert rss_kib < 512 * 1024, f"a child held {rss_kib} KiB"
 
 
 def test_node_never_follows_or_blocks_on_a_node_swapped_after_its_lstat(mod, tmp_path, monkeypatch):
