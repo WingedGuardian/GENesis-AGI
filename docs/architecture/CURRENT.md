@@ -1756,6 +1756,16 @@ the shared banner is not an assertion about all concurrent sessions.
   The existing foreground watchdog lacks a post-return scope-quiescence barrier;
   strict queue integration must retain unresolved cleanup ownership separately.
   Synthetic/descriptor fixtures do not qualify native OOM or production indexing.
+  Schema 4 adds explicit protocol-3 journal APIs in
+  `scripts/lib/index_marker_execution.py` on the same admitted connection:
+  unique reservation, actual scope registration, single-use committed native
+  intent, retained typed report/stop/cleanup facts and exact-once application.
+  Shared publishers and exclusive replay/admission reuse `.queue.lock`, including
+  busy spools. Completion is independent from safety and cleanup; late disproof
+  retains repo-wide exclusion without restoring old accounting or overwriting a
+  newer inflight pointer. This is transaction storage/interpretation only:
+  automatic readiness stays fenced, actual queued native production and lifetime
+  reconciliation remain unwired, and kernel/production acceptance is unqualified.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
   deletions; native query/client cgroup proof and orphan-scope checks precede
@@ -4430,7 +4440,16 @@ Refusing a proposed update preserves a previously valid opt-in.
   is every state where finishing forward is wrong or unknown (the update never
   changed the checkout, it is not where the update left it, the record cannot be
   trusted or read, a merge is in progress), whose message names the remedy
-  (usually: save any edit, Dismiss, run the update again). HEAD at the update's
+  (usually: save any edit, Dismiss, run the update again). The state file is
+  read only through the guard's `read_state` (#3964): never through a final
+  symlink, never blocking on a FIFO, a regular file of at most 1 MiB; anything
+  else is "it cannot be read" (`holds`). The live-move repair reads it the same
+  way while it holds its locks, and the runtime's readers (`genesis.env`
+  `update_in_progress`, which the dashboard's Dismiss asks under update.lock,
+  and the update progress route) use `genesis.env.read_update_state`, a mirror
+  pinned to the guard's by a parity test. The guard's git calls run with
+  `core.fsmonitor=false` and `core.hooksPath=/dev/null` (through
+  `GIT_CONFIG_COUNT`), so a repository config naming a program never runs it. HEAD at the update's
   own new code (`own_head`) in any phase is checked for a rollback checkout
   killed partway back to the tag (the two-dot residue back toward the tag),
   main and `live` alike. Merge residue at the tag is `mixed_tree` (exit 4): a half-written

@@ -136,7 +136,7 @@ def test_legacy_schema_upgrade_preserves_debt_clocks_diagnostics_and_receipts(
         assert receipts[0]["raw_payload"] == (None if version == 1 else b"retained")
         assert receipts[0]["source_mtime_ns"] == "-11"
     with closing(sqlite3.connect(queue.database_path())) as db:
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 4
         assert (
             db.execute(
                 "SELECT value FROM queue_meta WHERE key='automatic_protocol_ready'"
@@ -178,7 +178,7 @@ def test_every_schema_statement_failure_rolls_back_before_retry(queue, tmp_path)
             assert db.execute("PRAGMA user_version").fetchone()[0] == 2
             assert not db.in_transaction
         queue._publish_schema(db)
-        assert db.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 4
     finally:
         db.close()
 
@@ -203,7 +203,7 @@ def test_schema_commit_failure_leaves_only_old_or_complete_state(queue, tmp_path
             queue._publish_schema(db)
         db.enabled = False
         if after_commit:
-            assert db.execute("PRAGMA user_version").fetchone()[0] == 3
+            assert db.execute("PRAGMA user_version").fetchone()[0] == 4
             assert db.execute("SELECT count(*) FROM pending").fetchone()[0] == 2
             assert db.execute("SELECT count(*) FROM executions").fetchone()[0] == 2
         else:

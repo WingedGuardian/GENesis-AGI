@@ -630,7 +630,7 @@ class Repair:
         deadline = _now() + (BOOT_BUDGET_S if self.boot else self.wait)
         lock = self._update_lock()
         if self._hold(lock, 0) is None:
-            pid = (_load(self.state_path) or {}).get("pid")
+            pid = (self._state()[1] or {}).get("pid")
             if self.boot and isinstance(pid, int) and pid > 1 and _pid_alive(pid):
                 # update.sh or a deploy starts its own server under the lock; a
                 # failure here would only send it to its degraded fallback.
@@ -682,10 +682,22 @@ class Repair:
         kit = _load_kit("live_move_restore.py")
         return kit.check(types.SimpleNamespace(**globals()), self.repo, self.home, ts, self._say)
 
+    def _state(self) -> tuple[bytes | None, dict | None]:
+        """The state file's bytes and its object, through the guard's bounded
+        reader (#3964): a link, a FIFO or an over-cap file is (None, None), an
+        unreadable state, never a read that blocks while the locks are held."""
+        try:
+            raw = self.guard.read_state(self.state_path)
+        except (OSError, ValueError):
+            return None, None
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (ValueError, RecursionError):
+            return raw, None
+        return raw, data if isinstance(data, dict) else None
+
     def _judge_state(self, index_lock: str) -> int:
-        with open(self.state_path, "rb") as fh:
-            raw = fh.read()
-        state = _load(self.state_path)
+        raw, state = self._state()
         verdict, reason = self.guard.state_verdict(state, self.repo)
         to = self._live_target(state)
         if verdict == self.guard.SAFE and to:
@@ -1086,9 +1098,8 @@ class Repair:
         """Replace the state with ``state``, only while it is still the bytes that
         were judged (as _clear)."""
         try:
-            with open(self.state_path, "rb") as fh:
-                same = fh.read() == raw
-        except OSError:
+            same = self.guard.read_state(self.state_path) == raw
+        except (OSError, ValueError):
             return
         if not same:
             _log("the update state changed during the repair; it is kept")
@@ -1098,9 +1109,8 @@ class Repair:
     def _clear(self, raw: bytes) -> None:
         """Remove the state, only while it is still the bytes that were judged."""
         try:
-            with open(self.state_path, "rb") as fh:
-                same = fh.read() == raw
-        except OSError:
+            same = self.guard.read_state(self.state_path) == raw
+        except (OSError, ValueError):
             return
         if not same:
             _log("the update state changed during the repair; it is kept")

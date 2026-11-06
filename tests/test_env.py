@@ -888,3 +888,61 @@ class TestSignalHolderIdentity:
         state = home / "update_state.json"
         os.utime(state, (1_000_000_000, 1_000_000_000))
         assert update_in_progress() is True
+
+
+# ── #3964: the state file read bounded, as the restart guard reads it ───────
+
+
+def test_a_fifo_state_file_answers_at_once(home: Path):
+    """#3964 (audit SHOULD-FIX): the dashboard's Dismiss asks this while it
+    holds update.lock, so a FIFO at the state path must not block it (open
+    blocks with no writer). Run in a child so a hang fails the test, not the
+    suite."""
+    import subprocess
+    import sys
+
+    import genesis.env as env
+
+    os.mkfifo(home / "update_state.json")
+    src = str(Path(env.__file__).resolve().parents[1])
+    r = subprocess.run(
+        [sys.executable, "-c", "from genesis.env import update_in_progress as u; print(u())"],
+        capture_output=True, text=True, timeout=20,
+        env={**os.environ, "GENESIS_HOME": str(home), "PYTHONPATH": src},
+    )  # fmt: skip
+    assert r.returncode == 0 and r.stdout.strip() == "False", r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("kind", ["regular", "at-cap", "over-cap", "fifo", "symlink", "directory"])
+def test_the_runtime_reader_matches_the_restart_guard(tmp_path: Path, kind: str):
+    """The runtime mirror of the guard's bounded reader (the runtime cannot
+    import that kit file) gives the same answer for every kind of path."""
+    import importlib.util
+
+    import genesis.env as env
+
+    guard_path = Path(__file__).resolve().parents[1] / "scripts" / "lib" / "update_state_guard.py"
+    spec = importlib.util.spec_from_file_location("_guard_parity", guard_path)
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    assert env.UPDATE_STATE_BYTES == guard.STATE_BYTES
+    p = tmp_path / "update_state.json"
+    if kind == "regular":
+        p.write_text('{"phase": "done"}')
+    elif kind in ("at-cap", "over-cap"):
+        p.write_bytes(b" " * (guard.STATE_BYTES + (kind == "over-cap")))
+    elif kind == "fifo":
+        os.mkfifo(p)
+    elif kind == "symlink":
+        (tmp_path / "t.json").write_text("{}")
+        p.symlink_to(tmp_path / "t.json")
+    else:
+        p.mkdir()
+
+    def outcome(read):
+        try:
+            return ("ok", read(str(p)))
+        except (OSError, ValueError) as exc:
+            return ("refused", type(exc).__name__)
+
+    assert outcome(env.read_update_state) == outcome(guard.read_state), kind

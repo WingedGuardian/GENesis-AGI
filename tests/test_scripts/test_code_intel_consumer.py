@@ -50,6 +50,9 @@ def consumer(queue, tmp_path, monkeypatch):
         "index_marker_cli.py",
         "index_marker_legacy.py",
         "index_marker_legs.py",
+        "index_marker_execution.py",
+        "code_intel_execution.py",
+        "code_intel_cbm_admission.py",
         "proc_pressure.sh",
     ):
         source = ROOT / "scripts/lib" / name
