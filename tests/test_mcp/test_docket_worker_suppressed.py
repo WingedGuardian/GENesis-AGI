@@ -71,8 +71,9 @@ print(json.dumps({{
 
 
 _TOOL_MODULES_NOT_SERVED_BY_MCP = {
-    # These register on health only when the in-process runtime initializes
-    # user jobs. The standalone MCP bootstrappers do not import this module.
+    # Imported only when the in-process runtime initializes user jobs, and
+    # registered on an object of its own, never on health. The standalone MCP
+    # bootstrappers do not import this module.
     "genesis.mcp.health.user_job_tools",
 }
 
