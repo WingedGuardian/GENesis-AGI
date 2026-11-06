@@ -4602,7 +4602,10 @@ Refusing a proposed update preserves a previously valid opt-in.
   copying; `null` over 256 MiB, the restore check's per-file budget) and the
   mode the checkout had, a symlink's target, a FIFO's mode; bounded at
   32 MiB, past which it records no more and says `complete: false`. A saved file keeps its
-  extended attributes. The
+  extended attributes. A `deploy-backups` that is a link, another user's or
+  writable by others is still saved into (refusing would leave the checkout
+  half-written), and the output and the critical alert say the restore check
+  refuses reports there. The
   folders are this user's alone: `deploy-backups` is made (an existing one
   of this user's is set) 0700, each report dir 0700, `REPAIR.json` and
   `SAVED.json` 0600, and every saved copy, blob and directory below loses its

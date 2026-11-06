@@ -1851,6 +1851,27 @@ def test_the_report_folder_is_this_users_alone(w):
     assert any((backup / "index-blobs").iterdir()), "control: a blob was saved"
 
 
+def test_a_linked_backup_root_still_heals_and_warns(w):
+    """#3974 item 6 (owner ruling 2026-11-06: heal and warn): a deploy-backups
+    that is a link (or another user's, or writable by others) is still saved
+    into, since refusing would leave the checkout half-written, but the output
+    and the alert say the restore check refuses reports there."""
+    elsewhere = w.home / "elsewhere"
+    elsewhere.mkdir(mode=0o700)
+    (w.gen / "deploy-backups").symlink_to(elsewhere)
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: _foreign_inside_dir(w))
+    age_locks(w)
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert any(elsewhere.iterdir()), "control: the report was saved through the link"
+    assert w.report()["result"].startswith("healed"), w.report()["result"]
+    warning = "is not a folder of this user's alone"
+    assert warning in r.stdout, r.stdout
+    alerts = w.alerts()
+    assert alerts and alerts[-1]["severity"] == "critical" and warning in alerts[-1]["body"], alerts
+
+
 def test_repair_move_restore_reaches_the_kit(w):
     """The command the writer prints, `scripts/deploy_candidates repair-move
     --restore TS --check`, goes through the wrapper to the kit."""
