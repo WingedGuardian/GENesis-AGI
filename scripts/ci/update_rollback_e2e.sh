@@ -22,6 +22,12 @@ if [ "${GITHUB_ACTIONS:-}" != "true" ] || [ "${GENESIS_CI_DISPOSABLE:-}" != "1" 
     echo "refusing: this runs update.sh for real; disposable CI runners only" >&2
     exit 64
 fi
+# A stripped environment can arrive with HOME unset; resolve it from passwd.
+if [ -z "${HOME:-}" ]; then
+    HOME="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6)" || HOME=""
+    [ -n "$HOME" ] || { echo "HOME is unset and not in passwd" >&2; exit 64; }
+    export HOME
+fi
 
 G="$HOME/genesis"
 CI_ROOT="$HOME/ci"
