@@ -2357,7 +2357,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 98153e000 2026-11-05
+verified: c712f1bde 2026-11-06
 ```
 
 - **Peer-handoff surface (2026-09-26)**: a SessionStart hook
