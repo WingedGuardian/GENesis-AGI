@@ -563,7 +563,11 @@ esac
 """
 
 
-def _run_helper(tmp_path: Path, mono: float, **env) -> Path:
+# The helper's minimum rate limit (300 s), with a margin.
+_MIN_UPTIME_S = 330
+
+
+def _run_helper(tmp_path: Path, **env) -> Path:
     from datetime import UTC, datetime
 
     for name, body in (("tailscale", _TAILSCALE_STUB), ("systemctl", _SYSTEMCTL_STUB)):
@@ -594,7 +598,7 @@ def _run_helper(tmp_path: Path, mono: float, **env) -> Path:
         env={
             "PATH": "/usr/bin:/bin",
             "STUB_DIR": str(tmp_path),
-            "STUB_START_US": str(int((mono - 600) * 1e6)),
+            "STUB_START_US": "1",
             "NETWD_TS_RATE_LIMIT_SEC": "300",
             "NETWD_TS_VERIFY_SEC": "10",
             "NETWD_TAILSCALE_BIN": str(tmp_path / "tailscale"),
@@ -629,10 +633,17 @@ def _run_helper(tmp_path: Path, mono: float, **env) -> Path:
     ids=["healed", "observe", "restart-failed", "no-effect", "pinned", "pin-failed"],
 )
 async def test_the_real_helpers_file_becomes_the_right_rows(db, tmp_path, env, expected):
+    # The helper refuses a start time at or below 0 and rejects a rate limit
+    # below 300 s (this passes exactly 300), so the stub daemon "started at
+    # boot" (1 us) and this needs only that much uptime. A parallel run reaches these tests sooner after the
+    # runner boots than a serial one; the skip states the uptime it measured.
     mono = time.clock_gettime(time.CLOCK_MONOTONIC)
-    if mono < 900:
-        pytest.skip("this machine booted too recently to show a daemon that started long ago")
-    state = _run_helper(tmp_path, mono, **env)
+    if mono < _MIN_UPTIME_S:
+        pytest.skip(
+            f"this machine booted too recently ({mono:.0f}s < {_MIN_UPTIME_S}s) to show a "
+            "daemon that started long ago"
+        )
+    state = _run_helper(tmp_path, **env)
     await record_new_events(
         db,
         state_file=state,
