@@ -1146,10 +1146,10 @@ def _claim_active_test_breadcrumb():
 
     LIMIT, stated rather than discovered later: under ``pytest-xdist`` every
     worker is a child that inherits the owner, so all of them stand down and no
-    breadcrumb is written. The suite does not use xdist (it is not a declared
-    dependency), and a wrong name is worse than a missing one, so standing down
-    is the right direction to fail -- but a future ``-n`` would need a
-    per-worker path rather than this claim.
+    breadcrumb is written. No CI job runs under xdist yet (it is in the
+    ``[test]`` extra, but nothing passes ``-n``), and a wrong name is worse than
+    a missing one, so standing down is the right direction to fail -- but a
+    future ``-n`` would need a per-worker path rather than this claim.
     """
     if not os.environ.get(ACTIVE_TEST_FILE_ENV):
         return
