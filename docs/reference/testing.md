@@ -44,8 +44,9 @@ parametrized cases make the collected item count higher still). The suite runs
 without external service dependencies -- Qdrant, Ollama, and LLM APIs are
 mocked in unit tests.
 
-**Runtime.** CI runs the suite FULLY SERIALLY (no pytest-xdist; it is not a
-dependency). MEASURED 2026-09-06 over the last 23 successful `main` runs, for
+**Runtime.** CI runs the suite FULLY SERIALLY. pytest-xdist is in the `[test]`
+extra (pinned in `.github/test-tools/requirements.txt`), but no CI job passes
+`-n` yet, and a local `-n` run is unsupported. MEASURED 2026-09-06 over the last 23 successful `main` runs, for
 the **`test` job specifically** (`gh api .../actions/runs/<id>/jobs`, name ==
 `test`): min 19m38s, median 29m22s, max 31m15s. Do not quote workflow-RUN
 duration here — it is ~20 minutes longer because it spans 12 sibling jobs plus

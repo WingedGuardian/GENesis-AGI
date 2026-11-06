@@ -667,7 +667,8 @@ async def _collect_live_repair(config: GuardianConfig) -> str:
         rows = [r for r in rows if isinstance(r, dict)] if counted else []
         foreign = [r.get("path") for r in rows if r.get("class") == "foreign"]
         shown = ", ".join(_quoted(p, 200) for p in foreign[:10])
-        steps = report.get("reapply")
+        # The writer stores no shell steps (#3868); count what its folder holds.
+        saved = sum(1 for r in rows if isinstance(r.get("saved_as"), str))
         lines.append(
             f"newest report: ts {_quoted(report.get('ts'), 40)}, result "
             f"{_quoted(report.get('result') or 'not finished', 200)}; "
@@ -676,7 +677,7 @@ async def _collect_live_repair(config: GuardianConfig) -> str:
                 if counted
                 else "its restored paths could not be read; "
             )
-            + f"{len(steps) if isinstance(steps, list) else 0} re-apply step(s) in its REPAIR.json"
+            + f"{saved} saved path(s) in its folder"
         )
         if foreign:  # last, so the field cap cuts paths before anything else
             more = f" (+{len(foreign) - 10} more)" if len(foreign) > 10 else ""

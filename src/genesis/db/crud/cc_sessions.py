@@ -392,6 +392,16 @@ async def list_unpaged_stops(
     return [dict(r) for r in await cursor.fetchall()], total
 
 
+async def count_unreported(db: aiosqlite.Connection, *, since: str, until: str) -> int:
+    """Background sessions that ended in ``[since, until]`` without reporting a status."""
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM cc_sessions WHERE session_type != 'foreground'"
+        " AND outcome = 'unreported' AND completed_at >= ? AND completed_at <= ?",
+        (since, until),
+    )
+    return (await cursor.fetchone())[0]
+
+
 async def mark_outcome_paged(db: aiosqlite.Connection, ids: list[str], *, ts: str) -> int:
     """Record that the owner was told about these stops. Never re-stamps."""
     if not ids:

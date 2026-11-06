@@ -3713,8 +3713,10 @@ class TestCiOverrideSigil:
         )
 
     def test_not_bound_to_other_segment(self, guard_module):
-        # Sigil on a chained commit segment must not waive the merge segment.
-        segs = analyze("git commit -m wip  # ci-override && gh pr merge 5 --squash --admin")
+        # Sigil on another segment must not waive the merge segment. The merge
+        # sits on its own line: after "# ci-override" bash reads the rest of
+        # that line as comment, so "&& gh pr merge" there never runs.
+        segs = analyze("git commit -m wip  # ci-override\ngh pr merge 5 --squash --admin")
         merge = [s for s in segs if gh_pr_subcommand(s.argv) == "merge"][0]
         assert not has_trailing_override(merge.raw, "ci-override")
 

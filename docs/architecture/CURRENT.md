@@ -4587,19 +4587,33 @@ Refusing a proposed update preserves a previously valid opt-in.
   --source=<tag>`. A torn index (its trailing checksum fails: git reads it
   unchecked, then cannot write it back) is rebuilt from the tag after that
   copy, and the result says so. Permission bits other than the executable
-  bit are not saved: git does not track them, and a restore gives them the
-  umask's, as any checkout does. A path holding what the update did not write (another
+  bit are not kept by the repair's own restore: git does not track them, and
+  `git restore` gives them the umask's, as any checkout does. A path holding what the update did not write (another
   edit, a flag, a staged or unmerged entry, a gitlink, a directory symlink
   inside a target directory, a FIFO, socket or device) is still saved and
-  restored, and reported with its exact re-apply step: a foreign index
-  entry's blob is saved under `index-blobs/` and written back by the step
-  before one atomic NUL-delimited `update-index -z --index-info` call; both
-  flags of an `s` entry are restored; a FIFO is made again (`mkfifo -m`);
-  a socket or device holds nothing to save and is recorded by type and mode
-  and reported as removed. Steps run parents first; a row re-adding an index
-  entry first drops the entries the restore put below it; a row the repair
-  saw beyond a symlinked or non-directory parent (`unreachable_through`) gets
-  only its index state back, so no step acts through a link it restores. A failure before the checkout itself changes (a
+  restored, and reported as foreign: a foreign index entry's blob is saved
+  under `index-blobs/`; a socket or device holds nothing to save and is
+  recorded by type and mode. The writer generates NO shell (#3868, #3869,
+  #3492 B2a): `reapply` stays `[]` for older readers, and the report, its
+  output and its alert name `scripts/deploy_candidates repair-move --restore
+  <ts>` (`--check` first), which puts nothing back until the restore lands
+  (B2b). Every saved copy is recorded in `SAVED.json` beside `REPAIR.json`
+  (which names it as `integrity`): a regular file's sha256 (computed while
+  copying; `null` over 256 MiB, the restore check's per-file budget) and the
+  mode the checkout had, a symlink's target, a FIFO's mode; bounded at
+  32 MiB, past which it records no more and says `complete: false`. A saved file keeps its
+  extended attributes. A `deploy-backups` that is a link, another user's or
+  writable by others is still saved into (refusing would leave the checkout
+  half-written), and the output and the critical alert say the restore check
+  refuses reports there. The
+  folders are this user's alone: `deploy-backups` is made (an existing one
+  of this user's is set) 0700, each report dir 0700, `REPAIR.json` and
+  `SAVED.json` 0600, and every saved copy, blob and directory below loses its
+  group and world write bits (a restore takes the mode from the record,
+  never from the copy). The alert body is cut at 16 KiB, with how much was
+  left out and a pointer to `REPAIR.json`, because one argv or environment
+  string of 128 KiB or more is E2BIG (MEASURED); a queue that fails is
+  logged and never changes the exit code. A failure before the checkout itself changes (a
   failed backup included) exits 0 at `--boot`. The guard then judges
   again and only its SAFE removes the state (byte-identical re-read); `guards`
   or `holds` (an edit off the move's paths) keeps it, its result naming the
@@ -4611,7 +4625,7 @@ Refusing a proposed update preserves a previously valid opt-in.
   by the whole tree against HEAD and cleared by a clean-tree
   check. A main row is out of scope (exit 3; 0 at `--boot`). The engine
   writes its merges with `core.fsync=committed`. Each repair prints its report
-  (re-apply steps included) and queues an alert (critical when anything was
+  (the restore command included) and queues an alert (critical when anything was
   not the update's, the index was torn, or it did not heal); `REPAIR.json`
   and `manifests()` are the contract its readers (deploy health, the
   awareness check, the guardian's diagnosis) read. The readers REPORT and
@@ -4658,19 +4672,39 @@ Refusing a proposed update preserves a previously valid opt-in.
   class (never paging).
   `--dismiss TS` and `--restore TS` take only a ts the writer's report name
   rule accepts (`report_ts`; anything else exits 2 before a path is built) and
-  read the report through `load_report`. `live_move_repair.py --restore TS
+  read the report through `load_report`; `--dismiss` rewrites `REPAIR.json`
+  only under update.lock (30 s wait by default; still held, exit 1 and
+  nothing written), so it cannot race a restore's own rewrite. `scripts/
+  deploy_candidates repair-move --restore TS [--check]` passes through to the
+  kit. `live_move_repair.py --restore TS
   --check` (#3492 PR B1; restoring itself is PR B2, and until then `--restore`
   without `--check` exits 2) is the read-only judge of what a restore would
   write, in a second kit source, `scripts/lib/live_move_restore.py`, loaded
   from the kit's own directory like the guard. It takes the repair's locks in
   the repair's order with a short wait (30 s; `--wait` honoured) and exits 1
   while any is held, or while the guard calls the checkout `mixed_tree`. It
+  reaches `deploy-backups` by an fd opened from the resolved home without following
+  a link and reads everything after through that fd; that folder and every
+  node of the report dir (at most 200,000, never through a link) must be
+  this user's, and every one but a symlink without group or world write,
+  else the whole report is `other:not-owned <path>`, before `REPAIR.json` is
+  parsed (a writer with this user's uid is out of scope: it can already edit
+  the checkout). A report with a node part below another (the writer never
+  writes one) is `other:bad-report`, and one with no integrity record is
+  judged with a note that a restore refuses it. Every git call of the repair
+  and the check runs with `core.fsmonitor=false` and
+  `core.hooksPath=/dev/null`. It
   first refuses the whole report if a row is not exactly what the writer
   writes (relative paths outside `.git`, at most 4,096 bytes, the sum of
   length x depth over the rows within the report byte cap; git modes and
   object ids; one stage-0 index entry or stages 1-3 once each; blobs only
   `index-blobs/<oid>` of the row's own entries; `saved_as` only
-  `tree/<path>`; the writer's flag letters, classes and special shapes), or
+  `tree/<path>`; the writer's flag letters, classes and special shapes; an
+  `integrity` other than `SAVED.json`, or a `SAVED.json` that is not a regular
+  file of at most 32 MiB holding exactly `{files, complete}` with `tree/<path>`
+  keys (a nested checkout's `.git` below a row's path is saved data; a first
+  part `.git` is refused) and the writer's three record shapes; a report naming none, written
+  before the record existed, is judged as before), or
   if a newer report of this checkout (by its ts, dismissed ones too; one
   naming another checkout is skipped) cannot be read, the newer reports
   together exceed one report's caps (4 MiB of REPAIR.json, 20,000 rows), or
@@ -4775,8 +4809,10 @@ verified: 702274dfe 2026-11-05
   fragments retain narrow relief; complex valid heredoc forms can still be
   refused. See `docs/reference/shell-parse-completeness.md` for the boundary.
   For hash-free scanner inputs, its unquoted scanner consumes backslash/non-newline
-  pairs as word data. Hash-containing calls retain their earlier scanner behavior
+  pairs as word data. Hash-containing calls keep the earlier backslash handling
   to avoid a comment/quote regression; generic #3257/#3264 remain partial/open.
+  A `#` that starts a word at bash's top level opens a comment the scanner skips
+  (#3473), except in commands containing `<<`.
   Existing continuation, heredoc proof, size bounds and nested refusals remain.
   Codex's local CLI also has a budget-only shell action hook in
   `.codex/config.toml` (`scripts/hooks/codex-review-stop`). It consumes the
