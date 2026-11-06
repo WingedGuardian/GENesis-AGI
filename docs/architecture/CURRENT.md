@@ -1706,6 +1706,12 @@ the shared banner is not an assertion about all concurrent sessions.
   `cc/session_config._MCP_PROFILES`. `genesis-health` is the big one (~35 tool
   modules). `standalone_health.py` serves from `~/.genesis/status.json` when no
   live runtime (stale-but-functional).
+  The optional fixed-main Serena services qualify provider 2.1.0 and MCP 2.2
+  readiness; they select classic tools and reject switching or REPL capability.
+  Their existing locking, per-profile limits and native stdio worktree routing
+  remain in place. Provider upgrades require a drained, disabled sharing window;
+  this code does not upgrade or restart an enabled service. See
+  `docs/reference/serena-shared-main.md`.
   External Codebase has pinned configuration staging/diagnostics and bounded
   native query unit entry points in `scripts/codebase_managed.py`.
   Status separately observes conditional queue initialization-lock prerequisites
