@@ -866,6 +866,96 @@ def _excised_text(command: str) -> str:
     return excised[0] if excised is not None else command
 
 
+#: Characters after which an unquoted ``#`` starts a word, so bash reads a
+#: comment at the top level (MEASURED with bash 5: after whitespace, ``;``, ``|``,
+#: ``&&``, ``<`` and ``>``; not mid-word, not after ``{``, ``$`` or an escaped
+#: space). After ``<`` or ``>`` the redirect scan runs first and takes the ``#``
+#: as its target, so ``>#f`` keeps the old reading (bash errors; nothing runs). ``(`` and ``)`` are left out on purpose: with ``extglob`` on, ``+(a)#b``
+#: and ``@(#x)`` are one pattern word whose ``#`` is literal, and a hook cannot know
+#: a script turned it on. Inside ``${…}`` or a backtick the same ``#`` is NOT a
+#: comment (``${x:- #}``); ``_TopLevel`` skips only where nothing is open.
+_COMMENT_AFTER = frozenset(" \t\n;&|<>")
+
+
+def _starts_comment(command: str, i: int) -> bool:
+    """Whether the unquoted ``#`` at ``i`` opens a bash comment.
+
+    It must start a word: at the start of the command, or after a character in
+    ``_COMMENT_AFTER`` that is not itself backslash-escaped (``echo \\ #x`` passes
+    `` #x`` as an argument, and bash runs what follows on the line).
+    """
+    if i == 0:
+        return True
+    if command[i - 1] not in _COMMENT_AFTER:
+        return False
+    k = i - 1
+    while k > 0 and command[k - 1] == "\\":
+        k -= 1
+    return (i - 1 - k) % 2 == 0
+
+
+class _TopLevel:
+    """Is an offset of ``command`` at bash's top level: outside every quote and
+    every open ``(``, ``[``, ``{`` and backtick?
+
+    A separate, bash-like pass (quotes, and backslash escapes outside single
+    quotes) advanced lazily as the scan moves forward, so the whole parse stays
+    linear. Comment skipping asks it before every comment: ``parse_segments``
+    tracks none of that nesting, and a ``#`` inside ``${x:- #}`` or a backtick
+    is text to bash, so skipping it there hid the next command (an
+    adversarial review measured a push guard flip from deny to allow). Openers
+    are kept on a stack and each closer must match the top one; a closer that
+    matches nothing or the wrong opener (``echo ] ${x:- #}``, a ``case`` pattern's
+    ``)``, ``${x:- ) #}``) means this pass no longer knows where bash is, so it
+    turns comment skipping off for the rest of the command, sticky. That is
+    exactly the scan the parser had before comments were modelled. Counting
+    instead of matching let one stray closer cancel a later opener (security
+    review, measured: the push was hidden again).
+    """
+
+    _CLOSES = {")": "(", "]": "[", "}": "{"}
+
+    def __init__(self, command: str) -> None:
+        self.command = command
+        self.pos = 0
+        self.quote: str | None = None
+        self.stack: list[str] = []
+        self.lost = False
+
+    def at(self, i: int) -> bool:
+        cmd = self.command
+        while self.pos < i and not self.lost:
+            c = cmd[self.pos]
+            if self.quote == "'":
+                if c == "'":
+                    self.quote = None
+            elif self.quote == '"':
+                if c == "\\":
+                    self.pos += 1
+                elif c == '"':
+                    self.quote = None
+            elif c == "\\":
+                self.pos += 1
+            elif c in "'\"":
+                self.quote = c
+            elif c in "([{":
+                self.stack.append(c)
+            elif c in self._CLOSES:
+                if not self.stack or self.stack.pop() != self._CLOSES[c]:
+                    self.lost = True
+            elif c == "`":
+                if self.stack and self.stack[-1] == "`":
+                    self.stack.pop()
+                else:
+                    self.stack.append(c)
+            self.pos += 1
+        return not self.lost and self.pos == i and self.quote is None and not self.stack
+
+    def skip(self, j: int) -> None:
+        """The scan skipped a comment ending at ``j``: bash ignores its text too."""
+        self.pos = max(self.pos, j)
+
+
 def parse_segments(
     command: str,
     *,
@@ -921,8 +1011,14 @@ def parse_segments(
     redirs: list[str] = []
     i, n = 0, len(command)
     quote: str | None = None
-    # Comments are not modeled here; preserve the legacy hash-containing scan.
+    # Backslash escapes stay unmodelled when a `#` appears (the legacy scan
+    # test_hash_escape_partition.py pins). Comments are modelled below, but not in
+    # a command with a here-doc: the scan reads here-doc bodies as shell, and a
+    # body's `#` line is data whose quotes the legacy scan pairs up; skipping it
+    # there left a quote open past the terminator (MEASURED, 102 of 8,753 real
+    # commands newly blind), and _heredoc_hidden_suffixes already fails closed.
     word_escapes = "#" not in command
+    top = _TopLevel(command) if "<<" not in command else None
     while i < n:
         c = command[i]
         if quote:
@@ -948,6 +1044,18 @@ def parse_segments(
             raw_buf.append(c)
             argv_buf.append(c)
             i += 1
+            continue
+        if top is not None and c == "#" and _starts_comment(command, i) and top.at(i):
+            # A comment runs to end of line and nothing in it is scanner state: a
+            # quote there opened one that swallowed the executed lines after it
+            # (#3473). Kept in both buffers (raw carries override sigils); the
+            # newline after it still splits.
+            j = command.find("\n", i)
+            j = n if j == -1 else j
+            raw_buf.append(command[i:j])
+            argv_buf.append(command[i:j])
+            top.skip(j)
+            i = j
             continue
         two = command[i : i + 2]
         if two in ("&&", "||"):
