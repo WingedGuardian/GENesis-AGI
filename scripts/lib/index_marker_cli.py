@@ -23,10 +23,11 @@ def main(argv: list[str] | None, api: dict) -> int:
     sub.add_parser("automatic-ready")
     p = sub.add_parser("import-status")
     p.add_argument("--limit", type=int, default=20)
-    p = sub.add_parser("claim")
-    p.add_argument("--hash", required=True)
-    p.add_argument("--provider", choices=api['_legs'].PROVIDERS, required=True)
-    p.add_argument("--nul", action="store_true")
+    for name in ("claim", "claim-native"):
+        p = sub.add_parser(name)
+        p.add_argument("--hash", required=True)
+        p.add_argument("--provider", choices=api['_legs'].PROVIDERS, required=True)
+        p.add_argument("--nul", action="store_true")
     for name in ("consume", "restore", "remember-outcome", "apply-outcome"):
         p = sub.add_parser(name)
         p.add_argument("--context", required=True)
@@ -40,9 +41,13 @@ def main(argv: list[str] | None, api: dict) -> int:
         if name == "should-escalate":
             p.add_argument("--nul", action="store_true")
     sub.add_parser("reconcile-inflight")
+    sub.add_parser("reconcile-native")
+    api['_native'].add_commands(sub)
     args = parser.parse_args(argv)
+    if args.cmd in api['_native'].COMMANDS:
+        return api['_native'].dispatch(args, api, api['_proof'])
     machine = getattr(args, "nul", False)
-    if machine and args.cmd in ("claim", "should-escalate"):
+    if machine and args.cmd in ("claim", "claim-native", "should-escalate"):
         api['_machine_hash'](args.hash)
     if args.cmd in ("automatic-ready", "import-status"):
         try:
@@ -83,14 +88,16 @@ def main(argv: list[str] | None, api: dict) -> int:
             for row in rows:
                 print(json.dumps(row, ensure_ascii=True))
         return 0
-    if args.cmd == "claim":
-        row = api['claim'](args.hash, provider=args.provider)
+    if args.cmd in ("claim", "claim-native"):
+        operation = api['claim_native'] if args.cmd == "claim-native" else api['claim']
+        row = operation(args.hash, provider=args.provider)
         if row is None:
             if machine:
                 api['_write_machine']([("1", "unclaimed", args.hash, args.provider)])
             return 1
         if machine:
-            api['_write_machine']([api['_claim_record'](row, args.hash, args.provider)])
+            api['_write_machine']([api['_claim_record'](row, args.hash, args.provider,
+                                         protocol=3 if args.cmd == "claim-native" else 2)])
         else:
             print(json.dumps(row, ensure_ascii=True))
         return 0
@@ -127,5 +134,8 @@ def main(argv: list[str] | None, api: dict) -> int:
         rows = api['repend_stale_inflight']()
         if rows:
             print(f"re-pended {len(rows)} protocol2 claims without native intent")
+        return 0
+    if args.cmd == "reconcile-native":
+        print(json.dumps(api['reconcile_native']()))
         return 0
     return 2

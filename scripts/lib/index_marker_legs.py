@@ -385,9 +385,11 @@ def stored_hash(repo: str) -> str:
     return hashlib.sha1(repo.encode()).hexdigest()[:16]  # noqa: S324
 
 
-def validate_context(context: dict, _hash_repo=None) -> dict:
+def validate_context(context: dict, _hash_repo=None, *, protocol: int = 2) -> dict:
     # _hash_repo is accepted for call compatibility and deliberately unused: the
     # hash is checked against the stored spelling, never a live resolution.
+    if type(protocol) is not int or protocol not in (2, 3):
+        raise ValueError("unsupported claim protocol")
     if not isinstance(context, dict) or set(context) != CONTEXT:
         raise ValueError("complete queue claim context is required")
     repo = context["repo_path"]
@@ -398,7 +400,7 @@ def validate_context(context: dict, _hash_repo=None) -> dict:
         or context["hash"] != stored_hash(repo)
         or context["provider"] not in PROVIDERS
         or type(context["protocol"]) is not int
-        or context["protocol"] != 2
+        or context["protocol"] != protocol
         or type(context["execution_seq"]) is not int
         or not 1 <= context["execution_seq"] <= INTEGER_MAX
         or not isinstance(context["claim_id"], str)
@@ -432,7 +434,9 @@ def _execution(db, context):
     return dict(row)
 
 
-def claim(db, h, provider):
+def claim(db, h, provider, *, protocol=2):
+    if type(protocol) is not int or protocol not in (2, 3):
+        raise ValueError("unsupported claim protocol")
     if provider not in PROVIDERS:
         raise ValueError("provider must be cbm or gitnexus")
     if db.execute("SELECT 1 FROM inflight WHERE hash=?", (h,)).fetchone():
@@ -445,11 +449,12 @@ def claim(db, h, provider):
     cursor = db.execute(
         "INSERT INTO executions(hash,repo_path,provider,protocol,entry_kind,claim_id,original_tools,"
         "mode,requested_at,attempts,legacy_unqualified,legacy_shared_attempts,nonce_origin) "
-        "VALUES(?,?,?,2,'claim',?,?,?,?,?,?,?,'generated')",
+        "VALUES(?,?,?,?,'claim',?,?,?,?,?,?,?,'generated')",
         (
             h,
             row["repo_path"],
             provider,
+            protocol,
             nonce,
             provider,
             row["mode"],
@@ -462,12 +467,13 @@ def claim(db, h, provider):
     sequence = cursor.lastrowid
     db.execute(
         "INSERT INTO inflight(hash,repo_path,tools,provider,protocol,mode,requested_at,attempts,"
-        "claim_id,execution_seq,legacy_unqualified,legacy_shared_attempts) VALUES(?,?,?,?,2,?,?,?,?,?,?,?)",
+        "claim_id,execution_seq,legacy_unqualified,legacy_shared_attempts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         (
             h,
             row["repo_path"],
             provider,
             provider,
+            protocol,
             row["mode"],
             row["requested_at"],
             row["attempts"],
@@ -482,7 +488,7 @@ def claim(db, h, provider):
         hash=h,
         repo_path=row["repo_path"],
         provider=provider,
-        protocol=2,
+        protocol=protocol,
         execution_seq=sequence,
         claim_id=nonce,
     )
