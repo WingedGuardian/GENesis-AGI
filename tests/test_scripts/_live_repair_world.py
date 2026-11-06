@@ -26,6 +26,7 @@ MODULE = LIB / "live_move_repair.py"
 GUARD = LIB / "update_state_guard.py"
 KIT_FILES = (
     "live_move_repair.py",
+    "live_move_restore.py",
     "update_state_guard.py",
     "deploy_checkout.sh",
     "deploy_marker.sh",

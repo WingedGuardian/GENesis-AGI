@@ -91,7 +91,16 @@ permissions:
 
 jobs:
   fresh-install:
-    runs-on: ubuntu-latest
+    # Both releases, pinned. 26.04 is the newest; 24.04 is the release of the
+    # container host-setup.sh creates (images:ubuntu/noble), so most installs run it.
+    # Pinned rather than ubuntu-latest, which moves, so a check named for a release
+    # always ran on it. fail-fast off: a break on one should still show the other's.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, ubuntu-24.04]
+    name: fresh-install (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     # A healthy full install measures in the tens of minutes (apt + Node +
     # Qdrant + venv + Claude Code). The failure mode bounded here is a hung
     # network fetch or apt lock burning the 6h default job budget on a weekly

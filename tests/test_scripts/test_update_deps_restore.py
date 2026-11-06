@@ -31,7 +31,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_scripts._update_source import update_text
+from tests.test_scripts._update_source import UPDATE_SH, update_text
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE = REPO_ROOT / "scripts" / "update.sh"
@@ -861,10 +861,46 @@ def test_disk_hygiene_ages_out_records_helper_copies_and_leftovers(tmp_path):
     assert left == ["new.json", "new.lib", "new.lib/venv_state.py", "other.txt"]
 
 
-def _record_fn() -> str:
+def _shell_fn(name: str) -> str:
     text = update_text()
-    start = text.index("_record_update_history() {")
+    start = text.index(f"{name}() {{")
     return text[start : text.index("\n}\n", start) + 3]
+
+
+def _record_fn() -> str:
+    return _shell_fn("_retire_deps_record") + _shell_fn("_record_update_history")
+
+
+def _nothing_new_exit_branch() -> str:
+    """The "Already up to date" branch of update.sh, up to its exit."""
+    text = UPDATE_SH.read_text()
+    start = text.index("elif _nothing_new; then\n")
+    return text[start : text.index("    exit 0\n", start)]
+
+
+def test_the_already_up_to_date_exit_retires_the_record():
+    """A no-op update takes the record before it knows nothing is new, and that
+    branch writes an update_history row only for a stale marker or a
+    degradation. So it retires the record itself, before any exit, or every
+    clean no-op leaves one behind (measured on a disposable runner)."""
+    branch = _nothing_new_exit_branch()
+    assert "_retire_deps_record" in branch
+    assert "exit" not in branch.split("_retire_deps_record", 1)[0]
+
+
+@pytest.mark.parametrize(("taken", "kept"), [(1, False), (0, True)])
+def test_retiring_removes_only_a_record_this_run_took(tmp_path, taken, kept):
+    rec = tmp_path / "rec.json"
+    rec.write_text("{}")
+    (tmp_path / "rec.lib").mkdir()
+    script = (
+        f'DEPS_STATE_TAKEN={taken}\nDEPS_STATE_FILE="{rec}"\n'
+        + _shell_fn("_retire_deps_record")
+        + "\n_retire_deps_record\n"
+    )
+    subprocess.run(["bash", "-c", script], check=True)
+    assert rec.exists() is kept
+    assert (tmp_path / "rec.lib").exists() is kept
 
 
 @pytest.mark.parametrize(

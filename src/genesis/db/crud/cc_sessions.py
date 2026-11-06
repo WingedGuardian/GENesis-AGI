@@ -356,6 +356,56 @@ async def query_active(db: aiosqlite.Connection) -> list[dict]:
     return [dict(r) for r in await cursor.fetchall()]
 
 
+#: Outcomes that mean a background session STOPPED without doing its job.
+#: ``parked`` resumes on its own and ``unreported`` is a clean exit with no
+#: verdict, so neither is a stop.
+STOP_OUTCOMES = ("failed", "partial", "blocked", "expired")
+
+
+async def list_unpaged_stops(
+    db: aiosqlite.Connection,
+    *,
+    since: str,
+    until: str,
+    limit: int,
+) -> tuple[list[dict], int]:
+    """Background sessions that stopped in ``[since, until]`` and nobody has paged.
+
+    Returns ``(rows, total)``: the oldest *limit* rows, whole, and the full
+    count, so a caller listing a page can say how many it left out. Foreground
+    rows are excluded (an owner's own conversation is not a background stop).
+    ``until`` lets a caller leave a just-finished row to its own immediate
+    notifier, which stamps it a few seconds after the terminal write.
+    """
+    marks = ",".join("?" * len(STOP_OUTCOMES))
+    where = (
+        "session_type != 'foreground' AND outcome_paged_at IS NULL"
+        f" AND outcome IN ({marks}) AND completed_at >= ? AND completed_at <= ?"
+    )
+    args = (*STOP_OUTCOMES, since, until)
+    cursor = await db.execute(f"SELECT COUNT(*) FROM cc_sessions WHERE {where}", args)  # noqa: S608 -- fixed predicate, values bound
+    total = (await cursor.fetchone())[0]
+    cursor = await db.execute(
+        f"SELECT * FROM cc_sessions WHERE {where} ORDER BY completed_at LIMIT ?",  # noqa: S608 -- fixed predicate, values bound
+        (*args, limit),
+    )
+    return [dict(r) for r in await cursor.fetchall()], total
+
+
+async def mark_outcome_paged(db: aiosqlite.Connection, ids: list[str], *, ts: str) -> int:
+    """Record that the owner was told about these stops. Never re-stamps."""
+    if not ids:
+        return 0
+    marks = ",".join("?" * len(ids))
+    cursor = await db.execute(
+        f"UPDATE cc_sessions SET outcome_paged_at = ? WHERE outcome_paged_at IS NULL"  # noqa: S608 -- placeholders only
+        f" AND id IN ({marks})",
+        (ts, *ids),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
 async def query_stale(
     db: aiosqlite.Connection,
     *,

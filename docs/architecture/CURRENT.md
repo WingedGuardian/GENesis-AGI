@@ -73,7 +73,7 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: cd784816 2026-09-09
+verified: 2ece179f9ebc 2026-10-28
 ```
 
 **Cross-store integrity is detect + repair.** SQLite (`memory_metadata`/
@@ -235,6 +235,12 @@ a real bridge-node population; `centrality_cache` gains its first reader.
 run through a `GraphStore` protocol with two implementations: the default
 `NetworkxGraphStore` (the in-process MultiDiGraph projection of `memory_links`)
 and `FalkorGraphStore` (below);
+opt-in `RequestDatabase` traversal declines NetworkX before projection and uses
+the existing SQL tier on its owning connection, including pending writes. Healthy
+selected FalkorDB retains projected-data semantics; its scoped fallback uses SQL.
+Legacy NetworkX and centrality behavior are unchanged. The shared SQL traversal
+uses exact delimited hex-ID cycle membership, so substrings, LIKE wildcards,
+empty IDs and NULs cannot hide distinct TEXT nodes.
 `memory/graph.py` is a facade that owns the single production instance and the
 backend choice. The contract, and the reason the seam exists: a read that cannot
 REACH its store RAISES `GraphUnavailableError` and never returns empty — empty
@@ -4557,7 +4563,8 @@ Refusing a proposed update preserves a previously valid opt-in.
   `update_refused.json`.
   The rebuilt tip is recorded in the "merging" row as soon as it is adopted.
   **The live-move repair** (`scripts/lib/live_move_repair.py`, #3492 PR D1;
-  `scripts/deploy_candidates repair-move [--wait N] [--dismiss TS] [--explain]`
+  `scripts/deploy_candidates repair-move [--wait N] [--dismiss TS] [--explain]`;
+  the module itself also takes `--restore TS --check`, below
   runs the copy bootstrap installs under `~/.genesis/lib/live-repair/current`,
   never the checkout's; installing that kit, and running the repair at every
   server start, is PR D2, not yet built; `--explain` needs no kit: with none
@@ -4655,6 +4662,54 @@ Refusing a proposed update preserves a previously valid opt-in.
   no result, and only the tree says whether it healed (the next run removes
   a healed state without a new backup). The awareness check words every
   class (never paging).
+  `--dismiss TS` and `--restore TS` take only a ts the writer's report name
+  rule accepts (`report_ts`; anything else exits 2 before a path is built) and
+  read the report through `load_report`. `live_move_repair.py --restore TS
+  --check` (#3492 PR B1; restoring itself is PR B2, and until then `--restore`
+  without `--check` exits 2) is the read-only judge of what a restore would
+  write, in a second kit source, `scripts/lib/live_move_restore.py`, loaded
+  from the kit's own directory like the guard. It takes the repair's locks in
+  the repair's order with a short wait (30 s; `--wait` honoured) and exits 1
+  while any is held, or while the guard calls the checkout `mixed_tree`. It
+  first refuses the whole report if a row is not exactly what the writer
+  writes (relative paths outside `.git`, at most 4,096 bytes, the sum of
+  length x depth over the rows within the report byte cap; git modes and
+  object ids; one stage-0 index entry or stages 1-3 once each; blobs only
+  `index-blobs/<oid>` of the row's own entries; `saved_as` only
+  `tree/<path>`; the writer's flag letters, classes and special shapes), or
+  if a newer report of this checkout (by its ts, dismissed ones too; one
+  naming another checkout is skipped) cannot be read, the newer reports
+  together exceed one report's caps (4 MiB of REPAIR.json, 20,000 rows), or
+  a ts names no date; the refusal names the newer report. Then, with
+  HEAD's tree, the tag's tree and the index read once each, every part of
+  every foreign row (its node, only where the repair changed and could reach
+  it; its index entries, only where they differ from the tag's; its flag) is
+  printed as `as-left` (the tag's state: the repair's), `already-restored`
+  (the saved state) or `other:<reason>`. An as-left part counts as restorable
+  only while HEAD's entries at, below and above the path equal the tag's
+  (`changed-upstream`), the index there equals the tag's except at rows
+  already restored (`index-changed`), no index entry sits at a parent, no
+  parent is a symlink or a non-directory, and no newer report holds an
+  overlapping path. A parent that is this report's own row, already put
+  back, refuses none of these for its child (the writer's steps run parents
+  first, so a restore killed between them still converges). A symlinked or
+  non-directory parent is decided before anything below it is read, and no
+  directory, in the checkout or the backup, is walked through a link. A tag
+  directory is compared on the tag's own paths only (an untracked cache in it
+  changes no part), and only for a node part. An index part whose blob is
+  neither saved (a regular `index-blobs/<oid>` hashing to it) nor in the
+  object store is `other:not-saved`. Every file is hashed in 1 MiB chunks
+  from an fd opened without following a link or blocking on a FIFO, and only
+  while it is still the file its lstat saw. One check hashes no file over
+  256 MiB, at most 2 GiB in all, and looks at most at 200,000 nodes; a part
+  that would read past that is `other:too-large`. A symlinked or non-regular
+  lock file is refused by name, never followed. A directory row is never restored whole:
+  its `entry` parts are the saved files whose bytes are not the move target's
+  (only the foreign rows themselves when the target cannot be read); sockets
+  and devices are `other:cannot-make`. Exit 0 only when every part is as-left
+  or already-restored. It writes no report and no backup; like the repair, it
+  creates `locks/update.lock` and `.git/genesis-checkout.lock` when they are
+  missing.
   `--post-merge` on `live` never runs the engine. What is recorded and sent to
   the host guardian is the origin/main commit `live` is built on.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;

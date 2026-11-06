@@ -1020,17 +1020,23 @@ async def test_refused_reports_have_their_own_wording(db, monkeypatch):
     assert "named in the server log" in content and "--dismiss" not in content, content
 
 
-async def test_unread_older_reports_are_informational(db, monkeypatch):
-    """A3: reports past the newest eight are counted, never refused, and alone
-    they never raise more than a medium (informational) observation."""
+async def test_unread_older_reports_alone_raise_nothing(db, monkeypatch):
+    """A3, B1 review (carried item 4c): reports past the newest eight are
+    counted, never refused, and the count includes dismissed ones, so alone it
+    raises no observation at all. Beside another finding it is named, with the
+    dismissed ones said to be included."""
     snap = _snap(["live_repair_unread_older:3"])
     snap["live_repairs"] = _repairs(unread_older=3)
     _patch_snapshot(monkeypatch, snap)
     await loop._check_deploy_staleness(db)
+    assert await _rows(db) == []
+    snap = _snap(["live_repair_saved:1", "live_repair_unread_older:3"])
+    snap["live_repairs"] = _repairs(_repair("20261027T000000Z-1", 1), unread_older=3)
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
     [row] = await _rows(db)
     content = row["content"]
-    assert row["priority"] == "medium", row["priority"]
-    assert "3 older live-move repair report(s)" in content and "informational" in content
+    assert "3 older live-move repair report dir(s) not read, dismissed ones included" in content
     assert "could not be read" not in content, content
 
 
