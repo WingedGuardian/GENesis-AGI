@@ -64,11 +64,14 @@ __all__ = [
     "Derivation",
     "EvidenceDocument",
     "EvidenceError",
+    "RecheckResult",
     "Refusal",
     "decide",
     "derive",
     "parse_evidence",
+    "parse_recheck_result",
     "reason_for",
+    "rechecks_for",
 ]
 
 #: Evidence tiers, in the vocabulary CLAUDE.md's evidence rule already uses, so a
@@ -113,9 +116,8 @@ NOT_DEPLOYED = "DEPLOYMENT NOT ESTABLISHED"
 UNDEPLOYED_FAILURE = "FAILED WHERE DEPLOYMENT WAS NOT ESTABLISHED"
 
 #: The four kinds a declared gap can be. The kind, not the prose, decides what the
-#: gap does: ``not_yet_done`` keeps the row OPEN, and the other three close it with
-#: the gap named. (``event_gated`` carries its trigger and re-measuring command so
-#: the owed measurement is recorded in a shape a later recheck can act on.)
+#: gap does: ``not_yet_done`` keeps the row OPEN, ``event_gated`` closes it and
+#: leaves a recheck behind, and the other two close it with the gap named.
 GAP_KINDS = ("method", "event_gated", "owner_only", "not_yet_done")
 
 #: Rendered-gap prefixes for the kinds that are not plain method limits.
@@ -203,17 +205,19 @@ class OwnerGap(BaseModel):
     detail: Text
 
 
-#: An event-gated trigger that is a DATE. Anything else is a named event.
+#: An event-gated trigger that is a DATE. Anything else is a named event. The ONE
+#: definition: the CRUD's due filter imports it, so a trigger cannot be a date in
+#: the writer and an event in the reader.
 TRIGGER_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 #: A string that LOOKS like a date. Matching it while failing to be a real
-#: ``YYYY-MM-DD`` is refused: a mistyped date read as a named event would mean a
-#: different thing than the writer wrote, and nothing downstream could tell.
+#: ``YYYY-MM-DD`` is refused: a mistyped date silently read as a named event would
+#: be listed as due forever, and one read as a far-future date never would be.
 _DATE_LIKE = re.compile(r"^\d{4}-?\d{1,2}-?\d{1,2}")
 
 
 class EventGatedGap(BaseModel):
-    """Measurable only after something happens: a date, or a named event."""
+    """Measurable only after something happens. Closing stores it as a recheck."""
 
     model_config = _CONFIG
 
@@ -305,34 +309,58 @@ _HINTS = {
     "chars — close checks it; name the deployed artifact in deploy.detail",
     "controls": "each entry names an arm that had to come out the other way, and did",
     "gaps": "each gap is an object whose 'kind' decides what it does: 'method' or "
-    "'owner_only' (+detail), and 'event_gated' (+detail, +trigger, +recheck) close the "
-    "row with the gap named; 'not_yet_done' (+detail, +command) keeps it OPEN until "
-    "you run the command",
+    "'owner_only' (+detail) close the row with the gap named; 'event_gated' (+detail, "
+    "+trigger, +recheck) closes it and leaves a recheck; 'not_yet_done' (+detail, "
+    "+command) keeps it OPEN until you run the command",
     "scope_limits": "replaced by 'gaps', a list of objects each with a 'kind' "
     "(method, event_gated, owner_only, not_yet_done). It is never mapped across: the "
     "kind decides the verdict, so each entry needs its kind chosen by you",
 }
 
 
-def _path(loc: tuple[Any, ...]) -> str:
-    out = "evidence"
+def _path(loc: tuple[Any, ...], root: str = "evidence") -> str:
+    out = root
     for part in loc:
         out += f"[{part}]" if isinstance(part, int) else f".{part}"
     return out
 
 
-def parse_evidence(obj: object) -> EvidenceDocument:
-    """Validate *obj* strictly, or raise :class:`EvidenceError` naming every bad field."""
+def _validate(model: type[BaseModel], obj: object, root: str) -> Any:
     try:
-        return EvidenceDocument.model_validate(obj)
+        return model.model_validate(obj)
     except ValidationError as exc:
         lines = []
         for err in exc.errors():
             loc = tuple(err.get("loc", ()))
             msg = str(err.get("msg", "invalid")).removeprefix("Value error, ")
             hint = _HINTS.get(str(loc[0])) if loc else None
-            lines.append(f"{_path(loc)}: {msg}" + (f" — {hint}" if hint else ""))
+            lines.append(f"{_path(loc, root)}: {msg}" + (f" — {hint}" if hint else ""))
         raise EvidenceError("\n".join(lines)) from None
+
+
+def parse_evidence(obj: object) -> EvidenceDocument:
+    """Validate *obj* strictly, or raise :class:`EvidenceError` naming every bad field."""
+    return _validate(EvidenceDocument, obj, "evidence")
+
+
+class RecheckResult(BaseModel):
+    """One re-measurement of a closed row's event-gated gap, as ``recheck`` reads it.
+
+    ``repo`` is in the file for the reason it is in the evidence document: with
+    ``--pr`` it is the row's key, and a result appended to the wrong closed row is as
+    permanent as a close."""
+
+    model_config = _CONFIG
+
+    repo: Repo
+    result: Literal["done", "failed"]
+    #: What the recheck command showed — the measurement, not a summary of it.
+    note: Text
+
+
+def parse_recheck_result(obj: object) -> RecheckResult:
+    """Validate a recheck result file strictly, naming every bad field."""
+    return _validate(RecheckResult, obj, "result")
 
 
 @dataclass(frozen=True)
@@ -435,6 +463,19 @@ def derive(doc: EvidenceDocument) -> Derivation:
     if not gaps:
         return Derivation("pass-mechanical", gaps=(), failed=())
     return Derivation("pass-with-measured-gaps", gaps=tuple(gaps), failed=())
+
+
+def rechecks_for(doc: EvidenceDocument) -> list[dict]:
+    """The rechecks a CLOSING outcome stores: one per event-gated gap, in order.
+
+    The index into this list is what ``pr_verification.py recheck --index`` takes,
+    so it counts the event-gated gaps alone, never positions in ``gaps``.
+    """
+    return [
+        {"trigger": g.trigger, "recheck": g.recheck, "detail": g.detail}
+        for g in doc.gaps
+        if isinstance(g, EventGatedGap)
+    ]
 
 
 @dataclass(frozen=True)
