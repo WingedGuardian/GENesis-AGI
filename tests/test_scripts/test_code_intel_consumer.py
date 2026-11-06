@@ -47,6 +47,7 @@ def consumer(queue, tmp_path, monkeypatch):
     hashes = {}
     for name in (
         "index_marker.py",
+        "index_marker_cli.py",
         "index_marker_legacy.py",
         "index_marker_legs.py",
         "proc_pressure.sh",
