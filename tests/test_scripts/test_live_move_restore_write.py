@@ -110,27 +110,29 @@ def _runs(w) -> list[Path]:
     return sorted((w.gen / "deploy-backups").glob("*-live-move-restore"))
 
 
-def _kit():
-    spec = importlib.util.spec_from_file_location(
-        "_restore_kit_under_test", LIB / "live_move_restore.py"
-    )
+def _kit(name: str = "live_move_restore.py"):
+    spec = importlib.util.spec_from_file_location(f"_kit_under_test_{name[:-3]}", LIB / name)
     kit = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(kit)
     return kit
 
 
 def _restore_in(w, mod, monkeypatch, capsys, ts: str, at: dict | None = None, patch=None):
-    """The restore run in-process, the kit's step hook replaced: ``at[name]()``
-    runs when the write path reaches the step ``name`` (a session's write
-    there). Returns (rc, stdout)."""
-    kit = _kit()
+    """The restore run in-process, the write kit's step hook replaced:
+    ``at[name]()`` runs when the write path reaches the step ``name`` (a
+    session's write there); ``patch(writes, monkeypatch)`` edits the write kit.
+    Returns (rc, stdout)."""
+    kits = {n: _kit(n) for n in ("live_move_restore.py", "live_move_restore_write.py")}
+    writes = kits["live_move_restore_write.py"]
     if at:
-        real = kit._step
-        monkeypatch.setattr(kit, "_step", lambda name: (at.pop(name, lambda: None)(), real(name)))
+        real = writes._step
+        monkeypatch.setattr(
+            writes, "_step", lambda name: (at.pop(name, lambda: None)(), real(name))
+        )
     if patch:
-        patch(kit, monkeypatch)
+        patch(writes, monkeypatch)
     load = mod._load_kit
-    monkeypatch.setattr(mod, "_load_kit", lambda n: kit if n == "live_move_restore.py" else load(n))
+    monkeypatch.setattr(mod, "_load_kit", lambda n: kits[n] if n in kits else load(n))
     capsys.readouterr()
     rc = mod.main(["--restore", ts, str(w.state), str(w.root)])
     return rc, capsys.readouterr().out

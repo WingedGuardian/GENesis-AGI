@@ -4748,8 +4748,9 @@ Refusing a proposed update preserves a previously valid opt-in.
   or already-restored. It writes no report and no backup; like the repair, it
   creates `locks/update.lock` and `.git/genesis-checkout.lock` when they are
   missing.
-  **The restore** (`--restore TS` without `--check`, #3492 PR B2b,
-  `live_move_restore.restore`) passes the same gates (and refuses a report
+  **The restore** (`--restore TS` without `--check`, #3492 PR B2b, a
+  third kit source, `scripts/lib/live_move_restore_write.py`, which uses the
+  check's judge; the check stays in `live_move_restore.py`) passes the same gates (and refuses a report
   with no `SAVED.json` whole, `other:no-integrity`, and one with a node part
   below another, `bad-report`), judges every part once under the held locks
   with the stricter gate, and writes only parts judged `as-left`; it never

@@ -576,7 +576,8 @@ def _load_guard():
 
 
 def _load_kit(name: str):
-    """A kit source beside this one (the guard; live_move_restore.py)."""
+    """A kit source beside this one (the guard; live_move_restore.py and
+    live_move_restore_write.py)."""
     path = os.path.join(_LIB, name)
     spec = importlib.util.spec_from_file_location(f"_live_repair_{name[:-3]}", path)
     if spec is None or spec.loader is None:
@@ -681,9 +682,12 @@ class Repair:
             what = "half-written" if verdict == self.guard.MIXED_TREE else "mid-update"
             self._say(f"the checkout is {what} ({reason}); repair or finish it first, {nothing}")
             return 1
-        kit = _load_kit("live_move_restore.py")
-        act = kit.restore if write else kit.check
-        return act(types.SimpleNamespace(**globals()), self.repo, self.home, ts, self._say)
+        kit = _load_kit("live_move_restore.py")  # the check and the judge
+        rp = types.SimpleNamespace(**globals())
+        if not write:
+            return kit.check(rp, self.repo, self.home, ts, self._say)
+        writes = _load_kit("live_move_restore_write.py")
+        return writes.restore(rp, kit, self.repo, self.home, ts, self._say)
 
     def _judge_state(self, index_lock: str) -> int:
         with open(self.state_path, "rb") as fh:
