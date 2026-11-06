@@ -3986,8 +3986,12 @@ Refusing a proposed update preserves a previously valid opt-in.
   it does not provide whole-tool atomicity. Existing MCP initialization still
   uses its legacy connection. `spawn_database_task` gives scoped detached
   writers their own unit, preserves other caller context, and tracks jobs from
-  scheduling through shutdown, including cancellation before start. Activity,
-  embedding-heartbeat, deferred-recall, bookmark and proactive tasks use it;
+  scheduling through shutdown, including cancellation before start.
+  Detached work requires explicit background connection and job-count budgets;
+  foreground-only construction allocates neither. Background admission is
+  separate from foreground capacity; recall queue pressure falls back inline
+  while shutdown refuses new resource work (source checked 2026-11-06).
+  Activity, embedding-heartbeat, deferred-recall, bookmark and proactive tasks use it;
   legacy connections keep ordinary task scheduling. Internal
   `initialize_request_service` bootstraps memory/health/recon/outreach with
   mandatory request middleware even without metrics, awaits outreach schema,

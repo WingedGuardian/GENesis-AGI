@@ -933,9 +933,12 @@ async def proactive_context(
                     except Exception:
                         logger.debug("surfaced_count bump failed", exc_info=True)
 
-                from genesis.db.request_database import spawn_database_task
+                from genesis.db.request_database import DatabaseScopeError, spawn_database_task
 
-                spawn_database_task(db, _bump_surfaced(), name="proactive_surfaced_count")
+                try:
+                    spawn_database_task(db, _bump_surfaced(), name="proactive_surfaced_count")
+                except DatabaseScopeError:
+                    logger.debug("Surfaced-count observation refused by database admission")
 
         timings["procedure"] = round((time.monotonic() - t_proc) * 1000, 1)
     except asyncio.CancelledError:

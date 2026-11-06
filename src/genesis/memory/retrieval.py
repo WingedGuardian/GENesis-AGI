@@ -24,7 +24,11 @@ from genesis.db.crud._fts import (
     fts5_query_tokens,
     fts5_term,
 )
-from genesis.db.request_database import spawn_database_task
+from genesis.db.request_database import (
+    BackgroundTaskCapacityError,
+    DatabaseScopeError,
+    spawn_database_task,
+)
 from genesis.memory.activation import compute_activation
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
 from genesis.memory.intent import (
@@ -62,9 +66,13 @@ def _deferred_side_effects_inflight() -> int:
     return _deferred_side_effects_count
 
 
-def _schedule_deferred_side_effects(coro: Coroutine[Any, Any, None], *, name: str, db=None) -> None:
+def _schedule_deferred_side_effects(coro: Coroutine[Any, Any, None], *, name: str, db=None) -> bool | None:
     """Reserve a backstop slot SYNCHRONOUSLY, then schedule ``coro`` as a
     tracked task that releases the slot when it finishes.
+
+    Return True when accepted, False for queue pressure (fresh inline retry),
+    or None during shutdown (no inline resource use). Configuration errors
+    propagate. Refused coroutine instances are closed, never reused.
 
     Reserving before ``tracked_task`` (not inside the task body) is what makes
     the cap real under a burst: several recalls resuming in the same event-loop
@@ -89,11 +97,20 @@ def _schedule_deferred_side_effects(coro: Coroutine[Any, Any, None], *, name: st
 
     try:
         task = spawn_database_task(db, coro, name=name)
+    except BackgroundTaskCapacityError:
+        coro.close()
+        release()
+        return False
+    except DatabaseScopeError:
+        coro.close()
+        release()
+        return None
     except BaseException:
         coro.close()
         release()
         raise
     task.add_done_callback(release)
+    return True
 
 
 def _has_temporal_markers(query: str) -> bool:
@@ -976,14 +993,15 @@ class HybridRetriever:
             # whether the entity lane would surface something — its highest-value
             # case (Codex #1121 P2: don't skip the zero-hit path). No ranked
             # lists exist here, so lane novelty = its valid candidates.
-            _zero_hit_shadow = self._maybe_entity_lane_shadow(
-                query=query,
-                ranked_lists=[],
-                all_ids=set(),
-                limit=limit,
-                embedding_available=embedding_available,
-                recall_event_id=None,
-            )
+            async def _zero_hit_shadow() -> None:
+                await self._maybe_entity_lane_shadow(
+                    query=query,
+                    ranked_lists=[],
+                    all_ids=set(),
+                    limit=limit,
+                    embedding_available=embedding_available,
+                    recall_event_id=None,
+                )
             # Same deferral contract as the has-results path (ac27b693): the
             # shadow probe is pure observation, so on the latency-budgeted
             # proactive path it must not run inline here either. Inert today
@@ -994,9 +1012,12 @@ class HybridRetriever:
                 and event_id_sink is None
                 and _deferred_side_effects_inflight() < _DEFERRED_SIDE_EFFECT_CAP
             ):
-                _schedule_deferred_side_effects(_zero_hit_shadow, name="recall_zero_hit_shadow", db=self._db)
+                if _schedule_deferred_side_effects(
+                    _zero_hit_shadow(), name="recall_zero_hit_shadow", db=self._db,
+                ) is False:
+                    await _zero_hit_shadow()
             else:
-                await _zero_hit_shadow
+                await _zero_hit_shadow()
             if trace is not None:
                 trace["zero_hit"] = True
             return []
@@ -1283,14 +1304,17 @@ class HybridRetriever:
         # AND we're under the in-flight backstop. The backstop bounds memory:
         # each deferred task pins ``results``/candidate maps until it drains, so
         # a sustained burst that outruns the drain rate falls back to inline
-        # (graceful degradation to the pre-change behavior — a write is NEVER
-        # dropped, and the pending-task set can't grow without bound).
+        # (queue pressure trades latency for inline completion; shutdown refuses
+        # new work, and accepted jobs remain best effort rather than durable).
         if (
             defer_side_effects
             and event_id_sink is None
             and _deferred_side_effects_inflight() < _DEFERRED_SIDE_EFFECT_CAP
         ):
-            _schedule_deferred_side_effects(_run_side_effects(), name="recall_side_effects", db=self._db)
+            if _schedule_deferred_side_effects(
+                _run_side_effects(), name="recall_side_effects", db=self._db,
+            ) is False:
+                await _run_side_effects()
         else:
             await _run_side_effects()
 
@@ -1317,17 +1341,20 @@ class HybridRetriever:
             # queues behind the whole server's writes under load — is pure
             # latency waste. Nothing reads call_site_last_run synchronously
             # during recall, so a fire-and-forget task is correct here.
-            spawn_database_task(
-                self._db,
-                record_last_run(
+            try:
+                spawn_database_task(
                     self._db,
-                    "21b_query_embedding",
-                    provider="embedding",
-                    model_id="cloud-primary",
-                    response_text=f"Query embed: {query[:60]}",
-                ),
-                name="embed_last_run",
-            )
+                    record_last_run(
+                        self._db,
+                        "21b_query_embedding",
+                        provider="embedding",
+                        model_id="cloud-primary",
+                        response_text=f"Query embed: {query[:60]}",
+                    ),
+                    name="embed_last_run",
+                )
+            except DatabaseScopeError:
+                logger.debug("Embedding heartbeat refused by database admission")
         except EmbeddingUnavailableError:
             embedding_available = False
             logger.warning("Embedding unavailable, falling back to FTS5-only retrieval")

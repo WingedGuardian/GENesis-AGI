@@ -35,7 +35,9 @@ async with db.unit_of_work():
 server = await initialize_request_service("recon", db=db, activity_tracker=tracker)
 ```
 
-Here `db` is the already constructed `RequestDatabase`; the tracker and initializer
+Here `db` is the already constructed `RequestDatabase`, with explicit
+`max_background_units` and `max_background_jobs` when the service uses detached
+work (including tracker flushes or memory side effects). The tracker and initializer
 are imported from `genesis.observability.provider_activity` and
 `genesis.mcp.request_service`, respectively. Bootstrap owns the manager's shutdown.
 
@@ -138,3 +140,34 @@ and manager shutdown. External host/network/file collectors are replaced with
 isolated fixtures. Standalone means status-file health without runtime objects;
 it can still be hosted once for all clients. Neither these tests nor the internal
 initializer establish shared-process memory savings or activate that deployment.
+
+## Detached work and admission
+
+`spawn_database_task(db, coroutine, ...)` uses a fresh independent unit for a
+`RequestDatabase`; legacy connections retain their tracked-task behavior. To
+allow detached work, explicitly configure both `max_background_units` and
+`max_background_jobs` as positive integers. Without both budgets, spawning is a
+configuration error. `max_units` remains the foreground limit; the total physical
+connection bound is `max_units + max_background_units` when background work is
+enabled. Neither pool releases capacity until physical closure is confirmed.
+
+Background jobs retain their whole-job unit, including non-database work.
+Accepted jobs wait for background capacity without the foreground checkout
+timeout. Queued plus running jobs are bounded synchronously before scheduling;
+overflow raises `BackgroundTaskCapacityError` and closes the unstarted coroutine.
+This bounds task count, not retained payload bytes or SQLite disk contention.
+It is not a durable queue: cancellation, SQL failure, or shutdown can prevent an
+accepted job from completing. Shutdown refuses new work and cancels/drains both
+pools under the existing owner registry.
+
+Recall queue pressure falls back to a fresh inline coroutine in both candidate
+and zero-hit branches. Shutdown refusal does not request inline resource use.
+Best-effort observations tolerate admission refusal; provider activity retains
+its batch for the next record and plan bookmarks retain their pending marker.
+Programming/configuration errors are not treated as capacity pressure. The first
+service factory must explicitly budget both pools before wiring this facade.
+
+Admission and producer regressions are covered in
+`tests/test_db/test_background_admission.py`,
+`tests/test_db/test_request_database_tasks.py`, and
+`tests/test_memory/test_recall_deferral.py`.

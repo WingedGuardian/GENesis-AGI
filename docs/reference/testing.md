@@ -25,7 +25,7 @@ ruff check . && pytest -v
 ## Test Suite Overview
 
 For the opt-in request-owned database primitive, run
-`pytest -q tests/test_db/test_request_database.py tests/test_db/test_request_database_lifecycle.py`.
+`pytest -q tests/test_db/test_request_database.py tests/test_db/test_request_database_lifecycle.py tests/test_db/test_request_database_tasks.py tests/test_db/test_background_admission.py`.
 These use scratch SQLite databases, including independent readers, cancellation,
 WAL cursor release and process-death recovery. Four explicit outcome comparisons
 keep the actual legacy middleware as the negative control. Shared MCP service E2E

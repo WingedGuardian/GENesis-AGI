@@ -27,7 +27,7 @@ async def database(tmp_path):
     await create_all_tables(setup)
     await setup.commit()
     await setup.close()
-    db = RequestDatabase(path, max_units=4)
+    db = RequestDatabase(path, max_units=4, max_background_units=2, max_background_jobs=4)
     try:
         yield db
     finally:

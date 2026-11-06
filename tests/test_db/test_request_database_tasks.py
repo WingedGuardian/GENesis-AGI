@@ -23,7 +23,7 @@ async def database(tmp_path):
     await setup.execute("CREATE TABLE samples (value TEXT)")
     await setup.commit()
     await setup.close()
-    manager = scoped.RequestDatabase(path, max_units=2)
+    manager = scoped.RequestDatabase(path, max_units=2, max_background_units=2, max_background_jobs=4)
     try:
         yield manager
     finally:
@@ -176,8 +176,7 @@ async def test_rejected_deferred_job_releases_reservation(database):
         raise AssertionError("must never run")
 
     coro = body()
-    with pytest.raises(scoped.DatabaseScopeError):
-        retrieval._schedule_deferred_side_effects(coro, name="rejected", db=database)
+    assert retrieval._schedule_deferred_side_effects(coro, name="rejected", db=database) is None
     assert retrieval._deferred_side_effects_inflight() == baseline
     assert inspect.getcoroutinestate(coro) == inspect.CORO_CLOSED
 
@@ -189,3 +188,148 @@ async def test_legacy_helper_keeps_caller_connection(db):
 
     assert await scoped.spawn_database_task(db, body(), name="legacy") == 42
     assert await db.execute_fetchall("SELECT * FROM legacy_task") == []
+
+
+async def test_background_burst_does_not_starve_request_or_lose_writes(database):
+    manager = scoped.RequestDatabase(database.path, max_units=2, checkout_timeout_s=.5,
+                                     max_background_units=2, max_background_jobs=4)
+    entered = [asyncio.Event() for _ in range(2)]
+    release = asyncio.Event()
+
+    async def writer(index):
+        await manager.execute("INSERT INTO samples VALUES (?)", (str(index),))
+        await manager.commit()
+        if index < 2:
+            entered[index].set()
+        # Deliberately hold the job outside DB work, as the real producers do.
+        await release.wait()
+
+    jobs = [manager.spawn(writer(index), name=f"burst-{index}") for index in range(4)]
+    foreground_error = None
+    try:
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in entered)), 10)
+        try:
+            async with manager.unit_of_work():
+                rows = await manager.execute_fetchall("SELECT value FROM samples")
+                assert len(rows) == 2
+        except TimeoutError as error:
+            foreground_error = error
+    finally:
+        release.set()
+        outcomes = await asyncio.gather(*jobs, return_exceptions=True)
+        await manager.close()
+    assert foreground_error is None, "background non-DB work starved foreground admission"
+    assert outcomes == [None] * 4, outcomes
+    async with database.unit_of_work():
+        assert len(await database.execute_fetchall("SELECT value FROM samples")) == 4
+    assert not manager._jobs and not manager._owners and not manager._workers
+
+
+async def test_deferred_capacity_refusal_releases_reservation_and_allows_inline(database):
+    from genesis.memory import retrieval
+
+    release = asyncio.Event()
+
+    async def hold():
+        await release.wait()
+
+    blockers = [database.spawn(hold()) for _ in range(4)]
+
+    async def writer():
+        await database.execute("INSERT INTO samples VALUES ('inline-fallback')")
+
+    coroutine = writer()
+    baseline = retrieval._deferred_side_effects_inflight()
+    try:
+        assert retrieval._schedule_deferred_side_effects(coroutine, name='full', db=database) is False
+        assert inspect.getcoroutinestate(coroutine) == inspect.CORO_CLOSED
+        assert retrieval._deferred_side_effects_inflight() == baseline
+        async with database.unit_of_work():
+            await writer()  # fresh instance; the refused body never ran
+    finally:
+        release.set()
+        await asyncio.gather(*blockers)
+    async with database.unit_of_work():
+        assert [row[0] for row in await database.execute_fetchall('SELECT value FROM samples')] == ['inline-fallback']
+
+
+async def test_heartbeat_refusal_does_not_fail_a_successful_embedding(database):
+    from genesis.memory.retrieval import HybridRetriever
+
+    release = asyncio.Event()
+
+    async def hold():
+        await release.wait()
+
+    blockers = [database.spawn(hold()) for _ in range(4)]
+    retriever = HybridRetriever(
+        embedding_provider=SimpleNamespace(embed=AsyncMock(return_value=[.1, .2])),
+        qdrant_client=None, db=database,
+    )
+    try:
+        assert await retriever._embed_query('synthetic') == ([.1, .2], True)
+    finally:
+        release.set()
+        await asyncio.gather(*blockers)
+
+
+async def test_activity_batch_survives_capacity_refusal_and_retries(database, caplog):
+    import logging
+
+    from genesis.observability.provider_activity import ProviderActivityTracker
+
+    release = asyncio.Event()
+
+    async def hold():
+        await release.wait()
+
+    blockers = [database.spawn(hold()) for _ in range(4)]
+    tracker = ProviderActivityTracker()
+    tracker.set_db(database)
+    caplog.set_level(logging.DEBUG, logger='genesis.observability.provider_activity')
+    try:
+        tracker.record('synthetic', latency_ms=1, success=True)
+        assert len(tracker._write_batch) == 1
+        assert 'event loop closed' not in caplog.text
+    finally:
+        release.set()
+        await asyncio.gather(*blockers)
+    tracker.record('synthetic', latency_ms=2, success=True)
+    await tracker._flush_task
+    async with database.unit_of_work():
+        assert len(await database.execute_fetchall('SELECT * FROM activity_log')) == 2
+
+
+async def test_bookmark_capacity_refusal_retains_pending_marker(database, tmp_path, monkeypatch):
+    from genesis.mcp import memory as memory_mod
+
+    release = asyncio.Event()
+
+    async def hold():
+        await release.wait()
+
+    blockers = [database.spawn(hold()) for _ in range(4)]
+    marker = tmp_path/'pending.json'
+    marker.write_text('{}')
+    bodies = []
+
+    def pending(*args):
+        async def process():
+            marker.unlink()
+        coroutine = process()
+        bodies.append(coroutine)
+        return coroutine
+
+    monkeypatch.setattr(memory_mod, '_store', object())
+    monkeypatch.setattr(memory_mod, '_retriever', object())
+    monkeypatch.setattr(memory_mod, '_db', database)
+    monkeypatch.setattr(memory_mod, '_process_pending_bookmarks', True)
+    monkeypatch.setattr(memory_mod, '_PLAN_BOOKMARK_PENDING', marker)
+    monkeypatch.setattr(memory_mod, '_process_plan_bookmark_pending', pending)
+    try:
+        memory_mod._require_init()
+        assert marker.read_text() == '{}'
+        assert len(bodies) == 1 and inspect.getcoroutinestate(bodies[0]) == inspect.CORO_CLOSED
+    finally:
+        release.set()
+        await asyncio.gather(*blockers)
