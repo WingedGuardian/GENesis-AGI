@@ -96,6 +96,7 @@ def _special(s: object) -> bool:
     return (
         isinstance(s, dict)
         and set(s) == {"type", "mode"}
+        and isinstance(s["type"], str)
         and s["type"] in _SPECIALS
         and isinstance(s["mode"], str)
         and re.fullmatch(r"[0-7]{4}", s["mode"]) is not None
@@ -107,7 +108,13 @@ def _row_problem(row: dict, parents) -> str | None:
     if missing := ROW_KEYS - row.keys():
         return "missing " + ", ".join(sorted(missing))
     p, index = row["path"], row.get("index")
-    if row.get("class") not in ("foreign", "engine") or row.get("disk") not in _DISKS:
+    # isinstance first: a list or object here is unhashable (#3965 item 3).
+    disk = row.get("disk")
+    if (
+        row.get("class") not in ("foreign", "engine")
+        or not isinstance(disk, str)
+        or disk not in _DISKS
+    ):
         return "class or disk"
     if not isinstance(row.get("disk_changed"), bool):
         return "disk_changed"
@@ -135,7 +142,9 @@ def _row_problem(row: dict, parents) -> str | None:
     through = row.get("unreachable_through")
     if through is not None and through not in parents(p):
         return "unreachable_through"
-    if row.get("flag") is not None and row["flag"] not in _FLAGS:
+    if row.get("flag") is not None and (
+        not isinstance(row["flag"], str) or row["flag"] not in _FLAGS
+    ):
         return "flag"
     if (row["disk"] == "other") != (row.get("special") is not None) or (
         row.get("special") is not None and not _special(row["special"])
@@ -316,9 +325,14 @@ def _newer_paths(rp, repo: str, backups: str, ts: str) -> tuple[dict | None, str
         rows += len(found)
         if rows > rp.REPORT_ROWS:
             return None, f"{other}: the newer reports hold over {rp.REPORT_ROWS} rows together"
+        # Every row must name a plain path: one that does not could hide an
+        # overlap (#3966 item 1). load_report drops a row that is not an object.
+        if loaded and len(found) != len(loaded["report"].get("paths", ())):
+            return None, f"{other}: a row is not an object"
         for r in found:
-            if isinstance(r.get("path"), str):
-                paths.setdefault(r["path"], other)
+            if not _path(r.get("path")):
+                return None, f"{other}: a row names no plain path"
+            paths.setdefault(r["path"], other)
     return paths, ""
 
 

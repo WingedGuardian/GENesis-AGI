@@ -241,6 +241,26 @@ def test_a_newer_report_overlapping_the_path_is_other(w, newer_path):
     assert d.name[: -len(SUFFIX)] in r.stdout, "security L4: the newer report is not named"
 
 
+@pytest.mark.parametrize(
+    "rows",
+    [
+        pytest.param([{"path": ["sub"], "class": "engine"}], id="path-list"),
+        pytest.param([{"class": "engine"}], id="no-path"),
+        pytest.param([{"path": "sub/../sub", "class": "engine"}], id="not-canonical"),
+        pytest.param(["sub"], id="not-an-object"),
+    ],
+)
+def test_a_newer_report_whose_row_path_cannot_be_read_refuses(w, rows):
+    """#3966 item 1: the overlap check reads every newer row's path; a row
+    with no plain path could hide an overlap, so the restore is refused."""
+    ts = _repaired(w, _foreign_edit)
+    d = _newer_dir(w, ts)
+    (d / "REPAIR.json").write_text(json.dumps({"repo": str(w.root), "paths": rows}))
+    r = _check(w, ts)
+    assert r.returncode == 1 and "other:newer-report-unreadable" in r.stdout, r.stdout + r.stderr
+    assert d.name[: -len(SUFFIX)] in r.stdout
+
+
 def test_a_newer_report_elsewhere_and_an_older_one_do_not_block(w):
     ts = _repaired(w, _foreign_edit)
     d = _newer_dir(w, ts)
@@ -293,6 +313,10 @@ def _moved(report: dict, path: str) -> None:
         pytest.param(lambda m: _row(m, "A").update(saved_as="tree/K"), id="saved-as"),
         pytest.param(lambda m: _row(m, "A").update(unreachable_through="B"), id="through"),
         pytest.param(lambda m: _row(m, "A").update(flag="H"), id="flag"),
+        # #3965 item 3: an unhashable value refuses by name, not with a TypeError.
+        pytest.param(lambda m: _row(m, "A").update(flag=["S"]), id="flag-list"),
+        pytest.param(lambda m: _row(m, "A").update(disk=["file"]), id="disk-list"),
+        pytest.param(lambda m: _row(m, "A").update(**{"class": {"x": 1}}), id="class-object"),
         pytest.param(lambda m: _row(m, "A").update(**{"class": "mine"}), id="class"),
         pytest.param(lambda m: _row(m, "A").update(tag=["100644", "nothex"]), id="tag-entry"),
         pytest.param(lambda m: m.update(tag="-HEAD"), id="report-tag"),
