@@ -3,8 +3,11 @@
 For a scanner call whose input contains no literal `#`, the unquoted scanner
 consumes a backslash and its following non-newline character as word data,
 retaining both source bytes for later shell decoding. Escaped quotes/operators
-then cannot change scanner quote/operator state. Hash-containing calls retain
-the earlier scanner behavior, avoiding a new comment/quote regression. A decoded
+then cannot change scanner quote/operator state. Hash-containing calls keep
+the earlier backslash handling, avoiding a new comment/quote regression. Comments
+are modelled separately: a `#` that starts a word at bash's top level (outside
+every quote, open bracket and backtick) runs to end of line and changes no scanner
+state, except in a command containing `<<`, which keeps the earlier scan. A decoded
 hash-free child may still gain the repair even when its parent contains `#`.
 Backslash-newline retains the existing continuation handling. No input rewriting,
 new tokenizer, larger limit or generic tokenization exemption is added.

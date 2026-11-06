@@ -18,7 +18,6 @@ unique, fsynced spool files that the same importer coalesces into SQLite.
 
 from __future__ import annotations
 
-import argparse
 import errno
 import fcntl
 import hashlib
@@ -38,7 +37,7 @@ FULL_INTERVAL_S = 7 * 24 * 3600
 FULL_BACKOFF_S = 24 * 3600
 LOCK_WAIT_S = 0.5
 OUTCOME_LOCK_WAIT_S = 5.0
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 # `automatic-ready` reports an incomplete protocol with a dedicated status that
 # neither Python (1 on an uncaught exception) nor bash (1/2/126/127 on its own
 # failures) produces by accident, so the runner never mistakes a crash for the
@@ -72,6 +71,24 @@ _legs = _load_sibling(
     "_genesis_index_marker_legs",
     importlib.util.spec_from_file_location(
         "_genesis_index_marker_legs", Path(__file__).with_name("index_marker_legs.py")
+    ),
+)
+_native = _load_sibling(
+    "_genesis_index_marker_execution",
+    importlib.util.spec_from_file_location(
+        "_genesis_index_marker_execution", Path(__file__).with_name("index_marker_execution.py")
+    ),
+)
+_proof = _load_sibling(
+    "_genesis_code_intel_execution",
+    importlib.util.spec_from_file_location(
+        "_genesis_code_intel_execution", Path(__file__).with_name("code_intel_execution.py")
+    ),
+)
+_cli = _load_sibling(
+    "_genesis_index_marker_cli",
+    importlib.util.spec_from_file_location(
+        "_genesis_index_marker_cli", Path(__file__).with_name("index_marker_cli.py")
     ),
 )
 MAX_ATTEMPTS = _legs.MAX_ATTEMPTS
@@ -212,6 +229,8 @@ def _publish_schema(db: sqlite3.Connection) -> None:
             _legacy.upgrade_receipts(db)
         if previous < 3:
             _legs.upgrade(db)
+        if previous < 4:
+            _native.upgrade(db, _legs._SCHEMA)
         db.execute(
             "INSERT INTO queue_meta(key,value) VALUES('schema_version',?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -347,8 +366,7 @@ def _connect(wait_s: float = LOCK_WAIT_S, *, allow_convert: bool = False) -> sql
 
 
 @contextmanager
-def _write_db(*, wait_s: float = LOCK_WAIT_S):
-    db = _connect(wait_s)
+def _transaction(db):
     try:
         try:
             db.execute("BEGIN IMMEDIATE")
@@ -361,6 +379,57 @@ def _write_db(*, wait_s: float = LOCK_WAIT_S):
     except BaseException:
         db.rollback()
         raise
+
+
+@contextmanager
+def _write_db(*, wait_s: float = LOCK_WAIT_S):
+    db = _connect(wait_s)
+    try:
+        with _transaction(db):
+            yield db
+    finally:
+        db.close()
+
+
+@contextmanager
+def _publisher(*, wait_s: float = LOCK_WAIT_S, legacy_requests: bool = False):
+    """Keep shared publication authority through DB commit OR spool fsync."""
+    db = None
+    try:
+        try:
+            _prepare()
+            db = _connect(wait_s)
+        except QueueConversionDeferred:
+            if not legacy_requests:
+                raise
+        except (TimeoutError, sqlite3.OperationalError) as exc:
+            if isinstance(exc, sqlite3.OperationalError) and not _is_busy(exc):
+                raise
+            # Busy can precede the schema gate. Only requests have a format
+            # readable by older code; outcomes need proof of the current schema.
+            if not legacy_requests and _header_version() != SCHEMA_VERSION:
+                raise
+        with _legacy._lock(marker_dir(), OUTCOME_LOCK_WAIT_S, shared=True):
+            yield db
+    finally:
+        if db is not None:
+            db.close()
+
+
+@contextmanager
+def _queue_gate():
+    """Initialize first, then drain and decide under one exclusive barrier."""
+    db = _connect(OUTCOME_LOCK_WAIT_S)
+    try:
+        with _legacy._lock(marker_dir(), OUTCOME_LOCK_WAIT_S):
+            with _transaction(db):
+                if db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+                    raise RuntimeError("queue schema changed before admission")
+                imported = _legacy.drain(marker_dir(), db, _import_one, _fsync_dir)
+                native_imported = _native.drain(marker_dir(), db, _legs, _proof, marker_hash)
+                yield db
+            _legacy.retire(marker_dir(), imported, _fsync_dir)
+            _legacy.retire(marker_dir(), native_imported, _fsync_dir)
     finally:
         db.close()
 
@@ -538,32 +607,24 @@ def write_marker(repo_path: str, tools: str, mode: str) -> Path:
         "attempts": 0,
     }
     h = marker_hash(repo_path)
-    # A busy spool keeps the current envelope only on a queue known to be at the
-    # current schema; otherwise it may be one older code reads after a rollback,
-    # which imports only the plain format.
-    current = False
+    with _publisher(legacy_requests=True) as db:
+        def spool() -> Path:
+            return _write_spool(
+                h, data, legacy_body=not (db is not None or _header_version() == SCHEMA_VERSION)
+            )
 
-    def busy_spool() -> Path:
-        return _write_spool(
-            h, data, legacy_body=not (current or _header_version() == SCHEMA_VERSION)
-        )
-
-    try:
-        db = _connect()
-        db.close()
-        current = True
-        _migrate_legacy()
-        with _write_db() as db:
-            _coalesce_pending(db, h, data)
+        if db is None:
+            return spool()
+        try:
+            with _transaction(db):
+                _coalesce_pending(db, h, data)
+        except TimeoutError:
+            return spool()
+        except sqlite3.OperationalError as exc:
+            if not _is_busy(exc):
+                raise
+            return spool()
         return database_path()
-    except QueueConversionDeferred:
-        return _write_spool(h, data, legacy_body=True)
-    except TimeoutError:
-        return busy_spool()
-    except sqlite3.OperationalError as exc:
-        if not _is_busy(exc):
-            raise
-        return busy_spool()
 
 
 def list_markers() -> list[dict]:
@@ -585,11 +646,23 @@ def list_markers() -> list[dict]:
 
 
 def claim(h: str, *, provider: str) -> dict | None:
-    _prepare()
-    with _write_db() as db:
+    with _queue_gate() as db:
+        if _native.blocked(db, h, provider):
+            return None
         result = _legs.claim(db, h, provider)
         if result is not None:
             _legs.validate_context(result["context"], marker_hash)
+        return result
+
+
+def claim_native(h: str, *, provider: str) -> dict | None:
+    h = _machine_hash(h)
+    if provider not in _legs.PROVIDERS:
+        raise ValueError("provider must be cbm or gitnexus")
+    with _queue_gate() as db:
+        result = _native.claim(db, h, provider, _legs)
+        if result is not None:
+            _native.context(result["context"], _legs, marker_hash)
         return result
 
 
@@ -607,21 +680,23 @@ def remember_outcome(context: dict, action: str) -> Path:
     event = _legs.scalar_event(context, action, time.time(), marker_hash)
     context = {key: event[key] for key in _legs.CONTEXT}
     raw = json.dumps(event, sort_keys=True).encode() + b"\n"
-    try:
-        _prepare()
-        with _write_db(wait_s=OUTCOME_LOCK_WAIT_S) as db:
-            state = _record_outcome_db(db, event, raw)
+    with _publisher(wait_s=OUTCOME_LOCK_WAIT_S) as db:
+        if db is None:
+            return _write_outcome_spool(context, event)
+        try:
+            with _transaction(db):
+                state = _record_outcome_db(db, event, raw)
+        except TimeoutError:
+            return _write_outcome_spool(context, event)
+        except sqlite3.OperationalError as exc:
+            if not _is_busy(exc):
+                raise
+            return _write_outcome_spool(context, event)
         if state == "unowned":
             raise RuntimeError("cannot remember outcome for an unowned execution")
         if state == "conflict":
             raise RuntimeError("conflicting durable queue outcomes")
         return database_path()
-    except TimeoutError:
-        return _write_outcome_spool(context, event)
-    except sqlite3.OperationalError as exc:
-        if not _is_busy(exc):
-            raise
-        return _write_outcome_spool(context, event)
 
 
 def apply_remembered_outcome(context: dict) -> str | None:
@@ -635,6 +710,88 @@ def repend_stale_inflight() -> list[str]:
     _prepare()
     with _write_db() as db:
         return _legs.reconcile(db)
+
+
+def reconcile_native() -> list[str]:
+    with _queue_gate() as db:
+        return _native.reconcile(db, _legs)
+
+
+def reserve_launch(context: dict, data: dict) -> str:
+    context = _native.context(context, _legs, marker_hash)
+    data = _native.reservation(data, context)
+    with _queue_gate() as db:
+        state = _native.reserve(db, context, data, _legs)
+    if state in ("conflict", "held"):
+        raise RuntimeError("native reservation refused: " + state)
+    return state
+
+
+def cancel_launch(context: dict) -> str:
+    context = _native.context(context, _legs, marker_hash)
+    with _queue_gate() as db:
+        return _native.cancel(db, context, _legs)
+
+
+def _native_gate(context, data, operation):
+    context = _native.context(context, _legs, marker_hash)
+    with _queue_gate() as db:
+        state = operation(db, context, data, _legs, _proof)
+    if state in ("conflict", "resource", "held"):
+        raise RuntimeError("native launch refused: " + state)
+    return state
+
+
+def register_scope(context: dict, data: dict) -> str:
+    return _native_gate(context, data, _native.register)
+
+
+def begin_native(context: dict, data: dict) -> str:
+    return _native_gate(context, data, _native.begin)
+
+
+def remember_native_event(context: dict, kind: str, data: dict, *, recorded_at=None) -> Path:
+    context = _native.context(context, _legs, marker_hash)
+    event = _native.event(context, kind, data, time.time() if recorded_at is None else recorded_at, _proof)
+    def spool():
+        return _write_durable_event(
+            final_name=f".execution-spool-{context['hash']}-{context['claim_id']}-{secrets.token_hex(16)}.spool",
+            temp_prefix=".execution-tmp-", data=event,
+        )
+    with _publisher(wait_s=OUTCOME_LOCK_WAIT_S) as db:
+        state = "waiting"
+        if db is not None:
+            try:
+                with _transaction(db):
+                    state = _native.record(db, context, event, _legs, _proof)
+            except TimeoutError:
+                return spool()
+            except sqlite3.OperationalError as exc:
+                if not _is_busy(exc):
+                    raise
+                return spool()
+        if state in ("waiting", "retained"):
+            path = spool()
+            if state == "retained":
+                raise RuntimeError("additional native conflict retained: " + str(path))
+            return path
+        if state == "conflict":
+            raise RuntimeError("conflicting native evidence retained in queue")
+        return database_path()
+
+
+def apply_native(context: dict) -> str | None:
+    context = _native.context(context, _legs, marker_hash)
+    with _queue_gate() as db:
+        return _native.apply(db, context, _legs)
+
+
+def execution_status(context: dict) -> dict:
+    context = _native.context(context, _legs, marker_hash)
+    result = _legacy.import_status(database_path(), limit=0,
+                                   observe=lambda db: _native.status(db, context, _legs))
+    result["evidence_pending"] = any(marker_dir().glob(".execution-spool-*.spool"))
+    return result  # Observation only; never an admission decision or repair.
 
 
 def should_escalate_full(h: str) -> bool:
@@ -752,8 +909,8 @@ def _pending_record(row: dict) -> tuple[str, ...]:
     return "1", "pending", h, repo, provider, str(age)
 
 
-def _claim_record(row: dict, h: str, provider: str) -> tuple[str, ...]:
-    context = _legs.validate_context(row["context"], marker_hash)
+def _claim_record(row: dict, h: str, provider: str, *, protocol=2) -> tuple[str, ...]:
+    context = _legs.validate_context(row["context"], marker_hash, protocol=protocol)
     if (
         context["hash"] != h
         or context["provider"] != provider
@@ -789,126 +946,7 @@ def _write_machine(records) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Code-intel provider-leg queue")
-    sub = parser.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("write")
-    p.add_argument("--repo", required=True)
-    p.add_argument("--tools", default="both", choices=VALID_TOOLS)
-    p.add_argument("--mode", default="fast", choices=VALID_MODES)
-    p = sub.add_parser("hash")
-    p.add_argument("--repo", required=True)
-    sub.add_parser("list")
-    p = sub.add_parser("list-legs")
-    p.add_argument("--nul", action="store_true")
-    sub.add_parser("automatic-ready")
-    p = sub.add_parser("import-status")
-    p.add_argument("--limit", type=int, default=20)
-    p = sub.add_parser("claim")
-    p.add_argument("--hash", required=True)
-    p.add_argument("--provider", choices=_legs.PROVIDERS, required=True)
-    p.add_argument("--nul", action="store_true")
-    for name in ("consume", "restore", "remember-outcome", "apply-outcome"):
-        p = sub.add_parser(name)
-        p.add_argument("--context", required=True)
-        if name == "restore":
-            p.add_argument("--attempts-inc", action="store_true")
-        if name == "remember-outcome":
-            p.add_argument("--action", choices=VALID_OUTCOMES, required=True)
-    for name in ("should-escalate", "stamp-full", "mark-full-backoff"):
-        p = sub.add_parser(name)
-        p.add_argument("--hash", required=True)
-        if name == "should-escalate":
-            p.add_argument("--nul", action="store_true")
-    sub.add_parser("reconcile-inflight")
-    args = parser.parse_args(argv)
-    machine = getattr(args, "nul", False)
-    if machine and args.cmd in ("claim", "should-escalate"):
-        _machine_hash(args.hash)
-    if args.cmd in ("automatic-ready", "import-status"):
-        try:
-            result = _legacy.import_status(
-                database_path(),
-                limit=getattr(args, "limit", 0),
-                protocol_only=args.cmd == "automatic-ready",
-            )
-        except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:
-            print(
-                json.dumps({"state": "error", "error": str(exc)}, ensure_ascii=True),
-                file=sys.stderr if args.cmd == "automatic-ready" else sys.stdout,
-            )
-            # Only the runner's observer reports busy apart; import-status keeps 2.
-            busy = isinstance(exc, TimeoutError) or (
-                isinstance(exc, sqlite3.OperationalError) and _is_busy(exc)
-            )
-            return BUSY_STATUS if busy and args.cmd == "automatic-ready" else 2
-        print(json.dumps(result, ensure_ascii=True))
-        return AUTOMATIC_PROTOCOL_INCOMPLETE if args.cmd == "automatic-ready" else 0
-    if args.cmd == "write":
-        print(write_marker(args.repo, args.tools, args.mode))
-        return 0
-    if args.cmd == "hash":
-        print(marker_hash(args.repo))
-        return 0
-    if args.cmd in ("list", "list-legs"):
-        rows = list_markers()
-        if machine:
-            _write_machine([_pending_record(row) for row in rows])
-        elif args.cmd == "list":
-            # Legacy human view only; list-legs is lossless JSON per line.
-            for row in rows:
-                print(
-                    f"{row['hash']}\t{row['repo_path']}\t{row['provider']}\t{row['mode']}\t{row['attempts']}\t{row['age_s']}"
-                )
-        else:
-            for row in rows:
-                print(json.dumps(row, ensure_ascii=True))
-        return 0
-    if args.cmd == "claim":
-        row = claim(args.hash, provider=args.provider)
-        if row is None:
-            if machine:
-                _write_machine([("1", "unclaimed", args.hash, args.provider)])
-            return 1
-        if machine:
-            _write_machine([_claim_record(row, args.hash, args.provider)])
-        else:
-            print(json.dumps(row, ensure_ascii=True))
-        return 0
-    if args.cmd == "consume":
-        consume(_cli_context(args))
-        return 0
-    if args.cmd == "restore":
-        print(restore(_cli_context(args), attempts_inc=args.attempts_inc))
-        return 0
-    if args.cmd == "remember-outcome":
-        remember_outcome(_cli_context(args), args.action)
-        return 0
-    if args.cmd == "apply-outcome":
-        state = apply_remembered_outcome(_cli_context(args))
-        if state is None:
-            return 1
-        print(state)
-        return 0
-    if args.cmd == "should-escalate":
-        due = should_escalate_full(args.hash)
-        if machine:
-            if type(due) is not bool:
-                raise ValueError("invalid machine escalation answer")
-            _write_machine([("1", "escalation", args.hash, "1" if due else "0")])
-            return 0
-        return 0 if due else 1
-    if args.cmd == "stamp-full":
-        stamp_full(args.hash)
-        return 0
-    if args.cmd == "mark-full-backoff":
-        mark_full_backoff(args.hash)
-        return 0
-    if args.cmd == "reconcile-inflight":
-        rows = repend_stale_inflight()
-        if rows:
-            print(f"re-pended {len(rows)} protocol2 claims without native intent")
-        return 0
-    return 2
+    return _cli.main(argv, globals())
 
 
 if __name__ == "__main__":

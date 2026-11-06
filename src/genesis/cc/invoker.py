@@ -20,7 +20,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
 
-from genesis.cc import roster
+from genesis.cc import final_status, roster
 from genesis.cc.checkout_lock import CheckoutAdmission, admit_launch
 from genesis.cc.child_env import pin_dispatched_env
 from genesis.cc.exceptions import (
@@ -51,6 +51,7 @@ from genesis.cc.types import (
     clamp_effort,
     model_supports_effort,
 )
+from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED
 from genesis.observability.spans import SpanKind, start_span
 from genesis.util.inflight import inflight
 from genesis.util.proc_kill import (
@@ -162,6 +163,31 @@ def parse_cc_version(text: str) -> tuple[int, int, int] | None:
     """Parse the leading ``X.Y.Z`` of ``claude --version`` output, else None."""
     m = _CC_VERSION_RE.match(text or "")
     return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
+#: Prefix on a reason reported by a session that reads outside content.
+EXTERNAL_REASON_LABEL = "the session says: "
+
+
+def _split_final_status(invocation: CCInvocation, output: CCOutput) -> CCOutput:
+    """Move a trailing ``final_status`` block off ``output.text`` (see cc/final_status.py).
+
+    Both run paths return through here, so a caller that set ``report_status``
+    reads the same text its parser read before the contract existed. An
+    invocation that did not ask is never parsed. Accepted residual: the
+    ``expect_output`` silent-cap check runs before this, so an answer that was
+    ONLY the block reaches the caller as empty text without that alert; the
+    caller's own empty-output handling then fails it mechanically.
+    """
+    if not invocation.report_status:
+        return output
+    text, report = final_status.split(output.text)
+    if report is not None and report.reason and invocation.origin == ORIGIN_EXTERNAL_UNTRUSTED:
+        # A session reading outside content can be steered into writing its
+        # reason, and the reason reaches the owner's alert pages. Owner ruling:
+        # show it, labeled as the session's words, never as Genesis's own.
+        report = replace(report, reason=EXTERNAL_REASON_LABEL + report.reason)
+    return replace(output, text=text, final_status=report)
 
 
 def cost_is_cumulative_for(version: tuple[int, int, int] | None) -> bool:
@@ -2355,8 +2381,17 @@ class CCInvoker:
             protection_context = self._protected_paths.format_for_prompt()
             if protection_context:
                 system_prompt = system_prompt + "\n\n" + protection_context
+        append = inv.append_system_prompt
+        if inv.report_status:
+            # After the protected-paths block, so which sessions get that block
+            # is unchanged. With no caller prompt the contract is APPENDED:
+            # --system-prompt would replace Claude Code's default prompt.
+            if system_prompt:
+                system_prompt = system_prompt + "\n\n" + final_status.CONTRACT
+            else:
+                system_prompt, append = final_status.CONTRACT, True
         if system_prompt:
-            flag = "--append-system-prompt" if inv.append_system_prompt else "--system-prompt"
+            flag = "--append-system-prompt" if append else "--system-prompt"
             args += [flag, system_prompt]
         if inv.resume_session_id:
             args += ["--resume", inv.resume_session_id]
@@ -3008,6 +3043,7 @@ class CCInvoker:
                 await self._run_inner(invocation, admission),
                 roster_model=roster_model,
             )
+            output = _split_final_status(invocation, output)
             with contextlib.suppress(Exception):
                 span.set_attr("cost_usd", output.cost_usd)
                 span.set_attr("input_tokens", output.input_tokens)
@@ -3289,6 +3325,7 @@ class CCInvoker:
                 await self._run_streaming_inner(invocation, on_event, admission),
                 roster_model=roster_model,
             )
+            output = _split_final_status(invocation, output)
             with contextlib.suppress(Exception):
                 span.set_attr("cost_usd", output.cost_usd)
                 span.set_attr("input_tokens", output.input_tokens)

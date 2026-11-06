@@ -1361,3 +1361,58 @@ def test_the_residue_read_never_rewrites_the_index(guard, repo):
     before = index.read_bytes()
     assert guard._merge_residue(str(root), repo["base"], repo["base"], True) == []
     assert index.read_bytes() == before
+
+
+# ── #3964: one bounded reader for the state file ────────────────────────────
+
+
+def _unreadable_state(r: dict, kind: str) -> Path:
+    path = r["home"] / "update_state.json"
+    if kind == "fifo":
+        os.mkfifo(path)
+    elif kind == "symlink":
+        target = r["home"] / "elsewhere.json"
+        target.write_text(json.dumps({"phase": "done"}))
+        path.symlink_to(target)
+    elif kind == "over-cap":
+        path.write_text(json.dumps({"phase": "done", "pad": "x" * (2 << 20)}))
+    return path
+
+
+@pytest.mark.parametrize("kind", ["fifo", "symlink", "over-cap"])
+def test_a_state_path_no_writer_made_is_a_prompt_hold(repo, kind):
+    """#3964: a FIFO (open blocks with no writer), a link (followed) or a
+    file far over the state's size reads as "it cannot be read", at once; the
+    command line answers within the timeout instead of hanging every deploy."""
+    path = _unreadable_state(repo, kind)
+    r = subprocess.run(
+        [sys.executable, "-I", "-S", str(GUARD), str(path), str(repo["root"])],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert r.returncode == 6 and "cannot be read" in r.stdout, r.stdout + r.stderr  # HOLD
+
+
+def test_read_state_returns_a_normal_state_file(guard, repo):
+    path = _state(repo, {"phase": "done"})
+    assert json.loads(guard.read_state(str(path))) == {"phase": "done"}
+    assert guard.verdict(str(path), str(repo["root"]))[0] == "safe"
+
+
+def test_the_guards_git_runs_no_fsmonitor_the_repository_names(guard, repo, tmp_path):
+    """#3964 (from the #3984 review): the guard's git calls, its residue
+    helper's included, run with core.fsmonitor off and hooks disabled, so a
+    repository config naming a program never runs it. Control: plain git runs
+    the same program."""
+    mark = tmp_path / "fsmonitor-ran"
+    hook = tmp_path / "fsmonitor.sh"
+    hook.write_text(f"#!/bin/sh\ntouch {mark}\nexit 1\n")
+    hook.chmod(0o755)
+    _git(repo["root"], "config", "core.fsmonitor", str(hook))
+    status = ["git", "-C", str(repo["root"]), "status", "--porcelain"]
+    subprocess.run(status, capture_output=True, env=_git_env())
+    assert mark.exists(), "control: plain git status runs the configured fsmonitor"
+    mark.unlink()
+    subprocess.run(status, capture_output=True, env=guard._env())
+    assert not mark.exists(), "the guard's git environment still runs fsmonitor"

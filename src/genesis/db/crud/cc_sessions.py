@@ -111,12 +111,25 @@ async def get_active_foreground(
     return dict(row) if row else None
 
 
+#: How a session ENDED. ``unreported`` = it exited cleanly and nothing said
+#: whether it did its job; ``parked`` = stopped for a rate limit, resumed later.
+OUTCOMES = frozenset(
+    {"finished", "blocked", "failed", "partial", "unreported", "expired", "parked"}
+)
+#: The outcome a terminal status implies when the writer judged nothing, so a
+#: terminal row can never be left unjudged by a writer that forgot the field.
+_DEFAULT_OUTCOME = {"completed": "unreported", "failed": "failed", "expired": "expired"}
+
+
 async def update_status(
     db: aiosqlite.Connection,
     id: str,
     *,
     status: str,
     ts: str | None = None,
+    outcome: str | None = None,
+    outcome_reason: str | None = None,
+    only_if_active: bool = False,
 ) -> bool:
     """Single status writer, with terminal-timestamp discipline.
 
@@ -134,26 +147,49 @@ async def update_status(
     - ``active`` (reopen) clears ``completed_at`` — the pair
       (active, completed_at set) lies in both directions.
       ``checkpointed_at`` is left as history, deliberately.
+
+    The same single-writer argument carries the OUTCOME (how it ended): every
+    terminal write through here records ``outcome`` and ``outcome_reason`` in
+    the same UPDATE, defaulting from the status when the caller judged nothing,
+    so the background writers that bypass SessionManager (spawn failure, boot
+    orphan reconcile, peers) are recorded too, and no crash can land between
+    status and outcome. (Foreground adoption and voice sweeps write their own
+    SQL and leave it NULL; readers of outcome scope to background rows.)
+    A later terminal write overwrites the outcome (the real result wins) but
+    never ``outcome_paged_at``: a stop already reported is not reported again.
+    Reopening (``active``) clears all three, so the next end is judged afresh.
+    An unknown outcome is logged and replaced by the default rather than
+    raised: the outcome only adds information, and it must never veto the
+    status write (two callers retry status writes in a loop).
+    ``only_if_active`` makes the write conditional on the row still being
+    active, for a writer that decided from an earlier read (the idle reaper).
     """
     stamp = ts or datetime.now(UTC).isoformat()
+    if outcome is not None and outcome not in OUTCOMES:
+        _logger.error("unknown session outcome %r for %s; using the status default", outcome, id)
+        outcome_reason = outcome_reason or f"invalid_outcome:{outcome}"
+        outcome = None
+    guard = " AND status = 'active'" if only_if_active else ""
     if status in ("completed", "failed", "expired"):
         cursor = await db.execute(
-            "UPDATE cc_sessions SET status = ?, completed_at = ? WHERE id = ?",
-            (status, stamp, id),
+            "UPDATE cc_sessions SET status = ?, completed_at = ?, outcome = ?,"
+            " outcome_reason = ? WHERE id = ?" + guard,
+            (status, stamp, outcome or _DEFAULT_OUTCOME[status], outcome_reason, id),
         )
     elif status == "checkpointed":
         cursor = await db.execute(
-            "UPDATE cc_sessions SET status = ?, checkpointed_at = ? WHERE id = ?",
+            "UPDATE cc_sessions SET status = ?, checkpointed_at = ? WHERE id = ?" + guard,
             (status, stamp, id),
         )
     elif status == "active":
         cursor = await db.execute(
-            "UPDATE cc_sessions SET status = ?, completed_at = NULL WHERE id = ?",
+            "UPDATE cc_sessions SET status = ?, completed_at = NULL, outcome = NULL,"
+            " outcome_reason = NULL, outcome_paged_at = NULL WHERE id = ?" + guard,
             (status, id),
         )
     else:
         cursor = await db.execute(
-            "UPDATE cc_sessions SET status = ? WHERE id = ?",
+            "UPDATE cc_sessions SET status = ? WHERE id = ?" + guard,
             (status, id),
         )
     await db.commit()
@@ -318,6 +354,66 @@ async def query_active(db: aiosqlite.Connection) -> list[dict]:
         "SELECT * FROM cc_sessions WHERE status = 'active' ORDER BY started_at DESC",
     )
     return [dict(r) for r in await cursor.fetchall()]
+
+
+#: Outcomes that mean a background session STOPPED without doing its job.
+#: ``parked`` resumes on its own and ``unreported`` is a clean exit with no
+#: verdict, so neither is a stop.
+STOP_OUTCOMES = ("failed", "partial", "blocked", "expired")
+
+
+async def list_unpaged_stops(
+    db: aiosqlite.Connection,
+    *,
+    since: str,
+    until: str,
+    limit: int,
+) -> tuple[list[dict], int]:
+    """Background sessions that stopped in ``[since, until]`` and nobody has paged.
+
+    Returns ``(rows, total)``: the oldest *limit* rows, whole, and the full
+    count, so a caller listing a page can say how many it left out. Foreground
+    rows are excluded (an owner's own conversation is not a background stop).
+    ``until`` lets a caller leave a just-finished row to its own immediate
+    notifier, which stamps it a few seconds after the terminal write.
+    """
+    marks = ",".join("?" * len(STOP_OUTCOMES))
+    where = (
+        "session_type != 'foreground' AND outcome_paged_at IS NULL"
+        f" AND outcome IN ({marks}) AND completed_at >= ? AND completed_at <= ?"
+    )
+    args = (*STOP_OUTCOMES, since, until)
+    cursor = await db.execute(f"SELECT COUNT(*) FROM cc_sessions WHERE {where}", args)  # noqa: S608 -- fixed predicate, values bound
+    total = (await cursor.fetchone())[0]
+    cursor = await db.execute(
+        f"SELECT * FROM cc_sessions WHERE {where} ORDER BY completed_at LIMIT ?",  # noqa: S608 -- fixed predicate, values bound
+        (*args, limit),
+    )
+    return [dict(r) for r in await cursor.fetchall()], total
+
+
+async def count_unreported(db: aiosqlite.Connection, *, since: str, until: str) -> int:
+    """Background sessions that ended in ``[since, until]`` without reporting a status."""
+    cursor = await db.execute(
+        "SELECT COUNT(*) FROM cc_sessions WHERE session_type != 'foreground'"
+        " AND outcome = 'unreported' AND completed_at >= ? AND completed_at <= ?",
+        (since, until),
+    )
+    return (await cursor.fetchone())[0]
+
+
+async def mark_outcome_paged(db: aiosqlite.Connection, ids: list[str], *, ts: str) -> int:
+    """Record that the owner was told about these stops. Never re-stamps."""
+    if not ids:
+        return 0
+    marks = ",".join("?" * len(ids))
+    cursor = await db.execute(
+        f"UPDATE cc_sessions SET outcome_paged_at = ? WHERE outcome_paged_at IS NULL"  # noqa: S608 -- placeholders only
+        f" AND id IN ({marks})",
+        (ts, *ids),
+    )
+    await db.commit()
+    return cursor.rowcount
 
 
 async def query_stale(

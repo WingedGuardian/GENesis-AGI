@@ -5,7 +5,6 @@ import json
 import os
 import shlex
 import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -18,6 +17,7 @@ from tests.test_hooks.native_codex import (
     run_native,
     trust_fixture_hook,
 )
+from tests.test_hooks.test_codex_native import native_binaries as native_binaries
 
 ROOT = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.skipif(
@@ -28,12 +28,14 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("client", ["cli", "app"])
 @pytest.mark.parametrize("prefix", [r"echo It\'s", r'echo q\"r'])
 @pytest.mark.parametrize("mode", ["read", "deny", "noop"])
-def test_pinned_shared_guard_sees_hash_free_escaped_word(tmp_path, monkeypatch, client, prefix, mode):
-    binary = os.environ["GENESIS_CODEX_CLI_BIN"]
-    assert subprocess.check_output([binary, "--version"], text=True).strip() == "codex-cli 0.163.0"
-    assert hashlib.sha256(Path(binary).read_bytes()).digest() == bytes.fromhex(
-        "399ff69c 431c066e 40de318f ba45c2b0 7f45a76b 19939d24 7ee4828f c70c4215"
-    )
+def test_pinned_shared_guard_sees_hash_free_escaped_word(tmp_path, monkeypatch, native_binaries, client, prefix, mode):
+    binaries, versions = native_binaries
+    assert set(versions.values()) == {"codex-cli 0.166.0"}
+    binary_hashes = {name: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                     for name, path in binaries.items()}
+    expected_binary = bytes.fromhex("b8a11fed f24b2dfb 59a70c9e 52b030f9 a508dcd4 9cd2dd0d 41956f4c 785156b8").hex()
+    assert set(binary_hashes.values()) == {expected_binary}
+    binary = binaries[client]
     dependency = Path(os.environ.get("GENESIS_VALIDATOR_ADAPTER_SOURCE", ROOT)).resolve()
     helpers = private_module("quote_native_helpers", dependency / "tests/test_hooks/test_codex_validator_adapter_native.py")
     monkeypatch.setattr(helpers, "ROOT", ROOT)
@@ -63,7 +65,8 @@ def test_pinned_shared_guard_sees_hash_free_escaped_word(tmp_path, monkeypatch, 
             "input": "text(await tools.exec_command(" + json.dumps({"cmd": command}) + "));"}
     hashes = {str(path.relative_to(runtime)): hashlib.sha256(path.read_bytes()).hexdigest()
               for path in sorted(runtime.rglob("*")) if path.is_file()}
-    evidence = {"client": client, "prefix": prefix, "mode": mode, "command": command,
+    evidence = {"client": client, "versions": versions, "binary_hashes": binary_hashes,
+                "prefix": prefix, "mode": mode, "command": command,
                 "runtime": str(runtime), "hashes": hashes, "adapter_source": str(dependency),
                 "adapter_overlays": overlays}
     try:
@@ -80,7 +83,7 @@ def test_pinned_shared_guard_sees_hash_free_escaped_word(tmp_path, monkeypatch, 
                 f"result=subprocess.run(['bash','-c',{hook!r}],input=raw)\n"
                 "raise SystemExit(result.returncode)\n"
             )
-            evidence["trust"] = trust_fixture_hook(binary, tmp_path, env)
+            evidence["trust"] = trust_fixture_hook(binaries["app"], tmp_path, env)
             evidence["events"], evidence["stderr"] = run_native(binary, client, tmp_path, env, evidence)
             evidence["requests"] = requests
     finally:

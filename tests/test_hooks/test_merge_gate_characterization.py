@@ -404,6 +404,30 @@ _CASES: list[tuple[str, object, int, str]] = [
         "CI is RED",
     ),
     (
+        # Found by the defect corpus: this rung did not notice a conclusion GitHub
+        # adds later being ignored. The sibling job is what would vouch for the merge:
+        # alone, the unknown check leaves the required workflow unproven, which blocks
+        # for a different reason.
+        "ci_unrecognized_conclusion_blocks",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            ci=json.dumps(
+                [
+                    json.loads(_ci())[0],
+                    {
+                        "name": "a-new-check",
+                        "workflowName": "CI",
+                        "conclusion": "SOME_FUTURE_CONCLUSION",
+                        "status": "COMPLETED",
+                    },
+                ]
+            ),
+        ),
+        2,
+        "CI is RED",
+    ),
+    (
         "ci_red_with_ci_override_continues",
         lambda mp: _run(mp, _merge_cmd(trailer="# ci-override"), ci=_ci("FAILURE")),
         0,
@@ -1264,6 +1288,21 @@ _CASES: list[tuple[str, object, int, str]] = [
         2,
         "missing 2 required gate receipt(s)",
     ),
+]
+
+
+# Only `# ci-override` waives red CI. Found by the defect corpus: nothing failed when
+# `# review-override` also waived it. From the guard's own list, so a new sigil is
+# covered the day it is added.
+_CASES += [
+    (
+        f"ci_red_with_{sigil}_still_blocks",
+        lambda mp, sigil=sigil: _run(mp, _merge_cmd(trailer=f"# {sigil}"), ci=_ci("FAILURE")),
+        2,
+        "CI is RED",
+    )
+    for sigil in _mod._KNOWN_SIGILS
+    if sigil != "ci-override"
 ]
 
 

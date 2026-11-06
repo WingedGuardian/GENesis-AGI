@@ -485,21 +485,22 @@ busy tick and exits 0. Status 10 is reserved so that an interpreter crash (statu
 mistaken for the expected pause; the runner treats any other status as a
 failure. The runner discards the observer's JSON, so read the current state
 with `python3 scripts/lib/index_marker.py automatic-ready`. `import-status`
-lists receipts for schemas 2 and 3 and refuses a newer schema. The checked
+lists receipts for schemas 2, 3 and 4 and refuses a newer schema. The checked
 consumer is prepared behind this fence; native evidence and durable
 resource-failure quarantine must complete before automatic work can resume.
 That readiness does not authorize lifting a freeze or disable sentinel.
 
 No ordinary command converts an existing queue. Converting on connect is unsafe
 across code rollbacks: a failed update restores older code but not the queue,
-and older code refuses a newer schema. On an older queue (schema 1 or 2, or an
+and older code refuses a newer schema. On an older queue (schema 1, 2 or 3, or an
 unversioned file that already has tables), `write` durably spools the request
 in the plain format schema-2 code writes and imports, so a rolled-back install
 still consumes it; `automatic-ready` and `import-status` read schemas 1 and 2
 as before, and report an unversioned file that has tables as an observation
-error (so the runner stops with 76 until the cutover); every other command
-exits 2 with one line naming the schema and the cutover. A busy queue whose
-schema was not yet confirmed also spools the plain format. A missing queue is created at schema 3, unless an update is running
+error (so the runner stops with 76 until the cutover); other operations that
+require a current-schema connection exit 2 with one line naming the schema
+and the cutover. A busy queue whose schema was not yet confirmed also spools
+the plain format. A missing queue is created at schema 4, unless an update is known to be running before creation
 (`locks/update.lock` held exclusively, or `update_state.json` present under the
 state directory), in which case `write` spools and nothing is created. Only the
 explicit strict cutover converts an older queue and imports those spools.
@@ -523,7 +524,9 @@ contain six-field `1,pending,hash,repo,provider,age` records; claims contain
 seven-field `1,claim,hash,repo,provider,mode,context_json` records. No eligibility
 is a four-field `1,unclaimed,hash,provider` record with status 1. Escalation is
 `1,escalation,hash,0|1` with status 0 for either answer. Wire version 1 is
-independent of queue schema 3 and claim protocol 2. Other interfaces are unchanged.
+independent of queue schema 4 and claim protocols 2/3. The scalar `claim`
+interface still returns protocol 2; explicit `claim-native` returns protocol 3
+with the same framing. Neither operation enables automatic indexing.
 Listed and claimed repository spellings are validated as stored, never
 re-resolved against the live filesystem, so a queued repository that later moves
 (or gains a symlink) cannot stop the list. A request spooled while the queue was
@@ -570,10 +573,11 @@ OOM adjustment; only the native child receives 1000. The validated physical main
 path supplies both the native payload and working directory. Final admission
 rechecks managed settings, cache, native readiness and enablement under the
 lifecycle lock, which closes after child creation. Repository/runner locks and
-the scope watchdog retain execution ownership. Missing canonical repository
+the scope watchdog retain foreground execution ownership. The current watchdog
+does not verify scope quiescence after that foreground exits. Missing canonical repository
 locks refuse Codebase; GitNexus retains its independent handling.
 
-This wiring merged in #3012. Read-only availability/access repairs remain tracked
+This wiring merged in #3012. Read-only availability/access repairs merged
 in #3464. Neither fixture acceptance nor a successful probe grants permission to
 clear the sentinel, release the freeze or retry unattended after resource failures.
 Follow the supervised production acceptance and resource gates in
@@ -581,7 +585,13 @@ Follow the supervised production acceptance and resource gates in
 
 ### Legacy queue import evidence
 
-The queue upgrades schemas 0, 1 and 2 atomically to schema 3. Each legacy
+Only explicit conversion, reserved for strict cutover, upgrades existing schemas
+0 through 3 atomically to schema 4. Ordinary commands leave older queues unchanged:
+request writers spool the plain rollback-readable request; other mutations defer.
+Fresh queues initialize at schema 4 unless an update is in progress.
+Schema 3's
+provider-leg conversion and schema 4's execution rebuild retain old evidence.
+Each legacy
 artifact is isolated by a savepoint: malformed content produces a retained
 receipt containing its exact raw bytes and a reason, while unrelated valid
 requests continue. These diagnostics do not replace a repository's genuine
@@ -612,7 +622,7 @@ processing, not historical content validity. No rejected payload is invented.
 Receipt identity includes source bytes, raw digest and exact decimal mtime.
 Prior identities remain retained so a commit-before-unlink replay cannot import
 work twice. Do not clear this history to retry a request. Older queue binaries
-refuse schema 3; rolling back code must not restore an old queue snapshot over
+refuse a newer schema; rolling back code must not restore an old queue snapshot over
 new writes. Receipt and execution history are retained for idempotence and
 reconciliation; no implicit history prune or new backup service is installed.
 Before a supervised live upgrade, stop automatic consumption, verify no writer,
@@ -621,6 +631,128 @@ restoration in disposable storage. Do not assume the install's optional backup
 configuration covers this queue. The migration does not enable indexing, add
 resource quarantine, or implement the checked consumer's list/claim propagation
 tracked in #2043.
+
+### Explicit execution-evidence primitive
+
+`scripts/lib/code_intel_execution.py` is an internal stdlib helper with no
+automatic queue caller. It receives a private report-pipe descriptor, expected
+workload unit, exact cap, existing run bound and an argv vector. It does not
+enable a provider, change admission/limits, stop a scope or settle queue work.
+The caller must supply the existing native/supervisor launcher so maximum OOM
+preference remains confined to its native child. The reporter itself refuses
+maximum OOM preference. Its zero exit status means report delivery only. The
+run bound ends observation, not the payload: a payload still running at the
+deadline is neither signalled nor reaped, so the caller's launcher must stop and
+clean it up, and should pass an absolute executable path.
+
+The helper requires validated cgroup v2 routing, the requested finite memory
+cap, zero swap, hierarchical memory events and same-subtree task accounting.
+Unsupported v1/local-only events or unavailable proof refuse before payload.
+After launch, lost proof or an expired run bound yields uncertainty. It waits
+past foreground exit until only verified reporter tasks remain, including
+recursive descendant checks and the aggregate `pids.current` count, then samples
+and rechecks identity/counters. Owned `oom_kill` counts identify workload victims;
+they do not establish which cap caused the OOM. `high`/`max` and ancestor events
+remain diagnostic, with unavailable ancestor counters explicitly labeled. A final
+sample whose identity, counter population, ancestor availability or reporter
+thread count differs from the first is not retained, and the run stays uncertain:
+the pre-launch report-size bound assumes that shape.
+
+Reports use one bounded atomic JSON pipe write, separate from provider stdout
+and closed in the payload. Standard-descriptor aliases are rejected. Identical
+scope/ancestor identities are encoded once with an explicit shared reference;
+the reader restores all sampled facts. Oversized records refuse rather than
+truncate. The reader accumulates through EOF and rejects malformed, duplicate
+or trailing records. A received record and the reporter's later exit status are
+separate facts; a raw signal is not OOM proof.
+
+Future strict queue wiring must retain ownership through an actual bounded
+stop/quiescence/reap barrier and preserve an unresolved claim if cleanup cannot
+be proved. The existing foreground watchdog is insufficient for that contract.
+The explicit native journal below stores intent and interprets retained reports;
+its automatic native producer, scope-lifetime integration and supervised recovery
+remain separate work. This standalone observer does not implement them.
+Local synthetic cgroup and
+real descriptor/subprocess fixtures do not establish native kernel OOM behavior
+or production capacity. Keep existing disablement and supervised acceptance
+requirements in force.
+
+### Explicit native journal (automatic indexing remains fenced)
+
+Schema 4 retains launch permission, scope registration, native intent, the first
+typed terminal and conflict, stop observations and independent cleanup evidence
+on the existing execution row. Migration preserves foreign keys, execution
+identities, raw legacy bytes and the AUTOINCREMENT high-water, including a
+deleted highest row. It publishes the new version in the same transaction.
+
+These are trusted same-install producer APIs, not an operator authorization
+boundary or permission to launch a provider. The explicit CLI commands are
+`claim-native`, `reserve-launch`, `register-scope`, `begin-native`, `cancel-launch`,
+`remember-native-event`, `apply-native`, `reconcile-native` and `execution-status`.
+Every execution operation takes its complete protocol-3 context. Reservation
+binds source/configuration hashes, effective mode, owner boot/PID/start identity,
+the unique expected scope, the full 8 GiB cap and the selected existing routing
+profile. Registration binds actual scope facts and invocation before provider
+preparation. Intent rechecks registration, source and fresh counters; an owned
+preparation OOM refuses indexing and retains resource evidence.
+
+Reservation and intent must commit to SQLite. Only the first winning call
+returns the launch-authorizing result (`reserved` / `started`, CLI status 0).
+An identical repeat returns `already_reserved` / `already_started`, CLI status 1;
+it never grants another launch. A lost acknowledgment cannot authorize a resend.
+Cancellation cannot undo spent intent. Protocol-2 scalar settlement refuses
+protocol-3 contexts.
+Replaying `reserve-launch` after cancellation returns `cancelled` with CLI
+status 1; only `cancel-launch` treats that result as command success.
+
+All modern enqueue and outcome publishers hold the shared side of the existing
+`.queue.lock` through database commit or file-plus-directory synchronization.
+Deferred requests retain this barrier through legacy-body spool synchronization.
+Busy scalar/native outcome publication requires a connection or header proving
+the current schema; older or unknown state refuses without an outcome spool.
+The CLI retains busy status 75. The runner's existing persistence-acknowledgement
+failure remains 76; it defers busy application only after durable retention.
+Native admission and application take its exclusive side across legacy and
+typed spool replay and the decision transaction. Busy terminal/diagnostic writes
+can create immutable `.execution-spool-*.spool` files; admission cannot rely on
+a database-only snapshot that overlooks them. Duplicate evidence ignores its
+receipt timestamp, while original retained facts remain unchanged. Further
+distinct conflicts stay in their spools if the first conflict slot is occupied.
+Filesystem, SQLite, malformed-record and synchronization failures remain visible.
+If a reader blocks SQLite commit, the rolled-back native event is synchronized
+to a spool before acknowledgement. An in-memory record result is not retention;
+a failed spool synchronization reports failure and preserves the artifact.
+Never unlink the lock or discard those spools to force work through.
+An exact-context event missing its required reservation, registration or intent
+is retained as an explicit `unbound` conflict. It cannot establish completion,
+neutral no-start recovery or replacement-writer eligibility. Gate replay first
+publishes representable records, then interprets all still-retained hazards
+against that snapshot in the same transaction. Receipt/filename order cannot
+hide a newer nonempty observation behind an older cleanup proof.
+
+Completion, resource safety and cleanup remain separate. A complete report also
+requires explicit provider response validation before success; exit zero alone
+cannot override an owned OOM. Stop ordering uses same-boot monotonic observations.
+Application charges or consumes the exact execution once, preserves newer pending
+work and the healthy sibling, and retains the repo writer pointer until bound
+cleanup is proved. A later cleanup proof retires only that pointer. Original-root
+removal or a changed boot can establish cleanup, never successful completion.
+Once uncertainty has been settled, later cleanup or terminal evidence cannot
+clear its provider hold; approved supervised release remains separate work.
+Late OOM/conflict evidence cannot refund or repeat a completed execution. Historical
+cleanup disproof remains sticky and conservatively excludes both providers until
+the later real-scope reconciliation path can satisfy its fresh-proof obligation.
+
+`execution-status --context ...` uses the existing read-only/query-only opener;
+it neither initializes nor imports work. `evidence_pending` reports retained
+typed spools and makes a database-only observation explicitly incomplete.
+Unreserved claims recover neutrally; reserved/may-start work without trustworthy
+completion remains held. This journal does not observe a live kernel scope,
+stop a process, install a watchdog or supply supervised recovery authorization.
+The queued native producer, actual scope-lifetime barrier and final readiness
+cutover still require their separate implementation and disposable native tests.
+`automatic-ready` remains never-positive. Existing production disablement stays
+in force; isolated CLI/report fixtures are not native or production acceptance.
 
 ## Verification
 

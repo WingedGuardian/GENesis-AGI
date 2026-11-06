@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import json
 import os
 import subprocess
@@ -225,6 +226,40 @@ def validate_bytes(
     return ValidationResult(False, "parse_error", f"unknown kind {kind!r}")
 
 
+def _exists(path: Path) -> bool:
+    """Only "no such file" means absent, and anything else raises. From Python 3.14
+    ``Path.exists`` also answers False for a directory that denies search, which would
+    read as a missing file and restore over a live one. This runs on the system's
+    ``python3``, whichever that is. A symlink loop counts as absent, as it always has:
+    nothing can be read through one, and a restore heals it."""
+    try:
+        os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            return False
+        raise
+    return True
+
+
+def _backup_dir_if_present(candidate: Path) -> Path | None:
+    """The directory if it exists, else None. One that can't be checked is kept, so
+    :func:`validate_file` reports that for each target rather than reading "no backup"."""
+    try:
+        return candidate if _exists(candidate) else None
+    except OSError:
+        return candidate
+
+
+def _known_present(path: Path) -> bool:
+    """For a report, where "can't tell" is not "yes"."""
+    try:
+        return _exists(path)
+    except OSError:
+        return False
+
+
 def validate_file(
     target: CredTarget, home: Path, backup_dir: Path | None
 ) -> ValidationResult:
@@ -233,8 +268,14 @@ def validate_file(
     never provisioned ("absent", healthy — the clean degradation for installs
     without backups or without an optional file like genesis.yaml)."""
     path = home / target.path
-    if not path.exists():
-        has_backup = backup_dir is not None and (backup_dir / target.backup_rel).exists()
+    try:
+        present = _exists(path)
+        has_backup = (
+            not present and backup_dir is not None and _exists(backup_dir / target.backup_rel)
+        )
+    except OSError as exc:
+        return ValidationResult(False, "unreadable", f"could not check: {exc}")
+    if not present:
         if has_backup:
             return ValidationResult(False, "missing", f"{path} absent but backup exists")
         return ValidationResult(True, "absent", f"{path} never provisioned")
@@ -524,25 +565,23 @@ def resolve_passphrase(home: Path) -> str | None:
         return env_pass
 
     secrets = home / "genesis/secrets.env"
-    if secrets.exists():
-        try:
-            raw = secrets.read_bytes()
-        except OSError:
-            raw = b""
-        # Only trust secrets.env for the passphrase if it is NOT itself corrupt.
-        if validate_bytes("dotenv", raw, min_keys=1).ok:
-            val = _backup_passphrase_value(raw)
-            if val:
-                return val
+    try:
+        raw = secrets.read_bytes()
+    except OSError:
+        raw = b""
+    # Only trust secrets.env for the passphrase if it is NOT itself corrupt.
+    if validate_bytes("dotenv", raw, min_keys=1).ok:
+        val = _backup_passphrase_value(raw)
+        if val:
+            return val
 
     escrow = home / ".genesis/shared/guardian/backup_passphrase.env"
-    if escrow.exists():
-        try:
-            val = _backup_passphrase_value(escrow.read_bytes(), escrow=True)
-            if val:
-                return val
-        except (OSError, ValueError):
-            pass
+    try:
+        val = _backup_passphrase_value(escrow.read_bytes(), escrow=True)
+        if val:
+            return val
+    except (OSError, ValueError):
+        pass
     return None
 
 
@@ -645,7 +684,7 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.backup_dir).expanduser() if args.backup_dir
         else _default_backup_dir(home)
     )
-    backup_arg = backup_dir if backup_dir.exists() else None
+    backup_arg = _backup_dir_if_present(backup_dir)
 
     if args.cmd == "check":
         results = check_all(None, home, backup_arg)
@@ -658,7 +697,7 @@ def main(argv: list[str] | None = None) -> int:
                     "detail": r.detail,
                     "path": str(home / _targets_by_name()[name].path),
                     "backup_exists": backup_arg is not None
-                    and (backup_dir / _targets_by_name()[name].backup_rel).exists(),
+                    and _known_present(backup_dir / _targets_by_name()[name].backup_rel),
                 }
                 for name, r in results.items()
             },

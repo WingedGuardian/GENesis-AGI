@@ -83,6 +83,11 @@ _DEDUP_WINDOWS: dict[str, int] = {
     # same-batch protection while letting distinct batches through is the cleaner
     # future refinement; it needs a governance change, not a window value.)
     "critical_observation": 0,
+    # Stopped-background-session pages (outreach.stopped_sessions, fixed topic,
+    # hourly). The per-row cc_sessions.outcome_paged_at stamp already keeps a
+    # stop from paging twice; the 24h default would drop every page after the
+    # first of the day.
+    "stopped_background_sessions": 0,
     # Task lifecycle notifications — never dedup. Each is a distinct status
     # event for one task (topic = "Task <id>"), and every _notify call site
     # fires at most once per path. Without this they fell through to the 24h
@@ -124,6 +129,10 @@ _TOPIC_IS_IDENTITY: frozenset[str] = frozenset(
         "career_outreach_nudged",
         "peer_message",  # addressed message identity, never fuzzy body identity
         "peer_api_health",  # incident + phase is the notification identity
+        # topic = "direct_session_fail:<session id>" (cc/direct_session.py
+        # _notify): one owner-requested failure, never fuzzy body identity, so
+        # two fast failures with the same error body both page at once.
+        "direct_session_fail",
     }
 )
 

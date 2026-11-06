@@ -1578,6 +1578,7 @@ class InboxMonitor:
             # stamped external and barred by the user-model consumer gate.
             origin=ORIGIN_EXTERNAL_UNTRUSTED,
             caller_tag="inbox.eval",
+            report_status=True,
         )
 
     async def _set_drop_status(
