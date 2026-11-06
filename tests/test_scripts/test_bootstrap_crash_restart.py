@@ -1075,7 +1075,11 @@ def test_bootstrap_keeps_the_state_until_it_can_write_the_record(tmp_path):
 
 def _prior_state_conversion(text: str) -> str:
     start = text.index("# END prior-state-guard\n")
-    return text[start : text.index('\necho ""\necho "  Genesis Update"', start)] + "\n"
+    body = text[start : text.index('\necho ""\necho "  Genesis Update"', start)] + "\n"
+    # The OS-floor refusal sits between the guard and the conversion; it reads
+    # SCRIPT_DIR and has its own test (test_update_os_floor.py), so it is cut
+    # out here rather than set up.
+    return re.sub(r"# BEGIN os-floor[^\n]*\n.*?# END os-floor\n", "", body, flags=re.DOTALL)
 
 
 @pytest.mark.parametrize(

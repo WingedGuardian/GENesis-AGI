@@ -2,9 +2,11 @@
 
 ## Prerequisites
 
-- **OS**: Ubuntu 22.04+, tested on 24.04 and 26.04. CI's default runner, now 26.04, runs
-  the full suite and a fresh install, and a pinned 24.04 job runs the OS-sensitive tests.
-  The container `host-setup.sh` creates is 24.04, whatever the host runs.
+- **OS**: Ubuntu 24.04+ (glibc 2.38 or newer) on x86_64 or aarch64; the graph
+  engine's wheels are built for nothing else. Tested on 24.04 and 26.04: CI's default
+  runner, now 26.04, runs the full suite and a fresh install, and a pinned 24.04 job runs
+  the OS-sensitive tests. The container `host-setup.sh` creates is 24.04, whatever the
+  host runs.
 - **Python**: 3.12. A host whose only `python3` is 3.13 or 3.14 (Ubuntu 26.04 ships 3.14)
   gets 3.12 from [uv](https://docs.astral.sh/uv/) during setup, with no package
   source added, and each update that applies a change moves it to the latest patch the
@@ -75,93 +77,71 @@ Staging does not activate a provider or change the indexing queue.
   docker run -d --name qdrant -p 6333:6333 qdrant/qdrant
   ```
 - **Ollama**: Local embeddings. Set `OLLAMA_URL` in secrets.env.
-- **FalkorDB graph engine**: see below. `bootstrap.sh` fetches the engine
-  module; the `redis-server` that runs it is a manual step.
+- **FalkorDB graph engine**: see below. It installs with Genesis; there is no
+  separate step.
 
 Genesis degrades gracefully without these — it falls back to FTS5 text search
 and cloud embeddings.
 
 ### Graph engine (FalkorDB)
 
-Optional. FalkorDB is a Redis module. `bootstrap.sh` fetches the module (one
-file under `~/.genesis/deps`, verified against a pinned digest) and writes the
-`genesis-falkordb` user unit, **left disabled**. It does **not** install the
-`redis-server` that loads the module: the module refuses anything below 8.0.0,
-Ubuntu/Debian stable ship 7.x, so it comes from Redis's upstream apt repository,
-and adding a third-party repository to your machine is your call. (Automated
-provisioning is tracked in issue #2827.) `GENESIS_FALKORDB_PROVISION_DISABLED=1`
-skips the module fetch too.
+Optional to use, installed by default. FalkorDB is a Redis module, and the whole
+engine (a `redis-server`, `redis-cli` and the FalkorDB module) ships as one pip
+wheel, `falkordblite`, installed into Genesis's venv with the rest of its
+dependencies. There is no apt repository to add and no system `redis-server` to
+install. `install.sh` and `bootstrap.sh` install that wheel first, pinned by
+version and by the sha256 of each wheel file
+(`scripts/lib/falkordb-requirements.txt`, `pip --require-hashes`). They then
+check every engine file in the venv against digests committed in this repo
+(`scripts/lib/falkordb-engine-digests.txt`, generated from the pinned wheel
+files, never from the installed wheel's own record), copy the engine to
+`~/.genesis/deps/falkordb/<version>-<wheel tag>/`, re-check the copy, and write
+the `genesis-falkordb` user unit, **left disabled**, pointing at that copy. The
+unit re-checks the copy's digests every time it starts. The engine never runs
+from the venv, so a later install into the venv cannot change what it runs, and
+a new pin lands in a new directory beside the running one. Copies no unit runs
+are removed by the next `bootstrap.sh`. `GENESIS_FALKORDB_PROVISION_DISABLED=1`
+skips all of it.
+
+Moving the pin means regenerating the committed digests from the new wheel
+files, in the same change (the command is in the file's header).
+
+The wheels are built for glibc 2.38 or newer on x86_64 or aarch64, which is why
+Ubuntu 24.04 on one of those machines is the supported floor. On an older OS
+(Ubuntu 22.04, Debian 12) or another architecture, `install.sh` and
+`bootstrap.sh` refuse in one line before installing anything, and `update.sh`
+before fetching. An existing install below the floor gets that refusal from the
+update after the one that ships this check: that first update still runs its old
+`update.sh`, which merges, then rolls back when the new bootstrap refuses.
 
 The memory graph uses the engine only when `config/graphstore.yaml` selects
-`mode: falkordb`; the default is `networkx`, so an install that skips all of
-this loses nothing.
-
-**If this machine already runs `redis-server`**, adding the upstream repository
-upgrades it to 8.x on your next `apt upgrade`. Check first:
+`mode: falkordb`; the default is `networkx`, so an install that never arms it
+loses nothing. To arm it:
 
 ```bash
-dpkg-query -W -f='${Status} ${Version}\n' redis-server
-command -v redis-server valkey-server
+systemctl --user enable --now genesis-falkordb
+systemctl --user status genesis-falkordb
 ```
 
-To set it up (Ubuntu, Debian, and derivatives that declare `UBUNTU_CODENAME`):
+**An engine that is already running is never switched by an update.** If yours
+runs an older module (for example one an earlier Genesis fetched under
+`~/.genesis/deps`, with a `redis-server` from the upstream apt repository), the
+update keeps its unit as it is and says so. Switch it to the bundled engine
+deliberately, when it suits you:
 
-1. Fetch Redis's signing key and **verify its fingerprint before trusting it**.
-   Redis's apt documentation publishes none; the expected value below is the
-   key `packages.redis.io/gpg` served on 2026-10-03, cross-checked against
-   independent third-party pins of the same repository.
+```bash
+GENESIS_FALKORDB_SWITCH=1 ./scripts/bootstrap.sh
+systemctl --user restart genesis-falkordb
+```
 
-   ```bash
-   sudo apt-get install -y curl gpg
-   curl -fsSL https://packages.redis.io/gpg -o redis.gpg
-   gpg --show-keys --with-colons redis.gpg | grep -c '^pub:'
-   # must print: 1
-   gpg --show-keys --with-colons redis.gpg | awk -F: '$1 == "fpr" {print $10; exit}'
-   # must print: 54318FA4052D1E61A6B6F7BB5F4349D6BF53AA0C
-   ```
+After switching, a `redis-server` you installed only for Genesis is no longer
+used by it; removing it, its apt source and its key is your call.
 
-   Anything else — more than one key, or a different fingerprint — stop here.
+The bundled Redis 8 is tri-licensed (RSALv2 / SSPLv1 / AGPLv3). Running it
+unmodified places no obligation on your own code.
 
-2. Install the key and the source, then confirm apt now offers 8.0.0 or newer:
-
-   ```bash
-   sudo install -d -m 0755 /etc/apt/keyrings
-   sudo gpg --yes --dearmor -o /etc/apt/keyrings/redis-archive-keyring.gpg redis.gpg
-   sudo chmod 644 /etc/apt/keyrings/redis-archive-keyring.gpg
-   rm redis.gpg
-   suite="$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")"
-   echo "deb [signed-by=/etc/apt/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $suite main" | sudo tee /etc/apt/sources.list.d/redis.list
-   sudo apt-get update
-   apt-cache policy redis-server   # Candidate: must be 8.0.0 or newer
-   sudo apt-get install -y redis-server
-   ```
-
-3. The package enables a **system** redis on TCP port 6379. Genesis does not use
-   it — its unit is a per-user instance with no TCP port, reached over a unix
-   socket in `~/.genesis/falkordb`. Unless you use that system redis yourself:
-
-   ```bash
-   sudo systemctl disable --now redis-server
-   ```
-
-4. Re-run `./scripts/bootstrap.sh`: it fetches the module if it is not already
-   there, and re-renders the unit with the `redis-server` path it now finds.
-   Then arm it:
-
-   ```bash
-   systemctl --user enable --now genesis-falkordb
-   systemctl --user status genesis-falkordb
-   ```
-
-Redis 8 is tri-licensed (RSALv2 / SSPLv1 / AGPLv3) rather than the plain BSD of
-the 7.x in your distro. Running it unmodified places no obligation on your own
-code, but you are the one installing it.
-
-Uninstall disables the unit and removes the module with `~/.genesis`. It never
-touches the `redis-server` package, the apt source, or the key you added; to
-remove those, `sudo apt-get purge redis-server` and delete
-`/etc/apt/sources.list.d/redis.list` and
-`/etc/apt/keyrings/redis-archive-keyring.gpg`.
+Uninstall disables the unit; the engine leaves with the venv, and its copies under
+`~/.genesis/deps/falkordb` with the runtime state in `~/.genesis`.
 
 ## Post-Install Configuration
 

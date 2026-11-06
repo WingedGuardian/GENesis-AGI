@@ -276,6 +276,31 @@ docs (2026-09-07): only the NAMED-PATH form works for hop-wise filtering, the
 engine has NO temporal types despite its own documentation listing them, and a
 loading engine answers `BusyLoadingError` — which is unavailable, never empty.
 Acceptance: 400 live roots replayed through both stores, 0 node-set differences.
+The engine itself (redis-server, redis-cli and the FalkorDB module) is the
+hash-pinned `falkordblite` wheel, installed into Genesis's venv by
+`scripts/lib/falkordb_install.sh` before the editable install. The unit never
+runs it from the venv: `scripts/lib/falkordb_engine_check.py` checks every
+engine file against digests COMMITTED in `scripts/lib/falkordb-engine-digests.txt`
+(generated from the pinned wheel files and regenerated on every pin bump; the
+installed wheel's RECORD is not trusted, since pip does not re-verify an
+installed wheel), copies them to `~/.genesis/deps/falkordb/<version>-<wheel
+tag>/`, re-checks the copy and writes its `engine.sha256`, which the unit
+re-checks on every start (a drift check; the sandbox is best-effort, so the
+provision-time re-verify is the integrity check that holds). The
+version-tag directory means a pin bump never replaces a running engine's files;
+`bootstrap.sh` removes copies no unit loads (none while the unit has a drop-in),
+and a copy another account could write is rebuilt, never reused. If the
+hash-pinned package does not install, `bootstrap.sh` stops before the package
+install and `install.sh` skips it, so the engine is never fetched without its
+hashes. It needs glibc 2.38+ (Ubuntu 24.04)
+on x86_64 or aarch64, and `install.sh` and `bootstrap.sh` refuse anything else
+before installing it; `update.sh` refuses before fetching once it runs code that
+carries this check (the first update to it runs the old `update.sh`, which merges,
+then rolls back when bootstrap refuses). The unit is `Type=simple` with a PING readiness
+poll, because the wheel's redis has no libsystemd to notify with, and a deploy
+moves an engine onto a different module only when systemd reports it inactive
+or failed (a running engine, or one whose state cannot be read, keeps its unit)
+or `GENESIS_FALKORDB_SWITCH=1` asks for it.
 The FalkorDB projection is rebuilt hourly by `genesis-graph-project.timer`
 (`memory/graphstore_project.py`); that schedule is its staleness bound. The
 engine keeps no data on disk, so its unit also (re)starts the projector on
