@@ -91,7 +91,7 @@ class ProviderActivityTracker:
             except RuntimeError:
                 return
         try:
-            from genesis.db.request_database import spawn_database_task
+            from genesis.db.request_database import DatabaseScopeError, spawn_database_task
             from genesis.observability.types import Subsystem
 
             self._flush_task = spawn_database_task(
@@ -99,14 +99,18 @@ class ProviderActivityTracker:
                 name="activity-log-flush",
                 subsystem=Subsystem.OBSERVABILITY,
             )
-        except RuntimeError:
-            logger.debug("Cannot schedule activity flush — event loop closed")
         except ImportError:
             # tracked_task not available (e.g., minimal test env)
             try:
                 self._flush_task = self._loop.create_task(self._flush_to_db())
             except RuntimeError:
                 logger.debug("Cannot schedule activity flush — event loop closed")
+
+        except DatabaseScopeError:
+            # Refusal closes the coroutine before it can consume the batch.
+            logger.debug("Activity flush refused by database admission; batch retained")
+        except RuntimeError:
+            logger.debug("Cannot schedule activity flush — event loop closed")
 
     async def _flush_to_db(self) -> None:
         """Write batched records to activity_log table."""

@@ -62,3 +62,34 @@ Focused scratch-database coverage lives in
 controls assert the known interfering outcomes alongside the isolated outcomes;
 a shared physical connection cannot meet the isolation contract. These primitive tests are not shared-service activation
 or production qualification evidence.
+
+## Detached work and admission
+
+`spawn_database_task(db, coroutine, ...)` uses a fresh independent unit for a
+`RequestDatabase`; legacy connections retain their tracked-task behavior. To
+allow detached work, explicitly configure both `max_background_units` and
+`max_background_jobs` as positive integers. Without both budgets, spawning is a
+configuration error. `max_units` remains the foreground limit; the total physical
+connection bound is `max_units + max_background_units` when background work is
+enabled. Neither pool releases capacity until physical closure is confirmed.
+
+Background jobs retain their whole-job unit, including non-database work.
+Accepted jobs wait for background capacity without the foreground checkout
+timeout. Queued plus running jobs are bounded synchronously before scheduling;
+overflow raises `BackgroundTaskCapacityError` and closes the unstarted coroutine.
+This bounds task count, not retained payload bytes or SQLite disk contention.
+It is not a durable queue: cancellation, SQL failure, or shutdown can prevent an
+accepted job from completing. Shutdown refuses new work and cancels/drains both
+pools under the existing owner registry.
+
+Recall queue pressure falls back to a fresh inline coroutine in both candidate
+and zero-hit branches. Shutdown refusal does not request inline resource use.
+Best-effort observations tolerate admission refusal; provider activity retains
+its batch for the next record and plan bookmarks retain their pending marker.
+Programming/configuration errors are not treated as capacity pressure. The first
+service factory must explicitly budget both pools before wiring this facade.
+
+Admission and producer regressions are covered in
+`tests/test_db/test_background_admission.py`,
+`tests/test_db/test_request_database_tasks.py`, and
+`tests/test_memory/test_recall_deferral.py`.
