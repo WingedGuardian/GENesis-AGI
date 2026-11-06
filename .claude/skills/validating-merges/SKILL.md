@@ -82,6 +82,12 @@ they cannot promote or dispatch them. Memory writes retain the existing
 collection/supersedes interface and partial-failure limits. Do not write memory
 to manufacture a verification result when that memory store is under test.
 
+**One evidence claim per declared claim** applies to Codex exactly as to any
+validator (see the `claims[]` rule under Evidence). MEASURED in the Codex
+validator calibration, 2026-11-05: 14 of 14 documents carried one claim against 3
+to 14 in the blind ground truth, and 6 of them derived `pass-mechanical` on rows
+whose ground truth had gaps.
+
 **Never deploy, change a service, push, merge or fix code.** The deploy recipes
 and Host-Deploy Gate below describe the Claude operator's responsibilities.
 For Codex, a row waiting on deployment is NOT-YET-DONE: leave it open and note
@@ -271,9 +277,9 @@ meaning anything. Keep it RARE.
 
 **The same test applies to a gap.** NOT-YET-DONE is never a gap that a closing
 verdict can carry: do not write a reachable-but-skipped step (a test file you did
-not run, a probe skipped for cost) into `scope_limits` and close. Run it, or
-leave the row open. The tool cannot tell these apart, because both are prose in
-`scope_limits`, so the discipline is yours. Instance, one backlog run: a keyword
+not run, a probe skipped for cost) as a `method` gap and close. Record it as a
+`not_yet_done` gap, which keeps the row open, or run it. The tool trusts the
+`kind` you choose, so the discipline is still yours. Instance, one backlog run: a keyword
 scan of the 158 gaps on its 85 gap-carrying closed rows flagged 20 as test files
 or probes that were skipped, not hand-checked one by one.
 
@@ -459,6 +465,12 @@ because each pilot broke a field the obvious version would have had:
   `unverified` goes with `NOT_VERIFIABLE_HERE` and only with it: the model refuses
   either without the other, so a claim nobody could check is never written down as
   a pass or as a failure.
+  **List every claim the PR makes, one entry each:** every behaviour its body
+  promises, its `E2E:` line, and each behaviour the merged diff changes (behaviours,
+  not files). Each gets its own control. Never drop one and never fold it into a
+  neighbour, because `pass-mechanical` asserts that nothing was left out. A claim
+  this install cannot reach is `NOT_VERIFIABLE_HERE`. A claim you could have run
+  but did not is a `not_yet_done` gap with its `command`, which keeps the row open.
 - **`controls[]`** — a reader cannot distinguish a non-vacuous verification from
   a vacuous one without them. A document with none can still close, but never as
   `pass-mechanical`: "no negative control" becomes a named gap.

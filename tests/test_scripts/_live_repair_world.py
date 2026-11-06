@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import time
@@ -401,8 +402,97 @@ def _gc(w: World) -> None:
          "--prune=now")  # fmt: skip
 
 
+def age_locks(w: World) -> None:
+    """The killed switch's locks, aged past LOCK_FRESH_S: a lock left by an
+    earlier kill. Wherever this user runs a process whose fds cannot be read
+    (a CI runner, a systemd-user install) a FRESH lock counts as held, and the
+    repair waits it out in real time: about 30 s per test (MEASURED here, 30.7 s
+    fresh against 0.6 s aged). No test in this file is about a fresh git lock."""
+    old = time.time() - 3600
+    for lock in (w.root / ".git").rglob("*.lock"):
+        os.utime(lock, (old, old))
+
+
+def _as_index(entry) -> list[tuple[str, str, str]]:
+    return [(entry[0], entry[1], "0")] if entry else []
+
+
+def _parents(p: str) -> list[str]:
+    out, d = [], os.path.dirname(p)
+    while d:
+        out.append(d)
+        d = os.path.dirname(d)
+    return out
+
+
+def reapply_step(repo: str, backup: str, row: dict, below: list[str] | tuple = ()) -> str:
+    """TEST ORACLE ONLY: the writer's shell step (deleted from the writer, #3868),
+    kept so these tests can put a report's saved state back by hand until the
+    real restore (#3492 B2b) replaces it. Never run outside a scratch world: it
+    runs `rm -rf` unconditionally."""
+    q, path = shlex.quote, row["path"]
+    dst = os.path.join(repo, path)
+    steps = []
+    if [tuple(e) for e in row["index"]] != _as_index(row["tag"]):
+        for rel in row.get("blobs") or []:
+            blob = q(os.path.join(backup, rel))
+            steps.append(f"git -C {q(repo)} hash-object -w --no-filters -- {blob} >/dev/null")
+        null = "0" * len((row["index"] or [row["tag"]])[0][1])
+        stage0 = any(s == "0" for _m, _o, s in row["index"])
+        drops = [*below, path] if stage0 else [path]
+        recs = [f"0 {null}\t{d}" for d in drops]
+        recs += [f"{m} {o} {s}\t{path}" for m, o, s in row["index"]]
+        fields = " ".join(q(r) for r in recs)
+        steps.append(f"printf '%s\\0' {fields} | git -C {q(repo)} update-index -z --index-info")
+    parent = row.get("unreachable_through")
+    if parent and row["disk_changed"]:
+        note = (
+            f"{path} was not reachable through {parent} (a symlink or non-directory);"
+            " only its index state is re-applied"
+        )
+        steps.append(f"echo {q(note)} >&2")
+    elif row["disk_changed"]:
+        steps.append(f"rm -rf -- {q(dst)}")
+        special = row.get("special")
+        if row["saved_as"]:
+            src = os.path.join(backup, row["saved_as"])
+            steps += [f"mkdir -p -- {q(os.path.dirname(dst))}", f"cp -a -- {q(src)} {q(dst)}"]
+        elif special and special["type"] == "fifo":
+            steps.append(f"mkdir -p -- {q(os.path.dirname(dst))}")
+            steps.append(f"mkfifo -m {special['mode']} -- {q(dst)}")
+        elif special:
+            gone = (
+                f"{path} was a {special['type']} (mode {special['mode']}); it held nothing"
+                " to save, so whatever made it must make it again"
+            )
+            steps.append(f"echo {q(gone)} >&2")
+    flag = row["flag"]
+    if flag and flag in "Ss":
+        steps.append(f"git -C {q(repo)} update-index --skip-worktree -- {q(path)}")
+    if flag and flag.islower():
+        steps.append(f"git -C {q(repo)} update-index --assume-unchanged -- {q(path)}")
+    return " && ".join(steps)
+
+
+def reapply_steps(w: World) -> list[str]:
+    """TEST ORACLE ONLY: the steps the writer used to store in `reapply`, built
+    from the newest report as it built them (parents first; ``below`` from
+    rows that re-add what they held, or held nothing)."""
+    report, backup = w.report(), str(w.backups()[-1])
+    below: dict[str, list[str]] = {}
+    for r in report["paths"]:
+        if r["class"] != "foreign" and r["index"]:
+            continue
+        for d in _parents(r["path"]):
+            below.setdefault(d, []).append(r["path"])
+    foreign = sorted(
+        (r for r in report["paths"] if r["class"] == "foreign"), key=lambda r: r["path"].split("/")
+    )
+    return [reapply_step(str(w.root), backup, r, below.get(r["path"], ())) for r in foreign]
+
+
 def _run_steps(w: World) -> None:
-    for step in w.report()["reapply"]:
+    for step in reapply_steps(w):
         r = subprocess.run(["bash", "-c", step], capture_output=True, text=True, env=w.env())
         assert r.returncode == 0, step + "\n" + r.stderr
 

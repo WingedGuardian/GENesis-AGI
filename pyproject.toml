@@ -108,6 +108,10 @@ test = [
     "pytest>=8.0",
     "pytest-asyncio",
     "pytest-timeout",
+    # Parallel runs (`-n`). CI's `test` job is still serial; the parallel-CI
+    # work lands the fixes that make a parallel run report what a serial one
+    # does before any job passes `-n`.
+    "pytest-xdist",
     # Property tests exercise hook-output budget invariants across Unicode edges.
     "hypothesis>=6.0",
     "aioresponses>=0.7.7",
