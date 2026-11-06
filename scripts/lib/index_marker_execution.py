@@ -698,6 +698,8 @@ def dispatch(args, api, proof):
     else:
         result = operation(value)
     print(json.dumps(str(result) if args.cmd == "remember-native-event" else result, ensure_ascii=True))
-    if args.cmd in ("reserve-launch", "register-scope", "begin-native", "cancel-launch"):
-        return 0 if result in ("reserved", "registered", "started", "cancelled") else 1
+    success = {"reserve-launch": "reserved", "register-scope": "registered",
+               "begin-native": "started", "cancel-launch": "cancelled"}
+    if args.cmd in success:
+        return 0 if result == success[args.cmd] else 1
     return 1 if result is None else 0

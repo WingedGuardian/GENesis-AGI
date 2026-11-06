@@ -702,6 +702,8 @@ An identical repeat returns `already_reserved` / `already_started`, CLI status 1
 it never grants another launch. A lost acknowledgment cannot authorize a resend.
 Cancellation cannot undo spent intent. Protocol-2 scalar settlement refuses
 protocol-3 contexts.
+Replaying `reserve-launch` after cancellation returns `cancelled` with CLI
+status 1; only `cancel-launch` treats that result as command success.
 
 All modern enqueue and outcome publishers hold the shared side of the existing
 `.queue.lock` through database commit or file-plus-directory synchronization.

@@ -337,3 +337,51 @@ def test_actual_cli_journal_e2e_never_reissues_permit_or_replays_native_work(que
     status = json.loads(run("execution-status").stdout)
     assert status["completion_kind"] == "success" and not status["evidence_pending"]
     assert queue.get_inflight(claimed["context"]["hash"]) is None
+
+
+@pytest.mark.parametrize("command,success", [
+    ("reserve-launch", "reserved"), ("register-scope", "registered"),
+    ("begin-native", "started"), ("cancel-launch", "cancelled"),
+])
+@pytest.mark.parametrize("result", [
+    "reserved", "registered", "started", "cancelled", "already_reserved",
+    "already_registered", "already_started", "spent", None,
+])
+def test_native_cli_success_is_specific_to_the_requested_operation(
+    queue, capsys, command, success, result
+):
+    from types import SimpleNamespace
+
+    args = SimpleNamespace(cmd=command, context="{}", data="{}")
+    api = {command.replace("-", "_"): lambda *unused: result}
+    status = queue._native.dispatch(args, api, queue._proof)
+    assert status == (0 if result == success else 1)
+    assert json.loads(capsys.readouterr().out) == result
+
+
+@pytest.mark.parametrize("reserved_first", [False, True])
+def test_actual_cli_cancelled_reservation_never_returns_a_launch_permit(
+    queue, tmp_path, reserved_first
+):
+    claimed = _claim(queue, tmp_path)
+    reservation = _reservation(claimed)
+    if reserved_first:
+        assert _reserve(queue, claimed, reservation) == "reserved"
+    argv = [sys.executable, "-I", str(SCRIPT)]
+    context = json.dumps(claimed["context"])
+    cancelled = subprocess.run(
+        [*argv, "cancel-launch", "--context", context],
+        env=dict(os.environ), capture_output=True, timeout=20,
+    )
+    assert cancelled.returncode == 0, cancelled.stderr
+    assert json.loads(cancelled.stdout) == "cancelled"
+    replay = subprocess.run(
+        [*argv, "reserve-launch", "--context", context,
+         "--data", json.dumps(reservation)],
+        env=dict(os.environ), capture_output=True, timeout=20,
+    )
+    assert replay.returncode == 1, replay.stderr
+    assert json.loads(replay.stdout) == "cancelled"
+    assert queue.execution_status(claimed["context"])["launch_permission"] == "cancelled"
+    with pytest.raises(RuntimeError, match="open launch reservation"):
+        _register(queue, claimed)
