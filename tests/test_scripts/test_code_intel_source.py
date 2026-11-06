@@ -14,6 +14,10 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_scripts.test_code_intel_execution import evidence as evidence
+from tests.test_scripts.test_code_intel_execution import scope as scope
+from tests.test_scripts.test_index_marker_fresh_cleanup import _historical
+
 ROOT = Path(__file__).resolve().parents[2]
 SELF = "scripts/lib/code_intel_source.py"
 PYTHON = (
@@ -24,6 +28,7 @@ PYTHON = (
     "scripts/lib/code_intel_cbm_worker.py",
     "scripts/lib/codebase_managed_unit.py",
     "scripts/lib/code_intel_execution.py",
+    "scripts/lib/code_intel_scope.py",
     "scripts/lib/index_marker_legacy.py",
     "scripts/lib/index_marker_legs.py",
     "scripts/lib/index_marker_execution.py",
@@ -43,6 +48,7 @@ ALIASES = (
     "code_intel_cbm_worker",
     "codebase_managed_unit",
     "_genesis_code_intel_execution",
+    "_genesis_code_intel_scope",
     "_genesis_index_marker_legacy",
     "_genesis_index_marker_legs",
     "_genesis_index_marker_execution",
@@ -100,6 +106,34 @@ def case(tmp_path, monkeypatch, profile="entry", object_format="sha1"):
     module.__dict__["_ENTRY_BYTES"] = raw
     exec(compile(raw, str(root / SELF), "exec", dont_inherit=True), module.__dict__)  # noqa: S102 - trusted fixture bytes
     return root, module, module.capture(root, profile, raw)
+
+
+def test_captured_fresh_scope_and_cli_survive_deleted_checkout(
+    tmp_path, monkeypatch, scope, capsys
+):
+    root, _, captured = case(tmp_path, monkeypatch, "runner")
+    loaded = captured.assemble()
+    queue = loaded["queue"]
+    assert queue._cli is loaded["cli"]
+    claimed, _, leaf, _, _ = _historical(
+        queue, scope, loaded["proof"].__dict__, monkeypatch
+    )
+    # Delete the independently declared inventory, so omitting the scope from
+    # capture cannot leave an on-disk fallback that makes this probe pass.
+    for name in (*PYTHON, *SHELL, "scripts/code_intel_runner.sh"):
+        (root / name).unlink()
+    assert not captured.current_matches()
+    (leaf / "memory.events").write_text("low 0\nhigh 0\nmax 1\noom 1\noom_kill 1\n")
+    sibling = queue.claim_native(claimed["context"]["hash"], provider="gitnexus")
+    assert sibling
+    capsys.readouterr()
+    assert queue.main(["execution-status", "--context", json.dumps(claimed["context"])]) == 0
+    status = json.loads(capsys.readouterr().out)
+    assert status["safety_kind"] == "resource" and status["evidence_pending"] is True
+    assert status["typed_applied_state"] == "consumed" and status["typed_charged_attempts"] == 0
+    assert status["cleanup_invalidated"] == 1
+    assert queue.apply_native(claimed["context"]) == "consumed"
+    assert queue.get_inflight(claimed["context"]["hash"])["claim_id"] == sibling["context"]["claim_id"]
 
 
 @pytest.mark.parametrize("profile", ["entry", "runner"])

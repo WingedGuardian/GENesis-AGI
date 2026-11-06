@@ -560,6 +560,7 @@ _RELOAD = (
     "scripts/lib/index_marker_legs.py",
     "scripts/lib/index_marker_execution.py",
     "scripts/lib/code_intel_execution.py",
+    "scripts/lib/code_intel_scope.py",
     "scripts/lib/code_intel_cbm_admission.py",
     "scripts/hooks/worktree_claim.py",
     "scripts/hooks/secret_scrub.py",

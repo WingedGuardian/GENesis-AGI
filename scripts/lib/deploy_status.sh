@@ -30,6 +30,7 @@ _RUNTIME_RELOAD_SCRIPTS=(
     scripts/lib/index_marker_legs.py # retained provider-leg transactions on that connection
     scripts/lib/index_marker_execution.py # retained native journal transactions on that connection
     scripts/lib/code_intel_execution.py # retained report validator imported by the queue
+    scripts/lib/code_intel_scope.py # retained original-lifetime collector loaded by queue gates
     scripts/lib/code_intel_cbm_admission.py # retained by that report validator as well as fresh managed calls
     scripts/hooks/worktree_claim.py  # loaded at import by observability/worktree_ownership_config.py
 )

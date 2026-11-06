@@ -100,6 +100,9 @@ def test_commit_busy_retains_native_event_after_transaction_rollback(
     monkeypatch.setattr(queue._native, "record", record)
     # The reader is held until the call returns, so no timing race is involved.
     api = queue.remember_native_event.__globals__
+    # These synthetic prior-boot rows isolate durable publication, not fresh
+    # kernel ownership. A different real boot is otherwise valid G proof.
+    monkeypatch.setitem(api, "_fresh_cleanup", lambda db, row: False)
     monkeypatch.setitem(api, "OUTCOME_LOCK_WAIT_S", 0.1)
     real_sync = api["_fsync_dir"]
 
@@ -202,7 +205,9 @@ def test_duplicate_receipt_timestamp_is_not_a_conflicting_terminal(queue, tmp_pa
     assert status["terminal"]["recorded_at"] == 1000
 
 
-def test_late_disproof_never_refunds_or_reapplies_completed_work(queue, tmp_path):
+def test_late_disproof_never_refunds_or_reapplies_completed_work(queue, tmp_path, monkeypatch):
+    # No current original-kernel proof is supplied by this journal fixture.
+    monkeypatch.setitem(queue.claim_native.__globals__, "_fresh_cleanup", lambda db, row: False)
     claimed = _started(queue, tmp_path, mode="full")
     original = _terminal(claimed)
     _event(queue, claimed, "terminal", original)

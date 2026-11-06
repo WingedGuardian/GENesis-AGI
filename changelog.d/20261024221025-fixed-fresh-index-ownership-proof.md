@@ -1,0 +1,1 @@
+- Require fresh original-scope proof before releasing disputed index ownership, retaining new owned OOM evidence without repeating completed work or clearing provider safety holds. Automatic indexing remains fenced.

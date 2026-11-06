@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import runpy
 import signal
 import stat
@@ -20,6 +21,8 @@ import subprocess
 import sys
 import time
 import uuid
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 _ADMISSION = globals().get("_CAPTURED_ADMISSION")
@@ -69,29 +72,53 @@ def _identity(path: Path) -> dict:
     return {"path": str(path), "device": info.st_dev, "inode": info.st_ino}
 
 
+def mount_digest(path: Path) -> str:
+    mounts = []
+    for row in path.read_text().splitlines():
+        _, separator, right = row.partition(" - ")
+        parts = right.split()
+        if separator and parts and parts[0] == "cgroup2":
+            if len(parts) != 3 or "memory_localevents" in parts[2].split(","):
+                raise ValueError("hierarchical memory events unavailable")
+            mounts.append(row)
+    if not mounts:
+        raise ValueError("hierarchical v2 proof required")
+    return hashlib.sha256("\n".join(sorted(mounts)).encode()).hexdigest()
+
+
 class ScopeProbe:
     """Read actual scope proof; proc injection is a Python fixture seam only."""
 
-    def __init__(self, unit: str, cap: int, *, proc: Path = Path("/proc")):
-        self.unit, self.cap, self.proc = unit, cap, proc
+    def __init__(self, unit: str, cap: int, *, proc: Path = Path("/proc"), route=None):
+        self.unit, self.cap, self.proc, self.route = unit, cap, proc, route
+        if route is not None:
+            if (type(route) is not tuple or len(route) != 2
+                    or not all(isinstance(value, str) for value in route)
+                    or re.fullmatch(r"[A-Za-z0-9_.\\-]+\.slice", route[1]) is None
+                    or cap != 8 * 1024**3):
+                raise ValueError("invalid queued scope route or cap")
+            expected = re.fullmatch(r"code-intel-[a-f0-9]{12}-(cbm|gitnexus)-[0-9]+", unit)
+            if expected is None or not (
+                route == ("workload", "genesis-workload.slice")
+                or (route == ("capped", "app-capped.slice") and expected[1] == "gitnexus")
+                or (route[0] == "inherit" and expected[1] == "cbm")
+            ):
+                raise ValueError("queued route does not match provider")
 
     def capture(self) -> dict:
         member_path, mount_path = self.proc / "self/cgroup", self.proc / "self/mountinfo"
-        _ADMISSION["verify_workload_scope"](
-            self.unit,
-            self_path=member_path,
-            mountinfo_path=mount_path,
-        )
+        if self.route is None:
+            _ADMISSION["verify_workload_scope"](
+                self.unit,
+                self_path=member_path,
+                mountinfo_path=mount_path,
+            )
         leaf, root, version = _ADMISSION["resolve_cgroup"](member_path, mount_path)
-        mounts = []
-        for row in mount_path.read_text().splitlines():
-            _, separator, right = row.partition(" - ")
-            parts = right.split()
-            if separator and parts and parts[0] == "cgroup2":
-                if len(parts) != 3 or "memory_localevents" in parts[2].split(","):
-                    raise ValueError("hierarchical memory events unavailable")
-                mounts.append(row)
-        if not mounts or version != 2:
+        if self.route is not None and (leaf == root or leaf.name != self.unit + ".scope"
+                                       or leaf.parent.name != self.route[1]):
+            raise ValueError("batch is outside its explicitly reserved slice and scope")
+        mounts_sha256 = mount_digest(mount_path)
+        if version != 2:
             raise ValueError("hierarchical v2 proof required")
         leaf_identity = _identity(leaf)
         memory_max = _NUMBER((leaf / "memory.max").read_text(), "memory.max")
@@ -118,7 +145,7 @@ class ScopeProbe:
             "root": _identity(root),
             "reporter": reporter,
             "membership": member_path.read_text(),
-            "mounts_sha256": hashlib.sha256("\n".join(sorted(mounts)).encode()).hexdigest(),
+            "mounts_sha256": mounts_sha256,
             "memory_max": memory_max,
             "swap_max": swap_max,
             "oom_score_adj": adjustment,
@@ -348,8 +375,45 @@ def _payload_status(child: subprocess.Popen) -> int | None:
     return child.returncode
 
 
+@dataclass(frozen=True)
+class QueuedLaunch:
+    """Internal queued seam; caller retains diagnostics separately from facts."""
+
+    baseline: dict
+    before_spawn: Callable[[dict], str]
+    after_spawn: Callable[[], None]
+    pass_fds: tuple[int, ...] = ()
+    env: dict[str, str] | None = None
+    cwd: str | None = None
+    diagnostics: list[str] = field(default_factory=list)
+
+    @classmethod
+    def _checked(cls, launch, before):
+        if not isinstance(launch, cls) or not _facts(launch.baseline):
+            raise ValueError("invalid registered baseline")
+        _complete(launch.baseline, before)
+        return launch
+
+    def _spawn(self, command, before, deadline):
+        if self.before_spawn(before) != "started":
+            raise ValueError("first committed native intent not acknowledged")
+        if time.monotonic() >= deadline:
+            raise ValueError("deadline reached after native intent")
+        return subprocess.Popen(command, close_fds=True, pass_fds=self.pass_fds,
+                                env=self.env, cwd=self.cwd)
+
+    def _released(self):
+        try:
+            self.after_spawn()
+        except Exception as error:
+            # observe already owns the child and records its creation. A release
+            # failure stays diagnostic while actual completion is still observed.
+            self.diagnostics.append(f"admission_release_failed: {type(error).__name__}: {error}")
+
+
 def observe(
-    probe: ScopeProbe, command: list[str], *, seconds: float, report_limit: int = _LIMIT
+    probe: ScopeProbe, command: list[str], *, seconds: float, report_limit: int = _LIMIT,
+    launch: QueuedLaunch | None = None,
 ) -> dict:
     """Produce facts, never classify a signal/exit code as OOM or claim cleanup.
 
@@ -377,6 +441,8 @@ def observe(
         before = probe.capture()
         if not _facts(before):
             raise ValueError("invalid scope facts")
+        if launch is not None:
+            launch = QueuedLaunch._checked(launch, before)
         finality = probe.finality(before)
         if finality is None:
             raise ValueError("scope already contains other tasks")
@@ -404,8 +470,11 @@ def observe(
             raise ValueError("complete report cannot fit")
         if time.monotonic() >= deadline:
             raise ValueError("deadline reached before launch")
-        child = subprocess.Popen(command, close_fds=True)
+        child = (subprocess.Popen(command, close_fds=True) if launch is None
+                 else launch._spawn(command, before, deadline))
         report.update(payload_started=True, outcome="uncertain")
+        if launch is not None:
+            launch._released()
         while True:
             status = _payload_status(child)
             if status is not None:
