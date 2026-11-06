@@ -274,6 +274,25 @@ def test_the_restored_mode_is_the_records_without_setuid(w):
     assert stat.S_IMODE(os.lstat(w.root / path).st_mode) == 0o750
 
 
+def test_a_restored_file_gets_its_extended_attributes_back(w):
+    """#3974 item 7: the saved copy keeps a file's user.* extended attributes
+    (the repair's _copy_xattrs), and the restore copies them back with the
+    bytes, so a restored file holds what the original did."""
+
+    def make(w):
+        path = _foreign_edit(w)
+        try:
+            os.setxattr(w.root / path, "user.genesis-test", b"kept")
+        except OSError as exc:  # tmpfs before 6.6, some overlay setups
+            pytest.skip(f"no user xattrs on this file system: {exc}")
+        return path
+
+    ts, path, before = _fresh(w, make)
+    r = _restore(w, ts)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert os.getxattr(w.root / path, "user.genesis-test") == b"kept"
+
+
 def test_the_replaced_node_is_kept_in_a_private_run_folder_before_the_write(w):
     """What the restore replaces is renamed into <deploy-backups>/<run>/aside/
     first (no copy, no temp in the checkout); the run folder is this user's

@@ -1335,6 +1335,7 @@ class _Writer:
                 _step("stage")
                 if h.hexdigest() != rec["sha256"]:
                     raise bad
+                self.rp._copy_xattrs(sfd, out)  # the saved copy kept them (#3974 item 7)
                 os.fchmod(out, int(rec["mode"], 8) & 0o777)
             finally:
                 os.close(out)
