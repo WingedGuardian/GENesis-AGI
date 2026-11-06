@@ -108,3 +108,20 @@ def outcome_of(report: FinalStatus | None) -> tuple[str | None, str | None]:
     if report.status == MALFORMED:
         return "unreported", "malformed_final_status"
     return _OUTCOME[report.status], report.reason or None
+
+
+def outcome_of_output(output) -> tuple[str | None, str | None]:
+    """The outcome a clean exit's output implies: truncation first, then the report.
+
+    A run the CLI cut off at its background-task wait ceiling, or one that never
+    sent its result event, did not finish whatever its final message says, so it
+    is ``partial`` (the same rule ``DirectSessionRunner._result`` applies).
+    Otherwise the session's own report decides (:func:`outcome_of`). Only a
+    literal ``True``/``False`` counts, so a stand-in object without these flags
+    reads as a complete run.
+    """
+    if getattr(output, "bg_truncated", False) is True:
+        return "partial", "bg_truncated"
+    if getattr(output, "result_received", True) is False:
+        return "partial", "no_result_event"
+    return outcome_of(getattr(output, "final_status", None))

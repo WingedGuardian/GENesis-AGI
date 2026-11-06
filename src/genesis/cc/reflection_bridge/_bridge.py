@@ -508,7 +508,10 @@ class CCReflectionBridge:
             return ReflectionResult(success=False, reason=output.error_message)
 
         if used_cli:
-            await self._complete(session_id, output)
+            if depth != Depth.DEEP:
+                # A DEEP run ends its row after routing (below), whose verdict
+                # can still turn it into a failure.
+                await self._complete(session_id, output)
 
             await record_last_run(
                 db,
@@ -595,6 +598,11 @@ class CCReflectionBridge:
                     await observations.mark_influenced_batch(db, list(gathered_obs_ids))
                 except Exception:
                     logger.warning("Failed to mark influenced observations", exc_info=True)
+
+        if used_cli and depth == Depth.DEEP:
+            # Output the router could not read (even after salvage) is a failed
+            # run whatever the session reported, as in the weekly jobs.
+            await self._complete(session_id, output, parse_failed=routing_failed)
 
         # 6. Send to topic — parsed-fields summary only, never raw output.text.
         # Use the salvaged JSON (deep_text) so a prose-ended deep reflection shows
@@ -837,7 +845,7 @@ class CCReflectionBridge:
         if parse_failed:
             outcome, reason = "failed", "unparseable_output"
         else:
-            outcome, reason = final_status.outcome_of(output.final_status)
+            outcome, reason = final_status.outcome_of_output(output)
         await self._session_manager.complete(
             session_id,
             cost_usd=output.cost_usd,
