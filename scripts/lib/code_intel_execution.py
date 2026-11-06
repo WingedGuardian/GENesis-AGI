@@ -22,7 +22,9 @@ import time
 import uuid
 from pathlib import Path
 
-_ADMISSION = runpy.run_path(str(Path(__file__).with_name("code_intel_cbm_admission.py")))
+_ADMISSION = globals().get("_CAPTURED_ADMISSION")
+if _ADMISSION is None:
+    _ADMISSION = runpy.run_path(str(Path(__file__).with_name("code_intel_cbm_admission.py")))
 _NUMBER = _ADMISSION["number"]
 _MAX = _ADMISSION["MAX_NUMBER"]
 _EVENTS = {"low", "high", "max", "oom", "oom_kill"}

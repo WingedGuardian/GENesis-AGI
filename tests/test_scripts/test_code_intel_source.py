@@ -1,0 +1,332 @@
+"""Captured execution bytes must survive checkout drift without being relabelled."""
+
+from __future__ import annotations
+
+import base64
+import fcntl
+import hashlib
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[2]
+SELF = "scripts/lib/code_intel_source.py"
+PYTHON = (
+    SELF,
+    "scripts/lib/managed_units.py",
+    "scripts/lib/code_intel_cbm_admission.py",
+    "src/genesis/util/systemd.py",
+    "scripts/lib/code_intel_cbm_worker.py",
+    "scripts/lib/codebase_managed_unit.py",
+    "scripts/lib/code_intel_execution.py",
+    "scripts/lib/index_marker_legacy.py",
+    "scripts/lib/index_marker_legs.py",
+    "scripts/lib/index_marker_execution.py",
+    "scripts/lib/index_marker_cli.py",
+    "scripts/lib/index_marker.py",
+    "scripts/codebase_managed.py",
+)
+SHELL = (
+    "scripts/lib/code_intel_index.sh",
+    "scripts/lib/gitnexus_version.sh",
+    "scripts/lib/proc_pressure.sh",
+)
+ALIASES = (
+    "managed_units",
+    "code_intel_cbm_admission",
+    "_genesis_util_systemd",
+    "code_intel_cbm_worker",
+    "codebase_managed_unit",
+    "_genesis_code_intel_execution",
+    "_genesis_index_marker_legacy",
+    "_genesis_index_marker_legs",
+    "_genesis_index_marker_execution",
+    "_genesis_index_marker_cli",
+    "_genesis_index_marker",
+    "_genesis_codebase_managed",
+)
+
+
+@pytest.fixture(autouse=True)
+def isolated_modules():
+    old = {name: sys.modules[name] for name in ALIASES if name in sys.modules}
+    path = sys.path[:]
+    for name in ALIASES:
+        sys.modules.pop(name, None)
+    yield
+    for name in ALIASES:
+        sys.modules.pop(name, None)
+    sys.modules.update(old)
+    sys.path[:] = path
+
+
+def case(tmp_path, monkeypatch, profile="entry", object_format="sha1"):
+    # Assert inside the test call, so an absent implementation is a real RED.
+    assert (ROOT / SELF).is_file(), "captured-source implementation is absent"
+    root = tmp_path / "checkout with 'quotes' 雪"
+    root.mkdir()
+    for name in (*PYTHON, *SHELL, "scripts/code_intel_runner.sh"):
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes((ROOT / name).read_bytes())
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    for args in (
+        ("init", "-q", "--object-format=" + object_format),
+        ("add", "."),
+        (
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-qm",
+            "fixture",
+        ),
+    ):
+        subprocess.run(["git", "-C", str(root), *args], env=env, check=True, capture_output=True)
+    monkeypatch.setenv("GENESIS_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    raw = (root / SELF).read_bytes()
+    spec = importlib.util.spec_from_file_location("_source_fixture", root / SELF)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    module.__dict__["_ENTRY_BYTES"] = raw
+    exec(compile(raw, str(root / SELF), "exec", dont_inherit=True), module.__dict__)  # noqa: S102 - trusted fixture bytes
+    return root, module, module.capture(root, profile, raw)
+
+
+@pytest.mark.parametrize("profile", ["entry", "runner"])
+@pytest.mark.parametrize("object_format", ["sha1", "sha256"])
+def test_exact_closed_inventory_commit_and_immutable_buffers(
+    tmp_path, monkeypatch, profile, object_format
+):
+    root, module, captured = case(tmp_path, monkeypatch, profile, object_format)
+    expected = {*PYTHON, *SHELL} | (
+        {"scripts/code_intel_runner.sh"} if profile == "runner" else set()
+    )
+    assert set(captured.buffers) == expected
+    assert captured.files == {
+        name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in expected
+    }
+    assert (
+        captured.commit
+        == subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"]).decode().strip()
+    )
+    with pytest.raises(TypeError):
+        captured.buffers[SELF] = b"changed"
+    assert captured.current_matches()
+    with pytest.raises(ValueError, match="profile"):
+        module.capture(root, "arbitrary", captured.buffers[SELF])
+
+
+@pytest.mark.parametrize("name", [*PYTHON, *SHELL, "scripts/code_intel_runner.sh"])
+def test_every_captured_path_drift_is_detected_without_relabelling(tmp_path, monkeypatch, name):
+    root, module, captured = case(tmp_path, monkeypatch, "runner")
+    before = dict(captured.files)
+    (root / name).write_text("raise RuntimeError('new unbound bytes')\n")
+    assert not captured.current_matches()
+    assert captured.files == before
+    if name == SELF:
+        # The already captured entry remains A, correctly bound to commit A.
+        # Disk freshness is separate; it must not relabel or discard A.
+        assert module.capture(root, "runner", captured.buffers[SELF]).files == before
+    else:
+        with pytest.raises(ValueError, match="commit|source"):
+            module.capture(root, "runner", captured.buffers[SELF])
+    loaded = captured.assemble()
+    assert loaded["worker"].BUILD == loaded["managed"].BUILD
+    assert loaded["worker"].load_managed() is loaded["managed"].__dict__
+    assert loaded["proof"]._ADMISSION is loaded["admission"].__dict__
+    assert loaded["queue"]._proof is loaded["proof"]
+    assert loaded["queue"]._cli is loaded["cli"]
+    assert root / "scripts/codebase_managed.py" == loaded["managed"].SCRIPT
+    assert loaded["unit"].systemctl_env() == loaded["systemd"].systemctl_env()
+
+
+@pytest.mark.parametrize("alias", ALIASES)
+def test_foreign_cached_module_refuses_without_replacing_it(tmp_path, monkeypatch, alias):
+    _, _, captured = case(tmp_path, monkeypatch)
+    foreign = object()
+    monkeypatch.setitem(sys.modules, alias, foreign)
+    with pytest.raises(ValueError, match="already loaded"):
+        captured.assemble()
+    assert sys.modules[alias] is foreign
+    assert all(name not in sys.modules for name in ALIASES if name != alias)
+
+
+def test_sealed_roundtrip_keeps_old_bytes_after_files_disappear(tmp_path, monkeypatch):
+    root, module, captured = case(tmp_path, monkeypatch, "runner")
+    with captured.sealed() as fd:
+        assert fcntl.fcntl(fd, fcntl.F_GET_SEALS) & module.SEALS == module.SEALS
+        os.lseek(fd, os.fstat(fd).st_size, os.SEEK_SET)
+        for name in captured.buffers:
+            (root / name).unlink()
+        restored = module.restore(fd, captured.buffers[SELF], captured.transport_sha256)
+        assert restored.files == captured.files and restored.commit == captured.commit
+        assert (
+            restored.assemble()["worker"].load_managed()["SCRIPT"]
+            == root / "scripts/codebase_managed.py"
+        )
+        for action in (
+            lambda: os.pwrite(fd, b"x", 0),
+            lambda: os.ftruncate(fd, 0),
+            lambda: os.ftruncate(fd, os.fstat(fd).st_size + 1),
+        ):
+            with pytest.raises(OSError):
+                action()
+
+
+@pytest.mark.parametrize(
+    "fault", ["unsealed", "version", "missing", "extra", "digest", "entry", "duplicate"]
+)
+def test_capsule_rejects_incomplete_or_wrong_transport(tmp_path, monkeypatch, fault):
+    _, module, captured = case(tmp_path, monkeypatch)
+    with captured.sealed() as good:
+        raw = os.pread(good, os.fstat(good).st_size, 0)
+    document = json.loads(raw)
+    if fault == "version":
+        document["version"] = 2
+    elif fault == "missing":
+        document["buffers"].pop(SHELL[0])
+    elif fault == "extra":
+        document["buffers"]["arbitrary.py"] = ""
+    elif fault == "digest":
+        document["files"][SHELL[0]] = "0" * 64
+    payload = json.dumps(document).encode()
+    if fault == "duplicate":
+        payload = b'{"version":9,' + payload[1:]
+    fd = os.memfd_create("fixture", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+    try:
+        os.write(fd, payload)
+        if fault != "unsealed":
+            fcntl.fcntl(fd, fcntl.F_ADD_SEALS, module.SEALS)
+        with pytest.raises(ValueError):
+            module.restore(
+                fd,
+                b"different entry" if fault == "entry" else captured.buffers[SELF],
+                hashlib.sha256(payload).hexdigest(),
+            )
+    finally:
+        os.close(fd)
+
+
+def test_settings_capture_is_exact_and_validation_is_preserved(tmp_path, monkeypatch):
+    root, _, captured = case(tmp_path, monkeypatch)
+    managed = captured.assemble()["managed"]
+    settings = root / "settings.json"
+    raw = b'{ "version":2,"build":"wrong" }\n'
+    settings.write_bytes(raw)
+    seen = []
+    assert managed.read_document(settings, capture=seen.append) == json.loads(raw)
+    assert seen == [raw]
+    with pytest.raises(ValueError):
+        managed.read_settings(settings, capture=seen.append)
+    assert seen == [raw, raw]  # Parsed bytes arrive before settings-schema validation.
+    settings.write_bytes(b"x" * 65537)
+    seen.clear()
+    with pytest.raises(ValueError, match="64 KiB"):
+        managed.read_document(settings, capture=seen.append)
+    assert seen == []
+
+
+def test_real_cli_bootstrap_captures_then_describes_without_queue_or_provider(
+    tmp_path, monkeypatch
+):
+    root, _, captured = case(tmp_path, monkeypatch, "runner")
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", str(root / SELF), "describe", "runner"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    value = json.loads(result.stdout)
+    assert value["files"] == captured.files and value["commit"] == captured.commit
+    assert value["automatic_authority"] is False
+    assert not (tmp_path / "state").exists()
+
+
+def test_actual_isolated_handoff_uses_capsule_after_checkout_files_disappear(tmp_path, monkeypatch):
+    root, module, captured = case(tmp_path, monkeypatch, "runner")
+    with captured.sealed() as fd:
+        for name in captured.buffers:
+            (root / name).unlink()
+        result = subprocess.run(
+            captured.resume_command(), stdin=fd, capture_output=True, text=True, check=True
+        )
+    value = json.loads(result.stdout)
+    assert value == dict(commit=captured.commit, files=captured.files, automatic_authority=False)
+    assert not (tmp_path / "state").exists()
+
+
+@pytest.mark.parametrize("drift", ["removed", "changed"])
+def test_captured_queue_cli_uses_captured_bytes_after_disk_drift(
+    tmp_path, monkeypatch, capsys, drift
+):
+    root, _, captured = case(tmp_path, monkeypatch)
+    cli = root / "scripts/lib/index_marker_cli.py"
+    if drift == "removed":
+        cli.unlink()
+    else:
+        cli.write_text("raise RuntimeError('unbound CLI bytes executed')\n")
+    loaded = captured.assemble()
+    queue = loaded["queue"]
+    assert queue._cli is loaded["cli"]
+    repo = str(root / "literal '$() 雪\n")
+    assert queue.main(["hash", "--repo", repo]) == 0
+    assert capsys.readouterr().out.strip() == queue.marker_hash(repo)
+    assert queue.main(["import-status"]) == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "absent"
+    assert not (tmp_path / "state").exists()
+
+
+def test_handoff_rejects_wrong_entry_before_compiling_it(tmp_path, monkeypatch):
+    _, module, captured = case(tmp_path, monkeypatch)
+    with captured.sealed() as good:
+        value = json.loads(os.pread(good, os.fstat(good).st_size, 0))
+    raw = b"print('unbound-entry-executed')\nraise SystemExit(0)\n"
+    value["buffers"][SELF] = base64.b64encode(raw).decode("ascii")
+    value["files"][SELF] = hashlib.sha256(raw).hexdigest()
+    fd = os.memfd_create("wrong-entry", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+    try:
+        os.write(fd, json.dumps(value).encode())
+        fcntl.fcntl(fd, fcntl.F_ADD_SEALS, module.SEALS)
+        result = subprocess.run(captured.resume_command(), stdin=fd, capture_output=True, text=True)
+        assert "unbound-entry-executed" not in result.stdout
+        assert result.returncode != 0
+    finally:
+        os.close(fd)
+
+
+@pytest.mark.parametrize("kind", ["file", "scripts-directory"])
+def test_captured_managed_origin_does_not_follow_later_symlinks(tmp_path, monkeypatch, kind):
+    root, _, captured = case(tmp_path, monkeypatch)
+    expected = root / "scripts/codebase_managed.py"
+    if kind == "file":
+        foreign = tmp_path / "foreign.py"
+        foreign.write_text("raise RuntimeError('foreign code must not execute')\n")
+        expected.unlink()
+        expected.symlink_to(foreign)
+    else:
+        moved = tmp_path / "moved-scripts"
+        (root / "scripts").rename(moved)
+        (root / "scripts").symlink_to(moved, target_is_directory=True)
+    loaded = captured.assemble()["managed"]
+    assert expected == loaded.SCRIPT
+    assert loaded.__file__ == str(expected)
+    assert loaded.runtime_config.__code__.co_filename == str(expected)
+    # Isolate source-origin policy from unrelated immutable artifact checks.
+    monkeypatch.setattr(loaded, "read_settings", lambda path, **kwargs: {"main": str(root)})
+    monkeypatch.setattr(loaded, "validate_provider_paths", lambda config: None)
+    assert loaded.runtime_config(root / "settings")["main"] == str(root)
+    foreign_main = tmp_path / "foreign-main"
+    (foreign_main / ".git").mkdir(parents=True)
+    monkeypatch.setattr(loaded, "read_settings", lambda path, **kwargs: {"main": str(foreign_main)})
+    with pytest.raises(ValueError, match="primary checkout"):
+        loaded.runtime_config(root / "settings")

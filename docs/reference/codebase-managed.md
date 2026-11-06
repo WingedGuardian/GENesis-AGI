@@ -754,6 +754,32 @@ cutover still require their separate implementation and disposable native tests.
 `automatic-ready` remains never-positive. Existing production disablement stays
 in force; isolated CLI/report fixtures are not native or production acceptance.
 
+## Captured source diagnostics
+
+`python3 -I scripts/lib/code_intel_source.py describe runner` captures the finite
+Python and shell source closure from the primary checkout, checks those bytes
+against one immutable Git commit, and describes its commit and SHA-256 file map.
+Use `entry` for the direct entrypoint closure, which does not execute the runner.
+Dirty or missing source, unsupported tree entries and foreign cached local
+modules refuse. The helper compiles its captured Python buffers with their
+original canonical origins; it does not load local bytecode caches. The managed
+settings reader can retain the exact bounded JSON buffer alongside its existing
+validation, without changing the primary-checkout or provider-path restrictions.
+
+The process-private sealed handoff binds the complete capsule digest in the
+caller's fixed bootstrap command before compiling its entry. It can retain the
+same code/file identities after a deploy removes their original paths; its
+standard input is replaced with `/dev/null` before helper assembly. A sealed
+descriptor preserves bytes and does not authenticate a producer or authorize a
+provider launch. No captured source is persisted as recovery permission.
+
+This is an explicit read-only diagnostic and a preparation API. Actual queued
+runner/watchdog execution from the captured shell buffers, supervised recovery
+and automatic readiness remain separate integration work. The command neither
+opens the queue nor activates or runs either indexer. Run it from the deployed
+primary checkout after its source has landed; a linked development worktree
+does not establish production identity or resource capacity.
+
 ## Verification
 
 The transitional SQLite contention fixture explicitly drives real claim,
