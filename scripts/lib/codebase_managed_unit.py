@@ -16,6 +16,25 @@ from code_intel_cbm_admission import _mount_path, number, resolve_cgroup
 from managed_units import stamp
 
 
+def read_document(path: Path, *, open_flags: int, capture=None) -> dict:
+    fd = os.open(path, os.O_RDONLY | open_flags)
+    with os.fdopen(fd, "rb") as stream:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("managed settings must be regular")
+        payload = stream.read(65537)
+    if len(payload) > 65536:
+        raise ValueError("managed settings exceed 64 KiB")
+    try:
+        value = json.loads(payload)
+    except RecursionError as error:
+        raise ValueError("managed JSON nesting exceeds parser limit") from error
+    if not isinstance(value, dict):
+        raise ValueError("managed settings must be an object")
+    if capture is not None:
+        capture(payload)
+    return value
+
+
 def systemctl_env() -> dict[str, str]:
     """The user-manager environment from src/genesis/util/systemd.py.
 
@@ -23,6 +42,9 @@ def systemctl_env() -> dict[str, str]:
     started with no XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS cannot reach the
     user manager, and every systemctl --user call fails.
     """
+    captured = globals().get("_CAPTURED_SYSTEMCTL_ENV")
+    if captured is not None:
+        return captured()
     spec = importlib.util.spec_from_file_location(
         "_genesis_util_systemd",
         Path(__file__).resolve().parents[2] / "src/genesis/util/systemd.py",

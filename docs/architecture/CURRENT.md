@@ -1766,6 +1766,12 @@ the shared banner is not an assertion about all concurrent sessions.
   newer inflight pointer. This is transaction storage/interpretation only:
   automatic readiness stays fenced, actual queued native production and lifetime
   reconciliation remain unwired, and kernel/production acceptance is unqualified.
+  `scripts/lib/code_intel_source.py` provides explicit captured-source diagnostics
+  and a finite assembly API: Python and shell buffers match one immutable Git
+  tree, and Python compilation/hashing use those same bytes with original origins.
+  Private sealed handoff checks its caller-bound digest before entry compilation;
+  cached local modules refuse. This is not yet the queued shell/watchdog caller
+  and supplies no new launch, recovery or automatic-readiness authority.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
   deletions; native query/client cgroup proof and orphan-scope checks precede
