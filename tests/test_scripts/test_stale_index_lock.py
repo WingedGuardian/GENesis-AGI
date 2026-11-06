@@ -335,10 +335,18 @@ def test_a_git_daemon_in_the_checkout_does_not_count(tmp_path, repo, home):
     [
         (["git", "daemon", "--base-path=/x"], True),
         (["git", "fsmonitor--daemon", "run"], True),
-        (["git", "-C", "/x", "-c", "a=b", "--no-pager", "fsmonitor--daemon", "run"], True),
+        # Only `git <daemon>` matches: a daemon behind options counts (fail closed).
+        (["git", "-C", "/x", "-c", "a=b", "--no-pager", "fsmonitor--daemon", "run"], False),
         (["git", "-C", "/daemon", "commit"], False),
         (["git", "--work-tree", "/srv/gitdaemon", "commit"], False),
-        (["git", "--git-dir", "/x", "fsmonitor--daemon", "run"], True),
+        (["git", "--git-dir", "/x", "fsmonitor--daemon", "run"], False),
+        (["git", "--attr-source", "daemon", "commit"], False),
+        (["git", "commit", "-m", "daemon"], False),
+        # A dashed builtin's arguments are its own, never a subcommand.
+        (["git-commit", "-a", "-m", "daemon", "-e"], False),
+        (["/usr/lib/git-core/git-commit", "-m", "fsmonitor--daemon"], False),
+        (["git-merge", "-m", "daemon", "x"], False),
+        (["/usr/lib/git-core/git-daemon", "--base-path=/x"], True),
         (["/usr/local/bin/git-lfs-daemon"], False),
         (["/usr/lib/git-core/git-credential-cache--daemon", "/s"], True),
         (["git", "commit", "-a"], False),
@@ -433,3 +441,20 @@ def test_a_zombie_git_does_not_block_the_heal(tmp_path, repo, home):
         zombie.wait()
     assert rc == sil.RETIRED
     assert not lock.exists()
+
+
+def test_a_relative_git_dir_after_a_relative_dash_c_counts(tmp_path, monkeypatch):
+    """/proc shows the cwd after git applied -C, so a relative --git-dir after a
+    relative -C may be meant from either; both are places."""
+    proc = tmp_path / "proc"
+    (proc / "77").mkdir(parents=True)
+    work = tmp_path / "work"
+    (work / "a").mkdir(parents=True)
+    os.symlink(work / "a", proc / "77" / "cwd")
+    (proc / "77" / "cmdline").write_bytes(
+        b"\0".join([b"git", b"-C", b"a", b"--git-dir=../r/.git", b"add", b"x"])
+    )
+    (proc / "77" / "environ").write_bytes(b"")
+    monkeypatch.setattr(sil, "_PROC", str(proc))
+    places = sil._git_places("77")
+    assert os.path.normpath(str(work / "r" / ".git")) in [os.path.normpath(x) for x in places]

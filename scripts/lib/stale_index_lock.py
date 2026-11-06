@@ -113,7 +113,10 @@ def _git_places(pid: str) -> list[str] | None:
 
     Its cwd; each ``-C`` (cumulative: a later relative one is relative to the
     earlier one); ``--git-dir``/``--work-tree`` in both ``=X`` and ``X`` forms;
-    and ``GIT_DIR``/``GIT_WORK_TREE`` in its environment. None when any of that
+    and ``GIT_DIR``/``GIT_WORK_TREE`` in its environment. A relative
+    ``--git-dir``/``--work-tree`` is joined both to the ``-C`` chain and to the
+    cwd: /proc shows the cwd AFTER git applied ``-C``, so which one git meant
+    cannot be told apart, and an extra place can only make it count. None when any of that
     cannot be read (the caller counts the process)."""
     try:
         cwd = os.readlink(f"{_PROC}/{pid}/cwd")
@@ -137,12 +140,13 @@ def _git_places(pid: str) -> list[str] | None:
             i += 2
             continue
         if arg in ("--git-dir", "--work-tree"):
-            places.append(os.path.join(base, value))
+            places += [os.path.join(base, value), os.path.join(cwd, value)]
             i += 2
             continue
         for flag in ("--git-dir=", "--work-tree="):
             if arg.startswith(flag):
-                places.append(os.path.join(base, arg[len(flag) :]))
+                value = arg[len(flag) :]
+                places += [os.path.join(base, value), os.path.join(cwd, value)]
         i += 1
     for name in ("GIT_DIR", "GIT_WORK_TREE"):
         if env.get(name):
@@ -150,8 +154,6 @@ def _git_places(pid: str) -> list[str] | None:
     return places
 
 
-#: Global options that take their value as the next argument.
-_VALUE_OPTS = frozenset(("-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix"))
 #: The long-lived daemons, as a dashed program and as a subcommand.
 _DAEMONS = frozenset(("daemon", "credential-cache--daemon", "fsmonitor--daemon"))
 
@@ -159,15 +161,20 @@ _DAEMONS = frozenset(("daemon", "credential-cache--daemon", "fsmonitor--daemon")
 def _is_daemon(argv: list[str]) -> bool:
     """A long-lived git daemon (``git daemon``, ``git fsmonitor--daemon``,
     ``git-credential-cache--daemon``): it never writes the index, and counting it
-    would block the heal for as long as it runs. Matched by exact name, the
-    subcommand being the first argument after the global options."""
+    would block the heal for as long as it runs (an install using
+    ``credential.helper=cache`` or ``core.fsmonitor`` starts one in the repo).
+
+    Only two exact shapes match: ``git <daemon>`` with the daemon as the first
+    argument, which is how git starts its own, and a dashed program named for
+    one. No option is parsed: the arguments of a dashed builtin are its own
+    (``git-commit -m daemon``), and a global option list is never complete, so
+    anything else counts as a live git. A daemon started some other way only
+    leaves the heal blocked while it runs; a writer taken for a daemon would
+    lose its lock."""
     prog = os.path.basename(argv[0])
-    if prog.startswith("git-") and prog[4:] in _DAEMONS:
-        return True
-    i = 1
-    while i < len(argv) and argv[i].startswith("-"):
-        i += 2 if argv[i] in _VALUE_OPTS else 1
-    return i < len(argv) and argv[i] in _DAEMONS
+    if prog == "git":
+        return len(argv) > 1 and argv[1] in _DAEMONS
+    return prog.startswith("git-") and prog[4:] in _DAEMONS
 
 
 def _git_in_repo(targets: set[str], alive) -> int | None:
