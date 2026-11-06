@@ -1144,12 +1144,10 @@ def _claim_active_test_breadcrumb():
     ``pytest_lock``'s HELD_ENV does the same job for the box-wide lock, and its
     tests pop it precisely so a child stops mistaking itself for the outer run.
 
-    LIMIT, stated rather than discovered later: under ``pytest-xdist`` every
-    worker is a child that inherits the owner, so all of them stand down and no
-    breadcrumb is written. The suite does not use xdist (it is not a declared
-    dependency), and a wrong name is worse than a missing one, so standing down
-    is the right direction to fail -- but a future ``-n`` would need a
-    per-worker path rather than this claim.
+    Under ``pytest-xdist`` every worker is a child that inherits the owner, so
+    no worker writes the breadcrumb. The controller owns it instead: xdist
+    re-fires ``pytest_runtest_logstart``/``logfinish`` there for every worker's
+    test, so the file lists every test in flight (see ``pytest_runtest_logfinish``).
     """
     if not os.environ.get(ACTIVE_TEST_FILE_ENV):
         return
@@ -1200,6 +1198,7 @@ def pytest_sessionstart(session):
     step failed or before the first update that ran it; a hang observed on
     2026-10-11 held the box lock for about 40 minutes in a venv without it.
     """
+    _note_real_home_at_start(session.config)
     config = session.config
     if config.pluginmanager.hasplugin("timeout"):
         return
@@ -1208,6 +1207,37 @@ def pytest_sessionstart(session):
         reporter.write_line(_NO_TIMEOUT_WARNING, yellow=True, bold=True)
     else:
         sys.stderr.write(_NO_TIMEOUT_WARNING + "\n")
+
+
+# CI only: whether the runner's real ~/.genesis existed when the run began. A test
+# that writes the real home there (the runtime bootstrap once wrote two files on
+# every local run) is named at the end instead of passing unseen. Advisory: it
+# never fails the run.
+_REAL_GENESIS_HOME = Path.home() / ".genesis"
+_REAL_GENESIS_HOME_AT_START: bool | None = None
+
+
+def _note_real_home_at_start(config) -> None:
+    global _REAL_GENESIS_HOME_AT_START
+    if os.environ.get("CI") and not hasattr(config, "workerinput"):
+        _REAL_GENESIS_HOME_AT_START = _REAL_GENESIS_HOME.exists()
+
+
+def pytest_terminal_summary(terminalreporter):
+    if _REAL_GENESIS_HOME_AT_START is not False or not _REAL_GENESIS_HOME.exists():
+        return
+    try:
+        found = sorted(str(p.relative_to(_REAL_GENESIS_HOME)) for p in _REAL_GENESIS_HOME.rglob("*"))
+    except OSError as exc:
+        found = [f"(could not list it: {exc})"]
+    terminalreporter.section("real home written during the run (advisory)", yellow=True)
+    terminalreporter.write_line(
+        f"{_REAL_GENESIS_HOME} did not exist when the run began and does now, with "
+        f"{len(found)} entries. A test (or a module imported during collection) "
+        "wrote the real home instead of a temp one:"
+    )
+    for name in found:
+        terminalreporter.write_line(f"  {name}")
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -1242,6 +1272,46 @@ def pytest_runtest_logstart(nodeid, location):
     path = os.environ.get(ACTIVE_TEST_FILE_ENV)
     if not path or not _owns_active_test_breadcrumb():
         return
+    _IN_FLIGHT[nodeid] = None
+    _write_breadcrumb(path)
+
+
+def pytest_runtest_logfinish(nodeid, location):
+    """Drop a finished test from the breadcrumb while others are still running.
+
+    Serially at most one test is in flight, and when it finishes the file is left
+    naming it, exactly as before: a crash between tests is "at or immediately
+    after" the last one to start. Under pytest-xdist the controller re-fires both
+    hooks for every worker, so up to one test per worker is in flight; the file
+    then lists them all rather than whichever worker reported last.
+    """
+    path = os.environ.get(ACTIVE_TEST_FILE_ENV)
+    if not path or not _owns_active_test_breadcrumb():
+        return
+    _IN_FLIGHT.pop(nodeid, None)
+    if _IN_FLIGHT:
+        _write_breadcrumb(path)
+
+
+# Tests started and not yet finished, in start order (a dict keeps it).
+_IN_FLIGHT: dict[str, None] = {}
+
+
+def pytest_runtest_logreport(report):
+    """A test whose pytest-xdist worker crashed never gets a logfinish: xdist
+    reports it once, with ``when="???"``. Drop it then, or every later rewrite
+    would list a dead test as still running."""
+    if report.when != "???" or report.nodeid not in _IN_FLIGHT:
+        return
+    path = os.environ.get(ACTIVE_TEST_FILE_ENV)
+    if not path or not _owns_active_test_breadcrumb():
+        return
+    _IN_FLIGHT.pop(report.nodeid, None)
+    if _IN_FLIGHT:
+        _write_breadcrumb(path)
+
+
+def _write_breadcrumb(path: str) -> None:
     try:
         # surrogateescape, and `except Exception`, because a node id is not
         # guaranteed to be encodable. On POSIX a filename carrying a non-UTF-8
@@ -1252,7 +1322,7 @@ def pytest_runtest_logstart(nodeid, location):
         # be readable after a crash; being the crash is the one outcome it may
         # not have.
         with open(path, "w", encoding="utf-8", errors="surrogateescape") as fh:
-            fh.write(f"{nodeid}\n")
+            fh.write("".join(f"{n}\n" for n in _IN_FLIGHT))
             fh.flush()
             os.fsync(fh.fileno())
     except Exception:  # noqa: BLE001 - see above: this may never fail the suite

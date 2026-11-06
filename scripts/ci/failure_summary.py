@@ -44,6 +44,7 @@ Exit: always 0. The job is already failing; this only narrates.
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 from xml.etree import ElementTree
@@ -107,6 +108,12 @@ def _fence(text: str) -> str:
     return f"{fence}{pad}{flat}{pad}{fence}"
 
 
+# The error pytest-xdist records on the test a worker was running when it died:
+# `worker 'gw1' crashed while running 'tests/x.py::test_y'`. Matched with the
+# worker id and quotes, so a test whose own assertion quotes the phrase does not.
+_WORKER_CRASH = re.compile(r"worker '[^']+' crashed while running '")
+
+
 def _first_line(text: str | None) -> str:
     if not text:
         return ""
@@ -116,30 +123,27 @@ def _first_line(text: str | None) -> str:
     return ""
 
 
-def _active_test() -> str:
-    """The node id of the last test to START, or "" if unavailable.
+def _active_tests() -> list[str]:
+    """Every node id the breadcrumb lists, in start order; [] if unavailable.
 
-    Written by the conftest hook before each test and fsynced, so it survives a
-    process death that never reaches pytest's own reporting. Best-effort by
-    construction: every failure to read it returns "" and the caller simply says
-    less, because a narrator that raises while explaining a failure is worse
-    than one that is vague.
-
-    The id comes back WHOLE unless it crosses ``_ACTIVE_TEST_CEILING``, in which
-    case the return value says so and states the true length.
+    Serially that is one id: the last test to start. Under pytest-xdist it is
+    every test in flight, one per worker at most, because a crash there cannot be
+    pinned to whichever worker reported last.
     """
     import os
 
     path = os.environ.get("GENESIS_ACTIVE_TEST_FILE", "")
     if not path:
-        return ""
+        return []
     try:
-        name = Path(path).read_text(encoding="utf-8", errors="replace").strip()
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
     except OSError:
-        return ""
-    if not name:
-        return ""
-    first = name.splitlines()[0]
+        return []
+    return [_bounded_id(line) for line in text.splitlines() if line.strip()]
+
+
+def _bounded_id(first: str) -> str:
+    first = first.strip()
     if len(first) <= _ACTIVE_TEST_CEILING:
         return first
     # DECLARED, never silent. The whole point of this value is to identify one
@@ -166,13 +170,22 @@ def main(argv: list[str]) -> int:
         # conftest rewrites before each test and fsyncs. Without it this notice
         # can only say "something died", which is exactly the diagnosability the
         # verbosity used to buy.
-        active = _active_test()
-        where = (
-            f" The last test to START was {_fence(active)}, so the crash is at or "
-            "immediately after it."
-            if active
-            else ""
-        )
+        running = _active_tests()
+        active = running[0] if running else ""
+        if len(running) > 1:
+            where = (
+                f" {len(running)} tests were running at once (a parallel run), so "
+                "the crash is in one of them: "
+                + ", ".join(_fence(name) for name in running)
+                + "."
+            )
+        elif active:
+            where = (
+                f" The last test to START was {_fence(active)}, so the crash is at or "
+                "immediately after it."
+            )
+        else:
+            where = ""
         # The two causes need DIFFERENT directions, and conflating them sends
         # the reader to the wrong end of the log. A collection or startup crash
         # dies before any test runs, so its output really is at the HEAD, which
@@ -282,9 +295,25 @@ def main(argv: list[str]) -> int:
             f"{len(rows)} is in the artifact below."
         )
 
+    crashed = [test_id for _, test_id, message in rows if _WORKER_CRASH.search(message)]
     print(header)
     for line in lines:
         print(line)
+    if crashed:
+        # pytest-xdist reports a dead worker as an ERROR on the test it was
+        # running ("failed on setup with ... crashed while running", whichever
+        # phase it died in). MEASURED with xdist 3.8.0: with restarts disabled
+        # (--max-worker-restart=0) the whole run stops and every test not yet
+        # dispatched to ANY worker never runs; with restarts, the dead worker's
+        # queue goes to the others and every test runs.
+        print(
+            f"\n> **{len(crashed)} pytest-xdist worker crash(es).** A worker died "
+            "while running the test(s) whose error above says \"crashed while "
+            "running\". If the run does not restart workers "
+            "(`--max-worker-restart=0`), it stopped there, and every test not yet "
+            "handed to a worker never ran: compare the run's "
+            "passed/failed/skipped total with the number collected."
+        )
     print(trailer)
     return 0
 

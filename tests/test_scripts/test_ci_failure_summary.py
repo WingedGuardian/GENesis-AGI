@@ -50,6 +50,15 @@ long tail of traceback</failure>
 """
 
 
+@pytest.fixture(autouse=True)
+def _fresh_in_flight(monkeypatch):
+    """Tests here call the breadcrumb hook directly, without the finish a real run
+    always pairs it with, so each gets its own in-flight set."""
+    import tests.conftest as genesis_conftest
+
+    monkeypatch.setattr(genesis_conftest, "_IN_FLIGHT", {})
+
+
 def _run(*argv: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(_SCRIPT), *argv],
@@ -586,3 +595,100 @@ def test_a_node_id_that_is_not_valid_utf8_does_not_abort_pytest(tmp_path, monkey
     assert crumb.exists(), "the breadcrumb was not written at all"
     written = crumb.read_text(encoding="utf-8", errors="surrogateescape").strip()
     assert written.endswith("::test_undecodable"), written
+
+
+def test_a_crash_with_several_tests_in_flight_names_them_all(tmp_path, monkeypatch):
+    # Under pytest-xdist up to one test per worker is running when the run dies;
+    # naming only the last one written would point at the wrong test.
+    crumb = tmp_path / "active-test.txt"
+    crumb.write_text("tests/test_a.py::test_one\ntests/test_b.py::test_two\n")
+    monkeypatch.setenv("GENESIS_ACTIVE_TEST_FILE", str(crumb))
+
+    out = _run(str(tmp_path / "does-not-exist.xml"))
+    assert out.returncode == 0
+    assert "2 tests were running at once" in out.stdout
+    assert "tests/test_a.py::test_one" in out.stdout
+    assert "tests/test_b.py::test_two" in out.stdout
+    assert "The last test to START" not in out.stdout
+
+
+_REPORT_WITH_A_WORKER_CRASH = """<?xml version="1.0" encoding="utf-8"?>
+<testsuites>
+  <testsuite name="pytest" errors="1" failures="0" tests="2">
+    <testcase classname="tests.test_a" name="test_fine"/>
+    <testcase classname="tests.test_h" name="test_hangs">
+      <error message="failed on setup with &quot;worker 'gw0' crashed while running 'tests/test_h.py::test_hangs'&quot;">x</error>
+    </testcase>
+  </testsuite>
+</testsuites>
+"""
+
+
+def test_a_worker_crash_says_the_tests_behind_it_may_not_have_run(tmp_path):
+    report = tmp_path / "junit.xml"
+    report.write_text(_REPORT_WITH_A_WORKER_CRASH, encoding="utf-8")
+    out = _run(str(report))
+    assert out.returncode == 0
+    assert "tests.test_h::test_hangs" in out.stdout
+    assert "1 pytest-xdist worker crash(es)" in out.stdout
+    assert "never ran" in out.stdout
+
+
+def test_an_ordinary_failure_gets_no_worker_crash_note(tmp_path):
+    report = tmp_path / "junit.xml"
+    report.write_text(_REPORT_WITH_FAILURES, encoding="utf-8")
+    assert "worker crash" not in _run(str(report)).stdout
+
+
+def test_the_breadcrumb_lists_tests_in_flight_and_keeps_the_last_one(tmp_path, monkeypatch):
+    import tests.conftest as genesis_conftest
+
+    crumb = tmp_path / "active-test.txt"
+    monkeypatch.setenv(genesis_conftest.ACTIVE_TEST_FILE_ENV, str(crumb))
+    monkeypatch.setattr(genesis_conftest, "_owns_active_test_breadcrumb", lambda: True)
+    monkeypatch.setattr(genesis_conftest, "_BOX_LOCK", None)
+    monkeypatch.setattr(genesis_conftest, "_IN_FLIGHT", {})
+    start, finish = genesis_conftest.pytest_runtest_logstart, genesis_conftest.pytest_runtest_logfinish
+
+    start("t::a", None)
+    start("t::b", None)  # two workers' tests in flight at once
+    assert crumb.read_text().splitlines() == ["t::a", "t::b"]
+    finish("t::a", None)
+    assert crumb.read_text().splitlines() == ["t::b"]
+    finish("t::b", None)
+    # Nothing in flight: the file keeps naming the last test, as a serial run
+    # always has, so a crash between tests still points at where it happened.
+    assert crumb.read_text().splitlines() == ["t::b"]
+
+
+def test_a_crashed_test_leaves_the_in_flight_list(tmp_path, monkeypatch):
+    # xdist reports a test whose worker died once, with when="???", and never
+    # fires its logfinish; without this it would stay "running" for the rest of
+    # the run.
+    import types
+
+    import tests.conftest as genesis_conftest
+
+    crumb = tmp_path / "active-test.txt"
+    monkeypatch.setenv(genesis_conftest.ACTIVE_TEST_FILE_ENV, str(crumb))
+    monkeypatch.setattr(genesis_conftest, "_owns_active_test_breadcrumb", lambda: True)
+    monkeypatch.setattr(genesis_conftest, "_BOX_LOCK", None)
+    genesis_conftest.pytest_runtest_logstart("t::dies", None)
+    genesis_conftest.pytest_runtest_logstart("t::other", None)
+    genesis_conftest.pytest_runtest_logreport(types.SimpleNamespace(when="call", nodeid="t::other"))
+    genesis_conftest.pytest_runtest_logreport(types.SimpleNamespace(when="???", nodeid="t::dies"))
+    assert crumb.read_text().splitlines() == ["t::other"]
+
+
+def test_a_failure_quoting_the_phrase_is_not_a_worker_crash(tmp_path):
+    report = tmp_path / "junit.xml"
+    report.write_text(
+        _REPORT_WITH_A_WORKER_CRASH.replace(
+            "failed on setup with &quot;worker 'gw0' crashed while running 'tests/test_h.py::test_hangs'&quot;",
+            "AssertionError: assert 'crashed while running' in out",
+        ),
+        encoding="utf-8",
+    )
+    out = _run(str(report))
+    assert "tests.test_h::test_hangs" in out.stdout
+    assert "worker crash" not in out.stdout

@@ -275,3 +275,14 @@ timeout = 600
 # that names it. Cost: one hang ends the whole run instead of failing one test.
 # The box-wide pytest lock is an flock, released when the process dies.
 timeout_method = "thread"
+# Dump every thread's stack to stderr for a test still running at 540 s, just
+# before pytest-timeout ends the process at 600. The thread method writes its own
+# stacks to the terminal, which a pytest-xdist worker sends to /dev/null, so a
+# hung test in a parallel run showed only "worker crashed" (MEASURED 2026-11-05,
+# 0 stack lines in CI's hang control). stderr is kept. The faulthandler watchdog
+# never exits, so serial runs keep today's behaviour plus this dump. Limits:
+# its window spans setup, call and teardown together (pytest-timeout times
+# each phase), so a test whose phases add up past 540 s dumps and runs on; and
+# pytest cancels it once a test fails, so a hang in teardown after a failure
+# gets no dump.
+faulthandler_timeout = 540
