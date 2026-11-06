@@ -144,6 +144,7 @@ async def record_verification(
         decide,
         parse_evidence,
         reason_for,
+        rechecks_for,
     )
     from genesis.session_awareness.pr_recording import _no_duplicates, attempt_note, resolve_repo
 
@@ -175,6 +176,9 @@ async def record_verification(
         mismatch = check_merge_commit(doc.merge_commit, actual)
         if mismatch:
             raise ToolError(mismatch)
+        rechecks = rechecks_for(doc) if decision.closing else []
+        if rechecks and not await crud._rechecks_column_available(db):
+            raise ToolError("Rechecks are owed but their column is unavailable; run the migration first")
         result = {
             "repo": target,
             "pr": pr,
@@ -183,6 +187,7 @@ async def record_verification(
             "dry_run": preview,
             "server_dry_run_only": forced,
             "recorded": False,
+            "rechecks": rechecks,
         }
         if preview:
             return result

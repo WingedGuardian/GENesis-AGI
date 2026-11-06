@@ -1048,7 +1048,9 @@ class TestThirdReview:
         assert "Write tool" in _run(box).stderr
 
     def test_too_many_creates_offers_no_override_it_will_not_honour(self, box):
-        many = "; ".join(f"gh pr create -t t{i} -b b -R {PUBLIC} {SIGIL}" for i in range(21))
+        # One per line: SIGIL starts a comment, so after "; " bash would run
+        # only the first create.
+        many = "\n".join(f"gh pr create -t t{i} -b b -R {PUBLIC} {SIGIL}" for i in range(21))
         done = _run(box, many)
         assert _could_not_verify(done) and "pr-review-waived" not in done.stderr
 

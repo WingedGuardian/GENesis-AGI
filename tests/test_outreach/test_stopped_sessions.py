@@ -136,8 +136,12 @@ def test_a_full_page_stays_under_the_channel_limit_and_lists_only_what_fits():
     would be stamped without being shown (review BLOCKER). Only listed ids are
     returned, and the rest are counted for the next hour."""
     rows = [
-        {"id": f"{i:032d}", "source_tag": f"user_job:{'x' * 36}", "outcome": "failed",
-         "outcome_reason": "z" * 300}
+        {
+            "id": f"{i:032d}",
+            "source_tag": f"user_job:{'x' * 36}",
+            "outcome": "failed",
+            "outcome_reason": "z" * 300,
+        }
         for i in range(25)
     ]
     text, listed = ss.format_page(rows, total=25)
@@ -163,8 +167,9 @@ async def test_only_rendered_rows_are_stamped(db, monkeypatch):
     pipeline = AsyncMock()
     pipeline.submit_raw.return_value = _sent(OutreachStatus.DELIVERED)
     assert await ss.run_page(db, pipeline, now=NOW) == 1
-    stamped = [r for r in ("r0", "r1", "r2")
-               if (await cc_sessions.get_by_id(db, r))["outcome_paged_at"]]
+    stamped = [
+        r for r in ("r0", "r1", "r2") if (await cc_sessions.get_by_id(db, r))["outcome_paged_at"]
+    ]
     assert stamped == ["r2"]  # the oldest, the one actually listed
     request = pipeline.submit_raw.await_args.args[1]
     assert request.defer_retry is False
@@ -199,6 +204,37 @@ async def test_nothing_to_report_sends_nothing(db):
     pipeline = AsyncMock()
     assert await ss.run_page(db, pipeline, now=NOW) == 0
     pipeline.submit_raw.assert_not_awaited()
+
+
+async def test_a_page_counts_the_hours_unreported_sessions(db):
+    await _row(db, "a")
+    for i, ago in enumerate((10, 30, 50)):
+        await _row(
+            db, f"u{i}", status="completed", outcome="unreported", ago=timedelta(minutes=ago)
+        )
+    await _row(db, "u-old", status="completed", outcome="unreported", ago=timedelta(hours=2))
+    await _row(db, "u-fg", session_type="foreground", status="completed", outcome="unreported")
+    await _row(db, "u-now", status="completed", outcome="unreported", ago=timedelta(minutes=1))
+    pipeline = AsyncMock()
+    pipeline.submit_raw.return_value = _sent(OutreachStatus.DELIVERED)
+    assert await ss.run_page(db, pipeline, now=NOW) == 1
+    text = pipeline.submit_raw.await_args.args[0]
+    assert text.endswith(
+        "3 other background sessions in the last hour ended without reporting a status."
+    )
+
+
+async def test_unreported_sessions_alone_send_nothing(db):
+    await _row(db, "u", status="completed", outcome="unreported")
+    pipeline = AsyncMock()
+    assert await ss.run_page(db, pipeline, now=NOW) == 0
+    pipeline.submit_raw.assert_not_awaited()
+
+
+def test_the_count_line_is_singular_for_one_and_absent_for_none():
+    stops = [{"id": "abcdefgh1", "source_tag": "campaign", "outcome": "failed"}]
+    assert "1 other background session in" in ss.format_page(stops, total=1, unreported=1)[0]
+    assert "without reporting" not in ss.format_page(stops, total=1)[0]
 
 
 async def test_the_kill_switch_sends_and_stamps_nothing(db, monkeypatch):
@@ -297,7 +333,9 @@ async def test_each_owner_requested_failure_gets_its_own_dedup_identity():
     runtime = MagicMock()
     runtime._outreach_pipeline = pipeline
     runner = DirectSessionRunner(
-        invoker=AsyncMock(), session_manager=MagicMock(), config_builder=AsyncMock(),
+        invoker=AsyncMock(),
+        session_manager=MagicMock(),
+        config_builder=AsyncMock(),
         runtime=runtime,
     )
     req = DirectSessionRequest(prompt="x", caller_context="mcp_tool")

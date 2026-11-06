@@ -91,13 +91,21 @@ reinstall_damaged_distributions() {
     local repo_dir="$1"
     local venv_path="$2"
     local lib_dir="${3:-$repo_dir/scripts/lib}"
-    local spec
-    "$venv_path/bin/python" -P "$lib_dir/venv_missing_files.py" 2>/dev/null \
+    local spec notes
+    # stdout names what to reinstall. A "NOT reinstalling" line on stderr is a
+    # distribution refused because its files are also another one's: shown, so
+    # the refusal is never silent.
+    notes="$(mktemp)" || notes=/dev/null
+    "$venv_path/bin/python" -P "$lib_dir/venv_missing_files.py" 2>"$notes" \
         | while IFS= read -r spec || [ -n "$spec" ]; do
             [ -n "$spec" ] || continue
             echo "    Reinstalling $spec: an upgrade deleted files it owns"
             "$venv_path/bin/pip" install --quiet --no-deps --force-reinstall "$spec" 2>&1 | tail -1 || true
         done || true
+    if [ "$notes" != /dev/null ]; then
+        sed -n 's/^NOT reinstalling/    WARNING: not reinstalling/p' "$notes" || true
+        rm -f "$notes"
+    fi
 }
 
 # with_browser_stack_lock <command> [args...]
@@ -209,12 +217,16 @@ _restore_venv_state_unlocked() {
     # The repair is best effort and verify reads metadata, so a package the import
     # below never touches could keep matching metadata with its files gone. Report
     # that as an incomplete restore, keeping the record, rather than as a success.
-    local damaged
-    if ! damaged="$("$py" -P "$lib/venv_missing_files.py" 2>&1)"; then
+    # stdout only: a refusal note on stderr is not damage left behind.
+    local damaged damaged_err
+    damaged_err="$(mktemp)" || damaged_err=/dev/null
+    if ! damaged="$("$py" -P "$lib/venv_missing_files.py" 2>"$damaged_err")"; then
         echo "  Could not check the restored packages for missing files:"
-        printf '%s\n' "$damaged" | tail -3 | sed 's/^/    /'
+        tail -3 "$damaged_err" 2>/dev/null | sed 's/^/    /'
+        [ "$damaged_err" = /dev/null ] || rm -f "$damaged_err"
         return 1
     fi
+    [ "$damaged_err" = /dev/null ] || rm -f "$damaged_err"
     if [ -n "$damaged" ]; then
         echo "  Packages still have missing files after the repair:"
         printf '%s\n' "$damaged" | head -20 | sed 's/^/    /'
