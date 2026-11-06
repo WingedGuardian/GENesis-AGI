@@ -578,11 +578,11 @@ jobs:
     # sibling jobs and queue time: min 19m38s, p50 29m22s, max 31m15s.
     # The ceiling must exceed the worst LEGITIMATE case — that max plus one
     # full per-test kill (pyproject `timeout = 600`) = ~41 min — or this job
-    # would pre-empt the per-test timeout and make it dead code. 180 leaves
-    # ~139 min of growth headroom and still halves the default.
+    # would pre-empt the per-test timeout and make it dead code. 180 still
+    # halves the default. The serial job grew to 82-146 min by 2026-11-05;
+    # since then the suite runs on four workers (see the pytest step), and the
+    # measured step took 31-48 min, so this limit has room again.
     # Revisit as the suite grows — the --durations output below is the data.
-    # Since 2026-11 the suite runs on four workers (see the pytest step), so
-    # the step takes about a third of the serial time and this limit has room.
     timeout-minutes: 180
     # fetch-depth: 0 because measurement tests derive a rate from this
     # repository's own commit history and SKIP on a shallow clone rather than
