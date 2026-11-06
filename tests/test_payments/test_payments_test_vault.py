@@ -24,6 +24,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -224,6 +225,29 @@ def _test_root(tmp_path: Path) -> H.Layout:
     return layout
 
 
+# An AF_UNIX path holds at most 107 bytes on Linux. pytest's per-test tmp_path
+# embeds the test's name, and pytest-xdist adds a `popen-gwN` segment: the
+# listener test's socket came to 111 bytes in a parallel CI run (101 serial).
+# Tests that BIND a socket therefore root it in a short directory of their own.
+_SUN_PATH_MAX = 107
+
+
+@pytest.fixture()
+def short_dir():
+    path = Path(tempfile.mkdtemp(prefix="pv", dir="/tmp"))
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def test_a_socket_rooted_in_short_dir_fits_with_room(short_dir):
+    # Room for the deepest socket these tests bind. short_dir carries no test
+    # name or worker id, so this length does not grow with either.
+    deepest = _test_root(short_dir).socket
+    assert len(str(deepest).encode()) <= _SUN_PATH_MAX - 40
+
+
 def test_r3_a_run_dir_linked_to_a_live_run_dir_is_refused(tmp_path):
     live_run = tmp_path / "op" / ".genesis" / "run"
     live_run.mkdir(parents=True)
@@ -234,7 +258,8 @@ def test_r3_a_run_dir_linked_to_a_live_run_dir_is_refused(tmp_path):
         H.check_socket(layout, _live(tmp_path / "op"))
 
 
-def test_r3_a_hard_link_to_a_live_socket_is_refused(tmp_path):
+def test_r3_a_hard_link_to_a_live_socket_is_refused(short_dir):
+    tmp_path = short_dir  # binds a socket: see _SUN_PATH_MAX
     live_sock = tmp_path / "op" / ".genesis" / "run" / H.SOCKET_NAME
     live_sock.parent.mkdir(parents=True)
     s = socket.socket(socket.AF_UNIX)
@@ -249,7 +274,8 @@ def test_r3_a_hard_link_to_a_live_socket_is_refused(tmp_path):
         s.close()
 
 
-def test_r3_a_listener_or_a_non_socket_at_the_test_path_is_refused(tmp_path):
+def test_r3_a_listener_or_a_non_socket_at_the_test_path_is_refused(short_dir):
+    tmp_path = short_dir  # binds a socket: see _SUN_PATH_MAX
     layout = _test_root(tmp_path)
     layout.socket.parent.mkdir(parents=True)
     layout.socket.write_text("x")
