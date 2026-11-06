@@ -750,6 +750,17 @@ def test_td10_repair_move_runs_the_kit_never_the_checkouts_copy(w):
     outside = {k: v for k, v in w.snapshot().items() if k.split("/")[0] != "scripts"}
     assert outside == {k: v for k, v in tag_snapshot().items() if k.split("/")[0] != "scripts"}
     ts = w.report()["ts"]
+    # The wrapper forwards --restore TS like --dismiss TS, and --check rides after it
+    # (#3966 item 2): without the forward, argparse refuses --command with --restore.
+    c = subprocess.run(
+        ["bash", str(entry), "repair-move", "--restore", ts, "--check"],
+        capture_output=True,
+        text=True,
+        env=w.env(),
+    )
+    assert c.returncode == 0, c.stdout + c.stderr
+    assert f"report {ts}:" in c.stdout and "nothing was written" in c.stdout, c.stdout
+    assert not w.state.exists()
     d = subprocess.run(
         ["bash", str(entry), "repair-move", "--dismiss", ts],
         capture_output=True,
