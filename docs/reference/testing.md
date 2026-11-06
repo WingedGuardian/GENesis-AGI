@@ -31,6 +31,13 @@ WAL cursor release and process-death recovery. Four explicit outcome comparisons
 keep the actual legacy middleware as the negative control. Shared MCP service E2E
 qualification is separate from this primitive coverage.
 
+Scoped graph selection and SQL identity parity are covered by
+`tests/test_memory/test_graph_request_database.py` and
+`tests/test_memory/test_graph_path_identity.py`. They use scratch SQLite with
+production table definitions, compare ordered traversal fields against NetworkX,
+and check own pending writes and selected-backend fallback. The FalkorDB boundary
+is simulated; these tests do not claim a live-engine or shared-service E2E run.
+
 Genesis v3 has **~21,000 test functions** across **~1,345 files** (counted
 2026-09-06 by `grep -rEh "^\s*(async )?def test_" tests/ --include=*.py | wc -l`;
 parametrized cases make the collected item count higher still). The suite runs

@@ -479,6 +479,13 @@ class NetworkxGraphStore:
         #
         # Also before any graph work: declining must be cheap, and must not warm
         # or build a projection the caller will never read.
+        from genesis.db.request_database import RequestDatabase
+
+        # A stable facade owns different connections across units. A projection
+        # keyed to that facade can be stale and cannot see this unit's writes.
+        # The existing SQL tier reads the owning connection without a cache.
+        if isinstance(db, RequestDatabase):
+            raise GraphModeUnsupported("Request-owned traversal requires the SQL tier")
         if include_deprecated:
             raise GraphModeUnsupported(
                 "the NetworkX projection is filtered at build time, so it cannot "

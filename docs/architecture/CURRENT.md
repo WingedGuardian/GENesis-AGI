@@ -73,7 +73,7 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: cd784816 2026-09-09
+verified: 2ece179f9ebc 2026-10-28
 ```
 
 **Cross-store integrity is detect + repair.** SQLite (`memory_metadata`/
@@ -235,6 +235,12 @@ a real bridge-node population; `centrality_cache` gains its first reader.
 run through a `GraphStore` protocol with two implementations: the default
 `NetworkxGraphStore` (the in-process MultiDiGraph projection of `memory_links`)
 and `FalkorGraphStore` (below);
+opt-in `RequestDatabase` traversal declines NetworkX before projection and uses
+the existing SQL tier on its owning connection, including pending writes. Healthy
+selected FalkorDB retains projected-data semantics; its scoped fallback uses SQL.
+Legacy NetworkX and centrality behavior are unchanged. The shared SQL traversal
+uses exact delimited hex-ID cycle membership, so substrings, LIKE wildcards,
+empty IDs and NULs cannot hide distinct TEXT nodes.
 `memory/graph.py` is a facade that owns the single production instance and the
 backend choice. The contract, and the reason the seam exists: a read that cannot
 REACH its store RAISES `GraphUnavailableError` and never returns empty — empty
