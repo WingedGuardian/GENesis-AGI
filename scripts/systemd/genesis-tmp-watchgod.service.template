@@ -14,6 +14,8 @@ Type=exec
 ExecStart=__REPO_DIR__/scripts/tmp_watchgod.sh
 Restart=always
 RestartSec=10
+# The disk guardian outlives memory pressure: systemd-oomd chooses it last.
+ManagedOOMPreference=avoid
 
 [Install]
 WantedBy=default.target

@@ -431,6 +431,8 @@ def _run_writer(tmp_path: Path, venv_dir: Path) -> tuple[subprocess.CompletedPro
         f'VENV_DIR="{venv_dir}"\n'
         "OLD_TAG=old\nOLD_COMMIT=oldsha\nNEW_TAG=new\nNEW_COMMIT=newsha\n"
         'ROLLBACK_TAG=rollback\nSTARTED_AT=started\nPRE_UPDATE_DEGRADED="backup:process_exit"\n'
+        + _function(update_text(), "_retire_deps_record")
+        + "\n"
         + _function(update_text(), "_record_update_history")
         + '\n_record_update_history "success" "" "container_cc_sync"\n'
     )

@@ -388,6 +388,7 @@ _CONTAINER_LOCAL_UNITS = {
     "scripts/code_intel_runner.sh": "container-side code index only",
     "scripts/disk_hygiene.sh": "container-side file retention only",
     "scripts/graph_project_runner.sh": "container-side graph projection only",
+    "scripts/inbox_sync.sh": "container-side: mirrors the vault into this user's inbox only",
     "scripts/install_browser_stack.sh": "container-side: installs into this user's caches; never escalates in the unit (NoNewPrivileges)",
     "scripts/star_milestone_check.py": "container-side: one GitHub star-count read + an observation; no deploy/host/guard surface",
     "scripts/tmp_watchgod.sh": "container-side disk guard only",

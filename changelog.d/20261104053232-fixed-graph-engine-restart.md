@@ -1,0 +1,1 @@
+- After the graph engine restarts, memory-graph reads recover at once: the engine's unit rebuilds the projection as soon as the engine is up, and each process's first read retries the connection the restart closed instead of falling back to a multi-second in-process rebuild. A retried read still counts against the FalkorDB cutover clock.

@@ -244,6 +244,8 @@ else
 fi
 
 # Python 3.12-3.14 — prefer explicit python3.12 binary
+# shellcheck source=lib/python312.sh
+. "$SCRIPT_DIR/lib/python312.sh"
 _install_python312() {
     # Attempt to install Python 3.12 using the available package manager and OS-specific sources.
     if command -v apt-get &>/dev/null; then
@@ -272,23 +274,9 @@ _install_python312() {
     elif command -v yum &>/dev/null; then
         sudo yum install -y python3.12 2>/dev/null && return 0
     fi
-    # Universal fallback: uv downloads a pre-built Python 3.12 binary (no compilation).
+    # Universal fallback.
     # Works on Debian 12, RHEL, and any Linux where the package manager lacks python3.12.
-    echo "    Trying uv (pre-built Python 3.12 binary — no compilation needed)..."
-    if curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh 2>/dev/null; then
-        local uv_bin="${HOME}/.local/bin/uv"
-        if [[ -x "$uv_bin" ]] && "$uv_bin" python install 3.12 --quiet 2>/dev/null; then
-            local py_path
-            py_path=$("$uv_bin" python find 3.12 2>/dev/null) || true
-            if [[ -n "$py_path" && -x "$py_path" ]]; then
-                # Symlink into /usr/local/bin so 'python3.12' is discoverable system-wide
-                sudo ln -sf "$py_path" /usr/local/bin/python3.12 2>/dev/null || \
-                    ln -sf "$py_path" "${HOME}/.local/bin/python3.12" 2>/dev/null || true
-                export PATH="${HOME}/.local/bin:$PATH"
-                command -v python3.12 &>/dev/null && return 0
-            fi
-        fi
-    fi
+    genesis_install_python312_uv && return 0
     return 1
 }
 
@@ -299,7 +287,18 @@ elif command -v python3 &>/dev/null; then
     py_version=$(python3 --version 2>&1 | grep -oP '\d+\.\d+' || echo "0.0")
     # Upper bound mirrors pyproject's requires-python (litellm caps Python <3.15).
     if python3 -c "import sys; sys.exit(0 if (3, 12) <= sys.version_info[:2] < (3, 15) else 1)" 2>/dev/null; then
-        echo "    OK    Python $py_version"
+        if [ "$PREFLIGHT_OK" = 1 ] && genesis_new_venv_wants_python312 "$VENV_PATH" python3; then
+            echo "    Python $py_version found, but Genesis is tested on 3.12 — installing python3.12..."
+            if genesis_install_python312_uv; then
+                py_version=$(python3.12 --version 2>&1 | grep -oP '\d+\.\d+' || echo "3.12")
+                echo "    OK    Python $py_version (installed)"
+            else
+                echo "    WARN  Could not install python3.12; continuing on Python $py_version, which CI does not test. To retry, delete $VENV_PATH and re-run."
+                setup_warn "python3.12 could not be installed; the venv uses Python $py_version, which CI does not test"
+            fi
+        else
+            echo "    OK    Python $py_version"
+        fi
     else
         # Try to install Python 3.12 explicitly
         echo "    Python $py_version found but 3.12-3.14 required — installing python3.12..."
@@ -422,7 +421,7 @@ elif [[ "$_PKG_MGR" == "yum" ]]; then
 fi
 
 # pip — check on python3.12 first (installed in pre-flight), then fall back to python3
-_PIP_BIN=$(command -v python3.12 || command -v python3)
+_PIP_BIN=$(genesis_python_bin)
 if ! "$_PIP_BIN" -m pip --version &>/dev/null; then
     echo "    pip not found — installing..."
     if [[ "$_PKG_MGR" == "apt" ]]; then
@@ -444,7 +443,7 @@ fi
 
 # venv module — check ensurepip, not just "import venv" (the venv module ships
 # with base Python but ensurepip requires the python3.XX-venv package on apt systems)
-_CHECK_PY=$(command -v python3.12 || command -v python3)
+_CHECK_PY=$(genesis_python_bin)
 _PY_MINOR=$("$_CHECK_PY" -c 'import sys; print(sys.version_info.minor)')
 if ! "$_CHECK_PY" -c "import ensurepip" &>/dev/null; then
     echo "    python3.${_PY_MINOR}-venv not found — installing..."
@@ -711,7 +710,7 @@ else
 fi
 
 if ! command -v uv &>/dev/null; then
-    curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh 2>/dev/null || true
+    curl -LsSf "https://astral.sh/uv/$GENESIS_UV_VERSION/install.sh" 2>/dev/null | sh 2>/dev/null || true
     export PATH="$HOME/.local/bin:$PATH"
 fi
 # shellcheck source=lib/serena_install.sh
@@ -721,7 +720,7 @@ if command -v uv &>/dev/null; then
 fi
 
 # Python venv — prefer python3.12 for venv creation
-PYTHON_BIN=$(command -v python3.12 || command -v python3)
+PYTHON_BIN=$(genesis_python_bin)
 if [ ! -d "$VENV_PATH" ] || [ ! -x "$VENV_PATH/bin/python" ] || [ ! -x "$VENV_PATH/bin/pip" ]; then
     # Remove broken venv before recreating
     if [ -d "$VENV_PATH" ]; then
@@ -1653,6 +1652,18 @@ if [ ! -f /usr/local/bin/genesis ]; then
 #!/bin/bash
 repo=$_repo_q
 cd "\$repo" 2>/dev/null || { echo "Genesis repo not found at \$repo"; exit 1; }
+# An interactive session gets a systemd scope of its own (scripts/slot_exec.sh),
+# with a memory cap, so a runaway session is contained inside its own scope.
+# Print mode and the informational flags stay in the caller's scope, as at the
+# bashrc door: a headless child must die with the session that started it.
+for arg in "\$@"; do
+    case "\$arg" in
+        -p|--print|--version|-v|--help|-h) exec claude "\$@" ;;
+    esac
+done
+if [ -t 0 ] && [ -t 1 ] && [ "\$(id -u)" != 0 ] && [ -x "\$repo/scripts/slot_exec.sh" ]; then
+    exec "\$repo/scripts/slot_exec.sh" bare -- claude "\$@"
+fi
 exec claude "\$@"
 WRAPPER
     sudo chmod +x /usr/local/bin/genesis
@@ -2055,12 +2066,13 @@ echo "    journalctl --user -u genesis-server -f   # live logs"
 echo ""
 echo "  Dashboard: http://localhost:5000"
 echo "    (Access from your browser via host IP — see host setup output)"
-# Show a note on non-Ubuntu-24 systems — Genesis is developed on Ubuntu 24.04;
-# install works on other distros but runtime behaviour is not guaranteed.
+# Show a note on releases CI does not test: CI's default runner (now 26.04) runs the
+# suite and a fresh install, and a pinned 24.04 job runs the OS-sensitive tests.
+# Install works on other distros, but runtime behaviour is not guaranteed.
 _os_name=$(grep -oP '^PRETTY_NAME="\K[^"]+' /etc/os-release 2>/dev/null || echo "")
-if ! echo "$_os_name" | grep -qi 'ubuntu 24'; then
+if ! echo "$_os_name" | grep -qiE 'ubuntu (24|26)\.04'; then
     echo ""
-    echo "  OS note: Genesis is developed and tested on Ubuntu 24.04."
+    echo "  OS note: Genesis is tested on Ubuntu 24.04 and 26.04."
     echo "  This install ran on: $_os_name"
     echo "  Installation completed but runtime behaviour may vary on this OS."
     echo "  Report issues: https://github.com/WingedGuardian/GENesis-AGI/issues"

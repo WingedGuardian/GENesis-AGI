@@ -1459,7 +1459,7 @@ class SentinelDispatcher:
             else:
                 from genesis.cc import final_status
 
-                outcome, outcome_reason = final_status.outcome_of(output.final_status)
+                outcome, outcome_reason = final_status.outcome_of_output(output)
 
             # Parse output (degraded → don't trust self-reported resolution)
             result = self._parse_output(output, session_id, degraded=degraded)

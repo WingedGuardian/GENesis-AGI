@@ -1,0 +1,88 @@
+{
+  "_README": [
+    "The defect corpus: deliberate breaks in the merge gate's own code, each run",
+    "against every rung of the gate's tests, to show which rung notices. Run by",
+    "`scripts/ci/mutation_sweep.py --rung-report`. An escape is a finding, not a",
+    "failure: it exits 0, and on main it means a test is owed, filed as an issue.",
+    "This is not `config/mutation_gate.json`, whose cases must all be caught.",
+    "",
+    "`why` is written before running the case. `aim` is the rung that should catch",
+    "it. An anchor that stops matching fails `--check-anchors` on the PR that moved",
+    "it: update the case in that change."
+  ],
+  "rungs": {
+    "unit": [
+      "tests/test_hooks/test_merge_review_gate.py",
+      "tests/test_hooks/test_git_push_guard_codex_freshness.py",
+      "tests/test_hooks/test_scored_bot_reviewers.py"
+    ],
+    "characterization": [
+      "tests/test_hooks/test_merge_gate_characterization.py"
+    ]
+  },
+  "cases": [
+    {
+      "label": "critical lane blocks on three P2s instead of two",
+      "why": "the lane table decides how many P2s block a critical change. Raising it lets a change to the gate itself merge past findings that should stop it.",
+      "aim": "unit",
+      "path": "scripts/hooks/git_push_guard.py",
+      "validator": "python",
+      "anchor": "_INLINE_SCORE_BLOCK_THRESHOLDS = {\"critical\": 1.0,",
+      "replacement": "_INLINE_SCORE_BLOCK_THRESHOLDS = {\"critical\": 1.5,"
+    },
+    {
+      "label": "a Codex P1 on ordinary code no longer stops a merge",
+      "why": "the always-fix floor is what stops a lone P1 on ordinary code, which scores 1.0 against a threshold of 2.0. Without it that P1 passes the inline check with only a note.",
+      "aim": "characterization",
+      "path": "scripts/hooks/git_push_guard.py",
+      "validator": "python",
+      "anchor": "    floor_hits = len(p1) + len(cr_block) + len(devin_block)",
+      "replacement": "    floor_hits = len(cr_block) + len(devin_block)"
+    },
+    {
+      "label": "an unrecognised CI conclusion is ignored",
+      "why": "a conclusion GitHub adds later must read red. Ignoring it lets a run with that check merge on its sibling jobs' green.",
+      "aim": "characterization",
+      "path": "scripts/hooks/git_push_guard.py",
+      "validator": "python",
+      "anchor": "                red.append(name)\n        elif status is not None or state in _CI_PENDING_STATES:",
+      "replacement": "                pass\n        elif status is not None or state in _CI_PENDING_STATES:"
+    },
+    {
+      "label": "an abbreviated Codex id counts without resolving to the head",
+      "why": "a clean signal naming a prefix must resolve uniquely to this head across the repository. Otherwise a review of an older commit that shares the prefix reads as a review of this one.",
+      "aim": "unit",
+      "path": "scripts/hooks/git_push_guard.py",
+      "validator": "python",
+      "anchor": "        if _commit_at_prefix(short, repo=repo) == head:",
+      "replacement": "        if True:"
+    },
+    {
+      "label": "`# review-override` also waives red CI",
+      "why": "each override waives one named gate, because a waiver of findings is not a waiver of a red test run. A sigil that reaches a sibling lets a conscious yes on one thing merge past another.",
+      "aim": "characterization",
+      "path": "scripts/hooks/git_push_guard.py",
+      "validator": "python",
+      "anchor": "                ci_override = has_trailing_override(merge_seg.raw, \"ci-override\")",
+      "replacement": "                ci_override = has_trailing_override(merge_seg.raw, \"ci-override\") or has_trailing_override(merge_seg.raw, \"review-override\")"
+    },
+    {
+      "label": "the leaks review is no longer required of anyone",
+      "why": "the leaks marker stops an install's private data reaching the public repo. Dropping the requirement for everyone removes that check from every owner PR that has not been reviewed.",
+      "aim": "characterization",
+      "path": "scripts/hooks/git_push_guard.py",
+      "validator": "python",
+      "anchor": "    missing = [k for k in required if k not in kinds_here]",
+      "replacement": "    missing = [k for k in required if k not in kinds_here and k != \"leaks\"]"
+    },
+    {
+      "label": "every inline finding counts as answered by a maintainer",
+      "why": "a maintainer's reply is what clears an inline finding, so treating an unanswered one as replied clears them all without anyone reading them.",
+      "aim": "unit",
+      "path": "scripts/hooks/git_push_guard.py",
+      "validator": "python",
+      "anchor": "        c.get(\"reply_to\")\n        for c in raw\n        if c.get(\"reply_to\") and c.get(\"assoc\") in _MAINTAINER_ASSOCIATIONS",
+      "replacement": "        c.get(\"id\")\n        for c in raw\n        if c.get(\"id\")"
+    }
+  ]
+}

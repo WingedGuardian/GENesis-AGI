@@ -102,6 +102,10 @@ state and what a new session would launch, with the reason.
 
 ## Qualification checklist (when the shared service and adapter exist)
 
+Before any of these: the service calls `genesis.caller_context.enter_shared_service()`
+before its first request, or work that loses its request scope reads the service's own
+environment as its caller and passes human-only gates.
+
 Each step runs on one session first (`GENESIS_MCP_SHARED_STAGE=<stage>` in that
 session's environment), then for the install (the overlay).
 

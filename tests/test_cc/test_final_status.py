@@ -120,3 +120,34 @@ def test_every_mapped_outcome_is_in_the_recorder_vocabulary():
 
     for status in (*final_status.REPORTED, final_status.MALFORMED):
         assert outcome_of(FinalStatus(status))[0] in OUTCOMES
+
+
+class _Output:
+    def __init__(self, report=None, **flags):
+        self.final_status = report
+        self.__dict__.update(flags)
+
+
+@pytest.mark.parametrize(
+    ("flags", "expected"),
+    [
+        ({"bg_truncated": True}, ("partial", "bg_truncated")),
+        ({"result_received": False}, ("partial", "no_result_event")),
+        ({"bg_truncated": True, "result_received": False}, ("partial", "bg_truncated")),
+        ({}, ("finished", "why")),
+        ({"bg_truncated": False, "result_received": True}, ("finished", "why")),
+    ],
+)
+def test_a_cut_off_run_is_partial_whatever_it_reported(flags, expected):
+    """A run the CLI truncated, or one with no result event, did not finish,
+    even when its final message says completed."""
+    out = _Output(FinalStatus("completed", "why"), **flags)
+    assert final_status.outcome_of_output(out) == expected
+
+
+def test_flags_count_only_as_literal_booleans():
+    from unittest.mock import MagicMock
+
+    mock = MagicMock()
+    mock.final_status = None
+    assert final_status.outcome_of_output(mock) == (None, None)

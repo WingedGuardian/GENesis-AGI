@@ -59,7 +59,7 @@ def _reported(output) -> dict:
     """The session's own report as ``complete()`` outcome kwargs (cc/final_status.py)."""
     from genesis.cc import final_status
 
-    outcome, reason = final_status.outcome_of(output.final_status)
+    outcome, reason = final_status.outcome_of_output(output)
     return {"outcome": outcome, "outcome_reason": reason}
 
 

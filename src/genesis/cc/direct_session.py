@@ -68,6 +68,14 @@ _BG_TRUNCATION_NOTICE = (
     "cut off before finishing, so the results below may be incomplete."
 )
 
+# Appended to a delivered result when the session exited without sending its
+# final result event (CCOutput.result_received False): what arrived is the text
+# it produced along the way, not its answer.
+_NO_RESULT_NOTICE = (
+    "\n\n⚠️ Note: this session ended before sending its final result, so this is "
+    "the text it produced along the way and may be incomplete."
+)
+
 # Soft cap for a single Telegram delivery of a RESULT-mode outcome. Below the
 # 4096-char hard limit, leaving room for the header + HTML entity expansion.
 # Larger output is written to a file and delivered as a head + pointer.
@@ -2391,17 +2399,26 @@ class DirectSessionRunner:
                 getattr(pipeline, "_forum_chat_id", None),
             )
 
-            status = "✓" if result.success else "✗"
             raw = (
                 (result.output_text or "(no output)")
                 if result.success
                 else f"Task did not complete: {result.error or 'unknown error'}"
             )
-            header = f"<b>{status} Background task complete</b>\n\n"
-            if result.success and _is_stop(result):
+            # A stop reads as a stop, never as a clean finish: this send is
+            # stamped paged below, so the hourly page will not report it.
+            if not result.success:
+                header = "<b>✗ Background task complete</b>\n\n"
+            elif result.partial:
+                # Only a truncated run carries its own notice.
+                header = "<b>⚠ Background task stopped early</b>\n\n"
+                if _BG_TRUNCATION_NOTICE not in raw:
+                    raw += _NO_RESULT_NOTICE
+            elif _is_stop(result):
                 why = f": {result.outcome_reason}" if result.outcome_reason else ""
                 header = f"<b>⚠ Background task stopped ({result.outcome})</b>\n\n"
                 raw = f"{result.outcome.capitalize()}{why}\n\n{raw}"
+            else:
+                header = "<b>✓ Background task complete</b>\n\n"
             escaped = html_mod.escape(raw)
             text = header + escaped
             if len(text) > _TG_MSG_CAP:
@@ -2440,8 +2457,8 @@ class DirectSessionRunner:
                     target_thread_id=thread_id,
                 )
             )
-            # The owner now has this session's result (a partial run's text
-            # carries the truncation notice), so the hourly page skips it.
+            # The owner now has this session's result (a partial run is sent
+            # as stopped early, with a notice), so the hourly page skips it.
             await self._mark_paged(result.session_id, sent)
         except Exception:
             logger.error(

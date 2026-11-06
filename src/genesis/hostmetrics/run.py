@@ -31,6 +31,7 @@ from dataclasses import dataclass
 
 from genesis.hostmetrics import readings
 from genesis.hostmetrics.jobs import SCOPE_PREFIX, systemd_env
+from genesis.util.systemd import literal_scope_args
 
 # Runs inside the scope: the command (with the report fd closed for it), then
 # the scope's own peak memory, CPU time and OOM-kill count, written to that fd
@@ -184,7 +185,7 @@ def scope_argv(unit: str, props: list[str], slice_name: str | None, *trailing: s
     argv.append(f"--slice={slice_name or CAPPED_SLICE}")
     for prop in props:
         argv += ["-p", prop]
-    return [*argv, "--", *trailing]
+    return [*argv, *literal_scope_args(), "--", *trailing]
 
 
 def _probe_call(argv, unit, runner, owned):

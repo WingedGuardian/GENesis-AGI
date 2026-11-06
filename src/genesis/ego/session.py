@@ -990,7 +990,7 @@ class EgoSession:
             if parsed is None:
                 outcome, reason = "failed", "unparseable_output"
             else:
-                outcome, reason = final_status.outcome_of(output.final_status)
+                outcome, reason = final_status.outcome_of_output(output)
             await self._session_manager.complete(
                 session_id,
                 cost_usd=output.cost_usd,

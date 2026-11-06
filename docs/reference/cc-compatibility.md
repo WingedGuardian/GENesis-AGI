@@ -478,6 +478,7 @@ caller (MEASURED 2026-09-25).
 | CCCheckpoint | Session pause/resume | `src/genesis/cc/checkpoint.py` | User question handling |
 | CCFormatter | Output formatting | `src/genesis/cc/formatter.py` | Response parsing |
 | IntentClassifier | N/A (Genesis-internal) | `src/genesis/cc/intent.py` | No CC dependency |
+| PR-open review gate | Subagent records: `<session>/subagents/agent-*.meta.json` (`agentType`) and `agent-*.jsonl` (first line `cwd`, `gitBranch`, prompt; final assistant `stop_reason`, `model`); `/code-review` runs as `general-purpose` with a `` `<level> effort → `` prompt header | `scripts/hooks/pr_open_review_gate.py` | Read at `gh pr create`. Re-verify on a pin bump: a run in a real session must pass after `/code-review` and be refused with no review. A changed layout reads as "could not verify" when no record keeps `agentType`, a readable `gitBranch` or `cwd`, or a `stop_reason`; a moved `subagents/` directory reads as "no review", which `/deep-review` then cannot clear. Either way the owner override is the way through until the reader is fixed |
 | Guardian Diagnosis | `-p`, `--model opus`, `--effort` (configurable, default `high`; omitted for Haiku), `--max-turns 50`, `--dangerously-skip-permissions`, `--output-format json` | `src/genesis/guardian/diagnosis.py` | Agentic diagnosis + recovery on host VM. Highest-stakes CC call in system. |
 
 ### CC CLI Flags Used by Genesis

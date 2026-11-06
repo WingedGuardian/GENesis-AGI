@@ -388,6 +388,31 @@ class TestRunCheck:
         mock_hb.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_heartbeat_is_written_before_snapshot_maintenance(
+        self, config: GuardianConfig,
+    ) -> None:
+        """A slow (or failing) snapshot-maintenance pass must not delay the
+        liveness heartbeat past the watchdog threshold."""
+        with (
+            patch(
+                "genesis.guardian.check.collect_all_signals",
+                AsyncMock(return_value=_healthy_snapshot()),
+            ),
+            patch(
+                "genesis.guardian.check._write_guardian_heartbeat",
+                AsyncMock(),
+            ) as mock_hb,
+            patch(
+                "genesis.guardian.check._maintain_snapshots",
+                AsyncMock(side_effect=RuntimeError("slow window pass")),
+            ),
+            patch("genesis.guardian.check.load_secrets", return_value={}),
+            pytest.raises(RuntimeError, match="slow window pass"),
+        ):
+            await run_check(config)
+        mock_hb.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_does_not_write_heartbeat_on_crash(self, config: GuardianConfig) -> None:
         """If _check_cycle raises, heartbeat must NOT fire — Guardian failure
         should be visible to Genesis-side monitoring."""

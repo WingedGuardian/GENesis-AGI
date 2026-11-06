@@ -35,9 +35,17 @@ _REPO = Path(__file__).resolve().parent.parent.parent
 # (The job reports; it joins the required-check ruleset once it is stable.)
 _MOD = _REPO / "scripts" / "ci" / "mutation_sweep.py"
 
+# The harness imports its siblings by bare name, as it does when run as a script.
+# They stay registered for the session: only one instance of `mutation_stop` can
+# hold a sweep's stop.
+sys.path.insert(0, str(_MOD.parent))
+
 # Via conftest so the module name is restored after loading rather than left
 # registered for the rest of the session.
 ms = private_module("_mutation_sweep", _MOD)
+mcase = sys.modules["mutation_case"]
+mstop = sys.modules["mutation_stop"]
+mcopy = sys.modules["mutation_copy"]
 
 # GIT_* is dropped for the fixture's own git calls for the same reason the
 # harness drops it: run from inside a git hook, GIT_DIR would aim them at the
@@ -660,7 +668,7 @@ def _scripted(monkeypatch, rc: int, stdout: str) -> list[str]:
     ],
 )
 def test_the_summary_parser_reads_exact_outcome_keywords(stdout, counts):
-    parsed = ms.parse_pytest_summary(stdout)
+    parsed = mcase.parse_pytest_summary(stdout)
     if counts is None:
         assert parsed is None
     else:
@@ -892,8 +900,8 @@ def test_a_multi_edit_case_counts_EVERY_anchor(project):
         label="two-site",
         path=project / "guard.py",
         edits=(
-            ms.Edit('if name.startswith("danger"):', "if False:"),
-            ms.Edit("nonexistent second anchor", "x"),
+            mcase.Edit('if name.startswith("danger"):', "if False:"),
+            mcase.Edit("nonexistent second anchor", "x"),
         ),
         test="test_guard.py::test_blocks_danger",
         why="w",
@@ -909,8 +917,8 @@ def test_a_multi_edit_case_applies_all_edits_together(project, monkeypatch):
         label="two-site",
         path=project / "guard.py",
         edits=(
-            ms.Edit('if name.startswith("danger"):', "if False:"),
-            ms.Edit("return True", "return True  # touched"),
+            mcase.Edit('if name.startswith("danger"):', "if False:"),
+            mcase.Edit("return True", "return True  # touched"),
         ),
         test="test_guard.py::test_blocks_danger",
         why="w",
@@ -1447,7 +1455,7 @@ def test_an_undecodable_target_ABORTS_rather_than_crashing_the_sweep(project):
     ids=["replacement-without-anchor", "anchor-without-replacement"],
 )
 def test_anchor_and_replacement_must_come_together(kw):
-    edits = tuple(ms.Edit(a, r) for a, r in kw.pop("edits", ()))
+    edits = tuple(mcase.Edit(a, r) for a, r in kw.pop("edits", ()))
     with pytest.raises(ValueError, match="together"):
         ms.Case(
             label="x", path=Path("a.py"), test="t", why="w", validator="python", edits=edits, **kw
@@ -1464,7 +1472,7 @@ def test_an_explicit_empty_replacement_is_still_a_deletion():
         why="w",
         validator="python",
     )
-    assert case.edits == (ms.Edit("a", ""),)
+    assert case.edits == (mcase.Edit("a", ""),)
 
 
 @pytest.mark.parametrize("validator", ["none:", "none:   ", "none : "])
@@ -1652,7 +1660,7 @@ def test_a_directory_a_test_left_unreadable_is_still_removed(tmp_path, mode):
     (stuck / "f").write_text("x", encoding="utf-8")
     os.chmod(stuck, mode)
     try:
-        ms._force_rmtree(holder)
+        mcopy._force_rmtree(holder)
     finally:
         if stuck.exists():
             os.chmod(stuck, 0o700)
@@ -1684,8 +1692,8 @@ def test_an_anchor_manufactured_by_an_earlier_edit_aborts(project):
         anchor=None,
         replacement=None,
         edits=(
-            ms.Edit('if name.startswith("danger"):', "if False:  # MADE"),
-            ms.Edit("# MADE", "# changed"),
+            mcase.Edit('if name.startswith("danger"):', "if False:  # MADE"),
+            mcase.Edit("# MADE", "# changed"),
         ),
     )
     result = _sweep(project, [case])
@@ -1697,9 +1705,9 @@ def test_an_anchor_manufactured_by_an_earlier_edit_aborts(project):
     "text,edits,problem",
     [
         # `str.count` counts non-overlapping matches: 'aaa'.count('aa') == 1.
-        ("x = 'aaa'\n", (ms.Edit("aa", "bb"),), "2x or more"),
-        ("ab\n", (ms.Edit("ab", "x"), ms.Edit("b", "y")), "overlap"),
-        ("ab\n", (ms.Edit("ab", "x"), ms.Edit("ab\n", "y")), "overlap"),
+        ("x = 'aaa'\n", (mcase.Edit("aa", "bb"),), "2x or more"),
+        ("ab\n", (mcase.Edit("ab", "x"), mcase.Edit("b", "y")), "overlap"),
+        ("ab\n", (mcase.Edit("ab", "x"), mcase.Edit("ab\n", "y")), "overlap"),
     ],
 )
 def test_edits_are_judged_against_the_pristine_text(text, edits, problem):
@@ -1708,14 +1716,14 @@ def test_edits_are_judged_against_the_pristine_text(text, edits, problem):
 
 
 def test_disjoint_edits_apply_together_by_offset():
-    edits = (ms.Edit("b = 2", "b = 3"), ms.Edit("a = 1", "a = 0"))
+    edits = (mcase.Edit("b = 2", "b = 3"), mcase.Edit("a = 1", "a = 0"))
     out, why = ms.apply_edits("a = 1\nb = 2\n", edits)
     assert why is None and out == "a = 0\nb = 3\n"
 
 
 def test_an_empty_anchor_is_refused():
     with pytest.raises(ValueError, match="empty anchor"):
-        ms.Edit("", "x")
+        mcase.Edit("", "x")
 
 
 @pytest.mark.parametrize(
@@ -1770,7 +1778,7 @@ def test_removing_a_copy_never_chmods_the_temp_root(tmp_path):
     (holder / "sub").mkdir(parents=True)
     os.chmod(holder, 0o000)
     try:
-        ms._force_rmtree(holder)
+        mcopy._force_rmtree(holder)
     finally:
         if holder.exists():
             os.chmod(holder, 0o700)
@@ -1788,7 +1796,7 @@ def test_an_interpreter_that_cannot_start_is_an_ABORT_not_a_traceback(project):
 def test_edits_that_cancel_out_are_refused():
     """Two disjoint edits can restore the original text; the test then passes
     and SURVIVED would blame a test that was never given a mutation."""
-    out, why = ms.apply_edits("xaay", (ms.Edit("xa", "x"), ms.Edit("ay", "aay")))
+    out, why = ms.apply_edits("xaay", (mcase.Edit("xa", "x"), mcase.Edit("ay", "aay")))
     assert out == "xaay" and why is not None and "cancel out" in why
 
 
@@ -2002,7 +2010,7 @@ def test_drift_during_the_baselines_stops_the_sweep(project, monkeypatch):
 def test_a_case_whose_copy_cannot_be_made_aborts_alone(project, monkeypatch):
     """A file vanishing mid-overlay, or a full disk, raised out of the sweep and
     lost every earlier result; now only that case ABORTS."""
-    real = ms._overlay
+    real = mcopy._overlay
     calls = {"n": 0}
 
     def overlay(top, tree):
@@ -2011,7 +2019,7 @@ def test_a_case_whose_copy_cannot_be_made_aborts_alone(project, monkeypatch):
             raise RuntimeError("injected: a file vanished mid-overlay")
         return real(top, tree)
 
-    monkeypatch.setattr(ms, "_overlay", overlay)
+    monkeypatch.setattr(mcopy, "_overlay", overlay)
     result = _sweep(project, [_case(project, label="first"), _case(project, label="second")])
     assert result.results[0].outcome == ms.BIT, result.results[0].detail
     assert result.results[1].outcome == ms.ABORTED
@@ -2167,7 +2175,7 @@ def test_a_git_timeout_costs_a_case_not_the_sweep(project, monkeypatch):
 
     monkeypatch.setattr(ms.subprocess, "run", timed_out)
     with pytest.raises(RuntimeError, match="timed out"):
-        ms._git(project, "status")
+        mcopy._git(project, "status")
 
 
 def test_a_validator_timeout_is_a_reason_not_a_crash(project, monkeypatch):
@@ -2178,7 +2186,7 @@ def test_a_validator_timeout_is_a_reason_not_a_crash(project, monkeypatch):
         label="b",
         path=str(project / "guard.sh"),
         test="t",
-        edits=(ms.Edit("a", "b"),),
+        edits=(mcase.Edit("a", "b"),),
         validator="bash",
         why="a timeout is reported",
     )
@@ -2738,7 +2746,9 @@ def _sweep_that_hangs_on_its_second_case(project, tmp_path_factory):
             start_new_session=True,
             # A signal the caller ignored stays ignored (`nohup`), and a background
             # job of a non-interactive shell has SIGINT ignored.
-            preexec_fn=lambda: [signal.signal(each, signal.SIG_DFL) for each in ms._STOP_SIGNALS],
+            preexec_fn=lambda: [
+                signal.signal(each, signal.SIG_DFL) for each in mstop._STOP_SIGNALS
+            ],
         )
     return proc, hanging, tmp_root, report
 
@@ -2858,6 +2868,26 @@ def test_each_result_prints_once_then_the_tally(project, capsys, monkeypatch):
     assert out.rstrip().endswith("1 bit, 0 SURVIVED, 0 ABORTED")
 
 
+def test_running_the_sweep_writes_no_bytecode_beside_it(tmp_path):
+    """The sweep runs from the caller's tree and does not write it, so importing
+    its siblings must not leave a `__pycache__` there. Git ignores that directory,
+    so a status check cannot see this."""
+    scripts = tmp_path / "ci"
+    scripts.mkdir()
+    for each in _MOD.parent.glob("mutation_*.py"):
+        shutil.copy(each, scripts)
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONDONTWRITEBYTECODE"}
+    env.pop("PYTHONPYCACHEPREFIX", None)
+    ran = subprocess.run(
+        [sys.executable, str(scripts / _MOD.name), "--help"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert ran.returncode == 0, ran.stderr
+    assert not (scripts / "__pycache__").exists()
+
+
 def test_the_mutation_job_has_a_bound():
     """Without one, a hung case holds a runner for GitHub's six-hour default."""
     ci = yaml.safe_load(
@@ -2869,9 +2899,9 @@ def test_the_mutation_job_has_a_bound():
 @pytest.fixture
 def _stoppable(monkeypatch):
     """The handler `main` installs, in this process, with its state restored."""
-    monkeypatch.setattr(ms, "_stop_signal", None)
-    saved = {each: signal.getsignal(each) for each in ms._STOP_SIGNALS}
-    signal.signal(signal.SIGTERM, ms._stopped)
+    monkeypatch.setattr(mstop, "_stop_signal", None)
+    saved = {each: signal.getsignal(each) for each in mstop._STOP_SIGNALS}
+    signal.signal(signal.SIGTERM, mstop._stopped)
     yield
     for each, handler in saved.items():
         signal.signal(each, handler)
@@ -2880,7 +2910,7 @@ def _stoppable(monkeypatch):
 def _signal_me_before(monkeypatch, *git_args, skip=0):
     """SIGTERM this process just before the git command named, after letting
     ``skip`` of them pass, then run it."""
-    real = ms._git
+    real = mcopy._git
     ran = []
     seen = []
 
@@ -2895,7 +2925,7 @@ def _signal_me_before(monkeypatch, *git_args, skip=0):
             return out
         return real(repo, *args)
 
-    monkeypatch.setattr(ms, "_git", git)
+    monkeypatch.setattr(mcopy, "_git", git)
     return ran
 
 
@@ -2963,7 +2993,7 @@ def test_a_stop_the_interpreter_swallowed_still_ends_the_sweep(project, monkeypa
 
     def stop_after_the_first(result):
         ran.append(result)
-        monkeypatch.setattr(ms, "_stop_signal", signal.SIGTERM)
+        monkeypatch.setattr(mstop, "_stop_signal", signal.SIGTERM)
 
     monkeypatch.setattr(ms, "isolated_copy", counted)
     cases = [_case(project, label="first"), _case(project, label="second")]
@@ -2996,7 +3026,7 @@ def test_a_stop_as_the_last_case_ends_is_still_a_stop(project, monkeypatch, _sto
     """Otherwise the swallowed stop above reads as a clean sweep, at exit 0."""
 
     def stop(result):
-        monkeypatch.setattr(ms, "_stop_signal", signal.SIGTERM)
+        monkeypatch.setattr(mstop, "_stop_signal", signal.SIGTERM)
 
     with pytest.raises(SystemExit):
         _sweep(project, [_case(project)], on_result=stop)
@@ -3009,7 +3039,7 @@ def test_a_stop_after_the_sweep_returns_is_not_a_clean_tally(
     swallowed there read as the stop line, then exit 0 and a clean tally."""
 
     def stopped_late(*a, **kw):
-        monkeypatch.setattr(ms, "_stop_signal", signal.SIGTERM)
+        monkeypatch.setattr(mstop, "_stop_signal", signal.SIGTERM)
         return ms.Sweep()
 
     monkeypatch.setattr(ms, "sweep", stopped_late)
@@ -3046,7 +3076,7 @@ def test_a_closed_stream_does_not_turn_a_stop_into_a_case_failure(monkeypatch, _
 
     monkeypatch.setattr(ms.os, "write", broken)
     with pytest.raises(SystemExit) as stopped:
-        ms._stopped(signal.SIGTERM, None)
+        mstop._stopped(signal.SIGTERM, None)
     assert stopped.value.code == 128 + signal.SIGTERM
 
 
@@ -3054,10 +3084,10 @@ def test_a_signal_the_caller_ignored_stays_ignored(project, monkeypatch):
     """`nohup` means SIGHUP should not stop this run."""
     saved = signal.signal(signal.SIGHUP, signal.SIG_IGN)
     try:
-        monkeypatch.setattr(ms, "_stop_signal", None)
+        monkeypatch.setattr(mstop, "_stop_signal", None)
         previous = ms._catch_stop_signals()
         assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN
-        assert signal.getsignal(signal.SIGTERM) == ms._stopped
+        assert signal.getsignal(signal.SIGTERM) == mstop._stopped
         for each, handler in previous.items():
             signal.signal(each, handler)
     finally:

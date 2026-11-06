@@ -514,6 +514,17 @@ async def run_check(config: GuardianConfig | None = None) -> None:
         await _check_pool_relief(
             config, dispatcher, snapshots, healthy_confirmed=probe_healthy,
         )
+        # Heartbeat means "Guardian process is alive and watching" —
+        # NOT "Genesis container is healthy". Any successful check cycle
+        # (regardless of resulting state) should refresh liveness. A
+        # crashed _check_cycle raises out before reaching here, which
+        # correctly withholds the heartbeat — that is a real Guardian
+        # failure that Genesis-side monitoring should see. Written BEFORE
+        # snapshot maintenance (a window pass can wait out several slow
+        # deletes) and the pool check (the autonomous provisioning propose
+        # below can block on an APPROVE for up to approval_timeout_s):
+        # liveness must not hinge on either completing.
+        await _write_guardian_heartbeat(config)
         # Snapshot lifecycle maintenance runs regardless of resulting state —
         # a guardian stuck in confirmed_dead/recovering for weeks must still
         # enforce expiry + prune stale snapshots (the incident: prune only ran
@@ -530,16 +541,6 @@ async def run_check(config: GuardianConfig | None = None) -> None:
             snapshot_size_history=sm.state.snapshot_size_history,
             dispatcher=dispatcher,
         )
-        # Heartbeat means "Guardian process is alive and watching" —
-        # NOT "Genesis container is healthy". Any successful check cycle
-        # (regardless of resulting state) should refresh liveness. A
-        # crashed _check_cycle raises out before reaching here, which
-        # correctly withholds the heartbeat — that is a real Guardian
-        # failure that Genesis-side monitoring should see. Written BEFORE the
-        # pool check because the autonomous provisioning propose below can
-        # block on an APPROVE for up to approval_timeout_s — liveness must not
-        # hinge on that optional, bounded wait completing.
-        await _write_guardian_heartbeat(config)
         # Container-swap invariant (silent-skip class): host-setup sets
         # limits.memory.swap at creation, but an install that advances via bare
         # git pull never re-runs host-setup — reconcile the knob (persistent
@@ -739,6 +740,9 @@ async def _maintain_snapshots(
 
     if settled(config, now):
         snapshots.last_delete_error = None
+    # A stuck delete is this batch's fact only: a reused manager must not let
+    # it waive the next tick's settle.
+    snapshots.last_delete_stuck = None
     before_delete = _routine_delete_guard(config, snapshots, window)
     # Decided BEFORE the prune step re-stamps its own marker below.
     healthy_due = _marker_due(
@@ -765,6 +769,8 @@ async def _maintain_snapshots(
             config, snapshots, window, now, is_healthy=is_healthy,
             before_delete=before_delete,
         )
+        await _alert_window_stuck(config, snapshots, dispatcher, window, now)
+        await _alert_window_timezone(config, window, dispatcher, now)
 
     # `is True`: the YAML loader does not coerce, and `healthy_enabled: "false"`
     # is a truthy string (review).
@@ -824,6 +830,8 @@ async def _maintain_snapshots(
         )
         if name and defer.get("defer_deletes"):
             await _alert_superseded_surplus(config, snapshots, dispatcher, now)
+        elif name and defer:
+            await _reopen_window_pass(config, snapshots)
         note = getattr(snapshots, "last_rotation_note", None)
         if name:
             logger.info("Healthy snapshot refreshed: %s", name)
@@ -872,6 +880,12 @@ def _routine_delete_guard(config, snapshots, window):
     """Per-maintenance authorization, checked at each routine delete boundary.
 
     Pressure bypasses the window, never the settle or a failed reservation.
+    Every delete waits the settle interval since the last action, so routine
+    deletes are never stacked: a window pass deletes one snapshot and the next
+    pass continues. The one exception is the delete right after a DEFINITE
+    failure in this batch (``last_delete_stuck``): that attempt deleted
+    nothing, so there is no stall to wait out, and a snapshot that will not
+    delete must not hold every routine delete behind it.
     Only a real candidate reserves the shared cooldown. A stamp followed by
     a closed window leaves a conservative cooldown, just as a killed process
     after the stamp would. No-op passes never touch it.
@@ -883,11 +897,13 @@ def _routine_delete_guard(config, snapshots, window):
 
     def allowed(*, pressure: bool = False) -> bool:
         nonlocal started, stopped
-        stopped = stopped or isinstance(getattr(snapshots, "last_delete_error", None), str)
+        stuck = started and isinstance(getattr(snapshots, "last_delete_stuck", None), str)
+        failed = isinstance(getattr(snapshots, "last_delete_error", None), str)
+        stopped = stopped or (failed and not stuck)
         now = datetime.now(UTC)
         if stopped or (not pressure and not window.contains(now)):
             return False
-        if (pressure or not started) and not settled(config, now):
+        if (pressure or not stuck) and not settled(config, now):
             return False
         if not record_action(config, now):
             stopped = True
@@ -912,6 +928,8 @@ async def _window_deletions(
     listing shows no superseded healthy snapshot left. A failed list or delete
     is retried on the next tick inside the window rather than read as "nothing
     to delete"; a window the guardian missed is caught up by the next one.
+    An in-window healthy refresh that leaves a superseded snapshot clears the
+    stamp (``_reopen_window_pass``), so a later pass rotates it.
     Superseded healthy snapshots are rotated only on a probe-confirmed healthy
     tick: deleting one mid-incident would start a long filesystem stall while
     recovery runs (recovery only ever restores the newest).
@@ -949,11 +967,22 @@ async def _window_deletions(
             expires_before=window.next_open(now), before_delete=before_delete,
         )
         pruned_all = getattr(snapshots, "last_prune_complete", False) is True
-        # Stop at a failed prune: its retry comes after the settle interval.
+        # Stop at a prune that could not read its listing, or at an UNCERTAIN
+        # prune failure (a timeout or failed re-list: the daemon may still be
+        # deleting); the retry comes after the settle. A snapshot that
+        # definitely failed must not hold the rotation back.
+        uncertain = getattr(snapshots, "last_prune_read", False) is not True or (
+            isinstance(getattr(snapshots, "last_delete_error", None), str)
+            and not isinstance(getattr(snapshots, "last_delete_stuck", None), str)
+        )
         rotated = (
             await snapshots.rotate_superseded(before_delete=before_delete)
-            if is_healthy and pruned_all else 0
+            if is_healthy and not uncertain else 0
         )
+        stuck = getattr(snapshots, "stuck_deletes", None)
+        if isinstance(stuck, list) and stuck:
+            # Named by the first tick after the window, if still there then.
+            _record_stuck(config, stuck)
         left = await snapshots.superseded_healthy()
         done = (
             pruned_all and left == []
@@ -968,6 +997,113 @@ async def _window_deletions(
         logger.warning("deletion-window pass failed", exc_info=True)
     if done:
         _touch_marker(marker, now)
+
+
+async def _reopen_window_pass(config, snapshots) -> None:
+    """A refresh inside the open window can leave the snapshot it superseded
+    (its rotation waits the settle after the window pass's own delete). That
+    pass may already be stamped done, which would leave the superseded one for
+    the next day: clear the stamp so a later pass, after the settle, rotates
+    it. A failed listing clears it too; the pass re-reads and decides."""
+    try:
+        left = await snapshots.superseded_healthy()
+    except Exception:
+        logger.warning(
+            "could not list superseded healthy snapshots; re-opening the window pass",
+            exc_info=True,
+        )
+        left = None
+    if left == []:
+        return
+    try:
+        (config.state_path / ".last_window_deletes").unlink(missing_ok=True)
+    except OSError:
+        logger.warning("could not re-open the deletion window's pass", exc_info=True)
+
+
+# Snapshots whose delete definitely failed in the open window, one per line.
+# Written by the window's passes, read and removed by the first tick after it.
+_WINDOW_STUCK = ".window_stuck"
+
+
+def _record_stuck(config, names: list[str]) -> None:
+    from genesis.util.atomic import atomic_write_text
+
+    path = config.state_path / _WINDOW_STUCK
+    try:
+        known = set(path.read_text().split())
+    except OSError:
+        known = set()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(path, "\n".join(sorted(known | set(names))) + "\n")
+    except OSError:
+        logger.warning("could not write %s", path, exc_info=True)
+
+
+async def _alert_window_stuck(config, snapshots, dispatcher, window, now: datetime) -> None:
+    """After the window: WARN (throttled) naming each snapshot whose delete
+    definitely failed in it and that a fresh listing still shows. Never
+    raises: an unwritable state dir must not skip the rest of the tick."""
+    path = config.state_path / _WINDOW_STUCK
+    try:
+        if window.contains(now) or not path.exists():
+            return
+        names = set(path.read_text().split())
+        meta = await snapshots.list_snapshot_meta_strict()
+        if meta is None:
+            return  # retried next tick
+        still = sorted(names & {n for n, _ in meta})
+        path.unlink(missing_ok=True)
+    except Exception:
+        logger.warning("could not check the window's undeleted snapshots", exc_info=True)
+        return
+    if not still:
+        return
+    logger.warning("Deletion window ended with undeleted snapshots: %s", ", ".join(still))
+    marker = config.state_path / ".window_stuck_alert"
+    if dispatcher is None or not _marker_due(marker, config.storage_pool.realert_hours):
+        return
+    if not _touch_marker(marker, now):
+        return
+    try:
+        await dispatcher.send(Alert(
+            severity=AlertSeverity.WARNING,
+            title="Snapshot would not delete in the deletion window",
+            body=(
+                f"The deletion window ({window.describe()}) ended with "
+                f"{', '.join(still)} still present: each delete failed with a definite "
+                "error, so the window skipped it and deleted the rest. It was retried "
+                "after each settle interval while the window was open, and is retried in "
+                "the next window; pool relief still frees space under pressure."
+            ),
+        ))
+    except Exception:
+        logger.warning("failed to send stuck-snapshot alert", exc_info=True)
+
+
+async def _alert_window_timezone(config, window, dispatcher, now: datetime) -> None:
+    """WARN (throttled) when a configured window timezone could not be used."""
+    configured = getattr(config.snapshots, "deletion_window_timezone", "")
+    if window.any_time or not (isinstance(configured, str) and configured.strip()):
+        return
+    if window.tz_source == "config" or dispatcher is None:
+        return
+    marker = config.state_path / ".window_tz_alert"
+    if not _marker_due(marker, config.storage_pool.realert_hours) or not _touch_marker(marker, now):
+        return
+    try:
+        await dispatcher.send(Alert(
+            severity=AlertSeverity.WARNING,
+            title="Deletion window timezone is invalid",
+            body=(
+                f"snapshots.deletion_window_timezone={configured.strip()!r} is not a zone "
+                f"this host knows, so the window runs as {window.describe()}. Set an IANA "
+                "name (for example Europe/Berlin) in guardian.yaml."
+            ),
+        ))
+    except Exception:
+        logger.warning("failed to send window-timezone alert", exc_info=True)
 
 
 async def _alert_superseded_surplus(config, snapshots, dispatcher, now: datetime) -> None:

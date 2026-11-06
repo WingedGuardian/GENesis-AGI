@@ -5,7 +5,7 @@ NEXT token, so the walk can reach the command being wrapped. It is hand-written,
 and it has two failure directions that are not symmetric:
 
 * An option MISSING from it: its value is read as the command. The resolved exe
-  is then the value, which usually matches no gate — bad, but visible.
+  is then the value, which usually matches no gate, so the real command goes unseen.
 * An option WRONGLY listed: the walk eats the command WORD. The exe becomes the
   command's first argument, and a gate keyed on the exe never fires.
 
@@ -27,11 +27,12 @@ listed without a documented REQUIRED value fails the suite.
 Two things are out of scope on purpose, and saying which is which matters more
 than the fact that both are excluded:
 
-* An option simply ABSENT from a table. That is the visible direction, and the
-  case that prompted the search — a wrapper given an option it does not
-  recognise — turned out not to be a bypass at all: the wrapper exits 125 and
-  never runs the command, so nothing is permitted. Same reason #1686 stopped
-  decoding unterminated ANSI-C spans rather than parsing them.
+* An option the wrapper itself does not recognise. It exits 125 and never runs the
+  command, so nothing is permitted. Same reason #1686 stopped decoding unterminated
+  ANSI-C spans rather than parsing them. An option the wrapper DOES accept but a table
+  leaves out is different: its value reads as the command, which hides the real one.
+  `test_every_documented_value_option_is_listed` grades sudo's separate-word forms.
+  Bundled and abbreviated forms are not modelled: #3928.
 * ``env --split-string``, which is a REAL fail-open and is NOT fixed here. It
   carries a whole command line in one token, so it needs the nested walk rather
   than a table entry — and its own escape language, its appended arguments and
@@ -187,6 +188,33 @@ _AMBIGUOUS = "ambiguous"
 #: disambiguating fact is not in the help text at all, and `sudo` is a binary,
 #: so `_parser_arity` cannot read its getopt spec either.
 _KNOWN_AMBIGUOUS: dict[str, frozenset[str]] = {"sudo": frozenset({"-h"})}
+
+#: `sudo` is sudo-rs by default on Ubuntu 26.04, and `_WRAPPER_SPEC["sudo"]`
+#: describes classic sudo, which stays installed there as `sudo.ws`. sudo-rs stops
+#: at these options before running anything, so each is harmless in the table: a
+#: command written after one never runs. `test_sudo_rs_refuses_what_it_is_excused_from`
+#: measures that, rather than trusting this list.
+_SUDO_RS_REFUSED = frozenset(
+    {"-C", "-R", "-T", "-r", "-t", "--chroot", "--close-from", "--command-timeout", "--host", "--role", "--type"}
+)
+#: Its help prints `-h, --help` alone, while its parser takes a value for `-h` and
+#: then errors, so the help cannot grade it. Kept apart because the help does document
+#: it, which would otherwise read as a stale exception.
+_SUDO_RS_HELP_ONLY = frozenset({"-h"})
+
+
+def _is_sudo_rs() -> bool:
+    if not shutil.which("sudo"):
+        return False
+    proc = subprocess.run(["sudo", "--version"], capture_output=True, text=True, timeout=10)
+    return "sudo-rs" in proc.stdout + proc.stderr
+
+
+def _ungraded_options(tool: str) -> frozenset[str]:
+    """Table entries the installed ``tool`` cannot grade, each measured elsewhere."""
+    if tool == "sudo" and _is_sudo_rs():
+        return _SUDO_RS_REFUSED | _SUDO_RS_HELP_ONLY
+    return frozenset()
 
 
 def _unexpected_ambiguities(tool: str, arity: dict[str, str], listed) -> list[str]:
@@ -395,7 +423,9 @@ def _parser_arity(tool: str) -> dict[str, str]:
     return _getopt_arity(head)
 
 
-@pytest.mark.real_tool("sudo")  # reads each installed wrapper's own --help
+# Reads each installed wrapper's own --help. On sudo-rs one test also runs /bin/echo
+# under `sudo -n`, to measure what the exception list claims.
+@pytest.mark.real_tool("sudo")
 class TestTableAgreesWithTheToolsThemselves:
     """Re-derive arity from each installed tool and fail on the FAIL-OPEN direction.
 
@@ -408,7 +438,9 @@ class TestTableAgreesWithTheToolsThemselves:
     to prevent, so it declines to guess in exactly that case.
     """
 
-    @pytest.mark.parametrize("tool", sorted(sp._WRAPPER_SPEC))
+    # `coreutils` lists no options, so it has nothing to grade, and only 26.04 has it: a
+    # case here would skip on 24.04, and the skip ceiling has no headroom.
+    @pytest.mark.parametrize("tool", sorted(set(sp._WRAPPER_SPEC) - {"coreutils"}))
     def test_every_listed_option_documents_a_required_value(self, tool):
         if tool in _UNVERIFIABLE:
             pytest.skip(f"{tool} has no single authority to check against — see _UNVERIFIABLE")
@@ -423,12 +455,17 @@ class TestTableAgreesWithTheToolsThemselves:
         # entirely (see `_parser_arity`). Empty for every binary and builtin, so
         # this narrows nothing for the tools that have no spec to read.
         arity.update(_parser_arity(tool))
+        self._assert_table_agrees(
+            tool, arity, set(sp._WRAPPER_SPEC[tool][0]) - _ungraded_options(tool)
+        )
+
+    def _assert_table_agrees(self, tool: str, arity: dict[str, str], listed: set[str]) -> None:
         # A spelling the help declares two ways cannot be graded here — the
         # parser reading above has already resolved it wherever a parser could be
         # read, so what remains is genuinely unsettleable from prose. That makes
         # it a DECLARED exception or a failure, never a silent exclusion: see
         # `_KNOWN_AMBIGUOUS` for why printing it instead reached nobody.
-        surprises = _unexpected_ambiguities(tool, arity, sp._WRAPPER_SPEC[tool][0])
+        surprises = _unexpected_ambiguities(tool, arity, listed)
         assert not surprises, (
             f"{tool}: {surprises} — the help declares each of these two ways and no "
             f"parser was readable, so the lock cannot grade them. Settle the arity "
@@ -443,7 +480,7 @@ class TestTableAgreesWithTheToolsThemselves:
         # exact regression this test exists to prevent, hidden by the test.
         wrong = sorted(
             (opt, arity.get(opt, "NOT FOUND in --help or the tool's own getopt spec"))
-            for opt in sp._WRAPPER_SPEC[tool][0]
+            for opt in listed
             if arity.get(opt) != "required" and arity.get(opt) != _AMBIGUOUS
         )
         assert not wrong, (
@@ -451,6 +488,36 @@ class TestTableAgreesWithTheToolsThemselves:
             f"REQUIRED value — the resolver will consume a token the tool does not, "
             f"and that token is the wrapped command"
         )
+
+    def test_sudo_rs_refuses_what_it_is_excused_from(self):
+        """The exception list is a claim about sudo-rs, so it is run, not believed.
+
+        Each entry goes through twice, because an option that is really a boolean
+        would run the first form and one that takes a value would run the second.
+        A later sudo-rs that adds one of them fails here as well as below.
+        """
+        if not _is_sudo_rs():
+            assert _ungraded_options("sudo") == frozenset()
+            return
+        # These two need no sudo to run, so they come before the control can skip.
+        documented = _documented_arity(_help_text("sudo") or "")
+        stale = sorted(opt for opt in _SUDO_RS_REFUSED if opt in documented)
+        assert not stale, f"sudo-rs now documents {stale}: grade them, and drop them from _SUDO_RS_REFUSED"
+        if shutil.which("sudo.ws"):  # classic sudo, still what the table describes
+            classic = _help_text("sudo.ws")
+            assert classic is not None
+            self._assert_table_agrees("sudo", _documented_arity(classic), set(sp._WRAPPER_SPEC["sudo"][0]))
+        control = subprocess.run(
+            ["sudo", "-n", "/bin/echo", "RAN"], capture_output=True, text=True, timeout=30
+        )
+        if "RAN" not in control.stdout:
+            pytest.skip(f"sudo cannot run a command here, so a refusal proves nothing: {control.stderr}")
+        for opt in sorted(_SUDO_RS_REFUSED | _SUDO_RS_HELP_ONLY):
+            for form in (["sudo", "-n", opt, "/bin/echo", "RAN"], ["sudo", "-n", opt, "x", "/bin/echo", "RAN"]):
+                proc = subprocess.run(form, capture_output=True, text=True, timeout=30)
+                assert "RAN" not in proc.stdout, f"{form} ran the command: the table entry eats it"
+                if opt in _SUDO_RS_REFUSED:
+                    assert "invalid option provided" in proc.stderr, (form, proc.stderr)
 
     def test_the_lock_can_see_a_short_form(self):
         """Guard the guard: the defect this was written for was a SHORT option.
@@ -677,11 +744,20 @@ class TestTableAgreesWithTheToolsThemselves:
         help declares both bare and as `=list` — into the table and drive the
         actual check. This is the acceptance bar kept as a test rather than run
         once: before the fix the same injection produced a green, silent build.
+
+        The help is classic sudo's, fixed here: the defect is in its text, and sudo-rs
+        documents `--preserve-env=list` alone, so it would not show there.
         """
-        if _help_text("sudo") is None:
-            pytest.skip(
-                "sudo is not installed here, or refused to run (no_new_privs) — the ambiguity cannot be measured"
-            )
+        monkeypatch.setitem(
+            globals(),
+            "_help_text",
+            lambda _tool: (
+                "  -E, --preserve-env            preserve user environment when running command\n"
+                "      --preserve-env=list       preserve specific environment variables\n"
+                "  -h, --help                    display help message and exit\n"
+                "  -h, --host=host               run command on host (if supported by plugin)\n"
+            ),
+        )
         opts, *rest = sp._WRAPPER_SPEC["sudo"]
         monkeypatch.setitem(sp._WRAPPER_SPEC, "sudo", ({*opts, "--preserve-env"}, *rest))
         with pytest.raises(AssertionError) as caught:
@@ -701,3 +777,123 @@ class TestTableAgreesWithTheToolsThemselves:
         listed = ["-h", "-u", "-E"]
         arity = {"-h": _AMBIGUOUS, "-u": "required", "-E": "zero"}
         assert _unexpected_ambiguities("xargs", arity, listed) == ["-h"]
+
+
+@pytest.mark.real_tool("sudo")
+def test_every_documented_value_option_is_listed():
+    """An accepted option left out of the table hides the command after it: `sudo -D
+    /tmp <cmd>` resolved to `/tmp`. Graded against classic sudo's own help, wherever
+    this machine has it. No skip: the suite's skip ceiling has no headroom."""
+    classic = "sudo.ws" if shutil.which("sudo.ws") else None if _is_sudo_rs() else "sudo"
+    help_text = _help_text(classic) if classic else None
+    if help_text is None:
+        return
+    arity = _documented_arity(help_text)
+    assert arity, "the help parsed to nothing, so this graded nothing"
+    documented = {opt for opt, kind in arity.items() if kind == "required"}
+    assert documented - _load()._WRAPPER_SPEC["sudo"][0] == set()
+
+
+@pytest.mark.parametrize(
+    "word",
+    ["gnutimeout 5", "gnutimeout -k 1 5", "gnuenv A=1", "gnunice -n 5", "gnunohup", "gnustdbuf -o L",
+     "sudo.ws", "sudo-rs", "sudo -D /tmp", "sudo -r role", "sudo -T 5", "sudo --host h", "sudo --other-user u",
+     "sudo --command-timeout 5", "sudo --chroot /", "coreutils timeout 5", "coreutils", "/usr/bin/gnutimeout 5"],
+)
+def test_a_renamed_or_unlisted_form_still_reveals_the_command(word):
+    assert "git" in exes(f"{word} git status")
+
+
+def test_every_gnu_tool_resolves_to_its_own_name():
+    mod = _load()
+    for tool in mod._GNU_COREUTILS:
+        assert mod.tool_name(f"gnu{tool}") == tool
+
+
+@pytest.mark.parametrize("name", ["gnuplot", "gnutls-cli", "gnu", "gnupg", "gnome-terminal"])
+def test_a_name_that_only_looks_renamed_stays_itself(name):
+    assert _load().tool_name(name) == name
+
+
+def test_the_list_is_the_package_where_it_is_installed():
+    """Ubuntu 26.04 has this package, so CI measures the list there; elsewhere there is
+    nothing to compare with. The count stands guard everywhere."""
+    mod = _load()
+    assert len(mod._GNU_COREUTILS) == 105
+    listed = subprocess.run(
+        ["dpkg", "-L", "gnu-coreutils"], capture_output=True, text=True, timeout=30
+    ) if shutil.which("dpkg") else None
+    if listed is None or listed.returncode != 0:
+        return
+    shipped = {Path(line).name[3:] for line in listed.stdout.splitlines() if re.search(r"/s?bin/gnu", line)}
+    assert shipped == set(mod._GNU_COREUTILS)
+
+
+@pytest.mark.parametrize("carrier", ["gnuchroot /", "su-rs -c"])
+def test_a_renamed_carrier_is_refused_like_the_plain_one(carrier):
+    """Both run a command the walk cannot read, so they are refused by name."""
+    plain = carrier.replace("gnu", "").replace("su-rs", "su")
+    command = "'git push --force origin main'"
+    assert guard_rc(f"{carrier} {command}") == guard_rc(f"{plain} {command}") != 0
+
+
+def test_coreutils_keeps_a_wrapper_policy_neutral():
+    """It only names the tool, so a neighbouring verdict should not read as opaque."""
+    segments, blind = sp.analyze_policy("coreutils timeout 5 git status")
+    assert blind is None
+    assert [(segment.exe, segment.contexts) for segment in segments] == [("git", ())]
+
+
+def _guard_without_the_parser(guard: str, command: str) -> int:
+    """The degraded path: the guard loaded with `shell_parse` unimportable."""
+    code = (
+        "import runpy, sys\n"
+        "sys.modules['shell_parse'] = None\n"
+        f"sys.path.insert(0, {str(_HOOKS)!r})\n"
+        f"runpy.run_path({str(_HOOKS / guard)!r}, run_name='__main__')\n"
+    )
+    return subprocess.run(
+        [sys.executable, "-c", code],
+        input=json.dumps({"tool_name": "Bash", "tool_input": {"command": command}}),
+        capture_output=True,
+        text=True,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(Path.home())},
+    ).returncode
+
+
+@pytest.mark.parametrize(
+    "guard,command,rc",
+    [
+        ("destructive_command_guard.py", "rmdir /tmp/x", 0),
+        ("destructive_command_guard.py", "gnurm -rf {home}/.genesis", 2),
+        ("destructive_command_guard.py", "rm -rf {home}/.genesis", 2),
+        ("destructive_command_guard.py", "ls /tmp", 0),
+        ("destructive_command_guard.py", "gnurm -rf {home}/.genesis 'unterminated", 2),
+        ("protected_paths_guard.py", "gnurm /tmp/x", 2),
+        ("protected_paths_guard.py", "ls /tmp", 0),
+    ],
+)
+def test_the_degraded_path_still_works_and_sees_the_renamed_form(guard, command, rc):
+    assert _guard_without_the_parser(guard, command.format(home=Path.home())) == rc
+
+
+@pytest.mark.parametrize(
+    "guard,command,plain",
+    [
+        ("destructive_command_guard.py", "gnurm -rf {home}/.genesis", "rm -rf {home}/.genesis"),
+        ("destructive_command_guard.py", "coreutils rm -rf {home}/.genesis", "rm -rf {home}/.genesis"),
+        ("protected_paths_guard.py", "gnurmdir {home}/genesis/data", "rmdir {home}/genesis/data"),
+        ("protected_paths_guard.py", "gnurm -rf {home}/genesis/data", "rm -rf {home}/genesis/data"),
+        ("destructive_command_guard.py", "eval 'gnurm -rf {home}/.genesis'", "eval 'rm -rf {home}/.genesis'"),
+        ("destructive_command_guard.py", "gnurm -rf {home}/.genesis 'unterminated", "rm -rf {home}/.genesis 'unterminated"),
+        ("worktree_cwd_guard.py", "su-rs -c 'git worktree remove /tmp/x' root", "su -c 'git worktree remove /tmp/x' root"),
+        ("full_suite_guard.py", "gnutimeout 60 pytest tests/", "timeout 60 pytest tests/"),
+        ("git_push_guard.py", "gnutimeout 5 git push origin x", "timeout 5 git push origin x"),
+        ("git_push_guard.py", "sudo.ws git push origin x", "sudo git push origin x"),
+    ],
+)
+def test_a_guard_treats_the_renamed_form_like_the_plain_one(guard, command, plain):
+    home = str(Path.home())
+    renamed_rc = guard_rc(command.format(home=home), guard)
+    plain_rc = guard_rc(plain.format(home=home), guard)
+    assert renamed_rc == plain_rc and plain_rc != 0

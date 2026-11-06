@@ -25,6 +25,9 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   why. BIT means pass, fail, pass
   on a run that opened the target. A module-level import counts as opened, so a
   BIT still does not prove the test exercised the code.
+  `config/gate_defects.json` is the merge gate's own defect corpus, run with
+  `--rung-report`, which says which rung of the gate's tests noticed each break.
+  There a miss is a finding, not a failure.
 - **Verify-RED of a safety fence runs the test UNFENCED.** Removing a guard,
   stub or sandbox to watch its test fail means whatever the test executes
   reaches the real system for that run. Read the test first and make its probe
@@ -106,7 +109,7 @@ git add <files>                                   # STAGE FIRST — mark hashes 
 python3 scripts/review_state.py mark              # INTERNAL genesis-architect audit — plain mark, never counts
 git commit -F <msg-file>                          # bare, not piped (see below)
 # (a non-Anthropic cross-model round would instead be: mark --source external --defects|--clean)
-git push -u origin HEAD && gh pr create --title "..." --body-file <file>   # first push: ONE command (approve the dialog)
+git push -u origin HEAD && gh pr create --title "..." --body-file <file>   # first push: ONE command (approve the dialog); needs a finished reviewer of this branch in this session (build-session, "a PR opens only after an independent review")
 gh pr comment <N> --body "@codex review"          # after EVERY subsequent push
 python3 scripts/hooks/git_push_guard.py --check-pr <N>
 gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --check-pr

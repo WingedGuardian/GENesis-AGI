@@ -480,13 +480,15 @@ a readiness value is manually changed. There is no setter or environment bypass.
 `python3 scripts/lib/index_marker.py automatic-ready` is read-only and returns
 the dedicated status 10 for an incomplete protocol or status 2 for an
 observation error. Queue-operation exceptions raised from `main()` also return
-2. Status 10 is reserved so that an interpreter crash (status 1) is never
+2; a busy queue makes `automatic-ready` return 75, which the runner logs as a
+busy tick and exits 0. Status 10 is reserved so that an interpreter crash (status 1) is never
 mistaken for the expected pause; the runner treats any other status as a
 failure. The runner discards the observer's JSON, so read the current state
 with `python3 scripts/lib/index_marker.py automatic-ready`. `import-status`
 lists receipts for schemas 2 and 3 and refuses a newer schema. The checked
-consumer and resource-failure safeguards must land before automatic work can
-resume; that readiness does not authorize lifting a freeze or disable sentinel.
+consumer is prepared behind this fence; native evidence and durable
+resource-failure quarantine must complete before automatic work can resume.
+That readiness does not authorize lifting a freeze or disable sentinel.
 
 No ordinary command converts an existing queue. Converting on connect is unsafe
 across code rollbacks: a failed update restores older code but not the queue,
@@ -509,9 +511,47 @@ object. Settlement commands require that whole object as `--context`, including
 canonical repository, hash, provider, protocol, execution sequence and nonce.
 JSON preserves whitespace and Unicode paths; duplicate context fields are
 rejected. An ordinary no-eligible claim returns 1. Queue-operation exceptions
-raised from `main()` return 2 with diagnostics. Earlier startup failures remain
-visible and can still return 1; the later checked consumer must require a closed
-machine acknowledgement before accepting empty eligibility. No hash-only settlement alias selects a new provider claim.
+raised from `main()` return 2 with diagnostics; a busy queue returns 75. At readiness,
+reconciliation, listing, claim and escalation the runner logs a busy queue and
+exits 0, as for an overlapping tick, so routine contention never fails the unit. Earlier startup failures remain
+visible and can still return 1. The checked consumer requires a complete matching
+machine acknowledgement before accepting no eligibility. No hash-only settlement alias selects a new provider claim.
+
+`list-legs`, `claim` and `should-escalate` also accept `--nul`. Every machine
+field ends in NUL, preserving literal whitespace and trailing newlines. Lists
+contain six-field `1,pending,hash,repo,provider,age` records; claims contain
+seven-field `1,claim,hash,repo,provider,mode,context_json` records. No eligibility
+is a four-field `1,unclaimed,hash,provider` record with status 1. Escalation is
+`1,escalation,hash,0|1` with status 0 for either answer. Wire version 1 is
+independent of queue schema 3 and claim protocol 2. Other interfaces are unchanged.
+Listed and claimed repository spellings are validated as stored, never
+re-resolved against the live filesystem, so a queued repository that later moves
+(or gains a symlink) cannot stop the list. A request spooled while the queue was
+busy is still resolved when it is imported.
+
+The consumer checks actual child status, framing and every listed row before
+claiming anything. It dispatches only the claimed provider, using that claim's
+mode and opaque context, and rechecks Codebase disablement after claiming.
+GitNexus full requests do not change Codebase full-index clocks. A malformed
+or failed queue observation stops the tick with 76. The headerless list trusts
+the same-install producer to include the complete population; it cannot detect
+a successful response shortened exactly at a record boundary.
+
+The entrypoint and freeze use the same checked physical repository path before
+lock hashing, including trailing newlines and relative leading-dash spellings.
+Failed resolution stops before taking a repository lock; the freeze's default
+repository selection follows the same normalization.
+Leading slash aliases also collapse to the queue's Python-canonical Linux
+spelling, so `/repo` and `//repo` cannot select different repository locks.
+
+Terminal scalar decisions are retained before application. A busy database can
+leave a durable outcome spool; a later tick replays a retained decision before
+claiming work. This prevents resending a known completed execution. Completion
+with no durable terminal decision has no such guarantee here: native intent,
+uncertainty reconciliation and scope cleanup remain prerequisites for activation.
+The ephemeral transport file is private, removed on ordinary exit and never
+used as recovery evidence. Production readiness remains unqualified by owned
+future-capability simulations with a harmless provider.
 
 Migrated shared debt retains its original values and explicit legacy provenance,
 separately from the effective per-leg count. Old combined inflight work keeps one
@@ -530,10 +570,11 @@ OOM adjustment; only the native child receives 1000. The validated physical main
 path supplies both the native payload and working directory. Final admission
 rechecks managed settings, cache, native readiness and enablement under the
 lifecycle lock, which closes after child creation. Repository/runner locks and
-the scope watchdog retain execution ownership. Missing canonical repository
+the scope watchdog retain foreground execution ownership. The current watchdog
+does not verify scope quiescence after that foreground exits. Missing canonical repository
 locks refuse Codebase; GitNexus retains its independent handling.
 
-This wiring merged in #3012. Read-only availability/access repairs remain tracked
+This wiring merged in #3012. Read-only availability/access repairs merged
 in #3464. Neither fixture acceptance nor a successful probe grants permission to
 clear the sentinel, release the freeze or retry unattended after resource failures.
 Follow the supervised production acceptance and resource gates in
@@ -581,6 +622,49 @@ restoration in disposable storage. Do not assume the install's optional backup
 configuration covers this queue. The migration does not enable indexing, add
 resource quarantine, or implement the checked consumer's list/claim propagation
 tracked in #2043.
+
+### Explicit execution-evidence primitive
+
+`scripts/lib/code_intel_execution.py` is an internal stdlib helper with no
+automatic queue caller. It receives a private report-pipe descriptor, expected
+workload unit, exact cap, existing run bound and an argv vector. It does not
+enable a provider, change admission/limits, stop a scope or settle queue work.
+The caller must supply the existing native/supervisor launcher so maximum OOM
+preference remains confined to its native child. The reporter itself refuses
+maximum OOM preference. Its zero exit status means report delivery only. The
+run bound ends observation, not the payload: a payload still running at the
+deadline is neither signalled nor reaped, so the caller's launcher must stop and
+clean it up, and should pass an absolute executable path.
+
+The helper requires validated cgroup v2 routing, the requested finite memory
+cap, zero swap, hierarchical memory events and same-subtree task accounting.
+Unsupported v1/local-only events or unavailable proof refuse before payload.
+After launch, lost proof or an expired run bound yields uncertainty. It waits
+past foreground exit until only verified reporter tasks remain, including
+recursive descendant checks and the aggregate `pids.current` count, then samples
+and rechecks identity/counters. Owned `oom_kill` counts identify workload victims;
+they do not establish which cap caused the OOM. `high`/`max` and ancestor events
+remain diagnostic, with unavailable ancestor counters explicitly labeled. A final
+sample whose identity, counter population, ancestor availability or reporter
+thread count differs from the first is not retained, and the run stays uncertain:
+the pre-launch report-size bound assumes that shape.
+
+Reports use one bounded atomic JSON pipe write, separate from provider stdout
+and closed in the payload. Standard-descriptor aliases are rejected. Identical
+scope/ancestor identities are encoded once with an explicit shared reference;
+the reader restores all sampled facts. Oversized records refuse rather than
+truncate. The reader accumulates through EOF and rejects malformed, duplicate
+or trailing records. A received record and the reporter's later exit status are
+separate facts; a raw signal is not OOM proof.
+
+Future strict queue wiring must retain ownership through an actual bounded
+stop/quiescence/reap barrier and preserve an unresolved claim if cleanup cannot
+be proved. The existing foreground watchdog is insufficient for that contract.
+Durable intent, interpretation, provider quarantine and supervised recovery are
+separate work; this helper does not implement them. Local synthetic cgroup and
+real descriptor/subprocess fixtures do not establish native kernel OOM behavior
+or production capacity. Keep existing disablement and supervised acceptance
+requirements in force.
 
 ## Verification
 

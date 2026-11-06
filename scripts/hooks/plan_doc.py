@@ -158,6 +158,32 @@ def _visible_text(inline) -> str:
     )
 
 
+#: The tokens parsed while a ``reuse_parses()`` block is open, keyed by the exact
+#: text parsed; None (the default) keeps nothing.
+_REUSED: dict[str, list] | None = None
+
+
+@contextlib.contextmanager
+def reuse_parses():
+    """Parse each distinct text once inside this block, not once per reader.
+
+    ``premise_gate.owed_message`` reaches ``_blocks`` four times for one body
+    (strip, then read, twice over), and markdown-it is super-linear on hostile
+    input, so a caller with a time budget wraps the call in this. What is parsed,
+    and how, does not change: each call still gets fresh ``lines``; the tokens are
+    shared, which is safe because no reader here mutates them. Outside the block
+    nothing is kept, so the server gate and the plan hooks behave as before.
+    """
+    global _REUSED  # noqa: PLW0603
+    outer = _REUSED
+    if outer is None:
+        _REUSED = {}
+    try:
+        yield
+    finally:
+        _REUSED = outer
+
+
 def _blocks(text: str):
     """``(lines, offset, tokens)`` for ``text``, or None without a parser.
 
@@ -170,7 +196,13 @@ def _blocks(text: str):
         return None
     lines = text.replace("\r\n", "\n").split("\n")
     offset = _frontmatter_end(lines)
-    return lines, offset, md.parse("\n".join(lines[offset:]))
+    source = "\n".join(lines[offset:])
+    reused = _REUSED
+    if reused is None:
+        return lines, offset, md.parse(source)
+    if source not in reused:
+        reused[source] = md.parse(source)
+    return lines, offset, reused[source]
 
 
 def strip_quoted(text: str) -> str:

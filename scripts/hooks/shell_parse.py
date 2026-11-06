@@ -71,6 +71,9 @@ _WRAPPER_SPEC = {
             "-R",
             "-h",
             "-t",
+            "-D",
+            "-r",
+            "-T",
             "--user",
             "--group",
             "--prompt",
@@ -78,6 +81,10 @@ _WRAPPER_SPEC = {
             "--close-from",
             "--role",
             "--type",
+            "--host",
+            "--other-user",
+            "--command-timeout",
+            "--chroot",
         },
         0,
     ),
@@ -105,6 +112,10 @@ _WRAPPER_SPEC = {
     # carrier is revealed and the carrier arm catches it — rather than listing
     # `builtin` itself as a carrier, which would over-block `builtin cd`.
     "builtin": (set(), 0),
+    # uutils' multicall binary, the default on Ubuntu 26.04: `coreutils <tool> ...`
+    # runs the tool. GNU's own multicall form, `--coreutils-prog=<tool>`, is not
+    # modelled: no Ubuntu or Debian package ships that build (read, not measured).
+    "coreutils": (set(), 0),
     "exec": ({"-a"}, 0),
     # `-e/--eof` and `-i/--replace` are NOT here, and their absence is the point.
     # xargs gives them OPTIONAL values (`--eof[=END]`, `--replace[=R]`), so as a
@@ -513,7 +524,7 @@ _COMMIT_ARG_FLAGS = "mFCc"
 class Segment:
     """One executed command segment."""
 
-    exe: str  # resolved executable basename (e.g. "git", "gh"), "" if unknown
+    exe: str  # resolved executable's usual name (e.g. "git", "gh"), "" if unknown
     argv: list[str]  # argv with wrappers/env-assignments stripped
     override: bool  # a trailing `# review-override` shell comment on this segment
     raw: str  # the raw segment text (for messages)
@@ -1170,6 +1181,9 @@ _KNOWN_SIGILS = (
     # acknowledgement or `## Rework` section. Needs the owner's yes; logged.
     "rework-override",
     "discard-override",
+    # pr_open_review_gate: open a PR with no independent review, on the owner's yes in
+    # conversation. Refused in a dispatched session; logged.
+    "pr-review-waived",
     # Both were passed to has_trailing_override from the day they shipped but never
     # listed here, so the "kept in sync" claim above was false. The consequence is
     # silent and asymmetric: the sigil queried FOR ITSELF still matches, so nothing
@@ -1900,6 +1914,35 @@ _BLIND_BUILT_ESCAPE = BlindSpot(
     ),
 )
 
+_BLIND_BASH53_SUBSTITUTION = BlindSpot(
+    bounds_induced=True,
+    cause=(
+        "contains the text `${` followed by a space, tab, newline or `|`, which bash 5.3 "
+        "runs as a command and this parser does not model"
+    ),
+    hint=(
+        "use $(...), or if it is only text (a message, a script body), write that text to "
+        "a file instead"
+    ),
+)
+
+#: bash 5.3's ``${ cmd; }`` and ``${| cmd; }``, which an older bash refuses. REPORTED,
+#: NOT MODELLED, for the reason :data:`_BLIND_CONTINUATION` is. Reading one takes knowing
+#: where it closes, which depends on comments and here-docs in its body, and what follows
+#: it still runs: a body that expands to nothing leaves the rest as the command. So this
+#: reads the text alone, in quotes or not, which means a mention in single quotes or a
+#: comment is refused too. MEASURED: 24 of 158,389 distinct Bash commands across one
+#: install's session transcripts held such text at all, and of 127 bytes tried after
+#: `${` on real bash 5.3, exactly these 4 ran a command. A here-doc whose body is proven
+#: data was excised before this sees it.
+_BASH53_SUBSTITUTION = re.compile(r"\$\{[ \t\n|]")
+
+
+def has_bash53_substitution(command: str) -> bool:
+    """True when :data:`_BLIND_BASH53_SUBSTITUTION` applies to this text."""
+    return _BASH53_SUBSTITUTION.search(command) is not None
+
+
 _BLIND_STRUCTURAL = BlindSpot(
     bounds_induced=True,
     cause=(
@@ -2515,6 +2558,7 @@ def rewrites_before_running(command: str) -> bool:
     return (
         has_continuation(command)
         or has_built_escape(command)
+        or has_bash53_substitution(command)
         or _heredoc_hides_suffix(command)
     )
 
@@ -2682,6 +2726,7 @@ _ALL_BLIND_SPOTS = (
     _BLIND_UNCLASSIFIED_OPTION,
     _BLIND_CONTINUATION,
     _BLIND_BUILT_ESCAPE,
+    _BLIND_BASH53_SUBSTITUTION,
     _BLIND_STRUCTURAL,
     _BLIND_HEREDOC_BODY,
 )
@@ -2821,9 +2866,39 @@ def analyze_policy(command: str) -> tuple[list[PolicySegment], BlindSpot | None]
     return ([], blind) if blind else (sorted(records, key=lambda s: s.position), None)
 
 
+#: Ubuntu 26.04 keeps GNU coreutils and classic sudo beside their replacements, under
+#: other names, and every rule keyed on the usual name has to see them. `gnu<tool>` is a
+#: program from the `gnu-coreutils` package. The list is that package's file list (105,
+#: including the one in sbin), not a pattern, so `gnuplot` stays itself.
+_GNU_COREUTILS = frozenset("""
+    [ arch b2sum base32 base64 basename basenc cat chcon chgrp chmod chown chroot cksum comm
+    cp csplit cut date dd df dir dircolors dirname du echo env expand expr factor false
+    fmt fold groups head hostid id install join link ln logname ls md5sum mkdir mkfifo
+    mknod mktemp mv nice nl nohup nproc numfmt od paste pathchk pinky pr printenv
+    printf ptx pwd readlink realpath rm rmdir runcon seq sha1sum sha224sum sha256sum
+    sha384sum sha512sum shred shuf sleep sort split stat stdbuf stty sum sync tac tail
+    tee test timeout touch tr true truncate tsort tty uname unexpand uniq unlink users
+    vdir wc who whoami yes
+""".split())  # noqa: SIM905 - the package's file list, one edit away from a re-measure
+#: From `sudo-ws` and `sudo-rs`. Their other programs (`visudo.ws`, `sudoedit-rs`, ...)
+#: run no command.
+_RENAMED_TOOLS = {"sudo.ws": "sudo", "sudo-rs": "sudo", "su-rs": "su"}
+
+
 def _basename(token: str) -> str:
-    """Executable basename: /usr/bin/git → git, ./foo → foo."""
-    return token.rsplit("/", 1)[-1]
+    """Executable basename under its usual name: /usr/bin/git → git, ./foo → foo,
+    gnurm → rm."""
+    name = token.rsplit("/", 1)[-1]
+    if name in _RENAMED_TOOLS:
+        return _RENAMED_TOOLS[name]
+    if name.startswith("gnu") and name[3:] in _GNU_COREUTILS:
+        return name[3:]
+    return name
+
+
+def tool_name(token: str) -> str:
+    """The name a guard should match this command word by. See `_basename`."""
+    return _basename(token)
 
 
 def _is_hatch_selector(token: str) -> bool:
@@ -3045,7 +3120,7 @@ def _is_prefix_assignment(tok: str) -> bool:
 
 
 _POLICY_NEUTRAL_WRAPPERS = frozenset({
-    "command", "builtin", "exec", "time", "timeout", "nice", "nohup", "stdbuf", "setsid", "chrt", "ionice", "xargs",
+    "command", "builtin", "coreutils", "exec", "time", "timeout", "nice", "nohup", "stdbuf", "setsid", "chrt", "ionice", "xargs",
 })
 
 
@@ -4149,6 +4224,7 @@ def _analyze_bounded(
     structural_incomplete = _depth > 0 and _raw_untokenizable(command)
     continuation = has_continuation(command)
     built_escape = has_built_escape(command)
+    bash53_substitution = has_bash53_substitution(command)
     # The newlines this parse split on, from the SAME parse, so the here-doc check
     # compares bash's body boundary against this parse rather than a second model.
     splits: list[int] = []
@@ -4260,6 +4336,7 @@ def _analyze_bounded(
             structural_message = structural_message or inner.diagnostic is _BLIND_STRUCTURAL
             continuation = continuation or inner.diagnostic is _BLIND_CONTINUATION
             built_escape = built_escape or inner.diagnostic is _BLIND_BUILT_ESCAPE
+            bash53_substitution = bash53_substitution or inner.diagnostic is _BLIND_BASH53_SUBSTITUTION
             for inner_segment in inner.segments:
                 out.append(
                     Segment(
@@ -4283,6 +4360,8 @@ def _analyze_bounded(
         diagnostic = _BLIND_CONTINUATION
     elif built_escape:
         diagnostic = _BLIND_BUILT_ESCAPE
+    elif bash53_substitution:
+        diagnostic = _BLIND_BASH53_SUBSTITUTION
     elif structural_message:
         diagnostic = _BLIND_STRUCTURAL
     elif root_untokenizable:
@@ -4915,6 +4994,41 @@ _GH_FLAG_TABLE: dict[tuple[str, str], tuple[frozenset[str], frozenset[str]]] = {
         frozenset({'--all', '--help', '-a'})),
 }
 
+#: ``gh issue new`` is an alias of ``gh issue create`` (``gh help issue new`` prints
+#: the create help), so it shares the row rather than falling back to the union.
+_GH_FLAG_TABLE[("issue", "new")] = _GH_FLAG_TABLE[("issue", "create")]
+
+#: The subcommands that file a new issue, and the tokens that make one open the
+#: browser instead (pflag's true spellings of ``--web``). Shared by the hooks that
+#: read an issue create, so they agree on what files one.
+GH_ISSUE_CREATE_SUBCOMMANDS = frozenset({"create", "new"})
+#: pflag's boolean value set (``strconv.ParseBool``): gh rejects any other value.
+GH_TRUE_VALUES = frozenset({"1", "t", "T", "TRUE", "true", "True"})
+GH_FALSE_VALUES = frozenset({"0", "f", "F", "FALSE", "false", "False"})
+GH_WEB_FLAGS = frozenset({"--web", "-w"}) | frozenset(
+    f"{flag}={value}" for flag in ("--web", "-w") for value in GH_TRUE_VALUES
+)
+
+
+def gh_bool(opts: list[tuple[str, str | None]], names: frozenset[str]) -> bool | None:
+    """The value gh gives a boolean option, from :func:`gh_option_values` pairs.
+
+    The last spelling wins, as in pflag; a bare flag is true; absent is false. None
+    when any value is outside pflag's boolean set (``--web=yes``, ``--web=``): gh
+    refuses the command, so a caller must not read it as false."""
+    state = False
+    for name, value in opts:
+        if name not in names:
+            continue
+        if value is None or value in GH_TRUE_VALUES:
+            state = True
+        elif value in GH_FALSE_VALUES:
+            state = False
+        else:
+            return None
+    return state
+
+
 #: The UNION across every modeled row, used while the command path is still
 #: unresolved — which is exactly where gh itself applies it. MEASURED against
 #: the real CLI: ``gh -X PATCH api --help`` resolves to ``gh api`` and
@@ -5178,6 +5292,41 @@ def gh_api_request(argv: list[str]) -> GhApiRequest | None:
         has_input,
         inv.unmodelled,
     )
+
+
+def gh_option_values(argv: list[str], names: frozenset[str]) -> list[tuple[str, str | None]]:
+    """Every option in ``names`` that a ``gh`` argv carries, in argv order.
+
+    Each is ``(name, value)``: a value flag's argument (glued, ``=``-attached or the
+    next token, the last of which may start with a dash: ``-b --help`` is a body),
+    or a boolean's ``=``-attached value, or None for a bare boolean. Names are
+    matched as spelled (``-R`` and ``--repo`` are separate entries). The walk is
+    :func:`gh_api_request`'s two-phase grammar: the union of every row before the
+    command path, the resolved row after it. Returns [] for a non-``gh`` argv.
+    """
+    inv = gh_command(argv)
+    if inv is None:
+        return []
+    row = _GH_FLAG_TABLE.get((inv.group, inv.subcommand or ""))
+    post_values = row[0] if row is not None else _GH_ALL_VALUE_FLAGS
+    out: list[tuple[str, str | None]] = []
+    i = 1
+    while i < len(argv):
+        tok = argv[i]
+        if tok == "--":
+            break
+        if not tok.startswith("-") or tok == "-":
+            i += 1
+            continue
+        flags = _GH_ALL_VALUE_FLAGS if i < inv.path_end else post_values
+        name, value = _gh_option(tok, flags)
+        if name in flags and value is None:
+            i += 1
+            value = argv[i] if i < len(argv) else ""
+        if name in names:
+            out.append((name, value))
+        i += 1
+    return out
 
 
 _GH_HELP_FLAGS = frozenset({"-h", "--help"})
