@@ -399,7 +399,7 @@ class Judge:
     directory moved aside may hold no extra file git does not ignore)."""
 
     def __init__(self, rp, repo: str, backup: str, loaded: dict, newer: dict, *, records=None,
-                 runs=None, shown=None, strict=False, fd=None) -> None:  # fmt: skip
+                 runs=None, shown=None, strict=False, fd=None, complete=True) -> None:  # fmt: skip
         self.rp, self.repo, self.backup = rp, repo, backup
         self.budget, self.blockers = _Budget(rp), set()
         # _kept re-reads saved copies the walk already read once: its own budget,
@@ -410,6 +410,9 @@ class Judge:
         report, self.rows = loaded["report"], loaded["rows"]
         self.records, self.runs, self.shown, self.strict = records or {}, runs, shown, strict
         self.integrity, self.git_dir = records is not None, None
+        # SAVED.json's `complete`: false when the writer stopped recording at its
+        # cap (#3986 review), so a saved directory's inventory cannot be trusted whole.
+        self.complete = complete
         self.fds = () if fd is None else (fd,)
         self.record_keys = sorted(self.records)  # _dir's per-row range, by bisect
         block = restore_block(report)
@@ -547,7 +550,8 @@ class Judge:
         ``aside``: a root holding the directory ``below`` moved out of the
         checkout (#3986 review, finding 3). Its own ignore rules moved with it,
         so a rule inside it (git's most specific) decides, read in the aside;
-        else the checkout's rules outside it do."""
+        else the checkout's rules outside it do. Below a directory either
+        excludes, nothing is re-included (git's rule)."""
         if not paths:
             return set()
         if aside is None:
@@ -555,33 +559,46 @@ class Judge:
             return set(self.rp._z(p.stdout)) if p.returncode in (0, 1) else set()
         if self.git_dir is None:
             self.git_dir = self.rp._out(self.repo, "rev-parse", "--absolute-git-dir", check=False)
-        inner = self._rules(["-C", aside, "--git-dir", self.git_dir, "--work-tree", aside], paths)
-        outer = self._rules(["-C", self.repo], paths)
-        out = set()
-        for q in paths:
+        # Every ancestor directory is judged too, as git does: nothing below an
+        # excluded directory is re-included, whatever a rule inside it says
+        # (#3986 review: the checkout ignoring sub/ outranks sub/'s `!x.cache`).
+        # A directory is asked with --no-index: one holding tracked files reads
+        # as matching no rule otherwise, though the untracked files below it
+        # are excluded by it (MEASURED, git 2.43).
+        dirs = sorted({d + "/" for q in paths for d in self.rp._parents(q)})
+        aside_git = ["-C", aside, "--git-dir", self.git_dir, "--work-tree", aside]
+        inner = {**self._rules(aside_git, paths), **self._rules(aside_git, dirs, no_index=True)}
+        outer = {**self._rules(["-C", self.repo], paths),
+                 **self._rules(["-C", self.repo], dirs, no_index=True)}  # fmt: skip
+
+        def excluded(q: str) -> bool:
             src, pat = inner.get(q, ("", ""))
             if not src.startswith(below + "/"):
                 src, pat = outer.get(q, ("", ""))
                 if src.startswith(below + "/"):  # a node the restore put there: not the aside's
-                    continue
-            if pat and not pat.startswith("!"):
-                out.add(q)
-        return out
+                    return False
+            return bool(pat) and not pat.startswith("!")
 
-    def _rules(self, where: list[str], paths: list[str]) -> dict:
+        shut = {d for d in dirs if excluded(d)}
+        return {q for q in paths
+                if any(d + "/" in shut for d in self.rp._parents(q)) or excluded(q)}  # fmt: skip
+
+    def _rules(self, where: list[str], paths: list[str], no_index: bool = False) -> dict:
         """`check-ignore -v -n`: path -> (source, pattern) of the last rule
         matching it (a negation starts with "!"); {} when it fails."""
-        p = self._check_ignore(where, paths, verbose=True)
+        if not paths:
+            return {}
+        p = self._check_ignore(where, paths, verbose=True, no_index=no_index)
         if p.returncode not in (0, 1):
             return {}
         f = [os.fsdecode(x) for x in p.stdout.split(b"\0")]
         return {f[i + 3]: (f[i], f[i + 2]) for i in range(0, len(f) - 3, 4)}
 
-    def _check_ignore(self, where: list[str], paths: list[str], verbose: bool):
+    def _check_ignore(self, where: list[str], paths: list[str], verbose: bool, no_index=False):
         # An aside below /proc/self/fd/N is only reachable by git through fd N.
         return subprocess.run(
             ["git", *self.rp.GIT_C, *where, "check-ignore", "-z", "--stdin",
-             *(("-v", "-n") if verbose else ())],
+             *(("-v", "-n") if verbose else ()), *(("--no-index",) if no_index else ())],
             input=b"".join(os.fsencode(q) + b"\0" for q in paths),
             capture_output=True,
             env=_git_env(),
@@ -653,12 +670,28 @@ class Judge:
         self.notes[(p, "node")] = f"newer content kept at {where}"
         return False
 
+    def _as_recorded(self, rel: str, state):
+        """The node the copy at ``rel`` stands for: its state with SAVED.json's
+        mode, the one the restore writes (a file's record mode & 0o777, a
+        FIFO's without setuid, setgid, sticky), never the copy's own, which a
+        chmod after the repair can change (#3986 review). A file's git mode
+        takes the exec bit as the repair does (S_IXUSR). No record (a report
+        written before SAVED.json): the copy as it is."""
+        rec = self.records.get(rel)
+        if not state or not rec:
+            return state
+        if state[0] == "fifo" and rec["type"] == "fifo":
+            return _fifo(rec["mode"])
+        if state[0] in ("100644", "100755") and rec["type"] == "file":
+            return ("100755" if int(rec["mode"], 8) & stat.S_IXUSR else "100644", state[1])
+        return state
+
     def _saved_node(self, row: dict):
         """(is it saved, the saved node) of a non-directory row's disk part."""
         special = row.get("special")
         if row["saved_as"]:
             saved = self._state(self.backup, row["saved_as"])
-            return saved is not None, saved
+            return saved is not None, self._as_recorded(row["saved_as"], saved)
         if special and special["type"] == "fifo":
             return True, _fifo(special["mode"])
         return True, (special["type"], special["mode"]) if special else None
@@ -825,6 +858,16 @@ class Judge:
     def _dir(self, row: dict, link, gate: str | None) -> list[tuple[str, str, str]]:
         """A directory row: its node, then each saved entry the restore would write."""
         p = row["path"]
+        if self.integrity and not self.complete:
+            # #3986 review: past the writer's cap SAVED.json records nothing
+            # more, so a saved copy gone from the backup unrecorded is invisible
+            # here, and the directory would be built without it. It goes back
+            # by hand (a refusal no rerun turns into a write).
+            self.notes[(p, "node")] = (
+                "SAVED.json is incomplete (complete: false), so this saved directory"
+                " cannot be checked whole"
+            )
+            return [(p, "node", "other:no-hash")]
         if not self._real_dir(self.backup, row["saved_as"]):
             return [(p, "node", "other:not-saved")]
         restore, kept, unread = {}, {}, []
@@ -839,9 +882,7 @@ class Judge:
             i += 1
         for q, s in saved.items():
             rel = f"{row['saved_as']}/{q}"
-            rec = self.records.get(rel)
-            if s and s[0] == "fifo" and rec and rec["type"] == "fifo":
-                s = _fifo(rec["mode"])  # what the restore makes: the record's mode
+            s = self._as_recorded(rel, s)  # what the restore makes: the record's mode
             # The update's own bytes, left out, only while the copy is the one
             # SAVED.json records (#3986 review): a copy changed to the target's
             # bytes is restored instead, where staging refuses it.
@@ -1068,7 +1109,7 @@ def _judged(rp, repo: str, ctx, say, write: bool, nothing: str):
         return f"other:unreadable ({exc})"
     if why := problem(loaded, rp.REPORT_BYTES, rp._parents):
         return f"other:bad-report ({why})"
-    records, report = None, loaded["report"]
+    records, complete, report = None, True, loaded["report"]
     if "integrity" not in report:
         if write:
             return "other:no-integrity (written before SAVED.json)"
@@ -1078,7 +1119,7 @@ def _judged(rp, repo: str, ctx, say, write: bool, nothing: str):
         why, saved = _saved(rp, backup) if named else ("integrity names another file", None)
         if why:
             return f"other:bad-report (SAVED.json: {why})"
-        records = saved["files"]
+        records, complete = saved["files"], saved["complete"]
     nodes = {r["path"] for r in loaded["rows"] if r["class"] == "foreign"
              and r["disk_changed"] and not r["unreachable_through"]}  # fmt: skip
     whole = {r["path"] for r in loaded["rows"] if r["disk"] == "dir" and r["disk_changed"]}
@@ -1090,7 +1131,7 @@ def _judged(rp, repo: str, ctx, say, write: bool, nothing: str):
         return f"other:newer-report-unreadable ({why})"
     try:
         judge = Judge(rp, repo, backup, loaded, newer, records=records, runs=ctx.root,
-                      shown=ctx.shown, strict=write, fd=ctx.bfd)  # fmt: skip
+                      shown=ctx.shown, strict=write, fd=ctx.bfd, complete=complete)  # fmt: skip
     except rp.RepairError as exc:
         return f"other:tree-unreadable (HEAD's or the tag's tree: {exc})"
     try:

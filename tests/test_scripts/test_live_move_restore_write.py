@@ -48,6 +48,7 @@ from tests.test_scripts._live_repair_world import (
     _foreign_unmerged,
     _foreign_untracked,
     _git,
+    _git_env,
     _hash,
     _lock_aside,
     age_locks,
@@ -1315,6 +1316,194 @@ def test_a_flag_set_after_the_repair_is_never_dropped_by_the_index_call(w):
     assert _git(w.root, "ls-files", "-v", "--", "A").startswith("S "), "the newer flag was lost"
     assert _git(w.root, "ls-files", "-s", "--", "A") == index
     assert w.report()["restore"]["restored_at"] is None
+
+
+def _unmerged_below_a_file(w):
+    """The index holds a file `sub` and an unmerged `sub/s1` (stages 1-3),
+    which git keeps side by side (MEASURED, git 2.43)."""
+    sides = [_hash(w, f"side {n}\n") for n in (1, 2, 3)]
+    _git(w.root, "update-index", "--force-remove", "sub/s1", "sub/t")
+    info = "".join(f"100644 {o} {n}\tsub/s1\n" for n, o in zip((1, 2, 3), sides, strict=True))
+    subprocess.run(
+        ["git", "-C", str(w.root), "update-index", "--index-info"],
+        input=info, text=True, check=True, env=_git_env(),
+    )  # fmt: skip
+    staged = _hash(w, "STAGED SUB\n")
+    _git(w.root, "update-index", "--add", "--cacheinfo", f"100644,{staged},sub")
+    return "sub"
+
+
+def _back_below_a_refused_file(w) -> str:
+    """Run 1 puts sub/s1's unmerged stages back and refuses the stage-0 file
+    `sub` (a session staged sub/new below it); sub/new is then gone again, so
+    run 2 writes `sub`, whose footprint holds sub/s1, already back."""
+    ts = _repaired(w, _unmerged_below_a_file)
+    new = _hash(w, "NEW\n")
+    _git(w.root, "update-index", "--add", "--cacheinfo", f"100644,{new},sub/new")
+    r = _restore(w, ts)
+    assert r.returncode == 1 and _parts(r)[("sub", "index")].startswith("refused:"), r.stdout
+    assert _parts(r)[("sub/s1", "index")] == "restored", "control: sub/s1 back in run 1"
+    _git(w.root, "update-index", "--force-remove", "sub/new")
+    return ts
+
+
+def _stages(w, path: str) -> list[str]:
+    return [ln.split()[2] for ln in _git(w.root, "ls-files", "-s", "--", path).splitlines()]
+
+
+def test_an_index_part_already_back_keeps_its_entries_under_a_file_written_later(w):
+    """#3986 review: a stage-0 record drops every entry below it, and an index
+    part already back can sit in another row's footprint. Its saved entries
+    are written again in the same update-index call (and the whole index then
+    checked with them), so a run that clears the report never leaves them
+    deleted; the post-check judges that part again too."""
+    ts = _back_below_a_refused_file(w)
+    r = _restore(w, ts)
+    assert _stages(w, "sub/s1") == ["1", "2", "3"], r.stdout
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _parts(r)[("sub", "index")] == "restored", r.stdout
+    _converged(w, ts)
+
+
+def test_a_flagged_entry_already_back_in_a_footprint_still_refuses(w, mod, monkeypatch, capsys):
+    """The entries rewritten for an index part already back are still checked
+    for flags first: a flag the restore does not set again refuses the call
+    (`other:flag-changed`), and nothing at or below the path changes. Git
+    refuses to flag an unmerged entry (`Unable to mark file`, MEASURED on git
+    2.43), so the flag is faked in the index read the restore makes."""
+    ts = _back_below_a_refused_file(w)
+    index = _git(w.root, "ls-files", "-s")
+    real = mod._index_state
+
+    def flagged(repo):
+        entries, flags = real(repo)
+        return entries, {**flags, "sub/s1": "S"}
+
+    monkeypatch.setattr(mod, "_index_state", flagged)
+    rc, out = _restore_in(w, mod, monkeypatch, capsys, ts)
+    assert rc == 1 and _parts_of(out)[("sub", "index")] == "refused:other:flag-changed", out
+    assert '"sub/s1" holds a flag (S) the index call would drop' in out, out
+    assert _git(w.root, "ls-files", "-s") == index and _stages(w, "sub/s1") == ["1", "2", "3"]
+
+
+@pytest.mark.parametrize(
+    ("make", "rel", "part"),
+    [
+        (_foreign_edit, "sub/s1", ("sub/s1", "node")),
+        (_foreign_inside_dir, "P/mine.txt", ("P", "node")),  # an entry of a saved directory
+    ],
+)
+def test_a_saved_copys_exec_bit_never_outranks_its_record(w, make, rel, part):
+    """#3986 review: the node a saved copy stands for takes SAVED.json's mode,
+    the one the restore writes (its record's & 0o777), never the copy's. A copy
+    chmodded after the repair neither makes the post-check refuse the
+    restore's own write on every rerun nor lets a checkout with that mode read
+    already-restored."""
+    ts = _repaired(w, make)
+    copy = w.backups()[-1] / "tree" / rel
+    assert not os.lstat(copy).st_mode & 0o100, "control: saved without the exec bit"
+    os.chmod(copy, 0o700)
+    r = _restore(w, ts)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not os.lstat(w.root / rel).st_mode & 0o100, "the record's mode"
+    _converged(w, ts)
+    os.chmod(w.root / rel, 0o755)
+    assert _parts(_check(w, ts))[part] == "other:changed"
+
+
+def test_a_saved_executable_that_lost_its_bit_never_reads_restored(w):
+    """#3986 review: a saved executable whose backup copy and checkout copy
+    both lose the exec bit is not the saved state: SAVED.json records it
+    executable, and the copy stands for that record."""
+    ts, path, _ = _fresh(w, lambda w: (_foreign_edit(w), (w.root / "sub/s1").chmod(0o755))[0])
+    r = _restore(w, ts)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert os.lstat(w.root / path).st_mode & 0o100, "control: restored executable"
+    os.chmod(w.backups()[-1] / "tree" / path, 0o644)
+    os.chmod(w.root / path, 0o644)
+    assert _parts(_check(w, ts))[(path, "node")] == "other:changed"
+
+
+def test_a_saved_directory_with_an_incomplete_inventory_is_refused(w):
+    """#3986 review: past its cap SAVED.json records nothing more and says
+    `complete: false`. A saved file it never recorded, gone from the backup
+    since, is invisible, so the directory would be built without it and the
+    report cleared. Both judges refuse a saved directory then, as a part that
+    goes back by hand."""
+    ts = _repaired(w, _foreign_inside_dir)
+    saved = w.backups()[-1] / "tree" / "P" / "mine.txt"
+    saved.unlink()  # unrecorded, then lost from the backup
+    _saved_json(w, lambda d: (d["files"].pop("tree/P/mine.txt"), d.update(complete=False)))
+    c = _check(w, ts)
+    assert c.returncode == 1 and _parts(c)[("P", "node")] == "other:no-hash", c.stdout
+    r = _restore(w, ts)
+    assert r.returncode == 1 and _parts(r)[("P", "node")] == "refused:other:no-hash", r.stdout
+    assert "incomplete" in r.stdout and "by hand" in r.stdout, r.stdout
+    assert (w.root / "P").read_text() == "p\n" and w.report()["restore"]["restored_at"] is None
+
+
+def test_an_aside_check_never_spends_the_judges_budget(w, mod, monkeypatch, capsys):
+    """#3986 review: the judge's read budget is spent judging every row; each
+    check of an aside reads on its own, so a tag node checked again after the
+    move is never read as changed because the shared budget ran out."""
+    ts = _repaired(w, _foreign_edit)
+    made = []
+
+    def capture(kit, mp):
+        init = kit._Writer.__init__
+
+        def keep(self, *a):
+            init(self, *a)
+            made.append(self)
+
+        mp.setattr(kit._Writer, "__init__", keep)
+
+    def drain():
+        made[0].j.budget.entries = made[0].j.budget.bytes = 0  # the rows judged first used it
+
+    rc, out = _restore_in(w, mod, monkeypatch, capsys, ts, at={"intent": drain}, patch=capture)
+    assert rc == 0 and _parts_of(out)[("sub/s1", "node")] == "restored", out
+    assert (w.root / "sub" / "s1").read_text() == "mine\n"
+
+
+def test_a_flag_is_never_set_on_an_entry_staged_after_the_judge(w, mod, monkeypatch, capsys):
+    """#3986 review: a flag-only part (the index as the tag's) is set on the
+    entry the judge read. A session staging a newer blob there in between is
+    refused `changed-during-restore`: its entry is never flagged."""
+    ts = _repaired(w, _foreign_skip_worktree)
+    oid = _hash(w, "staged by a session\n")
+    stage = lambda: _git(w.root, "update-index", "--cacheinfo", f"100644,{oid},sub/s1")  # noqa: E731
+    rc, out = _restore_in(w, mod, monkeypatch, capsys, ts, at={"index": stage})
+    assert rc == 1 and _parts_of(out)[("sub/s1", "flag")] == "refused:changed-during-restore", out
+    assert _git(w.root, "ls-files", "-v", "--", "sub/s1").startswith("H "), "flagged anyway"
+    assert oid in _git(w.root, "ls-files", "-s", "--", "sub/s1")
+
+
+@pytest.mark.parametrize("killed", [False, True])
+def test_a_directory_the_checkout_ignores_keeps_its_files_ignored_in_the_aside(
+    tmp_path, monkeypatch, killed
+):
+    """#3986 review: the checkout ignores sub/ and the tag's sub/.gitignore
+    re-includes `x.cache`. Git never re-includes below an excluded directory
+    (MEASURED, git 2.43: `check-ignore -v` names the checkout's `sub/`), so
+    the aside is judged the same way: the cache stays an ignored extra, the
+    restore converges, and one killed after the aside resumes."""
+    from tests.test_scripts import _live_repair_world as world
+
+    monkeypatch.setitem(world.TAG_FILES, "sub/.gitignore", "!x.cache\n")
+    w = World(tmp_path)
+    ts, path, before = _fresh(w, _dir_file)
+    # The checkout's own .gitignore (not .git/info/exclude, which the aside's
+    # check reads too, sharing the checkout's git dir): only it stays behind.
+    (w.root / ".gitignore").write_text("sub/\n")
+    (w.root / "sub" / "x.cache").write_bytes(b"cache")
+    assert _parts(_check(w, ts))[("sub", "node")] == "as-left", "control"
+    if killed:
+        assert _restore(w, ts, **{KILL_ENV: "aside"}).returncode == -9
+    r = _restore(w, ts)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _state_of(w, path) == before
+    _converged(w, ts)
 
 
 def test_a_restore_killed_between_its_two_flag_writes_converges(w):

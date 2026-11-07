@@ -4717,7 +4717,10 @@ Refusing a proposed update preserves a previously valid opt-in.
   it; its index entries, only where they differ from the tag's; its flag) is
   printed as `as-left` (the tag's state: the repair's), `already-restored`
   (the saved state, every saved copy it compares still the one `SAVED.json`
-  records) or `other:<reason>`. An as-left part counts as restorable
+  records) or `other:<reason>`. A saved copy stands for its record's mode,
+  the one the restore writes (a file's executable bit read as the repair reads
+  it, S_IXUSR; a FIFO's without setuid, setgid and sticky), never the copy's
+  own, so a copy chmodded after the repair changes no verdict. An as-left part counts as restorable
   only while HEAD's entries at, below and above the path equal the tag's
   (`changed-upstream`), the index there equals the tag's except at rows
   already restored (`index-changed`), no index entry sits at a parent, no
@@ -4736,7 +4739,10 @@ Refusing a proposed update preserves a previously valid opt-in.
   stricter (it moves the whole directory aside): every other file there must
   be one git ignores (once moved aside, by the rules that moved with it: a
   rule inside the directory decides, read in the aside, else the checkout's
-  outside it). A restored directory with extras git ignores (the
+  outside it; and, as git does, nothing below a directory excluded by either
+  is re-included by a rule inside it, each directory asked with `--no-index`,
+  since one holding tracked files matches no rule otherwise, MEASURED on git
+  2.43). A restored directory with extras git ignores (the
   server's `__pycache__`) still reads already-restored. An index part whose blob is
   neither saved (a regular `index-blobs/<oid>` hashing to it) nor in the
   object store is `other:not-saved`. Every file is hashed in 1 MiB chunks
@@ -4749,7 +4755,10 @@ Refusing a proposed update preserves a previously valid opt-in.
   copy is not the one `SAVED.json` records (so a copy changed to the target's
   bytes is staged, and refused, never left out as the update's); only the
   foreign rows themselves when the target cannot be read; sockets
-  and devices are `other:cannot-make`. Exit 0 only when every part is as-left
+  and devices are `other:cannot-make`. A saved directory whose `SAVED.json`
+  says `complete: false` is `other:no-hash`, a part that goes back by hand: a
+  copy it never recorded and the backup lost since cannot be seen, so the
+  directory could be built without it. Exit 0 only when every part is as-left
   or already-restored. It writes no report and no backup; like the repair, it
   creates `locks/update.lock` and `.git/genesis-checkout.lock` when they are
   missing.
@@ -4768,7 +4777,8 @@ Refusing a proposed update preserves a previously valid opt-in.
   0o777, so setuid, setgid and sticky never come back; a directory row built
   whole without the update's own files; a FIFO from its row's or record's
   mode); record the part in flight; move what is at the path to
-  `<run>/aside/<path>` (folders made 0700); judge the aside again (a write
+  `<run>/aside/<path>` (folders made 0700); judge the aside again, each such
+  read on a budget of its own, never the one judging every row spent (a write
   since the judge is put back and the part refused
   `changed-during-restore`); put the staged node in with
   `renameat2(RENAME_NOREPLACE)` through ctypes (the one move it makes, for
@@ -4807,8 +4817,11 @@ Refusing a proposed update preserves a previously valid opt-in.
   refused `changed-during-restore`, a stage-0 part with a refused row below
   it `child-refused`, one whose footprint holds a flag (read with the index)
   that the restore does not set again after the call `other:flag-changed`
-  (the call re-creates entries unflagged), and the footprint is dropped explicitly; after the call
-  the WHOLE index must be the one expected, else every index part
+  (the call re-creates entries unflagged), and the footprint is dropped explicitly. A row
+  whose index part is already back can sit in that footprint (an unmerged entry
+  below a stage-0 file, which git keeps beside it, MEASURED on git 2.43): its
+  saved entries are written again in the same call, never dropped. After the call
+  the WHOLE index must be the one expected (those entries included), else every index part
   `index-skipped`, naming `<run>/index-before.txt`, where the footprint's
   entries from before the call were written (0600, `ls-files -s -z` records)
   before it ran; an index part runs only when the node part of its path and of
@@ -4816,10 +4829,13 @@ Refusing a proposed update preserves a previously valid opt-in.
   its directory row); a failing call (a session's git holding `index.lock`)
   refuses them `index-locked`. Flags go after the call (S skip-worktree, a
   lowercase tag assume-unchanged, s both: skip-worktree first, so the S a run
-  killed between the two leaves reads as-left; a failure `flag-failed`), then one
+  killed between the two leaves reads as-left; a failure `flag-failed`), each
+  only on the entry the judge read or the index call wrote, the index read
+  once right before them (one a session staged since is `changed-during-restore`,
+  never flagged; the same milliseconds residual as the index call), then one
   `update-index -q --refresh`, then a second judge that must read
-  already-restored for every part written, and for a flag already restored
-  whose entry the index call replaced (else `post-check`).
+  already-restored for every part written, and for a flag or an index part
+  already restored whose entry the index call replaced (else `post-check`).
   `REPAIR.json` gets a `restore` block, `{inflight: [run, path, "node"] |
   null, refused: <int>, restored_at: <str> | null}` (no per-part list; the
   output carries those), rewritten under update.lock after a re-read;

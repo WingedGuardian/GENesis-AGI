@@ -328,10 +328,18 @@ class _Writer:
         return True
 
     def _still_left(self, p: str, run: str) -> bool:
+        """Is the aside of ``p`` still the as-left state? Each such read has a
+        budget of its own (#3986 review): the judge's was spent judging every
+        row, and a large tag directory read again after the move would else
+        run it out and read as changed, refusing (or holding) for nothing."""
+        j = self.j
+        spent, j.budget = j.budget, self.chk._Budget(self.rp)
         try:
-            return self.j._left(p, root=os.path.join(self.ctx.root, run, "aside"), strict=True)
+            return j._left(p, root=os.path.join(self.ctx.root, run, "aside"), strict=True)
         except (OSError, self.rp.TooLarge):
             return False
+        finally:
+            j.budget = spent
 
     def _extras(self, p: str, run: str) -> None:
         """Review SF-D: ignored files a tag directory moved aside held, to name."""
@@ -460,7 +468,8 @@ class _Writer:
         part of that row refused) is refused, and its parents `child-refused`;
         so is one whose footprint holds a flag the restore does not set again
         after the call (`other:flag-changed`: the call re-creates entries
-        unflagged); each footprint is dropped explicitly. After the call the WHOLE index
+        unflagged); each footprint is dropped explicitly, and the entries of a
+        row already back inside one are written again in the same call. After the call the WHOLE index
         must be the one expected. Residual (owner ruling): a session's git
         that stages between that read and the call, milliseconds; git has no
         compare-and-swap for the index."""
@@ -533,12 +542,21 @@ class _Writer:
         if not feet:
             return
         gone = {q for f in feet.values() for q in f}  # each footprint holds its own path
+        # A row whose index is already back can sit in another's footprint (an
+        # unmerged entry below a stage-0 file, which git keeps beside it,
+        # MEASURED on git 2.43): its saved entries are written again in the
+        # same call, never dropped while the report is cleared (#3986 review).
+        # A flag on one still refuses the call above (`other:flag-changed`).
+        back = {q: rows[q]["index"] for q in gone - set(feet)
+                if q in rows and self.out.get((q, "index")) == "already-restored"}  # fmt: skip
         kept = self._kept(pre, gone)
         null = "0" * (2 * hashlib.new(j.fmt).digest_size)
         recs = []
         for p in sorted(feet):
             recs += [f"0 {null}\t{q}" for q in feet[p]]
             recs += [f"{m} {o} {s}\t{p}" for m, o, s in rows[p]["index"]]
+        for q in sorted(back):
+            recs += [f"{m} {o} {s}\t{q}" for m, o, s in back[q]]
         data = b"".join(os.fsencode(r) + b"\0" for r in recs)
         try:
             rp._git(self.repo, "update-index", "-z", "--index-info", data=data)
@@ -551,6 +569,7 @@ class _Writer:
         _step("index-call")
         want = {q: v for q, v in pre.items() if q not in gone}
         want.update((p, [tuple(e) for e in rows[p]["index"]]) for p in feet if rows[p]["index"])
+        want.update((q, [tuple(e) for e in v]) for q, v in back.items() if v)
         ok = rp._index_state(self.repo)[0] == want
         for p in feet:
             if ok:
@@ -594,7 +613,13 @@ class _Writer:
 
     def _flags(self) -> None:
         """Flags after the index call (it re-creates entries). Review N-1: S
-        skip-worktree, a lowercase tag assume-unchanged, s both."""
+        skip-worktree, a lowercase tag assume-unchanged, s both. A flag goes
+        only on the entry the judge read, or the one this run's index call
+        wrote (#3986 review): an entry a session staged since then is refused
+        `changed-during-restore`, never flagged. The index is read once, right
+        before the flags (the same residual as the index call: git has no
+        compare-and-swap, so a stage in the milliseconds after that read)."""
+        now = None
         for (p, k), v in sorted(self.verdict.items()):
             # A flag already back is set again when the index call re-created
             # its entry this run (#3986 review: it re-creates it unflagged).
@@ -603,6 +628,18 @@ class _Writer:
                 continue
             if not self._back(p, "index"):
                 self._refuse(p, "flag", "row-refused")
+                continue
+            if now is None:
+                now = self.rp._index_state(self.repo)[0]
+            written = self.out.get((p, "index")) == "restored"
+            expect = (
+                [tuple(e) for e in self.j.foreign[p]["index"]]
+                if written
+                else self.j.index.get(p, [])
+            )
+            if now.get(p, []) != expect:
+                why = f"{json.dumps(p)[:200]} changed since it was judged"
+                self._refuse(p, "flag", "changed-during-restore", why)
                 continue
             flag = self.j.foreign[p]["flag"]
             opts = [o for o, on in (("--skip-worktree", flag in "Ss"),
@@ -623,19 +660,20 @@ class _Writer:
         """A second judge: every part written must now read already-restored
         (review N-4: a disagreement counts as refused), and so must a flag read
         already-restored whose entry the index call replaced (#3986 review: an
-        index that is not the one written may hold it unflagged)."""
+        index that is not the one written may hold it unflagged), and so must an
+        index part read already-restored whose entries that call rewrote."""
         if not self.wrote:
             return
         loaded = {**self.loaded, "report": {**self.loaded["report"], "restore": None}}
         try:
             j = self.chk.Judge(self.rp, self.repo, self.ctx.backup, loaded, self.j.newer_ts,
-                      records=self.j.records, strict=True)  # fmt: skip
+                      records=self.j.records, strict=True, complete=self.j.complete)  # fmt: skip
             again = {(p, k): v for r in j.rows if r["class"] == "foreign" for p, k, v in j.row(r)}
         except (OSError, self.rp.RepairError):
             again = {}
         for key, o in list(self.out.items()):
             check = o == "restored" or (
-                o == "already-restored" and key[1] == "flag" and key[0] in self.called
+                o == "already-restored" and key[1] in ("flag", "index") and key[0] in self.called
             )
             if check and again.get(key) != "already-restored":
                 self._refuse(*key, "post-check", f"the judge now reads {again.get(key, 'nothing')}")
