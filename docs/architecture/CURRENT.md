@@ -3852,7 +3852,7 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, secrets_location.py, _config_overlay.py, caller_context.py, caller_credentials.py]
-verified: 58ff9f47c 2026-11-07
+verified: b18993e99 2026-11-07
 ```
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
@@ -4382,8 +4382,11 @@ Refusing a proposed update preserves a previously valid opt-in.
   `secrets_path()` delegates to the stdlib-only `secrets_location.py`, mirrored
   by the shell reader. `SECRETS_PATH` wins; otherwise an existing
   `~/.config/genesis/secrets.env` wins over the checkout and `~/genesis`
-  legacy files. With no file, creation still defaults to the checkout until
-  the services and recovery paths support the new default.
+  legacy files. With no file, creation defaults to the home config path.
+  Services load both optional files, new last; missing credentials queue a
+  critical startup alert. Guardian check/restore and passphrase resolution
+  share that order through their standalone replica, and the secrets guard
+  recognizes the new file's aliases and normalized configured destinations.
 - **Managed systemd user units** (deploy scripts, no `src/genesis` module):
   `bootstrap.sh` renders `scripts/systemd/*.template` and `setup-vnc.sh`
   renders `scripts/systemd/vnc/` into `~/.config/systemd/user`, both through

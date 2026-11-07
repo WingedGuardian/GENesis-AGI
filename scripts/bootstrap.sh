@@ -1099,6 +1099,7 @@ if [[ -f "$SECRETS_FILE" ]]; then
     echo "  secrets.env exists"
 else
     if [[ -f "$GENESIS_ROOT/secrets.env.example" ]]; then
+        mkdir -p -m 0700 "$(dirname "$SECRETS_FILE")"
         cp "$GENESIS_ROOT/secrets.env.example" "$SECRETS_FILE"
         chmod 600 "$SECRETS_FILE"
         echo "  Copied secrets.env.example -> secrets.env"

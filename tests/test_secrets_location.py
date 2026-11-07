@@ -55,7 +55,7 @@ def _expected(present: set[str], override: str | None, home: Path, checkout: Pat
     for name in ("new", "checkout", "home_legacy"):
         if name in present:
             return paths[name]
-    return checkout / "secrets.env"
+    return paths["new"]
 
 
 def _environ(override: str | None, paths) -> dict[str, str]:
@@ -98,6 +98,19 @@ def test_env_secrets_path_delegates_to_the_resolver(tmp_path, monkeypatch):
     monkeypatch.setenv("GENESIS_REPO_ROOT", str(checkout))
     # A worktree's own root holds no file; the main-tree file under HOME wins.
     assert secrets_path() == paths["home_legacy"]
+
+
+@pytest.mark.parametrize(("name", "present", "override"), STATES, ids=[s[0] for s in STATES])
+def test_guardian_replica_matches_the_python_resolver(tmp_path, monkeypatch, name, present, override):
+    from genesis.guardian.cred_integrity import resolve_secrets_path
+
+    home, checkout, paths = _layout(tmp_path, present)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("GENESIS_REPO_ROOT", str(checkout))
+    monkeypatch.delenv("SECRETS_PATH", raising=False)
+    for key, value in _environ(override, paths).items():
+        monkeypatch.setenv(key, value)
+    assert resolve_secrets_path(home) == _expected(present, override, home, checkout, paths)
 
 
 def test_xdg_config_home_is_ignored(tmp_path, monkeypatch):
