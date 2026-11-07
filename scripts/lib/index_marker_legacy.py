@@ -131,13 +131,14 @@ def _claim_files(paths: list[Path], directory: Path, sync: Callable) -> list[tup
     return claimed
 
 
-def _lock(directory: Path, wait_s: float):
+def _lock(directory: Path, wait_s: float, *, shared: bool = False):
     lock = (directory / ".queue.lock").open("a")
     deadline = time.monotonic() + wait_s
     try:
         while True:
             try:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                operation = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+                fcntl.flock(lock.fileno(), operation | fcntl.LOCK_NB)
                 return lock
             except OSError as exc:
                 if exc.errno not in (errno.EACCES, errno.EAGAIN):
@@ -330,35 +331,46 @@ def _stage_artifact(db, source: Path, raw: bytes, mtime: int, import_one: Callab
     db.execute("RELEASE legacy_artifact")
 
 
+def drain(directory: Path, db, import_one: Callable, sync: Callable) -> list[Path]:
+    """Import under the caller's exclusive publication lock and transaction."""
+    paths = _claim_files(legacy_files(directory), directory, sync)
+    paths.sort(
+        key=lambda item: bool(
+            item[1].name.startswith(".outcome-") or _OUTCOME.fullmatch(item[1].name)
+        )
+    )
+    imported = []
+    for owned, source in paths:
+        try:
+            raw = owned.read_bytes()
+            mtime = owned.stat().st_mtime_ns
+        except FileNotFoundError:
+            continue
+        _stage_artifact(db, source, raw, mtime, import_one)
+        imported.append(owned)
+    return imported
+
+
+def retire(directory: Path, imported: list[Path], sync: Callable) -> None:
+    """Only call after the representing transaction commits, still locked."""
+    for owned in imported:
+        owned.unlink(missing_ok=True)
+    if imported:
+        sync(directory)
+
+
 def migrate(
     directory: Path, write_db: Callable, import_one: Callable, sync: Callable, *, wait_s: float
 ):
     if not legacy_files(directory):
         return
     with _lock(directory, wait_s):
-        paths = _claim_files(legacy_files(directory), directory, sync)
-        paths.sort(
-            key=lambda item: bool(
-                item[1].name.startswith(".outcome-") or _OUTCOME.fullmatch(item[1].name)
-            )
-        )
-        imported = []
         with write_db() as db:
-            for owned, source in paths:
-                try:
-                    raw = owned.read_bytes()
-                    mtime = owned.stat().st_mtime_ns
-                except FileNotFoundError:
-                    continue
-                _stage_artifact(db, source, raw, mtime, import_one)
-                imported.append(owned)
-        for owned in imported:
-            owned.unlink(missing_ok=True)
-        if imported:
-            sync(directory)
+            imported = drain(directory, db, import_one, sync)
+        retire(directory, imported, sync)
 
 
-def import_status(database: Path, *, limit: int, protocol_only=False) -> dict:
+def import_status(database: Path, *, limit: int, protocol_only=False, observe=None, schema_check=None) -> dict:
     """Observe this rollback-journal queue without initialization or migration."""
     if limit < 0:
         raise ValueError("limit must be nonnegative")
@@ -387,8 +399,16 @@ def import_status(database: Path, *, limit: int, protocol_only=False) -> dict:
                 "schema_version": version,
                 "receipts_available": False,
             }
-        if version not in (2, 3):
+        if version == 5 and schema_check is not None:
+            schema_check(db)
+        elif version not in (2, 3, 4):
             raise RuntimeError(f"unsupported queue schema {version}")
+        if observe is not None:
+            if version not in (4, 5):
+                return {"state": "protocol-incomplete", "schema_version": version,
+                        "execution_available": False}
+            db.row_factory = sqlite3.Row
+            return observe(db)
         if protocol_only:
             if version == 2:
                 return {

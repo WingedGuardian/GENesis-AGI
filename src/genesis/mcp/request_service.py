@@ -28,11 +28,23 @@ async def initialize_request_service(name: str, *, db: RequestDatabase, activity
     a pending flush away from the manager that owns it.
     Bootstrap owns an independent unit and must not run inside an active unit
     owned by this task. Registration starts only after that unit finalizes.
+    Every injected dependency holding a database must hold this facade. Memory
+    and a persisting tracker detach work, so they need background budgets.
     """
     if not isinstance(db, RequestDatabase):
         raise TypeError("initialize_request_service requires RequestDatabase")
     if activity_tracker is not None and getattr(activity_tracker, "_db", None) is not db:
         raise ValueError("Activity tracker must already use the supplied RequestDatabase")
+    detached = name == "memory" or (
+        activity_tracker is not None and getattr(activity_tracker, "persist_activity", True)
+    )
+    if detached and db._background_slots is None:
+        raise ValueError(f"{name} detached work requires explicit background budgets")
+    if name == "memory" and "process_pending_bookmarks" not in dependencies:
+        raise ValueError("Memory callers must choose process_pending_bookmarks")
+    for key, dependency in dependencies.items():
+        if getattr(dependency, "_db", db) is not db:
+            raise ValueError(f"{name} dependency {key} must use the supplied RequestDatabase")
     module_name, initializer = _INITIALIZERS[name]
     module = import_module(module_name)
     if name == "health":

@@ -41,9 +41,15 @@ def install_instrumentation(server, tracker, server_name: str, db) -> None:
     ]
     if not isinstance(db, RequestDatabase) and tracker is None:
         return
-    # External read-only instrumentation already declines legacy transaction
-    # finalization. Scoped unit ownership remains mandatory even without metrics.
-    if not isinstance(db, RequestDatabase) and not getattr(tracker, "persist_activity", True):
+    # Health's external read-only instrumentation already declines legacy
+    # transaction finalization. Writable services keep the database for their
+    # commit boundary and the staleness guard. Scoped unit ownership remains
+    # mandatory even without metrics.
+    if (
+        server_name == "health"
+        and not isinstance(db, RequestDatabase)
+        and not getattr(tracker, "persist_activity", True)
+    ):
         db = None
     server.add_middleware(InstrumentationMiddleware(tracker, server_name, db=db))
 

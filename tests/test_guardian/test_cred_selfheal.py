@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 
 import pytest
 
@@ -99,6 +100,22 @@ def test_rate_cap_blocks_restore(env, monkeypatch):
     assert out["targets"]["claude_credentials"]["status"] == "restore_failed"
     assert "rate cap" in out["targets"]["claude_credentials"]["detail"]
     assert env.calls["restore"] == 1           # no new attempt
+
+
+def test_a_backups_directory_that_denies_search_is_reported(tmp_path, request):
+    """It promises never to raise, and the awareness loop relies on that. A file it can't
+    tell the state of is reported, not read as never provisioned."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores mode 000")
+    home = tmp_path / "home"
+    backups = home / "backups"
+    (backups / "genesis-backups").mkdir(parents=True)
+    backups.chmod(0o000)
+    request.addfinalizer(lambda: backups.chmod(0o700))
+    target = CredTarget("claude_credentials", ".claude/.credentials.json", "creds/x.gpg", "json")
+    out = cred_selfheal.check_and_selfheal(home=home, status_path=tmp_path / "status.json", targets=(target,))
+    assert out["targets"]["claude_credentials"]["status"] == "corrupt"
+    assert "unreadable" in out["targets"]["claude_credentials"]["detail"]
 
 
 def test_no_passphrase_is_restore_failed(env, monkeypatch):

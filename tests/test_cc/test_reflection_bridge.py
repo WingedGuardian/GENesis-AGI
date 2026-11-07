@@ -1195,3 +1195,29 @@ async def test_store_reflection_summary_skips_unparseable(db):
         "SELECT content FROM observations WHERE type = 'reflection_summary'"
     )
     assert rows == []
+
+
+async def test_unparseable_deep_output_fails_its_session_row(db, bridge, tick, mock_session_mgr):
+    """A CLI deep reflection ends its row AFTER routing, so output the router
+    could not read is recorded failed, whatever the session reported."""
+    bridge._output_router = AsyncMock()  # enable the deep routing path
+    mock_route = AsyncMock(return_value={"parse_failed": True})
+    with patch("genesis.cc.reflection_bridge._bridge.route_deep_output", mock_route):
+        result = await bridge.reflect(depth=Depth.DEEP, tick=tick, db=db)
+
+    assert not result.success
+    mock_session_mgr.complete.assert_awaited_once()
+    kwargs = mock_session_mgr.complete.await_args.kwargs
+    assert (kwargs["outcome"], kwargs["outcome_reason"]) == ("failed", "unparseable_output")
+
+
+async def test_routed_deep_output_ends_its_row_once_as_reported(db, bridge, tick, mock_session_mgr):
+    bridge._output_router = AsyncMock()
+    mock_route = AsyncMock(return_value={"observations_written": 1})
+    with patch("genesis.cc.reflection_bridge._bridge.route_deep_output", mock_route):
+        result = await bridge.reflect(depth=Depth.DEEP, tick=tick, db=db)
+
+    assert result.success
+    mock_session_mgr.complete.assert_awaited_once()
+    kwargs = mock_session_mgr.complete.await_args.kwargs
+    assert (kwargs["outcome"], kwargs["outcome_reason"]) == (None, None)

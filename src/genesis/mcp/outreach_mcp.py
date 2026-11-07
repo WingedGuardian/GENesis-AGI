@@ -90,7 +90,9 @@ def init_outreach_mcp(*, pipeline, engagement, config, db, activity_tracker=None
     _config = config
     _db = db
 
-    # Ensure pending_outreach table exists for standalone fallback
+    # Ensure pending_outreach table exists for standalone fallback. A
+    # RequestDatabase is skipped: a task outside any unit cannot use it, and
+    # initialize_request_service awaits ensure_table in its bootstrap unit.
     if db is not None and pipeline is None and not isinstance(db, RequestDatabase):
         import contextlib
 

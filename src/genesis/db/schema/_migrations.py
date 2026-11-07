@@ -2222,6 +2222,16 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "tool_call_outcomes.tool_use_id",
     )
 
+    # How a session ENDED (crud.cc_sessions.update_status). Mirrored in
+    # migration 20261104144136 for the standalone runner; here so an existing DB
+    # gets them on the base create_all_tables path (schema_both_build_paths).
+    for _col in ("outcome", "outcome_reason", "outcome_paged_at"):
+        await _try_alter(
+            db,
+            f"ALTER TABLE cc_sessions ADD COLUMN {_col} TEXT",
+            f"cc_sessions.{_col}",
+        )
+
 
 async def _migrate_cognitive_state_check(db: aiosqlite.Connection) -> None:
     """Rebuild cognitive_state if CHECK constraint lacks 'resilience_degradation'.

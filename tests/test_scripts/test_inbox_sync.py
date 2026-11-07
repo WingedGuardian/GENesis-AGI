@@ -103,7 +103,17 @@ case "$1" in
     exit 0
     ;;
   sync)
-    exit 0
+    # Stands in for rclone's --backup-dir: what the mirror would have removed.
+    if [ -n "${RCLONE_SYNC_SAVES:-}" ]; then
+      prev=""
+      for a in "$@"; do
+        if [ "$prev" = "--backup-dir" ]; then
+          mkdir -p "$a" && printf 'old\n' > "$a/$RCLONE_SYNC_SAVES"
+        fi
+        prev="$a"
+      done
+    fi
+    exit "${RCLONE_SYNC_RC:-0}"
     ;;
 esac
 exit 0
@@ -113,6 +123,22 @@ _REFUSING_PYTHON = """#!/bin/bash
 echo "refused: not on the trash's volume" >&2
 exit 1
 """
+
+
+def _refuse_the_trash(env: dict, tmp_path: Path) -> None:
+    """Point GENESIS_PYTHON at an interpreter that answers the config read
+    (genesis.inbox.sync_config) but refuses every other module (the trash)."""
+    refusing = tmp_path / "bin" / "refusing-python"
+    refusing.write_text(_REFUSING_PYTHON)
+    refusing.chmod(0o755)
+    wrapper = tmp_path / "bin" / "split-python"
+    wrapper.write_text(
+        "#!/bin/bash\n"
+        f'if [ "$2" = "genesis.inbox.sync_config" ]; then exec {sys.executable} "$@"; fi\n'
+        f'exec {refusing} "$@"\n'
+    )
+    wrapper.chmod(0o755)
+    env["GENESIS_PYTHON"] = str(wrapper)
 
 
 def _setup(tmp_path: Path) -> tuple[dict, Path, Path, Path]:
@@ -132,8 +158,16 @@ def _setup(tmp_path: Path) -> tuple[dict, Path, Path, Path]:
     lsf_out.write_text("")
     home = tmp_path / "genesis_home"
     home.mkdir()
+    # The script reads its remote / inbox / heartbeat from Genesis config via
+    # genesis.inbox.sync_config, so each test gets its own repo config.
+    repo = tmp_path / "repo"
+    (repo / "config").mkdir(parents=True)
+    (repo / "config" / "inbox_monitor.yaml").write_text(
+        f"inbox_monitor:\n  watch_path: {inbox}\n  sync_remote: '{_REMOTE}'\n"
+    )
 
     env = {
+        "GENESIS_REPO_ROOT": str(repo),
         "PATH": f"{shim_bin}:{_BASE_PATH}",
         "HOME": str(tmp_path),
         "GENESIS_HOME": str(home),
@@ -150,7 +184,7 @@ def _setup(tmp_path: Path) -> tuple[dict, Path, Path, Path]:
     return env, inbox, log, call_log
 
 
-_REMOTE = "dropbox:Apps/remotely-save/1/Genesis"
+_REMOTE = "dropbox:Apps/vault-sync/Inbox"
 
 
 def _record_path(inbox: Path) -> Path:
@@ -336,10 +370,7 @@ def test_trash_refusal_holds_the_response(tmp_path):
     cycle's push (no resurrection), and kept in the record (retried)."""
     env, inbox, log, call_log = _setup(tmp_path)
     vault = _use_vault_dir(env, tmp_path)
-    refusing = tmp_path / "bin" / "refusing-python"
-    refusing.write_text(_REFUSING_PYTHON)
-    refusing.chmod(0o755)
-    env["GENESIS_PYTHON"] = str(refusing)
+    _refuse_the_trash(env, tmp_path)
     held = _old_response_file(inbox, "Held [draft]-1.genesis.md")
     _set_record(inbox, [held.name])  # vault no longer has it: a user deletion
 
@@ -660,6 +691,260 @@ def test_state_files_excluded_from_mirror_and_not_pushed(tmp_path):
     assert filter_lines[-2:] == ["+ *.genesis.md", "- **"], filter_lines
 
 
+# --- configuration and heartbeat (#3183) ----------------------------------------
+
+
+def _heartbeat(env: dict) -> dict:
+    import json
+
+    return json.loads((Path(env["GENESIS_HOME"]) / "state" / "inbox_sync.json").read_text())
+
+
+def _write_config(env: dict, inbox: Path, remote: str) -> None:
+    (Path(env["GENESIS_REPO_ROOT"]) / "config" / "inbox_monitor.yaml").write_text(
+        f"inbox_monitor:\n  watch_path: {inbox}\n  sync_remote: '{remote}'\n"
+    )
+
+
+def test_unconfigured_sync_exits_without_touching_anything(tmp_path):
+    """Run by the timer (INVOCATION_ID set) on an install with no vault: silent."""
+    env, inbox, log, call_log = _setup(tmp_path)
+    _write_config(env, inbox, "")
+    env["INVOCATION_ID"] = "0123456789abcdef"
+    f = _old_response_file(inbox, "Genesis-1.genesis.md")
+
+    r = _run(env)
+
+    assert r.returncode == 0, r.stderr
+    assert call_log.read_text() == "", "an unconfigured sync called rclone"
+    assert f.exists()
+    assert not (Path(env["GENESIS_HOME"]) / "state" / "inbox_sync.json").exists()
+    assert not log.exists() or log.read_text() == ""
+
+
+def test_unconfigured_sync_run_by_cron_says_it_is_not_syncing(tmp_path):
+    """An old crontab line running the new script before sync_remote is set
+    must leave a trace, not stop syncing in silence (review S1)."""
+    env, inbox, log, call_log = _setup(tmp_path)
+    _write_config(env, inbox, "")
+    env.pop("INVOCATION_ID", None)
+
+    assert _run(env).returncode == 0
+    assert call_log.read_text() == ""
+    assert "NOT SYNCING: inbox_monitor.sync_remote is empty" in log.read_text()
+
+
+def test_failed_listing_carries_the_held_count_forward(tmp_path):
+    """held is measured only on a healthy listing; a failed one must not reset
+    it to 0, or the held alert clears and re-fires (review S2)."""
+    env, inbox, _, _ = _setup(tmp_path)
+    state = Path(env["GENESIS_HOME"]) / "state"
+    state.mkdir()
+    (state / "inbox_sync.json").write_text(
+        '{"last_run": "2026-01-01T00:00:00Z", "last_ok": "2026-01-01T00:00:00Z", "held": 3}\n'
+    )
+    env["RCLONE_LSF_RC"] = "1"
+
+    assert _run(env).returncode == 0
+    assert _heartbeat(env)["held"] == 3
+
+
+def test_invalid_remote_is_refused_loudly(tmp_path):
+    env, inbox, log, call_log = _setup(tmp_path)
+    _write_config(env, inbox, "-oops:path")
+
+    r = _run(env)
+
+    assert r.returncode == 1
+    assert call_log.read_text() == "", "an invalid remote reached rclone"
+    assert "REFUSED: inbox sync config unusable" in log.read_text()
+
+
+def test_healthy_cycle_writes_a_fresh_heartbeat(tmp_path):
+    env, inbox, _, _ = _setup(tmp_path)
+    _set_listing(env, [])
+
+    assert _run(env).returncode == 0
+    hb = _heartbeat(env)
+    assert hb["last_ok"] and hb["last_ok"] == hb["last_run"]
+    assert hb["held"] == 0
+
+
+def test_failed_listing_keeps_the_previous_last_ok(tmp_path):
+    env, inbox, log, _ = _setup(tmp_path)
+    state = Path(env["GENESIS_HOME"]) / "state"
+    state.mkdir()
+    (state / "inbox_sync.json").write_text(
+        '{"last_run": "2026-01-01T00:00:00Z", "last_ok": "2026-01-01T00:00:00Z", "held": 0}\n'
+    )
+    env["RCLONE_LSF_RC"] = "1"
+
+    assert _run(env).returncode == 0
+    hb = _heartbeat(env)
+    assert hb["last_ok"] == "2026-01-01T00:00:00Z", "a failed cycle advanced last_ok"
+    assert hb["last_run"] != "2026-01-01T00:00:00Z"
+    assert "Heartbeat: cycle not ok" in log.read_text()
+
+
+def test_failed_pull_is_not_an_ok_cycle(tmp_path):
+    env, inbox, log, _ = _setup(tmp_path)
+    _set_listing(env, [])
+    env["RCLONE_SYNC_RC"] = "3"
+
+    assert _run(env).returncode == 0
+    assert _heartbeat(env)["last_ok"] == ""
+    assert "Pull failed (rc=3)" in log.read_text()
+
+
+def test_failed_post_push_listing_is_not_an_ok_cycle(tmp_path):
+    """What the cycle uploaded is off the record, so last_ok must not advance."""
+    env, inbox, log, _ = _setup(tmp_path)
+    _use_vault_dir(env, tmp_path)
+    _old_response_file(inbox, "New-1.genesis.md")
+    _set_record(inbox, [])
+    env["RCLONE_LSF_FAIL_ON"] = "2"
+
+    assert _run(env).returncode == 0
+    assert _heartbeat(env)["last_ok"] == ""
+    assert "record failed" in log.read_text()
+
+
+def test_held_response_stays_out_across_a_failed_listing(tmp_path):
+    """The age gate lets a young file through, so a held one needs its name."""
+    env, inbox, _, _ = _setup(tmp_path)
+    vault = _use_vault_dir(env, tmp_path)
+    _refuse_the_trash(env, tmp_path)
+    held = _old_response_file(inbox, "Held [draft]-1.genesis.md")
+    _set_record(inbox, [held.name])
+
+    assert _run(env).returncode == 0
+    os.utime(held)  # now young enough to pass --max-age
+    env["RCLONE_LSF_RC"] = "1"
+
+    assert _run(env).returncode == 0
+    assert not (vault / held.name).exists(), "a held response was re-uploaded"
+    assert "--max-age" in _copy_calls(Path(env["RCLONE_CALL_LOG"]))[-1]
+
+
+def test_failed_listing_keeps_recorded_responses_out_and_ships_new_ones(tmp_path):
+    """A young recorded response may be a vault deletion. A never-seen one is not."""
+    env, inbox, _, _ = _setup(tmp_path)
+    vault = _use_vault_dir(env, tmp_path)
+    recorded = _old_response_file(inbox, "Recorded-1.genesis.md")
+    fresh = _old_response_file(inbox, "Fresh-1.genesis.md")
+    _set_record(inbox, [recorded.name])
+    os.utime(recorded)
+    os.utime(fresh)
+    env["RCLONE_LSF_RC"] = "1"
+
+    assert _run(env).returncode == 0
+    assert not (vault / recorded.name).exists(), "a vault deletion was re-uploaded"
+    assert (vault / fresh.name).exists(), "a never-seen response stopped shipping"
+
+
+def test_a_record_for_another_remote_excludes_nothing(tmp_path):
+    env, inbox, _, _ = _setup(tmp_path)
+    vault = _use_vault_dir(env, tmp_path)
+    fresh = _old_response_file(inbox, "Fresh-1.genesis.md")
+    _set_record(inbox, [fresh.name], remote="other:vault")
+    os.utime(fresh)
+    env["RCLONE_LSF_RC"] = "1"
+
+    assert _run(env).returncode == 0
+    assert (vault / fresh.name).exists()
+
+
+def test_an_unreadable_record_on_a_failed_listing_says_so(tmp_path):
+    env, inbox, log, call_log = _setup(tmp_path)
+    record = _set_record(inbox, [])
+    record.chmod(0o000)
+    _old_response_file(inbox, "Fresh-1.genesis.md")
+    env["RCLONE_LSF_RC"] = "1"
+    try:
+        assert _run(env).returncode == 0
+    finally:
+        record.chmod(0o600)
+    assert "could not read the vault record" in log.read_text()
+    assert not _copy_calls(call_log), "a push ran with no way to tell a deletion from a new file"
+
+
+def test_the_pull_stays_on_the_inboxs_filesystem(tmp_path):
+    env, _, _, call_log = _setup(tmp_path)
+    assert _run(env).returncode == 0
+    pull = next(ln for ln in call_log.read_text().splitlines() if ln.startswith("rclone sync"))
+    assert "--one-file-system" in pull
+
+
+def test_the_service_names_the_installed_interpreter():
+    repo = Path(__file__).resolve().parents[2]
+    unit = (repo / "scripts/systemd/genesis-inbox-sync.service.template").read_text()
+    assert "Environment=GENESIS_PYTHON=__VENV__/bin/python" in unit
+
+
+def test_a_directory_at_the_record_path_is_not_an_ok_cycle(tmp_path):
+    """Plain mv would move the record inside it and report success."""
+    env, inbox, log, _ = _setup(tmp_path)
+    _use_vault_dir(env, tmp_path)
+    (inbox / ".genesis-seen-in-vault").mkdir()
+
+    assert _run(env).returncode == 0
+    assert _heartbeat(env)["last_ok"] == ""
+    assert "could not write the vault record" in log.read_text()
+
+
+def test_a_directory_at_the_filter_path_stops_the_push(tmp_path):
+    env, inbox, log, call_log = _setup(tmp_path)
+    _use_vault_dir(env, tmp_path)
+    (inbox / ".genesis-push-filter").mkdir()
+
+    assert _run(env).returncode == 0
+    assert not _copy_calls(call_log)
+    assert "Push skipped: could not write the push filter" in log.read_text()
+    assert _heartbeat(env)["last_ok"] == ""
+
+
+def test_secrets_env_overrides_reach_the_sync(tmp_path):
+    env, inbox, _, _ = _setup(tmp_path)
+    other = tmp_path / "other-home"
+    other.mkdir()
+    (Path(env["GENESIS_REPO_ROOT"]) / "secrets.env").write_text(
+        f"GENESIS_HOME={other}\nUNRELATED_SECRET=abc\n"
+    )
+    default = Path(env.pop("GENESIS_HOME"))
+    env["HOME"] = str(default.parent)
+    _use_vault_dir(env, tmp_path)
+    deleted = _old_response_file(inbox, "Deleted-1.genesis.md")
+    _set_record(inbox, [deleted.name])
+
+    assert _run(env).returncode == 0
+    assert (other / "state" / "inbox_sync.json").exists()
+    # The trash runs in a child, so it needs the same home.
+    assert not deleted.exists()
+    assert list((other / "trash").glob("*/tombstone.json"))
+
+
+def test_failed_push_is_not_an_ok_cycle(tmp_path):
+    env, inbox, _, _ = _setup(tmp_path)
+    _use_vault_dir(env, tmp_path)
+    _set_record(inbox, [])
+    env["RCLONE_COPY_RC"] = "4"
+
+    assert _run(env).returncode == 0
+    assert _heartbeat(env)["last_ok"] == ""
+
+
+def test_heartbeat_counts_held_responses(tmp_path):
+    env, inbox, _, _ = _setup(tmp_path)
+    _use_vault_dir(env, tmp_path)
+    held = _old_response_file(inbox, "Held-1.genesis.md")
+    _set_record(inbox, [held.name])
+    _refuse_the_trash(env, tmp_path)
+
+    assert _run(env).returncode == 0
+    assert held.exists()
+    assert _heartbeat(env)["held"] == 1
+
+
 def test_symlinked_inbox_root_is_still_walked(tmp_path):
     """The inbox root may be a symlink to the real folder; cleanup must walk it
     (find does not follow a start-point symlink by default)."""
@@ -673,3 +958,97 @@ def test_symlinked_inbox_root_is_still_walked(tmp_path):
 
     assert _run(env).returncode == 0
     assert not gone.exists(), "a vault deletion was not applied through a symlinked inbox root"
+
+
+def test_duplicate_config_keys_are_refused(tmp_path):
+    """The script trusts sync_config's output only when each key appears exactly
+    once: a value smuggling a second key= line must stop the run."""
+    env, inbox, log, call_log = _setup(tmp_path)
+    liar = tmp_path / "bin" / "lying-python"
+    liar.write_text(
+        "#!/bin/bash\n"
+        f"echo 'remote={_REMOTE}'\n"
+        f"echo 'watch_path={inbox}'\n"
+        "echo 'heartbeat=/tmp/x'\n"
+        "echo 'heartbeat=/tmp/y'\n"
+    )
+    liar.chmod(0o755)
+    env["GENESIS_PYTHON"] = str(liar)
+
+    assert _run(env).returncode == 1
+    assert call_log.read_text() == ""
+    assert "does not carry exactly one heartbeat= line" in log.read_text()
+
+
+def _saved_folders(env: dict) -> list[Path]:
+    root = Path(env["GENESIS_HOME"]) / "state" / "inbox-pull-saved"
+    return sorted(root.iterdir()) if root.exists() else []
+
+
+def _vault_config(env: dict, inbox: Path) -> None:
+    _write_config(env, inbox, _REMOTE)
+
+
+def test_what_the_pull_saves_goes_to_the_trash(tmp_path):
+    env, inbox, log, call_log = _setup(tmp_path)
+    _vault_config(env, inbox)
+    env["RCLONE_SYNC_SAVES"] = "note.md"
+
+    assert _run(env).returncode == 0
+    sync = next(c for c in call_log.read_text().splitlines() if c.startswith("rclone sync"))
+    assert "--backup-dir " + str(Path(env["GENESIS_HOME"]) / "state" / "inbox-pull-saved") in sync
+    assert "--one-file-system" in sync
+    assert _saved_folders(env) == []
+    assert len(_trash_entries(env)) == 1
+    assert "the old copies are in the Genesis trash" in log.read_text()
+    assert _heartbeat(env)["last_ok"]
+
+
+def test_a_refused_trash_keeps_what_the_pull_saved_and_the_cycle_is_not_ok(tmp_path):
+    env, inbox, log, call_log = _setup(tmp_path)
+    _vault_config(env, inbox)
+    env["RCLONE_SYNC_SAVES"] = "note.md"
+    _refuse_the_trash(env, tmp_path)
+
+    assert _run(env).returncode == 0
+    saved = _saved_folders(env)
+    assert len(saved) == 1 and (saved[0] / "note.md").read_text() == "old\n"
+    body = log.read_text()
+    assert "the trash refused what the pull saved" in body
+    assert "saved files refused by the trash" in body
+    assert not _heartbeat(env)["last_ok"]
+
+
+def test_a_record_that_is_not_a_regular_file_holds_the_push_on_a_failed_listing(tmp_path):
+    env, inbox, log, call_log = _setup(tmp_path)
+    _vault_config(env, inbox)
+    env["RCLONE_LSF_RC"] = "1"
+    _record_path(inbox).symlink_to(tmp_path / "elsewhere")
+
+    assert _run(env).returncode == 0
+    assert _copy_calls(call_log) == []
+    assert "the vault record is not a regular file" in log.read_text()
+
+
+def test_a_crontab_caller_with_no_remote_leaves_the_marker_the_alert_reads(tmp_path):
+    env, inbox, log, call_log = _setup(tmp_path)
+    _write_config(env, inbox, "")
+    env.pop("INVOCATION_ID", None)
+
+    assert _run(env).returncode == 0
+    assert _heartbeat(env)["unconfigured_caller"]
+    assert call_log.read_text() == ""
+
+
+def test_the_heartbeat_is_not_written_through_a_planted_temp_link(tmp_path):
+    env, inbox, log, call_log = _setup(tmp_path)
+    _vault_config(env, inbox)
+    state = Path(env["GENESIS_HOME"]) / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    victim = tmp_path / "victim"
+    victim.write_text("keep\n")
+    (state / "inbox_sync.json.tmp").symlink_to(victim)
+
+    assert _run(env).returncode == 0
+    assert victim.read_text() == "keep\n"
+    assert _heartbeat(env)["last_ok"]

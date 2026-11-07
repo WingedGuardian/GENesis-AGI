@@ -230,7 +230,9 @@ class TestRunSessionParkWiring:
         assert result.success is False
         assert "parked for resume" in (result.error or "")
         runner._deliver_result_to_origin.assert_not_awaited()
-        runner._session_manager.fail.assert_awaited_with("sess-park", reason="rate_limited_parked")
+        runner._session_manager.fail.assert_awaited_with(
+            "sess-park", reason="rate_limited_parked", outcome="parked"
+        )
         assert await parks.count_open(db) == 1
 
     async def test_disabled_falls_through_to_failure(self, db, monkeypatch):

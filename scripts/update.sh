@@ -642,6 +642,31 @@ elif { [ -e "$STATE_FILE" ] || [ -L "$STATE_FILE" ]; }; then
     fi
 fi
 # END prior-state-guard
+# BEGIN os-floor (extracted by tests/test_scripts/test_update_os_floor.py)
+# Below the supported OS floor (glibc 2.38 on x86_64 or aarch64) the update
+# would merge code whose bootstrap then refuses (pyproject.toml declares the
+# graph engine's wheel, built for nothing else), leaving merged code nothing
+# activates. So refuse first, before anything is fetched or merged, using the
+# floor from THIS checkout's lib, run in its own shell so sourcing it changes
+# nothing here. No lib (an older checkout): no check, as before. --post-merge
+# finishes a merge that already happened, so it is not refused here.
+_os_floor_lib="$SCRIPT_DIR/lib/falkordb_install.sh"
+if [[ "$POST_MERGE" != "true" ]] && [ -f "$_os_floor_lib" ]; then
+    _os_floor_rc=0
+    _os_floor_msg="$(bash -c 'source "$1" && { falkordb_os_floor_ok || { falkordb_os_floor_message; exit 7; }; }' \
+        os-floor "$_os_floor_lib" 2>/dev/null)" || _os_floor_rc=$?
+    if [ "$_os_floor_rc" -eq 7 ]; then
+        echo "REFUSED: ${_os_floor_msg}."
+        echo "         Nothing was changed."
+        # 5, not 1: the supervised update reads 1 as a script error to retry
+        # and escalate, and nothing a session does can change the OS.
+        exit 5
+    elif [ "$_os_floor_rc" -ne 0 ]; then
+        echo "  WARNING: could not check the supported OS floor (exit $_os_floor_rc); bootstrap checks it again."
+    fi
+fi
+unset _os_floor_lib _os_floor_rc _os_floor_msg
+# END os-floor
 # A crashed run's state that the guard let through is about to be overwritten.
 # If it says that run stopped genesis-server, it may be the only evidence left
 # (an updater from before restart-owed, or a bootstrap that could not write the
@@ -2061,12 +2086,37 @@ _checkout_unmoved_or_roll_back
 # On `live` the engine's rebuild takes the merge's place (the live-engine block,
 # after the `else` below). Not re-indented, so the blocks the tests extract keep
 # their text.
+# BEGIN stale-index-lock (#3792)
+# A git process that died mid-write leaves .git/index.lock behind, and every
+# index write after it (the excused-edit resets, the merge, the live engine's
+# clears) then fails. Called right after genesis-checkout.lock is taken, with
+# update.lock held, so no Genesis mover can be writing: it retires the lock only
+# when no process holds it (scripts/lib/stale_index_lock.py), and alerts.
+_retire_stale_index_lock() {
+    local rc=0 out
+    out="$(python3 -I -S "$SCRIPT_DIR/lib/stale_index_lock.py" "$GENESIS_ROOT" 2>&1)" || rc=$?
+    case "$rc" in
+        0) case "$out" in *"left "*) echo "  $out" ;; esac ;;
+        3)
+            echo "  $out"
+            if [ -f "$SCRIPT_DIR/lib/alert_queue.sh" ]; then
+                # shellcheck source=lib/alert_queue.sh
+                . "$SCRIPT_DIR/lib/alert_queue.sh"
+                queue_alert warning update "update: cleared a stale .git/index.lock" "$out"
+            fi
+            ;;
+        *) echo "  WARNING: ${out:-stale-index-lock check failed (exit $rc)}" ;;
+    esac
+    return 0
+}
+# END stale-index-lock
 if [ "${ON_LIVE:-0}" != 1 ]; then
 if ! genesis_checkout_lock "$GENESIS_ROOT"; then
     _CHECKOUT_LOCK_BUSY=1
     _do_rollback "checkout lock busy: a Claude launch holds genesis-checkout.lock"
     exit 1
 fi
+_retire_stale_index_lock
 
 # Clear local edits to known-ephemeral tracked files (EPHEMERAL_DIRTY_RE) before
 # merging. They are rewritten in place at runtime and regenerate themselves
@@ -2358,6 +2408,7 @@ if ! genesis_checkout_lock "$GENESIS_ROOT"; then
     _do_rollback "checkout lock busy: a Claude launch holds genesis-checkout.lock"
     exit 1
 fi
+_retire_stale_index_lock
 # Every tracked path the dirty-tree gate excused is saved, then put back to HEAD:
 # a switch that writes one would otherwise refuse over the local edit.
 if ! _live_status="$(git -C "$GENESIS_ROOT" status --porcelain --no-renames)"; then
@@ -2599,6 +2650,10 @@ elif _nothing_new; then
     # Nothing changed and no --post-merge continuation follows, so clear the
     # in-progress signals (like the success path) — a leftover must never linger.
     _clear_deploy_state
+    # Nothing was installed, so the package record taken for a rollback is
+    # unused. The rows below are written only for a stale marker or a
+    # degradation, so retiring it is not left to _record_update_history.
+    _retire_deps_record
     # Transitional: the pre-merge step may have cleared live settings.local.json
     # or .serena/project.yml edits — put them back even though no merge landed.
     if [ -f "$SETTINGS_LOCAL_BAK" ]; then

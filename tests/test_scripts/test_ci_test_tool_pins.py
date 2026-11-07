@@ -49,9 +49,10 @@ def test_every_pin_is_exact():
 
 
 #: The tools pinned by the owner's ruling (2026-10-28): the test runner and the
-#: two plugins whose releases change how the suite runs. The rest of `[test]`
-#: (hypothesis, aioresponses, ...) still floats.
-PINNED = {"pytest", "pytest-asyncio", "pytest-timeout"}
+#: two plugins whose releases change how the suite runs. pytest-xdist joined
+#: them (2026-11-05) because its scheduler decides test order under `-n`. The
+#: rest of `[test]` (hypothesis, aioresponses, ...) still floats.
+PINNED = {"pytest", "pytest-asyncio", "pytest-timeout", "pytest-xdist"}
 
 
 def test_the_pins_are_the_named_test_tools():

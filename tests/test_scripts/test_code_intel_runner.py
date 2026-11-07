@@ -465,15 +465,23 @@ def test_import_status_lists_current_schema_and_refuses_newer(tmp_path):
     before = _inventory(tmp_path)
     listed = _cli(tmp_path, "import-status")
     assert listed.returncode == 0, listed.stdout
-    assert json.loads(listed.stdout)["schema_version"] == 3
+    assert json.loads(listed.stdout)["schema_version"] == 4
     observed = _cli(tmp_path, "automatic-ready")
     assert observed.returncode == 10, observed.stderr
     assert json.loads(observed.stdout)["state"] == "protocol-incomplete"
     assert _inventory(tmp_path) == before
     with closing(sqlite3.connect(_mdir(tmp_path) / "queue.sqlite3", isolation_level=None)) as db:
-        db.execute("PRAGMA user_version=4")
+        db.execute("PRAGMA user_version=5")
+    malformed_before = _inventory(tmp_path)
+    malformed = _cli(tmp_path, "import-status")
+    assert malformed.returncode == 2 and "incomplete provider safety schema" in malformed.stdout, malformed.stdout
+    assert _inventory(tmp_path) == malformed_before
+    with closing(sqlite3.connect(_mdir(tmp_path) / "queue.sqlite3", isolation_level=None)) as db:
+        db.execute("PRAGMA user_version=6")
+    newer_before = _inventory(tmp_path)
     newer = _cli(tmp_path, "import-status")
-    assert newer.returncode == 2 and "unsupported queue schema 4" in newer.stdout, newer.stdout
+    assert newer.returncode == 2 and "unsupported queue schema 6" in newer.stdout, newer.stdout
+    assert _inventory(tmp_path) == newer_before
 
 
 def test_ready_status_without_a_ready_protocol_stops_the_tick(tmp_path):

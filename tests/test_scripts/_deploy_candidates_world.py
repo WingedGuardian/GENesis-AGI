@@ -17,6 +17,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -328,9 +329,26 @@ class World:
         )
 
 
-@pytest.fixture()
-def dc():
+def load_engine(monkeypatch):
+    """Load the engine in-process, restoring import state when ``monkeypatch`` undoes.
+
+    The engine strips scripts/ from sys.path and adds a sibling finder to
+    sys.meta_path at import (deploy_candidates.py, top of file). Loaded
+    in-process, that would leak into every later test in this process. Scoped
+    here rather than in private_module: other scripts it loads insert their own
+    directory at import and import siblings lazily, and a general restore
+    breaks them. A test using this must not call ``monkeypatch.syspath_prepend``
+    afterwards: undo applies that saved copy last, which would be the stripped
+    path.
+    """
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))
     return private_module("deploy_candidates_under_test", ENGINE)
+
+
+@pytest.fixture()
+def dc(monkeypatch):
+    return load_engine(monkeypatch)
 
 
 @pytest.fixture()

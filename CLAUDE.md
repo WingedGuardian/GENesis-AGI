@@ -87,6 +87,10 @@ installs with no graph engine, so it is enabled everywhere; see
 the oneshot bootstrap starts after installing the browser packages: the
 Camoufox engine and Chromium they pin, and their system libraries; see
 `scripts/install_browser_stack.sh`),
+`genesis-inbox-sync.timer` (every 5 minutes, mirrors the vault set in
+`inbox_monitor.sync_remote` into the inbox and pushes responses back; exits at
+once where none is set, and the awareness loop alerts when its heartbeat goes
+stale; see `scripts/inbox_sync.sh`),
 `genesis-code-intel.timer` (idle-gated code-intel
 index-request consumer; see `scripts/code_intel_runner.sh`) with
 `genesis-code-intel-freeze.service` as its on-demand kill-switch (rendered but
@@ -898,6 +902,12 @@ gate works, its exemption categories, and the unit rules for size bounds:
 - **Bugs you see get fixed or tracked — never ignored.** Fix now by default; a
   deferred bug follows the routing above — a Genesis-repo bug becomes an ISSUE, a
   someday/not-pursuing one becomes `tabled` — never a silent drop.
+- **Found a Genesis bug or defect? Track it on the repo's issue tracker — in
+  addition to fixing it, never instead.** Foreground: offer to file it (a
+  courtesy, not an approval gate). Background/dispatched: never post; record it
+  per your profile and state it in your returned output so the foreground files
+  it (`.claude/docs/mcp-tools-guide.md`, "Dispatched / background sessions").
+  The privacy scrub and security-defect limit in "Where deferred work goes" apply.
 - **Data repair is not a fix.** If a mechanism failed to write or propagate
   something, hand-writing the missing artifact (memory, directive, row, flag)
   repairs ONE instance on ONE install. Label it "data repair", and fix the

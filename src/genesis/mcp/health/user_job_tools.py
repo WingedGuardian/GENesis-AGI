@@ -4,10 +4,18 @@ from __future__ import annotations
 
 import logging
 
+from fastmcp import FastMCP
+
 from genesis.cc.types import VALID_EFFORT_NAMES, VALID_MODEL_NAMES
-from genesis.mcp.health import mcp
 
 logger = logging.getLogger(__name__)
+
+# Its own object, not the shared health one. No MCP server serves this module
+# (genesis.learning.procedural.tool_names._NOT_SERVED); genesis-server imports it
+# only to wire the job scheduler. Registered on the health object, these tools
+# appeared in every in-process listing of health's tools (the dashboard's
+# /api/genesis/mcp/tools, the status snapshot) although no session can call them.
+mcp = FastMCP("genesis-user-jobs-unserved")
 
 # Module-level state — wired at runtime via init_user_job_tools()
 _db = None

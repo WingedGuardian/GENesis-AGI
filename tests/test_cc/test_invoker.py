@@ -757,6 +757,54 @@ def test_probe_sets_the_same_properties_as_the_real_invocation(monkeypatch):
         assert prop in out
 
 
+def test_scope_argv_carries_a_fixed_description():
+    import genesis.cc.invoker as inv_mod
+
+    assert inv_mod._scope_argv() == [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "--quiet",
+        "--description=Genesis CC session",
+        "-p",
+        "IOWeight=100",
+        "-p",
+        "MemoryHigh=62%",
+        "-p",
+        "MemoryMax=75%",
+        "--",
+    ]
+
+
+def test_scope_description_never_carries_the_command():
+    import genesis.cc.invoker as inv_mod
+
+    argv = inv_mod._scope_argv("/usr/local/bin/claude", "-p", "SECRET-PROMPT-TEXT")
+    descriptions = [arg for arg in argv if arg.startswith("--description=")]
+    assert descriptions == ["--description=Genesis CC session"]
+    assert all("SECRET-PROMPT-TEXT" not in arg for arg in argv[: argv.index("--")])
+
+
+def test_probe_carries_the_description(monkeypatch):
+    import subprocess as real_subprocess
+
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod.shutil, "which", lambda _: "/usr/bin/systemd-run")
+    seen = []
+
+    def _probe_ok(*args, **kwargs):
+        seen.append(list(args[0]))
+        return real_subprocess.CompletedProcess(args[0], 0, b"", b"")
+
+    monkeypatch.setattr(inv_mod.subprocess, "run", _probe_ok)
+    out = inv_mod._build_scope_args()
+
+    assert len(seen) == 1
+    description = "--description=Genesis CC session"
+    assert seen[0].index(description) == out.index(description)
+
+
 def test_scope_args_built_when_probe_succeeds(monkeypatch):
     import subprocess as real_subprocess
 
