@@ -146,3 +146,75 @@ def test_the_guarded_install_heals_between_pip_and_the_import_check(tmp_path: Pa
         i for i, c in enumerate(calls) if "import genesis.mcp.health" in c
     )
     assert install < detect < heal < check
+
+
+def test_a_pip_uninstall_stash_is_never_named(tmp_path: Path) -> None:
+    """pip leaves ``~itellm-1.78.7.dist-info`` behind an interrupted uninstall and
+    ignores it; importlib.metadata reports it as ``litellm 1.78.7``. Naming it
+    force-reinstalled 1.78.7 over the pinned version on a live install."""
+    site = tmp_path / "site"
+    stash = site / "~itellm-1.78.7.dist-info"
+    stash.mkdir(parents=True)
+    (stash / "METADATA").write_text("Metadata-Version: 2.1\nName: litellm\nVersion: 1.78.7\n")
+    (stash / "RECORD").write_text("litellm/gone.py,sha256=x,1\n")
+    current = _dist(site, "litellm", "1.100.4", {"litellm/__init__.py": True})
+    stashed = metadata.PathDistribution(stash)
+    assert stashed.metadata["Name"] == "litellm"  # why the stash is dangerous
+    assert venv_missing_files.damaged([stashed, current], warn=lambda _l: None) == []
+
+
+def test_a_fork_sharing_a_package_directory_is_reported_not_reinstalled(tmp_path: Path) -> None:
+    """Upgrading litellm deletes files a fork that also installs into ``litellm/``
+    recorded; reinstalling the fork would overwrite the upgraded package."""
+    site = tmp_path / "site"
+    real = _dist(site, "litellm", "1.100.4", {"litellm/__init__.py": True})
+    fork = _dist(
+        site,
+        "unclecode-litellm",
+        "1.81.13",
+        {"litellm/__init__.py": True, "litellm/removed_upstream.py": False},
+    )
+    warnings: list[str] = []
+    assert venv_missing_files.damaged([real, fork], warn=warnings.append) == []
+    assert len(warnings) == 1
+    assert warnings[0].startswith("NOT reinstalling unclecode-litellm==1.81.13")
+    assert "litellm also installs" in warnings[0]
+
+
+def test_a_namespace_package_sibling_is_still_repaired(tmp_path: Path) -> None:
+    """``google/`` is shared by several distributions that never record the same
+    file; a sibling whose own file went missing is still repaired."""
+    site = tmp_path / "site"
+    api_core = _dist(site, "google-api-core", "2.0", {"google/api_core/__init__.py": True})
+    auth = _dist(
+        site,
+        "google-auth",
+        "2.0",
+        {"google/auth/__init__.py": True, "google/auth/moved.py": False},
+    )
+    warnings: list[str] = []
+    assert venv_missing_files.damaged([api_core, auth], warn=warnings.append) == [
+        "google-auth==2.0"
+    ]
+    assert warnings == []
+
+
+def test_the_stash_check_still_sees_the_dist_info_directory(tmp_path: Path) -> None:
+    """The stash skip reads PathDistribution's private ``_path``; if a Python
+    release drops it, stashes would be named again, so pin it here."""
+    dist = _dist(tmp_path / "site", "tool", "1.0", {"tool/__init__.py": True})
+    assert getattr(dist, "_path", None) is not None
+
+
+def test_a_module_move_between_distributions_is_still_repaired(tmp_path: Path) -> None:
+    """The case the repair exists for: fastmcp 4 is a metadata-only distribution
+    (it records no ``fastmcp/`` files), so fastmcp-slim is the package's only
+    owner and is still named when an upgrade deleted its files."""
+    site = tmp_path / "site"
+    meta_only = _dist(site, "fastmcp", "4.1.5", {})
+    slim = _dist(site, "fastmcp-slim", "4.1.5", {"fastmcp/__init__.py": False})
+    warnings: list[str] = []
+    assert venv_missing_files.damaged([meta_only, slim], warn=warnings.append) == [
+        "fastmcp-slim==4.1.5"
+    ]
+    assert warnings == []

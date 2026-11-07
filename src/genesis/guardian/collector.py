@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -512,7 +513,8 @@ _REPAIR_JOURNAL = (
 # (same_repo, REPO_BYTES), the same order (report_order), future skew
 # (REPORT_FUTURE_S) and read count (REPAIR_REPORTS_READ); a parity test holds
 # the constants equal and a cross-reader test runs both readers on one dir set.
-_REPAIR_NAME = r"([0-9]{8}T[0-9]{6}Z-[0-9]+)\-live\-move\-repair"
+_REPAIR_TS = r"[0-9]{8}T[0-9]{6}Z-[0-9]+"
+_REPAIR_NAME = "(" + _REPAIR_TS + r")\-live\-move\-repair"
 _REPAIR_REPORT_BYTES = 4 * 1024 * 1024  # D1 writes about 0.5 KB per path
 _REPAIR_REPO_BYTES = 4096
 # The longest repo value the pick reads: the writer's json.dump escapes each
@@ -615,7 +617,7 @@ for (seconds, _), name in names:
             continue
     except Exception:
         continue
-    sys.stdout.buffer.write(@MARK@.encode() + shown)
+    sys.stdout.buffer.write(@MARK@.encode() + name[: -len(SUFFIX)].encode() + b"\n" + shown)
     break
 """.replace("@CAP@", str(_REPAIR_REPORT_BYTES))
     .replace("@REPO@", str(_REPAIR_REPO_BYTES))
@@ -646,10 +648,12 @@ async def _read_report(config: GuardianConfig) -> dict | None:
             _INCUS_TIMEOUT,
             user=config.container_user,
         )
-        report = json.loads(out.split(_REPAIR_MARK, 1)[1]) if rc == 0 else None
+        ts, doc = out.split(_REPAIR_MARK, 1)[1].split("\n", 1) if rc == 0 else ("", "")
+        report = json.loads(doc) if re.fullmatch(_REPAIR_TS, ts) else None
     except (TimeoutError, OSError, IndexError, ValueError, RecursionError):
         return None
-    return report if isinstance(report, dict) else None
+    # The ts shown is the dir name's, which the pick validated; the stored one is user-writable.
+    return {**report, "ts": ts} if isinstance(report, dict) else None
 
 
 async def _collect_live_repair(config: GuardianConfig) -> str:
@@ -663,7 +667,8 @@ async def _collect_live_repair(config: GuardianConfig) -> str:
         rows = [r for r in rows if isinstance(r, dict)] if counted else []
         foreign = [r.get("path") for r in rows if r.get("class") == "foreign"]
         shown = ", ".join(_quoted(p, 200) for p in foreign[:10])
-        steps = report.get("reapply")
+        # The writer stores no shell steps (#3868); count what its folder holds.
+        saved = sum(1 for r in rows if isinstance(r.get("saved_as"), str))
         lines.append(
             f"newest report: ts {_quoted(report.get('ts'), 40)}, result "
             f"{_quoted(report.get('result') or 'not finished', 200)}; "
@@ -672,7 +677,7 @@ async def _collect_live_repair(config: GuardianConfig) -> str:
                 if counted
                 else "its restored paths could not be read; "
             )
-            + f"{len(steps) if isinstance(steps, list) else 0} re-apply step(s) in its REPAIR.json"
+            + f"{saved} saved path(s) in its folder"
         )
         if foreign:  # last, so the field cap cuts paths before anything else
             more = f" (+{len(foreign) - 10} more)" if len(foreign) > 10 else ""

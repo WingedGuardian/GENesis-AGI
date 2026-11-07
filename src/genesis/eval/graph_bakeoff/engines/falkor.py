@@ -26,8 +26,9 @@ class FalkorEngine:
 
     @classmethod
     def available(cls) -> bool:
-        # find_spec("redislite") is only meaningful in the throwaway venv; False in
-        # the prod venv -> harness skips until the S2 subprocess bridge lands.
+        # falkordblite is now a Genesis dependency (it ships the graph engine),
+        # so find_spec("redislite") is True in the prod venv too. That reports
+        # the PACKAGE only: load/run below stay S2 stubs.
         return module_available(_MODULE)
 
     async def load(self, snapshot_path: str) -> LoadStats:  # pragma: no cover - S2

@@ -9,6 +9,7 @@ Exit 1 means the run itself could not be trusted. The guarantees are in
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from dataclasses import dataclass, field
@@ -119,8 +120,46 @@ class Report:
             lines.append(f"    {rung}: {got[rung].detail}")
         return lines
 
+    def complete(self) -> bool:
+        return all((d.label, r) in self.results for d in self.defects for r in d.rungs)
+
+    def findings(self) -> list[str]:
+        """What a test is owed for, one line each. Only from a finished run, and not
+        about a defect a rung aborted on: neither has a basis for saying a test missed."""
+        if not self.complete():
+            return []
+        out = []
+        for defect in self.defects:
+            got = {r: self.results[(defect.label, r)] for r in defect.rungs}
+            if any(self._untrusted(res) for res in got.values()):
+                continue
+            caught = [r for r, res in got.items() if res.outcome == BIT]
+            if not caught:
+                out.append(f"{defect.label} (aim: {defect.aim}): ESCAPED")
+            elif defect.aim not in caught:
+                out.append(
+                    f"{defect.label} (aim: {defect.aim}): caught only by {', '.join(caught)}"
+                )
+        return out + self._idle_rungs()
+
+    def _idle_rungs(self) -> list[str]:
+        if len(self.defects) < 2:
+            return []  # with one case, a rung that missed it says nothing about the rung
+        out = []
+        for rung in dict.fromkeys(r for d in self.defects for r in d.rungs):
+            judged = [res for (_, r), res in self.results.items() if r == rung]
+            if not any(res.outcome == BIT or self._untrusted(res) for res in judged):
+                out.append(f"rung `{rung}`: caught nothing")
+        return out
+
+    def write_findings(self, path: Path) -> None:
+        path.write_text(
+            json.dumps({"complete": self.complete(), "findings": self.findings()}),
+            encoding="utf-8",
+        )
+
     def table(self) -> str:
-        complete = all((d.label, r) in self.results for d in self.defects for r in d.rungs)
+        complete = self.complete()
         lines = ["", "RUNG REPORT", _LIMIT]
         if not complete:
             lines.append(
@@ -136,12 +175,8 @@ class Report:
             )
         for defect in self.defects:
             lines.extend(self._row(defect))
-        if complete and len(self.defects) >= 2:
-            rungs = dict.fromkeys(r for d in self.defects for r in d.rungs)
-            for rung in rungs:
-                judged = [res for (_, r), res in self.results.items() if r == rung]
-                if not any(res.outcome == BIT or self._untrusted(res) for res in judged):
-                    lines.append(f"rung `{rung}`: caught nothing")
+        if complete:
+            lines.extend(self._idle_rungs())
         return "\n".join(lines)
 
     def publish(self) -> None:

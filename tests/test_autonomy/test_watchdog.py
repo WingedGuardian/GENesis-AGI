@@ -201,6 +201,19 @@ class TestDatabaseQuarantine:
         assert state["consecutive_failures"] == 2
 
 
+@pytest.mark.parametrize("error", [OSError("loop"), RuntimeError("loop")])
+def test_a_quarantine_check_that_raises_counts_as_quarantined(error):
+    """A symlink loop raises OSError on Python 3.13+ and RuntimeError on 3.12."""
+    checker = WatchdogChecker()
+    state = {"consecutive_failures": 2, "next_attempt_after": None, "last_reason": "target_inactive"}
+    with (
+        patch.object(checker, "_targets_server", return_value=False),
+        patch("genesis.autonomy.watchdog.database_is_quarantined", side_effect=error),
+    ):
+        assert checker._restart_if_allowed(state, reason="target_inactive") is WatchdogAction.SKIP
+    assert state["consecutive_failures"] == 2
+
+
 class TestStaleBootstrapGrace:
     """A status file stale from BEFORE the service started is not evidence about
     THIS process (2026-09-08 incident: post-outage boot left a 22,583s-stale

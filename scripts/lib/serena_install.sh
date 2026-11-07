@@ -16,7 +16,7 @@ _install_serena() (
         return 0
     fi
     sharing="$(python3 - <<'PY'
-import json, os, shutil, subprocess
+import json, os, re, shutil, subprocess
 from pathlib import Path
 try:
     home = Path(os.environ.get("GENESIS_HOME") or Path.home() / ".genesis").expanduser()
@@ -61,16 +61,37 @@ if sharing == "disabled":
                 break
     except (OSError, ValueError, subprocess.CalledProcessError):
         sharing = "unknown in user services"
+if sharing == "disabled":
+    try:
+        # uv mutates its own environment, which need not be the PATH winner.
+        root = Path(os.fsdecode(subprocess.check_output(["uv", "tool", "dir"]).removesuffix(b"\n")))
+        if not root.is_absolute():
+            raise ValueError("invalid uv tool directory")
+        provider = root / "serena-agent/bin/serena"
+        selected = shutil.which("serena")
+        if selected and (not provider.is_file() or not os.path.samefile(selected, provider)):
+            sharing = "provider outside uv installation"
+        else:
+            output = subprocess.check_output([str(provider), "--version"], text=True).strip()
+            match = re.fullmatch(r"Serena ([0-9]+)\.([0-9]+)\.([0-9]+)", output)
+            if match is None:
+                sharing = "unknown provider version"
+            else:
+                version = tuple(map(int, match.groups()))
+                if version == (2, 1, 0):
+                    sharing = "pinned"
+                elif version > (2, 1, 0):
+                    sharing = "newer provider version"
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        sharing = "unreadable provider version"
 print(sharing)
 PY
 )" || sharing=unknown
-    if [ "$sharing" = fresh ]; then
-        uv tool install serena-agent 2>/dev/null || echo "  WARNING: Serena install failed (non-critical)"
+    if [ "$sharing" = fresh ] || [ "$sharing" = disabled ]; then
+        uv tool install 'serena-agent==2.1.0' 2>/dev/null || echo "  WARNING: Serena install failed (non-critical)"
+    elif [ "$sharing" = pinned ]; then
+        echo "  Serena: reviewed version 2.1.0 already installed"
     elif [ "$sharing" != disabled ]; then
         echo "  Serena: automatic install/upgrade skipped (sharing $sharing); disable sharing before upgrading and revalidate before enabling."
-    elif command -v serena >/dev/null 2>&1; then
-        uv tool upgrade serena-agent 2>/dev/null || echo "  WARNING: Serena upgrade failed (non-critical)"
-    else
-        uv tool install serena-agent 2>/dev/null || echo "  WARNING: Serena install failed (non-critical)"
     fi
 )
