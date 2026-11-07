@@ -11,6 +11,8 @@ import secrets
 import sqlite3
 import time
 
+import _genesis_index_marker_recovery as recovery
+
 PROVIDERS = ("cbm", "gitnexus")
 MODES = ("fast", "moderate", "full")
 OUTCOMES = ("consume", "consume_full", "restore", "restore_backoff", "restore_failure")
@@ -239,6 +241,7 @@ def legacy_outcome(db, h, nonce, action, recorded_at, raw):
     return _record_scalar(db, row, dict(action=action, recorded_at=recorded_at), raw)
 
 
+@recovery.legacy_transition
 def _record_scalar(db, row, event, raw):
     if row["conflict_reason"]:
         return "conflict"

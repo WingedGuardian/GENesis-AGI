@@ -1809,6 +1809,22 @@ the shared banner is not an assertion about all concurrent sessions.
   Private sealed handoff checks its caller-bound digest before entry compilation;
   cached local modules refuse. This is not yet the queued shell/watchdog caller
   and supplies no new launch, recovery or automatic-readiness authority.
+  `index_marker_recovery.py` adds explicit transaction-only schema-5 storage,
+  original-owner control completion, persistent provider holds and an exact
+  terminal/control/source acceptance-watermark reader on the same queue.
+  Incomplete startup retains actual child waits as uncertainty, without
+  fabricating registration or native completion. Optional original-scope startup
+  observations preserve owned OOM kills, including the first sample, before
+  duplicate/conflict reduction; clean control cannot erase resource evidence.
+  Default initialization stays4; new native authority requires5, with no live
+  cutover, retry grant, acceptance setter or positive automatic readiness here.
+  Legacy uncertainty preserves original settlement/shared debt and uses
+  non-claim observations for ambiguous pending/reused identities. Common scalar
+  reduction covers reconciliation and embedded outcomes; import batches dedupe
+  provider revision advances. Retained cleanup evidence preserves healthy
+  sibling eligibility after original physical/control release; unresolved extra
+  conflicts remain provider-scoped. Runner and supervised recovery remain
+  separate, unqualified contributions.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
   deletions; native query/client cgroup proof and orphan-scope checks precede
@@ -2153,7 +2169,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 25f3ad876 2026-11-03
+verified: 4721e0d93 2026-11-07
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -2164,6 +2180,14 @@ verified: 25f3ad876 2026-11-03
   host reconcilers that share its version probe run on any branch).
   Config `~/.genesis/guardian_remote.yaml`; missing → silently
   disabled.
+- **Delivered-alert history (development candidate)**: host `alert/sent_log.py`
+  records successful alert deliveries as displayed text, with two bounded JSONL
+  generations. The read-only `sent-log` gateway and existing container ingestor
+  use a terminal success/count protocol; an unreadable generation fails the
+  whole page. Locked appends sequence timestamps within a 300-second future
+  window; inadmissible clock outliers remain on disk until eligible, with a
+  new bounded stream after a large clock reset. Host redeploy and installed
+  conversation-history verification remain outstanding.
 - **Snapshot deletion window** (`guardian/deletion_window.py`): routine
   snapshot deletions (the superseded healthy snapshot, prune, and what incus
   would expire before the next window) wait for `snapshots.deletion_window`,
@@ -3202,7 +3226,13 @@ verified: 3e27b4794 2026-10-23
   Status reads confined snapshot metadata and reports individual source stat or
   fingerprint errors while continuing; bounded SQL previews and streaming CSV
   preserve full query counts without retaining every result row in Python.
-  Scheduling arrives in a dependent change. Additional backup
+  Source evidence validates the selected original block's ID/hash and reports
+  ambiguous reused IDs without choosing an owner. Its regular-file reader bounds
+  physical records at 1 MiB, withholds oversized/recursive context and reports
+  oversized targets unavailable while retaining search rows and original files.
+  Applicable result envelopes retain their hash eligibility and are scrubbed.
+  Scheduling arrives in a
+  dependent change. Additional backup
   and recovery integration is deferred independently of collection and search.
   Unknown historical content is excluded from content metrics. Views version 24
   preserves missing call/result hashes as unknown and admits ownership from the
