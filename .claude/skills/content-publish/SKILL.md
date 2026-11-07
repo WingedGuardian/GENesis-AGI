@@ -6,7 +6,7 @@ description: >
   publishes to Medium via browser automation. Invoke with "publish a post
   about X", "write and publish to Medium", "content-publish", or when an
   ego-dispatched session needs to create and distribute content.
-keywords: [publish, article, blog, marketing]
+keywords: [publish, article, blog, marketing, medium]
 ---
 
 ## Voice (MANDATORY — NON-NEGOTIABLE)

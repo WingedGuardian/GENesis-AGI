@@ -4,7 +4,7 @@ description: Canonical guide to Genesis browser automation - layers (Camoufox, C
 consumer: cc_background_task
 phase: 7
 skill_type: workflow
-keywords: [browser, click, scrape, popup, iframe, dropdown, checkbox, cdp, chrome, vnc]
+keywords: [browser, click, scrape, popup, iframe, dropdown, checkbox, cdp, chrome, vnc, screenshot, form]
 ---
 
 # Browser Automation

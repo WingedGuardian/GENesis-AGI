@@ -381,11 +381,15 @@ _GENERIC_KEYWORDS = frozenset({
     # writing / publishing
     "content", "write", "post", "draft", "report", "export", "client",
     "professional", "polish", "proposal", "submission", "distribution",
-    "medium",
     # web / UI nouns and verbs that every ops prompt uses
-    "page", "site", "tab", "web", "url", "form", "fill", "submit", "login",
-    "upload", "button", "navigate", "screenshot", "snapshot", "overlay",
-    "automate", "automation", "bot", "detection", "fingerprint",
+    "page", "site", "tab", "web", "url", "fill", "submit", "login",
+    "upload", "button", "navigate", "snapshot", "overlay",
+    "automate", "automation", "fingerprint",
+    # NOT listed, by owner choice 2026-11-07: `medium` (content-publish),
+    # `screenshot` and `form` (browser-automation), `bot` and `detection`
+    # (stealth-browser) stay as keywords, trading some misfires for those
+    # skills' real triggers ("write a Medium post", "fill out the form",
+    # "the site has bot detection").
     # analysis
     "audit", "missing", "map", "compare", "architecture", "capability",
     "capabilities", "lacks",
