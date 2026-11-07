@@ -4745,8 +4745,10 @@ Refusing a proposed update preserves a previously valid opt-in.
   256 MiB, at most 2 GiB in all, and looks at most at 200,000 nodes; a part
   that would read past that is `other:too-large`. A symlinked or non-regular
   lock file is refused by name, never followed. A directory row's `entry`
-  parts are the saved files whose bytes are not the move target's (only the
-  foreign rows themselves when the target cannot be read); sockets
+  parts are the saved files whose bytes are not the move target's, or whose
+  copy is not the one `SAVED.json` records (so a copy changed to the target's
+  bytes is staged, and refused, never left out as the update's); only the
+  foreign rows themselves when the target cannot be read; sockets
   and devices are `other:cannot-make`. Exit 0 only when every part is as-left
   or already-restored. It writes no report and no backup; like the repair, it
   creates `locks/update.lock` and `.git/genesis-checkout.lock` when they are
@@ -4772,7 +4774,25 @@ Refusing a proposed update preserves a previously valid opt-in.
   `renameat2(RENAME_NOREPLACE)` through ctypes (the one move it makes, for
   every kind and the put-back, so nothing that appeared meanwhile is ever
   replaced); judge the aside once more (a write through an open fd is named);
-  clear the in-flight record. Every checkout-side call goes through directory
+  clear the in-flight record. A run killed between the put-in and that
+  judgment leaves it to the next: the part `REPAIR.json` names in flight
+  reads already-restored only while its aside is still what was moved there,
+  else `other:changed`, naming the aside (`--check` too). The in-flight
+  record is cleared only once its part is back or its aside holds nothing
+  the restore did not move there: while the in-flight part's aside holds
+  anything else (a write after the move, through an open fd), unless that
+  part read already-restored or as-left by the resume rule (both judged the
+  aside itself), the record is kept, and since it has one slot no other part
+  is written (`other:inflight-unresolved`, naming the aside, in `--check`
+  too; the in-flight part too, when its path holds the tag's state again), so
+  every run names it and exits 1 until what is there is moved out. An aside
+  still holding the repair's own as-left copy (the part refused by a gate
+  after a kill, or a put-back that failed) holds nothing back; that one read
+  has its own budget. Moving the content out releases the other parts, and
+  the in-flight path is then judged by what it holds: the saved node a kill
+  after the put-in left there reads already-restored; a path a kill after
+  the aside left empty, or one holding whatever appeared there after a failed
+  put-back, goes back by hand, or the report is `--dismiss`ed. Every checkout-side call goes through directory
   fds opened one component at a time without following a link; a missing
   parent is made with `mkdir`, one at a time. `EXDEV` refuses the part
   `other:cross-device` and an unsupported RENAME_NOREPLACE (`EINVAL`,
@@ -4785,7 +4805,9 @@ Refusing a proposed update preserves a previously valid opt-in.
   and a file entry at a parent, git's directory/file rule, MEASURED) holds an
   entry that is not one of this report's rows as the judge read it is
   refused `changed-during-restore`, a stage-0 part with a refused row below
-  it `child-refused`, and the footprint is dropped explicitly; after the call
+  it `child-refused`, one whose footprint holds a flag (read with the index)
+  that the restore does not set again after the call `other:flag-changed`
+  (the call re-creates entries unflagged), and the footprint is dropped explicitly; after the call
   the WHOLE index must be the one expected, else every index part
   `index-skipped`, naming `<run>/index-before.txt`, where the footprint's
   entries from before the call were written (0600, `ls-files -s -z` records)

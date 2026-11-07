@@ -29,12 +29,22 @@ entry, one the same restore replaces), is neither an ``index-above`` nor a
 ``link-parent`` for its child. An index part whose blob is neither saved nor
 in the object store is ``not-saved``. A directory row's saved copy can hold
 the update's own files, so it lists as ``entry`` parts only the saved files
-whose bytes are not the move target's (when the target cannot be read, only
-those that are foreign rows themselves); the restore builds the directory
-from those. A node part a killed restore left half-done reads as-left by
-the resume rule (Judge._resume), and so does the S a restore killed between
-a both-flags entry's two writes left. ``check`` writes nothing; ``restore`` writes
-only parts judged as-left, each self-verifying (see _Writer)."""
+whose bytes are not the move target's, or whose copy is not the one SAVED.json
+records (when the target cannot be read, only those that are foreign rows
+themselves); the restore builds the directory from those. A node part a
+killed restore left half-done reads as-left by the resume rule
+(Judge._resume), and so does the S a restore killed between a both-flags
+entry's two writes left; the node part REPAIR.json names in flight reads
+already-restored only while its aside is still the state moved there
+(Judge._landed), and while one refused leaves its aside holding something
+the restore did not move there every other as-left part is
+``other:inflight-unresolved`` (Judge.unresolved: the record is kept, and it
+has one slot; moving that content out releases them, and the in-flight path
+is then judged by what it holds: the saved node, which a kill after the
+put-in left there, reads already-restored; a path a kill after the aside
+left empty, or one holding whatever appeared there after a failed put-back,
+goes back by hand or the report is dismissed). ``check`` writes nothing;
+``restore`` writes only parts judged as-left, each self-verifying (see _Writer)."""
 
 from __future__ import annotations
 
@@ -396,6 +406,7 @@ class Judge:
         # so the integrity check never spends the walk's and turns a directory
         # that restored correctly into other:too-large.
         self.kept_budget = _Budget(rp)
+        self.aside_budget = _Budget(rp)  # unresolved()'s one read of the in-flight aside
         report, self.rows = loaded["report"], loaded["rows"]
         self.records, self.runs, self.shown, self.strict = records or {}, runs, shown, strict
         self.integrity, self.git_dir = records is not None, None
@@ -404,6 +415,7 @@ class Judge:
         block = restore_block(report)
         self.inflight = block["inflight"] if block else None
         self.notes, self.dirs, self.entry_of, self.resumed = {}, {}, {}, None
+        self.held = None  # the unresolved in-flight aside, shown (set by _judged)
         self.fmt = rp._out(repo, "rev-parse", "--show-object-format")
         self.head = rp._tree(repo, "HEAD")
         self.tag = rp._tree(repo, report["tag"])
@@ -717,8 +729,64 @@ class Judge:
         if not ok:
             return "other:not-saved"
         rel = row["saved_as"]
-        done = lambda: self._state(self.repo, p) == saved and (not rel or self._kept(rel))  # noqa: E731
+        done = lambda: (  # noqa: E731
+            self._state(self.repo, p) == saved and (not rel or self._kept(rel)) and self._landed(p)
+        )
         return self._verdict(link, done, gate, lambda: self._as_left(p))
+
+    def _landed(self, p: str) -> bool:
+        """The in-flight part reads already-restored only while its aside is
+        still what the restore moved there (#3986 review): one killed after its
+        put-in, before it judged the aside again, may have left a write through
+        an open fd there, and clearing the in-flight record would lose it. No
+        aside (the path was empty) holds nothing to lose."""
+        inf = self.inflight
+        if not inf or inf[1] != p or self.runs is None:
+            return True
+        aside = os.path.join(self.runs, inf[0], "aside")
+        if self.rp._link_parent(aside, p) is None and not os.path.lexists(os.path.join(aside, p)):
+            return True
+        if self._left(p, root=aside, strict=True):  # a link parent: never as-left
+            return True
+        where = os.path.join(self.shown, inf[0], "aside", p)
+        self.notes[(p, "node")] = f"newer content kept at {where}"
+        return False
+
+    def unresolved(self, parts) -> str | None:
+        """The aside REPAIR.json's in-flight part left, as shown, while that
+        part is neither as-left nor already-restored and its aside holds
+        something that is not the state the restore moved there (#3986 review);
+        else None. The record then stays, and since it
+        has one slot, nothing else is written (live_move_restore_write) until
+        what is there is moved out: every rerun names it."""
+        inf = self.inflight
+        if not inf or self.runs is None:
+            return None
+        # Only a verdict that judged the aside itself settles it: already-restored
+        # (Judge._landed) and an as-left the resume rule read (path empty, aside
+        # the as-left state). An as-left checkout (the tag's node put back at the
+        # path) never looked at the aside, which may hold newer content.
+        v = next((v for p, k, v in parts if p == inf[1] and k == "node"), None)
+        if v == "already-restored" or (v == "as-left" and self.resumed == inf[1]):
+            return None
+        aside = os.path.join(self.runs, inf[0], "aside")
+        if self.rp._link_parent(aside, inf[1]) is None and not os.path.lexists(
+            os.path.join(aside, inf[1])
+        ):
+            return None
+        # Only content the restore did not move there holds the record: an aside
+        # still holding the repair's own as-left copy (a gate refusing the part
+        # after a kill) is what git gives back, and must not stop the rest. Read
+        # on its own budget: the rows judged before it may have spent the walk's.
+        spent, self.budget = self.budget, self.aside_budget
+        try:
+            if self._left(inf[1], root=aside, strict=True):
+                return None
+        except (OSError, self.rp.TooLarge):
+            pass  # unreadable: never taken for the as-left state
+        finally:
+            self.budget = spent
+        return os.path.join(self.shown, inf[0], "aside", inf[1])
 
     def _kept(self, rel: str) -> bool:
         """Is the backup's copy at ``rel`` the one SAVED.json records (#3986
@@ -770,11 +838,15 @@ class Judge:
                 return [(p, "node", "other:not-saved")]
             i += 1
         for q, s in saved.items():
-            rec = self.records.get(f"{row['saved_as']}/{q}")
+            rel = f"{row['saved_as']}/{q}"
+            rec = self.records.get(rel)
             if s and s[0] == "fifo" and rec and rec["type"] == "fifo":
                 s = _fifo(rec["mode"])  # what the restore makes: the record's mode
-            if self.target is not None and s == self.target.get(f"{p}/{q}"):
-                kept[q] = s  # the update's own bytes
+            # The update's own bytes, left out, only while the copy is the one
+            # SAVED.json records (#3986 review): a copy changed to the target's
+            # bytes is restored instead, where staging refuses it.
+            if self.target is not None and s == self.target.get(f"{p}/{q}") and self._kept(rel):
+                kept[q] = s
             elif self.target is not None or f"{p}/{q}" in self.foreign:
                 restore[q] = s
             else:
@@ -786,7 +858,9 @@ class Judge:
             have, tagged = self._walk(self.repo, p), self._tag_below(p)
             if not all(have.get(q) == s for q, s in restore.items()):
                 return False
-            if not all(self._kept(f"{row['saved_as']}/{q}") for q in restore):
+            if not self._landed(p) or not all(
+                self._kept(f"{row['saved_as']}/{q}") for q in restore
+            ):
                 return False  # #3986 review: the copies are the ones SAVED.json records
             # Review SF-6: a file git ignores (the server's __pycache__) is no change.
             extra = [f"{p}/{q}" for q, s in have.items()
@@ -1023,7 +1097,24 @@ def _judged(rp, repo: str, ctx, say, write: bool, nothing: str):
         parts = [part for row in judge.rows if row["class"] == "foreign" for part in judge.row(row)]
     except OSError as exc:
         return unreadable(exc)
+    if where := judge.unresolved(parts):
+        for n, (p, k, v) in enumerate(parts):
+            if v == "as-left":
+                parts[n] = (p, k, INFLIGHT_UNRESOLVED)
+                judge.notes[(p, k)] = unresolved_note(where)
+    judge.held = where
     return judge, parts, loaded, ctx
+
+
+#: A part not written while an interrupted restore's aside is unresolved.
+INFLIGHT_UNRESOLVED = "other:inflight-unresolved"
+
+
+def unresolved_note(where: str) -> str:
+    return (
+        f"an interrupted restore's aside {where} holds newer content: nothing else is"
+        " written until it is moved out; its own path is then judged by what it holds"
+    )
 
 
 def _line(path: str, part: str, outcome: str, note: str | None) -> str:

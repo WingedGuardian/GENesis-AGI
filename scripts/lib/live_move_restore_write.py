@@ -134,7 +134,11 @@ class _Writer:
     the part in flight; move what is at the path to <run>/aside/<path>;
     re-judge the aside (review SF-1: a session's write in between is put back,
     refused); PUT IN with renameat2(RENAME_NOREPLACE) (a node that appeared
-    meanwhile is never replaced); judge the aside again (review L-2); record.
+    meanwhile is never replaced); judge the aside again (review L-2; a run
+    killed before it leaves that to the judge of the next, Judge._landed); record.
+    A refused part whose aside holds something the restore did not move there
+    stays in flight, and then nothing else is written this run or the next
+    (Judge.unresolved); the repair's own as-left copy there holds nothing back.
     Then the index parts in one update-index call, the flags, a refresh, and a
     second judge that must read already-restored for every part written."""
 
@@ -149,6 +153,10 @@ class _Writer:
         self.run_name = self.run_fd = self.repo_fd = None
         self.wrote, self.extras, self.flight = [], [], None
         self.called = set()  # every path whose entries the index call replaced
+        # The in-flight record kept for the next run: an aside still holding what
+        # a refused in-flight part left there (#3986 review). While it is held
+        # nothing else is written, since the record has one slot.
+        self.hold = list(judge.inflight) if judge.held else None
 
     def run(self) -> int:
         j = self.j
@@ -164,13 +172,16 @@ class _Writer:
         self.repo_fd = os.open(self.repo, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
             for row in nodes:
+                if self.hold:
+                    break
                 self._node(row)
             for (p, k), v in self.verdict.items():
                 if k == "entry" and v == "as-left":
                     self.out[(p, k)] = self.out[(j.entry_of[p], "node")]
             _step("index")
-            self._index()
-            self._flags()
+            if not self.hold:
+                self._index()
+                self._flags()
             if self.wrote:
                 self.rp._git(self.repo, "update-index", "-q", "--refresh", check=False)
             _step("post-judge")
@@ -229,7 +240,7 @@ class _Writer:
         p, j = row["path"], self.j
         flying = p == j.resumed  # REPAIR.json names it in flight
         moved = j.inflight[0] if flying else None  # the run whose aside holds what was here
-        staged = None
+        staged, held = None, None  # held: the run whose aside a refusal leaves holding it
         self.flight = p
         try:
             staged = self._stage(row)
@@ -253,7 +264,8 @@ class _Writer:
                     os.close(dst)
                 _step("put-in")
                 if moved is not None and not self._still_left(p, moved):
-                    where, moved = self._aside(p, moved), None  # the path is the restore's now
+                    # The path is the restore's now; the aside holds the newer write.
+                    where, held, moved = self._aside(p, moved), moved, None
                     raise _Part("changed-during-restore", f"written after it was moved to {where}")
             self.out[(p, "node")] = "restored"
             self.wrote.append(p)
@@ -262,12 +274,28 @@ class _Writer:
             note = exc.note if isinstance(exc, _Part) else f"{exc.filename or ''}: {exc.strerror}"
             if moved is not None and not self._move(p, moved, to_aside=False):
                 note = f"{note}; what was at the path is kept at {self._aside(p, moved)}"
+                # Held only for content the restore did not move there: the
+                # repair's own as-left copy is what git gives back (#3986 review).
+                held = None if self._still_left(p, moved) else moved
             self._refuse(p, "node", reason, note)
         finally:
             if staged is not None:
                 os.close(staged)
+        if held is not None:  # kept in flight, and nothing else written (#3986 review)
+            self.hold = [held, p, "node"]
+            unresolved = self.chk.unresolved_note(self._aside(p, held))
+            for (q, k), v in self.verdict.items():
+                # An entry takes its directory's outcome (run()): one whose
+                # directory was decided this run is not refused here. Only an
+                # as-left entry is in entry_of (a cannot-make or unreadable one
+                # is not), so that is tested first.
+                if v != "as-left" or (q, k) in self.out:
+                    continue
+                if k == "entry" and (j.entry_of[q], "node") in self.out:
+                    continue
+                self._refuse(q, k, self.chk.INFLIGHT_UNRESOLVED, unresolved)
         if flying:
-            self._save(None)
+            self._save(self.hold)
         self.flight = None
 
     def _aside(self, p: str, run: str) -> str:
@@ -430,7 +458,9 @@ class _Writer:
         call the whole index is read once; a part whose footprint holds an
         entry that is not one of this report's rows as the judge read it (no
         part of that row refused) is refused, and its parents `child-refused`;
-        each footprint is dropped explicitly. After the call the WHOLE index
+        so is one whose footprint holds a flag the restore does not set again
+        after the call (`other:flag-changed`: the call re-creates entries
+        unflagged); each footprint is dropped explicitly. After the call the WHOLE index
         must be the one expected. Residual (owner ruling): a session's git
         that stages between that read and the call, milliseconds; git has no
         compare-and-swap for the index."""
@@ -461,8 +491,19 @@ class _Writer:
                 self._refuse(p, "index", "other:hash-mismatch", bad)
             else:
                 go.append(p)
-        pre = rp._index_state(self.repo)[0]
+        pre, flags = rp._index_state(self.repo)
         keys, feet = sorted(pre), {}
+
+        def sets_again(q: str) -> bool:
+            # The call re-creates every entry it drops unflagged (#3986 review):
+            # a flag there now survives only as one the judge read and _flags
+            # then sets, the row's own flag part (one already back is set again
+            # only when its entry is re-created, so only when its row is in the call).
+            v = self.verdict.get((q, "flag"))
+            return flags.get(q) == j.flags.get(q) and (
+                v == "as-left" or (v == "already-restored" and q in go)
+            )
+
         for p in go:
             # What git drops: a stage-0 record, every entry under it and a file
             # entry at a parent; any record, the entries at its path. A parent's
@@ -473,9 +514,14 @@ class _Writer:
             look = drop + [d for d in rp._parents(p) if d in pre and d not in drop]
             stray = [q for q in look if q not in rows or q in self.refused
                      or pre.get(q, []) != j.index.get(q, [])]  # fmt: skip
+            flagged = [q for q in drop if q in flags and not sets_again(q)]
             if stray:
                 why = f"{json.dumps(stray[0])[:200]} changed since it was judged"
                 self._refuse(p, "index", "changed-during-restore", why)
+            elif flagged:
+                q = flagged[0]
+                why = f"{json.dumps(q)[:200]} holds a flag ({flags[q]}) the index call would drop"
+                self._refuse(p, "index", "other:flag-changed", why)
             else:
                 feet[p] = drop
         while dropped := [
@@ -596,14 +642,16 @@ class _Writer:
 
     def _finish(self) -> None:
         """restored_at only when nothing was refused (review SF-4); a re-run
-        that changes nothing writes nothing."""
+        that changes nothing writes nothing. The in-flight record is cleared
+        only once its part is back, or its aside holds nothing (#3986 review:
+        kept, every rerun names that aside)."""
         refused = sum(o.startswith("refused:") for o in self.out.values())
         stamp = None if refused else time.strftime("%FT%TZ", time.gmtime())
         p = self.prior
-        same = p and p["inflight"] is None and p["refused"] == refused
+        same = p and p["inflight"] == self.hold and p["refused"] == refused
         if same and self.run_name is None and (p["restored_at"] is None) == (stamp is None):
             return
-        self._save(None, refused, stamp)
+        self._save(self.hold, refused, stamp)
 
     def _report(self) -> int:
         say, ts, shown = self.say, self.ctx.ts, self.ctx.shown_backup

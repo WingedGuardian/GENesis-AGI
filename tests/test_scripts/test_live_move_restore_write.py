@@ -619,6 +619,8 @@ def test_a_write_into_the_aside_after_the_put_in_is_named(w, mod, monkeypatch, c
     rc, out = _restore_in(w, mod, monkeypatch, capsys, ts, at={"put-in": write_through_fd})
     assert rc == 1 and _parts_of(out)[("sub/s1", "node")] == "refused:changed-during-restore", out
     assert "aside" in out
+    # #3986 review: the in-flight record names that aside for every later run.
+    assert w.report()["restore"]["inflight"][1:] == ["sub/s1", "node"]
 
 
 # ── SIGKILL at each step: a re-run converges ────────────────────────────────
@@ -700,10 +702,263 @@ def test_a_killed_restore_whose_aside_changed_names_where_it_is(w):
     [run] = _runs(w)
     aside = run / "aside" / "sub" / "s1"
     aside.write_text("written after the aside\n")
-    for r in (_check(w, ts), _restore(w, ts)):
+    # #3986 review: the in-flight record is kept, so a second run names it too.
+    for r in (_check(w, ts), _restore(w, ts), _restore(w, ts), _check(w, ts)):
         assert r.returncode == 1 and str(aside) in r.stdout, r.stdout
         assert _parts(r)[("sub/s1", "node")] in ("other:changed", "refused:other:changed")
+        assert w.report()["restore"]["restored_at"] is None
     assert aside.read_text() == "written after the aside\n"
+
+
+def _dir_and_later_edit(w):
+    """A directory row P (sorts first) and a later foreign edit sub/t."""
+    (w.root / "sub" / "t").write_text("my t\n")
+    return _foreign_inside_dir(w)
+
+
+def test_an_aside_holding_only_the_as_left_copy_never_holds_the_rest(w):
+    """#3986 review: killed after P's aside (it holds the tag's file P, the
+    repair's own copy), then a session stages at P before the re-run (git
+    refuses an entry below P while the index holds the file P): P is refused
+    `index-changed` by its gate, but an aside holding only what the restore
+    moved there is no unresolved content, so the other parts still restore
+    rather than every run refusing them `inflight-unresolved`."""
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: _dir_and_later_edit(w))
+    age_locks(w)
+    assert w.repair().returncode == 0
+    ts = w.backups()[-1].name[: -len(SUFFIX)]
+    assert _restore(w, ts, **{KILL_ENV: "aside"}).returncode == -9
+    assert w.report()["restore"]["inflight"][1:] == ["P", "node"], "control: P first"
+    oid = _hash(w, "staged at P since\n")
+    _git(w.root, "update-index", "--cacheinfo", f"100644,{oid},P")
+    c = _check(w, ts)
+    assert _parts(c)[("P", "node")] == "other:index-changed", c.stdout
+    assert _parts(c)[("sub/t", "node")] == "as-left", c.stdout
+    r = _restore(w, ts)
+    assert r.returncode == 1 and _parts(r)[("P", "node")] == "refused:other:index-changed", r.stdout
+    assert _parts(r)[("sub/t", "node")] == "restored", r.stdout
+    assert (w.root / "sub" / "t").read_text() == "my t\n"
+    assert "inflight-unresolved" not in r.stdout, r.stdout
+
+
+def test_a_failed_put_back_of_the_as_left_copy_never_holds_the_rest(w, mod, monkeypatch, capsys):
+    """#3986 review: P's put-in fails (EEXIST) and so does the put-back, so the
+    aside keeps what was at P: the repair's own as-left copy, named, which is
+    no unresolved content. The record is cleared and sub/t, after it, restores."""
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: _dir_and_later_edit(w))
+    age_locks(w)
+    assert w.repair().returncode == 0
+    ts = w.backups()[-1].name[: -len(SUFFIX)]
+
+    def fail_p(kit, mp):
+        real = kit._renameat2
+
+        def rename(sfd, sname, dfd, dname, where):
+            if sname == "P" and where in ("put-in", "put-back"):
+                raise OSError(errno.EEXIST, os.strerror(errno.EEXIST))
+            return real(sfd, sname, dfd, dname, where)
+
+        mp.setattr(kit, "_renameat2", rename)
+
+    rc, out = _restore_in(w, mod, monkeypatch, capsys, ts, patch=fail_p)
+    parts = _parts_of(out)
+    assert rc == 1 and parts[("P", "node")] == "refused:changed-during-restore", out
+    assert "what was at the path is kept at" in out, out
+    assert parts[("sub/t", "node")] == "restored", out
+    assert w.report()["restore"]["inflight"] is None
+
+
+def test_a_hold_set_mid_run_keeps_what_that_run_already_restored(w, mod, monkeypatch, capsys):
+    """#3986 review: the run restores the directory P (its entry P/mine.txt
+    with it), then sub/s1's aside is written through an open fd after its
+    put-in. The hold refuses only what is still to write (sub/t): P and its
+    entry stay restored, with no hold note on them."""
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: (_dir_and_later_edit(w), _foreign_edit(w)))
+    age_locks(w)
+    assert w.repair().returncode == 0
+    ts = w.backups()[-1].name[: -len(SUFFIX)]
+    put_ins = []
+
+    def write_into_s1_aside(kit, mp):
+        real = kit._step
+
+        def step(name):
+            if name == "put-in":
+                put_ins.append(name)
+                aside = w.gen / "deploy-backups"
+                found = list(aside.glob("*-live-move-restore/aside/sub/s1"))
+                if found:
+                    found[0].write_text("written through an open fd\n")
+            real(name)
+
+        mp.setattr(kit, "_step", step)
+
+    rc, out = _restore_in(w, mod, monkeypatch, capsys, ts, patch=write_into_s1_aside)
+    parts = _parts_of(out)
+    assert rc == 1 and len(put_ins) == 2, out  # P, then sub/s1; never sub/t
+    assert parts[("P", "node")] == "restored" and parts[("P/mine.txt", "entry")] == "restored", out
+    assert parts[("sub/s1", "node")] == "refused:changed-during-restore", out
+    assert parts[("sub/t", "node")] == "refused:other:inflight-unresolved", out
+    for line in out.splitlines():
+        if line.startswith(('"P"', '"P/')):
+            assert "inflight" not in line and "newer content" not in line, line
+    assert (w.root / "sub" / "t").read_text() == "t\n"
+    assert w.report()["restore"]["inflight"][1:] == ["sub/s1", "node"]
+
+
+def _newer_in_s1_aside(w, put_ins: list):
+    """The write kit's step hook: at each put-in, once sub/s1's aside exists,
+    a process holding the replaced file open writes newer content into it."""
+
+    def patch(kit, mp):
+        real = kit._step
+
+        def step(name):
+            if name == "put-in":
+                put_ins.append(name)
+                for aside in (w.gen / "deploy-backups").glob("*-live-move-restore/aside/sub/s1"):
+                    aside.write_text("written through an open fd\n")
+            real(name)
+
+        mp.setattr(kit, "_step", step)
+
+    return patch
+
+
+def test_a_hold_mid_run_beside_a_cannot_make_entry_still_reports(w, mod, monkeypatch, capsys):
+    """#3986 review: a directory row also lists entries it cannot restore (a
+    socket: `other:cannot-make`), and those are no restorable entry. A hold
+    set mid-run passes over them, and the run still prints its report with
+    the hold applied, rather than dying on the lookup of their directory."""
+    import socket as socketlib
+
+    killed_tag_side(w, "Z3")
+    monkeypatch.chdir(w.root)  # a unix socket path is capped near 108 bytes
+    keep = socketlib.socket(socketlib.AF_UNIX)
+    _lock_aside(w, lambda: (_dir_and_later_edit(w), _foreign_edit(w), keep.bind("P/sock")))
+    try:
+        age_locks(w)
+        assert w.repair().returncode == 0
+    finally:
+        keep.close()
+    ts = w.backups()[-1].name[: -len(SUFFIX)]
+    assert _parts(_check(w, ts))[("P/sock", "entry")] == "other:cannot-make", "control"
+    put_ins: list = []
+    rc, out = _restore_in(w, mod, monkeypatch, capsys, ts, patch=_newer_in_s1_aside(w, put_ins))
+    parts = _parts_of(out)
+    assert rc == 1 and "part(s):" in out, out
+    assert parts[("P/sock", "entry")] == "refused:other:cannot-make", out
+    assert parts[("sub/s1", "node")] == "refused:changed-during-restore", out
+    assert parts[("sub/t", "node")] == "refused:other:inflight-unresolved", out
+    assert w.report()["restore"]["inflight"][1:] == ["sub/s1", "node"]
+
+
+@pytest.mark.parametrize("step", ["aside", "put-in"])
+def test_an_in_flight_path_put_back_as_left_still_names_its_aside(w, step):
+    """#3986 review: killed after the aside (or the put-in), a process holding
+    the file open writes into the aside, and then the tag's file is put back at
+    the path (`git checkout --`). The path reads as-left on its own, but only
+    the resume rule's as-left looked at the aside: this one did not, so the
+    aside is judged, still holds, and the rerun neither writes the path again
+    (which would overwrite the record naming the aside) nor clears the report."""
+    killed_tag_side(w, "Z3")
+    # sub/s1 sorts first, so the kill lands on it; sub/t is the part after.
+    _lock_aside(w, lambda: ((w.root / "sub" / "t").write_text("my t\n"), _foreign_edit(w)))
+    age_locks(w)
+    assert w.repair().returncode == 0
+    ts = w.backups()[-1].name[: -len(SUFFIX)]
+    fd = os.open(w.root / "sub" / "s1", os.O_WRONLY)  # opened before the restore
+    try:
+        r = _restore(w, ts, **{KILL_ENV: step})
+        assert r.returncode == -9, r.stdout + r.stderr
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, b"newer, through an open fd\n", 0)
+    finally:
+        os.close(fd)
+    assert w.report()["restore"]["inflight"][1:] == ["sub/s1", "node"], "control: sub/s1"
+    [run] = _runs(w)
+    aside = run / "aside" / "sub" / "s1"
+    assert aside.read_text() == "newer, through an open fd\n", "control: the fd is the aside's"
+    _git(w.root, "checkout", "--", "sub/s1")  # the tag's file back at the path
+    assert (w.root / "sub" / "s1").read_text() == "s1\n"
+    for r in (_check(w, ts), _restore(w, ts), _restore(w, ts)):
+        parts = _parts(r)
+        assert r.returncode == 1 and str(aside) in r.stdout, r.stdout
+        assert parts[("sub/s1", "node")].endswith("other:inflight-unresolved"), r.stdout
+        assert w.report()["restore"]["inflight"][1:] == ["sub/s1", "node"]
+        assert w.report()["restore"]["restored_at"] is None
+        assert parts[("sub/t", "node")].endswith("other:inflight-unresolved"), r.stdout
+    assert (w.root / "sub" / "s1").read_text() == "s1\n"
+    assert (w.root / "sub" / "t").read_text() == "t\n"
+    assert aside.read_text() == "newer, through an open fd\n"
+
+
+def test_the_aside_read_never_spends_the_walks_budget(w, mod, monkeypatch, capsys):
+    """#3986 review: rows judged before the in-flight aside is read may spend
+    the check's read budget; that read has its own, so an aside holding only
+    the as-left copy is not taken for newer content (every part held) when
+    the shared budget runs out."""
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: _dir_and_later_edit(w))
+    age_locks(w)
+    assert w.repair().returncode == 0
+    ts = w.backups()[-1].name[: -len(SUFFIX)]
+    assert _restore(w, ts, **{KILL_ENV: "aside"}).returncode == -9
+    oid = _hash(w, "staged at P since\n")
+    _git(w.root, "update-index", "--cacheinfo", f"100644,{oid},P")  # P: index-changed
+    kit = _kit("live_move_restore.py")
+    real = kit.Judge.unresolved
+
+    def spent(self, parts):
+        self.budget.entries = self.budget.bytes = 0  # the rows before used it all
+        return real(self, parts)
+
+    monkeypatch.setattr(kit.Judge, "unresolved", spent)
+    load = mod._load_kit
+    monkeypatch.setattr(mod, "_load_kit", lambda n: kit if n == "live_move_restore.py" else load(n))
+    capsys.readouterr()
+    mod.main(["--restore", ts, "--check", str(w.state), str(w.root)])
+    out = capsys.readouterr().out
+    assert '"P" node other:index-changed' in out, out
+    assert '"sub/t" node as-left' in out and "inflight-unresolved" not in out, out
+
+
+def test_nothing_else_is_written_while_an_in_flight_aside_is_unresolved(w, tmp_path):
+    """#3986 review: REPAIR.json has one in-flight slot. While the in-flight
+    part's aside holds newer content, writing another part would overwrite
+    the record naming it, so no other part is written (`--check` says so too);
+    once that content is moved out, the rest is restored."""
+    killed_tag_side(w, "Z3")
+
+    def both(w):
+        (w.root / "sub" / "t").write_text("my t\n")  # sorts after sub/s1
+        return _foreign_edit(w)
+
+    _lock_aside(w, lambda: both(w))
+    age_locks(w)
+    assert w.repair().returncode == 0
+    ts = w.backups()[-1].name[: -len(SUFFIX)]
+    assert _restore(w, ts, **{KILL_ENV: "aside"}).returncode == -9
+    assert w.report()["restore"]["inflight"][1:] == ["sub/s1", "node"], "control: sub/s1 first"
+    [run] = _runs(w)
+    aside = run / "aside" / "sub" / "s1"
+    aside.write_text("written after the aside\n")
+    other = w.root / "sub" / "t"
+    os.utime(other, (1_000_000_000, 1_000_000_000))  # a marker a rewrite would lose
+    for r in (_check(w, ts), _restore(w, ts), _restore(w, ts)):
+        parts = _parts(r)
+        assert r.returncode == 1 and str(aside) in r.stdout, r.stdout
+        assert parts[("sub/t", "node")].endswith("other:inflight-unresolved"), r.stdout
+        assert other.read_text() == "t\n" and os.lstat(other).st_mtime == 1_000_000_000
+        assert w.report()["restore"]["inflight"][1:] == ["sub/s1", "node"]
+    assert aside.read_text() == "written after the aside\n"
+    shutil.move(aside, tmp_path / "dealt-with")  # what was there, moved out
+    r = _restore(w, ts)
+    assert _parts(r)[("sub/t", "node")] == "restored", r.stdout
+    assert other.read_text() == "my t\n" and w.report()["restore"]["inflight"] is None
 
 
 def test_a_resume_from_a_folder_others_can_write_is_refused(w):
@@ -989,6 +1244,76 @@ def test_a_saved_directory_entry_changed_to_match_the_checkout_is_refused(w):
     r = _restore(w, ts)
     assert r.returncode == 1, r.stdout + r.stderr
     assert _parts_of(r.stdout)[("P", "node")].startswith("refused:"), r.stdout
+    assert w.report()["restore"]["restored_at"] is None
+
+
+def _foreign_edit_of_an_update_file(w):
+    """P/inner, a file the update wrote into its new directory P/, edited."""
+    (w.root / "P" / "inner").write_text("my inner\n")
+    return "P"
+
+
+def test_a_saved_directory_entry_changed_to_the_update_bytes_is_refused(w):
+    """#3986 review (Codex, round 3, finding 1): a saved entry whose bytes are
+    the move target's is the update's own and is left out of the directory.
+    One changed back to the target's bytes is not what SAVED.json records, so
+    it is never taken for the update's: the restore refuses the directory
+    rather than putting back an empty one and clearing the report."""
+    ts = _repaired(w, _foreign_edit_of_an_update_file)
+    saved = w.backups()[-1] / "tree" / "P" / "inner"
+    assert saved.read_text() == "my inner\n", "control: the edit was saved"
+    saved.write_text("inner\n")  # the move target's P/inner
+    assert update_bytes(w, "P/inner", saved.read_bytes()), "control: the update's bytes"
+    r = _restore(w, ts)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert _parts_of(r.stdout)[("P", "node")] == "refused:other:hash-mismatch", r.stdout
+    assert (w.root / "P").read_text() == "p\n", "the tag's P was replaced"
+    assert w.report()["restore"]["restored_at"] is None
+
+
+def test_a_write_into_the_aside_after_a_kill_at_the_put_in_is_named(w):
+    """#3986 review (Codex, round 3, finding 2): killed after the put-in and
+    before the aside is judged again, a process holding the replaced file open
+    then writes into the aside. The checkout holds the saved state, but the
+    in-flight part is never read already-restored until its aside is still
+    what was moved there: the re-run and --check refuse it, naming the aside."""
+    ts = _repaired(w, _foreign_edit)
+    fd = os.open(w.root / "sub" / "s1", os.O_WRONLY)  # opened before the restore
+    try:
+        assert _restore(w, ts, **{KILL_ENV: "put-in"}).returncode == -9
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, b"newer, through an open fd\n", 0)
+    finally:
+        os.close(fd)
+    [run] = _runs(w)
+    aside = run / "aside" / "sub" / "s1"
+    assert aside.read_text() == "newer, through an open fd\n", "control: the fd is the aside's"
+    assert (w.root / "sub" / "s1").read_text() == "mine\n", "control: put in"
+    # The in-flight record is kept while its aside is unresolved, so every
+    # rerun refuses and names it, never one that reads it back and clears.
+    for r in (_check(w, ts), _restore(w, ts), _restore(w, ts), _check(w, ts)):
+        assert r.returncode == 1 and str(aside) in r.stdout, r.stdout
+        assert _parts(r)[("sub/s1", "node")] in ("other:changed", "refused:other:changed")
+        assert w.report()["restore"]["restored_at"] is None
+        assert w.report()["restore"]["inflight"][1:] == ["sub/s1", "node"]
+    assert aside.read_text() == "newer, through an open fd\n"
+
+
+def test_a_flag_set_after_the_repair_is_never_dropped_by_the_index_call(w):
+    """#3986 review (Codex, round 3, finding 3): the row saved no flag, so a
+    skip-worktree set after the repair is no flag part; the one index call
+    re-creates the entry unflagged. Its footprint's flags are read with it: a
+    flag the restore does not set again refuses the index part, and the entry
+    keeps its flag."""
+    ts, path, _ = _fresh(w, _foreign_staged)
+    _git(w.root, "update-index", "--skip-worktree", "A")
+    index = _git(w.root, "ls-files", "-s", "--", "A")
+    r = _restore(w, ts)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert _parts(r)[("A", "index")] == "refused:other:flag-changed", r.stdout
+    assert '"A" holds a flag (S) the index call would drop' in r.stdout, r.stdout
+    assert _git(w.root, "ls-files", "-v", "--", "A").startswith("S "), "the newer flag was lost"
+    assert _git(w.root, "ls-files", "-s", "--", "A") == index
     assert w.report()["restore"]["restored_at"] is None
 
 
