@@ -361,7 +361,11 @@ commit the main checkout has held since it started (read by
 on a reflog gap, a move in the start second, a clock step back or git's expiry
 cutoff), whether ALL of them contain the telemetry module (a module imported
 after start loads whatever is on disk then), plus whether HEAD has the module
-and whether `src/genesis/memory/` is dirty. Git runs with `--no-optional-locks`,
+and whether the graph-read path is dirty (`graph_census._RUNTIME_PATHS`: the
+graph and graph-store modules, their callers, the environment and config
+loaders, `config/graphstore.yaml` and the two entry scripts; owner ruling
+47bd37e025174c66 narrowed it from all of `src/`, so an early local run of
+unrelated code does not cost the clock). Git runs with `--no-optional-locks`,
 so the hourly read never takes the index lock a deploy needs. Since schema 2
 ("conservative unknowns", rules in `memory/graph_census_proof.py`) a server's row
 is clean only when three more things are PROVEN, each derived the way that
@@ -404,7 +408,11 @@ only memory servers:
   loaded;
 - any other python process on main's venv (found by its absolute interpreter
   path, or by resolving a bare `python` through its own PATH): history and
-  database scope only (owner ruling);
+  database scope only (owner ruling). One that is unprovable only because it
+  runs under another Genesis home or its interpreter cannot be resolved
+  (another session's test run or one-off job) does not hold the clock while
+  it started inside the 2h30m history lookback (owner ruling
+  9931626424ee4c6c); an older one still does;
 - replay, listed as excluded because it is not live traffic (owner ruling);
 - another bridge or server beside the host, always dirty.
 
