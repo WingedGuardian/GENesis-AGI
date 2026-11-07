@@ -2153,7 +2153,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 25f3ad876 2026-11-03
+verified: 4721e0d93 2026-11-07
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -2164,6 +2164,14 @@ verified: 25f3ad876 2026-11-03
   host reconcilers that share its version probe run on any branch).
   Config `~/.genesis/guardian_remote.yaml`; missing → silently
   disabled.
+- **Delivered-alert history (development candidate)**: host `alert/sent_log.py`
+  records successful alert deliveries as displayed text, with two bounded JSONL
+  generations. The read-only `sent-log` gateway and existing container ingestor
+  use a terminal success/count protocol; an unreadable generation fails the
+  whole page. Locked appends sequence timestamps within a 300-second future
+  window; inadmissible clock outliers remain on disk until eligible, with a
+  new bounded stream after a large clock reset. Host redeploy and installed
+  conversation-history verification remain outstanding.
 - **Snapshot deletion window** (`guardian/deletion_window.py`): routine
   snapshot deletions (the superseded healthy snapshot, prune, and what incus
   would expire before the next window) wait for `snapshots.deletion_window`,
