@@ -394,6 +394,202 @@ class TestRunExtractionCycle:
             assert (await cursor.fetchone())[0] >= 1
 
 
+class TestCredentialScrubWiring:
+    """#2426: the cycle holds every credential the user typed as a reference,
+    THEN scrubs every copy of every chunk secret from the episodic path and the
+    session index. Fake values only."""
+
+    @pytest.mark.asyncio
+    async def test_the_cycle_holds_then_scrubs_every_chunk_secret(self, tmp_path):
+        import json as _json
+
+        import aiosqlite
+
+        from genesis.db.schema import create_all_tables
+
+        said = (
+            "router login: username: admin7, password: First!Fake9; "
+            "backup password: Second!Fake8"
+        )
+        jsonl = tmp_path / "scrub-session.jsonl"
+        jsonl.write_text(_json.dumps({
+            "type": "user", "uuid": "u1", "timestamp": "2026-04-11T12:00:00Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": said}]},
+        }) + "\n")
+        extracted = {
+            "extractions": [
+                {"content": f"Lab {said}", "type": "entity", "confidence": 0.9,
+                 "entities": ["Lab router"]},
+                # A bare repeat in a sibling, and in a preference domain.
+                {"content": "The bench router now uses Second!Fake8 for its admin page",
+                 "type": "preference", "confidence": 0.9, "speech_act": "preference",
+                 "preference_domain": "Second!Fake8", "entities": ["Second!Fake8"]},
+            ],
+            "session_keywords": ["router", "first!fake9"],
+            "session_topic": "Rotating the router password First!Fake9",
+        }
+        async with aiosqlite.connect(":memory:") as real_db:
+            real_db.row_factory = aiosqlite.Row
+            await create_all_tables(real_db)
+            await real_db.execute(
+                "INSERT INTO cc_sessions (id, session_type, model, cc_session_id, "
+                "source_tag, started_at, last_activity_at, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("s-scrub", "foreground", "m", "scrub-session", "foreground",
+                 "2026-04-11T12:00:00+00:00", "2026-04-11T12:00:00+00:00", "active"),
+            )
+            await real_db.commit()
+            router = AsyncMock()
+            router.route_call = AsyncMock(return_value=FakeRoutingResult(
+                success=True, content="```json\n" + _json.dumps(extracted) + "\n```",
+            ))
+            store = AsyncMock()
+            store.store = AsyncMock(return_value="mem-1")
+            store._embeddings = MagicMock()
+            store._embeddings.model_name = "m"
+
+            summary = await run_extraction_cycle(
+                db=real_db, store=store, router=router, transcript_dir=tmp_path,
+                start_line_override=0,
+            )
+
+            assert summary["references_captured"] == 2
+            secrets = {r[0] for r in await real_db.execute_fetchall(
+                "SELECT value FROM reference_secrets")}
+            assert secrets == {"admin7 / First!Fake9", "password: Second!Fake8"}
+            episodic = [c for c in store.store.await_args_list
+                        if c.kwargs.get("source") == "session_extraction"]
+            assert len(episodic) == 2
+            for call in episodic:
+                dumped = _json.dumps([call.args, call.kwargs], default=str).lower()
+                assert "first!fake9" not in dumped and "second!fake8" not in dumped
+            assert episodic[1].kwargs["preference_domain"] is None
+            row = (await real_db.execute_fetchall(
+                "SELECT topic, keywords FROM cc_sessions WHERE id = 's-scrub'"))[0]
+            assert "First!Fake9" not in row["topic"] and "router" in row["topic"]
+            assert row["keywords"] == "router"
+
+    @pytest.mark.asyncio
+    async def test_a_secret_labelled_in_one_chunk_is_scrubbed_in_the_next(self, tmp_path):
+        """Review finding: the secret set accumulates over the session's chunks."""
+        import json as _json
+
+        import aiosqlite
+
+        from genesis.db.schema import create_all_tables
+
+        lines = [
+            "router login: password: First!Fake9 for the bench",
+            "and I rotated the bench router to First!Fake9 yesterday",
+        ]
+        jsonl = tmp_path / "two-chunks.jsonl"
+        jsonl.write_text("".join(_json.dumps({
+            "type": "user", "uuid": f"u{i}", "timestamp": "2026-04-11T12:00:00Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+        }) + "\n" for i, text in enumerate(lines)))
+
+        def _result(content: str, topic: str) -> FakeRoutingResult:
+            return FakeRoutingResult(success=True, content="```json\n" + _json.dumps({
+                "extractions": [{"content": content, "type": "entity", "confidence": 0.9}],
+                "session_keywords": [], "session_topic": topic,
+            }) + "\n```")
+
+        async with aiosqlite.connect(":memory:") as real_db:
+            real_db.row_factory = aiosqlite.Row
+            await create_all_tables(real_db)
+            await real_db.execute(
+                "INSERT INTO cc_sessions (id, session_type, model, cc_session_id, "
+                "source_tag, started_at, last_activity_at, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("s-two", "foreground", "m", "two-chunks", "foreground",
+                 "2026-04-11T12:00:00+00:00", "2026-04-11T12:00:00+00:00", "active"),
+            )
+            await real_db.commit()
+            router = AsyncMock()
+            router.route_call = AsyncMock(side_effect=[
+                _result(f"Lab {lines[0]}", "router setup"),
+                _result("The bench router was rotated to First!Fake9 yesterday",
+                        "router rotated to First!Fake9"),
+            ])
+            store = AsyncMock()
+            store.store = AsyncMock(return_value="mem-1")
+            store._embeddings = MagicMock()
+            store._embeddings.model_name = "m"
+
+            await run_extraction_cycle(
+                db=real_db, store=store, router=router, transcript_dir=tmp_path,
+                start_line_override=0, chunk_size=1,
+            )
+
+            episodic = [c for c in store.store.await_args_list
+                        if c.kwargs.get("source") == "session_extraction"]
+            assert len(episodic) == 2
+            for call in episodic:
+                assert "first!fake9" not in _json.dumps(call.kwargs, default=str).lower()
+            row = (await real_db.execute_fetchall(
+                "SELECT topic FROM cc_sessions WHERE id = 's-two'"))[0]
+            assert "First!Fake9" not in row["topic"]
+
+    @pytest.mark.asyncio
+    async def test_an_earlier_keyword_loses_a_password_labelled_later(self, tmp_path):
+        """4483059485: chunk 1 emits the password bare as a keyword and topic;
+        chunk 2 labels it. The session index is scrubbed with the FINAL set."""
+        import json as _json
+
+        import aiosqlite
+
+        from genesis.db.schema import create_all_tables
+
+        lines = [
+            "the bench code is First!Fake9 for now",
+            "router login: password: First!Fake9 for the bench",
+        ]
+        jsonl = tmp_path / "late-label.jsonl"
+        jsonl.write_text("".join(_json.dumps({
+            "type": "user", "uuid": f"u{i}", "timestamp": "2026-04-11T12:00:00Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+        }) + "\n" for i, text in enumerate(lines)))
+
+        def _result(content: str, topic: str, keywords: list[str]) -> FakeRoutingResult:
+            return FakeRoutingResult(success=True, content="```json\n" + _json.dumps({
+                "extractions": [{"content": content, "type": "entity", "confidence": 0.9}],
+                "session_keywords": keywords, "session_topic": topic,
+            }) + "\n```")
+
+        async with aiosqlite.connect(":memory:") as real_db:
+            real_db.row_factory = aiosqlite.Row
+            await create_all_tables(real_db)
+            await real_db.execute(
+                "INSERT INTO cc_sessions (id, session_type, model, cc_session_id, "
+                "source_tag, started_at, last_activity_at, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("s-late", "foreground", "m", "late-label", "foreground",
+                 "2026-04-11T12:00:00+00:00", "2026-04-11T12:00:00+00:00", "active"),
+            )
+            await real_db.commit()
+            router = AsyncMock()
+            router.route_call = AsyncMock(side_effect=[
+                _result("The bench code is First!Fake9 for now",
+                        "bench code First!Fake9", ["bench", "First!Fake9"]),
+                _result(f"Lab {lines[1]}", "", []),
+            ])
+            store = AsyncMock()
+            store.store = AsyncMock(return_value="mem-1")
+            store._embeddings = MagicMock()
+            store._embeddings.model_name = "m"
+
+            await run_extraction_cycle(
+                db=real_db, store=store, router=router, transcript_dir=tmp_path,
+                start_line_override=0, chunk_size=1,
+            )
+
+            row = (await real_db.execute_fetchall(
+                "SELECT topic, keywords FROM cc_sessions WHERE id = 's-late'"))[0]
+            assert "First!Fake9" not in (row["topic"] or "")
+            assert "First!Fake9" not in (row["keywords"] or "")
+            assert "bench" in (row["keywords"] or "")
+
+
 class TestHonestAdoption:
     """Filesystem adoption must record LIVE sessions as active (measured
     2026-09-04: a session with a 4-second-old transcript adopted as
