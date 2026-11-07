@@ -282,9 +282,15 @@ def read_reference(
                 live_unavailable = result
             raise FileNotFoundError("live evidence identity changed")
     except FileNotFoundError:
-        archive_dir = archive_dir or Path.home() / "backups/genesis-backups/transcripts"
-        archive = archive_dir / f"v2-{hashlib.sha256(os.fsencode(relative)).hexdigest()}.tar.gpg"
-        if not archive.is_file():
+        # This handler's own errors are not caught by the sibling clause below:
+        # Path.home() raises RuntimeError without a home, is_file() OSError.
+        try:
+            archive_dir = archive_dir or Path.home() / "backups/genesis-backups/transcripts"
+            archive = archive_dir / f"v2-{hashlib.sha256(os.fsencode(relative)).hexdigest()}.tar.gpg"
+            present = archive.is_file()
+        except (OSError, RuntimeError):
+            return live_unavailable or {"unavailable": "local encrypted archive location unreadable"}
+        if not present:
             return live_unavailable or {"unavailable": "original target and local encrypted archive unavailable"}
         try:
             return _archive_window(

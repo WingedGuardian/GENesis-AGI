@@ -198,3 +198,28 @@ def test_changed_live_identity_keeps_existing_archive_diagnostics(tmp_path, monk
     else:
         reason = "original target and local encrypted archive unavailable" if archive == "absent" else "local archive unreadable or invalid"
         assert out == {"unavailable": reason}
+
+
+@pytest.mark.parametrize("failure", ["no-home", "unreadable-archive-dir"])
+def test_archive_fallback_setup_errors_report_unavailable(tmp_path, monkeypatch, failure):
+    """Review (CodeRabbit, round 2): the archive fallback's own setup runs in the
+    FileNotFoundError handler, which the sibling except clause does not cover, so
+    Path.home() (RuntimeError) or is_file() (OSError) once escaped read_reference."""
+    if failure == "no-home":
+        def no_home():
+            raise RuntimeError("synthetic: could not determine home directory")
+
+        monkeypatch.setattr(evidence.Path, "home", staticmethod(no_home))
+        archive_dir = None
+    else:
+        archive_dir = tmp_path / "archives"
+        real_is_file = Path.is_file
+
+        def refusing(self, *args, **kwargs):
+            if self.parent == archive_dir:
+                raise PermissionError("synthetic: archive directory unreadable")
+            return real_is_file(self, *args, **kwargs)
+
+        monkeypatch.setattr(evidence.Path, "is_file", refusing)
+    out = evidence.read_reference(tmp_path, "missing.jsonl", 1, archive_dir=archive_dir)
+    assert out == {"unavailable": "local encrypted archive location unreadable"}
