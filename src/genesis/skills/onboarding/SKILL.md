@@ -121,7 +121,8 @@ are, not asking for keys. Let the user choose their comfort level.
    > **Configured:** [list any that have values]
    > **Not yet configured:** [list empty ones]
    >
-   > Your secrets file is at: `~/genesis/secrets.env`
+   > Your secrets file is at: [the path returned by `genesis.env.secrets_path()`;
+   > fresh installs default to `~/.config/genesis/secrets.env`]
 
 4. **Explain what's essential and why:**
    > To get Genesis fully operational, we need three things:

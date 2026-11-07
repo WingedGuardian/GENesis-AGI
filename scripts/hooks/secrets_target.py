@@ -144,6 +144,7 @@ def _candidate_roots() -> list[Path]:
         explicit = os.environ.get(name)
         if explicit:
             roots.append(Path(explicit).expanduser())
+    roots.append(Path.home() / ".config" / "genesis" / "secrets.env")
     roots.append(Path.home() / "genesis" / "secrets.env")
     repo = os.environ.get("CLAUDE_PROJECT_DIR")
     if repo:
@@ -163,7 +164,7 @@ def _secret_inodes() -> set[tuple[int, int]]:
         try:
             st = p.resolve().stat()
             out.add((st.st_dev, st.st_ino))
-        except OSError:
+        except (OSError, ValueError, RuntimeError):
             continue
     return out
 
@@ -187,6 +188,17 @@ def _is_secret_path(raw: str, inodes: set[tuple[int, int]], *, allow_bare: bool 
         return False
     try:
         p = Path(os.path.expanduser(raw))
+        # Identity still protects aliases of existing files. Normalized paths
+        # additionally protect configured destinations that do not exist yet.
+        normalized = p.resolve()
+        for root in _candidate_roots():
+            try:
+                known = root.resolve()
+            except (OSError, ValueError, RuntimeError):
+                continue
+            if normalized == known:
+                stripped = raw.rstrip("/")
+                return allow_bare or (os.sep in stripped or stripped.startswith("~"))
         # NOTE: there is deliberately no `.example` test here. An earlier
         # version short-circuited on the UNRESOLVED name before the inode
         # compare below, which made a filename outrank file identity: a symlink
@@ -223,7 +235,7 @@ def _is_secret_path(raw: str, inodes: set[tuple[int, int]], *, allow_bare: bool 
             return False
         stripped = raw.rstrip("/")
         return allow_bare or (os.sep in stripped or stripped.startswith("~"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RuntimeError):
         # Cannot stat: fall back to the NAME, so a path that does not exist yet
         # (a `cp … secrets.env` destination) is still recognised.
         stripped = raw.rstrip("/")
@@ -646,8 +658,9 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "") -> boo
 
     literal_globs = _db_query_literals(command)
 
+    candidate_names = {root.name for root in _candidate_roots()}
     for raw_tok in _tokens(scan):
-        if not _PATHY.search(raw_tok):
+        if not _PATHY.search(raw_tok) and raw_tok not in candidate_names:
             continue
         # Bash brace-expands before the command ever runs, so
         # `cp ~/genesis/{secrets.env,secrets.env.bak}` opens the real file while

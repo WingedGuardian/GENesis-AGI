@@ -1,0 +1,1 @@
+- Prepare services, credential recovery, installers and guards for secrets stored outside the checkout. Fresh installs use the home config directory; legacy files remain supported until migration.

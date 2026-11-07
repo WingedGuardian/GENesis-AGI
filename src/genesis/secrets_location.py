@@ -17,9 +17,8 @@ Order, first match wins:
    ``$HOME/genesis/secrets.env``. The second catches a worktree or a
    non-canonical checkout whose own root holds no file. This fallback is
    permanent: an install that skips several releases still finds its keys.
-4. Nothing exists: ``<repo root>/secrets.env``, where today's writers create
-   the file. (The switch to the new location for a fresh install lands with
-   the unit templates that read it.)
+4. Nothing exists: ``$HOME/.config/genesis/secrets.env``. Bootstrap, restore
+   and the dashboard create its parent directory when needed.
 
 ``XDG_CONFIG_HOME`` is deliberately ignored: the systemd user manager does
 not carry it, so honouring it would let a session and the server resolve
@@ -59,4 +58,4 @@ def resolve(*, environ: Mapping[str, str], home: Path, repo_root: Path) -> Path:
     for candidate in legacy_locations(home, repo_root):
         if candidate.is_file():
             return candidate
-    return repo_root / BASENAME
+    return new

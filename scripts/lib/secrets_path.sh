@@ -6,7 +6,7 @@
 #   1. $SECRETS_PATH when set (a leading ~/ is expanded)
 #   2. $HOME/.config/genesis/secrets.env when it exists
 #   3. <repo_root>/secrets.env, then $HOME/genesis/secrets.env, when one exists
-#   4. otherwise <repo_root>/secrets.env
+#   4. otherwise $HOME/.config/genesis/secrets.env
 # XDG_CONFIG_HOME is deliberately ignored (the systemd user manager lacks it).
 # tests/test_secrets_location.py keeps the twins in step.
 
@@ -40,5 +40,5 @@ genesis_secrets_path() {
             return 0
         fi
     done
-    printf '%s\n' "$repo_root/secrets.env"
+    printf '%s\n' "$HOME/.config/genesis/secrets.env"
 }
