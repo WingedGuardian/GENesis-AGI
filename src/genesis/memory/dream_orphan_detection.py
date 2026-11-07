@@ -49,7 +49,10 @@ async def run_orphan_detection(
     cursor = await db.execute(
         "SELECT memory_id FROM memory_metadata WHERE deprecated = 0"
     )
-    all_ids = {row[0] for row in await cursor.fetchall()}
+    from genesis.memory.namespace import is_namespaced_id
+
+    # Namespaced (external peer) memories are unlinked by design, not orphans.
+    all_ids = {row[0] for row in await cursor.fetchall() if not is_namespaced_id(row[0])}
     report["total_memories"] = len(all_ids)
 
     if not all_ids:

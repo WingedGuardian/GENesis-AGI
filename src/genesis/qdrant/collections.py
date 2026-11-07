@@ -103,6 +103,13 @@ def upsert_point(
     payload: dict,
 ) -> None:
     """Insert or update a single point."""
+    if collection in ("episodic_memory", "knowledge_base"):
+        from genesis.memory.namespace import is_namespaced_id
+
+        # Derived at the writer boundary, never from caller-supplied payload.
+        # First-release invariant for the unmerged namespace feature; this is
+        # not a backfill of points written by earlier unpublished branches.
+        payload = {**payload, "_namespace_reserved": is_namespaced_id(str(point_id))}
     client.upsert(
         collection_name=collection,
         points=[PointStruct(id=point_id, vector=vector, payload=payload)],
@@ -161,6 +168,7 @@ def search(
     tags_any: list[str] | None = None,
     exact: bool = False,
     created_before: str | None = None,
+    exclude_namespaced: bool = False,
 ) -> list[dict]:
     """Search by vector similarity with optional payload filters.
 
@@ -180,6 +188,10 @@ def search(
 
     conditions: list = []
     must_not_conditions: list = []
+    if exclude_namespaced:
+        must_not_conditions.append(
+            FieldCondition(key="_namespace_reserved", match=MatchValue(value=True))
+        )
 
     # Exclude deprecated memories (dream cycle soft-delete) by default.
     # Points without the field (legacy data) are preserved — Qdrant's
