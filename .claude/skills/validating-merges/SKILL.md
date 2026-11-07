@@ -504,11 +504,26 @@ because each pilot broke a field the obvious version would have had:
   neighbour, because `pass-mechanical` asserts that nothing was left out. A claim
   this install cannot reach is `NOT_VERIFIABLE_HERE`. A claim you could have run
   but did not is a `not_yet_done` gap with its `command`, which keeps the row open.
+- **`e2e[]`** — explicit coverage of the PR's declared E2E work. Each entry has
+  `step` (the exact declaration text without the `E2E:` prefix) and exactly one
+  zero-based `claim` or `gap` index into `claims[]` or `gaps[]`, for example:
+  `{"step": "restart and measure the timer", "claim": 0}`. A gap mapping uses
+  `{"step": "check the owner device", "gap": 0}` and the gap keeps its existing
+  kind, verdict and recheck behavior. Never omit unreachable steps.
+  CLI and MCP close read the PR body alongside its merge SHA and refuse a closing
+  result, including preview, if any visible plan declaration lacks a mapping or
+  a mapping names text no longer declared. Every plan line is one opaque step:
+  mapping a compound line asserts coverage of its whole text. Decompose its
+  behaviors into claims and use multiple mappings when needed. Code checks the
+  structure; it does not judge whether your measurement covers the prose.
+  `E2E: none — <reason>` needs no mapping. The field defaults to `[]` so older
+  evidence still parses; it cannot close over a declared plan without coverage.
+  An incomplete open attempt can still be recorded without a complete mapping.
 - **`controls[]`** — a reader cannot distinguish a non-vacuous verification from
   a vacuous one without them. A document with none can still close, but never as
   `pass-mechanical`: "no negative control" becomes a named gap.
 - **`merge_commit`** — the PR's OWN merge commit, 7+ hex characters. `close` checks
-  it against GitHub (`gh pr view --json mergeCommit`) and refuses a mismatch with
+  it against GitHub (`gh pr view --json mergeCommit,body`) and refuses a mismatch with
   exit 3, on `--dry-run` too; if gh cannot resolve it, the close is refused (exit 2)
   rather than waved through. MEASURED 2026-10-27: 5 of 15 documents in one group
   named main HEAD or the deployed commit instead. On a stacked PR this is still
