@@ -902,6 +902,12 @@ gate works, its exemption categories, and the unit rules for size bounds:
 - **Bugs you see get fixed or tracked — never ignored.** Fix now by default; a
   deferred bug follows the routing above — a Genesis-repo bug becomes an ISSUE, a
   someday/not-pursuing one becomes `tabled` — never a silent drop.
+- **Found a Genesis bug or defect? Track it on the repo's issue tracker — in
+  addition to fixing it, never instead.** Foreground: offer to file it (a
+  courtesy, not an approval gate). Background/dispatched: never post; record it
+  per your profile and state it in your returned output so the foreground files
+  it (`.claude/docs/mcp-tools-guide.md`, "Dispatched / background sessions").
+  The privacy scrub and security-defect limit in "Where deferred work goes" apply.
 - **Data repair is not a fix.** If a mechanism failed to write or propagate
   something, hand-writing the missing artifact (memory, directive, row, flag)
   repairs ONE instance on ONE install. Label it "data repair", and fix the
