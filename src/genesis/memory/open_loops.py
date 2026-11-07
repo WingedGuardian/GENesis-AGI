@@ -92,15 +92,23 @@ def _worktree_activity(path: str) -> float:
 
 
 def _list_worktrees(repo_root: Path) -> list[dict]:
-    """Parse ``git worktree list --porcelain`` into structured data.
+    """Parse ``git worktree list --porcelain`` into the LIVE linked worktrees.
 
     Returns list of dicts with keys: path, head, branch (branch absent for a
-    detached HEAD). Excludes the main worktree (the first porcelain entry).
+    detached HEAD). Excludes the main worktree (the first porcelain entry), and
+    every registration that is not a working worktree: one whose directory no
+    longer exists, and one the reaper locked as an archive anchor (see
+    ``_is_live``). On a long-lived install those outnumber the real ones
+    several times over, and counting them made "(+N more)" meaningless.
 
     Copied from ``scripts/worktree_lifecycle.py:_list_worktrees`` (scripts/ is
     not an importable package) with the subprocess timeout tightened from 10s
     to 2s for the session-start hook budget. Follow-up: extract a shared util
     so this logic is not maintained in two places.
+
+    Known limit: without ``-z``, git C-quotes a path containing special or
+    non-ASCII bytes, and such a path then fails the directory check and is left
+    out. Genesis worktree paths are ASCII; the reaper's own parser uses ``-z``.
     """
     try:
         result = subprocess.run(
@@ -126,6 +134,8 @@ def _list_worktrees(repo_root: Path) -> list[dict]:
         elif line.startswith("branch "):
             ref = line[len("branch "):]
             current["branch"] = ref.removeprefix("refs/heads/")
+        elif line == "locked" or line.startswith("locked "):
+            current["locked"] = line[len("locked "):]
         elif line == "":
             if current and "path" in current and not is_first:
                 worktrees.append(current)
@@ -135,7 +145,29 @@ def _list_worktrees(repo_root: Path) -> list[dict]:
     if current and "path" in current and not is_first:
         worktrees.append(current)
 
-    return worktrees
+    return [w for w in worktrees if _is_live(w)]
+
+
+# The reaper's archive-anchor lock reason, as written by
+# ``scripts/worktree_lifecycle.py`` (``ARCHIVE_LOCK_PREFIX``):
+#     archived by the reaper -> <entry>; recover with --recover
+# It archives a worktree's directory and keeps the registration LOCKED as the
+# history anchor, so `git worktree list` keeps reporting it. The script is not
+# importable, so the prefix is restated (as in
+# ``session_awareness/zero_drop_worker.py``).
+_REAPER_ANCHOR_PREFIX = "archived by the reaper -> "
+
+
+def _is_live(wt: dict) -> bool:
+    """A registration that is a working worktree: its directory exists and it is
+    not a reaper archive anchor. A worktree locked for any OTHER reason is live
+    (sessions lock worktrees they are using)."""
+    # Without -z, porcelain C-quotes a reason containing special characters, so
+    # a quoted anchor reason starts with '"'.
+    reason = (wt.get("locked") or "").removeprefix('"')
+    if reason.startswith(_REAPER_ANCHOR_PREFIX):
+        return False
+    return os.path.isdir(wt.get("path", ""))
 
 
 async def _task_lines(db) -> list[str]:
@@ -143,7 +175,9 @@ async def _task_lines(db) -> list[str]:
     rows = await list_active(db)
     lines: list[str] = []
     for r in rows[:_MAX_TASKS]:
-        tid = (r["task_id"] or "")[:8]
+        # Whole id: it is pasted back into task_detail/task_control, which
+        # match exactly, so a prefix is a not-found.
+        tid = r["task_id"] or ""
         phase = r["current_phase"] or "?"
         desc = (r["description"] or "").strip().replace("\n", " ")
         if len(desc) > _MAX_DESC:
