@@ -4111,8 +4111,18 @@ Refusing a proposed update preserves a previously valid opt-in.
   separate from foreground capacity; recall queue pressure falls back inline
   while shutdown refuses new resource work (source checked 2026-11-06).
   Activity, embedding-heartbeat, deferred-recall, bookmark and proactive tasks use it;
-  legacy connections keep ordinary task scheduling. Service integration remains
-  a separate prerequisite before shared activation. See
+  legacy connections keep ordinary task scheduling. Internal
+  `initialize_request_service` bootstraps memory/health/recon/outreach with
+  mandatory request middleware even without metrics, awaits outreach schema,
+  and refuses a separate memory read pool, an omitted memory bookmark policy,
+  a dependency holding another database, and detached work (memory or a
+  persisting tracker) without background budgets. Its tracker is bound and optionally
+  warmed once by the owning bootstrap; registration cannot rebind pending flushes
+  or duplicate history. Scoped health supports the standalone status-file service,
+  rejecting runtime snapshot sharing before changing registration. Reinitialization
+  replaces obsolete instrumentation in either DB mode. No CLI or transport
+  selects it yet; caller identity, bookmark policy and shared activation remain
+  separate work. See
   `docs/reference/request-database.md` for lifecycle and failure semantics.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Every
