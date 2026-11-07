@@ -40,6 +40,9 @@ def install_manager(
         "    g['require_enabled'](config)\n"
         "    if not Path(config['binary']).exists(): raise ValueError('backend unavailable')\n"
         "g['ready']=ready\n"
+        "g['validate_loaded_backend']=lambda config: None\n"
+        "g['verified_binary']=lambda path: path.open('rb')\n"
+        "g['check_backend']=ready\n"
         "raise SystemExit(ns['main']())\n"
     )
 

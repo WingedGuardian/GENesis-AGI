@@ -1,0 +1,50 @@
+name: gate-corpus-anchors
+
+# Does every case in the defect corpus still apply? Seconds, and runs no tests.
+# A PR that moves a line a case anchors on goes red here until it updates the case
+# in the same change. This is not a required check, and no test in the suite reads
+# the real anchors, so GitHub does not block on it; the local merge gate reads any
+# red check as CI red, and `# ci-override` waives that. A stale case that gets past
+# shows as a failed weekly run of `gate-corpus.yml`.
+#
+# The full report is `gate-corpus.yml`. It does not run on these PRs: an escape
+# exits 0, so here it could only ever turn red for what this job finds in seconds.
+# The cost, accepted: a PR that weakens a gate test shows nothing on that PR, and
+# the escape appears in the next weekly table.
+#
+# `paths` must list every file `config/gate_defects.json` names. A test enforces it.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - config/gate_defects.json
+      - .github/workflows/gate-corpus-anchors.yml
+      - scripts/ci/mutation_*.py
+      - scripts/hooks/git_push_guard.py
+      - tests/test_hooks/test_merge_review_gate.py
+      - tests/test_hooks/test_git_push_guard_codex_freshness.py
+      - tests/test_hooks/test_scored_bot_reviewers.py
+      - tests/test_hooks/test_merge_gate_characterization.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gate-corpus-anchors-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  anchors:
+    runs-on: ubuntu-latest
+    # Far above the seconds this takes: only a wedged runner reaches it.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Check the corpus still applies
+        run: python scripts/ci/mutation_sweep.py config/gate_defects.json --repo . --check-anchors

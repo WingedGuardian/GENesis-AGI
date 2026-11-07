@@ -1,1 +1,0 @@
-- Host uninstall supports an explicit container coordination namespace with `--container-genesis-home`, preserving contention with external-runtime index writers across login initialization.

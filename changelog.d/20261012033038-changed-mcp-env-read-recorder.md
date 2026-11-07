@@ -1,1 +1,0 @@
-- MCP child servers now record names-only reads of undeclared `secrets.env` keys, providing evidence to narrow their future environment allowlists without changing what they load.

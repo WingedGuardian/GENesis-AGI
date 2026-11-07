@@ -1,1 +1,0 @@
-- Qualification retains empty or whitespace-only processing and cleanup failures by exception type, so restarting cannot silently resume a failed attempt or resend its completion.

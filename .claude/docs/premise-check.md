@@ -21,6 +21,75 @@ Every plan and every issue that specifies work answers six questions:
 
 The answers belong in the plan or issue body, not in a reviewer's first round.
 
+**The format, in a plan:** one section, numbered to match the questions. `n/a — <reason>`
+is an answer; a bare `n/a` is not.
+
+```markdown
+## Premise checks
+1. <outside-behaviour claims: measured or cited>
+2. <what was searched, and what was found>
+3. <scope limits, and the shared code they leave reachable>
+4. <the caller, and its tracker or why there is none>
+5. <how each number was measured>
+6. <expected counted lines, and the split or Shape: reason>
+```
+
+`## Premise questions` is accepted as the heading too. A plan that names a
+repo-relative path (`src/`, `scripts/`, `tests/`, `.claude/`, `docs/`, `config/`,
+`.github/`) outside code blocks counts as specifying work, and the ExitPlanMode hook
+`scripts/hooks/plan_premise_gate.py` blocks it while the section is missing or an
+answer is empty. That is all it checks: whether an answer is true stays the
+reviewer's question.
+
+**On an issue,** the same parser applies, through the premise gate Action
+(`scripts/premise_gate.py`). An issue without its answers carries the
+`premises-missing` label until it has them. Issues opened before the gate, and bug
+reports filed through the bug-report form, are not newly labelled.
+
+**Before it is filed,** a foreground session's `gh issue create` is checked against
+that same rule: the PreToolUse hook `scripts/hooks/issue_premise_gate.py` blocks a
+create whose body would be labelled, and names the missing answers. It judges only
+a body it can read in full (a `--body` literal with no `$` or backtick, a
+`--body-file` that no earlier step can have written, or the heredoc in
+`-F - <<'EOF'`). Earlier steps are trusted only from a closed list of programs
+that cannot write a file (`cd`, `echo`, `grep`, `true`, `test`, `[`), run directly,
+in a command with no `<(`, no `tee` and no `>` anywhere except the whole tokens
+`2>&1` and `2>/dev/null`; a relative path after a
+`cd` is never read.
+bound for the configured public repo, and passes everything else.
+Dispatched sessions are never blocked.
+
+**A bug report answers different questions.** Its question is whether the bug is
+real, not how to build a change, so an issue labelled `bug` carries a
+`## Verification` section instead, with five numbered answers:
+
+```markdown
+## Verification
+1. <reproduced: how, and on which commit (a fresh main, not a stale checkout)>
+2. <evidence: the exact command and its output>
+3. <reporter-side causes ruled out: misuse, local config, a stale tree, credentials>
+4. <searched: no existing issue, and no fix already on main>
+5. <expected vs actual>
+```
+
+**`devin-ready` always needs the six premise answers,** bug or not, because Devin
+builds a change. Applying it to an issue without them removes it again, with an
+`(aside)` comment naming the missing answers, because that label starts a paid
+Devin session. Devin's own integration watches the label, so a session it has
+already started is not stopped; the label is the visible control. The check runs
+when the label is applied: editing the answers out later leaves `devin-ready` in
+place. `premises-missing` always means the issue's OWN section is incomplete (the
+Verification for a bug report), so a verified bug report that lacks the six loses
+`devin-ready` and gets the comment, but not that label.
+
+**Check before applying the label.** The Action acts only after the label event,
+and on a busy runner queue that can be minutes after Devin has started. So a
+session runs `python3 scripts/premise_gate.py check <issue>` first, and applies
+`devin-ready` only when it exits 0. Exit 1 lists the missing answers: fix the
+issue, never apply the label over them. Exit 2 means the issue could not be read,
+which is not a pass. On a `bug` issue it also lists missing Verification answers;
+those do not change the exit code, because only the six decide the label.
+
 ## Why it exists
 
 Review rounds accumulate for two reasons that the round COUNT cannot tell apart.
@@ -252,7 +321,10 @@ Unforeseen complications are expected, and the section is where they are stated.
 The output is a **judgment about direction**, handed to whoever owns the change. It
 is not permission to rewrite it, not a substitute for the code review (run this
 first, then review the code if the premises hold), and not a reason to close
-anything — a reviewer session retires nothing.
+anything — a reviewer session retires nothing. A premise that fails because
+the code cannot land, while the problem it solves is still wanted, keeps the
+PR open and routes it as below; only a dead problem closes a PR
+(closing-session, "Superseded is about the problem").
 
 **BROKEN routes through the ESTABLISHED disposition, not a new one — and the bar
 is HIGH.** The repo already has a route for a change that is wrong at the premise
@@ -274,9 +346,7 @@ exception: a Devin-built PR is audited before further rounds are spent, and a
 SOUND-BUT-INFERIOR verdict with a better shape that changes the mechanism or the
 files touched IS kicked back to Devin. See the closing-session skill, "Devin-built PRs".)
 
-**The evidence bar is TWO OR MORE independent signals**, the same bar the
-round-2 gate message states, because a doc that set a lower one would be the
-easier surface to read and would quietly undercut it. The signals: findings
+**The evidence bar is TWO OR MORE independent signals.** The signals: findings
 CONCENTRATING in one file or function; a finding landing on a line THIS change
 added in an earlier round; the diff GROWING across rounds instead of shrinking.
 One alone is an ordinary local defect wearing an architectural shape — findings

@@ -41,6 +41,7 @@ from genesis.transcript_analytics.extract import TABLES, extract_source, utc_tim
 from genesis.transcript_analytics.identity import source_identity
 from genesis.transcript_analytics.identity import source_path as source_path
 from genesis.transcript_analytics.schema import SCHEMA_VERSION, SCHEMAS
+from genesis.util.resolve import resolve_refusing_loops
 
 MARKER = "fragments"
 DEFAULT_LOCK = locks.DEFAULT_LOCK
@@ -712,13 +713,24 @@ def _prunable_key(marker, projects, cutoff, key=None):
         relative = Path(rel)
         if (
             not relative.parts or relative.is_absolute() or ".." in relative.parts
-            or not (projects / relative).resolve().is_relative_to(projects.resolve())
+            or not resolve_refusing_loops(projects / relative).is_relative_to(projects.resolve())
         ):
             return None
     except (OSError, ValueError, RuntimeError):
         print(f"prune: unreadable marker retained: {marker.name}", file=sys.stderr)
         return None
-    if not rel or (key is not None and srckey(rel) != key) or (projects / rel).exists():
+    if not rel or (key is not None and srckey(rel) != key):
+        return None
+    try:
+        # stat rather than exists(): from Python 3.14 exists() answers False when
+        # a parent cannot be searched, which reads a source still on disk as gone.
+        (projects / rel).stat()
+    except (FileNotFoundError, NotADirectoryError):
+        pass
+    except OSError:
+        print(f"prune: unreadable source retained: {marker.name}", file=sys.stderr)
+        return None
+    else:
         return None
     if last is None:
         print(f"prune: unknown retention timestamp retained: {rel}", file=sys.stderr)
@@ -805,13 +817,17 @@ def prune(data: Path, *, before: str, projects: Path, lock_path: Path | None = N
             raise ValueError(
                 "store projects root is unbound or unreadable; ingest with explicit adoption first"
             ) from exc
-        if root != str(projects.resolve(strict=True)):
+        # Resolve once, then judge retention only through the canonical root that
+        # matched the binding: a symlinked root or ancestor repointed after this
+        # check must not redirect the containment and existence checks.
+        canonical = projects.resolve(strict=True)
+        if root != str(canonical):
             raise ValueError("projects root differs from the store")
         retired = []
         for key in source_keys(data):
             records = _retained_records(data, key)
             if records and all(
-                _prunable_record(record, projects, cutoff, key) == key
+                _prunable_record(record, canonical, cutoff, key) == key
                 for record in records
             ):
                 retired.append(key)

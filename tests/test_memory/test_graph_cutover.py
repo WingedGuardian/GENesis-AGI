@@ -48,6 +48,7 @@ def _census_metrics(**over) -> dict:
         "unclassified": 0,
         "head_telemetry": True,
         "head_dirty": False,
+        "head_history_telemetry": True,
         "complete": True,
         "reasons": [],
     }
@@ -136,7 +137,7 @@ def test_traffic_older_than_fourteen_days_does_not_count():
 
 
 @pytest.mark.parametrize(
-    "outcome", ["fallback", "selection_failed", "error", "mode_unsupported", "brand_new"]
+    "outcome", ["fallback", "selection_failed", "error", "mode_unsupported", "retried", "brand_new"]
 )
 def test_every_outcome_but_primary_and_cancelled_restarts_the_clock(outcome):
     trav, census = _passing_inputs(clock_days=20)
@@ -285,6 +286,14 @@ def test_telemetry_switched_off_in_the_server_is_inconclusive():
         ({"head_dirty": True}, "dirty"),
         ({"v": 99}, "unknown census schema"),
         ({"v": 1}, "predates the current census contract"),
+        ({"v": 2}, "predates the current census contract"),
+        ({"head_history_telemetry": False}, "HEAD held code without telemetry in the last 2h30m"),
+        ({"procs": [_proc(role="ambient", telemetry_off=True)]}, "ambient worker pid 1 has"),
+        ({"procs": [_proc(role="venv-generic", telemetry=False)]}, "venv process pid 1 may run"),
+        ({"procs": [_proc(role="ambient", excluded="replay_not_live_traffic")]},
+         "unreadable census row"),
+        ({"procs": [{"pid": 2, "role": "server", "unknown_reasons": ["runs_alongside_host"]}]},
+         "server pid 2: cannot prove its code (runs_alongside_host)"),
         ({"procs": [_proc(telemetry_off=None)]}, "kill-switch state unknown"),
         ({"procs": [_proc(source=None, unknown_reasons=["not_main_venv"])]},
          "cannot prove its code (not_main_venv)"),
@@ -478,3 +487,16 @@ def test_the_clean_schema_is_the_one_the_census_writes():
 
     assert cut.CLEAN_CENSUS_SCHEMA == graph_census.CENSUS_SCHEMA
     assert set(range(1, cut.CLEAN_CENSUS_SCHEMA + 1)) == cut.KNOWN_CENSUS_SCHEMAS
+
+
+def test_an_excluded_replay_and_a_foreign_generic_process_hold_nothing():
+    census = _census(
+        NOW - timedelta(days=15), NOW,
+        procs=[
+            _proc(),
+            {"pid": 3, "role": "replay", "excluded": "replay_not_live_traffic"},
+            {"pid": 4, "role": "venv-generic", "telemetry": False, "foreign": True},
+            {"pid": 5, "role": "venv-generic", "telemetry": True, "foreign": False},
+        ],
+    )
+    assert cut.evaluate(_daily_traffic(14), census, [], NOW).status == "PASS"

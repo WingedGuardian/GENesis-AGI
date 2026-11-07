@@ -2045,7 +2045,7 @@ def test_status_is_owed_from_budget_plus_who_and_what_went_wrong(repo, tmp_path,
     budget = _budget(open_keys=["c1", "c2"], current_head=head, body="", errors=["e"])
     got = _status_with(monkeypatch, path, budget)
     shared = rr.owed_from_budget(
-        str(path), budget, "o/r", 7, now=T0 + timedelta(hours=1), cutover=None
+        str(path), budget, "o/r", 7, now=T0 + timedelta(hours=1), cutover=rr.REFLECTION_CUTOVER_ISO
     )
     assert got == {**shared, "repo": "o/r", "pr": 7, "errors": ["e"]}
     assert got["owed"] == ["c2"]

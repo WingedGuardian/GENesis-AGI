@@ -388,6 +388,62 @@ async def test_run_session_cancelled_marks_failed(db):
     assert row["status"] == "failed", (
         f"cancelled session left status={row['status']!r} — must be terminal"
     )
+    # The cancel's reason survives into the row (fail() used to discard it).
+    assert (row["outcome"], row["outcome_reason"]) == ("failed", "cancelled")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("truncated", "received", "expected"),
+    [
+        (True, True, ("partial", "bg_truncated")),
+        (False, False, ("partial", "no_result_event")),
+        (False, True, ("unreported", None)),
+    ],
+)
+async def test_a_clean_exit_that_did_not_finish_is_recorded_partial(
+    db, truncated, received, expected
+):
+    """A truncated run, or one with no result event, exits 0 and used to read
+    as plain success. Its row now says it did not finish."""
+    from types import SimpleNamespace
+
+    from genesis.cc.types import CCInvocation, CCModel, CCOutput, EffortLevel, SessionType
+
+    sm = SessionManager(db=db, invoker=AsyncMock(), day_boundary_hour=0)
+    invoker = AsyncMock()
+    invoker.run_streaming = AsyncMock(
+        return_value=CCOutput(
+            session_id="cc",
+            text="done-ish",
+            model_used="sonnet",
+            cost_usd=0.0,
+            input_tokens=0,
+            output_tokens=0,
+            duration_ms=1,
+            exit_code=0,
+            bg_truncated=truncated,
+            result_received=received,
+        )
+    )
+    runner = DirectSessionRunner(
+        invoker=invoker,
+        session_manager=sm,
+        config_builder=AsyncMock(),
+        runtime=SimpleNamespace(_db=db),
+    )
+    runner._build_invocation = lambda _req, _sid: CCInvocation(prompt="x")
+    sess = await sm.create_background(
+        session_type=SessionType.BACKGROUND_TASK,
+        model=CCModel.SONNET,
+        effort=EffortLevel.MEDIUM,
+    )
+
+    await runner._run_session(DirectSessionRequest(prompt="t", notify=False), sess["id"])
+
+    row = await cc_sessions.get_by_id(db, sess["id"])
+    assert row["status"] == "completed"
+    assert (row["outcome"], row["outcome_reason"]) == expected
 
 
 @pytest.mark.asyncio

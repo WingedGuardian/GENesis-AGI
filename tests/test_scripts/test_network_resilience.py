@@ -170,10 +170,14 @@ def test_failed_metadata_migration_does_not_claim_network_configuration_applied(
     target.write_bytes(original)
     log = Path(env["SYSTEMCTL_LOG"])
     log.write_text("")
-    fault = 'head -c 7 > "$2"; ' if partial else ''
+    fault = 'head -c 7 > "$2"; ' if partial else ""
     sudo = tmp_path / "bin/sudo"
-    sudo.write_text(_SUDO_STUB.replace('exec "$@"',
-        f'if [ "$1" = tee ] && [[ "$2" == */genesis-keep-config.conf ]]; then {fault}exit 1; fi\nexec "$@"'))
+    sudo.write_text(
+        _SUDO_STUB.replace(
+            'exec "$@"',
+            f'if [ "$1" = tee ] && [[ "$2" == */genesis-keep-config.conf ]]; then {fault}exit 1; fi\nexec "$@"',
+        )
+    )
     result = _run_apply(env)
     assert result.returncode == 0, result.stdout + result.stderr
     assert ("NOT fully applied" in result.stdout) == partial
@@ -665,7 +669,9 @@ def test_tailscale_watchdog_installs_where_tailscaled_exists(tmp_path):
     # The host's Python, never the venv; and a bound on a hung run.
     assert f"ExecStart=/usr/bin/python3 {p['script']}" in service
     assert "TimeoutStartSec=65min" in service
-    assert "Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" in service
+    assert (
+        "Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" in service
+    )
     assert "OnUnitActiveSec=2min" in p["timer"].read_text()
     calls = Path(env["SYSTEMCTL_LOG"]).read_text()
     assert "enable genesis-tailscale-watchdog.timer" in calls
@@ -694,7 +700,12 @@ def test_tailscale_watchdog_skipped_without_tailscaled(tmp_path):
 def test_tailscale_watchdog_installs_without_networkd(tmp_path):
     """It does not depend on networkd: a host whose network manager is not
     networkd still gets it, though the networkd parts are skipped."""
-    env = {**_stage(tmp_path), "TAILSCALED_CAT_RC": "0", "NETWORKD_ACTIVE_RC": "3", "NETWORKD_ENABLED": "disabled"}
+    env = {
+        **_stage(tmp_path),
+        "TAILSCALED_CAT_RC": "0",
+        "NETWORKD_ACTIVE_RC": "3",
+        "NETWORKD_ENABLED": "disabled",
+    }
     result = _run_apply(env)
     assert result.returncode == 0
     assert "not this host's network manager" in result.stdout
@@ -965,7 +976,9 @@ def test_root_watchdog_reporter_strips_completion_marker_and_reports_success():
 
 
 def test_root_watchdog_reporter_keeps_left_warning():
-    result = _run_root_watchdog_report("root watchdog still present: genesis-tailscale-watchdog.timer")
+    result = _run_root_watchdog_report(
+        "root watchdog still present: genesis-tailscale-watchdog.timer"
+    )
     assert "NOT fully removed" in result.stdout
     assert "+ Removed" not in result.stdout
     assert result.stdout.rstrip().endswith("REMOVED_COUNT=0")
@@ -980,9 +993,10 @@ def test_both_uninstall_paths_report_instead_of_claiming_success():
         start = before.rfind('if [ "$DRY_RUN" = true ]; then')
         assert start >= 0
         assert before.find("else", start) > start
-    assert 'ok "Removed root network and Tailscale watchdog timers"' in text.split(
-        "report_root_watchdog_removal() {"
-    )[1].split("\n}\n")[0]
+    assert (
+        'ok "Removed root network and Tailscale watchdog timers"'
+        in text.split("report_root_watchdog_removal() {")[1].split("\n}\n")[0]
+    )
 
 
 # ── round 3: the oneshot's timeout covers the worst supported run ────────
@@ -1009,8 +1023,15 @@ def test_the_oneshot_timeout_clears_the_worst_run_the_settings_allow():
         + mx["NETWD_TS_SCAN_BUDGET_SEC"]
         + 3 * call  # the probe in flight when the budget ends: up to 3 pings
         + mx["NETWD_TS_RESTART_TIMEOUT_SEC"]
-        + mx["NETWD_TS_POLL_SEC"] + call + 1  # the poll, one read past it, a 1s sleep
-        + mx["NETWD_TS_VERIFY_SEC"] + call + 2  # the check, one ping past it, a 2s sleep
+        + mx["NETWD_TS_POLL_SEC"]
+        + call
+        + 1  # the poll, one read past it, a 1s sleep
+        + mx["NETWD_TS_VERIFY_SEC"]
+        + call
+        + 2  # the check, one ping past it, a 2s sleep
+        # The home-DERP pin, on its own short timeout: derp-map, the pin before
+        # the heal, the pin after it, and identity reads on both sides of it.
+        + 5 * tsw.DERP_CALL_TIMEOUT_SEC
     )
     text = LIB.read_text()
     (minutes,) = re.findall(r"TimeoutStartSec=(\d+)min", text)

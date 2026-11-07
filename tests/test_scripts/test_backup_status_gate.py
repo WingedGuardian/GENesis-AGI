@@ -4,6 +4,8 @@ import json
 import subprocess
 from pathlib import Path
 
+from tests.test_scripts._update_source import update_text
+
 _GATE = Path(__file__).resolve().parents[2] / "scripts" / "lib" / "backup_status_gate.py"
 
 
@@ -75,7 +77,7 @@ def test_gate_treats_unconfirmed_tier1_as_degraded(tmp_path):
 
 
 def test_update_surfaces_and_persists_non_aborting_backup_failure():
-    update = (_GATE.parents[1] / "update.sh").read_text()
+    update = update_text()
     assert "BACKUP FAILED — UPDATE CONTINUING IN DEGRADED MODE" in update
     assert "scripts/lib/backup_status_gate.py" in update
     assert 'degraded="${degraded:+$degraded,}$PRE_UPDATE_DEGRADED"' in update

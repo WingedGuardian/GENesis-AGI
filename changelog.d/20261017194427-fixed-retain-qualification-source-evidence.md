@@ -1,1 +1,0 @@
-- Retain qualification source bytes outside temporary storage and require verified primary and restored evidence before complete admission. Checkpoint copied evidence when later source reads or validation fail.

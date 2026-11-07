@@ -1,0 +1,1 @@
+- Preserve malformed legacy index requests as durable import evidence while allowing valid sibling requests to proceed. Queue filesystem and database failures now remain visible and recoverable; `index_marker.py import-status` inspects retained receipts without running migration.

@@ -152,14 +152,14 @@
    operations, or a merge compounded with a local `git merge` into main are the
    ones measured, and the list is illustrative rather than exhaustive: anything
    that blocks before the PR resolves leaves no row. No OTHER sigil in
-   `shell_parse._KNOWN_SIGILS` is recorded either — `# depth-ack`, `# audit-ack`,
+   `shell_parse._KNOWN_SIGILS` is recorded either — `# depth-ack`,
    `# discard-override` and `# full-suite-ok` belong to gates outside this guard
-   and announce themselves on stderr only. The command-scoped acks
-   (`# merge-to-main-override`, `# escalation-ack`) are
-   NOT logged, for two different reasons. `# merge-to-main-override` waives a
+   and announce themselves on stderr only. The command-scoped
+   `# merge-to-main-override` is NOT logged: it waives a
    gate that short-circuits BEFORE the branch is resolved, so a row could only
-   say the ack was typed, never that it waived anything. The local
-   `# escalation-ack` is outside this guard. `# final-round-accept` remains
+   say the ack was typed, never that it waived anything. The former local
+   `# audit-ack` and `# escalation-ack` authorize no current gate and are no longer
+   recognized by the parser. `# final-round-accept` remains
    parser-compatible for stale worktrees but authorizes no current gate. Native round
    approvals are decisions rather than sigils and are deliberately not written as
    reusable receipts.

@@ -32,14 +32,17 @@ def verify(data):
     coverage = {"included": len(records), "excluded": excluded}
     # Reuse the configured, eager cache reader. A fallback is unavailable for
     # verification: comparing two live readers would certify no cached bytes.
-    with contextlib.closing(query.connect(data, selection=selection)) as snap:
-        if query._READS[snap].get("snapshot") is None:
-            return {
-                "ok": False,
-                "unavailable": "no readable current snapshot; run derive",
-                "coverage": coverage,
-                "snapshot_current": False,
-            }
+    # snapshot_only, so a missing cache is not first computed live in full.
+    try:
+        snap = query.connect(data, selection=selection, snapshot_only=True)
+    except query.NoSnapshot:
+        return {
+            "ok": False,
+            "unavailable": "no readable current snapshot; run derive",
+            "coverage": coverage,
+            "snapshot_current": False,
+        }
+    with contextlib.closing(snap):
         comparisons = {v: {"snapshot": _digest(snap, v)} for v in query._DERIVED}
     # Immutable captured source records remain usable after cache closure. The
     # connections run sequentially so they do not each retain half the RAM cap.

@@ -1,0 +1,1 @@
+- A foreground session's `gh issue create` is now refused before it posts when its body lacks the answers the premise gate requires (the six premise answers, or the five verification answers for an issue labelled `bug`). The refusal names the missing answers and the format. Dispatched sessions are never blocked, and a body the check cannot read in full passes as before.

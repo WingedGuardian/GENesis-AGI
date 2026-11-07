@@ -126,8 +126,8 @@ from typing import Literal, NamedTuple
 # script (sys.path[0] is this dir) AND when it is imported as a module for tests
 # (importlib does not add the file's dir to sys.path).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-# scripts/ (parent dir) for review_state — the shared escalation-cap constant, so
-# the Codex-round gate below and the commit gate's Rule 3 stop at the same N.
+# scripts/ (parent dir) for the shared review modules imported below
+# (review_findings, review_deadline, review_budget, …).
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 try:
     from hook_input import degraded_exit, field, read_payload, run_guard  # noqa: E402
@@ -201,6 +201,9 @@ try:
         INLINE_P2_RE as _INLINE_P2_RE,
     )
     from review_findings import (
+        INLINE_P3_RE as _INLINE_P3_RE,
+    )
+    from review_findings import (
         cr_header_fields as _cr_header_fields,
     )
     from review_findings import (
@@ -214,6 +217,9 @@ try:
         is_substitute_candidate,
         primary_reviewer_login,
     )
+    from review_findings import (
+        is_cr_marker_line as _is_cr_marker_line,
+    )
 except Exception as _findings_exc:  # noqa: BLE001 — degrade the merge gate only.
     # Only the exception's TYPE name is rendered, never the exception: even
     # __str__ can raise (the hook_input block above), and an exception escaping
@@ -226,7 +232,7 @@ except Exception as _findings_exc:  # noqa: BLE001 — degrade the merge gate on
         f"scripts/review_findings.py is unimportable ({_findings_exc_type}); "
         f"repair the hook tree"
     )
-    _INLINE_P1_RE = _INLINE_P2_RE = None  # type: ignore[assignment]
+    _INLINE_P1_RE = _INLINE_P2_RE = _INLINE_P3_RE = None  # type: ignore[assignment]
     _CR_SEVERITIES = frozenset()  # type: ignore[assignment]
 
     def _cr_header_fields(line, *, skip_partial=False):  # type: ignore[no-redef]
@@ -247,23 +253,19 @@ except Exception as _findings_exc:  # noqa: BLE001 — degrade the merge gate on
     def _devin_finding(body):  # type: ignore[no-redef]
         raise RuntimeError(_REVIEW_FINDINGS_ERROR)
 
-# SOFT dependency (mirrors review_enforcement_commit.py's guard for the SAME
-# import): an unimportable review_state must degrade ONLY the round-escalation
-# advisory to its documented default — never crash this module at load time.
-# A module-load exception exits 1 BEFORE run_guard's fail-closed wrapper can
-# convert it to a block, and CC treats non-2 as non-blocking → EVERY fail-closed
-# gate in this file (force-push, merge, sqlite) would silently vanish.
-# `ESCALATION_ROUND_CAP` is deliberately NOT imported here. AST-verified 2026-09-25:
-# it had ZERO Load references in this file — an ImportFrom and an except-branch Store
-# and nothing else — so no gate here ever consulted it, and the six-line rationale
-# about "every fail-closed gate in this file" protected a name none of them read. Its
-# real consumers import it from `review_state` directly, each behind its own degrade
-# (`review_enforcement_commit.py`, `ask_gate_menu.py`, `genesis_statusline.py`).
+    def _is_cr_marker_line(line):  # type: ignore[no-redef]
+        raise RuntimeError(_REVIEW_FINDINGS_ERROR)
+
+# This module imports nothing from `review_state`. It once imported the escalation
+# caps (`ESCALATION_ROUND_CAP`, `FINAL_ROUND_CAP`) that no gate here ever read
+# (AST-verified 2026-09-25: an ImportFrom and an except-branch Store, no Load); both
+# constants are now deleted along with the local review streak they capped.
 #
-# That is the same criterion this change applied to the retired `FINAL_ROUND_CAP`,
-# and applying it to one name in a two-name import while leaving its sibling is how
-# the next audit re-finds this. Note grep alone reports the name as live here — it
-# counts a docstring mention and the Store — so the check has to be AST.
+# Every soft import below follows one rule: a module-LOAD exception exits 1 BEFORE
+# run_guard's fail-closed wrapper can convert it to a block, and CC treats non-2 as
+# non-blocking, so EVERY fail-closed gate in this file (force-push, merge, sqlite)
+# would silently vanish. Each one therefore degrades to a documented default and
+# never raises at load time.
 
 try:
     from review_deadline import bounded_timeout as _bounded_timeout  # noqa: E402
@@ -485,8 +487,8 @@ def _mentions_gated_op(command: str) -> bool:
     return mentions(command, _GATED_MENTION) or mentions(command, _GH_MENTION, _CREATE_MENTION)
 
 
-# Local push allowlist (offline re-push cache). SOFT dependency, guarded exactly
-# like the review_state import above: a module-LOAD exception must degrade to
+# Local push allowlist (offline re-push cache). SOFT dependency, guarded by the
+# soft-import rule stated above: a module-LOAD exception must degrade to
 # None (→ the pure live-ls-remote republish path, i.e. today's behavior), NEVER
 # propagate — a raising import exits 1, which CC treats as non-blocking, silently
 # disabling EVERY fail-closed gate in this file. push_allowlist itself is
@@ -946,7 +948,7 @@ def _walk_merge_into_main(
     # asserts a waiver that was never consulted, in a store whose entire purpose
     # is answering "was this escape reached for?", and the row carries nothing to
     # reconcile it against. An honest row needs the branch resolved first; see
-    # the follow-up. `# escalation-ack` belongs to the local commit-streak gate;
+    # the follow-up. `# escalation-ack` belonged to the retired commit-streak gate;
     # `# final-round-accept` is recognized only for stale-tree compatibility.
     for s in merge_git_segs:
         if getattr(s, "depth", 0) > 0:
@@ -1160,6 +1162,9 @@ _MERGE_GATE_BUDGET_S = 45.0
 # included, which used to inherit it only as a side effect of the escalation
 # gate. It stays None on the `--check-pr` reporting path, which is not a hook
 # invocation and has no registration to overrun, so that one uses full caps.
+# main() disarms it on exit (#2904), so an in-process caller (a test) never
+# inherits a spent budget; gates called directly, outside main(), still arm it
+# and leave it armed, which is why tests/test_hooks/conftest.py resets it too.
 _merge_deadline: float | None = None
 
 
@@ -1972,6 +1977,87 @@ _WRAPPER_REVIEW_BODY_PARTS = (
 _WRAPPER_RESIDUE_MAX_CHARS = 24
 
 
+#: The pieces of Devin's review-report template, removed one at a time to see
+#: whether anything a human would read is left (the `_WRAPPER_REVIEW_BODY_PARTS`
+#: method). MEASURED 2026-10-31: every review body the merge gate surfaced on the
+#: 81 open PRs (57 bodies on 41 PRs) was Devin's, in three shapes: "found N
+#: potential issue(s)" (its findings are posted inline), "No Issues Found", and a
+#: "newer findings are available" marker on a superseded report.
+#:
+#: The badge is matched by its CONTENT, not just its two markers. Every badge read
+#: (33 of 51 Devin bodies on PRs #3680-#3820, MEASURED 2026-10-31) is one review
+#: link wrapping a picture whose only text is the image's `Devin Review` alt.
+#: A marker-to-marker span would also delete a sentence Devin put between the
+#: markers, and the body would then go quiet (CodeRabbit, PR #3810). Any other
+#: shape fails to match, its markers fall to the generic marker strip below, and
+#: the rest stays as residue, so the body stays visible.
+_DEVIN_REPORT_PARTS = (
+    re.compile(
+        r"<!-- devin-review-badge-begin -->\s{0,8}"
+        r'<a href="https://app\.devin\.ai/review/[A-Za-z0-9._/-]{1,200}" target="_blank">\s{0,8}'
+        r"<picture>\s{0,8}"
+        r'(?:<source media="\([a-z-]{1,40}: [a-z]{1,10}\)" '
+        r'srcset="https://static\.devin\.ai/[A-Za-z0-9._/?=&-]{1,200}">)?\s{0,8}'
+        r'<img src="https://static\.devin\.ai/[A-Za-z0-9._/?=&-]{1,200}" alt="Devin Review">'
+        r"\s{0,8}</picture>\s{0,8}</a>\s{0,8}"
+        r"<!-- devin-review-badge-end -->"
+    ),
+    re.compile(r"<!-- devin-review-[a-z-]{1,40} -->"),
+    re.compile(r"^#{1,6}[ \t]*\u2705?[ \t]*Devin Review: No Issues Found[ \t]*$", re.M),
+    re.compile(r"Devin Review analyzed this PR and found no bugs or issues to report\.?"),
+    re.compile(r"\*\*Devin Review\*\* found \d{1,4} (?:new )?potential issues?\.?"),
+    re.compile(r"^>[ \t]*\[!NOTE\][ \t]*$", re.M),
+    # The older superseded marker. It can share its line with "N flags not posted
+    # ...", which is not template and so keeps such a body visible.
+    re.compile(
+        r"^>[ \t]*\*\*This report is out of date\.\*\* Scroll down for Devin Review's "
+        r"latest report on this PR\.",
+        re.M,
+    ),
+    re.compile(
+        r"^>[ \t]*\*\*Newer findings are available below\.\*\* Devin Review posted a "
+        r"newer report on this PR, in addition to the findings presented here\.[ \t]*$",
+        re.M,
+    ),
+)
+#: Longer bodies are never quieted, so the template regexes never scan large
+#: third-party text. MEASURED 2026-10-31: the longest of 1,557 real Devin report
+#: bodies (PRs #2100-#3820) was 732 characters.
+_DEVIN_REPORT_MAX_CHARS = 2048
+_DEVIN_FOUND_RE = re.compile(r"\*\*Devin Review\*\* found (\d{1,4}) (?:new )?potential issues?")
+
+
+def _is_settled_devin_report(body: str, posted: int) -> bool:
+    """True when a review body is Devin's report template and nothing else, and its
+    stated count equals the inline comments that same review posted.
+
+    The body is the ONLY place Devin states its count, and findings can go
+    unposted: MEASURED on a past PR, three report bodies said "3 flags not posted
+    on this PR by your GitHub settings". So a body is quiet only when BOTH hold:
+      * nothing is left once the template pieces are removed (the "not posted"
+        sentence is not a template piece, so such a body always stays visible);
+      * the "found N" count (0 for "No Issues Found") equals ``posted``, the
+        top-level inline comments carrying this review's id.
+    MEASURED 2026-10-31: 100 of 100 "found N" reports in the 300 most recent PRs
+    matched their posted count. A body that fails either test is surfaced, as
+    every unparsed body was before; this only removes the ones that add nothing.
+    """
+    if len(body) > _DEVIN_REPORT_MAX_CHARS:
+        return False
+    counts = [int(n) for n in _DEVIN_FOUND_RE.findall(body)]
+    no_issues = "Devin Review: No Issues Found" in body
+    if len(counts) > 1 or (counts and no_issues) or not (counts or no_issues):
+        return False
+    residue = body
+    for part in _DEVIN_REPORT_PARTS:
+        residue = part.sub("", residue)
+    # NOTHING may be left: every real template body leaves 0 characters
+    # (MEASURED, 655 of 655), so any leftover text is something to read.
+    if residue.strip():
+        return False
+    return (counts[0] if counts else 0) == posted
+
+
 def _is_wrapper_review_body(body: str) -> bool:
     """True when a review BODY is a template carrying no findings of its own.
 
@@ -2193,6 +2279,20 @@ def _is_sqlite_write(cmd: str) -> bool:
     negative lookahead drops the ``replace()`` scalar function).
     """
     return "sqlite3" in cmd and bool(_DML_KEYWORD_RE.search(cmd))
+
+
+#: Lines each unrecognised-comment NOTE lists before stating how many it left out.
+_UNRECOGNISED_LISTED = 10
+
+
+def _print_listing_rest(total: int) -> None:
+    """State how many entries a bounded NOTE listing left out, if any."""
+    if total > _UNRECOGNISED_LISTED:
+        print(
+            f"  … and {total - _UNRECOGNISED_LISTED} more (listing bounded to "
+            f"{_UNRECOGNISED_LISTED}; the count above is the total)",
+            file=sys.stderr,
+        )
 
 
 def _inline_title(body: str) -> str:
@@ -2460,6 +2560,10 @@ def _coderabbit_title(body: str) -> str:
             continue
         stripped = line.strip()
         if not stripped:
+            continue
+        # Since 2026-10-17 a marker comment opens the body, ahead of the header;
+        # skipped like a blank line so the header is still the line skipped below.
+        if _is_cr_marker_line(stripped):
             continue
         # The header is bold since 2026-10-06 (#2992), so it would be read as the
         # title. Skip it, and only it: the header is always the FIRST line, and a
@@ -2735,16 +2839,27 @@ def _cr_summary_structural(lines: list[str], fence_mask: list[bool]) -> list[boo
 
 def _cr_outside_diff_entries(
     body: str,
-) -> tuple[list[tuple[str, str, str, str]], int, bool]:
+) -> tuple[list[tuple[str, str, str, str]], int, bool, list[str]]:
     """Findings from the 'Outside diff range comments' sections of ONE review body.
 
-    Returns ``(entries, declared, declared_known)`` — the parsed findings, the
-    total this body's own section headers SAY it carries, and whether EVERY
-    matched section header actually stated a count. ``declared_known`` is what
-    licenses the SURPLUS comparison: with any count absent, ``declared`` is an
-    underestimate, so parsed-exceeds-declared would fire on well-formed input.
-    The shortfall comparison needs no such licence — an underestimate can only
-    make it more lenient, never false-positive. The format states its own counts
+    Returns ``(entries, declared, declared_known, unreadable)`` — the findings
+    kept, the total this body's own section headers SAY it carries, whether
+    EVERY matched section header stated a count, and the reasons the read is
+    incomplete or unreliable (depth drift, and each section's count mismatch).
+
+    EACH COUNTED SECTION IS RECONCILED AGAINST ITS OWN ENTRIES, never against
+    body-wide totals (CodeRabbit, round 2 of #3827): with totals, a section
+    that over-reads by one cancels a section that under-reads by one, and a
+    section with no count adds entries that offset a counted section's missing
+    one, so the note that should name the gap never prints. A section that
+    over-reads is quarantined alone — its entries are dropped, because which
+    of them is the phantom is unknowable — while the other sections' entries,
+    which reconciled, are kept. A section with no count is read but cannot be
+    checked, and it no longer switches off the check for any other section.
+    What no count can catch is netting INSIDE one section (one phantom plus
+    one unread finding in the same section), so that remains a limit of the
+    canary. ``declared`` and ``declared_known`` describe the body and are no
+    longer what the caller compares. The format states its own counts
     ("Outside diff range comments (3)"), which is the one closed-set fact
     available about a third-party document nobody controls: it turns "did I
     parse everything?" from an unanswerable question into a comparison. Reading
@@ -2752,8 +2867,7 @@ def _cr_outside_diff_entries(
     CodeRabbit helper here carries a canary for what it read but did not
     recognise (``cr_unknown``, ``unmatched_bot``, ``header_seen``); without the
     declared count this one would have none. ``declared`` is 0 when a header
-    omits its count — absent, not zero findings, and the caller only ever acts
-    on a SHORTFALL.
+    omits its count — absent, not zero findings.
 
     Each entry is ``(path, lines, severity, title)``, severity lower-cased
     and drawn from the SAME vocabulary as the inline path (``_CR_SEVERITIES``)
@@ -2782,6 +2896,10 @@ def _cr_outside_diff_entries(
     declared = 0
     declared_known = True
     depth_drift: list[str] = []
+    # One (stated count or None, index of its first entry in `out`) per
+    # outside-diff section, in order. Entries are only ever appended while an
+    # outside-diff section is open, so each belongs to the latest one opened.
+    sections: list[tuple[int | None, int]] = []
     body, bq_depths = _cr_normalize_review_body(body)
     lines = body.split("\n")
     # FENCE half only. A review body is a code-bearing document: it quotes diffs
@@ -2794,9 +2912,59 @@ def _cr_outside_diff_entries(
     structural = _cr_summary_structural(lines, fence_mask)
     current_file: str | None = None
     in_section = False
+    in_bold_section = False  # the second layout (see _CR_BOLD_SECTION_RE)
     for pos, line in enumerate(lines):
         if fence_mask[pos]:
             continue
+        stripped = line.strip()
+        bold = _CR_BOLD_SECTION_RE.match(stripped)
+        if bold and (in_bold_section or in_section) and depths[pos] >= _CR_BOLD_ENTRY_DEPTH:
+            # Inside a finding of EITHER layout this is the finding's PROSE quoting
+            # a section line, not structure: neither a new section nor drift (the
+            # first layout's `structural` check holds the same line for its summaries).
+            bold = None
+        if bold:
+            if depths[pos] != _CR_BOLD_SECTION_DEPTH:
+                if bold.group(1) == "Outside diff range comments":
+                    # Same reasoning as the depth drift below: a section one
+                    # <details> deeper would read as zero declared, zero parsed.
+                    depth_drift.append(
+                        f"outside-diff section (bold) at <details> depth {depths[pos]}"
+                    )
+                continue
+            in_bold_section = bold.group(1) == "Outside diff range comments"
+            in_section = False
+            current_file = None
+            if in_bold_section:
+                if bold.group(2) is not None:
+                    declared += int(bold.group(2))
+                    sections.append((int(bold.group(2)), len(out)))
+                else:
+                    # Read the findings anyway; only the count is unknown, as for a
+                    # first-layout header without one (this section goes unchecked).
+                    declared_known = False
+                    sections.append((None, len(out)))
+            continue
+        if in_bold_section:
+            if stripped == "---" and depths[pos] == _CR_BOLD_SECTION_DEPTH:
+                in_bold_section = False  # the rule that closes the caution block
+                continue
+            old_section = _CR_SECTION_RE.search(line)
+            if old_section and structural[pos] and depths[pos] == _CR_SECTION_DEPTH:
+                # A first-layout section after a bold one with no closing rule:
+                # leave bold mode and let the first-layout code below read it,
+                # so its findings and its declared count are not swallowed here.
+                in_bold_section = False
+            elif structural[pos] and depths[pos] == _CR_BOLD_ENTRY_DEPTH:
+                entry = _cr_summary_entry(stripped)
+                if entry is not None:
+                    path, span, severity, title = entry
+                    if "/" not in path:  # a basename: find the finding's full path
+                        path = _cr_full_location(lines, fence_mask, depths, pos, path, span)
+                    out.append((path, span, severity, title))
+                continue
+            else:
+                continue
         # STRUCTURE IS ATTRIBUTED BY POSITION IN THE <details> TREE, never by
         # matching tag text wherever it appears. Both roles were reconstructed
         # from text before, and both were forgeable from content a PR author
@@ -2838,8 +3006,10 @@ def _cr_outside_diff_entries(
                 count = _CR_SECTION_COUNT_RE.search(section.group(0))
                 if count:
                     declared += int(count.group(1))
+                    sections.append((int(count.group(1)), len(out)))
                 else:
                     declared_known = False
+                    sections.append((None, len(out)))
             continue
         if not in_section:
             continue
@@ -2881,10 +3051,140 @@ def _cr_outside_diff_entries(
                     title = bold.group(1).strip()[:120]
                     break
             out.append((current_file, entry.group(1), severity or "", title))
-    return out, declared, declared_known, depth_drift
+    kept: list[tuple[str, str, str, str]] = []
+    unreadable = list(depth_drift)
+    for idx, (count, start) in enumerate(sections):
+        end = sections[idx + 1][1] if idx + 1 < len(sections) else len(out)
+        mine = out[start:end]
+        if count is not None and len(mine) > count:
+            # More entries than this section's own header declares: prose was
+            # mis-read as a finding (the phantom-Critical shape, Codex P2 on
+            # #1847), and which entry is the phantom is unknowable, so this
+            # section's batch is QUARANTINED rather than printed as findings.
+            unreadable.append(
+                f"outside-diff section declares {count} finding(s) but "
+                f"{len(mine)} were parsed — surplus entries indicate prose "
+                f"mis-read as findings"
+            )
+            continue
+        if count is not None and len(mine) < count:
+            # Fewer than declared: the read is INCOMPLETE. The entries that were
+            # read are still real and are kept. This is also the backstop for
+            # the one suppression shape the fence mask cannot judge: a BALANCED
+            # fence spanning a real finding reads as quoted content, and the
+            # count is what notices it went missing.
+            unreadable.append(
+                f"outside-diff section declares {count} finding(s), parsed {len(mine)}"
+            )
+        kept.extend(mine)
+    return kept, declared, declared_known, unreadable
 
 
 _CR_INLINE_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+
+# SECOND outside-diff layout, from 2026-09-14 (the first one is read above).
+# MEASURED over every CodeRabbit review body carrying the section on the 735 PRs
+# updated 2026-10-01 to 10-31: 49 bodies, the last 19 in the old layout (to
+# 2026-09-14) and 30 in this one, declaring 32 findings that the old reader saw
+# as zero declared and zero parsed, so none was shown and nothing warned (18 of
+# the 32 were Major). In this layout:
+#   * the section is a BOLD line, `**⚠️ Outside diff range comments (N)**`, at
+#     <details> depth 0 (30 of 30), usually inside a `> [!CAUTION]` quote;
+#   * each finding is its own <details> at depth 1 (32 of 32) whose <summary>
+#     reads `LEVEL · Title · <code>path:lines</code>`, where LEVEL has been
+#     `<em>🟠 Major</em>`, `<strong>🟡 Minor</strong>` and
+#     `<strong><picture>…</picture> Minor</strong>` in turn.
+# The summary is the one line all three spellings share, so it is what is read.
+_CR_BOLD_SECTION_RE = re.compile(
+    # The count is optional and the prefix (an icon, today `⚠️ `) generous: the count
+    # is what the reconciliation reads, so a header that drops it, or a longer icon,
+    # must still OPEN the section rather than read as zero declared, zero parsed.
+    r"^\*\*[^*\n]{0,40}?(" + "|".join(re.escape(n) for n in _CR_SECTION_NAMES) + r")(?: \((\d+)\))?\*\*$"
+)
+_CR_BOLD_SECTION_DEPTH = 0
+_CR_BOLD_ENTRY_DEPTH = 1
+# One HTML tag, bounded so a run of `<` cannot make the strip quadratic.
+_CR_TAG_RE = re.compile(r"<[^<>\n]{0,400}>")
+_CR_LINES_RE = re.compile(r"\d+(?:-\d+)?")
+_CR_SUMMARY_LOCATION = " · <code>"
+# The finding's own location line, `` `src/pkg/mod.py:120-124` ``. MEASURED: 28 of the
+# 32 summaries name only the file's BASENAME (`mod.py:120-124`) and every one of
+# those 28 carries this line with the full path; the other 4 name the full path
+# in the summary. The full path is the finding's identity in this channel: it is
+# the location the report prints and part of the dedupe key across re-reviews, so a
+# basename would name the wrong file, or merge two findings in same-named files.
+_CR_LOCATION_LINE_RE = re.compile(r"^`([^`\s]{1,400}):(\d+(?:-\d+)?)`$")
+_CR_LOCATION_LOOKAHEAD = 15
+
+
+def _cr_full_location(
+    lines: list[str], fence_mask: list[bool], depths: list[int], pos: int, path: str, span: str
+) -> str:
+    """The full path for a summary that may name only a basename (see above).
+
+    Looks ahead inside the SAME finding (depth at or below the entry's, up to the
+    next summary) for its location line, and takes it only when the line range
+    matches and the full path ends with the summary's path at a ``/`` boundary.
+    Anything else keeps the summary's own path.
+    """
+    for nxt in range(pos + 1, min(pos + 1 + _CR_LOCATION_LOOKAHEAD, len(lines))):
+        if fence_mask[nxt]:
+            continue
+        if depths[nxt] < _CR_BOLD_ENTRY_DEPTH:
+            break  # left the finding's <details>
+        text = lines[nxt].strip()
+        if text.startswith(("<summary>", "<details")):
+            break
+        found = _CR_LOCATION_LINE_RE.match(text)
+        if found:
+            full = html.unescape(found.group(1))
+            if found.group(2) == span and (full == path or full.endswith("/" + path)):
+                return full
+            break
+    return path
+
+
+def _cr_summary_entry(line: str) -> tuple[str, str, str, str] | None:
+    """``(path, lines, severity, title)`` from one second-layout finding summary.
+
+    String operations only (the text is third-party): the location is the LAST
+    ``· <code>…</code>`` field, the level the last word of the FIRST field once its
+    tags (an icon included) are removed. A summary of another shape returns None;
+    the section's declared count is what notices a finding that was not read. An
+    unknown level is returned as ``""``, the caller's unknown-severity canary.
+    """
+    if not line.startswith("<summary>"):
+        return None
+    end = line.find("</summary>")
+    if end < 0:
+        return None
+    inner = line[len("<summary>"):end]
+    if not inner.endswith("</code>"):
+        return None
+    at = inner.rfind(_CR_SUMMARY_LOCATION)
+    if at < 0:
+        return None
+    head = inner[:at]
+    split = head.find(" · ")
+    if split < 0:
+        return None
+    path, sep, lines = html.unescape(inner[at + len(_CR_SUMMARY_LOCATION):-len("</code>")]).rpartition(":")
+    if not sep or not path.strip() or not _CR_LINES_RE.fullmatch(lines):
+        return None
+    words = _CR_TAG_RE.sub(" ", head[:split]).split()
+    # The level field is the level word, after at most an emoji (`🟠 Major`) or an
+    # icon that the tag strip removed. A longer first field is not a level field,
+    # whatever its last word: unknown (the canary), never a guessed level.
+    severity = (
+        words[-1].casefold()
+        if 0 < len(words) <= 2 and words[-1].casefold() in _CR_SEVERITIES
+        else ""
+    )
+    # Unescaped for reading, then defanged: an entity can spell a carriage return
+    # or a bidi override, and this title is printed to the operator's terminal.
+    title = _defang_gate_text(html.unescape(_CR_TAG_RE.sub("", head[split + 3:]))).strip()[:120]
+    return path.strip(), lines, severity, title
+
 # Severity ORDER, for merging one finding restated across several reviews.
 # A dedupe that assigns (`seen[key] = severity`) is last-write-wins, and reviews
 # arrive oldest-first — so a Critical restated later as Minor, or restated with
@@ -2934,7 +3234,7 @@ def _cr_severity_inline(text: str) -> tuple[str | None, bool]:
 
 
 def _pr_review_bodies(pr_num: str, repo: str | None = None) -> tuple[list[dict] | None, bool]:
-    """Every review's ``{login, body, state}`` for a PR, paginated and fail-closed.
+    """Every review's ``{id, login, body, state}`` for a PR, paginated and fail-closed.
 
     Reuses ``_fetch_comments_paged`` for the hardened parts — page loop, the
     shared merge-deadline check BETWEEN pages, NEL-safe JSONL splitting, and the
@@ -2962,7 +3262,7 @@ def _pr_review_bodies(pr_num: str, repo: str | None = None) -> tuple[list[dict] 
         f"pulls/{pr_num}/reviews",
         pr_num,
         repo,
-        ".[] | {login: .user.login, body: .body, state: .state}",
+        ".[] | {id: .id, login: .user.login, body: .body, state: .state}",
     )
 
 
@@ -3401,7 +3701,8 @@ def _check_inline_review_findings(
         pr_num,
         repo,
         ".[] | {id: .id, reply_to: .in_reply_to_id, login: .user.login, "
-        "type: .user.type, assoc: .author_association, path: .path, body: .body}",
+        "type: .user.type, assoc: .author_association, path: .path, body: .body, "
+        "review_id: .pull_request_review_id}",
     )
     if raw is None:
         return _scan_unreadable("inline review comments")
@@ -3486,6 +3787,13 @@ def _check_inline_review_findings(
     cr_unknown: list[str] = []  # a severity header naming a level we don't know
     cr_doc_skipped: list[str] = []  # CodeRabbit Critical/Major on a doc path
     unmatched_bot: list[tuple[str, str]] = []  # (login, title) — read, unrecognised
+    # Which of those carry a P3 badge: informational by design (no parser
+    # scores P3), so they are not format drift. Indices into unmatched_bot.
+    informational: set[int] = set()
+    # Which logins the registry knows at all, and which of them is CodeQL: the
+    # unrecognised bucket is printed in three parts (see the NOTEs below).
+    known_review_logins = frozenset().union(*scanner_sets.values())
+    codeql_logins = scanner_sets.get("codeql", frozenset())
     # Off-diff findings (issue #1728): (title, path) — surfaced, never scored.
     cr_off_diff: list[tuple[str, str]] = []
     off_diff_p1: list[tuple[str, str]] = []
@@ -3583,7 +3891,11 @@ def _check_inline_review_findings(
         #
         # So an unrecognised author skips the matchers entirely and falls to the
         # unrecognised branch: SURFACED, never scored, never blocking.
-        parseable = utype == "Bot" or login in inline_review_logins
+        # CodeQL is surface-only (`review_findings.KNOWN_FORMATS`): its body is
+        # never searched for a severity badge, so it reaches only the CodeQL NOTE.
+        parseable = (
+            utype == "Bot" or login in inline_review_logins
+        ) and login not in codeql_logins
         if login in devin_logins and utype == "Bot":
             # EXCLUSIVE and terminal, and placed BEFORE the badge branches below:
             # Devin quotes guard output and code in its findings, so a body can
@@ -3789,6 +4101,8 @@ def _check_inline_review_findings(
             # protects the CodeRabbit path protects this one on the same terms.
             if c.get("id") in replied_to:
                 continue
+            if parseable and _INLINE_P3_RE.search(body):
+                informational.add(len(unmatched_bot))
             unmatched_bot.append((login, _inline_title(body)))
 
     # ── The SECOND delivery channel: findings CodeRabbit could not post inline ──
@@ -3796,22 +4110,23 @@ def _check_inline_review_findings(
     # folded into THIS scan's accumulators rather than given a blocking path of
     # their own — the one-score-one-threshold policy at `_CR_BLOCKING_WEIGHT`.
     #
-    # SEVERITY POLICY, and it deliberately differs from the inline path: only
-    # Critical scores. A Major here is surfaced loudly and does NOT block, because
-    # an undelivered finding has NO COMMENT THREAD — the maintainer-reply
+    # SEVERITY POLICY, and it deliberately differs from the inline path: NOTHING
+    # here scores, Critical included (owner ruling 2026-09-09; the channel was
+    # Critical-only before). Every finding is surfaced as a NOTE, because an
+    # undelivered finding has NO COMMENT THREAD — the maintainer-reply
     # engagement route that clears every other finding in this function does not
     # exist for it. Making it block would create findings satisfiable only by
     # fixing, never by disagreeing, on PRs anchored to lines they never touched.
-    # The floor (Critical) still binds, so the safety direction is kept while the
-    # disposition mechanism is built. MEASURED across the live queue when this
-    # shipped: 15 Major, 12 Minor, 0 Critical.
+    # MEASURED across the live queue when the channel first shipped: 15 Major,
+    # 12 Minor, 0 Critical.
     outside_critical: list[tuple[str, str]] = []  # surfaced, NEVER scored
     outside_major: list[tuple[str, str]] = []  # Major — surfaced loudly, 0.0
     # (label, path, severity) — the severity is carried so the report can
     # name the level the reviewer gave rather than one bucket for all of them.
     outside_minor: list[tuple[str, str, str]] = []  # below Major — surfaced, 0.0
-    # A body that declares more findings than this parser read: an INCOMPLETE
-    # scan, which blocks like any other incomplete read.
+    # Why a body's read is incomplete or unreliable (a section whose own count
+    # disagrees with its own entries, or a section at an unexpected depth). It
+    # prints the UNDER-REPORTING note; like the rest of this channel it never blocks.
     outside_shortfall: list[str] = []
     # Review bodies from an author this scan does not recognise — another bot, or
     # a human collaborator. Until this existed the loop below dropped them with a
@@ -3858,6 +4173,13 @@ def _check_inline_review_findings(
     # the one that keeps the obligation. Over-surfacing costs a printed line;
     # under-surfacing is the defect this whole scan exists to remove.
     outside_seen: dict[tuple[str, str, str], str] = {}
+    # Top-level inline comments each review actually POSTED, keyed by (login,
+    # review id): what a report body's "found N" count is checked against.
+    posted_by_review: dict[tuple[str, object], int] = {}
+    for c in raw:
+        if not c.get("reply_to") and c.get("review_id") is not None:
+            key = (c.get("login") or "", c.get("review_id"))
+            posted_by_review[key] = posted_by_review.get(key, 0) + 1
     for review in reviews:
         # Same deadline discipline as the fetch loop this follows: the parse is
         # the one CPU-bound phase here, and a PR with many re-reviews multiplies
@@ -3933,60 +4255,34 @@ def _check_inline_review_findings(
             # findings is a different capability and a different risk (see the
             # filed issue); awareness is the contract here.
             review_body = (review.get("body") or "").strip()
-            if review_body and not _is_wrapper_review_body(review_body):
+            if (
+                review_body
+                and not _is_wrapper_review_body(review_body)
+                and not (
+                    review_login in devin_logins
+                    and _is_settled_devin_report(
+                    review_body,
+                        posted_by_review.get((review_login, review.get("id")), 0),
+                    )
+                )
+            ):
                 unclassified_reviews.append(review_login)
             continue
-        parsed, declared, declared_known, depth_drift = _cr_outside_diff_entries(
+        parsed, _declared, _declared_known, unreadable = _cr_outside_diff_entries(
             review.get("body") or ""
         )
-        # A section found as REAL STRUCTURE at an unexpected <details> depth is
-        # a layout change in a document we do not control. Nothing else can see
-        # it — the count reconciliation reads its numbers from the very match
-        # this drift prevents — so it blocks as unreadable rather than letting
-        # the scan report clean.
-        outside_shortfall.extend(depth_drift)
-        if declared_known and len(parsed) > declared:
-            # The OTHER direction of the same reconciliation: more entries than
-            # the body's own headers declare means prose was mis-parsed as a
-            # finding — the phantom-Critical shape (Codex P2, PR #1847). We
-            # cannot tell WHICH entries are phantoms, so the read is unreliable
-            # rather than merely noisy, and it blocks as unreadable exactly
-            # like the shortfall — an explained stop beats a false block that
-            # names a finding nobody wrote. Only licensed when every section
-            # header stated its count (`declared_known`).
-            outside_shortfall.append(
-                f"outside-diff section declares {declared} finding(s) but "
-                f"{len(parsed)} were parsed — surplus entries indicate prose "
-                f"mis-read as findings"
-            )
-            # QUARANTINE the batch rather than merging it. Without this the
-            # entries still reached the score, and a phantom Critical among
-            # them returned the ordinary block message NAMING it as a real
-            # finding — the score branch returns before the shortfall check —
-            # so this check's own explained stop never surfaced in exactly the
-            # case it was written for. Both directions still block; what this
-            # buys is that the message is true. The asymmetry with the
-            # shortfall branch below is deliberate: an UNDER-parse's entries
-            # were read correctly and should still block on their own terms,
-            # while a SURPLUS means some entry in this batch is fictional and
-            # nothing here can say which.
-            continue
-        if declared > len(parsed):
-            # The body's own header says it carries more than this parser found,
-            # so the read is INCOMPLETE — and an incomplete finding scan blocks
-            # here exactly as `_scan_unreadable` does, rather than degrading to
-            # a note. Under-parsing is the fail-OPEN direction: a format shift,
-            # or content crafted to hide a finding from the parser, both surface
-            # as a quiet reduction in findings that looks just like a cleaner PR.
-            #
-            # This is also the backstop for the one suppression shape the fence
-            # mask cannot judge: a BALANCED fence spanning a real finding is
-            # indistinguishable from legitimately quoted content, so the mask
-            # correctly hides it — and the count is what notices it went missing.
-            outside_shortfall.append(
-                f"outside-diff section declares {declared} finding(s), parsed "
-                f"{len(parsed)}"
-            )
+        # Every reason this body's read is incomplete or unreliable: a section at
+        # an unexpected <details> depth (a layout change nothing else can see,
+        # because the count is read from the very match the drift prevents), and
+        # each counted section whose own entries disagree with its own count.
+        # The reconciliation is PER SECTION inside the reader, never body-wide
+        # here: with totals, one section's surplus cancels another's shortfall
+        # and a countless section offsets a counted one's missing finding
+        # (CodeRabbit, round 2 of #3827). A section that over-reads is already
+        # quarantined there, so what arrives in `parsed` is only what reconciled
+        # or was read short (real entries), plus countless sections' entries.
+        # Advisory: each reason becomes the UNDER-REPORTING note, never a block.
+        outside_shortfall.extend(unreadable)
         for path, line_range, severity, title in parsed:
             key = (path, line_range, title)
             prev = outside_seen.get(key)
@@ -4002,7 +4298,14 @@ def _check_inline_review_findings(
         # carry ESC, CR or bidi straight into this label. Rendered at display
         # time because the raw value is still needed for the diff-scope match
         # carried alongside it in the tuples below.
-        label = f"{title or '(untitled)'} ({_safe_report_path(path)}:{line_range})"
+        # ONE safe line, made where it is printed: the title and span come from
+        # CodeRabbit's text in either layout, and an unescaped `&#10;` (second
+        # layout) or a raw escape code (first layout) would otherwise print a
+        # forged extra report line (CodeRabbit, PR #3827). The path part is
+        # already made safe by `_safe_report_path`.
+        label = _one_safe_line(
+            f"{title or '(untitled)'} ({_safe_report_path(path)}:{line_range})"
+        )
         if not severity:
             cr_unknown.append(label)
         elif severity == "critical":
@@ -4046,22 +4349,66 @@ def _check_inline_review_findings(
         for label, _p, sev in outside_minor:
             print(f"  [outside-diff {sev.capitalize() or 'Minor'}] {label}", file=sys.stderr)
 
-    if unmatched_bot:
+    # The unrecognised bucket, printed in THREE parts because they ask for
+    # different reads (issue #2417). A CodeQL alert is a security scanner's
+    # finding with its own dismissal workflow: before this split it shared one
+    # NOTE, bounded to 5 lines, with format drift and strangers, so it read as
+    # noise. A known reviewer in a format no parser reads is format drift, which
+    # is a gate bug to fix. An author the registry does not know is a new voice
+    # to read. All three stay surfaced, never scored, never blocking, and the
+    # JSON count (`unrecognised_reviewer`) still totals all three.
+    codeql_found = [t for who, t in unmatched_bot if who in codeql_logins]
+    p3_notes = [
+        (who, t)
+        for i, (who, t) in enumerate(unmatched_bot)
+        if i in informational and who in known_review_logins and who not in codeql_logins
+    ]
+    drift = [
+        (who, t)
+        for i, (who, t) in enumerate(unmatched_bot)
+        if i not in informational and who in known_review_logins and who not in codeql_logins
+    ]
+    strangers = [(who, t) for who, t in unmatched_bot if who not in known_review_logins]
+    if p3_notes:
         print(
-            f"NOTE: PR #{pr_num} — {len(unmatched_bot)} inline review comment(s) in a "
-            f"format this gate does not recognise, or from an author it does not "
-            f"know. NOT scored — read them yourself; listed so a reviewer cannot "
-            f"be silently invisible:",
+            f"NOTE: PR #{pr_num} — {len(p3_notes)} P3 note(s) from a known reviewer. "
+            f"Informational by design: NOT scored and NOT blocking, but read them:",
             file=sys.stderr,
         )
-        for bot_login, title in unmatched_bot[:5]:
-            print(f"  [unrecognised: {bot_login}] {title}", file=sys.stderr)
-        if len(unmatched_bot) > 5:
-            print(
-                f"  … and {len(unmatched_bot) - 5} more (listing bounded to 5; the "
-                f"count above is the total)",
-                file=sys.stderr,
-            )
+        for bot_login, title in p3_notes[:_UNRECOGNISED_LISTED]:
+            print(f"  [P3: {bot_login}] {title}", file=sys.stderr)
+        _print_listing_rest(len(p3_notes))
+    if codeql_found:
+        print(
+            f"NOTE: PR #{pr_num} — {len(codeql_found)} inline CodeQL security finding(s) "
+            f"that no owner, member or collaborator has answered in its thread. NOT scored and NOT blocking (an alert has its "
+            f"own dismissal workflow), but read each one: fix it, or dismiss the "
+            f"alert with a reason and reply in its thread:",
+            file=sys.stderr,
+        )
+        for title in codeql_found[:_UNRECOGNISED_LISTED]:
+            print(f"  [CodeQL] {title}", file=sys.stderr)
+        _print_listing_rest(len(codeql_found))
+    if drift:
+        print(
+            f"NOTE: PR #{pr_num} — {len(drift)} inline comment(s) from a KNOWN "
+            f"reviewer in a format this gate does not parse (format drift, a gate "
+            f"bug). NOT scored — read them yourself:",
+            file=sys.stderr,
+        )
+        for bot_login, title in drift[:_UNRECOGNISED_LISTED]:
+            print(f"  [unrecognised format: {bot_login}] {title}", file=sys.stderr)
+        _print_listing_rest(len(drift))
+    if strangers:
+        print(
+            f"NOTE: PR #{pr_num} — {len(strangers)} inline review comment(s) from an "
+            f"author this gate does not know. NOT scored — read them yourself; "
+            f"listed so a reviewer cannot be silently invisible:",
+            file=sys.stderr,
+        )
+        for bot_login, title in strangers[:_UNRECOGNISED_LISTED]:
+            print(f"  [unrecognised reviewer: {bot_login}] {title}", file=sys.stderr)
+        _print_listing_rest(len(strangers))
     if unclassified_reviews:
         # The SECOND channel's version of the same silent drop. Logins only — no
         # body text: this NOTE's line 0 is not the one `check_pr_report` renders
@@ -5927,14 +6274,14 @@ _HOOK_SURFACE_FILES = (
         {
             "scripts/bash_safety_hook.sh",  # the global Bash chokepoint
             "scripts/review_scope.py",  # substantiality classifier (feeds THIS gate)
-            "scripts/review_state.py",  # escalation counter + review markers
+            "scripts/review_state.py",  # review markers + evidence
             "scripts/review_budget.py",  # distinct-head policy evaluator
             "scripts/review_findings.py",  # reviewer list + severity parsers
             "scripts/review_reflection.py",  # round reflection tool + validator
             "scripts/review_late.py",  # late findings the round reflection owes
             "scripts/review_deadline.py",  # aggregate hook timeout arithmetic
             "scripts/external_review.py",  # autonomous review-request boundary
-            "scripts/lib/gate_menu.py",  # cap decision menu shown to the user
+            "scripts/premise_gate.py",  # issue premise rule issue_premise_gate imports
             ".claude/settings.json",  # hook wiring (inline blob + matchers)
             # scripts/-root hooks wired via .claude/hooks/genesis-hook (which
             # resolves bare names as scripts/<name>); scripts/hooks/* wirings are
@@ -10006,6 +10353,300 @@ def _check_pin_receipts(pr_num: str, repo: str | None = None) -> tuple[bool, str
     return verdict.blocked, verdict.message
 
 
+# --- stale-base: the PR's CI predates base merges to its files (merge collision) ---
+
+#: Seconds subtracted from the CI run's creation time before reading the base's
+#: commits. A squash merge's committer date sits 0-1 s before its mergedAt
+#: (MEASURED 2026-10-28), and the run's merge ref is built moments before the run
+#: exists, so a merge in that window may be missing from what CI tested. Reading
+#: early can only add a NOTE, never hide one.
+_STALE_BASE_PAD_S = 5
+#: One page of a path's base commits. A full page means older ones went unread,
+#: which the NOTE states.
+_STALE_BASE_COMMITS_PAGE = 100
+#: Counted paths read (one call each). MEASURED 2026-10-29 over 100 merged PRs:
+#: the median PR changes 6 files and the 90th percentile 14, so 40 covers nearly
+#: every PR; the rest are named as not checked, never treated as untouched.
+_STALE_BASE_PATH_READS = 40
+#: Wall-clock budget for those reads; each read's own timeout is clamped to what
+#: is left. MEASURED 2026-10-29: one path read took 0.58 s, so 40 need about 23 s.
+_STALE_BASE_BUDGET_S = 30.0
+#: How many overlapping paths, and commits per path, the NOTE names before
+#: stating how many it left out.
+_STALE_BASE_PATHS_LISTED = 10
+_STALE_BASE_COMMITS_LISTED = 3
+def _stale_base_counts(path: str) -> bool:
+    """Is an overlap on *path* worth a NOTE? Code and config are; prose is not.
+
+    Prose overlaps are not counted (owner ruling 2026-10-29): files many PRs edit
+    (docs/architecture/CURRENT.md, the skills) overlap constantly and do not break
+    a build. MEASURED over the 490 PRs merged to main from 2026-09-29 to 10-29, any
+    overlap would have fired on 136 and a code-file overlap on 57, and both sets
+    held the one real overlap collision.
+
+    What counts as prose is :func:`_is_doc_path`'s answer, not a list of its own.
+    A suffix list here once treated every ``.txt`` as prose, which hid a CI
+    dependency manifest (``.github/test-tools/requirements.txt``); ``_is_doc_path``
+    takes ``.txt`` as prose only on a documentation name such as ``README``.
+    """
+    return not _is_doc_path(path)
+
+
+def _stale_base_note(pr_num: str, repo: str | None = None, head: str | None = None) -> str | None:
+    """A NOTE when the PR's newest CI run predates base commits touching its code.
+
+    WHY: a ``pull_request`` run tests the PR merged onto its base AS IT STOOD when
+    the run was created. A later merge to the base that changes the same files was
+    never tested together with this PR. MEASURED 2026-09-28 to 10-28: one of the two
+    cross-PR collisions that turned main red had exactly this shape (a PR's only CI
+    run was two days older than a main merge to the same file). A file overlap is a
+    lead, not proof: the other collision shared no files, and most overlaps merge
+    cleanly. Only code and config overlaps count; prose, as ``_is_doc_path``
+    defines it, does not (``_stale_base_counts``).
+
+    GUARD AXIOMS (owner rulings 2026-10-28/29: advisory, never a block):
+      * VERDICT: advisory. Report-only; it never counts toward ``failures`` and the
+        merge arm does not call it.
+      * AUDIENCE: the agent driving the merge. The NOTE names the shared paths and
+        the base commits that changed them, and asks the agent to weigh whether
+        they interact with this PR's change; only if they may, update the branch so
+        CI runs on the current base (an update moves the head, which costs a CI run
+        and a review request). A re-run does not help, because a re-run keeps the
+        original event's ``GITHUB_SHA`` (CITED: GitHub docs, "Re-running workflows
+        and jobs", read 2026-10-29), and so keeps the old merge commit.
+      * BACKGROUND: none — it runs only in the ``--check-pr`` report.
+
+    THE ANCHOR is the run's creation time, never the base sha the run's
+    ``pull_requests`` entry carries. MEASURED 2026-10-29: a run created at 13:41Z
+    named a base sha four main commits older than main at 13:41Z; that field is the
+    PR's stored base, not what the run tested. With several required workflows the
+    OLDEST of their newest runs is the anchor. A workflow with no run on the head,
+    or whose runs cannot be read, is skipped; the ``ci`` row speaks for it.
+
+    THE READ is one call per counted path the PR changes: the base's commits to
+    that path since the anchor. That attributes every overlap exactly and has no
+    window over the base's history, so a PR whose CI is weeks old is read as fully
+    as one from an hour ago. Paths past the read cap or the budget, a failed read,
+    and a full page are each stated: when nothing overlaps but something went
+    unread, the NOTE still prints, saying how much was not checked, because
+    silence would read as "nothing to weigh". Any other read failure (base, runs,
+    the PR's files) or no overlap returns None. The caller sanitizes every line.
+
+    Tests inject ``_TEST_GH_PR_CI_RUNS`` (a JSON object mapping workflow name to an
+    array shaped like ``gh run list --json databaseId,createdAt``),
+    ``_TEST_GH_PATH_COMMITS_SINCE`` (a JSON object mapping path to an array of
+    ``{sha, subject}``, or ``"__error__"``; an unnamed path reads as unreadable),
+    and reuse ``_TEST_GH_PR_FILES`` and ``_TEST_GH_BASE_REF``.
+    ``_TEST_STALE_BASE_NOTE=off`` skips every read: the hook-test conftest sets it
+    so report tests make no live call.
+    """
+    if os.environ.get("_TEST_STALE_BASE_NOTE") == "off":
+        return None
+    # No verified head (Codex has not reviewed it yet): read the live one. Only
+    # here, after the off switch, so a switched-off NOTE makes no read at all.
+    head = head or _pr_head_sha(pr_num, repo)
+    if not head:
+        return None
+    base = _pr_base_ref(pr_num, repo)
+    if not base:
+        return None
+    anchor: _dt.datetime | None = None
+    anchor_wf, anchor_run = "", ""
+    for workflow in _required_ci_workflows():
+        run = _newest_pr_ci_run(head, workflow, repo)
+        if not run:  # unreadable (None) or no run of it on this head (())
+            continue
+        created, run_id = run
+        if anchor is None or created < anchor:
+            anchor, anchor_wf, anchor_run = created, workflow, run_id
+    if anchor is None:
+        return None
+    pr_files = _pr_changed_files(pr_num, repo)
+    if pr_files is None:
+        return None
+    paths = sorted({p for p in pr_files if _stale_base_counts(p)})
+    if not paths:
+        return None
+    since = (anchor - _dt.timedelta(seconds=_STALE_BASE_PAD_S)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    deadline = time.monotonic() + _STALE_BASE_BUDGET_S
+    overlaps: list[tuple[str, list[tuple[str, str]]]] = []
+    unread: list[str] = []
+    full: list[str] = []
+    for i, path in enumerate(paths):
+        left = deadline - time.monotonic()
+        if i >= _STALE_BASE_PATH_READS or left <= 0:
+            unread += paths[i:]
+            break
+        commits = _base_commits_to_path(base, path, since, repo, timeout=min(8.0, left))
+        if commits is None:
+            unread.append(path)
+        elif commits:
+            overlaps.append((path, commits))
+            if len(commits) >= _STALE_BASE_COMMITS_PAGE:
+                full.append(path)
+    if not overlaps and not unread:
+        return None
+    when = anchor.strftime("%Y-%m-%d %H:%M:%SZ")
+    # One idea per line: the caller's sanitizer cuts any line over
+    # _GATE_TEXT_MAX_CHARS in the middle, which is where the advice would sit.
+    if overlaps:
+        lines = [
+            f"NOTE: PR #{pr_num} — base commits since its newest {anchor_wf} run changed "
+            f"code this PR also changes.",
+            f"Run {anchor_run} was created {when}; since then {base} changed "
+            f"{len(overlaps)} of this PR's {len(paths)} code path(s), so its CI never "
+            f"ran with them.",
+        ]
+    else:
+        lines = [
+            f"NOTE: PR #{pr_num} — {len(unread)} of this PR's {len(paths)} code path(s) "
+            f"were not checked for {base} commits since its newest {anchor_wf} run.",
+            f"Run {anchor_run} was created {when}; nothing checked overlaps, but the "
+            f"unchecked paths may.",
+        ]
+    for path, commits in overlaps[:_STALE_BASE_PATHS_LISTED]:
+        lines.append(f"{_safe_path(path)}:")
+        for sha, subject in commits[:_STALE_BASE_COMMITS_LISTED]:
+            lines.append(f"  {sha[:12]} {subject}")
+        if len(commits) > _STALE_BASE_COMMITS_LISTED:
+            at_least = "at least " if path in full else ""
+            lines.append(f"  (+{at_least}{len(commits) - _STALE_BASE_COMMITS_LISTED} more)")
+    if len(overlaps) > _STALE_BASE_PATHS_LISTED:
+        lines.append(f"(+{len(overlaps) - _STALE_BASE_PATHS_LISTED} more path(s) not listed)")
+    if unread and overlaps:
+        lines.append(f"{len(unread)} of {len(paths)} code path(s) were not checked.")
+    update = " ".join(["gh pr update-branch", pr_num, *_repo_args(repo)])
+    lines += [
+        "Weigh it before merging: do those changes interact with this PR's? Most "
+        "overlaps merge cleanly.",
+        f"If they may, update the branch ({update}, or a merge or rebase) so CI runs "
+        f"on the current base.",
+        "That moves the head, so the review gate then needs a review of the new head.",
+        "Re-running the old run does not help: a re-run tests the same merge commit.",
+    ]
+    return "\n".join(lines)
+
+
+def _newest_pr_ci_run(
+    head: str, workflow: str, repo: str | None = None
+) -> tuple[_dt.datetime, str] | tuple[()] | None:
+    """``(created_at, run_id)`` of the newest ``pull_request`` run of *workflow* on
+    *head*, ``()`` when that head has none, or None when it cannot be read.
+
+    ``gh run list`` returns runs newest first (MEASURED 2026-10-29). A re-attempt
+    keeps its run's creation time, which is right here: it reuses the same merge
+    commit. Only ``pull_request`` runs count: another event (a manual dispatch)
+    tests the bare head, not a merge with the base.
+    """
+    raw_map = os.environ.get("_TEST_GH_PR_CI_RUNS")
+    if raw_map is not None:
+        try:
+            raw = json.dumps(json.loads(raw_map).get(workflow, []))
+        except (ValueError, AttributeError):
+            return None
+    else:
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "run",
+                    "list",
+                    *_repo_args(repo),
+                    "--commit",
+                    head,
+                    "--workflow",
+                    workflow,
+                    "--event",
+                    "pull_request",
+                    "--limit",
+                    "1",
+                    "--json",
+                    "databaseId,createdAt",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=_gh_timeout(8),
+            )
+        except Exception:  # noqa: BLE001 - advisory: silent on a failed read
+            return None
+        if result.returncode != 0:
+            return None
+        raw = result.stdout
+    try:
+        runs = json.loads(raw or "[]")
+    except ValueError:
+        return None
+    if not isinstance(runs, list):
+        return None
+    if not runs:
+        return ()
+    run = runs[0]
+    if not isinstance(run, dict):
+        return None
+    run_id = str(run.get("databaseId") or "")
+    try:
+        created = _dt.datetime.strptime(str(run.get("createdAt")), "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+    if not run_id.isdigit():
+        return None
+    return created.replace(tzinfo=_dt.UTC), run_id
+
+
+def _base_commits_to_path(
+    base: str, path: str, since: str, repo: str | None = None, *, timeout: float = 8.0
+) -> list[tuple[str, str]] | None:
+    """``[(sha, subject), ...]``: commits on *base* to *path* since *since* (ISO,
+    UTC), newest first, at most one page of ``_STALE_BASE_COMMITS_PAGE``; None when
+    unreadable.
+
+    ``since`` is inclusive: MEASURED 2026-10-29, a commit whose committer date
+    equals it is returned. The branch and path are URL-encoded into the query.
+    """
+    raw_map = os.environ.get("_TEST_GH_PATH_COMMITS_SINCE")
+    if raw_map is not None:
+        try:
+            rows = json.loads(raw_map).get(path, "__error__")
+        except (ValueError, AttributeError):
+            return None
+    else:
+        from urllib.parse import quote
+
+        try:
+            result = subprocess.run(
+                [
+                    "gh",
+                    "api",
+                    f"repos/{repo or ':owner/:repo'}/commits?sha={quote(base, safe='')}"
+                    f"&path={quote(path, safe='')}&since={since}"
+                    f"&per_page={_STALE_BASE_COMMITS_PAGE}",
+                    "--jq",
+                    '[.[] | {sha: .sha, subject: (.commit.message | split("\\n")[0])}]',
+                ],
+                capture_output=True,
+                text=True,
+                timeout=max(0.1, timeout),
+            )
+        except Exception:  # noqa: BLE001 - advisory: an unreadable path is stated
+            return None
+        if result.returncode != 0:
+            return None
+        try:
+            rows = json.loads(result.stdout or "[]")
+        except ValueError:
+            return None
+    if not isinstance(rows, list):
+        return None
+    out: list[tuple[str, str]] = []
+    for r in rows:
+        sha = r.get("sha") if isinstance(r, dict) else None
+        if not isinstance(sha, str) or not sha:
+            return None
+        subject = r.get("subject")
+        out.append((sha, subject if isinstance(subject, str) else ""))
+    return out
+
+
 # --- main-reverts: a merge-from-main that kept the branch's stale copies (#2809) ---
 
 #: The four states `_check_main_reverts` reports (guard failure semantics, rule 1).
@@ -10417,6 +11058,182 @@ def _check_main_reverts(pr_num: str, repo: str | None = None) -> tuple[str, str]
         "Advisory only: this row never blocks a merge.",
     ]
     return MAIN_REVERTS_FINDINGS, "\n".join(lines)
+
+
+# --- main-ci: the base branch's own CI is red (cross-PR merge collision) ---
+
+#: Conclusions that say nothing about the base's health: a run cancelled because
+#: a newer push superseded it, one that never ran its jobs, or one waiting on an
+#: approval (``action_required``). Passed over.
+_MAIN_CI_NO_SIGNAL = frozenset(
+    {"cancelled", "skipped", "neutral", "stale", "action_required", ""}
+)
+#: Conclusions that mean the base is red.
+_MAIN_CI_RED = frozenset({"failure", "timed_out", "startup_failure"})
+#: How many of the base's newest push runs are read to find a completed one. Many
+#: are cancelled by the next push: MEASURED 2026-10-29 over main's last 500 CI push
+#: runs, the longest streak without a signal was 8 runs, and 43 of the last 100
+#: were cancelled. A longer streak leaves the NOTE silent, never wrong.
+_MAIN_CI_RUN_LIMIT = 30
+
+
+def _main_ci_red_note(pr_num: str, repo: str | None = None) -> str | None:
+    """A NOTE when the PR's base branch's latest completed CI run is red, else None.
+
+    WHY: a PR's own CI ran on its base as it stood then. MEASURED 2026-09-28 to
+    10-28: main's CI went red 15 times in 481 push runs; 14 PRs merged onto an
+    already-red main across 8 of the 11 red windows. None of those merges caused
+    the red, but each landed without a signal about itself, and a red base is when
+    a cross-PR collision would go unnoticed.
+
+    GUARD AXIOMS (owner ruling 2026-10-28: advisory, never a block):
+      * VERDICT: advisory. Report-only; it never counts toward ``failures`` and the
+        merge arm does not call it.
+      * AUDIENCE: the agent driving the merge. The NOTE names the run, its head and
+        the failing jobs, and asks the agent to weigh them; it never says "do not
+        merge" (most red bases in the measurement were flakes or infra, unrelated to
+        the PR merging onto them).
+      * BACKGROUND: none — it runs only in the ``--check-pr`` report.
+
+    Reads, per required CI workflow (``_required_ci_workflows``): the base branch's
+    newest push runs, passing over cancelled and skipped ones, and for a red run its
+    failing job names. Every red workflow gets its own block. A workflow whose runs
+    cannot be read, or with no completed run in reach, is skipped; when none is red
+    the result is None: the NOTE is silent rather than wrong. That includes the CI merge-gate workflows,
+    whose token has no ``actions: read``, so the NOTE appears only in a local
+    ``--check-pr``. "Latest completed" is literal: newer runs not yet completed are
+    counted on a detail line, since one of them may carry the fix. The caller
+    sanitizes every line before printing.
+
+    Tests inject ``_TEST_GH_MAIN_CI_RUNS`` (a JSON array shaped like ``gh run list
+    --json databaseId,status,conclusion,headSha``, used for every workflow, or an
+    object mapping workflow name to such an array, where a name it lacks or the
+    value ``"__error__"`` reads as unreadable) and ``_TEST_GH_RUN_FAILED_JOBS`` (a
+    JSON array of job names, or ``"__error__"``). ``_TEST_MAIN_CI_NOTE=off`` skips every read: the
+    hook-test conftest sets it so report tests make no live call.
+    """
+    if os.environ.get("_TEST_MAIN_CI_NOTE") == "off":
+        return None
+    base = _pr_base_ref(pr_num, repo)
+    if not base:
+        return None
+    blocks = [
+        block
+        for workflow in _required_ci_workflows()
+        if (block := _main_ci_red_block(pr_num, base, workflow, repo))
+    ]
+    return "\n".join(blocks) if blocks else None
+
+
+def _main_ci_runs(base: str, workflow: str, repo: str | None) -> list | None:
+    """The base's newest push runs of *workflow*, newest first; None when unreadable."""
+    raw = os.environ.get("_TEST_GH_MAIN_CI_RUNS")
+    if raw is not None:
+        try:
+            seeded = json.loads(raw)
+        except ValueError:
+            return None
+        if isinstance(seeded, dict):
+            seeded = seeded.get(workflow, "__error__")
+        return seeded if isinstance(seeded, list) else None
+    try:
+        result = subprocess.run(
+            [
+                "gh", "run", "list", *_repo_args(repo),
+                "--workflow", workflow, "--branch", base, "--event", "push",
+                "--limit", str(_MAIN_CI_RUN_LIMIT),
+                "--json", "databaseId,status,conclusion,headSha",
+            ],
+            capture_output=True, text=True, timeout=_gh_timeout(8),
+        )
+    except Exception:  # noqa: BLE001 - advisory: an unreadable workflow is skipped
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        runs = json.loads(result.stdout or "[]")
+    except ValueError:
+        return None
+    return runs if isinstance(runs, list) else None
+
+
+def _main_ci_red_block(pr_num: str, base: str, workflow: str, repo: str | None) -> str | None:
+    """The NOTE lines for one required workflow whose latest completed run is red."""
+    runs = _main_ci_runs(base, workflow, repo)
+    if runs is None:
+        return None
+    latest = next(
+        (
+            r for r in runs
+            if isinstance(r, dict)
+            and r.get("status") == "completed"
+            and (r.get("conclusion") or "") not in _MAIN_CI_NO_SIGNAL
+        ),
+        None,
+    )
+    if latest is None or latest.get("conclusion") not in _MAIN_CI_RED:
+        return None
+    newer_pending = sum(
+        1
+        for r in runs[: runs.index(latest)]
+        if isinstance(r, dict) and r.get("status") != "completed"
+    )
+    run_id = str(latest.get("databaseId") or "")
+    if not run_id.isdigit():
+        return None
+    jobs = _run_failed_jobs(run_id, repo)
+    if jobs is None:
+        listed = "(could not be read)"
+    elif jobs:
+        listed = ", ".join(jobs)
+    else:
+        listed = "none reported as failed or timed out (see the run)"
+    head = str(latest.get("headSha") or "")[:12]
+    view = " ".join(["gh run view", run_id, *_repo_args(repo), "--log-failed"])
+    # One idea per line: the caller's sanitizer cuts any line over
+    # _GATE_TEXT_MAX_CHARS in the middle, which is where the advice would sit.
+    lines = [
+        f"NOTE: PR #{pr_num} — {base}'s latest conclusive {workflow} run {run_id} "
+        f"(head {head}) is {latest.get('conclusion')}.",
+        "Merging lands this PR on a red base, with no signal about it.",
+        "failing jobs: " + listed,
+        "Weigh it before merging: does this PR touch what those jobs test, or fix them?",
+        "A flake or infra failure on the base is no reason to hold an unrelated PR.",
+        f"Details: {view}",
+    ]
+    if newer_pending:
+        lines.append(
+            f"{newer_pending} newer {workflow} run(s) on {base} have not completed yet; "
+            f"one may carry the fix."
+        )
+    return "\n".join(lines)
+
+
+def _run_failed_jobs(run_id: str, repo: str | None = None) -> list[str] | None:
+    """Names of a run's failed or timed-out jobs: ``[]`` when it has none (a
+    workflow-level failure), None when the job list cannot be read."""
+    raw = os.environ.get("_TEST_GH_RUN_FAILED_JOBS")
+    if raw is None:
+        try:
+            result = subprocess.run(
+                [
+                    "gh", "run", "view", run_id, *_repo_args(repo), "--json", "jobs",
+                    "--jq", '[.jobs[] | select(.conclusion=="failure" or .conclusion=="timed_out") | .name]',
+                ],
+                capture_output=True, text=True, timeout=_gh_timeout(8),
+            )
+        except Exception:  # noqa: BLE001 - advisory: an unreadable job list is shown as such
+            return None
+        if result.returncode != 0:
+            return None
+        raw = result.stdout
+    try:
+        names = json.loads(raw or "[]")
+    except ValueError:
+        return None
+    if not isinstance(names, list):
+        return None
+    return [str(n) for n in names if isinstance(n, str)]
 
 
 # --- rework: a rebuild of a sent-back PR carries its contract (owner decision) ---
@@ -14567,7 +15384,7 @@ def main() -> int:
     single hole in "every override attempt leaves a row", and it fails in the
     direction of a MISSING record, never a false one.
     """
-    global _ASK_EMITTED
+    global _ASK_EMITTED, _merge_deadline
     _PENDING_OVERRIDES.clear()  # a second call in-process must not inherit rows
     _MERGE_READ_CACHE.clear()  # nor reads cached during another invocation
     _ASK_EMITTED = False
@@ -14579,6 +15396,14 @@ def main() -> int:
         outcome = "blocked" if rc == 2 else ("asked" if _ASK_EMITTED else "allowed")
         return rc
     finally:
+        # Nor may anything that runs in-process after this call inherit its
+        # deadline (#2904): once it expires, `_gh_timeout` raises, and a later
+        # direct call such as `_commit_at_prefix` fails for a reason that has
+        # nothing to do with it. Disarmed on EXIT rather than entry, because the
+        # leak reaches calls that never go through main() again. And BEFORE the
+        # flush, so a flush that raises cannot skip it. The production hook is one
+        # process per call, so this changes nothing there.
+        _merge_deadline = None
         _flush_overrides(outcome)
 
 
@@ -14784,12 +15609,14 @@ def _run_merge_and_push_gates() -> int:
             # their sharper diagnostics. Bounds keep main's immediate refusal.
             blind_spot_deny = (
                 f"BLOCKED: this command {blind.cause} and mentions a gated "
-                "operation, so the guard cannot verify what it would actually run.\n"
+                "operation; a Git or GitHub operation may run, and the guard "
+                "cannot establish which one.\n"
                 f"To proceed: {blind.hint}. If you are WRITING TEXT (a commit "
                 "message, a plan, review notes) whose content merely mentions "
                 "push or merge, use the Write tool instead of a here-doc. If "
-                "you are RUNNING a git command, rewrite it in a "
-                "directly-parseable form (plain quotes, or -F <file>)."
+                "you are RUNNING a git command, split unreadable compounds or "
+                "rewrite it in a directly-parseable form (plain quotes, or "
+                "-F <file>)."
             )
             if blind.bounds_induced:
                 print(blind_spot_deny, file=sys.stderr)
@@ -16417,6 +17244,14 @@ def _gate_text_unsafe(char: str) -> bool:
     return unicodedata.category(char) in _GATE_TEXT_UNSAFE_CATEGORIES
 
 
+def _one_safe_line(text: str) -> str:
+    """*text* as ONE report line: every terminal-acting character, line breaks
+    included, becomes a space (``_defang_gate_text`` keeps ``\n`` on purpose,
+    for multi-line messages), and the result is bounded with a stated omission.
+    """
+    return _bound_with_stated_omission("".join(" " if _gate_text_unsafe(ch) else ch for ch in text))
+
+
 def _defang_gate_text(text: str) -> str:
     """Neutralise terminal-acting characters WITHOUT bounding the length.
 
@@ -16824,6 +17659,18 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     if blocked:
         _print_gate_detail(msg)
     failures += 1 if blocked else 0
+    # A CI run older than base merges to the PR's files (cross-PR merge collision;
+    # owner ruling 2026-10-28) — ADVISORY: a stderr NOTE only, never a row in the
+    # verdict, and never run by the merge arm.
+    try:
+        stale_note = _stale_base_note(pr_num, repo=repo, head=verified_head)
+    except Exception:  # noqa: BLE001 - an advisory NOTE never takes the report down.
+        stale_note = None
+    if stale_note:
+        first, *rest = _sanitize_gate_text(stale_note).split("\n")
+        print(first, file=sys.stderr)
+        for line in rest:
+            print(f"  {line}", file=sys.stderr)
     # Merge-from-main reverts (#2809) — ADVISORY, like `e2e-plan` and `rounds`: it
     # NEVER touches `failures`, and the merge arm does not run it, so the report and
     # enforcement cannot disagree about it. Four states, rendered distinctly so a
@@ -16843,6 +17690,18 @@ def check_pr_report(pr_num: str, repo: str | None = None) -> int:
     else:
         print(f"main-reverts   : could not check — {mr_head}")
     _print_gate_detail(mr_msg)
+    # A red base branch (cross-PR merge collision; owner ruling 2026-10-28) —
+    # ADVISORY: a stderr NOTE only when the base's latest completed CI run is red,
+    # never a row in the verdict, and never run by the merge arm.
+    try:
+        main_ci_note = _main_ci_red_note(pr_num, repo=repo)
+    except Exception:  # noqa: BLE001 - an advisory NOTE never takes the report down.
+        main_ci_note = None
+    if main_ci_note:
+        first, *rest = _sanitize_gate_text(main_ci_note).split("\n")
+        print(first, file=sys.stderr)
+        for line in rest:
+            print("  " + line, file=sys.stderr)
     # Rework contract (owner decision) — BLOCKING, in the pin-receipts pattern: the
     # merge arm runs the SAME function with the same verified head, so the two agree.
     # `_check_rework` never raises (its deadline/exception mapping is internal).

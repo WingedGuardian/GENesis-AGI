@@ -18,14 +18,13 @@ unique, fsynced spool files that the same importer coalesces into SQLite.
 
 from __future__ import annotations
 
-import argparse
 import errno
 import fcntl
 import hashlib
+import importlib.util
 import json
 import math
 import os
-import re
 import secrets
 import sqlite3
 import sys
@@ -34,23 +33,68 @@ import time
 from contextlib import contextmanager, suppress
 from pathlib import Path
 
-MAX_ATTEMPTS = 5
 FULL_INTERVAL_S = 7 * 24 * 3600
 FULL_BACKOFF_S = 24 * 3600
-VALID_TOOLS = ("cbm", "gitnexus", "both")
-VALID_MODES = ("fast", "moderate", "full")
-VALID_OUTCOMES = ("consume", "consume_full", "restore", "restore_backoff", "restore_failure")
 LOCK_WAIT_S = 0.5
 OUTCOME_LOCK_WAIT_S = 5.0
-SCHEMA_VERSION = 1
-_HASH_RE = re.compile(r"^[0-9a-f]{16}$")
-_CLAIM_RE = re.compile(r"^[0-9a-f]{32}$")
-_MIGRATION_CLAIM_RE = re.compile(r"^(?P<source>.+)\.migrating-[0-9a-f]{32}$")
-_SPOOL_RE = re.compile(r"^\.spool-(?P<hash>[0-9a-f]{16})-[0-9a-f]{32}\.spool$")
-_OUTCOME_SPOOL_RE = re.compile(
-    r"^\.outcome-spool-(?P<hash>[0-9a-f]{16})-(?P<claim>[0-9a-f]{32})-"
-    r"[0-9a-f]{32}\.spool$"
+SCHEMA_VERSION = 4
+# `automatic-ready` reports an incomplete protocol with a dedicated status that
+# neither Python (1 on an uncaught exception) nor bash (1/2/126/127 on its own
+# failures) produces by accident, so the runner never mistakes a crash for the
+# expected pause.
+AUTOMATIC_PROTOCOL_INCOMPLETE = 10
+# A busy queue is transient contention. The CLI reports it as 75 and the runner
+# logs it and exits 0, like an overlapping tick, so the unit never reads failed.
+BUSY_STATUS = 75
+
+
+def _load_sibling(name, spec):
+    module = sys.modules.get(name)
+    if module is None:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        try:
+            spec.loader.exec_module(module)
+        except BaseException:
+            sys.modules.pop(name, None)
+            raise
+    return module
+
+
+_legacy = _load_sibling(
+    "_genesis_index_marker_legacy",
+    importlib.util.spec_from_file_location(
+        "_genesis_index_marker_legacy", Path(__file__).with_name("index_marker_legacy.py")
+    ),
 )
+_legs = _load_sibling(
+    "_genesis_index_marker_legs",
+    importlib.util.spec_from_file_location(
+        "_genesis_index_marker_legs", Path(__file__).with_name("index_marker_legs.py")
+    ),
+)
+_native = _load_sibling(
+    "_genesis_index_marker_execution",
+    importlib.util.spec_from_file_location(
+        "_genesis_index_marker_execution", Path(__file__).with_name("index_marker_execution.py")
+    ),
+)
+_proof = _load_sibling(
+    "_genesis_code_intel_execution",
+    importlib.util.spec_from_file_location(
+        "_genesis_code_intel_execution", Path(__file__).with_name("code_intel_execution.py")
+    ),
+)
+_cli = _load_sibling(
+    "_genesis_index_marker_cli",
+    importlib.util.spec_from_file_location(
+        "_genesis_index_marker_cli", Path(__file__).with_name("index_marker_cli.py")
+    ),
+)
+MAX_ATTEMPTS = _legs.MAX_ATTEMPTS
+VALID_TOOLS = (*_legs.PROVIDERS, "both")
+VALID_MODES = _legs.MODES
+VALID_OUTCOMES = _legs.OUTCOMES
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS pending (
@@ -77,9 +121,6 @@ CREATE TABLE IF NOT EXISTS failed_outcomes (
  failed_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS repo_state (
  hash TEXT PRIMARY KEY, last_full REAL, full_backoff REAL);
-CREATE TABLE IF NOT EXISTS legacy_imports (
- path TEXT PRIMARY KEY, content_sha256 TEXT NOT NULL,
- source_mtime_ns INTEGER NOT NULL, imported_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS queue_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
 
@@ -118,15 +159,6 @@ def canonical_repo(repo_path: str) -> str:
 def marker_hash(repo_path: str) -> str:
     # Compatibility, not security: must byte-match sha1sum in the entrypoint.
     return hashlib.sha1(canonical_repo(repo_path).encode()).hexdigest()[:16]  # noqa: S324
-
-
-def _union_tools(a: str, b: str) -> str:
-    return a if a == b else "both"
-
-
-def _highest_mode(a: str, b: str) -> str:
-    order = {"fast": 0, "moderate": 1, "full": 2}
-    return a if order.get(a, 0) >= order.get(b, 0) else b
 
 
 def _valid_number(value: object) -> bool:
@@ -186,9 +218,95 @@ def _is_busy(exc: sqlite3.OperationalError) -> bool:
     return "locked" in msg or "busy" in msg
 
 
-def _initialize(db: sqlite3.Connection) -> None:
-    """Create/upgrade the database once, serialized across fresh CLI processes."""
+def _publish_schema(db: sqlite3.Connection) -> None:
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        previous = db.execute("PRAGMA user_version").fetchone()[0]
+        for statement in _SCHEMA.split(";"):
+            if statement.strip():
+                db.execute(statement)
+        if previous < 2:
+            _legacy.upgrade_receipts(db)
+        if previous < 3:
+            _legs.upgrade(db)
+        if previous < 4:
+            _native.upgrade(db, _legs._SCHEMA)
+        db.execute(
+            "INSERT INTO queue_meta(key,value) VALUES('schema_version',?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(SCHEMA_VERSION),),
+        )
+        db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
+
+
+class QueueConversionDeferred(RuntimeError):
+    """An ordinary queue operation met an older queue, or creation during an update.
+
+    Only the explicit strict cutover converts an existing queue. Converting on an
+    ordinary connect is unsafe across code rollbacks: an update that fails after
+    bootstrap restores the older code but not the queue, and the older code then
+    refuses the newer schema. Not a ``TimeoutError``, so no busy-spool path turns
+    it into a newer-format artifact the older code cannot import.
+    """
+
+
+def _update_in_progress() -> bool:
+    """True while an update runs or left its state file (fail closed on errors).
+
+    ``update.sh`` holds ``locks/update.lock`` exclusively for its whole run. A
+    shared probe ignores validation holds (``flock -s``), unlike bootstrap's own
+    exclusive probe of the same lock (``_update_lock_held``): creating a queue
+    during a validation hold is safe, during an update it is not.
+
+    A state file a failed update left behind keeps deferring creation (requests
+    still spool, nothing is lost) until that update is resolved. No staleness
+    rule here, unlike ``genesis.env``: this module is stdlib-only, and an
+    unresolved update is exactly when a newly created queue is unsafe.
+    """
+    state = Path(os.environ.get("GENESIS_HOME") or str(Path.home() / ".genesis"))
+    try:
+        (state / "update_state.json").lstat()
+        return True
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return True
+    try:
+        fd = os.open(state / "locks" / "update.lock", os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+def _conversion_gate(db: sqlite3.Connection, *, allow_convert: bool) -> int:
+    """Return the schema version, refusing any creation or upgrade not allowed now."""
     version = db.execute("PRAGMA user_version").fetchone()[0]
+    if version >= SCHEMA_VERSION or allow_convert:
+        return version
+    if version == 0 and db.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None:
+        if _update_in_progress():
+            raise QueueConversionDeferred("index queue creation deferred during an update")
+        return version
+    raise QueueConversionDeferred(
+        f"index queue is schema {version}; conversion happens only via strict cutover"
+    )
+
+
+def _initialize(db: sqlite3.Connection, *, allow_convert: bool = False) -> None:
+    """Create/upgrade the database once, serialized across fresh CLI processes."""
+    version = _conversion_gate(db, allow_convert=allow_convert)
     if version == SCHEMA_VERSION:
         return
     if version > SCHEMA_VERSION:
@@ -207,7 +325,9 @@ def _initialize(db: sqlite3.Connection) -> None:
                 if remaining <= 0:
                     raise TimeoutError("index-request database initialization busy") from exc
                 time.sleep(min(0.01, remaining))
-        version = db.execute("PRAGMA user_version").fetchone()[0]
+        # Re-check under the lock: another writer may have created the queue
+        # at an older schema between the first check and the lock.
+        version = _conversion_gate(db, allow_convert=allow_convert)
         if version == SCHEMA_VERSION:
             return
         if version > SCHEMA_VERSION:
@@ -217,24 +337,28 @@ def _initialize(db: sqlite3.Connection) -> None:
         mode = db.execute("PRAGMA journal_mode=DELETE").fetchone()[0]
         if str(mode).lower() != "delete":
             raise RuntimeError(f"index queue refused rollback journal mode: {mode}")
-        db.executescript(_SCHEMA)
-        db.execute(
-            "INSERT INTO queue_meta(key,value) VALUES('schema_version',?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (str(SCHEMA_VERSION),),
-        )
-        db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        _publish_schema(db)
 
 
-def _connect(wait_s: float = LOCK_WAIT_S) -> sqlite3.Connection:
+def _connect(wait_s: float = LOCK_WAIT_S, *, allow_convert: bool = False) -> sqlite3.Connection:
     marker_dir().mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(database_path(), timeout=wait_s, isolation_level=None)
+    path = database_path()
+    existed = path.exists()
+    # Probe before connecting, which would create an empty file. An update that
+    # starts after this probe is caught by the gate instead; the empty file it
+    # may leave is never deleted here: a process that already opened it could
+    # still initialize that unlinked inode, losing its request. This code's gate
+    # and readiness observer treat it as absent; older code after a rollback
+    # reports it as an observation error until its next write initializes it.
+    if not existed and not allow_convert and _update_in_progress():
+        raise QueueConversionDeferred("index queue creation deferred during an update")
+    db = sqlite3.connect(path, timeout=wait_s, isolation_level=None)
     db.row_factory = sqlite3.Row
     try:
         db.execute(f"PRAGMA busy_timeout={max(1, int(wait_s * 1000))}")
         db.execute("PRAGMA synchronous=FULL")
         db.execute("PRAGMA foreign_keys=ON")
-        _initialize(db)
+        _initialize(db, allow_convert=allow_convert)
         return db
     except BaseException:
         db.close()
@@ -242,8 +366,7 @@ def _connect(wait_s: float = LOCK_WAIT_S) -> sqlite3.Connection:
 
 
 @contextmanager
-def _write_db(*, wait_s: float = LOCK_WAIT_S):
-    db = _connect(wait_s)
+def _transaction(db):
     try:
         try:
             db.execute("BEGIN IMMEDIATE")
@@ -256,33 +379,64 @@ def _write_db(*, wait_s: float = LOCK_WAIT_S):
     except BaseException:
         db.rollback()
         raise
+
+
+@contextmanager
+def _write_db(*, wait_s: float = LOCK_WAIT_S):
+    db = _connect(wait_s)
+    try:
+        with _transaction(db):
+            yield db
     finally:
         db.close()
 
 
-def _coalesce_pending(db: sqlite3.Connection, h: str, data: dict) -> None:
-    row = db.execute("SELECT * FROM pending WHERE hash=?", (h,)).fetchone()
-    if row:
-        data = {
-            "repo_path": row["repo_path"],
-            "tools": _union_tools(row["tools"], data["tools"]),
-            "mode": _highest_mode(row["mode"], data["mode"]),
-            "requested_at": min(row["requested_at"], data["requested_at"]),
-            "attempts": max(row["attempts"], data.get("attempts", 0)),
-        }
-    db.execute(
-        "INSERT INTO pending(hash,repo_path,tools,mode,requested_at,attempts) VALUES(?,?,?,?,?,?) "
-        "ON CONFLICT(hash) DO UPDATE SET repo_path=excluded.repo_path,tools=excluded.tools,"
-        "mode=excluded.mode,requested_at=excluded.requested_at,attempts=excluded.attempts",
-        (
-            h,
-            data["repo_path"],
-            data["tools"],
-            data["mode"],
-            data["requested_at"],
-            data.get("attempts", 0),
-        ),
-    )
+@contextmanager
+def _publisher(*, wait_s: float = LOCK_WAIT_S, legacy_requests: bool = False):
+    """Keep shared publication authority through DB commit OR spool fsync."""
+    db = None
+    try:
+        try:
+            _prepare()
+            db = _connect(wait_s)
+        except QueueConversionDeferred:
+            if not legacy_requests:
+                raise
+        except (TimeoutError, sqlite3.OperationalError) as exc:
+            if isinstance(exc, sqlite3.OperationalError) and not _is_busy(exc):
+                raise
+            # Busy can precede the schema gate. Only requests have a format
+            # readable by older code; outcomes need proof of the current schema.
+            if not legacy_requests and _header_version() != SCHEMA_VERSION:
+                raise
+        with _legacy._lock(marker_dir(), OUTCOME_LOCK_WAIT_S, shared=True):
+            yield db
+    finally:
+        if db is not None:
+            db.close()
+
+
+@contextmanager
+def _queue_gate():
+    """Initialize first, then drain and decide under one exclusive barrier."""
+    db = _connect(OUTCOME_LOCK_WAIT_S)
+    try:
+        with _legacy._lock(marker_dir(), OUTCOME_LOCK_WAIT_S):
+            with _transaction(db):
+                if db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+                    raise RuntimeError("queue schema changed before admission")
+                imported = _legacy.drain(marker_dir(), db, _import_one, _fsync_dir)
+                native_imported = _native.drain(marker_dir(), db, _legs, _proof, marker_hash)
+                yield db
+            _legacy.retire(marker_dir(), imported, _fsync_dir)
+            _legacy.retire(marker_dir(), native_imported, _fsync_dir)
+    finally:
+        db.close()
+
+
+def _coalesce_pending(db: sqlite3.Connection, h: str, data: dict, *, legacy=False) -> None:
+    shared = [data["attempts"]] if legacy and data["tools"] == "both" else []
+    _legs.coalesce(db, h, data, legacy=legacy, shared=shared)
 
 
 def _fsync_dir(path: Path) -> None:
@@ -315,402 +469,126 @@ def _write_durable_event(*, final_name: str, temp_prefix: str, data: dict) -> Pa
         raise
 
 
-def _write_spool(h: str, data: dict) -> Path:
-    """Durably spool one immutable enqueue when SQLite is temporarily busy."""
+def _header_version() -> int | None:
+    """``user_version`` from the file header (offset 60), readable while SQLite is locked.
+
+    Ordinary writes never change it; only the explicit cutover does, so a stale
+    page left by a crashed cutover is the one state where it can mislead.
+    """
+    try:
+        with database_path().open("rb") as stream:
+            header = stream.read(100)
+    except OSError:
+        return None
+    if len(header) != 100 or header[:16] != b"SQLite format 3\0":
+        return None
+    return int.from_bytes(header[60:64], "big")
+
+
+def _write_spool(h: str, data: dict, *, legacy_body: bool = False) -> Path:
+    # A deferred conversion spools the plain request body that schema-2 code
+    # writes and imports, so an older checkout still consumes it after a rollback.
     nonce = secrets.token_hex(16)
     return _write_durable_event(
         final_name=f".spool-{h}-{nonce}.spool",
         temp_prefix=f".spool-{h}-",
-        data=data,
+        data=data if legacy_body else {"version": 2, "kind": "enqueue", "request": data},
     )
 
 
-def _write_outcome_spool(h: str, claim_id: str, action: str) -> Path:
-    """Durably spool a terminal action bound to one exact inflight claim."""
-    if not _HASH_RE.fullmatch(h) or not _CLAIM_RE.fullmatch(claim_id):
-        raise ValueError("outcome spool requires canonical hash and claim id")
+def _write_outcome_spool(context: dict, event: dict) -> Path:
+    h, claim_id = context["hash"], context["claim_id"]
     nonce = secrets.token_hex(16)
     return _write_durable_event(
         final_name=f".outcome-spool-{h}-{claim_id}-{nonce}.spool",
         temp_prefix=f".tmp-outcome-spool-{h}-{claim_id}-",
-        data={
-            "version": 1,
-            "claim_id": claim_id,
-            "action": action,
-            "recorded_at": time.time(),
-        },
+        data=event,
     )
 
 
 def _legacy_files() -> list[Path]:
-    if not marker_dir().is_dir():
-        return []
-    return sorted(
-        path
-        for path in marker_dir().iterdir()
-        if path.is_file()
-        and not path.name.endswith(".tmp")
-        and (
-            path.name.endswith(".json")
-            or _MIGRATION_CLAIM_RE.fullmatch(path.name)
-            or _SPOOL_RE.fullmatch(path.name)
-            or _OUTCOME_SPOOL_RE.fullmatch(path.name)
-            or path.name.startswith(
-                (".outcome-", ".failed-outcome-", ".last-full-", ".full-backoff-")
-            )
+    return _legacy.legacy_files(marker_dir())
+
+
+def _record_outcome_db(db, event, raw):
+    # Only the version-dispatched importer and validated direct writer call this.
+    if event["version"] == 1:
+        return _legs.legacy_outcome(
+            db, event["hash"], event["claim_id"], event["action"], event["recorded_at"], raw
         )
-    )
-
-
-def _legacy_source_name(path: Path) -> str:
-    match = _MIGRATION_CLAIM_RE.fullmatch(path.name)
-    return match.group("source") if match else path.name
-
-
-def _claim_legacy_files(paths: list[Path]) -> list[tuple[Path, Path]]:
-    """Move replaceable legacy paths aside before reading them.
-
-    The deployed JSON writer does not honor ``.queue.lock``. A unique rename is
-    therefore the ownership boundary: a later atomic replacement recreates the
-    original pathname and cannot be deleted when this claim is retired. Existing
-    claims and immutable spool files are already safe and are resumed in place.
-    """
-    claimed: list[tuple[Path, Path]] = []
-    changed = False
-    for path in paths:
-        source_name = _legacy_source_name(path)
-        if (
-            _MIGRATION_CLAIM_RE.fullmatch(path.name)
-            or _SPOOL_RE.fullmatch(path.name)
-            or _OUTCOME_SPOOL_RE.fullmatch(path.name)
-        ):
-            claimed.append((path, path.with_name(source_name)))
-            continue
-        claim = path.with_name(f"{path.name}.migrating-{secrets.token_hex(16)}")
-        try:
-            os.replace(path, claim)
-        except FileNotFoundError:
-            continue
-        claimed.append((claim, path))
-        changed = True
-    if changed:
-        _fsync_dir(marker_dir())
-    return claimed
-
-
-def _legacy_lock():
-    marker_dir().mkdir(parents=True, exist_ok=True)
-    lock = (marker_dir() / ".queue.lock").open("a")
-    deadline = time.monotonic() + LOCK_WAIT_S
-    while True:
-        try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return lock
-        except OSError as exc:
-            if exc.errno not in (errno.EACCES, errno.EAGAIN):
-                lock.close()
-                raise
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                lock.close()
-                raise TimeoutError("legacy index-request queue busy; request not changed") from exc
-            time.sleep(min(0.01, remaining))
-
-
-def _quarantine(db: sqlite3.Connection, h: str, reason: str, raw: bytes) -> None:
-    db.execute(
-        "INSERT INTO failed(hash,reason,raw_payload,failed_at) VALUES(?,?,?,?) "
-        "ON CONFLICT(hash) DO UPDATE SET reason=excluded.reason,raw_payload=excluded.raw_payload,"
-        "failed_at=excluded.failed_at",
-        (h, reason, raw, time.time()),
-    )
-
-
-def _record_failed_outcome(db: sqlite3.Connection, h: str, reason: str, raw: bytes) -> None:
-    db.execute(
-        "INSERT INTO failed_outcomes(hash,reason,raw_payload,failed_at) VALUES(?,?,?,?) "
-        "ON CONFLICT(hash) DO UPDATE SET reason=excluded.reason,"
-        "raw_payload=excluded.raw_payload,failed_at=excluded.failed_at",
-        (h, reason, raw, time.time()),
-    )
-
-
-def _legacy_hash(path: Path) -> tuple[str | None, bool]:
-    """Return a legacy artifact's repo hash and whether it is outcome-like."""
-    name = path.name
-    outcome_spool = _OUTCOME_SPOOL_RE.fullmatch(name)
-    if outcome_spool:
-        return outcome_spool.group("hash"), True
-    spool = _SPOOL_RE.fullmatch(name)
-    if spool:
-        return spool.group("hash"), False
-    for prefix in (".outcome-", ".failed-outcome-", ".last-full-", ".full-backoff-"):
-        if name.startswith(prefix):
-            h = name.removeprefix(prefix)
-            return (h if _HASH_RE.fullmatch(h) else None), True
-    suffix = next(
-        (suffix for suffix in (".inflight.json", ".failed.json", ".json") if name.endswith(suffix)),
-        None,
-    )
-    if suffix is None:
-        return None, False
-    h = name[: -len(suffix)]
-    return (h if _HASH_RE.fullmatch(h) else None), False
-
-
-def _quarantine_unreadable(
-    db: sqlite3.Connection, source_path: Path, exc: OSError
-) -> None:
-    """Retire an unreadable claimed artifact without blocking other queue work."""
-    h, outcome_like = _legacy_hash(source_path)
-    if h is None:
-        return
-    reason = f"unreadable legacy marker ({exc.__class__.__name__})"
-    raw = source_path.name.encode(errors="replace")
-    if outcome_like:
-        _record_failed_outcome(db, h, reason, raw)
-    else:
-        _quarantine(db, h, reason, raw)
-
-
-def _record_outcome_db(
-    db: sqlite3.Connection,
-    h: str,
-    claim_id: str,
-    action: str,
-    recorded_at: float,
-    raw: bytes,
-) -> str:
-    """Record one claim-bound outcome without permitting last-writer-wins."""
-    row = db.execute(
-        "SELECT outcome_action FROM inflight WHERE hash=? AND claim_id=?",
-        (h, claim_id),
-    ).fetchone()
-    if not row:
+    try:
+        return _legs.record_event(db, event, raw)
+    except _legs.UnownedExecution:
         return "unowned"
-    conflict_reason = f"conflicting durable outcomes for claim {claim_id}"
-    prior_failure = db.execute(
-        "SELECT reason FROM failed_outcomes WHERE hash=?", (h,)
-    ).fetchone()
-    if prior_failure and prior_failure["reason"] == conflict_reason:
-        return "conflict"
-    if row["outcome_action"] is None:
-        db.execute(
-            "UPDATE inflight SET outcome_action=?,outcome_recorded_at=? "
-            "WHERE hash=? AND claim_id=?",
-            (action, recorded_at, h, claim_id),
-        )
-        return "recorded"
-    if row["outcome_action"] == action:
-        return "idempotent"
-    db.execute(
-        "UPDATE inflight SET outcome_action=NULL,outcome_recorded_at=NULL "
-        "WHERE hash=? AND claim_id=?",
-        (h, claim_id),
-    )
-    _record_failed_outcome(db, h, conflict_reason, raw)
-    return "conflict"
 
 
-def _import_outcome(
-    db: sqlite3.Connection,
-    h: str,
-    raw: bytes,
-    *,
-    filename_claim: str | None = None,
-) -> None:
+def _parse_scalar_event(data: dict) -> dict:
+    expected = _legs.CONTEXT | {"version", "kind", "action", "recorded_at"}
+    if (
+        not isinstance(data, dict)
+        or set(data) != expected
+        or type(data["version"]) is not int
+        or data["version"] != 2
+        or data["kind"] != "outcome"
+    ):
+        raise ValueError("invalid scalar outcome envelope")
+    context = {key: data[key] for key in _legs.CONTEXT}
+    return _legs.scalar_event(context, data["action"], data["recorded_at"], marker_hash)
+
+
+def _import_pending(db, h, data, *, legacy=True):
     try:
-        data = json.loads(raw)
-    except (UnicodeDecodeError, ValueError):
-        data = None
-    payload_claim = data.get("claim_id") if isinstance(data, dict) else None
-    valid = (
-        _HASH_RE.fullmatch(h)
-        and isinstance(data, dict)
-        and data.get("version") == 1
-        and data.get("action") in VALID_OUTCOMES
-        and isinstance(payload_claim, str)
-        and _valid_number(data.get("recorded_at"))
-        and (filename_claim is None or filename_claim == payload_claim)
-    )
-    if valid:
-        state = _record_outcome_db(
-            db,
-            h,
-            payload_claim,
-            data["action"],
-            float(data["recorded_at"]),
-            raw,
-        )
-        if state == "unowned":
-            _record_failed_outcome(db, h, "invalid or stale durable outcome", raw)
-    elif _HASH_RE.fullmatch(h):
-        _record_failed_outcome(db, h, "invalid or stale durable outcome", raw)
+        _coalesce_pending(db, h, data, legacy=legacy)
+    except _legs.IdentityConflict as exc:
+        raise _legacy.LegacyArtifactInvalid("repository-identity-conflict") from exc
 
 
-def _import_one(db: sqlite3.Connection, path: Path, raw: bytes) -> None:
-    name = path.name
-    outcome_spool = _OUTCOME_SPOOL_RE.fullmatch(name)
-    if outcome_spool:
-        _import_outcome(
-            db,
-            outcome_spool.group("hash"),
-            raw,
-            filename_claim=outcome_spool.group("claim"),
-        )
-        return
-    spool = _SPOOL_RE.fullmatch(name)
-    if spool:
-        h = spool.group("hash")
-        try:
-            data = json.loads(raw)
-        except (UnicodeDecodeError, ValueError):
-            data = None
-        data = _normalize_queue_data(data)
-        if data is not None and marker_hash(data["repo_path"]) == h:
-            _coalesce_pending(db, h, data)
-        else:
-            _quarantine(db, h, "malformed enqueue spool", raw)
-        return
-    for prefix, column in ((".last-full-", "last_full"), (".full-backoff-", "full_backoff")):
-        if name.startswith(prefix):
-            h = name[len(prefix) :]
-            try:
-                value = float(raw.decode().strip())
-            except (UnicodeDecodeError, ValueError):
-                return
-            if _HASH_RE.fullmatch(h) and math.isfinite(value):
-                db.execute("INSERT OR IGNORE INTO repo_state(hash) VALUES(?)", (h,))
-                if column == "last_full":
-                    db.execute("UPDATE repo_state SET last_full=? WHERE hash=?", (value, h))
-                else:
-                    db.execute("UPDATE repo_state SET full_backoff=? WHERE hash=?", (value, h))
-            return
-    if name.startswith(".failed-outcome-"):
-        h = name.removeprefix(".failed-outcome-")
-        if _HASH_RE.fullmatch(h):
-            _record_failed_outcome(db, h, "legacy failed outcome", raw)
-        return
-    if name.startswith(".outcome-"):
-        h = name.removeprefix(".outcome-")
-        _import_outcome(db, h, raw)
-        return
-    suffix = next(
-        (s for s in (".inflight.json", ".failed.json", ".json") if name.endswith(s)), None
-    )
-    if suffix is None:
-        return
-    h = name[: -len(suffix)]
-    if not _HASH_RE.fullmatch(h):
-        return
+def _import_failed(db, h, data, raw, artifact_identity):
     try:
-        data = json.loads(raw)
-    except (UnicodeDecodeError, ValueError):
-        data = None
-    data = _normalize_queue_data(data)
-    if suffix == ".failed.json":
-        if data is not None:
-            db.execute(
-                "INSERT INTO failed(hash,repo_path,tools,mode,requested_at,attempts,reason,raw_payload,failed_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(hash) DO UPDATE SET repo_path=excluded.repo_path,"
-                "tools=excluded.tools,mode=excluded.mode,requested_at=excluded.requested_at,attempts=excluded.attempts,"
-                "reason=excluded.reason,raw_payload=excluded.raw_payload,failed_at=excluded.failed_at",
-                (
-                    h,
-                    data["repo_path"],
-                    data["tools"],
-                    data["mode"],
-                    data["requested_at"],
-                    data.get("attempts", 0),
-                    "legacy terminal failure",
-                    raw,
-                    time.time(),
-                ),
-            )
-        else:
-            _quarantine(db, h, "malformed legacy failed marker", raw)
-    elif suffix == ".inflight.json":
-        if data is None:
-            _quarantine(db, h, "malformed legacy inflight marker", raw)
-        elif not db.execute("SELECT 1 FROM inflight WHERE hash=?", (h,)).fetchone():
-            claim_id = data.get("claim_id")
-            if not isinstance(claim_id, str) or not claim_id:
-                # The deployed pre-PR queue had inflight ownership but no
-                # nonce. Assign one during migration; reconciliation then
-                # treats its outcome as unknown and charges exactly one retry.
-                claim_id = secrets.token_hex(16)
-            db.execute(
-                "INSERT INTO inflight(hash,repo_path,tools,mode,requested_at,attempts,claim_id) VALUES(?,?,?,?,?,?,?)",
-                (
-                    h,
-                    data["repo_path"],
-                    data["tools"],
-                    data["mode"],
-                    data["requested_at"],
-                    data.get("attempts", 0),
-                    claim_id,
-                ),
-            )
-    elif data is not None:
-        _coalesce_pending(db, h, data)
-    else:
-        _quarantine(db, h, "malformed legacy pending marker", raw)
+        _legs.legacy_failed(db, h, data, raw=raw, artifact_identity=artifact_identity)
+    except _legs.IdentityConflict as exc:
+        raise _legacy.LegacyArtifactInvalid("repository-identity-conflict") from exc
+
+
+def _import_claim(db, h, data, raw, artifact_identity):
+    try:
+        _legs.legacy_claim(db, h, data, raw=raw, artifact_identity=artifact_identity)
+    except _legs.IdentityConflict as exc:
+        raise _legacy.LegacyArtifactInvalid("repository-identity-conflict") from exc
+
+
+def _import_one(db, path, raw, artifact_identity=None):
+    operations = _legacy.QueueOperations(
+        normalize=_normalize_queue_data,
+        hash_repo=marker_hash,
+        coalesce=_import_pending,
+        record_outcome=_record_outcome_db,
+        valid_number=_valid_number,
+        outcomes=VALID_OUTCOMES,
+        parse_event=_parse_scalar_event,
+        record_failed=_import_failed,
+        record_claim=_import_claim,
+    )
+    _legacy.import_one(db, path, raw, operations, artifact_identity=artifact_identity)
 
 
 def _migrate_legacy() -> None:
-    if not _legacy_files():
-        return
-    lock = _legacy_lock()
-    try:
-        paths = _claim_legacy_files(_legacy_files())
-        # Import ownership before sidecar/durable outcomes.
-        paths.sort(
-            key=lambda item: bool(
-                item[1].name.startswith(".outcome-")
-                or _OUTCOME_SPOOL_RE.fullmatch(item[1].name)
-            )
-        )
-        imported: list[Path] = []
-        with _write_db() as db:
-            for claimed_path, source_path in paths:
-                try:
-                    raw = claimed_path.read_bytes()
-                    source_mtime_ns = claimed_path.stat().st_mtime_ns
-                except FileNotFoundError:
-                    continue
-                except OSError as exc:
-                    _quarantine_unreadable(db, source_path, exc)
-                    imported.append(claimed_path)
-                    continue
-                digest = hashlib.sha256(raw).hexdigest()
-                prior = db.execute(
-                    "SELECT content_sha256,source_mtime_ns FROM legacy_imports WHERE path=?",
-                    (source_path.name,),
-                ).fetchone()
-                if (
-                    not prior
-                    or prior["content_sha256"] != digest
-                    or prior["source_mtime_ns"] != source_mtime_ns
-                ):
-                    _import_one(db, source_path, raw)
-                    db.execute(
-                        "INSERT INTO legacy_imports(path,content_sha256,source_mtime_ns,imported_at) "
-                        "VALUES(?,?,?,?) ON CONFLICT(path) DO UPDATE SET "
-                        "content_sha256=excluded.content_sha256,"
-                        "source_mtime_ns=excluded.source_mtime_ns,imported_at=excluded.imported_at",
-                        (source_path.name, digest, source_mtime_ns, time.time()),
-                    )
-                imported.append(claimed_path)
-        for path in imported:
-            path.unlink(missing_ok=True)
-        if imported:
-            _fsync_dir(marker_dir())
-    finally:
-        lock.close()
+    _legacy.migrate(marker_dir(), _write_db, _import_one, _fsync_dir, wait_s=LOCK_WAIT_S)
 
 
 def _prepare() -> None:
     db = _connect()
+    db.close()
+    _migrate_legacy()
+
+
+def convert_queue() -> None:
+    """Explicitly convert an older queue, then import retained legacy artifacts.
+
+    No ordinary operation converts (see ``QueueConversionDeferred``); the strict
+    cutover is this function's only intended runtime caller.
+    """
+    db = _connect(allow_convert=True)
     db.close()
     _migrate_legacy()
 
@@ -729,17 +607,24 @@ def write_marker(repo_path: str, tools: str, mode: str) -> Path:
         "attempts": 0,
     }
     h = marker_hash(repo_path)
-    try:
-        _prepare()
-        with _write_db() as db:
-            _coalesce_pending(db, h, data)
+    with _publisher(legacy_requests=True) as db:
+        def spool() -> Path:
+            return _write_spool(
+                h, data, legacy_body=not (db is not None or _header_version() == SCHEMA_VERSION)
+            )
+
+        if db is None:
+            return spool()
+        try:
+            with _transaction(db):
+                _coalesce_pending(db, h, data)
+        except TimeoutError:
+            return spool()
+        except sqlite3.OperationalError as exc:
+            if not _is_busy(exc):
+                raise
+            return spool()
         return database_path()
-    except TimeoutError:
-        return _write_spool(h, data)
-    except sqlite3.OperationalError as exc:
-        if not _is_busy(exc):
-            raise
-        return _write_spool(h, data)
 
 
 def list_markers() -> list[dict]:
@@ -748,177 +633,165 @@ def list_markers() -> list[dict]:
     try:
         now = time.time()
         return [
-            {**dict(row), "age_s": max(0, int(now - row["requested_at"]))}
-            for row in db.execute("SELECT * FROM pending ORDER BY hash")
+            {
+                **dict(row),
+                "tools": row["provider"],
+                "legacy_shared_attempts": _legs.shared_debts(row["legacy_shared_attempts"]),
+                "age_s": int(min(_legs.INTEGER_MAX, max(0, now - row["requested_at"]))),
+            }
+            for row in db.execute("SELECT * FROM pending ORDER BY hash,provider")
         ]
     finally:
         db.close()
 
 
-def claim(h: str) -> dict | None:
-    _prepare()
-    with _write_db() as db:
-        if db.execute("SELECT 1 FROM inflight WHERE hash=?", (h,)).fetchone():
+def claim(h: str, *, provider: str) -> dict | None:
+    with _queue_gate() as db:
+        if _native.blocked(db, h, provider):
             return None
-        row = db.execute("SELECT * FROM pending WHERE hash=?", (h,)).fetchone()
-        if not row:
-            return None
-        claim_id = secrets.token_hex(16)
-        db.execute(
-            "INSERT INTO inflight(hash,repo_path,tools,mode,requested_at,attempts,claim_id) VALUES(?,?,?,?,?,?,?)",
-            (
-                h,
-                row["repo_path"],
-                row["tools"],
-                row["mode"],
-                row["requested_at"],
-                row["attempts"],
-                claim_id,
-            ),
-        )
-        db.execute("DELETE FROM pending WHERE hash=?", (h,))
-        return {**dict(row), "claim_id": claim_id}
+        result = _legs.claim(db, h, provider)
+        if result is not None:
+            _legs.validate_context(result["context"], marker_hash)
+        return result
 
 
-def consume(h: str, *, claim_id: str) -> None:
-    if not claim_id:
-        raise ValueError("claim id is required")
-    _prepare()
-    with _write_db() as db:
-        if not db.execute(
-            "DELETE FROM inflight WHERE hash=? AND claim_id=?", (h, claim_id)
-        ).rowcount:
-            raise RuntimeError(f"cannot consume unowned claim {h}")
+def claim_native(h: str, *, provider: str) -> dict | None:
+    h = _machine_hash(h)
+    if provider not in _legs.PROVIDERS:
+        raise ValueError("provider must be cbm or gitnexus")
+    with _queue_gate() as db:
+        result = _native.claim(db, h, provider, _legs)
+        if result is not None:
+            _native.context(result["context"], _legs, marker_hash)
+        return result
 
 
-def _restore_db(db: sqlite3.Connection, h: str, *, attempts_inc: bool = False) -> str:
-    row = db.execute("SELECT * FROM inflight WHERE hash=?", (h,)).fetchone()
-    if not row:
-        return "pending"
-    pending = db.execute("SELECT * FROM pending WHERE hash=?", (h,)).fetchone()
-    attempts = row["attempts"] + int(attempts_inc)
-    if attempts >= MAX_ATTEMPTS:
-        # The inflight row is one claimed generation. A pending row with the
-        # same hash is newer work that arrived while that generation ran; never
-        # merge it into, or delete it with, the exhausted generation.
-        db.execute(
-            "INSERT INTO failed(hash,repo_path,tools,mode,requested_at,attempts,reason,failed_at) VALUES(?,?,?,?,?,?,?,?) "
-            "ON CONFLICT(hash) DO UPDATE SET repo_path=excluded.repo_path,tools=excluded.tools,mode=excluded.mode,"
-            "requested_at=excluded.requested_at,attempts=excluded.attempts,reason=excluded.reason,failed_at=excluded.failed_at",
-            (
-                h,
-                row["repo_path"],
-                row["tools"],
-                row["mode"],
-                row["requested_at"],
-                attempts,
-                "attempt budget exhausted",
-                time.time(),
-            ),
-        )
-        db.execute("DELETE FROM inflight WHERE hash=?", (h,))
-        return "pending" if pending else "failed"
-    merged = {
-        "repo_path": row["repo_path"],
-        "tools": _union_tools(row["tools"], pending["tools"]) if pending else row["tools"],
-        "mode": _highest_mode(row["mode"], pending["mode"]) if pending else row["mode"],
-        "requested_at": min(row["requested_at"], pending["requested_at"])
-        if pending
-        else row["requested_at"],
-        "attempts": max(attempts, pending["attempts"]) if pending else attempts,
-    }
-    _coalesce_pending(db, h, merged)
-    db.execute("DELETE FROM inflight WHERE hash=?", (h,))
-    return "pending"
+def consume(context: dict) -> None:
+    remember_outcome(context, "consume")
+    apply_remembered_outcome(context)
 
 
-def restore(h: str, *, claim_id: str, attempts_inc: bool = False) -> str:
-    if not claim_id:
-        raise ValueError("claim id is required")
-    _prepare()
-    with _write_db() as db:
-        if not db.execute(
-            "SELECT 1 FROM inflight WHERE hash=? AND claim_id=?", (h, claim_id)
-        ).fetchone():
-            raise RuntimeError(f"cannot restore unowned claim {h}")
-        return _restore_db(db, h, attempts_inc=attempts_inc)
+def restore(context: dict, *, attempts_inc=False) -> str:
+    remember_outcome(context, "restore_failure" if attempts_inc else "restore")
+    return apply_remembered_outcome(context)
 
 
-def remember_outcome(h: str, action: str, *, claim_id: str) -> Path:
-    if action not in VALID_OUTCOMES:
-        raise ValueError(f"outcome must be one of {VALID_OUTCOMES}, got {action!r}")
-    if not _CLAIM_RE.fullmatch(claim_id):
-        raise ValueError("claim id must be 32 lowercase hexadecimal characters")
-    try:
-        _prepare()
-        recorded_at = time.time()
-        raw = json.dumps(
-            {
-                "version": 1,
-                "claim_id": claim_id,
-                "action": action,
-                "recorded_at": recorded_at,
-            },
-            sort_keys=True,
-        ).encode()
-        with _write_db(wait_s=OUTCOME_LOCK_WAIT_S) as db:
-            state = _record_outcome_db(db, h, claim_id, action, recorded_at, raw)
+def remember_outcome(context: dict, action: str) -> Path:
+    event = _legs.scalar_event(context, action, time.time(), marker_hash)
+    context = {key: event[key] for key in _legs.CONTEXT}
+    raw = json.dumps(event, sort_keys=True).encode() + b"\n"
+    with _publisher(wait_s=OUTCOME_LOCK_WAIT_S) as db:
+        if db is None:
+            return _write_outcome_spool(context, event)
+        try:
+            with _transaction(db):
+                state = _record_outcome_db(db, event, raw)
+        except TimeoutError:
+            return _write_outcome_spool(context, event)
+        except sqlite3.OperationalError as exc:
+            if not _is_busy(exc):
+                raise
+            return _write_outcome_spool(context, event)
         if state == "unowned":
-            raise RuntimeError(f"cannot remember outcome for unowned claim {h}")
+            raise RuntimeError("cannot remember outcome for an unowned execution")
         if state == "conflict":
-            raise RuntimeError(f"conflicting outcome for claim {h}/{claim_id}")
+            raise RuntimeError("conflicting durable queue outcomes")
         return database_path()
-    except TimeoutError:
-        return _write_outcome_spool(h, claim_id, action)
-    except sqlite3.OperationalError as exc:
-        if not _is_busy(exc):
-            raise
-        return _write_outcome_spool(h, claim_id, action)
 
 
-def _apply_outcome_db(db: sqlite3.Connection, h: str) -> str | None:
-    row = db.execute("SELECT * FROM inflight WHERE hash=?", (h,)).fetchone()
-    if not row or row["outcome_action"] is None:
-        return None
-    action, recorded = row["outcome_action"], row["outcome_recorded_at"]
-    if action == "consume_full":
-        db.execute(
-            "INSERT INTO repo_state(hash,last_full,full_backoff) VALUES(?,?,NULL) "
-            "ON CONFLICT(hash) DO UPDATE SET last_full=excluded.last_full,full_backoff=NULL",
-            (h, recorded),
-        )
-        db.execute("DELETE FROM inflight WHERE hash=?", (h,))
-        return "consumed"
-    if action == "consume":
-        db.execute("DELETE FROM inflight WHERE hash=?", (h,))
-        return "consumed"
-    if action == "restore_backoff":
-        db.execute(
-            "INSERT INTO repo_state(hash,full_backoff) VALUES(?,?) "
-            "ON CONFLICT(hash) DO UPDATE SET full_backoff=excluded.full_backoff",
-            (h, recorded),
-        )
-    return _restore_db(db, h, attempts_inc=action == "restore_failure")
-
-
-def apply_remembered_outcome(h: str) -> str | None:
+def apply_remembered_outcome(context: dict) -> str | None:
+    context = _legs.validate_context(context, marker_hash)
     _prepare()
     with _write_db() as db:
-        return _apply_outcome_db(db, h)
+        return _legs.apply(db, context)
 
 
 def repend_stale_inflight() -> list[str]:
     _prepare()
     with _write_db() as db:
-        hashes = [row[0] for row in db.execute("SELECT hash FROM inflight ORDER BY hash")]
-        repended = []
-        for h in hashes:
-            state = _apply_outcome_db(db, h)
-            if state is None:
-                state = _restore_db(db, h, attempts_inc=True)
-            if state == "pending":
-                repended.append(h)
-        return repended
+        return _legs.reconcile(db)
+
+
+def reconcile_native() -> list[str]:
+    with _queue_gate() as db:
+        return _native.reconcile(db, _legs)
+
+
+def reserve_launch(context: dict, data: dict) -> str:
+    context = _native.context(context, _legs, marker_hash)
+    data = _native.reservation(data, context)
+    with _queue_gate() as db:
+        state = _native.reserve(db, context, data, _legs)
+    if state in ("conflict", "held"):
+        raise RuntimeError("native reservation refused: " + state)
+    return state
+
+
+def cancel_launch(context: dict) -> str:
+    context = _native.context(context, _legs, marker_hash)
+    with _queue_gate() as db:
+        return _native.cancel(db, context, _legs)
+
+
+def _native_gate(context, data, operation):
+    context = _native.context(context, _legs, marker_hash)
+    with _queue_gate() as db:
+        state = operation(db, context, data, _legs, _proof)
+    if state in ("conflict", "resource", "held"):
+        raise RuntimeError("native launch refused: " + state)
+    return state
+
+
+def register_scope(context: dict, data: dict) -> str:
+    return _native_gate(context, data, _native.register)
+
+
+def begin_native(context: dict, data: dict) -> str:
+    return _native_gate(context, data, _native.begin)
+
+
+def remember_native_event(context: dict, kind: str, data: dict, *, recorded_at=None) -> Path:
+    context = _native.context(context, _legs, marker_hash)
+    event = _native.event(context, kind, data, time.time() if recorded_at is None else recorded_at, _proof)
+    def spool():
+        return _write_durable_event(
+            final_name=f".execution-spool-{context['hash']}-{context['claim_id']}-{secrets.token_hex(16)}.spool",
+            temp_prefix=".execution-tmp-", data=event,
+        )
+    with _publisher(wait_s=OUTCOME_LOCK_WAIT_S) as db:
+        state = "waiting"
+        if db is not None:
+            try:
+                with _transaction(db):
+                    state = _native.record(db, context, event, _legs, _proof)
+            except TimeoutError:
+                return spool()
+            except sqlite3.OperationalError as exc:
+                if not _is_busy(exc):
+                    raise
+                return spool()
+        if state in ("waiting", "retained"):
+            path = spool()
+            if state == "retained":
+                raise RuntimeError("additional native conflict retained: " + str(path))
+            return path
+        if state == "conflict":
+            raise RuntimeError("conflicting native evidence retained in queue")
+        return database_path()
+
+
+def apply_native(context: dict) -> str | None:
+    context = _native.context(context, _legs, marker_hash)
+    with _queue_gate() as db:
+        return _native.apply(db, context, _legs)
+
+
+def execution_status(context: dict) -> dict:
+    context = _native.context(context, _legs, marker_hash)
+    result = _legacy.import_status(database_path(), limit=0,
+                                   observe=lambda db: _native.status(db, context, _legs))
+    result["evidence_pending"] = any(marker_dir().glob(".execution-spool-*.spool"))
+    return result  # Observation only; never an admission decision or repair.
 
 
 def should_escalate_full(h: str) -> bool:
@@ -968,7 +841,6 @@ def _get_row(table: str, h: str) -> dict | None:
     try:
         queries = {
             "inflight": "SELECT * FROM inflight WHERE hash=?",
-            "failed": "SELECT * FROM failed WHERE hash=?",
             "repo_state": "SELECT * FROM repo_state WHERE hash=?",
         }
         row = db.execute(queries[table], (h,)).fetchone()
@@ -981,8 +853,20 @@ def get_inflight(h: str) -> dict | None:
     return _get_row("inflight", h)
 
 
-def get_failed(h: str) -> dict | None:
-    return _get_row("failed", h)
+def get_failed(h: str, *, provider=None) -> dict | None:
+    _prepare()
+    db = _connect()
+    try:
+        rows = list(db.execute("SELECT * FROM failed WHERE hash=?", (h,)))
+        if provider is not None:
+            if provider not in _legs.PROVIDERS:
+                raise ValueError("provider must be cbm or gitnexus")
+            rows = [row for row in rows if row["provider"] == provider]
+        if len(rows) > 1:
+            raise ValueError("provider required for multiple failed legs")
+        return dict(rows[0]) if rows else None
+    finally:
+        db.close()
 
 
 def list_failed() -> list[dict]:
@@ -999,94 +883,92 @@ def get_repo_state(h: str) -> dict:
     return row or {"hash": h, "last_full": None, "full_backoff": None}
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Code-intel index-request queue")
-    sub = parser.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("write")
-    p.add_argument("--repo", required=True)
-    p.add_argument("--tools", default="both", choices=VALID_TOOLS)
-    p.add_argument("--mode", default="fast", choices=VALID_MODES)
-    p = sub.add_parser("hash")
-    p.add_argument("--repo", required=True)
-    sub.add_parser("list")
-    for name in (
-        "claim",
-        "apply-outcome",
-        "should-escalate",
-        "stamp-full",
-        "mark-full-backoff",
+def _cli_context(args):
+    context = _legacy._decode(args.context.encode("utf-8"), strict=True)
+    _legs.validate_context(context, marker_hash)
+    return context
+
+
+def _machine_hash(value: str) -> str:
+    if len(value) != 16 or any(char not in "0123456789abcdef" for char in value):
+        raise ValueError("invalid machine repository hash")
+    return value
+
+
+def _pending_record(row: dict) -> tuple[str, ...]:
+    h = _machine_hash(row["hash"])
+    repo, provider, age = row["repo_path"], row["provider"], row["age_s"]
+    if (
+        not _legs.stored_repo(repo)
+        or _legs.stored_hash(repo) != h
+        or provider not in _legs.PROVIDERS
+        or type(age) is not int
+        or not 0 <= age <= _legs.INTEGER_MAX
     ):
-        p = sub.add_parser(name)
-        p.add_argument("--hash", required=True)
-    p = sub.add_parser("consume")
-    p.add_argument("--hash", required=True)
-    p.add_argument("--claim-id", required=True)
-    p = sub.add_parser("remember-outcome")
-    p.add_argument("--hash", required=True)
-    p.add_argument("--action", required=True, choices=VALID_OUTCOMES)
-    p.add_argument("--claim-id", required=True)
-    sub.add_parser("reconcile-inflight")
-    p = sub.add_parser("restore")
-    p.add_argument("--hash", required=True)
-    p.add_argument("--claim-id", required=True)
-    p.add_argument("--attempts-inc", action="store_true")
-    args = parser.parse_args(argv)
-    if args.cmd == "write":
-        print(write_marker(args.repo, args.tools, args.mode))
-        return 0
-    if args.cmd == "hash":
-        print(marker_hash(args.repo))
-        return 0
-    if args.cmd == "list":
-        for m in list_markers():
-            print(
-                f"{m['hash']}\t{m['repo_path']}\t{m['tools']}\t{m['mode']}\t{m['attempts']}\t{m['age_s']}"
-            )
-        return 0
-    if args.cmd == "claim":
-        data = claim(args.hash)
-        if data is None:
-            return 1
-        print(
-            f"{data['repo_path']}\t{data['tools']}\t{data['mode']}\t"
-            f"{data['attempts']}\t{data['claim_id']}"
+        raise ValueError("invalid machine pending snapshot")
+    return "1", "pending", h, repo, provider, str(age)
+
+
+def _claim_record(row: dict, h: str, provider: str, *, protocol=2) -> tuple[str, ...]:
+    context = _legs.validate_context(row["context"], marker_hash, protocol=protocol)
+    if (
+        context["hash"] != h
+        or context["provider"] != provider
+        or any(
+            row.get(key) != context[key] for key in ("hash", "repo_path", "provider", "claim_id")
         )
-        return 0
-    if args.cmd == "consume":
-        consume(args.hash, claim_id=args.claim_id)
-        return 0
-    if args.cmd == "remember-outcome":
-        remember_outcome(args.hash, args.action, claim_id=args.claim_id)
-        return 0
-    if args.cmd == "apply-outcome":
-        state = apply_remembered_outcome(args.hash)
-        if state is None:
-            return 1
-        print(state)
-        return 0
-    if args.cmd == "restore":
-        print(restore(args.hash, claim_id=args.claim_id, attempts_inc=args.attempts_inc))
-        return 0
-    if args.cmd == "should-escalate":
-        try:
-            due = should_escalate_full(args.hash)
-        except Exception as exc:  # noqa: BLE001 — CLI must reserve rc=1 for "not due"
-            print(f"ERROR: should-escalate failed: {exc}", file=sys.stderr)
-            return 2
-        return 0 if due else 1
-    if args.cmd == "stamp-full":
-        stamp_full(args.hash)
-        return 0
-    if args.cmd == "mark-full-backoff":
-        mark_full_backoff(args.hash)
-        return 0
-    if args.cmd == "reconcile-inflight":
-        repended = repend_stale_inflight()
-        if repended:
-            print(f"re-pended {len(repended)} stale inflight marker(s)")
-        return 0
-    return 2
+        or row.get("tools") != provider
+        or row.get("mode") not in VALID_MODES
+    ):
+        raise ValueError("invalid machine claim snapshot")
+    return (
+        "1",
+        "claim",
+        context["hash"],
+        context["repo_path"],
+        context["provider"],
+        row["mode"],
+        json.dumps(context, ensure_ascii=True, separators=(",", ":")),
+    )
+
+
+def _write_machine(records) -> None:
+    # Render/validate the complete population before emitting any byte. The
+    # consumer checks both actual process status and complete NUL framing.
+    encoded = []
+    for record in records:
+        for field in record:
+            if not isinstance(field, str) or "\0" in field:
+                raise ValueError("invalid machine field")
+            encoded.append(field.encode("utf-8") + b"\0")
+    sys.stdout.buffer.write(b"".join(encoded))
+    sys.stdout.buffer.flush()
+
+
+def main(argv: list[str] | None = None) -> int:
+    return _cli.main(argv, globals())
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except QueueConversionDeferred as exc:
+        print(f"index_marker: {exc}", file=sys.stderr)
+        sys.exit(2)
+    except TimeoutError as exc:
+        # A busy queue is transient: BUSY_STATUS lets the runner defer the tick.
+        print(f"index_marker: {exc}", file=sys.stderr)
+        sys.exit(BUSY_STATUS)
+    except sqlite3.OperationalError as exc:
+        if not _is_busy(exc):
+            import traceback
+
+            traceback.print_exc()
+            sys.exit(2)
+        print(f"index_marker: queue busy: {exc}", file=sys.stderr)
+        sys.exit(BUSY_STATUS)
+    except Exception:
+        import traceback
+
+        traceback.print_exc()
+        sys.exit(2)

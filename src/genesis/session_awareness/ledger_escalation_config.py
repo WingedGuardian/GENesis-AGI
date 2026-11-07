@@ -62,7 +62,7 @@ DEFAULTS: dict[str, Any] = {
     # Priority of the created follow-up.
     "priority": "high",
     # Provenance allow-list: which `session_ledger.added_by` values may escalate.
-    # Default is foreground-only ON PURPOSE. `ambient_ledger_extractor` rows are
+    # Default is owner commitments only, ON PURPOSE. `ambient_ledger_extractor` rows are
     # the detached extractor's PROPOSALS, not agreements a human made, so
     # escalating them would ask the owner to dispose of something nobody
     # committed to. The extractor shipped OFF (the ambient-extractor migration,
@@ -70,7 +70,12 @@ DEFAULTS: dict[str, Any] = {
     # the value, so this allow-list ships with the sweep rather than after the
     # first flood. Widen it deliberately if extractor rows ever become
     # agreements.
-    "escalate_added_by": ["foreground"],
+    # `relayed` is IN by default because it IS the owner's commitment: a
+    # dispatched session (a channel conversation) writing down something the
+    # owner asked for. Excluding it would leave exactly those rows with no
+    # safety net. Plain `ambient` stays out — it records only that a
+    # dispatched session wrote the row, not that anyone agreed to it.
+    "escalate_added_by": ["foreground", "relayed"],
 }
 
 INT_KNOBS = ("stale_days", "quiet_days", "max_per_run")
@@ -133,7 +138,7 @@ def priority(cfg: dict[str, Any]) -> str:
 def escalate_added_by(cfg: dict[str, Any]) -> frozenset[str]:
     """The `added_by` values allowed to escalate.
 
-    Damage degrades to the DEFAULT (foreground-only), never to "everything":
+    Damage degrades to the DEFAULT (foreground + relayed), never to "everything":
     this gates who may create follow-ups, so a corrupt value must not widen
     write authority. Unknown values are dropped rather than passed through to
     the SQL — they can only ever match nothing, and silently querying for a

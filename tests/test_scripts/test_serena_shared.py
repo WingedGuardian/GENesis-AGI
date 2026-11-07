@@ -133,6 +133,8 @@ def test_unit_preserves_literal_path_and_resource_ownership(tmp_path):
     assert "ExecStart=:" in text
     assert f"WorkingDirectory={str(project).replace('%', '%%')}\n" in text
     assert "MemoryMax=4G" in text and "MemorySwapMax=0" in text
+    # Shared by every session: systemd-oomd chooses it last, never ahead of one session.
+    assert "ManagedOOMPreference=avoid" in text
     assert "KillMode=control-group" in text and "StartLimitBurst=3" in text
 
 
@@ -215,8 +217,13 @@ def test_unit_line_injection_refuses(path):
 def test_installer_preserves_provider_when_sharing_enabled_or_unknown(tmp_path, enabled, home_kind):
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    (bindir / "serena").write_text("#!/bin/sh\nexit 0\n")
-    (bindir / "uv").write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$CALLS"\n')
+    (bindir / "serena").write_text("#!/bin/sh\necho Serena 1.7.0\n")
+    tools = tmp_path / "tools"
+    (tools / "serena-agent/bin").mkdir(parents=True)
+    (tools / "serena-agent/bin/serena").symlink_to(bindir / "serena")
+    (bindir / "uv").write_text(
+        '#!/bin/sh\nif [ "$*" = "tool dir" ]; then printf "%s\\n" "$TOOLS"; else printf "%s\\n" "$*" >> "$CALLS"; fi\n'
+    )
     (bindir / "systemctl").write_text(
         "#!/bin/sh\nprintf 'LoadState=not-found\\nActiveState=inactive\\nUnitFileState=\\n'\n"
     )
@@ -228,7 +235,13 @@ def test_installer_preserves_provider_when_sharing_enabled_or_unknown(tmp_path, 
     if enabled is not None:
         settings.write_text(json.dumps({"enabled": enabled}))
     calls = tmp_path / "calls"
-    env = dict(os.environ, HOME=str(tmp_path), PATH=f"{bindir}:{os.defpath}", CALLS=str(calls))
+    env = dict(
+        os.environ,
+        HOME=str(tmp_path),
+        PATH=f"{bindir}:{os.defpath}",
+        CALLS=str(calls),
+        TOOLS=str(tools),
+    )
     env.pop("GENESIS_HOME", None)
     if home_kind != "unset":
         env["GENESIS_HOME"] = {
@@ -246,7 +259,7 @@ def test_installer_preserves_provider_when_sharing_enabled_or_unknown(tmp_path, 
     )
     assert calls.exists() == (home_kind != "relative" and enabled in (False, None))
     if calls.exists():
-        assert calls.read_text() == "tool upgrade serena-agent\n"
+        assert calls.read_text() == "tool install serena-agent==2.1.0\n"
 
 
 @pytest.mark.parametrize(
@@ -873,9 +886,12 @@ def test_global_provider_upgrade_requires_both_services_stopped_and_disabled(
     bindir = tmp_path / "bin"
     bindir.mkdir()
     calls = tmp_path / "calls"
+    tools = tmp_path / "tools"
+    (tools / "serena-agent/bin").mkdir(parents=True)
+    (tools / "serena-agent/bin/serena").symlink_to(bindir / "serena")
     scripts = {
-        "serena": "#!/bin/sh\nexit 0\n",
-        "uv": '#!/bin/sh\necho upgrade >> "$CALLS"\n',
+        "serena": "#!/bin/sh\necho Serena 1.7.0\n",
+        "uv": '#!/bin/sh\nif [ "$*" = "tool dir" ]; then printf "%s\\n" "$TOOLS"; else echo upgrade >> "$CALLS"; fi\n',
         "systemctl": (
             '#!/bin/sh\nif [ "$3" = "$SELECTED" ]; then\n'
             '  [ "$STATE" != unreadable ] || exit 1\n  printf "%s" "$STATE"\n'
@@ -891,6 +907,7 @@ def test_global_provider_upgrade_requires_both_services_stopped_and_disabled(
         GENESIS_HOME=str(tmp_path / "other-config-root"),
         PATH=f"{bindir}:{os.defpath}",
         CALLS=str(calls),
+        TOOLS=str(tools),
         SELECTED=shared.unit_name(context),
         STATE=state,
     )
@@ -1365,7 +1382,7 @@ def test_fresh_install_without_manager_preserves_existing_or_uncertain_provider(
         check=True,
     )
     if marker is False and tool == "absent":
-        assert calls.read_text() == "tool install serena-agent\n"
+        assert calls.read_text() == "tool install serena-agent==2.1.0\n"
     else:
         assert not calls.exists()
 

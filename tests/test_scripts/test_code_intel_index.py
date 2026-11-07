@@ -90,9 +90,13 @@ def _inherited_oom_adj() -> str:
 
 
 def _fake_systemd_run(bindir: Path, log: Path, *, probe_ok: bool = True,
-                      reject_memory_max: str = "") -> None:
-    """Fake systemd-run: logs argv, then execs the command after ``--``."""
+                      reject_memory_max: str = "", literal_option_rc: int = 1) -> None:
+    """Fake systemd-run: logs argv, then execs the command after ``--``.
+
+    The entrypoint's question about the literal-arguments option is answered first and
+    left out of the log: refused by default, like a systemd older than 254."""
     bindir.mkdir(exist_ok=True)
+    answer = f'[ "$2" = --version ] && exit {literal_option_rc}\n'
     if probe_ok:
         cgroup = bindir / "test-cgroup"
         cgroup.mkdir(exist_ok=True)
@@ -110,7 +114,8 @@ def _fake_systemd_run(bindir: Path, log: Path, *, probe_ok: bool = True,
         )
         body = (
             "#!/usr/bin/env bash\n"
-            f'echo "$*" >> "{log}"\n'
+            + answer
+            + f'echo "$*" >> "{log}"\n'
             f'echo "SYSTEMD_RUN_OOM_ADJ:$(cat /proc/self/oom_score_adj)" >> "{log}"\n'
             'unit=""; cap=""; reserve=""; marker=""; memory_max=""\n'
             'for arg in "$@"; do\n'
@@ -147,7 +152,7 @@ def _fake_systemd_run(bindir: Path, log: Path, *, probe_ok: bool = True,
             'exec "${args[@]}"\n'
         )
     else:
-        body = f'#!/usr/bin/env bash\necho "$*" >> "{log}"\nexit 1\n'
+        body = f'#!/usr/bin/env bash\n{answer}echo "$*" >> "{log}"\nexit 1\n'
     _write_exec(bindir / "systemd-run", body)
     if probe_ok:
         # Production admission always reads kernel-owned /proc paths. The fake
@@ -875,6 +880,34 @@ def test_workload_routing_rejects_invalid_switch(tmp_path, value):
                      env_extra={"CODE_INTEL_WORKLOAD_SLICE": value})
     assert res.returncode == 125
     assert "must be 0 or 1" in res.stderr
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [(0, True), (1, False), (126, True)],
+    ids=["accepted", "refused", "ambiguous-keeps-it"],
+)
+def test_the_scope_passes_its_arguments_literally_where_systemd_can(tmp_path, answer, expected):
+    """On the probe and the workload both."""
+    fakebin, log = tmp_path / "fakebin", tmp_path / "tools.log"
+    slog = tmp_path / "systemd-run.log"
+    _fake_tools(fakebin, log)
+    _fake_systemd_run(fakebin, slog, probe_ok=True, literal_option_rc=answer)
+    repo = _make_repo(tmp_path)
+    res = _run_entry(
+        tmp_path,
+        repo,
+        "gitnexus",
+        path=f"{fakebin}:{_SYSTEM_PATH}",
+        env_extra={
+            "CODE_INTEL_MEM_CEILING_BYTES": str(64 * 1024**3),
+            "CODE_INTEL_MEM_CURRENT_BYTES": str(512 * 1024**2),
+        },
+    )
+    assert res.returncode == 0, res.stderr
+    calls = [line for line in slog.read_text().splitlines() if "MemoryMax=8G" in line]
+    assert len(calls) == 2  # probe and workload
+    assert all(("--expand-environment=no" in line) == expected for line in calls), calls
 
 
 def test_gitnexus_scope_uses_measured_8g_cap(tmp_path):

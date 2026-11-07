@@ -42,7 +42,7 @@ def sl(tmp_path, monkeypatch):
     mod = private_module("genesis_statusline_under_test", _SCRIPT)
     db = tmp_path / "genesis.db"
     monkeypatch.setattr(mod, "_db_path", lambda: db)
-    monkeypatch.setattr(mod, "_review_state", lambda cwd: (2, "feat/x", 3))
+    monkeypatch.setattr(mod, "_branch", lambda cwd: "feat/x")
     mod.test_db = db
     return mod
 
@@ -78,7 +78,7 @@ def test_all_fields_render_from_the_canonical_db(sl, tmp_path, monkeypatch, caps
         },
     )
     assert rc == 0
-    assert out == "feat/x · ledger:2 · streak:2/3 · PR#42:approved\n"
+    assert out == "feat/x · ledger:2 · PR#42:approved\n"
 
 
 def test_ledger_ignores_a_stale_charter_mirror(sl, tmp_path, monkeypatch, capsys):
@@ -105,10 +105,10 @@ def test_chartered_session_with_nothing_open_reads_zero(sl, monkeypatch, capsys)
 
 
 def test_missing_db_and_failing_git_render_absent(sl, monkeypatch, capsys):
-    monkeypatch.setattr(sl, "_review_state", lambda cwd: (_ for _ in ()).throw(OSError("boom")))
+    monkeypatch.setattr(sl, "_branch", lambda cwd: (_ for _ in ()).throw(OSError("boom")))
     rc, out = _run(sl, monkeypatch, capsys, {"session_id": "s", "cwd": "/nonexistent"})
     assert rc == 0
-    assert out == "— · ledger:— · streak:— · PR:—\n"
+    assert out == "— · ledger:— · PR:—\n"
 
 
 def test_unmigrated_db_renders_absent(sl, monkeypatch, capsys):
@@ -117,10 +117,10 @@ def test_unmigrated_db_renders_absent(sl, monkeypatch, capsys):
     assert rc == 0 and "ledger:—" in out
 
 
-def test_unknown_branch_does_not_claim_a_zero_streak(sl, monkeypatch, capsys):
-    monkeypatch.setattr(sl, "_review_state", lambda cwd: (0, "unknown", 3))
+def test_unknown_branch_renders_absent(sl, monkeypatch, capsys):
+    monkeypatch.setattr(sl, "_branch", lambda cwd: "unknown")
     _, out = _run(sl, monkeypatch, capsys, {"cwd": "/"})
-    assert out.startswith("— · ") and "streak:—" in out
+    assert out.startswith("— · ")
 
 
 @pytest.mark.parametrize("raw", ["{not json", "[" * 200_000, "[1, 2]", ""])
@@ -143,7 +143,7 @@ def test_pr_without_review_state(sl, monkeypatch, capsys):
 def test_render_crash_still_prints_a_line(sl, monkeypatch, capsys):
     monkeypatch.setattr(sl, "render", lambda data: 1 / 0)
     rc, out = _run(sl, monkeypatch, capsys, {"cwd": "/x"})
-    assert rc == 0 and out == "— · ledger:— · streak:— · PR:—\n"
+    assert rc == 0 and out == "— · ledger:— · PR:—\n"
 
 
 def _documented_recipe(other_cmd: str) -> str:
@@ -197,7 +197,7 @@ def test_documented_composition_runs_both_status_lines_from_one_stdin(tmp_path):
         {"OTHER": str(other)},
     )
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.splitlines() == ["— · ledger:— · streak:— · PR:—", "other:abc123"]
+    assert proc.stdout.splitlines() == ["— · ledger:— · PR:—", "other:abc123"]
 
 
 def test_a_failing_second_status_line_does_not_blank_ours(tmp_path):
@@ -260,19 +260,15 @@ def _write_round(home: Path, repo: Path, branch: str, n: int) -> None:
     )
 
 
-def test_streak_is_the_gates_own_counter_end_to_end(tmp_path):
-    """Real interpreter + real review_state: a round file the gate would read as
-    2 renders as 2, and the same file written for ANOTHER branch renders as 0 —
-    the branch-scoping the gate applies, not one this script re-implements."""
+def test_branch_end_to_end_and_no_streak_field(tmp_path):
+    """Real interpreter + real review_state: the branch renders, and the retired
+    local review streak is gone from the line even when an old round file exists."""
     repo = _git_repo(tmp_path / "r", "topic")
     _write_round(tmp_path, repo, "topic", 2)
     proc = _run_script(tmp_path, {"cwd": str(repo), "session_id": "e2e"})
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout == "topic · ledger:— · streak:2/3 · PR:—\n"
-
-    _write_round(tmp_path, repo, "some-other-branch", 2)
-    proc = _run_script(tmp_path, {"cwd": str(repo), "session_id": "e2e"})
-    assert proc.stdout == "topic · ledger:— · streak:0/3 · PR:—\n"
+    assert proc.stdout == "topic · ledger:— · PR:—\n"
+    assert "streak" not in proc.stdout
 
 
 def test_non_git_cwd_end_to_end(tmp_path):
@@ -280,4 +276,4 @@ def test_non_git_cwd_end_to_end(tmp_path):
     plain.mkdir()
     proc = _run_script(tmp_path, {"cwd": str(plain)})
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout == "— · ledger:— · streak:— · PR:—\n"
+    assert proc.stdout == "— · ledger:— · PR:—\n"

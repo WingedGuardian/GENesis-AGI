@@ -305,6 +305,8 @@ async def test_incomplete_output_never_claims_success(db, native, returned):
     row = await cc_sessions.get_by_id(db, sid)
     assert row["status"] == "failed"
     assert json.loads(row["metadata"])["result_partial"] is True
+    # Recorded as a partial run, not a bare failure with no reason.
+    assert (row["outcome"], row["outcome_reason"]) == ("partial", "partial_result")
 
 
 async def test_deadline_includes_start_hook_wait(db, native):
@@ -655,7 +657,15 @@ async def test_stdin_failure_still_drains_when_both_kill_methods_refuse(
 
 
 @pytest.mark.parametrize("behavior", ["result", "eof", "cancel"])
-@pytest.mark.parametrize("scoped", [False, True], ids=["process-group", "user-scope"])
+@pytest.mark.parametrize(
+    "scoped",
+    [
+        pytest.param(False, id="process-group"),
+        # A real transient user scope: the live fence's systemd-run stub would
+        # answer "unavailable" and skip it, so it opts out (tests/_live_fence.py).
+        pytest.param(True, id="user-scope", marks=pytest.mark.user_manager),
+    ],
+)
 async def test_native_subprocess_lifecycle_and_provenance(
     db, native, tmp_path, monkeypatch, behavior, caplog, scoped
 ):
@@ -694,6 +704,13 @@ async def test_native_subprocess_lifecycle_and_provenance(
         "_build_args",
         lambda *args, **kwargs: [str(script), "-p", "--output-format", "json"],
     )
+    if scoped:
+        # Probe afresh: an earlier test's probe under the live fence's systemd-run
+        # stub fails and starts the module's retry cooldown, which would answer []
+        # here without probing at all.
+        monkeypatch.setattr("genesis.cc.invoker._SCOPE_ARGS", None)
+        monkeypatch.setattr("genesis.cc.invoker._SCOPE_PROBE_FAILED_AT", None)
+        monkeypatch.setattr("genesis.cc.invoker._SCOPE_PROBE_FAILURES", 0)
     prefix = await _get_scope_args() if scoped else []
     if scoped and not prefix:
         pytest.skip("Native user scope is unavailable on this test host")
@@ -906,6 +923,35 @@ async def test_orphan_with_committed_outcome_is_finished_not_overwritten(
     assert meta["native_state"] == native_state
     assert meta["result_committed"] is True
     assert "error" not in meta
+
+
+@pytest.mark.parametrize(
+    ("native_state", "partial", "error", "outcome", "reason"),
+    [
+        ("failed", True, "execution_failed", "partial", "partial_result"),
+        ("cancelled", True, "cancelled", "failed", "cancelled"),
+        ("failed", False, "deadline_exceeded", "failed", "deadline_exceeded"),
+        ("succeeded", False, None, "unreported", None),
+    ],
+)
+async def test_orphan_with_committed_outcome_keeps_its_outcome(
+    db, native_state, partial, error, outcome, reason
+):
+    """A restart between _finalize's metadata write and its status write: boot
+    records the outcome _finalize would have, not a bare failure."""
+    req = request()
+    sid = await prepare(
+        db,
+        req,
+        native_state=native_state,
+        result_committed=True,
+        result_path="/synthetic/result.md",
+        result_partial=partial,
+        error=error,
+    )
+    assert await reconcile_orphans(db) == 1
+    row = await cc_sessions.get_by_id(db, sid)
+    assert (row["outcome"], row["outcome_reason"]) == (outcome, reason)
 
 
 async def test_successful_managed_run_lets_the_child_flush_before_the_group_kill(

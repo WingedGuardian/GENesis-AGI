@@ -1,0 +1,1 @@
+- **The guards now refuse commands holding bash 5.3's new substitution forms.** Ubuntu 26.04 ships bash 5.3, which runs them where an older bash refuses them, and the parser read them as ordinary parameter text. It now reports them as text it cannot read, so a guard that fails closed refuses, and a mention of that text in a message goes through a file instead.

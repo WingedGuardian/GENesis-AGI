@@ -102,7 +102,7 @@ except Exception as _exc:  # noqa: BLE001 - advisory: degrade to silence
     _IMPORT_ERROR = _exc
 
 _VERBS = frozenset({"rm", "unlink", "shred"})
-_PREFILTER = re.compile(r"\b(?:rm|unlink|shred)\b")
+_PREFILTER = re.compile(r"\b(?:gnu)?(?:rm|unlink|shred)\b")
 _GLOB_CHARS = ("*", "?", "[")
 _HEREDOC = re.compile(r"(?<!<)<<(?!<)")  # not a <<< here-string, which has no body
 _PIPE = re.compile(r"(?<!\|)\|(?!\|)")  # a pipe, not the || list operator

@@ -138,8 +138,10 @@ class CCContingencyDispatcher:
     ) -> ContingencyResult:
         """Route foreground conversation through API.
 
-        Operates in degraded-but-alive mode: same system prompt, conversation
-        history maintained, but no CC tool access.
+        Operates in degraded-but-alive mode, with no CC tool access. This
+        method adds only the system prompt; any chat history arrives inside
+        ``messages`` from the caller (``ConversationLoop._try_contingency``
+        fences the recent recap into the user turn).
         """
         full_messages = [{"role": "system", "content": system_prompt}] + messages
 

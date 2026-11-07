@@ -123,20 +123,26 @@ cache symlinks are unlinked without inspecting or deleting their targets.
 both the current views version and the captured inputs signature. Every table
 is read completely into connection-private DuckDB tables in one transaction,
 with its schema checked against the manifest. A missing, corrupt, unreadable,
-incompatible or stale snapshot rolls back and uses live views over the same
-captured source selection, emitting one `snapshot_fallback` event. This also
-catches damaged data pages with intact Parquet footers. A successful connection
+incompatible or stale snapshot rolls back, emits one `snapshot_fallback` event,
+and the derived views are computed live over the same captured source
+selection instead. This also catches damaged data pages with intact Parquet
+footers. A successful connection
 no longer depends on disposable files, so cache cleanup cannot break later
 queries. Full reads trade connection-start work and private spill for catching
 all snapshot read errors before results reach the caller.
 
-Use `run_query(..., live=True)` (CLI `sql --live`) for raw views; snapshots
-contain derived views only. The first release also requires `--live` for harmless
-raw-looking SQL text, including `SELECT 'raw_tool_calls'`, comments and search
-patterns such as `LIKE '%raw_%'`. Its text check is case sensitive, so uppercase
-raw relation queries can behave differently after cache fallback. Use `--live`
-consistently for these queries. This is a deferred SQL usability limitation, not
-a security boundary. The private spill rules also
+Use `run_query(..., live=True)` for raw views. Without it a connection holds
+the derived views only, in both modes: when no snapshot is current, the live
+graph is built on a private connection and each derived view is read in full
+into the returned one. Raw views and reconciliation intermediates therefore
+never reach a `live=False` caller, the SQL text is never inspected, and a reader
+never takes the writer lock or writes the store. A cache miss computes every
+derived view, which costs several times more than a lazy read of one; snapshots
+built on a schedule keep misses rare. The copy uses lossless Arrow conversion,
+so column types match the snapshot's, and the two DuckDB instances share the
+caller's memory limit by halves while it runs. `live=False` is a consistency
+guarantee, not a security boundary: DuckDB file functions such as
+`read_parquet()` still read the per-source records. The private spill rules also
 apply to snapshot materialization. `derive.is_current` checks the complete
 cache, not just file existence.
 

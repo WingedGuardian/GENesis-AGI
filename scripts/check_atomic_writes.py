@@ -10,7 +10,7 @@ both halves -- the leak happens, and nothing sweeps that directory
 sweeps only `~/.genesis/cc-tmp`. Neither covers the `~/.genesis` root).
 
 WHY A GUARD AND NOT JUST FIXES. MEASURED 2026-09-09 against the merge of this
-tree (re-derived 2026-10-22): 84 atomic-write sites across 70 files, 30 of them dirty.
+tree (re-derived 2026-11-06): 88 atomic-write sites across 75 files, 31 of them dirty.
 That denominator moved FOUR times, in both directions, and every move is worth
 recording because each was invisible in a different way:
   * +1 site (58 -> 59). The temp-name test was anchored to the END of a string
@@ -48,7 +48,7 @@ recording because each was invisible in a different way:
     every time a PR adding sites is open while main re-measures, and it is the
     merge -- not either parent -- that has to be measured. Found by the audit of
     that merge, not by the merge itself.
-Fixing 30 instances of a recurring pattern leaves nothing to stop instance 31.
+Fixing 31 instances of a recurring pattern leaves nothing to stop instance 32.
 This is the prose-to-gate move: the rule was "clean up your temp", carried by
 convention, and conventions are what reviewers find one instance of at a time.
 
@@ -89,8 +89,8 @@ EXCEPTION. The baseline key excludes the line number on purpose (line numbers
 churn on every unrelated edit above them), so a SECOND unprotected write added
 inside an already-baselined function, with the same temp name, collides with the
 existing row and passes silently. Verified: no duplicate dirty keys exist today,
-so the ledger is currently honest. But "instance 31 cannot arrive silently" is
-true only OUTSIDE the 30 functions already listed, and saying it unqualified was
+so the ledger is currently honest. But "instance 32 cannot arrive silently" is
+true only OUTSIDE the 31 functions already listed, and saying it unqualified was
 an overclaim. The baseline below is a
 DEBT LEDGER, not an exemption list: every entry is a known leak awaiting a fix,
 it is expected to shrink, and the guard reports entries that no longer match so

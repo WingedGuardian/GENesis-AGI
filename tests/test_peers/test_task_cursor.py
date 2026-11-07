@@ -35,7 +35,9 @@ def test_stamp_rejects_noncanonical_or_invalid_calendar(stamp):
 @pytest.mark.parametrize("field,value", [
     ("v", True), ("v", 2), ("id", "unowned"), ("id", None),
     ("at", "2026-02-30T00:00:00.000Z"), ("peer", "beta"),
-    ("epoch", "b" * 32), ("context", str(uuid4())), ("extra", "unexpected"),
+    ("epoch", "b" * 32),
+    pytest.param("context", str(uuid4()), id="context-uuid"),
+    ("extra", "unexpected"),
 ])
 def test_cursor_refuses_type_version_and_scope_changes(field, value):
     body = {"v": 1, "id": SID, "at": STAMP, "peer": PEER["peer_id"], "epoch": PEER["epoch"], "context": None}
@@ -45,7 +47,10 @@ def test_cursor_refuses_type_version_and_scope_changes(field, value):
     assert refused.value.code == "validation_error" and refused.value.status == 400
 
 
-@pytest.mark.parametrize("token", [SID, "", "A" * 1025, "++//", packed("[]"), packed("{}"), packed('{"v":1,"v":1}'), packed("null"), "a"])
+@pytest.mark.parametrize("token", [
+    pytest.param(SID, id="legacy-uuid"),
+    "", "A" * 1025, "++//", packed("[]"), packed("{}"), packed('{"v":1,"v":1}'), packed("null"), "a",
+])
 def test_cursor_refuses_legacy_malformed_and_duplicate_fields(token):
     with pytest.raises(ConversationRefusal) as refused:
         decode(token, PEER, None)

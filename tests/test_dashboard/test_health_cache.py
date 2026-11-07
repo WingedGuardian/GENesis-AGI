@@ -124,9 +124,26 @@ async def test_per_request_keys_never_reach_the_shared_snapshot():
 # --------------------------------------------------------------------------
 
 _CHECKOUT = {"status": "dirty", "count": 2, "paths": ["a.txt", "b.txt"], "paths_omitted": 0}
+_REPAIRS = {
+    "reports": [
+        {
+            "ts": "20260101T000000Z-1",
+            "backup_dir": "/srv/install/.genesis/deploy-backups/20260101T000000Z-1-live-move-repair",
+            "saved": 3,
+            "result": "healed",
+            "dismissed": False,
+            "unresolved": False,
+        }
+    ],
+    "saved": 3,
+    "refused": 1,
+    "unread_older": 2,
+    "unresolved": False,
+    "a_future_key": "/srv/install/private",
+}
 
 
-async def _health_as(remote_addr, headers=None, *, verified=False, monkeypatch):
+async def _health_as(remote_addr, headers=None, *, verified=False, monkeypatch, repairs=None):
     """Call the route as a peer at ``remote_addr``; returns (body, cached)."""
     from genesis.dashboard import auth
 
@@ -137,7 +154,11 @@ async def _health_as(remote_addr, headers=None, *, verified=False, monkeypatch):
     async def _compute():
         return {
             "infrastructure": {"genesis.db": {"status": "healthy"}},
-            "deploy_health": {"status": "attention", "main_checkout": dict(_CHECKOUT)},
+            "deploy_health": {
+                "status": "attention",
+                "main_checkout": dict(_CHECKOUT),
+                "live_repairs": dict(_REPAIRS) if repairs is None else repairs,
+            },
         }
 
     svc._compute_snapshot = _compute
@@ -222,6 +243,39 @@ async def test_the_internal_bearer_gets_the_checkout_file_names(monkeypatch):
         "198.51.100.7", {"Authorization": "Bearer wrong"}, monkeypatch=monkeypatch
     )
     assert "paths" not in body["deploy_health"]["main_checkout"]
+
+
+@pytest.mark.asyncio
+async def test_an_untrusted_peer_gets_live_repair_counts_only(monkeypatch):
+    """A4: the repair's reports name the home directory (the backup folder)
+    and report names. An untrusted caller gets an allow-list of counts, never
+    `reports` nor a key added later; the cached snapshot keeps the detail."""
+    body, cached = await _health_as("198.51.100.7", monkeypatch=monkeypatch)
+    repairs = body["deploy_health"]["live_repairs"]
+    assert repairs == {"saved": 3, "refused": 1, "unread_older": 2, "unresolved": False}, repairs
+    assert "/srv/install" not in str(body) and "20260101T000000Z-1" not in str(body), body
+    assert cached["deploy_health"]["live_repairs"]["reports"] == _REPAIRS["reports"]
+
+
+@pytest.mark.asyncio
+async def test_a_live_repairs_value_that_is_not_the_collectors_dict_fails_closed(monkeypatch):
+    """The redaction is an allow-list of the collector's dict; any other shape a
+    later change might put there reaches an untrusted caller as nothing."""
+    leak = ["/srv/install/.genesis/deploy-backups/20260101T000000Z-1-live-move-repair"]
+    body, _ = await _health_as("198.51.100.7", monkeypatch=monkeypatch, repairs=leak)
+    assert body["deploy_health"]["live_repairs"] is None, body
+    assert "/srv/install" not in str(body), body
+
+
+@pytest.mark.asyncio
+async def test_the_internal_bearer_gets_the_live_repair_reports(monkeypatch):
+    from genesis.dashboard import auth
+
+    monkeypatch.setattr(auth, "get_or_create_internal_api_token", lambda: "tok")
+    body, _ = await _health_as(
+        "198.51.100.7", {"Authorization": "Bearer tok"}, monkeypatch=monkeypatch
+    )
+    assert body["deploy_health"]["live_repairs"] == _REPAIRS
 
 
 # --------------------------------------------------------------------------

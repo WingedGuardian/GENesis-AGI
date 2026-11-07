@@ -40,6 +40,8 @@ if _WORKTREE_SRC.is_dir():
 
 import contextlib  # noqa: E402
 import os  # noqa: E402
+import shutil  # noqa: E402
+import subprocess  # noqa: E402
 
 import aiosqlite  # noqa: E402
 import pytest  # noqa: E402
@@ -391,7 +393,25 @@ def _is_introspection_only(config) -> bool:
     )
 
 
+pytest_plugins = ["tests._live_fence", "tests._live_closure", "tests._live_outbound"]
+
+
 def pytest_configure(config):
+    _configure_lock_and_basetemp(config)
+    # Armed AFTER the lock (a run refused by it exits above) and after basetemp is
+    # placed (the fence allows fakes under it). See tests/_live_fence.py.
+    from tests import _live_closure, _live_fence, _live_outbound
+
+    _live_fence.install(config)
+    # Live state paths and endpoints out of the environment, before any test runs
+    # (a test's own monkeypatch still wins). See tests/_live_closure.py.
+    _live_closure.install(config)
+    # In-process connects to live services on this machine, refused as on CI
+    # (reads the real home the live fence resolved). See tests/_live_outbound.py.
+    _live_outbound.install(config)
+
+
+def _configure_lock_and_basetemp(config):
     # ── Box-wide serialization ─────────────────────────────────────────────
     # Acquire BEFORE anything else, and before the basetemp early-return
     # below, so every exit path from this function is already governed.
@@ -493,6 +513,10 @@ def pytest_unconfigure(config):
     produces."""
     target = getattr(config, "_genesis_basetemp_cleanup", None)
     try:
+        from tests import _live_closure, _live_fence
+
+        _live_fence.uninstall_files(config)
+        _live_closure.uninstall_files(config)
         if target:
             # BROAD for the same reason as pytest_configure's fallback: a hook that
             # raises turns a passing suite into exit 1, and cleanup is best-effort.
@@ -538,6 +562,20 @@ def updates_sandbox(tmp_path, monkeypatch):
     return isolate_update_routes(
         monkeypatch, tmp_path / "sandbox-home", scratch_repo(tmp_path / "sandbox-repo")
     )
+
+
+# ── The deploy engine probe: unanswered for tests that build a health snapshot ──
+@pytest.fixture
+def deploy_engine_unanswered(monkeypatch):
+    """The health snapshot's deploy section runs ``scripts/deploy_candidates list
+    --json`` against this checkout, which reads the install's real deploy manifest
+    and which the live fence refuses. Tests that build a whole snapshot answer it
+    the way an unreachable engine does (``None``: carried as unknown, never 0)."""
+    import importlib
+
+    # The package re-exports a function named deploy_health; patch the module.
+    module = importlib.import_module("genesis.observability.snapshots.deploy_health")
+    monkeypatch.setattr(module, "_observe_engine", lambda *args, **kwargs: None)
 
 
 # ── Graph-traversal telemetry is OFF unless a test opts in ─────────────────
@@ -605,6 +643,19 @@ def _isolate_alert_queue(tmp_path):
     mp.undo()
 
 
+# ── Determinism: a launcher's systemd-run option probe is not a process to count ─
+@pytest.fixture(autouse=True)
+def _no_systemd_run_option_probe():
+    """``literal_scope_args`` asks ``systemd-run`` for every scope a launcher builds,
+    which tests counting that launcher's processes would see, and it would make what
+    they build depend on the machine. Answers as an older systemd would, so no option is
+    added. Its own tests call the real function. Fixture-owned ``MonkeyPatch``, as above."""
+    mp = pytest.MonkeyPatch()
+    mp.setattr("genesis.util.systemd._systemd_run_refuses_literal_arguments", lambda: True)
+    yield
+    mp.undo()
+
+
 # ── Safety: prevent tests from moving files into the REAL trash ─────────────
 @pytest.fixture(autouse=True)
 def _isolate_trash_root(tmp_path):
@@ -652,6 +703,21 @@ def _skip_daily_git_deep_scan():
     mp.setattr(awareness_loop, "_last_git_deep_run_at", time.monotonic())
     mp.setattr(awareness_loop, "_git_deep_task", None)
     mp.setattr(awareness_loop, "_git_deep_stopped", False)
+    yield
+    mp.undo()
+
+
+@pytest.fixture(autouse=True)
+def _reset_memory_alarm_breakdown():
+    """Drop the memory alarm's held process breakdown (``errors._memory_culprits``)
+    so one test firing the alarm cannot hand its line to the next. Applied only
+    when the module is already loaded, like the deep-scan guard above."""
+    errors = sys.modules.get("genesis.mcp.health.errors")
+    if errors is None:
+        yield
+        return
+    mp = pytest.MonkeyPatch()
+    mp.setattr(errors, "_memory_culprits", None)
     yield
     mp.undo()
 
@@ -726,6 +792,9 @@ def _isolate_genesis_db_path(tmp_path):
         "genesis.env.genesis_db_path",
         lambda: tmp_path / "isolated-genesis.db",
     )
+    # The same file for child processes, and for modules that bound the name
+    # before this patch (``from genesis.env import genesis_db_path``).
+    mp.setenv("GENESIS_DB_PATH", str(tmp_path / "isolated-genesis.db"))
     yield
     mp.undo()
 
@@ -898,6 +967,30 @@ def _guard_db_crud_not_mocked():
         )
 
 
+@contextlib.contextmanager
+def process_running_as(path):
+    """A live process whose ``/proc/<pid>/exe`` is ``path``, killed on exit.
+
+    The stand-in is a copy of bash, never of a coreutil: on Ubuntu 26.04 those are
+    one multicall binary that picks its applet from the executable's name, so a
+    copy of ``sleep`` under another name exits at once and a test watching for it
+    passes or fails on a process that is already gone. The handshake is the proof
+    that this one got as far as running.
+    """
+    shutil.copy2(shutil.which("bash"), path)
+    with subprocess.Popen(
+        [str(path), "-c", "echo ready; read -t 30"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    ) as proc:
+        try:
+            assert proc.stdout.readline() == b"ready\n", f"{path} did not stay running"
+            assert os.path.realpath(f"/proc/{proc.pid}/exe") == os.path.realpath(path)
+            yield proc
+        finally:
+            proc.kill()
+
+
 def private_module(name: str, path):
     """Load ``path`` as a PRIVATE module without leaking ``name`` to everyone.
 
@@ -1051,12 +1144,10 @@ def _claim_active_test_breadcrumb():
     ``pytest_lock``'s HELD_ENV does the same job for the box-wide lock, and its
     tests pop it precisely so a child stops mistaking itself for the outer run.
 
-    LIMIT, stated rather than discovered later: under ``pytest-xdist`` every
-    worker is a child that inherits the owner, so all of them stand down and no
-    breadcrumb is written. The suite does not use xdist (it is not a declared
-    dependency), and a wrong name is worse than a missing one, so standing down
-    is the right direction to fail -- but a future ``-n`` would need a
-    per-worker path rather than this claim.
+    Under ``pytest-xdist`` every worker is a child that inherits the owner, so
+    no worker writes the breadcrumb. The controller owns it instead: xdist
+    re-fires ``pytest_runtest_logstart``/``logfinish`` there for every worker's
+    test, so the file lists every test in flight (see ``pytest_runtest_logfinish``).
     """
     if not os.environ.get(ACTIVE_TEST_FILE_ENV):
         return
@@ -1107,6 +1198,7 @@ def pytest_sessionstart(session):
     step failed or before the first update that ran it; a hang observed on
     2026-10-11 held the box lock for about 40 minutes in a venv without it.
     """
+    _note_real_home_at_start(session.config)
     config = session.config
     if config.pluginmanager.hasplugin("timeout"):
         return
@@ -1115,6 +1207,37 @@ def pytest_sessionstart(session):
         reporter.write_line(_NO_TIMEOUT_WARNING, yellow=True, bold=True)
     else:
         sys.stderr.write(_NO_TIMEOUT_WARNING + "\n")
+
+
+# CI only: whether the runner's real ~/.genesis existed when the run began. A test
+# that writes the real home there (the runtime bootstrap once wrote two files on
+# every local run) is named at the end instead of passing unseen. Advisory: it
+# never fails the run.
+_REAL_GENESIS_HOME = Path.home() / ".genesis"
+_REAL_GENESIS_HOME_AT_START: bool | None = None
+
+
+def _note_real_home_at_start(config) -> None:
+    global _REAL_GENESIS_HOME_AT_START
+    if os.environ.get("CI") and not hasattr(config, "workerinput"):
+        _REAL_GENESIS_HOME_AT_START = _REAL_GENESIS_HOME.exists()
+
+
+def pytest_terminal_summary(terminalreporter):
+    if _REAL_GENESIS_HOME_AT_START is not False or not _REAL_GENESIS_HOME.exists():
+        return
+    try:
+        found = sorted(str(p.relative_to(_REAL_GENESIS_HOME)) for p in _REAL_GENESIS_HOME.rglob("*"))
+    except OSError as exc:
+        found = [f"(could not list it: {exc})"]
+    terminalreporter.section("real home written during the run (advisory)", yellow=True)
+    terminalreporter.write_line(
+        f"{_REAL_GENESIS_HOME} did not exist when the run began and does now, with "
+        f"{len(found)} entries. A test (or a module imported during collection) "
+        "wrote the real home instead of a temp one:"
+    )
+    for name in found:
+        terminalreporter.write_line(f"  {name}")
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -1149,6 +1272,46 @@ def pytest_runtest_logstart(nodeid, location):
     path = os.environ.get(ACTIVE_TEST_FILE_ENV)
     if not path or not _owns_active_test_breadcrumb():
         return
+    _IN_FLIGHT[nodeid] = None
+    _write_breadcrumb(path)
+
+
+def pytest_runtest_logfinish(nodeid, location):
+    """Drop a finished test from the breadcrumb while others are still running.
+
+    Serially at most one test is in flight, and when it finishes the file is left
+    naming it, exactly as before: a crash between tests is "at or immediately
+    after" the last one to start. Under pytest-xdist the controller re-fires both
+    hooks for every worker, so up to one test per worker is in flight; the file
+    then lists them all rather than whichever worker reported last.
+    """
+    path = os.environ.get(ACTIVE_TEST_FILE_ENV)
+    if not path or not _owns_active_test_breadcrumb():
+        return
+    _IN_FLIGHT.pop(nodeid, None)
+    if _IN_FLIGHT:
+        _write_breadcrumb(path)
+
+
+# Tests started and not yet finished, in start order (a dict keeps it).
+_IN_FLIGHT: dict[str, None] = {}
+
+
+def pytest_runtest_logreport(report):
+    """A test whose pytest-xdist worker crashed never gets a logfinish: xdist
+    reports it once, with ``when="???"``. Drop it then, or every later rewrite
+    would list a dead test as still running."""
+    if report.when != "???" or report.nodeid not in _IN_FLIGHT:
+        return
+    path = os.environ.get(ACTIVE_TEST_FILE_ENV)
+    if not path or not _owns_active_test_breadcrumb():
+        return
+    _IN_FLIGHT.pop(report.nodeid, None)
+    if _IN_FLIGHT:
+        _write_breadcrumb(path)
+
+
+def _write_breadcrumb(path: str) -> None:
     try:
         # surrogateescape, and `except Exception`, because a node id is not
         # guaranteed to be encodable. On POSIX a filename carrying a non-UTF-8
@@ -1159,7 +1322,7 @@ def pytest_runtest_logstart(nodeid, location):
         # be readable after a crash; being the crash is the one outcome it may
         # not have.
         with open(path, "w", encoding="utf-8", errors="surrogateescape") as fh:
-            fh.write(f"{nodeid}\n")
+            fh.write("".join(f"{n}\n" for n in _IN_FLIGHT))
             fh.flush()
             os.fsync(fh.fileno())
     except Exception:  # noqa: BLE001 - see above: this may never fail the suite

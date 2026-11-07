@@ -1,1 +1,0 @@
-- Enforce external and validator Genesis MCP tool profiles during discovery and direct calls, and skip unused health dispatch initialization for external clients.

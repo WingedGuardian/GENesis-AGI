@@ -29,9 +29,15 @@ class _JSONPairs(list):
     """Keep every object member, including duplicate keys, when decoding strings."""
 
 
+def _safe(text, allow):
+    result = scan_outbound(text)
+    return result.safe or set(result.detected) <= allow
+
+
 class _WorkBudget:
-    def __init__(self, limit=_MAX_SCAN_WORK):
+    def __init__(self, limit=_MAX_SCAN_WORK, allow=frozenset()):
         self.remaining = limit
+        self.allow = allow
 
     def charge(self, size):
         self.remaining -= max(1, size)
@@ -40,11 +46,15 @@ class _WorkBudget:
 
     def scan(self, text):
         self.charge(len(text))
-        return scan_outbound(text).safe
+        return _safe(text, self.allow)
 
 
-def json_strings_safe(value):
+def json_strings_safe(value, *, allow=frozenset()):
     """Refuse unsafe original or decoded JSON; fail closed on invalid or excessive work.
+
+    ``allow`` names ``scan_outbound`` patterns to tolerate (for example the
+    location-style ones a same-owner reader may see); every other pattern
+    still refuses.
 
     Scope: accident hygiene for same-owner peers, at least as strict as the
     outbound scan on other egress. It is not a confidentiality boundary: a
@@ -55,7 +65,7 @@ def json_strings_safe(value):
     Aggregate scanning is bounded to 32 times that limit; unusually nested or
     repetitive structures can be refused even when their serialization fits.
     """
-    budget = _WorkBudget()
+    budget = _WorkBudget(allow=frozenset(allow))
     try:
         # Inspect primitive lengths without allocating their escaped JSON form.
         preflight = _WorkBudget(_MAX_JSON_BYTES)
@@ -71,7 +81,7 @@ def json_strings_safe(value):
                 return False
             for key in keys:
                 budget.charge(len(key) + len(scalar) + 3)
-                if not scan_outbound("".join((key, " = ", scalar))).safe:
+                if not _safe("".join((key, " = ", scalar)), budget.allow):
                     return False
         return True
     except (TypeError, ValueError, RecursionError):

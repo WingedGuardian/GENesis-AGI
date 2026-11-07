@@ -27,8 +27,10 @@ def test_spill_uses_private_connection_children(tmp_path, monkeypatch, override,
     old = os.umask(0o022)
     first = second = None
     try:
-        first = query.connect(data, memory_limit="16MB", threads=1)
-        second = query.connect(data, memory_limit="16MB", threads=1)
+        # live=True: this measures spill privacy, and 16 MB cannot compute every
+        # derived view eagerly, which live=False does when no snapshot exists.
+        first = query.connect(data, memory_limit="16MB", threads=1, live=True)
+        second = query.connect(data, memory_limit="16MB", threads=1, live=True)
         children = sorted(root.glob("private-*"))
         assert len(children) == 2
         for child in children:

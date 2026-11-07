@@ -27,6 +27,29 @@ _SEVERITY_EMOJI = {
 
 _API_BASE = "https://api.telegram.org/bot{token}"
 
+
+def _utf16_units(text: str) -> int:
+    """Length as Telegram counts it: UTF-16 code units, so a character outside the
+    Basic Multilingual Plane (most emoji) counts twice. Per character, so a lone
+    surrogate cannot raise the way an encode would."""
+    return sum(2 if ord(ch) > 0xFFFF else 1 for ch in text)
+
+
+def _cut(text: str, limit: int) -> str:
+    """Bound one raw field BEFORE it is escaped, so no tag or entity is split.
+    Telegram refuses a message over 4,096 UTF-16 units of parsed text, which
+    would drop the alert itself; the field limits below, in the same units, sum
+    to well under that (escapes parse back to one character each)."""
+    if _utf16_units(text) <= limit:
+        return text
+    kept, used = [], 0
+    for ch in text:
+        used += 2 if ord(ch) > 0xFFFF else 1
+        if used > limit:
+            break
+        kept.append(ch)
+    return "".join(kept) + " … (cut)"
+
 # Sentinel returned by _poll_for_keyword_sync when getUpdates reports a 409
 # Conflict. A 409 means another consumer (the main Genesis bot) is actively
 # long-polling the SAME bot token — i.e. the main bot is alive. The caller
@@ -115,13 +138,13 @@ class TelegramAlertChannel(AlertChannel):
     def _format_alert(self, alert: Alert) -> str:
         """Format alert as HTML for Telegram."""
         emoji = _SEVERITY_EMOJI.get(alert.severity, "")
-        parts = [f"{emoji} <b>Guardian: {html.escape(alert.title)}</b>"]
+        parts = [f"{emoji} <b>Guardian: {html.escape(_cut(alert.title, 200))}</b>"]
 
         if alert.body:
-            parts.append(f"\n{html.escape(alert.body)}")
+            parts.append(f"\n{html.escape(_cut(alert.body, 2000))}")
 
         if alert.failed_probes:
-            probes = ", ".join(html.escape(p) for p in alert.failed_probes)
+            probes = html.escape(_cut(", ".join(alert.failed_probes), 1000))
             parts.append(f"\n<b>Failed probes:</b> {probes}")
 
         if alert.duration_s is not None:
@@ -134,10 +157,12 @@ class TelegramAlertChannel(AlertChannel):
             parts.append(f"<b>Duration:</b> {duration}")
 
         if alert.likely_cause:
-            parts.append(f"<b>Likely cause:</b> {html.escape(alert.likely_cause)}")
+            parts.append(f"<b>Likely cause:</b> {html.escape(_cut(alert.likely_cause, 500))}")
 
         if alert.proposed_action:
-            parts.append(f"<b>Proposed action:</b> {html.escape(alert.proposed_action)}")
+            parts.append(
+                f"<b>Proposed action:</b> {html.escape(_cut(alert.proposed_action, 100))}"
+            )
 
         return "\n".join(parts)
 

@@ -3,8 +3,9 @@
 import json
 
 import pyarrow.parquet as pq
+import pytest
 
-from genesis.transcript_analytics import derive, store, verify
+from genesis.transcript_analytics import derive, query, store, verify
 
 
 def test_verify_detects_schema_valid_cache_rows_that_differ_from_live(tmp_path):
@@ -55,3 +56,20 @@ def test_status_keeps_captured_source_metadata_when_collection_publishes(tmp_pat
     result = cli._status(argparse.Namespace(data=data, projects=projects))
     assert result["malformed_lines"] == 0
     assert result["snapshot_current"] is True
+
+
+def test_verify_without_a_snapshot_reports_unavailable_without_a_live_build(tmp_path, monkeypatch):
+    projects, data = tmp_path / "projects", tmp_path / "data"
+    projects.mkdir()
+    (projects / "source.jsonl").write_text(json.dumps({
+        "type": "assistant", "uuid": "event", "sessionId": "session",
+        "message": {"id": "message", "model": "fixture", "stop_reason": "end_turn",
+                    "content": [], "usage": {"input_tokens": 1, "output_tokens": 1}},
+    }) + "\n")
+    assert store.ingest(projects, data)["rebuilt"] == 1
+    monkeypatch.setattr(
+        query, "_load_live_derived", lambda *a, **k: pytest.fail("verify computed the live fallback")
+    )
+    result = verify.verify(data)
+    assert result["ok"] is False and result["snapshot_current"] is False
+    assert result["unavailable"] == "no readable current snapshot; run derive"

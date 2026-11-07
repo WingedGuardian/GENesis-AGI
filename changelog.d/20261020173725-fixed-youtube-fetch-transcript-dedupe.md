@@ -1,1 +1,0 @@
-- The `youtube-fetch` skill's fallback (yt-dlp) transcript step no longer breaks when the skill is loaded with arguments: its de-duplication kept only the first line, or failed with an awk syntax error.

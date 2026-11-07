@@ -14,7 +14,9 @@ import time
 from typing import Any
 
 from fastmcp.exceptions import ToolError
+from fastmcp.exceptions import ValidationError as ToolValidationError
 from fastmcp.server.middleware import Middleware
+from pydantic import ValidationError as PydanticValidationError
 
 from genesis.observability.commit_identity import is_stale
 from genesis.observability.commit_identity import (
@@ -43,14 +45,25 @@ class InstrumentationMiddleware(Middleware):
 
     Per-call transaction boundary (WS-15 follow-up): when constructed with the
     server's long-lived ``db`` connection, each tool call commits only after a
-    clean return and rolls back otherwise. This releases the read snapshot that a
-    read-only tool would otherwise leave open in deferred-isolation mode — which
-    pins the SQLite WAL checkpoint and makes later writes fail "database is locked".
-    Writes already commit at the CRUD layer before the tool returns, so the commit
-    here only closes a *trailing* read txn (it can never discard a tool's own
-    write); any non-clean exit — a raised ``Exception``, or a ``BaseException`` no
-    clause catches (``asyncio.CancelledError``, ``SystemExit``, …) — rolls back the
-    possibly-partial write instead of committing it. The boundary swallows
+    clean return and rolls back otherwise. What that boundary can and cannot end
+    (measured on a scratch database, Python 3.12 / SQLite 3.45 / aiosqlite 0.22,
+    legacy implicit-BEGIN isolation, WAL):
+
+    - commit/rollback end an open WRITE transaction, i.e. one a DML statement
+      began and nothing has committed yet;
+    - a read-only call opens no transaction (a SELECT does not BEGIN in this
+      mode), so for it the boundary is a no-op;
+    - a partially read multi-row SELECT pins the WAL checkpoint until its cursor
+      is closed or read to the end, and commit/rollback do NOT release that pin
+      (a ``LIMIT 1`` read with ``fetchone()`` steps to the end and pins nothing).
+
+    Most writes already commit at the CRUD layer before the tool returns, so the
+    commit here only flushes a write the tool left uncommitted (it can never
+    discard a tool's own write); any non-clean exit — a raised ``Exception``,
+    or a ``BaseException`` no clause catches (``asyncio.CancelledError``, ``SystemExit``, …) — rolls back the
+    possibly-partial write instead of committing it, but only when no other call
+    is in flight on the shared connection (a rollback then would discard a
+    concurrent call's uncommitted write; see ``on_call_tool``). The boundary swallows
     nothing: a ``BaseException`` is not caught at all, and the one ``except
     Exception`` clause always re-raises — sometimes as a ``ToolError`` chained to
     the original, when the argument diagnosis below can name a better cause. DB
@@ -66,6 +79,11 @@ class InstrumentationMiddleware(Middleware):
         self._tracker = tracker
         self._server = server_name
         self._db = db
+        # Tool calls in flight on this server's shared connection. The MCP SDK
+        # runs each request in its own task, so calls overlap; a failure
+        # rollback is only safe when no other call can have an uncommitted
+        # statement on the same connection (see on_call_tool's finally).
+        self._calls_in_flight: int = 0
         # Latches True once a post-spawn deploy is confirmed (staleness is
         # monotonic — it never reverts). A False verdict is deliberately NOT
         # cached; see _is_stale.
@@ -86,11 +104,13 @@ class InstrumentationMiddleware(Middleware):
         # and commit a partial). Nothing is swallowed: the ``except Exception``
         # below always re-raises, and a cancellation is not caught at all.
         success = False
+        self._calls_in_flight += 1
         try:
             if tool_name in GUARDED_MCP_TOOLS:
                 # Raises ToolError (block mode) if this subprocess is running
-                # stale code. Inside the try so the finally's rollback releases
-                # the read snapshot the staleness check opened on self._db.
+                # stale code. Inside the try so a block is recorded as a failed
+                # call. Its update_history read is LIMIT 1 + fetchone(), which
+                # opens no transaction and leaves no snapshot pinned.
                 await self._enforce_freshness(tool_name)
             result = await call_next(context)
             success = True
@@ -110,8 +130,14 @@ class InstrumentationMiddleware(Middleware):
             # slightly wrong explanation on a call that was refused regardless.
             hint = None
             try:
+                # v4 wraps binding errors in its own ValidationError. Keep the
+                # structured Pydantic error for the diagnosis; never unwrap a
+                # body exception or infer missing names from rendered prose.
+                diagnosis_error = exc
+                if isinstance(exc, ToolValidationError) and isinstance(exc.__cause__, PydanticValidationError):
+                    diagnosis_error = exc.__cause__
                 hint = absorbed_parameter_hint(
-                    exc,
+                    diagnosis_error,
                     getattr(context.message, "arguments", None) or {},
                     tool_name,
                 )
@@ -144,13 +170,36 @@ class InstrumentationMiddleware(Middleware):
             # cancelled `commit()` is durable afterwards. Issuing a rollback
             # here would either be a no-op behind the commit already in the
             # queue, or would discard a successful tool call's writes.
+            #
+            # The failure rollback runs only when this is the ONLY call in
+            # flight. The connection is shared and SerializedConnection lets
+            # two calls' statements interleave, so a rollback while another
+            # call sits between its execute and its own commit discards THAT
+            # call's write while it goes on to report success (reproduced by
+            # tests/test_observability/test_mcp_middleware_concurrency.py).
+            # Skipping it under concurrency leaves this call's partial
+            # statement, if any, for the next commit to flush: the same
+            # outcome a peer's commit already produced before this guard. It
+            # leaves no read snapshot behind: a read-only call opens no
+            # transaction, and a cursor-pinned snapshot is released only by
+            # closing the cursor, never by commit or rollback (class docstring).
+            # Per-call atomicity on one shared connection needs per-request
+            # connections, which this boundary cannot provide; that residual is
+            # tracked as P2b in the P4 shared-service design. Only calls
+            # through this middleware are counted.
             try:
                 if self._db is not None:
                     try:
                         if success:
                             await self._db.commit()
-                        else:
+                        elif self._calls_in_flight == 1:
                             await self._db.rollback()
+                        else:
+                            logger.warning(
+                                "Skipped rollback after failed %s: %d other "
+                                "call(s) in flight on the shared connection",
+                                provider, self._calls_in_flight - 1,
+                            )
                     except Exception:
                         logger.warning(
                             "DB %s after %s failed",
@@ -158,6 +207,10 @@ class InstrumentationMiddleware(Middleware):
                             provider, exc_info=True,
                         )
             finally:
+                # Decrement first and unconditionally: the record below can
+                # raise BaseException too, and a leaked count would disable the
+                # failure rollback for the life of the server process.
+                self._calls_in_flight -= 1
                 try:
                     self._tracker.record(
                         provider,

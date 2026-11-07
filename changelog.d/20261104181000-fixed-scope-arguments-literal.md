@@ -1,0 +1,1 @@
+- **Commands started in a systemd scope now receive their arguments exactly as written, on every systemd version.** Background Claude sessions, `genesis.hostmetrics run`, dashboard updates and the code-intelligence indexer all start commands this way, and Genesis now asks for literal arguments wherever systemd supports the option.

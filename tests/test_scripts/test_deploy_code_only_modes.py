@@ -96,11 +96,14 @@ _SCRIPT_FILES = (
     "deploy_code_only.sh",
     "lib/guardian_pause.sh",
     "lib/deploy_marker.sh",
+    "lib/gnu_timeout.sh",
     "lib/live_system_guard.sh",
     "lib/alert_queue.sh",
     "lib/deploy_status.sh",
     "lib/deploy_checkout.sh",
     "lib/server_session_refusal.sh",
+    "lib/shared_mcp_units.sh",
+    "lib/mcp_rollout.py",
     "lib/checkout_lock.sh",
     "lib/deploy_recovery.sh",
     "lib/port_owned_by.py",
@@ -1121,7 +1124,9 @@ def test_every_documented_validation_hold_uses_the_scripts_lock_path():
     docs = [
         SCRIPT,
         root / ".claude" / "skills" / "build-session" / "SKILL.md",
-        root / "changelog.d" / "20260927020000-added-deploy-code-only.md",
+        root / "CHANGELOG.md",
+        # Release assembly consumes fragments; check both storage phases.
+        *sorted((root / "changelog.d").glob("*.md")),
     ]
     found = 0
     for doc in docs:
