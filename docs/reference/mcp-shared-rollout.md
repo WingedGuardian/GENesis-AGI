@@ -61,6 +61,28 @@ in the overlay. Adapter argv placeholders: `{python}` `{root}` `{server}` `{url}
 `{stage}`. These names and the adapter contract are provisional: the shared
 service and the adapter own them and set their own where they differ.
 
+The configuration reader remains inside the self-contained stdlib CLI,
+`scripts/lib/mcp_rollout.py`. Extraction into `src/` waits for the first actual
+runtime consumer. Overlay merges stay shallow: a server key replaces that key,
+including a complete nested `service` object. JSON is read as UTF-8 even under
+an ASCII process locale. Direct execution works with `python -I -S` and imports
+no Genesis, MCP, or provider modules. A truthy non-object `servers` value reports
+a configuration error; legacy falsy values still mean no server overrides.
+
+The deploy helper captures the complete CLI source when sourced, then compiles
+it in its own namespace and invokes its real entry point from a fixed bootstrap.
+Future imports remain legal and CLI names cannot overwrite bootstrap dispatch.
+A nonempty snapshot stays fixed through source replacement or removal, including
+when executing the snapshot fails. If startup capture was missing or empty, the
+restart invocation can capture the CLI from its supplied synchronized checkout.
+The code-only deploy sources this helper before synchronization; the full update
+sources it after pulling. Each path invokes it once. Missing entry points,
+non-integer exit status, and capture/configuration failures return nonzero before
+shared-unit actions. Systemd failures retain their existing per-unit reporting.
+
+Package floors remain FastMCP 4.1.4 and MCP 2.3.0. A dependency range does not
+qualify every later release. No service is activated or routing stage advanced.
+
 A session decides once, when Claude Code spawns its MCP servers. Changing the stage
 affects new sessions; running ones keep the command they started with.
 
