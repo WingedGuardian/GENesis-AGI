@@ -1,16 +1,9 @@
-"""Materialized snapshots of the derived views.
+"""Disposable view cache; only per-source records are durable history.
 
-The live views assemble rows across ~15k per-source files and take 15-30 s per
-query on the full store; a snapshot answers in ~0.02 s (measured 2026-10-04).
-A snapshot is built after any ingest that changed a source:
-
-    <data>/derived/<stamp>/<view>.parquet + MANIFEST.json
-    <data>/derived/current -> <stamp>        (swapped atomically with os.replace)
-
-Readers resolve ``current`` once, so they never see a mix of old and new views.
-The snapshot it replaced is kept (an in-flight query may still read it); older
-ones are removed. Builds hold the store lock, so two builds never interleave.
-It is rebuildable at any time from the per-source files.
+Build under the writer flock, stage derived/<stamp>, then atomically swap
+derived/current. Keep the previous cache; readers fully read it before use
+and fall back to their captured live sources if cache cleanup races them.
+Restore discards only derived/. No epoch, catalog, lease or reader lock.
 """
 
 from __future__ import annotations
@@ -20,11 +13,11 @@ import json
 import os
 import shutil
 import time
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from genesis.transcript_analytics import catalog, query, store
-from genesis.transcript_analytics.locks import publication, restore_epoch
+from . import locks, query, store
 
 DERIVED_VIEWS = query._DERIVED
 
@@ -33,86 +26,119 @@ def is_current(data: Path) -> bool:
     return query.derived_current(data)
 
 
+def _remove_cache_entry(path: Path) -> None:
+    if not path.is_symlink() and path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
+
+
+def _sweep(root: Path, keep: frozenset[str] = frozenset()) -> None:
+    """Remove interrupted artifacts and obsolete snapshot directories.
+
+    Drops everything outside ``keep``: ``.staging`` trees, ``.current.*``
+    links, a real-directory ``current`` selector (malformed disposable
+    layout) and orphan snapshot directories.
+    """
+    _remove_cache_entry(root / ".staging")
+    for link in root.glob(".current.*"):
+        _remove_cache_entry(link)
+    current = root / "current"
+    if not current.is_symlink() and current.is_dir():
+        shutil.rmtree(current)
+    for directory in root.iterdir():
+        if (
+            not directory.is_symlink() and directory.is_dir()
+            and not directory.name.startswith(".") and directory.name not in keep
+        ):
+            shutil.rmtree(directory)
+
+
 def build(data: Path, *, lock_path: Path | None = None, if_stale: bool = False) -> dict:
-    t0 = time.monotonic()
+    started = time.monotonic()
     root = data / "derived"
-    with store._locked(lock_path or store.DEFAULT_LOCK):
-        selected = catalog.load(data)
-        if if_stale and query.derived_current(data, selected):
+    with locks.writer(lock_path or store.DEFAULT_LOCK):
+        # Discard malformed disposable layouts and interrupted artifacts
+        # before deciding there is nothing to do: an if_stale no-op must
+        # not leave a crash's leftovers behind.
+        if root.is_symlink() or (root.exists() and not root.is_dir()):
+            _remove_cache_entry(root)
+        if root.is_dir():
+            current = root / "current"
+            keep = frozenset({os.readlink(current)}) if current.is_symlink() else frozenset()
+            _sweep(root, keep)
+        selection = store.select_sources(data)
+        if if_stale and query.derived_current(data, selection=selection):
             return {"derived": "current; nothing to do"}
-        root.mkdir(
-            parents=True, exist_ok=True
-        )  # BEFORE reading input_fp: creating it bumps data's mtime
-        # Leftovers from a killed build (SIGKILL/SIGTERM skip Python cleanup): re-audit SF-4.
-        if (root / ".staging").is_dir():
-            for leftover in (root / ".staging").iterdir():
-                shutil.rmtree(leftover, ignore_errors=True)
-        for link in root.glob(".current.*"):
-            link.unlink(missing_ok=True)
-        input_fp = data.stat().st_mtime_ns  # under the lock: no publish can move it until we finish
-        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
-        staging = root / ".staging" / stamp
-        staging.mkdir(parents=True)
+        store._make_directory(data)
+        store._make_directory(root)
+        staging_root = root / ".staging"
+        staging_root.mkdir(exist_ok=True)
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid.uuid4().hex[:8]
+        staging = staging_root / stamp
+        staging.mkdir()
+        temporary = root / f".current.{os.getpid()}"
         try:
-            keys, excluded = store.compatible_sources(data, selected)
-            with contextlib.closing(query.connect(data, live=True, selected=selected)) as con:
-                for v in DERIVED_VIEWS:
-                    out = str(staging / f"{v}.parquet").replace("'", "''")
+            with contextlib.closing(query.connect(data, live=True, selection=selection)) as con:
+                schemas = {}
+                for view in DERIVED_VIEWS:
+                    path = staging / f"{view}.parquet"
+                    escaped = str(path).replace("'", "''")
                     con.execute(
-                        f"COPY (SELECT * FROM {v}) TO '{out}' (FORMAT parquet, COMPRESSION zstd)"  # noqa: S608 — fixed names, escaped path
+                        f"COPY (SELECT * FROM {view}) TO '{escaped}' (FORMAT parquet, COMPRESSION zstd)"  # noqa: S608 — fixed view names, escaped path
                     )
-                identity_coverage = query.turn_identity_coverage(con)
-            manifest = {
-                "views_version": query.VIEWS_VERSION,
-                "restore_epoch": restore_epoch(),
-                "input_fp": input_fp,
-                "catalog_revision": selected.revision if selected is not None else None,
-                "population_revision": selected.population_revision
-                if selected is not None
-                else None,
-                "semantics": {k.decode(): os.fsdecode(v) for k, v in store.semantics().items()},
-                "coverage": {"included": len(keys), "excluded": excluded},
-                "denominators": {"turns": identity_coverage["candidate_rows"]},
-                "denominator_basis": {"turns": "candidate_turn_rows"},
-                "turn_identity_coverage": identity_coverage,
-                "inventory": store.inventory(data, selected),
-                "sources": [
-                    {
-                        k.decode(): (
-                            store.source_identity(os.fsdecode(v))
-                            if k == b"ta.source"
-                            else v.decode()
-                        )
-                        for k, v in store.source_metadata(data, key, selected)[0].items()
-                        if k in (b"ta.source", b"ta.fp", b"ta.generation")
-                    }
-                    for key in keys
-                ],
-                "built_at": datetime.now(UTC).isoformat(),
-                "views": list(DERIVED_VIEWS),
-            }
-            (staging / "MANIFEST.json").write_text(json.dumps(manifest))
+                    schemas[view] = [
+                        list(row[:2]) for row in con.execute(f"DESCRIBE {view}").fetchall()  # noqa: S608 — fixed view names
+                    ]
+                    with path.open("rb") as handle:
+                        os.fsync(handle.fileno())
+                state = query._READS[con]
+                manifest = {
+                    "views_version": query.VIEWS_VERSION,
+                    "inputs_signature": state["inputs_signature"],
+                    "coverage": state["coverage"],
+                    "sources": [
+                        {
+                            k.decode(): store.source_identity(os.fsdecode(v))
+                            if k == b"ta.source" else os.fsdecode(v)
+                            for k, v in record.metadata.items() if k.startswith(b"ta.")
+                        } for record in selection[0]
+                    ],
+                    "turn_identity_coverage": query.turn_identity_coverage(con),
+                    "views": list(DERIVED_VIEWS),
+                    "schemas": schemas,
+                    "built_at": datetime.now(UTC).isoformat(),
+                }
+            with (staging / "MANIFEST.json").open("w") as handle:
+                json.dump(manifest, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            store._fsync_directory(staging)
             final = root / stamp
-            os.rename(staging, final)
+            os.replace(staging, final)
+            store._fsync_directory(root)
+            current = root / "current"
+            previous = os.readlink(current) if current.is_symlink() else None
+            temporary.symlink_to(stamp)
+            os.replace(temporary, current)
+            store._fsync_directory(root)
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
+            temporary.unlink(missing_ok=True)
             raise
-        with publication(exclusive=True):
-            previous = os.readlink(root / "current") if (root / "current").is_symlink() else None
-            link_tmp = root / f".current.{os.getpid()}"
-            os.symlink(stamp, link_tmp)
-            os.replace(link_tmp, root / "current")
-            keep = {stamp, previous}
-            for d in root.iterdir():
-                if (
-                    d.is_dir()
-                    and not d.is_symlink()
-                    and not d.name.startswith(".")
-                    and d.name not in keep
-                ):
-                    shutil.rmtree(d, ignore_errors=True)
+        _sweep(root, frozenset({stamp, previous}) - {None})
     return {
-        "dir": str(final),
-        "views": sorted(DERIVED_VIEWS),
-        "seconds": round(time.monotonic() - t0, 2),
+        "dir": str(final), "views": sorted(DERIVED_VIEWS),
+        "seconds": round(time.monotonic() - started, 2),
     }
+
+
+def discard_after_restore(data: Path, *, lock_path: Path | None = None):
+    """Drop only the disposable cache; leave every source and stamp untouched."""
+    with locks.writer(lock_path or store.DEFAULT_LOCK):
+        root = data / "derived"
+        if root.is_symlink() or root.exists():
+            _remove_cache_entry(root)
+        # A retry must finish a failed removal fence even when the cache is gone.
+        if data.is_dir():
+            store._fsync_directory(data)

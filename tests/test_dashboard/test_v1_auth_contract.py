@@ -150,16 +150,36 @@ def _production_blueprints() -> tuple[list, list, list]:
 
 
 @pytest.fixture()
-def app_with_every_v1_blueprint(monkeypatch):
+def app_with_every_v1_blueprint(monkeypatch, tmp_path):
     """One app carrying every blueprint PRODUCTION registers that serves /v1."""
     monkeypatch.setenv("GENESIS_MCP_HTTP_TOKEN", "contract-test-token")
 
+    import asyncio
     import importlib
+    import secrets
+    import threading
 
+    import aiosqlite
+
+    from genesis.db.schema import TABLES
+    from genesis.peers.registry import PeerRegistry
+
+    peer_name = "GENESIS_PEER_CONTRACT_TOKEN"
+    monkeypatch.setenv(peer_name, secrets.token_urlsafe(32))
+    registry = PeerRegistry(tmp_path / "peer-contract.db")
+    async def initialize_peer():
+        async with aiosqlite.connect(registry.path) as db:
+            for name in ("peer_settings", "peers", "peer_grants"):
+                await db.execute(TABLES[name])
+            await db.commit()
+        await registry.configure("fallback", service_url="https://genesis.example/v1/agent/a2a")
+        await registry.register("contract_peer", same_owner=True, daily_allowance=1, token_name=peer_name)
+    asyncio.run(initialize_peer())
     blueprints, adapters, helpers = _production_blueprints()
 
     app = Flask(__name__)
     app.config["TESTING"] = True
+    app.config["GENESIS_PEER_REGISTRY"] = registry
     # Production sets this, and it selects a DIFFERENT Werkzeug input-stream
     # wrapper — a bare app gets the raw stream, so a body-bound test on a bare
     # app exercises code the server never runs.
@@ -191,7 +211,25 @@ def app_with_every_v1_blueprint(monkeypatch):
         "contributes are NOT covered by the assertions below — which would pass "
         f"anyway: {skipped}"
     )
-    return app
+    loop = asyncio.new_event_loop()
+    ready = threading.Event()
+    def run_loop():
+        asyncio.set_event_loop(loop)
+        loop.call_soon(ready.set)
+        loop.run_forever()
+        loop.close()
+    thread = threading.Thread(target=run_loop)
+    thread.start()
+
+    try:
+        assert ready.wait(5)
+        app.config["GENESIS_EVENT_LOOP"] = loop
+        yield app
+    finally:
+        if loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+        thread.join(5)
+        assert not thread.is_alive()
 
 
 def _v1_rules(app):
@@ -251,7 +289,10 @@ def test_every_v1_route_refuses_an_anonymous_caller(app_with_every_v1_blueprint)
         # earlier version of this gate blind: an un-bootstrapped runtime also
         # answers 503, so accepting 503 let a route with its auth check DELETED
         # pass. The refusal must be an AUTH refusal — 401 naming the header.
-        if resp.status_code != 401 or "Authorization header" not in body:
+        if resp.status_code != 401 or (
+            (resp.get_json(silent=True) or {}).get("code") != "unauthorized"
+            if path.startswith("/v1/agent/a2a") else "Authorization header" not in body
+        ):
             offenders.append(f"{method} {path} -> {resp.status_code} {body[:80]!r}")
     assert not offenders, (
         "these /v1 routes did not refuse an UNAUTHENTICATED request on AUTH "
@@ -266,7 +307,9 @@ def test_a_valid_token_is_not_refused_by_the_auth_layer(app_with_every_v1_bluepr
     client.environ_base["HTTP_AUTHORIZATION"] = "Bearer contract-test-token"
     still_refusing = []
     for path, method in _v1_rules(app_with_every_v1_blueprint):
-        resp = client.open(path, method=method, json={})
+        from genesis.env import bearer_token
+        names = "GENESIS_PEER_CONTRACT_TOKEN" if path.startswith("/v1/agent/a2a") else "GENESIS_MCP_HTTP_TOKEN"
+        resp = client.open(path, method=method, json={}, headers={"Authorization": "Bearer " + bearer_token(names)})
         # Past auth, a route may well answer 400/503/500 — it has no runtime
         # behind it here. What it must NOT do is answer 401.
         if resp.status_code == 401:
@@ -300,7 +343,10 @@ def test_the_desk_token_opens_the_desk_routes_and_nothing_else(
             desk_seen += 1
             if resp.status_code == 401:
                 desk_refused.append(f"{method} {path}")
-        elif resp.status_code != 401 or "Invalid bearer token" not in resp.get_data(as_text=True):
+        elif resp.status_code != 401 or (
+            (resp.get_json(silent=True) or {}).get("code") != "unauthorized"
+            if path.startswith("/v1/agent/a2a") else "Invalid bearer token" not in resp.get_data(as_text=True)
+        ):
             leaked.append(f"{method} {path} -> {resp.status_code}")
 
     # Guard-the-guard: without a desk route in the enumeration, the "desk opens"
@@ -340,3 +386,14 @@ def test_an_unimportable_registration_target_fails_this_contract(monkeypatch):
     # above proves the assert fires rather than that the suite is broken.
     blueprints, _adapters, _helpers = _production_blueprints()
     assert blueprints, "the control did not recover — the poison leaked"
+
+
+def test_peer_and_broad_credentials_cannot_cross_surfaces(app_with_every_v1_blueprint):
+    from genesis.env import bearer_token
+
+    client = app_with_every_v1_blueprint.test_client()
+    for path, method in _v1_rules(app_with_every_v1_blueprint):
+        peer_path = path.startswith("/v1/agent/a2a")
+        name = "GENESIS_MCP_HTTP_TOKEN" if peer_path else "GENESIS_PEER_CONTRACT_TOKEN"
+        response = client.open(path, method=method, json={}, headers={"Authorization": "Bearer " + bearer_token(name)})
+        assert response.status_code == 401

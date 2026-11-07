@@ -39,6 +39,7 @@ from genesis.db.crud import memory as memory_crud
 from genesis.memory.activation import compute_activation
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
 from genesis.memory.graph import traverse as graph_traverse
+from genesis.memory.graph_telemetry import traversal_tally
 from genesis.memory.intent import classify_intent
 from genesis.memory.types import RetrievalResult
 from genesis.qdrant import collections as qdrant_ops
@@ -238,17 +239,21 @@ async def _local_drilldown(
 
     # Graph expansion: traverse 1-hop from top global results
     expansion_roots = global_ids[:5]  # Top 5 global results
-    for root_id in expansion_roots:
-        try:
-            traversal = await graph_traverse(
-                db, root_id, max_depth=1, min_strength=0.5
-            )
-            for node in traversal.nodes:
-                if node.memory_id not in local_ids:
-                    local_ids.append(node.memory_id)
-        except Exception:
-            # Graph traversal is best-effort; don't fail the query
-            continue
+    # One telemetry row for these traversals (graph_telemetry.traversal_tally). A caller
+    # that already opened a tally (the ambient worker, which traverses on a
+    # read-only connection) absorbs them, so nothing is written on `db` there.
+    async with traversal_tally(db, caller="drift"):
+        for root_id in expansion_roots:
+            try:
+                traversal = await graph_traverse(
+                    db, root_id, max_depth=1, min_strength=0.5
+                )
+                for node in traversal.nodes:
+                    if node.memory_id not in local_ids:
+                        local_ids.append(node.memory_id)
+            except Exception:
+                # Graph traversal is best-effort; don't fail the query
+                continue
 
     return local_ids
 

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # genesis-disk-hygiene — daily disk grooming entrypoint.
 #
-# Run by the genesis-disk-hygiene.timer systemd unit (also runnable by hand).
+# The daily timer starts independent maintenance and worktree-reaper services.
+# With no arguments, runs both in sequence for compatibility with manual use.
 # Best-effort steps — one failing must not skip the others:
 #   1. Reap merged/inactive git worktrees  → scripts/worktree_lifecycle.py
 #      (archives into ~/.genesis/worktree-trash; first releases session-claim
@@ -47,6 +48,14 @@
 #  15. Retention prune of the work board's local stores → scripts/prune_board.py
 #      (closed open-questions + their edges >90d, board events >180d; unverified
 #      questions and promotion pointers are never pruned)
+#  15b. Browser-profile copies (genesis.browser.profile_backup) → prune_browser_backups
+#      (scripts/prune_browser_backups.py decides: the newest copy per profile
+#      always stays, the newest per version for 90 days, older ones go after 14
+#      days, an unfinished *.tmp after a day)
+#  15c. Camoufox engines nothing runs → prune_browser_engines
+#      (scripts/prune_browser_engines.py decides: once the engine the installed
+#      camoufox pairs with has been in use 14 days, older version directories and
+#      the pre-0.5 root engine go, never one a running browser uses)
 #  16. Copytruncate rotation of the shared MCP logs in ~/tmp (>10MB, 2 kept)
 #      → rotate_log (mcp_health.log, turnstile_debug.log; the first is held open
 #      by every session's MCP server, so both are copied and truncated, never
@@ -292,6 +301,189 @@ prune_guard_corpus() {
         || echo "guard-corpus prune exited $?"
 }
 
+prune_backup_runs() {
+    # prune_backup_runs <dir> <label> <days>: remove the per-run directories under
+    # a Genesis-owned backup dir once older than <days> (each is written once, so
+    # its mtime is its age), through remove_tree_one_fs, which spares a tree that
+    # is or holds a mount. A <dir> that is a symlink is refused: it points at a
+    # directory Genesis does not own, and every old directory there would go.
+    local dir="$1" label="$2" days="$3" root mounts run
+    if [ -L "$dir" ]; then
+        echo "$label prune SKIPPED: $dir is a symlink; pruning would delete at its target"
+        return 0
+    fi
+    root="$(cd -P -- "$dir" 2>/dev/null && pwd -P)" || return 0
+    if ! mounts="$(mount_targets "$root")"; then
+        echo "$label prune SKIPPED: the mount table (/proc/self/mountinfo) is unreadable, so no tree can be proven free of mounts"
+        return 0
+    fi
+    while IFS= read -r -d '' run; do
+        remove_tree_one_fs "$run" "$mounts" 1 || echo "$label prune failed or spared $run"
+    done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -mtime +"$days" -print0 2>/dev/null)
+}
+
+prune_browser_backups() {
+    # genesis.browser.profile_backup copies a browser profile aside before a
+    # different engine first opens it (<profile>.pre-v<version>-<UTC time>, a
+    # few hundred MB with caches left out). scripts/prune_browser_backups.py
+    # decides what goes (per profile: the newest copy always stays; the newest
+    # copy of each version for 90 days, since going back to that version needs
+    # it; older copies after 14 days; an unfinished *.tmp after a day). This
+    # function only deletes what it names, each one a direct child of the
+    # canonical root, through remove_tree_one_fs like every other recursive
+    # deleter here.
+    local base="${1:-$HOME/.genesis}" canon mounts dir
+    if [ ! -x "${VENV_PY:-}" ] || [ ! -f "$SCRIPT_DIR/prune_browser_backups.py" ]; then
+        echo "browser backup prune SKIPPED: no python interpreter or no prune_browser_backups.py"
+        return 0
+    fi
+    canon="$(cd -P -- "$base" 2>/dev/null && pwd -P)" || return 0
+    if ! mounts="$(mount_targets "$canon")"; then
+        echo "browser backup prune SKIPPED in $canon: the mount table is unreadable"
+        return 0
+    fi
+    while IFS= read -r -d '' dir; do
+        [ "${dir%/*}" = "$canon" ] || { echo "browser backup prune refused $dir: not in $canon"; continue; }
+        remove_tree_one_fs "$dir" "$mounts" 1 || echo "browser backup prune failed or spared $dir"
+    done < <("$VENV_PY" "$SCRIPT_DIR/prune_browser_backups.py" "$canon")
+}
+
+_runs_from() {
+    # 0 when a process this user can see executes a binary under $1
+    # (/proc/<pid>/exe), other than one under $2 when given. An exe link this user
+    # may not read is skipped: MEASURED, every live Camoufox and Chromium process
+    # shows its own (the ones that hide it are systemd, gpg-agent, tmux), and the
+    # decider's own liveness input treats an unreadable process as running.
+    local exe
+    for exe in /proc/[0-9]*/exe; do
+        exe="$(readlink -- "$exe" 2>/dev/null)" || continue
+        if [ -n "${2:-}" ]; then
+            case "$exe" in "$2"/*) continue ;; esac
+        fi
+        case "$exe" in "$1"|"$1"/*) return 0 ;; esac
+    done
+    return 1
+}
+
+prune_browser_engines() {
+    # camoufox 0.5 keeps every engine version it ever fetched under
+    # <cache>/browsers/<repo>/<version> (about 2.4 GB each, MEASURED) and never
+    # deletes one, and a cache upgraded from camoufox 0.4 still holds the 0.4
+    # engine in its root. scripts/prune_browser_engines.py decides what goes (its
+    # header lists when nothing does). This function only deletes what it names,
+    # in the order printed, through remove_tree_one_fs:
+    #   - <root>/browsers/<repo>/<version>: renamed into <root>/browsers/.retiring/
+    #     first, so a run killed midway leaves it where the next run finds it
+    #     (camoufox's own listing skips dot directories);
+    #   - <root>/browsers/.retiring/<name>: what such a run left;
+    #   - a direct child of <root> that is not one of camoufox 0.5's own names.
+    # Anything else, a `.`/`..` component or a symlinked parent is refused. The
+    # provisioner's lock is held throughout, so no fetch runs underneath. Each
+    # path is re-checked just before it goes: a version or leftover against a
+    # browser running from it, a root entry against one running anywhere in the
+    # root outside browsers/ (the pre-0.5 engine runs from <root>/camoufox-bin,
+    # not from the file being removed). A version holding a mount is never moved,
+    # since the move would carry the mount out of the snapshot's sight. Once a
+    # root entry stays, the rest of the root stays too: the decider prints the
+    # marker it finds the root by (precomplete, else version.json) last, so the
+    # next run retries.
+    local base="${1:-${XDG_CACHE_HOME:-$HOME/.cache}/camoufox}" canon mounts path parent kind repo
+    local root_stuck=0 retiring
+    local lock_dir="${GENESIS_HOME:-$HOME/.genesis}/locks"
+    if [ ! -x "${VENV_PY:-}" ] || [ ! -f "$SCRIPT_DIR/prune_browser_engines.py" ]; then
+        echo "browser engine prune SKIPPED: no python interpreter or no prune_browser_engines.py"
+        return 0
+    fi
+    canon="$(cd -P -- "$base" 2>/dev/null && pwd -P)" || return 0
+    # The script reads "a browser runs from it" off the process table; a table
+    # this process cannot see would read as nothing running.
+    if ! liveness_visible; then
+        echo "browser engine prune SKIPPED: no other process is visible in /proc, so no engine can be proven unused"
+        return 0
+    fi
+    if ! mounts="$(mount_targets "$canon")"; then
+        echo "browser engine prune SKIPPED in $canon: the mount table is unreadable"
+        return 0
+    fi
+    mkdir -p "$lock_dir" 2>/dev/null || true
+    (
+        if ! command -v flock >/dev/null 2>&1 || ! flock -n 9; then
+            echo "browser engine prune SKIPPED: the browser stack lock is held or unavailable"
+            exit 0
+        fi
+        while IFS= read -r -d '' path; do
+            parent="${path%/*}"
+            case "$path/" in
+                */./*|*/../*|*//*) kind="" ;;
+                *)
+                    repo="${parent##*/}"
+                    if [ "${parent%/*}" = "$canon/browsers" ] && [ "${repo#.}" = "$repo" ]; then
+                        kind=version
+                    elif [ "$parent" = "$canon/browsers/.retiring" ]; then
+                        kind=leftover
+                    elif [ "$parent" = "$canon" ]; then
+                        case "${path##*/}" in
+                            browsers|config.json|repo_cache.json|.0.5_FLAG|addons|geoip|fontconfig) kind="" ;;
+                            *) kind=root ;;
+                        esac
+                    else
+                        kind=""
+                    fi
+                    ;;
+            esac
+            if [ -z "$kind" ] || [ "$(cd -P -- "$parent" 2>/dev/null && pwd -P)" != "$parent" ]; then
+                echo "browser engine prune refused $path: not an engine path in $canon"
+                continue
+            fi
+            if [ "$kind" = root ] && [ "$root_stuck" = 1 ]; then
+                echo "browser engine prune spared $path: an earlier entry of the pre-0.5 engine stayed"
+                continue
+            fi
+            if { [ "$kind" = root ] && _runs_from "$canon" "$canon/browsers"; } \
+                || { [ "$kind" != root ] && _runs_from "$path"; }; then
+                # Launched since the decision: re-checked here, just before the move.
+                echo "browser engine prune spared $path: a running process executes from it"
+                [ "$kind" = root ] && root_stuck=1
+                continue
+            fi
+            if [ "$kind" = version ] && tree_holds_mount "$path" "$mounts" 1; then
+                # A mount above the version (at browsers/ or its repo) counts too:
+                # such an install keeps every version, and says so each run.
+                echo "browser engine prune spared $path: it holds a mount"
+                continue
+            fi
+            if [ "$kind" = version ]; then
+                retiring="$canon/browsers/.retiring"
+                mkdir -p "$retiring" 2>/dev/null
+                # A link would carry the engine out of the cache, and a mount
+                # would turn the rename into a 2.4 GB copy.
+                if [ "$(cd -P -- "$retiring" 2>/dev/null && pwd -P)" != "$retiring" ] \
+                    || tree_holds_mount "$retiring" "$mounts" 1; then
+                    echo "browser engine prune refused $path: $retiring is not a plain directory in $canon"
+                    continue
+                fi
+                mv -T -- "$path" "$retiring/${parent##*/}.${path##*/}.$$" \
+                    || { echo "browser engine prune could not set aside $path"; continue; }
+                echo "browser engine prune set aside $path"
+                path="$retiring/${parent##*/}.${path##*/}.$$"
+                # Checked again past the rename: camoufox can no longer list or
+                # launch it, so a browser seen now started before the move. It
+                # stays in .retiring for the next run, which keeps it while used.
+                if _runs_from "$path"; then
+                    echo "browser engine prune spared $path: a running process executes from it"
+                    continue
+                fi
+            fi
+            if remove_tree_one_fs "$path" "$mounts" 1; then
+                echo "browser engine prune removed $path"
+            else
+                echo "browser engine prune failed or spared $path"
+                [ "$kind" = root ] && root_stuck=1
+            fi
+        done < <("$VENV_PY" "$SCRIPT_DIR/prune_browser_engines.py" "$canon")
+    ) 9>"$lock_dir/browser-stack.lock"
+}
+
 # rotate_log FILE [MAX_BYTES] [KEEP] — copytruncate rotation for a log that
 # long-lived processes hold open. The genesis-health MCP server of EVERY session
 # appends to ~/tmp/mcp_health.log through a logging.FileHandler opened once at
@@ -362,22 +554,80 @@ rotate_log() {
     fi
 }
 
-main() {
-    local disk_reclaim_rc=0
-    if [ -z "$VENV_PY" ]; then
-        echo "disk_hygiene: no python interpreter found" >&2
-        exit 1
-    fi
+rotate_mcp_logs() {
+    local mcp_log_dir
+    local helper="$REPO_DIR/src/genesis/util/mcp_logging.py"
+    [ -f "$helper" ] && [ -n "$VENV_PY" ] || return 0
+    # Pure stdlib entrypoint: no package import, handler, mkdir or secrets load.
+    # NUL framing preserves pathname newline bytes and rejects incomplete output.
+    IFS= read -r -d '' mcp_log_dir < <("$VENV_PY" -I "$helper") || return 0
+    [ -n "$mcp_log_dir" ] || return 0
+    # Keep dirname output ending in a dot: its command substitution in rotate_log
+    # otherwise strips trailing newlines from the selected directory name.
+    mcp_log_dir+=/.
+    rotate_log "$mcp_log_dir/mcp_health.log" 10000000 2
+    rotate_log "$mcp_log_dir/turnstile_debug.log" 10000000 2
+}
 
-    case "${1:-}" in
-        --pressure) pressure_main "${2:-}"; return 0 ;;
-        "") ;;
-        *) echo "disk_hygiene: unknown argument '$1' (usage: disk_hygiene.sh [--pressure [--last-resort]])" >&2
-           return 2 ;;
+# Settings read BY NAME out of secrets.env: the hook audit store knobs, and the
+# browser engine cache and override (prune_camoufox_engines_step).
+#
+# The writers see them because genesis-server loads that file; this unit does
+# not, so without this the trim resolved the DEFAULT directories on an install
+# that had configured custom ones — the real store growing with no retention
+# while the timer reported success on an empty default (Codex P2, PR #1609).
+#
+# Two variables rather than `EnvironmentFile=` on the unit, for two reasons.
+# MEASURED on systemd 255: an EnvironmentFile overrides `Environment=`
+# regardless of directive order, so loading secrets.env would silently replace
+# the unit's deliberately-pinned gh/git PATH on any install whose secrets.env
+# sets PATH. And this oneshot runs `rm -rf` and `find -delete`; it has no
+# business holding provider keys or the backup passphrase.
+#
+# No `eval` and no `source`: both execute file content, and this file is the
+# one place on the box that holds every credential.
+_load_store_knob() {
+    local key="$1"
+    local file="${2:-$REPO_DIR/secrets.env}"
+    local line=""
+    local val
+    [ -f "$file" ] || return 0
+    # Last assignment wins, which is how systemd reads these files too.
+    line="$(grep -aE "^${key}=" "$file" | tail -1)" || line=""
+    [ -n "$line" ] || return 0
+    val="${line#*=}"
+    case "$val" in
+        \"*\") val="${val#\"}"; val="${val%\"}" ;;
+        \'*\') val="${val#\'}"; val="${val%\'}" ;;
     esac
+    [ -n "$val" ] && export "$key=$val"
+    return 0
+}
 
-    echo "=== genesis-disk-hygiene $(date -u +%FT%TZ) ==="
+# The Camoufox cache the browser tools use can come from secrets.env, which this
+# unit does not load: the provisioner installs where XDG_CACHE_HOME there points.
+# It is read by name from the file the runtime reads (genesis.env.secrets_path:
+# SECRETS_PATH with a leading ~ expanded, else the checkout's), in a subshell so it
+# reaches no later step. The engine override the decider reads itself.
+prune_camoufox_engines_step() {
+    (
+        secrets="${SECRETS_PATH:-$REPO_DIR/secrets.env}"
+        _load_store_knob XDG_CACHE_HOME "${secrets/#\~/$HOME}"
+        prune_browser_engines "${XDG_CACHE_HOME:-$HOME/.cache}/camoufox"
+    )
+}
 
+hygiene_stage() {
+    local name="$1" started=$SECONDS rc=0
+    shift
+    echo "hygiene stage=$name start=$(date -u +%FT%TZ)"
+    "$@" || rc=$?
+    echo "hygiene stage=$name duration_s=$((SECONDS - started)) status=$rc"
+    return "$rc"
+}
+
+worktrees_main() {
+    local rc=0
     # BEFORE the reaper, deliberately. This is the wall-clock floor for the
     # stranded-work sweep — the detector is normally spawned at session
     # boundaries, so a box that starts no sessions for days would answer "what
@@ -387,23 +637,25 @@ main() {
     # likely to be deleting stale worktrees — and its restore path does not
     # reconstruct uncommitted state. Observing the world after the reaper had
     # cleared it would mean the one daily look never saw what was lost.
-    echo "--- zero-drop stranded-work sweep ---"
-    "$VENV_PY" "$REPO_DIR/scripts/zero_drop_worker.py" --trigger hygiene \
-        || echo "zero_drop_worker exited $?"
+    hygiene_stage zero-drop "$VENV_PY" "$REPO_DIR/scripts/zero_drop_worker.py" --trigger hygiene \
+        || rc=$?
 
     # Stale claims BEFORE the reaper, so a worktree whose claiming session died
     # is judged on its merits tonight rather than pinned for another day. The
     # claim module decides staleness; a lock it did not write is never touched.
-    echo "--- stale worktree-claim release ---"
-    "$VENV_PY" "$REPO_DIR/scripts/worktree_lifecycle.py" --release-stale-claims \
-        || echo "worktree_lifecycle --release-stale-claims exited $?"
+    hygiene_stage stale-claims "$VENV_PY" "$REPO_DIR/scripts/worktree_lifecycle.py" --release-stale-claims \
+        || rc=$?
+    hygiene_stage worktree-reaping "$VENV_PY" "$REPO_DIR/scripts/worktree_lifecycle.py" \
+        || rc=$?
+    return "$rc"
+}
 
-    echo "--- worktree reaping ---"
-    "$VENV_PY" "$REPO_DIR/scripts/worktree_lifecycle.py" || echo "worktree_lifecycle exited $?"
+maintenance_main() {
+    local disk_reclaim_rc=0
 
     # The deleting steps take the shared reclaim lock. A pressure run holding
     # it is already reclaiming, so after a bounded wait (inside this unit's
-    # 1200s timeout) the daily pass skips them rather than time out and lose
+    # service timeout) the daily pass skips them rather than time out and lose
     # every retention prune below.
     local reclaim_locked=1
     if ! reclaim_lock "${RECLAIM_WAIT_S:-180}"; then
@@ -436,6 +688,19 @@ main() {
 
     echo "--- mcp-spawn identity prune (dead-pid slots) ---"
     prune_mcp_spawn "$HOME/.genesis/mcp-spawn"
+
+    # update.sh records the venv's packages before each update
+    # (update-deps/<rollback tag>.json) and removes the record when the update or
+    # its rollback completes. One a failed rollback left is recovery material for
+    # a while, then only disk: the record, the helper copy beside it
+    # (<tag>.lib/, flat files), and any temporary file a killed run left.
+    # Files only, then the emptied copy directories: nothing recursive.
+    echo "--- update package-record prune (>30d) ---"
+    local deps_dir="${GENESIS_HOME:-$HOME/.genesis}/update-deps"
+    find "$deps_dir" -mindepth 1 -maxdepth 1 -type f \
+        \( -name '*.json' -o -name '*.tmp' -o -name 'tmp.*' \) -mtime +30 -delete 2>/dev/null || true
+    find "$deps_dir" -mindepth 2 -maxdepth 2 -type f -path '*.lib/*' -mtime +30 -delete 2>/dev/null || true
+    find "$deps_dir" -mindepth 1 -maxdepth 1 -type d -name '*.lib' -empty -delete 2>/dev/null || true
 
     echo "--- attention snapshot GC (label-aware) ---"
     "$VENV_PY" "$REPO_DIR/scripts/attention_snapshot_gc.py" --home-days 60 --omi-days 14 \
@@ -546,56 +811,21 @@ main() {
             || echo "reconcile ghost-export prune exited $?"
     fi
 
-    echo "--- update.sh ephemeral-file backup retention prune (>45d) ---"
-    # update.sh saves local edits to the tracked ephemeral files it discards before
-    # its merge (AGENTS.md, config/procedure_triggers.yaml) under one directory per
-    # run. Written once and never touched again, so a directory's mtime is its age.
-    # Same guarded removal as every other recursive deleter (remove_tree_one_fs,
-    # which spares a tree that is or holds a mount), over the CANONICAL root.
-    if ! _pmb_root="$(cd -P -- "$HOME/.genesis/premerge-backups" 2>/dev/null && pwd -P)"; then
-        :
-    elif ! _pmb_mounts="$(mount_targets "$_pmb_root")"; then
-        echo "premerge-backups prune SKIPPED: the mount table (/proc/self/mountinfo) is unreadable, so no tree can be proven free of mounts"
-    else
-        while IFS= read -r -d '' _pmb_dir; do
-            remove_tree_one_fs "$_pmb_dir" "$_pmb_mounts" 1 \
-                || echo "premerge-backups prune failed or spared $_pmb_dir"
-        done < <(find "$_pmb_root" -mindepth 1 -maxdepth 1 -type d -mtime +45 -print0 2>/dev/null)
-    fi
+    echo "--- ephemeral-file backup retention prune (>45d) ---"
+    # update.sh and deploy_code_only.sh save local edits to the tracked ephemeral
+    # files they discard before their merge (AGENTS.md, config/procedure_triggers.yaml)
+    # under one directory per run. Written once and never touched again, so a
+    # directory's mtime is its age.
+    prune_backup_runs "$HOME/.genesis/premerge-backups" premerge-backups 45
+
+    echo "--- replaced systemd unit backup retention prune (>90d) ---"
+    # update.sh --take-template / bootstrap's GENESIS_TAKE_TEMPLATES save a hand-edited
+    # unit here, one directory per run, before installing its template
+    # (lib/managed_units.sh). Written once, so a directory's mtime is its age.
+    prune_backup_runs "$HOME/.genesis/deploy-backups" deploy-backups 90
 
     echo "--- hook audit store size trim (>5MB per store, newest kept) ---"
-    # The two store knobs, read BY NAME out of secrets.env.
-    #
-    # The writers see them because genesis-server loads that file; this unit does
-    # not, so without this the trim resolved the DEFAULT directories on an install
-    # that had configured custom ones — the real store growing with no retention
-    # while the timer reported success on an empty default (Codex P2, PR #1609).
-    #
-    # Two variables rather than `EnvironmentFile=` on the unit, for two reasons.
-    # MEASURED on systemd 255: an EnvironmentFile overrides `Environment=`
-    # regardless of directive order, so loading secrets.env would silently replace
-    # the unit's deliberately-pinned gh/git PATH on any install whose secrets.env
-    # sets PATH. And this oneshot runs `rm -rf` and `find -delete`; it has no
-    # business holding provider keys or the backup passphrase.
-    #
-    # No `eval` and no `source`: both execute file content, and this file is the
-    # one place on the box that holds every credential.
-    _load_store_knob() {
-        local key="$1"
-        local line=""
-        local val
-        [ -f "$REPO_DIR/secrets.env" ] || return 0
-        # Last assignment wins, which is how systemd reads these files too.
-        line="$(grep -aE "^${key}=" "$REPO_DIR/secrets.env" | tail -1)" || line=""
-        [ -n "$line" ] || return 0
-        val="${line#*=}"
-        case "$val" in
-            \"*\") val="${val#\"}"; val="${val%\"}" ;;
-            \'*\') val="${val#\'}"; val="${val%\'}" ;;
-        esac
-        [ -n "$val" ] && export "$key=$val"
-        return 0
-    }
+    # The two store knobs, read BY NAME out of secrets.env (`_load_store_knob`).
     _load_store_knob GENESIS_MERGE_OVERRIDE_DIR
     _load_store_knob GENESIS_DISCARD_SNAPSHOT_DIR
     # One file per hook flush, so the oldest whole files are deleted past the byte
@@ -608,15 +838,50 @@ main() {
     echo "--- guard replay corpus retention prune (>45d) ---"
     prune_guard_corpus "$HOME/.genesis/output"
 
+    echo "--- browser profile copies (newest kept; per version 90d; older 14d; unfinished 1d) ---"
+    prune_browser_backups "$HOME/.genesis"
+
+    echo "--- Camoufox engines nothing runs (only once the paired one is 14d old) ---"
+    prune_camoufox_engines_step
+
     echo "--- MCP log rotation (>10MB, copytruncate, 2 kept) ---"
     # 10 MB: about nine days of mcp_health.log at the measured rate, small
     # enough to read whole, and with 2 copies the three files stay near 30 MB
     # instead of growing without bound.
-    rotate_log "$HOME/tmp/mcp_health.log" 10000000 2
-    rotate_log "$HOME/tmp/turnstile_debug.log" 10000000 2
+    rotate_mcp_logs
+
+    echo "--- Inbox sync log rotation (>10MB, copytruncate, 2 kept) ---"
+    # Appended to every 5 minutes by scripts/inbox_sync.sh and never rotated
+    # before: MEASURED 31.8 MB on a live install. Same bounds as the MCP logs.
+    rotate_log "${GENESIS_INBOX_SYNC_LOG:-$REPO_DIR/logs/inbox_sync.log}" 10000000 2
 
     echo "=== genesis-disk-hygiene done ==="
     return "$disk_reclaim_rc"
+}
+
+main() {
+    local mode="${1:-}" reaper_rc=0 maintenance_rc=0
+    if [ -z "$VENV_PY" ]; then
+        echo "disk_hygiene: no python interpreter found" >&2
+        return 1
+    fi
+    case "$mode" in
+        --pressure) pressure_main "${2:-}"; return 0 ;;
+        ""|--maintenance-only|--worktrees-only) ;;
+        *) echo "disk_hygiene: unknown argument '$mode' (usage: disk_hygiene.sh [--maintenance-only|--worktrees-only|--pressure [--last-resort]])" >&2
+           return 2 ;;
+    esac
+    echo "=== genesis-disk-hygiene $(date -u +%FT%TZ) mode=${mode:-all} ==="
+    if [ "$mode" != --maintenance-only ]; then
+        hygiene_stage worktrees worktrees_main || reaper_rc=$?
+    fi
+    if [ "$mode" != --worktrees-only ]; then
+        hygiene_stage maintenance maintenance_main || maintenance_rc=$?
+    fi
+    if [ "$maintenance_rc" -ne 0 ]; then
+        return "$maintenance_rc"
+    fi
+    return "$reaper_rc"
 }
 
 # Run main only when executed directly — lets tests `source` this file to call a

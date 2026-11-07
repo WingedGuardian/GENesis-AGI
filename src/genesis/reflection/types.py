@@ -38,8 +38,9 @@ class PendingWorkSummary:
     # Data counts for prompt assembly (only include sections with data)
     observation_backlog: int = 0
     skills_needing_review: int = 0
-    # Intelligence digest for intake pipeline awareness
-    intake_items_since_last: int = 0
+    # Intelligence digest for intake pipeline awareness. None means the
+    # knowledge_units read failed, so the count is unknown (not zero).
+    intake_items_since_last: int | None = 0
 
     @property
     def has_any_work(self) -> bool:
@@ -153,6 +154,9 @@ class DeepReflectionOutput:
     confidence_defaulted: bool = False
     separability: float | None = None
     alternative_assessment: str | None = None
+    # Surplus value probe: ids of the gathered surplus insights the model says
+    # it drew on. None = the model did not report the field; [] = it cited none.
+    surplus_cited: list[str] | None = None
     parse_failed: bool = False
 
 

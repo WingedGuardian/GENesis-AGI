@@ -8,6 +8,11 @@ dispatch:
   task_expiry_hours: 72       # Pending tasks older than this are drained
   max_iterations_per_cycle: 3 # Max tasks dispatched per cycle
 
+telegram:
+  # Post each surplus output to the supergroup's Surplus topic. Off by default.
+  # Output is stored and promoted the same way whether or not it is posted.
+  post_insights: false
+
 jobs:
   brainstorm_check_hours: 12
   code_index_hours: 4

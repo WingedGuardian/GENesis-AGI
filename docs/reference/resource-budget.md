@@ -128,7 +128,7 @@ WAIT build
    a controller missing from the parent, no memcg swap accounting), it warns
    that the cap could not be verified. Swap is skipped when no swap device is
    active, since nothing can swap. Either way the job still runs in the scope,
-   visible to other sessions, and also gets nice 19 and
+   visible to other sessions, and also gets the uncapped fallback's nice 19 and
    data limit.
 3. The job's exit code is `run`'s exit code (128+N for signal N). On exit it
    prints, on stderr, the job's peak memory, its CPU seconds, and whether it was
@@ -150,43 +150,26 @@ reservation. Two `run`s started within a few seconds of each other can both
 be admitted, since neither scope exists yet when the other checks. CPU is
 compressible and capped by the quota, so it is not reserved.
 
-SIGINT, SIGTERM and SIGHUP to `run` request cooperative SIGTERM cleanup of
-its process group and exact named scope, including descendants that stay in
-that scope. The wrapper keeps waiting for verified scope completion even if
-the launch process exits first. A second cancellation requests SIGKILL; there
-is no added timed escalation after the first cancellation. Existing scope
-runtime ceilings still apply. The cancellation exit code is 128 plus the last
-delivered caller signal. Supervision requires the Linux main CLI thread,
-default SIGCHLD disposition, and exclusive ownership of child wait status.
-Unexpected external reaping or unverifiable scope cleanup is reported.
-Once the direct child exits, its retained wait status is consumed before
-independently checking scope completion. A failed scope readback does not leave
-that exited child unreaped, and numeric signaling authority closes before reap.
+SIGINT, SIGTERM and SIGHUP to `run` request cooperative shutdown. The first caller
+signal sends SIGTERM; `run` keeps waiting for the owned child and acknowledged
+scope, including descendants remaining after the leader exits. A second caller
+signal forces SIGKILL. There is no automatic force deadline on that first caller
+signal. Before scope registration, only the owned process group can be signalled;
+an intended unit name alone grants no authority. A watchdog checks every 10 seconds;
+if the box stays over the line for 60 seconds (container memory or a disk named
+with `--disk`, in any combination), it stops this job. It stops this job even when other work caused the
+pressure, because this is the job Genesis can stop safely; it never touches
+anything else. A watchdog-originated stop alone arms a ten-second SIGKILL deadline,
+which remains active while the acknowledged scope has children after leader exit.
+That deadline does not count as another caller signal. A resource approved with
+`--approved-over-line` is not watched. Unverifiable scope cleanup reports incomplete
+cleanup rather than verified completion.
 
-The intended unit name alone does not authorize a scope signal or wait. A
-private pipe acknowledgment from a helper running inside the registered scope
-establishes that authority. Registration refusal, including a name collision,
-leaves any pre-existing scope alone. Before acknowledgment, cancellation can
-signal only the owned, unreaped launcher's process group. The helper runs with
-isolated Python startup and no site hooks, closes the registration writer,
-restores exec signal defaults and the incoming `LC_CTYPE` presence/value, then
-executes the payload. This prevents isolated Python locale coercion from
-changing a non-Python target's locale. Unit suffixes
-contain 128 random bits; this prevents accidental reuse with high probability,
-but does not provide atomic protection against deliberate same-user unit
-replacement or process migration.
-
-A watchdog checks every 10 seconds. If the box stays over the line for 60 seconds
-(container memory or a disk named with `--disk`, in any combination), it requests
-SIGTERM for this job, even when other work caused the pressure. A resource
-approved with `--approved-over-line` is not watched. A watchdog request does not
-count as a caller cancellation or certify that shutdown has completed.
-
-Without `systemd-run` or a reachable systemd user manager, `run` refuses the job
-before spawning it and exits 64 with the reason. It does not launch an invisible
-uncapped fallback. Accepted scopes whose caps are unenforced or unverified keep
-the warnings and additional nice 19/data-segment limit described above; this
-policy change does not change those scoped launches.
+Without `systemd-run` or a reachable systemd user manager, launch is refused.
+Existing scopes whose caps are unenforced or unreadable retain their explicit
+warnings and `nice 19` / data-segment-limit fallback. These warnings do not certify
+hard caps. An address-space limit is not used, because runtimes such as the JVM,
+node and OpenBLAS reserve address ranges they never touch and fail to start under one.
 
 `run` is for non-interactive jobs: the job runs in its own session, without a
 controlling terminal, so password prompts (ssh, sudo, git credentials) fail.
@@ -203,13 +186,10 @@ under `--json`), and the job's own report lines start with `genesis-job`.
 - `run` reads its limits and exit figures (peak memory, CPU time, cap kills)
   from cgroup v2 files. On cgroup v1 it warns that it cannot verify the caps and
   the exit report omits those figures.
-- A job that ignores the first cooperative cancellation can keep the wrapper
-  waiting until a second cancellation forces SIGKILL or an existing runtime
-  ceiling applies. Scope inspection failures are reported as incomplete cleanup.
-- Normal command exit retains detached-child behavior: the wrapper may return
-  while descendants remain in the capped scope, which the live job ledger
-  continues to account for. Verified quiescence waiting applies after a stop
-  or cancellation request.
+- Caller-requested cooperative shutdown can wait indefinitely for a job that
+  ignores SIGTERM; send a second cancellation to force it. Scope signal delivery
+  alone does not start systemd's stop-timeout escalation. Watchdog stops have
+  their separate ten-second deadline.
 - CPU reads cgroup v2 only. On cgroup v1, capacity is the affinity count and use
   comes from `/proc/stat`, which inside a container may cover the whole host.
 - Where the cgroup has no `*.pressure` files, PSI comes from `/proc/pressure`,

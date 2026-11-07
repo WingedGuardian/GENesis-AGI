@@ -96,6 +96,7 @@ class TestWalkFromSelf:
             "max": 2400,
             "pct": 41.7,
             "scope": "genesis-server.service",
+            "path": str(svc),
         }
 
     def test_leaf_max_finite_ancestor_binds(self, tmp_path, monkeypatch):

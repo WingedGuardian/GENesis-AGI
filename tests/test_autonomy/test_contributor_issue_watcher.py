@@ -596,7 +596,7 @@ async def test_e2e_autoapprove_then_drain_posts(db, tmp_path, monkeypatch):
 
     # scan_prose fails closed on a missing fingerprint file — point at a present empty one.
     fp = tmp_path / "fingerprints.txt"
-    fp.write_text("")
+    fp.write_text("zz-no-such-private-token-zz\n")  # one harmless pattern: an EMPTY file now reads as not scanned
     monkeypatch.setenv("GENESIS_RELEASE_FINGERPRINTS", str(fp))
 
     # propose side: live + autonomous posture

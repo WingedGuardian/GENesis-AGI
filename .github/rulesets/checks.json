@@ -32,6 +32,9 @@
           },
           {
             "context": "lint"
+          },
+          {
+            "context": "collected-floor"
           }
         ]
       }

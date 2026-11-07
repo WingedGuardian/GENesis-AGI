@@ -37,7 +37,8 @@ SELECT DISTINCT turn_key,event_key FROM observations WHERE turn_key IS NOT NULL;
 
 CREATE TEMP TABLE event_states AS
 SELECT event_key, count(DISTINCT message_id)>1 AS identity_conflict,
- count(DISTINCT content_hash) > 1 AS content_conflict,
+ CASE WHEN count(DISTINCT content_hash)>1 THEN TRUE
+ WHEN count(*) FILTER(WHERE content_hash IS NULL)>0 THEN NULL ELSE FALSE END AS content_conflict,
  count(DISTINCT immutable_hash) > 1 OR count(DISTINCT request_id_hash) > 1 AS immutable_conflict,
  count(DISTINCT payload_hash) FILTER(WHERE stop_reason IS NOT NULL) AS terminal_variants,
  count(DISTINCT payload_hash) AS payload_variants,
@@ -94,20 +95,24 @@ WITH candidates AS (
 ), g AS (
  SELECT event_key,count(DISTINCT actor_id) AS all_actors,
  count(DISTINCT actor_id) FILTER(WHERE NOT inherited) AS remaining,
+ count(*) FILTER(WHERE NOT inherited AND actor_id IS NULL) AS missing_actors,
  any_value(actor_id ORDER BY actor_id) FILTER(WHERE NOT inherited) AS executor,
  bool_or(inherited) AS has_inference,bool_or(context_conflict) AS context_conflict,
  list(DISTINCT context_session_id ORDER BY context_session_id) AS context_sessions
  FROM candidates GROUP BY event_key
 )
-SELECT g.*, CASE WHEN s.content_conflict OR g.context_conflict THEN 'conflicting'
- WHEN remaining=1 THEN CASE WHEN has_inference THEN 'inferred' ELSE 'confirmed' END
- ELSE 'unresolved' END AS attribution_status,
- CASE WHEN remaining=1 AND NOT s.content_conflict AND NOT g.context_conflict THEN executor END AS executor_id,
+SELECT g.*, CASE WHEN remaining=1 AND missing_actors=0 AND s.content_conflict IS FALSE
+ AND NOT g.context_conflict THEN executor END AS executor_id,
+ CASE WHEN s.content_conflict OR g.context_conflict THEN 'conflicting'
+ WHEN executor_id IS NULL THEN 'unresolved'
+ WHEN has_inference THEN 'inferred' ELSE 'confirmed' END AS attribution_status,
  CASE WHEN g.context_conflict THEN 'source path contradicts record context/actor'
  WHEN s.content_conflict THEN 'conflicting identity content'
- WHEN remaining=1 AND has_inference THEN 'shared containing-main prefix'
- WHEN remaining=1 THEN 'unique observed actor'
- ELSE 'multiple or missing observed actors' END AS attribution_reason
+ WHEN s.content_conflict IS NULL THEN 'unknown identity content'
+ WHEN missing_actors>0 THEN 'missing observed actor'
+ WHEN executor_id IS NOT NULL AND has_inference THEN 'shared containing-main prefix'
+ WHEN executor_id IS NOT NULL THEN 'unique observed actor'
+ ELSE 'multiple or unavailable observed actors' END AS attribution_reason
 FROM g JOIN event_states s USING(event_key);
 
 -- Evidence/availability precede presentation selection. Every distinct event
@@ -120,7 +125,9 @@ WITH events AS (
  JOIN event_ownership o USING(event_key)
 ), grouped AS (
  SELECT turn_key,count(*) AS distinct_event_count,
- bool_or(content_conflict) AS content_conflict,bool_or(state_conflict) AS state_conflict,
+ CASE WHEN bool_or(content_conflict) THEN TRUE
+ WHEN count(*) FILTER(WHERE content_conflict IS NULL)>0 THEN NULL ELSE FALSE END AS content_conflict,
+ bool_or(state_conflict) AS state_conflict,
  bool_or(identity_conflict) AS identity_conflict,bool_or(identity_conflict) AS count_uncertain,
  CASE WHEN NOT bool_or(identity_conflict) AND count(DISTINCT executor_id)=1 AND count(*) FILTER(WHERE executor_id IS NULL)=0
  THEN any_value(executor_id) END AS executor_id,
@@ -159,6 +166,8 @@ def _parent_graph(rows):
     evidence = {}
     explicit = {}
     for actor, parent, status, kind, ref in rows:
+        if actor is None:
+            continue
         evidence.setdefault(actor, []).append((parent, status, kind, ref))
         if kind == "parentAgentId":
             explicit.setdefault(actor, set()).add(parent)
@@ -224,17 +233,25 @@ def _sequence_contains(sequence, candidate):
 def _spawn_associations(con):
     """Reconcile child identity before an assertion can enter the parent graph."""
     con.execute("""
+      CREATE TEMP MACRO _tool_context(src,ctx,tid) AS to_json(struct_pack(
+        context_session_id:=ctx,source_file:=CASE WHEN ctx IS NULL THEN src END,tool_use_id:=tid));
+
       CREATE TEMP TABLE result_candidates AS
-      SELECT r.* EXCLUDE(result_agent_id,result_agent_ids),candidate AS result_agent_id
-      FROM raw_tool_calls r,unnest(r.result_agent_ids) identities(candidate);
+      SELECT r.* EXCLUDE(result_agent_id,result_agent_ids),candidate AS result_agent_id,
+        _tool_context(r.source_file,r.context_session_id,r.tool_use_id) AS association_key
+      FROM raw_tool_calls r,unnest(r.result_agent_ids) identities(candidate)
+      WHERE r.line_no_call IS NULL AND NOT r.context_conflict;
 
       CREATE TEMP TABLE producers AS
-      SELECT c.*,o.executor_id,o.attribution_status FROM raw_tool_calls c
-      JOIN tool_ownership o USING(tool_use_id)
+      SELECT c.*,o.executor_id,o.attribution_status,
+        _tool_context(c.source_file,c.context_session_id,c.tool_use_id) AS association_key
+      FROM raw_tool_calls c
+      JOIN tool_ownership o ON o.tool_use_id=c.tool_use_id AND o.source_file=c.source_file
       WHERE c.line_no_call IS NOT NULL AND c.tool IN ('Agent','Task');
 
       CREATE TEMP TABLE companion_assertions AS
       SELECT a.tool_use_id,a.actor_id,
+        _tool_context(a.source_file,a.context_session_id,a.tool_use_id) AS association_key,
         coalesce(p.executor_id,CASE WHEN a.parent_agent_id IS NOT NULL
           AND p.attribution_status!='conflicting' AND NOT p.context_conflict
           AND p.actor_id=_actor_identity(a.context_session_id,a.parent_agent_id)
@@ -245,34 +262,43 @@ def _spawn_associations(con):
           THEN 'confirmed' ELSE p.attribution_status END AS status,
         to_json(struct_pack(child_source:=a.source_file,call_source:=p.source_file,
           call_line:=p.line_no_call,tool_use_id:=a.tool_use_id)) AS ref
-      FROM raw_agents a LEFT JOIN producers p USING(tool_use_id)
+      FROM raw_agents a LEFT JOIN producers p
+        ON p.association_key=_tool_context(a.source_file,a.context_session_id,a.tool_use_id)
       WHERE a.tool_use_id IS NOT NULL;
 
       CREATE TEMP TABLE spawn_associations AS
       WITH calls AS (
-        SELECT tool_use_id,any_value(executor_id) AS executor_id,
-          any_value(attribution_status) AS producer_status FROM producers GROUP BY tool_use_id
+        SELECT association_key,any_value(tool_use_id) AS tool_use_id,
+          CASE WHEN count(DISTINCT executor_id)=1 AND count(*) FILTER(WHERE executor_id IS NULL)=0
+            THEN any_value(executor_id) END AS executor_id,
+          count(DISTINCT to_json([coalesce('uuid:' || call_uuid,
+            'local:' || source_file || ':' || line_no_call),tool_use_id])) AS producer_calls,
+          CASE WHEN bool_or(attribution_status='conflicting') THEN 'conflicting'
+            WHEN count(DISTINCT executor_id)!=1 OR count(*) FILTER(WHERE executor_id IS NULL)>0 THEN 'unresolved'
+            WHEN bool_or(attribution_status='inferred') THEN 'inferred' ELSE 'confirmed' END AS producer_status
+        FROM producers GROUP BY association_key
       ), companions AS (
-        SELECT tool_use_id,count(DISTINCT actor_id) FILTER(
+        SELECT association_key,count(DISTINCT actor_id) FILTER(
           WHERE parent IS NOT NULL AND status IN ('confirmed','inferred')) AS companion_actors,
           any_value(actor_id ORDER BY actor_id) FILTER(
           WHERE parent IS NOT NULL AND status IN ('confirmed','inferred')) AS companion_actor,
           CASE WHEN bool_or(status='inferred') FILTER(WHERE parent IS NOT NULL)
           THEN 'inferred' ELSE 'confirmed' END AS companion_status
-        FROM companion_assertions GROUP BY tool_use_id
+        FROM companion_assertions GROUP BY association_key
       ), results AS (
-        SELECT tool_use_id,count(DISTINCT result_agent_id) AS result_ids,
+        SELECT association_key,count(DISTINCT result_agent_id) AS result_ids,
           count(DISTINCT _actor_identity(context_session_id,result_agent_id)) AS result_actors,
           any_value(result_agent_id ORDER BY result_agent_id) AS result_id
-        FROM result_candidates GROUP BY tool_use_id
+        FROM result_candidates GROUP BY association_key
       ), evidence AS (
         SELECT calls.*,coalesce(companion_actors,0) AS companion_actors,companion_actor,companion_status,
           coalesce(result_ids,0) AS result_ids,coalesce(result_actors,0) AS result_actors,result_id
-        FROM calls LEFT JOIN companions USING(tool_use_id) LEFT JOIN results USING(tool_use_id)
+        FROM calls LEFT JOIN companions USING(association_key) LEFT JOIN results USING(association_key)
       ) SELECT *,CASE
         WHEN companion_actors>1 OR result_ids>1 OR
           (companion_actors=1 AND result_ids=1 AND result_id!=json_extract_string(companion_actor,'$[1]'))
           THEN 'conflicting'
+        WHEN producer_calls!=1 THEN 'unresolved'
         WHEN companion_actors=1 THEN companion_status
         WHEN result_ids=1 AND result_actors=1 AND executor_id IS NOT NULL
           AND producer_status IN ('confirmed','inferred') THEN producer_status
@@ -297,28 +323,49 @@ def install(con):
     con.execute(RECONCILIATION)
     # Tool/result assertions are interpreted only for an observed Agent/Task call.
     con.execute("""
+      CREATE TEMP VIEW call_observations AS
+      SELECT c.*,to_json([coalesce('uuid:' || c.call_uuid,
+       'local:' || c.source_file || ':' || c.line_no_call),c.tool_use_id]) AS call_key
+      FROM raw_tool_calls c WHERE c.line_no_call IS NOT NULL;
+      CREATE TEMP TABLE call_states AS
+      SELECT call_key,CASE WHEN count(DISTINCT call_hash)>1 THEN TRUE
+       WHEN count(*) FILTER(WHERE call_hash IS NULL)>0 THEN NULL ELSE FALSE END AS content_conflict
+      FROM call_observations GROUP BY call_key;
       CREATE TEMP TABLE tool_ownership AS
-      SELECT c.tool_use_id,
-       CASE WHEN count(DISTINCT c.call_hash)=1 AND count(DISTINCT o.executor_id)=1
-       AND count(*) FILTER(WHERE o.executor_id IS NULL)=0 THEN any_value(o.executor_id) END AS executor_id,
-       CASE WHEN count(DISTINCT c.call_hash)>1 OR bool_or(o.attribution_status='conflicting') THEN 'conflicting'
-       WHEN count(DISTINCT o.executor_id)!=1 OR count(*) FILTER(WHERE o.executor_id IS NULL)>0 THEN 'unresolved'
-       WHEN bool_or(o.attribution_status='inferred') THEN 'inferred' ELSE 'confirmed' END AS attribution_status,
-       'reconciled call observations' AS attribution_reason,
-       list_sort(list_distinct(flatten(list(o.context_sessions ORDER BY c.source_file,c.line_no_call)))) AS context_sessions
-      FROM raw_tool_calls c LEFT JOIN event_ownership o ON o.event_key=coalesce('uuid:' || c.call_uuid,'local:' || c.source_file || ':' || c.line_no_call)
-      WHERE c.line_no_call IS NOT NULL GROUP BY c.tool_use_id
+      WITH grouped AS (
+       SELECT c.source_file,c.tool_use_id,
+        CASE WHEN count(DISTINCT c.call_hash)>1 OR bool_or(s.content_conflict) THEN TRUE
+         WHEN count(*) FILTER(WHERE s.content_conflict IS NULL)>0 THEN NULL ELSE FALSE END AS content_conflict,
+        CASE WHEN count(DISTINCT o.executor_id)=1 AND count(*) FILTER(WHERE o.executor_id IS NULL)=0
+         THEN any_value(o.executor_id) END AS executor,
+        bool_or(o.attribution_status='conflicting') AS ownership_conflict,
+        bool_or(o.attribution_status='inferred') AS has_inference,
+        list_sort(list_distinct(flatten(list(o.context_sessions ORDER BY c.source_file,c.line_no_call)))) AS context_sessions
+       FROM call_observations c JOIN call_states s USING(call_key)
+       LEFT JOIN event_ownership o ON o.event_key=coalesce('uuid:' || c.call_uuid,'local:' || c.source_file || ':' || c.line_no_call)
+       GROUP BY c.source_file,c.tool_use_id
+      ) SELECT source_file,tool_use_id,
+       CASE WHEN content_conflict IS FALSE AND NOT ownership_conflict THEN executor END AS executor_id,
+       CASE WHEN content_conflict OR ownership_conflict THEN 'conflicting'
+        WHEN executor_id IS NULL THEN 'unresolved'
+        WHEN has_inference THEN 'inferred' ELSE 'confirmed' END AS attribution_status,
+       CASE WHEN ownership_conflict THEN 'conflicting call ownership'
+        WHEN content_conflict THEN 'conflicting call content'
+        WHEN content_conflict IS NULL THEN 'unknown call content'
+        ELSE 'reconciled call observations' END AS attribution_reason,context_sessions
+      FROM grouped
     """)
     _spawn_associations(con)
     rows = con.execute("""
       WITH assertions AS (
        SELECT c.actor_id,c.parent,c.status,'companion toolUseId' AS kind,c.ref
-       FROM companion_assertions c LEFT JOIN spawn_associations s USING(tool_use_id)
+       FROM companion_assertions c LEFT JOIN spawn_associations s USING(association_key)
        WHERE c.parent IS NOT NULL AND c.status IN ('confirmed','inferred') AND s.companion_actors=1
+         AND s.producer_calls=1
        UNION ALL
        SELECT c.actor_id,NULL,'unresolved','companion toolUseId',c.ref
-       FROM companion_assertions c LEFT JOIN spawn_associations s USING(tool_use_id)
-       WHERE c.parent IS NULL OR s.tool_use_id IS NULL
+       FROM companion_assertions c LEFT JOIN spawn_associations s USING(association_key)
+       WHERE c.parent IS NULL OR s.association_key IS NULL OR s.producer_calls!=1
        UNION ALL
        SELECT a.actor_id, _actor_identity(a.context_session_id,a.parent_agent_id), 'unresolved',
               'parentAgentId',to_json(struct_pack(source_file:=a.source_file,parent_agent_id:=a.parent_agent_id)) FROM raw_agents a WHERE a.parent_agent_id IS NOT NULL
@@ -328,29 +375,29 @@ def install(con):
               p.executor_id,p.attribution_status,
               'Agent/Task result',to_json(struct_pack(result_source:=r.source_file,
                 result_line:=r.line_no_result,call_source:=p.source_file,call_line:=p.line_no_call,
-                tool_use_id:=r.tool_use_id)) FROM result_candidates r JOIN producers p USING(tool_use_id)
-       JOIN spawn_associations s USING(tool_use_id)
+                tool_use_id:=r.tool_use_id)) FROM result_candidates r JOIN producers p USING(association_key)
+       JOIN spawn_associations s USING(association_key)
        WHERE r.result_agent_id IS NOT NULL AND s.result_ids=1 AND s.companion_actors<=1
          AND (s.companion_actors=1 OR s.result_actors=1)
-         AND s.association_status!='conflicting' AND p.executor_id IS NOT NULL
+         AND s.association_status IN ('confirmed','inferred') AND p.executor_id IS NOT NULL
          AND p.attribution_status IN ('confirmed','inferred')
        UNION ALL
        SELECT _actor_identity(r.context_session_id,r.result_agent_id),NULL,'conflicting',
          'spawn association',to_json(struct_pack(result_source:=r.source_file,
            result_line:=r.line_no_result,tool_use_id:=r.tool_use_id))
-       FROM result_candidates r JOIN spawn_associations s USING(tool_use_id)
+       FROM result_candidates r JOIN spawn_associations s USING(association_key)
        WHERE r.result_agent_id IS NOT NULL AND s.association_status='conflicting'
          AND NOT (s.companion_actors=1 AND
            _actor_identity(r.context_session_id,r.result_agent_id)=s.companion_actor)
        UNION ALL
        SELECT c.actor_id,NULL,'conflicting','spawn association',c.ref
-       FROM companion_assertions c JOIN spawn_associations s USING(tool_use_id)
+       FROM companion_assertions c JOIN spawn_associations s USING(association_key)
        WHERE s.companion_actors>1
        UNION ALL
        SELECT _actor_identity(r.context_session_id,r.result_agent_id),NULL,'unresolved',
          'spawn association',to_json(struct_pack(result_source:=r.source_file,
            result_line:=r.line_no_result,tool_use_id:=r.tool_use_id))
-       FROM result_candidates r JOIN spawn_associations s USING(tool_use_id)
+       FROM result_candidates r JOIN spawn_associations s USING(association_key)
        WHERE r.result_agent_id IS NOT NULL AND s.association_status='unresolved'
        UNION ALL
        SELECT actor_id,NULL,NULL,'source',to_json(struct_pack(source_file:=source_file)) FROM observations WHERE source_role='child'

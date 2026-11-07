@@ -12,7 +12,7 @@ ADDS that main's history never contained cannot be a revert of main (a changelog
 fragment written inside a merge commit is the measured case), so it is reported
 as a note, not a finding.
 
-Four states, never collapsed (genesis-development, guard failure semantics rule 1):
+Four states, never collapsed (build-session, guard failure semantics rule 1):
 FINDINGS, CHECKED-CLEAN, COULD-NOT-CHECK, OUT-OF-SCOPE (no merge commits). A
 capped or failed API read is COULD-NOT-CHECK, never clean.
 

@@ -1,10 +1,25 @@
 <!-- This file is the model catalog — what's available and what each model is good at.
-     For which model is assigned to which call site, see the Model Routing Registry:
-     docs/architecture/genesis-v3-model-routing-registry.md
+     For which model is assigned to which call site, see config/model_routing.yaml.
+     The design reasoning is in docs/architecture/genesis-v3-model-routing-registry.md.
      Read by the task decomposer and routing registry.
      Updated weekly by ModelsMdSynthesisJob (Sunday 8am UTC, after model intelligence recon). -->
 
 # Model Pool
+
+## Automated CC fallback
+
+The automated roster is configured in `config/cc_roster.yaml` plus the local
+`cc_roster.local.yaml` overlay. Only credentialed roster members enter failover;
+the foreground-only `gmodel.models` catalog is separate. Model catalog presence
+does not prove current credentials, entitlement, quota, or tool compatibility.
+
+Managed agent turns use tool-disabled readiness checks to select a provider
+before executing work once. Ordinary background parking and conversation
+failover retain their existing policies. Checks consume quota and may incur
+provider fees; actual task failure after selection does not trigger replay.
+The **Fallback** neural-monitor entry shows observed execution provider/model
+and outcome without private response content. See
+[managed-session selection](native-managed-sessions.md#provider-selection-before-work).
 
 ## THE HEAVY LIFTERS
 
@@ -133,15 +148,36 @@ The daily drivers for professional productivity and general intelligence.
 - Coding Security: Often generates working code that contains security vulnerabilities.
 - Conversation Length: Tends to lose focus after 20+ turns of dialogue.
 
-### Kimi 2.6
+### Kimi K3
 
-- **API ID:** `moonshotai/kimi-2.6` (OpenRouter)
+- **API ID:** `moonshotai/kimi-k3` (OpenRouter). The routed `kimi` provider follows `~moonshotai/kimi-latest` with this profile.
+- **Role:** Code auditing / long-context analysis
+- **Context:** 1M tokens
+- **Intelligence Tier:** A
+- **Cost:** $3.00/$15.00 per MTok (input/output)
+- **Free Tier:** None
+
+**Best At:**
+1. Code auditing and review.
+2. Long-context analysis.
+3. Multimodal input (text, image, video).
+
+**Worst For:**
+- Bulk work, on cost against the DeepSeek flash tier.
+
+These figures are from `config/model_profiles.yaml` (`kimi-k3`, reviewed 2026-09-21).
+
+### Kimi K2.6
+
+No routing provider uses this profile today; the routed `kimi` provider carries the K3 profile above.
+
+- **API ID:** `moonshotai/kimi-k2.6` (OpenRouter)
 - **Role:** Research / Long Docs
-- **Context:** 1M+ tokens (Turbo)
-- **Intelligence Tier:** A/S (Thoughtful reasoning)
+- **Context:** 2M tokens
+- **Intelligence Tier:** A
 - **SWE-Bench:** ~62%
-- **Cost:** $1.00/$4.00 per MTok (input/output)
-- **Free Tier:** None currently free — a 2026-08 routing probe found NIM's free Kimi (`moonshotai/kimi-k2.6`) returns 404-for-account and it was retired from Genesis routing; the OpenRouter `:free` variant (`moonshotai/kimi-k2.6:free`) was removed June 2026. Paid access via OpenRouter (`kimi-k2.5` provider) remains a deep fallback.
+- **Cost:** $0.60/$3.00 per MTok (input/output)
+- **Free Tier:** None currently free — a 2026-08 routing probe found NIM's free Kimi (`moonshotai/kimi-k2.6`) returns 404-for-account and it was retired from Genesis routing.
 
 **Best At:**
 1. Needle in a Haystack: Specialized architecture for searching its own memory — king of long-context retrieval.
@@ -403,7 +439,7 @@ Loose guidance — not prescriptive. Use your judgment based on the task require
 - **The Programmer:** DeepSeek V4 / Codex
 - **The Autonomous Agent:** GLM 5.1
 - **The Economist:** MiniMax 2.7
-- **The Librarian:** Kimi 2.6
+- **The Librarian:** Kimi K2.6
 - **The Researcher:** Gemini 3 Flash / Llama 4 Scout
 
 ---

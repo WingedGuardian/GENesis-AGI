@@ -53,7 +53,10 @@ def test_the_checks_ruleset_requires_exactly_the_agreed_contexts():
     checks = json.loads((_RULESET_DIR / "checks.json").read_text())
     (rule,) = [r for r in checks["rules"] if r["type"] == "required_status_checks"]
     contexts = {c["context"] for c in rule["parameters"]["required_status_checks"]}
-    assert contexts == {"test", "leak-detector", "lint"}, (
+    # collected-floor joined by owner ruling (2026-10-12, #3270): it replaced the
+    # collected-count floor that `test` used to enforce, so leaving it advisory
+    # would have dropped that enforcement for every merge outside the merge gate.
+    assert contexts == {"test", "leak-detector", "lint", "collected-floor"}, (
         "adding a required context makes a red result block every merge until a "
         "human disables the ruleset by hand — that is a decision, not a tweak"
     )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -55,6 +56,25 @@ class ApprovalManager:
         """
         if timeout_seconds is None and self._classifier is not None:
             timeout_seconds = self._classifier.get_timeout(action_type)
+
+        # Preserve ordinary gate contexts. Native/MCP origin is server-owned;
+        # a peer cannot supply or overwrite the attribution used for disclosure.
+        from genesis.caller_context import caller_context
+        from genesis.db.crud import cc_sessions
+        from genesis.observability.session_context import get_session_id
+
+        sid = get_session_id() or caller_context().session_id
+        if sid:
+            session = await cc_sessions.get_by_id(self._db, sid)
+            if session and session.get("source_tag") == "agent_api":
+                try:
+                    original = json.loads(context) if context else {}
+                except (ValueError, TypeError):
+                    original = {"detail": context}
+                if not isinstance(original, dict):
+                    original = {"detail": original}
+                original["agent_session_id"] = sid
+                context = json.dumps(original)
 
         now = datetime.now(UTC)
         now_iso = now.isoformat()
@@ -161,6 +181,20 @@ class ApprovalManager:
 
     async def update_context(self, request_id: str, *, context: str) -> bool:
         """Replace the serialized context payload for a request."""
+        row = await crud.get_by_id(self._db, request_id)
+        try:
+            previous = json.loads(row["context"]) if row and row.get("context") else {}
+        except (ValueError, TypeError):
+            previous = {}
+        if isinstance(previous, dict) and previous.get("agent_session_id"):
+            try:
+                updated = json.loads(context)
+            except (ValueError, TypeError):
+                updated = {"detail": context}
+            if not isinstance(updated, dict):
+                updated = {"detail": updated}
+            updated["agent_session_id"] = previous["agent_session_id"]
+            context = json.dumps(updated)
         return await crud.update_context(self._db, request_id, context=context)
 
     async def _emit(

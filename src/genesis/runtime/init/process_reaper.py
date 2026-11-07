@@ -90,14 +90,14 @@ def _read_uptime() -> float:
         return float(f.read().split()[0])
 
 
-def proc_starttime_ticks(pid: int) -> int | None:
+def proc_starttime_ticks(pid: int, proc_root: Path = Path("/proc")) -> int | None:
     """starttime of ``pid`` (clock ticks since boot, stat field 22), or None.
 
     ``(pid, starttime)`` is a reuse-proof process identity: starttime never
     changes for a live process, so a matching pair proves the pid was not
-    recycled.
+    recycled. ``proc_root`` is for tests.
     """
-    stat_path = Path(f"/proc/{pid}/stat")
+    stat_path = proc_root / str(pid) / "stat"
     if not stat_path.exists():
         return None
     try:

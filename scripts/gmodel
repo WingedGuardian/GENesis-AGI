@@ -97,7 +97,12 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 # ZAI_CODING_API_KEY) resolve for roster.overrides_for. The child's env is built
 # explicitly below — we never blanket-forward every secret, and ANTHROPIC_API_KEY
 # is dropped from a native child and pinned empty in a routed one.
-_SECRETS = _REPO_ROOT / "secrets.env"
+# SECRETS_PATH wins, as in genesis.env.secrets_path() (not importable yet here).
+_SECRETS = (
+    Path(os.environ["SECRETS_PATH"]).expanduser()
+    if os.environ.get("SECRETS_PATH")
+    else _REPO_ROOT / "secrets.env"
+)
 if _SECRETS.is_file():
     try:
         from dotenv import load_dotenv
@@ -336,7 +341,16 @@ def main(argv: list[str]) -> int:
             print(f"gmodel: {exc}", file=sys.stderr)
             return 1
         settings_args = ["--settings", str(settings_path)]
-    os.execve(claude, [claude, *tier_args, *settings_args, *passthrough], env)  # noqa: S606
+    claude_argv = [claude, *tier_args, *settings_args, *passthrough]
+    slot_exec = _REPO_ROOT / "scripts" / "slot_exec.sh"
+    if interactive and os.access(slot_exec, os.X_OK):
+        # An interactive session gets a systemd scope of its own, like every
+        # cc-slot slot, so it is never left in a login scope that systemd-oomd
+        # would kill whole. slot_exec.sh execs claude in place, with this exact
+        # environment, and execs it unscoped if no scope can be made.
+        label = os.environ.get("GENESIS_SLOT") or "gm"
+        os.execve(str(slot_exec), [str(slot_exec), label, "--", *claude_argv], env)  # noqa: S606
+    os.execve(claude, claude_argv, env)  # noqa: S606
     return 0  # unreachable (execve replaces the process)
 
 

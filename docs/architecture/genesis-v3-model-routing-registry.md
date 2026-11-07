@@ -1,16 +1,18 @@
 # Model Routing Registry
 
-**Status:** Active | **Last updated:** 2026-03-22
+The neural monitor also exposes **Fallback** (`cc_fallback`), a non-routing
+observation of configured CC-roster fallback in conversations and managed API
+tasks. It reports actual execution outcomes and provider/model labels without
+private responses. It adds no API routing chain or foreground `gmodel` catalog
+members; managed selection is documented in
+[native managed sessions](../reference/native-managed-sessions.md#provider-selection-before-work).
+
+**Status:** Design record, not current routing. Its tables were last updated in full on 2026-03-22, and many name models Genesis no longer routes to. **`config/model_routing.yaml` is authoritative** for which model serves a call site, and `docs/reference/models.md` describes the models. `config/model_routing.local.yaml` can override it on an install. The model columns and purpose of rows 17 and 20 were corrected against that config on 2026-11-04; other rows were not checked.
 
 
-> **What this is:** The authoritative assignment of specific models to every
-> Genesis background LLM call site. If `models.md` is the menu, this document
-> is the orders.
->
-> **How it's used:** Read by Genesis during compute routing. Reviewed during
-> Strategic reflection. Updated via the model review lifecycle (below).
->
-> **Last reviewed:** 2026-03-04 — added routing implementation section, anti-sycophancy clarification
+> **What this is:** The design reasoning behind model assignments for Genesis
+> background LLM call sites, as of March 2026. Runtime routing reads
+> `config/model_routing.yaml`, not this document.
 
 ---
 
@@ -25,7 +27,7 @@
    uses Claude (Opus or Sonnet). No Gemini. No model that validates weak
    reasoning.
 
-3. **Cross-vendor diversity for adversarial/review tasks.** Fresh-eyes review
+3. **Cross-vendor diversity for adversarial/review tasks.** Executor review
    and adversarial counterargument MUST use a different vendor than the primary
    model that produced the work.
 
@@ -142,7 +144,7 @@ Tasks requiring genuine reasoning, honest assessment, or creative synthesis.
 | 11 | User model synthesis | Claude Sonnet 4.6 ($3/$15) | Opus | Weekly | ~16K | Update user preference/behavior model from observations |
 | 14 | Weekly self-assessment | Claude Opus 4.6 ($5/$25) | — | Weekly | ~32K | Honest evaluation of Genesis's own performance. Anti-sycophancy critical |
 | 16 | Quality calibration | Claude Opus 4.6 ($5/$25) | — | Weekly | ~16K | Audit recent outputs for quality regression. Anti-sycophancy critical |
-| 17 | Fresh-eyes review | GPT-5.2 or Kimi 3 (switchable) | Sonnet | Per major decision | ~16K | Cross-vendor review of Genesis's reasoning. Must differ from primary vendor |
+| 17 | Executor review (`17_executor_review`) | `openrouter-mimo` | `deepseek-flash`, `openrouter-deepseek-flash`, `openrouter-qwen36plus` | Per executor task | ~16K | Task executor gate 2: cross-vendor review of deliverables. Must differ from primary vendor |
 | 27 | Pre-execution assessment | Same model as task executor | — | Per task | ~4K | Sanity check before executing. Uses whatever model will run the task |
 | 28 | Observation sweep | Qwen 3.5 Plus ($0.40/$2.40) | Sonnet | Per awareness tick | ~8K | Scan environment for noteworthy changes |
 
@@ -153,7 +155,7 @@ The 5% of calls that shape the system's trajectory.
 | # | Call Site | Primary | Paid Fallback | Freq | Context | Notes |
 |---|----------|---------|---------------|------|---------|-------|
 | 6 | Strategic reflection | Claude Opus 4.6 ($5/$25) | — | ~4-8/month | ~32K | Quarterly-depth strategic analysis. Anti-sycophancy critical |
-| 20 | Adversarial counterargument | Grok 4 (initial pick) | Kimi 3, GPT-5.2 (rotatable) | Per major decision | ~16K | Devil's advocate review. MUST be different vendor than primary. User-configurable rotation |
+| 20 | Adversarial counterargument | `openrouter-gpt-max` | `deepseek-flash`, `openrouter-deepseek-flash`, `openrouter-mimo`, `openrouter-qwen36plus` | Per executor task | ~16K | Task executor gate 3: devil's advocate challenge of deliverables. MUST be different vendor than primary |
 
 ### Bucket 5: Code Work — Claude Code CLI / DeepSeek V4
 
@@ -196,10 +198,10 @@ model selection (e.g., "Sonnet high thinking" vs just "Sonnet").
 | 14 | Weekly self-assessment | CC background | Opus, high thinking |
 | 15 | Triage calibration | CC background | Sonnet, high thinking |
 | 16 | Quality calibration | CC background | Opus, high thinking |
-| 17 | Fresh-eyes review | AZ (API) | Grok 4 / Kimi 2.5 / GPT-5.2 (cross-vendor) |
+| 17 | Executor review | AZ (API) | `17_executor_review` chain in `config/model_routing.yaml` (cross-vendor) |
 | 18 | Meta-prompting | Deferred (V4) | — |
 | 19 | Outreach draft | AZ (API) | Free API |
-| 20 | Adversarial counterargument | AZ (API) | Grok 4 / Kimi 2.5 / GPT-5.2 (cross-vendor) |
+| 20 | Adversarial counterargument | AZ (API) | `20_adversarial_counterargument` chain in `config/model_routing.yaml` (cross-vendor) |
 | 21 | Embeddings | AZ (API) | ollama-embedding |
 | 22 | Tagging | AZ (API) | Free API |
 | 27 | Pre-execution assessment | CC foreground | Absorbed into CC system prompt reasoning |
@@ -294,15 +296,15 @@ output with no stateful transactions.
 
 ## Configurable User Preferences
 
-These assignments are user-switchable via UI (planned) or manual override:
+These chains are ordered fallbacks, changed by editing the config or a local overlay:
 
-| # | Call Site | Options | Current Pick |
+| # | Call Site | Chain, in order | Primary |
 |---|----------|---------|-------------|
-| 17 | Fresh-eyes review | GPT-5.2, Kimi 2.5 | GPT-5.2 |
-| 20 | Adversarial counterargument | Grok 4, Kimi 2.5, GPT-5.2 | Grok 4 |
+| 17 | Executor review | `openrouter-mimo`, `deepseek-flash`, `openrouter-deepseek-flash`, `openrouter-qwen36plus` | `openrouter-mimo` |
+| 20 | Adversarial counterargument | `openrouter-gpt-max`, `deepseek-flash`, `openrouter-deepseek-flash`, `openrouter-mimo`, `openrouter-qwen36plus` | `openrouter-gpt-max` |
 
-The full registry is user-editable. These two are called out because they
-have explicit rotation pools designed for user preference.
+The design called for user-rotated pools on these two; the config holds ordered
+chains and no rotation pool.
 
 ---
 
@@ -331,9 +333,7 @@ from "how we ask for it" and serves as acceptance tests for model changes.
 
 - **Model catalog (the menu):** `docs/reference/models.md`
 - **Runtime YAML config:** `config/model_routing.yaml` — the machine-readable registry
-  loaded by `genesis.routing.config.load_config()`. 13 providers, 23 call sites.
-  Some registry entries use placeholder providers (e.g., `gpt-5-nano` for GPT-5.2/Grok 4/Kimi 2.5)
-  until those APIs are available.
+  loaded by `genesis.routing.config.load_config()`.
 - **Routing implementation:** `src/genesis/routing/` — Phase 2 package (router, circuit
   breaker, cost tracker, dead-letter queue, degradation tracker, retry logic)
 - **Runtime operations (config, failures, degradation):** `docs/plans/2026-03-03-model-routing-operations-design.md`

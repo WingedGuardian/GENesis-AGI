@@ -76,8 +76,10 @@ class Span:
     cost_known: bool | None = None
 
     def set_status_error(self, msg: str) -> None:
+        from genesis.util.execution_privacy import private_execution_active
+
         self.status = "error"
-        self.status_message = msg[:1024]
+        self.status_message = "private_execution_failed" if private_execution_active() else msg[:1024]
 
     def set_attr(self, key: str, value: Any) -> None:
         self.attributes[key] = value

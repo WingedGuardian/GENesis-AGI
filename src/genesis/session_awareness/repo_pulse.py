@@ -31,9 +31,10 @@ from datetime import datetime
 from pathlib import Path
 
 from genesis.env import genesis_home
+from genesis.session_awareness.headless import HEADLESS_JUDGE_MODEL
 from genesis.session_awareness.pr_watch import _parse_ts
 
-PULSE_MODEL = "claude-haiku-4-5-20251001"  # arbiter/extractor smoke-tested contract
+PULSE_MODEL = HEADLESS_JUDGE_MODEL  # the CC ``haiku`` alias (see headless.py)
 # 240s (was 120): live E2E measured 67s/122s/84s per call with TTFT alone
 # hitting 70s — 1 of 3 runs died at the old ceiling. The failure self-heals
 # (window re-covers) but wastes the Haiku call and delays proposals by a

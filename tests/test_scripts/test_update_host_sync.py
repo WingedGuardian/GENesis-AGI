@@ -208,7 +208,9 @@ def test_redeploy_gate_reconciles_against_host_deployed_commit():
     decision through _guardian_redeploy_reason — never revert to the old
     pull-delta-only gate (OLD_COMMIT→HEAD) that stranded hosts on orphans."""
     fn = _extract_sync_function()
-    assert 'diff --quiet "$HOST_DEPLOYED_COMMIT" HEAD -- $GUARDIAN_PATHS' in fn, (
+    # HEAD, read through $_GUARDIAN_SRC (the reviewed base on `live`).
+    assert "local _GUARDIAN_SRC=HEAD" in fn
+    assert 'diff --quiet "$HOST_DEPLOYED_COMMIT" "$_GUARDIAN_SRC" -- $GUARDIAN_PATHS' in fn, (
         "redeploy decision must content-diff against the host's deployed_commit"
     )
     assert "_guardian_redeploy_reason" in fn, (
@@ -226,7 +228,7 @@ def test_redeploy_sends_verified_form_with_legacy_fallback():
     gateway (redeploy verb but no sha arg) still deploys."""
     fn = _extract_sync_function()
     # Archive materialized to a file (not piped) so it can be hashed + re-sent.
-    assert 'git -C "$GENESIS_ROOT" archive HEAD' in fn
+    assert 'git -C "$GENESIS_ROOT" archive "$_GUARDIAN_SRC"' in fn
     assert '> "$GUARDIAN_ARCHIVE"' in fn, "archive must be written to a file, not piped"
     # Big-temp discipline: never the inherited TMPDIR (cc-tmp/tmpfs).
     assert "$HOME/tmp/guardian-deploy" in fn, "archive temp must route to ~/tmp"

@@ -91,14 +91,20 @@ block, and the calibration controls: `.claude/docs/premise-check.md`. In short:
    The split is often the whole rework, and sound code still gets one.
 
 Emit the `Design-premise:` block from the reference doc before the main review,
-including its `PR-shape:` line. When the check feeds a send-back, also write the
+including its `PR-shape:` line. Write it EXACTLY as the reference doc's "The
+output" specifies: code reads it. That means the verdict line at column 0, the `Expected before checking:` line
+directly under it (required), each claim as
+`P<n> <TRUE|FALSE|UNPROVEN> — <claim>` with the verdict first, each trailer line
+(`Effect:`, `Better shape:`, `PR-shape:`) on ONE line, plain lines with no bullets,
+bold or tables, a blank line after the block before any other text, and one block
+per output. When the check feeds a send-back, also write the
 decision-complete rework spec the reference doc describes ("Handing a verdict
 to a builder"). Never end it with a bare list of open questions.
 
 **BROKEN has a HIGH bar and routes to the repo's EXISTING disposition for a
 premise-wrong PR — a foreground architecture conversation with the user, or the
 `needs-architecture-session` label, the PR moved to draft, and a `ready` follow-up when none is present (a dispatched session's follow-up lands in the `tabled` lane; the intake gap is tracked in #2857)
-(genesis-development skill, "Some PRs are not a review problem"). Never a new
+(closing-session skill, "Some PRs are not a review problem"). Never a new
 path around it, and never another round —
 everything short of "the change cannot do what it says it was built to do" is
 SOUND-BUT-INFERIOR with the better shape named.** The reference doc owns the
@@ -155,7 +161,7 @@ Persisted-state: NONE | STATELESS-ALTERNATIVE (<the derivation>) | LIFECYCLE (wr
 
 This is about the COST of state, not about whether to gate. It does not say a
 single incident is too few to justify a guard — a credential exposure or an
-irreversible action can warrant one the first time. The genesis-development
+irreversible action can warrant one the first time. The build-session
 skill's advisory-default rule decides WHETHER to refuse; this step prices WHAT
 the refusal is allowed to remember.
 

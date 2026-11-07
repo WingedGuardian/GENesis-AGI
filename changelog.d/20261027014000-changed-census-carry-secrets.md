@@ -1,0 +1,1 @@
+- **A secrets.env edit no longer leaves every memory server "kill-switch state unknown" in the graph census.** Each census row now records a digest of the six secrets keys it reads (never a value), and the next census carries a server whose file changed only in other keys, so routine secrets edits stop resetting the FalkorDB cutover clock.

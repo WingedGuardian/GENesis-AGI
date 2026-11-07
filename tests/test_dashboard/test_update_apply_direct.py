@@ -14,6 +14,8 @@ import pytest
 
 from genesis.dashboard.routes import updates
 
+pytestmark = pytest.mark.usefixtures("updates_sandbox")
+
 
 @pytest.fixture
 def _passthrough_jsonify():
@@ -57,14 +59,16 @@ def test_apply_direct_falls_back_when_scope_unavailable(tmp_path, _passthrough_j
     assert not pid_file.exists()  # no marker written on the direct path
 
 
-def test_systemd_run_scope_probe():
-    """The viability probe: 0 → True; non-zero (D-Bus down) → False; missing → False."""
+def test_systemd_run_scope_probe(updates_sandbox):
+    """The viability probe: 0 → True; non-zero (D-Bus down) → False; missing → False.
+    The sandbox stubs it for every other test; this one checks the real function."""
+    probe = updates_sandbox.originals["_systemd_run_scope_available"]
     with patch.object(updates.subprocess, "run", return_value=MagicMock(returncode=0)):
-        assert updates._systemd_run_scope_available({}) is True
+        assert probe({}) is True
     with patch.object(updates.subprocess, "run", return_value=MagicMock(returncode=1)):
-        assert updates._systemd_run_scope_available({}) is False
+        assert probe({}) is False
     with patch.object(updates.subprocess, "run", side_effect=FileNotFoundError()):
-        assert updates._systemd_run_scope_available({}) is False
+        assert probe({}) is False
 
 
 def test_apply_guard_and_status_use_update_in_progress():

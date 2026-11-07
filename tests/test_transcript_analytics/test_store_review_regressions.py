@@ -5,7 +5,7 @@ import os
 
 import pytest
 
-from genesis.transcript_analytics import derive, query, store
+from genesis.transcript_analytics import query, store
 
 
 def setup_store(tmp_path, timestamps):
@@ -48,17 +48,11 @@ def test_prune_utc_boundary_and_unknown_timestamps(tmp_path):
     assert len(store.source_keys(data)) == 2
 
 
-def test_last_source_pruned_invalidates_and_builds_empty_snapshot(tmp_path):
+def test_last_source_pruned_empties_the_views(tmp_path):
     root, data = setup_store(tmp_path, ["2025-01-01T00:00:00Z"])
-    derive.build(data)
     (root / "0.jsonl").unlink()
     assert store.prune(data, before="2026-01-01", projects=root) == 1
-    assert query.snapshot_compatible(data) and not query.derived_current(data)
-    assert query.run_query(data, "select count(*) from turns")[1] == [(1,)]
     assert query.run_query(data, "select count(*) from turns", live=True)[1] == [(0,)]
-    derive.build(data)
-    assert query.snapshot_compatible(data)
-    assert query.run_query(data, "select count(*) from turns")[1] == [(0,)]
 
 
 def test_uuidless_and_api_error_turns_retained(tmp_path):
@@ -87,14 +81,6 @@ def test_filesystem_byte_path_roundtrip(tmp_path):
     md, error = store.source_metadata(data, store.srckey(relative))
     assert error is None and os.fsdecode(md[b"ta.source"]) == relative
     assert store.source_path(store.source_identity(relative)) == relative
-
-
-def test_raw_views_require_explicit_live_mode(tmp_path):
-    root, data = setup_store(tmp_path, ["2025-01-01T00:00:00Z"])
-    derive.build(data)
-    with pytest.raises(ValueError, match="require --live"):
-        query.run_query(data, "select count(*) from raw_fragments")
-    assert query.run_query(data, "select count(*) from raw_fragments", live=True)[1] == [(1,)]
 
 
 def test_resumed_api_error_uuid_counts_once(tmp_path):

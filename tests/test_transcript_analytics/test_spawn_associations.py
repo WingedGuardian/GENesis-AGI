@@ -49,11 +49,13 @@ def _build(
     placement="paired",
     structured=False,
     is_error=None,
+    result_session="parent",
 ):
     projects, data = tmp_path / "projects", tmp_path / "data"
     projects.mkdir()
     for number, child in enumerate(copies):
         result = _result(child, number)
+        result["sessionId"] = result_session
         if structured:
             result["toolUseResult"] = {"agentId": child}
             result["message"]["content"][0]["content"] = f"nonidentity result {number}"
@@ -94,13 +96,14 @@ def _build(
 
 @pytest.mark.parametrize("tool", ["Agent", "Task"])
 def test_conflicting_result_children_never_both_confirm(tmp_path, tool):
-    actors = _build(tmp_path, ["A", "B"], tool=tool)
+    actors = _build(tmp_path, ["A", "B"], tool=tool, placement="orphan")
+    assert set(actors) == {"A", "B"}
     assert all(a["parent_actor_id"] is None for a in actors.values())
     assert all(a["lineage_status"] == "conflicting" for a in actors.values())
 
 
 def test_equal_child_results_keep_unique_producer(tmp_path):
-    actor = _build(tmp_path, ["A", "A"])["A"]
+    actor = _build(tmp_path, ["A", "A"], placement="orphan")["A"]
     assert actor["lineage_status"] == "confirmed"
     assert json.loads(actor["parent_actor_id"]) == ["parent", None]
 
@@ -112,7 +115,7 @@ def test_competing_companion_children_never_both_confirm(tmp_path):
 
 
 def test_unique_companion_does_not_confirm_contradictory_result_child(tmp_path):
-    actors = _build(tmp_path, ["A", "B"], companions=["A"])
+    actors = _build(tmp_path, ["A", "B"], companions=["A"], placement="orphan")
     assert actors["A"]["lineage_status"] == "confirmed"
     assert actors["B"]["parent_actor_id"] is None
     assert actors["B"]["lineage_status"] == "conflicting"
@@ -122,7 +125,11 @@ def test_unique_companion_does_not_confirm_contradictory_result_child(tmp_path):
 @pytest.mark.parametrize("placement", ["paired", "late", "orphan"])
 @pytest.mark.parametrize("structured", [False, True])
 def test_result_placement_and_encoding_share_producer_proof(tmp_path, tool, placement, structured):
-    actor = _build(tmp_path, ["A"], tool=tool, placement=placement, structured=structured)["A"]
+    actors = _build(tmp_path, ["A"], tool=tool, placement=placement, structured=structured)
+    if placement == "paired":
+        assert actors == {}
+        return
+    actor = actors["A"]
     assert actor["lineage_status"] == "confirmed"
     assert json.loads(actor["parent_actor_id"]) == ["parent", None]
 
@@ -132,14 +139,36 @@ def test_result_placement_and_encoding_share_producer_proof(tmp_path, tool, plac
 @pytest.mark.parametrize("structured", [False, True])
 def test_conflicting_candidate_encodings_all_withhold_edges(tmp_path, tool, placement, structured):
     actors = _build(tmp_path, ["A", "B"], tool=tool, placement=placement, structured=structured)
+    assert set(actors) == (set() if placement == "paired" else {"A", "B"})
     assert all(a["parent_actor_id"] is None for a in actors.values())
     assert all(a["lineage_status"] == "conflicting" for a in actors.values())
 
 
 @pytest.mark.parametrize("is_error", [None, False, True])
 def test_unrelated_result_body_or_error_variance_does_not_conflict_child(tmp_path, is_error):
-    actor = _build(tmp_path, ["A", "A"], structured=True, is_error=is_error)["A"]
+    actor = _build(tmp_path, ["A", "A"], structured=True, is_error=is_error, placement="orphan")["A"]
     assert actor["lineage_status"] == "confirmed"
+
+
+@pytest.mark.parametrize("result_session", ["parent", "wrong"])
+@pytest.mark.parametrize("companions", [(), ("A",), ("B",)])
+def test_paired_results_preserve_raw_facts_without_supplying_lineage(
+    tmp_path, result_session, companions
+):
+    actors = _build(tmp_path, ["A"], companions=companions, result_session=result_session)
+    assert set(actors) == set(companions)
+    for actor in actors.values():
+        assert actor["lineage_status"] == "confirmed"
+        assert json.loads(actor["parent_actor_id"]) == ["parent", None]
+    with query.read_connection(tmp_path / "data", live=True) as con:
+        assert con.sql("SELECT line_no_call,line_no_result,result_agent_ids,has_result "
+                       "FROM raw_tool_calls WHERE has_result").fetchall() == [(1, 2, ["A"], True)]
+        expected = "confirmed" if companions else "unresolved"
+        assert con.sql("SELECT association_status FROM spawn_associations").fetchall() == [(expected,)]
+        assert con.sql("SELECT included,excluded FROM metric_coverage "
+                       "WHERE metric='spawn_association'").fetchone() == (
+                           int(bool(companions)), int(not companions)
+                       )
 
 
 @pytest.mark.parametrize("tool", ["Bash", "mcp__service__tool"])

@@ -39,6 +39,7 @@ import re
 from typing import TYPE_CHECKING
 
 from genesis.memory.knowledge_ingest import ingest_knowledge_unit
+from genesis.security.card_shapes import contains_card_number
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -291,6 +292,10 @@ def classify_as_reference(
     if len(content) < _MIN_CONTENT_LENGTH:
         return None
     if _looks_ephemeral(content):
+        return None
+    # A payment card number is never auto-captured: the reference store is
+    # plaintext, and cards belong in the encrypted card vault.
+    if contains_card_number(content):
         return None
 
     tags = [e for e in extraction.entities if e and e.strip()]
@@ -573,6 +578,10 @@ async def ingest_reference_from_extraction(
         tags=tags,
         session_id=source_session_id,
     )
+    # The body is what gets stored, and its identifier and tags come from the
+    # extraction's entities, which the content check above does not see.
+    if contains_card_number(body):
+        return None
 
     all_tags = ["reference", kind, *tags, "auto_captured"]
     tags_json = json.dumps(all_tags)

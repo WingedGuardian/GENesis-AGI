@@ -43,6 +43,7 @@ _MUST_DENY_MCP = [
     "mcp__genesis-health__deliberate",  # PAID model-panel call
     "mcp__genesis-health__campaign_create",
     "mcp__genesis-health__browser_run_js",
+    "mcp__genesis-health__browser_fill_card",  # pays behind the owner's tap
     "mcp__genesis-memory__memory_store",
     "mcp__genesis-memory__memory_synthesize",
     "mcp__genesis-memory__knowledge_ingest",

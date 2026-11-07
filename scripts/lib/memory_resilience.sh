@@ -31,36 +31,242 @@ MEMRES_ETC_ROOT="${MEMRES_ETC_ROOT:-/etc}"
 MEMRES_SYSTEMD_RUNTIME_DIR="${MEMRES_SYSTEMD_RUNTIME_DIR:-/run/systemd/system}"
 MEMRES_PSI_FILE="${MEMRES_PSI_FILE:-/proc/pressure/memory}"
 MEMRES_CGROUP_SWAP_MAX="${MEMRES_CGROUP_SWAP_MAX:-/sys/fs/cgroup/memory.swap.max}"
+MEMRES_USER_UNIT_DIR="${MEMRES_USER_UNIT_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user}"
+MEMRES_OOMCTL_POLL_S="${MEMRES_OOMCTL_POLL_S:-1}"
+MEMRES_OOMCTL_CONFIRM_S="${MEMRES_OOMCTL_CONFIRM_S:-2}"
 
-# The pressure policy, mirrored from the config proven live on the reference
-# install (2026-07-13 incident fix). user.slice is the backstop at 60%; the
-# per-user manager (systemd's per-user instance units) is the operative
-# monitor — Ubuntu ships a
-# kill@50% default for it, and our drop-in guarantees `kill` on distros that
-# ship `auto` or nothing (limit then falls back to DefaultMemoryPressureLimit).
+# The pressure policy. Where oomd watches decides what it may kill: only leaf
+# cgroups below a monitored unit are candidates, one per action, ranked by
+# preference (avoid last, omit never) and then by reclaim rate — and the
+# preference marks are honoured only when the candidate and the monitored
+# cgroup have the same owner (systemd.resource-control(5)).
+#
+# - The operative monitor is the per-user manager (user@<uid>.service), owned by
+#   the user, so genesis-server's `avoid` and the tmux server scope's `omit`
+#   (scripts/slot_exec.sh --omit) hold.
+#   PID 1 reports it from the user@.service drop-in below, but a
+#   `systemctl --user daemon-reload` silently ERASES that report (systemd issue
+#   #43174): the user manager's own root slice `-.slice` has the same cgroup
+#   path and reports `auto` for it. So the user manager reports `kill` for that
+#   path itself, from a drop-in on its root slice, and both reports carry the
+#   same limit (oomd keeps the last one received).
+# - user.slice (root-owned, so the preference marks are ignored under it) stays
+#   monitored as the backstop at a HIGHER limit, 80%. The user-manager monitor
+#   at 60% acts first; the backstop fires only on pressure it could not relieve:
+#   a hog outside the user manager (an SSH build in a login scope) or a runaway
+#   in a unit the first monitor ranks last (genesis-server). It is never turned
+#   off, so no state of this setup leaves oomd monitoring nothing.
+# - init.scope (the user manager itself) is omitted and dbus avoided: killing
+#   either takes every session down with it.
 # SwapUsedLimit only acts where oomd can see swap (bare/VM installs; inside a
 # container the host owns swap and the pressure path is the active mechanism).
-_MEMRES_USER_SLICE_CONF=$'[Slice]\nManagedOOMMemoryPressure=kill\nManagedOOMMemoryPressureLimit=60%'
-_MEMRES_USER_SERVICE_CONF=$'[Service]\nManagedOOMMemoryPressure=kill'
+_MEMRES_USER_SLICE_CONF=$'[Slice]\nManagedOOMMemoryPressure=kill\nManagedOOMMemoryPressureLimit=80%'
+_MEMRES_USER_SERVICE_CONF=$'[Service]\nManagedOOMMemoryPressure=kill\nManagedOOMMemoryPressureLimit=60%'
 _MEMRES_OOMD_CONF=$'[OOM]\nSwapUsedLimit=90%\nDefaultMemoryPressureLimit=60%\nDefaultMemoryPressureDurationSec=20s'
+_MEMRES_UM_ROOT_CONF=$'[Slice]\nManagedOOMMemoryPressure=kill\nManagedOOMMemoryPressureLimit=60%'
+# Earlier Genesis contents, recognised as Genesis-written (see _memres_install_dropin).
+_MEMRES_USER_SERVICE_CONF_V1=$'[Service]\nManagedOOMMemoryPressure=kill'
+_MEMRES_USER_SLICE_CONF_V1=$'[Slice]\nManagedOOMMemoryPressure=kill\nManagedOOMMemoryPressureLimit=60%'
+_MEMRES_UM_INIT_CONF=$'[Scope]\nManagedOOMPreference=omit'
+_MEMRES_UM_DBUS_CONF=$'[Service]\nManagedOOMPreference=avoid'
+
+# The write step is shared with every other /etc file Genesis manages
+# (scripts/lib/managed_etc.sh): stamped, and a drop-in edited by hand is KEPT and
+# named rather than overwritten. Sourced relative to this file, so the manual
+# `sudo bash -c 'source scripts/lib/memory_resilience.sh && …'` keeps working.
+# shellcheck source=managed_etc.sh
+# Pure parameter expansion, not dirname: callers may run with a minimal PATH.
+_MEMRES_LIB_DIR="${BASH_SOURCE[0]%/*}"
+[ "$_MEMRES_LIB_DIR" = "${BASH_SOURCE[0]}" ] && _MEMRES_LIB_DIR=.
+. "$_MEMRES_LIB_DIR/managed_etc.sh"
 
 # _memres_install_dropin <abs-path> <content> — write-if-different via sudo.
-# Sets _MEMRES_CHANGED=1 when it wrote (a variable, NOT stdout — capturing
-# stdout as the change flag would let any future diagnostic echo masquerade
-# as "changed" and churn systemd on idempotent runs). A failed write WARNS
-# instead of falling through to "already in place". Never fails the caller.
+# Sets _MEMRES_CHANGED=1 when the content changed (a variable, NOT stdout —
+# capturing stdout as the change flag would let any future diagnostic echo
+# masquerade as "changed" and churn systemd on idempotent runs), and
+# _MEMRES_RELOAD=1 when only the stamp line was added (daemon-reload, no oomd
+# restart). A failed write WARNS instead of falling through to "already in
+# place". Never fails the caller.
 _memres_install_dropin() {
-    local path="$1" content="$2"
-    if [[ "$(sudo cat "$path" 2>/dev/null)" == "$content" ]]; then
+    # Extra arguments are EARLIER Genesis contents of this file. A drop-in still
+    # holding one unstamped (written before stamps, never updated since) is
+    # Genesis's own, not a hand edit: stamp it as that content first, which
+    # genesis_etc_put treats as a migration, so the write below replaces it
+    # instead of keeping it as "edited". The first content change to these
+    # files is what makes this necessary (managed_etc.sh header).
+    local path="$1" content="$2" old
+    shift 2
+    local snap=""
+    if [ "$#" -gt 0 ] && snap="$(mktemp)"; then
+        # shellcheck disable=SC2024  # sudo reads the root file; the temp file it writes to is ours
+        sudo cat "$path" > "$snap" 2>/dev/null || : > "$snap"
+        for old in "$@"; do
+            if [ -s "$snap" ] && _genesis_etc_equal "$snap" "$old"; then
+                genesis_etc_put "$path" "$old" "" dropin
+                break
+            fi
+        done
+        rm -f -- "$snap"
+    fi
+    genesis_etc_put "$path" "$content" "" dropin
+    case "$GENESIS_ETC_RESULT" in
+        written|taken) _MEMRES_CHANGED=1 ;;
+        migrated) _MEMRES_RELOAD=1 ;;
+        kept-edited) _MEMRES_KEPT=1 ;;
+        kept-nonregular|uninspected|failed) _MEMRES_FAILED=1 ;;
+    esac
+    return 0
+}
+
+# _memres_user_put <abs-path> <content> — write a user-manager drop-in the way
+# genesis_etc_put writes an /etc one (same stamp, scripts/lib/managed_units.py),
+# without sudo: the user owns these files. Sets _MEMRES_USER_RESULT to written,
+# migrated, unchanged, kept-edited, kept-nonregular or failed. Never fails.
+_memres_user_put() {
+    local path="$1" content stamped state tmp
+    content="$(printf '%s' "$2")"
+    _MEMRES_USER_RESULT="failed"
+    if [ -L "$path" ] || { [ -e "$path" ] && [ ! -f "$path" ]; }; then
+        echo "  Kept: $path is a symlink or not a regular file; not writing through it."
+        _MEMRES_USER_RESULT="kept-nonregular"
         return 0
     fi
-    if ! sudo mkdir -p "$(dirname "$path")" 2>/dev/null \
-        || ! printf '%s\n' "$content" | sudo tee "$path" >/dev/null 2>&1; then
-        echo "  WARNING: could not write $path (read-only /etc?) — drop-in NOT applied."
-        _MEMRES_FAILED=1
+    if ! stamped="$(printf '%s\n' "$content" | python3 -I -S "$_GENESIS_ETC_MU" stamp)"; then
+        echo "  WARNING: could not stamp the content for $path; not written."
         return 0
     fi
-    _MEMRES_CHANGED=1
+    local result="written"
+    if [ -f "$path" ]; then
+        if _genesis_etc_equal "$path" "$stamped"; then
+            _MEMRES_USER_RESULT="unchanged"
+            return 0
+        fi
+        if _genesis_etc_equal "$path" "$content"; then
+            result="migrated"
+        else
+            state="$(python3 -I -S "$_GENESIS_ETC_MU" verify < "$path" 2>/dev/null)" || state=""
+            if [ "$state" != "stamped" ]; then
+                echo "  Kept: $path was edited by hand. Not overwritten; delete it to get the Genesis version."
+                _MEMRES_USER_RESULT="kept-edited"
+                return 0
+            fi
+        fi
+    fi
+    tmp="${path%/*}/.genesis-tmp.$$"
+    if ! mkdir -p "${path%/*}" 2>/dev/null \
+        || ! printf '%s\n' "$stamped" > "$tmp" 2>/dev/null \
+        || ! mv -f -- "$tmp" "$path" 2>/dev/null; then
+        rm -f -- "$tmp" 2>/dev/null
+        echo "  WARNING: could not write $path."
+        return 0
+    fi
+    _MEMRES_USER_RESULT="$result"
+    return 0
+}
+
+# _memres_oomd_monitors <cgroup path> — exit 0 when `oomctl` lists the path
+# under "Memory Pressure Monitored CGroups".
+_memres_oomd_monitors() {
+    command -v oomctl >/dev/null 2>&1 || return 1
+    oomctl 2>/dev/null | awk -v want="$1" '
+        /^Memory Pressure Monitored CGroups:/ { inside = 1; next }
+        /^[^[:space:]]/ { inside = 0 }
+        inside && $1 == "Path:" && $2 == want { found = 1 }
+        END { exit !found }'
+}
+
+# _memres_user_monitor_apply — the user-level half: no sudo, run as the user.
+# Writes the user-manager drop-ins, reloads the user manager when one changed,
+# and sets _MEMRES_UM_OK=1 only when the monitor is verified LIVE: the drop-in
+# is the Genesis one, the user manager reports `kill` for its root slice, and
+# oomctl lists that cgroup on two reads apart. oomctl alone cannot tell PID 1's
+# report from the user manager's (one path, last message wins), so the property
+# read is what proves the user manager's own report, the one that survives a
+# reload.
+_memres_user_monitor_apply() {
+    _MEMRES_UM_OK=0
+    _MEMRES_UM_NOTE=""
+    if [ "$(id -u)" = "0" ]; then
+        _MEMRES_UM_NOTE="user-manager monitor not applied: running as root (run bootstrap.sh as the Genesis user)"
+        echo "  Skipped the user-manager monitor: $_MEMRES_UM_NOTE."
+        return 0
+    fi
+    local root_result init_result dbus_result changed=0 reload_rc=0 cg mode limit pref i r
+    _memres_user_put "$MEMRES_USER_UNIT_DIR/-.slice.d/genesis-oomd.conf" "$_MEMRES_UM_ROOT_CONF"
+    root_result="$_MEMRES_USER_RESULT"
+    _memres_user_put "$MEMRES_USER_UNIT_DIR/init.scope.d/genesis-oomd.conf" "$_MEMRES_UM_INIT_CONF"
+    init_result="$_MEMRES_USER_RESULT"
+    _memres_user_put "$MEMRES_USER_UNIT_DIR/dbus.service.d/genesis-oomd.conf" "$_MEMRES_UM_DBUS_CONF"
+    dbus_result="$_MEMRES_USER_RESULT"
+    case "$root_result $init_result $dbus_result" in *written*|*migrated*) changed=1 ;; esac
+    if [ "$changed" = 1 ]; then
+        systemctl --user daemon-reload >/dev/null 2>&1 || reload_rc=$?
+    fi
+    for r in "root-slice:$root_result" "init.scope:$init_result" "dbus.service:$dbus_result"; do
+        case "${r#*:}" in
+            written|migrated|unchanged) ;;
+            *) _MEMRES_UM_NOTE="its ${r%%:*} drop-in was ${r#*:}"
+               echo "  User-manager monitor not verified: $_MEMRES_UM_NOTE."
+               return 0 ;;
+        esac
+    done
+    if [ "$reload_rc" != 0 ]; then
+        _MEMRES_UM_NOTE="systemctl --user daemon-reload failed (exit $reload_rc)"
+        echo "  User-manager monitor not verified: $_MEMRES_UM_NOTE."
+        return 0
+    fi
+    mode="$(systemctl --user show -p ManagedOOMMemoryPressure --value -- -.slice 2>/dev/null)" || mode=""
+    if [ "$mode" != "kill" ] && [ "$changed" = 0 ]; then
+        # The drop-in is in place but the manager does not report it: a reload
+        # on an earlier run failed or never happened. Reload now.
+        systemctl --user daemon-reload >/dev/null 2>&1 || true
+        mode="$(systemctl --user show -p ManagedOOMMemoryPressure --value -- -.slice 2>/dev/null)" || mode=""
+    fi
+    cg="$(systemctl --user show -p ControlGroup --value -- -.slice 2>/dev/null)" || cg=""
+    if [ "$mode" != "kill" ] || [ -z "$cg" ]; then
+        _MEMRES_UM_NOTE="the user manager reports '${mode:-nothing}' for its root slice"
+        echo "  User-manager monitor not verified: $_MEMRES_UM_NOTE."
+        return 0
+    fi
+    # The limit as the manager holds it: a fraction of 2^32 (60% is 2576980377,
+    # MEASURED systemd 255). Anything else, including a build that prints a
+    # percentage, reads as not verified: an honest miss, never a false live.
+    limit="$(systemctl --user show -p ManagedOOMMemoryPressureLimit --value -- -.slice 2>/dev/null)" || limit=""
+    case "$limit" in
+        2576980377) ;;
+        *) _MEMRES_UM_NOTE="the user manager reports limit '${limit:-nothing}' for its root slice, not 60%"
+           echo "  User-manager monitor not verified: $_MEMRES_UM_NOTE."
+           return 0 ;;
+    esac
+    for r in "init.scope:omit" "dbus.service:avoid"; do
+        pref="$(systemctl --user show -p ManagedOOMPreference --value -- "${r%%:*}" 2>/dev/null)" || pref=""
+        if [ "$pref" != "${r#*:}" ]; then
+            _MEMRES_UM_NOTE="the user manager reports '${pref:-nothing}' for ${r%%:*}, not ${r#*:}"
+            echo "  User-manager monitor not verified: $_MEMRES_UM_NOTE."
+            return 0
+        fi
+    done
+    # The report reaches oomd asynchronously after the reload: poll, then
+    # confirm on a second read so a report about to be erased is not trusted.
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        if _memres_oomd_monitors "$cg"; then
+            break
+        fi
+        if [ "$i" = 10 ]; then
+            _MEMRES_UM_NOTE="oomctl does not list $cg"
+            echo "  User-manager monitor not verified: $_MEMRES_UM_NOTE."
+            return 0
+        fi
+        sleep "$MEMRES_OOMCTL_POLL_S"
+    done
+    sleep "$MEMRES_OOMCTL_CONFIRM_S"
+    if ! _memres_oomd_monitors "$cg"; then
+        _MEMRES_UM_NOTE="oomctl listed $cg, then dropped it"
+        echo "  User-manager monitor not verified: $_MEMRES_UM_NOTE."
+        return 0
+    fi
+    _MEMRES_UM_OK=1
+    echo "  User-manager monitor live: oomd watches $cg."
     return 0
 }
 
@@ -95,6 +301,30 @@ _memres_swap_check() {
     return 0
 }
 
+# _memres_policy_summary — one line naming the monitors this run left in force.
+# Both halves come from reads made now: the user half from
+# _memres_user_monitor_apply, the backstop from PID 1's own view of
+# user.slice (80% is 3435973836 as a fraction of 2^32, MEASURED systemd 255),
+# so a reload that failed on an earlier run is not reported as in force.
+_memres_policy_summary() {
+    local um bs backstop
+    if [ "$_MEMRES_UM_OK" = 1 ]; then
+        um="user manager kill @60% PSI, init.scope omit, dbus avoid, verified live"
+    else
+        um="user manager NOT verified (${_MEMRES_UM_NOTE:-see above})"
+    fi
+    bs="$(systemctl show -p ManagedOOMMemoryPressure -p ManagedOOMMemoryPressureLimit --value user.slice 2>/dev/null | paste -sd' ')" || bs=""
+    case "$bs" in
+        "kill 3435973836") backstop="user.slice backstop kill @80% PSI" ;;
+        *) backstop="user.slice backstop NOT confirmed (systemd reports '${bs:-nothing}')" ;;
+    esac
+    if ! systemctl is-active --quiet systemd-oomd 2>/dev/null; then
+        backstop="systemd-oomd is not running, so no monitor is in force"
+        um=""
+    fi
+    echo "${um:+$um; }$backstop"
+}
+
 # memory_resilience_apply — the entrypoint. Always returns 0.
 memory_resilience_apply() {
     echo "--- Memory resilience (systemd-oomd + swap invariant) ---"
@@ -111,16 +341,23 @@ memory_resilience_apply() {
         echo "  Skipped: kernel PSI not available ($MEMRES_PSI_FILE missing) — systemd-oomd needs pressure accounting."
         return 0
     fi
+    # The user half needs no sudo, so without sudo it runs on its own. With
+    # sudo it runs AFTER the /etc half, so its live check sees the oomd that
+    # half may have restarted, and the summary describes the final state.
     if ! sudo -n true 2>/dev/null; then
-        echo "  Skipped: sudo unavailable non-interactively. To apply manually:"
+        _memres_user_monitor_apply
+        echo "  Skipped the /etc policy: sudo unavailable non-interactively. To apply it manually:"
         echo "           sudo bash -c 'source scripts/lib/memory_resilience.sh && memory_resilience_apply'"
+        echo "           (as root the user-manager half is skipped; run bootstrap.sh as the user for it)"
         return 0
     fi
 
     _MEMRES_CHANGED=""
+    _MEMRES_RELOAD=""
+    _MEMRES_KEPT=""
     _MEMRES_FAILED=""
-    _memres_install_dropin "$MEMRES_ETC_ROOT/systemd/system/user.slice.d/genesis-oomd.conf" "$_MEMRES_USER_SLICE_CONF"
-    _memres_install_dropin "$MEMRES_ETC_ROOT/systemd/system/user@.service.d/genesis-oomd.conf" "$_MEMRES_USER_SERVICE_CONF"
+    _memres_install_dropin "$MEMRES_ETC_ROOT/systemd/system/user.slice.d/genesis-oomd.conf" "$_MEMRES_USER_SLICE_CONF" "$_MEMRES_USER_SLICE_CONF_V1"
+    _memres_install_dropin "$MEMRES_ETC_ROOT/systemd/system/user@.service.d/genesis-oomd.conf" "$_MEMRES_USER_SERVICE_CONF" "$_MEMRES_USER_SERVICE_CONF_V1"
     _memres_install_dropin "$MEMRES_ETC_ROOT/systemd/oomd.conf.d/genesis.conf" "$_MEMRES_OOMD_CONF"
 
     if [[ -n "$_MEMRES_CHANGED" ]]; then
@@ -133,13 +370,21 @@ memory_resilience_apply() {
         sudo systemctl daemon-reload 2>/dev/null || true
         sudo systemctl enable systemd-oomd 2>/dev/null || true
         sudo systemctl restart systemd-oomd 2>/dev/null || true
+    elif [[ -n "$_MEMRES_RELOAD" ]]; then
+        sudo systemctl daemon-reload 2>/dev/null || true
     fi
+    # After an oomd restart with no user reload, "verified" may rest briefly on
+    # PID 1's report (same owner, same policy); the next user reload re-sends
+    # the user manager's own.
+    _memres_user_monitor_apply
     if [[ -n "$_MEMRES_FAILED" ]]; then
         echo "  systemd-oomd policy NOT fully applied — see warnings above."
+    elif [[ -n "$_MEMRES_KEPT" ]]; then
+        echo "  systemd-oomd policy: a drop-in edited by hand was kept — see above."
     elif [[ -n "$_MEMRES_CHANGED" ]]; then
-        echo "  systemd-oomd pressure-kill policy applied (user.slice kill @60% PSI; per-user manager kill)."
+        echo "  systemd-oomd pressure-kill policy applied ($(_memres_policy_summary))."
     else
-        echo "  systemd-oomd pressure-kill policy already in place."
+        echo "  systemd-oomd pressure-kill policy already in place ($(_memres_policy_summary))."
     fi
 
     _memres_swap_check
@@ -178,12 +423,14 @@ pid_budget_apply() {
     fi
 
     _MEMRES_CHANGED=""
+    _MEMRES_RELOAD=""
+    _MEMRES_KEPT=""
     _MEMRES_FAILED=""
     # High-numbered so it wins over systemd's 10-defaults.conf (33%); the
     # user-.slice TEMPLATE dir applies to every per-user slice regardless of UID.
     _memres_install_dropin "$MEMRES_ETC_ROOT/systemd/system/user-.slice.d/90-genesis-tasksmax.conf" "$_MEMRES_TASKSMAX_CONF"
 
-    if [[ -n "$_MEMRES_CHANGED" ]]; then
+    if [[ -n "$_MEMRES_CHANGED$_MEMRES_RELOAD" ]]; then
         # daemon-reload re-reads unit config; TasksMax applies to an already-
         # running slice on reload and unconditionally at its next (re)start/login.
         # Best-effort: the drop-in on disk is the durable guarantee — a reload
@@ -192,6 +439,8 @@ pid_budget_apply() {
     fi
     if [[ -n "$_MEMRES_FAILED" ]]; then
         echo "  TasksMax drop-in NOT applied — see warning above (posture check will surface it)."
+    elif [[ -n "$_MEMRES_KEPT" ]]; then
+        echo "  TasksMax drop-in edited by hand was kept — see above."
     elif [[ -n "$_MEMRES_CHANGED" ]]; then
         echo "  PID ceiling raised: user-.slice TasksMax=60% (was systemd's 33% default)."
     else

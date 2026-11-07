@@ -8,9 +8,15 @@ Description=Genesis FalkorDB — graph engine for the memory graph (socket-only)
 #   systemctl --user enable --now genesis-falkordb
 #   systemctl --user disable --now genesis-falkordb
 #
-# scripts/lib/falkordb_install.sh fetches the released module under
-# ~/.genesis/deps. redis-server >= 8.0.0 is an operator step (SETUP.md): the
-# module refuses to load on the 7.x that Ubuntu/Debian stable ship.
+# The engine ships as the hash-pinned `falkordblite` wheel. Provisioning
+# (scripts/lib/falkordb_install.sh) verifies the installed files against the
+# digests committed in scripts/lib/falkordb-engine-digests.txt and runs them
+# from a COPY, never from the venv: ~/.genesis/deps/falkordb/<version>-<wheel
+# tag>/, rendered here as absolute paths. The directory name changes with the
+# pin, so a pin bump lands beside this unit's files instead of on top of them.
+# A deploy moves this unit onto a new copy only when systemd reports it inactive
+# or failed; a running engine, or one whose state cannot be read, takes
+# `GENESIS_FALKORDB_SWITCH=1 scripts/bootstrap.sh` and a restart of this unit.
 #
 # StartLimit* live in [Unit], NOT [Service]: systemd ignores
 # StartLimitIntervalSec there (it accepts StartLimitBurst as a legacy alias, so
@@ -23,19 +29,18 @@ StartLimitBurst=4
 StartLimitIntervalSec=120
 
 [Service]
-# notify, not simple: with Type=simple systemd reports the unit active as soon
-# as it FORKS, and the socket is not answering yet. MEASURED on the reference
-# install, 3 restarts per config with the start limiter respected: Type=simple
-# was not ready immediately 3/3 times (61ms, 147ms, 78ms), Type=notify 0/3.
-# The posture rule reads "unit active + socket missing" as a fault, so that
-# window is a false alert waiting to fire; --supervised systemd below is what
-# makes redis send the readiness notification that closes it.
-Type=notify
-# Type=notify can hang where Type=simple could not: redis only sends READY=1
-# when built with libsystemd, and USE_SYSTEMD=yes is NOT redis's Makefile
-# default -- so a source build accepts --supervised systemd and never notifies.
-# Bound it well under the 90s manager default, so such a build fails fast into
-# the restart limiter instead of parking a start job for a minute and a half.
+# simple plus a readiness poll, not notify. The wheel's redis-server is built
+# WITHOUT libsystemd, so under Type=notify + --supervised systemd it never sends
+# READY=1 and every start times out (MEASURED). Plain Type=simple alone reports
+# the unit active as soon as it FORKS, before the socket answers (MEASURED on
+# the reference install: not ready 3/3 restarts, 61-147ms), and the posture
+# rule reads "unit active + socket missing" as a fault. The ExecStartPost below
+# closes that window: the start job completes only once the engine answers
+# PING over its socket (MEASURED: about 0.5 s after Starting).
+Type=simple
+# Bounds the whole start, the readiness poll included (15 s of polling at most),
+# well under the 90s manager default, so an engine that never answers fails
+# fast into the restart limiter instead of parking a start job.
 TimeoutStartSec=20
 # Socket-only by design: --port 0 disables the TCP listener entirely, so this
 # never collides with an operator's own redis on 6379 and is not reachable off
@@ -53,6 +58,13 @@ TimeoutStartSec=20
 # RSS around the 1G ceiling and is still ~6x the measured peak for this graph's
 # size. noeviction: silently evicting graph keys would corrupt the projection —
 # a write that cannot fit must fail loudly and be repaired by a re-project.
+#
+# --slowlog-max-len and --latency-monitor-threshold keep the engine's own record
+# of a slow moment: a read that times out client-side is otherwise news with no
+# cause. SLOWLOG times each command including its wait for a worker thread;
+# LATENCY catches a stalled main thread, which SLOWLOG cannot see. The default
+# 128 entries held about 2.5 h, nearly all hourly projection batches (MEASURED
+# 2026-10-20: about 47 entries an hour), so 4096 keeps about three days.
 # `+` runs this one command outside the sandbox below: ReadWritePaths names
 # the data dir itself, a missing ReadWritePaths entry fails namespace setup,
 # and under ProtectHome=read-only a sandboxed mkdir could not create it.
@@ -60,20 +72,63 @@ TimeoutStartSec=20
 # Paths are quoted items built on %h, never a rendered $HOME: systemd splits
 # unquoted whitespace into separate arguments (systemd.service(5) "Command
 # Lines", systemd.syntax(7) "Quoting"), and %h is expanded per item, so a home
-# with a space stays one argument. __REDIS_SERVER__ arrives escaped for these
-# quotes by _falkordb_redis_server_bin.
+# with a space stays one argument. __REDIS_SERVER__, __REDIS_CLI__,
+# __FALKORDB_MODULE__ and __FALKORDB_DIGESTS__ arrive escaped for these quotes
+# (and with `%` doubled) by falkordb_install.sh, which refuses a path holding
+# `"`, `\`, `$` or a control character.
 ExecStartPre=+/bin/mkdir -p "%h/.genesis/falkordb"
+# Integrity at EVERY start, not only at provision time: the copy's
+# engine.sha256 holds the digest of each engine file (binaries and the
+# libraries the module links), written by falkordb_engine_check.py after it
+# matched them to the committed digests. A file changed since then fails the
+# start here, before redis runs (MEASURED with a changed byte). --strict also
+# fails a malformed line. This catches DRIFT, not the engine itself: the
+# sandbox below is best-effort (where it is skipped, the engine could write the
+# copy), so the integrity check that holds is the re-verify against committed
+# digests at every provision.
+ExecStartPre=/usr/bin/sha256sum --quiet --strict -c "__FALKORDB_DIGESTS__"
 ExecStart="__REDIS_SERVER__" \
     --port 0 \
     --unixsocket "%h/.genesis/falkordb/falkordb.sock" \
     --unixsocketperm 700 \
     --dir "%h/.genesis/falkordb" \
-    --loadmodule "%h/.genesis/deps/falkordb/__FALKORDB_VERSION__/falkordb.so" \
+    --loadmodule "__FALKORDB_MODULE__" \
     --save "" \
     --appendonly no \
     --maxmemory 512mb \
     --maxmemory-policy noeviction \
-    --supervised systemd
+    --slowlog-max-len 4096 \
+    --latency-monitor-threshold 100
+# Readiness: the start job completes only once the engine answers PING over its
+# socket, polled up to 150 times at 0.1 s; otherwise the start fails. systemd
+# expands `%` specifiers and `$` variables in command lines (systemd.service(5)
+# "Command lines"), so every shell `$` is written `$$`, and the script uses no
+# `%`. The redis-cli path and the socket are passed as positional arguments,
+# never spliced into the script, so a path is never parsed as shell. This line
+# runs BEFORE the projector trigger below: ExecStartPost lines run in order, and
+# the projector must start only once the engine answers.
+ExecStartPost=/bin/sh -c 'i=0; while [ "$$i" -lt 150 ]; do [ "$$("$$1" -s "$$2" PING 2>/dev/null)" = PONG ] && exit 0; i=$$((i + 1)); sleep 0.1; done; echo "graph engine did not answer PING on $$2" >&2; exit 1' falkordb-ready "__REDIS_CLI__" "%h/.genesis/falkordb/falkordb.sock"
+# Re-project on EVERY start, restarts included (issue #3035). The engine keeps
+# no persistence, so a restarted engine holds no graph, and every traversal
+# fell back until the hourly timer next fired: up to an hour, with the first
+# fallback in each process costing a multi-second NetworkX rebuild. The timer's
+# Persistent=true does not help: it catches up runs missed while the TIMER was
+# inactive, not an engine that lost its data.
+#   restart, not start: if the hourly projection is mid-run when the engine
+#     dies, that run is writing into the engine that just lost everything, and
+#     a `start` of an already-activating oneshot merges into it and runs
+#     nothing new (MEASURED on a scratch oneshot, 2026-11-04). `restart` stops
+#     it (the projector unwinds on SIGTERM, graphstore_project.py) and runs a
+#     fresh projection; on an idle projector it is a plain start.
+#   --no-block: the projector unit orders After= this one, so it is queued and
+#     runs once this start completes; waiting for it here would deadlock.
+#   `-`: a failed trigger never fails the engine's own start.
+#   `+`: outside the sandbox below, like the mkdir, so the call reaches the
+#     user manager's bus whatever namespacing the sandbox ends up applying.
+#   One retry after 2 s, so a transient bus hiccup does not leave the engine
+#   empty until the hourly timer (which stays the bound if both attempts fail;
+#   systemd logs the failed command either way).
+ExecStartPost=-+/bin/sh -c '/usr/bin/systemctl --user restart --no-block genesis-graph-project.service || { sleep 2; /usr/bin/systemctl --user restart --no-block genesis-graph-project.service; }'
 Restart=always
 RestartSec=5
 # Budgeted on RSS, not on the allocator figure. Note this only bites where the
@@ -96,7 +151,7 @@ ProtectSystem=strict
 # all stay writable. --save "" does not close that: an explicit BGSAVE after
 # CONFIG SET dir writes wherever dir points, and the module is native code.
 # So the home is read-only and the data dir is the one writable path. The
-# module under ~/.genesis/deps only needs to be READ.
+# engine copy under ~/.genesis/deps only needs to be READ.
 #
 # BEST-EFFORT under a user manager: since systemd 254 these filesystem
 # directives imply PrivateUsers=yes in a user unit (systemd NEWS, 254), so

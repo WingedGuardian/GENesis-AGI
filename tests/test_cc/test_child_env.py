@@ -200,7 +200,7 @@ def test_the_update_orchestrator_script_pins_its_sessions():
     assert "env=env" in src, src
 
 
-def test_the_detached_update_session_is_pinned(monkeypatch, tmp_path):
+def test_the_detached_update_session_is_pinned(monkeypatch, tmp_path, updates_sandbox):
     from genesis.dashboard.routes import updates
 
     captured = {}

@@ -1,9 +1,9 @@
 """ta — local Claude Code transcript analytics.
 
     ta ingest [--since DAYS] [--timer]   build/refresh the per-source Parquet store
-    ta status                            store size, sources, staleness, row counts
+    ta status                            store size, sources, staleness
     ta sql "<query>" [--csv]             query the views (tool_calls, turns, hooks, events,
-                                         session_meta, agents, sessions; raw_<table> too)
+                                         session_meta, agents, sessions; raw_<table> with --live)
     ta prune --before YYYY-MM-DD         drop sources whose transcript is GONE and is older
 
 ``--timer`` honours the off-switch: GENESIS_TRANSCRIPT_ANALYTICS_DISABLED=1 or a
@@ -61,7 +61,6 @@ def _positive_window(value):
 
 
 def cmd_ingest(args) -> int:
-    from genesis.transcript_analytics import publication as source_publication
     from genesis.transcript_analytics import scrub, store
 
     args.since = _positive_window(args.since)
@@ -81,23 +80,6 @@ def cmd_ingest(args) -> int:
         # Fail closed AND retry later: writing would store fingerprints that never
         # rebuild, losing the failure text for good (review SF-2).
         print(f"transcript-analytics: {e}", file=sys.stderr)
-        return 2
-    except source_publication.Failed as exc:
-        print(
-            json.dumps(
-                {
-                    "publication_failed": True,
-                    "durability_uncertain": isinstance(exc, source_publication.Uncertain),
-                    "reason": str(exc),
-                    "staged_unpublished": getattr(exc, "staged_unpublished", None),
-                    "rebuilt_staged": getattr(exc, "rebuilt_staged", None),
-                    "rebuilt_durably_committed": getattr(exc, "rebuilt_durably_committed", None),
-                    "last_durable_revision": getattr(exc, "last_durable_revision", None),
-                    "visible_revision": getattr(exc, "visible_revision", None),
-                }
-            ),
-            file=sys.stderr,
-        )
         return 2
     from genesis.transcript_analytics import derive
 
@@ -188,37 +170,51 @@ def _marker_totals(markers):
     return malformed, marker_errors
 
 
-def _status(args):
-    from genesis.transcript_analytics import catalog, query, store
+def _snapshot_state(data, *, selection):
+    """The derived snapshot's manifest and whether the reader would use it.
 
-    selected = catalog.load(args.data)
+    The reader owns both the manifest read (regular files only) and the
+    freshness test, so status can never call current a cache the reader
+    rejects: see ``query.snapshot_state``.
+    """
+    from genesis.transcript_analytics import query
+
+    return query.snapshot_state(data, selection=selection)
+
+
+def _status(args):
+    from genesis.transcript_analytics import store
+
     sources = store.discover(args.projects)
     stale = 0
     source_errors = []
     for p, rel in sources:
         try:
-            st = os.stat(p)
-        except FileNotFoundError:  # removed since discovery (review N-6)
-            continue
-        try:
+            try:
+                st = os.stat(p)
+            except FileNotFoundError:  # removed since discovery (review N-6)
+                continue
             if not store.is_current(
-                args.data, store.srckey(rel), store.source_fingerprint(p, st), selected, source=rel
+                args.data, store.srckey(rel), store.source_fingerprint(p, st), source=rel
             ):
                 stale += 1
         except (OSError, ValueError) as exc:
             stale += 1
             source_errors.append({"source": store.source_identity(rel), "reason": str(exc)})
-    markers = [
-        store._table_path(args.data, store.MARKER, key, selected)
-        for key in store.source_keys(args.data, selected)
-    ]
+    selection = store.select_sources(args.data)
+    records, excluded = selection
+    markers = [record.path(store.MARKER) for record in records]
     malformed, marker_errors = _marker_totals(markers)
+    marker_errors.extend(
+        {"marker": store.MARKER, "key": source["key"], "reason": source["reason"]}
+        for source in excluded
+    )
     source_size, snapshot_size, size_errors = _parquet_bytes(args.data)
     out = {
         "data": str(args.data),
         "transcripts_now": len(sources),
         "stale_or_unbuilt": stale,
-        "sources_stored": len(markers),
+        "sources_stored": len(records) + len(excluded),
         "store_mb": round((source_size + snapshot_size) / 2**20, 1),
         "source_store_mb": round(source_size / 2**20, 1),
         "snapshot_store_mb": round(snapshot_size / 2**20, 1),
@@ -228,23 +224,18 @@ def _status(args):
         "malformed_lines": malformed,
         "disabled": (args.data / "DISABLED").exists(),
     }
-    keys, excluded = store.compatible_sources(args.data, selected)
-    out["coverage"] = {"included": len(keys), "excluded": excluded}
-    out["inventory"] = store.inventory(args.data, selected)
-    out["catalog_revision"] = selected.revision if selected is not None else None
-    out["snapshot"] = query.snapshot_manifest(args.data)
-    out["snapshot_current"] = query.derived_current(args.data, selected)
-    out["snapshot_compatible"] = query.snapshot_compatible(args.data)
+    out["coverage"] = {"included": len(records), "excluded": excluded}
+    out["inventory"] = store.inventory(args.data)
+    manifest, snapshot_current = _snapshot_state(args.data, selection=selection)
+    out["snapshot"] = manifest
+    out["snapshot_current"] = snapshot_current
     return out
 
 
 def cmd_status(args) -> int:
-    from genesis.transcript_analytics import store
-    from genesis.transcript_analytics.locks import publication
-
-    with store._locked(store.DEFAULT_LOCK), publication():
-        out = _status(args)
-    print(json.dumps(out, indent=2))
+    # A reader takes no lock: per-source records swap atomically, so status
+    # reports the accepted records captured once for this response.
+    print(json.dumps(_status(args), indent=2))
     return 0
 
 
@@ -256,12 +247,35 @@ def _cell(v, width: int) -> str:
     return s if len(s) <= width else s[:width] + f"…(+{len(s) - width} chars)"
 
 
-def cmd_sql(args) -> int:
-    from genesis.transcript_analytics.query import run_query
+def _sql_rows(rel, args):
+    """Drain once, retaining only the preview or streaming CSV batches."""
+    if rel is None:
+        return ([], [], 0), 0
+    cols, shown, total = rel.columns, [], 0
+    writer = None
+    if args.csv and cols:
+        import csv
 
-    cols, rows = run_query(
+        writer = csv.writer(sys.stdout)
+        writer.writerow(cols)
+    while batch := rel.fetchmany(1024):
+        total += len(batch)
+        if writer is not None:
+            writer.writerows(batch)
+        elif len(shown) < args.max_rows:
+            shown.extend(batch[: args.max_rows - len(shown)])
+    if writer is not None:
+        sys.stdout.flush()
+    return (cols, shown, total), total
+
+
+def cmd_sql(args) -> int:
+    from genesis.transcript_analytics.query import _query
+
+    cols, shown, total = _query(
         args.data,
         args.query,
+        consume=lambda rel: _sql_rows(rel, args),
         live=args.live,
         manifest_path=args.manifest,
         window=args.window,
@@ -270,13 +284,7 @@ def cmd_sql(args) -> int:
     if not cols:
         return 0
     if args.csv:
-        import csv
-
-        w = csv.writer(sys.stdout)
-        w.writerow(cols)
-        w.writerows(rows)
         return 0
-    shown = rows[: args.max_rows]
     from genesis.transcript_analytics.rendering import terminal_text
 
     cols = [terminal_text(c) for c in cols]
@@ -287,7 +295,7 @@ def cmd_sql(args) -> int:
     for r in cells:
         print("  ".join(v.ljust(w) for v, w in zip(r, widths, strict=True)))
     print(
-        f"({len(rows)} rows{'' if len(rows) <= args.max_rows else f', first {args.max_rows} shown; use --csv for all'})"
+        f"({total} rows{'' if total <= args.max_rows else f', first {args.max_rows} shown; use --csv for all'})"
     )
     return 0
 
@@ -344,7 +352,9 @@ def _configure(ap):
     p.add_argument("--window", help="analysis window label; SQL must apply this filter")
     p.add_argument("--baseline", help="deployment commit or baseline identifier")
     p.add_argument(
-        "--live", action="store_true", help="query the per-source files, not the snapshot (slow)"
+        "--live",
+        action="store_true",
+        help="query the per-source files, not the snapshot (slow); also exposes raw_<table> views",
     )
     p.add_argument("--max-rows", type=_nonnegative_int, default=100)
     p.add_argument(

@@ -402,3 +402,38 @@ async def test_ingest_reference_routes_to_episodic(db_with_schema, mock_store):
     call_kwargs = mock_store.store.call_args
     assert call_kwargs[1]["collection"] == "episodic_memory"
     assert call_kwargs[1]["memory_type"] == "episodic"
+
+
+# ─── Classifier: payment card numbers are never captured ─────────────────────
+
+_TEST_CARD = "4242" * 4  # Stripe's public test number, built from parts
+
+
+class TestClassifyRefusesCardNumbers:
+    @pytest.mark.parametrize(
+        "content",
+        [
+            f"The user's card number is {_TEST_CARD} and the PIN is 9931",
+            "Shop login: username: buyer42 password: "
+            f"{_TEST_CARD[:4]} {_TEST_CARD[4:8]} {_TEST_CARD[8:12]} {_TEST_CARD[12:]}",
+            f"API_KEY={_TEST_CARD}",
+        ],
+        ids=["card-and-pin", "card-as-password", "card-as-env-value"],
+    )
+    def test_card_bearing_extraction_is_not_a_reference(self, content):
+        ext = Extraction(
+            content=content,
+            extraction_type="entity",
+            confidence=0.9,
+            entities=["shop"],
+        )
+        assert classify_as_reference(ext) is None
+
+    def test_ordinary_credentials_still_classify(self):
+        ext = Extraction(
+            content="Shop login: username: buyer42 password: Passw0rd!x9z",
+            extraction_type="entity",
+            confidence=0.9,
+            entities=["Shop"],
+        )
+        assert classify_as_reference(ext) is not None

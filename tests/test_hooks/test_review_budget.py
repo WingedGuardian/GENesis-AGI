@@ -19,6 +19,22 @@ H4 = "4" * 40
 H5 = "5" * 40
 
 
+def _linear_commits(*heads):
+    """GraphQL commit nodes for a linear history, each with its parent."""
+    return [
+        {
+            "commit": {
+                "oid": h,
+                "parents": {
+                    "totalCount": 1 if i else 0,
+                    "nodes": [{"oid": heads[i - 1]}] if i else [],
+                },
+            }
+        }
+        for i, h in enumerate(heads)
+    ]
+
+
 def test_legacy_constant_import_surface_matches_shared_policy():
     assert review_state.STANDING_REVIEWED_HEAD_LIMIT == rb.STANDING_REVIEWED_HEAD_LIMIT
     assert review_state.GATE_DISCOVERY_ROUND_LIMIT == rb.GATE_DISCOVERY_ROUND_LIMIT
@@ -271,7 +287,7 @@ def _slow_runner(clock: _FakeClock, calls: list[tuple[str, float]]):
     serve = _graphql_server(
         head=H5,
         files=[{"path": "src/x.py", "changeType": "MODIFIED"}],
-        commits=[{"commit": {"oid": h}} for h in (H1, H2, H3, H4, H5)],
+        commits=_linear_commits(H1, H2, H3, H4, H5),
     )
 
     def run(argv, *, timeout):
@@ -517,7 +533,7 @@ def _gql_review(head, *, login="chatgpt-codex-connector", kind="Bot", state="COM
     }
 
 
-_COMMITS = [{"commit": {"oid": h}} for h in (H1, H2, H3, H4, H5)]
+_COMMITS = _linear_commits(H1, H2, H3, H4, H5)
 _FILES = [{"path": "src/x.py", "changeType": "MODIFIED"}]
 
 
@@ -594,7 +610,7 @@ def test_graphql_head_moving_between_pages_is_unknown(monkeypatch):
         heads=[H4, H5, H4, H4],
         reviews=[_gql_review(H4), _gql_review(H4)],
         files=_FILES,
-        commits=[{"commit": {"oid": H4}}],
+        commits=_linear_commits(H4),
     )
     got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
     assert got["status"] == "unknown", got
@@ -830,7 +846,7 @@ def test_a_copied_file_on_a_later_page_still_triggers_the_rest_fallback(monkeypa
             {"path": "src/b.py", "changeType": "COPIED"},
             {"path": "src/a.py", "changeType": "MODIFIED"},
         ],
-        commits=[{"commit": {"oid": H5}}],
+        commits=_linear_commits(H5),
     )
     rest_calls = []
 
@@ -1213,3 +1229,111 @@ def test_an_earlier_snapshots_recovered_failure_does_not_excuse_a_later_one(monk
     assert got["status"] == "unknown", got
     assert "graphql_read_budget_pages" in got["errors"], got
     assert not rb.errors_are_transient(got["errors"]), got
+
+
+def _gql_timed_review(head, when, *, login, body="Looks good.", tops=()):
+    return {
+        "state": "COMMENTED",
+        "submittedAt": when,
+        "body": body,
+        "author": {"login": login, "__typename": "Bot"},
+        "commit": {"oid": head},
+        "comments": {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {"fullDatabaseId": str(900 + i), "replyTo": None, "body": b}
+                for i, b in enumerate(tops)
+            ],
+        },
+    }
+
+
+def test_the_live_read_carries_commit_parents_and_finds_a_late_review(monkeypatch):
+    """End to end through the GraphQL read: each commit's parents reach the
+    evaluator, so a finding review that lands on an ancestor after a newer head
+    was reviewed opens no round, and is listed with its round instead."""
+    _no_seams(monkeypatch)
+    devin = (
+        '<!-- devin-review-comment {"id": "BUG_1", "kind": "bug"} -->\n\n'
+        "\U0001f7e1 **Title**\n\nWhy.\n"
+    )
+    serve = _graphql_server(
+        reviews=[
+            _gql_timed_review(H5, "2026-10-05T01:00:00Z", login="coderabbitai"),
+            _gql_timed_review(
+                H4, "2026-10-05T02:00:00Z", login="devin-ai-integration", tops=[devin]
+            ),
+        ],
+        files=_FILES,
+        commits=_linear_commits(H4, H5),
+    )
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "ok", got
+    assert got["commits"] == [{"sha": H4, "parents": []}, {"sha": H5, "parents": [H4]}]
+    assert got["count"] == 0, got
+    assert [(f["head"], f["keys"], f["round_head"]) for f in got["findings"]] == [
+        (H4, ["c900"], None)
+    ]
+    assert " parents(first: 100) { totalCount nodes { oid } }" in " ".join(serve.seen[0])
+
+
+def test_a_commit_node_without_its_parents_is_malformed(monkeypatch):
+    """The query asks for every commit's parents; a reply without them is not a
+    PR with no history, it is a malformed reply."""
+    _no_seams(monkeypatch)
+    serve = _graphql_server(files=_FILES, commits=[{"commit": {"oid": H5}}])
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "unknown" and "commits_malformed" in got["errors"], got
+
+
+def test_a_commit_graph_that_changes_between_the_reads_is_unknown(monkeypatch):
+    """The graph decides which reviews are late, so it is re-read with the other
+    mutable evidence; a PR commit list that moved while the head did not (a
+    base branch moving under a stacked PR) must not be evaluated from either read."""
+    _no_seams(monkeypatch)
+    first = _graphql_server(files=_FILES, commits=_linear_commits(H3, H4, H5))
+    second = _graphql_server(files=_FILES, commits=_linear_commits(H4, H5))
+    seen = []
+
+    def serve(argv, *, timeout):
+        seen.append(next(a for a in argv if a.startswith("query=")))
+        return (first if len(seen) == 1 else second)(argv, timeout=timeout)
+
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "unknown", got
+    assert "evidence_changed_during_evaluation" in got["errors"], got
+    assert " commits(first: 100" in seen[1]  # the re-read selects the graph
+
+
+def test_a_parent_list_that_did_not_come_back_complete_is_unknown(monkeypatch):
+    """Every parent is read; a commit whose parent count exceeds the parents
+    returned (an octopus merge past the page) would make round_of guess."""
+    _no_seams(monkeypatch)
+    octopus = {
+        "commit": {
+            "oid": H5,
+            "parents": {"totalCount": 3, "nodes": [{"oid": H3}, {"oid": H4}]},
+        }
+    }
+    serve = _graphql_server(files=_FILES, commits=[*_linear_commits(H3, H4), octopus])
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "unknown" and "commits_malformed" in got["errors"], got
+    assert " parents(first: 100) { totalCount nodes { oid } }" in " ".join(serve.seen[0])
+
+
+def test_the_live_read_carries_comment_edit_times(monkeypatch):
+    """Issue comments are read with their edit time, and that time reaches the
+    marks: a clean comment edited after it was posted marks at the edit."""
+    _no_seams(monkeypatch)
+    clean = {
+        "fullDatabaseId": "9",
+        "body": "Codex Review: Didn't find any major issues.\nReviewed commit: `" + H5[:10] + "`",
+        "createdAt": "2026-10-05T01:00:00Z",
+        "updatedAt": "2026-10-05T02:00:00Z",
+        "author": {"login": "chatgpt-codex-connector", "__typename": "Bot"},
+    }
+    serve = _graphql_server(files=_FILES, commits=_linear_commits(H5), comments=[clean])
+    got = rb.evaluate_pr("owner/repo", 7, runner=serve, external_identity_templates=())
+    assert got["status"] == "ok", got
+    assert "createdAt updatedAt" in " ".join(serve.seen[0])
+    assert [m["at"] for m in got["marks"]] == ["2026-10-05T02:00:00+00:00"]

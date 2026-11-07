@@ -655,6 +655,71 @@ class TestManualMode:
 
 
 
+
+_FAKE_SLOT_EXEC = """#!/usr/bin/env bash
+# Records how the door called it, then runs the wrapped command, as the real
+# slot_exec.sh does when it cannot make a scope.
+echo "$*" >> "$HOME/../slot_exec.log"
+while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
+shift
+exec "$@"
+"""
+
+
+class TestSlotScopeDoor:
+    """Each slot's claude, and a freshly started tmux server, get a systemd
+    scope of their own through scripts/slot_exec.sh (the real wrapper is tested
+    in tests/test_scripts/test_slot_exec.py). The default fixture has no
+    slot_exec.sh, which covers the fallback: nothing is wrapped."""
+
+    @staticmethod
+    def _install_wrapper(tmp_path: Path) -> Path:
+        wrapper = tmp_path / "checkout" / "scripts" / "slot_exec.sh"
+        wrapper.write_text(_FAKE_SLOT_EXEC)
+        wrapper.chmod(wrapper.stat().st_mode | stat.S_IEXEC)
+        return tmp_path / "slot_exec.log"
+
+    def test_claude_starts_through_the_wrapper_inside_the_cd_guard(self, door, tmp_path):
+        run, log, _sessions, listing, _panes = door
+        self._install_wrapper(tmp_path)
+        listing.write_text("cc-9|0|0\n")  # a server is already running
+        result = run("manual")
+        assert result.returncode == 0, result.stderr
+        line = _new_session_line(log)
+        cmd = line.split("LANG=", 1)[1]
+        assert "slot_exec.sh 1 -- claude" in cmd, line
+        assert cmd.index("cd ") < cmd.index("slot_exec.sh 1 -- claude"), "prefix must sit inside the cd && chain"
+
+    def test_no_wrapper_means_claude_is_launched_bare(self, door):
+        run, log, _sessions, _listing, _panes = door
+        result = run("manual")
+        assert result.returncode == 0, result.stderr
+        assert "slot_exec.sh" not in _new_session_line(log)
+
+    def test_a_fresh_tmux_server_starts_in_an_omit_scope(self, door, tmp_path):
+        run, log, _sessions, listing, _panes = door
+        wrapper_log = self._install_wrapper(tmp_path)
+        if listing.exists():
+            listing.unlink()  # list-sessions fails: no tmux server yet
+        result = run("manual")
+        assert result.returncode == 0, result.stderr
+        calls = wrapper_log.read_text().splitlines()
+        server_calls = [c for c in calls if "--unit-prefix genesis-tmux" in c]
+        assert len(server_calls) == 1, calls
+        assert "--slice app.slice --omit server -- tmux -u new-session -A -s cc-1" in server_calls[0]
+        _new_session_line(log)  # the wrapped exec still reached tmux
+
+    def test_a_running_tmux_server_is_joined_unwrapped(self, door, tmp_path):
+        run, log, _sessions, listing, _panes = door
+        wrapper_log = self._install_wrapper(tmp_path)
+        listing.write_text("cc-9|0|0\n")
+        result = run("manual")
+        assert result.returncode == 0, result.stderr
+        calls = wrapper_log.read_text().splitlines() if wrapper_log.exists() else []
+        assert not [c for c in calls if "genesis-tmux" in c], calls
+        _new_session_line(log)
+
+
 class TestSlotMapBudget:
     """The slot map is COSMETIC and must never be what makes a login feel slow."""
 
@@ -759,6 +824,72 @@ shopt -q patsub_replacement
             timeout=10,
         )
         assert result.stdout == "root=/tmp/genesis\\&slot\n"
+
+    @staticmethod
+    def _run_block(tmp_path: Path, block: str, args: list[str], *, tty: bool, env_extra: dict) -> str:
+        """Run the REAL bashrc block's claude() with stub door scripts and a fake
+        claude, under a pty when ``tty`` (the scope branch needs both [ -t 0 ]
+        and [ -t 1 ]). Returns the call log: one line per stub that ran."""
+        import pty
+        import select
+
+        root = tmp_path / "root"
+        (root / "scripts").mkdir(parents=True)
+        calls = tmp_path / "calls.log"
+        for name, tag in (("slot_exec.sh", "slot_exec"), ("cc-slot.sh", "cc-slot")):
+            stub = root / "scripts" / name
+            stub.write_text(f'#!/bin/bash\necho "{tag} $*" >> {str(calls)!r}\n')
+            stub.chmod(0o755)
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        fake = bindir / "claude"
+        fake.write_text(f'#!/bin/bash\necho "claude $*" >> {str(calls)!r}\n')
+        fake.chmod(0o755)
+        script = block.replace("__GENESIS_ROOT__", str(root)) + "\nclaude " + " ".join(args) + "\n"
+        env = {"PATH": f"{bindir}:/usr/bin:/bin", "HOME": str(tmp_path), **env_extra}
+        if tty:
+            pid, fd = pty.fork()
+            if pid == 0:
+                try:
+                    os.execve("/bin/bash", ["bash", "-c", script], env)  # noqa: S606
+                except Exception:  # noqa: BLE001
+                    os._exit(127)
+            while True:
+                r, _, _ = select.select([fd], [], [], 10)
+                if not r:
+                    break
+                try:
+                    if not os.read(fd, 4096):
+                        break
+                except OSError:
+                    break
+            os.waitpid(pid, 0)
+        else:
+            subprocess.run(["bash", "-c", script], env=env, stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=10, check=False)
+        return calls.read_text() if calls.exists() else ""
+
+    def test_interactive_claude_inside_tmux_gets_a_scope(self, block, tmp_path):
+        log = self._run_block(tmp_path, block, ["--resume", "x"], tty=True,
+                              env_extra={"TMUX": "/tmp/fake,1,0", "GENESIS_SLOT": "4"})
+        assert log.splitlines() == ["slot_exec 4 -- claude --resume x"], log
+
+    def test_opted_out_interactive_claude_gets_a_bare_scope(self, block, tmp_path):
+        log = self._run_block(tmp_path, block, [], tty=True,
+                              env_extra={"GENESIS_NO_TMUX_WRAP": "1"})
+        assert log.splitlines() == ["slot_exec bare -- claude"], log
+
+    def test_non_tty_claude_keeps_its_callers_scope(self, block, tmp_path):
+        """A session's Bash tool runs `claude mcp ...` through this function with
+        no terminal; it must not be moved out of that session's scope."""
+        log = self._run_block(tmp_path, block, ["mcp", "list"], tty=False,
+                              env_extra={"TMUX": "/tmp/fake,1,0"})
+        assert log.splitlines() == ["claude mcp list"], log
+
+    def test_print_mode_is_never_wrapped(self, block, tmp_path):
+        log = self._run_block(tmp_path, block, ["-p", "hi"], tty=True,
+                              env_extra={"TMUX": "/tmp/fake,1,0"})
+        assert log.splitlines() == ["claude -p hi"], log
 
     def test_wrapper_keeps_passthrough_and_optout(self, block):
         assert "-p|--print|--version|-v|--help|-h" in block
@@ -1468,19 +1599,20 @@ class TestSubcommandBypass:
     exit — which for `setup-token` is a long-lived credential. The capture is
     already scrubbed and fails closed, so this is defence in depth.
 
-    The split is by LIFETIME, not by "is it listed under Commands:". Three of
+    The split is by LIFETIME, not by "is it listed under Commands:". Four of
     claude's subcommands are exactly what the slot exists for, and bypassing
     them would hand an SSH drop the failure this launcher prevents.
     """
 
     # Ephemeral: prints and exits. These bypass.
     EPHEMERAL = [
-        "auth", "auto-mode", "doctor", "import", "install", "mcp", "plugin",
-        "plugins", "project", "setup-token", "update", "upgrade",
+        "auth", "auto-mode", "doctor", "import", "install", "kill", "logs",
+        "mcp", "plugin", "plugins", "project", "respawn", "rm", "setup-token",
+        "stop", "update", "upgrade",
     ]
     # Long-lived: a daemon, the interactive agent view, and a minutes-long
     # cloud review. These KEEP the slot, as a recorded decision.
-    KEEPS_A_SLOT = ["agents", "gateway", "ultrareview"]
+    KEEPS_A_SLOT = ["agents", "attach", "gateway", "ultrareview"]
 
     @staticmethod
     def _door_list(name: str) -> set[str]:
@@ -1602,6 +1734,7 @@ class TestSubcommandBypass:
     def test_the_two_lists_are_disjoint(self):
         assert not set(self.EPHEMERAL) & set(self.KEEPS_A_SLOT)
 
+    @pytest.mark.real_tool("claude")  # reads the installed claude's own --help
     def test_every_installed_subcommand_is_CLASSIFIED(self):
         """A new subcommand must be CLASSIFIED, not defaulted into the bypass.
 

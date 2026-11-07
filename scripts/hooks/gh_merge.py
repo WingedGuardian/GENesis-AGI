@@ -54,7 +54,7 @@ import tempfile
 from typing import NamedTuple
 from urllib.parse import unquote
 
-from pr_close_advisory import _parse_api
+from pr_close_predicate import _parse_api
 
 _MERGE_WORD = re.compile(r"(?i)(?:^|/)merge(?:-async)?(?:$|[/?#])")
 _MERGE_PATH = re.compile(

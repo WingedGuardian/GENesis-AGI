@@ -37,6 +37,7 @@ able to wedge a session through this path.
 from __future__ import annotations
 
 import json
+import re
 import sys
 from typing import Any
 
@@ -67,6 +68,42 @@ _DIVIDER_COST = 8
 _NEWLINE_COST = 1
 
 
+#: Any surrogate CODE POINT. A Python ``str`` can hold one unpaired — for
+#: example after ``json.loads('"\\ud800"')``, which is how hook stdin is parsed,
+#: or a filename decoded with ``surrogateescape`` — and no strict encoder will
+#: write it: ``print`` to a UTF-8 stdout raises ``UnicodeEncodeError``.
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+#: What one surrogate code point costs once :func:`printable` has escaped it:
+#: the six characters of ``\\udXXX``.
+_SURROGATE_ESCAPE_COST = 6
+
+
+def printable(text: str) -> str:
+    """``text`` exactly as the writers here emit it: surrogates escaped.
+
+    Every surrogate code point becomes the six-character escape ``\\udXXX``,
+    the spelling ``json.dumps`` already gives the same character, so the
+    plain-text writers and :func:`print_json_bounded` show it identically. A
+    replacement character would hide which code point was there; an escape is
+    ASCII, so it encodes on any stream, and it keeps the information.
+
+    One function, used by the measurement AND the write, so that what is billed
+    is what is written. Measuring a cleaned string while writing the raw one (or
+    the reverse) is the unit-mixing defect this module keeps having to remove.
+    Text without surrogates is returned unchanged, the same object.
+
+    UTF-8 with ``backslashreplace`` is the escape: surrogates are the only code
+    points UTF-8 cannot encode, so it replaces exactly those, each on its own
+    (a high and a low surrogate stored as two code points are NOT joined into
+    one character), and it runs in C — MEASURED about 30x faster than a regex
+    substitution on surrogate-dense text.
+    """
+    if text.isascii() or _SURROGATE.search(text) is None:
+        return text
+    return text.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
 def utf16_len(text: str) -> int:
     """Length of ``text`` in UTF-16 CODE UNITS — the unit the harness counts.
 
@@ -75,8 +112,12 @@ def utf16_len(text: str) -> int:
     unit the writer enforces. A sub-budget checked with ``len`` against a parent
     budget enforced in code units is not a smaller budget — it is a budget that
     silently stops bounding anything once astral text arrives.
+
+    Measured on :func:`printable` ``(text)``, the string the writers actually
+    emit, so a lone surrogate costs its six-character escape. A strict
+    ``encode`` of the raw text raised on one instead (#3237).
     """
-    return len(text.encode("utf-16-le")) // 2
+    return len(printable(text).encode("utf-16-le")) // 2
 
 
 def emit_cost(text: str) -> int:
@@ -119,17 +160,40 @@ def clip_to_cost(text: str, max_units: int) -> str:
     accounting without correcting the slicing left the two disagreeing, which is
     worse than having them consistently wrong.
 
-    Counts whole characters, so it can never split a surrogate pair.
+    Counts whole characters, so it can never split a surrogate pair. A lone
+    surrogate costs what :func:`printable` writes for it (six units), the same
+    unit :func:`utf16_len` bills: a clip that counted it as one would let a
+    caller's ``clip_to_cost(x, cap)`` emit six times its cap.
     """
     if max_units <= 0:
         return ""
     total = 0
     for i, ch in enumerate(text):
-        cost = 2 if ord(ch) > 0xFFFF else 1
+        cp = ord(ch)
+        if cp > 0xFFFF:
+            cost = 2
+        elif 0xD800 <= cp <= 0xDFFF:
+            cost = _SURROGATE_ESCAPE_COST
+        else:
+            cost = 1
         if total + cost > max_units:
             return text[:i]
         total += cost
     return text
+
+
+def clip_final_notice(text: str, *, emitted_units: int) -> str | None:
+    """Size a hard-stop notice from the stream's locked UTF-16 count.
+
+    The deadline writer may add a leading and trailing newline. Keep the
+    existing three-unit margin, including one spare unit, under the harness
+    cap. Unlike BoundedStdout's logical counter, this count includes writes
+    whose accounting was interrupted by the timer. Call under the stream lock.
+    """
+    room = HOOK_STDOUT_CAP - emitted_units - 3
+    if room <= 0:
+        return None
+    return clip_to_cost(text, room)
 
 
 #: Default headroom under the cap. The cap is the cliff, not the target: a
@@ -181,9 +245,11 @@ class BoundedStdout:
             tests can capture without patching the module.
         """
         self._budget = budget
-        self._label = label
+        # Both are written inside the cut marker, so they are made printable
+        # here, once, and every size decision below sees the written form.
+        self._label = printable(label)
         self._reserve = max(0, reserve)
-        self._mirror_hint = mirror_hint
+        self._mirror_hint = printable(mirror_hint)
         self._stream = stream
         self._emitted = 0
         self._intended: list[str] = []
@@ -230,7 +296,7 @@ class BoundedStdout:
 
     def set_mirror_hint(self, hint: str) -> None:
         """Name the durable mirror. Set before emitting so a cut can cite it."""
-        self._mirror_hint = hint
+        self._mirror_hint = printable(hint)
 
     @property
     def room(self) -> int:
@@ -305,6 +371,9 @@ class BoundedStdout:
             where to read it did) or ``"cut"`` — which branch was taken, so the
             caller can report it without re-deriving why.
         """
+        # Made printable before anything is measured, so the degrade below
+        # sizes the strings it will actually write (#3237).
+        text, divider, pointer, notice = (printable(s) for s in (text, divider, pointer, notice))
         div_cost = emit_cost(divider) if divider else 0
 
         def _fits(s: str) -> bool:
@@ -360,7 +429,13 @@ class BoundedStdout:
 
         Always records ``text`` in :attr:`intended`, including after a cut, so
         the mirror stays complete no matter where the cut fell.
+
+        ``text`` is made :func:`printable` first, and that form is what is
+        billed, written and recorded, so the mirror matches the stream and a
+        caller writing :attr:`intended` to disk cannot hit the encode error
+        either.
         """
+        text = printable(text)
         self._intended.append(text)
         if self.closed:
             return
@@ -388,6 +463,9 @@ class BoundedStdout:
         reader needs; the fallback exists so that outcome requires BOTH the full
         line AND its own shorter form to overflow, not merely the full line.
         """
+        text = printable(text)
+        if fallback is not None:
+            fallback = printable(fallback)
         self._intended.append(text)
         room = self._budget - self._emitted
         if room <= 0:
@@ -401,6 +479,12 @@ class BoundedStdout:
 
     # ── internals ──────────────────────────────────────────────────────
     def _write(self, text: str) -> None:
+        # Every caller above already passes printable text, so this is the
+        # identity on every path that exists. It stays because this is the one
+        # place a strict encoder sees the string: a future path that forgets
+        # would otherwise raise UnicodeEncodeError, which the OSError guard
+        # below does not catch, and kill the hook (#3237).
+        text = printable(text)
         stream = self._stream if self._stream is not None else sys.stdout
         try:
             print(text, file=stream)
@@ -505,15 +589,23 @@ def print_json_bounded(
     out of the named free-text fields — longest first — and the envelope always
     survives.
 
+    What a trimmed field keeps, in order of preference: the LONGEST prefix
+    that fits followed by the full truncation note; failing that (the room
+    beside the envelope is narrower than the note) the longest prefix that fits
+    followed by a short note; failing that, nothing. Fields are trimmed largest
+    serialised size first, each to the longest prefix that fits with the others
+    as they stand. A payload that already fits is emitted unchanged.
+
     :param text_keys: dotted paths to trimmable strings, e.g.
         ``("hookSpecificOutput.additionalContext",)``.
     :returns: True if the emitted payload is WITHIN budget. False means it was
         emitted anyway and may be persisted — the caller's decision could be
-        withheld from the model. False is reachable when the envelope alone
-        exceeds the budget, when no ``text_keys`` are trimmable, or when a
-        named path is absent or not a string; a warning naming the reason goes
-        to stderr in every such case. Callers that need the guarantee must
-        check this, because "something was trimmed" is not the same claim.
+        withheld from the model. False is returned exactly when the payload with
+        every trimmable field emptied (the ENVELOPE) still exceeds the budget —
+        including when no ``text_keys`` name a string, so nothing is trimmable;
+        a warning naming the reason goes to stderr. Callers that need the
+        guarantee must check this, because "something was trimmed" is not the
+        same claim.
     """
     stream = stream if stream is not None else sys.stdout
 
@@ -533,52 +625,139 @@ def print_json_bounded(
         node[parts[-1]] = value
 
     note = f"\n[truncated — over the {HOOK_STDOUT_CAP}-char hook output cap]"
-    # Bounded loop rather than one arithmetic pass: a trimmed field is
-    # RE-SERIALISED, and JSON escaping means the serialised length is not the
-    # Python length (the note's newline alone costs two characters once
-    # encoded). Converging on the measured size is correct where computing it
-    # is fiddly and wrong-by-one silently ships an oversize payload.
+    # The fallback when even the full note does not fit beside the envelope:
+    # a field that says it was cut, in fewer units, beats one that is silently
+    # empty.
+    short_note = "\n[truncated]"
+
     # What the STREAM receives, not what json.dumps returns: `print` appends a
-    # newline and the harness counts it. Measuring only the blob let a payload
-    # of exactly `budget` chars emit `budget + 1` while reporting success — the
-    # wrong direction for a size check, since it says "fine" about the one
-    # outcome this module exists to prevent.
+    # newline and the harness counts it, so `emit_cost` bills it. Measuring only
+    # the blob let a payload of exactly `budget` chars emit `budget + 1` while
+    # reporting success.
     #
-    # The off-by-one only bites a caller passing budget=HOOK_STDOUT_CAP, since the
-    # default budget sits 200 chars under the cap. It was fixed while still latent,
-    # because an off-by-one in a size guarantee is not something to hand an adopter.
-    #
+    # ONE unit throughout: the emitted cost of the whole serialised payload,
+    # re-measured on every probe. The previous version mixed three — serialised
+    # units for the overrun, Python characters for the field, UTF-16 units for
+    # the clip — and since `json.dumps` writes "—" as the six-character
+    # `—`, the overrun outgrew the field and the field was emptied (#3236).
+    # Computing the cost of a prefix instead of measuring it would mean
+    # restating JSON's escaping rules here; measuring cannot drift from them.
+    def _cost() -> int:
+        return emit_cost(json.dumps(payload))
+
+    def _jlen(value: str) -> int:
+        return len(json.dumps(value))
+
+    def _fits() -> bool:
+        return _cost() <= budget
+
+    def _fit_prefix(key: str, base: str, marker: str) -> bool:
+        """Set ``key`` to the LONGEST ``base`` prefix + ``marker`` that fits.
+
+        Exact, not estimated: the payload's cost never falls as the prefix
+        grows (``json.dumps`` escapes each character on its own, so a longer
+        prefix serialises to a longer string), which makes a binary search over
+        the prefix length return the longest one that fits in O(log n)
+        measurements. The prefix stays strictly shorter than ``base``, because
+        a marker on the whole text would announce a cut that did not happen.
+
+        The probes measure the FIELD, not the payload: a JSON string is a
+        self-delimited token, so the payload costs what it costs with the
+        marker alone, plus the difference in the field's own serialised length.
+        That keeps a probe proportional to the room (at most ``room``
+        characters, since every character costs at least one unit) rather than
+        to every other field in the payload. The result is then checked with
+        the full measurement, and a failed check restores the field and
+        returns False — an error in that reasoning can cost text, never
+        produce a payload that claims to fit and does not.
+        """
+        before = _get(key) or ""
+        _set(key, marker)
+        room = budget - (_cost() - _jlen(marker))
+        if not base or _jlen(marker) > room:
+            _set(key, before)
+            return False
+        lo, hi = 0, min(len(base) - 1, room)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if _jlen(base[:mid] + marker) <= room:
+                lo = mid
+            else:
+                hi = mid - 1
+        _set(key, base[:lo] + marker)
+        if not _fits():
+            _set(key, before)
+            return False
+        return True
+
+    keys: list[str] = []
+    for key in text_keys:
+        if key not in keys and _get(key) is not None:
+            keys.append(key)
+    originals: dict[str, str] = {}
+    for key in keys:
+        value = _get(key) or ""
+        # Never stack notes: text a caller already trimmed is trimmed afresh.
+        originals[key] = value[: -len(note)] if value.endswith(note) else value
+
+    if keys and not _fits():
+        for key in keys:
+            _set(key, "")
+        envelope_fits = _fits()
+        for key in keys:
+            _set(key, originals[key])
+        if not envelope_fits:
+            # Nothing the text fields can give up will fit. Keep the old shape
+            # for this case: each field the note would shorten carries the note.
+            for key in keys:
+                if _jlen(note) < _jlen(originals[key]):
+                    _set(key, note)
+        else:
+            # The emptied envelope fits, so a fitting payload EXISTS and this
+            # must find one (#3255: it used to stop at "note only", which can be
+            # wider than the room, and report False). Longest SERIALISED field
+            # first — the ranking used Python length, which under-ranks text
+            # whose escapes cost six units a character. Each pass trims one
+            # field to the longest prefix that fits; a field that cannot fit
+            # even its marker is reduced to the marker and the next field pays.
+            order = sorted(keys, key=lambda k: _jlen(originals[k]), reverse=True)
+            done = False
+            for marker in (note, short_note):
+                for key in order:
+                    if _fits() or _fit_prefix(key, originals[key], marker):
+                        done = True
+                        break
+                    if _jlen(marker) < _jlen(_get(key) or ""):
+                        _set(key, marker)
+                if done:
+                    break
+            if not done:
+                # Last resort, and the reason this branch always ends in
+                # budget: an empty field. Reached only when the room left by
+                # the envelope is smaller than even the short notes.
+                for key in order:
+                    if _fits():
+                        break
+                    _set(key, "")
+                    print(
+                        f"[hook_output] emptied {key!r} without a truncation note: "
+                        "the envelope leaves no room for one.",
+                        file=sys.stderr,
+                    )
+
     # Callers outside tests, ENUMERATED rather than counted from memory
-    # (`grep -rn print_json_bounded scripts/ src/`, no limit): capped_read_advisory
-    # (checks the return value), git_discard_guard (envelope backstop behind its own
-    # whole-note selection), plan_confidence_reminder (defence-in-depth — a fixed
-    # string far under budget), genesis_stop_hook (the Stop event's
-    # additionalContext), pr_close_advisory (one short fixed-shape note; the
-    # return value is not checked because a trimmed note is still a true note and
-    # the hook enforces nothing), rm_trash_advisory (one fixed-shape note naming the
-    # firing operands; the return value is not checked, for the same reason as
-    # pr_close_advisory), secrets_env_access_guard (a backstop behind the
-    # NOTE clips in hook_ask_policy; the return value is not checked because the
-    # envelope is a fixed ~100 characters, far under budget). This sentence has now
-    # been wrong twice in the same
-    # direction: it first read "no caller outside its tests", then named one of
-    # three. Both times an adopting change falsified a status claim living in a file
-    # the adopter never edits, which is exactly the kind of staleness a grep cannot
-    # catch. If you add a caller, this line is part of the change.
-    for _ in range(4 * max(1, len(text_keys))):
-        blob = json.dumps(payload)
-        if emit_cost(blob) <= budget:
-            break
-        over = emit_cost(blob) - budget
-        candidates = [(len(v), k) for k in text_keys if (v := _get(k)) is not None]
-        if not candidates:
-            break  # nothing trimmable — emit as-is rather than mangling a decision
-        _, key = max(candidates)
-        current = _get(key) or ""
-        # Never stack notes when a second pass is needed.
-        base = current[: -len(note)] if current.endswith(note) else current
-        keep = max(0, len(base) - over - len(note) - 8)
-        _set(key, clip_to_cost(base, keep) + note)
+    # (`grep -rn print_json_bounded scripts/ src/`, no limit; 2026-10-19):
+    # capped_read_advisory (two sites; checks the return value), genesis_stop_hook
+    # (the Stop event's additionalContext), git_discard_guard (envelope backstop
+    # behind its own whole-note selection), git_push_guard, issue_dup_advisory,
+    # main_checkout_guard, plan_confidence_reminder (defence-in-depth — a fixed
+    # string far under budget), pr_close_advisory and rm_trash_advisory (one
+    # fixed-shape note each; the return value is not checked because a trimmed
+    # note is still a true note and the hook enforces nothing), procedure_advisor,
+    # and secrets_env_access_guard (a backstop behind the NOTE clips in
+    # hook_ask_policy). This sentence has been wrong before in the same
+    # direction — an adopting change falsified a status claim living in a file
+    # the adopter never edits. If you add a caller, this line is part of the change.
     blob = json.dumps(payload)
     fits = emit_cost(blob) <= budget
     if not fits:

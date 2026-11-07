@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_scripts._update_source import update_text
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE_SH = REPO_ROOT / "scripts" / "update.sh"
 
@@ -46,7 +48,7 @@ FETCHING_MARKER = '\n_write_state "fetching"'
 
 @pytest.fixture(scope="module")
 def text() -> str:
-    return UPDATE_SH.read_text()
+    return update_text()
 
 
 def _idx(text: str, marker: str) -> int:
@@ -92,7 +94,7 @@ def test_rollback_takes_checkout_lock_after_stopping_bridge_and_unlocks_before_r
     skip = text.index('if [ "${_CHECKOUT_LOCK_BUSY:-0}" != "1" ]; then', stop)
     acquire = text.index('genesis_checkout_lock "$GENESIS_ROOT"', stop)
     release = text.index("genesis_checkout_unlock", acquire)
-    restart = text.index('if [ "$restart_ok" = "true" ]; then', acquire)
+    restart = text.index('if [ "$restart_ok" = "true" ] && [ "$db_ok" = "true" ]; then', acquire)
     assert stop < skip < acquire < release < restart
 
 
@@ -118,7 +120,8 @@ def test_pre_stop_fetch_is_post_merge_gated(text):
     f = _idx(text, FETCH)
     # The nearest gate opener before the fetch, with no column-0 `fi` closing it
     # in between: the fetch sits INSIDE that block, however long the comments.
-    gate = text.rfind('if [[ "$POST_MERGE" == "false" ]]; then', 0, f)
+    # (On `live` the same gate also skips it: `&& [ "${ON_LIVE:-0}" != 1 ]`.)
+    gate = text.rfind('if [[ "$POST_MERGE" == "false" ]]', 0, f)
     assert gate != -1, "pre-stop fetch must be POST_MERGE-gated"
     assert "\nfi\n" not in text[gate:f], "the POST_MERGE gate closes before the fetch"
 
@@ -158,5 +161,6 @@ def test_sync_deploy_targets_still_two_bare_calls(text):
 
 def test_update_sh_syntax_ok():
     """bash -n must pass after the reorder."""
-    r = subprocess.run(["bash", "-n", str(UPDATE_SH)], capture_output=True, text=True, timeout=30)
-    assert r.returncode == 0, r.stderr
+    for script in (UPDATE_SH, UPDATE_SH.parent / "lib" / "update_rollback.sh"):
+        r = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True, timeout=30)
+        assert r.returncode == 0, r.stderr

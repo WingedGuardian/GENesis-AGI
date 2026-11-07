@@ -231,12 +231,27 @@ class TestRecoveryIOTriage:
         assert engine._sm.state.recovery_attempts == 1
 
 
+_MAIN_CHECKOUT = (1, "other\n", "")  # live_checkout.py's answer on any branch but `live`
+_MAIN_HEAD = (0, "refs/heads/main\n", "")  # `symbolic-ref -q HEAD` on main
+
+
+def _on_main(rc: int = 0, stdout: str = "", stderr: str = ""):
+    """Like _mock_subprocess, but both live probes answer for `main`."""
+    async def mock(*args, **kwargs):
+        if "live_checkout.py" in args[-1]:
+            return _MAIN_CHECKOUT
+        if "symbolic-ref" in args[-1]:
+            return _MAIN_HEAD
+        return (rc, stdout, stderr)
+    return mock
+
+
 class TestRecoveryRevertCode:
 
     @pytest.mark.asyncio
     async def test_revert_code(self, engine: RecoveryEngine) -> None:
         with (
-            patch("genesis.guardian.recovery._run_subprocess", _mock_subprocess(0, "")),
+            patch("genesis.guardian.recovery._run_subprocess", _on_main(0, "")),
             patch("genesis.guardian.recovery.collect_all_signals", return_value=_healthy_snapshot()),
             patch.object(engine._snapshots, "take", return_value="pre-recovery"),
             patch("asyncio.sleep", new_callable=AsyncMock),
@@ -244,6 +259,115 @@ class TestRecoveryRevertCode:
             result = await engine.execute(_diagnosis(RecoveryAction.REVERT_CODE))
         assert result.success is True
         assert "reverted" in result.detail.lower()
+
+    @staticmethod
+    def _recording_subprocess(
+        stash_result: tuple[int, str, str],
+        probe: tuple[int, str, str] = _MAIN_CHECKOUT,
+        head: tuple[int, str, str] = _MAIN_HEAD,
+    ):
+        calls: list[str] = []
+
+        async def mock(*args, **kwargs):
+            command = args[-1]
+            calls.append(command)
+            if "live_checkout.py" in command:
+                return probe
+            if "symbolic-ref" in command:
+                return head
+            if "git stash" in command:
+                return stash_result
+            return (0, "", "")
+
+        return mock, calls
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "probe",
+        [
+            (0, "live\n", ""),  # on `live`, bound by the manifest
+            (2, "unreadable\n", ""),  # on `live`, manifest or git unreadable
+            (-1, "", "timeout"),  # the probe never reported
+            (1, "", ""),  # code without the word: a broken copy of the predicate
+            (0, "other\n", ""),  # word and code disagree
+        ],
+    )
+    async def test_never_stashes_or_reverts_unless_shown_not_live(
+        self, engine: RecoveryEngine, probe
+    ) -> None:
+        mock, calls = self._recording_subprocess((0, "", ""), probe=probe)
+        with patch("genesis.guardian.recovery._run_subprocess", mock):
+            ok, detail = await engine._revert_code("genesis")
+        assert ok is False
+        assert "`live`" in detail and "RESTART_CONTAINER" in detail
+        assert "deploy_candidates drop" in detail and "runs the server's boot repair" not in detail
+        assert not any("git stash" in c or "git revert" in c for c in calls), calls
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "head",
+        [
+            (0, "refs/heads/live\n", ""),  # on `live` with no manifest: the predicate says other
+            (0, "a login banner\nrefs/heads/live\n", ""),
+            (128, "", "fatal: not a git repository"),  # git failed
+            (-1, "", "timeout"),  # never reported
+            (0, "", ""),  # exit 0 without a ref
+        ],
+    )
+    async def test_head_on_live_bans_whatever_the_predicate_says(
+        self, engine: RecoveryEngine, head
+    ) -> None:
+        mock, calls = self._recording_subprocess((0, "", ""), head=head)
+        with patch("genesis.guardian.recovery._run_subprocess", mock):
+            ok, _ = await engine._revert_code("genesis")
+        assert ok is False
+        assert not any("git stash" in c or "git revert" in c for c in calls), calls
+
+    @pytest.mark.asyncio
+    async def test_detached_head_defers_to_the_predicate(self, engine: RecoveryEngine) -> None:
+        mock, calls = self._recording_subprocess((0, "", ""), head=(1, "", ""))
+        with patch("genesis.guardian.recovery._run_subprocess", mock):
+            ok, _ = await engine._revert_code("genesis")
+        assert ok is True
+
+    @pytest.mark.asyncio
+    async def test_main_checkout_still_reverts(self, engine: RecoveryEngine) -> None:
+        """A login shell may print before the probe; its last line decides."""
+        mock, calls = self._recording_subprocess(
+            (0, "", ""),
+            probe=(1, "a login banner\nother\n", ""),
+            head=(0, "a login banner\nrefs/heads/main\n", ""),
+        )
+        with patch("genesis.guardian.recovery._run_subprocess", mock):
+            ok, _ = await engine._revert_code("genesis")
+        assert ok is True
+        assert any("git stash" in c for c in calls), calls
+        assert any("git revert" in c for c in calls), calls
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("stash_result", "expected"),
+        [
+            ((1, "", "fatal: index.lock exists"), "failed"),
+            ((-1, "", "timeout"), "did not report"),
+        ],
+    )
+    async def test_failed_stash_never_reverts(
+        self, engine: RecoveryEngine, stash_result, expected
+    ) -> None:
+        mock, calls = self._recording_subprocess(stash_result)
+        with patch("genesis.guardian.recovery._run_subprocess", mock):
+            ok, detail = await engine._revert_code("genesis")
+        assert ok is False
+        assert expected in detail
+        assert not any("git revert" in c for c in calls), calls
+
+    @pytest.mark.asyncio
+    async def test_clean_tree_stash_still_reverts(self, engine: RecoveryEngine) -> None:
+        mock, calls = self._recording_subprocess((0, "No local changes to save", ""))
+        with patch("genesis.guardian.recovery._run_subprocess", mock):
+            await engine._revert_code("genesis")
+        assert any("git revert" in c for c in calls), calls
 
 
 class TestRestartContainerStopped:

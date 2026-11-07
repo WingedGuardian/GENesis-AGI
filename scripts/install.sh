@@ -195,6 +195,22 @@ else
     echo "    OK    Disk: $(df -h "$HOME" | tail -1 | awk '{print $4}') free"
 fi
 
+# OS floor: glibc 2.38 (Ubuntu 24.04+) on x86_64 or aarch64. pyproject.toml
+# declares the graph engine's wheel, built for nothing else, so off the floor
+# the package install in step 6 would fail after pip tried to compile the
+# engine from source. The floor lives in lib/falkordb_install.sh, which
+# bootstrap.sh and update.sh check too.
+if [ -f "$SCRIPT_DIR/lib/falkordb_install.sh" ]; then
+    # shellcheck source=lib/falkordb_install.sh
+    source "$SCRIPT_DIR/lib/falkordb_install.sh"
+    if falkordb_os_floor_ok; then
+        echo "    OK    OS: $(getconf GNU_LIBC_VERSION 2>/dev/null) on $("$FALKORDB_UNAME" -m 2>/dev/null)"
+    else
+        echo "    FAIL  OS: $(falkordb_os_floor_message)"
+        PREFLIGHT_OK=0
+    fi
+fi
+
 # RAM
 mem_total_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}')
 if [ -n "${mem_total_kb:-}" ]; then
@@ -243,7 +259,9 @@ else
     echo "    WARN  'ss' not found — cannot check for port conflicts"
 fi
 
-# Python 3.12+ — prefer explicit python3.12 binary
+# Python 3.12-3.14 — prefer explicit python3.12 binary
+# shellcheck source=lib/python312.sh
+. "$SCRIPT_DIR/lib/python312.sh"
 _install_python312() {
     # Attempt to install Python 3.12 using the available package manager and OS-specific sources.
     if command -v apt-get &>/dev/null; then
@@ -272,23 +290,9 @@ _install_python312() {
     elif command -v yum &>/dev/null; then
         sudo yum install -y python3.12 2>/dev/null && return 0
     fi
-    # Universal fallback: uv downloads a pre-built Python 3.12 binary (no compilation).
+    # Universal fallback.
     # Works on Debian 12, RHEL, and any Linux where the package manager lacks python3.12.
-    echo "    Trying uv (pre-built Python 3.12 binary — no compilation needed)..."
-    if curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh 2>/dev/null; then
-        local uv_bin="${HOME}/.local/bin/uv"
-        if [[ -x "$uv_bin" ]] && "$uv_bin" python install 3.12 --quiet 2>/dev/null; then
-            local py_path
-            py_path=$("$uv_bin" python find 3.12 2>/dev/null) || true
-            if [[ -n "$py_path" && -x "$py_path" ]]; then
-                # Symlink into /usr/local/bin so 'python3.12' is discoverable system-wide
-                sudo ln -sf "$py_path" /usr/local/bin/python3.12 2>/dev/null || \
-                    ln -sf "$py_path" "${HOME}/.local/bin/python3.12" 2>/dev/null || true
-                export PATH="${HOME}/.local/bin:$PATH"
-                command -v python3.12 &>/dev/null && return 0
-            fi
-        fi
-    fi
+    genesis_install_python312_uv && return 0
     return 1
 }
 
@@ -297,17 +301,29 @@ if command -v python3.12 &>/dev/null; then
     echo "    OK    Python $py_version"
 elif command -v python3 &>/dev/null; then
     py_version=$(python3 --version 2>&1 | grep -oP '\d+\.\d+' || echo "0.0")
-    if python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" 2>/dev/null; then
-        echo "    OK    Python $py_version"
+    # Upper bound mirrors pyproject's requires-python (litellm caps Python <3.15).
+    if python3 -c "import sys; sys.exit(0 if (3, 12) <= sys.version_info[:2] < (3, 15) else 1)" 2>/dev/null; then
+        if [ "$PREFLIGHT_OK" = 1 ] && genesis_new_venv_wants_python312 "$VENV_PATH" python3; then
+            echo "    Python $py_version found, but Genesis is tested on 3.12 — installing python3.12..."
+            if genesis_install_python312_uv; then
+                py_version=$(python3.12 --version 2>&1 | grep -oP '\d+\.\d+' || echo "3.12")
+                echo "    OK    Python $py_version (installed)"
+            else
+                echo "    WARN  Could not install python3.12; continuing on Python $py_version, which CI does not test. To retry, delete $VENV_PATH and re-run."
+                setup_warn "python3.12 could not be installed; the venv uses Python $py_version, which CI does not test"
+            fi
+        else
+            echo "    OK    Python $py_version"
+        fi
     else
         # Try to install Python 3.12 explicitly
-        echo "    Python $py_version found but 3.12+ required — installing python3.12..."
+        echo "    Python $py_version found but 3.12-3.14 required — installing python3.12..."
         _install_python312 || true
         if command -v python3.12 &>/dev/null; then
             py_version=$(python3.12 --version 2>&1 | grep -oP '\d+\.\d+' || echo "3.12")
             echo "    OK    Python $py_version (installed)"
         else
-            echo "    FAIL  Python 3.12+ required, found $py_version"
+            echo "    FAIL  Python 3.12-3.14 required, found $py_version"
             if command -v apt-get &>/dev/null; then
                 echo "    Install manually:"
                 echo "      Ubuntu: sudo add-apt-repository ppa:deadsnakes/ppa && sudo apt-get install python3.12 python3.12-venv"
@@ -421,7 +437,7 @@ elif [[ "$_PKG_MGR" == "yum" ]]; then
 fi
 
 # pip — check on python3.12 first (installed in pre-flight), then fall back to python3
-_PIP_BIN=$(command -v python3.12 || command -v python3)
+_PIP_BIN=$(genesis_python_bin)
 if ! "$_PIP_BIN" -m pip --version &>/dev/null; then
     echo "    pip not found — installing..."
     if [[ "$_PKG_MGR" == "apt" ]]; then
@@ -443,7 +459,7 @@ fi
 
 # venv module — check ensurepip, not just "import venv" (the venv module ships
 # with base Python but ensurepip requires the python3.XX-venv package on apt systems)
-_CHECK_PY=$(command -v python3.12 || command -v python3)
+_CHECK_PY=$(genesis_python_bin)
 _PY_MINOR=$("$_CHECK_PY" -c 'import sys; print(sys.version_info.minor)')
 if ! "$_CHECK_PY" -c "import ensurepip" &>/dev/null; then
     echo "    python3.${_PY_MINOR}-venv not found — installing..."
@@ -661,25 +677,8 @@ if [ -r "$SCRIPT_DIR/lib/cbm_disable_file.sh" ]; then
     . "$SCRIPT_DIR/lib/cbm_disable_file.sh"
     _cbm_disable="$(genesis_cbm_disable_file 2>/dev/null)" || _cbm_disable=""
 fi
-if [ -z "$_cbm_disable" ]; then
-    echo "    NOTE: codebase-memory-mcp kill-switch path unresolvable — refusing install (fail closed)"
-elif [ -e "$_cbm_disable" ]; then
-    echo "    . codebase-memory-mcp install/upgrade skipped (machine kill switch active)"
-else
-    # The pin, the digest and the install itself live in ONE place, shared with
-    # bootstrap.sh, so the commit and its digest cannot drift apart.
-    # shellcheck source=lib/cbm_installer.sh
-    . "$SCRIPT_DIR/lib/cbm_installer.sh"
-    _cbm_rc=0
-    genesis_cbm_install || _cbm_rc=$?
-    case "$_cbm_rc" in
-        0) echo "    + codebase-memory-mcp installed/upgraded" ;;
-        1) echo "    NOTE: codebase-memory-mcp installer download failed (optional)" ;;
-        3) echo "    ERROR: codebase-memory-mcp integrity check failed — the pinned installer does not match the committed digest (see above)" ;;
-        4) echo "    NOTE: codebase-memory-mcp install refused — machine kill switch active" ;;
-        *) echo "    NOTE: codebase-memory-mcp unavailable (optional) — see the error above" ;;
-    esac
-fi
+# Setup is deliberately manual (configure needs a pinned binary); whether it is
+# still owed is reported under "Next steps", after .mcp.json is rendered.
 
 _GITNEXUS_PIN_READY=0
 _gitnexus_pin_file="$SCRIPT_DIR/lib/gitnexus_version.sh"
@@ -727,7 +726,7 @@ else
 fi
 
 if ! command -v uv &>/dev/null; then
-    curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh 2>/dev/null || true
+    curl -LsSf "https://astral.sh/uv/$GENESIS_UV_VERSION/install.sh" 2>/dev/null | sh 2>/dev/null || true
     export PATH="$HOME/.local/bin:$PATH"
 fi
 # shellcheck source=lib/serena_install.sh
@@ -737,7 +736,7 @@ if command -v uv &>/dev/null; then
 fi
 
 # Python venv — prefer python3.12 for venv creation
-PYTHON_BIN=$(command -v python3.12 || command -v python3)
+PYTHON_BIN=$(genesis_python_bin)
 if [ ! -d "$VENV_PATH" ] || [ ! -x "$VENV_PATH/bin/python" ] || [ ! -x "$VENV_PATH/bin/pip" ]; then
     # Remove broken venv before recreating
     if [ -d "$VENV_PATH" ]; then
@@ -747,12 +746,12 @@ if [ ! -d "$VENV_PATH" ] || [ ! -x "$VENV_PATH/bin/python" ] || [ ! -x "$VENV_PA
     echo "    Creating venv at $VENV_PATH (using $PYTHON_BIN)..."
     "$PYTHON_BIN" -m venv "$VENV_PATH"
     echo "    + venv created"
-    # Verify venv Python is 3.12+ (defense-in-depth — pre-flight should catch this)
+    # Verify venv Python is 3.12-3.14 (defense-in-depth — pre-flight should catch this)
     _venv_pyver=$("$VENV_PATH/bin/python" --version 2>&1 | grep -oP '\d+\.\d+' || echo "0.0")
-    if ! "$VENV_PATH/bin/python" -c "import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)" 2>/dev/null; then
-        echo "    WARNING: venv Python is $_venv_pyver but Genesis requires 3.12+"
+    if ! "$VENV_PATH/bin/python" -c "import sys; sys.exit(0 if (3, 12) <= sys.version_info[:2] < (3, 15) else 1)" 2>/dev/null; then
+        echo "    WARNING: venv Python is $_venv_pyver but Genesis requires 3.12-3.14"
         echo "    Install Python 3.12 and re-run this script."
-        setup_warn "venv Python is $_venv_pyver but Genesis requires 3.12+"
+        setup_warn "venv Python is $_venv_pyver but Genesis requires 3.12-3.14"
     fi
 fi
 
@@ -897,20 +896,58 @@ fi
 # ══════════════════════════════════════════════════════════════
 echo "  [6/$TOTAL_STEPS] Installing Genesis package..."
 
+_genesis_installed=0  # the browser stack step (step 11) needs Genesis importable
 # shellcheck source=lib/venv_setup.sh
 . "$SCRIPT_DIR/lib/venv_setup.sh"
 if [ -d "$VENV_PATH" ]; then
+    # The graph engine's hash-pinned wheel, BEFORE the editable install:
+    # pyproject.toml declares the same falkordblite pin, and installed first it is
+    # what the editable install finds satisfied, rather than a copy fetched on
+    # TLS alone. Never fatal (rc 0 by contract), but a refused wheel skips the
+    # editable install below; the resolved engine paths it exports feed the unit
+    # render in step 7. bootstrap.sh runs the same call.
+    if [[ -f "$SCRIPT_DIR/lib/falkordb_install.sh" ]]; then
+        # shellcheck source=lib/falkordb_install.sh
+        source "$SCRIPT_DIR/lib/falkordb_install.sh"
+        # Not piped: a pipeline would run it in a subshell and drop its exports.
+        falkordb_provision "$VENV_PATH"
+    fi
     # Worktree guard + editable install + import verification — shared with
     # bootstrap.sh so the guard can't drift between the two entry points.
     _ei_rc=0
-    editable_install_guarded "$REPO_DIR" "$VENV_PATH" || _ei_rc=$?
+    if [ "${FALKORDB_PIP_REFUSED:-}" = "1" ]; then
+        # The hash-pinned wheel was refused: the editable install would fetch the
+        # same mandatory wheel with no hash check, so it does not run.
+        _ei_rc=3
+    else
+        editable_install_guarded "$REPO_DIR" "$VENV_PATH" || _ei_rc=$?
+    fi
     case $_ei_rc in
         0)
             echo "    + Genesis installed in editable mode"
+            _genesis_installed=1
+            # The browser packages, after the core and never fatal (see
+            # install_browser_extra); their engine and Chromium download in step 11.
+            if install_browser_extra "$REPO_DIR" "$VENV_PATH" | sed 's/^/    /'; then
+                echo "    + browser packages installed"
+            else
+                setup_warn "browser packages incomplete (see above; re-run scripts/bootstrap.sh)"
+            fi
+            # The test and payments extras, the same way (see install_runtime_extras).
+            if install_runtime_extras "$REPO_DIR" "$VENV_PATH" | sed 's/^/    /'; then
+                echo "    + test and payments packages installed"
+            else
+                setup_warn "test/payments packages incomplete (see above; re-run scripts/bootstrap.sh)"
+            fi
             ;;
         1)
             # Blocked (worktree) — guard already printed the reason; the
             # install continues, matching the previous inline behavior.
+            ;;
+        3)
+            echo "    FAIL  the graph engine's hash-pinned wheel did not install (see above);"
+            echo "          Genesis was not installed, so nothing fetched it unverified."
+            setup_warn "Genesis not installed: the graph engine's hash-pinned wheel did not install (re-run scripts/install.sh)"
             ;;
         *)
             echo "    FAIL  pip install completed but Genesis is not importable."
@@ -985,14 +1022,18 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
         CC_BIN_DIR="$CC_BIN_DIR:$_cc_prefix/bin"
     fi
 
-    # genesis-falkordb.service.template carries two placeholders beyond the
-    # shared five: __FALKORDB_VERSION__ and __REDIS_SERVER__. The resolver and
-    # the version pin live in the same lib bootstrap provisions from — sourced
-    # here for the render only; provisioning stays in bootstrap.sh. With the
-    # lib absent the literals below still produce a parseable (if inert) unit.
-    if [[ -f "$SCRIPT_DIR/lib/falkordb_install.sh" ]]; then
-        # shellcheck source=lib/falkordb_install.sh
-        source "$SCRIPT_DIR/lib/falkordb_install.sh"
+    # genesis-falkordb.service.template carries four placeholders beyond the
+    # shared ones: __REDIS_SERVER__, __REDIS_CLI__, __FALKORDB_MODULE__ and
+    # __FALKORDB_DIGESTS__, the engine-copy paths falkordb_provision placed in
+    # step 6. NOT re-sourced here:
+    # sourcing the lib resets those results. When step 6 never provisioned (no
+    # venv, or the lib is absent) the unit is not rendered at all.
+    if ! declare -F falkordb_unit_keep_existing >/dev/null; then
+        falkordb_unit_keep_existing() { FALKORDB_KEEP_REASON="unverified"; return 0; }
+        _falkordb_redis_server_bin() { :; }
+        _falkordb_redis_cli_bin() { :; }
+        _falkordb_module_path() { :; }
+        _falkordb_digests_path() { :; }
     fi
 
     for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template "$SYSTEMD_TEMPLATE_DIR"/*.timer.template "$SYSTEMD_TEMPLATE_DIR"/*.slice.template; do
@@ -1000,8 +1041,27 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
         svc_name=$(basename "$template" .template)
 
         target="$SYSTEMD_USER_DIR/$svc_name"
-        if [ -f "$target" ]; then
+        # Keep links (including masks) through the ordinary policy below, without
+        # writing through them. Other nonregular Codebase destinations refuse.
+        case "$svc_name" in
+            genesis-cbm-query.service | genesis-cbm-query-clients.slice)
+                if [[ ! -L "$target" && -e "$target" && ! -f "$target" ]]; then
+                    echo "    ERROR: refusing nonregular managed Codebase unit: $target" >&2
+                    exit 1
+                fi ;;
+        esac
+        # Any existing path counts, not only a regular file: a masked unit is a
+        # symlink to /dev/null, and replacing it would unmask it (the timer loop
+        # below then enables it). Bootstrap keeps such a unit the same way.
+        if [ -L "$target" ] || { [ -e "$target" ] && [ ! -f "$target" ]; }; then
+            echo "    . $svc_name is a symlink or not a regular file (masked?) — kept"
+        elif [ -f "$target" ]; then
             echo "    . $svc_name already exists (not overwriting)"
+        elif [ "$svc_name" = "genesis-falkordb.service" ] \
+            && falkordb_unit_keep_existing "$target"; then
+            # No unit exists here, so the only keep reason is an engine step 6
+            # did not verify: there are no engine paths to render with.
+            echo "    . $svc_name not rendered (graph engine not verified)"
         else
             # __AZ_ROOT__ (agent-zero.service.template's WorkingDirectory) was
             # absent from this list, so that unit shipped with a literal
@@ -1029,21 +1089,45 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
             # backslash. `\\\\&` would emit TWO, leaving `&` still meaning "the
             # whole match" — verified by hand, since it looks correct and is not.
             _sed_repl_esc() { printf '%s' "$1" | sed -e 's/[\\&|]/\\&/g'; }
+            _systemd_exec_esc() { printf '%s' "$1" | sed -e 's/[\\"]/\\&/g' -e 's/%/%%/g'; }
+            _home_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$HOME")")
+            _repo_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$REPO_DIR")")
+            _venv_exec_esc=$(_sed_repl_esc "$(_systemd_exec_esc "$VENV_PATH")")
             _home_esc=$(_sed_repl_esc "$HOME")
             _venv_esc=$(_sed_repl_esc "$VENV_PATH")
             _repo_esc=$(_sed_repl_esc "$REPO_DIR")
             _ccbin_esc=$(_sed_repl_esc "$CC_BIN_DIR")
             _az_root_esc=$(_sed_repl_esc "${AZ_ROOT:-$HOME/agent-zero}")
-            _falkordb_ver_esc=$(_sed_repl_esc "${FALKORDB_VERSION:-4.20.4}")
-            _redis_bin_esc=$(_sed_repl_esc "$(_falkordb_redis_server_bin 2>/dev/null || echo /usr/bin/redis-server)")
+            _redis_bin_esc=$(_sed_repl_esc "$(_falkordb_redis_server_bin 2>/dev/null || true)")
+            _redis_cli_esc=$(_sed_repl_esc "$(_falkordb_redis_cli_bin 2>/dev/null || true)")
+            _falkordb_mod_esc=$(_sed_repl_esc "$(_falkordb_module_path 2>/dev/null || true)")
+            _falkordb_digests_esc=$(_sed_repl_esc "$(_falkordb_digests_path 2>/dev/null || true)")
             sed -e "s|__HOME__|$_home_esc|g" \
+                -e "s|__HOME_EXEC__|$_home_exec_esc|g" \
+                -e "s|__REPO_EXEC__|$_repo_exec_esc|g" \
+                -e "s|__VENV_EXEC__|$_venv_exec_esc|g" \
                 -e "s|__VENV__|$_venv_esc|g" \
                 -e "s|__REPO_DIR__|$_repo_esc|g" \
                 -e "s|__CC_BIN_DIR__|$_ccbin_esc|g" \
                 -e "s|__AZ_ROOT__|$_az_root_esc|g" \
-                -e "s|__FALKORDB_VERSION__|$_falkordb_ver_esc|g" \
                 -e "s|__REDIS_SERVER__|$_redis_bin_esc|g" \
-                "$template" > "$target"
+                -e "s|__REDIS_CLI__|$_redis_cli_esc|g" \
+                -e "s|__FALKORDB_MODULE__|$_falkordb_mod_esc|g" \
+                -e "s|__FALKORDB_DIGESTS__|$_falkordb_digests_esc|g" \
+                "$template" > "$target.render"
+            # Stamped like every bootstrap render (scripts/lib/managed_units.py),
+            # so a hand edit is recognised from the first update on. Unstamped,
+            # the unit would be matched against its template with each
+            # __TOKEN__ as a wildcard, and an edit confined to a token's value
+            # would be overwritten silently.
+            if ! python3 -I -S "$SCRIPT_DIR/lib/managed_units.py" stamp \
+                    < "$target.render" > "$target.tmp"; then
+                rm -f "$target.render" "$target.tmp"
+                echo "    ! $svc_name: could not stamp the rendered unit"
+                exit 1
+            fi
+            rm -f "$target.render"
+            mv -f "$target.tmp" "$target"
             echo "    + $svc_name generated"
             SERVICES_GENERATED=1
         fi
@@ -1099,25 +1183,8 @@ if command -v claude &>/dev/null; then
     . "$SCRIPT_DIR/lib/mcp_register.sh"
     [ -x "$REPO_DIR/.claude/mcp/run-gitnexus" ] && \
         _register_mcp "gitnexus" "user" "$REPO_DIR/.claude/mcp/run-gitnexus" "mcp"
-    # Via the repo launcher (NOT the bare binary): wraps the server in a
-    # systemd scope with MemoryMax=2G to contain upstream's unbounded memory
-    # leak (DeusData/codebase-memory-mcp#581). Rationale in the launcher.
-    if command -v codebase-memory-mcp &>/dev/null; then
-        # REGISTERED EVEN WHEN THE KILL SWITCH IS ACTIVE, deliberately. Registration
-        # does not start anything, and the launcher is fail-closed on the sentinel
-        # (.claude/mcp/run-codebase-memory exits 1 with "disabled by <file>"), so
-        # writing the registration while disabled cannot run the server.
-        #
-        # Skipping preserved the exact drift this helper exists to repair: a
-        # PRE-EXISTING registration pointing at the bare `codebase-memory-mcp`
-        # binary survives untouched, bypasses the launcher entirely, and starts the
-        # uncapped raw server in the next session — and stays uncapped after the
-        # sentinel is removed until somebody runs this again.
-        _register_mcp "codebase-memory-mcp" "user" "$REPO_DIR/.claude/mcp/run-codebase-memory"
-        if [ -n "${_cbm_disable:-}" ] && [ -e "$_cbm_disable" ]; then
-            echo "    . codebase-memory-mcp registered to the launcher; kill switch active, so it will refuse to start"
-        fi
-    fi
+    # Register managed setup on every install; registration never activates CBM.
+    _register_mcp "codebase-memory-mcp" "user" "$REPO_DIR/.claude/mcp/run-codebase-memory"
     _serena_registration_available && \
         _register_serena "$REPO_DIR"
     # grep-app (grep.app) — literal/regex code search over ~1M public GitHub
@@ -1381,6 +1448,9 @@ fi
 # the exact gap that left genesis-cc-align.timer disabled under the old
 # hardcoded per-timer list.
 if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
+    GENESIS_ROOT="${GENESIS_ROOT:-$REPO_DIR}"
+    # shellcheck source=lib/managed_units.sh
+    . "$SCRIPT_DIR/lib/managed_units.sh"
     for template in "$SYSTEMD_TEMPLATE_DIR"/*.timer.template; do
         [ -f "$template" ] || continue
         timer_name=$(basename "$template" .template)
@@ -1392,11 +1462,42 @@ if [ -d "$SYSTEMD_TEMPLATE_DIR" ]; then
                     continue
                 fi ;;
         esac
+        # A re-run must not turn back on a timer the operator switched off
+        # (~/.genesis/config/disabled_timers; lib/managed_units.sh).
+        if genesis_timer_opted_out "$timer_name"; then
+            echo "    - $timer_name not enabled (listed in $GENESIS_DISABLED_TIMERS)"
+            continue
+        fi
         if [ -f "$SYSTEMD_USER_DIR/$timer_name" ]; then
             systemctl --user enable --now "$timer_name" 2>/dev/null && \
                 echo "    + $timer_name enabled + started" || true
         fi
     done
+fi
+
+# The browser stack: the Camoufox engine and the Chromium the browser packages pin,
+# and their system libraries. Inline here, unlike bootstrap.sh, which starts it as a
+# unit: a fresh install has no browser running and the user is present, and a sudo
+# credential this run already cached lets the script's `sudo -n` install missing
+# libraries. Inside a Claude Code session the provisioner refuses to run, so the
+# unit runs it instead, as bootstrap.sh does.
+if [ "$_genesis_installed" != "1" ]; then
+    echo "    Browser stack: skipped (the Genesis package step above did not complete)"
+elif [ -n "${CLAUDECODE:-}" ]; then
+    if systemctl --user start --no-block genesis-browser-stack.service 2>/dev/null; then
+        echo "    + genesis-browser-stack.service started (journalctl --user -u genesis-browser-stack);"
+        echo "      unattended, it reports missing system libraries with the command to run"
+    else
+        setup_warn "browser stack not started (run scripts/install_browser_stack.sh from a terminal)"
+    fi
+elif echo "    Browser stack: Camoufox engine and Chromium, about 1.5 GB the first time;" \
+    && echo "    no progress is shown while it downloads..." \
+    && VENV_PATH="$VENV_PATH" GENESIS_BROWSER_STACK_WAIT_S=7200 \
+        bash "$SCRIPT_DIR/install_browser_stack.sh" 2>&1 | sed 's/^/    /'; then
+    # Exit 0 is ready, or deliberately skipped (low disk, another run): its line says which.
+    echo "    + browser stack step done (its browser-stack: line above says what it did)"
+else
+    setup_warn "browser stack not ready (see its browser-stack: line above; re-run scripts/install_browser_stack.sh)"
 fi
 
 # Enable the cc-tmp cold-start apply SERVICE (WantedBy=default.target, not a
@@ -1608,6 +1709,18 @@ if [ ! -f /usr/local/bin/genesis ]; then
 #!/bin/bash
 repo=$_repo_q
 cd "\$repo" 2>/dev/null || { echo "Genesis repo not found at \$repo"; exit 1; }
+# An interactive session gets a systemd scope of its own (scripts/slot_exec.sh),
+# with a memory cap, so a runaway session is contained inside its own scope.
+# Print mode and the informational flags stay in the caller's scope, as at the
+# bashrc door: a headless child must die with the session that started it.
+for arg in "\$@"; do
+    case "\$arg" in
+        -p|--print|--version|-v|--help|-h) exec claude "\$@" ;;
+    esac
+done
+if [ -t 0 ] && [ -t 1 ] && [ "\$(id -u)" != 0 ] && [ -x "\$repo/scripts/slot_exec.sh" ]; then
+    exec "\$repo/scripts/slot_exec.sh" bare -- claude "\$@"
+fi
 exec claude "\$@"
 WRAPPER
     sudo chmod +x /usr/local/bin/genesis
@@ -1987,6 +2100,10 @@ echo "    Genesis will guide you through first-time setup."
 if [ "$_final_keys" = "0" ] 2>/dev/null; then
     echo "    (API keys, user profile, channels — all handled interactively)"
 fi
+# codebase-memory-mcp: one line only when it is registered but not set up (or OK).
+# shellcheck source=lib/cbm_setup_notice.sh
+. "$SCRIPT_DIR/lib/cbm_setup_notice.sh"
+genesis_cbm_setup_notice "$VENV_PYTHON" "$REPO_DIR" "    "
 # Clarify what the skipped smoke tests mean so new users aren't confused
 if [ "${SMOKE_SKIP:-0}" -gt 0 ] && [ "${SMOKE_FAIL:-0}" = "0" ]; then
     echo ""
@@ -2006,12 +2123,13 @@ echo "    journalctl --user -u genesis-server -f   # live logs"
 echo ""
 echo "  Dashboard: http://localhost:5000"
 echo "    (Access from your browser via host IP — see host setup output)"
-# Show a note on non-Ubuntu-24 systems — Genesis is developed on Ubuntu 24.04;
-# install works on other distros but runtime behaviour is not guaranteed.
+# Show a note on releases CI does not test: CI's default runner (now 26.04) runs the
+# suite and a fresh install, and a pinned 24.04 job runs the OS-sensitive tests.
+# Install works on other distros, but runtime behaviour is not guaranteed.
 _os_name=$(grep -oP '^PRETTY_NAME="\K[^"]+' /etc/os-release 2>/dev/null || echo "")
-if ! echo "$_os_name" | grep -qi 'ubuntu 24'; then
+if ! echo "$_os_name" | grep -qiE 'ubuntu (24|26)\.04'; then
     echo ""
-    echo "  OS note: Genesis is developed and tested on Ubuntu 24.04."
+    echo "  OS note: Genesis is tested on Ubuntu 24.04 and 26.04."
     echo "  This install ran on: $_os_name"
     echo "  Installation completed but runtime behaviour may vary on this OS."
     echo "  Report issues: https://github.com/WingedGuardian/GENesis-AGI/issues"

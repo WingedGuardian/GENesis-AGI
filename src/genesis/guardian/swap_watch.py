@@ -12,7 +12,7 @@ The guardian is the only Genesis component that runs host-side with incus +
 sudo access *continuously*, so it reconciles on OBSERVED state each tick:
 
 1. **Persistent**: ``incus config get limits.memory.swap`` is not already
-   swap-on (``_is_swap_on``: any Incus TRUE spelling, or a parseable byte-size
+   swap-on (``is_swap_on``: any Incus TRUE spelling, or a parseable byte-size
    ceiling) → ``incus config set ... true`` (covers unset, every FALSE
    spelling, and unparseable garbage; applies at every future container
    start).
@@ -124,7 +124,7 @@ def _is_parseable_incus_size(raw: str) -> bool:
     """Whether ``raw`` is a NONZERO Incus byte-size ceiling — trusting
     Incus's own write-time validation rather than re-mirroring its suffix
     grammar. Callers must rule out Incus's own boolean words first (see
-    ``_is_swap_on``) — this function alone cannot tell "0" the byte size
+    ``is_swap_on``) — this function alone cannot tell "0" the byte size
     from "0" the bool.
 
     ``incus config get`` only ever returns a value that already passed
@@ -170,7 +170,7 @@ def _is_parseable_incus_size(raw: str) -> bool:
     return any(ch != "0" for ch in raw[:i])
 
 
-def _is_swap_on(raw: str) -> bool:
+def is_swap_on(raw: str) -> bool:
     """Whether this ``limits.memory.swap`` value already explicitly encodes
     swap-on, so the reconciler should leave it alone: any Incus TRUE
     spelling, or a parseable byte-size ceiling (the native swap-ceiling
@@ -195,7 +195,7 @@ def _is_byte_ceiling(raw: str) -> bool:
     ceiling, as opposed to a boolean. The boolean words are ruled out FIRST,
     exactly as Incus does: ``"1"`` is Incus TRUE (a boolean, for which Incus
     writes ``memory.swap.max=0`` under a hard memory limit), even though it
-    also reads as a one-byte size. Testing ``_is_swap_on(v) and
+    also reads as a one-byte size. Testing ``is_swap_on(v) and
     _is_parseable_incus_size(v)`` instead would call ``"1"`` a ceiling and
     leave a live 0 under it unhealed."""
     stripped = raw.strip()
@@ -495,7 +495,7 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
         return
 
     container = config.container_name
-    healed: list[str] = []
+    healed: list[tuple[str, bool, bool]] = []
     problems: dict[str, list[str]] = {
         _PROBLEM_CLASS_SWAP_OFF: [],
         _PROBLEM_CLASS_CEILING: [],
@@ -549,6 +549,13 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
     config_verified = rc == 0
     raw_value = stdout.strip() if rc == 0 else ""
     key_now = raw_value  # the key as we understand it after any write this tick
+    # The live cgroup value BEFORE this tick's key write, read only when a key
+    # write is about to happen. Under a hard memory limit Incus resets the cgroup
+    # to 0 on a boolean key write, so the read in step 2 cannot tell a swap-off
+    # this tick found from one it caused; whether the alert says "repair" is
+    # decided from this value, never from the stored key alone.
+    pre_live: str | None = None
+    pre_read = False
 
     if mode == "degraded":
         reason = (
@@ -566,11 +573,18 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
             pass  # held: reported above; the final assessment below judges the key
         elif mode == "ceiling" and path == "native":
             if raw_value != target_str:
+                pre_live, pre_read = await read_swap_max(container), True
                 ok, err = await _incus_config_set(container, {"limits.memory.swap": target_str})
                 if ok:
                     healed.append(
-                        f"limits.memory.swap: {raw_value or 'unset'} → {target_str} bytes "
-                        f"(native ceiling, {config.swap_ceiling_pct:g}% of host swap)",
+                        (
+                            f"limits.memory.swap: {raw_value or 'unset'} → {target_str} bytes "
+                            f"(native ceiling, {config.swap_ceiling_pct:g}% of host swap)",
+                            # A repair when swap was off: a stored false value, or a
+                            # live 0 before the write. Unset is Incus's default true.
+                            (bool(raw_value) and not is_swap_on(raw_value)) or pre_live == "0",
+                            True,
+                        )
                     )
                     key_now = target_str
                 else:
@@ -578,20 +592,27 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
                         f"incus config set limits.memory.swap={target_str} failed: {err}",
                     )
         elif mode == "off" and _is_byte_ceiling(raw_value):
+            pre_live, pre_read = await read_swap_max(container), True
             ok, err = await _incus_config_set(container, {"limits.memory.swap": "true"})
             if ok:
                 healed.append(
-                    f"swap ceiling removed: limits.memory.swap {raw_value} → true "
-                    "(swap_ceiling_pct: off)",
+                    (
+                        f"swap ceiling removed: limits.memory.swap {raw_value} → true "
+                        "(swap_ceiling_pct: off)",
+                        False,
+                        True,
+                    )
                 )
                 key_now = "true"
             else:
                 problems[_PROBLEM_CLASS_CEILING].append(
                     f"could not remove the swap ceiling (limits.memory.swap={raw_value}): {err}",
                 )
-        elif not _is_swap_on(raw_value):
+        elif not is_swap_on(raw_value):
             # "none", "off", and the fallback path: the key only has to be
             # swap-on (on the fallback path Incus ignores it as a ceiling).
+            if mode == "ceiling":  # without a ceiling the heal is always a repair
+                pre_live, pre_read = await read_swap_max(container), True
             ok, err = await _incus_config_set(container, {"limits.memory.swap": "true"})
             if ok:
                 note = (
@@ -600,7 +621,19 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
                     else "swap-on in config; under a hard memory limit Incus still starts "
                     "the container at memory.swap.max=0, which this watch re-opens live"
                 )
-                healed.append(f"limits.memory.swap: {raw_value or 'unset'} → true ({note})")
+                # In ceiling mode an unset key is already swap-on (Incus's default),
+                # so only a stored false value or a live 0 before the write is a
+                # repair; the write serves the fallback ceiling, so it carries the
+                # ceiling flag. Without a ceiling, unset under a hard memory limit
+                # still starts at swap.max=0, so it stays a repair, as before.
+                repair = bool(raw_value) or mode != "ceiling" or pre_live == "0"
+                healed.append(
+                    (
+                        f"limits.memory.swap: {raw_value or 'unset'} → true ({note})",
+                        repair,
+                        mode == "ceiling",
+                    )
+                )
                 key_now = "true"
             else:
                 problems[_PROBLEM_CLASS_SWAP_OFF].append(
@@ -623,11 +656,22 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
     # `live_now` follows the value the cgroup holds after this tick's writes.
     current = await read_swap_max(container)
     live_now = current
+    # Was swap off before this tick? A 0 read after this tick's boolean key
+    # write may be the one Incus just wrote. When the pre-write read itself
+    # failed, such a 0 cannot be told apart and is not called a repair. With no
+    # pre-write read at all (no key write in a mode that reads), a live 0 is.
+    self_zeroed = key_now != raw_value and not _is_byte_ceiling(key_now)
+    if pre_read and pre_live is not None:
+        live_was_off = pre_live == "0"
+    else:
+        live_was_off = current == "0" and not (pre_read and self_zeroed)
 
     if mode == "ceiling":
         if current is not None and current != target_str:
             if await write_swap_max(container, target_str):
-                healed.append(f"memory.swap.max: {current} → {target_str} bytes (live)")
+                healed.append(
+                    (f"memory.swap.max: {current} → {target_str} bytes (live)", live_was_off, True)
+                )
                 live_now = target_str
             else:
                 problems[_PROBLEM_CLASS_CEILING].append(
@@ -658,7 +702,13 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
         elif await activate_swap_max(container):
             live_now = "max"
             if config_verified:
-                healed.append("memory.swap.max: 0 → max (live, no restart needed)")
+                healed.append(
+                    (
+                        "memory.swap.max: 0 → max (live, no restart needed)",
+                        live_was_off,
+                        not live_was_off,
+                    )
+                )
             else:
                 # Live-healed, but the config read failed so the PERSISTENT
                 # knob was never verified/set: a restart can revert
@@ -694,7 +744,11 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
         if await write_swap_max(container, "max"):
             live_now = "max"
             healed.append(
-                f"swap ceiling removed: memory.swap.max {current} → max (swap_ceiling_pct: off)"
+                (
+                    f"swap ceiling removed: memory.swap.max {current} → max (swap_ceiling_pct: off)",
+                    False,
+                    True,
+                )
             )
         else:
             problems[_PROBLEM_CLASS_CEILING].append(
@@ -705,7 +759,7 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
     # this step judges each class from what the tick actually observed after
     # its own writes, so no branch can leave a class claiming more (or less)
     # than was seen.
-    if config_verified and not _is_swap_on(key_now) and not problems[_PROBLEM_CLASS_SWAP_OFF]:
+    if config_verified and not is_swap_on(key_now) and not problems[_PROBLEM_CLASS_SWAP_OFF]:
         # A key left swap-off (a degraded hold, a failed native set): the next
         # container start turns swap off, whatever the live cgroup says now.
         problems[_PROBLEM_CLASS_SWAP_OFF].append(
@@ -724,18 +778,42 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
         )
 
     if healed:
-        logger.info("swap_watch healed: %s", "; ".join(healed))
+        has_repair = any(repair for _, repair, _ in healed)
+        has_ceiling = any(ceiling for _, _, ceiling in healed)
+        title = (
+            "Guardian set container swap"
+            if has_repair
+            else "Guardian updated container swap ceiling"
+        )
+        paragraphs = []
+        if has_repair:
+            paragraphs.append(
+                "Without this, a memory spike wedges the box into D-state "
+                "thrash instead of degrading into swap. If swap-off was "
+                "intentional, set swap_reconcile_enabled: false in guardian "
+                "config."
+            )
+        if has_ceiling:
+            pct = config.swap_ceiling_pct
+            ceiling_setting = (
+                "off" if pct == SWAP_CEILING_OFF else f"{pct:g}% of host swap"
+            )
+            paragraphs.append(
+                "This follows swap_ceiling_pct in the guardian config "
+                f"(now {ceiling_setting}). Change that setting to move the "
+                "ceiling; set swap_ceiling_pct: off to lift it. Removing the "
+                "setting leaves the current ceiling in place, unmanaged."
+            )
+        logger.info("swap_watch healed: %s", "; ".join(line for line, _, _ in healed))
         await _send(
             dispatcher,
             AlertSeverity.INFO,
-            "Guardian set container swap",
+            title,
             "Container-swap invariant reconciled on "
             f"'{container}':\n- "
-            + "\n- ".join(healed)
-            + "\n\nWithout this, a memory spike wedges the box into D-state "
-            "thrash instead of degrading into swap. If swap-off was "
-            "intentional, set swap_reconcile_enabled: false in guardian "
-            "config.",
+            + "\n- ".join(line for line, _, _ in healed)
+            + "\n\n"
+            + "\n\n".join(paragraphs),
         )
 
     # Which classes this tick VERIFIED healthy, from the final state: only those
@@ -743,7 +821,7 @@ async def check_container_swap_and_alert(config, dispatcher) -> None:
     # again at once, and an unverified tick never does.
     verified = {
         _PROBLEM_CLASS_SWAP_OFF: config_verified
-        and _is_swap_on(key_now)
+        and is_swap_on(key_now)
         and live_now not in (None, "0"),
         _PROBLEM_CLASS_CEILING: config_verified
         and (

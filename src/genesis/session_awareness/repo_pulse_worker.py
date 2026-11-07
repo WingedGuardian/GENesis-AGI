@@ -243,7 +243,9 @@ def _connect_rw(db_path: Path | str):
     return connect_aiosqlite_rw(db_path, timeout=10)
 
 
-async def _record_telemetry(db_path: Path | str, status: str, detail: str) -> bool:
+async def _record_telemetry(
+    db_path: Path | str, status: str, detail: str, model: str | None = None
+) -> bool:
     """Best-effort call_site_last_run row for the neural monitor."""
     try:
         from genesis.observability.call_site_recorder import record_last_run_detached
@@ -252,7 +254,7 @@ async def _record_telemetry(db_path: Path | str, status: str, detail: str) -> bo
             str(db_path),
             "repo_pulse",
             provider="cc",
-            model_id=PULSE_MODEL,
+            model_id=model or PULSE_MODEL,
             response_text=f"status={status}|{detail}"[:200],
             success=status in ("ok", "no_new_prs"),
         )
@@ -1312,6 +1314,7 @@ async def _run_locked(
     remaining = [] if lane_only_tick else [i for i in open_items if i["id"] not in absorbed]
     n_fuzzy = 0
     fuzzy_ran = False
+    served = PULSE_MODEL  # the id CC reports having served, once the judge runs
     if remaining:
         fuzzy_ran = True
         prompt, inc_items, inc_prs = build_fuzzy_prompt(
@@ -1320,6 +1323,7 @@ async def _run_locked(
         result = await run_headless_json(
             prompt, model=PULSE_MODEL, claude_path=claude_path, timeout_s=PULSE_TIMEOUT_S
         )
+        served = result.get("served_model") or PULSE_MODEL
         matches = (
             parse_matches(result["stdout"], len(inc_items), len(inc_prs))
             if result["status"] == "ok"
@@ -1342,13 +1346,13 @@ async def _run_locked(
                     n_open_items=len(open_items),
                     n_exact=n_exact,
                     prompt_version=PROMPT_VERSION,
-                    model=PULSE_MODEL,
+                    model=served,
                 ),
                 annotations=annotations,
             )
             if recorded:
                 _write_cursor(root, cursor, merged_at=None)
-            await _record_telemetry(db_path, status, str(reason)[:120])
+            await _record_telemetry(db_path, status, str(reason)[:120], model=served)
             return {"status": status, "detail": reason, "n_exact": n_exact}
         cap = knob_int(cfg, "max_proposals_per_run")
         for m in sorted(matches, key=lambda x: -x["confidence"])[:cap]:
@@ -1386,7 +1390,7 @@ async def _run_locked(
             n_exact=n_exact,
             n_fuzzy=n_fuzzy,
             prompt_version=PROMPT_VERSION if fuzzy_ran else None,
-            model=PULSE_MODEL if fuzzy_ran else None,
+            model=served if fuzzy_ran else None,
         ),
         annotations=annotations,
     )
@@ -1409,6 +1413,7 @@ async def _run_locked(
         db_path,
         "ok" if recorded else "failed",
         f"repo={repo}|prs={len(prs)}|exact={n_exact}|fuzzy={n_fuzzy}|recorded={recorded}",
+        model=served if fuzzy_ran else None,
     )
     return {
         "status": "ok" if recorded else "failed",

@@ -7,8 +7,9 @@ from decimal import Decimal
 
 import duckdb
 import pyarrow as pa
+import pytest
 
-from genesis.transcript_analytics import derive, query, reconcile, store
+from genesis.transcript_analytics import query, reconcile
 from genesis.transcript_analytics.extract import TABLES
 from genesis.transcript_analytics.schema import SCHEMAS
 
@@ -159,67 +160,6 @@ def _verification_digest(con, view):
     return len(rows), digest.hexdigest()
 
 
-def test_unchanged_corpus_parallel_live_and_snapshot_verification_hashes(tmp_path):
-    projects, data = tmp_path / "projects", tmp_path / "data"
-    projects.mkdir()
-    for index in range(24):
-        records = []
-        for fragment in range(8):
-            records.append(
-                {
-                    "type": "assistant",
-                    "sessionId": "s",
-                    "uuid": f"{index}-{fragment}",
-                    "timestamp": f"2026-01-01T00:00:{index:02}Z",
-                    "cwd": f"cwd-{index}",
-                    "gitBranch": f"branch-{index}",
-                    "message": {
-                        "id": f"message-{index}-{fragment}",
-                        "model": f"model-{index}",
-                        "stop_reason": "end_turn",
-                        "usage": {"output_tokens": fragment},
-                        "content": [],
-                    },
-                }
-            )
-        records.extend(
-            [
-                {"type": "ai-title", "sessionId": "s", "aiTitle": f"title-{index:02}"},
-                {
-                    "type": "pr-link",
-                    "sessionId": "s",
-                    "prNumber": index,
-                    "prRepository": f"org/repo-{index % 3}",
-                },
-            ]
-        )
-        (projects / f"source-{index:02}.jsonl").write_text(
-            "".join(json.dumps(record) + "\n" for record in records)
-        )
-    assert store.ingest(projects, data)["rebuilt"] == 24
-    derive.build(data)
-    with (
-        contextlib.closing(query.connect(data)) as snapshot,
-        contextlib.closing(query.connect(data, threads=4, live=True)) as live,
-    ):
-        expected = {view: _verification_digest(snapshot, view) for view in query._DERIVED}
-        for view in query._DERIVED:
-            actual = _verification_digest(live, view)
-            if actual != expected[view]:
-                a = snapshot.execute(f"SELECT * FROM {view} ORDER BY ALL").fetchone()
-                b = live.execute(f"SELECT * FROM {view} ORDER BY ALL").fetchone()
-                detail = [
-                    (type(x).__name__, str(x), type(y).__name__, str(y))
-                    for x, y in zip(a, b, strict=True)
-                    if type(x) is not type(y) or x != y
-                ]
-            else:
-                detail = []
-            assert actual == expected[view], (view, detail)
-        for _ in range(8):
-            assert _verification_digest(live, "sessions") == expected["sessions"]
-            assert _verification_digest(live, "turns") == expected["turns"]
-
 
 def test_sum_population_has_exact_decimal_parquet_roundtrip(tmp_path):
     rows = _rows()
@@ -262,3 +202,96 @@ def test_sum_population_has_exact_decimal_parquet_roundtrip(tmp_path):
             "SELECT output_tokens,input_tokens,cache_read,cache_create FROM sessions"
         ).fetchone() == (None, None, None, None)
         assert all(row == (None,) for row in con.execute("SELECT n_tool_use FROM turns").fetchall())
+
+
+def _default_row(table, **values):
+    row = {field.name: None for field in SCHEMAS[table]}
+    row.update(values)
+    return row
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_unknown_historical_actor_blocks_executor_ownership(terminal):
+    rows = _rows()
+    observed = rows["fragments"][1 if terminal else 0]
+    rows["fragments"].append(
+        {
+            **observed,
+            "source_file": "historical.jsonl",
+            "actor_id": None,
+            "line_no": observed["line_no"] + 100,
+        }
+    )
+    with contextlib.closing(_connection(rows)) as con:
+        executor, status, reasons = con.execute(
+            "SELECT executor_id,attribution_status,attribution_reasons "
+            "FROM turns WHERE message_id='m-00'"
+        ).fetchone()
+        assert (executor, status) == (None, "unresolved")
+        assert "missing observed actor" in reasons
+        assert con.execute("SELECT usage_available FROM turns WHERE message_id='m-00'").fetchone() == (False,)
+
+
+@pytest.mark.parametrize("view", ["tool_calls", "agents"])
+def test_scrub_failure_survives_across_all_discarded_copies(view):
+    rows = _rows()
+    actor = '["s",null]'
+    if view == "tool_calls":
+        rows["tool_calls"] = [
+            _default_row(
+                "tool_calls",
+                source_file="a.jsonl",
+                tool_use_id="tool",
+                line_no_call=1,
+                call_uuid="call-u",
+                actor_id=actor,
+                context_session_id="s",
+                source_role="main",
+                context_conflict=False,
+                has_result=False,
+                scrub_failed=False,
+            ),
+            _default_row(
+                "tool_calls",
+                source_file="z.jsonl",
+                tool_use_id="tool",
+                line_no_call=1,
+                call_uuid="call-u",
+                actor_id=actor,
+                context_session_id="s",
+                source_role="main",
+                context_conflict=False,
+                has_result=False,
+                scrub_failed=True,
+            ),
+        ]
+    else:
+        rows["agents"] = [
+            _default_row(
+                "agents",
+                source_file="a.jsonl",
+                actor_id=actor,
+                agent_id="child",
+                session_id="s",
+                scrub_failed=False,
+            ),
+            _default_row(
+                "agents",
+                source_file="z.jsonl",
+                actor_id=actor,
+                agent_id="child",
+                session_id="s",
+                scrub_failed=True,
+            ),
+        ]
+    with contextlib.closing(_connection(rows)) as con:
+        assert con.execute(f"SELECT scrub_failed FROM {view}").fetchall() == [(True,)]
+
+
+def test_sessions_preserve_unknown_scrub_state():
+    rows = _rows()
+    for table in rows.values():
+        for row in table:
+            row["scrub_failed"] = None
+    with contextlib.closing(_connection(rows)) as con:
+        assert con.execute("SELECT scrub_failed FROM sessions").fetchall() == [(None,)]

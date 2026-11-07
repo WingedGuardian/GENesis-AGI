@@ -21,6 +21,8 @@ import stat
 import subprocess
 from pathlib import Path
 
+import pytest
+
 _WATCHGOD = Path(__file__).resolve().parents[2] / "scripts" / "tmp_watchgod.sh"
 
 _TMUX_STUB = "#!/usr/bin/env bash\nexit 0\n"
@@ -369,7 +371,24 @@ def test_slice_names_nest_by_dash(tmp_path):
 def test_default_contained_slices(tmp_path):
     home, bind, tree = _setup(tmp_path)
     out = _run(home, bind, 'echo "$OOM_CONTAINED_SLICES"', tree.env())
-    assert out.split() == ["app-capped.slice", "genesis-workload.slice"]
+    assert out.split() == [
+        "app-capped.slice", "genesis-workload.slice", "genesis-cbm-query-clients.slice"
+    ]
+
+
+@pytest.mark.parametrize("case", ["own-cap", "ancestor", "unknown-baseline", "reset", "override"])
+def test_managed_reader_uses_existing_counted_attribution(tmp_path, case):
+    home, bind, tree = _setup(tmp_path, root=(10, 10), capped=(3, 3))
+    reader = tree.user / "genesis.slice/genesis-cbm.slice/genesis-cbm-query.slice/genesis-cbm-query-clients.slice"
+    _events(reader, *( (2, 2) if case == "reset" else (0, 0)))
+    if case == "unknown-baseline":
+        (reader / "memory.events").unlink()
+    extra = {"OOM_CONTAINED_SLICES": "app-capped.slice genesis-workload.slice"} if case == "override" else None
+    spec = _arm(home, bind, tree, extra)
+    tree.set(root=(11, 11), capped=(3, 3))
+    _events(reader, 1, 0 if case == "ancestor" else 1)
+    _tick(home, bind, tree, spec, extra)
+    assert bool(_calls(home)) is (case != "own-cap")
 
 
 def test_a_workload_slice_kill_is_contained_too(tmp_path):

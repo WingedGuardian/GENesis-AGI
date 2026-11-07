@@ -132,7 +132,7 @@
          roster peer because the home model (Claude) is rate-limited account-wide. -->
     <template x-if="$store.genesisDashboard.health.cc_sessions?.fallback?.is_fallback">
       <div style="background: #f0ad4e; color: white; padding: 0.5rem 1rem; font-size: 0.85rem; font-weight: 600; text-align: center;"
-           x-text="'⚠ Running on ' + ($store.genesisDashboard.health.cc_sessions.fallback.fallback || 'a roster peer') + ' — Claude ' + ($store.genesisDashboard.health.cc_sessions.fallback.reason || 'unavailable').replace(/_/g, ' ') + ' since ' + (($store.genesisDashboard.health.cc_sessions.fallback.since || '').replace('T', ' ').slice(0, 16) || 'unknown')"></div>
+           x-text="'Last successful fallback: ' + ($store.genesisDashboard.health.cc_sessions.fallback.fallback || 'a roster peer') + ' — home model ' + ($store.genesisDashboard.health.cc_sessions.fallback.reason || 'unavailable').replace(/_/g, ' ') + ' since ' + (($store.genesisDashboard.health.cc_sessions.fallback.since || '').replace('T', ' ').slice(0, 16) || 'unknown')"></div>
     </template>
     <!-- Resilience degradation banner -->
     <template x-if="$store.genesisDashboard.health.resilience?.level && $store.genesisDashboard.health.resilience.level !== 'L0' && $store.genesisDashboard.health.resilience.level !== 'not configured'">

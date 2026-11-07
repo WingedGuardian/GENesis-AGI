@@ -277,6 +277,44 @@ _CREDENTIAL_TOKEN_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# HTTP credential headers. Their VALUE is the secret, whatever its shape: a
+# scheme plus a token (``Bearer x``, ``Basic YTpi``), a parameter list
+# (``Digest username=..., response=...``, ``AWS4-HMAC-SHA256 Credential=...``)
+# or cookie pairs (``SID=...; HttpOnly``). Everything from the separator to the
+# END OF THE LINE is withheld, and quoting is deliberately not read: three
+# review rounds each found a quoting shape (a curl argument with escaped
+# quotes, an escaped quote inside a JSON value, double-encoded JSON) where a
+# value grammar stopped early and let the credential through. Not finding the
+# end of the value is what removes that whole class. The cost is that a
+# one-line record (a serialized tool response) loses everything after such a
+# header, the cheap direction. The label may sit in a quoted or escaped-quoted
+# key (``'authorization': ...``, ``\"cookie\": ...``). ``credential_label_kind``
+# also treats these names as token labels, so a structured member is withheld
+# whatever its value looks like.
+_HEADER_LABEL = r"(?<![A-Za-z])(?:(?:proxy[_\s-]?)?authorization|(?:set[_\s-]?)?cookie)"
+_HEADER_PATTERN = re.compile(
+    # The value may start on the NEXT line (pretty-printed JSON puts it there),
+    # so the gap after the separator may hold one line break.
+    _HEADER_LABEL + r"(?:\\?[\"'])?[ \t]*[:=][ \t]*(?:\r?\n[ \t]*)?(?P<value>[^\r\n]*[^\s])",
+    re.IGNORECASE,
+)
+
+
+# A bearer credential wherever it appears, with no header label in front: a
+# curl command line, a log line, a copied value. The word after "bearer" is
+# withheld whatever it is. A configured bearer secret only has to be non-empty
+# ASCII, so neither a length floor, nor a character class, nor a list of prose
+# words can tell a credential from text: "Bearer token" may be the token. Prose
+# that mentions a bearer loses the following word, the cheap direction. The
+# value ends at whitespace or a quote, and an escaping backslash before a
+# closing quote stays outside it, so a serialized string keeps its escapes.
+_BEARER_VALUE_PATTERN = re.compile(
+    r"(?<![A-Za-z])bearer[ \t]+"
+    r"(?P<token>[^\s\"']+?)(?=\\[\"']|[\s\"']|\Z)",
+    re.IGNORECASE,
+)
+
+
 # password/passphrase/pin values — keep the label, redact the value. A quoted
 # value is captured whole (the quote alternatives let the value contain spaces);
 # an unquoted value stops at whitespace/separator. The left anchor is
@@ -288,6 +326,110 @@ _SINGLE_CREDENTIAL_PATTERN = re.compile(
     r"(?P<value>\"[^\"]*\"|'[^']*'|[^\s,;]{4,})",
     re.IGNORECASE,
 )
+
+# A credential label as a QUOTED KEY: a JSON member, a Python dict repr, or a
+# key escaped inside a serialized string, at any realistic nesting depth
+# (``{"api_key": "…"}``, ``{'DB_PASSWORD': b'…'}``, ``\\"pin\\": …``). The two
+# label patterns above need the separator right after the label, so the key's
+# closing quote defeated them and these values passed through whole (measured
+# 2026-10-28).
+# THE KEY must END at the label and sit between quotes, so ``"pin_count"`` and
+# ``"password_policy"`` never match. Before the label it may carry a leading
+# ``_``, and ``_`` / ``-`` / ``.`` delimited segments (``OPENAI_API_KEY``,
+# ``x-api-key``, ``aws.secret_access_key``). The LONG labels (password, passwd,
+# passphrase, secret) also take an undelimited prefix (``dbpassword``,
+# ``mysecret``, ``userPassword``); the SHORT ones (pass, pin, key, token) do not,
+# because ``"bypass"``, ``"compass"`` and ``"spin"`` would then match. So
+# ``"dbpass"`` is a stated residual. Bare ``"token"`` and ``"secret"`` keys are
+# redacted even when they hold a count (``{"token": 500}``): the module's
+# recall-first direction.
+# THE VALUE follows the header rule above, for the same reason: quoting is not
+# read, and the rest of the line is withheld. A first version parsed the value as
+# a string literal and a review found it ended early on the OTHER quote kind
+# (``"it's a secret"``), on ``b'…'`` and on double escaping. A STRUCTURED value
+# (the line opens more ``[``/``{`` than it closes) continues on later lines, so it
+# is withheld until the brackets balance, at most _QUOTED_KEY_SCAN_LINES lines,
+# and to that limit when they never do: a review found ``{"password": [\n
+# "secret"\n]}`` leaking its next line. Brackets inside strings are counted too;
+# a miscount stops late or early by a line, never earlier than the key's line.
+# Linear: every scan starts at an opening quote, the repeats are bounded, and a
+# match inside an already-withheld span is skipped, so each line is withheld once.
+# The value STARTS at a non-space, so the whitespace gap and the value never
+# compete for the same characters (an ``[^\r\n]*[^\s]`` value against a 256-space
+# gap cost gap x line per attempt: measured 51 s on 5,000 lines of key + spaces).
+_QUOTED_KEY_EXTRA_LABEL = r"(?<![A-Za-z])(?:client[_\s-]?secret|id[_\s-]?token|secret|token|passwd)"
+_QUOTED_KEY_JOINED_LABEL = r"[A-Za-z0-9]{1,64}(?:password|passwd|passphrase|secret)"
+_QUOTED_KEY_CREDENTIAL_PATTERN = re.compile(
+    r"(?<=[\"'])_{0,4}(?:[A-Za-z0-9]{1,64}[_.-]){0,32}"
+    r"(?:" + _TOKEN_LABEL + r"|" + _PASSWORD_LABEL + r"|" + _QUOTED_KEY_EXTRA_LABEL
+    + r"|" + _QUOTED_KEY_JOINED_LABEL + r")"
+    r"\\{0,15}[\"'][ \t\r\n]{0,256}[:=][ \t\r\n]{0,256}(?P<value>\S[^\r\n]*)",
+    re.IGNORECASE,
+)
+_QUOTED_KEY_SCAN_LINES = 256
+
+
+def _bracket_balance(s: str) -> int:
+    """Openers minus closers OUTSIDE quoted strings. A bracket inside a string
+    (``"x}"``, a password containing ``{``) neither ends nor starts a structure:
+    counting it let ``{"password": ["x}",`` read as closed and leak the next line
+    (found by review). String state resets per line, so one stray quote cannot
+    blind the rest of the scan. Linear: one pass over the line."""
+    balance = 0
+    quote = ""
+    escaped = False
+    for ch in s:
+        if quote:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "[{":
+            balance += 1
+        elif ch in "]}":
+            balance -= 1
+    return balance
+
+
+def _structured_value_end(text: str, end: int, balance: int) -> int:
+    """Where a value that opened ``balance`` more brackets than it closed ends: the
+    end of the line where the brackets balance, else of the last line scanned. A
+    balanced value longer than the scan is cut at the limit and its tail is not
+    withheld: a stated residual (the PEM arm owns key blocks). The returned end
+    stops before a ``\\r\\n`` pair's ``\\r``, so a CRLF line ending survives."""
+    for _ in range(_QUOTED_KEY_SCAN_LINES):
+        if end >= len(text):
+            return len(text)
+        nxt = text.find("\n", end + 1)
+        nxt = len(text) if nxt == -1 else nxt
+        balance += _bracket_balance(text[end:nxt])
+        end = nxt
+        if balance <= 0:
+            break
+    if 0 < end < len(text) and text[end - 1] == "\r":
+        end -= 1
+    return end
+
+
+def _redact_quoted_key_values(text: str) -> str:
+    out: list[str] = []
+    pos = 0
+    for m in _QUOTED_KEY_CREDENTIAL_PATTERN.finditer(text):
+        start, end = m.span("value")
+        if start < pos:  # inside a span already withheld
+            continue
+        balance = _bracket_balance(m.group("value"))
+        if balance > 0:
+            end = _structured_value_end(text, end, balance)
+        out.append(text[pos:start])
+        out.append(_REDACTED)
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
 
 # Credentials embedded in a URL's userinfo section (the user/password pair that
 # can precede an "@" host separator). Only fires when an "@" follows, so a plain
@@ -390,7 +532,11 @@ def credential_label_kind(label: str) -> str | None:
     Structured values have no prose length floor. Environment labels retain
     uppercase/key-shape constraints; the secret hint alone is insufficient.
     """
-    for kind, pattern in (("token", _TOKEN_LABEL), ("password", _PASSWORD_LABEL)):
+    for kind, pattern in (
+        ("token", _TOKEN_LABEL),
+        ("token", _HEADER_LABEL),
+        ("password", _PASSWORD_LABEL),
+    ):
         if re.search(pattern + r"\s*\Z", label, re.IGNORECASE):
             return kind
     match = re.search(_ENV_LABEL + r"\s*\Z", label)
@@ -453,6 +599,9 @@ def scrub(text: str) -> str:
         text = _redact_pem_blocks(text)
         text = _KNOWN_KEY_PREFIX_PATTERN.sub(_REDACTED, text)
         text = _STRUCTURED_CREDENTIAL_PATTERN.sub(_REDACTED, text)
+        text = _redact_value_group(_HEADER_PATTERN, text, "value")
+        text = _redact_value_group(_BEARER_VALUE_PATTERN, text, "token")
+        text = _redact_quoted_key_values(text)
         text = _redact_value_group(_CREDENTIAL_TOKEN_PATTERN, text, "token")
         text = _redact_value_group(_SINGLE_CREDENTIAL_PATTERN, text, "value")
         text = _redact_value_group(_URL_CREDENTIAL_PATTERN, text, "pw")

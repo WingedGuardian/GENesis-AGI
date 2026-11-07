@@ -21,13 +21,14 @@ from __future__ import annotations
 import errno
 import importlib.util
 import os
-import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 import pytest
+
+from tests.conftest import process_running_as
 
 _WORKTREE = Path(__file__).resolve().parent.parent.parent
 _SCRIPT = _WORKTREE / "scripts" / "pytest_lock_wait.py"
@@ -36,6 +37,31 @@ _PYTHON = sys.executable
 _spec = importlib.util.spec_from_file_location("pytest_lock_wait", _SCRIPT)
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        "²\n0\npytest x",
+        "١\n0\npytest x",
+        "4242\n-inf\npytest x",
+        "4242\n0\npytest x\ntest_x\n-inf\n",
+        "4242\n0\npytest x\ntest_x\ninf\n",
+        "4242\n0\npytest x\ntest_x\nnan\n",
+    ],
+)
+def test_malformed_metadata_does_not_break_a_waiter(lock_file, lock_holder, record):
+    lock_holder(lock_file, record=record)
+    active, description = _mod.pytest_is_active()
+    assert active
+    assert description
+
+
+def test_a_marker_in_the_test_name_is_not_a_stall_report():
+    fresh = "  pid 4242 (running 2m)\n  current: test_x[LIKELY HUNG] (running 2s)"
+    assert _mod._stall_key(fresh) is None
+    stalled = fresh + "\n  LIKELY HUNG: one step has run 11m; wait channel unknown."
+    assert _mod._stall_key(stalled) == ("pid 4242", "current: test_x[LIKELY HUNG]")
 
 argv_is_pytest = _mod.argv_is_pytest
 scan_pytest_processes = _mod.scan_pytest_processes
@@ -447,6 +473,78 @@ class TestWaitMode:
         assert "TIMEOUT" not in out.getvalue()
 
 
+    def test_a_holder_that_goes_stale_mid_wait_is_reported_when_it_does(
+        self, lock_file, lock_holder, monkeypatch
+    ):
+        """The flag must not wait for the TIMEOUT summary: a waiter learns the
+        holder is stuck on the first progress line after it becomes so (#3135).
+        """
+        import io
+
+        now = time.time()
+        lock_holder(
+            lock_file,
+            record=f"4242\n{now - 60}\npytest tests/x.py\ntests/x.py::t\n{now - 1}\n\n",
+        )
+        monkeypatch.setenv(_mod.STALL_ENV, "2.5")
+        monkeypatch.setattr(_mod, "_POLL_SECONDS", 0.2)
+        monkeypatch.setattr(_mod, "_PROGRESS_SECONDS", 0.5)
+        out = io.StringIO()
+        assert _mod.wait_for_clear(6.0, out=out) == 1
+        text = out.getvalue()
+        head, _, _tail = text.partition("TIMEOUT")
+        assert "LIKELY HUNG" not in head.split("still waiting", 1)[0], (
+            "the holder was fresh when the wait began"
+        )
+        assert head.count("LIKELY HUNG") == 1, text
+
+
+    def test_a_second_stuck_step_in_the_same_wait_is_reported_too(
+        self, lock_file, lock_holder, monkeypatch
+    ):
+        """One report per stuck step, not one per wait: a holder that moves on
+        and hangs again (or a new holder that hangs) is news (#3135 review)."""
+        import io
+        import threading
+
+        old = time.time() - 900
+        lock_holder(
+            lock_file,
+            record=f"4242\n{old}\npytest tests/x.py\ntests/x.py::first\n{old}\n\n",
+        )
+        monkeypatch.setenv(_mod.STALL_ENV, "2")
+        monkeypatch.setattr(_mod, "_POLL_SECONDS", 0.2)
+        monkeypatch.setattr(_mod, "_PROGRESS_SECONDS", 0.5)
+
+        def _second_hang():
+            time.sleep(1.5)
+            lock_file.write_text(
+                f"4242\n{old}\npytest tests/x.py\ntests/x.py::second\n{old}\n\n"
+            )
+
+        threading.Thread(target=_second_hang, daemon=True).start()
+        out = io.StringIO()
+        assert _mod.wait_for_clear(5.0, out=out) == 1
+        head = out.getvalue().partition("TIMEOUT")[0]
+        assert "current: tests/x.py::first" in head
+        assert "current: tests/x.py::second" in head, head
+        assert head.count("LIKELY HUNG") == 2, head
+
+    def test_a_hidden_wait_channel_reads_as_unknown(self, monkeypatch, tmp_path):
+        """The kernel shows "0" when it hides the symbol; say unknown."""
+        fake = tmp_path / "wchan"
+        fake.write_text("0")
+        real_open = open
+
+        def _open(path, *a, **k):
+            if str(path).endswith("/wchan"):
+                return real_open(fake, *a, **k)
+            return real_open(path, *a, **k)
+
+        monkeypatch.setattr("builtins.open", _open)
+        assert _mod._wait_channel(1) == "unknown"
+
+
 class TestPinnedToTheLockModule:
     """The CLI duplicates two things from genesis.util.pytest_lock, because it
     must run without genesis importable. Pin both to real behaviour."""
@@ -564,12 +662,7 @@ def test_the_deleted_concurrency_oracle_stays_gone():
 
 def test_scan_reports_pid_command_and_age(tmp_path):
     """The scan's one remaining job: naming holders."""
-    sleep_bin = shutil.which("sleep")
-    assert sleep_bin, "sleep binary required"
-    decoy = tmp_path / "pytest"
-    shutil.copy(sleep_bin, decoy)
-    proc = subprocess.Popen([str(decoy), "30"], stdout=subprocess.DEVNULL)
-    try:
+    with process_running_as(tmp_path / "pytest") as proc:
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             match = [e for e in scan_pytest_processes() if e[0] == proc.pid]
@@ -580,9 +673,6 @@ def test_scan_reports_pid_command_and_age(tmp_path):
                 return
             time.sleep(0.02)
         raise AssertionError("decoy pytest never appeared in the scan")
-    finally:
-        proc.kill()
-        proc.wait(timeout=5)
 
 
 class TestOneParserNotTwo:

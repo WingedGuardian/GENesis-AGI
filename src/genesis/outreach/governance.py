@@ -83,6 +83,11 @@ _DEDUP_WINDOWS: dict[str, int] = {
     # same-batch protection while letting distinct batches through is the cleaner
     # future refinement; it needs a governance change, not a window value.)
     "critical_observation": 0,
+    # Stopped-background-session pages (outreach.stopped_sessions, fixed topic,
+    # hourly). The per-row cc_sessions.outcome_paged_at stamp already keeps a
+    # stop from paging twice; the 24h default would drop every page after the
+    # first of the day.
+    "stopped_background_sessions": 0,
     # Task lifecycle notifications — never dedup. Each is a distinct status
     # event for one task (topic = "Task <id>"), and every _notify call site
     # fires at most once per path. Without this they fell through to the 24h
@@ -101,6 +106,35 @@ _DEDUP_WINDOWS: dict[str, int] = {
     "rate_limit_park": 12,
 }
 _DEFAULT_DEDUP_HOURS = 24
+
+# Signal types whose topic IS the message identity: two requests with different
+# topics are different messages by construction. For these the topic-blind
+# content-hash secondary in _is_duplicate can only drop a distinct message (a
+# shared 200-char prefix is not a repeat), so it is skipped; the primary
+# (signal_type, topic, category) check still collapses genuine repeats.
+_TOPIC_IS_IDENTITY: frozenset[str] = frozenset(
+    {
+        # topic = "alert:<dedupe_key, else source>" (runtime/init/alert_drain.py).
+        # A repeated failure keeps one key, so it collapses on the primary check.
+        # A producer that queues with no key shares its source as the topic, so
+        # its distinct alerts collide on the primary check instead; that is the
+        # producer's key to fix, not this check's.
+        "queued_alert",
+        # topic = "Morning Report — <date>" (outreach/morning_report.py). Without
+        # this, a report drafted a few seconds faster than yesterday's lands inside
+        # the 24 h window and is dropped when both open with the same header.
+        "morning_report",
+        # topic carries a hash of the full staged company set
+        # (recon/career_outreach.py), so a distinct batch has a distinct topic.
+        "career_outreach_nudged",
+        "peer_message",  # addressed message identity, never fuzzy body identity
+        "peer_api_health",  # incident + phase is the notification identity
+        # topic = "direct_session_fail:<session id>" (cc/direct_session.py
+        # _notify): one owner-requested failure, never fuzzy body identity, so
+        # two fast failures with the same error body both page at once.
+        "direct_session_fail",
+    }
+)
 
 
 def content_hash(text: str) -> str:
@@ -146,6 +180,11 @@ class GovernanceGate:
                 reason="morning report allowed",
                 checks_passed=["morning_report_dedup"],
             )
+
+        # Keyed on the typed envelope, not the channel name: a caller can name the
+        # "agent" channel without being a peer message (delivery refuses that one).
+        if request.peer_envelope is not None:
+            return await self._check_peer(request)
 
         passed: list[str] = []
         failed: list[str] = []
@@ -290,6 +329,11 @@ class GovernanceGate:
             return False
         window_spec = f"-{window_hours} hours"
 
+        # Older recovery workers recorded morning reports as deferred_retry.
+        # Keep those delivered rows effective if queue completion failed before
+        # an upgrade; topic/category/window remain the same identity boundary.
+        legacy_signal = "deferred_retry" if request.signal_type == "morning_report" else request.signal_type
+
         # Primary key: (signal_type, topic, category) within the window.
         # NB: wrap delivered_at in datetime(). Stored values are ISO-8601 with a
         # 'T' separator (datetime.now(UTC).isoformat()); a raw string compare
@@ -298,10 +342,10 @@ class GovernanceGate:
         # UTC day. datetime() parses both sides before comparing.
         cursor = await self._db.execute(
             "SELECT COUNT(*) FROM outreach_history "
-            "WHERE signal_type = ? AND topic = ? AND category = ? "
+            "WHERE signal_type IN (?, ?) AND topic = ? AND category = ? "
             "AND delivered_at IS NOT NULL "
             "AND datetime(delivered_at) >= datetime('now', ?)",
-            (request.signal_type, request.topic, request.category.value, window_spec),
+            (request.signal_type, legacy_signal, request.topic, request.category.value, window_spec),
         )
         row = await cursor.fetchone()
         if (row[0] if row else 0) > 0:
@@ -312,6 +356,14 @@ class GovernanceGate:
                 window_hours,
             )
             return True
+
+        if request.signal_type in _TOPIC_IS_IDENTITY:
+            return False
+        # An empty context hashes identically for every request, so a match
+        # says nothing about the message (outreach recovery submits retries
+        # with context="").
+        if not request.context.strip():
+            return False
 
         # Secondary: content-hash match (catches near-duplicate topics with same
         # body). Same datetime(delivered_at) normalization as the primary query.
@@ -335,11 +387,63 @@ class GovernanceGate:
 
         return False
 
+    async def _check_peer(self, request: OutreachRequest) -> GovernanceResult:
+        """A message to an enrolled peer agent. Salience, quiet hours and the daily
+        budgets ration the OWNER's attention, which a machine-to-machine message
+        does not spend, so none of them apply. Duplicate suppression stays (the
+        scheduler closes a queued retry on a ``dedup`` failure), and a per-peer
+        daily cap stops a loop from flooding the peer."""
+        passed: list[str] = []
+        failed: list[str] = []
+        if await self._is_duplicate(request):
+            failed.append("dedup: similar outreach sent recently")
+        else:
+            passed.append("dedup")
+        peer = request.peer_envelope.peer_id
+        cap = self._config.agent_daily_per_peer
+        sent = await self._peer_sent_today(peer)
+        if sent is None:
+            failed.append("peer_daily_cap: could not count today's messages to this peer")
+        elif sent >= cap:
+            failed.append(f"peer_daily_cap: {cap}/day to this peer reached")
+        else:
+            passed.append("peer_daily_cap")
+        if failed:
+            return GovernanceResult(
+                verdict=GovernanceVerdict.DENY,
+                reason="; ".join(failed),
+                checks_passed=passed,
+                checks_failed=failed,
+            )
+        return GovernanceResult(
+            verdict=GovernanceVerdict.ALLOW,
+            reason="peer message: dedup and per-peer cap passed",
+            checks_passed=passed,
+        )
+
+    async def _peer_sent_today(self, peer: str) -> int | None:
+        """Messages delivered to ``peer`` since UTC midnight, from the peer outbox
+        (one row per delivered message). None when the count cannot be read: the
+        cap then refuses rather than reading an unknown count as zero."""
+        try:
+            cursor = await self._db.execute(
+                "SELECT COUNT(*) FROM peer_outbox WHERE peer_id = ? AND created_at >= date('now')",
+                (peer,),
+            )
+            row = await cursor.fetchone()
+        except aiosqlite.Error:
+            logger.warning("peer outbox count unavailable for %s", peer, exc_info=True)
+            return None
+        return row[0] if row else 0
+
     async def _within_rate_limit(self) -> bool:
+        # Peer (agent-channel) deliveries spend no owner attention: they have
+        # their own per-peer cap and never consume the owner's daily budget.
         cursor = await self._db.execute(
             "SELECT COUNT(*) FROM outreach_history "
             "WHERE delivered_at IS NOT NULL "
             "AND category NOT IN ('blocker', 'alert') "
+            "AND channel IS NOT 'agent' "
             "AND delivered_at >= date('now')",
         )
         row = await cursor.fetchone()
@@ -367,6 +471,7 @@ class GovernanceGate:
         cursor = await self._db.execute(
             "SELECT COUNT(*) FROM outreach_history "
             "WHERE category = 'notification' AND delivered_at IS NOT NULL "
+            "AND channel IS NOT 'agent' "
             "AND delivered_at >= date('now')",
         )
         row = await cursor.fetchone()

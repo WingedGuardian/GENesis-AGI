@@ -60,6 +60,7 @@ from pathlib import Path
 # Self-locate so hook_input resolves whether run as a script or imported (tests).
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hook_input import field, read_payload, tool_input  # noqa: E402
+from plan_doc import live_section, plan_path, strip_quoted  # noqa: E402
 
 _STATE_DIR = Path.home() / ".genesis" / "adopt_first"
 
@@ -90,21 +91,6 @@ _SOURCE_PATH = re.compile(
 _VERDICT_HEADER = re.compile(
     r"^#{1,6}\s*adopt\s*[/|vs.．\- ]+\s*(adapt|build)", re.IGNORECASE | re.MULTILINE
 )
-
-#: Fenced code blocks are quoted material, not proposals. A plan showing an
-#: example snippet that names a path is not proposing to create it. Both
-#: Markdown fence forms strip: ``` and ~~~, each up to three spaces indented,
-#: and an unclosed fence runs to EOF rather than exposing its contents.
-_FENCE = re.compile(
-    r"^[ \t]{0,3}`{3,}[^\n]*\n.*?(?:^[ \t]{0,3}`{3,}[ \t]*$|\Z)"
-    r"|^[ \t]{0,3}~{3,}[^\n]*\n.*?(?:^[ \t]{0,3}~{3,}[ \t]*$|\Z)",
-    re.DOTALL | re.MULTILINE,
-)
-
-#: Live plan content ends at the canonical superseded divider; everything below
-#: it is archaeology — old proposals cannot block a new exit and an old verdict
-#: cannot clear a new proposal.
-_SUPERSEDED = re.compile(r"^##\s*═+\s*SUPERSEDED BELOW\s*═+\s*$", re.MULTILINE)
 
 #: The evaluate skill's vocabulary. A verdict is still judged by WHERE the
 #: token appears (section body, non-placeholder, search evidence alongside) —
@@ -166,7 +152,8 @@ def _sentinel(cwd: str) -> Path:
 
     An empty sentinel rather than a JSON dict, for two reasons. It matches what
     three sibling hooks already do for once-per-X nudges
-    (``agent_tool_guidance``, ``stealth_skill_nudge``, ``subsystem_traps_hook``)
+    (``stealth_skill_nudge``, ``subsystem_traps_hook``, and the retired
+    ``agent_tool_guidance``)
     — adding a fifth mechanism to a change whose whole subject is "stop
     reinventing what exists" would have been the funniest possible defect. And
     it is ATOMIC: the previous JSON version did a read-modify-write, and several
@@ -205,48 +192,9 @@ def _mark_nudged(cwd: str) -> bool:
 
 
 # ── plan resolution ──────────────────────────────────────────────────────────
-def _plan_path(payload: dict) -> str:
-    """The plan file this ExitPlanMode is about.
-
-    Same two-step as ``plan_bookmark_hook._extract_plan_info``: look for an
-    explicit path in the payload, else fall back to the most recently modified
-    plan. Duplicated rather than imported because that module is a PostToolUse
-    hook with its own bookmark side effects, and importing it to reuse thirty
-    lines would drag those along.
-    """
-    # The AUTHORITATIVE field first. MEASURED across 1,862 real ExitPlanMode
-    # payloads on this install: `planFilePath` was present in 1862/1862. The
-    # blob regex below is a fallback for older shapes — and it is a fallback for
-    # a reason: `plan` (the full markdown) serializes BEFORE `planFilePath`, so
-    # a first-match scan can return a path quoted inside the plan's own prose
-    # and then gate on some entirely different document.
-    for key in ("planFilePath", "plan_file_path"):
-        direct = tool_input(payload).get(key) or payload.get(key)
-        if isinstance(direct, str) and direct.endswith(".md"):
-            return direct
-    blob = json.dumps(payload)
-    match = re.search(r"(/[^\s\"']+\.claude/plans/[^\s\"']+\.md)", blob)
-    if match:
-        return match.group(1)
-    plans = Path.home() / ".claude" / "plans"
-    if plans.is_dir():
-        try:
-            candidates = sorted(
-                plans.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True
-            )
-            # Never guess another session's plan. Without an explicit path the
-            # only honest correlation is the session id in the filename; absent
-            # that, a single unambiguous file is the only safe pick.
-            sid = str(payload.get("session_id") or "")
-            if sid:
-                own = [p for p in candidates if sid in p.name]
-                if own:
-                    return str(own[0])
-            if len(candidates) == 1:
-                return str(candidates[0])
-        except OSError:
-            pass
-    return ""
+# Which plan, and which part of it is live, come from the shared reader
+# (`plan_doc.plan_path` / `plan_doc.live_section`), the one copy both
+# plan-reading hooks use.
 
 
 def _repo_root(payload: dict) -> Path | None:
@@ -329,7 +277,8 @@ def _has_verdict(content: str) -> bool:
     nxt = re.search(rf"^#{{1,{max(depth, 1)}}}\s", rest, re.MULTILINE)
     body = rest[: nxt.start()] if nxt else rest
 
-    body = _FENCE.sub("", body)
+    # Code and HTML blocks are quoted material: an example verdict is not a verdict.
+    body = strip_quoted(body)
     # Strip <placeholder> spans so an unfilled copy of the emitted template
     # (`<ADOPT|ADAPT|BUILD> — <why>. Searched: <terms>`) satisfies nothing.
     body = re.sub(r"<[^>\n]*>", "", body)
@@ -352,20 +301,26 @@ def _has_verdict(content: str) -> bool:
 
 
 def _check_plan(payload: dict) -> int:
-    plan_path = _plan_path(payload)
-    if not plan_path:
+    path = plan_path(payload)
+    if not path:
         return 0  # nothing to read — never block on our own inability to find it
     try:
-        content = Path(plan_path).read_text(encoding="utf-8")
+        content = Path(path).read_text(encoding="utf-8")
     except OSError:
-        return 0
+        # The payload carries the plan text itself; an unreadable path must not
+        # turn the check off when the plan is right there.
+        content = tool_input(payload).get("plan")
+        if not isinstance(content, str) or not content:
+            return 0
 
     # Plans are append-only documents: everything below the superseded divider
     # is archaeology, so old proposals must not block the exit and old verdicts
     # must not clear the current one.
-    live = _SUPERSEDED.split(content, maxsplit=1)[0]
+    live = live_section(content)
 
-    named = sorted(set(_SOURCE_PATH.findall(_FENCE.sub('', live))))
+    # Code and HTML blocks are quoted material: a path in an example is not a proposal.
+    prose = strip_quoted(live)
+    named = sorted(set(_SOURCE_PATH.findall(prose)))
     if not named:
         return 0  # proposes no source files — not this gate's business
 
@@ -394,14 +349,14 @@ def _check_plan(payload: dict) -> int:
     # A rename's destination reads as "does not exist yet" without being a new
     # capability. When the plan describes a rename/move joining an existing
     # source to the candidate, exclude it.
-    for rm in _RENAME.finditer(live):
+    for rm in _RENAME.finditer(prose):
         if rm.group(1).strip("'`") in existing:
             renamed = rm.group(2).lstrip("'`\"").rstrip("'`\".,;:")
             sources = [s for s in sources if s != renamed and not renamed.endswith("/" + s)]
     if not sources:
         return 0
 
-    if _has_verdict(live):
+    if _has_verdict(prose):
         return 0
 
     shown = ", ".join(sources[:4]) + (" …" if len(sources) > 4 else "")

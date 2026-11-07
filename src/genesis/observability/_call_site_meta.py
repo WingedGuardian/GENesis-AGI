@@ -140,6 +140,15 @@ Fields:
 from __future__ import annotations
 
 _CALL_SITE_META: dict[str, dict] = {
+    "cc_fallback": {
+        "description": "Configured roster fallback for conversations and managed API jobs. Last execution outcome; readiness alone is not task success.",
+        "category": "core",
+        "frequency": "On provider refusal",
+        "cost_policy": "Configured roster (billing varies)",
+        "model_tier": "frontier",
+        "wired": True,
+        "status_reason": "WIRED",
+    },
     # ── WIRED: actively executing, have last_run records ──────────────
     "3_micro_reflection": {
         "description": "Fast LLM pattern check on the latest signals, fired only when a critical operational signal is active (~90% of micro ticks are silent by design; see PR #404). Free models.",
@@ -620,7 +629,7 @@ _CALL_SITE_META: dict[str, dict] = {
     "ambient_arbiter": {
         # Manual cost_policy on purpose: the chain is empty by design (no API
         # fallback), so auto-derivation would mislabel it "Not configured".
-        "description": "Ambient session-awareness arbiter: judges which drift-fire candidate memories deserve surfacing. Headless CC (pinned Haiku) spawned by the detached ambient worker; the router never dispatches it.",
+        "description": "Ambient session-awareness arbiter: judges which drift-fire candidate memories deserve surfacing. Headless CC (latest Haiku, `haiku` alias) spawned by the detached ambient worker; the router never dispatches it.",
         "category": "memory",
         "frequency": "Per drift-trigger fire (max 8/session)",
         "cost_policy": "CC subscription (Haiku)",
@@ -632,7 +641,7 @@ _CALL_SITE_META: dict[str, dict] = {
         # Manual cost_policy (empty chain by design, ambient_arbiter twin).
         # Deliberately NOT in critical_sites: a shadow-only site failing is
         # never red-worthy — the foreground ledger tools are the primary path.
-        "description": "Ambient session-ledger shadow extractor: proposes missed agreements/pivots from the transcript delta at each PreCompact boundary. Headless CC (pinned Haiku) spawned by the detached ledger shadow worker; shadow store only, never the live ledger.",
+        "description": "Ambient session-ledger shadow extractor: proposes missed agreements/pivots from the transcript delta at each PreCompact boundary. Headless CC (latest Haiku, `haiku` alias) spawned by the detached ledger shadow worker; shadow store only, never the live ledger.",
         "category": "memory",
         "frequency": "Per foreground compaction (~2-15/day)",
         "cost_policy": "CC subscription (Haiku)",
@@ -644,7 +653,7 @@ _CALL_SITE_META: dict[str, dict] = {
         # Manual cost_policy (empty chain by design, ambient_arbiter twin).
         # Deliberately NOT in critical_sites: a pulse run failing is never
         # red-worthy — it self-heals by re-covering its window next boundary.
-        "description": "Repo-pulse fuzzy matcher: one headless CC (pinned Haiku) call per pulse run scoring open-ledger-item x merged-PR matches. Spawned by the detached repo-pulse worker at SessionStart boundaries; proposal-only in every mode (the exact marker tier is deterministic and never routes).",
+        "description": "Repo-pulse fuzzy matcher: one headless CC (latest Haiku, `haiku` alias) call per pulse run scoring open-ledger-item x merged-PR matches. Spawned by the detached repo-pulse worker at SessionStart boundaries; proposal-only in every mode (the exact marker tier is deterministic and never routes).",
         "category": "memory",
         "frequency": "Per debounced session boundary (<=2/hour, realistically <10/day)",
         "cost_policy": "CC subscription (Haiku)",

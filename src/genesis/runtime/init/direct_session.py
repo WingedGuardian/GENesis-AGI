@@ -173,6 +173,9 @@ async def init(rt: GenesisRuntime) -> None:
             config_builder=SessionConfigBuilder(),
             runtime=rt,
         )
+        from genesis.cc.managed_session import reconcile_orphans
+
+        await reconcile_orphans(rt._db)
         rt._direct_session_runner = runner
 
         # Inject protected paths for background session prompt hardening

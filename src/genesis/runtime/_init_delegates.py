@@ -22,7 +22,11 @@ the runtime.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import json
 import logging
+import sys
 from pathlib import Path
 
 from genesis.runtime.init import (
@@ -64,6 +68,14 @@ _OFFICECLI_SHA256 = {
     "x64": "6a29c598a789b57c92c03e560907d3f131a4bd0a068785b1d338a86fc31a58a7",  # pragma: allowlist secret
     "arm64": "c50298e4698fcd1b15fe1a0f096405ad260b5c84d4440882582d0bba1e57bd49",  # pragma: allowlist secret
 }
+
+
+# The browser engine probe runs in a subprocess so this process never imports
+# camoufox, which imports playwright. 60 s (owner, 2026-10-10): the probe reads
+# files, and on camoufox >= 0.5 imports it (about 1.5 s here); a hung probe would
+# stall bootstrap, so it is killed and the capability reads degraded.
+_BROWSER_PROBE_CMD: tuple[str, ...] = (sys.executable, "-m", "genesis.browser.engine", "--json")
+_BROWSER_PROBE_TIMEOUT_S = 60
 
 
 class _InitDelegatesMixin:
@@ -253,3 +265,49 @@ class _InitDelegatesMixin:
             # must degrade, never propagate (→ _run_init_step would mark "failed").
             logger.info("OfficeCLI probe failed (treating as absent): %s", exc)
             self._officecli_path = None
+
+    async def _init_browser_automation(self) -> None:
+        """Resolve whether a Camoufox engine can launch; never raises.
+
+        Sets ``self._browser_engine_path`` to the engine the browser tools would
+        launch, else None (capability ``degraded``, reason logged). Asks
+        ``genesis.browser.engine`` in a subprocess; provisioning is never this
+        probe's job. A probe that fails, prints something unreadable or times out
+        degrades too: an exception here would record ``failed``.
+        """
+        self._browser_engine_path = None
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *_BROWSER_PROBE_CMD,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, err = await asyncio.wait_for(proc.communicate(), _BROWSER_PROBE_TIMEOUT_S)
+            lines = out.decode(errors="replace").strip().splitlines()
+            if proc.returncode != 0 or not lines:
+                logger.info(
+                    "Browser engine probe failed (exit %s, treating as absent): %s",
+                    proc.returncode,
+                    err.decode(errors="replace").strip(),
+                )
+                return
+            from genesis.browser.engine import EngineStatus
+
+            status = EngineStatus.from_json(json.loads(lines[-1]))
+            if status.ready and status.path:
+                self._browser_engine_path = str(status.path)
+            else:
+                logger.info("Browser automation degraded: %s", status.detail)
+        except TimeoutError:
+            logger.warning(
+                "Browser engine probe timed out after %ss (treating as absent)",
+                _BROWSER_PROBE_TIMEOUT_S,
+            )
+        except Exception as exc:  # noqa: BLE001 - probe is best-effort, never fatal
+            logger.info("Browser engine probe failed (treating as absent): %s", exc, exc_info=True)
+        finally:
+            if proc is not None and proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                await proc.wait()

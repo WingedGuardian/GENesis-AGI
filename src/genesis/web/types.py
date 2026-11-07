@@ -45,3 +45,4 @@ class FetchResult:
     status_code: int = 0
     error: str | None = None
     truncated: bool = False
+    client: str = ""

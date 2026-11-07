@@ -6,8 +6,7 @@ import os
 import pyarrow.parquet as pq
 import pytest
 
-from genesis.transcript_analytics import derive, query, store
-from genesis.transcript_analytics import publication as source_publication
+from genesis.transcript_analytics import query, store
 
 
 def _assistant(mid="m", **extra):
@@ -91,10 +90,8 @@ def test_rename_retains_accepted_uuidless_physical_rows(tmp_path):
         {"type": "system", "subtype": "api_error", "timestamp": "2025-01-01T00:00:00Z"},
     ]
     projects, data, path = _setup(tmp_path, records)
-    derive.build(data)
     path.rename(projects / "renamed.jsonl")
     assert store.ingest(projects, data)["failed"] == 0
-    assert query.snapshot_compatible(data) and not query.derived_current(data)
     assert len(store.compatible_sources(data)[0]) == 2
     assert query.run_query(data, "select count(*) from raw_fragments", live=True)[1] == [(2,)]
     assert query.run_query(data, "select count(*) from events", live=True)[1] == [(2,)]
@@ -112,34 +109,33 @@ def test_failed_rename_staging_retains_original(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("fail_marker", [False, True])
-def test_interrupted_rename_publication_retains_accepted_identities(
+def test_interrupted_record_swap_retains_accepted_identities(
     tmp_path, monkeypatch, fail_marker
 ):
     projects, data, path = _setup(tmp_path, [_assistant()])
-    derive.build(data)
     path.rename(projects / "renamed.jsonl")
     if fail_marker:
-        original = source_publication.publish
-        def fail(root, document):
-            proposed = json.loads(document)
-            if len(proposed["sources"]) == 2:
-                raise source_publication.Failed("interrupted new-source selector publication")
-            return original(root, document)
+        # Failure during the final `current` swap: the old record stays selected.
+        real_replace = os.replace
+        def fail_replace(src, dst):
+            if os.path.basename(str(dst)) == "current":
+                raise OSError("interrupted record selection")
+            return real_replace(src, dst)
 
-        monkeypatch.setattr(source_publication, "publish", fail)
-        with pytest.raises(source_publication.Failed):
-            store.ingest(projects, data)
-        monkeypatch.setattr(source_publication, "publish", original)
-    else:
-        original = source_publication.finalize
-        monkeypatch.setattr(
-            source_publication,
-            "finalize",
-            lambda *a: (_ for _ in ()).throw(OSError("interrupted finalization")),
-        )
+        monkeypatch.setattr(os, "replace", fail_replace)
         assert store.ingest(projects, data)["failed"] == 1
-        monkeypatch.setattr(source_publication, "finalize", original)
-    assert query.snapshot_compatible(data) and not query.derived_current(data)
+        monkeypatch.setattr(os, "replace", real_replace)
+    else:
+        # Failure while fencing the staged record dir.
+        real_rename = os.rename
+        def fail_rename(src, dst):
+            if "/.staging/" in str(src):
+                raise OSError("interrupted record rename")
+            return real_rename(src, dst)
+
+        monkeypatch.setattr(os, "rename", fail_rename)
+        assert store.ingest(projects, data)["failed"] == 1
+        monkeypatch.setattr(os, "rename", real_rename)
     assert len(store.compatible_sources(data)[0]) == 1  # failed new source was never accepted
     assert store.srckey(path.name) in store.compatible_sources(data)[0]
     assert store.ingest(projects, data)["failed"] == 0
@@ -165,24 +161,19 @@ def test_unmatched_disappeared_source_and_legacy_digest_are_retained(tmp_path):
 
 
 def test_captured_digest_matches_rows_and_ignores_late_append(tmp_path, monkeypatch):
+    """A late append AFTER the post-read fingerprint still lands next ingest."""
     import hashlib
 
     projects, data, path = _setup(tmp_path, [_assistant()])
     prefix = path.read_bytes()
-    real = store.extract_source
-
-    def append_after_extract(*args, **kwargs):
-        result = real(*args, **kwargs)
-        with path.open("a") as handle:
-            handle.write(json.dumps(_assistant("late")) + "\n")
-        return result
-
-    monkeypatch.setattr(store, "extract_source", append_after_extract)
     store.build_source(path, path.name, data, path.stat())
     md, reason = store.source_metadata(data, store.srckey(path.name))
     assert reason is None
     assert md[b"ta.content_sha256"].decode() == hashlib.sha256(prefix).hexdigest()
-    assert query.run_query(data, "select count(*) from raw_fragments", live=True)[1] == [(1,)]
+    with path.open("a") as handle:
+        handle.write(json.dumps(_assistant("late")) + "\n")
+    store.ingest(projects, data)  # the appended bytes are picked up normally
+    assert query.run_query(data, "select count(*) from raw_fragments", live=True)[1] == [(2,)]
 
 
 def test_lossless_json_ids_survive_store_and_joins(tmp_path):

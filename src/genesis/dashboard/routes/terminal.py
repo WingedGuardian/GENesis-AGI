@@ -16,7 +16,7 @@ import os
 import threading
 from typing import TYPE_CHECKING
 
-from flask import jsonify
+from flask import jsonify, request
 
 from genesis.dashboard._blueprint import blueprint
 
@@ -40,6 +40,45 @@ _active_sessions: set[str] = set()
 _session_lock = threading.Lock()
 _MAX_SESSIONS = 3
 
+# Endpoint name flask-sock registers for the route below (the handler's name).
+_TERMINAL_ENDPOINT = "terminal_ws"
+_TERMINAL_PATH = "/ws/terminal"
+
+
+def _refuse_cross_origin_terminal():
+    """App-level gate: the terminal WebSocket accepts same-origin handshakes only.
+
+    flask-sock performs the WebSocket handshake inside the route wrapper, before
+    the handler body runs, so the handler cannot refuse an upgrade. This runs as
+    a ``before_request`` instead and answers 403 (RFC 6455 §10.2) when the
+    request is not same-origin by the shared check (``Sec-Fetch-Site``, else
+    ``Origin``/``Referer`` against ``Host``, fail-closed when no signal). A
+    browser always sends ``Origin`` on a WebSocket handshake, and the dashboard's
+    own terminal page connects to ``location.host``, so it always matches.
+
+    Independent of the dashboard password: a session cookie is attached on a
+    same-site sibling origin too (``SameSite=Lax``), so being logged in proves
+    nothing about which page opened the socket. A request carrying the internal
+    bearer is exempt, as it is for the mutation gate.
+    """
+    if request.endpoint != _TERMINAL_ENDPOINT and request.path != _TERMINAL_PATH:
+        return None
+    from genesis.dashboard.auth import has_internal_bearer, is_same_origin_request
+
+    if has_internal_bearer() or is_same_origin_request():
+        return None
+    # A browser hides the handshake status from the page, so this line is the
+    # only diagnosis of a refused legitimate connection (for example a plain-HTTP
+    # reverse proxy that rewrites Host). Values are repr()'d, so a hostile header
+    # cannot inject log lines.
+    logger.warning(
+        "Refused a cross-origin terminal WebSocket handshake: origin=%r sec_fetch_site=%r host=%r",
+        request.headers.get("Origin"),
+        request.headers.get("Sec-Fetch-Site"),
+        request.headers.get("Host"),
+    )
+    return "Cross-origin terminal connection refused", 403
+
 
 def register_terminal_ws(app: Flask) -> None:
     """Wire the WebSocket endpoint onto a Flask app.
@@ -53,8 +92,9 @@ def register_terminal_ws(app: Flask) -> None:
         return
 
     sock = Sock(app)
+    app.before_request(_refuse_cross_origin_terminal)
 
-    @sock.route("/ws/terminal")
+    @sock.route(_TERMINAL_PATH)
     def terminal_ws(ws: WebSocket) -> None:
         """WebSocket handler — bridges xterm.js to a PTY session."""
         # Auth check — WebSocket runs in request context, can access session

@@ -82,6 +82,52 @@ def test_second_cancellation_forces_without_deadline(monkeypatch):
     assert owner.outcome(0) == 130
 
 
+def test_watchdog_stop_escalates_term_ignorer_to_sigkill():
+    with run.OwnedProcess() as owner:
+        child = subprocess.Popen(
+            [sys.executable, '-c',
+             'import signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); '
+             'print("armed", flush=True); time.sleep(60)'],
+            start_new_session=True, stdout=subprocess.PIPE)
+        assert child.stdout.readline() == b'armed\n'  # TERM must not land before SIG_IGN
+        owner.bind(child)
+        owner.stop(escalate_after=0.3)
+        assert owner.wait(timeout=15) == -signal.SIGKILL
+    # A watchdog request is not a caller signal: it never selects the outcome.
+    assert owner.outcome(0) == 0
+
+
+def test_watchdog_stop_without_escalation_stays_term(monkeypatch):
+    sent = []
+    monkeypatch.setattr(run, 'kill_group', lambda *args: sent.append(args))
+    with run.OwnedProcess() as owner:
+        owner.bind(_child())
+        owner.stop()
+        for _ in range(3):
+            owner.checkpoint()
+            time.sleep(0.05)
+        assert sent == [(owner.proc.pid, signal.SIGTERM)]
+        owner.wait(timeout=5)
+
+
+def test_caller_escalation_supersedes_armed_watchdog_deadline(monkeypatch):
+    sent = []
+    monkeypatch.setattr(run, 'kill_group', lambda *args: sent.append(args))
+    with run.OwnedProcess() as owner:
+        owner.bind(_child(60))
+        owner.stop(escalate_after=0.01)
+        owner._forward(signal.SIGINT, None)
+        owner._forward(signal.SIGINT, None)
+        time.sleep(0.05)
+        for _ in range(3):
+            owner.checkpoint()
+        # The caller's second signal already forced SIGKILL; the watchdog's
+        # armed deadline adds no duplicate dispatch.
+        pid = owner.proc.pid
+        assert sent == [(pid, signal.SIGTERM), (pid, signal.SIGKILL)]
+        owner.wait(timeout=15)
+
+
 def test_first_cancellation_after_reap_remains_cooperative_for_owned_scope(monkeypatch):
     sent = []
     monkeypatch.setattr(run, 'kill_group', lambda *_args: pytest.fail('reaped PID cannot be signalled'))
@@ -107,6 +153,31 @@ def test_first_cancellation_after_reap_remains_cooperative_for_owned_scope(monke
         assert owner.wait(timeout=5) == 7
         assert not owner._scope_authorized
     assert owner.outcome(7) == 130
+
+
+@pytest.mark.parametrize('scope_authorized', [False, True])
+def test_watchdog_after_reap_uses_only_acknowledged_scope(monkeypatch, scope_authorized):
+    sent = []
+    monkeypatch.setattr(run, 'kill_group', lambda *_args: pytest.fail('reaped PID cannot be signalled'))
+    monkeypatch.setattr(run, '_signal_scope', lambda unit, sig: sent.append((unit, sig)) or True)
+    monkeypatch.setattr(run, '_scope_quiescent', lambda _unit: bool(sent and sent[-1][1] == signal.SIGKILL))
+    with run.OwnedProcess() as owner:
+        owner.bind(_child(7), 'synthetic-owned-scope')
+        owner._scope_authorized = scope_authorized
+        assert owner.wait(timeout=5) == 7
+        assert owner.reaped and not owner._numeric_open
+        try:
+            owner.stop(escalate_after=0)
+            assert owner.wait(timeout=5) == 7
+            expected = [('synthetic-owned-scope', signal.SIGTERM),
+                        ('synthetic-owned-scope', signal.SIGKILL)] if scope_authorized else []
+            assert sent == expected
+            assert not owner._scope_authorized
+            assert owner.signals == 0
+        finally:
+            owner.stop(signal.SIGKILL)
+            owner.wait(timeout=5)
+    assert owner.outcome(7) == 7
 
 
 def test_external_reap_is_not_fabricated_success():

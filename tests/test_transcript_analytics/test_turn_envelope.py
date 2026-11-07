@@ -243,3 +243,16 @@ def test_nonselected_copy_failure_flags_survive_in_turn_and_session(
         tmp_path / "data", "SELECT scrub_failed FROM sessions", live=True
     )
     assert sessions == [(flag == "scrub_failed",)]
+
+
+def test_evidence_manifest_redacts_raw_source_metadata(tmp_path):
+    projects, data = tmp_path / "projects", tmp_path / "data"
+    projects.mkdir()
+    (projects / "private-name.jsonl").write_text(json.dumps(_record("A", 1)) + "\n")
+    assert store.ingest(projects, data)["failed"] == 0
+    manifest = tmp_path / "evidence.json"
+    query.run_query(data, "SELECT * FROM turns", manifest_path=manifest)
+    text = manifest.read_text()
+    assert "private-name.jsonl" not in text
+    assert str(projects) not in text
+    assert store.srckey("private-name.jsonl") in text

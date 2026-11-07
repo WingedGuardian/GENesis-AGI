@@ -55,18 +55,6 @@ def _isolate_dashboard_home(monkeypatch, tmp_home):
         d.mkdir(parents=True, exist_ok=True)
     # (dotted module global) -> isolated tmp path
     _patches = {
-        # updates.py — /updates/status GET auto-resolves an observation (WRITE)
-        "genesis.dashboard.routes.updates._HOME": tmp_home,
-        "genesis.dashboard.routes.updates._GENESIS_ROOT": gen,
-        "genesis.dashboard.routes.updates._UPDATE_SCRIPT": gen / "scripts" / "update.sh",
-        "genesis.dashboard.routes.updates._DB_PATH": gen / "data" / "genesis.db",
-        "genesis.dashboard.routes.updates._FAILURE_FILE": dot / "last_update_failure.json",
-        "genesis.dashboard.routes.updates._GENESIS_DIR": dot,
-        "genesis.dashboard.routes.updates._SUMMARY_FILE": dot / "last_update_summary.txt",
-        "genesis.dashboard.routes.updates._ESCALATION_FILE": dot / "update_escalation.txt",
-        "genesis.dashboard.routes.updates._CONFLICT_FILE": dot / "update_conflicts.json",
-        "genesis.dashboard.routes.updates._STATE_FILE": dot / "update_state.json",
-        "genesis.dashboard.routes.updates._PID_FILE": dot / "update_in_progress.pid",
         # files.py — /files READS real home; write/delete/upload routes too
         "genesis.dashboard.routes.files._HOME": tmp_home,
         "genesis.dashboard.routes.files._ALLOWED_ROOTS": [gen, dot, tmp_home / ".claude"],
@@ -94,6 +82,14 @@ def _isolate_dashboard_home(monkeypatch, tmp_home):
     }
     for dotted, value in _patches.items():
         monkeypatch.setattr(dotted, value, raising=False)
+    # updates.py — /updates/status GET auto-resolves an observation (WRITE), and
+    # its routes launch update.sh and Claude sessions: the shared sandbox every
+    # update-route test uses (tests/_update_routes_sandbox.py) patches every path
+    # constant and refuses its process launches.
+    from tests._update_routes_sandbox import isolate_update_routes
+
+    # GENESIS_HOME stays the tmp home _build_dashboard_app set (other routes read it).
+    isolate_update_routes(monkeypatch, tmp_home, gen, genesis_home=tmp_home)
 
 
 def _build_dashboard_app(monkeypatch, tmp_home, *, password: str | None):

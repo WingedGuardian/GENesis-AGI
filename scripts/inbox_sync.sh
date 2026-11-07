@@ -1,30 +1,99 @@
 #!/bin/bash
-# Sync Genesis inbox folder between Dropbox and local VM.
-# Runs via cron every 5 minutes.
+# Sync the Genesis inbox folder between a vault (an rclone remote, e.g. a
+# Dropbox folder an Obsidian vault syncs to) and the local inbox.
+# Run every 5 minutes by genesis-inbox-sync.timer. The remote is
+# inbox_monitor.sync_remote (config/inbox_monitor.yaml + the local overlay);
+# when it is empty the sync is off and each run exits at once.
+#
+# What a pull replaces or removes goes to the Genesis trash, so a wrong watch_path
+# or an emptied vault can be undone.
+#
+# Every configured run writes a heartbeat ($GENESIS_HOME/state/inbox_sync.json:
+# last_run, last_ok, held). The awareness loop alerts when last_ok goes stale,
+# so a sync that stops running, or keeps failing, is noticed.
 #
 # Flow:
 #   1. Pull new files FROM Dropbox → local (two-way sync for responses)
 #   2. Detect .genesis.md files deleted by user in Obsidian and clean up locally
 #   3. Push .genesis.md responses FROM local → Dropbox
+#   4. Record which responses the vault now holds (the evidence step 2 uses)
 #
-# Response files use .genesis.md suffix (sibling to source files).
-# No subdirectory needed — everything lives in the same folder.
+# Response files use .genesis.md suffix (sibling to source files), so a note in
+# a subfolder gets its response in that subfolder; steps 2-4 work at any depth.
 #
 # Local state files (".genesis-*", excluded from the step-1 mirror so the sync
-# can never delete its own state):
-#   .genesis-lsf-stderr  stderr of the last listing attempt (kept out of the
-#                        listing data so error text can never join a
-#                        membership decision)
+# can never delete its own state, and never pushed):
+#   .genesis-lsf-stderr     stderr of the last listing attempt (kept out of the
+#                           listing data so error text can never join a
+#                           membership decision)
+#   .genesis-seen-in-vault  "# remote: <remote>", then the response paths
+#                           (relative to the inbox root) the vault held at the
+#                           end of the last healthy cycle
+#   .genesis-push-filter    this cycle's push filter (rewritten every cycle)
 
 SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-DROPBOX_PATH="Apps/remotely-save/1/Genesis"
-LOCAL_PATH="${GENESIS_INBOX_PATH:-$HOME/inbox}"
 LOG="${GENESIS_INBOX_SYNC_LOG:-$REPO_DIR/logs/inbox_sync.log}"
+# The interpreter that runs genesis.inbox.sync_config and genesis.trash
+# (overridable for tests).
+PYTHON="${GENESIS_PYTHON:-$REPO_DIR/.venv/bin/python}"
 
-mkdir -p "$(dirname "$LOG")" "$LOCAL_PATH"
+mkdir -p "$(dirname "$LOG")"
+_stamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
-# Single-flight: an API outage can stretch a cycle past the 5-min cron period
+# Configuration comes from Genesis config, through one reader the server's
+# staleness check shares. A config that cannot be read, or a remote that is
+# not a valid rclone remote, stops the run with exit 1: never read as "off",
+# because "off" raises no alert.
+if ! CFG=$("$PYTHON" -m genesis.inbox.sync_config 2>&1); then
+    echo "--- $(_stamp) REFUSED: inbox sync config unusable: $(printf '%s' "$CFG" | tr -d '[:cntrl:]') ---" >> "$LOG"
+    exit 1
+fi
+REMOTE=$(printf '%s\n' "$CFG" | sed -n 's/^remote=//p')
+LOCAL_PATH=$(printf '%s\n' "$CFG" | sed -n 's/^watch_path=//p')
+HEARTBEAT=$(printf '%s\n' "$CFG" | sed -n 's/^heartbeat=//p')
+CFG_HOME=$(printf '%s\n' "$CFG" | sed -n 's/^genesis_home=//p')
+if [ -z "$REMOTE" ]; then
+    # Off on this install: nothing to sync, nothing to watch, nothing logged
+    # (the timer fires every 5 minutes on every install). Except one case: a
+    # caller that is NOT the systemd timer (no INVOCATION_ID, e.g. an old
+    # crontab line) means someone expects this to sync. That happens when an
+    # install that synced from cron updates before setting sync_remote, and
+    # it would otherwise stop syncing in silence: the log line is for the reader,
+    # and the heartbeat marker raises an alert (inbox/sync_health.py).
+    if [ -z "${INVOCATION_ID:-}" ]; then
+        echo "--- $(_stamp) NOT SYNCING: inbox_monitor.sync_remote is empty, but this run did not come from genesis-inbox-sync.timer (a crontab line?). Set sync_remote in ~/.genesis/config/inbox_monitor.local.yaml to resume the sync. ---" >> "$LOG"
+        if [ -n "$HEARTBEAT" ]; then
+            mkdir -p "$(dirname "$HEARTBEAT")"
+            rm -f -- "$HEARTBEAT.tmp"
+            printf '{"unconfigured_caller": "%s"}\n' "$(_stamp)" > "$HEARTBEAT.tmp" \
+                && mv -fT -- "$HEARTBEAT.tmp" "$HEARTBEAT"
+        fi
+    fi
+    exit 0
+fi
+# Exactly one line per key, or nothing is trusted: a value carrying a newline
+# would otherwise smuggle a second key= line in (sync_config refuses control
+# characters too; this is the script's own check of what it was handed).
+for key in remote watch_path heartbeat genesis_home; do
+    if [ "$(printf '%s\n' "$CFG" | grep -c "^$key=")" -ne 1 ]; then
+        echo "--- $(_stamp) REFUSED: inbox sync config output does not carry exactly one $key= line ---" >> "$LOG"
+        exit 1
+    fi
+done
+if [ -z "$LOCAL_PATH" ] || [ -z "$HEARTBEAT" ] || [ -z "$CFG_HOME" ]; then
+    echo "--- $(_stamp) REFUSED: inbox sync config incomplete: $(printf '%s' "$CFG" | tr -d '[:cntrl:]') ---" >> "$LOG"
+    exit 1
+fi
+# A trailing slash would make every relative path below start with "/", so no
+# local response could ever match the vault listing.
+[ "$LOCAL_PATH" != "/" ] && LOCAL_PATH="${LOCAL_PATH%/}"
+
+mkdir -p "$LOCAL_PATH"
+# genesis.trash below must use the home the config reader resolved.
+export GENESIS_HOME="$CFG_HOME"
+
+# Single-flight: an API outage can stretch a cycle past the 5-min timer period
 # (rclone retries); overlapping runs would interleave deletions and log lines.
 exec 9>"$LOG.lock"
 if ! flock -n 9; then
@@ -32,64 +101,165 @@ if ! flock -n 9; then
     exit 0
 fi
 
+# Escape a path for an rclone filter line: glob characters in a file name are
+# literal, and the leading "/" anchors it at the inbox root.
+_filter_literal() {
+    printf '/%s' "$1" | sed -e 's/[][\\*?{}]/\\&/g'
+}
+
+# Control chars stripped from audit lines (log injection defense-in-depth);
+# UTF-8 titles intact.
+_shown() {
+    printf '%s' "$1" | tr -d '[:cntrl:]'
+}
+
 {
     echo "--- $(date -u +%Y-%m-%dT%H:%M:%SZ) ---"
 
     # 1. Pull: Dropbox → local (get new files from Obsidian, skip .genesis.md
     #    so we don't overwrite local responses before push, and skip local
     #    ".genesis-*" state so the mirror never deletes it)
-    rclone sync "dropbox:$DROPBOX_PATH" "$LOCAL_PATH" \
+    #    The second ".genesis-*" exclude covers DIRECTORIES of that name: the
+    #    first matches files only, so a vault folder named like a state file
+    #    would otherwise be mirrored over it (MEASURED, rclone 1.60).
+    #    --one-file-system: a directory mounted under the inbox is not part of
+    #    the mirror, and without this its files are deleted (MEASURED, 1.60).
+    #    --backup-dir: what the mirror replaces or removes is saved, then moved to
+    #    the Genesis trash below. A mirror deletes whatever the vault lacks, so
+    #    this is what makes a wrong watch_path or an emptied vault recoverable.
+    SAVE_ROOT="$CFG_HOME/state/inbox-pull-saved"
+    rclone sync "$REMOTE" "$LOCAL_PATH" \
+        --one-file-system \
+        --backup-dir "$SAVE_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-$$" \
         --exclude "*.genesis.md" \
         --exclude ".genesis-*" \
+        --exclude ".genesis-*/**" \
         --verbose 2>&1
+    pull_rc=$?
+    [ "$pull_rc" -ne 0 ] && echo "Pull failed (rc=$pull_rc); new notes did not arrive this cycle"
+    # Every saved folder, so one the trash refused last cycle is retried. A refusal
+    # leaves it in place, still recoverable, and the cycle reads not ok.
+    SAVE_OK=1
+    while IFS= read -r -d '' saved; do
+        if trash_out=$("$PYTHON" -m genesis.trash put --reason "inbox_sync: a vault pull replaced or removed these files" -- "$saved" 2>&1); then
+            echo "Pull replaced or removed local files; the old copies are in the Genesis trash ($(_shown "${saved##*/}"))"
+        else
+            SAVE_OK=""
+            echo "WARNING: the trash refused what the pull saved; kept at $(_shown "$saved") and retried next cycle: $(_shown "$trash_out")"
+        fi
+    done < <(find "$SAVE_ROOT" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null)
 
-    # 2. Detect user-deleted .genesis.md files:
-    #    A local .genesis.md file >10min old that is missing from a HEALTHY
-    #    vault listing was deleted by the user in Obsidian; clean it up locally.
-    #    Grace period: cron runs every 5min, so new files push within 5min;
-    #    after 10min an unlisted file is treated as a user deletion.
+    # 2. Detect user-deleted .genesis.md files, at any depth.
+    #    A local response is a USER DELETION only if a previous healthy listing
+    #    saw it in the vault and this healthy listing does not. Absence alone
+    #    proves nothing: a response whose upload never landed (a failed push,
+    #    or a stretch when this job did not run at all) is also absent, and
+    #    deleting it would destroy the only copy. So every healthy cycle
+    #    records what the vault held, and only a response named in that record
+    #    can be cleaned. A response the vault has never listed is kept and
+    #    pushed in step 3.
+    #
+    #    A cleaned response goes to Genesis's trash (`genesis.trash put`), not
+    #    `rm`, so a wrong deletion can be restored. If the trash refuses (the
+    #    inbox on another volume, no interpreter), the response is HELD: kept,
+    #    left out of this cycle's push so it is not re-uploaded, and kept in
+    #    the record so the next cycle tries again. It is never `rm`'d.
+    #
+    #    A response at a recorded path that now appears elsewhere in the vault
+    #    under the same name (outside Obsidian's .trash) was MOVED, not deleted.
+    #    It is cleaned the same way and logged as a move.
     #
     #    FAIL-CLOSED (2026-08-24): the listing is the sole evidence for "the
-    #    user deleted this". If `rclone lsf` fails (Dropbox API outage), an
-    #    empty listing must NEVER be read as "everything was deleted" — on
-    #    2026-07-29 exactly that wiped all 150 local response files and reset
-    #    the response counter. On a failed listing we skip cleanup AND hold
-    #    back the push of >grace-age files (step 3), so an old local copy of a
-    #    vault-side deletion cannot be re-uploaded (resurrected) before the
-    #    next healthy cycle cleans it. Bulk deletions on a HEALTHY listing are
-    #    still honored (blocking would resurrect user-deleted files via the
-    #    push) but logged loudly.
+    #    user deleted this". If `rclone lsf` fails (Dropbox API outage, or one
+    #    folder it cannot read: lsf -R then exits non-zero, MEASURED on rclone
+    #    1.60), an empty or partial listing must NEVER be read as deletions —
+    #    on 2026-07-29 exactly that wiped all 150 local response files and
+    #    reset the response counter. On a failed listing we skip cleanup, leave
+    #    the record untouched, AND hold back the push of >grace-age files
+    #    (step 3), so an old local copy of a vault-side deletion cannot be
+    #    re-uploaded (resurrected) before the next healthy cycle cleans it.
+    #    Bulk deletions on a HEALTHY listing are still honored but logged
+    #    loudly.
     #
-    #    KNOWN LIMITATION (deferred, tracked): a response whose push never
-    #    landed (upload fails while the listing stays healthy) is absent from
-    #    the vault WITHOUT being a user deletion, and is reaped after the grace
-    #    period. Protecting that edge needs a durable "seen on the vault"
-    #    ledger — deferred to its own change. This behavior is no worse than
-    #    the pre-2026-08-24 script (which had neither the ledger nor fail-closed).
+    #    No usable record (a fresh install, the first cycle after this change,
+    #    a record written for a different remote, or a symlink): nothing is
+    #    cleaned and the record is seeded from the listing. A response deleted
+    #    in the vault in the minutes before that cycle is re-uploaded once;
+    #    deleting it again sticks.
     LSF_ERR="$LOCAL_PATH/.genesis-lsf-stderr"
+    SEEN="$LOCAL_PATH/.genesis-seen-in-vault"
+    FILTER="$LOCAL_PATH/.genesis-push-filter"
+    RECORD_HEADER="# remote: $REMOTE"
     PUSH_MAX_AGE=""
+    LISTING_OK=""
+    HELD=""
+    PUSH_EXCLUDE=""
+    PUSH_HOLD=""
+    # A state path that is not a regular file (a directory left by an older
+    # mirror, say) would make the record unreadable and every cycle a silent
+    # "seed": say so on every cycle until someone removes it.
+    for state in "$SEEN" "$FILTER" "$LSF_ERR"; do
+        if [ -e "$state" ] && { [ -d "$state" ] || [ ! -f "$state" ]; } && [ ! -L "$state" ]; then
+            echo "WARNING: state path is not a regular file, so this cycle cannot complete: $(_shown "$state")"
+        fi
+    done
     # Never write state through a pre-planted symlink (defense-in-depth;
     # single-tenant box, but rm -f is free and rm does not follow symlinks).
-    rm -f -- "$LSF_ERR"
-    if REMOTE_GENESIS=$(rclone lsf "dropbox:$DROPBOX_PATH" --include "*.genesis.md" 2>"$LSF_ERR"); then
+    rm -f -- "$LSF_ERR" "$FILTER"
+    if REMOTE_GENESIS=$(rclone lsf -R --files-only "$REMOTE" --include "*.genesis.md" 2>"$LSF_ERR"); then
+        LISTING_OK=1
         remote_count=$(printf '%s\n' "$REMOTE_GENESIS" | grep -c . || true)
         cleaned=0
-        for f in "$LOCAL_PATH"/*.genesis.md; do
-            [ -f "$f" ] || continue
-            fname=$(basename -- "$f")
-            # Filename is DATA, never grep/rm options: grep -qxF -- / rm --.
-            if ! printf '%s\n' "$REMOTE_GENESIS" | grep -qxF -- "$fname"; then
-                if [ "$(find "$f" -mmin +10 2>/dev/null)" ]; then
-                    if rm -- "$f"; then
-                        # Control chars stripped from the audit line (log
-                        # injection defense-in-depth); UTF-8 titles intact.
-                        echo "Cleaned up (deleted from vault): $(printf '%s' "$fname" | tr -d '[:cntrl:]')"
-                        cleaned=$((cleaned + 1))
-                    fi
+        held=0
+        kept_unseen=0
+        if [ -f "$SEEN" ] && [ ! -L "$SEEN" ] \
+            && [ "$(head -n 1 -- "$SEEN")" = "$RECORD_HEADER" ]; then
+            # Local responses at any depth, skipping dot directories (Obsidian's
+            # .trash and .obsidian, and this job's own state). Names are DATA:
+            # read NUL-delimited, compared with grep -qxF --.
+            while IFS= read -r -d '' f; do
+                rel="${f#"$LOCAL_PATH"/}"
+                case "$rel" in
+                    *$'\n'*)
+                        # grep -F reads a newline as two patterns, so this name
+                        # cannot be matched safely. Keep it; never decide on it.
+                        # (Other control characters are listed by rclone in an
+                        # escaped form, so such a name never matches the listing
+                        # or the record: it is kept as never-listed. Fails safe.)
+                        echo "Kept (name contains a newline, not compared): $(_shown "$rel")"
+                        continue ;;
+                esac
+                if printf '%s\n' "$REMOTE_GENESIS" | grep -qxF -- "$rel"; then
+                    continue
                 fi
-            fi
-        done
-        echo "Cleanup pass: vault listing $remote_count response file(s), cleaned $cleaned"
+                if ! grep -qxF -- "$rel" "$SEEN"; then
+                    kept_unseen=$((kept_unseen + 1))
+                    continue
+                fi
+                base="${rel##*/}"
+                # ENVIRON, not -v: awk -v would interpret backslashes in a name.
+                moved_to=$(printf '%s\n' "$REMOTE_GENESIS" | grep -v '^\.trash/' \
+                    | B="$base" awk -F/ '$NF == ENVIRON["B"]' | head -n 1)
+                if trash_out=$("$PYTHON" -m genesis.trash put --reason "inbox_sync: response deleted in the vault" -- "$f" 2>&1); then
+                    if [ -n "$moved_to" ]; then
+                        echo "Moved in vault: $(_shown "$rel") -> $(_shown "$moved_to") (old local copy trashed; responses are never pulled, so the moved copy lives in the vault only)"
+                    else
+                        echo "Cleaned up (deleted from vault): $(_shown "$rel") (moved to the Genesis trash)"
+                    fi
+                    cleaned=$((cleaned + 1))
+                else
+                    echo "HELD (trash refused; kept, not pushed, retried next cycle): $(_shown "$rel") — $(_shown "$trash_out")"
+                    HELD="$HELD$rel"$'\n'
+                    held=$((held + 1))
+                fi
+            # -H: follow the inbox root itself when it is a symlink (find does
+            # not by default, and the walk would then see nothing), but no
+            # symlink below it.
+            done < <(find -H "$LOCAL_PATH" -xdev -mindepth 1 -name '.*' -prune -o -type f -name '*.genesis.md' -print0)
+            echo "Cleanup pass: vault listing $remote_count response file(s), cleaned $cleaned, held $held, kept $kept_unseen never-listed (will push)"
+        else
+            echo "Cleanup pass: no usable vault record yet — seeding it from this listing ($remote_count response file(s)); nothing cleaned this cycle"
+        fi
         if [ "$cleaned" -gt 5 ]; then
             echo "WARNING: bulk cleanup — $cleaned response files removed in one cycle (vault listing was healthy; verify this matches a deliberate Obsidian cleanup)"
         fi
@@ -100,20 +270,137 @@ fi
         # responses (<10min) still ship promptly.
         PUSH_MAX_AGE="10m"
         echo "SKIP cleanup: vault listing failed (rc=$lsf_rc) — refusing to treat an empty listing as mass deletion; holding back push of >${PUSH_MAX_AGE} files. rclone stderr: $(tr -d '[:cntrl:]' < "$LSF_ERR" 2>/dev/null)"
+        # The age gate alone does not protect a young file: a response the
+        # vault has been seen to hold may have been deleted there, and
+        # --max-age also hides an older vault copy from --ignore-existing, so
+        # the push could overwrite it. Everything on record stays out by name
+        # (held responses are on record too); a never-seen young one still ships.
+        if [ -f "$SEEN" ] && [ ! -L "$SEEN" ]; then
+            if ! record_lines=$(cat -- "$SEEN" 2>&1); then
+                PUSH_HOLD=1
+                echo "WARNING: could not read the vault record ($SEEN), so nothing can tell a vault deletion from a new response: holding the push this cycle: $(_shown "$record_lines")"
+            elif [ "$(printf '%s\n' "$record_lines" | head -n 1)" = "$RECORD_HEADER" ]; then
+                PUSH_EXCLUDE=$(printf '%s\n' "$record_lines" | tail -n +2)
+            fi
+        elif [ -e "$SEEN" ] || [ -L "$SEEN" ]; then
+            PUSH_HOLD=1
+            echo "WARNING: the vault record is not a regular file ($(_shown "$SEEN")), so nothing can tell a vault deletion from a new response: holding the push this cycle"
+        fi
     fi
 
     # 3. Push: local .genesis.md files → Dropbox (responses back to vault).
+    #    --ignore-existing: responses are write-once, so a vault copy is not
+    #    overwritten (a response the user moved or kept in the vault wins over
+    #    a local file that happens to reuse its path). The exception is a
+    #    failed-listing cycle, where --max-age hides an older vault copy from
+    #    this check: a never-recorded young response at that path replaces it.
     #    On a failed-listing cycle PUSH_MAX_AGE gates this to fresh files only
     #    (see step 2) so a not-yet-cleaned deletion can't be re-uploaded.
-    if [ -n "$PUSH_MAX_AGE" ]; then
-        rclone copy "$LOCAL_PATH" "dropbox:$DROPBOX_PATH" \
-            --include "*.genesis.md" \
-            --max-age "$PUSH_MAX_AGE" \
+    #    Every cycle excludes HELD and already-listed responses by name, and a
+    #    failed-listing cycle excludes everything on record (see step 2).
+    #    Responses are write-once; a deletion after the initial listing must
+    #    not turn into a new upload before the next cleanup cycle. An empty or
+    #    partial filter would ship the whole inbox, so the filter must be
+    #    complete before it is used, or nothing is pushed.
+    push_age=()
+    [ -n "$PUSH_MAX_AGE" ] && push_age=(--max-age "$PUSH_MAX_AGE")
+    rm -f -- "$FILTER.tmp"
+    if [ -n "$PUSH_HOLD" ]; then
+        push_rc=1
+    elif {
+        while IFS= read -r h; do
+            [ -z "$h" ] || printf -- '- %s\n' "$(_filter_literal "$h")"
+        done <<< "$HELD
+${REMOTE_GENESIS:-}
+$PUSH_EXCLUDE" && printf '%s\n' '+ *.genesis.md' '- **'
+    } > "$FILTER.tmp" && [ "$(tail -n 1 -- "$FILTER.tmp")" = '- **' ] && mv -fT -- "$FILTER.tmp" "$FILTER"; then
+        rclone copy "$LOCAL_PATH" "$REMOTE" \
+            --one-file-system \
+            --filter-from "$FILTER" \
+            --ignore-existing \
+            "${push_age[@]}" \
             --verbose 2>&1
+        push_rc=$?
     else
-        rclone copy "$LOCAL_PATH" "dropbox:$DROPBOX_PATH" \
-            --include "*.genesis.md" \
-            --verbose 2>&1
+        rm -f -- "$FILTER.tmp"
+        push_rc=1
+        echo "Push skipped: could not write the push filter ($FILTER)"
+    fi
+    [ "$push_rc" -ne 0 ] && echo "Push failed (rc=$push_rc); unlanded responses stay unseen and are retried next cycle"
+
+    # 4. Record what the vault holds NOW, after the push, so a response this
+    #    cycle uploaded counts as seen: deleting it in the vault before the
+    #    next cycle is then a deletion, not an upload to retry. A response
+    #    whose upload failed is absent from this listing, so it stays unseen
+    #    and is kept and pushed again. Responses HELD in step 2 stay recorded,
+    #    so the next cycle retries their cleanup instead of re-pushing them.
+    #    The step-2 listing is recorded too: everything in it was seen in the
+    #    vault, so a response deleted between the push and this listing still
+    #    counts as seen and its deletion is honoured next cycle. If this second
+    #    listing fails, the step-2 listing alone is recorded. Never written on
+    #    a failed-listing cycle (accepted: a response pushed in such a cycle and
+    #    deleted before the next healthy one is re-uploaded once). Written
+    #    atomically: a cycle killed mid-write leaves the previous record, never
+    #    a truncated one.
+    RECORD_OK=""
+    if [ -n "$LISTING_OK" ]; then
+        RECORD_OK=1
+        if ! AFTER_PUSH=$(rclone lsf -R --files-only "$REMOTE" --include "*.genesis.md" 2>>"$LSF_ERR"); then
+            echo "Record: post-push listing failed; recording the pre-push listing"
+            AFTER_PUSH=""
+            # What this cycle uploaded is not on record, so a deletion of it
+            # would be re-uploaded: the cycle is not ok.
+            RECORD_OK=""
+        fi
+        rm -f -- "$SEEN.tmp"
+        # mv -T: plain mv moves the file INTO a directory left at this path and
+        # returns 0, which would read as a written record.
+        if { printf '%s\n' "$RECORD_HEADER"
+             printf '%s\n%s\n%s' "$REMOTE_GENESIS" "$AFTER_PUSH" "$HELD" | sed '/^$/d' | sort -u; } > "$SEEN.tmp" \
+            && mv -fT -- "$SEEN.tmp" "$SEEN"; then
+            :
+        else
+            rm -f -- "$SEEN.tmp"
+            echo "WARNING: could not write the vault record ($SEEN); the previous record is kept"
+            RECORD_OK=""
+        fi
+    fi
+
+    # 5. Heartbeat. "Ok" means the whole cycle worked: the pull, a healthy
+    #    trash move of what it saved, a healthy listing, the push and the record. last_ok keeps its previous value when this cycle
+    #    was not ok, so a sync that runs but keeps failing goes stale too.
+    #    held = responses the trash refused this cycle (alerted on while
+    #    non-zero: a deletion that cannot apply). Written atomically.
+    now=$(_stamp)
+    last_ok=""
+    prev_held=0
+    if [ -f "$HEARTBEAT" ] && [ ! -L "$HEARTBEAT" ]; then
+        last_ok=$(sed -n 's/.*"last_ok": *"\([0-9TZ:-]*\)".*/\1/p' "$HEARTBEAT" | head -n 1)
+        prev_held=$(sed -n 's/.*"held": *\([0-9][0-9]*\).*/\1/p' "$HEARTBEAT" | head -n 1)
+    fi
+    # held is measured only on a healthy listing; a failed-listing cycle keeps
+    # the previous count, so the held alert does not clear and re-fire.
+    [ -n "$LISTING_OK" ] || held="${prev_held:-0}"
+    if [ "$pull_rc" -eq 0 ] && [ -n "$SAVE_OK" ] && [ -n "$LISTING_OK" ] && [ "$push_rc" -eq 0 ] && [ -n "$RECORD_OK" ]; then
+        last_ok="$now"
+    else
+        listing_state="failed"
+        [ -n "$LISTING_OK" ] && listing_state="ok"
+        record_state="failed"
+        [ -n "$RECORD_OK" ] && record_state="ok"
+        [ -n "$LISTING_OK" ] || record_state="not written"
+        save_state="ok"
+        [ -n "$SAVE_OK" ] || save_state="refused by the trash"
+        echo "Heartbeat: cycle not ok (pull rc=$pull_rc, saved files $save_state, listing $listing_state, push rc=$push_rc, record $record_state)"
+    fi
+    mkdir -p "$(dirname "$HEARTBEAT")"
+    rm -f -- "$HEARTBEAT.tmp"
+    if printf '{"last_run": "%s", "last_ok": "%s", "held": %d}\n' "$now" "$last_ok" "${held:-0}" > "$HEARTBEAT.tmp" \
+        && mv -fT -- "$HEARTBEAT.tmp" "$HEARTBEAT"; then
+        :
+    else
+        rm -f -- "$HEARTBEAT.tmp"
+        echo "WARNING: could not write the heartbeat ($HEARTBEAT)"
     fi
 
     echo "--- done ---"

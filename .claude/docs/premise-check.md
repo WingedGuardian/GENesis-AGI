@@ -21,6 +21,75 @@ Every plan and every issue that specifies work answers six questions:
 
 The answers belong in the plan or issue body, not in a reviewer's first round.
 
+**The format, in a plan:** one section, numbered to match the questions. `n/a — <reason>`
+is an answer; a bare `n/a` is not.
+
+```markdown
+## Premise checks
+1. <outside-behaviour claims: measured or cited>
+2. <what was searched, and what was found>
+3. <scope limits, and the shared code they leave reachable>
+4. <the caller, and its tracker or why there is none>
+5. <how each number was measured>
+6. <expected counted lines, and the split or Shape: reason>
+```
+
+`## Premise questions` is accepted as the heading too. A plan that names a
+repo-relative path (`src/`, `scripts/`, `tests/`, `.claude/`, `docs/`, `config/`,
+`.github/`) outside code blocks counts as specifying work, and the ExitPlanMode hook
+`scripts/hooks/plan_premise_gate.py` blocks it while the section is missing or an
+answer is empty. That is all it checks: whether an answer is true stays the
+reviewer's question.
+
+**On an issue,** the same parser applies, through the premise gate Action
+(`scripts/premise_gate.py`). An issue without its answers carries the
+`premises-missing` label until it has them. Issues opened before the gate, and bug
+reports filed through the bug-report form, are not newly labelled.
+
+**Before it is filed,** a foreground session's `gh issue create` is checked against
+that same rule: the PreToolUse hook `scripts/hooks/issue_premise_gate.py` blocks a
+create whose body would be labelled, and names the missing answers. It judges only
+a body it can read in full (a `--body` literal with no `$` or backtick, a
+`--body-file` that no earlier step can have written, or the heredoc in
+`-F - <<'EOF'`). Earlier steps are trusted only from a closed list of programs
+that cannot write a file (`cd`, `echo`, `grep`, `true`, `test`, `[`), run directly,
+in a command with no `<(`, no `tee` and no `>` anywhere except the whole tokens
+`2>&1` and `2>/dev/null`; a relative path after a
+`cd` is never read.
+bound for the configured public repo, and passes everything else.
+Dispatched sessions are never blocked.
+
+**A bug report answers different questions.** Its question is whether the bug is
+real, not how to build a change, so an issue labelled `bug` carries a
+`## Verification` section instead, with five numbered answers:
+
+```markdown
+## Verification
+1. <reproduced: how, and on which commit (a fresh main, not a stale checkout)>
+2. <evidence: the exact command and its output>
+3. <reporter-side causes ruled out: misuse, local config, a stale tree, credentials>
+4. <searched: no existing issue, and no fix already on main>
+5. <expected vs actual>
+```
+
+**`devin-ready` always needs the six premise answers,** bug or not, because Devin
+builds a change. Applying it to an issue without them removes it again, with an
+`(aside)` comment naming the missing answers, because that label starts a paid
+Devin session. Devin's own integration watches the label, so a session it has
+already started is not stopped; the label is the visible control. The check runs
+when the label is applied: editing the answers out later leaves `devin-ready` in
+place. `premises-missing` always means the issue's OWN section is incomplete (the
+Verification for a bug report), so a verified bug report that lacks the six loses
+`devin-ready` and gets the comment, but not that label.
+
+**Check before applying the label.** The Action acts only after the label event,
+and on a busy runner queue that can be minutes after Devin has started. So a
+session runs `python3 scripts/premise_gate.py check <issue>` first, and applies
+`devin-ready` only when it exits 0. Exit 1 lists the missing answers: fix the
+issue, never apply the label over them. Exit 2 means the issue could not be read,
+which is not a pass. On a `bug` issue it also lists missing Verification answers;
+those do not change the exit code, because only the six decide the label.
+
 ## Why it exists
 
 Review rounds accumulate for two reasons that the round COUNT cannot tell apart.
@@ -125,14 +194,50 @@ absolute. Being a rework is not itself a reason to stay unsplit.
 ## The output
 
 ```
-Design-premise: [SOUND / SOUND-BUT-INFERIOR / BROKEN]
+Design-premise: <SOUND | SOUND-BUT-INFERIOR | BROKEN>[ — <qualifier>]
 Expected before checking: <one line>
-  P1 <claim> — TRUE/FALSE/UNPROVEN · <evidence> · <confidence>% · falsified by <x>
-  P2 …
+P1 <TRUE | FALSE | UNPROVEN> — <claim> · <evidence> · <confidence>% · falsified by <x>
+P2 <TRUE | FALSE | UNPROVEN> — …
 Effect: <what the caller does differently — or "nothing", which is the finding>
 Better shape: <none found | the alternative, named>
 PR-shape: <OK (N counted lines, band, one concern) | SPLIT — PR1 <concern>, PR2 <concern> …, in dependency order>
 ```
+
+**This block is read by code, so write it exactly.** A round reflection cites the
+output as `Premise-evidence:`, and `scripts/review_reflection.py` reads the block to
+check that the reflection restates what you concluded. The rules:
+
+- The `Design-premise:` line starts at column 0, as plain text, with one verdict
+  word. A qualifier follows a dash: `SOUND — UNPROVEN(2)`. Any other line at
+  column 0 that starts with `Design-premise:` (in any case, with a space for the
+  hyphen, or in bold) makes the whole output refused, and so does a heading or
+  list item labelled `Design-premise:` that carries an uppercase `SOUND` or
+  `BROKEN` (`## Design-premise: BROKEN`). So never write
+  `Design-premise: SOUND (80%)`, or a bold or bulleted one, in a summary. A
+  heading that only names the section, or asks a question in lowercase, is fine.
+- Each claim line puts its verdict FIRST, right after its number, then a dash
+  and the claim: `P1 TRUE — …`. A short qualifier may follow the verdict in
+  parentheses (`P3 FALSE (partially) — …`); the verdict word is still the one read.
+  A claim line with its verdict at the end is refused.
+- The `Expected before checking:` line is required: one line, directly under the
+  verdict line. If you restate your block in a summary, the Expected line may sit
+  in either one, as long as that block also has claim lines. The claim lines follow it. One line per claim: do not wrap a claim
+  line.
+- The block is closed. From the verdict line to the next blank line, every line
+  must be one of the block's lines: the verdict, the Expected line, the claims,
+  then `Effect:`, `Better shape:`, `PR-shape:` and `Persisted-state:` (one line
+  each), or a code-fence line. Anything else there refuses the whole output, naming its line, so leave a
+  blank line before any other text, and put a blank line above the verdict line:
+  the block begins there. Outside the block, only the `Design-premise:` rules in
+  the first bullet apply; claims, Expected lines and other text there are not read.
+- Plain text only: no bullets, bold or tables inside the block. Prose around it is
+  fine, and so is a code fence around the whole block.
+- One block per output. If you quote an example or an earlier check, indent its
+  `Design-premise:` line or prefix every line with `>`, so it is not read as
+  yours, and leave a blank line between your block and the quote. A summary may
+  restate your verdict and any of your claims with the same verdicts; it may
+  never add a claim or change a verdict. A re-check is written to a new file,
+  never appended to the old one.
 
 ### Resolving the verdict — the cases that are otherwise undecidable
 
@@ -189,7 +294,7 @@ misreading from a real complication. So the spec is decision-complete:
 - **Acceptance:** what the reviewer will check first.
 - **Contract:** the builder acknowledges the spec on the OLD PR before
   building, and each replacement PR carries a `## Rework` section
-  (genesis-development, "Building a rework"). Say so in the spec.
+  (build-session, "Building a rework"). Say so in the spec.
 - **Follow-up:** the spec's last line, `Follow-up: <id>`, naming the follow-up
   the closing session opened before posting it. The builder copies
   it into the replacement that merges into main last.
@@ -205,7 +310,7 @@ the deciding question in the most fail-closed way, and three of round 1's six
 findings landed in machinery that answer produced. The premise was right, and the
 spec still allowed the failure.
 
-The builder's side of the contract (genesis-development, "Building a rework")
+The builder's side of the contract (build-session, "Building a rework")
 is an acknowledgement on the old PR before building, then a rework section in
 each new PR's body. The section reports against this spec: its split position,
 each deviation with its reason, and each delegated question with its answer.
@@ -216,14 +321,17 @@ Unforeseen complications are expected, and the section is where they are stated.
 The output is a **judgment about direction**, handed to whoever owns the change. It
 is not permission to rewrite it, not a substitute for the code review (run this
 first, then review the code if the premises hold), and not a reason to close
-anything — a reviewer session retires nothing.
+anything — a reviewer session retires nothing. A premise that fails because
+the code cannot land, while the problem it solves is still wanted, keeps the
+PR open and routes it as below; only a dead problem closes a PR
+(closing-session, "Superseded is about the problem").
 
 **BROKEN routes through the ESTABLISHED disposition, not a new one — and the bar
 is HIGH.** The repo already has a route for a change that is wrong at the premise
 or structurally superseded, and it is NOT "hand it to a builder": it is a
 foreground ARCHITECTURE conversation with the user, and where no user is present,
 the `needs-architecture-session` label, the PR moved to draft, and a `ready`
-follow-up naming the PR and the decision it awaits (a dispatched session's follow-up lands in the `tabled` lane; the intake gap is tracked in #2857). See the genesis-development skill, "Some PRs are not a
+follow-up naming the PR and the decision it awaits (a dispatched session's follow-up lands in the `tabled` lane; the intake gap is tracked in #2857). See the closing-session skill, "Some PRs are not a
 review problem". This check produces the EVIDENCE for that conversation; it does
 not invent a parallel path around it, and a session that reads "hand back" as
 "dispatch a builder and move on" has skipped the decision the label exists to
@@ -238,9 +346,7 @@ exception: a Devin-built PR is audited before further rounds are spent, and a
 SOUND-BUT-INFERIOR verdict with a better shape that changes the mechanism or the
 files touched IS kicked back to Devin. See the closing-session skill, "Devin-built PRs".)
 
-**The evidence bar is TWO OR MORE independent signals**, the same bar the
-round-2 gate message states, because a doc that set a lower one would be the
-easier surface to read and would quietly undercut it. The signals: findings
+**The evidence bar is TWO OR MORE independent signals.** The signals: findings
 CONCENTRATING in one file or function; a finding landing on a line THIS change
 added in an earlier round; the diff GROWING across rounds instead of shrinking.
 One alone is an ordinary local defect wearing an architectural shape — findings

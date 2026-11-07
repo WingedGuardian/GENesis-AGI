@@ -1,77 +1,74 @@
 # Transcript analytics
 
-This optional local CLI collects Claude Code JSONL from projects under
-`~/.claude/projects`, including subagents, into
-`~/.genesis/analytics/transcripts`. Workflow journals are excluded from analysis.
-The running Genesis database is not involved. Codex sessions are outside v1.
-Collection defaults to disabled. Enable deliberately in the private
-`~/.genesis/config/transcript_analytics.local.yaml` overlay:
+The optional local CLI collects Claude Code project and subagent JSONL from
+`$CLAUDE_HOME/projects` into `$GENESIS_HOME/analytics/transcripts` (defaulting to
+`~/.claude/projects` and `~/.genesis/analytics/transcripts`). Codex logs are outside
+v1. It uses the optional `transcript-analytics` package extra and systemd user
+scopes; the running Genesis database is not involved.
+
+The shipped `config/transcript_analytics.yaml` defaults to disabled. Opt in through
+the existing private `~/.genesis/config/transcript_analytics.local.yaml` overlay:
 
 ```yaml
 enabled: true
-# Optional measured override; otherwise 25% of effective memory capacity.
-# ram_bytes: 3221225472
 ```
 
-The canonical `config/transcript_analytics.yaml` must remain installed.
-`GENESIS_TRANSCRIPT_ANALYTICS_DISABLED=1` or a `DISABLED` file in the configured
-data directory stops collection without rewriting the persistent opt-in.
-The environment kill switch preserves configured paths and resource settings;
-the canonical configuration and private overlay must still validate. Unknown keys
-are refused, including when the environment kill switch is set.
-Resource admission can defer work with exit75; unavailable enforcement exits69.
-Explicit RAM caps must meet the shared 16 MiB launcher minimum. A percentage
-that computes a smaller cap is refused with exit69 rather than increased.
-CPU caps are floored to hundredths of a percent of one CPU, never increased.
-A computed cap below 0.1% of one CPU is refused with exit69; caps below1%
-use a one-second quota period to respect systemd's one-millisecond minimum.
-Worker startup still requires confirmation within30 seconds. Very small caps
-can enforce correctly yet return unavailable if startup exceeds that deadline.
-This startup minimum does not guarantee that a given analytics workload fits.
-Heavy commands require an enforced, registered systemd scope with a one-hour
-runtime limit. Uncapped launches are refused. First cancellation requests
-cooperative shutdown; a second cancellation forcibly stops the owned scope.
-Admission rereads configuration while holding its lease before spawning work.
+The canonical configuration must remain installed even with a private opt-in.
+Explicit `projects_dir` and `data_dir` settings, including explicit tilde paths,
+override these defaults. The existing private overlay location above is unchanged.
+Defaults cap each admitted command at 25% of effective memory and CPU capacity;
+`ram_bytes`, `ram_pct` and `cpu_pct` provide explicit overrides. Admission can defer
+work with exit 75. Unavailable resource enforcement refuses a launch with exit 69.
+Very small CPU caps can exceed the existing 30-second startup deadline.
 
-Install the pinned `transcript-analytics` extra in the development environment
-before using the CLI. Timer installation and activation arrive in the dependent
-installer change; this change does not install scheduled collection.
+With the optional extra available, manual use follows the existing CLI:
 
 ```bash
 python -m genesis transcripts status
-python -m genesis transcripts ingest --since 14
-python -m genesis transcripts derive
-python -m genesis transcripts sql 'SELECT error_class,count(*) FROM tool_calls GROUP BY error_class' --csv
+python -m genesis transcripts ingest
+python -m genesis transcripts sql 'SELECT tool,count(*) FROM tool_calls GROUP BY tool' --live --csv
 python -m genesis transcripts verify
-python -m genesis transcripts prune --before 2025-01-01
 ```
 
-`ingest` derives a snapshot unless `--no-derive` is supplied. After skipping,
-run `derive`. `derive --if-stale` checks freshness under the same writer lock
-used for publication. SQL normally uses the compatible published snapshot,
-including a stale snapshot, and discloses freshness, coverage and collection
-gaps on stderr. `--live` reconstructs views from compatible source tables and
-exposes `raw_<table>` views. Incompatible retained sources remain on disk but
-are excluded from those views. Human-readable SQL escapes terminal control
-characters in values and column names; CSV preserves machine-readable values.
-The display limits `--max-rows` and `--cell-width` require nonnegative integers;
-zero remains valid.
+`ingest` refreshes source records and derives a disposable snapshot unless
+`--no-derive` is supplied. `derive` builds it separately. Cached SQL uses only a
+compatible, current snapshot; a stale, missing or unreadable cache falls back to
+live views over the same captured source selection. `verify` requires an available
+current cache and compares schemas, counts and row digests with forced live views.
+Excluded sources keep verification incomplete.
 
-`sql --manifest PATH --window LABEL --baseline COMMIT` writes private atomic
-JSON provenance. The window is a label; apply the actual filter in SQL.
-Accepted source identities remain selected across renames until explicit
-pruning. Retention and matching UUIDs do not establish ownership: executor,
-delegation and context views keep unresolved attribution and explicit coverage
-denominators. See [attribution](transcript-analytics-attribution.md).
+Plain `sql` sees the derived views only, whether or not the cache is current; use
+`sql --live` for the raw tables and reconciliation intermediates. A query's
+`--window` is a provenance label; filter timestamps in SQL for an actual analysis
+window. `--since` selects source files during ingestion
+and does not filter the records returned by SQL. Use a distinct `--manifest PATH`
+for each query so later queries do not overwrite earlier evidence.
 
-`verify` compares ordered column names, logical types, sorted rows and hashes
-across snapshot and live views, including empty views. It
-closes the snapshot engine before opening the live engine, retaining the writer
-and publication locks and the same selected catalog across both phases.
-It checks internal consistency; independent parser fixtures specify expected
-deduplication, error classes and final token usage. Schema5 and views version16
-require re-extraction or rebuilding when older material is incompatible.
-Evidence retrieval and encrypted backup/recovery arrive in dependent changes.
+`sql --max-rows N` bounds the retained preview, while the footer and manifest
+still count the complete result. The command drains the query once, so expensive
+SQL can still reach its resource or runtime limit. CSV streams every row using
+the existing CSV format; an interrupted export may leave partial output and
+exits with an error without publishing a new success manifest. Status reads only
+confined snapshot metadata; use `verify` for complete cache/live validation.
+Status reports individual source stat/fingerprint failures in `source_errors`
+and continues inspecting the remaining sources.
+
+`GENESIS_TRANSCRIPT_ANALYTICS_DISABLED=1` or a `DISABLED` file in the configured
+data directory blocks analytics commands while retaining saved opt-in. Status
+reports disabled; timer invocations skip without failing. First cancellation asks
+for cooperative shutdown; a second cancellation forcibly stops the owned scope.
+Wait for supervised commands and their scopes to finish before destructive
+uninstallation. The separate installer/retirement rollout is required before
+unattended hourly collection; this CLI does not activate scheduling.
+
+Accepted revisions remain until explicit maintenance. Stop readers before pruning.
+Historical adapters retain original provenance and mark unavailable facts unknown.
+Paired tool results keep their raw child IDs searchable, but those IDs alone cannot
+establish or contradict an agent relationship because their independent result
+context was not retained. Independent companion and scoped unpaired-result proof
+remain eligible; unsupported relationships stay unknown.
+See the [store and reader contract](../../src/genesis/transcript_analytics/README.md)
+for source selection, retention, reconciliation and snapshot details.
 
 Normal bootstrap/install installs the optional analytics extra only when persistent
 configuration opts in. Invalid configuration or missing DuckDB/PyArrow leaves the

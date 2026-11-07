@@ -2064,7 +2064,7 @@ def test_the_real_script_survives_a_worktree_name_that_is_not_utf8(tmp_path):
         text=True,
         errors="replace",
         env=env,
-        timeout=600,
+        timeout=300,  # below the 600 s per-test timeout, so this fires first
     )
     assert proc.returncode == 0, proc.stderr[-2000:]
     assert "TRASH" in proc.stdout, proc.stdout[-2000:]
@@ -3556,7 +3556,7 @@ def test_a_reap_whose_first_metadata_write_fails_changes_nothing(
     monkeypatch.setattr(wl, "_atomic_write_text", _full_disk)
     assert wl._trash_worktree(_wt_by_path(reaper_repo.repo, wt), reaper_repo.repo) is False
     assert wt.is_dir() and (wt / "a.txt").exists()
-    left = [p.name for p in trash.iterdir() if p.name != "logs"]
+    left = [p.name for p in trash.iterdir() if p.name not in ("logs", wl.LIFECYCLE_LOCK_NAME)]
     assert left == [], f"a failed reap left {left} in the trash (a claimed name or a staging file)"
 
 

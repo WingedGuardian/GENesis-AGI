@@ -76,27 +76,109 @@ def parse_hook_block(text: str) -> dict | None:
 
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _INTERPRETERS = ("bash", "sh", "python3", "python", "node")
+_SHELL_SYNTAX = frozenset("'\"\\`;&|<>()")
+_SCRIPT_EXPANSION = frozenset("$*?{}[]")
+
+
+# GNU env options that take a value: as the next token, attached to a short
+# option (``-uNAME``) or after ``=`` on a long one (``--unset=NAME``).
+_ENV_VALUE_SHORT = frozenset("uC")
+_ENV_VALUE_LONG = ("--unset", "--chdir")
+_ENV_SPLIT_LONG = "--split-string"
+_QUOTES = "'\""
+
+
+def _strip_quotes(tokens: list[str]) -> list[str]:
+    return [tok.strip(_QUOTES) for tok in tokens if tok.strip(_QUOTES)]
+
+
+def _skip_env_options(tokens: list[str]) -> list[str]:
+    """The tokens after ``env``'s own options (``tokens[0]`` is ``env``).
+
+    ``-S``/``--split-string`` carries the command itself, so its value is kept
+    as the following tokens (with the quoting that grouped it removed) and
+    option parsing continues inside it, as env does.
+    """
+    rest = tokens[1:]
+    while rest:
+        tok = rest[0]
+        if tok == "--":
+            return rest[1:]
+        if not tok.startswith("-"):
+            return rest
+        if tok == "-":  # same as -i
+            rest = rest[1:]
+            continue
+        if tok.startswith("--"):
+            name, eq, value = tok.partition("=")
+            if name == _ENV_SPLIT_LONG:
+                split = [value] if eq else []
+                rest = _strip_quotes(split + rest[1:])
+            elif name in _ENV_VALUE_LONG and not eq:
+                rest = rest[2:]
+            else:
+                rest = rest[1:]
+            continue
+        # A cluster of short options, e.g. ``-iu NAME`` or ``-S'cmd arg'``.
+        rest = rest[1:]
+        for i, ch in enumerate(tok[1:], start=1):
+            attached = tok[i + 1 :]
+            if ch == "S":
+                rest = _strip_quotes(([attached] if attached else []) + rest)
+                break
+            if ch in _ENV_VALUE_SHORT:
+                if not attached:
+                    rest = rest[1:]
+                break
+    return rest
 
 
 def _hook_script(command: str) -> str:
-    """Name of the hook script, never an argument value.
+    """Literal command target or option-free interpreter script, never an option.
 
-    Leading ``NAME=value`` assignments and ``env`` are skipped: the first token
-    of ``GH_TOKEN=… guard.sh`` is a credential, not the script (review SF-1).
+    Leading ``NAME=value`` assignments and ``env`` with its options are
+    skipped: the first token of ``GH_TOKEN=… guard.sh`` is a credential, and
+    in ``env -u GH_TOKEN guard.sh`` it is an option, not the script (review
+    SF-1). Unsupported interpreter options and ambiguous shell syntax are unknown;
+    the separately retained command remains available for analysis.
     """
     tokens = command.split()
-    while tokens and (tokens[0] == "env" or _ENV_ASSIGN.match(tokens[0])):
-        tokens = tokens[1:]
+    while tokens:
+        if tokens[0].rsplit("/", 1)[-1] == "env":
+            tokens = _skip_env_options(tokens)
+        elif _ENV_ASSIGN.match(tokens[0]):
+            tokens = tokens[1:]
+        else:
+            break
     if not tokens:
         return "<empty>"
-    if "-c" in tokens[:2] and tokens[0] in ("bash", "sh"):
+    program = tokens[0].rsplit("/", 1)[-1]
+    if len(tokens) > 1 and tokens[1] == "-c" and program in ("bash", "sh"):
         return "<inline>"
-    for i, tok in enumerate(tokens):
-        if tok.endswith("genesis-hook") and i + 1 < len(tokens):
-            return tokens[i + 1].rsplit("/", 1)[-1]
-    # First token that looks like a script path, skipping an interpreter.
-    start = 1 if tokens[0] in _INTERPRETERS and len(tokens) > 1 else 0
-    return tokens[start].rsplit("/", 1)[-1]
+    operands = iter(tokens[1:] if program in _INTERPRETERS else tokens)
+    script = next(operands, "")
+    # Dispatch only a command target, never a genesis-hook mentioned in arguments.
+    if script.rsplit("/", 1)[-1] == "genesis-hook":
+        script = next(operands, "")
+    if not script or script.startswith("-"):
+        return "<unknown>"
+    if not _SHELL_SYNTAX.isdisjoint(" ".join(tokens)):
+        return "<unknown>"
+    if not _SCRIPT_EXPANSION.isdisjoint(script):
+        return "<unknown>"
+    return script.rsplit("/", 1)[-1] or "<unknown>"
+
+
+def _is_error_value(value) -> bool:
+    """A string error, or a JSON-RPC error object (integer ``code``, string ``message``)."""
+    if isinstance(value, str):
+        return True
+    return (
+        isinstance(value, dict)
+        and isinstance(value.get("code"), int)
+        and not isinstance(value.get("code"), bool)
+        and isinstance(value.get("message"), str)
+    )
 
 
 def classify(
@@ -121,7 +203,7 @@ def classify(
         error_object = json.loads(full)
     except (ValueError, RecursionError):
         error_object = None
-    structural_error = isinstance(error_object, dict) and isinstance(error_object.get("error"), str)
+    structural_error = isinstance(error_object, dict) and _is_error_value(error_object.get("error"))
     if is_error is True:
         if is_hook:
             return "hook_block", "flag"

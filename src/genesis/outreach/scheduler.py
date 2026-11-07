@@ -132,6 +132,19 @@ class OutreachScheduler:
             id="outreach_ambient_health",
             replace_existing=True,
         )
+        # Stopped background sessions — at most one page an hour. Cron, not an
+        # interval (an interval resets on restart); state is per row, so a
+        # coalesced or missed fire neither skips nor repeats a stop.
+        self._scheduler.add_job(
+            self._stopped_sessions_job,
+            "cron",
+            minute=5,
+            timezone=tz,
+            id="outreach_stopped_sessions",
+            replace_existing=True,
+            coalesce=True,
+            misfire_grace_time=3000,
+        )
         self._scheduler.start()
         logger.info(
             "OutreachScheduler started (morning=%s:%s %s, engagement=%dm, health=30m, drain=5m, critical_obs=5m)",
@@ -509,6 +522,23 @@ class OutreachScheduler:
             logger.exception("Critical observations outreach job failed")
             await self._record_job_result("critical_observations", error=str(exc), exc=exc)
 
+    async def _stopped_sessions_job(self) -> None:
+        """Page the owner once about background sessions that stopped.
+
+        Runs even when paused, like the critical-observations job: it reports,
+        it never dispatches. See ``outreach.stopped_sessions``.
+        """
+        try:
+            from genesis.outreach.stopped_sessions import run_page
+
+            paged = await run_page(self._db, self._pipeline)
+            if paged:
+                logger.info("Stopped-session page sent (%d stop(s))", paged)
+            await self._record_job_result("stopped_sessions")
+        except Exception as exc:
+            logger.exception("Stopped-session page job failed")
+            await self._record_job_result("stopped_sessions", error=str(exc), exc=exc)
+
     async def _ambient_health_job(self) -> None:
         """Alert when the edge ambient-capture bridge goes dark or regresses.
 
@@ -760,6 +790,7 @@ class OutreachScheduler:
                     req = OutreachRequest(
                         category=cat,
                         topic=row["message"][:100],
+                        email_subject=row.get("email_subject"),
                         context=row["message"],
                         salience_score=0.7,
                         signal_type="pending_queue",
@@ -779,7 +810,12 @@ class OutreachScheduler:
                         # the LLM drafter must never re-word a stored message.
                         verbatim=True,
                     )
-                    if row.get("urgency") == "high":
+                    if channel == "agent":
+                        from genesis.peers.outbox import PeerEnvelope
+
+                        # Typed identity, never message-prefix dedup or urgent bypass.
+                        req = PeerEnvelope.decode(row["message"]).request(defer_retry=False)
+                    if row.get("urgency") == "high" and channel != "agent":
                         result = await self._pipeline.submit_urgent(req)
                     else:
                         result = await self._pipeline.submit(req)
@@ -790,11 +826,26 @@ class OutreachScheduler:
                     # IGNORED = the pipeline deliberately dropped it (self-send /
                     # no recipient). Anything else (REJECTED via quiet_hours,
                     # FAILED) is transient and retried next cycle.
-                    if result.status in (
-                        OutreachStatus.DELIVERED,
-                        OutreachStatus.ENGAGED,
-                        OutreachStatus.HELD,
-                        OutreachStatus.IGNORED,
+                    # As in deferred recovery, exact agent-history dedup means
+                    # the retained message was already delivered; close its queue row.
+                    agent_duplicate = (
+                        channel == "agent"
+                        and result.status == OutreachStatus.REJECTED
+                        and result.governance_result
+                        and any(
+                            check.startswith("dedup")
+                            for check in result.governance_result.checks_failed
+                        )
+                    )
+                    if (
+                        result.status
+                        in (
+                            OutreachStatus.DELIVERED,
+                            OutreachStatus.ENGAGED,
+                            OutreachStatus.HELD,
+                            OutreachStatus.IGNORED,
+                        )
+                        or agent_duplicate
                     ):
                         delivered_at = datetime.now(UTC).isoformat()
                         await self._mark_row_delivered(row, delivered_at)

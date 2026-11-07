@@ -5,8 +5,8 @@ and retries via ``OutreachPipeline.submit_raw()``. Exponential backoff
 (1m → 5m → 15m → 1h → 1h), max 5 retries. Creates an observation after
 exhausting all retries so the failure is visible in the health system.
 
-Scoped to outreach only — NOT reflections, morning reports, or memory ops.
-Those have different failure semantics and higher false-positive risk.
+Scoped to queued outreach deliveries, including morning reports; not
+reflection or memory work.
 """
 
 from __future__ import annotations
@@ -139,9 +139,14 @@ class OutreachRecoveryWorker:
             request = OutreachRequest(
                 category=category,
                 topic=payload.get("topic", ""),
+                # The subject the original send resolved (and the owner saw).
+                email_subject=payload.get("email_subject"),
                 context="",  # Original context not stored — delivery is pre-formatted
                 salience_score=0.9,
-                signal_type="deferred_retry",
+                signal_type=(
+                    "morning_report" if payload.get("signal_type") == "morning_report"
+                    else "deferred_retry"
+                ),
                 channel=payload.get("channel"),
                 # Preserve origin-targeted telegram delivery across the retry so a
                 # once-failed background result still reaches its exact origin thread.
@@ -159,9 +164,30 @@ class OutreachRecoveryWorker:
                 await self._queue.mark_discarded(item_id, "Empty content")
                 return
 
-            result = await self._pipeline.submit_raw(content, request)
+            if payload.get("channel") == "agent":
+                from genesis.peers.outbox import PeerEnvelope
 
-            if result.status == OutreachStatus.DELIVERED:
+                request = PeerEnvelope.decode(payload["peer_envelope"]).request(defer_retry=False)
+                result = await self._pipeline.submit(request)
+            else:
+                result = await self._pipeline.submit_raw(content, request)
+
+            if (
+                payload.get("channel") == "agent"
+                and result.status == OutreachStatus.REJECTED
+                and not (
+                    result.governance_result
+                    and any(
+                        check.startswith("dedup")
+                        for check in result.governance_result.checks_failed
+                    )
+                )
+            ):
+                # Full peer governance can refuse temporarily; ordinary raw
+                # recovery's REJECTED-as-delivered-dedup contract stays below.
+                await self._queue.reset_to_pending(item_id)
+                logger.info("Peer outreach retry temporarily governed: %s", item_id)
+            elif result.status == OutreachStatus.DELIVERED:
                 await self._queue.mark_completed(item_id)
                 logger.info(
                     "Outreach recovery: delivered %s on attempt %d",

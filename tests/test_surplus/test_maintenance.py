@@ -112,6 +112,7 @@ class TestBackupVerification:
             "sqlite_lines": 300000,
             "qdrant_collections": 2,
             "secrets_encrypted": True,
+            "payment_vault": "ok",
         }
         (genesis_dir / "backup_status.json").write_text(json.dumps(status))
 
@@ -121,6 +122,7 @@ class TestBackupVerification:
         assert result.insights[0]["backup_stale"] is False
         assert "OK" in result.content
         assert "300,000" in result.content  # sqlite_lines formatted
+        assert "Payment vault: ok" in result.content
 
     @pytest.mark.asyncio
     async def test_stale_backup(self, tmp_path, monkeypatch):

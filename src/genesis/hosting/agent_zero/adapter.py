@@ -101,13 +101,15 @@ class AgentZeroAdapter:
         # /api mutation auth gate — MUST be applied wherever the dashboard/outreach
         # blueprints are mounted, or setting DASHBOARD_PASSWORD would leave /api
         # mutations unauthenticated in Agent Zero hosting mode (the blueprint auth
-        # hook exempts /api/*). Idempotent.
+        # hook exempts /api/*). The Host-header gate is registered first; it is
+        # scoped to Genesis-owned paths, so AZ's own routes are untouched.
+        # Idempotent.
         try:
-            from genesis.dashboard.auth import apply_api_mutation_gate
+            from genesis.dashboard.auth import apply_dashboard_gates
 
-            apply_api_mutation_gate(app)
+            apply_dashboard_gates(app)
         except Exception:
-            logger.exception("Failed to apply /api mutation auth gate")
+            logger.exception("Failed to apply dashboard auth gates")
 
     def register_overlay(self, app: Flask) -> None:
         """Register AZ-specific UI overlay (skip in standalone mode).

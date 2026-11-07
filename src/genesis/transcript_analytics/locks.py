@@ -1,23 +1,26 @@
-"""Cross-process lock order: writer, then snapshot publication."""
+"""The single writer lock. Readers take no lock: a per-source record is always
+either the old directory or the new one — never a mix — because records publish
+through an atomic ``current`` symlink swap (see ``store``)."""
 
 import contextlib
 import fcntl
+from pathlib import Path
 
 from genesis.env import genesis_home
 
-PUBLICATION_LOCK = genesis_home() / "locks/transcript-analytics-publication.lock"
+DEFAULT_LOCK = genesis_home() / "locks" / "transcript-analytics.lock"
 
 
-def restore_epoch():
-    try:
-        return (PUBLICATION_LOCK.parent / "transcript-analytics-restore-epoch").read_text()
-    except FileNotFoundError:
-        return None
+class Busy(RuntimeError):
+    """Another ingest/prune holds the lock."""
 
 
 @contextlib.contextmanager
-def publication(*, exclusive=False):
-    PUBLICATION_LOCK.parent.mkdir(parents=True, exist_ok=True)
-    with PUBLICATION_LOCK.open("a") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+def writer(lock_path: Path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a") as fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as e:
+            raise Busy(str(lock_path)) from e
         yield

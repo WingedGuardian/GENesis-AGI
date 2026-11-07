@@ -67,23 +67,31 @@ def test_backup_alert_fires_from_exit_trap():
     assert on_exit.count("|| true") >= 3  # alert / write_status / backend_cleanup
 
 
-def test_backup_sql_tmp_trap_cleaned():
-    """N2: the plaintext SQL dump temp is removed in the EXIT trap, guarded for
-    the not-yet-assigned case."""
+def test_backup_sql_dump_has_no_plaintext_file():
+    """N2: the SQL dump streams straight into encryption, so there is no
+    plaintext dump file for the EXIT trap to miss; the line-count temp it does
+    create is trap-cleaned, guarded for the not-yet-assigned case."""
     text = _BACKUP.read_text()
+    assert ".dump >" not in text  # the dump is never redirected into a file
+    assert "| encrypt_stream" in text
     on_exit = text.split("_on_exit()", 1)[1].split("trap _on_exit", 1)[0]
-    assert 'rm -f "${_SQL_TMP:-}"' in on_exit
-    assert '_SQL_TMP=""' in text  # initialized before the trap can fire
+    assert 'rm -f "${_SQL_COUNT:-}"' in on_exit
+    assert '_SQL_COUNT=""' in text  # initialized before the trap can fire
 
 
 def test_restore_offsite_pull_warns_on_failure():
-    """SF6: the qdrant/transcripts pull uses process-substitution + warn (not the
-    silent `list | while | done || true`)."""
+    """Selected Qdrant and legacy transcript pulls retain failure warnings."""
     text = _RESTORE.read_text()
-    seg = text.split("for sub in qdrant transcripts", 1)[1].split("_pull_from_offsite", 1)[0]
-    assert 'warn "off-site: failed to pull $sub/$fname' in seg
-    assert "done < <(backend_list" in seg  # process substitution, runs in THIS shell
-    assert "| while read -r fname; do" not in seg  # the old subshell form is gone
+    pull = text.split("_pull_from_offsite() {", 1)[1].split("\nif $_EXPLICIT_LOCAL_SOURCE;", 1)[0]
+    component = pull.split("_selected_pull_component() {", 1)[1].split(
+        '    marker="$_RESTORE_WORKSPACE/COMPLETE"', 1
+    )[0]
+    assert 'else warn "off-site: failed to pull $remote/$name from selected snapshot"' in component
+    assert 'done <<<"$entries"' in component
+    assert "| while read -r" not in component
+    assert "_selected_pull_component qdrant data/qdrant" in pull
+    legacy = pull.split('elif [ "$transcript_mode" = legacy ]; then', 1)[1].split("\n    fi", 1)[0]
+    assert "_selected_pull_component transcripts transcripts" in legacy
 
 
 def test_restore_sets_umask_before_writes():
@@ -123,6 +131,7 @@ def restore_sandbox(tmp_path):
     backup = tmp_path / "backup"
     backup.mkdir()
     env = dict(os.environ)
+    env.pop("SECRETS_PATH", None)  # GENESIS_DIR names the secrets file, as on CI
     env.update(
         HOME=str(home),
         GENESIS_DIR=str(home / "genesis"),

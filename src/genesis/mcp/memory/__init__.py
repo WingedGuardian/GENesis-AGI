@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -63,6 +64,7 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP("genesis-memory")
 
 _PLAN_BOOKMARK_PENDING = Path.home() / ".genesis" / "plan_bookmark_pending.json"
+_process_pending_bookmarks = True
 
 
 def init(
@@ -78,8 +80,12 @@ def init(
     rerank_breaker: CircuitBreaker | None = None,
     # Backward compat — old callers pass ``embedding_provider``
     embedding_provider: EmbeddingProvider | None = None,
+    process_pending_bookmarks: bool = True,
 ) -> None:
     """Initialize memory MCP with live dependencies.
+
+    External clients set ``process_pending_bookmarks=False``: their tool calls
+    must not consume another client's pending Claude session bookmark.
 
     Accepts split embedding providers: ``storage_embedding_provider`` for
     writes (MemoryStore) and ``recall_embedding_provider`` for reads
@@ -108,6 +114,8 @@ def init(
         raise TypeError(msg)
 
     global _store, _retriever, _user_model_evolver, _db, _qdrant, _bookmark_mgr  # noqa: PLW0603
+    global _process_pending_bookmarks  # noqa: PLW0603
+    _process_pending_bookmarks = process_pending_bookmarks
     _db = db
     _qdrant = qdrant_client
     linker = MemoryLinker(qdrant_client=qdrant_client, db=db)
@@ -152,13 +160,16 @@ def _require_init() -> None:
     if _store is None or _retriever is None or _db is None:
         raise RuntimeError("memory-mcp not initialized — call init() first")
 
-    if _PLAN_BOOKMARK_PENDING.exists():
-        from genesis.util.tasks import tracked_task
+    if _process_pending_bookmarks and _PLAN_BOOKMARK_PENDING.exists():
+        from genesis.db.request_database import DatabaseScopeError, spawn_database_task
 
-        tracked_task(
-            _process_plan_bookmark_pending(_bookmark_mgr, _resolve_session_id),
-            name="plan-bookmark-pending",
-        )
+        # The marker is consumed only by an accepted job; retry next call.
+        with suppress(DatabaseScopeError):
+            spawn_database_task(
+                _db,
+                _process_plan_bookmark_pending(_bookmark_mgr, _resolve_session_id),
+                name="plan-bookmark-pending",
+            )
 
 
 def _resolve_session_id(session_id: str) -> str:

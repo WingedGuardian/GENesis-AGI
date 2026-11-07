@@ -16,10 +16,15 @@ Reliability decreases as scope increases. Layers reinforce each other.
 
 ### Layer 1: PreToolUse Procedure Advisor (highest reliability)
 - `scripts/procedure_advisor.py` — fires on every CC tool call
-- Reads YAML trigger cache (`config/procedure_triggers.yaml`)
-- Outputs JSON with `additionalContext` for matching procedures
-- Only CORE/ADVISORY-tier procedures with tool triggers (trigger cache built from both)
-- ~10ms overhead per non-matching call
+- Reads the trigger cache (`config/procedure_triggers.json`, falling back to the YAML)
+- Outputs advisory `additionalContext` only, never a `permissionDecision`
+- Entries: CORE/ADVISORY-tier earned procedures with tool triggers, plus live lessons
+  (authored through `procedure_store` or shipped in `config/lessons/`; a held lesson
+  from an untrusted origin is left out)
+- An entry matches on its `patterns` (a lesson's regexes, run with a per-pattern
+  timeout; an earned row's tags, as substrings) or, for Bash, its `commands` (shell
+  phrases matched on the parsed command)
+- A lesson with `repeat: session` fires once per context window and agent
 
 ### Layer 2: Skill-Embedded Procedures (active when skill invoked)
 - Skills contain `## Known Procedures` section

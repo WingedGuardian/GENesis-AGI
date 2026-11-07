@@ -7,6 +7,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from genesis.cc.final_status import FinalStatus
 
 # CC's spawn/escape-class tool names — the single source of truth for the restricted CC
 # sessions where spawning would escape the parent's tool restrictions: reflection (fully
@@ -337,6 +341,9 @@ class CCInvocation:
     timeout_s: int = 7200
     allowed_tools: list[str] | None = None
     disallowed_tools: list[str] | None = None
+    # Positive removal of ALL built-in tools (--tools ""). An empty allowlist
+    # is not equivalent, especially under skip-permissions.
+    disable_tools: bool = False
     skip_permissions: bool = False
     skill_tags: list[str] | None = None
     working_dir: str | None = None
@@ -412,6 +419,12 @@ class CCInvocation:
     # autonomy executors, mail judge) opt in. NEVER changes control flow —
     # detection/alerting only, never a raise or failover.
     expect_output: bool = False
+    # Ask the session to end with a ``final_status`` block (cc/final_status.py):
+    # the invoker adds the contract to the system prompt, then splits the block
+    # off ``CCOutput.text`` into ``CCOutput.final_status``, so the caller's own
+    # parser reads the text it always did. Set by callers that own a
+    # ``cc_sessions`` row and record its outcome; foreground turns never set it.
+    report_status: bool = False
     # cc-loop-01: opaque per-session key for the invoker's proc registry, so an
     # interrupt (e.g. Telegram /stop) targets THIS session's subprocess and not
     # a concurrent background one. None → keyed by pid (never cross-fired).
@@ -445,6 +458,8 @@ class CCInvocation:
     # content there (visible in the enforce ledger + auto-demote), never
     # toward injecting into an unsupervised session.
     supervised: bool = False
+    # Managed native receipts may release capacity only after the group exits.
+    confirm_cleanup: bool = False
     # Applied LAST in CCInvoker._build_env, after every computed key — the
     # per-invocation escape hatch for env the invoker doesn't model (e.g. the
     # eval bench's CLAUDE_CONFIG_DIR cleanroom). Overrides win over inherited
@@ -456,6 +471,10 @@ class CCInvocation:
         compare=False,
         repr=False,
     )
+
+    # --no-session-persistence: disposable print-mode checks must not leave
+    # transcripts in CC's separate project tree. Actual tasks keep persistence.
+    no_session_persistence: bool = False
 
     def __post_init__(self) -> None:
         # Producer-side loud validation of the WS-3 origin (the env READER is
@@ -556,6 +575,9 @@ class CCOutput:
     # that survives a model switch. A caller that SUMS `cost_usd` across turns
     # must record the difference, via `cc_sessions.record_turn_cost`.
     cost_is_cumulative: bool = False
+    # False for a streaming EOF fallback without a structured terminal result.
+    # Ordinary callers retain their legacy interpretation of that fallback.
+    result_received: bool = True
 
     # How many over-limit stream-json lines the reader DROPPED on this run.
     # Nonzero means the event stream this output was built from is INCOMPLETE:
@@ -567,6 +589,10 @@ class CCOutput:
     # CC transcript on disk. Sibling of `bg_truncated`: both say "this result is
     # partial", and both exist so the partiality cannot be silent.
     stream_lines_dropped: int = 0
+    # The session's own account of how it ended, split off ``text`` by the
+    # invoker when the invocation set ``report_status``. None: not asked for, or
+    # no block ended the text.
+    final_status: FinalStatus | None = None
 
 
 @dataclass(frozen=True)
@@ -584,6 +610,27 @@ class StreamEvent:
     #: a caller can ask "how many blocks would this line have produced?" without
     #: re-implementing the extraction — see ``recognized_blocks``.
     _RECOGNIZED_BLOCKS = ("thinking", "text", "tool_use")
+
+    @property
+    def is_synthetic(self) -> bool:
+        """True for an ``assistant`` line the CLI wrote itself, not the model.
+
+        CC reports a usage limit as an assistant message with one text block
+        ("You've hit your weekly limit ...") whose ``message.model`` is
+        ``"<synthetic>"``; its transcript record also carries
+        ``isApiErrorMessage: true`` and ``error``. That text is a notice about
+        the run, not an answer, so a guard asking "did answer text reach the
+        user?" must not count it. The model check reads the ``message`` object
+        the stream event shares with the transcript record; the two flags are
+        honoured when the line carries them.
+        """
+        raw = self.raw or {}
+        if raw.get("type") != "assistant":
+            return False
+        message = raw.get("message")
+        if isinstance(message, dict) and message.get("model") == "<synthetic>":
+            return True
+        return raw.get("isApiErrorMessage") is True or bool(raw.get("error"))
 
     @staticmethod
     def recognized_blocks(raw: dict) -> int:
@@ -604,6 +651,28 @@ class StreamEvent:
             for b in blocks
             if isinstance(b, dict) and b.get("type") in StreamEvent._RECOGNIZED_BLOCKS
         )
+
+    def tool_uses(self) -> list[tuple[str, object]]:
+        """Every ``(name, input)`` tool_use this event carries.
+
+        ``from_raw`` stops at the first recognized block, so a line shaped
+        ``text + tool_use`` parses as "text". Telemetry that is persisted as an
+        inventory reads the raw content array through this instead. An event
+        built without a raw ``assistant`` line falls back to its parsed fields.
+        """
+        raw = self.raw or {}
+        if raw.get("type") == "assistant":
+            blocks = raw.get("message", {}).get("content", [])
+            if not isinstance(blocks, list):
+                return []
+            return [
+                (b["name"], b.get("input"))
+                for b in blocks
+                if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name")
+            ]
+        if self.event_type == "tool_use" and self.tool_name:
+            return [(self.tool_name, self.tool_input)]
+        return []
 
     @classmethod
     def from_raw(cls, raw: dict) -> StreamEvent:

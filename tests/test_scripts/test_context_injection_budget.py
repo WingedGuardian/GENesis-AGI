@@ -101,10 +101,25 @@ def test_settings_wires_four_parts_in_order():
 # ── per-part budget, real payloads, real subprocess ─────────────────────
 
 
+def _child_env(home: Path) -> dict[str, str]:
+    """A from-scratch environment for the hook script, with a scratch HOME.
+
+    ``SECRETS_PATH`` names a file that does not exist: without it the script
+    loads the secrets file of the checkout ``genesis`` is imported from (the
+    editable install's, i.e. the deployed one), which a scratch HOME does not
+    move. MEASURED with strace: ``--part charter`` and ``all`` opened the real
+    ``secrets.env``; every database it opened was under the scratch HOME."""
+    return {
+        "HOME": str(home),
+        "PATH": "/usr/bin:/bin",
+        "SECRETS_PATH": str(home / "no-secrets.env"),
+    }
+
+
 def _run_part(part: str, home: Path, *, extra_env: dict | None = None) -> str:
     (home / ".genesis").mkdir(parents=True, exist_ok=True)
     (home / ".genesis" / "cc_context_enabled").touch()
-    env = {"HOME": str(home), "PATH": "/usr/bin:/bin"}
+    env = _child_env(home)
     env.update(extra_env or {})
     result = subprocess.run(
         [sys.executable, str(_SCRIPTS_DIR / "genesis_session_context.py"), "--part", part],
@@ -144,7 +159,7 @@ def _run_raw(tmp_path: Path, *args: str, sid: str = "11111111-2222-3333-4444-555
         [sys.executable, str(_SCRIPTS_DIR / "genesis_session_context.py"), *args],
         capture_output=True,
         text=True,
-        env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
+        env=_child_env(tmp_path),
         input=json.dumps({"session_id": sid, "source": "startup"}),
         timeout=60,
     )
@@ -815,8 +830,7 @@ def test_a_malformed_probe_value_does_not_silence_the_injection(tmp_path):
         capture_output=True,
         text=True,
         env={
-            "HOME": str(tmp_path),
-            "PATH": "/usr/bin:/bin",
+            **_child_env(tmp_path),
             "GENESIS_CTX_PROBE_BYTES": "10k",  # a human wrote this, not a probe
         },
         input="{}",

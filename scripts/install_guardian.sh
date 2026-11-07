@@ -406,20 +406,34 @@ REPO_ROOT="$(unset CDPATH; cd "$(dirname "$0")/.." && pwd)"
 
 # If already running from the install dir (e.g. host-setup.sh cloned directly
 # into INSTALL_DIR), skip the copy — code is already in place.
+_guardian_copy_config=0
 if [ "$(cd "$REPO_ROOT" && pwd)" = "$(cd "$INSTALL_DIR" 2>/dev/null && pwd)" ] 2>/dev/null; then
     echo "  Code already in $INSTALL_DIR (same as repo)"
 elif [ -d "$INSTALL_DIR/src/genesis/guardian" ]; then
+    _guardian_copy_config=1
     echo "  Updating from local repo: $REPO_ROOT"
     # Use cp -rT to merge contents into existing dirs (not nest src/src/)
     cp -rT "$REPO_ROOT/src" "$INSTALL_DIR/src"
-    cp -rT "$REPO_ROOT/config" "$INSTALL_DIR/config"
     cp -rT "$REPO_ROOT/scripts" "$INSTALL_DIR/scripts"
 else
+    _guardian_copy_config=1
     echo "  Copying from local repo: $REPO_ROOT"
     mkdir -p "$INSTALL_DIR"
     cp -r "$REPO_ROOT/src" "$INSTALL_DIR/src"
-    cp -r "$REPO_ROOT/config" "$INSTALL_DIR/config"
     cp -r "$REPO_ROOT/scripts" "$INSTALL_DIR/scripts"
+fi
+
+# Copy shipped configuration without the operator-owned Guardian file. Keeping
+# an absent file absent lets Step 5 generate the detected values on first install.
+if [ "$_guardian_copy_config" = 1 ]; then
+    "$PYTHON" - "$REPO_ROOT/config" "$INSTALL_DIR/config" <<'PYCONFIG'
+from pathlib import Path
+import shutil
+import sys
+source, destination = map(Path, sys.argv[1:])
+shutil.copytree(source, destination, dirs_exist_ok=True, symlinks=True,
+                ignore=lambda directory, names: ["guardian.yaml"] if Path(directory) == source else [])
+PYCONFIG
 fi
 
 # ── Step 3: Create venv ──────────────────────────────────────────────

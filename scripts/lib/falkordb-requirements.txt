@@ -1,0 +1,30 @@
+# The graph engine (redis-server, redis-cli and the FalkorDB module), shipped as
+# one pip wheel. Installed by scripts/lib/falkordb_install.sh BEFORE the editable
+# install of Genesis, with:
+#
+#   pip install --only-binary=:all: --no-deps --require-hashes -r <this file>
+#
+# Why before: pyproject.toml declares the same pin, and the editable install
+# would otherwise fetch the wheel first, trusting it on TLS alone. Installed here
+# first, the editable install finds the requirement already satisfied.
+#
+# Why --require-hashes: the wheel carries native code that runs as the engine.
+# pip refuses a file whose sha256 is not listed below, and installs nothing. pip
+# does not re-check a wheel that is already installed, so the installed files are
+# then checked again, on every provision, against the per-file digests committed
+# in falkordb-engine-digests.txt (generated from these same wheel files), and the
+# engine runs from a verified copy under ~/.genesis/deps/falkordb, never from the
+# venv. The unit re-checks that copy's digest file on every start.
+#
+# Wheels are manylinux_2_38 (glibc 2.38, Ubuntu 24.04 and later) for CPython
+# 3.12, 3.13 and 3.14 on x86_64 and aarch64; installers refuse any other OS or
+# machine. To move the pin, replace the version and every hash together, from
+# the wheel files themselves, and regenerate falkordb-engine-digests.txt from
+# them in the same change (the command is in its header).
+falkordblite==0.11.0 \
+    --hash=sha256:538f38fc6e2b871ee6a173e4529603d5ac7886a5aec34fe8d5b327779d5d00d1 \
+    --hash=sha256:2275de4aa726b792c0b1e48c81735e8538a472f85e6d74739951a395499fa359 \
+    --hash=sha256:a913db722197344d741cad96f4ce712fe07d47abe027f388dc892d003bb361ca \
+    --hash=sha256:966bac2094e42615198655a2955b89812bc48f8885652de547a554ce8790138d \
+    --hash=sha256:dc34b7a53ce6bf9be52c7e2d594b32d886a6f511cc84db04e7ecf4a0dd753ed1 \
+    --hash=sha256:bd50f5f2be35224be4604893ed54435f34a52f960e5f09087ad6da6f4749bba4

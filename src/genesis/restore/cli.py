@@ -38,8 +38,13 @@ def run(args: argparse.Namespace) -> int:
         cmd.append("--dry-run")
     if args.force:
         cmd.append("--force")
+    if getattr(args, "refresh_snapshot", False):
+        cmd.append("--refresh-snapshot")
     if getattr(args, "database_only", False):
         cmd.append("--database-only")
+
+    for preference in getattr(args, "transcript_preference", []):
+        cmd.extend(["--transcript-preference", preference])
 
     # Inherit environment so GENESIS_BACKUP_PASSPHRASE and friends flow through.
     proc = subprocess.run(cmd, env=os.environ.copy(), check=False)
@@ -53,11 +58,11 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     """
     p = subparsers.add_parser(
         "restore",
-        help="Restore Genesis state from your backups repo",
+        help="Restore Genesis state from a snapshot or local backup",
         description=(
             "Rehydrate SQLite, Qdrant, transcripts, auto-memory, local "
-            "config overlays, and secrets from your private genesis-backups "
-            "repo. Counterpart to scripts/backup.sh."
+            "config overlays, and secrets from a selected off-site snapshot or "
+            "local backup. Counterpart to scripts/backup.sh."
         ),
     )
     p.add_argument(
@@ -75,5 +80,13 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     p.add_argument(
         "--database-only", action="store_true",
         help="Restore and verify only SQLite, leaving other state untouched",
+    )
+    p.add_argument(
+        "--refresh-snapshot", action="store_true",
+        help="Select the latest complete off-site snapshot instead of resuming the pinned selection",
+    )
+    p.add_argument(
+        "--transcript-preference", action="append", default=[], metavar="PATH=legacy|legacy-plain|legacy-encrypted|v2",
+        help="Resolve an ambiguous transcript capture format (repeatable)",
     )
     p.set_defaults(func=run)

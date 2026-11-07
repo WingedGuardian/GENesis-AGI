@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
 #: Imported rather than re-spelled: comparing against a copied string is
 #: how the rescue below silently stops firing when the notice is reworded.
-from genesis.cc.conversation import _TRUNCATION_NOTICE
+from genesis.cc.conversation import _TRUNCATION_NOTICE, CONTINGENCY_HEADER_PREFIX
 
 log = logging.getLogger(__name__)
 
@@ -113,6 +113,21 @@ async def _apply_pending_settings(ctx: HandlerContext, user_id: int, tid: str | 
 
 
 _MODEL_PREFIX_GAP_S = 3600  # Show model/effort prefix after 1h of silence
+
+
+def _with_model_prefix(streamer: DraftStreamer | None, response: str) -> str:
+    """Prepend the streamer's ``[Model / Effort]`` prefix to the final reply.
+
+    The prefix names the HOME session's model, read before the turn ran. A
+    contingency reply was not written by that model and carries its own
+    ``[Contingency mode via <provider> ...]`` label, so it gets no prefix:
+    stacking both told the reader two different models answered.
+    """
+    if not (streamer and streamer._prefix):
+        return response
+    if response.startswith(CONTINGENCY_HEADER_PREFIX):
+        return response
+    return streamer._prefix + "\n" + response
 
 
 async def _make_streamer(ctx: HandlerContext, msg, user, tid) -> DraftStreamer | None:
@@ -296,8 +311,7 @@ async def _handle_text_inner(ctx: HandlerContext, msg, user, tid):
             # Always send text first — voice is additional, never a replacement
             if response:
                 response = response.lstrip("\n")
-                if streamer and streamer._prefix:
-                    response = streamer._prefix + "\n" + response
+                response = _with_model_prefix(streamer, response)
                 sent_msg = await _reply_formatted(msg, response)
 
             # Then send voice if wanted (text already delivered; TTS failure is non-fatal)
@@ -480,8 +494,7 @@ async def _handle_voice_inner(ctx: HandlerContext, msg, user, voice, context, wh
             # Send response first — voice and transcription echo follow separately
             if response:
                 response = response.lstrip("\n")
-                if streamer and streamer._prefix:
-                    response = streamer._prefix + "\n" + response
+                response = _with_model_prefix(streamer, response)
             sent_msg = await _reply_formatted(msg, response or "(no response)")
 
             # Then send voice if wanted (text already delivered; TTS failure is non-fatal)
@@ -668,8 +681,7 @@ async def _handle_media_inner(
                 streamer.disable()
             if response:
                 response = response.lstrip("\n")
-                if streamer and streamer._prefix:
-                    response = streamer._prefix + "\n" + response
+                response = _with_model_prefix(streamer, response)
                 sent_msg = await _reply_formatted(msg, response)
 
         if response:
@@ -1505,6 +1517,31 @@ async def _resolution_label(gate, request_id: str) -> str:
     return f"⚠️ Already resolved ({actual})"
 
 
+async def _handle_payment_tap(ctx: HandlerContext, query, user) -> None:
+    """``payapprove:<nonce>``: one answer per tap, "Approved" only for a grant."""
+    registry = ctx.payment_approvals
+    granted = False
+    if registry is None:
+        answer = "Payment approval is unavailable here"
+    else:
+        try:
+            granted = await registry.handle_tap(
+                query.data.split(":", 1)[1], user.id if user else None, query.message
+            )
+        except Exception:
+            log.error("payment approval tap failed", exc_info=True)
+        answer = "Approved" if granted else "Refused"
+    try:
+        await query.answer(answer, show_alert=not granted)
+    except Exception:
+        log.debug("Failed to answer payment approval tap", exc_info=True)
+    if granted:
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            log.debug("Failed to remove the payment approval button", exc_info=True)
+
+
 async def handle_callback_query(
     ctx: HandlerContext, update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
@@ -1525,6 +1562,11 @@ async def handle_callback_query(
     """
     query = update.callback_query
     if not query:
+        return
+    # Card-release approval: decided by the registry alone, before the generic
+    # allowlist and before the approve/reject fall-through to ReplyWaiter.
+    if (query.data or "").startswith("payapprove:"):
+        await _handle_payment_tap(ctx, query, update.effective_user)
         return
 
     user = update.effective_user

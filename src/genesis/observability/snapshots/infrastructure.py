@@ -280,7 +280,8 @@ def _collect_pid_budget(base_dir: str | None = None) -> dict:
     level that has a finite ``pids.max``, and reports the one at highest %. Reads are
     fork-free.
 
-    Returns ``{status, current, max, pct, scope}`` for the binding level. When the
+    Returns ``{status, current, max, pct, scope, path}`` for the binding level
+    (``path``: its cgroup directory, which ``pid_breakdown`` walks). When the
     whole VISIBLE chain is uncapped (all ``pids.max == "max"``) →
     ``{status: healthy, current, max: "max", pct: None}`` — genuinely no sub-cap
     (the container root may still be capped by the LXC host ABOVE our visible root,
@@ -314,7 +315,7 @@ def _collect_pid_budget(base_dir: str | None = None) -> dict:
 
     # Walk leaf → cgroup mount root, collecting every finite level as
     # (pct, current, max, scope).
-    candidates: list[tuple[float, int, int, str]] = []
+    candidates: list[tuple[float, int, int, str, str]] = []
     d = leaf
     while True:
         parsed = _read_finite_pids_level(d)
@@ -325,7 +326,7 @@ def _collect_pid_budget(base_dir: str | None = None) -> dict:
             return {"status": "unavailable"}
         if parsed is not None:
             cur, mx = parsed  # type: ignore[misc]
-            candidates.append((round(cur / mx * 100, 1), cur, mx, _scope_label(d)))
+            candidates.append((round(cur / mx * 100, 1), cur, mx, _scope_label(d), d))
         if _same_path(d, _CGROUP_ROOT):
             break
         parent = os.path.dirname(d)
@@ -344,13 +345,14 @@ def _collect_pid_budget(base_dir: str | None = None) -> dict:
     # exactly that masking: it answers "how many more forks can THIS process do", a
     # different question from this %-threshold monitor's "which level is nearest its
     # ceiling". max() keeps the first (innermost) level on % ties.
-    pct, current, max_pids, scope = max(candidates, key=lambda c: c[0])
+    pct, current, max_pids, scope, path = max(candidates, key=lambda c: c[0])
     return {
         "status": _pid_status(pct),
         "current": current,
         "max": max_pids,
         "pct": pct,
         "scope": scope,
+        "path": path,
     }
 
 

@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import logging
 
-from genesis.mcp.health import mcp
+from fastmcp.exceptions import ToolError
+
+from genesis.mcp.external_profiles import ExternalProfile, current_external_profile
+from genesis.mcp.health import mcp, validator_writes
 
 logger = logging.getLogger(__name__)
 
@@ -110,15 +113,11 @@ async def _impl_follow_up_create(
         return {"error": "scheduled_at is required when strategy is 'scheduled_task'"}
 
     try:
-        import os
-
+        from genesis.caller_context import caller_context
         from genesis.ego.domain_classifier import classify_domain
 
         # Detect dispatched session context for proper source attribution
-        if os.environ.get("GENESIS_CC_SESSION") == "1":
-            source = "ego_dispatch"
-        else:
-            source = "foreground_session"
+        source = "ego_dispatch" if caller_context().dispatched else "foreground_session"
 
         # Sacred-board authorization: the hot `follow_up` board is reserved for
         # sanctioned (≈ foreground) paths. An autonomous/dispatched CC session's
@@ -455,9 +454,9 @@ async def _impl_follow_up_update(
             # a re-affirm of an already-on-board item (existing kind == 'follow_up') is a
             # no-op that must NOT demote it, and moving TO tabled stays allowed.
             if resolved_kind == "follow_up" and existing.get("kind") != "follow_up":
-                import os
+                from genesis.caller_context import caller_context
 
-                if os.environ.get("GENESIS_CC_SESSION") == "1":
+                if caller_context().dispatched:
                     resolved_kind = "tabled"
                     autonomous_promotion_blocked = True
             effective_cond = (
@@ -594,7 +593,7 @@ async def _impl_follow_up_update(
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool()
+@mcp.tool(task=False)
 async def follow_up_create(
     content: str,
     reason: str,
@@ -606,6 +605,7 @@ async def follow_up_create(
     domain: str = "",
     revisit_condition: str = "",
     source_session: str = "",
+    request_key: str = "",
 ) -> dict:
     """Create a follow-up in the accountability ledger.
 
@@ -643,6 +643,14 @@ async def follow_up_create(
             (foreground) or the "## This Session" block (dispatched). An
             unresolvable prefix is stored NULL. Empty only if not from CC.
     """
+    if current_external_profile.get() == ExternalProfile.VALIDATOR:
+        if strategy != "user_input_needed" or scheduled_at or pinned or source_session:
+            raise ToolError("Validators create private user_input_needed records without schedule, pin or session")
+        return await validator_writes.private_create(
+            _get_db(), request_key=request_key, content=content, reason=reason,
+            work_state=work_state, priority=priority, domain=domain or None,
+            revisit_condition=revisit_condition,
+        )
     return await _impl_follow_up_create(
         content,
         reason,
@@ -657,7 +665,7 @@ async def follow_up_create(
     )
 
 
-@mcp.tool()
+@mcp.tool(task=False)
 async def follow_up_update(
     follow_up_id: str,
     status: str = "",
@@ -695,6 +703,14 @@ async def follow_up_update(
         revisit_condition: Set/replace the revisit trigger (the event that would
             resurface the item). Empty to leave unchanged.
     """
+    if current_external_profile.get() == ExternalProfile.VALIDATOR:
+        if pinned or work_state or revisit_condition:
+            raise ToolError("Validators cannot change pins, lanes or triggers")
+        return await validator_writes.private_update(
+            _get_db(), follow_up_id, status=status or None,
+            resolution_notes=resolution_notes or None, blocked_reason=blocked_reason or None,
+            priority=priority or None,
+        )
     pinned_bool: bool | None = None
     if pinned.lower() in ("true", "1", "yes"):
         pinned_bool = True
@@ -713,7 +729,7 @@ async def follow_up_update(
     )
 
 
-@mcp.tool()
+@mcp.tool(task=False)
 async def follow_up_list(
     status_filter: str = "",
     limit: int = 20,
@@ -741,6 +757,10 @@ async def follow_up_list(
         limit: Max items to return (default 20)
         include_tabled: Include tabled (someday/maybe) items in the list. Default False.
     """
+    if current_external_profile.get() == ExternalProfile.VALIDATOR:
+        return await validator_writes.private_list(
+            _get_db(), status_filter=status_filter, limit=limit, include_tabled=include_tabled,
+        )
     return await _impl_follow_up_list(
         status_filter=status_filter or None,
         limit=limit,

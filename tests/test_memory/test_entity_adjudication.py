@@ -457,8 +457,16 @@ async def test_live_phase0_stale_on_norm_drift(file_db):
 
 
 @pytest.mark.asyncio
-async def test_live_backlog_skips_unapproved(db):
-    """The core PR-1 gate: an UN-approved proposal is never applied, even in live."""
+async def test_live_backlog_skips_unapproved(file_db):
+    """The core PR-1 gate: an UN-approved proposal is never applied, even in live.
+
+    Uses ``file_db`` because the live apply path opens its own connection, which cannot see
+    the shared in-memory ``db``. Under ``db`` nothing can be applied at all, so a bare
+    ``merged == 0`` would hold with or without the gate. The second half approves the SAME
+    row and expects it to apply, which proves this fixture can apply and so gives the first
+    half's ``merged == 0`` meaning.
+    """
+    db = file_db
     a = await _mk_entity(db, "mu", "mu")
     b = await _mk_entity(db, "muu", "muu")
     await adj_crud.record_verdict(
@@ -476,6 +484,13 @@ async def test_live_backlog_skips_unapproved(db):
     assert counts["merged"] == 0
     assert await _status(db, b) == "active"  # NOT merged
     assert (await adj_crud.get_by_pair(db, a, b))["verdict"] == "proposed_merge"
+
+    # Positive arm: once a human approves the same row, the same drain applies it.
+    await adj_crud.approve(db, pair_key=adj_crud.pair_key(a, b), approved_by="owner")
+    counts = await adj.run_adjudication_drain(db, _router({}), mode="live", budget=10)
+    assert counts["merged"] == 1
+    assert await _status(db, b) == "merged"
+    assert (await adj_crud.get_by_pair(db, a, b))["verdict"] == "merge"
 
 
 @pytest.mark.asyncio

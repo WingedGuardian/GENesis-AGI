@@ -1109,3 +1109,114 @@ def test_status_non_string_failure_reason_does_not_500(client, tmp_path):
     assert resp.status_code == 200
     data = resp.get_json()
     assert data["backup_health"]["code"] == "failed"
+
+
+# ── extra directories incomplete (#2854) ──
+
+
+def _route_health(record, resolved_backend, sch=None):
+    """The verdict the status route gives: `destinations` is built from the SAME
+    record, as the route does, never passed as None."""
+    from genesis.dashboard.routes import backup as bk
+
+    with patch(f"{_BK}.has_verified_credential", return_value=False):
+        dest = bk._destinations(record, None)
+    return _health(record, sch or _sch(), dest, resolved_backend=resolved_backend)
+
+
+def _run_record(backend, **extras):
+    """A record shaped like backup.sh's `_write_status` for a run whose CORE
+    snapshot completed. With a backend, any positive extras counter makes the
+    off-site copy `partial` and unconfirmed (backup.sh, the extras-only case)."""
+    gap = any(isinstance(v, int) and v > 0 for v in extras.values())
+    record = {**_healthy_lb(), "tier2_backend": backend, **extras}
+    if backend == "none":
+        record.update(tier2_status="not_configured", offsite_confirmed=False)
+    else:
+        record.update(
+            tier2_status="partial" if gap else "ok",
+            offsite_confirmed=not gap,
+            offsite_core_complete=True,
+        )
+    return record
+
+
+@pytest.mark.parametrize("backend", ["local", "smb"])
+@pytest.mark.parametrize(
+    "field", ["extra_dirs_skipped", "extra_dirs_partial", "extra_upload_failed"]
+)
+def test_health_extras_only_gap_with_a_backend_is_its_own_warning(backend, field):
+    r = _route_health(_run_record(backend, **{field: 2}), backend)
+    assert (r["state"], r["code"]) == ("warn", "extra_dirs_incomplete")
+    assert "backup log" in r["reason"]
+
+
+@pytest.mark.parametrize("field", ["extra_dirs_skipped", "extra_dirs_partial"])
+def test_health_local_extras_gaps_warn_without_a_backend(field):
+    r = _route_health(_run_record("none", **{field: 1}), "none")
+    assert r["code"] == "extra_dirs_incomplete"
+
+
+def test_health_a_core_offsite_gap_still_wins_over_extras():
+    record = _run_record("smb", extra_upload_failed=1)
+    record["offsite_core_complete"] = False
+    r = _route_health(record, "smb")
+    assert r["code"] == "tier2_incomplete"
+
+
+def test_health_partial_offsite_with_no_extras_gap_is_still_an_offsite_problem():
+    # A complete-core claim alone must not turn an incomplete off-site copy healthy.
+    record = _run_record("smb")
+    record.update(tier2_status="partial", offsite_confirmed=False)
+    assert _route_health(record, "smb")["code"] == "tier2_incomplete"
+
+
+def test_health_legacy_partial_without_the_core_flag_stays_an_offsite_problem():
+    record = _run_record("smb", extra_dirs_skipped=1)
+    del record["offsite_core_complete"]
+    assert _route_health(record, "smb")["code"] == "tier2_incomplete"
+
+
+def test_health_stale_upload_failure_is_ignored_once_the_backend_is_none():
+    # The record still carries the last run's upload failure, but the operator
+    # has since switched Tier 2 off: nothing uploads, so nothing is incomplete.
+    record = _run_record("smb", extra_upload_failed=3)
+    record["tier2_backend"] = "none"
+    assert _route_health(record, "none")["code"] != "extra_dirs_incomplete"
+
+
+def test_health_extras_gap_does_not_mask_a_schedule_probe_failure():
+    record = _run_record("none", extra_dirs_skipped=1)
+    r = _route_health(record, "none", sch=_sch(probe_ok=False))
+    assert r["code"] == "schedule_probe_failed"
+
+
+@pytest.mark.parametrize("backend", ["none", "local"])
+def test_health_extra_dirs_zero_is_healthy(backend):
+    record = _run_record(backend, extra_dirs_skipped=0, extra_dirs_partial=0, extra_upload_failed=0)
+    assert _route_health(record, backend)["state"] == "ok"
+
+
+@pytest.mark.parametrize("backend", ["none", "local"])
+@pytest.mark.parametrize("bad", ["3", "lots", None, True, -1, 1.5, [1]])
+def test_health_extra_dirs_malformed_counter_never_raises(backend, bad):
+    record = _run_record(
+        backend, extra_dirs_skipped=bad, extra_dirs_partial=bad, extra_upload_failed=bad
+    )
+    r = _route_health(record, backend)
+    assert r["code"] != "extra_dirs_incomplete"
+
+
+def test_status_allowlist_passes_every_extras_field():
+    # backup.sh writes these into backup_status.json. The status route copies only
+    # allowlisted fields into what the health check reads, so a field missing here
+    # can never reach it.
+    from genesis.dashboard.routes import backup as bk
+
+    for field in (
+        "extra_dirs_skipped",
+        "extra_dirs_partial",
+        "extra_upload_failed",
+        "offsite_core_complete",
+    ):
+        assert field in bk._STATUS_SAFE_FIELDS, field

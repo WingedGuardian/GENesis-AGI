@@ -214,6 +214,9 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         # Optional external OfficeCLI binary (deliverable-builder render backend);
         # resolved by _init_office_deliverables, None when not provisioned.
         self._officecli_path: str | None = None
+        # The Camoufox engine the browser tools would launch; resolved by
+        # _init_browser_automation, None when no engine is launchable.
+        self._browser_engine_path: str | None = None
         # Set by the ``board`` bootstrap step once the reconciler job is wired.
         self._board_reconciler: str | None = None
         self._activity_tracker: ProviderActivityTracker | None = None
@@ -500,6 +503,9 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         # Unconditional (also in readonly probes): optional OfficeCLI render
         # backend. Present → active; absent → degraded (never fatal).
         self._run_init_step("office_deliverables", self._init_office_deliverables)
+        # Unconditional too: the browser stack is optional infrastructure.
+        # Launchable engine → active; anything else → degraded (never fatal).
+        await self._run_init_step_async("browser_automation", self._init_browser_automation)
 
         if _full:
             await self._run_init_step_async(
@@ -628,6 +634,16 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
                 logger.exception("Failed to stop outreach recovery worker")
 
     async def shutdown(self) -> None:
+        # Also retire a writer installed by an incomplete bootstrap. Cancel the
+        # loop first, then wait for any worker it left behind before DB teardown.
+        if self._status_writer_task is not None and not self._status_writer_task.done():
+            self._status_writer_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._status_writer_task
+            logger.info("Stopped status writer loop")
+        if self._status_writer is not None:
+            await self._status_writer.aclose()
+
         if not self._bootstrapped:
             return
 
@@ -638,12 +654,6 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
             with contextlib.suppress(asyncio.CancelledError):
                 await self._approval_timeout_task
             logger.info("Stopped approval timeout poller")
-
-        if self._status_writer_task is not None and not self._status_writer_task.done():
-            self._status_writer_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._status_writer_task
-            logger.info("Stopped status writer loop")
 
         # Cancel-and-await in-flight direct sessions while the DB is still
         # open, so _run_session's CancelledError handler can persist a
@@ -763,6 +773,7 @@ class GenesisRuntime(_RuntimeProperties, _PauseStateMixin, _InitDelegatesMixin):
         "pipeline": "_pipeline_orchestrator",
         "campaigns": "_campaign_runner",
         "office_deliverables": "_officecli_path",
+        "browser_automation": "_browser_engine_path",
         "board": "_board_reconciler",
     }
 

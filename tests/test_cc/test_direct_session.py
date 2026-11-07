@@ -388,6 +388,62 @@ async def test_run_session_cancelled_marks_failed(db):
     assert row["status"] == "failed", (
         f"cancelled session left status={row['status']!r} — must be terminal"
     )
+    # The cancel's reason survives into the row (fail() used to discard it).
+    assert (row["outcome"], row["outcome_reason"]) == ("failed", "cancelled")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("truncated", "received", "expected"),
+    [
+        (True, True, ("partial", "bg_truncated")),
+        (False, False, ("partial", "no_result_event")),
+        (False, True, ("unreported", None)),
+    ],
+)
+async def test_a_clean_exit_that_did_not_finish_is_recorded_partial(
+    db, truncated, received, expected
+):
+    """A truncated run, or one with no result event, exits 0 and used to read
+    as plain success. Its row now says it did not finish."""
+    from types import SimpleNamespace
+
+    from genesis.cc.types import CCInvocation, CCModel, CCOutput, EffortLevel, SessionType
+
+    sm = SessionManager(db=db, invoker=AsyncMock(), day_boundary_hour=0)
+    invoker = AsyncMock()
+    invoker.run_streaming = AsyncMock(
+        return_value=CCOutput(
+            session_id="cc",
+            text="done-ish",
+            model_used="sonnet",
+            cost_usd=0.0,
+            input_tokens=0,
+            output_tokens=0,
+            duration_ms=1,
+            exit_code=0,
+            bg_truncated=truncated,
+            result_received=received,
+        )
+    )
+    runner = DirectSessionRunner(
+        invoker=invoker,
+        session_manager=sm,
+        config_builder=AsyncMock(),
+        runtime=SimpleNamespace(_db=db),
+    )
+    runner._build_invocation = lambda _req, _sid: CCInvocation(prompt="x")
+    sess = await sm.create_background(
+        session_type=SessionType.BACKGROUND_TASK,
+        model=CCModel.SONNET,
+        effort=EffortLevel.MEDIUM,
+    )
+
+    await runner._run_session(DirectSessionRequest(prompt="t", notify=False), sess["id"])
+
+    row = await cc_sessions.get_by_id(db, sess["id"])
+    assert row["status"] == "completed"
+    assert (row["outcome"], row["outcome_reason"]) == expected
 
 
 @pytest.mark.asyncio
@@ -930,7 +986,7 @@ async def test_verification_failure_memory_stamps_origin_and_class(db, tmp_path)
 # ── Incomplete stream telemetry must not certify an audit (PR #1625) ────
 
 
-async def _run_ego_session_with(db, *, dropped: int):
+async def _run_ego_session_with(db, *, dropped: int, raw: dict | None = None):
     """Run one ego-dispatch session whose stream dropped `dropped` lines, and
     return the kwargs the protected-path auditor was called with."""
     from types import SimpleNamespace
@@ -950,7 +1006,10 @@ async def _run_ego_session_with(db, *, dropped: int):
         if on_event:
             # A small tool DID survive — that is what makes tools_summary
             # truthy, which is the precondition for the pre-filter to fire.
-            await on_event(StreamEvent(event_type="tool_use", tool_name="Read"))
+            if raw is not None:
+                await on_event(StreamEvent.from_raw(raw))
+            else:
+                await on_event(StreamEvent(event_type="tool_use", tool_name="Read"))
         return CCOutput(
             session_id="cc-1", text="done", model_used="sonnet", cost_usd=0.0,
             input_tokens=1, output_tokens=1, duration_ms=1, exit_code=0,
@@ -1101,3 +1160,23 @@ async def test_a_clean_session_reports_zero_dropped_lines_in_both_projections(
 
     assert status["stream_lines_dropped"] == 0
     assert row["stream_lines_dropped"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_tool_after_text_on_one_line_reaches_the_audit_inventory(db):
+    """`StreamEvent.from_raw` stops at the first recognized block, so a line
+    shaped `text + tool_use` parses as "text". The inventory handed to the
+    audit pre-filter must still carry the Write, or the pre-filter certifies a
+    protected-path mutation as clean."""
+    raw = {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {"type": "text", "text": "editing now"},
+                {"type": "tool_use", "name": "Read", "input": {}},
+                {"type": "tool_use", "name": "Write", "input": {"file_path": "x"}},
+            ]
+        },
+    }
+    kwargs = await _run_ego_session_with(db, dropped=0, raw=raw)
+    assert kwargs["tools_summary"] == {"Read": 1, "Write": 1}

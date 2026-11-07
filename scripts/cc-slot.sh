@@ -125,6 +125,11 @@ while [ -L "$_CC_SLOT_SCRIPT" ]; do
 done
 _CC_SLOT_DIR="$(unset CDPATH; cd -P "$(dirname "$_CC_SLOT_SCRIPT")" && pwd)"
 GENESIS_ROOT="$(cd "$_CC_SLOT_DIR/.." 2>/dev/null && pwd)"
+# Optional: without it the door still opens, with the system's weaker kill.
+if [ -r "$_CC_SLOT_DIR/lib/gnu_timeout.sh" ]; then
+    # shellcheck source=scripts/lib/gnu_timeout.sh
+    . "$_CC_SLOT_DIR/lib/gnu_timeout.sh"
+fi
 unset _CC_SLOT_SCRIPT _CC_SLOT_DIR _CC_SLOT_TARGET
 SESSION_PREFIX="cc"
 
@@ -156,12 +161,13 @@ CLAUDE_EXTRA_ARGS=("$@")
 # rather than relying on redaction to take it out afterwards.
 #
 # THE SPLIT IS BY LIFETIME, NOT BY "is it a subcommand". Being listed under
-# `Commands:` in --help does not make something short-lived, and three of them
+# `Commands:` in --help does not make something short-lived, and four of them
 # are exactly what the slot exists for — losing them to a dropped SSH is the
 # failure this launcher prevents:
 #   gateway      "Run the enterprise auth/telemetry gateway"  — a daemon
 #   agents       the interactive agent view; its own --help says --json is the
 #                variant that "does not require a TTY", so the default does
+#   attach       opens a background session in this terminal
 #   ultrareview  a cloud multi-agent review over the current branch — minutes
 # Those KEEP the slot. _CC_KEEPS_A_SLOT records that as a decision rather than
 # an omission, so the drift test can demand every new subcommand be classified
@@ -177,8 +183,8 @@ CLAUDE_EXTRA_ARGS=("$@")
 # limit rather than a hole: the capture is scrubbed either way, and the failure
 # direction is the safe one — a missed bypass costs a slot, while a FALSE bypass
 # would drop an interactive session on SSH disconnect.
-_CC_EPHEMERAL=(auth auto-mode doctor import install mcp plugin plugins project setup-token update upgrade)
-_CC_KEEPS_A_SLOT=(agents gateway ultrareview)
+_CC_EPHEMERAL=(auth auto-mode doctor import install kill logs mcp plugin plugins project respawn rm setup-token stop update upgrade)
+_CC_KEEPS_A_SLOT=(agents attach gateway ultrareview)
 
 # Resolve a USABLE temp directory into an exported TMPDIR, or leave both names
 # genuinely unset. Returns 0 when a candidate was accepted, 1 when none was.
@@ -1249,11 +1255,32 @@ fi
 # containing spaces, shell metacharacters, or newlines.
 _GENESIS_ROOT_Q=$(printf '%q' "$GENESIS_ROOT")
 _CC_EXIT_CAPTURE_Q=$(printf '%q' "$GENESIS_ROOT/scripts/cc_exit_capture.sh")
-exec tmux -u new-session -A -s "$SESSION_NAME" \
+# Each slot's claude starts in a systemd scope of its own
+# (genesis-slot-<slot>-<hex>.scope), so systemd-oomd (and any later per-slot
+# limit) acts on ONE slot. Without it every slot's claude stays in the tmux
+# server's cgroup: tmux 3.4 moves a pane into its own scope but does not wait
+# for the move, so the pane shell forks claude first (scripts/slot_exec.sh
+# header). slot_exec.sh execs in place and falls back to an unscoped exec, so
+# the pane, its exit code and the exit capture below are unchanged either way.
+_SLOT_EXEC_PREFIX=""
+if [ -x "$GENESIS_ROOT/scripts/slot_exec.sh" ]; then
+    _SLOT_EXEC_PREFIX="$(printf '%q' "$GENESIS_ROOT/scripts/slot_exec.sh") ${SLOT} -- "
+fi
+# The tmux SERVER owns every slot's terminal, so whatever ends it ends every
+# slot. It runs in the cgroup of the client that started it: a login scope from
+# SSH, or genesis-server.service when the dashboard terminal started it, where a
+# server restart kills it. When no server is running yet, start it in a scope of
+# its own, marked omit (honoured once oomd monitors the user manager, see
+# slot_exec.sh). A running server is joined as before, with nothing wrapped.
+_TMUX_SERVER_SCOPE=()
+if [ -x "$GENESIS_ROOT/scripts/slot_exec.sh" ] && ! tmux -u list-sessions >/dev/null 2>&1; then
+    _TMUX_SERVER_SCOPE=("$GENESIS_ROOT/scripts/slot_exec.sh" --unit-prefix genesis-tmux --slice app.slice --omit server --)
+fi
+exec "${_TMUX_SERVER_SCOPE[@]}" tmux -u new-session -A -s "$SESSION_NAME" \
     -e "GENESIS_SLOT=${SLOT}" \
     -e "GENESIS_CC_PERMISSION_MODE=${GENESIS_CC_PERMISSION_MODE:-auto}" \
     "${_TMPDIR_PIN[@]}" \
     -e "GENESIS_CC_SLOT_OAUTH=${_slot_oauth_mode}" \
     "${_FUNCTION_HOOKS_PIN[@]}" \
     -e "LANG=$LANG" \
-    "${_OAUTH_SRC}cd ${_GENESIS_ROOT_Q} && ${_TMPDIR_UNSET:-}${_FUNCTION_HOOKS_UNSET:-}claude ${_WEB_OVERRIDE_ARGS:-}${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${_CC_EXIT_CAPTURE_Q} ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"
+    "${_OAUTH_SRC}cd ${_GENESIS_ROOT_Q} && ${_TMPDIR_UNSET:-}${_FUNCTION_HOOKS_UNSET:-}${_SLOT_EXEC_PREFIX:-}claude ${_WEB_OVERRIDE_ARGS:-}${CC_PERM_FLAG}${CLAUDE_ARGS_Q}; __ec=\$?; ${_CC_EXIT_CAPTURE_Q} ${SLOT} \$__ec >/dev/null 2>&1; exit \$__ec"

@@ -29,19 +29,92 @@ installs retrofit automatically. It is idempotent and **adaptive — every thres
 pressure percentage, never an absolute byte value**, so the same config
 right-sizes from a small VPS to a large workstation:
 
-- `/etc/systemd/system/user.slice.d/genesis-oomd.conf` —
-  `ManagedOOMMemoryPressure=kill` at **60%** memory-pressure (PSI) on the
-  user slice: the backstop monitor.
-- `/etc/systemd/system/user@.service.d/genesis-oomd.conf` — `kill` for the
-  per-user manager. In practice this is the operative monitor (many distros
-  ship a 50% default limit for it; ours guarantees `kill` where the distro
-  ships `auto` or nothing).
-- `/etc/systemd/oomd.conf.d/genesis.conf` — swap-use limit 90%, default
+**Where oomd watches decides what it may kill.** Only leaf cgroups below a
+monitored unit are candidates, one per action, ranked first by preference
+(`omit` never, `avoid` last) and then by reclaim rate. The preference marks are
+honoured only when the candidate and the monitored cgroup have the same owner
+(systemd.resource-control(5), `ManagedOOMPreference=`). So the monitor that
+matters is the per-user manager, `user@<uid>.service`, which the user owns:
+under it, `genesis-server`'s `avoid` holds. Under the root-owned `user.slice`
+every mark is ignored, which is how genesis-server was killed in a 2026-11
+incident despite `avoid`.
+
+- `/etc/systemd/system/user@.service.d/genesis-oomd.conf`: `kill` at **60%**
+  for the per-user manager, reported by PID 1. Never removed: after a boot it
+  is the monitor until the first user reload. It overrides the distro's own
+  50% for that unit (Ubuntu's `10-oomd-user-service-defaults.conf`).
+- `~/.config/systemd/user/-.slice.d/genesis-oomd.conf`: the same policy on the
+  user manager's own root slice. This is what keeps the per-user monitor alive.
+  The root slice has the same cgroup path as `user@<uid>.service`, and on every
+  `systemctl --user daemon-reload` the user manager reports it; left at the
+  default `auto`, that report silently erases PID 1's `kill` (systemd issue
+  #43174). Reporting `kill` itself, with the same limit, makes the monitor
+  survive reloads. Genesis reloads the user manager on every bootstrap and
+  deploy, so without this the per-user monitor was effectively never on.
+- `~/.config/systemd/user/init.scope.d/` and `dbus.service.d/`
+  `genesis-oomd.conf`: the user manager itself is `omit` and its D-Bus is
+  `avoid`. Killing either would take every session and unit with it.
+- `/etc/systemd/system/user.slice.d/genesis-oomd.conf`: the backstop, `kill`
+  at **80%**, never switched off. The per-user monitor at 60% acts first and
+  honours `avoid`; the backstop acts only once pressure passes 80%, i.e. on
+  pressure the first monitor could not relieve. Under it `avoid` is ignored and
+  the victim is chosen by reclaim rate, which favours the hog itself. Because
+  the backstop is always on, no state of this setup leaves oomd monitoring
+  nothing.
+- **What the thresholds measure, and how sure they are.** oomd compares the
+  cgroup's PSI `full` 10-second average: the share of time in which every task
+  in it was stalled on memory, not a share of RAM. 60% held for 20s means the
+  tree made almost no progress for 12 of every 20 seconds. A share of time
+  self-calibrates across box sizes. 60% is upstream systemd's
+  `DefaultMemoryPressureLimit`; 80% sits above it so the monitor that honours
+  `avoid` always acts first. Neither is validated against this workload yet:
+  Genesis records no pressure history, so both are to be re-set from sampled
+  data.
+- **Known residuals.** Each of these lets the 60% monitor kill sessions or
+  background runs that are not the cause:
+  - a hog outside the user manager: a command run in an SSH login scope, a
+    system service (Qdrant runs in `system.slice`), another user. Global
+    pressure stalls tasks under the user manager too, so its leaves are killed
+    while the hog is out of reach until the backstop (login scope, other users)
+    or neither monitor (`system.slice`);
+  - a runaway genesis-server: `avoid` ranks it last, so every other leaf under
+    the user manager goes first before it is chosen; the backstop chooses by
+    reclaim rate, but only above 80%.
+  - **one action can kill several cgroups (systemd 255).** After killing a
+    cgroup, oomd makes a second pass over `cgroup.threads`; on this systemd it
+    opens a pidfd for each thread id, which fails with EINVAL for any
+    non-leader thread, so oomd counts the kill as failed and moves on to the
+    next candidate until one kill returns cleanly (a single-threaded or
+    fast-exiting cgroup). Under the 60% monitor `omit` cgroups are excluded
+    before ranking and small single-threaded services sit between the
+    sessions and the `avoid` units, so the cascade stops early. Under the 80%
+    backstop marks are ignored, and the first clean kill can be the tmux
+    server or `init.scope` (both single-threaded). systemd 256 fixed this
+    (`CGROUP_NO_PIDFD` in `cg_kill`); #3874 tracks it here. The per-session
+    memory cap (the slot scope's `MemoryMax`) keeps a runaway session on the
+    kernel's single-victim path, away from oomd.
+  Attributing pressure to its source, so the cause and not a bystander is acted
+  on, is planned work beyond this policy.
+- Every run verifies the per-user monitor live before saying so: all three
+  user drop-ins are the Genesis ones, the user manager reports `kill` at 60%
+  for its root slice, `omit` for `init.scope` and `avoid` for `dbus.service`,
+  and `oomctl` lists its cgroup on two reads. The summary line names only what
+  those reads confirmed: the backstop as PID 1 reports `user.slice` now (so a
+  reload that failed on an earlier run is not reported as in force), and
+  neither monitor when systemd-oomd is not running. The infra profile's
+  `oomd_active` and `oomd_user_manager_monitored` facts carry it to the
+  awareness posture check.
+- Uninstall removes the three user drop-ins, which sit on non-Genesis unit
+  names; left behind, oomd would keep monitoring the user's other services.
+- `/etc/systemd/oomd.conf.d/genesis.conf`: swap-use limit 90%, default
   pressure limit 60%, 20s duration.
-- `genesis-server.service` carries `ManagedOOMPreference=avoid`, so oomd prefers
-  killing the greedy session tree over the cognitive core. `avoid` is honored by
-  the per-user monitor (same-UID cgroup ownership) — see
-  systemd.resource-control(5).
+- `genesis-server.service` carries `ManagedOOMPreference=avoid`: oomd chooses
+  it only when no other candidate is left. The shared Serena units and the
+  disk guardian carry `avoid` too; a shared service killed for one session's
+  pressure would hurt every session.
+- The user half needs no sudo and runs as the Genesis user; run as root (the
+  manual `sudo bash -c …` path) it is skipped and says so, and `user.slice`
+  then stays monitored.
 - Its kernel-side `OOMScoreAdjust` is **`100`, not a negative value**, and that
   is a constraint rather than a preference. A user manager cannot lower
   `oom_score_adj` below the `oom_score_adj_min` of 0 it inherits from init;
@@ -70,7 +143,8 @@ remediation for the detected vantage — because the knob is never local:
   that advance via bare `git pull` and never re-run host-setup. A heal pages
   an INFO alert; opt a host out with `swap_reconcile_enabled: false` in the
   guardian config (an explicitly-false knob is otherwise reconciled back to
-  true — swap-on is the install invariant).
+  true — swap-on is the install invariant). A configured ceiling change also
+  pages its own INFO alert naming `swap_ceiling_pct`.
   **Opt-in ceiling**: `swap_ceiling_pct` (install-local only — set it in the
   deployed `guardian.yaml`, never in this repo's shipped template) caps the
   container's swap at that percentage of the HOST's `SwapTotal`, so the cap
@@ -90,6 +164,99 @@ remediation for the detected vantage — because the knob is never local:
 - **Bare metal / VM**: create a swapfile or LV sized to taste. Even a few
   GiB turns the OOM cliff into a ramp. **On guardian hosts this is now
   mechanical** — see the zram layer below.
+
+## Each interactive session in its own scope (the slot door)
+
+systemd-oomd kills a whole cgroup, so what shares a cgroup dies together. Every
+interactive Claude Code session therefore starts in a systemd user scope of its
+own, `genesis-slot-<slot>-<hex>.scope` under `genesis-slots.slice`, through
+`scripts/slot_exec.sh`. The scope holds claude and everything it spawns (its MCP
+servers, subagents, tool commands). Two things follow:
+
+- **A per-session memory cap.** A slot scope carries `MemoryMax=55%` of what
+  systemd sees as the machine (its container limit when there is one; for
+  example about 17.6 GiB on a 32 GiB machine) and `MemorySwapMax=5%` of the
+  same, with `OOMPolicy=continue`. A session whose tree outgrows both loses
+  its largest process to the kernel's OOM killer, inside that scope only, and
+  the next largest if it is still over; the scope and its claude keep running
+  unless claude itself is chosen. No `MemoryHigh` is set: near the cap it would
+  throttle the session instead of ending the runaway. The swap cap is what makes the
+  memory cap bite: measured, with swap uncapped a scope over `MemoryMax`
+  swaps and nothing is killed, so a runaway would thrash the shared swap.
+  `SLOT_EXEC_MEMORY_MAX` and `SLOT_EXEC_SWAP_MAX` override the values (`20G`,
+  `40%`, `infinity`); a malformed value falls back to the default, never to
+  no cap. This is the containment a runaway session meets first. The value is
+  set so that one runaway session, with the rest of a typical workload, stays
+  below the box-wide pressure line where oomd acts; two runaway sessions at
+  once can still reach it. If systemd refuses the cap (older versions lack
+  `OOMPolicy=` on scopes, which is then dropped silently; a manager that
+  refuses the memory properties gets a scope without them, said aloud), the
+  session still gets its scope. It is an interim value, set ahead
+  of measured per-session footprints; the learned per-slot limit replaces it.
+- **A smaller oomd action.** An oomd kill no longer takes every slot at once.
+  It is not one session per action on systemd 255, though: after killing a
+  cgroup, oomd's second pass over `cgroup.threads` fails with EINVAL for any
+  non-leader thread (pidfd_open without `PIDFD_THREAD`), oomd counts the kill
+  as failed and moves on to the next candidate, until one kill returns
+  cleanly (a single-threaded or fast-exiting cgroup). So one action takes the
+  top candidate plus every cgroup ranked above the first clean kill. systemd
+  256 fixed this (`CGROUP_NO_PIDFD` in `cg_kill`); Ubuntu 24.04's 255 does not
+  have it (#3874).
+
+Why a wrapper is needed: a pane's claude used to inherit the cgroup of the tmux
+SERVER, and the server lives wherever its first client ran (a login session
+scope from SSH, or `genesis-server.service` when the dashboard terminal started
+it). tmux 3.4 does move each pane into a `tmux-spawn-*.scope`, but it sends the
+request without waiting for the move, so the pane shell has usually forked
+claude already and claude stays behind. Measured on a live install: every
+foreground slot's claude sat in one login scope, so the smallest thing oomd
+could kill there was every slot at once.
+
+How it works and what it changes:
+
+- `slot_exec.sh` probes that systemd will create a scope (one throwaway
+  `systemd-run --scope … true`, about 40 ms), then `exec`s `systemd-run
+  --scope`, which registers the scope and execs the command in place. The pid,
+  the terminal, the process group and the exit status are claude's own, so the
+  slot's exit capture is unchanged. The environment is unchanged too: the
+  wrapper removes the `INVOCATION_ID` systemd adds (a caller's own is kept), and supplies
+  `XDG_RUNTIME_DIR` to `systemd-run` alone when the caller lacks it.
+- If no scope can be made (no systemd user manager, no `systemd-run`, a refused
+  property), it prints one line saying so and runs the command unscoped,
+  which is the behaviour before the wrapper.
+- Launch paths that use it: every `cc-slot.sh` slot (SSH slot hostnames, manual
+  SSH, the dashboard terminal); the bashrc `claude()` wrapper when claude runs
+  interactively without taking a slot (inside tmux, or with
+  `GENESIS_NO_TMUX_WRAP=1`); an interactive `gmodel` launch; and the
+  `genesis` command a fresh `install.sh` writes to `/usr/local/bin` (written
+  once, so an existing install keeps its old copy until it is regenerated; #2116). A non-tty
+  `claude` call (a session's Bash tool running `claude mcp …`), `-p` and
+  headless runs are not wrapped: they stay in their caller's scope.
+  Background `claude -p` runs started by the server already get their own scope
+  from the invoker.
+- When `cc-slot.sh` or `lobby-door.sh` starts the tmux server (no server was
+  running), the server
+  gets `genesis-tmux-server-<hex>.scope` in `app.slice`, marked
+  `ManagedOOMPreference=omit`. Every slot's terminal belongs to the server, so
+  killing it would end every slot. A server restart can no longer end it, since
+  it is out of `genesis-server.service`'s cgroup. The omit mark takes effect
+  only once oomd monitors a cgroup the user owns (the user manager): oomd
+  ignores the mark under a root-owned monitor such as `user.slice`, per
+  systemd.resource-control(5). A running server is joined
+  as before. Panes then get tmux's own scopes in `app.slice`. A process forked
+  before tmux's late move (the pane shell's first child) lands in the server's
+  scope and shares its omit mark; that is why the slot door wraps claude even
+  when it starts in that scope.
+- Check a session: `cat /proc/<claude pid>/cgroup` ends in
+  `genesis-slots.slice/genesis-slot-<slot>-<hex>.scope`. A slot started before
+  this change keeps its old cgroup until it is relaunched.
+- The scope adds no task cap (`TasksMax=infinity`; the per-user slice budget
+  still applies) and its systemd description is the slot label, never the
+  command line. The memory cap above is the interim value; learned per-slot
+  throttle and ceiling values arm only after measured per-session footprints
+  exist. A cap kill shows up as a "cgroup OOM kill(s) detected" alert from the
+  disk guardian, on purpose: a session lost work.
+- The tmux server's scope has no memory cap: it holds only the server.
 
 ## The zram layer (guardian hosts)
 
@@ -153,6 +320,21 @@ TasksMax=<value>` for a runtime change. The live PID budget is on the dashboard
 Container panel (amber ≥ 80%, red ≥ 90%), and the awareness loop raises an
 explanatory alert on approach.
 
+**Who holds it.** On every 5-minute awareness tick while the binding level is
+at or above 80%, the loop also records which processes hold the tasks
+(`observability/pid_breakdown.py`), whether or not the alert itself is in its
+hourly cooldown. It reads only `/proc` and the cgroup filesystem (no fork) and
+writes a best-effort JSON sample to `~/.genesis/logs/pid_snapshots/`: sampled cgroups
+under the binding level with their task counts, and observed process candidates grouped
+into trees (one per Claude Code session, and one per service or session scope
+otherwise), each with its thread total and its five largest members. A process
+is named by its program, plus the module or script for an interpreter, never
+its other arguments. The alert text carries the top five trees and cgroups and
+the file's path when retained; collection limits are reported as a partial sample.
+Files older than 7 days are pruned, and the directory is kept
+under 20 MB. `GENESIS_PID_BREAKDOWN_DISABLED=1` in the server's environment
+turns the recording off.
+
 ## How the body schema surfaces it
 
 The infrastructure profile (`INFRASTRUCTURE.md`, `infra_profile` package)
@@ -163,6 +345,8 @@ flags unprotected installs:
 |---|---|---|---|
 | `cgroup_memory_swap_max` | container | `"max"` (or an int) | `0` |
 | `oomd_user_slice_kill` | container | `true` | `false` |
+| `oomd_active` | container | `true` (`systemd-oomd.service` running: its cgroup is populated) | `false`: oomd is not running, so nothing monitors whatever is configured. `null` when it cannot be read: not booted with systemd, no unified hierarchy, or systemd's cgroup root not locatable |
+| `oomd_user_manager_monitored` | container | `true` (live `oomctl` listing) | `false`: oomd runs and does not list it (degraded to the backstop, where `avoid` is ignored). `null` when oomd is not running, `oomctl` is absent, or this process is barred from the system bus; any other failing `oomctl` keeps the prior value |
 | `pid_ceiling_effective_ok` | container | `true` | `false` |
 | `swap_total_kb` | host | > 0 | `0` |
 | `container_limits["limits.memory.swap"]` | host_virt | `"true"`/absent | `"false"` |

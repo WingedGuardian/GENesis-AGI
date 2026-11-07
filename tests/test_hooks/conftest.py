@@ -6,9 +6,49 @@ import json
 import os
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
+
+
+def _push_guard_instances(test_module) -> list[types.ModuleType]:
+    """Every copy of ``git_push_guard`` the test module holds in its globals.
+
+    Each test file loads its OWN copy, under its own name (``git_push_guard``,
+    ``round_request_guard``, ``gpg_uut`` …) and mostly without registering it in
+    ``sys.modules``, so a ``sys.modules`` lookup misses them. The test module's
+    globals hold the copy it actually calls, whatever it is named."""
+    if test_module is None:
+        return []
+    found = []
+    for value in vars(test_module).values():
+        path = getattr(value, "__file__", None) if isinstance(value, types.ModuleType) else None
+        if (
+            path
+            and os.path.basename(path) == "git_push_guard.py"
+            and hasattr(value, "_merge_deadline")
+        ):
+            found.append(value)
+    return found
+
+
+@pytest.fixture(autouse=True)
+def _disarm_push_guard_deadline(request):
+    """Start and end every hook test with no merge deadline armed (#2904).
+
+    ``git_push_guard`` keeps its shared merge-path deadline in a module global.
+    ``main()`` disarms it on exit, but tests also call gates such as
+    ``_check_codex_round_escalation`` directly, and those arm it outside
+    ``main()``. A deadline left armed expires ~45 s later and makes every later
+    gh-backed call in that file raise, failing whichever test happens to run
+    then. Reads the test module's globals; imports nothing."""
+    guards = _push_guard_instances(getattr(request, "module", None))
+    for guard in guards:
+        guard._merge_deadline = None
+    yield
+    for guard in guards:
+        guard._merge_deadline = None
 
 
 @pytest.fixture(autouse=True)
@@ -214,6 +254,18 @@ def _hermetic_squash_body_file(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_main_ci_note(monkeypatch):
+    """Skip the ``--check-pr`` red-base NOTE's reads for EVERY hook test.
+
+    The NOTE reads the PR's base ref and the base branch's CI runs; report tests
+    run as subprocesses too, hence an environment variable. The NOTE is advisory
+    and never moves a verdict. Its own behaviour is tested in
+    tests/test_hooks/test_merge_gate_main_ci_note.py, which clears this per case."""
+    monkeypatch.setenv("_TEST_MAIN_CI_NOTE", "off")
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_main_reverts(monkeypatch):
     """Pin the ``--check-pr`` ``main-reverts`` row's commit read for EVERY hook test.
 
@@ -225,6 +277,38 @@ def _hermetic_main_reverts(monkeypatch):
     own behaviour is tested in tests/test_hooks/test_merge_gate_main_reverts.py,
     which overrides this per case."""
     monkeypatch.setenv("_TEST_GH_PR_COMMITS", '{"sha": "' + "0" * 40 + '", "parents": 1}')
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_stale_base_note(monkeypatch):
+    """Switch off the ``--check-pr`` stale-base NOTE for EVERY hook test.
+
+    The NOTE reads the PR head's CI runs, the base's commits and their files, so
+    without this every test that drives ``check_pr_report`` would make live calls
+    (some as a subprocess, hence an environment variable the children inherit). It
+    is advisory and never moves a verdict. Its own behaviour is tested in
+    tests/test_hooks/test_merge_gate_stale_base_note.py, which clears this per case."""
+    monkeypatch.setenv("_TEST_STALE_BASE_NOTE", "off")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_rework(monkeypatch):
+    """Pin the BLOCKING ``rework`` gate's sent-back list EMPTY for EVERY hook test.
+
+    The gate reads ``gh pr list --label needs-rework`` (and the architecture label)
+    first, in both the ``--check-pr`` report and the merge arm, so without this pin
+    every test driving either one makes a live call (some as a subprocess, hence an
+    environment variable the children inherit). An empty list makes every PR ``n/a``
+    unless its body declares a replacement: a declared reference then falls to a
+    timeline read, whose seam is pinned empty here so it reads as UNREADABLE rather
+    than reaching the network. No existing test body declares one. The gate's own
+    behaviour is tested in tests/test_hooks/test_rework_gate.py, which overrides
+    these per case."""
+    monkeypatch.setenv("_TEST_GH_REWORK_SENT_BACK", "")
+    monkeypatch.setenv("_TEST_GH_REWORK_TIMELINE", "{}")
+    monkeypatch.setenv("_TEST_GH_REWORK_ACK", "{}")
     yield
 
 

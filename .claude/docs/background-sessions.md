@@ -16,6 +16,12 @@ Read this guide any time you're considering a background session or sub-agent.
 outlive this conversation → background session. If you just need an answer in
 the next few minutes → sub-agent.
 
+Server-side machine connectors use an opt-in prepared native receipt rather than
+the MCP queue. This mode has explicit cancellation, a receipt-to-execution
+deadline, private full results and no automatic parking/replay. It does not
+enable peer access by itself. See
+[prepared native sessions](../../docs/reference/native-managed-sessions.md).
+
 > **Note:** the background lane owns a longer CC background-wait ceiling (set to its
 > full `timeout_s`), so a dispatched `Workflow` inside a background session runs to
 > completion instead of the CLI's default 600s truncation.

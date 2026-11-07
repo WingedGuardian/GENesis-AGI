@@ -24,6 +24,9 @@ async def enqueue(
     thread_id: str | None = None,
     validated_recipient: str | None = None,
     labeled_surplus: bool = False,
+    email_subject: str | None = None,
+    pending_id: str | None = None,
+    commit: bool = True,
 ) -> str:
     """Queue a message for bridge delivery. Returns the pending ID.
 
@@ -36,16 +39,21 @@ async def enqueue(
     QUEUED cold-marketing send (the MCP subprocess enqueue path) is rebuilt with
     ``labeled_surplus=True`` and classifies BULK at the autonomy gate — without it
     a queued cold send mis-classifies as IDENTITY.
+
+    ``email_subject`` carries an email's own subject line through the queue. The
+    drain makes it the request topic, which becomes the MIME subject; without it
+    the topic is rebuilt from the message start, so a queued marketing email went
+    out with the start of its body in the subject.
     """
     from datetime import UTC, datetime
 
-    pending_id = str(uuid.uuid4())
+    pending_id = pending_id or str(uuid.uuid4())
     now = datetime.now(UTC).isoformat()
     await db.execute(
         """INSERT INTO pending_outreach
            (id, message, category, channel, urgency, deliver_after, created_at,
-            thread_id, validated_recipient, labeled_surplus)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            thread_id, validated_recipient, labeled_surplus, email_subject)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             pending_id,
             message,
@@ -57,9 +65,11 @@ async def enqueue(
             thread_id,
             validated_recipient,
             1 if labeled_surplus else 0,
+            email_subject or None,
         ),
     )
-    await db.commit()
+    if commit:
+        await db.commit()
     return pending_id
 
 
@@ -117,15 +127,43 @@ async def cancel(db: aiosqlite.Connection, pending_id: str) -> tuple[bool, str]:
     Making ``delivered`` stop meaning two things is a larger fix in the scheduler
     and is tracked separately; this function refuses to assert what it cannot
     know.
+
+    A retained peer message has already left for collection even while its
+    pending row awaits history reconciliation. Refuse cancellation atomically
+    against that retained identity; leave the pending row open for recovery.
     """
     from datetime import UTC, datetime
 
+    # Standalone MCP can have only pending_outreach before bootstrap. Runtime
+    # migrations finish before delivery starts; online schema changes are not
+    # supported. Do not cache this compatibility check. Fetch all rows so its
+    # read statement is finished before the guarded write obtains its snapshot.
+    has_outbox = await (
+        await db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='peer_outbox'")
+    ).fetchall()
+    retained_guard = ""
+    if has_outbox:
+        # CASE keeps legacy plaintext/invalid JSON cancellable. Match identity,
+        # including ACKed anchors, without rerunning mutable disclosure policy.
+        retained_guard = """
+          AND NOT EXISTS (
+              SELECT 1 FROM peer_outbox AS retained
+               WHERE pending_outreach.channel = 'agent'
+                 AND retained.peer_id = CASE WHEN json_valid(pending_outreach.message)
+                     THEN json_extract(pending_outreach.message, '$.peer_id') END
+                 AND retained.epoch = CASE WHEN json_valid(pending_outreach.message)
+                     THEN json_extract(pending_outreach.message, '$.epoch') END
+                 AND retained.message_id = CASE WHEN json_valid(pending_outreach.message)
+                     THEN json_extract(pending_outreach.message, '$.message.messageId') END
+          )
+        """
     cursor = await db.execute(
         """UPDATE pending_outreach
               SET cancelled_at = ?
             WHERE id = ?
               AND delivered = 0
-              AND cancelled_at IS NULL""",
+              AND cancelled_at IS NULL"""
+        + retained_guard,  # noqa: S608 — fixed compatibility clause only
         (datetime.now(UTC).isoformat(), pending_id),
     )
     await db.commit()
@@ -203,6 +241,7 @@ async def ensure_table(db: aiosqlite.Connection) -> None:
             thread_id           TEXT,
             validated_recipient TEXT,
             labeled_surplus     INTEGER NOT NULL DEFAULT 0,
+            email_subject       TEXT,
             cancelled_at        TEXT
         )
     """)
@@ -227,6 +266,7 @@ async def ensure_table(db: aiosqlite.Connection) -> None:
             "ALTER TABLE pending_outreach ADD COLUMN labeled_surplus INTEGER NOT NULL DEFAULT 0",
         ),
         ("cancelled_at", "ALTER TABLE pending_outreach ADD COLUMN cancelled_at TEXT"),
+        ("email_subject", "ALTER TABLE pending_outreach ADD COLUMN email_subject TEXT"),
     ):
         if column in cols:
             continue

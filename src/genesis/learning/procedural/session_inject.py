@@ -63,13 +63,16 @@ async def load_active_procedures(db_path: str | Path) -> str | None:
         # blind session-start injection from CORE/ADVISORY/LIBRARY to CORE so we
         # don't inject mid-tier procedures of uncertain relevance before the
         # session topic is known. Lower tiers surface contextually elsewhere.
+        from genesis.learning.procedural.lesson_shape import LIVE_LESSON_SQL
+
+        # A held lesson (external, unreviewed) never reaches a session.
+        # LIVE_LESSON_SQL is a constant, not input.
         rows = await db.execute(
-            """SELECT task_type, principle, steps, activation_tier, confidence
-               FROM procedural_memory
-               WHERE activation_tier = 'CORE'
-                 AND deprecated = 0 AND quarantined = 0
-               ORDER BY confidence DESC
-               LIMIT ?""",
+            "SELECT task_type, principle, steps, activation_tier, confidence "  # noqa: S608
+            "FROM procedural_memory "
+            "WHERE activation_tier = 'CORE' AND deprecated = 0 AND quarantined = 0 "
+            f"AND ({LIVE_LESSON_SQL}) "
+            "ORDER BY confidence DESC LIMIT ?",
             (_MAX_PROCEDURES,),
         )
         results = await rows.fetchall()

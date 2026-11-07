@@ -16,6 +16,8 @@ from flask import Flask
 
 from genesis.dashboard.routes import updates
 
+pytestmark = pytest.mark.usefixtures("updates_sandbox")
+
 _DDL = """
 CREATE TABLE observations (
     id TEXT PRIMARY KEY, type TEXT, content TEXT,

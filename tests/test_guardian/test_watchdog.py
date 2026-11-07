@@ -479,7 +479,7 @@ def _git_side_effect(container_hash: str):
 
     def _run(cmd, **kw):
         if "symbolic-ref" in cmd:
-            return MagicMock(returncode=0, stdout="main\n")
+            return MagicMock(returncode=0, stdout="refs/heads/main\n")
         if "log" in cmd:
             return MagicMock(returncode=0, stdout=container_hash + "\n")
         return MagicMock(returncode=0, stdout="")
@@ -576,7 +576,7 @@ class TestCodeDrift:
 
         def _side_effect(cmd, **kw):
             if "symbolic-ref" in cmd:
-                return MagicMock(returncode=0, stdout="main\n")
+                return MagicMock(returncode=0, stdout="refs/heads/main\n")
             if "log" in cmd:
                 return MagicMock(returncode=0, stdout="a915a28\n")
             if "merge-base" in cmd:
@@ -606,7 +606,7 @@ class TestCodeDrift:
 
         def _se(cmd, **kw):
             if "symbolic-ref" in cmd:
-                return MagicMock(returncode=0, stdout="main\n")
+                return MagicMock(returncode=0, stdout="refs/heads/main\n")
             if "log" in cmd:
                 seen["log_cmd"] = cmd
                 return MagicMock(returncode=0, stdout="dep10y0\n")
@@ -1197,3 +1197,63 @@ class TestContainerLingerReconciler:
             for _ in range(_THRESHOLD):
                 await wd._check_container_linger()
         assert _alert_source_ids(outreach).count("guardian:container_linger_disabled") == 2
+class TestBranchGate:
+    """The off-main skip gates only the drift comparison (#2978 PR E): the four
+    host reconcilers that reuse the version() payload run on any branch, and
+    `live`, the integration branch, is compared like main."""
+
+    @staticmethod
+    def _run_on(ref: str):
+        from unittest.mock import MagicMock
+
+        def _run(cmd, **kw):
+            if "symbolic-ref" in cmd:
+                return MagicMock(returncode=0, stdout=ref + "\n")
+            if "log" in cmd:
+                return MagicMock(returncode=0, stdout="a915a28\n")
+            return MagicMock(returncode=0, stdout="")
+
+        return _run
+
+    @staticmethod
+    def _stub_reconcilers(wd):
+        names = (
+            "_check_gateway_staleness",
+            "_check_authkey_hardening",
+            "_check_cc_auth",
+            "_check_host_linger",
+        )
+        for name in names:
+            setattr(wd, name, AsyncMock())
+        return names
+
+    @pytest.mark.asyncio
+    async def test_off_main_the_reconcilers_run_and_drift_is_skipped(self):
+        wd, r, eb, outreach = _drift_watchdog(deployed_commit="0ld0ld0")
+        wd._host_contains_commit = AsyncMock(return_value=False)  # would alarm if reached
+        names = self._stub_reconcilers(wd)
+        with patch(
+            "genesis.guardian.watchdog.subprocess.run",
+            side_effect=self._run_on("refs/heads/feat/x"),
+        ):
+            for _ in range(_THRESHOLD + 1):
+                await wd._check_code_drift_inner()
+        for name in names:
+            getattr(wd, name).assert_awaited()
+        wd._host_contains_commit.assert_not_awaited()
+        assert wd._drift_count == 0
+        outreach.submit_raw.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_on_live_drift_is_compared_like_main(self):
+        wd, r, eb, outreach = _drift_watchdog(deployed_commit="0ld0ld0")
+        wd._host_contains_commit = AsyncMock(return_value=False)
+        self._stub_reconcilers(wd)
+        with patch(
+            "genesis.guardian.watchdog.subprocess.run",
+            side_effect=self._run_on("refs/heads/live"),
+        ):
+            for _ in range(_THRESHOLD):
+                await wd._check_code_drift_inner()
+        wd._host_contains_commit.assert_awaited()
+        assert wd._drift_count == _THRESHOLD

@@ -44,8 +44,13 @@ commands perform no cloud budget lookup.
 
 Guarded actions must be standalone, unwrapped commands. Compounds, prior `cd`,
 `pushd`, `env -C`, command-scoped assignments and other wrappers are refused.
-For commits, use the payload directory or one literal `git -C` directory; repeated
-`-C` and other global Git options are unsupported. Inherited `GH_REPO`, `GIT_DIR`,
+For commits, use exactly `git -C /absolute/canonical/path commit …`: one literal,
+absolute `-C` directory that is already its own real path (no symlink, no `..`, no
+process-relative path such as `/proc/self/cwd`). The payload directory alone, repeated
+`-C` and other global Git options are unsupported. For review requests, use one
+literal PR number with `--repo github.com/OWNER/REPO`, or one literal github.com PR
+URL; a host-less `OWNER/REPO` would resolve against gh's configured default host.
+Inherited `GH_REPO`, `GIT_DIR`,
 `GIT_WORK_TREE` and `GIT_COMMON_DIR` are refused before either budget lookup.
 
 Help and positively identified dry-run modes bypass budget lookup. Option values

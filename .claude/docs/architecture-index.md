@@ -10,7 +10,6 @@
 
 ## Where Else to Look
 
-- **Plans**: `docs/plans/` — implementation plans for specific features
 - **Reference**: `docs/reference/` — lessons learned, audits, project rules
-- **Design specs**: `docs/superpowers/specs/` — detailed feature designs
+- **Decisions**: `docs/decisions/` — design decisions
 - **CC docs**: `.claude/docs/` — Claude Code-specific reference material

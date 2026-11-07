@@ -180,6 +180,12 @@ async def unified_comms():
                 pending_approvals.append(dict(row))
             elif isinstance(row, dict):
                 pending_approvals.append(row)
+        from genesis.payments.approval import PAYMENT_APPROVAL_ACTION_TYPE
+
+        # A card release is approved only by its Telegram tap (payments/approval.py).
+        pending_approvals = [
+            r for r in pending_approvals if r.get("action_type") != PAYMENT_APPROVAL_ACTION_TYPE
+        ]
         # Desktop-takeover rows are withheld here for the same reason the
         # dashboard approvals queue withholds them: this feed renders a pending
         # row as a generic approval card, and a card that cannot say it is

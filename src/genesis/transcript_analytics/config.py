@@ -6,14 +6,14 @@ import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from genesis.env import genesis_home
+from genesis.env import claude_home, genesis_home
 from genesis.hostmetrics.run import MIN_RAM
 
 
 @dataclass(frozen=True)
 class Config:
     enabled: bool = False
-    projects_dir: Path = field(default_factory=lambda: Path.home() / ".claude/projects")
+    projects_dir: Path = field(default_factory=lambda: claude_home() / "projects")
     data_dir: Path = field(default_factory=lambda: genesis_home() / "analytics/transcripts")
     ram_bytes: int | None = None
     ram_pct: float = 25

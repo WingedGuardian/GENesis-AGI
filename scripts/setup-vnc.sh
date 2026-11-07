@@ -56,65 +56,33 @@ fi
 # ── 3. Systemd units ─────────────────────────────────────
 mkdir -p "$SYSTEMD_DIR"
 
-# Xvfb — virtual display :99 with openbox window manager
-cat > "$SYSTEMD_DIR/genesis-xvfb.service" << EOF
-[Unit]
-Description=Genesis Virtual Display (Xvfb)
-After=default.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/Xvfb :99 -screen 0 1920x1080x24 -ac
-ExecStartPost=/bin/bash -c 'sleep 1 && DISPLAY=:99 /usr/bin/openbox --sm-disable &'
-ExecStartPost=/bin/bash -c 'sleep 1 && HOME=%h DISPLAY=:99 /usr/bin/feh --bg-center $BRAIN_IMG'
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=default.target
-EOF
-
-# x11vnc — VNC server on display :99
-# Flags:
+# The three units are templates under scripts/systemd/vnc/: Xvfb (virtual display
+# :99 with openbox), x11vnc (VNC server on :99), noVNC (browser client). Each is
+# written only when the installed unit is Genesis's own render: one edited by hand
+# is kept and named (lib/managed_units.sh); local changes belong in a
+# <unit>.d/*.conf drop-in. The templates hold no comments on purpose: their text
+# equals what this script used to write, so existing installs read as unedited.
+#
+# x11vnc flags (genesis-vnc.service.template):
 #   -xdamage   — use X DAMAGE extension to only send changed regions (was -noxdamage)
 #   -threads   — multi-threaded encoding for better FPS
 #   NOTE: -ncache was removed — it creates a hidden pixel cache below the
 #   visible screen that makes the framebuffer ~11x taller, causing noVNC
 #   local scaling to produce a stretched/distorted view.
 #   xclip required for clipboard sync (installed above)
-cat > "$SYSTEMD_DIR/genesis-vnc.service" << EOF
-[Unit]
-Description=Genesis VNC Server (x11vnc)
-After=genesis-xvfb.service
-Requires=genesis-xvfb.service
-
-[Service]
-Type=simple
-Environment=DISPLAY=:99
-ExecStart=/usr/bin/x11vnc -display :99 -forever -shared -rfbauth %h/.genesis/vnc_passwd -rfbport 5999 -xdamage -threads
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=default.target
-EOF
-
-# noVNC — browser-based VNC client
-cat > "$SYSTEMD_DIR/genesis-novnc.service" << EOF
-[Unit]
-Description=Genesis noVNC (browser-based VNC client)
-After=genesis-vnc.service
-Requires=genesis-vnc.service
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/websockify --web=/usr/share/novnc/ 6080 localhost:5999
-Restart=on-failure
-RestartSec=3
-
-[Install]
-WantedBy=default.target
-EOF
+# shellcheck source=lib/managed_units.sh
+. "$SCRIPT_DIR/lib/managed_units.sh"
+# shellcheck disable=SC2034  # read by genesis_install_managed_unit
+GENESIS_MU_PREV="$(genesis_mu_prev_from_state)"
+mkdir -p "$HOME/tmp"
+_mu_dir="$(mktemp -d -p "$HOME/tmp" setup-vnc-units.XXXXXX)"
+genesis_mu_precheck "$SYSTEMD_DIR" "$_mu_dir"
+_brain_esc=$(printf '%s' "$BRAIN_IMG" | sed -e 's/[\\&|]/\\&/g')
+for _vnc_unit in genesis-xvfb.service genesis-vnc.service genesis-novnc.service; do
+    sed -e "s|__BRAIN_IMG__|$_brain_esc|g" "$GENESIS_ROOT/scripts/systemd/vnc/$_vnc_unit.template" > "$_mu_dir/render"
+    genesis_install_managed_unit "scripts/systemd/vnc/$_vnc_unit.template" "$_mu_dir/render" "$SYSTEMD_DIR/$_vnc_unit"
+done
+rm -rf "$_mu_dir"
 
 echo "Systemd units written to $SYSTEMD_DIR"
 

@@ -41,7 +41,7 @@ async def _setup() -> aiosqlite.Connection:
 
 
 def _patch_compute(monkeypatch, alerts):
-    async def _fake():
+    async def _fake(**kwargs):
         return alerts, {a["id"] for a in alerts}
 
     monkeypatch.setattr("genesis.mcp.health.errors._compute_alerts", _fake)
@@ -135,7 +135,7 @@ async def test_compute_failure_never_raises(monkeypatch):
     db = await _setup()
     try:
 
-        async def _boom():
+        async def _boom(**kwargs):
             raise RuntimeError("health snapshot exploded")
 
         monkeypatch.setattr("genesis.mcp.health.errors._compute_alerts", _boom)

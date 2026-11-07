@@ -127,6 +127,8 @@ _CASES = [
         "gated",
     ),
     ("git_push_guard", "hooks/git_push_guard.py", "git log --oneline -5", 0, "benign"),
+    ("pr_open_review_gate", "hooks/pr_open_review_gate.py", 'gh pr create --title t --body b', 2, "gated"),
+    ("pr_open_review_gate", "hooks/pr_open_review_gate.py", "git status", 0, "benign"),
     (
         "review_enforcement_commit",
         "review_enforcement_commit.py",
@@ -668,6 +670,14 @@ _NOT_WIRED = {
     # test_codex_review_stop::test_launcher_denies_each_module_scope_import_failure;
     # test_project_config_wires_fallback_launcher checks the actual entry point.
     "codex_review_stop.py": "Codex shell launcher converts every sibling import crash to exit 2",
+    # The inactive validator definition also runs its explicit-allow shell
+    # launcher. Missing/crashing sibling imports and a healthy allow control
+    # are measured by test_codex_validator_adapter's launcher import test.
+    "codex_validator_adapter.py": "Codex shell launcher converts every sibling import crash to exit 2",
+    # An inactive adapter child, not a directly configured Claude/Codex hook.
+    # test_validator_role_guard::test_actual_adapter_denies_every_role_import_failure
+    # measures missing/crashing imports for every bare sibling plus healthy allow.
+    "validator_role_guard.py": "Validator adapter converts child import failures to an explicit deny",
     # Its remaining bare import is `shell_parse`, and its only usable degraded token
     # would be the pipe character — 52,220 of 74,282 commands (70.30%). Wiring it would
     # not make the broken state safe, it would make it UNREPAIRABLE, and a degraded
@@ -685,12 +695,33 @@ _NOT_WIRED = {
     # direction for a gate whose whole measured design property is that it must
     # never become the thing that wedges the work.
     "adopt_first_gate.py": "fail-open by contract — refusing would wedge every edit and plan exit",
+    # plan_premise_gate shares that contract and that matcher: a broken import that
+    # refused would stop every ExitPlanMode until repair, for a check whose worst miss
+    # is a plan presented without its premise answers.
+    "plan_premise_gate.py": "fail-open by contract — refusing would wedge every plan exit",
     # Not a hook at all: the deploy-candidates engine is a command-line program run
     # through scripts/deploy_candidates. Its "return 2" is argparse's usage error,
     # and a failed import exiting 1 is the correct CLI answer ("failed"), not a
     # vanished guard. MEASURED 2026-10-01: 0 references to it in .claude/settings.json,
     # .claude/ or scripts/hooks/, so Claude Code never runs it as a hook.
     "deploy_candidates.py": "a CLI, not a hook: wired nowhere in .claude/settings.json",
+    # Not wired as a hook: the issue premise gate is the GitHub Action
+    # .github/workflows/premise-gate.yml's script. Its `return 2` is "no event file",
+    # a usage error, and a failed import there fails the Actions job loudly. It IS
+    # imported by hooks/issue_premise_gate.py, lazily and under that hook's
+    # degraded_exit, so a broken import of it blocks the create there instead.
+    "premise_gate.py": "an Actions script, not wired as a hook: issue_premise_gate imports it under degraded_exit",
+    # Not a hook either: the validator's sealed shell command RUNS this program;
+    # the PreToolUse decision is codex_validator_guard.py's. A failed import exits
+    # 1 before any request is read, so nothing is served and the caller sees a
+    # failure. MEASURED 2026-10-14: 0 references in .claude/settings.json or
+    # .claude/; its only scripts/hooks/ mention is codex_validator_shell.py naming
+    # it as the admitted runner.
+    "codex_validator_request.py": "a sealed-command CLI, not a hook: wired nowhere in .claude/",
+    # Standalone CLI: settings and its generated hook invoke the adapter, not
+    # this launcher. test_launcher_sibling_import_failure_stops_before_startup
+    # measures both sibling failures aborting before profile/session startup.
+    "codex_validator_launcher.py": "a standalone CLI; import failure aborts startup, not a hook decision",
 }
 
 
@@ -1348,13 +1379,10 @@ def test_degraded_pretool_check_reads_the_stamp_exactly_as_the_healthy_path_does
 #:
 #: Keyed on the EXACT normalised command, not a substring. A substring key is an
 #: exemption with a wildcard on the end: a newly wired
-#: `python3 scripts/cc-deploy-timeout-guard.py` would inherit the shell hook's
+#: `python3 scripts/<hook>.py` would inherit a shell hook's
 #: waiver and never be executed, which is precisely the "a new guard fails by
 #: construction" guarantee this gate exists to make.
-_NOT_PYTHON_ON_BASH = {
-    "bash ${CLAUDE_PROJECT_DIR}/.claude/hooks/cc-deploy-timeout-guard":
-        "shell script; never imports hook_input",
-}
+_NOT_PYTHON_ON_BASH: dict[str, str] = {}
 
 #: The inline `bash -c` guard is exempted by its own exact text, which is long and
 #: contains quoting, so it is matched after whitespace normalisation rather than
@@ -1384,6 +1412,7 @@ _INLINE_SHELL_PREFIX = "bash -c 'IN=$(cat);"
 _ADVISORY_BY_DESIGN = {
     "hooks/capped_read_advisory.py": "ADVISORY ONLY.",
     "hooks/credential_surface_hook.py": "Exit 0 always — advisory, never blocks.",
+    "hooks/deploy_timeout_advisory.py": "ADVISORY ONLY. It never blocks and never asks",
     "hooks/pipe_status_guard.py": "ADVISORY, never blocking:",
     "hooks/pr_close_advisory.py": "Say so; never block it.",
     "hooks/pre_push_privacy_review.py": "NON-BLOCKING.",
@@ -1517,13 +1546,17 @@ def test_every_bash_hook_declares_its_degrade_direction(tmp_path, display, rel, 
         return
 
     root, home = _broken_hook_input(tmp_path, f"home_contract_{abs(hash(display)) % 10**8}")
+    # The dispatched stamp is SCRUBBED: a hook that passes dispatched sessions first
+    # (issue_premise_gate) would otherwise exit 0 here whenever this suite itself runs
+    # inside a dispatched session, and the foreground contract would go untested.
+    env = {k: v for k, v in os.environ.items() if k != "GENESIS_CC_SESSION"}
     res = subprocess.run(
         [sys.executable, str(root / "scripts" / rel), *argv],
         input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "echo hello"}}),
         capture_output=True,
         text=True,
         cwd=str(root),
-        env={**os.environ, "HOME": str(home)},
+        env={**env, "HOME": str(home)},
         timeout=90,
     )
 

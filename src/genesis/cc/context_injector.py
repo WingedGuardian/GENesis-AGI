@@ -44,6 +44,10 @@ class ContextInjector:
                 limit=limit,
             )
         except Exception as exc:
+            from genesis.util.execution_privacy import private_execution_active
+            if private_execution_active():
+                logger.warning("Private context enrichment unavailable")
+                return ""
             logger.warning(
                 "Context injection retrieval failed: %s: %s",
                 type(exc).__name__,

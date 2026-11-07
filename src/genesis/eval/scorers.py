@@ -365,7 +365,7 @@ class LLMJudgeScorer(Scorer):
                 raise ValueError("judge response missing required 'score' key")
             score_val = float(parsed["score"])
             rationale = str(parsed.get("rationale", ""))
-        except (json.JSONDecodeError, ValueError, TypeError) as exc:
+        except (json.JSONDecodeError, ValueError, TypeError, OverflowError) as exc:
             logger.debug(
                 "LLMJudgeScorer parse failure on rubric %s: %s; raw=%r",
                 rubric.name, exc, raw[:200],

@@ -23,6 +23,7 @@ from genesis.learning.procedural.embedding import (
     _fail_open_timestamps,
     get_embedding_provider,
 )
+from genesis.learning.procedural.tool_names import TOOL_TRIGGER_GUIDANCE
 
 if TYPE_CHECKING:
     import aiosqlite
@@ -116,7 +117,7 @@ _MULTI_SEGMENTATION = (
 
 _MULTI_SCHEMA_EXAMPLE = """\
 ```json
-{"procedures": [{"task_type": "kebab-slug", "scenario": "When <trigger>", "principle": "<specific problem solved, one line>", "steps": ["<concrete step with the REAL command/path/flag>"], "tools_used": ["..."], "context_tags": ["..."], "tool_trigger": ["Bash"], "is_subprocedure_of": "<parent task_type or null>"}]}
+{"procedures": [{"task_type": "kebab-slug", "scenario": "When <trigger>", "principle": "<specific problem solved, one line>", "steps": ["<concrete step with the REAL command/path/flag>"], "tools_used": ["..."], "context_tags": ["..."], "tool_trigger": ["<a tool name, or one shell command such as git push>"], "is_subprocedure_of": "<parent task_type or null>"}]}
 ```"""
 
 
@@ -132,6 +133,7 @@ def _build_multi_struggle_prompt(spine_text: str, score: float) -> str:
         + "\n\n"
         "## Struggle Score: " + f"{score:.2f}" + "\n\n"
         "Return ONLY this JSON in backticks (the list may be empty):\n\n" + _MULTI_SCHEMA_EXAMPLE
+        + "\n\ntool_trigger: " + TOOL_TRIGGER_GUIDANCE + "\n"
     )
 
 

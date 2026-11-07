@@ -1,21 +1,18 @@
-"""Consistency LOCK for the value-flag specs duplicated across the guard hooks.
+"""Consistency locks for duplicated Git-global value-flag specs.
 
-The pr-merge / push / commit guards each carry their OWN copy of the gh/git
-"value-flag" sets — the flags that consume the FOLLOWING argv token as their
-value (so a scan for a positional/binding does not misread that value). Those
-copies MUST stay identical across files: a flag added to one copy but not the
-others is exactly the parse divergence that let the separated ``-R`` form
-bypass every fail-closed merge gate (``gh pr -R o/r merge N --admin``, #1385
-round-5).
+The pr-merge / push / commit guards each carry their OWN copy of the Git-global
+flags that consume the FOLLOWING argv token as their value (so a scan for a
+positional/binding does not misread that value). Those copies MUST stay
+identical across files: a flag added to one copy but not the others is exactly
+the parse divergence that let the separated ``-R`` form bypass every
+fail-closed merge gate (``gh pr -R o/r merge N --admin``, #1385 round-5).
 
-This test is the drift TRIP-WIRE. Physical de-duplication (one shared spec) is
-deliberately deferred to the gate-core extraction (S3) — which restructures
-these files anyway; until then this lock makes the next silent drift a RED CI
-check instead of a live bypass.
+The Git-push argument scanner now has one shared implementation and a help-table
+drift test. ``pre_push_privacy_review`` retains its separate parser and local
+value-flag contract.
 
-If this test FAILS: you changed ONE copy of a value-flag set. Update ALL copies
-named in the failing assertion so they match again — they are intentionally
-identical, not coincidentally so.
+If the global-value consistency test fails, update all copies named in its
+assertion.
 """
 
 from __future__ import annotations
@@ -105,21 +102,15 @@ def test_git_global_value_flags_identical_across_all_copies():
         )
 
 
-def test_push_value_flags_identical_across_all_copies():
-    """The two git-push value-flag copies must be byte-identical (as sets)."""
-    copies = {
-        "git_push_guard._PUSH_VALUE_FLAGS": gpg._PUSH_VALUE_FLAGS,
-        "pre_push_privacy_review._PUSH_VALUE_FLAGS": ppr._PUSH_VALUE_FLAGS,
-    }
-    for name, spec in copies.items():
-        members = set(spec)
-        assert members == set(_CANONICAL_PUSH_VALUE_FLAGS), (
-            f"{name} drifted from the canonical git-push value-flag set. "
-            f"All copies MUST stay identical — update every one of "
-            f"{sorted(copies)}. "
-            f"Missing={set(_CANONICAL_PUSH_VALUE_FLAGS) - members}, "
-            f"Extra={members - set(_CANONICAL_PUSH_VALUE_FLAGS)}"
-        )
+def test_privacy_hook_push_value_flags_match_its_contract():
+    """The privacy hook keeps its separate parser and value-flag contract."""
+    members = set(ppr._PUSH_VALUE_FLAGS)
+    assert members == set(_CANONICAL_PUSH_VALUE_FLAGS), (
+        "pre_push_privacy_review._PUSH_VALUE_FLAGS drifted from its canonical "
+        "git-push value-flag set. "
+        f"Missing={set(_CANONICAL_PUSH_VALUE_FLAGS) - members}, "
+        f"Extra={members - set(_CANONICAL_PUSH_VALUE_FLAGS)}"
+    )
 
 
 # ── Derived expectation: the table must cover what the INSTALLED git consumes ──

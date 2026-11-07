@@ -108,6 +108,26 @@ def test_build_args_safe_mode(invoker):
     assert "--safe-mode" not in default_args
 
 
+@pytest.mark.parametrize("ephemeral", [False, True])
+def test_session_persistence_can_be_disabled_without_changing_the_default(invoker, ephemeral):
+    args = invoker._build_args(CCInvocation(prompt="diagnostic", no_session_persistence=ephemeral))
+    assert ("--no-session-persistence" in args) == ephemeral
+    assert "--no-session-persistence" not in invoker._build_args(CCInvocation(prompt="ordinary"))
+
+
+def test_disable_tools_is_explicit_and_probe_settings_keep_only_env(invoker, monkeypatch):
+    from genesis.cc.provider_readiness import isolated_provider
+
+    hooks = MagicMock(return_value="/unused-hooks.json")
+    monkeypatch.setattr("genesis.cc.invoker.cc_span_settings_path", hooks)
+    with isolated_provider(probe=True):
+        args = invoker._build_args(CCInvocation(prompt="probe", disable_tools=True))
+    assert args[args.index("--tools") + 1] == ""
+    assert set(json.loads(args[args.index("--settings") + 1])) == {"env"}
+    hooks.assert_not_called()
+    assert "--tools" not in invoker._build_args(CCInvocation(prompt="ordinary"))
+
+
 def test_build_args_includes_span_settings(invoker, monkeypatch):
     """Dispatched sessions get --settings pointing at the span-hook file."""
     import genesis.cc.invoker as inv_mod
@@ -735,6 +755,54 @@ def test_probe_sets_the_same_properties_as_the_real_invocation(monkeypatch):
     for prop in inv_mod._SCOPE_PROPERTIES:
         assert ["-p", prop] == probe_argv[probe_argv.index(prop) - 1 : probe_argv.index(prop) + 1]
         assert prop in out
+
+
+def test_scope_argv_carries_a_fixed_description():
+    import genesis.cc.invoker as inv_mod
+
+    assert inv_mod._scope_argv() == [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "--quiet",
+        "--description=Genesis CC session",
+        "-p",
+        "IOWeight=100",
+        "-p",
+        "MemoryHigh=62%",
+        "-p",
+        "MemoryMax=75%",
+        "--",
+    ]
+
+
+def test_scope_description_never_carries_the_command():
+    import genesis.cc.invoker as inv_mod
+
+    argv = inv_mod._scope_argv("/usr/local/bin/claude", "-p", "SECRET-PROMPT-TEXT")
+    descriptions = [arg for arg in argv if arg.startswith("--description=")]
+    assert descriptions == ["--description=Genesis CC session"]
+    assert all("SECRET-PROMPT-TEXT" not in arg for arg in argv[: argv.index("--")])
+
+
+def test_probe_carries_the_description(monkeypatch):
+    import subprocess as real_subprocess
+
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod.shutil, "which", lambda _: "/usr/bin/systemd-run")
+    seen = []
+
+    def _probe_ok(*args, **kwargs):
+        seen.append(list(args[0]))
+        return real_subprocess.CompletedProcess(args[0], 0, b"", b"")
+
+    monkeypatch.setattr(inv_mod.subprocess, "run", _probe_ok)
+    out = inv_mod._build_scope_args()
+
+    assert len(seen) == 1
+    description = "--description=Genesis CC session"
+    assert seen[0].index(description) == out.index(description)
 
 
 def test_scope_args_built_when_probe_succeeds(monkeypatch):
@@ -1597,6 +1665,58 @@ async def test_run_streaming_attaches_tools_when_the_stream_has_no_result(invoke
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("with_result", [False, True])
+@pytest.mark.parametrize("text", ["", "answer"])
+@pytest.mark.parametrize(
+    "infos,rejected",
+    [
+        ([{"status": "allowed", "overageStatus": "rejected"}], False),
+        ([{"status": "allowed_warning"}], False),
+        ([{"status": "rejected", "isUsingOverage": True}], False),
+        ([{"status": "rejected"}, {"status": "allowed"}], False),
+        ([{"status": "allowed"}, {"status": "rejected"}], True),
+        ([{"status": "rejected", "isUsingOverage": False}], True),
+        ([{"status": "rejected", "isUsingOverage": "true"}], True),
+        ([{"status": "unknown"}], False),
+        ([{}], False),
+    ],
+)
+async def test_streaming_uses_final_effective_quota_state(
+    invoker, monkeypatch, infos, rejected, text, with_result
+):
+    from genesis.cc.exceptions import CCRateLimitError
+
+    _no_host_syscalls(monkeypatch)
+    status, empty, downgrade = AsyncMock(), AsyncMock(), AsyncMock()
+    invoker._on_cc_status_change = status
+    invoker._on_cc_empty_output = empty
+    invoker._on_model_downgrade = downgrade
+    invoker._last_was_error = True
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        *({"type": "rate_limit_event", "rate_limit_info": info} for info in infos),
+    ]
+    if with_result:
+        events.append(_result_event(text))
+    elif text:
+        events.append({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}})
+    proc = _streaming_proc(_make_stream_lines(*events))
+    proc.pid = 424214
+    with patch("asyncio.create_subprocess_exec", return_value=proc):
+        if rejected and not text:
+            with pytest.raises(CCRateLimitError) as caught:
+                await invoker.run_streaming(CCInvocation(prompt="test", expect_output=True))
+            assert caught.value.raw_event["rate_limit_info"] == infos[-1]
+        else:
+            out = await invoker.run_streaming(CCInvocation(prompt="test", expect_output=True))
+            assert out.text == text
+            assert out.result_received == with_result
+    status.assert_awaited_once_with("RATE_LIMITED" if rejected else "NORMAL")
+    assert empty.await_count == int(not rejected and not text)
+    downgrade.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_run_streaming_rate_limit_with_valid_response():
     """rate_limit_event with valid text returns the response, sets RATE_LIMITED."""
     statuses: list[str] = []
@@ -1609,7 +1729,7 @@ async def test_run_streaming_rate_limit_with_valid_response():
     events = [
         {"type": "system", "subtype": "init", "session_id": "s1"},
         {"type": "assistant", "message": {"content": [{"type": "text", "text": "Got it"}]}},
-        {"type": "rate_limit_event", "info": {}},
+        {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected"}},
         {
             "type": "result",
             "subtype": "success",
@@ -1651,7 +1771,7 @@ async def test_run_streaming_rate_limit_with_empty_response_raises():
 
     events = [
         {"type": "system", "subtype": "init", "session_id": "s1"},
-        {"type": "rate_limit_event", "info": {}},
+        {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected"}},
         {
             "type": "result",
             "subtype": "success",
@@ -1668,6 +1788,41 @@ async def test_run_streaming_rate_limit_with_empty_response_raises():
 
     mock_proc = AsyncMock()
     mock_proc.stdout = _make_async_stdout(data)
+    mock_proc.stdin = _make_mock_stdin()
+    mock_proc.stderr = _make_mock_stderr()
+    mock_proc.wait = AsyncMock()
+    mock_proc.terminate = MagicMock()
+    mock_proc.returncode = 0
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+        pytest.raises(CCRateLimitError),
+    ):
+        await inv.run_streaming(CCInvocation(prompt="test"))
+
+
+@pytest.mark.asyncio
+async def test_a_synthetic_limit_notice_is_not_an_answer_under_a_rate_limit():
+    """The CLI's own limit notice must not turn an empty rate-limited result
+    into a served answer: it would be delivered and failover would never run."""
+    from genesis.cc.exceptions import CCRateLimitError
+
+    inv = CCInvoker(claude_path="claude")
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected"}},
+        {"type": "assistant", "message": {"model": "<synthetic>", "content": [
+            {"type": "text", "text": "You've hit your 5-hour limit"},
+        ]}},
+        {
+            "type": "result", "subtype": "success", "is_error": False, "result": "",
+            "session_id": "s1", "total_cost_usd": 0.0, "duration_ms": 50,
+            "usage": {"input_tokens": 5, "output_tokens": 0},
+            "modelUsage": {"claude-sonnet-4-6": {}},
+        },
+    ]
+    mock_proc = AsyncMock()
+    mock_proc.stdout = _make_async_stdout(_make_stream_lines(*events))
     mock_proc.stdin = _make_mock_stdin()
     mock_proc.stderr = _make_mock_stderr()
     mock_proc.wait = AsyncMock()
@@ -3571,7 +3726,7 @@ async def test_a_drop_before_an_empty_rate_limited_result_is_not_retryable(invok
                 ]
             },
         },
-        {"type": "rate_limit_event", "info": {}},
+        {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected"}},
         _result_event(""),
     )
     proc = _streaming_proc(data, raise_on=(1,))
@@ -3599,7 +3754,7 @@ async def test_an_empty_rate_limited_result_without_a_drop_still_rate_limits(inv
     _no_host_syscalls(monkeypatch)
     data = _make_stream_lines(
         {"type": "system", "subtype": "init", "session_id": "s1"},
-        {"type": "rate_limit_event", "info": {}},
+        {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected"}},
         _result_event(""),
     )
     proc = _streaming_proc(data)  # nothing dropped
@@ -3633,7 +3788,7 @@ async def test_a_drop_does_not_discard_a_rate_limited_answer_that_survived(invok
                 ]
             },
         },
-        {"type": "rate_limit_event", "info": {}},
+        {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected"}},
         _result_event("the answer survived"),
     )
     proc = _streaming_proc(data, raise_on=(1,))
@@ -3644,6 +3799,58 @@ async def test_a_drop_does_not_discard_a_rate_limited_answer_that_survived(invok
 
     assert 1 in proc.stdout.reads, proc.stdout.reads  # the drop really happened
     assert output.text == "the answer survived"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "infos,refused",
+    [
+        ([{"status": "allowed", "overageStatus": "rejected"}], False),
+        ([{"status": "rejected", "isUsingOverage": False}], True),
+        ([{"status": "rejected", "isUsingOverage": True}], False),
+        ([{"status": "rejected"}, {"status": "allowed"}], False),
+        ([{"status": "allowed"}, {"status": "rejected"}], True),
+    ],
+)
+async def test_readiness_receives_effective_limits_through_the_real_stream_decoder(
+    invoker, monkeypatch, tmp_path, infos, refused
+):
+    from genesis.cc import invoker as invoker_module
+    from genesis.cc.exceptions import CCRateLimitError
+    from genesis.cc.provider_readiness import READY, probe_provider
+
+    _no_host_syscalls(monkeypatch)
+    monkeypatch.setenv("GENESIS_BIG_TMP", str(tmp_path))
+    monkeypatch.setattr(invoker, "_network_preflight", AsyncMock())
+    monkeypatch.setattr(invoker, "_cc_version", AsyncMock(return_value=(2, 1, 280)))
+    monkeypatch.setattr(invoker, "_apply_login_fallback", AsyncMock(side_effect=lambda env, inv: env))
+    monkeypatch.setattr(
+        invoker, "_build_env", lambda inv: dict.fromkeys(invoker_module._GH_CREDENTIAL_ENV, "")
+    )
+    monkeypatch.setattr("genesis.cc.invoker._get_scope_args", AsyncMock(return_value=[]))
+    monkeypatch.setattr("genesis.cc.invoker._settings_env_pins", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        "genesis.cc.invoker.admit_launch",
+        AsyncMock(return_value=SimpleNamespace(release=lambda: None)),
+    )
+    monkeypatch.setattr("genesis.cc.invoker.confirm_process_exit", AsyncMock())
+    status = AsyncMock()
+    invoker._on_cc_status_change = status
+    data = _make_stream_lines(
+        {"type": "system", "subtype": "init", "tools": [], "mcp_servers": []},
+        *({"type": "rate_limit_event", "rate_limit_info": info} for info in infos),
+        _result_event(READY),
+    )
+    proc = _streaming_proc(data)
+    proc.pid = 424213
+    with patch("asyncio.create_subprocess_exec", return_value=proc):
+        if refused:
+            with pytest.raises(CCRateLimitError):
+                await probe_provider(invoker, CCInvocation(prompt="private task"), timeout_s=7)
+        else:
+            result = await probe_provider(invoker, CCInvocation(prompt="private task"), timeout_s=7)
+            assert result.text == READY
+    status.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -4396,12 +4603,16 @@ def test_sealed_gh_config_is_idempotent_and_self_healing(monkeypatch, tmp_path):
     assert (repaired / "config.yml").stat().st_mode & 0o777 == 0o400
 
 
-def test_build_env_hardens_gh_only_for_an_allowlisted_session(invoker, monkeypatch, tmp_path):
+@pytest.mark.parametrize("operator_pager", ["cat", "synthetic-pager"])
+def test_build_env_hardens_gh_only_for_an_allowlisted_session(
+    invoker, monkeypatch, tmp_path, operator_pager
+):
     """The hardening rides the allowlist, not the binary being present.
 
     An ordinary dispatch must keep the operator's own gh config — repointing
     GH_CONFIG_DIR for every session would change unrelated behaviour.
     """
+    monkeypatch.setenv("GH_PAGER", operator_pager)
     _seal(monkeypatch, tmp_path)
 
     scoped = invoker._build_env(CCInvocation(prompt="hi", bash_allowlist=("gh",)))
@@ -4410,7 +4621,7 @@ def test_build_env_hardens_gh_only_for_an_allowlisted_session(invoker, monkeypat
 
     unscoped = invoker._build_env(CCInvocation(prompt="hi"))
     assert unscoped.get("GH_CONFIG_DIR") != scoped["GH_CONFIG_DIR"]
-    assert "GH_PAGER" not in unscoped or unscoped["GH_PAGER"] != "cat"
+    assert unscoped["GH_PAGER"] == operator_pager
 
 
 def test_build_env_does_not_harden_gh_for_an_unrelated_allowlist(invoker, monkeypatch, tmp_path):
@@ -6962,7 +7173,7 @@ def _track_checkout_admission(monkeypatch, invoker, *, streaming, spawn_error=No
     monkeypatch.setattr(invoker, "_build_env", lambda _invocation: {})
     monkeypatch.setattr(invoker, "_apply_login_fallback", fallback)
     monkeypatch.setattr(invoker, "_launch_env", lambda env, _invocation: env)
-    monkeypatch.setattr(invoker, "_register_proc", lambda *_args: None)
+    monkeypatch.setattr(invoker, "_register_proc", lambda key, _proc, **_kwargs: key)
     monkeypatch.setattr(invoker, "_unregister_proc", lambda *_args: None)
 
     result = {

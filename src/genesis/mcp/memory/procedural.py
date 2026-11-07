@@ -68,8 +68,22 @@ async def procedure_store(
     context_tags: list[str],
     scenario: str | None = None,
     tool_trigger: list[str] | None = None,
+    trigger_patterns: list[str] | None = None,
+    repeat: str = "session",
 ) -> str:
     """Store a learned procedure. Returns the procedure ID.
+
+    Passing ``trigger_patterns`` makes the call a LESSON: advice shown when one
+    of ``tool_trigger``'s tools is called with input matching any pattern (a
+    regex), once per session (``repeat='session'``) or every time
+    (``'every'``). A lesson from this session is live unless the session's
+    origin is external, in which case it is held until the owner reviews it;
+    the response says which.
+
+    Without patterns, a shell command in ``tool_trigger`` (``ssh``, ``git push``)
+    makes the procedure fire on that command only, when commands are the whole
+    trigger (at most 8). Beside another tool name, or more than 8, they are
+    stored inert (naming no tool), and the response warns.
 
     An MCP `procedure_store` call represents an *explicit teach* — the caller
     is asserting the procedure works. We seed it as already-confirmed
@@ -92,26 +106,48 @@ async def procedure_store(
     memory_mod = _memory_mod()
     memory_mod._require_init()
     assert memory_mod._db is not None
+    from datetime import UTC, datetime
+
+    from genesis.learning.procedural.lesson_shape import is_live_lesson
     from genesis.learning.procedural.operations import store_procedure_checked
+    from genesis.memory.provenance import ORIGIN_FIRST_PARTY, session_origin_from_env
+    from genesis.security.immunity_shadow import is_dispatched_session_env
+
+    origin = session_origin_from_env() or ORIGIN_FIRST_PARTY
+    lesson = None
+    if trigger_patterns is not None:
+        lesson = {
+            "authored_via": "mcp",
+            "authored_in": "dispatched" if is_dispatched_session_env() else "foreground",
+            "origin": origin,
+            "reviewed": False,
+            "authored_at": datetime.now(UTC).isoformat(),
+        }
 
     principle_blob = await _embed_principle_for_hook(principle)
 
-    result = await store_procedure_checked(
-        memory_mod._db,
-        task_type=task_type,
-        principle=principle,
-        scenario=scenario,
-        steps=steps,
-        tools_used=tools_used,
-        context_tags=context_tags,
-        tool_trigger=tool_trigger,
-        activation_tier="LIBRARY",
-        draft=0,
-        success_count=1,
-        confidence=2 / 3,
-        source={"type": "explicit_teach"},
-        principle_embedding=principle_blob,
-    )
+    try:
+        result = await store_procedure_checked(
+            memory_mod._db,
+            task_type=task_type,
+            principle=principle,
+            scenario=scenario,
+            steps=steps,
+            tools_used=tools_used,
+            context_tags=context_tags,
+            tool_trigger=tool_trigger,
+            activation_tier="LIBRARY",
+            draft=0,
+            success_count=1,
+            confidence=2 / 3,
+            source={"type": "explicit_teach"},
+            principle_embedding=principle_blob,
+            trigger_spec={"patterns": trigger_patterns, "repeat": repeat} if lesson else None,
+            lesson=lesson,
+            caller_origin=origin,
+        )
+    except ValueError as exc:
+        return f"Refused: {exc}"
 
     # WS-3 B1 gate-1 (procedure): shadow-record the teach, classified by the
     # CALLER session's origin (GENESIS_SESSION_ORIGIN env — this MCP tool is
@@ -146,6 +182,25 @@ async def procedure_store(
         response = f"Updated existing procedure {result.procedure_id} (version bumped)"
     elif result.action == "skipped":
         response = f"Skipped: procedure {result.conflicting_ids[0]} already covers this task_type"
+    if lesson is not None and result.action != "skipped":
+        if is_live_lesson(lesson):
+            if result.cache_rebuilt is False:
+                response += (
+                    "\n\nLesson is stored and live, but the trigger cache rebuild failed, "
+                    "so it is not active until the cache is next rebuilt."
+                )
+            else:
+                response += "\n\nLesson is live (unreviewed): it reaches the trigger cache now."
+        else:
+            response += (
+                "\n\nLesson is HELD: this session's origin is external, so it stays out of "
+                "every session until the owner reviews it."
+            )
+    elif result.cache_rebuilt is False:
+        response += (
+            "\n\nThe procedure is stored, but the trigger cache rebuild failed, so the "
+            "advisor keeps its old trigger until the cache is next rebuilt."
+        )
     if result.warnings:
         response += "\n\nWarnings:\n" + "\n".join(f"- {w}" for w in result.warnings)
     return response

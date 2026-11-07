@@ -68,10 +68,36 @@ be approved by someone other than its pusher closes that window without
 recreating the self-approval deadlock, because self-authored PRs merge through
 the admin bypass rather than through this rule.
 
-## What is required, and why exactly these three
+## What is required, and why exactly these four
 
-`test`, `leak-detector`, `lint` — all contexts of the `CI` workflow, matched by
-the check-run name exactly as the rollup reports it.
+`test`, `leak-detector`, `lint`, `collected-floor` — all contexts of the `CI`
+workflow, matched by the check-run name exactly as the rollup reports it.
+
+`collected-floor` joined in #3270 (owner ruling 2026-10-12). It carries the
+collected-count check that used to live inside `test` as a hand-kept
+`--min-collected` number, so it had to be required from the same change: an
+advisory replacement would have dropped that enforcement for any merge made
+outside the merge gate. It is diff-scoped (test ids that vanish against the
+commit a change lands on, from files the change did not touch). It installs the
+same dependency RANGES from `pyproject.toml` as `test`, resolved at the same
+moment, so upstream drift reaches both alike and its outage risk is about
+`test`'s. A red is one of two things, and the step says which: exit 1, tests
+stopped being collected (or a new collection error); exit 2, the job could not
+measure (a base that would not resolve or install, pytest itself failing, an
+unreadable PR body when one is needed). A deliberate drop clears it with
+a `Collected-drop: <reason>` line in the PR body and a re-run. Apply the
+ruleset with `scripts/apply_rulesets.py --apply` after #3270 merges, not before:
+until then only that PR's own runs report the context, and a required context
+that never reports holds every merge. After applying, an open PR whose last CI
+run predates the merge has no `collected-floor` result and needs one fresh run
+(a push, or merging main) before it can merge.
+
+One residual, not measured: the job is skipped on `workflow_dispatch` and
+`schedule`. A maintainer who manually dispatches CI on a PR's head commit may
+leave a SKIPPED `collected-floor` result on that commit, and GitHub treats a
+skipped required check as passing. Only someone with write access can
+dispatch, so this is noted rather than closed. Do not dispatch CI on a PR head
+to clear a red; push instead.
 
 They were chosen on one criterion: a red result must mean the change is
 genuinely not mergeable, never that something unrelated is flaky.
@@ -98,6 +124,22 @@ is our own workflow but reports under matrix-named contexts and depends on
 analysis-service latency, which is a different argument for the same conclusion;
 the remaining `CI` jobs are worth keeping green but a stall in one should not
 hold the repository.
+
+`branch-leak-scan` (the `Branch leak scan` workflow) is also absent on
+purpose. It runs the same steps as `leak-detector` — both call
+`scripts/ci/leak_scan.sh` — plus a gitleaks scan of the branch's history, on
+every push to every non-main branch, so a branch with no PR is still scanned.
+Every push gets its own run (no concurrency group), because a cancelled run's
+commits can be force-pushed out of the next run's range after they were public.
+A push runs the workflow file at the pushed commit, so a branch cut from a main
+older than this workflow, or one that deletes it, is not scanned by it: it
+catches accidental leaks, beside GitHub's own secret scanning and push
+protection, and is not a boundary. A rule on `main` has nothing to require from it:
+`leak-detector` already covers every pull request, and the branch job is named
+differently precisely so a push to a PR's branch never puts a second
+`leak-detector` check on the same head commit. A red `branch-leak-scan` on a
+PR's head still blocks the local merge gate, which reads every check in the
+rollup.
 
 `genesis-merge-gate` (the `merge-gate` workflow, issue #1670) is likewise
 deliberately absent from this list for now: it runs the local merge gate's

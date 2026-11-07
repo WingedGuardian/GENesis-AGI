@@ -1,307 +1,549 @@
-"""Materialized view snapshots: built after an ingest that changed something,
-swapped in atomically via a ``current`` symlink, used only when their views
-version matches the code, and identical to the live views."""
+"""Disposable snapshots, complete reads, and history-only fresh restore."""
 
+import contextlib
+import hashlib
 import json
 import os
+import shutil
+import tarfile
+from pathlib import Path
 
+import duckdb
+import pyarrow.parquet as pq
 import pytest
 
-from genesis.transcript_analytics import catalog, derive, locks, query, store, verify
-
-SID = "11111111-2222-3333-4444-555555555555"
+from genesis.transcript_analytics import derive, query, store
 
 
-@pytest.mark.parametrize('empty', [False, True])
-@pytest.mark.parametrize('change', ['name', 'type', 'column-count'])
-def test_verify_digest_includes_schema_for_empty_and_populated_views(empty, change):
-    import contextlib
-
-    import duckdb
-    suffix = ' WHERE false' if empty else ''
-    with contextlib.closing(duckdb.connect(':memory:')) as con:
-        con.execute("SET threads=1")
-        con.execute("SET memory_limit='128MB'")
-        con.execute('CREATE VIEW original AS SELECT 1::INTEGER AS x' + suffix)
-        expression = {'name': '1::INTEGER AS y', 'type': '1::BIGINT AS x',
-                      'column-count': '1::INTEGER AS x, 2::INTEGER AS extra'}[change]
-        con.execute('CREATE VIEW changed AS SELECT ' + expression + suffix)
-        assert verify._digest(con, 'original') != verify._digest(con, 'changed')
-        assert verify._digest(con, 'original') == verify._digest(con, 'original')
-
-
-def _asst(mid, ts, out, stop="end_turn", uuid=None, tools=()):
-    blocks = [
-        {"type": "tool_use", "id": t, "name": "Bash", "input": {"command": "ls"}} for t in tools
-    ] or [{"type": "text", "text": "x"}]
-    return {
-        "type": "assistant",
-        "uuid": uuid or f"{mid}-{ts}",
-        "sessionId": SID,
-        "timestamp": ts,
-        "message": {
-            "id": mid,
-            "model": "m",
-            "stop_reason": stop,
-            "content": blocks,
-            "usage": {"input_tokens": 1, "output_tokens": out},
+def _write(path, number):
+    path.write_text(json.dumps({
+        "type": "assistant", "uuid": f"event-{number}", "sessionId": "session",
+        "timestamp": "2026-01-01T00:00:00Z", "message": {
+            "id": f"message-{number}", "model": "fixture", "stop_reason": "tool_use",
+            "content": [{"type": "tool_use", "id": f"tool-{number}", "name": "Bash",
+                         "input": {"command": f"echo {number}"}}],
+            "usage": {"input_tokens": 1, "output_tokens": number},
         },
-    }
-
-
-def _res(tid, ts, content="ok", is_error=None):
-    b = {"type": "tool_result", "tool_use_id": tid, "content": content}
-    if is_error is not None:
-        b["is_error"] = is_error
-    return {
-        "type": "user",
-        "uuid": f"r-{tid}",
-        "sessionId": SID,
-        "timestamp": ts,
-        "message": {"role": "user", "content": [b]},
-    }
+    }) + "\n")
 
 
 @pytest.fixture
 def built(tmp_path):
     projects, data = tmp_path / "projects", tmp_path / "data"
-    f = projects / "p" / f"{SID}.jsonl"
-    f.parent.mkdir(parents=True)
-    f.write_text(
-        "".join(
-            json.dumps(r) + "\n"
-            for r in [
-                _asst("m1", "2026-10-01T00:00:00Z", 5, stop="tool_use", tools=["t1"]),
-                _res("t1", "2026-10-01T00:00:01Z", content="Exit code 2\nx", is_error=True),
-                _asst("m2", "2026-10-01T00:00:02Z", 7),
-            ]
-        )
-    )
-    store.ingest(projects, data)
-    return projects, data, f
-
-
-def _view_sql(con, name):
-    return con.sql("select sql from duckdb_views() where view_name = ?", params=[name]).fetchone()[
-        0
-    ]
-
-
-def test_derive_builds_snapshot_and_connect_uses_it(built):
-    projects, data, _ = built
-    info = derive.build(data)
-    cur = data / "derived" / "current"
-    assert (
-        cur.is_symlink() and (cur / "turns.parquet").exists() and (cur / "MANIFEST.json").exists()
-    )
-    assert json.loads((cur / "MANIFEST.json").read_text())["views_version"] == query.VIEWS_VERSION
-    assert info["views"] == sorted(derive.DERIVED_VIEWS)
-    con = query.connect(data)
-    assert "derived" in _view_sql(con, "turns")
-    assert "derived" not in _view_sql(query.connect(data, live=True), "turns")
-
-
-def test_snapshot_equals_live_views(built):
-    projects, data, _ = built
+    projects.mkdir()
+    path = projects / "source.jsonl"
+    _write(path, 1)
+    assert store.ingest(projects, data)["rebuilt"] == 1
     derive.build(data)
-    snap, live = query.connect(data), query.connect(data, live=True)
-    for v in derive.DERIVED_VIEWS:
-        cols = ", ".join(c for c in live.sql(f"select * from {v} limit 0").columns)
-        a = snap.sql(f"select {cols} from {v} order by all").fetchall()
-        b = live.sql(f"select {cols} from {v} order by all").fetchall()
-        assert a == b, v
+    return projects, data, path
 
 
-@pytest.mark.parametrize("failure", [None, "snapshot-connect", "snapshot-digest", "live-connect", "live-digest"])
-def test_verify_uses_one_engine_and_retains_both_locks(built, monkeypatch, tmp_path, failure):
-    import fcntl
-
-    _, data, _ = built
-    derive.build(data)
-    monkeypatch.setattr(store, "DEFAULT_LOCK", tmp_path / "writer.lock")
-    monkeypatch.setattr(locks, "PUBLICATION_LOCK", tmp_path / "publication.lock")
-    real_connect, real_digest = query.connect, verify._digest
-    active, phases, selections = [], [], []
-
-    def probe_locks():
-        for path in (store.DEFAULT_LOCK, locks.PUBLICATION_LOCK):
-            with path.open("a") as handle, pytest.raises(BlockingIOError):
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-    class Tracked:
-        def __init__(self, con, phase):
-            self.con, self.phase = con, phase
-
-        def execute(self, *args):
-            probe_locks()
-            if failure == self.phase + "-digest":
-                raise RuntimeError("injected digest failure")
-            return self.con.execute(*args)
-
-        def close(self):
-            self.con.close()
-            active.remove(self)
-
-    def connect(*args, **kwargs):
-        probe_locks()
-        phase = "live" if kwargs.get("live") else "snapshot"
-        phases.append(phase)
-        selections.append(kwargs["selected"])
-        assert not active, "verification opened two engines at once"
-        if failure == phase + "-connect":
-            raise RuntimeError("injected connect failure")
-        tracked = Tracked(real_connect(*args, **kwargs), phase)
-        active.append(tracked)
-        return tracked
-
-    def digest(*args):
-        probe_locks()
-        return real_digest(*args)
-
-    def reporting_locked(fn):
-        def checked(*args, **kwargs):
-            probe_locks()
-            assert not active, "verification retained an engine during reporting"
-            return fn(*args, **kwargs)
-        return checked
-
-    monkeypatch.setattr(query, "connect", connect)
-    monkeypatch.setattr(verify, "_digest", digest)
-    monkeypatch.setattr(store, "compatible_sources", reporting_locked(store.compatible_sources))
-    monkeypatch.setattr(query, "derived_current", reporting_locked(query.derived_current))
-    if failure:
-        with pytest.raises(RuntimeError):
-            verify.verify(data)
-    else:
-        result = verify.verify(data)
-        assert result["ok"] and result["snapshot_current"]
-        assert set(result["views"]) == set(query._DERIVED)
-        assert all(item["snapshot"] == item["live"] for item in result["views"].values())
-        assert phases == ["snapshot", "live"]
-    assert not active
-    assert all(selected is selections[0] for selected in selections)
-    for path in (store.DEFAULT_LOCK, locks.PUBLICATION_LOCK):
-        with path.open("a") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+def _rows(data, *, live):
+    with query.read_connection(data, live=live) as con:
+        return {
+            view: (con.sql(f"SELECT * FROM {view}").columns,
+                   con.sql(f"SELECT * FROM {view} ORDER BY ALL").fetchall())
+            for view in derive.DERIVED_VIEWS
+        }
 
 
-def test_verify_reports_real_snapshot_live_mismatch(built):
-    projects, data, source = built
-    derive.build(data)
-    with source.open("a") as handle:
-        handle.write(json.dumps(_asst("later", "2026-10-01T00:00:09Z", 99)) + "\n")
-    store.ingest(projects, data)
-    result = verify.verify(data)
-    assert not result["ok"] and not result["snapshot_current"]
-    assert result["views"]["turns"]["snapshot"] != result["views"]["turns"]["live"]
-
-
-def test_stale_views_version_falls_back_to_live(built, monkeypatch):
-    projects, data, _ = built
-    derive.build(data)
-    monkeypatch.setattr(query, "VIEWS_VERSION", "999")
-    assert "derived" not in _view_sql(query.connect(data), "turns")
-
-
-def test_swap_keeps_previous_snapshot_and_drops_older(built):
-    projects, data, _ = built
-    first = derive.build(data)["dir"]
-    second = derive.build(data)["dir"]
-    third = derive.build(data)["dir"]
-    remaining = sorted(
-        p.name for p in (data / "derived").iterdir() if p.name not in ("current", ".staging")
-    )
-    assert remaining == sorted({os.path.basename(second), os.path.basename(third)})
-    assert os.path.basename(first) not in remaining
-    assert os.readlink(data / "derived" / "current") == os.path.basename(third)
-
-
-# Re-audit fixes (SF-1..SF-5) -------------------------------------------------
-def test_reaudit_sf1_snapshot_goes_stale_when_inputs_change_or_prune_runs(built):
-    projects, data, f = built
-    derive.build(data)
+def test_snapshot_equals_every_live_view(built):
+    _projects, data, _path = built
     assert derive.is_current(data)
-    with open(f, "a") as fh:
-        fh.write(json.dumps(_asst("m9", "2026-10-01T00:00:09Z", 1)) + "\n")
-    store.ingest(projects, data)  # rebuilds a source but does not derive
-    assert not derive.is_current(data)
-    derive.build(data)
-    assert derive.is_current(data)
+    assert derive.build(data, if_stale=True) == {"derived": "current; nothing to do"}
+    assert _rows(data, live=False) == _rows(data, live=True)
+    with query.read_connection(data) as con:
+        assert query._READS[con]["snapshot"]["views_version"] == query.VIEWS_VERSION
 
 
-def test_reaudit_sf2_prune_date_is_normalized(tmp_path):
+def test_snapshot_matches_shared_current_and_historical_corpus(tmp_path):
     projects, data = tmp_path / "projects", tmp_path / "data"
-    gone, keep = projects / "p" / "gone.jsonl", projects / "p" / "keep.jsonl"
-    gone.parent.mkdir(parents=True)
-    gone.write_text(json.dumps(_asst("g1", "2026-09-01T00:00:00Z", 1)) + "\n")
-    keep.write_text(json.dumps(_asst("k1", "2026-09-01T00:00:00Z", 1)) + "\n")
-    store.ingest(projects, data)
-    gone.unlink()
-    assert (
-        store.prune(data, before="20260101", projects=projects) == 0
-    )  # 2026-09-01 is NOT before 2026-01-01
-
-
-def test_reaudit_sf3_derive_on_empty_store_publishes_empty_views(tmp_path):
-    (tmp_path / "data").mkdir()
-    assert "views" in derive.build(tmp_path / "data")
-    assert query.run_query(tmp_path / "data", "select count(*) from turns")[1] == [(0,)]
-
-
-def test_reaudit_sf4_build_sweeps_leftover_staging_and_temp_links(built):
-    projects, data, _ = built
-    root = data / "derived"
-    (root / ".staging" / "dead").mkdir(parents=True)
-    (root / ".staging" / "dead" / "x.parquet").write_bytes(b"x")
-    os.symlink("nowhere", root / ".current.424242")
+    projects.mkdir()
+    fixture = Path(__file__).with_name("fixtures") / "flat-v1"
+    shutil.copytree(fixture, data)
+    for name, number in [("session", 1), ("copy", 1), ("other", 2)]:
+        _write(projects / f"{name}.jsonl", number)
+    assert store.ingest(projects, data, adopt_projects_root=True)["rebuilt"] == 3
+    live = _rows(data, live=True)
+    assert live["tool_calls"][1] and live["turns"][1] and live["sessions"][1]
+    assert len(store.select_sources(data)[0]) == 4
+    shutil.rmtree(projects)
     derive.build(data)
-    assert list((root / ".staging").iterdir()) == []
+    assert _rows(data, live=False) == live
+    with query.read_connection(data) as con:
+        assert query._READS[con]["snapshot"]["coverage"]["historical"][0]["adapter"] == "flat-v1"
+
+
+@pytest.mark.parametrize("fault", [
+    "missing", "corrupt", "read_error", "schema", "manifest", "version", "signature",
+    "dangling", "loop", "escaping",
+])
+def test_every_snapshot_open_or_read_error_falls_back_once(built, capsys, fault):
+    """One snapshot_fallback event, then the derived views are computed live."""
+    _projects, data, _path = built
+    current = data / "derived/current"
+    table = current / "tool_calls.parquet"
+    manifest_path = current / "MANIFEST.json"
+    if fault == "missing":
+        table.unlink()
+    elif fault == "corrupt":
+        table.write_bytes(b"not parquet")
+    elif fault == "read_error":
+        blob = bytearray(table.read_bytes())
+        blob[4:32] = b"\xff" * 28
+        table.write_bytes(blob)
+        assert pq.read_metadata(table).num_rows == 1  # footer remains readable
+    elif fault == "schema":
+        shutil.copy2(current / "turns.parquet", table)
+    elif fault == "manifest":
+        manifest_path.write_text("broken json")
+    elif fault in {"version", "signature"}:
+        manifest = json.loads(manifest_path.read_text())
+        manifest["views_version" if fault == "version" else "inputs_signature"] = "wrong"
+        manifest_path.write_text(json.dumps(manifest))
+    else:
+        current.unlink()
+        current.symlink_to({
+            "dangling": "absent", "loop": "current", "escaping": "../..",
+        }[fault])
+    capsys.readouterr()
+    assert query.run_query(data, "SELECT output_tokens FROM turns")[1] == [(1,)]
+    events = [json.loads(line) for line in capsys.readouterr().err.splitlines()]
+    assert sum(event.get("event") == "snapshot_fallback" for event in events) == 1
+    assert events[-1]["mode"] == "live"
+
+
+def test_snapshot_is_stale_after_ingest_and_prune(built):
+    projects, data, path = built
+    _write(path, 2)
+    store.ingest(projects, data)
+    assert not derive.is_current(data)
+    assert query.run_query(data, "SELECT output_tokens FROM turns")[1] == [(2,)]
+    derive.build(data)
+    assert derive.is_current(data)
+    path.unlink()
+    assert store.prune(data, before="2027-01-01", projects=projects) == 1
+    assert not derive.is_current(data)
+    assert query.run_query(data, "SELECT count(*) FROM turns")[1] == [(0,)]
+
+
+def test_opened_snapshot_survives_two_newer_builds_and_old_cache_cleanup(built):
+    _projects, data, _path = built
+    first = (data / "derived/current").resolve()
+    with query.read_connection(data) as reader:
+        second = Path(derive.build(data)["dir"])
+        third = Path(derive.build(data)["dir"])
+        assert not first.exists()
+        assert second.exists() and third.exists()
+        assert os.readlink(data / "derived/current") == third.name
+        assert reader.sql("SELECT output_tokens FROM turns").fetchall() == [(1,)]
+
+
+def test_build_failure_keeps_old_snapshot_but_queries_use_fresh_live(built, monkeypatch):
+    projects, data, path = built
+    old = (data / "derived/current").resolve()
+    original = (old / "MANIFEST.json").read_bytes()
+    _write(path, 2)
+    store.ingest(projects, data)
+    connect = query.connect
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("synthetic build failure")
+
+    monkeypatch.setattr(query, "connect", fail)
+    with pytest.raises(RuntimeError, match="synthetic"):
+        derive.build(data)
+    assert (data / "derived/current").resolve() == old
+    assert (old / "MANIFEST.json").read_bytes() == original
+    monkeypatch.setattr(query, "connect", connect)
+    assert query.run_query(data, "SELECT output_tokens FROM turns")[1] == [(2,)]
+
+
+def test_build_sweeps_killed_staging_and_temporary_links(built):
+    _projects, data, _path = built
+    root = data / "derived"
+    (root / ".staging/dead").mkdir(parents=True)
+    (root / ".staging/dead/body").write_bytes(b"incomplete")
+    (root / ".current.424242").symlink_to("absent")
+    derive.build(data)
+    staging = root / ".staging"
+    assert not staging.exists() or not list(staging.iterdir())
     assert not (root / ".current.424242").is_symlink()
 
 
-def test_reaudit_sf5_scrub_version_matches_the_loaded_code(tmp_path, monkeypatch):
-    import importlib
-
-    from genesis.transcript_analytics import scrub
-
-    repo = tmp_path / "repo" / "scripts" / "hooks"
-    repo.mkdir(parents=True)
-    (repo / "secret_scrub.py").write_text("def scrub(t):\n    return t.replace('S', '*')\n")
-    monkeypatch.setenv("GENESIS_REPO", str(tmp_path / "repo"))
-    mod = importlib.reload(scrub)
-    try:
-        v = mod.version()
-        (repo / "secret_scrub.py").write_text("def scrub(t):\n    return t\n")  # changes after load
-        assert mod.version() == v  # the stamp describes the code actually in use
-    finally:
-        monkeypatch.delenv("GENESIS_REPO")
-        importlib.reload(scrub)
-
-
-def test_failed_derive_retains_stale_snapshot_and_original_provenance(built, monkeypatch, tmp_path):
-    projects, data, source = built
-    derive.build(data)
-    first = (data / "derived/current").resolve()
-    saved_revision = catalog.load(data).revision
-    extra = projects / "p/new.jsonl"
-    extra.write_text(json.dumps(_asst("new-message", "2026-10-02T00:00:00Z", 99)) + "\n")
+def test_build_empty_store_and_normalized_prune(tmp_path):
+    projects, data = tmp_path / "projects", tmp_path / "data"
+    projects.mkdir()
     store.ingest(projects, data)
-    real_connect = query.connect
-    monkeypatch.setattr(
-        query, "connect", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("build fails"))
-    )
-    with pytest.raises(RuntimeError):
-        derive.build(data)
-    assert (data / "derived/current").resolve() == first
-    monkeypatch.setattr(query, "connect", real_connect)
-    manifest = tmp_path / "report.json"
-    _, rows = query.run_query(data, "SELECT count(*) FROM turns", manifest_path=manifest)
-    assert rows == [(2,)]
-    recorded = json.loads(manifest.read_text())
-    assert recorded["catalog_revision"] == saved_revision
-    assert recorded["latest_catalog_revision"] == catalog.load(data).revision
-    assert recorded["catalog_revision"] != recorded["latest_catalog_revision"]
-    assert recorded["snapshot_current"] is False
-    assert recorded["coverage"]["included"] == 1
-    assert recorded["source_references"] == ["p/" + source.name]
-    assert query.run_query(data, "SELECT count(*) FROM turns", live=True)[1] == [(3,)]
+    derive.build(data)
+    assert query.run_query(data, "SELECT count(*) FROM turns")[1] == [(0,)]
+    assert store.prune(data, before="20260101", projects=projects) == 0
+
+
+@pytest.mark.parametrize("format_name", ["flat-v1", "record-v5"])
+def test_history_live_snapshot_and_fresh_archive_restore_without_originals(tmp_path, format_name):
+    fixture = Path(__file__).parent / "fixtures" / format_name
+    data = tmp_path / "original"
+    shutil.copytree(fixture, data, symlinks=True)
+    live = _rows(data, live=True)
+    assert live["turns"][1] and live["tool_calls"][1]
+    derive.build(data)
+    assert _rows(data, live=False) == live
+    archive = tmp_path / "backup.tar"
+    with tarfile.open(archive, "w") as output:
+        output.add(data, arcname="store")
+    fresh = tmp_path / "fresh"
+    fresh.mkdir()
+    with tarfile.open(archive) as incoming:
+        incoming.extractall(fresh, filter="data")
+    restored = fresh / "store"
+    durable = {
+        str(path.relative_to(restored)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in restored.rglob("*") if path.is_file() and "derived" not in path.parts
+    }
+    shutil.rmtree(data)
+    derive.discard_after_restore(restored)
+    assert not (restored / "derived").exists()
+    assert durable == {
+        str(path.relative_to(restored)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in restored.rglob("*") if path.is_file()
+    }
+    assert _rows(restored, live=True) == live
+    derive.build(restored)
+    assert _rows(restored, live=False) == live
+    with query.read_connection(restored) as con:
+        historical = query._READS[con]["coverage"]["historical"]
+        assert historical[0]["adapter"] == format_name
+        assert historical[0]["unknown"]["unrecoverable"]
+
+
+def test_snapshot_preserves_reconciliation_query_surface(tmp_path):
+    projects, data = tmp_path / "projects", tmp_path / "data"
+    projects.mkdir()
+    _write(projects / "source.jsonl", 1)
+    assert store.ingest(projects, data)["rebuilt"] == 1
+    before = {
+        view: query.run_query(data, f"SELECT count(*) FROM {view}")[1]
+        for view in ("fragments", "spawn_associations", "tool_ownership")
+    }
+    derive.build(data)
+    after = {
+        view: query.run_query(data, f"SELECT count(*) FROM {view}")[1]
+        for view in before
+    }
+    assert after == before
+    with query.read_connection(data) as con:
+        assert query._READS[con]["snapshot"] is not None
+        assert con.sql("SELECT count(*) FROM fragments").fetchone() == (1,)
+
+
+def test_if_stale_noop_still_sweeps_interrupted_artifacts(built):
+    """Codex: sweep interrupted artifacts before the early return."""
+    _projects, data, _path = built
+    root = data / "derived"
+    (root / ".staging" / "torn").mkdir(parents=True)
+    (root / ".current.999").symlink_to("torn")
+    (root / "orphaned-snapshot").mkdir()
+    assert derive.is_current(data)
+    assert derive.build(data, if_stale=True) == {"derived": "current; nothing to do"}
+    remaining = {entry.name for entry in root.iterdir()}
+    assert ".staging" not in remaining
+    assert not list(root.glob(".current.*"))
+    assert "orphaned-snapshot" not in remaining
+
+
+def test_non_symlink_snapshot_selector_is_rejected_and_falls_back(built):
+    """Codex: reject non-symlink snapshot selectors."""
+    _projects, data, _path = built
+    root = data / "derived"
+    selector = root / "current"
+    target = selector.resolve()
+    selector.unlink()
+    target.rename(selector)
+    assert selector.is_dir() and not selector.is_symlink()
+    assert not derive.is_current(data)
+    with query.read_connection(data) as con:
+        assert query._READS[con].get("snapshot") is None
+        assert con.sql("SELECT count(*) FROM tool_calls").fetchall()
+
+
+def test_symlink_derived_root_is_discarded_on_build(built):
+    """Codex: a symlinked derived root is malformed and must not be used."""
+    _projects, data, _path = built
+    root = data / "derived"
+    moved = data / "moved-derived"
+    root.rename(moved)
+    root.symlink_to(moved.name)
+    assert not derive.is_current(data)
+    derive.build(data)
+    assert root.is_dir() and not root.is_symlink()
+    assert derive.is_current(data)
+
+
+def _relations(con):
+    return {
+        name for (name,) in con.execute(
+            "SELECT view_name FROM duckdb_views() WHERE NOT internal"
+            " UNION SELECT table_name FROM duckdb_tables() WHERE NOT internal"
+        ).fetchall() if not name.startswith("_derived_")
+    }
+
+
+def _view_contents(con):
+    """Each derived view's schema and every row, in a stable order."""
+    out = {}
+    for view in query._DERIVED:
+        schema = [tuple(row[:2]) for row in con.execute(f"DESCRIBE {view}").fetchall()]
+        rows = sorted(repr(row) for row in con.execute(f"SELECT * FROM {view}").fetchall())
+        out[view] = (schema, rows)
+    return out
+
+
+def test_live_false_exposes_the_same_relations_with_or_without_a_snapshot(built):
+    """Round 3 class fix: a failed snapshot load must not widen what live=False can
+    read. Before, the fallback served the whole live graph (raw_* views, the
+    reconcile intermediates) and only a SQL text check stood in front of it. Now
+    the derived views are computed on a private connection and copied in."""
+    _projects, data, _path = built
+    with query.read_connection(data) as con:
+        assert query._READS[con].get("snapshot") is not None
+        with_snapshot = _relations(con)
+        expected = _view_contents(con)
+    shutil.rmtree(data / "derived")
+    with query.read_connection(data) as con:
+        assert query._READS[con].get("snapshot") is None
+        fallback = _relations(con)
+        got = _view_contents(con)
+    assert fallback == with_snapshot
+    assert got == expected
+    assert set(query._DERIVED) <= fallback
+    assert not {name for name in fallback if name.startswith(("raw_", "call_", "_empty_"))}
+    assert not (data / "derived").exists(), "a reader must never write the store"
+
+
+def test_is_current_never_computes_the_live_fallback(built, monkeypatch):
+    """derive.build asks derived_current under the writer lock; a stale cache
+    must answer False without the full live computation. A corrupt table keeps
+    the manifest readable, so derived_current reaches connect()."""
+    _projects, data, _path = built
+    (data / "derived/current/tool_calls.parquet").write_bytes(b"not parquet")
+    monkeypatch.setattr(query, "_load_live_derived", lambda *a, **k: pytest.fail("computed live"))
+    assert not derive.is_current(data)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT count(*) FROM raw_tool_calls",
+        "SELECT count(*) FROM RAW_TOOL_CALLS",
+        'SELECT count(*) FROM "Raw_Tool_Calls"',
+        "SELECT count(*) FROM query_table('ra' || 'w_tool_calls')",
+        "SELECT count(*) FROM call_observations",
+    ],
+)
+@pytest.mark.parametrize("snapshot", [True, False])
+def test_raw_relations_are_unreachable_without_live(built, sql, snapshot):
+    """Case, quoting and a name built at run time all fail the same way in both
+    modes, because the relation is absent rather than filtered by text."""
+    _projects, data, _path = built
+    if not snapshot:
+        shutil.rmtree(data / "derived")
+    with pytest.raises(duckdb.CatalogException, match="need live=True"):
+        query.run_query(data, sql, live=False)
+
+
+def test_both_instances_get_half_the_memory_during_the_copy(built, monkeypatch):
+    """The private live graph and the caller's connection are both alive while
+    the derived views are copied, so neither may hold the whole budget."""
+    _projects, data, _path = built
+    shutil.rmtree(data / "derived")
+    seen = []
+    real = query._configured
+
+    def spy(memory_limit, threads):
+        seen.append(memory_limit)
+        return real(memory_limit, threads)
+
+    monkeypatch.setattr(query, "_configured", spy)
+    with query.connect(data, memory_limit="1000MB", threads=1) as con:
+        limit = con.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+    assert seen == ["1000MB", "500000000B"]
+    with contextlib.closing(real("1000MB", 1)) as fresh:  # restored once the copy ends
+        assert limit == fresh.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+    assert query._half("2GiB") == f"{2**30}B" and query._half("16MB") == "8000000B"
+
+
+def test_live_true_still_reads_raw_views(built):
+    _projects, data, _path = built
+    shutil.rmtree(data / "derived")
+    _columns, rows = query.run_query(data, "SELECT count(*) FROM raw_tool_calls", live=True)
+    assert rows[0][0] > 0
+
+
+@pytest.mark.parametrize("name", ["MANIFEST.json", "tool_calls.parquet"])
+def test_a_special_file_in_the_snapshot_falls_back_instead_of_blocking(built, name):
+    """A FIFO in place of MANIFEST.json used to block the reader's read_text();
+    one in place of a table blocked the full Parquet read the same way."""
+    _projects, data, _path = built
+    damaged = (data / "derived/current").resolve()
+    (damaged / name).unlink()
+    os.mkfifo(damaged / name)
+    with query.read_connection(data) as con:
+        assert query._READS[con].get("snapshot") is None
+        assert con.execute("SELECT count(*) FROM tool_calls").fetchone()[0] > 0
+
+
+def test_malformed_layout_is_swept_before_rebuild(built):
+    """Codex: discard invalid disposable layouts before rebuilding."""
+    _projects, data, _path = built
+    root = data / "derived"
+    selector = root / "current"
+    target = selector.resolve()
+    selector.unlink()
+    target.rename(selector)
+    (root / ".staging" / "torn").mkdir(parents=True)
+    (root / "orphaned").mkdir()
+    result = derive.build(data, if_stale=True)
+    assert result["dir"].endswith((root / "current").resolve().name)
+    names = {entry.name for entry in root.iterdir()}
+    assert ".staging" not in names and "orphaned" not in names
+    assert (root / "current").is_symlink()
+    assert derive.is_current(data)
+
+
+@pytest.mark.parametrize("entry,kind", [
+    (".staging", "file"), (".staging", "link"), (".staging", "dangling"),
+    (".current.424242", "directory"), (".current.424242", "file"),
+    (".current.424242", "link"), (".", "file"),
+])
+def test_rebuild_recovers_malformed_cache_entry_types(built, tmp_path, entry, kind):
+    _projects, data, _path = built
+    root = data / "derived"
+    target = root if entry == "." else root / entry
+    if target.is_dir():
+        shutil.rmtree(target)
+    outside = tmp_path / "outside-cache"
+    outside.mkdir()
+    sentinel = outside / "retained"
+    sentinel.write_text("keep")
+    if kind == "directory":
+        target.mkdir()
+        (target / "partial").write_text("interrupted")
+    elif kind in {"link", "dangling"}:
+        target.symlink_to(outside if kind == "link" else outside / "absent")
+    else:
+        target.write_text("malformed")
+    derive.build(data, if_stale=True)
+    assert derive.is_current(data)
+    assert sentinel.read_text() == "keep"
+    assert not (root / ".staging").exists()
+    assert not (root / ".staging").is_symlink()
+    assert not (root / ".current.424242").exists()
+    with query.read_connection(data) as con:
+        assert con.sql("SELECT output_tokens FROM turns").fetchall() == [(1,)]
+
+
+@pytest.mark.parametrize("kind", ["directory", "file", "link", "dangling"])
+def test_restore_cache_discard_syncs_parent_after_removal(tmp_path, monkeypatch, kind):
+    data = tmp_path / "data"
+    data.mkdir()
+    root = data / "derived"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "retained").write_text("keep")
+    if kind == "directory":
+        root.mkdir()
+    elif kind in {"link", "dangling"}:
+        root.symlink_to(outside if kind == "link" else outside / "absent")
+    else:
+        root.write_text("malformed")
+    synced = []
+    fsync = store._fsync_directory
+
+    def record_sync(path):
+        assert not root.exists() and not root.is_symlink()
+        synced.append(path)
+        fsync(path)
+
+    monkeypatch.setattr(store, "_fsync_directory", record_sync)
+    derive.discard_after_restore(data, lock_path=tmp_path / "writer.lock")
+    assert synced == [data]
+    assert (outside / "retained").read_text() == "keep"
+
+
+def test_restore_cache_discard_reports_failed_parent_sync(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    (data / "derived").mkdir(parents=True)
+
+    def fail_sync(_path):
+        raise OSError("synthetic directory sync failure")
+
+    monkeypatch.setattr(store, "_fsync_directory", fail_sync)
+    with pytest.raises(OSError, match="synthetic directory sync failure"):
+        derive.discard_after_restore(data, lock_path=tmp_path / "writer.lock")
+
+
+@pytest.mark.parametrize("failures", [1, 2])
+def test_restore_cache_discard_retries_failed_parent_sync(tmp_path, monkeypatch, failures):
+    data = tmp_path / "data"
+    root = data / "derived"
+    root.mkdir(parents=True)
+    calls = []
+    fsync = store._fsync_directory
+
+    def retry_sync(path):
+        assert not root.exists() and not root.is_symlink()
+        calls.append(path)
+        if len(calls) <= failures:
+            raise OSError("synthetic directory sync failure")
+        fsync(path)
+
+    monkeypatch.setattr(store, "_fsync_directory", retry_sync)
+    for _ in range(failures):
+        with pytest.raises(OSError, match="synthetic directory sync failure"):
+            derive.discard_after_restore(data, lock_path=tmp_path / "writer.lock")
+    derive.discard_after_restore(data, lock_path=tmp_path / "writer.lock")
+    assert calls == [data] * (failures + 1)
+
+
+@pytest.mark.parametrize("data_exists", [False, True])
+def test_restore_cache_discard_with_absent_cache(tmp_path, monkeypatch, data_exists):
+    data = tmp_path / "data"
+    if data_exists:
+        data.mkdir()
+    calls = []
+    fsync = store._fsync_directory
+
+    def record_sync(path):
+        calls.append(path)
+        fsync(path)
+
+    monkeypatch.setattr(store, "_fsync_directory", record_sync)
+    for _ in range(2):
+        derive.discard_after_restore(data, lock_path=tmp_path / "writer.lock")
+    assert calls == ([data, data] if data_exists else [])
+    assert data.exists() == data_exists
+
+
+@pytest.mark.parametrize("entry", [".staging", ".current.424242", "current", "."])
+def test_rebuild_unlinks_cache_links_without_searching_their_targets(built, tmp_path, entry):
+    _projects, data, _path = built
+    root = data / "derived"
+    target = root if entry == "." else root / entry
+    if target.is_symlink():
+        target.unlink()
+    elif target.is_dir():
+        shutil.rmtree(target)
+    outside = tmp_path / "outside-cache"
+    nested = outside / "nested"
+    nested.mkdir(parents=True)
+    sentinel = nested / "retained"
+    sentinel.write_text("keep")
+    target.symlink_to(nested)
+    outside.chmod(0)
+    try:
+        derive.build(data, if_stale=True)
+    finally:
+        outside.chmod(0o700)
+    assert sentinel.read_text() == "keep"
+    assert derive.is_current(data)

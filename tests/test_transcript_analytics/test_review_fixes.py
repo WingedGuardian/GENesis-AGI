@@ -281,8 +281,7 @@ def test_n3_stale_staging_files_are_swept_and_nothing_is_left(env):
         projects / "p" / f"{SID}.jsonl", [_asst("m1", "2026-10-01T00:00:00Z", 1, stop="end_turn")]
     )
     store.ingest(projects, data, lock_path=lock)
-    assert list((data / ".staging/sources").iterdir()) == []
-    assert not old.exists()
+    assert not (data / ".staging").exists()
 
 
 def test_n8_hooks_view_dedupes_across_files(env):
@@ -302,7 +301,7 @@ def test_n8_hooks_view_dedupes_across_files(env):
     _write(projects / "p" / f"{SID}.jsonl", [hook])
     _write(projects / "p" / "00000000-2222-3333-4444-555555555555.jsonl", [hook])
     store.ingest(projects, data, lock_path=lock)
-    c = connect(data)
+    c = connect(data, live=True)
     assert c.sql("select count(*) from raw_hooks").fetchone() == (2,)
     assert c.sql("select count(*) from hooks").fetchone() == (1,)
 
@@ -342,16 +341,16 @@ def test_forked_child_copies_attribute_to_the_parent_holding_the_whole_message(e
 
 def test_tool_call_is_assembled_from_its_call_row_and_a_result_row_in_another_file(env):
     projects, data, lock = env
-    other = "33333333-2222-3333-4444-555555555555"
+    other = "result-copy"
     # Original file: the call, but its result was never written there.
     _write(
         projects / "p" / f"{SID}.jsonl",
         [_asst("mO", "2026-10-01T00:00:00Z", 1, stop="tool_use", uuid="o1", tools=["tO"])],
     )
-    # Another file holds only the result (an orphan there).
+    # A second source in the same context holds only the result (an orphan there).
     _write(
         projects / "p" / f"{other}.jsonl",
-        [_res("tO", "2026-10-01T00:00:02Z", content="Exit code 3\nboom", is_error=True, sid=other)],
+        [_res("tO", "2026-10-01T00:00:02Z", content="Exit code 3\nboom", is_error=True)],
     )
     store.ingest(projects, data, lock_path=lock)
     row = (
@@ -363,3 +362,120 @@ def test_tool_call_is_assembled_from_its_call_row_and_a_result_row_in_another_fi
         .fetchone()
     )
     assert row == ("mO", "Bash", True, "exit_nonzero", 3, SID, 2000)
+
+
+@pytest.mark.parametrize("shared_call_record", [False, True])
+@pytest.mark.parametrize("with_uuid", [False, True])
+def test_every_tool_block_survives_shared_call_and_result_records(
+    env, shared_call_record, with_uuid
+):
+    projects, data, lock = env
+    calls = (
+        [_asst("multi", "2026-10-01T00:00:00Z", 1, tools=["one", "two"])]
+        if shared_call_record
+        else [
+            _asst(f"multi-{tool}", "2026-10-01T00:00:00Z", 1, tools=[tool])
+            for tool in ("one", "two")
+        ]
+    )
+    if not with_uuid:
+        for call in calls:
+            call.pop("uuid")
+    result = _res("one", "2026-10-01T00:00:01Z")
+    result["message"]["content"].extend(_res("two", "2026-10-01T00:00:01Z")["message"]["content"])
+    _write(projects / "p" / f"{SID}.jsonl", [*calls, result])
+    assert store.ingest(projects, data, lock_path=lock)["failed"] == 0
+    with connect(data) as con:
+        assert con.sql(
+            "SELECT tool_use_id, has_result, call_valid FROM tool_calls ORDER BY tool_use_id"
+        ).fetchall() == [("one", True, True), ("two", True, True)]
+
+
+@pytest.mark.parametrize("duplicate", ["call", "result", "both"])
+def test_identical_tool_block_copies_keep_one_linked_result(env, duplicate):
+    projects, data, lock = env
+    call = _asst("duplicate", "2026-10-01T00:00:00Z", 1, tools=["one"])
+    result = _res("one", "2026-10-01T00:00:01Z")
+    if duplicate in ("call", "both"):
+        call["message"]["content"] *= 2
+    if duplicate in ("result", "both"):
+        result["message"]["content"] *= 2
+    _write(projects / "p" / f"{SID}.jsonl", [call, result])
+    assert store.ingest(projects, data, lock_path=lock)["failed"] == 0
+    with connect(data) as con:
+        assert con.sql(
+            "SELECT has_result, call_valid, result_valid, result_conflict FROM tool_calls"
+        ).fetchall() == [(True, True, True, False)]
+
+
+def test_distinct_calls_with_reused_id_leave_an_orphan_result_unassigned(env):
+    projects, data, lock = env
+    calls = [_asst(f"candidate-{i}", "2026-10-01T00:00:00Z", 1, tools=["one"]) for i in range(2)]
+    for i, call in enumerate(calls):
+        _write(projects / f"call-{i}.jsonl", [call])
+    _write(projects / "result.jsonl", [_res("one", "2026-10-01T00:00:01Z")])
+    assert store.ingest(projects, data, lock_path=lock)["failed"] == 0
+    with connect(data) as con:
+        assert con.sql(
+            "SELECT count(*) FILTER(WHERE line_no_call IS NOT NULL AND has_result), "
+            "count(*) FILTER(WHERE line_no_call IS NULL AND has_result) FROM tool_calls"
+        ).fetchone() == (0, 1)
+
+
+def test_same_record_conflicting_results_remain_visible(env):
+    projects, data, lock = env
+    call = _asst("conflict", "2026-10-01T00:00:00Z", 1, tools=["one"])
+    result = _res("one", "2026-10-01T00:00:01Z", content="first")
+    result["message"]["content"].extend(
+        _res("one", "2026-10-01T00:00:01Z", content="different")["message"]["content"]
+    )
+    _write(projects / "p" / f"{SID}.jsonl", [call, result])
+    assert store.ingest(projects, data, lock_path=lock)["failed"] == 0
+    with connect(data) as con:
+        assert con.sql("SELECT result_conflict, result_valid FROM tool_calls").fetchone() == (
+            True,
+            False,
+        )
+
+
+def test_result_scrub_failure_survives_a_clean_call_in_another_source(env):
+    projects, data, lock = env
+    _write(
+        projects / "a.jsonl",
+        [_asst("scrub", "2026-10-01T00:00:00Z", 1, tools=["one"])],
+    )
+    _write(
+        projects / "b.jsonl",
+        [
+            _res(
+                "one",
+                "2026-10-01T00:00:01Z",
+                content="[scrub-error: content withheld]",
+                is_error=True,
+            )
+        ],
+    )
+    assert store.ingest(projects, data, lock_path=lock)["failed"] == 0
+    with connect(data) as con:
+        assert con.sql(
+            "SELECT scrub_failed FROM tool_calls WHERE line_no_call IS NOT NULL"
+        ).fetchone() == (True,)
+
+
+def test_unrelated_context_result_never_confirms_a_spawn_parent(env):
+    projects, data, lock = env
+    call = _asst("spawn", "2026-10-01T00:00:00Z", 1, tools=["reused-id"])
+    call["message"]["content"][0]["name"] = "Agent"
+    result = _res("reused-id", "2026-10-01T00:00:01Z", sid="unrelated")
+    result["toolUseResult"] = {"agentId": "child"}
+    _write(projects / "parent.jsonl", [call])
+    _write(projects / "unrelated.jsonl", [result])
+    assert store.ingest(projects, data, lock_path=lock)["failed"] == 0
+    with connect(data) as con:
+        assert con.sql(
+            "SELECT count(*) FROM actor_lineage WHERE parent_actor_id IS NOT NULL "
+            "AND lineage_status IN ('confirmed', 'inferred')"
+        ).fetchone() == (0,)
+        assert con.sql(
+            "SELECT count(*) FROM tool_calls WHERE line_no_call IS NOT NULL AND has_result"
+        ).fetchone() == (0,)

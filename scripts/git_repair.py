@@ -177,7 +177,7 @@ def _packed_refs_corrupt(git_dir: Path) -> bool:
         return True
 
 
-def _fsck_corrupt_paths(fsck_stderr: str, git_dir: Path) -> list[Path]:
+def _fsck_corrupt_paths(fsck_output: str, git_dir: Path) -> list[Path]:
     """Extract loose-object filesystem paths flagged corrupt by ``fsck --full``.
 
     fsck prints e.g. ``error: unable to unpack header of .git/objects/22/3b..``
@@ -186,17 +186,27 @@ def _fsck_corrupt_paths(fsck_stderr: str, git_dir: Path) -> list[Path]:
     40-hex ``object corrupt`` SHAs to their loose path if present on disk."""
     paths: set[Path] = set()
     repo_root = git_dir.parent
-    for m in _OBJ_PATH.finditer(fsck_stderr):
+    for m in _OBJ_PATH.finditer(fsck_output):
         p = (repo_root / m.group(0)).resolve()
         if p.exists():
             paths.add(p)
-    for line in fsck_stderr.splitlines():
+    for line in fsck_output.splitlines():
         if "object corrupt or missing" in line or "object corrupt" in line:
             for sha in _HEX40.findall(line):
                 cand = git_dir / "objects" / sha[:2] / sha[2:]
                 if cand.exists():
                     paths.add(cand.resolve())
     return sorted(paths)
+
+
+def _fsck_problem_lines(stderr: str, stdout: str) -> list[str]:
+    lines = [
+        line.strip()
+        for line in (stderr or "").splitlines() + (stdout or "").splitlines()
+        if line.strip() and not line.strip().startswith(("dangling", "notice:"))
+    ]
+    lines.sort(key=lambda line: line.startswith("warning"))
+    return lines
 
 
 def diagnose(repo: Path) -> Diagnosis:
@@ -244,26 +254,29 @@ def diagnose(repo: Path) -> Diagnosis:
     )
 
     # fsck --full — authoritative content-level scan, enumerates ALL corrupt
-    r = _git(repo, "fsck", "--full", "--no-progress", timeout=_FSCK_TIMEOUT_S)
-    # fsck exits non-zero on corruption; "dangling"/"notice" lines are normal.
-    fsck_errs = [
-        ln
-        for ln in r.stderr.splitlines()
-        if ln.startswith(("error:", "fatal:")) or "corrupt" in ln or "missing" in ln
-    ]
-    fsck_ok = r.returncode == 0 and not fsck_errs
+    r = _git(
+        repo, "fsck", "--full", "--no-progress", "--no-reflogs", timeout=_FSCK_TIMEOUT_S
+    )
+    fsck_output = r.stderr + "\n" + r.stdout
+    fsck_errs = _fsck_problem_lines(r.stderr, r.stdout)
+    fsck_lines = r.stderr.splitlines() + r.stdout.splitlines()
+    fsck_has_errors = any(
+        ln.startswith(("error:", "fatal:")) or "corrupt" in ln or "missing" in ln
+        for ln in fsck_lines
+    )
+    fsck_ok = r.returncode == 0 and not fsck_has_errors
     d.add(
         "fsck --full clean",
         fsck_ok,
         ""
         if fsck_ok
-        else f"{len(fsck_errs)} error line(s); e.g. {fsck_errs[0][:100]}"
+        else f"{len(fsck_errs)} problem line(s); e.g. {fsck_errs[0][:100]}"
         if fsck_errs
         else f"rc={r.returncode}",
     )
 
     # merge fsck-reported corrupt paths with the zero-scan for the quarantine set
-    corrupt = set(zeroed) | set(_fsck_corrupt_paths(r.stderr, git_dir))
+    corrupt = set(zeroed) | set(_fsck_corrupt_paths(fsck_output, git_dir))
     d.corrupt_objects = sorted(corrupt)
 
     # origin reachability — a PRECONDITION for refetch/reclone, recorded on its

@@ -14,6 +14,7 @@ logger = logging.getLogger("genesis.runtime")
 def init(rt: GenesisRuntime) -> None:
     """Initialize health data service — reads from all other subsystems."""
     try:
+        from genesis.observability.agent_api_health import sample
         from genesis.observability.health_data import HealthDataService
 
         # Provider health checker — probes /v1/models endpoints periodically
@@ -47,6 +48,7 @@ def init(rt: GenesisRuntime) -> None:
             activity_tracker=rt._activity_tracker,
             provider_health_checker=provider_health_checker,
             event_bus=rt._event_bus,
+            agent_api_reader=lambda: sample(rt),
         )
 
         from genesis.mcp.health_mcp import init_health_mcp

@@ -440,6 +440,7 @@ class TestEveryGuardConsultsTheChokepoint:
             "git_repo_selection.py",
             "gh_merge.py",
             "pr_close_advisory.py",
+            "pr_close_predicate.py",
             "hook_output.py",
         ):
             (hooks / dep).write_text((_HOOKS_DIR / dep).read_text())

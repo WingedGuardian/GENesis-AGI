@@ -486,17 +486,21 @@ class TestOutputFormat:
 
         # Required fields
         assert hook["hookEventName"] == "PreToolUse"
-        assert hook["permissionDecision"] == "allow"
         assert isinstance(hook["additionalContext"], str)
         assert len(hook["additionalContext"]) > 0
 
-    def test_permission_decision_always_allow(self) -> None:
-        """Advisory hook must NEVER block — permissionDecision is always 'allow'."""
+    def test_advice_never_makes_a_permission_decision(self) -> None:
+        """Advice must neither block nor approve: no permissionDecision at all.
+
+        ``"allow"`` would skip the session's normal permission check for the
+        matched call, so the hook leaves the decision to the session.
+        """
         payload = {"tool_name": "Bash", "tool_input": {"command": "pip install -e /danger/zone"}}
         result = _run_hook(payload)
         output = _parse_output(result)
         assert output is not None
-        assert output["hookSpecificOutput"]["permissionDecision"] == "allow"
+        assert result.returncode == 0
+        assert "permissionDecision" not in output["hookSpecificOutput"]
 
     def test_output_is_valid_json(self) -> None:
         payload = {"tool_name": "WebFetch", "tool_input": {"url": "https://youtube.com/watch?v=x"}}

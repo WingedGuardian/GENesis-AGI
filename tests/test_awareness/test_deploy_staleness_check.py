@@ -44,6 +44,10 @@ def _reset_cooldowns(monkeypatch):
     monkeypatch.setattr(loop, "_last_deploy_alert_key", "")
     monkeypatch.setattr(loop, "_last_main_checkout_status", "")
     monkeypatch.setattr(loop, "_last_actionable_main_checkout", None)
+    monkeypatch.setattr(loop, "_last_live_state", "")
+    monkeypatch.setattr(loop, "_last_actionable_live_findings", None)
+    monkeypatch.setattr(loop, "_last_live_unknown", False)
+    monkeypatch.setattr(loop, "_last_actionable_base_findings", None)
 
 
 def _snap(
@@ -55,16 +59,24 @@ def _snap(
     tier2=None,
     host_status="ok",
     main_checkout=None,
+    live=None,
+    git_live=None,
 ):
     return {
         "status": "attention" if findings else "healthy",
         "findings": findings,
         "last_update": {"age_days": age_days, "new_commit": "abc", "completed_at": "x"},
-        "git": {"head": "abc", "commits_behind_upstream": behind, "fetch_age_hours": 1.0},
+        "git": {
+            "head": "abc",
+            "commits_behind_upstream": behind,
+            "fetch_age_hours": 1.0,
+            "live": git_live,
+        },
         "missing_units": missing_units or [],
         "tier2_pending": tier2 or [],
         "host_gateway": {"status": host_status},
         "main_checkout": main_checkout or {"status": "clean", "count": 0, "paths": []},
+        "live": live,
     }
 
 
@@ -151,12 +163,13 @@ async def test_recent_update_below_behind_threshold_is_quiet(db, monkeypatch):
     assert await _rows(db) == []
 
 
-async def test_escalation_supersedes_high_row(db, monkeypatch):
+async def test_escalation_supersedes_the_drift_row(db, monkeypatch):
     _patch_snapshot(
         monkeypatch, _snap(_real_findings(age_days=1.0, behind=60), age_days=1.0, behind=60)
     )
     await loop._check_deploy_staleness(db)
-    assert (await _rows(db))[0]["priority"] == "high"
+    # behind_upstream alone is written at medium (routine maintenance).
+    assert (await _rows(db))[0]["priority"] == "medium"
     monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
     _patch_snapshot(
         monkeypatch, _snap(_real_findings(age_days=8.0, behind=60), age_days=8.0, behind=60)
@@ -537,6 +550,10 @@ def _restart(monkeypatch):
     """Module state gone, as after a server restart; the store is untouched."""
     monkeypatch.setattr(loop, "_last_main_checkout_status", "")
     monkeypatch.setattr(loop, "_last_actionable_main_checkout", None)
+    monkeypatch.setattr(loop, "_last_live_state", "")
+    monkeypatch.setattr(loop, "_last_actionable_live_findings", None)
+    monkeypatch.setattr(loop, "_last_live_unknown", False)
+    monkeypatch.setattr(loop, "_last_actionable_base_findings", None)
     monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
     monkeypatch.setattr(loop, "_last_deploy_alert_key", "")
 
@@ -641,3 +658,423 @@ async def test_after_a_restart_with_no_dirty_alert_the_first_check_reconciles(db
     (row,) = await _rows(db)
     assert "missing systemd units: x.timer" in row["content"]
     assert "could not be read" not in row["content"]
+
+
+# ── `live`, the integration branch (#2978 PR E) ──────────────────────────────
+
+
+async def test_a_live_only_alert_carries_no_update_sh_paragraph(db, monkeypatch):
+    """The drift paragraph advises update.sh for merged-but-undeployed code;
+    a live-only state has nothing of that kind, and never pages."""
+    _patch_snapshot(
+        monkeypatch,
+        _snap(["live_off_branch:2"], live={"state": "other", "candidates": 2}),
+    )
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    assert row["priority"] == "high"
+    assert "NOT fully deployed" not in row["content"]
+    assert "lists 2 candidate(s)" in row["content"]
+    # Round-1 review (P1): a bare `git switch live` boots whatever `live` held
+    # before; the recovery is the engine's rebuild, then a restart.
+    assert "To run them: scripts/deploy_candidates rebuild" in row["content"]
+    assert "deploy_code_only.sh restart" in row["content"]
+
+
+async def test_on_live_the_recovery_sentence_names_the_rebuild(db, monkeypatch):
+    _patch_snapshot(
+        monkeypatch,
+        _snap(["tier2_pending:1"], age_days=1.0, tier2=["a"], git_live="live"),
+    )
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    assert "rebuilds `live` from the deploy manifest first" in row["content"]
+
+
+async def test_a_first_unreadable_live_tick_does_not_alert(db, monkeypatch):
+    snap = _snap(["live_unreadable"], live={"state": "unreadable", "reason": "slow"})
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    assert await _rows(db) == []
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    assert "could not be read on two consecutive checks (slow)" in row["content"]
+
+
+async def test_a_deploy_carries_the_standing_live_alert(db, monkeypatch):
+    _patch_snapshot(
+        monkeypatch,
+        _snap(["live_off_branch:1"], live={"state": "other", "candidates": 1}),
+    )
+    await loop._check_deploy_staleness(db)
+    [before] = await _rows(db)
+    monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
+    _patch_snapshot(monkeypatch, _snap([], live={"state": "deploying"}))
+    await loop._check_deploy_staleness(db)
+    [after] = await _rows(db)
+    assert after["id"] == before["id"], "a deploy tick resolved the live alert"
+
+
+async def test_an_unknown_candidate_count_never_resolves_a_standing_live_alert(db, monkeypatch):
+    """Round-1 review: an unknown count (list timed out, ref probe failed) read as
+    0, so a tick that observed nothing resolved the live_off_branch alert."""
+    _patch_snapshot(
+        monkeypatch,
+        _snap(["live_off_branch:2"], live={"state": "other", "candidates": 2}),
+    )
+    await loop._check_deploy_staleness(db)
+    [before] = await _rows(db)
+    monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
+    _patch_snapshot(monkeypatch, _snap([], live={"state": "other", "candidates": None}))
+    await loop._check_deploy_staleness(db)
+    assert [r["id"] for r in await _rows(db)] == [before["id"]]
+    assert await _rows(db, resolved=1) == []
+
+
+@pytest.mark.parametrize(
+    "live",
+    [
+        {"state": "deploying"},
+        {"state": "unreadable", "reason": "slow"},
+        {"state": "other", "candidates": None},
+    ],
+    ids=["deploying", "first-unreadable", "unknown-count"],
+)
+async def test_after_a_restart_a_standing_live_alert_is_not_resolved(db, monkeypatch, live):
+    """Round-1 review: after a restart the in-memory live findings are gone, and a
+    first tick that reads nothing stripped them and recorded recovery. The
+    standing alert's class is now carried from the store, as the checkout path
+    does."""
+    _patch_snapshot(
+        monkeypatch,
+        _snap(["live_off_branch:2"], live={"state": "other", "candidates": 2}),
+    )
+    await loop._check_deploy_staleness(db)
+    _restart(monkeypatch)
+    _patch_snapshot(monkeypatch, _snap([], live=live))
+    await loop._check_deploy_staleness(db)
+    assert await _rows(db, resolved=1) == [], "a tick that read nothing resolved the alert"
+    [after] = await _rows(db)
+    assert "live_off_branch" in after["content"]
+
+
+async def test_a_carried_unknown_count_is_worded_without_a_number(db, monkeypatch):
+    _patch_snapshot(
+        monkeypatch,
+        _snap(["live_off_branch:?"], live={"state": "other", "candidates": None}),
+    )
+    monkeypatch.setattr(loop, "_last_actionable_live_findings", ["live_off_branch:?"])
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    assert "lists candidates (their count was not read on this check)" in row["content"]
+
+
+_UNKNOWN_LIVE = {"state": "other", "candidates": None, "reason": "the engine did not answer"}
+
+
+async def test_a_second_unknown_live_tick_escalates_a_standing_alert(db, monkeypatch):
+    """Round-2 audit (D4): an unknown count was carried on EVERY tick, so a
+    standing alert could never escalate or clear. The first unknown tick carries;
+    the second raises live_unreadable while a live alert stands."""
+    _patch_snapshot(
+        monkeypatch, _snap(["live_off_branch:2"], live={"state": "other", "candidates": 2})
+    )
+    await loop._check_deploy_staleness(db)
+    [before] = await _rows(db)
+    _patch_snapshot(monkeypatch, _snap([], live=_UNKNOWN_LIVE))
+    monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
+    await loop._check_deploy_staleness(db)
+    assert [r["id"] for r in await _rows(db)] == [before["id"]]  # carried
+    monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
+    await loop._check_deploy_staleness(db)
+    [after] = await _rows(db)
+    assert "live_unreadable" in after["content"] and "live_off_branch" not in after["content"]
+
+
+async def test_repeated_unknown_live_ticks_raise_nothing_when_no_alert_stands(db, monkeypatch):
+    """An install that never uses `live` must not alert because the engine was
+    slow twice: with no live alert standing, a repeated unknown is dropped."""
+    _patch_snapshot(monkeypatch, _snap([], live=_UNKNOWN_LIVE))
+    for _ in range(3):
+        monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
+        await loop._check_deploy_staleness(db)
+    assert await _rows(db) == []
+
+
+async def test_after_a_restart_a_second_unknown_tick_still_escalates(db, monkeypatch):
+    """The escalation reads the standing alert from the store, so a restart
+    between the ticks only restarts the count, never loses the alert."""
+    _patch_snapshot(monkeypatch, _snap(["live_unbuilt:1"], live={"state": "live", "unbuilt": 1}))
+    await loop._check_deploy_staleness(db)
+    _restart(monkeypatch)
+    _patch_snapshot(monkeypatch, _snap([], live=_UNKNOWN_LIVE))
+    await loop._check_deploy_staleness(db)
+    assert await _rows(db, resolved=1) == []
+    monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    assert "live_unreadable" in row["content"]
+
+
+@pytest.mark.parametrize(
+    ("finding", "text"),
+    [
+        ("live_unbuilt:2", "lists 2 candidate(s) that `live` does not hold"),
+        ("live_unlisted:1", "`live` holds 1 candidate(s) that no deploy manifest"),
+    ],
+)
+async def test_the_new_live_classes_have_their_own_wording(db, monkeypatch, finding, text):
+    _patch_snapshot(monkeypatch, _snap([finding], live={"state": "live"}))
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    assert text in row["content"]
+    assert "scripts/deploy_candidates status" in row["content"]
+    assert "update.sh" not in row["content"].split("`live`", 1)[0]
+    assert row["priority"] != "critical"
+
+
+@pytest.mark.parametrize(
+    "live",
+    [
+        {"state": "unreadable", "on_live_branch": True, "reason": "slow"},
+        {"state": "deploying", "on_live_branch": True, "base": None},
+    ],
+    ids=["unreadable", "deploying"],
+)
+async def test_a_tick_with_no_live_base_keeps_tier2_and_guardian_alerts(db, monkeypatch, live):
+    """Round-4 review: with no base the tier-2 and Guardian comparisons do not run,
+    and the tick resolved their standing alerts as if the drift had gone."""
+    _patch_snapshot(
+        monkeypatch,
+        _snap(
+            ["tier2_pending:2", "host_guardian_drift"],
+            tier2=["a", "b"],
+            host_status="drift",
+            live={"state": "live", "base": "a" * 40},
+        ),
+    )
+    await loop._check_deploy_staleness(db)
+    [before] = await _rows(db)
+    monkeypatch.setattr(loop, "_last_deploy_alert_at", 0.0)
+    _patch_snapshot(monkeypatch, _snap([], host_status="no_data", live=live))
+    await loop._check_deploy_staleness(db)
+    assert await _rows(db, resolved=1) == []
+    assert [r["id"] for r in await _rows(db)] == [before["id"]]
+
+
+async def test_after_a_restart_a_base_less_tick_keeps_a_standing_guardian_alert(db, monkeypatch):
+    _patch_snapshot(
+        monkeypatch,
+        _snap(
+            ["host_guardian_drift"], host_status="drift", live={"state": "live", "base": "a" * 40}
+        ),
+    )
+    await loop._check_deploy_staleness(db)
+    _restart(monkeypatch)
+    _patch_snapshot(
+        monkeypatch,
+        _snap([], host_status="no_data", live={"state": "unreadable", "on_live_branch": True}),
+    )
+    await loop._check_deploy_staleness(db)
+    assert await _rows(db, resolved=1) == []
+
+
+async def test_off_live_a_resolved_guardian_drift_still_resolves(db, monkeypatch):
+    """The carry is only for a missing `live` base; on main the comparison ran."""
+    _patch_snapshot(
+        monkeypatch, _snap(["host_guardian_drift"], host_status="drift", live={"state": "other"})
+    )
+    await loop._check_deploy_staleness(db)
+    _patch_snapshot(monkeypatch, _snap([], live={"state": "other", "candidates": 0}))
+    await loop._check_deploy_staleness(db)
+    assert len(await _rows(db, resolved=1)) == 1
+
+
+async def test_the_unbound_class_has_its_own_wording(db, monkeypatch):
+    _patch_snapshot(monkeypatch, _snap(["live_unbound"], live={"state": "unbound"}))
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    assert "no deploy manifest of this repository binds it" in row["content"]
+
+
+def _repair(ts: str, saved: int, *, dismissed=False, unresolved=False, result="healed"):
+    """One collect_live_repairs report entry."""
+    return {
+        "ts": ts,
+        "backup_dir": f"/home/u/.genesis/deploy-backups/{ts}-live-move-repair",
+        "saved": saved,
+        "result": result,
+        "dismissed": dismissed,
+        "unresolved": unresolved,
+    }
+
+
+def _repairs(*reports, refused=0, unread_older=0, unresolved=False):
+    saved = sum(r["saved"] for r in reports if not r["dismissed"])
+    return {
+        "reports": list(reports),
+        "saved": saved,
+        "refused": refused,
+        "unread_older": unread_older,
+        "unresolved": unresolved,
+    }
+
+
+async def test_td19_a_live_repair_report_raises_its_own_wording_then_resolves(db, monkeypatch):
+    """T-D19 (#3492 PR D1): the repair's report becomes the deploy observation:
+    per report its ts, its backup folder, the count saved there, the fixed
+    --restore and --dismiss commands, the 90-day prune; no update.sh advice,
+    high (never critical); a later tick without it resolves it."""
+    ts = "20261027T000000Z-7"
+    snap = _snap(["live_repair_saved:2", "live_repair_unresolved"])
+    snap["live_repairs"] = _repairs(_repair(ts, 2, unresolved=True), unresolved=True)
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    rows = await _rows(db)
+    assert len(rows) == 1 and rows[0]["priority"] == "high", rows
+    content = rows[0]["content"]
+    assert f"/home/u/.genesis/deploy-backups/{ts}-live-move-repair" in content, content
+    assert "2 path(s) the update did not write were recorded" in content, content
+    assert "were saved there" not in content, content  # a flag-only or deleted row has no file
+    assert f"scripts/deploy_candidates repair-move --restore {ts}" in content, content
+    assert (
+        "once both the installed repair kit and scripts/deploy_candidates include --restore"
+        in content
+    ), content
+    assert f"scripts/deploy_candidates repair-move --dismiss {ts}" in content, content
+    assert "puts the saved files back as uncommitted edits" in content, content
+    assert "deploy_code_only.sh and update.sh refuse to deploy" in content, content
+    assert "committed (on a branch, as a PR), moved out, or removed" in content, content
+    assert "90 days after the last write" in content, content
+    assert "did not finish" in content and "run scripts/update.sh" not in content, content
+    assert "says why" not in content, content  # a run killed partway wrote no reason
+    _patch_snapshot(monkeypatch, _snap([]))
+    await loop._check_deploy_staleness(db)
+    assert await _rows(db) == []
+    assert len(await _rows(db, resolved=1)) == 1
+
+
+async def test_only_undismissed_reports_with_saved_paths_are_named(db, monkeypatch):
+    shown, dismissed, empty = "20261028T000000Z-3", "20261027T000000Z-2", "20261026T000000Z-1"
+    snap = _snap(["live_repair_saved:1"])
+    snap["live_repairs"] = _repairs(
+        _repair(shown, 1), _repair(dismissed, 4, dismissed=True), _repair(empty, 0)
+    )
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert f"--restore {shown}" in content and "1 path(s)" in content, content
+    assert dismissed not in content and empty not in content, content
+
+
+async def test_a_new_report_refreshes_the_alert(db, monkeypatch):
+    """A5: same classes, a new report inside the cooldown: the standing
+    observation is replaced, never left naming only the old report; the same
+    state on the next tick is still deduplicated."""
+    old, new = "20261027T000000Z-1", "20261028T000000Z-2"
+    first = _snap(["live_repair_saved:1"])
+    first["live_repairs"] = _repairs(_repair(old, 1))
+    _patch_snapshot(monkeypatch, first)
+    await loop._check_deploy_staleness(db)
+    second = _snap(["live_repair_saved:2"])
+    second["live_repairs"] = _repairs(_repair(new, 1), _repair(old, 1))
+    _patch_snapshot(monkeypatch, second)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    assert new in row["content"] and old in row["content"], row["content"]
+    _patch_snapshot(monkeypatch, second)
+    await loop._check_deploy_staleness(db)
+    assert len(await _rows(db)) == 1 and len(await _rows(db, resolved=1)) == 1
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        lambda r: r["reports"][0].update(dismissed=True),
+        lambda r: r["reports"][0].update(saved=5),
+        lambda r: r.update(refused=1),
+        lambda r: r.update(unread_older=3),
+    ],
+    ids=["dismissed", "saved", "refused", "unread_older"],
+)
+def test_the_alert_identity_follows_every_named_field(change):
+    import copy
+
+    base = _repairs(_repair("20261027T000000Z-1", 1), _repair("20261026T000000Z-1", 2))
+    changed = copy.deepcopy(base)
+    change(changed)
+    assert loop._deploy_repair_identity(base) != loop._deploy_repair_identity(changed)
+    assert loop._deploy_repair_identity(base) == loop._deploy_repair_identity(copy.deepcopy(base))
+
+
+async def test_refused_reports_have_their_own_wording(db, monkeypatch):
+    snap = _snap(["live_repair_refused:2"])
+    snap["live_repairs"] = _repairs(refused=2)
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert row["priority"] == "high" and "update.sh" not in content, content
+    assert "2 live-move repair report(s)" in content and "could not be read" in content
+    assert "named in the server log" in content and "--dismiss" not in content, content
+
+
+async def test_unread_older_reports_alone_raise_nothing(db, monkeypatch):
+    """A3, B1 review (carried item 4c): reports past the newest eight are
+    counted, never refused, and the count includes dismissed ones, so alone it
+    raises no observation at all. Beside another finding it is named, with the
+    dismissed ones said to be included."""
+    snap = _snap(["live_repair_unread_older:3"])
+    snap["live_repairs"] = _repairs(unread_older=3)
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    assert await _rows(db) == []
+    snap = _snap(["live_repair_saved:1", "live_repair_unread_older:3"])
+    snap["live_repairs"] = _repairs(_repair("20261027T000000Z-1", 1), unread_older=3)
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    content = row["content"]
+    assert "3 older live-move repair report dir(s) not read, dismissed ones included" in content
+    assert "could not be read" not in content, content
+
+
+async def test_one_unencodable_field_never_drops_the_deploy_alert(db, monkeypatch):
+    """An unrelated finding (stale_update) and a repair field holding a lone
+    surrogate: the observation is still written, the field escaped."""
+    snap = _snap(["stale_update:9.0d,30behind", "live_repair_saved:1"], age_days=9.0, behind=30)
+    report = _repair("20261027T000000Z-1", 1)
+    report["backup_dir"] = "/home/\udcff/x"
+    snap["live_repairs"] = _repairs(report)
+    _patch_snapshot(monkeypatch, snap)
+    await loop._check_deploy_staleness(db)
+    [row] = await _rows(db)
+    assert "stale_update" in row["content"] and "\\udcff" in row["content"], row["content"]
+
+
+async def test_commits_behind_alone_is_written_medium(db, monkeypatch):
+    """Being N commits behind upstream is routine maintenance, not an alarm.
+
+    Written at high it reached the morning report as a BLOCKER every day. The
+    priority is set where the row is written, so every reader sees the same one.
+    """
+    _patch_snapshot(monkeypatch, _snap(["behind_upstream:12"], age_days=1.0, behind=12))
+    await loop._check_deploy_staleness(db)
+    assert [r["priority"] for r in await _rows(db)] == ["medium"]
+
+
+async def test_commits_behind_with_another_drift_class_stays_high(db, monkeypatch):
+    """Control: only the bare commits-behind state is lowered. Pending tier-2
+    work beside it is a different finding and keeps its priority."""
+    _patch_snapshot(
+        monkeypatch,
+        _snap(
+            ["behind_upstream:12", "tier2_pending:2"],
+            age_days=1.0,
+            behind=12,
+            tier2=["a", "b"],
+        ),
+    )
+    await loop._check_deploy_staleness(db)
+    assert [r["priority"] for r in await _rows(db)] == ["high"]

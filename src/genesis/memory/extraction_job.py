@@ -85,6 +85,8 @@ _EXCLUDED_SOURCE_TAGS = frozenset({
     "mail_follow_up",  # mail pipeline; own handling
     "mail_reply",  # mail pipeline; own handling
     "models_md_synthesis",  # models.md synthesis job; own output
+    "agent_api",  # peer-agent receipts: external-untrusted, like inbox_evaluation;
+                  # their scanned result artifact is the owned output
 })
 
 # Prefix families whose per-run tags are all excluded (e.g. "reflection_deep",

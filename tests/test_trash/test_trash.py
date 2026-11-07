@@ -379,10 +379,28 @@ def test_an_unreadable_trash_is_reported_not_shown_empty(tmp_path, root, capsys)
         if os.access(root, os.R_OK):
             pytest.skip("running as a user that ignores directory permissions")
         assert main(["list"]) == EXIT_REFUSED
-        assert "cannot read the trash" in capsys.readouterr().err
+        # _check_root fires first now; listdir's "cannot read" is reachable
+        # only through an ACL or LSM denial on a 0700 root.
+        assert "is not mode 0700" in capsys.readouterr().err
     finally:
         root.chmod(0o700)
     assert list_entries()  # readable again, entry intact
+
+
+@pytest.mark.parametrize("shape", ["mode", "symlink"])
+def test_restore_refuses_a_root_that_is_no_longer_ours(tmp_path, root, shape):
+    stone = trash(_touch(tmp_path / "a.txt"), reason="r", caller="c")
+    if shape == "mode":
+        root.chmod(0o755)
+    else:
+        moved = tmp_path / "moved-trash"
+        root.rename(moved)
+        root.symlink_to(moved)
+    with pytest.raises(TrashRefused):
+        restore(stone.entry_id)
+    with pytest.raises(TrashRefused):
+        list_entries()
+    assert not (tmp_path / "a.txt").exists()
 
 
 def test_a_trash_not_created_yet_is_empty():
@@ -393,3 +411,34 @@ def test_cli_usage_error_exits_64():
     with pytest.raises(SystemExit) as exc:
         main(["restor", "x"])  # no abbreviations
     assert exc.value.code == EXIT_USAGE
+
+
+def test_a_root_lstat_error_other_than_missing_is_a_refusal(monkeypatch, tmp_path, root):
+    # os.path.lexists answers False on EACCES; only a missing root is empty.
+    trash(_touch(tmp_path / "a.txt"), reason="r", caller="c")
+    real = os.lstat
+
+    def denied(path, *a, **k):
+        if Path(path) == root:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real(path, *a, **k)
+
+    monkeypatch.setattr(os, "lstat", denied)
+    with pytest.raises(TrashRefused, match="cannot read the trash"):
+        list_entries()
+
+
+def test_an_unreadable_item_is_a_refusal_not_an_incomplete_entry(monkeypatch, tmp_path, root):
+    stone = trash(_touch(tmp_path / "a.txt"), reason="r", caller="c")
+    real = os.lstat
+
+    def denied(path, *a, **k):
+        if Path(path).name == ITEM:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real(path, *a, **k)
+
+    monkeypatch.setattr(os, "lstat", denied)
+    with pytest.raises(TrashRefused, match="cannot read the trash"):
+        list_entries()
+    monkeypatch.undo()
+    assert [e.complete for e in list_entries() if e.path.name == stone.entry_id] == [True]

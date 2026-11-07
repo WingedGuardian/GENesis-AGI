@@ -290,19 +290,33 @@ async def queues(
     # inflate the raw total but are NOT stuck recovery work, so alerting on the
     # raw total cries wolf on every tick. Mirror the dead_letter raw-vs-stuck
     # split below.
+    # A failed query leaves every figure None (key present, value None): a
+    # consumer must never read a depth nobody measured as 0. The zero
+    # convention applies only when both the database and wrapper are absent.
     deferred_recovery = None
-    deferred_worklist = 0
+    deferred_worklist = None
+    # Worklist items stalled past a full drain cycle: counted in BOTH
+    # deferred_recovery and deferred_worklist. All four populations use one
+    # statement and one cutoff, so their subset relationships remain coherent.
+    deferred_worklist_stalled = None
     if deferred_queue:
         try:
-            deferred = await deferred_queue.count_pending()
-            deferred_recovery = await deferred_queue.count_recovery_pending()
-            deferred_worklist = await deferred_queue.count_worklist_pending()
+            counts = await deferred_queue.count_pending_split()
+            deferred = counts["total"]
+            deferred_recovery = counts["recovery"]
+            deferred_worklist = counts["worklist"]
+            deferred_worklist_stalled = counts["stalled"]
         except Exception:
+            deferred = deferred_recovery = deferred_worklist = deferred_worklist_stalled = None
             errors.append("deferred_work: query failed")
             logger.error("Failed to query deferred work queue", exc_info=True)
+    elif db is not None:
+        errors.append("deferred_work: queue unavailable")
     else:
         deferred = 0
         deferred_recovery = 0
+        deferred_worklist = 0
+        deferred_worklist_stalled = 0
 
     dead = None
     if dead_letter:
@@ -344,6 +358,8 @@ async def queues(
         except Exception:
             errors.append("dead_letters: query failed")
             logger.error("Failed to query dead letter queue", exc_info=True)
+    elif db is not None:
+        errors.append("dead_letters: queue unavailable")
     else:
         dead = 0
 
@@ -618,6 +634,8 @@ async def queues(
         # Batch worklist depth (dream synthesis etc.) — display only, never
         # summed into the depth alarm.
         "deferred_worklist": deferred_worklist,
+        # Display only: the stalled-worklist overlap between the two above.
+        "deferred_worklist_stalled": deferred_worklist_stalled,
         "deferred_oldest_age_seconds": deferred_oldest_s,
         "deferred_processing": deferred_processing,
         "deferred_stuck": deferred_stuck,

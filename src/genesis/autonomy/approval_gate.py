@@ -521,6 +521,8 @@ class AutonomousCliApprovalGate:
         - Work-board promotions. Each turns ONE private record into a public
           issue; the drain also refuses a non-human resolver, but a sweep's
           resolver IS human, so only this exclusion keeps them per-item.
+        - Card releases. Approval is a Telegram tap on the one message that
+          names the payment (``payments/approval.py``), never a row here.
         """
         from genesis.autonomy.contributor_worklog_config import (
             CONTRIBUTOR_ISSUE_ACTION_TYPE,
@@ -529,8 +531,10 @@ class AutonomousCliApprovalGate:
         from genesis.autonomy.email_gate import EMAIL_GATE_ACTION_TYPE
         from genesis.autonomy.task_unblock_config import TASK_UNBLOCK_ACTION_TYPE
         from genesis.board.promotion import BOARD_PROMOTION_ACTION_TYPE
+        from genesis.payments.approval import PAYMENT_APPROVAL_ACTION_TYPE
 
         excluded = {
+            PAYMENT_APPROVAL_ACTION_TYPE,
             EMAIL_GATE_ACTION_TYPE,
             CONTRIBUTOR_ISSUE_ACTION_TYPE,
             DESKTOP_GATE_ACTION_TYPE,
@@ -565,6 +569,7 @@ class AutonomousCliApprovalGate:
         """
         from genesis.autonomy.desktop_gate import DESKTOP_GATE_ACTION_TYPE
         from genesis.autonomy.task_unblock_config import TASK_UNBLOCK_ACTION_TYPE
+        from genesis.payments.approval import PAYMENT_APPROVAL_ACTION_TYPE
 
         # Excluding a type from approve_all_pending is not enough on its own.
         # A `cli_approve_all:<request_id>` callback resolves the TRIGGERING row
@@ -572,7 +577,9 @@ class AutonomousCliApprovalGate:
         # type the sweep skips is still approved when it is the row that
         # triggered the sweep. The exclusion has to exist at both ends, which is
         # why desktop is already here.
-        refuse_generic = {DESKTOP_GATE_ACTION_TYPE, TASK_UNBLOCK_ACTION_TYPE}
+        refuse_generic = {
+            DESKTOP_GATE_ACTION_TYPE, TASK_UNBLOCK_ACTION_TYPE, PAYMENT_APPROVAL_ACTION_TYPE,
+        }
 
         row = await self.get_request(request_id)
         if row is not None and row.get("action_type") in refuse_generic:

@@ -118,6 +118,19 @@ def _run_hook(
     )
 
 
+def _phase_lines(stderr: str) -> list[dict]:
+    """The hook's per-step timing lines (hook_phases.py) from its stderr."""
+    prefix = "[hook-phases] "
+    return [json.loads(ln[len(prefix) :]) for ln in stderr.splitlines() if ln.startswith(prefix)]
+
+
+def _only_phase_line(stderr: str) -> dict:
+    lines = _phase_lines(stderr)
+    assert len(lines) == 1, f"expected exactly one phase line, got {len(lines)}:\n{stderr[-2000:]}"
+    assert lines[0]["cut"] is False
+    return lines[0]
+
+
 def _metrics(home: Path) -> dict:
     return json.loads((home / ".genesis" / "proactive_metrics.json").read_text())
 
@@ -172,6 +185,12 @@ def test_stub_server_mode_server(fts_db: Path, tmp_path: Path):
         )
 
     assert result.returncode == 0, result.stderr[:2000]
+    phase = _only_phase_line(result.stderr)
+    assert phase["path"] == "server"
+    names = [name for name, _ in phase["phases"]]
+    assert names[:4] == ["imports", "dotenv", "genesis_env", "module"]
+    assert "server" in names and "server_emit" in names and names[-1] == "finish"
+    assert phase["recall_landed"] is True
     assert server_line in result.stdout
     # The degraded banner must NOT appear on the healthy server path.
     assert "degraded" not in result.stdout.lower()
@@ -312,6 +331,10 @@ def test_server_down_falls_back_to_fts5(fts_db: Path, tmp_path: Path):
         home,
     )
     assert result.returncode == 0, result.stderr[:2000]
+    phase = _only_phase_line(result.stderr)
+    assert phase["path"] == "degraded"
+    assert phase["server_reason"]
+    assert "fts5" in [name for name, _ in phase["phases"]]
     assert "degraded" in result.stdout.lower()
     assert f"id:{_FTS_ID[:8]}" in result.stdout  # the seeded FTS5 memory surfaced
     assert "Memory·degraded" in result.stdout
@@ -360,6 +383,7 @@ def test_mode_off_no_recall(fts_db: Path, tmp_path: Path):
         home,
     )
     assert result.returncode == 0, result.stderr[:2000]
+    assert _only_phase_line(result.stderr)["path"] == "off"
     assert "[Memory" not in result.stdout
     assert "degraded" not in result.stdout.lower()
     # off mode is still recorded (observable), not a metrics blind spot.
@@ -379,6 +403,9 @@ def test_local_mode_forces_fts5(fts_db: Path, tmp_path: Path):
         home,
     )
     assert result.returncode == 0, result.stderr[:2000]
+    phase = _only_phase_line(result.stderr)
+    assert phase["path"] == "local"
+    assert "server" not in [name for name, _ in phase["phases"]]
     assert f"id:{_FTS_ID[:8]}" in result.stdout
     assert "local keyword-only mode" in result.stdout
     assert _metrics(home)["mode"] == "local"
@@ -397,6 +424,7 @@ def test_genesis_cc_session_exits_immediately():
         timeout=10,
     )
     assert result.returncode == 0
+    assert _phase_lines(result.stderr) == []  # dispatched sessions skip the hook entirely
     assert "[Memory" not in result.stdout
     assert "[Procedure" not in result.stdout
 
@@ -414,3 +442,6 @@ def test_empty_input_exits_cleanly():
         timeout=10,
     )
     assert result.returncode == 0
+    phase = _only_phase_line(result.stderr)  # an early return still writes its line
+    assert "path" not in phase
+    assert [name for name, _ in phase["phases"]][-1] == "stdin"

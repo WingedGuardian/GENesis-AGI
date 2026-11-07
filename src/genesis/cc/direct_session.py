@@ -21,15 +21,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import json
 import logging
 import shutil
 import time
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from genesis.cc import rate_limit_park, roster
+from genesis.cc import final_status, rate_limit_park, roster
 from genesis.cc.exceptions import CCQuotaExhaustedError, CCRateLimitError
 from genesis.cc.session_config import _USER_SCOPED_MCP_WILDCARDS
 from genesis.cc.types import (
@@ -46,6 +48,7 @@ from genesis.cc.types import (
 )
 from genesis.observability.session_context import set_session_id as _set_obs_session
 from genesis.util.inflight import close_unit, open_unit, within
+from genesis.util.proc_kill import ProcessCleanupUncertain
 from genesis.util.tasks import tracked_task
 
 if TYPE_CHECKING:
@@ -63,6 +66,14 @@ logger = logging.getLogger(__name__)
 _BG_TRUNCATION_NOTICE = (
     "\n\n⚠️ Note: this run reached its time budget and some background work was "
     "cut off before finishing, so the results below may be incomplete."
+)
+
+# Appended to a delivered result when the session exited without sending its
+# final result event (CCOutput.result_received False): what arrived is the text
+# it produced along the way, not its answer.
+_NO_RESULT_NOTICE = (
+    "\n\n⚠️ Note: this session ended before sending its final result, so this is "
+    "the text it produced along the way and may be incomplete."
 )
 
 # Soft cap for a single Telegram delivery of a RESULT-mode outcome. Below the
@@ -107,7 +118,13 @@ _BG_CC_TMP_ROOT = Path.home() / "tmp" / "bg-cc-sessions"
 
 
 def _bg_session_root(session_id: str) -> Path:
-    """Per-session root dir for a background CC session's isolated sandbox."""
+    """Per-session root dir for a background CC session's isolated sandbox.
+
+    Callers remove this tree recursively, so the id must be one plain path
+    component; anything else is refused rather than resolved.
+    """
+    if not session_id or session_id in {".", ".."} or Path(session_id).name != session_id:
+        raise ValueError("Session id is not a single path component")
     return _BG_CC_TMP_ROOT / session_id
 
 
@@ -200,6 +217,7 @@ _UNIVERSAL_DISALLOW = [
 ]
 
 _NO_OUTREACH_SEND = [
+    "mcp__genesis-outreach__agent_send",
     "mcp__genesis-outreach__outreach_send",
     "mcp__genesis-outreach__outreach_send_and_wait",
 ]
@@ -208,6 +226,9 @@ _NO_OUTREACH_SEND = [
 _NO_BROWSER_INTERACTION = [
     "mcp__genesis-health__browser_click",
     "mcp__genesis-health__browser_fill",
+    # Pays with a vault card behind the owner's Telegram tap. Profiles that
+    # keep browser interaction (interact) keep it too.
+    "mcp__genesis-health__browser_fill_card",
     "mcp__genesis-health__browser_run_js",
     "mcp__genesis-health__browser_clear_domain",
     "mcp__genesis-health__browser_collaborate",
@@ -260,6 +281,7 @@ _NO_WEB_TOOLS = [
 # untrusted-inbound perimeter until it is named here. Add new tools to this list
 # as part of adding them, not afterwards.
 _NO_OUTREACH_EXTRAS = [
+    "mcp__genesis-outreach__agent_send",
     "mcp__genesis-outreach__outreach_send_and_wait",
     "mcp__genesis-outreach__outreach_poll",
     "mcp__genesis-outreach__outreach_digest",
@@ -385,6 +407,7 @@ PROFILES: dict[str, list[str]] = {
     # autonomous cold-marketing caller. Every other profile denies it above/below.
     "campaign": (
         _UNIVERSAL_DISALLOW
+        + ["mcp__genesis-outreach__agent_send"]
         + _NO_BROWSER_INTERACTION
         + _NO_OUTREACH_QUEUE_CONTROL
         + _NO_OPEN_QUESTION_READS
@@ -862,8 +885,23 @@ class DirectSessionRequest:
     # to route a RESULT delivery back to that conversation. Captured from
     # GENESIS_SESSION_ID at dispatch (see direct_session_run). None otherwise.
     origin_session_id: str | None = None
+    # Server-owned prepared receipt mode, never reconstructed from queue payloads.
+    managed: bool = False
 
     def __post_init__(self) -> None:
+        if self.managed and (
+            self.profile not in {"observe", "interact"}
+            or self.tool_exceptions
+            or self.source_tag != "agent_api"
+            or not (self.caller_context or "").startswith("agent_api:")
+            or type(self.timeout_s) is not int
+            or not 1 <= self.timeout_s <= 7200
+            or self.origin_session_id
+            or self.origin_caller_context
+            or self.delivery_mode not in {None, DeliveryMode.SILENT}
+            or self.notify
+        ):
+            raise ValueError("Invalid managed session controls")
         if self.profile not in VALID_PROFILES:
             raise ValueError(
                 f"Invalid profile {self.profile!r}. "
@@ -878,6 +916,33 @@ class DirectSessionRequest:
                 "delivery_mode",
                 DeliveryMode.from_legacy(self.notify, self.notify_on_failure_only),
             )
+
+
+def _is_stop(result: DirectSessionResult) -> bool:
+    """A run recorded as a stop (crud.cc_sessions.STOP_OUTCOMES), clean exit or not."""
+    from genesis.db.crud.cc_sessions import STOP_OUTCOMES
+
+    return result.outcome in STOP_OUTCOMES
+
+
+def pages_immediately(request: DirectSessionRequest) -> bool:
+    """Whether a failure of this session pages the owner at once.
+
+    Owner-requested work does: an MCP request, an ego dispatch, and a job the
+    owner scheduled (owner rulings 2026-11-04). Every other background stop
+    reaches the owner in the hourly page (``outreach.stopped_sessions``), so a
+    recurring job no longer pages on each failure. A resumed park is classed by
+    the context it was parked under.
+    """
+    ctx = rate_limit_park.effective_caller_context(
+        request.caller_context, request.origin_caller_context
+    )
+    return (
+        ctx == "mcp_tool"
+        or (ctx or "").startswith(("ego_proposal:", "user_job:"))
+        or (request.source_tag or "") == "ego_dispatch"
+        or (request.source_tag or "").startswith("user_job:")
+    )
 
 
 @dataclass
@@ -896,6 +961,13 @@ class DirectSessionResult:
     tools_called: list[dict] = field(default_factory=list)
     model_used: str = ""
     roster_model: str = ""  # roster NAME the chokepoint selected (peer name or "claude")
+    stream_lines_dropped: int = 0
+    partial: bool = False
+    # How the run was recorded on its cc_sessions row (crud.cc_sessions.OUTCOMES).
+    # A clean exit can still be a stop (partial, or self-reported blocked or
+    # failed), so the messages below read this, not ``success``.
+    outcome: str | None = None
+    outcome_reason: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -938,6 +1010,15 @@ class DirectSessionRunner:
         self._rt = runtime
         self._semaphore = asyncio.Semaphore(self._MAX_CONCURRENT)
         self._active: dict[str, asyncio.Task] = {}
+        self._managed_cancel: dict[str, asyncio.Event] = {}
+        # Admissions that may still adopt a receipt. shutdown() closes the gate
+        # and drains them before cancelling sessions, while the DB is open.
+        self._admissions: set[asyncio.Task] = set()
+        # Peer identity work shares this runner-wide budget across HTTP services.
+        self._peer_admissions: dict[str, tuple[str, str, asyncio.Task]] = {}
+        self._closing = False
+        # Managed sessions whose runner slot is held through finalization.
+        self._managed_slots: set[str] = set()
         self._protected_paths: object | None = None
         self._auditor: object | None = None
 
@@ -951,8 +1032,8 @@ class DirectSessionRunner:
 
     # -- Public API --------------------------------------------------------
 
-    async def spawn(self, request: DirectSessionRequest) -> str:
-        """Fire-and-forget. Returns genesis session_id immediately.
+    async def _check_background(self, request: DirectSessionRequest) -> None:
+        """Check the existing background breaker, strictly for managed work.
 
         Includes a lightweight autonomy ceiling check: if the background
         cognitive category has been fully regressed, block ALL background
@@ -966,6 +1047,18 @@ class DirectSessionRunner:
         _SKIP_TAGS = {"foreground", "user_request"}
         if request.source_tag not in _SKIP_TAGS:
             mgr = getattr(self._rt, "_autonomy_manager", None)
+            if request.managed:
+                from genesis.autonomy.types import AutonomyCategory
+
+                required = 3 if request.profile == "interact" else 1
+                if (
+                    mgr is None
+                    or await mgr.effective_level(
+                        AutonomyCategory.BACKGROUND_COGNITIVE.value,
+                    )
+                    < required
+                ):
+                    raise RuntimeError("Background authority is unavailable")
             if mgr is not None:
                 try:
                     from genesis.autonomy.types import AutonomyCategory
@@ -998,12 +1091,19 @@ class DirectSessionRunner:
                 except RuntimeError:
                     raise  # re-raise the circuit breaker
                 except Exception:
+                    if request.managed:
+                        raise
                     # Non-fatal: if check fails, allow spawn
                     logger.debug(
                         "Autonomy ceiling check failed (non-fatal)",
                         exc_info=True,
                     )
 
+    async def spawn(self, request: DirectSessionRequest) -> str:
+        """Fire-and-forget. Managed requests must adopt an atomic receipt."""
+        if request.managed:
+            raise ValueError("Managed requests require a prepared receipt")
+        await self._check_background(request)
         session = await self._session_manager.create_background(
             session_type=SessionType.BACKGROUND_TASK,
             model=request.model,
@@ -1042,6 +1142,90 @@ class DirectSessionRunner:
     def active_count(self) -> int:
         return len(self._active)
 
+    def is_active(self, session_id: str) -> bool:
+        return session_id in self._active
+
+    def register_admission(self, task: asyncio.Task) -> None:
+        """Track a task that may adopt a receipt; refused once shutdown began."""
+        if self._closing:
+            raise RuntimeError("Direct-session runner is shutting down")
+        self._admissions.add(task)
+        task.add_done_callback(self._admissions.discard)
+
+    @property
+    def closing(self) -> bool:
+        return self._closing
+
+    def cancel(self, session_id: str) -> bool:
+        """Signal a managed session; repeated signals never interrupt its drain."""
+        signal = self._managed_cancel.get(session_id)
+        if signal is None:
+            return False
+        signal.set()
+        return True
+
+    async def adopt(self, session_id: str, request: DirectSessionRequest) -> str:
+        """Register an already persisted receipt before any awaited hook/effect."""
+        from genesis.cc.managed_session import fingerprint, metadata
+        from genesis.db.crud import cc_sessions
+
+        # The receipt id names files and directories (sandbox, artifact), so
+        # only a canonical UUID is adoptable, whoever created the row.
+        try:
+            canonical = str(uuid.UUID(session_id)) == session_id
+        except (ValueError, TypeError, AttributeError):
+            canonical = False
+        if not canonical or self._closing:
+            raise ValueError("Prepared receipt cannot be adopted")
+        # Verify and run one private snapshot: a caller mutating its own
+        # request (e.g. the skills list) after adoption cannot change what runs.
+        request = copy.deepcopy(request)
+        row = await cc_sessions.get_by_id(self._session_manager.db, session_id)
+        if (
+            not request.managed
+            or row is None
+            or session_id in self._active
+            or getattr(self._rt, "_db", None) is not self._session_manager.db
+            or row["source_tag"] != "agent_api"
+            or row["status"] != "active"
+            or row["session_type"] != "background_task"
+            or row["channel"] != "agent"
+            or row["origin_class"] != "external_untrusted"
+            or metadata(row).get("native_state") != "pending"
+            or metadata(row).get("managed_fingerprint") != fingerprint(request)
+        ):
+            raise ValueError("Prepared receipt cannot be adopted")
+        signal = asyncio.Event()
+        unit = open_unit("direct_session", "managed native session", item_id=session_id)
+        coroutine = self._run_session_registered(request, session_id, unit)
+        try:
+            task = tracked_task(coroutine, name=f"managed-session-{session_id[:8]}")
+        except BaseException:
+            coroutine.close()
+            close_unit(unit)
+            from genesis.cc.managed_session import update_state
+
+            await update_state(
+                self._session_manager.db,
+                session_id,
+                "failed",
+                error="not_started",
+            )
+            await cc_sessions.update_status(
+                self._session_manager.db,
+                session_id,
+                status="failed",
+                outcome_reason="not_started",
+            )
+            raise
+        self._active[session_id] = task
+        self._managed_cancel[session_id] = signal
+        self._session_manager.set_background_liveness(self.is_active)
+        task.add_done_callback(lambda _t: self._active.pop(session_id, None))
+        task.add_done_callback(lambda _t: self._managed_cancel.pop(session_id, None))
+        task.add_done_callback(lambda _t: close_unit(unit))
+        return session_id
+
     async def _run_session_registered(
         self,
         request: DirectSessionRequest,
@@ -1054,6 +1238,12 @@ class DirectSessionRunner:
         it. ``shutdown`` cancels it anywhere in that span. The unit closes when
         the task does (a done-callback), whichever way it ends."""
         with within(unit):
+            if request.managed:
+                from genesis.cc.managed_session import run_managed
+
+                return await run_managed(
+                    self, request, session_id, self._managed_cancel[session_id]
+                )
             return await self._run_session(request, session_id)
 
     async def shutdown(self, *, grace_s: float = 10.0) -> int:
@@ -1073,9 +1263,22 @@ class DirectSessionRunner:
 
         Returns the number of tasks that were still in flight.
         """
+        # Close the admission gate first: an admission racing shutdown either
+        # finishes (its adopt is refused while closing) or is cancelled here,
+        # never adopting after the cancellation pass below.
+        self._closing = True
+        admissions = [t for t in self._admissions if not t.done()]
+        if admissions:
+            _, pending = await asyncio.wait(admissions, timeout=grace_s)
+            for t in pending:
+                t.cancel()
+            if pending:
+                await asyncio.wait(pending, timeout=grace_s)
         tasks = [t for t in self._active.values() if not t.done()]
         for t in tasks:
-            t.cancel()
+            sid = next((sid for sid, active in self._active.items() if active is t), None)
+            if sid is None or not self.cancel(sid):
+                t.cancel()
         if tasks:
             await asyncio.wait(tasks, timeout=grace_s)
         return len(tasks)
@@ -1091,6 +1294,84 @@ class DirectSessionRunner:
 
     # -- Internal ----------------------------------------------------------
 
+    async def _invoke(self, request, session_id, on_event) -> CCOutput:
+        """Shared profile configuration, runner slot and native invocation."""
+        if not request.managed:
+            async with self._semaphore:
+                return await self._invoke_in_slot(request, session_id, on_event)
+        # A managed run keeps its slot until its receipt is finalized, not just
+        # until the subprocess exits: run_managed releases it through
+        # release_managed_slot() once finalization has committed.
+        await self._semaphore.acquire()
+        self._managed_slots.add(session_id)
+        return await self._invoke_in_slot(request, session_id, on_event)
+
+    def release_managed_slot(self, session_id: str) -> None:
+        """Free the slot a managed run took, once its receipt is persisted."""
+        if session_id in self._managed_slots:
+            self._managed_slots.discard(session_id)
+            self._semaphore.release()
+
+    async def _invoke_in_slot(self, request, session_id, on_event) -> CCOutput:
+        invocation = self._build_invocation(request, session_id)
+        if request.managed:
+            invocation = replace(
+                invocation,
+                confirm_cleanup=True,
+                origin="external_untrusted",
+                supervised=False,
+            )
+        if invocation.claude_code_tmpdir:
+            Path(invocation.claude_code_tmpdir).mkdir(parents=True, exist_ok=True)
+        try:
+            if request.managed:
+                from genesis.cc.managed_fallback import execute_selected
+
+                return await execute_selected(self, request, session_id, invocation, on_event)
+            return await self._invoker.run_streaming(invocation, on_event=on_event)
+        except ProcessCleanupUncertain:
+            if not request.managed:
+                raise
+            from genesis.cc.managed_session import hold_uncertain
+
+            # A child may still be running: keep this runner slot with it.
+            await hold_uncertain(self._session_manager.db, session_id)
+            raise  # unreachable: hold_uncertain never returns
+
+    @staticmethod
+    def _result(session_id, output: CCOutput, telemetry, elapsed) -> DirectSessionResult:
+        # A truncated run, or one with no result event, did not finish even
+        # though it exited cleanly. Otherwise a clean exit is judged by the
+        # session's own report (cc/final_status.py); an error stays a failure.
+        partial = output.bg_truncated or not output.result_received
+        outcome = reason = None
+        if partial:
+            outcome = "partial"
+            reason = "bg_truncated" if output.bg_truncated else "no_result_event"
+        elif not output.is_error:
+            outcome, reason = final_status.outcome_of(output.final_status)
+            outcome = outcome or "unreported"
+        return DirectSessionResult(
+            session_id=session_id,
+            cc_session_id=output.session_id,
+            success=not output.is_error,
+            output_text=(
+                output.text + _BG_TRUNCATION_NOTICE if output.bg_truncated else output.text
+            ),
+            error=output.error_message if output.is_error else None,
+            cost_usd=output.cost_usd,
+            input_tokens=output.input_tokens,
+            output_tokens=output.output_tokens,
+            duration_s=round(elapsed, 1),
+            tools_called=telemetry,
+            model_used=output.model_used,
+            roster_model=output.roster_model,
+            stream_lines_dropped=output.stream_lines_dropped,
+            partial=partial,
+            outcome=outcome,
+            outcome_reason=reason,
+        )
+
     async def _run_session(
         self,
         request: DirectSessionRequest,
@@ -1099,52 +1380,29 @@ class DirectSessionRunner:
         """Execute a single CC session. Called inside tracked_task."""
         _set_obs_session(session_id)
         telemetry: list[dict] = []
+        # Keep only the scrubbed, bounded warning inventory while running;
+        # telemetry's preview is an unscrubbed 200-char cut, not this record.
+        inventory: list[dict] = []
         start = time.monotonic()
 
         async def on_event(event: StreamEvent) -> None:
-            if event.event_type == "tool_use" and event.tool_name:
+            nonlocal inventory
+            for name, tool_input in event.tool_uses():
+                inventory = rate_limit_park.merge_inventory(
+                    inventory, rate_limit_park.ran_inventory([(name, tool_input)]),
+                )
                 telemetry.append(
                     {
-                        "name": event.tool_name,
-                        "input_preview": (str(event.tool_input)[:200] if event.tool_input else ""),
+                        "name": name,
+                        "input_preview": (str(tool_input)[:200] if tool_input else ""),
                     }
                 )
 
         try:
-            async with self._semaphore:
-                invocation = self._build_invocation(request, session_id)
-                # Create this session's isolated CC sandbox (off cc-tmp) just
-                # before the run; removed in the finally below. The guard is
-                # intentional: if claude_code_tmpdir is unset (tests, or any
-                # future non-isolated path), CC falls back to the shared cc-tmp
-                # (the old behaviour) rather than this crashing.
-                if invocation.claude_code_tmpdir:
-                    Path(invocation.claude_code_tmpdir).mkdir(
-                        parents=True,
-                        exist_ok=True,
-                    )
-                output: CCOutput = await self._invoker.run_streaming(
-                    invocation,
-                    on_event=on_event,
-                )
+            output = await self._invoke(request, session_id, on_event)
 
             elapsed = time.monotonic() - start
-            result = DirectSessionResult(
-                session_id=session_id,
-                cc_session_id=output.session_id,
-                success=not output.is_error,
-                output_text=(
-                    output.text + _BG_TRUNCATION_NOTICE if output.bg_truncated else output.text
-                ),
-                error=output.error_message if output.is_error else None,
-                cost_usd=output.cost_usd,
-                input_tokens=output.input_tokens,
-                output_tokens=output.output_tokens,
-                duration_s=round(elapsed, 1),
-                tools_called=telemetry,
-                model_used=output.model_used,
-                roster_model=output.roster_model,
-            )
+            result = self._result(session_id, output, telemetry, elapsed)
 
             # Persist result in session metadata (merge, don't overwrite).
             # A dropped over-limit stream line is recorded alongside the result:
@@ -1239,17 +1497,32 @@ class DirectSessionRunner:
                         exc_info=True,
                     )
 
+            # A truncated run, or one with no result event, did not finish, even
+            # though it exited cleanly: record it as such (managed runs already
+            # fail on the same condition, managed_session.py).
+            # Otherwise the session's own report decides (see _result).
             await self._session_manager.complete(
                 session_id,
                 cost_usd=output.cost_usd,
                 input_tokens=output.input_tokens,
                 output_tokens=output.output_tokens,
+                outcome=result.outcome,
+                outcome_reason=result.outcome_reason,
             )
 
             # RESULT-mode: deliver the finished outcome back to the origin
             # conversation. Best-effort (own try/except) — never fails the run.
             if request.delivery_mode == DeliveryMode.RESULT:
                 await self._deliver_result_to_origin(request, result)
+            elif request.notify and pages_immediately(request) and _is_stop(result):
+                # A clean exit that stopped short pages like a failure would.
+                try:
+                    sent = await self._notify(request, result, success=False)
+                    await self._mark_paged(session_id, sent)
+                except Exception:
+                    logger.error(
+                        "Failed to send stop notification for %s", session_id[:8], exc_info=True
+                    )
 
             # If this session was a rate-limit resume, close its park now that the
             # result is delivered (no-op unless caller_context carries a park id).
@@ -1284,6 +1557,9 @@ class DirectSessionRunner:
                 duration_s=round(elapsed, 1),
                 tools_called=telemetry,
             )
+            # Own statement (it never raises), so a failed write below cannot
+            # skip it; one quick row write, well inside the shutdown grace.
+            await self._record_resumed_calls(request, inventory)
             try:
                 await self._store_result(session_id, request, cancel_result)
                 # Write the terminal 'failed' status BEFORE the outcome embed:
@@ -1321,7 +1597,12 @@ class DirectSessionRunner:
             db = getattr(self._rt, "_db", None)
             park_id = None
             if db is not None:
-                park_id = await rate_limit_park.park_direct_session(db, request=request, exc=exc)
+                park_id = await rate_limit_park.park_direct_session(
+                    db,
+                    request=request,
+                    exc=exc,
+                    inventory=inventory,
+                )
             if park_id is not None:
                 elapsed = time.monotonic() - start
                 parked_result = DirectSessionResult(
@@ -1344,6 +1625,7 @@ class DirectSessionRunner:
                     await self._session_manager.fail(
                         session_id,
                         reason="rate_limited_parked",
+                        outcome="parked",
                     )
                 except Exception:
                     logger.error(
@@ -1361,6 +1643,9 @@ class DirectSessionRunner:
             await self._finalize_failure(session_id, request, exc, telemetry, start)
 
         except Exception as exc:
+            # Not in _finalize_failure: the rate-limit path above reuses it
+            # after park_direct_session already recorded these calls.
+            await self._record_resumed_calls(request, inventory)
             await self._finalize_failure(session_id, request, exc, telemetry, start)
 
         finally:
@@ -1368,6 +1653,16 @@ class DirectSessionRunner:
             # before the run above). Best-effort; the disk-hygiene reaper catches
             # any orphans left by a hard SIGKILL that skips this finally.
             shutil.rmtree(_bg_session_root(session_id), ignore_errors=True)
+
+    async def _record_resumed_calls(self, request, inventory) -> None:
+        """A resumed run that failed or was cancelled stays parked for a later
+        retry; record the calls it made so that retry checks before repeating
+        them. Best-effort, and a no-op for a run that is not a resume."""
+        db = getattr(self._rt, "_db", None)
+        if db is not None:
+            await rate_limit_park.record_resumed_run_calls(
+                db, request.caller_context, inventory=inventory,
+            )
 
     async def _finalize_failure(
         self,
@@ -1416,9 +1711,12 @@ class DirectSessionRunner:
         # swallows its own errors, so no extra guard is needed here.
         if request.delivery_mode == DeliveryMode.RESULT:
             await self._deliver_result_to_origin(request, error_result)
-        elif request.notify:
+        elif request.notify and pages_immediately(request):
+            # Owner-requested work pages at once; every other stop reaches the
+            # owner in the hourly page (outreach.stopped_sessions).
             try:
-                await self._notify(request, error_result, success=False)
+                sent = await self._notify(request, error_result, success=False)
+                await self._mark_paged(session_id, sent)
             except Exception:
                 logger.error(
                     "Failed to send failure notification for %s",
@@ -1476,7 +1774,11 @@ class DirectSessionRunner:
             # empty files are hard failures; size/content misses are advisories
             # that KEEP the proposal executed — a real deliverable was produced,
             # and a string/size miss is a failure of the proxy, not the work.
-            if result.success:
+            # A clean exit that stopped short (partial, or a self-reported
+            # blocked/failed) did not do the job: it must not enter the
+            # track record as a success.
+            succeeded = result.success and not _is_stop(result)
+            if succeeded:
                 vres = await self._verify_proposal_outputs(db, proposal_id)
                 if vres is not None and vres.missing_files:
                     # Deliverable not produced → hard fail + observation.
@@ -1517,6 +1819,9 @@ class DirectSessionRunner:
                     advisories = list(vres.advisories)
 
             base = result.output_text or result.error or ""
+            if result.success and not succeeded:
+                why = f": {result.outcome_reason}" if result.outcome_reason else ""
+                base = f"[stopped: {result.outcome}{why}] {base}"
             if advisories:
                 # Informational only — never changes the |completed: polarity
                 # the feedback harvester reads from this suffix. Budget the note
@@ -1529,7 +1834,7 @@ class DirectSessionRunner:
             await update_proposal_outcome(
                 db,
                 proposal_id,
-                success=result.success,
+                success=succeeded,
                 summary=summary,
             )
             # Record the dispatch outcome (BOTH polarities) as a retrievable
@@ -1553,7 +1858,7 @@ class DirectSessionRunner:
                     except Exception:
                         logger.debug("Failed to fetch proposal subject", exc_info=True)
                     _subj_tag = f" ({_subj})" if _subj else ""
-                    if result.success:
+                    if succeeded:
                         content = (
                             f"Ego dispatch SUCCEEDED for proposal "
                             f"{proposal_id}{_subj_tag}: {summary}"
@@ -1637,7 +1942,12 @@ class DirectSessionRunner:
             if tm is None:
                 return
 
-            status = "✓ Completed" if result.success else "✗ Failed"
+            if not result.success:
+                status = "✗ Failed"
+            elif _is_stop(result):
+                status = f"⚠ {result.outcome.capitalize()}"
+            else:
+                status = "✓ Completed"
             outcome = (result.output_text or result.error or "no output")[:400]
             outcome_escaped = html_mod.escape(outcome)
 
@@ -1802,6 +2112,7 @@ class DirectSessionRunner:
             effort=request.effort,
             system_prompt=system_prompt,
             append_system_prompt=True,
+            report_status=True,
             timeout_s=request.timeout_s,
             # Background lane may legitimately own long dispatched Workflow work
             # (e.g. deep-research, 100+ agents). Let the CLI wait for bg tasks up
@@ -1888,7 +2199,11 @@ class DirectSessionRunner:
         # so a future resume can target the same provider. No-op for native Claude.
         # Token never stored (NAME only).
         if result.roster_model and result.roster_model != roster.CLAUDE:
-            payload = roster.endpoint_payload(result.roster_model)
+            payload = (
+                existing["execution_endpoint"]
+                if request.managed and "execution_endpoint" in existing
+                else roster.endpoint_payload(result.roster_model)
+            )
             if payload:
                 existing["roster_endpoint"] = payload
 
@@ -1907,8 +2222,8 @@ class DirectSessionRunner:
         result: DirectSessionResult,
         *,
         success: bool,
-    ) -> None:
-        """Send Telegram notification via outreach pipeline.
+    ) -> object | None:
+        """Send Telegram notification via outreach pipeline; return its result.
 
         Only failures are sent — successes are logged to the DB and visible
         via direct_session_list MCP tool and the dashboard.  Sending success
@@ -1935,29 +2250,61 @@ class DirectSessionRunner:
             or "none"
         )
 
+        import html as html_mod
+
+        what = (result.outcome or "failed").upper()
+        why = result.error or result.outcome_reason or "unknown"
         body = (
-            f"<b>Direct Session FAILED</b>\n\n"
+            f"<b>Direct Session {what}</b>\n\n"
             f"Profile: {request.profile} | "
             f"Model: {result.model_used or request.model} | "
             f"Duration: {result.duration_s:.0f}s\n\n"
-            f"Error: {result.error or 'unknown'}\n\n"
-            f"Tools before failure: {tools_str}"
+            f"{'Error' if result.error else 'Reason'}: {html_mod.escape(why)}\n\n"
+            f"Tools before it stopped: {tools_str}"
         )
 
         try:
             from genesis.outreach.types import OutreachCategory, OutreachRequest
 
-            await pipeline.submit(
+            return await pipeline.submit(
                 OutreachRequest(
                     category=OutreachCategory.ALERT,
-                    topic="direct_session_fail",
+                    # Per session: governance dedups on (signal, topic,
+                    # category) for 24h, so a fixed topic let only the first
+                    # owner-requested failure of the day page at once.
+                    topic=f"direct_session_fail:{result.session_id}",
+                    signal_type="direct_session_fail",
                     context=body,
                     salience_score=0.9,
                     verbatim=True,  # composed failure detail — never reword
+                    # An undelivered alert stays unstamped and the hourly
+                    # stopped-session page carries it; a deferred retry would
+                    # deliver it a second time.
+                    defer_retry=False,
                 )
             )
         except Exception:
             logger.error("Outreach submit failed", exc_info=True)
+
+    async def _mark_paged(self, session_id: str, sent: object | None) -> None:
+        """Stamp ``outcome_paged_at`` when an immediate send was DELIVERED.
+
+        Anything short of delivered (deduped, held, failed, no pipeline) leaves
+        the row unstamped, so the hourly page still reports the stop.
+        """
+        from datetime import UTC, datetime
+
+        from genesis.db.crud import cc_sessions
+        from genesis.outreach.types import OutreachStatus
+
+        if getattr(sent, "status", None) != OutreachStatus.DELIVERED:
+            return
+        try:
+            await cc_sessions.mark_outcome_paged(
+                self._session_manager.db, [session_id], ts=datetime.now(UTC).isoformat()
+            )
+        except Exception:
+            logger.warning("Could not stamp %s as paged", session_id[:8], exc_info=True)
 
     @staticmethod
     def _resolve_origin_target(
@@ -2052,13 +2399,26 @@ class DirectSessionRunner:
                 getattr(pipeline, "_forum_chat_id", None),
             )
 
-            status = "✓" if result.success else "✗"
             raw = (
                 (result.output_text or "(no output)")
                 if result.success
                 else f"Task did not complete: {result.error or 'unknown error'}"
             )
-            header = f"<b>{status} Background task complete</b>\n\n"
+            # A stop reads as a stop, never as a clean finish: this send is
+            # stamped paged below, so the hourly page will not report it.
+            if not result.success:
+                header = "<b>✗ Background task complete</b>\n\n"
+            elif result.partial:
+                # Only a truncated run carries its own notice.
+                header = "<b>⚠ Background task stopped early</b>\n\n"
+                if _BG_TRUNCATION_NOTICE not in raw:
+                    raw += _NO_RESULT_NOTICE
+            elif _is_stop(result):
+                why = f": {result.outcome_reason}" if result.outcome_reason else ""
+                header = f"<b>⚠ Background task stopped ({result.outcome})</b>\n\n"
+                raw = f"{result.outcome.capitalize()}{why}\n\n{raw}"
+            else:
+                header = "<b>✓ Background task complete</b>\n\n"
             escaped = html_mod.escape(raw)
             text = header + escaped
             if len(text) > _TG_MSG_CAP:
@@ -2083,7 +2443,7 @@ class DirectSessionRunner:
 
             from genesis.outreach.types import OutreachCategory, OutreachRequest
 
-            await pipeline.submit_urgent(
+            sent = await pipeline.submit_urgent(
                 OutreachRequest(
                     category=OutreachCategory.ALERT,
                     # Unique per session so governance dedup never collides with
@@ -2097,6 +2457,9 @@ class DirectSessionRunner:
                     target_thread_id=thread_id,
                 )
             )
+            # The owner now has this session's result (a partial run is sent
+            # as stopped early, with a notice), so the hourly page skips it.
+            await self._mark_paged(result.session_id, sent)
         except Exception:
             logger.error(
                 "Failed to deliver RESULT to origin for session %s",

@@ -61,10 +61,11 @@ REPO = "owner/repo"
 
 @pytest.fixture(autouse=True)
 def _reset_merge_deadline():
-    """``main()`` arms the module-global ``_merge_deadline`` once and never resets
-    it to ``None``; without this a prior test's (now-expired) deadline leaks into
-    the next and skews ``_gh_timeout``. The router ignores timeouts, but reset to
-    keep each case hermetic."""
+    """Start and end every case with no ``_merge_deadline`` armed. Since #2904,
+    ``main()`` disarms it on exit, so this no longer repairs a leak from this file;
+    it stays because ``test_rework_gate`` imports it, and because a case that arms
+    the deadline some other way would otherwise leak it. The router ignores
+    timeouts; the reset only keeps each case hermetic."""
     _mod._merge_deadline = None
     yield
     _mod._merge_deadline = None
@@ -399,6 +400,30 @@ _CASES: list[tuple[str, object, int, str]] = [
     (
         "ci_red_blocks",
         lambda mp: _run(mp, _merge_cmd(), ci=_ci("FAILURE")),
+        2,
+        "CI is RED",
+    ),
+    (
+        # Found by the defect corpus: this rung did not notice a conclusion GitHub
+        # adds later being ignored. The sibling job is what would vouch for the merge:
+        # alone, the unknown check leaves the required workflow unproven, which blocks
+        # for a different reason.
+        "ci_unrecognized_conclusion_blocks",
+        lambda mp: _run(
+            mp,
+            _merge_cmd(),
+            ci=json.dumps(
+                [
+                    json.loads(_ci())[0],
+                    {
+                        "name": "a-new-check",
+                        "workflowName": "CI",
+                        "conclusion": "SOME_FUTURE_CONCLUSION",
+                        "status": "COMPLETED",
+                    },
+                ]
+            ),
+        ),
         2,
         "CI is RED",
     ),
@@ -1266,6 +1291,21 @@ _CASES: list[tuple[str, object, int, str]] = [
 ]
 
 
+# Only `# ci-override` waives red CI. Found by the defect corpus: nothing failed when
+# `# review-override` also waived it. From the guard's own list, so a new sigil is
+# covered the day it is added.
+_CASES += [
+    (
+        f"ci_red_with_{sigil}_still_blocks",
+        lambda mp, sigil=sigil: _run(mp, _merge_cmd(trailer=f"# {sigil}"), ci=_ci("FAILURE")),
+        2,
+        "CI is RED",
+    )
+    for sigil in _mod._KNOWN_SIGILS
+    if sigil != "ci-override"
+]
+
+
 @pytest.mark.parametrize(
     "case_id,thunk,expected_rc,expected_msg", _CASES, ids=[c[0] for c in _CASES]
 )
@@ -1396,6 +1436,8 @@ def _report_env(monkeypatch, *, scheduled: str, head: str = HEAD):
     monkeypatch.setenv("_TEST_GH_CODEX_REVIEWS", _reviews_jsonl(head))
     monkeypatch.setenv("_TEST_GH_CODEX_COMMENTS", "")
     monkeypatch.setenv("_TEST_GH_SCHEDULED_COMMENTS", scheduled)
+    # The BLOCKING `rework` row: an empty sent-back list makes it n/a (green).
+    monkeypatch.setenv("_TEST_GH_REWORK_SENT_BACK", "")
     monkeypatch.setattr(_mod, "_check_mergeable", lambda n, repo=None: "MERGEABLE")
     monkeypatch.setattr(_mod, "_pr_ci_status", lambda n, repo=None: ("green", []))
     monkeypatch.setattr(_mod, "_check_base_is_default", lambda n, repo=None: (False, ""))

@@ -142,8 +142,12 @@ def test_disk_hygiene_actually_invokes_the_pruner():
     """
     body = _HYGIENE.read_text()
     assert "prune_hook_audit_logs.py" in body, "the groom does not invoke the pruner"
-    main_body = body.split("\nmain() {", 1)[-1] if "\nmain() {" in body else body
-    assert "prune_hook_audit_logs.py" in main_body, "the invocation is outside main()"
+    # The daily steps live in maintenance_main(); main() runs it as a stage.
+    start = body.index("\nmaintenance_main() {")
+    maintenance = body[start:body.index("\n}\n", start)]
+    assert "prune_hook_audit_logs.py" in maintenance, "the invocation is outside maintenance_main()"
+    main_body = body[body.index("\nmain() {"):]
+    assert "hygiene_stage maintenance maintenance_main" in main_body, "main() never runs maintenance_main"
 
 
 def test_a_recently_written_file_is_not_trimmed(tmp_path):
@@ -241,7 +245,7 @@ def test_the_hygiene_groom_reads_the_store_knobs_without_executing_secrets_env()
     assert "_load_store_knob() {" in body, (
         "the loader is gone, so the scan below would silently cover the whole file"
     )
-    loader = body.split("_load_store_knob() {", 1)[-1].split("\n    }", 1)[0]
+    loader = body.split("_load_store_knob() {", 1)[-1].split("\n}", 1)[0]
     # CODE lines only. Scanning prose too makes any comment containing ". " fail this,
     # which trains the next person to delete the comment rather than keep the property.
     code = [

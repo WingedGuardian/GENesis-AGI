@@ -241,6 +241,12 @@ async def call_sites(
     for _k, _v in _CALL_SITE_META.get("model_fusion", {}).items():
         mf.setdefault(_k, _v)
 
+    fallback = result.setdefault("cc_fallback", {"status": "idle", "routing": False})
+    for key, value in _CALL_SITE_META.get("cc_fallback", {}).items():
+        fallback.setdefault(key, value)
+    if fallback.get("last_run_success") is False:
+        fallback["status"] = "warning"  # Last attempt failed, not a live provider outage.
+
     # ── Groundwork sites → idle (gray) ──────────────────────────────────
     # Sites with wired=False and no last_run record are groundwork/ceremonial.
     for sid, site_data in result.items():

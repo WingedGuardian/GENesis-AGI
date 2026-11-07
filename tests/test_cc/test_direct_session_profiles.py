@@ -3,6 +3,7 @@
 Validates that profile changes don't accidentally grant or revoke tool access.
 """
 
+import re
 import sys
 import types
 from unittest.mock import MagicMock
@@ -40,6 +41,48 @@ def test_all_expected_profiles_exist():
     assert "observe" in PROFILES
     assert "interact" in PROFILES
     assert "research" in PROFILES
+
+
+async def test_direct_session_run_description_matches_profile_disallows():
+    from genesis.mcp.health import mcp
+
+    description = (await mcp.get_tool("direct_session_run")).description
+    assert description is not None
+
+    universal_match = re.search(r"All built-in profiles block:\s*(.+?)\.", description)
+    assert universal_match is not None
+    universal_tools = {
+        tool.strip().strip("`., ")
+        for tool in re.split(r",|\band\b", universal_match.group(1))
+        if tool.strip().strip("`., ")
+    }
+    assert universal_tools
+    for tool in universal_tools:
+        assert all(
+            tool in denied or any(denied_tool.endswith(f"__{tool}") for denied_tool in denied)
+            for denied in (PROFILES[name] for name in _SHIPPED_PROFILE_NAMES)
+        ), f"{tool} must be blocked by every built-in profile"
+
+    write_match = re.search(r"Built-in profiles that block `Write`:\s*(.+?)\.", description)
+    assert write_match is not None
+    described_write_profiles = set(re.findall(r"`([^`]+)`", write_match.group(1)))
+    actual_write_profiles = {
+        name for name in _SHIPPED_PROFILE_NAMES if "Write" in PROFILES[name]
+    }
+    assert described_write_profiles == actual_write_profiles
+
+    # Every tool the sentence names, not only the first. Built-in profiles only:
+    # an install-local overlay (genesis.cc.profile_overlay) is a supported way to
+    # add profiles with other rules, and must not redden this.
+    no_call = re.search(r"No built-in profile can call\s*(.+?)\.", description, re.S)
+    assert no_call is not None
+    named = set(re.findall(r"`([^`]+)`", no_call.group(1)))
+    assert "memory_store" in named and len(named) >= 7
+    for tool in named:
+        assert all(
+            any(t == tool or t.endswith(f"__{tool}") for t in PROFILES[name])
+            for name in _SHIPPED_PROFILE_NAMES
+        ), f"{tool} must be blocked by every built-in profile"
 
 
 # --- Universal safety blocks (all profiles) ---
@@ -106,6 +149,7 @@ def test_observe_blocks_browser_interaction():
     assert "mcp__genesis-health__browser_click" in PROFILES["observe"]
     assert "mcp__genesis-health__browser_fill" in PROFILES["observe"]
     assert "mcp__genesis-health__browser_run_js" in PROFILES["observe"]
+    assert "mcp__genesis-health__browser_fill_card" in PROFILES["observe"]
 
 
 def test_observe_blocks_memory_writes():
@@ -187,6 +231,7 @@ def test_research_blocks_browser_interaction():
     assert "mcp__genesis-health__browser_click" in PROFILES["research"]
     assert "mcp__genesis-health__browser_fill" in PROFILES["research"]
     assert "mcp__genesis-health__browser_run_js" in PROFILES["research"]
+    assert "mcp__genesis-health__browser_fill_card" in PROFILES["research"]
 
 
 def test_research_blocks_outreach_send():
@@ -201,6 +246,8 @@ def test_interact_allows_browser_interaction():
     assert "mcp__genesis-health__browser_click" not in PROFILES["interact"]
     assert "mcp__genesis-health__browser_fill" not in PROFILES["interact"]
     assert "mcp__genesis-health__browser_run_js" not in PROFILES["interact"]
+    # Background sessions pay behind the owner's tap (owner ruling).
+    assert "mcp__genesis-health__browser_fill_card" not in PROFILES["interact"]
 
 
 def test_interact_blocks_vector_store_writes():
@@ -1226,7 +1273,7 @@ _PERIMETER_ALLOWED_OUTREACH = {"outreach_send"}
 async def test_perimeter_profiles_deny_every_outreach_tool_but_the_reply_actuator():
     from genesis.mcp.outreach_mcp import mcp as outreach_mcp
 
-    registered = set(await outreach_mcp.get_tools())
+    registered = set({tool.name: tool for tool in await outreach_mcp.list_tools()})
     assert "outreach_send" in registered, "enumeration is stale — the server changed"
 
     for profile in ("mail", "community-responder"):

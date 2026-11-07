@@ -78,15 +78,18 @@ def backup_env(tmp_path):
     bind = tmp_path / "bin"
     bind.mkdir()
     smb_log = tmp_path / "smb_commands.log"
-    # smbclient stub: log the -c command (the arg after -c), succeed.
+    # Log each invocation's initial directory alongside its command. The backend
+    # uses -D for paths, keeping those paths out of smbclient's command parser.
     _make_stub(
         bind / "smbclient",
         "#!/usr/bin/env bash\n"
-        'prev=""\n'
+        'prev=""; directory=""; command=""\n'
         'for a in "$@"; do\n'
-        f'  [ "$prev" = "-c" ] && printf "%s\\n" "$a" >> "{smb_log}"\n'
+        '  [ "$prev" = "-D" ] && directory="$a"\n'
+        '  [ "$prev" = "-c" ] && command="$a"\n'
         '  prev="$a"\n'
         "done\n"
+        f'printf "%s\\t%s\\n" "$directory" "$command" >> "{smb_log}"\n'
         "exit 0\n",
     )
     # curl stub: SF3 existence probe answers 404 (collections genuinely absent
@@ -123,6 +126,7 @@ _SESSION_BUS_VARS = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
 
 def _run(backup_env):
     env = dict(os.environ)
+    env.pop("SECRETS_PATH", None)  # GENESIS_DIR names the secrets file, as on CI
     env.update(
         HOME=str(backup_env["home"]),
         GENESIS_DIR=str(backup_env["gd"]),
@@ -148,11 +152,13 @@ def test_sqlite_uploaded_under_dated_snapshot_dir(backup_env):
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
     put_sql = [ln for ln in cmds.splitlines() if "put" in ln and "genesis.sql.gpg" in ln]
     assert put_sql, f"no SQL upload command logged:\n{cmds}"
-    # The cd target for the SQL put must include a dated snapshot dir + /data.
-    assert any(_STAMP_RE.search(ln) for ln in put_sql), (
-        f"SQL upload not under a dated snapshot dir:\n{put_sql}"
-    )
-    assert any("/data" in ln for ln in put_sql), f"SQL upload not under .../data:\n{put_sql}"
+    # Assert the remote initial directory paired with this put, rather than
+    # accepting the local source's 'data/' component as remote-path evidence.
+    assert any(
+        re.fullmatch(r"Genesis/[^/]+/\d{8}T\d{6}Z/data", ln.split("\t", 1)[0])
+        and ln.split("\t", 1)[1] == 'put "data/genesis.sql.gpg" "genesis.sql.gpg"'
+        for ln in put_sql
+    ), f"SQL upload not under the dated remote data directory:\n{put_sql}"
 
 
 def test_snapshot_dir_is_created(backup_env):
@@ -171,6 +177,7 @@ def test_snapshot_dir_is_created(backup_env):
 def _run_local(backup_env, offsite_root: Path, extra_env: dict | None = None):
     """Run backup.sh through the `local` Tier-2 backend (no smbclient stub)."""
     env = dict(os.environ)
+    env.pop("SECRETS_PATH", None)  # GENESIS_DIR names the secrets file, as on CI
     env.update(
         HOME=str(backup_env["home"]),
         GENESIS_DIR=str(backup_env["gd"]),
@@ -284,6 +291,7 @@ def test_large_temp_goes_to_dedicated_dir_not_inherited_tmpdir(backup_env, tmp_p
     bigtmp = tmp_path / "dedicated-big-tmp"
     bigtmp.mkdir()
     env = dict(os.environ)
+    env.pop("SECRETS_PATH", None)  # GENESIS_DIR names the secrets file, as on CI
     env.update(
         HOME=str(backup_env["home"]),
         GENESIS_DIR=str(backup_env["gd"]),
@@ -600,13 +608,20 @@ def test_extra_round_trip_real_backup_into_real_restore_keeps_links(backup_env, 
     (fresh / "tmp").mkdir()
     (fresh / ".gnupg").mkdir(mode=0o700)
     env = {
-        **{k: v for k, v in os.environ.items() if k not in _SESSION_BUS_VARS},
+        # GENESIS_DIR names the secrets file, as on CI: SECRETS_PATH is dropped too.
+        **{
+            k: v
+            for k, v in os.environ.items()
+            if k not in (*_SESSION_BUS_VARS, "SECRETS_PATH")
+        },
         "HOME": str(fresh),
         "GENESIS_DIR": str(fresh / "genesis"),
         "GENESIS_BACKUP_TMPDIR": str(fresh / "tmp"),
         "GENESIS_BACKUP_TIER2_BACKEND": "none",
         "QDRANT_URL": "http://127.0.0.1:1",
         "GENESIS_BACKUP_PASSPHRASE": "testpass",
+        # This freshly created fixture is offline, not the installed DB.
+        "GENESIS_RESTORE_HOLDER_SCAN": "none",
         "GNUPGHOME": str(fresh / ".gnupg"),
         "PATH": f"{backup_env['bind']}:{os.environ['PATH']}",
     }
@@ -686,6 +701,30 @@ def test_extra_dirs_refuses_risky_entries_with_a_reason(backup_env, tmp_path, en
 
 def _status(backup_env) -> dict:
     return json.loads((backup_env["home"] / ".genesis" / "backup_status.json").read_text())
+
+
+def test_extra_core_inspection_failure_withholds_optional_archive(backup_env, tmp_path):
+    home = backup_env["home"]
+    _seed_extra_dir(home)
+    native = shutil.which("realpath")
+    assert native
+    _make_stub(backup_env["bind"] / "realpath",
+               '#!/usr/bin/env bash\n'
+               'for arg in "$@"; do\n'
+               '  if [ "$arg" = "$HOME/.genesis/shared" ]; then exit 2; fi\n'
+               'done\n'
+               f'exec "{native}" "$@"\n')
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/store"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "separation could not be established" in proc.stdout
+    assert not list((_repo(backup_env) / "extra").glob("*.tar.gpg"))
+    status = _status(backup_env)
+    assert status["extra_dirs_skipped"] == 1
+    assert status["tier2_status"] == "partial"
+    assert status["offsite_core_complete"] is True
+    assert status["extras_complete"] is False
 
 
 @pytest.mark.parametrize(
@@ -1041,6 +1080,28 @@ def test_a_directory_restore_would_refuse_members_of_is_kept_as_partial(backup_e
     assert len(list((snap / "extra").glob("work_a-*.tar.gpg"))) == 1
 
 
+def test_extra_restore_diagnostics_preserve_all_long_member_names(backup_env, tmp_path):
+    home = backup_env["home"]
+    directory = home / "work" / "store"
+    deep = directory / ("a" * 160) / ("b" * 160)
+    deep.mkdir(parents=True)
+    (directory / "keep.txt").write_text("retained evidence\n")
+    (deep / "absolute-link").symlink_to("/synthetic/outside")
+    (deep / "escaping-link").symlink_to("../../../../outside")
+    os.mkfifo(deep / "pipe")
+    offsite = tmp_path / "offsite"
+    offsite.mkdir()
+    proc = _run_local(backup_env, offsite, {"GENESIS_BACKUP_EXTRA_DIRS": "~/work/store"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    for name in ("absolute-link", "escaping-link", "pipe"):
+        member = (deep / name).relative_to(home).as_posix()
+        assert f"refused member {member!r}:" in proc.stdout
+    assert "AbsoluteLinkError" in proc.stdout
+    assert "link leaves work/store" in proc.stdout
+    assert "SpecialFileError" in proc.stdout
+    assert _status(backup_env)["extra_dirs_partial"] == 1
+
+
 def test_the_local_manifest_is_rewritten_when_extras_are_unset(backup_env, tmp_path):
     """Codex P2 round 5: a run with the setting unset still writes .extra-manifest, so
     a local restore never reads an earlier run's skipped or extra lines."""
@@ -1059,3 +1120,22 @@ def test_the_local_manifest_is_rewritten_when_extras_are_unset(backup_env, tmp_p
     assert manifest.read_text() == "genesis-snapshot 1\n"
     assert not list((manifest.parent / "extra").glob("*.tar.gpg"))
     assert not (manifest.parent / ".extra-manifest.tmp").exists()
+
+
+def test_smb_offsite_refuses_a_name_that_could_leave_its_quotes(backup_env):
+    """A payload name holding ';' (or a quote) never reaches `smbclient -c`: its put
+    is refused, the snapshot is not COMPLETE (tier2 partial), and the run goes on."""
+    cc_id = str(backup_env["gd"]).replace("/", "-")
+    mem_dir = backup_env["home"] / ".claude" / "projects" / cc_id / "memory"
+    (mem_dir / "semi;colon.md").write_text("x\n")
+    (_repo(backup_env) / "creds").mkdir(exist_ok=True)
+    (_repo(backup_env) / "creds" / 'q"uote.gpg').write_bytes(b"x")
+    proc, cmds = _run(backup_env)
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    assert "semi;colon" not in cmds and 'q"uote' not in cmds, cmds
+    assert "refusing smb path" in proc.stderr
+    assert "off-site upload failed for memory/semi;colon.md.gpg" in proc.stdout, proc.stdout
+    assert 'off-site upload failed for creds/q"uote.gpg' in proc.stdout, proc.stdout
+    status = json.loads((backup_env["home"] / ".genesis" / "backup_status.json").read_text())
+    assert status["tier2_status"] == "partial", status
+    assert not any("COMPLETE" in ln and "put" in ln for ln in cmds.splitlines()), cmds

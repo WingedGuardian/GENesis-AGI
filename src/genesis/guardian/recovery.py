@@ -4,7 +4,7 @@ Recovery actions in escalation order:
 1. RESTART_SERVICES  — systemctl restart genesis-server
 2. IO_TRIAGE         — kill top I/O consumer (one per cycle)
 3. RESOURCE_CLEAR    — clear /tmp, reclaim page cache, restart
-4. REVERT_CODE       — git stash && git revert HEAD, restart
+4. REVERT_CODE       — git stash && git revert HEAD, restart (never on `live`)
 5. RESTART_CONTAINER — incus restart genesis
 6. SNAPSHOT_ROLLBACK — incus snapshot restore genesis {last_healthy}
 7. ESCALATE          — alert user, stop automated recovery
@@ -29,6 +29,36 @@ from genesis.guardian.snapshots import PRE_RECOVERY_LABEL, SnapshotManager
 from genesis.guardian.state_machine import ConfirmationStateMachine
 
 logger = logging.getLogger(__name__)
+
+
+# The branch itself, then the shared predicate (#3013) run from the checkout.
+_HEAD_PROBE = "git -C ~/genesis symbolic-ref -q HEAD"
+_LIVE_PROBE = "python3 -I -S ~/genesis/scripts/lib/live_checkout.py ~/genesis"
+
+
+async def _in_container(container: str, cmd: str) -> tuple[int, list[str]]:
+    rc, stdout, _ = await _run_subprocess(
+        "incus", "exec", container, "--", "su", "-", "ubuntu", "-c", cmd, timeout=30.0,
+    )
+    return rc, stdout.strip().splitlines()  # a login shell may print first
+
+
+async def container_on_live(container: str) -> bool:
+    """False only when the container checkout is shown NOT to be on `live`.
+
+    Two signals; either one saying live, or unclear, bans. Git's own HEAD: on
+    `refs/heads/live` it is live whatever the manifest says (a missing manifest
+    makes the predicate answer `other`, and its copy is the candidate's code);
+    only another branch, or a detached HEAD (exit 1, no output), passes on. Then
+    the predicate, whose word must be `other` with exit 1. A failed git, a broken
+    copy of the predicate and an exec that never reported all count as live.
+    """
+    rc, head = await _in_container(container, _HEAD_PROBE)
+    on_branch = rc == 0 and head[-1:] != [] and head[-1].startswith("refs/heads/")
+    if head[-1:] == ["refs/heads/live"] or not (on_branch or (rc == 1 and not head)):
+        return True
+    rc, word = await _in_container(container, _LIVE_PROBE)
+    return not (rc == 1 and word[-1:] == ["other"])
 
 
 @dataclass(frozen=True)
@@ -295,13 +325,45 @@ class RecoveryEngine:
 
     async def _revert_code(self, container: str) -> tuple[bool, str]:
         """Stash uncommitted changes and revert last commit, then restart."""
-        # Stash any uncommitted work
-        rc, _, _ = await _run_subprocess(
+        # Never on `live` (#3492 D3). The stash would push a half-written tree, or
+        # a candidate's working files, onto the stash stack every session shares,
+        # where any session's later `stash pop` lays it over another tree; the
+        # revert would commit onto the integration branch the deploy engine
+        # rebuilds. check.py already proposes RESTART_CONTAINER there before the
+        # approval; this refusal is the backstop for a branch that moved since.
+        # It fires after execute() has taken its snapshot, sent its alert and
+        # recorded the attempt; acceptable, since it only fires in the window
+        # between the two probes.
+        if await container_on_live(container):
+            return False, (
+                "REVERT_CODE refused: the container checkout is on `live` (or could "
+                "not be shown not to be), where a code revert never runs. A container "
+                "restart (RESTART_CONTAINER) ends lock holders and lets a boot repair "
+                "run where one is installed; a bad candidate is removed with "
+                "`scripts/deploy_candidates drop <branch>`"
+            )
+        # Stash any uncommitted work. git revert itself refuses to overwrite
+        # dirty files, so this guard is not about data loss: a failed stash
+        # leaves uncommitted code live, a revert commit cannot fix a fault that
+        # lives there, and an unfinished stash may still hold the index.
+        rc, _, stderr = await _run_subprocess(
             "incus", "exec", container, "--",
             "su", "-", "ubuntu", "-c",
             "cd ~/genesis && git stash",
-            timeout=15.0,
+            timeout=30.0,
         )
+        if rc == -1:
+            # _run_subprocess returns -1 for a timeout or exec error: the stash
+            # did not report, so whether it ran is unknown.
+            return False, (
+                f"git stash did not report ({stderr}); not reverting. "
+                "Check `git stash list` and the working tree before retrying"
+            )
+        if rc != 0:
+            return False, (
+                f"git stash (or the exec around it) failed ({stderr}); not "
+                "reverting. Check `git stash list` and the working tree"
+            )
 
         # Revert the last commit
         rc, stdout, stderr = await _run_subprocess(

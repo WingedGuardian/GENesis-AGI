@@ -21,9 +21,9 @@ import sys
 
 
 def rank(value):
-    """ok > degraded > everything else. Ordering only — never a pass/fail test."""
+    """ok/disabled > degraded > everything else; disablement is deliberate."""
     s = str(value)
-    return 2 if s == "ok" else 1 if s == "degraded" else 0
+    return 2 if s in {"ok", "disabled"} else 1 if s == "degraded" else 0
 
 
 def owner_ok(doc, pid_want):
@@ -105,7 +105,7 @@ try:
         # deleted or newly-skipped subsystem. A legitimate rename costs one false
         # positive, once; a silent drop costs the signal entirely.
         for name in sorted(set(before) - set(after)):
-            if rank(before[name]) == 2:
+            if before[name] == "ok":
                 bad.append(name + ":gone")
     print(",".join(bad))
 except Exception as exc:

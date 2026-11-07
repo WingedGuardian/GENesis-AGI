@@ -113,7 +113,7 @@ def test_crash_before_commit_marker_forces_rebuild(env, monkeypatch):
     monkeypatch.setattr(pq, "write_table", crash_on_table)
     crashed = store.ingest(projects, data)  # the failure is isolated per source, not fatal
     assert crashed["failed"] == 1 and crashed["rebuilt"] == 0
-    assert list((data / ".staging/sources").iterdir()) == []
+    assert not (data / ".staging").exists()
     assert connect(data).sql("select count(*) from turns").fetchone() == (1,)
     monkeypatch.setattr(pq, "write_table", real_write)
     s = store.ingest(projects, data)  # marker still old -> source is stale -> rebuilt
@@ -161,7 +161,7 @@ def test_fingerprint_metadata_and_staging_is_outside_globs(env):
         "mtime_ns": st.st_mtime_ns,
     }
     assert md[b"ta.source"].decode() == "p1/" + f.name
-    assert not list((data / ".staging/sources").iterdir())
+    assert not (data / ".staging").exists()
 
 
 def test_turns_view_attributes_resumed_copies_to_earliest_file(env):

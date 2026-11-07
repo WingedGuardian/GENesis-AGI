@@ -48,6 +48,8 @@ class HandlerContext:
     # Proposal approval workflow — injected by the channels bridge so
     # quote-replies to ego proposal digests can resolve proposals inline.
     proposal_workflow: object | None = None
+    # Card-release approval (payments/approval.py); None on the legacy bridge.
+    payment_approvals: object | None = None
 
     draft_streaming_enabled: bool = True
     typing_breaker_instance: TypingCircuitBreaker = field(init=False)

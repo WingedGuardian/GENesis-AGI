@@ -5,6 +5,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from tests.test_scripts._update_source import update_text
+
 _ROOT = Path(__file__).resolve().parents[2] / "src" / "genesis"
 _IMPLEMENTATIONS = {
     "db/connection.py",
@@ -13,6 +15,15 @@ _IMPLEMENTATIONS = {
 _UNRELATED_OR_SNAPSHOT = {
     "browser/profile.py",
     "eval/bench/isolation.py",
+    # The card vault's own cards.db (0600, in the 0700 vault dir), never genesis.db.
+    "payments/vault_store.py",
+    # vault migrate's copy of that cards.db (a new file in a new 0700 sibling dir).
+    "payments/vault_migrate.py",
+}
+_ISOLATED_RECOVERY_WRITERS = {
+    # Stdlib-only, existing staged file; restore/update publish only on success.
+    # This is not a canonical reader or a whole-module exemption.
+    "db/crud/peer_restore.py:reset_peer_authority",
 }
 _CANONICAL_READERS_USING_WRITABLE_MODE = {
     "attention/calibrate.py:load_labeled",
@@ -30,6 +41,22 @@ _CANONICAL_READERS_USING_WRITABLE_MODE = {
     "mcp/health/manifest.py:_impl_job_health",
     "mcp/health/update_history.py:_impl_update_history_recent",
 }
+
+
+def _first_arg_is_ro_uri_call(node: ast.Call) -> bool:
+    """Whether the connect call's FIRST argument is itself a call to ``ro_uri``.
+
+    ``integrity.ro_uri(...)`` always yields a ``?mode=ro`` URI (locked by
+    tests/test_db/test_readonly_query.py::test_ro_uri_is_read_only). Only the
+    direct form is trusted: ``ro_uri`` merely appearing somewhere in the call's
+    source (a keyword argument, a comment, an unrelated name) is not.
+    """
+    if not node.args or not isinstance(node.args[0], ast.Call):
+        return False
+    func = node.args[0].func
+    return (isinstance(func, ast.Name) and func.id == "ro_uri") or (
+        isinstance(func, ast.Attribute) and func.attr == "ro_uri"
+    )
 
 
 def _enclosing_function(node: ast.AST, parents: dict[ast.AST, ast.AST]) -> str:
@@ -63,7 +90,7 @@ def test_canonical_rw_opens_use_guarded_factories():
             ):
                 continue
             source_segment = ast.get_source_segment(source, node) or ""
-            if "mode=ro" in source_segment:
+            if "mode=ro" in source_segment or _first_arg_is_ro_uri_call(node):
                 continue
             # A private in-memory database is never the canonical store.
             if (
@@ -73,7 +100,7 @@ def test_canonical_rw_opens_use_guarded_factories():
             ):
                 continue
             key = f"{relative}:{_enclosing_function(node, parents)}"
-            if key not in _CANONICAL_READERS_USING_WRITABLE_MODE:
+            if key not in _CANONICAL_READERS_USING_WRITABLE_MODE | _ISOLATED_RECOVERY_WRITERS:
                 unexpected.append(f"{key}:{node.lineno}")
 
     assert unexpected == [], (
@@ -84,7 +111,26 @@ def test_canonical_rw_opens_use_guarded_factories():
 
 def test_update_path_inline_writers_enforce_quarantine():
     repo = _ROOT.parents[1]
-    update = (repo / "scripts" / "update.sh").read_text()
+    update = update_text()
     bootstrap = (repo / "scripts" / "bootstrap.sh").read_text()
     assert 'connect_sqlite_rw(os.environ["GH_DB_PATH"]' in update
-    assert "assert_not_quarantined('$DB_PATH')" in bootstrap
+    # bootstrap's crash-recovery insert runs under the system python3, before the
+    # venv exists, so it cannot import connect_sqlite_rw (aiosqlite); it makes the
+    # same admission check (assert_admitted delegates to it) before opening.
+    start = bootstrap.index("INSERT INTO update_history")
+    block = bootstrap[bootstrap.rindex("<<'PY'", 0, start) : bootstrap.index("\nPY\n", start)]
+    assert "from genesis.db.integrity import assert_not_quarantined" in block
+    check = block.index("assert_not_quarantined(db_path)")
+    assert check < block.index("sqlite3.connect(db_path")
+
+
+def test_ro_uri_exemption_is_structural_not_textual():
+    def call(src: str) -> ast.Call:
+        return ast.parse(src).body[0].value
+
+    assert _first_arg_is_ro_uri_call(call("sqlite3.connect(ro_uri(p), uri=True)"))
+    assert _first_arg_is_ro_uri_call(call("sqlite3.connect(integrity.ro_uri(p), uri=True)"))
+    assert not _first_arg_is_ro_uri_call(call("sqlite3.connect(p, x=ro_uri(q))"))
+    assert not _first_arg_is_ro_uri_call(call("sqlite3.connect(p)  # ro_uri(p)"))
+    assert not _first_arg_is_ro_uri_call(call("sqlite3.connect(not_ro_uri(p))"))
+    assert not _first_arg_is_ro_uri_call(call("sqlite3.connect(ro_uri_path)"))

@@ -27,8 +27,10 @@ def test_spill_uses_private_connection_children(tmp_path, monkeypatch, override,
     old = os.umask(0o022)
     first = second = None
     try:
-        first = query.connect(data, live=True, memory_limit="16MB", threads=1)
-        second = query.connect(data, live=True, memory_limit="16MB", threads=1)
+        # live=True: this measures spill privacy, and 16 MB cannot compute every
+        # derived view eagerly, which live=False does when no snapshot exists.
+        first = query.connect(data, memory_limit="16MB", threads=1, live=True)
+        second = query.connect(data, memory_limit="16MB", threads=1, live=True)
         children = sorted(root.glob("private-*"))
         assert len(children) == 2
         for child in children:
@@ -66,7 +68,7 @@ def test_unsafe_spill_roots_refuse_before_connection(tmp_path, monkeypatch, kind
         root.chmod(0o777)
     monkeypatch.setenv("TA_DUCKDB_TMP", str(root))
     with pytest.raises((ValueError, OSError)):
-        query.connect(tmp_path / "data", live=True)
+        query.connect(tmp_path / "data")
     assert not list(tmp_path.rglob("private-*"))
 
 

@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from genesis.transcript_analytics import derive, query, store
+from genesis.transcript_analytics import query, store
 
 
 def row(event, provider, *, terminal=False, context="parent"):
@@ -97,9 +97,8 @@ def test_every_present_candidate_survives_without_inventing_unknown_turn(
         assert turn["physical_observation_count"] == len(expected)
 
 
-@pytest.mark.parametrize("live", [False, True])
 @pytest.mark.parametrize("scenario", ["empty", "known", "uncertain"])
-def test_query_and_snapshot_provenance_disclose_candidate_denominators(tmp_path, live, scenario):
+def test_query_provenance_discloses_candidate_denominators(tmp_path, scenario):
     projects, data = tmp_path / "projects", tmp_path / "data"
     projects.mkdir()
     if scenario != "empty":
@@ -113,9 +112,8 @@ def test_query_and_snapshot_provenance_disclose_candidate_denominators(tmp_path,
             json.dumps(row("early", "other" if scenario == "uncertain" else "provider")) + "\n"
         )
     assert store.ingest(projects, data, lock_path=tmp_path / "writer.lock")["failed"] == 0
-    derive.build(data, lock_path=tmp_path / "writer.lock")
     manifest = tmp_path / "query-manifest.json"
-    query.run_query(data, "SELECT * FROM sessions", live=live, manifest_path=manifest)
+    query.run_query(data, "SELECT * FROM sessions", manifest_path=manifest)
     candidates = 0 if scenario == "empty" else 2 if scenario == "uncertain" else 1
     uncertain = 2 if scenario == "uncertain" else 0
     expected = {
@@ -123,14 +121,10 @@ def test_query_and_snapshot_provenance_disclose_candidate_denominators(tmp_path,
         "uncertain_candidate_rows": uncertain,
         "unambiguous_candidate_rows": candidates - uncertain,
     }
-    published = query.snapshot_manifest(data)
     saved = json.loads(manifest.read_text())
-    for summary in [published, saved]:
-        assert summary["denominators"]["turns"] == candidates
-        assert summary["denominator_basis"]["turns"] == "candidate_turn_rows"
-        assert summary["turn_identity_coverage"] == expected
-    if not live:
-        assert saved["snapshot"]["turn_identity_coverage"] == expected
+    assert saved["denominators"]["turns"] == candidates
+    assert saved["denominator_basis"]["turns"] == "candidate_turn_rows"
+    assert saved["turn_identity_coverage"] == expected
 
 
 @pytest.mark.parametrize("flag", ["api_error", "scrub_failed"])
