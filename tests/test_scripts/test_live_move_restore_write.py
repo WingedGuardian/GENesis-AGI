@@ -962,6 +962,117 @@ def test_a_saved_directory_missing_a_recorded_entry_is_refused(w):
     assert w.report()["restore"]["restored_at"] is None
 
 
+def test_a_saved_copy_changed_to_match_the_checkout_is_refused(w):
+    """#3986 review (Codex, finding 1): a saved copy changed to hold what the
+    checkout holds is not the saved state SAVED.json records, so it never
+    reads already-restored and clears the report; the restore refuses it."""
+    ts = _repaired(w, _foreign_edit)
+    saved = w.backups()[-1] / "tree" / "sub" / "s1"
+    assert saved.read_text() == "mine\n", "control: the edit was saved"
+    saved.write_bytes((w.root / "sub" / "s1").read_bytes())
+    r = _restore(w, ts)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert _parts_of(r.stdout)[("sub/s1", "node")] == "refused:other:hash-mismatch", r.stdout
+    assert w.report()["restore"]["restored_at"] is None
+
+
+def test_a_saved_directory_entry_changed_to_match_the_checkout_is_refused(w):
+    """The same for an entry of a saved directory: the checkout and the saved
+    copy agree, SAVED.json does not, so the directory never reads
+    already-restored."""
+    ts = _repaired(w, _foreign_inside_dir)
+    saved = w.backups()[-1] / "tree" / "P" / "mine.txt"
+    assert saved.read_text() == "notes\n", "control: the file was saved"
+    saved.write_text("not the notes\n")
+    (w.root / "P").unlink()  # the repair left the tag's file P
+    shutil.copytree(saved.parent, w.root / "P", symlinks=True)
+    r = _restore(w, ts)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert _parts_of(r.stdout)[("P", "node")].startswith("refused:"), r.stdout
+    assert w.report()["restore"]["restored_at"] is None
+
+
+def test_a_restore_killed_between_its_two_flag_writes_converges(w):
+    """#3986 review (Codex, finding 2): a row saved with both flags (`s`) is
+    written skip-worktree first, then assume-unchanged. Killed between the two,
+    the entry holds `S`, the restore's own half-written state: the re-run
+    finishes it rather than refusing it `other:changed`."""
+    ts, path, before = _fresh(w, _foreign_both_flags)
+    assert before["flags"].startswith("s "), "control: both flags"
+    assert _restore(w, ts, **{KILL_ENV: "flag"}).returncode == -9
+    assert _git(w.root, "ls-files", "-v", "--", path).startswith("S "), "control: half written"
+    r = _restore(w, ts)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _state_of(w, path) == before
+    _converged(w, ts)
+
+
+@pytest.mark.parametrize(
+    ("make", "flag", "verdict"),
+    [
+        (_foreign_both_flags, "--skip-worktree", "as-left"),  # the restore's own half
+        (_foreign_both_flags, "--assume-unchanged", "other:changed"),  # never its half
+        (_foreign_skip_worktree, "--assume-unchanged", "other:changed"),
+    ],
+)
+def test_only_the_restores_own_half_written_flag_reads_as_left(w, make, flag, verdict):
+    """A flag state the restore cannot have left (assume-unchanged alone, or a
+    flag a one-flag row never had) is still `other:changed`."""
+    ts = _repaired(w, make)
+    _git(w.root, "update-index", flag, "--", "sub/s1")
+    assert _parts(_check(w, ts))[("sub/s1", "flag")] == verdict
+
+
+def test_a_flag_lost_to_an_index_call_that_did_not_verify_is_refused(w, mod, monkeypatch, capsys):
+    """#3986 review (CodeRabbit, finding 4): the flag part already reads restored
+    and the index part is written; the call re-creates the entry unflagged, and
+    then the whole index is not the one written (a session staged meanwhile).
+    The flag is judged again and refused, never reported already-restored; a
+    re-run puts it back."""
+    ts, path, before = _fresh(
+        w, lambda w: (_foreign_staged(w), _git(w.root, "update-index", "--skip-worktree", "A"))[0]
+    )
+    _git(w.root, "update-index", "--skip-worktree", "A")  # the flag back by hand, the index not
+    oid = _hash(w, "LATE\n")
+    late = lambda: _git(w.root, "update-index", "--add", "--cacheinfo", f"100644,{oid},late")  # noqa: E731
+    rc, out = _restore_in(w, mod, monkeypatch, capsys, ts, at={"index-call": late})
+    parts = _parts_of(out)
+    assert rc == 1 and parts[("A", "index")] == "refused:index-skipped", out
+    assert not _git(w.root, "ls-files", "-v", "--", "A").startswith("S "), "control: flag lost"
+    assert parts[("A", "flag")].startswith("refused:"), out
+    r = _restore(w, ts)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _git(w.root, "ls-files", "-v", "--", "A").startswith("S ")
+
+
+@pytest.mark.parametrize("killed", [False, True])
+def test_ignore_rules_inside_a_moved_directory_still_apply_to_its_aside(
+    tmp_path, monkeypatch, killed
+):
+    """#3986 review (Codex, finding 3): the tag's sub/.gitignore ignores
+    `*.cache`; a cache file in the tag directory sub/ moves aside with it. Its
+    rule moved too, so the aside is judged by the rules it holds, not by a
+    checkout that no longer has them: the restore converges (and a restore
+    killed after the aside resumes)."""
+    from tests.test_scripts import _live_repair_world as world
+
+    monkeypatch.setitem(world.TAG_FILES, "sub/.gitignore", "*.cache\n")
+    w = World(tmp_path)
+    ts, path, before = _fresh(w, _dir_file)
+    (w.root / "sub" / "x.cache").write_bytes(b"cache")
+    assert _parts(_check(w, ts))[("sub", "node")] == "as-left", "control"
+    if killed:
+        assert _restore(w, ts, **{KILL_ENV: "aside"}).returncode == -9
+        c = _check(w, ts)
+        assert _parts(c)[("sub", "node")] == "as-left", c.stdout
+    r = _restore(w, ts)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert _state_of(w, path) == before
+    if not killed:
+        assert "sub/x.cache" in r.stdout, r.stdout
+    _converged(w, ts)
+
+
 def test_a_disagreeing_post_write_judge_counts_as_refused(w, mod, monkeypatch, capsys):
     """Review N-4: the judge run after the writes must read already-restored
     for every part written; one that does not is refused, and the report is

@@ -13,7 +13,8 @@ flag. A part is
   tag directory, the tag's paths in it, other untracked files aside; an empty
   directory for a gitlink; or nothing), so writing the saved state loses
   nothing git cannot give back;
-- ``already-restored``: it holds the saved state (a re-run converges);
+- ``already-restored``: it holds the saved state, every saved copy compared
+  still the one SAVED.json records (a re-run converges);
 - ``other:<reason>``: anything else, which the restore must leave alone.
 
 An as-left part may be written only when, at and below and above its path,
@@ -31,7 +32,8 @@ the update's own files, so it lists as ``entry`` parts only the saved files
 whose bytes are not the move target's (when the target cannot be read, only
 those that are foreign rows themselves); the restore builds the directory
 from those. A node part a killed restore left half-done reads as-left by
-the resume rule (Judge._resume). ``check`` writes nothing; ``restore`` writes
+the resume rule (Judge._resume), and so does the S a restore killed between
+a both-flags entry's two writes left. ``check`` writes nothing; ``restore`` writes
 only parts judged as-left, each self-verifying (see _Writer)."""
 
 from __future__ import annotations
@@ -39,6 +41,7 @@ from __future__ import annotations
 import bisect
 import calendar
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -211,8 +214,9 @@ def _saved(rp, backup: str) -> tuple[str | None, dict | None]:
     writer wrote. Opened as load_report opens REPAIR.json: no symlink followed,
     no FIFO blocked on, a regular file of at most SAVED_BYTES, holding exactly
     {files, complete}: `tree/<path>` keys and the writer's three record
-    shapes. Only the shape: whether a copy still matches its record the
-    restore checks as it copies it."""
+    shapes. Only the shape here: whether a copy still matches its record the
+    judge checks before it reads a part already-restored (Judge._kept), and the
+    restore again as it copies it."""
     try:
         flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
         fd = os.open(os.path.join(backup, "SAVED.json"), flags)
@@ -377,17 +381,25 @@ class _Budget:
 
 
 class Judge:
-    """``records``: SAVED.json's files (a FIFO's restored mode is its record's).
+    """``records``: SAVED.json's files (a FIFO's restored mode is its record's;
+    None for a report written before it, which only --check judges).
     ``runs``: deploy-backups as read (restore run folders, for the resume rule),
-    ``shown`` as named in output. ``strict``: the restore's write gate (a tag
+    ``shown`` as named in output; ``fd`` the descriptor ``runs`` names, handed
+    to git when it reads an aside. ``strict``: the restore's write gate (a tag
     directory moved aside may hold no extra file git does not ignore)."""
 
     def __init__(self, rp, repo: str, backup: str, loaded: dict, newer: dict, *, records=None,
-                 runs=None, shown=None, strict=False) -> None:  # fmt: skip
+                 runs=None, shown=None, strict=False, fd=None) -> None:  # fmt: skip
         self.rp, self.repo, self.backup = rp, repo, backup
         self.budget, self.blockers = _Budget(rp), set()
+        # _kept re-reads saved copies the walk already read once: its own budget,
+        # so the integrity check never spends the walk's and turns a directory
+        # that restored correctly into other:too-large.
+        self.kept_budget = _Budget(rp)
         report, self.rows = loaded["report"], loaded["rows"]
         self.records, self.runs, self.shown, self.strict = records or {}, runs, shown, strict
+        self.integrity, self.git_dir = records is not None, None
+        self.fds = () if fd is None else (fd,)
         self.record_keys = sorted(self.records)  # _dir's per-row range, by bisect
         block = restore_block(report)
         self.inflight = block["inflight"] if block else None
@@ -518,17 +530,51 @@ class Judge:
             i += 1
         return out
 
-    def _ignored(self, paths: list[str]) -> set:
-        """Which of ``paths`` git ignores: one `check-ignore`; none when it fails."""
+    def _ignored(self, paths: list[str], aside: str | None = None, below: str = "") -> set:
+        """Which of ``paths`` git ignores: one `check-ignore`; none when it fails.
+        ``aside``: a root holding the directory ``below`` moved out of the
+        checkout (#3986 review, finding 3). Its own ignore rules moved with it,
+        so a rule inside it (git's most specific) decides, read in the aside;
+        else the checkout's rules outside it do."""
         if not paths:
             return set()
-        p = subprocess.run(
-            ["git", *self.rp.GIT_C, "-C", self.repo, "check-ignore", "-z", "--stdin"],
+        if aside is None:
+            p = self._check_ignore(["-C", self.repo], paths, verbose=False)
+            return set(self.rp._z(p.stdout)) if p.returncode in (0, 1) else set()
+        if self.git_dir is None:
+            self.git_dir = self.rp._out(self.repo, "rev-parse", "--absolute-git-dir", check=False)
+        inner = self._rules(["-C", aside, "--git-dir", self.git_dir, "--work-tree", aside], paths)
+        outer = self._rules(["-C", self.repo], paths)
+        out = set()
+        for q in paths:
+            src, pat = inner.get(q, ("", ""))
+            if not src.startswith(below + "/"):
+                src, pat = outer.get(q, ("", ""))
+                if src.startswith(below + "/"):  # a node the restore put there: not the aside's
+                    continue
+            if pat and not pat.startswith("!"):
+                out.add(q)
+        return out
+
+    def _rules(self, where: list[str], paths: list[str]) -> dict:
+        """`check-ignore -v -n`: path -> (source, pattern) of the last rule
+        matching it (a negation starts with "!"); {} when it fails."""
+        p = self._check_ignore(where, paths, verbose=True)
+        if p.returncode not in (0, 1):
+            return {}
+        f = [os.fsdecode(x) for x in p.stdout.split(b"\0")]
+        return {f[i + 3]: (f[i], f[i + 2]) for i in range(0, len(f) - 3, 4)}
+
+    def _check_ignore(self, where: list[str], paths: list[str], verbose: bool):
+        # An aside below /proc/self/fd/N is only reachable by git through fd N.
+        return subprocess.run(
+            ["git", *self.rp.GIT_C, *where, "check-ignore", "-z", "--stdin",
+             *(("-v", "-n") if verbose else ())],
             input=b"".join(os.fsencode(q) + b"\0" for q in paths),
             capture_output=True,
             env=_git_env(),
-        )
-        return set(self.rp._z(p.stdout)) if p.returncode in (0, 1) else set()
+            pass_fds=self.fds,
+        )  # fmt: skip
 
     def left_is_node(self, p: str) -> bool:
         """Did the repair leave a node at ``p`` (a tag entry, a gitlink's
@@ -553,8 +599,9 @@ class Judge:
                 return all(self._state(root, f"{p}/{q}") == e for q, e in tagged.items())
             have = self._walk(root, p)
             extra = [f"{p}/{q}" for q in have if q not in tagged]
+            aside = None if root == self.repo else root
             return all(have.get(q) == e for q, e in tagged.items()) and (
-                set(extra) <= self._ignored(extra)
+                set(extra) <= self._ignored(extra, aside, p)
             )
         return self._state(root, p) == t
 
@@ -669,8 +716,40 @@ class Judge:
         ok, saved = self._saved_node(row)
         if not ok:
             return "other:not-saved"
-        done = lambda: self._state(self.repo, p) == saved  # noqa: E731
+        rel = row["saved_as"]
+        done = lambda: self._state(self.repo, p) == saved and (not rel or self._kept(rel))  # noqa: E731
         return self._verdict(link, done, gate, lambda: self._as_left(p))
+
+    def _kept(self, rel: str) -> bool:
+        """Is the backup's copy at ``rel`` the one SAVED.json records (#3986
+        review, finding 1)? A copy changed to match the checkout is not the
+        saved state, so nothing reads already-restored from it (and the
+        writer's staging check refuses it). A file recorded with no hash cannot
+        be told apart, so it never is either. A report written before SAVED.json
+        has nothing to check against (only --check judges one)."""
+        if not self.integrity:
+            return True
+        rec, full = self.records.get(rel), os.path.join(self.backup, rel)
+        try:
+            if rec is None or rec["type"] == "symlink":
+                return rec is not None and os.readlink(full) == rec["target"]
+            if rec["type"] == "fifo":
+                return stat.S_ISFIFO(os.lstat(full).st_mode)
+            if rec["sha256"] is None:
+                return False
+            fd = os.open(full, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+            try:
+                st, h = os.fstat(fd), hashlib.sha256()
+                if not stat.S_ISREG(st.st_mode):
+                    return False
+                self.kept_budget(st.st_size)
+                while chunk := os.read(fd, 1 << 20):
+                    h.update(chunk)
+            finally:
+                os.close(fd)
+        except OSError:
+            return False
+        return h.hexdigest() == rec["sha256"]
 
     def _as_left(self, p: str) -> bool:
         return self._left(p, strict=self.strict) or self._resume(p)
@@ -707,6 +786,8 @@ class Judge:
             have, tagged = self._walk(self.repo, p), self._tag_below(p)
             if not all(have.get(q) == s for q, s in restore.items()):
                 return False
+            if not all(self._kept(f"{row['saved_as']}/{q}") for q in restore):
+                return False  # #3986 review: the copies are the ones SAVED.json records
             # Review SF-6: a file git ignores (the server's __pycache__) is no change.
             extra = [f"{p}/{q}" for q, s in have.items()
                      if s not in (restore.get(q), kept.get(q), tagged.get(q))]  # fmt: skip
@@ -759,9 +840,12 @@ class Judge:
             out.append((p, "index", v))
         if row["flag"]:
             flag = self.flags.get(p)
+            # The restore sets skip-worktree, then assume-unchanged: one killed
+            # between the two left S where s was saved, its own half (#3986 review).
+            half = (None, "S") if row["flag"] == "s" else (None,)
             v = self._part(
                 lambda: self._verdict(
-                    link, lambda: flag == row["flag"], gate, lambda: left(lambda: flag is None)
+                    link, lambda: flag == row["flag"], gate, lambda: left(lambda: flag in half)
                 )
             )
             out.append((p, "flag", v))
@@ -932,7 +1016,7 @@ def _judged(rp, repo: str, ctx, say, write: bool, nothing: str):
         return f"other:newer-report-unreadable ({why})"
     try:
         judge = Judge(rp, repo, backup, loaded, newer, records=records, runs=ctx.root,
-                      shown=ctx.shown, strict=write)  # fmt: skip
+                      shown=ctx.shown, strict=write, fd=ctx.bfd)  # fmt: skip
     except rp.RepairError as exc:
         return f"other:tree-unreadable (HEAD's or the tag's tree: {exc})"
     try:

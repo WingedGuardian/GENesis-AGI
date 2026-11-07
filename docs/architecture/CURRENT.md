@@ -4716,7 +4716,8 @@ Refusing a proposed update preserves a previously valid opt-in.
   every foreign row (its node, only where the repair changed and could reach
   it; its index entries, only where they differ from the tag's; its flag) is
   printed as `as-left` (the tag's state: the repair's), `already-restored`
-  (the saved state) or `other:<reason>`. An as-left part counts as restorable
+  (the saved state, every saved copy it compares still the one `SAVED.json`
+  records) or `other:<reason>`. An as-left part counts as restorable
   only while HEAD's entries at, below and above the path equal the tag's
   (`changed-upstream`), the index there equals the tag's except at rows
   already restored (`index-changed`), no index entry sits at a parent, no
@@ -4733,7 +4734,9 @@ Refusing a proposed update preserves a previously valid opt-in.
   directory is compared on the tag's own paths only (an untracked cache in it
   changes no part), and only for a node part; the restore's own gate is
   stricter (it moves the whole directory aside): every other file there must
-  be one git ignores. A restored directory with extras git ignores (the
+  be one git ignores (once moved aside, by the rules that moved with it: a
+  rule inside the directory decides, read in the aside, else the checkout's
+  outside it). A restored directory with extras git ignores (the
   server's `__pycache__`) still reads already-restored. An index part whose blob is
   neither saved (a regular `index-blobs/<oid>` hashing to it) nor in the
   object store is `other:not-saved`. Every file is hashed in 1 MiB chunks
@@ -4790,9 +4793,11 @@ Refusing a proposed update preserves a previously valid opt-in.
   every parent is back (`row-refused` otherwise, so a covered child waits for
   its directory row); a failing call (a session's git holding `index.lock`)
   refuses them `index-locked`. Flags go after the call (S skip-worktree, a
-  lowercase tag assume-unchanged, s both; a failure `flag-failed`), then one
+  lowercase tag assume-unchanged, s both: skip-worktree first, so the S a run
+  killed between the two leaves reads as-left; a failure `flag-failed`), then one
   `update-index -q --refresh`, then a second judge that must read
-  already-restored for every part written (else `post-check`).
+  already-restored for every part written, and for a flag already restored
+  whose entry the index call replaced (else `post-check`).
   `REPAIR.json` gets a `restore` block, `{inflight: [run, path, "node"] |
   null, refused: <int>, restored_at: <str> | null}` (no per-part list; the
   output carries those), rewritten under update.lock after a re-read;

@@ -1057,6 +1057,34 @@ def test_a_report_another_user_owns_is_refused(w, mod, monkeypatch, capsys):
     assert rc == 1 and "other:not-owned" in out, out
 
 
+def test_the_integrity_check_never_spends_the_walks_read_budget(w, mod, monkeypatch, capsys):
+    """#3986 review: a directory row is read by the walk of its saved copy and of
+    the checkout, then each saved copy again against SAVED.json. That third read
+    has its own budget, so a directory the two walks can afford still reads
+    already-restored instead of other:too-large."""
+    big = 4 * 1024 * 1024
+
+    def foreign(w):
+        (w.root / "P" / "mine.txt").write_text("notes\n")
+        (w.root / "P" / "big.bin").write_bytes(b"x" * big)
+        return "P"
+
+    ts = _repaired(w, foreign)
+    shutil.rmtree(w.root / "P") if (w.root / "P").is_dir() else (w.root / "P").unlink()
+    shutil.copytree(w.backups()[-1] / "tree" / "P", w.root / "P", symlinks=True)
+    spec = importlib.util.spec_from_file_location("_restore_kit", LIB / "live_move_restore.py")
+    kit = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(kit)
+    monkeypatch.setattr(kit, "READ_BYTES", 2 * big + 1024 * 1024)  # two walks, not three
+    load = mod._load_kit
+    monkeypatch.setattr(mod, "_load_kit", lambda n: kit if n == "live_move_restore.py" else load(n))
+    capsys.readouterr()
+    rc = mod.main(["--restore", ts, "--check", str(w.state), str(w.root)])
+    out = capsys.readouterr().out
+    assert "too-large" not in out, out
+    assert '"P" node already-restored' in out, (rc, out)
+
+
 def test_a_node_part_below_another_refuses_the_report(w):
     """Review LOW-2: the writer never writes a node part below another (a
     directory row covers its children; a non-directory parent makes them

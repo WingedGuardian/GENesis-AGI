@@ -36,7 +36,7 @@ _PERMANENT = ("other:cannot-make", "other:target-unreadable", "other:too-large",
 
 def _step(name: str) -> None:
     """A named point of the write path (stage, intent, aside, put-in, index,
-    index-call, post-judge). A test sets KILL_ENV to SIGKILL the run there."""
+    index-call, flag, post-judge). A test sets KILL_ENV to SIGKILL the run there."""
     if os.environ.get(KILL_ENV) == name:
         os.kill(os.getpid(), signal.SIGKILL)
 
@@ -148,6 +148,7 @@ class _Writer:
         self.prior = chk.restore_block(loaded["report"])
         self.run_name = self.run_fd = self.repo_fd = None
         self.wrote, self.extras, self.flight = [], [], None
+        self.called = set()  # every path whose entries the index call replaced
 
     def run(self) -> int:
         j = self.j
@@ -500,6 +501,7 @@ class _Writer:
                 self._refuse(p, "index", "index-locked", str(exc)[:300])
             return
         self.wrote += list(feet)
+        self.called = gone
         _step("index-call")
         want = {q: v for q, v in pre.items() if q not in gone}
         want.update((p, [tuple(e) for e in rows[p]["index"]]) for p in feet if rows[p]["index"])
@@ -562,6 +564,7 @@ class _Writer:
             try:
                 for opt in opts:
                     self.rp._git(self.repo, "update-index", opt, "--", p)
+                    _step("flag")
             except self.rp.RepairError as exc:
                 self._refuse(p, "flag", "flag-failed", str(exc)[:300])
                 continue
@@ -572,7 +575,9 @@ class _Writer:
 
     def _post(self) -> None:
         """A second judge: every part written must now read already-restored
-        (review N-4: a disagreement counts as refused)."""
+        (review N-4: a disagreement counts as refused), and so must a flag read
+        already-restored whose entry the index call replaced (#3986 review: an
+        index that is not the one written may hold it unflagged)."""
         if not self.wrote:
             return
         loaded = {**self.loaded, "report": {**self.loaded["report"], "restore": None}}
@@ -583,7 +588,10 @@ class _Writer:
         except (OSError, self.rp.RepairError):
             again = {}
         for key, o in list(self.out.items()):
-            if o == "restored" and again.get(key) != "already-restored":
+            check = o == "restored" or (
+                o == "already-restored" and key[1] == "flag" and key[0] in self.called
+            )
+            if check and again.get(key) != "already-restored":
                 self._refuse(*key, "post-check", f"the judge now reads {again.get(key, 'nothing')}")
 
     def _finish(self) -> None:
