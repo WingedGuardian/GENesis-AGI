@@ -1809,6 +1809,22 @@ the shared banner is not an assertion about all concurrent sessions.
   Private sealed handoff checks its caller-bound digest before entry compilation;
   cached local modules refuse. This is not yet the queued shell/watchdog caller
   and supplies no new launch, recovery or automatic-readiness authority.
+  `index_marker_recovery.py` adds explicit transaction-only schema-5 storage,
+  original-owner control completion, persistent provider holds and an exact
+  terminal/control/source acceptance-watermark reader on the same queue.
+  Incomplete startup retains actual child waits as uncertainty, without
+  fabricating registration or native completion. Optional original-scope startup
+  observations preserve owned OOM kills, including the first sample, before
+  duplicate/conflict reduction; clean control cannot erase resource evidence.
+  Default initialization stays4; new native authority requires5, with no live
+  cutover, retry grant, acceptance setter or positive automatic readiness here.
+  Legacy uncertainty preserves original settlement/shared debt and uses
+  non-claim observations for ambiguous pending/reused identities. Common scalar
+  reduction covers reconciliation and embedded outcomes; import batches dedupe
+  provider revision advances. Retained cleanup evidence preserves healthy
+  sibling eligibility after original physical/control release; unresolved extra
+  conflicts remain provider-scoped. Runner and supervised recovery remain
+  separate, unqualified contributions.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
   deletions; native query/client cgroup proof and orphan-scope checks precede

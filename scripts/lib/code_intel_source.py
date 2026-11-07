@@ -37,6 +37,7 @@ MODULES = (
     ("proof", "_genesis_code_intel_execution", "scripts/lib/code_intel_execution.py"),
     ("scope", "_genesis_code_intel_scope", "scripts/lib/code_intel_scope.py"),
     ("legacy", "_genesis_index_marker_legacy", "scripts/lib/index_marker_legacy.py"),
+    ("recovery", "_genesis_index_marker_recovery", "scripts/lib/index_marker_recovery.py"),
     ("legs", "_genesis_index_marker_legs", "scripts/lib/index_marker_legs.py"),
     ("native", "_genesis_index_marker_execution", "scripts/lib/index_marker_execution.py"),
     ("cli", "_genesis_index_marker_cli", "scripts/lib/index_marker_cli.py"),

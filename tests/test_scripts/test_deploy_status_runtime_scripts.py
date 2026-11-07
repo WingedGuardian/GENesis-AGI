@@ -558,6 +558,7 @@ _RELOAD = (
     "scripts/lib/index_marker_cli.py",
     "scripts/lib/index_marker_legacy.py",
     "scripts/lib/index_marker_legs.py",
+    "scripts/lib/index_marker_recovery.py",
     "scripts/lib/index_marker_execution.py",
     "scripts/lib/code_intel_execution.py",
     "scripts/lib/code_intel_scope.py",
