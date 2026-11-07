@@ -31,25 +31,6 @@ WAL cursor release and process-death recovery. Four explicit outcome comparisons
 keep the actual legacy middleware as the negative control. Shared MCP service E2E
 qualification is separate from this primitive coverage.
 
-Shutdown grace and actual synchronous completion are covered by
-`tests/test_db/test_request_database_drain.py`,
-`tests/test_db/test_request_database_drain_states.py`,
-`tests/test_db/test_physical_work.py`, and
-`tests/test_db/test_physical_work_states.py`. These cover real owned-file use,
-queued/running executor cancellation, ambiguous submission, joined children,
-context propagation and legacy cancellation. The connection budget is tested
-separately from the number of physical operations. Fault fixtures release and
-join their real workers; an import failure or unrelated timeout is not evidence
-of forbidden resource use. Production factories and shared activation remain
-separate qualifications.
-
-`tests/test_memory/test_resource_thread_ownership.py` exercises all nine migrated
-memory boundaries with gated real file I/O, cancellation and a real scratch
-database lease. `tests/test_memory/test_tag_index_ownership.py` covers independent
-background admission, physical scan drain, refusal/creation failure, prestart
-cancellation, retriever propagation and the body-completed/done-callback gap.
-`tests/test_memory/test_tag_index_swr.py` retains legacy stale-query behavior.
-
 Scoped graph selection and SQL identity parity are covered by
 `tests/test_memory/test_graph_request_database.py` and
 `tests/test_memory/test_graph_path_identity.py`. They use scratch SQLite with
@@ -340,3 +321,24 @@ When adding a new subsystem or feature:
 2. Add subsystem-specific fixtures in `tests/test_<subsystem>/conftest.py`.
 3. Mock external dependencies; do not require live services for unit tests.
 4. Verify the new tests pass in isolation: `pytest -v tests/test_<subsystem>/`.
+
+## Request-owned resource coverage
+
+Shutdown grace and actual synchronous completion are covered by
+`tests/test_db/test_request_database_drain.py`,
+`tests/test_db/test_request_database_drain_states.py`,
+`tests/test_db/test_physical_work.py`, and
+`tests/test_db/test_physical_work_states.py`. These cover real owned-file use,
+queued/running executor cancellation, ambiguous submission, joined children,
+context propagation and legacy cancellation. The connection budget is tested
+separately from the number of physical operations. Fault fixtures release and
+join their real workers; an import failure or unrelated timeout is not evidence
+of forbidden resource use. Production factories and shared activation remain
+separate qualifications.
+
+`tests/test_memory/test_resource_thread_ownership.py` exercises all nine migrated
+memory boundaries with gated real file I/O, cancellation and a real scratch
+database lease. `tests/test_memory/test_tag_index_ownership.py` covers independent
+background admission, physical scan drain, refusal/creation failure, prestart
+cancellation, retriever propagation and the body-completed/done-callback gap.
+`tests/test_memory/test_tag_index_swr.py` retains legacy stale-query behavior.
