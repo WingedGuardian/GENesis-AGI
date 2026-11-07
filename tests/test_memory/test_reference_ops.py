@@ -123,7 +123,8 @@ async def _insert_ref(db, *, qdrant_id="qid-123", project_type=REFERENCE_PROJECT
         domain="reference.credentials",
         source_doc="reference_store:manual",
         concept="Test Cred",
-        body="[reference.credentials] Test Cred\n\nctx\n\nValue: admin / pw",
+        # The shape #2426 writes: the value is held out of the indexed body.
+        body=f"[reference.credentials] Test Cred\n\nctx\n\nValue: {kc.SECRET_PLACEHOLDER}",
         qdrant_id=qdrant_id,
         source_pipeline="reference_store",
     )
