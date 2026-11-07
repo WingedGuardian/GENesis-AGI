@@ -254,6 +254,19 @@ jobs:
             [ -f "$_t" ] || continue
             _n=$(basename "$_t")
             [ "$_n" = "genesis-backup.timer" ] && continue
+            # Transcript analytics is opt-in: the installer enables its timer only
+            # when transcript_analytics_ready (lib/venv_setup.sh) says so, and
+            # disables it otherwise. Mirror that predicate, and on a fresh install
+            # (not configured) require the timer to stay off.
+            if [ "$_n" = "genesis-transcript-analytics.timer" ]; then
+              if ! ( . scripts/lib/venv_setup.sh && transcript_analytics_ready .venv ); then
+                if systemctl --user is-enabled --quiet "$_n"; then
+                  echo "::error::$_n is enabled although transcript analytics is not configured"
+                  exit 1
+                fi
+                continue
+              fi
+            fi
             # BOTH questions. is-enabled catches "never armed"; is-active
             # catches an `enable --now` whose START leg failed — the triggered
             # .service missing or unloadable — which install.sh swallows with
