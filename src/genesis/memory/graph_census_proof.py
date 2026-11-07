@@ -506,15 +506,45 @@ def interpreter_source(
     return reasons
 
 
-def secrets_file(env: dict[str, str], *, main_root: Path) -> Path | None:
+def secrets_file(
+    env: dict[str, str], *, main_root: Path, start: float | None = None
+) -> Path | None:
     """The secrets file that process loads, chosen as ``genesis.env.secrets_path``
-    chooses it: ``SECRETS_PATH``, else ``GENESIS_REPO_ROOT``'s, else main's."""
+    chooses it (``genesis.secrets_location``), with that process's own HOME,
+    ``SECRETS_PATH`` and ``GENESIS_REPO_ROOT``, else main's root."""
+    from genesis.secrets_location import legacy_locations, new_location, resolve
+
     if env.get("SECRETS_PATH"):
         return expand_home(env["SECRETS_PATH"], env)
+    root = main_root
     if env.get("GENESIS_REPO_ROOT"):
         root = expand_home(env["GENESIS_REPO_ROOT"], env)
-        return None if root is None else root / "secrets.env"
-    return main_root / "secrets.env"
+        if root is None:
+            return None
+    home = expand_home("~", env)
+    if home is None:
+        # Path.home() would consult that process's passwd identity, not ours.
+        return None
+    try:
+        selected = resolve(environ={}, home=home, repo_root=root)
+        if start is not None:
+            for candidate in (new_location(home), *legacy_locations(home, root)):
+                if candidate == selected:
+                    break
+                # An absent preferred file might have been loaded, then removed.
+                # Its nearest extant ancestor records removals/renames, including
+                # through a dangling symlink's target. Unrelated changes there
+                # conservatively make this process unknown until a restart.
+                if not _links_unchanged_since(candidate, start):
+                    return None
+                ancestor = candidate.resolve()
+                while not ancestor.exists() and ancestor != ancestor.parent:
+                    ancestor = ancestor.parent
+                if not _unchanged_since(ancestor, start):
+                    return None
+        return selected
+    except (OSError, RuntimeError, ValueError):
+        return None
 
 
 def _links_unchanged_since(path: Path, start: float, _depth: int = 0) -> bool:
@@ -666,7 +696,7 @@ def carry_secrets(
     current = changed_secrets_values(path, start)
     if current is None or "SECRETS_PATH" in current or "GENESIS_REPO_ROOT" in current:
         return None
-    if secrets_file({**env, **current}, main_root=main_root) != path:
+    if secrets_file({**env, **current}, main_root=main_root, start=start) != path:
         return None
     return current if secrets_digest(current) == proven_digest else None
 

@@ -96,7 +96,9 @@ cd "$REPO_DIR" || { _log "repo directory $REPO_DIR is unreachable"; exit 75; }
 # The runtime reads these from secrets.env (overriding its environment), so the
 # oneshot must provision where it launches from. By name only: no other secret
 # reaches the downloaders. Last assignment wins, as in systemd's own reader.
-SECRETS_FILE="${SECRETS_PATH:-$REPO_DIR/secrets.env}"
+# shellcheck source=lib/secrets_path.sh
+. "$REPO_DIR/scripts/lib/secrets_path.sh"
+SECRETS_FILE="$(genesis_secrets_path "$REPO_DIR")"
 _load_browser_setting() {
     local key="$1" line="" val
     [ -f "$SECRETS_FILE" ] || return 0

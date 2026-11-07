@@ -247,8 +247,9 @@ def test_a_reason_never_carries_an_environment_value(tree):
 
 def test_the_secrets_file_is_chosen_the_way_genesis_env_chooses_it(tree):
     main = tree["main"]
-    assert proof.secrets_file({}, main_root=main) == main / "secrets.env"
-    assert proof.secrets_file({"GENESIS_REPO_ROOT": "/r"}, main_root=main) == Path("/r/secrets.env")
+    assert proof.secrets_file({}, main_root=main) is None
+    env = {"HOME": str(tree["tmp"] / "home"), "GENESIS_REPO_ROOT": "/r"}
+    assert proof.secrets_file(env, main_root=main) == Path("/r/secrets.env")
     env = {"GENESIS_REPO_ROOT": "/r", "SECRETS_PATH": "/s/x.env"}
     assert proof.secrets_file(env, main_root=main) == Path("/s/x.env")
     env = {"SECRETS_PATH": "~/s.env", "HOME": "/home/other"}
@@ -264,6 +265,39 @@ def test_a_secrets_file_unchanged_since_start_is_read(tmp_path):
         "GENESIS_GRAPH_TELEMETRY_DISABLED": "1",
         "OTHER": "x",
     }
+
+
+@pytest.mark.parametrize("removed", ["new", "checkout"])
+def test_removing_a_preferred_file_cannot_prove_the_fallback(tmp_path, removed):
+    home = tmp_path / "home"
+    checkout = tmp_path / "checkout"
+    paths = {
+        "new": home / ".config" / "genesis" / "secrets.env",
+        "checkout": checkout / "secrets.env",
+        "home": home / "genesis" / "secrets.env",
+    }
+    for path in paths.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("GENESIS_GRAPH_TELEMETRY_DISABLED=0\n")
+    if removed == "checkout":
+        paths["new"].unlink()
+    paths[removed].write_text("GENESIS_GRAPH_TELEMETRY_DISABLED=1\n")
+    start = time.time()
+    time.sleep(0.02)
+    paths[removed].unlink()
+    assert proof.secrets_file({"HOME": str(home)}, main_root=checkout, start=start) is None
+
+
+def test_an_unchanged_fallback_can_still_be_proven(tmp_path):
+    home = tmp_path / "home"
+    (home / ".config" / "genesis").mkdir(parents=True)
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    legacy = checkout / "secrets.env"
+    legacy.write_text("GENESIS_GRAPH_TELEMETRY_DISABLED=0\n")
+    assert proof.secrets_file(
+        {"HOME": str(home)}, main_root=checkout, start=time.time() + 60
+    ) == legacy
 
 
 def test_a_secrets_file_changed_after_start_is_unknown(tmp_path):

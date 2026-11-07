@@ -468,8 +468,12 @@ def build_census(
         )
         # Each value derived the way THIS server derives it (its own SECRETS_PATH,
         # GENESIS_REPO_ROOT and HOME), never from the census process's state.
-        secrets_path = proof.secrets_file(env, main_root=repo)
+        secrets_path = proof.secrets_file(env, main_root=repo, start=proc["start"])
         file_vals = proof.secrets_values(secrets_path, proc["start"])
+        # Recheck selection after the read as well: a preferred candidate may
+        # have appeared or disappeared while the lower-priority file was read.
+        if proof.secrets_file(env, main_root=repo, start=proc["start"]) != secrets_path:
+            file_vals = None
         carried = False
         if file_vals is None and prior:
             # Changed since start: still proven if an earlier row for this same

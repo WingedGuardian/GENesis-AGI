@@ -179,14 +179,12 @@ def venv_path() -> Path:
 
 
 def secrets_path() -> Path:
-    value = os.environ.get("SECRETS_PATH")
-    if value:
-        resolved = Path(value).expanduser()
-        logger.debug("secrets_path: SECRETS_PATH override → %s", resolved)
-        return resolved
-    genesis_path = repo_root() / "secrets.env"
-    logger.debug("secrets_path: genesis repo → %s", genesis_path)
-    return genesis_path
+    """The credentials file this process reads (order: ``genesis.secrets_location``)."""
+    from genesis.secrets_location import resolve
+
+    resolved = resolve(environ=os.environ, home=Path.home(), repo_root=repo_root())
+    logger.debug("secrets_path → %s", resolved)
+    return resolved
 
 
 def genesis_db_path() -> Path:

@@ -53,12 +53,20 @@ def _db_is_fenced(db_path) -> bool:
 
 # Load secrets.env so USER_TIMEZONE and other env vars are available
 # before any genesis module imports (which may read os.environ at import time).
-# SECRETS_PATH wins, as in genesis.env.secrets_path() (not importable yet here).
-_SECRETS_PATH = (
-    Path(os.environ["SECRETS_PATH"]).expanduser()
-    if os.environ.get("SECRETS_PATH")
-    else Path(__file__).resolve().parent.parent / "secrets.env"
-)
+# Resolved as genesis.env.secrets_path() resolves it, by loading the stdlib-only
+# resolver module by path (the genesis package is not importable yet here).
+def _resolve_secrets_file(repo: Path) -> Path:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_genesis_secrets_location", repo / "src" / "genesis" / "secrets_location.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.resolve(environ=os.environ, home=Path.home(), repo_root=repo)
+
+
+_SECRETS_PATH = _resolve_secrets_file(Path(__file__).resolve().parent.parent)
 if _SECRETS_PATH.is_file():
     try:
         from dotenv import load_dotenv

@@ -139,13 +139,11 @@ if str(SRC_DIR) not in sys.path:
 # only loaded by the Genesis runtime (bridge/AZ), not by Claude Code.
 from dotenv import load_dotenv  # noqa: E402
 
-# SECRETS_PATH wins, as in genesis.env.secrets_path().
+from genesis.secrets_location import resolve as _resolve_secrets  # noqa: E402
+
+# Resolved as genesis.env.secrets_path() resolves it.
 _PHASES.mark("dotenv")
-load_dotenv(
-    Path(os.environ["SECRETS_PATH"]).expanduser()
-    if os.environ.get("SECRETS_PATH")
-    else REPO_DIR / "secrets.env"
-)
+load_dotenv(_resolve_secrets(environ=os.environ, home=Path.home(), repo_root=REPO_DIR))
 
 # Skip in dispatched sessions (bridge, reflection, surplus)
 if os.environ.get("GENESIS_CC_SESSION") == "1":
