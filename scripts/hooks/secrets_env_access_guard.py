@@ -55,8 +55,11 @@ destructive-action guard, and a crashed hook must not wedge every tool call.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import select
+import signal
 import sys
 
 # Self-locate so sibling hook modules resolve whether run as a script or imported.
@@ -121,25 +124,95 @@ _PATTERN_IS_PATH_TOOLS = ("Glob",)
 #: (#3789). ``low`` keeps the record for forensics without a page.
 _DISPATCHED_PRIORITY = "low"
 
+#: Hard limit on one check, in seconds. The hook's timeout is 10 s
+#: (.claude/settings.json), and a hook that times out lets the tool run with no
+#: decision, so a check that has not answered by now gates instead. MEASURED on
+#: the previous code: crafted commands of 30 characters to 40 KB kept the scan
+#: running 8 to 21 s inside single calls (brace expansion, two regexes) that no
+#: deadline inside the scan can interrupt; only killing the process bounds them.
+_CHECK_LIMIT_S = 5.0
+
+
+def _touches_bounded(paths: list[str], command: str) -> bool:
+    """``touches_secrets`` in a child process that is killed at the limit.
+
+    Anything but a clean "no" from the child is a yes: a timeout, a crash, an
+    exception or a short read all gate. Where no child can be started it gates
+    too: running the check here would have no limit. The child also arms its own
+    alarm, so it cannot outlive a parent the harness killed. The hook starts no
+    threads before this point, so the fork is single-threaded (Python warns only
+    when a multi-threaded test runner calls it)."""
+    try:
+        r, w = os.pipe()
+    except OSError:
+        return True
+    try:
+        pid = os.fork()
+    except OSError:
+        os.close(r)
+        os.close(w)
+        return True
+    if pid == 0:  # child
+        os.close(r)
+        signal.alarm(int(_CHECK_LIMIT_S) + 2)
+        try:
+            out = b"0" if not touches_secrets(paths=paths, command=command) else b"1"
+        except BaseException:  # noqa: BLE001 — any failure is reported as a yes
+            out = b"1"
+        os.write(w, out)
+        os._exit(0)
+    os.close(w)
+    answer = b""
+    try:
+        ready, _, _ = select.select([r], [], [], _CHECK_LIMIT_S)
+        if ready:
+            answer = os.read(r, 1)
+    except OSError:
+        pass
+    finally:
+        os.close(r)
+        if answer not in (b"0", b"1") and pid > 1:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+            # A child stuck in uninterruptible I/O (a hung mount under a glob)
+            # does not die at once; do not wait for it past the hook's timeout.
+            with contextlib.suppress(OSError):
+                os.waitpid(pid, os.WNOHANG)
+        else:
+            with contextlib.suppress(OSError):
+                os.waitpid(pid, 0)
+    return answer != b"0"
+
 
 def main() -> int:
-    payload = read_payload()
-    ti = tool_input(payload)
+    # Reading the payload is the one step before the bounded check that can
+    # raise on input alone (a 30,000-deep JSON nest raises RecursionError; a NUL
+    # in a Grep path makes expanduser raise ValueError). An exception here exits
+    # non-zero, which lets the tool run, so an unreadable payload gates instead.
+    unreadable = False
+    try:
+        payload = read_payload()
+        ti = tool_input(payload)
 
-    paths = [ti[f] for f in _PATH_FIELDS if isinstance(ti.get(f), str)]
-    if payload.get("tool_name") in _PATTERN_IS_PATH_TOOLS and isinstance(ti.get("pattern"), str):
-        paths.append(ti["pattern"])
-    command = ti.get("command") if isinstance(ti.get("command"), str) else ""
+        paths = [ti[f] for f in _PATH_FIELDS if isinstance(ti.get(f), str)]
+        if payload.get("tool_name") in _PATTERN_IS_PATH_TOOLS and isinstance(
+            ti.get("pattern"), str
+        ):
+            paths.append(ti["pattern"])
+        command = ti.get("command") if isinstance(ti.get("command"), str) else ""
 
-    # Grep's `glob` is relative to its `path` (or the cwd). Checking it alone
-    # only catches the case where the pattern happens to resolve from here, so
-    # also offer the joined form — `path="~/genesis"` + `glob="secrets.env"` is
-    # a read of the real file and must gate the same as the full path would.
-    base, pat = ti.get("path"), ti.get("glob")
-    if isinstance(base, str) and isinstance(pat, str) and base and pat:
-        paths.append(os.path.join(os.path.expanduser(base), pat))
+        # Grep's `glob` is relative to its `path` (or the cwd). Checking it alone
+        # only catches the case where the pattern happens to resolve from here, so
+        # also offer the joined form — `path="~/genesis"` + `glob="secrets.env"` is
+        # a read of the real file and must gate the same as the full path would.
+        base, pat = ti.get("path"), ti.get("glob")
+        if isinstance(base, str) and isinstance(pat, str) and base and pat:
+            paths.append(os.path.join(os.path.expanduser(base), pat))
+    except Exception:  # noqa: BLE001 — see above: an unreadable payload gates
+        unreadable = True
+        payload, paths, command = {}, [], ""
 
-    if not touches_secrets(paths=paths, command=command):
+    if not unreadable and not _touches_bounded(paths, command):
         return 0
 
     # One line, quoted, so the owner sees WHAT is happening rather than being
