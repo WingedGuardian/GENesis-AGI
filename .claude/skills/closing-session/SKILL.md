@@ -772,13 +772,13 @@ diff, not just the section.
   exception — measured: PR #1541's originating session had died and the work sat
   unowned. Ownership lives with the queue, not with the author.
 - **It does not open new work.** If it finds an UNRELATED bug, it files it and
-  moves on — **routed by OWNER, per CLAUDE.md's "Where deferred work goes"**.
-  An unrelated defect in Genesis itself is repo work, so it becomes a **GitHub
-  issue**, scrubbed to technical detail only; that is what lets another
-  contributor pick it up instead of leaving it install-local and invisible to
-  the project queue. `follow_up_create` is for user-owned work and state purely
-  local to this box, not for a repo bug. A security defect is never filed
-  publicly before it is fixed. Note this is a deliberate narrowing of
+  moves on — **public by default, per CLAUDE.md's "Where deferred work goes"**.
+  File/reuse a safely described GitHub issue even for install-local or
+  security-related work, then verify its receipt. Private supporting evidence
+  does not force a private task. Use `follow_up_create` for the whole item only
+  when useful public wording necessarily reveals protected information or enables
+  concrete exploit/cost/harm; state that harm and why redaction cannot avoid it.
+  Note this is a deliberate narrowing of
   CLAUDE.md's "bias = FIX NOW" default, not an exemption from it: a closing
   session is the standing case (3) of that rule — fixing unrelated things in
   place is how it turns back into a build session and stops closing anything. A
