@@ -8,6 +8,20 @@ import sqlite3
 import sys
 
 
+def pending_record(row: dict, machine_hash, legs) -> tuple[str, ...]:
+    h = machine_hash(row["hash"])
+    repo, provider, age = row["repo_path"], row["provider"], row["age_s"]
+    if (
+        not legs.stored_repo(repo)
+        or legs.stored_hash(repo) != h
+        or provider not in legs.PROVIDERS
+        or type(age) is not int
+        or not 0 <= age <= legs.INTEGER_MAX
+    ):
+        raise ValueError("invalid machine pending snapshot")
+    return "1", "pending", h, repo, provider, str(age)
+
+
 def main(argv: list[str] | None, api: dict) -> int:
     parser = argparse.ArgumentParser(description="Code-intel provider-leg queue")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -55,6 +69,7 @@ def main(argv: list[str] | None, api: dict) -> int:
                 api['database_path'](),
                 limit=getattr(args, "limit", 0),
                 protocol_only=args.cmd == "automatic-ready",
+                schema_check=lambda db: api['_recovery'].validate_schema(db, api['_native']),
             )
         except (OSError, sqlite3.Error, ValueError, RuntimeError) as exc:
             print(

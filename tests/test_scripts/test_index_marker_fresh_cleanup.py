@@ -12,6 +12,7 @@ from tests.test_scripts.test_code_intel_execution import evidence as evidence
 from tests.test_scripts.test_code_intel_execution import scope as scope
 from tests.test_scripts.test_index_marker_execution import (
     _claim,
+    _finish_control,
     _intent,
     _registration,
     _reservation,
@@ -31,6 +32,8 @@ def _historical(queue, scope, evidence, monkeypatch, *, settle_before=True):
     claimed = _claim(queue, scope[1].parents[2])
     reserved = _reservation(claimed)
     _, leaf, proc = scope
+    (proc / "self/stat").write_bytes(Path("/proc/self/stat").read_bytes())
+    (proc / "sys/kernel/random/boot_id").write_bytes(Path("/proc/sys/kernel/random/boot_id").read_bytes())
     leaf = leaf.rename(leaf.with_name(reserved["unit"] + ".scope"))
     membership = "0::/genesis-workload.slice/" + leaf.name + "\n"
     (proc / "self/cgroup").write_text(membership)
@@ -54,6 +57,7 @@ def _historical(queue, scope, evidence, monkeypatch, *, settle_before=True):
     (leaf / "cgroup.events").write_text("populated 0\nfrozen 0\n")
     proof = collector(registration, queue._native.digest(registration), queue._proof, owned_wait=True, proc=proc)
     queue.remember_native_event(claimed["context"], "cleanup", proof)
+    _finish_control(queue, claimed)
     if settle_before:
         assert queue.apply_native(claimed["context"]) == "consumed"
         assert queue.get_inflight(claimed["context"]["hash"]) is None

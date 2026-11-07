@@ -789,6 +789,78 @@ cutover still require their separate implementation and disposable native tests.
 `automatic-ready` remains never-positive. Existing production disablement stays
 in force; isolated CLI/report fixtures are not native or production acceptance.
 
+### Provider safety and control completion
+
+Normal initialization still targets schema 4. An explicit transaction-only
+schema-5 converter adds provider safety coverage and retained control-completion
+witnesses; startup and enqueue do not invoke that converter. Compatible enqueue
+and read-only diagnostics recognize complete schema 5. A busy supported schema-4
+or schema-5 queue retains a modern enqueue envelope, so transport contention does
+not turn a new request into legacy uncertainty. Missing schema-5 fields
+refuse. Native claim, reservation, registration and intent require schema 5;
+there is no live cutover command or readiness setter in this contribution.
+
+A reserved execution with no control-completion witness retains repository-wide
+ownership independently of cancellation, native completion and kernel cleanup,
+including after an older pointer was retired. The original live owner publishes
+its boot/PID/start-bound witness. A clean launched witness requires known
+foreground status and a successful monitor wait; an unlaunched cancelled
+reservation uses the separate no-registration/no-intent case. Generic publication
+cannot manufacture an orphan witness. Controller uncertainty holds the affected
+provider even when native success is known, without charging or repeating that
+completed work.
+
+An uncertain closure is allowed only after all possible old output producers
+have ended. Lost raw child wait status still prevents clean acceptance, but does
+not itself mean a producer survives: the authenticated original-owner closure
+and independent physical release can end temporary repository exclusion while
+the affected provider remains held. A missing closure retains that exclusion.
+
+A launched process that ends before startup is acknowledged retains its actual
+child waits as `uncertain/startup_incomplete`, including an exit status of zero.
+This requires cancelled future launch permission and no native intent; it does
+not create a missing registration or claim native success. An optional startup
+observation retains the original scope and its actual counters. A confirmed
+owned-leaf OOM kill, including one in the first sample, remains a resource hold
+even after successful native completion or a conflicting control receipt.
+Ancestor counters remain diagnostic. Missing startup facts do not mean zero OOM.
+The native journal retains its existing registration-relative counter contract
+for trusted same-install producers. The queued owner/reporter must reject a
+positive first sample before startup acknowledgement or registration and retain
+that original observation through the optional startup witness; supplying an
+arbitrary positive registration baseline directly is not that startup protocol.
+This contribution does not reinterpret historical native baselines or accounting.
+
+Provider safety persists across ordinary enqueue and commit generations. The
+reader recognizes coverage only from the exact selected trial's clean terminal,
+control and source identities; ordinary success cannot write that acceptance.
+Newer incidents and a changed or conflicted accepted trial hold the provider.
+Older covered incidents remain retained. Original physical/control obligations
+are never discharged by a provider acceptance watermark. Supervised retry and
+acceptance commands remain a separate contribution.
+
+Retained cleanup/population/OOM bodies keep their existing safety interpretation
+and fresh original-kernel checks. Their presence alone does not hold a healthy
+sibling after physical/control release. Additional unresolved terminal, stop or
+control conflicts fence their affected repository/provider; malformed, missing
+or unreadable evidence still refuses. Duplicate event identity excludes receipt
+timestamps, and a later pressure stop retains resource safety even after a prior
+wall stop.
+
+Legacy conversion preserves raw evidence, shared debt, settlement and clocks.
+Unknown or conflicting old work gains uncertainty, never an inferred OOM or
+no-start result. Consumed combined history is compared with pending work only at
+initial cutover; a later normal enqueue cannot reclassify that history. Pending
+legacy snapshots and contradictory reused claim identities are observations with
+no claim ID, inflight ownership or accounting effect. Canonical semantic origins
+make repeat projection idempotent. A conflicting claim candidate retains its raw
+body and the union of original/incoming provider attribution without rebinding
+the queue's canonical repository.
+
+This storage and admission contract does not run either indexer, lift production
+disablement or qualify the unfinished runner/recovery paths. Disposable native
+and production acceptance remain separate gates.
+
 ## Captured source diagnostics
 
 `python3 -I scripts/lib/code_intel_source.py describe runner` captures the finite

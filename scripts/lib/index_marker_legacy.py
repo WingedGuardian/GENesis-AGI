@@ -370,7 +370,7 @@ def migrate(
         retire(directory, imported, sync)
 
 
-def import_status(database: Path, *, limit: int, protocol_only=False, observe=None) -> dict:
+def import_status(database: Path, *, limit: int, protocol_only=False, observe=None, schema_check=None) -> dict:
     """Observe this rollback-journal queue without initialization or migration."""
     if limit < 0:
         raise ValueError("limit must be nonnegative")
@@ -399,10 +399,12 @@ def import_status(database: Path, *, limit: int, protocol_only=False, observe=No
                 "schema_version": version,
                 "receipts_available": False,
             }
-        if version not in (2, 3, 4):
+        if version == 5 and schema_check is not None:
+            schema_check(db)
+        elif version not in (2, 3, 4):
             raise RuntimeError(f"unsupported queue schema {version}")
         if observe is not None:
-            if version != 4:
+            if version not in (4, 5):
                 return {"state": "protocol-incomplete", "schema_version": version,
                         "execution_available": False}
             db.row_factory = sqlite3.Row
