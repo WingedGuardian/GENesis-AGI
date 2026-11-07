@@ -10,7 +10,7 @@ from fastmcp.exceptions import ToolError
 
 from genesis.db.connection import get_db
 from genesis.db.request_database import RequestDatabase
-from genesis.observability.mcp_middleware import install_instrumentation
+from genesis.observability.mcp_middleware import InstrumentationMiddleware, install_instrumentation
 
 
 @pytest.mark.parametrize("persist", (False, True))
@@ -45,6 +45,33 @@ async def test_legacy_readonly_metrics_do_not_finalize_a_borrowed_transaction(tm
         assert rows == ([('pending',)] if persist and not fail else [])
     finally:
         await db.rollback()
+        await db.close()
+
+
+@pytest.mark.parametrize("name", ("memory", "recon", "outreach"))
+async def test_legacy_writable_services_keep_their_database_boundary(tmp_path, name):
+    """Only health's read-only external profile declines legacy finalization."""
+    path = tmp_path / "legacy-writable.db"
+    db = await get_db(path)
+    try:
+        await db.execute("CREATE TABLE samples (value TEXT)")
+        await db.commit()
+        server = FastMCP("legacy-writable-fixture")
+        install_instrumentation(server, SimpleNamespace(persist_activity=False, record=Mock()), name, db)
+        # The same database also feeds the staleness guard for procedure_store.
+        assert [m._db for m in server.middleware if isinstance(m, InstrumentationMiddleware)] == [db]
+
+        @server.tool()
+        async def write() -> str:
+            await db.execute("INSERT INTO samples VALUES ('written')")
+            return "written"
+
+        async with Client(server) as client:
+            assert (await client.call_tool("write")).data == "written"
+        assert not db.in_transaction
+        with sqlite3.connect(path) as reader:
+            assert reader.execute("SELECT value FROM samples").fetchall() == [('written',)]
+    finally:
         await db.close()
 
 

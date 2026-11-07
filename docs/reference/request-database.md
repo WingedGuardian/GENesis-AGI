@@ -12,7 +12,12 @@ a bootstrap unit, then returns the actual FastMCP server. Scoped health uses
 `StandaloneHealthDataService` holding that same facade; the common health
 initializer rejects the runtime health aggregator before changing registration
 because its shared snapshot task is not request-owned. Ordinary-connection
-runtime health remains supported. Memory requires `read_pool=None`.
+runtime health remains supported. Memory requires `read_pool=None` and an
+explicit `process_pending_bookmarks` argument. Any injected dependency that
+holds a database (an outreach pipeline or engagement tracker, a recon memory
+store or surplus queue) must hold the same facade. Memory, and any service given
+a persisting tracker, require the background budgets described below. Each of
+these checks rejects before registration changes.
 Call it before serving requests, and stop
 requests before closing the manager. Initialization is not a hot-reload API.
 Bootstrap owns an independent database unit; call it outside a unit owned by the
@@ -49,9 +54,10 @@ failure as a failed call. A normal result containing an `error` field remains
 a normal return. Reinitializing replaces this service's instrumentation in either
 database mode, removing an obsolete scoped boundary when returning to a legacy
 connection. Other services' middleware and unrelated middleware are retained.
-Legacy trackers with `persist_activity=False` leave borrowed transaction
-finalization to its owner. Request-owned units still finalize every call with
-that tracker setting.
+Legacy health trackers with `persist_activity=False` leave borrowed transaction
+finalization to its owner. Writable legacy services keep their database for the
+commit boundary and the staleness guard whatever that tracker setting is.
+Request-owned units still finalize every call with that tracker setting.
 
 No CLI or transport currently selects this bootstrap. Shared activation must
 also supply caller identity, resolve the pending-bookmark policy explicitly,

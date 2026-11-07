@@ -4084,7 +4084,9 @@ Refusing a proposed update preserves a previously valid opt-in.
   legacy connections keep ordinary task scheduling. Internal
   `initialize_request_service` bootstraps memory/health/recon/outreach with
   mandatory request middleware even without metrics, awaits outreach schema,
-  and refuses a separate memory read pool. Its tracker is bound and optionally
+  and refuses a separate memory read pool, an omitted memory bookmark policy,
+  a dependency holding another database, and detached work (memory or a
+  persisting tracker) without background budgets. Its tracker is bound and optionally
   warmed once by the owning bootstrap; registration cannot rebind pending flushes
   or duplicate history. Scoped health supports the standalone status-file service,
   rejecting runtime snapshot sharing before changing registration. Reinitialization
