@@ -3226,7 +3226,13 @@ verified: 3e27b4794 2026-10-23
   Status reads confined snapshot metadata and reports individual source stat or
   fingerprint errors while continuing; bounded SQL previews and streaming CSV
   preserve full query counts without retaining every result row in Python.
-  Scheduling arrives in a dependent change. Additional backup
+  Source evidence validates the selected original block's ID/hash and reports
+  ambiguous reused IDs without choosing an owner. Its regular-file reader bounds
+  physical records at 1 MiB, withholds oversized/recursive context and reports
+  oversized targets unavailable while retaining search rows and original files.
+  Applicable result envelopes retain their hash eligibility and are scrubbed.
+  Scheduling arrives in a
+  dependent change. Additional backup
   and recovery integration is deferred independently of collection and search.
   Unknown historical content is excluded from content metrics. Views version 24
   preserves missing call/result hashes as unknown and admits ownership from the
