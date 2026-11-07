@@ -102,10 +102,28 @@ follow-ups and the owner conversation. A successful scan is not permission to
 publish private content. Validators do not request development reviews or
 trigger paid agents; the filer is not a review-budget gate.
 
-**A native guard denial means stop that action and ask the owner.** Do not
-retry through another command spelling, subprocess, tool or client. Do not
-write stores under test or run migrations on live data. Discovery of this skill
-does not qualify or activate the launcher, and it does not authorize PR6.
+**A native guard denial stops that action, not the run.** Do not retry it
+through another command spelling, subprocess, tool or client. Record the claim it
+served as a `not_yet_done` gap whose `command` is the denied step and whose
+reason is "blocked by the validator guard: <one line>", so the row stays open for
+a client that can run it; use `NOT_VERIFIABLE_HERE` only where no client on this
+install could. List the denial (command, reason) in the run log and carry on with
+the other claims and rows. Put any question for the owner in plain text in your
+report: the validator profile has no question tool, and its guard denied the
+native one in the 2026-11-06 calibration. Do not write stores under test or run
+migrations on live data. Discovery of this skill does not qualify or activate the
+launcher, and it does not authorize PR6.
+
+Write commands so that the most common false denials never fire; once a command
+is denied, the paragraph above governs. The credentials guard expands a `*` it
+cannot prove is literal, quoted or not, so a raw `sqlite3` or `python -c` query
+with `count(*)` run from the checkout is read as touching the credentials file.
+Prefer `python -m genesis db query "<sql>"`, which is exempt; otherwise write
+`count(1)`, name columns and use explicit paths. A command whose prose names the
+credentials file trips the same guard. Separately, the box-wide pytest lock is a
+refusal, not a guard denial: another session holds it. Wait on it with
+`python3 scripts/pytest_lock_wait.py` (run in the background if you have other
+rows to work), and never stop the run or kill the holder because of it.
 
 ## Load Gate
 
@@ -374,6 +392,20 @@ For every claim you verify, run the arm that must come out the OTHER way. A
 guard that blocks the case under test would also block everything; only the
 control tells those apart. A verification with no control is a story.
 
+**The PR's own tests are the author's evidence, not yours.** Re-running them
+confirms what the author already checked, and it cannot find a case they did not
+think of. Every claim needs at least one probe or code-path read that the shipped
+tests do not already perform: the other branch of a two-sided rule, the other
+call sites of a changed message, the path the test fixture skips. Before deriving
+a verdict, also search the issues that cite the PR, open and closed
+(`gh issue list --state all --search "#<number>"`, and its title words); a later
+report of the same behaviour is evidence, and a fail it names must be measured or
+refuted, never ignored. MEASURED in the 2026-11-06 Codex calibration: both false
+passes (2 of 14 rows) came from this. One PR's
+refusal rule was tested only on its release half, and the defect was in the serve
+half; another's post-save warning was tested on one stop path, and a second path
+lacked it. Open issues named both defects, and neither was read.
+
 ---
 
 ## Hard limits
@@ -433,7 +465,8 @@ control tells those apart. A verification with no control is a story.
   genuine decision (closing-session, "Working the queue", step 5). The triage
   never moves what this skill already gives the owner: a `fail-intent` goes to
   them as a conversation (the verdicts table above), and a native guard denial
-  means stop and ask.
+  means stop and ask (under Codex: stop that action and carry on, as "Running
+  under Codex" says).
 
 ---
 
