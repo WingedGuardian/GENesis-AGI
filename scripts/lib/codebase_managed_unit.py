@@ -57,11 +57,11 @@ def systemctl_env() -> dict[str, str]:
 
 
 
-def bus_call(path: str, interface: str, method: str, *args: str) -> dict:
+def bus_call(path: str, interface: str, method: str, *args: str, timeout: float = 30) -> dict:
     result = subprocess.run(
         ["/usr/bin/busctl", "--user", "--json=short", "call", "org.freedesktop.systemd1",
          path, interface, method, *args],
-        capture_output=True, text=True, check=True, timeout=30, env=systemctl_env(),
+        capture_output=True, text=True, check=True, timeout=timeout, env=systemctl_env(),
     )
     value = json.loads(result.stdout)
     if not isinstance(value, dict) or set(value) != {"type", "data"}:

@@ -1777,7 +1777,9 @@ the shared banner is not an assertion about all concurrent sessions.
   cleanup and persistent resource quarantine remain separate activation gates.
   `scripts/lib/code_intel_execution.py` adds an explicit stdlib scope-evidence
   observer with private bounded pipe transport and complete-subtree task/counter
-  checks. It has no automatic queue caller, stop authority or quarantine state.
+  checks. Its optional queued seam preserves first-intent-before-Popen, accepted
+  descriptors and actual child wait independently of lifecycle-release errors.
+  It has no automatic queue caller, stop authority or quarantine state.
   The existing foreground watchdog lacks a post-return scope-quiescence barrier;
   strict queue integration must retain unresolved cleanup ownership separately.
   Synthetic/descriptor fixtures do not qualify native OOM or production indexing.
@@ -1787,10 +1789,20 @@ the shared banner is not an assertion about all concurrent sessions.
   intent, retained typed report/stop/cleanup facts and exact-once application.
   Shared publishers and exclusive replay/admission reuse `.queue.lock`, including
   busy spools. Completion is independent from safety and cleanup; late disproof
-  retains repo-wide exclusion without restoring old accounting or overwriting a
-  newer inflight pointer. This is transaction storage/interpretation only:
-  automatic readiness stays fenced, actual queued native production and lifetime
-  reconciliation remain unwired, and kernel/production acceptance is unqualified.
+  keeps cleanup invalidated without restoring old accounting or overwriting a
+  newer inflight pointer. `code_intel_scope.py` supplies fresh original-subtree
+  proof to admission and exact-pointer retirement, retaining sticky invalidation
+  and independent provider holds. Newly measured owned OOMs use the existing
+  durable evidence path; preparation OOM remains visible after admission refusal.
+  Typed manager inspection is read-only and bounds every call by its remaining
+  deadline. Registration binds the manager's native cgroup ID to the captured
+  original leaf on 64-bit Linux; missing-leaf cleanup verifies the visible
+  original ancestor chain. Collector read failures retain the affected physical
+  hold without aborting unrelated reconciliation; publication failures propagate.
+  Intent callback RuntimeError refuses child creation
+  with private diagnostics. Automatic readiness stays fenced; actual scope creation, watchdog/
+  runner wiring and recovery remain unfinished. Synthetic fixtures do not
+  establish native kernel or production acceptance.
   `scripts/lib/code_intel_source.py` provides explicit captured-source diagnostics
   and a finite assembly API: Python and shell buffers match one immutable Git
   tree, and Python compilation/hashing use those same bytes with original origins.

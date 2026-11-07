@@ -645,9 +645,38 @@ def list_markers() -> list[dict]:
         db.close()
 
 
+def _spool_native_event(event):
+    context = event["context"]
+    return _write_durable_event(
+        final_name=f".execution-spool-{context['hash']}-{context['claim_id']}-{secrets.token_hex(16)}.spool",
+        temp_prefix=".execution-tmp-", data=event)
+
+
+def _fresh_gate(db):
+    return lambda row: _fresh_cleanup(db, row)
+
+
+def _fresh_cleanup(db, row, *, proc=Path("/proc")) -> bool:
+    """Re-read a disputed lifetime using the admitted queue decision transaction."""
+    if (row["scope_registration"] is None or row["cleanup_proof"] is None
+            or row["completion_kind"] == "unbound" or row["launch_permission"] not in ("spent", "cancelled")):
+        return False
+    scope = _load_sibling(
+        "_genesis_code_intel_scope",
+        importlib.util.spec_from_file_location(
+            "_genesis_code_intel_scope", Path(__file__).with_name("code_intel_scope.py")),
+    )
+    retained = (json.loads(path.read_bytes(), object_pairs_hook=_proof._unique)
+                for path in marker_dir().glob(f".execution-spool-{row['hash']}-{row['claim_id']}-*.spool"))
+    return _native.retain_fresh_cleanup(
+        db, row, _legs, _proof, collect=scope.cleanup_observation, proc=proc,
+        clock=time.time, retained=retained, publish=_spool_native_event,
+    )
+
+
 def claim(h: str, *, provider: str) -> dict | None:
     with _queue_gate() as db:
-        if _native.blocked(db, h, provider):
+        if _native.blocked(db, h, provider, fresh_cleanup=_fresh_gate(db)):
             return None
         result = _legs.claim(db, h, provider)
         if result is not None:
@@ -660,7 +689,7 @@ def claim_native(h: str, *, provider: str) -> dict | None:
     if provider not in _legs.PROVIDERS:
         raise ValueError("provider must be cbm or gitnexus")
     with _queue_gate() as db:
-        result = _native.claim(db, h, provider, _legs)
+        result = _native.claim(db, h, provider, _legs, fresh_cleanup=_fresh_gate(db))
         if result is not None:
             _native.context(result["context"], _legs, marker_hash)
         return result
@@ -714,14 +743,14 @@ def repend_stale_inflight() -> list[str]:
 
 def reconcile_native() -> list[str]:
     with _queue_gate() as db:
-        return _native.reconcile(db, _legs)
+        return _native.reconcile(db, _legs, fresh_cleanup=_fresh_gate(db))
 
 
 def reserve_launch(context: dict, data: dict) -> str:
     context = _native.context(context, _legs, marker_hash)
     data = _native.reservation(data, context)
     with _queue_gate() as db:
-        state = _native.reserve(db, context, data, _legs)
+        state = _native.reserve(db, context, data, _legs, fresh_cleanup=_fresh_gate(db))
     if state in ("conflict", "held"):
         raise RuntimeError("native reservation refused: " + state)
     return state
@@ -736,7 +765,7 @@ def cancel_launch(context: dict) -> str:
 def _native_gate(context, data, operation):
     context = _native.context(context, _legs, marker_hash)
     with _queue_gate() as db:
-        state = operation(db, context, data, _legs, _proof)
+        state = operation(db, context, data, _legs, _proof, fresh_cleanup=_fresh_gate(db))
     if state in ("conflict", "resource", "held"):
         raise RuntimeError("native launch refused: " + state)
     return state
@@ -753,11 +782,6 @@ def begin_native(context: dict, data: dict) -> str:
 def remember_native_event(context: dict, kind: str, data: dict, *, recorded_at=None) -> Path:
     context = _native.context(context, _legs, marker_hash)
     event = _native.event(context, kind, data, time.time() if recorded_at is None else recorded_at, _proof)
-    def spool():
-        return _write_durable_event(
-            final_name=f".execution-spool-{context['hash']}-{context['claim_id']}-{secrets.token_hex(16)}.spool",
-            temp_prefix=".execution-tmp-", data=event,
-        )
     with _publisher(wait_s=OUTCOME_LOCK_WAIT_S) as db:
         state = "waiting"
         if db is not None:
@@ -765,13 +789,13 @@ def remember_native_event(context: dict, kind: str, data: dict, *, recorded_at=N
                 with _transaction(db):
                     state = _native.record(db, context, event, _legs, _proof)
             except TimeoutError:
-                return spool()
+                return _spool_native_event(event)
             except sqlite3.OperationalError as exc:
                 if not _is_busy(exc):
                     raise
-                return spool()
+                return _spool_native_event(event)
         if state in ("waiting", "retained"):
-            path = spool()
+            path = _spool_native_event(event)
             if state == "retained":
                 raise RuntimeError("additional native conflict retained: " + str(path))
             return path
@@ -783,7 +807,7 @@ def remember_native_event(context: dict, kind: str, data: dict, *, recorded_at=N
 def apply_native(context: dict) -> str | None:
     context = _native.context(context, _legs, marker_hash)
     with _queue_gate() as db:
-        return _native.apply(db, context, _legs)
+        return _native.apply(db, context, _legs, fresh_cleanup=_fresh_gate(db))
 
 
 def execution_status(context: dict) -> dict:

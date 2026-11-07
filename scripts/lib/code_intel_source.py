@@ -35,6 +35,7 @@ MODULES = (
     ("worker", "code_intel_cbm_worker", "scripts/lib/code_intel_cbm_worker.py"),
     ("unit", "codebase_managed_unit", "scripts/lib/codebase_managed_unit.py"),
     ("proof", "_genesis_code_intel_execution", "scripts/lib/code_intel_execution.py"),
+    ("scope", "_genesis_code_intel_scope", "scripts/lib/code_intel_scope.py"),
     ("legacy", "_genesis_index_marker_legacy", "scripts/lib/index_marker_legacy.py"),
     ("legs", "_genesis_index_marker_legs", "scripts/lib/index_marker_legs.py"),
     ("native", "_genesis_index_marker_execution", "scripts/lib/index_marker_execution.py"),

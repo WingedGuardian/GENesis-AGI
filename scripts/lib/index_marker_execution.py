@@ -156,7 +156,7 @@ def reservation(value, claimed):
     if route == "capped" and claimed["provider"] == "gitnexus" and parent == "app-capped.slice":
         return value
     if route == "inherit" and claimed["provider"] == "cbm":
-        return value  # The actual caller Unit.Slice is independently checked at registration.
+        return value  # The trusted producer must independently bind the actual owner's Unit.Slice.
     raise ValueError("native route does not match the reservation")
 
 
@@ -167,7 +167,7 @@ def _conflict(db, row, raw):
     return "conflict"
 
 
-def reserve(db, value, data, legs):
+def reserve(db, value, data, legs, *, fresh_cleanup=None):
     row = execution(db, value, legs)
     raw = encode(data)
     if row["launch_reservation"] is not None:
@@ -177,7 +177,7 @@ def reserve(db, value, data, legs):
     if row["typed_applied_state"] is not None or row["launch_permission"] == "cancelled":
         return "cancelled"
     _owns(db, row)
-    if blocked(db, value["hash"], value["provider"], exclude=row["execution_seq"]):
+    if blocked(db, value["hash"], value["provider"], exclude=row["execution_seq"], fresh_cleanup=fresh_cleanup):
         return "held"
     if ("fast", "moderate", "full").index(data["run_mode"]) < legs.MODES.index(row["mode"]):
         raise ValueError("reservation cannot narrow the claimed workload")
@@ -212,7 +212,7 @@ def _bound_facts(facts, reserved, proof):
         raise ValueError("scope facts do not match reserved kernel ownership")
 
 
-def register(db, value, data, legs, proof):
+def register(db, value, data, legs, proof, *, fresh_cleanup=None):
     _object(data, ("unit", "invocation_id", "facts", "stop_usec"), "scope registration")
     _hex(data["invocation_id"], 32, "scope invocation")
     _integer(data["stop_usec"], "scope stop budget", positive=True)
@@ -227,13 +227,13 @@ def register(db, value, data, legs, proof):
     raw = encode(data)
     if row["scope_registration"] is not None:
         return "already_registered" if bytes(row["scope_registration"]) == raw else _conflict(db, row, raw)
-    if blocked(db, value["hash"], value["provider"], exclude=row["execution_seq"]):
+    if blocked(db, value["hash"], value["provider"], exclude=row["execution_seq"], fresh_cleanup=fresh_cleanup):
         return "held"
     db.execute("UPDATE executions SET scope_registration=? WHERE execution_seq=?", (raw, row["execution_seq"]))
     return "registered"
 
 
-def begin(db, value, data, legs, proof):
+def begin(db, value, data, legs, proof, *, fresh_cleanup=None):
     _object(data, ("source", "executable", "facts", "registration_sha256", "before_ns"), "native intent")
     source_identity(data["source"])
     _integer(data["before_ns"], "native start observation", positive=True)
@@ -260,7 +260,7 @@ def begin(db, value, data, legs, proof):
         db.execute("UPDATE executions SET safety_kind='resource',first_typed_conflict="
                    "coalesce(first_typed_conflict,?) WHERE execution_seq=?", (raw, row["execution_seq"]))
         return "resource"  # Preparation OOM is durable; no indexing intent/debt is fabricated.
-    if blocked(db, value["hash"], value["provider"], exclude=row["execution_seq"]):
+    if blocked(db, value["hash"], value["provider"], exclude=row["execution_seq"], fresh_cleanup=fresh_cleanup):
         return "held"
     db.execute("UPDATE executions SET native_intent=?,launch_permission='spent' WHERE execution_seq=?",
                (raw, row["execution_seq"]))
@@ -453,6 +453,62 @@ def _cleanup_disproved(row):
     return False
 
 
+def owned_oom(data):
+    """Largest validated owned counter; absence never invents a resource cause."""
+    facts = (data["report"]["before"], data["report"]["after"]) if "report" in data else (data.get("facts"),)
+    return max((value["events"]["oom_kill"] for value in facts if value is not None), default=0)
+
+
+def _known_owned_oom(row, legs, proof, retained):
+    """Interpret represented and retained facts for one exact historical subject."""
+    counts = [owned_oom(json.loads(row["scope_registration"]))]
+    if row["native_intent"]:
+        counts.append(owned_oom(json.loads(row["native_intent"])))
+    events = [json.loads(row[key]) for key in ("terminal", "cleanup_proof", "cleanup_first_failure", "first_typed_conflict")
+              if row[key] is not None]
+    value = {key: row[key] for key in legs.CONTEXT}
+    for item in retained:
+        if item["context"] != value:
+            raise ValueError("retained resource evidence has another execution")
+        checked = event(value, item["kind"], item["data"], item["recorded_at"], proof)
+        if not _binding(row, checked, proof):
+            raise ValueError("retained resource evidence lacks its original binding")
+        events.append(checked)
+    counts.extend(owned_oom(item["data"]) for item in events
+                  if item.get("kind") in ("terminal", "cleanup", "cleanup-disproof"))
+    return max(counts)
+
+
+def retain_fresh_cleanup(db, row, legs, proof, *, collect, proc, clock, retained, publish):
+    """Re-read the lifetime and retain owned OOM before any physical release.
+
+    Physical proof is never cached as a recovery override. First proof, completion,
+    debt and invalidation remain unchanged. The facade owns the exclusive barrier
+    and supplies its collector, retained artifacts and durable publisher on this
+    admitted connection; no opener or nested lock belongs here.
+    """
+    registered = json.loads(row["scope_registration"])
+    previous = json.loads(row["cleanup_proof"])["data"]
+    registration_sha256 = digest(registered)
+    owned_wait = previous.get("owned_wait") is True
+    try:
+        data = collect(registered, registration_sha256, proof, owned_wait=owned_wait, proc=proc)
+    except (OSError, ValueError):
+        # Unavailable proof holds this execution while unrelated recovery continues.
+        return False
+    value = {key: row[key] for key in legs.CONTEXT}
+    item = event(value, "cleanup", data, clock(), proof)
+    if not _binding(row, item, proof):
+        return False
+    data, value = item["data"], item["context"]
+    if owned_oom(data) > _known_owned_oom(row, legs, proof, retained):
+        publish(item)
+        record(db, value, item, legs, proof)
+    if data["state"] not in ("quiescent", "removed", "rebooted"):
+        return False
+    return _cleanup_valid({**row, "cleanup_invalidated": 0, "cleanup_proof": encode(item)})
+
+
 def _classification(row):
     terminal = json.loads(row["terminal"]) if row["terminal"] else None
     stop = json.loads(row["first_stop"]) if row["first_stop"] else None
@@ -467,10 +523,10 @@ def _classification(row):
     if terminal:
         report, sealed = terminal["data"]["report"], terminal["data"]["sealed_ns"]
         registered = json.loads(row["scope_registration"])
-        after = report["after"]
-        resource = resource or (after is not None and after["events"]["oom_kill"] > registered["facts"]["events"]["oom_kill"])
+        owned_resource = owned_oom(terminal["data"]) > registered["facts"]["events"]["oom_kill"]
+        resource = resource or owned_resource
         clean = (report["outcome"] == "complete" and report["payload_returncode"] == 0
-                 and terminal["data"]["provider_ok"] and not (after and after["events"]["oom_kill"] > registered["facts"]["events"]["oom_kill"]))
+                 and terminal["data"]["provider_ok"] and not owned_resource)
         before_stop = stop is None or sealed < stop["data"]["observed_ns"]
         if not report["payload_started"] and row["native_intent"] is None:
             completion = "unstarted"
@@ -540,7 +596,13 @@ def record(db, value, item, legs, proof):
     return "recorded"
 
 
-def apply(db, value, legs):
+def _ownership_clear(row, fresh_cleanup=None):
+    if row["cleanup_invalidated"]:
+        return fresh_cleanup is not None and fresh_cleanup(row) is True
+    return _cleanup_valid(row)
+
+
+def apply(db, value, legs, *, fresh_cleanup=None):
     row = execution(db, value, legs)
     if row["completion_kind"] == "unbound":
         return None
@@ -567,7 +629,7 @@ def apply(db, value, legs):
                    "completion_kind=?,safety_kind=? WHERE execution_seq=?",
                    (state, disposition, charged, completion, safety, row["execution_seq"]))
         row = execution(db, value, legs)
-    if _cleanup_valid(row):
+    if _ownership_clear(row, fresh_cleanup):
         db.execute("DELETE FROM inflight WHERE hash=? AND execution_seq=? AND claim_id=?",
                    (row["hash"], row["execution_seq"], row["claim_id"]))
     return row["typed_applied_state"]
@@ -606,30 +668,41 @@ def _drain_one(path, db, legs, proof, hash_repo):
     checked = event(value, item["kind"], item["data"], item["recorded_at"], proof)
     return record(db, value, checked, legs, proof)
 
-def blocked(db, h: str, provider: str, *, exclude=0) -> bool:
-    # Q3 has no recovery override. Q4 adds the approved acceptance watermark;
-    # unresolved repo ownership remains independent of any provider acceptance.
+def _provider_blocked(db, h, provider):
     rows = db.execute(
         "SELECT 1 FROM executions WHERE hash=? AND protocol=3 AND ("
-        "cleanup_invalidated=1 OR completion_kind='unbound' OR "
+        "completion_kind='unbound' OR "
         "(provider=? AND (safety_kind IS NOT NULL OR first_typed_conflict IS NOT NULL))) LIMIT 1",
         (h, provider),
     )
-    if rows.fetchone() is not None:
+    return rows.fetchone() is not None
+
+
+def blocked(db, h: str, provider: str, *, exclude=0, fresh_cleanup=None) -> bool:
+    # Physical cleanup cannot release the independent provider safety hold.
+    if _provider_blocked(db, h, provider):
         return True
-    return any(
-        not _cleanup_valid(dict(row))
-        for row in db.execute(
-            "SELECT * FROM executions WHERE hash=? AND protocol=3 AND execution_seq<>? AND "
+    invalidated = []
+    for record in db.execute(
+            "SELECT * FROM executions WHERE hash=? AND protocol=3 AND (cleanup_invalidated=1 OR (execution_seq<>? AND "
             "(scope_registration IS NOT NULL OR native_intent IS NOT NULL OR "
-            "(launch_reservation IS NOT NULL AND launch_permission IS NOT 'cancelled'))",
+            "(launch_reservation IS NOT NULL AND launch_permission IS NOT 'cancelled'))))",
             (h, exclude),
-        )
-    )
+    ):
+        row = dict(record)
+        if row["cleanup_invalidated"]:
+            invalidated.append(row)
+        elif not _cleanup_valid(row):
+            return True
+    # Finish the SELECT before callbacks retain newly observed resource facts on
+    # these rows. Re-read the safety predicate after those writes as well.
+    if any(not _ownership_clear(row, fresh_cleanup) for row in invalidated):
+        return True
+    return _provider_blocked(db, h, provider)
 
 
-def claim(db, h: str, provider: str, legs):
-    if blocked(db, h, provider):
+def claim(db, h: str, provider: str, legs, *, fresh_cleanup=None):
+    if blocked(db, h, provider, fresh_cleanup=fresh_cleanup):
         return None
     return legs.claim(db, h, provider, protocol=3)
 
@@ -643,7 +716,7 @@ def _finish_pointer(db, row):
         raise RuntimeError("native execution does not own current inflight")
 
 
-def reconcile(db, legs):
+def reconcile(db, legs, *, fresh_cleanup=None):
     """Only unreserved native claims have structural proof of no launch."""
     restored = []
     rows = list(db.execute(
@@ -656,14 +729,14 @@ def reconcile(db, legs):
         if row["completion_kind"] == "unbound":
             continue
         if row["terminal"] is not None or row["first_stop"] is not None or row["cleanup_proof"] is not None:
-            apply(db, value, legs)
+            apply(db, value, legs, fresh_cleanup=fresh_cleanup)
             continue
         if row["typed_applied_state"] is not None:
             continue
         if row["launch_reservation"] is not None and row["launch_permission"] != "cancelled":
             continue  # Reservation/intent recovery requires its bound facts.
         state, disposition, charged = legs._restore(db, row, False)
-        if row["scope_registration"] is None or _cleanup_valid(row):
+        if row["scope_registration"] is None or _ownership_clear(row, fresh_cleanup):
             _finish_pointer(db, row)
         db.execute(
             "UPDATE executions SET completion_kind='unstarted',typed_applied_state=?,"

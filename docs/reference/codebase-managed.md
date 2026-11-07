@@ -740,15 +740,50 @@ removal or a changed boot can establish cleanup, never successful completion.
 Once uncertainty has been settled, later cleanup or terminal evidence cannot
 clear its provider hold; approved supervised release remains separate work.
 Late OOM/conflict evidence cannot refund or repeat a completed execution. Historical
-cleanup disproof remains sticky and conservatively excludes both providers until
-the later real-scope reconciliation path can satisfy its fresh-proof obligation.
+cleanup disproof remains sticky. Every scalar/native claim, reservation,
+registration, native intent and current-pointer reconciliation checks the
+original kernel subtree afresh before releasing its physical hold. This never
+clears provider safety or rewrites completed accounting. Missing counters,
+changed identity or unreadable original roots keep that execution held while
+reconciliation continues for unrelated repositories. Only the collector's
+`OSError`/`ValueError` becomes a hold; decoding and digest failures before
+collection, returned-event validation and durable publication/write errors
+retain their transaction-failure behavior. A newly observed
+owned OOM is durably retained before release, including when the first cleanup
+proof is already occupied; an unchanged counter does not generate repeated
+resource facts. A preparation OOM observed before an admission refusal remains
+resource evidence even when no native intent was recorded.
+The collector samples recursive population before the owned counters, so an OOM
+at the last descendant's exit is retained before physical release. A populated
+sample remains unresolved for that observation even if tasks exit afterward.
+
+Manager registration additionally matches the typed positive `ControlGroupId`
+to the captured leaf inode on 64-bit Linux and requires the leaf's cgroup
+filesystem device to match the original root. An enclosing unit lookup and
+matching scope/slice names alone cannot authorize a deeper delegated leaf.
+Missing or incompatible native identity refuses; there is no basename fallback.
+When the leaf is absent, cleanup checks original ancestor identities from the
+root down. A genuinely deleted branch under an unchanged ancestor can prove
+removal; replaced or unreadable visible ancestors cannot.
+
+The queued observer reports an intent callback's `RuntimeError` as refusal
+before child creation, preserving its type/message in the caller's private
+diagnostics. Errors elsewhere retain their existing behavior. Producers must
+independently bind the actual owner identity and inherited slice, use the
+accepted executable descriptor for the invocation, and close their creation and
+migration paths before cleanup. Descriptor transport alone is not executable
+acceptance; the queue lock does not prevent arbitrary external cgroup migration.
 
 `execution-status --context ...` uses the existing read-only/query-only opener;
 it neither initializes nor imports work. `evidence_pending` reports retained
 typed spools and makes a database-only observation explicitly incomplete.
 Unreserved claims recover neutrally; reserved/may-start work without trustworthy
-completion remains held. This journal does not observe a live kernel scope,
-stop a process, install a watchdog or supply supervised recovery authorization.
+completion remains held. The original-subtree collector reads actual boot,
+mount/root/leaf identity, hierarchical/local counters and recursive population.
+Quiescence also requires retained owned-wait proof; original-subtree removal or
+a changed boot provides a distinct lifetime proof. The typed manager helper
+reads existing unit identities and actual stop policy with a remaining overall
+deadline. These helpers do not create or stop scopes or authorize recovery.
 The queued native producer, actual scope-lifetime barrier and final readiness
 cutover still require their separate implementation and disposable native tests.
 `automatic-ready` remains never-positive. Existing production disablement stays
