@@ -182,7 +182,7 @@ def secrets_path() -> Path:
     """The credentials file this process reads (order: ``genesis.secrets_location``)."""
     from genesis.secrets_location import resolve
 
-    resolved = resolve(environ=os.environ, home=Path.home(), repo_root=repo_root())
+    resolved = resolve(environ=os.environ, repo_root=repo_root())
     logger.debug("secrets_path → %s", resolved)
     return resolved
 

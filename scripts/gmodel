@@ -100,7 +100,7 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 # Resolved as genesis.env.secrets_path() resolves it (src is on sys.path above).
 from genesis.secrets_location import resolve as _resolve_secrets  # noqa: E402
 
-_SECRETS = _resolve_secrets(environ=os.environ, home=Path.home(), repo_root=_REPO_ROOT)
+_SECRETS = _resolve_secrets(environ=os.environ, repo_root=_REPO_ROOT)
 if _SECRETS.is_file():
     try:
         from dotenv import load_dotenv

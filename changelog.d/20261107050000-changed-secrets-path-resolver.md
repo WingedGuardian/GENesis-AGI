@@ -1,1 +1,1 @@
-Centralize secrets-file path resolution across Python and shell readers, preserving legacy installs and explicit overrides while preparing services for an out-of-checkout location.
+- Secrets-file readers and writers in Python and shell now find the file through one shared resolver with the same rule as before: `SECRETS_PATH` if set, otherwise the checkout's `secrets.env`.

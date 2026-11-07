@@ -66,7 +66,7 @@ def _resolve_secrets_file(repo: Path) -> Path:
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.resolve(environ=os.environ, home=Path.home(), repo_root=repo)
+    return module.resolve(environ=os.environ, repo_root=repo)
 
 
 _SECRETS_PATH = _resolve_secrets_file(Path(__file__).resolve().parent.parent)

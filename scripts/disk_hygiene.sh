@@ -590,7 +590,9 @@ rotate_mcp_logs() {
 # one place on the box that holds every credential.
 _load_store_knob() {
     local key="$1"
-    local file="${2:-$(genesis_secrets_path "$REPO_DIR")}"
+    # The checkout's file, not the resolver's: the hook-audit stores' writers
+    # read their directories from it, and this must read the same one.
+    local file="${2:-$REPO_DIR/secrets.env}"
     local line=""
     local val
     [ -f "$file" ] || return 0
@@ -613,7 +615,11 @@ _load_store_knob() {
 # The engine override the decider reads itself.
 prune_camoufox_engines_step() {
     (
-        _load_store_knob XDG_CACHE_HOME "$(genesis_secrets_path "$REPO_DIR")"
+        # An unresolvable override loads nothing: never the checkout's file instead.
+        local _secrets
+        if _secrets="$(genesis_secrets_path "$REPO_DIR")"; then
+            _load_store_knob XDG_CACHE_HOME "$_secrets"
+        fi
         prune_browser_engines "${XDG_CACHE_HOME:-$HOME/.cache}/camoufox"
     )
 }

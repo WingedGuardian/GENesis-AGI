@@ -143,7 +143,7 @@ from genesis.secrets_location import resolve as _resolve_secrets  # noqa: E402
 
 # Resolved as genesis.env.secrets_path() resolves it.
 _PHASES.mark("dotenv")
-load_dotenv(_resolve_secrets(environ=os.environ, home=Path.home(), repo_root=REPO_DIR))
+load_dotenv(_resolve_secrets(environ=os.environ, repo_root=REPO_DIR))
 
 # Skip in dispatched sessions (bridge, reflection, surplus)
 if os.environ.get("GENESIS_CC_SESSION") == "1":

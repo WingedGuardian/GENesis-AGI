@@ -617,11 +617,11 @@ def test_a_server_running_another_trees_script_is_not_main(proc_root, repo, tmp_
 
 
 def test_the_default_secrets_file_is_main_checkouts(proc_root, repo, tmp_path, main_venv):
-    """With a known HOME and no overrides, a legacy-only install still loads
-    main's secrets.env, proven by selection history and ctime against start."""
+    """No SECRETS_PATH and no GENESIS_REPO_ROOT: the server loads main's own
+    secrets.env, which the census proves by its ctime against the start."""
     r, _, _ = repo
     (r / "secrets.env").write_text("OTHER=1\n")
-    env = {"GENESIS_DB_PATH": str(tmp_path / "live.db"), "HOME": str(tmp_path)}
+    env = {"GENESIS_DB_PATH": str(tmp_path / "live.db")}
     p = _census_one(proc_root, repo, tmp_path, main_venv, env, secrets=False)
     assert p["telemetry_off"] is False
     # Changed after the server started (a fresh /proc with an earlier start): unknown.

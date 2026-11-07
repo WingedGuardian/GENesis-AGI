@@ -97,7 +97,8 @@ cd "$REPO_DIR" || { _log "repo directory $REPO_DIR is unreachable"; exit 75; }
 # oneshot must provision where it launches from. By name only: no other secret
 # reaches the downloaders. Last assignment wins, as in systemd's own reader.
 # shellcheck source=lib/secrets_path.sh
-. "$REPO_DIR/scripts/lib/secrets_path.sh"
+# From this script's own tree, not REPO_DIR (which may name another checkout).
+. "$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/secrets_path.sh"
 SECRETS_FILE="$(genesis_secrets_path "$REPO_DIR")"
 _load_browser_setting() {
     local key="$1" line="" val

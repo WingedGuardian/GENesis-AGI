@@ -791,8 +791,25 @@ class TestAuditFindings:
         """The two resolvers are a REPLICA — a hook is stdlib-only and cannot
         import `genesis.env` — so the only defence is that they are checked
         against each other rather than maintained in parallel from memory."""
+        import re as _re
+
         from genesis.env import secrets_path
 
+        # Every override name the resolver reads must be one the guard reads.
+        src = (
+            Path(__file__).resolve().parents[2] / "src" / "genesis" / "secrets_location.py"
+        ).read_text(encoding="utf-8")
+        names = set(_re.findall(r"environ\.get\(\s*[\"'](\w+)[\"']", src))
+        assert names, "could not read the resolver's override — this test is checking nothing"
+        guard = (_HOOKS / "secrets_target.py").read_text(encoding="utf-8")
+        missing = sorted(n for n in names if f'"{n}"' not in guard)
+        assert not missing, (
+            f"the resolver honours {missing}, which secrets_target.py does not read. "
+            "An override the runtime obeys and the guard ignores is a credentials "
+            "file outside the gate."
+        )
+
+        # And the file the runtime resolves under that override is gated.
         relocated = tmp_path / "vault" / "credentials.prod"
         relocated.parent.mkdir()
         relocated.write_text("SYNTHETIC_KEY=value\n")
