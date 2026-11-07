@@ -3817,8 +3817,11 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, _config_overlay.py, caller_context.py, caller_credentials.py]
-verified: 973a0e6 2026-10-30
+verified: 064a1e9d8 2026-11-07
 ```
+
+The 2026-11-07 verification covers the request-ownership prerequisite below;
+the other platform descriptions retain their individually cited verification dates.
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
 provider/model/outcome. Failed historical attempts render as a warning, not an
@@ -3991,6 +3994,15 @@ Refusing a proposed update preserves a previously valid opt-in.
   foreground-only construction allocates neither. Background admission is
   separate from foreground capacity; recall queue pressure falls back inline
   while shutdown refuses new resource work (source checked 2026-11-06).
+  `begin_draining`/explicit-grace `drain` extend the same registry; `close`
+  initiates zero-grace shutdown and concurrent callers join the first policy.
+  `run_in_thread` retains actual synchronous completion independently of an
+  asyncio proxy, including joined-child work, before DB finalization/admission
+  release. Ambiguous submission/canceled-before-start work retains its claim and
+  fails shutdown; dependent provider closure requires positive settlement.
+  `run_resource_thread` preserves ordinary legacy thread cancellation. These are
+  internal prerequisites; memory-consumer migration and shared factory wiring
+  remain separate. Lease budgets bound database connections, not executor items.
   Activity, embedding-heartbeat, deferred-recall, bookmark and proactive tasks use it;
   legacy connections keep ordinary task scheduling. Internal
   `initialize_request_service` bootstraps memory/health/recon/outreach with
