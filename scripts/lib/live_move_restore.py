@@ -1,4 +1,5 @@
-"""What a restore of a live-move repair report may write (#3492 PR B1).
+"""The restore of a live-move repair report: what it may write (#3492 PR
+B1, ``check``) and the writes (PR B2b, ``restore``).
 
 A kit source beside live_move_repair.py, loaded by it from the same directory
 (as it loads the guard), standard library only. ``check`` validates a report's
@@ -12,7 +13,8 @@ flag. A part is
   tag directory, the tag's paths in it, other untracked files aside; an empty
   directory for a gitlink; or nothing), so writing the saved state loses
   nothing git cannot give back;
-- ``already-restored``: it holds the saved state (a re-run converges);
+- ``already-restored``: it holds the saved state, every saved copy compared
+  still the one SAVED.json records (a re-run converges);
 - ``other:<reason>``: anything else, which the restore must leave alone.
 
 An as-left part may be written only when, at and below and above its path,
@@ -22,19 +24,24 @@ restored (``index-changed``: the #3721 Codex P1 case, a file staged below),
 no index entry sits at a parent (``index-above``), no parent is a symlink or a
 non-directory (``link-parent``: decided first, before anything below it is
 read), and no newer report holds an overlapping path (``newer-report``). A
-parent that is this report's own row, already put back, is neither an
-``index-above`` nor a ``link-parent`` for its child. An index part whose blob
-is neither saved nor in the object store is ``not-saved``. A directory row is
-never restored whole: its saved copy can hold the update's own files, so it
-lists as ``entry`` parts only the saved files whose bytes are not the move
-target's (when the target cannot be read, only those that are foreign rows
-themselves). It writes no report and no backup."""
+parent that is this report's own row, already put back (or, for an index
+entry, one the same restore replaces), is neither an ``index-above`` nor a
+``link-parent`` for its child. An index part whose blob is neither saved nor
+in the object store is ``not-saved``. A directory row's saved copy can hold
+the update's own files, so it lists as ``entry`` parts only the saved files
+whose bytes are not the move target's (when the target cannot be read, only
+those that are foreign rows themselves); the restore builds the directory
+from those. A node part a killed restore left half-done reads as-left by
+the resume rule (Judge._resume), and so does the S a restore killed between
+a both-flags entry's two writes left. ``check`` writes nothing; ``restore`` writes
+only parts judged as-left, each self-verifying (see _Writer)."""
 
 from __future__ import annotations
 
 import bisect
 import calendar
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -207,8 +214,9 @@ def _saved(rp, backup: str) -> tuple[str | None, dict | None]:
     writer wrote. Opened as load_report opens REPAIR.json: no symlink followed,
     no FIFO blocked on, a regular file of at most SAVED_BYTES, holding exactly
     {files, complete}: `tree/<path>` keys and the writer's three record
-    shapes. Only the shape: whether a copy still matches its record the
-    restore checks as it copies it."""
+    shapes. Only the shape here: whether a copy still matches its record the
+    judge checks before it reads a part already-restored (Judge._kept), and the
+    restore again as it copies it."""
     try:
         flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
         fd = os.open(os.path.join(backup, "SAVED.json"), flags)
@@ -373,11 +381,29 @@ class _Budget:
 
 
 class Judge:
-    def __init__(self, rp, repo: str, backup: str, loaded: dict, newer: dict) -> None:
+    """``records``: SAVED.json's files (a FIFO's restored mode is its record's;
+    None for a report written before it, which only --check judges).
+    ``runs``: deploy-backups as read (restore run folders, for the resume rule),
+    ``shown`` as named in output; ``fd`` the descriptor ``runs`` names, handed
+    to git when it reads an aside. ``strict``: the restore's write gate (a tag
+    directory moved aside may hold no extra file git does not ignore)."""
+
+    def __init__(self, rp, repo: str, backup: str, loaded: dict, newer: dict, *, records=None,
+                 runs=None, shown=None, strict=False, fd=None) -> None:  # fmt: skip
         self.rp, self.repo, self.backup = rp, repo, backup
         self.budget, self.blockers = _Budget(rp), set()
-        self.notes = {}
+        # _kept re-reads saved copies the walk already read once: its own budget,
+        # so the integrity check never spends the walk's and turns a directory
+        # that restored correctly into other:too-large.
+        self.kept_budget = _Budget(rp)
         report, self.rows = loaded["report"], loaded["rows"]
+        self.records, self.runs, self.shown, self.strict = records or {}, runs, shown, strict
+        self.integrity, self.git_dir = records is not None, None
+        self.fds = () if fd is None else (fd,)
+        self.record_keys = sorted(self.records)  # _dir's per-row range, by bisect
+        block = restore_block(report)
+        self.inflight = block["inflight"] if block else None
+        self.notes, self.dirs, self.entry_of, self.resumed = {}, {}, {}, None
         self.fmt = rp._out(repo, "rev-parse", "--show-object-format")
         self.head = rp._tree(repo, "HEAD")
         self.tag = rp._tree(repo, report["tag"])
@@ -387,6 +413,7 @@ class Judge:
             self.target = None
         self.index, self.flags = rp._index_state(repo)
         self.foreign = {r["path"]: r for r in self.rows if r["class"] == "foreign"}
+        self.by_path = {r["path"]: r for r in self.rows}
         self.tag_dirs = {d for q in self.tag for d in rp._parents(q)}
         self.tag_sorted = sorted(self.tag)
         self.whole = {r["path"] for r in self.rows if r["disk"] == "dir" and r["disk_changed"]}
@@ -407,6 +434,17 @@ class Judge:
     def _index_back(self, q: str) -> bool:
         """Does the index at ``q`` hold what this report's row there saved?"""
         return q in self.foreign and self.index.get(q, []) == self._saved_index(self.foreign[q])
+
+    def _replaced(self, d: str) -> bool:
+        """Is the index at ``d`` the tag's, as the repair left it, at a row of
+        this report that saved something else there (so the restore's one
+        update-index call takes it away; it checks that call's footprint)?"""
+        row, now = self.by_path.get(d), self.index.get(d, [])
+        return (
+            row is not None
+            and now == self.rp._as_index(self.tag.get(d))
+            and (self._saved_index(row) != now)
+        )
 
     def _index_part(self, row: dict) -> bool:
         return self._saved_index(row) != self.rp._as_index(self.tag.get(row["path"]))
@@ -492,22 +530,116 @@ class Judge:
             i += 1
         return out
 
-    def _left(self, p: str, whole: bool = True) -> bool:
-        """Does the disk hold what the repair left at ``p``: the tag's? A tag
-        directory is compared on the tag's own paths only (the repair never
-        removes an untracked file there that is not a row), and only for a
-        node part (``whole``); an index or flag part needs only the directory."""
-        t = self.tag.get(p)
+    def _ignored(self, paths: list[str], aside: str | None = None, below: str = "") -> set:
+        """Which of ``paths`` git ignores: one `check-ignore`; none when it fails.
+        ``aside``: a root holding the directory ``below`` moved out of the
+        checkout (#3986 review, finding 3). Its own ignore rules moved with it,
+        so a rule inside it (git's most specific) decides, read in the aside;
+        else the checkout's rules outside it do."""
+        if not paths:
+            return set()
+        if aside is None:
+            p = self._check_ignore(["-C", self.repo], paths, verbose=False)
+            return set(self.rp._z(p.stdout)) if p.returncode in (0, 1) else set()
+        if self.git_dir is None:
+            self.git_dir = self.rp._out(self.repo, "rev-parse", "--absolute-git-dir", check=False)
+        inner = self._rules(["-C", aside, "--git-dir", self.git_dir, "--work-tree", aside], paths)
+        outer = self._rules(["-C", self.repo], paths)
+        out = set()
+        for q in paths:
+            src, pat = inner.get(q, ("", ""))
+            if not src.startswith(below + "/"):
+                src, pat = outer.get(q, ("", ""))
+                if src.startswith(below + "/"):  # a node the restore put there: not the aside's
+                    continue
+            if pat and not pat.startswith("!"):
+                out.add(q)
+        return out
+
+    def _rules(self, where: list[str], paths: list[str]) -> dict:
+        """`check-ignore -v -n`: path -> (source, pattern) of the last rule
+        matching it (a negation starts with "!"); {} when it fails."""
+        p = self._check_ignore(where, paths, verbose=True)
+        if p.returncode not in (0, 1):
+            return {}
+        f = [os.fsdecode(x) for x in p.stdout.split(b"\0")]
+        return {f[i + 3]: (f[i], f[i + 2]) for i in range(0, len(f) - 3, 4)}
+
+    def _check_ignore(self, where: list[str], paths: list[str], verbose: bool):
+        # An aside below /proc/self/fd/N is only reachable by git through fd N.
+        return subprocess.run(
+            ["git", *self.rp.GIT_C, *where, "check-ignore", "-z", "--stdin",
+             *(("-v", "-n") if verbose else ())],
+            input=b"".join(os.fsencode(q) + b"\0" for q in paths),
+            capture_output=True,
+            env=_git_env(),
+            pass_fds=self.fds,
+        )  # fmt: skip
+
+    def left_is_node(self, p: str) -> bool:
+        """Did the repair leave a node at ``p`` (a tag entry, a gitlink's
+        directory or a tag directory), rather than nothing?"""
+        return p in self.tag or p in self.tag_dirs
+
+    def _left(self, p: str, whole: bool = True, root: str | None = None, strict=False) -> bool:
+        """Does ``root`` (the checkout; a run's aside) hold what the repair left
+        at ``p``: the tag's? A tag directory is compared on the tag's own paths
+        only (the repair never removes an untracked file there that is not a
+        row), and only for a node part (``whole``); an index or flag part needs
+        only the directory. ``strict`` (the restore moves the whole directory
+        aside, review SF-D): every other file in it must be one git ignores."""
+        root, t = root or self.repo, self.tag.get(p)
         if t and t[0] == "160000":
-            return self._real_dir(self.repo, p) and self._walk(self.repo, p) == {}
+            return self._real_dir(root, p) and self._walk(root, p) == {}
         if t is None and p in self.tag_dirs:
-            return self._real_dir(self.repo, p) and (
-                not whole
-                or all(
-                    self._state(self.repo, f"{p}/{q}") == e for q, e in self._tag_below(p).items()
-                )
+            if not self._real_dir(root, p) or not whole:
+                return self._real_dir(root, p)
+            tagged = self._tag_below(p)
+            if not strict:
+                return all(self._state(root, f"{p}/{q}") == e for q, e in tagged.items())
+            have = self._walk(root, p)
+            extra = [f"{p}/{q}" for q in have if q not in tagged]
+            aside = None if root == self.repo else root
+            return all(have.get(q) == e for q, e in tagged.items()) and (
+                set(extra) <= self._ignored(extra, aside, p)
             )
-        return self._state(self.repo, p) == t
+        return self._state(root, p) == t
+
+    def _resume(self, p: str) -> bool:
+        """The resume rule (review item 1, B-1, SF-C, SF-E): a restore killed
+        after moving the node at ``p`` aside left the path empty. It reads
+        as-left when REPAIR.json's in-flight part is this node, the path is
+        absent (no link parent), the run folder and every folder the restore
+        made under its aside/ are this user's alone (0700: no other account
+        can have planted the aside; the aside itself, the checkout's own node,
+        is only checked for its owner), and the aside is the as-left state."""
+        inf = self.inflight
+        if not inf or inf[1] != p or self.runs is None:
+            return False
+        if self.rp._link_parent(self.repo, p) or os.path.lexists(os.path.join(self.repo, p)):
+            return False
+        aside = os.path.join(self.runs, inf[0], "aside")
+        made = [os.path.dirname(aside), aside] + [
+            os.path.join(aside, d) for d in self.rp._parents(p)
+        ]
+        try:
+            for d in made:
+                st = os.lstat(d)
+                if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
+                    return False
+            if os.lstat(os.path.join(aside, p)).st_uid != os.geteuid():
+                return False
+        except OSError:
+            return False
+        if self._left(p, root=aside, strict=True):
+            self.notes[(p, "node")] = (
+                f"interrupted restore; the replaced copy is in {os.path.join(self.shown, inf[0])}"
+            )
+            self.resumed = p
+            return True
+        where = os.path.join(self.shown, inf[0], "aside", p)
+        self.notes[(p, "node")] = f"newer content kept at {where}"
+        return False
 
     def _saved_node(self, row: dict):
         """(is it saved, the saved node) of a non-directory row's disk part."""
@@ -515,6 +647,8 @@ class Judge:
         if row["saved_as"]:
             saved = self._state(self.backup, row["saved_as"])
             return saved is not None, saved
+        if special and special["type"] == "fifo":
+            return True, _fifo(special["mode"])
         return True, (special["type"], special["mode"]) if special else None
 
     def _link(self, row: dict) -> str | None:
@@ -524,6 +658,11 @@ class Judge:
         child the writer saw beyond it (a killed restore must converge)."""
         d = self.rp._link_parent(self.repo, row["path"])
         if d is None:
+            return None
+        if d in self.whole and self._left(d):
+            # A directory row's path, still the tag's non-directory the repair
+            # left there: this row is covered by it (index and flag parts only,
+            # nothing read below), and the restore writes that directory first.
             return None
         parent = self.foreign.get(d)
         if parent and row["unreachable_through"] == d and parent["disk"] != "dir":
@@ -549,9 +688,11 @@ class Judge:
         if (hit := self.newer.which(p, parents)) is not None:
             self.blockers.add(self.newer_ts[hit])
             return "newer-report"
-        # An entry above that this report's own row put back is the writer's
-        # order (parents first), never a refusal of its child.
-        if any(not self._index_back(d) for d in self.index.keys() & set(parents)):
+        # An entry above that this report's own row put back, or one its row's
+        # index part replaces in the same update-index call (the restore checks
+        # that call's whole footprint first), is never a refusal of its child.
+        if any(not self._index_back(d) and not self._replaced(d)
+               for d in self.index.keys() & set(parents)):  # fmt: skip
             return "index-above"
         if self.dirty.overlaps(p, parents):
             return "index-changed"
@@ -575,8 +716,43 @@ class Judge:
         ok, saved = self._saved_node(row)
         if not ok:
             return "other:not-saved"
-        done = lambda: self._state(self.repo, p) == saved  # noqa: E731
-        return self._verdict(link, done, gate, lambda: self._left(p))
+        rel = row["saved_as"]
+        done = lambda: self._state(self.repo, p) == saved and (not rel or self._kept(rel))  # noqa: E731
+        return self._verdict(link, done, gate, lambda: self._as_left(p))
+
+    def _kept(self, rel: str) -> bool:
+        """Is the backup's copy at ``rel`` the one SAVED.json records (#3986
+        review, finding 1)? A copy changed to match the checkout is not the
+        saved state, so nothing reads already-restored from it (and the
+        writer's staging check refuses it). A file recorded with no hash cannot
+        be told apart, so it never is either. A report written before SAVED.json
+        has nothing to check against (only --check judges one)."""
+        if not self.integrity:
+            return True
+        rec, full = self.records.get(rel), os.path.join(self.backup, rel)
+        try:
+            if rec is None or rec["type"] == "symlink":
+                return rec is not None and os.readlink(full) == rec["target"]
+            if rec["type"] == "fifo":
+                return stat.S_ISFIFO(os.lstat(full).st_mode)
+            if rec["sha256"] is None:
+                return False
+            fd = os.open(full, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+            try:
+                st, h = os.fstat(fd), hashlib.sha256()
+                if not stat.S_ISREG(st.st_mode):
+                    return False
+                self.kept_budget(st.st_size)
+                while chunk := os.read(fd, 1 << 20):
+                    h.update(chunk)
+            finally:
+                os.close(fd)
+        except OSError:
+            return False
+        return h.hexdigest() == rec["sha256"]
+
+    def _as_left(self, p: str) -> bool:
+        return self._left(p, strict=self.strict) or self._resume(p)
 
     def _dir(self, row: dict, link, gate: str | None) -> list[tuple[str, str, str]]:
         """A directory row: its node, then each saved entry the restore would write."""
@@ -584,7 +760,19 @@ class Judge:
         if not self._real_dir(self.backup, row["saved_as"]):
             return [(p, "node", "other:not-saved")]
         restore, kept, unread = {}, {}, []
-        for q, s in self._walk(self.backup, row["saved_as"]).items():
+        saved = self._walk(self.backup, row["saved_as"])
+        # #3986 review: every copy SAVED.json records below the row must still
+        # be there, or the restore would write the rest and clear the report.
+        prefix, keys = row["saved_as"] + "/", self.record_keys
+        i = bisect.bisect_left(keys, prefix)
+        while i < len(keys) and keys[i].startswith(prefix):
+            if keys[i][len(prefix) :] not in saved:
+                return [(p, "node", "other:not-saved")]
+            i += 1
+        for q, s in saved.items():
+            rec = self.records.get(f"{row['saved_as']}/{q}")
+            if s and s[0] == "fifo" and rec and rec["type"] == "fifo":
+                s = _fifo(rec["mode"])  # what the restore makes: the record's mode
             if self.target is not None and s == self.target.get(f"{p}/{q}"):
                 kept[q] = s  # the update's own bytes
             elif self.target is not None or f"{p}/{q}" in self.foreign:
@@ -596,11 +784,18 @@ class Judge:
             if not self._real_dir(self.repo, p):
                 return False
             have, tagged = self._walk(self.repo, p), self._tag_below(p)
-            return all(have.get(q) == s for q, s in restore.items()) and all(
-                s in (restore.get(q), kept.get(q), tagged.get(q)) for q, s in have.items()
-            )
+            if not all(have.get(q) == s for q, s in restore.items()):
+                return False
+            if not all(self._kept(f"{row['saved_as']}/{q}") for q in restore):
+                return False  # #3986 review: the copies are the ones SAVED.json records
+            # Review SF-6: a file git ignores (the server's __pycache__) is no change.
+            extra = [f"{p}/{q}" for q, s in have.items()
+                     if s not in (restore.get(q), kept.get(q), tagged.get(q))]  # fmt: skip
+            return set(extra) <= self._ignored(extra)
 
-        v = self._verdict(link, done, gate, lambda: self._left(p))
+        self.dirs[p] = restore
+        v = self._verdict(link, done, gate, lambda: self._as_left(p))
+        self.entry_of.update((f"{p}/{q}", p) for q in restore)
         out = [(p, "node", v)] + [(f"{p}/{q}", "entry", v) for q in sorted(restore)]
         out += [(q, "entry", "other:target-unreadable") for q in sorted(unread)]
         return out + [(u["path"], "entry", "other:cannot-make") for u in row["unsaved"]]
@@ -645,20 +840,51 @@ class Judge:
             out.append((p, "index", v))
         if row["flag"]:
             flag = self.flags.get(p)
+            # The restore sets skip-worktree, then assume-unchanged: one killed
+            # between the two left S where s was saved, its own half (#3986 review).
+            half = (None, "S") if row["flag"] == "s" else (None,)
             v = self._part(
                 lambda: self._verdict(
-                    link, lambda: flag == row["flag"], gate, lambda: left(lambda: flag is None)
+                    link, lambda: flag == row["flag"], gate, lambda: left(lambda: flag in half)
                 )
             )
             out.append((p, "flag", v))
         return out
 
 
+# ── the restore (#3492 PR B2b) ──────────────────────────────────────────────
+
+RUN_SUFFIX = "-live-move-restore"
+#: A restore run's folder under deploy-backups: its UTC time, its pid.
+RUN_NAME = re.compile(r"[0-9]{8}T[0-9]{6}Z-[0-9]+" + re.escape(RUN_SUFFIX))
 _DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
+def _fifo(mode: str) -> tuple[str, str]:
+    """A FIFO's state as the restore makes it: the mode without setuid, setgid, sticky."""
+    return "fifo", f"{int(mode, 8) & 0o777:04o}"
+
+
+def restore_block(report: dict) -> dict | None:
+    """REPAIR.json's `restore` block when it is exactly what restore() writes,
+    {inflight: [run, path, "node"] | None, refused: int, restored_at: str |
+    None}; else None (and a malformed one never resumes anything)."""
+    b = report.get("restore")
+    if not isinstance(b, dict) or set(b) != {"inflight", "refused", "restored_at"}:
+        return None
+    inf = b["inflight"]
+    if inf is not None and not (
+        isinstance(inf, list) and len(inf) == 3 and isinstance(inf[0], str)
+        and RUN_NAME.fullmatch(inf[0]) and _path(inf[1]) and inf[2] == "node"
+    ):  # fmt: skip
+        return None
+    if type(b["refused"]) is not int or b["refused"] < 0:
+        return None
+    return b if b["restored_at"] is None or isinstance(b["restored_at"], str) else None
+
+
 class _Whole(Exception):
-    """The whole report refused, by name, before anything is judged."""
+    """The whole report refused, by name, before anything is written."""
 
 
 def _mine(st: os.stat_result, link: bool = False) -> bool:
@@ -712,14 +938,14 @@ def _origin(root: str, name: str) -> None:
                 raise _Whole(f"other:not-owned {json.dumps(rel)[:200]}")
 
 
-def _open(rp, repo: str, home: str, ts: str, say):
-    """Every gate a --restore TS --check run passes before it judges: the ts,
-    the origin rule, the loader, the validators, the integrity record (a
+def _open(rp, repo: str, home: str, ts: str, say, write: bool):
+    """Every gate a --restore TS run passes before it judges or writes: the
+    ts, the origin rule, the loader, the validators, the integrity record (a
     restore refuses a report without one whole, review N-3), no node part
     below another (review LOW-2: the writer never writes one), the newer
     reports, then B1's judge. (judge, parts, loaded, ctx), or an exit code
     once it has said why."""
-    nothing = "nothing judged"
+    nothing = "nothing was written" if write else "nothing judged"
     shown = os.path.join(home, "deploy-backups")
     try:
         _order(ts)
@@ -735,9 +961,9 @@ def _open(rp, repo: str, home: str, ts: str, say):
         return 1
     root = f"/proc/self/fd/{bfd}"
     ctx = types.SimpleNamespace(bfd=bfd, root=root, shown=shown, ts=ts, name=ts + rp.SUFFIX)
-    ctx.backup = os.path.join(root, ctx.name)
+    ctx.backup, ctx.shown_backup = os.path.join(root, ctx.name), os.path.join(shown, ctx.name)
     try:
-        got = _judged(rp, repo, ctx, say)
+        got = _judged(rp, repo, ctx, say, write, nothing)
     except BaseException:
         os.close(bfd)
         raise
@@ -748,7 +974,7 @@ def _open(rp, repo: str, home: str, ts: str, say):
     return got
 
 
-def _judged(rp, repo: str, ctx, say):
+def _judged(rp, repo: str, ctx, say, write: bool, nothing: str):
     """_open's gates past the anchor: (judge, parts, loaded, ctx), or why not."""
     ts, backup = ctx.ts, ctx.backup
 
@@ -768,14 +994,17 @@ def _judged(rp, repo: str, ctx, say):
         return f"other:unreadable ({exc})"
     if why := problem(loaded, rp.REPORT_BYTES, rp._parents):
         return f"other:bad-report ({why})"
-    report = loaded["report"]
+    records, report = None, loaded["report"]
     if "integrity" not in report:
+        if write:
+            return "other:no-integrity (written before SAVED.json)"
         say(f"report {ts}: no integrity record (written before SAVED.json); a restore refuses it")
     else:
-        named = report["integrity"]
-        why = saved_problem(rp, backup) if named == "SAVED.json" else "integrity names another file"
+        named = report["integrity"] == "SAVED.json"
+        why, saved = _saved(rp, backup) if named else ("integrity names another file", None)
         if why:
             return f"other:bad-report (SAVED.json: {why})"
+        records = saved["files"]
     nodes = {r["path"] for r in loaded["rows"] if r["class"] == "foreign"
              and r["disk_changed"] and not r["unreachable_through"]}  # fmt: skip
     whole = {r["path"] for r in loaded["rows"] if r["disk"] == "dir" and r["disk_changed"]}
@@ -786,7 +1015,8 @@ def _judged(rp, repo: str, ctx, say):
     if newer is None:
         return f"other:newer-report-unreadable ({why})"
     try:
-        judge = Judge(rp, repo, backup, loaded, newer)
+        judge = Judge(rp, repo, backup, loaded, newer, records=records, runs=ctx.root,
+                      shown=ctx.shown, strict=write, fd=ctx.bfd)  # fmt: skip
     except rp.RepairError as exc:
         return f"other:tree-unreadable (HEAD's or the tag's tree: {exc})"
     try:
@@ -803,7 +1033,7 @@ def _line(path: str, part: str, outcome: str, note: str | None) -> str:
 def check(rp, repo: str, home: str, ts: str, say) -> int:
     """``--restore TS --check``: judge the report ``ts`` names, print one line
     per part and a summary; 0 if every part is as-left or already-restored."""
-    got = _open(rp, repo, home, ts, say)
+    got = _open(rp, repo, home, ts, say, write=False)
     if isinstance(got, int):
         return got
     judge, parts, loaded, ctx = got

@@ -342,6 +342,19 @@ async def test_live_repair_counts_saved_paths_not_reapply_steps(monkeypatch):
     assert "2 saved path(s)" in text and "re-apply" not in text, text
 
 
+async def test_live_repair_shows_the_restore_outcome_quoted(monkeypatch):
+    """#3492 B2b (review NOTE-4): the newest report's `restore` block shows its
+    restored_at and refused count, quoted and bounded; a report with none
+    shows no restore line."""
+    block = {"inflight": None, "refused": 2, "restored_at": "x\x1b[2J" * 50}
+    text = await _collect(monkeypatch, "", _reports(_report(restore=block)))
+    line = next(ln for ln in text.splitlines() if "restore:" in ln)
+    assert "refused 2" in line.replace('"', "") and "\x1b" not in line, line
+    assert len(line) < 200, line
+    text = await _collect(monkeypatch, "", _reports(_report()))
+    assert "restore:" not in text, text
+
+
 async def test_live_repair_journal_lines_are_capped(monkeypatch):
     journal = "".join(f"live-move repair: {i} " + "z" * 5000 + "\n" for i in range(50))
     text = await _collect(monkeypatch, journal, "")
