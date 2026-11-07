@@ -27,6 +27,22 @@ def _fields(raw):
     return raw[:-1].split(b"\0")
 
 
+def test_actual_machine_list_keeps_current_validator_and_atomic_output(queue, tmp_path, monkeypatch, capsys):
+    repo = str(tmp_path / "literal 雪\n")
+    queue.write_marker(repo, "both", "fast")
+    seen = []
+
+    def reject(value):
+        seen.append(value)
+        raise ValueError("fixture current machine validator")
+
+    monkeypatch.setitem(queue._pending_record.__globals__, "_machine_hash", reject)
+    with pytest.raises(ValueError, match="fixture current machine validator"):
+        queue.main(["list-legs", "--nul"])
+    assert seen == [queue.marker_hash(repo)]
+    assert capsys.readouterr().out == ""
+
+
 @pytest.mark.parametrize(
     "name", ["space 雪", "tab\tpath", "line\npath", "trailing\n", "two\n\n", "literal$()'\\"]
 )

@@ -10,8 +10,11 @@ import hashlib
 import json
 import math
 import re
+import sys
 import uuid
 from pathlib import PurePosixPath
+
+import _genesis_index_marker_recovery as recovery
 
 INTEGER_MAX = 2**63 - 1
 FIELDS = (
@@ -34,7 +37,7 @@ def digest(value) -> str:
 
 
 def _identifier(value: str) -> str:
-    if not re.fullmatch(r"[a-z_]+", value):
+    if not re.fullmatch(r"[a-z_][a-z_0-9]*", value):
         raise RuntimeError("unexpected retained queue column")
     return '"' + value + '"'
 
@@ -167,6 +170,7 @@ def _conflict(db, row, raw):
     return "conflict"
 
 
+@recovery.safety_transition
 def reserve(db, value, data, legs, *, fresh_cleanup=None):
     row = execution(db, value, legs)
     raw = encode(data)
@@ -212,10 +216,20 @@ def _bound_facts(facts, reserved, proof):
         raise ValueError("scope facts do not match reserved kernel ownership")
 
 
-def register(db, value, data, legs, proof, *, fresh_cleanup=None):
+def registration_data(data, proof):
+    """One complete shape for live registration and retained startup observations."""
     _object(data, ("unit", "invocation_id", "facts", "stop_usec"), "scope registration")
+    _text(data["unit"], "scope unit")
     _hex(data["invocation_id"], 32, "scope invocation")
     _integer(data["stop_usec"], "scope stop budget", positive=True)
+    if not proof._facts(data["facts"]):
+        raise ValueError("invalid native scope facts")
+    return data
+
+
+@recovery.safety_transition
+def register(db, value, data, legs, proof, *, fresh_cleanup=None):
+    registration_data(data, proof)
     row = execution(db, value, legs)
     _owns(db, row)
     if row["launch_permission"] != "reserved":
@@ -233,6 +247,7 @@ def register(db, value, data, legs, proof, *, fresh_cleanup=None):
     return "registered"
 
 
+@recovery.safety_transition
 def begin(db, value, data, legs, proof, *, fresh_cleanup=None):
     _object(data, ("source", "executable", "facts", "registration_sha256", "before_ns"), "native intent")
     source_identity(data["source"])
@@ -279,7 +294,8 @@ def cancel(db, value, legs):
 def status(db, value, legs):
     row = execution(db, value, legs)
     for name in ("launch_reservation", "scope_registration", "native_intent", "terminal",
-                 "first_stop", "cleanup_first_failure", "cleanup_proof", "first_typed_conflict"):
+                 "first_stop", "cleanup_first_failure", "cleanup_proof", "first_typed_conflict",
+                 *(("control_closure",) if "control_closure" in row else ())):
         if row[name] is not None:
             try:
                 row[name] = json.loads(row[name])
@@ -318,6 +334,8 @@ def event(value, kind, data, recorded_at, proof):
         source_identity(data["source"])
         if type(data["provider_ok"]) is not bool:
             raise ValueError("provider validation must be explicit")
+    elif kind == "control-closure":
+        recovery.control_data(data, sys.modules[__name__], proof)
     elif kind == "stop":
         _object(data, ("reason", "observed_ns", "boot_id", "unit"), "native stop")
         if data["reason"] not in ("pressure_stop", "wall", "cancellation"):
@@ -370,6 +388,8 @@ def _binding(row, item, proof):
     data, kind = item["data"], item["kind"]
     if reserved is None:
         return False  # Keep an out-of-order spool; it is not completion authority.
+    if kind == "control-closure":
+        return recovery.bind_control(row, item, sys.modules[__name__], proof)
     if kind == "stop":
         if data["unit"] != reserved["unit"] or data["boot_id"] != reserved["owner"]["boot_id"]:
             raise ValueError("stop does not name the reserved scope")
@@ -455,6 +475,9 @@ def _cleanup_disproved(row):
 
 def owned_oom(data):
     """Largest validated owned counter; absence never invents a resource cause."""
+    if "startup" in data:
+        startup = data["startup"]
+        return max(owned_oom(startup["scope"]), startup["facts"]["events"]["oom_kill"])
     facts = (data["report"]["before"], data["report"]["after"]) if "report" in data else (data.get("facts"),)
     return max((value["events"]["oom_kill"] for value in facts if value is not None), default=0)
 
@@ -464,8 +487,8 @@ def _known_owned_oom(row, legs, proof, retained):
     counts = [owned_oom(json.loads(row["scope_registration"]))]
     if row["native_intent"]:
         counts.append(owned_oom(json.loads(row["native_intent"])))
-    events = [json.loads(row[key]) for key in ("terminal", "cleanup_proof", "cleanup_first_failure", "first_typed_conflict")
-              if row[key] is not None]
+    events = [json.loads(row[key]) for key in ("terminal", "cleanup_proof", "cleanup_first_failure", "first_typed_conflict", "control_closure")
+              if key in row and row[key] is not None]
     value = {key: row[key] for key in legs.CONTEXT}
     for item in retained:
         if item["context"] != value:
@@ -475,7 +498,7 @@ def _known_owned_oom(row, legs, proof, retained):
             raise ValueError("retained resource evidence lacks its original binding")
         events.append(checked)
     counts.extend(owned_oom(item["data"]) for item in events
-                  if item.get("kind") in ("terminal", "cleanup", "cleanup-disproof"))
+                  if item.get("kind") in ("terminal", "cleanup", "cleanup-disproof", "control-closure"))
     return max(counts)
 
 
@@ -517,6 +540,8 @@ def _classification(row):
     ) else None
     if row["cleanup_first_failure"]:
         safety = safety or "uncertainty"
+    if "control_closure" in row and row["control_closure"] and json.loads(row["control_closure"])["data"]["state"] != "clean":
+        safety = safety or "uncertainty"
     if row["completion_kind"] == "unbound":
         return "unbound", safety or "uncertainty"
     resource = stop and stop["data"]["reason"] == "pressure_stop"
@@ -547,7 +572,14 @@ def _classification(row):
     return completion, safety
 
 
+@recovery.safety_transition
 def record(db, value, item, legs, proof):
+    if item["kind"] == "control-closure":
+        return recovery.record_control(db, value, item, legs, proof, sys.modules[__name__])
+    return _record(db, value, item, legs, proof)
+
+
+def _record(db, value, item, legs, proof):
     row = execution(db, value, legs)
     if not _binding(row, item, proof):
         # Do not invent an absent reservation/registration/intent, and do not
@@ -557,6 +589,9 @@ def record(db, value, item, legs, proof):
         db.execute("UPDATE executions SET completion_kind='unbound' WHERE execution_seq=?", (row["execution_seq"],))
         return "conflict" if represented else "retained"
     kind, raw = item["kind"], encode(item)
+    if kind == "stop" and item["data"]["reason"] == "pressure_stop":
+        db.execute("UPDATE executions SET safety_kind='resource' WHERE execution_seq=?", (row["execution_seq"],))
+        row["safety_kind"] = "resource"
     facts = item["data"].get("facts")
     if kind in ("cleanup", "cleanup-disproof") and facts is not None:
         baseline = json.loads(row["scope_registration"])["facts"]
@@ -597,6 +632,11 @@ def record(db, value, item, legs, proof):
 
 
 def _ownership_clear(row, fresh_cleanup=None):
+    if recovery.control_pending(row):
+        return False
+    if ("control_closure" in row and row["scope_registration"] is None
+            and row["native_intent"] is None and row["launch_permission"] == "cancelled"):
+        return True  # Structural no-future-native permission, not kernel emptiness.
     if row["cleanup_invalidated"]:
         return fresh_cleanup is not None and fresh_cleanup(row) is True
     return _cleanup_valid(row)
@@ -635,17 +675,17 @@ def apply(db, value, legs, *, fresh_cleanup=None):
     return row["typed_applied_state"]
 
 
-def drain(directory, db, legs, proof, hash_repo):
+def drain(directory, db, legs, proof, hash_repo, *, residual=None):
     """Called only with the facade's exclusive barrier and active transaction."""
     pending = sorted(directory.glob(".execution-spool-*.spool"))
     retired = []
     # First publish all representable facts/proofs. Then interpret still-raw
     # hazards against that complete snapshot before any decision can release
     # ownership. Publishers are excluded throughout; no new spool can arrive.
-    for _ in range(2):
+    for phase in range(2):
         retained = []
         for path in pending:
-            state = _drain_one(path, db, legs, proof, hash_repo)
+            state = _drain_one(path, db, legs, proof, hash_repo, residual=residual if phase == 1 else None)
             if state in ("waiting", "retained"):
                 retained.append(path)
             else:
@@ -654,7 +694,7 @@ def drain(directory, db, legs, proof, hash_repo):
     return retired
 
 
-def _drain_one(path, db, legs, proof, hash_repo):
+def _drain_one(path, db, legs, proof, hash_repo, *, residual=None):
     name = re.fullmatch(r"\.execution-spool-([0-9a-f]{16})-([0-9a-f]{32})-[0-9a-f]{32}\.spool", path.name)
     if name is None:
         raise ValueError("invalid native spool filename")
@@ -666,9 +706,15 @@ def _drain_one(path, db, legs, proof, hash_repo):
     if (value["hash"], value["claim_id"]) != name.groups():
         raise ValueError("native spool filename does not own its context")
     checked = event(value, item["kind"], item["data"], item["recorded_at"], proof)
-    return record(db, value, checked, legs, proof)
+    state = record(db, value, checked, legs, proof)
+    if residual is not None and state in ("waiting", "retained"):
+        identity = {key: checked[key] for key in ("version", "kind", "context", "data")}
+        residual.append((value["hash"], value["provider"], checked["kind"], digest(identity)))
+    return state
 
 def _provider_blocked(db, h, provider):
+    if db.execute("PRAGMA user_version").fetchone()[0] == recovery.SCHEMA_VERSION:
+        return recovery.provider_blocked(db, h, provider, sys.modules[__name__])
     rows = db.execute(
         "SELECT 1 FROM executions WHERE hash=? AND protocol=3 AND ("
         "completion_kind='unbound' OR "
@@ -680,7 +726,7 @@ def _provider_blocked(db, h, provider):
 
 def blocked(db, h: str, provider: str, *, exclude=0, fresh_cleanup=None) -> bool:
     # Physical cleanup cannot release the independent provider safety hold.
-    if _provider_blocked(db, h, provider):
+    if recovery.control_blocked(db, h, exclude) or _provider_blocked(db, h, provider):
         return True
     invalidated = []
     for record in db.execute(
@@ -732,17 +778,21 @@ def reconcile(db, legs, *, fresh_cleanup=None):
             apply(db, value, legs, fresh_cleanup=fresh_cleanup)
             continue
         if row["typed_applied_state"] is not None:
+            if _ownership_clear(row, fresh_cleanup):
+                _finish_pointer(db, row)
             continue
         if row["launch_reservation"] is not None and row["launch_permission"] != "cancelled":
             continue  # Reservation/intent recovery requires its bound facts.
         state, disposition, charged = legs._restore(db, row, False)
-        if row["scope_registration"] is None or _ownership_clear(row, fresh_cleanup):
+        if not recovery.control_pending(row) and (row["scope_registration"] is None or _ownership_clear(row, fresh_cleanup)):
             _finish_pointer(db, row)
+        before = execution(db, value, legs)  # Fresh-cleanup callbacks may already have retained safety.
         db.execute(
             "UPDATE executions SET completion_kind='unstarted',typed_applied_state=?,"
             "disposition=?,typed_charged_attempts=?,safety_kind=coalesce(safety_kind,?) WHERE execution_seq=?",
             (state, disposition, charged, "uncertainty" if row["scope_registration"] else None, row["execution_seq"]),
         )
+        recovery.note_transition(db, before, execution(db, value, legs))
         restored.append(row["hash"])
     return restored
 
@@ -758,7 +808,7 @@ def add_commands(sub):
         if name in ("reserve-launch", "register-scope", "begin-native", "remember-native-event"):
             parser.add_argument("--data", required=True)
         if name == "remember-native-event":
-            parser.add_argument("--kind", choices=("terminal", "stop", "cleanup", "cleanup-disproof"), required=True)
+            parser.add_argument("--kind", choices=("terminal", "stop", "cleanup", "cleanup-disproof", "control-closure"), required=True)
 
 
 def dispatch(args, api, proof):

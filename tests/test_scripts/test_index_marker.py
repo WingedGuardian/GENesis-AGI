@@ -159,7 +159,9 @@ def test_newer_schema_fails_loud_instead_of_downgrading(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     im.marker_dir().mkdir(parents=True)
     with closing(sqlite3.connect(im.database_path())) as db:
-        db.execute(f"PRAGMA user_version={im.SCHEMA_VERSION + 1}")
+        # Default startup remains4 while explicit schema5 is supported.
+        future = max(im.SCHEMA_VERSION, im._recovery.SCHEMA_VERSION) + 1
+        db.execute(f"PRAGMA user_version={future}")
         db.commit()
     with pytest.raises(RuntimeError, match="newer than supported"):
         im.list_markers()

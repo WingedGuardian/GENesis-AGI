@@ -1809,6 +1809,22 @@ the shared banner is not an assertion about all concurrent sessions.
   Private sealed handoff checks its caller-bound digest before entry compilation;
   cached local modules refuse. This is not yet the queued shell/watchdog caller
   and supplies no new launch, recovery or automatic-readiness authority.
+  `index_marker_recovery.py` adds explicit transaction-only schema-5 storage,
+  original-owner control completion, persistent provider holds and an exact
+  terminal/control/source acceptance-watermark reader on the same queue.
+  Incomplete startup retains actual child waits as uncertainty, without
+  fabricating registration or native completion. Optional original-scope startup
+  observations preserve owned OOM kills, including the first sample, before
+  duplicate/conflict reduction; clean control cannot erase resource evidence.
+  Default initialization stays4; new native authority requires5, with no live
+  cutover, retry grant, acceptance setter or positive automatic readiness here.
+  Legacy uncertainty preserves original settlement/shared debt and uses
+  non-claim observations for ambiguous pending/reused identities. Common scalar
+  reduction covers reconciliation and embedded outcomes; import batches dedupe
+  provider revision advances. Retained cleanup evidence preserves healthy
+  sibling eligibility after original physical/control release; unresolved extra
+  conflicts remain provider-scoped. Runner and supervised recovery remain
+  separate, unqualified contributions.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
   deletions; native query/client cgroup proof and orphan-scope checks precede
@@ -2153,7 +2169,7 @@ radius) and the container-side Sentinel (CC-driven diagnosis/repair).
 ```yaml subsystem-map
 entry: guardian-sentinel
 modules: [guardian, sentinel]
-verified: 25f3ad876 2026-11-03
+verified: 4721e0d93 2026-11-07
 ```
 
 - **guardian/** is bidirectional: host side (`python -m genesis.guardian`,
@@ -2164,6 +2180,14 @@ verified: 25f3ad876 2026-11-03
   host reconcilers that share its version probe run on any branch).
   Config `~/.genesis/guardian_remote.yaml`; missing → silently
   disabled.
+- **Delivered-alert history (development candidate)**: host `alert/sent_log.py`
+  records successful alert deliveries as displayed text, with two bounded JSONL
+  generations. The read-only `sent-log` gateway and existing container ingestor
+  use a terminal success/count protocol; an unreadable generation fails the
+  whole page. Locked appends sequence timestamps within a 300-second future
+  window; inadmissible clock outliers remain on disk until eligible, with a
+  new bounded stream after a large clock reset. Host redeploy and installed
+  conversation-history verification remain outstanding.
 - **Snapshot deletion window** (`guardian/deletion_window.py`): routine
   snapshot deletions (the superseded healthy snapshot, prune, and what incus
   would expire before the next window) wait for `snapshots.deletion_window`,
@@ -3202,7 +3226,13 @@ verified: 3e27b4794 2026-10-23
   Status reads confined snapshot metadata and reports individual source stat or
   fingerprint errors while continuing; bounded SQL previews and streaming CSV
   preserve full query counts without retaining every result row in Python.
-  Scheduling arrives in a dependent change. Additional backup
+  Source evidence validates the selected original block's ID/hash and reports
+  ambiguous reused IDs without choosing an owner. Its regular-file reader bounds
+  physical records at 1 MiB, withholds oversized/recursive context and reports
+  oversized targets unavailable while retaining search rows and original files.
+  Applicable result envelopes retain their hash eligibility and are scrubbed.
+  Scheduling arrives in a
+  dependent change. Additional backup
   and recovery integration is deferred independently of collection and search.
   Unknown historical content is excluded from content metrics. Views version 24
   preserves missing call/result hashes as unknown and admits ownership from the
@@ -4081,8 +4111,18 @@ Refusing a proposed update preserves a previously valid opt-in.
   separate from foreground capacity; recall queue pressure falls back inline
   while shutdown refuses new resource work (source checked 2026-11-06).
   Activity, embedding-heartbeat, deferred-recall, bookmark and proactive tasks use it;
-  legacy connections keep ordinary task scheduling. Service integration remains
-  a separate prerequisite before shared activation. See
+  legacy connections keep ordinary task scheduling. Internal
+  `initialize_request_service` bootstraps memory/health/recon/outreach with
+  mandatory request middleware even without metrics, awaits outreach schema,
+  and refuses a separate memory read pool, an omitted memory bookmark policy,
+  a dependency holding another database, and detached work (memory or a
+  persisting tracker) without background budgets. Its tracker is bound and optionally
+  warmed once by the owning bootstrap; registration cannot rebind pending flushes
+  or duplicate history. Scoped health supports the standalone status-file service,
+  rejecting runtime snapshot sharing before changing registration. Reinitialization
+  replaces obsolete instrumentation in either DB mode. No CLI or transport
+  selects it yet; caller identity, bookmark policy and shared activation remain
+  separate work. See
   `docs/reference/request-database.md` for lifecycle and failure semantics.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Every
@@ -4653,7 +4693,11 @@ Refusing a proposed update preserves a previously valid opt-in.
   a process holds it, then saved into the backup's `git/` and removed by one
   step, on every path that ends healed; a same-user process whose open files
   cannot be read counts as a holder only if it is a git or the lock is under
-  30 s old, so a non-git process that cannot be inspected and holds a lock
+  30 s old, is not exiting (the kernel's PF_EXITING flag: such a process
+  runs no user code again), and stays the same process, still unreadable,
+  across three re-checks about 0.15 s apart, so a git that is passing through
+  does not keep a stale lock (#4001; `stale_index_lock.py` applies the same
+  rule); a non-git process that cannot be inspected and holds a lock
   longer than that has it judged stale), every path of the two-dot diff, plus
   a symlink or non-directory parent of one (nothing is read or removed through
   such a parent), plus every index entry under one of those and every index
