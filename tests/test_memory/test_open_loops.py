@@ -292,3 +292,50 @@ def test_anchor_prefix_matches_the_reapers_writer():
     ]
     assert values == [open_loops._REAPER_ANCHOR_PREFIX]
     assert _ANCHOR_REASON.startswith(open_loops._REAPER_ANCHOR_PREFIX)
+
+
+def test_real_git_archive_reasons_agree_with_reaper_parser(tmp_path):
+    """Read real porcelain; the writer's full parser is the archive oracle."""
+    import ast
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[2] / "scripts/worktree_lifecycle.py"
+    tree = ast.parse(source.read_text())
+    nodes = [
+        node for node in tree.body
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                getattr(target, "id", None) in {"ARCHIVE_LOCK_PREFIX", "ARCHIVE_LOCK_SUFFIXES"}
+                for target in node.targets
+            )
+        ) or (
+            isinstance(node, ast.FunctionDef)
+            and node.name in {"_archive_lock_reason", "_archive_entry_from_reason"}
+        )
+    ]
+    oracle = {}
+    # Only the trusted writer's constants and two pure functions enter the oracle.
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), oracle)  # noqa: S102
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "init")
+    live = tmp_path / "live"
+    _git(repo, "worktree", "add", "-q", "-b", "topic", str(live))
+    reasons = [
+        "archived by the reaper -> manual hold",
+        _ANCHOR_REASON + " (manual)",
+        "closing queue: in use",
+    ]
+    for entry in ("valid", "a;b", "tab\tentry", "quote\"entry", "", ".", "..", "../other"):
+        for failed in (False, True):
+            reasons.append(oracle["_archive_lock_reason"](entry, recovery_failed=failed))
+    for reason in reasons:
+        _git(repo, "worktree", "lock", "--reason", reason, str(live))
+        try:
+            expected_live = oracle["_archive_entry_from_reason"](reason) is None
+            actual_live = any(w["path"] == str(live) for w in open_loops._list_worktrees(repo))
+            assert actual_live is expected_live, repr(reason)
+        finally:
+            _git(repo, "worktree", "unlock", str(live))

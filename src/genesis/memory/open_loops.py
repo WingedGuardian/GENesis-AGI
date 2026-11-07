@@ -153,9 +153,13 @@ def _list_worktrees(repo_root: Path) -> list[dict]:
 #     archived by the reaper -> <entry>; recover with --recover
 # It archives a worktree's directory and keeps the registration LOCKED as the
 # history anchor, so `git worktree list` keeps reporting it. The script is not
-# importable, so the prefix is restated (as in
+# importable, so the complete reason format is restated (as in
 # ``session_awareness/zero_drop_worker.py``).
 _REAPER_ANCHOR_PREFIX = "archived by the reaper -> "
+_REAPER_ANCHOR_SUFFIXES = (
+    "; recover with --recover",
+    "; recovery did not complete, still recoverable with --recover",
+)
 
 
 def _is_live(wt: dict) -> bool:
@@ -164,9 +168,16 @@ def _is_live(wt: dict) -> bool:
     (sessions lock worktrees they are using)."""
     # Without -z, porcelain C-quotes a reason containing special characters, so
     # a quoted anchor reason starts with '"'.
-    reason = (wt.get("locked") or "").removeprefix('"')
+    reason = wt.get("locked") or ""
+    if reason.startswith('"') and reason.endswith('"'):
+        reason = reason[1:-1]
     if reason.startswith(_REAPER_ANCHOR_PREFIX):
-        return False
+        rest = reason[len(_REAPER_ANCHOR_PREFIX):]
+        for suffix in _REAPER_ANCHOR_SUFFIXES:
+            if rest.endswith(suffix):
+                entry = rest[:-len(suffix)]
+                if entry and entry not in (".", "..") and "/" not in entry and "\0" not in entry:
+                    return False
     return os.path.isdir(wt.get("path", ""))
 
 
