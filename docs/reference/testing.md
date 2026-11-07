@@ -1,5 +1,16 @@
 # Testing Guide
 
+The standalone rollout CLI and captured deploy source are exercised with real
+`python -I -S` subprocesses in `tests/test_scripts/test_mcp_rollout_config.py`,
+`test_mcp_rollout_failures.py`, and `test_mcp_rollout_repair.py`. Run them with
+`tests/test_scripts/test_mcp_rollout.py`, `test_shared_mcp_units.py`, and
+`test_deploy_code_only_modes.py` (all under `tests/test_scripts/`). Systemd
+calls use fixture shims. Coverage includes missing/incomplete captured source,
+future imports and namespace isolation, source replacement, exact launch argv,
+UTF-8 under an ASCII locale when available, post-sync CLI arrival, and the
+candidate gate's pure classifier. It never executes the candidate operator.
+No unused `src/` configuration reader is installed by this change.
+
 ## Running Tests
 
 All tests run from the genesis project root using pytest:
@@ -25,11 +36,17 @@ ruff check . && pytest -v
 ## Test Suite Overview
 
 For the opt-in request-owned database primitive, run
-`pytest -q tests/test_db/test_request_database.py tests/test_db/test_request_database_lifecycle.py`.
+`pytest -q tests/test_db/test_request_database.py tests/test_db/test_request_database_lifecycle.py tests/test_db/test_request_database_tasks.py tests/test_db/test_background_admission.py`.
 These use scratch SQLite databases, including independent readers, cancellation,
 WAL cursor release and process-death recovery. Four explicit outcome comparisons
 keep the actual legacy middleware as the negative control. Shared MCP service E2E
 qualification is separate from this primitive coverage.
+
+`tests/test_db/test_request_database_tasks.py` exercises detached ownership,
+parent rollback, caller ContextVars, cancellation before start and during work,
+shutdown admission, and real activity/heartbeat persistence on scratch SQLite.
+It also checks deferred-recall and procedure-refresh bookkeeping when a job
+never enters its body. Providers and vector services are not called.
 
 Scoped graph selection and SQL identity parity are covered by
 `tests/test_memory/test_graph_request_database.py` and

@@ -72,6 +72,51 @@ def _wire(mock_qdrant, mock_crud, mock_links):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('has_results', [True, False])
+@pytest.mark.parametrize('outcome', [True, False, None])
+@patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
+@patch("genesis.memory.retrieval.memory_links")
+@patch("genesis.memory.retrieval.memory_crud")
+@patch("genesis.memory.retrieval.qdrant_ops")
+async def test_both_recall_branches_handle_scheduling_outcomes(
+    mock_qdrant, mock_crud, mock_links, _exp, has_results, outcome, monkeypatch,
+):
+    from genesis.memory import retrieval
+
+    retriever = _build_retriever()
+    _wire(mock_qdrant, mock_crud, mock_links)
+    if not has_results:
+        mock_qdrant.search.return_value = []
+    shadow = AsyncMock(return_value=None)
+    monkeypatch.setattr(retriever, '_maybe_entity_lane_shadow', shadow)
+    jobs = []
+    refused = []
+
+    def schedule(coroutine, **options):
+        if outcome is True:
+            jobs.append(asyncio.create_task(coroutine))
+        else:
+            coroutine.close()
+            refused.append(coroutine)
+        return outcome
+
+    monkeypatch.setattr(retrieval, '_schedule_deferred_side_effects', schedule)
+    results = await retriever.recall('test', limit=5, defer_side_effects=True)
+    assert bool(results) == has_results
+    if outcome is False:
+        assert shadow.await_count == 1  # rejected work ran inline, from a fresh instance
+        if has_results:
+            assert mock_qdrant.update_payload.call_count >= 1
+    else:
+        assert shadow.await_count == 0
+    if jobs:
+        await asyncio.gather(*jobs)
+        assert shadow.await_count == 1  # accepted deferred work did not also run inline
+    if outcome is None:
+        assert shadow.await_count == 0  # shutdown refusal must not access resources inline
+
+
+@pytest.mark.asyncio
 @patch("genesis.memory.retrieval.expand_query", new_callable=AsyncMock, return_value="test")
 @patch("genesis.memory.retrieval.memory_links")
 @patch("genesis.memory.retrieval.memory_crud")

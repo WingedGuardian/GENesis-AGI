@@ -1,0 +1,1 @@
+- Shared MCP deploy checks retain a complete standalone configuration CLI through checkout updates, including future imports and source removal. Invalid server configuration reports a clear error; JSON reads use UTF-8. Shared routing stays off.

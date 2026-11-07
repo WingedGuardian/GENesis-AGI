@@ -14,7 +14,7 @@ from pydantic import StrictInt
 from genesis.db.connection import connect_aiosqlite_rw
 from genesis.db.crud import follow_ups
 from genesis.mcp.health import mcp
-from genesis.session_awareness.pr_recording import check_merge_commit, gh_merge_commit
+from genesis.session_awareness.pr_recording import check_merge_commit, gh_pr_metadata
 from genesis.util.tasks import tracked_task
 
 logger = logging.getLogger(__name__)
@@ -128,7 +128,7 @@ async def record_verification(
     verdict: str | None = None,
     dry_run: bool = False,
     *,
-    merge_commit_of=None,
+    pr_metadata_of=None,
 ) -> dict:
     """Derive a verification result; server calibration policy can force preview.
 
@@ -141,6 +141,7 @@ async def record_verification(
     from genesis.session_awareness.pr_evidence import (
         MAX_EVIDENCE_BYTES,
         Refusal,
+        check_e2e_coverage,
         decide,
         parse_evidence,
         reason_for,
@@ -170,12 +171,15 @@ async def record_verification(
             raise ToolError("Verification schema is unavailable")
         target = resolve_repo(await crud.open_repos_for_pr(db, pr_number=pr), pr, doc.repo)
         try:
-            actual = await asyncio.to_thread(merge_commit_of or gh_merge_commit, target, pr)
+            actual = await asyncio.to_thread(pr_metadata_of or gh_pr_metadata, target, pr)
         except LookupError as exc:
             raise ToolError("Cannot check merge_commit: " + str(exc)) from None
-        mismatch = check_merge_commit(doc.merge_commit, actual)
+        mismatch = check_merge_commit(doc.merge_commit, actual.merge_commit)
         if mismatch:
             raise ToolError(mismatch)
+        coverage = check_e2e_coverage(doc, actual.body) if decision.closing else None
+        if coverage:
+            raise ToolError(coverage.message)
         rechecks = rechecks_for(doc) if decision.closing else []
         if rechecks and not await crud._rechecks_column_available(db):
             raise ToolError("Rechecks are owed but their column is unavailable; run the migration first")

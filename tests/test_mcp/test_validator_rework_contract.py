@@ -142,9 +142,9 @@ async def test_identity_refusal_keeps_every_ledger_field(recording, monkeypatch,
         assert (repo, pr) == ("owner/repo", 7)
         if failure == "error":
             raise LookupError("owned lookup unavailable")
-        return "f" * 40
+        return pr_recording.PrMetadata("f" * 40, "")
 
-    monkeypatch.setattr(validator_writes, "gh_merge_commit", lookup, raising=False)
+    monkeypatch.setattr(validator_writes, "gh_pr_metadata", lookup, raising=False)
     with pytest.raises(ToolError, match="merge_commit"):
         await call(_doc(), dry_run=preview)
     assert row(path) == before
@@ -157,9 +157,9 @@ async def test_default_lookup_alias_is_consumed(recording, monkeypatch):
 
     def lookup(repo, pr):
         calls.append((repo, pr))
-        return MERGE_SHA
+        return pr_recording.PrMetadata(MERGE_SHA, "")
 
-    monkeypatch.setattr(validator_writes, "gh_merge_commit", lookup, raising=False)
+    monkeypatch.setattr(validator_writes, "gh_pr_metadata", lookup, raising=False)
     result = await call(_doc())
     assert result["dry_run"] and not result["recorded"]
     assert calls == [("owner/repo", 7)]

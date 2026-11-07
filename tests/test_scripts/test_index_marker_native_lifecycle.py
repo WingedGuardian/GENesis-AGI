@@ -38,6 +38,27 @@ def test_dropped_final_sample_is_uncertain_and_never_success_or_oom(queue, tmp_p
     assert queue.claim_native(claimed["context"]["hash"], provider="cbm") is None
 
 
+@pytest.mark.parametrize("owned_oom,expected", [(0, None), (1, "resource")])
+def test_preparation_oom_survives_refusal_without_a_final_sample(
+    queue, tmp_path, owned_oom, expected
+):
+    claimed = _claim(queue, tmp_path)
+    _reserve(queue, claimed, _reservation(claimed))
+    _register(queue, claimed)
+    terminal = _terminal(claimed)
+    terminal["provider_ok"] = False
+    terminal["report"].update(outcome="refused", payload_started=False,
+                              payload_returncode=None, after=None, finality=None,
+                              error="proof_unavailable")
+    terminal["report"]["before"]["events"]["oom_kill"] = owned_oom
+    _event(queue, claimed, "terminal", terminal)
+    assert _apply(queue, claimed) == "pending"
+    status = queue.execution_status(claimed["context"])
+    assert status["native_intent"] is None and status["completion_kind"] == "unstarted"
+    assert status["typed_charged_attempts"] == 0 and status["safety_kind"] == expected
+    assert queue.get_inflight(claimed["context"]["hash"]) is not None
+
+
 def test_registered_cancellation_keeps_cleanup_obligation(queue, tmp_path):
     claimed = _claim(queue, tmp_path)
     _reserve(queue, claimed, _reservation(claimed))
@@ -68,7 +89,10 @@ def test_cleanup_cannot_leave_permission_for_a_later_native_start(queue, tmp_pat
 
 @pytest.mark.parametrize("kind", ["cleanup", "cleanup-disproof"])
 @pytest.mark.parametrize("observed_ns,invalidated", [(250, 0), (400, 1)])
-def test_population_disproof_uses_bound_observation_and_not_event_name_or_arrival(queue, tmp_path, kind, observed_ns, invalidated):
+def test_population_disproof_uses_bound_observation_and_not_event_name_or_arrival(queue, tmp_path, monkeypatch, kind, observed_ns, invalidated):
+    # These synthetic identities provide no fresh kernel evidence. A changed
+    # actual host boot must not accidentally qualify this journal-only premise.
+    monkeypatch.setitem(queue.claim_native.__globals__, "_fresh_cleanup", lambda db, row: False)
     claimed = _started(queue, tmp_path)
     _event(queue, claimed, "terminal", _terminal(claimed))
     _event(queue, claimed, "cleanup", _cleanup(queue, claimed))

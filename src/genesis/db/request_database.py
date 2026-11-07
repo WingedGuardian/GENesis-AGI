@@ -35,6 +35,10 @@ class DatabaseScopeError(RuntimeError):
     """SQL was attempted without a live owning unit of work."""
 
 
+class BackgroundTaskCapacityError(DatabaseScopeError):
+    """The bounded background job budget refused work before acceptance."""
+
+
 @dataclass(eq=False)
 class _Lease:
     connection: SerializedConnection | None = None
@@ -115,7 +119,8 @@ async def _settle(task: asyncio.Task) -> Any:
 class RequestDatabase:
     """Stable DB facade; every independent scope gets a fresh connection.
 
-    ``max_units`` bounds this manager's opening, active and closing leases.
+    ``max_units`` bounds foreground opening, active and closing leases. Explicit
+    background budgets add a separate pool; total leases cannot exceed their sum.
     Independently owned connections in existing tool implementations are not
     included. There is no fallback to an unrelated connection on exhaustion.
     """
@@ -125,17 +130,32 @@ class RequestDatabase:
     def __init__(
         self, path: str | Path, *, max_units: int,
         checkout_timeout_s: float = DEFAULT_CHECKOUT_TIMEOUT_S,
+        max_background_units: int | None = None,
+        max_background_jobs: int | None = None,
     ):
-        if isinstance(max_units, bool) or not isinstance(max_units, int) or max_units < 1:
-            raise ValueError("max_units must be a positive integer")
+        if (max_background_units is None) != (max_background_jobs is None):
+            raise ValueError("both background budgets must be configured together")
+        limits = {"max_units": max_units}
+        if max_background_units is not None:
+            limits.update(max_background_units=max_background_units, max_background_jobs=max_background_jobs)
+        for name, value in limits.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
         if not math.isfinite(checkout_timeout_s) or checkout_timeout_s <= 0:
             raise ValueError("checkout_timeout_s must be finite and positive")
         self.path = Path(path).expanduser().resolve()
         self._slots = asyncio.BoundedSemaphore(max_units)
+        self._background_slots = (
+            asyncio.BoundedSemaphore(max_background_units) if max_background_units is not None else None
+        )
+        self._background_job_limit = max_background_jobs or 0
+        self._background_job_count = 0
+        self._background_scope: ContextVar[bool] = ContextVar("database_background_scope", default=False)
         self._timeout = checkout_timeout_s
         self._current: ContextVar[_Lease | None] = ContextVar("database_lease", default=None)
         self._owners: dict[asyncio.Task, asyncio.Future[None]] = {}
         self._workers: set[asyncio.Task] = set()
+        self._jobs: set[asyncio.Task] = set()
         self._closing = False
         self._close_task: asyncio.Task | None = None
         self._unclosed: set[_Lease] = set()
@@ -200,6 +220,10 @@ class RequestDatabase:
             raise DatabaseScopeError("A unit of work requires an asyncio task")
         if owner in self._owners:
             raise DatabaseScopeError("Independent work must run in a separate task")
+        background = self._background_scope.get()
+        slots = self._background_slots if background else self._slots
+        if slots is None:
+            raise ValueError("background admission is not configured")
         finished: asyncio.Future[None] = asyncio.get_running_loop().create_future()
         self._owners[owner] = finished
         acquired = False
@@ -208,8 +232,13 @@ class RequestDatabase:
         lease = _Lease()
         success = False
         try:
-            async with asyncio.timeout(self._timeout):
-                await self._slots.acquire()
+            if background:
+                # Accepted jobs are already bounded by the scheduling budget.
+                # Queue until a background connection is free or shutdown cancels.
+                await slots.acquire()
+            else:
+                async with asyncio.timeout(self._timeout):
+                    await slots.acquire()
             acquired = True
             opening = self._worker(self._open(lease))
             await asyncio.shield(opening)
@@ -231,16 +260,66 @@ class RequestDatabase:
             finally:
                 if acquired:
                     if lease.closed:
-                        self._slots.release()
+                        slots.release()
                     else:
                         self._unclosed.add(lease)
                         logger.error("Database connection closure could not be confirmed")
                 del self._owners[owner]
                 finished.set_result(None)
 
+    def spawn(self, coroutine, **task_options) -> asyncio.Task:
+        """Schedule independent work, preserving all non-database context.
+
+        Ownership starts synchronously, including jobs cancelled before their
+        coroutine enters or while waiting for admission. Shutdown joins them.
+        """
+        from genesis.util.tasks import tracked_task
+
+        if self._closing:
+            coroutine.close()
+            raise DatabaseScopeError("Database manager is closing")
+        if self._background_slots is None:
+            coroutine.close()
+            raise ValueError("detached work requires explicit background budgets")
+        if self._background_job_count >= self._background_job_limit:
+            coroutine.close()
+            raise BackgroundTaskCapacityError("Background job capacity is exhausted")
+        self._background_job_count += 1
+        started = False
+
+        async def run():
+            nonlocal started
+            async with self.unit_of_work():
+                started = True
+                return await coroutine
+
+        def finished(task):
+            if not started:
+                coroutine.close()
+            self._jobs.discard(task)
+            self._background_job_count -= 1
+
+        token = self._current.set(None)
+        background_token = self._background_scope.set(True)
+        runner = run()
+        try:
+            task = tracked_task(runner, **task_options)
+        except BaseException:
+            runner.close()
+            coroutine.close()
+            self._background_job_count -= 1
+            raise
+        finally:
+            self._background_scope.reset(background_token)
+            self._current.reset(token)
+        self._jobs.add(task)
+        task.add_done_callback(finished)
+        return task
+
     async def _shutdown(self) -> None:
         owners = tuple(self._owners.items())
-        for task, _finished in owners:
+        jobs = tuple(self._jobs)
+        for task in set(self._owners) | set(jobs):
             task.cancel()
         # Wait for the unit, not the task: a task that has left its unit may be
         # awaiting this shutdown in its own close().
@@ -249,6 +328,7 @@ class RequestDatabase:
                 asyncio.wait({task, finished}, return_when=asyncio.FIRST_COMPLETED)
                 for task, finished in owners
             ),
+            *jobs,
             return_exceptions=True,
         )
         while self._workers:
@@ -324,3 +404,12 @@ class RequestDatabase:
     @property
     def total_changes(self):
         return self._lease().require_active().total_changes
+
+
+def spawn_database_task(db, coroutine, **task_options) -> asyncio.Task:
+    """Detach work with database ownership; preserve legacy task scheduling."""
+    if isinstance(db, RequestDatabase):
+        return db.spawn(coroutine, **task_options)
+    from genesis.util.tasks import tracked_task
+
+    return tracked_task(coroutine, **task_options)

@@ -50,8 +50,10 @@ def _proof(queue, claimed, state):
 @pytest.mark.parametrize("observed_ns,after_proof", [(250, False), (400, True)])
 @pytest.mark.parametrize("slots", ["free", "failure", "both"])
 def test_all_retained_population_observations_participate_in_cleanup_validity(
-    queue, tmp_path, kind, arrival, state, observed_ns, after_proof, slots
+    queue, tmp_path, monkeypatch, kind, arrival, state, observed_ns, after_proof, slots
 ):
+    # This table tests retained ordering with no new original-kernel proof.
+    monkeypatch.setitem(queue.claim_native.__globals__, "_fresh_cleanup", lambda db, row: False)
     claimed = _started(queue, tmp_path)
     _event(queue, claimed, "terminal", _terminal(claimed))
     _occupy(queue, claimed, slots)
@@ -72,6 +74,7 @@ def test_all_retained_population_observations_participate_in_cleanup_validity(
 
 
 def test_one_drain_interprets_retained_hazard_against_later_spooled_proof(queue, tmp_path, monkeypatch):
+    monkeypatch.setitem(queue.claim_native.__globals__, "_fresh_cleanup", lambda db, row: False)
     claimed = _started(queue, tmp_path)
     _event(queue, claimed, "terminal", _terminal(claimed))
     _occupy(queue, claimed, "both")

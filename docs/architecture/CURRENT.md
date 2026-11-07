@@ -276,6 +276,31 @@ docs (2026-09-07): only the NAMED-PATH form works for hop-wise filtering, the
 engine has NO temporal types despite its own documentation listing them, and a
 loading engine answers `BusyLoadingError` — which is unavailable, never empty.
 Acceptance: 400 live roots replayed through both stores, 0 node-set differences.
+The engine itself (redis-server, redis-cli and the FalkorDB module) is the
+hash-pinned `falkordblite` wheel, installed into Genesis's venv by
+`scripts/lib/falkordb_install.sh` before the editable install. The unit never
+runs it from the venv: `scripts/lib/falkordb_engine_check.py` checks every
+engine file against digests COMMITTED in `scripts/lib/falkordb-engine-digests.txt`
+(generated from the pinned wheel files and regenerated on every pin bump; the
+installed wheel's RECORD is not trusted, since pip does not re-verify an
+installed wheel), copies them to `~/.genesis/deps/falkordb/<version>-<wheel
+tag>/`, re-checks the copy and writes its `engine.sha256`, which the unit
+re-checks on every start (a drift check; the sandbox is best-effort, so the
+provision-time re-verify is the integrity check that holds). The
+version-tag directory means a pin bump never replaces a running engine's files;
+`bootstrap.sh` removes copies no unit loads (none while the unit has a drop-in),
+and a copy another account could write is rebuilt, never reused. If the
+hash-pinned package does not install, `bootstrap.sh` stops before the package
+install and `install.sh` skips it, so the engine is never fetched without its
+hashes. It needs glibc 2.38+ (Ubuntu 24.04)
+on x86_64 or aarch64, and `install.sh` and `bootstrap.sh` refuse anything else
+before installing it; `update.sh` refuses before fetching once it runs code that
+carries this check (the first update to it runs the old `update.sh`, which merges,
+then rolls back when bootstrap refuses). The unit is `Type=simple` with a PING readiness
+poll, because the wheel's redis has no libsystemd to notify with, and a deploy
+moves an engine onto a different module only when systemd reports it inactive
+or failed (a running engine, or one whose state cannot be read, keeps its unit)
+or `GENESIS_FALKORDB_SWITCH=1` asks for it.
 The FalkorDB projection is rebuilt hourly by `genesis-graph-project.timer`
 (`memory/graphstore_project.py`); that schedule is its staleness bound. The
 engine keeps no data on disk, so its unit also (re)starts the projector on
@@ -1752,7 +1777,9 @@ the shared banner is not an assertion about all concurrent sessions.
   cleanup and persistent resource quarantine remain separate activation gates.
   `scripts/lib/code_intel_execution.py` adds an explicit stdlib scope-evidence
   observer with private bounded pipe transport and complete-subtree task/counter
-  checks. It has no automatic queue caller, stop authority or quarantine state.
+  checks. Its optional queued seam preserves first-intent-before-Popen, accepted
+  descriptors and actual child wait independently of lifecycle-release errors.
+  It has no automatic queue caller, stop authority or quarantine state.
   The existing foreground watchdog lacks a post-return scope-quiescence barrier;
   strict queue integration must retain unresolved cleanup ownership separately.
   Synthetic/descriptor fixtures do not qualify native OOM or production indexing.
@@ -1762,10 +1789,26 @@ the shared banner is not an assertion about all concurrent sessions.
   intent, retained typed report/stop/cleanup facts and exact-once application.
   Shared publishers and exclusive replay/admission reuse `.queue.lock`, including
   busy spools. Completion is independent from safety and cleanup; late disproof
-  retains repo-wide exclusion without restoring old accounting or overwriting a
-  newer inflight pointer. This is transaction storage/interpretation only:
-  automatic readiness stays fenced, actual queued native production and lifetime
-  reconciliation remain unwired, and kernel/production acceptance is unqualified.
+  keeps cleanup invalidated without restoring old accounting or overwriting a
+  newer inflight pointer. `code_intel_scope.py` supplies fresh original-subtree
+  proof to admission and exact-pointer retirement, retaining sticky invalidation
+  and independent provider holds. Newly measured owned OOMs use the existing
+  durable evidence path; preparation OOM remains visible after admission refusal.
+  Typed manager inspection is read-only and bounds every call by its remaining
+  deadline. Registration binds the manager's native cgroup ID to the captured
+  original leaf on 64-bit Linux; missing-leaf cleanup verifies the visible
+  original ancestor chain. Collector read failures retain the affected physical
+  hold without aborting unrelated reconciliation; publication failures propagate.
+  Intent callback RuntimeError refuses child creation
+  with private diagnostics. Automatic readiness stays fenced; actual scope creation, watchdog/
+  runner wiring and recovery remain unfinished. Synthetic fixtures do not
+  establish native kernel or production acceptance.
+  `scripts/lib/code_intel_source.py` provides explicit captured-source diagnostics
+  and a finite assembly API: Python and shell buffers match one immutable Git
+  tree, and Python compilation/hashing use those same bytes with original origins.
+  Private sealed handoff checks its caller-bound digest before entry compilation;
+  cached local modules refuse. This is not yet the queued shell/watchdog caller
+  and supplies no new launch, recovery or automatic-readiness authority.
   Whole-install removal enters the same fixed guarded transaction from direct
   and host cleanup: runner/repository/lifecycle locks survive exec and all root
   deletions; native query/client cgroup proof and orphan-scope checks precede
@@ -2367,7 +2410,7 @@ The loops that make Genesis think between conversations.
 entry: ambient-cognition
 modules: [awareness, perception, reflection, attention, session_awareness,
           session_charter.py]
-verified: 973a0e6 2026-10-30
+verified: c712f1bde 2026-11-06
 ```
 
 - **Peer-handoff surface (2026-09-26)**: a SessionStart hook
@@ -2677,10 +2720,21 @@ verified: 973a0e6 2026-10-30
   verdict twice. The health MCP pr_verification_close tool uses that same policy
   and shared CLI recording helpers, with independent PR and actual merge-commit
   checks before previews or writes. CLI and MCP use one empty-safe attempt-note
-  formatter; fixture lookup injection stays outside the public MCP schema. Its
+  formatter and require explicit `e2e` claim/gap mappings for every declared plan
+  before a closing result. Both fetch the PR body with its merge SHA and refuse
+  uncovered or stale declarations, including previews; old evidence still parses
+  and reasoned `E2E: none` declarations need no mapping. The shared source parser
+  also supplies the existing script facade (verified: 2026-11-06).
+  Fixture lookup injection stays outside the public MCP schema. Its
   server-side calibration gate forces preview until operator opt-in, including
   attempt notes. Real writes use a separate admitted existing-only connection;
-  preview uses SELECTs on the shared handle. Only a PASS verdict discharges
+  preview uses SELECTs on the shared handle. Event-gated gaps are captured by
+  the shared close CRUD as structured rechecks on the closed row. The backlog
+  lists due dates and named events, with result commands bound to its database;
+  the recheck CLI appends failed/done measurements without reopening the row.
+  Unfinished or malformed rechecks survive retention; malformed histories are
+  surfaced for inspection rather than hiding later rows. Owed rechecks refuse
+  closes before migration, including CLI/MCP previews. Only a PASS verdict discharges
   an obligation; the other verdicts leave the row OPEN and annotate it, so a PR
   nobody could verify says why instead of looking untouched. The one non-obvious
   invariant, because the obvious one is false: a PASS verdict implies the row is
@@ -4019,8 +4073,16 @@ Refusing a proposed update preserves a previously valid opt-in.
   per independent unit, bounded admission, retained cancellation cleanup and
   cursor closure. It preserves explicit CRUD commits and refuses expired scopes;
   it does not provide whole-tool atomicity. Existing MCP initialization still
-  uses its legacy connection. Service integration and detached-writer ownership
-  are separate prerequisites before shared activation. See
+  uses its legacy connection. `spawn_database_task` gives scoped detached
+  writers their own unit, preserves other caller context, and tracks jobs from
+  scheduling through shutdown, including cancellation before start.
+  Detached work requires explicit background connection and job-count budgets;
+  foreground-only construction allocates neither. Background admission is
+  separate from foreground capacity; recall queue pressure falls back inline
+  while shutdown refuses new resource work (source checked 2026-11-06).
+  Activity, embedding-heartbeat, deferred-recall, bookmark and proactive tasks use it;
+  legacy connections keep ordinary task scheduling. Service integration remains
+  a separate prerequisite before shared activation. See
   `docs/reference/request-database.md` for lifecycle and failure semantics.
 - **db/**: aiosqlite WAL behind `SerializedConnection` (an asyncio.Lock —
   without it interleaved commits pin `in_transaction` until restart). Every

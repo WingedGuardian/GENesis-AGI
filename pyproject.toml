@@ -84,12 +84,23 @@ dependencies = [
                                     # yt-dlp release pins, installed locally: never fetched at run time.
     "networkx>=3.0",  # In-memory graph for memory_links traversal + algorithms
     "wyoming>=1.5",  # Wyoming protocol for HA voice satellite STT/TTS integration
-    "falkordb>=1.7.1,<2",  # Graph-engine client for the memory graph. CORE, like
+    "falkordb>=1.8.1,<2",  # Graph-engine client for the memory graph. CORE, like
                            # qdrant-client above: the graph engine is part of the memory
                            # architecture, not an optional add-on. `config/graphstore.yaml`
                            # defaulting to networkx is a STAGED CUTOVER, not optionality.
-                           # Its own pin is redis<9,>=8.0.0, so the line below is not an
-                           # independent choice — declaring falkordb mandates redis 8.
+                           # Its own pin is redis<9,>=8.0.0, so the redis line below is not
+                           # an independent choice — declaring falkordb mandates redis 8.
+                           # >=1.8.1 because falkordblite requires falkordb[hiredis]>=1.8.0.
+    "falkordblite==0.11.0",  # The graph ENGINE itself, as a pip dependency: redis-server,
+                             # redis-cli and the FalkorDB module ship in this one wheel, so
+                             # the engine installs with Genesis (no apt repo, no download
+                             # step). Wheels are manylinux_2_38 x86_64/aarch64 only, which is
+                             # why the supported OS floor is Ubuntu 24.04 on those machines.
+                             # Pinned EXACTLY and kept in step with
+                             # scripts/lib/falkordb-requirements.txt (applied first with
+                             # --require-hashes) and falkordb-engine-digests.txt (the
+                             # committed per-file digests the unit's copy is checked
+                             # against): a bump regenerates both.
     "redis>=8,<9",  # Required by falkordb and the first-party engine-health probe.
                     # FastMCP no longer supplies this through its optional task worker.
     # Transitive deps pinned to secure floors (audit #638) so a clean/cached install can't resolve a vulnerable version

@@ -102,10 +102,28 @@ follow-ups and the owner conversation. A successful scan is not permission to
 publish private content. Validators do not request development reviews or
 trigger paid agents; the filer is not a review-budget gate.
 
-**A native guard denial means stop that action and ask the owner.** Do not
-retry through another command spelling, subprocess, tool or client. Do not
-write stores under test or run migrations on live data. Discovery of this skill
-does not qualify or activate the launcher, and it does not authorize PR6.
+**A native guard denial stops that action, not the run.** Do not retry it
+through another command spelling, subprocess, tool or client. Record the claim it
+served as a `not_yet_done` gap whose `command` is the denied step and whose
+reason is "blocked by the validator guard: <one line>", so the row stays open for
+a client that can run it; use `NOT_VERIFIABLE_HERE` only where no client on this
+install could. List the denial (command, reason) in the run log and carry on with
+the other claims and rows. Put any question for the owner in plain text in your
+report: the validator profile has no question tool, and its guard denied the
+native one in the 2026-11-06 calibration. Do not write stores under test or run
+migrations on live data. Discovery of this skill does not qualify or activate the
+launcher, and it does not authorize PR6.
+
+Write commands so that the most common false denials never fire; once a command
+is denied, the paragraph above governs. The credentials guard expands a `*` it
+cannot prove is literal, quoted or not, so a raw `sqlite3` or `python -c` query
+with `count(*)` run from the checkout is read as touching the credentials file.
+Prefer `python -m genesis db query "<sql>"`, which is exempt; otherwise write
+`count(1)`, name columns and use explicit paths. A command whose prose names the
+credentials file trips the same guard. Separately, the box-wide pytest lock is a
+refusal, not a guard denial: another session holds it. Wait on it with
+`python3 scripts/pytest_lock_wait.py` (run in the background if you have other
+rows to work), and never stop the run or kill the holder because of it.
 
 ## Load Gate
 
@@ -148,6 +166,24 @@ Read back what was decided, and on what evidence, with
 ```bash
 python3 scripts/repo_pulse_worker.py --verification-log [--pr <N>]
 ```
+
+A closed row can still owe an event-gated recheck. The backlog's **Rechecks due**
+section lists dates on or before today (UTC) and every named event for the
+validator to judge. It prints the stored `--index` and a recording command bound
+to the database it read. After running the named read-only measurement, write
+`{"repo": "owner/name", "result": "done" | "failed", "note": "what it showed"}`
+to a result file outside the repository and record it with:
+
+```bash
+python3 scripts/pr_verification.py recheck --pr <N> --index <I> \
+    --result-file ~/.genesis/output/prv-<N>-recheck.json [--dry-run] [--db-path <DB>]
+```
+
+`done` finishes the recheck; `failed` appends the result and leaves it due. Bring
+a failed measurement to the owner as fail-intent; recording files nothing and
+never reopens the row. `raced` means nothing was appended by this attempt: re-read
+before retrying. A malformed stored entry/history is listed once for inspection
+with `--verification-log`, retained, and refused as an append target.
 
 Two mechanics worth knowing before your first run. **`--dry-run` resolves the
 target and renders the record without writing** — use it, because a closed row
@@ -265,17 +301,17 @@ not run, a probe skipped for cost) as a `method` gap and close. Record it as a
 scan of the 158 gaps on its 85 gap-carrying closed rows flagged 20 as test files
 or probes that were skipped, not hand-checked one by one.
 
-**A closed row never comes back, so a gap that waits on an event needs its own
-recheck.** "The code is right, but the event it handles has not happened yet"
+**A closed row keeps event-gated rechecks.** "The code is right, but the event
+it handles has not happened yet"
 (the first revert, an engine old enough to prune, a skipped backup directory)
-is a real gap that production will eventually test, and nothing reads a closed
-row's gaps again. Apply the actor-and-resource test above first. An event that
+is a real gap that production will eventually test. Apply the actor-and-resource
+test above first. An event that
 can be named and will happen in ordinary running ("after the next deploy", "on
-11-03", "on the first REVERT_CODE") is reachable later. Route it as local state:
-a `follow_up_create` row naming the trigger and the one read-only command that
-re-measures it. A repo defect still gets an issue. An event that may never occur
-is the cannot-verify case above and is not filed. The follow-up is the only
-reminder: nothing in this skill's backlog reader shows it yet.
+11-03", "on the first REVERT_CODE") is reachable later. Record a typed
+`event_gated` gap naming its trigger and one read-only `recheck` command.
+Closing stores it on the same row, and **Rechecks due** surfaces it for later
+measurement without reopening the row. A repo defect still gets an issue. An
+event that may never occur is the cannot-verify case above and is not filed.
 
 A security defect is the one thing never filed publicly before it is fixed —
 private record plus a local row, whoever owns it.
@@ -356,6 +392,20 @@ For every claim you verify, run the arm that must come out the OTHER way. A
 guard that blocks the case under test would also block everything; only the
 control tells those apart. A verification with no control is a story.
 
+**The PR's own tests are the author's evidence, not yours.** Re-running them
+confirms what the author already checked, and it cannot find a case they did not
+think of. Every claim needs at least one probe or code-path read that the shipped
+tests do not already perform: the other branch of a two-sided rule, the other
+call sites of a changed message, the path the test fixture skips. Before deriving
+a verdict, also search the issues that cite the PR, open and closed
+(`gh issue list --state all --search "#<number>"`, and its title words); a later
+report of the same behaviour is evidence, and a fail it names must be measured or
+refuted, never ignored. MEASURED in the 2026-11-06 Codex calibration: both false
+passes (2 of 14 rows) came from this. One PR's
+refusal rule was tested only on its release half, and the defect was in the serve
+half; another's post-save warning was tested on one stop path, and a second path
+lacked it. Open issues named both defects, and neither was read.
+
 ---
 
 ## Hard limits
@@ -415,7 +465,8 @@ control tells those apart. A verification with no control is a story.
   genuine decision (closing-session, "Working the queue", step 5). The triage
   never moves what this skill already gives the owner: a `fail-intent` goes to
   them as a conversation (the verdicts table above), and a native guard denial
-  means stop and ask.
+  means stop and ask (under Codex: stop that action and carry on, as "Running
+  under Codex" says).
 
 ---
 
@@ -453,11 +504,26 @@ because each pilot broke a field the obvious version would have had:
   neighbour, because `pass-mechanical` asserts that nothing was left out. A claim
   this install cannot reach is `NOT_VERIFIABLE_HERE`. A claim you could have run
   but did not is a `not_yet_done` gap with its `command`, which keeps the row open.
+- **`e2e[]`** — explicit coverage of the PR's declared E2E work. Each entry has
+  `step` (the exact declaration text without the `E2E:` prefix) and exactly one
+  zero-based `claim` or `gap` index into `claims[]` or `gaps[]`, for example:
+  `{"step": "restart and measure the timer", "claim": 0}`. A gap mapping uses
+  `{"step": "check the owner device", "gap": 0}` and the gap keeps its existing
+  kind, verdict and recheck behavior. Never omit unreachable steps.
+  CLI and MCP close read the PR body alongside its merge SHA and refuse a closing
+  result, including preview, if any visible plan declaration lacks a mapping or
+  a mapping names text no longer declared. Every plan line is one opaque step:
+  mapping a compound line asserts coverage of its whole text. Decompose its
+  behaviors into claims and use multiple mappings when needed. Code checks the
+  structure; it does not judge whether your measurement covers the prose.
+  `E2E: none — <reason>` needs no mapping. The field defaults to `[]` so older
+  evidence still parses; it cannot close over a declared plan without coverage.
+  An incomplete open attempt can still be recorded without a complete mapping.
 - **`controls[]`** — a reader cannot distinguish a non-vacuous verification from
   a vacuous one without them. A document with none can still close, but never as
   `pass-mechanical`: "no negative control" becomes a named gap.
 - **`merge_commit`** — the PR's OWN merge commit, 7+ hex characters. `close` checks
-  it against GitHub (`gh pr view --json mergeCommit`) and refuses a mismatch with
+  it against GitHub (`gh pr view --json mergeCommit,body`) and refuses a mismatch with
   exit 3, on `--dry-run` too; if gh cannot resolve it, the close is refused (exit 2)
   rather than waved through. MEASURED 2026-10-27: 5 of 15 documents in one group
   named main HEAD or the deployed commit instead. On a stacked PR this is still
@@ -468,10 +534,14 @@ because each pilot broke a field the obvious version would have had:
   of 158 untyped gaps, 35 were reachable work that had not been done, 44 waited on
   an event, 57 were method limits and 22 belonged to the owner — and the untyped
   list closed every one of them alike.
-  - `method` (`detail`), `owner_only` (`detail`) and `event_gated` (`detail`,
-    `trigger`: a real `YYYY-MM-DD` or a named event, `recheck`: one read-only
-    command or SQL that re-measures it) — close as `pass-with-measured-gaps` with
-    the gap named.
+  - `method` (`detail`) and `owner_only` (`detail`) — close as
+    `pass-with-measured-gaps` with the gap named.
+  - `event_gated` (`detail`, `trigger`: a real `YYYY-MM-DD` or a named event,
+    `recheck`: one read-only command or SQL that re-measures it) — closes with
+    the gap named and stores a recheck on the closed row. The backlog lists it
+    under **Rechecks due** until a result marks it done. The close is refused
+    before the rechecks column exists, including previews, so the measurement
+    cannot disappear during an upgrade.
   - `not_yet_done` (`detail`, `command`) — keeps the row OPEN as `not-yet-done`.
   The old untyped `scope_limits` is refused by name, never mapped across: choosing
   each entry's kind is the judgment the untyped list let a close skip.

@@ -76,13 +76,18 @@ cannot-verify RARE, or the ledger fills with parked rows and the backlog stops
 meaning anything.
 
 ``merge_commit`` IS CHECKED, NOT TRUSTED. ``close`` resolves the PR's real merge
-commit (``gh pr view --json mergeCommit``; the row stores none) and refuses a
+commit (``gh pr view --json mergeCommit,body``; the row stores none) and refuses a
 document whose ``merge_commit`` is not a prefix of it of at least 7 hex characters.
 MEASURED 2026-10-27: an independent re-verification found 5 of 15 documents in one
 group naming main HEAD or the host's deployed commit instead of the PR's merge. If
 the commit cannot be resolved (gh missing, offline, no merge commit) the close is
 refused and says why — a fault never waves a document through. ``--dry-run`` runs
 the check too.
+
+Declared E2E plans are checked in that same read. A closing result needs an
+``e2e`` mapping from each complete declaration to an existing claim or typed gap;
+missing or stale mappings refuse, including on ``--dry-run``. A reasoned
+``E2E: none`` needs none. Open attempts may still record incomplete evidence.
 
 WHERE THE DATABASE IS, and the trap that costs a confusing run: ``genesis_db_path()``
 resolves RELATIVE TO THE REPO ROOT, so running this from a linked worktree points
@@ -142,6 +147,7 @@ from genesis.session_awareness.pr_evidence import (  # noqa: E402
     EvidenceDocument,
     EvidenceError,
     Refusal,
+    check_e2e_coverage,
     decide,
     parse_evidence,
     parse_recheck_result,
@@ -149,11 +155,13 @@ from genesis.session_awareness.pr_evidence import (  # noqa: E402
     rechecks_for,
 )
 from genesis.session_awareness.pr_recording import (  # noqa: E402
+    PrMetadata,
     _DuplicateKey,
     _no_duplicates,
     attempt_note,
     check_merge_commit,
     gh_merge_commit,
+    gh_pr_metadata,
     resolve_repo,
 )
 
@@ -165,6 +173,7 @@ __all__ = [
     "build_reason",
     "check_merge_commit",
     "gh_merge_commit",
+    "gh_pr_metadata",
     "main",
     "resolve_repo",
     "validate_evidence",
@@ -207,6 +216,7 @@ SCHEMA_TEMPLATE = {
         "the arm that had to come out the other way, and did — without one the "
         "document derives pass-with-measured-gaps, never pass-mechanical"
     ],
+    "e2e": [{"step": "exact E2E declaration text, without the E2E: prefix", "claim": 0}],
     "gaps": [
         {"kind": "method", "detail": "a limit of HOW this was verified, accepted as it is"},
         {"kind": "owner_only", "detail": "what only the owner can check"},
@@ -260,7 +270,7 @@ async def _write(
     note: str | None,
     payload: str,
     dry_run: bool,
-    merge_commit_of: Callable[[str, int], str],
+    pr_metadata_of: Callable[[str, int], PrMetadata],
 ) -> int:
     import aiosqlite
 
@@ -310,7 +320,7 @@ async def _write(
 
             # After the row lookup, so a PR with no open row costs no network call.
             try:
-                actual = merge_commit_of(target, pr_number)
+                actual = pr_metadata_of(target, pr_number)
             except LookupError as exc:
                 print(
                     f"pr_verification: cannot check merge_commit — the merge commit of "
@@ -319,10 +329,14 @@ async def _write(
                     file=sys.stderr,
                 )
                 return 2
-            mismatch = check_merge_commit(doc.merge_commit, actual)
+            mismatch = check_merge_commit(doc.merge_commit, actual.merge_commit)
             if mismatch:
                 print(f"pr_verification: {mismatch}", file=sys.stderr)
                 return 3
+
+            coverage = check_e2e_coverage(doc, actual.body) if decision.closing else None
+            if coverage:
+                return _refuse(coverage.message, coverage.code)
 
             verdict = decision.verdict
             reason = build_reason(doc, decision)
@@ -616,7 +630,7 @@ def _run_recheck(args: argparse.Namespace) -> int:
 def main(
     argv: list[str] | None = None,
     *,
-    merge_commit_of: Callable[[str, int], str] | None = None,
+    pr_metadata_of: Callable[[str, int], PrMetadata] | None = None,
 ) -> int:
     from genesis.db.crud import pr_verifications as crud
 
@@ -738,7 +752,7 @@ def main(
             note=args.note,
             payload=payload,
             dry_run=args.dry_run,
-            merge_commit_of=merge_commit_of or gh_merge_commit,
+            pr_metadata_of=pr_metadata_of or gh_pr_metadata,
         )
     )
 
