@@ -166,8 +166,8 @@ WantedBy=default.target
 
 def validate_version(serena: str) -> None:
     version = subprocess.check_output([serena, "--version"], text=True).strip()
-    if version != "Serena 1.7.0":
-        raise ValueError("revalidate shared services before changing Serena 1.7.0")
+    if version != "Serena 2.1.0":
+        raise ValueError("revalidate shared services before changing Serena 2.1.0")
 
 
 def serve(project: Path, context: str, serena: str) -> None:
@@ -179,6 +179,8 @@ def serve(project: Path, context: str, serena: str) -> None:
         context,
         "--project",
         str(project),
+        "--agent-interface",
+        "tools",
         "--transport",
         "streamable-http",
         "--host",
@@ -217,14 +219,14 @@ def check_capabilities(serena: str, port: int) -> None:
     # fixed/optional tools can override the provider's single-project exclusion.
     code = """import asyncio, sys
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 async def check():
-    async with streamablehttp_client('http://127.0.0.1:' + sys.argv[1] + '/mcp') as (r, w, _):
+    async with streamable_http_client('http://127.0.0.1:' + sys.argv[1] + '/mcp') as (r, w):
         async with ClientSession(r, w) as session:
             await session.initialize()
             tools = {t.name for t in (await session.list_tools()).tools}
-            if tools.intersection({'activate_project', 'switch_modes'}):
-                raise RuntimeError('Shared project switching exposed')
+            if tools.intersection({'activate_project', 'switch_modes', 'serena_repl'}):
+                raise RuntimeError('Shared project switching or REPL exposed')
 asyncio.run(check())
 """
     subprocess.run([provider_python(serena), "-c", code, str(port)], check=True)
@@ -254,7 +256,7 @@ def snapshot_context(serena: str, context: str, destination: Path, project: Path
     interpreter = provider_python(serena)
     code = """import sys, yaml, serena
 from serena.config.context_mode import SerenaAgentContext
-if serena.__version__ != '1.7.0':
+if serena.__version__ != '2.1.0':
     raise RuntimeError('Revalidate sharing before changing Serena version')
 path = SerenaAgentContext.get_path(sys.argv[1])
 with open(path) as f: config = yaml.safe_load(f)

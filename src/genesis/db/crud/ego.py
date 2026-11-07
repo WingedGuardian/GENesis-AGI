@@ -962,6 +962,10 @@ async def update_proposal_outcome(
     Called after the dispatched session completes, so the ego knows whether
     the action actually succeeded or failed.
     """
+    # Readers find the polarity by substring, so text from the session (its
+    # output, its reported reason) must never carry a marker of its own.
+    for marker in ("|completed:", "|failed:"):
+        summary = summary.replace(marker, " ")
     suffix = f"|{'completed' if success else 'failed'}:{summary[:1000]}"
     cursor = await db.execute(
         "UPDATE ego_proposals SET user_response = COALESCE(user_response, '') || ? "

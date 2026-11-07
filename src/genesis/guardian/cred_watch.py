@@ -295,12 +295,18 @@ async def check_credential_integrity_and_alert(config, dispatcher) -> None:
         if decision.action == "step_in":
             attempts = list(episode.get("restore_attempts", []))
             episode["last_status"] = corrupt[name]
-            episode["stepped_in_at"] = now_iso
-            episode["last_alert_at"] = now_iso
             # Only auto-restore proven-corrupt (restorable) statuses. An
             # "unreadable" verdict is ambiguous — alert for manual action, never
-            # overwrite a file that was not proven corrupt.
+            # overwrite a file that was not proven corrupt. Not a step-in: if it
+            # later proves corrupt, the restore is still owed. So it keeps its own
+            # alert cadence, as nothing here marks the episode as handled.
             if corrupt_status.get(name) not in RESTORABLE_STATUSES:
+                last_alert = _parse(episode.get("last_alert_at"))
+                warned_at = _parse(episode.get("warned_at"))
+                already_alerted = last_alert is not None and last_alert != warned_at
+                if already_alerted and (now - last_alert).total_seconds() < cfg.realert_hours * 3600:
+                    continue
+                episode["last_alert_at"] = now_iso
                 await _send(dispatcher, AlertSeverity.CRITICAL,
                             f"Credential unreadable: {name}",
                             f"{name} is {corrupt[name]} and the container did not "
@@ -308,6 +314,8 @@ async def check_credential_integrity_and_alert(config, dispatcher) -> None:
                             "proven-corrupt state (permission/IO?), so the guardian "
                             "will NOT auto-restore — manual intervention needed.")
                 continue
+            episode["stepped_in_at"] = now_iso
+            episode["last_alert_at"] = now_iso
             if not allowed_restore(attempts, now, cfg.max_restores_per_day):
                 episode["restore_attempts"] = attempts
                 await _send(dispatcher, AlertSeverity.CRITICAL,

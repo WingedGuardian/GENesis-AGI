@@ -255,7 +255,7 @@ def test_b9_no_pipe_to_shell():
     assert "install.sh | bash" not in code
     assert "uv/install.sh | sh" not in code
     # … replaced by download-to-file then execute-from-file (full download first).
-    assert 'curl -LsSf https://astral.sh/uv/install.sh -o "$_uv_installer"' in code
+    assert 'curl -LsSf "https://astral.sh/uv/$GENESIS_UV_VERSION/install.sh" -o "$_uv_installer"' in code
     assert 'sh "$_uv_installer"' in code
     # The optional legacy helper remains independently pinned; ordinary setup
     # no longer invokes it or fetches a raw provider.

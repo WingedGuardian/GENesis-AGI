@@ -45,8 +45,8 @@ def decoded_tool_result(result):
 async def test_native_validator_writer_dispatch(tmp_path, monkeypatch, client, case):
     binary = os.environ["GENESIS_CODEX_CLI_BIN" if client == "cli" else "GENESIS_CODEX_APP_SERVER_BIN"]
     app = os.environ["GENESIS_CODEX_APP_SERVER_BIN"]
-    assert subprocess.check_output([binary, "--version"], text=True).strip() == "codex-cli 0.163.0"
-    expected_binary = bytes.fromhex("399ff69c 431c066e 40de318f ba45c2b0 7f45a76b 19939d24 7ee4828f c70c4215")
+    assert subprocess.check_output([binary, "--version"], text=True).strip() == "codex-cli 0.166.0"
+    expected_binary = bytes.fromhex("b8a11fed f24b2dfb 59a70c9e 52b030f9 a508dcd4 9cd2dd0d 41956f4c 785156b8")
     assert hashlib.sha256(Path(binary).read_bytes()).digest() == expected_binary
     assert hashlib.sha256(Path(app).read_bytes()).digest() == expected_binary
     profile = "external" if case.startswith("external_") else "validator"

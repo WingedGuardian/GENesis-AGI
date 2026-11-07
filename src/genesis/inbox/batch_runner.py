@@ -49,6 +49,20 @@ _DOMAIN_TO_NAMES: dict[str, list[str]] = {
 }
 
 
+#: A batch the retry lane will re-run is parked work, not a stop to page (the
+#: same call as the deferred-failure lane above): whatever the session reported
+#: about a URL it could not fetch, the next attempt decides.
+_RETRYING = {"outcome": "parked", "outcome_reason": "url_retry"}
+
+
+def _reported(output) -> dict:
+    """The session's own report as ``complete()`` outcome kwargs (cc/final_status.py)."""
+    from genesis.cc import final_status
+
+    outcome, reason = final_status.outcome_of_output(output)
+    return {"outcome": outcome, "outcome_reason": reason}
+
+
 def _is_acknowledged(response_text: str) -> bool:
     """Detect if the LLM classified this item as Acknowledged (no response needed).
 
@@ -198,7 +212,8 @@ async def run_one_batch(
         err = f"CC invocation deferred, {reason}: {exc}"
         errors.append(err)
         logger.warning(err)
-        await monitor._session_manager.fail(session_id, reason=err)
+        # The retry lane re-runs it, so it is parked work, not a stop to page.
+        await monitor._session_manager.fail(session_id, reason=err, outcome="parked")
         # retriable_below: an approved row resumed from a parked approval
         # can carry a count from an older, higher cap; an outage must not
         # land it at the current one (#2447 review).
@@ -284,7 +299,7 @@ async def run_one_batch(
         )
         await monitor._complete_batch_baseline(item, completed_at)
         if session_id is not None:
-            await monitor._session_manager.complete(session_id)
+            await monitor._session_manager.complete(session_id, **_reported(output))
         await monitor._notify_batch(
             message_queue,
             item,
@@ -344,7 +359,7 @@ async def run_one_batch(
             processed_at=completed_at,
         )
         if session_id is not None:
-            await monitor._session_manager.complete(session_id)
+            await monitor._session_manager.complete(session_id, **_RETRYING)
         return False
 
     # Coverage gate: a URL the response never MENTIONS emitted no give-up
@@ -389,7 +404,7 @@ async def run_one_batch(
                 error_message="partial_url_failure: uncovered " + shown,
             )
             if session_id is not None:
-                await monitor._session_manager.complete(session_id)
+                await monitor._session_manager.complete(session_id, **_RETRYING)
             return False
 
     # Follow-ups + build lane fire only for evaluations that passed their
@@ -460,7 +475,7 @@ async def run_one_batch(
         response_path=response_path,
     )
     if session_id is not None:
-        await monitor._session_manager.complete(session_id)
+        await monitor._session_manager.complete(session_id, **_reported(output))
 
     await monitor._notify_batch(
         message_queue,

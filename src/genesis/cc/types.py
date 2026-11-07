@@ -7,6 +7,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from genesis.cc.final_status import FinalStatus
 
 # CC's spawn/escape-class tool names — the single source of truth for the restricted CC
 # sessions where spawning would escape the parent's tool restrictions: reflection (fully
@@ -415,6 +419,12 @@ class CCInvocation:
     # autonomy executors, mail judge) opt in. NEVER changes control flow —
     # detection/alerting only, never a raise or failover.
     expect_output: bool = False
+    # Ask the session to end with a ``final_status`` block (cc/final_status.py):
+    # the invoker adds the contract to the system prompt, then splits the block
+    # off ``CCOutput.text`` into ``CCOutput.final_status``, so the caller's own
+    # parser reads the text it always did. Set by callers that own a
+    # ``cc_sessions`` row and record its outcome; foreground turns never set it.
+    report_status: bool = False
     # cc-loop-01: opaque per-session key for the invoker's proc registry, so an
     # interrupt (e.g. Telegram /stop) targets THIS session's subprocess and not
     # a concurrent background one. None → keyed by pid (never cross-fired).
@@ -579,6 +589,10 @@ class CCOutput:
     # CC transcript on disk. Sibling of `bg_truncated`: both say "this result is
     # partial", and both exist so the partiality cannot be silent.
     stream_lines_dropped: int = 0
+    # The session's own account of how it ended, split off ``text`` by the
+    # invoker when the invocation set ``report_status``. None: not asked for, or
+    # no block ended the text.
+    final_status: FinalStatus | None = None
 
 
 @dataclass(frozen=True)

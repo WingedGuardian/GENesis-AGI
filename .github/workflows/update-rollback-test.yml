@@ -1,0 +1,124 @@
+name: Update Rollback Test
+
+# Forces a failed scripts/update.sh on a DISPOSABLE runner and checks what the
+# rollback promises, end to end, on a real install: the exact pre-update
+# packages come back, the database snapshot is restored through SQLite while a
+# Genesis MCP server holds it open, and the server starts and writes again. Also
+# runs a no-op update and a clean update to check the package record is retired.
+# A last arm repeats the forced failure with the database restore swapped back to
+# the old cp, and reports whether these checks tell the two apart.
+#
+# Everything here is synthetic: a fresh install, a local bare "origin" and a
+# local bare backups remote inside the runner. No secrets are used. The steps
+# live in scripts/ci/update_rollback_e2e.sh, which refuses to run anywhere but
+# a GitHub Actions runner.
+#
+# It is slow (three to four full updates), so it runs by hand, weekly, and on
+# pull requests that change this check itself — not on every update.sh change.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/update-rollback-test.yml"
+      - "scripts/ci/update_rollback_e2e.sh"
+      - "scripts/ci/mcp_rollback_reader.py"
+  workflow_dispatch:
+  schedule:
+    - cron: "0 8 * * 1"  # weekly Mon 08:00 UTC, an hour after the install test
+
+concurrency:
+  group: update-rollback-test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  update-rollback:
+    runs-on: ubuntu-latest
+    # A full install is 5-20 min and each update re-runs bootstrap (one with a
+    # 180 s health window and a rollback); four updates fit well inside this.
+    # The failure mode bounded here is a hung network fetch.
+    timeout-minutes: 150
+    env:
+      GENESIS_CI_DISPOSABLE: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # This job executes the checked-out tree, so no token is left in
+          # .git/config for it to read (as in install-test.yml).
+          persist-credentials: false
+          # update.sh needs real history (tags, merge bases), not a shallow clone.
+          fetch-depth: 0
+
+      - name: Provision a user systemd session
+        # As in install-test.yml: hosted runners have no user bus by default,
+        # and every Genesis service is a user unit.
+        run: |
+          set -euo pipefail
+          sudo loginctl enable-linger "$USER"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+          export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+          for _ in $(seq 1 20); do
+            systemctl --user is-system-running >/dev/null 2>&1 && break
+            sleep 1
+          done
+          systemctl --user show-environment >/dev/null
+
+      - name: Place the checkout at ~/genesis on a main branch
+        # Two update paths hard-code ~/genesis, and update.sh refuses any
+        # branch but main (the PR checkout is a detached merge commit).
+        run: |
+          set -euo pipefail
+          git clone -q "$GITHUB_WORKSPACE" "$HOME/genesis"
+          git -C "$HOME/genesis" checkout -q -B main
+          git -C "$HOME/genesis" log -1 --format='testing %H %s'
+
+      - name: Install Genesis (non-interactive, strict)
+        env:
+          GENESIS_INSTALL_STRICT: "1"
+        run: cd ~/genesis && ./scripts/install.sh --non-interactive
+
+      - name: Set up the local origin and backups remote
+        id: setup
+        run: ~/genesis/scripts/ci/update_rollback_e2e.sh setup
+
+      - name: No-op update (is the package record retired?)
+        # A failing phase must not hide the later phases' results (each reports
+        # its own checks, and the job still fails); all of them need setup.
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: ~/genesis/scripts/ci/update_rollback_e2e.sh noop
+
+      - name: Clean update (control - no record left)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: ~/genesis/scripts/ci/update_rollback_e2e.sh clean
+
+      - name: Forced failed update - exact packages, SQLite restore, MCP reader
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: ~/genesis/scripts/ci/update_rollback_e2e.sh fault
+
+      - name: Same failure with the old cp restore (does the check tell them apart?)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: ~/genesis/scripts/ci/update_rollback_e2e.sh mutant
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## Update rollback test"
+            echo
+            echo '```'
+            cat ~/ci/evidence/summary.txt 2>/dev/null || echo "(no summary written)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: update-rollback-evidence
+          path: ~/ci/evidence
+          retention-days: 30
+          if-no-files-found: warn

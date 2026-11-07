@@ -31,6 +31,10 @@ from genesis.qdrant.collections import (
 
 TEST_COLLECTION = "test_genesis_" + uuid.uuid4().hex[:8]
 
+# Opens the outbound fence for the module. The opt-in is the qdrant fixture's own
+# skip, not a module mark, so the mock-only TestPayloadIndexes still runs.
+pytestmark = pytest.mark.live_service
+
 
 def _uuid():
     return str(uuid.uuid4())

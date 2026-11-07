@@ -34,7 +34,8 @@ git commands in its cwd can change those.)
 
 THE FILES. This one drives a sweep. `mutation_case.py` holds what a sweep judges,
 `mutation_copy.py` the disposable copy, `mutation_stop.py` how a sweep stops, and
-`mutation_rungs.py` the report mode for the gate's defect corpus.
+`mutation_rungs.py` the report mode for the gate's defect corpus, whose findings
+`gate_corpus_issue.py` files as an issue.
 To import this as a library, put this directory on `sys.path` first: the siblings
 are imported by bare name.
 
@@ -860,13 +861,24 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="the manifest is a defect corpus: check every defect still applies, and run no tests.",
     )
+    ap.add_argument(
+        "--findings-file",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="with --rung-report: write what a test is owed for, as JSON, for the job "
+        "that opens an issue.",
+    )
     return ap
 
 
 def main(argv: list[str] | None = None) -> int:
     # A label the stream cannot encode must not lose the report at the last step.
     sys.stdout.reconfigure(errors="backslashreplace")
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.findings_file and not args.rung_report:
+        parser.error("--findings-file needs --rung-report")
     # Resolved ONCE, before anything is derived from it. A relative --repo once
     # reached the child as a relative PYTHONPATH, resolved against the child's
     # own cwd: <repo>/<repo>/src.
@@ -922,6 +934,11 @@ def main(argv: list[str] | None = None) -> int:
             signal.signal(each, handler)
         if report:
             report.publish()  # here, so a stop or a red baseline still shows what ran
+            if args.findings_file:
+                try:
+                    report.write_findings(args.findings_file)
+                except OSError as exc:  # never in place of what ended the sweep
+                    print(f"mutation-sweep: could not write the findings: {exc}", file=sys.stderr)
     _raise_if_stopped()  # a raise swallowed in a `__del__` must not reach a clean tally
     if report:
         return report.exit_code()
