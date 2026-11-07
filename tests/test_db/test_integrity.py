@@ -9,6 +9,7 @@ import aiosqlite
 import pytest
 
 from genesis.db import integrity
+from tests.conftest import require_access_denied
 
 
 @pytest.fixture(autouse=True)
@@ -540,3 +541,26 @@ async def test_default_connector_await_still_creates_database(tmp_path):
     finally:
         await conn.close()
     assert db.is_file()
+
+
+def test_a_marker_that_cannot_be_reached_fails_closed(tmp_path, isolated_genesis_home):
+    """A marker behind a directory that cannot be searched is an unreadable marker,
+    not an absent one. From Python 3.14 Path.exists() answers False here."""
+    db = tmp_path / "held.db"
+    _healthy_db(db)
+    integrity.quarantine_database(db, source="test", detail="test")
+    isolated_genesis_home.chmod(0)
+    try:
+        require_access_denied(isolated_genesis_home)
+        assert integrity.database_is_quarantined(db) is True
+    finally:
+        isolated_genesis_home.chmod(0o700)
+
+
+@pytest.mark.parametrize("layout", ["no directory", "home is a file"])
+def test_a_marker_that_cannot_exist_is_absent(tmp_path, isolated_genesis_home, layout):
+    db = tmp_path / "plain.db"
+    _healthy_db(db)
+    if layout == "home is a file":
+        isolated_genesis_home.write_text("not a directory")
+    assert integrity.database_is_quarantined(db) is False

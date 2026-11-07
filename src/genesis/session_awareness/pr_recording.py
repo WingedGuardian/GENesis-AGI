@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import dataclass
 
 from genesis.session_awareness.pr_evidence import NOTE_PREFIXED_GAPS, Decision
 
@@ -61,18 +62,29 @@ def attempt_note(decision: Decision, note: str | None) -> str | None:
     return " — ".join(part for part in parts if part)
 
 
+@dataclass(frozen=True)
+class PrMetadata:
+    merge_commit: str
+    body: str
+
+
 def gh_merge_commit(repo: str, pr: int) -> str:
-    """The PR's merge commit sha from GitHub, or raise LookupError naming why not.
+    """Compatibility SHA-only reader. Close writers use the complete metadata."""
+    return gh_pr_metadata(repo, pr).merge_commit
+
+
+def gh_pr_metadata(repo: str, pr: int) -> PrMetadata:
+    """The PR's merge SHA and body from one GitHub read, or a named LookupError.
 
     The one network call in this tool, kept to one function so tests replace it
-    (``main(..., merge_commit_of=...)``) and never call gh for real.
+    (``main(..., pr_metadata_of=...)``) and never call gh for real.
     """
     import shutil
     import subprocess
 
     if shutil.which("gh") is None:
         raise LookupError("gh is not installed or not on PATH")
-    argv = ["gh", "pr", "view", str(pr), "--repo", repo, "--json", "mergeCommit"]
+    argv = ["gh", "pr", "view", str(pr), "--repo", repo, "--json", "mergeCommit,body"]
     try:
         # 120 s: gh on a dead network can hang with no output, and a validator's run
         # would sit there silently; a refusal that names the cause can be retried.
@@ -87,12 +99,16 @@ def gh_merge_commit(repo: str, pr: int) -> str:
     if proc.returncode != 0:
         raise LookupError(f"gh exited {proc.returncode}: {proc.stderr.strip()[:300]}")
     try:
-        oid = (json.loads(proc.stdout).get("mergeCommit") or {}).get("oid")
+        data = json.loads(proc.stdout)
+        oid = (data.get("mergeCommit") or {}).get("oid")
     except (ValueError, AttributeError):
         raise LookupError("gh returned output that is not the expected JSON") from None
     if not isinstance(oid, str) or not re.fullmatch(r"[0-9a-f]{40}", oid):
         raise LookupError(f"{repo}#{pr} has no merge commit on GitHub (is it merged?)")
-    return oid
+    body = data.get("body")
+    if not isinstance(body, str) or len(body) > 65_536:
+        raise LookupError("gh returned a missing, non-string or oversized PR body; cannot check E2E coverage")
+    return PrMetadata(oid, body)
 
 
 def check_merge_commit(claimed: str, actual: str) -> str | None:

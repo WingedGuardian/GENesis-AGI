@@ -111,8 +111,8 @@ def database_is_fenced(db_path) -> bool:
         return bool(database_is_quarantined(path))
     except Exception:
         # Includes the pathological legs: `database_is_quarantined` resolves
-        # the path, and on CPython 3.12 `Path.resolve()` raises RuntimeError
-        # (NOT OSError) for a symlink loop. The contract published here is
+        # the path, and a symlink loop raises RuntimeError on CPython 3.12 and
+        # OSError on later versions. The contract published here is
         # "never raises, fences on doubt" — keep that true at the boundary
         # rather than relying on every caller to carry its own guard.
         return True

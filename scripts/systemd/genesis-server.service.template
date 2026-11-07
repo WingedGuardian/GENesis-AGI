@@ -4,8 +4,8 @@ Description=Genesis Standalone Server
 # rendered on every install but armed only by an explicit `enable`, and a Wants=
 # here would START it regardless of that -- MEASURED: a DISABLED unit named in
 # another unit's Wants= is started anyway (enablement gates only what
-# default.target pulls in). On an install whose operator never set up the
-# engine there is no redis >= 8.0.0 to run, so it would restart-loop to
+# default.target pulls in). On an install where the engine was never verified
+# (an OS below the floor, a failed provision) it would restart-loop to
 # `failed` on a box that never asked for the feature. After= alone orders the two
 # where the operator armed the engine, and is inert everywhere else.
 After=network.target qdrant.service genesis-falkordb.service

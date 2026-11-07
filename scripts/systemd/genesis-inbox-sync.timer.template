@@ -1,0 +1,17 @@
+[Unit]
+Description=Genesis Inbox Sync — every 5 minutes
+
+[Timer]
+# Enabled on every install by bootstrap, like the other genesis-* timers. A run
+# on an install with no vault configured (inbox_monitor.sync_remote empty)
+# exits at once, so being enabled everywhere costs one interpreter start every
+# 5 minutes and avoids an opt-in step that, forgotten, would leave a configured
+# vault unsynced with nothing to say so. The staleness alert in the awareness
+# loop covers a configured sync that stops succeeding.
+OnCalendar=*:0/5
+# A box that was off or asleep still runs one sync on wake.
+Persistent=true
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

@@ -3,6 +3,8 @@ cleanly when their libs are absent (prod venv / CI) — never errors on collecti
 
 from __future__ import annotations
 
+import importlib.util
+
 from genesis.eval.graph_bakeoff.engines.falkor import FalkorEngine
 from genesis.eval.graph_bakeoff.engines.ladybug import LadybugEngine
 from genesis.eval.graph_bakeoff.engines.nx_incremental import NxIncrementalEngine
@@ -11,9 +13,11 @@ from genesis.eval.graph_bakeoff.engines.nx_incremental import NxIncrementalEngin
 def test_control_available_contenders_skip_in_prod_venv():
     # The control runs in-process (networkx is a prod dep).
     assert NxIncrementalEngine.available() is True
-    # Contenders live in the throwaway venv only -> absent here, reported (not raised).
+    # Ladybug lives in the throwaway venv only -> absent here, reported (not raised).
     assert LadybugEngine.available() is False
-    assert FalkorEngine.available() is False
+    # falkordblite is a Genesis dependency (it ships the graph engine), so its
+    # package is present wherever that wheel installed: the probe must say so.
+    assert FalkorEngine.available() is (importlib.util.find_spec("redislite") is not None)
 
 
 def test_available_never_raises():

@@ -12,6 +12,7 @@ from genesis.db.connection import SerializedConnection
 from genesis.db.crud import pr_verifications
 from genesis.db.schema import create_all_tables, seed_data
 from genesis.mcp.external_profiles import ExternalProfileMiddleware
+from genesis.session_awareness.pr_recording import PrMetadata
 from tests.test_scripts.test_pr_verification_closer import MERGE_SHA, _doc, _doc_for
 
 
@@ -39,7 +40,7 @@ async def recording(tmp_path, monkeypatch):
     monkeypatch.setattr(_config_overlay, "_user_config_dir", lambda: user)
     monkeypatch.setattr(codex_validator_config, "_base_path", lambda: config)
     monkeypatch.setattr(follow_up_tools, "_get_db", lambda: shared)
-    monkeypatch.setattr(validator_writes, "gh_merge_commit", lambda repo, pr: MERGE_SHA)
+    monkeypatch.setattr(validator_writes, "gh_pr_metadata", lambda repo, pr: PrMetadata(MERGE_SHA, ""))
     try:
         yield path, shared, config
     finally:
@@ -64,6 +65,55 @@ async def call(doc, **over):
         return (await client.call_tool("pr_verification_close", dict(
             evidence_json=json.dumps(doc), pr=7,
         ) | over)).data
+
+
+@pytest.mark.parametrize("preview", [False, True])
+@pytest.mark.parametrize("covered", [False, True])
+async def test_mcp_enforces_e2e_mapping_before_preview_or_write(recording, monkeypatch, preview, covered):
+    from genesis.mcp.health import validator_writes
+
+    path, _, config = recording
+    config.with_suffix(".local.yaml").write_text("dry_run_only: false")
+    before = row(path)
+    step = "restart the timer and measure its next run"
+    monkeypatch.setattr(validator_writes, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, "E2E: " + step))
+    doc = _doc(e2e=[{"step": step, "claim": 0}]) if covered else _doc()
+    if covered:
+        result = await call(doc, dry_run=preview)
+        assert result["would_close"] and result["verdict"] == "pass-mechanical"
+        assert result["recorded"] is not preview
+    else:
+        with pytest.raises(ToolError, match=step):
+            await call(doc, dry_run=preview)
+    if preview or not covered:
+        assert row(path) == before
+
+
+async def test_missing_mapping_does_not_prevent_recording_an_incomplete_attempt(recording, monkeypatch):
+    from genesis.mcp.health import validator_writes
+
+    path, _, config = recording
+    config.with_suffix(".local.yaml").write_text("dry_run_only: false")
+    monkeypatch.setattr(validator_writes, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, "E2E: run the timer"))
+    doc = _doc(gaps=[{"kind": "not_yet_done", "detail": "not run", "command": "run timer"}])
+    result = await call(doc)
+    assert result["verdict"] == "not-yet-done" and result["recorded"]
+    assert row(path)["status"] == "open"
+
+
+async def test_existing_mcp_close_stores_rechecks_without_a_new_caller_argument(recording):
+    path, _, config = recording
+    config.with_suffix(".local.yaml").write_text("dry_run_only: false")
+    gap = {"kind": "event_gated", "detail": "Synthetic future run",
+           "trigger": "2030-01-02", "recheck": "echo synthetic"}
+    result = await call(_doc(gaps=[gap]))
+    assert result["recorded"] is True
+    stored = row(path)
+    assert stored["status"] == "closed"
+    assert json.loads(stored["rechecks"]) == [
+        {**{k: gap[k] for k in ("trigger", "recheck", "detail")},
+         "results": [], "done_at": None}
+    ]
 
 
 @pytest.mark.parametrize("verdict", ["pass-mechanical", "fail-intent", "cannot-verify"])

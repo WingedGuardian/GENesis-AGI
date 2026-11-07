@@ -1676,6 +1676,10 @@ async def _check_deploy_staleness(db) -> None:
             _last_actionable_base_findings = [
                 f for f in findings if f.split(":", 1)[0] in _BASE_DEPENDENT_CLASSES
             ]
+        # Older repair report dirs not read (dismissed ones included) are named
+        # beside another finding, never an alert of their own.
+        if {f.split(":", 1)[0] for f in findings} == {"live_repair_unread_older"}:
+            findings = []
         if not findings:
             await _resolve_deploy_staleness(db)
             return
@@ -1896,8 +1900,9 @@ def _deploy_repair_paragraph(repairs: dict) -> str:
     unread = repairs.get("unread_older") or 0
     if unread:
         parts.append(
-            f"{unread} older live-move repair report(s) were not read (only the newest are); "
-            "this is informational, and they are pruned with their backups."
+            f"{unread} older live-move repair report dir(s) not read, dismissed ones included "
+            "(only the newest are read); this is informational, and they are pruned with "
+            "their backups."
         )
     if repairs.get("unresolved"):
         parts.append(
@@ -4488,6 +4493,13 @@ class AwarenessLoop:
             # completions (recorded by the invoker) and alerts on a run. Guarded
             # on db internally; a query failure no-ops (never breaks the tick).
             await _check_cc_cap_detection(self._db)
+            # Inbox sync staleness — reads one heartbeat file the timer-run sync
+            # writes; alerts when it stops succeeding (#3183). Every tick, not
+            # the hourly block: the hourly count resets on restart, and a dead
+            # sync went unnoticed for 17 days. Silent when no vault is set.
+            from genesis.inbox.sync_health import check_inbox_sync_health
+
+            await check_inbox_sync_health(self._db)
             # Dead-provider notification sweep — clock-driven ON PURPOSE (the
             # trip-driven version starved when traffic stopped; PR #1573).
             # Guarded on db internally; lever: provider_outage_notify domain +

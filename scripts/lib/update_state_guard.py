@@ -104,6 +104,7 @@ import os
 import re
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 
@@ -146,9 +147,44 @@ def _env() -> dict[str, str]:
     # GIT_OPTIONAL_LOCKS=0: deploy health asks while a deploy may be running,
     # and `git status` would otherwise refresh the index under index.lock,
     # failing a concurrent writer (MEASURED: a stale cached stat rewrites it).
+    # The GIT_CONFIG_* pairs are `-c` for every call, the residue helper's
+    # included (git 2.31+): a repository config naming an fsmonitor program
+    # or a hooks path never runs it here (#3964, from the #3984 review).
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env["GIT_OPTIONAL_LOCKS"] = "0"
+    env.update(
+        GIT_CONFIG_COUNT="2",
+        GIT_CONFIG_KEY_0="core.fsmonitor",
+        GIT_CONFIG_VALUE_0="false",
+        GIT_CONFIG_KEY_1="core.hooksPath",
+        GIT_CONFIG_VALUE_1="/dev/null",
+    )
     return env
+
+
+#: The state file is a few hundred bytes (update.sh writes one small object);
+#: one far over that is not a state any writer made.
+STATE_BYTES = 1 << 20
+
+
+def read_state(path: str) -> bytes:
+    """The state file's bytes, read so no file at that path can stall a caller
+    (#3964): never through a final symlink (ELOOP), never blocking on a FIFO
+    (O_NONBLOCK), a regular file only, at most STATE_BYTES. Raises OSError or
+    ValueError otherwise, which every reader takes as "it cannot be read"."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"{path} is not a regular file")
+        chunks, size = [], 0
+        while size <= STATE_BYTES and (chunk := os.read(fd, STATE_BYTES + 1 - size)):
+            chunks.append(chunk)
+            size += len(chunk)
+    finally:
+        os.close(fd)
+    if size > STATE_BYTES:
+        raise ValueError(f"{path} is over {STATE_BYTES} bytes")
+    return b"".join(chunks)
 
 
 def _rev(repo: str, rev: str) -> str:
@@ -653,8 +689,7 @@ def verdict(state_path: str, repo: str, conflicts_path: str | None = None) -> tu
     if not os.path.lexists(state_path):
         return SAFE, "there is no state file"
     try:
-        with open(state_path, encoding="utf-8") as fh:
-            state = json.load(fh)
+        state = json.loads(read_state(state_path).decode("utf-8"))
     except (OSError, ValueError, RecursionError):
         return _hold("it cannot be read", _UNTRUSTED)
     if conflicts_path is None:

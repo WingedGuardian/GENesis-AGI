@@ -225,6 +225,7 @@ def _engine_script(root: Path, script_dir: Path, base: str, mu: str, pre: str = 
         + "trap _on_err ERR\ntrap '_on_signal INT' INT\ntrap '_on_signal TERM' TERM\n"
         + '_write_state "merging"\n'
         + pre
+        + _block("stale-index-lock")
         + _block("live-engine")
         + 'echo "RESULT OWN=$UPDATE_OWN_HEAD DEPLOY=$DEPLOY_HEAD NEW=$NEW_COMMIT"\n'
     )

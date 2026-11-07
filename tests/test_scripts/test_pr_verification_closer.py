@@ -33,6 +33,7 @@ from pathlib import Path
 import aiosqlite
 import pytest
 
+from genesis.session_awareness.pr_recording import PrMetadata
 from tests.conftest import private_module
 from tests.test_session_awareness.conftest import build_pr_verifications
 
@@ -53,11 +54,11 @@ def _no_real_github(monkeypatch):
     the lookup is replaced for every test, and the ones about it replace it again."""
     calls: list[tuple[str, int]] = []
 
-    def fake(repo: str, pr: int) -> str:
+    def fake(repo: str, pr: int) -> PrMetadata:
         calls.append((repo, pr))
-        return MERGE_SHA
+        return PrMetadata(MERGE_SHA, "")
 
-    monkeypatch.setattr(_prv, "gh_merge_commit", fake)
+    monkeypatch.setattr(_prv, "gh_pr_metadata", fake)
     return calls
 
 
@@ -186,6 +187,17 @@ def _run(tmp_path: Path, doc: dict, *extra: str, pr: int = 7) -> int:
 
 
 # ── print-schema ─────────────────────────────────────────────────────────
+
+
+def test_existing_cli_close_stores_rechecks_without_a_new_caller_argument(tmp_path):
+    _seed(tmp_path / "genesis.db")
+    assert _run(tmp_path, _doc(gaps=[EVENT_GAP])) == 0
+    stored = _row(tmp_path / "genesis.db")
+    assert stored["status"] == "closed"
+    assert json.loads(stored["rechecks"]) == [
+        {**{k: EVENT_GAP[k] for k in ("trigger", "recheck", "detail")},
+         "results": [], "done_at": None}
+    ]
 
 
 def test_print_schema_emits_a_document_its_own_validator_shape_accepts(capsys):
@@ -1276,7 +1288,7 @@ def test_an_unresolvable_merge_commit_refuses_and_names_the_cause(tmp_path, caps
     def offline(repo, pr):
         raise LookupError("gh did not answer within 120 s (offline?)")
 
-    monkeypatch.setattr(_prv, "gh_merge_commit", offline)
+    monkeypatch.setattr(_prv, "gh_pr_metadata", offline)
     assert _run(tmp_path, _doc()) == 2
     err = capsys.readouterr().err
     assert "cannot check merge_commit" in err and "offline" in err
@@ -1304,11 +1316,50 @@ def test_an_injected_resolver_is_used_instead_of_gh(tmp_path):
         "--db-path",
         str(tmp_path / "genesis.db"),
     ]
-    assert _prv.main(argv, merge_commit_of=lambda r, n: "f" * 40) == 3
+    assert _prv.main(argv, pr_metadata_of=lambda r, n: PrMetadata("f" * 40, "")) == 3
 
 
 #: The real lookup, captured before the autouse fixture replaces it on the module.
 _REAL_GH = _prv.gh_merge_commit
+_REAL_METADATA = _prv.gh_pr_metadata
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("target", ["claim", "gap"])
+def test_declared_e2e_mapping_allows_the_existing_close(tmp_path, monkeypatch, dry_run, target):
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    before = _row(db)
+    step = "measure the next timer run"
+    monkeypatch.setattr(_prv, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, "E2E: " + step))
+    doc = _doc(e2e=[{"step": step, target: 0}], gaps=[EVENT_GAP] if target == "gap" else [])
+    assert _run(tmp_path, doc, *(["--dry-run"] if dry_run else [])) == 0
+    stored = _row(db)
+    if dry_run:
+        assert stored == before
+    else:
+        assert stored["status"] == "closed"
+        assert stored["verdict"] == ("pass-mechanical" if target == "claim" else "pass-with-measured-gaps")
+        assert json.loads(stored["evidence"])["e2e"][0][target] == 0
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_missing_declared_e2e_coverage_refuses_without_writing(tmp_path, monkeypatch, capsys, dry_run):
+    import shutil
+    import subprocess
+
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    before = _row(db)
+    step = "restart the timer and measure its next scheduled run"
+    monkeypatch.setattr(_prv, "gh_pr_metadata", _REAL_METADATA)
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/gh")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _Proc(
+        0, json.dumps({"mergeCommit": {"oid": MERGE_SHA}, "body": "E2E: " + step})
+    ))
+    assert _run(tmp_path, _doc(), *(["--dry-run"] if dry_run else [])) == 2
+    assert step in capsys.readouterr().err
+    assert _row(db) == before
 
 
 class _Proc:
@@ -1316,10 +1367,23 @@ class _Proc:
         self.returncode, self.stdout, self.stderr = rc, out, err
 
 
+@pytest.mark.parametrize("body", [None, [], {}, False, 1, "x" * 65_537])
+def test_unreadable_body_is_not_treated_as_no_e2e(monkeypatch, body):
+    import shutil
+    import subprocess
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/gh")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _Proc(
+        0, json.dumps({"mergeCommit": {"oid": MERGE_SHA}, "body": body})
+    ))
+    with pytest.raises(LookupError, match="PR body"):
+        _REAL_METADATA(REPO, 7)
+
+
 @pytest.mark.parametrize(
     ("proc", "expect"),
     [
-        (_Proc(0, json.dumps({"mergeCommit": {"oid": MERGE_SHA}})), MERGE_SHA),
+        (_Proc(0, json.dumps({"mergeCommit": {"oid": MERGE_SHA}, "body": ""})), MERGE_SHA),
         (_Proc(0, json.dumps({"mergeCommit": None})), "has no merge commit"),
         (_Proc(1, "", "HTTP 404"), "gh exited 1: HTTP 404"),
         (_Proc(0, "not json"), "not the expected JSON"),
@@ -1343,7 +1407,7 @@ def test_gh_merge_commit_parses_or_names_why_not(monkeypatch, proc, expect):
     else:
         with pytest.raises(LookupError, match=expect):
             _REAL_GH(REPO, 7)
-    assert seen[-1] == ["gh", "pr", "view", "7", "--repo", REPO, "--json", "mergeCommit"]
+    assert seen[-1] == ["gh", "pr", "view", "7", "--repo", REPO, "--json", "mergeCommit,body"]
 
 
 def test_gh_merge_commit_names_non_UTF8_output_rather_than_raising(monkeypatch):
@@ -1370,7 +1434,7 @@ def test_a_non_UTF8_gh_reply_refuses_the_close_with_code_2(tmp_path, capsys, mon
     def bad_bytes(argv, **kw):
         raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
 
-    monkeypatch.setattr(_prv, "gh_merge_commit", _REAL_GH)
+    monkeypatch.setattr(_prv, "gh_pr_metadata", _REAL_METADATA)
     monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/gh")
     monkeypatch.setattr(subprocess, "run", bad_bytes)
     assert _run(tmp_path, _doc()) == 2

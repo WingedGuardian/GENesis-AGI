@@ -22,6 +22,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from genesis.env import genesis_home
+from genesis.util.resolve import resolve_refusing_loops
 
 logger = logging.getLogger(__name__)
 
@@ -81,14 +82,17 @@ def _fingerprint(path: Path) -> dict[str, int | str]:
 
 def _read_marker() -> dict[str, object] | None:
     marker = quarantine_path()
-    if not marker.exists():
-        return None
     try:
+        # Read it rather than test exists(): from Python 3.14 that answers False
+        # when the directory cannot be searched, which would admit a quarantined
+        # database.
         payload = json.loads(marker.read_text())
         if isinstance(payload, dict):
             return payload
         logger.error("DB quarantine marker is not a JSON object: %s", marker)
         return {"_malformed": True}
+    except (FileNotFoundError, NotADirectoryError):
+        return None
     except (OSError, json.JSONDecodeError):
         logger.error("DB quarantine marker unreadable: %s", marker, exc_info=True)
         return {"_malformed": True}
@@ -107,7 +111,7 @@ def database_is_quarantined(path: str | Path) -> bool:
         return False
     if marker.get("_malformed"):
         return True
-    if marker.get("db_path") != str(db_path.resolve()):
+    if marker.get("db_path") != str(resolve_refusing_loops(db_path)):
         return False
     try:
         current = _fingerprint(db_path)

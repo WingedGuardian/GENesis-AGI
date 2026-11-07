@@ -64,7 +64,8 @@ async def test_failed_bootstrap_finalization_never_registers(database, monkeypat
     from genesis.db import request_database
 
     module = isolate_module(monkeypatch, name)
-    manager = RequestDatabase(database.path, max_units=1)
+    # Memory detaches side effects, so its bootstrap requires background budgets.
+    manager = RequestDatabase(database.path, max_units=1, max_background_units=1, max_background_jobs=1)
     key = "_service" if name == "health" else "_db"
     prior = getattr(module, key)
     middleware = list(module.mcp.middleware)
@@ -204,6 +205,55 @@ async def test_health_cannot_bind_different_database(database, monkeypatch):
         await initialize_request_service("health", db=database, service=SimpleNamespace(_db=None))
 
 
+@pytest.mark.parametrize(("name", "key"), [
+    ("outreach", "pipeline"), ("outreach", "engagement"),
+    ("recon", "pipeline"), ("recon", "memory_store"), ("recon", "surplus_queue"),
+])
+async def test_injected_dependency_cannot_bind_different_database(database, monkeypatch, name, key):
+    module = isolate_module(monkeypatch, name)
+    base = dict(pipeline=None, engagement=None, config=None) if name == "outreach" else {}
+    previous = (module._db, list(module.mcp.middleware))
+    with pytest.raises(ValueError, match=f"{key}.*supplied RequestDatabase"):
+        await initialize_request_service(name, db=database, **{**base, key: SimpleNamespace(_db=object())})
+    assert (module._db, module.mcp.middleware) == previous
+    bound = SimpleNamespace(_db=database)
+    await initialize_request_service(name, db=database, **{**base, key: bound})
+    assert getattr(module, f"_{key}") is bound
+
+
+async def test_memory_requires_explicit_pending_bookmark_policy(database, monkeypatch):
+    module = isolate_module(monkeypatch, "memory")
+    prior = (module._db, module._process_pending_bookmarks)
+    with pytest.raises(ValueError, match="process_pending_bookmarks"):
+        await initialize_request_service("memory", db=database, embedding_provider=object(), qdrant_client=object())
+    assert (module._db, module._process_pending_bookmarks) == prior
+
+
+@pytest.mark.parametrize(("name", "persist"), [("memory", None), ("recon", True), ("health", True)])
+async def test_detached_work_requires_background_budgets_before_registration(database, monkeypatch, name, persist):
+    module = isolate_module(monkeypatch, name)
+    manager = RequestDatabase(database.path, max_units=1)
+    try:
+        dependencies = bootstrap_dependencies(name, manager)
+        tracker = None
+        if persist is not None:
+            tracker = ProviderActivityTracker()
+            tracker.set_db(manager)
+            tracker.persist_activity = persist
+        key = "_service" if name == "health" else "_db"
+        previous = (getattr(module, key), list(module.mcp.middleware))
+        with pytest.raises(ValueError, match="background budgets"):
+            await initialize_request_service(name, db=manager, activity_tracker=tracker, **dependencies)
+        assert (getattr(module, key), module.mcp.middleware) == previous
+        if tracker is not None:
+            # Control: a tracker that never flushes needs no detached admission.
+            tracker.persist_activity = False
+            await initialize_request_service(name, db=manager, activity_tracker=tracker, **dependencies)
+            assert len([m for m in module.mcp.middleware if isinstance(m, InstrumentationMiddleware)]) == 1
+    finally:
+        await manager.close()
+
+
 @pytest.mark.parametrize("name", ["memory", "health", "recon", "outreach"])
 @pytest.mark.parametrize("metrics", [False, True])
 async def test_reinitialization_to_legacy_removes_scoped_boundary(database, monkeypatch, name, metrics):
@@ -331,3 +381,16 @@ async def test_registration_preserves_pending_tracker_flush(database, monkeypatc
         assert [tuple(row) for row in rows] == [("synthetic-pending", 3)]
     finally:
         await observer.close()
+
+
+async def test_direct_outreach_init_leaves_request_database_schema_to_bootstrap(database, monkeypatch):
+    module = isolate_module(monkeypatch, "outreach")
+    scheduled = []
+
+    def record(coro, **kwargs):
+        scheduled.append(kwargs.get("name"))
+        coro.close()
+
+    monkeypatch.setattr("genesis.util.tasks.tracked_task", record)
+    module.init_outreach_mcp(pipeline=None, engagement=None, config=None, db=database)
+    assert scheduled == []
