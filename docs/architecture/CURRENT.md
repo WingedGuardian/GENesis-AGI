@@ -3103,9 +3103,30 @@ verified: c712f1bde 2026-11-06
   a short floor (`FAILED_RETRY_FLOOR_MINUTES`) rather than the full interval —
   exempting it entirely was worse than the behaviour it replaced, since the
   uncaught raise (an unreadable DB) happens AFTER both expensive legs run.
-  Each class reconciles inside its own SAVEPOINT, so a class that raises
-  mid-DML cannot leave partial writes for the next commit on the shared
-  connection to flush while the record reports that class as not applied.
+  Each class reconciles in its own transaction, opened with `BEGIN IMMEDIATE`
+  and rolled back whole on failure, so a class that raises mid-DML cannot
+  leave partial writes for the next commit on the connection to flush while
+  the record reports that class as not applied. IMMEDIATE, not a deferred
+  SAVEPOINT: the class reads its prior rows and then writes, and a deferred
+  transaction's upgrade loses AT ONCE while the server is writing (SQLITE_BUSY,
+  or SQLITE_BUSY_SNAPSHOT once it has committed; no busy handler either way,
+  so only elapsed time separates this from a long-held writer). MEASURED
+  2026-11-07: 0 ms to the error; 24-33 runs per class frozen on "database is
+  locked", all 86 class tracebacks at a write after the read. Taking the
+  writer slot first makes the server's write wait instead (measured hold for
+  a 421-row class: median 87 ms, max 151 ms, against the 5 s busy_timeout; it
+  grows roughly linearly with rows). A class or the blindness alert that
+  still loses the lock is retried whole (3 attempts, the connection layer's
+  delays); each lost attempt is logged with its SQLite error name and timing,
+  `applied[cls].lock_retries` records retries that succeeded, and a unit that
+  gives up writes a lock-holder snapshot (`db/lock_holders.py`) and records
+  its `writer_pids` under `lock_evidence` in `last_run.json` (never in
+  `degraded`, whose text feeds the blindness alert's hash). The blindness
+  alert's own losses are a different cause: single-statement writes DO wait
+  out busy_timeout, so a loss there means a writer held the slot past 5 s.
+  A class whose rollback itself fails leaves the connection in
+  a transaction; the worker then discards that connection, skips the classes
+  not yet reconciled, and finishes the run on a fresh one.
   Untrusted text reaching a MODEL: a branch identity is the ack key and is
   emitted VERBATIM, paired with a neutralised `branch_display` and an
   `identity_unrenderable` flag. `check-ref-format` bans control characters but
