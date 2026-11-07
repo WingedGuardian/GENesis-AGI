@@ -156,7 +156,7 @@ def reservation(value, claimed):
     if route == "capped" and claimed["provider"] == "gitnexus" and parent == "app-capped.slice":
         return value
     if route == "inherit" and claimed["provider"] == "cbm":
-        return value  # The actual caller Unit.Slice is independently checked at registration.
+        return value  # The trusted producer must independently bind the actual owner's Unit.Slice.
     raise ValueError("native route does not match the reservation")
 
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import re
+import sys
 import time
 import uuid
 from copy import deepcopy
@@ -61,6 +62,15 @@ def cleanup_observation(registration, registration_sha256, proof, *, owned_wait,
     try:
         identity = proof._identity(leaf)
     except FileNotFoundError:
+        # Absence below a matching original ancestor proves removal; absence
+        # through a replaced or unreadable ancestor proves only lost visibility.
+        for item in reversed(baseline["ancestors"]):
+            try:
+                ancestor = proof._identity(Path(item["identity"]["path"]))
+            except FileNotFoundError:
+                break
+            if ancestor != item["identity"]:
+                raise ValueError("original ancestor inode changed") from None
         _root(baseline, proof, proc)
         if _boot(proc) != current_boot:
             raise ValueError("boot changed during cleanup observation") from None
@@ -176,8 +186,14 @@ class ScopeManager:
         leaf = PurePosixPath(facts["leaf"]["path"])
         group = self.property(properties, "ControlGroup", "s")
         target = PurePosixPath(group)
+        native_id = self.property(properties, "ControlGroupId", "t")
         stop = self.property(properties, "TimeoutStopUSec", "t")
         if (identity[0] != unit + ".scope" or leaf.name != identity[0]
+                # kernfs exposes the full native ID as st_ino on 64-bit Linux.
+                # An enclosing GetUnitByPID result or matching names is weaker.
+                or sys.maxsize <= 2**32 or native_id == 0
+                or native_id != facts["leaf"]["inode"]
+                or facts["leaf"]["device"] != facts["root"]["device"]
                 or self.property(properties, "Slice", "s") != leaf.parent.name
                 or not target.is_absolute() or ".." in target.parts or "\0" in group
                 or target.name != leaf.name or target.parent.name != leaf.parent.name

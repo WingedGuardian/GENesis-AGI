@@ -753,6 +753,23 @@ The collector samples recursive population before the owned counters, so an OOM
 at the last descendant's exit is retained before physical release. A populated
 sample remains unresolved for that observation even if tasks exit afterward.
 
+Manager registration additionally matches the typed positive `ControlGroupId`
+to the captured leaf inode on 64-bit Linux and requires the leaf's cgroup
+filesystem device to match the original root. An enclosing unit lookup and
+matching scope/slice names alone cannot authorize a deeper delegated leaf.
+Missing or incompatible native identity refuses; there is no basename fallback.
+When the leaf is absent, cleanup checks original ancestor identities from the
+root down. A genuinely deleted branch under an unchanged ancestor can prove
+removal; replaced or unreadable visible ancestors cannot.
+
+The queued observer reports an intent callback's `RuntimeError` as refusal
+before child creation, preserving its type/message in the caller's private
+diagnostics. Errors elsewhere retain their existing behavior. Producers must
+independently bind the actual owner identity and inherited slice, use the
+accepted executable descriptor for the invocation, and close their creation and
+migration paths before cleanup. Descriptor transport alone is not executable
+acceptance; the queue lock does not prevent arbitrary external cgroup migration.
+
 `execution-status --context ...` uses the existing read-only/query-only opener;
 it neither initializes nor imports work. `evidence_pending` reports retained
 typed spools and makes a database-only observation explicitly incomplete.

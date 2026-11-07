@@ -1,6 +1,7 @@
 """Synthetic original-subtree proof; this is not native cgroup qualification."""
 import os
 import runpy
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -106,6 +107,55 @@ def test_real_original_path_absence_under_same_root_is_separate_proof(original_s
     assert data['root'] == registration['facts']['root']
     assert data['mounts_sha256'] == registration['facts']['mounts_sha256']
     assert data['boot_id'] == registration['facts']['reporter']['boot_id']
+
+
+def _nested_original_scope(original_scope):
+    registration, leaf, proc, proof = original_scope
+    branch = leaf.parent.parent / 'original-branch'
+    branch.mkdir()
+    leaf.parent.rename(branch / leaf.parent.name)
+    leaf = branch / leaf.parent.name / leaf.name
+    facts = registration['facts']
+    facts['leaf']['path'] = str(leaf)
+    facts['membership'] = '0::/' + str(leaf.relative_to(facts['root']['path'])) + '\n'
+    facts['ancestors'][0]['identity']['path'] = str(leaf.parent)
+    facts['ancestors'].insert(1, {'identity': proof._identity(branch), 'events': None,
+                                 'error': 'ancestor_events_unavailable'})
+    return registration, leaf, proc, proof
+
+
+@pytest.mark.parametrize('fault', ['replaced', 'unreadable'])
+@pytest.mark.parametrize('depth', [1, 2])
+def test_hidden_leaf_cannot_be_removed_through_unproven_original_ancestor(original_scope, fault, depth):
+    operation = control()
+    if depth == 2:
+        original_scope = _nested_original_scope(original_scope)
+    _, leaf, _, proof = original_scope
+    ancestor = leaf.parent if depth == 1 else leaf.parent.parent
+    identity = proof._identity
+
+    def hidden(path):
+        if path == leaf:
+            raise FileNotFoundError('original leaf is not visible')
+        if path == ancestor:
+            if fault == 'unreadable':
+                raise PermissionError('original parent is not visible')
+            return {**identity(path), 'inode': identity(path)['inode'] + 1}
+        return identity(path)
+
+    proof._identity = hidden
+    with pytest.raises((OSError, ValueError)):
+        read(operation, original_scope, waited=False)
+
+
+@pytest.mark.parametrize('depth', [1, 2])
+def test_genuinely_removed_parent_branch_under_original_root_is_removed(original_scope, depth):
+    # This is a private fixture tree, not native cgroup rename/removal evidence.
+    if depth == 2:
+        original_scope = _nested_original_scope(original_scope)
+    _, leaf, _, _ = original_scope
+    shutil.rmtree(leaf.parent if depth == 1 else leaf.parent.parent)
+    assert read(control(), original_scope, waited=False)['state'] == 'removed'
 
 
 def test_changed_actual_boot_closes_old_tasks_without_old_root_visibility(original_scope):

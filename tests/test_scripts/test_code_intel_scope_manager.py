@@ -3,6 +3,7 @@ import runpy
 import sys
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,6 +26,7 @@ class Bus:
                      'InvocationID': variant('ay', [1] * 16)}
         self.scope = {'Slice': variant('s', 'genesis-workload.slice'),
                       'ControlGroup': variant('s', '/user.slice/genesis-workload.slice/' + UNIT + '.scope'),
+                      'ControlGroupId': variant('t', 3),
                       'TimeoutStopUSec': variant('t', 90_000_000),
                       'MemoryMax': variant('t', 8 * 1024**3), 'MemorySwapMax': variant('t', 0),
                       'KillMode': variant('s', 'control-group'), 'SendSIGKILL': variant('b', True)}
@@ -82,9 +84,64 @@ def test_registration_uses_getunit_and_bounded_typed_properties():
     assert [call[4] for call in bus.calls] == pytest.approx([1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4])
 
 
+@pytest.mark.parametrize('native_id', [3, 2**40 + 3])
+def test_native_group_identity_survives_different_visible_path_prefixes(native_id):
+    bus = Bus()
+    facts = _facts(CLAIM)
+    facts['leaf']['inode'] = native_id
+    bus.scope['ControlGroupId'] = variant('t', native_id)
+    bus.scope['ControlGroup'] = variant('s', '/manager-prefix/genesis-workload.slice/' + UNIT + '.scope')
+    assert manager(bus).registration(UNIT, facts, wall_seconds=3600)['facts'] == facts
+
+
+@pytest.mark.parametrize('value', [None, 0, -1, True, '3', 3.0, 4, 2**40 + 3, 2**64])
+def test_missing_malformed_or_different_native_group_identity_refuses(value):
+    bus = Bus()
+    if value is None:
+        del bus.scope['ControlGroupId']
+    else:
+        bus.scope['ControlGroupId'] = variant('t', value)
+    with pytest.raises(ValueError):
+        manager(bus).registration(UNIT, _facts(CLAIM), wall_seconds=3600)
+
+
+def test_enclosing_unit_does_not_authorize_a_delegated_leaf_with_repeated_names():
+    bus = Bus()
+    facts = _facts(CLAIM)
+    original = deepcopy(facts['leaf'])
+    nested = Path(original['path']) / 'genesis-workload.slice' / (UNIT + '.scope')
+    facts['leaf'].update(path=str(nested), inode=4)
+    facts['membership'] = '0::/' + str(nested.relative_to(facts['root']['path'])) + '\n'
+    counters = facts['events']
+    facts['ancestors'] = [
+        {'identity': {'path': str(nested.parent), 'device': 7, 'inode': 5},
+         'events': deepcopy(counters), 'error': None},
+        {'identity': original, 'events': deepcopy(counters), 'error': None},
+        *facts['ancestors'],
+    ]
+    # Both basename comparisons and both enclosing-unit lookups still match.
+    # The actual deeper kernel identity differs from the manager's outer scope.
+    with pytest.raises(ValueError):
+        manager(bus).registration(UNIT, facts, wall_seconds=3600)
+
+
+def test_native_group_id_requires_the_captured_cgroup_filesystem():
+    facts = _facts(CLAIM)
+    facts['leaf']['device'] += 1
+    with pytest.raises(ValueError):
+        manager(Bus()).registration(UNIT, facts, wall_seconds=3600)
+
+
+def test_truncated_kernel_inode_platform_cannot_claim_full_native_id(monkeypatch):
+    operation = manager(Bus())
+    monkeypatch.setitem(operation.registration.__globals__, 'sys', SimpleNamespace(maxsize=2**31 - 1))
+    with pytest.raises(ValueError):
+        operation.registration(UNIT, _facts(CLAIM), wall_seconds=3600)
+
+
 @pytest.mark.parametrize('fault', ['id', 'load', 'invocation-type', 'invocation-size', 'invocation-bool',
                                   'slice', 'group', 'relative-group', 'traversal-group',
-                                  'stop-zero', 'stop-infinite', 'stop-bool', 'cap', 'swap',
+    'stop-zero', 'stop-infinite', 'stop-bool', 'native-id-type', 'cap', 'swap',
                                   'kill-mode', 'no-sigkill', 'sigkill-type'])
 def test_unproven_scope_identity_or_stop_policy_refuses(fault):
     bus = Bus()
@@ -102,6 +159,7 @@ def test_unproven_scope_identity_or_stop_policy_refuses(fault):
         'stop-zero': (bus.scope, 'TimeoutStopUSec', variant('t', 0)),
         'stop-infinite': (bus.scope, 'TimeoutStopUSec', variant('t', 2**64 - 1)),
         'stop-bool': (bus.scope, 'TimeoutStopUSec', variant('t', True)),
+        'native-id-type': (bus.scope, 'ControlGroupId', variant('u', 3)),
         'cap': (bus.scope, 'MemoryMax', variant('t', 2 * 1024**3)),
         'swap': (bus.scope, 'MemorySwapMax', variant('t', 1)),
         'kill-mode': (bus.scope, 'KillMode', variant('s', 'process')),

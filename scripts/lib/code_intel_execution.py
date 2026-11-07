@@ -395,7 +395,12 @@ class QueuedLaunch:
         return launch
 
     def _spawn(self, command, before, deadline):
-        if self.before_spawn(before) != "started":
+        try:
+            acknowledgement = self.before_spawn(before)
+        except RuntimeError as error:
+            self.diagnostics.append(f"native_intent_callback_failed: {type(error).__name__}: {error}")
+            raise ValueError("native intent callback did not authorize launch") from error
+        if acknowledgement != "started":
             raise ValueError("first committed native intent not acknowledged")
         if time.monotonic() >= deadline:
             raise ValueError("deadline reached after native intent")

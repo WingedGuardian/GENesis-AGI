@@ -1795,7 +1795,10 @@ the shared banner is not an assertion about all concurrent sessions.
   and independent provider holds. Newly measured owned OOMs use the existing
   durable evidence path; preparation OOM remains visible after admission refusal.
   Typed manager inspection is read-only and bounds every call by its remaining
-  deadline. Automatic readiness stays fenced; actual scope creation, watchdog/
+  deadline. Registration binds the manager's native cgroup ID to the captured
+  original leaf on 64-bit Linux; missing-leaf cleanup verifies the visible
+  original ancestor chain. Intent callback RuntimeError refuses child creation
+  with private diagnostics. Automatic readiness stays fenced; actual scope creation, watchdog/
   runner wiring and recovery remain unfinished. Synthetic fixtures do not
   establish native kernel or production acceptance.
   `scripts/lib/code_intel_source.py` provides explicit captured-source diagnostics
