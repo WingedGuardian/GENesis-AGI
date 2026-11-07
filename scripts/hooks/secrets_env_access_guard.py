@@ -130,6 +130,9 @@ _DISPATCHED_PRIORITY = "low"
 #: the previous code: crafted commands of 30 characters to 40 KB kept the scan
 #: running 8 to 21 s inside single calls (brace expansion, two regexes) that no
 #: deadline inside the scan can interrupt; only killing the process bounds them.
+#: The 10 s is shared: launcher and startup about 0.3 s, this check at most 5 s,
+#: and a dispatched deny's record about 1.5 s (the genesis import, plus
+#: create_sync's 1 s SQLite timeout). Re-check that sum before raising this.
 _CHECK_LIMIT_S = 5.0
 
 

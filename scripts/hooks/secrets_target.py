@@ -701,7 +701,8 @@ def touches_secrets(*, paths: list[str] | None = None, command: str = "", _depth
             # and expands the WHOLE word, never a piece of it, so the glob and
             # suspicion arms below stay on `tok`.
             bare_tok = raw_tok in unquoted
-            for piece in _operand_spellings(tok)[1:]:
+            # An excluding option's value names a file to skip (`--exclude=NAME`).
+            for piece in [] if _excluding(tok) else _operand_spellings(tok)[1:]:
                 if _is_secret_path(piece, inodes, allow_bare=bare_tok):
                     return True
             if bare_tok and _pattern_piece_hits(tok):
@@ -901,9 +902,42 @@ def _ansi_c_names_secret(scan: str) -> bool:
             text = codecs.decode(content, "unicode_escape")
         except (UnicodeDecodeError, ValueError):
             continue
-        if any(name in text for name in _SECRET_BASENAMES):
+        # The span must BE the operand (the name, or a path ending in it), the
+        # rule a quoted word follows everywhere else; a decoded commit message
+        # that only mentions the name is still prose.
+        value = text.strip().rstrip("/")
+        if value.rsplit("/", 1)[-1] in _SECRET_BASENAMES and (
+            value in _SECRET_BASENAMES or "/" in value
+        ):
             return True
     return False
+
+
+def _decode_ansi_c(text: str) -> str:
+    """``text`` with each escape-bearing `$'...'` span replaced by its decoded
+    value, single-quoted, so the word list and any carried script read what bash
+    passes (`bash -c $'cat x\\n'` runs `cat x`). shell_parse leaves those spans
+    undecoded on purpose; this decodes them only to read the words."""
+    spans = [s for s in shell_parse._ansi_c_spans(text) if s[3]]
+    if not spans:
+        return text
+    out, last = [], 0
+    for start, end, content, _has_escape in spans:
+        try:
+            value = codecs.decode(content, "unicode_escape")
+        except (UnicodeDecodeError, ValueError):
+            continue
+        out.append(text[last:start])
+        out.append(shlex.quote(value))
+        last = end
+    out.append(text[last:])
+    return "".join(out)
+
+
+def _excluding(word: str) -> bool:
+    """`--exclude=NAME` and its kin name a file to SKIP: never an operand."""
+    head = _JOINTS.split(word, 1)[0]
+    return head != word and _EXCLUDING.match(head) is not None
 
 
 def _joined_word_hits(scan: str, inodes, deadline: float, depth: int = 0) -> bool:
@@ -918,6 +952,10 @@ def _joined_word_hits(scan: str, inodes, deadline: float, depth: int = 0) -> boo
     # mostly), so the fallback stays this narrow.
     if _ansi_c_names_secret(scan):
         return True
+    # shell_parse reports an escape-bearing `$'...'` as a blind spot, so decode
+    # those spans before parsing: the words, their quoting and any carried
+    # script are then read as bash passes them.
+    scan = _decode_ansi_c(scan)
     try:
         segments, blind = shell_parse.analyze_checked(scan)
     except Exception:
@@ -939,6 +977,9 @@ def _joined_word_hits(scan: str, inodes, deadline: float, depth: int = 0) -> boo
             if time.monotonic() > deadline:
                 return True
             clean = word.rstrip(")")
+            if _excluding(clean) or _EXCLUDING.match(prev):
+                prev = word
+                continue
             if prev in _PATTERN_OPTS and (
                 _names_secret_pattern(clean)
                 or clean.rsplit("/", 1)[-1].lower() in {n.lower() for n in _SECRET_BASENAMES}

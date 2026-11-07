@@ -97,6 +97,11 @@ def in_checkout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "watch 'cat secrets.env'",
         "env -S 'cat secrets.env'",
         "find . -exec sh -c 'cat secrets.env' \\;",
+        # A carried script in `$'...'` is read decoded.
+        "bash -c $'cat secrets.env\\n'",
+        "bash -c $'cat secrets.env\\nls'",
+        "eval $'cat secrets.env\\n'",
+        "bash -c $'cat \\x73ecrets.env'",
         # A pattern the program expands names the file as surely as its name.
         "grep -r --include=s*.env KEY .",
         "grep -r --include='secrets.*' KEY .",
@@ -130,6 +135,11 @@ def test_a_joined_secrets_operand_gates(in_checkout: Path, command: str) -> None
         # An excluding option's pattern names files to skip, never to open.
         "rsync -a --exclude=*.env . /backup",
         "tar --exclude=secrets.* -czf /backup/x.tgz .",
+        "tar --exclude=secrets.env -cf /backup/x.tar .",
+        "grep -r --exclude=secrets.env KEY src",
+        # A decoded `$'...'` message that only mentions the name is prose.
+        "git commit -m $'Update secrets.env.example\\n\\nFix template'",
+        "git commit -m $'rotate secrets.env\\n'",
         # Pattern options naming other files, and a carried command naming none.
         "find . -name '*.py' -newer x",
         "rg -g '*.md' TODO docs",
