@@ -20,11 +20,21 @@ from pathlib import Path
 import aiosqlite
 
 from genesis.db.crud.observations import SAFE_ORIGIN_SQL, SAFE_SURFACING_ORIGINS
+from genesis.util.text import clip_words
 
 logger = logging.getLogger(__name__)
 
 _OUTPUT_PATH = Path.home() / ".genesis" / "essential_knowledge.md"
 _MAX_TOKENS = 300  # Target size in approximate tokens
+
+# Display lengths, marker included (genesis.util.text.clip_words). They are
+# the old raw-slice lengths, so no line grows; each now ends on a whole word.
+_TOPIC_CHARS = 200
+_FOCUS_CHARS = 200
+_INSIGHT_CHARS = 250
+# How much of an insight row is read, and deduplicated on, before it is
+# clipped for display. Bounded so a huge row never crosses into Python whole.
+_INSIGHT_READ_CHARS = 1000
 
 
 async def generate_deterministic(db: aiosqlite.Connection) -> str:
@@ -288,7 +298,7 @@ async def _recent_session_topics(db: aiosqlite.Connection, days: int = 7) -> lis
             sql, (*allowed, *safe_origins, f"-{days} days"),
         )
         rows = await cursor.fetchall()
-        return [row[0][:200] for row in rows if row[0]]
+        return [clip_words(row[0], _TOPIC_CHARS) for row in rows if row[0]]
     except Exception:
         return []
 
@@ -364,11 +374,11 @@ async def _recent_decisions(
         # entries are collected, which bounds the work instead.
         results: list[str] = []
         seen: set[str] = set()
-        # The 250-char display slice is taken in SQL, so a long row never
-        # crosses into Python whole, and the dedup key is computed on exactly
-        # the text that would be shown.
+        # The read is capped in SQL, so a long row never crosses into Python
+        # whole. Dedup keys on that capped text, not on the shorter display
+        # clip: rows that share their opening and differ later are distinct.
         async with db.execute(
-            "SELECT substr(content, 1, 250) FROM observations "  # noqa: S608 - literal SQL fragments; values bound as parameters
+            "SELECT substr(content, 1, ?) FROM observations "  # noqa: S608 - literal SQL fragments; values bound as parameters
             f"WHERE type NOT IN ({placeholders}) "
             "AND resolved = 0 "
             # WS-3: exclude external/unknown-origin content from the L1 file
@@ -376,16 +386,24 @@ async def _recent_decisions(
             f"AND {SAFE_ORIGIN_SQL} "
             "AND created_at > datetime('now', ?) "
             "ORDER BY created_at DESC",
-            (*_EXCLUDED_TYPES, f"-{days} days"),
+            (_INSIGHT_READ_CHARS, *_EXCLUDED_TYPES, f"-{days} days"),
         ) as cursor:
             async for row in cursor:
-                shown = row[0]
-                if not shown:
+                text = row[0]
+                if not text:
                     continue
-                key = _insight_dedup_key(shown)
-                if key in seen:
+                key = _insight_dedup_key(text)
+                shown = clip_words(text, _INSIGHT_CHARS)
+                # Also dedup on what is SHOWN: two rows that differ only
+                # past the display cut would otherwise print as two lines
+                # that look identical.
+                # Keyed on the 250-char WINDOW, not the clip: a short row shown
+                # whole and a longer one shown with "…" share that window.
+                shown_key = ("shown", _insight_dedup_key(text[:_INSIGHT_CHARS]))
+                if key in seen or shown_key in seen:
                     continue
                 seen.add(key)
+                seen.add(shown_key)
                 results.append(shown)
                 if len(results) >= limit:
                     break
@@ -438,8 +456,11 @@ async def _ego_focus(db: aiosqlite.Connection) -> str | None:
         )
         row = await cursor.fetchone()
         if row and row[0]:
-            focus = row[0][:200]
-            if _BEHAVIORAL_FOCUS_RE.search(focus):
+            focus = clip_words(row[0], _FOCUS_CHARS)
+            # The safety filter reads the OLD 200-char window, not the clip: a
+            # word-boundary clip can drop a phrase ending at character 200
+            # that the raw slice kept.
+            if _BEHAVIORAL_FOCUS_RE.search(row[0][:_FOCUS_CHARS]):
                 logger.warning(
                     "Ego focus contains behavioral self-assignment, "
                     "omitting from essential knowledge: %s",

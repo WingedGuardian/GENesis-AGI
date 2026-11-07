@@ -119,10 +119,68 @@ async def test_stops_at_limit_distinct_entries(db):
 
 
 @pytest.mark.asyncio
-async def test_shown_text_is_the_250_char_slice(db):
+async def test_shown_text_is_clipped_to_250_chars(db):
+    # A single word longer than the limit is the one case cut mid-word.
     await _mk(db, "long", "learning", "x" * 400)
 
-    assert await _recent_decisions(db) == ["x" * 250]
+    assert await _recent_decisions(db) == ["x" * 249 + "…"]
+
+
+_PROSE = " ".join(f"word{i}" for i in range(200))  # ~1,190 chars, synthetic
+
+
+@pytest.mark.asyncio
+async def test_long_insight_ends_at_a_word_boundary(db):
+    await _mk(db, "long", "learning", _PROSE)
+
+    [shown] = await _recent_decisions(db)
+    assert shown.endswith("…")
+    assert len(shown) <= 250
+    assert set(shown[:-1].split()) <= set(_PROSE.split())
+
+
+@pytest.mark.asyncio
+async def test_rows_differing_only_past_the_display_cut_show_once(db):
+    """Two rows that share their first 250 chars but differ later would print
+    as two IDENTICAL lines; only the newer is shown."""
+    shared = "a " * 150  # 300 chars of common prefix
+    await _mk(db, "a", "learning", shared + "ending one", minutes_ago=0)
+    await _mk(db, "b", "learning", shared + "ending two", minutes_ago=1)
+    await _mk(db, "c", "learning", "something else", minutes_ago=2)
+
+    out = await _recent_decisions(db)
+    assert len(out) == 2
+    assert len(set(out)) == len(out), "no two shown lines may look identical"
+    assert out[1] == "something else"
+
+
+@pytest.mark.asyncio
+async def test_a_whole_short_row_and_a_longer_one_with_its_opening_show_once(db):
+    """A <=250-char row is shown whole, a longer row with the same opening is
+    shown clipped with "…"; they must not print as two near-identical lines."""
+    short = ("word " * 50).strip()  # 249 chars
+    await _mk(db, "a", "learning", short + " and then much more text follows", minutes_ago=0)
+    await _mk(db, "b", "learning", short + " ", minutes_ago=1)
+
+    assert len(await _recent_decisions(db)) == 1
+
+
+@pytest.mark.asyncio
+async def test_rows_differing_within_the_display_window_are_both_kept(db):
+    shared = "a " * 50  # 100 chars, well inside the 250 shown
+    await _mk(db, "a", "learning", shared + "ending one", minutes_ago=0)
+    await _mk(db, "b", "learning", shared + "ending two", minutes_ago=1)
+
+    assert len(await _recent_decisions(db)) == 2
+
+
+@pytest.mark.asyncio
+async def test_rows_identical_in_the_first_1000_chars_collapse(db):
+    shared = "b " * 600  # 1,200 chars
+    await _mk(db, "a", "learning", shared + "tail one", minutes_ago=0)
+    await _mk(db, "b", "learning", shared + "tail two", minutes_ago=1)
+
+    assert len(await _recent_decisions(db)) == 1
 
 
 @pytest.mark.asyncio
