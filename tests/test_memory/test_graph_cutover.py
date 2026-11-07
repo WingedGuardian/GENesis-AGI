@@ -500,3 +500,69 @@ def test_an_excluded_replay_and_a_foreign_generic_process_hold_nothing():
         ],
     )
     assert cut.evaluate(_daily_traffic(14), census, [], NOW).status == "PASS"
+
+
+# ── Owner ruling 9931626424ee4c6c: a young unprovable generic process ─────────
+def _generic(unknown: str, started: datetime) -> dict:
+    return {
+        "pid": 7, "role": "venv-generic", "started_at": started.isoformat(),
+        "commit": "c", "held": ["c"], "telemetry": None, "unknown": unknown,
+        "foreign": False, "db_identity": [1, 2],
+    }
+
+
+@pytest.mark.parametrize("unknown", ["other_genesis_home", "interpreter_unresolved"])
+def test_a_young_unprovable_generic_process_does_not_hold_the_clock(unknown):
+    row = _census_metrics(procs=[_proc(), _generic(unknown, NOW - timedelta(seconds=5))])
+    assert cut.census_dirt(row, NOW) is None
+    # The row's history check vouches for it; without that the excuse is void.
+    assert cut.census_dirt({**row, "head_history_telemetry": False}, NOW) is not None
+
+
+@pytest.mark.parametrize("unknown", ["other_genesis_home", "interpreter_unresolved"])
+def test_an_unprovable_generic_process_older_than_the_lookback_still_holds_it(unknown):
+    old = _generic(unknown, NOW - cut.HISTORY_LOOKBACK - timedelta(seconds=1))
+    edge = _generic(unknown, NOW - cut.HISTORY_LOOKBACK)
+    assert "may run old code" in cut.census_dirt(_census_metrics(procs=[old]), NOW)
+    assert cut.census_dirt(_census_metrics(procs=[edge]), NOW) is None
+
+
+def test_the_excuse_needs_the_row_time_a_start_and_a_named_reason():
+    young = _generic("other_genesis_home", NOW - timedelta(seconds=5))
+    assert cut.census_dirt(_census_metrics(procs=[young])) is not None  # no row time
+    no_start = {**young, "started_at": None}
+    assert cut.census_dirt(_census_metrics(procs=[no_start]), NOW) is not None
+    future = _generic("other_genesis_home", NOW + timedelta(seconds=5))
+    assert cut.census_dirt(_census_metrics(procs=[future]), NOW) is not None
+    other = _generic("started_on_old_code", NOW - timedelta(seconds=5))
+    assert cut.census_dirt(_census_metrics(procs=[other]), NOW) is not None
+
+
+@pytest.mark.parametrize("unknown", [["other_genesis_home"], {"x": 1}])
+def test_an_unhashable_unknown_reads_dirty_and_never_aborts_the_report(unknown):
+    p = {**_generic("other_genesis_home", NOW - timedelta(seconds=5)), "unknown": unknown}
+    assert cut.census_dirt(_census_metrics(procs=[p]), NOW) is not None
+
+
+@pytest.mark.parametrize("role", ["mcp-memory", "ambient"])
+def test_a_traversal_producer_gets_no_such_excuse(role):
+    p = {**_generic("other_genesis_home", NOW - timedelta(seconds=5)), "role": role}
+    p.update(unknown_reasons=["other_genesis_home"], source=None, telemetry_off=False)
+    assert cut.census_dirt(_census_metrics(procs=[p]), NOW) is not None
+
+
+def test_evaluate_passes_each_row_time_so_young_jobs_never_reset_the_clock():
+    rows = []
+    t = NOW - timedelta(days=15)
+    while t <= NOW:
+        procs = [_proc(), _generic("other_genesis_home", t - timedelta(seconds=3))]
+        rows.append((_ts(t), json.dumps(_census_metrics(procs=procs))))
+        t += timedelta(hours=1)
+    v = cut.evaluate(_daily_traffic(14), rows, [], NOW)
+    assert v.status == "PASS", v.reasons
+
+
+def test_the_verdict_lookback_is_the_writer_lookback():
+    from genesis.memory import graph_census
+
+    assert timedelta(seconds=graph_census.HISTORY_LOOKBACK_S) == cut.HISTORY_LOOKBACK

@@ -53,6 +53,17 @@ _ROLE_NAMES = {
     "bridge": "bridge",
     "venv-generic": "venv process",
 }
+#: Why a generic venv process may be unprovable: in every measured case another
+#: session's test run or one-off job. Owner rulings ba877469 (a generic process
+#: is judged on main's history and its database scope only) and
+#: 9931626424ee4c6c (these two reasons never reset the clock) excuse it. The
+#: excuse holds only inside the writer's history lookback, where the row's
+#: ``head_history_telemetry`` (checked in ``census_dirt``) covers main's commits;
+#: a stored row cannot say more about an older process.
+_GENERIC_UNPROVABLE = frozenset({"other_genesis_home", "interpreter_unresolved"})
+#: The census writer's history lookback (graph_census.HISTORY_LOOKBACK_S; a test
+#: pins the two equal).
+HISTORY_LOOKBACK = timedelta(hours=2.5)
 _CLEAN_OUTCOMES = frozenset({"primary"})
 _NEUTRAL_OUTCOMES = frozenset({"cancelled"})
 
@@ -122,8 +133,9 @@ def _is_count(n: object) -> bool:
     return type(n) is int and n >= 0
 
 
-def census_dirt(m: dict | None) -> str | None:
-    """Why a census row is NOT clean, or ``None`` when it is."""
+def census_dirt(m: dict | None, at: datetime | None = None) -> str | None:
+    """Why a census row is NOT clean, or ``None`` when it is. ``at`` is the row's
+    timestamp; without it no generic process is excused."""
     if m is None:
         return "unreadable census row"
     schema, reasons = m.get("v"), m.get("reasons")
@@ -146,7 +158,7 @@ def census_dirt(m: dict | None) -> str | None:
     if m.get("head_telemetry") is not True:
         return "the checkout's HEAD does not contain the telemetry module"
     if m.get("head_dirty") is not False:
-        return "the checkout's runtime code (src/ or an entry script) is dirty"
+        return "the checkout's graph-read code (graph_census._RUNTIME_PATHS) is dirty"
     if m.get("head_history_telemetry") is not True:
         return "HEAD held code without telemetry in the last 2h30m (or its history is unreadable)"
     procs = m.get("procs")
@@ -166,6 +178,13 @@ def census_dirt(m: dict | None) -> str | None:
             continue  # a bench process on a scratch DB: its traversals are not ours
         if role == "venv-generic":
             # Owner ruling: history and scope only, no source or switch proof.
+            unknown = p.get("unknown")
+            if (
+                isinstance(unknown, str)
+                and unknown in _GENERIC_UNPROVABLE
+                and _within_lookback(p, at)
+            ):
+                continue
             if p.get("telemetry") is not True:
                 why = p.get("unknown") or "started on, or has seen, code without telemetry"
                 return f"{who} may run old code ({why})"
@@ -192,6 +211,14 @@ def census_dirt(m: dict | None) -> str | None:
             why = p.get("unknown") or "started on, or has seen, code without telemetry"
             return f"{who} may run old code ({why})"
     return None
+
+
+def _within_lookback(p: dict, at: datetime | None) -> bool:
+    """Whether the process started inside the row's history lookback, where
+    ``head_history_telemetry`` covers every commit main's checkout held."""
+    raw = p.get("started_at")
+    started = parse_ts(raw) if isinstance(raw, str) else None
+    return at is not None and started is not None and at - HISTORY_LOOKBACK <= started <= at
 
 
 def traversal_breaks_clock(m: dict) -> str | None:
@@ -243,7 +270,7 @@ def evaluate(
         if t is None:
             integrity.append("a census row has no readable timestamp")
         elif t <= now:
-            parsed.append((t, census_dirt(m) is not None, m))
+            parsed.append((t, census_dirt(m, t) is not None, m))
     census = sorted(parsed, key=lambda r: (r[0], r[1]))
     census_clock: datetime | None = None
     prev: datetime | None = None
@@ -257,7 +284,7 @@ def evaluate(
                     {"at": prev.isoformat(), "why": f"census gap until {t.isoformat()}"}
                 )
             census_clock = None
-        dirt = census_dirt(m)
+        dirt = census_dirt(m, t)
         if dirt is None:
             census_clock = census_clock or t
         else:

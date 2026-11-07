@@ -1018,11 +1018,20 @@ def test_a_generic_process_in_another_mount_namespace_is_never_foreign(
 
 
 @pytest.mark.parametrize(
-    "rel", ["src/genesis/routing/standalone.py", "scripts/genesis_mcp_server.py"]
+    "rel",
+    [
+        "scripts/genesis_mcp_server.py",
+        "scripts/ambient_awareness_worker.py",
+        "src/genesis/memory/graph.py",
+        "src/genesis/memory/graphstore_falkor.py",
+        "src/genesis/memory/graph_telemetry.py",
+        "src/genesis/mcp/memory/core.py",
+        "src/genesis/env.py",
+    ],
 )
-def test_an_edited_loader_outside_the_memory_package_marks_head_dirty(proc_root, repo, rel):
-    """The proofs model the entry scripts and loaders: an uncommitted edit there
-    means a process may run code no commit records."""
+def test_an_edited_file_on_the_graph_path_marks_head_dirty(proc_root, repo, rel):
+    """An uncommitted edit where a traversal runs means it may run code no
+    commit records (owner ruling 47bd37e025174c66)."""
     r, _, _ = repo
     f = r / rel
     f.parent.mkdir(parents=True, exist_ok=True)
@@ -1494,3 +1503,21 @@ def test_an_edit_between_the_check_and_the_read_is_unknown(monkeypatch, tmp_path
     start = secrets.stat().st_ctime - 100  # the file now postdates the start
     monkeypatch.setattr(proof, "_unchanged_since", lambda _p, _s: True)  # the stale check
     assert proof.secrets_values(secrets, start) is None
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [
+        "src/genesis/routing/standalone.py",
+        "src/genesis/memory/linker.py",
+        "scripts/hooks/git_push_guard.py",
+    ],
+)
+def test_an_edited_file_off_the_graph_path_leaves_head_clean(proc_root, repo, rel):
+    """Owner ruling 47bd37e025174c66: an early local run of unrelated code does
+    not cost the clock."""
+    r, _, _ = repo
+    f = r / rel
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("edited = True\n")
+    assert census.build_census(r, proc_root=proc_root)["head_dirty"] is False
