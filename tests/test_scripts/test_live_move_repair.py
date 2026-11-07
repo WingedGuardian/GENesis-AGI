@@ -521,7 +521,7 @@ def test_td6_an_unreadable_fd_list_of_this_user_may_hold_the_lock(mod, tmp_path,
     (entry / "fd").mkdir(parents=True)
     (entry / "stat").write_text("1 (git) S 1 1\n")
     (entry / "comm").write_text("git\n")
-    monkeypatch.setattr(mod, "_PROC", str(proc))
+    _static_proc(monkeypatch, mod, proc)
     assert mod._held_open("/x/index.lock") is False, "control: a readable, empty fd list"
     (entry / "fd").chmod(0)
     try:
@@ -1355,6 +1355,15 @@ def test_r4_ref_locks_a_killed_transaction_left_are_retired(w):
     _git(w.root, "switch", "-q", "-c", "probe")
 
 
+def _static_proc(monkeypatch, mod, proc: Path) -> None:
+    """Point the repair at a fake /proc. Its entries never change, so the
+    re-check of an unreadable process (#4001) has nothing to wait out: its real
+    wait would only age a fresh lock past LOCK_FRESH_S on the real clock while
+    the fake clock runs out the budget."""
+    monkeypatch.setattr(mod, "_PROC", str(proc))
+    monkeypatch.setattr(mod, "_settle", lambda _s: None)
+
+
 def _fake_proc(tmp_path: Path, comm: str) -> tuple[Path, Path]:
     """A /proc with one live process of this user, ``comm``, whose fd list
     cannot be read (non-dumpable)."""
@@ -1384,7 +1393,7 @@ def test_r4_an_unreadable_process_holds_only_if_git_or_the_lock_is_fresh(
     proc, lock = _fake_proc(tmp_path, comm)
     then = time.time() - age
     os.utime(lock, (then, then))
-    monkeypatch.setattr(mod, "_PROC", str(proc))
+    _static_proc(monkeypatch, mod, proc)
     try:
         assert mod._held_open(str(lock)) is held
     finally:
@@ -1418,7 +1427,7 @@ def test_r4_a_fresh_ref_lock_is_waited_for_never_left_behind(w, mod, tmp_path, m
         pytest.skip("running as root: EACCES cannot be produced")
     killed_tag_side(w, "prepared")
     proc, _ = _fake_proc(tmp_path, "codex")
-    monkeypatch.setattr(mod, "_PROC", str(proc))
+    _static_proc(monkeypatch, mod, proc)
     clock = FakeClock()
     monkeypatch.setattr(mod, "_now", clock.now)
     monkeypatch.setattr(mod, "_sleep", clock.sleep)
