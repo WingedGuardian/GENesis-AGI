@@ -3259,6 +3259,11 @@ verified: 3e27b4794 2026-10-23
   including an incomplete suffix in its fingerprint. Dependent query views must
   preserve those unknown-duration semantics when deriving fallback latency.
 
+- **Optional analytics installation (development candidate)**: persistent opt-in
+  installs DuckDB/PyArrow; the hourly supervised collection timer remains disabled
+  when configuration or optional dependencies are unavailable. On-demand
+  opportunity-scan is installed as a skill; configured timer rollout is unverified.
+
 - **The graders are TOLD the response status; they must never infer it.** The
   triage/outcome/delta graders each judge an `InteractionSummary`, and the
   summarizer (`learning/triage/summarizer.py`) sizes `response_text` for them.
