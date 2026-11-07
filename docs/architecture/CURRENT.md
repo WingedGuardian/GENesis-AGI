@@ -73,8 +73,20 @@ side.
 ```yaml subsystem-map
 entry: memory
 modules: [memory, qdrant]
-verified: 2ece179f9ebc 2026-10-28
+verified: 064a1e9d8 2026-11-07
 ```
+
+The 2026-11-07 verification covers the request-owned memory thread boundaries
+below; other memory descriptions retain their individually cited verification dates.
+
+**Shared-owner prerequisite (not activated):** nine thread boundaries in
+`memory/store.py`, `retrieval.py`, `intent.py` and `proactive.py` retain actual
+physical completion through their RequestDatabase unit. Legacy connections keep
+ordinary thread cancellation. The retriever forwards the facade to tag expansion;
+tag scans run in independently admitted background units, with accepted-task
+completion as the single-flight release. Pressure or draining serves the stale
+query. Other maintenance threads and shared provider closers still need factory
+qualification; this is not a shared-service activation.
 
 **Cross-store integrity is detect + repair.** SQLite (`memory_metadata`/
 `memory_fts`) and Qdrant share no transaction, so drift (orphaned "ghost"
@@ -4001,8 +4013,9 @@ Refusing a proposed update preserves a previously valid opt-in.
   release. Ambiguous submission/canceled-before-start work retains its claim and
   fails shutdown; dependent provider closure requires positive settlement.
   `run_resource_thread` preserves ordinary legacy thread cancellation. These are
-  internal prerequisites; memory-consumer migration and shared factory wiring
-  remain separate. Lease budgets bound database connections, not executor items.
+  internal prerequisites; the nine memory-consumer thread boundaries use them,
+  while shared factory wiring remains separate. Lease budgets bound database
+  connections, not executor items.
   Activity, embedding-heartbeat, deferred-recall, bookmark and proactive tasks use it;
   legacy connections keep ordinary task scheduling. Internal
   `initialize_request_service` bootstraps memory/health/recon/outreach with

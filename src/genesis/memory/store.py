@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import uuid
 from datetime import UTC, datetime
@@ -16,6 +15,7 @@ from genesis.db.crud._id_resolve import AMBIGUOUS as _AMBIGUOUS
 from genesis.db.crud._id_resolve import NOT_FOUND as _NOT_FOUND
 from genesis.db.crud._id_resolve import PASSTHROUGH as _PASSTHROUGH
 from genesis.db.crud._id_resolve import normalize_id
+from genesis.db.request_database import run_resource_thread
 from genesis.memory._locks import memory_id_lock
 from genesis.memory.classification import classify_memory
 from genesis.memory.embeddings import EmbeddingProvider, EmbeddingUnavailableError
@@ -583,7 +583,8 @@ class MemoryStore:
                     # round-trip on this hot store() path doesn't stall every
                     # other coroutine (background paths already do this; see
                     # memory/health.py, dream_cycle.py, entity_resolution.py).
-                    await asyncio.to_thread(
+                    await run_resource_thread(
+                        self._db,
                         upsert_point,
                         self._qdrant,
                         collection=resolved_collection,
@@ -1035,7 +1036,8 @@ class MemoryStore:
             try:
                 present: list[str] = []
                 for coll in ("episodic_memory", "knowledge_base"):
-                    got = await asyncio.to_thread(
+                    got = await run_resource_thread(
+                        self._db,
                         self._qdrant.retrieve,
                         collection_name=coll,
                         ids=[old_id],
@@ -1045,7 +1047,8 @@ class MemoryStore:
                     if got:
                         present.append(coll)
                 for coll in present:
-                    await asyncio.to_thread(
+                    await run_resource_thread(
+                        self._db,
                         update_payload,
                         self._qdrant,
                         collection=coll,
@@ -1152,7 +1155,8 @@ class MemoryStore:
         try:
             present: list[str] = []
             for coll in ("episodic_memory", "knowledge_base"):
-                got = await asyncio.to_thread(
+                got = await run_resource_thread(
+                    self._db,
                     self._qdrant.retrieve,
                     collection_name=coll,
                     ids=[memory_id],
@@ -1162,8 +1166,8 @@ class MemoryStore:
                 if got:
                     present.append(coll)
             for coll in present:  # atomic on the point's real collection
-                await asyncio.to_thread(
-                    delete_point, self._qdrant, collection=coll, point_id=memory_id,
+                await run_resource_thread(
+                    self._db, delete_point, self._qdrant, collection=coll, point_id=memory_id,
                 )
         except Exception:
             logger.error(

@@ -43,6 +43,13 @@ join their real workers; an import failure or unrelated timeout is not evidence
 of forbidden resource use. Production factories and shared activation remain
 separate qualifications.
 
+`tests/test_memory/test_resource_thread_ownership.py` exercises all nine migrated
+memory boundaries with gated real file I/O, cancellation and a real scratch
+database lease. `tests/test_memory/test_tag_index_ownership.py` covers independent
+background admission, physical scan drain, refusal/creation failure, prestart
+cancellation, retriever propagation and the body-completed/done-callback gap.
+`tests/test_memory/test_tag_index_swr.py` retains legacy stale-query behavior.
+
 Scoped graph selection and SQL identity parity are covered by
 `tests/test_memory/test_graph_request_database.py` and
 `tests/test_memory/test_graph_path_identity.py`. They use scratch SQLite with
