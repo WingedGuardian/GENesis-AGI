@@ -628,9 +628,10 @@ prune_camoufox_engines_step() {
 # Genesis's OWN unnamed scopes, not only ad-hoc session commands: the CC
 # session launcher (cc/invoker.py), the code-intel indexer and the dashboard
 # update route all start `run-u*` scopes without --collect, deliberately, so a
-# scope killed by its MemoryMax stays visible. This stage leaves each failure
-# visible for a day, logs its Result (oom-kill, exit-code, …) when it resets
-# it, and the failure itself stays in the user journal.
+# scope killed by its MemoryMax stays visible. This stage NEVER resets a unit
+# whose Result is oom-kill (owner ruling 2026-11-07: a memory kill is a real
+# alarm and stays listed until someone looks). Any other failure stays visible
+# for a day, is logged with its Result when reset, and stays in the journal.
 #
 # "Transient" is systemd's own `Transient=yes`, not the unit's name or an empty
 # FragmentPath. MEASURED on systemd 255: a transient unit's FragmentPath is NOT
@@ -689,6 +690,12 @@ reset_failed_transient_units() {
             continue
         fi
         [ $((now - ts)) -gt "$min_age" ] || continue
+        if [ "$result" = oom-kill ]; then
+            # Owner ruling: a scope killed by its memory limit is a real alarm,
+            # so it stays in the failed list until someone looks at it.
+            echo "transient unit reset: kept $unit (result=oom-kill is never auto-reset)"
+            continue
+        fi
         echo "transient unit reset: $unit (failed $(( (now - ts) / 3600 ))h ago, result=${result:-unknown})"
         systemctl --user reset-failed -- "$unit" 2>/dev/null \
             || echo "transient unit reset failed for $unit"

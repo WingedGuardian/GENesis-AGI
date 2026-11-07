@@ -148,21 +148,38 @@ def test_old_failed_run_u_transient_unit_is_reset_and_logged_first(tmp_path):
 
 
 def test_the_reset_line_records_why_the_unit_failed(tmp_path):
-    """Genesis's own unnamed scopes (CC sessions, code-intel) are in this
-    population, and one killed by its MemoryMax is a real alarm: the reset must
-    not erase WHY it failed from the daily log."""
+    """The reset must not erase WHY a unit failed from the daily log."""
+    shim_dir, units, calls = _setup(tmp_path)
+    _unit(
+        units,
+        "run-u778.scope",
+        transient=True,
+        fragment=f"{_TRANSIENT_DIR}/run-u778.scope",
+        failed_ago_s=2 * 86400,
+        result="exit-code",
+    )
+    r = _run(tmp_path, shim_dir, units, calls)
+    assert _resets(calls) == ["run-u778.scope"]
+    assert any("run-u778.scope" in ln and "result=exit-code" in ln for ln in r.stdout.splitlines())
+
+
+def test_an_oom_killed_scope_is_never_reset(tmp_path):
+    """Owner ruling: Genesis's own unnamed scopes (CC sessions, code-intel) are
+    in this population, and one killed by its MemoryMax is a real alarm, so it
+    stays in the failed list however old it is."""
     shim_dir, units, calls = _setup(tmp_path)
     _unit(
         units,
         "run-u777.scope",
         transient=True,
         fragment=f"{_TRANSIENT_DIR}/run-u777.scope",
-        failed_ago_s=2 * 86400,
+        failed_ago_s=30 * 86400,
         result="oom-kill",
     )
     r = _run(tmp_path, shim_dir, units, calls)
-    assert _resets(calls) == ["run-u777.scope"]
-    assert any("run-u777.scope" in ln and "result=oom-kill" in ln for ln in r.stdout.splitlines())
+    assert "rc=0" in r.stdout, r.stderr
+    assert _resets(calls) == []
+    assert "kept run-u777.scope (result=oom-kill is never auto-reset)" in r.stdout
 
 
 def test_a_unit_name_starting_with_a_dash_is_passed_after_double_dash(tmp_path):
