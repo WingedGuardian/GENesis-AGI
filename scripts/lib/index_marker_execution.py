@@ -489,8 +489,13 @@ def retain_fresh_cleanup(db, row, legs, proof, *, collect, proc, clock, retained
     """
     registered = json.loads(row["scope_registration"])
     previous = json.loads(row["cleanup_proof"])["data"]
-    data = collect(registered, digest(registered), proof,
-                   owned_wait=previous.get("owned_wait") is True, proc=proc)
+    registration_sha256 = digest(registered)
+    owned_wait = previous.get("owned_wait") is True
+    try:
+        data = collect(registered, registration_sha256, proof, owned_wait=owned_wait, proc=proc)
+    except (OSError, ValueError):
+        # Unavailable proof holds this execution while unrelated recovery continues.
+        return False
     value = {key: row[key] for key in legs.CONTEXT}
     item = event(value, "cleanup", data, clock(), proof)
     if not _binding(row, item, proof):

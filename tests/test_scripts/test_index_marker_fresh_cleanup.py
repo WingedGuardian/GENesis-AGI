@@ -1,5 +1,6 @@
 """Real scratch SQLite gates with synthetic original-kernel files; no native run."""
 
+import json
 import runpy
 import time
 from copy import deepcopy
@@ -205,6 +206,7 @@ def test_all_remaining_launch_gates_recheck_after_a_successful_claim(queue, hist
 @pytest.mark.parametrize("fault", ["missing-counter", "replacement", "root", "mount"])
 def test_unprovable_current_identity_never_releases_a_claim(queue, historical, fault):
     claimed, _, leaf, proc, ns = historical()
+    before = queue.execution_status(claimed["context"])
     if fault == "missing-counter":
         (leaf / "memory.events").unlink()
     elif fault == "replacement":
@@ -219,9 +221,9 @@ def test_unprovable_current_identity_never_releases_a_claim(queue, historical, f
     else:
         path = proc / "self/mountinfo"
         path.write_text(path.read_text().replace("1 0", "2 0"))
-    with pytest.raises((OSError, ValueError)):
-        queue.claim_native(claimed["context"]["hash"], provider="gitnexus")
+    assert queue.claim_native(claimed["context"]["hash"], provider="gitnexus") is None
     assert queue.get_inflight(claimed["context"]["hash"]) is None
+    assert queue.execution_status(claimed["context"]) == before
 
 
 @pytest.mark.parametrize("state", ["removed", "rebooted"])
@@ -251,3 +253,78 @@ def test_physical_cleanup_does_not_release_provider_hold_or_hide_sticky_disproof
     status = queue.execution_status(claimed["context"])
     assert status["safety_kind"] == hold and status["cleanup_invalidated"] == 1
     assert status["typed_charged_attempts"] == 0 and status["completion_kind"] == "success"
+
+
+@pytest.mark.parametrize("fault", ["missing-counter", "changed-mapping"])
+def test_unreadable_disputed_scope_does_not_roll_back_unrelated_reconciliation(
+    queue, historical, tmp_path, fault
+):
+    earlier = _claim(queue, tmp_path / "earlier")
+    disputed, _, leaf, proc, _ = historical(settle_before=False)
+    later = _claim(queue, tmp_path / "later")
+    before = queue.execution_status(disputed["context"])
+    if fault == "missing-counter":
+        (leaf / "memory.events").unlink()
+    else:
+        mapping = proc / "self/mountinfo"
+        mapping.write_text(mapping.read_text().replace("1 0", "2 0"))
+
+    failure = None
+    try:
+        queue.reconcile_native()
+    except (OSError, ValueError) as error:
+        failure = error
+    for claimed in (earlier, later):
+        assert queue.get_inflight(claimed["context"]["hash"]) is None, (
+            "one unreadable scope rolled back or prevented unrelated recovery"
+        )
+        rows = [row for row in queue.list_markers() if row["hash"] == claimed["context"]["hash"]]
+        assert {row["provider"] for row in rows} == {"cbm", "gitnexus"}
+        assert all(row["attempts"] == 0 for row in rows)
+    assert failure is None
+    assert queue.get_inflight(disputed["context"]["hash"])["claim_id"] == disputed["context"]["claim_id"]
+    after = queue.execution_status(disputed["context"])
+    assert after["cleanup_invalidated"] == 1 and after["safety_kind"] == "uncertainty"
+    assert after["typed_applied_state"] == "consumed" and after["typed_charged_attempts"] == 0
+    assert all(after[key] == before[key] for key in ("terminal", "cleanup_proof", "native_intent"))
+    assert queue.reconcile_native() == []
+    assert queue.execution_status(disputed["context"]) == after
+
+
+@pytest.mark.parametrize("fault", ["registration-digest", "collector-runtime", "returned-proof", "retained-event"])
+def test_fresh_cleanup_does_not_hide_digest_or_unexpected_collector_failures(
+    queue, historical, monkeypatch, fault
+):
+    claimed, _, _, proc, _ = historical()
+    before = queue.execution_status(claimed["context"])
+    collected = []
+
+    def fail_digest(*args):
+        raise ValueError("synthetic registration digest failure")
+
+    def collect(*args, **kwargs):
+        collected.append(True)
+        if fault == "collector-runtime":
+            raise RuntimeError("synthetic unexpected collector failure")
+        if fault == "returned-proof":
+            return {}
+        return {**json.loads(row["cleanup_proof"])["data"], "observed_ns": time.monotonic_ns()}
+
+    def publish(item):
+        pytest.fail("a failed observation cannot publish evidence")
+
+    with queue._queue_gate() as db:
+        row = queue._native.execution(db, claimed["context"], queue._legs)
+        with monkeypatch.context() as patcher:
+            if fault == "registration-digest":
+                patcher.setattr(queue._native, "digest", fail_digest)
+            expected = RuntimeError if fault == "collector-runtime" else ValueError
+            message = ("invalid cleanup" if fault == "returned-proof" else
+                       "retained resource evidence" if fault == "retained-event" else "synthetic")
+            with pytest.raises(expected, match=message):
+                queue._native.retain_fresh_cleanup(
+                    db, row, queue._legs, queue._proof, collect=collect, proc=proc,
+                    clock=time.time, retained=({"context": {}},) if fault == "retained-event" else (), publish=publish,
+                )
+    assert collected == ([] if fault == "registration-digest" else [True])
+    assert queue.execution_status(claimed["context"]) == before

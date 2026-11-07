@@ -744,7 +744,11 @@ cleanup disproof remains sticky. Every scalar/native claim, reservation,
 registration, native intent and current-pointer reconciliation checks the
 original kernel subtree afresh before releasing its physical hold. This never
 clears provider safety or rewrites completed accounting. Missing counters,
-changed identity or unreadable original roots refuse visibly. A newly observed
+changed identity or unreadable original roots keep that execution held while
+reconciliation continues for unrelated repositories. Only the collector's
+`OSError`/`ValueError` becomes a hold; decoding and digest failures before
+collection, returned-event validation and durable publication/write errors
+retain their transaction-failure behavior. A newly observed
 owned OOM is durably retained before release, including when the first cleanup
 proof is already occupied; an unchanged counter does not generate repeated
 resource facts. A preparation OOM observed before an admission refusal remains
