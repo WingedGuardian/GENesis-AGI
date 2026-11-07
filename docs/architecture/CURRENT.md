@@ -1807,8 +1807,14 @@ the shared banner is not an assertion about all concurrent sessions.
   and a finite assembly API: Python and shell buffers match one immutable Git
   tree, and Python compilation/hashing use those same bytes with original origins.
   Private sealed handoff checks its caller-bound digest before entry compilation;
-  cached local modules refuse. This is not yet the queued shell/watchdog caller
-  and supplies no new launch, recovery or automatic-readiness authority.
+  cached local modules refuse. Service startup enters captured runner and
+  entry helpers, including the queue/availability and scope/watchdog closure;
+  only the canonical runner lock crosses its entry handoff. Optional queued
+  inputs freeze the native environment with one registered invocation slot,
+  preserving process-control environment and managed config/path/admission
+  checks. Private runtime transport is not launch authority. The physical
+  owner, monitor and recovery caller remain separate, and automatic readiness
+  stays fenced.
   `index_marker_recovery.py` adds explicit transaction-only schema-5 storage,
   original-owner control completion, persistent provider holds and an exact
   terminal/control/source acceptance-watermark reader on the same queue.

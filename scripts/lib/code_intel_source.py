@@ -4,7 +4,8 @@
 Compile and hash the same buffers (transcript_analytics.scrub's existing pattern).
 The fixed isolated bootstrap is a declared trust root. A sealed capsule preserves
 bytes across handoff; its seals do not authenticate its producer. Reservation and
-supervised recovery remain the queue's responsibility. No provider runs here.
+supervised recovery remain the queue's responsibility. Describe is read-only;
+captured shell handoffs retain the existing owner's admission and readiness.
 """
 
 from __future__ import annotations
@@ -17,11 +18,12 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
 
@@ -42,12 +44,14 @@ MODULES = (
     ("native", "_genesis_index_marker_execution", "scripts/lib/index_marker_execution.py"),
     ("cli", "_genesis_index_marker_cli", "scripts/lib/index_marker_cli.py"),
     ("queue", "_genesis_index_marker", "scripts/lib/index_marker.py"),
+    ("queued", "_genesis_code_intel_queued_worker", "scripts/lib/code_intel_queued_worker.py"),
     ("managed", "_genesis_codebase_managed", "scripts/codebase_managed.py"),
 )
 SHELL = (
     "scripts/lib/code_intel_index.sh",
     "scripts/lib/gitnexus_version.sh",
     "scripts/lib/proc_pressure.sh",
+    "scripts/lib/code_intel_scope.sh",
 )
 FILE_LIMIT = 1024 * 1024
 CAPSULE_LIMIT = 4 * FILE_LIMIT
@@ -65,7 +69,7 @@ exec(compile(raw,str(p),'exec',dont_inherit=True),m.__dict__)
 raise SystemExit(m.main(sys.argv[2:]))
 """
 
-# Only an inherited private capsule enters this fixed describe role. Seals
+# Only an inherited private capsule enters these fixed roles. Seals
 # preserve bytes, not producer trust. Helpers are assembled after full validation.
 RESUME_BOOTSTRAP = """import base64,fcntl,hashlib,importlib.util,json,os,pathlib,sys
 if fcntl.fcntl(0,fcntl.F_GET_SEALS)&15!=15: raise ValueError('unsealed source')
@@ -83,7 +87,7 @@ s=importlib.util.spec_from_file_location('_genesis_code_intel_source',p)
 m=importlib.util.module_from_spec(s);sys.modules[s.name]=m
 m.__dict__.update(_ENTRY_BYTES=raw,_CAPSULE_FD=0,_CAPSULE_SHA256=sys.argv[1])
 exec(compile(raw,str(p),'exec',dont_inherit=True),m.__dict__)
-raise SystemExit(m.main(['describe',v['profile']]))
+raise SystemExit(m.main(sys.argv[2:]))
 """
 
 
@@ -162,10 +166,29 @@ class Snapshot:
     profile: str
     commit: str
     buffers: object
+    _runtime_json: bytes | None = field(default=None, repr=False)
 
     @property
     def files(self):
         return _checksums(self.buffers)
+
+    @property
+    def runtime_value(self):
+        """Return an independent private value; diagnostics expose only source."""
+        return None if self._runtime_json is None else json.loads(self._runtime_json)
+
+    def with_runtime(self, value):
+        """Bind transport structure; each runtime role must validate authority."""
+        fields = {"context", "reservation", "policy", "provider_options", "environment_recipe"}
+        if self.profile != "runner":
+            raise ValueError("runtime capsule requires the runner profile")
+        if (not isinstance(value, dict) or set(value) != fields
+                or any(not isinstance(value[key], dict) for key in fields)):
+            raise ValueError("invalid private runtime envelope")
+        raw = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        result = replace(self, _runtime_json=raw)
+        result._payload()  # The existing bound includes private runtime values.
+        return result
 
     def current_matches(self):
         """Pre-intent drift observation only; never replace retained identities."""
@@ -196,6 +219,8 @@ class Snapshot:
                     module.__dict__["_CAPTURED_SYSTEMCTL_ENV"] = loaded["systemd"].systemctl_env
                 if key == "managed":
                     module.__dict__["_CAPTURED_SCRIPT"] = origin
+                if key == "queued":
+                    module.__dict__["_CAPTURED_CLEANUP"] = loaded["scope"].cleanup_observation
                 sys.modules[alias] = inserted[alias] = module
                 exec(  # noqa: S102 - fixed inventory, trusted captured Git bytes
                     compile(self.buffers[name], str(origin), "exec", dont_inherit=True),
@@ -212,18 +237,21 @@ class Snapshot:
             sys.path[:] = old_path
 
     def _payload(self):
+        value = dict(
+            version=1,
+            root=str(self.root),
+            profile=self.profile,
+            commit=self.commit,
+            files=self.files,
+            buffers={
+                name: base64.b64encode(raw).decode("ascii")
+                for name, raw in self.buffers.items()
+            },
+        )
+        if self._runtime_json is not None:
+            value.update(version=2, runtime=self.runtime_value)
         payload = json.dumps(
-            dict(
-                version=1,
-                root=str(self.root),
-                profile=self.profile,
-                commit=self.commit,
-                files=self.files,
-                buffers={
-                    name: base64.b64encode(raw).decode("ascii")
-                    for name, raw in self.buffers.items()
-                },
-            ),
+            value,
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
@@ -235,8 +263,82 @@ class Snapshot:
     def transport_sha256(self):
         return hashlib.sha256(self._payload()).hexdigest()
 
-    def resume_command(self):
-        return [sys.executable, "-I", "-S", "-B", "-c", RESUME_BOOTSTRAP, self.transport_sha256]
+    def resume_command(self, action="describe", *arguments):
+        if action not in ("describe", "shell", "queue", "available"):
+            raise ValueError("unsupported captured role")
+        if self._runtime_json is not None and action != "describe":
+            raise ValueError("runtime capsule cannot use a source-only role")
+        return [
+            sys.executable,
+            "-I",
+            "-S",
+            "-B",
+            "-c",
+            RESUME_BOOTSTRAP,
+            self.transport_sha256,
+            action,
+            self.profile,
+            *arguments,
+        ]
+
+    def shell_prelude(self, role):
+        names = {
+            "entry": "scripts/lib/code_intel_index.sh",
+            "runner": "scripts/code_intel_runner.sh",
+        }
+        if role not in names or (role == "runner" and self.profile != "runner"):
+            raise ValueError("unsupported captured shell role")
+        lines = [
+            "readonly _CI_ORIGIN=" + shlex.quote(str(self.root / names[role])),
+            "readonly _CI_EXPECTED_ENTRY=" + shlex.quote(str(self.root / names["entry"])),
+        ]
+        cases = []
+        for index, name in enumerate(SHELL[1:]):
+            body = self.buffers[name].decode("utf-8")
+            if "\0" in body:
+                raise ValueError("NUL in captured shell helper")
+            variable = "_CI_BUFFER_" + str(index)
+            lines.append("readonly " + variable + "=" + shlex.quote(body))
+            cases.append(
+                name.rsplit("/", 1)[1] + ") builtin source <(printf '%s' \"$" + variable + '");;'
+            )
+        lines.append('_ci_source() { case "$1" in ' + "\n".join(cases) + "\n*) return 2;; esac; }")
+        for function, action, arguments in (
+            ("_ci_entry", "shell", ("entry",)),
+            ("_ci_queue", "queue", ()),
+            ("_ci_available", "available", ()),
+        ):
+            lines.append(
+                function
+                + "() { "
+                + shlex.join(self.resume_command(action, *arguments))
+                + ' "$@"; }'
+            )
+        lines.append("readonly -f _ci_source _ci_entry _ci_queue _ci_available")
+        return "\n".join(lines) + "\n"
+
+    def shell_command(self, role, arguments):
+        prelude = self.shell_prelude(role)
+        name = (
+            "scripts/code_intel_runner.sh"
+            if role == "runner"
+            else "scripts/lib/code_intel_index.sh"
+        )
+        body = self.buffers[name].decode("utf-8")
+        if "\0" in body:
+            raise ValueError("NUL in captured shell body")
+        # -p ignores startup files, imported functions and inherited shell options.
+        # Bash5.2.21: oracle8/8, -p8/8, ordinary1/8 across the registered8-cell sweep.
+        return [
+            "/bin/bash",
+            "--noprofile",
+            "--norc",
+            "-p",
+            "-c",
+            prelude + body,
+            str(self.root / name),
+            *arguments,
+        ]
 
     @contextmanager
     def sealed(self):
@@ -277,11 +379,15 @@ def restore(fd, entry_bytes, expected_sha256):
         value = json.loads(payload, object_pairs_hook=_unique)
         if (
             not isinstance(value, dict)
-            or set(value) != {"version", "root", "profile", "commit", "files", "buffers"}
-            or type(value["version"]) is not int
-            or value["version"] != 1
+            or type(value.get("version")) is not int
+            or value["version"] not in (1, 2)
         ):
             raise ValueError("unsupported source capsule")
+        fields = {"version", "root", "profile", "commit", "files", "buffers"}
+        if value["version"] == 2:
+            fields.add("runtime")
+        if set(value) != fields:
+            raise ValueError("unsupported source capsule fields")
         names = set(_inventory(value["profile"]))
         if (
             not isinstance(value["buffers"], dict)
@@ -307,15 +413,33 @@ def restore(fd, entry_bytes, expected_sha256):
             or re.fullmatch(r"(?:[a-f0-9]{40}|[a-f0-9]{64})", value["commit"]) is None
         ):
             raise ValueError("invalid source capsule origin/commit")
-        return Snapshot(root, value["profile"], value["commit"], MappingProxyType(buffers))
+        snapshot = Snapshot(root, value["profile"], value["commit"], MappingProxyType(buffers))
+        return snapshot.with_runtime(value["runtime"]) if value["version"] == 2 else snapshot
     except (OSError, TypeError, KeyError, RecursionError) as error:
         raise ValueError("invalid source capsule") from error
 
 
+def _runner_lock_fds():
+    """Keep only the canonical inherited runner lock in its entry handoff."""
+    base = Path(os.environ.get("GENESIS_HOME") or str(Path.home() / ".genesis"))
+    if not base.is_absolute():
+        raise ValueError("captured runner requires an absolute lock namespace")
+    held = os.fstat(8)
+    named = (base / "locks/code-intel-runner.lock").stat(follow_symlinks=False)
+    if (not stat.S_ISREG(held.st_mode) or not stat.S_ISREG(named.st_mode)
+            or (held.st_dev, held.st_ino) != (named.st_dev, named.st_ino)):
+        raise ValueError("captured runner lock identity differs")
+    # Same inherited open-file description preserves the existing lock; an
+    # unlocked legitimate descriptor may acquire it, but a competitor refuses.
+    fcntl.flock(8, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return (8,)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("describe",))
+    parser.add_argument("action", choices=("describe", "shell", "queue", "available"))
     parser.add_argument("profile", choices=("entry", "runner"))
+    parser.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     if "_CAPSULE_FD" in globals():
         captured = restore(
@@ -325,7 +449,39 @@ def main(argv=None):
             os.dup2(stream.fileno(), 0)
     else:
         captured = capture(Path(__file__).parents[2], args.profile, globals().get("_ENTRY_BYTES"))
-    captured.assemble()
+    if args.profile != captured.profile:
+        parser.error("captured profile differs from command")
+    if captured.runtime_value is not None and args.action != "describe":
+        parser.error("runtime capsule cannot use a source-only role")
+    if args.action == "shell":
+        if not args.arguments:
+            parser.error("shell role required")
+        inherited = _runner_lock_fds() if (
+            captured.profile == "runner" and args.arguments[0] == "entry"
+        ) else ()
+        with captured.sealed() as fd:
+            return subprocess.run(
+                captured.shell_command(args.arguments[0], args.arguments[1:]),
+                stdin=fd, pass_fds=inherited, check=False
+            ).returncode
+    modules = captured.assemble()
+    if args.action == "queue":
+        try:
+            return modules["queue"].main(args.arguments)
+        except Exception:
+            import traceback
+
+            traceback.print_exc()
+            return 2  # The existing queue CLI's visible failure contract.
+    if args.action == "available":
+        if len(args.arguments) != 3:
+            parser.error("available requires config, repo and persistence")
+        config, repo, persistence = args.arguments
+        return modules["managed"].main(
+            ["--config", config, "available", "--repo", repo, "--persistence", persistence]
+        )
+    if args.arguments:
+        parser.error("describe takes no extra arguments")
     print(json.dumps(dict(commit=captured.commit, files=captured.files, automatic_authority=False)))
     return 0
 
