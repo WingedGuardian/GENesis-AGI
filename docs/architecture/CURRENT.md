@@ -545,7 +545,7 @@ preserve usable answers, real refusal health and dropped-output replay guards.
 ```yaml subsystem-map
 entry: execution-cc
 modules: [cc]
-verified: a8fa35a35 2026-10-23
+verified: 4721e0d93 2026-11-07
 ```
 
 - **Foreground model billing routes** (`scripts/gmodel`, `cc/gmodel_routes.py`,
@@ -1058,6 +1058,14 @@ verified: a8fa35a35 2026-10-23
 - `cc/context_injector.py` (memory→session injection) lives HERE, not in
   memory. GROUNDWORK: `reflection_bridge/_bridge.py` (v4-executor),
   `session_config.py` (hook-inheritance).
+- **Light-reflection topic repeats (development candidate)**: the bridge stores
+  every reflection output, then suppresses repeat light-topic summaries or posts
+  a periodic stub. Explicit material changes always post. The local comparison
+  preserves negation, compares all observed chunks, and posts changed text when
+  either side spans multiple chunks. History uses insertion order so a current
+  stub supersedes an older future-dated row. Unknown history posts; deep and
+  strategic topic delivery retain their direct path. Installed verification is
+  still outstanding.
 - **Background-wait ceiling ownership** (invoker.py): the CLI's headless
   `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS` (default 600s) SIGKILLs a dispatched
   Workflow/subagent mid-run with a partial result. `CCInvocation.bg_wait_ceiling_ms`

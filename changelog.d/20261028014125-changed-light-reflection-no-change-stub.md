@@ -1,0 +1,1 @@
+- **The Light Reflections topic suppresses repeat summaries while retaining every stored reflection.** A periodic "No material change since …" note keeps the topic live. Explicit material changes, changed negated text and changed multi-chunk summaries post, and a new stub supersedes older future-dated history.

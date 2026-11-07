@@ -588,6 +588,10 @@ def _topic_observation(text: str) -> str:
     return "\n".join(shown)
 
 
+_TOPIC_PARSE_FALLBACK = "Reflection completed — output was not parseable; stored for review."
+_TOPIC_EMPTY_FALLBACK = "Reflection completed — no summary fields in output; stored for review."
+
+
 def format_topic_summary(depth, output, *, text: str | None = None) -> str:
     """Build the Telegram topic message from PARSED reflection fields only.
 
@@ -603,10 +607,7 @@ def format_topic_summary(depth, output, *, text: str | None = None) -> str:
     """
     source_text = text if text is not None else output.text
     header = f"<b>{depth.value} Reflection</b>"
-    fallback = (
-        f"{header}\n\nReflection completed — output was not parseable; "
-        "stored for review."
-    )
+    fallback = f"{header}\n\n{_TOPIC_PARSE_FALLBACK}"
     # Use the SAME canonical extractor as the routing parser and the salvage
     # gate, so the topic never shows the "not parseable" stub for output that
     # actually routed (e.g. a bare-untagged ``` fence). One algorithm, three
@@ -639,11 +640,182 @@ def format_topic_summary(depth, output, *, text: str | None = None) -> str:
         return fallback
 
     if len(parts) == 1:
-        return (
-            f"{header}\n\nReflection completed — no summary fields in "
-            "output; stored for review."
-        )
+        return f"{header}\n\n{_TOPIC_EMPTY_FALLBACK}"
     return "\n\n".join(parts)
+
+
+#: A light summary whose terms overlap the last full post's at or above this
+#: local overlap score (stopwords dropped, negations and numbers kept) counts as "no
+#: material change". MEASURED 2026-10-27 over one install's 85 light posts in
+#: the previous 30 days, consecutive pairs: top scores 0.62, 0.58, then 0.50.
+#: The two above this line were restatements on reading (a sub-point memory
+#: drift; the same persistent job failure restated); the 0.50 pair reported
+#: moved values. Raise it to post more; it is not meant to catch rewordings
+#: that a model judges unchanged (``material_change`` does that).
+LIGHT_NEAR_DUPLICATE_JACCARD = 0.55
+
+#: The model's ``"material_change": false`` is trusted only when the summary
+#: still shares at least this much with the last FULL post. The model compares
+#: against the previous stored finding, which may itself have gone unposted, so
+#: without a floor a chain of small drifts could hide a large change from the
+#: user indefinitely. Over the same 85 posts, 21 of 84 consecutive pairs scored
+#: at least 0.3, so the flag can act on about a quarter of them.
+LIGHT_MODEL_FLAG_MIN_JACCARD = 0.3
+
+#: While nothing changes, at most one "no material change" stub per this many
+#: hours, measured from the topic's last reflection post (full or stub). That keeps the
+#: topic a liveness surface (``format_topic_summary``) at two posts a day at
+#: most, against a measured 1-5 repeat posts a day before this gate.
+LIGHT_NO_CHANGE_STUB_HOURS = 12
+
+#: How many of the topic's newest outbound rows are scanned for the last full
+#: post. A long post is one row per chunk and a stub is one row, so this covers
+#: many intervals; when no full post is found inside it the summary is posted.
+_LIGHT_SCAN_ROWS = 20
+
+#: Opens every stub. Model text is HTML-escaped before it reaches the topic, so
+#: no assessment can contain a literal ``<i>`` and be mistaken for a stub.
+_STUB_MARK = "<i>No material change since"
+
+def _is_light_fallback(content: str) -> bool:
+    """Only formatter fallbacks qualify; ordinary assessments can share a suffix."""
+    header = f"<b>{Depth.LIGHT.value} Reflection</b>\n\n"
+    return content in {header + _TOPIC_PARSE_FALLBACK, header + _TOPIC_EMPTY_FALLBACK}
+
+
+def _comparable(content: str) -> str:
+    """Topic text reduced to its words: tags and the header line removed."""
+    body = content.split("\n\n", 1)[1] if "\n\n" in content else content
+    return _html.unescape(re.sub(r"<[^>]+>", " ", body))
+
+
+def _light_overlap(first: str, second: str) -> float:
+    """Local comparison: changed negated text posts, exact repeats can dedup.
+
+    Keeping 'not' as just one term still hides a polarity change under a long
+    common prefix. Counts alone also miss moving 'not' to another subject.
+    """
+    from genesis.memory.source_verification import extract_terms
+
+    def negations(body: str) -> set[str]:
+        words = re.findall(r"\b\w+(?:['’]\w+)*\b", body.casefold())
+        return {w for w in words if w in {"no", "nor", "not", "never", "none", "neither", "without", "cannot"}
+                or w.endswith(("n't", "n’t"))}
+
+    neg_first, neg_second = negations(first), negations(second)
+    if first != second and (neg_first or neg_second):
+        return 0.0
+    terms_first = extract_terms(first) | neg_first
+    terms_second = extract_terms(second) | neg_second
+    if not terms_first or not terms_second:
+        return 0.0
+    return len(terms_first & terms_second) / len(terms_first | terms_second)
+
+
+def _light_history(rows: list[dict], header: str) -> list[dict] | None:
+    """Reassemble complete observed runs from each header, in insertion order.
+
+    Chunks have no group metadata. Include intervening outbound text rather
+    than silently discard a possible continuation; only headers set the clock.
+    A window without a full header cannot provide a comparison baseline.
+    """
+    groups: list[dict] = []
+    for row in reversed(rows):
+        if not isinstance(row, dict) or not isinstance(row.get("content"), str):
+            return None
+        content = row["content"]
+        if content.startswith(header):
+            full = not content[len(header):].lstrip().startswith(_STUB_MARK) and not _is_light_fallback(content)
+            groups.append({"content": content, "timestamp": row.get("timestamp"), "full": full})
+        elif groups:
+            groups[-1]["content"] += content
+    return groups
+
+
+async def send_light_topic_summary(
+    session_id: str,
+    text: str,
+    *,
+    source_text: str,
+    topic_manager,
+    now: datetime | None = None,
+) -> str:
+    """Post a light summary unless it repeats the last full post.
+
+    Returns ``"posted"``, ``"stub"`` or ``"skipped"``. Only the Telegram post is
+    gated; the caller has already stored the reflection's output. A summary is
+    "no change" when it scores at least ``LIGHT_NEAR_DUPLICATE_JACCARD`` against
+    the last full post in the topic, or when the model says so
+    (``"material_change": false``) and it still scores at least
+    ``LIGHT_MODEL_FLAG_MIN_JACCARD``. Then a stub is posted if the topic has been quiet for
+    ``LIGHT_NO_CHANGE_STUB_HOURS``, and nothing otherwise. "Last posted" is read
+    from ``telegram_messages`` (``TopicManager.recent_outbound``), so a restart
+    neither re-posts nor forgets a stub. Anything that cannot be decided
+    (no history, a failed read, a parse-failure fallback) is posted.
+    """
+    from genesis.channels.telegram._handler_helpers import _split_for_telegram
+    from genesis.util.tz import fmt, parse_utc_iso
+
+    depth = Depth.LIGHT
+    if not topic_manager or _is_light_fallback(text):
+        await send_to_topic(session_id, depth, text, topic_manager=topic_manager)
+        return "posted"
+    data = _extract_json_obj(source_text) or {}
+    if data.get("material_change") is True:
+        await send_to_topic(session_id, depth, text, topic_manager=topic_manager)
+        return "posted"
+    category = f"reflection_{depth.value.lower()}"
+    try:
+        rows = await topic_manager.recent_outbound(category, limit=_LIGHT_SCAN_ROWS)
+    except Exception:
+        logger.warning("Light topic history unreadable; posting summary", exc_info=True)
+        rows = None
+    header = f"<b>{depth.value} Reflection</b>"
+    reflection_rows = _light_history(rows or [], header) or []
+    last_full = next(
+        (
+            r for r in reversed(reflection_rows)
+            if r["full"]
+        ),
+        None,
+    )
+    if last_full is None:
+        await send_to_topic(session_id, depth, text, topic_manager=topic_manager)
+        return "posted"
+
+    current, previous = _comparable(text), _comparable(last_full["content"])
+    multi = len(_split_for_telegram(text)) > 1 or len(_split_for_telegram(last_full["content"])) > 1
+    # A large shared prefix must not hide a changed or previously missing tail.
+    # Code fences can be inserted by the splitter, so that baseline is uncertain.
+    uncertain = "```" in text or "```" in last_full["content"]
+    score = 0.0 if uncertain or (multi and current != previous) else _light_overlap(current, previous)
+    model_unchanged = (
+        data.get("material_change") is False and score >= LIGHT_MODEL_FLAG_MIN_JACCARD
+    )
+    if not model_unchanged and score < LIGHT_NEAR_DUPLICATE_JACCARD:
+        await send_to_topic(session_id, depth, text, topic_manager=topic_manager)
+        return "posted"
+
+    now = now or datetime.now(UTC)
+    # The clock runs from the last reflection post (a reply Genesis made in the
+    # thread is not one). A timestamp that will not parse, or lies in the
+    # future, counts as no history: the stub is posted.
+    last_post = parse_utc_iso(reflection_rows[-1]["timestamp"])
+    quiet = (
+        last_post is None
+        or last_post > now
+        or now - last_post >= timedelta(hours=LIGHT_NO_CHANGE_STUB_HOURS)
+    )
+    if not quiet:
+        logger.info(
+            "Light reflection not posted: no material change (model=%s, jaccard=%.2f)",
+            model_unchanged, score,
+        )
+        return "skipped"
+    since = fmt(last_full["timestamp"], "%Y-%m-%d %H:%M %Z")
+    stub = f"{header}\n\n{_STUB_MARK} {_escape(since)}.</i>"
+    await send_to_topic(session_id, depth, stub, topic_manager=topic_manager)
+    return "stub"
 
 
 async def send_to_topic(session_id: str, depth, text: str, *, topic_manager) -> None:
