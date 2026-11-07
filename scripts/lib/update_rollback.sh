@@ -573,6 +573,17 @@ RESTORE_PY
 }
 # END db-restore-through-sqlite
 
+# Retires the pre-update package record this run took (and its helper copy).
+# Called once the update or its rollback has completed, and on the
+# "Already up to date" exit, where nothing changed and nothing will read it.
+# A failed delete must not stop the caller under set -e (disk_hygiene.sh ages
+# out a record left behind).
+_retire_deps_record() {
+    if [ "${DEPS_STATE_TAKEN:-0}" = 1 ] && [ -n "${DEPS_STATE_FILE:-}" ]; then
+        rm -rf "$DEPS_STATE_FILE" "${DEPS_STATE_FILE%.json}.lib" 2>/dev/null || true
+    fi
+}
+
 # Records an entry in update_history. Silently no-ops if the table
 # doesn't exist yet (first update before migration 0001 has run).
 _record_update_history() {
@@ -585,10 +596,7 @@ _record_update_history() {
     # The pre-update package record is retired once the update or its rollback
     # has completed; one a failed rollback leaves is recovery material.
     case "$status" in
-        success | rolled_back)
-            if [ "${DEPS_STATE_TAKEN:-0}" = 1 ] && [ -n "${DEPS_STATE_FILE:-}" ]; then
-                rm -rf "$DEPS_STATE_FILE" "${DEPS_STATE_FILE%.json}.lib"
-            fi ;;
+        success | rolled_back) _retire_deps_record ;;
     esac
     local db_path="$GENESIS_ROOT/data/genesis.db"
     [ -f "$db_path" ] || return 0

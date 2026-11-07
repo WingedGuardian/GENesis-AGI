@@ -74,6 +74,7 @@ probe) and gets no stub for those names.
 
 from __future__ import annotations
 
+import json
 import os
 import pwd
 import shlex
@@ -133,6 +134,7 @@ class _State:
     late_hits: list[str] = []
     answered: list[str] = []  # stub answers: reported, never failed
     saved_bus: dict[str, str | None] = {}
+    merged_workers: set[str] = set()  # xdist workers whose findings were merged
 
 
 _S = _State()
@@ -324,6 +326,45 @@ def _stub_dir_without(names: frozenset[str]) -> str:
     return str(own)
 
 
+# Under pytest-xdist the controller arms the fence first and each worker inherits
+# its already-fenced environment. Read naively, a worker's "original" PATH would
+# start with the controller's stub directory and its saved bus would be the
+# controller's no-bus override: real_tool and user_manager tests would then get
+# stubs. So an xdist controller exports what it found, and a worker it started
+# adopts that instead. Bound to the controller's pid: a nested run inside a
+# worker has a different parent and reads its own environment, as a serial
+# nested run does.
+_ORIG_ENV = "GENESIS_LIVE_FENCE_ORIG"
+_BUS_KEYS = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
+
+
+def _originals(config) -> dict:
+    """The environment this fence wraps: this process's own, or for an xdist
+    worker the one its controller found before fencing it."""
+    if hasattr(config, "workerinput"):
+        try:
+            data = json.loads(os.environ.get(_ORIG_ENV, ""))
+        except ValueError:
+            data = None
+        if isinstance(data, dict) and data.get("run") == os.getppid():
+            return data
+    return {
+        "path": os.environ.get("PATH", os.defpath),
+        "bus": {k: os.environ.get(k) for k in _BUS_KEYS},
+        "cc_bin": os.environ.get("GENESIS_CC_BIN"),
+    }
+
+
+def _is_xdist_controller(config) -> bool:
+    # xdist's own test for distribution mode: `-n` sets option.tx before
+    # pytest_configure, and an explicit --tx sets it too.
+    return (
+        not hasattr(config, "workerinput")
+        and getattr(config.option, "dist", "no") != "no"
+        and bool(getattr(config.option, "tx", None))
+    )
+
+
 def install(config) -> None:
     """Arm the fence for this process. Idempotent: an audit hook cannot be removed."""
     if _S.installed:
@@ -337,7 +378,14 @@ def install(config) -> None:
         _S.real_home = os.environ.get("HOME")
     if not _S.real_home or not os.path.isabs(_S.real_home):
         _S.real_home = None
-    _S.orig_path = os.environ.get("PATH", os.defpath)
+    orig = _originals(config)
+    if _is_xdist_controller(config):
+        os.environ[_ORIG_ENV] = json.dumps({"run": os.getpid(), **orig})
+    _S.orig_path = orig["path"]
+    if orig["cc_bin"] is None:
+        os.environ.pop("GENESIS_CC_BIN", None)
+    else:
+        os.environ["GENESIS_CC_BIN"] = orig["cc_bin"]
     base = Path(tempfile.mkdtemp(prefix="genesis-live-fence-"))
     _S.base = str(base)
     _S.shim_dir = str(base / "bin")
@@ -362,7 +410,7 @@ def install(config) -> None:
     if "claude" in _S.stubbed:
         os.environ["GENESIS_CC_BIN"] = str(Path(_S.shim_dir) / "claude")
     nobus = base / "no-bus"
-    _S.saved_bus = {k: os.environ.get(k) for k in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")}
+    _S.saved_bus = dict(orig["bus"])
     os.environ["XDG_RUNTIME_DIR"] = str(nobus)
     os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={nobus}/bus"
     # The deploy scripts' own guard (scripts/lib/live_system_guard.sh's
@@ -545,6 +593,37 @@ def pytest_sessionfinish(session, exitstatus):
     _S.late_hits.extend(ln for ln in rest if not _is_answer(ln))
     if _S.late_hits and session.exitstatus == 0:
         session.exitstatus = 1
+    # An xdist worker's exit status and terminal summary never reach the run's
+    # result, so it hands its findings to the controller (pytest_testnodedown).
+    if hasattr(session.config, "workeroutput"):
+        session.config.workeroutput["genesis_live_fence"] = {
+            "late_hits": list(_S.late_hits),
+            "answered": list(_S.answered),
+            "real_tool_tests": list(_S.real_tool_tests),
+            "opted_out_tests": list(_S.opted_out_tests),
+        }
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node, error):
+    """The controller collects each worker's findings, so a late refusal in a
+    worker fails the run as it does in a serial one. A worker that went down
+    without reporting (it died after its last test) fails the run too: its
+    findings are unknown, and every worker loads this fence."""
+    if not _S.installed:
+        return
+    worker = (getattr(node, "gateway", None) and getattr(node.gateway, "id", None)) or "a worker"
+    if worker in _S.merged_workers:
+        return  # xdist can report one worker down twice (an interrupted run)
+    _S.merged_workers.add(worker)
+    got = (getattr(node, "workeroutput", None) or {}).get("genesis_live_fence")
+    if not got:
+        _S.late_hits.append(f"{worker}: went down without reporting its live-fence findings ({error})")
+        return
+    _S.late_hits.extend(got["late_hits"])
+    _S.answered.extend(got["answered"])
+    _S.real_tool_tests.extend(got["real_tool_tests"])
+    _S.opted_out_tests.extend(got["opted_out_tests"])
 
 
 def pytest_terminal_summary(terminalreporter):
@@ -565,7 +644,7 @@ def pytest_terminal_summary(terminalreporter):
         for prog, nodes in sorted(by_name.items()):
             tr.write_line(f"{prog}: {len(nodes)} tests")
         report = os.environ.get("GENESIS_LIVE_FENCE_REPORT")
-        if report:
+        if report and not hasattr(tr.config, "workerinput"):  # the controller holds all
             Path(report).write_text("\n".join(_S.answered) + "\n")
     if _S.real_tool_tests:
         tr.section("live fence: real_tool tests (installed tools ran for real)")

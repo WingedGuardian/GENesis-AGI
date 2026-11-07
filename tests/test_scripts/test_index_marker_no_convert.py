@@ -56,7 +56,7 @@ def _cli(queue, *args):
     )
 
 
-@pytest.mark.parametrize("version", [1, 2])
+@pytest.mark.parametrize("version", [1, 2, 3])
 def test_enqueue_on_older_queue_spools_plain_body_without_converting(queue, tmp_path, version):
     _schema2(queue, version=version)
     database = queue.database_path().read_bytes()
@@ -208,11 +208,11 @@ def test_busy_after_the_schema_is_confirmed_keeps_the_current_envelope(
     queue.write_marker(str(tmp_path / "first"), "cbm", "fast")
 
     @contextmanager
-    def busy(**_):
+    def busy(_db):
         raise TimeoutError("index-request queue busy; request not changed")
         yield
 
-    monkeypatch.setitem(queue.write_marker.__globals__, "_write_db", busy)
+    monkeypatch.setitem(queue.write_marker.__globals__, "_transaction", busy)
     spool = queue.write_marker(str(tmp_path / "second"), "cbm", "fast")
     assert json.loads(spool.read_bytes())["kind"] == "enqueue"
 
@@ -250,3 +250,95 @@ def test_explicit_conversion_upgrades_and_imports_deferred_spools(queue, tmp_pat
     rows = queue.list_markers()
     assert [(row["tools"], row["mode"]) for row in rows] == [("gitnexus", "full")]
     assert rows[0]["legacy_unqualified"] == 1
+
+
+def _older_queue(queue, version):
+    _schema2(queue)
+    if version == 3:
+        with closing(sqlite3.connect(queue.database_path(), isolation_level=None)) as db:
+            db.execute("BEGIN IMMEDIATE")
+            queue._legs.upgrade(db)
+            db.execute("UPDATE queue_meta SET value='3' WHERE key='schema_version'")
+            db.execute("PRAGMA user_version=3")
+            db.commit()
+
+
+@pytest.mark.parametrize("version", [2, 3])
+@pytest.mark.parametrize("opener", ["_connect", "_write_db", "_publisher", "_queue_gate"])
+def test_native_prefix_openers_never_convert_existing_queue(queue, tmp_path, version, opener):
+    _older_queue(queue, version)
+    before = _files(queue)
+    with pytest.raises(queue.QueueConversionDeferred, match="only via strict cutover"):
+        if opener == "_connect":
+            queue._connect()
+        else:
+            with getattr(queue, opener)():
+                pytest.fail("older queue reached an admitted transaction")
+    assert _files(queue) == before and _version(queue) == version
+
+
+@pytest.mark.parametrize("kind", ["scalar", "native"])
+@pytest.mark.parametrize("version,unknown_header", [(2, False), (3, False), (4, True)])
+def test_busy_before_schema_proof_never_publishes_outcomes(
+    queue, tmp_path, monkeypatch, kind, version, unknown_header
+):
+    from tests.test_scripts.test_index_marker_execution import _claim, _reservation
+
+    if kind == "native":
+        claimed = _claim(queue, tmp_path)
+    else:
+        repo = str(tmp_path / "repo")
+        queue.write_marker(repo, "cbm", "fast")
+        claimed = queue.claim(queue.marker_hash(repo), provider="cbm")
+    if version < 4:
+        assert queue.database_path().is_relative_to(tmp_path)
+        queue.database_path().unlink()
+        _older_queue(queue, version)
+    if unknown_header:
+        monkeypatch.setitem(queue.remember_outcome.__globals__, "_header_version", lambda: None)
+    before = _files(queue)
+    holder = sqlite3.connect(queue.database_path(), isolation_level=None)
+    holder.execute("BEGIN EXCLUSIVE")
+    try:
+        with pytest.raises((TimeoutError, sqlite3.OperationalError)) as caught:
+            if kind == "scalar":
+                queue.remember_outcome(claimed["context"], "consume")
+            else:
+                reserved = _reservation(claimed)
+                queue.remember_native_event(
+                    claimed["context"], "stop",
+                    {"reason": "wall", "observed_ns": 100,
+                     "boot_id": reserved["owner"]["boot_id"], "unit": reserved["unit"]},
+                )
+        assert isinstance(caught.value, TimeoutError) or queue._is_busy(caught.value)
+    finally:
+        holder.rollback()
+        holder.close()
+    assert _files(queue) == before and _version(queue) == version
+
+
+@pytest.mark.parametrize("protocol", [2, 3])
+def test_protocol_extension_keeps_stored_identity_and_unused_callback(queue, tmp_path, protocol):
+    repo = str(tmp_path / "stored")
+    context = dict(hash=queue._legs.stored_hash(repo), repo_path=repo, provider="cbm",
+                   protocol=protocol, execution_seq=1, claim_id="a" * 32)
+
+    def forbidden_callback(*_):
+        pytest.fail("retained repository identity was re-resolved")
+
+    assert queue._legs.validate_context(context, forbidden_callback, protocol=protocol) == context
+    if protocol == 3:
+        with pytest.raises(ValueError, match="invalid queue claim context"):
+            queue._legs.scalar_event(context, "consume", 1)
+
+
+@pytest.mark.parametrize("version", [2, 3])
+def test_native_status_observer_never_converts_existing_queue(queue, tmp_path, version):
+    _older_queue(queue, version)
+    repo = str(tmp_path / "stored")
+    context = dict(hash=queue._legs.stored_hash(repo), repo_path=repo, provider="cbm",
+                   protocol=3, execution_seq=1, claim_id="a" * 32)
+    before = _files(queue)
+    result = queue.execution_status(context)
+    assert result["state"] == "protocol-incomplete" and result["execution_available"] is False
+    assert _files(queue) == before and _version(queue) == version

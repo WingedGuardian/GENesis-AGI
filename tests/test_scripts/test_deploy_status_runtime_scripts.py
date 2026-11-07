@@ -555,8 +555,12 @@ def test_the_scan_sees_each_shape_it_claims(tmp_path):
 # collect no case and read as a pass); a test keeps them equal to the lists.
 _RELOAD = (
     "scripts/lib/index_marker.py",
+    "scripts/lib/index_marker_cli.py",
     "scripts/lib/index_marker_legacy.py",
     "scripts/lib/index_marker_legs.py",
+    "scripts/lib/index_marker_execution.py",
+    "scripts/lib/code_intel_execution.py",
+    "scripts/lib/code_intel_cbm_admission.py",
     "scripts/hooks/worktree_claim.py",
     "scripts/hooks/secret_scrub.py",
 )
@@ -578,7 +582,6 @@ _FRESH = (
     "scripts/lib/serving_commit.py",
     "scripts/codebase_managed.py",
     "scripts/lib/codebase_managed_unit.py",
-    "scripts/lib/code_intel_cbm_admission.py",
     "scripts/lib/code_intel_cbm_worker.py",
     "scripts/lib/cbm_disable_file.sh",
     ".claude/hooks/genesis-hook",

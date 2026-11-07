@@ -3,8 +3,6 @@ import hashlib
 import json
 import os
 import shlex
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 
@@ -17,6 +15,7 @@ from tests.test_hooks.native_codex import (
     run_native,
     trust_fixture_hook,
 )
+from tests.test_hooks.test_codex_native import native_binaries as native_binaries
 from tests.test_hooks.test_codex_validator_adapter_native import source_copy
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -29,13 +28,12 @@ MATRIX += [(rule, mode, 'adapter') for rule in ('gh', 'heredoc', 'hash_escape', 
 
 @pytest.mark.parametrize('client', ['cli', 'app'])
 @pytest.mark.parametrize('rule,mode,boundary', MATRIX)
-def test_native_role_controls_only_owned_sinks(tmp_path, monkeypatch, client, rule, mode, boundary):
+def test_native_role_controls_only_owned_sinks(tmp_path, monkeypatch, native_binaries, client, rule, mode, boundary):
     monkeypatch.syspath_prepend(str(ROOT / 'scripts/hooks'))
     definition = private_module('role_native_definition', ROOT / 'scripts/hooks/codex_validator_adapter.py')
-    cli = os.environ.get('GENESIS_CODEX_CLI_BIN') or shutil.which('codex')
-    app = os.environ.get('GENESIS_CODEX_APP_SERVER_BIN') or cli
-    binary = cli if client == 'cli' else app
-    assert binary and subprocess.check_output([binary, '--version'], text=True).strip() == 'codex-cli 0.163.0'
+    binaries, versions = native_binaries
+    assert set(versions.values()) == {'codex-cli 0.166.0'}
+    binary, app = binaries[client], binaries['app']
     runtime = source_copy(tmp_path)
     source_hashes = {str(p.relative_to(runtime)): hashlib.sha256(p.read_bytes()).hexdigest()
                      for p in sorted(runtime.rglob('*')) if p.is_file()}
@@ -114,6 +112,9 @@ def test_native_role_controls_only_owned_sinks(tmp_path, monkeypatch, client, ru
         item = {'type': 'function_call', 'id': 'fc_fixture', 'call_id': 'call_fixture',
                 'name': 'exec_command', 'arguments': json.dumps(args)}
     evidence = {'client': client, 'rule': rule, 'mode': mode, 'boundary': boundary,
+                'versions': versions, 'binary': binary,
+                'binary_hashes': {name: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+                                  for name, path in binaries.items()},
                 'command': command, 'runtime': str(runtime), 'receipt': str(receipt),
                 'protected': str(protected), 'guarded_alias': str(guarded_alias),
                 'ordinary_alias': str(ordinary_alias), 'hashes': source_hashes}

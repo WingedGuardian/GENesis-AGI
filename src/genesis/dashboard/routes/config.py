@@ -16,6 +16,7 @@ from flask import jsonify, request
 
 from genesis.dashboard._blueprint import blueprint
 from genesis.env import cc_project_dir
+from genesis.util.resolve import resolve_refusing_loops
 
 logger = logging.getLogger(__name__)
 
@@ -80,9 +81,9 @@ def _categorize_memory(filename: str) -> str:
 
 def _memory_index() -> Path | None:
     """The resolved memory index, or None when it cannot be resolved (a symlink
-    loop raises RuntimeError on Python 3.12)."""
+    loop)."""
     try:
-        return (_MEMORY_DIR / "MEMORY.md").resolve()
+        return resolve_refusing_loops(_MEMORY_DIR / "MEMORY.md")
     except (OSError, RuntimeError):
         return None
 

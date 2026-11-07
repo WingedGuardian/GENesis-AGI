@@ -64,11 +64,15 @@ __all__ = [
     "Derivation",
     "EvidenceDocument",
     "EvidenceError",
+    "RecheckResult",
     "Refusal",
     "decide",
+    "check_e2e_coverage",
     "derive",
     "parse_evidence",
+    "parse_recheck_result",
     "reason_for",
+    "rechecks_for",
 ]
 
 #: Evidence tiers, in the vocabulary CLAUDE.md's evidence rule already uses, so a
@@ -113,9 +117,8 @@ NOT_DEPLOYED = "DEPLOYMENT NOT ESTABLISHED"
 UNDEPLOYED_FAILURE = "FAILED WHERE DEPLOYMENT WAS NOT ESTABLISHED"
 
 #: The four kinds a declared gap can be. The kind, not the prose, decides what the
-#: gap does: ``not_yet_done`` keeps the row OPEN, and the other three close it with
-#: the gap named. (``event_gated`` carries its trigger and re-measuring command so
-#: the owed measurement is recorded in a shape a later recheck can act on.)
+#: gap does: ``not_yet_done`` keeps the row OPEN, ``event_gated`` closes it and
+#: leaves a recheck behind, and the other two close it with the gap named.
 GAP_KINDS = ("method", "event_gated", "owner_only", "not_yet_done")
 
 #: Rendered-gap prefixes for the kinds that are not plain method limits.
@@ -203,17 +206,19 @@ class OwnerGap(BaseModel):
     detail: Text
 
 
-#: An event-gated trigger that is a DATE. Anything else is a named event.
+#: An event-gated trigger that is a DATE. Anything else is a named event. The ONE
+#: definition: the CRUD's due filter imports it, so a trigger cannot be a date in
+#: the writer and an event in the reader.
 TRIGGER_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 #: A string that LOOKS like a date. Matching it while failing to be a real
-#: ``YYYY-MM-DD`` is refused: a mistyped date read as a named event would mean a
-#: different thing than the writer wrote, and nothing downstream could tell.
+#: ``YYYY-MM-DD`` is refused: a mistyped date silently read as a named event would
+#: be listed as due forever, and one read as a far-future date never would be.
 _DATE_LIKE = re.compile(r"^\d{4}-?\d{1,2}-?\d{1,2}")
 
 
 class EventGatedGap(BaseModel):
-    """Measurable only after something happens: a date, or a named event."""
+    """Measurable only after something happens. Closing stores it as a recheck."""
 
     model_config = _CONFIG
 
@@ -255,6 +260,22 @@ class NotYetDoneGap(BaseModel):
 Gap = Annotated[MethodGap | OwnerGap | EventGatedGap | NotYetDoneGap, Field(discriminator="kind")]
 
 
+class E2ECoverage(BaseModel):
+    """An explicit coverage assertion; meaning stays with the validator."""
+
+    model_config = _CONFIG
+
+    step: Text
+    claim: StrictInt | None = Field(default=None, ge=0)
+    gap: StrictInt | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _one_target(self) -> E2ECoverage:
+        if (self.claim is None) == (self.gap is None):
+            raise ValueError("each E2E step needs exactly one claim or gap index")
+        return self
+
+
 class EvidenceDocument(BaseModel):
     """The whole evidence document. ``extra="forbid"``: an unknown key is almost
     always a typo of a real one (``control`` for ``controls``), and dropping it
@@ -274,6 +295,18 @@ class EvidenceDocument(BaseModel):
     controls: list[Text] = []
     gaps: list[Gap] = []
     findings: list[Finding] = []
+    # Optional for historical documents; the close checks against the live PR body.
+    e2e: list[E2ECoverage] = []
+
+    @model_validator(mode="after")
+    def _coverage_targets_exist(self) -> EvidenceDocument:
+        for i, item in enumerate(self.e2e):
+            for key in ("claim", "gap"):
+                index = getattr(item, key)
+                targets = self.claims if key == "claim" else self.gaps
+                if index is not None and index >= len(targets):
+                    raise ValueError(f"e2e[{i}].{key}: index {index} is out of range")
+        return self
 
     @field_validator("repo", mode="before")
     @classmethod
@@ -305,34 +338,58 @@ _HINTS = {
     "chars — close checks it; name the deployed artifact in deploy.detail",
     "controls": "each entry names an arm that had to come out the other way, and did",
     "gaps": "each gap is an object whose 'kind' decides what it does: 'method' or "
-    "'owner_only' (+detail), and 'event_gated' (+detail, +trigger, +recheck) close the "
-    "row with the gap named; 'not_yet_done' (+detail, +command) keeps it OPEN until "
-    "you run the command",
+    "'owner_only' (+detail) close the row with the gap named; 'event_gated' (+detail, "
+    "+trigger, +recheck) closes it and leaves a recheck; 'not_yet_done' (+detail, "
+    "+command) keeps it OPEN until you run the command",
     "scope_limits": "replaced by 'gaps', a list of objects each with a 'kind' "
     "(method, event_gated, owner_only, not_yet_done). It is never mapped across: the "
     "kind decides the verdict, so each entry needs its kind chosen by you",
 }
 
 
-def _path(loc: tuple[Any, ...]) -> str:
-    out = "evidence"
+def _path(loc: tuple[Any, ...], root: str = "evidence") -> str:
+    out = root
     for part in loc:
         out += f"[{part}]" if isinstance(part, int) else f".{part}"
     return out
 
 
-def parse_evidence(obj: object) -> EvidenceDocument:
-    """Validate *obj* strictly, or raise :class:`EvidenceError` naming every bad field."""
+def _validate(model: type[BaseModel], obj: object, root: str) -> Any:
     try:
-        return EvidenceDocument.model_validate(obj)
+        return model.model_validate(obj)
     except ValidationError as exc:
         lines = []
         for err in exc.errors():
             loc = tuple(err.get("loc", ()))
             msg = str(err.get("msg", "invalid")).removeprefix("Value error, ")
             hint = _HINTS.get(str(loc[0])) if loc else None
-            lines.append(f"{_path(loc)}: {msg}" + (f" — {hint}" if hint else ""))
+            lines.append(f"{_path(loc, root)}: {msg}" + (f" — {hint}" if hint else ""))
         raise EvidenceError("\n".join(lines)) from None
+
+
+def parse_evidence(obj: object) -> EvidenceDocument:
+    """Validate *obj* strictly, or raise :class:`EvidenceError` naming every bad field."""
+    return _validate(EvidenceDocument, obj, "evidence")
+
+
+class RecheckResult(BaseModel):
+    """One re-measurement of a closed row's event-gated gap, as ``recheck`` reads it.
+
+    ``repo`` is in the file for the reason it is in the evidence document: with
+    ``--pr`` it is the row's key, and a result appended to the wrong closed row is as
+    permanent as a close."""
+
+    model_config = _CONFIG
+
+    repo: Repo
+    result: Literal["done", "failed"]
+    #: What the recheck command showed — the measurement, not a summary of it.
+    note: Text
+
+
+def parse_recheck_result(obj: object) -> RecheckResult:
+    """Validate a recheck result file strictly, naming every bad field."""
+    return _validate(RecheckResult, obj, "result")
 
 
 @dataclass(frozen=True)
@@ -396,7 +453,8 @@ def derive(doc: EvidenceDocument) -> Derivation:
     total — a document that established something but named no gap and ran no
     control is not "incomplete with nothing to say", it is a pass with one measured
     gap, and now it says so. ``pass-mechanical`` therefore means established,
-    controlled, and nothing left out, by construction.
+    controlled, and gap-free within the document. Close writers separately check
+    the document's E2E coverage against the PR body before discharging its row.
     """
     if not doc.deploy.established:
         undeployed = [
@@ -437,6 +495,19 @@ def derive(doc: EvidenceDocument) -> Derivation:
     return Derivation("pass-with-measured-gaps", gaps=tuple(gaps), failed=())
 
 
+def rechecks_for(doc: EvidenceDocument) -> list[dict]:
+    """The rechecks a CLOSING outcome stores: one per event-gated gap, in order.
+
+    The index into this list is what ``pr_verification.py recheck --index`` takes,
+    so it counts the event-gated gaps alone, never positions in ``gaps``.
+    """
+    return [
+        {"trigger": g.trigger, "recheck": g.recheck, "detail": g.detail}
+        for g in doc.gaps
+        if isinstance(g, EventGatedGap)
+    ]
+
+
 @dataclass(frozen=True)
 class Decision:
     """What gets written: the outcome verdict, and the derivation behind it."""
@@ -456,6 +527,30 @@ class Refusal:
 
     code: int
     message: str
+
+
+def check_e2e_coverage(doc: EvidenceDocument, body: str) -> Refusal | None:
+    """Check declaration identities before a close; never match prose semantically.
+
+    Targets already participate in derive/rechecks. A mapping cannot hide a gap
+    or promote an inferred/unverified claim. Multiple mappings may decompose a
+    compound declaration; each mapping asserts coverage of that declaration.
+    """
+    from genesis.session_awareness.e2e_declaration import e2e_steps
+
+    steps = e2e_steps(body)
+    mapped = {item.step.strip() for item in doc.e2e}
+    missing = [step for step in steps if step not in mapped]
+    stale = sorted(mapped - set(steps))
+    if missing or stale:
+        return Refusal(
+            2,
+            "E2E coverage is incomplete; add evidence.e2e entries with the exact "
+            "declaration text in step and a zero-based claim or gap index."
+            + _listing("missing E2E step", tuple(missing))
+            + _listing("not a declared E2E step", tuple(stale)),
+        )
+    return None
 
 
 def _listing(label: str, items: tuple[str, ...]) -> str:

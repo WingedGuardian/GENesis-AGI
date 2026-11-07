@@ -25,8 +25,12 @@
 _RUNTIME_RELOAD_SCRIPTS=(
     scripts/hooks/secret_scrub.py    # retained by transcript_analytics.scrub
     scripts/lib/index_marker.py      # imported by surplus/jobs/gitnexus.py (and disk_reclaim.py)
+    scripts/lib/index_marker_cli.py  # retained queue CLI dispatch through the facade loader
     scripts/lib/index_marker_legacy.py # retained by index_marker's registered sibling loader
     scripts/lib/index_marker_legs.py # retained provider-leg transactions on that connection
+    scripts/lib/index_marker_execution.py # retained native journal transactions on that connection
+    scripts/lib/code_intel_execution.py # retained report validator imported by the queue
+    scripts/lib/code_intel_cbm_admission.py # retained by that report validator as well as fresh managed calls
     scripts/hooks/worktree_claim.py  # loaded at import by observability/worktree_ownership_config.py
 )
 # Read or run afresh on every use, so a new copy is live at once, no restart:
@@ -48,7 +52,6 @@ _RUNTIME_FRESH_SCRIPTS=(
     scripts/lib/serving_commit.py         # loaded afresh by memory/graph_census.py on every hourly census
     scripts/codebase_managed.py           # run by infra_profile/codebase_mcp.py (`status`) on every profile refresh
     scripts/lib/codebase_managed_unit.py  # imported by codebase_managed.py on every run
-    scripts/lib/code_intel_cbm_admission.py # imported by codebase_managed.py and codebase_managed_unit.py
     scripts/lib/code_intel_cbm_worker.py  # imported by codebase_managed.py (the pinned BUILD)
     scripts/lib/cbm_disable_file.sh       # run by infra_profile/codebase_mcp.py to resolve the opt-out path
     # Not under scripts/, but the same kind: cc/invoker.py runs the allowlist

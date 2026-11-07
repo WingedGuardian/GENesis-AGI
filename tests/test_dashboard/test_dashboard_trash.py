@@ -40,6 +40,16 @@ def client(tmp_path, monkeypatch):
     return app.test_client()
 
 
+def test_a_looping_database_path_reports_no_identity(tmp_path, monkeypatch, caplog):
+    """The warning is the only sign the authoritative half of the guard is off."""
+    loop = tmp_path / "loop.db"
+    loop.symlink_to(loop)
+    monkeypatch.setattr("genesis.env.genesis_db_path", lambda: loop)
+    monkeypatch.setattr(files_mod, "_identity_failure_logged", False)
+    assert files_mod._configured_db_identity() == (None, None)
+    assert "configured database path unreadable" in caplog.text
+
+
 def _entry_for(caller: str):
     [entry] = [e for e in list_entries() if e.tombstone and e.tombstone.caller == caller]
     return entry

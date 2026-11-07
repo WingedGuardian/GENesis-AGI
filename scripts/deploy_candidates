@@ -6,7 +6,7 @@
 #        scripts/deploy_candidates drop <branch> [--no-rebuild] [--wait N]
 #        scripts/deploy_candidates rebuild [--wait N]
 #        scripts/deploy_candidates list | status
-#        scripts/deploy_candidates repair-move [--wait N] [--dismiss TS] [--explain]
+#        scripts/deploy_candidates repair-move [--wait N] [--dismiss TS | --restore TS [--check]] [--explain]
 #
 # This shell is thin on purpose. For every command that writes the manifest or
 # moves the checkout (rebuild, drop in every form, add) it takes update.lock
@@ -44,7 +44,7 @@ _SELF_DIR="$(unset CDPATH; cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # repair-move sources neither shell lib: both are tracked files the half-written
 # move it repairs may have truncated or removed. The test fence is a no-op unless
 # armed; armed, a guard that cannot load refuses (97) rather than skip it.
-# repair-move [--wait N] [--dismiss TS] [--explain]: puts back a `live` checkout a
+# repair-move [--wait N] [--dismiss TS | --restore TS [--check]] [--explain]: puts back a `live` checkout a
 # killed switch left half-written (#3492). It runs the repair KIT bootstrap
 # installed (~/.genesis/lib/live-repair/current), never this checkout's copy: the
 # checkout is what may be half-written. The kit takes update.lock itself.
@@ -82,11 +82,19 @@ exec(compile(src, sys.argv[0], "exec"), {"__name__": "__main__", "__file__": sys
         fi
     done
     [ -f "$kit" ] || die "the live-move repair kit is not installed ($kit). The manual steps: scripts/deploy_candidates repair-move --explain"
-    mode=(--command)
-    case "${1:-}" in
-        --dismiss) mode=(--dismiss "${2:?--dismiss needs the repair timestamp}"); shift 2 ;;
-    esac
-    exec python3 -I -S "$kit" "${mode[@]}" "$HOME/.genesis/update_state.json" "$(dirname "$_SELF_DIR")" "$@"
+    # The mode may follow --wait N (#3974 item 4); every other argument is passed
+    # on. A second mode is refused, never silently preferred (the kit's argparse
+    # refused both together before the mode moved here).
+    mode=(--command) rest=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --dismiss | --restore)
+                [ "${mode[0]}" = --command ] || die "repair-move takes one of --dismiss TS or --restore TS"
+                mode=("$1" "${2:?$1 needs the repair timestamp}"); shift 2 ;;
+            *) rest+=("$1"); shift ;;
+        esac
+    done
+    exec python3 -I -S "$kit" "${mode[@]}" "$HOME/.genesis/update_state.json" "$(dirname "$_SELF_DIR")" "${rest[@]}"
 fi
 
 # Test fence first (sourced): the engine only ever acts on the checkout this

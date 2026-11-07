@@ -25,6 +25,29 @@ import uuid
 
 import aiosqlite
 
+from genesis.db.crud.pr_verification_rechecks import (
+    RECHECK_RESULTS as RECHECK_RESULTS,
+)
+from genesis.db.crud.pr_verification_rechecks import (
+    append_recheck_result as append_recheck_result,
+)
+from genesis.db.crud.pr_verification_rechecks import (
+    list_rechecks_due as list_rechecks_due,
+)
+from genesis.db.crud.pr_verification_rechecks import (
+    normalize_rechecks as _normalize_rechecks,
+)
+from genesis.db.crud.pr_verification_rechecks import (
+    prune_recheck_free_closed,
+    rechecks_from_evidence,
+)
+from genesis.db.crud.pr_verification_rechecks import (
+    recheck_state as recheck_state,
+)
+from genesis.db.crud.pr_verification_rechecks import (
+    rechecks_column_available as _rechecks_column_available,
+)
+
 STATUSES = ("open", "closed")
 
 #: Serialised-evidence ceiling, enforced HERE because this module owns the column.
@@ -193,6 +216,7 @@ async def close_verification(
     reason: str,
     evidence: str | None,
     now: str,
+    rechecks: list[dict] | None = None,
 ) -> bool:
     """Close an OPEN obligation with its verification record (the validator's
     write). True iff a row changed — a closed row never flips back or gets its
@@ -230,6 +254,10 @@ async def close_verification(
     price of a last-wins record: the row always describes its LATEST state, and nothing
     here keeps attempt history. If per-attempt history is ever wanted it needs a child
     table, which the shipping PR considered and rejected against the New-Store Gate.
+
+    Event-gated ``rechecks`` are stored atomically with the close. Omitted entries
+    are derived from typed evidence, covering existing callers during rollout.
+    A close owing rechecks refuses while their column is absent.
     """
     if verdict not in PASS_VERDICTS:
         raise ValueError(
@@ -238,6 +266,7 @@ async def close_verification(
             f"record_attempt(), which leaves the row OPEN."
         )
     _check_evidence_size(evidence)
+    stored = _normalize_rechecks(rechecks_from_evidence(evidence) if rechecks is None else rechecks)
     if not reason or not reason.strip():
         # A closed row with no reason is an unverifiable claim in permanent
         # record — the row would say "handled" and carry nothing. The schema
@@ -250,12 +279,19 @@ async def close_verification(
         return False
     if not await _verdict_columns_available(db):
         return False
+    if stored is not None and not await _rechecks_column_available(db):
+        return False
+    extra = ", rechecks = ?" if stored is not None else ""
+    params = (reason, now, evidence, verdict, now)
+    if stored is not None:
+        params += (stored,)
     cursor = await db.execute(
         "UPDATE pr_verifications SET status = 'closed', closed_reason = ?, "
         "closed_at = ?, evidence = ?, verdict = ?, last_attempt_at = ?, "
-        "last_attempt_note = NULL, attempt_count = attempt_count + 1 "
-        "WHERE repo = ? AND pr_number = ? AND status = 'open'",
-        (reason, now, evidence, verdict, now, repo, pr_number),
+        "last_attempt_note = NULL, attempt_count = attempt_count + 1"
+        + extra
+        + " WHERE repo = ? AND pr_number = ? AND status = 'open'",
+        (*params, repo, pr_number),
     )
     await db.commit()
     return bool(cursor.rowcount)
@@ -609,6 +645,13 @@ async def prune_closed(
     closed row. The guard lives HERE rather than only at the CLI because the
     caller that gets it wrong is the one that never thought about it — the CLI
     validates too, for a readable error instead of a traceback.
+
+    A closed row that still owes a recheck is KEPT, whatever its age: the recheck is
+    the only record that a measurement is still owed, and a row pruned at 180 days
+    with an event that had not happened yet would forgive it silently — the open-row
+    rule, one column over. A row whose ``rechecks`` is not valid JSON is kept too,
+    and never fails the prune: retention is a hygiene step, and a hygiene step that
+    deletes or crashes on what it cannot read has picked the two wrong defaults.
     """
     if older_than_days < 1:
         raise ValueError(
@@ -622,6 +665,8 @@ async def prune_closed(
     from datetime import datetime, timedelta
 
     cutoff = (datetime.fromisoformat(now) - timedelta(days=older_than_days)).isoformat()
+    if await _rechecks_column_available(db):
+        return await prune_recheck_free_closed(db, cutoff=cutoff)
     cursor = await db.execute(
         "DELETE FROM pr_verifications WHERE status = 'closed' AND closed_at < ?",
         (cutoff,),

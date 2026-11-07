@@ -38,6 +38,7 @@ lives in, never the CWD. Gitignored; seeded from `secrets.env.example`.
 | `eval` harnesses (`reflection_golden_set`, `longmemeval.client`) | `secrets_path()`, then `~/genesis/secrets.env` as a worktree fallback that is skipped when `SECRETS_PATH` is set; `os.environ.setdefault` | inherited env wins |
 | One-off scripts (`reindex_fts_to_qdrant`, `backfill_session_memories`, `migrate_reference_data`, `mine_references_from_history`, `eval` CLI) | `load_dotenv(override=True)` | file wins |
 | `wing_backfill`, `wing_payload_resync`, `ambient_replay` | `load_dotenv(...)`, default | inherited env wins |
+| Inbox sync (`scripts/inbox_sync.sh`, through `genesis.inbox.sync_config`) | `secrets_path()`, only `GENESIS_INBOX_PATH` and `GENESIS_HOME`, so `rclone` inherits no secrets | file wins, as for the server |
 | Shell (`backup.sh`, `restore.sh`) | `scripts/lib/load_secrets.sh` — literal, never expanded or executed | exported |
 | Guardian credential bridge (`credential_bridge.py`, awareness tick) | reads `secrets_path()` by name to propagate the Telegram, provisioning and backup credentials to the shared mount | not loaded into the env |
 | Credential-integrity check (`guardian/cred_integrity.py`, `cred_selfheal.py`) | `$HOME/genesis/secrets.env`, home-relative **by design** (the targets are shared with the host Guardian); isolate it with `HOME` / `--home`, not `SECRETS_PATH` | not loaded into the env |
