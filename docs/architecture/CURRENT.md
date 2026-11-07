@@ -4683,7 +4683,11 @@ Refusing a proposed update preserves a previously valid opt-in.
   a process holds it, then saved into the backup's `git/` and removed by one
   step, on every path that ends healed; a same-user process whose open files
   cannot be read counts as a holder only if it is a git or the lock is under
-  30 s old, so a non-git process that cannot be inspected and holds a lock
+  30 s old, is not exiting (the kernel's PF_EXITING flag: such a process
+  runs no user code again), and stays the same process, still unreadable,
+  across three re-checks about 0.15 s apart, so a git that is passing through
+  does not keep a stale lock (#4001; `stale_index_lock.py` applies the same
+  rule); a non-git process that cannot be inspected and holds a lock
   longer than that has it judged stale), every path of the two-dot diff, plus
   a symlink or non-directory parent of one (nothing is read or removed through
   such a parent), plus every index entry under one of those and every index
