@@ -385,19 +385,7 @@ class MemoryStore:
                     f"got {life_domain!r}"
                 )
 
-        # Dedup: skip if exact content already stored (any collection)
-        try:
-            existing = await memory_crud.find_exact_duplicate(
-                self._db, content=content,
-            )
-            if existing:
-                logger.debug("Skipping duplicate memory store: %s", existing)
-                # NOT created by this call: the caller must not compensate it.
-                return (existing, False)
-        except Exception:
-            # Dedup check is best-effort — never block a store on lookup failure
-            logger.warning("Dedup check failed, proceeding with store", exc_info=True)
-
+        raw_content = content
         # Surface form normalization: expand known aliases before embedding
         try:
             from genesis.memory.entity_resolution import normalize_content
@@ -405,6 +393,23 @@ class MemoryStore:
             content = normalize_content(content)
         except Exception:
             pass  # best-effort — never block a store on normalization failure
+
+        # Dedup normalized identity first; retain legacy raw-text compatibility.
+        try:
+            existing = await memory_crud.find_exact_duplicate(
+                self._db, content=content, source_subsystem=source_subsystem,
+            )
+            if existing is None and content != raw_content:
+                existing = await memory_crud.find_exact_duplicate(
+                    self._db, content=raw_content, source_subsystem=source_subsystem,
+                )
+            if existing:
+                logger.debug("Skipping duplicate memory store: %s", existing)
+                # NOT created by this call: the caller must not compensate it.
+                return (existing, False)
+        except Exception:
+            # Dedup check is best-effort — never block a store on lookup failure
+            logger.warning("Dedup check failed, proceeding with store", exc_info=True)
 
         # Confidence gate: low-confidence → FTS5 only, skip Qdrant
         # Deferred import to break circular: memory.store ↔ perception
