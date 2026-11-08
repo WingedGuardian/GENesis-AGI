@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 from genesis.cc.exceptions import CCProcessError
 from genesis.util.proc_kill import ProcessCleanupUncertain
+from genesis.util.systemd import literal_scope_args
 
 if TYPE_CHECKING:
     from genesis.cc.types import CCInvocation
@@ -199,7 +200,8 @@ class PeerSegment:
         if remaining <= 0:
             raise ValueError("peer segment deadline expired")
         args = [
-            "systemd-run", "--user", "--scope", "--collect", "--quiet", f"--unit={self.unit_name}"
+            "systemd-run", "--user", "--scope", "--collect", "--quiet", *literal_scope_args(),
+            f"--unit={self.unit_name}",
         ]
         for value in (
             *resource_properties,
