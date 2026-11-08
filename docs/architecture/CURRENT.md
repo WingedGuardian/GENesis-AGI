@@ -3992,6 +3992,22 @@ The marker is inert until the Codex project config forwards it to the Genesis
 MCP launcher; it exists so an unmarked Codex run can mean the owner's own
 client, as an unmarked Claude Code session does.
 
+Tool calls from a labelled client (`GENESIS_CALLER_PROFILE`, read into
+`CallerContext.profile`; owner-mode Codex sets `codex`) are logged to
+`client_tool_calls` by `observability/client_call_log.py`, which
+`install_instrumentation` puts on all four servers and which reads
+`caller_context()` per call: client, server, tool, start time, `outcome`
+(`returned`/`raised`/`cancelled` — how the call ended, not whether the tool
+succeeded), and the written row's id for an allowlisted set of writer tools.
+Never the arguments. The write runs after the call on its own connection,
+shielded from cancellation; a failed or skipped write (no database file, table
+not migrated yet) is a warning that never changes the tool result. Credential
+lookups stamp the same label into `credential_access_log.client` server-side.
+Retention: `scripts/prune_client_tool_calls.py` (default 180 days) from disk
+hygiene. Unlabelled calls, which include every Claude Code session, log nothing.
+Credential values returned through `knowledge_recall`/`memory_recall` are still
+not in `credential_access_log` (#3983 removes them from those paths).
+
 Fresh dedicated validator-health trackers disable new activity persistence
 before DB attachment, retaining memory metrics and historical provider SELECTs.
 Health instrumentation then has no transaction DB, so it cannot retire another

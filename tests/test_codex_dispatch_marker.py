@@ -32,6 +32,7 @@ import pytest
 
 from genesis.caller_context import (
     CC_SESSION_ENV,
+    PROFILE_ENV,
     SESSION_ID_ENV,
     SUPERVISED_ENV,
     TRANSCRIPT_ID_ENV,
@@ -69,6 +70,11 @@ def test_dispatched_child_env_drops_supervision_and_session_identity():
         }
     )
     assert env == {CC_SESSION_ENV: "1", "GENESIS_SESSION_ORIGIN": "external_untrusted"}
+
+
+def test_dispatched_child_env_drops_the_client_label():
+    # An unattended run is never the labelled client whose server started it.
+    assert PROFILE_ENV not in dispatched_child_env({PROFILE_ENV: "codex", "PATH": "/bin"})
 
 
 def test_dispatched_child_env_copies_os_environ(monkeypatch: pytest.MonkeyPatch):

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from datetime import UTC, datetime
 
+from genesis.caller_context import caller_context
 from genesis.memory import graph_expansion
 from genesis.memory.provenance import label_result_dicts, wrap_external_recall
 from genesis.memory.reference_ops import (
@@ -627,13 +629,29 @@ async def _log_credential_access(
     memory_mod = _memory_mod()
     assert memory_mod._db is not None
     now_iso = datetime.now(UTC).isoformat()
+    # Stamped here, from the server's own caller context, so a caller cannot
+    # claim another client through ``accessor_context``.
+    client = caller_context().profile
     try:
-        await memory_mod._db.executemany(
-            "INSERT INTO credential_access_log "
-            "(unit_id, accessor_context, accessed_at, query_match_score) "
-            "VALUES (?, ?, ?, ?)",
-            [(uid, accessor_context, now_iso, query_match_score) for uid in unit_ids],
-        )
+        try:
+            await memory_mod._db.executemany(
+                "INSERT INTO credential_access_log "
+                "(unit_id, accessor_context, accessed_at, query_match_score, client) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [(uid, accessor_context, now_iso, query_match_score, client) for uid in unit_ids],
+            )
+        except sqlite3.OperationalError as exc:
+            # Code can reach an MCP process before the server restart that
+            # applies the column's migration; keep the audit row, lose the label.
+            if "no column named client" not in str(exc):
+                raise
+            logger.warning("credential_access_log has no client column yet; row kept without it")
+            await memory_mod._db.executemany(
+                "INSERT INTO credential_access_log "
+                "(unit_id, accessor_context, accessed_at, query_match_score) "
+                "VALUES (?, ?, ?, ?)",
+                [(uid, accessor_context, now_iso, query_match_score) for uid in unit_ids],
+            )
         await memory_mod._db.commit()
     except Exception:
         logger.warning(
