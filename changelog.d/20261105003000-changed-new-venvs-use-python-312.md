@@ -1,0 +1,1 @@
+- **A new install on a host with a newer Python now uses 3.12.** Ubuntu 26.04 ships only Python 3.14, and 23 tests fail on it. Setup now installs uv's Python 3.12 for the venv, adding no package source, and warns and carries on with the system Python if it cannot get one. An existing venv stays on the Python it has.

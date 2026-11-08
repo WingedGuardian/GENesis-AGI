@@ -1,7 +1,7 @@
 """Opening a card for a release, and retiring a single-use card after it.
 
-The vault service calls these in a thread, with the identity it holds after
-``vault unlock``, for a release the owner approved (``payments/release.py``).
+The vault service calls these in a thread, with the identity it loaded from
+``identity.key``, for a release the owner approved (``payments/release.py``).
 They reuse ``vault_store``'s locked, checked access to cards.db; the clear
 columns and the sealed blob are the ones ``vault_store.add_card`` writes.
 """
@@ -92,7 +92,7 @@ def open_card(card_ref: str, identity, path: Path | None = None) -> dict:
 
 
 def retire_released(card_ref: str, path: Path | None = None) -> None:
-    """Retire a single-use card after its release; no passphrase (the held key proved the unlock).
+    """Retire a single-use card after its release; nothing to ask (the release was granted by the owner's tap).
 
     The directory lock is tried for about five seconds and then refused, so the
     thread running this always ends.
@@ -100,3 +100,32 @@ def retire_released(card_ref: str, path: Path | None = None) -> None:
     path = path or vs.vault_dir()
     with vs._dir_lock(path, tries=50) as dfd:
         vs._retire_row(vs._pin(path, dfd), card_ref)
+
+
+def load_identity(path: Path | None = None):
+    """The vault's age X25519 identity, from identity.key, for the vault service.
+
+    Refuses (VaultError) whatever ``check_ready`` refuses (a vault still to
+    migrate included), a key file that is not the one cards.db records, and a
+    key whose public half is not recipient.txt. The bytes checked are the
+    bytes parsed: the file is read once.
+    """
+    path = path or vs.vault_dir()
+    vs.check_ready(path)
+    data = vs._check_identity(path)
+    vs._check_bound_keys(path, data)
+    text = data.decode("ascii").strip()
+    del data
+    from pyrage import IdentityError, x25519
+
+    try:
+        identity = x25519.Identity.from_str(text)
+    except (IdentityError, ValueError):
+        raise vs.VaultError("identity.key does not hold an age X25519 key") from None
+    finally:
+        del text
+    if str(identity.to_public()) != vs._recipient_text(path):
+        raise vs.VaultError(
+            "identity.key and recipient.txt do not match; restore the vault from backup"
+        )
+    return identity

@@ -8,25 +8,11 @@
 # when the box is idle, so a reindex can never storm the container the way the
 # per-commit fire-and-forget spawns did (host load 136, 70 D-state procs).
 #
-# Flow per pending marker:
-#   idle gate (loadavg1 < 2, iowait < 10%, no CC session > 50% CPU; relaxed
-#   after 24h so work is never starved forever) -> transactional claim -> run the
-#   entrypoint FOREGROUND with CODE_INTEL_INDEX_LOCK_SKIP_RC=75 -> act on rc:
-#     0  -> consume the in-flight row; stamp the full-success clock if applicable
-#     75 -> lock held / host-frozen: restore the marker untouched (freeze-safe)
-#     3  -> a requested tool was missing: restore, NO attempts penalty, loud log
-#     *  -> failure: if this was an ESCALATED full (marker mode was fast), fall
-#           back to fast + back off full (no attempts penalty); otherwise
-#           restore with attempts+1 (moved to terminal failed state at the cap).
-# The terminal action is persisted with the claim id before queue mutation. A
-# later tick replays that exact action if the runner loses queue access or dies
-# after the entrypoint returns, preventing a successful index from being run
-# again or charged as a failure.
-#
-# Escalation: a fast marker whose graph has no recent full index runs as full
-# (weekly refresh / first build), unless a recent full FAILED (backoff). cbm 0.9
-# cannot resume a killed full, so the INITIAL from-scratch full rebuild is done
-# SUPERVISED by an operator, not left to this loop (see the incident handoff).
+# This intermediate binary still refuses automatic consumption at readiness.
+# The checked consumer below is prepared for the later complete protocol: one
+# provider per claim, complete NUL records and context-bound scalar settlement.
+# Native intent, uncertain completion, scope quiescence and persistent holds
+# belong to Q3/Q4 before automatic readiness can become positive.
 
 set -u
 
@@ -69,19 +55,71 @@ _log() {
 
 _marker() { python3 "$MARKER_PY" "$@"; }
 
-_finish_outcome() {
-    local hash="$1" action="$2" claim_id="$3" state
-    if ! _marker remember-outcome --hash "$hash" --action "$action" \
-        --claim-id "$claim_id" >> "$LOG_FILE" 2>&1; then
-        _log "could not persist terminal action $action for $hash — stopping tick"
-        return 76
-    fi
-    if ! state="$(_marker apply-outcome --hash "$hash" 2>> "$LOG_FILE")"; then
-        _log "terminal action $action retained for $hash but could not be applied — stopping tick"
-        return 76
-    fi
-    printf '%s\n' "$state"
+# Checked machine transport. _WIRE is replaced only after the child has exited;
+# the list snapshot is separately retained before claim/escalation reuse it.
+_WIRE=()
+
+_queue_capture() {
+    : > "$QUEUE_OUTPUT" || return 76
+    _marker "$@" > "$QUEUE_OUTPUT" 2>> "$LOG_FILE"
 }
+
+_read_wire() {
+    _WIRE=()
+    local field=""
+    while IFS= read -r -d '' field; do
+        _WIRE+=("$field")
+        field=""
+    done < "$QUEUE_OUTPUT" || return 1
+    [[ -z "$field" ]]
+}
+
+_wire_hash() { [[ "$1" =~ ^[0123456789abcdef]{16}$ ]]; }
+_wire_provider() { [[ "$1" == cbm || "$1" == gitnexus ]]; }
+_wire_mode() { [[ "$1" == fast || "$1" == moderate || "$1" == full ]]; }
+
+_wire_number() {
+    local raw="$1" parsed=""
+    [[ "$raw" =~ ^(0|[123456789][0123456789]*)$ && ${#raw} -le 19 ]] || return 1
+    printf -v parsed '%d' "$raw" 2>/dev/null || return 1
+    [[ "$parsed" == "$raw" ]]
+}
+
+_pending_wire() {
+    local i="$1"
+    [[ "${_WIRE[i]}" == 1 && "${_WIRE[i+1]}" == pending ]] || return 1
+    _wire_hash "${_WIRE[i+2]}" && [[ -n "${_WIRE[i+3]}" ]] &&
+        _wire_provider "${_WIRE[i+4]}" && _wire_number "${_WIRE[i+5]}"
+}
+
+_finish_outcome() {
+    local context="$1" action="$2" state
+    if ! _marker remember-outcome --context "$context" --action "$action" >> "$LOG_FILE" 2>&1; then
+        _log "could not persist terminal action $action — stopping tick"
+        return 76
+    fi
+    local apply_rc=0
+    state="$(_marker apply-outcome --context "$context" 2>> "$LOG_FILE")" || apply_rc=$?
+    if [ "$apply_rc" -eq 75 ]; then
+        # Retained: the next tick's reconciliation replays it.
+        _log "terminal action $action retained; queue busy, apply deferred"
+        return 75
+    fi
+    if [ "$apply_rc" -ne 0 ]; then
+        _log "terminal action $action retained but could not be applied — stopping tick"
+        return 76
+    fi
+    case "$state" in consumed|pending|failed) printf '%s\n' "$state" ;;
+        *) _log "invalid terminal disposition — stopping tick"; return 76 ;;
+    esac
+}
+
+# A busy apply (75) defers the tick like any busy queue call; anything else fails.
+_settle_exit() {
+    if [ "$1" -eq 75 ]; then exit 0; fi
+    exit 76
+}
+
 
 # Check at each queue boundary; the sentinel can change while a tick runs.
 # Unresolvable configuration defers CBM, as the entrypoint does.
@@ -141,177 +179,171 @@ elif [ "$lock_rc" -ne 0 ]; then
 fi
 
 if [ ! -f "$ENTRYPOINT" ] || [ ! -f "$MARKER_PY" ]; then
-    _log "entrypoint or marker helper missing — nothing to do"
-    exit 0
+    _log "entrypoint or marker helper missing — deferring without reading the queue"
+    exit 75
 fi
 
-# Re-pend any orphaned in-flight markers from a previous run that died mid-index
-# (OOM / host stop / unit timeout). Safe here: we hold the runner flock, so no
-# other tick is mid-claim — any inflight row is necessarily from a dead run.
-if ! _marker reconcile-inflight >> "$LOG_FILE" 2>&1; then
-    _log "inflight reconciliation failed — stopping tick without claiming new work"
+# Partial protocol upgrades may enqueue and expose status, but never reconcile,
+# claim, or launch automatically. Only the later strict cutover can enable this.
+# An incomplete protocol (the helper's dedicated status 10) is the expected
+# steady state until then, so it exits 0 like a busy tick. Any other status,
+# including 1 from a Python import crash or a failed log redirection, is a real
+# failure and exits 76 so the unit shows failed. This protocol has no ready
+# state yet, so status 0 is an anomaly too: it stops the tick rather than
+# proceeding, until the strict cutover defines what ready means. The helper's
+# per-tick JSON goes to /dev/null so the pause adds one log line per tick, not
+# two; its errors still reach the log.
+protocol_rc=0
+_marker automatic-ready > /dev/null 2>> "$LOG_FILE" || protocol_rc=$?
+case "$protocol_rc" in
+    0) _log "readiness helper reported ready, but this protocol has no ready state — stopping tick"; exit 76 ;;
+    10) _log "automatic queue protocol incomplete — deferring"; exit 0 ;;
+    75) _log "queue busy at readiness — deferring"; exit 0 ;;
+    *) _log "automatic queue protocol observation failed — stopping tick"; exit 76 ;;
+esac
+
+# One owned, private, ephemeral transport path. It is never recovery evidence.
+if ! QUEUE_OUTPUT="$(umask 077; mktemp -- "$GENESIS_HOME/.code-intel-output.XXXXXXXX.tmp")"; then
+    _log "cannot create queue transport — stopping tick"
     exit 76
 fi
+trap 'rm -f -- "$QUEUE_OUTPUT"' EXIT
 
-# Snapshot the pending markers up front (TSV: hash repo tools mode attempts age).
-mapfile -t _MARKERS < <(_marker list 2>/dev/null)
-if [ "${#_MARKERS[@]}" -eq 0 ]; then
-    exit 0  # nothing queued — quiet no-op (the common case)
+# Protocol2 has no native-intent path: restore its unstarted claims or replay a
+# retained scalar. Legacy uncertainty is preserved. Q3 must replace this premise
+# before a later protocol enables automatic native work.
+reconcile_rc=0
+_marker reconcile-inflight >> "$LOG_FILE" 2>&1 || reconcile_rc=$?
+case "$reconcile_rc" in 0) ;;
+    75) _log "queue busy at inflight reconciliation — deferring"; exit 0 ;;
+    *) _log "inflight reconciliation failed — stopping tick without claiming new work"; exit 76 ;;
+esac
+
+list_rc=0
+_queue_capture list-legs --nul || list_rc=$?
+if [ "$list_rc" -eq 75 ]; then
+    _log "queue busy at pending-list — deferring"
+    exit 0
 fi
-
-for line in "${_MARKERS[@]}"; do
-    # From the list snapshot we use ONLY hash + age (for the idle gate). repo/
-    # tools/mode are read from the CLAIM below, not here — a concurrent commit
-    # can coalesce the marker during the idle-sampling window, so the snapshot's
-    # tools/mode may be stale (e.g. a gitnexus-only marker that became "both").
-    IFS=$'\t' read -r hash _l_repo _l_tools _l_mode _l_attempts age <<< "$line"
-    if [ -z "${hash:-}" ]; then
-        continue
-    fi
-
-    # Deferral leaves the pending generation untouched. If a new GitNexus
-    # request coalesces after this snapshot, the next tick sees it.
-    if [ "$_l_tools" = "cbm" ] && _cbm_disabled "$_l_repo"; then
-        _log "CBM disabled — leaving request pending: $_l_repo"
-        continue
-    fi
-
-    if ! _idle_ok "${age:-0}"; then
-        continue
-    fi
-
-    # Claim into a separate row FIRST (so a commit landing mid-index is never dropped),
-    # then act on the CLAIMED state — the authoritative snapshot for this run.
-    claimed="$(_marker claim --hash "$hash" 2>/dev/null)"
-    if [ -z "$claimed" ]; then
-        _log "could not claim marker $hash (already consumed?) — skipping"
-        continue
-    fi
-    IFS=$'\t' read -r repo tools mode _attempts claim_id <<< "$claimed"
-    if [ -z "${repo:-}" ] || [ -z "${claim_id:-}" ]; then
-        _log "claimed marker $hash has incomplete ownership data — stopping tick"
-        # Without the claim nonce a terminal event cannot be safely bound to
-        # this generation. Reconciliation on the next tick will recover it.
+if [ "$list_rc" -ne 0 ] || ! _read_wire; then
+    _log "pending-list observation failed (rc=$list_rc) — stopping tick"
+    exit 76
+fi
+if (( ${#_WIRE[@]} % 6 != 0 )); then
+    _log "invalid pending-list framing — stopping tick"
+    exit 76
+fi
+# Validate EVERY row before the first claim; a valid prefix cannot authorize
+# partial processing of a list whose later record is malformed.
+for ((i=0; i<${#_WIRE[@]}; i+=6)); do
+    if ! _pending_wire "$i"; then
+        _log "invalid pending-list record — stopping tick"
         exit 76
     fi
+done
+_MARKERS=("${_WIRE[@]}")
 
-    # Authoritative tools may differ from the snapshot, and disablement can
-    # race claim. Restore durably before any escalation or tool invocation.
-    if [ "$tools" = "cbm" ] && _cbm_disabled "$repo"; then
-        _finish_outcome "$hash" restore "$claim_id" >/dev/null || exit 76
+for ((i=0; i<${#_MARKERS[@]}; i+=6)); do
+    hash="${_MARKERS[i+2]}"
+    listed_repo="${_MARKERS[i+3]}"
+    provider="${_MARKERS[i+4]}"
+    age="${_MARKERS[i+5]}"
+    if [ "$provider" = cbm ] && _cbm_disabled "$listed_repo"; then
+        _log "CBM disabled — leaving request pending: $listed_repo"
+        continue
+    fi
+    _idle_ok "$age" || continue
+
+    claim_rc=0
+    _queue_capture claim --hash "$hash" --provider "$provider" --nul || claim_rc=$?
+    case "$claim_rc" in 0|1) ;;
+        75) _log "queue busy at claim — deferring"; exit 0 ;;
+        *) _log "claim failed (rc=$claim_rc) — stopping tick"; exit 76 ;;
+    esac
+    if ! _read_wire; then
+        _log "invalid claim framing — stopping tick"
+        exit 76
+    fi
+    if [ "$claim_rc" -eq 1 ]; then
+        if [ "${#_WIRE[@]}" -eq 4 ] &&
+            [[ "${_WIRE[0]}" == 1 && "${_WIRE[1]}" == unclaimed &&
+               "${_WIRE[2]}" == "$hash" && "${_WIRE[3]}" == "$provider" ]]; then
+            continue
+        fi
+        _log "claim predicate lacks a matching acknowledgement — stopping tick"
+        exit 76
+    fi
+    if [ "${#_WIRE[@]}" -ne 7 ]; then
+        _log "invalid claim arity — stopping tick"
+        exit 76
+    fi
+    if ! [[ "${_WIRE[0]}" == 1 && "${_WIRE[1]}" == claim &&
+            "${_WIRE[2]}" == "$hash" && "${_WIRE[4]}" == "$provider" &&
+            -n "${_WIRE[3]}" && -n "${_WIRE[6]}" ]] || ! _wire_mode "${_WIRE[5]}"; then
+        _log "invalid claimed ownership snapshot — stopping tick"
+        exit 76
+    fi
+    repo="${_WIRE[3]}"
+    mode="${_WIRE[5]}"
+    context="${_WIRE[6]}"
+    if [ "$provider" = cbm ] && _cbm_disabled "$repo"; then
+        _finish_outcome "$context" restore >/dev/null || _settle_exit $?
         _log "CBM disabled after claim — restored request: $repo"
         continue
     fi
 
-    # Escalate a fast marker to full when the graph is due (and not backed off),
-    # using the CLAIMED tools/mode. "full" is a cbm-only concept — gitnexus
-    # analyze ignores mode (always incremental) — so a gitnexus-only marker must
-    # NOT escalate or it would stamp the shared full-success clock and falsely suppress
-    # cbm's genuinely-needed full pass.
     run_mode="$mode"
-    if [ "$mode" != "full" ] && { [ "$tools" = "cbm" ] || [ "$tools" = "both" ]; }; then
+    if [ "$provider" = cbm ] && [ "$mode" != full ]; then
         escalation_rc=0
-        _marker should-escalate --hash "$hash" || escalation_rc=$?
-        case "$escalation_rc" in
-            0)
-                run_mode="full"
-                _log "escalating $repo to full (weekly/first full cbm index due)"
-                ;;
-            1)
-                ;;
-            *)
-                _log "full-escalation query failed (rc=$escalation_rc) — restoring $repo and stopping tick"
-                _finish_outcome "$hash" restore "$claim_id" >/dev/null || true
-                exit 76
-                ;;
-        esac
+        _queue_capture should-escalate --hash "$hash" --nul || escalation_rc=$?
+        escalation_ok=0
+        if [ "$escalation_rc" -eq 0 ] && _read_wire && [ "${#_WIRE[@]}" -eq 4 ]; then
+            if [[ "${_WIRE[0]}" == 1 && "${_WIRE[1]}" == escalation &&
+                  "${_WIRE[2]}" == "$hash" && ( "${_WIRE[3]}" == 0 || "${_WIRE[3]}" == 1 ) ]]; then
+                escalation_ok=1
+                if [ "${_WIRE[3]}" = 1 ]; then run_mode=full; fi
+            fi
+        fi
+        if [ "$escalation_rc" -eq 75 ]; then
+            _finish_outcome "$context" restore >/dev/null || _settle_exit $?
+            _log "queue busy at full-escalation check — restored claim, deferring"
+            exit 0
+        fi
+        if [ "$escalation_ok" -ne 1 ]; then
+            _log "full-escalation observation failed — restoring claim and stopping tick"
+            _finish_outcome "$context" restore >/dev/null || true
+            exit 76
+        fi
     fi
 
-    _log "indexing $repo (tools=$tools mode=$run_mode)"
+    _log "indexing $repo (tools=$provider mode=$run_mode)"
     CODE_INTEL_INDEX_LOCK_SKIP_RC=75 \
-        bash "$ENTRYPOINT" "$repo" "$tools" "$run_mode" >> "$LOG_FILE" 2>&1
+        bash "$ENTRYPOINT" "$repo" "$provider" "$run_mode" >> "$LOG_FILE" 2>&1
     rc=$?
-
     case "$rc" in
         0)
-            # Only a successful FULL run that INCLUDED cbm records the full-success clock
-            # (the escalation guard already ensures run_mode=full ⟹ cbm, but be
-            # explicit — the clock is shared across tools and gates cbm's full).
-            if [ "$run_mode" = "full" ] && { [ "$tools" = "cbm" ] || [ "$tools" = "both" ]; }; then
-                action="consume_full"
-            else
-                action="consume"
-            fi
-            _finish_outcome "$hash" "$action" "$claim_id" >/dev/null || exit 76
-            _log "indexed OK: $repo (mode=$run_mode)"
+            action=consume
+            if [ "$provider" = cbm ] && [ "$run_mode" = full ]; then action=consume_full; fi
+            _finish_outcome "$context" "$action" >/dev/null || _settle_exit $?
+            _log "indexed OK: $repo (tools=$provider mode=$run_mode)"
             ;;
         75)
-            _finish_outcome "$hash" restore "$claim_id" >/dev/null || exit 76
-            _log "lock held / host-frozen — kept marker for $repo"
+            _finish_outcome "$context" restore >/dev/null || _settle_exit $?
+            _log "lock held / host-frozen — kept request for $repo"
             ;;
         3)
-            # Nothing indexed: a requested tool is missing or refused (a
-            # persistent condition, not a transient). Keep the marker with no
-            # attempts penalty — but if this was an escalated full, back off
-            # full so it doesn't re-escalate a heavy cbm full EVERY idle tick;
-            # it degrades to cheap fast retries until the condition is fixed.
-            if [ "$run_mode" = "full" ]; then
-                action="restore_backoff"
-            else
-                action="restore"
-            fi
-            _finish_outcome "$hash" "$action" "$claim_id" >/dev/null || exit 76
-            _log "requested tool missing or refused (rc=3) — kept marker, no penalty: $repo"
-            ;;
-        4)
-            # cbm leg completed; the gitnexus leg did not (missing, wrong
-            # version, refused by admission control, or failed). Restoring the
-            # whole marker would rebuild cbm every idle tick forever, so consume
-            # cbm's durable work — and requeue a gitnexus-only marker FIRST, so
-            # the unfinished leg survives: its blocking condition (sentinel
-            # removed, install repaired, admission headroom) can clear without
-            # a new trigger ever writing a marker. Written before the consume
-            # so a runner death mid-branch restores the inflight "both" marker
-            # and coalesces — the pending work is never lost. A refused leg then
-            # retries like any rc-3 marker (no penalty); a failed leg retries
-            # with attempts counting, bounded by MAX_ATTEMPTS.
-            if ! _marker write --repo "$repo" --tools gitnexus --mode "$mode" >> "$LOG_FILE" 2>&1; then
-                _log "could not requeue gitnexus leg for $repo — restoring combined marker"
-                _finish_outcome "$hash" restore "$claim_id" >/dev/null || exit 76
-            elif [ "$run_mode" = "full" ]; then
-                _finish_outcome "$hash" consume_full "$claim_id" >/dev/null || exit 76
-                _log "cbm indexed; gitnexus leg did not complete (rc=4) — consumed cbm (full stamp), requeued gitnexus: $repo"
-            else
-                _finish_outcome "$hash" consume "$claim_id" >/dev/null || exit 76
-                _log "cbm indexed; gitnexus leg did not complete (rc=4) — consumed cbm, requeued gitnexus: $repo"
-            fi
-            ;;
-        5)
-            # gitnexus leg completed; the cbm leg did not (missing, kill-switch-
-            # skipped, or failed). Same split as rc 4: requeue a cbm-only marker
-            # before consuming so the skipped leg's request is not discarded
-            # when the sentinel is later removed. Consume, but NEVER
-            # consume_full: cbm never ran, so stamping the shared full-success
-            # clock would suppress its genuinely-needed full pass for the
-            # whole interval. The requeued fast marker re-escalates on its own
-            # next tick if a full is still due.
-            if ! _marker write --repo "$repo" --tools cbm --mode "$mode" >> "$LOG_FILE" 2>&1; then
-                _log "could not requeue cbm leg for $repo — restoring combined marker"
-                _finish_outcome "$hash" restore "$claim_id" >/dev/null || exit 76
-            else
-                _finish_outcome "$hash" consume "$claim_id" >/dev/null || exit 76
-                _log "gitnexus indexed; cbm leg did not complete (rc=5) — consumed gitnexus, requeued cbm, no full stamp: $repo"
-            fi
+            action=restore
+            if [ "$provider" = cbm ] && [ "$run_mode" = full ]; then action=restore_backoff; fi
+            _finish_outcome "$context" "$action" >/dev/null || _settle_exit $?
+            _log "requested provider missing or refused — kept request, no penalty: $repo"
             ;;
         *)
-            if [ "$run_mode" = "full" ] && [ "$mode" != "full" ]; then
-                # Escalated-full failure: keep incremental fast indexing alive and
-                # back off full so a doomed full (cbm can't resume) can't thrash.
-                _finish_outcome "$hash" restore_backoff "$claim_id" >/dev/null || exit 76
-                _log "escalated full failed (rc=$rc) — fell back to fast, backed off full: $repo"
+            if [ "$provider" = cbm ] && [ "$run_mode" = full ] && [ "$mode" != full ]; then
+                _finish_outcome "$context" restore_backoff >/dev/null || _settle_exit $?
+                _log "escalated full failed (rc=$rc) — retained request with full backoff: $repo"
             else
-                state="$(_finish_outcome "$hash" restore_failure "$claim_id")" || exit 76
-                _log "index failed (rc=$rc) — marker $state: $repo"
+                state="$(_finish_outcome "$context" restore_failure)" || _settle_exit $?
+                _log "index failed (rc=$rc) — request $state: $repo"
             fi
             ;;
     esac

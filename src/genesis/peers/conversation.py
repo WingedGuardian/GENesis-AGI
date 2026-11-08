@@ -18,6 +18,8 @@ from genesis.cc.managed_session import fingerprint, metadata, prepared_metadata,
 from genesis.cc.system_prompt import SystemPromptAssembler
 from genesis.cc.types import CCModel, EffortLevel
 from genesis.db.crud import cc_sessions, pending_outreach
+from genesis.db.peer_status import PENDING, VALID
+from genesis.peers import task_cursor
 from genesis.util.execution_privacy import private_execution
 from genesis.util.inflight import inflight
 
@@ -380,7 +382,9 @@ class ConversationService:
                 while True:
                     try:
                         await update_state(self.runtime._db, sid, "failed", error="not_started")
-                        await cc_sessions.update_status(self.runtime._db, sid, status="failed")
+                        await cc_sessions.update_status(
+                            self.runtime._db, sid, status="failed", outcome_reason="not_started"
+                        )
                         break
                     except Exception as exc:
                         now = time.monotonic()
@@ -414,7 +418,9 @@ class ConversationService:
                         return
                     # A prior write may have committed metadata but lost its
                     # acknowledgement before terminal row status was written.
-                    await cc_sessions.update_status(db, sid, status="failed")
+                    await cc_sessions.update_status(
+                        db, sid, status="failed", outcome_reason="not_started"
+                    )
                     return
             except ConversationRefusal:
                 raise
@@ -535,28 +541,30 @@ class ConversationService:
             clause, owner = owned(peer)
             row = await (
                 await db.execute(
-                    f"SELECT * FROM cc_sessions WHERE {clause} AND id=?",  # noqa: S608 — compiled owner clause, values bound
+                    f"SELECT cc_sessions.*, {PENDING} AS pending_approvals, COALESCE(({VALID}),0) AS projection_valid "  # noqa: S608 — static schema expressions
+                    f"FROM cc_sessions WHERE {clause} AND id=?",  # noqa: S608 — compiled owner clause, values bound
                     (*owner, sid),
                 )
             ).fetchone()
             if row is None:
                 raise ConversationRefusal("not_found", 404)
+            if not row["projection_valid"]:
+                raise ConversationRefusal("not_ready", 503)
             return dict(row)
 
     async def list(self, identity, size, token=None, context=None):
-        if token:
-            anchor = await self.get(identity, uuid_id(token))
-        else:
-            anchor = None
         if context:
             uuid_id(context)
+        else:
+            context = None
+        anchor = task_cursor.decode(token, identity.peer, context) if token is not None else None
         async with self.registry.connection() as authority_db:
             peer = await authorize(authority_db, identity, allow_shared=True)
         where, owner = owned(peer)
         values = list(owner)
         if anchor:
-            where += " AND (started_at,id)<(?,?)"
-            values += [anchor["started_at"], anchor["id"]]
+            where += " AND (a2a_status_at,id)<(?,?)"
+            values += list(anchor)
         if context:
             where += " AND json_extract(metadata,'$.context_id')=?"
             values.append(context)
@@ -568,7 +576,8 @@ class ConversationService:
                 raise ConversationRefusal("state_conflict", 409)
             rows = await (
                 await db.execute(
-                    f"SELECT * FROM cc_sessions WHERE {where} ORDER BY started_at DESC,id DESC LIMIT ?",  # noqa: S608 — fixed clauses, placeholders
+                    f"SELECT cc_sessions.*, {PENDING} AS pending_approvals "  # noqa: S608 — static schema expression
+                    f"FROM cc_sessions WHERE {where} ORDER BY a2a_status_at DESC,id DESC LIMIT ?",  # noqa: S608 — fixed clauses, placeholders
                     (*values, size + 1),
                 )
             ).fetchall()
@@ -577,13 +586,15 @@ class ConversationService:
             )
             total = await (
                 await db.execute(
-                    f"SELECT count(*) FROM cc_sessions WHERE {total_where}",  # noqa: S608 — fixed clauses, placeholders
+                    f"SELECT count(*), sum(NOT COALESCE(({VALID}),0)) FROM cc_sessions WHERE {total_where}",  # noqa: S608 — fixed clauses, placeholders
                     (*owner, context) if context else owner,
                 )
             ).fetchone()
+            if total[1]:
+                raise ConversationRefusal("not_ready", 503)
             return (
                 [dict(r) for r in rows[:size]],
-                rows[size - 1]["id"] if len(rows) > size else "",
+                task_cursor.encode(rows[size - 1], identity.peer, context) if len(rows) > size else "",
                 total[0],
             )
 

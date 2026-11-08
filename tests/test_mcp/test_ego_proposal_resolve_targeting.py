@@ -22,7 +22,7 @@ from genesis.db.schema import TABLES
 from genesis.mcp.health import ego_tools
 
 # The MCP tool is a FunctionTool; .fn is the underlying coroutine function.
-RESOLVE = ego_tools.ego_proposal_resolve.fn
+RESOLVE = ego_tools.ego_proposal_resolve
 
 
 @pytest.fixture

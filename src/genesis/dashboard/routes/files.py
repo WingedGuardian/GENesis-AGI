@@ -20,6 +20,7 @@ from genesis.dashboard.auth import (
     has_internal_bearer,
     is_authenticated,
 )
+from genesis.util.resolve import resolve_refusing_loops
 
 logger = logging.getLogger(__name__)
 
@@ -327,10 +328,10 @@ def _configured_db_identity() -> tuple[Path | None, Path | None]:
     try:
         from genesis.env import genesis_db_path
 
-        db_path = genesis_db_path().resolve()
+        db_path = resolve_refusing_loops(genesis_db_path())
     except Exception:
-        # resolve() is inside the try on purpose: it can raise OSError on a
-        # symlink loop or an unreadable component, and an earlier revision left
+        # This is inside the try on purpose: it raises on a symlink loop, and an
+        # earlier revision left
         # it outside, so the documented "(None, None) on failure" contract
         # became a 500 out of every route.
         if not _identity_failure_logged:
@@ -630,10 +631,9 @@ def _in_a_trash(resolved: Path) -> bool:
 
 
 def _resolve_or_none(path: Path) -> Path | None:
-    """``path.resolve()``, or None when it cannot be resolved: Python 3.12
-    raises RuntimeError on a symlink loop (MEASURED), later versions OSError."""
+    """``path.resolve()``, or None when it cannot be resolved (a symlink loop)."""
     try:
-        return path.resolve()
+        return resolve_refusing_loops(path)
     except (OSError, RuntimeError):
         return None
 

@@ -10,7 +10,7 @@ Run it with the MAIN venv's python (the vault side is main's code)::
 
 ``setup`` builds the directory: a venv whose ``import genesis`` is the branch
 worktree's, a vault holding one card (Stripe's public test Visa, labelled with
-``TEST_LABEL``) unlocked by a passphrase the harness generated, an audit
+``TEST_LABEL``) whose key the test vault service loads at start, an audit
 database, and ``mcp.json`` for a test health MCP that runs the worktree's
 server. ``serve`` runs a vault service on that directory's own socket with its
 own approval registry. Its approvals are asked in the serve terminal, not on
@@ -128,10 +128,6 @@ class Layout:
     @property
     def state(self) -> Path:
         return self.root / "state.json"
-
-    @property
-    def passphrase(self) -> Path:
-        return self.root / "passphrase"
 
     @property
     def pidfile(self) -> Path:
@@ -317,7 +313,7 @@ def live_paths(
     return Live(resolved, frozenset(sockets), frozenset(dbs))
 
 
-# -- R2, R3, R4, R6, R9, R10 ----------------------------------------------------
+# -- R2, R3, R4, R9, R10 ------------------------------------------------------
 
 
 def check_placement(layout: Layout, live: Live, *, new: bool) -> None:
@@ -509,23 +505,6 @@ def check_vault_content(layout: Layout, merchant: str) -> str:
     if any(card.get(k) != v for k, v in expected.items()):
         raise Refused("R4: the test vault's card is not the TEST 4242 card setup added")
     return card["card_ref"]
-
-
-def read_passphrase(layout: Layout) -> str:
-    """R6: the generated passphrase, from a private regular file in the test dir."""
-    try:
-        fd = os.open(layout.passphrase, os.O_RDONLY | os.O_NOFOLLOW)
-    except OSError:
-        raise Refused("R6: the test passphrase file is missing or a symlink") from None
-    with os.fdopen(fd, "r") as f:
-        info = os.fstat(f.fileno())
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_uid != os.getuid()
-            or stat.S_IMODE(info.st_mode) != 0o600
-        ):
-            raise Refused("R6: the test passphrase file is not a private (0600) file you own")
-        return f.read().strip()
 
 
 def check_test_db(layout: Layout, live: Live) -> None:
@@ -782,10 +761,7 @@ def setup(
         d.mkdir(mode=0o700)
     check_socket_bindable(layout)
     _write_private(layout.cc_flag, "")
-    passphrase = secrets.token_urlsafe(32)
-    _write_private(layout.passphrase, passphrase + "\n")
-    vs.init_vault(passphrase, layout.vault)
-    del passphrase
+    vs.init_vault(layout.vault)
     vs.add_card(  # R5: the constants above are the only card the harness holds
         vs.parse_card(TEST_NUMBER, TEST_EXPIRY, TEST_CVC),
         label=TEST_LABEL,
@@ -1103,9 +1079,9 @@ async def run_serve(
         await service.start()
         started = True
         registry.attach_audit(service._audit)
-        unlocked = await service.unlock(read_passphrase(layout), None)
-        if not unlocked.get("ok"):
-            raise Refused(f"serve: the test vault did not unlock ({unlocked.get('error')})")
+        if not service.unlocked:  # start() loads the key; a refusal says why in status
+            reason = (await service.status()).get("ready_error")
+            raise Refused(f"serve: the test vault's key did not load ({reason})")
         bot = await approver.start(registry)
         registry.attach_bot(bot, CONSOLE_OWNER, stopping=lambda: approver.stopping)
         if on_ready is not None:
@@ -1177,7 +1153,7 @@ _ROOT_ENTRIES = frozenset(
     {
         MARKER,
         "state.json",
-        "passphrase",
+        "passphrase",  # written by setup before the vault passphrase was dropped
         "serve.pid",
         "mcp.json",
         "launch.py",
@@ -1337,7 +1313,6 @@ def _serve_locked(layout: Layout, live: Live, timeout_cap_s: float) -> None:
     check_vault_content(layout, state["merchant"])
     check_socket(layout, live)
     check_test_db(layout, live)
-    read_passphrase(layout)
     if other_browsers():
         raise Refused(
             "Q16: a browser is open in another session; close it (or wait for its "

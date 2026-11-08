@@ -9,6 +9,7 @@ Configuration is published once. Native enablement owns operational state.
 from __future__ import annotations
 
 import argparse
+import errno
 import fcntl
 import hashlib
 import json
@@ -25,7 +26,10 @@ import uuid
 from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+SCRIPT = globals().get("_CAPTURED_SCRIPT")
+if SCRIPT is None:
+    SCRIPT = Path(__file__).resolve()
+sys.path.insert(0, str(SCRIPT.parent / "lib"))
 from code_intel_cbm_admission import (  # noqa: E402
     _host_available,
     _working_charge,
@@ -41,6 +45,7 @@ from codebase_managed_unit import (  # noqa: E402,F401
     canonical_sources,
     cgroup_empty,
     config_path,
+    first_existing_parent,
     frontend_command,
     implicit_slice_absent,
     index_writer_targets_main,
@@ -48,6 +53,7 @@ from codebase_managed_unit import (  # noqa: E402,F401
     native_env,
     native_install,
     parent_identity,
+    queue_initialization_advisory,
     sentinel_armed,
     systemctl_env,
     units_dir,
@@ -55,13 +61,16 @@ from codebase_managed_unit import (  # noqa: E402,F401
     validate_frontend_boundary,
     validate_provider_paths,
     validate_source_identity,
+    verify_binary_access,
     verify_worker_writes,
 )
 from codebase_managed_unit import (  # noqa: E402
     parse_arguments as native_parse_arguments,
 )
+from codebase_managed_unit import (  # noqa: E402
+    read_document as _read_document,
+)
 
-SCRIPT = Path(__file__).resolve()
 BACKEND = "genesis-cbm-query.service"
 SLICE = "genesis-cbm-query-clients.slice"
 DISABLED_KEYS = ("auto_index", "auto_watch", "watcher_enabled")
@@ -289,8 +298,8 @@ def retire_managed():
     return sources
 
 
-def runtime_config(path: Path) -> dict:
-    config = read_settings(path)
+def runtime_config(path: Path, *, capture=None) -> dict:
+    config = read_settings(path, capture=capture)
     validate_provider_paths(config)
     main = absolute(config["main"]).resolve(strict=True)
     if main != SCRIPT.parent.parent or not (main / ".git").is_dir():
@@ -430,6 +439,13 @@ def report_retained_state() -> None:
         for key in ("binary", "cache", "runtime"):
             try:
                 path = absolute(config[key]).resolve()
+                # Python 3.13+ non-strict resolve leaves a symlink loop unresolved,
+                # so ask the kernel. Any other failure to stat is still classified.
+                try:
+                    path.stat()
+                except OSError as error:
+                    if error.errno == errno.ELOOP:
+                        raise
                 # A final root symlink is unlinked, never recursively followed.
                 # Runtime pruning keeps its addressed locks child; another real
                 # deletion root may still cover the candidate independently.
@@ -476,25 +492,12 @@ def uninstall(arguments: list[str]) -> None:
         )
 
 
-def read_document(path: Path) -> dict:
-    fd = os.open(path, os.O_RDONLY | OPEN_FLAGS)
-    with os.fdopen(fd, "rb") as stream:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise ValueError("managed settings must be regular")
-        payload = stream.read(65537)
-    if len(payload) > 65536:
-        raise ValueError("managed settings exceed 64 KiB")
-    try:
-        value = json.loads(payload)
-    except RecursionError as error:
-        raise ValueError("managed JSON nesting exceeds parser limit") from error
-    if not isinstance(value, dict):
-        raise ValueError("managed settings must be an object")
-    return value
+def read_document(path: Path, *, capture=None) -> dict:
+    return _read_document(path, open_flags=OPEN_FLAGS, capture=capture)
 
 
-def read_settings(path: Path, *, require_build: bool = True) -> dict:
-    value = read_document(path)
+def read_settings(path: Path, *, require_build: bool = True, capture=None) -> dict:
+    value = read_document(path, capture=capture)
     return validate_settings(value, require_build=require_build)
 
 
@@ -510,15 +513,13 @@ def validate_settings(value: dict, *, require_build: bool = True) -> dict:
     return value
 
 
-def verified_binary(path: Path):
-    """Execute this verified inode, not a later resolution of its pathname."""
+def verified_binary(path: Path, *, execute: bool = True):
+    """Verify this inode; only a staging copy source may omit effective execute access."""
     absolute(str(path))
     fd = os.open(path, os.O_RDONLY | OPEN_FLAGS)
     stream = os.fdopen(fd, "rb")
     try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o111:
-            raise ValueError("managed binary must be a regular executable")
+        verify_binary_access(fd, execute=execute)
         digest = hashlib.sha256()
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
@@ -547,13 +548,6 @@ def sync_directory(path: Path) -> None:
         os.fsync(fd)
     finally:
         os.close(fd)
-
-
-def first_existing_parent(path: Path) -> Path:
-    parent = path.parent
-    while not parent.exists():
-        parent = parent.parent
-    return parent
 
 
 def sync_ancestors(path: Path, stop: Path) -> None:
@@ -639,7 +633,7 @@ def configure(args: argparse.Namespace, path: Path) -> None:
         staging_created = False
         try:
             existing_parent = first_existing_parent(state)
-            with verified_binary(source) as executable:
+            with verified_binary(source, execute=False) as executable:
                 state.mkdir(parents=True, mode=0o700)
                 staging_created = True
                 (state / "bin").mkdir(mode=0o700)
@@ -679,7 +673,8 @@ def configure(args: argparse.Namespace, path: Path) -> None:
 
 def status(path: Path | None, path_error: str | None = None) -> dict:
     """Diagnose broken/old configuration without running its binary or requiring it."""
-    result = dict(settings=None, settings_error=path_error, service=None, manager_error=None)
+    result = dict(settings=None, settings_error=path_error, service=None, manager_error=None,
+                  queue_initialization=queue_initialization_advisory())
     try:
         if path is not None:
             value = read_document(path)
@@ -943,15 +938,15 @@ def available(path: Path, repo: str, persistence: bool = True) -> None:
         raise ValueError("managed indexing requires the configured physical main checkout")
     verify_worker_writes(config, persistence)
     verify_cache(config)
-    ready(config)
-
-
-def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
-    return native_parse_arguments(argv, __doc__)
+    require_enabled(config)
+    validate_loaded_backend(config)
+    with verified_binary(Path(config["binary"])):
+        check_backend(config)
+    require_enabled(config)
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_arguments(argv)
+    args = native_parse_arguments(argv, __doc__)
     try:
         home = os.environ.get("HOME") or pwd.getpwuid(os.getuid()).pw_dir
         absolute(home)

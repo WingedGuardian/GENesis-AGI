@@ -1,1 +1,0 @@
-- Keep deployment status fields aligned with the values used to calculate their verification token when runtime state changes during a status read.

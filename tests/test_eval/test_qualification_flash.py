@@ -177,7 +177,7 @@ async def test_paired_detached_report_censuses_exact_scored_snapshots(tmp_path, 
             alias = FLASH if path == selected.campaign else execution.ALIASES[0]
             assert alias not in views, "snapshot was reopened after scoring"
             self.state = SimpleNamespace(attempts={"a": rows[alias]}, settled=currency("0.10"),
-                                         reserved=currency("0"))
+                                         reserved=currency("0"), manifest={"binding": {}})
             views[alias] = self
 
     async def qualify(alias, cases, params, campaign, *_, **kwargs):

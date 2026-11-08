@@ -90,6 +90,7 @@ def _snapshot(sandbox, host: str, stamp: str, *, complete: bool = True,
 
 def _run(sandbox, *, backend="local", host_override=None, extra_args=(), force=True):
     env = dict(os.environ)
+    env.pop("SECRETS_PATH", None)  # GENESIS_DIR names the secrets file, as on CI
     env.update(
         HOME=str(sandbox["home"]), GENESIS_DIR=str(sandbox["gd"]),
         GENESIS_BACKUP_PASSPHRASE="testpass", QDRANT_URL="http://127.0.0.1:1",

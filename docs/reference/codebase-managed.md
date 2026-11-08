@@ -83,8 +83,10 @@ starting, rechecks and refreshes accepted sources again, then starts and verifie
 native readiness. Backend argv must match
 the installed positional bridge, including its `no-env-expand` flag; auxiliary
 execution commands refuse. A custom installation must supply the same absolute
-`VENV_PATH` used by `install.sh` when invoking `enable`; otherwise the configured
-main checkout's `.venv` is expected. Disable/remove do not require that variable.
+`VENV_PATH` used by `install.sh` when invoking `enable` or `available`; otherwise
+the configured main checkout's `.venv` is expected. The rendered indexing runner
+exports that same literal selection to its child processes.
+Disable/remove do not require that variable.
 Missing typed manager properties, unsupported native namespace layouts or unavailable
 `busctl` refuse activation. Installation calls cannot fall back to a client-side
 reader. Current canonical templates are the authority, not a partial directive
@@ -299,6 +301,30 @@ regular units; bootstrap follows the shared managed-unit ownership policy.
 
 ## Diagnose and recover
 
+The read-only `available --repo /absolute/main --persistence true|false` command
+checks configured main identity, cache and completed query-service startup, plus writer
+prerequisites in the caller's filesystem namespace. It creates no probe files or
+queue rows and does not index repositories. It validates the loaded startup
+contract, accepted executable and active constrained backend without invoking the
+native CLI. Current RPC responsiveness is checked again by final worker admission.
+Persistence checks include the artifact destination
+and the pinned provider's fixed snapshot scratch directory; false omits both.
+The immutable `_config.db` stays a reader surface, while index databases and their
+WAL/SHM and rollback-journal sidecars require read/write access, as does the
+mutable queue database and its sidecars. Cache and queue directories require
+read access for enumeration. The append-only runner log and non-enumerated
+runtime/lock directories do not require read access. The accepted executable
+must also be executable by the caller in this namespace. Existing writable
+descendants can remain usable under a read-only parent.
+
+Availability is advisory: a runner with filesystem restrictions must perform its
+own checks. Custom state roots need an operator-owned `ReadWritePaths` allowlist;
+persistent snapshot scratch can use an operator-owned disk `BindPaths` mapping.
+Genesis does not install a policy drop-in or broaden the runner sandbox. Preserve
+paths masked by a mapping and assess its capacity before using it. The separate
+worker/queue integration performs final admission; this command grants no right
+to index and does not activate providers.
+
 ```bash
 .venv/bin/python -I scripts/codebase_managed.py status
 .venv/bin/python -I scripts/codebase_managed.py --config /absolute/settings.json status
@@ -320,6 +346,19 @@ Unsupported repository/cache identities and symlink-resolution failures also
 populate `settings_error` without suppressing metadata or the systemd check.
 Structural settings reads remain available for retained-state diagnosis; no
 incompatible cache is repaired or deleted automatically.
+
+The separate `queue_initialization` object observes
+`$GENESIS_HOME/index-requests/.queue-db-init.lock` (defaulting to
+`$HOME/.genesis`). Its `required_when` is `queue initialization or schema upgrade`:
+a current-schema queue can remain usable when this append-only lock is not
+writable. `state` reports `absent`, `observed_writable`, or `unavailable`, with
+the selected `path`, observed lexical `exists`, and any `error`. Unknown
+existence is `null` when lookup fails. An absent lock also checks its first
+existing parent's write/search prerequisites without creating anything. This
+advisory neither inspects the database schema nor acquires a lock, and does not
+change availability or readiness. Observed writability does not guarantee a
+future open or an uncontended lock. Settings and manager diagnostics remain
+independent of this observation.
 
 Existing settings and state are never refreshed in place. Schema 1 and other
 builds remain diagnosable, but are not valid schema-2 execution configurations.
@@ -421,18 +460,112 @@ runtime. Current-install tests are not a separate Python 3.10 runtime qualificat
 
 ## Queued indexing
 
-The existing idle-gated runner probes managed availability before and after
-claiming a Codebase-only request. Unavailability leaves the pending generation
-uncharged; a post-claim refusal durably restores it. A combined request can
-complete GitNexus and requeue its unfinished Codebase leg before consuming the
-combined request. Partial-success outcomes (rc 4/5) use the ordinary request
-writer: a new pending row starts at zero attempts; coalescing with an existing
-pending row retains that row's higher count. The original inflight attempt
-count is not carried into the split request. Operators must not manually reset
-attempts to force retries. Retry-budget continuity across splits and commit
-generations remains part of the resource-failure quarantine work.
-The runner records availability errors in its log; the index entry point includes
-the final refusal line in its skip diagnostic.
+Schema 3 stores Codebase and GitNexus requests as separate provider legs in the
+existing SQLite queue. A `both` enqueue creates both legs in one transaction.
+Coalescing keeps each leg's strongest requested mode, earliest request time and
+higher debt. Claiming one leg leaves its sibling pending; only one claim per
+repository can be inflight. A completed older claim cannot delete a newer
+pending request. A failure charges only its claimed provider and is applied once.
+
+Automatic consumption is paused while the queue protocol is incomplete. The
+runner holds its ordinary lock, then observes readiness before reconciliation,
+listing, claiming or invoking a provider. Missing, legacy and incomplete queues
+defer with exit 0, logged as a paused tick, so the unit does not read as failed
+while the pause is expected. Unsupported metadata, observation failures and a
+crashed or unreadable readiness helper stop with exit 76, as does a helper that
+reports ready (this protocol has no ready state yet); lock failures and a
+missing entrypoint or helper file still defer with exit 75. This binary never reports automatic readiness, including if
+a readiness value is manually changed. There is no setter or environment bypass.
+
+`python3 scripts/lib/index_marker.py automatic-ready` is read-only and returns
+the dedicated status 10 for an incomplete protocol or status 2 for an
+observation error. Queue-operation exceptions raised from `main()` also return
+2; a busy queue makes `automatic-ready` return 75, which the runner logs as a
+busy tick and exits 0. Status 10 is reserved so that an interpreter crash (status 1) is never
+mistaken for the expected pause; the runner treats any other status as a
+failure. The runner discards the observer's JSON, so read the current state
+with `python3 scripts/lib/index_marker.py automatic-ready`. `import-status`
+lists receipts for schemas 2, 3 and 4 and refuses a newer schema. The checked
+consumer is prepared behind this fence; native evidence and durable
+resource-failure quarantine must complete before automatic work can resume.
+That readiness does not authorize lifting a freeze or disable sentinel.
+
+No ordinary command converts an existing queue. Converting on connect is unsafe
+across code rollbacks: a failed update restores older code but not the queue,
+and older code refuses a newer schema. On an older queue (schema 1, 2 or 3, or an
+unversioned file that already has tables), `write` durably spools the request
+in the plain format schema-2 code writes and imports, so a rolled-back install
+still consumes it; `automatic-ready` and `import-status` read schemas 1 and 2
+as before, and report an unversioned file that has tables as an observation
+error (so the runner stops with 76 until the cutover); other operations that
+require a current-schema connection exit 2 with one line naming the schema
+and the cutover. A busy queue whose schema was not yet confirmed also spools
+the plain format. A missing queue is created at schema 4, unless an update is known to be running before creation
+(`locks/update.lock` held exclusively, or `update_state.json` present under the
+state directory), in which case `write` spools and nothing is created. Only the
+explicit strict cutover converts an older queue and imports those spools.
+
+`write --repo ... --tools cbm|gitnexus|both --mode fast|moderate|full` and `hash`
+retain their interfaces. `list-legs` emits one JSON object per leg. `claim`
+requires `--hash` and `--provider` and returns a JSON snapshot with a `context`
+object. Settlement commands require that whole object as `--context`, including
+canonical repository, hash, provider, protocol, execution sequence and nonce.
+JSON preserves whitespace and Unicode paths; duplicate context fields are
+rejected. An ordinary no-eligible claim returns 1. Queue-operation exceptions
+raised from `main()` return 2 with diagnostics; a busy queue returns 75. At readiness,
+reconciliation, listing, claim and escalation the runner logs a busy queue and
+exits 0, as for an overlapping tick, so routine contention never fails the unit. Earlier startup failures remain
+visible and can still return 1. The checked consumer requires a complete matching
+machine acknowledgement before accepting no eligibility. No hash-only settlement alias selects a new provider claim.
+
+`list-legs`, `claim` and `should-escalate` also accept `--nul`. Every machine
+field ends in NUL, preserving literal whitespace and trailing newlines. Lists
+contain six-field `1,pending,hash,repo,provider,age` records; claims contain
+seven-field `1,claim,hash,repo,provider,mode,context_json` records. No eligibility
+is a four-field `1,unclaimed,hash,provider` record with status 1. Escalation is
+`1,escalation,hash,0|1` with status 0 for either answer. Wire version 1 is
+independent of queue schema 4 and claim protocols 2/3. The scalar `claim`
+interface still returns protocol 2; explicit `claim-native` returns protocol 3
+with the same framing. Neither operation enables automatic indexing.
+Listed and claimed repository spellings are validated as stored, never
+re-resolved against the live filesystem, so a queued repository that later moves
+(or gains a symlink) cannot stop the list. A request spooled while the queue was
+busy is still resolved when it is imported.
+
+The consumer checks actual child status, framing and every listed row before
+claiming anything. It dispatches only the claimed provider, using that claim's
+mode and opaque context, and rechecks Codebase disablement after claiming.
+GitNexus full requests do not change Codebase full-index clocks. A malformed
+or failed queue observation stops the tick with 76. The headerless list trusts
+the same-install producer to include the complete population; it cannot detect
+a successful response shortened exactly at a record boundary.
+
+The entrypoint and freeze use the same checked physical repository path before
+lock hashing, including trailing newlines and relative leading-dash spellings.
+Failed resolution stops before taking a repository lock; the freeze's default
+repository selection follows the same normalization.
+Leading slash aliases also collapse to the queue's Python-canonical Linux
+spelling, so `/repo` and `//repo` cannot select different repository locks.
+
+Terminal scalar decisions are retained before application. A busy database can
+leave a durable outcome spool; a later tick replays a retained decision before
+claiming work. This prevents resending a known completed execution. Completion
+with no durable terminal decision has no such guarantee here: native intent,
+uncertainty reconciliation and scope cleanup remain prerequisites for activation.
+The ephemeral transport file is private, removed on ordinary exit and never
+used as recovery evidence. Production readiness remains unqualified by owned
+future-capability simulations with a harmless provider.
+
+Migrated shared debt retains its original values and explicit legacy provenance,
+separately from the effective per-leg count. Old combined inflight work keeps one
+protocol-1 history record and is never represented as two proven native runs.
+Old inflight work and conflicting scalar evidence remain for supervised
+reconciliation. A retained failed-row snapshot preserves original fields and
+failure time after the latest failure is replaced; exact raw bytes stay separate. Protocol-2 claims have no automatic native-intent path; explicit
+reconciliation can neutrally restore an unstarted claim, or apply its remembered
+scalar outcome. Neither is proof about a legacy or future native scope. Operators
+must not reset attempts or erase history to force retries. Persistent resource
+quarantine across commit generations remains a separate work package.
 
 The adapter executes the accepted native inode inside the admitted 8 GiB,
 zero-swap scope with a 6 GiB native budget. Its supervisor retains a nonmaximum
@@ -440,20 +573,342 @@ OOM adjustment; only the native child receives 1000. The validated physical main
 path supplies both the native payload and working directory. Final admission
 rechecks managed settings, cache, native readiness and enablement under the
 lifecycle lock, which closes after child creation. Repository/runner locks and
-the scope watchdog retain execution ownership. Missing canonical repository
+the scope watchdog retain foreground execution ownership. The current watchdog
+does not verify scope quiescence after that foreground exits. Missing canonical repository
 locks refuse Codebase; GitNexus retains its independent handling.
 
-This wiring merged in #3012. Read-only availability/access repairs remain tracked
+This wiring merged in #3012. Read-only availability/access repairs merged
 in #3464. Neither fixture acceptance nor a successful probe grants permission to
 clear the sentinel, release the freeze or retry unattended after resource failures.
 Follow the supervised production acceptance and resource gates in
 `../architecture/codebase-managed-runtime.md`.
 
+### Legacy queue import evidence
+
+Only explicit conversion, reserved for strict cutover, upgrades existing schemas
+0 through 3 atomically to schema 4. Ordinary commands leave older queues unchanged:
+request writers spool the plain rollback-readable request; other mutations defer.
+Fresh queues initialize at schema 4 unless an update is in progress.
+Schema 3's
+provider-leg conversion and schema 4's execution rebuild retain old evidence.
+Each legacy
+artifact is isolated by a savepoint: malformed content produces a retained
+receipt containing its exact raw bytes and a reason, while unrelated valid
+requests continue. These diagnostics do not replace a repository's genuine
+failed request or conflicting-outcome state. Stale, unowned outcome artifacts
+also appear in import receipts. Conflicting outcomes retain the first action and
+conflict evidence against their exact execution; they do not trigger an automatic
+failure retry. Filesystem and SQLite failures remain errors, with claimed
+files retained until the import transaction commits. A failure after commit is
+recoverable from the receipt even if a later directory sync fails after unlink.
+
+Inspect receipts without importing work or initializing the queue:
+
+```bash
+python3 scripts/lib/index_marker.py import-status --limit 20
+```
+
+The JSON reports actual totals, imported/quarantined counts, the display limit
+and truncation. Source names use lossless hexadecimal filesystem bytes. Schema 3
+retains exact raw bytes for every newly imported artifact, including valid and
+duplicate old claims; raw payloads remain private and are not printed.
+An absent queue is explicit; schema 1 reports that receipt diagnostics are
+unavailable. Unsupported schema/journal mode, read and lock failures exit 2.
+The reader uses read-only/query-only SQLite against the supported rollback
+journal format; it never ignores recovery journals with `immutable=1`.
+Converted schema-1 metadata is labeled `legacy-metadata-only`: it proves prior
+processing, not historical content validity. No rejected payload is invented.
+
+Receipt identity includes source bytes, raw digest and exact decimal mtime.
+Prior identities remain retained so a commit-before-unlink replay cannot import
+work twice. Do not clear this history to retry a request. Older queue binaries
+refuse a newer schema; rolling back code must not restore an old queue snapshot over
+new writes. Receipt and execution history are retained for idempotence and
+reconciliation; no implicit history prune or new backup service is installed.
+Before a supervised live upgrade, stop automatic consumption, verify no writer,
+preserve a consistent SQLite backup with its owned spool inventory, and verify
+restoration in disposable storage. Do not assume the install's optional backup
+configuration covers this queue. The migration does not enable indexing, add
+resource quarantine, or implement the checked consumer's list/claim propagation
+tracked in #2043.
+
+### Explicit execution-evidence primitive
+
+`scripts/lib/code_intel_execution.py` is an internal stdlib helper with no
+automatic queue caller. It receives a private report-pipe descriptor, expected
+workload unit, exact cap, existing run bound and an argv vector. It does not
+enable a provider, change admission/limits, stop a scope or settle queue work.
+The caller must supply the existing native/supervisor launcher so maximum OOM
+preference remains confined to its native child. The reporter itself refuses
+maximum OOM preference. Its zero exit status means report delivery only. The
+run bound ends observation, not the payload: a payload still running at the
+deadline is neither signalled nor reaped, so the caller's launcher must stop and
+clean it up, and should pass an absolute executable path.
+
+The helper requires validated cgroup v2 routing, the requested finite memory
+cap, zero swap, hierarchical memory events and same-subtree task accounting.
+Unsupported v1/local-only events or unavailable proof refuse before payload.
+After launch, lost proof or an expired run bound yields uncertainty. It waits
+past foreground exit until only verified reporter tasks remain, including
+recursive descendant checks and the aggregate `pids.current` count, then samples
+and rechecks identity/counters. Owned `oom_kill` counts identify workload victims;
+they do not establish which cap caused the OOM. `high`/`max` and ancestor events
+remain diagnostic, with unavailable ancestor counters explicitly labeled. A final
+sample whose identity, counter population, ancestor availability or reporter
+thread count differs from the first is not retained, and the run stays uncertain:
+the pre-launch report-size bound assumes that shape.
+
+Reports use one bounded atomic JSON pipe write, separate from provider stdout
+and closed in the payload. Standard-descriptor aliases are rejected. Identical
+scope/ancestor identities are encoded once with an explicit shared reference;
+the reader restores all sampled facts. Oversized records refuse rather than
+truncate. The reader accumulates through EOF and rejects malformed, duplicate
+or trailing records. A received record and the reporter's later exit status are
+separate facts; a raw signal is not OOM proof.
+
+Future strict queue wiring must retain ownership through an actual bounded
+stop/quiescence/reap barrier and preserve an unresolved claim if cleanup cannot
+be proved. The existing foreground watchdog is insufficient for that contract.
+The explicit native journal below stores intent and interprets retained reports;
+its automatic native producer, scope-lifetime integration and supervised recovery
+remain separate work. This standalone observer does not implement them.
+Local synthetic cgroup and
+real descriptor/subprocess fixtures do not establish native kernel OOM behavior
+or production capacity. Keep existing disablement and supervised acceptance
+requirements in force.
+
+### Explicit native journal (automatic indexing remains fenced)
+
+Schema 4 retains launch permission, scope registration, native intent, the first
+typed terminal and conflict, stop observations and independent cleanup evidence
+on the existing execution row. Migration preserves foreign keys, execution
+identities, raw legacy bytes and the AUTOINCREMENT high-water, including a
+deleted highest row. It publishes the new version in the same transaction.
+
+These are trusted same-install producer APIs, not an operator authorization
+boundary or permission to launch a provider. The explicit CLI commands are
+`claim-native`, `reserve-launch`, `register-scope`, `begin-native`, `cancel-launch`,
+`remember-native-event`, `apply-native`, `reconcile-native` and `execution-status`.
+Every execution operation takes its complete protocol-3 context. Reservation
+binds source/configuration hashes, effective mode, owner boot/PID/start identity,
+the unique expected scope, the full 8 GiB cap and the selected existing routing
+profile. Registration binds actual scope facts and invocation before provider
+preparation. Intent rechecks registration, source and fresh counters; an owned
+preparation OOM refuses indexing and retains resource evidence.
+
+Reservation and intent must commit to SQLite. Only the first winning call
+returns the launch-authorizing result (`reserved` / `started`, CLI status 0).
+An identical repeat returns `already_reserved` / `already_started`, CLI status 1;
+it never grants another launch. A lost acknowledgment cannot authorize a resend.
+Cancellation cannot undo spent intent. Protocol-2 scalar settlement refuses
+protocol-3 contexts.
+Replaying `reserve-launch` after cancellation returns `cancelled` with CLI
+status 1; only `cancel-launch` treats that result as command success.
+
+All modern enqueue and outcome publishers hold the shared side of the existing
+`.queue.lock` through database commit or file-plus-directory synchronization.
+Deferred requests retain this barrier through legacy-body spool synchronization.
+Busy scalar/native outcome publication requires a connection or header proving
+the current schema; older or unknown state refuses without an outcome spool.
+The CLI retains busy status 75. The runner's existing persistence-acknowledgement
+failure remains 76; it defers busy application only after durable retention.
+Native admission and application take its exclusive side across legacy and
+typed spool replay and the decision transaction. Busy terminal/diagnostic writes
+can create immutable `.execution-spool-*.spool` files; admission cannot rely on
+a database-only snapshot that overlooks them. Duplicate evidence ignores its
+receipt timestamp, while original retained facts remain unchanged. Further
+distinct conflicts stay in their spools if the first conflict slot is occupied.
+Filesystem, SQLite, malformed-record and synchronization failures remain visible.
+If a reader blocks SQLite commit, the rolled-back native event is synchronized
+to a spool before acknowledgement. An in-memory record result is not retention;
+a failed spool synchronization reports failure and preserves the artifact.
+Never unlink the lock or discard those spools to force work through.
+An exact-context event missing its required reservation, registration or intent
+is retained as an explicit `unbound` conflict. It cannot establish completion,
+neutral no-start recovery or replacement-writer eligibility. Gate replay first
+publishes representable records, then interprets all still-retained hazards
+against that snapshot in the same transaction. Receipt/filename order cannot
+hide a newer nonempty observation behind an older cleanup proof.
+
+Completion, resource safety and cleanup remain separate. A complete report also
+requires explicit provider response validation before success; exit zero alone
+cannot override an owned OOM. Stop ordering uses same-boot monotonic observations.
+Application charges or consumes the exact execution once, preserves newer pending
+work and the healthy sibling, and retains the repo writer pointer until bound
+cleanup is proved. A later cleanup proof retires only that pointer. Original-root
+removal or a changed boot can establish cleanup, never successful completion.
+Once uncertainty has been settled, later cleanup or terminal evidence cannot
+clear its provider hold; approved supervised release remains separate work.
+Late OOM/conflict evidence cannot refund or repeat a completed execution. Historical
+cleanup disproof remains sticky. Every scalar/native claim, reservation,
+registration, native intent and current-pointer reconciliation checks the
+original kernel subtree afresh before releasing its physical hold. This never
+clears provider safety or rewrites completed accounting. Missing counters,
+changed identity or unreadable original roots keep that execution held while
+reconciliation continues for unrelated repositories. Only the collector's
+`OSError`/`ValueError` becomes a hold; decoding and digest failures before
+collection, returned-event validation and durable publication/write errors
+retain their transaction-failure behavior. A newly observed
+owned OOM is durably retained before release, including when the first cleanup
+proof is already occupied; an unchanged counter does not generate repeated
+resource facts. A preparation OOM observed before an admission refusal remains
+resource evidence even when no native intent was recorded.
+The collector samples recursive population before the owned counters, so an OOM
+at the last descendant's exit is retained before physical release. A populated
+sample remains unresolved for that observation even if tasks exit afterward.
+
+Manager registration additionally matches the typed positive `ControlGroupId`
+to the captured leaf inode on 64-bit Linux and requires the leaf's cgroup
+filesystem device to match the original root. An enclosing unit lookup and
+matching scope/slice names alone cannot authorize a deeper delegated leaf.
+Missing or incompatible native identity refuses; there is no basename fallback.
+When the leaf is absent, cleanup checks original ancestor identities from the
+root down. A genuinely deleted branch under an unchanged ancestor can prove
+removal; replaced or unreadable visible ancestors cannot.
+
+The queued observer reports an intent callback's `RuntimeError` as refusal
+before child creation, preserving its type/message in the caller's private
+diagnostics. Errors elsewhere retain their existing behavior. Producers must
+independently bind the actual owner identity and inherited slice, use the
+accepted executable descriptor for the invocation, and close their creation and
+migration paths before cleanup. Descriptor transport alone is not executable
+acceptance; the queue lock does not prevent arbitrary external cgroup migration.
+
+`execution-status --context ...` uses the existing read-only/query-only opener;
+it neither initializes nor imports work. `evidence_pending` reports retained
+typed spools and makes a database-only observation explicitly incomplete.
+Unreserved claims recover neutrally; reserved/may-start work without trustworthy
+completion remains held. The original-subtree collector reads actual boot,
+mount/root/leaf identity, hierarchical/local counters and recursive population.
+Quiescence also requires retained owned-wait proof; original-subtree removal or
+a changed boot provides a distinct lifetime proof. The typed manager helper
+reads existing unit identities and actual stop policy with a remaining overall
+deadline. These helpers do not create or stop scopes or authorize recovery.
+The queued native producer, actual scope-lifetime barrier and final readiness
+cutover still require their separate implementation and disposable native tests.
+`automatic-ready` remains never-positive. Existing production disablement stays
+in force; isolated CLI/report fixtures are not native or production acceptance.
+
+### Provider safety and control completion
+
+Normal initialization still targets schema 4. An explicit transaction-only
+schema-5 converter adds provider safety coverage and retained control-completion
+witnesses; startup and enqueue do not invoke that converter. Compatible enqueue
+and read-only diagnostics recognize complete schema 5. A busy supported schema-4
+or schema-5 queue retains a modern enqueue envelope, so transport contention does
+not turn a new request into legacy uncertainty. Missing schema-5 fields
+refuse. Native claim, reservation, registration and intent require schema 5;
+there is no live cutover command or readiness setter in this contribution.
+
+A reserved execution with no control-completion witness retains repository-wide
+ownership independently of cancellation, native completion and kernel cleanup,
+including after an older pointer was retired. The original live owner publishes
+its boot/PID/start-bound witness. A clean launched witness requires known
+foreground status and a successful monitor wait; an unlaunched cancelled
+reservation uses the separate no-registration/no-intent case. Generic publication
+cannot manufacture an orphan witness. Controller uncertainty holds the affected
+provider even when native success is known, without charging or repeating that
+completed work.
+
+An uncertain closure is allowed only after all possible old output producers
+have ended. Lost raw child wait status still prevents clean acceptance, but does
+not itself mean a producer survives: the authenticated original-owner closure
+and independent physical release can end temporary repository exclusion while
+the affected provider remains held. A missing closure retains that exclusion.
+
+A launched process that ends before startup is acknowledged retains its actual
+child waits as `uncertain/startup_incomplete`, including an exit status of zero.
+This requires cancelled future launch permission and no native intent; it does
+not create a missing registration or claim native success. An optional startup
+observation retains the original scope and its actual counters. A confirmed
+owned-leaf OOM kill, including one in the first sample, remains a resource hold
+even after successful native completion or a conflicting control receipt.
+Ancestor counters remain diagnostic. Missing startup facts do not mean zero OOM.
+The native journal retains its existing registration-relative counter contract
+for trusted same-install producers. The queued owner/reporter must reject a
+positive first sample before startup acknowledgement or registration and retain
+that original observation through the optional startup witness; supplying an
+arbitrary positive registration baseline directly is not that startup protocol.
+This contribution does not reinterpret historical native baselines or accounting.
+
+Provider safety persists across ordinary enqueue and commit generations. The
+reader recognizes coverage only from the exact selected trial's clean terminal,
+control and source identities; ordinary success cannot write that acceptance.
+Newer incidents and a changed or conflicted accepted trial hold the provider.
+Older covered incidents remain retained. Original physical/control obligations
+are never discharged by a provider acceptance watermark. Supervised retry and
+acceptance commands remain a separate contribution.
+
+Retained cleanup/population/OOM bodies keep their existing safety interpretation
+and fresh original-kernel checks. Their presence alone does not hold a healthy
+sibling after physical/control release. Additional unresolved terminal, stop or
+control conflicts fence their affected repository/provider; malformed, missing
+or unreadable evidence still refuses. Duplicate event identity excludes receipt
+timestamps, and a later pressure stop retains resource safety even after a prior
+wall stop.
+
+Legacy conversion preserves raw evidence, shared debt, settlement and clocks.
+Unknown or conflicting old work gains uncertainty, never an inferred OOM or
+no-start result. Consumed combined history is compared with pending work only at
+initial cutover; a later normal enqueue cannot reclassify that history. Pending
+legacy snapshots and contradictory reused claim identities are observations with
+no claim ID, inflight ownership or accounting effect. Canonical semantic origins
+make repeat projection idempotent. A conflicting claim candidate retains its raw
+body and the union of original/incoming provider attribution without rebinding
+the queue's canonical repository.
+
+This storage and admission contract does not run either indexer, lift production
+disablement or qualify the unfinished runner/recovery paths. Disposable native
+and production acceptance remain separate gates.
+
+## Captured source diagnostics
+
+`python3 -I scripts/lib/code_intel_source.py describe runner` captures the finite
+Python and shell source closure from the primary checkout, checks those bytes
+against one immutable Git commit, and describes its commit and SHA-256 file map.
+Use `entry` for the direct entrypoint closure, which does not execute the runner.
+Dirty or missing source, unsupported tree entries and foreign cached local
+modules refuse. The helper compiles its captured Python buffers with their
+original canonical origins; it does not load local bytecode caches. The managed
+settings reader can retain the exact bounded JSON buffer alongside its existing
+validation, without changing the primary-checkout or provider-path restrictions.
+
+The process-private sealed handoff binds the complete capsule digest in the
+caller's fixed bootstrap command before compiling its entry. It can retain the
+same code/file identities after a deploy removes their original paths; its
+standard input is replaced with `/dev/null` before helper assembly. A sealed
+descriptor preserves bytes and does not authenticate a producer or authorize a
+provider launch. No captured source is persisted as recovery permission.
+
+This is an explicit read-only diagnostic and a preparation API. Actual queued
+runner/watchdog execution from the captured shell buffers, supervised recovery
+and automatic readiness remain separate integration work. The command neither
+opens the queue nor activates or runs either indexer. Run it from the deployed
+primary checkout after its source has landed; a linked development worktree
+does not establish production identity or resource capacity.
+
 ## Verification
+
+The transitional SQLite contention fixture explicitly drives real claim,
+fake-provider, outcome-spool and CLI reconciliation paths. After the fixture
+locker releases the ordinary runner lock, reconciliation must retire pending,
+inflight, failure and spool state, retain the completed execution, and show
+only one provider call. Actual automatic ticks separately prove refusal without
+changing queue bytes. Explicit CLI replay is not automatic-dispatch acceptance.
+An empty pending list or a successful lock-busy no-op does not prove completion.
+The fixture bounds its locker readiness wait. These tests use an isolated home
+and fake provider; they do not qualify production indexing or explain a separate
+first-tick timeout.
+
+Permission-denial fixtures first verify the specific denied role with effective
+IDs. If privilege defeats that premise, only that case skips with its role in
+the reason; ordinary refusal assertions and writable positive controls still
+run. The hot-journal positive case performs real SQLite recovery. Copy-source
+configuration retains its mode-bit contract independently of effective execute
+access, so its positive case also runs when privilege permits execution.
 
 The configuration test suite uses synthetic paths and fixtures. Native staging
 acceptance explicitly opts in to the independently pinned release binary:
-
 ```bash
 GENESIS_TEST_CBM_PINNED_BINARY="$HOME/tmp/codebase-memory-mcp" \
   .venv/bin/pytest tests/test_scripts/test_codebase_managed_config.py

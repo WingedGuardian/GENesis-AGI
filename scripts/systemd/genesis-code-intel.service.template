@@ -23,6 +23,8 @@ TimeoutStartSec=16200
 # fallback's bin dir, so a Node/GitNexus installed under ~/.nvm stays visible
 # to the timer instead of every index being refused off the system PATH.
 Environment=PATH=__VENV__/bin:__CC_BIN_DIR__:__HOME__/.npm-global/bin:__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Retain the renderer's literal selection for managed loaded-command validation.
+Environment="VENV_PATH=__VENV_EXEC__"
 StandardOutput=journal
 StandardError=journal
 # Writes only under $HOME (index-request markers + locks under ~/.genesis, the

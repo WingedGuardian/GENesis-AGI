@@ -111,7 +111,7 @@ async def test_memory_recall_threads_the_visibility_choice(_mcp_state, monkeypat
         ]
     )
 
-    await core_mod.memory_recall.fn(
+    await core_mod.memory_recall(
         query="q",
         include_deprecated=asked,
         compact=False,
@@ -137,7 +137,7 @@ async def test_memory_expand_threads_the_visibility_choice(_mcp_state, monkeypat
         [point] if collection_name == "episodic_memory" else []
     )
 
-    await core_mod.memory_expand.fn(memory_ids=[mid], include_deprecated=asked)
+    await core_mod.memory_expand(memory_ids=[mid], include_deprecated=asked)
 
     assert rec.calls, "graph enrichment never ran — this test proves nothing"
     assert rec.calls[0]["include_deprecated"] is asked
@@ -184,7 +184,7 @@ async def test_the_drift_pipeline_does_not_get_the_visibility_choice(_mcp_state,
     monkeypatch.setattr(drift_mod, "drift_recall", AsyncMock(return_value=[hit]))
     _mcp_state._retriever.recall = AsyncMock(return_value=[hit])
 
-    await core_mod.memory_recall.fn(
+    await core_mod.memory_recall(
         query="q",
         mode=mode,
         include_deprecated=True,
@@ -283,7 +283,7 @@ async def test_a_hidden_neighbour_is_LABELLED_when_the_caller_opted_in(
                     )
                 ]
             )
-            out = await core_mod.memory_recall.fn(
+            out = await core_mod.memory_recall(
                 query="q",
                 include_deprecated=include_deprecated,
                 compact=False,
@@ -297,7 +297,7 @@ async def test_a_hidden_neighbour_is_LABELLED_when_the_caller_opted_in(
             _mcp_state._qdrant.retrieve = lambda collection_name, ids, with_payload: (
                 [point] if collection_name == "episodic_memory" else []
             )
-            out = await core_mod.memory_expand.fn(
+            out = await core_mod.memory_expand(
                 memory_ids=[root_id],
                 include_deprecated=include_deprecated,
             )
@@ -415,7 +415,7 @@ async def test_a_failed_label_check_withdraws_the_absence_contract(_mcp_state, m
                 )
             ]
         )
-        out = await core_mod.memory_recall.fn(
+        out = await core_mod.memory_recall(
             query="q",
             include_deprecated=True,
             compact=False,
@@ -429,7 +429,7 @@ async def test_a_failed_label_check_withdraws_the_absence_contract(_mcp_state, m
         _mcp_state._qdrant.retrieve = lambda collection_name, ids, with_payload: (
             [point] if collection_name == "episodic_memory" else []
         )
-        out = await core_mod.memory_expand.fn(memory_ids=[root_id], include_deprecated=True)
+        out = await core_mod.memory_expand(memory_ids=[root_id], include_deprecated=True)
 
     assert out[0].get("graph_neighbors"), (
         "guard-the-guard: there must be neighbours for the marker to apply to"
@@ -459,8 +459,8 @@ async def test_the_two_tools_defaults_are_deliberately_different(_mcp_state):
 
     from genesis.mcp.memory import core as core_mod
 
-    recall = inspect.signature(core_mod.memory_recall.fn).parameters
-    expand = inspect.signature(core_mod.memory_expand.fn).parameters
+    recall = inspect.signature(core_mod.memory_recall).parameters
+    expand = inspect.signature(core_mod.memory_expand).parameters
     assert recall["include_deprecated"].default is False, (
         "memory_recall must keep hiding by default — graph enrichment must not "
         "surface what the search beside it hides"
@@ -562,7 +562,7 @@ async def test_a_calendar_boosted_row_keeps_the_callers_visibility_in_drift_mode
     )
     monkeypatch.setattr(memory_crud, "get_by_id", AsyncMock(return_value=_row(calendar_id)))
 
-    await core_mod.memory_recall.fn(
+    await core_mod.memory_recall(
         query="q",
         mode="drift",
         time_range="2026-01-01/2026-12-31",

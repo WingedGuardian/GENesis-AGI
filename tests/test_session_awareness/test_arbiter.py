@@ -20,6 +20,7 @@ from genesis.session_awareness.arbiter import (
     judge_candidates,
     parse_verdict,
 )
+from tests._live_fence import _S
 
 
 def _envelope(result: str) -> str:
@@ -206,8 +207,10 @@ async def test_timeout_group_kills_children(tmp_path):
 
 
 @pytest.mark.skipif(
-    shutil.which("claude") is None, reason="claude CLI not on PATH",
+    os.environ.get("GENESIS_LIVE_E2E") != "1" or shutil.which("claude", path=_S.orig_path) is None,
+    reason="requires an installed Claude CLI and opt-in with GENESIS_LIVE_E2E=1",
 )
+@pytest.mark.real_tool("claude")
 @pytest.mark.asyncio
 async def test_live_arbiter_e2e():
     """The smoke test through the real module: deterministic pick."""

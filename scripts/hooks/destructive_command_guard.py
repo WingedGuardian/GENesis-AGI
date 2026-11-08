@@ -68,7 +68,7 @@ except Exception:  # noqa: BLE001 — GUARDED: an unguarded import failure would
 # Legacy single-token pattern — kept as the fallback when shlex cannot
 # tokenize the command (unmatched quotes etc.).
 _RM_RF_PATTERN = re.compile(
-    r"\brm\s+"
+    r"\b(?:gnu)?rm\s+"
     r"(?:-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*|-[a-zA-Z]*f[a-zA-Z]*r[a-zA-Z]*)"
     r"\s+"
 )
@@ -221,12 +221,18 @@ _COMMAND_OPENERS = frozenset(
 try:  # noqa: SIM105
     from shell_parse import analyze_checked as _analyze_checked
     from shell_parse import mentions as _mentions
+    from shell_parse import tool_name as _tool_name
 except Exception:  # noqa: BLE001 — degraded, never permissive
     _analyze_checked = None
 
     def _mentions(command: str, *patterns) -> bool:
         """No resolver: the raw text is the only reading, as before this existed."""
         return all(p.search(command) for p in patterns)
+
+    def _tool_name(token: str) -> str:
+        """No resolver: only the names this guard itself keys on."""
+        name = os.path.basename(token)
+        return name[3:] if name in ("gnurm", "gnurmdir") else name
 
 # The launchers the RESOLVER refuses to model. The shells are deliberately NOT
 # here: the resolver recovers `sh -c "…"` into real segments (MEASURED:
@@ -316,7 +322,8 @@ def _resolver_carrier_refusal(cmd: str) -> tuple[str | None, bool]:
     return None, True
 
 
-_RM_WORD = re.compile(r"\brm\b|\brmdir\b")
+# `gnu` for the names Ubuntu 26.04 keeps GNU's tools under; see shell_parse._GNU_COREUTILS.
+_RM_WORD = re.compile(r"\b(?:gnu)?rm\b|\b(?:gnu)?rmdir\b")
 
 # The CARRIER pre-pass's own prefilter, and it deliberately EXCLUDES `rmdir`.
 # `rmdir` removes an EMPTY directory and has no recursive-force combination at
@@ -329,7 +336,7 @@ _RM_WORD = re.compile(r"\brm\b|\brmdir\b")
 #
 # `_RM_WORD` keeps BOTH verbs, because the ordinary operand scan below is what
 # the wider prefilter exists for.
-_RM_CARRIER_WORD = re.compile(r"\brm\b")
+_RM_CARRIER_WORD = re.compile(r"\b(?:gnu)?rm\b")
 
 # A carrier segment whose payload carries an UNRESOLVED EXPANSION — `$(…)`,
 # `${…}`, `$VAR`, `$1`/`$@`/…, or a backtick — is opaque: the resolver cannot see
@@ -879,7 +886,7 @@ def _rm_violations(cmd: str, *, refuse_carriers: bool = True) -> list[str] | Non
             )
             i += 1
             continue
-        if os.path.basename(core) != "rm":
+        if _tool_name(core) != "rm":
             i += 1
             continue
 

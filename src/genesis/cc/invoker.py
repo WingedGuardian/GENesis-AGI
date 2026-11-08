@@ -21,7 +21,7 @@ from dataclasses import replace
 from functools import wraps
 from pathlib import Path
 
-from genesis.cc import roster
+from genesis.cc import final_status, roster
 from genesis.cc.checkout_lock import CheckoutAdmission, admit_launch
 from genesis.cc.child_env import pin_dispatched_env
 from genesis.cc.exceptions import (
@@ -42,6 +42,7 @@ from genesis.cc.provider_readiness import (
     isolated_provider,
     probing_provider,
     provider_status_isolated,
+    rate_limit_rejected,
 )
 from genesis.cc.types import (
     PROBE_CALLER_TAG,
@@ -53,6 +54,7 @@ from genesis.cc.types import (
     clamp_effort,
     model_supports_effort,
 )
+from genesis.memory.provenance import ORIGIN_EXTERNAL_UNTRUSTED
 from genesis.observability.spans import SpanKind, start_span
 from genesis.util.execution_privacy import private_execution
 from genesis.util.inflight import inflight
@@ -64,6 +66,7 @@ from genesis.util.proc_kill import (
     reap_bounded,
     spawn_owned,
 )
+from genesis.util.systemd import literal_scope_args
 
 logger = logging.getLogger(__name__)
 
@@ -180,6 +183,31 @@ def parse_cc_version(text: str) -> tuple[int, int, int] | None:
     return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
 
 
+#: Prefix on a reason reported by a session that reads outside content.
+EXTERNAL_REASON_LABEL = "the session says: "
+
+
+def _split_final_status(invocation: CCInvocation, output: CCOutput) -> CCOutput:
+    """Move a trailing ``final_status`` block off ``output.text`` (see cc/final_status.py).
+
+    Both run paths return through here, so a caller that set ``report_status``
+    reads the same text its parser read before the contract existed. An
+    invocation that did not ask is never parsed. Accepted residual: the
+    ``expect_output`` silent-cap check runs before this, so an answer that was
+    ONLY the block reaches the caller as empty text without that alert; the
+    caller's own empty-output handling then fails it mechanically.
+    """
+    if not invocation.report_status:
+        return output
+    text, report = final_status.split(output.text)
+    if report is not None and report.reason and invocation.origin == ORIGIN_EXTERNAL_UNTRUSTED:
+        # A session reading outside content can be steered into writing its
+        # reason, and the reason reaches the owner's alert pages. Owner ruling:
+        # show it, labeled as the session's words, never as Genesis's own.
+        report = replace(report, reason=EXTERNAL_REASON_LABEL + report.reason)
+    return replace(output, text=text, final_status=report)
+
+
 def cost_is_cumulative_for(version: tuple[int, int, int] | None) -> bool:
     """Whether a CC of this version reports a resumed session's running totals.
 
@@ -228,6 +256,7 @@ def set_oom_score_adj(pid: int, score: int = 500) -> None:
 # scripts/lib/code_intel_index.sh) already set their own properties at probe
 # time for this reason; this was the one that did not.
 _SCOPE_PROPERTIES = ("IOWeight=100", "MemoryHigh=62%", "MemoryMax=75%")
+_SCOPE_DESCRIPTION = "Genesis CC session"
 
 
 def _scope_argv(*trailing: str) -> list[str]:
@@ -237,7 +266,8 @@ def _scope_argv(*trailing: str) -> list[str]:
     with `/bin/true` it is the probe. Sharing the builder is what keeps the two
     from drifting apart again.
     """
-    argv = ["systemd-run", "--user", "--scope", "--quiet"]
+    argv = ["systemd-run", "--user", "--scope", "--quiet", *literal_scope_args()]
+    argv.append(f"--description={_SCOPE_DESCRIPTION}")
     for prop in _SCOPE_PROPERTIES:
         argv += ["-p", prop]
     argv.append("--")
@@ -2046,7 +2076,7 @@ class CCInvoker:
 
         The silent-cap signature: an Anthropic-subscription cap makes ``claude -p``
         return 0-token, no-text output with ``is_error=False`` and no
-        ``rate_limit_event`` — which every success path reads as a completed run.
+        effective quota refusal — which success paths read as a completed run.
         Only invocations that opt in via ``expect_output`` (output-producing
         cognitive call sites) are considered; the caller has already confirmed the
         output is genuinely empty and non-error before calling this. This is
@@ -2060,6 +2090,21 @@ class CCInvoker:
             await self._on_cc_empty_output(invocation, output)
         except Exception:
             logger.warning("CC empty-output callback failed", exc_info=True)
+
+    async def _observe_stream_limit(self, output: CCOutput, raw_event: dict | None) -> bool:
+        """Classify the final quota state without discarding a usable answer."""
+        if not rate_limit_rejected(raw_event):
+            return False
+        err = CCRateLimitError("CC rate limited (stream event)", raw_event=raw_event)
+        await self._notify_status_change(err)
+        if output.text.strip():
+            return True
+        if output.stream_lines_dropped:
+            raise _unreplayable_after_drop(
+                output.stream_lines_dropped,
+                "the result carried no text under a rate-limit event",
+            ) from err
+        raise err
 
     def _refuse_unenforceable_allowlist(self, inv: CCInvocation, span_settings: str | None) -> None:
         """Refuse to launch a Bash-restricted profile whose restriction will not
@@ -2361,8 +2406,17 @@ class CCInvoker:
             protection_context = self._protected_paths.format_for_prompt()
             if protection_context:
                 system_prompt = system_prompt + "\n\n" + protection_context
+        append = inv.append_system_prompt
+        if inv.report_status:
+            # After the protected-paths block, so which sessions get that block
+            # is unchanged. With no caller prompt the contract is APPENDED:
+            # --system-prompt would replace Claude Code's default prompt.
+            if system_prompt:
+                system_prompt = system_prompt + "\n\n" + final_status.CONTRACT
+            else:
+                system_prompt, append = final_status.CONTRACT, True
         if system_prompt:
-            flag = "--append-system-prompt" if inv.append_system_prompt else "--system-prompt"
+            flag = "--append-system-prompt" if append else "--system-prompt"
             args += [flag, system_prompt]
         if inv.resume_session_id:
             args += ["--resume", inv.resume_session_id]
@@ -3036,6 +3090,7 @@ class CCInvoker:
                 await self._run_inner(invocation, admission),
                 roster_model=roster_model,
             )
+            output = _split_final_status(invocation, output)
             with contextlib.suppress(Exception):
                 span.set_attr("cost_usd", output.cost_usd)
                 span.set_attr("input_tokens", output.input_tokens)
@@ -3331,6 +3386,7 @@ class CCInvoker:
                 await self._run_streaming_inner(invocation, on_event, admission),
                 roster_model=roster_model,
             )
+            output = _split_final_status(invocation, output)
             with contextlib.suppress(Exception):
                 span.set_attr("cost_usd", output.cost_usd)
                 span.set_attr("input_tokens", output.input_tokens)
@@ -3626,7 +3682,10 @@ class CCInvoker:
                         cc_version = event_raw.get("version", "unknown")
                         logger.info("CC version: %s", cc_version)
 
-                    if event.event_type == "text" and event.text:
+                    # Not CC's own synthetic line (a usage-limit notice): it is
+                    # not an answer, and collected as one it made an empty
+                    # rate-limited result read as served instead of raising.
+                    if event.event_type == "text" and event.text and not event.is_synthetic:
                         collected_text.append(event.text)
                     if etype == "assistant":
                         # Read off the RAW content array, not the parsed
@@ -3876,40 +3935,11 @@ class CCInvoker:
                     ) from err
                 raise err
 
-            # CC may return is_error=false but emit rate_limit_event in
-            # the stream.  Update rate-limited status for awareness/scheduling
-            # but still deliver the response if it has content — throwing away
-            # a valid answer just because the API signaled rate pressure wastes
-            # work and forces a contingency fallback the user didn't need.
-            if "rate_limit_event" in event_types:
-                if output.text and output.text.strip():
-                    # Valid response despite rate limit signal — deliver it
-                    # but mark CC as rate-limited so scheduling can back off.
-                    logger.info(
-                        "CC rate-limited but response has content (%d chars) — delivering",
-                        len(output.text),
-                    )
-                    err = CCRateLimitError(
-                        "CC rate limited (stream event)", raw_event=rate_limit_raw
-                    )
-                    await self._notify_status_change(err)
-                    await self._fire_downgrade_callback(output)
-                    return output
-                # Empty/no response — rate limit prevented a real answer
-                err = CCRateLimitError(
-                    output.text or "CC rate limited (stream event)",
-                    raw_event=rate_limit_raw,
-                )
-                await self._notify_status_change(err)
-                if oversized_dropped:
-                    # A rate-limit error is the one that reaches roster failover,
-                    # so this is the branch where a replay costs a SECOND live
-                    # peer running the same prompt with full tools.
-                    raise _unreplayable_after_drop(
-                        oversized_dropped,
-                        "the result carried no text under a rate-limit event",
-                    ) from err
-                raise err
+            # A later allowed state supersedes a rejection. A real final
+            # refusal still updates health, while any valid answer is delivered.
+            if await self._observe_stream_limit(output, rate_limit_raw):
+                await self._fire_downgrade_callback(output)
+                return output
 
             # A result arrived, but a dropped line left it with NO text — so the
             # dropped line WAS the answer. `_parse_result_dict` already recovers
@@ -3942,7 +3972,7 @@ class CCInvoker:
                 await self._notify_status_change(None)
             await self._fire_downgrade_callback(output)
             # Silent-cap detection: reaching here means is_error=False AND no
-            # rate_limit_event (both handled above) — empty text is the signal.
+            # effective quota refusal (both handled above) — empty text is the signal.
             if (
                 invocation.expect_output
                 and not output.is_error
@@ -3989,8 +4019,6 @@ class CCInvoker:
             raise CCProcessError("Contained peer exited without a result")
 
         # No result event — treat collected text as response (success path)
-        if self._last_was_error:
-            await self._notify_status_change(None)
         output = CCOutput(
             session_id="",
             result_received=False,
@@ -4009,14 +4037,18 @@ class CCInvoker:
         )
         if bg_truncated:
             await _emit_bg_truncation_event(output.session_id)
+        if await self._observe_stream_limit(output, rate_limit_raw):
+            await self._fire_downgrade_callback(output)
+            return output
+        if self._last_was_error:
+            await self._notify_status_change(None)
         await self._fire_downgrade_callback(output)
-        # Silent-cap detection (no-result path): also guard on rate_limit_event,
-        # since the rate-limit branch above runs only inside the result_data block.
+        # As with a result event, informational quota events do not explain
+        # empty output. Effective refusals were already handled above.
         if (
             invocation.expect_output
             and not output.is_error
             and not output.text.strip()
-            and "rate_limit_event" not in event_types
             # A drop CAN reach here now: the bg-truncation exemption above lets a
             # dropped run through when real partial text survived. That is why
             # the exemption strips before testing — text that survives is text
