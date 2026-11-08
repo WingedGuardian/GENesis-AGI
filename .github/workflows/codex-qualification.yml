@@ -4,6 +4,7 @@ on:
     paths:
       - '.github/workflows/codex-qualification.yml'
       - '.github/workflows/ci.yml'
+      - 'docs/reference/codex-native-harness.md'
       - '.github/test-tools/**'
       - 'scripts/ci/codex_qualification*'
       - 'tests/test_hooks/*codex*'

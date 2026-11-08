@@ -34,7 +34,7 @@ default in the shared driver.
 
 The image installs test tools under `.github/test-tools/requirements.txt`, the
 same constraints CI uses; changes to those pins trigger fresh qualification.
-Changes to the main CI workflow also trigger qualification. Ordinary CI skips
+Changes to the main CI workflow or this reference also trigger qualification. Ordinary CI skips
 the fifteen contained-only compatibility cases; its skip ceiling includes those
 measured identities. The contained workflow requires every native case to run.
 It first runs the pure driver tests to exercise shared fixture setup and its
@@ -55,7 +55,7 @@ An expected incompatibility can be a completed measurement: native command
 approval is distinct from canonical guard approval, and `production_ready`
 always remains false. Read the copied `readback.json`, raw receipts and workflow
 conclusion together; fixture results do not establish native subscription login,
-live quality, a seven-day ego pilot, arbitrary descendant containment or support
+live quality, production operation, arbitrary descendant containment or support
 for a different native version. Native outer-hook fail-open behavior remains the
 documented limitation described below.
 
