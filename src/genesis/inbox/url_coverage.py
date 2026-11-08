@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections import Counter
+from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 # Patterns indicating the evaluation GAVE UP on URLs (not just encountered errors).
@@ -104,60 +106,71 @@ def _extract_coverage_input_urls(text: str) -> list[str]:
 
 
 # Prose punctuation that ends a sentence, and delimiters that come in pairs.
-# Used ONLY to render a coverage token for the prompt -- never to decide
-# coverage identity.
+# The shared occurrence extractor uses source context to prove these wrappers
+# before either prompt presentation or the gate can accept an alternate form.
 _DISPLAY_TRIM_CHARS = ".,;:!?"
 _DISPLAY_PAIRS = {")": "(", "]": "[", "}": "{", '"': '"', "'": "'", "`": "`"}
 
 
-def _display_url(url: str) -> str:
-    """Render a lossless coverage token as the URL the writer meant.
+def _is_escaped(text: str, index: int) -> bool:
+    """Whether an odd adjacent backslash run escapes this delimiter."""
+    start = index
+    while start and text[start - 1] == "\\":
+        start -= 1
+    return (index - start) % 2 == 1
 
-    The coverage grammar keeps every non-whitespace terminal character so the
-    GATE can fail closed on ambiguous punctuation. That is wrong for the
-    PROMPT: a markdown link or a quoted URL yields a token carrying its own
-    wrapper, and telling the model to fetch ``https://example.com/foo)`` asks
-    for a resource that does not exist.
 
-    Trimming here is STRUCTURAL, not a prose heuristic. A paired delimiter is
-    removed only when the remainder leaves it unmatched -- so a markdown
-    wrapper goes and a balanced ``/wiki/Foo_(bar)`` stays, and an IPv6
-    authority keeps its ``]`` because the ``[`` is still open. Sentence
-    punctuation is trimmed outright.
+def _display_url(url: str, *, wrappers: str = "") -> str:
+    """Remove only matching wrappers observed immediately BEFORE this token.
 
-    This runs on the presentation side only. ``_coverage_identity`` still
-    compares the untrimmed token, so nothing here can make a truncated sibling
-    vouch for an omitted URL.
+    Without source context there is no proof a terminal delimiter is prose.
+    Process outer to inner, with one counter and a moving end index; nested
+    wrappers do not repeatedly copy or rescan the URL. A malformed/escaped
+    wrapper leaves the original token intact. Punctuation inside the final
+    wrapper remains part of the URL.
     """
-    candidate = url
-    unwrapped = False
-    while candidate:
-        last = candidate[-1]
-        if last in _DISPLAY_TRIM_CHARS:
-            candidate = candidate[:-1]
-            continue
-        opener = _DISPLAY_PAIRS.get(last)
-        if opener is None:
-            break
-        body = candidate[:-1]
-        # Symmetric delimiters (quotes) pair off; asymmetric ones nest.
-        unmatched = (
-            body.count(last) % 2 == 0
-            if opener == last
-            else body.count(opener) <= body.count(last)
-        )
-        if not unmatched:
-            break
-        candidate = body
-        unwrapped = True
-    # Sentence punctuation alone is NOT evidence of a wrapper. `/path;` and
-    # `/q?x=1!` are legal URLs, and round 3 established that such ambiguity
-    # must fail CLOSED -- trimming them for display would ask the evaluator
-    # for a DIFFERENT resource than the one the user saved, and the gate
-    # would then accept that answer. So a trim only stands when it removed a
-    # paired delimiter, which is structurally provable. Sentence punctuation
-    # is consumed only to reach one (`...x",` -> `...x`).
-    return candidate if unwrapped else url
+    if not wrappers:
+        return url
+    counts = Counter(url)
+    end = len(url)
+    for opener in wrappers:
+        while end and url[end - 1] in _DISPLAY_TRIM_CHARS:
+            end -= 1
+        closer = next(key for key, value in _DISPLAY_PAIRS.items() if value == opener)
+        if not end or url[end - 1] != closer or _is_escaped(url, end - 1):
+            return url
+        remaining = counts[closer] - 1
+        if (opener == closer and remaining % 2) or (
+            opener != closer and counts[opener] > remaining
+        ):
+            return url
+        counts[closer] -= 1
+        end -= 1
+    return url[:end]
+
+
+@dataclass(frozen=True)
+class _CoverageUrlOccurrence:
+    raw: str
+    start: int
+    end: int
+    display: str
+
+
+def _coverage_url_occurrences(text: str) -> list[_CoverageUrlOccurrence]:
+    """Keep every occurrence's own context, including repeated raw tokens."""
+    occurrences = []
+    openers = set(_DISPLAY_PAIRS.values())
+    for match in _COVERAGE_INPUT_URL_RE.finditer(text):
+        left = match.start()
+        while left and text[left - 1] in openers and not _is_escaped(text, left - 1):
+            left -= 1
+        raw = match.group(0)
+        occurrences.append(_CoverageUrlOccurrence(
+            raw, match.start(), match.end(),
+            _display_url(raw, wrappers=text[left:match.start()]),
+        ))
+    return occurrences
 
 
 def _extract_source_urls(response_text: str) -> list[str]:
@@ -217,47 +230,44 @@ def _coverage_url_label(url: str) -> str:
 def _uncovered_urls(response_text: str, input_content: str) -> list[str]:
     """Return input URLs not cited as complete parsed URL identities.
 
-    The response is first reduced to the URLs recognized by the canonical inbox
-    scanner. Comparing parsed identities makes prefixes, sibling hosts, Unicode
-    continuations, and legal URL delimiters different URLs by construction. It
-    also avoids the prior substring matcher's growing boundary rules and keeps
-    the scan linear in the number of extracted URLs.
+    Evidence comes only from Source fields. Every input occurrence keeps its
+    source-proven presentation until after coverage is checked; repeated raw
+    tokens in different contexts cannot erase each other's obligations.
     """
-    urls = _extract_coverage_input_urls(input_content)
-    if not urls:
-        return []
+    return list(dict.fromkeys(
+        occurrence.raw for occurrence in _uncovered_occurrences(
+            response_text, _coverage_url_occurrences(input_content),
+        )
+    ))
+
+
+def _uncovered_occurrences(
+    response_text: str, occurrences: list[_CoverageUrlOccurrence],
+) -> list[_CoverageUrlOccurrence]:
+    """Shared live/report policy, without reconstructing or merging context."""
     response_identities = {
         identity
         for cited in _extract_source_urls(response_text)
         if (identity := _coverage_identity(cited)) is not None
     }
-    return [url for url in urls if not _PLACEHOLDER_RE.search(url)
-            and not _accepted_identities(url) & response_identities]
+    return [
+        occurrence for occurrence in occurrences
+        if not _PLACEHOLDER_RE.search(occurrence.raw)
+        and not _accepted_identities(occurrence.raw, display=occurrence.display)
+        & response_identities
+    ]
 
 
-def _accepted_identities(url: str) -> set[str]:
+def _accepted_identities(url: str, *, display: str | None = None) -> set[str]:
     """Return the identities that count as citing THIS input URL.
 
-    Two renderings of one token, never a widened rule about URLs in general.
-    The prompt shows ``_display_url(url)`` while the gate discovered ``url``,
-    so a response that cites exactly what it was asked for must satisfy the
-    gate -- otherwise the item can never be covered by any compliant answer.
-    MEASURED 2026-09-14 over this install's corpus (284 stored baselines + 112
-    live inbox files, 18,119 tokens): 331 (1.83%) render differently, and 72
-    collapse two input tokens onto one prompt line. Without this, that 1.83%
-    would be a permanent floor under the shadow flag rate -- and the shadow
-    rate is precisely the signal the shadow->enforce decision is meant to read.
-
-    Scoping is what keeps this safe. The set is derived from ONE token, so a
-    truncated SIBLING still cannot vouch for it: given inputs ``/foo`` and
-    ``/foo:bar``, neither one's display form is the other's identity. That is
-    the guarantee the untrimmed comparison was introduced to provide, and it
-    is unchanged.
-
-    An empty set (both renderings unparseable) leaves the URL uncovered.
+    The alternate is supplied only by source-aware occurrence extraction.
+    Without that context, only the raw identity counts. Never union these
+    sets across repeated raw tokens: a literal and a wrapped occurrence can
+    require different citations. An empty set leaves the occurrence uncovered.
     """
     return {
         identity
-        for candidate in (url, _display_url(url))
+        for candidate in (url, display if display is not None else url)
         if (identity := _coverage_identity(candidate)) is not None
     }

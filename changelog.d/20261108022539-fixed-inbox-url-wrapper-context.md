@@ -1,0 +1,1 @@
+- Inbox evaluations no longer accept a shortened citation for a literal URL ending in delimiter punctuation. Explicitly wrapped URLs remain supported, and the coverage report uses the same source context as the evaluator.

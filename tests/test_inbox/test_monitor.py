@@ -209,6 +209,40 @@ async def test_silently_omitted_url_requeues_not_baselines(
 
 
 @pytest.mark.asyncio
+async def test_literal_url_retries_then_completes_only_with_exact_citation(
+    monitor, inbox_dir, db, mock_invoker,
+):
+    """Real scan/SQLite/writer pipeline, with a controlled evaluator response."""
+    from genesis.db.crud import inbox_items
+
+    literal = "https://example.com/literal)"
+    source = inbox_dir / "literal.md"
+    source.write_text(literal)
+    monitor._create_follow_ups_from_eval = AsyncMock()
+    mock_invoker.run.return_value = _success_output(
+        "# Evaluation\n**Source:** <https://example.com/literal>\n" + "x" * 300,
+    )
+    await monitor.check_once()
+    failed = await inbox_items.get_by_file_path(db, str(source))
+    assert failed["status"] == "failed"
+    assert failed["evaluated_content"] is None
+    monitor._create_follow_ups_from_eval.assert_not_awaited()
+
+    mock_invoker.run.return_value = _success_output(
+        f"# Evaluation\n**Source:** <{literal}>\n" + "x" * 300,
+    )
+    await monitor.check_once()
+    completed = await inbox_items.get_by_file_path(db, str(source))
+    assert completed["status"] == "completed"
+    assert completed["evaluated_content"] == literal
+    assert completed["response_path"]
+    assert literal in Path(completed["response_path"]).read_text()
+    calls = mock_invoker.run.await_count
+    await monitor.check_once()
+    assert mock_invoker.run.await_count == calls
+
+
+@pytest.mark.asyncio
 async def test_shadow_mode_logs_but_does_not_requeue(monitor, inbox_dir, db, mock_invoker, caplog):
     """Shadow mode, the contrast with the test above: compute, log, act on nothing.
 
@@ -1512,15 +1546,15 @@ async def test_build_prompt_lists_the_url_the_writer_meant(
 def test_citing_exactly_what_the_prompt_asked_for_covers_the_url():
     """A compliant answer must be able to satisfy the gate.
 
-    The prompt shows ``_display_url(token)`` while the gate discovered
-    ``token``. If only the untrimmed form counted, every URL whose two
+    The prompt uses the source-aware display while the gate discovered
+    the raw token. If only the untrimmed form counted, every URL whose two
     renderings differ would be permanently uncoverable -- a floor under the
     shadow flag rate, which is the signal the enforce decision reads.
     """
-    from genesis.inbox.url_coverage import _display_url, _uncovered_urls
+    from genesis.inbox.url_coverage import _coverage_url_occurrences, _uncovered_urls
 
     source = '"https://example.com/q?x=1",'
-    assert _display_url('https://example.com/q?x=1",') == "https://example.com/q?x=1"
+    assert _coverage_url_occurrences(source)[0].display == "https://example.com/q?x=1"
 
     # What the prompt actually asked for.
     assert _uncovered_urls("**Source:** <https://example.com/q?x=1>", source) == []

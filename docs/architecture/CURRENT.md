@@ -1440,11 +1440,17 @@ verified: b0867170e 2026-10-02
   4h staleness cancel that re-detected unchanged files and nagged. Three checks
   sit between a response and the baseline: a coherence check (annotates, never
   blocks), a give-up-LANGUAGE URL-failure check, and a URL-COVERAGE check
-  requiring every scanner-recognized input URL's parsed identity to appear in
+  requiring every recognized input URL occurrence's parsed identity to appear in
   the response — that last one catches SILENT omission, which the language
   check cannot see by construction. Scheme and host case plus one leading
   `www.` are presentation variants; authority, path, query, and fragment
-  identity remain exact. Coverage
+  identity remain exact. Prompt and coverage share source-aware URL occurrences:
+  only matching wrappers immediately preceding a URL justify removing closing
+  delimiters. Literal terminal punctuation and repeated tokens in different
+  contexts retain their own identities. The read-only coverage report retains
+  these occurrences too; it does not reconstruct coverage from normalized URLs.
+  The wrapper correction is scoped to this URL path; the entry's existing
+  verification stamp remains the basis for its other claims. Coverage
   is ENFORCED by default (`url_coverage_mode`, `config/inbox_monitor.yaml`;
   `shadow` observes without acting): an uncovered URL re-queues its item
   through the bounded retry lane, logging only stable opaque URL ids. It

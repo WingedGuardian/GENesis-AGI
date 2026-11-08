@@ -130,6 +130,50 @@ def test_evaluated_response_missing(tmp_path: Path) -> None:
     assert f"| {URL} | evaluated | missing | unknown |  |" in out.read_text()
 
 
+def test_report_keeps_literal_and_wrapped_contexts_separate(tmp_path: Path) -> None:
+    inbox = tmp_path / "inbox"
+    inbox.mkdir()
+    note = inbox / "note.md"
+    content = f"[docs]({URL})\n{URL})"
+    note.write_text(content)
+    response = tmp_path / "response.genesis.md"
+    response.write_text(f"**Source:** <{URL}>\n")
+    db = tmp_path / "genesis.db"
+    _make_db(db)
+    _insert(db, note, batch_items=_v2(content), response_path=str(response))
+    out = tmp_path / "out.md"
+    assert _rep.main(["--inbox", str(inbox), "--db", str(db), "--out", str(out)]) == 0
+    assert f"| {URL} | evaluated | present | yes |  |" in out.read_text()
+    assert f"| {URL}) | evaluated | present | no |  |" in out.read_text()
+
+
+@pytest.mark.parametrize(
+    ("content", "citation", "expected"),
+    [
+        (f'"{URL}",', URL, "yes"),
+        (f"{URL}\nhttps://example.org/uncited", URL, "yes"),
+        (f"{URL}?utm_source=one\n{URL}?utm_source=two", f"{URL}?utm_source=one", "no"),
+        (f"{URL}?utm_source=one\n{URL}?utm_source=two",
+         f"{URL}?utm_source=one>\n**Source:** <{URL}?utm_source=two", "yes"),
+    ],
+)
+def test_report_checks_all_and_only_associated_occurrences(content, citation, expected):
+    decoded = _rep._row_item_urls(_v2(content))
+    assert decoded is not None
+    row = _rep.RowInput(
+        "completed", None, "fixture.genesis.md", "2026-01-01", 1,
+        decoded[0], decoded[1],
+    )
+    result = _rep._classify_url(URL, [row], False, lambda _: f"**Source:** <{citation}>")
+    assert result["covered"] == expected
+
+
+def test_report_missing_occurrence_context_is_unknown():
+    row = _rep.RowInput("completed", None, "fixture.genesis.md", "2026-01-01", 1, [URL])
+    result = _rep._classify_url(URL, [row], False, lambda _: f"**Source:** <{URL}>")
+    assert result["covered"] == "unknown"
+
+
 def test_evaluated_not_covered(tmp_path: Path) -> None:
     inbox = tmp_path / "inbox"
     inbox.mkdir()
