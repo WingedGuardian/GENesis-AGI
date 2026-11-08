@@ -1,0 +1,1 @@
+- Removed the Bash privacy advisory in favor of the native pre-push privacy checks. Test runs now identify the main checkout when linked worktrees exist, helping distinguish which source tree a run exercises.

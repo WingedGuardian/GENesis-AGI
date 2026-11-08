@@ -1,6 +1,6 @@
 """Which git commands are pointed at a repository by something other than cwd.
 
-Shared by ``git_push_guard`` and ``pre_push_privacy_review``. Both resolve the
+Used by ``git_push_guard`` to classify the
 repository a push or merge acts on from where the command RUNS — the payload
 cwd, the last ``cd``, a ``git -C``. git can also be pointed at a different
 repository with the ``--git-dir`` / ``--work-tree`` global options or the

@@ -44,13 +44,8 @@ _assert() {
 _make_fake_genesis_repo() {
     local dir="$1"
     mkdir -p "$dir/scripts/hooks"
-    cp "$SRC_POST_COMMIT" "$dir/scripts/hooks/post-commit"
-    cp "$SRC_AUDIT_HELPER" "$dir/scripts/hooks/emit_bugfix_audit.py"
-    # sync-hooks.sh installs every HELPERS_TO_SYNC entry; the source tree it
-    # reads from must therefore contain them all, or the sync silently
-    # installs a helper whose sibling import cannot resolve.
-    cp "$SRC_ADMISSION_SHIM" "$dir/scripts/hooks/db_admission_check.py"
-    cp "$WORKTREE_ROOT/scripts/hooks/sync-hooks.sh" "$dir/scripts/hooks/sync-hooks.sh"
+    # The canonical installer requires its complete current source closure.
+    cp -a "$WORKTREE_ROOT/scripts/hooks/." "$dir/scripts/hooks/"
     chmod +x "$dir/scripts/hooks/"*.sh "$dir/scripts/hooks/"*.py 2>/dev/null
     cd "$dir"
     git init -q -b main

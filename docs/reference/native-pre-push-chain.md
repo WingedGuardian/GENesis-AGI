@@ -35,6 +35,14 @@ An interrupted installation must finish its recorded target before switching to
 a different target, and removing or reordering helpers requires a separate
 transition.
 
+Candidate deployments refuse native-to-native helper closure changes before
+admission: the current installer cannot undo them when a candidate is dropped.
+An already-expanded installation also refuses a checkout move to a smaller or
+reordered native closure before changing the deploy manifest or checkout.
+Ordinary helper-content updates, released-main additive upgrades and qualified
+legacy rollback/re-upgrade remain supported; automatic native contraction is
+not supported. Fresh install and bootstrap use the same canonical sync path.
+
 The existing Genesis push gates run after an enrolled custom hook. This change
 alone does not qualify native privacy enforcement or retire the advisory;
 those require the subsequent scanner integration and installed qualification.

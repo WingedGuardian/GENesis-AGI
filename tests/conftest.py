@@ -1188,6 +1188,40 @@ _NO_TIMEOUT_WARNING = (
 )
 
 
+def _note_main_checkout(config) -> None:
+    """Make main-tree test provenance visible even with -q; never fail a run."""
+    root = Path(__file__).resolve().parents[1]
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_") or k.startswith("GIT_CONFIG")}
+
+    def git(*args):
+        result = subprocess.run(
+            ["git", "-C", str(root), *args], env=env, capture_output=True, timeout=2,
+        )
+        return result.stdout if result.returncode == 0 else b""
+
+    try:
+        git_dir = git("rev-parse", "--path-format=absolute", "--git-dir").removesuffix(b"\n")
+        common_dir = git("rev-parse", "--path-format=absolute", "--git-common-dir").removesuffix(b"\n")
+        if not git_dir or not common_dir or git_dir != common_dir:
+            return
+        registrations = git("worktree", "list", "--porcelain", "-z")
+        if sum(field.startswith(b"worktree ") for field in registrations.split(b"\0")) <= 1:
+            return
+        message = (
+            f"NOTE: tests/conftest.py is loaded from the MAIN checkout ({root!s}), "
+            "which has linked worktree registrations. Verify the selected test "
+            "and import paths before judging branch changes."
+        )
+        reporter = config.pluginmanager.get_plugin("terminalreporter")
+        if reporter is not None:
+            reporter.write_line(message, yellow=True)
+        else:
+            print(message, file=sys.stderr)
+    except (OSError, subprocess.SubprocessError):
+        # Missing Git, unreadable metadata or a timeout is not a test failure.
+        return
+
+
 def pytest_sessionstart(session):
     """Say LOUDLY, at the top of the run, when no per-test timeout applies.
 
@@ -1198,6 +1232,7 @@ def pytest_sessionstart(session):
     step failed or before the first update that ran it; a hang observed on
     2026-10-11 held the box lock for about 40 minutes in a venv without it.
     """
+    _note_main_checkout(session.config)
     _note_real_home_at_start(session.config)
     config = session.config
     if config.pluginmanager.hasplugin("timeout"):

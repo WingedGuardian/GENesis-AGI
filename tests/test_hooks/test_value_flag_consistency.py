@@ -8,8 +8,7 @@ the parse divergence that let the separated ``-R`` form bypass every
 fail-closed merge gate (``gh pr -R o/r merge N --admin``, #1385 round-5).
 
 The Git-push argument scanner now has one shared implementation and a help-table
-drift test. ``pre_push_privacy_review`` retains its separate parser and local
-value-flag contract.
+drift test.
 
 If the global-value consistency test fails, update all copies named in its
 assertion.
@@ -26,16 +25,13 @@ from pathlib import Path
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[2]
-# The guard hooks live in scripts/hooks/ (shell_parse, git_push_guard,
-# pre_push_privacy_review) and scripts/ (review_enforcement_commit); the privacy
-# hook also imports genesis.contribution.sanitize, so src/ must be importable.
+# The remaining guard consumers live in scripts/hooks/ and scripts/.
 for _p in ("scripts/hooks", "scripts", "src"):
     _abs = str(_ROOT / _p)
     if _abs not in sys.path:
         sys.path.insert(0, _abs)
 
 import git_push_guard as gpg  # noqa: E402
-import pre_push_privacy_review as ppr  # noqa: E402
 import review_enforcement_commit as rec  # noqa: E402
 import shell_parse as sp  # noqa: E402
 
@@ -77,19 +73,14 @@ _CANONICAL_GIT_GLOBAL_VALUE_FLAGS = frozenset(
         "--shallow-file",
     }
 )
-# git push flags that consume the FOLLOWING token as their value.
-_CANONICAL_PUSH_VALUE_FLAGS = frozenset(
-    {"-o", "--push-option", "--repo", "--receive-pack", "--exec"}
-)
 
 
 def test_git_global_value_flags_identical_across_all_copies():
-    """The four git-global value-flag copies must be byte-identical (as sets)."""
+    """The three git-global value-flag copies must be byte-identical (as sets)."""
     copies = {
         "git_push_guard._GIT_GLOBAL_VALUE_FLAGS": gpg._GIT_GLOBAL_VALUE_FLAGS,
         "shell_parse._GIT_OPTS_WITH_ARG": sp._GIT_OPTS_WITH_ARG,
         "review_enforcement_commit._GIT_GLOBAL_VALUE_FLAGS": rec._GIT_GLOBAL_VALUE_FLAGS,
-        "pre_push_privacy_review._GIT_GLOBAL_VALUE_OPTS": ppr._GIT_GLOBAL_VALUE_OPTS,
     }
     for name, spec in copies.items():
         members = set(spec)
@@ -102,20 +93,11 @@ def test_git_global_value_flags_identical_across_all_copies():
         )
 
 
-def test_privacy_hook_push_value_flags_match_its_contract():
-    """The privacy hook keeps its separate parser and value-flag contract."""
-    members = set(ppr._PUSH_VALUE_FLAGS)
-    assert members == set(_CANONICAL_PUSH_VALUE_FLAGS), (
-        "pre_push_privacy_review._PUSH_VALUE_FLAGS drifted from its canonical "
-        "git-push value-flag set. "
-        f"Missing={set(_CANONICAL_PUSH_VALUE_FLAGS) - members}, "
-        f"Extra={members - set(_CANONICAL_PUSH_VALUE_FLAGS)}"
-    )
 
 
 # ── Derived expectation: the table must cover what the INSTALLED git consumes ──
 #
-# The consistency test above locks the four copies to each other. It cannot see
+# The consistency test above locks the three copies to each other. It cannot see
 # whether the set they agree on is RIGHT — all four were identically wrong about
 # `--config-env`, `--attr-source` and `--shallow-file`, and stayed so until a
 # reviewer constructed a bypass. This test closes that: it asks the installed

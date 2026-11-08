@@ -37,7 +37,6 @@ comes about.
 from __future__ import annotations
 
 import importlib.util
-import io
 import json
 import shlex
 import subprocess
@@ -58,7 +57,6 @@ gpg = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(gpg)
 
 import git_repo_selection as grs  # noqa: E402
-import pre_push_privacy_review as privacy  # noqa: E402
 from shell_parse import analyze  # noqa: E402
 
 
@@ -194,56 +192,7 @@ def test_a_merge_on_the_feature_repository_is_still_allowed(repos) -> None:
     assert _merges_onto_main("git merge main", on_feature) is False
 
 
-# --- the privacy advisory -----------------------------------------------------
-
-
-def _advisory(command: str, cwd: str, monkeypatch) -> str:
-    payload = {
-        "hook_event_name": "PreToolUse",
-        "tool_name": "Bash",
-        "tool_input": {"command": command},
-        "cwd": cwd,
-    }
-    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
-    out = io.StringIO()
-    monkeypatch.setattr(sys, "stdout", out)
-    privacy.main()
-    text = out.getvalue()
-    return json.loads(text)["hookSpecificOutput"]["additionalContext"] if text else ""
-
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        "git --git-dir=/r/.git --work-tree=/r push",
-        "GIT_DIR=/r/.git git push",
-        "export GIT_WORK_TREE=/r && git push",
-    ],
-)
-def test_the_privacy_scan_says_it_did_not_run_rather_than_scanning_the_wrong_repo(
-    command: str, monkeypatch
-) -> None:
-    """An advisory cannot block, so the honest failure is a loud one.
-
-    Before: it diffed the checkout the command ran in and could report clean for
-    commits it never looked at. The scan must NOT run at all here — a result
-    from the wrong repository is worse than none.
-    """
-    scanned = []
-    monkeypatch.setattr(privacy, "_outgoing_diff", lambda cwd: scanned.append(cwd) or "")
-    text = _advisory(command, "/here", monkeypatch)
-    assert "NOT SCANNED" in text
-    assert scanned == [], f"the scan ran against {scanned} — the wrong repository"
-
-
-def test_the_privacy_scan_still_runs_for_an_ordinary_push(monkeypatch) -> None:
-    """CONTROL — the detector must not swallow ordinary pushes too."""
-    scanned = []
-    monkeypatch.setattr(privacy, "_targets_public_repo", lambda remote, cwd: True)
-    monkeypatch.setattr(privacy, "_outgoing_diff", lambda cwd: scanned.append(cwd) or "")
-    text = _advisory("git -C /r push", "/here", monkeypatch)
-    assert "NOT SCANNED" not in text
-    assert scanned == ["/r"]
+# Advisory-only tests moved to installed native privacy qualification.
 
 
 # --- round 2: the redirect is read from the shared parser's segments ----------
@@ -319,7 +268,6 @@ def test_persistent_spellings_are_all_seen(raw: str) -> None:
     command = raw + " && git push"
     push = [s for s in analyze(command) if s.exe == "git"][-1]
     assert gpg._effective_cwd(command, {"cwd": "/here"}, seg=push) is gpg._CWD_UNKNOWN
-    assert privacy._repo_redirected(command) is True
 
 
 @pytest.mark.parametrize(
@@ -355,62 +303,12 @@ def test_a_commit_message_mentioning_the_variable_does_not_block_a_merge(repos) 
     assert _merges_onto_main(cmd, on_feature) is False
 
 
-@pytest.mark.parametrize(
-    "command",
-    [
-        "git branch push && GIT_DIR=/o/.git git push",
-        "git push origin && GIT_DIR=/o/.git git push",
-        "git push origin && git --git-dir=/o/.git push",
-    ],
-)
-def test_the_privacy_check_reads_every_push_not_the_first_apparent_one(command: str) -> None:
-    """Round-1 finding: the walk stopped at the first segment holding the words
-    `git` and `push` — `git branch push` included — and never saw the redirect."""
-    assert privacy._repo_redirected(command) is True
-
-
-@pytest.mark.parametrize(
-    "command",
-    [
-        "env GIT_DIR=/r/.git git push",
-        "sudo git --git-dir=/r/.git push",
-        "/usr/bin/git --git-dir=/r/.git push",
-    ],
-)
-def test_a_wrapped_redirected_push_gets_the_notice(command: str, monkeypatch) -> None:
-    """Round-1 finding: these returned before the redirect check, because the
-    hook's own push parser accepts only a literal `git` word — no scan and no
-    notice. The redirect check now runs first, on the shared parser."""
-    scanned = []
-    monkeypatch.setattr(privacy, "_outgoing_diff", lambda cwd: scanned.append(cwd) or "")
-    text = _advisory(command, "/here", monkeypatch)
-    assert "NOT SCANNED" in text
-    assert scanned == []
-
-
-def test_the_privacy_scan_still_runs_after_unrelated_segments(monkeypatch) -> None:
-    """CONTROL — mentions and command-scoped assignments must not suppress it."""
-    scanned = []
-    monkeypatch.setattr(privacy, "_targets_public_repo", lambda remote, cwd: True)
-    monkeypatch.setattr(privacy, "_outgoing_diff", lambda cwd: scanned.append(cwd) or "")
-    for cmd in (
-        'git commit -m "handle GIT_DIR= spelling" && git -C /r push',
-        "git --work-tree=/x status && git -C /r push",
-        "GIT_DIR=/o/.git git status && git -C /r push",
-        "git -C /r push -o --git-dir=/x",
-    ):
-        scanned.clear()
-        text = _advisory(cmd, "/here", monkeypatch)
-        assert "NOT SCANNED" not in text, cmd
-        assert scanned == ["/r"], cmd
-
-
-def test_both_hooks_use_the_one_shared_detector() -> None:
+def test_push_guard_uses_the_one_shared_detector() -> None:
     """The matcher used to be duplicated in both hooks and diverged in review.
-    It now has one home; this pins that neither hook grows a private copy."""
+    It now has one home; this pins that the guard does not grow a private copy."""
     assert gpg.seg_redirects_repo is grs.seg_redirects_repo
     assert gpg.raw_sets_repo_env is grs.raw_sets_repo_env
-    for mod in (gpg, privacy):
+    for mod in (gpg,):
         for name in ("_GIT_REPO_ASSIGN_RE", "_GIT_REPO_FLAGS", "_GIT_REPO_VARS"):
             assert not hasattr(mod, name), f"{mod.__name__} carries a private copy: {name}"
 
@@ -478,7 +376,6 @@ def test_an_append_assignment_prefix_counts_once_the_parser_resolves_the_command
 def test_the_redirect_survives_continuations_and_indirect_assignment(command: str) -> None:
     push = [s for s in analyze(command) if s.exe == "git"][-1]
     assert gpg._effective_cwd(command, {"cwd": "/here"}, seg=push) is gpg._CWD_UNKNOWN
-    assert privacy._repo_redirected(command) is True
 
 
 def test_a_continuation_without_a_repository_variable_is_ordinary() -> None:

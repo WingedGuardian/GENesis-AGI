@@ -420,6 +420,32 @@ def native_chain_failure(repo: Repo, names: list[str]) -> str | None:
 
 
 # ── admission ─────────────────────────────────────────────────────────────
+def native_closure_change(repo: Repo, before: str, after: str) -> str | None:
+    """Native candidate closure changes cannot be undone by the current installer."""
+    try:
+        contracts = [native_chain_contract(repo, ref, sync_hook_names(repo.show(ref, SYNC_HOOKS) or ""))
+                     for ref in (before, after)]
+        if all(contracts) and contracts[0]["HELPERS"] != contracts[1]["HELPERS"]:
+            return "changes the native pre-push helper closure; candidate rollback cannot contract or reorder it"
+    except (ValueError, TypeError, KeyError, SyntaxError, Refusal) as exc:
+        return f"cannot qualify native pre-push helper closure ({exc})"
+    return None
+
+
+def native_move_failure(repo: Repo, tip: str) -> str | None:
+    """Before moving, the installed native closure must fit the target prefix."""
+    try:
+        current, target = [native_chain_contract(repo, ref, sync_hook_names(repo.show(ref, SYNC_HOOKS) or ""))
+                           for ref in ("HEAD", tip)]
+        if target:
+            record = repo.hooks_dir() / target["MANIFEST"]
+            if current or record.exists() or record.is_symlink():
+                native_chain_record(repo, target, target_exact=False)
+    except (OSError, ValueError, TypeError, KeyError, SyntaxError, Refusal) as exc:
+        return f"native pre-push transition is unqualified before checkout movement ({exc})"
+    return None
+
+
 def path_refusal(path: str, hooks_approved: bool = False) -> str | None:
     """Why a changed path keeps a candidate off `live`, or None.
     ``hooks_approved`` skips ONLY the hook rule: every other rule still applies
@@ -510,6 +536,9 @@ def admission_failures(repo: Repo, base: str, head: str, hooks_approved: bool = 
     hook rule only (see path_refusal)."""
     fails: list[str] = []
     changed = changed_paths(repo, base, head)
+    closure_failure = native_closure_change(repo, base, head)
+    if closure_failure:
+        fails.append(closure_failure)
     for path in changed:
         why = path_refusal(path, hooks_approved)
         if why:
@@ -760,6 +789,13 @@ def hook_ownership_failures(
     # and the next pass judges the tip built without it.
     if out:
         return out
+    closure_failure = native_closure_change(repo, base, tip)
+    if closure_failure:
+        for path in (SYNC_HOOKS, "scripts/hooks/pre_push_chain.py"):
+            for branch in owned.get(path, []):
+                out[branch] = closure_failure
+        if out:
+            return out
     bad = listed_non_files(repo, tip)
     if bad:
         try:

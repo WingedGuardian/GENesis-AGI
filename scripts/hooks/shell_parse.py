@@ -416,8 +416,8 @@ _CMD_POSITION_WORDS = frozenset({"!", "if", "elif", "while", "until", "then", "d
 # version-dependent, and an entry for an option a given git lacks is inert
 # because that git refuses the command outright.
 #
-# Four copies of this set exist (here, git_push_guard, review_enforcement_commit,
-# pre_push_privacy_review) and are locked identical by
+# Three copies of this set exist (here, git_push_guard, review_enforcement_commit)
+# and are locked identical by
 # tests/test_hooks/test_value_flag_consistency.py. Update all of them together.
 _GIT_OPTS_WITH_ARG = {
     "-C",
