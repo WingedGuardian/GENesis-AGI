@@ -112,3 +112,37 @@ def test_no_persist_when_unslotted(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "_SPAWN_DIR", tmp_path / "mcp-spawn")
     si.capture_spawn_identity()
     assert not (tmp_path / "mcp-spawn").exists()
+
+
+def test_shared_capture_uses_actual_source_root_without_slot_persistence(tmp_path, monkeypatch):
+    _reset(monkeypatch)
+    from genesis.observability import mcp_spawn_store as store
+
+    source = tmp_path / "source-checkout"
+    seen, persisted = [], []
+    monkeypatch.setenv("GENESIS_SLOT", "4")
+
+    def unexpected():
+        raise AssertionError("Explicit source root must not read the default checkout")
+
+    def git(root, *args, timeout):
+        seen.append(root)
+        return 0, "a" * 40, ""
+
+    monkeypatch.setattr(si, "repo_root", unexpected)
+    monkeypatch.setattr(si, "_run_git", git)
+    monkeypatch.setattr(store, "persist_spawn_commit", lambda *args: persisted.append(args))
+    si.capture_spawn_identity(source_root=source, persist_session=False)
+    assert seen == [source] and persisted == []
+    assert si.spawn_commit() == "a" * 40
+    assert datetime.fromisoformat(si.spawn_at()).utcoffset() is not None
+
+
+def test_shared_capture_cannot_be_rebound_by_later_calls(tmp_path, monkeypatch):
+    _reset(monkeypatch)
+    monkeypatch.setattr(si, "_run_git", _fake_git(0, "a" * 40))
+    si.capture_spawn_identity(source_root=tmp_path, persist_session=False)
+    first = si.spawn_commit(), si.spawn_at()
+    monkeypatch.setattr(si, "_run_git", _fake_git(0, "b" * 40))
+    si.capture_spawn_identity(source_root=tmp_path / "other", persist_session=False)
+    assert (si.spawn_commit(), si.spawn_at()) == first

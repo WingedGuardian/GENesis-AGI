@@ -1,0 +1,135 @@
+# Shared MCP HTTP composition and owned bootstrap
+
+`genesis.mcp.shared_http.build_http_app` is an explicitly constructed transport.
+The explicit shared launcher described below calls it. It receives an already
+initialized FastMCP server, a matching `RequestDatabase` and tracker, immutable
+`SharedHTTPConfig`, a loaded P3 `CallerResolver`, known loaded commit, aware
+startup timestamp and live enabled callback. Resource construction, owner drainage
+and provider closure belong to the enclosing bootstrap. This builder neither
+creates credentials nor deploys or starts a listener.
+
+The shared-only metadata fence admits FastMCP4.1.4/MCP2.3.0/Uvicorn0.54.0 exactly,
+before importing the version-specific assembly. The configuration requires a
+literal loopback HTTP URL with explicit port and `/mcp` path, positive finite
+limits and tool concurrency no greater than the facade's `foreground_limit`.
+The shared bootstrap runs this preflight before constructing resources and
+captures identity from its actual source checkout before importing service tools.
+The launcher and imported implementation checkout must match before secrets or
+rollout configuration are read; an editable install pointing at another checkout
+is refused rather than serving code under the wrong commit label.
+
+The composition retains the original low-level FastMCP server and SDK stateful
+session manager. Its manager owns the single FastMCP lifespan entry. The SDK
+receives explicit session-count, body-size and idle-time limits; response mode
+prefers SSE; modern fast calls without notifications can return JSON. Event
+storage is absent. Shutdown terminates transports before manager
+cancellation. It does not guarantee all HTTP handlers finish before resource
+shutdown; the resource-owner contract is a separate bootstrap obligation.
+
+An app-wide SDK-backed exact Host/Origin guard precedes bearer authentication.
+P3 authentication covers `/status` GET/HEAD and `/mcp` GET/POST/DELETE. Body limits
+and raw-envelope admission follow authentication. Duplicate structural JSON
+fields, nonfinite constants, batches and IDs colliding under the qualified SDK's
+actual coercion helper are refused; admitted bytes are replayed unchanged.
+Task-augmented calls are explicitly refused: disabling the task extension alone
+does not prevent ordinary body execution on this stack.
+
+The entire validated caller participates in the SDK session principal. Every
+message binds caller, session and profile context from authenticated HTTP
+metadata. The builder selects shared mode after validation; the explicit launcher
+also clears inherited identity before bootstrap and restores the untrusted
+process fallback after standalone routing loads its environment.
+Health validator messages additionally suppress automatic activity-row admission
+for their whole middleware chain, including post-unit instrumentation and copied
+child contexts. Counters remain in memory; ordinary health and validator-memory
+persistence retain their defaults. The tracker construction flag remains a hard
+opt-out. Flush/reap behavior and existing batch durability limits are unchanged;
+ordinary rows may flush concurrently with a validator request.
+
+One frozen catalog classifies actual defining-function and transformed-parent
+ancestry, enforcing both location and all parent capability names. Browser,
+module and payment ancestry is local; unknown modules, sync handlers and new
+resource/prompt/task surfaces require qualification before startup. Listing,
+direct calls and status revision use this same policy. A tool token is acquired
+without waiting before instrumentation and released after its real unit finishes.
+Overflow returns `Shared MCP service busy`; discovery and control messages do
+not borrow tool capacity. Runtime disablement empties discovery and refuses tool
+work while authenticated status and protocol control routes remain available.
+
+`/status` contains service, loaded commit, startup timestamp, transport schema
+version1, caller-visible catalog revision, enabled flag, tri-state freshness,
+aggregate active tools and busy refusals. It contains no caller identifiers,
+credentials or private paths. Freshness joins the tool's unit or opens a status
+unit, reusing `commit_identity.is_stale` without latching across rollback.
+Unavailable freshness is JSON null; guarded tools retain the existing live
+off/warn/block policy and positive-confirmation semantics.
+
+Targeted tests: `test_shared_http_admission.py`, `test_shared_http_policy.py` and
+`test_shared_http_runtime.py` under `tests/test_mcp/`, plus
+`tests/test_observability/test_activity_persistence_scope.py`. Runtime fixtures
+exercise actual SDK dispatch and SQLite with synthetic qualified tool modules;
+they do not prove native-client compatibility or deployed service readiness.
+
+## Explicit owned startup
+
+`scripts/genesis_mcp_server.py --shared-service health --transport streamable-http`
+selects the owned path; `memory`, `outreach` and `recon` are also supported. The
+required selection group keeps ordinary `--server` launch intact. Shared mode
+rejects legacy bind, auth and external-profile flags, including empty overrides.
+Its configured URL is the sole bind authority and P3 credentials authenticate
+each message. A legacy HTTP token cannot substitute for the P3 store.
+
+`genesis.mcp.shared_settings.load_shared_settings` executes the complete current
+trusted `scripts/lib/mcp_rollout.py` program in its own temporary module namespace
+and calls its genuine reader. It consumes the existing repository config plus
+install overlay, retaining the loader's merge semantics. It reads source bytes,
+so a same-size replacement with an old timestamp cannot select a stale bytecode
+cache. Missing or invalid source/configuration refuses this explicit path with a
+sanitized field error. Every returned limit is a generation snapshot.
+
+All these service fields must be explicitly configured:
+
+| Fields | Requirement |
+| --- | --- |
+| `unit`, `url` | Safe service unit and literal loopback HTTP `/mcp` URL with explicit port |
+| `db_units`, `db_background_units`, `db_background_jobs` | Positive integer connection/job budgets |
+| `tool_concurrency`, `max_sessions`, `max_body_bytes` | Positive integers; concurrency cannot exceed foreground units |
+| `db_checkout_timeout_s`, `session_idle_timeout_s` | Finite positive seconds |
+| `shutdown_grace_s` | Finite nonnegative seconds; zero requests immediate cancellation |
+
+The shipped rollout remains off and carries no machine-specific resource limits.
+The explicit launcher requires the enabled flag, usable existing P3 credentials,
+known loaded commit and aware startup timestamp. It never provisions credentials
+or persists its identity against an inherited caller slot.
+
+`initialize_shared_service` owns one bounded `RequestDatabase` and tracker. It
+requires an existing database containing the canonical table inventory, warms
+the tracker in a bootstrap unit and calls the actual request-service initializer
+after that unit exits. The table check is a startup floor, not a migration or a
+full column/version validator. A bootstrapped runtime cannot be borrowed.
+
+Health uses the standalone health data service with the same facade and ordinary
+action wiring. Memory retains distinct storage and priority-tier recall chains,
+their vector-space checks, the reranker and standalone dependencies; it uses no
+read pool and leaves session bookmark files untouched. Outreach and recon retain
+their standalone dependency modes. The existing standalone routing setup is reused.
+
+Every completed provider/cache construction is registered immediately. Builtin
+embedding clients close only when owned; injected clients remain borrowed. Each
+provider's cache closes on its constructing loop thread, separately from its
+backends. Partial construction unwinds the completed safe prefix. After confirmed
+registry drainage, an ordinary closer failure does not skip other safe closers;
+failures are aggregated. Unconfirmed registered work withholds dependent closers.
+
+The outer owner spans the HTTP lifecycle. Shutdown closes database admission
+synchronously, starts its configured grace concurrently with Uvicorn shutdown,
+then settles registered work before provider closure. A shielded shutdown task
+allows a cancelled waiter to rejoin cleanup. Provider retirement finishes before
+Uvicorn replays a captured termination signal. Exceptional startup also settles
+an already-started ASGI lifespan before owner retirement, including cancellation
+before the listener-ready flag. HTTP grace and resource grace are separate waits
+using the configured value; expiry permits cancellation, never premature resource
+closure. A nonterminating physical worker can still require operator intervention.
+
+Bind-before-READY notification, inert service templates, thin client forwarding,
+local capability union and matched measurements remain separate rollout steps.
