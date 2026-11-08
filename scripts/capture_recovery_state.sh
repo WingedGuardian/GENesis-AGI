@@ -50,7 +50,9 @@ fi
 
 # shellcheck source=lib/secrets_path.sh
 . "$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/secrets_path.sh"
-_secrets_file="$(genesis_secrets_path "$GENESIS_REPO")"
+# Best effort like every other step here: an unresolvable SECRETS_PATH skips
+# this one file rather than ending the capture.
+_secrets_file="$(genesis_secrets_path "$GENESIS_REPO")" || _secrets_file=""
 if [ -f "$_secrets_file" ]; then
     stat "$_secrets_file" > "$OUT_DIR/secrets_stat.txt" || true
 fi

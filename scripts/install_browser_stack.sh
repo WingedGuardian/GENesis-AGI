@@ -102,7 +102,10 @@ cd "$REPO_DIR" || { _log "repo directory $REPO_DIR is unreachable"; exit 75; }
 # shellcheck source=lib/secrets_path.sh
 # From this script's own tree, not REPO_DIR (which may name another checkout).
 . "$SCRIPT_DIR/lib/secrets_path.sh"
-SECRETS_FILE="$(genesis_secrets_path "$REPO_DIR")"
+SECRETS_FILE="$(genesis_secrets_path "$REPO_DIR")" || {
+    _log "SECRETS_PATH cannot be resolved; not provisioning without its browser settings"
+    exit 75
+}
 _load_browser_setting() {
     local key="$1" line="" val
     [ -f "$SECRETS_FILE" ] || return 0

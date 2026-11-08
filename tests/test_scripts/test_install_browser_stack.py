@@ -256,3 +256,12 @@ def test_a_relative_invocation_from_outside_the_checkout_loads_the_helper(repo, 
     assert "secrets_path.sh" not in r.stderr, r.stderr
     assert "genesis_secrets_path" not in r.stderr, r.stderr
     assert out.read_text().split("|")[0] == "/data/pw"
+
+
+def test_an_unresolvable_secrets_path_is_exit_75_before_provisioning(repo, tmp_path):
+    """An override naming an unknown user cannot be resolved: provisioning without
+    the runtime's browser settings would install where it does not launch from."""
+    out = _env_stub(repo, tmp_path)
+    r = _run(repo, tmp_path, env_extra={"SECRETS_PATH": "~nosuchuser-for-tests/secrets.env"})
+    assert r.returncode == 75, r.stdout + r.stderr
+    assert not out.exists(), "the provisioner must not run"
