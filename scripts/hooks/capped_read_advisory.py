@@ -58,7 +58,7 @@ NAMED GAPS, so this is not read as covering more than it does:
     CONFIRMED against gh 2.98.0: ``gh pr --state open list`` runs, and resolves
     here to the target ``("pr", "open")``, which has no table entry, so the hook
     stays silent. Closing it needs a per-subcommand model of gh's option grammar
-    -- the open-set surface the genesis-development skill names as a tar pit --
+    -- the open-set surface the build-session skill names as a tar pit --
     and the failure direction is SILENCE, which is the status quo. Left open
     deliberately.
   * A limit inside a short-flag CLUSTER is a miss in the other direction.

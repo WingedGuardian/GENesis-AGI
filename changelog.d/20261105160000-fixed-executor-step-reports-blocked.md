@@ -1,0 +1,1 @@
+- A task step that could not finish (for example, denied a tool it needed) and said so no longer counts as completed: it stops the task as blocked and you are notified, as for any blocked step. A step that reports it failed is treated the same way, as blocked, so nothing re-runs it automatically on its own say-so.

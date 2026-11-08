@@ -14,7 +14,7 @@ from genesis.mcp.discord_bot_mcp import mcp
 @pytest.mark.asyncio
 async def test_all_tools_registered():
     """All three Discord tools should be registered."""
-    tools = await mcp.get_tools()
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
     for name in ["fetch_messages", "fetch_forum_threads", "send_reply"]:
         assert name in tools, f"Missing tool: {name}"
 
@@ -53,7 +53,7 @@ async def test_fetch_messages_success():
     try:
         bot_mod._bot_token = "test-token"
         with patch("genesis.mcp.discord_bot_mcp.httpx.AsyncClient", return_value=mock_client):
-            tools = await mcp.get_tools()
+            tools = {tool.name: tool for tool in await mcp.list_tools()}
             result = await tools["fetch_messages"].fn(channel_id="123", limit=10)
 
         data = json.loads(result)
@@ -84,7 +84,7 @@ async def test_fetch_messages_rate_limited():
     try:
         bot_mod._bot_token = "test-token"
         with patch("genesis.mcp.discord_bot_mcp.httpx.AsyncClient", return_value=mock_client):
-            tools = await mcp.get_tools()
+            tools = {tool.name: tool for tool in await mcp.list_tools()}
             result = await tools["fetch_messages"].fn(channel_id="123")
 
         data = json.loads(result)
@@ -100,7 +100,7 @@ async def test_fetch_messages_no_token():
     old_token = bot_mod._bot_token
     try:
         bot_mod._bot_token = None
-        tools = await mcp.get_tools()
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
         result = await tools["fetch_messages"].fn(channel_id="123")
 
         data = json.loads(result)
@@ -157,7 +157,7 @@ async def test_fetch_forum_threads_success():
     try:
         bot_mod._bot_token = "test-token"
         with patch("genesis.mcp.discord_bot_mcp.httpx.AsyncClient", return_value=mock_client):
-            tools = await mcp.get_tools()
+            tools = {tool.name: tool for tool in await mcp.list_tools()}
             result = await tools["fetch_forum_threads"].fn(channel_id="forum1")
 
         data = json.loads(result)
@@ -189,7 +189,7 @@ async def test_send_reply_success():
     try:
         bot_mod._bot_token = "test-token"
         with patch("genesis.mcp.discord_bot_mcp.httpx.AsyncClient", return_value=mock_client):
-            tools = await mcp.get_tools()
+            tools = {tool.name: tool for tool in await mcp.list_tools()}
             result = await tools["send_reply"].fn(
                 channel_id="456", content="Hello!", reply_to="msg-789",
             )
@@ -225,7 +225,7 @@ async def test_send_reply_auto_chunks():
     try:
         bot_mod._bot_token = "test-token"
         with patch("genesis.mcp.discord_bot_mcp.httpx.AsyncClient", return_value=mock_client):
-            tools = await mcp.get_tools()
+            tools = {tool.name: tool for tool in await mcp.list_tools()}
             result = await tools["send_reply"].fn(
                 channel_id="456", content=long_message,
             )
@@ -238,7 +238,103 @@ async def test_send_reply_auto_chunks():
         bot_mod._bot_token = old_token
 
 
-# ── Profile tests ───────────────────────────────────────────────────────
+# ── Egress boundary ────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def reply_transport(monkeypatch):
+    monkeypatch.setattr(bot_mod, "_bot_token", "test-token")
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.post.return_value = MagicMock(status_code=200)
+    client.post.return_value.json.return_value = {"id": "sent-1"}
+    with (
+        patch.object(bot_mod.httpx, "AsyncClient", return_value=client) as factory,
+        patch.object(bot_mod, "_chunk_text", wraps=bot_mod._chunk_text) as chunk,
+        patch("genesis.autonomy.shadow_gate.observe_discord_send") as observe,
+    ):
+        yield client, factory, chunk, observe
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content", [
+    "sk-" + "synthetic" * 4,
+    "Internal host: 192.168.1.42",
+    "Read /home/example/private.txt",
+    "Use 4242 4242 4242 4242",
+    "Safe prefix " * 200 + "\nAPI_TOKEN=synthetic-not-a-real-secret",
+])
+async def test_send_reply_egress_refuses_before_transport(content, reply_transport, caplog):
+    client, factory, chunk, observe = reply_transport
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    result = await tools["send_reply"].fn(channel_id="456", content=content)
+
+    error = json.loads(result)["error"]
+    if content == "Use 4242 4242 4242 4242":
+        assert error == "send_reply: refused, the message contains a payment card number."
+    else:
+        assert error == "send_reply: refused, the message contains sensitive content."
+    assert content not in result
+    assert content not in caplog.text
+    factory.assert_not_called()
+    client.post.assert_not_called()
+    chunk.assert_not_called()
+    observe.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_send_reply_egress_failure_is_value_free(reply_transport, caplog):
+    client, factory, chunk, observe = reply_transport
+    secret = "synthetic-private-value"
+    with patch("genesis.content.egress.scan_outbound", side_effect=RuntimeError(secret)):
+        tools = {tool.name: tool for tool in await mcp.list_tools()}
+        result = await tools["send_reply"].fn(channel_id="456", content="Hello!")
+
+    assert "refused" in json.loads(result)["error"]
+    assert secret not in result + caplog.text
+    factory.assert_not_called()
+    client.post.assert_not_called()
+    chunk.assert_not_called()
+    observe.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_send_reply_scrubbed_text_is_chunked_and_observed(reply_transport):
+    client, _, chunk, observe = reply_transport
+    content = "Hello — world! " * 180
+    expected = "Hello--world! " * 180
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    result = await tools["send_reply"].fn(
+        channel_id="456", content=content, reply_to="msg-789",
+    )
+
+    assert json.loads(result)["status"] == "sent"
+    chunk.assert_called_once_with(expected)
+    payloads = [call.kwargs["json"] for call in client.post.call_args_list]
+    assert len(payloads) > 1
+    assert "".join(payload["content"] for payload in payloads) == expected
+    assert all(len(payload["content"]) <= 2000 for payload in payloads)
+    assert payloads[0]["message_reference"]["message_id"] == "msg-789"
+    assert all("message_reference" not in payload for payload in payloads[1:])
+    observe.assert_awaited_once()
+    assert observe.call_args.kwargs["content"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [429, 500])
+async def test_send_reply_later_http_error_preserves_sent_ids(status, reply_transport):
+    client, _, _, observe = reply_transport
+    failure = MagicMock(status_code=status, text="unavailable")
+    failure.json.return_value = {"retry_after": 3}
+    client.post.side_effect = [client.post.return_value, failure]
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    result = await tools["send_reply"].fn(channel_id="456", content="A" * 5000)
+
+    data = json.loads(result)
+    assert "error" in data
+    assert data["sent_ids"] == ["sent-1"]
+    assert client.post.call_count == 2
+    observe.assert_not_called()
 
 
 def test_community_responder_profile_exists():

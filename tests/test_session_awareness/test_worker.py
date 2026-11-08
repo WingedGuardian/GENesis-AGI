@@ -227,3 +227,26 @@ async def test_entity_candidates_zero_when_no_entity_lane(tmp_path):
             qdrant_url="http://127.0.0.1:1",
         )
     assert result["entity_candidates"] == 0
+
+
+def test_the_entry_script_logs_with_time_and_pid():
+    """worker_err.log lines carry no time without this, so a fallback warning
+    there could never be joined to the telemetry row of the same moment."""
+    import re
+
+    code = "\n".join(
+        [
+            "import logging, runpy, sys",
+            f"sys.path.insert(0, {str(REPO_DIR / 'src')!r})",
+            "import genesis.session_awareness.worker as w",
+            "async def fake(sid, no_arbiter=False):",
+            "    logging.getLogger('probe').warning('hello')",
+            "w.run_worker = fake",
+            "sys.argv = ['worker', '--session-id', 's']",
+            f"runpy.run_path({str(SCRIPT)!r}, run_name='__main__')",
+        ]
+    )
+    proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+    assert proc.returncode == 0, proc.stderr
+    line = r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d+ \d+ WARNING probe: hello$"
+    assert re.search(line, proc.stderr, re.M), proc.stderr

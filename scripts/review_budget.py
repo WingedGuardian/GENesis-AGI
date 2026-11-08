@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Authoritative review-round budget from pull-request evidence.
 
-The local review-state counter is deliberately unsuitable for this job: it
-tracks a defect-bearing streak, while this policy counts ROUNDS: distinct commit
-heads that drew findings from a GitHub App reviewer (before
+This policy counts ROUNDS: distinct commit heads that drew findings from a
+GitHub App reviewer (before
 ``ROUND_RULE_CUTOVER_ISO``, heads the primary reviewed).  This module is stdlib-only so the
 PreToolUse and commit hooks, the external-review runner, and maintenance CLIs can
 all ask the same question.
@@ -115,7 +114,9 @@ HOOK_SURFACE_FILES = frozenset(
         "scripts/review_late.py",
         "scripts/review_deadline.py",
         "scripts/external_review.py",
-        "scripts/lib/gate_menu.py",
+        # The issue premise gate: an Action script that hooks/issue_premise_gate.py
+        # imports, so its rule decides a block.
+        "scripts/premise_gate.py",
         ".claude/settings.json",
         "scripts/behavioral_linter.py",
         "scripts/check_stale_pending.py",
@@ -825,7 +826,11 @@ def evaluate_evidence(
         event = first_event[sha]
         return _iso(event["when"], event["source"]["submitted_at"])
 
-    # A head force-pushed out of the PR sorts before every live commit.
+    # A head force-pushed out of the PR sorts before every live commit. This
+    # order is for stable output only: it is the commit list's DATE order, so a
+    # reader finds a round by its head, never by its position. Exception,
+    # pending #3302-B: ``trend`` below, and the push guard's findings-per-round
+    # arrow, still read this order.
     rounds = [
         {
             "head": sha,
@@ -888,23 +893,28 @@ def evaluate_evidence(
             if scored[-1] < scored[-2]
             else "flat"
         )
+    # The open round is the CURRENT HEAD's own round, found by identity. The
+    # order of ``rounds`` follows the PR's commit list, which GitHub sorts by
+    # date, not ancestry: after a rebase or cherry-pick a commit can be listed
+    # after the head. Nothing may take a meaning from that order (#3302), except
+    # ``trend`` and the guard's findings arrow until #3302-B.
+    by_head = {r["head"]: r for r in rounds}
     if not rounds:
         round_state = "none"
-    elif rounds[-1]["head"] == head:
+    elif head in round_heads:
         round_state = "open"
     else:
         round_state = "complete"
 
     # What a round reflection must answer for, read by review_reflection.status
-    # (and by the commit gate once it enforces reflections; until then they are
-    # reported, never enforced). The newest round only, and only while it is
-    # open. A LATE review (one that opened no round, above) never lands here: it
+    # and by the commit gate, which denies a content commit while any is owed.
+    # The current head's round only, and only while it is open. A LATE review (one that opened no round, above) never lands here: it
     # is listed in ``findings`` with the round it belongs to, and ``review_late``
     # owes those keys from its cutover on.
     seen: dict[str, None] = {}  # ordered and linear, however many keys arrive
     keys_known = True
     if round_state == "open":
-        for source in rounds[-1]["reviews"]:
+        for source in by_head[head]["reviews"]:
             for key in source["finding_keys"]:
                 if key is None:
                     keys_known = False
@@ -915,7 +925,7 @@ def evaluate_evidence(
         # not read findings, so a head the primary reviewed CLEAN before the
         # cutover reads the same way: unknown. Fail-closed, and only a PR whose
         # current head predates the cutover can reach it.
-        keys_known = keys_known and rounds[-1]["head"] not in legacy
+        keys_known = keys_known and head not in legacy
     open_keys = list(seen)
     # Who the settle window waits for: every reviewer that reported on ANY other
     # head of this PR, clean reviews included (a reviewer that reviewed an
@@ -949,7 +959,7 @@ def evaluate_evidence(
         newest = [r for r in older if older - {r} <= ancestors(r)]
         return newest[0] if len(newest) == 1 else None
 
-    open_head = rounds[-1]["head"] if round_state == "open" else None
+    open_head = head if round_state == "open" else None
     findings_out: list[dict[str, Any]] = []
     late_known = True
     for event in events:
@@ -1688,6 +1698,10 @@ def _evaluate_pr_inner(
         len(bodies) == 2 and bodies[0] != bodies[1]
     )
     result["body"] = None if result["body_changed"] or not bodies else bodies[-1]
+    # A test that supplies every input makes no read, so it names the body too.
+    seam_body = os.environ.get("_TEST_REVIEW_BUDGET_BODY")
+    if seam_body is not None and not reads:
+        result["body"] = seam_body
     return result
 
 

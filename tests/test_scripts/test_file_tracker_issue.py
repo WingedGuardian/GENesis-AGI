@@ -1265,6 +1265,26 @@ def test_a_clean_body_still_files(tmp_path, capsys):
     assert any("issue create" in " ".join(c) for c in calls)
 
 
+def test_an_unreadable_fingerprint_file_refuses_and_says_why(tmp_path, capsys, monkeypatch):
+    """A present file the scan cannot read refuses too, and the operator is told
+    the file is the problem rather than that the draft matched a private value."""
+    fp = tmp_path / "fingerprints.txt"
+    fp.write_text("tok_private\n")
+    fp.chmod(0)
+    monkeypatch.setenv("GENESIS_RELEASE_FINGERPRINTS", str(fp))
+    calls: list = []
+    t, b = _file(tmp_path, "A real title", "Entirely innocuous text.")
+    try:
+        rc = _main(t, b, _scan_runner(calls))
+    finally:
+        fp.chmod(0o600)
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "could not be read" in err
+    assert "content withheld" not in err
+    assert calls == []
+
+
 def test_a_missing_fingerprint_file_refuses_rather_than_filing(tmp_path, capsys, monkeypatch):
     """Fail-CLOSED, pinned rather than inherited.
 

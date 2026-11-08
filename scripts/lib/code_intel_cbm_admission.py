@@ -144,12 +144,15 @@ def assess(
     reserve: int,
     unit: str,
     *,
+    provider: str = "cbm",
     cache_reserve: int = 2 * 1024**3,
     self_path: Path = Path("/proc/self/cgroup"),
     mountinfo_path: Path = Path("/proc/self/mountinfo"),
     meminfo_path: Path = Path("/proc/meminfo"),
 ) -> None:
-    if not re.fullmatch(r"code-intel-[a-f0-9]{12}-cbm-[0-9]+", unit):
+    if provider not in ("cbm", "gitnexus"):
+        raise AdmissionRefused("invalid admission provider")
+    if not re.fullmatch(r"code-intel-[a-f0-9]{12}-" + provider + r"-[0-9]+", unit):
         raise AdmissionRefused("invalid expected scope name")
     leaf, root, version = resolve_cgroup(self_path, mountinfo_path)
     if leaf.name != unit + ".scope" or leaf == root:

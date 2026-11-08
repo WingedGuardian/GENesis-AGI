@@ -1,1 +1,0 @@
-- Local Codex CLI sessions can now stop recognized review requests and fix commits when the shared review budget requires fresh approval, handing the decision back to the user.

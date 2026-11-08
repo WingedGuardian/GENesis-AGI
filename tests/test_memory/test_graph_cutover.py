@@ -31,6 +31,10 @@ def _proc(**over) -> dict:
         "unknown": None,
         "telemetry_off": False,
         "foreign": False,
+        "role": "mcp-memory",
+        "source": "main",
+        "unknown_reasons": [],
+        "db_identity": [1, 2],
     }
     p.update(over)
     return p
@@ -38,12 +42,13 @@ def _proc(**over) -> dict:
 
 def _census_metrics(**over) -> dict:
     m = {
-        "v": 1,
+        "v": cut.CLEAN_CENSUS_SCHEMA,
         "procs": [_proc()],
         "other_servers": {},
         "unclassified": 0,
         "head_telemetry": True,
         "head_dirty": False,
+        "head_history_telemetry": True,
         "complete": True,
         "reasons": [],
     }
@@ -132,7 +137,7 @@ def test_traffic_older_than_fourteen_days_does_not_count():
 
 
 @pytest.mark.parametrize(
-    "outcome", ["fallback", "selection_failed", "error", "mode_unsupported", "brand_new"]
+    "outcome", ["fallback", "selection_failed", "error", "mode_unsupported", "retried", "brand_new"]
 )
 def test_every_outcome_but_primary_and_cancelled_restarts_the_clock(outcome):
     trav, census = _passing_inputs(clock_days=20)
@@ -280,6 +285,21 @@ def test_telemetry_switched_off_in_the_server_is_inconclusive():
         ({"head_telemetry": False}, "HEAD does not contain"),
         ({"head_dirty": True}, "dirty"),
         ({"v": 99}, "unknown census schema"),
+        ({"v": 1}, "predates the current census contract"),
+        ({"v": 2}, "predates the current census contract"),
+        ({"head_history_telemetry": False}, "HEAD held code without telemetry in the last 2h30m"),
+        ({"procs": [_proc(role="ambient", telemetry_off=True)]}, "ambient worker pid 1 has"),
+        ({"procs": [_proc(role="venv-generic", telemetry=False)]}, "venv process pid 1 may run"),
+        ({"procs": [_proc(role="ambient", excluded="replay_not_live_traffic")]},
+         "unreadable census row"),
+        ({"procs": [{"pid": 2, "role": "server", "unknown_reasons": ["runs_alongside_host"]}]},
+         "server pid 2: cannot prove its code (runs_alongside_host)"),
+        ({"procs": [_proc(telemetry_off=None)]}, "kill-switch state unknown"),
+        ({"procs": [_proc(source=None, unknown_reasons=["not_main_venv"])]},
+         "cannot prove its code (not_main_venv)"),
+        ({"procs": [_proc(source=None)]}, "cannot prove its code (no source proof)"),
+        ({"procs": [_proc(unknown_reasons="x")]}, "unreadable census row"),
+        ({"procs": [_proc(unknown_reasons=None)]}, "unreadable census row"),
     ],
 )
 def test_a_dirty_census_row_holds_the_clock(over, why):
@@ -447,3 +467,114 @@ def test_negative_or_boolean_counts_are_unreadable(over):
     v = cut.evaluate(trav, census, [], NOW)
     assert v.status == "INCONCLUSIVE"
     assert any(r.startswith("unreadable traversal row") for r in v.reasons), v.reasons
+
+
+def test_an_unknown_switch_is_never_reported_as_on():
+    """S6: None means unproven, which is a different fault from a switch that is
+    on, and the message must not send a reader looking for the wrong one."""
+    why = cut.census_dirt(_census_metrics(procs=[_proc(telemetry_off=None)]))
+    assert "unknown" in why
+    assert "kill switch on" not in why
+
+
+def test_a_disabled_row_of_an_older_schema_still_reads_disabled():
+    row = {"v": 1, "procs": [], "complete": False, "reasons": ["telemetry_disabled"]}
+    assert cut.census_dirt(row) == cut._DISABLED
+
+
+def test_the_clean_schema_is_the_one_the_census_writes():
+    from genesis.memory import graph_census
+
+    assert cut.CLEAN_CENSUS_SCHEMA == graph_census.CENSUS_SCHEMA
+    assert set(range(1, cut.CLEAN_CENSUS_SCHEMA + 1)) == cut.KNOWN_CENSUS_SCHEMAS
+
+
+def test_an_excluded_replay_and_a_foreign_generic_process_hold_nothing():
+    census = _census(
+        NOW - timedelta(days=15), NOW,
+        procs=[
+            _proc(),
+            {"pid": 3, "role": "replay", "excluded": "replay_not_live_traffic"},
+            {"pid": 4, "role": "venv-generic", "telemetry": False, "foreign": True},
+            {"pid": 5, "role": "venv-generic", "telemetry": True, "foreign": False},
+        ],
+    )
+    assert cut.evaluate(_daily_traffic(14), census, [], NOW).status == "PASS"
+
+
+# ── Owner ruling 9931626424ee4c6c: a young unprovable generic process ─────────
+def _generic(unknown: str, started: datetime) -> dict:
+    return {
+        "pid": 7, "role": "venv-generic", "started_at": started.isoformat(),
+        "commit": "c", "held": ["c"], "telemetry": None, "unknown": unknown,
+        "foreign": False, "db_identity": [1, 2],
+    }
+
+
+@pytest.mark.parametrize("unknown", ["other_genesis_home", "interpreter_unresolved"])
+def test_a_young_unprovable_generic_process_does_not_hold_the_clock(unknown):
+    row = _census_metrics(procs=[_proc(), _generic(unknown, NOW - timedelta(seconds=5))])
+    assert cut.census_dirt(row, NOW) is None
+    # The row's history check vouches for it; without that the excuse is void.
+    assert cut.census_dirt({**row, "head_history_telemetry": False}, NOW) is not None
+
+
+@pytest.mark.parametrize("unknown", ["other_genesis_home", "interpreter_unresolved"])
+def test_an_unprovable_generic_process_older_than_the_lookback_still_holds_it(unknown):
+    old = _generic(unknown, NOW - cut.HISTORY_LOOKBACK - timedelta(seconds=1))
+    edge = _generic(unknown, NOW - cut.HISTORY_LOOKBACK)
+    assert "may run old code" in cut.census_dirt(_census_metrics(procs=[old]), NOW)
+    assert "may run old code" in cut.census_dirt(_census_metrics(procs=[edge]), NOW)
+
+
+@pytest.mark.parametrize("unknown", ["other_genesis_home", "interpreter_unresolved"])
+@pytest.mark.parametrize(
+    ("inside_us", "clean"),
+    [(0, False), (1_999_999, False), (2_000_000, True), (2_000_001, True)],
+)
+def test_generic_history_boundary_reserves_the_boot_time_error(unknown, inside_us, clean):
+    started = NOW - cut.HISTORY_LOOKBACK + timedelta(microseconds=inside_us)
+    row = _census_metrics(procs=[_generic(unknown, started)])
+    assert (cut.census_dirt(row, NOW) is None) is clean
+
+
+def test_the_excuse_needs_the_row_time_a_start_and_a_named_reason():
+    young = _generic("other_genesis_home", NOW - timedelta(seconds=5))
+    assert cut.census_dirt(_census_metrics(procs=[young])) is not None  # no row time
+    no_start = {**young, "started_at": None}
+    assert cut.census_dirt(_census_metrics(procs=[no_start]), NOW) is not None
+    future = _generic("other_genesis_home", NOW + timedelta(seconds=5))
+    assert cut.census_dirt(_census_metrics(procs=[future]), NOW) is not None
+    other = _generic("started_on_old_code", NOW - timedelta(seconds=5))
+    assert cut.census_dirt(_census_metrics(procs=[other]), NOW) is not None
+
+
+@pytest.mark.parametrize("unknown", [["other_genesis_home"], {"x": 1}])
+def test_an_unhashable_unknown_reads_dirty_and_never_aborts_the_report(unknown):
+    p = {**_generic("other_genesis_home", NOW - timedelta(seconds=5)), "unknown": unknown}
+    assert cut.census_dirt(_census_metrics(procs=[p]), NOW) is not None
+
+
+@pytest.mark.parametrize("role", ["mcp-memory", "ambient"])
+def test_a_traversal_producer_gets_no_such_excuse(role):
+    p = {**_generic("other_genesis_home", NOW - timedelta(seconds=5)), "role": role}
+    p.update(unknown_reasons=["other_genesis_home"], source=None, telemetry_off=False)
+    assert cut.census_dirt(_census_metrics(procs=[p]), NOW) is not None
+
+
+def test_evaluate_passes_each_row_time_so_young_jobs_never_reset_the_clock():
+    rows = []
+    t = NOW - timedelta(days=15)
+    while t <= NOW:
+        procs = [_proc(), _generic("other_genesis_home", t - timedelta(seconds=3))]
+        rows.append((_ts(t), json.dumps(_census_metrics(procs=procs))))
+        t += timedelta(hours=1)
+    v = cut.evaluate(_daily_traffic(14), rows, [], NOW)
+    assert v.status == "PASS", v.reasons
+
+
+def test_the_verdict_lookback_is_the_writer_lookback():
+    from genesis.memory import graph_census
+
+    assert timedelta(seconds=graph_census.HISTORY_LOOKBACK_S) == cut.HISTORY_LOOKBACK
+    assert timedelta(seconds=graph_census._BOOT_TOLERANCE_S) == cut.BOOT_TIME_MARGIN

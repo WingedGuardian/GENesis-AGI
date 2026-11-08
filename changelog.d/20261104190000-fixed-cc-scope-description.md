@@ -1,0 +1,1 @@
+- CC session scopes use the fixed description "Genesis CC session" instead of the Claude command line, keeping prompts out of systemd scope descriptions and their journal entries.

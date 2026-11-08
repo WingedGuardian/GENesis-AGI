@@ -36,6 +36,20 @@ def provider_status_isolated() -> bool:
     return _phase.get() is not None
 
 
+def rate_limit_rejected(event: dict | None) -> bool:
+    """Whether the latest CLI quota event refuses further use.
+
+    Informational states and an explicitly usable overage are not refusals;
+    overageStatus alone does not establish that the call is using overage.
+    """
+    info = (event or {}).get("rate_limit_info")
+    return (
+        isinstance(info, dict)
+        and info.get("status") == "rejected"
+        and info.get("isUsingOverage") is not True
+    )
+
+
 async def probe_provider(invoker, base: CCInvocation, *, timeout_s: float):
     """Require enforced empty authority and a complete, exact readiness answer.
 
@@ -97,8 +111,7 @@ async def probe_provider(invoker, base: CCInvocation, *, timeout_s: float):
         # CC also emits informational limits and usable-overage states. Use
         # the last effective state, as the CLI does; a later allowed update can
         # supersede a rejection encountered while the diagnostic was retrying.
-        info = (last_limit or {}).get("rate_limit_info") or {}
-        if info.get("status") == "rejected" and info.get("isUsingOverage") is not True:
+        if rate_limit_rejected(last_limit):
             raise CCRateLimitError("Provider readiness was refused", raw_event=last_limit)
         return output
     except ProcessCleanupUncertain as exc:

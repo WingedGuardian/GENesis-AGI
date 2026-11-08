@@ -9,7 +9,7 @@ prints is stamped UNCLASSIFIED. This docstring is also the CLI's --help text, so
 the old wording was recreating the exact misreading the rest of the file exists
 to prevent, on the most-read surface it has.
 
-The dev skill's "Acceptance Bar + Measured Rate" asks a change to a Bash guard's
+The build-session skill's "Acceptance Bar + Measured Rate" asks a change to a Bash guard's
 PREDICATE to carry a measured `blocked k/N` figure. That is a CONVENTION, not an
 enforced gate — the PR template does not ask for it, no CI job checks it, and the
 review-depth check is advisory by design. An earlier draft of this docstring called

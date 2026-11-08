@@ -312,6 +312,10 @@ def _budget(**over):
         "expected_reviewers": [],
         "reviewers_reported": ["chatgpt-codex-connector[bot]"],
     }
+    if "current_head" in over and "rounds" not in over:
+        # The open round is the head's own entry (#3302): keep the default
+        # round on whatever head the test names, as the producer would.
+        budget["rounds"] = [dict(budget["rounds"][0], head=over["current_head"])]
     budget.update(over)
     return budget
 
@@ -351,7 +355,11 @@ def test_round_one_with_nobody_expected_waits_the_whole_window():
 
 
 def test_no_readable_review_time_never_settles():
-    got = rr.owed_state(_budget(rounds=[{"reviews": [{"submitted_at": None}]}]), [], now=T0)
+    # The head's OWN round, so this reaches the unreadable-time path, not the
+    # "no entry for the head" one (GLM P3 on #3302-A).
+    budget = _budget(rounds=[{"head": HEAD, "reviews": [{"submitted_at": None}]}])
+    got = rr.owed_state(budget, [], now=T0)
+    assert got["round_head"] == HEAD and got["owed"] == ["c1", "c2", "r5:1"]
     assert not got["settled"] and got["settle_until"] is None
 
 
@@ -530,28 +538,551 @@ def test_a_fix_reverted_before_the_reflection_still_disqualifies_it(repo, tmp_pa
     assert _covered(path, head) == set()
 
 
-def test_a_merge_between_the_head_and_the_reflection_disqualifies_it(repo, tmp_path):
+# -- the credit rule: a commit before a finding is no fix of it ----------------
+#
+# Owner rulings 2026-10-20: a merge of the default branch is no fix while it
+# holds only git's own merge result and the resolution of its conflicted files
+# (narrowed the same day), and any other commit between the round head
+# and the reflection is a fix of finding k only when the LATER of its author
+# and committer times is no earlier than k's review time (less the 1 s clock
+# slack). Unknown means fix.
+
+REVIEW = datetime(2026, 10, 5, 12, 0, tzinfo=UTC)
+
+
+def _dated(repo: Path, *args: str, when: datetime, committed: datetime | None = None) -> str:
+    stamp = lambda t: t.strftime("%Y-%m-%dT%H:%M:%S+0000")  # noqa: E731
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_DATE": stamp(when),
+        "GIT_COMMITTER_DATE": stamp(committed or when),
+    }
+    subprocess.run(["git", "-C", str(repo), *args], capture_output=True, check=True, env=env)
+    return _git(repo, "rev-parse", "HEAD").strip()
+
+
+def _change(repo: Path, content: str, when: datetime, committed: datetime | None = None) -> str:
+    (repo / "f.txt").write_text(content)
+    return _dated(repo, "commit", "-q", "-am", f"set {content.strip()}", when=when, committed=committed)
+
+
+def _main_moves(repo: Path, name: str = "main", *, remote: str | None = "main") -> None:
+    """``name`` gains a commit; ``remote`` (if given) is the origin ref it is
+    published as, so the merge reads as a merge of the default branch."""
+    _git(repo, "checkout", "-q", name)
+    (repo / "g.txt").write_text(f"{name}\n")
+    _git(repo, "add", "g.txt")
+    _git(repo, "commit", "-q", "-m", f"{name} moves")
+    if remote:
+        _git(repo, "update-ref", f"refs/remotes/origin/{remote}", name)
+    _git(repo, "checkout", "-q", "feat/x")
+
+
+def _at(minutes: int) -> datetime:
+    return REVIEW + timedelta(minutes=minutes)
+
+
+def test_a_commit_made_before_the_review_is_no_fix_of_it(repo, tmp_path):
+    """The dead end this rule removes: a session that committed after pushing
+    the head, before the head's review landed, could never reflect."""
     path, head = repo
-    _git(path, "checkout", "-q", "main")
-    (path / "g.txt").write_text("main\n")
-    _git(path, "add", "g.txt")
-    _git(path, "commit", "-q", "-m", "main moves")
-    _git(path, "checkout", "-q", "feat/x")
-    _git(path, "merge", "-q", "--no-edit", "main")
+    _change(path, "local\n", _at(-10))
     _commit_reflection(path, tmp_path, _reflection(head=head))
+    assert _covered(path, head, reviewed_at={"c1": _at(0), "c2": _at(0)}) == {"c1", "c2"}
+    # Control: with no review time the commit is a fix, as before.
     assert _covered(path, head) == set()
 
 
-def test_a_merge_that_changes_no_tree_still_disqualifies_it(repo, tmp_path):
-    """Only the one-parent rule decides this: `-s ours` keeps the tree."""
+def test_a_commit_made_after_the_review_is_a_fix_of_it(repo, tmp_path):
+    path, head = repo
+    _change(path, "fix\n", _at(10))
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    assert _covered(path, head, reviewed_at={"c1": _at(0), "c2": _at(0)}) == set()
+
+
+def test_each_key_is_judged_by_its_own_review_time(repo, tmp_path):
+    path, head = repo
+    _change(path, "between\n", _at(10))
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    assert _covered(path, head, reviewed_at={"c1": _at(0), "c2": _at(20)}) == {"c2"}
+
+
+@pytest.mark.parametrize("seconds, credited", [(0, False), (-1, False), (-2, True)])
+def test_the_clock_slack_counts_toward_a_fix(repo, tmp_path, seconds, credited):
+    path, head = repo
+    _change(path, "edge\n", REVIEW + timedelta(seconds=seconds))
+    _commit_reflection(path, tmp_path, _reflection(keys=("c1",), head=head))
+    got = _covered(path, head, reviewed_at={"c1": REVIEW})
+    assert got == ({"c1"} if credited else set())
+
+
+def test_an_amended_commit_is_judged_by_its_later_clock(repo, tmp_path):
+    """An amend keeps the author time; the committer time moves, so a commit
+    first written before the review and amended after it is a fix."""
+    path, head = repo
+    _change(path, "amended\n", _at(-10), committed=_at(10))
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    assert _covered(path, head, reviewed_at={"c1": _at(0), "c2": _at(0)}) == set()
+
+
+def test_a_merge_of_the_default_branch_is_no_fix(repo, tmp_path):
+    """Owner ruling 2026-10-20, replacing "any merge disqualifies": merging
+    main in is how a branch keeps up, not how it fixes a finding."""
+    path, head = repo
+    _main_moves(path)
+    _dated(path, "merge", "-q", "--no-edit", "main", when=_at(30))
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    assert _covered(path, head, reviewed_at={"c1": _at(0), "c2": _at(0)}) == {"c1", "c2"}
+    # The main merge is exempt even when a key's review time is unknown.
+    assert _covered(path, head) == {"c1", "c2"}
+
+
+def _conflicting_main(repo: Path) -> None:
+    """main and feat/x both change f.txt, so merging main in conflicts."""
+    _git(repo, "checkout", "-q", "main")
+    (repo / "f.txt").write_text("main's line\n")
+    _git(repo, "commit", "-q", "-am", "main edits f")
+    _git(repo, "update-ref", "refs/remotes/origin/main", "main")
+    _git(repo, "checkout", "-q", "feat/x")
+    done = subprocess.run(["git", "-C", str(repo), "merge", "-q", "main"], capture_output=True)
+    assert done.returncode != 0, "the fixture must really conflict"
+
+
+def test_a_conflict_resolved_main_merge_is_no_fix(repo, tmp_path):
+    """The owner's accepted residual: what a resolution changes inside the
+    conflicted files is credited, even after the review."""
+    path, head = repo
+    _conflicting_main(path)
+    (path / "f.txt").write_text("resolved\n")
+    _git(path, "add", "f.txt")
+    _dated(path, "commit", "-q", "--no-edit", when=_at(30))
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    assert _covered(path, head, reviewed_at={"c1": _at(0), "c2": _at(0)}) == {"c1", "c2"}
+
+
+def test_a_resolution_reaching_other_files_is_judged_by_its_time(repo, tmp_path):
+    """Owner ruling 2026-10-20, narrowed: changes outside the conflicted files
+    ride the merge as content (74 of 285 conflicted local main merges, 2026-10-20)."""
+    path, head = repo
+    (path / "h.txt").write_text("h\n")
+    _git(path, "add", "h.txt")
+    _dated(path, "commit", "-q", "-m", "add h", when=_at(-30))
+    head = _git(path, "rev-parse", "HEAD").strip()
+    _conflicting_main(path)
+    (path / "f.txt").write_text("resolved\n")
+    (path / "h.txt").write_text("a fix riding the merge\n")
+    _git(path, "add", "f.txt", "h.txt")
+    _dated(path, "commit", "-q", "--no-edit", when=_at(30))
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    assert _covered(path, head, reviewed_at={"c1": _at(0), "c2": _at(0)}) == set()
+    assert _covered(path, head, reviewed_at={"c1": _at(40), "c2": _at(40)}) == {"c1", "c2"}
+
+
+def _write(repo: Path, name: bytes, data: bytes) -> None:
+    with open(bytes(repo) + b"/" + name, "wb") as f:
+        f.write(data)
+
+
+def _smuggling_merge(
+    repo: Path, conflict: bytes, extra: bytes, *, gitlink: bool = False, gitmodules: str = ""
+) -> str:
+    """A main merge that resolves ``conflict`` and also edits ``extra``, a file
+    git merged cleanly (or, with ``gitlink``, adds a submodule entry instead):
+    content beyond the resolution. Returns the round head, the branch tip just
+    before the merge."""
+    _git(repo, "checkout", "-q", "main")
+    for name in (conflict, extra):
+        _write(repo, name, b"1\n2\n3\n4\n5\n")
+    if gitmodules:
+        (repo / ".gitmodules").write_text(gitmodules)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "add both files")
+    _git(repo, "checkout", "-q", "feat/x")
+    _git(repo, "merge", "-q", "--no-edit", "main")
+    _git(repo, "checkout", "-q", "main")
+    _write(repo, conflict, b"main\n2\n3\n4\n5\n")
+    _write(repo, extra, b"1\n2\n3\n4\nmain\n")
+    _git(repo, "commit", "-q", "-am", "main edits")
+    _git(repo, "update-ref", "refs/remotes/origin/main", "main")
+    _git(repo, "checkout", "-q", "feat/x")
+    _write(repo, conflict, b"feat\n2\n3\n4\n5\n")
+    _write(repo, extra, b"feat\n2\n3\n4\n5\n")
+    _git(repo, "commit", "-q", "-am", "feat edits")
+    head = _git(repo, "rev-parse", "HEAD").strip()
+    done = subprocess.run(["git", "-C", str(repo), "merge", "-q", "main"], capture_output=True)
+    assert done.returncode != 0, "the fixture must really conflict"
+    _write(repo, conflict, b"resolved\n2\n3\n4\n5\n")
+    if not gitlink:
+        _write(repo, extra, b"feat\n2\nA FIX RIDING THE MERGE\n4\nmain\n")
+    _git(repo, "add", "-A")
+    if gitlink:  # after `add -A`, which would drop an entry with no directory
+        _git(repo, "update-index", "--add", "--cacheinfo", f"160000,{'1' * 40},sub")
+        assert "160000" in _git(repo, "ls-files", "-s", "sub")
+    _dated(repo, "commit", "-q", "--no-edit", when=_at(30))
+    return head
+
+
+def _smuggled_is_a_fix(path: Path, tmp_path: Path, head: str, cwd: Path | None = None) -> None:
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    got = rr.covered_keys(
+        str(cwd or path),
+        head,
+        round_number=1,
+        gate_lane=False,
+        prior_heads=[],
+        acceptance=None,
+        round_started=T0 - timedelta(days=3650),
+        reviewed_at={"c1": _at(0), "c2": _at(0)},
+    )
+    assert got == set()
+
+
+def test_the_smuggling_fixture_is_a_fix_with_no_tricks(repo, tmp_path):
+    """Control for the four round-2 cases below: plain names, no config."""
+    path, _ = repo
+    _smuggled_is_a_fix(path, tmp_path, _smuggling_merge(path, b"c.txt", b"e.txt"))
+
+
+def test_paths_that_are_not_utf8_cannot_hide_an_extra_edit(repo, tmp_path):
+    """Round 2 of #3493 (Codex c4328462308): decoded with replacement, both
+    names read as U+FFFD, so the extra edit looked like the conflicted file."""
+    path, _ = repo
+    _smuggled_is_a_fix(path, tmp_path, _smuggling_merge(path, b"\xff", b"\xfe"))
+
+
+def test_an_ignored_submodule_change_still_counts(repo, tmp_path):
+    """Round 2 of #3493 (Codex c4328462312): porcelain git diff honours
+    diff.ignoreSubmodules=all and dropped a gitlink the merge carried."""
+    path, _ = repo
+    head = _smuggling_merge(path, b"c.txt", b"e.txt", gitlink=True)
+    _git(path, "config", "diff.ignoreSubmodules", "all")
+    _smuggled_is_a_fix(path, tmp_path, head)
+
+
+def test_a_committed_submodule_ignore_cannot_hide_a_gitlink(repo, tmp_path):
+    """Found while fixing round 2: a committed .gitmodules "ignore = all"
+    hides a gitlink change from plumbing diff-tree too, not only from git diff."""
+    path, _ = repo
+    gitmodules = '[submodule "sub"]\n\tpath = sub\n\turl = ./sub\n\tignore = all\n'
+    head = _smuggling_merge(path, b"c.txt", b"e.txt", gitlink=True, gitmodules=gitmodules)
+    _smuggled_is_a_fix(path, tmp_path, head)
+
+
+def test_a_repo_merge_default_cannot_widen_the_conflicted_set(repo, tmp_path):
+    """Round-2 fix audit: merge.default=binary makes every file without a merge
+    attribute conflict, so a fix inside a cleanly merging file was exempt."""
+    path, _ = repo
+    head = _smuggling_merge(path, b"c.txt", b"e.txt")
+    _git(path, "config", "merge.default", "binary")
+    _smuggled_is_a_fix(path, tmp_path, head)
+
+
+def test_a_global_merge_default_cannot_widen_the_conflicted_set(repo, tmp_path, monkeypatch):
+    """The same through the user's global ~/.gitconfig."""
+    path, _ = repo
+    head = _smuggling_merge(path, b"c.txt", b"e.txt")
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".gitconfig").write_text("[merge]\n\tdefault = binary\n")
+    env = {k: v for k, v in rr._GIT_ENV.items() if k not in ("GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME")}
+    monkeypatch.setattr(rr, "_GIT_ENV", {**env, "HOME": str(home)})
+    _smuggled_is_a_fix(path, tmp_path, head)
+
+
+def test_a_relative_diff_from_a_subdirectory_still_sees_the_whole_tree(repo, tmp_path):
+    """The round-2 premise check's unreported member: diff.relative=true, with
+    the check run from a subdirectory, limited porcelain diff to that directory."""
+    path, _ = repo
+    head = _smuggling_merge(path, b"c.txt", b"e.txt")
+    (path / "sub").mkdir()
+    _git(path, "config", "diff.relative", "true")
+    _smuggled_is_a_fix(path, tmp_path, head, cwd=path / "sub")
+
+
+def test_a_machine_attribute_cannot_widen_the_conflicted_set(repo, tmp_path):
+    """The round-2 premise check's unreported member: core.attributesFile with
+    `-merge` made a cleanly merging file conflict, so a fix inside it was
+    exempt. (.git/info/attributes has no off switch: a stated residual.)"""
+    path, _ = repo
+    head = _smuggling_merge(path, b"c.txt", b"e.txt")
+    attrs = tmp_path / "attributes"
+    attrs.write_text("e.txt -merge\n")
+    _git(path, "config", "core.attributesFile", str(attrs))
+    _smuggled_is_a_fix(path, tmp_path, head)
+
+
+def test_a_merge_tree_that_says_nothing_is_no_exemption(monkeypatch):
+    """CodeRabbit c4328380094: a timed-out merge-tree reads as exit 1 with no
+    output. It must not pass as a conflicted merge even if the next call
+    happens to answer with nothing changed."""
+    calls = []
+
+    def fake(argv, cwd=None, *, env=None):
+        calls.append(argv)
+        return (1, b"", b"timed out") if "merge-tree" in argv else (0, b"", b"")
+
+    monkeypatch.setattr(rr, "_run_bytes", fake)
+    assert rr._merge_is_no_fix("/r", "t" * 40, ["a", "b"], {"b"}, {"a"}) is False
+    assert len(calls) == 1
+
+
+def test_the_merge_exemption_runs_git_with_injected_config_cut_off(monkeypatch):
+    """A hook under `git -c ... commit` inherits that config through
+    GIT_CONFIG_*: none of it, no system attributes and no grafts reach the
+    exemption's git calls, and the global attributes file is cut too."""
+    seen = []
+
+    def fake(argv, cwd=None, *, env=None):
+        seen.append((list(argv), env))
+        return 1, b"", b""
+
+    env = {
+        "GIT_CONFIG_PARAMETERS": "'diff.ignoresubmodules'='all'",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "merge.default",
+        "GIT_CONFIG_VALUE_0": "binary",
+    }
+    monkeypatch.setattr(rr, "_GIT_ENV", {**rr._GIT_ENV, **env})
+    monkeypatch.setattr(rr, "_run_bytes", fake)
+    rr._merge_is_no_fix("/r", "t" * 40, ["a", "b"], {"b"}, {"a"})
+    argv, used = seen[0]
+    assert not set(env) & set(used)
+    assert used["GIT_CONFIG_GLOBAL"] == os.devnull and used["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert used["GIT_ATTR_NOSYSTEM"] == "1" and used["GIT_NO_REPLACE_OBJECTS"] == "1"
+    assert not os.path.exists(used["GIT_GRAFT_FILE"])
+    assert f"core.attributesFile={os.devnull}" in argv and "merge.default=text" in argv
+
+
+def test_a_clean_main_merge_with_extra_changes_is_judged_by_its_time(repo, tmp_path):
+    """An edited merge (30 of 494 local main merges, 2026-10-20) is content."""
+    path, head = repo
+    _main_moves(path)
+    _git(path, "merge", "-q", "--no-commit", "--no-ff", "main")
+    (path / "f.txt").write_text("a fix in the merge\n")
+    _git(path, "add", "f.txt")
+    _dated(path, "commit", "-q", "--no-edit", when=_at(30))
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    assert _covered(path, head, reviewed_at={"c1": _at(0), "c2": _at(0)}) == set()
+    assert _covered(path, head, reviewed_at={"c1": _at(40), "c2": _at(40)}) == {"c1", "c2"}
+
+
+def test_a_main_merge_amended_with_a_fix_is_judged_by_its_time(repo, tmp_path):
+    path, head = repo
+    _main_moves(path)
+    _dated(path, "merge", "-q", "--no-edit", "main", when=_at(10))
+    (path / "f.txt").write_text("amended in\n")
+    _dated(path, "commit", "-q", "-a", "--amend", "--no-edit", when=_at(10), committed=_at(30))
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    assert _covered(path, head, reviewed_at={"c1": _at(0), "c2": _at(0)}) == set()
+
+
+def test_a_merge_that_brings_nothing_new_is_judged_by_its_time(repo, tmp_path):
+    """A 'merge' of a main commit the branch already holds adds no main
+    content, so whatever its tree holds is the session's own."""
+    path, head = repo
+    _git(path, "update-ref", "refs/remotes/origin/main", "main")
+    fixed = _change(path, "fixed\n", _at(-50))
+    _git(path, "reset", "-q", "--hard", head)
+    tree = _git(path, "rev-parse", f"{fixed}^{{tree}}").strip()
+    base = _git(path, "merge-base", "HEAD", "main").strip()
+    env = {**os.environ, "GIT_AUTHOR_DATE": "2026-10-05T12:30:00+0000"}
+    env["GIT_COMMITTER_DATE"] = env["GIT_AUTHOR_DATE"]
+    made = subprocess.run(
+        ["git", "-C", str(path), "commit-tree", tree, "-p", "HEAD", "-p", base, "-m", "m"],
+        capture_output=True, text=True, check=True, env=env,
+    ).stdout.strip()
+    _git(path, "reset", "-q", "--hard", made)
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    assert _covered(path, head, reviewed_at={"c1": _at(0), "c2": _at(0)}) == set()
+
+
+def test_a_topic_later_merged_into_main_is_still_judged_by_its_time(repo, tmp_path):
+    """Round 1 of #3493 (Codex c4326223553): the branch merges a topic after
+    the review; main later merges that same topic with a merge commit, so the
+    topic becomes reachable from main through a SECOND parent. It was never
+    main's tip, so the earlier merge is still the branch's own content."""
+    path, head = repo
+    _git(path, "checkout", "-q", "-b", "topic", "main")
+    (path / "t.txt").write_text("the fix\n")
+    _git(path, "add", "t.txt")
+    _git(path, "commit", "-q", "-m", "topic")
+    _git(path, "checkout", "-q", "feat/x")
+    _dated(path, "merge", "-q", "--no-ff", "--no-edit", "topic", when=_at(10))
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    _git(path, "checkout", "-q", "main")
+    _git(path, "commit", "-q", "--allow-empty", "-m", "main moves")
+    _git(path, "merge", "-q", "--no-ff", "--no-edit", "topic")
+    _git(path, "update-ref", "refs/remotes/origin/main", "main")
+    _git(path, "checkout", "-q", "feat/x")
+    topic = _git(path, "rev-parse", "topic").strip()
+    done = subprocess.run(["git", "-C", str(path), "merge-base", "--is-ancestor", topic, "main"])
+    assert done.returncode == 0, "the fixture must put the topic in main"
+    assert _covered(path, head, reviewed_at={"c1": _at(0), "c2": _at(0)}) == set()
+
+
+def test_a_fix_cannot_ride_in_through_a_merges_first_parent(repo, tmp_path):
+    """Fix-code audit N1: when the head is already in main, a branch forked
+    elsewhere can merge main in and reach the reflection with its fix on the
+    merge's FIRST parent, off the head's line. That merge is no main merge."""
+    path, head = repo
+    _git(path, "checkout", "-q", "main")
+    _dated(path, "merge", "-q", "--no-ff", "--no-edit", "feat/x", when=_at(-30))
+    _git(path, "update-ref", "refs/remotes/origin/main", "main")
+    base = _git(path, "rev-parse", "main^1").strip()
+    _git(path, "checkout", "-q", "-b", "fixside", base)
+    (path / "fix.txt").write_text("the fix\n")
+    _git(path, "add", "fix.txt")
+    _dated(path, "commit", "-q", "-m", "the fix", when=_at(30))
+    _dated(path, "merge", "-q", "--no-edit", "origin/main", when=_at(40))
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    assert _covered(path, head, reviewed_at={"c1": _at(0), "c2": _at(0)}) == set()
+
+
+def test_an_unfetched_head_is_unknown_on_the_open_path(repo, tmp_path):
+    """Fix-code audit NOTE 1: a round head this clone lacks refuses (status
+    reports it could not be checked); it never reads as every key owed or as
+    nothing owed."""
+    path, head = repo
+    _commit_reflection(path, tmp_path, _reflection(head="e" * 40))
+    with pytest.raises(rr.Refused, match="not fetched"):
+        _covered(path, "e" * 40)
+
+
+def test_a_dangling_remote_head_falls_back_to_origin_main(repo, tmp_path):
+    """After a default-branch rename and prune, origin/HEAD can name a ref
+    that is gone: that must neither refuse the status nor drop the rule."""
+    path, head = repo
+    _main_moves(path)
+    _git(path, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/gone")
+    _dated(path, "merge", "-q", "--no-edit", "main", when=_at(30))
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    assert _covered(path, head, reviewed_at={"c1": _at(0), "c2": _at(0)}) == {"c1", "c2"}
+
+
+def test_a_parentless_commit_after_the_head_credits_nothing(repo, tmp_path, monkeypatch):
+    """Only the local commit loses its parent; the reflection itself (which
+    ``head..sha`` also lists) keeps its own, so it is still no fix."""
+    path, head = repo
+    local = _change(path, "local\n", _at(-10))
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    assert _covered(path, head, reviewed_at={"c1": _at(0), "c2": _at(0)}) == {"c1", "c2"}
+    real = rr._run
+
+    def orphan(argv, cwd=None):
+        code, out, err = real(argv, cwd)
+        if "--ancestry-path" in argv:
+            rows = []
+            for row in (r for r in out.split("\n") if r.strip()):
+                names, _, stamps = row.partition("|")
+                if names.startswith(local):
+                    names = " ".join(names.split()[:2])
+                rows.append(f"{names}|{stamps}")
+            out = "\n".join(rows)
+        return code, out, err
+
+    monkeypatch.setattr(rr, "_run", orphan)
+    assert _covered(path, head, reviewed_at={"c1": _at(0), "c2": _at(0)}) == set()
+
+
+def test_a_merge_of_another_branch_is_judged_by_its_time(repo, tmp_path):
+    """Only the one-parent rule used to decide this: `-s ours` keeps the tree.
+    A merge of anything but the default branch is a fix after the review and
+    no fix before it."""
     path, head = repo
     _git(path, "checkout", "-q", "-b", "side", "main")
     _git(path, "commit", "-q", "--allow-empty", "-m", "side")
+    _git(path, "update-ref", "refs/remotes/origin/main", "main")
     _git(path, "checkout", "-q", "feat/x")
-    _git(path, "merge", "-q", "--no-edit", "-s", "ours", "side")
+    _dated(path, "merge", "-q", "--no-edit", "-s", "ours", "side", when=_at(10))
     assert _git(path, "rev-parse", "HEAD^{tree}") == _git(path, "rev-parse", "HEAD^1^{tree}")
     _commit_reflection(path, tmp_path, _reflection(head=head))
-    assert _covered(path, head) == set()
+    assert _covered(path, head, reviewed_at={"c1": _at(0), "c2": _at(0)}) == set()
+    assert _covered(path, head, reviewed_at={"c1": _at(20), "c2": _at(20)}) == {"c1", "c2"}
+
+
+def test_with_no_known_default_branch_a_merge_is_judged_by_its_time(repo, tmp_path):
+    path, head = repo
+    _main_moves(path, remote=None)
+    _dated(path, "merge", "-q", "--no-edit", "main", when=_at(10))
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    assert _covered(path, head, reviewed_at={"c1": _at(0), "c2": _at(0)}) == set()
+    assert _covered(path, head, reviewed_at={"c1": _at(20), "c2": _at(20)}) == {"c1", "c2"}
+
+
+def test_the_remote_head_names_the_default_branch(repo, tmp_path):
+    """``origin/HEAD`` wins over ``origin/main`` when it is set."""
+    path, head = repo
+    _git(path, "branch", "trunk", "main")
+    _main_moves(path, "trunk", remote="trunk")
+    _git(path, "update-ref", "refs/remotes/origin/main", "main")
+    _git(path, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk")
+    _dated(path, "merge", "-q", "--no-edit", "trunk", when=_at(10))
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    assert _covered(path, head, reviewed_at={"c1": _at(0), "c2": _at(0)}) == {"c1", "c2"}
+
+
+def test_an_unreadable_commit_time_is_a_fix(repo, tmp_path, monkeypatch):
+    path, head = repo
+    _change(path, "local\n", _at(-10))
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    real = rr._run
+
+    def blank_times(argv, cwd=None):
+        code, out, err = real(argv, cwd)
+        if "--ancestry-path" in argv:
+            out = "\n".join(row.split("|")[0] + "|" for row in out.split("\n") if row.strip())
+        return code, out, err
+
+    monkeypatch.setattr(rr, "_run", blank_times)
+    assert _covered(path, head, reviewed_at={"c1": _at(0), "c2": _at(0)}) == set()
+
+
+def test_a_reflection_not_descending_from_the_head_credits_nothing(repo, tmp_path):
+    path, head = repo
+    _git(path, "checkout", "-q", "-b", "elsewhere", "main")
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    assert _covered(path, head, reviewed_at={"c1": _at(0), "c2": _at(0)}) == set()
+
+
+def test_fix_clock_and_clears_state_the_rule(repo, tmp_path):
+    path, head = repo
+    local = _at(-10)
+    _change(path, "local\n", local)
+    sha = _commit_reflection(path, tmp_path, _reflection(head=head))
+    clock = rr.fix_clock(str(path), head, sha)
+    assert clock == local
+    assert rr.clears(clock, _at(0))
+    assert not rr.clears(clock, _at(-20))
+    assert not rr.clears(clock, None)
+    assert rr.clears(None, None)
+    assert not rr.clears(rr.NEVER, _at(0))
+
+
+def test_an_expired_deadline_refuses(repo, tmp_path):
+    """The commit gate passes its own remaining time: running out is unknown,
+    never "nothing owed" and never a kill that fails open by accident."""
+    path, head = repo
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    with pytest.raises(rr.Refused, match="ran out of time"):
+        _covered(path, head, deadline=0.0)
+    assert _covered(path, head, deadline=None) == {"c1", "c2"}
+
+
+def test_git_under_a_deadline_is_bounded_by_it(monkeypatch):
+    seen = {}
+
+    def fake(argv, **kw):
+        seen["timeout"] = kw["timeout"]
+        raise subprocess.TimeoutExpired(argv, kw["timeout"])
+
+    monkeypatch.setattr(rr.subprocess, "run", fake)
+    import time
+
+    with rr.deadline_scope(time.monotonic() + 5), pytest.raises(rr.Refused, match="ran out"):
+        rr._run(["git", "status"])
+    assert 0 < seen["timeout"] <= 5
+    # With no deadline a timeout is an ordinary failed command, as before.
+    assert rr._run(["git", "status"])[0] == 1 and seen["timeout"] == 120
 
 
 def test_a_second_reflection_for_the_same_round_still_counts(repo, tmp_path):
@@ -1408,7 +1939,7 @@ def test_an_acceptance_point_maps_within_one_covered_scope_line(scopes, ok):
 
 
 def test_an_open_round_with_unknown_keys_still_reports_its_timing():
-    """GLM secondary P3: owed stays unknown, but the settle window is still
+    """Secondary review P3: owed stays unknown, but the settle window is still
     reported, so a reader can tell when the round settles."""
     got = rr.owed_state(_budget(reflection_keys="unknown"), (), now=T0 + timedelta(hours=1))
     assert got["owed"] is None
@@ -1470,6 +2001,64 @@ def test_status_subtracts_what_is_covered(repo, tmp_path, monkeypatch):
     assert got["owed"] == ["c2"] and got["settled"]
 
 
+def test_status_judges_each_open_key_by_its_review_in_the_budget(repo, tmp_path, monkeypatch):
+    """The budget's own review times reach the credit rule: a commit made
+    after the head and before the reviews is no fix, after them it is."""
+    path, head = repo
+    _change(path, "local\n", _at(-10))
+    _commit_reflection(path, tmp_path, _reflection(head=head))
+    reviews = [
+        {"submitted_at": _at(0).isoformat(), "finding_keys": ["c1"]},
+        {"submitted_at": _at(-20).isoformat(), "finding_keys": ["c2"]},
+    ]
+    budget = _budget(
+        open_keys=["c1", "c2"],
+        current_head=head,
+        body="",
+        rounds=[{"head": head, "reviews": reviews}],
+    )
+    assert _status_with(monkeypatch, path, budget)["owed"] == ["c2"]
+
+
+@pytest.mark.parametrize(
+    "first, second, want",
+    [
+        (_at(0), _at(30), _at(0)),
+        (_at(30), _at(0), _at(0)),
+        (None, _at(0), None),
+        (_at(0), None, None),
+    ],
+)
+def test_a_key_listed_twice_takes_its_earliest_or_unknown_time(first, second, want):
+    def review(when):
+        return {"submitted_at": when.isoformat() if when else None, "finding_keys": ["c1"]}
+
+    budget = _budget(rounds=[{"head": HEAD, "reviews": [review(first), review(second)]}])
+    assert rr._open_review_times(budget) == {"c1": want}
+
+
+def test_status_is_owed_from_budget_plus_who_and_what_went_wrong(repo, tmp_path, monkeypatch):
+    """One answer for status and the commit gate: status adds only the PR and
+    the budget's errors to what owed_from_budget says."""
+    path, head = repo
+    _commit_reflection(path, tmp_path, _reflection(keys=("c1",), head=head))
+    budget = _budget(open_keys=["c1", "c2"], current_head=head, body="", errors=["e"])
+    got = _status_with(monkeypatch, path, budget)
+    shared = rr.owed_from_budget(
+        str(path), budget, "o/r", 7, now=T0 + timedelta(hours=1), cutover=rr.REFLECTION_CUTOVER_ISO
+    )
+    assert got == {**shared, "repo": "o/r", "pr": 7, "errors": ["e"]}
+    assert got["owed"] == ["c2"]
+
+
+def test_owed_from_budget_refuses_past_its_deadline(repo, tmp_path):
+    path, head = repo
+    _commit_reflection(path, tmp_path, _reflection(keys=("c1",), head=head))
+    budget = _budget(open_keys=["c1"], current_head=head, body="")
+    with pytest.raises(rr.Refused, match="ran out of time"):
+        rr.owed_from_budget(str(path), budget, "o/r", 7, now=T0, cutover=None, deadline=0.0)
+
+
 def test_unreadable_git_is_refused_never_nothing_owed(tmp_path):
     with pytest.raises(rr.Refused):
         rr.covered_keys(
@@ -1507,3 +2096,72 @@ def test_an_unexpected_error_in_status_is_cannot_check_not_invalid(monkeypatch):
 
     monkeypatch.setattr(rr, "status", boom)
     assert rr.main(["status"]) == 2
+
+
+# -- the open round is the head's own entry, never rounds[-1] (#3302) --------
+
+OLD = "b" * 40
+
+
+def _entry(head: str, minutes: int, key: str) -> dict:
+    review = {"submitted_at": _at(minutes).isoformat(), "finding_keys": [key]}
+    return {"head": head, "reviews": [review]}
+
+
+def _head_listed_first(**over):
+    """An open round on HEAD whose entry is listed BEFORE an older round's, as a
+    commit list ordered by date puts it after a rebase or cherry-pick."""
+    return _budget(
+        count=2,
+        open_keys=["c2"],
+        rounds=[_entry(HEAD, 5, "c2"), _entry(OLD, 0, "c1")],
+        **over,
+    )
+
+
+def test_the_open_round_is_read_by_the_heads_identity():
+    got = rr.owed_state(_head_listed_first(), [], now=_at(60))
+    assert got["owed"] == ["c2"] and got["round_head"] == HEAD
+    assert got["round_started"] == _at(5).isoformat()
+    assert rr._open_review_times(_head_listed_first()) == {"c2": _at(5)}
+
+
+def test_prior_heads_are_every_round_but_the_heads_own(monkeypatch):
+    seen = {}
+
+    def covered(cwd, head, **kw):
+        seen.update(kw, head=head)
+        return set()
+
+    monkeypatch.setattr(rr, "covered_keys", covered)
+    budget = _head_listed_first()
+    rr._open_covered("/x", budget, rr.owed_state(budget, [], now=_at(60)), None)
+    assert seen["head"] == HEAD and seen["prior_heads"] == [OLD]
+    assert seen["reviewed_at"] == {"c2": _at(5)}
+
+
+@pytest.mark.parametrize(
+    "rounds",
+    [
+        [{"head": OLD, "reviews": []}],  # the producer says open, no entry for the head
+        [{"head": HEAD, "reviews": []}, {"head": HEAD, "reviews": []}],  # two entries
+    ],
+)
+def test_an_open_round_without_one_entry_for_the_head_owes_unknown(rounds):
+    got = rr.owed_state(_budget(rounds=rounds), [], now=_at(60))
+    assert got["owed"] is None and got["round_started"] is None
+
+
+def test_owed_from_budget_keeps_an_inconsistent_open_round_unknown(repo):
+    """Coverage narrows a KNOWN debt only; it never turns None into a list."""
+    path, head = repo
+    budget = _budget(current_head=head, body="", rounds=[_entry(OLD, 0, "c1")])
+    got = rr.owed_from_budget(str(path), budget, "o/r", 7, now=T0, cutover=None)
+    assert got["owed"] is None
+
+
+def test_a_complete_round_names_no_round_head():
+    """``round_head`` was the newest entry by list order, a guess; with no round
+    open there is no head-owned round to name."""
+    got = rr.owed_state(_budget(round_state="complete"), [], now=T0)
+    assert got["round_head"] is None and got["owed"] == []

@@ -1,0 +1,21 @@
+#!/bin/bash
+# Codex permits ordinary hook errors. Require our evaluator's explicit allow.
+# Advisory JSON stays on stdout; the private decision token never reaches Codex.
+# Explained denials carry fd 3's signal. The future profile wrapper also catches
+# missing/broken launchers. Outer-hook startup failure/kill/timeout still fails open.
+hook_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd) || exit 2
+rc=0
+output=$(python3 "$hook_dir/codex_validator_adapter.py") || rc=$?
+decision=${output%%$'\n'*}
+if [ "$rc" -eq 0 ] && [ "$decision" = "allow" ]; then
+    if [[ "$output" == *$'\n'* ]]; then
+        printf '%s\n' "${output#*$'\n'}"
+    fi
+    { printf 'allow\n' >&3; } 2>/dev/null
+    exit 0
+fi
+if ! { [ "$rc" -eq 2 ] && [ "$output" = "deny" ]; }; then
+    printf '%s\n' 'BLOCKED: Validator adapter did not explicitly allow. Stop and raise this with the owner.' >&2
+fi
+{ printf 'deny\n' >&3; } 2>/dev/null
+exit 2

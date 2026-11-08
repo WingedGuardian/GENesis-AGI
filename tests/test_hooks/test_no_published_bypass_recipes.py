@@ -171,12 +171,12 @@ _ALLOWED: dict[tuple[str, str, str], str] = {
     # describes the same CLOSED defect — the destructive guard's own continuation
     # fold, fixed to fold only odd backslash runs — so none of them hands a reader a
     # working shape.
-    (".claude/skills/genesis-development/SKILL.md", "backslash-newline", "bypass"): (
+    (".claude/skills/build-session/SKILL.md", "backslash-newline", "bypass"): (
         "The skill's own worked example of a false structural claim: it quotes the "
         "wrong premise and explains why it was wrong. The defect it describes, in "
         "the destructive guard's fold, was fixed before the example was written."
     ),
-    (".claude/skills/genesis-development/SKILL.md", "continuation", "bypass"): (
+    (".claude/skills/build-session/SKILL.md", "continuation", "bypass"): (
         "The same worked example as the triple above, spelled 'continuation' in "
         "its later paragraphs: the fixed destructive-guard fold. (The permission-"
         "mode heading nearby is already exempted by _MODE_NAME_RE — checked, not "

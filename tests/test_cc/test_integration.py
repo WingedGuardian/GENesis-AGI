@@ -5,15 +5,17 @@ and inside a Claude Code session (CLAUDECODE env var set).
 """
 
 import os
+import shutil
 
 import pytest
 
 from genesis.cc.invoker import CCInvoker
 from genesis.cc.types import CCInvocation
+from tests._live_fence import _S
 
 _skip_no_claude = pytest.mark.skipif(
-    os.environ.get("GENESIS_LIVE_E2E") != "1",
-    reason="calls the real Claude API; opt in with GENESIS_LIVE_E2E=1",
+    os.environ.get("GENESIS_LIVE_E2E") != "1" or shutil.which("claude", path=_S.orig_path) is None,
+    reason="requires an installed Claude CLI and opt-in with GENESIS_LIVE_E2E=1",
 )
 _skip_inside_cc = pytest.mark.skipif(
     os.environ.get("CLAUDECODE") == "1",

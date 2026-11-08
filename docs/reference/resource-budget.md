@@ -150,21 +150,26 @@ reservation. Two `run`s started within a few seconds of each other can both
 be admitted, since neither scope exists yet when the other checks. CPU is
 compressible and capped by the quota, so it is not reserved.
 
-SIGINT, SIGTERM and SIGHUP to `run` stop the scope (and the launch itself, if
-the signal arrives before systemd has registered it); `run` does not wait for the
-job to finish stopping. A second signal escalates to SIGKILL, which matters for
-an uncapped job that ignores SIGTERM. A watchdog checks every 10 seconds;
+SIGINT, SIGTERM and SIGHUP to `run` request cooperative shutdown. The first caller
+signal sends SIGTERM; `run` keeps waiting for the owned child and acknowledged
+scope, including descendants remaining after the leader exits. A second caller
+signal forces SIGKILL. There is no automatic force deadline on that first caller
+signal. Before scope registration, only the owned process group can be signalled;
+an intended unit name alone grants no authority. A watchdog checks every 10 seconds;
 if the box stays over the line for 60 seconds (container memory or a disk named
 with `--disk`, in any combination), it stops this job. It stops this job even when other work caused the
 pressure, because this is the job Genesis can stop safely; it never touches
-anything else. A resource approved with `--approved-over-line` is not watched.
+anything else. A watchdog-originated stop alone arms a ten-second SIGKILL deadline,
+which remains active while the acknowledged scope has children after leader exit.
+That deadline does not count as another caller signal. A resource approved with
+`--approved-over-line` is not watched. Unverifiable scope cleanup reports incomplete
+cleanup rather than verified completion.
 
-Without `systemd-run` or a reachable systemd user manager the job runs
-UNCAPPED, under `nice 19` and a data-segment limit (`RLIMIT_DATA`) of `--ram`;
-the output says so. An address-space limit is not used, because runtimes such
-as the JVM, node and OpenBLAS reserve address ranges they never touch and fail
-to start under one. An uncapped job is invisible to other sessions' `status`
-and `preflight`.
+Without `systemd-run` or a reachable systemd user manager, launch is refused.
+Existing scopes whose caps are unenforced or unreadable retain their explicit
+warnings and `nice 19` / data-segment-limit fallback. These warnings do not certify
+hard caps. An address-space limit is not used, because runtimes such as the JVM,
+node and OpenBLAS reserve address ranges they never touch and fail to start under one.
 
 `run` is for non-interactive jobs: the job runs in its own session, without a
 controlling terminal, so password prompts (ssh, sudo, git credentials) fail.
@@ -181,8 +186,10 @@ under `--json`), and the job's own report lines start with `genesis-job`.
 - `run` reads its limits and exit figures (peak memory, CPU time, cap kills)
   from cgroup v2 files. On cgroup v1 it warns that it cannot verify the caps and
   the exit report omits those figures.
-- A job that ignores SIGTERM keeps running until the scope's own stop timeout
-  (systemd's default is 90 s), though `run` has already reported its exit.
+- Caller-requested cooperative shutdown can wait indefinitely for a job that
+  ignores SIGTERM; send a second cancellation to force it. Scope signal delivery
+  alone does not start systemd's stop-timeout escalation. Watchdog stops have
+  their separate ten-second deadline.
 - CPU reads cgroup v2 only. On cgroup v1, capacity is the affinity count and use
   comes from `/proc/stat`, which inside a container may cover the whole host.
 - Where the cgroup has no `*.pressure` files, PSI comes from `/proc/pressure`,

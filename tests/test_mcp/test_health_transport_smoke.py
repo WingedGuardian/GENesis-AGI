@@ -55,6 +55,8 @@ _REQUIRED_TOOLS = frozenset({
     "health_status",
     "bootstrap_manifest",
     "update_history_recent",
+    # The card-payment tool.
+    "browser_fill_card",
 })
 
 

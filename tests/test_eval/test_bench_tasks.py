@@ -120,7 +120,7 @@ def test_bench_rubric_registered_and_calibration_shaped():
     from genesis.eval.rubrics import get_rubric, list_rubrics
 
     rubric = get_rubric("bench_task_success")
-    assert rubric.version == "1.0.0"
+    assert rubric.version == "1.1.0"
     assert rubric.name in {r.name for r in list_rubrics()}
     assert rubric.extra_placeholders == ("task_prompt",)
 

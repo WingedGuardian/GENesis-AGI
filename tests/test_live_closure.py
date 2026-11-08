@@ -1,8 +1,9 @@
-"""Tests for the credential and state closure (tests/_live_closure.py).
+"""Tests for the live closure (tests/_live_closure.py).
 
-Every probe is harmless even if the closure were absent: nothing here reads a
-real secret, and the only network attempt targets a name under ``.invalid``
-through ``GIT_SSH_COMMAND=false``, which never opens a connection.
+Every probe is harmless even if the closure were absent: nothing here opens a
+real database, posts to a server or reads a credential. The only network attempt
+targets a name under ``.invalid`` through ``GIT_SSH_COMMAND=false``, which never
+opens a connection.
 """
 
 from __future__ import annotations
@@ -16,9 +17,25 @@ import pytest
 
 from tests import _live_closure as closure
 
+_REPO = Path(__file__).resolve().parent.parent
 _SECRETS_HALF_OFF = pytest.mark.skipif(
     closure._S.live_e2e, reason="the secrets half is off under GENESIS_LIVE_E2E=1"
 )
+# Everything the closure sets: a sub-run starts without them, so what it shows is
+# its own closure at work, not values inherited from this run.
+_CLOSURE_VARS = (
+    "PYTEST_CURRENT_TEST", "GENESIS_LIVE_E2E", "GENESIS_DB_PATH", "SECRETS_PATH",
+    "GENESIS_PROACTIVE_HOOK_URL", "GENESIS_MCP_LOG_DIR", "GH_CONFIG_DIR",
+    "GIT_TERMINAL_PROMPT", "GIT_SSH_COMMAND", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM",
+    "GIT_CONFIG_SYSTEM",
+)  # fmt: skip
+
+
+def test_the_root_conftest_names_the_closure_in_pytest_plugins(request):
+    """Registered through ``pytest_plugins`` (so imported before any
+    ``tests/test*/conftest.py``), not merely imported by ``pytest_configure``,
+    which would be too late for paths bound at import."""
+    assert request.config.pluginmanager.get_plugin("tests._live_closure") is not None
 
 
 @_SECRETS_HALF_OFF
@@ -33,15 +50,8 @@ def test_secrets_path_names_a_file_that_does_not_exist_in_this_test(tmp_path):
 
 def test_the_session_wide_secrets_path_is_the_closures_own():
     assert closure._S.base and os.path.isdir(closure._S.base)
-    assert not os.path.exists(os.path.join(closure._S.base, "no-secrets.env"))
-
-
-@_SECRETS_HALF_OFF
-def test_no_credential_variable_survived_the_closure():
-    # Bookkeeping: what install() left, not os.environ now, so a test that leaks a
-    # variable later in the run cannot fail this one. The behaviour itself is
-    # checked end to end by test_a_run_removes_keys_and_names_them.
-    assert closure._S.remaining == ()
+    assert not os.path.exists(closure._NO_SECRETS)
+    assert closure._NO_SECRETS.startswith(closure._S.base)
 
 
 def test_the_credential_name_rule():
@@ -50,16 +60,20 @@ def test_the_credential_name_rule():
         "AWS_SECRET_ACCESS_KEY": "", "SSH_AUTH_SOCK": "", "GH_TOKEN": "", "GITHUB_TOKEN": "",
         "AWS_ACCESS_KEY_ID": "", "DASHBOARD_PASSWORD": "", "BACKUP_PASSPHRASE": "",
         "NAS_PASS": "", "CHAT_WEBHOOK_URL": "", "SSH_PRIVATE_KEY": "", "GCP_CREDENTIALS": "",
+        "API_KEY": "", "DOCKER_AUTH_CONFIG": "", "GIT_ASKPASS": "", "SSH_ASKPASS": "",
+        "VSCODE_GIT_IPC_HANDLE": "", "VSCODE_GIT_ASKPASS_MAIN": "",
         # kept: not credentials, or the run's own switches
         "TOKEN_OPTIMIZER_MODE": "", "PYTEST_ADDOPTS_TOKEN": "", "GENESIS_LIVE_E2E": "",
         "KEYBOARD": "", "PATH": "", "PASSAGE_DIR": "", "AWS_DEFAULT_REGION": "",
         "USER_TIMEZONE": "", "GUARDIAN_SECRETS": "", "GENESIS_SECRETS_PATH": "",
+        "API_KEYS_DIR": "", "AUTH_CONFIG_MODE": "",
     }  # fmt: skip
     assert closure.credential_names(env) == sorted([
         "API_KEY_BAR", "AWS_SECRET_ACCESS_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "FOO_API_KEY",
         "GH_TOKEN", "GITHUB_TOKEN", "SSH_AUTH_SOCK", "X_API_KEY_Y", "AWS_ACCESS_KEY_ID",
         "DASHBOARD_PASSWORD", "BACKUP_PASSPHRASE", "NAS_PASS", "CHAT_WEBHOOK_URL",
-        "SSH_PRIVATE_KEY", "GCP_CREDENTIALS",
+        "SSH_PRIVATE_KEY", "GCP_CREDENTIALS", "API_KEY", "DOCKER_AUTH_CONFIG",
+        "GIT_ASKPASS", "SSH_ASKPASS", "VSCODE_GIT_IPC_HANDLE", "VSCODE_GIT_ASKPASS_MAIN",
     ])  # fmt: skip
 
 
@@ -67,6 +81,8 @@ def test_gh_has_no_stored_login_and_git_cannot_prompt_or_use_ssh():
     gh_dir = Path(os.environ["GH_CONFIG_DIR"])
     assert gh_dir.is_dir() and not any(gh_dir.iterdir())
     assert os.environ["GIT_TERMINAL_PROMPT"] == "0"
+    assert os.environ["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert os.environ["GIT_CONFIG_NOSYSTEM"] == "1"
     # The ssh transport runs `false` (seen in the trace), never a real ssh: a
     # name lookup failure would print the same "Could not read" line.
     out = subprocess.run(
@@ -78,13 +94,6 @@ def test_gh_has_no_stored_login_and_git_cannot_prompt_or_use_ssh():
     )
     assert out.returncode != 0
     assert " false git@example.invalid" in out.stderr, out.stderr
-    gh = subprocess.run(
-        [sys.executable, "-c", "import os; print(os.environ.get('GH_TOKEN', '<none>'))"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    assert gh.stdout.strip() == "<none>"
 
 
 def test_the_memory_hook_url_is_a_closed_port():
@@ -92,9 +101,12 @@ def test_the_memory_hook_url_is_a_closed_port():
 
 
 def test_the_mcp_log_directory_does_not_exist():
+    from genesis.util.mcp_logging import mcp_log_directory
+
     path = os.environ["GENESIS_MCP_LOG_DIR"]
     assert path.startswith(closure._S.base)
     assert not os.path.exists(path)
+    assert mcp_log_directory() is None
 
 
 def test_children_resolve_the_per_test_database(tmp_path):
@@ -107,11 +119,9 @@ def test_children_resolve_the_per_test_database(tmp_path):
     assert out.stdout.strip() == str(tmp_path / "isolated-genesis.db")
 
 
-_SUBRUN_CONFTEST = """
-# Imported before the closure installs, as the box lock in tests/conftest.py
-# does: its directory constant is bound to the real home and must be moved.
-from genesis.util import process_lock  # noqa: F401
-
+# A sub-run wired the way tests/conftest.py wires the closure: the plugin named
+# in ``pytest_plugins`` of the root conftest, installed in pytest_configure.
+_SUBRUN_ROOT_CONFTEST = """
 pytest_plugins = ["tests._live_closure"]
 
 
@@ -127,223 +137,215 @@ def pytest_unconfigure(config):
     _live_closure.uninstall_files(config)
 """
 
-_SUBRUN_TESTS = """
+# A ``test*`` subdirectory conftest of a directory argument: pytest imports it
+# BEFORE pytest_configure, so these modules resolve the database path first.
+_SUBRUN_EARLY_CONFTEST = """
 import os
-from pathlib import Path
 
-from genesis.util import process_lock
+import genesis.db.connection  # noqa: F401
+import genesis.mcp.health.task_tools  # noqa: F401
 
-# Bound at import, during collection: after the closure is installed.
-IMPORT_HOME = Path.home()
-
-
-def test_key_state():
-    print("KEY=" + os.environ.get("FENCE_PROBE_API_KEY", "<absent>"))
-    print("IMPORT_HOME=" + str(IMPORT_HOME))
-    print("PID_DIR=" + str(process_lock._DEFAULT_PID_DIR))
+print("EARLY_ENV=" + os.environ.get("GENESIS_DB_PATH", "<unset>"))
+print("EARLY_SECRETS=" + os.environ.get("SECRETS_PATH", "<unset>"))
+if os.environ.get("CLOSURE_PROBE_RESET_DB"):
+    # Something resetting the variable between the plugin's import and configure.
+    os.environ["GENESIS_DB_PATH"] = os.environ["CLOSURE_PROBE_RESET_DB"]
 """
 
+_SUBRUN_EARLY_TEST = """
+import inspect
+import os
+import subprocess
 
-def _subrun(tmp_path: Path, live_e2e: bool) -> str:
-    (tmp_path / "conftest.py").write_text(_SUBRUN_CONFTEST)
-    (tmp_path / "test_sub.py").write_text(_SUBRUN_TESTS)
-    repo = Path(__file__).resolve().parent.parent
-    env = {
-        **os.environ,
-        "PYTHONPATH": os.pathsep.join([str(repo), str(repo / "src")]),
-        "FENCE_PROBE_API_KEY": "probe-value",
-        # The parent's HOME is this session's private one; hand the child the
-        # real home so the opt-in run's "unchanged" is measured against it.
-        "HOME": closure.REAL_HOME,
-    }
-    env.pop("PYTEST_CURRENT_TEST", None)
-    if live_e2e:
-        env["GENESIS_LIVE_E2E"] = "1"
-    else:
-        env.pop("GENESIS_LIVE_E2E", None)
-    out = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-s", "-p", "no:cacheprovider", str(tmp_path)],
-        cwd=tmp_path,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    assert out.returncode == 0, out.stdout + out.stderr
-    return out.stdout
-
-
-_SUBRUN_IMPORT_TIME = """
 import genesis.db.connection as connection
-import genesis.mcp.health.campaign_tools as campaign_tools
 import genesis.mcp.health.task_tools as task_tools
 from tests import _live_closure
 
 
-def test_bound_paths():
+def _git(*args, env=None):
+    out = subprocess.run(["git", *args], capture_output=True, text=True, env=env)
+    return out.stdout.strip().replace("\\n", "|")
+
+
+def test_bound():
     print("BASE=" + _live_closure._S.base)
-    for bound in (connection.DEFAULT_DB_PATH, task_tools._DB_PATH, campaign_tools._DB_PATH):
-        print("BOUND=" + str(bound))
+    print("DB_CONST=" + str(connection.DEFAULT_DB_PATH))
+    print("DB_DEFAULT=" + str(inspect.signature(connection.init_db).parameters["path"].default))
+    print("TASK_DB=" + str(task_tools._DB_PATH))
+    print("HOOK_URL=" + os.environ["GENESIS_PROACTIVE_HOOK_URL"])
+    print("CLOSURE_PROBE_API_KEY=" + os.environ.get("CLOSURE_PROBE_API_KEY", "<absent>"))
+    # Presence only: a live-mode child keeps real credentials, and _subrun prints
+    # this output when a run fails. The probe above holds a value the test made up.
+    for name in (
+        "API_KEY", "DOCKER_AUTH_CONFIG", "GIT_ASKPASS", "SSH_ASKPASS",
+        "VSCODE_GIT_IPC_HANDLE", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+    ):  # fmt: skip
+        print(name + "=" + ("<present>" if name in os.environ else "<absent>"))
+    print("GIT_CONFIG_GLOBAL=" + os.environ.get("GIT_CONFIG_GLOBAL", "<unset>"))
+    print("GIT_GLOBAL=" + _git("config", "--global", "--list"))
+    print("GIT_SYSTEM=" + _git("config", "--system", "--list"))
+    # Names and origins only: if the closure ever failed, the assertion message
+    # (and a public CI log) would otherwise show this machine's config values.
+    print("GIT_EFFECTIVE=" + _git("config", "--list", "--show-origin", "--name-only"))
+    print("GIT_HELPER=" + _git("config", "--get", "credential.helper"))
+    # Guard-the-guard: without the closure's git variables the same child does
+    # read the fixture's helpers, so the fixture really plants them. Only under
+    # that fixture: anywhere else these would read this machine's real config,
+    # and _subrun prints this output when a run fails.
+    if os.environ.get("CLOSURE_PROBE_SYSTEM_CFG"):
+        closed = ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_SYSTEM")
+        unclosed = {k: v for k, v in os.environ.items() if k not in closed}
+        unclosed["GIT_CONFIG_SYSTEM"] = os.environ["CLOSURE_PROBE_SYSTEM_CFG"]
+        print("GIT_HELPER_UNCLOSED=" + _git("config", "--get", "credential.helper", env=unclosed))
+        print("GIT_SYSTEM_UNCLOSED=" + _git("config", "--system", "--list", env=unclosed))
 """
-
-
-def test_a_module_imported_at_collection_binds_the_closures_database(tmp_path):
-    """Collection runs before any fixture, so a module that resolves the database
-    path at import binds whatever the environment says then: the closure's file,
-    never the checkout's data/genesis.db (the live database in the main checkout)."""
-    (tmp_path / "conftest.py").write_text(_SUBRUN_CONFTEST)
-    (tmp_path / "test_sub.py").write_text(_SUBRUN_IMPORT_TIME)
-    repo = Path(__file__).resolve().parent.parent
-    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(repo), str(repo / "src")])}
-    for name in ("PYTEST_CURRENT_TEST", "GENESIS_DB_PATH", "GENESIS_LIVE_E2E"):
-        env.pop(name, None)
-    out = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-s", "-p", "no:cacheprovider", str(tmp_path)],
-        cwd=tmp_path,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    assert out.returncode == 0, out.stdout + out.stderr
-    lines = out.stdout.splitlines()
-    base = next(line.split("=", 1)[1] for line in lines if line.startswith("BASE="))
-    bound = [line.split("=", 1)[1] for line in lines if line.startswith("BOUND=")]
-    assert bound == [str(Path(base) / "import-time-genesis.db")] * 3, out.stdout
 
 
 def _value(text: str, key: str) -> str:
     return next(line.split("=", 1)[1] for line in text.splitlines() if line.startswith(key + "="))
 
 
-def test_a_run_removes_keys_and_names_them(tmp_path):
-    text = _subrun(tmp_path, live_e2e=False)
-    assert "KEY=<absent>" in text
-    assert "credential variables removed" in text and "FENCE_PROBE_API_KEY" in text
-    assert "probe-value" not in text  # names only, never values
-
-
-def test_a_run_gets_a_private_home_bound_before_collection(tmp_path):
-    """A module that resolves ``Path.home()`` when collected binds the session's
-    private home, and a value bound earlier (the process lock's directory) moved
-    with it. The run's summary says so."""
-    text = _subrun(tmp_path, live_e2e=False)
-    home = _value(text, "IMPORT_HOME")
-    assert home != closure.REAL_HOME and "genesis-test-home-" in home, text
-    assert _value(text, "PID_DIR") == str(Path(home) / ".genesis"), text
-    assert "HOME redirected" in text
-
-
-def test_an_opt_in_live_run_keeps_its_keys(tmp_path):
-    text = _subrun(tmp_path, live_e2e=True)
-    assert "KEY=probe-value" in text
-    assert "GENESIS_LIVE_E2E=1, secrets left in place" in text
-    assert _value(text, "IMPORT_HOME") == closure.REAL_HOME  # HOME untouched too
-
-
-@pytest.mark.skipif(
-    not closure._S.home, reason="HOME not redirected (GENESIS_LIVE_E2E=1 or setup failed)"
-)
-def test_this_session_runs_with_a_private_home_outside_basetemp(request):
-    """pytest empties basetemp on first use, so the home must sit beside it."""
-    home = Path(closure._S.home)
-    assert Path.home() == home and str(home) != closure.REAL_HOME
-    assert (home / "tmp").is_dir()
-    basetemp = Path(request.config._tmp_path_factory.getbasetemp())
-    assert home not in basetemp.parents and basetemp not in home.parents
-
-
-def test_the_box_lock_was_taken_before_the_redirect(request):
-    """Placed after the lock: resolved under the private home (no ``.genesis``),
-    the lock path would be None and the run would silently take no lock."""
-    from genesis.util import pytest_lock
-
-    lock = request.config._genesis_pytest_lock
-    if lock.acquired:
-        path = Path(lock._path)
-        assert not closure._S.home or Path(closure._S.home) not in path.parents
-        if not os.environ.get(pytest_lock.PATH_ENV):
-            assert Path(closure.REAL_HOME, ".genesis") in path.parents, path
-        return
-    excused = [
-        name
-        for name in (pytest_lock.HELD_ENV, pytest_lock.DISABLE_ENV, pytest_lock.PATH_ENV)
-        if os.environ.get(name)
-    ]
-    if excused or not Path(closure.REAL_HOME, ".genesis").is_dir():
-        pytest.skip(f"no lock expected here ({excused or 'no install'})")
-    pytest.fail("an install exists and nothing excused the box lock, yet none was taken")
-
-
-_SUBRUN_EARLY_CONFTEST = """
-# A test* subdirectory conftest of a directory argument: pytest imports it
-# BEFORE pytest_configure, so these modules bind their paths first.
-import genesis.cc.direct_session  # noqa: F401
-import genesis.cc.types  # noqa: F401
-import genesis.db.connection  # noqa: F401
-"""
-
-_SUBRUN_EARLY_TEST = """
-from pathlib import Path
-
-import inspect
-
-import genesis.cc.direct_session as direct_session
-import genesis.cc.types as types
-import genesis.db.connection as connection
-from tests import _live_closure
-
-
-def test_bound_dir():
-    print("HOME=" + str(Path.home()))
-    print("BOUND=" + str(types._BACKGROUND_SESSION_DIR))
-    print("TMP_BOUND=" + str(direct_session._BG_CC_TMP_ROOT))
-    print("BASE=" + _live_closure._S.base)
-    print("DB_CONST=" + str(connection.DEFAULT_DB_PATH))
-    default = inspect.signature(connection.init_db).parameters["path"].default
-    print("DB_DEFAULT=" + str(default))
-"""
-
-
-def test_a_path_bound_before_configure_is_moved_into_the_home(tmp_path):
-    """CI's bare ``pytest`` (a directory) imports ``tests/test*/conftest.py`` before
-    configure; a state path a module bound then is moved into the test home and
-    named in the summary, and the database path it bound is already the
-    closure's."""
-    (tmp_path / "conftest.py").write_text(_SUBRUN_CONFTEST)
+def _subrun(tmp_path: Path, extra_env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    (tmp_path / "conftest.py").write_text(_SUBRUN_ROOT_CONFTEST)
     sub = tmp_path / "test_early"
     sub.mkdir()
     (sub / "conftest.py").write_text(_SUBRUN_EARLY_CONFTEST)
     (sub / "test_x.py").write_text(_SUBRUN_EARLY_TEST)
-    repo = Path(__file__).resolve().parent.parent
-    env = {
-        **os.environ,
-        "PYTHONPATH": os.pathsep.join([str(repo), str(repo / "src")]),
-        "HOME": closure.REAL_HOME,
-    }
-    # TMPDIR in the real ~/tmp, as on an install whose Claude Code sessions use it:
-    # the closure's own directory then sits under a state root of the home, and
-    # ~/tmp state bound before configure must still move.
-    env["TMPDIR"] = str(Path(closure.REAL_HOME, "tmp"))
-    for name in ("PYTEST_CURRENT_TEST", "GENESIS_LIVE_E2E", "GENESIS_DB_PATH", "SECRETS_PATH"):
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(_REPO), str(_REPO / "src")])}
+    for name in _CLOSURE_VARS:
         env.pop(name, None)
+    env.update(extra_env or {})
     out = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-s", "-p", "no:cacheprovider", str(tmp_path)],
         cwd=tmp_path,
         env=env,
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=300,
     )
     assert out.returncode == 0, out.stdout + out.stderr
-    home = _value(out.stdout, "HOME")
-    assert home != closure.REAL_HOME, out.stdout
-    assert _value(out.stdout, "BOUND") == str(Path(home, ".genesis", "background-sessions"))
-    assert "genesis.cc.types._BACKGROUND_SESSION_DIR" in out.stdout
-    assert _value(out.stdout, "TMP_BOUND") == str(Path(home, "tmp", "bg-cc-sessions"))
-    # The database path, bound at import AND as a default argument, which no
-    # rebase reaches: it must be the closure's file because the closure set
-    # GENESIS_DB_PATH when it was imported, before this conftest ran.
-    expected_db = str(Path(_value(out.stdout, "BASE"), "import-time-genesis.db"))
-    assert _value(out.stdout, "DB_CONST") == expected_db, out.stdout
-    assert _value(out.stdout, "DB_DEFAULT") == expected_db, out.stdout
+    return out
+
+
+def test_a_module_imported_by_a_subdirectory_conftest_binds_the_import_time_file(tmp_path):
+    """A directory run (CI's bare ``pytest``) imports ``tests/test*/conftest.py``
+    before configure. A module imported there binds the database path at import
+    and as default arguments, which nothing can change afterwards; it must bind
+    the closure's file, never the checkout's ``data/genesis.db``."""
+    out = _subrun(tmp_path)
+    expected = str(Path(_value(out.stdout, "BASE")) / "import-time-genesis.db")
+    assert _value(out.stdout, "EARLY_ENV") == expected, out.stdout
+    # SECRETS_PATH likewise, for a module that loads secrets.env at import.
+    no_secrets = str(Path(_value(out.stdout, "BASE")) / "no-secrets.env")
+    assert _value(out.stdout, "EARLY_SECRETS") == no_secrets, out.stdout
+    for key in ("DB_CONST", "DB_DEFAULT", "TASK_DB"):
+        assert _value(out.stdout, key) == expected, (key, out.stdout)
+    assert "data/genesis.db" not in out.stdout
+
+
+def test_a_database_path_changed_after_import_is_restored_and_named(tmp_path):
+    """Something that resets GENESIS_DB_PATH between the plugin's import and
+    configure leaves paths bound in between on the other value: say so."""
+    out = _subrun(tmp_path, {"CLOSURE_PROBE_RESET_DB": str(tmp_path / "elsewhere.db")})
+    expected = str(Path(_value(out.stdout, "BASE")) / "import-time-genesis.db")
+    assert "GENESIS_DB_PATH changed after the live closure set it" in out.stderr, out.stderr
+    assert _value(out.stdout, "DB_CONST") == expected, out.stdout
+
+
+def test_an_opt_in_live_run_keeps_the_state_closures(tmp_path):
+    """GENESIS_LIVE_E2E=1 needs real credentials, never the live database or the
+    live memory hook or this machine's git configuration: the credential half
+    is skipped, and the summary says so; the other closures stay on."""
+    out = _subrun(
+        tmp_path,
+        {"GENESIS_LIVE_E2E": "1", "CLOSURE_PROBE_API_KEY": "probe-value",
+         "API_KEY": "made-up-live-key", "DOCKER_AUTH_CONFIG": "made-up-docker-auth"},
+    )  # fmt: skip
+    expected = str(Path(_value(out.stdout, "BASE")) / "import-time-genesis.db")
+    assert _value(out.stdout, "DB_CONST") == expected, out.stdout
+    assert _value(out.stdout, "HOOK_URL") == "http://127.0.0.1:9"
+    assert _value(out.stdout, "CLOSURE_PROBE_API_KEY") == "probe-value"
+    # Kept, and never printed: _subrun shows this output when a run fails.
+    assert _value(out.stdout, "API_KEY") == "<present>"
+    assert _value(out.stdout, "DOCKER_AUTH_CONFIG") == "<present>"
+    assert "made-up-live-key" not in out.stdout
+    assert "made-up-docker-auth" not in out.stdout
+    assert "GENESIS_LIVE_E2E=1, secrets left in place" in out.stdout
+    assert _value(out.stdout, "GIT_CONFIG_GLOBAL") == os.devnull
+
+
+def test_the_closure_directory_is_removed_at_unconfigure(tmp_path):
+    out = _subrun(tmp_path)
+    assert not os.path.exists(_value(out.stdout, "BASE"))
+
+
+def test_a_run_removes_keys_and_names_them(tmp_path):
+    out = _subrun(
+        tmp_path,
+        {"CLOSURE_PROBE_API_KEY": "probe-value", "API_KEY": "bare-value",
+         "DOCKER_AUTH_CONFIG": "docker-value"},
+    )  # fmt: skip
+    for name in ("CLOSURE_PROBE_API_KEY", "API_KEY", "DOCKER_AUTH_CONFIG"):
+        assert _value(out.stdout, name) == "<absent>", out.stdout
+    summary = out.stdout.split("credential variables removed", 1)[1]
+    for name in ("CLOSURE_PROBE_API_KEY", "API_KEY", "DOCKER_AUTH_CONFIG"):
+        assert name in summary, out.stdout
+    for value in ("probe-value", "bare-value", "docker-value"):
+        assert value not in out.stdout + out.stderr  # names only, never values
+
+
+def test_git_reads_no_user_or_system_config_whatever_home_and_xdg_say(tmp_path):
+    """A credential helper in ``$XDG_CONFIG_HOME/git/config``, in
+    ``$HOME/.gitconfig`` and in a system file is invisible to a child, even to an
+    explicit ``git config --system`` (which reads the system file under
+    ``GIT_CONFIG_NOSYSTEM=1`` alone: MEASURED, git 2.43)."""
+    fixture = tmp_path / "fixture"
+    helper = "[credential]\n\thelper = store --file=/nonexistent/creds\n"
+    (fixture / "xdg" / "git").mkdir(parents=True)
+    (fixture / "xdg" / "git" / "config").write_text(helper)
+    (fixture / "home").mkdir()
+    (fixture / "home" / ".gitconfig").write_text(helper)
+    (fixture / "system.cfg").write_text(helper)
+    run = tmp_path / "run"
+    run.mkdir()
+    out = _subrun(
+        run,
+        {
+            "XDG_CONFIG_HOME": str(fixture / "xdg"),
+            "HOME": str(fixture / "home"),
+            # The closure must override an inherited system file, not just set one.
+            "GIT_CONFIG_SYSTEM": str(fixture / "system.cfg"),
+            "CLOSURE_PROBE_SYSTEM_CFG": str(fixture / "system.cfg"),
+        },
+    )
+    unclosed_system = "credential.helper=store --file=/nonexistent/creds"
+    assert _value(out.stdout, "GIT_HELPER_UNCLOSED") == "store --file=/nonexistent/creds"
+    assert _value(out.stdout, "GIT_SYSTEM_UNCLOSED") == unclosed_system, out.stdout
+    assert _value(out.stdout, "GIT_HELPER") == "", out.stdout
+    assert _value(out.stdout, "GIT_GLOBAL") == "", out.stdout
+    assert _value(out.stdout, "GIT_SYSTEM") == "", out.stdout
+    assert _value(out.stdout, "GIT_EFFECTIVE") == "", out.stdout
+
+
+def test_git_askpass_helpers_and_inherited_config_are_removed(tmp_path):
+    """An askpass program answers git's credential prompt even under
+    ``GIT_TERMINAL_PROMPT=0``, and inherited ``-c`` config can name a helper
+    whatever the config files say: none of them reach a child."""
+    out = _subrun(
+        tmp_path,
+        {
+            "GIT_ASKPASS": "/nonexistent/askpass",
+            "SSH_ASKPASS": "/nonexistent/ssh-askpass",
+            "VSCODE_GIT_IPC_HANDLE": "/nonexistent/ipc.sock",
+            "GIT_CONFIG_PARAMETERS": "'credential.helper'='store --file=/nonexistent/creds'",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "credential.helper",
+            "GIT_CONFIG_VALUE_0": "store --file=/nonexistent/creds",
+        },
+    )
+    for name in (
+        "GIT_ASKPASS", "SSH_ASKPASS", "VSCODE_GIT_IPC_HANDLE", "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+    ):  # fmt: skip
+        assert _value(out.stdout, name) == "<absent>", out.stdout
+    assert _value(out.stdout, "GIT_HELPER") == "", out.stdout

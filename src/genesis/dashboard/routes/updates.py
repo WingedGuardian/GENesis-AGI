@@ -25,8 +25,9 @@ from genesis.dashboard.update_marker import (
     release_marker,
 )
 from genesis.db.connection import connect_sqlite_rw
-from genesis.env import genesis_home, update_in_progress
+from genesis.env import genesis_home, read_update_state, update_in_progress
 from genesis.observability.deploy_record import row_facts
+from genesis.util.systemd import literal_scope_args
 
 logger = logging.getLogger(__name__)
 
@@ -437,7 +438,7 @@ def _systemd_run_scope_available(env: dict) -> bool:
     """
     try:
         r = subprocess.run(
-            ["systemd-run", "--user", "--scope", "--", "true"],
+            ["systemd-run", "--user", "--scope", *literal_scope_args(), "--", "true"],
             capture_output=True, timeout=10, env=env,
         )
         return r.returncode == 0
@@ -465,7 +466,7 @@ def _apply_direct(pid_file: Path) -> tuple:
         env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus")
         if _systemd_run_scope_available(env):
             proc = subprocess.Popen(
-                ["systemd-run", "--user", "--scope", "--", "bash", str(_UPDATE_SCRIPT)],
+                ["systemd-run", "--user", "--scope", *literal_scope_args(), "--", "bash", str(_UPDATE_SCRIPT)],
                 stdout=log_fh,
                 stderr=subprocess.STDOUT,
                 env=env,
@@ -542,10 +543,12 @@ You are supervising a Genesis update. Your role is WATCH AND ESCALATE.
    the user's decision. Write to {summary_file}: "refused: <the units it names>".
    Do not write {escalation_file}. Done.
 
-7. If exit 5 (refused, an earlier update unfinished):
+7. If exit 5 (refused: an earlier update unfinished, or this OS below the
+   supported floor, which update.sh names in one line):
    Exit 5 means update.sh REFUSED, before changing anything, because an earlier
    update's ~/.genesis/update_state.json still guards code it merged and never
-   activated, or merge conflicts it is waiting on. That file is the restart guard:
+   activated, merge conflicts it is waiting on, or a checkout it left half-written
+   (which --post-merge refuses too). That file is the restart guard:
    never delete or edit ~/.genesis/update_state.json, and never run --post-merge
    yourself. Write to {summary_file}: "refused: <the message update.sh printed>".
    Do not write {escalation_file}. Done.
@@ -590,8 +593,9 @@ If MERGE CONFLICTS:
    - Run: bash {update_script} --post-merge 2>&1
      (--post-merge skips fetch/merge, runs only bootstrap + health)
    - --post-merge keeps a systemd unit that was edited by hand and names it at
-     the end ("kept <unit>: edited by hand"). Never modify, delete, replace or
-     re-stamp those unit files, and never pass --take-template or
+     the end ("kept <unit>: edited by hand"); any update keeps an /etc file
+     Genesis manages the same way ("kept-etc <path>: ..."). Never modify,
+     delete, replace or re-stamp those files, and never pass --take-template or
      --take-templates: whether the hand edit goes is the user's decision. List
      them in your summary.
 
@@ -605,7 +609,8 @@ Do not write {escalation_file}. Done.
 If update.sh EXITS 5:
 Exit 5 means update.sh REFUSED, before changing anything, because an earlier
 update's ~/.genesis/update_state.json still guards code it merged and never
-activated, or merge conflicts it is waiting on. It is the restart guard: never
+activated, merge conflicts it is waiting on, or a checkout it left half-written
+(which --post-merge refuses too). It is the restart guard: never
 delete or edit ~/.genesis/update_state.json to get past it. Write to
 {summary_file}: "refused: <the message update.sh printed>". Do not write
 "tier3_needed" or anything else to {escalation_file}. Stop. Done.
@@ -650,9 +655,10 @@ IMPORTANT: The main working tree is CLEAN. Work on a temporary branch.
 9. Run: bash {update_script} --post-merge 2>&1
 
 --post-merge keeps a systemd unit that was edited by hand and names it at the
-end ("kept <unit>: edited by hand"). Never modify, delete, replace or re-stamp
-those unit files, and never pass --take-template or --take-templates: whether
-the hand edit goes is the user's decision. List them in your report.
+end ("kept <unit>: edited by hand"), and an /etc file Genesis manages the same
+way ("kept-etc <path>: ..."). Never modify, delete, replace or re-stamp those
+files, and never pass --take-template or --take-templates: whether the hand
+edit goes is the user's decision. List them in your report.
 
 Never delete or edit ~/.genesis/update_state.json to get past an update.sh
 refusal: it is the restart guard (and the record --post-merge finishes).
@@ -711,7 +717,10 @@ def _load_state_guard():
 def _state_guard_verdict() -> tuple[str, str, str | None]:
     """The restart-guard verdict on update_state.json: (verdict, reason, remedy).
 
-    ``verdict`` is "safe", "guards" or "conflict_pending"; ``remedy`` is the
+    ``verdict`` is "safe", "guards" (merged code awaiting bootstrap, which
+    --post-merge finishes), "conflict_pending", "mixed_tree" (a half-written
+    checkout) or "holds" (finishing forward is wrong or unknown; --post-merge
+    refuses both of the last two); ``remedy`` is the
     message every refusing caller prints, None when safe. A guard that cannot be
     evaluated keeps an existing file (doubt keeps the guard)."""
     try:
@@ -729,8 +738,10 @@ def _state_guard_verdict() -> tuple[str, str, str | None]:
         return (
             "guards",
             "it could not be checked",
-            f"{_STATE_FILE} could not be checked, so it is kept. Finish that update "
-            "with scripts/update.sh --post-merge, or Dismiss it on the update card.",
+            f"{_STATE_FILE} could not be checked, so it is kept. Run "
+            "scripts/update.sh --post-merge (it refuses a half-written tree; on live, "
+            "scripts/deploy_candidates repair-move puts such a tree back), or Dismiss "
+            "it on the update card.",
         )
 
 
@@ -814,7 +825,7 @@ def _apply_supervised(pid_file: Path) -> tuple:
             "DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus"
         )
         proc = subprocess.Popen(
-            ["systemd-run", "--user", "--scope", "--", python, script_path],
+            ["systemd-run", "--user", "--scope", *literal_scope_args(), "--", python, script_path],
             stdout=log_fh,
             stderr=subprocess.STDOUT,
             env=env,
@@ -1148,8 +1159,8 @@ def update_progress():
     state_data = None
     state_exists = _STATE_FILE.exists() or _STATE_FILE.is_symlink()
     if state_exists:
-        with contextlib.suppress(ValueError, OSError):
-            state_data = json.loads(_STATE_FILE.read_text())
+        with contextlib.suppress(ValueError, OSError, RecursionError):
+            state_data = json.loads(read_update_state(_STATE_FILE).decode("utf-8"))
         if isinstance(state_data, dict) and isinstance(state_data.get("phase"), str):
             phase = state_data["phase"]
     state_unreadable = state_exists and not isinstance(state_data, dict)
@@ -1171,6 +1182,7 @@ def update_progress():
 
     stale = False
     guard = None
+    guard_remedy = None
     if not in_progress and state_exists and phase != "done":
         # Only declare stale if state file is older than 60s
         import time
@@ -1179,9 +1191,11 @@ def update_progress():
             stale = age > 60
         except OSError:
             stale = True
-        # Whether it still guards merged code: the card says so and hides Retry.
-        # Asked only when a file exists and no update is running.
-        guard = _state_guard_verdict()[0]
+        # Whether it still guards merged code: the card says so, shows the
+        # guard's own remedy (a half-written tree's is not --post-merge, which
+        # refuses one) and hides Retry. Asked once, only when a file exists and
+        # no update is running.
+        guard, _reason, guard_remedy = _state_guard_verdict()
 
     return jsonify({
         "in_progress": in_progress,
@@ -1193,5 +1207,6 @@ def update_progress():
         "stale": stale,
         "guards": guard not in (None, "safe"),
         "guard": guard,
+        "guard_remedy": guard_remedy,
         "state_unreadable": state_unreadable,
     })

@@ -1776,3 +1776,80 @@ def test_untimed_legacy_evidence_changes_nothing_but_the_opening_time():
         }
 
     assert without_opened_at(with_pending) == without_opened_at(without)
+
+
+# -- the open round is found by the head's identity, never by list order (#3302)
+
+
+def _permuted(order):
+    """A parent graph H1 -> H2 with head H2, both heads rounds (c1 on H1 at T1,
+    c2 on H2 at T2), the commit list in ``order``. GitHub lists commits by date,
+    so a rebase or cherry-pick can list the head before its parent."""
+    rows = {H1: {"sha": H1, "parents": []}, H2: {"sha": H2, "parents": [H1]}}
+    return _ev(
+        head=H2,
+        commits=[rows[sha] for sha in order],
+        reviews=(
+            _keyed(_rv(CODEX, H1, P2, when=T1), 1, [1]),
+            _keyed(_rv(DEVIN, H2, _devin("🟡"), when=T2), 2, [2]),
+        ),
+    )
+
+
+@pytest.mark.parametrize("order", [(H1, H2), (H2, H1)])
+def test_the_open_round_is_the_heads_own_whatever_the_commit_order(order):
+    got = _permuted(order)
+    assert got["status"] == "ok" and got["count"] == 2
+    assert got["round_state"] == "open"
+    assert got["open_keys"] == ["c2"] and got["reflection_keys"] == "ok"
+    # The rounds list keeps its order for output stability; nothing reads it.
+    assert [r["head"] for r in got["rounds"]] == list(order)
+
+
+def test_an_unkeyed_open_round_finding_never_makes_late_debt_unknown_under_any_order():
+    """The open round's own findings are judged by ``reflection_keys``; only a
+    finding outside it may make ``late_state`` unknown, whatever the list order."""
+    rows = {H1: {"sha": H1, "parents": []}, H2: {"sha": H2, "parents": [H1]}}
+    for order in ((H1, H2), (H2, H1)):
+        got = _ev(
+            head=H2,
+            commits=[rows[sha] for sha in order],
+            reviews=(
+                _keyed(_rv(CODEX, H1, P2, when=T1), 1, [1]),
+                _rv(DEVIN, H2, _devin("🟡"), when=T2),  # no ids: unkeyable
+            ),
+        )
+        assert got["round_state"] == "open", order
+        assert got["reflection_keys"] == "unknown", order
+        assert got["late_state"] == "ok", order
+
+
+def test_shuffling_the_commit_list_never_moves_the_open_round():
+    """As a property: the open round, its keys and the count read the head's
+    identity, so any permutation of the commit list leaves them unchanged."""
+    rng = random.Random(3302)
+    opened = 0
+    for _ in range(300):
+        reviews, comments = _random_corpus(rng, [T1, T2, T3, T4])
+        reviews = [
+            _keyed(r, i, [i * 10 + j for j in range(len(r["top_level"]))])
+            for i, r in enumerate(reviews, 1)
+        ]
+        head = rng.choice(COMMITS)
+        dag = _dag(*COMMITS)
+        base = _ev(head=head, reviews=reviews, comments=comments, commits=dag)
+        shuffled = list(dag)
+        rng.shuffle(shuffled)
+        got = _ev(head=head, reviews=reviews, comments=comments, commits=shuffled)
+        assert got["status"] == base["status"]
+        if base["status"] != "ok":
+            continue
+        for field in ("round_state", "open_keys", "reflection_keys", "count", "late_state"):
+            assert got[field] == base[field], field
+        opened += base["round_state"] == "open"
+    assert opened  # the corpus does produce open rounds
+
+
+def test_the_row_names_the_open_round_by_the_head_under_a_permuted_list(guard):
+    row = guard._format_rounds(_permuted((H2, H1)))
+    assert f"open at {H2[:10]} ({DEVIN})" in row

@@ -625,6 +625,8 @@ def test_the_script_and_update_sh_share_one_excused_path_list():
         text = script.read_text()
         assert not re.search(r"^\s*EPHEMERAL_DIRTY_RE=", text, re.MULTILINE), script.name
         assert re.search(r'^\s*\. "\$\w+/lib/deploy_marker\.sh"$', text, re.MULTILINE), script.name
+    rollback = (UPDATE_SH.parent / "lib" / "update_rollback.sh").read_text()
+    assert not re.search(r"^\s*EPHEMERAL_DIRTY_RE=", rollback, re.MULTILINE)
 
 
 def test_both_callers_name_the_lock_fd_the_way_the_lib_expects():
@@ -1024,3 +1026,54 @@ def test_a_path_argument_in_the_unit_is_not_read_as_its_python(station):
     _advance_upstream(station)
     r = _run(station, env={**station["env"], "UNIT_ARGS": "--db-path=/data/x.db"})
     assert r.returncode == 0, r.stderr
+
+
+# ── the extras advisory: warns about missing test/payments packages, never refuses ──
+
+
+def _run_extras_advisory(tmp_path: Path, gate_out: str, gate_rc: int):
+    """Run deploy_code_only.sh's _extras_advisory alone (the script is not a library),
+    with a venv python that answers the gate's --extras call as told."""
+    code = SCRIPT.read_text()
+    start = code.index("_extras_advisory() {")
+    body = code[start : code.index("\n}\n", start) + 3]
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin" / "python").write_text(
+        f"#!/bin/sh\ncat > /dev/null\nprintf '%s' '{gate_out}'\nexit {gate_rc}\n"
+    )
+    (venv / "bin" / "python").chmod(0o755)
+    script = f'{body}\n_extras_advisory "the working tree" "[project]"; echo "rc=$?"'
+    return subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "VENV_DIR": str(venv), "_SELF_DIR": str(tmp_path)},
+    )
+
+
+def test_the_extras_advisory_warns_and_never_refuses(tmp_path):
+    res = _run_extras_advisory(tmp_path, "missing: pyrage [payments] (required >=1.4)\n", 1)
+    assert "rc=0" in res.stdout
+    assert "WARNING: the venv lacks optional packages" in res.stderr
+    assert "missing: pyrage [payments]" in res.stderr
+    # Plain update.sh stops at "Already up to date" on a current tree.
+    assert "scripts/update.sh --post-merge" in res.stderr
+
+
+@pytest.mark.parametrize(
+    ("gate_out", "gate_rc"),
+    [
+        ("", 0),  # everything installed
+        # A gate that predates --extras reads it as a checkout path (measured on
+        # origin/main's gate): rc 1 with lines that are not package lines.
+        ("genesis-v3 is installed from /x, not --extras\npackage root: /x/src\n", 1),
+        ("extra not declared: [payments]\n", 1),  # not a reinstall problem
+    ],
+    ids=["present", "older-gate", "undeclared-group"],
+)
+def test_the_extras_advisory_is_silent_unless_packages_are_missing(tmp_path, gate_out, gate_rc):
+    res = _run_extras_advisory(tmp_path, gate_out, gate_rc)
+    assert "rc=0" in res.stdout
+    assert res.stderr == ""

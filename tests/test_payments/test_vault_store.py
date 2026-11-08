@@ -5,18 +5,22 @@ Only Stripe's public test numbers appear here, built from parts.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
 import sqlite3
 import stat
+from contextlib import closing
 from datetime import UTC, datetime
 
 import pytest
 from pyrage import decrypt, x25519
 from pyrage import passphrase as age_passphrase
 
+from genesis.payments import vault_migrate as vm
+from genesis.payments import vault_release_store as vrs
 from genesis.payments import vault_store as vs
 from genesis.security.card_shapes import luhn_ok
 
@@ -35,36 +39,62 @@ def _future() -> str:
     return f"12/{(datetime.now(UTC).year + 2) % 100:02d}"
 
 
-# A stand-in for scrypt that has the shape of a sealed key (header, stanza,
-# 43-character MAC, 106-byte payload), so the vault reads as intact.
-FAKE_SEALED = (
-    b"age-encryption.org/v1\n-> scrypt "
-    + b"c2FsdA 18\nd3JhcA\n--- "
-    + b"m" * 43
-    + b"\n"
-    + b"p" * 106
-)
-
-
-@pytest.fixture(scope="module")
-def _sealed_vault(tmp_path_factory):
-    """One real init (scrypt costs seconds), copied fresh into each test."""
-    path = tmp_path_factory.mktemp("sealed") / "payment_vault"
-    vs.init_vault(PASSPHRASE, path)
-    return path
-
-
 @pytest.fixture
-def vault(_sealed_vault, tmp_path):
+def vault(tmp_path):
     path = tmp_path / "payment_vault"
-    shutil.copytree(_sealed_vault, path)
-    os.chmod(path, 0o700)
+    vs.init_vault(path)
     return path
 
 
 def _identity(path):
-    sealed = (path / vs.IDENTITY).read_bytes()
-    return x25519.Identity.from_str(age_passphrase.decrypt(sealed, PASSPHRASE).decode())
+    return x25519.Identity.from_str((path / vs.IDENTITY).read_text().strip())
+
+
+def _digest_row(path):
+    with closing(sqlite3.connect(path / vs.CARDS)) as conn:
+        row = conn.execute("SELECT value FROM vault_meta WHERE key = 'identity_sha256'")
+        return row.fetchone()[0]
+
+
+def _set_digest_row(path, digest):
+    with closing(sqlite3.connect(path / vs.CARDS)) as conn, conn:
+        conn.execute("UPDATE vault_meta SET value = ? WHERE key = 'identity_sha256'", (digest,))
+
+
+def _seal_legacy(path):
+    """Turn an initialised vault into one made before the passphrase was dropped."""
+    key = (path / vs.IDENTITY).read_text()
+    sealed = age_passphrase.encrypt(key.strip().encode(), PASSPHRASE)
+    fd = os.open(path / vs.SEALED_IDENTITY, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(sealed)
+    (path / vs.IDENTITY).unlink()
+    _set_digest_row(path, hashlib.sha256(sealed).hexdigest())
+    return key
+
+
+@pytest.fixture(scope="module")
+def _legacy_template(tmp_path_factory):
+    """One legacy vault holding one card (scrypt costs seconds), copied fresh into each test."""
+    path = tmp_path_factory.mktemp("legacy") / "payment_vault"
+    vs.init_vault(path)
+    ref = _add(path)
+    key = _seal_legacy(path)
+    return path, ref, key
+
+
+@pytest.fixture
+def legacy(_legacy_template, tmp_path):
+    template, ref, key = _legacy_template
+    path = tmp_path / "legacy" / "payment_vault"  # its own parent: the copy aside lands there
+    path.parent.mkdir()
+    shutil.copytree(template, path)
+    os.chmod(path, 0o700)
+    return path, ref, key
+
+
+def _snapshot(path):
+    return {p.name: (p.read_bytes(), _mode(p)) for p in sorted(path.iterdir())}
 
 
 def _mode(p):
@@ -79,34 +109,39 @@ def _add(path, number=VISA, **kw):
 
 
 class TestInit:
-    def test_layout_and_modes(self, _sealed_vault):
-        path = _sealed_vault
+    def test_layout_and_modes(self, vault):
+        path = vault
         assert _mode(path) == 0o700
         for name in (vs.IDENTITY, vs.RECIPIENT, vs.CARDS):
             assert _mode(path / name) == 0o600, name
         assert (path / vs.RECIPIENT).read_text().startswith("age1")
+        assert not (path / vs.SEALED_IDENTITY).exists()
         assert not list(path.glob(".*.tmp"))
-        # The identity opens with the passphrase and matches the recipient.
+        # The key opens with no passphrase and matches the recipient.
         identity = _identity(path)
         assert str(identity.to_public()) == (path / vs.RECIPIENT).read_text().strip()
 
-    def test_refuses_a_weak_passphrase_and_creates_nothing(self, tmp_path):
-        path = tmp_path / "v"
-        with pytest.raises(vs.VaultError, match="guessable"):
-            vs.init_vault("password1", path)
-        assert not path.exists()
+    def test_the_key_file_is_age_secret_key_text_and_its_digest_is_recorded(self, vault):
+        data = (vault / vs.IDENTITY).read_bytes()
+        # age's own form: str(x25519.Identity) and one newline, nothing else.
+        assert data == str(_identity(vault)).encode() + b"\n"
+        assert data.startswith(b"AGE-SECRET-KEY-1") and data.count(b"\n") == 1
+        assert vs.key_text_ok(data)
+        assert _mode(vault / vs.IDENTITY) == 0o600
+        assert _digest_row(vault) == hashlib.sha256(data).hexdigest()
+        status = vs.vault_status(vault)
+        assert status["error"] is None and status["migrate"] is None
 
     def test_refuses_an_initialised_vault(self, vault):
         before = (vault / vs.IDENTITY).read_bytes()
         with pytest.raises(vs.VaultError, match="already initialised"):
-            vs.init_vault(PASSPHRASE, vault)
+            vs.init_vault(vault)
         assert (vault / vs.IDENTITY).read_bytes() == before
 
     @pytest.mark.parametrize("killed_at", [vs.RECIPIENT, vs.IDENTITY])
     def test_a_run_killed_before_the_identity_lands_reads_uninitialised_and_reruns(
         self, tmp_path, monkeypatch, killed_at
     ):
-        monkeypatch.setattr(age_passphrase, "encrypt", lambda data, pw: FAKE_SEALED)
         path = tmp_path / "v"
         real_replace, real_link = os.replace, os.link
 
@@ -121,44 +156,29 @@ class TestInit:
         monkeypatch.setattr(vs.os, "replace", dying(real_replace))
         monkeypatch.setattr(vs.os, "link", dying(real_link))
         with pytest.raises(KeyboardInterrupt):
-            vs.init_vault(PASSPHRASE, path)
+            vs.init_vault(path)
         assert not vs.is_initialised(path)
         monkeypatch.setattr(vs.os, "replace", real_replace)
         monkeypatch.setattr(vs.os, "link", real_link)
-        vs.init_vault(PASSPHRASE, path)
+        vs.init_vault(path)
         assert vs.is_initialised(path)
         assert not list(path.glob(".*.tmp"))
 
-    def test_tightens_a_loose_existing_directory(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(age_passphrase, "encrypt", lambda data, pw: FAKE_SEALED)
+    def test_tightens_a_loose_existing_directory(self, tmp_path):
         path = tmp_path / "v"
         path.mkdir(mode=0o755)
         os.chmod(path, 0o755)
-        vs.init_vault(PASSPHRASE, path)
+        vs.init_vault(path)
         assert _mode(path) == 0o700
 
 
 class TestInitRefusals:
-    @pytest.fixture(autouse=True)
-    def _fast_seal(self, monkeypatch):
-        monkeypatch.setattr(age_passphrase, "encrypt", lambda data, pw: FAKE_SEALED)
-
-    def test_scores_a_passphrase_longer_than_72_characters(self, tmp_path):
-        long = " ".join(["quartz lantern ember noodle"] * 3)
-        assert len(long) > 72
-        vs.init_vault(long, tmp_path / "v")
-        assert vs.is_initialised(tmp_path / "v")
-
-    def test_refuses_an_absurdly_long_passphrase(self, tmp_path):
-        with pytest.raises(vs.VaultError, match="longer than"):
-            vs.init_vault("x" * (vs.MAX_PASSPHRASE_LENGTH + 1), tmp_path / "v")
-
     def test_refuses_to_orphan_existing_cards(self, vault):
         _add(vault)
         recipient = (vault / vs.RECIPIENT).read_text()
         (vault / vs.IDENTITY).unlink()  # e.g. an attempt to "reset the passphrase"
         with pytest.raises(vs.VaultError, match="1 card"):
-            vs.init_vault(PASSPHRASE, vault)
+            vs.init_vault(vault)
         assert (vault / vs.RECIPIENT).read_text() == recipient
 
     @pytest.mark.parametrize("shape", ["directory", "dangling symlink", "no recipient"])
@@ -172,7 +192,7 @@ class TestInitRefusals:
             (vault / vs.IDENTITY).write_bytes(b"x")
             (vault / vs.RECIPIENT).unlink()
         with pytest.raises(vs.VaultError, match="incomplete"):
-            vs.init_vault(PASSPHRASE, vault)
+            vs.init_vault(vault)
         with pytest.raises(vs.VaultError, match="incomplete"):
             _add(vault)
 
@@ -190,7 +210,7 @@ class TestInitRefusals:
 
         monkeypatch.setattr(vs.os, "link", copy_lands_first)
         with pytest.raises(vs.VaultError, match="appeared while this init ran"):
-            vs.init_vault(PASSPHRASE, path)
+            vs.init_vault(path)
         assert (path / vs.IDENTITY).read_bytes() == b"theirs"
         assert (path / vs.RECIPIENT).read_bytes() == self.THEIRS
         assert not list(path.glob(".*.tmp"))
@@ -210,7 +230,7 @@ class TestInitRefusals:
 
         monkeypatch.setattr(vs, "_create_cards_db", copy_lands_before_our_recipient)
         with pytest.raises(vs.VaultError, match="appeared while this init ran"):
-            vs.init_vault(PASSPHRASE, path)
+            vs.init_vault(path)
         assert (path / vs.IDENTITY).read_bytes() == b"theirs"
         # Seen before this run's recipient was written: their files stay exactly as they were.
         if their_recipient is None:
@@ -226,14 +246,14 @@ class TestInitRefusals:
         (vault / vs.RECIPIENT).write_text(str(other.to_public()) + "\n")
         # check_ready now refuses it first, from the pair recorded at init.
         with pytest.raises(vs.VaultError, match="recipient.txt is not the public key"):
-            vs.retire_card(ref, PASSPHRASE, vault)
+            vs.retire_card(ref, vault)
 
-    @pytest.mark.parametrize("keep", [33, 40, 150, 255])
+    @pytest.mark.parametrize("keep", [0, 16, 40, 73])
     def test_a_truncated_identity_is_damage(self, vault, keep):
         data = (vault / vs.IDENTITY).read_bytes()
-        assert len(data) == 256
+        assert len(data) == 75
         (vault / vs.IDENTITY).write_bytes(data[:keep])
-        with pytest.raises(vs.VaultError, match="not a whole passphrase-sealed age key"):
+        with pytest.raises(vs.VaultError, match="not a whole age secret key"):
             vs.check_ready(vault)
 
     def test_a_recipient_with_a_bad_checksum_is_an_error_in_status(self, vault):
@@ -242,15 +262,14 @@ class TestInitRefusals:
         (vault / vs.RECIPIENT).write_text(flipped + "\n")
         assert "recipient.txt" in vs.vault_status(vault)["error"]
 
-    def test_a_cards_table_of_another_shape_is_foreign(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(age_passphrase, "encrypt", lambda data, pw: FAKE_SEALED)
+    def test_a_cards_table_of_another_shape_is_foreign(self, tmp_path):
         path = tmp_path / "v"
         path.mkdir(mode=0o700)
         with sqlite3.connect(path / vs.CARDS) as conn:
             conn.execute("CREATE TABLE cards (card_ref TEXT PRIMARY KEY, status TEXT)")
             conn.execute(f"PRAGMA user_version = {vs.SCHEMA_VERSION}")
         with pytest.raises(vs.VaultError, match="not an empty vault card database"):
-            vs.init_vault(PASSPHRASE, path)
+            vs.init_vault(path)
 
     def test_writes_go_to_the_locked_directory_even_if_another_is_moved_onto_the_path(
         self, tmp_path, monkeypatch
@@ -269,7 +288,7 @@ class TestInitRefusals:
 
         monkeypatch.setattr(vs, "_create_cards_db", swap_mid_init)
         with pytest.raises(vs.VaultError, match="moved onto"):
-            vs.init_vault(PASSPHRASE, path)
+            vs.init_vault(path)
         assert sorted(p.name for p in path.iterdir()) == [vs.IDENTITY, vs.RECIPIENT]
         assert (path / vs.IDENTITY).read_bytes() == b"restored"
         assert (path / vs.RECIPIENT).read_bytes() == b"age1restored\n"
@@ -290,7 +309,7 @@ class TestInitRefusals:
 
         monkeypatch.setattr(vs, "check_can_init", copy_after_the_last_check)
         with pytest.raises(vs.VaultError, match="sealed to an earlier key"):
-            vs.init_vault(PASSPHRASE, path)
+            vs.init_vault(path)
         assert not (path / vs.IDENTITY).exists()
 
     def test_makes_an_existing_empty_cards_db_private(self, tmp_path):
@@ -298,7 +317,7 @@ class TestInitRefusals:
         path.mkdir(mode=0o700)
         sqlite3.connect(path / vs.CARDS).close()
         os.chmod(path / vs.CARDS, 0o644)
-        vs.init_vault(PASSPHRASE, path)
+        vs.init_vault(path)
         assert _mode(path / vs.CARDS) == 0o600
         vs.check_ready(path)  # an add would not be refused as not private
 
@@ -308,7 +327,7 @@ class TestInitRefusals:
         with pytest.raises(vs.VaultError, match="not a directory you own"):
             vs.check_can_init(path)
         with pytest.raises(vs.VaultError, match="not a directory you own"):
-            vs.init_vault(PASSPHRASE, path)
+            vs.init_vault(path)
 
 
 class TestParseCard:
@@ -473,28 +492,22 @@ class TestRetire:
     def test_malformed_or_unknown_ref_is_refused_without_echo(self, vault, ref):
         _add(vault)
         with pytest.raises(vs.VaultError) as exc:
-            vs.retire_card(ref, PASSPHRASE, vault)
+            vs.retire_card(ref, vault)
         assert VISA not in str(exc.value)
 
     def test_retire_refuses_a_vault_whose_files_are_not_private(self, vault):
         ref = _add(vault)
         os.chmod(vault / vs.CARDS, 0o644)
         with pytest.raises(vs.VaultError, match="not private"):
-            vs.retire_card(ref, PASSPHRASE, vault)
+            vs.retire_card(ref, vault)
         os.chmod(vault / vs.CARDS, 0o600)
-        assert vs.list_cards(vault)[0]["status"] == "active"
-
-    def test_wrong_passphrase_changes_nothing(self, vault):
-        ref = _add(vault)
-        with pytest.raises(vs.VaultError, match="wrong passphrase"):
-            vs.retire_card(ref, "not it", vault)
         assert vs.list_cards(vault)[0]["status"] == "active"
 
     def test_retire_erases_the_blob(self, vault):
         ref = _add(vault)
         with sqlite3.connect(vault / vs.CARDS) as conn:
             (blob,) = conn.execute("SELECT blob FROM cards").fetchone()
-        vs.retire_card(ref, PASSPHRASE, vault)
+        vs.retire_card(ref, vault)
         [card] = vs.list_cards(vault)
         assert card["status"] == "retired" and card["retired_at"]
         with sqlite3.connect(vault / vs.CARDS) as conn:
@@ -503,7 +516,7 @@ class TestRetire:
         raw = (vault / vs.CARDS).read_bytes()
         assert blob[:64] not in raw and blob[-64:] not in raw
         with pytest.raises(vs.VaultError, match="no active card"):
-            vs.retire_card(ref, PASSPHRASE, vault)
+            vs.retire_card(ref, vault)
 
 
 class TestStatus:
@@ -565,9 +578,9 @@ class TestStatus:
         [
             ("cards.db mode 000", "could not be read or written"),
             ("cards.db 0 bytes", "not a vault card database (empty)"),
-            ("identity garbage", "not a whole passphrase-sealed age key"),
-            ("identity mode 000", "identity.age cannot be read"),
-            ("identity missing, cards remain", "identity.age is missing"),
+            ("identity garbage", "not a whole age secret key"),
+            ("identity mode 000", "identity.key cannot be read"),
+            ("identity missing, cards remain", "identity.key is missing"),
             ("recipient missing", "incomplete"),
         ],
     )
@@ -609,17 +622,14 @@ class TestStatus:
         finally:
             os.chmod(vault, 0o700)
 
-    def test_init_refuses_a_foreign_database_at_cards_db_and_leaves_it_alone(
-        self, tmp_path, monkeypatch
-    ):
-        monkeypatch.setattr(age_passphrase, "encrypt", lambda data, pw: FAKE_SEALED)
+    def test_init_refuses_a_foreign_database_at_cards_db_and_leaves_it_alone(self, tmp_path):
         path = tmp_path / "v"
         path.mkdir(mode=0o700)
         with sqlite3.connect(path / vs.CARDS) as conn:
             conn.execute("CREATE TABLE other (x)")
         before = (path / vs.CARDS).read_bytes()
         with pytest.raises(vs.VaultError, match="not an empty vault card database"):
-            vs.init_vault(PASSPHRASE, path)
+            vs.init_vault(path)
         assert (path / vs.CARDS).read_bytes() == before
         assert not (path / vs.IDENTITY).exists()
 
@@ -651,6 +661,7 @@ class TestStatus:
             "cards": {"active": 0, "retired": 0},
             "files": {},
             "error": None,
+            "migrate": None,
         }
 
 
@@ -712,16 +723,16 @@ class TestRoundTwoFindings:
         ref = _add_visa(vault)
         other = tmp_path / "other"
         shutil.copytree(vault, other)
-        real = vs.verify_passphrase
+        real = vs.check_active_card
 
-        def swap_after_verify(passphrase, path=None):
-            real(passphrase, path)
+        def swap_after_the_checks(card_ref, path=None):
+            real(card_ref, path)
             vault.rename(tmp_path / "moved")
             other.rename(vault)
 
-        monkeypatch.setattr(vs, "verify_passphrase", swap_after_verify)
+        monkeypatch.setattr(vs, "check_active_card", swap_after_the_checks)
         with pytest.raises(vs.VaultError, match="replaced"):
-            vs.retire_card(ref, PASSPHRASE, vault)
+            vs.retire_card(ref, vault)
         for path in (vault, tmp_path / "moved"):
             assert [c["status"] for c in vs.list_cards(path)] == ["active"]
 
@@ -738,33 +749,24 @@ class TestRoundTwoFindings:
 
 
 class TestIdentityDigest:
-    """init records sha256(identity.age); a same-length corruption is caught without the passphrase."""
-
-    def _flip_one_payload_byte(self, vault):
-        data = bytearray((vault / vs.IDENTITY).read_bytes())
-        data[-5] ^= 0x01  # inside the 106-byte payload: length and shape unchanged
-        (vault / vs.IDENTITY).write_bytes(bytes(data))
+    """init records sha256(identity.key); a damaged or replaced key file is caught by stdlib checks."""
 
     def test_a_fresh_vault_records_the_digest_and_is_healthy(self, vault):
-        import hashlib
-
-        with sqlite3.connect(vault / vs.CARDS) as conn:
-            (digest,) = conn.execute(
-                "SELECT value FROM vault_meta WHERE key = 'identity_sha256'"
-            ).fetchone()
-        assert digest == hashlib.sha256((vault / vs.IDENTITY).read_bytes()).hexdigest()
+        assert _digest_row(vault) == hashlib.sha256((vault / vs.IDENTITY).read_bytes()).hexdigest()
         assert vs.vault_status(vault)["error"] is None
 
     def test_a_same_length_corruption_is_an_error_and_add_refuses(self, vault):
-        self._flip_one_payload_byte(vault)
-        assert "not the key this vault was created with" in vs.vault_status(vault)["error"]
-        with pytest.raises(vs.VaultError, match="not the key this vault was created with"):
+        data = bytearray((vault / vs.IDENTITY).read_bytes())
+        data[30] = ord("Q") if data[30] != ord("Q") else ord("P")  # length and alphabet unchanged
+        (vault / vs.IDENTITY).write_bytes(bytes(data))
+        assert "not a whole age secret key" in vs.vault_status(vault)["error"]
+        with pytest.raises(vs.VaultError, match="not a whole age secret key"):
             _add_visa(vault)
         assert vs.list_cards(vault) == []
 
     def test_an_identity_from_another_vault_is_refused(self, vault, tmp_path):
         other = tmp_path / "other"
-        vs.init_vault(PASSPHRASE, other)
+        vs.init_vault(other)
         (vault / vs.IDENTITY).write_bytes((other / vs.IDENTITY).read_bytes())
         assert "not the key this vault was created with" in vs.vault_status(vault)["error"]
 
@@ -780,7 +782,7 @@ class TestIdentityDigest:
 
     def test_a_swapped_recipient_is_an_error_and_add_refuses(self, vault, tmp_path):
         other = tmp_path / "other"
-        vs.init_vault(PASSPHRASE, other)
+        vs.init_vault(other)
         (vault / vs.RECIPIENT).write_bytes((other / vs.RECIPIENT).read_bytes())
         assert "recipient.txt is not the public key" in vs.vault_status(vault)["error"]
         with pytest.raises(vs.VaultError, match="recipient.txt is not the public key"):
@@ -808,9 +810,9 @@ class TestIdentityDigest:
 
         monkeypatch.setattr(vs.os, "link", killed_once)
         with pytest.raises(KeyboardInterrupt):
-            vs.init_vault(PASSPHRASE, path)
+            vs.init_vault(path)
         assert not vs.is_initialised(path)
-        vs.init_vault(PASSPHRASE, path)  # a new identity, so a new digest
+        vs.init_vault(path)  # a new identity, so a new digest
         assert vs.vault_status(path)["error"] is None
         _add_visa(path)
         assert len(vs.list_cards(path)) == 1
@@ -956,11 +958,10 @@ class TestChecksHeldThroughTheWrite:
 
         monkeypatch.setattr(vs, target, write_armed)
         monkeypatch.setattr(vs, "_shape", shape_then_meddle)
-        monkeypatch.setattr(vs, "verify_passphrase", lambda pw, path=None: None)
         if op == "add":
             _add_visa(vault)
         else:
-            vs.retire_card(ref, PASSPHRASE, vault)
+            vs.retire_card(ref, vault)
         assert seen == ["database is locked"]
 
     def test_init_refuses_a_cards_db_swapped_before_sqlite_opens_it(self, tmp_path, monkeypatch):
@@ -976,7 +977,7 @@ class TestChecksHeldThroughTheWrite:
 
         monkeypatch.setattr(vs.sqlite3, "connect", swap_then_connect)
         with pytest.raises(vs.VaultError, match="changed while init was opening it"):
-            vs.init_vault(PASSPHRASE, path)
+            vs.init_vault(path)
         assert not vs.is_initialised(path)
         assert (path / vs.CARDS).stat().st_size == 0  # nothing was written into the swap
 
@@ -1002,3 +1003,271 @@ class TestChecksHeldThroughTheWrite:
         finally:
             tracemalloc.stop()
         assert peak < (4 << 20)  # a whole-file read would hold 16 MiB at once
+
+
+def _blob(path):
+    with closing(sqlite3.connect(path / vs.CARDS)) as conn:
+        return conn.execute("SELECT blob FROM cards").fetchone()[0]
+
+
+class TestKeyTextOk:
+    """The stdlib check of identity.key: one whole age secret key line, checksum included."""
+
+    KEY = str(x25519.Identity.generate())
+
+    def test_a_whole_key_passes_with_or_without_its_newline(self):
+        assert vs.key_text_ok(self.KEY.encode() + b"\n")
+        assert vs.key_text_ok(self.KEY.encode())
+
+    @pytest.mark.parametrize("keep", [0, 16, 50, 73])
+    def test_a_truncated_key_fails(self, keep):
+        assert not vs.key_text_ok(self.KEY.encode()[:keep] + b"\n")
+
+    def test_a_bad_checksum_fails(self):
+        last = self.KEY[-1]
+        flipped = self.KEY[:-1] + ("Q" if last != "Q" else "P")
+        assert not vs.key_text_ok(flipped.encode() + b"\n")
+
+    @pytest.mark.parametrize("second", ["KEY", "", "X"], ids=["twice", "blank", "junk"])
+    def test_two_lines_fail(self, second):
+        line = self.KEY if second == "KEY" else second
+        data = (self.KEY + "\n" + line + "\n").encode()
+        assert data.count(b"\n") == 2
+        assert not vs.key_text_ok(data)
+
+    def test_non_ascii_fails(self):
+        assert not vs.key_text_ok(self.KEY.encode()[:-1] + "É".encode() + b"\n")
+
+
+class TestLegacyVault:
+    """A vault made before the passphrase was dropped: identity.age only."""
+
+    def test_status_asks_for_a_migration_and_still_counts_the_cards(self, legacy):
+        path, _ref, _key = legacy
+        status = vs.vault_status(path)
+        assert status["initialised"] is True
+        assert status["migrate"] == "needed"
+        assert "vault migrate" in status["error"] and "sealed" in status["error"]
+        assert status["cards"] == {"active": 1, "retired": 0}
+        assert vs.SEALED_IDENTITY in status["files"] and vs.IDENTITY not in status["files"]
+        assert vm.migration_state(path) == "needed"
+        with pytest.raises(vs.VaultError, match="vault migrate"):
+            vs.check_ready(path)
+        with pytest.raises(vs.VaultError, match="vault migrate"):
+            vrs.load_identity(path)
+        with pytest.raises(vs.VaultError, match="vault migrate"):
+            _add_visa(path)
+
+    def test_verify_set_accepts_either_set(self, vault, legacy):
+        path, _ref, _key = legacy
+        vs.verify_set(vault)
+        vs.verify_set(path)
+
+    def test_verify_set_refuses_a_damaged_sealed_key(self, legacy):
+        path, _ref, _key = legacy
+        data = (path / vs.SEALED_IDENTITY).read_bytes()
+        (path / vs.SEALED_IDENTITY).write_bytes(data[:-1])
+        with pytest.raises(vs.VaultError, match="not a whole passphrase-sealed age key"):
+            vs.verify_set(path)
+
+    def test_verify_set_refuses_a_sealed_key_cards_db_does_not_record(self, legacy):
+        path, _ref, _key = legacy
+        _set_digest_row(path, "0" * 64)
+        with pytest.raises(vs.VaultError, match="identity.age is not the key this vault"):
+            vs.verify_set(path)
+
+    def test_verify_set_refuses_a_key_file_cards_db_does_not_record(self, vault):
+        _set_digest_row(vault, "0" * 64)
+        with pytest.raises(vs.VaultError, match="identity.key is not the key this vault"):
+            vs.verify_set(vault)
+
+
+class TestMigrate:
+    def test_the_right_passphrase_unseals_the_key_once(self, legacy):
+        path, ref, key = legacy
+        aside = vm.migrate_vault(PASSPHRASE, path)
+        assert aside is not None and aside.parent == path.parent
+        assert (path / vs.IDENTITY).read_text() == key
+        assert _mode(path / vs.IDENTITY) == 0o600
+        assert not (path / vs.SEALED_IDENTITY).exists()
+        assert not list(path.glob(".*.tmp"))
+        assert _digest_row(path) == hashlib.sha256((path / vs.IDENTITY).read_bytes()).hexdigest()
+        status = vs.vault_status(path)
+        assert status["error"] is None and status["migrate"] is None
+        assert status["cards"] == {"active": 1, "retired": 0}
+        vs.verify_set(path)
+        # The card sealed before the migration opens with the loaded key.
+        secret = json.loads(decrypt(_blob(path), [vrs.load_identity(path)]))
+        assert secret["card_ref"] == ref and secret["number"] == VISA
+        with pytest.raises(vs.VaultError, match="no sealed key to migrate"):
+            vm.migrate_vault(PASSPHRASE, path)
+
+    def test_a_wrong_passphrase_leaves_the_vault_unchanged(self, legacy):
+        path, _ref, _key = legacy
+        before = _snapshot(path)
+        with pytest.raises(vs.VaultError, match="wrong passphrase"):
+            vm.migrate_vault("not it", path)
+        assert _snapshot(path) == before
+        assert vm.pre_migrate_copies(path) == []
+        assert vm.migration_state(path) == "needed"
+
+    @pytest.mark.parametrize("passphrase", [None, ""])
+    def test_a_sealed_key_needs_the_passphrase(self, legacy, passphrase):
+        path, _ref, _key = legacy
+        before = _snapshot(path)
+        with pytest.raises(vs.VaultError, match="passphrase is needed"):
+            vm.migrate_vault(passphrase, path)
+        assert _snapshot(path) == before
+
+    def test_refuses_an_absurdly_long_passphrase(self, legacy):
+        path, _ref, _key = legacy
+        before = _snapshot(path)
+        with pytest.raises(vs.VaultError, match="longer than"):
+            vm.migrate_vault("x" * (vm.MAX_PASSPHRASE_LENGTH + 1), path)
+        assert _snapshot(path) == before
+
+    def test_the_copy_aside_is_the_vault_as_it_was(self, legacy):
+        path, ref, _key = legacy
+        before = _snapshot(path)
+        cards = vs.list_cards(path)
+        aside = vm.migrate_vault(PASSPHRASE, path)
+        assert aside.name.startswith(vm.PRE_MIGRATE_PREFIX)
+        assert vm.pre_migrate_copies(path) == [aside]
+        assert _mode(aside) == 0o700
+        assert sorted(p.name for p in aside.iterdir()) == sorted(
+            [vs.CARDS, vs.RECIPIENT, vs.SEALED_IDENTITY]
+        )
+        for name in (vs.CARDS, vs.RECIPIENT, vs.SEALED_IDENTITY):
+            assert _mode(aside / name) == 0o600, name
+        for name in (vs.RECIPIENT, vs.SEALED_IDENTITY):
+            assert (aside / name).read_bytes() == before[name][0], name
+        # Still a whole legacy vault: the way back if the migration went wrong.
+        assert vs.list_cards(aside) == cards and cards[0]["card_ref"] == ref
+        assert vs.vault_status(aside)["migrate"] == "needed"
+        vs.verify_set(aside)
+
+    def test_a_kill_between_the_link_and_the_row_update_resumes_with_no_passphrase(
+        self, legacy, monkeypatch
+    ):
+        path, ref, key = legacy
+
+        def killed(*args):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(vm, "_rebind", killed)
+        with pytest.raises(KeyboardInterrupt):
+            vm.migrate_vault(PASSPHRASE, path)
+        monkeypatch.undo()
+        assert (path / vs.IDENTITY).read_text() == key
+        assert (path / vs.SEALED_IDENTITY).exists()
+        status = vs.vault_status(path)
+        assert status["migrate"] == "resume" and "stopped part-way" in status["error"]
+        assert status["cards"] == {"active": 1, "retired": 0}
+        assert vm.migration_state(path) == "resume"
+        with pytest.raises(vs.VaultError, match="stopped part-way"):
+            vrs.load_identity(path)
+        assert vm.migrate_vault(None, path) is None
+        assert not (path / vs.SEALED_IDENTITY).exists()
+        assert _digest_row(path) == hashlib.sha256((path / vs.IDENTITY).read_bytes()).hexdigest()
+        status = vs.vault_status(path)
+        assert status["error"] is None and status["migrate"] is None
+        assert len(vm.pre_migrate_copies(path)) == 1  # the resume made no second copy
+        secret = json.loads(decrypt(_blob(path), [vrs.load_identity(path)]))
+        assert secret["card_ref"] == ref
+
+    def test_a_leftover_sealed_key_beside_the_recorded_key_is_removed(self, legacy):
+        path, _ref, _key = legacy
+        aside = vm.migrate_vault(PASSPHRASE, path)
+        shutil.copy(aside / vs.SEALED_IDENTITY, path / vs.SEALED_IDENTITY)
+        os.chmod(path / vs.SEALED_IDENTITY, 0o600)
+        key = (path / vs.IDENTITY).read_bytes()
+        assert vm.migration_state(path) == "cleanup"
+        assert (
+            vs.vault_status(path)["error"] is None
+        )  # usable meanwhile: the key is the recorded one
+        assert vm.migrate_vault(None, path) is None
+        assert vm.migration_state(path) is None
+        assert not (path / vs.SEALED_IDENTITY).exists()
+        assert (path / vs.IDENTITY).read_bytes() == key
+        assert vs.vault_status(path)["error"] is None
+
+    def test_refuses_a_vault_with_nothing_to_migrate(self, vault):
+        _add(vault)
+        before = _snapshot(vault)
+        with pytest.raises(vs.VaultError, match="no sealed key to migrate"):
+            vm.migrate_vault(PASSPHRASE, vault)
+        assert _snapshot(vault) == before
+        assert vm.pre_migrate_copies(vault) == []
+
+
+class TestLoadIdentity:
+    def test_loads_the_key_that_opens_the_cards(self, vault):
+        ref = _add(vault)
+        identity = vrs.load_identity(vault)
+        assert str(identity.to_public()) == (vault / vs.RECIPIENT).read_text().strip()
+        assert json.loads(decrypt(_blob(vault), [identity]))["card_ref"] == ref
+
+    def test_refuses_a_key_file_from_another_vault(self, vault, tmp_path):
+        other = tmp_path / "other"
+        vs.init_vault(other)
+        (vault / vs.IDENTITY).write_bytes((other / vs.IDENTITY).read_bytes())
+        with pytest.raises(vs.VaultError, match="not the key this vault was created with"):
+            vrs.load_identity(vault)
+
+    def _recorded_but_unpaired(self, vault):
+        """State D: a valid key whose digest cards.db records, but not recipient.txt's pair."""
+        other = str(x25519.Identity.generate()).encode() + b"\n"
+        (vault / vs.IDENTITY).write_bytes(other)
+        _set_digest_row(vault, hashlib.sha256(other).hexdigest())
+
+    def test_status_refuses_a_recorded_key_that_is_not_the_recipients_pair(self, vault):
+        _add(vault)
+        self._recorded_but_unpaired(vault)
+        status = vs.vault_status(vault)
+        assert "identity.key and recipient.txt do not match" in status["error"]
+        assert status["migrate"] is None and status["cards"] is None
+        for call in (vs.check_ready, vrs.load_identity):
+            with pytest.raises(vs.VaultError, match="identity.key and recipient.txt do not match"):
+                call(vault)
+        with pytest.raises(vs.VaultError, match="do not match"):
+            _add_visa(vault)
+
+    def test_load_identity_pair_checks_even_where_status_cannot(self, vault, monkeypatch):
+        """Without the payments extra, status checks only the digest; the loader still pairs."""
+        import importlib.util
+
+        self._recorded_but_unpaired(vault)
+        real = importlib.util.find_spec
+        monkeypatch.setattr(
+            importlib.util, "find_spec", lambda name, *a: None if name == "pyrage" else real(name)
+        )
+        assert vs.vault_status(vault)["error"] is None  # the stdlib checks all pass
+        with pytest.raises(vs.VaultError, match="identity.key and recipient.txt do not match"):
+            vrs.load_identity(vault)
+
+
+class TestMigrateLeftovers:
+    def test_a_leftover_temporary_key_is_removed_whatever_the_state(self, legacy, monkeypatch):
+        path, _ref, _key = legacy
+
+        def killed(*args):
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(vm, "_rebind", killed)
+        with pytest.raises(KeyboardInterrupt):
+            vm.migrate_vault(PASSPHRASE, path)
+        monkeypatch.undo()
+        os.link(path / vs.IDENTITY, path / f".{vs.IDENTITY}.tmp")  # a kill before its unlink
+        assert ".identity.key.tmp" in vs.vault_status(path)["files"]
+        assert vm.migrate_vault(None, path) is None  # resume
+        assert not (path / f".{vs.IDENTITY}.tmp").exists()
+
+    def test_a_key_that_is_not_the_recipients_pair_is_never_resumed(self, legacy):
+        from pyrage import x25519
+
+        path, _ref, _key = legacy
+        (path / vs.IDENTITY).write_text(str(x25519.Identity.generate()) + "\n")
+        os.chmod(path / vs.IDENTITY, 0o600)
+        status = vs.vault_status(path)
+        assert status["migrate"] != "resume"
+        assert status["error"] and "stopped part-way" not in status["error"]

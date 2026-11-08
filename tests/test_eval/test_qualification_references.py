@@ -126,6 +126,46 @@ def mixed():
     return guidance, cases
 
 
+def test_previous_task_completion_references_require_fresh_review():
+    guidance, cases = mixed()
+    name = "bench_task_success"
+    case = cases[name][0]
+    corpus.validate(name, [case], reference_policy=guidance)
+    case["reference_provenance"]["rubric_version"] = "1.0.0"
+    receipt(name, case, guidance)
+    with pytest.raises(Incomplete, match="mismatched contract version"):
+        corpus.validate(name, [case], reference_policy=guidance)
+
+
+def test_previous_human_task_completion_references_are_not_reinterpreted():
+    _, cases = mixed()
+    case = cases["bench_task_success"][1]
+    rubric = get_rubric("bench_task_success")
+    _validate_references([case], rubric)
+    case["reference_provenance"]["rubric_version"] = "1.0.0"
+    with pytest.raises(ValueError, match="reference rubric_version"):
+        _validate_references([case], rubric)
+
+
+async def test_previous_task_completion_refuses_before_preflight_render(tmp_path, monkeypatch):
+    from genesis.eval.qualification import preflight
+
+    guidance, cases = mixed()
+    name = "bench_task_success"
+    case = cases[name][0]
+    corpus.validate(name, [case], reference_policy=guidance)
+    case["reference_provenance"]["rubric_version"] = "1.0.0"
+    receipt(name, case, guidance)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("stale reference reached rendering/provider setup")
+
+    monkeypatch.setattr(preflight.contracts, "Sandbox", forbidden)
+    monkeypatch.setattr(preflight, "Capture", forbidden)
+    with pytest.raises(Incomplete, match="mismatched contract version"):
+        await preflight.prepare({name: [case]}, tmp_path, reference_policy=guidance)
+
+
 def approval(cases, guidance):
     return {
         "label_source": "human",

@@ -18,13 +18,13 @@ is the one that goes stale.
 | A number without a denominator is not a measurement | same |
 | A truncated listing is not absence | same |
 | An "absent" claim needs enumeration, not a failed spot-check | same |
-| **Vacuous tests** — the named shapes, and "would this still pass if the mechanism it names were deleted?" | SKILL.md, Test-First Discipline |
+| **Vacuous tests** — the named shapes, and "would this still pass if the mechanism it names were deleted?" | build-session, "Test-First Discipline, continued" (its verify-RED core is in `commit-path.md`) |
 | **A RED that comes back GREEN has six causes**, the first being that the run never executed — abort when the command emits no result line | same |
 | **Mutation housekeeping** — proving a mutation applied, restore placement, hashing, and PRESERVING a file that no longer matches what the mutation wrote | same |
 | A corpus replay is structurally blind to a shape nobody has typed | same, and the guard-corollary block |
-| Every harness needs a control expected to FAIL, wired as an abort | SKILL.md, guard corollaries ("pair it with a control that DOES flip") |
+| Every harness needs a control expected to FAIL, wired as an abort | build-session, Common Traps: the guard corollaries ("pair it with a control that DOES flip") |
 | Re-measure another agent's finding before acting on it | CLAUDE.md, "Verify agent output" |
-| Acceptance bar + measured rate as the default method | SKILL.md, On-Load Mindset |
+| Acceptance bar + measured rate as the default method | build-session, "Acceptance Bar + Measured Rate" |
 | **Choosing a command/value by reasoning about an external tool** — do not; §9 below | here |
 | **Instrument for the answer, not the alarm** — the trigger, and the one-question test for an instrument | CLAUDE.md, "Instrument For The Answer, Not The Alarm"; mechanics in §10 below |
 
@@ -72,7 +72,7 @@ Reading alone finds little. What finds things:
   model of the syntax
 
 A corpus replay and a generated matrix answer different questions and neither
-substitutes for the other (SKILL.md carries the full form of this). When you
+substitutes for the other (build-session's SKILL.md carries the full form of this). When you
 find one defect, search for its SHAPE across the codebase, not for the symptom.
 
 ## 5. Check what is already in flight before claiming novelty
@@ -196,6 +196,22 @@ contradicted each other so that nothing could satisfy both, and a decorated
 directory name passed where a state label belonged — which made an arm report
 that every candidate failed.
 
+A MUTATION harness has two more instrument defects of its own (#2255):
+
+- **Restore must survive a signal.** A Python `finally:` does not run on SIGTERM
+  or SIGHUP unless a handler turns the signal into an exception (MEASURED
+  2026-10-22, Python 3.12; a bash `EXIT` trap did run on both), so a harness
+  killed by a timeout leaves the tree MUTATED. Install handlers for SIGTERM, SIGINT
+  and SIGHUP, and after the restore re-read the file and compare hashes rather
+  than trusting the copy. Nothing in-process survives SIGKILL, and the next run's
+  baseline would be taken from the mutated file, so the check before each cycle
+  does not catch it either. Mutate a disposable copy (a scratch worktree), or
+  keep the pristine original outside the process and have every run compare
+  against it (or against `git`) before taking its baseline.
+- **Refuse to mutate on a non-unique anchor.** Assert the anchor matches exactly
+  the expected number of times (once, for a single-site mutation) before writing. A harness that edits blind measures the wrong line and
+  reports a verdict about a different function.
+
 ### Split the space where the question stops being well-posed
 
 Sometimes the sweep reveals that one region cannot be scored at all — a comparison
@@ -292,7 +308,7 @@ defects a fully green suite had shipped past, each one a sentence that outran
 its evidence.
 
 **Claims live in ENUMERABLE places, which is what makes this mechanical rather
-than a mood.** This is the canonical list; SKILL.md and CLAUDE.md point here
+than a mood.** This is the canonical list; the skills and CLAUDE.md point here
 rather than carrying their own copies:
 
 | Surface | Why it goes wrong |
@@ -331,7 +347,7 @@ sits:
    different question.** An allowlist comment and a classifier docstring
    disagreed about whether skill-file findings score; calling the predicate
    settled it in seconds, and the comment-reading was the wrong one. The
-   generalisation is already written up in SKILL.md's Pre-Merge Gate section
+   generalisation is already written up in `references/merge-gate-findings.md`
    under `_is_doc_path` — read it there.
 
 Denominators for negatives are covered by the table at the top of this file and

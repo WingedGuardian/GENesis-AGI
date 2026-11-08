@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -41,6 +42,23 @@ def test_unrelated_commands_do_not_lookup_budget(adapter, monkeypatch, command):
     monkeypatch.setattr(adapter.requests, "_check_codex_round_escalation", lambda *a: ("allow", ""))
     monkeypatch.setattr(adapter.commits, "_branch_review_budget", lambda *a, **kw: pytest.fail("lookup"))
     assert adapter.decide(payload(command)) is None
+
+
+@pytest.mark.parametrize(
+    ("command", "blocked"),
+    [
+        ("bash -c " + shlex.quote("echo ok # don't\ngit $ACTION status"), True),
+        ("bash -c " + shlex.quote("echo ok # don't\ngh pr $ACTION 1"), True),
+        ("bash -c " + shlex.quote("echo ok # don't\nprintf hello"), False),
+    ],
+)
+def test_nested_blind_git_gh_errors_but_unrelated_text_is_allowed(
+    adapter, monkeypatch, command, blocked
+):
+    monkeypatch.setattr(
+        adapter.commits, "_branch_review_budget", lambda *a, **kw: pytest.fail("lookup")
+    )
+    assert bool(adapter.decide(payload(command))) is blocked
 
 
 @pytest.mark.parametrize("result", [None, {"status": "ok", "commit_approval_required": False}])
@@ -139,6 +157,35 @@ def test_explicit_review_identity_reaches_unchanged_policy(adapter, monkeypatch,
     monkeypatch.setattr(adapter.requests, "_check_codex_round_escalation", policy)
     assert adapter.decide(payload(f'gh pr comment {selector} --body "@codex review"')) is None
     assert seen == [("1", "owner/repo")]
+
+
+@pytest.mark.parametrize("flag", ["--repo {}", "--repo={}", "-R {}", "-R{}", "-R={}"])
+@pytest.mark.parametrize("repo", ["github.com/owner/repo", "github.com/other/repo"])
+@pytest.mark.parametrize("before", [False, True])
+def test_mixed_review_selectors_never_query_budget(adapter, monkeypatch, flag, repo, before):
+    url = "https://github.com/owner/repo/pull/1"
+    selector = flag.format(repo)
+    target = f"{selector} {url}" if before else f"{url} {selector}"
+    monkeypatch.setattr(adapter.requests._review_budget, "evaluate_pr",
+                        lambda *a, **kw: pytest.fail("budget lookup"))
+    assert isinstance(adapter.decide(payload(f'gh pr comment {target} --body "@codex review"')),
+                      adapter.Fixable)
+
+
+@pytest.mark.parametrize("selector", [
+    "1 --repo github.com/owner/repo", "1 -R=github.com/owner/repo",
+    "https://github.com/owner/repo/pull/1",
+])
+def test_literal_review_identity_queries_intended_budget(adapter, monkeypatch, selector):
+    seen = []
+
+    def budget(repo, number, **kwargs):
+        seen.append((repo, number))
+        return {"status": "ok", "approval_required": False}
+
+    monkeypatch.setattr(adapter.requests._review_budget, "evaluate_pr", budget)
+    assert adapter.decide(payload(f'gh pr comment {selector} --body "--repo other/repo @codex review"')) is None
+    assert seen == [("owner/repo", "1")]
 
 
 @pytest.mark.parametrize("command", [

@@ -12,6 +12,18 @@ uniqueness of the selected rendered prompt: IDs, unused fields, truncation or
 selection can differ while the judge sees the same question. Part5 preflight
 must hash every actual rendered request and reject duplicates before execution.
 
+`bench_task_success` 1.1.0 treats an answer that omits or contradicts an explicitly
+required substantive deliverable as incomplete, with an instructed score ceiling
+of 0.5 below the unchanged 0.6 pass threshold. Requirements in the task count even
+when not repeated in the criteria. Optional details and writing quality are
+separate; requested progress updates and accepted refusal outcomes are judged in
+their stated context. This is a model instruction, not deterministic semantic
+enforcement by the numeric scorer. Skill replay also uses this rubric.
+References pinned to 1.0.0 need genuine new-version review before qualification;
+historical labels, reports and approvals are not automatically migrated. Class
+floors remain unchanged. Changing shared policy feedback also invalidates each
+case's policy-bound review, including otherwise unaffected contracts.
+
 Human-only rubric references use the existing strict calibration validator.
 Frontier-assisted loading requires a validated policy and reference admission
 receipts. Shared actor checks require feedback reviewers to declare their own human/frontier

@@ -57,16 +57,17 @@ def test_the_audit_is_armed():
 
 
 def test_the_session_allows_its_test_home_and_the_lock_it_took(request):
-    """Installed after the closure moved HOME: the test home (under the real home
-    in ``~/tmp/pytest/<pid>``) is allowed, and the lock file is the one this run
-    holds, not one re-resolved under the test home."""
+    """Installed after the closure: its test home, when it gives the session one
+    (under the real home in ``~/tmp/pytest/<pid>``), is allowed, and the lock file
+    is the one this run holds, not one re-resolved under a test home."""
     from tests import _live_closure
 
-    if _live_closure._S.home:
+    test_home = getattr(_live_closure._S, "home", None)
+    if test_home:
         # The home itself, not a parent: with the basetemp redirect the per-PID
         # leaf already contains it, which would hide a missing entry; without it
         # (CI, an explicit --basetemp) the home is the only root that covers it.
-        assert os.path.realpath(_live_closure._S.home) in audit._S.allowed_roots
+        assert os.path.realpath(test_home) in audit._S.allowed_roots
     lock = request.config._genesis_pytest_lock
     if lock.acquired:
         assert audit._S.allowed_files == frozenset({os.path.realpath(str(lock._path))})

@@ -13,44 +13,18 @@ two ways:
 1. **An audit hook** (PEP 578) sees every process THIS interpreter starts
    (``subprocess.Popen`` incl. asyncio and ``shell=True``, ``os.posix_spawn``,
    ``os.exec*`` incl. ``os.spawn*``, ``os.system``) and refuses, before any
-   process exists, when the program is:
-
-   - one of ``DENY_NAMES`` (claude, systemd-run, systemctl, sudo, gh, loginctl;
-     ``claude.exe``/``claude-code`` count as claude) resolving anywhere but a
-     test's own temp dir or the fence's stubs. A bare name resolves through the
-     call's own ``PATH`` (including a ``PATH=`` the command line sets), so it
-     normally finds a stub: ``claude`` (except a bare ``--version``/``--help``)
-     and ``sudo`` stubs are refused, so code that finds a stub never mistakes it
-     for the real thing; the ``ANSWERED_NAMES`` stubs (and those two ``claude``
-     reads) run and answer as the real tool does on a CI runner, where nothing
-     is reachable (no bus: exit 1; gh unauthenticated: exit 4), and are
-     reported, not failed. A stub exists only for a tool installed on this
-     machine, so ``shutil.which`` still says "not installed" where it is not;
-   - a deploy script (``scripts/{update,deploy_code_only,restore,backup,
-     bootstrap}.sh``) run against live state: with the real ``HOME``, or acting
-     on the deployed checkout. Where a script acts is computed per script:
-     ``update.sh`` and ``deploy_code_only.sh`` act on their root override
-     (``GENESIS_UPDATE_ORIG_DIR``, ``GENESIS_DEPLOY_ROOT``) or else on the
-     checkout they live in; ``backup.sh`` and ``restore.sh`` on ``GENESIS_DIR``
-     or else ``$HOME/genesis``; ``bootstrap.sh`` on the checkout it lives in.
-     Tests run these scripts with a private ``HOME`` and a fixture tree all the
-     time, which stays allowed. ``bash -n`` (parse only) is allowed. A command
-     named like a deploy script whose file cannot be found (a path the shell
-     builds at run time) is judged by the ``HOME`` rule alone.
-
-   Each command is judged as far as the repo's own parser
-   (``scripts/hooks/shell_parse.py``) can read it: wrappers (env, timeout,
-   setsid, sudo and the like) are stripped and judged themselves, ``-c`` strings
-   and here-strings fed to a shell are opened, and every resulting command gets
-   both checks, under every ``PATH`` the line sets. Heredoc bodies that only
-   feed data to a command (``cat <<EOF``) are dropped first, since the parser
-   would otherwise read their lines as commands. Under the ``user_manager``
-   opt-out, the command an in-process ``systemd-run`` would start is judged too.
-   What the parser does not open (``eval``, a command held in a variable, a
-   function body, a script piped or redirected into a shell, ``find -exec``,
-   ``su``/``runuser``/``flock``/``script``/``unshare``/``setpriv``) is judged
-   only by the PATH stubs, so a bare name there is still caught and an absolute
-   path is not.
+   process exists, when the PROGRAM it will run — the resolved file, never its
+   arguments or a shell string — is one of ``DENY_NAMES`` (claude, systemd-run,
+   systemctl, sudo, gh, loginctl; ``claude.exe``/``claude-code`` count as
+   claude) resolving anywhere but a test's own temp dir or the fence's stubs.
+   A bare name resolves through the call's own ``PATH``, so it normally finds
+   a stub: ``claude`` (except a bare ``--version``/``--help``) and ``sudo``
+   stubs are refused, so code that finds a stub never mistakes it for the real
+   thing; the ``ANSWERED_NAMES`` stubs (and those two ``claude`` reads) run and
+   answer as the real tool does on a CI runner, where nothing is reachable (no
+   bus: exit 1; gh unauthenticated: exit 4), and are reported, not failed. A
+   stub exists only for a tool installed on this machine, so ``shutil.which``
+   still says "not installed" where it is not.
 
    The refusal is ``LiveStateViolation``, a ``BaseException``, so a caller's
    ``except OSError`` / ``except Exception`` fallback cannot catch it and try a
@@ -60,6 +34,20 @@ two ways:
    recorded and the child exits 127 instead, so it never unwinds into a second
    copy of the pytest session.
 
+   Arguments are never judged: which file ``bash -c <string>`` or a heredoc
+   would run is unknowable in-process, and every attempt to predict it leaked
+   launch forms. A deploy script run through any shell spelling instead refuses
+   ITSELF: the fence exports ``GENESIS_TEST_FENCE_LIVE_ROOTS`` (this checkout's
+   real root, the real home's ``~/.genesis``/``~/genesis`` whether or not they
+   exist yet, and
+   a root named in ``GENESIS_LIVE_FENCE_LIVE_ROOT``) and
+   ``GENESIS_TEST_FENCE_LOG`` (this log), and
+   ``scripts/lib/live_system_guard.sh``'s ``refuse_if_test_fenced_live`` makes
+   each deploy script refuse — ``REFUSED (test fence): ...`` on stderr, the same
+   line appended here, exit 97 — when its acting root, ``HOME``,
+   ``GENESIS_HOME`` or ``HOME/.genesis`` is at or under a listed root, or a
+   path it must check cannot be resolved provably.
+
 2. **PATH shims** for processes a child starts (a script under test, a detached
    orchestrator): a directory of refusing, logging stubs goes first on ``PATH``,
    ``GENESIS_CC_BIN`` points at the ``claude`` stub, and the session-bus
@@ -68,28 +56,27 @@ two ways:
    sandbox exists for: an absolute path in a child (``/usr/bin/systemctl``); a
    child given a hand-built ``env`` without the fence's ``PATH`` and bus
    variables (scripts that default ``XDG_RUNTIME_DIR`` when it is unset then
-   reach the real user manager); a ``systemd-run`` a child starts in a
-   ``user_manager`` test.
+   reach the real user manager); whatever a child shell string or a real
+   ``systemd-run`` in a ``user_manager`` test goes on to start.
 
 Every refusal, from either layer, is appended to one log with the test's node
 id. The test that caused it fails at teardown even if the code swallowed the
-exception; a hit that arrives after its test ended (a detached child) fails the
-session.
+exception; a hit drained after its test ended (a detached child) fails the
+session. Reporting ends at the final session drain. Shim files remain in their
+unique temp directory for surviving children, until normal temp cleanup.
 
 Opt-outs, each listed in the terminal summary: a test marked ``user_manager``
 may run the real ``systemd-run`` (for a transient ``--user`` scope or a unit
-check) and keeps the bus variables, while what it starts is still judged; a
-test marked ``real_tool("gh")`` deliberately runs the named installed tools
-(their own ``--help``, a kernel probe) and gets no stub for those names. Deploy
-scripts against live state stay refused for both.
+check) and keeps the bus variables; a test marked ``real_tool("gh")``
+deliberately runs the named installed tools (their own ``--help``, a kernel
+probe) and gets no stub for those names.
 """
 
 from __future__ import annotations
 
-import importlib.util
+import json
 import os
 import pwd
-import re
 import shlex
 import shutil
 import sys
@@ -103,6 +90,7 @@ DENY_NAMES = frozenset({"claude", "systemd-run", "systemctl", "sudo", "gh", "log
 # Other names the same programs install under (the repo's own list:
 # cc/slot_liveness.py): the claude launcher is a symlink to `claude.exe`.
 _ALIASES = {"claude.exe": "claude", "claude-code": "claude"}
+_STUB_NAMES = DENY_NAMES | _ALIASES.keys()
 # Of those, the tools hundreds of existing tests reach only to READ live state
 # (a user-manager query, a GitHub GET). Called by bare name they get the stub,
 # which answers as the real tool does on CI (nothing reachable) and is reported,
@@ -113,38 +101,12 @@ _ALIASES = {"claude.exe": "claude", "claude-code": "claude"}
 ANSWERED_NAMES = frozenset({"systemctl", "systemd-run", "gh", "loginctl"})
 # What a ``user_manager`` test may run for real.
 USER_MANAGER_ALLOWED = frozenset({"systemd-run"})
-DEPLOY_SCRIPTS = frozenset(
-    {"update.sh", "deploy_code_only.sh", "restore.sh", "backup.sh", "bootstrap.sh"}
-)
-_SHELLS = frozenset({"bash", "sh", "dash", "zsh", "ksh"})
-# A heredoc fed to one of these runs its body.
-_INTERPRETERS = _SHELLS | {"python", "python3", "node", "perl", "ruby", "source", "."}
-# Root overrides: where a deploy script acts instead of the checkout it lives in
-# (a test seam: a fixture tree in place of the checkout).
-_ROOT_OVERRIDES = {
-    "deploy_code_only.sh": "GENESIS_DEPLOY_ROOT",
-    "update.sh": "GENESIS_UPDATE_ORIG_DIR",
-}
-# These two act on ${GENESIS_DIR:-$HOME/genesis} (backup.sh, restore.sh), not
-# on where they live.
-_GENESIS_DIR_SCRIPTS = frozenset({"backup.sh", "restore.sh"})
-# systemd-run options that take their value as the next argument (systemd 255).
-_SYSTEMD_RUN_VALUE_OPTS = frozenset(
-    {
-        "-H", "--host", "-M", "--machine", "-u", "--unit", "-p", "--property",
-        "-E", "--setenv", "--description", "--slice", "--expand-environment",
-        "--service-type", "--uid", "--gid", "--nice", "--working-directory",
-        "--path-property", "--socket-property", "--on-active", "--on-boot",
-        "--on-startup", "--on-unit-active", "--on-unit-inactive", "--on-calendar",
-        "--timer-property", "--job-mode",
-    }
-)  # fmt: skip
 _EVENTS = frozenset({"subprocess.Popen", "os.posix_spawn", "os.exec", "os.system"})
 # Exactly these argv tails of `claude` only READ the binary (CI: not installed),
 # so the stub answers them; every other `claude` call is refused.
 _CLAUDE_READS = (["--version"], ["--help"])
-_ASSIGN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
-_HEREDOC = re.compile(r"<<(-?)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
+# First words of a deploy script's own refusal line (see the module docstring).
+_REFUSAL_PREFIX = "REFUSED"
 # Captured at import: tests monkeypatch shutil.which, and the fence must keep
 # resolving programs the way exec will.
 _which = shutil.which
@@ -157,7 +119,7 @@ class LiveStateViolation(BaseException):  # noqa: N818 - named for what it is
 class _State:
     installed = False
     pid = 0  # the pytest process; a refusal in a forked child exits instead
-    real_home = ""
+    real_home: str | None = None
     orig_path = ""  # PATH before the fence put its stubs in front
     shim_dir = ""
     all_stub_dir = ""  # every DENY_NAMES stub, for the fence's own tests
@@ -167,12 +129,12 @@ class _State:
     allowed_roots: tuple[str, ...] = ()
     opted_out = False  # the running test is marked user_manager
     real_tool_names: frozenset[str] = frozenset()  # what this real_tool test may run
-    live_roots: frozenset[str] = frozenset()  # the deployed checkout on this machine
     real_tool_tests: list[str] = []
     opted_out_tests: list[str] = []
     late_hits: list[str] = []
     answered: list[str] = []  # stub answers: reported, never failed
     saved_bus: dict[str, str | None] = {}
+    merged_workers: set[str] = set()  # xdist workers whose findings were merged
 
 
 _S = _State()
@@ -181,7 +143,9 @@ _S = _State()
 # ── decision ────────────────────────────────────────────────────────────────
 
 
-def _real(path: str) -> str:
+def _real(path: str, cwd=None) -> str:
+    if cwd is not None and not os.path.isabs(path):
+        path = os.path.join(cwd, path)
     try:
         return os.path.realpath(path)
     except (OSError, ValueError):
@@ -203,29 +167,6 @@ def _env_get(env, key: str):
     return None
 
 
-def _with_assignments(env, words) -> dict | Mapping | None:
-    """``env`` plus the ``NAME=value`` words a command line sets in front of a
-    command (``env PATH=/usr/bin systemctl``, ``PATH=/x cmd``)."""
-    assigned = {w.split("=", 1)[0]: w.split("=", 1)[1] for w in words if _ASSIGN.match(w)}
-    if not assigned:
-        return env
-    base = os.environ if env is None else env
-    merged = {os.fsdecode(k): os.fsdecode(v) for k, v in base.items()} if base else {}
-    merged.update(assigned)
-    return merged
-
-
-def _line_paths(line: str, env) -> list:
-    """Environments to resolve names under: the call's own, plus one per
-    ``PATH=`` the line sets anywhere (on a wrapper, inside a ``-c`` string, by
-    ``export``), and the default PATH when ``env -i``/``env -u PATH`` clears it.
-    A name is judged under each, since any of them may be the one in force."""
-    values = [v.strip("'\"") for v in re.findall(r"(?:^|[\s;&|(`'\"])PATH=([^\s;&|)`]+)", line)]
-    if re.search(r"\benv\s+(?:-\w*i\b|--ignore-environment|-u\s*PATH\b|--unset[= ]PATH\b)", line):
-        values.append(os.defpath)
-    return [_with_assignments(env, [f"PATH={v}"]) for v in dict.fromkeys(values)]
-
-
 def _resolve(program: str, env, cwd=None) -> str | None:
     """The file a program name runs: a path (relative to ``cwd``) when it has a
     '/', else via the call's PATH. None when there is no such file: it cannot run,
@@ -233,177 +174,36 @@ def _resolve(program: str, env, cwd=None) -> str | None:
     if "/" in program:
         path = program if os.path.isabs(program) else os.path.join(cwd or os.getcwd(), program)
         return path if os.path.exists(path) else None
-    search = _env_get(env, "PATH") or os.defpath
+    search = _env_get(env, "PATH")
+    if search is None:
+        search = os.defpath
+    # Empty and relative PATH components are relative to the child's cwd,
+    # including an explicitly empty PATH (which is not the default PATH).
+    search = os.pathsep.join(
+        part if os.path.isabs(part) else os.path.join(cwd or os.getcwd(), part)
+        for part in search.split(os.pathsep)
+    )
     return _which(program, path=search)
 
 
-def _shell_parse():
-    """The repo's own shell parser (scripts/hooks/shell_parse.py, stdlib-only),
-    loaded once under a private module name so it cannot shadow the `shell_parse`
-    other tests import."""
-    global _SP  # noqa: PLW0603
-    if _SP is None:
-        path = Path(__file__).resolve().parent.parent / "scripts" / "hooks" / "shell_parse.py"
-        spec = importlib.util.spec_from_file_location("_live_fence_shell_parse", path)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
-        _SP = module
-    return _SP
-
-
-_SP = None
-
-
-def _heredoc_ops(line: str) -> list[int]:
-    """Offsets of the ``<<`` heredoc operators in one line of shell: not inside
-    quotes, a ``#`` comment or an arithmetic ``$((...))``, and not ``<<<``."""
-    found: list[int] = []
-    quote = ""
-    arith = 0
-    i = 0
-    while i < len(line):
-        c = line[i]
-        if quote:
-            if c == "\\" and quote == '"':
-                i += 2
-                continue
-            if c == quote:
-                quote = ""
-            i += 1
-            continue
-        if c == "\\":
-            i += 2
-            continue
-        if line.startswith("$((", i):
-            arith += 1
-            i += 3
-            continue
-        if arith and line.startswith("))", i):
-            arith -= 1
-            i += 2
-            continue
-        if c in "'\"":
-            quote = c
-        elif c == "#" and (i == 0 or line[i - 1] in " \t;&|("):
-            break
-        elif not arith and line.startswith("<<", i):
-            if line.startswith("<<<", i):
-                i += 3
-                continue
-            found.append(i)
-            i += 2
-            continue
-        i += 1
-    return found
-
-
-def _runs_code(words: str) -> bool:
-    """Whether a command line names a shell or interpreter anywhere, or pipes on:
-    a heredoc or here-string on that line may be code, not data."""
-    if "|" in words:
-        return True
-    return any(os.path.basename(w) in _INTERPRETERS for w in re.findall(r"[\w./+-]+", words))
-
-
-def _drop_heredoc_bodies(text: str) -> str:
-    """``text`` without the bodies of heredocs that only feed DATA to a command
-    (``cat <<EOF``, ``tee f <<'EOF'``): the parser has no heredoc state and would
-    read their lines as commands. A body is kept when it may run: its line names
-    a shell or interpreter anywhere or pipes onward, or (unquoted delimiter) it
-    holds a ``$(...)`` or backtick substitution, which the shell expands."""
-    if "<<" not in text or "\n" not in text:
-        return text
-    lines = text.split("\n")
-    out: list[str] = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        out.append(line)
-        i += 1
-        ops = _heredoc_ops(line)
-        if not ops:
-            continue
-        m = _HEREDOC.match(line, ops[0])
-        if not m:
-            continue
-        dash, quote, delim = m.group(1), m.group(2), m.group(3)
-        body: list[str] = []
-        end = None
-        while i < len(lines):
-            candidate = lines[i]
-            i += 1
-            if (candidate.lstrip("\t") if dash else candidate) == delim:
-                end = candidate
-                break
-            body.append(candidate)
-        runs = _runs_code(line[: m.start()] + " " + line[m.end() :])
-        expands = not quote and any("$(" in b or "`" in b for b in body)
-        # A second heredoc on the line: its body follows; keep both (over-read).
-        if runs or expands or end is None or len(ops) > 1:
-            out.extend(body)
-            if end is not None:
-                out.append(end)
-    return "\n".join(out)
-
-
-def _here_strings(text: str) -> list[str]:
-    """The strings fed by ``<<<`` to a shell or interpreter: code, not data."""
-    found = []
-    for line in text.split("\n"):
-        for m in re.finditer(r"<<<\s*(?:'([^']*)'|\"([^\"]*)\"|(\S+))", line):
-            if _runs_code(line[: m.start()]):
-                found.append(next(g for g in m.groups() if g is not None))
-    return found
-
-
-def _segments(command: str) -> list[tuple[list[str], list[str]]]:
-    """Every command the shell would run for ``command``, as ``(argv, wrappers)``:
-    the house parser strips wrappers (env, timeout, setsid, sudo and the like) and
-    opens ``-c`` strings; ``wrappers`` are the words in front of that command it
-    stripped, so a wrapper that is itself refused (``sudo``) is still seen, and a
-    ``PATH=`` set there is honored. An unparseable command yields only its plain
-    split (stated residual)."""
-    try:
-        segs, _blind = _shell_parse().analyze_checked(command)
-    except Exception:  # noqa: BLE001 - a parser fault must not break every test
-        segs = []
-    out = []
-    for seg in segs:
-        try:
-            raw = shlex.split(seg.raw)
-        except ValueError:
-            raw = []
-        if not seg.argv:
-            # Only wrappers (`sudo -v`, a bare `sudo`): judge them all.
-            if raw:
-                out.append(([], raw))
-            continue
-        cut = raw.index(seg.argv[0]) if seg.argv[0] in raw else 0
-        out.append((list(seg.argv), raw[:cut]))
-    if not out:
-        try:
-            out = [(shlex.split(command), [])]
-        except ValueError:
-            out = []
-    return out
-
-
-def _tool_name(program: str) -> str:
-    """The DENY_NAMES entry ``program`` runs, by its name or, for a path, by the
-    name of the file it resolves to; else its plain basename."""
+def _tool_name(program: str, env, cwd=None) -> str:
+    """The DENY_NAMES entry ``program`` runs, by its name or by the name of the
+    file it resolves to (a slash path against ``cwd``, a bare name against the
+    child's PATH); else its plain basename."""
     name = os.path.basename(program)
     name = _ALIASES.get(name, name)
-    if name not in DENY_NAMES and "/" in program:
-        target = os.path.basename(_real(program))
-        target = _ALIASES.get(target, target)
-        if target in DENY_NAMES:
-            return target
+    if name not in DENY_NAMES:
+        resolved = program if "/" in program else _resolve(program, env, cwd)
+        if resolved is not None:
+            target = os.path.basename(_real(resolved, cwd))
+            target = _ALIASES.get(target, target)
+            if target in DENY_NAMES:
+                return target
     return name
 
 
 def _deny_reason(program: str, argv: list[str], env, cwd) -> str | None:
-    name = _tool_name(program)
+    name = _tool_name(program, env, cwd)
     if name not in DENY_NAMES or name in _S.real_tool_names:
         return None
     if _S.opted_out and name in USER_MANAGER_ALLOWED:
@@ -421,98 +221,13 @@ def _deny_reason(program: str, argv: list[str], env, cwd) -> str | None:
     return None
 
 
-def _deploy_script(path: str, cwd) -> tuple[str, str | None] | None:
-    """``(name, checkout root)`` when ``path`` runs a deploy script; the root is
-    None when the file cannot be found (a path the shell builds at run time, a
-    relative path from a directory only the shell knows)."""
-    full = path if os.path.isabs(path) else os.path.join(cwd or os.getcwd(), path)
-    if os.path.exists(full):
-        real = Path(_real(full))
-        if real.name in DEPLOY_SCRIPTS and real.parent.name == "scripts":
-            return real.name, str(real.parent.parent)
-        return None
-    name = os.path.basename(path)
-    return (name, None) if name in DEPLOY_SCRIPTS else None
-
-
-def _script_args(argv: list[str]) -> list[str]:
-    """The script a script-running program would run: a shell's first operand
-    (none with ``-c``, whose string is judged as commands; none with ``-n``, parse
-    only, when it comes BEFORE the script), what ``source``/``.`` read, and any
-    operand of ``systemd-run``."""
-    head = os.path.basename(argv[0])
-    if head in _SHELLS:
-        for i, arg in enumerate(argv[1:], 1):
-            if arg.startswith("--") or arg in ("-o", "+o", "-O", "+O"):
-                continue
-            if arg.startswith(("-", "+")):
-                if "c" in arg[1:] or "n" in arg[1:]:
-                    return []
-                continue
-            if argv[i - 1] in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file"):
-                continue
-            return [arg]
-        return []
-    if head in ("source", "."):
-        return argv[1:2]
-    if head == "systemd-run":
-        return [a for a in argv[1:] if not a.startswith("-")]
-    return []
-
-
-def _deploy_reason(argv: list[str], env, cwd) -> str | None:
-    """A deploy script run against live state: by the real HOME, or acting on the
-    live install's checkout (see the module docstring for where each acts)."""
-    if not argv:
-        return None
-    for arg in [argv[0], *_script_args(argv)]:
-        found = _deploy_script(arg, cwd)
-        if found is None:
-            continue
-        name, root = found
-        home = _env_get(env, "HOME")
-        if name in _GENESIS_DIR_SCRIPTS:
-            target = _env_get(env, "GENESIS_DIR") or (
-                os.path.join(home, "genesis") if home else None
-            )
-        else:
-            target = _env_get(env, _ROOT_OVERRIDES.get(name, "")) or root
-        target = _real(target) if target else None
-        if not home or _real(home) == _real(_S.real_home):
-            why = "the real HOME"
-        elif target in _S.live_roots:
-            why = f"the live install's checkout as its root ({target})"
-        else:
-            continue
-        return (
-            f"{name} run with {why}: a deploy script against this machine's live "
-            "state (give it a private HOME and point its root at a fixture tree)"
-        )
-    return None
-
-
-def _systemd_run_payload(argv: list[str]) -> list[str]:
-    """The command a ``systemd-run`` argv starts."""
-    i = 1
-    while i < len(argv):
-        arg = argv[i]
-        if arg == "--":
-            return argv[i + 1 :]
-        if not arg.startswith("-") or arg == "-":
-            return argv[i:]
-        if arg in _SYSTEMD_RUN_VALUE_OPTS:
-            i += 1
-        i += 1
-    return []
-
-
 def judge(program, argv, env, cwd=None) -> str | None:
     """Why this exec must be refused, or None to allow it.
 
     ``program`` is what the kernel will run (a path or a bare name), ``argv``
     the argument vector, ``env`` the child's environment (None = inherited),
-    ``cwd`` its working directory (None = the current one). Every command the
-    argv would run is judged, wrappers and ``-c`` strings included.
+    ``cwd`` its working directory (None = the current one). Only the resolved
+    program is judged — never its arguments or a shell string.
     """
     if program is None and argv:
         program = argv[0]
@@ -521,47 +236,7 @@ def judge(program, argv, env, cwd=None) -> str | None:
     program = os.fsdecode(program)
     argv = [os.fsdecode(a) for a in (argv or [])]
     cwd = os.fsdecode(cwd) if cwd is not None else None
-    reason = _deny_reason(program, argv, env, cwd)
-    if reason:
-        return reason
-    if not argv:
-        return None
-    reason = _deploy_reason(argv, env, cwd)
-    if reason:
-        return reason
-    raw_line = shlex.join(argv)
-    for code in (c for arg in argv for c in _here_strings(arg)):
-        reason = judge("sh", ["sh", "-c", code], env, cwd)
-        if reason:
-            return reason
-    line = shlex.join(_drop_heredoc_bodies(a) for a in argv)
-    alt_envs = _line_paths(raw_line, env)
-    for seg, wrappers in _segments(line):
-        seg_env = _with_assignments(env, wrappers)
-        for word in wrappers:
-            for e in (seg_env, *alt_envs):
-                reason = _deny_reason(word, [word], e, cwd)
-                if reason:
-                    return reason
-        if not seg:
-            continue
-        for e in (seg_env, *alt_envs):
-            reason = _deny_reason(seg[0], seg, e, cwd)
-            if reason:
-                return reason
-        reason = _deploy_reason(seg, seg_env, cwd)
-        if reason:
-            return reason
-        if _S.opted_out and _tool_name(seg[0]) == "systemd-run":
-            # A real systemd-run starts its payload in the user manager, under
-            # that manager's PATH, where no stub stands in for anything.
-            payload = _systemd_run_payload(seg)
-            if payload:
-                unit_env = dict(_with_assignments(seg_env, ["PATH=" + _S.orig_path]))
-                reason = judge(payload[0], payload, unit_env, cwd)
-                if reason:
-                    return f"systemd-run payload: {reason}"
-    return None
+    return _deny_reason(program, argv, env, cwd)
 
 
 def _record(line: str) -> None:
@@ -570,7 +245,7 @@ def _record(line: str) -> None:
     try:
         fd = os.open(_S.log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         try:
-            os.write(fd, (line.replace("\n", " ") + "\n").encode())
+            os.write(fd, (line.replace("\n", " ") + "\n").encode("utf-8", "backslashreplace"))
         finally:
             os.close(fd)
     except OSError:
@@ -585,7 +260,8 @@ def _hook(event: str, args: tuple) -> None:
         program, argv, cwd, env = args
         argv = [argv] if isinstance(argv, (str, bytes)) else list(argv or [])
     elif event == "os.system":
-        # A shell command line: judged as `sh -c <line>`, which the parser opens.
+        # A shell command line: judged on the shell it starts (`sh`). The shim
+        # refuses whatever deny-listed name that shell goes on to run.
         program, argv, env = "sh", ["sh", "-c", os.fsdecode(args[0])], None
     else:  # os.posix_spawn, os.exec
         program, argv, env = args
@@ -611,14 +287,15 @@ def _hook(event: str, args: tuple) -> None:
 
 _SHIM = """#!/bin/sh
 tag={tag}
-if [ "$(basename "$0")" = claude ] && [ $# -eq 1 ]; then
+tool={tool}
+if [ "$tool" = claude ] && [ $# -eq 1 ]; then
   case "$1" in --version|--help) tag=answered ;; esac
 fi
 args=$(printf '%s' "$*" | tr '\\n\\t' '  ')
 printf '%s\\t%s\\t%s %s\\n' "${{PYTEST_CURRENT_TEST:-<no test>}}" "$tag" "$(basename "$0")" "$args" >> {log}
 if [ "$tag" = answered ]; then
   # What the real tool says on a CI runner, where nothing is reachable.
-  case "$(basename "$0")" in
+  case "$tool" in
     gh) echo "To get started with GitHub CLI, please run:  gh auth login" >&2; exit 4 ;;
     claude) exit 127 ;;
     *) echo "Failed to connect to bus: No such file or directory" >&2; exit 1 ;;
@@ -633,8 +310,9 @@ def _write_shims(directory: Path, log: str, names) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     for name in names:
         shim = directory / name
-        tag = "answered" if name in ANSWERED_NAMES else "shim"
-        shim.write_text(_SHIM.format(log=shlex.quote(log), tag=tag))
+        tool = _ALIASES.get(name, name)
+        tag = "answered" if tool in ANSWERED_NAMES else "shim"
+        shim.write_text(_SHIM.format(log=shlex.quote(log), tag=tag, tool=shlex.quote(tool)))
         shim.chmod(0o755)
 
 
@@ -644,8 +322,47 @@ def _stub_dir_without(names: frozenset[str]) -> str:
         return _S.shim_dir
     own = Path(_S.base) / ("bin-real-" + "-".join(sorted(names)))
     if not own.is_dir():
-        _write_shims(own, _S.log, _S.stubbed - names)
+        _write_shims(own, _S.log, {n for n in _S.stubbed if _ALIASES.get(n, n) not in names})
     return str(own)
+
+
+# Under pytest-xdist the controller arms the fence first and each worker inherits
+# its already-fenced environment. Read naively, a worker's "original" PATH would
+# start with the controller's stub directory and its saved bus would be the
+# controller's no-bus override: real_tool and user_manager tests would then get
+# stubs. So an xdist controller exports what it found, and a worker it started
+# adopts that instead. Bound to the controller's pid: a nested run inside a
+# worker has a different parent and reads its own environment, as a serial
+# nested run does.
+_ORIG_ENV = "GENESIS_LIVE_FENCE_ORIG"
+_BUS_KEYS = ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")
+
+
+def _originals(config) -> dict:
+    """The environment this fence wraps: this process's own, or for an xdist
+    worker the one its controller found before fencing it."""
+    if hasattr(config, "workerinput"):
+        try:
+            data = json.loads(os.environ.get(_ORIG_ENV, ""))
+        except ValueError:
+            data = None
+        if isinstance(data, dict) and data.get("run") == os.getppid():
+            return data
+    return {
+        "path": os.environ.get("PATH", os.defpath),
+        "bus": {k: os.environ.get(k) for k in _BUS_KEYS},
+        "cc_bin": os.environ.get("GENESIS_CC_BIN"),
+    }
+
+
+def _is_xdist_controller(config) -> bool:
+    # xdist's own test for distribution mode: `-n` sets option.tx before
+    # pytest_configure, and an explicit --tx sets it too.
+    return (
+        not hasattr(config, "workerinput")
+        and getattr(config.option, "dist", "no") != "no"
+        and bool(getattr(config.option, "tx", None))
+    )
 
 
 def install(config) -> None:
@@ -653,8 +370,22 @@ def install(config) -> None:
     if _S.installed:
         return
     _S.pid = os.getpid()
-    _S.real_home = pwd.getpwuid(os.getuid()).pw_dir
-    _S.orig_path = os.environ.get("PATH", "")
+    try:
+        _S.real_home = pwd.getpwuid(os.getuid()).pw_dir
+    except KeyError:
+        # Numeric-UID containers need not have an /etc/passwd entry. HOME is
+        # usable identity only when absolute; otherwise deploys remain refused.
+        _S.real_home = os.environ.get("HOME")
+    if not _S.real_home or not os.path.isabs(_S.real_home):
+        _S.real_home = None
+    orig = _originals(config)
+    if _is_xdist_controller(config):
+        os.environ[_ORIG_ENV] = json.dumps({"run": os.getpid(), **orig})
+    _S.orig_path = orig["path"]
+    if orig["cc_bin"] is None:
+        os.environ.pop("GENESIS_CC_BIN", None)
+    else:
+        os.environ["GENESIS_CC_BIN"] = orig["cc_bin"]
     base = Path(tempfile.mkdtemp(prefix="genesis-live-fence-"))
     _S.base = str(base)
     _S.shim_dir = str(base / "bin")
@@ -663,21 +394,12 @@ def install(config) -> None:
     Path(_S.log).touch()
     # A stub only where the tool is installed: where it is not, a bare call
     # fails as on CI and `shutil.which` keeps answering "not installed".
-    stubbed = {n for n in DENY_NAMES if _which(n, path=_S.orig_path or os.defpath)}
+    stubbed = {n for n in _STUB_NAMES if _resolve(n, {"PATH": _S.orig_path}, os.getcwd())}
     if os.environ.get("GENESIS_CC_BIN"):
         stubbed.add("claude")
     _S.stubbed = frozenset(stubbed)
     _write_shims(Path(_S.shim_dir), _S.log, _S.stubbed)
-    _write_shims(Path(_S.all_stub_dir), _S.log, DENY_NAMES)
-    # The deployed install, as a root deploy scripts may not act on. A CI
-    # checkout is never here, so the rule is inert there. An install elsewhere
-    # names its checkout in GENESIS_LIVE_FENCE_LIVE_ROOT.
-    live = {Path(_S.real_home) / "genesis"}
-    if os.environ.get("GENESIS_LIVE_FENCE_LIVE_ROOT"):
-        live.add(Path(os.environ["GENESIS_LIVE_FENCE_LIVE_ROOT"]))
-    _S.live_roots = frozenset(
-        _real(str(root)) for root in live if (root / "scripts" / "update.sh").is_file()
-    )
+    _write_shims(Path(_S.all_stub_dir), _S.log, _STUB_NAMES)
     roots = {_real(tempfile.gettempdir())}
     if config.option.basetemp:
         roots.add(_real(str(config.option.basetemp)))
@@ -688,15 +410,31 @@ def install(config) -> None:
     if "claude" in _S.stubbed:
         os.environ["GENESIS_CC_BIN"] = str(Path(_S.shim_dir) / "claude")
     nobus = base / "no-bus"
-    _S.saved_bus = {k: os.environ.get(k) for k in ("XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS")}
+    _S.saved_bus = dict(orig["bus"])
     os.environ["XDG_RUNTIME_DIR"] = str(nobus)
     os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={nobus}/bus"
+    # The deploy scripts' own guard (scripts/lib/live_system_guard.sh's
+    # refuse_if_test_fenced_live) refuses any run whose acting root is a listed
+    # root: this checkout's real root, the real home's ~/.genesis and ~/genesis
+    # (listed even when absent at install, since a test may create one mid-run),
+    # and an install elsewhere named in
+    # GENESIS_LIVE_FENCE_LIVE_ROOT. Its REFUSED line lands in this log, so the
+    # test that caused it fails at teardown.
+    live = {_real(str(Path(__file__).resolve().parent.parent))}
+    if _S.real_home:
+        live.update(
+            _real(str(root))
+            for root in (Path(_S.real_home) / ".genesis", Path(_S.real_home) / "genesis")
+        )
+    if os.environ.get("GENESIS_LIVE_FENCE_LIVE_ROOT"):
+        live.add(_real(os.environ["GENESIS_LIVE_FENCE_LIVE_ROOT"]))
+    os.environ["GENESIS_TEST_FENCE_LIVE_ROOTS"] = ":".join(sorted(live))
+    os.environ["GENESIS_TEST_FENCE_LOG"] = _S.log
     config.addinivalue_line(
         "markers",
         "user_manager: the test needs a reachable systemd user manager for a read-only "
         "or self-contained operation (a transient --user scope, a unit check); the live "
-        "fence lets it run the real systemd-run, judges what that starts, and keeps "
-        "the session-bus variables",
+        "fence lets it run the real systemd-run and keeps the session-bus variables",
     )
     config.addinivalue_line(
         "markers",
@@ -704,15 +442,18 @@ def install(config) -> None:
         "real (it checks a table against their own --help, or probes the kernel); the "
         "live fence lets those names run and lists the test",
     )
-    _shell_parse()  # load now: never import from inside the hook, mid-test
     sys.addaudithook(_hook)
     _S.installed = True
 
 
 def uninstall_files(config) -> None:
-    base = getattr(config, "_genesis_live_fence_dir", None)
-    if base:
-        shutil.rmtree(base, ignore_errors=True)
+    """Keep the file layer armed for children that outlive pytest.
+
+    Inherited PATH readers must not fall through to installed tools when the
+    parent finishes. Unique scratch directories remain for normal temp cleanup;
+    reporting ends at the session's final drain, while the shims still refuse.
+    The audit hook also remains installed, so same-process reuse stays armed.
+    """
 
 
 # ── per-test enforcement ────────────────────────────────────────────────────
@@ -720,6 +461,8 @@ def uninstall_files(config) -> None:
 # One cursor into the log: everything before it has been attributed. Lines
 # between two tests (a detached child refused late) and lines naming another
 # test are "late" and fail the session; lines naming the running test fail it.
+# A deploy script's own `REFUSED (test fence):` line carries no node id (the
+# spec fixes its text), so it attributes to the test it drains under.
 
 _cursor = 0
 
@@ -736,6 +479,10 @@ def _tag(line: str) -> str:
 
 def _is_answer(line: str) -> bool:
     return _tag(line) == "answered"
+
+
+def _is_refusal(line: str) -> bool:
+    return line.startswith(_REFUSAL_PREFIX)
 
 
 def _drain() -> list[str]:
@@ -762,10 +509,12 @@ class _Expect:
 
     def __exit__(self, exc_type, exc, tb):
         drained = _drain()
-        self.reasons = [ln for ln in drained if _tag(ln) == "audit"]
+        self.reasons = [ln for ln in drained if _tag(ln) == "audit" or _is_refusal(ln)]
         _pending.extend(self._before)
-        _pending.extend(ln for ln in drained if _tag(ln) != "audit")
-        if exc_type is LiveStateViolation:
+        _pending.extend(ln for ln in drained if _tag(ln) != "audit" and not _is_refusal(ln))
+        if exc_type is not None and exc_type is not LiveStateViolation:
+            return None  # a real failure inside the block: never swallow it
+        if exc_type is LiveStateViolation or self.reasons:
             return True
         raise AssertionError(f"expected the live fence to refuse; it did not ({exc_type})")
 
@@ -827,8 +576,8 @@ def _live_fence(request):
     _pending.clear()
     _S.answered.extend(ln for ln in lines if _is_answer(ln))
     lines = [ln for ln in lines if not _is_answer(ln)]
-    mine = [ln for ln in lines if _node(ln) == request.node.nodeid]
-    _S.late_hits.extend(ln for ln in lines if _node(ln) != request.node.nodeid)
+    mine = [ln for ln in lines if _node(ln) == request.node.nodeid or _is_refusal(ln)]
+    _S.late_hits.extend(ln for ln in lines if _node(ln) != request.node.nodeid and not _is_refusal(ln))
     if mine:
         pytest.fail(
             "live fence: this test ran (or tried to run) a real command:\n  " + "\n  ".join(mine),
@@ -844,6 +593,37 @@ def pytest_sessionfinish(session, exitstatus):
     _S.late_hits.extend(ln for ln in rest if not _is_answer(ln))
     if _S.late_hits and session.exitstatus == 0:
         session.exitstatus = 1
+    # An xdist worker's exit status and terminal summary never reach the run's
+    # result, so it hands its findings to the controller (pytest_testnodedown).
+    if hasattr(session.config, "workeroutput"):
+        session.config.workeroutput["genesis_live_fence"] = {
+            "late_hits": list(_S.late_hits),
+            "answered": list(_S.answered),
+            "real_tool_tests": list(_S.real_tool_tests),
+            "opted_out_tests": list(_S.opted_out_tests),
+        }
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node, error):
+    """The controller collects each worker's findings, so a late refusal in a
+    worker fails the run as it does in a serial one. A worker that went down
+    without reporting (it died after its last test) fails the run too: its
+    findings are unknown, and every worker loads this fence."""
+    if not _S.installed:
+        return
+    worker = (getattr(node, "gateway", None) and getattr(node.gateway, "id", None)) or "a worker"
+    if worker in _S.merged_workers:
+        return  # xdist can report one worker down twice (an interrupted run)
+    _S.merged_workers.add(worker)
+    got = (getattr(node, "workeroutput", None) or {}).get("genesis_live_fence")
+    if not got:
+        _S.late_hits.append(f"{worker}: went down without reporting its live-fence findings ({error})")
+        return
+    _S.late_hits.extend(got["late_hits"])
+    _S.answered.extend(got["answered"])
+    _S.real_tool_tests.extend(got["real_tool_tests"])
+    _S.opted_out_tests.extend(got["opted_out_tests"])
 
 
 def pytest_terminal_summary(terminalreporter):
@@ -864,7 +644,7 @@ def pytest_terminal_summary(terminalreporter):
         for prog, nodes in sorted(by_name.items()):
             tr.write_line(f"{prog}: {len(nodes)} tests")
         report = os.environ.get("GENESIS_LIVE_FENCE_REPORT")
-        if report:
+        if report and not hasattr(tr.config, "workerinput"):  # the controller holds all
             Path(report).write_text("\n".join(_S.answered) + "\n")
     if _S.real_tool_tests:
         tr.section("live fence: real_tool tests (installed tools ran for real)")

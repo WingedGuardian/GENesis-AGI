@@ -27,6 +27,9 @@ Subcommands (run with ``python3 -I -S``, stdlib only):
 
 * ``stamp``: read a render on stdin, write it stamped to stdout. Exit 3 if the
   render already contains the stamp prefix.
+* ``verify``: read a file on stdin, print ``stamped``, ``unstamped`` or ``edited``
+  (the stamp grammar above), exit 0. Used for root-owned files the caller reads
+  with sudo (scripts/lib/managed_etc.sh).
 * ``classify --repo R --template REL --target PATH --upto REV [--also REV]...
   [--accept-legacy]``: print one word, exit 0: ``stamped``, ``legacy`` (unstamped,
   matches a template version), ``edited``, ``nonregular`` (a symlink or not a
@@ -207,8 +210,11 @@ def _main(argv: list[str]) -> int:
             print(f"managed_units: {exc}", file=sys.stderr)
             return EXIT_PREFIX
         return 0
+    if argv == ["verify"]:
+        print(verify(sys.stdin.buffer.read()))
+        return 0
     if not argv or argv[0] not in ("classify", "check"):
-        print("usage: managed_units.py stamp | classify ... | check ...", file=sys.stderr)
+        print("usage: managed_units.py stamp | verify | classify ... | check ...", file=sys.stderr)
         return 2
     opts: dict[str, list[str]] = {}
     flags, rest = set(), argv[1:]

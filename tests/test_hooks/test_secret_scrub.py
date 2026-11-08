@@ -1058,3 +1058,193 @@ class TestHttpCredentialHeaders:
         start = time.perf_counter()
         s.scrub(shape)
         assert time.perf_counter() - start < 5.0
+
+
+class TestQuotedKeyCredentials:
+    """A credential label as a QUOTED key: a JSON member, a dict repr, or an
+    escaped key in a serialized string. The label patterns need the separator
+    right after the label, so the key's closing quote let these values through
+    whole (measured 2026-10-28: ``{"api_key": "..."}`` came back unchanged).
+    The value follows the header rule: the rest of the line is withheld and
+    quoting is not read, because a parsed value grammar ended early on the
+    shapes in ``test_no_quoting_shape_ends_the_value_early``."""
+
+    SECRET = "q7Lm2Xp9Rt4"  # pragma: allowlist secret
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            '{"api_key": "%s"}',
+            '{"access_token":"%s"}',
+            '{"secret_key": "%s", "region": "eu"}',
+            '{"private_key": "%s"}',
+            '{"password": "%s"}',
+            '{"passphrase": "%s"}',
+            "{'password': '%s'}",
+            "{'api_key': '%s'}",
+            '"{\\"api_key\\": \\"%s\\"}"',
+            '{\n  "auth_token":\n    "%s"\n}',
+            '{"API_KEY": "%s"}',
+            '{"password" : "%s"}',
+            '{"OPENAI_API_KEY": "%s"}',
+            '{"DB_PASSWORD": "%s"}',
+            '{"x-api-key": "%s"}',
+            '{"client_secret": "%s"}',
+            '{"secret": "%s"}',
+            '{"token": "%s"}',
+            '{"id_token": "%s"}',
+            '{"passwd": "%s"}',
+            '{"pin": %s}',
+            '{"a_b_c_d_e_f_api_key": "%s"}',
+            '{"dbpassword": "%s"}',
+            '{"mysecret": "%s"}',
+            '{"userPassword": "%s"}',
+            '{"aws.secret_access_key": "%s"}',
+            '{"_secret": "%s"}',
+            '{"password"' + " " * 65 + ': "%s"}',
+            "\\\\\\\\\\\\\\\"password\\\\\\\\\\\\\\\": \\\\\\\\\\\\\\\"%s\\\\\\\\\\\\\\\"",
+        ],
+    )
+    def test_the_value_is_redacted(self, template):
+        out = s.scrub(template % self.SECRET)
+        assert self.SECRET not in out
+        assert R in out
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            '{"password": "it\'s a %s pass"}',
+            "{'password': 'say \"hi\" %s'}",
+            '{"password": "ab\\"cd %s"}',
+            "{'password': b'%s'}",
+            "{'password': u'%s'}",
+            '{"password"\n: "%s"}',
+            '{"password":\n\n"%s"}',
+            '{"password": ["%s"]}',
+            '{"password": "pre" + "%s"}',
+            '\\\\"password\\\\": \\\\"%s\\\\"',
+            '{"password": \u201c%s secret\u201d}',
+        ],
+    )
+    def test_no_quoting_shape_ends_the_value_early(self, template):
+        assert self.SECRET not in s.scrub(template % self.SECRET)
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            '{"password": [\n "%s"\n]}',
+            '{"password": {\n  "v": "%s"\n}}',
+            '{"api_key":\n  [\n    "%s"\n  ]\n}',
+            '{"password": ["a",\n "%s"]}',
+            '{"password": {\n  "inner": {\n    "x": 1\n  },\n  "v": "%s"\n}}',
+        ],
+    )
+    def test_a_structured_value_is_withheld_until_its_brackets_balance(self, template):
+        assert self.SECRET not in s.scrub(template % self.SECRET)
+
+    def test_withholding_ends_at_the_line_that_balances(self):
+        text = '{"password": [\n  "' + self.SECRET + '"\n],\n"next": 1}\nkeep this line'
+        assert s.scrub(text) == '{"password": ' + R + '\n"next": 1}\nkeep this line'
+
+    def test_an_unbalanced_value_is_withheld_to_the_scan_limit(self):
+        tail = "".join(f"line {i}\n" for i in range(400))
+        out = s.scrub('{"password": [\n' + tail)
+        assert "line 254" not in out and "line 399" in out
+
+    def test_the_rest_of_the_line_is_withheld(self):
+        # Decision (the header rule): quoting is not read, so a one-line record
+        # loses the rest of its line after a credential key. The next line stays.
+        text = '{"api_key": "' + self.SECRET + '", "n": 1}\nnext line'
+        assert s.scrub(text) == '{"api_key": ' + R + "\nnext line"
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            '{"pin_count": 5, "password_policy": "strict"}',
+            '{"api": "v1", "key": "k1", "token_count": 12}',
+            '{"keyboard": "us", "spinner": "dots"}',
+            '{"spin": 3, "bypass": true, "max_tokens": 512}',
+            'the "api_key" field is documented below',
+            '{"secretary": "x", "passwords_rotated": 3, "compass": "n"}',
+        ],
+    )
+    def test_lookalike_keys_are_kept(self, text):
+        assert s.scrub(text) == text
+
+    def test_an_undelimited_short_label_is_the_stated_residual(self):
+        # Only the long labels take an undelimited prefix: for pass / pin / key /
+        # token it would also admit "bypass", "compass" and "spin".
+        assert self.SECRET in s.scrub('{"dbpass": "' + self.SECRET + '"}')
+
+    @pytest.mark.parametrize(
+        "unit",
+        [
+            '"password":',
+            "'pin' ",
+            '"a_b_c_d_api_key"\\\\\\"',
+            '"api_key"   \n',
+            '"x-',
+            '"password": [\n',
+            '"password":' + " " * 40 + "\n",
+            '"zzzzzzzz' + "a" * 60,
+        ],
+    )
+    def test_quoted_key_shapes_scale_linearly(self, unit):
+        import time
+
+        def cost(n):
+            start = time.perf_counter()
+            s.scrub(unit * n)
+            return time.perf_counter() - start
+
+        small, large = cost(10000), cost(40000)
+        assert large < 5.0
+        assert large < 12 * max(small, 0.002), f"4x input took {large / max(small, 1e-9):.1f}x"
+
+    def test_a_long_whitespace_tail_does_not_backtrack_through_the_gap(self):
+        # A value pattern that could start on whitespace competed with the
+        # 256-wide gap for every space: measured 3.8 s for this input, against
+        # 0.05 s with the value starting at a non-space (84x).
+        import time
+
+        text = ('"password":' + " " * 300 + "\n") * 2000
+        start = time.perf_counter()
+        s._redact_quoted_key_values(text)
+        assert time.perf_counter() - start < 1.0
+
+    @pytest.mark.parametrize(
+        "template",
+        [
+            '{"password": ["x}", \n"%s"]}',
+            '{"password": ["a]", "b"\n, "%s"]}',
+            '{"password": {"hint": "}"\n, "v":"%s"}}',
+            '{"password": ["it\'s ]"\n,"%s"]}',
+            "{'password': ['say \"]\"',\n'%s']}",
+            '{"password": ["a\\"]", \n"%s"]}',
+        ],
+    )
+    def test_brackets_inside_strings_do_not_end_the_structure(self, template):
+        # Found by review: counting the string's ``}`` read the value as closed
+        # on its first line, and the next line leaked.
+        assert self.SECRET not in s.scrub(template % self.SECRET)
+
+    def test_a_bracket_inside_a_string_does_not_open_a_structure(self):
+        text = '{"token": "ab{"\n' + "".join(f'{{"n": {i}}}\n' for i in range(300))
+        assert s.scrub(text).count('"n"') == 300
+
+    def test_crlf_line_endings_survive_a_withheld_span(self):
+        out = s.scrub('{"password": [\r\n"' + self.SECRET + '"\r\n]}\r\nafter')
+        assert out == '{"password": ' + R + "\r\nafter"
+
+    def test_the_text_around_a_span_is_kept_exactly(self):
+        assert s.scrub('x{"api_key": [\n"a"\n]}y\nz') == 'x{"api_key": ' + R + "\nz"
+        assert s.scrub('{"api_key": [\n"' + self.SECRET + '"') == '{"api_key": ' + R
+
+    def test_a_credential_key_after_a_withheld_span_is_still_withheld(self):
+        text = '{"password": [\n"a"\n],\n"api_key": "' + self.SECRET + '"}'
+        assert self.SECRET not in s.scrub(text)
+
+    @pytest.mark.parametrize("key", ["secretary", "passphrases", "passwordless", "password_hash", "secret_name"])
+    def test_joined_label_lookalikes_are_kept(self, key):
+        text = '{"' + key + '": "v1"}'
+        assert s.scrub(text) == text

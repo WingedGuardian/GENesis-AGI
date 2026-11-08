@@ -1,0 +1,50 @@
+# The graph engine's files, by sha256, for every pinned falkordblite wheel.
+# One line per file: <version> <wheel tag> <sha256> <path in the wheel>.
+#
+# scripts/lib/falkordb_engine_check.py checks the installed wheel against
+# these lines (never against the wheel's own RECORD, which whatever installed
+# the wheel wrote) before it copies the engine to the directory the unit runs.
+#
+# Generated from the wheel files themselves, each first checked against the
+# hashes in falkordb-requirements.txt. Regenerate on EVERY pin bump, from the
+# new pin's wheel files (one per tag the pin lists a hash for):
+#
+#   python3 -I scripts/lib/falkordb_engine_check.py --generate \
+#       --requirements scripts/lib/falkordb-requirements.txt <dir>/*.whl \
+#       > scripts/lib/falkordb-engine-digests.txt
+0.11.0 cp312-cp312-manylinux_2_38_aarch64 94b19a8f744ec1c4c8188e3cf40045c936dae34110a4bdc97b90d81e19316f36 falkordblite.libs/libcrypto-b27a2396.so.3
+0.11.0 cp312-cp312-manylinux_2_38_aarch64 37ecaf3f119a2f89042648bf7f7b01418309c3c8940ba3ae599768db93b0c92f falkordblite.libs/libgomp-33c8bcb7.so.1.0.0
+0.11.0 cp312-cp312-manylinux_2_38_aarch64 6cfd9755304f7841d9eb415184dd4984d3b9f99ff9d183f868431a7ca5e9b1d3 falkordblite.libs/libssl-cd89f6e6.so.3
+0.11.0 cp312-cp312-manylinux_2_38_aarch64 b347856f1a545e0748018629c421cb4b255f01ed1424dc25eb3cfb5c3c159770 redislite/bin/falkordb.so
+0.11.0 cp312-cp312-manylinux_2_38_aarch64 1bbe21263b834af4332934545085268dac20004a545026ab5f9898e2e1bf6a6a redislite/bin/redis-cli
+0.11.0 cp312-cp312-manylinux_2_38_aarch64 6a507217e7114e844f5d2142def8e2ba74c9c2159ec534876c524886e62bf331 redislite/bin/redis-server
+0.11.0 cp312-cp312-manylinux_2_38_x86_64 f8a922cfbee1b4977b7c78899fd36cec932c912b09d5dc96a241fa7918bbd615 falkordblite.libs/libcrypto-6866ed71.so.3
+0.11.0 cp312-cp312-manylinux_2_38_x86_64 6a3d31044ab0a216fb2448872640d35a3faf89a74306b65a7b8e13a1d496850f falkordblite.libs/libgomp-135f3c8f.so.1.0.0
+0.11.0 cp312-cp312-manylinux_2_38_x86_64 0e6fd2a351a7544708f985cbd7adc29e26478fc4b349c4773ce4871b97084d57 falkordblite.libs/libssl-a40e7b67.so.3
+0.11.0 cp312-cp312-manylinux_2_38_x86_64 90b8dc7bb88b668db1e182401cf8d5554c769deffef9c7d40a4153c76bb79ae5 redislite/bin/falkordb.so
+0.11.0 cp312-cp312-manylinux_2_38_x86_64 8ca9e8f706abe165d35c4091981097999814eedd3c0006260b11ebd3301ec1e9 redislite/bin/redis-cli
+0.11.0 cp312-cp312-manylinux_2_38_x86_64 adb5a7714ba74cac8cffc2707c7573c85409008211c02f8732f2407b54a5584e redislite/bin/redis-server
+0.11.0 cp313-cp313-manylinux_2_38_aarch64 94b19a8f744ec1c4c8188e3cf40045c936dae34110a4bdc97b90d81e19316f36 falkordblite.libs/libcrypto-b27a2396.so.3
+0.11.0 cp313-cp313-manylinux_2_38_aarch64 37ecaf3f119a2f89042648bf7f7b01418309c3c8940ba3ae599768db93b0c92f falkordblite.libs/libgomp-33c8bcb7.so.1.0.0
+0.11.0 cp313-cp313-manylinux_2_38_aarch64 6cfd9755304f7841d9eb415184dd4984d3b9f99ff9d183f868431a7ca5e9b1d3 falkordblite.libs/libssl-cd89f6e6.so.3
+0.11.0 cp313-cp313-manylinux_2_38_aarch64 b347856f1a545e0748018629c421cb4b255f01ed1424dc25eb3cfb5c3c159770 redislite/bin/falkordb.so
+0.11.0 cp313-cp313-manylinux_2_38_aarch64 69a9850198c72945eb0047259ab47894e5b6cd33c60bb92ef7435533fee1d576 redislite/bin/redis-cli
+0.11.0 cp313-cp313-manylinux_2_38_aarch64 87aeee639e693eecfd5d12ac1401af83e7d150ebb4c3be6d74c6abd3e8421ea1 redislite/bin/redis-server
+0.11.0 cp313-cp313-manylinux_2_38_x86_64 f8a922cfbee1b4977b7c78899fd36cec932c912b09d5dc96a241fa7918bbd615 falkordblite.libs/libcrypto-6866ed71.so.3
+0.11.0 cp313-cp313-manylinux_2_38_x86_64 6a3d31044ab0a216fb2448872640d35a3faf89a74306b65a7b8e13a1d496850f falkordblite.libs/libgomp-135f3c8f.so.1.0.0
+0.11.0 cp313-cp313-manylinux_2_38_x86_64 0e6fd2a351a7544708f985cbd7adc29e26478fc4b349c4773ce4871b97084d57 falkordblite.libs/libssl-a40e7b67.so.3
+0.11.0 cp313-cp313-manylinux_2_38_x86_64 90b8dc7bb88b668db1e182401cf8d5554c769deffef9c7d40a4153c76bb79ae5 redislite/bin/falkordb.so
+0.11.0 cp313-cp313-manylinux_2_38_x86_64 7499fa47801bf9d02d708877b01c63fc0ab49086f8ecff475ee32e42826c8b4e redislite/bin/redis-cli
+0.11.0 cp313-cp313-manylinux_2_38_x86_64 73a876b5840d2f99d2f9aa23ed51fbf43797aaa66103fe7d4dd7d306c52e3cc2 redislite/bin/redis-server
+0.11.0 cp314-cp314-manylinux_2_38_aarch64 94b19a8f744ec1c4c8188e3cf40045c936dae34110a4bdc97b90d81e19316f36 falkordblite.libs/libcrypto-b27a2396.so.3
+0.11.0 cp314-cp314-manylinux_2_38_aarch64 37ecaf3f119a2f89042648bf7f7b01418309c3c8940ba3ae599768db93b0c92f falkordblite.libs/libgomp-33c8bcb7.so.1.0.0
+0.11.0 cp314-cp314-manylinux_2_38_aarch64 6cfd9755304f7841d9eb415184dd4984d3b9f99ff9d183f868431a7ca5e9b1d3 falkordblite.libs/libssl-cd89f6e6.so.3
+0.11.0 cp314-cp314-manylinux_2_38_aarch64 b347856f1a545e0748018629c421cb4b255f01ed1424dc25eb3cfb5c3c159770 redislite/bin/falkordb.so
+0.11.0 cp314-cp314-manylinux_2_38_aarch64 45c79a6aaea77aa64f620a491b395f0eba5a0945fdd32c0075214fab118757c9 redislite/bin/redis-cli
+0.11.0 cp314-cp314-manylinux_2_38_aarch64 1b1a095603f36ea92f57bc35e65e0ed12bd7a748e8d6a698822db5f92894d435 redislite/bin/redis-server
+0.11.0 cp314-cp314-manylinux_2_38_x86_64 f8a922cfbee1b4977b7c78899fd36cec932c912b09d5dc96a241fa7918bbd615 falkordblite.libs/libcrypto-6866ed71.so.3
+0.11.0 cp314-cp314-manylinux_2_38_x86_64 6a3d31044ab0a216fb2448872640d35a3faf89a74306b65a7b8e13a1d496850f falkordblite.libs/libgomp-135f3c8f.so.1.0.0
+0.11.0 cp314-cp314-manylinux_2_38_x86_64 0e6fd2a351a7544708f985cbd7adc29e26478fc4b349c4773ce4871b97084d57 falkordblite.libs/libssl-a40e7b67.so.3
+0.11.0 cp314-cp314-manylinux_2_38_x86_64 90b8dc7bb88b668db1e182401cf8d5554c769deffef9c7d40a4153c76bb79ae5 redislite/bin/falkordb.so
+0.11.0 cp314-cp314-manylinux_2_38_x86_64 f7b98a672d76fa0844439fc05753b5cedddf2ffca6f9dfea40b2af7af58a8eff redislite/bin/redis-cli
+0.11.0 cp314-cp314-manylinux_2_38_x86_64 a50a743a7dcc82efe746194283241421d020024dd63cbdf30f636f6f34c1e6a5 redislite/bin/redis-server

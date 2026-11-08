@@ -9,12 +9,15 @@ telling the fence that the test's own listener is not ours.
 from __future__ import annotations
 
 import asyncio
+import builtins
 import errno
+import io
 import os
 import socket
 import subprocess
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -35,6 +38,30 @@ def listener():
 def not_ours(monkeypatch):
     """Make every listener on this machine look like someone else's service."""
     monkeypatch.setattr(outbound, "_our_socket_inodes", lambda: set())
+
+
+@pytest.fixture(autouse=True)
+def _isolated_records(monkeypatch):
+    """Refusals and faults these tests cause on purpose stay out of the outer run's
+    summary and report, which record the real ones."""
+    monkeypatch.setattr(outbound._S, "refusals", list(outbound._S.refusals))
+    monkeypatch.setattr(outbound._S, "faults", Counter(outbound._S.faults))
+
+
+def _proc_table(monkeypatch, tables: dict) -> None:
+    """Answer these paths from text, or raise the exception given; others are real."""
+    real = builtins.open
+
+    def fake(path, *args, **kwargs):
+        if path in tables:
+            value = tables[path]
+            if isinstance(value, Exception):
+                raise value
+            mode = args[0] if args else kwargs.get("mode", "r")
+            return io.BytesIO(value.encode()) if "b" in mode else io.StringIO(value)
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", fake)
 
 
 def _connect(addr, family=socket.AF_INET):
@@ -149,6 +176,122 @@ def test_a_tests_own_unix_socket_is_reachable(tmp_path, monkeypatch):
         _connect(str(path), socket.AF_UNIX)
     finally:
         srv.close()
+
+
+def _unix_listener(path: bytes) -> socket.socket:
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path)
+    srv.listen()
+    return srv
+
+
+@pytest.mark.parametrize("name", [b"svc with space.sock", b"svc-\xff-bytes.sock"])
+def test_a_live_unix_socket_with_any_legal_path_is_refused(tmp_path, not_ours, monkeypatch, name):
+    """Acceptance 2: /proc/net/unix holds the bound path verbatim, spaces and
+    non-UTF-8 bytes included, so both are matched and refused."""
+    monkeypatch.setattr(outbound._S, "real_home", str(tmp_path))
+    path = os.fsencode(tmp_path) + b"/" + name
+    srv = _unix_listener(path)
+    try:
+        with pytest.raises(FileNotFoundError):
+            _connect(path, socket.AF_UNIX)
+    finally:
+        srv.close()
+
+
+def test_a_bytearray_unix_path_is_judged_like_bytes(tmp_path, not_ours, monkeypatch):
+    """connect() takes any bytes-like path; a bytearray must not slip past as an
+    address the fence does not recognise."""
+    monkeypatch.setattr(outbound._S, "real_home", str(tmp_path))
+    path = os.fsencode(tmp_path) + b"/svc.sock"
+    srv = _unix_listener(path)
+    try:
+        with pytest.raises(FileNotFoundError):
+            _connect(bytearray(path), socket.AF_UNIX)
+    finally:
+        srv.close()
+
+
+def test_a_non_utf8_socket_elsewhere_does_not_disable_the_fence(tmp_path, not_ours, monkeypatch):
+    """Acceptance 2: an odd socket path anywhere on the machine (here, outside
+    every judged directory) must not turn the judgement of an ordinary one into a
+    fault that allows it."""
+    home = tmp_path / "home"
+    other = tmp_path / "other"
+    home.mkdir()
+    other.mkdir()
+    monkeypatch.setattr(outbound._S, "real_home", str(home))
+    odd = _unix_listener(os.fsencode(other) + b"/odd-\xfe\xff.sock")
+    ordinary = _unix_listener(os.fsencode(home / "ordinary.sock"))
+    faults = sum(outbound._S.faults.values())
+    try:
+        with pytest.raises(FileNotFoundError):
+            _connect(str(home / "ordinary.sock"), socket.AF_UNIX)
+    finally:
+        odd.close()
+        ordinary.close()
+    assert sum(outbound._S.faults.values()) == faults
+
+
+def test_without_a_real_home_only_the_run_directories_are_judged(tmp_path, not_ours, monkeypatch):
+    monkeypatch.setattr(outbound._S, "real_home", None)
+    path = tmp_path / "anywhere.sock"
+    srv = _unix_listener(os.fsencode(path))
+    try:
+        _connect(str(path), socket.AF_UNIX)  # not under /run/user/<uid> or /run/dbus
+    finally:
+        srv.close()
+    assert outbound._live_dirs() == [
+        os.fsencode(f"/run/user/{os.getuid()}"),
+        b"/run/dbus",
+    ]
+
+
+def test_a_tests_own_listener_does_not_vouch_for_anothers_on_the_same_port(monkeypatch):
+    """Acceptance 3: a test-owned listener on 127.0.0.1:P and a foreign one on
+    another local address with the same port P. Only the foreign one is refused."""
+    own = socket.socket()
+    own.bind(("127.0.0.1", 0))
+    own.listen()
+    port = own.getsockname()[1]
+    foreign = socket.socket()
+    foreign.bind(("127.0.0.2", port))
+    foreign.listen()
+    own_inode = str(os.fstat(own.fileno()).st_ino)
+    monkeypatch.setattr(outbound, "_our_socket_inodes", lambda: {own_inode})
+    try:
+        _connect(("127.0.0.1", port))
+        with pytest.raises(ConnectionRefusedError, match="live service"):
+            _connect(("127.0.0.2", port))
+    finally:
+        own.close()
+        foreign.close()
+
+
+def test_a_wildcard_listener_is_reached_from_any_local_address(listener, monkeypatch):
+    """A listener on 0.0.0.0 answers a connect to 127.0.0.1: it counts."""
+    srv = socket.socket()
+    srv.bind(("0.0.0.0", 0))  # noqa: S104 - a test listener
+    srv.listen()
+    port = srv.getsockname()[1]
+    monkeypatch.setattr(outbound, "_our_socket_inodes", lambda: set())
+    try:
+        with pytest.raises(ConnectionRefusedError):
+            _connect(("127.0.0.1", port))
+    finally:
+        srv.close()
+
+
+def test_a_fault_in_the_judgement_allows_the_connect_and_is_counted(listener, monkeypatch):
+    """Acceptance 4: a fence fault never breaks a connect, and it is counted."""
+
+    def broken(*_args):
+        raise RuntimeError("forced fault")
+
+    monkeypatch.setattr(outbound, "_tcp_listen_inodes", broken)
+    before = outbound._S.faults["RuntimeError"]
+    _connect(("127.0.0.1", listener))
+    assert outbound._S.faults["RuntimeError"] == before + 1
 
 
 @pytest.mark.live_service
@@ -276,7 +419,7 @@ def test_interrupted(cleanup):
 """
 
 
-def _subrun(tmp_path: Path, files: dict) -> tuple[int, str]:
+def _subrun(tmp_path: Path, files: dict, *extra: str) -> tuple[int, str]:
     (tmp_path / "conftest.py").write_text(_SUBRUN_CONFTEST)
     for name, body in files.items():
         (tmp_path / name).write_text(body)
@@ -285,7 +428,17 @@ def _subrun(tmp_path: Path, files: dict) -> tuple[int, str]:
     env.pop("PYTEST_CURRENT_TEST", None)
     env.pop("GENESIS_LIVE_OUTBOUND_REPORT", None)  # never the outer run's report
     out = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-s", "-p", "no:cacheprovider", str(tmp_path)],
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-s",
+            "-p",
+            "no:cacheprovider",
+            *extra,
+            str(tmp_path),
+        ],
         cwd=tmp_path,
         env=env,
         capture_output=True,
@@ -300,6 +453,23 @@ def test_an_interrupted_live_service_tests_teardown_may_still_connect(tmp_path):
     any test. A live test's cleanup (deleting what it created) must not be refused
     there."""
     _rc, text = _subrun(tmp_path, {"test_interrupted.py": _SUBRUN_INTERRUPTED})
+    assert "TEARDOWN=connected" in text, text
+
+
+def test_a_live_service_tests_teardown_may_still_connect_after_x_stops_the_run(tmp_path):
+    """-x stops the run after a live test fails while the module is still open
+    (the second test keeps it open). pytest 9 then tears everything down inside
+    the failing item's protocol (_pytest/runner.py, runtestprotocol), where the
+    fence lets the live test through. This pins that: a pytest that deferred the
+    teardown to session finish would have the cleanup refused, leaking what the
+    live test created."""
+    body = _SUBRUN_INTERRUPTED.replace(
+        "    raise KeyboardInterrupt\n",
+        "    assert False\n\n\n@pytest.mark.live_service\ndef test_after(cleanup):\n    pass\n",
+    )
+    assert body != _SUBRUN_INTERRUPTED
+    _rc, text = _subrun(tmp_path, {"test_x.py": body}, "-x")
+    assert "1 failed" in text, text
     assert "TEARDOWN=connected" in text, text
 
 
@@ -322,3 +492,162 @@ def test_a_run_reports_refusals_without_failing_the_test(tmp_path):
     assert out.returncode == 0, text
     assert "live connections refused (reported, not failed)" in text, text
     assert "a live service on this machine" in text, text
+
+
+_SUBRUN_FAULT = """
+import socket
+
+from tests import _live_outbound
+
+
+def test_a_fault(monkeypatch):
+    def broken(*_args):
+        raise RuntimeError("forced fault")
+
+    monkeypatch.setattr(_live_outbound, "_tcp_listen_inodes", broken)
+    srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen()
+    c = socket.socket()
+    try:
+        c.connect(srv.getsockname())  # allowed: a fault never breaks a connect
+    finally:
+        c.close(); srv.close()
+"""
+
+
+def test_the_summary_names_the_faults(tmp_path):
+    """Acceptance 4: the run summary says the fence stopped judging, by type."""
+    rc, text = _subrun(tmp_path, {"test_fault.py": _SUBRUN_FAULT})
+    assert rc == 0, text
+    assert "outbound fence: 1 judgments failed and were allowed (RuntimeError x1)" in text, text
+
+
+def test_the_report_file_names_the_faults(tmp_path, monkeypatch):
+    """A reader of the report alone must see the fence stopped judging."""
+    report = tmp_path / "report.tsv"
+    monkeypatch.setenv("GENESIS_LIVE_OUTBOUND_REPORT", str(report))
+    run = tmp_path / "run"
+    run.mkdir()
+    repo = Path(__file__).resolve().parent.parent
+    (run / "conftest.py").write_text(_SUBRUN_CONFTEST)
+    (run / "test_fault.py").write_text(_SUBRUN_FAULT)
+    env = {**os.environ, "PYTHONPATH": f"{repo}{os.pathsep}{repo / 'src'}"}
+    env.pop("PYTEST_CURRENT_TEST", None)
+    out = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(run)],
+        cwd=run,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "FAULT\tRuntimeError\t1" in report.read_text()
+
+
+def test_every_live_service_test_file_is_gated_on_the_opt_in():
+    """The marker alone opens the fence, and the opt-in is each test's own
+    ``skipif``. A file that marks a test ``live_service`` must also read
+    ``GENESIS_LIVE_E2E``, or the test reaches live services on every default run.
+    This file is exempt: its marked tests connect only to their own listeners."""
+    tests_dir = Path(__file__).resolve().parent
+    ungated = [
+        str(path.relative_to(tests_dir))
+        for path in sorted(tests_dir.rglob("test_*.py"))
+        if path.name != Path(__file__).name
+        and "mark.live_service" in (text := path.read_text(errors="replace"))
+        and "GENESIS_LIVE_E2E" not in text
+    ]
+    assert ungated == []
+
+
+_IF_INET6 = "20010db8000000000000000000000001 02 40 00 80 eth0\n00000000000000000000000000000002 03 40 00 80 eth1\n"
+
+
+def test_the_first_interface_address_is_kept(monkeypatch):
+    """/proc/net/if_inet6 has no header line to drop."""
+    _proc_table(monkeypatch, {"/proc/net/if_inet6": _IF_INET6, "/proc/net/fib_trie": ""})
+    assert "2001:db8::1" in outbound._local_addresses()
+    assert "::2" in outbound._local_addresses()
+
+
+@pytest.mark.parametrize("table", ["/proc/net/if_inet6", "/proc/net/fib_trie"])
+def test_an_unreadable_address_table_is_counted(monkeypatch, table):
+    _proc_table(monkeypatch, {table: PermissionError("denied")})
+    before = outbound._S.faults["PermissionError"]
+    outbound._local_addresses()
+    assert outbound._S.faults["PermissionError"] == before + 1
+
+
+def test_a_missing_address_table_is_no_fault(monkeypatch):
+    _proc_table(
+        monkeypatch,
+        {"/proc/net/if_inet6": FileNotFoundError(), "/proc/net/fib_trie": FileNotFoundError()},
+    )
+    before = sum(outbound._S.faults.values())
+    outbound._local_addresses()
+    assert sum(outbound._S.faults.values()) == before
+
+
+@pytest.mark.parametrize("table", ["/proc/net/tcp", "/proc/net/tcp6"])
+def test_an_unreadable_tcp_table_allows_the_connect_and_counts_it(
+    listener, not_ours, monkeypatch, table
+):
+    _proc_table(monkeypatch, {table: PermissionError("denied")})
+    before = outbound._S.faults["PermissionError"]
+    _connect(("127.0.0.1", listener))
+    assert outbound._S.faults["PermissionError"] == before + 1
+
+
+def test_a_missing_tcp6_table_still_judges_ipv4(listener, not_ours, monkeypatch):
+    _proc_table(monkeypatch, {"/proc/net/tcp6": FileNotFoundError()})
+    with pytest.raises(ConnectionRefusedError):
+        _connect(("127.0.0.1", listener))
+
+
+def test_a_missing_ipv4_table_is_a_counted_fault(listener, not_ours, monkeypatch):
+    _proc_table(monkeypatch, {"/proc/net/tcp": FileNotFoundError()})
+    before = outbound._S.faults["FileNotFoundError"]
+    _connect(("127.0.0.1", listener))
+    assert outbound._S.faults["FileNotFoundError"] == before + 1
+
+
+def test_an_unreadable_unix_table_allows_the_connect_and_counts_it(tmp_path, not_ours, monkeypatch):
+    monkeypatch.setattr(outbound._S, "real_home", str(tmp_path))
+    path = tmp_path / "svc.sock"
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(path))
+    srv.listen()
+    _proc_table(monkeypatch, {"/proc/net/unix": PermissionError("denied")})
+    before = outbound._S.faults["PermissionError"]
+    try:
+        _connect(str(path), socket.AF_UNIX)
+    finally:
+        srv.close()
+    assert outbound._S.faults["PermissionError"] == before + 1
+
+
+@pytest.mark.parametrize("spelling", ["absolute", "relative"])
+def test_a_listener_bound_by_a_relative_name_is_fenced(tmp_path, not_ours, monkeypatch, spelling):
+    monkeypatch.setattr(outbound._S, "real_home", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind("rel-live.sock")
+    srv.listen()
+    target = str(tmp_path / "rel-live.sock") if spelling == "absolute" else "rel-live.sock"
+    try:
+        with pytest.raises(FileNotFoundError):
+            _connect(target, socket.AF_UNIX)
+    finally:
+        srv.close()
+
+
+def test_a_relative_name_does_not_match_a_longer_file_name(tmp_path, not_ours, monkeypatch):
+    monkeypatch.setattr(outbound._S, "real_home", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind("live.sock")
+    srv.listen()
+    try:
+        assert outbound._unix_listen_inodes(os.fsencode(tmp_path / "not-live.sock")) == set()
+    finally:
+        srv.close()

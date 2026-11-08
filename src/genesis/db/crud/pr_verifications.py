@@ -25,6 +25,29 @@ import uuid
 
 import aiosqlite
 
+from genesis.db.crud.pr_verification_rechecks import (
+    RECHECK_RESULTS as RECHECK_RESULTS,
+)
+from genesis.db.crud.pr_verification_rechecks import (
+    append_recheck_result as append_recheck_result,
+)
+from genesis.db.crud.pr_verification_rechecks import (
+    list_rechecks_due as list_rechecks_due,
+)
+from genesis.db.crud.pr_verification_rechecks import (
+    normalize_rechecks as _normalize_rechecks,
+)
+from genesis.db.crud.pr_verification_rechecks import (
+    prune_recheck_free_closed,
+    rechecks_from_evidence,
+)
+from genesis.db.crud.pr_verification_rechecks import (
+    recheck_state as recheck_state,
+)
+from genesis.db.crud.pr_verification_rechecks import (
+    rechecks_column_available as _rechecks_column_available,
+)
+
 STATUSES = ("open", "closed")
 
 #: Serialised-evidence ceiling, enforced HERE because this module owns the column.
@@ -55,21 +78,23 @@ def _check_evidence_size(evidence: str | None) -> None:
         )
 
 
-#: The four verdicts a validator session returns (owner standing ruling,
-#: 2026-09-26). Enforced HERE rather than by a CHECK constraint: SQLite cannot
-#: ALTER a CHECK, so a vocabulary this young — invented before the validator had
-#: run once — would cost a full table rebuild to widen. A raise also gives the
-#: caller (an LLM session) a message naming the legal values instead of
+#: The verdicts a validator session returns (owner standing ruling, 2026-09-26;
+#: ``not-yet-done`` added 2026-10-27). Enforced HERE rather than by a CHECK
+#: constraint: SQLite cannot ALTER a CHECK, so a vocabulary this young — invented
+#: before the validator had run once — would cost a full table rebuild to widen,
+#: and the fifth value arrived exactly that way. A raise also gives the caller (an
+#: LLM session) a message naming the legal values instead of
 #: ``IntegrityError: CHECK constraint failed``.
 VERDICTS = (
     "pass-mechanical",
     "pass-with-measured-gaps",
     "fail-intent",
+    "not-yet-done",
     "cannot-verify",
 )
 
 #: The verdicts that DISCHARGE the obligation and therefore close the row. The
-#: other two record an attempt and leave it OPEN, because the work is not done.
+#: others record an attempt and leave it OPEN, because the work is not done.
 PASS_VERDICTS = ("pass-mechanical", "pass-with-measured-gaps")
 
 # Per-CONNECTION-TARGET cache: only the TRUE result is cached — a missing table
@@ -191,6 +216,7 @@ async def close_verification(
     reason: str,
     evidence: str | None,
     now: str,
+    rechecks: list[dict] | None = None,
 ) -> bool:
     """Close an OPEN obligation with its verification record (the validator's
     write). True iff a row changed — a closed row never flips back or gets its
@@ -228,14 +254,19 @@ async def close_verification(
     price of a last-wins record: the row always describes its LATEST state, and nothing
     here keeps attempt history. If per-attempt history is ever wanted it needs a child
     table, which the shipping PR considered and rejected against the New-Store Gate.
+
+    Event-gated ``rechecks`` are stored atomically with the close. Omitted entries
+    are derived from typed evidence, covering existing callers during rollout.
+    A close owing rechecks refuses while their column is absent.
     """
     if verdict not in PASS_VERDICTS:
         raise ValueError(
             f"close_verification accepts only {list(PASS_VERDICTS)}, got {verdict!r}. "
-            f"'fail-intent' and 'cannot-verify' do not discharge the obligation — "
-            f"record them with record_attempt(), which leaves the row OPEN."
+            f"The other verdicts do not discharge the obligation — record them with "
+            f"record_attempt(), which leaves the row OPEN."
         )
     _check_evidence_size(evidence)
+    stored = _normalize_rechecks(rechecks_from_evidence(evidence) if rechecks is None else rechecks)
     if not reason or not reason.strip():
         # A closed row with no reason is an unverifiable claim in permanent
         # record — the row would say "handled" and carry nothing. The schema
@@ -248,12 +279,19 @@ async def close_verification(
         return False
     if not await _verdict_columns_available(db):
         return False
+    if stored is not None and not await _rechecks_column_available(db):
+        return False
+    extra = ", rechecks = ?" if stored is not None else ""
+    params = (reason, now, evidence, verdict, now)
+    if stored is not None:
+        params += (stored,)
     cursor = await db.execute(
         "UPDATE pr_verifications SET status = 'closed', closed_reason = ?, "
         "closed_at = ?, evidence = ?, verdict = ?, last_attempt_at = ?, "
-        "last_attempt_note = NULL, attempt_count = attempt_count + 1 "
-        "WHERE repo = ? AND pr_number = ? AND status = 'open'",
-        (reason, now, evidence, verdict, now, repo, pr_number),
+        "last_attempt_note = NULL, attempt_count = attempt_count + 1"
+        + extra
+        + " WHERE repo = ? AND pr_number = ? AND status = 'open'",
+        (*params, repo, pr_number),
     )
     await db.commit()
     return bool(cursor.rowcount)
@@ -288,8 +326,13 @@ async def record_attempt(
     note: str,
     now: str,
     evidence: str | None = None,
+    tracking_pending: bool = False,
 ) -> str:
-    """Record a NON-closing validation attempt. ``"recorded" | "missing" | "unavailable"``.
+    """Record a non-closing measurement. ``"recorded" | "missing" | "unavailable"``.
+
+    A passing measurement may stay OPEN with ``tracking_pending=True`` and an
+    explicit pending note/evidence. Measurement verdict and routing completion
+    are separate; the candidate reader includes these rows for recovery.
 
     The row STAYS OPEN — ``status`` is deliberately absent from the SET list, so
     the "keep it open" rule is enforced by the SQL rather than by every caller
@@ -316,12 +359,14 @@ async def record_attempt(
         raise ValueError(
             f"record_attempt: verdict must be one of {list(VERDICTS)}, got {verdict!r}"
         )
-    if verdict in PASS_VERDICTS:
+    if verdict in PASS_VERDICTS and not tracking_pending:
         raise ValueError(
             f"record_attempt refuses {verdict!r}: a PASS discharges the obligation and "
             f"must go through close_verification, so exactly one writer moves the row "
             f"to 'closed'."
         )
+    if tracking_pending and (not evidence or not note or not note.startswith("TRACKING PENDING:")):
+        raise ValueError("pending tracking requires evidence and a TRACKING PENDING note")
     _check_evidence_size(evidence)
     if not note or not note.strip():
         raise ValueError(
@@ -441,12 +486,14 @@ async def list_closed(
 
 
 async def list_open(db: aiosqlite.Connection, *, limit: int = 500) -> list[dict]:
-    """Open obligations — FAILED first, then NEVER-ATTEMPTED, then PARKED;
-    oldest merge first within each.
+    """Open obligations — FAILED first, then NOT-YET-DONE, then NEVER-ATTEMPTED,
+    then PARKED; oldest merge first within each.
 
     ``fail-intent`` leads because it is the one open state that is a finding: it
     goes to the user, and an open row is its only durable record, so a capped
     window must never be able to drop it behind untouched work (Codex, round 3).
+    ``not-yet-done`` comes next because it is the cheapest work in the ledger: a
+    validator already named the commands that finish it.
 
     Oldest-first within each group because the backlog's point is what has
     waited longest. The group split is newer and exists because this store now
@@ -459,9 +506,8 @@ async def list_open(db: aiosqlite.Connection, *, limit: int = 500) -> list[dict]
     review caught this; the class did not exist before the attempt record did,
     so the ordering is part of that change rather than an unrelated fix.
 
-    The verdict is the discriminator and it is exact on an open row: a PASS
-    verdict closes the row, so an OPEN row carries a verdict only after a recorded
-    non-closing attempt — ``fail-intent`` or ``cannot-verify``.
+    Passing measurements awaiting task receipts sort with unfinished work.
+    They retain their measured verdict while the row stays OPEN.
 
     Assumes a Row factory. Empty pre-migration — and on a pre-migration database
     the ordering degrades to plain oldest-first rather than failing, because the
@@ -471,8 +517,9 @@ async def list_open(db: aiosqlite.Connection, *, limit: int = 500) -> list[dict]
         return []
     lim = max(1, min(int(limit), 2000))
     order = (
-        "CASE WHEN verdict = 'fail-intent' THEN 0 WHEN verdict IS NULL THEN 1 "
-        "ELSE 2 END ASC, merged_at ASC"
+        "CASE WHEN verdict = 'fail-intent' THEN 0 "
+        "WHEN verdict IN ('not-yet-done', 'pass-mechanical', 'pass-with-measured-gaps') THEN 1 "
+        "WHEN verdict IS NULL THEN 2 ELSE 3 END ASC, merged_at ASC"
         if await _verdict_columns_available(db)
         else "merged_at ASC"
     )
@@ -481,6 +528,96 @@ async def list_open(db: aiosqlite.Connection, *, limit: int = 500) -> list[dict]
         (lim,),
     )
     return [dict(r) for r in await cursor.fetchall()]
+
+
+#: The verdicts a standing validator may pick, and the tier each sorts into. An
+#: open row whose verdict is NULL was never attempted (any attempt sets one).
+#: This map is the picker's ONLY copy of the vocabulary: the query and the
+#: re-attempt check below are built from it, and a test pins that every
+#: non-closing verdict in :data:`VERDICTS` is either here or in
+#: :data:`_NEVER_PICKED`, so a new verdict cannot silently go unpicked.
+_CANDIDATE_TIERS = {
+    "not-yet-done": 0, "pass-mechanical": 0, "pass-with-measured-gaps": 0,
+    None: 1, "cannot-verify": 2,
+}
+
+#: Picked only once their last attempt is older than the re-attempt window.
+_DELAYED_VERDICTS = frozenset({"cannot-verify"})
+
+#: Never picked: a failure is the owner's to act on, never the loop's to retry.
+_NEVER_PICKED = frozenset({"fail-intent"})
+
+
+async def list_validation_candidates(
+    db: aiosqlite.Connection, *, now: str, reattempt_days: int = 7
+) -> list[dict]:
+    """Open rows a validator may pick next, best first. Each carries a ``tier``.
+
+    Eligibility (owner ruling, 2026-10-29): ``not-yet-done`` always, with no
+    delay, because the commands that finish it are named and runnable now
+    (tier 0), as do passing measurements awaiting routing; never attempted
+    (tier 1); ``cannot-verify`` only once its last
+    attempt is at least ``reattempt_days`` old (tier 2), so a precondition gets
+    time to become reachable; ``fail-intent`` never. Within a tier, NEWEST merge
+    first: a standing validator works recent merges while their context is warm,
+    which is the opposite of :func:`list_open`'s backlog order, so this is its
+    own query rather than a flag on that one.
+
+    Deliberately UNLIMITED: the caller ranks across all of it (deploy state and
+    the E2E plan come from GitHub, not this table), so a capped read would rank
+    a subset and call it the answer.
+
+    The re-attempt window compares parsed INSTANTS in Python, not strings in
+    SQL: writers store ISO stamps in more than one spelling (``Z`` and
+    ``+00:00``), and those sort differently as text. A stamp that does not parse
+    leaves the row out, since an unknown age is not "old enough".
+
+    Before the verdict columns exist no attempt could have been recorded, so
+    every open row is never-attempted. Assumes a Row factory. Empty
+    pre-migration.
+    """
+    if reattempt_days < 1:
+        raise ValueError(
+            f"list_validation_candidates: reattempt_days must be >= 1, got {reattempt_days!r}"
+        )
+    from datetime import datetime, timedelta
+
+    cutoff = datetime.fromisoformat(now) - timedelta(days=reattempt_days)
+    if cutoff.tzinfo is None:
+        # A naive `now` cannot be compared with a stored aware stamp; refuse it
+        # here rather than raise TypeError on the first parked row.
+        raise ValueError(f"list_validation_candidates: now must carry a timezone, got {now!r}")
+    if not await _tables_available(db):
+        return []
+    if not await _verdict_columns_available(db):
+        cursor = await db.execute(
+            "SELECT * FROM pr_verifications WHERE status = 'open' ORDER BY merged_at DESC"
+        )
+        return [{**dict(r), "tier": _CANDIDATE_TIERS[None]} for r in await cursor.fetchall()]
+
+    named = sorted(v for v in _CANDIDATE_TIERS if v is not None)
+    cursor = await db.execute(
+        "SELECT * FROM pr_verifications WHERE status = 'open' AND "
+        f"(verdict IS NULL OR verdict IN ({', '.join('?' for _ in named)})) "
+        "ORDER BY merged_at DESC",
+        named,
+    )
+    picked: list[dict] = []
+    for raw in await cursor.fetchall():
+        row = dict(raw)
+        verdict = row.get("verdict")
+        if verdict in _DELAYED_VERDICTS:
+            try:
+                last = datetime.fromisoformat(str(row.get("last_attempt_at")))
+            except ValueError:
+                continue
+            if last.tzinfo is None or last > cutoff:
+                continue
+        row["tier"] = _CANDIDATE_TIERS[verdict]
+        picked.append(row)
+    # Stable sort: newest-merge order from SQL survives inside each tier.
+    picked.sort(key=lambda r: r["tier"])
+    return picked
 
 
 async def counts(db: aiosqlite.Connection) -> dict:
@@ -519,6 +656,13 @@ async def prune_closed(
     closed row. The guard lives HERE rather than only at the CLI because the
     caller that gets it wrong is the one that never thought about it — the CLI
     validates too, for a readable error instead of a traceback.
+
+    A closed row that still owes a recheck is KEPT, whatever its age: the recheck is
+    the only record that a measurement is still owed, and a row pruned at 180 days
+    with an event that had not happened yet would forgive it silently — the open-row
+    rule, one column over. A row whose ``rechecks`` is not valid JSON is kept too,
+    and never fails the prune: retention is a hygiene step, and a hygiene step that
+    deletes or crashes on what it cannot read has picked the two wrong defaults.
     """
     if older_than_days < 1:
         raise ValueError(
@@ -532,6 +676,8 @@ async def prune_closed(
     from datetime import datetime, timedelta
 
     cutoff = (datetime.fromisoformat(now) - timedelta(days=older_than_days)).isoformat()
+    if await _rechecks_column_available(db):
+        return await prune_recheck_free_closed(db, cutoff=cutoff)
     cursor = await db.execute(
         "DELETE FROM pr_verifications WHERE status = 'closed' AND closed_at < ?",
         (cutoff,),

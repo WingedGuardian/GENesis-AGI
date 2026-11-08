@@ -75,3 +75,20 @@ def test_install_runs_the_step_only_after_genesis_installed():
     assert gate < code.index('[ -n "${CLAUDECODE:-}" ]; then') < code.index(
         'bash "$SCRIPT_DIR/install_browser_stack.sh"'
     )
+
+
+def test_bootstrap_installs_the_runtime_extras_after_the_core_never_fatally():
+    """The test and payments extras follow the browser packages the same way."""
+    code = _code("bootstrap.sh")
+    core = code.index('editable_install_guarded "$GENESIS_ROOT" "$VENV_DIR" ||')
+    extras = code.index('install_runtime_extras "$GENESIS_ROOT" "$VENV_DIR"')
+    assert core < extras
+    statement = code[extras : code.index("\n", code.index("\\\n", extras) + 2)]
+    assert "||" in statement and "exit" not in statement
+
+
+def test_install_installs_the_runtime_extras_only_after_genesis_and_warns():
+    code = _code("install.sh")
+    extras = code.index('install_runtime_extras "$REPO_DIR" "$VENV_PATH"')
+    assert code.index("_genesis_installed=1") < extras
+    assert re.search(r"else\n\s+setup_warn \"test/payments packages incomplete", code[extras:])

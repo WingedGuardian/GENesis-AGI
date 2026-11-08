@@ -349,3 +349,193 @@ async def test_final_alert_path_is_utf8_even_for_filesystem_surrogates(
         assert "Full breakdown:" not in content
     else:
         assert path.encode("utf-8", "backslashreplace").decode("utf-8") in content
+
+
+# ── Resolve on healthy ─────────────────────────────────────────────────────
+# A healthy tick resolves an open pid_budget_monitor alert, found in the STORE
+# (no in-memory guard: an alert written before a restart must still resolve).
+# A read-only probe gates the write, so a healthy tick with nothing open writes
+# nothing. Hysteresis: resolve only below _PID_RESOLVE_PCT (or no sub-cap).
+
+
+@pytest.fixture
+def store(monkeypatch):
+    """Mock the probe + resolve; ``store.open`` is what the probe reports."""
+
+    class _Store:
+        open = True
+
+    st = _Store()
+
+    async def _probe(db, *, source, content_like):
+        st.probe_calls.append(source)
+        return st.open
+
+    st.probe_calls = []
+    st.resolve = AsyncMock(return_value=1)
+    monkeypatch.setattr(loop.observations, "has_unresolved_matching", _probe)
+    monkeypatch.setattr(loop.observations, "resolve_by_source_and_type", st.resolve)
+    return st
+
+
+@pytest.mark.asyncio
+async def test_alert_from_before_restart_resolves_on_healthy(
+    _reset_cooldown_and_mock_create, store
+):
+    # Fresh process: nothing was written in-process, but the store holds one.
+    await loop._check_pid_budget(object(), budget=_budget("healthy", 41.0))
+    assert store.probe_calls == ["pid_budget_monitor"]
+    store.resolve.assert_awaited_once()
+    kwargs = store.resolve.await_args.kwargs
+    assert kwargs["source"] == "pid_budget_monitor"
+    assert kwargs["type"] == "infrastructure_alert"
+
+
+@pytest.mark.asyncio
+async def test_healthy_with_nothing_open_does_no_write(_reset_cooldown_and_mock_create, store):
+    store.open = False
+    for _ in range(3):
+        await loop._check_pid_budget(object(), budget=_budget("healthy", 41.0))
+    store.resolve.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_uncapped_healthy_is_resolvable(_reset_cooldown_and_mock_create, store):
+    await loop._check_pid_budget(
+        object(), budget={"status": "healthy", "current": 1500, "max": "max", "pct": None}
+    )
+    store.resolve.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_hysteresis_band_does_not_resolve(_reset_cooldown_and_mock_create, store):
+    # Healthy (<80%) but not below the resolve threshold: hold the alert open.
+    assert loop._PID_RESOLVE_PCT < 80
+    await loop._check_pid_budget(object(), budget=_budget("healthy", loop._PID_RESOLVE_PCT + 1.0))
+    store.resolve.assert_not_awaited()
+    assert store.probe_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["degraded", "error", "unavailable"])
+async def test_non_healthy_tick_never_resolves(_reset_cooldown_and_mock_create, store, status):
+    await loop._check_pid_budget(object(), budget=_budget(status, 85.0))
+    store.resolve.assert_not_awaited()
+    assert store.probe_calls == []
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """A controllable monotonic clock for the alert cooldown."""
+
+    class _Clock:
+        t = 10_000.0
+
+        def __call__(self):
+            return self.t
+
+    c = _Clock()
+    monkeypatch.setattr(loop, "_pid_clock", c)
+    return c
+
+
+@pytest.mark.asyncio
+async def test_flap_realerts_after_resolve(_reset_cooldown_and_mock_create, store, clock):
+    # degraded -> healthy -> degraded: once the first episode is resolved, a new
+    # one re-alerts after a quarter of the cooldown, not the full hour.
+    create = _reset_cooldown_and_mock_create
+    quarter = loop._PID_BUDGET_ALERT_COOLDOWN_S / 4
+    await loop._check_pid_budget(object(), budget=_budget("degraded", 83.0))
+    clock.t += 60
+    await loop._check_pid_budget(object(), budget=_budget("healthy", 41.0))
+    store.resolve.assert_awaited_once()
+    clock.t += quarter
+    await loop._check_pid_budget(object(), budget=_budget("degraded", 84.0))
+    assert create.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_rapid_oscillation_alerts_at_most_once_per_quarter_cooldown(
+    _reset_cooldown_and_mock_create, store, clock
+):
+    # Load swinging 70 <-> 85 every tick: each healthy tick resolves, but the
+    # resolve must not lift the rate limit entirely.
+    create = _reset_cooldown_and_mock_create
+    quarter = loop._PID_BUDGET_ALERT_COOLDOWN_S / 4
+    start = clock.t
+    while clock.t - start < quarter - 60:
+        await loop._check_pid_budget(object(), budget=_budget("degraded", 85.0))
+        clock.t += 30
+        await loop._check_pid_budget(object(), budget=_budget("healthy", 70.0))
+        clock.t += 30
+    assert create.await_count == 1
+    # Past the quarter-cooldown since the last alert: the next swing re-alerts.
+    clock.t = start + quarter + 1
+    await loop._check_pid_budget(object(), budget=_budget("degraded", 85.0))
+    assert create.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_unresolved_episode_keeps_the_full_cooldown(
+    _reset_cooldown_and_mock_create, store, clock
+):
+    # No resolve in between (still open): a same-severity repeat after the
+    # quarter but inside the hour stays suppressed.
+    create = _reset_cooldown_and_mock_create
+    await loop._check_pid_budget(object(), budget=_budget("degraded", 83.0))
+    clock.t += loop._PID_BUDGET_ALERT_COOLDOWN_S / 2
+    await loop._check_pid_budget(object(), budget=_budget("degraded", 84.0))
+    assert create.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_escalation_after_resolve_bypasses_the_quarter(
+    _reset_cooldown_and_mock_create, store, clock
+):
+    create = _reset_cooldown_and_mock_create
+    await loop._check_pid_budget(object(), budget=_budget("degraded", 83.0))
+    clock.t += 30
+    await loop._check_pid_budget(object(), budget=_budget("healthy", 41.0))
+    clock.t += 30
+    await loop._check_pid_budget(object(), budget=_budget("error", 95.0))
+    assert create.await_count == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("budget", "note_has", "note_lacks"),
+    [
+        (_budget("healthy", 41.0), "75%", "sub-cap"),
+        ({"status": "healthy", "current": 9, "max": "max", "pct": None}, "no sub-cap", "75%"),
+    ],
+)
+async def test_resolution_note_matches_the_reading(
+    _reset_cooldown_and_mock_create, store, budget, note_has, note_lacks
+):
+    await loop._check_pid_budget(object(), budget=budget)
+    note = store.resolve.await_args.kwargs["resolution_notes"]
+    assert note_has in note
+    assert note_lacks not in note
+
+
+@pytest.mark.asyncio
+async def test_resolving_nothing_keeps_the_cooldown(_reset_cooldown_and_mock_create, store):
+    create = _reset_cooldown_and_mock_create
+    store.resolve.return_value = 0
+    await loop._check_pid_budget(object(), budget=_budget("degraded", 83.0))
+    await loop._check_pid_budget(object(), budget=_budget("healthy", 41.0))
+    await loop._check_pid_budget(object(), budget=_budget("degraded", 84.0))
+    assert create.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_resolve_failures_never_raise(_reset_cooldown_and_mock_create, store):
+    store.resolve.side_effect = RuntimeError("db locked")
+    await loop._check_pid_budget(object(), budget=_budget("healthy", 41.0))
+
+
+@pytest.mark.asyncio
+async def test_healthy_with_no_db_does_nothing(_reset_cooldown_and_mock_create, store):
+    await loop._check_pid_budget(None, budget=_budget("healthy", 41.0))
+    assert store.probe_calls == []
+    store.resolve.assert_not_awaited()

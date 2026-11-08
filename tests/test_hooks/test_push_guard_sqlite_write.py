@@ -169,3 +169,43 @@ class TestAcceptedLimitations:
         # A read whose STRING VALUE is a keyword. The historical guard blocked
         # this too; distinguishing it needs SQL parsing.
         assert _is_write("sqlite3 -readonly db \"SELECT * FROM t WHERE action = 'DELETE'\"")
+
+
+class TestReadOnlyQueryRoute:
+    """The sanctioned read route is ``genesis db query`` (a separate change adds
+    it; these tests are guard-only and need none of its code): its read-only
+    property is enforced by SQLite (``mode=ro`` + ``query_only`` + an allowlist
+    authorizer), so the guard needs no exemption (the command text carries no
+    ``sqlite3``) and the block message points sessions at it."""
+
+    def test_cli_read_with_dml_literal_not_blocked(self):
+        assert not _is_write(
+            "~/genesis/.venv/bin/python -m genesis db query \"select * from t where s='DELETE'\""
+        )
+        assert not _is_write("python -m genesis db query \"select * from t where s='DELETE'\"")
+
+    def test_block_message_names_the_read_route(self):
+        import json
+        import os
+        import subprocess
+
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_TOOL_INPUT"}
+        payload = json.dumps(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": 'sqlite3 db "DELETE FROM t"'},
+            }
+        )
+        result = subprocess.run(
+            [sys.executable, str(_HOOKS_DIR / "git_push_guard.py")],
+            input=payload,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert result.returncode == 2
+        # The venv interpreter, not a bare `python`: a session shell has no
+        # `python` on PATH and the system python3 cannot import genesis.
+        assert '~/genesis/.venv/bin/python -m genesis db query "<sql>"' in result.stderr

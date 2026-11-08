@@ -1,1 +1,0 @@
-- The card vault is now backed up with the encrypted credentials every backup run and comes back with a restore, staged and checked but never put in place for you. A vault backup that fails, or a backed-up vault that disappears, fails the backup run and sends the backup-failed alert. `python -m genesis vault init`, `add` and `retire` remind you to run a backup right away.

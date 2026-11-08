@@ -45,8 +45,8 @@ class TestRuntimeRetrieverProperties:
     @pytest.mark.live_service
     @pytest.mark.asyncio
     async def test_retriever_created_after_bootstrap(self):
-        # Probed here, inside the live_service test, never at collection: the
-        # outbound fence refuses a connect made outside any test.
+        # Probed here, inside the opted-in test, never at collection: a skipped
+        # run then opens no connection at all.
         if not _qdrant_available():
             pytest.skip("Qdrant not reachable")
         GenesisRuntime.reset()

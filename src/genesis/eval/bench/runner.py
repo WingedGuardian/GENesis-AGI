@@ -157,7 +157,7 @@ async def judge_arm(scorer, task: BenchTask, outcome: BenchArmOutcome) -> BenchA
     passed, score, detail = await scorer.score_async(
         actual=outcome.output_text,
         expected=task.expected,
-        config={"rubric_name": _RUBRIC_NAME, "task_prompt": task.prompt},
+        config={"rubric_name": _RUBRIC_NAME, "task_prompt": task.rendered_prompt()},
     )
     try:
         detail_obj = json.loads(detail)

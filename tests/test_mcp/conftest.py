@@ -16,6 +16,16 @@ from unittest.mock import patch
 
 import pytest
 
+# test_payment_context_js.py runs payment_context's page scripts in a real
+# browser. Where Playwright is not installed (CI's test job installs no
+# [browser] extra) it is not collected, rather than adding 13 skips to the
+# suite's skip ceiling; the live card-fill L-tests are its coverage there.
+# Same pattern as tests/test_ui/conftest.py.
+try:
+    import playwright  # noqa: F401
+except ImportError:
+    collect_ignore = ["test_payment_context_js.py"]
+
 
 @pytest.fixture()
 def config_dir(tmp_path: Path) -> Path:
