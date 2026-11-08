@@ -167,6 +167,8 @@ def worktree_root_for(path: str | Path) -> Path | None:
         try:
             if dot_git.is_file():
                 return candidate
+            if dot_git.is_dir():
+                return None  # A nearer primary checkout is not the enclosing worktree.
         except OSError:
             continue
         if candidate == candidate.parent:

@@ -121,6 +121,39 @@ def test_foreign_live_claim_advises_without_overwriting(world):
         first.close()
 
 
+@pytest.mark.parametrize("target_kind", ["existing", "new-file", "deep-uncreated"])
+@pytest.mark.parametrize("preexisting_owner", [False, True])
+def test_nested_standalone_repository_neither_claims_nor_advises_outer(world, target_kind, preexisting_owner):
+    _, worktree, env = world
+    nested = worktree / "vendor/independent"
+    nested.mkdir(parents=True)
+    subprocess.run(["git", "-C", str(nested), "-c", "init.templateDir=", "init", "-q"], env=env, check=True)
+    target = nested / ("missing/deep/file.txt" if target_kind == "deep-uncreated" else "file.txt")
+    if target_kind == "existing":
+        target.write_text("owned fixture")
+    owner = session(world, [event(worktree)]) if preexisting_owner else None
+    try:
+        if owner is not None:
+            next(owner)
+        original = claim.read_lock(worktree)
+        raw = original.raw if original else None
+        probe = session(world, [
+            event(worktree, "PreToolUse", tool_input={"file_path": str(target)}),
+            event(worktree, tool_input={"file_path": str(target)}),
+        ])
+        try:
+            _, receipt = next(probe)
+            assert all(row["code"] == 0 and row["out"] == "" for row in receipt["results"]), receipt
+            current = claim.read_lock(worktree)
+            assert (current.raw if current else None) == raw
+            assert not (nested / ".git/locked").exists()
+        finally:
+            probe.close()
+    finally:
+        if owner is not None:
+            owner.close()
+
+
 @pytest.mark.parametrize("reason", ["foreign owner", "reaper archived worktree"])
 def test_existing_nonclaim_lock_stays_untouched(world, reason):
     repo, worktree, env = world
