@@ -3974,6 +3974,16 @@ provider/model/outcome. Failed historical attempts render as a warning, not an
 inferred current provider outage. The readiness worker uses the shared
 tool-disabled CC probe without changing its schedule or routing authority.
 
+`util/codex_cli.py` is the only place under `src/genesis` that names the Codex
+CLI. Its `codex_exec_argv`/`codex_child_env` give every Codex run Genesis
+starts unattended (the executor's adversarial verifier, the contribution
+reviewer) a child environment from `caller_context.dispatched_child_env`:
+`GENESIS_CC_SESSION=1`, supervised marker dropped, origin kept.
+`tests/test_codex_dispatch_marker.py` fails on a `codex` literal anywhere else.
+The marker is inert until the Codex project config forwards it to the Genesis
+MCP launcher; it exists so an unmarked Codex run can mean the owner's own
+client, as an unmarked Claude Code session does.
+
 Fresh dedicated validator-health trackers disable new activity persistence
 before DB attachment, retaining memory metrics and historical provider SELECTs.
 Health instrumentation then has no transaction DB, so it cannot retire another
