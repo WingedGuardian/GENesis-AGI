@@ -248,9 +248,11 @@ _python="$REPO_ROOT/.venv/bin/python"
 _chain_args=(--install --source "$HOOKS_SRC" --repo "${HOOK_REPO:-$REPO_ROOT}")
 [[ $CHAIN_PRE_PUSH -eq 0 ]] || _chain_args+=(--opt-in)
 [[ $RESTORE_PRE_PUSH -eq 0 ]] || _chain_args+=(--restore)
-if ! "$_python" "$HOOKS_SRC/pre_push_chain.py" "${_chain_args[@]}"; then
-    exit 2
-fi
+_chain_status=0
+"$_python" "$HOOKS_SRC/pre_push_chain.py" "${_chain_args[@]}" || _chain_status=$?
+# Only declined custom-hook opt-in allows unrelated updates. Ownership damage,
+# helper collisions and missing shared-repository enrollment still stop here.
+[[ $_chain_status -eq 0 || $_chain_status -eq 3 ]] || exit 2
 
 _chain_helpers=$("$_python" "$HOOKS_SRC/pre_push_chain.py" --list-helpers) || exit 2
 declare -A CHAIN_HELPERS=()
@@ -276,7 +278,7 @@ if [[ $SYNCED -gt 0 ]]; then
     _log "synced $SYNCED file(s) to $HOOKS_DST"
 fi
 
-if [[ $MODIFIED_FOUND -eq 1 ]]; then
+if [[ $MODIFIED_FOUND -eq 1 || $_chain_status -ne 0 ]]; then
     exit 2
 fi
 

@@ -2,9 +2,17 @@
 
 Run `scripts/hooks/sync-hooks.sh --chain-pre-push` from the main checkout to
 explicitly enroll a custom pre-push hook. Without that option, an unknown hook
-is preserved and sync reports non-success. Git chooses the effective hook
+is preserved and sync reports non-success while updating unrelated hooks and helpers.
+Ownership conflicts or invalid chain state still stop synchronization before other updates. Git chooses the effective hook
 location, including `core.hooksPath`; `--hook-repo /path/to/linked-worktree`
 selects a linked worktree while the main checkout supplies the code.
+
+The qualified profile is Linux with readable `/proc/self/environ`, Bash 4+ and
+Git supporting `git var GIT_SHELL_PATH` (native checks use Git 2.43). The original
+startup environment is retained in memory across Python interpreter startup; if
+it cannot be read, native execution refuses without displaying its contents.
+Executable originals without a shebang use Git’s configured shell only after
+`ENOEXEC`; missing interpreters and permission failures do not take that fallback.
 
 The original remains beside the wrapper, with its bytes and mode preserved.
 It runs first with the same arguments, working directory and environment; each
