@@ -1,0 +1,1 @@
+Deduplicated memory corrections now apply supersession through the existing validated, locked path. Invalid correction handles and successor pairs reject without creating a new memory; duplicate results retain their existing ownership flag.

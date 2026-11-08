@@ -385,6 +385,12 @@ class MemoryStore:
                     f"got {life_domain!r}"
                 )
 
+        # Invalid correction handles are preconditions, including on dedup.
+        # Resolve before any lookup catch or write can hide the rejection.
+        resolved_supersedes = (
+            await self._resolve_supersede_target(supersedes)
+            if supersedes and supersedes.strip() else None
+        )
         raw_content = content
         # Surface form normalization: expand known aliases before embedding
         try:
@@ -395,6 +401,7 @@ class MemoryStore:
             pass  # best-effort — never block a store on normalization failure
 
         # Dedup normalized identity first; retain legacy raw-text compatibility.
+        existing = None
         try:
             existing = await memory_crud.find_exact_duplicate(
                 self._db, content=content, source_subsystem=source_subsystem,
@@ -403,13 +410,26 @@ class MemoryStore:
                 existing = await memory_crud.find_exact_duplicate(
                     self._db, content=raw_content, source_subsystem=source_subsystem,
                 )
-            if existing:
-                logger.debug("Skipping duplicate memory store: %s", existing)
-                # NOT created by this call: the caller must not compensate it.
-                return (existing, False)
         except Exception:
             # Dedup check is best-effort — never block a store on lookup failure
             logger.warning("Dedup check failed, proceeding with store", exc_info=True)
+
+        if existing:
+            if resolved_supersedes:
+                try:
+                    # Full ids retain the standalone validation, ordered locks,
+                    # and repair path; invalid pairs must not become new stores.
+                    await self.supersede(resolved_supersedes, existing)
+                except SupersedeUnresolved:
+                    raise
+                except Exception:
+                    logger.warning(
+                        "Failed to mark memory %s as superseded by %s",
+                        resolved_supersedes, existing, exc_info=True,
+                    )
+            logger.debug("Skipping duplicate memory store: %s", existing)
+            # NOT created by this call: the caller must not compensate it.
+            return (existing, False)
 
         # Confidence gate: low-confidence → FTS5 only, skip Qdrant
         # Deferred import to break circular: memory.store ↔ perception
@@ -434,16 +454,6 @@ class MemoryStore:
         is_subsystem_write = source_subsystem is not None
         if is_subsystem_write:
             force_fts5_only = True
-
-        # Resolve the supersede target BEFORE anything is written. An
-        # unresolvable target then costs nothing and leaves nothing behind, and
-        # the raise reaches the caller with no half-done operation attached.
-        # It also has to be before ``create_metadata``: resolving afterwards let
-        # a short prefix match the row this call had just written, deprecating
-        # the new memory as its own successor.
-        resolved_supersedes = (
-            await self._resolve_supersede_target(supersedes) if supersedes else None
-        )
 
         memory_id = str(uuid.uuid4())
         now_iso = datetime.now(UTC).isoformat()
