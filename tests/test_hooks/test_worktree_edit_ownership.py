@@ -203,7 +203,7 @@ def test_settings_wire_both_events_and_all_supported_tools():
     for name in ("PreToolUse", "PostToolUse"):
         matches = [row for row in settings["hooks"][name] if any("worktree_ownership_advisory.py" in h.get("command", "") for h in row["hooks"])]
         assert len(matches) == 1
-        assert matches[0]["matcher"] == "^(Edit|Write|MultiEdit|NotebookEdit)$"
+        assert matches[0]["matcher"] == "^(Write|Edit|MultiEdit|NotebookEdit)$"
 
 
 @pytest.mark.parametrize("change", [

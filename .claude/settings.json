@@ -392,7 +392,7 @@
                 ]
             },
             {
-                "matcher": "^(Edit|Write|MultiEdit|NotebookEdit)$",
+                "matcher": "^(Write|Edit|MultiEdit|NotebookEdit)$",
                 "hooks": [
                     {
                         "type": "command",
@@ -563,7 +563,7 @@
         ],
         "PostToolUse": [
             {
-                "matcher": "^(Edit|Write|MultiEdit|NotebookEdit)$",
+                "matcher": "^(Write|Edit|MultiEdit|NotebookEdit)$",
                 "hooks": [
                     {
                         "type": "command",
