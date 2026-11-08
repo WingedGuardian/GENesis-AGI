@@ -155,6 +155,22 @@ async def test_rows_differing_only_past_the_display_cut_show_once(db):
 
 
 @pytest.mark.asyncio
+async def test_rows_differing_only_in_the_word_the_clip_drops_show_once(db):
+    """The word crossing the 250-char boundary is dropped by the clip, so rows
+    that differ only inside it print identically even though their raw
+    250-char windows differ; they must not take five slots and starve an
+    older distinct row."""
+    for i in range(5):
+        text = "context " * 30 + f"variant{i}xxxxxxxxxxxx extra details"
+        await _mk(db, f"v{i}", "learning", text, minutes_ago=i)
+    await _mk(db, "o", "learning", "an older distinct insight", minutes_ago=10)
+
+    out = await _recent_decisions(db)
+    assert len(set(out)) == len(out), "no two shown lines may look identical"
+    assert out[-1] == "an older distinct insight"
+
+
+@pytest.mark.asyncio
 async def test_a_whole_short_row_and_a_longer_one_with_its_opening_show_once(db):
     """A <=250-char row is shown whole, a longer row with the same opening is
     shown clipped with "…"; they must not print as two near-identical lines."""

@@ -20,7 +20,7 @@ from pathlib import Path
 import aiosqlite
 
 from genesis.db.crud.observations import SAFE_ORIGIN_SQL, SAFE_SURFACING_ORIGINS
-from genesis.util.text import clip_words
+from genesis.util.text import ELLIPSIS, clip_words
 
 logger = logging.getLogger(__name__)
 
@@ -373,7 +373,7 @@ async def _recent_decisions(
         # could be all one text. The scan stops once ``limit`` distinct
         # entries are collected, which bounds the work instead.
         results: list[str] = []
-        seen: set[str] = set()
+        seen: set[str | tuple[str, str]] = set()
         # The read is capped in SQL, so a long row never crosses into Python
         # whole. Dedup keys on that capped text, not on the shorter display
         # clip: rows that share their opening and differ later are distinct.
@@ -400,10 +400,15 @@ async def _recent_decisions(
                 # Keyed on the 250-char WINDOW, not the clip: a short row shown
                 # whole and a longer one shown with "…" share that window.
                 shown_key = ("shown", _insight_dedup_key(text[:_INSIGHT_CHARS]))
-                if key in seen or shown_key in seen:
+                # And on the clip itself: the clip drops the word crossing the
+                # cut, so rows differing only inside that word share a clip
+                # while their windows differ.
+                display_key = ("display", _insight_dedup_key(shown.removesuffix(ELLIPSIS)))
+                if key in seen or shown_key in seen or display_key in seen:
                     continue
                 seen.add(key)
                 seen.add(shown_key)
+                seen.add(display_key)
                 results.append(shown)
                 if len(results) >= limit:
                     break
