@@ -18,8 +18,8 @@ ARG SOURCE_HEAD
 ARG SOURCE_BASE
 ENV HOME=/work/home PYTHONPATH=/fixture/src PYTHONDONTWRITEBYTECODE=1 \
     GENESIS_CODEX_NATIVE_TESTS=1 \
-    GENESIS_CODEX_CLI_BIN=/opt/codex/package/vendor/x86_64-unknown-linux-musl/codex/codex \
-    GENESIS_CODEX_APP_SERVER_BIN=/opt/codex/package/vendor/x86_64-unknown-linux-musl/codex/codex \
+    GENESIS_CODEX_CLI_BIN=/opt/codex/package/vendor/x86_64-unknown-linux-musl/bin/codex \
+    GENESIS_CODEX_APP_SERVER_BIN=/opt/codex/package/vendor/x86_64-unknown-linux-musl/bin/codex \
     QUALIFICATION_HEAD=${SOURCE_HEAD} QUALIFICATION_BASE=${SOURCE_BASE} \
     QUALIFICATION_MANIFEST=/fixture/expected.json QUALIFICATION_REPORT=/evidence/report.json
 # Freeze the collection and source/binary hashes into the image before any test runs.

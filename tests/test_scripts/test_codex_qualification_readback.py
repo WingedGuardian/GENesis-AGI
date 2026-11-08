@@ -2,8 +2,13 @@
 
 import copy
 import json
+import os
+import subprocess
+import tarfile
+from pathlib import Path
 
 import pytest
+import yaml
 
 from genesis.eval.qualification.evidence import digest
 from scripts.ci.codex_qualification_readback import (
@@ -190,3 +195,25 @@ def test_missing_or_contradictory_native_witness_refuses(packet, fault):
     report["artifacts"] = inventory(root, (".",))
     with pytest.raises(ValueError):
         result(packet)
+
+
+def test_workflow_preserves_hidden_files_and_directory_links(tmp_path):
+    workflow = Path(__file__).resolve().parents[2] / ".github/workflows/codex-qualification.yml"
+    steps = yaml.safe_load(workflow.read_text())["jobs"]["contained"]["steps"]
+    pack = [step for step in steps if step.get("name") == "Pack complete evidence"]
+    assert len(pack) == 1, "workflow must preserve hidden files and link shape in an evidence archive"
+    root = tmp_path / "codex-evidence"
+    hidden = root / "case/.claude/hooks/guard.py"
+    hidden.parent.mkdir(parents=True)
+    hidden.write_text("synthetic fixture bytes")
+    (root / "case-current").symlink_to("case", target_is_directory=True)
+    (root / "file-link").symlink_to("case/.claude/hooks/guard.py")
+    before = inventory(root, (".",))
+    subprocess.run(["bash", "-euo", "pipefail", "-c", pack[0]["run"]], check=True,
+                   env={"PATH": os.environ["PATH"], "RUNNER_TEMP": str(tmp_path)})
+    restored = tmp_path / "download"
+    with tarfile.open(tmp_path / "codex-evidence.tar.gz") as archive:
+        archive.extractall(restored, filter="data")
+    assert inventory(restored, (".",)) == before
+    assert (restored / "case-current").is_symlink()
+    assert (restored / "file-link").is_symlink()

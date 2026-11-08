@@ -37,7 +37,8 @@ jobs:
           mkdir -p "$RUNNER_TEMP/codex-context" "$RUNNER_TEMP/codex-evidence"
           git archive HEAD | tar -x -C "$RUNNER_TEMP/codex-context"
           docker build --build-arg SOURCE_HEAD="$SOURCE_HEAD" --build-arg SOURCE_BASE="$SOURCE_BASE" \
-            -f scripts/ci/codex_qualification.Dockerfile -t codex-qualification "$RUNNER_TEMP/codex-context"
+            -f scripts/ci/codex_qualification.Dockerfile -t codex-qualification "$RUNNER_TEMP/codex-context" \
+            2>&1 | tee "$RUNNER_TEMP/codex-evidence/build.txt"
           docker image inspect codex-qualification > "$RUNNER_TEMP/codex-evidence/image.json"
       - name: Run with no network, credentials, host mounts or capabilities
         run: |
@@ -74,9 +75,14 @@ jobs:
           python3 scripts/ci/codex_qualification_readback.py \
             "$RUNNER_TEMP/codex-evidence/expected.json" "$RUNNER_TEMP/codex-evidence/report.json" \
             "$RUNNER_TEMP/codex-evidence/native" --head "$SOURCE_HEAD" --base "$SOURCE_BASE"
+      - name: Pack complete evidence
+        if: always()
+        run: |
+          tar -C "$RUNNER_TEMP/codex-evidence" -czf "$RUNNER_TEMP/codex-evidence.tar.gz" .
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: codex-compatibility-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/codex-evidence
+          path: ${{ runner.temp }}/codex-evidence.tar.gz
+          compression-level: 0
           if-no-files-found: error

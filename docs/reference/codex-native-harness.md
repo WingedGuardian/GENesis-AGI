@@ -11,7 +11,9 @@ native binary on the developer's host is required or launched by this workflow.
 Execution is inside a read-only, unprivileged container with no network, host
 bind mounts, credentials or capabilities. A unique owned Docker volume retains
 test evidence after exit; it is copied out before the container and volume are
-removed. Model responses come from loopback fixtures, not a paid provider. The
+removed, then transported as `codex-evidence.tar.gz` to preserve hidden files and
+symbolic-link shape. Build logs remain available even when image collection
+fails. Model responses come from loopback fixtures, not a paid provider. The
 fixed CI resource limits and25-minute job ceiling bound this deterministic
 Linux qualification; they are not production agent timeouts or install defaults.
 
