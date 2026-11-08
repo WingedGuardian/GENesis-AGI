@@ -55,14 +55,14 @@ def evidence(tmp_path):
     (tmp_path / "compat-evidence.json").write_text(json.dumps(record, indent=2))
 
 
-def begin(driver, *, persistent=False):
+def begin(driver, *, persistent=False, approvals=False):
     driver.initialize()
     thread = driver.request("thread/start", {
         "cwd": str(driver.root / "workspace"), "ephemeral": not persistent,
     }, 2)["thread"]["id"]
     turn = driver.request("turn/start", {
         "threadId": thread, "input": [{"type": "text", "text": "Run the isolated fixture."}],
-    }, 3)["turn"]["id"]
+    }, 3, allow_requests=approvals)["turn"]["id"]
     return thread, turn
 
 
@@ -85,15 +85,19 @@ def test_native_approval(tmp_path, pinned, evidence, decision):
     with fixture_provider(item) as (url, requests):
         env = configure(tmp_path, url, "allow")
         config = tmp_path / "codex/config.toml"
-        config.write_text(config.read_text().replace('approval_policy = "never"', 'approval_policy = "on-request"'))
+        config.write_text(config.read_text().replace('approval_policy = "never"', 'approval_policy = "on-request"')
+                          .replace('sandbox_mode = "danger-full-access"', 'sandbox_mode = "read-only"'))
         trust_fixture_hook(pinned["app"], tmp_path, env)
         driver = AppServer(pinned["app"], tmp_path, env)
         driver.root = tmp_path
         evidence["events"] = driver.events
         try:
-            thread, turn = begin(driver)
+            thread, turn = begin(driver, approvals=True)
             evidence.update(thread=thread, turn=turn)
-            request = driver.until(lambda event: "id" in event and "method" in event, allow_requests=True)
+            started = next(event["result"] for event in driver.events if event.get("id") == 2 and "method" not in event)
+            assert started["approvalPolicy"] == "on-request" and started["sandbox"]["type"] == "readOnly", started
+            request = next((event for event in driver.events if "id" in event and "method" in event), None)
+            request = request or driver.until(lambda event: "id" in event and "method" in event, allow_requests=True)
             assert request["method"] == "item/commandExecution/requestApproval", request
             assert request["params"]["threadId"] == thread and request["params"]["turnId"] == turn
             assert str(sink) in request["params"]["command"], request
@@ -178,6 +182,8 @@ def test_canonical_ask_route(tmp_path, pinned, evidence, client, mode):
     assert result["code"] == 0, result
     if mode != "safe":
         assert json.loads(result["stdout"])["hookSpecificOutput"]["permissionDecision"] == "ask"
+    else:
+        assert result["stdout"] == "", result
     allowed = mode != "adapted-ask"
     evidence.update(client=client, mode=mode, canonical_same_session_approval="unproven", sink=(workspace / "canonical-receipt.txt").exists())
     assert evidence["sink"] == allowed

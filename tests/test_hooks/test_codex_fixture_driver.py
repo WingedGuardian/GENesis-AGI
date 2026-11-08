@@ -56,3 +56,15 @@ def test_expected_rpc_error_is_explicit():
 def test_failed_transport_never_satisfies_predicate(event):
     with pytest.raises(AssertionError):
         driver_with(event).until(lambda item: True, allow_requests=True, allow_error=True)
+
+
+@pytest.mark.parametrize("early", [False, True])
+def test_explicit_approval_survives_start_response_order(early):
+    approval = {"id": "approval", "method": "item/commandExecution/requestApproval", "params": {}}
+    response = {"id": 3, "result": {"turn": {"id": "turn"}}}
+    driver = driver_with(*( (approval, response) if early else (response, approval)))
+    assert driver.request("turn/start", {}, 3, allow_requests=True) == response["result"]
+    observed = next((e for e in driver.events if "method" in e and "id" in e), None)
+    observed = observed or driver.until(lambda e: "method" in e and "id" in e, allow_requests=True)
+    driver.reply(observed, {"decision": "decline"})
+    assert json.loads(driver.process.stdin.getvalue().splitlines()[-1])["id"] == "approval"

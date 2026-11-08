@@ -8,7 +8,7 @@ import pytest
 from tests.test_hooks import codex_qualification as capture
 
 
-@pytest.mark.parametrize("drift", ["none", "source", "binary", "census", "test-tools"])
+@pytest.mark.parametrize("drift", ["none", "source", "binary", "census", "test-tools", "cli-selection", "renamed-app"])
 def test_collection_is_frozen_before_execution(tmp_path, monkeypatch, drift):
     source = tmp_path / "src/witness.py"
     source.parent.mkdir()
@@ -20,7 +20,7 @@ def test_collection_is_frozen_before_execution(tmp_path, monkeypatch, drift):
     binary.write_bytes(b"fixture executable; never executed")
     binary.with_name("codex-code-mode-host").write_bytes(b"fixture companion")
     manifest = tmp_path / "expected.json"
-    for key, value in {"GENESIS_CODEX_APP_SERVER_BIN": binary, "QUALIFICATION_HEAD": "head",
+    for key, value in {"GENESIS_CODEX_APP_SERVER_BIN": binary, "GENESIS_CODEX_CLI_BIN": binary, "QUALIFICATION_HEAD": "head",
                        "QUALIFICATION_BASE": "base", "QUALIFICATION_MANIFEST": manifest}.items():
         monkeypatch.setenv(key, str(value))
     session = SimpleNamespace(config=SimpleNamespace(rootpath=tmp_path, option=SimpleNamespace(collectonly=True)),
@@ -37,6 +37,12 @@ def test_collection_is_frozen_before_execution(tmp_path, monkeypatch, drift):
         session.items = []
     elif drift == "test-tools":
         test_tools.write_text("pytest==0.0.0\n")
+    elif drift in {"cli-selection", "renamed-app"}:
+        alternate = binary.with_name("alternate-codex")
+        alternate.write_bytes(binary.read_bytes())
+        monkeypatch.setenv("GENESIS_CODEX_CLI_BIN", str(alternate))
+        if drift == "renamed-app":
+            monkeypatch.setenv("GENESIS_CODEX_APP_SERVER_BIN", str(alternate))
     if drift == "none":
         capture.pytest_collection_finish(session)
     else:

@@ -25,6 +25,12 @@ approvals are synthetic. A real secrets guard runs only against a scratch file
 containing synthetic text: its raw `ask` output and the existing adapter's deny
 interpretation are measured separately. This does not install a full Genesis
 Codex policy or establish an in-session canonical owner approval path.
+The six approval fixtures use `read-only` with `on-request` and explicit
+escalation, and verify the policy returned by `thread/start`. Full-access
+commands in the initial fixture ran immediately without approval, so that
+configuration cannot establish approval handling. Early approval requests are
+retained while awaiting the turn response; unexpected requests still fail by
+default in the shared driver.
 
 The image installs test tools under `.github/test-tools/requirements.txt`, the
 same constraints CI uses; changes to those pins trigger fresh qualification.
@@ -37,6 +43,11 @@ and teardown phases and a unique raw receipt. Independent readback after copying
 the artifacts verifies the head/base, source snapshot, manifest binding, full
 census, phase outcomes, artifact hashes and new sink witnesses. Missing,
 skipped, partial, failed or altered evidence refuses a completion verdict.
+This qualification requires both clients to select the same package executable
+named `codex`; different or renamed overrides are refused. Inherited receipts
+must match their declared action/decision or adapter case/instrument and actual
+sink bytes. Direct MCP calls unsupported by the native tool metadata remain
+transport controls with no sink. Safe canonical guard cases require silence.
 An expected incompatibility can be a completed measurement: native command
 approval is distinct from canonical guard approval, and `production_ready`
 always remains false. Read the copied `readback.json`, raw receipts and workflow

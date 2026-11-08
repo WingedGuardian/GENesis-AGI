@@ -13,13 +13,14 @@ CLIENTS = ("cli", "app")
 SOURCE_PATHS = ("src", "scripts", "tests", ".claude/hooks", ".github", "pyproject.toml")
 ACCEPTED_STEER = "fixture-accepted-steer"
 REJECTED_STEER = "fixture-rejected-steer"
+ADAPTER_ALLOW_CASES = ("shell", "patch", "code_shell", "code_patch", "mcp", "mcp_direct", "advisory", "allow-reason", "patch-relative", "outer-timeout")
 
 
 def required_cases():
     prefix = "tests/test_hooks/test_codex_compatibility_native.py::"
     # Frozen inherited population, independently checked against pytest collection.
     # A change to those suites updates this census deliberately, never by dropping cells.
-    allow = ("shell", "patch", "code_shell", "code_patch", "mcp", "mcp_direct", "advisory", "allow-reason", "patch-relative", "outer-timeout")
+    allow = ADAPTER_ALLOW_CASES
     deny = ("deny", "ask", "crash", "missing", "malformed", "timeout", "patch-deny", "missing-launcher", "broken-launcher", "silent-launcher", "mcp_direct-deny", "mcp-deny", "outer-completes", "legacy-anchor")
     hooks = {f"tests/test_hooks/test_codex_native.py::test_native_hook_controls_actual_sink[{decision}-{action}-{client}]"
              for decision in ("allow", "deny") for action in ("shell", "patch", "mcp", "code_shell", "code_patch") for client in CLIENTS}
@@ -81,11 +82,34 @@ def readback(manifest, report, artifacts, *, head, base):
         elif (evidence.get("versions") != {"cli": "codex-cli 0.166.0", "app": "codex-cli 0.166.0"}
               or len(evidence.get("requests", [])) != 2 or not completed_route(evidence.get("events", []), evidence.get("client"))):
             raise ValueError("missing inherited native transport witnesses")
+        else:
+            check_inherited_receipt(nodeid, (artifacts / receipt).parent, evidence)
     # Results apply only to this transport/guard route. Same-session canonical
     # approval remains unproven; no adapter, auth or production path was built.
     return {"status": "complete", "case_total": len(cases), "production_ready": False,
             "native_command_approval": "supported", "canonical_ask_native_wire": "unsupported",
             "canonical_same_session_approval": "unproven", "head": head, "base": base}
+
+
+def check_inherited_receipt(nodeid, root, evidence):
+    params = nodeid.rsplit("[", 1)[1][:-1]
+    if "test_codex_native.py::" in nodeid:
+        decision, action, _ = params.split("-")
+        if evidence.get("decision") != decision or evidence.get("action") != action:
+            raise ValueError("inherited receipt belongs to another hook case")
+        sink = root / f"workspace/{action.removeprefix('code_')}-receipt.txt"
+        allowed = decision == "allow"
+    else:
+        case, instrument, _ = params.rsplit("-", 2)
+        if evidence.get("case") != case or evidence.get("instrument") != instrument:
+            raise ValueError("inherited receipt belongs to another adapter case")
+        kind = "patch" if "patch" in case else "mcp" if case.startswith("mcp") else "shell"
+        directory = "tmp/validator/session/workspace" if case == "patch-relative" else "workspace" if case == "patch-deny" or kind == "mcp" else "tmp/validator"
+        sink = root / directory / f"{kind}-receipt.txt"
+        # Raw direct MCP calls never reach a hook, including no-op controls.
+        allowed = not case.startswith("mcp_direct") and (instrument == "noop" or case in ADAPTER_ALLOW_CASES)
+    if sink.exists() != allowed or (allowed and sink.read_bytes().strip() != b"fixture"):
+        raise ValueError("inherited native effect contradicts its case")
 
 
 def check_sink(path, evidence, allowed):
@@ -118,6 +142,9 @@ def check_native_receipt(nodeid, root, evidence):
         raise ValueError("missing native events or provider requests")
     if "::test_native_approval[" in nodeid:
         decision = nodeid.rsplit("[", 1)[1][:-1]
+        starts = [event["result"] for event in events if event.get("id") == 2 and "method" not in event and "result" in event]
+        if len(starts) != 1 or starts[0].get("thread", {}).get("id") != evidence["thread"] or starts[0].get("approvalPolicy") != "on-request" or starts[0].get("sandbox", {}).get("type") != "readOnly":
+            raise ValueError("missing native approval policy witness")
         check_sink(root / "workspace/approval.txt", evidence, decision == "accept")
         approvals = [event["params"] for event in events if event.get("method") == "item/commandExecution/requestApproval"]
         if evidence["decision"] != decision or not requests or not any(
@@ -138,7 +165,7 @@ def check_native_receipt(nodeid, root, evidence):
         mode = next(mode for mode in ASK_MODES if any(nodeid.endswith(f"[{mode}-{client}]") for client in CLIENTS))
         check_sink(root / "workspace/canonical-receipt.txt", evidence, mode != "adapted-ask")
         guard = load_json((root / "guard-result.json").read_bytes())
-        if guard["code"] != 0 or (mode != "safe" and load_json(guard["stdout"])["hookSpecificOutput"]["permissionDecision"] != "ask"):
+        if guard["code"] != 0 or (mode == "safe" and guard["stdout"] != "") or (mode != "safe" and load_json(guard["stdout"])["hookSpecificOutput"]["permissionDecision"] != "ask"):
             raise ValueError("missing actual canonical ask witness")
         if len(requests) != 2 or not completed_route(events, evidence["client"]):
             raise ValueError("missing canonical route native completion")

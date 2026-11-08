@@ -18,6 +18,7 @@ def pytest_collection_finish(session):
     global _manifest_digest
     root = Path(session.config.rootpath)
     binary = Path(os.environ["GENESIS_CODEX_APP_SERVER_BIN"])
+    assert binary.name == "codex" and Path(os.environ["GENESIS_CODEX_CLI_BIN"]).resolve() == binary.resolve(), "unsupported executable selection identity drift"
     manifest = {
         "schema": "codex-compatibility/v1", "head": os.environ["QUALIFICATION_HEAD"],
         "base": os.environ["QUALIFICATION_BASE"],

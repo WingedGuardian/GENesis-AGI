@@ -36,6 +36,8 @@ def packet(tmp_path):
             evidence.update(decision=decision, sink=decision == "accept")
             evidence["events"].insert(0, {"id": 8, "method": "item/commandExecution/requestApproval",
                 "params": {"threadId": thread, "turnId": turn, "command": "printf fixture > approval.txt"}})
+            evidence["events"].insert(1, {"id": 2, "result": {"thread": {"id": thread},
+                "approvalPolicy": "on-request", "sandbox": {"type": "readOnly"}}})
             if decision in {"interrupt", "stale"}:
                 terminal["params"]["turn"]["status"] = "interrupted"
             elif decision == "disconnect":
@@ -53,7 +55,7 @@ def packet(tmp_path):
                 evidence["events"] = [{"type": "turn.completed"}]
             evidence["sink"] = "[adapted-ask-" not in nodeid
             (path.parent / "guard-result.json").write_text(json.dumps({
-                "code": 0, "stdout": json.dumps({"hookSpecificOutput": {"permissionDecision": "ask"}}),
+                "code": 0, "stdout": "" if "[safe-" in nodeid else json.dumps({"hookSpecificOutput": {"permissionDecision": "ask"}}),
             }))
             if evidence["sink"]:
                 (path.parent / "workspace").mkdir()
@@ -75,6 +77,22 @@ def packet(tmp_path):
                             client="cli" if nodeid.endswith("-cli]") else "app", requests=[{}, {}])
             if evidence["client"] == "cli":
                 evidence["events"] = [{"type": "turn.completed"}]
+            params = nodeid.rsplit("[", 1)[1][:-1]
+            if "test_codex_native.py::" in nodeid:
+                decision, action, _ = params.split("-")
+                evidence.update(decision=decision, action=action)
+                sink = path.parent / f"workspace/{action.removeprefix('code_')}-receipt.txt"
+                allowed = decision == "allow"
+            else:
+                case, instrument, _ = params.rsplit("-", 2)
+                evidence.update(case=case, instrument=instrument)
+                kind = "patch" if "patch" in case else "mcp" if case.startswith("mcp") else "shell"
+                directory = "tmp/validator/session/workspace" if case == "patch-relative" else "workspace" if case == "patch-deny" or kind == "mcp" else "tmp/validator"
+                sink = path.parent / directory / f"{kind}-receipt.txt"
+                allowed = not case.startswith("mcp_direct") and (instrument == "noop" or case in {"shell", "patch", "code_shell", "code_patch", "mcp", "advisory", "allow-reason", "patch-relative", "outer-timeout"})
+            if allowed:
+                sink.parent.mkdir(parents=True, exist_ok=True)
+                sink.write_text("fixture\n")
         evidence["files"] = inventory(path.parent, (".",))
         path.write_text(json.dumps(evidence))
         rows[nodeid] = {"phases": [[phase, "passed"] for phase in ("setup", "call", "teardown")], "receipt": name}
@@ -159,11 +177,43 @@ def test_non_receipt_artifact_change_refuses(packet):
         result(packet)
 
 
-@pytest.mark.parametrize("fault", ["events", "terminal", "approval-turn", "resume", "replay", "required-response", "required-work", "cleanup", "steer", "eof"])
+def test_inherited_same_client_receipt_swap_refuses(packet):
+    _, report, _ = packet
+    allow = next(k for k in report["cases"] if k.endswith("[allow-shell-cli]"))
+    deny = next(k for k in report["cases"] if k.endswith("[deny-shell-cli]"))
+    report["cases"][allow]["receipt"], report["cases"][deny]["receipt"] = report["cases"][deny]["receipt"], report["cases"][allow]["receipt"]
+    with pytest.raises(ValueError):
+        result(packet)
+
+
+def test_inherited_wrong_sink_refuses(packet):
+    _, report, root = packet
+    key = next(k for k in report["cases"] if k.endswith("[allow-shell-cli]"))
+    sink = (root / report["cases"][key]["receipt"]).parent / "workspace/shell-receipt.txt"
+    sink.write_text("wrong fixture bytes")
+    report["artifacts"] = inventory(root, (".",))
+    with pytest.raises(ValueError):
+        result(packet)
+
+
+def test_safe_guard_ask_refuses(packet):
+    _, report, root = packet
+    key = next(k for k in report["cases"] if k.endswith("[safe-cli]"))
+    receipt = root / report["cases"][key]["receipt"]
+    (receipt.parent / "guard-result.json").write_text(json.dumps({"code": 0, "stdout": json.dumps({"hookSpecificOutput": {"permissionDecision": "ask"}})}))
+    evidence = json.loads(receipt.read_text())
+    evidence["files"] = {name: value for name, value in inventory(receipt.parent, (".",)).items() if name != receipt.name}
+    receipt.write_text(json.dumps(evidence))
+    report["artifacts"] = inventory(root, (".",))
+    with pytest.raises(ValueError):
+        result(packet)
+
+
+@pytest.mark.parametrize("fault", ["events", "terminal", "approval-turn", "approval-policy", "resume", "replay", "required-response", "required-work", "cleanup", "steer", "eof"])
 def test_missing_or_contradictory_native_witness_refuses(packet, fault):
     _, report, root = packet
     target = {"events": "test_native_approval[accept]", "terminal": "test_native_approval[accept]",
-              "approval-turn": "test_native_approval[accept]", "resume": "test_native_resume",
+              "approval-turn": "test_native_approval[accept]", "approval-policy": "test_native_approval[accept]", "resume": "test_native_resume",
               "replay": "test_native_resume", "required-response": "test_required_mcp_and_owned_cleanup[required-failure]",
               "required-work": "test_required_mcp_and_owned_cleanup[required-failure]",
               "cleanup": "test_required_mcp_and_owned_cleanup[provenance-cleanup]",
@@ -177,6 +227,8 @@ def test_missing_or_contradictory_native_witness_refuses(packet, fault):
         evidence["events"][-1]["params"]["turn"]["status"] = "failed"
     elif fault == "approval-turn":
         evidence["events"][0]["params"]["turnId"] = "wrong-turn"
+    elif fault == "approval-policy":
+        evidence["events"][1]["result"]["sandbox"]["type"] = "dangerFullAccess"
     elif fault == "resume":
         evidence["resume"]["thread"]["id"] = "wrong-thread"
     elif fault == "replay":

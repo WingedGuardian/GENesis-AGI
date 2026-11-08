@@ -64,9 +64,10 @@ class AppServer:
             if predicate(event):
                 return event
 
-    def request(self, method: str, params: dict, request_id: int):
+    def request(self, method: str, params: dict, request_id: int, *, allow_requests=False):
         self.send(method, params, request_id)
-        return self.until(lambda event: event.get("id") == request_id and "method" not in event)["result"]
+        return self.until(lambda event: event.get("id") == request_id and "method" not in event,
+                          allow_requests=allow_requests)["result"]
 
     def initialize(self):
         result = self.request("initialize", {
