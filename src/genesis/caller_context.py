@@ -6,7 +6,8 @@ Caller identity today is process environment. ``CCInvoker._build_env`` stamps
 it on every Claude Code child, and stdio MCP servers inherit it:
 
 - ``GENESIS_CC_SESSION=1``: a Genesis-dispatched session (set on every child,
-  channel conversations included).
+  channel conversations included, and by :func:`dispatched_child_env` on the
+  agent CLIs Genesis starts unattended, such as ``codex exec``).
 - ``GENESIS_SESSION_SUPERVISED=1``: an owner-attended conversation.
 - ``GENESIS_SESSION_ID``: the Genesis ``cc_sessions.id`` row.
 - ``GENESIS_SESSION_ORIGIN``: the dispatching session's origin class.
@@ -62,7 +63,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from collections.abc import Iterator, MutableMapping
+from collections.abc import Iterator, Mapping, MutableMapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -169,6 +170,24 @@ def drop_client_label(env: MutableMapping[str, str]) -> MutableMapping[str, str]
     not inherit the label and have its calls recorded as that client's.
     """
     env.pop(PROFILE_ENV, None)
+    return env
+
+
+def dispatched_child_env(base: Mapping[str, str] | None = None) -> dict[str, str]:
+    """A copy of *base* (default: this process's environment) marked dispatched.
+
+    For an agent CLI Genesis starts unattended, such as ``codex exec``. Without
+    the marker the child reads as the owner's own interactive client, which is
+    what an unmarked session means everywhere else. The supervised marker is
+    dropped: nobody watches this child, even when its parent was an
+    owner-attended conversation. So are the parent's session and transcript
+    ids, which the child is not. The origin class is kept, so a child of an
+    external-influenced session stays classified as one.
+    """
+    env = dict(os.environ if base is None else base)
+    env[CC_SESSION_ENV] = "1"
+    for name in (SUPERVISED_ENV, SESSION_ID_ENV, TRANSCRIPT_ID_ENV, LEGACY_SESSION_ID_ENV):
+        env.pop(name, None)
     return env
 
 

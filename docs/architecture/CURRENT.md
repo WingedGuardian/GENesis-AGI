@@ -948,8 +948,9 @@ verified: a8fa35a35 2026-10-23
   `emit_bugfix_audit`) stamp origin inline. Migration 0085 backfills historical rows. On the
   READ side, the LAUNDERING-CRITICAL surfaces now EXCLUDE external/unknown-origin content
   (fail-closed: `origin_class IN ('owner','first_party')`, NULL excluded) —
-  `essential_knowledge._recent_decisions` + `_active_session_pivots` (the always-loaded L1
-  file), `reflection.gather_evaluation_context` (×4) + `_recent_observations` +
+  `essential_knowledge._recent_decisions` (the always-loaded L1 file; its old
+  `_active_session_pivots` reader is gone, since live sessions are now shown only in the
+  session-start in-flight block, `memory/open_loops.py`, which skips external-origin rows), `reflection.gather_evaluation_context` (×4) + `_recent_observations` +
   `gather_for_calibration`, and `perception.context._build_memory_hits` + `_build_light_chain`
   (the deep-reflection/perception prompt pipeline) — severing the external→reflection→
   `first_party`-stamped-delta laundering path, with a deep-reflection prompt-rule belt and a
@@ -1615,7 +1616,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
-verified: 973a0e6 2026-10-30
+verified: 6b4f275 2026-11-08
 ```
 
 The neural monitor includes the non-routing **Fallback** observation, and the
@@ -1745,7 +1746,11 @@ the shared banner is not an assertion about all concurrent sessions.
   discord-bot) + external codebase-memory; profile→server allowlist lives in
   `cc/session_config._MCP_PROFILES`. `genesis-health` is the big one (~35 tool
   modules). `standalone_health.py` serves from `~/.genesis/status.json` when no
-  live runtime (stale-but-functional).
+  live runtime (stale-but-functional). Surplus liveness there comes from the
+  server's in-memory `surplus_dispatch` success pulse, which the status writer
+  carries in `liveness_pulses` (verified 2026-11-08): it is trusted only while the
+  file is at most 300s old (`snapshots/surplus.py` `STATUS_FILE_MAX_AGE_S`), and
+  any stale, future-dated or mistyped field reads `liveness_error`, never green.
   The optional fixed-main Serena services qualify provider 2.1.0 and MCP 2.2
   readiness; they select classic tools and reject switching or REPL capability.
   Their existing locking, per-profile limits and native stdio worktree routing
@@ -3455,7 +3460,10 @@ verified: 3e27b4794 2026-10-23
   See `docs/reference/qualification-corpus.md`.
   Qualification's pinned transport supplies a caller-provided adapter router
   through the production delegate, a shared one-egress wire guard, response-hook
-  durability and exact lexical Decimal GET billing. Documented selected-route
+  durability and exact lexical Decimal GET billing. Frozen gateway `model`,
+  optional `backend_model` and `receipt_model` keep namespace-specific exact
+  matching; omitted pins retain strict legacy IDs, with no inferred aliases or
+  migration of stopped campaigns. Documented selected-route
   metadata is checked on live acceptance and replay; gateway response caching
   is explicitly disabled. Contradictory served identities retain unresolved
   liability, while expense settlement cannot qualify invalid routing evidence.
@@ -3973,6 +3981,16 @@ verified: 973a0e6 2026-10-30
 provider/model/outcome. Failed historical attempts render as a warning, not an
 inferred current provider outage. The readiness worker uses the shared
 tool-disabled CC probe without changing its schedule or routing authority.
+
+`util/codex_cli.py` is the only place under `src/genesis` that names the Codex
+CLI. Its `codex_exec_argv`/`codex_child_env` give every Codex run Genesis
+starts unattended (the executor's adversarial verifier, the contribution
+reviewer) a child environment from `caller_context.dispatched_child_env`:
+`GENESIS_CC_SESSION=1`, supervised marker dropped, origin kept.
+`tests/test_codex_dispatch_marker.py` fails on a `codex` literal anywhere else.
+The marker is inert until the Codex project config forwards it to the Genesis
+MCP launcher; it exists so an unmarked Codex run can mean the owner's own
+client, as an unmarked Claude Code session does.
 
 Tool calls from a labelled client (`GENESIS_CALLER_PROFILE`, read into
 `CallerContext.profile`; owner-mode Codex sets `codex`) are logged to
