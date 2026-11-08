@@ -10,6 +10,7 @@ import uvicorn
 
 from genesis.caller_context import enter_shared_service
 from genesis.mcp.shared_http import build_http_app
+from genesis.mcp.shared_notify import notify_ready
 from genesis.mcp.shared_resources import initialize_shared_service
 from genesis.util.tasks import tracked_task
 
@@ -32,6 +33,10 @@ class SharedServer(uvicorn.Server):
             # Its SDK lifespan has already started and must settle first.
             await self.lifespan.shutdown()
             raise
+        # A failure after bind belongs to serve_shared's normal server/owner
+        # cleanup, not the partial-startup handler above.
+        if self.started and not self.should_exit:
+            notify_ready()
 
     async def shutdown(self, sockets=None):
         # Admission closes synchronously before Uvicorn can cancel handlers.
