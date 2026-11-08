@@ -181,13 +181,14 @@ def dispatched_child_env(base: Mapping[str, str] | None = None) -> dict[str, str
     what an unmarked session means everywhere else. The supervised marker is
     dropped: nobody watches this child, even when its parent was an
     owner-attended conversation. So are the parent's session and transcript
-    ids, which the child is not. The origin class is kept, so a child of an
+    ids and its client label, which the child is not. The origin class is kept, so a child of an
     external-influenced session stays classified as one.
     """
     env = dict(os.environ if base is None else base)
     env[CC_SESSION_ENV] = "1"
     for name in (SUPERVISED_ENV, SESSION_ID_ENV, TRANSCRIPT_ID_ENV, LEGACY_SESSION_ID_ENV):
         env.pop(name, None)
+    drop_client_label(env)
     return env
 
 
