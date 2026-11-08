@@ -174,6 +174,20 @@ def test_report_missing_occurrence_context_is_unknown():
     assert result["covered"] == "unknown"
 
 
+@pytest.mark.parametrize("width", [1, 2, 3])
+def test_report_rejects_terminal_code_trim_after_an_internal_matching_run(width):
+    run = "`" * width
+    shortened = URL + run + "literal"
+    raw = shortened + run
+    decoded = _rep._row_item_urls(_v2(run + raw))
+    assert decoded is not None and decoded[0] == [raw]
+    row = _rep.RowInput("completed", None, "fixture.genesis.md", "2026-01-01", 1, *decoded)
+    result = _rep._classify_url(raw, [row], False, lambda _: f"**Source:** <{shortened}>")
+    assert result["covered"] == "no"
+    result = _rep._classify_url(raw, [row], False, lambda _: f"**Source:** <{raw}>")
+    assert result["covered"] == "yes"
+
+
 def test_evaluated_not_covered(tmp_path: Path) -> None:
     inbox = tmp_path / "inbox"
     inbox.mkdir()

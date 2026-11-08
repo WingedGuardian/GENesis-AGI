@@ -223,6 +223,7 @@ async def test_literal_url_retries_then_completes_only_with_exact_citation(
         "# Evaluation\n**Source:** <https://example.com/literal>\n" + "x" * 300,
     )
     await monitor.check_once()
+    assert f"1. {literal}" in mock_invoker.run.await_args.args[0].prompt.splitlines()
     failed = await inbox_items.get_by_file_path(db, str(source))
     assert failed["status"] == "failed"
     assert failed["evaluated_content"] is None
@@ -1496,6 +1497,11 @@ async def test_build_prompt_enumerates_urls(monitor, inbox_dir):
         ('see "https://example.com/x", later', "https://example.com/x"),
         # A code span around a URL is likewise presentation.
         ("`https://example.com/y`.", "https://example.com/y"),
+        ("``https://example.com/y``", "https://example.com/y"),
+        ("(see https://example.com/y)", "https://example.com/y"),
+        ('"[docs](https://example.com/y)"', "https://example.com/y"),
+        # An earlier matching code delimiter makes terminal trimming unproved.
+        ("`https://example.com/a`literal`", "https://example.com/a`literal`"),
         # A URL-shaped markdown LABEL is its own token and must not absorb
         # `](https://...` -- this case reaches the bare-domain `]` stop, which
         # the `[docs](...)` cases above never do.

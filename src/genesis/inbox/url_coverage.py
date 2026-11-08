@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
@@ -110,6 +111,9 @@ def _extract_coverage_input_urls(text: str) -> list[str]:
 # before either prompt presentation or the gate can accept an alternate form.
 _DISPLAY_TRIM_CHARS = ".,;:!?"
 _DISPLAY_PAIRS = {")": "(", "]": "[", "}": "{", '"': '"', "'": "'", "`": "`"}
+_DISPLAY_CLOSERS = {opener: closer for closer, opener in _DISPLAY_PAIRS.items()}
+_CONTEXT_DELIMITERS = re.compile(r"`+|[()\[\]{}'\"\r\n]")
+_BACKTICK_RUNS = re.compile(r"`+")
 
 
 def _is_escaped(text: str, index: int) -> bool:
@@ -120,33 +124,132 @@ def _is_escaped(text: str, index: int) -> bool:
     return (index - start) % 2 == 1
 
 
-def _display_url(url: str, *, wrappers: str = "") -> str:
-    """Remove only matching wrappers observed immediately BEFORE this token.
+def _closing_wrapper_suffix(url: str, pos: int, wrappers: Sequence[str]) -> int | None:
+    """After the FIRST source closure, accept only ordered closers/punctuation."""
+    remaining = len(wrappers)
+    while pos < len(url):
+        if url[pos] in _DISPLAY_TRIM_CHARS:
+            pos += 1
+            continue
+        if not remaining:
+            return None
+        opener = wrappers[remaining - 1]
+        closer = _DISPLAY_CLOSERS.get(opener, opener)
+        if opener.startswith("`"):
+            run = _BACKTICK_RUNS.match(url, pos)
+            if run is None or run.group() != opener:
+                return None
+        elif not url.startswith(closer, pos) or _is_escaped(url, pos):
+            return None
+        pos += len(closer)
+        remaining -= 1
+    return remaining
 
-    Without source context there is no proof a terminal delimiter is prose.
-    Process outer to inner, with one counter and a moving end index; nested
-    wrappers do not repeatedly copy or rescan the URL. A malformed/escaped
-    wrapper leaves the original token intact. Punctuation inside the final
-    wrapper remains part of the URL.
+
+def _paired_source_closure(
+    url: str, current: str, available: Counter[str],
+) -> tuple[int | None, bool]:
+    """Find a source closure, or report uncertainty from misnested URI pairs."""
+    own: list[str] = []
+    for match in _CONTEXT_DELIMITERS.finditer(url):
+        delimiter = match.group()
+        if _is_escaped(url, match.start()):
+            continue
+        if delimiter in ("(", "[", "{"):
+            own.append(delimiter)
+        elif delimiter in (")", "]", "}"):
+            opener = _DISPLAY_PAIRS[delimiter]
+            if own:
+                if own.pop() != opener:
+                    return None, True
+            elif current == opener:
+                return match.start(), False
+            elif available[opener]:
+                return None, True
+        elif available[delimiter]:
+            return None, True
+    return None, False
+
+
+def _symmetric_source_closure(url: str, current: str) -> int | None:
+    """Quotes honor escapes; a code span closes at the first equal-width run."""
+    for match in _CONTEXT_DELIMITERS.finditer(url):
+        if match.group() != current:
+            continue
+        if current.startswith("`") or not _is_escaped(url, match.start()):
+            return match.start()
+    return None
+
+
+def _url_wrapper_proof(
+    url: str, wrappers: Sequence[str], wrapper_counts: Counter[str] | None = None,
+) -> tuple[int, int | None]:
+    """Return payload boundary and remaining source frames (None = uncertain).
+
+    URL-internal openers never create source frames. The first source closure
+    must start a wholly valid closing suffix; later payload/openers cannot
+    restore that proof. Quote/code modes protect their other payload characters.
     """
     if not wrappers:
-        return url
-    counts = Counter(url)
-    end = len(url)
-    for opener in wrappers:
-        while end and url[end - 1] in _DISPLAY_TRIM_CHARS:
-            end -= 1
-        closer = next(key for key, value in _DISPLAY_PAIRS.items() if value == opener)
-        if not end or url[end - 1] != closer or _is_escaped(url, end - 1):
-            return url
-        remaining = counts[closer] - 1
-        if (opener == closer and remaining % 2) or (
-            opener != closer and counts[opener] > remaining
+        return len(url), 0
+    current = wrappers[-1]
+    if current.startswith("`") or current in ("'", '"'):
+        closure = _symmetric_source_closure(url, current)
+    else:
+        available = wrapper_counts if wrapper_counts is not None else Counter(wrappers)
+        closure, uncertain = _paired_source_closure(url, current, available)
+        if uncertain:
+            return len(url), None
+    if closure is None:
+        return len(url), len(wrappers)
+    remaining = _closing_wrapper_suffix(url, closure, wrappers)
+    return (closure, remaining) if remaining is not None else (len(url), None)
+
+
+def _display_url(
+    url: str, *, wrappers: Sequence[str] = (), wrapper_counts: Counter[str] | None = None,
+) -> str:
+    """Return only the display identity justified by the shared source proof."""
+    boundary, _ = _url_wrapper_proof(url, wrappers, wrapper_counts)
+    return url[:boundary]
+
+
+def _advance_wrapper_context(
+    wrappers: list[str], counts: Counter[str], text: str, start: int, end: int,
+) -> None:
+    """Read only intervening prose and proved closing wrappers, never URL bytes."""
+    for match in _CONTEXT_DELIMITERS.finditer(text, start, end):
+        delimiter = match.group()
+        if delimiter in ("\n", "\r"):
+            wrappers.clear()
+            counts.clear()
+            continue
+        in_code = bool(wrappers and wrappers[-1].startswith("`"))
+        if in_code and delimiter != wrappers[-1]:
+            continue
+        # Backslashes are literal inside a code span, including before its
+        # matching closing run (the installed MarkdownIt backtick rule).
+        if not in_code and _is_escaped(text, match.start()):
+            continue
+        if (
+            delimiter == "'" and 0 < match.start() < len(text) - 1
+            and text[match.start() - 1].isalnum() and text[match.end()].isalnum()
         ):
-            return url
-        counts[closer] -= 1
-        end -= 1
-    return url[:end]
+            continue  # A contraction inside a word is not a prose quote.
+        if wrappers and delimiter == wrappers[-1] and delimiter[0] in "'\"`":
+            counts[wrappers.pop()] -= 1
+        elif delimiter in ("'", '"') and counts[delimiter]:
+            wrappers.clear()  # A source quote cannot close across an unclosed frame.
+            counts.clear()
+        elif delimiter in (")", "]", "}"):
+            if wrappers and wrappers[-1] == _DISPLAY_PAIRS[delimiter]:
+                counts[wrappers.pop()] -= 1
+            else:
+                wrappers.clear()
+                counts.clear()
+        else:
+            wrappers.append(delimiter)
+            counts[delimiter] += 1
 
 
 @dataclass(frozen=True)
@@ -160,16 +263,36 @@ class _CoverageUrlOccurrence:
 def _coverage_url_occurrences(text: str) -> list[_CoverageUrlOccurrence]:
     """Keep every occurrence's own context, including repeated raw tokens."""
     occurrences = []
-    openers = set(_DISPLAY_PAIRS.values())
+    wrappers: list[str] = []
+    counts: Counter[str] = Counter()
+    cursor = 0
     for match in _COVERAGE_INPUT_URL_RE.finditer(text):
-        left = match.start()
-        while left and text[left - 1] in openers and not _is_escaped(text, left - 1):
-            left -= 1
+        _advance_wrapper_context(wrappers, counts, text, cursor, match.start())
         raw = match.group(0)
+        # The discovery regex excludes angle brackets: within an explicit
+        # <URL> those bounds own the URL, not an outer prose delimiter. Inside
+        # code, angle characters are payload and cannot shield code closure.
+        angle_bounded = (
+            match.start() > 0 and text[match.start() - 1] == "<"
+            and not _is_escaped(text, match.start() - 1)
+            and match.end() < len(text) and text[match.end()] == ">"
+            and not (wrappers and wrappers[-1].startswith("`"))
+        )
+        boundary, remaining = (
+            (len(raw), len(wrappers)) if angle_bounded
+            else _url_wrapper_proof(raw, wrappers, counts)
+        )
+        display = raw[:boundary]
         occurrences.append(_CoverageUrlOccurrence(
-            raw, match.start(), match.end(),
-            _display_url(raw, wrappers=text[left:match.start()]),
+            raw, match.start(), match.end(), display,
         ))
+        if remaining is None:
+            wrappers.clear()
+            counts.clear()
+        else:
+            while len(wrappers) > remaining:
+                counts[wrappers.pop()] -= 1
+        cursor = match.end()
     return occurrences
 
 

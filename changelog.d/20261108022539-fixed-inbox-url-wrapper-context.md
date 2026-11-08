@@ -1,1 +1,2 @@
-- Inbox evaluations no longer accept a shortened citation for a literal URL ending in delimiter punctuation. Explicitly wrapped URLs remain supported, and the coverage report uses the same source context as the evaluator.
+- Inbox evaluations preserve literal delimiter punctuation and use source-proven wrappers consistently across prompts, coverage enforcement and the coverage report.
+- Support same-line prose wrappers, quoted Markdown links and matching backtick runs, retaining raw tokens whenever early or ambiguous closure prevents a wrapper proof.

@@ -1454,10 +1454,13 @@ verified: b0867170e 2026-10-02
   check cannot see by construction. Scheme and host case plus one leading
   `www.` are presentation variants; authority, path, query, and fragment
   identity remain exact. Prompt and coverage share source-aware URL occurrences:
-  only matching wrappers immediately preceding a URL justify removing closing
-  delimiters. Literal terminal punctuation and repeated tokens in different
+  only matching unmatched wrappers in the same-line source context justify
+  removing closing delimiters, including prose parentheticals, quoted links
+  and matching backtick runs. Literal terminal punctuation and repeated tokens in different
   contexts retain their own identities. The read-only coverage report retains
   these occurrences too; it does not reconstruct coverage from normalized URLs.
+  An ordered proof finds the first source-frame closure; ambiguous tokens stay
+  raw and cannot supply wrapper context for later URLs.
   The wrapper correction is scoped to this URL path; the entry's existing
   verification stamp remains the basis for its other claims. Coverage
   is ENFORCED by default (`url_coverage_mode`, `config/inbox_monitor.yaml`;
