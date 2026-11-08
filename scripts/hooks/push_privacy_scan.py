@@ -37,8 +37,9 @@ class ScanResult:
 
 def _checks(parsed, fingerprint_file, *, fingerprint_text=None):
     """R9/R10 extend this lazy sequence using the same canonical scan units."""
-    from genesis.contribution.sanitize import _check_fingerprints
+    from genesis.contribution.sanitize import _check_credentials, _check_fingerprints
 
+    yield from _check_credentials(parsed, stop_after_first=True)
     yield from _check_fingerprints(parsed, fingerprint_file, stop_after_first=True,
                                    fingerprint_text=fingerprint_text)
 
