@@ -976,15 +976,17 @@ class WatchdogChecker:
                 # bool is a subclass of int; a True timestamp is not a time.
                 if isinstance(ts, bool) or not isinstance(ts, (int, float)):
                     continue
-                if entry.get("reason") in _LEGACY_REASONS:
-                    entry["reason"] = _LEGACY_REASONS[entry["reason"]]
+                reason = entry.get("reason")
+                if isinstance(reason, str) and reason in _LEGACY_REASONS:
+                    entry["reason"] = _LEGACY_REASONS[reason]
                 kept.append(entry)
             state["restart_history"] = kept
         else:
             # Not even a list — the shape below it cannot be trusted either.
             state["restart_history"] = []
-        if state.get("last_reason") in _LEGACY_REASONS:
-            state["last_reason"] = _LEGACY_REASONS[state["last_reason"]]
+        last_reason = state.get("last_reason")
+        if isinstance(last_reason, str) and last_reason in _LEGACY_REASONS:
+            state["last_reason"] = _LEGACY_REASONS[last_reason]
         return state
 
     def _save_state(self, state: dict) -> bool:
