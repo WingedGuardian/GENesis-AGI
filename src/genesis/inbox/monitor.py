@@ -40,8 +40,11 @@ from genesis.inbox.scanner import (
 from genesis.inbox.types import CheckResult, InboxConfig, InboxItem
 from genesis.inbox.url_coverage import (  # the URL coverage gate (#2017), used below
     _coverage_url_label,
-    _display_url,
+    _coverage_url_occurrences,
     _extract_coverage_input_urls,
+)
+from genesis.inbox.url_coverage import (
+    _display_url as _display_url,
 )
 from genesis.inbox.url_coverage import (
     _has_url_failures as _has_url_failures,
@@ -2346,21 +2349,9 @@ class InboxMonitor:
 
         for idx, item in enumerate(items, 1):
             name = Path(item.file_path).name
-            # The PROMPT is a presentation surface, the gate an identity one.
-            # Render each coverage token as the URL the writer meant, so a
-            # markdown link does not ask the model to fetch a trailing `)`.
-            # MEASURED over this install's corpus (284 evaluated baselines +
-            # 112 live inbox files, 18,119 extracted tokens): 340 (1.88%) end
-            # in wrapper punctuation; after trimming, 11 (0.06%) do. The
-            # residual is deliberate -- 8 trailing commas and 1 semicolon that
-            # no paired delimiter proves are prose, plus 2 `{...}` templates
-            # the gate already exempts.
-            #
-            # Where display and identity disagree (331 tokens, 1.83%) the gate
-            # accepts EITHER rendering of that same token, so a compliant
-            # answer always clears. See `url_coverage._accepted_identities` for why that is
-            # scoped per-token rather than a widened rule.
-            urls = [_display_url(u) for u in _extract_coverage_input_urls(item.content)]
+            # Prompt and gate derive presentation from the same source spans;
+            # a terminal delimiter alone is never evidence of a wrapper.
+            urls = [u.display for u in _coverage_url_occurrences(item.content)]
             urls = list(dict.fromkeys(u for u in urls if u))
             parts.append(f"\n---\n\n## Item {idx}: {name}\n")
             if urls:
