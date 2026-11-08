@@ -29,6 +29,7 @@ without disturbing anything.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -465,6 +466,7 @@ def _prepare_and_push_branch(
             ],
             capture_output=True, text=True,
             cwd=str(wt_dir), timeout=120, check=False,
+            env={**os.environ, "GENESIS_AUTOMATED_PUSH": "1"},
         )
         if proc.returncode != 0:
             return False, f"push to fork failed: {proc.stderr.strip()}"

@@ -100,7 +100,7 @@ class World:
         }
         for name in HOOK_NAMES + HELPER_NAMES:
             files[f"scripts/hooks/{name}"] = f"#!/bin/sh\n# {name}\nexit 0\n"
-        for name in ("pre-push", "pre_push_chain.py", "push_privacy_scan.py", "push_destinations.py"):
+        for name in ("pre-push", "pre_push_chain.py", "push_privacy_scan.py", "push_destinations.py", "push_privacy_ack.py"):
             files[f"scripts/hooks/{name}"] = (SCRIPTS / "hooks" / name).read_text()
         self.commit(self.up, files, "base")
         self.git(self.up, "push", "-q", "origin", "main")

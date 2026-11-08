@@ -18,17 +18,20 @@ mapping = {
     "/fixture/private.git": root / 'private.git',
 }
 target = None
+program = None
 try:
     command = shlex.split(args[1]) if len(args) == 2 else []
-    if args and args[0] == 'git@github.com' and len(command) == 2 and command[0] == 'git-upload-pack':
+    if args and args[0] == 'git@github.com' and len(command) == 2 and command[0] in {'git-upload-pack', 'git-receive-pack'}:
         target = mapping.get(command[1])
+        program = command[0]
 except ValueError:
     pass
 allowed = target is not None and not os.environ.get('R8_SHIM_FAIL')
+execution = ['/usr/bin/' + program, *(['--strict'] if program == 'git-upload-pack' else []), str(target)] if allowed else None
 with (root / 'transport.jsonl').open('a') as receipt:
-    receipt.write(json.dumps({'argv': received, 'allowed': allowed, 'exec': ['/usr/bin/git-upload-pack', '--strict', str(target)] if allowed else None}) + '\n')
+    receipt.write(json.dumps({'argv': received, 'allowed': allowed, 'exec': execution}) + '\n')
 if not allowed:
     print('owned transport refused unsupported request', file=sys.stderr)
     sys.exit(97)
 env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_') or key in {'GIT_PROTOCOL', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM'}}
-os.execve('/usr/bin/git-upload-pack', ['/usr/bin/git-upload-pack', '--strict', str(target)], env)  # noqa: S606 — owned local transport fixture
+os.execve(execution[0], execution, env)  # noqa: S606 — owned local transport fixture

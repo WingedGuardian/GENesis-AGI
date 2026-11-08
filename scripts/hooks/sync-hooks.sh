@@ -125,6 +125,7 @@ HELPERS_TO_SYNC=(
     "pre_push_gates.sh"
     "push_privacy_scan.py"
     "push_destinations.py"
+    "push_privacy_ack.py"
 )
 
 MODIFIED_FOUND=0

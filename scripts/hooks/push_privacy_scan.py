@@ -37,21 +37,37 @@ class ScanResult:
 
 def _checks(parsed, fingerprint_file, *, fingerprint_text=None):
     """R9/R10 extend this lazy sequence using the same canonical scan units."""
-    from genesis.contribution.sanitize import _check_fingerprints
+    from genesis.contribution.sanitize import _check_emails, _check_fingerprints, _check_portability
 
     yield from _check_fingerprints(parsed, fingerprint_file, stop_after_first=True,
                                    fingerprint_text=fingerprint_text)
+    yield from _check_portability(parsed)
+    yield from _check_emails(parsed)
 
 
 def finish(result: ScanResult) -> int:
-    """R9 attaches its foreground repeat policy here, after all earlier gates."""
+    """Allow one identical foreground repeat only for generic/incomplete scans."""
     if result.verdict == "CLEAN":
         if result.degraded:
             print("Genesis native privacy: complete scan with degraded public-base proof.", file=sys.stderr)
         return 0
-    print(f"Genesis native privacy {result.verdict}: publication refused.", file=sys.stderr)
     for category, location in result.findings:
-        print(f"  {category} {location}", file=sys.stderr)
+        print(f"Genesis native privacy: {category} {location}", file=sys.stderr)
+    if (result.verdict in {"TIER_B", "COULD_NOT_SCAN"}
+            and os.environ.get("GENESIS_CC_SESSION") != "1"
+            and os.environ.get("GENESIS_AUTOMATED_PUSH") != "1" and result.common_dir):
+        try:
+            from push_privacy_ack import acknowledge
+
+            state = acknowledge(Path(result.common_dir), result.identity)
+        except (ImportError, OSError, ValueError):
+            state = "unavailable"
+        if state == "repeat":
+            print("Genesis native privacy: identical foreground repeat accepted once.", file=sys.stderr)
+            return 0
+        if state == "first":
+            print("Genesis native privacy: inspect this refusal; one identical foreground repeat is available for 24 hours.", file=sys.stderr)
+    print(f"Genesis native privacy {result.verdict}: publication refused.", file=sys.stderr)
     return 2
 
 
@@ -90,6 +106,7 @@ def _file_identity(path: Path) -> str:
 def _inputs(source: Path, argv: list[str], data: bytes) -> dict:
     fingerprint = Path(os.environ.get("GENESIS_RELEASE_FINGERPRINTS", str(Path.home() / ".genesis/release-fingerprints.txt")))
     paths = [Path(__file__), Path(__file__).with_name("push_destinations.py"),
+             Path(__file__).with_name("push_privacy_ack.py"),
              source / "src/genesis/contribution/sanitize.py", source / "src/genesis/contribution/findings.py"]
     return {"argv": argv, "tuples": hashlib.sha256(data).hexdigest(),
             "config": _file_identity(Path.home() / ".genesis/config/genesis.yaml"),

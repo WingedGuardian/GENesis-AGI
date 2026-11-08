@@ -41,7 +41,7 @@ def native_world(tmp_path, request):
     hooks = repo / "scripts/hooks"
     hooks.mkdir(parents=True)
     for name in ("sync-hooks.sh", "pre-push", "pre_push_chain.py", "pre_push_gates.sh",
-                 "push_privacy_scan.py", "push_destinations.py"):
+                 "push_privacy_scan.py", "push_destinations.py", "push_privacy_ack.py"):
         if (SOURCE / "scripts/hooks" / name).exists():
             shutil.copy2(SOURCE / "scripts/hooks" / name, hooks / name)
     (repo / "src").symlink_to(SOURCE / "src", target_is_directory=True)
