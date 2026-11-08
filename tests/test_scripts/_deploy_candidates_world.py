@@ -37,7 +37,8 @@ HOOK_NAMES = (
     "pre-push",
     "pre-merge-commit",
 )
-HELPER_NAMES = ("emit_bugfix_audit.py", "db_admission_check.py", "pre_push_chain.py", "pre_push_gates.sh")
+CHAIN_HELPERS = private_module("candidate_fixture_closure", SCRIPTS / "hooks/pre_push_chain.py").HELPERS
+HELPER_NAMES = ("emit_bugfix_audit.py", "db_admission_check.py", *CHAIN_HELPERS)
 LOCKED = ("add", "drop", "rebuild")
 
 
@@ -57,7 +58,8 @@ class World:
     def __init__(self, tmp: Path):
         self.tmp = tmp
         self.home = tmp / "home"
-        (self.home / ".genesis").mkdir(parents=True)
+        (self.home / ".genesis/config").mkdir(parents=True)
+        (self.home / ".genesis/config/genesis.yaml").write_text("github:\n  user: fixture\n  public_repo: public\n")
         (self.home / ".gitconfig").write_text(
             "[user]\n\tname = t\n\temail = t@example.invalid\n[init]\n\tdefaultBranch = main\n"
         )
@@ -98,7 +100,7 @@ class World:
         }
         for name in HOOK_NAMES + HELPER_NAMES:
             files[f"scripts/hooks/{name}"] = f"#!/bin/sh\n# {name}\nexit 0\n"
-        for name in ("pre-push", "pre_push_chain.py"):
+        for name in ("pre-push", "pre_push_chain.py", "push_privacy_scan.py", "push_destinations.py"):
             files[f"scripts/hooks/{name}"] = (SCRIPTS / "hooks" / name).read_text()
         self.commit(self.up, files, "base")
         self.git(self.up, "push", "-q", "origin", "main")
@@ -108,9 +110,13 @@ class World:
             check=True,
             capture_output=True,
         )
+        (self.root / "src").symlink_to(REPO / "src", target_is_directory=True)
+        (self.root / ".venv").symlink_to(Path(sys.executable).parent.parent, target_is_directory=True)
+        with (self.root / ".git/info/exclude").open("a") as stream:
+            stream.write("\n/src\n/.venv\n")
         # The installed hook copies equal their sources: readiness's hooks check passes.
         for name in HOOK_NAMES + HELPER_NAMES:
-            if name in ("pre-push", "pre_push_chain.py", "pre_push_gates.sh"):
+            if name == "pre-push" or name in CHAIN_HELPERS:
                 continue  # the actual installer publishes the owned chain below
             dst = self.root / ".git" / "hooks" / name
             shutil.copy2(self.root / "scripts" / "hooks" / name, dst)
