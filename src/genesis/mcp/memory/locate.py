@@ -187,24 +187,62 @@ def _secret_file_ids() -> set[tuple[int, int]]:
     return {(st.st_dev, st.st_ino)}
 
 
+# A value is treated as a secret when its key names one, or when it looks
+# random. secrets.env also holds ordinary settings (URLs, paths, model names, a
+# timezone); measured on a live install, 14 of 35 values of 12+ characters were
+# such settings, and redacting them would withhold ordinary lines.
+_SECRET_KEY_WORDS = re.compile(
+    r"KEY|TOKEN|SECRET|PASS|CREDENTIAL|AUTH|COOKIE|PRIVATE|SIGNING|WEBHOOK", re.IGNORECASE,
+)
+_NOT_RANDOM = re.compile(r"^[a-z][a-z0-9+.-]*://|^[/~.]|^[^@\s]+@[^@\s]+$", re.IGNORECASE)
+
+
+# A generated token carries a long unbroken alphanumeric run mixing letters and
+# digits; a model name or slug (``large-v3-turbo``) has only short segments.
+_RANDOM_RUN = re.compile(r"[A-Za-z0-9]{16,}")
+
+
+def _looks_random(value: str) -> bool:
+    if any(ch.isspace() for ch in value) or _NOT_RANDOM.search(value):
+        return False
+    return any(
+        any(ch.isdigit() for ch in run) and any(ch.isalpha() for ch in run)
+        for run in _RANDOM_RUN.findall(value)
+    )
+
+
 def _secret_values() -> frozenset[str]:
-    """The values in the configured secrets file, for redacting matched lines.
+    """The secret values in the configured secrets file, for redacting matches.
 
     A copy of a credential under a neutral name, or a value pasted into a note,
     passes every name and inode rule; a matched line that contains one of these
     values is dropped instead. Read server-side only, never returned.
+
+    The file is read the way the runtime loads it (python-dotenv, which strips
+    inline comments, ``export`` and quotes) and the way the Telegram bridge
+    reads it, and both readings are kept, so a value either reader uses is
+    covered.
     """
+    from dotenv import dotenv_values
+
     from genesis.channels.bridge_config import parse_secrets_env_text
 
+    path = env.secrets_path()
     try:
-        text = env.secrets_path().read_text(errors="replace")
-    except OSError:
+        text = path.read_text(errors="replace")
+        runtime = dotenv_values(path)
+    except (OSError, ValueError):
         return frozenset()
-    return frozenset(
-        value
-        for value in (v.strip().strip("'") for v in parse_secrets_env_text(text).values())
-        if len(value) >= _MIN_SECRET_VALUE_LEN
-    )
+    pairs = [(k, v or "") for k, v in runtime.items()]
+    pairs += list(parse_secrets_env_text(text).items())
+    values = set()
+    for key, raw in pairs:
+        value = raw.strip().strip("'\"")
+        if len(value) < _MIN_SECRET_VALUE_LEN:
+            continue
+        if _SECRET_KEY_WORDS.search(key) or _looks_random(value):
+            values.add(value)
+    return frozenset(values)
 
 
 def _snippet(line: str, secret_values: frozenset[str]) -> str | None:

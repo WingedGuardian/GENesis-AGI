@@ -367,3 +367,44 @@ async def test_a_line_carrying_a_secret_value_is_withheld_wherever_it_lives(
     # A value under the length floor never redacts ordinary text.
     r = await _impl_locate(scope="repo", within="0", contains="flag")
     assert r["content_redacted_secret_lines"] == 0
+
+
+async def test_redaction_reads_secrets_like_the_runtime_and_spares_ordinary_settings(
+    roots, monkeypatch
+):
+    # The runtime loads secrets.env with python-dotenv (inline comments and
+    # `export` stripped). Ordinary settings that live in the same file (URLs,
+    # model names, a timezone) are not secrets and must not withhold lines.
+    secrets = _touch(
+        roots["tmp"] / "vault" / "secrets.env",
+        content=(
+            "FAKE_API_KEY=not-a-real-value-123 # rotated\n"
+            "export FAKE_SIGNING_SECRET='also-not-real-456'\n"
+            "FAKE_WEBHOOK_URL=https://hooks.example.invalid/fake\n"
+            "NEUTRAL_NAME=Zq7fakeRandomish9Value\n"
+            "OLLAMA_URL=http://ollama.example.invalid:11434\n"
+            "USER_TIMEZONE=America/New_York\n"
+            "WHISPER_MODEL=large-v3-turbo-fake\n"
+        ),
+    )
+    monkeypatch.setenv("SECRETS_PATH", str(secrets))
+    _touch(
+        roots["repo"] / "notes.md",
+        content=(
+            "probe not-a-real-value-123\n"
+            "probe also-not-real-456\n"
+            "probe https://hooks.example.invalid/fake\n"
+            "probe Zq7fakeRandomish9Value\n"
+            "probe http://ollama.example.invalid:11434\n"
+            "probe America/New_York\n"
+            "probe large-v3-turbo-fake\n"
+        ),
+    )
+    r = await _impl_locate(scope="repo", within="0", contains="probe")
+    texts = [m["text"] for m in r["results"][0]["matches"]]
+    assert texts == [
+        "probe http://ollama.example.invalid:11434",
+        "probe America/New_York",
+        "probe large-v3-turbo-fake",
+    ]
+    assert r["content_redacted_secret_lines"] == 4
