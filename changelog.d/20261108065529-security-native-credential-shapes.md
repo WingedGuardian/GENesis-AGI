@@ -1,0 +1,1 @@
+- Native public-push privacy checks reject AWS key IDs and URLs containing passwords, including temporary AWS IDs and passwords containing colons. Diagnostics identify the category without printing matched values.
