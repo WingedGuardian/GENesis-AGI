@@ -23,6 +23,20 @@ logger = logging.getLogger(__name__)
 # its complete()/fail() call would have set.
 _COMMITTED_STATUS = {"succeeded": "completed", "failed": "failed", "cancelled": "failed"}
 
+
+def _failure_outcome(partial, error) -> tuple[str, str | None]:
+    """The (outcome, reason) a failed run records; one rule for _finalize and boot.
+
+    A clean exit that was truncated or never sent its result: _execute turned it
+    into a failure (error "execution_failed"), but it is a partial run. A cancel,
+    deadline or artifact-write failure keeps its own reason, even on a result
+    that was also partial.
+    """
+    if partial and error == "execution_failed":
+        return "partial", "partial_result"
+    return "failed", error
+
+
 # How long a held uncertain receipt sleeps between (write-free) wakeups.
 _HOLD_PARK_S = 3600.0
 
@@ -128,10 +142,18 @@ async def reconcile_orphans(db) -> int:
                         input_tokens=int(usage.get("input_tokens") or 0),
                         output_tokens=int(usage.get("output_tokens") or 0),
                     )
-            await cc_sessions.update_status(db, row["id"], status=finished)
+            # The outcome _finalize would have recorded, from what it committed.
+            outcome = reason = None
+            if finished == "failed":
+                outcome, reason = _failure_outcome(meta.get("result_partial"), meta.get("error"))
+            await cc_sessions.update_status(
+                db, row["id"], status=finished, outcome=outcome, outcome_reason=reason
+            )
             continue
         await update_state(db, row["id"], "failed", error="outcome_unknown")
-        await cc_sessions.update_status(db, row["id"], status="failed")
+        await cc_sessions.update_status(
+            db, row["id"], status="failed", outcome_reason="outcome_unknown"
+        )
     return len(orphaned)
 
 
@@ -309,9 +331,15 @@ async def _finalize(runner, request, result, state):
                     cost_usd=result.cost_usd,
                     input_tokens=result.input_tokens,
                     output_tokens=result.output_tokens,
+                    # The session's own report (cc/final_status.py), via _result.
+                    outcome=result.outcome,
+                    outcome_reason=result.outcome_reason,
                 )
             else:
-                await runner._session_manager.fail(result.session_id, reason=result.error)
+                outcome, reason = _failure_outcome(result.partial, result.error)
+                await runner._session_manager.fail(
+                    result.session_id, reason=reason, outcome=outcome
+                )
             from genesis.cc.managed_fallback import record_managed_outcome
 
             await record_managed_outcome(runner, result.session_id, result)

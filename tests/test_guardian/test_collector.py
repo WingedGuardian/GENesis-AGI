@@ -199,34 +199,43 @@ def _report(**over) -> dict:
             {"path": "src/a.py", "class": "engine"},
             {"path": "src/b.py", "class": "foreign"},
         ],
-        "reapply": ["rm -rf -- /r/src/b.py && cp -a -- /b/tree/src/b.py /r/src/b.py"],
+        "reapply": [],
         "dismissed_at": None,
     }
     report.update(over)
     return report
 
 
-def _reports(*reports) -> str:
-    """The report read's output: each REPAIR.json followed by a NUL."""
-    return "".join(json.dumps(r) + "\0" for r in reports)
+def _reports(report: dict) -> str:
+    """The report the container picked, as the collector reads it back."""
+    return json.dumps(report)
 
+
+_DIR_TS = "20261103T120000Z-7"  # the report dir's name, as the pick prints it first
 
 _JOURNAL = (
     "live-move repair: update.lock is still held after the wait; the checkout is mixed_tree\n"
 )
 
 
-def _repair_exec(journal: tuple[int, str], report: tuple[int, str]):
-    async def fake(container, cmd, timeout=15.0):
-        return journal if "journalctl" in cmd else report
+def _repair_exec(monkeypatch, journal: tuple[int, str], report: tuple[int, str]):
+    import genesis.guardian.collector as gc
 
-    return fake
+    async def user(container, cmd, timeout=15.0):
+        return journal
+
+    async def picked(container, cmd, data, timeout, user="ubuntu"):
+        rc, doc = report
+        return rc, ("a login banner\n" + gc._REPAIR_MARK + _DIR_TS + "\n" + doc) if doc else ""
+
+    monkeypatch.setattr(gc, "_incus_exec_user", user)
+    monkeypatch.setattr(gc, "_incus_exec_stdin", picked)
 
 
 async def _collect(monkeypatch, journal: str, report: str) -> str:
     import genesis.guardian.collector as gc
 
-    monkeypatch.setattr(gc, "_incus_exec_user", _repair_exec((0, journal), (0, report)))
+    _repair_exec(monkeypatch, (0, journal), (0, report))
     return await gc._collect_live_repair(GuardianConfig())
 
 
@@ -235,36 +244,62 @@ async def test_live_repair_names_journal_lines_and_report(monkeypatch):
     assert "update.lock is still held after the wait" in text
     assert "newest report" in text and "unresolved: mixed_tree" in text
     assert "2 path(s)" in text and '"src/b.py"' in text and "src/a.py" not in text
-    assert "1 re-apply step(s)" in text
-    assert "cp -a" not in text  # the steps stay in REPAIR.json; only their count is shown
+    assert "0 saved path(s)" in text and "re-apply" not in text
+
+
+async def test_live_repair_shows_the_dir_names_ts_never_the_stored_one(monkeypatch):
+    text = await _collect(monkeypatch, "", _reports(_report(ts="x\n--- END ---")))
+    assert f'ts "{_DIR_TS}"' in text and "END" not in text, text
+
+
+async def test_live_repair_a_shown_ts_the_pick_never_prints_is_no_report(monkeypatch):
+    import genesis.guardian.collector as gc
+
+    _repair_exec(monkeypatch, (0, _JOURNAL), (0, _reports(_report())))
+    real = gc._incus_exec_stdin
+
+    async def bad_ts(*a, **kw):
+        rc, out = await real(*a, **kw)
+        return rc, out.replace(_DIR_TS, "../x")
+
+    monkeypatch.setattr(gc, "_incus_exec_stdin", bad_ts)
+    text = await gc._collect_live_repair(GuardianConfig())
+    assert "newest report" not in text and "update.lock" in text, text
 
 
 async def test_live_repair_absent_is_empty(config, monkeypatch):
     import genesis.guardian.collector as gc
 
     # no matching journal line; no backup directory (the `cd` fails)
-    monkeypatch.setattr(gc, "_incus_exec_user", _repair_exec((0, ""), (1, "")))
+    _repair_exec(monkeypatch, (0, ""), (0, ""))
     assert await gc._collect_live_repair(config) == ""
+
+
+async def test_live_repair_pick_runs_as_the_configured_container_user(monkeypatch):
+    """The pick reads ~/.genesis/deploy-backups, so it runs as the configured
+    container user (cred_watch._incus_exec_stdin's contract), never a default."""
+    import genesis.guardian.collector as gc
+
+    seen = []
+
+    async def picked(container, cmd, data, timeout, user="ubuntu"):
+        seen.append((container, user))
+        return 0, gc._REPAIR_MARK + _DIR_TS + "\n" + _reports(_report())
+
+    async def journal(container, cmd, timeout=15.0):
+        return 0, ""
+
+    monkeypatch.setattr(gc, "_incus_exec_stdin", picked)
+    monkeypatch.setattr(gc, "_incus_exec_user", journal)
+    config = GuardianConfig(container_name="box", container_user="someone")
+    assert "newest report" in await gc._collect_live_repair(config)
+    assert seen == [("box", "someone")]
 
 
 async def test_live_repair_unparseable_report_keeps_journal(monkeypatch):
     for bad in ("{not json", "[" * 100000 + "]" * 100000):  # RecursionError too
-        text = await _collect(monkeypatch, _JOURNAL, bad + "\0")
+        text = await _collect(monkeypatch, _JOURNAL, bad)
         assert "update.lock is still held" in text and "report" not in text
-
-
-async def test_live_repair_skips_dismissed_superseded_and_old(monkeypatch):
-    text = await _collect(
-        monkeypatch,
-        "",
-        _reports(
-            _report(ts=_ts(2), result="healed"),
-            _report(ts=_ts(1), result="superseded"),
-            _report(ts=_ts(0.5), dismissed_at="2026-10-21T00:00:00Z"),
-        ),
-    )
-    assert '"healed"' in text and "superseded" not in text and "unresolved" not in text
-    assert await _collect(monkeypatch, "", _reports(_report(ts=_ts(7)))) == ""
 
 
 async def test_live_repair_path_cannot_break_out_of_its_line(monkeypatch):
@@ -288,10 +323,36 @@ async def test_live_repair_is_bounded(monkeypatch):
     text = await _collect(monkeypatch, "", _reports(_report(paths=rows, reapply="abc")))
     assert len(text) <= 2100
     assert "(+4990 more)" in text and "5000 path(s)" in text
-    assert "0 re-apply step(s)" in text  # a non-list reapply counts as none
+    assert "0 saved path(s)" in text and "re-apply" not in text  # rows with no saved_as
     # With a long journal too, the field stays bounded and the counts line survives.
     text = await _collect(monkeypatch, journal, _reports(_report(paths=rows)))
     assert len(text) <= 2100 and text.startswith("newest report: ") and "5000 path(s)" in text
+
+
+async def test_live_repair_counts_saved_paths_not_reapply_steps(monkeypatch):
+    """#3492 B2a: the writer stores no shell steps (`reapply` is []); the line
+    counts the rows whose node the report saved (a str `saved_as`)."""
+    rows = [
+        {"path": "src/a.py", "class": "engine", "saved_as": "tree/src/a.py"},
+        {"path": "src/b.py", "class": "foreign", "saved_as": "tree/src/b.py"},
+        {"path": "src/c.py", "class": "foreign", "saved_as": None},
+        {"path": "src/d.py", "class": "foreign", "saved_as": ["not", "a", "str"]},
+    ]
+    text = await _collect(monkeypatch, "", _reports(_report(paths=rows, reapply=[])))
+    assert "2 saved path(s)" in text and "re-apply" not in text, text
+
+
+async def test_live_repair_shows_the_restore_outcome_quoted(monkeypatch):
+    """#3492 B2b (review NOTE-4): the newest report's `restore` block shows its
+    restored_at and refused count, quoted and bounded; a report with none
+    shows no restore line."""
+    block = {"inflight": None, "refused": 2, "restored_at": "x\x1b[2J" * 50}
+    text = await _collect(monkeypatch, "", _reports(_report(restore=block)))
+    line = next(ln for ln in text.splitlines() if "restore:" in ln)
+    assert "refused 2" in line.replace('"', "") and "\x1b" not in line, line
+    assert len(line) < 200, line
+    text = await _collect(monkeypatch, "", _reports(_report()))
+    assert "restore:" not in text, text
 
 
 async def test_live_repair_journal_lines_are_capped(monkeypatch):
@@ -311,10 +372,11 @@ async def test_live_repair_shows_at_most_ten_paths(monkeypatch):
     assert '"p9"' in text and '"p10"' not in text and "(+40 more)" in text
 
 
-async def test_live_repair_non_list_paths_count_as_none(monkeypatch):
+async def test_live_repair_non_list_paths_claim_no_counts(monkeypatch):
     for paths in ("abc", None, 7):
         text = await _collect(monkeypatch, "", _reports(_report(paths=paths)))
-        assert "0 path(s)" in text
+        assert "its restored paths could not be read" in text
+        assert "path(s) restored" not in text
 
 
 def test_prompt_fences_the_repair_section_only_when_present() -> None:
@@ -355,59 +417,130 @@ def _container_sh(cmd: str, home, extra_path=None) -> str:
     return done.stdout
 
 
-def test_report_read_is_bounded_and_skips_symlinks(tmp_path):
-    import os
-
-    import genesis.guardian.collector as gc
-
-    backups = tmp_path / ".genesis" / "deploy-backups"
-    zero = backups / "20261022T000001Z-1-live-move-repair"
-    sparse = backups / "20261022T000002Z-2-live-move-repair"
-    zero.mkdir(parents=True)
-    sparse.mkdir()
-    os.symlink("/dev/zero", zero / "REPAIR.json")
-    with open(sparse / "REPAIR.json", "wb") as fh:
-        fh.truncate(200 * 1024 * 1024)  # sparse: no disk used
-    total, _widest = (int(n) for n in _container_sh(gc._REPAIR_REPORT, tmp_path).split())
-    assert total <= 4 * 1024 * 1024 + 16  # one report at most, and only a capped read of it
-
-
-def test_report_read_still_returns_a_report(tmp_path):
+def _pick(home) -> bytes:
+    """Run the container-side report pick, as the collector pipes it, in a scratch HOME."""
     import subprocess
+    import sys
 
     import genesis.guardian.collector as gc
 
-    one = tmp_path / ".genesis" / "deploy-backups" / "20261022T000001Z-1-live-move-repair"
-    one.mkdir(parents=True)
-    (one / "REPAIR.json").write_text(json.dumps({"ts": "x"}))
-    out = subprocess.run(
-        ["bash", "-c", gc._REPAIR_REPORT],
-        env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
+    return subprocess.run(
+        [sys.executable, "-I", "-S", "-"],
+        input=gc._REPAIR_PICK,
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
         capture_output=True,
-        text=True,
         timeout=60,
     ).stdout
-    assert out == json.dumps({"ts": "x"}) + "\0"
 
 
-def test_report_read_never_follows_a_symlinked_report(tmp_path):
-    """A report symlinked to a regular file elsewhere is not read: only the
-    repair's own files are the repair's report."""
+def _mine(home, **over) -> dict:
+    """A report naming ``home``'s ~/genesis, the checkout the pick compares with."""
+    (home / "genesis").mkdir(parents=True, exist_ok=True)
+    return _report(repo=str(home / "genesis"), **over)
+
+
+def _backup_dir(home, name: str):
+    d = home / ".genesis" / "deploy-backups" / f"{name}-live-move-repair"
+    d.mkdir(parents=True)
+    return d
+
+
+def test_report_pick_is_bounded_and_skips_non_files(tmp_path):
     import os
-    import subprocess
 
     import genesis.guardian.collector as gc
 
+    os.symlink("/dev/zero", _backup_dir(tmp_path, _ts(0.1)) / "REPAIR.json")
+    os.mkfifo(_backup_dir(tmp_path, _ts(0.2)) / "REPAIR.json")
+    with open(_backup_dir(tmp_path, _ts(0.3)) / "REPAIR.json", "wb") as fh:
+        fh.truncate(200 * 1024 * 1024)  # sparse: no disk used
+    padded = _writer_bytes(_mine(tmp_path, ts=_ts(0.4)), pad_rows=50_000)  # over 10 MiB
+    (_backup_dir(tmp_path, _ts(0.4)) / "REPAIR.json").write_bytes(padded)
+    out = _pick(tmp_path)
+    assert out.startswith(gc._REPAIR_MARK.encode())
+    assert len(out) <= len(gc._REPAIR_MARK) + 64 + 4 * 1024 * 1024
+
+
+def test_report_pick_returns_the_report(tmp_path):
+    import genesis.guardian.collector as gc
+
+    older = _mine(tmp_path, ts=_ts(1), result="healed, the older one")
+    (_backup_dir(tmp_path, _ts(1)) / "REPAIR.json").write_text(json.dumps(older))
+    raw, name = json.dumps(_mine(tmp_path)).encode(), _ts()
+    (_backup_dir(tmp_path, name) / "REPAIR.json").write_bytes(raw)
+    newest = f"{name}\n".encode()
+    assert _pick(tmp_path) == gc._REPAIR_MARK.encode() + newest + raw  # the newest eligible one
+
+
+def test_report_pick_surfaces_an_over_cap_report_instead_of_an_older_one(tmp_path):
+    """A newest report over the 4 MiB cap is not silently skipped (an older
+    report would then read as the newest): the pick says it was too large."""
+    import genesis.guardian.collector as gc
+
+    older = _mine(tmp_path, ts=_ts(1), result="healed, the older one")
+    (_backup_dir(tmp_path, _ts(1)) / "REPAIR.json").write_text(json.dumps(older))
+    ts = _ts()
+    big = _writer_bytes(_mine(tmp_path, ts=ts), pad_rows=25_000)
+    assert len(big) > gc._REPAIR_REPORT_BYTES
+    (_backup_dir(tmp_path, ts) / "REPAIR.json").write_bytes(big)
+    out = _pick(tmp_path)
+    assert out.startswith(gc._REPAIR_MARK.encode()), out[:200]
+    shown_ts, doc = out[len(gc._REPAIR_MARK) :].split(b"\n", 1)
+    picked = json.loads(doc)
+    assert shown_ts.decode() == ts
+    assert "report too large" in picked["result"], picked
+    assert picked["ts"] == ts
+    assert len(out) <= len(gc._REPAIR_MARK) + len(shown_ts) + 1 + gc._REPAIR_REPORT_BYTES
+
+
+def test_report_pick_reads_the_repo_of_a_long_non_utf8_checkout(tmp_path):
+    """Codex c4463433353: the writer escapes each non-UTF-8 byte of the repo
+    path as six characters, so a path the loader accepts (4096 bytes) can run
+    past a fixed 20,000-character field bound; the over-cap report must still
+    be shown, not skipped as if it named another checkout."""
+    import os
+
+    import genesis.guardian.collector as gc
+
+    home = tmp_path
+    for _ in range(17):  # 17 x 200 non-UTF-8 bytes: over 20,000 characters escaped
+        home = home / os.fsdecode(b"\xff" * 200)
+    home.mkdir(parents=True)
+    report = _mine(home)
+    assert len(json.dumps(report["repo"])) > 20_000
+    assert len(os.fsencode(report["repo"])) <= gc._REPAIR_REPO_BYTES
+    ts = _ts()
+    big = _writer_bytes(_mine(home, ts=ts), pad_rows=25_000)
+    assert len(big) > gc._REPAIR_REPORT_BYTES
+    (_backup_dir(home, ts) / "REPAIR.json").write_bytes(big)
+    out = _pick(home)
+    assert b"report too large" in out, out[:300]
+
+
+def test_report_pick_never_follows_a_symlinked_report(tmp_path):
+    """A report symlinked to a file elsewhere is not read: only the repair's own
+    files are the repair's report."""
+    import os
+
     elsewhere = tmp_path / "elsewhere.json"
-    elsewhere.write_text(json.dumps({"ts": "not the repair's"}))
-    one = tmp_path / ".genesis" / "deploy-backups" / "20261022T000001Z-1-live-move-repair"
-    one.mkdir(parents=True)
-    os.symlink(elsewhere, one / "REPAIR.json")
-    out = subprocess.run(
-        ["bash", "-c", gc._REPAIR_REPORT], env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
-        capture_output=True, text=True, timeout=60,
-    ).stdout
-    assert out == "\0"
+    elsewhere.write_text(json.dumps(_mine(tmp_path, result="not the repair's")))
+    os.symlink(elsewhere, _backup_dir(tmp_path, _ts()) / "REPAIR.json")
+    assert _pick(tmp_path) == b""
+
+
+def test_report_pick_skips_dismissed_superseded_and_old(tmp_path):
+    for hours, over in (
+        (0.5, {"dismissed_at": "2026-10-21T00:00:00Z"}),
+        (1, {"result": "superseded"}),
+        (2, {"result": "healed"}),
+    ):
+        (_backup_dir(tmp_path, _ts(hours)) / "REPAIR.json").write_text(
+            json.dumps(_mine(tmp_path, ts=_ts(hours), **over))
+        )
+    assert b'"healed"' in _pick(tmp_path)
+    old = tmp_path / "old"
+    (_backup_dir(old, _ts(7)) / "REPAIR.json").write_text(json.dumps(_mine(old, ts=_ts(7))))
+    assert _pick(old) == b""
 
 
 def test_journal_read_is_bounded(tmp_path):
@@ -424,3 +557,216 @@ def test_journal_read_is_bounded(tmp_path):
     total, widest = (int(n) for n in _container_sh(gc._REPAIR_JOURNAL, tmp_path, bin_dir).split())
     assert widest <= 400
     assert total <= 20 * 401
+
+
+# End to end: the collector's real container commands, run by a local bash
+# against a scratch HOME standing in for the container.
+
+
+def _local_container(monkeypatch, home):
+    import asyncio
+    import os
+
+    import genesis.guardian.collector as gc
+
+    bin_dir = home / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "journalctl").write_text("#!/bin/bash\nexit 0\n")
+    (bin_dir / "journalctl").chmod(0o755)
+    env = {"HOME": str(home), "PATH": f"{bin_dir}:{os.environ.get('PATH', '/usr/bin:/bin')}"}
+    outputs: list[str] = []
+
+    async def run(cmd: str, data: bytes | None) -> tuple[int, str]:
+        proc = await asyncio.create_subprocess_exec(
+            "bash",
+            "-c",
+            cmd,
+            env=env,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(data or b""), timeout=60)
+        outputs.append(out.decode("utf-8", "replace"))
+        return proc.returncode or 0, outputs[-1]
+
+    async def user(container, cmd, timeout=15.0):
+        return await run(cmd, None)
+
+    async def stdin(container, cmd, data, timeout, user="ubuntu"):
+        return await run(cmd, data)
+
+    monkeypatch.setattr(gc, "_incus_exec_user", user)
+    monkeypatch.setattr(gc, "_incus_exec_stdin", stdin, raising=False)
+    return outputs
+
+
+def _write_report(home, name: str, report: dict | None = None, raw: bytes | None = None):
+    d = home / ".genesis" / "deploy-backups" / f"{name}-live-move-repair"
+    d.mkdir(parents=True)
+    (d / "REPAIR.json").write_bytes(raw if raw is not None else json.dumps(report).encode())
+    return d
+
+
+async def test_e2e_older_eligible_report_behind_five_ineligible_is_shown(tmp_path, monkeypatch):
+    import genesis.guardian.collector as gc
+
+    _local_container(monkeypatch, tmp_path)
+    _write_report(tmp_path, _ts(3), _mine(tmp_path, ts=_ts(3), result="healed, the older one"))
+    for i in range(5):  # newer, every one ineligible
+        hours = 2 - i * 0.3
+        over = {"result": "superseded"} if i % 2 else {"dismissed_at": "2026-10-21T00:00:00Z"}
+        _write_report(tmp_path, _ts(hours), _mine(tmp_path, ts=_ts(hours), **over))
+    text = await gc._collect_live_repair(GuardianConfig())
+    assert "healed, the older one" in text
+
+
+def test_report_pick_stops_at_the_first_report_older_than_the_window(tmp_path):
+    """Names sort newest first by their ts: once one is older than the window,
+    every later one is too, so the pick reads no further (here: a report whose
+    own ts claims to be new is never reached behind an old directory)."""
+    report = json.dumps(_mine(tmp_path, ts=_ts()))
+    (_backup_dir(tmp_path, _ts(7)) / "REPAIR.json").write_text(report)
+    assert _pick(tmp_path) == b""
+
+
+def _writer_bytes(report: dict, pad_rows: int = 0) -> bytes:
+    """A REPAIR.json as the writer's write_json lays it out (indent=2, its key
+    order: ts, repo, ..., result, paths, reapply, dismissed_at, index_rebuilt),
+    ``pad_rows`` extra rows making it as large as needed."""
+    rows = list(report.get("paths") or [])
+    rows += [{"path": f"pad/{n}" + "p" * 200, "class": "engine"} for n in range(pad_rows)]
+    order = ("ts", "repo", "state_row", "tag", "other", "result", "paths", "reapply")
+    out = {k: report.get(k) for k in order}
+    out.update(paths=rows, dismissed_at=report.get("dismissed_at"), index_rebuilt=False)
+    return json.dumps(out, indent=2).encode()
+
+
+@pytest.mark.parametrize(
+    "over",
+    [{"dismissed_at": "2026-10-21T00:00:00Z"}, {"result": "superseded"}, {"repo": "/elsewhere"}],
+    ids=["dismissed", "superseded", "other-checkout"],
+)
+def test_report_pick_skips_an_ineligible_over_cap_report(tmp_path, over):
+    """CodeRabbit c4461224312: a newest report over the cap that is dismissed
+    (or superseded, or another checkout's) is not shown as "too large": the
+    pick reads those top-level fields from the writer's layout without parsing
+    the file, and the older eligible report is shown."""
+    import genesis.guardian.collector as gc
+
+    older = _mine(tmp_path, ts=_ts(1), result="healed, the older one")
+    (_backup_dir(tmp_path, _ts(1)) / "REPAIR.json").write_text(json.dumps(older))
+    ts = _ts()
+    big = _writer_bytes({**_mine(tmp_path, ts=ts), **over}, pad_rows=25_000)
+    assert len(big) > gc._REPAIR_REPORT_BYTES
+    (_backup_dir(tmp_path, ts) / "REPAIR.json").write_bytes(big)
+    out = _pick(tmp_path)
+    assert b"healed, the older one" in out and b"too large" not in out, out[:300]
+    # The control: the same over-cap report, eligible, is the one shown.
+    eligible = _writer_bytes(_mine(tmp_path, ts=ts), pad_rows=25_000)
+    (
+        tmp_path / ".genesis" / "deploy-backups" / f"{ts}-live-move-repair" / "REPAIR.json"
+    ).write_bytes(eligible)
+    assert b"too large" in _pick(tmp_path)
+
+
+def test_report_pick_orders_same_second_reports_by_pid_as_a_number(tmp_path):
+    """Codex c4464516280: pids 9999 and 10000 in the same second sort the
+    wrong way as text; the pick orders by the loader's report_order (seconds,
+    then pid), as deploy health does."""
+    stamp = _ts()[:-3]
+    for pid, result in ((9999, "healed, pid 9999"), (10000, "healed, pid 10000")):
+        name = f"{stamp}-{pid}"
+        (_backup_dir(tmp_path, name) / "REPAIR.json").write_text(
+            json.dumps(_mine(tmp_path, ts=name, result=result))
+        )
+    assert b"pid 10000" in _pick(tmp_path)
+
+
+def test_report_pick_reads_at_most_the_readers_count_of_reports(tmp_path):
+    """R2 premise LOW-1: the pick reads at most _REPAIR_READS report dirs (deploy
+    health's REPAIR_REPORTS_READ). An eligible report behind that many newer
+    ineligible ones is not read, and the pick takes its none-found path (prints
+    nothing); one fewer ineligible and it is shown."""
+    import genesis.guardian.collector as gc
+
+    (_backup_dir(tmp_path, _ts(3)) / "REPAIR.json").write_text(
+        json.dumps(_mine(tmp_path, ts=_ts(3), result="healed, the older one"))
+    )
+    dismissed = [_ts(2 - i * 0.1) for i in range(gc._REPAIR_READS)]
+    for ts in dismissed:
+        report = _mine(tmp_path, ts=ts, dismissed_at="2026-10-21T00:00:00Z")
+        (_backup_dir(tmp_path, ts) / "REPAIR.json").write_text(json.dumps(report))
+    assert _pick(tmp_path) == b""
+    import shutil
+
+    shutil.rmtree(tmp_path / ".genesis" / "deploy-backups" / f"{dismissed[0]}-live-move-repair")
+    assert b"healed, the older one" in _pick(tmp_path)
+
+
+@pytest.mark.parametrize("case", ["not-json", "not-an-object", "unreadable"])
+def test_report_pick_shows_a_malformed_newest_report_instead_of_an_older_one(tmp_path, case):
+    """R2 premise LOW-3: a newest report that cannot be parsed is shown as
+    unreadable, its ts from its dir, never skipped so an older report reads as
+    the newest (deploy health counts it as refused)."""
+    import os
+
+    import genesis.guardian.collector as gc
+
+    older = _mine(tmp_path, ts=_ts(1), result="healed, the older one")
+    (_backup_dir(tmp_path, _ts(1)) / "REPAIR.json").write_text(json.dumps(older))
+    ts = _ts()
+    path = _backup_dir(tmp_path, ts) / "REPAIR.json"
+    path.write_text({"not-json": "{not json", "not-an-object": "[1, 2]"}.get(case, "{}"))
+    if case == "unreadable":
+        os.chmod(path, 0)
+        if os.access(path, os.R_OK):
+            pytest.skip("running as a user that reads mode-0 files")
+    out = _pick(tmp_path)
+    shown_ts, doc = out[len(gc._REPAIR_MARK) :].split(b"\n", 1)
+    assert shown_ts.decode() == ts, out[:300]
+    assert json.loads(doc) == {
+        "ts": ts,
+        "result": "report unreadable; not read",
+    }, out[:300]
+
+
+@pytest.mark.parametrize(
+    "over",
+    [{"dismissed_at": "2026-10-21T00:00:00Z"}, {"result": "superseded"}, {"repo": "/elsewhere"}],
+    ids=["dismissed", "superseded", "other-checkout"],
+)
+def test_report_pick_skips_a_malformed_report_its_top_fields_make_ineligible(tmp_path, over):
+    """The over-cap branch's rule, for a malformed report: top-level fields
+    read from the writer's layout that make it ineligible skip it."""
+    older = _mine(tmp_path, ts=_ts(1), result="healed, the older one")
+    (_backup_dir(tmp_path, _ts(1)) / "REPAIR.json").write_text(json.dumps(older))
+    ts = _ts()
+    broken = _writer_bytes({**_mine(tmp_path, ts=ts), **over})[:-2]  # cut: not JSON
+    (_backup_dir(tmp_path, ts) / "REPAIR.json").write_bytes(broken)
+    out = _pick(tmp_path)
+    assert b"healed, the older one" in out and b"unreadable" not in out, out[:300]
+
+
+def test_report_pick_takes_the_window_from_the_directory_name(tmp_path):
+    """CodeRabbit c4461224334: the stored ts is user-writable; the dir name is
+    the writer's (and what the loader reads). A recent dir whose stored ts
+    claims to be old is still picked."""
+    stale = _mine(tmp_path, ts="20200101T000000Z-1", result="healed, recent by name")
+    (_backup_dir(tmp_path, _ts()) / "REPAIR.json").write_text(json.dumps(stale))
+    assert b"recent by name" in _pick(tmp_path)
+
+
+def test_report_pick_compares_the_report_repo_with_the_checkout(tmp_path):
+    """CodeRabbit c4461224321: a newer report naming another checkout is
+    skipped; the older one naming ~/genesis (by any spelling) is shown."""
+    import os
+
+    (tmp_path / "real").mkdir()
+    os.symlink(tmp_path / "real", tmp_path / "genesis")
+    mine = _report(ts=_ts(1), result="healed, mine", repo=str(tmp_path / "real"))
+    (_backup_dir(tmp_path, _ts(1)) / "REPAIR.json").write_text(json.dumps(mine))
+    other = _report(result="healed, another checkout's", repo=str(tmp_path / "other"))
+    (_backup_dir(tmp_path, _ts()) / "REPAIR.json").write_text(json.dumps(other))
+    out = _pick(tmp_path)
+    assert b"healed, mine" in out and b"another checkout" not in out, out

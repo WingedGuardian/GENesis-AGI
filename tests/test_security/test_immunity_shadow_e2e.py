@@ -155,7 +155,7 @@ async def test_memory_recall_compact_branch_emits(tmp_path, monkeypatch):
         )
         from genesis.mcp.memory.core import memory_recall
 
-        out = await memory_recall.fn(
+        out = await memory_recall(
             "q",
             source="knowledge",
             compact=True,

@@ -75,10 +75,24 @@ HISTORY_LOOKBACK_S = 2.5 * 3600
 #: src (role -> script under the main checkout).
 _SELF_SRC_SCRIPTS = {"ambient": "ambient_awareness_worker.py"}
 _REPLAY_SCRIPT = "ambient_replay.py"
-#: What a traversal producer loads code from in the checkout: an edit here
-#: means a process may run code no commit records.
+#: The code a graph read and its telemetry run through, as git pathspecs: an
+#: uncommitted edit here means a traversal may run code no commit records. Owner
+#: ruling 47bd37e025174c66 narrowed this from all of ``src/`` to the graph path,
+#: so an early local run of unrelated code does not cost the clock. This is a
+#: bounded source list, not a certificate of every transitive import.
 _RUNTIME_PATHS = (
-    "src/",
+    "src/genesis/memory/graph*.py",  # traversal, telemetry, census, cutover, stores
+    "src/genesis/db/request_database.py",  # picks the SQL tier or the projection
+    "src/genesis/hostmetrics/readings.py",  # pressure reads inside the query budget
+    "src/genesis/db/crud/j9_eval.py",  # persists traversal telemetry
+    "src/genesis/db/connection.py",  # telemetry and request-database connections
+    "config/graphstore.yaml",  # the shipped traversal mode
+    "src/genesis/memory/drift.py",  # traversal callers
+    "src/genesis/mcp/memory/core.py",
+    "src/genesis/session_awareness/worker.py",
+    "src/genesis/runtime/init/learning.py",  # runs the census and its jobs
+    "src/genesis/env.py",  # the engine socket, the DB and the lost-writes path
+    "src/genesis/_config_overlay.py",  # how the graphstore mode resolves
     "scripts/genesis_mcp_server.py",
     "scripts/ambient_awareness_worker.py",
 )
@@ -399,9 +413,8 @@ def build_census(
     rc, head = _git(repo, "rev-parse", "HEAD")
     head = head.strip() if rc == 0 else ""
     head_telemetry = has_telemetry(repo, head, cache) if head else None
-    # The history rule reasons about COMMITS, and the proofs model the loaders
-    # (the entry scripts, routing, env): an edit anywhere a producer loads code
-    # from voids both, not only one inside the memory package.
+    # The history rule reasons about COMMITS: an edit on the graph path voids it
+    # (``_RUNTIME_PATHS``; owner ruling 47bd37e025174c66).
     rc, dirty = _git(repo, "status", "--porcelain", "--", *_RUNTIME_PATHS)
     head_dirty = bool(dirty.strip()) if rc == 0 else None
     if head_telemetry is None or head_dirty is None:

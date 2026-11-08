@@ -4,7 +4,7 @@ description: Canonical guide to Genesis browser automation - layers (Camoufox, C
 consumer: cc_background_task
 phase: 7
 skill_type: workflow
-keywords: [browser, navigate, click, button, fill, form, submit, login, scrape, automate, web, page, site, url, tab, popup, overlay, iframe, dropdown, checkbox, upload, screenshot, snapshot, cdp, chrome, vnc]
+keywords: [browser, click, scrape, popup, iframe, dropdown, checkbox, cdp, chrome, vnc, screenshot, form]
 ---
 
 # Browser Automation
@@ -431,7 +431,15 @@ their own Chrome, or, when card fill is on, use `browser_fill_card`:
 - The tool reopens the checkout in a window no other tool reaches, waits for
   the owner's Telegram tap, fills, clicks Pay itself and closes the window.
   You get a fixed `code` and `status` only.
+- A checkout that shows its result in place after Pay (the page does not
+  change: a drawer or panel swaps to a receipt) takes `success`: a selector in
+  the top document for that result (a container, not a button). Shown, steady
+  and with Pay gone, it gives `submitted_in_place`; without it such a checkout
+  ends as `challenge`. After a save, Pay is found again by its selector (a
+  checkout may rebuild it) and must pass every check it passed at the tap.
 - `submitted_unverified`: check the order page or the merchant account.
+  `submitted_in_place`: most likely paid; do NOT retry; tell the owner to check
+  the merchant account.
   `challenge`, `card_url_blocked`, `card_url_leaked`, `pay_click_unknown`, `moved_while_filling`, `card_url_before_pay`, `card_value_in_request` or `outcome_unknown`: do NOT retry; tell the owner the outcome is
   unknown. `card_url_before_pay`: Pay was not clicked, but a card value was
   sent or nearly sent in a URL; tell the owner the card may be exposed.
@@ -440,6 +448,12 @@ their own Chrome, or, when card fill is on, use `browser_fill_card`:
   other code before Pay (`failed_before_pay`, `claimed_not_filled`, a
   refusal): Pay was not clicked; a single-use card may be spent, so ask the
   owner before trying again.
+- A code after the tap can carry a suffix naming the check that stopped it
+  (`page_changed:granted:title`, `failed_before_pay:held`,
+  `saved_page_changed:pay_price`). What to do follows the part before the first
+  colon; report the whole code to the owner. `page_changed:granted` stopped
+  before anything was typed; any later `page_changed` may follow billing
+  fields being typed (never the card).
 
 **Credentials.**
 - Do not type a password, code or card number the user pasted into chat. Ask

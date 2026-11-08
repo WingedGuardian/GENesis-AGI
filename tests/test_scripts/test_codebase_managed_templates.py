@@ -65,7 +65,6 @@ def render(tmp_path):
             CC_BIN_DIR="/usr/bin",
             SERVICES_GENERATED="0",
             SERVICES_UPDATED="0",
-            FALKORDB_VERSION="4.20.4",
             GENESIS_TAKE_TEMPLATES=take,
             GENESIS_UPDATE_TIER=tier,
             GENESIS_DEPLOY_SUMMARY=str(tmp_path / "summary"),
@@ -76,7 +75,10 @@ def render(tmp_path):
             [
                 "/bin/bash",
                 "-euc",
-                "_falkordb_redis_server_bin() { printf /usr/bin/redis-server; }\n"
+                "_falkordb_redis_server_bin() { printf /opt/e/redis-server; }\n"
+                "_falkordb_redis_cli_bin() { printf /opt/e/redis-cli; }\n"
+                "_falkordb_module_path() { printf /opt/e/falkordb.so; }\n"
+                "_falkordb_digests_path() { printf /opt/e/engine.sha256; }\n"
                 'systemctl() { printf "%s\\n" "$*" >> "$TEST_MANAGER_LOG"; }\n'
                 'loginctl() { printf "Linger=yes\\n"; }\n'
                 + prelude(tmp_path)

@@ -28,6 +28,9 @@ This snapshot makes that drift visible:
   the behind-count, tier-2 pending and host drift are measured from the
   commit `live` was built on, never HEAD, so a candidate's own files never
   read as undeployed merges
+- ``live_repairs`` — what the live-move repair (scripts/lib/live_move_repair.py)
+  reported after healing a half-written `live` checkout: per report, how many
+  paths it saved that were not the update's; an unresolved repair
 
 The awareness tick's ``_check_deploy_staleness`` consumes the same collectors
 to raise a dashboard/morning-report observation. Everything is best-effort:
@@ -38,12 +41,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.util
 import json
 import logging
 import os
 import re
 import signal
 import subprocess
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -919,6 +924,216 @@ def live_findings(live: dict | None) -> list[str]:
     return found
 
 
+#: A repair report with no result yet is a repair still running, or one killed
+#: partway; after this long it is the latter.
+REPAIR_UNFINISHED_S = 3600
+#: Report dirs read per snapshot, newest first by the ts in their name; older
+#: ones are counted (``unread_older``), never read.
+REPAIR_REPORTS_READ = 8
+
+_REPAIR_SCRIPT = Path(__file__).resolve().parents[4] / "scripts" / "lib" / "live_move_repair.py"
+_GUARD_SCRIPT = Path(__file__).resolve().parents[4] / "scripts" / "lib" / "update_state_guard.py"
+_REPAIR_SUFFIX = "-live-move-repair"
+#: The writer's results, by prefix, most specific first; anything else is "unknown".
+_REPAIR_RESULTS = (
+    ("healed, state kept", "healed-kept"),
+    ("healed", "healed"),
+    ("unresolved", "unresolved"),
+    ("superseded", "superseded"),
+)
+#: (name, reason) of each refused report this process logged: a refusal is
+#: named once in the server log, not on every snapshot. Bounded, because the
+#: names come from a user-writable directory: past the cap a refusal is still
+#: counted in the snapshot, only no longer logged.
+_REPAIR_REFUSALS_LOGGED: set[tuple[str, str]] = set()
+_REPAIR_REFUSALS_LOG_CAP = 256
+
+
+# Per git call. A real residue check took about 1 s on a clone (measured).
+_GUARD_GIT_TIMEOUT_S = 5
+
+
+def _script(path: Path):
+    """A script of the tree this module ships in, loaded afresh: the repair's
+    own rules, so this reader judges what the writer judged."""
+    spec = importlib.util.spec_from_file_location(f"_deploy_health_{path.stem}", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"{path} cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _refused(name: str, reason: str) -> None:
+    key = (name, reason)
+    if (
+        key not in _REPAIR_REFUSALS_LOGGED
+        and len(_REPAIR_REFUSALS_LOGGED) < _REPAIR_REFUSALS_LOG_CAP
+    ):
+        _REPAIR_REFUSALS_LOGGED.add(key)
+        logger.warning("live-move repair report %r not read: %s", name, reason)
+
+
+def _repair_result(raw: object) -> str:
+    """The stored result as an enum, by prefix: no report string leaves the reader."""
+    if raw is None:
+        return "unfinished"
+    if isinstance(raw, str):
+        for prefix, enum in _REPAIR_RESULTS:
+            if raw.startswith(prefix):
+                return enum
+    return "unknown"
+
+
+def collect_live_repairs(
+    genesis_home_dir: Path, repo_dir: Path | str, now: float | None = None
+) -> dict:
+    """The live-move repair's REPAIR.json reports (scripts/lib/live_move_repair.py)
+    for the deploy checkout ``repo_dir``, as counts. The reader reports and
+    never judges a path: restoring is the repair's own mode, which judges each
+    path when it writes.
+
+    A dir ending in the repair's suffix whose name is not one the writer makes
+    (``report_ts``), whose ts is no date, or whose ts is more than the loader's
+    REPORT_FUTURE_S ahead of ``now`` (a write while the clock ran ahead; the
+    guardian's pick skips it too, so neither reader takes it as the newest), is
+    refused unread. Of the rest, the newest REPAIR_REPORTS_READ by the loader's
+    ``report_order`` (seconds, then pid; the guardian's pick sorts by the same
+    key) are read through the repair's
+    own ``load_report`` (its module loads once per call, only when such a dir
+    exists); older ones count in ``unread_older`` (dismissed ones included). A report load_report refuses
+    (a symlinked dir, a REPAIR.json that is not a regular file within the byte
+    cap, not a JSON object, over the row cap, or naming another checkout), or
+    one that fails in any other way, counts in ``refused`` and is named once in
+    the server log; it never costs the other reports.
+
+    ``reports`` (newest first): per report its ``ts``, ``backup_dir``,
+    ``saved`` (its foreign rows: every dict row of class "foreign", no other
+    field read; 0 once a restore cleared it, see _restore_counts),
+    ``restore_refused`` (the parts its last restore refused), ``result`` (the
+    stored result as an enum, by prefix: healed, healed-kept, unresolved,
+    superseded, unfinished, else unknown),
+    ``dismissed``, and ``unresolved`` (the report says so, or has had no result
+    for REPAIR_UNFINISHED_S, and is not dismissed). ``saved``: the sum over
+    reports neither dismissed nor cleared. ``unresolved``: the newest READ report is (a
+    dismissed or superseded newest one included: by design this differs from
+    the guardian's pick, which shows the newest ELIGIBLE report), while the
+    update state's guard still calls the checkout half-written (a repair
+    killed after its restore leaves no result; only the tree says whether it
+    healed). The guard loads only then; nothing else runs in the checkout."""
+    now = time.time() if now is None else now
+    repo = str(repo_dir)
+    backups = genesis_home_dir / "deploy-backups"
+    out: dict = {"reports": [], "saved": 0, "refused": 0, "unread_older": 0, "unresolved": False}
+    try:
+        names = [n for n in os.listdir(backups) if n.endswith(_REPAIR_SUFFIX)]
+    except FileNotFoundError:
+        names = []
+    except OSError as exc:
+        # A folder that cannot be read saw nothing. Reading it as "no reports" would
+        # close a standing alert about a report still there.
+        _refused(backups.name, type(exc).__name__)
+        out["refused"] = 1
+        return out
+    if not names:
+        return out
+    try:  # the module and every name used from it: a module on disk lacking
+        # one (renamed by a later pull) is unloadable, never a blank snapshot
+        repair = _script(_REPAIR_SCRIPT)
+        report_ts, load_report, bad = repair.report_ts, repair.load_report, repair.BadReport
+        report_order, future_s = repair.report_order, repair.REPORT_FUTURE_S
+    except Exception:  # noqa: BLE001 - unloadable: no report can be read
+        logger.warning("live-move repair module could not be loaded", exc_info=True)
+        out["refused"] = len(names)
+        return out
+    named: list[tuple[tuple[int, int], str, str]] = []
+    for name in names:
+        ts = report_ts(name)
+        try:
+            if ts is None:
+                raise ValueError("not a name the repair writes")
+            order = report_order(ts)
+            if order[0] - now > future_s:
+                raise ValueError(f"named more than {future_s} s ahead of this clock")
+            named.append((order, ts, name))
+        except Exception as exc:  # noqa: BLE001 - a later module's rules must not blank the section
+            _refused(name, str(exc))
+            out["refused"] += 1
+    named.sort(reverse=True)
+    out["unread_older"] = max(0, len(named) - REPAIR_REPORTS_READ)
+    for _, ts, name in named[:REPAIR_REPORTS_READ]:
+        # One boundary per report: a fault no check foresaw costs that report,
+        # never the rest of the snapshot.
+        try:
+            loaded = load_report(str(backups / name), repo)
+            if loaded is None:
+                continue
+            m = loaded["report"]
+            result, dismissed = _repair_result(m.get("result")), bool(m.get("dismissed_at"))
+            stale = result == "unfinished" and now - loaded["mtime"] > REPAIR_UNFINISHED_S
+            saved = sum(1 for r in loaded["rows"] if r.get("class") == "foreign")
+            refused, cleared = _restore_counts(m.get("restore"))
+        except Exception as exc:  # noqa: BLE001 - see the boundary comment above
+            _refused(name, str(exc) if isinstance(exc, bad) else type(exc).__name__)
+            out["refused"] += 1
+            continue
+        out["reports"].append(
+            {
+                "ts": ts,
+                "backup_dir": str(backups / name),
+                "saved": 0 if cleared else saved,
+                "restore_refused": refused,
+                "result": result,
+                "dismissed": dismissed,
+                "unresolved": (result == "unresolved" or stale) and not dismissed,
+            }
+        )
+        out["saved"] += 0 if dismissed or cleared else saved
+    if out["reports"] and out["reports"][0]["unresolved"]:
+        out["unresolved"] = _mixed(genesis_home_dir, repo)
+    return out
+
+
+def _restore_counts(block: object) -> tuple[int, bool]:
+    """(parts the last restore refused, has it cleared the report) from a
+    report's `restore` block (live_move_restore.restore). Cleared only when
+    `restored_at` is a str and `refused` is an int (never a bool) of 0: a
+    restore that refused a part leaves the report's saved paths counted."""
+    if not isinstance(block, dict) or type(block.get("refused")) is not int:
+        return 0, False
+    refused = max(block["refused"], 0)
+    return refused, block["refused"] == 0 and isinstance(block.get("restored_at"), str)
+
+
+def _mixed(genesis_home_dir: Path, repo: str | None) -> bool:
+    """Does the shared restart guard call the checkout half-written? Doubt
+    (no checkout named, a guard that cannot run, a git that stalls) keeps the
+    report's word."""
+    try:
+        guard = _script(_GUARD_SCRIPT)
+        # The guard's own limit suits a deploy holding a lock, not this read: the
+        # health route gives up at 15 s. This copy of the module is ours alone.
+        guard._TIMEOUT_S = _GUARD_GIT_TIMEOUT_S
+        verdict, _ = guard.verdict(str(genesis_home_dir / "update_state.json"), repo)
+    except Exception:  # noqa: BLE001 - any failure to decide keeps "unresolved"
+        return True
+    return verdict == guard.MIXED_TREE
+
+
+def live_repair_findings(repairs: dict | None) -> list[str]:
+    """The ``live_repair_*`` keys of a :func:`collect_live_repairs` dict (None:
+    not read, as in a linked worktree)."""
+    repairs = repairs or {}
+    found = [f"live_repair_saved:{repairs['saved']}"] if repairs.get("saved") else []
+    if repairs.get("unread_older"):
+        found.append(f"live_repair_unread_older:{repairs['unread_older']}")
+    if repairs.get("unresolved"):
+        found.append("live_repair_unresolved")
+    if repairs.get("refused"):
+        found.append(f"live_repair_refused:{repairs['refused']}")
+    return found
+
+
 # Sustained-staleness thresholds (the awareness check's paging axis). A
 # finding-CLASS boundary, so they live here beside derive_findings — the
 # single producer of finding keys — not in the awareness layer: an alert
@@ -938,6 +1153,7 @@ def derive_findings(
     behind_threshold: int = 50,
     main_checkout: dict | None = None,
     live: dict | None = None,
+    live_repairs: dict | None = None,
 ) -> list[str]:
     """Stable, order-deterministic finding keys — the alert/dedup contract.
 
@@ -953,7 +1169,8 @@ def derive_findings(
     ``main_checkout_unreadable`` when that could not be read: never nothing, so
     an unreadable tree cannot clear a standing dirty finding. ``clean``,
     ``not_deploy_root`` and ``deploying`` add nothing. ``live``
-    (:func:`collect_live`) adds the ``live_*`` keys of :func:`live_findings`."""
+    (:func:`collect_live`) adds the ``live_*`` keys of :func:`live_findings`, and
+    ``live_repairs`` (:func:`collect_live_repairs`) the ``live_repair_*`` keys."""
     findings: list[str] = []
     if missing_units:
         findings.append("missing_units:" + ",".join(sorted(missing_units)))
@@ -974,6 +1191,7 @@ def derive_findings(
         findings.append(f"behind_upstream:{commits_behind}")
     findings.extend(main_checkout_findings(main_checkout))
     findings.extend(live_findings(live))
+    findings.extend(live_repair_findings(live_repairs))
     return findings
 
 
@@ -1020,6 +1238,12 @@ def _collect_sync(repo: Path, genesis_home_dir: Path) -> dict:
         "main_checkout": main_checkout,
         "live": live,
         "upto": upto,
+        # Like `live`: the reports are the deploy checkout's, never a dev tree's.
+        "live_repairs": (
+            None
+            if main_checkout.get("status") == "not_deploy_root"
+            else collect_live_repairs(genesis_home_dir, repo)
+        ),
     }
 
 
@@ -1042,6 +1266,7 @@ async def deploy_health(db: aiosqlite.Connection | None) -> dict:
             update_age_days=update.get("age_days"),
             main_checkout=collected["main_checkout"],
             live=collected["live"],
+            live_repairs=collected["live_repairs"],
         )
         return {
             "status": "attention" if findings else "healthy",
@@ -1053,6 +1278,7 @@ async def deploy_health(db: aiosqlite.Connection | None) -> dict:
             "host_gateway": collected["host_gateway"],
             "main_checkout": collected["main_checkout"],
             "live": collected["live"],
+            "live_repairs": collected["live_repairs"],
         }
     except Exception:
         logger.error("deploy_health snapshot failed", exc_info=True)

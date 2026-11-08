@@ -97,10 +97,14 @@ finishes only 0. Only exit 10 lets a caller go on.
 
 from __future__ import annotations
 
+import contextlib
+import glob
 import json
 import os
 import re
 import shlex
+import signal
+import stat
 import subprocess
 import sys
 
@@ -140,7 +144,47 @@ _TIMEOUT_S = 120
 
 def _env() -> dict[str, str]:
     # Local reads only; GIT_* from the caller would point git elsewhere.
-    return {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    # GIT_OPTIONAL_LOCKS=0: deploy health asks while a deploy may be running,
+    # and `git status` would otherwise refresh the index under index.lock,
+    # failing a concurrent writer (MEASURED: a stale cached stat rewrites it).
+    # The GIT_CONFIG_* pairs are `-c` for every call, the residue helper's
+    # included (git 2.31+): a repository config naming an fsmonitor program
+    # or a hooks path never runs it here (#3964, from the #3984 review).
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    env.update(
+        GIT_CONFIG_COUNT="2",
+        GIT_CONFIG_KEY_0="core.fsmonitor",
+        GIT_CONFIG_VALUE_0="false",
+        GIT_CONFIG_KEY_1="core.hooksPath",
+        GIT_CONFIG_VALUE_1="/dev/null",
+    )
+    return env
+
+
+#: The state file is a few hundred bytes (update.sh writes one small object);
+#: one far over that is not a state any writer made.
+STATE_BYTES = 1 << 20
+
+
+def read_state(path: str) -> bytes:
+    """The state file's bytes, read so no file at that path can stall a caller
+    (#3964): never through a final symlink (ELOOP), never blocking on a FIFO
+    (O_NONBLOCK), a regular file only, at most STATE_BYTES. Raises OSError or
+    ValueError otherwise, which every reader takes as "it cannot be read"."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"{path} is not a regular file")
+        chunks, size = [], 0
+        while size <= STATE_BYTES and (chunk := os.read(fd, STATE_BYTES + 1 - size)):
+            chunks.append(chunk)
+            size += len(chunk)
+    finally:
+        os.close(fd)
+    if size > STATE_BYTES:
+        raise ValueError(f"{path} is over {STATE_BYTES} bytes")
+    return b"".join(chunks)
 
 
 def _rev(repo: str, rev: str) -> str:
@@ -216,8 +260,14 @@ def _merge_residue(
     legal file name arrives exactly; bytes that are not UTF-8 are kept as
     surrogates); any failure to run it is residue. ``ephemeral_ok`` leaves out
     the known-ephemeral paths. Read as bytes and decoded here: text mode would
-    turn a carriage return in a name into a newline, naming another file."""
-    proc = subprocess.run(
+    turn a carriage return in a name into a newline, naming another file.
+
+    Run in its own session: on a timeout the whole group is killed (git
+    included, which would otherwise outlive bash) and the scratch index the
+    hidden-entry pass names after its shell's pid ($$, this child's pid) is
+    removed, as deploy_health's checkout probe does; TimeoutExpired is then
+    raised to the caller as before."""
+    proc = subprocess.Popen(
         [
             "bash",
             "-c",
@@ -230,14 +280,55 @@ def _merge_residue(
             "--two-dot" if two_dot else "",
             "1" if ephemeral_ok else "",
         ],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         env=_env(),
-        timeout=_TIMEOUT_S,
+        start_new_session=True,
     )
+    try:
+        stdout, _ = proc.communicate(timeout=_TIMEOUT_S)
+    except BaseException:  # the timeout, or an interrupt that its own session never sees
+        _kill_residue_check(proc, repo)
+        raise
     if proc.returncode != 0:
         return [f"(the merge residue check failed: exit {proc.returncode})"]
-    out = proc.stdout.decode("utf-8", "surrogateescape")
+    out = stdout.decode("utf-8", "surrogateescape")
     return [rec for rec in out.split("\0") if rec]
+
+
+def _git_dir_of(repo: str) -> str | None:
+    """``repo``'s git directory without running git (a hung git is why we are
+    here): ``.git`` itself, or the directory a ``gitdir:`` file names."""
+    dot_git = os.path.join(repo, ".git")
+    if os.path.isdir(dot_git):
+        return dot_git
+    try:
+        with open(dot_git, encoding="utf-8") as fh:
+            line = fh.read().strip()
+    except (OSError, ValueError):
+        return None
+    if not line.startswith("gitdir:"):
+        return None
+    return os.path.join(repo, line.removeprefix("gitdir:").strip())
+
+
+def _kill_residue_check(proc: subprocess.Popen, repo: str) -> None:
+    """Kill a timed-out or interrupted residue check's group and remove its scratch index."""
+    if proc.pid > 1:  # its own group leader (start_new_session); killpg(1) is everything
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        # Before the reap: until then the pid cannot name another process's copy.
+        git_dir = _git_dir_of(repo)
+        if git_dir is not None:
+            for leftover in glob.glob(
+                os.path.join(glob.escape(git_dir), f"genesis-hidden-index.{proc.pid}.*")
+            ):
+                with contextlib.suppress(OSError):
+                    os.unlink(leftover)
+    # Bounded: SIGKILL stays pending in uninterruptible I/O, the failure the
+    # timeout contains; Popen reaps a process left this way when collected.
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.communicate(timeout=5)
 
 
 def _conflict_recorded(conflicts_path: str, deploy_head: str) -> bool:
@@ -598,8 +689,7 @@ def verdict(state_path: str, repo: str, conflicts_path: str | None = None) -> tu
     if not os.path.lexists(state_path):
         return SAFE, "there is no state file"
     try:
-        with open(state_path, encoding="utf-8") as fh:
-            state = json.load(fh)
+        state = json.loads(read_state(state_path).decode("utf-8"))
     except (OSError, ValueError, RecursionError):
         return _hold("it cannot be read", _UNTRUSTED)
     if conflicts_path is None:

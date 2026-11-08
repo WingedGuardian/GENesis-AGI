@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_scripts._update_source import update_text
 from tests.test_scripts.test_update_state_guard import diverged_live, live_row, post_merge_advice
 
 REPO = Path(__file__).resolve().parents[2]
@@ -36,7 +37,7 @@ pytestmark = pytest.mark.skipif(sys.platform.startswith("win"), reason="bash + g
 
 
 def _text() -> str:
-    return UPDATE.read_text()
+    return update_text()
 
 
 def _block(name: str) -> str:

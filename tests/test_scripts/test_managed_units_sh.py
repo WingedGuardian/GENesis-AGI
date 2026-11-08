@@ -224,6 +224,15 @@ def test_a_bootstrap_refusal_keeps_a_summary_file_it_did_not_create(world):
     assert theirs.read_text() == "keep me\n"
 
 
+# The graph-engine helpers step 6 defines when it sources lib/falkordb_install.sh.
+_FALKORDB_STUBS = (
+    "_falkordb_redis_server_bin() { echo /opt/e/redis-server; }\n"
+    "_falkordb_redis_cli_bin() { echo /opt/e/redis-cli; }\n"
+    "_falkordb_module_path() { echo /opt/e/falkordb.so; }\n"
+    "_falkordb_digests_path() { echo /opt/e/engine.sha256; }\n"
+)
+
+
 def _install_step7_block() -> str:
     text = (REPO / "scripts" / "install.sh").read_text()
     start = text.index('    for template in "$SYSTEMD_TEMPLATE_DIR"/*.service.template')
@@ -244,7 +253,8 @@ def test_install_writes_stamped_units_and_never_overwrites(tmp_path):
         f"SYSTEMD_TEMPLATE_DIR={str(tdir)!r} SYSTEMD_USER_DIR={str(udir)!r}\n"
         f"HOME={str(tmp_path)!r} VENV_PATH=/opt/v REPO_DIR=/opt/r CC_BIN_DIR=/opt/c\n"
         f"SCRIPT_DIR={str(REPO / 'scripts')!r}\n"
-        "_falkordb_redis_server_bin() { echo /usr/bin/redis-server; }\n" + _install_step7_block()
+        + _FALKORDB_STUBS
+        + _install_step7_block()
     )
     r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
@@ -273,7 +283,8 @@ def test_an_install_rerun_never_replaces_a_masked_unit(tmp_path, link_to):
         f"SYSTEMD_TEMPLATE_DIR={str(tdir)!r} SYSTEMD_USER_DIR={str(udir)!r}\n"
         f"HOME={str(tmp_path)!r} VENV_PATH=/opt/v REPO_DIR=/opt/r CC_BIN_DIR=/opt/c\n"
         f"SCRIPT_DIR={str(REPO / 'scripts')!r}\n"
-        "_falkordb_redis_server_bin() { echo /usr/bin/redis-server; }\n" + _install_step7_block()
+        + _FALKORDB_STUBS
+        + _install_step7_block()
     )
     r = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr

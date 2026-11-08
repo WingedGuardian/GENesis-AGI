@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -148,7 +149,7 @@ def test_hash_matches_live_bash_sha1sum():
 def test_sqlite_queue_uses_full_sync_without_wal(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     im.write_marker("/tmp", "cbm", "fast")
-    with sqlite3.connect(im.database_path()) as db:
+    with closing(sqlite3.connect(im.database_path())) as db:
         assert db.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
         assert db.execute("PRAGMA synchronous").fetchone()[0] == 2
         assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
@@ -157,8 +158,11 @@ def test_sqlite_queue_uses_full_sync_without_wal(tmp_path, monkeypatch):
 def test_newer_schema_fails_loud_instead_of_downgrading(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     im.marker_dir().mkdir(parents=True)
-    with sqlite3.connect(im.database_path()) as db:
-        db.execute(f"PRAGMA user_version={im.SCHEMA_VERSION + 1}")
+    with closing(sqlite3.connect(im.database_path())) as db:
+        # Default startup remains4 while explicit schema5 is supported.
+        future = max(im.SCHEMA_VERSION, im._recovery.SCHEMA_VERSION) + 1
+        db.execute(f"PRAGMA user_version={future}")
+        db.commit()
     with pytest.raises(RuntimeError, match="newer than supported"):
         im.list_markers()
 
@@ -181,16 +185,15 @@ def test_write_list_and_coalesce(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     assert im.write_marker("/tmp", "cbm", "fast") == im.database_path()
     first = im.list_markers()[0]
-    time.sleep(0.01)
     im.write_marker("/tmp/.", "gitnexus", "full")
-    rows = im.list_markers()
-    assert len(rows) == 1
-    assert rows[0]["repo_path"] == "/tmp"
-    assert rows[0]["tools"] == "both"
-    assert rows[0]["mode"] == "full"
-    assert rows[0]["requested_at"] == first["requested_at"]
-    assert rows[0]["attempts"] == 0
-    assert rows[0]["age_s"] >= 0
+    rows = {row["provider"]: row for row in im.list_markers()}
+    assert set(rows) == {"cbm", "gitnexus"}
+    assert rows["cbm"]["requested_at"] == first["requested_at"]
+    assert rows["cbm"]["mode"] == "fast" and rows["gitnexus"]["mode"] == "full"
+    assert all(
+        row["repo_path"] == "/tmp" and row["attempts"] == 0 and row["age_s"] >= 0
+        for row in rows.values()
+    )
 
 
 def test_concurrent_thread_writers_do_not_lose_widening(tmp_path, monkeypatch):
@@ -201,8 +204,11 @@ def test_concurrent_thread_writers_do_not_lose_widening(tmp_path, monkeypatch):
         futures = [pool.submit(im.write_marker, "/tmp", tool, mode) for tool, mode in requests]
         for future in futures:
             future.result(timeout=10)
-    row = im.list_markers()[0]
-    assert (row["tools"], row["mode"]) == ("both", "full")
+    rows = {row["provider"]: row for row in im.list_markers()}
+    assert {provider: row["mode"] for provider, row in rows.items()} == {
+        "cbm": "full",
+        "gitnexus": "fast",
+    }
 
 
 def test_database_write_lock_durably_spools_without_losing_widening(tmp_path, monkeypatch):
@@ -218,8 +224,11 @@ def test_database_write_lock_durably_spools_without_losing_widening(tmp_path, mo
     finally:
         blocker.rollback()
         blocker.close()
-    row = im.list_markers()[0]
-    assert (row["tools"], row["mode"]) == ("both", "full")
+    rows = {row["provider"]: row for row in im.list_markers()}
+    assert {provider: row["mode"] for provider, row in rows.items()} == {
+        "cbm": "fast",
+        "gitnexus": "full",
+    }
     assert not spool.exists()
 
 
@@ -244,7 +253,7 @@ def test_process_death_with_uncommitted_write_recovers_cleanly(tmp_path, monkeyp
     _home(tmp_path, monkeypatch)
     im.write_marker("/tmp", "cbm", "fast")
     h = im.marker_hash("/tmp")
-    im.claim(h)
+    im.claim(h, provider="cbm")
     code = """
 import os, sqlite3, sys
 db = sqlite3.connect(sys.argv[1], isolation_level=None)
@@ -256,7 +265,7 @@ os._exit(9)
     result = subprocess.run(["python3", "-c", code, str(im.database_path())])
     assert result.returncode == 9
     assert im.get_inflight(h) is not None
-    with sqlite3.connect(im.database_path()) as db:
+    with closing(sqlite3.connect(im.database_path())) as db:
         assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
 
 
@@ -272,13 +281,13 @@ def test_claim_consume_and_concurrent_request(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     im.write_marker("/tmp", "cbm", "full")
     h = im.marker_hash("/tmp")
-    claimed = im.claim(h)
+    claimed = im.claim(h, provider="cbm")
     assert claimed and claimed["claim_id"]
     assert im.get_inflight(h)["tools"] == "cbm"
     assert im.list_markers() == []
     im.write_marker("/tmp", "gitnexus", "fast")
-    assert im.claim(h) is None
-    im.consume(h, claim_id=claimed["claim_id"])
+    assert im.claim(h, provider="cbm") is None
+    im.consume(claimed["context"])
     assert im.get_inflight(h) is None
     assert im.list_markers()[0]["tools"] == "gitnexus"
 
@@ -287,14 +296,17 @@ def test_restore_atomically_coalesces_pending_and_inflight(tmp_path, monkeypatch
     _home(tmp_path, monkeypatch)
     im.write_marker("/tmp", "cbm", "full")
     h = im.marker_hash("/tmp")
-    claim_id = im.claim(h)["claim_id"]
+    context = im.claim(h, provider="cbm")["context"]
     im.write_marker("/tmp", "gitnexus", "fast")
-    assert im.restore(h, claim_id=claim_id) == "pending"
+    assert im.restore(context) == "pending"
     assert im.get_inflight(h) is None
-    row = im.list_markers()[0]
-    assert (row["tools"], row["mode"], row["attempts"]) == ("both", "full", 0)
-    with sqlite3.connect(im.database_path()) as db:
-        assert db.execute("SELECT count(*) FROM pending WHERE hash=?", (h,)).fetchone()[0] == 1
+    rows = {row["provider"]: row for row in im.list_markers()}
+    assert {provider: (row["mode"], row["attempts"]) for provider, row in rows.items()} == {
+        "cbm": ("full", 0),
+        "gitnexus": ("fast", 0),
+    }
+    with closing(sqlite3.connect(im.database_path())) as db:
+        assert db.execute("SELECT count(*) FROM pending WHERE hash=?", (h,)).fetchone()[0] == 2
         assert db.execute("SELECT count(*) FROM inflight WHERE hash=?", (h,)).fetchone()[0] == 0
 
 
@@ -303,8 +315,8 @@ def test_deferrals_never_burn_failure_budget(tmp_path, monkeypatch):
     im.write_marker("/tmp", "both", "fast")
     h = im.marker_hash("/tmp")
     for _ in range(im.MAX_ATTEMPTS * 2):
-        claim_id = im.claim(h)["claim_id"]
-        assert im.restore(h, claim_id=claim_id) == "pending"
+        context = im.claim(h, provider="cbm")["context"]
+        assert im.restore(context) == "pending"
     assert im.list_markers()[0]["attempts"] == 0
     assert im.get_failed(h) is None
 
@@ -315,11 +327,14 @@ def test_genuine_failures_euthanize_at_exact_budget(tmp_path, monkeypatch):
     h = im.marker_hash("/tmp")
     states = []
     for _ in range(im.MAX_ATTEMPTS):
-        claim_id = im.claim(h)["claim_id"]
-        states.append(im.restore(h, claim_id=claim_id, attempts_inc=True))
+        context = im.claim(h, provider="cbm")["context"]
+        states.append(im.restore(context, attempts_inc=True))
     assert states == ["pending"] * (im.MAX_ATTEMPTS - 1) + ["failed"]
-    assert im.list_markers() == [] and im.get_inflight(h) is None
-    assert im.get_failed(h)["attempts"] == im.MAX_ATTEMPTS
+    assert [row["provider"] for row in im.list_markers()] == ["gitnexus"]
+    assert (
+        im.get_inflight(h) is None
+        and im.get_failed(h, provider="cbm")["attempts"] == im.MAX_ATTEMPTS
+    )
 
 
 @pytest.mark.parametrize(
@@ -338,8 +353,8 @@ def test_remembered_outcomes_reconcile_exactly(
     _home(tmp_path, monkeypatch)
     im.write_marker("/tmp", "cbm", "full")
     h = im.marker_hash("/tmp")
-    claim_id = im.claim(h)["claim_id"]
-    im.remember_outcome(h, action, claim_id=claim_id)
+    context = im.claim(h, provider="cbm")["context"]
+    im.remember_outcome(context, action)
     recorded = im.get_inflight(h)["outcome_recorded_at"]
     repended = im.repend_stale_inflight()
     assert bool(im.list_markers()) is pending
@@ -360,12 +375,12 @@ def test_busy_terminal_outcome_is_durably_spooled_and_replayed(tmp_path, monkeyp
     _home(tmp_path, monkeypatch)
     im.write_marker("/tmp", "cbm", "fast")
     h = im.marker_hash("/tmp")
-    claim_id = im.claim(h)["claim_id"]
+    context = im.claim(h, provider="cbm")["context"]
     monkeypatch.setattr(im, "OUTCOME_LOCK_WAIT_S", 0.01)
     blocker = sqlite3.connect(im.database_path(), isolation_level=None)
     blocker.execute("BEGIN IMMEDIATE")
     try:
-        spool = im.remember_outcome(h, "consume", claim_id=claim_id)
+        spool = im.remember_outcome(context, "consume")
         assert spool.exists() and spool.name.startswith(f".outcome-spool-{h}-")
     finally:
         blocker.rollback()
@@ -381,83 +396,83 @@ def test_stale_outcome_spool_cannot_apply_to_a_newer_claim(tmp_path, monkeypatch
     _home(tmp_path, monkeypatch)
     im.write_marker("/tmp", "cbm", "fast")
     h = im.marker_hash("/tmp")
-    old_claim = im.claim(h)["claim_id"]
-    spool = im._write_outcome_spool(h, old_claim, "consume")
-    new_claim = "c" * 32
-    with sqlite3.connect(im.database_path()) as db:
-        db.execute("UPDATE inflight SET claim_id=? WHERE hash=?", (new_claim, h))
+    old = im.claim(h, provider="cbm")["context"]
+    im.consume(old)
+    im.write_marker("/tmp", "cbm", "full")
+    current = im.claim(h, provider="cbm")["context"]
+    event = im._legs.scalar_event(old, "consume", 123, im.marker_hash)
+    spool = im._write_outcome_spool(old, event)
+    im.list_markers()  # Imports the late duplicate against retained old history.
+    assert im.get_inflight(h)["execution_seq"] == current["execution_seq"]
+    assert im.apply_remembered_outcome(current) is None
+    assert im.apply_remembered_outcome(old) == "consumed"
+    assert not spool.exists() and _import_receipts()[0]["disposition"] == "imported"
+    assert im.repend_stale_inflight() == [h]  # Protocol2 never had a native-intent path.
+    assert im.list_markers()[0]["attempts"] == 0
 
-    assert im.repend_stale_inflight() == [h]
-    assert im.list_markers()[0]["attempts"] == 1
-    receipt = _import_receipts()[0]
-    assert receipt["disposition"] == "quarantined" and receipt["reason"] == "unowned-outcome"
-    assert bytes(receipt["raw_payload"])
-    assert not spool.exists()
 
-
-def test_conflicting_outcome_spools_fail_closed_to_one_retry(tmp_path, monkeypatch):
+def test_conflicting_outcome_spools_preserve_claim_for_reconciliation(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     im.write_marker("/tmp", "cbm", "fast")
     h = im.marker_hash("/tmp")
-    claim_id = im.claim(h)["claim_id"]
-    first = im._write_outcome_spool(h, claim_id, "consume")
-    second = im._write_outcome_spool(h, claim_id, "restore")
-
-    assert im.repend_stale_inflight() == [h]
-    assert im.list_markers()[0]["attempts"] == 1
-    with sqlite3.connect(im.database_path()) as db:
-        reason = db.execute("SELECT reason FROM failed_outcomes WHERE hash=?", (h,)).fetchone()[0]
-    assert reason == f"conflicting durable outcomes for claim {claim_id}"
+    context = im.claim(h, provider="cbm")["context"]
+    first = im._write_outcome_spool(
+        context, im._legs.scalar_event(context, "consume", 1, im.marker_hash)
+    )
+    second = im._write_outcome_spool(
+        context, im._legs.scalar_event(context, "restore", 2, im.marker_hash)
+    )
+    with pytest.raises(RuntimeError, match="requires reconciliation"):
+        im.repend_stale_inflight()
+    assert im.list_markers() == [] and im.get_inflight(h)["claim_id"] == context["claim_id"]
+    with closing(sqlite3.connect(im.database_path())) as db:
+        reason, evidence = db.execute(
+            "SELECT conflict_reason,conflict_raw FROM executions"
+        ).fetchone()
+    assert reason == "conflicting durable outcomes" and bytes(evidence)
     assert not first.exists() and not second.exists()
+    assert len(_import_receipts()) == 2 and all(row["raw_payload"] for row in _import_receipts())
 
 
-def test_conflicting_direct_outcomes_fail_closed_to_one_retry(tmp_path, monkeypatch):
+def test_conflicting_direct_outcomes_preserve_claim_for_reconciliation(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     im.write_marker("/tmp", "cbm", "fast")
     h = im.marker_hash("/tmp")
-    claim_id = im.claim(h)["claim_id"]
-    im.remember_outcome(h, "consume", claim_id=claim_id)
+    context = im.claim(h, provider="cbm")["context"]
+    im.remember_outcome(context, "consume")
+    with pytest.raises(RuntimeError, match="conflicting durable queue outcomes"):
+        im.remember_outcome(context, "restore")
+    with pytest.raises(RuntimeError, match="requires reconciliation"):
+        im.repend_stale_inflight()
+    assert im.get_inflight(h)["attempts"] == 0 and im.list_markers() == []
 
-    with pytest.raises(RuntimeError, match="conflicting outcome"):
-        im.remember_outcome(h, "restore", claim_id=claim_id)
 
-    assert im.repend_stale_inflight() == [h]
-    assert im.list_markers()[0]["attempts"] == 1
-
-
-def test_unknown_runner_deaths_exhaust_budget(tmp_path, monkeypatch):
+def test_protocol2_claim_without_native_intent_restores_without_failure_charge(
+    tmp_path, monkeypatch
+):
     _home(tmp_path, monkeypatch)
     im.write_marker("/tmp", "cbm", "full")
     h = im.marker_hash("/tmp")
-    for _ in range(im.MAX_ATTEMPTS):
-        assert im.claim(h)
-        im.repend_stale_inflight()
-    assert im.list_markers() == []
-    assert im.get_failed(h)["attempts"] == im.MAX_ATTEMPTS
+    for _ in range(im.MAX_ATTEMPTS * 2):
+        assert im.claim(h, provider="cbm")
+        assert im.repend_stale_inflight() == [h]
+    assert im.list_markers()[0]["attempts"] == 0 and im.get_failed(h) is None
 
 
 def test_exhausted_inflight_never_terminalizes_new_pending_work(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     im.write_marker("/tmp", "cbm", "fast")
     h = im.marker_hash("/tmp")
-    im.claim(h)
-    with sqlite3.connect(im.database_path()) as db:
-        db.execute("UPDATE inflight SET attempts=? WHERE hash=?", (im.MAX_ATTEMPTS - 1, h))
+    for _ in range(im.MAX_ATTEMPTS - 1):
+        context = im.claim(h, provider="cbm")["context"]
+        im.restore(context, attempts_inc=True)
+    context = im.claim(h, provider="cbm")["context"]
     im.write_marker("/tmp", "gitnexus", "full")
-
-    assert im.repend_stale_inflight() == [h]
+    assert im.restore(context, attempts_inc=True) == "failed"
     pending = im.list_markers()[0]
-    assert (pending["tools"], pending["mode"], pending["attempts"]) == (
-        "gitnexus",
-        "full",
-        0,
-    )
-    failed = im.get_failed(h)
-    assert (failed["tools"], failed["mode"], failed["attempts"]) == (
-        "cbm",
-        "fast",
-        im.MAX_ATTEMPTS,
-    )
+    assert (pending["tools"], pending["mode"], pending["attempts"]) == ("gitnexus", "full", 0)
+    failed = im.get_failed(h, provider="cbm")
+    assert (failed["tools"], failed["mode"], failed["attempts"]) == ("cbm", "fast", im.MAX_ATTEMPTS)
 
 
 def test_full_escalation_and_backoff_clock(tmp_path, monkeypatch):
@@ -503,8 +518,8 @@ def test_identical_legacy_request_recreated_later_is_not_deduped_away(tmp_path, 
     payload = _queue_payload()
     _legacy(path, payload)
     assert im.list_markers()
-    claim_id = im.claim(h)["claim_id"]
-    im.consume(h, claim_id=claim_id)
+    context = im.claim(h, provider="cbm")["context"]
+    im.consume(context)
     time.sleep(0.001)
     _legacy(path, payload)
     assert len(im.list_markers()) == 1
@@ -521,9 +536,9 @@ def test_migration_never_unlinks_a_concurrently_replaced_legacy_marker(tmp_path,
     original_import = im._import_one
     replaced = False
 
-    def replace_during_import(db, source_path, raw):
+    def replace_during_import(db, source_path, raw, artifact_identity=None):
         nonlocal replaced
-        result = original_import(db, source_path, raw)
+        result = original_import(db, source_path, raw, artifact_identity)
         if source_path.name == path.name and not replaced:
             replaced = True
             _legacy(path, _queue_payload(tools="gitnexus", mode="full"))
@@ -533,8 +548,11 @@ def test_migration_never_unlinks_a_concurrently_replaced_legacy_marker(tmp_path,
     first = im.list_markers()[0]
     assert (first["tools"], first["mode"]) == ("cbm", "fast")
     assert path.exists(), "the replacement written after the claim must survive"
-    second = im.list_markers()[0]
-    assert (second["tools"], second["mode"]) == ("both", "full")
+    second = {row["provider"]: row for row in im.list_markers()}
+    assert {provider: row["mode"] for provider, row in second.items()} == {
+        "cbm": "fast",
+        "gitnexus": "full",
+    }
     assert not path.exists()
 
 
@@ -606,8 +624,8 @@ def test_crash_left_legacy_file_is_not_imported_twice(tmp_path, monkeypatch):
     _legacy(path, payload)
     original_mtime = path.stat().st_mtime_ns
     assert im.list_markers()
-    claim_id = im.claim(h)["claim_id"]
-    im.consume(h, claim_id=claim_id)
+    context = im.claim(h, provider="cbm")["context"]
+    im.consume(context)
     # Recreate the exact inode metadata shape that survives commit-before-unlink.
     _legacy(path, payload)
     os.utime(path, ns=(original_mtime, original_mtime))
@@ -620,23 +638,23 @@ def test_legacy_pending_and_inflight_both_survive_migration(tmp_path, monkeypatc
     h = im.marker_hash("/tmp")
     _legacy(im.marker_dir() / f"{h}.json", _queue_payload(tools="gitnexus"))
     _legacy(im.marker_dir() / f"{h}.inflight.json", _queue_payload(mode="full", claim_id="claim-1"))
-    im.list_markers()
     assert im.list_markers()[0]["tools"] == "gitnexus"
-    assert im.get_inflight(h)["claim_id"] == "claim-1"
-    assert im.restore(h, claim_id="claim-1") == "pending"
-    assert (im.list_markers()[0]["tools"], im.list_markers()[0]["mode"]) == ("both", "full")
+    old = im.get_inflight(h)
+    assert old["claim_id"] == "claim-1" and old["protocol"] == 1
+    assert im.repend_stale_inflight() == [] and im.get_inflight(h) == old
+    assert im.claim(h, provider="gitnexus") is None
 
 
-def test_deployed_legacy_inflight_without_claim_id_is_retried(tmp_path, monkeypatch):
+def test_deployed_legacy_inflight_without_claim_id_is_preserved_unqualified(tmp_path, monkeypatch):
     _home(tmp_path, monkeypatch)
     h = im.marker_hash("/tmp")
     path = im.marker_dir() / f"{h}.inflight.json"
     _legacy(path, _queue_payload(mode="full", attempts=2))
-    assert im.repend_stale_inflight() == [h]
-    row = im.list_markers()[0]
-    assert row["mode"] == "full" and row["attempts"] == 3
-    assert im.get_failed(h) is None
-    assert not path.exists()
+    assert im.repend_stale_inflight() == [] and im.list_markers() == []
+    row = im.get_inflight(h)
+    assert row["mode"] == "full" and row["attempts"] == 2 and row["protocol"] == 1
+    assert row["legacy_unqualified"] == 1 and len(row["claim_id"]) == 32
+    assert im.get_failed(h) is None and not path.exists()
 
 
 def test_legacy_remembered_outcome_attaches_after_inflight(tmp_path, monkeypatch):
@@ -647,8 +665,13 @@ def test_legacy_remembered_outcome_attaches_after_inflight(tmp_path, monkeypatch
         im.outcome_path(h),
         {"version": 1, "claim_id": "claim-1", "action": "consume", "recorded_at": 456.0},
     )
-    assert im.repend_stale_inflight() == []
-    assert im.get_inflight(h) is None and im.list_markers() == []
+    assert im.repend_stale_inflight() == [] and im.list_markers() == []
+    row = im.get_inflight(h)
+    assert (
+        row["protocol"] == 1
+        and row["outcome_action"] == "consume"
+        and row["outcome_recorded_at"] == 456
+    )
 
 
 @pytest.mark.parametrize("payload", ["{truncated", "[]", "{}", '{"requested_at":NaN}'])
@@ -716,25 +739,19 @@ def test_cli_roundtrip_and_cross_process_coalesce(tmp_path):
         ]
         for future in futures:
             future.result(timeout=20)
-    fields = cli("list").stdout.strip().split("\t")
-    assert fields[1:5] == ["/tmp", "both", "full", "0"]
+    rows = [json.loads(line) for line in cli("list-legs").stdout.splitlines()]
+    assert {(row["provider"], row["mode"], row["attempts"]) for row in rows} == {
+        ("cbm", "full", 0),
+        ("gitnexus", "fast", 0),
+    }
     h = cli("hash", "--repo", "/tmp").stdout.strip()
-    claim_id = cli("claim", "--hash", h).stdout.strip().split("\t")[4]
+    for provider in ("cbm", "gitnexus"):
+        context = json.loads(cli("claim", "--hash", h, "--provider", provider).stdout)["context"]
+        encoded = json.dumps(context)
+        assert cli("remember-outcome", "--context", encoded, "--action", "consume").returncode == 0
+        assert cli("apply-outcome", "--context", encoded).stdout.strip() == "consumed"
+        assert cli("claim", "--hash", h, "--provider", provider, check=False).returncode == 1
     assert cli("list").stdout == ""
-    assert (
-        cli(
-            "remember-outcome",
-            "--hash",
-            h,
-            "--action",
-            "consume",
-            "--claim-id",
-            claim_id,
-        ).returncode
-        == 0
-    )
-    assert cli("apply-outcome", "--hash", h).stdout.strip() == "consumed"
-    assert cli("claim", "--hash", h, check=False).returncode == 1
 
 
 def test_cli_enqueue_spools_across_process_boundary_when_database_is_busy(tmp_path):
@@ -762,8 +779,11 @@ def test_cli_enqueue_spools_across_process_boundary_when_database_is_busy(tmp_pa
         blocker.rollback()
         blocker.close()
 
-    fields = cli("list").stdout.strip().split("\t")
-    assert fields[2:4] == ["both", "full"]
+    rows = [json.loads(line) for line in cli("list-legs").stdout.splitlines()]
+    assert {(row["provider"], row["mode"]) for row in rows} == {
+        ("cbm", "fast"),
+        ("gitnexus", "full"),
+    }
     assert not spool.exists()
 
 
@@ -785,19 +805,18 @@ def test_cli_terminal_outcome_spools_across_process_boundary_when_database_is_bu
 
     cli("write", "--repo", "/tmp", "--tools", "cbm", "--mode", "fast")
     h = cli("hash", "--repo", "/tmp").stdout.strip()
-    claim_id = cli("claim", "--hash", h).stdout.strip().split("\t")[4]
+    context = json.loads(cli("claim", "--hash", h, "--provider", "cbm").stdout)["context"]
+    claim_id = context["claim_id"]
     queue_dir = tmp_path / ".genesis" / "index-requests"
     blocker = sqlite3.connect(queue_dir / "queue.sqlite3", isolation_level=None)
     blocker.execute("BEGIN IMMEDIATE")
     try:
         result = cli(
             "remember-outcome",
-            "--hash",
-            h,
+            "--context",
+            json.dumps(context),
             "--action",
             "consume",
-            "--claim-id",
-            claim_id,
         )
         spool = (
             Path(result.stdout.strip())

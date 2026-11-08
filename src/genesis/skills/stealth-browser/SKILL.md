@@ -3,7 +3,7 @@ name: stealth-browser
 description: Anti-detection behaviour for Genesis browser automation - what the Camoufox tools already do, what the agent must still do, Cloudflare Turnstile handling, and per-site notes for bot-hostile sites
 consumer: cc_any
 phase: execution
-keywords: [browser, stealth, camoufox, cloudflare, turnstile, captcha, recaptcha, anti-bot, bot, detection, honeypot, fingerprint, navigate, automation, vnc, click, medium, publish]
+keywords: [browser, stealth, camoufox, cloudflare, turnstile, captcha, recaptcha, anti-bot, honeypot, vnc, click, bot, detection]
 ---
 
 # Stealth Browser

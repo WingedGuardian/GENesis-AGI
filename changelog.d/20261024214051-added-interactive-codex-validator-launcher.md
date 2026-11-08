@@ -1,0 +1,1 @@
+- Add an owner-supervised Codex validator launcher with a dedicated profile, explicit login, trusted-hook and server checks, physical source qualification, and a main-root branch-test mode. Versions differing from its native qualification reference warn while retaining startup checks. It does not install a service or enable unattended validation.

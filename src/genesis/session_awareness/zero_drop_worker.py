@@ -41,6 +41,7 @@ import fcntl
 import json
 import logging
 import os
+import random
 import re
 import tempfile
 import time
@@ -807,6 +808,142 @@ async def _observe_worktrees(
     }
 
 
+async def _retry_on_lock(db, fn, *, label: str):
+    """Run ``fn()`` (one whole write unit) up to 3 times on a SQLite lock error.
+
+    Whole-unit, not per-statement: ``SerializedConnection._retry_locked``
+    retries one statement, which cannot help a unit whose own transaction has
+    to start over. Each unit here (a class reconcile, the blind alert) is safe
+    to run again from the top — the class reconcile rolls itself back on
+    failure, and the alert writes are dedup-keyed and commit per step.
+
+    Returns ``(result, attempts, elapsed_ms, lock_exc)``; ``lock_exc`` is the
+    last lock error when every attempt lost, else None. A non-lock error
+    propagates at once, exactly as it did before this helper existed. Every
+    lost attempt is logged WITH its SQLite error name and timing, so a retry
+    that eventually succeeds still leaves the evidence of contention: without
+    that, "no failures" after deploy would be indistinguishable from "no
+    contention", and the fix's own falsifier could never fire.
+    """
+    # Private names, imported deliberately: the delays and jitter are the
+    # tuned values the connection layer documents for exactly this convoy
+    # case, `_async_sleep` is its declared test seam, and `_is_lock_error` is
+    # the one lock predicate. Copying them would let the two drift.
+    from genesis.db import connection as dbconn
+
+    delays = dbconn._WRITE_RETRY_DELAYS[:2]
+    started = time.monotonic()
+    last: Exception | None = None
+    for attempt in range(1, len(delays) + 2):
+        try:
+            result = await fn()
+            return result, attempt, round((time.monotonic() - started) * 1000), None
+        except Exception as exc:
+            if not dbconn._is_lock_error(exc):
+                raise
+            last = exc
+            elapsed_ms = round((time.monotonic() - started) * 1000)
+            logger.warning(
+                "zero_drop %s lost the DB lock (attempt %d/%d, %s, %d ms since start)",
+                label,
+                attempt,
+                len(delays) + 1,
+                getattr(exc, "sqlite_errorname", None) or "no error name",
+                elapsed_ms,
+            )
+            if db.in_transaction:
+                # A statement that loses the lock still leaves Python's implicit
+                # BEGIN open (MEASURED: `in_transaction` is True after a failed
+                # INSERT), and every unit here commits per step, so what is
+                # pending is only the failed unit's own work. Discard it before
+                # trying again; if even that fails, another attempt would nest
+                # inside the leftovers, so stop and let the caller see the
+                # state (`in_transaction` stays True).
+                try:
+                    await db.rollback()
+                except Exception:
+                    logger.error(
+                        "zero_drop %s: rollback after a lost lock failed", label, exc_info=True
+                    )
+                    break
+            if attempt <= len(delays):
+                await dbconn._async_sleep(
+                    delays[attempt - 1] * random.uniform(dbconn._JITTER_LOW, dbconn._JITTER_HIGH)
+                )
+    return None, attempt, round((time.monotonic() - started) * 1000), last
+
+
+async def _lock_holder_evidence(db_path: Path | str, context: dict) -> dict:
+    """Who held the writer slot when a unit gave up: written to the shared
+    lock-holder snapshot directory (``db/lock_holders.py``, self-pruning),
+    returned as ``{"snapshot", "writer_pids"}``. Never raises: losing the
+    evidence must not lose the run that went looking for it."""
+    from genesis.db import lock_holders
+
+    if os.environ.get(lock_holders.DISABLE_ENV) == "1":
+        return {"snapshot": "not captured (disabled)", "writer_pids": []}
+    target = lock_holders.snapshot_path()
+    try:
+        snapshot = await asyncio.to_thread(
+            lock_holders.capture_and_write, target, Path(db_path), context
+        )
+    except Exception:
+        logger.warning("zero_drop lock-holder snapshot failed", exc_info=True)
+        return {"snapshot": "not captured (failed)", "writer_pids": []}
+    return {"snapshot": str(target), "writer_pids": snapshot.get("writer_pids", [])}
+
+
+async def _record_lock_giveup(
+    db_path: Path | str | None,
+    *,
+    label: str,
+    exc: Exception,
+    attempts: int,
+    elapsed_ms: int,
+    sink: dict | None,
+) -> str:
+    """A write unit gave up on the lock: say who held it, everywhere it is read.
+
+    The holders go to the log and to ``sink`` (the run record's
+    ``lock_evidence``), never into a ``degraded`` string: that string feeds the
+    blindness alert's text and dedup hash, and a holder set that changes
+    between runs would re-mint the alert for a fault that has not changed.
+    Returns the SQLite error name for the caller's own message.
+    """
+    errname = getattr(exc, "sqlite_errorname", None) or "no error name"
+    if db_path is None:
+        evidence = {"snapshot": "not captured (no database path)", "writer_pids": []}
+    else:
+        evidence = await _lock_holder_evidence(
+            db_path,
+            {
+                "source": "zero_drop_worker",
+                "unit": label,
+                "error": errname,
+                "attempts": attempts,
+                "elapsed_ms": elapsed_ms,
+            },
+        )
+    logger.warning(
+        "zero_drop %s gave up on the DB lock: %s after %d attempts, %d ms; "
+        "writer_pids=%s; lock-holder snapshot: %s",
+        label,
+        errname,
+        attempts,
+        elapsed_ms,
+        evidence["writer_pids"],
+        evidence["snapshot"],
+    )
+    if sink is not None:
+        sink[label] = {
+            "error": errname,
+            "attempts": attempts,
+            "elapsed_ms": elapsed_ms,
+            **evidence,
+        }
+    return errname
+
+
 async def _emit_heartbeat(db, *, detail: str) -> None:
     """Durable liveness pulse so a DEAD detector is visible as dead.
 
@@ -833,6 +970,51 @@ async def _emit_heartbeat(db, *, detail: str) -> None:
         # A missing pulse degrades the health surface, never the sweep — but a
         # silent one turns "the detector died" into "the detector is fine".
         logger.warning("zero_drop heartbeat write failed", exc_info=True)
+
+
+#: Every source whose open alert row describes a condition that persists until
+#: the detector reads it gone. The morning report keeps counting these toward
+#: Standing Items while they stay open (``confirm_delivery``).
+PERSISTENT_ALERT_SOURCES = (ALERT_SOURCE, BLIND_SOURCE)
+
+
+async def _keep_surfacing(
+    db, *, source: str, created: str | None, content_hash: str, content: str, priority: str
+) -> None:
+    """Keep the alert's morning-report history across sweeps.
+
+    Each alert is replaced by a NEW row whenever its text changes, and the
+    report surfaces a row once. Without the carry, the replacement starts at
+    count 0 with no ``surfaced_at``: it is shown as new again, and a fault that
+    lasts weeks never reaches Standing Items. Called after the create and
+    before the supersede, while the predecessor is still open. A critical row
+    carries the count only, so a changed critical state still reaches the
+    pager (``get_unsurfaced``).
+
+    A dedup-skipped create (``created`` is None) re-confirmed the open row, so
+    its TTL restarts and its text is rewritten to ``content`` (the blind
+    alert's hash ignores digits, so its counts would otherwise stay as first
+    written): a row that stays open while the fault persists is what
+    lets the carry trust only OPEN predecessors. Both are logged on failure and
+    never stop the supersede.
+    """
+    from genesis.db.crud import observations
+
+    try:
+        if created:
+            await observations.carry_surfacing(
+                db,
+                source=source,
+                type=ALERT_TYPE,
+                to_id=created,
+                carry_surfaced_at=priority != "critical",
+            )
+        else:
+            await observations.refresh_open_expiry(
+                db, source=source, type=ALERT_TYPE, content_hash=content_hash, content=content
+            )
+    except Exception:
+        logger.warning("zero_drop surfacing carry-over failed (%s)", source, exc_info=True)
 
 
 async def _maintain_alert(db, *, cfg: dict, findings: list[dict], total: int, coverage: str) -> str:
@@ -926,6 +1108,14 @@ async def _maintain_alert(db, *, cfg: dict, findings: list[dict], total: int, co
             content_hash=content_hash,
             skip_if_duplicate=True,
         )
+        await _keep_surfacing(
+            db,
+            source=ALERT_SOURCE,
+            created=created,
+            content_hash=content_hash,
+            content=content,
+            priority=alert_priority(cfg),
+        )
         await observations.supersede_except_hash(
             db,
             source=ALERT_SOURCE,
@@ -940,7 +1130,14 @@ async def _maintain_alert(db, *, cfg: dict, findings: list[dict], total: int, co
     return "created" if created else "unchanged"
 
 
-async def _maintain_blind_alert(db, *, degraded: dict, frozen: list[str]) -> str:
+async def _maintain_blind_alert(
+    db,
+    *,
+    degraded: dict,
+    frozen: list[str],
+    db_path: Path | str | None = None,
+    lock_evidence: dict | None = None,
+) -> str:
     """Announce a BLIND detector — separately from what it found.
 
     This is the failure the rest of the design guards against arriving through
@@ -963,7 +1160,8 @@ async def _maintain_blind_alert(db, *, degraded: dict, frozen: list[str]) -> str
 
     now_iso = _now()
     if not degraded:
-        try:
+
+        async def _resolve():
             await observations.resolve_by_source_and_type(
                 db,
                 source=BLIND_SOURCE,
@@ -971,8 +1169,27 @@ async def _maintain_blind_alert(db, *, degraded: dict, frozen: list[str]) -> str
                 resolved_at=now_iso,
                 resolution_notes="all zero-drop legs are reading again",
             )
+
+        # NOT the class reconcile's failure: these are single-statement writes,
+        # which DO wait out busy_timeout, so a lock lost here means a writer
+        # held the slot past it (9 measured `alert_failed` runs; in 6 the
+        # heartbeat also lost the lock seconds later). The retry is for that,
+        # and a give-up records who held it — on this path the holder is the
+        # whole answer. A non-lock failure is reported exactly as before.
+        try:
+            _r, n, ms, lock_exc = await _retry_on_lock(db, _resolve, label="blind-alert resolve")
         except Exception:
             logger.warning("zero_drop blind-alert resolve failed", exc_info=True)
+            return "resolve_failed"
+        if lock_exc is not None:
+            await _record_lock_giveup(
+                db_path,
+                label="blind-alert resolve",
+                exc=lock_exc,
+                attempts=n,
+                elapsed_ms=ms,
+                sink=lock_evidence,
+            )
             return "resolve_failed"
         return "resolved"
 
@@ -1023,17 +1240,27 @@ async def _maintain_blind_alert(db, *, degraded: dict, frozen: list[str]) -> str
     # would therefore mint a fresh high-priority row every sweep for a fault
     # that had not changed, which forfeits the dedup this hash exists to
     # provide. What it costs: a fault whose SCALE changes but whose words do
-    # not (1 unreadable -> 47) no longer supersedes, so the open row keeps the
-    # older count. That is the acceptable half — this row is the ALARM ("the
-    # detector is blind on X"), while the live counts are in the run record and
-    # are re-rendered by `zero_drop_status` on every sweep.
+    # not (1 unreadable -> 47) no longer supersedes. The open row's text is
+    # rewritten in place on that sweep instead (`_keep_surfacing`), so it shows
+    # the current numbers while keeping its row and its report history; the
+    # live counts are also in the run record, re-rendered by `zero_drop_status`.
+    # In the morning report's Standing Items such a rewrite still reads
+    # [unchanged]: change is judged by row identity, not digits, the same
+    # trade this hash makes.
     _identity = re.sub(
         r"\d+",
         "#",
         f"{content}\n{json.dumps(degraded, default=str, sort_keys=True)}",
     )
     content_hash = hashlib.sha256(f"zero_drop_blind:{_identity}".encode()).hexdigest()
-    try:
+    # The row an EARLIER attempt created, if any. Each step below commits on
+    # its own, so a lock lost after the create leaves the row in place; the
+    # retry's create then dedups to None, and without this it would report
+    # "unchanged" and skip the surfacing carry-over the new row still needs
+    # (carry_surfacing is idempotent, so running it again is safe).
+    first_created: dict[str, str | None] = {"id": None}
+
+    async def _write():
         created = await observations.create(
             db,
             id=str(uuid.uuid4()),
@@ -1045,6 +1272,15 @@ async def _maintain_blind_alert(db, *, degraded: dict, frozen: list[str]) -> str
             content_hash=content_hash,
             skip_if_duplicate=True,
         )
+        first_created["id"] = first_created["id"] or created
+        await _keep_surfacing(
+            db,
+            source=BLIND_SOURCE,
+            created=first_created["id"],
+            content_hash=content_hash,
+            content=content,
+            priority="high",
+        )
         await observations.supersede_except_hash(
             db,
             source=BLIND_SOURCE,
@@ -1053,10 +1289,23 @@ async def _maintain_blind_alert(db, *, degraded: dict, frozen: list[str]) -> str
             resolved_at=now_iso,
             resolution_notes="superseded by a new zero-drop blindness state",
         )
+
+    try:
+        _r, n, ms, lock_exc = await _retry_on_lock(db, _write, label="blind-alert write")
     except Exception:
         logger.warning("zero_drop blind-alert write failed", exc_info=True)
         return "alert_failed"
-    return "created" if created else "unchanged"
+    if lock_exc is not None:
+        await _record_lock_giveup(
+            db_path,
+            label="blind-alert write",
+            exc=lock_exc,
+            attempts=n,
+            elapsed_ms=ms,
+            sink=lock_evidence,
+        )
+        return "alert_failed"
+    return "created" if first_created["id"] else "unchanged"
 
 
 async def run_zero_drop_worker(
@@ -1396,6 +1645,9 @@ async def _run_locked(
     # ── Reconcile only the classes whose sweep COMPLETED ─────────────────────
     escalation_k = knob_int(cfg, "escalation_k")
     applied: dict[str, dict] = {}
+    # {unit: {error, attempts, elapsed_ms, snapshot, writer_pids}} for every
+    # write unit that gave up on the DB lock this run.
+    lock_evidence: dict[str, dict] = {}
     counts: dict[str, int] = {}
     alert_state = "skipped"
     blind_state = "skipped"
@@ -1410,15 +1662,42 @@ async def _run_locked(
         the only symptom was an overdue pulse two days later.
         """
         try:
-            applied[cls] = await zd_crud.apply_sweep(
+            result, attempts, elapsed_ms, lock_exc = await _retry_on_lock(
                 db,
-                class_=cls,
-                present=present,
-                run_id=run_id,
-                now=now_iso,
-                escalation_k=escalation_k,
-                held=held,
+                lambda: zd_crud.apply_sweep(
+                    db,
+                    class_=cls,
+                    present=present,
+                    run_id=run_id,
+                    now=now_iso,
+                    escalation_k=escalation_k,
+                    held=held,
+                ),
+                label=f"reconcile of {cls}",
             )
+            if lock_exc is not None:
+                await _record_lock_giveup(
+                    db_path,
+                    label=f"reconcile of {cls}",
+                    exc=lock_exc,
+                    attempts=attempts,
+                    elapsed_ms=elapsed_ms,
+                    sink=lock_evidence,
+                )
+                # No SQLite error name here: this text is the blindness alert's
+                # identity, and the name can flip between BUSY and BUSY_SNAPSHOT
+                # for one unchanged fault (digits are quantised out of the hash,
+                # words are not). The name lives in `lock_evidence` and the log;
+                # the elapsed time is what tells an instant loss from a long
+                # holder anyway.
+                degraded[cls] = (
+                    f"reconcile failed after {attempts} attempts, {elapsed_ms} ms: "
+                    f"{type(lock_exc).__name__}: {lock_exc}"
+                )[:200]
+                return
+            applied[cls] = result
+            if attempts > 1:
+                applied[cls]["lock_retries"] = attempts - 1
             if applied[cls].get("duplicate_identities"):
                 # Two entries for one identity in a single sweep is bug-shaped,
                 # not routine — the store survives it, but a count that lands
@@ -1432,12 +1711,34 @@ async def _run_locked(
             logger.warning("zero_drop reconcile failed for class %s", cls, exc_info=True)
             degraded[cls] = f"reconcile failed: {type(exc).__name__}: {exc}"[:200]
 
-    async with get_raw_db(str(db_path)) as db:
+    async with contextlib.AsyncExitStack() as stack:
+        db = await stack.enter_async_context(get_raw_db(str(db_path)))
+        units: list[tuple[str, list[dict], set[str]]] = []
         if branch_findings is not None:
-            for cls in BRANCH_CLASSES:
-                await _apply(db, cls, branch_findings[cls], branch_held)
+            units += [(cls, branch_findings[cls], branch_held) for cls in BRANCH_CLASSES]
         if dirty_findings is not None:
-            await _apply(db, CLASS_DIRTY, dirty_findings, dirty_held)
+            units.append((CLASS_DIRTY, dirty_findings, dirty_held))
+        for i, (cls, present, held) in enumerate(units):
+            await _apply(db, cls, present, held)
+            if db.in_transaction:
+                # A class failed AND could not roll itself back, so this
+                # connection still carries its half-finished rows. Every later
+                # write here — the next class, the alerts, the heartbeat —
+                # would commit them while the run record reports the class as
+                # not applied. Closing discards them; the tail of the run gets
+                # a fresh connection, and the classes not yet reconciled are
+                # skipped rather than run on it, so the failure stays one
+                # run's worth of FROZEN classes, reported as such.
+                logger.error(
+                    "zero_drop: the connection is unusable after class %s; "
+                    "discarding it and skipping the remaining classes",
+                    cls,
+                )
+                for later, _present, _held in units[i + 1 :]:
+                    degraded[later] = "skipped: the connection was unusable after a failed rollback"
+                await db.close()
+                db = await stack.enter_async_context(get_raw_db(str(db_path)))
+                break
 
         # These are REPORTING reads, and they run after the sweep has already
         # committed. Letting one raise would throw away the run record, the
@@ -1479,7 +1780,9 @@ async def _run_locked(
                 degraded["alert"] = alert_state
         # Blindness is reported in EVERY running mode: the lever governs egress
         # about findings, and a broken instrument is not a finding.
-        blind_state = await _maintain_blind_alert(db, degraded=degraded, frozen=frozen)
+        blind_state = await _maintain_blind_alert(
+            db, degraded=degraded, frozen=frozen, db_path=db_path, lock_evidence=lock_evidence
+        )
         if blind_state in ("alert_failed", "resolve_failed"):
             # The other half of the pair above, and it was missing. A failed
             # RESOLVE is the worse direction: the detector has recovered, the
@@ -1489,6 +1792,13 @@ async def _run_locked(
             # contradiction is visible instead of being split across two
             # surfaces that disagree (Codex P2, PR #1794).
             degraded["blind_alert"] = blind_state
+        if db.in_transaction:
+            # An alert write lost the lock and its rollback failed too. Every
+            # alert step commits on its own, so what is pending is that failed
+            # write; the heartbeat's commit below must not flush it.
+            logger.error("zero_drop: connection unusable after the alerts; reopening")
+            await db.close()
+            db = await stack.enter_async_context(get_raw_db(str(db_path)))
         await _emit_heartbeat(
             db,
             detail=(
@@ -1524,6 +1834,9 @@ async def _run_locked(
         "frozen_classes": frozen,
         "alert": alert_state,
         "blind_alert": blind_state,
+        # Who held the DB writer slot when a unit gave up on it. Kept OUT of
+        # `degraded`, whose text feeds the blindness alert's dedup hash.
+        "lock_evidence": lock_evidence,
     }
     _atomic_write_json(last_run_path(), record)
     return {

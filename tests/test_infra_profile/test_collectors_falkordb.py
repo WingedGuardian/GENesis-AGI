@@ -169,6 +169,63 @@ def test_a_version_dir_without_a_module_is_not_installed(tmp_path):
     assert _installed_versions(deps) == ["4.20.4"]
 
 
+_TAG = "0.11.0-cp312-cp312-manylinux_2_38_x86_64"
+
+
+def _copy_dir(deps: Path, name: str = _TAG) -> Path:
+    """An engine copy the way provisioning lays it out: the wheel's two dirs."""
+    module = deps / name / "redislite" / "bin" / "falkordb.so"
+    module.parent.mkdir(parents=True)
+    (deps / name / "falkordblite.libs").mkdir()
+    module.write_bytes(b"module")
+    return module
+
+
+def test_the_wheel_copy_layout_counts_as_installed(monkeypatch, tmp_path):
+    """The unit runs the copy under deps/falkordb/<version>-<wheel tag>/."""
+    _copy_dir(tmp_path / ".genesis" / "deps" / "falkordb")
+    result = _run(monkeypatch, tmp_path)
+    assert result.facts["module_installed"] is True
+    assert result.facts["module_versions"] == [_TAG]
+
+
+def test_a_copy_without_its_module_is_not_installed(tmp_path):
+    deps = tmp_path / "deps"
+    (deps / _TAG / "redislite" / "bin").mkdir(parents=True)
+    assert _installed_versions(deps) == []
+
+
+def test_legacy_and_copy_dirs_are_both_listed_sorted(tmp_path):
+    """A pin bump under a running engine leaves the old dir the unit still
+    loads beside the new one; both are on disk, so both are reported."""
+    deps = tmp_path / "deps"
+    (deps / "4.20.4").mkdir(parents=True)
+    (deps / "4.20.4" / "falkordb.so").write_bytes(b"x")
+    _copy_dir(deps)
+    _copy_dir(deps, "0.12.0-cp312-cp312-manylinux_2_38_x86_64")
+    assert _installed_versions(deps) == [
+        "0.11.0-cp312-cp312-manylinux_2_38_x86_64",
+        "0.12.0-cp312-cp312-manylinux_2_38_x86_64",
+        "4.20.4",
+    ]
+
+
+def test_a_copy_still_being_built_or_retired_is_not_listed(tmp_path):
+    """A crash mid-copy leaves ``.<name>.tmp-<pid>``; a replacement in flight
+    leaves ``.<name>.stale-<pid>``. Neither is an engine any unit runs."""
+    deps = tmp_path / "deps"
+    _copy_dir(deps, f".{_TAG}.tmp-123")
+    _copy_dir(deps, f".{_TAG}.stale-456")
+    assert _installed_versions(deps) == []
+
+
+def test_a_file_named_like_an_engine_dir_is_not_listed(tmp_path):
+    deps = tmp_path / "deps"
+    deps.mkdir()
+    (deps / _TAG).write_bytes(b"not a dir")
+    assert _installed_versions(deps) == []
+
+
 def test_missing_deps_root_is_empty_not_an_error(tmp_path):
     assert _installed_versions(tmp_path / "nope") == []
 

@@ -1114,7 +1114,7 @@ class TestCallerWiring:
     def test_the_state_predicates_are_the_single_definition(self) -> None:
         """No reader may hand-list good states again (that is how `defaults` was
         nearly missed); the predicates own the meaning."""
-        for script in ("bootstrap.sh", "install.sh", "update.sh"):
+        for script in ("bootstrap.sh", "install.sh", "update.sh", "lib/update_rollback.sh"):
             src = (_REPO_ROOT / "scripts" / script).read_text()
             assert "ok|defaults|repaired" not in src and "ok|repaired" not in src, script
             assert '!= "ok"' not in src, script

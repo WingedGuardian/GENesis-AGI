@@ -49,6 +49,9 @@ class QueueOperations:
     record_outcome: Callable
     valid_number: Callable
     outcomes: tuple[str, ...]
+    parse_event: Callable
+    record_failed: Callable
+    record_claim: Callable
 
 
 def upgrade_receipts(db: sqlite3.Connection) -> None:
@@ -128,13 +131,14 @@ def _claim_files(paths: list[Path], directory: Path, sync: Callable) -> list[tup
     return claimed
 
 
-def _lock(directory: Path, wait_s: float):
+def _lock(directory: Path, wait_s: float, *, shared: bool = False):
     lock = (directory / ".queue.lock").open("a")
     deadline = time.monotonic() + wait_s
     try:
         while True:
             try:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                operation = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+                fcntl.flock(lock.fileno(), operation | fcntl.LOCK_NB)
                 return lock
             except OSError as exc:
                 if exc.errno not in (errno.EACCES, errno.EAGAIN):
@@ -150,9 +154,16 @@ def _lock(directory: Path, wait_s: float):
         raise
 
 
-def _decode(raw: bytes):
+def _unique_fields(pairs):
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise LegacyArtifactInvalid("duplicate-json-field")
+    return result
+
+
+def _decode(raw: bytes, *, strict=False):
     try:
-        return json.loads(raw)
+        return json.loads(raw, object_pairs_hook=_unique_fields if strict else None)
     except (UnicodeError, ValueError, RecursionError) as exc:
         raise LegacyArtifactInvalid("invalid-json") from exc
 
@@ -164,22 +175,51 @@ def _text(value: str) -> None:
         raise LegacyArtifactInvalid("invalid-text-encoding") from exc
 
 
-def _queue_data(raw: bytes, ops: QueueOperations) -> dict:
-    data = ops.normalize(_decode(raw))
+def _queue_data(raw: bytes, ops: QueueOperations, *, allow_current=False) -> tuple[dict, bool]:
+    value = _decode(raw)
+    legacy = True
+    if isinstance(value, dict) and "repo_path" not in value and "request" in value:
+        value = _decode(raw, strict=True)
+        if (
+            not allow_current
+            or set(value) != {"version", "kind", "request"}
+            or type(value["version"]) is not int
+            or value["version"] != 2
+            or value["kind"] != "enqueue"
+            or not isinstance(value["request"], dict)
+            or set(value["request"]) != {"repo_path", "tools", "mode", "requested_at", "attempts"}
+        ):
+            raise LegacyArtifactInvalid("invalid-enqueue-envelope")
+        value, legacy = value["request"], False
+    data = ops.normalize(value)
     if data is None:
         raise LegacyArtifactInvalid("invalid-queue-fields")
     _text(data["repo_path"])
     if "\0" in data["repo_path"]:
         raise LegacyArtifactInvalid("invalid-repo-path")
-    return data
+    return data, legacy
 
 
 def _import_outcome(db, h: str, raw: bytes, ops: QueueOperations, filename_claim=None):
     data = _decode(raw)
+    if isinstance(data, dict) and type(data.get("version")) is int and data["version"] == 2:
+        try:
+            event = ops.parse_event(_decode(raw, strict=True))
+        except (ValueError, UnicodeError, OverflowError) as exc:
+            raise LegacyArtifactInvalid("invalid-outcome-fields") from exc
+        if event["hash"] != h or (
+            filename_claim is not None and filename_claim != event["claim_id"]
+        ):
+            raise LegacyArtifactInvalid("outcome-context-mismatch")
+        state = ops.record_outcome(db, event, raw)
+        if state == "unowned":
+            raise LegacyArtifactInvalid("unowned-outcome")
+        return
     if (
         not _HASH.fullmatch(h)
         or not isinstance(data, dict)
-        or data.get("version") != 1
+        or type(data.get("version")) is not int
+        or data["version"] != 1
         or data.get("action") not in ops.outcomes
         or not isinstance(data.get("claim_id"), str)
         or not ops.valid_number(data.get("recorded_at"))
@@ -187,14 +227,21 @@ def _import_outcome(db, h: str, raw: bytes, ops: QueueOperations, filename_claim
     ):
         raise LegacyArtifactInvalid("invalid-outcome-fields")
     _text(data["claim_id"])
-    state = ops.record_outcome(
-        db, h, data["claim_id"], data["action"], float(data["recorded_at"]), raw
+    event = dict(
+        version=1,
+        hash=h,
+        claim_id=data["claim_id"],
+        action=data["action"],
+        recorded_at=float(data["recorded_at"]),
     )
+    state = ops.record_outcome(db, event, raw)
     if state == "unowned":
         raise LegacyArtifactInvalid("unowned-outcome")
 
 
-def import_one(db: sqlite3.Connection, path: Path, raw: bytes, ops: QueueOperations) -> None:
+def import_one(
+    db: sqlite3.Connection, path: Path, raw: bytes, ops: QueueOperations, *, artifact_identity=None
+) -> None:
     name = path.name
     outcome = _OUTCOME.fullmatch(name)
     if outcome:
@@ -202,14 +249,14 @@ def import_one(db: sqlite3.Connection, path: Path, raw: bytes, ops: QueueOperati
         return
     spool = _SPOOL.fullmatch(name)
     if spool:
-        data = _queue_data(raw, ops)
+        data, legacy = _queue_data(raw, ops, allow_current=True)
         try:
             h = ops.hash_repo(data["repo_path"])
         except (UnicodeError, ValueError, OverflowError) as exc:
             raise LegacyArtifactInvalid("invalid-repo-path") from exc
         if h != spool["hash"]:
             raise LegacyArtifactInvalid("enqueue-hash-mismatch")
-        ops.coalesce(db, h, data)
+        ops.coalesce(db, h, data, legacy=legacy)
         return
     for prefix, column in ((".last-full-", "last_full"), (".full-backoff-", "full_backoff")):
         if name.startswith(prefix):
@@ -241,47 +288,26 @@ def import_one(db: sqlite3.Connection, path: Path, raw: bytes, ops: QueueOperati
     if suffix is None or not _HASH.fullmatch(name[: -len(suffix)]):
         raise LegacyArtifactInvalid("invalid-source-name")
     h = name[: -len(suffix)]
-    data = _queue_data(raw, ops)
+    data, _ = _queue_data(raw, ops)
     if suffix == ".failed.json":
-        db.execute(
-            "INSERT INTO failed(hash,repo_path,tools,mode,requested_at,attempts,reason,raw_payload,failed_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(hash) DO UPDATE SET repo_path=excluded.repo_path,"
-            "tools=excluded.tools,mode=excluded.mode,requested_at=excluded.requested_at,"
-            "attempts=excluded.attempts,reason=excluded.reason,raw_payload=excluded.raw_payload,"
-            "failed_at=excluded.failed_at",
-            (
-                h,
-                data["repo_path"],
-                data["tools"],
-                data["mode"],
-                data["requested_at"],
-                data["attempts"],
-                "legacy terminal failure",
-                raw,
-                time.time(),
-            ),
-        )
+        failed = {
+            **data,
+            "reason": "legacy terminal failure",
+            "raw_payload": raw,
+            "failed_at": time.time(),
+        }
+        ops.record_failed(db, h, failed, raw, artifact_identity)
     elif suffix == ".inflight.json":
-        claim = data.get("claim_id")
-        if not isinstance(claim, str) or not claim:
-            claim = secrets.token_hex(16)
-        _text(claim)
-        if not db.execute("SELECT 1 FROM inflight WHERE hash=?", (h,)).fetchone():
-            db.execute(
-                "INSERT INTO inflight(hash,repo_path,tools,mode,requested_at,attempts,claim_id) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (
-                    h,
-                    data["repo_path"],
-                    data["tools"],
-                    data["mode"],
-                    data["requested_at"],
-                    data["attempts"],
-                    claim,
-                ),
-            )
+        if isinstance(data.get("claim_id"), str):
+            _text(data["claim_id"])
+        action, recorded = data.get("outcome_action"), data.get("outcome_recorded_at")
+        if (action is None) != (recorded is None) or (
+            action is not None and (action not in ops.outcomes or not ops.valid_number(recorded))
+        ):
+            raise LegacyArtifactInvalid("invalid-legacy-outcome-fields")
+        ops.record_claim(db, h, data, raw, artifact_identity)
     else:
-        ops.coalesce(db, h, data)
+        ops.coalesce(db, h, data, legacy=True)
 
 
 def _stage_artifact(db, source: Path, raw: bytes, mtime: int, import_one: Callable) -> None:
@@ -292,9 +318,9 @@ def _stage_artifact(db, source: Path, raw: bytes, mtime: int, import_one: Callab
     ).fetchone():
         return
     db.execute("SAVEPOINT legacy_artifact")
-    disposition, reason, rejected = "imported", "ok", None
+    disposition, reason, rejected = "imported", "ok", raw
     try:
-        import_one(db, source, raw)
+        import_one(db, source, raw, identity)
     except LegacyArtifactInvalid as exc:
         db.execute("ROLLBACK TO legacy_artifact")
         disposition, reason, rejected = "quarantined", str(exc), raw
@@ -305,35 +331,46 @@ def _stage_artifact(db, source: Path, raw: bytes, mtime: int, import_one: Callab
     db.execute("RELEASE legacy_artifact")
 
 
+def drain(directory: Path, db, import_one: Callable, sync: Callable) -> list[Path]:
+    """Import under the caller's exclusive publication lock and transaction."""
+    paths = _claim_files(legacy_files(directory), directory, sync)
+    paths.sort(
+        key=lambda item: bool(
+            item[1].name.startswith(".outcome-") or _OUTCOME.fullmatch(item[1].name)
+        )
+    )
+    imported = []
+    for owned, source in paths:
+        try:
+            raw = owned.read_bytes()
+            mtime = owned.stat().st_mtime_ns
+        except FileNotFoundError:
+            continue
+        _stage_artifact(db, source, raw, mtime, import_one)
+        imported.append(owned)
+    return imported
+
+
+def retire(directory: Path, imported: list[Path], sync: Callable) -> None:
+    """Only call after the representing transaction commits, still locked."""
+    for owned in imported:
+        owned.unlink(missing_ok=True)
+    if imported:
+        sync(directory)
+
+
 def migrate(
     directory: Path, write_db: Callable, import_one: Callable, sync: Callable, *, wait_s: float
 ):
     if not legacy_files(directory):
         return
     with _lock(directory, wait_s):
-        paths = _claim_files(legacy_files(directory), directory, sync)
-        paths.sort(
-            key=lambda item: bool(
-                item[1].name.startswith(".outcome-") or _OUTCOME.fullmatch(item[1].name)
-            )
-        )
-        imported = []
         with write_db() as db:
-            for owned, source in paths:
-                try:
-                    raw = owned.read_bytes()
-                    mtime = owned.stat().st_mtime_ns
-                except FileNotFoundError:
-                    continue
-                _stage_artifact(db, source, raw, mtime, import_one)
-                imported.append(owned)
-        for owned in imported:
-            owned.unlink(missing_ok=True)
-        if imported:
-            sync(directory)
+            imported = drain(directory, db, import_one, sync)
+        retire(directory, imported, sync)
 
 
-def import_status(database: Path, *, limit: int) -> dict:
+def import_status(database: Path, *, limit: int, protocol_only=False, observe=None, schema_check=None) -> dict:
     """Observe this rollback-journal queue without initialization or migration."""
     if limit < 0:
         raise ValueError("limit must be nonnegative")
@@ -341,6 +378,10 @@ def import_status(database: Path, *, limit: int) -> dict:
         with database.open("rb") as stream:
             header = stream.read(100)
     except FileNotFoundError:
+        return {"state": "absent", "receipts_available": False}
+    if not header:
+        # An empty file is a queue no writer has initialized yet (for example a
+        # creation deferred during an update); it holds no state.
         return {"state": "absent", "receipts_available": False}
     # WAL readers can create sidecars even with mode=ro. This queue is pinned
     # to DELETE; reject other headers before SQLite opens them. This is an
@@ -358,8 +399,33 @@ def import_status(database: Path, *, limit: int) -> dict:
                 "schema_version": version,
                 "receipts_available": False,
             }
-        if version != 2:
+        if version == 5 and schema_check is not None:
+            schema_check(db)
+        elif version not in (2, 3, 4):
             raise RuntimeError(f"unsupported queue schema {version}")
+        if observe is not None:
+            if version not in (4, 5):
+                return {"state": "protocol-incomplete", "schema_version": version,
+                        "execution_available": False}
+            db.row_factory = sqlite3.Row
+            return observe(db)
+        if protocol_only:
+            if version == 2:
+                return {
+                    "state": "legacy-schema",
+                    "schema_version": version,
+                    "automatic_protocol_ready": 0,
+                }
+            row = db.execute(
+                "SELECT value FROM queue_meta WHERE key='automatic_protocol_ready'"
+            ).fetchone()
+            if row is None or row[0] != "0":
+                raise RuntimeError("unsupported automatic queue protocol")
+            return {
+                "state": "protocol-incomplete",
+                "schema_version": version,
+                "automatic_protocol_ready": 0,
+            }
         counts = dict(
             db.execute("SELECT disposition,count(*) FROM legacy_imports GROUP BY disposition")
         )

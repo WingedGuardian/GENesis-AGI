@@ -1,0 +1,1 @@
+- Publish optional run/attempt-bound collected-test review evidence for pull requests, preserving the existing collected-floor verdict and raw artifact.

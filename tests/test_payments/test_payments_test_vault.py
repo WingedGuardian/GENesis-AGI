@@ -24,6 +24,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -138,7 +139,12 @@ def _setup(tmp: Path, checkouts, merchant: str = MERCHANT):
 @pytest.fixture(scope="module")
 def built(tmp_path_factory, checkouts):
     tmp = tmp_path_factory.mktemp("built")
-    layout, state = _setup(tmp, checkouts)
+    # Module scope runs before the autouse function-scoped _isolate_trash_root, and
+    # check_trashable needs the trash on this directory's volume, which the real
+    # one is not when the test temp is its own filesystem (a separate /tmp).
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("genesis.trash.home_trash_root", lambda: tmp / "genesis-trash")
+        layout, state = _setup(tmp, checkouts)
     yield layout, state
     Path(state["overlay"]).unlink(missing_ok=True)
 
@@ -219,6 +225,29 @@ def _test_root(tmp_path: Path) -> H.Layout:
     return layout
 
 
+# An AF_UNIX path holds at most 107 bytes on Linux. pytest's per-test tmp_path
+# embeds the test's name, and pytest-xdist adds a `popen-gwN` segment: the
+# listener test's socket came to 111 bytes in a parallel CI run (101 serial).
+# Tests that BIND a socket therefore root it in a short directory of their own.
+_SUN_PATH_MAX = 107
+
+
+@pytest.fixture()
+def short_dir():
+    path = Path(tempfile.mkdtemp(prefix="pv", dir="/tmp"))
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def test_a_socket_rooted_in_short_dir_fits_with_room(short_dir):
+    # Room for the deepest socket these tests bind. short_dir carries no test
+    # name or worker id, so this length does not grow with either.
+    deepest = _test_root(short_dir).socket
+    assert len(str(deepest).encode()) <= _SUN_PATH_MAX - 40
+
+
 def test_r3_a_run_dir_linked_to_a_live_run_dir_is_refused(tmp_path):
     live_run = tmp_path / "op" / ".genesis" / "run"
     live_run.mkdir(parents=True)
@@ -229,7 +258,8 @@ def test_r3_a_run_dir_linked_to_a_live_run_dir_is_refused(tmp_path):
         H.check_socket(layout, _live(tmp_path / "op"))
 
 
-def test_r3_a_hard_link_to_a_live_socket_is_refused(tmp_path):
+def test_r3_a_hard_link_to_a_live_socket_is_refused(short_dir):
+    tmp_path = short_dir  # binds a socket: see _SUN_PATH_MAX
     live_sock = tmp_path / "op" / ".genesis" / "run" / H.SOCKET_NAME
     live_sock.parent.mkdir(parents=True)
     s = socket.socket(socket.AF_UNIX)
@@ -244,7 +274,8 @@ def test_r3_a_hard_link_to_a_live_socket_is_refused(tmp_path):
         s.close()
 
 
-def test_r3_a_listener_or_a_non_socket_at_the_test_path_is_refused(tmp_path):
+def test_r3_a_listener_or_a_non_socket_at_the_test_path_is_refused(short_dir):
+    tmp_path = short_dir  # binds a socket: see _SUN_PATH_MAX
     layout = _test_root(tmp_path)
     layout.socket.parent.mkdir(parents=True)
     layout.socket.write_text("x")
@@ -1086,17 +1117,29 @@ def test_serve_refuses_an_overlay_missing_changed_or_replaced(
     os.chmod(own_overlay, 0o600)  # a chmod or touch changes nothing that is compared
     os.utime(own_overlay)
     H.check_overlay(state, wt, main)
-    for change in ("edited", "replaced", "deleted"):
-        if change == "replaced":  # another file with the same text: a different inode
-            spare = own_overlay.with_name("spare.yaml")
-            spare.write_text(text)
-            os.replace(spare, own_overlay)
-        else:
-            own_overlay.unlink()
-        if change == "edited":
-            own_overlay.write_text(text + "# edited\n")
-        with pytest.raises(H.Refused, match="^R10: .* missing or changed since setup"):
-            H.check_overlay(state, wt, main)
+    # Keep the original inode allocated. "replaced" needs a file with the same text
+    # and a DIFFERENT inode, and a freed inode is reused: under concurrent file
+    # churn (3 processes creating and deleting files in the same directory) the
+    # spare landed on the original inode in 426 of 3000 trials, and in 0 of 3000
+    # with this link held (MEASURED 2026-11-06). That made check_overlay rightly
+    # pass and failed one parallel CI run. The overlay check compares inode and
+    # text, not the link count.
+    held = own_overlay.with_name("held-original.yaml")
+    os.link(own_overlay, held)
+    try:
+        for change in ("edited", "replaced", "deleted"):
+            if change == "replaced":  # another file with the same text: a different inode
+                spare = own_overlay.with_name("spare.yaml")
+                spare.write_text(text)
+                os.replace(spare, own_overlay)
+            else:
+                own_overlay.unlink()
+            if change == "edited":
+                own_overlay.write_text(text + "# edited\n")
+            with pytest.raises(H.Refused, match="^R10: .* missing or changed since setup"):
+                H.check_overlay(state, wt, main)
+    finally:
+        held.unlink(missing_ok=True)
 
 
 async def test_a_failing_approver_shutdown_still_stops_the_vault(built):

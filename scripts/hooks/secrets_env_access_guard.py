@@ -15,7 +15,8 @@ happen unseen. That is what an ``ask`` is for, and this hook is a deliberate
 instance of the rare "hook that asks the user" exception rather than a drift into
 asking.
 
-**Dispatched sessions are DENIED, loudly** — see ``needs_user``.
+**Dispatched sessions are DENIED and recorded** — see ``needs_user``; the record is
+``low`` priority, no page (``_DISPATCHED_PRIORITY`` below).
 
 **An install may turn the prompt off** with ``hooks.asks.secrets_env: off`` in
 ``~/.genesis/config/genesis.yaml``. That is a decision about approval fatigue on
@@ -108,6 +109,18 @@ _PATH_FIELDS = ("file_path", "path", "notebook_path", "glob")
 #: Tools whose `pattern` field IS a path selector.
 _PATTERN_IS_PATH_TOOLS = ("Glob",)
 
+#: Observation priority for a DISPATCHED deny (#3848). The deny itself never
+#: changes; this is only how loudly it is reported. Owner ruling 2026-11-04: a
+#: background session merely denied this file is not page-worthy, true access or
+#: false positive; what pages is a background session that is STOPPED, which is
+#: reported with the session's outcome (a denied session that cannot finish
+#: reports itself blocked, cc/final_status.py from #3932, and the hourly
+#: stopped-session page lists it, outreach/stopped_sessions.py from #3902; ``low``
+#: depends on both, so it must not ship without them). MEASURED 2026-11-04 on one live
+#: install, all 4 recorded background denials: 3 were matcher false positives
+#: (#3789). ``low`` keeps the record for forensics without a page.
+_DISPATCHED_PRIORITY = "low"
+
 
 def main() -> int:
     payload = read_payload()
@@ -132,9 +145,12 @@ def main() -> int:
     # One line, quoted, so the owner sees WHAT is happening rather than being
     # asked to approve an abstraction. Bounded: a prompt nobody reads is a prompt
     # that gets clicked through, and the full text is in the transcript anyway.
-    subject = " ".join((command or " ".join(paths)).split())
-    if len(subject) > 240:
-        subject = subject[:240] + " …"
+    whole = " ".join((command or " ".join(paths)).split())
+    subject = whole[:240] + " …" if len(whole) > 240 else whole
+    # The RECORD gets the command whole, so needs_user scrubs it before cutting
+    # it: a credential split by the cut above would no longer match the scrub's
+    # patterns and would be stored. needs_user owns the bound (_excerpt).
+    record_detail = whole
 
     reason = (
         "GENESIS CREDENTIALS — this is not a routine approval.\n\n"
@@ -162,16 +178,29 @@ def main() -> int:
     # parameter. Retry without it: the prompt is exactly what this guard did
     # before the knob existed, so the degraded path is the old behaviour rather
     # than a new one.
+    # The same skew logic covers ``priority``: an older needs_user without it is
+    # retried with ``ask_key`` alone, then bare, and either way records at its
+    # own default, ``critical`` — the louder direction.
     try:
         decision = decide(
             "access secrets.env",
             reason,
-            detail=subject,
+            detail=record_detail,
             payload=payload,
             ask_key="secrets_env",
+            priority=_DISPATCHED_PRIORITY,
         )
     except TypeError:
-        decision = decide("access secrets.env", reason, detail=subject, payload=payload)
+        try:
+            decision = decide(
+                "access secrets.env",
+                reason,
+                detail=record_detail,
+                payload=payload,
+                ask_key="secrets_env",
+            )
+        except TypeError:
+            decision = decide("access secrets.env", reason, detail=record_detail, payload=payload)
     # Bounded: the decision carries operator-written NOTEs, and a payload over
     # the harness's output cap is persisted instead of read, which would lose
     # the ask and let the access through ungated. Only the free text is trimmed;

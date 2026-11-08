@@ -12,10 +12,12 @@ scratch HOME's ~/.genesis/lib/live-repair/current.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -23,290 +25,53 @@ from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parents[2]
-LIB = REPO / "scripts" / "lib"
-MODULE = LIB / "live_move_repair.py"
-GUARD = LIB / "update_state_guard.py"
-KIT_FILES = (
-    "live_move_repair.py",
-    "update_state_guard.py",
-    "deploy_checkout.sh",
-    "deploy_marker.sh",
-    "alert_queue.sh",
+from tests.test_scripts._live_repair_world import (
+    GUARD,
+    LIB,
+    MODULE,
+    REPO,
+    TAG_FILES,
+    TO_FILES,
+    Killed,
+    World,
+    _aged,
+    _ancestor_file,
+    _deep_desc,
+    _dir_becomes_file,
+    _foreign_both_flags,
+    _foreign_dir_symlink_inside_dir,
+    _foreign_edit,
+    _foreign_fifo_inside_dir,
+    _foreign_gitlink,
+    _foreign_inside_dir,
+    _foreign_skip_worktree,
+    _foreign_staged,
+    _foreign_symlink,
+    _foreign_unmerged,
+    _foreign_untracked,
+    _gc,
+    _git,
+    _git_env,
+    _gitlink_desc,
+    _hash,
+    _killed_mid_repair,
+    _lock_aside,
+    _lock_aside_if_any,
+    _retarget,
+    _skip_worktree_desc,
+    _staged_desc,
+    age_locks,
+    assert_healed,
+    foreign_rows,
+    killed_rollback,
+    killed_tag_side,
+    restore,
+    restore_all,
+    tag_snapshot,
+    update_bytes,
 )
 
 pytestmark = pytest.mark.skipif(sys.platform.startswith("win"), reason="git + bash")
-
-
-def _git_env(home: Path | None = None) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "GENESIS_"))}
-    env.update(
-        GIT_AUTHOR_NAME="t",
-        GIT_AUTHOR_EMAIL="t@example.invalid",
-        GIT_COMMITTER_NAME="t",
-        GIT_COMMITTER_EMAIL="t@example.invalid",
-        GIT_CONFIG_NOSYSTEM="1",
-    )
-    if home is not None:
-        env["HOME"] = str(home)
-    return env
-
-
-def _git(repo: Path, *args: str, check: bool = True) -> str:
-    return subprocess.run(
-        ["git", "-C", str(repo), *args], check=check, capture_output=True, text=True, env=_git_env()
-    ).stdout.strip()
-
-
-def _write(root: Path, files: dict[str, str | None]) -> None:
-    for path, body in files.items():
-        full = root / path
-        if body is None:
-            if full.is_dir() and not full.is_symlink():
-                shutil.rmtree(full)
-            elif full.exists() or full.is_symlink():
-                full.unlink()
-            continue
-        full.parent.mkdir(parents=True, exist_ok=True)
-        full.write_text(body)
-
-
-#: The tag (the old tip, checked out on `live`) and the move's target differ in
-#: every way a switch writes: modifications (A, sub/s1), additions (F, Z1-Z5, and
-#: AGENTS.md, an ephemeral path), a deletion (O) and a file that becomes a
-#: directory (P -> P/inner). K and the spy are the same on both sides.
-TAG_FILES = {
-    "A": "a\n",
-    "K": "keep\n",
-    "O": "o\n",
-    "P": "p\n",
-    "sub/s1": "s1\n",
-    "sub/t": "t\n",
-}
-TO_FILES = {
-    "A": "a2 with more bytes\n",
-    "AGENTS.md": "agents\n",
-    "F": "f\n",
-    "O": None,
-    "P": None,
-    "P/inner": "inner\n",
-    "sub/s1": "s1 changed\n",
-    "sub/t": None,
-    **{f"Z{i}": f"z{i}\n" for i in range(1, 6)},
-}
-
-
-class World:
-    """A scratch HOME (with ~/.genesis) and a repository whose `live` sits at the
-    tag ``pre``; ``to`` is the rebuilt tip the move was going to."""
-
-    def __init__(self, tmp: Path):
-        self.home = tmp / "home"
-        self.gen = self.home / ".genesis"
-        self.gen.mkdir(parents=True)
-        self.root = tmp / "repo"
-        self.root.mkdir()
-        self.state = self.gen / "update_state.json"
-        _git(self.root, "init", "-q", "-b", "main")
-        _write(self.root, TAG_FILES)
-        _git(self.root, "add", "-A")
-        _git(self.root, "commit", "-qm", "tag")
-        self.tag = _git(self.root, "rev-parse", "HEAD")
-        _write(self.root, TO_FILES)
-        _git(self.root, "add", "-A")
-        _git(self.root, "commit", "-qm", "rebuilt tip")
-        self.to = _git(self.root, "rev-parse", "HEAD")
-        _git(self.root, "checkout", "-q", "-B", "live", self.tag)
-        _git(self.root, "tag", "pre", self.tag)
-        _git(self.root, "branch", "-q", "-D", "main")
-
-    def row(self, phase: str = "moving", **over) -> dict:
-        return {
-            "phase": "merging",
-            "rollback_tag": "pre",
-            "original_branch": "live",
-            "own_head": self.tag,
-            "deploy_head": self.tag,
-            "post_merge": False,
-            "pid": 2_147_483_647,
-            "live_move": {"to": self.to, "phase": phase},
-            **over,
-        }
-
-    def write_state(self, state: dict) -> None:
-        self.state.write_text(json.dumps(state, indent=4))
-
-    def env(self, **extra: str) -> dict[str, str]:
-        return {**_git_env(self.home), **extra}
-
-    def kit(self) -> Path:
-        kit = self.gen / "lib" / "live-repair" / "current"
-        kit.mkdir(parents=True, exist_ok=True)
-        for name in KIT_FILES:
-            shutil.copy2(LIB / name, kit / name)
-        return kit
-
-    def repair(
-        self, *args: str, mode: str = "--command", **env: str
-    ) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            ["python3", "-I", "-S", str(MODULE), mode, str(self.state), str(self.root), *args],
-            capture_output=True,
-            text=True,
-            env=self.env(**env),
-            timeout=600,
-        )
-
-    def guard_rc(self, state: dict | None = None) -> int:
-        path = self.gen / "judge.json"
-        path.write_text(json.dumps(state or self.row()))
-        return subprocess.run(
-            ["python3", "-I", "-S", str(GUARD), str(path), str(self.root)],
-            capture_output=True,
-            env=self.env(),
-        ).returncode
-
-    def backups(self) -> list[Path]:
-        root = self.gen / "deploy-backups"
-        return sorted(root.glob("*-live-move-repair")) if root.exists() else []
-
-    def report(self) -> dict:
-        return json.loads((self.backups()[-1] / "REPAIR.json").read_text())
-
-    def alerts(self) -> list[dict]:
-        queue = self.gen / "alerts" / "queue"
-        return (
-            [json.loads(p.read_text()) for p in sorted(queue.glob("*.json"))]
-            if queue.exists()
-            else []
-        )
-
-    def snapshot(self) -> dict[str, bytes | str]:
-        """Every node under the checkout (outside .git): bytes, or "dir"/"link:<target>"."""
-        nodes: dict[str, bytes | str] = {}
-        for top, dirs, files in os.walk(self.root):
-            dirs[:] = [d for d in dirs if not (top == str(self.root) and d == ".git")]
-            for name in dirs + files:
-                full = Path(top) / name
-                rel = str(full.relative_to(self.root))
-                if full.is_symlink():
-                    nodes[rel] = "link:" + os.readlink(full)
-                elif full.is_dir():
-                    nodes[rel] = "dir"
-                elif not full.is_file():  # a FIFO or socket: opening it would block
-                    st = os.lstat(full)
-                    nodes[rel] = f"special:{st.st_mode:o}"
-                else:
-                    nodes[rel] = full.read_bytes()
-        return nodes
-
-
-def tag_snapshot() -> dict[str, bytes | str]:
-    nodes: dict[str, bytes | str] = {}
-    for path, body in TAG_FILES.items():
-        nodes[path] = body.encode()
-        parent = os.path.dirname(path)
-        while parent:
-            nodes[parent] = "dir"
-            parent = os.path.dirname(parent)
-    return nodes
-
-
-def kill_switch(root: Path, target: str, victim: str) -> None:
-    """A real `git switch -C live <target>`, SIGKILLed by a smudge filter while it
-    writes ``victim``: what git wrote before it is on disk, HEAD, `live` and the
-    index stay put, and the stale index.lock a SIGKILL leaves is kept."""
-    info = root / ".git" / "info"
-    info.mkdir(exist_ok=True)
-    (info / "attributes").write_text(f"{victim} filter=killer\n")
-    _git(root, "config", "filter.killer.smudge", "kill -9 $PPID")
-    _git(root, "config", "filter.killer.required", "true")
-    r = subprocess.run(
-        ["git", "-C", str(root), "switch", "--no-overwrite-ignore", "-C", "live", target],
-        capture_output=True,
-        text=True,
-        env=_git_env(),
-    )
-    assert r.returncode != 0, "the switch was not killed"
-    (info / "attributes").unlink()
-    _git(root, "config", "--remove-section", "filter.killer")
-
-
-def kill_prepared(root: Path, target: str) -> None:
-    """A switch killed by its reference-transaction hook at "prepared": the whole
-    target tree and index written, HEAD and `live` unmoved."""
-    hook = root / ".git" / "hooks" / "reference-transaction"
-    hook.write_text('#!/bin/sh\n[ "$1" = prepared ] && kill -9 $PPID\nexit 0\n')
-    hook.chmod(0o755)
-    r = subprocess.run(
-        ["git", "-C", str(root), "switch", "-C", "live", target],
-        capture_output=True,
-        text=True,
-        env=_git_env(),
-    )
-    hook.unlink()
-    assert r.returncode != 0, "the switch was not killed"
-
-
-def killed_tag_side(w: World, victim: str) -> None:
-    """The move toward ``to`` killed while writing ``victim`` (or at "prepared")."""
-    if victim == "prepared":
-        kill_prepared(w.root, w.to)
-    else:
-        kill_switch(w.root, w.to, victim)
-    assert _git(w.root, "rev-parse", "HEAD") == w.tag, "HEAD moved: the kill came too late"
-    w.write_state(w.row())
-
-
-def killed_rollback(w: World, victim: str) -> None:
-    """The move finished (HEAD on `live` at ``to``), then the rollback's switch back
-    to the tag was killed while writing ``victim`` (S18)."""
-    _git(w.root, "checkout", "-q", "-B", "live", w.to)
-    kill_switch(w.root, w.tag, victim)
-    assert _git(w.root, "rev-parse", "HEAD") == w.to, "HEAD moved: the kill came too late"
-    w.write_state(w.row("done"))
-
-
-@pytest.fixture
-def w(tmp_path: Path) -> World:
-    return World(tmp_path)
-
-
-@pytest.fixture
-def mod(monkeypatch, w):
-    """The module loaded fresh in-process (its globals are per test), with HOME
-    pointing at the scratch home."""
-    for k in list(os.environ):
-        if k.startswith(("GIT_", "GENESIS_")):
-            monkeypatch.delenv(k)
-    monkeypatch.setenv("HOME", str(w.home))
-    for k, v in _git_env(w.home).items():
-        if k.startswith("GIT_"):
-            monkeypatch.setenv(k, v)
-    spec = importlib.util.spec_from_file_location("live_move_repair_under_test", MODULE)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-def assert_healed(w: World, before: dict) -> None:
-    """At the tag, byte for byte, the state gone, the guard SAFE on the original
-    row, and every pre-repair node not at the tag's bytes saved byte-equal."""
-    assert w.snapshot() == tag_snapshot(), "the checkout is not the tag's tree"
-    assert _git(w.root, "status", "--porcelain", "-uall", "--ignored") == ""
-    for lock in ("index.lock", "HEAD.lock", "refs/heads/live.lock"):
-        assert not (w.root / ".git" / lock).exists(), f"a stale {lock} was left"
-    assert not w.state.exists(), "the healed state was not cleared"
-    assert w.guard_rc() == 10
-    backup = w.backups()[-1]
-    tag = tag_snapshot()
-    for rel, node in before.items():
-        if isinstance(node, bytes) and tag.get(rel) != node:
-            saved = [b for b in (backup / "tree" / rel, *(backup / "tree").rglob(rel))]
-            assert any(p.is_file() and p.read_bytes() == node for p in saved), (
-                f"{rel} was not saved"
-            )
-    assert w.report()["result"] == "healed"
 
 
 # ── T-D1, T-D2: real killed switches, both directions ───────────────────────
@@ -331,7 +96,7 @@ def test_td1_a_switch_killed_on_the_tag_side_is_healed_and_saved(w, victim):
     assert_healed(w, before)
     assert _git(w.root, "rev-parse", "HEAD") == w.tag
     assert (w.backups()[-1] / "git" / "index.lock").exists() is lock_left
-    assert w.report()["reapply"] == [], "the update's own files were reported as foreign"
+    assert foreign_rows(w) == [], "the update's own files were reported as foreign"
 
 
 def test_td2_a_rollback_killed_partway_is_left_to_the_forward_repair(w):
@@ -349,86 +114,6 @@ def test_td2_a_rollback_killed_partway_is_left_to_the_forward_repair(w):
 
 
 # ── T-D3: foreign paths are saved, healed and reported ───────────────────────
-
-
-def _foreign_edit(w):
-    (w.root / "sub" / "s1").write_text("mine\n")
-    return "sub/s1"
-
-
-def _foreign_untracked(w):
-    (w.root / "Z5").write_text("my own z5\n")
-    return "Z5"
-
-
-def _foreign_inside_dir(w):
-    (w.root / "P" / "mine.txt").write_text("notes\n")
-    return "P"
-
-
-def _foreign_staged(w):
-    (w.root / "A").write_text("staged by someone\n")
-    _git(w.root, "add", "A")
-    return "A"
-
-
-def _foreign_unmerged(w):
-    oids = [
-        subprocess.run(
-            ["git", "-C", str(w.root), "hash-object", "-w", "--stdin"],
-            input=f"side {n}\n",
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
-        for n in (1, 2, 3)
-    ]
-    info = "".join(f"100644 {o} {n}\tsub/s1\n" for n, o in zip((1, 2, 3), oids, strict=True))
-    _git(w.root, "update-index", "--force-remove", "sub/s1")
-    subprocess.run(
-        ["git", "-C", str(w.root), "update-index", "--index-info"],
-        input=info,
-        text=True,
-        check=True,
-        env=_git_env(),
-    )
-    return "sub/s1"
-
-
-def _foreign_skip_worktree(w):
-    _git(w.root, "update-index", "--skip-worktree", "sub/s1")
-    (w.root / "sub" / "s1").write_text("hidden edit\n")
-    return "sub/s1"
-
-
-def _foreign_gitlink(w):
-    _git(w.root, "update-index", "--add", "--cacheinfo", f"160000,{w.tag},Z5")
-    (w.root / "Z5").mkdir()
-    return "Z5"
-
-
-def _foreign_both_flags(w):
-    """`ls-files -v` tags a path with both flags `s` (MEASURED, git 2.43)."""
-    _git(w.root, "update-index", "--skip-worktree", "sub/s1")
-    _git(w.root, "update-index", "--assume-unchanged", "sub/s1")
-    (w.root / "sub" / "s1").write_text("hidden edit\n")
-    return "sub/s1"
-
-
-def _foreign_symlink(w):
-    os.symlink("A", w.root / "Z5")
-    return "Z5"
-
-
-def _foreign_dir_symlink_inside_dir(w):
-    """os.walk lists a directory symlink among the dirnames, not the files."""
-    os.symlink("../sub", w.root / "P" / "notes")
-    return "P"
-
-
-def _foreign_fifo_inside_dir(w):
-    os.mkfifo(w.root / "P" / "pipe", 0o640)
-    return "P"
 
 
 @pytest.mark.parametrize(
@@ -450,7 +135,7 @@ def _foreign_fifo_inside_dir(w):
 def test_td3_a_foreign_path_is_saved_healed_and_reported(w, make):
     """T-D3: something the update did not write, on a path the switch writes.
     The repair saves it, heals the tree anyway, lists the path as foreign, and
-    the step it prints puts the node and its index entries back exactly,
+    the restore it prints puts the node and its index entries back exactly,
     whatever the node's kind."""
     killed_tag_side(w, "Z3")
     # The edit is made with the killed switch's stale index.lock moved aside
@@ -460,7 +145,8 @@ def test_td3_a_foreign_path_is_saved_healed_and_reported(w, make):
     path = make(w)
     lock.with_name("held").rename(lock)
     node_before = w.snapshot().get(path)
-    sub_before = {k: v for k, v in w.snapshot().items() if k.startswith(path + "/")}
+    sub_before = {k: v for k, v in w.snapshot().items()
+                  if k.startswith(path + "/") and not update_bytes(w, k, v)}  # fmt: skip
     index_before = _git(w.root, "ls-files", "-s", "--", path)
     flags_before = _git(w.root, "ls-files", "-v", "--", path)
     before = w.snapshot()
@@ -469,35 +155,26 @@ def test_td3_a_foreign_path_is_saved_healed_and_reported(w, make):
     assert_healed(w, before)
     rows = {row["path"]: row for row in w.report()["paths"]}
     assert rows[path]["class"] == "foreign", rows[path]
-    steps = w.report()["reapply"]
-    assert len(steps) == 1, steps
-    assert steps[0] in r.stdout, "the re-apply step was not reported"
-    assert any(steps[0] in a["body"] for a in w.alerts()), "no alert carries the step"
+    assert len(foreign_rows(w)) == 1, foreign_rows(w)
+    ts = w.report()["ts"]
+    assert w.report()["reapply"] == [], "the writer stored a shell step (#3868)"
+    assert f"scripts/deploy_candidates repair-move --restore {ts} --check" in r.stdout, r.stdout
+    assert w.alerts() and all(f"repair-move --restore {ts}" in a["body"] for a in w.alerts())
+    assert "rm -rf" not in r.stdout and not any("rm -rf" in a["body"] for a in w.alerts())
     assert all(a["severity"] == "critical" for a in w.alerts())
-    subprocess.run(["bash", "-c", steps[0]], check=True, env=w.env())
+    restore_all(w)
     after = w.snapshot()
-    assert after.get(path) == node_before, "the re-apply step did not restore the node"
+    assert after.get(path) == node_before, "the restore did not put the node back"
     assert {k: v for k, v in after.items() if k.startswith(path + "/")} == sub_before
     assert _git(w.root, "ls-files", "-s", "--", path) == index_before
     assert _git(w.root, "ls-files", "-v", "--", path) == flags_before
-
-
-def _lock_aside(w: World, fn):
-    """Run ``fn`` with the killed switch's stale index.lock moved aside (git
-    refuses an index write while it stands), then put it back."""
-    lock = w.root / ".git" / "index.lock"
-    lock.rename(lock.with_name("held"))
-    try:
-        return fn()
-    finally:
-        lock.with_name("held").rename(lock)
 
 
 def test_r1_a_foreign_staged_blob_survives_gc_and_is_reapplied(w):
     """Codex c4385619761: staged content that differs from the worktree's is
     only in the object store; once the repair drops its index entry a
     `git gc --prune=now` deletes it. The backup holds the blob's bytes and the
-    re-apply step writes the object back before the index entry."""
+    restore writes the object back before the index entry."""
     killed_tag_side(w, "Z3")
 
     def stage():
@@ -514,8 +191,7 @@ def test_r1_a_foreign_staged_blob_survives_gc_and_is_reapplied(w):
         subprocess.run(["git", "-C", str(w.root), "cat-file", "-e", oid], env=_git_env()).returncode
         != 0
     ), "control: gc pruned the staged blob"
-    step = w.report()["reapply"][0]
-    subprocess.run(["bash", "-c", step], check=True, env=w.env())
+    restore_all(w)
     assert _git(w.root, "ls-files", "-s", "--", "A") == index_before
     assert _git(w.root, "cat-file", "blob", oid) == "staged by someone"
     assert (w.root / "A").read_text() == "then edited again\n"
@@ -523,8 +199,8 @@ def test_r1_a_foreign_staged_blob_survives_gc_and_is_reapplied(w):
 
 def test_r1_a_name_with_a_newline_reapplies_its_index_entry(tmp_path, monkeypatch):
     """Codex c4385619771 / Devin c4385592698: index records are NUL-delimited, so
-    a path with a newline neither breaks the re-apply step nor feeds git an
-    extra record; and nothing is removed before the step that can fail."""
+    a path with a newline neither breaks the restore nor feeds git an extra
+    record."""
     name = "odd\nname"
     monkeypatch.setitem(TO_FILES, name, "theirs\n")
     w = World(tmp_path)
@@ -539,9 +215,7 @@ def test_r1_a_name_with_a_newline_reapplies_its_index_entry(tmp_path, monkeypatc
     assert w.repair().returncode == 0
     rows = {row["path"]: row for row in w.report()["paths"]}
     assert rows[name]["class"] == "foreign"
-    [step] = w.report()["reapply"]
-    r = subprocess.run(["bash", "-c", step], capture_output=True, text=True, env=w.env())
-    assert r.returncode == 0, r.stderr
+    restore_all(w)
     assert _git(w.root, "ls-files", "-s", "-z") == index_before
     assert (w.root / name).read_text() == "mine\n"
 
@@ -549,8 +223,8 @@ def test_r1_a_name_with_a_newline_reapplies_its_index_entry(tmp_path, monkeypatc
 @pytest.mark.parametrize("kind", ["fifo", "socket"])
 def test_r1_a_fifo_or_socket_on_a_move_path_is_recorded(w, monkeypatch, kind):
     """Devin c4385592015: a node that holds no bytes is still recorded (type
-    and mode) and reported as foreign; a FIFO's re-apply step makes it again,
-    a socket's says it is gone (its process binds it again)."""
+    and mode) and reported as foreign; the restore makes a FIFO again, and
+    refuses a socket by name (its process binds it again)."""
     import socket as socketlib
 
     killed_tag_side(w, "Z3")  # Z5 is a target-only path, unwritten
@@ -572,16 +246,18 @@ def test_r1_a_fifo_or_socket_on_a_move_path_is_recorded(w, monkeypatch, kind):
     assert row["special"]["type"] == kind, row
     if kind == "fifo":
         assert row["special"]["mode"] == "0640", row
-    [step] = w.report()["reapply"]
-    assert step in r.stdout
-    subprocess.run(["bash", "-c", step], check=True, env=w.env())
+    assert len(foreign_rows(w)) == 1
+    assert f"--restore {w.report()['ts']}" in r.stdout and "mkfifo" not in r.stdout, r.stdout
+    put = restore(w)
     import stat as st
 
     if kind == "fifo":
+        assert put.returncode == 0, put.stdout + put.stderr
         mode = os.lstat(w.root / "Z5").st_mode
         assert st.S_ISFIFO(mode) and st.S_IMODE(mode) == 0o640
     else:
-        assert "socket" in step and not (w.root / "Z5").exists()
+        assert put.returncode == 1 and "other:cannot-make" in put.stdout, put.stdout
+        assert not (w.root / "Z5").exists()
 
 
 def test_r1_the_backup_is_durable_in_its_parents_before_the_checkout_changes(w, mod, monkeypatch):
@@ -685,7 +361,7 @@ def test_td4_empty_prefix_and_ephemeral_paths_are_the_updates(w):
     assert_healed(w, before)
     rows = {row["path"]: row["class"] for row in w.report()["paths"]}
     assert rows["Z5"] == rows["sub/s1"] == rows["AGENTS.md"] == "engine", rows
-    assert w.report()["reapply"] == []
+    assert foreign_rows(w) == []
     assert [a["severity"] for a in w.alerts()] == ["warning"]
 
 
@@ -714,16 +390,6 @@ def _hold(path: Path) -> int:
     fd = os.open(path, os.O_RDWR | os.O_CREAT)
     fcntl.flock(fd, fcntl.LOCK_EX)
     return fd
-
-
-def _aged(path: Path) -> None:
-    """A lock left by an EARLIER kill: older than LOCK_FRESH_S. A lock made a
-    moment ago is fresh, and wherever this user runs a process whose fds cannot
-    be read (a CI runner, a systemd-user install; pytest's PID namespace hides
-    them locally) a fresh lock counts as held."""
-    if path.exists():
-        old = time.time() - 3600
-        os.utime(path, (old, old))
 
 
 def _no_git(monkeypatch):
@@ -856,7 +522,7 @@ def test_td6_an_unreadable_fd_list_of_this_user_may_hold_the_lock(mod, tmp_path,
     (entry / "fd").mkdir(parents=True)
     (entry / "stat").write_text("1 (git) S 1 1\n")
     (entry / "comm").write_text("git\n")
-    monkeypatch.setattr(mod, "_PROC", str(proc))
+    _static_proc(monkeypatch, mod, proc)
     assert mod._held_open("/x/index.lock") is False, "control: a readable, empty fd list"
     (entry / "fd").chmod(0)
     try:
@@ -877,10 +543,6 @@ def test_td7_a_second_run_does_nothing(w):
     r = w.repair()
     assert r.returncode == 0 and "nothing to repair" in r.stdout, r.stdout
     assert w.snapshot() == snap and w.backups() == backups
-
-
-class Killed(BaseException):
-    """A SIGKILL stand-in: not an Exception, so nothing in the module catches it."""
 
 
 def test_td7_a_repair_killed_partway_converges(w, mod, monkeypatch):
@@ -1089,6 +751,32 @@ def test_td10_repair_move_runs_the_kit_never_the_checkouts_copy(w):
     outside = {k: v for k, v in w.snapshot().items() if k.split("/")[0] != "scripts"}
     assert outside == {k: v for k, v in tag_snapshot().items() if k.split("/")[0] != "scripts"}
     ts = w.report()["ts"]
+    # The wrapper forwards --restore TS like --dismiss TS, and --check rides after it
+    # (#3966 item 2): without the forward, argparse refuses --command with --restore.
+    c = subprocess.run(
+        ["bash", str(entry), "repair-move", "--restore", ts, "--check"],
+        capture_output=True,
+        text=True,
+        env=w.env(),
+    )
+    assert c.returncode == 0, c.stdout + c.stderr
+    assert f"report {ts}:" in c.stdout and "nothing was written" in c.stdout, c.stdout
+    # #3974 item 4: --wait may come first; the mode is found wherever it is.
+    c = subprocess.run(
+        ["bash", str(entry), "repair-move", "--wait", "5", "--restore", ts, "--check"],
+        capture_output=True,
+        text=True,
+        env=w.env(),
+    )
+    assert c.returncode == 0 and f"report {ts}:" in c.stdout, c.stdout + c.stderr
+    # Two modes are refused before the kit runs: never the last one silently.
+    for two in (["--restore", ts, "--dismiss", ts], ["--dismiss", ts, "--restore", ts, "--check"]):
+        c = subprocess.run(
+            ["bash", str(entry), "repair-move", *two], capture_output=True, text=True, env=w.env()
+        )
+        assert c.returncode == 1 and "one of --dismiss TS or --restore TS" in c.stderr, two
+    assert w.report()["dismissed_at"] is None
+    assert not w.state.exists()
     d = subprocess.run(
         ["bash", str(entry), "repair-move", "--dismiss", ts],
         capture_output=True,
@@ -1158,17 +846,6 @@ def test_td17_an_unreadable_target_is_healed_by_the_full_tree(w):
             assert (backup / "tree" / rel).read_bytes() == node, rel
 
 
-def _retarget(w: World, change) -> None:
-    """Rebuild ``to`` as the current target plus ``change(w)`` (a symlink, or a
-    directory that becomes a file), then put `live` back at the tag."""
-    _git(w.root, "checkout", "-q", "--detach", w.to)
-    change(w)
-    _git(w.root, "add", "-A")
-    _git(w.root, "commit", "-qm", "retarget")
-    w.to = _git(w.root, "rev-parse", "HEAD")
-    _git(w.root, "checkout", "-q", "-B", "live", w.tag)
-
-
 def _nested_dir_rows(w):
     """Codex c4385987795: P and P/inner are both directory rows."""
     killed_tag_side(w, "prepared")
@@ -1199,9 +876,8 @@ def test_r2_a_row_inside_a_saved_directory_is_saved_by_it(w, make):
     for row in w.report()["paths"]:
         if row["disk_changed"] and row["disk"] not in ("absent", "other"):
             assert os.path.lexists(backup / row["saved_as"]), row
-    for step in w.report()["reapply"]:
-        subprocess.run(["bash", "-c", step], check=True, env=w.env())
-    if w.report()["reapply"]:
+    if foreign_rows(w):
+        restore_all(w)
         assert {k: v for k, v in w.snapshot().items() if k.startswith("P")} == {
             k: v for k, v in before.items() if k.startswith("P")
         }
@@ -1245,35 +921,13 @@ def test_r2_a_torn_index_is_kept_and_rebuilt_from_the_tag(w, victim):
 
 def test_r2_a_mode_only_edit_reapplies_its_mode(w):
     """Codex c4385987787, the writer half: an executable-bit-only edit is
-    foreign, and its re-apply step puts the bit back."""
+    foreign, and the restore puts the bit back."""
     killed_tag_side(w, "Z3")  # sub/s1 is still the tag's bytes
     (w.root / "sub" / "s1").chmod(0o755)
     assert w.repair().returncode == 0
     assert not os.access(w.root / "sub" / "s1", os.X_OK)
-    [step] = w.report()["reapply"]
-    subprocess.run(["bash", "-c", step], check=True, env=w.env())
+    restore_all(w)
     assert os.access(w.root / "sub" / "s1", os.X_OK)
-
-
-def _killed_mid_repair(w: World, mod, monkeypatch, where: str) -> None:
-    """A repair killed right after its restore (``_apply``), or at it."""
-    real = mod.Repair._apply
-
-    def die(self, *a, **kw):
-        if where == "after_apply":
-            real(self, *a, **kw)
-        raise Killed
-
-    monkeypatch.setattr(mod.Repair, "_apply", die)
-    with pytest.raises(Killed):
-        mod.Repair(str(w.state), str(w.root), True, 0).run()
-    monkeypatch.setattr(mod.Repair, "_apply", real)
-    assert w.report()["result"] is None
-
-
-def _dir_becomes_file(w):
-    shutil.rmtree(w.root / "sub")
-    (w.root / "sub").write_text("now a file\n")
 
 
 def test_r2_a_repair_killed_after_restoring_a_tag_directory_is_cleared(w, mod, monkeypatch):
@@ -1487,19 +1141,118 @@ def test_sf2_never_deletes_through_a_symlinked_parent(tmp_path):
     assert w.state.exists()
 
 
-def test_sf4_repair_move_explain_works_with_no_kit(w):
-    """SF4a: with no kit installed (it arrives in PR D2), --explain still prints
-    the by-hand steps, from the checkout's own module (it only prints)."""
-    entry = _entry_checkout(w)
-    shutil.copy2(MODULE, entry.parent / "lib" / MODULE.name)
+def test_sf4_repair_move_explain_works_with_no_kit(w, tmp_path):
+    """SF4a / CodeRabbit c4390266663: with no kit installed (it arrives in PR
+    D2), --explain still prints the by-hand steps. It reads the module as HEAD
+    committed it, never the working tree's copy, which can be one of the
+    half-written files: truncated here, so running it would fail."""
+    co = tmp_path / "co"
+    (co / "scripts" / "lib").mkdir(parents=True)
+    shutil.copy2(REPO / "scripts" / "deploy_candidates", co / "scripts" / "deploy_candidates")
+    for name in ("deploy_marker.sh", "live_system_guard.sh", MODULE.name):
+        shutil.copy2(LIB / name, co / "scripts" / "lib" / name)
+    _git(co, "init", "-q", "-b", "live")
+    _git(co, "add", "-A")
+    _git(co, "commit", "-qm", "tag")
+    half = co / "scripts" / "lib" / MODULE.name
+    half.write_bytes(MODULE.read_bytes()[:300])  # mid-docstring: a SyntaxError
+    control = subprocess.run(["python3", "-I", "-S", str(half), "--explain"], capture_output=True)
+    assert control.returncode != 0, "control: the truncated copy runs"
     e = subprocess.run(
-        ["bash", str(entry), "repair-move", "--explain"],
+        ["bash", str(co / "scripts" / "deploy_candidates"), "repair-move", "--explain"],
         capture_output=True,
         text=True,
         env=w.env(),
     )
     assert e.returncode == 0, e.stderr
     assert "git restore --source=<tag>" in e.stdout, e.stdout
+
+
+def test_explain_with_no_kit_ignores_a_callers_git_dir(w, tmp_path):
+    """The no-kit --explain reads the module from this checkout's HEAD even when
+    the caller exports GIT_DIR (a hook does): it never runs another repository's
+    committed module."""
+    co = tmp_path / "co"
+    (co / "scripts" / "lib").mkdir(parents=True)
+    shutil.copy2(REPO / "scripts" / "deploy_candidates", co / "scripts" / "deploy_candidates")
+    for name in ("deploy_marker.sh", "live_system_guard.sh", MODULE.name):
+        shutil.copy2(LIB / name, co / "scripts" / "lib" / name)
+    _git(co, "init", "-q", "-b", "live")
+    _git(co, "add", "-A")
+    _git(co, "commit", "-qm", "tag")
+    other = tmp_path / "other"
+    (other / "scripts" / "lib").mkdir(parents=True)
+    trap = tmp_path / "ran-the-other-module"
+    (other / "scripts" / "lib" / MODULE.name).write_text(f"open({str(trap)!r}, 'w').close()\n")
+    _git(other, "init", "-q")
+    _git(other, "add", "-A")
+    _git(other, "commit", "-qm", "other")
+    env = {**w.env(), "GIT_DIR": str(other / ".git")}
+    e = subprocess.run(
+        ["bash", str(co / "scripts" / "deploy_candidates"), "repair-move", "--explain"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert not trap.exists(), "ran the module GIT_DIR named"
+    assert e.returncode == 0, e.stderr
+    assert "git restore --source=<tag>" in e.stdout, e.stdout
+
+
+@pytest.mark.parametrize("lib", ["deploy_marker.sh", "live_system_guard.sh"])
+@pytest.mark.parametrize("damage", ["truncated", "removed"])
+def test_explain_survives_a_half_written_shell_lib(w, tmp_path, lib, damage):
+    """Audit SHOULD-FIX: repair-move sources neither of the checkout's shell libs
+    (the move it repairs may have truncated or removed them), so --explain still
+    prints the steps."""
+    co = tmp_path / "co"
+    (co / "scripts" / "lib").mkdir(parents=True)
+    shutil.copy2(REPO / "scripts" / "deploy_candidates", co / "scripts" / "deploy_candidates")
+    for name in ("deploy_marker.sh", "live_system_guard.sh", MODULE.name):
+        shutil.copy2(LIB / name, co / "scripts" / "lib" / name)
+    _git(co, "init", "-q", "-b", "live")
+    _git(co, "add", "-A")
+    _git(co, "commit", "-qm", "tag")
+    hurt = co / "scripts" / "lib" / lib
+    if damage == "truncated":
+        hurt.write_bytes(hurt.read_bytes()[:200])
+    else:
+        hurt.unlink()
+    env = {k: v for k, v in w.env().items() if k != "GENESIS_TEST_FENCE_LIVE_ROOTS"}
+    e = subprocess.run(
+        ["bash", str(co / "scripts" / "deploy_candidates"), "repair-move", "--explain"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert e.returncode == 0, e.stderr
+    assert "git restore --source=<tag>" in e.stdout, e.stdout
+
+
+def test_the_restore_never_stages_a_deletion_of_an_engine_row(w):
+    """Audit LOW: an UNMERGED ancestor `sub` (git checks file/directory conflicts
+    per stage) beside a stage-0 sub/s1. Restoring the ancestor's stages drops
+    nothing below it, so no tag file is left staged for deletion."""
+    killed_tag_side(w, "prepared")
+
+    def plant():
+        oids = [_hash(w, f"UNMERGED {n}\n") for n in (1, 2, 3)]
+        recs = "".join(f"100644 {o} {n}\tsub\0" for n, o in zip((1, 2, 3), oids, strict=True))
+        subprocess.run(
+            ["git", "-C", str(w.root), "update-index", "-z", "--index-info"],
+            input=recs.encode(),
+            check=True,
+            env=_git_env(),
+        )
+
+    _lock_aside_if_any(w, plant)
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    restore_all(w)
+    st = _git(w.root, "status", "--porcelain")
+    staged_deletions = [ln for ln in st.splitlines() if ln.startswith("D ")]
+    assert staged_deletions == [], st
+    assert "UU sub" in st, st
 
 
 def test_sf4_a_tag_side_live_message_is_actionable_with_no_kit(w):
@@ -1533,48 +1286,15 @@ def test_low5_the_live_hint_rides_only_the_at_tag_refusal():
 # ── Round 4: the inventory is the restore's footprint; one stale-lock rule ───
 
 
-def _staged_desc(w):
-    """Codex c4386510837: a staged P/notes whose worktree bytes differ."""
-    (w.root / "P" / "notes").write_text("STAGED\n")
-    _git(w.root, "add", "--", "P/notes")
-    (w.root / "P" / "notes").write_text("WORKTREE\n")
-    return "P/notes"
-
-
-def _skip_worktree_desc(w):
-    """Skip-worktree P/flagged whose disk file is absent (silent before)."""
-    (w.root / "P" / "flagged").write_text("FLAGGED\n")
-    _git(w.root, "add", "--", "P/flagged")
-    _git(w.root, "update-index", "--skip-worktree", "P/flagged")
-    (w.root / "P" / "flagged").unlink()
-    return "P/flagged"
-
-
-def _deep_desc(w):
-    (w.root / "P" / "x" / "y").mkdir(parents=True)
-    (w.root / "P" / "x" / "y" / "deep").write_text("DEEP\n")
-    _git(w.root, "add", "--", "P/x/y/deep")
-    return "P/x/y/deep"
-
-
-def _gitlink_desc(w):
-    """A gitlink P/sub (an empty directory on disk): silent before."""
-    (w.root / "P" / "sub").mkdir()
-    _git(w.root, "update-index", "--add", "--cacheinfo", f"160000,{w.tag},P/sub")
-    return "P/sub"
-
-
-def _lock_aside_if_any(w: World, fn):
-    lock = w.root / ".git" / "index.lock"
-    return _lock_aside(w, fn) if lock.exists() else fn()
-
-
-@pytest.mark.parametrize("make", [_staged_desc, _skip_worktree_desc, _deep_desc, _gitlink_desc])
+@pytest.mark.parametrize(
+    "make", [_staged_desc, _skip_worktree_desc, _deep_desc, _gitlink_desc, _ancestor_file]
+)
 def test_r4_an_index_entry_under_a_row_path_is_its_own_row(w, make):
     """Restoring P (a file in the tag) drops every index entry under P, so each
     is a row of its own: classified foreign, its blob saved, and after a
-    `git gc --prune=now` the printed re-apply steps put the entry, its flag and
-    its node back. Invariant: every pre-repair index entry the repair changed
+    `git gc --prune=now` the restore puts the entry, its flag and its node
+    back (the gc took the target, so P's own files, the update's, cannot be
+    told apart any more: those are refused by name, and only those). Invariant: every pre-repair index entry the repair changed
     has a row."""
     killed_tag_side(w, "prepared")
     path = _lock_aside_if_any(w, lambda: make(w))
@@ -1595,12 +1315,15 @@ def test_r4_an_index_entry_under_a_row_path_is_its_own_row(w, make):
         assert (w.backups()[-1] / "index-blobs" / oid).is_file(), "the staged blob was not saved"
     _git(w.root, "-c", "gc.reflogExpire=now", "-c", "gc.reflogExpireUnreachable=now", "gc", "-q",
          "--prune=now")  # fmt: skip
-    for step in w.report()["reapply"]:
-        r = subprocess.run(["bash", "-c", step], capture_output=True, text=True, env=w.env())
-        assert r.returncode == 0, step + "\n" + r.stderr
+    put = restore(w)
+    refused = [ln for ln in put.stdout.splitlines() if " refused:" in ln]
+    assert all("other:target-unreadable" in ln for ln in refused), put.stdout
     assert _git(w.root, "ls-files", "-s", "--", path) == entry
     assert _git(w.root, "ls-files", "-v", "--", path) == flags
-    assert w.snapshot().get(path) == node
+    if make is _gitlink_desc:  # review N-11: a saved directory's empty subdirectory
+        assert node == "dir" and w.snapshot().get(path) is None  # is not rebuilt
+    else:
+        assert w.snapshot().get(path) == node
 
 
 def test_r4_the_safe_branch_retires_a_stale_index_lock(w):
@@ -1633,6 +1356,15 @@ def test_r4_ref_locks_a_killed_transaction_left_are_retired(w):
     _git(w.root, "switch", "-q", "-c", "probe")
 
 
+def _static_proc(monkeypatch, mod, proc: Path) -> None:
+    """Point the repair at a fake /proc. Its entries never change, so the
+    re-check of an unreadable process (#4001) has nothing to wait out: its real
+    wait would only age a fresh lock past LOCK_FRESH_S on the real clock while
+    the fake clock runs out the budget."""
+    monkeypatch.setattr(mod, "_PROC", str(proc))
+    monkeypatch.setattr(mod, "_settle", lambda _s: None)
+
+
 def _fake_proc(tmp_path: Path, comm: str) -> tuple[Path, Path]:
     """A /proc with one live process of this user, ``comm``, whose fd list
     cannot be read (non-dumpable)."""
@@ -1662,7 +1394,7 @@ def test_r4_an_unreadable_process_holds_only_if_git_or_the_lock_is_fresh(
     proc, lock = _fake_proc(tmp_path, comm)
     then = time.time() - age
     os.utime(lock, (then, then))
-    monkeypatch.setattr(mod, "_PROC", str(proc))
+    _static_proc(monkeypatch, mod, proc)
     try:
         assert mod._held_open(str(lock)) is held
     finally:
@@ -1671,7 +1403,7 @@ def test_r4_an_unreadable_process_holds_only_if_git_or_the_lock_is_fresh(
 
 def test_r4_ephemeral_paths_match_whole_like_the_guard(tmp_path, monkeypatch):
     """Codex c4386510850: `notes AGENTS.md` is not the top-level AGENTS.md; a
-    foreign edit there is reported with its re-apply step."""
+    foreign edit there is reported, and restored."""
     monkeypatch.setitem(TAG_FILES, "notes AGENTS.md", "n1\n")
     monkeypatch.setitem(TO_FILES, "notes AGENTS.md", "n2\n")
     w = World(tmp_path)
@@ -1681,8 +1413,7 @@ def test_r4_ephemeral_paths_match_whole_like_the_guard(tmp_path, monkeypatch):
     assert r.returncode == 0, r.stdout + r.stderr
     rows = {row["path"]: row for row in w.report()["paths"]}
     assert rows["notes AGENTS.md"]["class"] == "foreign", rows["notes AGENTS.md"]
-    [step] = w.report()["reapply"]
-    subprocess.run(["bash", "-c", step], check=True, env=w.env())
+    restore_all(w)
     assert (w.root / "notes AGENTS.md").read_text() == "FOREIGN EDIT\n"
 
 
@@ -1696,19 +1427,486 @@ def test_r4_a_fresh_ref_lock_is_waited_for_never_left_behind(w, mod, tmp_path, m
         pytest.skip("running as root: EACCES cannot be produced")
     killed_tag_side(w, "prepared")
     proc, _ = _fake_proc(tmp_path, "codex")
-    monkeypatch.setattr(mod, "_PROC", str(proc))
+    _static_proc(monkeypatch, mod, proc)
     clock = FakeClock()
     monkeypatch.setattr(mod, "_now", clock.now)
     monkeypatch.setattr(mod, "_sleep", clock.sleep)
     head_lock = w.root / ".git" / "HEAD.lock"
+    ref_lock = w.root / ".git" / "refs" / "heads" / "live.lock"
+    for lock in (head_lock, ref_lock):
+        os.utime(lock)  # this test is about a fresh lock; the kill helper ages them
     try:
         assert mod.Repair(str(w.state), str(w.root), True, 0).run() == 1
         assert w.state.exists() and head_lock.exists() and w.backups() == []
         old = time.time() - 2 * mod.LOCK_FRESH_S
-        for lock in (head_lock, w.root / ".git" / "refs" / "heads" / "live.lock"):
+        for lock in (head_lock, ref_lock):
             os.utime(lock, (old, old))
         assert mod.Repair(str(w.state), str(w.root), True, 0).run() == 0
     finally:
         (proc / str(os.getppid()) / "fd").chmod(0o755)
     assert not w.state.exists() and not head_lock.exists()
     assert (w.backups()[-1] / "git" / "HEAD.lock").exists()
+
+
+# ── #3657 / #3658: index ancestors are rows; no step reaches through a link ──
+
+
+def test_r5_an_index_ancestor_of_a_row_path_is_saved_and_reapplied(w):
+    """#3657 (Codex c4390238983): the index holds a foreign file `sub` while
+    the disk holds sub/; restoring sub/s1 drops that entry. It is a row of its
+    own, its blob is saved, and after `git gc --prune=now` the restore puts
+    the staged `sub` back."""
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: _ancestor_file(w))
+    index_before = _git(w.root, "ls-files", "-s", "-z")
+    oid = _git(w.root, "ls-files", "-s", "--", "sub").split()[1]
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    rows = {row["path"]: row for row in w.report()["paths"]}
+    assert rows.get("sub", {}).get("class") == "foreign", sorted(rows)
+    assert (w.backups()[-1] / "index-blobs" / oid).is_file(), "the staged blob was not saved"
+    _gc(w)
+    gone = subprocess.run(["git", "-C", str(w.root), "cat-file", "-e", oid], env=_git_env())
+    assert gone.returncode != 0, "control: gc pruned the staged blob"
+    restore_all(w)
+    assert _git(w.root, "ls-files", "-s", "-z") == index_before
+    assert _git(w.root, "cat-file", "blob", oid) == "STAGED SUB"
+
+
+@pytest.mark.parametrize("ancestor", [False, True], ids=["staged-child", "ancestor-file"])
+def test_r5_no_restore_reaches_through_a_restored_symlink(w, tmp_path, ancestor):
+    """#3658 (Codex c4390238996): `sub` is a foreign symlink to a directory
+    outside the checkout and the index holds foreign content at sub/s1 (or,
+    with #3657, a foreign file `sub`). The repair never reads through the link;
+    neither may the restore: the outside file survives it unchanged, the child
+    gets only its index state back, and its row says it was not reachable."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "s1").write_text("not the checkout's\n")
+    killed_tag_side(w, "Z3")
+
+    def plant():
+        if ancestor:
+            _ancestor_file(w)
+        else:
+            (w.root / "sub" / "s1").write_text("STAGED S1\n")
+            _git(w.root, "add", "--", "sub/s1")
+        shutil.rmtree(w.root / "sub")
+        os.symlink(outside, w.root / "sub")
+
+    _lock_aside(w, plant)
+    index_before = _git(w.root, "ls-files", "-s", "-z")
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (outside / "s1").read_text() == "not the checkout's\n", "the repair reached outside"
+    rows = {row["path"]: row for row in w.report()["paths"]}
+    assert rows["sub"]["class"] == "foreign", rows["sub"]
+    if not ancestor:
+        assert rows["sub/s1"]["class"] == "foreign", rows["sub/s1"]
+        assert rows["sub/s1"].get("unreachable_through") == "sub", rows["sub/s1"]
+    _gc(w)
+    restore_all(w)
+    assert (outside / "s1").exists(), "the restore deleted a file outside the checkout"
+    assert (outside / "s1").read_text() == "not the checkout's\n"
+    assert sorted(p.name for p in outside.iterdir()) == ["s1"], "the restore wrote outside"
+    assert os.readlink(w.root / "sub") == str(outside)
+    assert _git(w.root, "ls-files", "-s", "-z") == index_before
+
+
+# ── #3492 B2a: no generated shell (#3868, #3869), the integrity record, modes ──
+
+
+def _many_foreign(w: World, n: int) -> list[str]:
+    """#3869: ``n`` target-only files the switch wrote whole (killed at
+    "prepared"), each then overwritten with a person's own bytes: ``n``
+    foreign rows. Long names make the old shell steps outgrow one argv string."""
+    names = [f"many/{i:03d}-" + "n" * 80 for i in range(n)]
+
+    def add(w):
+        (w.root / "many").mkdir()
+        for p in names:
+            (w.root / p).write_text("theirs\n")
+
+    _retarget(w, add)
+    killed_tag_side(w, "prepared")
+
+    def mine():
+        for p in names:
+            (w.root / p).write_text("mine\n")
+
+    _lock_aside_if_any(w, mine)
+    age_locks(w)
+    return names
+
+
+def test_3869_boot_with_300_foreign_rows_exits_0_and_queues_its_alert(w):
+    """#3869: the tree is healed and the state cleared, so the start must
+    proceed (rc 0) and the alert must queue. The old writer passed every
+    stored step to bash in one argv string: E2BIG, rc 1, the alert lost."""
+    _many_foreign(w, 300)
+    r = w.repair(mode="--boot")
+    assert r.returncode == 0, r.stderr[-3000:]
+    assert not w.state.exists(), "control: the repair healed and cleared"
+    report = w.report()
+    assert sum(1 for row in report["paths"] if row["class"] == "foreign") == 300
+    assert report["reapply"] == []
+    [alert] = w.alerts()
+    assert alert["severity"] == "critical", alert
+    assert f"repair-move --restore {report['ts']}" in alert["body"], alert["body"][:500]
+    assert "rm -rf" not in alert["body"]
+
+
+def test_3868_the_writer_keeps_no_shell_step(w, mod):
+    """#3868: a printed `rm -rf` + `cp -a` step destroyed newer work when run
+    late. The writer generates none: the report's `reapply` stays [] for older
+    readers, and what it prints and alerts is the restore command."""
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: _foreign_edit(w))
+    age_locks(w)
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    report = w.report()
+    assert any(row["class"] == "foreign" for row in report["paths"]), "control: a foreign row"
+    assert report["reapply"] == []
+    ts = report["ts"]
+    texts = [r.stdout, *(a["body"] for a in w.alerts())]
+    assert len(texts) == 2, texts
+    for text in texts:
+        assert f"scripts/deploy_candidates repair-move --restore {ts} --check" in text, text
+        assert f"scripts/deploy_candidates repair-move --restore {ts}." in text, text
+        assert "rm -rf" not in text and "cp -a" not in text and "update-index" not in text
+    assert not hasattr(mod, "reapply_step"), "the step generator is still in the writer"
+
+
+def _finished(w, mod):
+    """A real repair with a foreign row, its queue emptied; (Repair, backup, manifest)."""
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: _foreign_edit(w))
+    age_locks(w)
+    assert w.repair().returncode == 0
+    shutil.rmtree(w.gen / "alerts")  # the same dedupe key would not queue again
+    return mod.Repair(str(w.state), str(w.root), True, 0), str(w.backups()[-1]), w.report()
+
+
+@pytest.mark.parametrize("rc", [0, 1])
+def test_a_result_of_any_size_is_alerted_under_the_argv_bound(w, mod, rc):
+    """Review SF-8: MIXED_TREE's reason lists every residue path, and the body
+    goes to bash as one argv string and on as ALERT_BODY. MEASURED here: one
+    string of 131,072 bytes or more is E2BIG (getconf ARG_MAX: 2,097,152 for
+    argv and env together). The body is cut, says so, and the alert queues;
+    the full result stays in REPAIR.json; the exit code is the caller's."""
+    repair, backup, manifest = _finished(w, mod)
+    huge = "unresolved: mixed_tree: " + " ".join(f"residue/{i:05d}" for i in range(20_000))
+    assert len(huge.encode()) > 131_072, "control: one argv string over the limit"
+    assert repair._finish(backup, manifest, huge, rc) == rc
+    [alert] = w.alerts()
+    body = alert["body"].encode()
+    assert len(body) <= mod.ALERT_BYTES < 131_072, len(body)
+    assert b"more bytes" in body and b"REPAIR.json" in body, body[-300:]
+    assert w.report()["result"] == huge
+
+
+@pytest.mark.parametrize("rc", [0, 1])
+def test_a_failed_alert_never_changes_the_exit_code(w, mod, monkeypatch, rc):
+    """The module header: exit 1 only where a start would run a half-written
+    tree. An alert that cannot be queued (here: bash cannot be started) is
+    logged, never raised."""
+    repair, backup, manifest = _finished(w, mod)
+
+    def cannot(*a, **k):
+        raise OSError(7, "Argument list too long")
+
+    monkeypatch.setattr(mod.subprocess, "run", cannot)
+    assert repair._finish(backup, manifest, "healed", rc) == rc
+    assert w.report()["result"] == "healed"
+
+
+@pytest.mark.parametrize(
+    "backup, body",
+    [
+        ("/x/100%done", "y" * 20_000),  # the cut note was a %-format holding the path
+        ("/x", "a\0b"),  # an argv string cannot hold a NUL
+        ("/x", "lone \ud800 surrogate " * 2_000),  # not a surrogateescape byte
+    ],
+    ids=["percent-in-path", "nul", "lone-surrogate"],
+)
+def test_no_alert_text_can_raise_out_of_the_alert(w, mod, backup, body):
+    """Security review W2: each of these raised past the alert's try (TypeError,
+    ValueError, UnicodeEncodeError), so a healed boot exited 1 again. However
+    the text looks, the alert logs and returns."""
+    repair, _backup, _manifest = _finished(w, mod)
+    repair._alert("critical", body, "live_move_repair:x", backup)
+    if "%" in backup:
+        [alert] = w.alerts()
+        assert len(alert["body"].encode()) <= mod.ALERT_BYTES, len(alert["body"])
+        assert "more bytes" in alert["body"] and backup in alert["body"]
+
+
+def test_the_report_dir_is_never_one_it_did_not_make(w, mod):
+    """Security review W1: a node already at the report's name (a symlink, or a
+    directory others can write) was adopted, and _sync's chmod walk followed
+    the link. The writer makes the dir itself, or finds the one it made this
+    run (0700, this user's); anything else refuses before a byte is saved."""
+    repair = mod.Repair(str(w.state), str(w.root), True, 0)
+    os.makedirs(repair.backups, exist_ok=True)
+    victim = w.gen / "victim"
+    victim.mkdir()
+    (victim / "f").write_text("x")
+    os.chmod(victim / "f", 0o666)
+    os.chmod(victim, 0o777)
+    link = Path(repair.backups) / f"20991231T000000Z-1{mod.SUFFIX}"
+    link.symlink_to(victim)
+    loose = Path(repair.backups) / f"20991231T000000Z-2{mod.SUFFIX}"
+    loose.mkdir()
+    os.chmod(loose, 0o775)
+    for planted in (link, loose):
+        with pytest.raises(mod.RepairError):
+            repair._report_dir(str(planted))
+    assert stat.S_IMODE(os.lstat(victim).st_mode) == 0o777
+    assert stat.S_IMODE(os.lstat(victim / "f").st_mode) == 0o666
+    own = Path(repair.backups) / f"20991231T000000Z-3{mod.SUFFIX}"
+    repair._report_dir(str(own))
+    repair._report_dir(str(own))  # again in the same run: its own dir
+    assert stat.S_IMODE(os.lstat(own).st_mode) == 0o700
+
+
+def test_write_json_never_writes_through_a_planted_temp(mod, tmp_path):
+    """Security review W1: the temp name is guessable (`<path>.<pid>.tmp`);
+    a link planted there had the JSON written into its target and was then
+    renamed over the report. The temp is created fresh, never followed."""
+    victim = tmp_path / "victim"
+    victim.write_text("keep")
+    path = tmp_path / "REPAIR.json"
+    os.symlink(victim, f"{path}.{os.getpid()}.tmp")
+    mod.write_json(str(path), {"a": 1}, private=True)
+    assert victim.read_text() == "keep"
+    assert not path.is_symlink() and json.loads(path.read_text()) == {"a": 1}
+    assert stat.S_IMODE(os.lstat(path).st_mode) == 0o600
+
+
+def _modes(root: Path) -> dict[str, int]:
+    """Every node below ``root`` (outside .git) by relative path: its lstat st_mode."""
+    out = {}
+    for top, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if not (top == str(root) and d == ".git")]
+        for name in dirs + files:
+            full = os.path.join(top, name)
+            out[os.path.relpath(full, root)] = os.lstat(full).st_mode
+    return out
+
+
+def _foreign_exec_edit(w):
+    (w.root / "sub" / "s1").write_text("mine, executable\n")
+    os.chmod(w.root / "sub" / "s1", 0o775)
+    return "sub/s1"
+
+
+def _group_writable(w, make):
+    """``make``'s foreign path, every non-executable regular file at or below
+    it made 0664: the copy loses the group-write bit, the record keeps the mode."""
+    path = make(w)
+    full = w.root / path
+    nodes = [full, *full.rglob("*")] if full.is_dir() and not full.is_symlink() else [full]
+    for node in nodes:
+        st = os.lstat(node)
+        if stat.S_ISREG(st.st_mode) and not st.st_mode & stat.S_IXUSR:
+            os.chmod(node, 0o664)
+    return path
+
+
+@pytest.mark.parametrize(
+    "make",
+    [_foreign_edit, _foreign_exec_edit, _foreign_untracked, _foreign_inside_dir, _foreign_symlink,
+     _foreign_fifo_inside_dir, _foreign_dir_symlink_inside_dir],
+)  # fmt: skip
+def test_saved_json_records_every_saved_copy(w, make):
+    """Rev 2 item 3 (owner ruling ced82b49: sha256): for every saved regular
+    file under tree/, its sha256 and the mode the checkout had (st_mode &
+    0o7777); a symlink, its target; a FIFO, its mode. In SAVED.json beside
+    REPAIR.json (which names it), so a large directory row cannot push
+    REPAIR.json over REPORT_BYTES."""
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: _group_writable(w, make))
+    age_locks(w)
+    before = _modes(w.root)
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    backup = w.backups()[-1]
+    report = w.report()
+    assert report.get("integrity") == "SAVED.json", sorted(report)
+    assert list(report)[-2:] == ["index_rebuilt", "integrity"], list(report)
+    saved = json.loads((backup / "SAVED.json").read_text())
+    assert set(saved) == {"files", "complete"} and saved["complete"] is True
+    tree, seen = backup / "tree", {}
+    for rel, mode in _modes(tree).items():
+        if stat.S_ISDIR(mode):
+            continue
+        full, key = tree / rel, f"tree/{rel}"
+        orig = stat.S_IMODE(before[rel])
+        if stat.S_ISLNK(mode):
+            seen[key] = {"type": "symlink", "target": os.readlink(full)}
+        elif stat.S_ISFIFO(mode):
+            seen[key] = {"type": "fifo", "mode": f"{orig:04o}"}
+        else:
+            sha = hashlib.sha256(full.read_bytes()).hexdigest()
+            seen[key] = {"type": "file", "mode": f"{orig:04o}", "sha256": sha}
+    assert seen and saved["files"] == seen
+    if make is not _foreign_symlink:  # it saves a link, no regular file of its own
+        modes = {v.get("mode") for v in seen.values()}
+        assert modes & {"0664", "0775"}, f"control: the planted modes: {modes}"
+
+
+@pytest.mark.parametrize("make", [_foreign_edit, _foreign_inside_dir])
+def test_a_saved_file_keeps_its_extended_attributes(w, make):
+    """The repair deletes the original after saving it, so the copy is the only
+    record: a foreign file's user.* extended attributes are copied with it, as
+    copy2 copied them before the hashing copier replaced it (#3973 review)."""
+    killed_tag_side(w, "Z3")
+    rel = make(w)
+    src = w.root / rel
+    files = [src] if src.is_file() else [p for p in src.rglob("*") if p.is_file()]
+    try:
+        for f in files:
+            os.setxattr(f, "user.genesis-test", f.name.encode())
+    except OSError as exc:  # tmpfs before 6.6, some overlay setups
+        pytest.skip(f"no user xattrs on this file system: {exc}")
+    age_locks(w)
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    tree = w.backups()[-1] / "tree"
+    copies = [tree / f.relative_to(w.root) for f in files]
+    assert copies and all(c.is_file() for c in copies), copies
+    for c in copies:
+        assert os.getxattr(c, "user.genesis-test") == c.name.encode(), c
+
+
+def test_a_file_over_the_hash_budget_is_recorded_without_a_hash(w, mod, monkeypatch):
+    """B1's per-file budget (FILE_BYTES): a bigger saved file is recorded with
+    sha256 null, which a restore then refuses (`too-large`), never guesses."""
+    monkeypatch.setattr(mod, "HASH_BYTES", 3, raising=False)
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: _foreign_edit(w))
+    age_locks(w)
+    assert mod.Repair(str(w.state), str(w.root), False, 0).run() == 0
+    backup = w.backups()[-1]
+    files = json.loads((backup / "SAVED.json").read_text())["files"]
+    sizes = {k: (backup / k).stat().st_size for k, v in files.items() if v["type"] == "file"}
+    assert {k for k, n in sizes.items() if n > 3} == {
+        k for k, v in files.items() if v["type"] == "file" and v["sha256"] is None
+    }
+    assert any(n > 3 for n in sizes.values()) and any(n <= 3 for n in sizes.values()), sizes
+
+
+def test_saved_json_stays_under_its_cap(w, mod, monkeypatch):
+    """SAVED.json is bounded like REPAIR.json: past SAVED_BYTES the writer
+    records no more and says so (`complete` false); a record left out is a
+    copy with no hash, which a restore refuses."""
+    monkeypatch.setattr(mod, "SAVED_BYTES", 400, raising=False)
+    killed_tag_side(w, "prepared")
+    age_locks(w)
+    assert mod.Repair(str(w.state), str(w.root), False, 0).run() == 0
+    raw = (w.backups()[-1] / "SAVED.json").read_bytes()
+    saved = json.loads(raw)
+    assert len(raw) <= 400 and saved["complete"] is False and saved["files"], raw
+
+
+def test_the_budgets_match_the_restore_and_the_argv_bound():
+    spec = importlib.util.spec_from_file_location("_restore", LIB / "live_move_restore.py")
+    restore = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(restore)
+    spec = importlib.util.spec_from_file_location("_writer", MODULE)
+    writer = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(writer)
+    assert writer.HASH_BYTES == restore.FILE_BYTES
+    assert writer.ALERT_BYTES * 2 < 131_072  # argv $4 and ALERT_BODY: one string each
+
+
+def test_the_report_folder_is_this_users_alone(w):
+    """Rev 2 item 4 (owner ruling 73b6285d): deploy-backups 0700 (an existing
+    one of this user's is set to it), the report dir 0700, REPAIR.json and
+    SAVED.json 0600, and nothing below with a group or world write bit, under
+    a umask that grants group write (genesis-server's UMask=0002)."""
+    (w.gen / "deploy-backups").mkdir()
+    os.chmod(w.gen / "deploy-backups", 0o775)
+    killed_tag_side(w, "Z3")
+
+    def plant():
+        _group_writable(w, _foreign_inside_dir)
+        os.mkfifo(w.root / "P" / "pipe")
+        os.chmod(w.root / "P" / "pipe", 0o662)
+        _foreign_staged(w)  # its blob is written to index-blobs/ under the umask
+
+    _lock_aside(w, plant)
+    age_locks(w)
+    old = os.umask(0o002)
+    try:
+        r = w.repair()
+    finally:
+        os.umask(old)
+    assert r.returncode == 0, r.stdout + r.stderr
+    backup = w.backups()[-1]
+    assert stat.S_IMODE(os.lstat(w.gen / "deploy-backups").st_mode) == 0o700
+    assert stat.S_IMODE(os.lstat(backup).st_mode) == 0o700
+    for name in ("REPAIR.json", "SAVED.json"):
+        assert stat.S_IMODE(os.lstat(backup / name).st_mode) == 0o600, name
+    loose = {rel: f"{stat.S_IMODE(m):04o}" for rel, m in _modes(backup).items()
+             if not stat.S_ISLNK(m) and m & 0o022}  # fmt: skip
+    assert loose == {}, loose
+    assert (backup / "tree" / "P" / "pipe").exists(), "control: the FIFO was saved"
+    assert (backup / "tree" / "P" / "mine.txt").exists(), "control: the file was saved"
+    assert any((backup / "index-blobs").iterdir()), "control: a blob was saved"
+
+
+def test_a_linked_backup_root_still_heals_and_warns(w):
+    """#3974 item 6 (owner ruling 2026-11-06: heal and warn): a deploy-backups
+    that is a link (or another user's, or writable by others) is still saved
+    into, since refusing would leave the checkout half-written, but the output
+    and the alert say the restore check refuses reports there."""
+    elsewhere = w.home / "elsewhere"
+    elsewhere.mkdir(mode=0o700)
+    (w.gen / "deploy-backups").symlink_to(elsewhere)
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: _foreign_inside_dir(w))
+    age_locks(w)
+    r = w.repair()
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert any(elsewhere.iterdir()), "control: the report was saved through the link"
+    assert w.report()["result"].startswith("healed"), w.report()["result"]
+    warning = "is not a folder of this user's alone"
+    assert warning in r.stdout, r.stdout
+    alerts = w.alerts()
+    assert alerts and alerts[-1]["severity"] == "critical" and warning in alerts[-1]["body"], alerts
+
+
+def test_repair_move_restore_reaches_the_kit(w):
+    """The command the writer prints, `scripts/deploy_candidates repair-move
+    --restore TS --check`, goes through the wrapper to the kit."""
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: _foreign_edit(w))
+    age_locks(w)
+    entry = _entry_checkout(w)
+    w.kit()
+    assert w.repair().returncode == 0
+    ts = w.report()["ts"]
+    r = subprocess.run(
+        ["bash", str(entry), "repair-move", "--restore", ts, "--check"],
+        capture_output=True, text=True, env=w.env(),
+    )  # fmt: skip
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert f"report {ts}: " in r.stdout and '"sub/s1" node as-left' in r.stdout, r.stdout
+
+
+@pytest.mark.parametrize("mode", ["--boot", "--command"])
+def test_a_fifo_at_the_state_path_never_stalls_the_repair(w, mode):
+    """#3964: the repair reads the state file under update.lock and the
+    checkout lock; a FIFO there (open blocks with no writer) would hold both
+    for every update and deploy. Read through the guard's bounded reader, it
+    is an unreadable state: nothing to repair, at once."""
+    os.mkfifo(w.state)
+    r = subprocess.run(
+        ["python3", "-I", "-S", str(MODULE), mode, str(w.state), str(w.root)],
+        capture_output=True, text=True, env=w.env(), timeout=30,
+    )  # fmt: skip
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "cannot be read" in r.stdout + r.stderr, r.stdout + r.stderr
+    assert stat.S_ISFIFO(os.lstat(w.state).st_mode), "the repair left the state path alone"

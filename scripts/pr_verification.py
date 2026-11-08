@@ -18,13 +18,14 @@ USAGE
         --note "needs an install with no graph engine" \\
         --evidence-file ~/.genesis/output/prv-1573.json
 
-THE VERDICT IS DERIVED FROM THE DOCUMENT, not chosen. The four verdicts are the
-owner's standing ruling (2026-09-26); which one a document supports is decided by
-``genesis.session_awareness.pr_evidence.derive``, a decision tree that gives every
-valid document exactly one:
+THE VERDICT IS DERIVED FROM THE DOCUMENT, not chosen. The verdicts are the owner's
+standing ruling (2026-09-26, not-yet-done added 2026-10-27); which one a document
+supports is decided by ``genesis.session_awareness.pr_evidence.derive``, a decision
+tree that gives every valid document exactly one:
 
   deploy.established is false           -> cannot-verify          LEAVES IT OPEN
   a claim failed at MEASURED or READ    -> fail-intent            LEAVES IT OPEN
+  a not_yet_done gap                    -> not-yet-done           LEAVES IT OPEN
   a claim failed at INFERRED            -> cannot-verify          LEAVES IT OPEN
   nothing passing at MEASURED or READ   -> cannot-verify          LEAVES IT OPEN
   no gaps                               -> pass-mechanical        CLOSES the row
@@ -33,9 +34,13 @@ valid document exactly one:
 Deployment comes first: ``deploy.established`` is required, and false derives
 cannot-verify (row OPEN, "DEPLOYMENT NOT ESTABLISHED" named) whatever the claims say.
 
-Gaps are the declared ``scope_limits`` plus the ones the document implies: no
-negative control, any NOT_VERIFIABLE_HERE claim, any INFERRED claim, and a named
-SUSPECTED FAILURE for each claim that failed only at INFERRED.
+Gaps are the declared ``gaps`` plus the ones the document implies: no negative
+control, any NOT_VERIFIABLE_HERE claim, any INFERRED claim, and a named SUSPECTED
+FAILURE for each claim that failed only at INFERRED. A declared gap is typed by its
+``kind``: ``method``, ``owner_only`` and ``event_gated`` (+``trigger``, +``recheck``)
+close with the gap named; ``not_yet_done`` keeps the row OPEN with its command at
+the head of the note. ``scope_limits``, the untyped list this replaced, is refused
+by name rather than mapped across.
 
 EACH CLAIM is ``pass``, ``fail`` or ``unverified``. ``unverified`` goes with tier
 NOT_VERIFIABLE_HERE and only with it; the model refuses either without the other,
@@ -55,17 +60,34 @@ What the caller still decides:
              cannot-verify instead, because something was established but nothing
              MATERIAL was. A failure can never be parked — it goes to the USER as a
              conversation, never an automatic rollback, and the defect gets filed.
-  --note     Required whenever the row stays open (fail-intent, cannot-verify): it
+  --note     Required when the row stays open on fail-intent or cannot-verify: it
              is the whole value of an open row, the thing that stops the next
-             validator re-deriving why. Refused when the row closes.
+             validator re-deriving why. Optional on not-yet-done, whose NOT YET
+             DONE gaps already are the note. Refused when the row closes.
   --verdict  OPTIONAL. An expectation checked for equality with the outcome; a
              mismatch refuses with "document derives X". Worth passing: it catches a
              document that does not say what you think it says.
 
 "I DID NOT GET TO IT" IS NOT ``cannot-verify``. The test is whether you could have
-done it with the access and the time you had. If yes it is not-yet-done: leave the
-row alone. Keep cannot-verify RARE, or the ledger fills with parked rows and the
-backlog stops meaning anything.
+done it with the access and the time you had. If yes it is not-yet-done: do it, or
+record a ``not_yet_done`` gap with the command that does it — the row stays open
+with that command leading its note, and ``--park`` is refused on it. Keep
+cannot-verify RARE, or the ledger fills with parked rows and the backlog stops
+meaning anything.
+
+``merge_commit`` IS CHECKED, NOT TRUSTED. ``close`` resolves the PR's real merge
+commit (``gh pr view --json mergeCommit,body``; the row stores none) and refuses a
+document whose ``merge_commit`` is not a prefix of it of at least 7 hex characters.
+MEASURED 2026-10-27: an independent re-verification found 5 of 15 documents in one
+group naming main HEAD or the host's deployed commit instead of the PR's merge. If
+the commit cannot be resolved (gh missing, offline, no merge commit) the close is
+refused and says why — a fault never waves a document through. ``--dry-run`` runs
+the check too.
+
+Declared E2E plans are checked in that same read. A closing result needs an
+``e2e`` mapping from each complete declaration to an existing claim or typed gap;
+missing or stale mappings refuse, including on ``--dry-run``. A reasoned
+``E2E: none`` needs none. Open attempts may still record incomplete evidence.
 
 WHERE THE DATABASE IS, and the trap that costs a confusing run: ``genesis_db_path()``
 resolves RELATIVE TO THE REPO ROOT, so running this from a linked worktree points
@@ -90,11 +112,14 @@ returns a false "not deployed" while the code is live and behaving correctly. Re
 live thing was observed doing it); ``ancestry`` is a fast positive path and never a
 negative verdict.
 
-EXIT CODES. 0 wrote (or dry-ran); 1 the ledger declined (no such open row, a race,
+EXIT CODES. 0 wrote (or dry-ran) with complete tracking; 4 measurement recorded
+(or previewed) but tracking pending, row OPEN. Re-read before retrying a 4: the
+measurement write succeeded. 1 the ledger declined (no such open row, a race,
 an absent or quarantined database); 2 the request was malformed (bad evidence, a
 missing or discarded note, a PR mismatch, a --verdict/--park the document does not
-support); 3 refused on policy (a failing claim under any other --verdict, or --park
-on a failure). Deliberately meaningful, which is why this is a separate script
+support, a merge commit that cannot be resolved); 3 refused on policy (a failing
+claim under any other --verdict, --park on a failure, a ``merge_commit`` that is
+not the PR's). Deliberately meaningful, which is why this is a separate script
 rather than a subcommand of ``repo_pulse_worker.py``: that module's documented
 contract is that its exit code is always 0.
 """
@@ -106,6 +131,7 @@ import asyncio
 import json
 import sqlite3
 import sys
+from collections.abc import Callable
 from datetime import UTC
 from pathlib import Path
 
@@ -123,9 +149,22 @@ from genesis.session_awareness.pr_evidence import (  # noqa: E402
     EvidenceDocument,
     EvidenceError,
     Refusal,
+    check_e2e_coverage,
     decide,
     parse_evidence,
+    parse_recheck_result,
     reason_for,
+    rechecks_for,
+)
+from genesis.session_awareness.pr_recording import (  # noqa: E402
+    PrMetadata,
+    _DuplicateKey,
+    _no_duplicates,
+    attempt_note,
+    check_merge_commit,
+    gh_merge_commit,
+    gh_pr_metadata,
+    resolve_repo,
 )
 
 __all__ = [
@@ -134,6 +173,9 @@ __all__ = [
     "TIERS",
     "EvidenceError",
     "build_reason",
+    "check_merge_commit",
+    "gh_merge_commit",
+    "gh_pr_metadata",
     "main",
     "resolve_repo",
     "validate_evidence",
@@ -155,34 +197,10 @@ def build_reason(doc: EvidenceDocument, decision: Decision) -> str:
     return reason_for(doc, decision)
 
 
-def resolve_repo(open_repos: list[str], pr_number: int, repo: str) -> str:
-    """Return *repo* if ``(repo, pr_number)`` is an OPEN obligation, else raise LookupError.
-
-    The document names the repository, so nothing is chosen here — only CHECKED.
-    Before the document named it, a ``--repo`` flag did, unchecked, and it closed a
-    DIFFERENT repository's obligation with this PR's evidence at exit 0, permanently
-    (MEASURED end-to-end on an earlier draft). "Nothing open for this PR" and "that
-    repo is not among the open ones" are different facts, so they read differently.
-    """
-    if not open_repos:
-        raise LookupError(
-            f"no OPEN row for PR #{pr_number} — it may be discharged already, or "
-            f"never opened. Run `python3 scripts/repo_pulse_worker.py "
-            f"--verification-backlog` to see the open set."
-        )
-    if repo not in open_repos:
-        raise LookupError(
-            f"no OPEN row for {repo}#{pr_number} (the repository the evidence document "
-            f"names). Open rows for PR #{pr_number}: {', '.join(open_repos)}. If the "
-            f"document names the wrong repository, correct the document."
-        )
-    return repo
-
-
 SCHEMA_TEMPLATE = {
     "repo": "<owner/name — with 'pr' this is the ledger row's key>",
     "pr": 1234,
-    "merge_commit": "<sha of the artifact you actually verified>",
+    "merge_commit": "<the PR's merge commit sha, 7+ hex chars — close checks it on GitHub>",
     "deploy": {
         "method": "behaviour | content | ancestry",
         "established": True,
@@ -200,9 +218,58 @@ SCHEMA_TEMPLATE = {
         "the arm that had to come out the other way, and did — without one the "
         "document derives pass-with-measured-gaps, never pass-mechanical"
     ],
-    "scope_limits": ["what this install could not reach, named"],
-    "findings": [{"summary": "what you found", "disposition": "issue #N | note | none"}],
+    "e2e": [{"step": "exact E2E declaration text, without the E2E: prefix", "claim": 0}],
+    "gaps": [
+        {"kind": "method", "detail": "a limit of HOW this was verified, accepted as it is"},
+        {"kind": "owner_only", "detail": "what only the owner can check"},
+        {
+            "kind": "event_gated",
+            "detail": "what cannot be measured until something happens",
+            "trigger": "YYYY-MM-DD, or the named event",
+            "recheck": "one read-only command or SQL that re-measures it",
+        },
+        {
+            "kind": "not_yet_done",
+            "detail": "reachable work you have not done — keeps the row OPEN",
+            "command": "what to run to do it",
+        },
+    ],
+    "findings": [{"summary": "what you found", "disposition": "see structured tracking"}],
+    "tracking": [
+        {"kind": "public", "target": "findings/0",
+         "url": "https://github.com/owner/repo/issues/123",
+         "quote": "exact excerpt read back from that open issue or its referenced comment",
+         "rationale": "how this task covers this concern"},
+        {"kind": "accepted_limit", "target": "gaps/0",
+         "rationale": "why this method limit needs no further work"},
+    ],
 }
+
+
+async def _close_schema_refusal(db, rechecks: list[dict]) -> str | None:
+    from genesis.db.crud import pr_verifications as crud
+
+    if not await crud.tables_available(db):
+        return "pr_verifications does not exist yet — this database predates the obligation ledger."
+    if not await crud._verdict_columns_available(db):
+        return (
+            "the verdict columns are not present yet. This database has the table "
+            "but not the migration — restart genesis-server (or run the migration runner) and retry."
+        )
+    if rechecks and not await crud._rechecks_column_available(db):
+        return (
+            "refusing to close: event-gated rechecks are owed, but the rechecks "
+            "column is not present yet. Run the migration before closing. Nothing was written."
+        )
+    return None
+
+
+def _print_recheck_plan(rechecks: list[dict]) -> None:
+    if not rechecks:
+        return
+    print(f"  rechecks : {len(rechecks)} to store")
+    for i, item in enumerate(rechecks):
+        print(f"    --index {i}  {item['trigger']}  recheck: {item['recheck']}")
 
 
 async def _write(
@@ -213,6 +280,7 @@ async def _write(
     note: str | None,
     payload: str,
     dry_run: bool,
+    pr_metadata_of: Callable[[str, int], PrMetadata],
 ) -> int:
     import aiosqlite
 
@@ -239,30 +307,20 @@ async def _write(
     from genesis.db.connection import connect_aiosqlite_rw
 
     pr_number = doc.pr
+    rechecks = []
     # Set the moment a writer COMMITS. Anything that fails after that (the success
     # print, the connection's close) must not be reported as "nothing recorded" —
     # a retry would then meet a closed row and a message that contradicts it.
     committed: str | None = None
+    committed_code = 0
     try:
         async with connect_aiosqlite_rw(resolved, timeout=10) as db:
             await db.execute("PRAGMA busy_timeout=5000")
             db.row_factory = aiosqlite.Row
 
-            if not await crud.tables_available(db):
-                print(
-                    "pr_verification: pr_verifications does not exist yet — this "
-                    "database predates the obligation ledger.",
-                    file=sys.stderr,
-                )
-                return 1
-            if not await crud._verdict_columns_available(db):
-                print(
-                    "pr_verification: the verdict columns are not present yet. This "
-                    "database has the table but not the migration — restart "
-                    "genesis-server (or run the migration runner) and retry.",
-                    file=sys.stderr,
-                )
-                return 1
+            schema_error = await _close_schema_refusal(db, rechecks)
+            if schema_error:
+                return _refuse(schema_error, 1)
 
             open_repos = await crud.open_repos_for_pr(db, pr_number=pr_number)
             try:
@@ -271,6 +329,34 @@ async def _write(
                 print(f"pr_verification: {exc}", file=sys.stderr)
                 return 1
 
+            # After the row lookup, so a PR with no open row costs no network call.
+            try:
+                actual = pr_metadata_of(target, pr_number)
+            except LookupError as exc:
+                print(
+                    f"pr_verification: cannot check merge_commit — the merge commit of "
+                    f"{target}#{pr_number} did not resolve: {exc}. Nothing was written; "
+                    f"retry where gh can reach GitHub.",
+                    file=sys.stderr,
+                )
+                return 2
+            mismatch = check_merge_commit(doc.merge_commit, actual.merge_commit)
+            if mismatch:
+                print(f"pr_verification: {mismatch}", file=sys.stderr)
+                return 3
+
+            from genesis.session_awareness.pr_tracking import assess_tracking
+
+            tracking = await assess_tracking(doc, db=db)
+            closing = decision.closing and tracking.complete
+            coverage = check_e2e_coverage(doc, actual.body) if closing else None
+            if coverage:
+                return _refuse(coverage.message, coverage.code)
+            rechecks = rechecks_for(doc) if closing else []
+            if rechecks:
+                schema_error = await _close_schema_refusal(db, rechecks)
+                if schema_error:
+                    return _refuse(schema_error, 1)
             verdict = decision.verdict
             reason = build_reason(doc, decision)
             # An open row's note is the validator's own words, with two kinds of
@@ -280,35 +366,32 @@ async def _write(
             # stored document would read there exactly like an ordinary precondition.
             # A long prefix can push the validator's words past the backlog's clip;
             # the clip marker names the read that shows them whole. And a park, which
-            # is a judgment the note must own up to.
-            attempt_note = None
-            if not decision.closing:
-                attempt_note = str(note).strip()
-                visible = [g for g in decision.derivation.gaps if g.startswith(NOTE_PREFIXED_GAPS)]
-                if visible:
-                    attempt_note = "; ".join(visible) + " — " + attempt_note
-                if decision.parked:
-                    attempt_note = "PARKED (nothing material established) — " + attempt_note
+            # is a judgment the note must own up to. On not-yet-done the note is
+            # optional, so the prefix may be all there is — never "None" in its place.
+            rendered_note = attempt_note(decision, note)
+            if not tracking.complete:
+                rendered_note = tracking.note(rendered_note)
 
             if dry_run:
                 print("pr_verification: DRY RUN — nothing written.")
                 print(f"  target   : {target}#{pr_number}")
                 print(
                     f"  verdict  : {verdict}  "
-                    f"({'CLOSES the row' if decision.closing else 'row STAYS OPEN'})"
+                    f"({'CLOSES the row' if closing else 'row STAYS OPEN'})"
                 )
-                if decision.closing:
+                if closing:
                     print(f"  reason   : {reason}")
                 else:
-                    print(f"  note     : {attempt_note}")
+                    print(f"  note     : {rendered_note}")
+                _print_recheck_plan(rechecks)
                 print(f"  evidence : {len(payload.encode('utf-8'))} bytes")
-                return 0
+                return 0 if tracking.complete else 4
 
             from datetime import datetime
 
             now = datetime.now(UTC).isoformat()
 
-            if decision.closing:
+            if closing:
                 changed = await crud.close_verification(
                     db,
                     repo=target,
@@ -329,6 +412,8 @@ async def _write(
                     return 1
                 committed = f"CLOSED {target}#{pr_number} as {verdict}"
                 print(f"pr_verification: CLOSED {target}#{pr_number} — {reason} at {now}")
+                if rechecks:
+                    print(f"  {len(rechecks)} recheck(s) stored on the closed row.")
                 return 0
 
             outcome = await crud.record_attempt(
@@ -336,9 +421,10 @@ async def _write(
                 repo=target,
                 pr_number=pr_number,
                 verdict=verdict,
-                note=attempt_note,
+                note=rendered_note,
                 now=now,
                 evidence=payload,
+                tracking_pending=not tracking.complete,
             )
             if outcome != "recorded":
                 print(
@@ -348,6 +434,10 @@ async def _write(
                 )
                 return 1
             committed = f"{verdict} recorded on {target}#{pr_number}, row still OPEN"
+            if not tracking.complete:
+                committed_code = 4
+                print(f"pr_verification: {committed}. {rendered_note}")
+                return 4
             print(
                 f"pr_verification: {target}#{pr_number} STAYS OPEN — {verdict} recorded "
                 f"at {now}. The obligation is not discharged."
@@ -367,12 +457,17 @@ async def _write(
                     "  Deployment was not established, so nothing measured here is a "
                     "finding about the PR. Deploy the merge and re-run."
                 )
+            elif verdict == "not-yet-done":
+                print(
+                    "  Work the document names is NOT YET DONE: run the commands above, "
+                    "then record the result with a fresh close."
+                )
             elif any(g.startswith(SUSPECTED_FAILURE) for g in gaps):
                 print(
                     "  A failure was SUSPECTED but not established. Measure it if you "
                     "can; until then it is a named gap on an open row, not a finding."
                 )
-            return 0
+            return committed_code
     except DatabaseIntegrityError as exc:
         print(f"pr_verification: refusing to write — {exc}", file=sys.stderr)
         return 1
@@ -387,7 +482,7 @@ async def _write(
                 f"{pr_number}`.",
                 file=sys.stderr,
             )
-            return 0
+            return committed_code
         # A lock held past busy_timeout, a malformed file, a full disk: the ledger
         # declined, which is exit 1 by this tool's contract — not a traceback. Each
         # writer commits in one statement, and none had committed, so nothing was
@@ -400,30 +495,169 @@ async def _write(
         return 1
 
 
-class _DuplicateKey(ValueError):
-    pass
-
-
-def _no_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    # json.loads keeps the LAST of two equal keys without a word, so a document with
-    # "verdict" twice records whichever the author wrote second. Refuse instead.
-    out: dict[str, object] = {}
-    for key, value in pairs:
-        if key in out:
-            raise _DuplicateKey(
-                f"the evidence document repeats the key {key!r} in one object; JSON "
-                f"would keep only the last one silently, so it is refused"
-            )
-        out[key] = value
-    return out
-
-
 def _refuse(message: str, code: int) -> int:
     print(f"pr_verification: {message}", file=sys.stderr)
     return code
 
 
-def main(argv: list[str] | None = None) -> int:
+_RECHECK_REFUSALS = {
+    "missing": (1, "there is no CLOSED row for {key} — a recheck belongs to a discharged row"),
+    "no-rechecks": (1, "{key} is closed but stores no rechecks"),
+    "not-json": (
+        1,
+        "{key}'s rechecks column is not valid JSON; read it with "
+        "`repo_pulse_worker.py --verification-log --pr {pr}`",
+    ),
+    "bad-entry": (
+        1,
+        "{key}'s recheck --index {index} is not in the stored shape; read it with "
+        "`repo_pulse_worker.py --verification-log --pr {pr}`",
+    ),
+    "out-of-range": (
+        2,
+        "{key} has no recheck at --index {index}; the backlog's Rechecks "
+        "due section prints the exact --index for each one",
+    ),
+    "already-done": (
+        1,
+        "recheck --index {index} on {key} is already done; a finished "
+        "recheck takes no further results",
+    ),
+    "unavailable": (
+        1,
+        "the rechecks column is not present yet — restart genesis-server "
+        "(or run the migration runner) and retry",
+    ),
+    "raced": (1, "{key} changed while this was being written; re-read it and retry"),
+}
+
+
+async def _recheck(
+    *,
+    db_path: str,
+    pr_number: int,
+    index: int,
+    repo: str,
+    result: str,
+    note: str,
+    dry_run: bool,
+) -> int:
+    from datetime import datetime
+
+    import aiosqlite
+
+    from genesis.db.connection import connect_aiosqlite_rw
+    from genesis.db.crud import pr_verifications as crud
+    from genesis.db.integrity import DatabaseIntegrityError
+
+    resolved = Path(db_path)
+    if not resolved.exists():
+        print(
+            f"pr_verification: no database at {resolved} — pass --db-path, or run "
+            f"from the main checkout.",
+            file=sys.stderr,
+        )
+        return 1
+    key = f"{repo}#{pr_number}"
+    state = None
+    try:
+        async with connect_aiosqlite_rw(resolved, timeout=10) as db:
+            await db.execute("PRAGMA busy_timeout=5000")
+            db.row_factory = aiosqlite.Row
+            if dry_run:
+                state = await crud.recheck_state(db, repo=repo, pr_number=pr_number, index=index)
+            else:
+                state = await crud.append_recheck_result(
+                    db,
+                    repo=repo,
+                    pr_number=pr_number,
+                    index=index,
+                    result=result,
+                    note=note,
+                    now=datetime.now(UTC).isoformat(),
+                )
+        if state not in ("ok", "recorded"):
+            code, why = _RECHECK_REFUSALS[state]
+            return _refuse(why.format(key=key, pr=pr_number, index=index), code)
+        verb = "DRY RUN — would append" if dry_run else "appended"
+        print(
+            f"pr_verification: {verb} {result!r} to recheck --index {index} on {key}. "
+            f"The row stays CLOSED."
+        )
+        if result == "failed" and not dry_run:
+            print(
+                "  The recheck FAILED: bring it to the user as fail-intent — a conversation, "
+                "never an automatic rollback. Nothing was filed; it stays due."
+            )
+        return 0
+    except DatabaseIntegrityError as exc:
+        print(f"pr_verification: refusing to write — {exc}", file=sys.stderr)
+        return 1
+    except (sqlite3.Error, OSError) as exc:
+        # As in _write: a failure after the append committed (closing the connection)
+        # must not send the validator to append the same result twice.
+        landed = "the append COMMITTED" if state == "recorded" else "Nothing was recorded"
+        print(
+            f"pr_verification: the ledger declined — {type(exc).__name__}: {exc}. {landed}.",
+            file=sys.stderr,
+        )
+        return 0 if state == "recorded" else 1
+
+
+def _load_json(path: Path, what: str) -> object:
+    """Load strictly; failures raise, so scalar JSON can never become an exit code."""
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise EvidenceError(f"cannot read {what} file {path}: {exc}") from None
+    if len(raw) > MAX_EVIDENCE_BYTES:
+        raise EvidenceError(
+            f"{what} file is {len(raw)} bytes, over the {MAX_EVIDENCE_BYTES}-byte cap; "
+            "REFUSED rather than cut"
+        )
+    try:
+        return json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicates)
+    except UnicodeDecodeError as exc:
+        raise EvidenceError(f"{what} file is not UTF-8: {exc}") from None
+    except json.JSONDecodeError as exc:
+        raise EvidenceError(f"{what} file is not valid JSON: {exc}") from None
+    except _DuplicateKey as exc:
+        raise EvidenceError(str(exc)) from None
+    except ValueError as exc:
+        raise EvidenceError(f"{what} file has an unsupported JSON value: {exc}") from None
+    except RecursionError:
+        raise EvidenceError(f"{what} file is nested too deeply") from None
+
+
+def _run_recheck(args: argparse.Namespace) -> int:
+    from genesis.env import genesis_db_path
+
+    if args.index < 0:
+        return _refuse(f"--index must be 0 or more, got {args.index}", 2)
+    if not 1 <= args.pr <= 2**63 - 1:
+        return _refuse("--pr must be in the SQLite integer key range 1..2**63-1", 2)
+    try:
+        res = parse_recheck_result(_load_json(Path(args.result_file).expanduser(), "result"))
+    except EvidenceError as exc:
+        return _refuse(f"the result file is malformed:\n{exc}", 2)
+    return asyncio.run(
+        _recheck(
+            db_path=args.db_path or str(genesis_db_path()),
+            pr_number=args.pr,
+            index=args.index,
+            repo=res.repo,
+            result=res.result,
+            note=res.note,
+            dry_run=args.dry_run,
+        )
+    )
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    pr_metadata_of: Callable[[str, int], PrMetadata] | None = None,
+) -> int:
     from genesis.db.crud import pr_verifications as crud
 
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
@@ -470,34 +704,41 @@ def main(argv: list[str] | None = None) -> int:
     )
     close.add_argument("--db-path", default=None, help="override the database path")
 
+    recheck = sub.add_parser(
+        "recheck",
+        help="append a dated result to a CLOSED row's event-gated recheck (never reopens it)",
+    )
+    recheck.add_argument("--pr", type=int, required=True, help="the closed row's PR number")
+    recheck.add_argument(
+        "--index",
+        type=int,
+        required=True,
+        help="0-based position in the row's stored rechecks (NOT in the document's gaps); "
+        "the backlog's Rechecks due section prints it",
+    )
+    recheck.add_argument(
+        "--result-file",
+        required=True,
+        help='JSON {"repo": "owner/name", "result": "done" | "failed", "note": "..."}',
+    )
+    recheck.add_argument(
+        "--dry-run", action="store_true", help="check the target and show the append, write nothing"
+    )
+    recheck.add_argument("--db-path", default=None, help="override the database path")
+
     args = parser.parse_args(argv)
 
     if args.command == "print-schema":
         print(json.dumps(SCHEMA_TEMPLATE, indent=2))
         return 0
 
-    path = Path(args.evidence_file).expanduser()
+    from genesis.env import genesis_db_path
+
+    if args.command == "recheck":
+        return _run_recheck(args)
+
     try:
-        raw = path.read_bytes()
-    except FileNotFoundError:
-        return _refuse(f"cannot read evidence file {path}: it does not exist", 2)
-    except OSError as exc:
-        return _refuse(f"cannot read evidence file {path}: {exc}", 2)
-    if len(raw) > MAX_EVIDENCE_BYTES:
-        return _refuse(
-            f"evidence file is {len(raw)} bytes, over the {MAX_EVIDENCE_BYTES}-byte "
-            f"cap — REFUSED rather than cut, because a truncated evidence record still "
-            f"looks complete.",
-            2,
-        )
-    try:
-        doc = validate_evidence(json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicates))
-    except UnicodeDecodeError as exc:
-        return _refuse(f"evidence file is not UTF-8: {exc}", 2)
-    except json.JSONDecodeError as exc:
-        return _refuse(f"evidence file is not valid JSON: {exc}", 2)
-    except _DuplicateKey as exc:
-        return _refuse(str(exc), 2)
+        doc = validate_evidence(_load_json(Path(args.evidence_file).expanduser(), "evidence"))
     except EvidenceError as exc:
         return _refuse(f"the evidence document is malformed:\n{exc}", 2)
 
@@ -529,8 +770,6 @@ def main(argv: list[str] | None = None) -> int:
             2,
         )
 
-    from genesis.env import genesis_db_path
-
     return asyncio.run(
         _write(
             db_path=args.db_path or str(genesis_db_path()),
@@ -539,6 +778,7 @@ def main(argv: list[str] | None = None) -> int:
             note=args.note,
             payload=payload,
             dry_run=args.dry_run,
+            pr_metadata_of=pr_metadata_of or gh_pr_metadata,
         )
     )
 

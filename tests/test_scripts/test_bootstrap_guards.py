@@ -255,7 +255,7 @@ def test_b9_no_pipe_to_shell():
     assert "install.sh | bash" not in code
     assert "uv/install.sh | sh" not in code
     # … replaced by download-to-file then execute-from-file (full download first).
-    assert 'curl -LsSf https://astral.sh/uv/install.sh -o "$_uv_installer"' in code
+    assert 'curl -LsSf "https://astral.sh/uv/$GENESIS_UV_VERSION/install.sh" -o "$_uv_installer"' in code
     assert 'sh "$_uv_installer"' in code
     # The optional legacy helper remains independently pinned; ordinary setup
     # no longer invokes it or fetches a raw provider.
@@ -777,7 +777,7 @@ def test_update_state_persists_the_recovery_ownership_inputs(
 ):
     text = UPDATE.read_text()
     start = text.index("_write_state() {")
-    end = text.index("\n}\n\n# Clear this run's deploy state files", start) + 2
+    end = text.index("\n}\n", start) + 2
     state_path = tmp_path / "home" / ".genesis" / "update_state.json"
     script = (
         'set -euo pipefail; STATE_FILE="$1"; STARTED_AT="2026-01-01T00:00:00Z"; '

@@ -129,6 +129,14 @@ working I/O throttle here) under load and kills a run that can't make headway. A
 guardrail test (`tests/test_scripts/test_code_intel_index.py`) fails the build on
 any new raw spawn site. `CODE_INTEL_INDEX_DISABLE=1` skips indexing entirely.
 
+**Automatic consumption is currently paused.** Until the queue protocol's
+explicit strict cutover lands, the runner observes readiness first and defers
+each tick that reaches it (exit 0, logged "automatic queue protocol incomplete"), so markers
+accumulate and no index refreshes on its own, including a fresh install's first
+index. Refresh by hand when freshness matters:
+`scripts/lib/code_intel_index.sh "$PWD" gitnexus fast` (the manual entrypoint is
+not fenced).
+
 **Emergency kill-switch — `genesis-code-intel-freeze`.** A managed systemd USER
 unit (`scripts/code_intel_freeze.sh`) that holds BOTH single-flight locks (the
 main-repo lock and the runner self-lock), so while armed nothing indexes at all:

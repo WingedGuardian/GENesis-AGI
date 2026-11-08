@@ -25,8 +25,9 @@ from genesis.dashboard.update_marker import (
     release_marker,
 )
 from genesis.db.connection import connect_sqlite_rw
-from genesis.env import genesis_home, update_in_progress
+from genesis.env import genesis_home, read_update_state, update_in_progress
 from genesis.observability.deploy_record import row_facts
+from genesis.util.systemd import literal_scope_args
 
 logger = logging.getLogger(__name__)
 
@@ -437,7 +438,7 @@ def _systemd_run_scope_available(env: dict) -> bool:
     """
     try:
         r = subprocess.run(
-            ["systemd-run", "--user", "--scope", "--", "true"],
+            ["systemd-run", "--user", "--scope", *literal_scope_args(), "--", "true"],
             capture_output=True, timeout=10, env=env,
         )
         return r.returncode == 0
@@ -465,7 +466,7 @@ def _apply_direct(pid_file: Path) -> tuple:
         env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus")
         if _systemd_run_scope_available(env):
             proc = subprocess.Popen(
-                ["systemd-run", "--user", "--scope", "--", "bash", str(_UPDATE_SCRIPT)],
+                ["systemd-run", "--user", "--scope", *literal_scope_args(), "--", "bash", str(_UPDATE_SCRIPT)],
                 stdout=log_fh,
                 stderr=subprocess.STDOUT,
                 env=env,
@@ -542,7 +543,8 @@ You are supervising a Genesis update. Your role is WATCH AND ESCALATE.
    the user's decision. Write to {summary_file}: "refused: <the units it names>".
    Do not write {escalation_file}. Done.
 
-7. If exit 5 (refused, an earlier update unfinished):
+7. If exit 5 (refused: an earlier update unfinished, or this OS below the
+   supported floor, which update.sh names in one line):
    Exit 5 means update.sh REFUSED, before changing anything, because an earlier
    update's ~/.genesis/update_state.json still guards code it merged and never
    activated, merge conflicts it is waiting on, or a checkout it left half-written
@@ -823,7 +825,7 @@ def _apply_supervised(pid_file: Path) -> tuple:
             "DBUS_SESSION_BUS_ADDRESS", f"unix:path=/run/user/{uid}/bus"
         )
         proc = subprocess.Popen(
-            ["systemd-run", "--user", "--scope", "--", python, script_path],
+            ["systemd-run", "--user", "--scope", *literal_scope_args(), "--", python, script_path],
             stdout=log_fh,
             stderr=subprocess.STDOUT,
             env=env,
@@ -1157,8 +1159,8 @@ def update_progress():
     state_data = None
     state_exists = _STATE_FILE.exists() or _STATE_FILE.is_symlink()
     if state_exists:
-        with contextlib.suppress(ValueError, OSError):
-            state_data = json.loads(_STATE_FILE.read_text())
+        with contextlib.suppress(ValueError, OSError, RecursionError):
+            state_data = json.loads(read_update_state(_STATE_FILE).decode("utf-8"))
         if isinstance(state_data, dict) and isinstance(state_data.get("phase"), str):
             phase = state_data["phase"]
     state_unreadable = state_exists and not isinstance(state_data, dict)
