@@ -260,8 +260,10 @@ jobs:
             # (not configured) require the timer to stay off.
             if [ "$_n" = "genesis-transcript-analytics.timer" ]; then
               if ! ( . scripts/lib/venv_setup.sh && transcript_analytics_ready .venv ); then
-                if systemctl --user is-enabled --quiet "$_n"; then
-                  echo "::error::$_n is enabled although transcript analytics is not configured"
+                # install.sh's `disable --now` ignores its own failure, so a
+                # timer left running would pass an enabled-only check.
+                if systemctl --user is-enabled --quiet "$_n" || systemctl --user is-active --quiet "$_n"; then
+                  echo "::error::$_n is enabled or active although transcript analytics is not configured"
                   exit 1
                 fi
                 continue
@@ -356,12 +358,22 @@ jobs:
             systemctl --user status "$_ta.timer" --no-pager -l || true
             exit 1
           fi
-          systemctl --user start "$_ta.service" || true
+          # Both: the start's own status (a run the timer fired first could leave
+          # Result=success behind a failed start) and the unit's Result.
+          _ta_start=0
+          systemctl --user start "$_ta.service" || _ta_start=$?
           _ta_result=$(systemctl --user show -p Result --value "$_ta.service")
-          if [ "$_ta_result" != "success" ]; then
-            echo "::error::$_ta.service ran with Result=$_ta_result"
+          if [ "$_ta_start" -ne 0 ] || [ "$_ta_result" != "success" ]; then
+            echo "::error::$_ta.service start exited $_ta_start with Result=$_ta_result"
             systemctl --user status "$_ta.service" --no-pager -l || true
             journalctl --user -u "$_ta.service" --no-pager -n 80 || true
+            # The unit's own output may not reach this user's journal on a
+            # runner: run the same command line once more, outside systemd, so
+            # the failure is named.
+            echo "--- the unit's command, run directly:"
+            _ta_rc=0
+            .venv/bin/python -m genesis transcripts ingest --timer || _ta_rc=$?
+            echo "--- exit status: $_ta_rc"
             exit 1
           fi
           # Leave the box as a fresh install left it.
