@@ -22,8 +22,8 @@ from tests.test_cc.test_managed_fallback import managed as managed
 
 
 @pytest.mark.skipif(shutil.which("claude") is None, reason="native Claude CLI unavailable")
-@pytest.mark.real_tool("claude")  # runs the installed CLI against a local synthetic provider
-@pytest.mark.user_manager  # and its real transient --user scope
+@pytest.mark.real_tool("claude", "systemctl")  # the installed CLI, and systemctl to confirm its scope drained
+@pytest.mark.user_manager  # its real transient --user scope
 async def test_native_managed_failover_and_committed_result(managed, monkeypatch, tmp_path):
     b = managed
     config = tmp_path / "cli-config"
