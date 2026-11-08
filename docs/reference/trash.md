@@ -171,7 +171,30 @@ is why the note says "if this session created them, nothing to do".
 
 ## Retention and backups
 
-Nothing expires trash entries; expiry is blocked on #2504. The disk watchdog's
+Nothing expires trash entries on a schedule. `scripts/worktree_lifecycle.py
+--expire-trash --retention-days N` expires a reaper archive only when every
+check below holds, and keeps it (logging `KEEP <name>: <reason>`) otherwise:
+
+- the reaper recorded it on the merged lane with no uncommitted changes, and it
+  is older than N days;
+- its recorded head still resolves, and a fresh merge check of that head says
+  it is an ancestor of `main` or the exact head of a PR merged into the default
+  branch (a patch-id match is not enough);
+- every file in the tarball matches that head's tree byte for byte (git blob
+  ids, symlink targets included), apart from regenerable paths: Python and tool
+  caches (`__pycache__`, `.pytest_cache`, `.ruff_cache`, `.mypy_cache`, `.venv`,
+  `venv`, `node_modules`, `.tox`, `*.pyc`, `*.pyo`), the worktree's `.git`
+  pointer file, the reaper's `.trash_meta.json`, an `.abide` symlink,
+  `config/.generated/`, and `*.egg-info/`;
+- the archive reads cleanly to the end of its gzip stream.
+
+Legacy directory entries are never expired. `--dry-run` reports how many would
+expire. One residual: once an archive judged by its merged PR expires, its exact
+head commit survives only in the hosting service's PR refs, since squash merges
+keep its changes but not the commit itself, and where `main` also changed a
+file the PR touched, not its exact files either. Expiry also removes the
+archive's worktree registration, and with it that worktree's own reflog and
+index, which the archive never held. The disk watchdog's
 YELLOW attribution lists `~/.genesis/trash` and `~/.genesis/worktree-trash` on
 their own lines, so trash growth is named when a disk fills. `backup.sh` names
 its stores explicitly and does not include the trash.
