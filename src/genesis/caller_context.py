@@ -13,6 +13,10 @@ it on every Claude Code child, and stdio MCP servers inherit it:
 - ``CLAUDE_CODE_SESSION_ID``: the Claude Code transcript id (the charter key).
 - ``CLAUDE_SESSION_ID``: a legacy name current Claude Code no longer sets; only
   the trash tombstone still reads it.
+- ``GENESIS_CALLER_PROFILE``: the client a stdio server serves, set by that
+  client's launcher (``codex`` for owner-mode Codex). Read into
+  :attr:`CallerContext.profile`; it labels what the client did and never grants
+  anything.
 
 Code must not read those variables itself. It calls :func:`caller_context`,
 and a test fails on any direct read under ``src/`` outside this module. The
@@ -58,7 +62,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterator, MutableMapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -71,6 +75,9 @@ SESSION_ID_ENV = "GENESIS_SESSION_ID"
 SESSION_ORIGIN_ENV = "GENESIS_SESSION_ORIGIN"
 TRANSCRIPT_ID_ENV = "CLAUDE_CODE_SESSION_ID"
 LEGACY_SESSION_ID_ENV = "CLAUDE_SESSION_ID"
+# The client a stdio server is serving, set by that client's launcher (``codex``
+# for owner-mode Codex). A record of which client acted, never a permission.
+PROFILE_ENV = "GENESIS_CALLER_PROFILE"
 
 IDENTITY_ENV_VARS = frozenset(
     {
@@ -80,6 +87,7 @@ IDENTITY_ENV_VARS = frozenset(
         SESSION_ORIGIN_ENV,
         TRANSCRIPT_ID_ENV,
         LEGACY_SESSION_ID_ENV,
+        PROFILE_ENV,
     }
 )
 
@@ -150,7 +158,18 @@ def caller_context_from_env() -> CallerContext:
         origin=env.get(SESSION_ORIGIN_ENV),
         transcript_id=env.get(TRANSCRIPT_ID_ENV),
         legacy_session_id=env.get(LEGACY_SESSION_ID_ENV),
+        profile=env.get(PROFILE_ENV) or None,
     )
+
+
+def drop_client_label(env: MutableMapping[str, str]) -> MutableMapping[str, str]:
+    """Remove the client label from a child's environment, in place.
+
+    A process Genesis spawns is never the labelled client itself, so it must
+    not inherit the label and have its calls recorded as that client's.
+    """
+    env.pop(PROFILE_ENV, None)
+    return env
 
 
 def caller_context() -> CallerContext:

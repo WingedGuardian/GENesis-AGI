@@ -21,6 +21,8 @@
 #      (WS-5 Discord observe-only gate log; bounds the shadow store)
 #   8. Retention prune of session_ledger_shadow_* (>45d) → scripts/prune_ledger_shadow.py
 #      (session-manager PR-3 ambient extractor shadow store; runs + events)
+#   8a. Retention prune of client_tool_calls (default 180d) → scripts/prune_client_tool_calls.py
+#      (labelled-client tool-call log, e.g. owner-mode Codex)
 #   8b. Retention prune of ~/.genesis/sessions/<id>/ (>60d, whole dirs)
 #      (per-session state + SessionStart context mirrors; age far exceeds any
 #      live session, which rewrites last_prompt_time every prompt)
@@ -803,6 +805,10 @@ maintenance_main() {
     echo "--- ledger shadow retention prune (>45d) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_ledger_shadow.py" --days 45 \
         || echo "prune_ledger_shadow exited $?"
+
+    echo "--- client tool-call log retention prune (default window) ---"
+    "$VENV_PY" "$REPO_DIR/scripts/prune_client_tool_calls.py" \
+        || echo "prune_client_tool_calls exited $?"
 
     echo "--- repo pulse retention prune (>45d) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_repo_pulse.py" --days 45 \

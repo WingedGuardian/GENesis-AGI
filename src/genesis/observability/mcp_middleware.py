@@ -39,6 +39,7 @@ def install_instrumentation(server, tracker, server_name: str, db) -> None:
         if not (isinstance(middleware, InstrumentationMiddleware)
                 and middleware._server == server_name)
     ]
+    _install_client_call_log(server, server_name)
     if not isinstance(db, RequestDatabase) and tracker is None:
         return
     # Health's external read-only instrumentation already declines legacy
@@ -52,6 +53,23 @@ def install_instrumentation(server, tracker, server_name: str, db) -> None:
     ):
         db = None
     server.add_middleware(InstrumentationMiddleware(tracker, server_name, db=db))
+
+
+def _install_client_call_log(server, server_name: str) -> None:
+    """Install the labelled-client call log on this server.
+
+    It decides per call, from ``caller_context()``, whether the caller is a
+    labelled client (owner-mode Codex); unlabelled calls pass straight through.
+    Re-installation replaces the previous log middleware for this server.
+    """
+    from genesis.observability.client_call_log import ClientCallLogMiddleware
+
+    server.middleware[:] = [
+        middleware for middleware in server.middleware
+        if not (isinstance(middleware, ClientCallLogMiddleware)
+                and middleware._server == server_name)
+    ]
+    server.add_middleware(ClientCallLogMiddleware(server_name))
 
 # Staleness verdict (`is_stale`) + the prefix-tolerant compare (`same_commit`) live
 # in the stdlib-only ``commit_identity`` leaf so the dashboard (Part B) shares the
