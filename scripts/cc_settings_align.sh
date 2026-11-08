@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # cc_settings_align.sh — recurring CONTAINER-side reconcile of Claude Code's
-# auto-updater suppression, plus the set-if-absent container settings defaults
+# auto-updater suppression, shared retention policy and container settings defaults
 # (cc_reconcile_container_settings in scripts/lib/cc_version.sh — the same call
 # every other container path makes).
 #
@@ -23,12 +23,13 @@
 # that script is host-only by contract and its unit is hardened on that basis, so
 # a container-side filesystem write does not belong there.
 #
-# Exit codes: 0 ONLY when suppression was positively verified — the keys were
+# Exit codes: 0 ONLY when the effective settings policy was positively verified —
+# suppression and retention were
 # already correct (with or without new set-if-absent defaults written, state
 # `defaults`), or were repaired (a repair is logged loudly; a REPEAT repair
 # across runs is the real "something on this machine keeps rewriting
-# settings.json" signal), or another run of THIS script already holds the lock
-# and is doing the work. Every other path exits non-zero, including the
+# settings.json" signal), or a lock-contended read-only check verified the same
+# policy. Every other path exits non-zero, including the
 # structural ones (no lock, no library, function renamed away): a path that
 # verified nothing must never report success, or the unit becomes a green light
 # for an unguarded auto-updater. The unit then enters `failed` and the miss is
@@ -105,6 +106,23 @@ _persist_outcome() {
     return 0
 }
 
+if [ ! -f "$CC_ENV" ]; then
+    echo "cc_settings_align: $CC_ENV missing — cannot load the reconciler; suppression NOT verified"
+    exit 3
+fi
+
+# shellcheck source=/dev/null
+source "$CC_ENV"
+
+for _fn in cc_ensure_updater_suppressed cc_reconcile_container_settings cc_resolve_container_defaults; do
+    if ! declare -F "$_fn" >/dev/null 2>&1; then
+        # A rename or move upstream would otherwise leave this timer firing daily,
+        # green, and completely inert — for months, with unit state saying healthy.
+        echo "cc_settings_align: $_fn not defined in $CC_ENV — suppression NOT verified"
+        exit 3
+    fi
+done
+
 # ── Single-flight guard: two concurrent reconciles would race each other on the
 # same read-modify-write. Non-blocking — a run already in flight makes this one
 # redundant. (The function itself also compare-and-swaps, which covers writers
@@ -136,54 +154,24 @@ if ! flock -n "$LOCK_FD"; then
     # Another run holds the WRITE lock. Do not write — but a held lock is not
     # evidence the keys are present, and the old `exit 0` here recorded a
     # successful check that checked nothing. Reads race nothing destructively,
-    # so VERIFY read-only and report the truth: green only if both keys are on
-    # disk right now.
-    if command -v python3 >/dev/null 2>&1 && python3 - "$HOME/.claude/settings.json" <<'RONLY'
-import json, os, stat, sys
-try:
-    # Type first, and stat never blocks: open() on a FIFO parks until a writer
-    # appears, which would hang this "read-only, races nothing" verification —
-    # and with it the unit — on exactly the input the write path now declines.
-    if not stat.S_ISREG(os.stat(sys.argv[1]).st_mode):
-        sys.exit(1)
-    env = (json.load(open(sys.argv[1])).get("env") or {})
-except Exception:
-    sys.exit(1)
-sys.exit(0 if env.get("DISABLE_AUTOUPDATER") == "1"
-         and env.get("DISABLE_UPDATES") == "1" else 1)
-RONLY
-    then
+    # so VERIFY read-only and report the truth: green only if the same effective policy is on
+    # disk right now. The shared check-only path never writes settings.
+    cc_resolve_container_defaults "$HOME/.claude"
+    if cc_ensure_updater_suppressed "$HOME/.claude/settings.json" --check-only "${CC_CONTAINER_DEFAULTS_EFFECTIVE[@]}"; then
         # A verified-clean run, even under contention, is a real `ok` outcome and
         # MUST land in the state file. Exiting 0 here without recording it left a
         # stale `repaired` in place, so the next genuine repair was misread as
         # the second consecutive one and failed the unit.
         _persist_outcome ok || exit 3
         echo "cc_settings_align: another run is in progress — verified read-only:" \
-             "both suppression keys present"
+             "suppression, retention and effective defaults verified"
         exit 0
     fi
-    echo "cc_settings_align: another run is in progress and suppression could NOT" \
+    echo "cc_settings_align: another run is in progress and the settings policy could NOT" \
          "be verified read-only — deferring to that run; failing this one so the" \
          "unit does not report a check that checked nothing"
     exit 3
 fi
-
-if [ ! -f "$CC_ENV" ]; then
-    echo "cc_settings_align: $CC_ENV missing — cannot load the reconciler; suppression NOT verified"
-    exit 3
-fi
-
-# shellcheck source=/dev/null
-source "$CC_ENV"
-
-for _fn in cc_ensure_updater_suppressed cc_reconcile_container_settings; do
-    if ! declare -F "$_fn" >/dev/null 2>&1; then
-        # A rename or move upstream would otherwise leave this timer firing daily,
-        # green, and completely inert — for months, with unit state saying healthy.
-        echo "cc_settings_align: $_fn not defined in $CC_ENV — suppression NOT verified"
-        exit 3
-    fi
-done
 
 # Clear the state before the call so an OLDER cc_version.sh — one that defines
 # the function but does not set this variable — cannot be read as `ok` by the
@@ -230,7 +218,7 @@ case "${CC_SUPPRESSION_STATE:-unverified}" in
         exit 0
         ;;
     repaired)
-        echo "cc_settings_align: auto-updater suppression was MISSING and has been restored"
+        echo "cc_settings_align: suppression or retention policy was MISSING or incorrect and has been restored"
         if [ "$_prev" = "repaired" ]; then
             echo "cc_settings_align: WARNING — this is the SECOND consecutive repair, so the fix is not holding:" \
                  "something on this machine keeps rewriting ~/.claude/settings.json. Find that writer."
@@ -251,7 +239,7 @@ case "${CC_SUPPRESSION_STATE:-unverified}" in
     *)
         # failed — suppression is NOT in effect. Fail the unit so this is visible
         # as unit state, not just a journal line nobody reads.
-        echo "cc_settings_align: WARNING — could not establish auto-updater suppression (${CC_SUPPRESSION_STATE}); CC may self-update past the pin"
+        echo "cc_settings_align: WARNING — could not verify suppression and retention policy (${CC_SUPPRESSION_STATE}); see the diagnostic above"
         if [ "$_prev" = "${CC_SUPPRESSION_STATE}" ]; then
             # Same cause as last run. Say so rather than emitting an identical
             # fresh failure daily — a repeat that reads as new is a repeat that

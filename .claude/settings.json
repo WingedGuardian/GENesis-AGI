@@ -4,7 +4,6 @@
         "DISABLE_UPDATES": "1",
         "MCP_TIMEOUT": "120000"
     },
-    "cleanupPeriodDays": 180,
     "skillListingBudgetFraction": 0.02,
     "attribution": {
         "commit": "",
