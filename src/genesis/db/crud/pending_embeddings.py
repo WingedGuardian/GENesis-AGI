@@ -161,54 +161,59 @@ async def requeue_for_reembed(
     content cannot be re-embedded (mark it 'failed' instead; see the reconcile
     lane).
     """
-    import uuid as _uuid
+    from genesis.memory.namespace import lifecycle_write
 
-    cursor = await db.execute(
-        "SELECT 1 FROM pending_embeddings WHERE memory_id = ? LIMIT 1",
-        (memory_id,),
-    )
-    exists = await cursor.fetchone()
-    if exists:
+    async def perform():
+        import uuid as _uuid
+
         cursor = await db.execute(
-            f"""UPDATE pending_embeddings
-               SET status = 'pending', error_message = NULL, content = ?,
-                   tags = ?, memory_type = ?, collection = ?, confidence = ?
-               WHERE memory_id = ? AND {_REQUEUE_GUARD}""",  # noqa: S608
-            (content, tags, memory_type, collection, confidence, memory_id, memory_id, memory_id),
-        )
-    else:
-        cursor = await db.execute(
-            f"""INSERT INTO pending_embeddings
-               (id, memory_id, content, memory_type, tags, collection,
-                created_at, status, source, confidence)
-               SELECT ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?
-               WHERE {_REQUEUE_GUARD}""",  # noqa: S608
-            (
-                _uuid.uuid4().hex,
-                memory_id,
-                content,
-                memory_type,
-                tags,
-                collection,
-                created_at,
-                source,
-                confidence,
-                memory_id,
-                memory_id,
-            ),
-        )
-    requeued = bool(cursor.rowcount and cursor.rowcount > 0)
-    if requeued:
-        # Mirror flip only when the queue row actually landed — flipping the
-        # mirror for a refused requeue would un-lie nothing and could revive a
-        # row the delete cascade is about to remove.
-        await db.execute(
-            "UPDATE memory_metadata SET embedding_status = 'pending' WHERE memory_id = ?",
+            "SELECT 1 FROM pending_embeddings WHERE memory_id = ? LIMIT 1",
             (memory_id,),
         )
-    await db.commit()
-    return requeued
+        exists = await cursor.fetchone()
+        if exists:
+            cursor = await db.execute(
+                f"""UPDATE pending_embeddings
+                   SET status = 'pending', error_message = NULL, content = ?,
+                       tags = ?, memory_type = ?, collection = ?, confidence = ?
+                   WHERE memory_id = ? AND {_REQUEUE_GUARD}""",  # noqa: S608
+                (content, tags, memory_type, collection, confidence, memory_id, memory_id, memory_id),
+            )
+        else:
+            cursor = await db.execute(
+                f"""INSERT INTO pending_embeddings
+                   (id, memory_id, content, memory_type, tags, collection,
+                    created_at, status, source, confidence)
+                   SELECT ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?
+                   WHERE {_REQUEUE_GUARD}""",  # noqa: S608
+                (
+                    _uuid.uuid4().hex,
+                    memory_id,
+                    content,
+                    memory_type,
+                    tags,
+                    collection,
+                    created_at,
+                    source,
+                    confidence,
+                    memory_id,
+                    memory_id,
+                ),
+            )
+        requeued = bool(cursor.rowcount and cursor.rowcount > 0)
+        if requeued:
+            # Mirror flip only when the queue row actually landed — flipping the
+            # mirror for a refused requeue would un-lie nothing and could revive a
+            # row the delete cascade is about to remove.
+            await db.execute(
+                "UPDATE memory_metadata SET embedding_status = 'pending' WHERE memory_id = ?",
+                (memory_id,),
+            )
+        await db.commit()
+        return requeued
 
+
+    return await lifecycle_write(db, memory_id, perform)
 
 async def reset_failed_to_pending(
     db: aiosqlite.Connection,
@@ -342,3 +347,13 @@ async def count_pending(
     cursor = await db.execute("SELECT COUNT(*) FROM pending_embeddings WHERE status = 'pending'")
     row = await cursor.fetchone()
     return int(row[0])
+
+
+async def matches_pending_snapshot(db, snapshot: dict) -> bool:
+    """Validate every captured job field, including in-place requeue edits."""
+    cursor = await db.execute("SELECT * FROM pending_embeddings WHERE id=?", (snapshot["id"],))
+    row = await cursor.fetchone()
+    if row is None:
+        return False
+    current = dict(zip((column[0] for column in cursor.description), row, strict=True))
+    return current.get("status") == "pending" and current == snapshot

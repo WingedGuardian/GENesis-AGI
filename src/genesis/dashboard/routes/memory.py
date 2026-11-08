@@ -145,27 +145,19 @@ async def memory_delete(memory_id: str):
 
     try:
         if rt.memory_store is None:
-            # Degraded boot (no MemoryStore/Qdrant client): SQLite is all we can
-            # touch. Refuse to delete an EMBEDDED memory — we can't remove its
-            # point, and dropping only FTS+metadata would orphan it as a ghost.
-            # fts5_only/pending/failed rows have no durable point, so FTS +
-            # metadata is a complete, safe delete.
-            from genesis.db.crud import memory as memory_crud
+            # SQL mirrors cannot prove vector absence after a partial store.
+            # Retain rows and let the existing vector-aware delete drain intent.
+            from genesis.memory.store import delete_without_vector_store
 
-            meta = await memory_crud.get_metadata(rt.db, memory_id)
-            if meta and meta["embedding_status"] == "embedded":
-                return (
-                    jsonify(
-                        {
-                            "status": "unavailable",
-                            "detail": "vector store unavailable; cannot safely delete an embedded memory",
-                        }
-                    ),
-                    503,
-                )
-            deleted = await memory_crud.delete(rt.db, memory_id=memory_id)
-            await memory_crud.delete_metadata(rt.db, memory_id=memory_id)
-            return jsonify({"status": "partial", "fts5": deleted})
+            outcome = await delete_without_vector_store(rt.db, memory_id)
+            return (
+                jsonify({
+                    "status": "deferred",
+                    "detail": "vector-aware deletion deferred; retry when the memory store is available",
+                    "details": outcome,
+                }),
+                503,
+            )
 
         results = await rt.memory_store.delete(memory_id)
         if results.get("deferred"):

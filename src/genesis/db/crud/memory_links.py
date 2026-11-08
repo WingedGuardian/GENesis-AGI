@@ -23,8 +23,14 @@ async def create(
     classifier: str | None = None,
     review_state: str | None = None,
     safe_for_boost: int | None = None,
+    allow_namespaced: bool = False,
 ) -> tuple[str, str]:
     """Insert a memory link. Returns (source_id, target_id).
+
+    Namespaced (external peer) memories never acquire automatic links, so an
+    edge touching one is refused with ``ValueError`` — this is the sink every
+    linker and dream producer shares. Only an explicit owner action (a
+    supersession the owner requested) passes ``allow_namespaced=True``.
 
     The five trailing kwargs are the MW-2 (0082) edge-metadata columns — the
     classifier-verdict stamping location (GROUNDWORK(mw-5-merge-gate)). All
@@ -32,6 +38,10 @@ async def create(
     ``safe_for_boost`` = boost-eligible, NULL ``review_state`` = the
     ``link_type`` stands as written. No production caller passes them yet.
     """
+    from genesis.memory.namespace import is_namespaced_id
+
+    if not allow_namespaced and (is_namespaced_id(source_id) or is_namespaced_id(target_id)):
+        raise ValueError("namespaced memories do not take automatic links")
     await db.execute(
         "INSERT INTO memory_links (source_id, target_id, link_type, strength, created_at, "
         "proposed_type, confidence, classifier, review_state, safe_for_boost) "
@@ -228,10 +238,14 @@ async def copy_external_links(
     def _ext_of(src: str, tgt: str) -> str:
         return tgt if src == to_id else src
 
+    from genesis.memory.namespace import is_namespaced_id
+
     written = 0
     for (new_src, new_tgt, ltype), strength in candidates.items():
         if _ext_of(new_src, new_tgt) not in live_external:
             continue
+        if is_namespaced_id(new_src) or is_namespaced_id(new_tgt):
+            continue  # same no-automatic-link policy as create()
         await db.execute(
             "INSERT INTO memory_links (source_id, target_id, link_type, strength, created_at) "
             "VALUES (?, ?, ?, ?, ?) "
