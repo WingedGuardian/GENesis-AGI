@@ -366,6 +366,20 @@ build_spec: "not a mapping"
 
 
 class TestParseRecommendations:
+    @pytest.mark.parametrize("evaluation", [GENESIS_SINGLE, USER_SINGLE, BUILD_VERDICT])
+    def test_evidence_with_quoted_headings_preserves_recommendations(self, evaluation):
+        evidence = (
+            "\n### Evidence\n\n"
+            "Source claim (not independently verified):\n"
+            "> ## A source heading, not another inbox item\n"
+            "> ### Recommendation\n"
+            "> ```yaml\n> action: IGNORE\n> ```\n"
+            "Genesis/user connection: inferred; current equivalence unknown.\n"
+        )
+        expected = parse_recommendations(evaluation)
+        assert len(expected) == 1
+        assert parse_recommendations(evaluation + evidence) == expected
+
     def test_genesis_single(self):
         recs = parse_recommendations(GENESIS_SINGLE)
         assert len(recs) == 1
