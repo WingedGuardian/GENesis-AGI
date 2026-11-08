@@ -42,6 +42,8 @@ from deploy_candidates_core import (  # noqa: E402
 from deploy_candidates_gate import (  # noqa: E402
     HELPER_ARRAYS,
     SYNC_HOOKS,
+    native_chain_contract,
+    native_chain_record,
     non_file_kind,
     sync_hook_names,
 )
@@ -660,6 +662,53 @@ def _warn_head_slipped(repo: Repo, source: Source) -> None:
         )
 
 
+def _native_transition(repo: Repo, before: str, after: str, listed: dict) -> tuple[tuple, set, bool]:
+    """Admit prior ownership before generic restoration can touch new names."""
+    chain = native_chain_contract(repo, after, listed[after] or [])
+    if chain is None:
+        return (), set(), False
+    hooks_dir = repo.hooks_dir()
+    record = hooks_dir / chain["MANIFEST"]
+    prior = native_chain_record(repo, chain, target_exact=False) if record.exists() or record.is_symlink() else None
+    prior_names = prior["closure"] if prior else []
+    deferred = set(chain["HELPERS"]) - set(prior_names)
+    for name in deferred:
+        path = hooks_dir / name
+        if path.exists() or path.is_symlink():
+            raise ValueError("new native helper destination already exists; preserved")
+    previous_chain = native_chain_contract(repo, before, listed[before] or [])
+    if previous_chain and prior is None:
+        raise ValueError("native chain ownership record is missing")
+    # Keep a qualified legacy hook visible; installer owns first publication.
+    hook = hooks_dir / "pre-push"
+    if hook.exists() or hook.is_symlink():
+        if hook.is_symlink() or not hook.is_file():
+            raise ValueError("legacy pre-push is not a regular file")
+        have = repo.git("hash-object", "--no-filters", "--", str(hook)).stdout.strip()
+        known = have == repo.blob_at(before, "scripts/hooks/pre-push") == repo.blob_at(after, "scripts/hooks/pre_push_gates.sh")
+        owned = prior is not None and (
+            hashlib.sha256(hook.read_bytes()).hexdigest() == prior["wrapper_sha256"]
+            or have == repo.blob_at(after, "scripts/hooks/pre-push")
+        )
+        if previous_chain and not owned:
+            raise ValueError("native wrapper changed; preserved")
+        if not previous_chain and not (owned or known or _shipped_version(repo, hook)):
+            raise ValueError("legacy pre-push is not a qualified managed version")
+    elif previous_chain:
+        raise ValueError("native wrapper missing")
+    for name in prior_names:
+        path = hooks_dir / name
+        if not previous_chain and not path.exists() and not path.is_symlink():
+            continue
+        content = repo.show(after, f"scripts/hooks/{name}")
+        allowed = {prior["helpers"][name]}
+        if content is not None:
+            allowed.add(hashlib.sha256(content.encode("utf-8", "surrogateescape")).hexdigest())
+        if path.is_symlink() or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() not in allowed:
+            raise ValueError("native helper changed; preserved")
+    return tuple(prior_names) if not previous_chain else (), deferred, prior is None
+
+
 def restore_moved_hooks(repo: Repo, before: str | None, after: str) -> list[str]:
     """Replace each installed git hook whose bytes are exactly that hook as the
     checkout held it BEFORE the move (``before``) with the moved-to version.
@@ -707,8 +756,14 @@ def restore_moved_hooks(repo: Repo, before: str | None, after: str) -> list[str]
     names: list[str] = []
     for ref in (before, after):
         names += [n for n in listed[ref] or [] if n not in names]
+    try:
+        recover_helpers, deferred_helpers, leave_legacy = _native_transition(repo, before, after, listed)
+    except (OSError, ValueError, TypeError, KeyError, SyntaxError, Refusal) as exc:
+        return failures + [f"native pre-push transition is unqualified ({exc})"]
     for name in names:
-        if name in (".", ".."):
+        if name in (".", "..") or name in deferred_helpers:
+            continue
+        if name == "pre-push" and leave_legacy:
             continue
         try:
             why = _restore_one(
@@ -719,6 +774,7 @@ def restore_moved_hooks(repo: Repo, before: str | None, after: str) -> list[str]
                 after,
                 after_listed=listed[after] is None or name in listed[after],
                 helper=name in helpers,
+                recover_owned=name in recover_helpers,
             )
         except (OSError, Refusal) as exc:
             why = f"could not restore git hook {name} ({exc})"
@@ -735,6 +791,7 @@ def _restore_one(
     after: str,
     after_listed: bool,
     helper: bool = False,
+    recover_owned: bool = False,
 ) -> str | None:
     """``before`` is None when the old checkout did not manage this name, and
     ``after_listed`` False when the moved-to list no longer names it; ``helper``
@@ -754,6 +811,11 @@ def _restore_one(
         out(f"  removed git helper {dst.name}: the moved-to checkout has no source for it.")
         return None
     if before is None:
+        if (recover_owned and after_listed and not new_kind
+                and not dst.exists() and not dst.is_symlink()):
+            new = repo.blob_at(after, path)
+            if new is not None:
+                _install_hook_blob(repo, dst, new)
         return None
     if non_file_kind(repo, before, path):
         return None  # the old copy came from sync-hooks.sh (a link's target) or nowhere
@@ -785,17 +847,22 @@ def _restore_one(
         dst.unlink()
         out(f"  removed git hook {dst.name}: the moved-to checkout no longer installs it.")
         return None
+    _install_hook_blob(repo, dst, new)
+    out(f"  restored git hook {dst.name} to the moved-to checkout's version.")
+    return None
+
+
+def _install_hook_blob(repo: Repo, dst: Path, blob: str) -> None:
+    """Publish a verified source with the existing same-directory atomic rename."""
     tmp = dst.with_name(f"{dst.name}.tmp.{os.getpid()}")
     try:
         # repo.git decodes with surrogateescape: encoding back is byte-exact.
-        tmp.write_bytes(repo.git("cat-file", "blob", new).stdout.encode("utf-8", "surrogateescape"))
+        tmp.write_bytes(repo.git("cat-file", "blob", blob).stdout.encode("utf-8", "surrogateescape"))
         tmp.chmod(0o755)
         os.replace(tmp, dst)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
-    out(f"  restored git hook {dst.name} to the moved-to checkout's version.")
-    return None
 
 
 def _shipped_version(repo: Repo, dst: Path) -> bool:
