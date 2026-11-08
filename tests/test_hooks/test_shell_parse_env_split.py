@@ -221,7 +221,8 @@ def test_carrier_preserves_source_groups_and_separate_substitution_context(parse
     assert status == 0 and records == [["push"], ["status"]]
     policy, blind = parser.analyze_policy(command)
     assert blind is None
-    assert [s.position for s in policy if not s.depth] == [(0,), (len(first) + 2,)]
+    # Policy positions mark the source range after ';', including its leading space.
+    assert [s.position for s in policy if not s.depth] == [(0,), (len(first) + 1,)]
     child = [s for s in policy if s.depth][0]
     assert child.scope_kind == "substitution" and child.ancestors == ()
     plain = parser.analyze(command)
