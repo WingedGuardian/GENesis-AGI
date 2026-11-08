@@ -211,6 +211,87 @@ async def test_every_pre_approved_tool_is_a_registered_tool(server):
     assert approved <= await _registered(server)
 
 
+# Every tool that runs without asking, per server. A tool joins this tier only
+# by editing this list, so each addition is a reviewed read-only classification.
+_PRE_APPROVED = {
+    "health": {
+        "bench_status",
+        "board_item",
+        "board_status",
+        "bootstrap_manifest",
+        "browser_sessions",
+        "browser_snapshot",
+        "build_lane_status",
+        "calibration_status",
+        "campaign_list",
+        "campaign_status",
+        "codebase_navigate",
+        "cognitive_modification_status",
+        "db_schema",
+        "direct_session_list",
+        "direct_session_status",
+        "ego_calibration_status",
+        "ego_goal_list",
+        "experiment_status",
+        "follow_up_list",
+        "health_alerts",
+        "health_errors",
+        "health_status",
+        "immunity_status",
+        "inbox_digest",
+        "job_health",
+        "loop_closure_status",
+        "module_list",
+        "open_question_list",
+        "provider_activity",
+        "reflex_status",
+        "session_address",
+        "session_charter",
+        "settings_get",
+        "settings_list",
+        "skill_usage_status",
+        "subsystem_heartbeats",
+        "task_detail",
+        "task_list",
+        "update_history_recent",
+        "zero_drop_status",
+    },
+    "memory": {
+        "conversation_history",
+        "entity_adjudication_list",
+        "knowledge_recall",
+        "knowledge_status",
+        "locate",
+        "memory_core_facts",
+        "memory_expand",
+        "memory_proactive",
+        "memory_recall",
+        "memory_stats",
+        "observation_query",
+        "procedure_recall",
+        "reference_export",
+        "reference_lookup",
+    },
+    "outreach": {
+        "marketing_prospects_list",
+        "outreach_digest",
+        "outreach_pending",
+        "outreach_queue",
+    },
+    "recon": {
+        "recon_findings",
+        "recon_github_read",
+        "recon_github_search",
+        "recon_run_github_discovery",
+    },
+}
+
+
+@pytest.mark.parametrize("server", sorted(_PRE_APPROVED))
+def test_the_pre_approved_set_is_exactly_the_reviewed_one(server):
+    assert set(_servers()[f"genesis-{server}"].get("tools", {})) == _PRE_APPROVED[server]
+
+
 # Tools that write, send, spend or spawn. None may be pre-approved; this list is
 # a tripwire for the obvious ones, not the full classification.
 _NEVER_PRE_APPROVED = {
@@ -237,6 +318,7 @@ _NEVER_PRE_APPROVED = {
         "entity_adjudication_apply",
         "observation_write",
         "resume_review",
+        "bookmark_unshelve",  # increments the bookmark's resume counter
     },
     "outreach": {"outreach_send", "outreach_send_and_wait", "marketing_send", "provision_grow"},
     "recon": {"recon_store_finding", "recon_triage"},

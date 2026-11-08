@@ -97,7 +97,6 @@ cwd = "."
 startup_timeout_sec = 30
 env_vars = ["GENESIS_CC_SESSION", "GENESIS_SESSION_ORIGIN"]
 default_tools_approval_mode = "prompt"
-tools.bookmark_unshelve.approval_mode = "approve"
 tools.conversation_history.approval_mode = "approve"
 tools.entity_adjudication_list.approval_mode = "approve"
 tools.knowledge_recall.approval_mode = "approve"
