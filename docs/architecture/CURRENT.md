@@ -3965,8 +3965,8 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
-          env.py, _config_overlay.py, caller_context.py, caller_credentials.py]
-verified: 973a0e6 2026-10-30
+          env.py, secrets_location.py, _config_overlay.py, caller_context.py, caller_credentials.py]
+verified: 58ff9f47c 2026-11-07
 ```
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
@@ -4526,7 +4526,10 @@ Refusing a proposed update preserves a previously valid opt-in.
   marker only while holding `locks/update.lock`; the routes also run the `live`
   check under it and remove a marker only when its holder is dead or theirs.
   Exception: `bootstrap.sh`'s crash recovery still removes it unconditionally.
-  `secrets_path()` is repo-relative unless SECRETS_PATH set.
+  `secrets_path()` delegates to the stdlib-only `secrets_location.py`, mirrored
+  by `scripts/lib/secrets_path.sh`: `SECRETS_PATH` if set, else the checkout's
+  `secrets.env` (unchanged). Disk hygiene's store knobs, bootstrap and the eval
+  loaders keep their own rules for now.
 - **Managed systemd user units** (deploy scripts, no `src/genesis` module):
   `bootstrap.sh` renders `scripts/systemd/*.template` and `setup-vnc.sh`
   renders `scripts/systemd/vnc/` into `~/.config/systemd/user`, both through
