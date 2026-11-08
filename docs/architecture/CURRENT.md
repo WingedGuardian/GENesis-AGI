@@ -361,7 +361,12 @@ commit the main checkout has held since it started (read by
 on a reflog gap, a move in the start second, a clock step back or git's expiry
 cutoff), whether ALL of them contain the telemetry module (a module imported
 after start loads whatever is on disk then), plus whether HEAD has the module
-and whether `src/genesis/memory/` is dirty. Git runs with `--no-optional-locks`,
+and whether the graph-read path is dirty (`graph_census._RUNTIME_PATHS`: the
+graph and graph-store modules, their callers, direct pressure/DB telemetry
+helpers, the environment and config
+loaders, `config/graphstore.yaml` and the two entry scripts; owner ruling
+47bd37e025174c66 narrowed it from all of `src/`, so an early local run of
+unrelated code does not cost the clock). Git runs with `--no-optional-locks`,
 so the hourly read never takes the index lock a deploy needs. Since schema 2
 ("conservative unknowns", rules in `memory/graph_census_proof.py`) a server's row
 is clean only when three more things are PROVEN, each derived the way that
@@ -404,7 +409,11 @@ only memory servers:
   loaded;
 - any other python process on main's venv (found by its absolute interpreter
   path, or by resolving a bare `python` through its own PATH): history and
-  database scope only (owner ruling);
+  database scope only (owner ruling). One that is unprovable only because it
+  runs under another Genesis home or its interpreter cannot be resolved
+  (another session's test run or one-off job) does not hold the clock while
+  its reported start is at least 2s inside the 2h30m history lookback (owner ruling
+  9931626424ee4c6c); an older one still does;
 - replay, listed as excluded because it is not live traffic (owner ruling);
 - another bridge or server beside the host, always dirty.
 
@@ -3103,9 +3112,30 @@ verified: c712f1bde 2026-11-06
   a short floor (`FAILED_RETRY_FLOOR_MINUTES`) rather than the full interval —
   exempting it entirely was worse than the behaviour it replaced, since the
   uncaught raise (an unreadable DB) happens AFTER both expensive legs run.
-  Each class reconciles inside its own SAVEPOINT, so a class that raises
-  mid-DML cannot leave partial writes for the next commit on the shared
-  connection to flush while the record reports that class as not applied.
+  Each class reconciles in its own transaction, opened with `BEGIN IMMEDIATE`
+  and rolled back whole on failure, so a class that raises mid-DML cannot
+  leave partial writes for the next commit on the connection to flush while
+  the record reports that class as not applied. IMMEDIATE, not a deferred
+  SAVEPOINT: the class reads its prior rows and then writes, and a deferred
+  transaction's upgrade loses AT ONCE while the server is writing (SQLITE_BUSY,
+  or SQLITE_BUSY_SNAPSHOT once it has committed; no busy handler either way,
+  so only elapsed time separates this from a long-held writer). MEASURED
+  2026-11-07: 0 ms to the error; 24-33 runs per class frozen on "database is
+  locked", all 86 class tracebacks at a write after the read. Taking the
+  writer slot first makes the server's write wait instead (measured hold for
+  a 421-row class: median 87 ms, max 151 ms, against the 5 s busy_timeout; it
+  grows roughly linearly with rows). A class or the blindness alert that
+  still loses the lock is retried whole (3 attempts, the connection layer's
+  delays); each lost attempt is logged with its SQLite error name and timing,
+  `applied[cls].lock_retries` records retries that succeeded, and a unit that
+  gives up writes a lock-holder snapshot (`db/lock_holders.py`) and records
+  its `writer_pids` under `lock_evidence` in `last_run.json` (never in
+  `degraded`, whose text feeds the blindness alert's hash). The blindness
+  alert's own losses are a different cause: single-statement writes DO wait
+  out busy_timeout, so a loss there means a writer held the slot past 5 s.
+  A class whose rollback itself fails leaves the connection in
+  a transaction; the worker then discards that connection, skips the classes
+  not yet reconciled, and finishes the run on a fresh one.
   Untrusted text reaching a MODEL: a branch identity is the ack key and is
   emitted VERBATIM, paired with a neutralised `branch_display` and an
   `identity_unrenderable` flag. `check-ref-format` bans control characters but
@@ -4693,7 +4723,11 @@ Refusing a proposed update preserves a previously valid opt-in.
   a process holds it, then saved into the backup's `git/` and removed by one
   step, on every path that ends healed; a same-user process whose open files
   cannot be read counts as a holder only if it is a git or the lock is under
-  30 s old, so a non-git process that cannot be inspected and holds a lock
+  30 s old, is not exiting (the kernel's PF_EXITING flag: such a process
+  runs no user code again), and stays the same process, still unreadable,
+  across three re-checks about 0.15 s apart, so a git that is passing through
+  does not keep a stale lock (#4001; `stale_index_lock.py` applies the same
+  rule); a non-git process that cannot be inspected and holds a lock
   longer than that has it judged stale), every path of the two-dot diff, plus
   a symlink or non-directory parent of one (nothing is read or removed through
   such a parent), plus every index entry under one of those and every index
