@@ -1615,7 +1615,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
-verified: 973a0e6 2026-10-30
+verified: 6b4f275 2026-11-08
 ```
 
 The neural monitor includes the non-routing **Fallback** observation, and the
@@ -1745,7 +1745,11 @@ the shared banner is not an assertion about all concurrent sessions.
   discord-bot) + external codebase-memory; profile→server allowlist lives in
   `cc/session_config._MCP_PROFILES`. `genesis-health` is the big one (~35 tool
   modules). `standalone_health.py` serves from `~/.genesis/status.json` when no
-  live runtime (stale-but-functional).
+  live runtime (stale-but-functional). Surplus liveness there comes from the
+  server's in-memory `surplus_dispatch` success pulse, which the status writer
+  carries in `liveness_pulses` (verified 2026-11-08): it is trusted only while the
+  file is at most 300s old (`snapshots/surplus.py` `STATUS_FILE_MAX_AGE_S`), and
+  any stale, future-dated or mistyped field reads `liveness_error`, never green.
   The optional fixed-main Serena services qualify provider 2.1.0 and MCP 2.2
   readiness; they select classic tools and reject switching or REPL capability.
   Their existing locking, per-profile limits and native stdio worktree routing
