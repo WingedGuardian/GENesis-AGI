@@ -1,2 +1,1 @@
-### Added
 - Extend the internal request-owned database registry with explicit shutdown grace and synchronous resource-work ownership. Keep admission until actual physical completion and DB closure; unconfirmed dispatch fails shutdown without permitting dependent provider cleanup. Legacy thread cancellation and zero-grace initiating `close()` remain supported. No shared service is activated.
