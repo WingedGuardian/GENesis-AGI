@@ -59,7 +59,9 @@ LimitCORE=0
 # value: lowering below oom_score_adj_min (0, inherited from init) needs
 # CAP_SYS_RESOURCE, and the manager holds only CAP_WAKE_ALARM. Verified via
 # transient units: 500->500, 0->0, but -1->100 and -500->100. Raising always
-# works; lowering never does. So -500 was decoration, not protection.
+# works; lowering below oom_score_adj_min (0 here) does not, though a decrease
+# that stays at or above the floor is accepted. So -500 was decoration, not
+# protection.
 #
 # DELETING the line would be WORSE than leaving it. `systemctl --user show`
 # reports 200 for any unit that does not set OOMScoreAdjust — systemd's own

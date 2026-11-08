@@ -121,9 +121,13 @@ incident despite `avoid`.
   doing so needs `CAP_SYS_RESOURCE`, which the manager does not hold, and the
   write fails **silently**. MEASURED 2026-09-08: the unit declared `-500` while
   the live process ran at `100`, and had since the line was written. Raising
-  always works, lowering never does — so the kill order is built by pushing
-  sacrificial processes UP (CC subprocesses to 500), never by protecting the
-  server DOWN. Deleting the declaration would be worse than a wrong value:
+  always works; lowering is refused only below the inherited
+  `oom_score_adj_min`, so a decrease that stays at or above that floor is
+  accepted — the kernel compares the requested value against the floor when
+  `CAP_SYS_RESOURCE` is absent (`fs/proc/base.c`), rather than prohibiting every
+  downward change. The kill order is still built by pushing sacrificial
+  processes UP (CC subprocesses to 500), never by protecting the server DOWN,
+  because the rungs below the floor are the ones that are unavailable. Deleting the declaration would be worse than a wrong value:
   unset units report systemd's default of **200**, which is more killable than
   100.
 

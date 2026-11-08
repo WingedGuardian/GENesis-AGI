@@ -212,10 +212,15 @@ def set_oom_score_adj(pid: int, score: int = 500) -> None:
     MEASURED 2026-09-08: the unit declared ``-500`` while the live process ran at
     ``100``, because a user manager cannot lower oom_score_adj below the inherited
     ``oom_score_adj_min`` of 0 without CAP_SYS_RESOURCE — the write fails silently.
-    The unit now declares an achievable ``100``. Only the direction this function
-    uses is actually available to us: RAISING needs no privilege, LOWERING is
-    always refused, so every rung of the kill order has to be built by pushing
-    sacrificial processes UP rather than protecting important ones DOWN.
+    The unit now declares an achievable ``100``. RAISING needs no privilege.
+    LOWERING is refused only below the inherited ``oom_score_adj_min``: an owned
+    child with no effective capabilities, starting at 0, accepted 500, then 100,
+    then 0, and refused only ``-1`` with EACCES (MEASURED 2026-11-08, Linux 6.8).
+    The kernel compares the requested value against ``oom_score_adj_min`` when
+    CAP_SYS_RESOURCE is absent (``fs/proc/base.c``), rather than prohibiting every
+    downward change. So the kill order is still built by pushing sacrificial
+    processes UP: a rung below the floor is what is unavailable, not every
+    decrease.
     """
     try:
         Path(f"/proc/{pid}/oom_score_adj").write_text(str(score))
