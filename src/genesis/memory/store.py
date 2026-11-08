@@ -150,7 +150,7 @@ class SupersedeUnresolved(Exception):
 class SupersedeIncomplete(Exception):
     """The supersession HALF-finished: SQLite committed, a mirror did not.
 
-    Raised only by the standalone ``supersede()`` path (strict propagation).
+    Propagated by standalone ``supersede()``; stores catch it and report failure.
     By the time this raises, *old_id* is deprecated in SQLite with
     ``superseded_by`` recorded — but the named *stage* did not complete:
 
@@ -343,6 +343,7 @@ class MemoryStore:
         life_domain: str | None = None,
         project_type: str | None = None,
         supersedes: str | None = None,
+        supersede_outcome: dict | None = None,
         origin_class: str | None = None,
         speech_act: str | None = None,
         speech_act_confidence: float | None = None,
@@ -359,6 +360,8 @@ class MemoryStore:
         delete a memory other rows already reference.
 
         Args:
+            supersede_outcome: Optional internal report, reset unconfirmed on
+                entry and filled with full pair ids and completion status.
             collection: Explicit Qdrant collection override. If provided, bypasses
                 ``_COLLECTION_MAP`` lookup. Default routing: ``episodic`` types →
                 ``episodic_memory``, ``knowledge`` types → ``knowledge_base``.
@@ -376,6 +379,9 @@ class MemoryStore:
                 Qdrant payload, memory_metadata, and (for KB ingest paths)
                 knowledge_units.
         """
+        if supersede_outcome is not None:
+            supersede_outcome.clear()
+            supersede_outcome["superseded"] = False
         # Validate life_domain if explicitly provided
         if life_domain is not None:
             from genesis.memory.taxonomy import LIFE_DOMAINS
@@ -416,17 +422,10 @@ class MemoryStore:
 
         if existing:
             if resolved_supersedes:
-                try:
-                    # Full ids retain the standalone validation, ordered locks,
-                    # and repair path; invalid pairs must not become new stores.
-                    await self.supersede(resolved_supersedes, existing)
-                except SupersedeUnresolved:
-                    raise
-                except Exception:
-                    logger.warning(
-                        "Failed to mark memory %s as superseded by %s",
-                        resolved_supersedes, existing, exc_info=True,
-                    )
+                await self._apply_store_supersession(
+                    resolved_supersedes, existing, existing=True,
+                    outcome=supersede_outcome,
+                )
             logger.debug("Skipping duplicate memory store: %s", existing)
             # NOT created by this call: the caller must not compensate it.
             return (existing, False)
@@ -747,15 +746,39 @@ class MemoryStore:
         # above, so anything that fails here is an infrastructure fault rather
         # than a bad handle.
         if resolved_supersedes:
-            try:
-                await self._mark_superseded(resolved_supersedes, memory_id, now_iso)
-            except Exception:
-                logger.warning(
-                    "Failed to mark memory %s as superseded by %s",
-                    resolved_supersedes, memory_id, exc_info=True,
-                )
+            await self._apply_store_supersession(
+                resolved_supersedes, memory_id, existing=False,
+                outcome=supersede_outcome, timestamp=now_iso,
+            )
 
         return (memory_id, True)
+
+    async def _apply_store_supersession(
+        self, old_id: str, new_id: str, *, existing: bool,
+        outcome: dict | None, timestamp: str | None = None,
+    ) -> None:
+        """Keep saved content while reporting only fully completed supersession."""
+        if outcome is not None:
+            outcome.update(superseded=False, old_id=old_id, new_id=new_id)
+        try:
+            if existing:
+                # Preserve preconditions, sorted locks and exact-pair repair.
+                await self.supersede(old_id, new_id)
+            else:
+                await self._mark_superseded(
+                    old_id, new_id, timestamp or datetime.now(UTC).isoformat(),
+                    strict=True,
+                )
+        except Exception as exc:
+            if existing and isinstance(exc, SupersedeUnresolved):
+                raise
+            logger.warning(
+                "Failed to mark memory %s as superseded by %s",
+                old_id, new_id, exc_info=True,
+            )
+        else:
+            if outcome is not None:
+                outcome["superseded"] = True
 
     async def supersede(
         self,
@@ -1005,12 +1028,11 @@ class MemoryStore:
     ) -> None:
         """Mark *old_id* as superseded by *new_id* in both SQLite and Qdrant.
 
-        *strict* chooses what a MIRROR failure (Qdrant payload, succeeded_by
-        link) does after the SQLite deprecation has committed: ``False`` (the
-        ``store(supersedes=...)`` path) logs and swallows it — the new
-        content's fate dominates that call's outcome; ``True`` (the standalone
-        ``supersede()`` path) raises ``SupersedeIncomplete``, because there
-        the caller named both ids and a retry of the same call is the repair.
+        *strict* chooses what a MIRROR failure does after SQLite commits:
+        ``False`` logs and swallows it; ``True`` raises ``SupersedeIncomplete``.
+        Both standalone supersession and the store apply helper use strict
+        mode. The store helper catches failure to preserve saved content and
+        report the incomplete outcome without claiming mirror success.
         Success must not be reported over a stale vector mirror — recall
         excludes a memory from vector search only through the Qdrant
         ``deprecated`` payload.
