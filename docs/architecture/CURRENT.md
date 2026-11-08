@@ -3229,7 +3229,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 3e27b4794 2026-10-23
+verified: 5be8573a5 2026-11-07
 ```
 
 - **eval/ego_runtime**: opt-in canonical proposal-operation probes using fresh
@@ -3575,6 +3575,11 @@ verified: 3e27b4794 2026-10-23
   pinned monolith invocation, retaining outer context/probe/backoff/wake code.
   Thirteen cases/fifteen wakes/thirteen native sessions plus reader correlations
   require actual state, bytes, run attribution, context and pacing evidence.
+  Command cleanup is measured through task-local group-closure records for
+  version discovery, setup, appends, wakes, history and correlation readers;
+  missing, live or unverifiable scopes cannot pass. Verified container init
+  identity and before/after census additionally reject unexpected survivors.
+  This stamp refresh covers that developer-evaluation cleanup slice only.
   Integration requires its actual post-review CI report. Tiered memory is off,
   deterministic related context remains on, and only the protected MCP effect is
   exposed; no full runtime, dispatcher or capability parity follows. See
