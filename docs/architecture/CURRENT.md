@@ -1442,7 +1442,10 @@ verified: b0867170e 2026-10-02
   The phase order is prompt preflight → recover pending → resume approval →
   detect → create → dispatch;
   `approval_key_stable=True` (ONE
-  site-level approval key). The refresh path folds parked files into the
+  site-level approval key). Resume consumes an approved grant before releasing
+  its awaiting row. A lookup/retirement failure preserves that row and defers
+  all new/modified/retry site work for the scan, while healthy approved siblings
+  can resume after successful consumption. The refresh path folds parked files into the
   batch so approvals fire once (#914). A pending approval is HELD until the
   user resolves it (no re-ask, no age-based cancel) and is auto-cancelled only
   when *orphaned* — no live inbox row (`awaiting_approval:`/`dispatching:`)
@@ -1450,11 +1453,20 @@ verified: b0867170e 2026-10-02
   4h staleness cancel that re-detected unchanged files and nagged. Three checks
   sit between a response and the baseline: a coherence check (annotates, never
   blocks), a give-up-LANGUAGE URL-failure check, and a URL-COVERAGE check
-  requiring every scanner-recognized input URL's parsed identity to appear in
+  requiring every recognized input URL occurrence's parsed identity to appear in
   the response — that last one catches SILENT omission, which the language
   check cannot see by construction. Scheme and host case plus one leading
   `www.` are presentation variants; authority, path, query, and fragment
-  identity remain exact. Coverage
+  identity remain exact. Prompt and coverage share source-aware URL occurrences:
+  only matching unmatched wrappers in the same-line source context justify
+  removing closing delimiters, including prose parentheticals, quoted links
+  and matching backtick runs. Literal terminal punctuation and repeated tokens in different
+  contexts retain their own identities. The read-only coverage report retains
+  these occurrences too; it does not reconstruct coverage from normalized URLs.
+  An ordered proof finds the first source-frame closure; ambiguous tokens stay
+  raw and cannot supply wrapper context for later URLs.
+  The wrapper correction is scoped to this URL path; the entry's existing
+  verification stamp remains the basis for its other claims. Coverage
   is ENFORCED by default (`url_coverage_mode`, `config/inbox_monitor.yaml`;
   `shadow` observes without acting): an uncovered URL re-queues its item
   through the bounded retry lane, logging only stable opaque URL ids. It
@@ -3217,7 +3229,7 @@ Self-improvement loops and the instrumentation that keeps them honest.
 ```yaml subsystem-map
 entry: learning-evaluation
 modules: [learning, eval, experimentation, feedback, calibration, ledger, transcript_analytics]
-verified: 3e27b4794 2026-10-23
+verified: 5be8573a5 2026-11-07
 ```
 
 - **eval/ego_runtime**: opt-in canonical proposal-operation probes using fresh
@@ -3563,6 +3575,11 @@ verified: 3e27b4794 2026-10-23
   pinned monolith invocation, retaining outer context/probe/backoff/wake code.
   Thirteen cases/fifteen wakes/thirteen native sessions plus reader correlations
   require actual state, bytes, run attribution, context and pacing evidence.
+  Command cleanup is measured through task-local group-closure records for
+  version discovery, setup, appends, wakes, history and correlation readers;
+  missing, live or unverifiable scopes cannot pass. Verified container init
+  identity and before/after census additionally reject unexpected survivors.
+  This stamp refresh covers that developer-evaluation cleanup slice only.
   Integration requires its actual post-review CI report. Tiered memory is off,
   deterministic related context remains on, and only the protected MCP effect is
   exposed; no full runtime, dispatcher or capability parity follows. See
@@ -3973,8 +3990,8 @@ config resolution, and hygiene utilities.
 entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
-          env.py, _config_overlay.py, caller_context.py, caller_credentials.py]
-verified: 973a0e6 2026-10-30
+          env.py, secrets_location.py, _config_overlay.py, caller_context.py, caller_credentials.py]
+verified: 58ff9f47c 2026-11-07
 ```
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
@@ -3991,6 +4008,22 @@ reviewer) a child environment from `caller_context.dispatched_child_env`:
 The marker is inert until the Codex project config forwards it to the Genesis
 MCP launcher; it exists so an unmarked Codex run can mean the owner's own
 client, as an unmarked Claude Code session does.
+
+Tool calls from a labelled client (`GENESIS_CALLER_PROFILE`, read into
+`CallerContext.profile`; owner-mode Codex sets `codex`) are logged to
+`client_tool_calls` by `observability/client_call_log.py`, which
+`install_instrumentation` puts on all four servers and which reads
+`caller_context()` per call: client, server, tool, start time, `outcome`
+(`returned`/`raised`/`cancelled` — how the call ended, not whether the tool
+succeeded), and the written row's id for an allowlisted set of writer tools.
+Never the arguments. The write runs after the call on its own connection,
+shielded from cancellation; a failed or skipped write (no database file, table
+not migrated yet) is a warning that never changes the tool result. Credential
+lookups stamp the same label into `credential_access_log.client` server-side.
+Retention: `scripts/prune_client_tool_calls.py` (default 180 days) from disk
+hygiene. Unlabelled calls, which include every Claude Code session, log nothing.
+Credential values returned through `knowledge_recall`/`memory_recall` are still
+not in `credential_access_log` (#3983 removes them from those paths).
 
 Fresh dedicated validator-health trackers disable new activity persistence
 before DB attachment, retaining memory metrics and historical provider SELECTs.
@@ -4544,7 +4577,10 @@ Refusing a proposed update preserves a previously valid opt-in.
   marker only while holding `locks/update.lock`; the routes also run the `live`
   check under it and remove a marker only when its holder is dead or theirs.
   Exception: `bootstrap.sh`'s crash recovery still removes it unconditionally.
-  `secrets_path()` is repo-relative unless SECRETS_PATH set.
+  `secrets_path()` delegates to the stdlib-only `secrets_location.py`, mirrored
+  by `scripts/lib/secrets_path.sh`: `SECRETS_PATH` if set, else the checkout's
+  `secrets.env` (unchanged). Disk hygiene's store knobs, bootstrap and the eval
+  loaders keep their own rules for now.
 - **Managed systemd user units** (deploy scripts, no `src/genesis` module):
   `bootstrap.sh` renders `scripts/systemd/*.template` and `setup-vnc.sh`
   renders `scripts/systemd/vnc/` into `~/.config/systemd/user`, both through
