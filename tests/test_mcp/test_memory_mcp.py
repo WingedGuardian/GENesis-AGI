@@ -479,7 +479,15 @@ async def test_reference_store_full_roundtrip():
             assert row["project_type"] == "reference"
             assert row["domain"] == "reference.credentials"
             assert row["concept"] == "HobbyForum forum login"
-            assert "ForumUser42 / hunter2" in row["body"]
+            # #2426: the value is held out of the indexed body, in its own table.
+            assert "hunter2" not in row["body"]
+            assert "Value: [held in the reference secret store; read it with reference_lookup]" in row["body"]
+            assert "used by the ForumUser42 persona" in row["body"]
+            secret = await real_db.execute_fetchall(
+                "SELECT value FROM reference_secrets WHERE unit_id = ?", (unit_id,)
+            )
+            assert secret[0][0] == "ForumUser42 / hunter2"
+            assert "hunter2" not in mock_store.store.call_args[0][0]
             assert "hobby community forum" in row["body"]
             assert "forum" in row["tags"]
             assert "persona:example" in row["tags"]
@@ -606,6 +614,52 @@ async def test_reference_store_different_kinds_no_body_collision():
             assert store_call_contents[0] != store_call_contents[1]
             assert "reference.network" in store_call_contents[0]
             assert "reference.url" in store_call_contents[1]
+        finally:
+            mod._store, mod._db, mod._retriever, mod._qdrant = old
+
+
+async def test_reference_lookup_puts_a_held_out_value_back():
+    """#2426: the indexed body carries a placeholder; lookup returns the value,
+    and says so when the held-out value is missing instead of returning the
+    placeholder as if it were the value."""
+    import aiosqlite
+
+    import genesis.mcp.memory_mcp as mod
+    from genesis.db.schema import create_all_tables
+
+    async with aiosqlite.connect(":memory:") as real_db:
+        await create_all_tables(real_db)
+        mock_store = AsyncMock()
+        mock_store.store = AsyncMock(return_value="q1")
+        mock_store._embeddings = MagicMock()
+        mock_store._embeddings.model_name = "m"
+        mock_retriever = AsyncMock()
+        mock_retriever.recall = AsyncMock(return_value=[])
+
+        old = (mod._store, mod._db, mod._retriever, mod._qdrant)
+        try:
+            mod._store, mod._db, mod._retriever, mod._qdrant = (
+                mock_store, real_db, mock_retriever, MagicMock(),
+            )
+            tools = await _get_tools()
+            uid = await tools["reference_store"].fn(
+                kind="credentials",
+                identifier="Example staging login",
+                value="deploy-bot / Staging!Fake-77",
+                description="Credentials for the example staging environment",
+            )
+            assert "Staging!Fake-77" not in mock_store.store.call_args[0][0]
+
+            results = await tools["reference_lookup"].fn(query="staging", kind="credentials")
+            hit = next(r for r in results if r["unit_id"] == uid)
+            assert "Value: deploy-bot / Staging!Fake-77" in hit["body"]
+            assert "value_missing" not in hit
+
+            await real_db.execute("DELETE FROM reference_secrets")
+            results = await tools["reference_lookup"].fn(query="staging", kind="credentials")
+            hit = next(r for r in results if r["unit_id"] == uid)
+            assert hit["value_missing"] is True
+            assert "Staging!Fake-77" not in hit["body"]
         finally:
             mod._store, mod._db, mod._retriever, mod._qdrant = old
 

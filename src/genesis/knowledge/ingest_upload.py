@@ -11,6 +11,8 @@ Supports two modes:
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
 import logging
 import shutil
@@ -179,6 +181,33 @@ async def _store_as_is(
     tags = [effective_domain, project_type, "stored-as-is"]
     if context:
         tags.append("user-context")
+
+    # #2426: an uploaded file is never stored as a credential reference. The
+    # vector below is written BEFORE the database row, so refuse here, before
+    # anything is written, rather than at the db layer's refusal afterwards.
+    from genesis.db.crud.knowledge import holds_secret
+
+    if holds_secret(project_type, effective_domain):
+        raise ValueError(
+            "refusing to store an upload as a credential reference: use "
+            "reference_store, which holds the value out (#2426)"
+        )
+    # Any other reference unit loses every credential-pattern secret its free
+    # text carries, as one written through ingest_knowledge_unit does.
+    from genesis.memory.reference_ops import REFERENCE_PROJECT, scrub_reference, scrub_with
+
+    if (project_type or "").strip().lower() == REFERENCE_PROJECT:
+        # A whole file: off the event loop, since the scrub is one pass per
+        # secret fragment over the text.
+        file_content, tags_scrubbed, concept, frags = await asyncio.to_thread(
+            functools.partial(
+                scrub_reference, file_content, json.dumps(tags), concept,
+                also=(context,), formatted=False,
+            ),
+        )
+        tags = json.loads(tags_scrubbed) if tags_scrubbed else tags
+        if context and frags.all:
+            context = scrub_with(context, frags)
 
     # Store to Qdrant
     # WS-3: curated ingest is external_untrusted (authority tier, not

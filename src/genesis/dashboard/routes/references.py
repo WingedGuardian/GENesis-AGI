@@ -32,6 +32,7 @@ from genesis.memory.reference_ops import (
     ReferenceStoreUnavailable,
     delete_reference_entry,
     parse_reference_body,
+    resolve_value,
 )
 
 logger = logging.getLogger(__name__)
@@ -229,7 +230,11 @@ async def references_reveal(unit_id: str):
         row = await knowledge.get(rt.db, unit_id)
         if row is None or row.get("project_type") != REFERENCE_PROJECT:
             return jsonify({"error": "Reference not found"}), 404
-        value = parse_reference_body(row.get("body")).get("value", "")
+        # A credential's value is held out of the body (#2426): resolve_value
+        # reads it from reference_secrets, and parses every other row as before.
+        value = await resolve_value(rt.db, row)
+        if value is None:
+            return jsonify({"error": "This reference's value is missing"}), 409
         return jsonify({"id": unit_id, "value": value})
     except Exception:
         logger.exception("Reference reveal failed")

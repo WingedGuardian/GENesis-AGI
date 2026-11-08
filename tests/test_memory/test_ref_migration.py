@@ -18,6 +18,10 @@ async def db_with_refs():
     """In-memory DB with schema + simulated reference entries in knowledge_base."""
     async with aiosqlite.connect(":memory:") as db:
         await create_all_tables(db)
+        # The rows below simulate data from before this migration ran, long
+        # before #2426, when a credential's value sat inline in its body. The
+        # current schema refuses such a body, so lift that guard for the setup.
+        await db.execute("DROP TRIGGER knowledge_units_credential_body_insert")
         await db.commit()
 
         # Insert a reference entry into knowledge_units

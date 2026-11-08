@@ -34,6 +34,39 @@ _BACKGROUND_COMPENSATIONS: set[asyncio.Task] = set()
 _SANITIZER = ContentSanitizer()
 
 
+def _scrub_reference_unit(unit):
+    """A copy of a distilled reference unit with every credential-pattern
+    secret its free text carries redacted, as ingest_knowledge_unit redacts a
+    reference written through it (#2426): the body, concept and tags, and the
+    caveats, relationships and section title stored beside them."""
+    import dataclasses
+
+    from genesis.memory.reference_ops import scrub_reference, scrub_with
+
+    lists = [*unit.caveats, *unit.relationships]
+    body, tags_json, concept, frags = scrub_reference(
+        unit.body, json.dumps(unit.tags), unit.concept,
+        also=(*[t for t in lists if isinstance(t, str)], unit.section_title, unit.source_date),
+        formatted=False,
+    )
+    if not frags.all:
+        return unit
+
+    def _clean(value):
+        return scrub_with(value, frags) if isinstance(value, str) else value
+
+    return dataclasses.replace(
+        unit,
+        body=body,
+        concept=concept,
+        tags=json.loads(tags_json) if tags_json else unit.tags,
+        caveats=[_clean(c) for c in unit.caveats],
+        relationships=[_clean(r) for r in unit.relationships],
+        section_title=_clean(unit.section_title),
+        source_date=_clean(unit.source_date),
+    )
+
+
 @dataclass
 class IngestResult:
     """Result of a single source ingestion."""
@@ -421,6 +454,20 @@ class KnowledgeOrchestrator:
 
         memory_mod._require_init()
         assert memory_mod._store is not None  # noqa: S101 - type-narrowing invariant
+
+        # #2426: a credential reference is never written by distillation. The
+        # vectors below are stored BEFORE the database rows, so the db layer's
+        # refusal would come after the value had already reached the vector
+        # store: refuse the whole batch here, before anything is written.
+        from genesis.db.crud.knowledge import holds_secret
+
+        if any(holds_secret(project_type, unit.domain) for unit in units):
+            raise ValueError(
+                "refusing to distil credential references: write them with "
+                "reference_store, which holds the value out (#2426)"
+            )
+        if (project_type or "").strip().lower() == "reference":
+            units = [_scrub_reference_unit(unit) for unit in units]
 
         unit_ids: list[str] = []
         qdrant_ids: list[str] = []  # Track for compensation on failure
