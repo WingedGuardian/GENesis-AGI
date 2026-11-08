@@ -3459,7 +3459,10 @@ verified: 3e27b4794 2026-10-23
   See `docs/reference/qualification-corpus.md`.
   Qualification's pinned transport supplies a caller-provided adapter router
   through the production delegate, a shared one-egress wire guard, response-hook
-  durability and exact lexical Decimal GET billing. Documented selected-route
+  durability and exact lexical Decimal GET billing. Frozen gateway `model`,
+  optional `backend_model` and `receipt_model` keep namespace-specific exact
+  matching; omitted pins retain strict legacy IDs, with no inferred aliases or
+  migration of stopped campaigns. Documented selected-route
   metadata is checked on live acceptance and replay; gateway response caching
   is explicitly disabled. Contradictory served identities retain unresolved
   liability, while expense settlement cannot qualify invalid routing evidence.
