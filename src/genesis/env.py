@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import stat
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -247,6 +248,17 @@ def boundary_key_path() -> Path:
     id that would close it. Created once, mode 0600, by the sanitizer.
     """
     return genesis_home() / "boundary_key"
+
+
+def mcp_credentials_dir() -> Path:
+    """Directory of the shared MCP service's caller credentials (``~/.genesis/mcp_credentials``).
+
+    Holds the static forwarder secret and one credential per external-client
+    profile, each mode 0600 in a 0700 directory. Written only by
+    ``genesis.caller_credentials.ensure_caller_credentials`` and read only by
+    its resolver. Composed from ``genesis_home()`` so tests redirect it.
+    """
+    return genesis_home() / "mcp_credentials"
 
 
 def internal_api_token_path() -> Path:
@@ -501,6 +513,24 @@ def sqlite_slow_ms() -> int:
         return 1000
 
 
+def sqlite_txn_hold_ms() -> int:
+    """Threshold (ms) at which a shared connection's write transaction, held
+    open from its first write to its commit or rollback, is logged
+    (``genesis.db._txn_hold``; default 1000).
+
+    Overridable via ``GENESIS_SQLITE_TXN_HOLD_MS``; ``0`` or a negative value
+    turns it off. Missing or non-integer values fall back to the default. It
+    only decides what is LOGGED — it never changes how a transaction runs.
+    """
+    raw = os.environ.get("GENESIS_SQLITE_TXN_HOLD_MS", "").strip()
+    if not raw:
+        return 1000
+    try:
+        return int(raw)
+    except ValueError:
+        return 1000
+
+
 def recall_rerank_gate_off() -> bool:
     """True when the recall rerank rate-gate + circuit-breaker must NOT be built
     (kill switch).
@@ -605,6 +635,32 @@ def _marker_holder_live(pid: int) -> bool:
         return True
 
 
+#: As scripts/lib/update_state_guard.STATE_BYTES (a test holds them equal):
+#: the state file is a few hundred bytes; one far over that no writer made.
+UPDATE_STATE_BYTES = 1 << 20
+
+
+def read_update_state(path: str | os.PathLike) -> bytes:
+    """``update_state.json``'s bytes, read as the restart guard reads them
+    (update_state_guard.read_state, #3964; the runtime cannot import that kit
+    file, so this mirrors it and a parity test pins the two): never through a
+    final symlink, never blocking on a FIFO, a regular file of at most
+    UPDATE_STATE_BYTES. Raises OSError or ValueError otherwise."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"{path} is not a regular file")
+        chunks, size = [], 0
+        while size <= UPDATE_STATE_BYTES and (chunk := os.read(fd, UPDATE_STATE_BYTES + 1 - size)):
+            chunks.append(chunk)
+            size += len(chunk)
+    finally:
+        os.close(fd)
+    if size > UPDATE_STATE_BYTES:
+        raise ValueError(f"{path} is over {UPDATE_STATE_BYTES} bytes")
+    return b"".join(chunks)
+
+
 def update_in_progress() -> bool:
     """True while a Genesis self-update (deploy) is actively running.
 
@@ -647,10 +703,12 @@ def update_in_progress() -> bool:
 
         # CLI path: update.sh state file with phase + owning PID + start time.
         state_file = home / "update_state.json"
-        if state_file.exists():
+        if state_file.exists() or state_file.is_symlink():
             try:
-                state = json.loads(state_file.read_text())
-            except (json.JSONDecodeError, OSError, ValueError, UnicodeDecodeError):
+                # Bounded (#3964): a FIFO there must not block the caller, which
+                # may hold update.lock (the dashboard's Dismiss).
+                state = json.loads(read_update_state(state_file).decode("utf-8"))
+            except (OSError, ValueError, RecursionError):
                 state = None
             if (
                 isinstance(state, dict)

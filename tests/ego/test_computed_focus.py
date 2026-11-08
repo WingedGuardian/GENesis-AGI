@@ -141,3 +141,132 @@ async def test_db_error_returns_fallback(db):
 
     result = await compute_focus_summary(db, "ego_focus_summary")
     assert result == "general system awareness"
+
+
+# -- Word-boundary clipping ---------------------------------------------------
+#
+# The focus text feeds both egos' prompts, the dashboard and the essential
+# knowledge block. Each field used to be a raw slice, which cut words in half
+# ("nothing leaves Gen"). Fixtures below are synthetic.
+
+_LONG_DIRECTIVE = (
+    "Keep every outbound message inside the approval queue so nothing leaves "
+    "Genesis without an explicit yes"
+)
+_LONG_PROPOSAL = (
+    "Rewrite the onboarding guide around the three most common install paths "
+    "and their recovery steps. Then measure it."
+)
+_LONG_GOAL = "Finish the long-running documentation overhaul for contributors"
+
+
+def _segment(result: str, label: str) -> str:
+    """The text after ``label`` up to the end of that part."""
+    return result.split(label, 1)[1].split("; ", 1)[0]
+
+
+async def test_long_directive_ends_at_a_word_boundary(db):
+    await db.execute(
+        "INSERT INTO ego_directives (id, content, ego_target) VALUES (?, ?, 'user_ego')",
+        ("d1", _LONG_DIRECTIVE),
+    )
+    await db.commit()
+
+    result = await compute_focus_summary(db, "ego_focus_summary")
+    shown = _segment(result, "1 directive(s): ")
+    assert shown.endswith("…")
+    assert len(shown) <= 60
+    body = shown[:-1]
+    assert set(body.split()) <= set(_LONG_DIRECTIVE.split())
+
+
+async def test_long_proposal_uses_its_first_sentence_clipped(db):
+    await db.execute(
+        "INSERT INTO ego_proposals (id, content, status) VALUES (?, ?, 'pending')",
+        ("p1", _LONG_PROPOSAL),
+    )
+    await db.commit()
+
+    result = await compute_focus_summary(db, "ego_focus_summary")
+    shown = _segment(result, "1 pending proposal(s): ")
+    assert shown.endswith("…")
+    assert len(shown) <= 40
+    assert set(shown[:-1].split()) <= set(_LONG_PROPOSAL.split(".")[0].split())
+
+
+async def test_short_proposal_keeps_its_first_sentence_without_the_dot(db):
+    await db.execute(
+        "INSERT INTO ego_proposals (id, content, status) VALUES (?, ?, 'pending')",
+        ("p1", "Ship v3.0 docs. Then rest."),
+    )
+    await db.commit()
+
+    result = await compute_focus_summary(db, "ego_focus_summary")
+    # A version number is not a sentence end, and no marker without a cut.
+    assert result.startswith("1 pending proposal(s): Ship v3.0 docs")
+    assert "…" not in result
+    assert "docs." not in result
+
+
+async def test_long_goal_title_ends_at_a_word_boundary(db):
+    await db.execute(
+        "INSERT INTO user_goals (id, title, category, status, priority) "
+        "VALUES ('g1', ?, 'project', 'active', 'high')",
+        (_LONG_GOAL,),
+    )
+    await db.commit()
+
+    result = await compute_focus_summary(db, "ego_focus_summary")
+    shown = _segment(result, "goals: ")
+    assert shown.endswith("…")
+    assert len(shown) <= 40
+    assert set(shown[:-1].split()) <= set(_LONG_GOAL.split())
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        _LONG_DIRECTIVE,
+        _LONG_PROPOSAL,
+        "Investigate why the quiet hours window drops alerts after midnight",
+        "Review the backlog. No proposals were filed last week for voice work",
+        "Document the fallow-period behaviour of the scheduler for operators",
+        "Holding pattern analysis for the v2.1 release candidates and docs",
+    ],
+)
+async def test_clipped_focus_does_not_newly_trip_the_behavioral_filter(db, content):
+    """The essential-knowledge reader drops a focus that matches
+    _BEHAVIORAL_FOCUS_RE. Clipping changes the text, so check that ordinary
+    topical content still passes the same way the old slices did."""
+    from genesis.memory.essential_knowledge import _BEHAVIORAL_FOCUS_RE
+
+    await db.execute(
+        "INSERT INTO ego_directives (id, content, ego_target) VALUES (?, ?, 'user_ego')",
+        ("d1", content),
+    )
+    await db.execute(
+        "INSERT INTO ego_proposals (id, content, status) VALUES (?, ?, 'pending')",
+        ("p1", content),
+    )
+    await db.execute(
+        "INSERT INTO user_goals (id, title, category, status, priority) "
+        "VALUES ('g1', ?, 'project', 'active', 'high')",
+        (content,),
+    )
+    await db.commit()
+
+    result = await compute_focus_summary(db, "ego_focus_summary")
+    old = _old_focus_shape(content)
+    assert bool(_BEHAVIORAL_FOCUS_RE.search(result)) == bool(_BEHAVIORAL_FOCUS_RE.search(old)), (
+        result,
+        old,
+    )
+
+
+def _old_focus_shape(content: str) -> str:
+    """The focus string the pre-clip slices produced for one row of each kind."""
+    return (
+        f"1 directive(s): {content[:60].split('.')[0]}; "
+        f"1 pending proposal(s): {content[:40].split('.')[0]}; "
+        f"goals: {content[:40]}"
+    )

@@ -227,10 +227,10 @@ async def init(rt: GenesisRuntime) -> None:
         logger.info("Genesis surplus scheduler started")
 
         if rt._router is not None and rt._db is not None:
-            from genesis.surplus.executor import SurplusLLMExecutor
+            from genesis.surplus.executor import SurplusLLMExecutor, surplus_posting_enabled
 
             real_executor = SurplusLLMExecutor(
-                rt._router, db=rt._db,
+                rt._router, db=rt._db, post_to_telegram=surplus_posting_enabled(cfg),
             )
             rt._surplus_scheduler.set_executor(real_executor)
             logger.info("Surplus executor upgraded: SurplusLLMExecutor")

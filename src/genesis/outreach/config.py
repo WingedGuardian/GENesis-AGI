@@ -97,6 +97,10 @@ class OutreachConfig:
     # Falls back to "default" key, then "supergroup" if unset.
     # When forum_chat_id is not configured, "supergroup" degrades to DM.
     delivery_routing: dict[str, str] = None  # type: ignore[assignment]
+    # Messages to ONE enrolled peer agent per day. Peer messages skip quiet hours,
+    # salience and the owner's daily budgets (they spend no human attention); this
+    # cap is what stops a loop from flooding a peer instead.
+    agent_daily_per_peer: int = 50
 
     def __post_init__(self) -> None:
         if self.delivery_routing is None:
@@ -187,7 +191,13 @@ def validate_preferences(preferences: dict) -> list[str]:
 
     if "rate_limits" in preferences:
         rl = preferences["rate_limits"]
-        for field in ("max_daily", "surplus_daily", "content_daily", "notification_daily"):
+        for field in (
+            "max_daily",
+            "surplus_daily",
+            "content_daily",
+            "notification_daily",
+            "agent_daily_per_peer",
+        ):
             val = rl.get(field)
             if val is not None:
                 try:
@@ -218,6 +228,7 @@ def save_outreach_config(config: OutreachConfig, path: Path | None = None) -> No
             "surplus_daily": config.surplus_daily,
             "content_daily": config.content_daily,
             "notification_daily": config.notification_daily,
+            "agent_daily_per_peer": config.agent_daily_per_peer,
         },
         "morning_report": {
             "trigger_time": config.morning_report_time,
@@ -286,6 +297,9 @@ def load_outreach_config(path: Path | None = None) -> OutreachConfig:
         surplus_daily=raw.get("rate_limits", {}).get("surplus_daily", 1),
         content_daily=raw.get("rate_limits", {}).get("content_daily", 3),
         notification_daily=raw.get("rate_limits", {}).get("notification_daily", 10),
+        agent_daily_per_peer=raw.get("rate_limits", {}).get(
+            "agent_daily_per_peer", _DEFAULTS.agent_daily_per_peer
+        ),
         morning_report_time=raw.get("morning_report", {}).get("trigger_time", "07:00"),
         engagement_timeout_hours=raw.get("engagement", {}).get("timeout_hours", 24),
         engagement_poll_minutes=raw.get("engagement", {}).get("poll_interval_minutes", 60),

@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_scripts._update_source import update_text
 from tests.test_scripts.test_bootstrap_guards import (
     _assert_recovery_refused,
     _recover,
@@ -55,7 +56,7 @@ _GIT_ENV = {
 
 
 def _text() -> str:
-    return UPDATE.read_text()
+    return update_text()
 
 
 def _block(marker: str) -> str:
@@ -162,10 +163,10 @@ def _live_world(dc, w, capsys, files: dict | None = None) -> str:
 
 
 def _do_rollback_fn() -> str:
-    """update.sh's _do_rollback, whole (its body holds a column-0 `}` in an
+    """The rollback body, whole (it holds a column-0 `}` in an
     embedded python program, so _function cannot cut it)."""
     text = _text()
-    start = text.index("_do_rollback() {\n")
+    start = text.index("_rollback_body() {\n")
     end = text.index("\n}\n", text.index("# END rollback-state-clear", start)) + len("\n}\n")
     return text[start:end]
 
@@ -192,12 +193,14 @@ def _engine_script(root: Path, script_dir: Path, base: str, mu: str, pre: str = 
         'UPDATE_OWN_HEAD="$VALIDATED_HEAD"\n'
         f'_LIVE_BASE="{base}"\nDEPLOY_HEAD="$_LIVE_BASE"\n'
         'OLD_TAG=untagged\nOLD_COMMIT=old\nNEW_TAG=""\nNEW_COMMIT=""\nSTARTED_AT=now\n'
-        'MERGE_ATTEMPTED=0\nMIGRATIONS_RAN=0\nDB_FILE="$HOME/none.db"\n'
+        'MERGE_ATTEMPTED=0\nDB_RESTORE_OWED=0\nDB_FILE="$HOME/none.db"\n'
         'GENESIS_TAKE_TEMPLATES=""\nREFUSED_FILE="$HOME/.genesis/update_refused.json"\n'
         'STATE_FILE="$HOME/.genesis/update_state.json"\nWERE_RUNNING=(genesis-server)\n'
         '_STATE_WRITTEN=0\n_STATE_PHASE=""\n_LIVE_ENGINE_RAN=0\nCALLS="$HOME/calls"\n'
         'VENV_DIR="$HOME/venv"\nmkdir -p "$VENV_DIR/bin" "$HOME/.genesis/locks"\n'
         'printf \'#!/bin/sh\\nexit 0\\n\' > "$VENV_DIR/bin/pip"\nchmod +x "$VENV_DIR/bin/pip"\n'
+        # A healthy venv: the rollback's package step also checks the import.
+        'printf \'#!/bin/sh\\nexit 0\\n\' > "$VENV_DIR/bin/python"\nchmod +x "$VENV_DIR/bin/python"\n'
         'exec {_UPDATE_LOCK_FD}>"$HOME/.genesis/locks/update.lock"\nflock -n "$_UPDATE_LOCK_FD"\n'
         + mu
         + "".join(
@@ -208,16 +211,21 @@ def _engine_script(root: Path, script_dir: Path, base: str, mu: str, pre: str = 
         )
         # The restart record (#3451) the stop and _do_rollback write.
         + _block("restart-owed")
+        # The DB-restore measurement _do_rollback runs (no snapshot here: it keeps the DB).
+        + _block("db-restore-owed")
         + _function("_write_state")
         + _function("_clear_deploy_marker")
         + _block("live-helpers")
         + _SERVICE_STUBS
+        + _function("_note_rollback_source")
+        + _function("_do_rollback")
         + _do_rollback_fn()
         + _function("_on_err")
         + _function("_on_signal")
         + "trap _on_err ERR\ntrap '_on_signal INT' INT\ntrap '_on_signal TERM' TERM\n"
         + '_write_state "merging"\n'
         + pre
+        + _block("stale-index-lock")
         + _block("live-engine")
         + 'echo "RESULT OWN=$UPDATE_OWN_HEAD DEPLOY=$DEPLOY_HEAD NEW=$NEW_COMMIT"\n'
     )

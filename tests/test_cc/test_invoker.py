@@ -757,6 +757,54 @@ def test_probe_sets_the_same_properties_as_the_real_invocation(monkeypatch):
         assert prop in out
 
 
+def test_scope_argv_carries_a_fixed_description():
+    import genesis.cc.invoker as inv_mod
+
+    assert inv_mod._scope_argv() == [
+        "systemd-run",
+        "--user",
+        "--scope",
+        "--quiet",
+        "--description=Genesis CC session",
+        "-p",
+        "IOWeight=100",
+        "-p",
+        "MemoryHigh=62%",
+        "-p",
+        "MemoryMax=75%",
+        "--",
+    ]
+
+
+def test_scope_description_never_carries_the_command():
+    import genesis.cc.invoker as inv_mod
+
+    argv = inv_mod._scope_argv("/usr/local/bin/claude", "-p", "SECRET-PROMPT-TEXT")
+    descriptions = [arg for arg in argv if arg.startswith("--description=")]
+    assert descriptions == ["--description=Genesis CC session"]
+    assert all("SECRET-PROMPT-TEXT" not in arg for arg in argv[: argv.index("--")])
+
+
+def test_probe_carries_the_description(monkeypatch):
+    import subprocess as real_subprocess
+
+    import genesis.cc.invoker as inv_mod
+
+    monkeypatch.setattr(inv_mod.shutil, "which", lambda _: "/usr/bin/systemd-run")
+    seen = []
+
+    def _probe_ok(*args, **kwargs):
+        seen.append(list(args[0]))
+        return real_subprocess.CompletedProcess(args[0], 0, b"", b"")
+
+    monkeypatch.setattr(inv_mod.subprocess, "run", _probe_ok)
+    out = inv_mod._build_scope_args()
+
+    assert len(seen) == 1
+    description = "--description=Genesis CC session"
+    assert seen[0].index(description) == out.index(description)
+
+
 def test_scope_args_built_when_probe_succeeds(monkeypatch):
     import subprocess as real_subprocess
 
@@ -1740,6 +1788,41 @@ async def test_run_streaming_rate_limit_with_empty_response_raises():
 
     mock_proc = AsyncMock()
     mock_proc.stdout = _make_async_stdout(data)
+    mock_proc.stdin = _make_mock_stdin()
+    mock_proc.stderr = _make_mock_stderr()
+    mock_proc.wait = AsyncMock()
+    mock_proc.terminate = MagicMock()
+    mock_proc.returncode = 0
+
+    with (
+        patch("asyncio.create_subprocess_exec", return_value=mock_proc),
+        pytest.raises(CCRateLimitError),
+    ):
+        await inv.run_streaming(CCInvocation(prompt="test"))
+
+
+@pytest.mark.asyncio
+async def test_a_synthetic_limit_notice_is_not_an_answer_under_a_rate_limit():
+    """The CLI's own limit notice must not turn an empty rate-limited result
+    into a served answer: it would be delivered and failover would never run."""
+    from genesis.cc.exceptions import CCRateLimitError
+
+    inv = CCInvoker(claude_path="claude")
+    events = [
+        {"type": "system", "subtype": "init", "session_id": "s1"},
+        {"type": "rate_limit_event", "rate_limit_info": {"status": "rejected"}},
+        {"type": "assistant", "message": {"model": "<synthetic>", "content": [
+            {"type": "text", "text": "You've hit your 5-hour limit"},
+        ]}},
+        {
+            "type": "result", "subtype": "success", "is_error": False, "result": "",
+            "session_id": "s1", "total_cost_usd": 0.0, "duration_ms": 50,
+            "usage": {"input_tokens": 5, "output_tokens": 0},
+            "modelUsage": {"claude-sonnet-4-6": {}},
+        },
+    ]
+    mock_proc = AsyncMock()
+    mock_proc.stdout = _make_async_stdout(_make_stream_lines(*events))
     mock_proc.stdin = _make_mock_stdin()
     mock_proc.stderr = _make_mock_stderr()
     mock_proc.wait = AsyncMock()

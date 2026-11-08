@@ -31,6 +31,7 @@ from pathlib import Path
 from genesis.guardian.cred_integrity import (
     DEFAULT_TARGETS,
     RESTORABLE_STATUSES,
+    _backup_dir_if_present,
     allowed_restore,
     check_all,
     resolve_passphrase,
@@ -89,8 +90,7 @@ def check_and_selfheal(
     """
     home = home or Path.home()
     if backup_dir is None:
-        candidate = home / "backups" / "genesis-backups"
-        backup_dir = candidate if candidate.exists() else None
+        backup_dir = _backup_dir_if_present(home / "backups" / "genesis-backups")
     status_path = status_path or (home / ".genesis" / "cred_integrity_status.json")
     tgts = targets if targets is not None else DEFAULT_TARGETS
     by_name = {t.name: t for t in tgts}

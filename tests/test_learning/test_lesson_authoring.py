@@ -39,7 +39,7 @@ async def env(tmp_path, monkeypatch):
         old = mod._store, mod._db, mod._retriever
         mod._store, mod._db, mod._retriever = MagicMock(), db, MagicMock()
         try:
-            store = (await mcp.get_tools())["procedure_store"].fn
+            store = ({tool.name: tool for tool in await mcp.list_tools()})["procedure_store"].fn
             yield db, store, cache
         finally:
             mod._store, mod._db, mod._retriever = old

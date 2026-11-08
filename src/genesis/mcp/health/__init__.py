@@ -21,13 +21,14 @@ from typing import TYPE_CHECKING
 from fastmcp import FastMCP
 
 if TYPE_CHECKING:
+    from genesis.mcp.standalone_health import StandaloneHealthDataService
     from genesis.observability.health_data import HealthDataService
 
 logger = logging.getLogger(__name__)
 
 mcp = FastMCP("genesis-health")
 
-_service: HealthDataService | None = None
+_service: HealthDataService | StandaloneHealthDataService | None = None
 _event_bus: object | None = None
 _activity_tracker: object | None = None
 _job_retry_registry: object | None = None
@@ -36,23 +37,32 @@ _alert_history: dict[str, str] = {}
 
 
 def init_health_mcp(
-    service: HealthDataService,
+    service: HealthDataService | StandaloneHealthDataService,
     *,
     event_bus: object | None = None,
     activity_tracker: object | None = None,
     job_retry_registry: object | None = None,
 ) -> None:
+    from genesis.db.request_database import RequestDatabase
+    from genesis.mcp.standalone_health import StandaloneHealthDataService
+
+    if isinstance(getattr(service, "_db", None), RequestDatabase) and not isinstance(
+        service, StandaloneHealthDataService,
+    ):
+        raise ValueError(
+            "Request-owned health requires StandaloneHealthDataService; "
+            "runtime snapshot sharing is unsupported"
+        )
+
     global _service, _event_bus, _activity_tracker, _job_retry_registry
     _service = service
     _event_bus = event_bus
     _activity_tracker = activity_tracker
     _job_retry_registry = job_retry_registry
 
-    if activity_tracker is not None:
-        from genesis.observability.mcp_middleware import InstrumentationMiddleware
+    from genesis.observability.mcp_middleware import install_instrumentation
 
-        # service._db is the long-lived health connection (set in init_health_mcp's caller)
-        mcp.add_middleware(InstrumentationMiddleware(activity_tracker, "health", db=service._db))
+    install_instrumentation(mcp, activity_tracker, "health", getattr(service, "_db", None))
 
     logger.info("Health MCP wired to HealthDataService")
 
@@ -97,6 +107,7 @@ from genesis.mcp.health import skill_usage_status as _skill_usage_status  # noqa
 from genesis.mcp.health import status as _status  # noqa: E402
 from genesis.mcp.health import task_tools as _task_tools  # noqa: E402
 from genesis.mcp.health import update_history as _update_history  # noqa: E402
+from genesis.mcp.health import validator_writes as _validator_writes  # noqa: E402, F401
 from genesis.mcp.health import web_tools as _web_tools  # noqa: E402, F401
 from genesis.mcp.health import zero_drop_tools as _zero_drop_tools  # noqa: E402, F401
 

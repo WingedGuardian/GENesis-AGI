@@ -29,7 +29,9 @@ JOB_CAP = 8 * 1024**3
 
 def verify_scope(env: dict[str, str]) -> int:
     """Reuse destination-scope admission; never accept a caller-only cap."""
-    admission = runpy.run_path(str(Path(__file__).with_name("code_intel_cbm_admission.py")))
+    admission = globals().get("_CAPTURED_ADMISSION")
+    if admission is None:
+        admission = runpy.run_path(str(Path(__file__).with_name("code_intel_cbm_admission.py")))
     number = admission["number"]
     try:
         cap = number(env.get("CODE_INTEL_CHILD_CAP_BYTES", ""), "worker cap")
@@ -67,6 +69,9 @@ def read_result(path: Path) -> dict:
 
 
 def load_managed() -> dict:
+    captured = globals().get("_CAPTURED_MANAGED")
+    if captured is not None:
+        return captured()
     return runpy.run_path(str(Path(__file__).resolve().parents[1] / "codebase_managed.py"))
 
 

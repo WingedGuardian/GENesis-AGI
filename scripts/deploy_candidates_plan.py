@@ -67,6 +67,13 @@ def shared_with(repo: Repo, base: str, heads: dict[str, str]) -> dict[str, list[
     return result
 
 
+#: The merges a rebuild writes are loose objects, which git does not fsync by
+#: default (git-config(1): core.fsync defaults to committed,-loose-object). The
+#: move record names the tip durably, so these two calls harden its objects too:
+#: a power loss after the record must not lose the tree it names (#3492 PR D).
+DURABLE_OBJECTS = ("-c", "core.fsync=committed")
+
+
 def build_plan(
     repo: Repo,
     base: str,
@@ -112,6 +119,7 @@ def build_plan(
         # `.gitattributes` (`merge=union`) would otherwise merge two conflicting
         # candidates into an unreviewed concatenation (MEASURED, git 2.43).
         p = repo.git(
+            *DURABLE_OBJECTS,
             f"--attr-source={base}",
             "merge-tree",
             "--write-tree",
@@ -139,7 +147,15 @@ def build_plan(
             f"{TRAILER_KEY}: {rebuild_id}\n{CANDIDATE_KEY}: {b}\n"
         )
         tip = repo.git(
-            "commit-tree", tree, "-p", tip, "-p", head, input=msg, extra_env=IDENTITY
+            *DURABLE_OBJECTS,
+            "commit-tree",
+            tree,
+            "-p",
+            tip,
+            "-p",
+            head,
+            input=msg,
+            extra_env=IDENTITY,
         ).stdout.strip()
         merged.append((b, head))
     return Plan(base=base, tip=tip, merged=merged, excluded=excluded, contained=contained)
@@ -492,15 +508,22 @@ def _move_checkout_locked(
                 if changed:
                     _write_move_record(repo, plan.tip, "partial", before=False)
                     more = f"\n  … and {len(changed) - 20} more" if len(changed) > 20 else ""
+                    # Recorded in update.sh's row, the move is one the repair reads;
+                    # a hand run records nothing, so its paths go back by hand.
+                    put_back = (
+                        "Put them back with scripts/deploy_candidates repair-move (it saves every "
+                        "path it changes under ~/.genesis/deploy-backups/ first)"
+                        if repo.env.get("DEPLOY_CANDIDATES_OWN_STATE_PID")
+                        else "Put the tracked ones back (git restore --source=HEAD --staged "
+                        "--worktree -- <path>), delete the new untracked ones"
+                    )
                     raise Refusal(
                         f"git failed partway through moving the checkout to {plan.tip[:12]}: HEAD "
                         f"is still {head_ref or 'detached'}, but these paths changed:\n"
                         + "\n".join("  " + c for c in changed[:20])
                         + more
-                        + "\nThe working tree mixes two trees; nothing was restarted. Put the tracked "
-                        "ones back (git restore --source=HEAD --staged --worktree -- <path>), delete "
-                        "the new untracked ones, fix the cause below, then retry:\n"
-                        + p.stderr.strip()
+                        + f"\nThe working tree mixes two trees; nothing was restarted. {put_back}, "
+                        "fix the cause below, then retry:\n" + p.stderr.strip()
                     )
                 _write_move_record(repo, plan.tip, "clean", before=False)
                 raise Refusal(

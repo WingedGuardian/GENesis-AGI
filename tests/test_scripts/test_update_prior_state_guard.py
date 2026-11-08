@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.test_scripts._update_source import update_text
 from tests.test_scripts.test_update_state_guard import diverged_live, live_row, post_merge_advice
 
 REPO = Path(__file__).resolve().parents[2]
@@ -36,7 +37,7 @@ pytestmark = pytest.mark.skipif(sys.platform.startswith("win"), reason="bash + g
 
 
 def _text() -> str:
-    return UPDATE.read_text()
+    return update_text()
 
 
 def _block(name: str) -> str:
@@ -283,6 +284,27 @@ def test_a_rollback_keeps_the_state_when_merged_code_stayed(world, checkout_ok, 
     assert world["state"].exists() is kept
     if kept:
         assert "restart guard" in r.stdout
+
+
+def test_td20_a_suspect_live_tree_the_guard_cannot_judge_names_the_repair(world, tmp_path):
+    """T-D20: the live rollback marked the tree suspect and the guard could not
+    run (since #3532 every verdict it CAN give prints its own remedy, a live
+    half-written one naming the repair, so this line is only for a guard that
+    said nothing): the kept-state line names the repair (it says when there is
+    nothing to repair), and keeps the by-hand steps."""
+    world["state"].write_text(json.dumps({"phase": "bootstrap", "rollback_tag": "pre"}))
+    no_guard = tmp_path / "no-guard-here"  # python3 exits 2: the guard file is missing
+    script = (
+        "set -Eeuo pipefail\n"
+        f'STATE_FILE="{world["state"]}"\ncheckout_ok=false\n_LIVE_TREE_SUSPECT=1\n'
+        f'SCRIPT_DIR="{no_guard}"\nGENESIS_ROOT="{world["root"]}"\nROLLBACK_TAG=pre\n'
+        f'. "{MARKER_LIB}"\n' + _function("_clear_deploy_marker") + _block("rollback-state-clear")
+    )
+    r = _bash(script, world["home"])
+    assert r.returncode == 0, r.stderr
+    assert "scripts/deploy_candidates repair-move puts it back to pre" in r.stdout, r.stdout
+    assert "by hand, put back the paths" in r.stdout and world["state"].exists()
+    assert not post_merge_advice(r.stdout), r.stdout
 
 
 # ── --post-merge over a half-written checkout (#3492) ───────────────────────────

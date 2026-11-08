@@ -1,0 +1,1 @@
+- **Essential knowledge's "Key Insights" no longer fills with job logs.** The process reaper's, entity adjudication's and the dream cycle's per-run status reports are no longer shown as insights (they are still recorded), and an insight repeated with only whitespace or case differences appears once, so repeats no longer push distinct insights out of the section.

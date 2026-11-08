@@ -1,0 +1,1 @@
+- The `[test]` extra now includes pytest-xdist, pinned in CI to 3.8.0. No CI job runs tests in parallel yet; this lets the fixes for parallel runs carry their own `-n` tests. Because the extra changed, an install's next code-only deploy refuses and names `scripts/update.sh`, which reinstalls.

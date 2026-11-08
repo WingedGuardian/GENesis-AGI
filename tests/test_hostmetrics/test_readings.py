@@ -243,8 +243,13 @@ def test_disk_reads_statvfs(tmp_path):
 
 
 def test_disk_matches_os_statvfs(tmp_path):
+    # Two reads of free space taken moments apart differ whenever anything else
+    # writes to the filesystem: a parallel CI worker wrote 4 KiB between them
+    # (2026-11-07). The total is exact; free space must agree within 1 MiB.
     st = os.statvfs(tmp_path)
-    assert r.read_disk(tmp_path) == (st.f_blocks * st.f_frsize, st.f_bavail * st.f_frsize)
+    total, free = r.read_disk(tmp_path)
+    assert total == st.f_blocks * st.f_frsize
+    assert abs(free - st.f_bavail * st.f_frsize) <= 1024 * 1024
 
 
 def test_disk_path_not_yet_created_reads_its_parent(tmp_path):

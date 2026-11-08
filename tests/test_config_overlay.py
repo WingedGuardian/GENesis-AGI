@@ -239,7 +239,10 @@ def test_no_unisolated_local_yaml_resolver():
     # session_awareness/handoff_send.py: reads peers through merge_local_overlay
     # (strict); peers.local.yaml and handoffs.local.yaml appear only in operator
     # messages, including one inside the constant program it runs on a peer.
+    # inbox/sync_health.py: reads the overlay through genesis.inbox.config, which
+    # routes via merge_local_overlay; the path appears only in its alert text.
     prose_mentions = {
+        "inbox/sync_health.py",
         "mcp/health/reflex_status.py",
         "cc/conversation.py",
         "awareness/loop.py",
