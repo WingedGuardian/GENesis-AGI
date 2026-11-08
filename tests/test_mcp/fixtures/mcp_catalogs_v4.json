@@ -3630,7 +3630,7 @@
           "contains": {
             "default": "",
             "type": "string",
-            "description": "Optional content match (only files passing the other filters are\nopened). Empty = no content filtering."
+            "description": "Optional content match (only files passing the other filters are\nopened). Empty = no content filtering. Credential files (the\nsecrets file and its backups, .env files, private keys, token and\ncredential files) are never content-searched: they stay findable by\nname, content_skipped_credential_files counts them, and stored\ncredentials are read with reference_lookup. A matched line that\ncontains a value from the secrets file is withheld (counted in\ncontent_redacted_secret_lines), wherever the file lives."
           },
           "regex": {
             "default": false,

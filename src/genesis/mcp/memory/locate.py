@@ -49,10 +49,15 @@ _PRUNE_DIRS = frozenset({
     "target", "worktrees", "worktree-trash", "background-sessions", "cc-tmp",
     "embedding_cache", "qdrant_storage", "browser-profile", "camoufox-profile",
     "paste-cache", "file-history", "backups", "downloads",
-    # XDG config dirs hold tool auth state (gh's hosts.yml carries a token),
-    # never project content.
-    ".config",
 })
+
+# Directory names whose files are never content-searched (still found by name):
+# XDG config dirs hold tool auth state (gh's hosts.yml carries a token).
+_CREDENTIAL_DIRS = frozenset({".config"})
+
+# A secret value shorter than this is not used to redact matches: short values
+# (ports, flags, user names) would redact ordinary lines.
+_MIN_SECRET_VALUE_LEN = 12
 
 # Per-file glob skips (binary/churn artifacts not worth surfacing).
 _SKIP_FILE_GLOBS = ("*.db", "*.db-wal", "*.db-shm", "*.sqlite", "*.sqlite3", "*.lock")
@@ -182,6 +187,33 @@ def _secret_file_ids() -> set[tuple[int, int]]:
     return {(st.st_dev, st.st_ino)}
 
 
+def _secret_values() -> frozenset[str]:
+    """The values in the configured secrets file, for redacting matched lines.
+
+    A copy of a credential under a neutral name, or a value pasted into a note,
+    passes every name and inode rule; a matched line that contains one of these
+    values is dropped instead. Read server-side only, never returned.
+    """
+    from genesis.channels.bridge_config import parse_secrets_env_text
+
+    try:
+        text = env.secrets_path().read_text(errors="replace")
+    except OSError:
+        return frozenset()
+    return frozenset(
+        value
+        for value in (v.strip().strip("'") for v in parse_secrets_env_text(text).values())
+        if len(value) >= _MIN_SECRET_VALUE_LEN
+    )
+
+
+def _snippet(line: str, secret_values: frozenset[str]) -> str | None:
+    """The match text for a line, or None when the line carries a secret value."""
+    if any(value in line for value in secret_values):
+        return None
+    return line.strip()[:_SNIPPET_CHARS]
+
+
 def _holds_credentials(record: dict, secret_ids: set[tuple[int, int]]) -> bool:
     """Whether a file's content must never be searched (#4129).
 
@@ -196,7 +228,9 @@ def _holds_credentials(record: dict, secret_ids: set[tuple[int, int]]) -> bool:
         parts = record["path"].relative_to(record["root"]).parts
     except ValueError:
         parts = (record["name"],)
-    return any(is_credential_component(part) for part in parts)
+    return any(
+        part in _CREDENTIAL_DIRS or is_credential_component(part) for part in parts
+    )
 
 
 # ── walk ──────────────────────────────────────────────────────────────────────
@@ -293,11 +327,12 @@ def _is_text_and_small(path: Path) -> bool:
 
 def _content_match(
     records: list[dict], contains: str, regex: bool,
-) -> tuple[list[dict], str | None, int]:
+) -> tuple[list[dict], str | None, int, int]:
     """Filter records to those whose content matches, attaching ``matches``.
 
-    Returns (records_with_matches, error, credential_files_skipped). ``error``
-    set only on invalid regex. Credential files are never opened.
+    Returns (records_with_matches, error, credential_files_skipped,
+    secret_lines_redacted). ``error`` set only on invalid regex. Credential
+    files are never opened; a matched line carrying a secret value is dropped.
     Binary/oversize files are excluded up front (see ``_is_text_and_small``).
     Tries rg first (fast); falls back to pure Python when rg is absent or
     errors — identical result shape either way.
@@ -306,19 +341,29 @@ def _content_match(
         try:
             re.compile(contains)
         except re.error as exc:
-            return [], f"invalid regex: {exc}", 0
+            return [], f"invalid regex: {exc}", 0, 0
     secret_ids = _secret_file_ids()
     searchable = [r for r in records if not _holds_credentials(r, secret_ids)]
     skipped = len(records) - len(searchable)
     eligible = [r for r in searchable if _is_text_and_small(r["path"])]
+    secret_values = _secret_values()
+    redacted = [0]
     if _have_rg():
-        out = _content_match_rg(eligible, contains, regex)
+        out = _content_match_rg(eligible, contains, regex, secret_values, redacted)
         if out is not None:
-            return out, None, skipped
-    return _content_match_python(eligible, contains, regex), None, skipped
+            return out, None, skipped, redacted[0]
+        redacted = [0]
+    out = _content_match_python(eligible, contains, regex, secret_values, redacted)
+    return out, None, skipped, redacted[0]
 
 
-def _content_match_rg(records: list[dict], contains: str, regex: bool) -> list[dict] | None:
+def _content_match_rg(
+    records: list[dict],
+    contains: str,
+    regex: bool,
+    secret_values: frozenset[str] = frozenset(),
+    redacted: list[int] | None = None,
+) -> list[dict] | None:
     """rg-backed content match. Returns None to signal 'fall back to Python'."""
     by_path = {str(r["path"]): r for r in records}
     if not by_path:
@@ -353,16 +398,26 @@ def _content_match_rg(records: list[dict], contains: str, regex: bool) -> list[d
             lst = matches_by_path.setdefault(p, [])
             if len(lst) >= _MAX_MATCHES_PER_FILE:
                 continue
-            text = (data.get("lines", {}).get("text") or "").strip()[:_SNIPPET_CHARS]
+            text = _snippet(data.get("lines", {}).get("text") or "", secret_values)
+            if text is None:
+                if redacted is not None:
+                    redacted[0] += 1
+                continue
             lst.append({"line": data.get("line_number"), "text": text})
     return [
         {**rec, "matches": matches_by_path[p]}
         for p, rec in by_path.items()
-        if p in matches_by_path
+        if matches_by_path.get(p)
     ]
 
 
-def _content_match_python(records: list[dict], contains: str, regex: bool) -> list[dict]:
+def _content_match_python(
+    records: list[dict],
+    contains: str,
+    regex: bool,
+    secret_values: frozenset[str] = frozenset(),
+    redacted: list[int] | None = None,
+) -> list[dict]:
     """Pure-Python content match fallback (binary/oversize-guarded)."""
     pattern = re.compile(contains) if regex else None
     out: list[dict] = []
@@ -382,7 +437,12 @@ def _content_match_python(records: list[dict], contains: str, regex: bool) -> li
         for lineno, line in enumerate(text.splitlines(), start=1):
             hit = pattern.search(line) if pattern else (contains in line)
             if hit:
-                matches.append({"line": lineno, "text": line.strip()[:_SNIPPET_CHARS]})
+                snippet = _snippet(line, secret_values)
+                if snippet is None:
+                    if redacted is not None:
+                        redacted[0] += 1
+                    continue
+                matches.append({"line": lineno, "text": snippet})
                 if len(matches) >= _MAX_MATCHES_PER_FILE:
                     break
         if matches:
@@ -402,6 +462,7 @@ def _error_response(query: dict, error: str, *, roots=None, skipped=None, scanne
         "truncated": False,
         "content_pool_capped": False,
         "content_skipped_credential_files": 0,
+        "content_redacted_secret_lines": 0,
         "scan_truncated": False,
         "scanned": scanned,
         "roots": roots or [],
@@ -413,7 +474,7 @@ def _error_response(query: dict, error: str, *, roots=None, skipped=None, scanne
 
 def _summarize(
     scope, within, file_type, contains, total, shown, truncated, skipped, capped, scan_truncated,
-    credential_skipped=0,
+    credential_skipped=0, secret_lines_redacted=0,
 ) -> str:
     extra = []
     if skipped:
@@ -423,6 +484,8 @@ def _summarize(
             f"{credential_skipped} credential file(s) not content-searched "
             "(find them by name; read stored credentials with reference_lookup)"
         )
+    if secret_lines_redacted:
+        extra.append(f"{secret_lines_redacted} matched line(s) withheld: they contain a secret value")
     if capped:
         extra.append(f"content pool capped at {_CONTENT_POOL_CAP}")
     if scan_truncated:
@@ -501,12 +564,15 @@ async def _impl_locate(
 
     capped = False
     credential_skipped = 0
+    secret_lines_redacted = 0
     if contains:
         if len(records) > _CONTENT_POOL_CAP:
             records.sort(key=lambda r: (-r["mtime"], str(r["path"])))
             records = records[:_CONTENT_POOL_CAP]
             capped = True
-        records, error, credential_skipped = _content_match(records, contains, regex)
+        records, error, credential_skipped, secret_lines_redacted = _content_match(
+            records, contains, regex,
+        )
         if error:
             return _error_response(
                 query, error, roots=walked_roots, skipped=skipped_roots, scanned=scan_budget[0],
@@ -537,6 +603,7 @@ async def _impl_locate(
         "summary": _summarize(
             scope, within, file_type, contains, total, len(results),
             truncated, skipped_roots, capped, scan_truncated, credential_skipped,
+            secret_lines_redacted,
         ),
         "query": query,
         "count": len(results),
@@ -544,6 +611,7 @@ async def _impl_locate(
         "truncated": truncated,
         "content_pool_capped": capped,
         "content_skipped_credential_files": credential_skipped,
+        "content_redacted_secret_lines": secret_lines_redacted,
         "scan_truncated": scan_truncated,
         "scanned": scan_budget[0],
         "roots": walked_roots,
@@ -584,15 +652,18 @@ async def locate(
             secrets file and its backups, .env files, private keys, token and
             credential files) are never content-searched: they stay findable by
             name, content_skipped_credential_files counts them, and stored
-            credentials are read with reference_lookup.
+            credentials are read with reference_lookup. A matched line that
+            contains a value from the secrets file is withheld (counted in
+            content_redacted_secret_lines), wherever the file lives.
         regex: Treat ``contains`` as a regex (default: literal substring).
         limit: Max results (default 50, hard cap 200; 0 or negative = all up to
             the cap). Truncation is reported explicitly via count / total_matched
             / truncated.
 
     Returns a dict with: summary, query (echoed), count, total_matched, truncated,
-    content_pool_capped, content_skipped_credential_files, scan_truncated (true if
-    the walk hit its file ceiling, so
+    content_pool_capped, content_skipped_credential_files,
+    content_redacted_secret_lines, scan_truncated (true if the walk hit its file
+    ceiling, so
     results may be incomplete), scanned, roots, skipped_roots, and results[] (path,
     name, scope, mtime, age, size, and matches[] when ``contains`` is used), newest first.
     """

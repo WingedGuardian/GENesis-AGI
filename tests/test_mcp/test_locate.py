@@ -315,10 +315,11 @@ async def test_credential_files_are_findable_by_name_but_never_content_searched(
     r = await _impl_locate(scope="repo", within="0", contains="FAKE_TOKEN")
     assert _names(r) == {"notes.md"}
     assert "not-a-real-value" not in str(r)
-    # Counted, so a skipped file never reads as "no match"; .config is pruned.
-    assert r["content_skipped_credential_files"] == len(_CREDENTIAL_NAMES) + 1
+    # Counted, so a skipped file never reads as "no match" (incl. creds/ and .config/).
+    assert r["content_skipped_credential_files"] == len(_CREDENTIAL_NAMES) + 2
     assert "not content-searched" in r["summary"]
     assert "secrets.env" in _names(await _impl_locate(scope="repo", within="0", name="secrets.env"))
+    assert "hosts.yml" in _names(await _impl_locate(scope="repo", within="0", name="hosts.yml"))
 
 
 async def test_the_configured_secrets_file_is_skipped_under_any_name(roots, monkeypatch):
@@ -337,3 +338,32 @@ def test_dashboard_and_locate_share_one_credential_predicate():
     from genesis.security.credential_names import is_credential_component
 
     assert files._is_credential_component is is_credential_component
+
+
+@pytest.mark.parametrize("have_rg", [True, False])
+async def test_a_line_carrying_a_secret_value_is_withheld_wherever_it_lives(
+    roots, monkeypatch, have_rg
+):
+    # A copy under a neutral name, or a value pasted into a note, passes every
+    # name and inode rule; the secret VALUE is what gives it away.
+    if not have_rg:
+        monkeypatch.setattr("genesis.mcp.memory.locate._have_rg", lambda: False)
+    secrets = _touch(
+        roots["tmp"] / "vault" / "secrets.env",
+        content='FAKE_TOKEN="not-a-real-value-123"\nSHORT_FLAG=on\n',
+    )
+    monkeypatch.setenv("SECRETS_PATH", str(secrets))
+    _touch(roots["repo"] / "keys.txt", content="FAKE_TOKEN=not-a-real-value-123\n")
+    _touch(
+        roots["repo"] / "notes.md",
+        content="FAKE_TOKEN is rotated monthly\npasted FAKE_TOKEN not-a-real-value-123\nflag on\n",
+    )
+    r = await _impl_locate(scope="repo", within="0", contains="FAKE_TOKEN")
+    assert _names(r) == {"notes.md"}
+    assert [m["text"] for m in r["results"][0]["matches"]] == ["FAKE_TOKEN is rotated monthly"]
+    assert "not-a-real-value-123" not in str(r)
+    assert r["content_redacted_secret_lines"] == 2
+    assert "withheld" in r["summary"]
+    # A value under the length floor never redacts ordinary text.
+    r = await _impl_locate(scope="repo", within="0", contains="flag")
+    assert r["content_redacted_secret_lines"] == 0
