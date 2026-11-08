@@ -808,6 +808,34 @@ async def test_the_audio_fallback_never_runs_for_an_unbounded_stream(monkeypatch
     assert any(reason in e for e in result.errors), result.errors
 
 
+async def test_the_audio_fallback_treats_an_overflowing_duration_as_unknown(
+    monkeypatch, tmp_path,
+):
+    """#4042: a JSON duration of 1e400 decodes to inf; formatting it with
+    int() raised OverflowError instead of skipping audio as unknown length."""
+
+    async def run(argv):
+        out = argv[argv.index("-o") + 1].replace("%%", "%")
+        stem = out.replace("video.%(ext)s", "video.")
+        if "--write-info-json" in argv:
+            with open(stem + "info.json", "w") as fh:
+                fh.write('{"title": "T", "duration": 1e400}')
+        return 0, b"", b""
+
+    monkeypatch.setattr(yt, "_exec", run)
+    monkeypatch.setattr(yt, "tls_mode", lambda: "verify")
+    monkeypatch.setattr(yt, "audio_max_minutes", lambda: 120)
+    monkeypatch.setattr(yt, "big_tmp_dir", lambda: tmp_path)
+
+    async def audio(self, result, url, **kw):
+        raise AssertionError("audio must not be downloaded")
+
+    monkeypatch.setattr(YouTubeProcessor, "_transcribe_audio", audio)
+    result = await YouTubeProcessor().fetch("https://youtu.be/abc123")
+    assert result.transcript is None
+    assert any("unknown length" in e for e in result.errors), result.errors
+
+
 async def test_the_audio_download_repeats_the_length_check_in_yt_dlp(monkeypatch, tmp_path):
     seen = []
 
