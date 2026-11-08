@@ -48,6 +48,16 @@ Repeating the command does not release it again. There is no bulk release or
 force flag; changed-source or corrupt-payload cases need a separately reviewed
 operator repair, not an automatic guess at item boundaries.
 
+## Corrupt payloads during approval resume
+
+A corrupt versioned payload encountered while resuming an approved batch is
+marked `batch_items_corrupt_restart`. Its retry count is kept below the active
+`max_retries`, including when that cap was lowered while approval was pending.
+The old approval is consumed and item boundaries are re-derived from the source
+under a fresh approval, rather than replaying the whole file as a legacy batch.
+This recovery does not release `replay_unsafe:` holds; unreadable held payloads
+still need deliberate operator repair as described above.
+
 ## Limits
 
 Unknown or unusable turn counts remain retryable by explicit accepted policy.

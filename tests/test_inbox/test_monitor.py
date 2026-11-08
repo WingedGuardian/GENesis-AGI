@@ -3016,6 +3016,10 @@ async def test_resume_pass_dispatches_on_pending_to_approved_transition(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("active_cap", "stored_retries"),
+    [(1, 0), (1, 1), (1, 3), (3, 0), (3, 2), (3, 3), (3, 5), (5, 2)],
+)
+@pytest.mark.parametrize(
     "corrupt_payload",
     [
         "inbox-items-v2:not-json",
@@ -3028,10 +3032,15 @@ async def test_resume_corrupt_v2_batch_rederives_without_full_file_replay(
     mock_invoker,
     db,
     corrupt_payload,
+    active_cap,
+    stored_retries,
 ):
     """Corrupt structured storage is not the legacy full-file fallback."""
+    from dataclasses import replace
+
     from genesis.db.crud import inbox_items
 
+    monitor._config = replace(monitor._config, max_retries=active_cap)
     path, _ = await _seed_parked_row(
         db,
         inbox_dir,
@@ -3043,7 +3052,7 @@ async def test_resume_corrupt_v2_batch_rederives_without_full_file_replay(
         "UPDATE inbox_items SET batch_items = ?, retry_count = ? WHERE id = ?",
         (
             corrupt_payload,
-            monitor._config.max_retries - 1,
+            stored_retries,
             "row-req-corrupt",
         ),
     )
@@ -3072,7 +3081,7 @@ async def test_resume_corrupt_v2_batch_rederives_without_full_file_replay(
     assert corrupt["error_message"] == (
         f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-fresh"
     )
-    assert corrupt["retry_count"] == monitor._config.max_retries - 1
+    assert corrupt["retry_count"] == min(stored_retries, active_cap - 1)
     assert inbox_items.batch_items_for_dispatch(corrupt["batch_items"]) == "first item"
     dispatcher.approval_gate.mark_consumed.assert_awaited_once_with("req-corrupt")
     rows = await db.execute_fetchall(

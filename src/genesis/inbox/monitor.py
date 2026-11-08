@@ -666,20 +666,19 @@ class InboxMonitor:
                 # legacy full-file replay, which would dispatch the whole file
                 # once per parked batch. Invalidate and re-derive under a fresh
                 # approval instead.
-                await inbox_items.update_status(
+                await inbox_items.mark_failed_keeping_retries(
                     self._db,
                     row_id,
-                    status="failed",
                     # This remains retryable.  ``approval_invalidated:`` rows
                     # are intentionally excluded from the retry lane, which
                     # would strand corruption whenever a healthy sibling at
                     # the same file hash completes in this scan.
                     error_message="batch_items_corrupt_restart",
                     processed_at=now_iso,
-                    # Corrupt storage is not an evaluation attempt. Preserve
-                    # the budget so a max-1 parked row cannot become terminal
-                    # at the unchanged file hash and block re-derivation.
-                    retry_count=int(row.get("retry_count") or 0),
+                    # Corrupt storage is not an evaluation attempt. Keep the
+                    # row below the active cap even if that cap was lowered
+                    # while approval was pending.
+                    retriable_below=self._config.max_retries,
                 )
                 if request_id:
                     await self._consume_approval(request_id)
