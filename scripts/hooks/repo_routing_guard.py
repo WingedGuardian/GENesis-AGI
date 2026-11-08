@@ -134,10 +134,10 @@ _SHELL_OPS = {"&&", "||", ";", "|", "&"}
 # answer exists catches the ones nobody did.
 #
 # NOT a parity claim: the sibling resolvers (git_push_guard,
-# review_enforcement_commit, pre_push_privacy_review) each carry their OWN
+# review_enforcement_commit) each carry their OWN
 # class and they are NOT identical — review_enforcement_commit's is wider and
 # also handles `cd -`, a bare `cd` and CDPATH. An earlier comment here asserted
-# they matched; they do not. Canonicalizing the four copies is filed as a
+# they matched; they do not. Canonicalizing the remaining copies is filed as a
 # follow-up rather than done here, because the shared module it belongs in is
 # being edited by another open branch.
 _UNRESOLVABLE_DIR_CHARS = "$`*?"

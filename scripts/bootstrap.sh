@@ -1220,34 +1220,14 @@ echo
 # --- Git hooks (worktree safety, push guards) ---
 echo "--- Installing git hooks ---"
 HOOKS_SRC="$GENESIS_ROOT/scripts/hooks"
-# Handle both regular repos (.git/hooks) and worktrees (.git is a file)
-GIT_COMMON_DIR=$(cd "$GENESIS_ROOT" && _gcd=$(git rev-parse --git-common-dir 2>/dev/null) && cd "$_gcd" && pwd || echo "")
-if [[ -n "$GIT_COMMON_DIR" ]] && [[ -d "$GIT_COMMON_DIR/hooks" ]]; then
-    HOOKS_DST="$GIT_COMMON_DIR/hooks"
-elif [[ -d "$GENESIS_ROOT/.git/hooks" ]]; then
-    HOOKS_DST="$GENESIS_ROOT/.git/hooks"
-else
-    echo "  WARNING: .git/hooks not found — skipping"
-    HOOKS_DST=""
-fi
-if [[ -n "$HOOKS_DST" ]]; then
-    # Phase 6: prefer sync-hooks.sh if available — it handles the
-    # full set (HOOKS_TO_SYNC in sync-hooks.sh) + helper scripts
-    # (emit_bugfix_audit.py) + version tracking via
-    # .genesis-hook-versions. Legacy loop remains as a fallback for
-    # very old installs that don't have sync-hooks.sh yet.
-    if [[ -x "$HOOKS_SRC/sync-hooks.sh" ]]; then
-        "$HOOKS_SRC/sync-hooks.sh" --quiet || echo "  WARNING: sync-hooks.sh exited non-zero (may be user-modified — leaving alone)"
+if [[ -f "$HOOKS_SRC/sync-hooks.sh" ]]; then
+    if bash "$HOOKS_SRC/sync-hooks.sh" --quiet; then
         echo "  + hooks synced via sync-hooks.sh"
     else
-        for hook in pre-commit pre-push pre-merge-commit; do
-            if [[ -f "$HOOKS_SRC/$hook" ]]; then
-                cp "$HOOKS_SRC/$hook" "$HOOKS_DST/$hook"
-                chmod +x "$HOOKS_DST/$hook"
-                echo "  + $hook"
-            fi
-        done
+        echo "  WARNING: hooks remain unqualified; sync-hooks.sh did not complete"
     fi
+else
+    echo "  WARNING: sync-hooks.sh missing; hooks were not installed"
 fi
 echo
 

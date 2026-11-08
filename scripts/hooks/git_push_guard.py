@@ -567,8 +567,7 @@ def _seg_dash_C(argv) -> str | None:
 
 
 # Repository selection by --git-dir / --work-tree / GIT_DIR & co. lives in
-# git_repo_selection (imported above, shared with pre_push_privacy_review) so the
-# two hooks cannot disagree about what counts as a redirect.
+# git_repo_selection (imported above), keeping redirect classification in one place.
 
 
 def _cd_target(raw: str):

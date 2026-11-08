@@ -537,6 +537,9 @@ class Engine(Repo):
             sticky.update(unowned)
 
     def _refuse_blockers(self, tip: str, what: str) -> None:
+        native_failure = gate.native_move_failure(self, tip)
+        if native_failure:
+            raise Refusal(f"{native_failure}. Nothing changed ({what}).")
         blockers = plan.move_blockers(self, tip)
         if blockers:
             raise Refusal(

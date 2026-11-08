@@ -588,6 +588,33 @@ def _check_gitignored_paths(
     return hits
 
 
+# Native publication scans intentionally use only the two owner-approved shapes.
+_CREDENTIAL_SHAPES = (
+    ("aws-key-id", re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{12,}\b")),
+    ("url-credential", re.compile(
+        r"(?<![A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*://"
+        r"[^\s:/@?#]*:[^\s/@?#]+@[^\s/?#]+"
+    )),
+)
+
+
+def _check_credentials(parsed: _ParsedDiff, *, stop_after_first: bool = False) -> list[Finding]:
+    """Recognize the approved hard-block shapes without emitting matched text."""
+    hits: list[Finding] = []
+    for file, line_no, text in parsed.added_lines:
+        for category, pattern in _CREDENTIAL_SHAPES:
+            if pattern.search(text):
+                hits.append(Finding(
+                    kind=FindingKind.SECRET, severity=Severity.BLOCK,
+                    message="Credential shape detected", file=file, line=line_no,
+                    scanner=category,
+                ))
+                if stop_after_first:
+                    return hits
+                break
+    return hits
+
+
 def _check_portability(parsed: _ParsedDiff) -> list[Finding]:
     hits: list[Finding] = []
     for file, line_no, text in parsed.added_lines:

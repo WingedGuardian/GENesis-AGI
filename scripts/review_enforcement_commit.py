@@ -479,7 +479,7 @@ def _staged_files(cwd: str | None, *, deadline: float | None = None) -> list[str
 # add or select content beyond the current --cached snapshot.
 # MEASURED against the installed binary, never `git -h` (which omits
 # `--attr-source` while git accepts it). Locked identical to the copies in
-# shell_parse / git_push_guard / pre_push_privacy_review by
+# shell_parse / git_push_guard by
 # tests/test_hooks/test_value_flag_consistency.py.
 _GIT_GLOBAL_VALUE_FLAGS = frozenset(
     {
