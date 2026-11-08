@@ -499,12 +499,15 @@ async def test_one_approval_per_drop_then_resume_dispatches_all(
     assert len(parked) == 2
     assert {p["drop_id"] for p in parked} == {parked[0]["drop_id"]}  # same drop
 
-    # User approves -> scan 2 resume dispatches BOTH batches, consumes once.
+    # Each row retires the grant before releasing its awaiting marker. The
+    # second sibling observes an already-consumed grant and still dispatches.
     approvals["req-1"] = {"status": "approved"}
+    disp.approval_gate.mark_consumed.side_effect = [True, False]
     await mon.check_once()
     assert mock_invoker.run.call_count == 2, "both batches dispatched on resume"
     assert disp.route.call_count == 1, "resume does NOT re-route"
-    disp.approval_gate.mark_consumed.assert_awaited_once_with("req-1")
+    assert disp.approval_gate.mark_consumed.await_count == 2
+    assert all(call.args == ("req-1",) for call in disp.approval_gate.mark_consumed.await_args_list)
 
 
 @pytest.mark.asyncio

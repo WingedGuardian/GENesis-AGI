@@ -347,16 +347,22 @@ class InboxMonitor:
         await self._phase_recover_pending(now_iso)
 
         # Phase 2: Resume approval-parked items
-        resume_items, _resumed_ids, resumed_paths = await self._phase_resume(
+        resume_items, _resumed_ids, resumed_paths, defer_new_work = await self._phase_resume(
             now,
             now_iso,
         )
 
         # Phase 3: Detect new/modified files
-        new_files, modified_files = await self._phase_detect_changes(
-            watch,
-            resumed_paths,
-        )
+        if defer_new_work:
+            # The approval key spans the inbox site. An uncertain retirement
+            # must not let another file ride its old grant this scan.
+            logger.warning("Inbox new work deferred: approval lookup or retirement did not finish")
+            new_files, modified_files = [], []
+        else:
+            new_files, modified_files = await self._phase_detect_changes(
+                watch,
+                resumed_paths,
+            )
 
         # Phase 3b: partial-failure retry candidates — files with a stranded
         # retriable-failed batch and no in-flight row. They are NOT detected as
@@ -366,14 +372,16 @@ class InboxMonitor:
         detected = (
             {str(p) for p in new_files} | {str(p) for p in modified_files} | set(resumed_paths)
         )
-        retry_files = [
-            Path(fp)
-            for fp in await inbox_items.get_retriable_failure_files(
-                self._db,
-                max_retries=self._config.max_retries,
-            )
-            if fp not in detected
-        ]
+        retry_files = []
+        if not defer_new_work:
+            retry_files = [
+                Path(fp)
+                for fp in await inbox_items.get_retriable_failure_files(
+                    self._db,
+                    max_retries=self._config.max_retries,
+                )
+                if fp not in detected
+            ]
 
         if not (new_files + modified_files + retry_files) and not resume_items:
             return CheckResult(
@@ -454,16 +462,19 @@ class InboxMonitor:
         self,
         now: datetime,
         now_iso: str,
-    ) -> tuple[list[InboxItem], set[str], set[str]]:
+    ) -> tuple[list[InboxItem], set[str], set[str], bool]:
         """Resume rows parked waiting for user approval.
 
-        Returns ``(resume_items, resumed_ids, resumed_paths)``.
+        Returns ``(resume_items, resumed_ids, resumed_paths, defer_new_work)``.
+        Lookup/retirement uncertainty defers all new site work for this scan,
+        while already-approved resume items keep their ordinary row claims.
 
         Rows stay in 'processing' state with an
         ``awaiting_approval:<request_id>`` marker in error_message.
         The resume pass ONLY dispatches on the pending→approved state
-        transition.  A VANISHED file is invalidated immediately regardless of
-        approval state; a file EDITED while the approval is still pending is
+        transition. A vanished source with an approved grant waits for
+        retirement before invalidation; pending-source disappearance keeps
+        its existing orphan policy. A file edited while approval is pending is
         HELD (the detection phase supersedes it onto the same request this
         tick) — the edit check applies only at dispatch time (approved), where
         a stale delta is invalidated and the approval consumed.
@@ -474,6 +485,7 @@ class InboxMonitor:
         from genesis.db.crud import inbox_items
 
         resume_items: list[InboxItem] = []
+        defer_new_work = False
         awaiting_rows = await inbox_items.get_awaiting_approval(self._db)
 
         # Walk the dispatcher → approval_gate → approval_manager chain.
@@ -511,33 +523,8 @@ class InboxMonitor:
                 else ""
             )
 
-            p = Path(file_path)
-
-            # Vanish check FIRST — a deleted file invalidates regardless of
-            # approval state (nothing left to evaluate; the orphan guard
-            # cancels the request if no other rows remain).
-            #
-            # A CHANGED file is handled per approval state below: while the
-            # approval is still PENDING the row is HELD — the detection phase
-            # supersedes it with the recomputed delta on the SAME request in
-            # this very tick (invalidating here instead would zero the
-            # request's live rows and make the orphan guard cancel + re-request
-            # → a new Telegram message per edit, the residual storm seed).
-            try:
-                current_hash = compute_hash(p)
-            except (FileNotFoundError, PermissionError):
-                await inbox_items.update_status(
-                    self._db,
-                    row_id,
-                    status="failed",
-                    error_message=(
-                        f"{inbox_items.APPROVAL_INVALIDATED_PREFIX}source file vanished"
-                    ),
-                    processed_at=now_iso,
-                )
-                continue
-
-            # Query approval status.
+            # Read status before invalidation: a vanished source can return
+            # later, so an already-approved grant still needs retirement.
             approval_status: str | None = None
             if approval_manager is not None and request_id:
                 try:
@@ -556,7 +543,32 @@ class InboxMonitor:
                         row_id,
                         exc_info=True,
                     )
+                    defer_new_work = True
                     continue
+
+            p = Path(file_path)
+            # A missing source still invalidates a known pending row; orphan
+            # cancellation and concurrent pending resolution retain their
+            # existing policy. This guard retires already-approved grants.
+            try:
+                current_hash = compute_hash(p)
+            except (FileNotFoundError, PermissionError):
+                if (
+                    approval_status == "approved" and request_id
+                    and await self._consume_approval(request_id) == "failed"
+                ):
+                    defer_new_work = True
+                    continue
+                await inbox_items.update_status(
+                    self._db,
+                    row_id,
+                    status="failed",
+                    error_message=(
+                        f"{inbox_items.APPROVAL_INVALIDATED_PREFIX}source file vanished"
+                    ),
+                    processed_at=now_iso,
+                )
+                continue
 
             if approval_status == "rejected":
                 await inbox_items.update_status(
@@ -615,6 +627,13 @@ class InboxMonitor:
                 )
                 continue
 
+            # Retire the site grant BEFORE invalidating or dispatching any
+            # awaiting row. On failure the durable marker must survive, so a
+            # later scan can retry instead of leaving a reusable orphan grant.
+            if request_id and await self._consume_approval(request_id) == "failed":
+                defer_new_work = True
+                continue
+
             # approved or legacy fall-through: about to dispatch — a file
             # changed since parking must NOT dispatch its stale delta (the
             # user may have removed that content). Invalidate AND consume the
@@ -624,7 +643,8 @@ class InboxMonitor:
             # grant this same tick instead of getting a fresh approval.
             # Tri-state consume keeps sibling drops safe (their consume
             # returns "already_consumed" and they proceed on their row
-            # claims). A vanished file needs no consume — nothing re-detects.
+            # claims). Invalidation waits for consumption before discarding
+            # the durable marker; a log alone cannot contain new site work.
             # 'superseded', not 'failed': the newer content is re-detected and
             # evaluated under a fresh approval, so nothing failed. The
             # non-failed branch of update_status leaves retry_count alone.
@@ -636,8 +656,6 @@ class InboxMonitor:
                     error_message=(f"{inbox_items.APPROVAL_INVALIDATED_PREFIX}content changed"),
                     processed_at=now_iso,
                 )
-                if request_id:
-                    await self._consume_approval(request_id)
                 continue
             try:
                 content = read_content(p)
@@ -666,23 +684,20 @@ class InboxMonitor:
                 # legacy full-file replay, which would dispatch the whole file
                 # once per parked batch. Invalidate and re-derive under a fresh
                 # approval instead.
-                await inbox_items.update_status(
+                await inbox_items.mark_failed_keeping_retries(
                     self._db,
                     row_id,
-                    status="failed",
                     # This remains retryable.  ``approval_invalidated:`` rows
                     # are intentionally excluded from the retry lane, which
                     # would strand corruption whenever a healthy sibling at
                     # the same file hash completes in this scan.
                     error_message="batch_items_corrupt_restart",
                     processed_at=now_iso,
-                    # Corrupt storage is not an evaluation attempt. Preserve
-                    # the budget so a max-1 parked row cannot become terminal
-                    # at the unchanged file hash and block re-derivation.
-                    retry_count=int(row.get("retry_count") or 0),
+                    # Corrupt storage is not an evaluation attempt. Keep the
+                    # row below the active cap even if that cap was lowered
+                    # while approval was pending.
+                    retriable_below=self._config.max_retries,
                 )
-                if request_id:
-                    await self._consume_approval(request_id)
                 logger.error(
                     "Inbox row %s has corrupt versioned batch_items; "
                     "queued for safe re-derivation",
@@ -706,7 +721,7 @@ class InboxMonitor:
 
         resumed_ids: set[str] = {item.id for item in resume_items}
         resumed_paths: set[str] = {item.file_path for item in resume_items}
-        return resume_items, resumed_ids, resumed_paths
+        return resume_items, resumed_ids, resumed_paths, defer_new_work
 
     # =================================================================
     # Phase 2: Detect new/modified files
@@ -1409,7 +1424,8 @@ class InboxMonitor:
         batch in the drop is dispatched directly as its own CC session, so a
         16-URL file becomes ~4 small evals + 4 response files under a single
         approval. Resume batches (their drop's approval already resolved) are
-        dispatched directly and their approval is consumed once per drop.
+        dispatched directly after resume retired the grant for each awaiting
+        row, including already-consumed outcomes for sibling rows.
 
         Returns the number of batches successfully dispatched.
         """
@@ -1437,7 +1453,7 @@ class InboxMonitor:
 
         batches_dispatched = 0
 
-        # --- Resume drops: claim (at-most-once) -> consume -> dispatch. ---
+        # --- Resume drops: approval retired in resume -> claim -> dispatch. ---
         for _drop_id, items in self._group_by_drop(resume_items):
             # CLAIM each batch row out of the awaiting-approval parked state
             # BEFORE the CC call. The claim (awaiting_approval: -> dispatching:)
@@ -1458,15 +1474,9 @@ class InboxMonitor:
             ]
             if not claimed:
                 continue
-            # Consume the drop's approval. Tri-state (see _consume_approval):
-            # consumed / already_consumed both proceed — the row-state claim
-            # above is the at-most-once dispatch gate, and already-consumed is
-            # NORMAL for sibling drops of an approve-once fanout and for
-            # cross-tick crash recovery. A persistent failure is ERROR-logged
-            # there (stale rideable approval) and still proceeds on the claim.
-            reqid = claimed[0].approval_reqid
-            if reqid:
-                await self._consume_approval(reqid)
+            # _phase_resume consumes before releasing the awaiting marker.
+            # A consumed grant is normal for siblings/crash recovery; the
+            # per-row claim remains the at-most-once dispatch authority.
             for item in claimed:
                 if await self._dispatch_one_batch(
                     item,
@@ -1744,8 +1754,8 @@ class InboxMonitor:
         - ``"failed"`` — consume failed twice (e.g. DB lock). ERROR-logged: the
           approval stays approved-unconsumed and IS rideable by a later new
           drop via the gate's reuse path until its staleness window lapses.
-          Callers still proceed (the row claim gates dispatch); the loud log is
-          the containment.
+          Resume callers retain the awaiting row and defer new site work
+          until retirement succeeds. Row claims still gate actual dispatch.
         - ``"no_gate"`` — no dispatcher/gate wired (gate-off/test path).
         """
         gate = getattr(self._autonomous_dispatcher, "approval_gate", None)

@@ -1442,7 +1442,10 @@ verified: b0867170e 2026-10-02
   The phase order is prompt preflight → recover pending → resume approval →
   detect → create → dispatch;
   `approval_key_stable=True` (ONE
-  site-level approval key). The refresh path folds parked files into the
+  site-level approval key). Resume consumes an approved grant before releasing
+  its awaiting row. A lookup/retirement failure preserves that row and defers
+  all new/modified/retry site work for the scan, while healthy approved siblings
+  can resume after successful consumption. The refresh path folds parked files into the
   batch so approvals fire once (#914). A pending approval is HELD until the
   user resolves it (no re-ask, no age-based cancel) and is auto-cancelled only
   when *orphaned* — no live inbox row (`awaiting_approval:`/`dispatching:`)
