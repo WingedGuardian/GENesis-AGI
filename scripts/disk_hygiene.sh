@@ -94,6 +94,8 @@ fi
 
 # shellcheck source=scripts/lib/tmp_liveness.sh
 . "$SCRIPT_DIR/lib/tmp_liveness.sh"
+# shellcheck source=lib/secrets_path.sh
+. "$SCRIPT_DIR/lib/secrets_path.sh"
 
 # prune_tmp DIR [AGE_MIN] — delete direct children of DIR not modified for more
 # than AGE_MIN minutes (default: the historical `-mtime +7`), EXCLUDING
@@ -593,6 +595,8 @@ rotate_mcp_logs() {
 # one place on the box that holds every credential.
 _load_store_knob() {
     local key="$1"
+    # The checkout's file, not the resolver's: the hook-audit stores' writers
+    # read their directories from it, and this must read the same one.
     local file="${2:-$REPO_DIR/secrets.env}"
     local line=""
     local val
@@ -611,13 +615,16 @@ _load_store_knob() {
 
 # The Camoufox cache the browser tools use can come from secrets.env, which this
 # unit does not load: the provisioner installs where XDG_CACHE_HOME there points.
-# It is read by name from the file the runtime reads (genesis.env.secrets_path:
-# SECRETS_PATH with a leading ~ expanded, else the checkout's), in a subshell so it
-# reaches no later step. The engine override the decider reads itself.
+# It is read by name from the file the runtime reads (genesis_secrets_path, the
+# twin of genesis.env.secrets_path), in a subshell so it reaches no later step.
+# The engine override the decider reads itself.
 prune_camoufox_engines_step() {
     (
-        secrets="${SECRETS_PATH:-$REPO_DIR/secrets.env}"
-        _load_store_knob XDG_CACHE_HOME "${secrets/#\~/$HOME}"
+        # An unresolvable override loads nothing: never the checkout's file instead.
+        local _secrets
+        if _secrets="$(genesis_secrets_path "$REPO_DIR")"; then
+            _load_store_knob XDG_CACHE_HOME "$_secrets"
+        fi
         prune_browser_engines "${XDG_CACHE_HOME:-$HOME/.cache}/camoufox"
     )
 }

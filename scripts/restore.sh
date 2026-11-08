@@ -184,7 +184,9 @@ TRANSCRIPT_DIR="$HOME/.claude/projects/${_CC_PROJECT_ID}"
 source "$_SCRIPT_DIR/lib/backup_core_paths.sh"
 # shellcheck source=scripts/lib/payment_vault_backup.sh
 source "$_SCRIPT_DIR/lib/payment_vault_backup.sh"
-SECRETS_FILE="${SECRETS_PATH:-$GENESIS_DIR/secrets.env}"
+# shellcheck source=lib/secrets_path.sh
+source "$_SCRIPT_DIR/lib/secrets_path.sh"
+SECRETS_FILE="$(genesis_secrets_path "$GENESIS_DIR")"
 QDRANT_URL="${QDRANT_URL:-http://localhost:6333}"
 LOG_PREFIX="[genesis-restore]"
 
