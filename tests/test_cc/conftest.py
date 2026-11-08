@@ -23,6 +23,13 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _isolate_oom_membership(tmp_path, monkeypatch):
+    from genesis.cc import oom
+
+    monkeypatch.setattr(oom, "_MEMBERSHIP", tmp_path / "absent-cgroup-membership")
+
+
+@pytest.fixture(autouse=True)
 def _isolate_cc_span_settings(tmp_path, monkeypatch):
     from genesis.cc import invoker as inv_mod
 

@@ -9,6 +9,7 @@ import pytest
 from genesis.cc import invoker as invoker_module
 from genesis.cc import peer_availability
 from genesis.cc.exceptions import (
+    CCMemoryPressureError,
     CCProcessError,
     CCQuotaExhaustedError,
     CCRateLimitError,
@@ -16,6 +17,7 @@ from genesis.cc.exceptions import (
 )
 from genesis.cc.invoker import CCInvoker
 from genesis.cc.managed_fallback import record_fallback
+from genesis.cc.oom import OOMEvidence
 from genesis.cc.provider_readiness import isolated_provider
 from genesis.cc.types import StreamEvent
 from genesis.resilience.cc_fallback_probe import CCFallbackProbeWorker
@@ -63,11 +65,14 @@ async def test_home_identity_comes_from_selection_not_a_stale_runtime_read(manag
 
 
 @pytest.mark.parametrize("provider", ["claude", "backup"])
-@pytest.mark.parametrize("kind", ["quota", "rate", "credit", "wrapped", "mcp", "local"])
+@pytest.mark.parametrize("kind", ["quota", "rate", "credit", "wrapped", "mcp", "local", "pressure", "wrapped_pressure"])
 async def test_actual_refusal_updates_only_attributable_health(managed, provider, kind):
     status = AsyncMock()
     managed.runner._rt._cc_invoker = CCInvoker(on_cc_status_change=status)
     peer_availability.note_success("backup")
+    pressure = CCMemoryPressureError(
+        OOMEvidence("synthetic", (1, 2), (1, 2), 4, 5, -9), cause=CCQuotaExhaustedError(),
+    )
     errors = {
         "quota": CCQuotaExhaustedError(),
         "rate": CCRateLimitError(),
@@ -75,6 +80,8 @@ async def test_actual_refusal_updates_only_attributable_health(managed, provider
         "wrapped": CCReplayUnsafeError(cause=CCQuotaExhaustedError()),
         "mcp": CCReplayUnsafeError("MCP tool failure", cause=CCQuotaExhaustedError()),
         "local": CCProcessError("local validation failure"),
+        "pressure": pressure,
+        "wrapped_pressure": CCReplayUnsafeError(cause=pressure),
     }
 
     async def run(invocation, on_event=None):
@@ -89,7 +96,7 @@ async def test_actual_refusal_updates_only_attributable_health(managed, provider
     managed.invoker.run_streaming.side_effect = run
     row, _ = await settle(managed, await start(managed))
     assert row["status"] == "failed" and len(managed.tasks) == 1
-    refused = kind not in ("mcp", "local")
+    refused = kind not in ("mcp", "local", "pressure", "wrapped_pressure")
     if provider == "claude":
         assert status.call_args.args == (
             ("RATE_LIMITED" if kind == "rate" else "UNAVAILABLE") if refused else "NORMAL",
