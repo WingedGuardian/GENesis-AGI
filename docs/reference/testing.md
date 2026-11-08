@@ -405,8 +405,11 @@ The protocol step names the admission, policy, actual HTTP and shared CLI module
 explicitly. The CLI checks start all four real factories with disposable local
 dependencies, exercise catalog/authentication/read calls over TCP, and observe
 SDK shutdown and registered-owner drainage before resource closure on SIGTERM.
+They also exercise path/abstract readiness datagrams after bind and cleanup on
+failed notification, bind failure and shutdown requested during startup. The
+memory notification-failure case checks its actual provider/cache closers.
 Its fresh JUnit report must pass `scripts/check_skip_ceiling.py` with zero skips
-and a floor of 95 cases. Installation, collection, test or report-check failure
+and a floor of 100 cases. Installation, collection, test or report-check failure
 fails the job; missing or filtered workflow runs do not qualify a PR. Closing
 checks its actual head/base result. Ordinary skip-budget changes require observed
 skip identities; this workflow does not raise that budget automatically.
@@ -414,6 +417,16 @@ skip identities; this workflow does not raise that budget automatically.
 For a local run, use an already qualified isolated interpreter and the same
 strict test flag, then run the workflow's report check. Changing installed
 packages or enabling shared services is not part of that test command.
+
+`test_shared_notify.py` exercises owned local datagrams and error propagation
+without SDK qualification. `test_shared_mcp_templates.py` reuses both actual
+renderer loops and executes their activation sections with nondelegating command
+shims, checking literal paths, stamps and keep/take behavior without starting a
+unit. Successful per-test payload/event files require both an explicit scratch
+`--basetemp` and `-o tmp_path_retention_policy=all`; the normal policy removes
+successful test directories. Read-only `systemd-analyze verify` can validate
+rendered syntax with generators disabled; it does not execute or qualify a live
+service.
 
 ## Integration Tests
 

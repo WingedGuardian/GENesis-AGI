@@ -187,11 +187,18 @@ def test_every_unit_path_starts_at_an_ALLOWED_root():
             name, sep, value = line.partition("=")
             if not sep or name.strip() not in _PATH_DIRECTIVES:
                 continue
-            # The managed backend starts at a neutral cwd; its helper validates
-            # and enters the configured primary checkout before executing native.
-            if (source, name.strip(), value) == (
-                TEMPLATE_DIR / "genesis-cbm-query.service.template", "WorkingDirectory", "/"
-            ):
+            # These managed services validate their configured checkout after
+            # starting at a neutral cwd. Keep the exception template-specific.
+            neutral_cwd_templates = {
+                TEMPLATE_DIR / filename for filename in (
+                    "genesis-cbm-query.service.template",
+                    "genesis-mcp-health.service.template",
+                    "genesis-mcp-memory.service.template",
+                    "genesis-mcp-outreach.service.template",
+                    "genesis-mcp-recon.service.template",
+                )
+            }
+            if source in neutral_cwd_templates and (name.strip(), value) == ("WorkingDirectory", "/"):
                 continue
             for token in _path_tokens(value):
                 if token.startswith("__") or token.startswith(_ALLOWED_ROOT_PREFIXES):
@@ -216,6 +223,14 @@ def test_every_unit_path_starts_at_an_ALLOWED_root():
         ("genesis-cbm-query.service.template", "ExecStart", "/", False),
         ("genesis-cbm-query.service.template", "WorkingDirectory", "/home/foreign", False),
         ("genesis-cbm-query.service.template", "WorkingDirectory", "/ /home/foreign", False),
+        ("genesis-mcp-extra.service.template", "WorkingDirectory", "/", False),
+        *[(f"genesis-mcp-{service}.service.template", directive, value, allowed)
+          for service in ("health", "memory", "outreach", "recon")
+          for directive, value, allowed in (
+              ("WorkingDirectory", "/", True), ("ExecStart", "/", False),
+              ("WorkingDirectory", "/home/foreign", False),
+              ("WorkingDirectory", "/ /home/foreign", False),
+          )],
     ],
 )
 def test_neutral_cwd_exception_is_specific(tmp_path, monkeypatch, filename, directive, value, allowed):
@@ -229,6 +244,21 @@ def test_neutral_cwd_exception_is_specific(tmp_path, monkeypatch, filename, dire
     else:
         with pytest.raises(AssertionError, match="not an allowed root"):
             test_every_unit_path_starts_at_an_ALLOWED_root()
+
+
+@pytest.mark.parametrize("filename", ["genesis-cbm-query.service.template", *(
+    f"genesis-mcp-{service}.service.template" for service in ("health", "memory", "outreach", "recon")
+)])
+def test_neutral_cwd_exception_does_not_allow_a_matching_name_outside_templates(tmp_path, monkeypatch, filename):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    source = outside / filename
+    source.write_text("[Service]\nWorkingDirectory=/\n")
+    monkeypatch.setitem(globals(), "REPO_ROOT", tmp_path)
+    monkeypatch.setitem(globals(), "TEMPLATE_DIR", tmp_path)
+    monkeypatch.setitem(globals(), "_unit_sources", lambda: [source])
+    with pytest.raises(AssertionError, match="not an allowed root"):
+        test_every_unit_path_starts_at_an_ALLOWED_root()
 
 
 def _rejected(value: str) -> bool:

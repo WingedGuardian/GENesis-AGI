@@ -126,9 +126,12 @@ state and what a new session would launch, with the reason.
 
 The internal [HTTP composition](shared-mcp-http.md) now accepts initialized
 request-owned resources. Explicit `--shared-service` startup constructs the owned
-factories; ordinary session launch keeps its existing selection. Unit readiness,
-the stdio adapter, local catalog union and matched measurements remain rollout
-prerequisites; constructing the HTTP app alone is not activation evidence.
+factories; ordinary session launch keeps its existing selection. Four inert
+`Type=notify` unit templates and bind-before-READY notification are available;
+rendering does not enable them. Qualify actual manager readiness and measured
+start/stop settings before activation. The stdio adapter, local catalog/bookmark
+union and matched measurements remain rollout prerequisites; constructing the
+HTTP app or rendering a unit alone is not activation evidence.
 
 Before any of these: the service calls `genesis.caller_context.enter_shared_service()`
 before its first request, or work that loses its request scope reads the service's own

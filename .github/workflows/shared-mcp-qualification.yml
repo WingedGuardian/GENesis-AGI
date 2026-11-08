@@ -50,10 +50,10 @@ jobs:
           pip install -e ".[test,transcript-analytics]" -c .github/test-tools/requirements.txt -c .github/shared-mcp/requirements.txt
       - name: Check pure settings and qualification contracts
         run: |
-          python -m pytest tests/test_mcp/test_shared_http_settings.py tests/test_mcp/test_shared_qualification_contract.py tests/test_scripts/test_ci_test_tool_pins.py -q
+          python -m pytest tests/test_mcp/test_shared_http_settings.py tests/test_mcp/test_shared_qualification_contract.py tests/test_scripts/test_ci_test_tool_pins.py tests/test_mcp/test_shared_notify.py tests/test_scripts/test_shared_mcp_templates.py -q
       - name: Run the real protocol and shared CLI suites
         run: |
           rm -f junit-shared-mcp.xml
           python -m pytest tests/test_mcp/test_shared_http_admission.py tests/test_mcp/test_shared_http_policy.py tests/test_mcp/test_shared_http_runtime.py tests/test_mcp/test_shared_cli_startup_contract.py -q --junitxml=junit-shared-mcp.xml
       - name: Require the complete unskipped protocol population
-        run: python scripts/check_skip_ceiling.py junit-shared-mcp.xml --ceiling 0 --min-collected 95
+        run: python scripts/check_skip_ceiling.py junit-shared-mcp.xml --ceiling 0 --min-collected 100
