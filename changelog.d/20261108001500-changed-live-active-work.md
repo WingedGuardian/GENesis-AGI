@@ -1,0 +1,1 @@
+- The session-start context now lists live sessions and the other live sessions' missions, computed when the session starts. Essential Knowledge no longer carries the stale "Active sessions" count or the raw-prompt "Active Work" list.

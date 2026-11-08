@@ -948,8 +948,9 @@ verified: a8fa35a35 2026-10-23
   `emit_bugfix_audit`) stamp origin inline. Migration 0085 backfills historical rows. On the
   READ side, the LAUNDERING-CRITICAL surfaces now EXCLUDE external/unknown-origin content
   (fail-closed: `origin_class IN ('owner','first_party')`, NULL excluded) —
-  `essential_knowledge._recent_decisions` + `_active_session_pivots` (the always-loaded L1
-  file), `reflection.gather_evaluation_context` (×4) + `_recent_observations` +
+  `essential_knowledge._recent_decisions` (the always-loaded L1 file; its old
+  `_active_session_pivots` reader is gone, since live sessions are now shown only in the
+  session-start in-flight block, `memory/open_loops.py`, which skips external-origin rows), `reflection.gather_evaluation_context` (×4) + `_recent_observations` +
   `gather_for_calibration`, and `perception.context._build_memory_hits` + `_build_light_chain`
   (the deep-reflection/perception prompt pipeline) — severing the external→reflection→
   `first_party`-stamped-delta laundering path, with a deep-reflection prompt-rule belt and a

@@ -1094,8 +1094,8 @@ def _emit_body() -> tuple[str, str, str] | None:
                 )
                 first = False
 
-        # In-flight working state (advisory): active autonomy tasks, live
-        # worktrees, and recently-touched plan files — computed fresh here
+        # In-flight working state (advisory): live sessions, active autonomy
+        # tasks, live worktrees, and recently-touched plan files — computed fresh here
         # because they change far faster than the L1 essential-knowledge
         # regeneration cadence. Folds directly UNDER Essential Knowledge with
         # NO "---" divider so it reads as session context for recollection, not
@@ -1103,7 +1103,7 @@ def _emit_body() -> tuple[str, str, str] | None:
         # the non-genesis-session branch). Writer: genesis.memory.open_loops.
         if _in("knowledge"):
             try:
-                _inflight = _load_inflight_block()
+                _inflight = _load_inflight_block(_hook_session_id)
                 for _chunk in _inflight_emission_chunks(
                     _inflight, ek_emitted=_ek_emitted, first=first
                 ):
@@ -1696,7 +1696,7 @@ def _inflight_emission_chunks(inflight: str, *, ek_emitted: bool, first: bool) -
     return chunks
 
 
-def _load_inflight_block() -> str:
+def _load_inflight_block(own_session_id: str = "") -> str:
     """Fresh in-flight working-state block for the foreground session context.
 
     Opens its own short-timeout connection (mirroring the "2.6 Codebase L0"
@@ -1718,7 +1718,10 @@ def _load_inflight_block() -> str:
 
             async with aiosqlite.connect(str(db_path), timeout=2) as db:
                 db.row_factory = aiosqlite.Row
-                return await build_inflight_block(db, repo_root=repo_root, plans_dir=plans_dir)
+                return await build_inflight_block(
+                    db, repo_root=repo_root, plans_dir=plans_dir,
+                    own_session_id=own_session_id,
+                )
 
         return asyncio.run(_run())
     except Exception:
