@@ -64,11 +64,28 @@ unit, reusing `commit_identity.is_stale` without latching across rollback.
 Unavailable freshness is JSON null; guarded tools retain the existing live
 off/warn/block policy and positive-confirmation semantics.
 
-Targeted tests: `test_shared_http_admission.py`, `test_shared_http_policy.py` and
+Targeted tests: pure `test_shared_http_settings.py`; qualified
+`test_shared_http_admission.py`, `test_shared_http_policy.py` and
 `test_shared_http_runtime.py` under `tests/test_mcp/`, plus
 `tests/test_observability/test_activity_persistence_scope.py`. Runtime fixtures
 exercise actual SDK dispatch and SQLite with synthetic qualified tool modules;
-they do not prove native-client compatibility or deployed service readiness.
+they do not prove four real service factories, native-client compatibility or
+deployed service readiness.
+
+The separate shared-MCP qualification workflow runs the real protocol and shared CLI suites
+under its pinned SDK constraints and requires zero skips. Ordinary floating CI
+keeps pure configuration/refusal coverage and explicitly skips these four
+version-specific modules when unqualified; the dedicated job fails instead.
+See [testing environments](testing.md#shared-mcp-qualification-environments).
+
+`tests/test_mcp/test_shared_cli_startup_contract.py` additionally starts each real
+service through the explicit CLI with disposable SQLite, local Qdrant and dummy
+credentials. It checks the shared catalog against the existing fixture (excluding
+the health browser/module local edge), authentication, one safe read per service,
+and SDK/owner/provider closure before SIGTERM replay. The two complete
+`recon_config` output-schema `anyOf` alternatives may appear in either order;
+all other advertised contract fields remain exact. This does not qualify native
+clients, real providers, the full local/shared union or deployed readiness.
 
 ## Explicit owned startup
 

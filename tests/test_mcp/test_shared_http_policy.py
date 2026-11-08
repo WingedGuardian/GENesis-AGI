@@ -1,5 +1,10 @@
 """Closed credential and defining-function policy on actual upstream objects."""
 
+# Qualification precedes every version-specific import.
+from tests.shared_mcp_qualification import QUALIFIED_TEST_STACK as QUALIFIED_TEST_STACK
+
+# isort: split
+
 import json
 
 import pytest

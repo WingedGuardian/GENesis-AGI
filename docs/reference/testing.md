@@ -385,6 +385,36 @@ IPv6 link-local scope id, which `/proc/net/tcp6` does not record, so two
 listeners with the same link-local address on different interfaces are judged
 as one.
 
+## Shared MCP qualification environments
+
+Ordinary CI keeps its existing runtime dependency ranges. The shared-only
+protocol and shared CLI suites require the exact versions admitted by
+`genesis.mcp.shared_http._settings.require_qualified_stack`; an unsupported
+ordinary environment explicitly skips those four modules before SDK imports.
+Pure configuration and missing/later-version refusal tests remain ordinary
+tests in `tests/test_mcp/test_shared_http_settings.py`.
+
+`.github/workflows/shared-mcp-qualification.yml` installs the separate
+`.github/shared-mcp/requirements.txt` constraints alongside the existing test-tool
+pins. It runs for relevant PRs across base branches, including stacked PRs, with
+read-only permissions. `GENESIS_REQUIRE_SHARED_MCP_QUALIFICATION=1` is test-only:
+qualification refusal becomes a collection error in this job. No production
+version, feature, credential or rollout gate changes.
+
+The protocol step names the admission, policy, actual HTTP and shared CLI modules
+explicitly. The CLI checks start all four real factories with disposable local
+dependencies, exercise catalog/authentication/read calls over TCP, and observe
+SDK shutdown and registered-owner drainage before resource closure on SIGTERM.
+Its fresh JUnit report must pass `scripts/check_skip_ceiling.py` with zero skips
+and a floor of 95 cases. Installation, collection, test or report-check failure
+fails the job; missing or filtered workflow runs do not qualify a PR. Closing
+checks its actual head/base result. Ordinary skip-budget changes require observed
+skip identities; this workflow does not raise that budget automatically.
+
+For a local run, use an already qualified isolated interpreter and the same
+strict test flag, then run the workflow's report check. Changing installed
+packages or enabling shared services is not part of that test command.
+
 ## Integration Tests
 
 Integration tests in `tests/integration/` require running external services
