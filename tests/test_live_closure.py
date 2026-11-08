@@ -404,7 +404,7 @@ def test_this_session_runs_with_a_private_home():
 _STATE_ROOTS = (".genesis", ".claude", "tmp", ".cache", ".config", ".local/share", ".local/state")
 
 
-def test_no_genesis_module_holds_a_state_path_under_the_real_home():
+def test_no_genesis_module_holds_a_state_path_under_the_real_home(request):
     """The check that replaces moving paths after the fact: every ``genesis``
     module loaded so far (configure's lock and tmp modules included) resolved
     the private home. The checkout itself may live under the real home."""
@@ -413,6 +413,10 @@ def test_no_genesis_module_holds_a_state_path_under_the_real_home():
     roots = [Path(_REAL_HOME, r) for r in _STATE_ROOTS]
     # The test home itself sits in the real ~/tmp; paths inside it are private.
     ours = Path(closure._S.home)
+    # So does pytest's basetemp, which keeps its real-home location on purpose
+    # (test_the_box_lock_and_basetemp_keep_their_real_home_locations): a fixture
+    # pointing a module's state file at tmp_path is private too.
+    base = Path(request.config._tmp_path_factory.getbasetemp())
     offenders = []
     for name, module in list(sys.modules.items()):
         if module is None or not (name == "genesis" or name.startswith("genesis.")):
@@ -422,6 +426,7 @@ def test_no_genesis_module_holds_a_state_path_under_the_real_home():
                 isinstance(value, PurePath)
                 and value != ours
                 and ours not in value.parents
+                and base not in value.parents
                 and any(value == root or root in value.parents for root in roots)
             ):
                 offenders.append(f"{name}.{attr}={value}")
