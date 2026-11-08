@@ -13,16 +13,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-_SESSION_CONTEXT = (
-    "GENESIS_CC_SESSION",
-    "GENESIS_SESSION_ID",
-    "GENESIS_SESSION_ORIGIN",
-    "GENESIS_SESSION_SUPERVISED",
-    "GENESIS_SLOT",
-    "GENESIS_TRACE_ID",
-    "GENESIS_PARENT_SPAN_ID",
-    "CLAUDE_CODE_SESSION_ID",
-)
+# The wrapper runs with system Python before the venv launcher. This declaration
+# is stdlib-only, so use the checkout source without importing the runtime.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from genesis.caller_context import EXTERNAL_IDENTITY_ENV_VARS  # noqa: E402
+
+_SESSION_CONTEXT = EXTERNAL_IDENTITY_ENV_VARS
 
 
 def sanitized_environment(source: dict[str, str] | None = None) -> dict[str, str]:

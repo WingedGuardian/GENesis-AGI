@@ -69,7 +69,7 @@ _SERVER_DECLARED_PREFIXES: dict[str, tuple[str, ...]] = {
 _STANDALONE_ROUTER_SERVERS = frozenset({"health", "memory", "outreach", "recon"})
 
 
-def _standalone_routing_env_names(server: str) -> frozenset[str]:
+def _standalone_routing_env_names(server: str, *, required: bool = False) -> frozenset[str]:
     if server not in _STANDALONE_ROUTER_SERVERS:
         return frozenset()
 
@@ -82,13 +82,44 @@ def _standalone_routing_env_names(server: str) -> frozenset[str]:
             repo_root() / "config" / "model_routing.yaml",
             check_api_keys=False,
         )
+        types = {provider.provider_type for provider in config.providers.values()}
+        if required:
+            # A selected secrets file can enable one of these configured
+            # providers after discovery. Freeze its keys before that load too.
+            types.update(config.disabled_providers.values())
         return frozenset(
             name
-            for provider in config.providers.values()
-            for name in api_key_env_names(provider.provider_type)
+            for provider_type in types
+            for name in api_key_env_names(provider_type)
         )
     except Exception:
+        if required:
+            raise ValueError("external dependency keys unavailable") from None
         return frozenset()
+
+
+def _external_file_keys(server: str) -> frozenset[str]:
+    """File-import population for the retained external health/memory readers."""
+    common = frozenset({
+        "GENESIS_DB_PATH", "GENESIS_DB_BUSY_TIMEOUT_MS", "GENESIS_MCP_HTTP_TOKEN",
+        "GENESIS_MCP_ENV_RECORDER",
+    })
+    if server == "health":
+        return common
+    if server != "memory":
+        raise ValueError("unsupported external server")
+    return common | _standalone_routing_env_names(server, required=True) | {
+        "QDRANT_URL", "OLLAMA_URL", "API_KEY_DEEPINFRA", "API_KEY_QWEN", "API_KEY_VOYAGE",
+        "GENESIS_ENABLE_OLLAMA", "OLLAMA_EMBEDDING_MODEL", "GENESIS_EMBED_LOCAL_FIRST",
+        "GENESIS_EMBED_PRIORITY_TIER", "GENESIS_RECALL_READ_POOL_OFF",
+        "GENESIS_SESSION_READ_POOL_SIZE", "GENESIS_RECALL_READ_POOL_SIZE",
+        "GENESIS_GRAPH_TELEMETRY_DISABLED", "GENESIS_MEMORY_WRITEBACKS_OFF",
+        "GENESIS_MEMORY_RERANK_OFF", "GENESIS_FALKORDB_STORE_DISABLED",
+        "GENESIS_ENABLE_LM_STUDIO", "LM_STUDIO_URL", "LM_STUDIO_HEALTH_URL",
+        "GENESIS_DAILY_BUDGET_DISABLED",
+        # Admitted knowledge_recall uses corrective web augmentation internally.
+        "API_KEY_TINYFISH", "API_KEY_BRAVE", "SEARXNG_URL", "BRAVE_API_URL",
+    }
 
 
 _DEFAULT_FLAG = Path.home() / ".genesis" / "cc_context_enabled"
@@ -723,7 +754,13 @@ def main(argv: list[str] | None = None) -> None:
     from genesis.env import secrets_path
 
     secrets = secrets_path()
-    if secrets.exists():
+    external_file_names = frozenset()
+    if args.external_client:
+        from genesis.routing.standalone import configure_external_secrets, load_external_secrets
+
+        configure_external_secrets(_external_file_keys(args.server))
+        external_file_names = load_external_secrets(secrets)
+    elif secrets.exists():
         from dotenv import dotenv_values
 
         for key, value in dotenv_values(secrets).items():
@@ -749,7 +786,9 @@ def main(argv: list[str] | None = None) -> None:
         from genesis.env import genesis_home
         from genesis.observability.mcp_env_reads import install
 
-        secret_keys = frozenset(dotenv_values(secrets)) if secrets.is_file() else frozenset()
+        secret_keys = external_file_names if args.external_client else (
+            frozenset(dotenv_values(secrets)) if secrets.is_file() else frozenset()
+        )
         declared = (
             frozenset(_MCP_VARS)
             | _SERVER_DECLARED_VARS[args.server]
