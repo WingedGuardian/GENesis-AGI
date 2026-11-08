@@ -28,6 +28,8 @@ from tests.test_peers.test_conversation import http_bridge as http_bridge
 
 
 @pytest.mark.skipif(shutil.which("claude") is None, reason="native Claude CLI unavailable")
+@pytest.mark.real_tool("claude")  # runs the installed CLI against a local synthetic provider
+@pytest.mark.user_manager  # and its real transient --user scope
 async def test_authenticated_shared_native_reply_continuation_and_owner_handoff(http_bridge, monkeypatch):
     from a2a.types import TaskState
 
