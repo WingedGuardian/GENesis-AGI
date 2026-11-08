@@ -60,6 +60,9 @@
 #      → rotate_log (mcp_health.log, turnstile_debug.log; the first is held open
 #      by every session's MCP server, so both are copied and truncated, never
 #      renamed)
+#  17. Reset failed TRANSIENT user units (failed >24h) → reset_failed_transient_units
+#      (ad-hoc `systemd-run` launches without --collect stay listed as failed
+#      forever; never a genesis-* unit, never a persistent unit)
 #
 # Note: run under a hardened systemd sandbox (NoNewPrivileges, ProtectSystem=
 # strict), so disk_reclaim's --system (/var, sudo) path is intentionally NOT
@@ -617,6 +620,89 @@ prune_camoufox_engines_step() {
     )
 }
 
+# reset_failed_transient_units [MIN_AGE_S] — `systemctl --user reset-failed` each
+# FAILED transient unit whose failure is older than MIN_AGE_S (default 24h). A
+# `systemd-run` launch without --collect is left loaded as failed after it
+# exits non-zero, and nothing else ever clears it, so the failed list fills
+# with old jobs and a new failure is harder to see among them. That includes
+# Genesis's OWN unnamed scopes, not only ad-hoc session commands: the CC
+# session launcher (cc/invoker.py), the code-intel indexer and the dashboard
+# update route all start `run-u*` scopes without --collect, deliberately, so a
+# scope killed by its MemoryMax stays visible. This stage NEVER resets a unit
+# whose Result is oom-kill (owner ruling 2026-11-07: a memory kill is a real
+# alarm and stays listed until someone looks). Any other failure stays visible
+# for a day, is logged with its Result when reset, and stays in the journal.
+#
+# "Transient" is systemd's own `Transient=yes`, not the unit's name or an empty
+# FragmentPath. MEASURED on systemd 255: a transient unit's FragmentPath is NOT
+# empty, it is <runtime dir>/systemd/transient/<name>; and a persistent unit
+# whose file was removed (LoadState=not-found) reports an EMPTY FragmentPath
+# with Transient=no. So the gate is Transient=yes AND a FragmentPath that is
+# empty or under a systemd/transient/ directory. A persistent unit's failure is
+# a real alarm and is never reset, and neither is any genesis-* unit.
+#
+# The age is the unit's StateChangeTimestamp in Unix seconds
+# (`--timestamp=unix`), a wall-clock value. The *Monotonic fields are not
+# usable here: inside a container they count the HOST's monotonic clock, which
+# MEASURED ran far ahead of the container's /proc/uptime. A unit whose time
+# cannot be read is kept. Each unit is logged before it is reset. A box with no
+# systemctl, or with no reachable user manager, skips the stage.
+reset_failed_transient_units() {
+    local min_age="${1:-86400}" listing unit props key val now
+    local transient fragment state ts result
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo "transient unit reset SKIPPED: systemctl not found"
+        return 0
+    fi
+    if ! listing="$(systemctl --user list-units --state=failed --all --no-legend --plain 2>/dev/null)"; then
+        echo "transient unit reset SKIPPED: the systemd user manager is unreachable"
+        return 0
+    fi
+    now="$(date +%s)"
+    while read -r unit _; do
+        [ -n "$unit" ] || continue
+        case "$unit" in genesis-*) continue ;; esac
+        if ! props="$(systemctl --user show --timestamp=unix \
+                -p Transient -p FragmentPath -p ActiveState -p StateChangeTimestamp \
+                -p Result -- "$unit" 2>/dev/null)"; then
+            echo "transient unit reset: kept $unit (its properties could not be read)"
+            continue
+        fi
+        transient="" fragment="" state="" ts="" result=""
+        while IFS='=' read -r key val; do
+            case "$key" in
+                Transient) transient="$val" ;;
+                FragmentPath) fragment="$val" ;;
+                ActiveState) state="$val" ;;
+                StateChangeTimestamp) ts="$val" ;;
+                Result) result="$val" ;;
+            esac
+        done <<< "$props"
+        [ "$state" = failed ] || continue
+        [ "$transient" = yes ] || continue
+        case "$fragment" in
+            ""|*/systemd/transient/*) ;;
+            *) continue ;;
+        esac
+        ts="${ts#@}"
+        if ! [[ "$ts" =~ ^[0-9]+$ ]]; then
+            echo "transient unit reset: kept $unit (no readable failure time)"
+            continue
+        fi
+        [ $((now - ts)) -gt "$min_age" ] || continue
+        if [ "$result" = oom-kill ]; then
+            # Owner ruling: a scope killed by its memory limit is a real alarm,
+            # so it stays in the failed list until someone looks at it.
+            echo "transient unit reset: kept $unit (result=oom-kill is never auto-reset)"
+            continue
+        fi
+        echo "transient unit reset: $unit (failed $(( (now - ts) / 3600 ))h ago, result=${result:-unknown})"
+        systemctl --user reset-failed -- "$unit" 2>/dev/null \
+            || echo "transient unit reset failed for $unit"
+    done <<< "$listing"
+    return 0
+}
+
 hygiene_stage() {
     local name="$1" started=$SECONDS rc=0
     shift
@@ -854,6 +940,9 @@ maintenance_main() {
     # Appended to every 5 minutes by scripts/inbox_sync.sh and never rotated
     # before: MEASURED 31.8 MB on a live install. Same bounds as the MCP logs.
     rotate_log "${GENESIS_INBOX_SYNC_LOG:-$REPO_DIR/logs/inbox_sync.log}" 10000000 2
+
+    echo "--- failed transient unit reset (>24h; never genesis-*, never persistent) ---"
+    reset_failed_transient_units 86400
 
     echo "=== genesis-disk-hygiene done ==="
     return "$disk_reclaim_rc"
