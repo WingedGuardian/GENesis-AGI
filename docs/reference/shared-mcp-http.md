@@ -60,8 +60,15 @@ unit, reusing `commit_identity.is_stale` without latching across rollback.
 Unavailable freshness is JSON null; guarded tools retain the existing live
 off/warn/block policy and positive-confirmation semantics.
 
-Targeted tests: `test_shared_http_admission.py`, `test_shared_http_policy.py` and
+Targeted tests: pure `test_shared_http_settings.py`; qualified
+`test_shared_http_admission.py`, `test_shared_http_policy.py` and
 `test_shared_http_runtime.py` under `tests/test_mcp/`, plus
 `tests/test_observability/test_activity_persistence_scope.py`. Runtime fixtures
 exercise actual SDK dispatch and SQLite with synthetic qualified tool modules;
 they do not prove four real service factories or native-client compatibility.
+
+The separate shared-MCP qualification workflow runs the real protocol suites
+under its pinned SDK constraints and requires zero skips. Ordinary floating CI
+keeps pure configuration/refusal coverage and explicitly skips these three
+version-specific modules when unqualified; the dedicated job fails instead.
+See [testing environments](testing.md#shared-mcp-qualification-environments).

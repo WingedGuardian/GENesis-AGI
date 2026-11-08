@@ -1,5 +1,10 @@
 """Actual SDK dispatch and caller/resource boundaries with synthetic tools."""
 
+# Qualification precedes every version-specific import.
+from tests.shared_mcp_qualification import QUALIFIED_TEST_STACK as QUALIFIED_TEST_STACK
+
+# isort: split
+
 import asyncio
 import json
 from dataclasses import asdict
