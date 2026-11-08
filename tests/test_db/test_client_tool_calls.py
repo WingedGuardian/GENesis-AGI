@@ -31,11 +31,6 @@ def _normalize(sql: str) -> str:
     return " ".join(sql.split())
 
 
-@pytest.fixture(autouse=True)
-def _reset_table_cache(monkeypatch):
-    monkeypatch.setattr(client_tool_calls, "_table_verified", False)
-
-
 def test_table_ddl_matches_between_build_paths():
     assert _normalize(_migration()._TABLE_DDL) == _normalize(TABLES["client_tool_calls"])
 
@@ -204,3 +199,58 @@ def test_prune_script_deletes_only_old_rows(tmp_path):
     assert "deleted 1 row" in run.stdout, (run.stdout, run.stderr)
     with sqlite3.connect(path) as conn:
         assert [r[0] for r in conn.execute("SELECT tool FROM client_tool_calls")] == ["new"]
+
+
+def _run_prune(path, *args):
+    env = {**os.environ, "GENESIS_DB_PATH": str(path)}
+    return subprocess.run(
+        [sys.executable, str(_REPO / "scripts" / "prune_client_tool_calls.py"), *args],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=120,
+        check=False,
+    )
+
+
+def test_prune_script_never_creates_a_missing_database(tmp_path):
+    path = tmp_path / "absent" / "genesis.db"
+    run = _run_prune(path, "--days", "30")
+    assert run.returncode == 0, run.stderr
+    assert not path.exists() and not path.parent.exists()
+
+
+def test_prune_script_exits_nonzero_on_failure(tmp_path):
+    path = tmp_path / "genesis.db"
+    path.write_text("this is not a sqlite database")
+    run = _run_prune(path, "--days", "30")
+    assert run.returncode == 1
+    assert "client_tool_calls prune error" in run.stderr
+
+
+async def test_the_table_check_is_per_connection(db, tmp_path):
+    # A migrated connection first, then an unmigrated one in the same process:
+    # the second must skip, not raise.
+    assert await client_tool_calls.record(
+        db,
+        client="codex",
+        server="memory",
+        tool="t",
+        called_at="2026-01-01T00:00:00+00:00",
+        outcome="returned",
+        result_ref=None,
+    )
+    async with aiosqlite.connect(str(tmp_path / "bare.db")) as bare:
+        assert (
+            await client_tool_calls.record(
+                bare,
+                client="codex",
+                server="memory",
+                tool="t",
+                called_at="2026-01-01T00:00:00+00:00",
+                outcome="returned",
+                result_ref=None,
+            )
+            is False
+        )
+        assert await client_tool_calls.prune(bare, older_than_days=1) == 0

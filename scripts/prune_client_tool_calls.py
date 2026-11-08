@@ -5,7 +5,8 @@ Deletes rows older than a retention window (default
 ``client_tool_calls.DEFAULT_RETENTION_DAYS``, whose comment says why) so the log
 stays bounded. Invoked by ``scripts/disk_hygiene.sh`` (genesis-disk-hygiene.timer);
 also runnable by hand. Best-effort: a failure here must not skip other hygiene
-steps, and an absent table prunes nothing.
+steps (it exits nonzero, which hygiene reports and moves past); an absent
+database or table prunes nothing and creates nothing.
 """
 
 from __future__ import annotations
@@ -23,11 +24,16 @@ if str(SRC_DIR) not in sys.path:
 
 
 async def _prune(days: int) -> int:
-    from genesis.db.connection import get_raw_db
+    from genesis.db.connection import connect_aiosqlite_rw
     from genesis.db.crud.client_tool_calls import prune
     from genesis.env import genesis_db_path
 
-    async with get_raw_db(genesis_db_path()) as conn:
+    path = genesis_db_path()
+    if not path.exists():
+        return 0  # nothing to prune, and never create a database to prune
+    # existing_only: SQLite mode=rw, so a database removed after the check
+    # above is never recreated empty.
+    async with connect_aiosqlite_rw(path, existing_only=True) as conn:
         return await prune(conn, older_than_days=days, now=datetime.now(UTC).isoformat())
 
 
@@ -47,6 +53,8 @@ def main() -> None:
         print(f"client_tool_calls prune: deleted {deleted} row(s) older than {args.days}d")
     except Exception as exc:
         print(f"client_tool_calls prune error: {exc}", file=sys.stderr)
+        # Nonzero so disk hygiene reports it; hygiene still runs its other steps.
+        raise SystemExit(1) from exc
 
 
 if __name__ == "__main__":

@@ -23,21 +23,17 @@ import aiosqlite
 # another window.
 DEFAULT_RETENTION_DAYS = 180
 
-# Once the table is confirmed present, stop re-checking. A missing table is
-# re-checked on every call so a writer self-heals when the migration lands.
-_table_verified = False
-
-
 async def _table_available(db: aiosqlite.Connection) -> bool:
-    global _table_verified
-    if _table_verified:
-        return True
+    """Whether THIS connection's database has the table.
+
+    Checked on every call, never cached per process: one process can hold
+    connections to different databases (a test, a restore), and a cached True
+    would turn an unmigrated one into a raised error instead of a skip.
+    """
     cursor = await db.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='client_tool_calls'"
     )
-    exists = await cursor.fetchone() is not None
-    _table_verified = exists
-    return exists
+    return await cursor.fetchone() is not None
 
 
 async def record(
