@@ -762,6 +762,7 @@ _cc_ensure_updater_suppressed_inner() {
     #     makes the function honest regardless of how the next one is written.
     rc=0
     out="$(python3 - "$settings_file" "${extra_defaults[@]}" <<'PYEOF'
+import io
 import json, os, random, shutil, signal, stat, sys, tempfile, time
 
 # SIGTERM must RAISE, or the cleanup arm below is decorative.
@@ -832,8 +833,9 @@ for _arg in sys.argv[2:]:
             # indent=2, which takes the recursive pure-Python encoder and
             # overflows, failing the suppression. So the check must mirror the
             # write exactly, including the one level of nesting under the file's
-            # top-level object.
-            json.dumps({_k: _val}, indent=2, allow_nan=False)
+            # top-level object, and its call: from Python 3.13 json.dumps takes the
+            # C encoder with indent too, and only json.dump still recurses.
+            json.dump({_k: _val}, io.StringIO(), indent=2, allow_nan=False)
             TOP_DEFAULTS[_k] = _val
         except (ValueError, RecursionError):
             print("top-level default %r ignored (value is not strict JSON)" % _shown,

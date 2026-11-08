@@ -8,8 +8,9 @@ When a plan is approved (ExitPlanMode fires), this hook:
 The MCP server picks up the pending file on the next tool call and
 creates the bookmark programmatically — no LLM dependency.
 
-Reads hook input from stdin as JSON:
-  {"tool_name": "ExitPlanMode", "tool_input": {...}, "tool_output": {...}}
+Reads hook input from stdin as JSON (the PostToolUse shape):
+  {"tool_name": "ExitPlanMode", "session_id": "...",
+   "tool_input": {"plan": "...", "planFilePath": "..."}, "tool_response": {...}}
 
 Output format (CC PostToolUse hook contract):
 {
@@ -24,7 +25,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -83,65 +83,29 @@ _EXECUTION_PROTOCOL = (
 _GENESIS_DIR = Path.home() / ".genesis"
 _PENDING_FILE = _GENESIS_DIR / "plan_bookmark_pending.json"
 
-
-def _outside_fences(lines: list[str]):
-    """Yield `(index, line)` for lines that are NOT inside a fenced block.
-
-    A plan documents a convention by SHOWING it, so the divider and the title
-    heading both appear inside ``` examples in perfectly ordinary plans — this
-    repo's own reference doc does exactly that. Matching those is how a plan
-    truncates itself at its own illustration.
-
-    Fence detection is the CommonMark-ish subset that markdown writers actually
-    use: a line whose first non-space run is three or more backticks or tildes
-    toggles the state. The info string is ignored, and a closing fence of a
-    different character does not close — ``` inside a ~~~ block is content.
-    """
-    fence_char = ""
-    for idx, line in enumerate(lines):
-        stripped = line.lstrip()
-        if stripped[:3] in ("```", "~~~"):
-            char = stripped[0]
-            if not fence_char:
-                fence_char = char
-                continue
-            if char == fence_char:
-                fence_char = ""
-            continue
-        if not fence_char:
-            yield idx, line
+# Which plan, and which part of it is live, come from the shared reader both
+# plan-reading hooks use (`scripts/hooks/plan_doc.py`). Imported defensively: a
+# broken hooks tree must not cost the execution protocol below, so the hook then
+# records no plan path and classifies nothing, and still emits its reminders.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "hooks"))
+try:
+    from plan_doc import live_section, plan_path
+except Exception as exc:  # noqa: BLE001 — degrade to "no plan known", never crash
+    print(f"plan_bookmark_hook: degraded, no plan reader: {exc!r}", file=sys.stderr)
+    live_section = plan_path = None
+try:
+    from hook_input import session_id as _payload_session_id
+except Exception as exc:  # noqa: BLE001 — degrade to "no session hint", never crash
+    print(f"plan_bookmark_hook: degraded, no session reader: {exc!r}", file=sys.stderr)
+    _payload_session_id = None
 
 
-def _live_half(content: str) -> str:
-    """The part of a plan above its superseded-content divider.
-
-    The convention is documented in the genesis-development skill
-    (`references/plan-docs.md`): a heading containing SUPERSEDED BELOW divides
-    live plan content from archaeology kept for provenance. No divider means
-    the whole document is live, which is also the correct reading for every
-    plan written before the convention existed.
-
-    Matched on the WORDS at a heading line, not on the decorative rule the
-    template draws around them — the box characters are ornament and a plan
-    that omits them still means it. Anchored at column zero on a `#` heading so
-    the phrase quoted inside a paragraph cannot truncate the document, and
-    skipped inside FENCED blocks so a plan that documents the convention by
-    showing it — which is how anyone would document it, and how the reference
-    doc does — does not truncate itself at its own example.
-    """
-    lines = content.splitlines()
-    for idx, line in _outside_fences(lines):
-        if line.startswith("#") and "SUPERSEDED BELOW" in line:
-            return "\n".join(lines[:idx])
-    return content
-
-
-def _classify_plan_complexity(plan_path: str) -> str:
+def _classify_plan_complexity(path_str: str) -> str:
     """Classify plan as small/medium/large based on task and step count."""
-    if not plan_path:
+    if not path_str:
         return "unknown"
     try:
-        content = Path(plan_path).read_text(encoding="utf-8")
+        content = Path(path_str).read_text(encoding="utf-8")
     except OSError:
         return "unknown"
 
@@ -151,7 +115,8 @@ def _classify_plan_complexity(plan_path: str) -> str:
     # classify as `large`, and `_plan_instructions` then injects the full
     # planning pipeline on the strength of work that is already done. The
     # archaeology grows without bound, so this only ever gets worse.
-    content = _live_half(content)
+    if live_section is not None:
+        content = live_section(content)
     task_count = content.count("### Task")
     step_count = content.count("- [ ]")
 
@@ -167,44 +132,22 @@ def _classify_plan_complexity(plan_path: str) -> str:
 def _extract_plan_info(hook_input: dict) -> tuple[str, str]:
     """Extract plan file path and title.
 
-    Tries hook input first, falls back to most recently modified file
-    in ~/.claude/plans/.
+    The path comes from the shared reader: the payload's authoritative
+    ``planFilePath``, else a plan path in the payload, else this session's own
+    plan by filename, else the single plan on the box when there is only one.
+    An earlier version regex-scanned the payload, where the plan's markdown
+    serializes first, so it bookmarked the first plan the prose happened to
+    quote, and fell back to the newest plan on the box from any session.
 
     Returns (plan_path, title). Both may be empty if not available.
     """
-    tool_input = hook_input.get("tool_input", {})
-    tool_output = hook_input.get("tool_output", {})
-
-    plan_path = ""
+    path_str = plan_path(hook_input) if plan_path is not None else ""
     title = ""
 
-    # Try to find plan path in hook input/output
-    for source_str in (str(tool_output), str(tool_input)):
-        if ".claude/plans/" in source_str:
-            match = re.search(r"(/[^\s\"']+\.claude/plans/[^\s\"']+\.md)", source_str)
-            if match:
-                plan_path = match.group(1)
-                break
-
-    # Fallback: find most recently modified plan file
-    if not plan_path:
-        plans_dir = Path.home() / ".claude" / "plans"
-        if plans_dir.is_dir():
-            try:
-                candidates = sorted(
-                    plans_dir.glob("*.md"),
-                    key=lambda p: p.stat().st_mtime,
-                    reverse=True,
-                )
-                if candidates:
-                    plan_path = str(candidates[0])
-            except OSError:
-                pass
-
     # Read the plan title from the first heading
-    if plan_path:
+    if path_str:
         try:
-            path = Path(plan_path)
+            path = Path(path_str)
             if path.exists():
                 for line in _title_candidate_lines(path.read_text()):
                     if line.startswith("#") and not line.startswith("<!--"):
@@ -213,7 +156,7 @@ def _extract_plan_info(hook_input: dict) -> tuple[str, str]:
         except OSError:
             pass
 
-    return plan_path, title
+    return path_str, title
 
 
 def _title_candidate_lines(text: str) -> list[str]:
@@ -288,29 +231,19 @@ def _is_yaml_mapping(block: str) -> bool:
         return False
 
 
-def _guess_session_id() -> str:
-    """Best-effort session ID from most recently modified sessions directory."""
-    sessions_dir = _GENESIS_DIR / "sessions"
-    if not sessions_dir.exists():
+def _session_hint(hook_input: dict) -> str:
+    """The session that exited plan mode, from the payload's own ``session_id``.
+
+    An earlier version guessed it as the most recently modified directory under
+    ``~/.genesis/sessions``, which names whichever session on the box touched its
+    directory last, so a plan approved in one session was bookmarked under
+    another. The payload carries the id, validated by ``hook_input.session_id``;
+    absent, the hint is empty rather than a guess.
+    """
+    # Genesis background sessions are not bookmarked.
+    if os.environ.get("GENESIS_CC_SESSION") == "1" or _payload_session_id is None:
         return ""
-
-    # Skip Genesis background sessions (env var check)
-    if os.environ.get("GENESIS_CC_SESSION") == "1":
-        return ""
-
-    try:
-        # Find the most recently modified session directory
-        candidates = sorted(
-            (d for d in sessions_dir.iterdir() if d.is_dir()),
-            key=lambda d: d.stat().st_mtime,
-            reverse=True,
-        )
-        if candidates:
-            return candidates[0].name
-    except OSError:
-        pass
-
-    return ""
+    return _payload_session_id(hook_input, default="")
 
 
 def main() -> int:
@@ -321,14 +254,14 @@ def main() -> int:
     except (json.JSONDecodeError, OSError):
         hook_input = {}
 
-    plan_path, title = _extract_plan_info(hook_input)
-    session_id_hint = _guess_session_id()
+    path_str, title = _extract_plan_info(hook_input)
+    session_id_hint = _session_hint(hook_input)
 
     # Write pending bookmark file for MCP server to consume
     _GENESIS_DIR.mkdir(parents=True, exist_ok=True)
     try:
         pending_data = {
-            "plan_path": plan_path,
+            "plan_path": path_str,
             "title": title,
             "session_id_hint": session_id_hint,
             "created_at": datetime.now(UTC).isoformat(),
@@ -338,7 +271,7 @@ def main() -> int:
         print(f"plan_bookmark_hook: failed to write pending file: {exc}", file=sys.stderr)
 
     # Classify plan complexity for review depth guidance
-    complexity = _classify_plan_complexity(plan_path)
+    complexity = _classify_plan_complexity(path_str)
     complexity_note = ""
     if complexity == "small":
         complexity_note = (

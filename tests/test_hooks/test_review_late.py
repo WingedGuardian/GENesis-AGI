@@ -109,9 +109,13 @@ def _block(keys, head, *, extra=()):
 # -- the cutover None path is main's ----------------------------------------------
 
 
-def test_the_shipped_cutover_is_none():
-    # Ruling 50cc9dec: nothing new is owed before the commit gate enforces.
-    assert rr.REFLECTION_CUTOVER_ISO is None
+def test_the_shipped_cutover_is_the_gates_go_live_moment():
+    """Ruling 50cc9dec: nothing new is owed before the commit gate enforces, so the
+    cutover is the moment it started to: a real, zoned time no later than now and
+    no earlier than the enforcement change itself."""
+    cut = datetime.fromisoformat(rr.REFLECTION_CUTOVER_ISO)
+    assert cut.tzinfo is not None
+    assert datetime(2026, 10, 21, tzinfo=UTC) <= cut <= datetime.now(UTC)
 
 
 def test_with_no_cutover_review_late_is_never_imported():
@@ -1302,8 +1306,9 @@ def test_status_owes_late_keys_only_from_a_cutover(pr, tmp_path, monkeypatch, ca
     path, base, head, fix = pr
     budget = _late_budget(path, base, fix, [_rv(head, _at(0), 1), _rv(head, _at(90), 9)])
     _status_env(monkeypatch, budget)
-    shipped = rr.status(str(path), now=T0)
-    assert shipped["owed"] == [] and shipped["cutover"] is None
+    monkeypatch.setattr(rr, "REFLECTION_CUTOVER_ISO", None)
+    uncut = rr.status(str(path), now=T0)
+    assert uncut["owed"] == [] and uncut["cutover"] is None
     monkeypatch.setattr(rr, "REFLECTION_CUTOVER_ISO", CUT)
     assert rr.status(str(path), now=T0)["owed"] == ["c9"]
     _reflect(path, tmp_path, _block(["c9"], fix), T0 + timedelta(minutes=120))

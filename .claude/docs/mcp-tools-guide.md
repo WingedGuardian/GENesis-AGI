@@ -104,6 +104,13 @@ window by something else can be; check the title it quotes. When it cannot check
 host other than github.com, gh older than 2.98, the 10-a-minute search rate limit), it
 says why. It does not cover the script above, which keeps its exact-title check.
 
+**A raw `gh issue create` without its premise answers is refused before it posts,** in a
+foreground session, when the hook can read the body in full:
+`scripts/hooks/issue_premise_gate.py` blocks a body the premise gate would label
+`premises-missing` and names the missing answers (`.claude/docs/premise-check.md`, "At plan
+and issue time"). Add the section and run the command again. Anything the hook cannot read
+in full passes, and the server label still applies afterwards.
+
 Exit codes: `0` filed (or dry-run clean) · `2` refused — **nothing was posted**, that
 is a hard guarantee · `3` an identical title already exists · `4` **INDETERMINATE** ·
 `1` unexpected error. **Run `--dry-run` first** — it performs every check and posts

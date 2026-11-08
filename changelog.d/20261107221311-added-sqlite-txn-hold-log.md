@@ -1,0 +1,1 @@
+- The database layer now logs any write transaction the server keeps open for a second or more (`sqlite txn held: …`), naming the code that opened it, so a process that keeps the database's writer slot busy can be found; set `GENESIS_SQLITE_TXN_HOLD_MS=0` to turn it off.

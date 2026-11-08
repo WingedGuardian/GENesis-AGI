@@ -1,0 +1,1 @@
+- **Guardian alerts appear in conversation history.** Alerts the host Guardian posts to Telegram are now recorded alongside Genesis's own messages and labelled as the Guardian's, so a reply to one has its context. This needs a Guardian redeployed with the `sent-log` gateway verb; with an older Guardian nothing changes. `GENESIS_GUARDIAN_SENT_LOG_DISABLED=1` turns the pull off.

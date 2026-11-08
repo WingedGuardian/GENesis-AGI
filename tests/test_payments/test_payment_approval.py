@@ -23,6 +23,7 @@ from genesis.channels.telegram._handler_messages import handle_callback_query
 from genesis.dashboard._blueprint import blueprint
 from genesis.db.crud import payment_vault_events as audit
 from genesis.payments import approval as ap
+from genesis.payments import vault_store as vs
 from genesis.payments.approval import PAYMENT_APPROVAL_ACTION_TYPE, PaymentApprovalRegistry
 from genesis.payments.vault_service import VaultService
 
@@ -369,20 +370,15 @@ def test_a_malformed_first_entry_leaves_no_owner(raw):
 # -- audit trail interleaving -----------------------------------------------------
 
 
-async def test_approval_rows_do_not_hide_an_unlock_left_open(db, tmp_path):
-    """The trail-correction reads the last KEY event, not the last row."""
-    await audit.record_event(db, "unlock")
-    await audit.record_event(db, "approval_requested", {"nonce": "n"})
-    svc = VaultService(db, vault_path=tmp_path / "v", socket_path=tmp_path / "s")
-    await svc._correct_trail()
-    assert (await audit.list_recent(db, 1))[0]["event"] == "lock"
-
-
 async def test_status_last_event_is_the_last_key_event(db, tmp_path):
-    await audit.record_event(db, "lock")
-    await audit.record_event(db, "approval_requested", {"nonce": "n"})
+    """An approval row after the key loaded does not hide the key event."""
+    vs.init_vault(tmp_path / "v")
     svc = VaultService(db, vault_path=tmp_path / "v", socket_path=tmp_path / "s")
-    assert (await svc.status())["last_event"]["event"] == "lock"
+    await svc.ensure_key()
+    assert svc.unlocked
+    await audit.record_event(db, "approval_requested", {"nonce": "n"})
+    assert (await audit.list_recent(db, 1))[0]["event"] == "approval_requested"
+    assert (await svc.status())["last_event"]["event"] == "key_loaded"
 
 
 async def test_start_vault_service_attaches_the_registry_audit(db, monkeypatch):
@@ -873,7 +869,9 @@ async def test_adapter_start_hands_the_registry_to_the_callback_handler(monkeypa
         await adapter.start()
     bot = FakeBot()
     query = CallbackQuery(
-        id="q", from_user=User(id=OWNER, first_name="u", is_bot=False), chat_instance="c",
+        id="q",
+        from_user=User(id=OWNER, first_name="u", is_bot=False),
+        chat_instance="c",
         data="payapprove:n",
     )
     query.set_bot(bot)

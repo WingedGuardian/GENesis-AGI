@@ -1,6 +1,6 @@
 [project]
 name = "genesis-v3"
-version = "3.0.0b18"
+version = "3.0.0b19"
 requires-python = ">=3.12,<3.15"  # upper bound: every current litellm release caps Python <3.15
 dependencies = [
     "aiosqlite",
@@ -11,7 +11,7 @@ dependencies = [
     "regex",  # procedure_advisor runs author regexes with a per-pattern timeout (re has none)
     "tzlocal>=5",  # transitive dep of apscheduler (ego/cadence uses the local-timezone path); declare so a clean/cached install can't drop it
     "python-telegram-bot>=21.0",
-    "litellm==1.93.2",  # pinned EXACTLY — 1.82.7/1.82.8 contained malware, so never float.
+    "litellm==1.100.4",  # pinned EXACTLY — 1.82.7/1.82.8 contained malware, so never float.
                        # 1.93.2 admits Python 3.14 and fixes PYSEC-2026-4066, which is
                        # present in 1.93.0. pip-audit, 2026-10-13: no known
                        # advisories. Like every current release it caps Requires-Python <3.15,
@@ -71,9 +71,8 @@ dependencies = [
     "flask>=3.0",
     "flask-sock>=0.7",
     "wsproto>=1.2",  # transitive dep of flask-sock; pin to prevent silent uninstall
-    "fastmcp>=2.0,<3.0",  # <3 for API stability (3.x breaks the API). Genesis uses fastmcp stdio
-                         # transport only (no OpenAPIProvider/OAuthProxy), so its OpenAPI/OAuth CVEs
-                         # (CVE-2026-32871/27124/2025-64340, unfixed pre-3.2.0) are not reachable.
+    "fastmcp>=4.1.4,<5",  # Qualified v4 API and security floor; no background-tasks extra.
+    "mcp>=2.3.0,<3",  # Direct SDK floor; FastMCP v4 requires the v2 protocol implementation.
     "detect-secrets>=1.4",  # Phase 6 contribution sanitizer — REQUIRED floor. sanitize.py fails closed if missing.
     "pymupdf>=1.27",  # PDF text extraction for knowledge ingestion pipeline
     "scrapling>=0.4.7",  # Web fetching with TLS fingerprint impersonation
@@ -85,34 +84,25 @@ dependencies = [
                                     # yt-dlp release pins, installed locally: never fetched at run time.
     "networkx>=3.0",  # In-memory graph for memory_links traversal + algorithms
     "wyoming>=1.5",  # Wyoming protocol for HA voice satellite STT/TTS integration
-    "falkordb>=1.7.1,<2",  # Graph-engine client for the memory graph. CORE, like
+    "falkordb>=1.8.1,<2",  # Graph-engine client for the memory graph. CORE, like
                            # qdrant-client above: the graph engine is part of the memory
                            # architecture, not an optional add-on. `config/graphstore.yaml`
                            # defaulting to networkx is a STAGED CUTOVER, not optionality.
-                           # Its own pin is redis<9,>=8.0.0, so the line below is not an
-                           # independent choice — declaring falkordb mandates redis 8.
-    "redis>=8,<9",  # Was UNDECLARED and purely transitive (fastmcp -> pydocket -> redis>=5,
-                    # no upper bound). Pinned explicitly now that first-party code depends
-                    # on it: observability/health.py's engine probe is the first in-tree
-                    # importer (there were zero before this change).
-                    #
-                    # MEASURED 2026-09-07, isolated venv, control flipping. Genesis
-                    # configures no redis URL, so the surface is the IMPORT chain rather
-                    # than a network connection.
-                    # ⚠ CORRECTED 2026-09-24: an earlier version of this comment added
-                    # "and never uses docket", which was FALSE and cost ~1.58 cores of
-                    # idle CPU before anyone looked. FastMCP instantiates a live Docket
-                    # AND runs a Worker at every server start, over in-process fakeredis
-                    # — it just has an empty queue, because no Genesis tool opts into
-                    # background tasks. `_run_mcp` now suppresses that worker; see
-                    # scripts/genesis_mcp_server.py::_suppress_docket_worker. Under
-                    # fastmcp 2.14.6 + pydocket
-                    # 0.25.0: redis 8.1.0 + fakeredis 2.37.1 import, FastMCP instantiates
-                    # and registers tools, docket._redis loads, fakeredis async round-trips,
-                    # and redis.asyncio's unix-socket client behaves. The same probe passes
-                    # on 7.4.0/2.34.1 and FAILS when asked to assert 8.x against 7.4.0, so
-                    # it is measuring the version it names. The whole graph-engine path
-                    # (12.4s full projection, concurrent-reader swap) also ran on 8.1.0.
+                           # Its own pin is redis<9,>=8.0.0, so the redis line below is not
+                           # an independent choice — declaring falkordb mandates redis 8.
+                           # >=1.8.1 because falkordblite requires falkordb[hiredis]>=1.8.0.
+    "falkordblite==0.11.0",  # The graph ENGINE itself, as a pip dependency: redis-server,
+                             # redis-cli and the FalkorDB module ship in this one wheel, so
+                             # the engine installs with Genesis (no apt repo, no download
+                             # step). Wheels are manylinux_2_38 x86_64/aarch64 only, which is
+                             # why the supported OS floor is Ubuntu 24.04 on those machines.
+                             # Pinned EXACTLY and kept in step with
+                             # scripts/lib/falkordb-requirements.txt (applied first with
+                             # --require-hashes) and falkordb-engine-digests.txt (the
+                             # committed per-file digests the unit's copy is checked
+                             # against): a bump regenerates both.
+    "redis>=8,<9",  # Required by falkordb and the first-party engine-health probe.
+                    # FastMCP no longer supplies this through its optional task worker.
     # Transitive deps pinned to secure floors (audit #638) so a clean/cached install can't resolve a vulnerable version
     "urllib3>=2.7.0",  # via qdrant-client/requests — CVE-2026-44431/44432 (auth-header leak, decompression DoS)
     "idna>=3.15",  # via httpx/requests — CVE-2026-45409 (quadratic-processing DoS)
@@ -129,6 +119,10 @@ test = [
     "pytest>=8.0",
     "pytest-asyncio",
     "pytest-timeout",
+    # Parallel runs (`-n`). CI's `test` job is still serial; the parallel-CI
+    # work lands the fixes that make a parallel run report what a serial one
+    # does before any job passes `-n`.
+    "pytest-xdist",
     # Property tests exercise hook-output budget invariants across Unicode edges.
     "hypothesis>=6.0",
     "aioresponses>=0.7.7",
@@ -153,7 +147,10 @@ test = [
 # camoufox < 0.5 engine the browser step has not replaced yet (measured:
 # "Protocol error (Browser.setDefaultViewport)").
 browser = [
-    "camoufox>=0.5.7,<0.6",  # engine pinned by the package's browser-pin.json (Firefox 156).
+    "camoufox>=0.5.7,<0.5.9",  # engine pinned by the package's browser-pin.json (Firefox 156).
+                             # <0.5.9: 0.5.9 removed camoufox.addons.maybe_download_addons,
+                             # which provision.py's addon step calls, and moves the engine to
+                             # Firefox 158; adopt it deliberately, not through a range.
                              # Upper bound: 0.4 -> 0.5 shipped no migration guide and changed
                              # the engine layout; take the next minor deliberately.
     "playwright>=1.62,<1.63",  # camoufox 0.5.7 and 0.5.8 declare playwright<1.63.
@@ -245,6 +242,13 @@ quote-style = "double"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Explicit, so pytest-asyncio stops warning that it is unset (pytest 9.2 prints
+# that warning ahead of everything, including tests/conftest.py's own first
+# line). Unset, an async fixture's loop scope falls back to the fixture's own
+# caching scope; every async fixture under tests/ is function-scoped (none passes
+# `scope=` or `loop_scope=`), so "function" changes no fixture's loop. An async
+# fixture that needs a wider loop must now pass `loop_scope=` itself.
+asyncio_default_fixture_loop_scope = "function"
 # Remove a PASSING test's tmp_path at that test's teardown; keep only failures'
 # for debugging. Without it every run with its own --basetemp keeps every test
 # directory forever (pytest clears a basetemp only when the same name is
@@ -286,3 +290,14 @@ timeout = 600
 # that names it. Cost: one hang ends the whole run instead of failing one test.
 # The box-wide pytest lock is an flock, released when the process dies.
 timeout_method = "thread"
+# Dump every thread's stack to stderr for a test still running at 540 s, just
+# before pytest-timeout ends the process at 600. The thread method writes its own
+# stacks to the terminal, which a pytest-xdist worker sends to /dev/null, so a
+# hung test in a parallel run showed only "worker crashed" (MEASURED 2026-11-05,
+# 0 stack lines in CI's hang control). stderr is kept. The faulthandler watchdog
+# never exits, so serial runs keep today's behaviour plus this dump. Limits:
+# its window spans setup, call and teardown together (pytest-timeout times
+# each phase), so a test whose phases add up past 540 s dumps and runs on; and
+# pytest cancels it once a test fails, so a hang in teardown after a failure
+# gets no dump.
+faulthandler_timeout = 540

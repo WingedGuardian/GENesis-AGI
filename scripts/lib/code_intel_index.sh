@@ -597,7 +597,18 @@ esac
 
 # Physical path (-P): the single-flight lock is keyed on this, and a symlinked
 # spelling of the same repo must not get a second lock (= second concurrent index).
-REPO_PATH="$(unset CDPATH; cd "$REPO_PATH" && pwd -P)"
+# A bare "-" is a directory name here, not cd's $OLDPWD shorthand.
+[ "$REPO_PATH" = - ] && REPO_PATH=./-
+if ! _repo_physical="$(unset CDPATH; cd -P -- "$REPO_PATH" && printf '%s.' "$PWD")"; then
+    _log "ERROR: cannot resolve physical repository path"
+    exit 1
+fi
+# A non-newline sentinel preserves legal trailing newlines through substitution.
+REPO_PATH="${_repo_physical%.}"
+# Match Linux/Python's single-root spelling before choosing a lock.
+while [[ "$REPO_PATH" == //* ]]; do
+    REPO_PATH="${REPO_PATH#/}"
+done
 
 # ── 1. Worktree skip ────────────────────────────────────────────────────
 # In a linked worktree, <root>/.git is a FILE (gitdir pointer), not a dir.
@@ -649,6 +660,16 @@ fi
 # sometimes cannot reach the user manager even when systemd-run exists.
 _GN_SCOPE_OK=0
 _CBM_SCOPE_OK=0
+# The scope's command gets its arguments as written. Systemd older than 254 refuses
+# this option (exit 1, before it reaches --version), and only that drops it: anything
+# else keeps it, and the probe below then decides. genesis.util.systemd does the same.
+_SD_LITERAL=(--expand-environment=no)
+_sd_literal_rc=0
+/usr/bin/systemd-run "${_SD_LITERAL[@]}" --version >/dev/null 2>&1 || _sd_literal_rc=$?
+if [ "$_sd_literal_rc" -eq 1 ]; then
+    _SD_LITERAL=()
+fi
+
 _probe_scope() {
     # GitNexus batches run in app-capped.slice (a child of app.slice: same
     # ancestors, plus a kill counter that outlives the scope, which the disk
@@ -657,7 +678,7 @@ _probe_scope() {
     local -a slice_args=(--slice=app-capped.slice)
     [ "$2" = "cbm" ] && slice_args=(--slice-inherit)
     [ "$WORKLOAD_SLICE" = "1" ] && slice_args=(--slice=genesis-workload.slice)
-    /usr/bin/systemd-run --user --scope "${slice_args[@]}" --quiet \
+    /usr/bin/systemd-run --user --scope "${slice_args[@]}" "${_SD_LITERAL[@]}" --quiet \
         -p "MemoryMax=$1" -p "MemorySwapMax=0" \
         -p "IOWeight=${IO_WEIGHT}" -p "CPUQuota=${CPU_QUOTA}" \
         -- /bin/true 2>/dev/null
@@ -678,7 +699,7 @@ _run_capped() {
         [ "$WORKLOAD_SLICE" = "1" ] && slice_args=(--slice=genesis-workload.slice)
         # _CI_SCOPE_UNIT (set by _run_with_watchdog) gives the scope a
         # deterministic name so the watchdog can freeze/thaw/stop it by unit.
-        /usr/bin/systemd-run --user --scope "${slice_args[@]}" --quiet \
+        /usr/bin/systemd-run --user --scope "${slice_args[@]}" "${_SD_LITERAL[@]}" --quiet \
             ${_CI_SCOPE_UNIT:+--unit="$_CI_SCOPE_UNIT"} \
             -p "MemoryMax=${MEM_MAX}" -p "MemorySwapMax=0" \
             -p "IOWeight=${IO_WEIGHT}" -p "CPUQuota=${CPU_QUOTA}" \

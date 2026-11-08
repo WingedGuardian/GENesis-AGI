@@ -1,3 +1,0 @@
-- Added snapshot-bound restore retries and compatible legacy/v2 encrypted transcript readers before new-format capture is enabled. Explicit local sources take precedence over off-site configuration, separate Tier-1 audit records remain recoverable, and failed selection initialization cleans unpublished staging.
-- Fixed selected cache identity and inventory validation, preventing damaged inventory from silently omitting recovery, and made retirement resumable after interrupted deletion. Identical legacy transcript copies collapse; differing plaintext/encrypted copies require an explicit encoding preference.
-- Fixed fresh pooled transcript recovery over SMB by keeping its temporary credentials available through all off-site downloads.

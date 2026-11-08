@@ -59,6 +59,15 @@ async def test_active_tasks_render(empty_db, empty_dirs):
     assert "Refactor the dispatcher" in block
 
 
+async def test_task_id_printed_whole(empty_db, empty_dirs):
+    # The id is pasted back into task_detail / task_control, which match it
+    # exactly — a prefix is a not-found, so the block must print it whole.
+    repo, plans = empty_dirs
+    await _insert_task(empty_db, "t-0123456789ab", "Long-id task")
+    block = await build_inflight_block(empty_db, repo_root=repo, plans_dir=plans)
+    assert "`t-0123456789ab`" in block
+
+
 async def test_terminal_tasks_excluded(empty_db, empty_dirs):
     repo, plans = empty_dirs
     await _insert_task(empty_db, "done0001", "Completed thing", phase="completed")
@@ -173,3 +182,160 @@ async def test_truncation_hard_cap(empty_db, empty_dirs, monkeypatch):
     block = await build_inflight_block(empty_db, repo_root=repo, plans_dir=plans)
     assert len(block) <= open_loops._MAX_CHARS + 20
     assert "…(truncated)" in block
+
+
+_ANCHOR_REASON = "archived by the reaper -> wt-gone-20260101; recover with --recover"
+
+
+def _git(cwd, *args):
+    import subprocess
+
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
+        cwd=str(cwd), check=True, capture_output=True,
+    )
+
+
+def test_list_worktrees_skips_anchors_and_missing_dirs(tmp_path):
+    """Real git: only registrations with a directory that are not reaper
+    archive anchors count as live. A worktree locked for another reason is live."""
+    import shutil
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "init")
+    for name in ("live", "held", "anchor", "stale"):
+        _git(repo, "worktree", "add", "-q", "-b", f"feat/{name}", str(tmp_path / name))
+    _git(repo, "worktree", "lock", "--reason", "closing queue: in use", str(tmp_path / "held"))
+    _git(repo, "worktree", "lock", "--reason", _ANCHOR_REASON, str(tmp_path / "anchor"))
+    shutil.rmtree(tmp_path / "anchor")  # the reaper archives the directory away
+    shutil.rmtree(tmp_path / "stale")   # unlocked, directory gone: prunable
+
+    branches = sorted(w.get("branch") for w in open_loops._list_worktrees(repo))
+    assert branches == ["feat/held", "feat/live"]
+
+
+def test_overflow_counts_only_live_worktrees(empty_dirs, tmp_path, monkeypatch):
+    """The "+N more" count ignores directory-less registrations and anchors,
+    including an anchor whose directory happens to exist."""
+    import types
+
+    repo, _plans = empty_dirs
+    records = [f"worktree {repo}\nHEAD {'0' * 40}\nbranch refs/heads/main\n"]
+    for i in range(10):
+        d = tmp_path / f"live{i}"
+        d.mkdir()
+        records.append(f"worktree {d}\nHEAD {'1' * 40}\nbranch refs/heads/b{i}\n")
+    for i in range(20):
+        records.append(
+            f"worktree {tmp_path / f'gone{i}'}\nHEAD {'2' * 40}\n"
+            f"branch refs/heads/g{i}\nlocked {_ANCHOR_REASON}\n"
+        )
+    for i in range(3):
+        d = tmp_path / f"anchored{i}"
+        d.mkdir()
+        records.append(
+            f"worktree {d}\nHEAD {'4' * 40}\nbranch refs/heads/a{i}\nlocked {_ANCHOR_REASON}\n"
+        )
+    for i in range(5):
+        records.append(
+            f"worktree {tmp_path / f'stale{i}'}\nHEAD {'3' * 40}\n"
+            f"branch refs/heads/s{i}\nprunable gitdir file points to non-existent location\n"
+        )
+    out = "\n".join(records)
+    monkeypatch.setattr(
+        open_loops.subprocess, "run",
+        lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=out, stderr=""),
+    )
+    lines = open_loops._worktree_lines(repo)
+    assert lines[-1] == "- …(+2 more)"  # 10 live - 8 cap; anchors/stale not counted
+    assert not any(line.startswith(("- g", "- s", "- a")) for line in lines)
+
+
+@pytest.mark.parametrize(
+    ("locked", "has_dir", "live"),
+    [
+        (None, True, True),
+        ("", True, True),  # bare `locked` line, no reason
+        ("closing queue: in use", True, True),  # locked for another reason
+        (_ANCHOR_REASON, True, False),  # anchor whose directory still exists
+        ('"' + _ANCHOR_REASON + '"', True, False),  # porcelain C-quoted reason
+        (None, False, False),  # directory gone
+    ],
+)
+def test_is_live_classifies_each_registration_shape(tmp_path, locked, has_dir, live):
+    path = tmp_path / "wt"
+    if has_dir:
+        path.mkdir()
+    wt = {"path": str(path)}
+    if locked is not None:
+        wt["locked"] = locked
+    assert open_loops._is_live(wt) is live
+
+
+def test_anchor_prefix_matches_the_reapers_writer():
+    """The reader restates the writer's prefix (scripts/ is not importable);
+    if the reaper ever rewords it, anchors with a directory would count as live."""
+    import ast
+    from pathlib import Path
+
+    src = (
+        Path(__file__).resolve().parents[2] / "scripts" / "worktree_lifecycle.py"
+    ).read_text()
+    values = [
+        node.value.value
+        for node in ast.walk(ast.parse(src))
+        if isinstance(node, ast.Assign)
+        and any(getattr(t, "id", None) == "ARCHIVE_LOCK_PREFIX" for t in node.targets)
+        and isinstance(node.value, ast.Constant)
+    ]
+    assert values == [open_loops._REAPER_ANCHOR_PREFIX]
+    assert _ANCHOR_REASON.startswith(open_loops._REAPER_ANCHOR_PREFIX)
+
+
+def test_real_git_archive_reasons_agree_with_reaper_parser(tmp_path):
+    """Read real porcelain; the writer's full parser is the archive oracle."""
+    import ast
+    from pathlib import Path
+
+    source = Path(__file__).resolve().parents[2] / "scripts/worktree_lifecycle.py"
+    tree = ast.parse(source.read_text())
+    nodes = [
+        node for node in tree.body
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                getattr(target, "id", None) in {"ARCHIVE_LOCK_PREFIX", "ARCHIVE_LOCK_SUFFIXES"}
+                for target in node.targets
+            )
+        ) or (
+            isinstance(node, ast.FunctionDef)
+            and node.name in {"_archive_lock_reason", "_archive_entry_from_reason"}
+        )
+    ]
+    oracle = {}
+    # Only the trusted writer's constants and two pure functions enter the oracle.
+    exec(compile(ast.Module(body=nodes, type_ignores=[]), str(source), "exec"), oracle)  # noqa: S102
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "init")
+    live = tmp_path / "live"
+    _git(repo, "worktree", "add", "-q", "-b", "topic", str(live))
+    reasons = [
+        "archived by the reaper -> manual hold",
+        _ANCHOR_REASON + " (manual)",
+        "closing queue: in use",
+    ]
+    for entry in ("valid", "a;b", "tab\tentry", "quote\"entry", "", ".", "..", "../other"):
+        for failed in (False, True):
+            reasons.append(oracle["_archive_lock_reason"](entry, recovery_failed=failed))
+    for reason in reasons:
+        _git(repo, "worktree", "lock", "--reason", reason, str(live))
+        try:
+            expected_live = oracle["_archive_entry_from_reason"](reason) is None
+            actual_live = any(w["path"] == str(live) for w in open_loops._list_worktrees(repo))
+            assert actual_live is expected_live, repr(reason)
+        finally:
+            _git(repo, "worktree", "unlock", str(live))

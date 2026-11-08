@@ -21,8 +21,37 @@ from genesis.autonomy.executor.resources import (
     load_step_resources,
 )
 from genesis.autonomy.executor.types import ResearchResult, StepResult, StepType
+from genesis.cc.final_status import FinalStatus
 
 logger = logging.getLogger(__name__)
+
+
+def _step_status(parsed: dict, output) -> tuple[str, str | None, str | None]:
+    """The step's status, blocker description, and result text override.
+
+    The step's own JSON status stands, except that the session's final report
+    (cc/final_status.py) saying ``blocked`` or ``failed`` wins over a JSON
+    ``completed`` or no JSON at all: a step denied a tool usually exits cleanly
+    and claims nothing, and ``parse_step_output`` then defaults to completed.
+    A blocked step reaches the owner through the engine's existing blocker
+    notification. Nothing reported anywhere stays ``completed``, as before.
+
+    A reported ``failed`` is ``blocked`` too, never ``failed`` (owner ruling
+    2026-11-05): ``failed`` starts automatic re-runs (workaround, research, up
+    to 10 exit-gate retries) of a step that may already have done its work,
+    which is not safe to repeat on the model's word alone; the owner decides.
+    Revisit once the self-report's accuracy is measured. The third value is
+    the reason, for a stop the report decided with no JSON ``result``.
+    """
+    status = parsed.get("status", "completed")
+    blocker = parsed.get("blocker_description")
+    report = getattr(output, "final_status", None)
+    reported = report.status if isinstance(report, FinalStatus) else None
+    if status != "completed" or reported not in ("blocked", "failed"):
+        return status, blocker, None
+    status = "blocked"
+    reason = report.reason or f"Step reported {reported}"
+    return status, blocker or reason, None if "result" in parsed else reason
 
 
 class StepDispatcher:
@@ -240,6 +269,9 @@ class StepDispatcher:
             mcp_config=step_mcp_config,
             disallowed_tools=step_disallowed,
             working_dir=working_dir,
+            # A step denied what it needed usually still exits cleanly and
+            # reports nothing, which read as completed (cc/final_status.py).
+            report_status=True,
         )
 
         api_call_site_id = None
@@ -338,16 +370,18 @@ class StepDispatcher:
                 )
             if decision.mode == "api" and decision.output is not None:
                 parsed = _dispatch.parse_step_output(decision.output.text)
+                # Same rule as the CLI path; an API output carries no report today.
+                status, blocker, reason = _step_status(parsed, decision.output)
                 return StepResult(
                     idx=step_idx,
-                    status=parsed.get("status", "completed"),
-                    result=parsed.get("result", decision.output.text[:500]),
+                    status=status,
+                    result=reason or parsed.get("result", decision.output.text[:500]),
                     cost_usd=decision.output.cost_usd,
                     session_id=decision.output.session_id,
                     model_used=decision.output.model_used,
                     duration_s=0.0,
                     artifacts=parsed.get("artifacts", []),
-                    blocker_description=parsed.get("blocker_description"),
+                    blocker_description=blocker,
                 )
 
         start = time.monotonic()
@@ -367,17 +401,18 @@ class StepDispatcher:
 
         # Parse structured output from CC response
         parsed = _dispatch.parse_step_output(output.text)
+        status, blocker, reason = _step_status(parsed, output)
 
         return StepResult(
             idx=step_idx,
-            status=parsed.get("status", "completed"),
-            result=parsed.get("result", output.text[:500]),
+            status=status,
+            result=reason or parsed.get("result", output.text[:500]),
             cost_usd=output.cost_usd,
             session_id=output.session_id,
             model_used=output.model_used,
             duration_s=duration,
             artifacts=parsed.get("artifacts", []),
-            blocker_description=parsed.get("blocker_description"),
+            blocker_description=blocker,
         )
 
     async def try_workaround(

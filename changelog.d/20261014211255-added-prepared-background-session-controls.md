@@ -1,1 +1,0 @@
-- Machine connectors can now use prepared background-session receipts with explicit cancellation, bounded execution, private full results, and restart reconciliation. These native controls preserve existing tool and owner-approval boundaries and do not enable network access by themselves.

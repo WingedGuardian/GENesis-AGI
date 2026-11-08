@@ -7,11 +7,16 @@ tests reconstruct the hook's exact emit sequence — base reminder, then manifes
 through the same writer — from the REAL base string, lifted out of the hook by
 AST so the assertions track the text rather than a copy of it.
 
-THE DEFECT THIS LOCKS. The base reminder is ~6.4k characters, roughly two thirds
-of the harness's 10,000-character cap, before a single file is listed.
+THE DEFECT THIS LOCKS. The base reminder alone takes most of the harness's
+10,000-character cap before a single file is listed. Its exact size is not quoted
+here on purpose: it is a literal that grows with every prose edit to the hook, and
+a hand-copied figure went stale twice (#2398). The tests below lift the real
+string and compute it.
 `review_scope._MAX_LISTED_FILES` caps the manifest's COUNT, not its characters.
-MEASURED against this repo's real tracked paths: 50 median-length paths reach
-9,030 total and 50 of the longest reach 10,961 — over by 961. Over the cap the harness
+MEASURED 2026-09, when the reminder was about 6.4k characters, against this repo's
+real tracked paths: 50 median-length paths reached 9,030 total and 50 of the
+longest reached 10,961, over by 961. The reminder has grown since, so today's
+margin is smaller still. Over the cap the harness
 files the WHOLE block and shows a ~2 KB preview, so an unbounded manifest does
 not cost the manifest, it costs the mandatory reminder.
 

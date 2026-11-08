@@ -212,8 +212,8 @@ async def test_project_allowlists_only_registered_genesis_tools() -> None:
     root = Path(__file__).resolve().parents[2]
     servers = tomllib.loads((root / ".codex" / "config.toml").read_text())["mcp_servers"]
     registered = {
-        "genesis-health": set(await health_mcp.get_tools()),
-        "genesis-memory": set(await memory_mcp.get_tools()),
+        "genesis-health": set({tool.name: tool for tool in await health_mcp.list_tools()}),
+        "genesis-memory": set({tool.name: tool for tool in await memory_mcp.list_tools()}),
     }
 
     for server_name, tools in registered.items():

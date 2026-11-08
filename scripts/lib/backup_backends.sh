@@ -70,6 +70,8 @@ _BACKEND_LOCAL_ROOT=""  # local: root directory
 _BACKEND_CTL_TIMEOUT="${GENESIS_BACKUP_CTL_TIMEOUT:-60}"
 _BACKEND_XFER_TIMEOUT="${GENESIS_BACKUP_XFER_TIMEOUT:-1800}"
 _BACKEND_DEL_TIMEOUT="${GENESIS_BACKUP_DEL_TIMEOUT:-600}"
+# shellcheck source=scripts/lib/gnu_timeout.sh
+. "$(dirname "${BASH_SOURCE[0]}")/gnu_timeout.sh"
 # `-k 10`: if the op ignores/blocks SIGTERM at the deadline, SIGKILL it 10s
 # later. (A truly uninterruptible D-state mount wait survives even SIGKILL
 # until the kernel IO returns — no userland timeout can escape that; the -k

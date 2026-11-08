@@ -57,6 +57,7 @@ async def test_delivered_finding_is_closed_not_relisted():
         gen = MorningReportGenerator.__new__(MorningReportGenerator)
         gen._db = db
         gen._pending_surface_ids = []
+        gen._pending_persisting_ids = []
         gen._pending_mq_ids = ["mq-1"]
         await gen.confirm_delivery()
 

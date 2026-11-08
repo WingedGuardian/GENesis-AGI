@@ -2394,10 +2394,11 @@
         },
 
         async dismissUpdate() {
-          // A record that still guards unactivated code: dismissing it lets
+          // A record that still guards (unactivated code, a half-written
+          // checkout, or a record that cannot be read): dismissing it lets
           // code-only deploys and the live engine restart onto the checkout.
           if (this.updateProgress?.guards && !(await this.showConfirm("Dismiss update record",
-            "An earlier update merged code it has not activated (or its record cannot be read).\n\nDismissing it lets code-only deploys restart onto the checkout as it stands. Dismiss anyway?"))) return;
+            "An earlier update has not finished: it merged code it has not activated, left the checkout half-written (on live, scripts/deploy_candidates repair-move puts that back; Dismiss does not), or its record cannot be read.\n\nDismissing it lets code-only deploys restart onto the checkout as it stands. Dismiss anyway?"))) return;
           try {
             await fetchApi("/api/genesis/updates/dismiss", { method: "POST" });
             this.updateProgress = {};
@@ -3313,11 +3314,14 @@
               headers: {'Content-Type': 'application/json'},
               body: JSON.stringify({ action }),
             });
-            if (resp && resp.ok) {
-              await this.fetchSchedulerData();
+            const data = resp ? await resp.json() : null;
+            if (!resp?.ok || data?.success !== true) {
+              alert(data?.error || "User job action failed. Check the current job status and retry.");
             }
           } catch (e) {
-            console.warn("User job action failed:", e);
+            alert("User job action failed. Check the current job status and retry.");
+          } finally {
+            await this.fetchSchedulerData();
           }
         },
 

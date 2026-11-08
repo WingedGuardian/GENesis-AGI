@@ -1,1 +1,0 @@
-- Send peer API outage and recovery notices through Telegram, preserving incidents across restarts and keeping deliberate disablement quiet.

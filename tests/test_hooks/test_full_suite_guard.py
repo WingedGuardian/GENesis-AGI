@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shlex
 import subprocess
 import sys
 import time
@@ -123,6 +124,11 @@ class TestEndToEnd:
 
     def test_chained_full_suite_blocks(self):
         assert _run_guard("ruff check . && pytest -q").returncode == 2
+
+    def test_nested_pytest_mention_blocks_but_targeted_control_is_allowed(self):
+        hidden = "bash -c " + shlex.quote("echo ok # don't\npytest -q")
+        assert _run_guard(hidden).returncode == 2
+        assert _run_guard("pytest tests/test_hooks/test_full_suite_guard.py").returncode == 0
 
     # --- allowed: targeted runs ---
     def test_specific_file_allowed(self):

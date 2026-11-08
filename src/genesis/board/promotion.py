@@ -319,19 +319,41 @@ async def log_refusal(db, now: str | None, reason: str, detail: dict) -> None:
 
 
 def _scan_refusal(scan) -> dict:
-    """Line + scanner only — never the matched text or the scanner's message."""
+    """Line + scanner only — never the matched text or the scanner's message.
+
+    A refusal caused by the scanner's own state (a fingerprint file that is
+    missing or unreadable) names that state, since no rewrite of the draft can
+    clear it; those details are fixed sentinels, never scanned content.
+    """
     from genesis.contribution.findings import Severity
 
+    blocking = [f for f in scan.findings if f.severity == Severity.BLOCK]
     hits = sorted(
-        {(f.line, f.scanner) for f in scan.findings if f.severity == Severity.BLOCK},
+        {(f.line, f.scanner) for f in blocking},
         key=lambda t: (t[0] or 0, t[1] or ""),
     )
-    return {
+    environment = sorted(
+        {f.detail for f in blocking if f.file is None and f.detail in _SCANNER_STATE_DETAILS}
+    )
+    refusal = {
         "status": "blocked",
         "reason": "privacy scan refused the draft; rewrite the flagged lines",
         "findings": [{"line": line, "scanner": scanner} for line, scanner in hits],
         "scanners_run": scan.scanners_run,
     }
+    if environment:
+        refusal["reason"] = (
+            "privacy scan could not run in full here (" + ", ".join(environment) + "); "
+            "repair or regenerate the release fingerprint file, then retry"
+        )
+        refusal["environment"] = environment
+    return refusal
+
+
+#: Findings whose ``detail`` describes the scanner's own state, not the draft.
+_SCANNER_STATE_DETAILS = frozenset(
+    {"missing_fingerprint_file", "unreadable_fingerprint_file", "empty_fingerprint_file"}
+)
 
 
 async def propose(

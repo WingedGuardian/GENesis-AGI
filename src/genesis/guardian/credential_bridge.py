@@ -306,6 +306,16 @@ def load_backup_passphrase(
         return {}
 
 
+def _is_vault_archive(rel: Path) -> bool:
+    """The card vault's archives (scripts/lib/payment_vault_backup.sh): kept off the
+    host mirror (owner ruling). The mirror sits beside the escrowed backup
+    passphrase, and the vault's key has no passphrase of its own, so a mirrored
+    archive would be readable by anything that reads that directory. The
+    private backup repo still carries them; after a host-only restore the card
+    is added again with `vault add`."""
+    return rel.parent == Path("creds") and rel.name.startswith("payment_vault.")
+
+
 def mirror_credential_backup(
     shared_dir: Path | None = None,
     backup_dir: Path | None = None,
@@ -340,11 +350,21 @@ def mirror_credential_backup(
         if not base.is_dir():
             continue
         for f in base.rglob("*.gpg"):
-            if f.is_file():
+            if f.is_file() and not _is_vault_archive(f.relative_to(src_root)):
                 src_files[f.relative_to(src_root)] = f
 
     if not src_files:
         logger.debug("Backup clone %s has no encrypted creds to mirror", src_root)
+        # A vault archive mirrored before the exclusion still goes, even when the
+        # vault is all the clone holds; the rest of the mirror is left as it was.
+        old = shared_base / _CREDS_SUBDIR / _MIRROR_SUBDIR
+        if old.is_dir() and not old.is_symlink():
+            keep = {
+                f.relative_to(old)
+                for f in old.rglob("*")
+                if f.is_file() and not _is_vault_archive(f.relative_to(old))
+            }
+            _prune_to_keep(old, keep)
         return None
 
     dest_root = shared_base / _CREDS_SUBDIR / _MIRROR_SUBDIR

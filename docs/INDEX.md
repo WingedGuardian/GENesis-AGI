@@ -48,7 +48,7 @@ the internals well enough to modify them.
 - [Memory Collections](architecture/genesis-v3-memory-collections.md) —
   Episodic and knowledge memory architecture (SQLite + Qdrant).
 - [Model Routing Registry](architecture/genesis-v3-model-routing-registry.md) —
-  Which model handles which task, and why.
+  The design reasoning behind model assignments, as of March 2026 (`config/model_routing.yaml` is authoritative).
 - [Procedure Activation](architecture/genesis-v3-procedure-activation.md) —
   How learned procedures are stored, recalled, and applied.
 - [Capability Layer](architecture/genesis-v3-capability-layer-addendum.md) —

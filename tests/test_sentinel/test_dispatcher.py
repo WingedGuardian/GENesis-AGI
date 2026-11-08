@@ -1404,3 +1404,120 @@ class TestDegradedMcpConfig:
         # Control: non-degraded round-trips as False.
         r2 = SentinelResult(dispatched=True, degraded=False)
         assert _deserialize_result(_serialize_result(r2)).degraded is False
+
+
+class TestAlarmClearedHysteresis:
+    """A parked approval is cancelled as ``alarm_cleared`` only after its alarm
+    has been ABSENT for ``_ALARM_CLEAR_TICKS`` consecutive ticks, and that cancel
+    starts the same re-dispatch cooldown as a resolved dispatch. Origin: a
+    memory alarm hovering at its threshold parked a Tier-2 request, cancelled it
+    on the first tick it dipped, and re-requested shortly after (approval churn).
+    """
+
+    _ALARM = "infra:container_memory_high"
+
+    def _parked(self, state=SentinelState.AWAITING_DISPATCH_APPROVAL, request_id="req-park-1"):
+        import json
+
+        gate = MagicMock()
+        gate.resolve_request = AsyncMock()
+        d = _make_dispatcher(approval_gate=gate)
+        d._state.started_at = "2020-01-01T00:00:00+00:00"
+        d._state.pending_request_id = request_id
+        d._state.pending_policy_id = (
+            "sentinel_dispatch" if state == SentinelState.AWAITING_DISPATCH_APPROVAL else "sentinel_action"
+        )
+        d._state.pending_pattern = self._ALARM
+        d._state.pending_request_json = json.dumps(
+            {"alarms": [{"alert_id": self._ALARM, "tier": 2, "severity": "critical", "message": "mem"}]}
+        )
+        d._state.transition(state, reason="test setup")
+        return d, gate
+
+    async def _ticks(self, d, sequence):
+        on = [{"id": self._ALARM, "severity": "CRITICAL", "message": "mem"}]
+        calls = [on if present else [] for present in sequence]
+
+        async def _alerts(*args, **kwargs):
+            return calls.pop(0)
+
+        with patch("genesis.mcp.health_mcp._impl_health_alerts", new=_alerts), \
+             patch("genesis.sentinel.dispatcher.write_last_run"), \
+             patch("genesis.sentinel.dispatcher.write_state_for_guardian"), \
+             patch("genesis.sentinel.dispatcher.append_log"):
+            for _ in sequence:
+                await d.check_fire_alarms()
+        assert calls == []  # every scripted tick was consumed
+
+    def test_clear_ticks_constant_is_two_and_fits_the_ring(self):
+        import genesis.sentinel.dispatcher as mod
+
+        assert mod._ALARM_CLEAR_TICKS == 2
+        # The streak is read from the ring buffer, so it cannot be longer than it.
+        assert mod._ALARM_CLEAR_TICKS <= mod._ALARM_RING_SIZE
+
+    @pytest.mark.asyncio
+    async def test_one_absent_tick_keeps_the_park(self):
+        d, gate = self._parked()
+        await self._ticks(d, [False])
+        assert d._state.state == SentinelState.AWAITING_DISPATCH_APPROVAL
+        gate.resolve_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_two_absent_ticks_cancel_and_start_cooldown(self):
+        d, gate = self._parked()
+        await self._ticks(d, [False, False])
+        assert d._state.state == SentinelState.HEALTHY
+        gate.resolve_request.assert_awaited_once_with(
+            "req-park-1", decision="cancelled", resolved_by="alarm_cleared",
+        )
+        ready, reason = d._backoff_ready(self._ALARM)
+        assert ready is False and "cooldown" in reason
+
+    @pytest.mark.asyncio
+    async def test_absent_ticks_must_be_consecutive(self):
+        """absent, present, absent: the reappearance resets the count."""
+        d, gate = self._parked()
+        await self._ticks(d, [False, True, False])
+        assert d._state.state == SentinelState.AWAITING_DISPATCH_APPROVAL
+        gate.resolve_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_action_approval_park_uses_the_same_hysteresis(self):
+        d, gate = self._parked(state=SentinelState.AWAITING_ACTION_APPROVAL)
+        await self._ticks(d, [False])
+        assert d._state.state == SentinelState.AWAITING_ACTION_APPROVAL
+        gate.resolve_request.assert_not_awaited()
+        await self._ticks(d, [False])
+        assert d._state.state == SentinelState.HEALTHY
+        gate.resolve_request.assert_awaited_once()
+        ready, reason = d._backoff_ready(self._ALARM)
+        assert ready is False and "cooldown" in reason
+
+    @pytest.mark.asyncio
+    async def test_ticks_where_the_alarm_was_present_do_not_count(self):
+        """The real flow: the park happened on ticks where the alarm was firing.
+        Those ticks sit in the ring; only the absent ticks after them count."""
+        d, gate = self._parked()
+        d._recent_alarm_sets.extend([{self._ALARM}, {self._ALARM}])
+        await self._ticks(d, [False])
+        assert d._state.state == SentinelState.AWAITING_DISPATCH_APPROVAL
+        gate.resolve_request.assert_not_awaited()
+        await self._ticks(d, [False])
+        assert d._state.state == SentinelState.HEALTHY
+        gate.resolve_request.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_direct_park_keeps_its_old_behaviour_and_gets_no_cooldown(self):
+        """An alarm-less park (escalate_direct, a Guardian concern) has pattern
+        "direct:<source>". Its cancel path is unchanged — first tick, no
+        hysteresis — and it must NOT start a cooldown that would refuse the
+        next escalation from that source."""
+        d, gate = self._parked()
+        d._state.pending_pattern = "direct:guardian_dialogue"
+        d._state.pending_request_json = '{"alarms": []}'
+        await self._ticks(d, [False])
+        assert d._state.state == SentinelState.HEALTHY
+        gate.resolve_request.assert_awaited_once()
+        ready, _reason = d._backoff_ready("direct:guardian_dialogue")
+        assert ready is True

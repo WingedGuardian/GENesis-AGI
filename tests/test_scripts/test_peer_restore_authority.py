@@ -9,6 +9,7 @@ import pytest
 
 from genesis.db.crud.peer_restore import RestoreAuthorityError, reset_peer_authority
 from tests.test_scripts import test_restore_safety as restore
+from tests.test_scripts._update_source import update_text
 
 ROOT = Path(__file__).resolve().parents[2]
 sandbox = restore.sandbox
@@ -24,13 +25,26 @@ INSERT INTO peer_tasks VALUES('muse','old-epoch','running');
 """
 
 
+def _contents(db):
+    """Every schema row and every row of each plain table. Not ``iterdump``: on
+    Python 3.13 and 3.14 it runs a foreign key check, which a virtual table standing
+    in for a referenced one fails with a mismatch."""
+    schema = db.execute("SELECT type,name,sql FROM sqlite_master ORDER BY type,name").fetchall()
+    rows = {
+        name: db.execute(f'SELECT * FROM "{name}"').fetchall()  # noqa: S608 - names from sqlite_master
+        for kind, name, sql in schema
+        if kind == "table"
+    }
+    return schema, rows
+
+
 def _seed(path, sql=SCHEMA):
     with sqlite3.connect(path) as db:
         db.executescript(sql)
     return path
 
 
-def _assert_reset(path):
+def _assert_reset(path, journal="delete"):
     with sqlite3.connect(path) as db:
         assert db.execute("SELECT mode FROM peer_settings").fetchall() == [("disabled",)]
         assert db.execute("SELECT * FROM peer_grants").fetchall() == []
@@ -46,7 +60,7 @@ def _assert_reset(path):
             "realm",
             "https://peer.example",
         )
-        assert db.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+        assert db.execute("PRAGMA journal_mode").fetchone() == (journal,)
 
 
 @pytest.mark.parametrize("mode", ["disabled", "fallback", "sam"])
@@ -93,11 +107,11 @@ def test_legacy_and_uri_path_and_missing_file(tmp_path):
 def test_incompatible_or_failed_reset_rolls_back(tmp_path, mutation):
     path = _seed(tmp_path / "candidate.db", SCHEMA + mutation)
     with sqlite3.connect(path) as db:
-        before = list(db.iterdump())
+        before = _contents(db)
     with pytest.raises((RestoreAuthorityError, sqlite3.Error)):
         reset_peer_authority(path)
     with sqlite3.connect(path) as db:
-        assert list(db.iterdump()) == before
+        assert _contents(db) == before
 
 
 @pytest.mark.parametrize(
@@ -134,11 +148,11 @@ def test_collateral_effects_refuse_without_changing_any_rows(tmp_path, mutation)
         "INSERT INTO unrelated VALUES(42);" + mutation,
     )
     with sqlite3.connect(path) as db:
-        before = list(db.iterdump())
+        before = _contents(db)
     with pytest.raises(sqlite3.DatabaseError):
         reset_peer_authority(path)
     with sqlite3.connect(path) as db:
-        assert list(db.iterdump()) == before
+        assert _contents(db) == before
 
 
 @pytest.mark.parametrize(
@@ -151,11 +165,11 @@ def test_required_virtual_tables_are_refused(tmp_path, table, columns):
         SCHEMA + f"DROP TABLE {table}; CREATE VIRTUAL TABLE {table} USING fts5({columns});",
     )
     with sqlite3.connect(path) as db:
-        before = list(db.iterdump())
+        before = _contents(db)
     with pytest.raises(RestoreAuthorityError):
         reset_peer_authority(path)
     with sqlite3.connect(path) as db:
-        assert list(db.iterdump()) == before
+        assert _contents(db) == before
 
 
 def test_unrelated_triggers_and_foreign_keys_remain_compatible(tmp_path):
@@ -263,7 +277,7 @@ def test_refusal_or_dry_run_preserves_live_and_does_not_stop(sandbox, monkeypatc
 
 @pytest.mark.parametrize("compatible", [True, False])
 def test_update_prepares_guarded_snapshot_before_stop(tmp_path, compatible):
-    source = (ROOT / "scripts/update.sh").read_text()
+    source = update_text()
     block = source[
         source.index('DB_FILE="$GENESIS_ROOT/data/genesis.db"') : source.index(
             "# ── Stop services for update"
@@ -281,6 +295,9 @@ def test_update_prepares_guarded_snapshot_before_stop(tmp_path, compatible):
         # The window also holds the staged-excused pre-stop guard (normal,
         # non --post-merge path); it reads git state and has its own tests.
         'POST_MERGE=false\n_staged_excused_divergence_guard() { :; }\n'
+        # The window also records the venv's packages (tested in
+        # test_update_deps_restore.py); no venv exists here.
+        "ROLLBACK_TAG=pre-update-test\nVENV_DIR=/nonexistent\ncapture_venv_state() { return 1; }\n"
         # update.sh reads the authority check's source at its start.
         + f'_PEER_RESTORE_PY="$(cat "{ROOT / "src/genesis/db/crud/peer_restore.py"}")"\n'
         + block
@@ -315,12 +332,18 @@ def test_cli_refusal_has_fixed_diagnostics(tmp_path):
 
 @pytest.mark.parametrize("candidate_present", [True, False])
 def test_rollback_to_old_code_consumes_only_guarded_candidate(tmp_path, candidate_present):
-    source = (ROOT / "scripts/update.sh").read_text()
+    source = update_text()
     marker = source.index("# BEGIN rollback-db-decision")
     decision = source[
         source.index("\n", marker) + 1 : source.index("# END rollback-db-decision", marker)
     ]
-    start = source.index("    genesis_checkout_unlock\n", source.index("_do_rollback() {"))
+    restore_marker = source.index("# BEGIN db-restore-through-sqlite")
+    restore_fn = source[
+        source.index("\n", restore_marker) + 1 : source.index(
+            "# END db-restore-through-sqlite", restore_marker
+        )
+    ]
+    start = source.index("    genesis_checkout_unlock\n", source.index("_rollback_body() {"))
     restart = source[start : source.index('\n    if [ "$checkout_ok"', start)]
     live = _seed(tmp_path / "genesis.db", "CREATE TABLE migrated(x);")
     raw = _seed(tmp_path / "genesis.db.pre-update")
@@ -331,10 +354,12 @@ def test_rollback_to_old_code_consumes_only_guarded_candidate(tmp_path, candidat
     # Rolled-back checkout has no helper; the real rollback branch needs none.
     script = tmp_path / "old-code-rollback.sh"
     script.write_text(
-        'set -euo pipefail\nDB_FILE="$1"\nMIGRATIONS_RAN=1\nDB_SNAPSHOT_TAKEN=1\n'
+        'set -euo pipefail\nDB_FILE="$1"\nDB_RESTORE_OWED=1\nDB_SNAPSHOT_TAKEN=1\n'
         "code_action=none\ncode_kept=false\nserver_down=true\nrestart_ok=true\n"
         "WERE_RUNNING=(genesis-server)\ngenesis_checkout_unlock() { :; }\n"
-        "_start_genesis_server() { echo STARTED; }\nrun() {\n"
+        "_start_genesis_server() { echo STARTED; }\n"
+        + restore_fn
+        + "run() {\n"
         + decision
         + restart
         + '\nprintf "DB_OK=%s\\n" "$db_ok"\n}\nrun\n'
@@ -344,7 +369,9 @@ def test_rollback_to_old_code_consumes_only_guarded_candidate(tmp_path, candidat
     assert ("STARTED" in result.stdout) == candidate_present
     assert f"DB_OK={'true' if candidate_present else 'false'}" in result.stdout
     if candidate_present:
-        _assert_reset(live)
+        # The restore writes into the live file through SQLite, which switches it
+        # to WAL first: a rollback-journal live file is what readers locked out.
+        _assert_reset(live, journal="wal")
     else:
         with sqlite3.connect(live) as db:
             assert db.execute("SELECT name FROM sqlite_schema").fetchall() == [("migrated",)]

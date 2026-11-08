@@ -17,7 +17,17 @@ Adapted from superpowers `test-driven-development`, scoped to where it pays:
   broken assertion — before its green is trusted. A test that has only ever
   passed may be testing nothing; a whole suite passing every review round
   while a reviewer keeps finding real spec bugs is the tell that the tests
-  encode the same wrong spec as the code.
+  encode the same wrong spec as the code. `scripts/ci/mutation_sweep.py` does
+  this as a library: it mutates a private copy, so the sweep never writes your
+  working tree (a test it runs still can), and the `mutation-gate` CI job runs `config/mutation_gate.json`. To
+  pin a guard, add a case there: a label, the target, an anchor that matches
+  once, the replacement, the file's validator, the test that must catch it, and
+  why. BIT means pass, fail, pass
+  on a run that opened the target. A module-level import counts as opened, so a
+  BIT still does not prove the test exercised the code.
+  `config/gate_defects.json` is the merge gate's own defect corpus, run with
+  `--rung-report`, which says which rung of the gate's tests noticed each break.
+  There a miss is a finding, not a failure.
 - **Verify-RED of a safety fence runs the test UNFENCED.** Removing a guard,
   stub or sandbox to watch its test fail means whatever the test executes
   reaches the real system for that run. Read the test first and make its probe
@@ -99,7 +109,7 @@ git add <files>                                   # STAGE FIRST — mark hashes 
 python3 scripts/review_state.py mark              # INTERNAL genesis-architect audit — plain mark, never counts
 git commit -F <msg-file>                          # bare, not piped (see below)
 # (a non-Anthropic cross-model round would instead be: mark --source external --defects|--clean)
-git push -u origin HEAD && gh pr create --title "..." --body-file <file>   # first push: ONE command (approve the dialog)
+git push -u origin HEAD && gh pr create --title "..." --body-file <file>   # first push: ONE command (approve the dialog); needs a finished reviewer of this branch in this session (build-session, "a PR opens only after an independent review")
 gh pr comment <N> --body "@codex review"          # after EVERY subsequent push
 python3 scripts/hooks/git_push_guard.py --check-pr <N>
 gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --check-pr
@@ -123,11 +133,17 @@ gh pr merge <N> --squash --admin --match-head-commit <head>   # verbatim from --
 ### Sigils, chained commits and worktree removal
 
 - **Ack sigils bind per-guard, and mostly to the LAST pipeline segment.**
-  `git commit ... | tail  # audit-ack` puts the ack on `tail`. Run the commit
+  `git commit ... | tail  # depth-ack` puts the ack on `tail`. Run the commit
   bare. Some guards accept a sigil on any segment, others only on the offending
   one — do not generalise from one guard's behaviour.
 - **Sigils must lead the trailing comment.** The override is read from the
-  leading run of recognised tokens, so `# see audit-ack notes` overrides nothing.
+  leading run of recognised tokens, so `# see depth-ack notes` overrides nothing.
+  The retired `# audit-ack` and `# escalation-ack` are no longer recognised, so
+  writing one FIRST ends the run: `# audit-ack depth-ack` waives nothing. Drop them.
+  Put several sigils in ONE comment: `# stale-review-override scheduled-review-override`.
+  In `# stale-review-override # scheduled-review-override` the second `#` is a
+  token the parser does not recognise, so it ends the run and only the first
+  sigil applies (`scripts/hooks/shell_parse.py` `_has_trailing_override`).
 - **`--no-verify` is blocked before any override is even considered.** There is
   no way to skip the native hooks; fix the cause.
 - **Chained commits are heavily restricted** — across worktrees, blocked
@@ -264,7 +280,10 @@ Verify before any commit:
   and says so. `preflight` checks without running. It is not a way around the
   full-suite rule: test targets must still be named, and do not count on the
   full-suite guard to see inside the wrapper. Guide:
-  `docs/reference/resource-budget.md`.
+  `docs/reference/resource-budget.md`. An ad-hoc `systemd-run` launch must pass
+  `--collect` (or go through `genesis.hostmetrics run`, which does), because a
+  failed transient unit is otherwise never unloaded and they pile up in the
+  failed list.
 - **Deleting user or project data goes through the trash, not `rm`.** A file or
   directory you did not create in this session (memory and plans, config, a
   deliverable, notes) goes to `… -m genesis.trash put PATH --reason R`, which

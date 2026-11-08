@@ -119,6 +119,14 @@ REFUSAL_FILES = (
     "scripts/lib/deploy_status.sh",
     "scripts/lib/live_system_guard.sh",
     "scripts/lib/checkout_lock.sh",
+    # The shared-MCP unit restarts, sourced at startup, and the helper it reads
+    # with `cat` when sourced.
+    "scripts/lib/shared_mcp_units.sh",
+    "scripts/lib/mcp_rollout.py",
+    # The package record and restore helpers, sourced by update.sh at startup.
+    "scripts/lib/venv_setup.sh",
+    # The rollback and the service helpers it needs, also sourced at startup.
+    "scripts/lib/update_rollback.sh",
     # Read with `cat` before the branch check and run as python later: the
     # serving read runs inside `deploy_code_only.sh status`, which readiness runs.
     "scripts/lib/serving_commit.py",
@@ -136,6 +144,9 @@ REFUSAL_FILES = (
     # engine loads for its own move refusal, and the dashboard loads (#3139).
     "scripts/lib/update_state_guard.py",
     "src/genesis/dashboard/routes/updates.py",
+    # The stale index.lock retirement both scripts run by path before they
+    # write the index (#3792).
+    "scripts/lib/stale_index_lock.py",
     # PR C's file: readiness reads it from the server's base, and it will hold
     # bootstrap's crash-recovery branch guard.
     PR_C_MARKER,

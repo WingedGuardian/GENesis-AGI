@@ -92,6 +92,16 @@ async def finish_acquisition_logging():
 
     with pinned.private_logs():
         await asyncio.wait_for(GLOBAL_LOGGING_WORKER.flush(), timeout=10)
+        # The worker is process-global, and an earlier test's closed loop can
+        # still own its tasks. Those cannot be awaited from this one, and
+        # gather refuses them from Python 3.14.
+        loop = asyncio.get_running_loop()
+        worker = GLOBAL_LOGGING_WORKER._worker_task
+        if worker is not None and worker.get_loop() is not loop:
+            GLOBAL_LOGGING_WORKER._worker_task = None
+        GLOBAL_LOGGING_WORKER._running_tasks = {
+            task for task in GLOBAL_LOGGING_WORKER._running_tasks if task.get_loop() is loop
+        }
         await GLOBAL_LOGGING_WORKER.stop()
 
 

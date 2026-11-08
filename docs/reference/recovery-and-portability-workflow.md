@@ -76,8 +76,38 @@ a runtime that started disabled also requires a restart to enable execution.
 
 Update prepares a separate, guarded `.pre-update.peer-restore` candidate before
 stopping services or changing code, retaining the original `.pre-update` snapshot.
-Migration rollback uses the guarded candidate; an incomplete database rollback
-does not explicitly restart services. External watchdog recovery is unchanged.
+A rollback restores from the guarded candidate only when the update changed the
+database: the candidate and the live database are compared on their schema
+(DDL), `user_version` and applied migrations, and any difference, or a
+comparison that cannot run, restores it. When nothing differs the database is
+kept, with the writes made since the snapshot. Data migrations are not part of
+the comparison. The restore itself goes through SQLite's backup API into the
+live file, never a file copy: Claude Code MCP servers keep the database open
+while services are down, and a copy underneath them leaves a file the restarted
+server cannot open for writing. Readers stay attached and see the restored data
+on their next transaction; nothing is terminated. It is bounded (600 s,
+`GENESIS_UPDATE_DB_RESTORE_TIMEOUT_S`), refuses without enough free disk for a
+WAL the size of the database, and a restore stopped before it commits leaves the
+live database unchanged. The rollback report says which happened: not restored,
+restored, or restored but not verified. An incomplete database rollback does not explicitly restart
+services. External watchdog recovery is unchanged.
+
+Update also records the venv's installed packages before it changes anything
+(`~/.genesis/update-deps/<rollback tag>.json`, written only when the venv imports
+Genesis), with a copy of the helper scripts the restore runs beside it
+(`<rollback tag>.lib/`), since by then the checkout is back at the old tag. A rollback restores exactly that set: it removes what the update
+added, reinstalls the recorded versions without resolving, repairs any package
+whose files the removals deleted, and succeeds only when the installed set
+matches the record and Genesis imports. The checkout's own editable install is
+recorded by name only and re-pointed at the rolled-back checkout, never pinned
+to a version. Without a record it falls back to reinstalling the old checkout,
+which must then also import. A version no longer in the package index or pip's
+cache cannot be restored offline: the rollback reports itself incomplete, keeps
+the record (`disk_hygiene.sh` removes it after 30 days) and re-resolves the old
+version ranges as salvage, so the restarted services get the best set
+available. The restore waits at most 600 s for a browser provisioning run's
+lock, since the services are stopped meanwhile. A `--post-merge` run keeps the
+record the conflicted run took before its merge.
 
 Guardian whole-container snapshot rollback is different: its existing second
 approval prompt warns that saved peer permissions, jobs and consent return.
@@ -333,8 +363,11 @@ retired cards or replace a newer key. Placement, on a box with no vault:
 1. confirm `~/.genesis/payment_vault` does not exist;
 2. `systemctl --user stop genesis-server`;
 3. `mv -T ~/.genesis/restore-creds/payment_vault ~/.genesis/payment_vault`;
-4. start the server and run `python -m genesis vault unlock`; a successful
-   unlock proves the passphrase and the key match.
+4. start the server and run `python -m genesis vault status`: "key loaded"
+   proves the key and the cards match. An archive made before the vault's
+   migration holds the sealed `identity.age`; such a vault asks for `python -m
+   genesis vault migrate` once, with the old vault passphrase (keep it while such
+   archives exist).
 
 Backup states (`payment_vault` in `backup_status.json`): `ok`; `absent` (no
 vault); `skipped` (not attempted: no backup passphrase, or the run stopped first); `failed` (the vault exists but no fresh
@@ -350,8 +383,13 @@ Every version stays in the backups repo's git history. The host mirror holds the
 current archive, and the host archive keeps the newest copy of each file name and
 never deletes one, so a retired vault's last archive stays on the host; a restore
 that falls back to it says so, because it may be a vault since retired. Both sit next to the
-escrowed backup passphrase, so on the host only the vault passphrase protects the
-card details. The mirror fallback is all-or-nothing: when the Tier-1 clone has
+escrowed backup passphrase. The vault has no passphrase of its own any more
+(owner ruling a4a95392), so its archive is NOT mirrored to the host
+(`credential_bridge._is_vault_archive`): it lives only in the backup repo and
+the off-site snapshots, gpg-encrypted. After a host-only restore there is no
+vault to stage: add the card again with `python -m genesis vault add`. Copies
+the host mirror and archive took before this change hold the key still sealed
+under the old vault passphrase. The mirror fallback is all-or-nothing: when the Tier-1 clone has
 any credential payload, restore reads the clone alone, which is the newer copy.
 
 The guardian also emits a WARNING if the mirror goes stale (its newest

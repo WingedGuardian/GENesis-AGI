@@ -1,0 +1,1 @@
+- A plan that names repo files can no longer leave plan mode without a `## Premise checks` section answering the six plan-time premise questions. It blocks until the section exists and every answer is filled in (`n/a — <reason>` counts). Plans that name no repo paths, such as research or errand plans, are unaffected.

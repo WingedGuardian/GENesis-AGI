@@ -9,6 +9,10 @@ import pytest
 
 from genesis.observability.health_data import HealthDataService
 
+# The health snapshot's deploy section would run the real deploy engine
+# (see the deploy_engine_unanswered fixture in tests/conftest.py).
+pytestmark = pytest.mark.usefixtures("deploy_engine_unanswered")
+
 
 @pytest.fixture
 def mock_db():
