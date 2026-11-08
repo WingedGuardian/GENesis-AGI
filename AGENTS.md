@@ -286,6 +286,7 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 - **linkedin-hook-writer** (`src/genesis/skills/linkedin-hook-writer/SKILL.md`) — This skill should be used when the user asks to "write a hook for my post", "give me opening lines", "help me start this LinkedIn post", "I need a better opener", or when the linkedin-post-writer skill needs strong opening options. Also triggered by "my posts aren't getting clicks" or "how do I get people to read my posts".
 - **linkedin-post-writer** (`src/genesis/skills/linkedin-post-writer/SKILL.md`) — This skill should be used when the user asks to "write a LinkedIn post", "draft a post about", "help me post on LinkedIn", "create LinkedIn content", or when Genesis proactively generates post ideas during surplus compute. Also triggered by content calendar execution or when the user shares a topic they want to write about.
 - **linkedin-profile-optimizer** (`src/genesis/skills/linkedin-profile-optimizer/SKILL.md`) — This skill should be used when the user asks to "optimize my LinkedIn profile", "update my LinkedIn headline", "rewrite my LinkedIn summary", "improve my LinkedIn about section", or when Genesis identifies that the user's profile doesn't align with their current goals or target audience.
+- **model-validation** (`src/genesis/skills/model-validation/SKILL.md`) — Qualify a Genesis routing model or compare a candidate against an incumbent using the isolated qualification runner, approved references and retained billing evidence. Use for model qualification and a qualification campaign; not ordinary routing edits, generic product comparisons or a request to select a model from advertised benchmarks.
 - **obstacle-resolution** (`src/genesis/skills/obstacle-resolution/SKILL.md`) — Resolve obstacles using fallback chains — use when an approach fails, a dependency is unavailable, an API returns errors, or a task is blocked and needs an alternative path forward
 - **onboarding** (`src/genesis/skills/onboarding/SKILL.md`) — First-run onboarding — guides new users through Genesis setup on their first CC session. Configures user profile, essential API keys, Telegram, GitHub backup, and service verification. Triggered automatically while the install is not yet FUNCTIONAL (the setup floor — Claude Code login + an LLM key + an embedding key — is unmet), not merely while ~/.genesis/setup-complete is absent. Re-runnable by asking Genesis to "run setup" or "reconfigure [section]".
 - **osint** (`src/genesis/skills/osint/SKILL.md`) — OSINT investigation — discover, track, and report on people, companies, and technologies
@@ -324,7 +325,7 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 - `browser_click` — Click an element on the current page by CSS selector or text.
 - `browser_collaborate` — Toggle collaborative timing mode.
 - `browser_fill` — Fill a form field on the current page.
-- `browser_fill_card` — Pay with a vault card on the Camoufox checkout page now open, after the owner approves this payment with a Telegram tap. Card values never reach you.
+- `browser_fill_card` — Pay with a vault card on the open Camoufox checkout after the owner's Telegram tap; fills in a separate window and clicks Pay itself. Card values never reach you. Usage and limits: the browser-automation skill, "Money".
 - `browser_navigate` — Navigate to a URL and return an accessibility tree snapshot.
 - `browser_press_key` — Press a keyboard key on the current page.
 - `browser_run_js` — Execute JavaScript in the browser's console on the current page.
@@ -402,7 +403,7 @@ Each entry gives the full path to the skill's instruction file. The filename is 
 - `outreach_poll` — Create a Discord poll via webhook. Returns JSON with message_id.
 - `outreach_preferences` — Get/set user channel preferences and quiet hours.
 - `outreach_queue` — List the 20 most recent SENT outreach messages, newest first.
-- `outreach_send` — Queue a message for delivery. Returns outreach_id.
+- `outreach_send` — Queue a message for delivery. Returns outreach_id or a queued status.
 - `outreach_send_and_wait` — Send a message and wait for user reply. Returns JSON with reply or timeout.
 - `provision_grow` — Grow this VM's or container's capacity — approval-gated.
 - `provision_vzdump` — Take a hypervisor backup (vzdump) of the host VM — approval-gated.
