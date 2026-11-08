@@ -1841,6 +1841,14 @@ the shared banner is not an assertion about all concurrent sessions.
   checks. Private runtime transport is not launch authority. The physical
   owner, monitor and recovery caller remain separate, and automatic readiness
   stays fenced.
+  The private CBM reporter consumes its bounded startup ACK before worker entry,
+  verifies its actual live parent and original scope, and rechecks ownership at
+  registration and native intent. Original counter baselines and fresh startup
+  OOM observations survive the handoff; either hierarchical or local sampled
+  kills refuse startup. The existing private output carries framed control
+  data, with provider output routed to logging. Watchdog/CPU/IO policy binds
+  the same source identity. Physical owner integration, GitNexus's runtime
+  adapter and native qualification remain separate gates.
   `index_marker_recovery.py` adds explicit transaction-only schema-5 storage,
   original-owner control completion, persistent provider holds and an exact
   terminal/control/source acceptance-watermark reader on the same queue.

@@ -55,6 +55,7 @@ SHELL = (
 )
 FILE_LIMIT = 1024 * 1024
 CAPSULE_LIMIT = 4 * FILE_LIMIT
+RUNTIME_ROLES = ('reporter',)
 SEALS = fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE
 # Read entry once BEFORE compiling its substantive code, register for dataclasses,
 # and retain its original origin. -I -S excludes caller imports and site hooks.
@@ -73,7 +74,12 @@ raise SystemExit(m.main(sys.argv[2:]))
 # preserve bytes, not producer trust. Helpers are assembled after full validation.
 RESUME_BOOTSTRAP = """import base64,fcntl,hashlib,importlib.util,json,os,pathlib,sys
 if fcntl.fcntl(0,fcntl.F_GET_SEALS)&15!=15: raise ValueError('unsealed source')
-n=os.fstat(0).st_size
+capsule=os.fstat(0)
+for fd in (1,2):
+ other=os.fstat(fd)
+ if (capsule.st_dev,capsule.st_ino)==(other.st_dev,other.st_ino):
+  raise ValueError('source capsule aliases a standard output')
+n=capsule.st_size
 if not 0<n<=4194304: raise ValueError('invalid source size')
 payload=os.pread(0,n,0)
 if len(payload)!=n or hashlib.sha256(payload).hexdigest()!=sys.argv[1]:
@@ -264,9 +270,11 @@ class Snapshot:
         return hashlib.sha256(self._payload()).hexdigest()
 
     def resume_command(self, action="describe", *arguments):
-        if action not in ("describe", "shell", "queue", "available"):
+        if action not in ("describe", "shell", "queue", "available", *RUNTIME_ROLES):
             raise ValueError("unsupported captured role")
-        if self._runtime_json is not None and action != "describe":
+        if action in RUNTIME_ROLES and (self._runtime_json is None or self.profile != 'runner'):
+            raise ValueError('executable role requires private runner runtime')
+        if self._runtime_json is not None and action not in ('describe', *RUNTIME_ROLES):
             raise ValueError("runtime capsule cannot use a source-only role")
         return [
             sys.executable,
@@ -437,7 +445,7 @@ def _runner_lock_fds():
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("describe", "shell", "queue", "available"))
+    parser.add_argument("action", choices=("describe", "shell", "queue", "available", *RUNTIME_ROLES))
     parser.add_argument("profile", choices=("entry", "runner"))
     parser.add_argument("arguments", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
@@ -451,8 +459,16 @@ def main(argv=None):
         captured = capture(Path(__file__).parents[2], args.profile, globals().get("_ENTRY_BYTES"))
     if args.profile != captured.profile:
         parser.error("captured profile differs from command")
-    if captured.runtime_value is not None and args.action != "describe":
+    if args.action in RUNTIME_ROLES and (captured.runtime_value is None or captured.profile != 'runner'):
+        parser.error('executable role requires private runner runtime')
+    if captured.runtime_value is not None and args.action not in ('describe', *RUNTIME_ROLES):
         parser.error("runtime capsule cannot use a source-only role")
+    if args.action == 'reporter':
+        if (len(args.arguments) != 1 or not args.arguments[0].isascii()
+                or not args.arguments[0].isdecimal()):
+            parser.error('reporter requires its startup descriptor')
+        modules = captured.assemble()
+        return modules['queued'].reporter(captured, modules, int(args.arguments[0]))
     if args.action == "shell":
         if not args.arguments:
             parser.error("shell role required")
