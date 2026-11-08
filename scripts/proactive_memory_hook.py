@@ -168,12 +168,6 @@ _METRICS_PATH = Path.home() / ".genesis" / "proactive_metrics.json"
 _MIN_KEYWORD_CHARS = 3
 _MAX_KEYWORD_CHARS = 32
 
-# Ceiling for one rendered [Code] hint line, and the floor below which clipping
-# the signature stops being worth it (clip the whole line instead). Derivation +
-# measured index: _render_code_hint.
-_MAX_CODE_HINT_CHARS = 400
-_MIN_CODE_SIG_CHARS = 16
-
 # Peers rendered in the [Concurrent] block. Each line is already bounded by its
 # per-field sanitize_detail limits — exactly 271 units at maximum width
 # (30 + 40 + 8 + 90 + 80 fields plus 23 of grammar), MEASURED by driving the
@@ -205,8 +199,8 @@ _MAX_PEERS_SHOWN = 12
 # NO MIRROR, deliberately — the one place this writer's contract is relaxed.
 # BoundedStdout asks callers to name a durable mirror because a cut destroys the
 # tail. Nothing here is an only copy: every block is a RENDERING of state that
-# outlives the cut (session_heartbeats rows, intent_trail.json, the memory store,
-# code_symbols). So a cut drops a view, not data, which makes it a selection
+# outlives the cut (session_heartbeats rows, intent_trail.json, the memory
+# store). So a cut drops a view, not data, which makes it a selection
 # rather than an amputation — and inventing a per-prompt mirror file would add a
 # new unbounded store, on the hottest path there is, to protect nothing.
 #: Headroom held back from `emit` so a cut can always be ANNOUNCED.
@@ -854,7 +848,7 @@ def _render_trail_line(labels: list[str]) -> str | None:
     budget for one metadata line.
 
     Measured in UTF-16 CODE UNITS, the unit the harness bills. ``len`` was wrong
-    here for the same reason it was wrong in _render_code_hint: twenty labels of
+    here for the same reason it was wrong in the old [Code] hint renderer: twenty labels of
     131 ASTRAL characters score 1,491 by ``len`` and 2,932 by the harness, so a
     line 1.83x over the stated ceiling reported as fitting. Astral text is
     reachable from an ordinary prompt — ``str.isalnum`` is True for astral CJK
@@ -1181,9 +1175,8 @@ def _extract_keywords(prompt: str, *, window: bool = True) -> list[str]:
     corpus is EPHEMERAL here — trail files are per-session and get reaped — so
     that is an observation with a date, not a re-runnable query.
 
-    CODEPOINTS, DELIBERATELY — unlike _render_trail_line and _render_code_hint,
-    which measure the UTF-16 units the harness bills. This window asks "is this
-    token a word or a pasted blob", which is a question about the token, not
+    CODEPOINTS, DELIBERATELY — unlike _render_trail_line, which measures the
+    UTF-16 units the harness bills. This window asks "is this token a word or a pasted blob", which is a question about the token, not
     about output size: billing a 20-character astral CJK word as 40 units would
     drop a legitimate word for being non-Latin. The SIZE job belongs to the line
     bound, which is where an astral-heavy label is caught. _detect_pivot's filter
@@ -1200,7 +1193,7 @@ def _extract_keywords(prompt: str, *, window: bool = True) -> list[str]:
     token is over-window — a bare commit sha, a ULID, a pasted token, an
     unsegmented CJK phrase — extracts NOTHING here, and _run's
     ``len(keywords) < _MIN_PROMPT_WORDS`` gate would then return early and skip
-    recall ENTIRELY: not just the local FTS and code lanes, but the SERVER call,
+    recall ENTIRELY: not just the local FTS lane, but the SERVER call,
     which receives the raw prompt and runs its own semantic retrieval. That
     would throw away recall this window has no business touching — the window
     governs what gets RENDERED and STORED, not whether the prompt is worth
@@ -1268,112 +1261,6 @@ def _load_recent_files(session_id: str) -> list[str]:
 def _escape_fts5(query: str) -> str:
     """Escape special FTS5 characters."""
     return "".join(c if c.isalnum() or c.isspace() else " " for c in query)
-
-
-def _render_code_hint(sig: str, loc: str) -> str:
-    """Render one ``[Code]`` hint line, bounded, clipping the SIGNATURE only.
-
-    ``signature`` comes from the ``code_symbols`` index with no length cap, and
-    this is the largest real model-facing surface in the hook — MEASURED against
-    the live index (5,508 public symbols, 2026-09-10): the longest rendered line
-    is 1,014 characters and the worst six the SQL can return sum to 4,664, which
-    is 47% of the hook's whole budget from code hints alone. Not a pasted-blob
-    worst case; today's data.
-
-    The clip lands on the signature because ``loc`` is the ACTIONABLE half — it
-    is where to go look — and a bounded pointer to a real file beats a whole
-    signature with a mangled path. Marked with an ellipsis so a clipped argument
-    list does not read as a complete one. ``clip_to_cost``, not a slice: the
-    harness bills UTF-16 code units, and a signature can carry astral text.
-
-    400 is a COMPATIBILITY bound priced against that index: it clips 42 of 5,508
-    symbols (0.76%), leaves p99 (365) untouched, and holds the six-hint block
-    under 2,400 units.
-
-    MEASURED IN UTF-16 CODE UNITS THROUGHOUT, including the guard — which is the
-    half that was wrong first. This function BILLED in UTF-16 (``clip_to_cost``)
-    while DECIDING in codepoints (``len``), so an astral signature short enough
-    in codepoints to clear the guard was never clipped at all: 200 emoji rendered
-    626 units against a stated 400, and the bound was skipped rather than
-    loosened. The extremes hide it — at 500+ emoji the guard fires and
-    ``clip_to_cost`` bounds correctly — so a probe that only tries a huge value
-    reports clean. ``hook_output`` fixed this exact unit-mixing inside itself;
-    the lesson is that adopters reintroduce it AT THE GUARD, not at the clip.
-    """
-    head, tail = "[Code] ", f" — {loc}"
-    room = _MAX_CODE_HINT_CHARS - utf16_len(head) - utf16_len(tail)
-    if room < utf16_len(sig):
-        # Keep a real pointer even when `loc` alone would blow the budget: clip
-        # the whole line rather than computing a negative room for the signature.
-        if room < _MIN_CODE_SIG_CHARS:
-            return clip_to_cost(f"{head}{sig}{tail}", _MAX_CODE_HINT_CHARS - 1) + "…"
-        sig = clip_to_cost(sig, room - 1) + "…"
-    return f"{head}{sig}{tail}"
-
-
-def _search_code_index(
-    db_path: Path,
-    keywords: list[str],
-    *,
-    deadline: float | None = None,
-) -> list[dict]:
-    """Search code_modules/code_symbols for relevant code entities.
-
-    Returns results in memory-like format for RRF fusion. ~5ms (SQLite).
-    Gracefully returns [] if code index tables don't exist yet.
-    """
-    if not keywords:
-        return []
-
-    try:
-        conn = _sqlite_connect(db_path, timeout=2, deadline=deadline)
-        try:
-            conn.row_factory = sqlite3.Row
-            # Search symbols by name match (exact prefix or contains)
-            # Escape SQL LIKE special chars in user-derived keywords
-            placeholders = " OR ".join(["name LIKE ? ESCAPE '\\'"] * len(keywords))
-            params = [f"%{k.replace('%', '\\%').replace('_', '\\_')}%" for k in keywords]
-            cursor = conn.execute(
-                f"""
-                SELECT cs.name, cs.symbol_type, cs.signature, cs.module_path,
-                       cs.parent_class, cm.package
-                FROM code_symbols cs
-                JOIN code_modules cm ON cs.module_path = cm.path
-                WHERE ({placeholders}) AND cs.is_public = 1
-                ORDER BY cs.line_start
-                LIMIT 6
-                """,  # noqa: S608 - literal SQL fragments; values bound as parameters
-                params,
-            )
-            rows = cursor.fetchall()
-            if not rows:
-                return []
-
-            results = []
-            for row in rows:
-                # Format as memory-like content for fusion
-                sig = row["signature"] or f"{row['symbol_type']} {row['name']}"
-                loc = row["module_path"]
-                if row["parent_class"]:
-                    loc = f"{row['module_path']}:{row['parent_class']}"
-                content = _render_code_hint(sig, loc)
-                results.append(
-                    {
-                        "memory_id": f"code:{row['module_path']}:{row['name']}",
-                        "content": content,
-                        "source_type": "code_index",
-                        "memory_class": "fact",
-                    }
-                )
-            return results
-        finally:
-            conn.close()
-    except sqlite3.OperationalError:
-        # Table doesn't exist yet — index hasn't run
-        return []
-    except Exception as exc:
-        print(f"Code index search error: {exc}", file=sys.stderr)
-        return []
 
 
 def _search_fts5(
@@ -1695,7 +1582,7 @@ def _format_degraded(
     reason: str | None = None,
     deadline: float | None = None,
 ) -> str:
-    """Render FTS5/code fallback hits with a visible degraded marker.
+    """Render FTS5 fallback hits with a visible degraded marker.
 
     Used ONLY when the server recall path is unavailable (server down/slow) or
     deliberately bypassed (``GENESIS_PROACTIVE_HOOK_MODE=local``). Reuses the
@@ -2389,26 +2276,6 @@ async def _run_body(
             if not _emit_tracked(out, line, "server-recall"):
                 server_lines_landed = False
 
-        # Code-index structural hints ([Code] symbol — location). The server
-        # engine surfaces SEMANTIC memory only; the pre-flip fork also fused local
-        # code_symbols matches on code/debug prompts, so keep that lane hook-side —
-        # a cheap local SQLite lookup, distinct from (and additive to) memory
-        # recall. Best-effort; empty when the code index hasn't been built.
-        # Suppressed when the engine is deliberately silenced (status "disabled" =
-        # config kill switch → inject NOTHING), so code hints don't leak past it.
-        _PHASES.mark("code_hints")
-        code_hits: list[dict] = []
-        if server_data.get("status") != "disabled":
-            code_keywords = keywords + [k for k in file_keywords if k not in keywords]
-            for ch in _search_code_index(
-                _DB_PATH,
-                code_keywords,
-                deadline=deadline,
-            )[:_MAX_RESULTS]:
-                content = ch.get("content")
-                if content and _emit_tracked(out, content, "code-hints"):
-                    code_hits.append(ch)
-
         # Adapt structured rows for H-1 measurement: the engine emits pre-bump
         # ``retrieved_count``; _ws_measure reads ``_retrieved_count`` (default -1
         # → FTS-only hits stay excluded from the never-surfaced stat, exactly as
@@ -2427,10 +2294,6 @@ async def _run_body(
                 if "retrieved_count" in r:
                     row["_retrieved_count"] = r["retrieved_count"]
                 fused.append(row)
-        # Count the locally-injected code hints in the H-1 accounting too (their
-        # ``code:`` ids classify as kind "code" in the working set) — the fork
-        # fused them into the same measured set (Codex #1169).
-        fused.extend(code_hits)
         proc = server_data.get("procedure")
         surfaced_proc_id = proc.get("id") if isinstance(proc, dict) else None
         shadow = server_data.get("shadow") or {}
@@ -2485,7 +2348,7 @@ async def _run_body(
         _ambient_fold(embedding, session_id, prompt, recent_files)
         return
 
-    # ── DEGRADED FALLBACK: FTS5 + code index only, NO write-backs ────
+    # ── DEGRADED FALLBACK: FTS5 only, NO write-backs ────
     # Reached when the server is unreachable/slow (mode "server") or when the
     # operator forced local recall (GENESIS_PROACTIVE_HOOK_MODE=local).
     fallback_mode = "local" if _HOOK_MODE == "local" else "degraded"
@@ -2501,20 +2364,10 @@ async def _run_body(
     )
     if _deadline_expired(deadline):
         return
-    _PHASES.mark("code_index")
+    _PHASES.mark("degraded_emit")
     from genesis.memory.provenance import is_garbage
 
-    code_results = _search_code_index(
-        _DB_PATH,
-        fallback_keywords,
-        deadline=deadline,
-    )
-    if _deadline_expired(deadline):
-        return
-    _PHASES.mark("degraded_emit")
     fused = [r for r in fts_results if not is_garbage(r.get("content", ""))][:_MAX_RESULTS]
-    if len(fused) < _MAX_RESULTS and code_results:
-        fused += code_results[: _MAX_RESULTS - len(fused)]
 
     if fused:
         output = _format_degraded(
