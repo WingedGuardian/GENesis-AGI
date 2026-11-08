@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import fcntl
 import hashlib
 import json
@@ -28,7 +29,11 @@ HELPERS = ("pre_push_chain.py", "pre_push_gates.sh")
 INPUT_LIMIT = 1024 * 1024
 
 
-def _git(repo: Path, *args: str, env: dict[str, str] | None = None) -> str:
+class OptInRequired(ValueError):
+    """Only a declined custom-hook opt-in permits unrelated hook synchronization."""
+
+
+def _git(repo: Path, *args: str, env: dict[str, str] | dict[bytes, bytes] | None = None) -> str:
     return os.fsdecode(subprocess.check_output(
         ["git", "-C", str(repo), *args], stderr=subprocess.DEVNULL, env=env,
     )).removesuffix("\n")
@@ -256,7 +261,7 @@ def _prepare(source: Path, common: str, hook: Path, state: dict | None, *, opt_i
         if hook.exists() and (_digest(hook) == target["wrapper_sha256"] or (known and b"pre_push_chain.py" in hook.read_bytes())):
             raise ValueError("chain wrapper has no ownership record; preserved")
         if hook.exists() and not known and not opt_in:
-            raise ValueError("custom hook preserved; explicit chain opt-in required")
+            raise OptInRequired("custom hook preserved; explicit chain opt-in required")
         state = {"version": 1, "repos": {}, "original": None, "run_original_for_enrolled": not known}
         if hook.exists():
             state["original"] = {"sha256": _digest(hook), "mode": stat.S_IMODE(hook.stat().st_mode)}
@@ -297,30 +302,54 @@ def _install_locked(source: Path, common: str, hook: Path, *, opt_in: bool, rest
     _save(record, state)
 
 
+def _initial_environment() -> dict[bytes, bytes]:
+    # Supported Linux/proc profile: Python startup may have coerced LC_CTYPE in
+    # os.environ already. Keep the original bytes only in memory, never on disk.
+    return dict(entry.split(b"=", 1) for entry in Path("/proc/self/environ").read_bytes().split(b"\0") if entry)
+
+
+def _run_hook(path: Path, argv: list[str], env: dict[bytes, bytes], data: bytes | None) -> int:
+    command = [str(path), *argv]
+    try:
+        if data is None:
+            os.execve(command[0], command, env)  # noqa: S606 — native unregistered stdin
+        return subprocess.run(command, input=data, env=env, check=False).returncode
+    except OSError as error:
+        if error.errno != errno.ENOEXEC:
+            raise
+    # Match Git's ENOEXEC-only fallback, including its configured shell. Neither
+    # missing interpreters nor permissions errors authorize running a shell.
+    command.insert(0, _git(Path.cwd(), "var", "GIT_SHELL_PATH", env=env))
+    if data is None:
+        os.execve(command[0], command, env)  # noqa: S606 — native shell fallback
+    return subprocess.run(command, input=data, env=env, check=False).returncode
+
+
 def run(argv: list[str]) -> int:
+    env = _initial_environment()
     directory = Path(__file__).resolve().parent
     state = _load(directory / MANIFEST)
     if state["phase"] != "active" or tuple(state["closure"]) != HELPERS or not _original_valid(directory, state):
         raise ValueError("native hook chain is unqualified")
     if _digest(directory / "pre-push") != state["wrapper_sha256"]:
         raise ValueError("native wrapper changed")
-    common = _git(Path.cwd(), "rev-parse", "--path-format=absolute", "--git-common-dir")
+    common = _git(Path.cwd(), "rev-parse", "--path-format=absolute", "--git-common-dir", env=env)
     original = directory / ORIGINAL
     if common not in state["repos"]:
         if state["original"] and state["original"]["mode"] & 0o111:
-            os.execv(str(original), [str(original), *argv])  # noqa: S606 — preserve unregistered native stdin
+            return _run_hook(original, argv, env, None)
         return 0
     # The main checkout recorded by the installer owns runtime dependencies,
     # including a separate-git-dir install. Only explicit development probes
     # choose the invoking worktree's interpreter first.
     roots = [Path(state["repos"][common])]
-    if os.environ.get("GENESIS_HOOK_DEV_LOCAL") == "1":
-        roots.insert(0, Path(_git(Path.cwd(), "rev-parse", "--show-toplevel")))
+    if env.get(b"GENESIS_HOOK_DEV_LOCAL") == b"1":
+        roots.insert(0, Path(_git(Path.cwd(), "rev-parse", "--show-toplevel", env=env)))
     for root in roots:
         python = root / ".venv/bin/python"
         if os.access(python, os.X_OK):
             if os.path.abspath(sys.executable) != str(python):
-                os.execv(str(python), [str(python), __file__, "--", *argv])  # noqa: S606 — trusted recorded runtime
+                os.execve(str(python), [str(python), __file__, "--", *argv], env)  # noqa: S606 — trusted runtime
             break
     for name, digest in state["helpers"].items():
         if not _regular(directory / name) or _digest(directory / name) != digest:
@@ -333,7 +362,7 @@ def run(argv: list[str]) -> int:
         consumers.append(original)
     consumers.append(directory / "pre_push_gates.sh")
     for consumer in consumers:
-        code = subprocess.run([str(consumer), *argv], input=data, check=False).returncode
+        code = _run_hook(consumer, argv, env, data)
         if code:
             return code if code > 0 else 128 - code
     return 0
@@ -357,6 +386,9 @@ def main() -> int:
         if len(sys.argv) < 2 or sys.argv[1] != "--":
             raise ValueError("native invocation separator missing")
         return run(sys.argv[2:])
+    except OptInRequired:
+        print("Genesis custom pre-push hook preserved; explicit chain opt-in required.", file=sys.stderr)
+        return 3  # Internal installer status; sync-hooks still exits 2.
     except (OSError, ValueError, KeyError, TypeError, SyntaxError, subprocess.SubprocessError):
         print("Genesis native pre-push chain could not be qualified; existing user changes are preserved.", file=sys.stderr)
         return 2
