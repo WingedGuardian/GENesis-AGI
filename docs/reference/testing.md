@@ -1,5 +1,17 @@
 # Testing Guide
 
+Internal shared HTTP qualification uses the exact upgraded-stack interpreter and
+explicit files `tests/test_mcp/test_shared_http_admission.py`,
+`tests/test_mcp/test_shared_http_policy.py`,
+`tests/test_mcp/test_shared_http_runtime.py`, and
+`tests/test_observability/test_activity_persistence_scope.py`. Runtime tests own
+the real manager lifespan in one task, use actual SDK dispatch/SQLite and
+synthetic tools, and cover authentication, profiles/local refusal, activity
+suppression, tool/session/body limits, idle expiration and freshness rollback.
+Persistence assertions explicitly settle existing asynchronous batches; they
+are not an immediate-durability guarantee. These fixtures do not replace owned
+loopback progress/cancellation qualification, independent review or landed E2E.
+
 The standalone rollout CLI and captured deploy source are exercised with real
 `python -I -S` subprocesses in `tests/test_scripts/test_mcp_rollout_config.py`,
 `test_mcp_rollout_failures.py`, and `test_mcp_rollout_repair.py`. Run them with

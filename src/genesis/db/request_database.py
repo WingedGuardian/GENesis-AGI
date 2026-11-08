@@ -144,6 +144,7 @@ class RequestDatabase:
         if not math.isfinite(checkout_timeout_s) or checkout_timeout_s <= 0:
             raise ValueError("checkout_timeout_s must be finite and positive")
         self.path = Path(path).expanduser().resolve()
+        self._foreground_limit = max_units
         self._slots = asyncio.BoundedSemaphore(max_units)
         self._background_slots = (
             asyncio.BoundedSemaphore(max_background_units) if max_background_units is not None else None
@@ -159,6 +160,11 @@ class RequestDatabase:
         self._closing = False
         self._close_task: asyncio.Task | None = None
         self._unclosed: set[_Lease] = set()
+
+    @property
+    def foreground_limit(self) -> int:
+        """Configured foreground capacity; live checkout count is separate."""
+        return self._foreground_limit
 
     def _lease(self) -> _Lease:
         lease = self._current.get()

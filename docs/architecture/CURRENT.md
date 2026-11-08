@@ -1606,8 +1606,16 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
-verified: 973a0e6 2026-10-30
+verified: 5a3de4eee 2026-11-08
 ```
+
+Scoped verification: internal `mcp/shared_http` composition only. It receives
+initialized request-owned resources and supplies SDK transport limits, app-wide
+authority/authentication, per-message caller/profile binding, shared/local
+ancestry admission, nonblocking tool capacity and authenticated version/catalog
+status. No launcher selects it; owned bootstrap, native clients and rollout
+remain separate. See `docs/reference/shared-mcp-http.md`. This stamp does not
+requalify the other channels/interfaces subsystems.
 
 The neural monitor includes the non-routing **Fallback** observation, and the
 dashboard labels the shared fallback indicator as last successful/observed use.
@@ -3944,6 +3952,12 @@ process-environment identity through both accessors, including after environment
 drift; validated requests use `caller_context()`. Legacy reads remain raw and
 per-call. This does not requalify the remaining platform/data subsystems or
 activate shared MCP.
+
+Shared validator-health also has a request-local automatic activity-write opt-out
+around the entire message boundary. It preserves memory counters and the
+construction-time persistence hard opt-out, without suppressing queued ordinary
+flushes or validator-memory records. This does not strengthen batch durability
+or make the service read-only.
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
 provider/model/outcome. Failed historical attempts render as a warning, not an
