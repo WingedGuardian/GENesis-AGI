@@ -46,14 +46,21 @@ class AppServer:
         self.process.stdin.write(json.dumps(message) + "\n")
         self.process.stdin.flush()
 
-    def until(self, predicate, timeout=30):
+    def reply(self, request: dict, result: dict):
+        """Reply only to an explicitly observed server request, not a notification."""
+        assert isinstance(request.get("method"), str) and "id" in request, request
+        assert type(request["id"]) in (int, str), request
+        self.process.stdin.write(json.dumps({"id": request["id"], "result": result}) + "\n")
+        self.process.stdin.flush()
+
+    def until(self, predicate, timeout=30, *, allow_requests=False, allow_error=False):
         deadline = time.monotonic() + timeout
         while True:
             event = self.pending.get(timeout=max(0, deadline - time.monotonic()))
             self.events.append(event)
             assert "closed" not in event and "invalid_json" not in event, event
-            assert not ("method" in event and "id" in event), f"Unanswered server request: {event}"
-            assert "error" not in event, event
+            assert allow_requests or not ("method" in event and "id" in event), f"Unanswered server request: {event}"
+            assert allow_error or "error" not in event, event
             if predicate(event):
                 return event
 

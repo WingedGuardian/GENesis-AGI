@@ -1,0 +1,82 @@
+name: Native Codex compatibility qualification
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/codex-qualification.yml'
+      - '.github/test-tools/**'
+      - 'scripts/ci/codex_qualification*'
+      - 'tests/test_hooks/*codex*'
+      - 'scripts/hooks/**'
+      - '.claude/hooks/**'
+      - 'src/genesis/caller_context.py'
+      - 'src/genesis/util/codex_cli.py'
+      - 'src/genesis/eval/qualification/evidence.py'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: codex-qualification-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  contained:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CONTAINER: codex-qualification-${{ github.run_id }}-${{ github.run_attempt }}
+      SOURCE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+      SOURCE_BASE: ${{ github.event.pull_request.base.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SOURCE_HEAD }}
+          persist-credentials: false
+      - name: Build fixture image from the exact source snapshot
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_HEAD"
+          mkdir -p "$RUNNER_TEMP/codex-context" "$RUNNER_TEMP/codex-evidence"
+          git archive HEAD | tar -x -C "$RUNNER_TEMP/codex-context"
+          docker build --build-arg SOURCE_HEAD="$SOURCE_HEAD" --build-arg SOURCE_BASE="$SOURCE_BASE" \
+            -f scripts/ci/codex_qualification.Dockerfile -t codex-qualification "$RUNNER_TEMP/codex-context"
+          docker image inspect codex-qualification > "$RUNNER_TEMP/codex-evidence/image.json"
+      - name: Run with no network, credentials, host mounts or capabilities
+        run: |
+          set -euo pipefail
+          docker volume create "$CONTAINER"
+          docker create --name "$CONTAINER" --init --network none --read-only \
+            --user 65532:65532 --cap-drop ALL --security-opt no-new-privileges \
+            --pids-limit 256 --memory 3g --memory-swap 3g --cpus 2 \
+            --tmpfs /work:rw,exec,nosuid,nodev,size=1536m,mode=1777 \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,size=128m,mode=1777 \
+            --mount type=volume,src="$CONTAINER",dst=/evidence codex-qualification
+          docker inspect "$CONTAINER" > "$RUNNER_TEMP/codex-evidence/container.json"
+          docker cp "$CONTAINER:/fixture/expected.json" "$RUNNER_TEMP/codex-evidence/expected.json"
+          docker cp "$CONTAINER:/fixture/python-packages.txt" "$RUNNER_TEMP/codex-evidence/python-packages.txt"
+          docker cp "$CONTAINER:/fixture/os-packages.txt" "$RUNNER_TEMP/codex-evidence/os-packages.txt"
+          docker start -a "$CONTAINER" > "$RUNNER_TEMP/codex-evidence/output.txt" 2>&1
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$CONTAINER")" = 0
+      - name: Collect evidence and remove only the owned container
+        if: always()
+        run: |
+          set -euo pipefail
+          copy_status=0
+          if docker inspect "$CONTAINER" > /dev/null 2>&1; then
+            docker cp "$CONTAINER:/evidence/." "$RUNNER_TEMP/codex-evidence/" || copy_status=$?
+            docker rm -f "$CONTAINER"
+            if docker inspect "$CONTAINER" > /dev/null 2>&1; then exit 1; fi
+          fi
+          if docker volume inspect "$CONTAINER" > /dev/null 2>&1; then docker volume rm "$CONTAINER"; fi
+          test "$copy_status" = 0
+      - name: Independently read back copied native evidence
+        env:
+          PYTHONPATH: src
+        run: |
+          python3 scripts/ci/codex_qualification_readback.py \
+            "$RUNNER_TEMP/codex-evidence/expected.json" "$RUNNER_TEMP/codex-evidence/report.json" \
+            "$RUNNER_TEMP/codex-evidence/native" --head "$SOURCE_HEAD" --base "$SOURCE_BASE"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: codex-compatibility-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/codex-evidence
+          if-no-files-found: error
