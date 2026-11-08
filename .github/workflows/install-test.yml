@@ -337,6 +337,37 @@ jobs:
             fi
           done
 
+          # The opt-in analytics timer is checked OFF above (not configured on a
+          # fresh install), so its start path would otherwise never run here.
+          # Opt in the way a user does (the local overlay), install its extra and
+          # check readiness through the installer's own functions
+          # (lib/venv_setup.sh), arm it as install.sh does, then run its service
+          # once. Result= honours the unit's SuccessExitStatus (75: skipped).
+          _ta=genesis-transcript-analytics
+          mkdir -p ~/.genesis/config
+          printf 'enabled: true\n' > ~/.genesis/config/transcript_analytics.local.yaml
+          if ! ( . scripts/lib/venv_setup.sh && editable_install_guarded "$PWD" .venv && transcript_analytics_ready .venv ); then
+            echo "::error::transcript analytics configured, but the installer's readiness check still fails"
+            exit 1
+          fi
+          systemctl --user enable --now "$_ta.timer"
+          if ! systemctl --user is-enabled --quiet "$_ta.timer" || ! systemctl --user is-active --quiet "$_ta.timer"; then
+            echo "::error::$_ta.timer configured but not enabled and active"
+            systemctl --user status "$_ta.timer" --no-pager -l || true
+            exit 1
+          fi
+          systemctl --user start "$_ta.service" || true
+          _ta_result=$(systemctl --user show -p Result --value "$_ta.service")
+          if [ "$_ta_result" != "success" ]; then
+            echo "::error::$_ta.service ran with Result=$_ta_result"
+            systemctl --user status "$_ta.service" --no-pager -l || true
+            journalctl --user -u "$_ta.service" --no-pager -n 80 || true
+            exit 1
+          fi
+          # Leave the box as a fresh install left it.
+          systemctl --user disable --now "$_ta.timer"
+          rm -f ~/.genesis/config/transcript_analytics.local.yaml
+
           # The user-facing artifacts that hardcoded ~/genesis until this PR: both
           # must point at where the repo ACTUALLY is, or they are installed dead on
           # any clone that is not at ~/genesis.

@@ -280,6 +280,21 @@ def test_the_graph_engine_unit_uses_exactly_its_engine_tokens():
         assert "__FALKORDB_VERSION__" not in found, f"{renderer} still renders the deps path"
 
 
+def test_the_analytics_service_quotes_its_interpreter_path():
+    """systemd splits an unquoted ExecStart on spaces, so a venv path with a
+    space would run its first word. The analytics unit uses the escaped,
+    quoted __VENV_EXEC__ form both renderers already substitute."""
+    unit = TEMPLATE_DIR / "genesis-transcript-analytics.service.template"
+    exec_lines = [
+        line for line in unit.read_text().splitlines() if line.startswith("ExecStart=")
+    ]
+    assert exec_lines == [
+        'ExecStart="__VENV_EXEC__/bin/python" -m genesis transcripts ingest --timer'
+    ], exec_lines
+    for renderer in RENDERERS:
+        assert "__VENV_EXEC__" in _substituted_tokens(renderer), renderer
+
+
 def test_a_token_named_only_in_a_comment_does_not_count_as_substituted(tmp_path, monkeypatch):
     """LOCKS the comment strip, which is the difference between this module
     checking behaviour and checking documentation.
