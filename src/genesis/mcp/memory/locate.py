@@ -25,6 +25,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from genesis import env
+from genesis.security.credential_names import is_credential_component
 from genesis.session_awareness.zero_drop_git import scrubbed_git_env
 
 from ..memory import mcp
@@ -48,10 +49,14 @@ _PRUNE_DIRS = frozenset({
     "target", "worktrees", "worktree-trash", "background-sessions", "cc-tmp",
     "embedding_cache", "qdrant_storage", "browser-profile", "camoufox-profile",
     "paste-cache", "file-history", "backups", "downloads",
+    # XDG config dirs hold tool auth state (gh's hosts.yml carries a token),
+    # never project content.
+    ".config",
 })
 
 # Per-file glob skips (binary/churn artifacts not worth surfacing).
 _SKIP_FILE_GLOBS = ("*.db", "*.db-wal", "*.db-shm", "*.sqlite", "*.sqlite3", "*.lock")
+
 
 _MAX_CONTENT_BYTES = 1_048_576       # 1 MiB — matches `rg --max-filesize 1M`
 _BINARY_SNIFF_BYTES = 8192
@@ -164,6 +169,36 @@ def _matches_skip_glob(name: str) -> bool:
     return any(fnmatch.fnmatch(name, g) for g in _SKIP_FILE_GLOBS)
 
 
+def _secret_file_ids() -> set[tuple[int, int]]:
+    """(device, inode) of the configured secrets file, whatever it is named.
+
+    ``SECRETS_PATH`` can point anywhere, and a hard link or a backup copy under
+    a neutral name is not caught by a name rule; the inode is.
+    """
+    try:
+        st = env.secrets_path().stat()
+    except OSError:
+        return set()
+    return {(st.st_dev, st.st_ino)}
+
+
+def _holds_credentials(record: dict, secret_ids: set[tuple[int, int]]) -> bool:
+    """Whether a file's content must never be searched (#4129).
+
+    A content match returns the matching lines, which in a credential file are
+    the secrets themselves. Such files stay findable by name; stored
+    credentials are read through ``reference_lookup``, which audits each read.
+    Uses the same predicate the dashboard's file routes refuse paths by.
+    """
+    if record["file_id"] in secret_ids:
+        return True
+    try:
+        parts = record["path"].relative_to(record["root"]).parts
+    except ValueError:
+        parts = (record["name"],)
+    return any(is_credential_component(part) for part in parts)
+
+
 # ── walk ──────────────────────────────────────────────────────────────────────
 
 
@@ -230,6 +265,8 @@ def _walk(
                 "scope": label,
                 "mtime": st.st_mtime,
                 "size": st.st_size,
+                "root": root,
+                "file_id": (st.st_dev, st.st_ino),
             })
     return records
 
@@ -254,10 +291,13 @@ def _is_text_and_small(path: Path) -> bool:
     return b"\x00" not in head
 
 
-def _content_match(records: list[dict], contains: str, regex: bool) -> tuple[list[dict], str | None]:
+def _content_match(
+    records: list[dict], contains: str, regex: bool,
+) -> tuple[list[dict], str | None, int]:
     """Filter records to those whose content matches, attaching ``matches``.
 
-    Returns (records_with_matches, error). ``error`` set only on invalid regex.
+    Returns (records_with_matches, error, credential_files_skipped). ``error``
+    set only on invalid regex. Credential files are never opened.
     Binary/oversize files are excluded up front (see ``_is_text_and_small``).
     Tries rg first (fast); falls back to pure Python when rg is absent or
     errors — identical result shape either way.
@@ -266,13 +306,16 @@ def _content_match(records: list[dict], contains: str, regex: bool) -> tuple[lis
         try:
             re.compile(contains)
         except re.error as exc:
-            return [], f"invalid regex: {exc}"
-    eligible = [r for r in records if _is_text_and_small(r["path"])]
+            return [], f"invalid regex: {exc}", 0
+    secret_ids = _secret_file_ids()
+    searchable = [r for r in records if not _holds_credentials(r, secret_ids)]
+    skipped = len(records) - len(searchable)
+    eligible = [r for r in searchable if _is_text_and_small(r["path"])]
     if _have_rg():
         out = _content_match_rg(eligible, contains, regex)
         if out is not None:
-            return out, None
-    return _content_match_python(eligible, contains, regex), None
+            return out, None, skipped
+    return _content_match_python(eligible, contains, regex), None, skipped
 
 
 def _content_match_rg(records: list[dict], contains: str, regex: bool) -> list[dict] | None:
@@ -358,6 +401,7 @@ def _error_response(query: dict, error: str, *, roots=None, skipped=None, scanne
         "total_matched": 0,
         "truncated": False,
         "content_pool_capped": False,
+        "content_skipped_credential_files": 0,
         "scan_truncated": False,
         "scanned": scanned,
         "roots": roots or [],
@@ -367,10 +411,18 @@ def _error_response(query: dict, error: str, *, roots=None, skipped=None, scanne
     }
 
 
-def _summarize(scope, within, file_type, contains, total, shown, truncated, skipped, capped, scan_truncated) -> str:
+def _summarize(
+    scope, within, file_type, contains, total, shown, truncated, skipped, capped, scan_truncated,
+    credential_skipped=0,
+) -> str:
     extra = []
     if skipped:
         extra.append(f"{len(skipped)} root(s) absent")
+    if credential_skipped:
+        extra.append(
+            f"{credential_skipped} credential file(s) not content-searched "
+            "(find them by name; read stored credentials with reference_lookup)"
+        )
     if capped:
         extra.append(f"content pool capped at {_CONTENT_POOL_CAP}")
     if scan_truncated:
@@ -448,12 +500,13 @@ async def _impl_locate(
     scan_truncated = scan_budget[0] >= _MAX_FILES_SCANNED
 
     capped = False
+    credential_skipped = 0
     if contains:
         if len(records) > _CONTENT_POOL_CAP:
             records.sort(key=lambda r: (-r["mtime"], str(r["path"])))
             records = records[:_CONTENT_POOL_CAP]
             capped = True
-        records, error = _content_match(records, contains, regex)
+        records, error, credential_skipped = _content_match(records, contains, regex)
         if error:
             return _error_response(
                 query, error, roots=walked_roots, skipped=skipped_roots, scanned=scan_budget[0],
@@ -483,13 +536,14 @@ async def _impl_locate(
     return {
         "summary": _summarize(
             scope, within, file_type, contains, total, len(results),
-            truncated, skipped_roots, capped, scan_truncated,
+            truncated, skipped_roots, capped, scan_truncated, credential_skipped,
         ),
         "query": query,
         "count": len(results),
         "total_matched": total,
         "truncated": truncated,
         "content_pool_capped": capped,
+        "content_skipped_credential_files": credential_skipped,
         "scan_truncated": scan_truncated,
         "scanned": scan_budget[0],
         "roots": walked_roots,
@@ -526,14 +580,19 @@ async def locate(
             or "noncode" (.md/.txt/.pdf/… — the working-docs class).
         name: Case-insensitive glob on the filename, e.g. "*roadmap*.md". Empty = all.
         contains: Optional content match (only files passing the other filters are
-            opened). Empty = no content filtering.
+            opened). Empty = no content filtering. Credential files (the
+            secrets file and its backups, .env files, private keys, token and
+            credential files) are never content-searched: they stay findable by
+            name, content_skipped_credential_files counts them, and stored
+            credentials are read with reference_lookup.
         regex: Treat ``contains`` as a regex (default: literal substring).
         limit: Max results (default 50, hard cap 200; 0 or negative = all up to
             the cap). Truncation is reported explicitly via count / total_matched
             / truncated.
 
     Returns a dict with: summary, query (echoed), count, total_matched, truncated,
-    content_pool_capped, scan_truncated (true if the walk hit its file ceiling, so
+    content_pool_capped, content_skipped_credential_files, scan_truncated (true if
+    the walk hit its file ceiling, so
     results may be incomplete), scanned, roots, skipped_roots, and results[] (path,
     name, scope, mtime, age, size, and matches[] when ``contains`` is used), newest first.
     """

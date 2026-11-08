@@ -283,3 +283,57 @@ def test_humanize_age():
     assert _humanize_age(now, now) == "just now"
     assert _humanize_age(now - 7200, now) == "2h ago"
     assert _humanize_age(now - 3 * 86400, now) == "3d ago"
+
+
+_CREDENTIAL_NAMES = (
+    "secrets.env",
+    "secrets.env.bak-1",
+    ".env",
+    ".env.local",
+    "prod.env",
+    "id_ed25519",
+    "API_TOKEN",
+    ".credentials.json",
+    "deploy.pem",
+)
+
+
+@pytest.mark.parametrize("have_rg", [True, False])
+async def test_credential_files_are_findable_by_name_but_never_content_searched(
+    roots, monkeypatch, have_rg
+):
+    # #4129: a content match returns matching lines, which in these files are
+    # the credentials themselves.
+    if not have_rg:
+        monkeypatch.setattr("genesis.mcp.memory.locate._have_rg", lambda: False)
+    monkeypatch.setenv("SECRETS_PATH", str(roots["tmp"] / "elsewhere" / "absent.env"))
+    for name in _CREDENTIAL_NAMES:
+        _touch(roots["repo"] / name, content="FAKE_TOKEN=not-a-real-value\n")
+    _touch(roots["repo"] / "creds" / "service_creds.env", content="FAKE_TOKEN=not-a-real-value\n")
+    _touch(roots["repo"] / ".config" / "gh" / "hosts.yml", content="FAKE_TOKEN: not-a-real-value\n")
+    _touch(roots["repo"] / "notes.md", content="rotate FAKE_TOKEN monthly\n")
+    r = await _impl_locate(scope="repo", within="0", contains="FAKE_TOKEN")
+    assert _names(r) == {"notes.md"}
+    assert "not-a-real-value" not in str(r)
+    # Counted, so a skipped file never reads as "no match"; .config is pruned.
+    assert r["content_skipped_credential_files"] == len(_CREDENTIAL_NAMES) + 1
+    assert "not content-searched" in r["summary"]
+    assert "secrets.env" in _names(await _impl_locate(scope="repo", within="0", name="secrets.env"))
+
+
+async def test_the_configured_secrets_file_is_skipped_under_any_name(roots, monkeypatch):
+    # SECRETS_PATH can point anywhere; a hard link under a neutral name is the
+    # same file, caught by inode rather than by name.
+    real = _touch(roots["tmp"] / "vault" / "keys.txt", content="FAKE_TOKEN=not-a-real-value\n")
+    os.link(real, roots["repo"] / "notes-copy.txt")
+    monkeypatch.setenv("SECRETS_PATH", str(real))
+    r = await _impl_locate(scope="repo", within="0", contains="FAKE_TOKEN")
+    assert r["results"] == []
+    assert r["content_skipped_credential_files"] == 1
+
+
+def test_dashboard_and_locate_share_one_credential_predicate():
+    from genesis.dashboard.routes import files
+    from genesis.security.credential_names import is_credential_component
+
+    assert files._is_credential_component is is_credential_component
