@@ -4,13 +4,16 @@ Cross-tool agent entry point (Codex, Cursor, OpenCode, …). The canonical
 project instructions live in **CLAUDE.md** — read it first; everything below
 is supplementary.
 
-## Codex external-client boundary
+## Codex and Genesis
 
-Codex connects to Genesis through the project `.codex/config.toml` as an
-external MCP client. It can request Genesis capabilities on demand, but it is
-not a Genesis foreground or background session: never register its transcript,
-create a charter for it, send its identifiers to session tools, or add lifecycle
-hooks that make Genesis manage the conversation. See
+Codex connects to Genesis through the project `.codex/config.toml`. An
+owner-operated Codex session gets the same Genesis MCP servers and tools a
+Claude Code session gets (owner ruling); read tools run without a prompt and
+anything that writes, sends, spends or spawns asks first. Its calls are
+recorded as client `codex`. A Codex run Genesis starts unattended keeps a
+restricted read floor. Codex is not yet a registered Genesis session: do not
+register its transcript, create a charter for it, send its identifiers to
+session tools, or add lifecycle hooks; that is a later phase. See
 `.agents/skills/genesis-external-client/SKILL.md` when working through Codex.
 
 ## Deploy and working-tree boundary

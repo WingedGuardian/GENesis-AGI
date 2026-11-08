@@ -23,10 +23,10 @@ checkout alike, and it adds or removes no registration.
   which execs either that stdio command or the configured adapter. The final process
   is the same `python genesis_mcp_server.py …` on the stdio path, so process census
   and spawn identity see what they always saw.
-- **Never routed:** any argv other than the registered `--server <name>` form, so
-  Codex (`--external-client`, which `scripts/codex_external_mcp.py` passes; the Codex
-  switch is separate) always runs stdio; and any spawn while
-  `GENESIS_MCP_SHARED_DISABLED` is set to anything but `0`.
+- **Never routed:** any argv other than the registered `--server <name>` form
+  (the unattended Codex floor passes `--external-client`); any spawn carrying
+  `GENESIS_CALLER_PROFILE` (owner-mode Codex, whose label a shared service would not
+  see); and any spawn while `GENESIS_MCP_SHARED_DISABLED` is set to anything but `0`.
 - **On any error** (an unreadable overlay, an unknown stage name) the helper launches
   the stdio server and says why on stderr, which Claude Code keeps in its MCP log.
 

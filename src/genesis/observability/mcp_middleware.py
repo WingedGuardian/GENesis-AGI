@@ -329,15 +329,17 @@ class InstrumentationMiddleware(Middleware):
         # ToolError is imported at module level now (the absorbed-parameter
         # diagnosis needs it too), so the local re-import here would shadow it
         # with the identical symbol.
+        from genesis.caller_context import client_session_name
         from genesis.observability import mcp_spawn_identity as si
 
+        session = client_session_name()
         raise ToolError(
-            "This Claude Code session is running stale Genesis code: a deploy "
+            f"This {session} is running stale Genesis code: a deploy "
             "landed after the session started (its MCP server is still on commit "
             f"{(si.spawn_commit() or 'unknown')[:8]}). '{tool_name}' overwrites an "
             "existing procedure by similarity match, and that match logic may have "
             "changed in the deploy — acting on stale logic risks corrupting the "
-            "wrong row. Restart this Claude Code session to load the deployed "
+            f"wrong row. Restart this {session} to load the deployed "
             "code, then retry."
         )
 
