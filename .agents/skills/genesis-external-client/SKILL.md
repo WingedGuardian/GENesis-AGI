@@ -41,6 +41,13 @@ before retrying; verification attempt counters are not idempotency keys. See
 `docs/reference/codex-validator-writers.md`. This skill does not activate the
 dedicated validator launcher or authorize deployment/calibration.
 
+Validator batches also follow `docs/reference/validator-tracking.md`: preflight
+the actual exposed tools, persist measurements, verify structured task receipts,
+and checkpoint the selected rows. Public-by-default includes install-local and
+security-related work; private tasks require concrete unavoidable disclosure
+harm. A missing private writer does not block safe public filing. Honor pauses
+without creating a Genesis session or adding lifecycle hooks.
+
 Do not pass a Codex thread or session identifier to `session_charter`,
 `session_ledger_*`, or other session-bound tools. Those tools operate only on an
 explicitly identified, existing Genesis session. Never create a synthetic session

@@ -819,44 +819,32 @@ gate works, its exemption categories, and the unit rules for size bounds:
   does the routing question below become the whole answer. Naming the OWNER of a
   piece of work is a classification, and a classification is not a decision.
 
-  Route by OWNER:
-  **Genesis-repo work** (code, tests, docs, infra — anything that would live in the
-  public repo, even when hit locally) → a **GitHub issue**, so anyone can pick it up.
-  **User-owned work** (a deliverable, an errand, anything asked for and unfinished),
-  and operational state purely local to this box → a local **follow-up** via
-  `follow_up_create`, never plain text. **Consciously not doing** (nitpick, someday, a
-  far-off direction) → **tabled** (`work_state="deferred_cold"`) — a private record,
-  never dispatched, surfaced, or filed as an issue, because we don't want it picked
-  up. `work_state` DERIVES the lane, so priority never picks it. ONE record per item.
-  A public post is IRREVERSIBLE and PUBLIC — so the gate on the issue route is WHAT
-  GOES IN IT, not permission to file. **Scan every issue for personal or identifying
-  detail** — names, hosts, IPs, paths embedding a username, anything about the user's
-  real-world life — and strip it; an issue carries technical detail only. Borderline,
-  either way? Ask. Filing itself needs no per-instance approval: a bug you found while
-  reviewing a PR, that does not block that PR, is the ordinary case — file it and keep
-  the PR moving (discriminator + bounds: closing-session, "Keep the PR the PR").
-  One limit stays absolute, and it turns on **who gains**: a security defect —
-  one whose disclosure hands someone a capability they do not already have — is
-  NEVER filed publicly before it is fixed, no matter who owns it. Credential
-  exposure, an auth or privilege bypass, anything reachable by a party with LESS
-  access than it grants.
-  **A fail-open in a local development guard is USUALLY not that** — apply the
-  test, never the label, because the bare word "bypass" is what misroutes it.
-  Those hooks run only where an install wires them, and whoever can trigger one
-  already has commit access to that checkout. For a guard on the REVIEW chain
-  the worst case is typically an under-reviewed change reaching a PR that still
-  waits on maintainer approval — the state of any PR authored without them; a
-  guard protecting something else (local data, backups, repo routing) has its
-  own worst case — name it, never inherit this one. **The exception that the
-  test catches and the label does not:** a guard whose job is to stop a SECRET
-  or PRIVATE DATA reaching a public surface is security-class however local it
-  is — a branch on a public repo is public the moment it is pushed, merged or
-  not, and this repo's own leak incident was install IPs and personal emails,
-  not keys. So name the
-  adversary and what they gain before withholding; if the answer is "us, and
-  nothing we already lacked", file it. And verify the CHAIN rather than the
-  wording — a deny message naming "secrets" describes what the FLAG does to
-  git's hook chain, not which of this install's controls stand in that path.
+  **Actionable work is PUBLIC BY DEFAULT**, including install-local compatibility,
+  operations, security-related code and compliance/guard gaps. Route by the harm
+  of publishing the useful task, not by its owner or subsystem label. File a GitHub
+  issue whenever a useful description can be written safely. Filing needs no
+  per-instance approval within the session's authorized scope.
+
+  **Scrub the title, body and comments before publishing:** personal identifiers,
+  private configuration, user-specific sensitive or reputationally damaging details
+  and unnecessarily personal wording stay out. A public task with private supporting
+  evidence is a valid receipt. Sensitive evidence alone does not make the task private.
+
+  Keep the WHOLE item private only when a useful public description necessarily
+  reveals protected information or enables concrete exploitation, cost or harm.
+  An active public-internet-exploitable hole is a clear example; merely calling
+  something a security flaw, leak guard or compliance gap is insufficient. State the
+  specific harm and why redaction or a public task with private evidence cannot
+  avoid it. If it cannot be decided from the evidence, ask that concrete question.
+  A genuinely private task goes through `follow_up_create`; plain text or a run log
+  is not a task receipt. Nonactionable ideas consciously not pursued may be tabled
+  (`work_state="deferred_cold"`), but this is no exemption for unfinished real work.
+
+  Persist the measurement, route each actionable concern, verify its task readback,
+  then claim it handled. Reuse a matching issue rather than duplicating it. If a
+  writer is unavailable, preserve evidence and name routing as pending; do not
+  silently activate a new capability. Missing private tools do not block safe public
+  filing. Honor user pauses immediately and leave a checkpoint of what remains.
   Everything else — who may file, the command,
   labels, dispatched sessions, the time-gated case — is in
   `.claude/docs/mcp-tools-guide.md` ("Where Deferred Work Goes"). Read it before
