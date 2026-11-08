@@ -17,6 +17,7 @@ import pytest
 
 
 @pytest.mark.skipif(shutil.which("claude") is None, reason="native Claude CLI unavailable")
+@pytest.mark.real_tool("claude")  # runs the installed CLI against a local synthetic provider
 @pytest.mark.parametrize("mode", ["json", "stream-json"])
 @pytest.mark.parametrize("auth", ["api", "oauth"])
 def test_native_context_suppression_preserves_facade(tmp_path, mode, auth, record_property):
@@ -44,7 +45,7 @@ def test_native_context_suppression_preserves_facade(tmp_path, mode, auth, recor
     marker = tmp_path / "facade-called"
     facade = tmp_path / "facade.py"
     facade.write_text(
-        "from pathlib import Path\nfrom mcp.server.fastmcp import FastMCP\n"
+        "from pathlib import Path\nfrom fastmcp import FastMCP\n"
         "m=FastMCP('genesis_peer')\ndef ping()->str:\n"
         f" Path({str(marker)!r}).write_text('called')\n return 'pong'\nm.tool()(ping)\nm.run()\n"
     )
