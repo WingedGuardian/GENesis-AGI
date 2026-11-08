@@ -68,6 +68,12 @@ def cmd_ingest(args) -> int:
     if args.timer and _disabled(args):
         print("transcript-analytics: disabled by lever; nothing done")
         return 0
+    if args.timer and not os.path.lexists(args.projects):
+        # A fresh install has no transcripts until Claude Code first runs: a
+        # skipped tick, not a failure. A manual ingest still names the missing
+        # root, and a dangling link still fails the store's strict resolve.
+        print(f"transcript-analytics: no transcripts yet at {args.projects}; skipped")
+        return 75  # the unit's SuccessExitStatus
     try:
         options = {"since_days": args.since}
         if getattr(args, "adopt_projects_root", False):
