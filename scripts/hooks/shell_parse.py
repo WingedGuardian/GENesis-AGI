@@ -89,13 +89,8 @@ _WRAPPER_SPEC = {
         0,
     ),
     "doas": ({"-u", "-C"}, 0),
-    # `-S`/`--split-string` is deliberately ABSENT, and its absence is tracked
-    # rather than accidental. It carries a whole command line as ONE token, so
-    # listing it here would stop that token being read as the executable while
-    # HIDING what it carries — strictly worse than today's visible mis-read. It
-    # needs the nested walk, and `-S` has its own escape language, appends the
-    # arguments that follow it, and re-reads the split fields as env's own
-    # options. That is a grammar to model against the binary, not a table entry.
+    # env's split-string carrier needs GNU argv decoding, not a value flag.
+    # _env_command handles its options before the generic wrapper walk.
     "env": ({"-u", "--unset", "-C", "--chdir"}, 0),
     "nice": ({"-n", "--adjustment"}, 0),
     "ionice": ({"-c", "--class", "-n", "--classdata", "-p", "--pid"}, 0),
@@ -2054,8 +2049,9 @@ def has_bash53_substitution(command: str) -> bool:
 _BLIND_STRUCTURAL = BlindSpot(
     bounds_induced=True,
     cause=(
-        "contains nested syntax or here-doc text this parser cannot tokenize safely "
-        "(for example an unbalanced quote inside a $(...) on a here-doc line)"
+        "contains nested syntax, env carrier options or here-doc text this parser "
+        "cannot resolve safely (for example an unknown env expansion or an "
+        "unbalanced quote inside a $(...) on a here-doc line)"
     ),
     hint=(
         "split the unreadable compound into separate commands, or write prose or "
@@ -2879,8 +2875,8 @@ def analyze_checked(command: str, *, _policy=None) -> tuple[list[Segment], Blind
 
     That is deliberately weaker than "the parse was complete", and the difference
     matters because five guards now hang their fail-closed decision on it. MEASURED,
-    each returning no ``rm`` segment AND ``blind_spot`` None: ``eval "rm -rf …"``,
-    process substitution ``cat <(rm -rf …)``, and ``env -S 'rm -rf …'``. Those forms
+    each returning no ``rm`` segment AND ``blind_spot`` None: ``eval "rm -rf …"``
+    and process substitution ``cat <(rm -rf …)``. Those forms
     are not parsed and cannot be reported — the module does not know it missed them.
     Pre-existing, documented at :func:`_substitutions`, and not a promise this
     function can make.
@@ -3244,7 +3240,144 @@ def _env_policy_context(option: str, value: str | None) -> tuple[tuple[str, str 
     return (("unknown", None),)
 
 
-def _strip_wrappers(argv: list[str], carried_open: int = 0, *, _contexts=None) -> list[str]:
+def _env_split_string(text: str) -> list[str] | None:
+    """GNU env -S grammar (coreutils manual 23.2.3), never shell evaluation.
+
+    None means malformed or environment-dependent. Escaped dollars and single
+    quotes are literal; an unescaped dollar cannot be resolved from source alone.
+    """
+    fields, word = [], []
+    quote = ""
+    started = False
+    escapes = {"f": "\f", "n": "\n", "r": "\r", "t": "\t", "v": "\v",
+               "#": "#", "$": "$", '"': '"', "'": "'", "\\": "\\"}
+    i = 0
+    while i < len(text):
+        char = text[i]
+        i += 1
+        if char == "\\":
+            if i == len(text):
+                return None
+            escaped = text[i]
+            if quote == "'" and escaped not in {"'", "\\"}:
+                word.append(char)
+                started = True
+                continue
+            i += 1
+            if escaped == "c":
+                if quote:
+                    return None
+                break
+            if escaped == "_":
+                char = " "
+                if quote == '"':
+                    word.append(char)
+                    started = True
+                    continue
+            elif escaped in escapes:
+                word.append(escapes[escaped])
+                started = True
+                continue
+            else:
+                return None
+        elif char in {"'", '"'}:
+            if not quote:
+                quote, started = char, True
+                continue
+            if quote == char:
+                quote = ""
+                continue
+        elif char == "$" and quote != "'":
+            return None
+        elif char == "#" and not quote and not started:
+            break
+        if not quote and char in " \t\n\r\v\f":
+            if started:
+                fields.append("".join(word))
+                word, started = [], False
+        else:
+            word.append(char)
+            started = True
+    if quote:
+        return None
+    if started:
+        fields.append("".join(word))
+    return fields
+
+
+@dataclass
+class _EnvSplitState:
+    depth: int = 0
+    used: int = 0
+    unresolved: bool = False
+    exhausted: bool = False
+
+
+def _env_command(argv: list[str], i: int, state: _EnvSplitState, contexts) -> tuple[list[str], int]:
+    """Consume env options/assignments; splice proven split fields into argv.
+
+    The splice is argv, never shell source: metacharacters stay literal and the
+    caller retains the original source occurrence, redirects and policy scope.
+    """
+    options = True
+    while i < len(argv):
+        token = argv[i]
+        if options and token in {"--", "-"}:
+            options = False
+            i += 1
+            continue
+        if options and token.startswith("-"):
+            consumed = 1
+            option, sep, value = token.partition("=") if token.startswith("--") else (token, "", "")
+            if not token.startswith("--"):
+                j = 1
+                while j < len(token) and token[j] in "iv":
+                    j += 1
+                if j == len(token):
+                    i += 1
+                    continue
+                option, value = "-" + token[j], token[j + 1:]
+                sep = bool(value)
+                if option not in {"-u", "-C", "-S"}:
+                    state.unresolved = True
+                    return [], 0
+            if option in {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}:
+                if not sep:
+                    if i + 1 == len(argv):
+                        state.unresolved = True
+                        return [], 0
+                    value, consumed = argv[i + 1], 2
+                if option in {"-S", "--split-string"}:
+                    if state.depth + state.used >= MAX_SUBSTITUTION_DEPTH:
+                        state.exhausted = True
+                        return [], 0
+                    state.used += 1
+                    fields = _env_split_string(value)
+                    if fields is None:
+                        state.unresolved = True
+                        return [], 0
+                    argv = argv[:i] + fields + argv[i + consumed:]
+                    continue  # split fields are env's options again
+                if contexts is not None:
+                    contexts.extend(_env_policy_context(token, value))
+            elif option not in {"--ignore-environment", "--debug"} or sep:
+                # Unknown option arity, early exits, null-output mode, and signal
+                # options cannot establish a carried execution in this grammar.
+                state.unresolved = True
+                return [], 0
+            i += consumed
+            continue
+        if "=" in token:
+            options = False  # GNU stops getopt at the FIRST assignment
+            if contexts is not None:
+                contexts.append(("assignment", token))
+            i += 1
+            continue
+        break
+    return argv, i
+
+
+def _strip_wrappers(argv: list[str], carried_open: int = 0, *, _contexts=None, _env=None) -> list[str]:
     """Drop leading shell command-position tokens, env-assignments (VAR=x), and
     wrapper commands (sudo/env/…) so the returned argv[0] is the ACTUAL executed
     command, and peel the matching subshell-close `)` off the revealed argv.
@@ -3286,6 +3419,7 @@ def _strip_wrappers(argv: list[str], carried_open: int = 0, *, _contexts=None) -
     analyze()'s separate substitution path).
     """
     argv = list(argv)  # local copy — we may rebind a glued `(token` / strip closers
+    env_state = _env if _env is not None else _EnvSplitState()
     if argv and argv[0].startswith("(("):
         return []  # `((…))` arithmetic evaluation — no external command runs
     i = 0
@@ -3354,6 +3488,9 @@ def _strip_wrappers(argv: list[str], carried_open: int = 0, *, _contexts=None) -
         wrapper_at = i
         argflags, positional = spec
         wrapper_name = _basename(tok)
+        if wrapper_name == "env":
+            argv, i = _env_command(argv, i + 1, env_state, _contexts)
+            continue
         if _contexts is not None and wrapper_name not in _POLICY_NEUTRAL_WRAPPERS | {"env"}:
             _contexts.append(("opaque", None))
         if _contexts is not None and wrapper_name == "xargs":
@@ -3373,9 +3510,6 @@ def _strip_wrappers(argv: list[str], carried_open: int = 0, *, _contexts=None) -
                 i += 1
                 continue
             if t.startswith("-") and not options_done:
-                if _contexts is not None and wrapper_name == "env":
-                    value = argv[i + 1] if t in argflags and "=" not in t and i + 1 < len(argv) else None
-                    _contexts.extend(_env_policy_context(t, value))
                 if t in argflags and "=" not in t:
                     i += 2  # flag + its separate value token
                 elif recoverable and "=" not in t:
@@ -4308,6 +4442,7 @@ def _analyze_bounded(
     _scope: tuple[int, ...] = (),
     _ancestors: tuple[tuple[str, str | None], ...] = (),
     _kind: str = "root",
+    _env_depth: int = 0,
 ) -> _AnalysisResult:
     """Parse once, retaining diagnostics and structural facts from every visited level."""
     # Past the cap, parse NOTHING. Not a prefix: truncating a command mid-string flips
@@ -4379,7 +4514,11 @@ def _analyze_bounded(
         # (incl. an expansion one) can never become argv[1] and spoof the subcommand.
         tokens = _argv(seg.argv_src)
         contexts = [] if _policy is not None else None
-        argv = _strip_wrappers(tokens, carried_open, _contexts=contexts)
+        env_state = _EnvSplitState(depth=_depth + _env_depth)
+        argv = _strip_wrappers(tokens, carried_open, _contexts=contexts, _env=env_state)
+        structural_incomplete = structural_incomplete or env_state.unresolved
+        structural_message = structural_message or env_state.unresolved
+        truncated = truncated or env_state.exhausted
         carried_open = max(0, carried_open + _net_subshell_depth(seg.argv_src))
         exe = _basename(argv[0]) if argv else ""
         out.append(
@@ -4427,16 +4566,18 @@ def _analyze_bounded(
         # is unaffected by construction, which is what keeps `[s.raw for s in
         # analyze(cmd) if s.depth == 0] == split_segments(cmd)` byte-identical for
         # the cwd consumers.
-        if _depth >= MAX_SUBSTITUTION_DEPTH:
-            truncated = True
-            continue
         for nested_index, (script, origin, in_substitution, kind) in enumerate(nested):
+            env_depth = _env_depth + (0 if in_substitution else env_state.used)
+            if _depth + env_depth >= MAX_SUBSTITUTION_DEPTH:
+                truncated = True
+                continue
             inner = _analyze_bounded(
                 script, _depth=_depth + 1, _decision_text=_decision_text,
                 _origin=origin, _in_substitution=in_substitution,
                 _policy=_policy, _scope=_scope + (begin, nested_index),
                 _ancestors=_ancestors + (() if in_substitution else tuple(contexts or ())),
                 _kind=kind,
+                _env_depth=env_depth,
             )
             truncated = truncated or inner.bound_reason == "depth"
             heredoc = heredoc or inner.heredoc_incomplete
@@ -4534,7 +4675,7 @@ def _substitutions(text: str) -> list[str]:
     DATA, so the body is extracted to its TRUE close (the same scanner the redirect-
     target boundary uses, so the two never disagree on where a ``$()`` ends).
     Best-effort: exotic forms (process substitution ``<(…)``, ANSI-C ``$'…'``
-    scripts, ``env -S`` string-splitting, shell aliases/functions) are NOT parsed —
+    scripts, shell aliases/functions) are NOT parsed —
     this guard is an approval/friction layer, not a sandbox, and fails toward
     over-matching on the common forms rather than pretending to cover every shell
     construct.
