@@ -50,21 +50,21 @@ jobs:
             --tmpfs /work:rw,exec,nosuid,nodev,size=1536m,mode=1777 \
             --tmpfs /tmp:rw,exec,nosuid,nodev,size=128m,mode=1777 \
             --mount type=volume,src="$CONTAINER",dst=/evidence codex-qualification
-          docker inspect "$CONTAINER" > "$RUNNER_TEMP/codex-evidence/container.json"
+          docker container inspect "$CONTAINER" > "$RUNNER_TEMP/codex-evidence/container.json"
           docker cp "$CONTAINER:/fixture/expected.json" "$RUNNER_TEMP/codex-evidence/expected.json"
           docker cp "$CONTAINER:/fixture/python-packages.txt" "$RUNNER_TEMP/codex-evidence/python-packages.txt"
           docker cp "$CONTAINER:/fixture/os-packages.txt" "$RUNNER_TEMP/codex-evidence/os-packages.txt"
           docker start -a "$CONTAINER" > "$RUNNER_TEMP/codex-evidence/output.txt" 2>&1
-          test "$(docker inspect --format '{{.State.ExitCode}}' "$CONTAINER")" = 0
+          test "$(docker container inspect --format '{{.State.ExitCode}}' "$CONTAINER")" = 0
       - name: Collect evidence and remove only the owned container
         if: always()
         run: |
           set -euo pipefail
           copy_status=0
-          if docker inspect "$CONTAINER" > /dev/null 2>&1; then
+          if docker container inspect "$CONTAINER" > /dev/null 2>&1; then
             docker cp "$CONTAINER:/evidence/." "$RUNNER_TEMP/codex-evidence/" || copy_status=$?
             docker rm -f "$CONTAINER"
-            if docker inspect "$CONTAINER" > /dev/null 2>&1; then exit 1; fi
+            if docker container inspect "$CONTAINER" > /dev/null 2>&1; then exit 1; fi
           fi
           if docker volume inspect "$CONTAINER" > /dev/null 2>&1; then docker volume rm "$CONTAINER"; fi
           test "$copy_status" = 0

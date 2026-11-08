@@ -217,3 +217,30 @@ def test_workflow_preserves_hidden_files_and_directory_links(tmp_path):
     assert inventory(restored, (".",)) == before
     assert (restored / "case-current").is_symlink()
     assert (restored / "file-link").is_symlink()
+
+
+def test_workflow_cleanup_distinguishes_container_from_same_named_volume(tmp_path):
+    workflow = Path(__file__).resolve().parents[2] / ".github/workflows/codex-qualification.yml"
+    steps = yaml.safe_load(workflow.read_text())["jobs"]["contained"]["steps"]
+    cleanup = next(step["run"] for step in steps if step.get("name") == "Collect evidence and remove only the owned container")
+    for kind in ("container", "volume"):
+        (tmp_path / kind).touch()
+    docker = tmp_path / "docker"
+    docker.write_text('''#!/bin/bash
+set -eu
+case "$1 $2" in
+  "container inspect") test -f "$RUNNER_TEMP/container" ;;
+  "volume inspect") test -f "$RUNNER_TEMP/volume" ;;
+  "volume rm") rm "$RUNNER_TEMP/volume" ;;
+  "inspect fixture") test -f "$RUNNER_TEMP/container" || test -f "$RUNNER_TEMP/volume" ;;
+  "rm -f") rm "$RUNNER_TEMP/container" ;;
+  "cp fixture:/evidence/.") touch "$RUNNER_TEMP/copied" ;;
+  *) exit 2 ;;
+esac
+''')
+    docker.chmod(0o755)
+    result = subprocess.run(["bash", "-euo", "pipefail", "-c", cleanup], capture_output=True, text=True,
+                            env={"PATH": f"{tmp_path}:{os.environ['PATH']}", "RUNNER_TEMP": str(tmp_path), "CONTAINER": "fixture"})
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "copied").exists()
+    assert not (tmp_path / "container").exists() and not (tmp_path / "volume").exists()

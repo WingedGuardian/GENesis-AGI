@@ -3,7 +3,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends bash git jq pro
 RUN python -m venv /opt/venv
 ENV PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin
 COPY .github/test-tools/requirements.txt /opt/test-tools.txt
-RUN pip install --no-cache-dir -c /opt/test-tools.txt pytest pytest-asyncio pytest-timeout fastmcp==4.1.5 aiosqlite==0.22.1 pyyaml==6.0.3 python-dotenv==1.2.2 regex==2026.3.32
+RUN pip install --no-cache-dir -c /opt/test-tools.txt pytest pytest-asyncio pytest-timeout fastmcp==4.1.5 aiosqlite==0.22.1 pyyaml==6.0.3 python-dotenv==1.2.2 regex==2026.3.32 aiohttp==3.14.5 litellm==1.100.4 apscheduler==3.11.2
 # Public reference package. Verify before extraction; preserve native companion layout.
 RUN python - <<'PY'
 import base64, hashlib, io, tarfile, urllib.request
@@ -22,8 +22,10 @@ ENV HOME=/work/home PYTHONPATH=/fixture/src PYTHONDONTWRITEBYTECODE=1 \
     GENESIS_CODEX_APP_SERVER_BIN=/opt/codex/package/vendor/x86_64-unknown-linux-musl/bin/codex \
     QUALIFICATION_HEAD=${SOURCE_HEAD} QUALIFICATION_BASE=${SOURCE_BASE} \
     QUALIFICATION_MANIFEST=/fixture/expected.json QUALIFICATION_REPORT=/evidence/report.json
-# Freeze the collection and source/binary hashes into the image before any test runs.
-RUN mkdir -p /work/home && python -m pytest --collect-only -q -p tests.test_hooks.codex_qualification \
+# Exercise shared autouse setup without starting any native executable.
+RUN mkdir -p /work/home && python -m pytest -q tests/test_hooks/test_codex_fixture_driver.py
+# Freeze native collection and source/binary hashes before any native test runs.
+RUN python -m pytest --collect-only -q -p tests.test_hooks.codex_qualification \
     tests/test_hooks/test_codex_native.py tests/test_hooks/test_codex_validator_adapter_native.py \
     tests/test_hooks/test_codex_compatibility_native.py
 RUN pip freeze > /fixture/python-packages.txt && dpkg-query -W > /fixture/os-packages.txt

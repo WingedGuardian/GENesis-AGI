@@ -28,6 +28,8 @@ Codex policy or establish an in-session canonical owner approval path.
 
 The image installs test tools under `.github/test-tools/requirements.txt`, the
 same constraints CI uses; changes to those pins trigger fresh qualification.
+It first runs the pure driver tests to exercise shared fixture setup and its
+Python dependencies without starting a native executable.
 Before execution, collection freezes the case census, source inventory (including
 the CI configuration and test-tool pins) and
 binary hashes into the image. Every executed case must have passed setup, call
