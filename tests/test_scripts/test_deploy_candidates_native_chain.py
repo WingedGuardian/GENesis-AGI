@@ -161,6 +161,61 @@ def _expanded_chain_changes(w):
     }
 
 
+@pytest.mark.parametrize("change", ["expand", "reorder", "missing_source"])
+def test_candidate_closure_change_is_refused_before_admission(dc, dc_ready, change):
+    w = dc_ready
+    changes = _expanded_chain_changes(w)
+    if change == "reorder":
+        changes = {"scripts/hooks/pre_push_chain.py": (w.root / "scripts/hooks/pre_push_chain.py").read_text().replace(
+            'HELPERS = ("pre_push_chain.py", "pre_push_gates.sh")',
+            'HELPERS = ("pre_push_gates.sh", "pre_push_chain.py")')}
+    elif change == "missing_source":
+        changes = {"scripts/hooks/pre_push_chain.py": None}
+    w.candidate("feat/closure", changes)
+    before = w.rev("HEAD")
+    manifest = w.manifest_path.read_bytes() if w.manifest_path.exists() else None
+    assert w.add(dc, "feat/closure", "--approve-hooks", "owner, in chat") == 1
+    assert w.rev("HEAD") == before
+    assert (w.manifest_path.read_bytes() if w.manifest_path.exists() else None) == manifest
+
+
+@pytest.mark.parametrize("operation", ["drop", "rebuild"])
+def test_existing_expanded_candidate_drop_refuses_before_any_mutation(dc, dc_ready, monkeypatch, operation):
+    w = dc_ready
+    w.candidate("feat/closure", _expanded_chain_changes(w))
+    # Reproduce a candidate admitted by the previous engine, without weakening
+    # its installed ownership or source contracts.
+    with monkeypatch.context() as old:
+        old.setattr(dc.gate, "admission_failures", lambda *args, **kwargs: [])
+        old.setattr(dc.gate, "native_closure_change", lambda *args: None)
+        assert w.add(dc, "feat/closure", "--approve-hooks", "owner, in chat") == 0
+        assert w.run(dc, "rebuild") == 0
+    before = w.rev("HEAD")
+    manifest = w.manifest_path.read_bytes()
+    hooks = w.root / ".git/hooks"
+    record = (hooks / ".genesis-pre-push.json").read_bytes()
+    args = ("drop", "feat/closure") if operation == "drop" else ("rebuild",)
+    assert w.run(dc, *args) == 1
+    assert w.rev("HEAD") == before
+    assert w.manifest_path.read_bytes() == manifest
+    assert (hooks / ".genesis-pre-push.json").read_bytes() == record
+    assert dc.gate.hook_install_failures(dc.Engine(w.root, w.env, w.gh, w.serving)) == []
+
+
+def test_released_main_expansion_is_supported_but_candidate_contraction_is_not(dc, dc_ready):
+    w = dc_ready
+    changes = _expanded_chain_changes(w)
+    originals = {path: (w.root / path).read_text() if (w.root / path).exists() else None for path in changes}
+    w.advance_main(changes)
+    w.write_manifest([])
+    assert w.run(dc, "rebuild") == 0
+    assert dc.gate.hook_install_failures(dc.Engine(w.root, w.env, w.gh, w.serving)) == []
+    before = w.rev("HEAD")
+    w.candidate("feat/contract", originals)
+    assert w.add(dc, "feat/contract", "--approve-hooks", "owner, in chat") == 1
+    assert w.rev("HEAD") == before
+
+
 @pytest.mark.parametrize("collision", [None, "file", "dangling-link", "directory"])
 def test_candidate_additive_closure_admits_prior_ownership_before_mutation(dc, dc_ready, collision):
     w = dc_ready
@@ -254,3 +309,50 @@ def test_legacy_reupgrade_recovers_only_prior_owned_closure(dc, dc_ready, collis
     assert not target.exists()
     assert dc.plan.sync_git_hooks(repo) is None
     assert dc.gate.hook_install_failures(repo) == []
+
+
+@pytest.mark.parametrize("history", ["retained_larger", "dangling_record", "compatible", "record_free"])
+def test_legacy_reupgrade_checks_retained_record_before_checkout_move(dc, dc_ready, history):
+    w = dc_ready
+    paths = ["scripts/hooks/sync-hooks.sh", "scripts/hooks/pre-push",
+             "scripts/hooks/pre_push_chain.py", "scripts/hooks/pre_push_gates.sh"]
+    small = {path: (w.root / path).read_text() for path in paths}
+    expanded = {**small, **_expanded_chain_changes(w)}
+    w.advance_main(expanded)
+    w.write_manifest([])
+    assert w.run(dc, "rebuild") == 0
+    sync = expanded["scripts/hooks/sync-hooks.sh"]
+    arrays = sync[sync.index("HOOKS_TO_SYNC=("):sync.index("MODIFIED_FOUND=0")]
+    for name in ("pre_push_chain.py", "pre_push_gates.sh", "future_chain_helper.py"):
+        arrays = arrays.replace(f'    "{name}"\n', "")
+    w.advance_main({
+        "scripts/hooks/sync-hooks.sh": "#!/bin/bash\n" + arrays + "exit 0\n",
+        "scripts/hooks/pre-push": small["scripts/hooks/pre_push_gates.sh"],
+        "scripts/hooks/pre_push_chain.py": None, "scripts/hooks/pre_push_gates.sh": None,
+        "scripts/hooks/future_chain_helper.py": None,
+    })
+    assert w.run(dc, "rebuild") == 0
+    record = w.root / ".git/hooks/.genesis-pre-push.json"
+    assert record.exists()
+    if history in ("record_free", "dangling_record"):
+        record.unlink()
+    if history == "dangling_record":
+        record.symlink_to("absent-owned-record")
+    w.candidate("feat/reupgrade", expanded if history == "compatible" else small)
+    assert w.add(dc, "feat/reupgrade", "--approve-hooks", "owner, in chat") == 0
+    head = w.rev("HEAD")
+    manifest = w.manifest_path.read_bytes()
+    prior_record = record.read_bytes() if record.exists() else None
+    result = w.run(dc, "rebuild")
+    if history in ("retained_larger", "dangling_record"):
+        assert result == 1
+        assert w.rev("HEAD") == head
+        assert w.manifest_path.read_bytes() == manifest
+        if history == "dangling_record":
+            assert str(record.readlink()) == "absent-owned-record"
+        else:
+            assert record.read_bytes() == prior_record
+    else:
+        assert result == 0
+        assert w.rev("HEAD") != head
+    assert dc.gate.hook_install_failures(dc.Engine(w.root, w.env, w.gh, w.serving)) == []
