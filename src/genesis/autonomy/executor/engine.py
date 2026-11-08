@@ -20,6 +20,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -76,6 +77,7 @@ async def _run_git_push(wt_path: Path, branch: str) -> tuple[int, str]:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
+        env={**os.environ, "GENESIS_AUTOMATED_PUSH": "1"},
     )
     try:
         _, stderr = await asyncio.wait_for(

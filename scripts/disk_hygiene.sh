@@ -304,6 +304,11 @@ prune_guard_corpus() {
         || echo "guard-corpus prune exited $?"
 }
 
+prune_privacy_acknowledgements() {
+    "$VENV_PY" "$REPO_DIR/scripts/hooks/push_privacy_ack.py" --prune "$REPO_DIR" \
+        || echo "privacy acknowledgement prune exited $?"
+}
+
 prune_backup_runs() {
     # prune_backup_runs <dir> <label> <days>: remove the per-run directories under
     # a Genesis-owned backup dir once older than <days> (each is written once, so
@@ -738,6 +743,8 @@ worktrees_main() {
 
 maintenance_main() {
     local disk_reclaim_rc=0
+
+    prune_privacy_acknowledgements
 
     # The deleting steps take the shared reclaim lock. A pressure run holding
     # it is already reclaiming, so after a bounded wait (inside this unit's

@@ -25,7 +25,7 @@ from pathlib import Path
 
 MANIFEST = ".genesis-pre-push.json"
 ORIGINAL = ".genesis-pre-push-original"
-HELPERS = ("pre_push_chain.py", "pre_push_gates.sh", "push_privacy_scan.py", "push_destinations.py")
+HELPERS = ("pre_push_chain.py", "pre_push_gates.sh", "push_privacy_scan.py", "push_destinations.py", "push_privacy_ack.py")
 INPUT_LIMIT = 1024 * 1024
 
 

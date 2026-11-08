@@ -1,0 +1,1 @@
+- Public native pushes refuse generic privacy findings and incomplete scans once, then permit one identical foreground repeat within 24 hours. Known values and automated callers never use that permission; expired acknowledgement files retire through disk hygiene.
