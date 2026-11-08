@@ -39,6 +39,7 @@ from __future__ import annotations
 import importlib.util
 import io
 import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -102,6 +103,11 @@ def test_the_env_form_is_invisible_in_argv_which_is_why_the_prefix_is_read() -> 
     assert not any("GIT_DIR" in tok for tok in seg.argv), "argv now carries the env assignment"
     assert grs._prefix_words(seg) == ["GIT_DIR=/r/.git"]
     assert grs.seg_redirects_repo(seg) is True
+
+
+def test_nested_unreadable_repo_selection_stays_unknown() -> None:
+    command = "bash -c " + shlex.quote("echo ok # don't\nGIT_DIR=$TARGET git push")
+    assert grs.unreadable_mention(command)
 
 
 # --- _effective_cwd (push path) ---------------------------------------------

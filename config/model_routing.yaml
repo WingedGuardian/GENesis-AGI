@@ -189,9 +189,19 @@ providers:
     # This family reasons by default (~70-90 thinking tokens even on trivial
     # prompts → empty content at tight max_tokens + free-tier TPM bloat). This is
     # the fast-flash lane (fact extraction, tagging, surplus brainstorm), so
-    # suppress thinking. reasoning_effort=disable → Gemini thinkingBudget=0
-    # (verified live 2026-06-23 on 3.5-flash: content correct, 0 reasoning
-    # tokens at mt=20).
+    # suppress thinking with thinkingBudget=0 (verified live 2026-06-23 on
+    # 3.5-flash: content correct, 0 reasoning tokens at mt=20).
+    #
+    # The budget is sent as a raw thinkingConfig, which litellm forwards into
+    # generationConfig unchanged. Do NOT go back to reasoning_effort: litellm
+    # 1.93.2 maps reasoning_effort=disable to thinkingLevel=minimal for any
+    # model named gemini-3*-flash, which 3.8-flash rejects with HTTP 400
+    # ("Thinking level MINIMAL is not supported", issue #3674). Nor
+    # thinking={type: disabled}: on Gemini 3 that sends only includeThoughts=false,
+    # so the model still thinks. tests/test_routing/test_gemini_thinking.py
+    # checks the body litellm builds for every google provider here. A caller
+    # cannot turn thinking back on through reasoning_effort or thinking: litellm
+    # 1.93.2 lets this raw thinkingConfig win over both, without an error.
     #
     # RE-VERIFIED 2026-09-21 on 3.8-flash, because the suppression is a
     # per-version behaviour and the bump would otherwise have carried the old
@@ -207,7 +217,8 @@ providers:
     # Routed callers use 150-2000; the one max_tokens=10 site,
     # `eval/longmemeval/judge.py`, is documented as independent of this table.
     params:
-      reasoning_effort: disable
+      thinkingConfig:
+        thinkingBudget: 0
   # Google's "latest Flash" alias. NOT IN ANY CHAIN yet (owner, 2026-10-07):
   # it goes immediately ahead of gemini-free in every Gemini chain once a probe
   # shows it resolving to a DIFFERENT model. While it is the same model it adds
@@ -229,11 +240,15 @@ providers:
     free: true
     rpm_limit: 15
     open_duration_s: 120
-    # The suppression (reasoning_effort=disable -> thinkingBudget=0) is a
-    # per-version behaviour, verified for 3.8-flash; re-verify whenever the alias
-    # moves.
+    # The suppression (thinkingBudget=0) is a per-version behaviour, verified
+    # for 3.8-flash; re-verify whenever the alias moves. It is sent the same raw
+    # way as gemini-free's: reasoning_effort happens to work here only because
+    # litellm's Gemini 3 check looks for "gemini-3" in the model name and this
+    # alias has none, so its body would change under any litellm whose check
+    # matched the alias.
     params:
-      reasoning_effort: disable
+      thinkingConfig:
+        thinkingBudget: 0
   openrouter-free:
     # Curated free-pool hop (2026-08-07): repointed off qwen/qwen-2.5-72b-instruct
     # — that BARE slug is PAID on OpenRouter (~$0.36/$0.40 per MTok, verified live)

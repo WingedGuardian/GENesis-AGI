@@ -1,0 +1,1 @@
+- Add explicit read-only indexing-source diagnostics that retain the captured helper identities across deployment changes without enabling indexing.

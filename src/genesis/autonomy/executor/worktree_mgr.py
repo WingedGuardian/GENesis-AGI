@@ -27,14 +27,6 @@ _GIT_READ_TIMEOUT_S = 60.0
 # ---------------------------------------------------------------------------
 
 
-def _branch_from_wt_path(wt_path: Path) -> str | None:
-    """Derive branch name from worktree path: task-XXXX → task/XXXX."""
-    name = wt_path.name
-    if name.startswith("task-"):
-        return f"task/{name[5:]}"
-    return None
-
-
 async def _delete_branch(branch: str, repo_root: Path) -> None:
     """Delete a local git branch. Logs result, never raises."""
     proc = await asyncio.create_subprocess_exec(
@@ -250,6 +242,80 @@ class StaleWorktreeError(RuntimeError):
     """
 
 
+def task_locator(task_id: str, worktree_base: Path) -> tuple[str, Path]:
+    short_id = task_id[:8]
+    return f"task/{short_id}", worktree_base / f"task-{short_id}"
+
+
+async def branch_tip(branch: str, repo_root: Path) -> str | None:
+    """Return a local task branch tip, or None when it is absent."""
+    ref = f"refs/heads/{branch}"
+    # --exists, not --verify --quiet: that exits 1 for a corrupt ref as well as a
+    # missing one. Here 2 alone means missing (git 2.43; older git rejects the
+    # flag, which reads as unreadable).
+    rc, _ = await _git_read(repo_root, "show-ref", "--exists", ref)
+    if rc == 2:
+        return None
+    if rc != 0:
+        raise StaleWorktreeError(f"local branch {branch} could not be read")
+    rc, sha = await _git_read(
+        repo_root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}",
+    )
+    if rc != 0 or not sha:
+        raise StaleWorktreeError(f"local branch {branch} does not resolve to a commit")
+    return sha
+
+
+async def _tag_conflict(branch: str, repo_root: Path) -> bool:
+    rc, _ = await _git_read(repo_root, "show-ref", "--exists", f"refs/tags/{branch}")
+    if rc == 0:
+        return True
+    if rc == 2:
+        return False
+    raise StaleWorktreeError(f"tag {branch} could not be read")
+
+
+def _task_stale(task_id: str, branch: str, wt_path: Path, detail: str) -> StaleWorktreeError:
+    return StaleWorktreeError(
+        f"task {task_id}, branch {branch}, worktree {wt_path}: {detail}; "
+        "inspect the retained ref and Git worktree registration manually before retrying",
+    )
+
+
+def _listed_records(
+    records: list[dict[str, str]], wt_path: Path,
+) -> list[dict[str, str]]:
+    target = _as_named(wt_path)
+    return [
+        record for record in records
+        if _as_named(Path(record["worktree"])) == target
+    ]
+
+
+async def _validate_live_worktree(
+    wt_path: Path,
+    repo_root: Path,
+    branch: str,
+    tip: str,
+    records: list[dict[str, str]],
+) -> None:
+    listed = _listed_records(records, wt_path)
+    ref = f"refs/heads/{branch}"
+    if len(listed) != 1:
+        raise StaleWorktreeError("worktree registration is missing or duplicated")
+    record = listed[0]
+    if "prunable" in record:
+        raise StaleWorktreeError("worktree registration is prunable")
+    if "locked" in record:
+        raise StaleWorktreeError("worktree registration is locked")
+    if record.get("branch") != ref or not await is_registered_worktree(wt_path, repo_root):
+        raise StaleWorktreeError(f"worktree is not safely registered on {branch}")
+    rc, head_ref = await _git_read(wt_path, "symbolic-ref", "--quiet", "HEAD")
+    rc2, head = await _git_read(wt_path, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+    if rc != 0 or head_ref != ref or rc2 != 0 or head != tip:
+        raise StaleWorktreeError(f"worktree does not match retained {branch}@{tip}")
+
+
 async def _worktree_records(repo_root: Path) -> list[dict[str, str]] | None:
     """``git worktree list --porcelain -z`` as one dict per worktree, or None
     when it cannot be read. NUL-delimited, so a path holding a newline cannot
@@ -407,34 +473,8 @@ async def cleanup_worktree(
     wt_path: Path,
     repo_root: Path,
 ) -> None:
-    """Remove a worktree and its associated branch.
-
-    NO --force per CLAUDE.md worktree rules.
-    """
-    branch = _branch_from_wt_path(wt_path)
-
-    if not wt_path.exists():
-        # Worktree dir gone but branch might linger
-        if branch:
-            await _delete_branch(branch, repo_root)
-        return
-
-    proc = await asyncio.create_subprocess_exec(
-        "git", "worktree", "remove", str(wt_path),
-        cwd=str(repo_root),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=_scrubbed_git_env(),
+    """Leave worktree and Git state unchanged for independent lifecycle management."""
+    logger.info(
+        "Leaving task worktree state untouched at %s; lifecycle cleanup is independent",
+        wt_path,
     )
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        logger.warning(
-            "Worktree cleanup failed for %s: %s",
-            wt_path, stderr.decode(errors="replace"),
-        )
-    else:
-        logger.info("Cleaned up worktree at %s", wt_path)
-
-    # Delete the branch (even if worktree removal failed, try anyway)
-    if branch:
-        await _delete_branch(branch, repo_root)

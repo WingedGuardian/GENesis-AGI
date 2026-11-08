@@ -28,7 +28,6 @@ from genesis.cc.direct_session import (
     _build_profile_addendum,
 )
 from genesis.cc.types import CCModel
-from genesis.mcp.health.direct_session_tools import direct_session_run
 
 # --- Profile existence ---
 
@@ -44,8 +43,10 @@ def test_all_expected_profiles_exist():
     assert "research" in PROFILES
 
 
-def test_direct_session_run_description_matches_profile_disallows():
-    description = direct_session_run.description
+async def test_direct_session_run_description_matches_profile_disallows():
+    from genesis.mcp.health import mcp
+
+    description = (await mcp.get_tool("direct_session_run")).description
     assert description is not None
 
     universal_match = re.search(r"All built-in profiles block:\s*(.+?)\.", description)
@@ -148,6 +149,7 @@ def test_observe_blocks_browser_interaction():
     assert "mcp__genesis-health__browser_click" in PROFILES["observe"]
     assert "mcp__genesis-health__browser_fill" in PROFILES["observe"]
     assert "mcp__genesis-health__browser_run_js" in PROFILES["observe"]
+    assert "mcp__genesis-health__browser_fill_card" in PROFILES["observe"]
 
 
 def test_observe_blocks_memory_writes():
@@ -229,6 +231,7 @@ def test_research_blocks_browser_interaction():
     assert "mcp__genesis-health__browser_click" in PROFILES["research"]
     assert "mcp__genesis-health__browser_fill" in PROFILES["research"]
     assert "mcp__genesis-health__browser_run_js" in PROFILES["research"]
+    assert "mcp__genesis-health__browser_fill_card" in PROFILES["research"]
 
 
 def test_research_blocks_outreach_send():
@@ -243,6 +246,8 @@ def test_interact_allows_browser_interaction():
     assert "mcp__genesis-health__browser_click" not in PROFILES["interact"]
     assert "mcp__genesis-health__browser_fill" not in PROFILES["interact"]
     assert "mcp__genesis-health__browser_run_js" not in PROFILES["interact"]
+    # Background sessions pay behind the owner's tap (owner ruling).
+    assert "mcp__genesis-health__browser_fill_card" not in PROFILES["interact"]
 
 
 def test_interact_blocks_vector_store_writes():
@@ -1268,7 +1273,7 @@ _PERIMETER_ALLOWED_OUTREACH = {"outreach_send"}
 async def test_perimeter_profiles_deny_every_outreach_tool_but_the_reply_actuator():
     from genesis.mcp.outreach_mcp import mcp as outreach_mcp
 
-    registered = set(await outreach_mcp.get_tools())
+    registered = set({tool.name: tool for tool in await outreach_mcp.list_tools()})
     assert "outreach_send" in registered, "enumeration is stale — the server changed"
 
     for profile in ("mail", "community-responder"):

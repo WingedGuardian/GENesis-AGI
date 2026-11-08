@@ -1,6 +1,7 @@
 """The tool-name normalizer applied to every stored tool_trigger."""
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -77,13 +78,16 @@ def test_the_builtin_set_covers_the_three_existing_lists():
 def test_the_mcp_short_names_match_the_registered_tools():
     """The map is read from source without importing the servers; this pins it
     to what each server really registers, so drift fails here."""
-    # A fresh interpreter: an import elsewhere in the test run (the runtime
-    # imports user_job_tools) would add tools to these same server objects.
+    # A fresh interpreter, so no import elsewhere in the test run can add tools
+    # to these server objects. user_job_tools, the case that once did, now
+    # registers on an object of its own; this keeps the guard for the next one.
     probe = (
         "import json; from genesis.cc.session_config import _registered_mcp_tool_names as r; "
         f"print(json.dumps({{s: r(m) for s, m in {tool_names._MCP_MODULES!r}.items()}}))"
     )
-    out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True)
+    src = str(Path(tool_names.__file__).resolve().parents[3])
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [src, os.environ.get("PYTHONPATH")]))}
+    out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True, env=env)
     registered = {}
     for server, names in json.loads(out.stdout.strip().splitlines()[-1]).items():
         for name in names:

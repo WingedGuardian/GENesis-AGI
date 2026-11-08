@@ -1,0 +1,1 @@
+- Retain explicit index-launch intent, completion and cleanup evidence durably so replay can preserve completed work while an unresolved writer, uncertain outcome or resource failure continues to block unsafe retries. Automatic indexing remains disabled pending native integration and acceptance.

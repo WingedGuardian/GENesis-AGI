@@ -88,6 +88,10 @@ def _is_public_suffix(d: str) -> bool:
     dependency; if it is missing anyway the clear is refused rather than
     guessed, because this check guards a credential-affecting bulk delete.
     """
+    return _extract(d).domain == ""
+
+
+def _extract(d: str):
     global _SUFFIXES
     if _SUFFIXES is None:
         try:
@@ -99,7 +103,19 @@ def _is_public_suffix(d: str) -> bool:
         _SUFFIXES = tldextract.TLDExtract(
             suffix_list_urls=(), cache_dir=None, include_psl_private_domains=True
         )
-    return _SUFFIXES(d).domain == ""
+    return _SUFFIXES(d)
+
+
+def registrable_domain(host: str) -> str:
+    """The site ``host`` belongs to: its domain one label under the public suffix
+    (``shop.example.co.uk`` -> ``example.co.uk``), by the same bundled list as
+    :func:`_is_public_suffix`. An IP literal, a single label, or a host that is
+    itself a public suffix is returned as it is. Raises ValueError when
+    tldextract is missing."""
+    h = (host or "").lower().strip(".")
+    if ":" in h or "." not in h or h.replace(".", "").isdigit():
+        return h
+    return _extract(h).top_domain_under_public_suffix or h
 
 
 def domain_matches(host: str, domain: str) -> bool:

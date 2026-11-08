@@ -1,1 +1,0 @@
-- Codex can use a reviewed set of Genesis health and recall tools as an external MCP client without joining Genesis session tracking.

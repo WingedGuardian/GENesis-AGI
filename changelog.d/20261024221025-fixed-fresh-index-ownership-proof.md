@@ -1,0 +1,1 @@
+- Require fresh original-scope proof before releasing disputed index ownership, retaining new owned OOM evidence without repeating completed work or clearing provider safety holds. Reject ambiguous manager or ancestor identities, isolate unavailable cleanup proof from unrelated recovery, and retain pre-launch refusal diagnostics. Automatic indexing remains fenced.

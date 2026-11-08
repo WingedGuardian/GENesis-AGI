@@ -1,0 +1,1 @@
+- Record delivered Guardian alerts as displayed text, fail incomplete history reads, and preserve cursor ordering through bounded clock changes.

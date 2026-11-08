@@ -139,7 +139,7 @@ the procedure (step 5).
 
    `cc_shadow_scan` matters here because a second nvm/native/user-prefix copy on a different
    interactive PATH has bitten this project repeatedly — without it the whole soak can exercise a
-   stale shadow binary while the same-shell version check passes. (`update.sh:477-488` pairs the
+   stale shadow binary while the same-shell version check passes. (`update.sh`, beside its `cc_align_host_sync` call, pairs the
    two the same way, but `unset`s `CC_VERSION` first so both run on the pin.)
    `cc_ensure_local` is **container-only**, so the host stays on the pin — a live rollback path.
 
@@ -153,7 +153,7 @@ the procedure (step 5).
      `node -v`. **If the floor rises above the container's Node, STOP: there is no container-side
      Node transition tool today.** Every `NODE_MAJOR` consumer is either a CI assertion
      (`check_cc_node_lockstep.py`) or a dispatch to the **host** via the guardian `update-node` op
-     (`update.sh:441`, `cc_align_host.sh`); the only container-side Node installer
+     (`cc_align_host_sync` in `scripts/lib/cc_version.sh`, called by `update.sh` and `cc_align_host.sh`); the only container-side Node installer
      (`install.sh:473-477` `_node_version_ok`) gates on a hardcoded `>= 20` and never reads
      `NODE_MAJOR`. Treat a rising floor as prerequisite work, not something to improvise here.
    - **A failed align is NOT a clean no-op.** `cc_ensure_local` runs `npm install -g` and only
@@ -478,6 +478,7 @@ caller (MEASURED 2026-09-25).
 | CCCheckpoint | Session pause/resume | `src/genesis/cc/checkpoint.py` | User question handling |
 | CCFormatter | Output formatting | `src/genesis/cc/formatter.py` | Response parsing |
 | IntentClassifier | N/A (Genesis-internal) | `src/genesis/cc/intent.py` | No CC dependency |
+| PR-open review gate | Subagent records: `<session>/subagents/agent-*.meta.json` (`agentType`) and `agent-*.jsonl` (first line `cwd`, `gitBranch`, prompt; final assistant `stop_reason`, `model`); `/code-review` runs as `general-purpose` with a `` `<level> effort → `` prompt header | `scripts/hooks/pr_open_review_gate.py` | Read at `gh pr create`. Re-verify on a pin bump: a run in a real session must pass after `/code-review` and be refused with no review. A changed layout reads as "could not verify" when no record keeps `agentType`, a readable `gitBranch` or `cwd`, or a `stop_reason`; a moved `subagents/` directory reads as "no review", which `/deep-review` then cannot clear. Either way the owner override is the way through until the reader is fixed |
 | Guardian Diagnosis | `-p`, `--model opus`, `--effort` (configurable, default `high`; omitted for Haiku), `--max-turns 50`, `--dangerously-skip-permissions`, `--output-format json` | `src/genesis/guardian/diagnosis.py` | Agentic diagnosis + recovery on host VM. Highest-stakes CC call in system. |
 
 ### CC CLI Flags Used by Genesis
@@ -732,17 +733,7 @@ When a new CC version is released, run through this:
    safety guard a real payload, so it catches a changed hook payload shape that
    would otherwise silently disable the guards (see the hook input contract
    under "Actively Used" above).
-8. **Re-probe the `AskUserQuestion` rewrite path.** The gate-menu substitution
-   (`scripts/hooks/ask_gate_menu.py`) rests on `updatedInput` rewriting an
-   `AskUserQuestion` call, and on it working ONLY without a `permissionDecision` field.
-   Both are documented or measured, but the docs carry no version contract and do not
-   enumerate the contexts where the field degrades. Make one real ask at the cap and
-   confirm the appended question renders.
-   **Failure here is QUIET, and quiet in the direction that does not announce itself:**
-   the session simply relays the gate's options in its own words again — the
-   pre-2026-09 behaviour, and the exact thing the mechanism exists to stop. Nothing
-   blocks and nothing errors, because by design no gate reads this back.
-9. **Re-run the WebSearch override against the candidate** (`plugins/genesis-web-override`,
+8. **Re-run the WebSearch override against the candidate** (`plugins/genesis-web-override`,
    a function-hook plugin; early access, so its API can move in any release). In a
    scratch cwd: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude -p --model haiku
    --plugin-dir <repo>/plugins/genesis-web-override --debug-file <f> "Use WebSearch once …"`
@@ -750,7 +741,7 @@ When a new CC version is released, run through this:
    `resolved by a hooks module (result)` and no `does not match its output shape`.
    A shape Claude Code stops accepting reaches the model as a tool error, not as
    the built-in search, so this is the one place the regression shows.
-10. **Update this document** with findings.
+9. **Update this document** with findings.
 
 ---
 
@@ -1328,8 +1319,9 @@ difference and send a real turn.
 A PreToolUse hook returning `updatedInput` under `hookSpecificOutput` rewrites the
 tool input before the tool runs. It is **documented** (hooks reference), it is
 **documented as applying to `AskUserQuestion`**, and it is what lets a gate put its own
-question in front of the user instead of the session's retelling
-(`scripts/hooks/ask_gate_menu.py`).
+question in front of the user instead of the session's retelling. (The
+gate-menu hook that used it was removed with the retired local review streak;
+the measured behaviour below still holds.)
 
 | shape | payload | result |
 |---|---|---|

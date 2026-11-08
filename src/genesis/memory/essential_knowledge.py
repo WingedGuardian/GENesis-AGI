@@ -20,11 +20,21 @@ from pathlib import Path
 import aiosqlite
 
 from genesis.db.crud.observations import SAFE_ORIGIN_SQL, SAFE_SURFACING_ORIGINS
+from genesis.util.text import ELLIPSIS, clip_words
 
 logger = logging.getLogger(__name__)
 
 _OUTPUT_PATH = Path.home() / ".genesis" / "essential_knowledge.md"
 _MAX_TOKENS = 300  # Target size in approximate tokens
+
+# Display lengths, marker included (genesis.util.text.clip_words). They are
+# the old raw-slice lengths, so no line grows; each now ends on a whole word.
+_TOPIC_CHARS = 200
+_FOCUS_CHARS = 200
+_INSIGHT_CHARS = 250
+# How much of an insight row is read, and deduplicated on, before it is
+# clipped for display. Bounded so a huge row never crosses into Python whole.
+_INSIGHT_READ_CHARS = 1000
 
 
 async def generate_deterministic(db: aiosqlite.Connection) -> str:
@@ -71,10 +81,10 @@ async def generate_deterministic(db: aiosqlite.Connection) -> str:
             parts.append(f"- {topic}")
 
     # Key insights: meaningful observations from last 7 days
-    decisions = await _recent_decisions(db, days=7)
+    decisions = await _recent_decisions(db, days=7, limit=5)
     if decisions:
         parts.append("\n### Key Insights (7d)")
-        for decision in decisions[:5]:
+        for decision in decisions:
             parts.append(f"- {decision}")
 
     # Upcoming events: user-world events from the SVO calendar
@@ -288,13 +298,22 @@ async def _recent_session_topics(db: aiosqlite.Connection, days: int = 7) -> lis
             sql, (*allowed, *safe_origins, f"-{days} days"),
         )
         rows = await cursor.fetchall()
-        return [row[0][:200] for row in rows if row[0]]
+        return [clip_words(row[0], _TOPIC_CHARS) for row in rows if row[0]]
     except Exception:
         return []
 
 
-async def _recent_decisions(db: aiosqlite.Connection, days: int = 7) -> list[str]:
-    """Get recent meaningful observations (exclusion-based to capture future types)."""
+async def _recent_decisions(
+    db: aiosqlite.Connection, days: int = 7, limit: int = 10,
+) -> list[str]:
+    """Get recent meaningful observations (exclusion-based to capture future types).
+
+    Newest first, at most ``limit`` entries, with repeats collapsed to their
+    newest copy (see ``_insight_dedup_key``).
+    """
+    if limit <= 0:
+        return []
+
     # Exclude noisy/mechanical types; everything else surfaces.
     _EXCLUDED_TYPES = (
         # Mechanical / tick-level
@@ -334,24 +353,79 @@ async def _recent_decisions(db: aiosqlite.Connection, days: int = 7) -> list[str
         # Autonomy gate data — must never surface to ego context (opacity)
         "autonomy_audit",
         "autonomy_gate_decision",
+        # Scheduled-job run reports: a job's log, not an insight. The
+        # observations are still stored for their own readers (the morning
+        # report shows entity_adjudication's). Measured over one install's
+        # 7-day window, these four types were 240 of 362 candidate rows.
+        # - JSON run payloads. The reaper writes one each tick that finds
+        #   candidates, so a candidate that persists repeats it (164 rows,
+        #   2 distinct texts). Entity adjudication writes one per run that
+        #   proposed or merged anything (68 rows).
+        "process_reaper_would_kill",
+        "entity_adjudication",
+        # - Written on every run, whether or not anything changed.
+        "dream_cycle_report",
+        "dream_synthesis_drain_report",
     )
     placeholders = ",".join("?" * len(_EXCLUDED_TYPES))
     try:
-        cursor = await db.execute(
-            "SELECT content FROM observations "  # noqa: S608 - literal SQL fragments; values bound as parameters
+        # No SQL LIMIT: repeats are dropped below, so a fixed window of rows
+        # could be all one text. The scan stops once ``limit`` distinct
+        # entries are collected, which bounds the work instead.
+        results: list[str] = []
+        seen: set[str | tuple[str, str]] = set()
+        # The read is capped in SQL, so a long row never crosses into Python
+        # whole. Dedup keys on that capped text, not on the shorter display
+        # clip: rows that share their opening and differ later are distinct.
+        async with db.execute(
+            "SELECT substr(content, 1, ?) FROM observations "  # noqa: S608 - literal SQL fragments; values bound as parameters
             f"WHERE type NOT IN ({placeholders}) "
             "AND resolved = 0 "
             # WS-3: exclude external/unknown-origin content from the L1 file
             # (fail-closed; NULL excluded post-backfill).
             f"AND {SAFE_ORIGIN_SQL} "
             "AND created_at > datetime('now', ?) "
-            "ORDER BY created_at DESC LIMIT 10",
-            (*_EXCLUDED_TYPES, f"-{days} days"),
-        )
-        rows = await cursor.fetchall()
-        return [row[0][:250] for row in rows if row[0]]
+            "ORDER BY created_at DESC",
+            (_INSIGHT_READ_CHARS, *_EXCLUDED_TYPES, f"-{days} days"),
+        ) as cursor:
+            async for row in cursor:
+                text = row[0]
+                if not text:
+                    continue
+                key = _insight_dedup_key(text)
+                shown = clip_words(text, _INSIGHT_CHARS)
+                # Also dedup on what is SHOWN: two rows that differ only
+                # past the display cut would otherwise print as two lines
+                # that look identical.
+                # Keyed on the 250-char WINDOW, not the clip: a short row shown
+                # whole and a longer one shown with "…" share that window.
+                shown_key = ("shown", _insight_dedup_key(text[:_INSIGHT_CHARS]))
+                # And on the clip itself: the clip drops the word crossing the
+                # cut, so rows differing only inside that word share a clip
+                # while their windows differ.
+                display_key = ("display", _insight_dedup_key(shown.removesuffix(ELLIPSIS)))
+                if key in seen or shown_key in seen or display_key in seen:
+                    continue
+                seen.add(key)
+                seen.add(shown_key)
+                seen.add(display_key)
+                results.append(shown)
+                if len(results) >= limit:
+                    break
+        return results
     except Exception:
+        logger.warning("Key Insights query failed", exc_info=True)
         return []
+
+
+def _insight_dedup_key(text: str) -> str:
+    """Whitespace- and case-insensitive identity for an insight line.
+
+    Digits are deliberately kept: a count that moved ("3 failing" -> "9
+    failing") is a real change, not a repeat. Masking them collapsed no
+    additional rows on the measured window anyway.
+    """
+    return " ".join(text.split()).casefold()
 
 
 # Behavioral focus patterns — ego should describe a topic, not a behavioral
@@ -387,8 +461,11 @@ async def _ego_focus(db: aiosqlite.Connection) -> str | None:
         )
         row = await cursor.fetchone()
         if row and row[0]:
-            focus = row[0][:200]
-            if _BEHAVIORAL_FOCUS_RE.search(focus):
+            focus = clip_words(row[0], _FOCUS_CHARS)
+            # The safety filter reads the OLD 200-char window, not the clip: a
+            # word-boundary clip can drop a phrase ending at character 200
+            # that the raw slice kept.
+            if _BEHAVIORAL_FOCUS_RE.search(row[0][:_FOCUS_CHARS]):
                 logger.warning(
                     "Ego focus contains behavioral self-assignment, "
                     "omitting from essential knowledge: %s",

@@ -99,6 +99,7 @@ def test_a_session_genesis_server_launched_is_told_apart_by_its_environ(proc):
     assert proc.check().kind == pc.LAUNCHED
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod-0 file")
 def test_an_unreadable_claude_environ_leaves_the_kind_to_ancestry(proc):
     (proc.root / "300" / "environ").write_bytes(b"GENESIS_CC_SESSION=1\0")
     (proc.root / "300" / "environ").chmod(0)
@@ -228,6 +229,7 @@ def test_recorded_python_names_are_capped(proc):
     assert len(names) == 8 and all(len(n) == 64 for n in names)
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a chmod-0 file")
 def test_an_unreadable_environ_refuses(proc):
     environ = proc.root / str(PEER) / "environ"
     environ.chmod(0)

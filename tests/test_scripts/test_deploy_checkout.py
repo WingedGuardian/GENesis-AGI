@@ -614,3 +614,46 @@ def test_lib_functions_return_and_never_exit():
 def test_recovery_lib_may_print_but_never_terminates_its_caller():
     code = "\n".join(_code_lines(RECOVERY_LIB))
     assert not re.search(r"\bexit\b", code), "deploy_recovery.sh must return, never exit"
+
+
+@pytest.mark.parametrize(
+    ("name", "quoted"),
+    [("a\nb.txt", '"a\\nb.txt"'), ("e\x1bv.txt", '"e\\033v.txt"'), ("plain.txt", "plain.txt")],
+    ids=["newline", "esc", "plain"],
+)
+def test_a_hidden_change_is_one_quoted_line(repos, name, quoted):
+    """#3532 round-3 review S1: a change hidden by skip-worktree is listed in
+    git's own quoted form, one line per path, as every consumer of
+    genesis_tracked_dirty_paths reads it (update.sh, bootstrap.sh,
+    deploy_code_only.sh, deploy_health's _dirty_paths); never raw, which split
+    a newline name into two lines and sent ESC to the terminal."""
+    from genesis.observability.snapshots.deploy_health import _dirty_paths
+
+    root = repos["primary"]
+    (root / name).write_text("v1\n")
+    subprocess.run(["git", "-C", str(root), "add", "--", name], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "commit",
+            "-qm",
+            "a file",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(root), "update-index", "--skip-worktree", "--", name], check=True
+    )
+    (root / name).write_text("hidden edit\n")
+    r = _dirty(root)
+    lines = r.stdout.split("\n")
+    assert lines[0] == "RC=0", r.stdout
+    assert [ln for ln in lines[1:] if ln] == [" M " + quoted], r.stdout
+    assert "\x1b" not in r.stdout
+    assert _dirty_paths(r.stdout.split("\n", 1)[1].encode()) == [name]

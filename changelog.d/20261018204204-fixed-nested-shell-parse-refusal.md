@@ -1,0 +1,2 @@
+- Checked shell parsing now preserves nested structural uncertainty and refuses possible Git/GitHub operations instead of trusting a partial parse.
+- Preserve main’s heredoc protections and narrow inert-data relief while combining nested diagnostics; complex valid heredoc prefixes can remain explicit structural refusals.

@@ -1,1 +1,0 @@
-- Codex's inactive validator boundary now admits workspace patch sources and destinations while refusing protected instructions, paths outside the workspace, symlinks and shared file inodes.

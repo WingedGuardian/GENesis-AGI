@@ -555,6 +555,11 @@ class Repo:
                 )
             )
 
+    def record_move(self, to: str, phase: str, *, before: bool) -> None:
+        """Record how far a checkout move got, for the caller that runs it
+        (deploy_candidates_plan.py names the phases). A plain Repo has no caller
+        to record for; the engine writes it into update.sh's own row."""
+
     def live_checked_out_elsewhere(self) -> str | None:
         """The path of a worktree OTHER than this checkout that has `live`
         checked out, read from `git worktree list --porcelain -z`: each field

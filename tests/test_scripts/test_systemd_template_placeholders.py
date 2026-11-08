@@ -259,6 +259,27 @@ def test_the_graph_projection_units_use_only_shared_tokens():
         )
 
 
+#: The graph engine's own tokens: the four paths inside the version-tag copy
+#: the engine check places (three binaries and the copy's digest file). The
+#: version-pinned deps path token (`__FALKORDB_VERSION__`) is retired with the
+#: GitHub download.
+_FALKORDB_TOKENS = frozenset(
+    {"__REDIS_SERVER__", "__REDIS_CLI__", "__FALKORDB_MODULE__", "__FALKORDB_DIGESTS__"}
+)
+
+
+def test_the_graph_engine_unit_uses_exactly_its_engine_tokens():
+    """Pinned by name, beyond the sweep: the sweep proves every token used is
+    substituted, not that a retired one stopped being used, nor that a
+    renderer stopped substituting it."""
+    unit = TEMPLATE_DIR / "genesis-falkordb.service.template"
+    assert _tokens_used(unit) == _FALKORDB_TOKENS, sorted(_tokens_used(unit))
+    for renderer in RENDERERS:
+        found = _substituted_tokens(renderer)
+        assert found >= _FALKORDB_TOKENS, (renderer, sorted(_FALKORDB_TOKENS - found))
+        assert "__FALKORDB_VERSION__" not in found, f"{renderer} still renders the deps path"
+
+
 def test_a_token_named_only_in_a_comment_does_not_count_as_substituted(tmp_path, monkeypatch):
     """LOCKS the comment strip, which is the difference between this module
     checking behaviour and checking documentation.

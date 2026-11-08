@@ -91,9 +91,10 @@ EOF
 # --rcfile, nested -c, a path built in a variable all defeat it).
 #
 #   unset/empty  → return 0 immediately: production behaviour never changes.
-#   set          → resolve the acting root, HOME, explicit GENESIS_HOME and
+#   set          → resolve the acting root, HOME, explicit GENESIS_HOME (a
+#                  "~" or "~/x" one both literally and against HOME) and
 #                  default HOME/.genesis, preserving pathname bytes;
-#                  unprovable resolution, colon paths and tilde-form explicit
+#                  unprovable resolution, colon paths and "~user" explicit
 #                  homes refuse while armed (the list cannot encode colons);
 #                  any of them equal to or under a listed root prints
 #                  "REFUSED (test fence): <script> would act on <path>" to
@@ -121,10 +122,25 @@ refuse_if_test_fenced_live() {
     _roots+=("$_rest")
     local -a _candidates=("$1" "${HOME:-}" "${GENESIS_HOME:-}")
     [ -z "${HOME:-}" ] || _candidates+=("$HOME/.genesis")
-    # Backup expands this form differently from the raw lock path.
+    # Backup expands a tilde GENESIS_HOME against HOME, while the lock path
+    # reads it literally (#3438), relative to the cwd. Check both: the raw
+    # value above is the literal form, and "~" or "~/x" adds its HOME form.
+    # A "~user" form names a home this guard cannot prove, so it refuses.
     if [[ "${GENESIS_HOME:-}" == '~'* ]]; then
-        _hit=$GENESIS_HOME
-        _reason="unsupported tilde-form GENESIS_HOME"
+        if [[ "$GENESIS_HOME" != '~' && "$GENESIS_HOME" != '~/'* ]]; then
+            _hit=$GENESIS_HOME
+            _reason="unsupported tilde-form GENESIS_HOME"
+        elif [ -z "${HOME:-}" ]; then
+            _hit=$GENESIS_HOME
+            _reason="tilde GENESIS_HOME with no HOME"
+        elif [[ "$HOME" == *$'\n' ]]; then
+            # Backup's $(...) expansion strips a trailing newline, so the home
+            # it acts on is not the one this guard would resolve.
+            _hit=$GENESIS_HOME
+            _reason="tilde GENESIS_HOME with a newline-terminated HOME"
+        else
+            _candidates+=("$HOME${GENESIS_HOME#\~}")
+        fi
     fi
     for _candidate in "${_candidates[@]}"; do
         [ -z "$_hit" ] || break

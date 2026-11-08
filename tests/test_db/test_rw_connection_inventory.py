@@ -5,6 +5,8 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from tests.test_scripts._update_source import update_text
+
 _ROOT = Path(__file__).resolve().parents[2] / "src" / "genesis"
 _IMPLEMENTATIONS = {
     "db/connection.py",
@@ -15,6 +17,8 @@ _UNRELATED_OR_SNAPSHOT = {
     "eval/bench/isolation.py",
     # The card vault's own cards.db (0600, in the 0700 vault dir), never genesis.db.
     "payments/vault_store.py",
+    # vault migrate's copy of that cards.db (a new file in a new 0700 sibling dir).
+    "payments/vault_migrate.py",
 }
 _ISOLATED_RECOVERY_WRITERS = {
     # Stdlib-only, existing staged file; restore/update publish only on success.
@@ -107,7 +111,7 @@ def test_canonical_rw_opens_use_guarded_factories():
 
 def test_update_path_inline_writers_enforce_quarantine():
     repo = _ROOT.parents[1]
-    update = (repo / "scripts" / "update.sh").read_text()
+    update = update_text()
     bootstrap = (repo / "scripts" / "bootstrap.sh").read_text()
     assert 'connect_sqlite_rw(os.environ["GH_DB_PATH"]' in update
     # bootstrap's crash-recovery insert runs under the system python3, before the

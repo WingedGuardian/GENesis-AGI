@@ -49,15 +49,28 @@ fi
 REPO_PATH="${1:-}"
 if [ -z "$REPO_PATH" ]; then
     # Default to the repo this script ships in (scripts/ -> repo root).
-    REPO_PATH="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+    case "${BASH_SOURCE[0]}" in
+        */*) REPO_PATH="${BASH_SOURCE[0]%/*}/.." ;;
+        *) REPO_PATH=".." ;;
+    esac
 fi
 if [ ! -d "$REPO_PATH" ]; then
     printf '[code-intel-freeze] ERROR: repo path not a directory: %s\n' "$REPO_PATH" >&2
     exit 1
 fi
 # Physical path — the per-repo lock is keyed on it (must match the entrypoint's
-# `cd && pwd -P`, so a symlinked spelling maps to the same lock).
-REPO_PATH="$(unset CDPATH; cd "$REPO_PATH" && pwd -P)"
+# lossless physical capture, so literal trailing newlines and symlinks agree).
+# A bare "-" is a directory name here, not cd's $OLDPWD shorthand.
+[ "$REPO_PATH" = - ] && REPO_PATH=./-
+if ! _repo_physical="$(unset CDPATH; cd -P -- "$REPO_PATH" && printf '%s.' "$PWD")"; then
+    printf '[code-intel-freeze] ERROR: cannot resolve physical repository path\n' >&2
+    exit 1
+fi
+REPO_PATH="${_repo_physical%.}"
+# Match Linux/Python's single-root spelling before choosing a lock.
+while [[ "$REPO_PATH" == //* ]]; do
+    REPO_PATH="${REPO_PATH#/}"
+done
 
 GENESIS_HOME="${GENESIS_HOME:-$HOME/.genesis}"
 LOCK_DIR="$GENESIS_HOME/locks"

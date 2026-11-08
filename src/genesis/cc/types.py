@@ -7,6 +7,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from genesis.cc.final_status import FinalStatus
 
 # CC's spawn/escape-class tool names — the single source of truth for the restricted CC
 # sessions where spawning would escape the parent's tool restrictions: reflection (fully
@@ -415,6 +419,12 @@ class CCInvocation:
     # autonomy executors, mail judge) opt in. NEVER changes control flow —
     # detection/alerting only, never a raise or failover.
     expect_output: bool = False
+    # Ask the session to end with a ``final_status`` block (cc/final_status.py):
+    # the invoker adds the contract to the system prompt, then splits the block
+    # off ``CCOutput.text`` into ``CCOutput.final_status``, so the caller's own
+    # parser reads the text it always did. Set by callers that own a
+    # ``cc_sessions`` row and record its outcome; foreground turns never set it.
+    report_status: bool = False
     # cc-loop-01: opaque per-session key for the invoker's proc registry, so an
     # interrupt (e.g. Telegram /stop) targets THIS session's subprocess and not
     # a concurrent background one. None → keyed by pid (never cross-fired).
@@ -579,6 +589,10 @@ class CCOutput:
     # CC transcript on disk. Sibling of `bg_truncated`: both say "this result is
     # partial", and both exist so the partiality cannot be silent.
     stream_lines_dropped: int = 0
+    # The session's own account of how it ended, split off ``text`` by the
+    # invoker when the invocation set ``report_status``. None: not asked for, or
+    # no block ended the text.
+    final_status: FinalStatus | None = None
 
 
 @dataclass(frozen=True)
@@ -596,6 +610,27 @@ class StreamEvent:
     #: a caller can ask "how many blocks would this line have produced?" without
     #: re-implementing the extraction — see ``recognized_blocks``.
     _RECOGNIZED_BLOCKS = ("thinking", "text", "tool_use")
+
+    @property
+    def is_synthetic(self) -> bool:
+        """True for an ``assistant`` line the CLI wrote itself, not the model.
+
+        CC reports a usage limit as an assistant message with one text block
+        ("You've hit your weekly limit ...") whose ``message.model`` is
+        ``"<synthetic>"``; its transcript record also carries
+        ``isApiErrorMessage: true`` and ``error``. That text is a notice about
+        the run, not an answer, so a guard asking "did answer text reach the
+        user?" must not count it. The model check reads the ``message`` object
+        the stream event shares with the transcript record; the two flags are
+        honoured when the line carries them.
+        """
+        raw = self.raw or {}
+        if raw.get("type") != "assistant":
+            return False
+        message = raw.get("message")
+        if isinstance(message, dict) and message.get("model") == "<synthetic>":
+            return True
+        return raw.get("isApiErrorMessage") is True or bool(raw.get("error"))
 
     @staticmethod
     def recognized_blocks(raw: dict) -> int:

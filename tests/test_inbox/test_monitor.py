@@ -162,7 +162,9 @@ def test_set_build_lane_wires_hook(monitor):
 
 
 @pytest.mark.asyncio
-async def test_silently_omitted_url_requeues_not_baselines(monitor, inbox_dir, db, mock_invoker):
+async def test_silently_omitted_url_requeues_not_baselines(
+    monitor, inbox_dir, db, mock_invoker, mock_session_manager
+):
     """An evaluation that never MENTIONS one of its URLs must not complete.
 
     Silent omission emits no give-up language, so _has_url_failures cannot
@@ -199,6 +201,11 @@ async def test_silently_omitted_url_requeues_not_baselines(monitor, inbox_dir, d
     assert "secret-two" not in row["error_message"]
     assert row["evaluated_content"] is None
     assert row["retry_count"] == 1
+    # The retry lane re-runs it: parked work, not a stop the hourly page lists.
+    assert mock_session_manager.complete.await_args.kwargs == {
+        "outcome": "parked",
+        "outcome_reason": "url_retry",
+    }
 
 
 @pytest.mark.asyncio

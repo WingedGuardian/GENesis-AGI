@@ -10,6 +10,10 @@ from genesis.observability.health_data import HealthDataService
 from genesis.resilience.deferred_work import DeferredWorkQueue
 from genesis.routing.dead_letter import DeadLetterQueue
 
+# The health snapshot's deploy section would run the real deploy engine
+# (see the deploy_engine_unanswered fixture in tests/conftest.py).
+pytestmark = pytest.mark.usefixtures("deploy_engine_unanswered")
+
 
 @pytest.mark.asyncio
 async def test_both_ego_contexts_render_real_queue_snapshot_depths():

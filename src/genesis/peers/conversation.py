@@ -311,7 +311,9 @@ class ConversationService:
                 while True:
                     try:
                         await update_state(self.runtime._db, sid, "failed", error="not_started")
-                        await cc_sessions.update_status(self.runtime._db, sid, status="failed")
+                        await cc_sessions.update_status(
+                            self.runtime._db, sid, status="failed", outcome_reason="not_started"
+                        )
                         break
                     except Exception as exc:
                         now = time.monotonic()

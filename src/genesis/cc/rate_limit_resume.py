@@ -50,7 +50,11 @@ async def _redispatch(db, park: dict) -> None:
     payload = json.loads(park["payload_json"])
     await direct_session_queue.enqueue(
         db,
-        prompt=payload.get("prompt", ""),
+        # A conversation capped after tool calls carries their inventory; the
+        # note is rendered here so the stored prompt stays the bare request.
+        prompt=park_helpers.with_already_ran_note(
+            payload.get("prompt", ""), payload.get("ran"),
+        ),
         profile=payload.get("profile", "research"),
         model=payload.get("model", "sonnet"),
         effort=payload.get("effort", "high"),

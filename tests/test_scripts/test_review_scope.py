@@ -953,6 +953,8 @@ def test_the_explicit_rules_FULLY_EXPLAIN_the_critical_set():
 
     def declared(path: str) -> bool:
         """The critical rules, re-expressed from the module's own constants."""
+        if path in _rs._LANE_CRITICAL_CONFIG_PATHS:
+            return True
         if any(path.startswith(pre) for pre in _rs._LANE_CRITICAL_PREFIXES):
             return True
         base = os.path.basename(path)
@@ -1014,6 +1016,224 @@ def test_lane_config_is_ORDINARY_not_critical():
     """
     assert _rs.classify_lane(["config/reflex.yaml"], hook_surface=False) == "standard"
     assert _rs.classify_lane(["config/github_steward.yaml"], hook_surface=False) == "standard"
+
+
+_LANE_CRITICAL_CONFIG_LITERAL = [
+    # read by CI checks
+    ".gitleaks.toml",
+    ".leak-scan-history-allow.json",
+    "config/atomic_write_baseline.json",
+    ".genesis-hook-versions",
+    "config/mutation_gate.json",
+    "config/gate_defects.json",
+    # approval gates
+    "config/autonomous_cli_policy.yaml",
+    "config/autonomy_rules.yaml",
+    "config/autonomy.yaml",
+    "config/payments.yaml",
+    # levers that switch an outbound or irreversible action on
+    "config/board.yaml",
+    "config/contributor_worklog.yaml",
+    "config/marketing_outreach.yaml",
+    "config/career_outreach.yaml",
+    "config/desktop_takeover.yaml",
+    "config/entity_adjudication.yaml",
+    "config/updates.yaml",
+]
+
+
+@pytest.mark.parametrize("path", _LANE_CRITICAL_CONFIG_LITERAL)
+def test_lane_gate_harness_config_is_critical(path):
+    """Data files that decide what a CI check enforces, or that arm an approval
+    gate or an outbound action. A PR editing ONLY one of them can silence a check
+    or switch an action on, so it is reviewed at the bar of the code that reads
+    it rather than as ordinary config. Listed literally, not read from the
+    constant, so dropping one fails here."""
+    assert _rs.classify_lane([path], hook_surface=False) == "critical"
+
+
+def test_the_literal_list_and_the_constant_agree():
+    """Adding a path to the constant without the literal list would leave it
+    untested; this makes the two lists move together in both directions."""
+    assert set(_LANE_CRITICAL_CONFIG_LITERAL) == set(_rs._LANE_CRITICAL_CONFIG_PATHS)
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["pyproject.toml", "config/guardian.yaml", "config/cc_rate_limit_resume.yaml"],
+)
+def test_the_named_exclusions_stay_standard(path):
+    """Excluded on purpose, with the reason in the constant's comment. Moving one
+    in is a decision to make there, not a side effect of something else."""
+    assert _rs.classify_lane([path], hook_surface=False) == "standard"
+
+
+#: How a CI script names a data file. Three shapes:
+#:   1. a path join on a `config` component, `/` or `,` separated, any quote, any
+#:      depth: `REPO / "config" / "x.json"`, `os.path.join(R, "config", "x.json")`;
+#:   2. a literal `config/....{json,yaml,yml,toml,txt}`;
+#:   3. a repo-root dotfile, with or without an extension, standing alone or after
+#:      a `/`: `.gitleaks.toml`, `"$ROOT/.genesis-hook-versions"`.
+#: Only names that are TRACKED files count, so a stray match on prose costs nothing.
+_CI_DATA_FILE = re.compile(
+    r"""['"]config['"]\s*[/,]\s*((?:['"][\w.-]+['"]\s*[/,]\s*)*)['"]([\w.-]+)['"]"""
+    r"""|(?<![\w./-])(config/[\w./-]+\.(?:json|ya?ml|toml|txt))(?![\w.-])"""
+    r"""|(?:^|[\s'"=/(\[])(\.[\w-]+(?:\.(?:toml|ya?ml|json|cfg|ini))?)(?=['"\s),;\]}:|&]|$)"""
+)
+
+
+def _ci_data_names(line: str) -> list[str]:
+    """Every data-file name `_CI_DATA_FILE` reads off one line.
+
+    A join emits EVERY prefix of its parts (`config/a`, `config/a/b`, ...),
+    because a later quoted argument looks like one more part:
+    `open(REPO / "config" / "x.json", "r")` joins to `config/x.json/r`. The
+    caller keeps only names that are tracked files, which picks the right one.
+    """
+    names = []
+    for middle, last, slashed, dotfile in _CI_DATA_FILE.findall(line):
+        if last:
+            parts = [x.strip(" '\"") for x in re.split(r"[/,]", middle) if x.strip(" '\"")]
+            parts.append(last)
+            names.extend("/".join(["config", *parts[: i + 1]]) for i in range(len(parts)))
+        else:
+            names.append(slashed or dotfile)
+    return names
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ('baseline = REPO / "config" / "atomic_write_baseline.json"', {"config/atomic_write_baseline.json"}),
+        ("p = REPO / 'config' / 'x.json'", {"config/x.json"}),
+        ('os.path.join(ROOT, "config", "x.yaml")', {"config/x.yaml"}),
+        ('Path("config", "x.toml")', {"config/x.toml"}),
+        ('REPO / "config" / "sub" / "x.json"', {"config/sub/x.json"}),
+        # A trailing positional argument looks like one more path part; every
+        # prefix is emitted, so the real name is still among them.
+        ('with open(REPO / "config" / "x.json", "r") as f:', {"config/x.json"}),
+        ('load("config", "x.yaml", "utf-8")', {"config/x.yaml"}),
+        ("python check.py config/x.json --repo .", {"config/x.json"}),
+        ('"$gl" detect -c .gitleaks.toml --source .', {".gitleaks.toml"}),
+        ('VERSIONS_FILE="$REPO_ROOT/.genesis-hook-versions"', {".genesis-hook-versions"}),
+        ('ALLOW_PATH = ".leak-scan-history-allow.json"', {".leak-scan-history-allow.json"}),
+        ("tool -c .gitleaks.toml, --x", {".gitleaks.toml"}),
+        ("cfg = [.gitleaks.toml]", {".gitleaks.toml"}),
+        ("cat .gitleaks.toml|grep x && cat .gitleaks.toml&", {".gitleaks.toml"}),
+    ],
+)
+def test_the_ci_data_extractor_reads_each_spelling(line, expected):
+    """The derived test below is only as good as what this regex sees. Its first
+    version missed the shell `$ROOT/.dotfile` form, single quotes and path joins,
+    and its precondition could not notice, so each spelling is pinned here."""
+    assert expected <= set(_ci_data_names(line))
+
+
+@pytest.mark.parametrize(
+    ("line", "wrong"),
+    [
+        # A `config/` path under another directory is not the root config file.
+        ('"src/genesis/config/foo.yaml"', "config/foo.yaml"),
+        ('"myconfig/x.json"', "config/x.json"),
+        # A longer name is not truncated to a shorter tracked one.
+        ("cp config/x.json.bak .", "config/x.json"),
+        ("cat config/genesis.yaml.example", "config/genesis.yaml"),
+    ],
+)
+def test_the_ci_data_extractor_does_not_misattribute(line, wrong):
+    assert wrong not in _ci_data_names(line)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # Declared non-goals: a variable holding the directory, data outside
+        # `config/` that is not a dotfile, and implicit readers (ruff, pytest and
+        # pyproject.toml) are not visible to any spelling-based extractor.
+        'DIR = REPO / "config"',
+        'data = ROOT / "scripts" / "data" / "x.json"',
+        "ruff check src/ tests/ scripts/",
+    ],
+)
+def test_the_ci_data_extractor_declared_non_goals(line):
+    assert _ci_data_names(line) == []
+
+
+def _ci_read_data_files(root: Path) -> dict[str, list[str]]:
+    """Tracked data files named in `ci.yml` or in the scripts it invokes (plus
+    every `scripts/ci/` file), mapped to where each is named.
+
+    ONE level deep: a helper that an invoked script calls in turn, outside
+    `scripts/ci/`, is not read, and neither is a path built in an f-string or
+    with backslash joins. Both are declared gaps of this watchdog test, not of
+    the lane itself; none applies to a tracked data file today."""
+    workflow = root / ".github" / "workflows" / "ci.yml"
+    tracked = set(
+        subprocess.run(
+            ["git", "-C", str(root), "ls-files"], capture_output=True, text=True, check=True
+        ).stdout.split()
+    )
+    sources = {str(workflow.relative_to(root))}
+    sources |= set(_ci_invoked_scripts(workflow))
+    sources |= {p for p in tracked if p.startswith("scripts/ci/")}
+    found: dict[str, list[str]] = {}
+    for rel in sorted(sources):
+        path = root / rel
+        if not path.is_file():
+            continue
+        for n, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue
+            for name in _ci_data_names(line):
+                if name in tracked:
+                    found.setdefault(name, []).append(f"{rel}:{n}")
+    return found
+
+
+def test_data_files_read_by_ci_checks_are_critical():
+    """Derived, like `test_required_check_implementations_are_critical`: a CI
+    check that starts reading a new baseline, allowlist or manifest, in a spelling
+    `_CI_DATA_FILE` recognises, fails HERE until the file joins
+    `_LANE_CRITICAL_CONFIG_PATHS`. Its first version was a hand-checked list that
+    said "no other config file is read by CI" and missed `check_atomic_writes.py`,
+    which builds the path as `REPO / "config" / ...`."""
+    root = Path(__file__).resolve().parents[2]
+    found = _ci_read_data_files(root)
+    assert {
+        ".gitleaks.toml",
+        ".genesis-hook-versions",
+        "config/atomic_write_baseline.json",
+    } <= set(found), (
+        f"precondition: the extractor no longer sees files it is known to find "
+        f"({sorted(found)}); fix it before trusting this test"
+    )
+    missed = {
+        name: where
+        for name, where in found.items()
+        if _rs.classify_lane([name], hook_surface=False) != "critical"
+    }
+    assert not missed, (
+        f"data files read by CI checks are outside the critical lane: {missed} — "
+        f"add each to review_scope._LANE_CRITICAL_CONFIG_PATHS"
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "config/mutation_gate.yaml",  # same stem, different file
+        "config/sub/mutation_gate.json",  # same basename, different place
+        "config/mutation_gate.json.bak",  # a continuation of the name
+        "docs/config/gate_defects.json",  # the name under another root
+        "config/gate_defects_notes.json",
+        "docs/.gitleaks.toml",  # a dotfile's name below the root
+    ],
+)
+def test_lane_gate_harness_config_matches_exact_paths_only(path):
+    """The exception is a set of EXACT paths, never a `config/` prefix or a
+    basename rule: the prefix was measured and dropped (see the test above), and
+    a basename rule would follow the name to any directory."""
+    assert _rs.classify_lane([path], hook_surface=False) == "standard"
 
 
 def test_lane_auth_tag_is_NOT_critical():
