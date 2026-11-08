@@ -4708,8 +4708,8 @@ Refusing a proposed update preserves a previously valid opt-in.
   `update_refused.json`.
   The rebuilt tip is recorded in the "merging" row as soon as it is adopted.
   **The live-move repair** (`scripts/lib/live_move_repair.py`, #3492 PR D1;
-  `scripts/deploy_candidates repair-move [--wait N] [--dismiss TS] [--explain]`;
-  the module itself also takes `--restore TS --check`, below
+  `scripts/deploy_candidates repair-move [--wait N] [--dismiss TS | --restore TS
+  [--check]] [--explain]`; `--restore`, below
   runs the copy bootstrap installs under `~/.genesis/lib/live-repair/current`,
   never the checkout's; installing that kit, and running the repair at every
   server start, is PR D2, not yet built; `--explain` needs no kit: with none
@@ -4751,8 +4751,7 @@ Refusing a proposed update preserves a previously valid opt-in.
   recorded by type and mode. The writer generates NO shell (#3868, #3869,
   #3492 B2a): `reapply` stays `[]` for older readers, and the report, its
   output and its alert name `scripts/deploy_candidates repair-move --restore
-  <ts>` (`--check` first), which puts nothing back until the restore lands
-  (B2b). Every saved copy is recorded in `SAVED.json` beside `REPAIR.json`
+  <ts>` (`--check` first), the restore below (#3492 B2b). Every saved copy is recorded in `SAVED.json` beside `REPAIR.json`
   (which names it as `integrity`): a regular file's sha256 (computed while
   copying; `null` over 256 MiB, the restore check's per-file budget) and the
   mode the checkout had, a symlink's target, a FIFO's mode; bounded at
@@ -4806,15 +4805,23 @@ Refusing a proposed update preserves a previously valid opt-in.
   counts, flag-only and deleted ones too; no other row field is read), a result enum (`healed`,
   `healed-kept`, `unresolved`, `superseded`, `unfinished`, else `unknown`: no
   report string reaches the snapshot, the alert text or the alert key),
-  `dismissed` and `unresolved`; `live_repair_saved:<n>` sums the reports not
-  `--dismiss`ed. It loads the repair's module once per snapshot when any
+  `dismissed`, `unresolved` and `restore_refused` (the parts its last restore
+  refused); `live_repair_saved:<n>` sums the reports neither `--dismiss`ed nor
+  cleared by a restore (its `restore.restored_at` a string and
+  `restore.refused` an int, never a bool, of 0). It loads the repair's module once per snapshot when any
   report dir exists (a module that cannot load, or lacks a name the reader
   uses, reads every report as refused and blanks nothing), and a linked worktree reads none. The awareness paragraph
   names, per undismissed report with saved paths, its backup folder,
   `scripts/deploy_candidates repair-move --restore <ts>` (once both the
-  installed repair kit and `scripts/deploy_candidates` include it) and `--dismiss <ts>`, says a restore leaves
-  uncommitted edits the deploy scripts refuse, and that backups are pruned 90
-  days after the last write to their folder; it escapes any text a database
+  installed repair kit and `scripts/deploy_candidates` include it; an exit 2
+  "not available yet" means an older kit) and `--dismiss <ts>`, says a
+  restore leaves uncommitted edits (tracked ones block deploy_code_only.sh and
+  update.sh, untracked ones deploy_code_only.sh only under `src/`, `config/` or
+  `pyproject.toml`), that backups are pruned 90 days after the last write to
+  their folder, and, for a report whose last restore refused parts, that its
+  output names each and that a part it can never write goes back by hand from
+  the folder's `tree/`, then `--dismiss`; the guardian's diagnosis shows the
+  newest report's `restore.restored_at` and `restore.refused`, quoted; it escapes any text a database
   column cannot hold rather than losing the alert, and is replaced whenever
   the reports it names change. `GET /api/genesis/health` reduces
   `live_repairs` to an allow-list of its counts for a caller without the
@@ -4832,23 +4839,19 @@ Refusing a proposed update preserves a previously valid opt-in.
   nothing written), so it cannot race a restore's own rewrite. `scripts/
   deploy_candidates repair-move --restore TS [--check]` passes through to the
   kit. `live_move_repair.py --restore TS
-  --check` (#3492 PR B1; restoring itself is PR B2, and until then `--restore`
-  without `--check` exits 2) is the read-only judge of what a restore would
+  --check` (#3492 PR B1) is the read-only judge of what a restore would
   write, in a second kit source, `scripts/lib/live_move_restore.py`, loaded
   from the kit's own directory like the guard. It takes the repair's locks in
   the repair's order with a short wait (30 s; `--wait` honoured) and exits 1
-  while any is held, or while the guard calls the checkout `mixed_tree`. It
-  reaches `deploy-backups` by an fd opened from the resolved home without following
+  while any is held (naming the pid the update state records, if any), or
+  while the guard calls the checkout `mixed_tree` or `guards`. It reaches
+  `deploy-backups` by an fd opened from the resolved home without following
   a link and reads everything after through that fd; that folder and every
   node of the report dir (at most 200,000, never through a link) must be
   this user's, and every one but a symlink without group or world write,
   else the whole report is `other:not-owned <path>`, before `REPAIR.json` is
   parsed (a writer with this user's uid is out of scope: it can already edit
-  the checkout). A report with a node part below another (the writer never
-  writes one) is `other:bad-report`, and one with no integrity record is
-  judged with a note that a restore refuses it. Every git call of the repair
-  and the check runs with `core.fsmonitor=false` and
-  `core.hooksPath=/dev/null`. It
+  the checkout). It
   first refuses the whole report if a row is not exactly what the writer
   writes (relative paths outside `.git`, at most 4,096 bytes, the sum of
   length x depth over the rows within the report byte cap; git modes and
@@ -4868,31 +4871,161 @@ Refusing a proposed update preserves a previously valid opt-in.
   every foreign row (its node, only where the repair changed and could reach
   it; its index entries, only where they differ from the tag's; its flag) is
   printed as `as-left` (the tag's state: the repair's), `already-restored`
-  (the saved state) or `other:<reason>`. An as-left part counts as restorable
+  (the saved state, every saved copy it compares still the one `SAVED.json`
+  records) or `other:<reason>`. A saved copy stands for its record's mode,
+  the one the restore writes (a file's executable bit read as the repair reads
+  it, S_IXUSR; a FIFO's without setuid, setgid and sticky), never the copy's
+  own, so a copy chmodded after the repair changes no verdict. An as-left part counts as restorable
   only while HEAD's entries at, below and above the path equal the tag's
   (`changed-upstream`), the index there equals the tag's except at rows
   already restored (`index-changed`), no index entry sits at a parent, no
   parent is a symlink or a non-directory, and no newer report holds an
   overlapping path. A parent that is this report's own row, already put
-  back, refuses none of these for its child (the writer's steps run parents
-  first, so a restore killed between them still converges). A symlinked or
+  back, refuses none of these for its child (so a restore stopped between
+  them still converges); nor does an index entry at a parent that is the
+  tag's, as the repair left it, on a row that saved something else there (the
+  restore's one index call replaces it, under the footprint check below), or
+  a directory row's path still holding the tag's non-directory, for a row it
+  covers (index and flag parts only; the restore writes the directory first). A symlinked or
   non-directory parent is decided before anything below it is read, and no
   directory, in the checkout or the backup, is walked through a link. A tag
   directory is compared on the tag's own paths only (an untracked cache in it
-  changes no part), and only for a node part. An index part whose blob is
+  changes no part), and only for a node part; the restore's own gate is
+  stricter (it moves the whole directory aside): every other file there must
+  be one git ignores (once moved aside, by the rules that moved with it: a
+  rule inside the directory decides, read in the aside, else the checkout's
+  outside it; and, as git does, nothing below a directory excluded by either
+  is re-included by a rule inside it, each directory asked with `--no-index`,
+  since one holding tracked files matches no rule otherwise, MEASURED on git
+  2.43). A restored directory with extras git ignores (the
+  server's `__pycache__`) still reads already-restored. An index part whose blob is
   neither saved (a regular `index-blobs/<oid>` hashing to it) nor in the
   object store is `other:not-saved`. Every file is hashed in 1 MiB chunks
   from an fd opened without following a link or blocking on a FIFO, and only
   while it is still the file its lstat saw. One check hashes no file over
   256 MiB, at most 2 GiB in all, and looks at most at 200,000 nodes; a part
   that would read past that is `other:too-large`. A symlinked or non-regular
-  lock file is refused by name, never followed. A directory row is never restored whole:
-  its `entry` parts are the saved files whose bytes are not the move target's
-  (only the foreign rows themselves when the target cannot be read); sockets
-  and devices are `other:cannot-make`. Exit 0 only when every part is as-left
+  lock file is refused by name, never followed. A directory row's `entry`
+  parts are the saved files whose bytes are not the move target's, or whose
+  copy is not the one `SAVED.json` records (so a copy changed to the target's
+  bytes is staged, and refused, never left out as the update's); only the
+  foreign rows themselves when the target cannot be read; sockets
+  and devices are `other:cannot-make`. A saved directory whose `SAVED.json`
+  says `complete: false` is `other:no-hash`, a part that goes back by hand: a
+  copy it never recorded and the backup lost since cannot be seen, so the
+  directory could be built without it. Exit 0 only when every part is as-left
   or already-restored. It writes no report and no backup; like the repair, it
   creates `locks/update.lock` and `.git/genesis-checkout.lock` when they are
   missing.
+  **The restore** (`--restore TS` without `--check`, #3492 PR B2b, a
+  third kit source, `scripts/lib/live_move_restore_write.py`, which uses the
+  check's judge; the check stays in `live_move_restore.py`) passes the same gates (and refuses a report
+  with no `SAVED.json` whole, `other:no-integrity`, and one with a node part
+  below another, `bad-report`), judges every part once under the held locks
+  with the stricter gate, and writes only parts judged `as-left`; it never
+  restarts anything. Each node part, the one `REPAIR.json` names in flight
+  first: STAGE the saved node in a run folder
+  `deploy-backups/<UTC time>-<pid>-live-move-restore/new/<path>` (made 0700 at
+  the first write; each file copied with its sha256 checked against
+  `SAVED.json`, else `other:hash-mismatch`, a missing record
+  `other:no-hash`, a null hash `other:too-large`; its mode the record's &
+  0o777, so setuid, setgid and sticky never come back; a directory row built
+  whole without the update's own files; a FIFO from its row's or record's
+  mode); record the part in flight; move what is at the path to
+  `<run>/aside/<path>` (folders made 0700); judge the aside again, each such
+  read on a budget of its own, never the one judging every row spent (a write
+  since the judge is put back and the part refused
+  `changed-during-restore`); put the staged node in with
+  `renameat2(RENAME_NOREPLACE)` through ctypes (the one move it makes, for
+  every kind and the put-back, so nothing that appeared meanwhile is ever
+  replaced); judge the aside once more (a write through an open fd is named);
+  clear the in-flight record. A run killed between the put-in and that
+  judgment leaves it to the next: the part `REPAIR.json` names in flight
+  reads already-restored only while its aside is still what was moved there,
+  else `other:changed`, naming the aside (`--check` too). The in-flight
+  record is cleared only once its part is back or its aside holds nothing
+  the restore did not move there: while the in-flight part's aside holds
+  anything else (a write after the move, through an open fd), unless that
+  part read already-restored or as-left by the resume rule (both judged the
+  aside itself), the record is kept, and since it has one slot no other part
+  is written (`other:inflight-unresolved`, naming the aside, in `--check`
+  too; the in-flight part too, when its path holds the tag's state again), so
+  every run names it and exits 1 until what is there is moved out. An aside
+  still holding the repair's own as-left copy (the part refused by a gate
+  after a kill, or a put-back that failed) holds nothing back; that one read
+  has its own budget. Moving the content out releases the other parts, and
+  the in-flight path is then judged by what it holds: the saved node a kill
+  after the put-in left there reads already-restored; a path a kill after
+  the aside left empty, or one holding whatever appeared there after a failed
+  put-back, goes back by hand, or the report is `--dismiss`ed. Every checkout-side call goes through directory
+  fds opened one component at a time without following a link; a missing
+  parent is made with `mkdir`, one at a time. `EXDEV` refuses the part
+  `other:cross-device` and an unsupported RENAME_NOREPLACE (`EINVAL`,
+  `ENOSYS`) `other:no-noreplace`, at the aside or the put-in, with nothing
+  moved; there is no copy fallback. Then the index parts whose node (if any)
+  is back go in ONE `git update-index -z --index-info` call: the saved blobs
+  the object store lacks are written back first (each must hash to its
+  name), and the whole index is read once right before the call; a part
+  whose footprint (its path; for a stage-0 entry also every entry below it
+  and a file entry at a parent, git's directory/file rule, MEASURED) holds an
+  entry that is not one of this report's rows as the judge read it is
+  refused `changed-during-restore`, a stage-0 part with a refused row below
+  it `child-refused`, one whose footprint holds a flag (read with the index)
+  that the restore does not set again after the call `other:flag-changed`
+  (the call re-creates entries unflagged), and the footprint is dropped explicitly. A row
+  whose index part is already back can sit in that footprint (an unmerged entry
+  below a stage-0 file, which git keeps beside it, MEASURED on git 2.43): its
+  saved entries are written again in the same call, never dropped. After the call
+  the WHOLE index must be the one expected (those entries included), else every index part
+  `index-skipped`, naming `<run>/index-before.txt`, where the footprint's
+  entries from before the call were written (0600, `ls-files -s -z` records)
+  before it ran; an index part runs only when the node part of its path and of
+  every parent is back (`row-refused` otherwise, so a covered child waits for
+  its directory row); a failing call (a session's git holding `index.lock`)
+  refuses them `index-locked`. Flags go after the call (S skip-worktree, a
+  lowercase tag assume-unchanged, s both: skip-worktree first, so the S a run
+  killed between the two leaves reads as-left; a failure `flag-failed`), each
+  only on the entry the judge read or the index call wrote, the index read
+  once right before them (one a session staged since is `changed-during-restore`,
+  never flagged; the same milliseconds residual as the index call), then one
+  `update-index -q --refresh`, then a second judge that must read
+  already-restored for every part written, and for a flag or an index part
+  already restored whose entry the index call replaced (else `post-check`).
+  `REPAIR.json` gets a `restore` block, `{inflight: [run, path, "node"] |
+  null, refused: <int>, restored_at: <str> | null}` (no per-part list; the
+  output carries those), rewritten under update.lock after a re-read;
+  `restored_at` only when nothing was refused, and a re-run that changes
+  nothing writes nothing. A failure to write it stops the run, naming the
+  part in flight and the run folder. The resume rule lives in the judge, so
+  `--check` agrees: a node part reads `as-left (interrupted restore ...)`
+  when the in-flight record names it, its path is absent, the run folder and
+  every folder the restore made under its `aside/` are this user's with mode
+  0700 (the aside itself, the checkout's own node, only owned), and the aside
+  is the as-left state; an aside that is not names where that newer content
+  is. The output gives one line per part (`restored`, `already-restored` or
+  `refused:<reason>`, with a note where things are), a summary, the restored
+  paths and what they now block (tracked edits: deploy_code_only.sh and
+  update.sh; untracked ones: deploy_code_only.sh, only under `src/`,
+  `config/` or `pyproject.toml`), the run folder (pruned 90 days after its
+  last write), the ignored files a directory moved aside held, and for a
+  part it can never write (`cannot-make`, `target-unreadable`, `too-large`,
+  `no-hash`) to put it back by hand from the report's `tree/`, then
+  `--dismiss`. Exit 0 when nothing was refused, else 1. Residuals, named: a
+  session's git that stages in the milliseconds between that full index
+  read and the call (git has no compare-and-swap for the index; owner
+  ruling: accepted); disk_hygiene's prune takes no lock, so a report over 90
+  days old can vanish mid-restore (reads then fail, each part checks its
+  staged copy first, nothing half-written); a same-uid writer can forge a
+  report; a filesystem without RENAME_NOREPLACE, or a home on another
+  filesystem than the checkout, refuses every node part by name; a resume can
+  undo a deletion a person made between the put-in and its record; a
+  restored `.gitignore` of `*` hides extras in its directory from the
+  already-restored check; a saved directory's empty subdirectories are not
+  rebuilt (they stay in `tree/`); a server importing from a directory moved
+  aside fails there until it restarts; every git call of the repair and the
+  restore runs with `core.fsmonitor=false` and `core.hooksPath=/dev/null`, but
+  a clean filter a `.git/config` driver and `.gitattributes` name still runs on
+  the closing `--refresh`, as in any git call in that checkout.
   `--post-merge` on `live` never runs the engine. What is recorded and sent to
   the host guardian is the origin/main commit `live` is built on.
 - **_config_overlay.py**: `.local.yaml` deep-merge (user config dir first;
