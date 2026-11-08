@@ -815,6 +815,7 @@ async def test_the_audio_fallback_treats_an_overflowing_duration_as_unknown(
     int() raised OverflowError instead of skipping audio as unknown length."""
 
     async def run(argv):
+        """Fake yt-dlp that writes metadata with an overflowing duration."""
         out = argv[argv.index("-o") + 1].replace("%%", "%")
         stem = out.replace("video.%(ext)s", "video.")
         if "--write-info-json" in argv:
@@ -828,10 +829,13 @@ async def test_the_audio_fallback_treats_an_overflowing_duration_as_unknown(
     monkeypatch.setattr(yt, "big_tmp_dir", lambda: tmp_path)
 
     async def audio(self, result, url, **kw):
+        """Fail if audio transcription is attempted for this fetch."""
         raise AssertionError("audio must not be downloaded")
 
     monkeypatch.setattr(YouTubeProcessor, "_transcribe_audio", audio)
     result = await YouTubeProcessor().fetch("https://youtu.be/abc123")
+    assert result.metadata["title"] == "T"
+    assert result.metadata["duration"] == float("inf")
     assert result.transcript is None
     assert any("unknown length" in e for e in result.errors), result.errors
 
