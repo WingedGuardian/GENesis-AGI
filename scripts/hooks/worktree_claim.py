@@ -85,17 +85,17 @@ PAYLOAD_NAMESPACE = "genesis.worktree-ownership"
 RULE_CLAIM = "claim"
 RULES = (RULE_CLAIM,)
 
-# A session process: argv[0]'s basename is exactly `claude`. MEASURED: the
+# A session process: argv[0] has a supported Claude launcher basename. MEASURED: the
 # wrapper that launches it (`bash -c cd ... && claude ...`) also contains the
 # string "claude", so a substring test over the whole cmdline matches the shell
 # too and would record the WRONG pid -- one that outlives the session it wraps.
-_SESSION_EXE = "claude"
+_SESSION_EXES = {"claude", "claude.exe", "claude-code"}
 
 _GIT_TIMEOUT = 30
 
-# Session ids are UUID-shaped. Anything else is not one, and is refused rather
-# than escaped -- the id is echoed into a lock reason a human reads.
-_SID_RE = re.compile(r"[0-9a-fA-F-]{1,64}\Z")
+# Load the canonical stdlib predicate by sibling path: reapers also import this
+# module directly under system Python, without hooks on sys.path.
+_is_safe_session_id = runpy.run_path(str(Path(__file__).with_name("hook_input.py")))["is_safe_session_id"]
 
 # Locks written by something else that we can nonetheless NAME. Claude Code's own
 # `isolation: "worktree"` subagents lock the worktree they create, with a reason
@@ -293,7 +293,7 @@ def is_session_process(pid: int) -> bool:
         return False
     if not argv or not argv[0]:
         return False
-    return os.path.basename(argv[0].decode(errors="replace")) == _SESSION_EXE
+    return os.path.basename(argv[0].decode(errors="replace")) in _SESSION_EXES
 
 
 def session_pid_from_ancestry(start_pid: int | None = None, max_hops: int = 12) -> int | None:
@@ -524,7 +524,7 @@ def build_payload(
         "pid": pid,
         "start": start,
     }
-    if sid and _SID_RE.match(sid):
+    if _is_safe_session_id(sid):
         payload["sid"] = sid
     return payload
 
@@ -534,6 +534,7 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess | None:
         result = subprocess.run(
             ["git", "-C", str(root), *args],
             capture_output=True,
+            env={k: v for k, v in os.environ.items() if not k.startswith("GIT_") or k.startswith("GIT_CONFIG")},
             timeout=_GIT_TIMEOUT,
         )
         # Paths are bytes: text=True both rejects non-UTF-8 peers and changes
