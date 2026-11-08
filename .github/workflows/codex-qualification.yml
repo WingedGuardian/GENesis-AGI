@@ -3,6 +3,7 @@ on:
   pull_request:
     paths:
       - '.github/workflows/codex-qualification.yml'
+      - '.github/workflows/ci.yml'
       - '.github/test-tools/**'
       - 'scripts/ci/codex_qualification*'
       - 'tests/test_hooks/*codex*'
