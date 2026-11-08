@@ -226,3 +226,33 @@ def test_the_venv_on_path_wins_over_a_checkout_venv(repo, tmp_path):
     # tell them apart by which one ran the import check.
     assert (tmp_path / "stub.log").read_text().split() == ["-m", "genesis.browser.provision", "run"]
     assert (tmp_path / "pathvenv" / "ran").exists()
+
+
+def test_a_relative_invocation_from_outside_the_checkout_loads_the_helper(repo, tmp_path):
+    """Run as `bash <checkout>/scripts/install_browser_stack.sh` from the checkout's
+    parent: the script `cd`s to REPO_DIR before sourcing its secrets-path helper, so
+    a helper path built from the relative BASH_SOURCE[0] no longer resolves and the
+    browser settings are dropped without an error."""
+    out = _env_stub(repo, tmp_path)
+    (repo / "secrets.env").write_text("PLAYWRIGHT_BROWSERS_PATH=/data/pw\n")
+    parent = _SCRIPT.parents[2].parent
+    rel = _SCRIPT.relative_to(parent)
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(tmp_path / "home"),
+        "GENESIS_HOME": str(tmp_path / "gh"),
+        "GENESIS_REPO_DIR": str(repo),
+    }
+    r = subprocess.run(
+        ["bash", str(rel)],
+        cwd=parent,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "secrets_path.sh" not in r.stderr, r.stderr
+    assert "genesis_secrets_path" not in r.stderr, r.stderr
+    assert out.read_text().split("|")[0] == "/data/pw"

@@ -34,6 +34,9 @@ if [ -z "${HOME:-}" ]; then
     export HOME
 fi
 GENESIS_HOME="${GENESIS_HOME:-$HOME/.genesis}"
+# Absolute, before the `cd` below: a relative BASH_SOURCE[0] stops naming this
+# script once the working directory changes.
+SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="${GENESIS_REPO_DIR:-$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 VENV_PY="${VENV_PATH:-$REPO_DIR/.venv}/bin/python"  # VENV_PATH as in genesis.env.venv_path()
 LOCK_DIR="$GENESIS_HOME/locks"
@@ -98,7 +101,7 @@ cd "$REPO_DIR" || { _log "repo directory $REPO_DIR is unreachable"; exit 75; }
 # reaches the downloaders. Last assignment wins, as in systemd's own reader.
 # shellcheck source=lib/secrets_path.sh
 # From this script's own tree, not REPO_DIR (which may name another checkout).
-. "$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/secrets_path.sh"
+. "$SCRIPT_DIR/lib/secrets_path.sh"
 SECRETS_FILE="$(genesis_secrets_path "$REPO_DIR")"
 _load_browser_setting() {
     local key="$1" line="" val
