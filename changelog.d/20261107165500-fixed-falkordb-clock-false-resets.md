@@ -1,6 +1,5 @@
-- **The FalkorDB default-on clock no longer restarts because another session
-  ran tests or a one-off job, or edited unrelated code in the main checkout.**
-  The hourly census still lists such processes, but only a process that serves
-  graph reads, or an uncommitted edit on the graph-read path, resets the
-  14-day clock. Stored census rows are re-judged, so the clock picks up the
-  clean days it had already earned.
+- **The FalkorDB default-on clock ignores unrelated source edits and qualifying
+  recent generic processes.** Generic-process relief requires clean history and
+  a reported start at least 2s inside the 2h30m lookback. Graph-read producers
+  retain their existing proof requirements; dirty-code checks cover the bounded
+  graph-read dependency list. Stored census rows are re-judged.

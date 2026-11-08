@@ -362,7 +362,8 @@ on a reflog gap, a move in the start second, a clock step back or git's expiry
 cutoff), whether ALL of them contain the telemetry module (a module imported
 after start loads whatever is on disk then), plus whether HEAD has the module
 and whether the graph-read path is dirty (`graph_census._RUNTIME_PATHS`: the
-graph and graph-store modules, their callers, the environment and config
+graph and graph-store modules, their callers, direct pressure/DB telemetry
+helpers, the environment and config
 loaders, `config/graphstore.yaml` and the two entry scripts; owner ruling
 47bd37e025174c66 narrowed it from all of `src/`, so an early local run of
 unrelated code does not cost the clock). Git runs with `--no-optional-locks`,
@@ -411,7 +412,7 @@ only memory servers:
   database scope only (owner ruling). One that is unprovable only because it
   runs under another Genesis home or its interpreter cannot be resolved
   (another session's test run or one-off job) does not hold the clock while
-  it started inside the 2h30m history lookback (owner ruling
+  its reported start is at least 2s inside the 2h30m history lookback (owner ruling
   9931626424ee4c6c); an older one still does;
 - replay, listed as excluded because it is not live traffic (owner ruling);
 - another bridge or server beside the host, always dirty.

@@ -1025,6 +1025,9 @@ def test_a_generic_process_in_another_mount_namespace_is_never_foreign(
         "src/genesis/memory/graph.py",
         "src/genesis/memory/graphstore_falkor.py",
         "src/genesis/memory/graph_telemetry.py",
+        "src/genesis/hostmetrics/readings.py",
+        "src/genesis/db/crud/j9_eval.py",
+        "src/genesis/db/connection.py",
         "src/genesis/mcp/memory/core.py",
         "src/genesis/env.py",
     ],
@@ -1036,6 +1039,26 @@ def test_an_edited_file_on_the_graph_path_marks_head_dirty(proc_root, repo, rel)
     f = r / rel
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text("edited = True\n")
+    assert census.build_census(r, proc_root=proc_root)["head_dirty"] is True
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [
+        "src/genesis/hostmetrics/readings.py",
+        "src/genesis/db/crud/j9_eval.py",
+        "src/genesis/db/connection.py",
+    ],
+)
+def test_an_edited_tracked_graph_dependency_marks_head_dirty(proc_root, repo, rel):
+    r, _, _ = repo
+    path = r / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("version = 1\n")
+    _git(r, "add", rel)
+    _git(r, "commit", "-qm", "add graph dependency")
+    assert census.build_census(r, proc_root=proc_root)["head_dirty"] is False
+    path.write_text("version = 2\n")
     assert census.build_census(r, proc_root=proc_root)["head_dirty"] is True
 
 

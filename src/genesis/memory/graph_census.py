@@ -78,11 +78,14 @@ _REPLAY_SCRIPT = "ambient_replay.py"
 #: The code a graph read and its telemetry run through, as git pathspecs: an
 #: uncommitted edit here means a traversal may run code no commit records. Owner
 #: ruling 47bd37e025174c66 narrowed this from all of ``src/`` to the graph path,
-#: so an early local run of unrelated code does not cost the clock; a defect such
-#: an edit causes in a traversal still shows as a fallback in the telemetry.
+#: so an early local run of unrelated code does not cost the clock. This is a
+#: bounded source list, not a certificate of every transitive import.
 _RUNTIME_PATHS = (
     "src/genesis/memory/graph*.py",  # traversal, telemetry, census, cutover, stores
     "src/genesis/db/request_database.py",  # picks the SQL tier or the projection
+    "src/genesis/hostmetrics/readings.py",  # pressure reads inside the query budget
+    "src/genesis/db/crud/j9_eval.py",  # persists traversal telemetry
+    "src/genesis/db/connection.py",  # telemetry and request-database connections
     "config/graphstore.yaml",  # the shipped traversal mode
     "src/genesis/memory/drift.py",  # traversal callers
     "src/genesis/mcp/memory/core.py",

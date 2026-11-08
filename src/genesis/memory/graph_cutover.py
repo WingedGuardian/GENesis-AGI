@@ -64,6 +64,11 @@ _GENERIC_UNPROVABLE = frozenset({"other_genesis_home", "interpreter_unresolved"}
 #: The census writer's history lookback (graph_census.HISTORY_LOOKBACK_S; a test
 #: pins the two equal).
 HISTORY_LOOKBACK = timedelta(hours=2.5)
+#: The writer permits this much boot-time error. A reported start at the old
+#: lower edge may actually predate the history proof; reserve that uncertainty.
+#: A contract test pins this to graph_census._BOOT_TOLERANCE_S without importing
+#: the I/O census writer into this pure evaluator.
+BOOT_TIME_MARGIN = timedelta(seconds=2)
 _CLEAN_OUTCOMES = frozenset({"primary"})
 _NEUTRAL_OUTCOMES = frozenset({"cancelled"})
 
@@ -218,7 +223,11 @@ def _within_lookback(p: dict, at: datetime | None) -> bool:
     ``head_history_telemetry`` covers every commit main's checkout held."""
     raw = p.get("started_at")
     started = parse_ts(raw) if isinstance(raw, str) else None
-    return at is not None and started is not None and at - HISTORY_LOOKBACK <= started <= at
+    return (
+        at is not None
+        and started is not None
+        and at - HISTORY_LOOKBACK + BOOT_TIME_MARGIN <= started <= at
+    )
 
 
 def traversal_breaks_clock(m: dict) -> str | None:

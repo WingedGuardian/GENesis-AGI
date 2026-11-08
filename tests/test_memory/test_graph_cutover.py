@@ -524,7 +524,18 @@ def test_an_unprovable_generic_process_older_than_the_lookback_still_holds_it(un
     old = _generic(unknown, NOW - cut.HISTORY_LOOKBACK - timedelta(seconds=1))
     edge = _generic(unknown, NOW - cut.HISTORY_LOOKBACK)
     assert "may run old code" in cut.census_dirt(_census_metrics(procs=[old]), NOW)
-    assert cut.census_dirt(_census_metrics(procs=[edge]), NOW) is None
+    assert "may run old code" in cut.census_dirt(_census_metrics(procs=[edge]), NOW)
+
+
+@pytest.mark.parametrize("unknown", ["other_genesis_home", "interpreter_unresolved"])
+@pytest.mark.parametrize(
+    ("inside_us", "clean"),
+    [(0, False), (1_999_999, False), (2_000_000, True), (2_000_001, True)],
+)
+def test_generic_history_boundary_reserves_the_boot_time_error(unknown, inside_us, clean):
+    started = NOW - cut.HISTORY_LOOKBACK + timedelta(microseconds=inside_us)
+    row = _census_metrics(procs=[_generic(unknown, started)])
+    assert (cut.census_dirt(row, NOW) is None) is clean
 
 
 def test_the_excuse_needs_the_row_time_a_start_and_a_named_reason():
@@ -566,3 +577,4 @@ def test_the_verdict_lookback_is_the_writer_lookback():
     from genesis.memory import graph_census
 
     assert timedelta(seconds=graph_census.HISTORY_LOOKBACK_S) == cut.HISTORY_LOOKBACK
+    assert timedelta(seconds=graph_census._BOOT_TOLERANCE_S) == cut.BOOT_TIME_MARGIN
