@@ -1,4 +1,4 @@
-"""Inert, explicitly constructed shared HTTP transport; no launcher selects it."""
+"""Explicit shared HTTP transport, selected by the owned shared launcher."""
 
 from ._settings import SharedHTTPConfig, require_qualified_stack
 

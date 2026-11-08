@@ -12,9 +12,9 @@ Usage:
     # HTTP (for external clients):
     python genesis_mcp_server.py --server health --transport streamable-http --port 8100
 
-Architecture note: mcp.run(transport=...) owns the event loop (via anyio).
-Bootstrappers must be synchronous — async DB connections are opened inside
-the MCP server's event loop via FastMCP's _lifespan hook.
+Legacy mcp.run(transport=...) owns the event loop (via anyio); its synchronous
+bootstrappers open async DB connections in FastMCP's lifespan. Explicit
+--shared-service startup instead owns resources around the Uvicorn lifecycle.
 """
 
 from __future__ import annotations
@@ -123,11 +123,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         nargs="?", const="external", choices=["external", "validator"],
         help="Enforce an external tool profile and disable Claude bookmark processing",
     )
-    parser.add_argument(
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument(
         "--server",
-        required=True,
         choices=sorted(_VALID_SERVERS),
         help="Which MCP server to run",
+    )
+    selection.add_argument(
+        "--shared-service",
+        choices=sorted(_STANDALONE_ROUTER_SERVERS),
+        help="Explicit owned shared HTTP service (requires configured limits and P3 credentials)",
     )
     parser.add_argument(
         "--transport",
@@ -137,7 +142,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--host",
-        default="127.0.0.1",
+        default=None,
         help="HTTP bind address (default: 127.0.0.1)",
     )
     parser.add_argument(
@@ -152,6 +157,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Bearer token for HTTP auth (default: GENESIS_MCP_HTTP_TOKEN env var)",
     )
     args = parser.parse_args(argv)
+    if args.shared_service is not None:
+        if (args.transport != "streamable-http" or args.host is not None or args.port is not None
+                or args.auth_token is not None or args.external_client is not None):
+            parser.error("Shared service requires streamable-http and configured bind/auth/profile authority")
+        args.server = args.shared_service
+    elif args.host is None:
+        args.host = "127.0.0.1"
     if args.external_client and args.server not in {"health", "memory"}:
         parser.error("External client profiles support only health and memory servers")
     return args
@@ -661,6 +673,12 @@ def _bearer_auth_middleware(expected_token: str):
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    shared_root = None
+    if args.shared_service is not None:
+        from genesis.mcp.shared_runner import require_source_checkout
+
+        # Bind imports before loading any checkout-dependent secrets/config.
+        shared_root = require_source_checkout(Path(__file__).resolve().parents[1])
 
     logging.basicConfig(
         level=logging.WARNING,
@@ -764,6 +782,19 @@ def main(argv: list[str] | None = None) -> None:
         )
     except Exception:
         logger.warning("Could not install MCP environment read recorder", exc_info=True)
+
+    if args.shared_service is not None:
+        from genesis.env import genesis_home
+        from genesis.mcp.shared_runner import run_shared
+
+        home = genesis_home()
+        run_shared(args.shared_service, source_root=shared_root,
+            db_path=_default_db_path(), status_path=home / "status.json",
+            cache_dir=home / "embedding_cache",
+            enabled=lambda: is_genesis_enabled(flag_path=home / "cc_context_enabled"),
+            setup_routing=_init_standalone_health_router,
+            setup_health_actions=_init_standalone_health_actions)
+        return
 
     transport_kwargs = _build_transport_kwargs(args)
 

@@ -718,13 +718,13 @@ class TestEnrichFromDB:
         status_json: Path,
     ) -> None:
         """If enrichment fails, the snapshot should still return valid data."""
-        from unittest.mock import AsyncMock, patch
+        from unittest.mock import MagicMock, patch
 
         from genesis.mcp.standalone_health import StandaloneHealthDataService
 
         # Create a mock DB that raises on execute
-        mock_db = AsyncMock()
-        mock_db.execute = AsyncMock(side_effect=RuntimeError("DB broken"))
+        mock_db = MagicMock()
+        mock_db.execute.side_effect = RuntimeError("DB broken")
 
         with patch(
             "genesis.observability.service_status.collect_service_status",

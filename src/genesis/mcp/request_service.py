@@ -1,7 +1,7 @@
 """Internal opt-in initialization for request-owned MCP services.
 
-No transport, CLI flag or live configuration selects this path. The caller owns
-the manager and must close it after stopping requests. Providers are injected.
+The explicit shared bootstrap selects this path. Its caller owns the manager
+and must close it after stopping requests. Providers are injected.
 """
 
 from importlib import import_module

@@ -388,9 +388,9 @@ as one.
 ## Shared MCP qualification environments
 
 Ordinary CI keeps its existing runtime dependency ranges. The shared-only
-protocol suites require the exact versions admitted by
+protocol and shared CLI suites require the exact versions admitted by
 `genesis.mcp.shared_http._settings.require_qualified_stack`; an unsupported
-ordinary environment explicitly skips those three modules before SDK imports.
+ordinary environment explicitly skips those four modules before SDK imports.
 Pure configuration and missing/later-version refusal tests remain ordinary
 tests in `tests/test_mcp/test_shared_http_settings.py`.
 
@@ -401,9 +401,12 @@ read-only permissions. `GENESIS_REQUIRE_SHARED_MCP_QUALIFICATION=1` is test-only
 qualification refusal becomes a collection error in this job. No production
 version, feature, credential or rollout gate changes.
 
-The protocol step names the admission, policy and actual HTTP modules explicitly.
+The protocol step names the admission, policy, actual HTTP and shared CLI modules
+explicitly. The CLI checks start all four real factories with disposable local
+dependencies, exercise catalog/authentication/read calls over TCP, and observe
+SDK shutdown and registered-owner drainage before resource closure on SIGTERM.
 Its fresh JUnit report must pass `scripts/check_skip_ceiling.py` with zero skips
-and a floor of 91 cases. Installation, collection, test or report-check failure
+and a floor of 95 cases. Installation, collection, test or report-check failure
 fails the job; missing or filtered workflow runs do not qualify a PR. Closing
 checks its actual head/base result. Ordinary skip-budget changes require observed
 skip identities; this workflow does not raise that budget automatically.
@@ -430,3 +433,34 @@ When adding a new subsystem or feature:
 2. Add subsystem-specific fixtures in `tests/test_<subsystem>/conftest.py`.
 3. Mock external dependencies; do not require live services for unit tests.
 4. Verify the new tests pass in isolation: `pytest -v tests/test_<subsystem>/`.
+
+## Request-owned resource coverage
+
+Shutdown grace and actual synchronous completion are covered by
+`tests/test_db/test_request_database_drain.py`,
+`tests/test_db/test_request_database_drain_states.py`,
+`tests/test_db/test_physical_work.py`, and
+`tests/test_db/test_physical_work_states.py`. These cover real owned-file use,
+queued/running executor cancellation, ambiguous submission, joined children,
+context propagation and legacy cancellation. The connection budget is tested
+separately from the number of physical operations. Fault fixtures release and
+join their real workers; an import failure or unrelated timeout is not evidence
+of forbidden resource use. Production factories and shared activation remain
+separate qualifications.
+
+`tests/test_memory/test_resource_thread_ownership.py` exercises all nine migrated
+memory boundaries with gated real file I/O, cancellation and a real scratch
+database lease. `tests/test_memory/test_tag_index_ownership.py` covers independent
+background admission, physical scan drain, refusal/creation failure, prestart
+cancellation, retriever propagation and the body-completed/done-callback gap.
+`tests/test_memory/test_tag_index_swr.py` retains legacy stale-query behavior.
+
+Owned shared bootstrap coverage lives in `tests/test_mcp/test_shared_service_settings.py`,
+`test_shared_resource_factories.py`, `test_shared_launch_selection.py` and
+`test_shared_runner.py`, plus `tests/test_memory/test_embedding_resource_lifecycle.py`.
+Factory argument tests use real canonical SQLite/facades with captured initializer
+arguments and provider doubles; they are not real-provider or native-client E2E.
+`test_shared_runner_lifecycle.py` runs disposable child processes with real Uvicorn
+and inert ASGI/resource dependencies to verify signal replay, cancelled startup,
+bind errors, failed lifespan and cancelled/forced shutdown ordering. These tests
+do not send signals to another session or start a deployed service.
