@@ -7,7 +7,10 @@ collection, and replies through the asynchronous conversation API. Genesis and
 the peer retain their own tool permissions and owner approval flows.
 
 Requires the [conversation API](agent-conversations.md), enabled peer mode,
-current same-owner enrollment and conversation allow. No new credential,
+current same-owner enrollment and conversation allow. A conversation_shared grant
+does not permit prepare/enqueue/put/poll/ACK, internal adapter sends or queued/
+deferred replay for foreign peers. Contexts from shared receipts cannot seed a
+same-owner outbox after reclassification. No new credential,
 listener, webhook, network sender or mandatory incoming task/day budget.
 
 ## Sending from Genesis

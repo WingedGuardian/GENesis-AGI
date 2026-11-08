@@ -14,7 +14,7 @@ from genesis.db.connection import CACHE_SIZE_KIB, connect_aiosqlite_rw
 from genesis.env import db_busy_timeout_ms, genesis_db_path
 
 CAPABILITIES = frozenset(
-    {"conversation", "research", "knowledge_offer", "knowledge_promote", "recurrence"}
+    {"conversation", "conversation_shared", "research", "knowledge_offer", "knowledge_promote", "recurrence"}
 )
 MODES = frozenset({"disabled", "fallback", "sam"})
 

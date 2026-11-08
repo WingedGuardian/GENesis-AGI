@@ -1,7 +1,7 @@
 # Trusted peer registry
 
 The registry supports scoped health, local relationship management and the
-same-owner native A2A conversation binding. Access starts disabled. A ready
+native A2A conversation binding. Access starts disabled. A ready
 native runner/database is required before advertising the Agent Card. No new
 listener, automatic deployment or enrollment. See
 [agent conversations](agent-conversations.md) and the existing ingress runbook.
@@ -20,8 +20,10 @@ python -m genesis peers configure disabled
 ```
 
 Registration creates a relationship epoch and grants nothing. Conversation
-admission requires current same-owner identity and `conversation allow`; `ask`
-or `deny` refuses work until the operator changes that grant. No per-day task
+admission requires current active identity/epoch and `conversation allow`.
+Cross-owner relationships additionally require explicit `conversation_shared allow`
+and are restricted to public tools-free reasoning/proposals. `ask`, `deny` or a
+missing grant refuses access; no migration seeds shared authority. No per-day task
 allowance is enforced. Deprecated `--daily-allowance` preserves the positive
 legacy field for database compatibility only. Native concurrency, wall deadline,
 background autonomy and permitted tool gates still apply.
@@ -35,7 +37,9 @@ does not automatically replay or cancel it.
 
 Optional SAM mode additionally needs `--sam-realm`, pinned peer `--sam-node`
 and optionally exact delegated `--principal`. Cross-owner identities can be
-recorded with `--cross-owner` but this MVP refuses their conversations. Node
+recorded with `--cross-owner`; their conversations stay refused until both grants
+are explicitly allowed. The owner-only default authorization still refuses all
+foreign proactive outbox operations and approval-description reads. Node
 and scoped credential names are unique. SAM accepts only the dedicated backend
 credential and verified identity headers; fallback accepts only active registered
 peer credentials and ignores those headers. No automatic downgrade.
@@ -75,3 +79,18 @@ retained for retries. Existing restore handling resets saved peer authority on
 normal data restore; Guardian snapshot rollback uses the owner's informed
 snapshot-specific approval. Do not claim retained-state exactly-once behavior
 across deliberate purge or rollback; re-enrollment resets client epoch/context.
+
+
+For an intentionally shared foreign relationship after deployment:
+
+```bash
+python -m genesis peers register other-agent --cross-owner --token-name GENESIS_PEER_OTHER_TOKEN
+python -m genesis peers grant other-agent conversation allow
+python -m genesis peers grant other-agent conversation_shared allow
+```
+
+Generate/store/transfer the credential through the existing protected procedure;
+these commands store its name, never its value. Receipt trust mode is immutable:
+reclassification never exposes old private or shared receipts across modes.
+See [conversation boundaries](agent-conversations.md#explicit-shared-conversations)
+and the [roadmap coverage](peer-roadmap.md) before reviving older peer branches.

@@ -12,7 +12,7 @@ from a2a.types import Message, Part, Role
 from google.protobuf.json_format import MessageToDict, ParseDict
 
 from genesis.peers.auth import PeerIdentity
-from genesis.peers.conversation import OWNED, ConversationRefusal, authorize, uuid_id
+from genesis.peers.conversation import OWNED, TRUST, ConversationRefusal, authorize, uuid_id
 from genesis.peers.disclosure_scan import json_strings_safe
 from genesis.peers.protocol import _unique_object
 from genesis.peers.registry import PeerRegistry, identifier
@@ -124,7 +124,7 @@ async def enabled(db):
 async def owned_context(db, peer_id, epoch, context_id):
     row = await (
         await db.execute(
-            f"SELECT 1 FROM cc_sessions WHERE {OWNED} AND json_extract(metadata,'$.context_id')=? "  # noqa: S608 — compiled owner clause only
+            f"SELECT 1 FROM cc_sessions WHERE {OWNED} AND {TRUST}='same_owner' AND json_extract(metadata,'$.context_id')=? "  # noqa: S608 — compiled owner clause only
             "UNION ALL SELECT 1 FROM peer_outbox WHERE peer_id=? AND epoch=? AND context_id=? LIMIT 1",  # noqa: S608 — compiled owner clause only
             (peer_id, epoch, context_id, peer_id, epoch, context_id),
         )
