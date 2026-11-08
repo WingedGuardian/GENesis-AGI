@@ -513,6 +513,24 @@ def sqlite_slow_ms() -> int:
         return 1000
 
 
+def sqlite_txn_hold_ms() -> int:
+    """Threshold (ms) at which a shared connection's write transaction, held
+    open from its first write to its commit or rollback, is logged
+    (``genesis.db._txn_hold``; default 1000).
+
+    Overridable via ``GENESIS_SQLITE_TXN_HOLD_MS``; ``0`` or a negative value
+    turns it off. Missing or non-integer values fall back to the default. It
+    only decides what is LOGGED — it never changes how a transaction runs.
+    """
+    raw = os.environ.get("GENESIS_SQLITE_TXN_HOLD_MS", "").strip()
+    if not raw:
+        return 1000
+    try:
+        return int(raw)
+    except ValueError:
+        return 1000
+
+
 def recall_rerank_gate_off() -> bool:
     """True when the recall rerank rate-gate + circuit-breaker must NOT be built
     (kill switch).

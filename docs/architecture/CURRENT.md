@@ -4164,6 +4164,21 @@ Refusing a proposed update preserves a previously valid opt-in.
   the run (run includes SQLite's busy-timeout wait and lock-retry backoff), the
   outcome (ok / cancelled / error) and what it was stuck behind — rate-limited
   per label and outcome to one line per 60 s unless a repeat is twice as slow.
+  The GAP between statements is timed separately by `db/_txn_hold.py`: a
+  `SerializedConnection` write transaction held open at least
+  `GENESIS_SQLITE_TXN_HOLD_MS` (default 1000, `0` = off) from its first write
+  to its commit or rollback logs `sqlite txn held: …` naming the opening
+  statement, the crud site and the non-`genesis.db` origin that issued it, the
+  asyncio task, what closed it, and `loop_lag=yes|no` (same rate limit). It
+  tests the hypothesis that such gaps are how the server holds the writer slot
+  past other processes' 5 s busy_timeout while every statement is fast:
+  MEASURED 2026-11-07, the server was the only process holding the slot for
+  0.5 s or more (96 of 96 holds in 20 min, max 2.55 s), and its event loop
+  stalled 5 s or more 13 times in two days. Under `loop_lag=yes` the opener is
+  a bystander and the stalled frame in the `loop-stall` log is the cause.
+  Coverage is `SerializedConnection` only: owned `get_raw_db` connections
+  (e.g. the knowledge batch's `BEGIN IMMEDIATE` envelope) are not observed, so
+  no line does not clear them.
   When a lock outlives the retry budget (`DB lock persisted through N attempts
   … giving up`, or a lock error on the unretried `executescript`),
   `db/lock_holders.py` records local failure context, then samples the kernel
