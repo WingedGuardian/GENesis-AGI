@@ -79,10 +79,11 @@ for source selection, retention, reconciliation and snapshot details.
 Normal bootstrap/install installs the optional analytics extra only when persistent
 configuration opts in. Invalid configuration or missing DuckDB/PyArrow leaves the
 analytics timer disabled with a warning; core installation remains successful.
-The hourly timer uses the same supervised ingest path as the CLI. Until the
-configured projects directory exists (a fresh install where Claude Code has not
-run yet), a timer tick is skipped with exit 75 rather than failing; a manual
-`ingest` still reports the missing directory.
+The hourly timer uses the same supervised ingest path as the CLI. Until Claude Code
+creates its own projects directory (`~/.claude/projects` on a fresh install where
+it has not run yet), a timer tick is skipped with exit 75 rather than failing. A
+configured `projects_dir` that does not exist still fails each tick by name, since
+that is a wrong setting, and a manual `ingest` always reports a missing directory.
 
 For a temporary pause of scheduled collection, set the user-manager kill switch
 and stop active analytics work:

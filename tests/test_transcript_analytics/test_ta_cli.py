@@ -269,13 +269,33 @@ def test_timer_ingest_skips_a_projects_root_that_does_not_exist_yet(tmp_path, mo
         raise AssertionError("the store must not run without a projects root")
 
     monkeypatch.setattr(store, "ingest", never)
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "claude"))  # the default root is <CLAUDE_HOME>/projects
     args = argparse.Namespace(
-        timer=True, projects=tmp_path / "projects", data=tmp_path / "data", since=None,
-        no_derive=False, disabled=False,
+        timer=True, projects=tmp_path / "claude" / "projects", data=tmp_path / "data",
+        since=None, no_derive=False, disabled=False,
     )
     monkeypatch.setattr(cli, "_disabled", lambda a: False)
     assert cli.cmd_ingest(args) == 75
     assert "no transcripts yet" in capsys.readouterr().out
+
+
+def test_timer_ingest_still_fails_a_missing_configured_projects_root(tmp_path, monkeypatch):
+    """A configured path that does not exist is a wrong setting: it must not
+    pass as a quiet skipped tick every hour."""
+    import argparse
+
+    from genesis.transcript_analytics import store
+
+    calls = []
+    monkeypatch.setattr(store, "ingest", lambda *a, **kw: calls.append(a) or {"failed": 0})
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "claude"))
+    monkeypatch.setattr(cli, "_disabled", lambda a: False)
+    args = argparse.Namespace(
+        timer=True, projects=tmp_path / "typo" / "projects", data=tmp_path / "data",
+        since=None, no_derive=True,
+    )
+    cli.cmd_ingest(args)
+    assert calls, "a missing non-default root reaches the store, which names it"
 
 
 def test_manual_ingest_still_reports_a_missing_projects_root(tmp_path, monkeypatch):
