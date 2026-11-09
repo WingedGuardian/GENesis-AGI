@@ -988,6 +988,25 @@ neither blocks opening).
    Check the triage by how few bucket-3 decisions the owner reverses: a reversal
    means that kind of call belongs in bucket 4.
 
+### Standing mode (Claude Code only)
+
+When the owner starts a closing session to keep working the queue on a pace
+(`/loop` with ScheduleWakeup, at the interval the owner sets and can change), the
+one-closing-session precondition above holds for the whole life of that session.
+Each pass reads the queue with ONE listing (`gh pr list --state open --json
+number,isDraft,updatedAt,headRefOid,statusCheckRollup`, with a limit above the
+queue size, reconciled against an independent count as step 1 says; drafts stay
+out of the closing set) and acts only on PRs whose `updatedAt` is later than the
+previous wake: a new head, a new review, or checks that finished. The listing is the cheap read; what it rules out is the
+unprompted per-PR watching that "When to DRIVE a Merge" defines, and re-requesting
+review with nothing new pushed. Owner questions are still batched across PRs
+(step 3 above). Merge, gate and deploy rules are unchanged, including the deploy
+owed after merging a host-path PR. The validator's standing-mode limits
+(validating-merges, "Standing mode") do not apply here. A second opinion inside
+a pass is a fresh-context review subagent, never a workflow runner that spawns
+its own sessions outside the approval gate; the round-1 two-reviewer rule for
+hook-surface PRs is unchanged.
+
 ### Two reviewers pushing opposite values
 
 - **Two reviewers pushing OPPOSITE values for the same constant, one review

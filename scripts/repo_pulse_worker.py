@@ -34,6 +34,10 @@ SRC_DIR = Path(__file__).resolve().parent.parent / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+# The interpreter running this reader, for the commands it prints: those need
+# the same packages (aiosqlite), which a bare `python3` may lack.
+_PY = shlex.quote(sys.executable)
+
 
 def _print_verification_backlog(db_path: str | None) -> None:
     """The pr_verifications day-one reader: open obligations in BACKLOG order —
@@ -160,7 +164,7 @@ def _print_verification_backlog(db_path: str | None) -> None:
     _print_rechecks_due(due, db_path=resolved)
     print(f"pr_verifications: {open_total} open, {histogram.get('closed', 0)} closed ({resolved})")
     print(
-        "  close one: python3 scripts/pr_verification.py close --pr <N> "
+        f"  close one: {_PY} scripts/pr_verification.py close --pr <N> "
         "--evidence-file <doc.json> [--note <why>]  (the verdict is derived from the "
         "document; run `pr_verification.py print-schema` for a template)   "
         "(--verification-log --pr <N> shows what was decided, on any row)"
@@ -206,7 +210,7 @@ def _print_rechecks_due(due: list[dict] | None, *, db_path: Path | str | None = 
         print(f"      {r.get('detail')}")
         print(f"      recheck: {r.get('recheck')}")
         print(
-            f"      record : python3 scripts/pr_verification.py recheck --pr {r['pr_number']} "
+            f"      record : {_PY} scripts/pr_verification.py recheck --pr {r['pr_number']} "
             f"--index {r['index']} --result-file <result.json>{target_db}"
         )
 
@@ -717,7 +721,7 @@ def _print_next_for_validation(
     # The database the row was read from, so recording lands on the same ledger
     # (without it, close falls back to genesis_db_path(), another file or none).
     print(
-        f"  record: python3 scripts/pr_verification.py close --pr {n} "
+        f"  record: {_PY} scripts/pr_verification.py close --pr {n} "
         f"--db-path {shlex.quote(resolved)} "
         f"--evidence-file <doc.json> --dry-run   (then again without --dry-run)"
     )

@@ -9,12 +9,12 @@ until a validator records what it concluded. The READER shipped with the table
 ``close_verification``, so 217 obligations were open and ``evidence`` was NULL on
 all 258 rows. A validator could validate and could not record.
 
-USAGE
+USAGE (with the checkout's venv: this imports aiosqlite, which a bare python3 may lack)
 
-    python3 scripts/pr_verification.py print-schema
-    python3 scripts/pr_verification.py close --pr 2273 \\
+    .venv/bin/python scripts/pr_verification.py print-schema
+    .venv/bin/python scripts/pr_verification.py close --pr 2273 \\
         --evidence-file ~/.genesis/output/prv-2273.json
-    python3 scripts/pr_verification.py close --pr 1573 \\
+    .venv/bin/python scripts/pr_verification.py close --pr 1573 \\
         --note "needs an install with no graph engine" \\
         --evidence-file ~/.genesis/output/prv-1573.json
 
