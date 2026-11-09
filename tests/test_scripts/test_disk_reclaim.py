@@ -27,6 +27,14 @@ _spec.loader.exec_module(_mod)
 CacheTarget = _mod.CacheTarget
 
 
+@pytest.fixture(autouse=True)
+def _isolated_log_dir(tmp_path):
+    # Own the patch: a test's monkeypatch.undo() must not restore live logging.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(_mod, "LOG_DIR", tmp_path / "disk-reclaim-logs")
+        yield
+
+
 # ─── Safety allowlist ────────────────────────────────────────────────────
 
 
@@ -405,3 +413,31 @@ def test_mount_points_keep_raw_bytes_whatever_the_locale(tmp_path):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("entry", ["logger", "helper", "main"])
+def test_logging_stays_in_test_directory(tmp_path, monkeypatch, entry):
+    expected = tmp_path / "disk-reclaim-logs"
+    # Assert before invoking even the real logger: RED must not touch live logs.
+    assert expected == _mod.LOG_DIR
+    outside = tmp_path / "outside" / "disk_reclaim.log"
+    outside.parent.mkdir()
+    outside.write_text("sentinel\n")
+    monkeypatch.setattr(_mod, "LOG_DIR", outside.parent)
+    monkeypatch.undo()
+    assert expected == _mod.LOG_DIR
+    if entry == "logger":
+        _mod._log("owned log probe")
+        message = "owned log probe"
+    elif entry == "helper":
+        target = _make_cache(tmp_path)
+        _mod._clear_cache(target, apply=False)
+        message = "WOULD CLEAR"
+    else:
+        monkeypatch.setattr(_mod, "_CACHE_TARGETS", [])
+        monkeypatch.setattr(_mod, "_disk_pct", lambda: 0.0)
+        monkeypatch.setattr(sys, "argv", ["disk_reclaim"])
+        assert _mod.main() == 0
+        message = "Disk reclaim complete"
+    assert message in (expected / "disk_reclaim.log").read_text()
+    assert outside.read_text() == "sentinel\n"
