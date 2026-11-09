@@ -182,7 +182,30 @@ _GRAPHQL_VARIABLES = {
 }
 
 
+#: The REST ``files[].status`` values and the GraphQL ``PatchStatus`` GitHub reports
+#: for the same file. The GraphQL node carries no previous path, so a reader learns
+#: of a rename only from ``RENAMED``/``COPIED`` and goes back to REST for the path.
+_PATCH_STATUS = {
+    "added": "ADDED",
+    "removed": "DELETED",
+    "modified": "MODIFIED",
+    "renamed": "RENAMED",
+    "copied": "COPIED",
+    "changed": "CHANGED",
+}
+
+
+def _change_type(record: dict) -> str:
+    status = record.get("status")
+    if status not in _PATCH_STATUS:
+        raise _Unrouted(f"recorded file {record.get('filename')!r} has status {status!r}")
+    return _PATCH_STATUS[status]
+
+
 def _graphql(opts: dict[str, list[str]], state: dict) -> tuple[int, str, str]:
+    # gh sends a graphql query as a POST; any other method is not the read recorded.
+    if _one(opts, "-X") not in (None, "POST"):
+        raise _Unrouted(f"api graphql -X {_one(opts, '-X')}")
     fields: dict[str, str] = {}
     for flag in ("-f", "-F"):
         for item in opts.get(flag, []):
@@ -265,7 +288,9 @@ def _review_budget_answer(state: dict) -> dict:
         }
         for c in api[f"issues/{pr}/comments"]
     ]
-    files = [{"path": f["filename"], "changeType": "MODIFIED"} for f in api[f"pulls/{pr}/files"]]
+    files = [
+        {"path": f["filename"], "changeType": _change_type(f)} for f in api[f"pulls/{pr}/files"]
+    ]
     commits = [
         {
             "commit": {

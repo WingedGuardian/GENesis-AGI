@@ -491,6 +491,28 @@ def test_two_codex_p2s_block_a_critical_change(tmp_path):
     assert rows["verdict"] == "1 gate(s) would block"
 
 
+def test_a_file_renamed_out_of_the_hook_surface_runs_the_gate_lane(tmp_path):
+    """GraphQL names only the new path; ``RENAMED`` sends the evaluator back to REST
+    for the previous one, and that previous path under ``scripts/hooks/`` is what
+    puts the change in the gate lane."""
+    state = _green_state()
+    state["api"][f"pulls/{PR}/files"] = [
+        {
+            "filename": "scripts/example_moved.py",
+            "previous_filename": "scripts/hooks/example_moved.py",
+            "status": "renamed",
+        }
+    ]
+    proc, rows, calls = _report(tmp_path, state)
+    # The budget evaluator's own REST fallback; the guard reads REST files elsewhere
+    # whatever GraphQL says, so only this jq tells the two apart.
+    budget_jq = ".[] | {filename: .filename, previous_filename: .previous_filename}"
+    assert any(c["argv"][-1] == budget_jq for c in calls), (
+        "the rename never sent the evaluator back to REST for the previous path"
+    )
+    assert rows["rounds"].startswith("1 (gate lane, terminal at 2)"), proc.stdout
+
+
 def test_red_ci_blocks(tmp_path):
     state = _green_state()
     state["pr_view"]["statusCheckRollup"] = [
@@ -712,6 +734,19 @@ def _fake_gh(tmp_path: Path, argv: list[str]) -> subprocess.CompletedProcess:
 
 
 _COMMENTS = f"repos/{REPO}/issues/{PR}/comments"
+_OWNER, _NAME = REPO.split("/")
+#: A graphql read the fake has a recorded answer for, so only the method can refuse it.
+_GRAPHQL_READ = [
+    "-f",
+    "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,"
+    "name:$name){pullRequest(number: $number) { headRefOid body }}}",
+    "-f",
+    f"owner={_OWNER}",
+    "-f",
+    f"name={_NAME}",
+    "-F",
+    f"number={PR}",
+]
 
 
 @pytest.mark.parametrize(
@@ -723,8 +758,18 @@ _COMMENTS = f"repos/{REPO}/issues/{PR}/comments"
         ["api", "-X", "PATCH", _COMMENTS],
         ["pr", "merge", PR, "--repo", REPO, "--squash"],
         ["pr", "comment", PR, "--repo", REPO, "--body", "x"],
+        ["api", "graphql", "-X", "DELETE", *_GRAPHQL_READ],
+        ["api", "graphql", "-X", "PATCH", *_GRAPHQL_READ],
     ],
-    ids=["post", "fields-without-get", "patch", "pr-merge", "pr-comment"],
+    ids=[
+        "post",
+        "fields-without-get",
+        "patch",
+        "pr-merge",
+        "pr-comment",
+        "graphql-delete",
+        "graphql-patch",
+    ],
 )
 def test_the_fake_refuses_every_write(tmp_path, argv):
     """A write the gate starts must fail loudly, never get a recorded answer: the
@@ -739,6 +784,14 @@ def test_the_same_endpoint_read_with_get_is_answered(tmp_path):
     proc = _fake_gh(tmp_path, ["api", "-X", "GET", _COMMENTS])
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout)
+
+
+@pytest.mark.parametrize("method", [[], ["-X", "POST"]], ids=["default", "post"])
+def test_the_same_graphql_read_is_answered(tmp_path, method):
+    """The control for the graphql refusals above: the query itself is routed."""
+    proc = _fake_gh(tmp_path, ["api", "graphql", *method, *_GRAPHQL_READ])
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)["data"]["repository"]["pullRequest"]["headRefOid"] == HEAD
 
 
 def test_the_child_environment_carries_nothing_from_the_test_process(tmp_path, monkeypatch):
