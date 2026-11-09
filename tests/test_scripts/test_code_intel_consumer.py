@@ -35,8 +35,8 @@ def consumer(queue, tmp_path, monkeypatch):
     lib = scripts / "lib"
     lib.mkdir(parents=True)
     original = (ROOT / "scripts/code_intel_runner.sh").read_text()
-    old = '_marker() { python3 "$MARKER_PY" "$@"; }'
-    new = '_marker() { if [ "${1:-}" = automatic-ready ]; then return 0; fi; python3 "$MARKER_PY" "$@"; }'
+    old = "_marker() {\n"
+    new = old + '    if [ "${1:-}" = automatic-ready ]; then return 0; fi\n'
     assert original.count(old) == 1
     # The shipped binary stops on a ready answer (exit 76); only the strict
     # cutover gives "ready" a meaning, so the private copy proceeds instead.
