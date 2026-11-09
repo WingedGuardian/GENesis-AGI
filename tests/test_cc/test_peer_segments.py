@@ -274,7 +274,8 @@ def test_scope_drain_checks_descendants_not_launcher_pid(
     else:
         with pytest.raises(RuntimeError, match="drain was not confirmed"):
             peer._stop_scope()
-    assert calls[-1] == ["systemctl", "--user", "stop", peer.unit_name]
+    assert os.path.isabs(calls[-1][0]) and os.path.basename(calls[-1][0]) == "systemctl"
+    assert calls[-1][1:] == ["--user", "stop", peer.unit_name]
 
 
 def test_failed_manager_query_is_not_an_empty_scope(peer_invocation, monkeypatch):
@@ -879,3 +880,40 @@ async def test_peer_non_streaming_success_cannot_clear_the_owner_cli_limited_sta
     assert not output.is_error
     notify.assert_not_awaited()
     assert invoker._last_was_error is True
+
+
+def test_peer_environment_keeps_tmpdir_with_the_cc_tmpdir(peer_invocation, tmp_path):
+    """The CLI's own temp files follow TMPDIR; the peer env sets it with
+    CLAUDE_CODE_TMPDIR, as the ordinary path does, instead of falling back to /tmp."""
+    invocation = replace(peer_invocation, claude_code_tmpdir=str(tmp_path / "cc-tmp"))
+    env = CCInvoker(claude_path="/fixture/claude")._build_env(invocation)
+    assert env["TMPDIR"] == env["CLAUDE_CODE_TMPDIR"] == str(tmp_path / "cc-tmp")
+
+
+def test_scope_state_uses_systemctl_from_absolute_path_entries_only(tmp_path, monkeypatch):
+    """A relative PATH entry resolves against the server's cwd; systemctl is taken
+    from absolute entries only, as launch_args resolves systemd-run."""
+    for where in ("rel/bin", "abs/bin"):
+        fake = tmp_path / where / "systemctl"
+        fake.parent.mkdir(parents=True)
+        fake.write_text("#!/bin/sh\nexit 0\n")
+        fake.chmod(0o755)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PATH", os.pathsep.join(["rel/bin", str(tmp_path / "abs" / "bin")]))
+    seen = []
+
+    def run(argv, **kwargs):
+        seen.append(argv[0])
+        return subprocess.CompletedProcess(
+            argv, 0, stdout="LoadState=loaded\nActiveState=active\nControlGroup=/x\n"
+        )
+
+    monkeypatch.setattr(peer_segment.subprocess, "run", run)
+    peer = PeerSegment(
+        segment_id="a" * 32, deadline_at=time.time() + 60, tools=("mcp__genesis_peer__perform",)
+    )
+    peer._show_scope()
+    assert seen == [str(tmp_path / "abs" / "bin" / "systemctl")]
+    monkeypatch.setenv("PATH", "rel/bin")
+    with pytest.raises(RuntimeError, match="could not be confirmed"):
+        peer._show_scope()

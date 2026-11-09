@@ -2492,7 +2492,10 @@ class CCInvoker:
             env = inv.peer_segment.environment(inv)
             env.update({name: "" for name in _GH_CREDENTIAL_ENV})
             if inv.claude_code_tmpdir:
+                # Both, as the ordinary path keeps them: the CLI's own temp files
+                # follow TMPDIR, which would otherwise fall back to /tmp.
                 env["CLAUDE_CODE_TMPDIR"] = inv.claude_code_tmpdir
+                env["TMPDIR"] = inv.claude_code_tmpdir
             return env
         env = dict(os.environ)
         env.pop("CLAUDECODE", None)

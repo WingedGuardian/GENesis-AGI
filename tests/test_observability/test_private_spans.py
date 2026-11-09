@@ -207,3 +207,18 @@ def test_deep_cyclic_provenance_and_base_exception_group(monkeypatch, caplog):
     with pytest.raises(BaseExceptionGroup) as caught, spans.start_span("ancestor"):
         raise group
     assert caught.value is group and CANARY not in caplog.text
+
+
+def test_a_split_private_group_stays_private():
+    """``except*`` and ``split()`` build new groups around the same leaves, so the
+    private marker must sit on every leaf, not only on the group that was raised."""
+    from genesis.util.execution_privacy import exception_is_private
+
+    leaf = ValueError(CANARY)
+    with pytest.raises(ExceptionGroup) as caught, private_execution():
+        raise ExceptionGroup("Synthetic group", [leaf, TypeError("Synthetic other")])
+    matched, rest = caught.value.split(ValueError)
+    assert matched is not caught.value and matched.exceptions[0] is leaf
+    assert exception_is_private(matched)
+    assert exception_is_private(rest)
+    assert exception_is_private(leaf)

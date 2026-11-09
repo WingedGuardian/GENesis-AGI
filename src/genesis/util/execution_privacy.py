@@ -12,12 +12,27 @@ from contextvars import ContextVar
 _private = ContextVar("genesis_private_execution", default=False)
 _ERROR_MARKER = "_genesis_trace_error_message"
 PRIVATE_ERROR = "private_execution_failed"
+# The C-level member, read directly so a subclass property (a user hook) never runs.
+_GROUP_MEMBERS = BaseExceptionGroup.__dict__["exceptions"]
+
+
+def _group_members(exc: BaseException) -> tuple[BaseException, ...]:
+    """An exception group's members: ``except*`` and ``split()`` build NEW
+    groups around the SAME leaves, so privacy must live on every leaf."""
+    return _GROUP_MEMBERS.__get__(exc) if isinstance(exc, BaseExceptionGroup) else ()
 
 
 def _mark_private_exception(exc: BaseException) -> None:
+    pending, seen = [exc], set()
     try:
-        attrs = BaseException.__dict__["__dict__"].__get__(exc)
-        dict.__setitem__(attrs, _ERROR_MARKER, PRIVATE_ERROR)
+        while pending:
+            current = pending.pop()
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            attrs = BaseException.__dict__["__dict__"].__get__(current)
+            dict.__setitem__(attrs, _ERROR_MARKER, PRIVATE_ERROR)
+            pending.extend(_group_members(current))
     except BaseException:
         pass  # Diagnostics must never replace the caller's exception.
 
@@ -38,8 +53,7 @@ def exception_is_private(exc: BaseException | None) -> bool:
                 return True  # Presence, including malformed/falsey values.
             for edge in ("__cause__", "__context__"):
                 pending.append(BaseException.__dict__[edge].__get__(current))
-            if isinstance(current, BaseExceptionGroup):
-                pending.extend(BaseExceptionGroup.__dict__["exceptions"].__get__(current))
+            pending.extend(_group_members(current))
     except BaseException:
         return True  # Metadata refusal is not permission to format content.
     return False

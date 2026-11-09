@@ -57,6 +57,21 @@ _PROVIDER_ENV = frozenset(
 )
 
 
+def _systemctl() -> str:
+    """``systemctl`` from the absolute PATH entries only, the rule ``launch_args``
+    applies to ``systemd-run``: a relative entry would resolve against whatever
+    directory the server runs in. Unresolvable is unconfirmed scope state."""
+    path = os.pathsep.join(
+        entry
+        for entry in os.environ.get("PATH", os.defpath).split(os.pathsep)
+        if entry and os.path.isabs(entry)
+    )
+    found = shutil.which("systemctl", path=path) if path else None
+    if found is None:
+        raise RuntimeError("peer scope state could not be confirmed")
+    return found
+
+
 @dataclass(frozen=True)
 class PeerSegment:
     segment_id: str
@@ -274,7 +289,7 @@ class PeerSegment:
     def _show_scope(self) -> dict[str, str]:
         result = subprocess.run(
             [
-                "systemctl",
+                _systemctl(),
                 "--user",
                 "show",
                 self.unit_name,
@@ -309,7 +324,7 @@ class PeerSegment:
         if not control_group.startswith("/") or ".." in group.parts or group.name != self.unit_name:
             raise RuntimeError("peer scope control group could not be confirmed")
         stopped = subprocess.run(
-            ["systemctl", "--user", "stop", self.unit_name], capture_output=True, timeout=15
+            [_systemctl(), "--user", "stop", self.unit_name], capture_output=True, timeout=15
         )
         try:
             events = dict(
