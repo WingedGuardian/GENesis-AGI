@@ -69,6 +69,13 @@
       "type": "Hex High Entropy String",
       "sha1": "2c74b2b5a39b54beae7d7c0e994feb84693a3466",
       "reason": "git's well-known empty-tree object id (_EMPTY_TREE), identical in every repository, not sensitive; current source carries the inline pragma"
+    },
+    {
+      "commit": "22057738c8a1e63f838526510c3123a43b10a8a8",
+      "path": "COMMIT_MESSAGE",
+      "type": "Hex High Entropy String",
+      "sha1": "f3daf256059ffcbf76fccbf602060a7a11e67c90",
+      "reason": "Public Git commit ID in a main-integration merge message (git merge by commit id); verified: sha1 of the referenced main commit id equals the hashed value."
     }
   ]
 }
