@@ -170,14 +170,10 @@ def test_printed_commands_name_the_interpreter_running_the_reader(tmp_path, caps
     _build_rechecks(db, [_EVENT])
     _w._print_verification_backlog(str(db))
     out = capsys.readouterr().out
-    recheck = next(
-        line.split("record : ", 1)[1] for line in out.splitlines() if "record : " in line
-    )
-    close = next(
-        line.split("close one: ", 1)[1] for line in out.splitlines() if "close one: " in line
-    )
-    assert shlex.split(recheck)[0] == sys.executable
-    assert shlex.split(close)[0] == sys.executable
+    py = shlex.quote(sys.executable)
+    # Read the whole output: a quoted interpreter path is not confined to one line.
+    assert f"record : {py} scripts/pr_verification.py recheck" in out
+    assert f"close one: {py} scripts/pr_verification.py close" in out
 
 
 @pytest.mark.parametrize("bad_results", [["bad"], [None], [{}], "bad", 0])
