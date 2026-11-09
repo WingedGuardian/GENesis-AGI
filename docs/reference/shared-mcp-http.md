@@ -75,6 +75,22 @@ unit, reusing `commit_identity.is_stale` without latching across rollback.
 Unavailable freshness is JSON null; guarded tools retain the existing live
 off/warn/block policy and positive-confirmation semantics.
 
+Memory alone advertises `plan_bookmark_pending_version: 1`. An opting-in
+memory forwarder sends `_meta["genesis/planBookmarkPending"]` as exactly
+`{"version": 1, "path": "/caller/.genesis/plan_bookmark_pending.json"}`.
+The version must be an integer, the path absolute without NUL, and its final
+filename and parent must be `plan_bookmark_pending.json` and `.genesis`.
+Validation is lexical; it does not resolve or read files. The path supplies
+input, not authority: only an authenticated P3 forwarder with no profile on
+`/mcp/v1` can supply it. Static credentials and the old endpoint refuse this
+reserved metadata. Absent metadata retains shared opt-out. The binding resets
+on exit/cancellation and is usable only with its captured authenticated caller.
+SDK argument validation precedes the actual memory guard and background job.
+Shared initialization remains `process_pending_bookmarks=False`, so lost scope
+never falls back to the server's pending file. Jobs capture the path and its
+sibling session directory before detaching. Ordinary memory routing is a later
+consumer; this contract changes no registrations or rollout defaults.
+
 Targeted tests: pure `test_shared_http_settings.py`; qualified
 `test_shared_http_admission.py`, `test_shared_http_policy.py` and
 `test_shared_http_runtime.py` under `tests/test_mcp/`, plus
@@ -139,7 +155,8 @@ full column/version validator. A bootstrapped runtime cannot be borrowed.
 Health uses the standalone health data service with the same facade and ordinary
 action wiring. Memory retains distinct storage and priority-tier recall chains,
 their vector-space checks, the reranker and standalone dependencies; it uses no
-read pool and leaves session bookmark files untouched. Outreach and recon retain
+read pool and disables default pending-bookmark consumption. Only the explicit
+authenticated request contract above can opt a memory call in. Outreach and recon retain
 their standalone dependency modes. The existing standalone routing setup is reused.
 
 Every completed provider/cache construction is registered immediately. Builtin

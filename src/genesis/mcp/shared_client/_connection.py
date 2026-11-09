@@ -13,6 +13,7 @@ from mcp.shared.exceptions import MCPError
 from mcp.shared.jsonrpc_dispatcher import JSONRPCDispatcher
 from mcp_types import CONNECTION_CLOSED, INTERNAL_ERROR, INVALID_REQUEST, PARSE_ERROR
 
+from genesis.mcp.plan_bookmark_context import PENDING_VERSION, pending_path, prepare_pending_params
 from genesis.mcp.shared_paths import forwarder_url, prepare_params
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,7 @@ class _Negotiation:
 
 
 class RemotePeer:
-    def __init__(self, group, settings, header_factory, *, expected_catalog_revision=None):
+    def __init__(self, group, settings, header_factory, *, expected_catalog_revision=None, pending_file=None):
         self.group, self.settings, self.header_factory = group, settings, header_factory
         self.url = forwarder_url(settings.http.url)
         self.current, self.front, self.initialization, self.version = None, None, None, None
@@ -69,6 +70,10 @@ class RemotePeer:
         self.lock = anyio.Lock()
         self.expected_catalog_revision = expected_catalog_revision
         self.initialization_header_version = None
+        if pending_file is not None and settings.http.service != "memory":
+            raise ValueError("Pending bookmarks require a memory peer")
+        self.pending_file = (pending_path({"version": PENDING_VERSION, "path": str(pending_file)})
+                             if pending_file is not None else None)
 
     def arm_initialize(self):
         if self.negotiation is not None and not self.negotiation.done.is_set():
@@ -157,7 +162,7 @@ class RemotePeer:
                 timeout=httpx2.Timeout(MCP_DEFAULT_TIMEOUT, read=None),
                 event_hooks={"response": [observe_response]},
             ) as client:
-                if self.expected_catalog_revision is not None:
+                if self.expected_catalog_revision is not None or self.pending_file is not None:
                     response = await client.get(self.settings.http.origin + "/status")
                     response.raise_for_status()
                     status = response.json()
@@ -166,7 +171,11 @@ class RemotePeer:
                             or status.get("enabled") is not True
                             or type(status.get("transport_schema_version")) is not int
                             or status["transport_schema_version"] != 1
-                            or status.get("catalog_revision") != self.expected_catalog_revision):
+                            or (self.expected_catalog_revision is not None
+                                and status.get("catalog_revision") != self.expected_catalog_revision)
+                            or (self.pending_file is not None and (
+                                type(status.get("plan_bookmark_pending_version")) is not int
+                                or status["plan_bookmark_pending_version"] != PENDING_VERSION))):
                         raise ValueError("Shared catalog does not match this frontend")
                 async with streamable_http_client(
                     self.url, http_client=client,
@@ -216,6 +225,8 @@ class RemotePeer:
         generation, gate = None, self.negotiation if method == "initialize" else None
         try:
             params = prepare_params(self.settings.http.service, method, params)
+            if self.pending_file is not None:
+                params = prepare_pending_params(method, params, self.pending_file)
             if method != "initialize":
                 await self._wait_initialize()
             generation = await self._get()

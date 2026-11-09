@@ -1,0 +1,1 @@
+- Shared memory can accept an explicit pending plan-bookmark file from an authenticated forwarder after validating tool arguments. Opting-in peers require the matching server capability on every connection; shared defaults and ordinary registrations remain unchanged.
