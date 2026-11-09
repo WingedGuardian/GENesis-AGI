@@ -8,6 +8,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -29,6 +30,7 @@ PYTHON = (
     "scripts/lib/codebase_managed_unit.py",
     "scripts/lib/code_intel_execution.py",
     "scripts/lib/code_intel_scope.py",
+    "scripts/lib/code_intel_queued_worker.py",
     "scripts/lib/index_marker_legacy.py",
     "scripts/lib/index_marker_recovery.py",
     "scripts/lib/index_marker_legs.py",
@@ -41,6 +43,7 @@ SHELL = (
     "scripts/lib/code_intel_index.sh",
     "scripts/lib/gitnexus_version.sh",
     "scripts/lib/proc_pressure.sh",
+    "scripts/lib/code_intel_scope.sh",
 )
 ALIASES = (
     "managed_units",
@@ -50,6 +53,7 @@ ALIASES = (
     "codebase_managed_unit",
     "_genesis_code_intel_execution",
     "_genesis_code_intel_scope",
+    "_genesis_code_intel_queued_worker",
     "_genesis_index_marker_legacy",
     "_genesis_index_marker_recovery",
     "_genesis_index_marker_legs",
@@ -138,6 +142,108 @@ def test_captured_fresh_scope_and_cli_survive_deleted_checkout(
     assert queue.get_inflight(claimed["context"]["hash"])["claim_id"] == sibling["context"]["claim_id"]
 
 
+@pytest.mark.parametrize("lock_state", [
+    "held", "open", "missing", "foreign", "competing", "symlink",
+    "named_nonregular", "descriptor_nonregular",
+])
+def test_captured_runner_entry_preserves_only_its_canonical_lock(
+    tmp_path, monkeypatch, lock_state
+):
+    root, module, old = case(tmp_path, monkeypatch, "runner")
+    # A harmless scratch entry reports the exact received inode. No provider,
+    # manager or queue operation is reachable, even before the transport fix.
+    entry = root / "scripts/lib/code_intel_index.sh"
+    entry.write_text(
+        "#!/bin/bash\nexec /usr/bin/python3 -I -c "
+        + shlex.quote("import os,json;s=os.fstat(8);print(json.dumps([s.st_dev,s.st_ino]))")
+        + "\n"
+    )
+    subprocess.run(
+        ["git", "-C", str(root), "-c", "core.hooksPath=/dev/null", "-c",
+         "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-am", "scratch entry"],
+        check=True, capture_output=True,
+    )
+    captured = module.capture(root, "runner", old.buffers[SELF])
+    lock = tmp_path / "state/locks/code-intel-runner.lock"
+    lock.parent.mkdir(parents=True)
+    selected = lock
+    if lock_state == "symlink":
+        selected = tmp_path / "symlink-target"
+        selected.touch()
+        lock.symlink_to(selected)
+    elif lock_state == "named_nonregular":
+        lock.mkdir()
+        selected = tmp_path / "foreign"
+        selected.touch()
+    else:
+        lock.touch()
+    held = selected.open("a")
+    if lock_state == "competing":
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    if lock_state == "foreign":
+        selected = tmp_path / "foreign"
+    elif lock_state == "descriptor_nonregular":
+        selected = Path("/dev/null")
+    setup = "exec 8>&-;" if lock_state == "missing" else "exec 8>" + shlex.quote(str(selected)) + ";"
+    if lock_state == "held":
+        setup += "flock -n 8 || exit 97;"
+    try:
+        with captured.sealed() as capsule:
+            result = subprocess.run(
+                ["/bin/bash", "--noprofile", "--norc", "-p", "-c",
+                 setup + "exec " + shlex.join(captured.resume_command("shell", "entry"))],
+                stdin=capsule, capture_output=True, text=True, timeout=30,
+            )
+        if lock_state in ("held", "open"):
+            assert result.returncode == 0, result.stderr
+            metadata = lock.stat()
+            assert json.loads(result.stdout) == [metadata.st_dev, metadata.st_ino]
+        else:
+            assert result.returncode != 0 and not result.stdout
+    finally:
+        held.close()
+
+
+def test_actual_source_capsule_survives_creator_exit_before_describe(tmp_path, monkeypatch):
+    root, _, captured = case(tmp_path, monkeypatch, "runner")
+    read_gate, write_gate = os.pipe()
+    consumer = """import json,os,sys
+if os.read(int(sys.argv[1]),1)!=b'1': raise SystemExit(2)
+os.close(int(sys.argv[1]))
+command=json.loads(sys.argv[2]);os.execv(command[0],command)
+"""
+    creator_program = """import importlib.util,json,os,pathlib,subprocess,sys
+root=pathlib.Path(sys.argv[1]);path=root/'scripts/lib/code_intel_source.py'
+raw=path.read_bytes();spec=importlib.util.spec_from_file_location('_source_creator',path)
+module=importlib.util.module_from_spec(spec);sys.modules[spec.name]=module
+module.__dict__['_ENTRY_BYTES']=raw
+exec(compile(raw,str(path),'exec',dont_inherit=True),module.__dict__)
+captured=module.capture(root,'runner',raw);gate=int(sys.argv[2])
+with captured.sealed() as fd:
+    subprocess.Popen([sys.executable,'-I','-S','-c',sys.argv[3],str(gate),
+                      json.dumps(captured.resume_command())],stdin=fd,pass_fds=(gate,))
+os._exit(0)
+"""
+    try:
+        with subprocess.Popen(
+            [sys.executable, "-I", "-S", "-c", creator_program, str(root), str(read_gate), consumer],
+            pass_fds=(read_gate,), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        ) as creator:
+            os.close(read_gate)
+            read_gate = None
+            # The consumer cannot dispatch until its actual capsule creator
+            # has exited; source validity is independent of creator liveness.
+            assert creator.wait(timeout=30) == 0
+            os.write(write_gate, b"1")
+            stdout, stderr = creator.communicate(timeout=30)
+        observed = json.loads(stdout)
+        assert observed == dict(commit=captured.commit, files=captured.files, automatic_authority=False), stderr
+    finally:
+        if read_gate is not None:
+            os.close(read_gate)
+        os.close(write_gate)
+
+
 @pytest.mark.parametrize("profile", ["entry", "runner"])
 @pytest.mark.parametrize("object_format", ["sha1", "sha256"])
 def test_exact_closed_inventory_commit_and_immutable_buffers(
@@ -182,6 +288,12 @@ def test_every_captured_path_drift_is_detected_without_relabelling(tmp_path, mon
     assert loaded["proof"]._ADMISSION is loaded["admission"].__dict__
     assert loaded["queue"]._proof is loaded["proof"]
     assert loaded["queue"]._cli is loaded["cli"]
+
+
+    assert (
+        loaded["queued"].QueuedRun.__init__.__globals__["_CAPTURED_CLEANUP"]
+        is loaded["scope"].cleanup_observation
+    )
     assert root / "scripts/codebase_managed.py" == loaded["managed"].SCRIPT
     assert loaded["unit"].systemctl_env() == loaded["systemd"].systemctl_env()
 
@@ -220,7 +332,8 @@ def test_sealed_roundtrip_keeps_old_bytes_after_files_disappear(tmp_path, monkey
 
 
 @pytest.mark.parametrize(
-    "fault", ["unsealed", "version", "missing", "extra", "digest", "entry", "duplicate"]
+    "fault",
+    ["unsealed", "version", "unsupported-version", "missing", "extra", "digest", "entry", "duplicate"],
 )
 def test_capsule_rejects_incomplete_or_wrong_transport(tmp_path, monkeypatch, fault):
     _, module, captured = case(tmp_path, monkeypatch)
@@ -229,6 +342,8 @@ def test_capsule_rejects_incomplete_or_wrong_transport(tmp_path, monkeypatch, fa
     document = json.loads(raw)
     if fault == "version":
         document["version"] = 2
+    elif fault == "unsupported-version":
+        document["version"] = 3
     elif fault == "missing":
         document["buffers"].pop(SHELL[0])
     elif fault == "extra":
@@ -366,3 +481,112 @@ def test_captured_managed_origin_does_not_follow_later_symlinks(tmp_path, monkey
     monkeypatch.setattr(loaded, "read_settings", lambda path, **kwargs: {"main": str(foreign_main)})
     with pytest.raises(ValueError, match="primary checkout"):
         loaded.runtime_config(root / "settings")
+
+
+@pytest.mark.parametrize("role", ["entry", "runner"])
+@pytest.mark.parametrize(
+    "helper,symbol",
+    [
+        ("gitnexus_version.sh", "genesis_gitnexus_installed_is_pinned"),
+        ("proc_pressure.sh", "pressure_loadavg1"),
+        ("code_intel_scope.sh", "_run_with_watchdog"),
+    ],
+)
+def test_shell_prelude_sources_only_captured_helpers_and_original_origin(
+    tmp_path, monkeypatch, role, helper, symbol
+):
+    root, _, captured = case(tmp_path, monkeypatch, "runner")
+    (root / "scripts/lib" / helper).write_text("exit 93\n")
+    program = captured.shell_prelude(role) + "\n_ci_source " + shlex.quote(helper) + "\n"
+    program += (
+        "declare -F " + shlex.quote(symbol) + ' >/dev/null || exit 94\nprintf "%s" "$_CI_ORIGIN"\n'
+    )
+    with captured.sealed() as fd:
+        result = subprocess.run(
+            ["/bin/bash", "--noprofile", "--norc", "-p", "-c", program],
+            stdin=fd,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    name = "scripts/code_intel_runner.sh" if role == "runner" else "scripts/lib/code_intel_index.sh"
+    assert result.stdout == str(root / name)
+
+
+def test_captured_shell_entry_keeps_logical_origin_after_all_sources_disappear(
+    tmp_path, monkeypatch
+):
+    root, _, captured = case(tmp_path, monkeypatch, "runner")
+    repo = tmp_path / "linked-repository"
+    repo.mkdir()
+    (repo / ".git").write_text("gitdir: unused linked fixture\n")
+    for name in captured.buffers:
+        (root / name).unlink()
+    with captured.sealed() as fd:
+        result = subprocess.run(
+            captured.shell_command("entry", [str(repo), "both", "fast"]),
+            stdin=fd,
+            env={**os.environ, "CODE_INTEL_INDEX_DISABLE": "0"},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    assert "linked git worktree" in result.stdout
+    assert not (tmp_path / "state").exists()
+
+
+@pytest.mark.parametrize("startup", [False, True])
+@pytest.mark.parametrize("function", [False, True])
+@pytest.mark.parametrize("noexec", [False, True])
+def test_captured_runner_stays_fenced_and_uses_held_queue_after_deletion(
+    tmp_path, monkeypatch, startup, function, noexec
+):
+    _, _, captured = case(tmp_path, monkeypatch, "runner")
+    marker = tmp_path / "startup-executed"
+    startup_file = tmp_path / "startup.sh"
+    startup_file.write_text("printf bad > " + shlex.quote(str(marker)) + "\n")
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS"}
+        and not key.startswith("BASH_FUNC_")
+    }
+    if startup:
+        env["BASH_ENV"] = str(startup_file)
+    if function:
+        env["BASH_FUNC_flock%%"] = "() { printf bad > " + shlex.quote(str(marker)) + "; return 0; }"
+    if noexec:
+        env["SHELLOPTS"] = "noexec"
+    with captured.sealed() as fd:
+        for name in captured.buffers:
+            (captured.root / name).unlink()
+        result = subprocess.run(
+            captured.resume_command("shell", "runner"),
+            stdin=fd,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+    assert result.returncode == 0, result.stderr
+    log = (tmp_path / "state/code-intelligence-runner.log").read_text()
+    assert "automatic queue protocol incomplete" in log
+    assert not marker.exists()
+    assert {
+        str(path.relative_to(tmp_path / "state")) for path in (tmp_path / "state").rglob("*")
+    } == {"locks", "locks/code-intel-runner.lock", "code-intelligence-runner.log"}
+
+
+def test_captured_queue_role_observes_without_initializing_after_deletion(tmp_path, monkeypatch):
+    _, _, captured = case(tmp_path, monkeypatch, "runner")
+    with captured.sealed() as fd:
+        for name in captured.buffers:
+            (captured.root / name).unlink()
+        result = subprocess.run(
+            captured.resume_command("queue", "automatic-ready"),
+            stdin=fd,
+            capture_output=True,
+            text=True,
+        )
+    assert result.returncode == 10, result.stderr
+    assert json.loads(result.stdout) == {"state": "absent", "receipts_available": False}
+    assert not (tmp_path / "state").exists()

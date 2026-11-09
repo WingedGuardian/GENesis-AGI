@@ -1420,7 +1420,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: b0867170e 2026-10-02
+verified: 1b79527b5c7 2026-11-08
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -1439,6 +1439,14 @@ verified: b0867170e 2026-10-02
   precedence footer. A missing, unreadable, or empty component fails the scan
   closed without caching a partial prompt; a successful composite is reused
   byte-for-byte by the approval route, CC invocation, and prompt-version hash.
+  Evaluations request one model-reported Evidence section per item, preserving
+  source claims, acquired quotations or acquisition limits, current mechanism/
+  user evidence, and labelled uncertainty. The existing optional output-memory
+  extractor is unchanged and may still lose qualifications or introduce an
+  unsupported claim; evaluator evidence is not mechanical source grounding or
+  a guarantee of memory correctness. Reuse and
+  deliverable-backed BUILD/adoption boundaries are described in
+  `docs/reference/inbox-evaluation-quality.md`.
   The phase order is prompt preflight → recover pending → resume approval →
   detect → create → dispatch;
   `approval_key_stable=True` (ONE
@@ -1833,8 +1841,14 @@ the shared banner is not an assertion about all concurrent sessions.
   and a finite assembly API: Python and shell buffers match one immutable Git
   tree, and Python compilation/hashing use those same bytes with original origins.
   Private sealed handoff checks its caller-bound digest before entry compilation;
-  cached local modules refuse. This is not yet the queued shell/watchdog caller
-  and supplies no new launch, recovery or automatic-readiness authority.
+  cached local modules refuse. Service startup enters captured runner and
+  entry helpers, including the queue/availability and scope/watchdog closure;
+  only the canonical runner lock crosses its entry handoff. Optional queued
+  inputs freeze the native environment with one registered invocation slot,
+  preserving process-control environment and managed config/path/admission
+  checks. Private runtime transport is not launch authority. The physical
+  owner, monitor and recovery caller remain separate, and automatic readiness
+  stays fenced.
   `index_marker_recovery.py` adds explicit transaction-only schema-5 storage,
   original-owner control completion, persistent provider holds and an exact
   terminal/control/source acceptance-watermark reader on the same queue.
@@ -3993,11 +4007,18 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, secrets_location.py, _config_overlay.py, caller_context.py, caller_credentials.py]
-verified: 5a3de4eee 2026-11-07
+verified: 5a3de4eee 2026-11-08
 ```
 
-The 2026-11-07 verification covers the request-ownership prerequisite below;
-the other platform descriptions retain their individually cited verification dates.
+Scoped verification: the caller identity boundary only. Shared mode refuses
+process-environment identity through both accessors, including after environment
+drift; validated requests use `caller_context()`. Legacy reads remain raw and
+per-call. This does not requalify the remaining platform/data subsystems or
+activate shared MCP.
+
+A 2026-11-07 verification at the same commit covers the request-ownership
+prerequisite below; the other platform descriptions retain their individually
+cited verification dates.
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
 provider/model/outcome. Failed historical attempts render as a warning, not an

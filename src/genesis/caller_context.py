@@ -150,7 +150,13 @@ def enter_shared_service() -> None:
 
 
 def caller_context_from_env() -> CallerContext:
-    """The caller as this process's environment describes it, read now."""
+    """Read legacy process identity; shared processes have no environment caller.
+
+    Shared mode returns the lost-scope caller even inside a request. Use
+    ``caller_context()`` for the validated request's identity instead.
+    """
+    if _shared_service:
+        return _LOST_SCOPE_CALLER
     env = os.environ
     return CallerContext(
         dispatched=env.get(CC_SESSION_ENV) == "1",
