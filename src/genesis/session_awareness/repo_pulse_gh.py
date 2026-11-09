@@ -120,9 +120,14 @@ async def list_merged_prs(
     until_date: str | None = None,
     limit: int = 200,
     repo: str | None = None,
+    fields: str = PR_FIELDS,
     runner: Runner | None = None,
 ) -> dict:
     """Enumerate PRs merged on/after ``since_date`` (YYYY-MM-DD, date-granular).
+
+    ``fields`` is the ``--json`` field list, ``PR_FIELDS`` unless a caller needs
+    others (the validation picker asks for ``mergeCommit``). Rows are still
+    filtered on ``number`` and ``mergedAt``, so a custom list must include both.
 
     ``until_date`` closes the window (``merged:since..until``) — the worker's
     pagination bound when a capped result forces paging down (hardening 2).
@@ -151,7 +156,7 @@ async def list_merged_prs(
             "--search",
             qualifier,
             "--json",
-            PR_FIELDS,
+            fields,
             "--limit",
             str(limit),
         ]

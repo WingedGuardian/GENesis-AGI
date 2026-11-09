@@ -168,6 +168,7 @@ _DEGRADED_GATED = r"\bclean\b|--recurse-submodules|submodule\.recurse"
 
 try:
     from shell_parse import (  # noqa: E402
+        _BLIND_STRUCTURAL,  # the one blind spot the hidden-verb refusal names
         analyze_checked,
         git_subcommand_index,
         has_trailing_override,
@@ -281,13 +282,26 @@ _SNAPSHOT_VERBS = frozenset(
 # a 32,000-character command took 4 seconds with it.
 _GIT_WORD = re.compile(r"\bgit\b")
 _HIDDEN_VERB_MSG = (
-    "[git-discard-guard] BLOCKED: this command runs git with a subcommand the "
-    "guard cannot read (a variable, a substitution or an escape stands where it "
-    "goes, or an option before it that the parser cannot classify). It could be "
-    "one that discards uncommitted work, and the guard cannot check or snapshot "
-    "an operation it cannot name. To proceed: write the git subcommand out "
-    "literally, and pass any option the parser does not recognise after it or "
-    "not at all."
+    "[git-discard-guard] BLOCKED: this command may run a git operation whose "
+    "subcommand the guard cannot read or reliably establish (a variable, a "
+    "substitution, an escape, unreadable nested syntax, or an unclassified Git "
+    "global option obscures it). A Git operation may discard uncommitted work, "
+    "and the guard cannot check or snapshot an operation it cannot name. To "
+    "proceed: for an unclassified Git global option, omit it or configure it "
+    "another way; split unreadable compounds into separate commands, "
+    "write the git subcommand out literally, or write prose or script text to a "
+    "file."
+)
+# The same refusal when the parse itself is uncertain (shell_parse's structural
+# blind spot): the git part may be perfectly readable, and the unreadable part is
+# other text in the command, often here-doc prose. Built from the parser's own
+# cause and hint so the two cannot drift apart.
+_STRUCTURAL_VERB_MSG = (
+    "[git-discard-guard] BLOCKED: this command {cause}, so the guard cannot see "
+    "every git operation it would run or read the subcommand each one names. A Git "
+    "operation may discard uncommitted work, and the guard cannot check or snapshot "
+    "an operation it cannot see. To proceed: {hint}; run the git command on its own, "
+    "with its subcommand written out literally."
 )
 # The submodule gate's word, case-folded: the config KEY is case-insensitive.
 _RECURSE_WORD = re.compile("recurse", re.IGNORECASE)
@@ -1835,8 +1849,14 @@ def main() -> int:
     # crash, like 1b and 1c.
     with contextlib.suppress(Exception):
         if "git" in unresolved_verb_programs(cmd):
+            # Wording only, chosen where nothing can stop the refusal below.
+            message = _HIDDEN_VERB_MSG
+            with contextlib.suppress(Exception):
+                blind = _parse_once(cmd)[1]
+                if blind is _BLIND_STRUCTURAL:
+                    message = _STRUCTURAL_VERB_MSG.format(cause=blind.cause, hint=blind.hint)
             with contextlib.suppress(OSError):
-                print(_HIDDEN_VERB_MSG, file=sys.stderr)
+                print(message, file=sys.stderr)
             if discarded_write is not None:
                 with contextlib.suppress(
                     Exception

@@ -1,1 +1,0 @@
-- **Updates no longer delete the end of your `~/.claude/CLAUDE.md` when a managed block's end marker is missing.** The block writers (network identity, container specs) now leave the file untouched and say which marker is unbalanced and on which line; before, everything from the unmatched begin marker to the end of the file, Personal Notes included, was removed.

@@ -15,17 +15,38 @@ state through the main checkout rather than creating worktree-local state.
 Codex defers MCP schemas until requested. Before calling a Genesis tool that is
 not already visible, use MCP tool discovery for its exact `server.tool` name.
 
-The initial Codex surface provides approved health and recall tools only. It
-does not expose persistent memory writes, task dispatch, browser control,
-outreach, Discord, recon, campaign management, or session controls. Do not
-work around this allowlist; expanding it needs a separate capability review.
+The ordinary Codex profile provides the approved health and recall floor.
+The separately qualified validator profile also admits memory_store, private
+follow_up_create/list/update and pr_verification_close. It has no session ledger,
+charter, dispatch, browser, outreach, campaign or settings authority. Do not work
+around either allowlist; another expansion needs its own capability review.
 
 The standalone launcher enforces `--external-client` on the server as well as
 the client allowlist. Both the `external` default and explicit `validator`
-profile currently expose the same health and recall floor. Direct calls to
-other tools are rejected before their bodies run; the health bootstrap also
+profile have separate closed tool sets: external retains5health/8memory tools;
+validator admits9health/9memory. Direct calls to other tools are rejected before
+their bodies run; the health bootstrap also
 skips dispatch queue and campaign initialization. These tool profiles are not
 authentication or isolation from an operator with full host access.
+
+Validator follow-ups require user_input_needed, a stable request_key for creation
+and no schedule, pin or session provenance; updates may touch eligible private
+records from other clients. A public link or pending publication makes a row
+ineligible. Memory writes retain the existing collection/supersedes interface and
+its existing partial-failure limits. Use these writes only for authorized work.
+Verification results are derived from strict evidence and an independent PR
+number; the server forces preview until post-calibration operator opt-in. A
+preview discharges nothing. After an uncertain real response, read stored state
+before retrying; verification attempt counters are not idempotency keys. See
+`docs/reference/codex-validator-writers.md`. This skill does not activate the
+dedicated validator launcher or authorize deployment/calibration.
+
+Validator batches also follow `docs/reference/validator-tracking.md`: preflight
+the actual exposed tools, persist measurements, verify structured task receipts,
+and checkpoint the selected rows. Public-by-default includes install-local and
+security-related work; private tasks require concrete unavoidable disclosure
+harm. A missing private writer does not block safe public filing. Honor pauses
+without creating a Genesis session or adding lifecycle hooks.
 
 Do not pass a Codex thread or session identifier to `session_charter`,
 `session_ledger_*`, or other session-bound tools. Those tools operate only on an
@@ -35,6 +56,16 @@ or charter to make one work.
 Use `genesis-health` for live status and `genesis-memory` for recall. Recall
 may update Genesis retrieval-use metadata; this is expected and does not make
 the conversation a Genesis session.
+
+The project also configures `gitnexus` through `.claude/mcp/run-gitnexus`,
+which enforces the repository's installed-version and Node compatibility pin.
+Its explicit 15-tool catalog excludes source-editing `rename` and group-metadata
+`group_sync`. The retained tools include raw Cypher and can have incidental
+cache/recovery effects; this is not a side-effect-free server contract.
+GitNexus reads a snapshot, so check
+freshness before relying on it for current code. Linked worktrees use live
+symbol tools for branch truth rather than indexing another checkout. See
+`docs/reference/codex-gitnexus.md` for setup and qualification limits.
 
 If a capability requires automatic context injection, transcript extraction,
 session continuity, or background delivery into this conversation, explain that

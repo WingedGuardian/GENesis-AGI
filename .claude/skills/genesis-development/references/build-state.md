@@ -17,7 +17,7 @@
 
 When checking whether a subsystem is active:
 - **ACTIVE** means registered in bootstrap, has callers, produces data
-- **INERT** means code exists but zero production callers (e.g., ego/)
+- **INERT** means code exists but zero production callers
 - **STUB** means interface exists but implementation is placeholder
 - **Skeleton** means registry exists but no real modules registered
 

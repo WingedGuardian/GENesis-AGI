@@ -9,8 +9,10 @@ regresses:
 
 1. A foreground session ASKS (a human can decide) but a dispatched session is
    DENIED, because an ask nobody can answer is a silent block.
-2. The deny is LOUD — a critical observation — because a dispatched session
-   walking into a wall it can never pass has no legitimate instance.
+2. The deny is RECORDED, never silent: an observation lands for every one. It
+   no longer pages (#3848, owner ruling 2026-11-04): a session merely denied
+   this file is not news; a session that is stopped is, and is reported where
+   the session's outcome is.
 
 The fail-safe test is the one that matters most: if recording breaks, the block
 must still hold. A logging failure must never become a security hole.
@@ -21,6 +23,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
+import site
 import sqlite3
 import subprocess
 import sys
@@ -130,14 +134,14 @@ def test_unrelated_or_template_is_silent(command: str, db: str) -> None:
     assert _run(command, db, dispatched=False) == ("silent-allow", 0)
 
 
-def test_dispatched_is_denied_and_recorded_critical(db: str) -> None:
+def test_dispatched_is_denied_and_recorded(db: str) -> None:
     decision, rc = _run("source ~/genesis/secrets.env", db, dispatched=True)
     assert (decision, rc) == ("deny", 0)
 
     rows = sqlite3.connect(db).execute("SELECT priority, type, source FROM observations").fetchall()
     assert len(rows) == 1
     assert rows[0] == (
-        "critical",
+        "low",
         "background_session_blocked_needs_user",
         "hook.needs_user",
     )
@@ -272,7 +276,7 @@ def test_recorded_row_carries_ttl_and_origin(db: str) -> None:
     )
     assert row is not None, "the deny must record an observation"
     priority, origin_class, created_at, expires_at = row
-    assert priority == "critical"
+    assert priority == "low"
     assert origin_class == "first_party"
     assert created_at
     assert expires_at, (
@@ -339,6 +343,166 @@ def test_dispatch_detector_matches_the_canonical_one() -> None:
             os.environ["GENESIS_CC_SESSION"] = original
 
 
+class TestBackgroundAlertLevel:
+    """#3848: a dispatched secrets deny is recorded, not paged.
+
+    The deny never changes. Owner ruling 2026-11-04: a background session merely
+    denied this file is not page-worthy, true access or false positive; a
+    session that is STOPPED is what pages, and that is reported where the
+    session's outcome is, not here. On one live install 3 of 4 recorded
+    background denials were matcher false positives (#3789).
+    """
+
+    @staticmethod
+    def _priorities(db: str) -> list[str]:
+        return [r[0] for r in sqlite3.connect(db).execute("SELECT priority FROM observations")]
+
+    @staticmethod
+    def _run_in(home: Path, command: str, db: str, session: str = "s") -> str:
+        """Run the guard dispatched with HOME and cwd at a stub checkout."""
+        env = {
+            **os.environ,
+            "GENESIS_DB_PATH": db,
+            "GENESIS_CC_SESSION": "1",
+            "HOME": str(home),
+            # Moving HOME moves Python's user site; keep the real one, or an
+            # install whose dependencies live there cannot import them and the
+            # record is silently not written.
+            "PYTHONUSERBASE": site.getuserbase(),
+        }
+        proc = subprocess.run(
+            [sys.executable, str(_GUARD)],
+            input=json.dumps(
+                {"tool_name": "Bash", "session_id": session, "tool_input": {"command": command}}
+            ),
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=home / "genesis",
+            check=False,
+        )
+        return json.loads(proc.stdout)["hookSpecificOutput"]["permissionDecision"]
+
+    @pytest.fixture
+    def home(self, tmp_path: Path) -> Path:
+        (tmp_path / "genesis").mkdir()
+        (tmp_path / "genesis" / "secrets.env").write_text("API_KEY=x\n")
+        return tmp_path
+
+    @pytest.mark.parametrize("command", ["grep -c KEY ~/genesis/secrets.env", "cat s*.env"])
+    def test_denied_and_recorded_without_a_page(self, home: Path, db: str, command: str) -> None:
+        assert self._run_in(home, command, db) == "deny"
+        assert self._priorities(db) == ["low"]
+
+    def test_a_credential_cut_by_the_excerpt_is_still_scrubbed(self, home: Path, db: str) -> None:
+        """The record is scrubbed BEFORE it is cut: a token split at the cut no
+        longer matches the scrub's patterns, and records now persist (morning
+        report, dashboard) rather than only paging."""
+        prefix = "cat secrets.env; echo "
+        filler = "x" * (230 - len(prefix))
+        command = prefix + filler + " ghp_" + "a" * 36  # the token straddles char 240
+        assert self._run_in(home, command, db) == "deny"
+        (content,) = sqlite3.connect(db).execute("SELECT content FROM observations").fetchone()
+        assert "ghp_" not in content
+
+    def test_a_credential_cut_at_the_scrub_bound_never_reaches_the_record(
+        self, home: Path, db: str
+    ) -> None:
+        """A command longer than the scrub bound keeps no excerpt. An earlier
+        secret that shrinks to a redaction marker would otherwise pull text from
+        past the cut, a credential split there that no pattern still matches,
+        into the stored excerpt."""
+        command = "cat secrets.env; API_KEY=" + "a" * 3790 + "; echo ghp_" + "b" * 36
+        assert self._run_in(home, command, db) == "deny"
+        (content,) = sqlite3.connect(db).execute("SELECT content FROM observations").fetchone()
+        assert "ghp_" not in content
+        assert "bbbb" not in content
+        assert "excerpt withheld" in content
+
+    def test_the_deny_reason_no_longer_promises_a_critical(self, home: Path, db: str) -> None:
+        env = {
+            **os.environ,
+            "GENESIS_DB_PATH": db,
+            "GENESIS_CC_SESSION": "1",
+            "HOME": str(home),
+            # Moving HOME moves Python's user site; keep the real one, or an
+            # install whose dependencies live there cannot import them and the
+            # record is silently not written.
+            "PYTHONUSERBASE": site.getuserbase(),
+        }
+        proc = subprocess.run(
+            [sys.executable, str(_GUARD)],
+            input=json.dumps({"tool_name": "Bash", "tool_input": {"command": "cat secrets.env"}}),
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=home / "genesis",
+            check=False,
+        )
+        reason = json.loads(proc.stdout)["hookSpecificOutput"]["permissionDecisionReason"]
+        assert "critical" not in reason.lower()
+        assert "handoff" in reason
+
+    def test_a_later_critical_in_the_same_session_is_not_swallowed(
+        self, db: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A quiet record must not dedupe away a loud one on the same wall."""
+        monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+        monkeypatch.setenv("GENESIS_DB_PATH", db)
+        nu = _needs_user()
+        nu.decide("act", "r", payload={"session_id": "s"}, priority="low")
+        nu.decide("act", "r", payload={"session_id": "s"})
+        assert sorted(self._priorities(db)) == ["critical", "low"]
+
+    def test_an_unknown_priority_falls_back_to_critical(
+        self, db: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A typo at a call site must never make a block quieter."""
+        nu = _needs_user()
+        monkeypatch.setenv("GENESIS_CC_SESSION", "1")
+        monkeypatch.setenv("GENESIS_DB_PATH", db)
+        decision = nu.decide("x", "r", payload={"session_id": "s"}, priority="urgent")
+        assert decision["hookSpecificOutput"]["permissionDecision"] == "deny"
+        assert self._priorities(db) == ["critical"]
+
+    def test_the_critical_identity_is_unchanged(
+        self, db: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Rows recorded before this change keep deduping against new ones."""
+        import hashlib
+
+        monkeypatch.setenv("GENESIS_DB_PATH", db)
+        nu = _needs_user()
+        nu._record("act", "d", "sess")
+        (h,) = sqlite3.connect(db).execute("SELECT content_hash FROM observations").fetchone()
+        old = hashlib.sha256(f"{nu._TYPE}|act|sess".encode()).hexdigest()
+        assert h == old
+
+    def test_an_older_needs_user_still_records_critical(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Reverse skew: a needs_user.py without ``priority`` must still decide,
+        and its own default is the louder direction."""
+        spec = importlib.util.spec_from_file_location("g2", _GUARD)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        calls: list[dict] = []
+
+        def old_decide(action, reason, detail="", payload=None, *, ask_key=None):
+            calls.append({"ask_key": ask_key})
+            return {"hookSpecificOutput": {"permissionDecision": "deny"}}
+
+        monkeypatch.setattr(mod, "decide", old_decide)
+        monkeypatch.setattr(
+            mod,
+            "read_payload",
+            lambda: {"tool_name": "Bash", "tool_input": {"command": "cat secrets.env"}},
+        )
+        assert mod.main() == 0
+        assert calls == [{"ask_key": "secrets_env"}]
+        assert '"deny"' in capsys.readouterr().out
+
+
 class TestAuditFindings:
     """Regressions for an adversarial audit of this module (2026-09-06).
 
@@ -378,6 +542,13 @@ class TestAuditFindings:
 
     def test_grep_glob_alone_is_gated(self, fake_home: Path) -> None:
         assert self._touches(paths=[str(fake_home / "genesis" / "secrets*")])
+
+    def test_nested_unreadable_receiver_is_unknown(self) -> None:
+        spec = importlib.util.spec_from_file_location("st", _HOOKS / "secrets_target.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        command = "bash -c " + shlex.quote("echo ok # don't\ncat $SECRET_PATH")
+        assert mod._heredoc_feeds_an_executor(command)
 
     # ── a NAME must never outrank the INODE ─────────────────────────────────
     def test_a_dot_example_name_pointing_at_the_real_file_is_gated(self, fake_home: Path) -> None:

@@ -57,8 +57,10 @@ class PeerRegistry:
             yield db
 
     @asynccontextmanager
-    async def transaction(self):
+    async def transaction(self, *, before_begin=None):
         async with self.connection() as db:
+            if before_begin is not None:
+                await before_begin(db)
             await db.execute("BEGIN IMMEDIATE")
             try:
                 yield db

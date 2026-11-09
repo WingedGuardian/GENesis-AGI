@@ -4,7 +4,10 @@
 # paused is confirmed stopped. Detection, and the decision to call this, live in
 # scripts/lib/watchgod_runaway.sh (wg_runaway_check); this file only acts.
 # Sourced after watchgod_signal.sh, watchgod_records.sh and
-# watchgod_runaway.sh. Pure functions; nothing runs at source time.
+# watchgod_runaway.sh. Pure functions; at source time it only loads gnu_timeout.sh.
+
+# shellcheck source=scripts/lib/gnu_timeout.sh
+. "$(dirname "${BASH_SOURCE[0]}")/gnu_timeout.sh"
 
 # A command the guardian paused and nobody resumed is paged again every this
 # many hours while it stays paused: nothing resumes it on its own, and a
@@ -92,6 +95,24 @@ declare -gA _RW_EMPTIED_EP=()
 # and paused again. An independent premise check found the proof bought no
 # safety and drew most of the review findings; it was removed. A thaw that
 # lands between the unlock and the truncate is the same case: a refill.
+#
+# Testing this live (real /proc, real signals): give the stand-in session a
+# script of more than one command, e.g. a copy of bash named `claude` run as
+#   ./claude -c 'bash -c "exec >> <cc-tmp>/claude-<uid>/p/s/tasks/t.output; while :; do head -c 1M /dev/zero; sleep 0.25; done"; exit'
+# With a single command bash execs it, so the stand-in stops being `claude`
+# (MEASURED). The nearest claude is then the real session running the test,
+# and the pause takes that session's tool shell and the test script with it,
+# which hangs the test until `HOME=<scratch> scripts/watchgod thaw all` (the
+# same HOME: thaw reads the pause records from $HOME/.genesis/watchgod). Run it
+# with HOME and GENESIS_ALERT_QUEUE_ROOT pointing at a scratch directory, so the
+# pause records and the pages stay out of the live daemon's state and the alert
+# channel. Those variables do not reach the running genesis-tmp-watchgod, which
+# watches /, $HOME and /tmp itself: stop it for the test
+# (`systemctl --user stop genesis-tmp-watchgod`, start it after), or the writer
+# can cross the live runaway threshold and page through the real queue.
+# Give the scratch cc-tmp its own domain key only if it is on its own
+# filesystem: a small total on a shared device makes every large file on that
+# device read as a runaway against it.
 
 _rw_task_output() {
     # 0 when $1 is exactly a Claude Code task output under cc-tmp.

@@ -1,0 +1,381 @@
+"""Separate stateful publishing proof; run without the legacy replay plugin."""
+
+import ast
+import asyncio
+import hashlib
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from tests.conftest import private_module
+from tests.test_hooks import codex_adapter_replay as bridge
+from tests.test_hooks import test_push_create_override as original
+
+CASES = (
+    "test_republish_bare_push_allows",
+    "test_republish_explicit_push_allows",
+    "test_safe_flags_still_allow",
+    "test_republish_hit_records_branch",
+    "test_republish_offline_allow_when_ls_remote_fails",
+    "test_integration_record_stays_under_isolated_home",
+)
+COMMANDS = ("git push", "git push origin feat/x", "git push -uv -o ci.skip origin feat/x")
+
+
+def arm_environment(home):
+    home.mkdir()
+    return {
+        "PATH": os.environ["PATH"], "HOME": str(home), "GENESIS_HOME": str(home / ".genesis"),
+        "GENESIS_DB_PATH": str(home / "absent.db"), "TMPDIR": str(home),
+        "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
+        "_TEST_CANONICAL_PUBLIC_REPO": "",
+    }
+
+
+@pytest.fixture
+def publishing_fixture(monkeypatch, tmp_path, request):
+    assert not request.config.pluginmanager.hasplugin("tests.test_hooks.codex_adapter_replay")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.syspath_prepend(str(bridge.ROOT / "scripts/hooks"))
+    monkeypatch.setattr(bridge, "COPIED", {})
+    config = SimpleNamespace(_codex_replay_state={})
+    runtime = bridge.existing_replay_runtime.__wrapped__(
+        SimpleNamespace(mktemp=lambda _: tmp_path), SimpleNamespace(config=config)
+    )
+    clone = Path(original.published_feat.__wrapped__(tmp_path))
+    adapter = private_module("republish_adapter", bridge.ROOT / "scripts/hooks/codex_validator_adapter.py")
+    allowlist = private_module("republish_allowlist", bridge.ROOT / "scripts/hooks/push_allowlist.py")
+    return runtime, clone, adapter, allowlist
+
+
+def invoke_replay(monkeypatch, tmp_path, fixture, name, *, scope=None, guard=None):
+    runtime, clone, _, _ = fixture
+    sidecar = tmp_path / "sidecar"
+    (sidecar / "temp").mkdir(parents=True)
+    env = arm_environment(tmp_path / "direct-home")
+    request = SimpleNamespace(
+        config=SimpleNamespace(_codex_replay_state={"sidecar": sidecar, "ambient_tmpdir": None}),
+        node=SimpleNamespace(originalname=name, nodeid="fixture::" + name),
+        module=scope or original,
+    )
+    monkeypatch.setattr(bridge, "ROWS", [])
+    with pytest.MonkeyPatch.context() as patch:
+        case = bridge.replay_case(request, patch, tmp_path,
+                                  SimpleNamespace(getbasetemp=lambda: tmp_path), runtime)
+        next(case)
+        try:
+            return subprocess.run(
+                [sys.executable, str(guard or original._GUARD)], cwd=clone, env=env,
+                input=json.dumps({"hook_event_name": "PreToolUse", "tool_name": "Bash", "cwd": str(clone),
+                                  "tool_input": {"command": "git push"}}),
+                capture_output=True, text=True, timeout=15,
+            )
+        finally:
+            with pytest.raises(StopIteration):
+                next(case)
+
+
+@pytest.mark.parametrize("name", CASES)
+def test_six_frozen_publishing_allowances_remain_direct(monkeypatch, tmp_path, publishing_fixture, name):
+    result = invoke_replay(monkeypatch, tmp_path, publishing_fixture, name)
+    assert original._decision(result) == "allow"
+    row = bridge.ROWS[-1]
+    assert row["kind"] == "direct" and "publishing allowance" in row["reason"]
+    assert row["publishing_test_sha256"] == bridge.sha(Path(original.__file__))
+    assert row["original_guard_sha256"] == bridge.sha(original._GUARD)
+    assert "adapter_assertions_passed" not in row
+    assert (tmp_path / "direct-home/.genesis/pushed_branches.json").is_file()
+
+
+@pytest.mark.parametrize("outside", ["module", "file", "case", "guard"])
+def test_publishing_exception_does_not_expand(monkeypatch, tmp_path, publishing_fixture, outside):
+    runtime, _, _, _ = publishing_fixture
+    scope = SimpleNamespace(__name__=original.__name__, __file__=original.__file__)
+    name, guard = CASES[0], original._GUARD
+    if outside == "module":
+        scope.__name__ = "tests.test_hooks.another_module"
+    if outside == "file":
+        scope.__file__ = str(tmp_path / "another_module.py")
+    if outside == "case":
+        name = "test_first_push_new_branch_asks"
+    if outside == "guard":
+        guard = runtime / "scripts/hooks/git_push_guard.py"
+    result = invoke_replay(monkeypatch, tmp_path, publishing_fixture, name, scope=scope, guard=guard)
+    assert original._decision(result) == "ask"
+    assert bridge.ROWS[-1]["kind"] == "replay"
+    assert not bridge.ROWS[-1]["actual_allow"]
+
+
+@pytest.mark.parametrize("changed", ["test", "guard"])
+def test_publishing_exception_requires_reviewed_source(monkeypatch, tmp_path, publishing_fixture, changed):
+    if changed == "test":
+        target, sha = Path(original.__file__), bridge.sha
+        monkeypatch.setattr(bridge, "sha", lambda path: "changed" if Path(path) == target else sha(path))
+    else:
+        monkeypatch.setattr(bridge, "publishing_guard_digest", lambda path: "changed")
+    with pytest.raises(AssertionError, match="publishing allowance source changed"):
+        invoke_replay(monkeypatch, tmp_path, publishing_fixture, CASES[0])
+    assert not (tmp_path / "direct-home/.genesis/pushed_branches.json").exists()
+
+
+def _guard_with(tmp_path, edit):
+    copy = tmp_path / "git_push_guard.py"
+    copy.write_text(edit(original._GUARD.read_text()))
+    return copy
+
+
+def _insert_in_body(src, name):
+    head = src.index(f"def {name}(")
+    body = src.index(":\n", head) + 2
+    return src[:body] + "    _probe = 1\n" + src[body:]
+
+
+def test_the_guard_digest_is_pinned_to_the_publishing_code():
+    assert bridge.publishing_guard_digest(original._GUARD) == bridge.PUBLISHING_GUARD_DIGEST
+
+
+def test_an_edit_outside_the_publishing_code_does_not_requalify(tmp_path):
+    """The point of the narrowing: guard PRs that never touch the publishing arm
+    no longer fail these tests or collide on the pin."""
+    copy = _guard_with(tmp_path, lambda s: _insert_in_body(s, "check_pr_report") + "\n_NEW = 1\n")
+    assert bridge.publishing_guard_digest(copy) == bridge.publishing_guard_digest(original._GUARD)
+
+
+@pytest.mark.parametrize("name", ["_push_is_dry_run", "_run_merge_and_push_gates", "main"])
+def test_an_edit_inside_the_publishing_code_requalifies(tmp_path, name):
+    copy = _guard_with(tmp_path, lambda s: _insert_in_body(s, name))
+    assert bridge.publishing_guard_digest(copy) != bridge.publishing_guard_digest(original._GUARD)
+
+
+def _a_constant_the_listed_code_reads():
+    tree = ast.parse(original._GUARD.read_text())
+    listed = set(bridge.PUBLISHING_GUARD_FUNCTIONS)
+    funcs = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in listed]
+    read = {n.id for f in funcs for n in ast.walk(f) if isinstance(n, ast.Name)}
+    const = next(
+        n for n in tree.body
+        if isinstance(n, ast.Assign) and len(n.targets) == 1
+        and isinstance(n.targets[0], ast.Name) and n.targets[0].id in read
+    )
+    return const.targets[0].id
+
+
+# Each edit below changes what the six cases run without touching a listed body.
+# A fix-review measured every one of them slipping past an earlier digest.
+_RELATED_EDITS = {
+    "a later rebinding of a constant the code reads": lambda s: s + (
+        f"\n{_a_constant_the_listed_code_reads()} = {_a_constant_the_listed_code_reads()}\n"
+    ),
+    "an import inside a top-level try block": lambda s: s.replace(
+        "import push_allowlist", "push_allowlist = None", 1
+    ),
+    "a top-level if block rebinding a listed function": lambda s: s + "\nif True:\n    _allow = None\n",
+    "a decorator on a listed function": lambda s: s.replace(
+        "\ndef _allow(", "\n@staticmethod\ndef _allow(", 1
+    ),
+    "the __main__ entry block": lambda s: s.replace(
+        'if __name__ == "__main__":', 'if __name__ == "__main__":\n    pass', 1
+    ),
+    "a sys.path change at module level": lambda s: s.replace(
+        "sys.path.insert(0", "sys.path.insert(1", 1
+    ),
+    "a constant another selected constant is built from": lambda s: s.replace(
+        "mergePullRequest|", "mergePullRequestX|", 1
+    ),
+    # Round 1 on #3788 (Codex, measured): the guard holds NEL, U+2028 and U+2029
+    # literally, and str.splitlines broke on them while AST line numbers do not,
+    # so every segment after them was shifted and this real flip kept the pin.
+    "a listed body after the guard's literal line separators": lambda s: s.replace(
+        "    return any(os.environ.get(v) for v in _REPO_SELECTION_ENV)",
+        "    return not any(os.environ.get(v) for v in _REPO_SELECTION_ENV)",
+        1,
+    ),
+    # Round 1 on #3788 (CodeRabbit): a compound statement that binds an unrelated
+    # name and mutates a selected one through a method call.
+    "a loop mutating a read constant through a method": lambda s: s + (
+        f"\nfor _p in ():\n    {_a_constant_the_listed_code_reads()}.update(_p)\n"
+    ),
+}
+
+
+def test_the_guard_really_holds_the_line_separators_the_digest_must_ignore():
+    """Precondition for the separator case above: without these characters in the
+    guard, that case would pass on a str.splitlines digest too."""
+    src = original._GUARD.read_text(encoding="utf-8")
+    assert any(ch in src for ch in ("\x85", " ", " "))
+
+
+@pytest.mark.parametrize("edit", list(_RELATED_EDITS), ids=list(_RELATED_EDITS))
+def test_module_level_code_the_publishing_path_depends_on_requalifies(tmp_path, edit):
+    src = original._GUARD.read_text()
+    changed = _RELATED_EDITS[edit](src)
+    assert changed != src, "precondition: the edit's anchor exists"
+    copy = _guard_with(tmp_path, lambda s: changed)
+    assert bridge.publishing_guard_digest(copy) != bridge.publishing_guard_digest(original._GUARD)
+
+
+_TRACER = '''
+import atexit, os, sys
+_SEEN = set()
+def _prof(frame, event, arg):
+    if event == "call" and frame.f_code.co_filename.endswith("scripts/hooks/git_push_guard.py"):
+        _SEEN.add(frame.f_code.co_qualname.split(".")[0])
+sys.setprofile(_prof)
+@atexit.register
+def _dump():
+    if _SEEN:
+        fd = os.open(os.environ["GUARD_TRACE_OUT"], os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+        os.write(fd, ("\\n".join(sorted(_SEEN)) + "\\n").encode())
+        os.close(fd)
+'''
+
+
+def test_the_six_cases_run_no_guard_code_outside_the_pin(tmp_path):
+    """The list is a measurement, so it is re-measured here: run the six cases
+    with a profile hook in every Python process they start, and fail if any of
+    them executes a top-level guard function or class the digest does not
+    cover. Without this, a change that routes the publishing path through new
+    code would pass under an allowance nobody re-approved for it."""
+    tracer = tmp_path / "tracer"
+    tracer.mkdir()
+    (tracer / "sitecustomize.py").write_text(_TRACER)
+    out = tmp_path / "seen.txt"
+    env = {**os.environ, "GUARD_TRACE_OUT": str(out)}
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(tracer), env.get("PYTHONPATH")) if p)
+    env.pop("PYTEST_CURRENT_TEST", None)
+    selector = " or ".join(sorted(bridge.DIRECT_PUBLISHING_ALLOWANCES))
+    run = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         str(Path(original.__file__)), "-k", selector],
+        cwd=bridge.ROOT, env=env, capture_output=True, text=True, timeout=900,
+    )
+    assert f"{len(bridge.DIRECT_PUBLISHING_ALLOWANCES)} passed" in run.stdout, run.stdout[-3000:]
+    seen = {ln for ln in out.read_text().split() if ln and not ln.startswith("<")}
+    assert seen, "precondition: the tracer saw the guard run"
+    assert seen <= set(bridge.PUBLISHING_GUARD_FUNCTIONS), (
+        "the publishing cases now run guard code outside PUBLISHING_GUARD_FUNCTIONS: "
+        f"{sorted(seen - set(bridge.PUBLISHING_GUARD_FUNCTIONS))}; add them, re-pin and "
+        "re-review the allowance"
+    )
+
+
+def test_a_listed_name_that_disappears_fails_closed(tmp_path):
+    copy = _guard_with(tmp_path, lambda s: s.replace("def _push_is_force(", "def _push_is_forced(", 1))
+    digest = bridge.publishing_guard_digest(copy)
+    assert digest.startswith("missing:") and "_push_is_force" in digest
+
+
+def git_state(clone):
+    return tuple(subprocess.check_output(["git", "-C", str(clone), *args], text=True)
+                 for args in (("config", "--local", "--list"), ("show-ref",)))
+
+
+def assert_adapter_republish(raw, refused, note):
+    specific = json.loads(raw["stdout"]).get("hookSpecificOutput", {}) if raw["stdout"].strip() else {}
+    reason = specific.get("permissionDecisionReason", "")
+    assert (raw["code"] == 0 and specific.get("permissionDecision") == "ask"
+            and "another step in this command" in reason and "git config or remotes" in reason
+            and refused and reason in note), "Expected real guard ask/refusal cause"
+
+
+@pytest.mark.parametrize("offline", [False, True], ids=["fresh-online", "recorded-offline"])
+@pytest.mark.parametrize("command", COMMANDS, ids=["bare", "explicit", "safe-flags"])
+@pytest.mark.parametrize("fault", [None, "empty", "deny"], ids=["real", "empty-control", "deny-control"])
+def test_republish_matrix_owns_both_initial_states(monkeypatch, tmp_path, publishing_fixture,
+                                                 offline, command, fault):
+    runtime, clone, adapter, allowlist = publishing_fixture
+    remote = tmp_path / "remote.git"
+    url = str(remote)
+    direct_env = arm_environment(tmp_path / "direct-home")
+    adapted_env = arm_environment(tmp_path / "adapted-home")
+    initial = None
+    if offline:
+        seed_env = arm_environment(tmp_path / "fixture-record")
+        with monkeypatch.context() as patch:
+            patch.setattr(os, "environ", seed_env)
+            assert allowlist._state_path() == Path(seed_env["GENESIS_HOME"]) / "pushed_branches.json"
+            allowlist.record({url}, "feat/x")
+            assert allowlist.is_recorded({url}, "feat/x")
+        initial = (Path(seed_env["GENESIS_HOME"]) / "pushed_branches.json").read_bytes()
+        remote.rename(tmp_path / "unavailable.git")
+    for env in (direct_env, adapted_env):
+        cache = Path(env["GENESIS_HOME"]) / "pushed_branches.json"
+        if initial is not None:
+            cache.parent.mkdir()
+            cache.write_bytes(initial)
+        assert cache.exists() == offline
+    before = git_state(clone)
+    remote_before = git_state(remote) if remote.exists() else None
+    active = runtime
+    guard_relative = "scripts/hooks/git_push_guard.py"
+    expected_guard = bridge.sha(runtime / guard_relative)
+    if fault:
+        active = tmp_path / "mutant-runtime"
+        shutil.copytree(runtime, active, symlinks=True, ignore=shutil.ignore_patterns("__pycache__"))
+        target = active / guard_relative
+        assert not target.is_symlink()
+        target.write_text("pass\n" if fault == "empty" else
+                          'import sys; print("fixture generic deny",file=sys.stderr);sys.exit(2)\n')
+        assert bridge.sha(target) != expected_guard
+    payload = {"hook_event_name": "PreToolUse", "tool_name": "Bash", "cwd": str(clone),
+               "tool_input": {"command": command}}
+    direct = subprocess.run(
+        [str(runtime / ".claude/hooks/genesis-hook"), "hooks/git_push_guard.py"],
+        input=json.dumps(payload), cwd=clone, env=direct_env, capture_output=True, text=True, timeout=15,
+    )
+    assert direct.returncode == 0 and original._decision(direct) == "allow"
+    raw = {}
+    reducer = adapter.child_result
+
+    def observe(code, stdout, stderr):
+        raw.update(code=code, stdout=stdout.decode(), stderr=stderr.decode())
+        return reducer(code, stdout, stderr)
+
+    payload["tool_input"]["command"] = "cd " + shlex.quote(str(clone)) + " || exit\n" + command
+    refused, note = False, ""
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "environ", adapted_env)
+        patch.setattr(adapter, "RUNTIME_ROOT", active)
+        patch.setattr(adapter, "child_result", observe)
+        call = next(c for c in adapter.prepare(payload) if c[0][-1] == "hooks/git_push_guard.py")
+        try:
+            note = asyncio.run(adapter.run_guard(*call))
+        except adapter.Refused as exc:
+            refused, note = True, str(exc)
+    if fault:
+        with pytest.raises(AssertionError, match="Expected real guard ask/refusal cause"):
+            assert_adapter_republish(raw, refused, note)
+    else:
+        assert_adapter_republish(raw, refused, note)
+    for env in (direct_env, adapted_env):
+        cache = Path(env["GENESIS_HOME"]) / "pushed_branches.json"
+        expected = env is direct_env or not fault or offline
+        assert cache.exists() == expected
+        if expected:
+            with monkeypatch.context() as patch:
+                patch.setattr(os, "environ", env)
+                assert allowlist.is_recorded({url}, "feat/x")
+                assert allowlist._state_path() == cache
+            if offline:
+                assert cache.read_bytes() == initial
+    assert git_state(clone) == before and remote.exists() == (not offline)
+    if remote.exists():
+        assert git_state(remote) == remote_before
+    assert bridge.sha(runtime / guard_relative) == expected_guard
+    (tmp_path / "republish-evidence.json").write_text(json.dumps({
+        "offline": offline, "command": command, "fault": fault,
+        "guard_sha256": expected_guard, "executed_guard_sha256": bridge.sha(active / guard_relative),
+        "adapter_sha256": hashlib.sha256((bridge.ROOT / "scripts/hooks/codex_validator_adapter.py").read_bytes()).hexdigest(),
+        "direct_genesis_home": direct_env["GENESIS_HOME"], "adapted_genesis_home": adapted_env["GENESIS_HOME"],
+        "fixture_initial_sha256": hashlib.sha256(initial).hexdigest() if initial else None,
+        "raw": raw, "refused": refused, "note": note,
+        "kind": "instrument-control" if fault else "independent-state-pair",
+    }, indent=2))

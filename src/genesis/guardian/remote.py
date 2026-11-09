@@ -13,7 +13,7 @@ update, sync-gateway, redeploy, update-cc, update-node, test-approval,
 disk-status, host-profile, cc-tmp-apply, reharden-key, ping, provision-status,
 provision-grow-disk, provision-grow-memory, provision-vzdump,
 provision-vzdump-status, storage-expand, grow-root,
-set-container-limits.
+set-container-limits, sent-log.
 """
 
 from __future__ import annotations
@@ -55,6 +55,8 @@ _VZDUMP_TIMEOUT = 330.0      # gateway: timeout 300 (start: gate+POST / status:
 _EXPAND_TIMEOUT = 660.0      # gateway: timeout 600 (pvresize + autoextend profile)
 _GROW_ROOT_TIMEOUT = 330.0   # gateway: timeout 300 (incus LV + fs online resize)
 _SET_LIMITS_TIMEOUT = 70.0   # gateway: timeout 60 (incus config set + verify)
+_SENT_LOG_TIMEOUT = 20.0     # gateway: timeout 15 (read a bounded local JSONL;
+                             # short, since it runs inside the awareness tick)
 
 
 async def _reap(proc: asyncio.subprocess.Process) -> None:
@@ -347,6 +349,21 @@ class GuardianRemote:
         """
         ok, out = await self._ssh_command("ram-status", timeout=_STATUS_TIMEOUT)
         return self._as_json(ok, out, "ram-status")
+
+    async def sent_log(self, since: float) -> tuple[bool, str]:
+        """Read-only: alerts the guardian delivered since ``since`` (epoch s).
+
+        Returns the raw ``(ok, output)``: JSON lines plus a terminal ok line,
+        parsed and validated by ``guardian/sent_log_ingest.py``. A pre-redeploy
+        gateway answers ``denied`` (its unknown-verb default) and one whose src
+        predates the verb answers a skew error; both arrive as ``ok=False``.
+        """
+        if not (0 <= since < 1e10):
+            return False, "invalid since"
+        # Exactly the shape the gateway admits: <=10 integer digits, 6 fraction.
+        return await self._ssh_command(
+            f"sent-log --since {since + 0.0:.6f}", timeout=_SENT_LOG_TIMEOUT,
+        )
 
     async def request_grow_disk(self, disk: str, add_gib: int) -> dict:
         """EXECUTE a pre-approved VM disk grow + absorb into the thin pool."""

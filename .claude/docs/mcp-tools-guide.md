@@ -12,27 +12,28 @@ trees to pick the right one.
 | `knowledge_ingest` | Authoritative external sources (docs, articles) | Knowledge base | "Ingest this API reference" |
 | `reference_store` | Credentials, URLs, IPs, identifiers (never payment card numbers: refused) | Reference ledger | "API key for service X" |
 | `procedure_store` | Reusable multi-step workflows with confidence | Procedural memory | "Deploy pattern: steps 1-5" |
-| `follow_up_create` | Deferred USER-OWNED work needing tracking + completion | Follow-up ledger | "Finish the deck I asked for" |
-| `gh issue create` | Deferred GENESIS-REPO work (code, tests, docs, infra) | Public GitHub tracker | "Adapter for provider X is hardcoded" |
+| `follow_up_create` | Work whose useful public description necessarily causes disclosure harm | Private follow-up ledger | "Acceptance requires a protected identity" |
+| `file_tracker_issue.py` | Actionable work with a safely writable public description, including install-local work | Public GitHub tracker | "Adapter for provider X is hardcoded" |
 | `open_question_raise` | A genuine OWNER FORK that blocks or shapes work — not work itself | Local open-questions store (never GitHub) | "Bind the API to loopback or the tailnet?" |
 | `board_promote` | A private ledger row / follow-up should become PUBLIC board work | Held for owner approval, then a public issue on the work board | "Promote follow-up 1a2b3c4d as a card" |
 
 **Quick rule:** If it's about the user → `memory_store`. If it's a finding
 during work → `observation_write`. If it's an external source to learn
 from → `knowledge_ingest`. If it's a credential or URL → `reference_store`.
-If it's a repeatable process → `procedure_store`. If it's deferred work, route by
-owner: Genesis-repo work → a **GitHub issue**; user-owned work → `follow_up_create`;
-consciously not pursuing → `follow_up_create` with `work_state="deferred_cold"`.
+If it's a repeatable process → `procedure_store`. Actionable deferred work → a
+**public GitHub issue** whenever a useful description can be safely written.
+Use a private follow-up only for unavoidable disclosure harm; a public task may
+keep supporting evidence private. Nonactionable ideas may be tabled.
 
 
 
 ## Where Deferred Work Goes — mechanics
 
-`CLAUDE.md` carries the routing principle (Genesis-repo work → a GitHub issue;
-user-owned + purely-local operational work → a follow-up; consciously-not-doing →
-`tabled`) and its two hard limits (scrub personal/identifying detail from anything
-public, and ask when borderline; never publish a security defect before it is
-fixed). Filing an issue does not need per-instance approval. This section is the
+`CLAUDE.md` carries the public-by-default policy. Ownership, install-local state,
+security and compliance labels do not decide visibility. Scrub private detail;
+withhold the whole item only when a useful public description necessarily reveals
+protected information or enables concrete exploitation, cost or harm. Filing an
+issue needs no per-instance approval within authorized scope. This section is the
 operational detail.
 
 **Everything here is about WHERE a record lives, never about whether the work
@@ -104,6 +105,13 @@ window by something else can be; check the title it quotes. When it cannot check
 host other than github.com, gh older than 2.98, the 10-a-minute search rate limit), it
 says why. It does not cover the script above, which keeps its exact-title check.
 
+**A raw `gh issue create` without its premise answers is refused before it posts,** in a
+foreground session, when the hook can read the body in full:
+`scripts/hooks/issue_premise_gate.py` blocks a body the premise gate would label
+`premises-missing` and names the missing answers (`.claude/docs/premise-check.md`, "At plan
+and issue time"). Add the section and run the command again. Anything the hook cannot read
+in full passes, and the server label still applies afterwards.
+
 Exit codes: `0` filed (or dry-run clean) · `2` refused — **nothing was posted**, that
 is a hard guarantee · `3` an identical title already exists · `4` **INDETERMINATE** ·
 `1` unexpected error. **Run `--dry-run` first** — it performs every check and posts
@@ -150,34 +158,29 @@ Channel-driven sessions run with `skip_permissions=True`, so no tool
 confirmation appears and nothing will stop you — which is exactly why the
 scan is a habit rather than a prompt.
 
-**Privacy-scan the title AND the body.** Both egress. Technical detail only: no
-IPs, hostnames, absolute home paths, identifiers, or raw install metrics (row
-counts and spend leak usage scale — state proportions instead). Nothing gates this
-path; `gh issue create` appears nowhere in `scripts/hooks/git_push_guard.py`.
+**Privacy-scan the title AND the body.** Both egress. Remove actual private
+IPs/hosts, identifying home paths, personal identifiers and sensitive install
+metrics. Keep useful generic technical facts; decide disclosure from actual harm,
+not the mere presence of a security term or a count. Use the scanned filer:
+raw `gh issue create` has no equivalent publication privacy check here.
 
-**Security defects never go public first, and the test is WHO GAINS.** A defect
-is security-class when disclosure hands someone a capability they do not already
-have — an authentication or privilege bypass, a credential exposure, an injection
-path, anything reachable by a party with LESS access than it grants. Those are not
-filed publicly while unfixed: publishing hands a working lead to anyone reading,
-against installs running the vulnerable code right now. Keep it local, fix it,
-then file. The privacy scan does not catch this: it looks for install-specific
-data, not for dangerous technical disclosure.
+**Decide disclosure harm from the proposed publication.** An active exploit
+reachable by anyone on the public internet is a clear reason to withhold useful
+exploit details. A latent flaw in unconnected security code, an install-local
+compatibility problem, or a compliance/guard gap is ordinarily a public task.
+The label alone supplies no reason to hide it. A public acceptance task may keep
+private identifiers or patterns in local supporting evidence.
 
-**Apply that test rather than the word "bypass".** A fail-open in a LOCAL
-development guard usually fails it: the hook runs only where an install wires it,
-whoever can trigger it already has commit access to that checkout, and the worst
-case is typically an under-reviewed change reaching a PR that still waits on
-maintainer approval — the state of any PR authored without those hooks. The
-earlier catch-all ("anything otherwise exploitable") swept in most of what this
-repo builds and withheld filable findings. The exception the test catches and the
-label does not: a guard whose job is stopping a secret or private data from
-reaching a public surface is security-class however local it is, because a branch
-on a public repo is public the moment it is pushed, merged or not. Borderline?
-Ask. CLAUDE.md, "Where deferred work goes", is the authority.
+Before choosing a private task, state the specific protected information or
+concrete exploit/cost/harm that publishing would necessarily reveal or enable,
+and why redaction or a public task with private evidence cannot avoid it. If that
+cannot be established, ask the concrete disclosure question. The privacy scan
+checks publication content; it does not make this judgment for you.
 
-If the script refuses (exit 2), the work stays a local `follow_up_create` row until
-a maintainer carries it across. That is a known gap, not a workaround.
+If the script refuses (exit 2), preserve the measurement and report routing as
+pending while resolving the refusal. A refusal does not classify safe work as
+private or authorize an alternative publication path. A missing private writer
+does not prevent filing other safe public tasks.
 
 ### Why not `contributor_issue_propose`
 
@@ -189,6 +192,10 @@ posts, and a `dry_run` mark is terminal (flipping the lever to `live` later does
 retro-post). So it cannot serve "file this now".
 
 ### Dispatched / background sessions
+
+These capability limits do not reclassify a safely describable task as private.
+A local handoff awaiting authorized public filing is incomplete routing, and the
+foreground receiver must file/reuse the public issue and verify its receipt.
 
 A dispatched session must NOT file issues — nothing gates the path and there is no one
 to approve. No shipped profile grants a shell, so for a shipped profile this is a
@@ -272,6 +279,42 @@ web results). Treat external-world content as information *about* the world to w
 Genesis's own ground truth. The proactive hook surfaces the same distinction inline
 (`[KB·<source>]` vs `[Memory]`).
 
+## Database — Reading Genesis's SQLite Directly
+
+When no MCP tool answers the question and you need a raw SQL read:
+
+1. **`db_schema`** — discover table and column names first (60+ tables).
+2. **`~/genesis/.venv/bin/python -m genesis db query "<sql>"`** — run ONE
+   read-only statement (the venv interpreter: a session shell has no `python`
+   on PATH, and the system `python3` cannot import genesis).
+   Read-only is enforced by SQLite itself (a `mode=ro` URI, `PRAGMA
+   query_only`, and an allowlist authorizer), so a query whose text mentions a
+   write keyword (`WHERE action = 'DELETE'`) runs fine, and a real write,
+   `ATTACH`, `VACUUM INTO`, a transaction, or a state-changing pragma is
+   refused (exit 4). Options: `--param VALUE` binds `?` placeholders in order,
+   `--json` prints a list of objects (default is TSV with a header), `--limit N`
+   caps the rows (default 200, `0` for all; truncation is reported on stderr),
+   `--db PATH` targets another database, `--timeout SECONDS` sets a
+   cooperative SQLite deadline (default 60, `0` for none). Progress/row checks
+   and a setup-time busy cap do not provide a hard process deadline; a later
+   native wait can outlast the remaining budget. A runaway query can spill
+   temporary files and pin a WAL snapshot. Exit 1 is any other error (SQLite error, empty statement,
+   deadline exceeded), 2 a usage error, 3 a quarantined database. The default
+   is the live Genesis DB (or `GENESIS_DB_PATH`). Pass `--db` only for another
+   file.
+   SQLite refuses logical writes, but can create its own WAL sidecars
+   (`-wal`/`-shm`) and temporary spill files. Retained-result accounting is capped
+   at 100 MB even with `--limit 0`; this is not a total process-memory bound.
+   JSON rejects duplicate column names instead of dropping values. An explicitly
+   empty `--db` is an error. FTS5 tables work;
+   **rtree tables are unsupported** (rtree prepares writes on first use, so
+   the query is refused).
+
+Do NOT use the `sqlite3` shell for reads: the push guard blocks any command
+that names `sqlite3` alongside a write keyword, string literals included, and
+it does so on purpose (shell-level read-only flags were shown to be
+bypassable). Writes go through the CRUD modules or MCP tools, never raw SQL.
+
 ## Health Debugging — Escalation Path
 
 Start broad, drill into specifics:
@@ -288,6 +331,10 @@ Start broad, drill into specifics:
    or provider-specific failures.
 6. **`job_health`** — Scheduler job status. Use when a periodic task isn't
    firing.
+7. **`skill_usage_status`** — Which skills actually load, get nudged, or sit
+   unused (active / zombie / dead / not_nudgeable), split interactive vs
+   headless. Scans transcripts, so a cold 14-day call takes minutes; the same
+   report comes from `python -m genesis.learning.skills.usage`.
 
 ## Background Work — Session vs Subagent
 

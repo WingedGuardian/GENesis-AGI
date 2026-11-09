@@ -18,12 +18,16 @@ _spec.loader.exec_module(_rep)
 
 NOW = datetime(2026, 11, 1, 12, 0, tzinfo=UTC)
 
+from genesis.memory.graph_cutover import CLEAN_CENSUS_SCHEMA  # noqa: E402
+
 
 def _ts(t: datetime) -> str:
     return t.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
-def _db(tmp_path: Path, *, days: int, fallback_at: datetime | None = None) -> Path:
+def _db(
+    tmp_path: Path, *, days: int, fallback_at: datetime | None = None, event: dict | None = None
+) -> Path:
     path = tmp_path / "genesis.db"
     conn = sqlite3.connect(path)
     conn.execute(
@@ -32,12 +36,13 @@ def _db(tmp_path: Path, *, days: int, fallback_at: datetime | None = None) -> Pa
         " created_at TEXT, prompt_hash TEXT)"
     )
     census = {
-        "v": 1,
+        "v": CLEAN_CENSUS_SCHEMA,
         "procs": [],
         "other_servers": {},
         "unclassified": 0,
         "head_telemetry": True,
         "head_dirty": False,
+        "head_history_telemetry": True,
         "complete": True,
         "reasons": [],
     }
@@ -75,7 +80,7 @@ def _db(tmp_path: Path, *, days: int, fallback_at: datetime | None = None) -> Pa
             "outcomes": {"fallback": 1},
             "served": {"networkx": 1},
             "configured": {"falkordb": 1},
-            "events": [{"outcome": "fallback", "primary_reason": "ConnectionError"}],
+            "events": [event or {"outcome": "fallback", "primary_reason": "ConnectionError"}],
             "prior_write_failures": 0,
         }
         conn.execute(
@@ -228,3 +233,215 @@ def test_the_read_waits_for_an_exclusive_writer(tmp_path):
 
 def test_a_missing_lost_writes_file_reads_as_empty(tmp_path):
     assert _rep.read_lost_writes(tmp_path / "absent.jsonl") == []
+
+
+def test_a_reset_prints_the_cause_its_event_recorded(tmp_path, capsys):
+    event = {
+        "outcome": "fallback",
+        "primary_reason": "TimeoutError",
+        "pid": 4242,
+        "starttime_ticks": 99,
+        "proc_age_s": 12.5,
+        "diag": {
+            "budget_ms": 500.0,
+            "elapsed_ms": 501.2,
+            "late_ms": 1.2,
+            "cancel_ms": 0.4,
+            "frames": ["query", "readuntil", "_wait_for_data"],
+            "psi_stall_us": {"cpu_some": 0, "io_full": 3000},
+        },
+    }
+    db = _db(tmp_path, days=20, fallback_at=NOW - timedelta(days=2), event=event)
+    assert _run(tmp_path, db) == 1
+    out = capsys.readouterr().out
+    assert "pid 4242, age 12.5s" in out
+    assert "late 1.2ms" in out and "budget 500.0ms" in out and "cancel 0.4ms" in out
+    assert "at query>readuntil>_wait_for_data" in out
+    assert "stall io_full=3000us" in out
+    assert "cpu_some" not in out  # a zero stall is not news
+
+
+def test_a_reset_written_before_the_diagnostics_says_so(tmp_path, capsys):
+    db = _db(tmp_path, days=20, fallback_at=NOW - timedelta(days=2))
+    assert _run(tmp_path, db) == 1
+    assert "uninstrumented (written before timeout diagnostics)" in capsys.readouterr().out
+
+
+def test_a_malformed_event_never_crashes_the_report(tmp_path, capsys):
+    event = {"outcome": "fallback", "pid": 7, "diag": {"frames": "not-a-list", "psi_stall_us": 3}}
+    db = _db(tmp_path, days=20, fallback_at=NOW - timedelta(days=2), event=event)
+    assert _run(tmp_path, db) == 1
+    assert "pid 7" in capsys.readouterr().out
+
+
+def test_the_query_a_timeout_hit_is_named(tmp_path, capsys):
+    event = {"outcome": "fallback", "pid": 7, "diag": {"query": "marker", "budget_ms": 120.0}}
+    db = _db(tmp_path, days=20, fallback_at=NOW - timedelta(days=2), event=event)
+    assert _run(tmp_path, db) == 1
+    assert "marker query" in capsys.readouterr().out
+# ── T2: the phase a timeout's frames name ──────────────────────────────────
+# Real stacks, deepest last, as redis 8.1.0 builds them (counted by reading the
+# client): a query reply, a reconnect handshake, and a retry's reconnect, which
+# ALSO holds `_send_command_parse_response` above the connect frames.
+_READER = ["_read_response", "_readline", "readline", "readuntil", "_wait_for_data"]
+_REPLY = [
+    "execute_command",
+    "call_with_retry",
+    "_send_command_parse_response",
+    "parse_response",
+    "read_response",
+    "_read_response_from_parser",
+    "read_response",
+    *_READER,
+]
+_HANDSHAKE = [
+    "execute_command",
+    "get_connection",
+    "ensure_connection",
+    "connect",
+    "call_with_retry",
+    "connect_check_health",
+    "on_connect_check_health",
+    "read_response",
+    *_READER,
+]
+_RETRY_RECONNECT = [
+    "call_with_retry",
+    "_send_command_parse_response",
+    "send_command",
+    "send_packed_command",
+    "connect_check_health",
+    "_connect",
+    "create_unix_connection",
+]
+
+
+def _cause_of(diag: dict) -> str:
+    return _rep._cause({"outcome": "fallback", "pid": 7, "diag": diag})
+
+
+def test_a_reply_wait_is_named_as_one():
+    assert "phase reply" in _cause_of({"frames": _REPLY[-16:], "conn": "idle_open", "in_use": 1})
+
+
+def test_a_handshake_wait_is_named_as_one():
+    out = _cause_of({"frames": _HANDSHAKE[-16:], "conn": "new", "in_use": 0})
+    assert "phase connect" in out and "conn new" in out and "in_use 0" in out
+
+
+def test_a_retry_reconnect_is_a_connect_not_a_reply():
+    """The retry path reconnects INSIDE the reply call, so its stack names both;
+    the connect frames are checked first."""
+    assert "phase connect" in _cause_of({"frames": _RETRY_RECONNECT, "conn": "idle_open"})
+
+
+def test_a_wait_on_client_construction_is_its_own_phase():
+    assert "phase construct" in _cause_of(
+        {"frames": ["wait_for", "_run", "_graph"], "conn": "no_client"}
+    )
+
+
+def test_a_row_from_before_t2_says_its_frames_cannot_tell():
+    out = _cause_of({"frames": ["_readline", "readline", "readuntil", "_wait_for_data"]})
+    assert "phase unknown (predates the connection capture)" in out
+    assert ", conn " not in out  # no state was recorded, so none is printed
+
+
+def test_every_frame_the_phase_rule_names_exists_in_the_installed_client():
+    """The rule keys on redis-py's own function names. A client upgrade that
+    renames one would turn every such timeout into "unknown" silently."""
+    import redis.asyncio.client as rc
+    import redis.asyncio.connection as rconn
+
+    defined = set()
+    for mod in (rc, rconn):
+        for obj in vars(mod).values():
+            if isinstance(obj, type):
+                defined.update(vars(obj))
+            elif callable(obj):
+                defined.add(getattr(obj, "__name__", ""))
+    for name in sorted(_rep.PHASE_FRAMES["connect"] | _rep.PHASE_FRAMES["reply"]):
+        assert name in defined, name
+    # Two names are shared with other classes; pin them to the owners whose
+    # frames the rule actually sees.
+    assert "connect" in vars(rconn.AbstractConnection)
+    assert "parse_response" in vars(rc.Redis)
+
+
+async def _real_client_frames(tmp_path, *, answer_handshake: bool) -> list[str]:
+    """The frames a REAL redis-py client is cancelled in, against a socket that
+    never answers (the handshake) or answers only the handshake (the reply)."""
+    import asyncio
+
+    import redis.asyncio as ra
+
+    sock = str(tmp_path / "r.sock")
+
+    async def handler(reader, writer):
+        while data := await reader.read(65536):
+            if answer_handshake and (n := data.count(b"SETINFO")):
+                writer.write(b"+OK\r\n" * n)
+                await writer.drain()
+
+    server = await asyncio.start_unix_server(handler, path=sock)
+    # protocol=2, as the falkordb client builds it: its handshake is CLIENT
+    # SETINFO, where redis-py's own default would open with HELLO 3.
+    client = ra.Redis(unix_socket_path=sock, protocol=2)
+    try:
+        await asyncio.wait_for(client.execute_command("GET", "k"), 0.3)
+    except TimeoutError as exc:
+        tb = exc.__cause__.__traceback__
+        names = []
+        while tb is not None:
+            names.append(tb.tb_frame.f_code.co_name)
+            tb = tb.tb_next
+        return names
+    finally:
+        server.close()
+        await client.aclose()
+    raise AssertionError("the read was expected to time out")
+
+
+async def test_a_real_client_stuck_in_its_handshake_reads_as_connect(tmp_path):
+    from genesis.memory import graphstore_falkor as falkor_mod
+
+    names = await _real_client_frames(tmp_path, answer_handshake=False)
+    assert _rep._phase(names[-falkor_mod._DIAG_FRAMES :]) == "connect", names
+
+
+async def test_a_real_client_waiting_on_its_reply_reads_as_reply(tmp_path):
+    from genesis.memory import graphstore_falkor as falkor_mod
+
+    names = await _real_client_frames(tmp_path, answer_handshake=True)
+    assert _rep._phase(names[-falkor_mod._DIAG_FRAMES :]) == "reply", names
+
+
+def test_a_retried_reset_says_what_the_retry_recovered_from():
+    """#3035: a retried read has no timeout diag, so without this the reset line
+    would name a pid and nothing else."""
+    out = _rep._cause(
+        {"outcome": "retried", "pid": 7, "primary_reason": "ConnectionError", "diag": None}
+    )
+    assert "retried a dropped connection (ConnectionError)" in out
+
+
+def test_a_fallback_reset_never_claims_a_retry():
+    # redis-py's own frames include `call_with_retry`, so test the phrase, not the word.
+    phrase = "retried a dropped connection"
+    assert phrase not in _cause_of({"frames": _REPLY[-16:], "conn": "idle_open"})
+
+
+def test_a_cancelled_retry_is_never_called_answered():
+    """A cancelled read records `retried` with served_by none: the line must
+    not report an answer that was never returned."""
+    out = _rep._cause(
+        {
+            "outcome": "retried",
+            "served_by": "none",
+            "pid": 7,
+            "primary_reason": "ConnectionError",
+            "diag": None,
+        }
+    )
+    assert "answered" not in out
+    assert "retried a dropped connection (ConnectionError)" in out

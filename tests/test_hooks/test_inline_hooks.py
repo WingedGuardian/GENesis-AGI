@@ -182,14 +182,6 @@ class TestBashHookRmRf:
     deep to be allowed. Special targets (., .., /) are always blocked.
     """
 
-    @pytest.fixture(autouse=True)
-    def _a_real_home(self, monkeypatch):
-        """``~`` cases assume an ordinary (two-level) home; the live closure's
-        session HOME is deep. The guard only judges the text it is given."""
-        from tests import _live_closure
-
-        monkeypatch.setenv("HOME", _live_closure.REAL_HOME)
-
     def test_rm_rf_root_blocked(self, rm_rf_hook_command: str) -> None:
         """rm -rf / -> BLOCKED (always-block target)."""
         result = run_hook(rm_rf_hook_command, {"command": "rm -rf /"})
@@ -1054,6 +1046,17 @@ class TestSettingsStructure:
         assert "hooks/plan_confidence_reminder.py" in commands, (
             f"the {tool} PreToolUse entry does not run plan_confidence_reminder.py"
         )
+
+    def test_the_plan_premise_gate_is_wired(self, settings: dict) -> None:
+        """Built is not wired: the gate's own tests pass with its settings entry
+        deleted, and an unwired blocking hook fails silent."""
+        commands = " ".join(
+            h.get("command", "")
+            for e in settings["hooks"]["PreToolUse"]
+            if "ExitPlanMode" in (e.get("matcher") or "").split("|")
+            for h in e.get("hooks", [])
+        )
+        assert "hooks/plan_premise_gate.py" in commands
 
     def test_bash_hook_is_command(self, settings: dict) -> None:
         """Bash hooks are type=command (inline bash -c or Python script)."""

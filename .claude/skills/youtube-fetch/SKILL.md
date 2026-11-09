@@ -82,7 +82,7 @@ unavailable or you need a specific track. The workflow below is that fallback.
    VTT="$HOME/tmp/yt-transcripts/$VID.en-orig.vtt"
    [ -f "$VTT" ] || VTT="$HOME/tmp/yt-transcripts/$VID.en.vtt"
    [ -f "$VTT" ] || { echo "no English VTT for $VID — see step 6" >&2; exit 1; }
-   sed '/^WEBVTT/d;/^Kind:/d;/^Language:/d;/^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9]* -->/d;s/<[^>]*>//g;/^[[:space:]]*$/d' "$VTT" | awk '!seen[$0]++'
+   sed '/^WEBVTT/d;/^Kind:/d;/^Language:/d;/^[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9]* -->/d;s/<[^>]*>//g;/^[[:space:]]*$/d' "$VTT" | awk '!seen[$ 0]++'
    ```
    The ORDER is the whole point, and each stage bit a previous version:
 

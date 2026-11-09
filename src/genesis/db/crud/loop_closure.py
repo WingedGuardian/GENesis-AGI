@@ -195,7 +195,8 @@ async def skill_funnel(db: aiosqlite.Connection) -> dict:
             "in a session's skill_tags (only background sessions tag today), "
             "measured = outcome computable (terminal-status session). "
             "leak_uninstrumented = no usage signal at all (foreground usage "
-            "uncaptured + no graded outcome source) — closing it is LC2-maturity."
+            "uncaptured + no graded outcome source) — closing it is LC2-maturity. "
+            "Foreground and dispatched skill usage: see the skill_usage_status tool."
         ),
     }
 

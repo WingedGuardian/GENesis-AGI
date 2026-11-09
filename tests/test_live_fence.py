@@ -2,9 +2,11 @@
 
 Every probe here is harmless even if the fence were absent: the refused call
 is ``sudo -n true``, the answered one ``systemctl --user is-active <a unit
-that does not exist>``, and every deploy script run is a stub under tmp_path. The fence's own tests must never be
-the thing that reaches live state (#2863: a fence's verify-RED once stopped a
-live server).
+that does not exist>``, and every deploy script run is either a stub under
+tmp_path or the checkout's own ``scripts/update.sh``, which refuses itself under
+the fence before it does anything (checked before each run, see
+``_require_self_guarded``). The fence's own tests must never be the thing that
+reaches live state (#2863: a fence's verify-RED once stopped a live server).
 """
 
 from __future__ import annotations
@@ -24,6 +26,21 @@ from tests import _live_fence as fence
 
 PROBE = ["sudo", "-n", "true"]
 READ = ["systemctl", "--user", "is-active", "genesis-fence-probe-nonexistent"]
+UPDATE_SH = Path(__file__).resolve().parent.parent / "scripts" / "update.sh"
+
+
+def _require_self_guarded(script: Path) -> None:
+    """The replay tests run the REAL update.sh, which is safe only because it
+    sources the live-system guard and refuses itself before its first real step
+    (the copy-to-temp block). Check that order before spawning it, so a change
+    that moves or drops the guard fails here instead of running the script."""
+    text = script.read_text(encoding="utf-8")
+    source = text.find("lib/live_system_guard.sh")
+    call = text.find("refuse_if_test_fenced_live")
+    copy = text.find("# ── Copy-to-temp guard")
+    assert 0 <= source < call < copy, (
+        f"{script} must source and call the test fence before its copy-to-temp block"
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -116,9 +133,13 @@ def test_asyncio_and_threads_are_refused_too():
         asyncio.run(via_thread())
 
 
-def test_os_system_is_refused():
-    with fence.expect_violation():
-        os.system(" ".join(PROBE))  # noqa: S605 - the shape under test
+def test_os_system_hits_the_shim():
+    """os.system runs `sh -c <line>`: the shell itself is allowed, and the
+    deny-listed name inside the line hits the PATH shim (exit 3, logged)."""
+    rc = os.system(" ".join(PROBE))  # noqa: S605 - the shape under test
+    lines = fence._drain()  # consume, so this test's teardown does not fail it
+    assert rc != 0
+    assert any("\tshim\tsudo" in ln for ln in lines)
 
 
 def test_a_fake_in_tmp_path_runs(tmp_path):
@@ -166,28 +187,45 @@ def test_a_real_path_to_an_answered_tool_is_refused(tmp_path, monkeypatch):
     assert fence.judge(str(fake), [str(fake)], None) is not None
 
 
-def _stub_scripts(tmp_path: Path) -> Path:
-    scripts = tmp_path / "checkout" / "scripts"
-    scripts.mkdir(parents=True)
-    script = scripts / "update.sh"
+def test_the_fence_arms_the_deploy_scripts_own_guard():
+    """The deploy refusal moved into the scripts: the fence only exports the
+    two variables scripts/lib/live_system_guard.sh reads."""
+    repo_root = os.path.realpath(Path(__file__).resolve().parent.parent)
+    roots = os.environ["GENESIS_TEST_FENCE_LIVE_ROOTS"].split(":")
+    assert repo_root in roots
+    if fence._S.real_home:
+        # Listed whether or not they exist yet: a test that creates one
+        # mid-run must not open a gap (CI: a test created ~/.genesis).
+        for name in (".genesis", "genesis"):
+            assert os.path.realpath(os.path.join(fence._S.real_home, name)) in roots
+    assert os.environ["GENESIS_TEST_FENCE_LOG"] == fence._S.log
+
+
+def test_a_guarded_script_refuses_itself_and_the_log_line_fails(tmp_path):
+    """A script wired like a deploy script (source the guard, check its acting
+    root) run against a listed root exits 97 and its REFUSED line lands in the
+    fence's log — the line teardown would fail an unwrapped test for."""
+    lib = Path(__file__).resolve().parent.parent / "scripts" / "lib" / "live_system_guard.sh"
+    script = tmp_path / "deploy.sh"
+    script.write_text(
+        f'#!/bin/bash\n. "{lib}"\nrefuse_if_test_fenced_live "$1" || exit 97\n'
+    )
+    script.chmod(0o755)
+    repo_root = os.path.realpath(Path(__file__).resolve().parent.parent)
+    with fence.expect_violation() as v:
+        run = subprocess.run(["bash", str(script), repo_root], capture_output=True, text=True)
+    assert run.returncode == 97
+    assert "REFUSED (test fence):" in run.stderr
+    assert any("REFUSED (test fence):" in r for r in v.reasons)
+
+
+def test_an_unguarded_script_under_tmp_runs(tmp_path):
+    """A script without the guard runs wherever it is launched from: refusing
+    is the script's own decision now, not the fence's."""
+    script = tmp_path / "checkout" / "scripts" / "update.sh"
+    script.parent.mkdir(parents=True)
     script.write_text("#!/bin/sh\nexit 0\n")
     script.chmod(0o755)
-    return script
-
-
-def test_a_deploy_script_with_the_real_home_is_refused(tmp_path, monkeypatch):
-    script = _stub_scripts(tmp_path)
-    with fence.expect_violation():
-        subprocess.run(["bash", str(script)], env={**os.environ, "HOME": fence._S.real_home})
-    # The closure gives the session a private HOME; put the real one back so the
-    # inherited-environment branch is the one under test.
-    monkeypatch.setenv("HOME", fence._S.real_home)
-    with fence.expect_violation():
-        subprocess.run([str(script)])  # inherits the real HOME
-
-
-def test_a_deploy_script_with_a_private_home_runs(tmp_path):
-    script = _stub_scripts(tmp_path)
     home = tmp_path / "home"
     home.mkdir()
     env = {**os.environ, "HOME": str(home)}
@@ -199,15 +237,14 @@ def test_a_deploy_script_with_a_private_home_runs(tmp_path):
     [
         ("/opt/somewhere/gh", ["gh", "pr", "list"], False),  # no such file: fails as on CI
         ("/usr/bin/env", ["env"], False),
-        ("bash", ["bash", "-c", "true update.sh"], False),  # an argument, not a command
         ("git", ["git", "status"], False),
-        ("bash", ["bash", "-n", "/x/scripts/update.sh"], False),  # parse only
-        ("bash", ["bash", "-en", "/x/scripts/update.sh"], False),
-        ("bash", ["bash", "-e", "/x/scripts/update.sh"], True),
+        ("bash", ["bash", "-c", "true update.sh"], False),
+        # Only the resolved PROGRAM is judged, never argv: a deploy script
+        # named here is refused by the script itself, not by the fence.
+        ("bash", ["bash", "-e", "/x/scripts/update.sh"], False),
     ],
 )
-def test_judge(program, argv, refused, monkeypatch):
-    monkeypatch.setenv("HOME", fence._S.real_home)  # env=None reads the process HOME
+def test_judge(program, argv, refused):
     assert (fence.judge(program, argv, None) is not None) is refused
 
 
@@ -218,17 +255,24 @@ def test_a_user_manager_test_may_run_systemd_run_but_nothing_else(tmp_path, monk
     assert fence.judge("systemd-run", ["systemd-run"], None) is None
     stubs = {"PATH": fence._S.all_stub_dir, "HOME": fence._S.real_home}
     assert fence.judge("claude", ["claude"], stubs) is not None
-    # What the real systemd-run would start is judged, under the user
-    # manager's PATH: a deploy run with the real HOME stays refused.
+    # What the real systemd-run goes on to start is a stated residual of the
+    # opt-out: arguments are never judged.
     run = ["systemd-run", "--user", "--scope", "-p", "MemoryMax=1G", "bash", "/x/scripts/update.sh"]
-    assert fence.judge("systemd-run", run, stubs) is not None
-    fake = tmp_path / "claude"
-    fake.write_text("#!/bin/sh\nexit 0\n")
-    fake.chmod(0o755)
-    monkeypatch.setattr(fence._S, "allowed_roots", ())  # treat tmp as an install dir
-    run = ["systemd-run", "--user", "-u", "x", "--", str(fake), "-p", "hi"]
-    assert "payload" in (fence.judge("systemd-run", run, stubs) or "")
-    assert fence.judge("systemd-run", ["systemd-run", "--user", "--", "true"], stubs) is None
+    assert fence.judge("systemd-run", run, stubs) is None
+
+
+def _wait_for_refusal(after: int) -> None:
+    """The update runs `bash update.sh` in a detached child: poll the log for a
+    REFUSED appended after offset ``after`` — earlier tests' consumed REFUSED
+    lines stay in the file, so the whole file cannot be searched."""
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            if b"REFUSED (test fence):" in Path(fence._S.log).read_bytes()[after:]:
+                return
+        except OSError:
+            pass
+        time.sleep(0.1)
 
 
 # ── acceptance: the 2026-10-12 shape, every spawn branch ────────────────────
@@ -255,9 +299,6 @@ def update_routes(tmp_path, monkeypatch):
     root = tmp_path / "root"
     root.mkdir()
     monkeypatch.setattr(updates, "_GENESIS_ROOT", root)
-    # The incident ran with the real HOME; the closure's private session HOME
-    # would make the deploy-script branches look harmless, so restore it.
-    monkeypatch.setenv("HOME", fence._S.real_home)
     app = Flask(__name__)
     with app.app_context():
         yield updates
@@ -315,19 +356,30 @@ def test_replay_supervised_fallback_never_reaches_claude(update_routes, monkeypa
 
 
 def test_replay_direct_branch_is_refused(update_routes, spawned, monkeypatch):
+    """The fallback runs `bash <checkout>/scripts/update.sh`: allowed in-process
+    (bash resolves fine), then the SCRIPT refuses itself under the exported
+    roots — exit 97, REFUSED logged — which this test consumes. Here the real
+    checkout's update.sh stands in for the deployed one: both are listed roots."""
     monkeypatch.setattr(update_routes, "_systemd_run_scope_available", lambda env: False)
+    _require_self_guarded(UPDATE_SH)
+    monkeypatch.setattr(update_routes, "_UPDATE_SCRIPT", UPDATE_SH)
     with fence.expect_violation() as v:
+        mark = os.path.getsize(fence._S.log)
         update_routes._apply_direct(Path("/nonexistent/pid"))
-    assert spawned == []
-    assert "update.sh" in v.reasons[0]
+        _wait_for_refusal(mark)
+    assert any("REFUSED (test fence):" in r and "update.sh" in r for r in v.reasons), v.reasons
 
 
-def test_replay_direct_probe_is_answered_and_the_fallback_refused(update_routes, spawned):
+def test_replay_direct_probe_is_answered_and_the_fallback_refused(update_routes, spawned, monkeypatch):
     """The scope probe runs systemd-run: the stub answers "unavailable" (as on CI),
-    which steers into the `bash update.sh` fallback. That fallback, with the real
-    HOME, is refused: a fence that answers a probe must still stop the route it
-    steers into."""
+    which steers into the `bash update.sh` fallback. The script then refuses
+    itself: a fence that answers a probe must still stop the route it steers
+    into."""
+    _require_self_guarded(UPDATE_SH)
+    monkeypatch.setattr(update_routes, "_UPDATE_SCRIPT", UPDATE_SH)
     with fence.expect_violation() as v:
+        mark = os.path.getsize(fence._S.log)
         update_routes._apply_direct(Path("/nonexistent/pid"))
-    assert [a[0] for a in spawned] == ["systemd-run"]
-    assert any("update.sh" in r for r in v.reasons)
+        _wait_for_refusal(mark)
+    assert [a[0] for a in spawned] == ["systemd-run", "bash"]
+    assert any("REFUSED (test fence):" in r and "update.sh" in r for r in v.reasons), v.reasons

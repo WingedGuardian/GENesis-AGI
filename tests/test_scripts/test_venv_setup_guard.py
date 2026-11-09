@@ -221,3 +221,85 @@ def test_browser_extra_waits_for_a_running_provisioner(tmp_path: Path) -> None:
     assert res.returncode != 0
     assert not any(c.startswith("pip install") for c in log.read_text().splitlines())
     assert "browser-stack" in res.stdout + res.stderr
+
+
+# ── install_runtime_extras: the test and payments extras ──────────────────────
+
+
+def _extras_venv(tmp_path: Path, *, list_out: str = "test,payments", check_rc: int = 0):
+    """A venv whose pip and python log their arguments. python answers the gate's
+    --install-extras with *list_out* (nothing and exit 1 when empty) and its
+    --extras check with *check_rc*; every other call (the import check) exits 0."""
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True)
+    log = tmp_path / "calls"
+    (venv / "bin" / "pip").write_text(f'#!/bin/sh\necho "pip $*" >> "{log}"\n')
+    list_rc = 0 if list_out else 1
+    (venv / "bin" / "python").write_text(
+        "#!/bin/sh\n"
+        f'echo "python $*" >> "{log}"\n'
+        'case "$*" in\n'
+        f'  *--install-extras*) printf "%s\\n" "{list_out}"; exit {list_rc};;\n'
+        f'  *--extras*) cat > /dev/null; echo "missing: pyrage [payments]"; exit {check_rc};;\n'
+        "esac\nexit 0\n"
+    )
+    for name in ("pip", "python"):
+        (venv / "bin" / name).chmod(0o755)
+    return venv, log
+
+
+def _install_runtime_extras(tmp_path: Path, venv: Path, env_extra: dict | None = None):
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    (repo / "pyproject.toml").write_text('[project]\nname = "fixture"\n')
+    _git("init", "-q", cwd=repo)
+    script = f'set -euo pipefail; source "{_LIB}"; install_runtime_extras "{repo}" "{venv}"'
+    env = {**os.environ, **(env_extra or {})}
+    env.pop("GENESIS_DEPLOY_SUMMARY", None)
+    env.update(env_extra or {})
+    return subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, timeout=120, env=env
+    )
+
+
+def test_runtime_extras_read_the_list_install_it_then_check_it(tmp_path: Path) -> None:
+    """The list comes from the gate (one record of it), pip installs exactly that
+    list as the extras of THIS checkout, and the gate checks it against the
+    checkout's pyproject.toml."""
+    venv, log = _extras_venv(tmp_path)
+    res = _install_runtime_extras(tmp_path, venv)
+    assert res.returncode == 0, res.stdout + res.stderr
+    calls = log.read_text().splitlines()
+    gate = tmp_path / "repo" / "scripts" / "lib" / "venv_matches_pyproject.py"
+    assert calls[0] == f"python -P {gate} --install-extras"
+    assert calls[1].startswith(f"pip install -e {tmp_path / 'repo'}[test,payments]")
+    assert calls[-1] == f"python -P {gate} --extras test,payments"
+
+
+def test_runtime_extras_report_what_pip_left_out(tmp_path: Path) -> None:
+    """pip's status is masked, so the gate's check is what makes it visible; the
+    deploy summary gets a line because update.sh shows only bootstrap's tail."""
+    venv, _ = _extras_venv(tmp_path, check_rc=1)
+    summary = tmp_path / "summary"
+    res = _install_runtime_extras(tmp_path, venv, {"GENESIS_DEPLOY_SUMMARY": str(summary)})
+    assert res.returncode == 1
+    assert "missing: pyrage [payments]" in res.stdout
+    line = summary.read_text()
+    assert line.startswith("warning: runtime extras [test,payments] incomplete")
+    # The safe remedy: never a bare editable install (the guard may be the reason).
+    assert "scripts/update.sh --post-merge" in line and "pip install" not in line
+
+
+def test_runtime_extras_install_nothing_when_the_list_cannot_be_read(tmp_path: Path) -> None:
+    venv, log = _extras_venv(tmp_path, list_out="")
+    res = _install_runtime_extras(tmp_path, venv)
+    assert res.returncode == 1
+    assert not any(c.startswith("pip ") for c in log.read_text().splitlines())
+    assert "cannot read the list" in res.stderr
+
+
+def test_runtime_extras_failure_without_a_summary_writes_nothing_else(tmp_path: Path) -> None:
+    venv, _ = _extras_venv(tmp_path, check_rc=1)
+    res = _install_runtime_extras(tmp_path, venv)
+    assert res.returncode == 1
+    assert list(tmp_path.glob("summary*")) == []

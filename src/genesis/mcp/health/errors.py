@@ -13,6 +13,12 @@ from genesis.mcp.health.constants import JOB_STALE_GAP_DAYS
 
 logger = logging.getLogger(__name__)
 
+# Actual alarmed depths; raw totals and scheduled display subsets are excluded.
+_QUEUE_DEPTH_FIELDS = frozenset({
+    "pending_embeddings", "dead_letters", "deferred_recovery", "deferred_processing",
+    "deferred_stuck", "failed_embeddings", "discarded_count",
+})
+
 
 async def _impl_health_errors(
     window_minutes: int = 60,
@@ -203,6 +209,32 @@ _ONGOING_MARK = "(ongoing for "
 _ONGOING_RE = re.compile(rf"\s*{re.escape(_ONGOING_MARK)}[^)]*\)\s*$")
 
 
+# The process-tree breakdown attached to ``infra:container_memory_high``: the
+# alarm said THAT memory was high but never WHO held it (2026-10-26: one tree held
+# ~13 GB and nothing in the alarm named it). Taken once, when the alarm begins
+# firing in this process, and reused while it keeps firing: `_compute_alerts`
+# runs on every tick and every dashboard poll, and a /proc pass per call would be
+# work nobody reads. Reused text also keeps the message stable, which the
+# `alert_events` row (captured at first fire) already assumes. The line carries
+# its own UTC date and time, so a held breakdown never reads as current. In memory: a
+# restart while the alarm fires takes one fresh breakdown, stamped with its own
+# time. Cleared on the first call where the alarm is not firing.
+_memory_culprits: str | None = None
+
+
+async def _memory_breakdown_line() -> str:
+    """The top-memory-trees line; never raises (see ``pid_breakdown.memory_summary``)."""
+    import asyncio
+
+    from genesis.observability import pid_breakdown
+
+    try:
+        return await asyncio.to_thread(pid_breakdown.memory_summary)
+    except Exception as exc:  # noqa: BLE001 - a diagnostic must not take the alert set down
+        logger.warning("memory breakdown could not run", exc_info=True)
+        return f"Process breakdown unavailable: {type(exc).__name__}."
+
+
 def _ongoing_for(created_at: str | None, now: datetime) -> str | None:
     """Human duration an alert has been open, or None if it should not be shown.
 
@@ -283,7 +315,9 @@ def _apply_ongoing_duration(
             logger.debug("ongoing-duration decoration failed", exc_info=True)
 
 
-async def _compute_alerts(*, agent_api_observation: dict | None = None) -> tuple[list[dict], set[str]]:
+async def _compute_alerts(
+    *, agent_api_observation: dict | None = None, queue_unknown_ids: set[str] | None = None,
+) -> tuple[list[dict], set[str]]:
     """Pure alert computation — recompute the firing alert set from live health.
 
     Returns ``(alerts, current_ids)`` and carries NO ``_alert_history`` state.
@@ -300,6 +334,9 @@ async def _compute_alerts(*, agent_api_observation: dict | None = None) -> tuple
     _job_retry_registry = health_mcp_mod._job_retry_registry
     if agent_api_observation is not None:
         agent_api_observation.update(status="unknown")
+    if queue_unknown_ids is not None:
+        queue_unknown_ids.clear()
+        queue_unknown_ids.update(f"queue:{field}" for field in _QUEUE_DEPTH_FIELDS)
 
     # WS-2 P1b: ledger writer-hook failures — checked BEFORE the
     # uninitialized-service early return because the counter needs no health
@@ -511,15 +548,12 @@ async def _compute_alerts(*, agent_api_observation: dict | None = None) -> tuple
     # back in (see resilience/deferred_work.py:STALE_WORKLIST_DAYS), so a genuinely
     # broken drain still surfaces. `deferred_work`/`deferred_worklist` stay in the
     # snapshot for honest display but are not depth-alarmed here.
-    _QUEUE_DEPTH_FIELDS = {
-        "pending_embeddings",
-        "dead_letters",
-        "deferred_recovery",
-        "deferred_processing",
-        "deferred_stuck",
-        "failed_embeddings",
-        "discarded_count",
-    }
+    if queue_unknown_ids is not None:
+        queue_unknown_ids.clear()
+        queue_unknown_ids.update(
+            f"queue:{field}" for field in _QUEUE_DEPTH_FIELDS
+            if not isinstance(queues.get(field), int)
+        )
     for queue_name, depth in queues.items():
         if queue_name not in _QUEUE_DEPTH_FIELDS:
             continue
@@ -630,6 +664,7 @@ async def _compute_alerts(*, agent_api_observation: dict | None = None) -> tuple
     # Use anon_pct (non-reclaimable memory) for alerts, not used_pct
     # (total cgroup including reclaimable page cache).
     anon_pct = container_mem.get("anon_pct", container_mem.get("used_pct", 0))
+    global _memory_culprits  # noqa: PLW0603
     if anon_pct > 85:
         alert_id = "infra:container_memory_high"
         # CRITICAL at >85% (lowered from >90% on 2026-06-13). This is a
@@ -637,14 +672,31 @@ async def _compute_alerts(*, agent_api_observation: dict | None = None) -> tuple
         # both the Telegram alert AND the voice chime earlier. anon_pct is
         # non-reclaimable memory, so >85% is genuine pressure (the box idles
         # ~76-79%). 6h dedup prevents repeat spam.
+        if _memory_culprits is None:
+            _memory_culprits = await _memory_breakdown_line()
+        # Kernel memory (slab, page tables) counts toward this alarm but belongs
+        # to no process, so the trees below can never add up to it. Saying how
+        # the figure splits lets a reader tell "the breakdown missed something"
+        # from "kernel memory is the cause".
+        split = ""
+        if container_mem.get("anon_gb") is not None and container_mem.get("kernel_gb") is not None:
+            split = (
+                f"; anon {container_mem['anon_gb']} GB, kernel {container_mem['kernel_gb']} GB"
+                " (kernel is held by no process)"
+            )
         alerts.append(
             {
                 "id": alert_id,
                 "severity": "CRITICAL",
-                "message": f"Container memory at {anon_pct}% anon+kernel ({container_mem.get('current_gb', '?')}/{container_mem.get('limit_gb', '?')}GB total)",
+                "message": (
+                    f"Container memory at {anon_pct}% anon+kernel ({container_mem.get('current_gb', '?')}/"
+                    f"{container_mem.get('limit_gb', '?')}GB total{split}). {_memory_culprits}"
+                ),
             }
         )
         current_ids.add(alert_id)
+    else:
+        _memory_culprits = None
 
     qdrant_cols = snap.get("infrastructure", {}).get("qdrant_collections", {})
     missing_cols = qdrant_cols.get("missing", [])
@@ -1472,8 +1524,10 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
     """
     import genesis.mcp.health_mcp as health_mcp_mod
 
-    alerts, current_ids = await _compute_alerts()
+    queue_unknown_ids: set[str] = set()
+    alerts, current_ids = await _compute_alerts(queue_unknown_ids=queue_unknown_ids)
     _alert_history = health_mcp_mod._alert_history
+    retained = {aid: stamp for aid, stamp in _alert_history.items() if aid in queue_unknown_ids}
 
     now = datetime.now(UTC).isoformat()
     for old_id in list(_alert_history.keys()):
@@ -1486,6 +1540,8 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
 
     if not active_only:
         for resolved_id, resolved_at in _alert_history.items():
+            if resolved_id in retained:
+                continue
             alerts.append(
                 {
                     "id": resolved_id,
@@ -1495,6 +1551,7 @@ async def _impl_health_alerts(active_only: bool = True) -> list[dict]:
             )
 
     health_mcp_mod._alert_history = {aid: now for aid in current_ids}
+    health_mcp_mod._alert_history.update(retained)
 
     return alerts
 

@@ -333,6 +333,9 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             thread_id           TEXT,
             validated_recipient TEXT,
             labeled_surplus     INTEGER NOT NULL DEFAULT 0,
+            -- An email's own subject line, when the sender gave one. NULL = none;
+            -- the drain falls back to DEFAULT_EMAIL_SUBJECT ("Message from Genesis").
+            email_subject       TEXT,
             -- NULL = live; non-NULL = cancelled at that time. Deliberately ONE
             -- column rather than a flag + timestamp like `delivered` above: this
             -- way "cancelled with no timestamp" is unrepresentable.
@@ -556,7 +559,14 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             -- when the TOPIC was written, as distinct from
             -- last_extracted_at, which is a pass watermark the extraction
             -- job advances even when it writes no topic.
-            topic_updated_at TEXT
+            topic_updated_at TEXT,
+            a2a_state        TEXT,
+            a2a_status_at    TEXT,
+            -- how the session ENDED (crud.cc_sessions.update_status); NULL on
+            -- rows older than the column = not judged, never paged.
+            outcome          TEXT,
+            outcome_reason   TEXT,
+            outcome_paged_at TEXT
         )
     """,
     "inbox_items": """
@@ -1987,7 +1997,7 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             source_ref  TEXT,
             added_by    TEXT NOT NULL DEFAULT 'foreground'
                         CHECK(added_by IN ('foreground','ambient','pulse',
-                                           'ambient_ledger_extractor')),
+                                           'ambient_ledger_extractor','relayed')),
             evidence    TEXT,
             source_quote TEXT,   -- provenance; resolvers write `evidence`, never this
             created_at  TEXT NOT NULL,
@@ -2116,7 +2126,8 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             verdict           TEXT,
             attempt_count     INTEGER NOT NULL DEFAULT 0,
             last_attempt_at   TEXT,
-            last_attempt_note TEXT
+            last_attempt_note TEXT,
+            rechecks          TEXT
         )
     """,
     # ── WS-2 sensor fabric (M9/M10) ──────────────────────────────────────

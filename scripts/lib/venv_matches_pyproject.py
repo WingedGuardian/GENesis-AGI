@@ -2,6 +2,9 @@
 requirements?
 
 Usage: venv_matches_pyproject.py <checkout-root>   (the pyproject.toml on stdin)
+       venv_matches_pyproject.py --extras [a,b]     (presence of optional groups;
+                                                     default: INSTALL_EXTRAS)
+       venv_matches_pyproject.py --install-extras   (prints INSTALL_EXTRAS)
 
 Run it with the venv's own python: the answer is about what that interpreter
 imports. It asks the installed project's own metadata, never the environment's
@@ -67,9 +70,10 @@ reinstalls, so it is safe only while the install still describes this tree, and
 Its cost is that a requirements change the venv already satisfies is still
 sent to a reinstall. Equality alone cannot see a package removed or downgraded
 after the install, so the base requirements are also checked for presence.
-Optional groups are not: which of them an install uses is not recorded
-anywhere, and the one an update installs (`browser`, through bootstrap.sh's
-non-fatal step) may legitimately be incomplete, which its own check reports. A base requirement that names extras
+Optional groups are not checked here: they are installed by separate non-fatal
+steps and may legitimately be incomplete. The groups every install installs are
+recorded in INSTALL_EXTRAS and checked by `--extras` (presence only, exit 1 with
+each missing package, never a reason to refuse); `browser` has its own check. A base requirement that names extras
 is checked by its own version only, as pip's resolver would have left it.
 """
 
@@ -88,6 +92,58 @@ class _CannotTell(Exception):
 
 class _WrongInterpreter(Exception):
     """This python cannot satisfy the incoming requires-python: exit 3."""
+
+
+# The optional groups every install installs (scripts/lib/venv_setup.sh
+# install_runtime_extras, a separate non-fatal step after the core package). The
+# one list: bootstrap's install step reads it with --install-extras, and `--extras`
+# with no list checks it (the deploy advisory runs the gate of the tree it sits in;
+# the group definitions come from the pyproject on stdin). `browser` is installed
+# the same way but checked by its own step (genesis.browser.provision
+# check-packages), not here.
+INSTALL_EXTRAS = ("test", "payments")
+
+
+def _extras_missing(pyproject: str, extras: tuple[str, ...]) -> list[str]:
+    """Presence only: each named group's requirements that apply to this
+    interpreter are installed at a version their specifier accepts. A named group
+    the pyproject does not declare is a difference too."""
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as installed_version
+
+    from packaging.requirements import InvalidRequirement, Requirement
+    from packaging.utils import canonicalize_name
+
+    try:
+        groups = tomllib.loads(pyproject)["project"].get("optional-dependencies") or {}
+    except (tomllib.TOMLDecodeError, KeyError, TypeError) as exc:
+        raise _CannotTell(f"cannot read the pyproject's optional groups: {exc}") from exc
+    declared = {canonicalize_name(g): specs for g, specs in groups.items()}
+    diffs = []
+    for extra in extras:
+        specs = declared.get(canonicalize_name(extra))
+        if specs is None:
+            diffs.append(f"extra not declared: [{extra}]")
+            continue
+        for spec in specs:
+            try:
+                req = Requirement(spec)
+            except InvalidRequirement as exc:
+                raise _CannotTell(f"cannot parse [{extra}] requirement {spec!r}: {exc}") from exc
+            if req.marker and not req.marker.evaluate({"extra": canonicalize_name(extra)}):
+                continue
+            try:
+                got = installed_version(req.name)
+            except PackageNotFoundError:
+                diffs.append(
+                    f"missing: {req.name} [{extra}] (required {req.specifier or 'at any version'})"
+                )
+                continue
+            if req.specifier and not req.specifier.contains(got, prereleases=True):
+                diffs.append(
+                    f"unsatisfied: {req.name} [{extra}] {got} does not meet {req.specifier}"
+                )
+    return diffs
 
 
 _FIND_KEYS = {"where", "include", "exclude", "namespaces"}
@@ -335,6 +391,24 @@ def _differences(root: Path, pyproject: str) -> tuple[list[str], str]:
 
 
 def main(argv: list[str]) -> int:
+    if argv[1:] == ["--install-extras"]:
+        print(",".join(INSTALL_EXTRAS))
+        return 0
+    if argv[1:2] == ["--extras"]:
+        try:
+            if len(argv) > 3:
+                raise _CannotTell("usage: venv_matches_pyproject.py --extras [a,b]")
+            named = tuple(e for e in argv[2].split(",") if e) if len(argv) == 3 else INSTALL_EXTRAS
+            diffs = _extras_missing(sys.stdin.read(), named)
+        except ImportError as exc:
+            print(f"cannot tell: {exc}", file=sys.stderr)
+            return 2
+        except _CannotTell as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        for line in diffs:
+            print(line)
+        return 1 if diffs else 0
     try:
         if len(argv) != 2:
             raise _CannotTell("usage: venv_matches_pyproject.py <checkout-root>")

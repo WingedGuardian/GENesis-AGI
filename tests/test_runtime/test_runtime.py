@@ -18,6 +18,17 @@ def _reset_runtime():
     GenesisRuntime.reset()
 
 
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path, monkeypatch):
+    """Bootstrap writes ``capabilities.json`` and ``bootstrap_manifest.json`` under
+    ``Path.home()`` (runtime/_capabilities.py). Without this, a local run
+    overwrote the live install's files, and a later test in the same process
+    (health_alerts) read this run's degraded subsystems back from them.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    return tmp_path
+
+
 def _all_init_patches():
     """Context managers that patch all bootstrap init steps."""
     return [
@@ -141,6 +152,18 @@ class TestBootstrap:
             # Second call should be a no-op
             await rt.bootstrap()
             assert mocks["_init_db"].call_count == 1  # NOT called again
+
+    @pytest.mark.asyncio
+    async def test_bootstrap_writes_its_files_under_the_isolated_home(self, tmp_path):
+        # The writer uses Path.home() at call time, so HOME is what keeps a
+        # local run from overwriting the live install's files. Reads tmp_path,
+        # not the fixture by name, so this fails if the fixture stops being
+        # autouse and every other bootstrap test here leaks again.
+        rt = GenesisRuntime.instance()
+        with _patched_bootstrap(rt):
+            await rt.bootstrap()
+        assert (tmp_path / ".genesis" / "bootstrap_manifest.json").is_file()
+        assert (tmp_path / ".genesis" / "capabilities.json").is_file()
 
     @pytest.mark.asyncio
     async def test_bootstrap_sets_bootstrapped(self):

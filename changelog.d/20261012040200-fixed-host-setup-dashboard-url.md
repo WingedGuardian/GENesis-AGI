@@ -1,1 +1,0 @@
-- `host-setup.sh` now checks that a proxy device is configured to forward the dashboard address to this container before printing it. When none does, it says what it found, prints the command that fixes it, and offers only routes that reach the container directly, instead of advertising a host URL that does not answer.

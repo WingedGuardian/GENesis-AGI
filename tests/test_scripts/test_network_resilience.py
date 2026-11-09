@@ -11,6 +11,7 @@ decision (grace window, rate limit, telemetry).
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -23,6 +24,14 @@ LIB = REPO_ROOT / "scripts" / "lib" / "network_resilience.sh"
 WATCHDOG = REPO_ROOT / "scripts" / "systemd" / "genesis-network-watchdog.sh"
 BOOTSTRAP = REPO_ROOT / "scripts" / "bootstrap.sh"
 UPDATE = REPO_ROOT / "scripts" / "update.sh"
+
+
+def _stamped(body: str) -> str:
+    """What scripts/lib/managed_units.py stamp writes for <body>."""
+    body = body.rstrip("\n") + "\n"
+    digest = hashlib.sha256(body.encode()).hexdigest()
+    return body + f"# genesis-managed v1 sha256={digest}\n"
+
 
 # ── stubs for the lib (network_resilience_apply) ──────────────────────────────
 
@@ -152,6 +161,30 @@ def _run_apply(env_overlay: dict) -> subprocess.CompletedProcess:
     )
 
 
+@pytest.mark.parametrize("partial", [False, True])
+def test_failed_metadata_migration_does_not_claim_network_configuration_applied(tmp_path, partial):
+    env = _stage(tmp_path)
+    assert _run_apply(env).returncode == 0
+    target = _paths(env)["keepconf"]
+    original = target.read_text().split("# genesis-managed v1 sha256=", 1)[0].encode()
+    target.write_bytes(original)
+    log = Path(env["SYSTEMCTL_LOG"])
+    log.write_text("")
+    fault = 'head -c 7 > "$2"; ' if partial else ""
+    sudo = tmp_path / "bin/sudo"
+    sudo.write_text(
+        _SUDO_STUB.replace(
+            'exec "$@"',
+            f'if [ "$1" = tee ] && [[ "$2" == */genesis-keep-config.conf ]]; then {fault}exit 1; fi\nexec "$@"',
+        )
+    )
+    result = _run_apply(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert ("NOT fully applied" in result.stdout) == partial
+    assert target.read_bytes() == (original[:7] if partial else original)
+    assert "reload" not in log.read_text().splitlines()
+
+
 def _paths(env: dict) -> dict[str, Path]:
     etc = Path(env["NETRES_ETC_ROOT"])
     libexec = Path(env["NETRES_LIBEXEC_DIR"])
@@ -171,7 +204,7 @@ def test_fresh_apply_writes_dropin_units_and_reloads(tmp_path):
 
     p = _paths(env)
     # KeepConfiguration=true (superset of dhcp) — not =dhcp, not a percentage.
-    assert p["keepconf"].read_text() == "[Network]\nKeepConfiguration=true\n"
+    assert p["keepconf"].read_text() == _stamped("[Network]\nKeepConfiguration=true\n")
     assert p["timer"].exists()
     # ExecStart tracks the (overridden) install dir, not a hardcoded path.
     service = p["service"].read_text()
@@ -636,7 +669,9 @@ def test_tailscale_watchdog_installs_where_tailscaled_exists(tmp_path):
     # The host's Python, never the venv; and a bound on a hung run.
     assert f"ExecStart=/usr/bin/python3 {p['script']}" in service
     assert "TimeoutStartSec=65min" in service
-    assert "Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" in service
+    assert (
+        "Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" in service
+    )
     assert "OnUnitActiveSec=2min" in p["timer"].read_text()
     calls = Path(env["SYSTEMCTL_LOG"]).read_text()
     assert "enable genesis-tailscale-watchdog.timer" in calls
@@ -665,7 +700,12 @@ def test_tailscale_watchdog_skipped_without_tailscaled(tmp_path):
 def test_tailscale_watchdog_installs_without_networkd(tmp_path):
     """It does not depend on networkd: a host whose network manager is not
     networkd still gets it, though the networkd parts are skipped."""
-    env = {**_stage(tmp_path), "TAILSCALED_CAT_RC": "0", "NETWORKD_ACTIVE_RC": "3", "NETWORKD_ENABLED": "disabled"}
+    env = {
+        **_stage(tmp_path),
+        "TAILSCALED_CAT_RC": "0",
+        "NETWORKD_ACTIVE_RC": "3",
+        "NETWORKD_ENABLED": "disabled",
+    }
     result = _run_apply(env)
     assert result.returncode == 0
     assert "not this host's network manager" in result.stdout
@@ -936,7 +976,9 @@ def test_root_watchdog_reporter_strips_completion_marker_and_reports_success():
 
 
 def test_root_watchdog_reporter_keeps_left_warning():
-    result = _run_root_watchdog_report("root watchdog still present: genesis-tailscale-watchdog.timer")
+    result = _run_root_watchdog_report(
+        "root watchdog still present: genesis-tailscale-watchdog.timer"
+    )
     assert "NOT fully removed" in result.stdout
     assert "+ Removed" not in result.stdout
     assert result.stdout.rstrip().endswith("REMOVED_COUNT=0")
@@ -951,9 +993,10 @@ def test_both_uninstall_paths_report_instead_of_claiming_success():
         start = before.rfind('if [ "$DRY_RUN" = true ]; then')
         assert start >= 0
         assert before.find("else", start) > start
-    assert 'ok "Removed root network and Tailscale watchdog timers"' in text.split(
-        "report_root_watchdog_removal() {"
-    )[1].split("\n}\n")[0]
+    assert (
+        'ok "Removed root network and Tailscale watchdog timers"'
+        in text.split("report_root_watchdog_removal() {")[1].split("\n}\n")[0]
+    )
 
 
 # ── round 3: the oneshot's timeout covers the worst supported run ────────
@@ -980,9 +1023,59 @@ def test_the_oneshot_timeout_clears_the_worst_run_the_settings_allow():
         + mx["NETWD_TS_SCAN_BUDGET_SEC"]
         + 3 * call  # the probe in flight when the budget ends: up to 3 pings
         + mx["NETWD_TS_RESTART_TIMEOUT_SEC"]
-        + mx["NETWD_TS_POLL_SEC"] + call + 1  # the poll, one read past it, a 1s sleep
-        + mx["NETWD_TS_VERIFY_SEC"] + call + 2  # the check, one ping past it, a 2s sleep
+        + mx["NETWD_TS_POLL_SEC"]
+        + call
+        + 1  # the poll, one read past it, a 1s sleep
+        + mx["NETWD_TS_VERIFY_SEC"]
+        + call
+        + 2  # the check, one ping past it, a 2s sleep
+        # The home-DERP pin, on its own short timeout: derp-map, the pin before
+        # the heal, the pin after it, and identity reads on both sides of it.
+        + 5 * tsw.DERP_CALL_TIMEOUT_SEC
     )
     text = LIB.read_text()
     (minutes,) = re.findall(r"TimeoutStartSec=(\d+)min", text)
     assert int(minutes) * 60 >= worst + 300, (int(minutes) * 60, worst)
+
+
+# ── Hand edits are kept, not overwritten (scripts/lib/managed_etc.sh) ────────
+
+
+def test_a_watchdog_unit_edited_by_hand_is_kept_and_named(tmp_path):
+    env = _stage(tmp_path)
+    _run_apply(env)
+    service = _paths(env)["service"]
+    edited = service.read_text().replace("Type=oneshot", "Type=oneshot\nNice=10")
+    service.write_text(edited)
+    result = _run_apply(env)
+    assert result.returncode == 0, result.stderr
+    assert service.read_text() == edited
+    assert "was edited by hand" in result.stdout
+    assert f"{service}.d/override.conf" in result.stdout  # the unit-class remedy
+    assert "a file edited by hand was kept" in result.stdout
+
+
+def test_stamping_pre_stamp_files_never_reloads_networkd(tmp_path):
+    """An install from before stamps holds the bare content. Adding the stamp is
+    a comment change: daemon-reload for the units, but no networkd reload."""
+    env = _stage(tmp_path)
+    _run_apply(env)
+    p = _paths(env)
+    for key in ("keepconf", "service", "timer"):
+        text = p[key].read_text()
+        p[key].write_text(text[: text.index("# genesis-managed")])
+    Path(env["SYSTEMCTL_LOG"]).write_text("")
+    result = _run_apply(env)
+    assert result.returncode == 0, result.stderr
+    for key in ("keepconf", "service", "timer"):
+        assert "# genesis-managed v1 sha256=" in p[key].read_text()
+    calls = Path(env["SYSTEMCTL_LOG"]).read_text().splitlines()
+    assert "daemon-reload" in calls
+    assert "reload" not in calls  # the networkctl stub logs a bare "reload"
+
+
+def test_the_watchdog_script_stays_unstamped(tmp_path):
+    """The /usr/local/lib copy is an executable, not config: no stamp line."""
+    env = _stage(tmp_path)
+    _run_apply(env)
+    assert _paths(env)["script"].read_text() == WATCHDOG.read_text()

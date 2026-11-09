@@ -26,7 +26,7 @@ async def db():
 @pytest.fixture
 async def tools(db):
     init_recon_mcp(db=db)
-    return await mcp.get_tools()
+    return {tool.name: tool for tool in await mcp.list_tools()}
 
 
 @pytest.fixture(autouse=True)

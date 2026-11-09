@@ -45,7 +45,13 @@ per systemd.network(5)): the address and routes provided by DHCP are **never**
 dropped even if the lease expires or the daemon stops, and static/foreign
 config is kept too. It is exactly what netplan `critical: true` renders to, so
 one drop-in delivers the full protection. Written under `/etc` (not the
-`/run`-rendered unit), so it survives `netplan apply` regeneration.
+`/run`-rendered unit), so it survives `netplan apply` regeneration. This file and
+the watchdog units below end with a `# genesis-managed` stamp line: if you edit
+one, updates keep your version and name it rather than overwrite it (see
+`scripts/lib/managed_etc.sh`). Put changes in a later-sorting `.conf` in the same
+directory instead (for a watchdog unit, `<unit>.d/override.conf`), or let the
+Genesis version replace yours with `update.sh --take-template <full path>`, which
+backs yours up first.
 
 *Cost, by design:* re-addressing that interface then requires a full networkd
 restart (or manual flush) — a reconfigure request alone won't tear down kept
@@ -222,6 +228,43 @@ writing and chmodding through it would change `/dev/null` itself.
 for remaining files and the `ActiveState` of every unit. It reports removal
 only when the command returns its completion marker; a missing marker or a
 remaining active unit is warned about rather than reported as removed.
+
+### Keeping the home DERP region pinned (`NETWD_TS_PREFER_DERP`)
+
+Opt-in, off by default (`0`). A peer whose client resets can keep sending to
+the DERP region this node was homed on at that moment; when this node's home
+later moves, the tunnel goes one-way until tailscaled restarts
+(tailscale/tailscale#21686). Set `NETWD_TS_PREFER_DERP=<region id>`
+(`1`..`9007199254740991`, from `tailscale debug derp-map`) in the same drop-in, and each
+live run keeps this node homed there with `tailscale debug force-prefer-derp
+<id>`. That pin is runtime-only and every tailscaled restart clears it, and
+`status` cannot show whether it is set, so a run re-applies it when
+`Self.Relay` is off the region's code, or when it has not yet been applied to
+the running daemon (tailscaled started since, a new boot, or this run's own
+restart heal, after which it is re-applied before tunnel verification). Remembering which daemon
+got it, rather than calling the setter every run, keeps tailscaled's log quiet.
+The command's exit code decides `applied` or `failed`; after a heal, unreadable
+or changed daemon identity around the setter records `unknown`. The next run
+judges whether it took (it takes effect at the next netcheck). Removing the
+setting or setting it to `0` clears a previously managed pin. Failed clears
+remain `clear-failed` and retry; observe mode records `clear-pending` without
+clearing. Incomplete runs retain ownership as `unknown` so later removal can
+still clear it. A positively known newer daemon retires the old ownership
+without a clear call, including in observe mode. The run records
+`derp_pin` (`ok`, `applied`, `failed`, `drift-persists`, `unknown` for a
+missing relay, a region not in the DERP map or an unreadable tailscaled start
+time, or `drift` in observe mode, which runs nothing and marks `would_apply`
+where a live run would pin) and a per-boot `derp_lapses` count: the home
+leaving the pinned region while tailscaled kept running. That is either a
+netcheck at which the region was unreachable (the forced region applies only
+where it is reachable) or the pin being cleared. Neither record is a restart
+event or spends the rate limit, the pin's calls have their own 20s timeout, and
+a voided run leaves the pin alone. The awareness tick raises one `high` row per
+lapse (`tailscale_derp_pin`, keyed per boot and lapse, naming the result of the
+re-apply), and one `high` condition for `failed`, `unknown`, `drift` or
+`drift-persists`, `clear-failed` or `clear-pending`, resolved on `ok` or after
+the pin is cleared. Each fresh failure sighting renews that condition's
+three-day expiry without creating a new alert or repeating its notification.
 
 ## How the body schema surfaces it
 

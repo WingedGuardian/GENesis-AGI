@@ -6,7 +6,7 @@ description: >-
   release, or says "clog code update". Routes to the canonical, standardized process in
   docs/reference/cc-compatibility.md — do NOT re-derive the update mechanism by grepping every
   time. Do NOT use for general "what changed in CC" trivia with no intent to update.
-keywords: [bump, pin, clog]
+keywords: [bump, clog]
 ---
 
 # CC Update — start from the canonical source, don't rediscover
@@ -134,7 +134,7 @@ later restarts the procedure (step 5).
      is the last point at which the old binary is still installed. See §Model-alias drift below for
      the invocation; the post-align half is step 4.
 2. **Deploy current `main` FIRST** — `scripts/update.sh` **detached from the session** (the
-   `systemd-run --user` recipe in the genesis-development skill's Timeout Policy; NOT
+   `systemd-run --user` recipe in the validating-merges skill, "DEPLOYS ARE THE EXCEPTION"; NOT
    `run_in_background`, which is session-bound and has killed deploys mid-run), BEFORE aligning
    the candidate, so the soak runs on current code. Otherwise step 8 lands accumulated Genesis change
    AND the CC bump together and you cannot attribute a regression to either.

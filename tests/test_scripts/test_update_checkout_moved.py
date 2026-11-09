@@ -13,11 +13,14 @@ from __future__ import annotations
 
 import os
 import re
+import sqlite3
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+
+from tests.test_scripts._update_source import rollback_body_text, update_text
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 UPDATE = REPO_ROOT / "scripts" / "update.sh"
@@ -54,7 +57,7 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 def _text() -> str:
-    return UPDATE.read_text()
+    return update_text()
 
 
 def _block(marker: str) -> str:
@@ -132,8 +135,9 @@ def _rollback_guard(
             else "_ephemeral_backup_before_reset() { echo BACKUP-BEFORE-RESET; }\n"
         )
         + extra
+        + (_block("db-restore-through-sqlite") if db_file else "")
         + "guard() {\n"
-        + (f'MIGRATIONS_RAN=1\nDB_SNAPSHOT_TAKEN=1\nDB_FILE="{db_file}"\n' if db_file else "")
+        + (f'DB_RESTORE_OWED=1\nDB_SNAPSHOT_TAKEN=1\nDB_FILE="{db_file}"\n' if db_file else "")
         + _block("rollback-code-guard")
         + (
             "    local server_down=true\n"
@@ -644,11 +648,30 @@ def test_an_ephemeral_edit_the_update_changed_is_cleared_only_with_a_backup(
 
 
 def _db(tmp_path: Path) -> Path:
+    """Real SQLite files (the restore goes through SQLite): the live database is
+    marked "migrated", the guarded restore source "guarded-pre-update". The raw
+    `.pre-update` snapshot is never read by the rollback; it stays a text file."""
     db = tmp_path / "genesis.db"
-    db.write_text("migrated\n")
+    for path, mark, mode in (
+        (db, "migrated", "WAL"),
+        (tmp_path / "genesis.db.pre-update.peer-restore", "guarded-pre-update", "DELETE"),
+    ):
+        con = sqlite3.connect(path)
+        con.execute(f"PRAGMA journal_mode={mode}")
+        con.execute("CREATE TABLE mark (v TEXT)")
+        con.execute("INSERT INTO mark VALUES (?)", (mark,))
+        con.commit()
+        con.close()
     (tmp_path / "genesis.db.pre-update").write_text("pre-update\n")
-    (tmp_path / "genesis.db.pre-update.peer-restore").write_text("guarded-pre-update\n")
     return db
+
+
+def _mark(db: Path) -> str:
+    con = sqlite3.connect(db)
+    try:
+        return con.execute("SELECT v FROM mark").fetchone()[0]
+    finally:
+        con.close()
 
 
 @pytest.mark.parametrize(
@@ -691,11 +714,27 @@ def test_the_database_follows_the_code_left_on_disk(repo, tmp_path, case, restor
     db = _db(tmp_path)
     r = _run(_rollback_guard(repo, own_head=merged, db_file=str(db), extra=extra), tmp_path)
     assert r.returncode == 0, r.stderr
-    assert db.read_text() == ("guarded-pre-update\n" if restored else "migrated\n"), r.stdout
+    assert _mark(db) == ("guarded-pre-update" if restored else "migrated"), r.stdout
     assert db.with_name("genesis.db.pre-update").read_text() == "pre-update\n"
     assert ("DB_OK=true" in r.stdout) is restored, r.stdout
     if not restored:
-        assert "migrated database is kept" in r.stdout
+        assert "the database is kept to match it" in r.stdout
+
+
+def test_a_changed_database_under_someone_elses_checkout_is_kept(repo, tmp_path):
+    """This run never merged and someone else committed on top (`untouched`): the
+    rollback leaves their code, and the database change it measured may be
+    theirs. Restoring the snapshot under their code would delete their schema
+    changes and writes, so the database stays and the rollback is incomplete.
+    Run, not read: the guard and the DB decision together, a restore owed."""
+    tag = _git(repo, "rev-parse", "pre-update-test")
+    _git(repo, "commit", "-q", "--allow-empty", "-m", "theirs")
+    db = _db(tmp_path)
+    r = _run(_rollback_guard(repo, own_head=tag, db_file=str(db)), tmp_path)
+    assert _verdict(r) == ("untouched", "false")
+    assert _mark(db) == "migrated", r.stdout
+    assert "DB_OK=false" in r.stdout
+    assert "belongs to someone else" in r.stdout
 
 
 def test_a_switched_branch_is_left_exactly_as_it_is(repo, tmp_path):
@@ -876,28 +915,24 @@ def test_an_interrupted_merge_that_left_tracked_changes_is_reported_not_reset(re
 def test_a_moved_checkout_keeps_the_migrated_database():
     """Code left as it is (merged plus their change) must keep the schema that
     matches it; restoring the pre-update DB would put new code on an old schema."""
-    text = _text()
-    start = text.index("_do_rollback() {")
-    body = text[start : text.index("\n_on_err() {", start)]  # the heredoc holds a column-0 }
-    migrated = body.index('if [ "${MIGRATIONS_RAN:-0}" = "1" ]; then')
+    body = rollback_body_text()
+    migrated = body.index('if [ "${DB_RESTORE_OWED:-0}" = "1" ]; then')
     moved = body.index(
         'if [ "$code_action" = "moved" ] || [ "$code_kept" = "true" ]; then', migrated
     )
-    restore = body.index('cp "$DB_FILE.pre-update.peer-restore" "$DB_FILE"', migrated)
+    restore = body.index("elif _restore_db_snapshot; then", migrated)
     assert migrated < moved < restore
     branch = body[moved : body.index("elif", moved)]
-    assert "db_ok=false" in branch and "cp " not in branch
+    assert "db_ok=false" in branch and "_restore_db_snapshot" not in branch
 
 
 def test_reinstall_and_restart_happen_only_on_a_verified_old_tree():
     """The guard's verdict must actually gate the two steps that would boot the
     checkout: the dependency reinstall and the service restarts."""
-    text = _text()
-    start = text.index("_do_rollback() {")
-    body = text[start : text.index("\n_on_err() {", start)]  # the heredoc holds a column-0 }
+    body = rollback_body_text()
     guard_end = body.index("# END rollback-code-guard")
-    pip = body.index('"$VENV_DIR/bin/pip" install', guard_end)
-    assert 'if [ "$restart_ok" = "true" ] \\\n' in body[guard_end:pip]
+    pip = body.index("restore_venv_state", guard_end)
+    assert 'if [ "$restart_ok" = "true" ]; then\n' in body[guard_end:pip]
     loop = body.index('for svc in "${WERE_RUNNING[@]}"; do', guard_end)
     gate = body.rindex('if [ "$restart_ok" = "true" ] && [ "$db_ok" = "true" ]; then', guard_end, loop)
     assert "\n    fi\n" not in body[gate:loop]
@@ -905,17 +940,15 @@ def test_reinstall_and_restart_happen_only_on_a_verified_old_tree():
 
 
 def test_the_closing_banner_does_not_claim_a_rollback_that_did_not_happen():
-    text = _text()
-    start = text.index("_do_rollback() {")
-    body = text[start : text.index("\n_on_err() {", start)]  # the heredoc holds a column-0 }
+    body = rollback_body_text()
     banner = body.index('echo "  Rolled back: $OLD_TAG ($OLD_COMMIT) on $ORIGINAL_BRANCH"')
-    gate = body.rindex(
-        'if [ "$checkout_ok" = "true" ] && [ "$pip_ok" = "true" ] && [ "$db_ok" = "true" ]',
-        0,
-        banner,
-    )
+    gate = body.rindex('if [ "$rollback_ok" = true ]', 0, banner)
     assert "\n    fi\n" not in body[gate:banner]
     assert "NOT fully rolled back" in body[banner:]
+    # rollback_ok is the one verdict, and it needs every recovery step back.
+    verdict = body[body.index("local rollback_ok=false") : body.index("rollback_ok=true")]
+    for part in ("checkout_ok", "pip_ok", "db_ok", "hooks_ok", "svc_ok"):
+        assert f'"${part}"' in verdict, part
 
 
 _SWITCH_BACK = 'checkout -q --no-overwrite-ignore -B "$ORIGINAL_BRANCH" "$ROLLBACK_TAG"'
@@ -972,7 +1005,7 @@ def test_the_rollback_moves_only_the_original_branch_with_a_non_forced_checkout(
     reset arm only; never a reset of the tree."""
     text = _text()
     body = text[
-        text.index("_do_rollback() {") : text.index("\n}\n", text.index("_do_rollback() {"))
+        text.index("_rollback_body() {") : text.index("\n}\n", text.index("_rollback_body() {"))
     ]
     assert 'checkout "$ORIGINAL_BRANCH"' not in body
     code = _code(_block("rollback-code-guard"))

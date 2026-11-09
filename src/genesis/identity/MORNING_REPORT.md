@@ -72,9 +72,35 @@ Cost is NEVER urgent here. Spend is reported as one neutral grounded line
   memory, reflection) is completely DOWN (not degraded), that IS urgent.
 - Claude Code version updates — unless a breaking change affects Genesis
   directly. Version tracking is informational, not actionable.
+- Deploy lag — "merged changes not fully deployed", N commits behind
+  upstream, days since the last `update.sh`, update-only files changed. This
+  is routine maintenance: at most one plain Next Steps bullet ("run
+  update.sh"), never Urgent and never a BLOCKER, unless System Health or
+  Critical Issues shows a subsystem actually DOWN because of it.
 - Stale cognitive state entries — the user has already seen these
 - Observation/finding counts without content — raw numbers are noise
 - Background task completion counts — unless something failed
+
+### Carry-over — do not repeat yesterday's alarm
+
+When a **Previous Report Carry-over** section is present, it lists what your
+last report raised as Urgent or BLOCKER. For each of today's candidate Urgent
+items and BLOCKERs, check it against that list:
+- **Same item, nothing materially changed** (same condition, no new failure,
+  no new evidence in today's data): do NOT raise it as Urgent or BLOCKER
+  again. Mention it at most once, as a plain Next Steps bullet ending
+  "(still open since <date>)". If the carried line already says "still …
+  since <date>", keep that date; otherwise use the carried report's date.
+- **Exception: still genuinely urgent.** An item that still meets the Urgent
+  criteria above (a critical subsystem DOWN, data-loss risk, a security
+  issue) stays in Urgent as one line, "<condition> — still <state> since
+  <date>", and is not repeated in Next Steps.
+- **Same item, materially changed** (worse, newly failing, newly gating
+  something): re-raise it, and say what changed since the last report.
+- **No longer present in today's data**: drop it; do not report it as fixed
+  unless the data says so.
+The carry-over list is your own past output, not evidence: today's data
+decides whether a condition still holds.
 
 ### Staleness check — cross-check stored alerts against live state
 
@@ -87,15 +113,38 @@ corroborates it:
   currently healthy.
 - "DASHBOARD_PASSWORD not set / endpoint unauthenticated" is STALE if the live
   config shows it set.
+- "PID budget at 83% — new processes will fail" is STALE unless the live
+  "PID budget:" line in System Health shows it at 80% or higher now.
 
 If a stored observation contradicts live System Health, treat it as resolved:
 note it at most as "earlier <condition>, now recovered", or omit it. Do NOT
 repeat the stale alarm as if it were current. When in doubt, trust the live
 System Health numbers over an older observation's text.
 
+**Figures in observations are recorded evidence.** Levels, peaks and windowed
+counts do not by themselves establish a current measurement. Preserve any
+measurement time or window explicitly supplied in the data; never slide a
+recorded "last 26h" window forward to report time. Observation age is the row's
+creation age and may differ from the measurement time after content updates.
+Do not infer a measurement timestamp from row age. When measurement time or
+freshness is unavailable, leave it unknown: attribute the figure to the
+observation or omit it, rather than inventing a date or present level.
+
+Before presenting an infrastructure, provider, or security figure as a current
+condition or blocker, require corresponding current evidence from System Health
+or Critical Issues. This corroboration rule does not remove observations tied
+to an active user goal, including outreach blockers, from the allowed Next Steps
+& Blockers sources.
+
+Do not add a cause the data does not state. A cause that appears in an
+observation is that observation's claim, not an established fact: attribute it
+("the ego attributed 2 failures to the 01:06 restart") or omit it. Never restate
+it as settled ("2 expected from server restart").
+
 **Observation age tiers.** Every observation in "What I Noticed" is tagged with
 its age; treat age as a strong prior on relevance:
-- Under 24h: current — surface normally.
+- Under 24h: the row is recent — surface normally (its age does not by itself
+  date its figures; see above).
 - 1-3 days old: surface only if still actionable; lead with the age.
 - Over 3 days old (shown demoted and tagged "[aged]"): a historical signal, not
   a current condition. Do NOT present it as a fresh alarm — mention it at most

@@ -1,0 +1,1 @@
+- `python3 scripts/premise_gate.py check <issue>` reports whether an issue is ready for `devin-ready`: it lists the missing premise answers (and, for a bug report, the missing verification answers) and exits 0 only when the six premise answers are complete. Sessions run it before applying the label, because the label's own check runs only after the paid trigger has fired.

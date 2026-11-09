@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # genesis-disk-hygiene — daily disk grooming entrypoint.
 #
-# Run by the genesis-disk-hygiene.timer systemd unit (also runnable by hand).
+# The daily timer starts independent maintenance and worktree-reaper services.
+# With no arguments, runs both in sequence for compatibility with manual use.
 # Best-effort steps — one failing must not skip the others:
 #   1. Reap merged/inactive git worktrees  → scripts/worktree_lifecycle.py
 #      (archives into ~/.genesis/worktree-trash; first releases session-claim
@@ -59,6 +60,9 @@
 #      → rotate_log (mcp_health.log, turnstile_debug.log; the first is held open
 #      by every session's MCP server, so both are copied and truncated, never
 #      renamed)
+#  17. Reset failed TRANSIENT user units (failed >24h) → reset_failed_transient_units
+#      (ad-hoc `systemd-run` launches without --collect stay listed as failed
+#      forever; never a genesis-* unit, never a persistent unit)
 #
 # Note: run under a hardened systemd sandbox (NoNewPrivileges, ProtectSystem=
 # strict), so disk_reclaim's --system (/var, sudo) path is intentionally NOT
@@ -553,6 +557,21 @@ rotate_log() {
     fi
 }
 
+rotate_mcp_logs() {
+    local mcp_log_dir
+    local helper="$REPO_DIR/src/genesis/util/mcp_logging.py"
+    [ -f "$helper" ] && [ -n "$VENV_PY" ] || return 0
+    # Pure stdlib entrypoint: no package import, handler, mkdir or secrets load.
+    # NUL framing preserves pathname newline bytes and rejects incomplete output.
+    IFS= read -r -d '' mcp_log_dir < <("$VENV_PY" -I "$helper") || return 0
+    [ -n "$mcp_log_dir" ] || return 0
+    # Keep dirname output ending in a dot: its command substitution in rotate_log
+    # otherwise strips trailing newlines from the selected directory name.
+    mcp_log_dir+=/.
+    rotate_log "$mcp_log_dir/mcp_health.log" 10000000 2
+    rotate_log "$mcp_log_dir/turnstile_debug.log" 10000000 2
+}
+
 # Settings read BY NAME out of secrets.env: the hook audit store knobs, and the
 # browser engine cache and override (prune_camoufox_engines_step).
 #
@@ -601,22 +620,100 @@ prune_camoufox_engines_step() {
     )
 }
 
-main() {
-    local disk_reclaim_rc=0
-    if [ -z "$VENV_PY" ]; then
-        echo "disk_hygiene: no python interpreter found" >&2
-        exit 1
+# reset_failed_transient_units [MIN_AGE_S] — `systemctl --user reset-failed` each
+# FAILED transient unit whose failure is older than MIN_AGE_S (default 24h). A
+# `systemd-run` launch without --collect is left loaded as failed after it
+# exits non-zero, and nothing else ever clears it, so the failed list fills
+# with old jobs and a new failure is harder to see among them. That includes
+# Genesis's OWN unnamed scopes, not only ad-hoc session commands: the CC
+# session launcher (cc/invoker.py), the code-intel indexer and the dashboard
+# update route all start `run-u*` scopes without --collect, deliberately, so a
+# scope killed by its MemoryMax stays visible. This stage NEVER resets a unit
+# whose Result is oom-kill (owner ruling 2026-11-07: a memory kill is a real
+# alarm and stays listed until someone looks). Any other failure stays visible
+# for a day, is logged with its Result when reset, and stays in the journal.
+#
+# "Transient" is systemd's own `Transient=yes`, not the unit's name or an empty
+# FragmentPath. MEASURED on systemd 255: a transient unit's FragmentPath is NOT
+# empty, it is <runtime dir>/systemd/transient/<name>; and a persistent unit
+# whose file was removed (LoadState=not-found) reports an EMPTY FragmentPath
+# with Transient=no. So the gate is Transient=yes AND a FragmentPath that is
+# empty or under a systemd/transient/ directory. A persistent unit's failure is
+# a real alarm and is never reset, and neither is any genesis-* unit.
+#
+# The age is the unit's StateChangeTimestamp in Unix seconds
+# (`--timestamp=unix`), a wall-clock value. The *Monotonic fields are not
+# usable here: inside a container they count the HOST's monotonic clock, which
+# MEASURED ran far ahead of the container's /proc/uptime. A unit whose time
+# cannot be read is kept. Each unit is logged before it is reset. A box with no
+# systemctl, or with no reachable user manager, skips the stage.
+reset_failed_transient_units() {
+    local min_age="${1:-86400}" listing unit props key val now
+    local transient fragment state ts result
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo "transient unit reset SKIPPED: systemctl not found"
+        return 0
     fi
+    if ! listing="$(systemctl --user list-units --state=failed --all --no-legend --plain 2>/dev/null)"; then
+        echo "transient unit reset SKIPPED: the systemd user manager is unreachable"
+        return 0
+    fi
+    now="$(date +%s)"
+    while read -r unit _; do
+        [ -n "$unit" ] || continue
+        case "$unit" in genesis-*) continue ;; esac
+        if ! props="$(systemctl --user show --timestamp=unix \
+                -p Transient -p FragmentPath -p ActiveState -p StateChangeTimestamp \
+                -p Result -- "$unit" 2>/dev/null)"; then
+            echo "transient unit reset: kept $unit (its properties could not be read)"
+            continue
+        fi
+        transient="" fragment="" state="" ts="" result=""
+        while IFS='=' read -r key val; do
+            case "$key" in
+                Transient) transient="$val" ;;
+                FragmentPath) fragment="$val" ;;
+                ActiveState) state="$val" ;;
+                StateChangeTimestamp) ts="$val" ;;
+                Result) result="$val" ;;
+            esac
+        done <<< "$props"
+        [ "$state" = failed ] || continue
+        [ "$transient" = yes ] || continue
+        case "$fragment" in
+            ""|*/systemd/transient/*) ;;
+            *) continue ;;
+        esac
+        ts="${ts#@}"
+        if ! [[ "$ts" =~ ^[0-9]+$ ]]; then
+            echo "transient unit reset: kept $unit (no readable failure time)"
+            continue
+        fi
+        [ $((now - ts)) -gt "$min_age" ] || continue
+        if [ "$result" = oom-kill ]; then
+            # Owner ruling: a scope killed by its memory limit is a real alarm,
+            # so it stays in the failed list until someone looks at it.
+            echo "transient unit reset: kept $unit (result=oom-kill is never auto-reset)"
+            continue
+        fi
+        echo "transient unit reset: $unit (failed $(( (now - ts) / 3600 ))h ago, result=${result:-unknown})"
+        systemctl --user reset-failed -- "$unit" 2>/dev/null \
+            || echo "transient unit reset failed for $unit"
+    done <<< "$listing"
+    return 0
+}
 
-    case "${1:-}" in
-        --pressure) pressure_main "${2:-}"; return 0 ;;
-        "") ;;
-        *) echo "disk_hygiene: unknown argument '$1' (usage: disk_hygiene.sh [--pressure [--last-resort]])" >&2
-           return 2 ;;
-    esac
+hygiene_stage() {
+    local name="$1" started=$SECONDS rc=0
+    shift
+    echo "hygiene stage=$name start=$(date -u +%FT%TZ)"
+    "$@" || rc=$?
+    echo "hygiene stage=$name duration_s=$((SECONDS - started)) status=$rc"
+    return "$rc"
+}
 
-    echo "=== genesis-disk-hygiene $(date -u +%FT%TZ) ==="
-
+worktrees_main() {
+    local rc=0
     # BEFORE the reaper, deliberately. This is the wall-clock floor for the
     # stranded-work sweep — the detector is normally spawned at session
     # boundaries, so a box that starts no sessions for days would answer "what
@@ -626,23 +723,25 @@ main() {
     # likely to be deleting stale worktrees — and its restore path does not
     # reconstruct uncommitted state. Observing the world after the reaper had
     # cleared it would mean the one daily look never saw what was lost.
-    echo "--- zero-drop stranded-work sweep ---"
-    "$VENV_PY" "$REPO_DIR/scripts/zero_drop_worker.py" --trigger hygiene \
-        || echo "zero_drop_worker exited $?"
+    hygiene_stage zero-drop "$VENV_PY" "$REPO_DIR/scripts/zero_drop_worker.py" --trigger hygiene \
+        || rc=$?
 
     # Stale claims BEFORE the reaper, so a worktree whose claiming session died
     # is judged on its merits tonight rather than pinned for another day. The
     # claim module decides staleness; a lock it did not write is never touched.
-    echo "--- stale worktree-claim release ---"
-    "$VENV_PY" "$REPO_DIR/scripts/worktree_lifecycle.py" --release-stale-claims \
-        || echo "worktree_lifecycle --release-stale-claims exited $?"
+    hygiene_stage stale-claims "$VENV_PY" "$REPO_DIR/scripts/worktree_lifecycle.py" --release-stale-claims \
+        || rc=$?
+    hygiene_stage worktree-reaping "$VENV_PY" "$REPO_DIR/scripts/worktree_lifecycle.py" \
+        || rc=$?
+    return "$rc"
+}
 
-    echo "--- worktree reaping ---"
-    "$VENV_PY" "$REPO_DIR/scripts/worktree_lifecycle.py" || echo "worktree_lifecycle exited $?"
+maintenance_main() {
+    local disk_reclaim_rc=0
 
     # The deleting steps take the shared reclaim lock. A pressure run holding
     # it is already reclaiming, so after a bounded wait (inside this unit's
-    # 1200s timeout) the daily pass skips them rather than time out and lose
+    # service timeout) the daily pass skips them rather than time out and lose
     # every retention prune below.
     local reclaim_locked=1
     if ! reclaim_lock "${RECLAIM_WAIT_S:-180}"; then
@@ -675,6 +774,19 @@ main() {
 
     echo "--- mcp-spawn identity prune (dead-pid slots) ---"
     prune_mcp_spawn "$HOME/.genesis/mcp-spawn"
+
+    # update.sh records the venv's packages before each update
+    # (update-deps/<rollback tag>.json) and removes the record when the update or
+    # its rollback completes. One a failed rollback left is recovery material for
+    # a while, then only disk: the record, the helper copy beside it
+    # (<tag>.lib/, flat files), and any temporary file a killed run left.
+    # Files only, then the emptied copy directories: nothing recursive.
+    echo "--- update package-record prune (>30d) ---"
+    local deps_dir="${GENESIS_HOME:-$HOME/.genesis}/update-deps"
+    find "$deps_dir" -mindepth 1 -maxdepth 1 -type f \
+        \( -name '*.json' -o -name '*.tmp' -o -name 'tmp.*' \) -mtime +30 -delete 2>/dev/null || true
+    find "$deps_dir" -mindepth 2 -maxdepth 2 -type f -path '*.lib/*' -mtime +30 -delete 2>/dev/null || true
+    find "$deps_dir" -mindepth 1 -maxdepth 1 -type d -name '*.lib' -empty -delete 2>/dev/null || true
 
     echo "--- attention snapshot GC (label-aware) ---"
     "$VENV_PY" "$REPO_DIR/scripts/attention_snapshot_gc.py" --home-days 60 --omi-days 14 \
@@ -822,11 +934,43 @@ main() {
     # 10 MB: about nine days of mcp_health.log at the measured rate, small
     # enough to read whole, and with 2 copies the three files stay near 30 MB
     # instead of growing without bound.
-    rotate_log "$HOME/tmp/mcp_health.log" 10000000 2
-    rotate_log "$HOME/tmp/turnstile_debug.log" 10000000 2
+    rotate_mcp_logs
+
+    echo "--- Inbox sync log rotation (>10MB, copytruncate, 2 kept) ---"
+    # Appended to every 5 minutes by scripts/inbox_sync.sh and never rotated
+    # before: MEASURED 31.8 MB on a live install. Same bounds as the MCP logs.
+    rotate_log "${GENESIS_INBOX_SYNC_LOG:-$REPO_DIR/logs/inbox_sync.log}" 10000000 2
+
+    echo "--- failed transient unit reset (>24h; never genesis-*, never persistent) ---"
+    reset_failed_transient_units 86400
 
     echo "=== genesis-disk-hygiene done ==="
     return "$disk_reclaim_rc"
+}
+
+main() {
+    local mode="${1:-}" reaper_rc=0 maintenance_rc=0
+    if [ -z "$VENV_PY" ]; then
+        echo "disk_hygiene: no python interpreter found" >&2
+        return 1
+    fi
+    case "$mode" in
+        --pressure) pressure_main "${2:-}"; return 0 ;;
+        ""|--maintenance-only|--worktrees-only) ;;
+        *) echo "disk_hygiene: unknown argument '$mode' (usage: disk_hygiene.sh [--maintenance-only|--worktrees-only|--pressure [--last-resort]])" >&2
+           return 2 ;;
+    esac
+    echo "=== genesis-disk-hygiene $(date -u +%FT%TZ) mode=${mode:-all} ==="
+    if [ "$mode" != --maintenance-only ]; then
+        hygiene_stage worktrees worktrees_main || reaper_rc=$?
+    fi
+    if [ "$mode" != --worktrees-only ]; then
+        hygiene_stage maintenance maintenance_main || maintenance_rc=$?
+    fi
+    if [ "$maintenance_rc" -ne 0 ]; then
+        return "$maintenance_rc"
+    fi
+    return "$reaper_rc"
 }
 
 # Run main only when executed directly — lets tests `source` this file to call a

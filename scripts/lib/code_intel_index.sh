@@ -43,8 +43,7 @@
 # Env overrides:
 #   CODE_INTEL_WORKLOAD_SLICE     default 0; 1 requires genesis-workload.slice
 #   CODE_INTEL_INDEX_MEMORY_MAX   legacy override for both tools
-#   CODE_INTEL_CBM_WORKER_BINARY  opt-in absolute pinned v0.11 worker executable
-#   CODE_INTEL_CBM_MEMORY_MAX     default 4G     (requested CBM batch ceiling)
+#   CODE_INTEL_CBM_MEMORY_MAX     default 8G     (required managed batch ceiling)
 #   CODE_INTEL_GITNEXUS_MEMORY_MAX default 8G    (measured GitNexus rebuild)
 #   CODE_INTEL_FILE_CACHE_RESERVE_BYTES default 2G (clean cache kept outside job)
 #   CODE_INTEL_INDEX_IO_WEIGHT    default 20     (1-10000; low = polite)
@@ -62,7 +61,10 @@ set -u
 # preference only in the disposable child, immediately before exec, and verify
 # the effective value. +1000 is maximally preferred among tasks eligible in the
 # applicable OOM domain; cgroup OOM-domain boundaries still govern eligibility.
-if [ "${1:-}" = "--exec-indexer-with-oom-adj" ]; then
+if [ "${1:-}" = "--exec-indexer-with-oom-adj" ] \
+    || [ "${1:-}" = "--exec-managed-supervisor" ]; then
+    _supervisor=0
+    [ "$1" != "--exec-managed-supervisor" ] || _supervisor=1
     shift
     if [ "$#" -eq 0 ]; then
         printf '%s\n' "code-intel: missing indexer command" >&2
@@ -110,13 +112,24 @@ if [ "${1:-}" = "--exec-indexer-with-oom-adj" ]; then
         exit 125
     fi
     _oom_adj_file=/proc/self/oom_score_adj
-    if ! { printf '%s\n' 1000 > "$_oom_adj_file"; } 2>/dev/null; then
+    if [ "$_supervisor" = "0" ] \
+        && ! { printf '%s\n' 1000 > "$_oom_adj_file"; } 2>/dev/null; then
         printf '%s\n' "code-intel: cannot establish oom_score_adj=1000; refusing batch workload" >&2
         exit 125
     fi
     _oom_adj_actual=""
     read -r _oom_adj_actual < "$_oom_adj_file" 2>/dev/null || _oom_adj_actual=""
-    if [ "$_oom_adj_actual" != "1000" ]; then
+    if [ "$_supervisor" = "1" ]; then
+        # Preserve the inherited coordinator adjustment; never rely on a
+        # privileged reset. Only its disposable native child is promoted.
+        if ! [[ "$_oom_adj_actual" =~ ^-?[0-9]+$ ]] \
+            || [ "$_oom_adj_actual" -lt -1000 ] || [ "$_oom_adj_actual" -ge 1000 ]; then
+            [ -z "${CODE_INTEL_CHILD_REFUSAL_MARKER:-}" ] \
+                || printf '%s\n' refused > "$CODE_INTEL_CHILD_REFUSAL_MARKER"
+            printf '%s\n' "code-intel: cannot prove nonmaximum supervisor OOM adjustment" >&2
+            exit 125
+        fi
+    elif [ "$_oom_adj_actual" != "1000" ]; then
         printf '%s\n' \
             "code-intel: cannot establish oom_score_adj=1000 (read back '${_oom_adj_actual:-unavailable}'); refusing batch workload" >&2
         exit 125
@@ -168,9 +181,9 @@ case "$WORKLOAD_SLICE" in 0|1) ;; *)
 esac
 
 _LEGACY_MEM_MAX="${CODE_INTEL_INDEX_MEMORY_MAX:-}"
-# Four GiB is the provisional batch ceiling. The bounded child checks actual
+# Eight GiB is the accepted managed batch ceiling. The bounded child checks actual
 # destination-scope headroom for the entire requested cap before indexing.
-CBM_MEM_MAX="${CODE_INTEL_CBM_MEMORY_MAX:-${_LEGACY_MEM_MAX:-4G}}"
+CBM_MEM_MAX="${CODE_INTEL_CBM_MEMORY_MAX:-${_LEGACY_MEM_MAX:-8G}}"
 # Measured 2026-09-16: a forced full rebuild peaked at 4,874,166,272 bytes
 # (4.54 GiB) and completed under an 8 GiB, swapless scope. The old shared 2G
 # cap killed it on the way up. Keep headroom for repository growth; admission
@@ -527,27 +540,6 @@ IO_WEIGHT="${CODE_INTEL_INDEX_IO_WEIGHT:-20}"
 CPU_QUOTA="${CODE_INTEL_INDEX_CPU_QUOTA:-200%}"
 PERSISTENCE="${CODE_INTEL_INDEX_PERSISTENCE:-true}"
 
-# The kill-switch path resolves through the ONE shared site (same override
-# semantics the launcher enforces). An override that is relative, or begins
-# with a ~/ that no HOME can expand, would make `-e` silently read as
-# "not disabled" — an UNRESOLVABLE path instead refuses the cbm leg below,
-# never indexing a tool the machine may have switched off.
-CBM_DISABLE_FILE=""
-CBM_DISABLE_UNRESOLVED=1
-# %/* not dirname(1): minimal-PATH invocations (stripped-env services) may not
-# have dirname, and a resolver that cannot be found fails the leg closed.
-_cbm_disable_lib="${BASH_SOURCE[0]%/*}/cbm_disable_file.sh"
-[ "$_cbm_disable_lib" = "${BASH_SOURCE[0]}/cbm_disable_file.sh" ] \
-    && _cbm_disable_lib="./cbm_disable_file.sh"
-if [ -r "$_cbm_disable_lib" ]; then
-    # shellcheck source=cbm_disable_file.sh
-    . "$_cbm_disable_lib"
-    if declare -F genesis_cbm_disable_file >/dev/null \
-        && CBM_DISABLE_FILE="$(genesis_cbm_disable_file 2>/dev/null)"; then
-        CBM_DISABLE_UNRESOLVED=""
-    fi
-fi
-
 _GITNEXUS_PIN_READY=0
 _gitnexus_pin_file="$(dirname "${BASH_SOURCE[0]}")/gitnexus_version.sh"
 if [ -r "$_gitnexus_pin_file" ]; then
@@ -605,7 +597,18 @@ esac
 
 # Physical path (-P): the single-flight lock is keyed on this, and a symlinked
 # spelling of the same repo must not get a second lock (= second concurrent index).
-REPO_PATH="$(unset CDPATH; cd "$REPO_PATH" && pwd -P)"
+# A bare "-" is a directory name here, not cd's $OLDPWD shorthand.
+[ "$REPO_PATH" = - ] && REPO_PATH=./-
+if ! _repo_physical="$(unset CDPATH; cd -P -- "$REPO_PATH" && printf '%s.' "$PWD")"; then
+    _log "ERROR: cannot resolve physical repository path"
+    exit 1
+fi
+# A non-newline sentinel preserves legal trailing newlines through substitution.
+REPO_PATH="${_repo_physical%.}"
+# Match Linux/Python's single-root spelling before choosing a lock.
+while [[ "$REPO_PATH" == //* ]]; do
+    REPO_PATH="${REPO_PATH#/}"
+done
 
 # ── 1. Worktree skip ────────────────────────────────────────────────────
 # In a linked worktree, <root>/.git is a FILE (gitdir pointer), not a dir.
@@ -616,7 +619,16 @@ fi
 
 # ── 2. Single-flight lock (per repo path) ───────────────────────────────
 LOCK_DIR="${GENESIS_HOME:-$HOME/.genesis}/locks"
-mkdir -p "$LOCK_DIR" 2>/dev/null || LOCK_DIR="${TMPDIR:-/tmp}"
+_CBM_LOCK_REFUSE=0
+case "$LOCK_DIR" in /*) : ;; *) _CBM_LOCK_REFUSE=1 ;; esac
+if ! mkdir -p "$LOCK_DIR" 2>/dev/null; then
+    _CBM_LOCK_REFUSE=1
+    LOCK_DIR="${TMPDIR:-/tmp}"
+fi
+if [ "$_CBM_LOCK_REFUSE" = "1" ] && [ "$TOOLS" != "gitnexus" ]; then
+    _log "managed CBM requires the canonical repository lock namespace"
+    [ "$TOOLS" != "cbm" ] || exit 75
+fi
 LOCK_FILE="$LOCK_DIR/code-intel-$(printf '%s' "$REPO_PATH" | sha1sum | cut -c1-16).lock"
 
 # Take the lock only when flock AND a writable lock file are both available.
@@ -635,15 +647,29 @@ if command -v flock >/dev/null 2>&1 && { exec 9>"$LOCK_FILE"; } 2>/dev/null; the
         exit "${CODE_INTEL_INDEX_LOCK_SKIP_RC:-0}"
     fi
 else
+    if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
+        _log "managed CBM requires the repository flock — refusing unlocked execution"
+        _CBM_LOCK_REFUSE=1
+        [ "$TOOLS" != "cbm" ] || exit 75
+    fi
     _log "WARNING: flock or lock file unavailable ($LOCK_FILE) — proceeding UNLOCKED"
 fi
 
 # ── 3. Resource-capped runner ───────────────────────────────────────────
-# Probe systemd-run exactly like .claude/mcp/run-codebase-memory does: the
-# probe must create a real scope, because CC-spawned / hook-spawned contexts
+# The probe must create a real scope, because CC-spawned / hook-spawned contexts
 # sometimes cannot reach the user manager even when systemd-run exists.
 _GN_SCOPE_OK=0
 _CBM_SCOPE_OK=0
+# The scope's command gets its arguments as written. Systemd older than 254 refuses
+# this option (exit 1, before it reaches --version), and only that drops it: anything
+# else keeps it, and the probe below then decides. genesis.util.systemd does the same.
+_SD_LITERAL=(--expand-environment=no)
+_sd_literal_rc=0
+/usr/bin/systemd-run "${_SD_LITERAL[@]}" --version >/dev/null 2>&1 || _sd_literal_rc=$?
+if [ "$_sd_literal_rc" -eq 1 ]; then
+    _SD_LITERAL=()
+fi
+
 _probe_scope() {
     # GitNexus batches run in app-capped.slice (a child of app.slice: same
     # ancestors, plus a kill counter that outlives the scope, which the disk
@@ -652,7 +678,7 @@ _probe_scope() {
     local -a slice_args=(--slice=app-capped.slice)
     [ "$2" = "cbm" ] && slice_args=(--slice-inherit)
     [ "$WORKLOAD_SLICE" = "1" ] && slice_args=(--slice=genesis-workload.slice)
-    /usr/bin/systemd-run --user --scope "${slice_args[@]}" --quiet \
+    /usr/bin/systemd-run --user --scope "${slice_args[@]}" "${_SD_LITERAL[@]}" --quiet \
         -p "MemoryMax=$1" -p "MemorySwapMax=0" \
         -p "IOWeight=${IO_WEIGHT}" -p "CPUQuota=${CPU_QUOTA}" \
         -- /bin/true 2>/dev/null
@@ -673,7 +699,7 @@ _run_capped() {
         [ "$WORKLOAD_SLICE" = "1" ] && slice_args=(--slice=genesis-workload.slice)
         # _CI_SCOPE_UNIT (set by _run_with_watchdog) gives the scope a
         # deterministic name so the watchdog can freeze/thaw/stop it by unit.
-        /usr/bin/systemd-run --user --scope "${slice_args[@]}" --quiet \
+        /usr/bin/systemd-run --user --scope "${slice_args[@]}" "${_SD_LITERAL[@]}" --quiet \
             ${_CI_SCOPE_UNIT:+--unit="$_CI_SCOPE_UNIT"} \
             -p "MemoryMax=${MEM_MAX}" -p "MemorySwapMax=0" \
             -p "IOWeight=${IO_WEIGHT}" -p "CPUQuota=${CPU_QUOTA}" \
@@ -684,7 +710,7 @@ _run_capped() {
                 "CODE_INTEL_CHILD_RESERVE_BYTES=$CODE_INTEL_SIBLING_RESERVE_BYTES" \
                 "CODE_INTEL_CHILD_SCOPE_UNIT=${_CI_SCOPE_UNIT:-}" \
                 "CODE_INTEL_CHILD_REFUSAL_MARKER=${CODE_INTEL_CHILD_REFUSAL_MARKER:-}" \
-                /bin/bash "$_CODE_INTEL_ENTRYPOINT" --exec-indexer-with-oom-adj "$@"
+                /bin/bash "$_CODE_INTEL_ENTRYPOINT" "${_CI_EXEC_MODE:---exec-indexer-with-oom-adj}" "$@"
     else
         # Fallback: polite scheduling + soft address-space cap. Mirrors the
         # run-codebase-memory launcher's degradation (never block on missing
@@ -775,8 +801,10 @@ _run_with_watchdog() {
     local label="$1"; shift
     local _SCOPE_OK="$_GN_SCOPE_OK"
     local scope_inherit=0
+    local _CI_EXEC_MODE=--exec-indexer-with-oom-adj
     [ "$label" = "cbm" ] && _SCOPE_OK="$_CBM_SCOPE_OK"
     [ "$label" = "cbm" ] && scope_inherit=1
+    [ "$label" != "cbm" ] || _CI_EXEC_MODE=--exec-managed-supervisor
     if [ "$WORKLOAD_SLICE" = "1" ] && [ "$_SCOPE_OK" != "1" ]; then
         if [ -n "${CODE_INTEL_CHILD_REFUSAL_MARKER:-}" ]; then
             printf '%s\n' refused > "$CODE_INTEL_CHILD_REFUSAL_MARKER" 2>/dev/null || true
@@ -830,19 +858,20 @@ _leg_failed() {
 }
 
 if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
-    if [ -n "$CBM_DISABLE_UNRESOLVED" ]; then
-        _log "cbm kill-switch path unresolvable — refusing cbm leg (fail closed)"
+    if [ "$_CBM_LOCK_REFUSE" = "1" ]; then
         MISSING="${MISSING}cbm "
-    elif [ -e "$CBM_DISABLE_FILE" ]; then
-        _log "codebase-memory-mcp disabled by $CBM_DISABLE_FILE — skipped"
-        MISSING="${MISSING}cbm "
-    elif [ -n "${CODE_INTEL_CBM_WORKER_BINARY:-}" ] || command -v codebase-memory-mcp >/dev/null 2>&1; then
+    elif _cbm_unavailable="$(/usr/bin/python3 -I "${_CODE_INTEL_ENTRYPOINT%/*}/../codebase_managed.py" \
+        --config "$HOME/.genesis/config/codebase-managed.json" available --repo "$REPO_PATH" \
+        --persistence "$PERSISTENCE" \
+        2>&1 >/dev/null)"; then
         CBM_MEM_REFUSE=""
         _cbm_want_b="$(_genesis_mem_bytes "$CBM_MEM_MAX")"
         if [ -n "$GENESIS_CBM_ENV_REFUSE" ]; then
             CBM_MEM_REFUSE="$GENESIS_CBM_ENV_REFUSE"
         elif [ -z "$_cbm_want_b" ]; then
             CBM_MEM_REFUSE="CODE_INTEL_CBM_MEMORY_MAX='${CBM_MEM_MAX}' is not a parseable memory value"
+        elif [ "$_cbm_want_b" -ne 8589934592 ]; then
+            CBM_MEM_REFUSE="managed worker requires the full 8 GiB job cap"
         elif [ "$_cbm_want_b" -lt "$CODE_INTEL_CBM_MIN_BYTES" ]; then
             CBM_MEM_REFUSE="configured cap ${CBM_MEM_MAX} is below the measured $(( CODE_INTEL_CBM_MIN_BYTES / 1024 / 1024 ))M Codebase Memory workload"
         fi
@@ -871,13 +900,11 @@ if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
                 _log "SKIP cbm: cannot create admission outcome marker"
                 MISSING="${MISSING:+$MISSING }cbm"
             else
-                _cbm_command=(codebase-memory-mcp cli index_repository)
-                if [ -n "${CODE_INTEL_CBM_WORKER_BINARY:-}" ]; then
-                    _cbm_command=(/usr/bin/python3 -I "${_CODE_INTEL_ENTRYPOINT%/*}/code_intel_cbm_worker.py")
-                fi
+                _cbm_command=(/usr/bin/python3 -I "${_CODE_INTEL_ENTRYPOINT%/*}/code_intel_cbm_worker.py")
                 if MEM_MAX="$CBM_MEM_MAX" CODE_INTEL_CHILD_ADMIT_CAP_BYTES="$_cbm_want_b" \
                     CODE_INTEL_CHILD_REFUSAL_MARKER="$_cbm_refusal_marker" \
                     _run_with_watchdog cbm "${_cbm_command[@]}" \
+                    --managed-config "$HOME/.genesis/config/codebase-managed.json" \
                     --repo-path "$REPO_PATH" --mode "$MODE" --persistence "$PERSISTENCE"; then
                     CBM_RAN=1
                 else
@@ -894,7 +921,7 @@ if [ "$TOOLS" = "cbm" ] || [ "$TOOLS" = "both" ]; then
             fi
         fi
     else
-        _log "codebase-memory-mcp not on PATH — skipped"
+        _log "managed Codebase unavailable — skipped: ${_cbm_unavailable##*$'\n'}"
         MISSING="${MISSING}cbm "
     fi
 fi

@@ -1,5 +1,16 @@
 # Testing Guide
 
+The standalone rollout CLI and captured deploy source are exercised with real
+`python -I -S` subprocesses in `tests/test_scripts/test_mcp_rollout_config.py`,
+`test_mcp_rollout_failures.py`, and `test_mcp_rollout_repair.py`. Run them with
+`tests/test_scripts/test_mcp_rollout.py`, `test_shared_mcp_units.py`, and
+`test_deploy_code_only_modes.py` (all under `tests/test_scripts/`). Systemd
+calls use fixture shims. Coverage includes missing/incomplete captured source,
+future imports and namespace isolation, source replacement, exact launch argv,
+UTF-8 under an ASCII locale when available, post-sync CLI arrival, and the
+candidate gate's pure classifier. It never executes the candidate operator.
+No unused `src/` configuration reader is installed by this change.
+
 ## Running Tests
 
 All tests run from the genesis project root using pytest:
@@ -24,14 +35,56 @@ ruff check . && pytest -v
 
 ## Test Suite Overview
 
+For the opt-in request-owned database primitive, run
+`pytest -q tests/test_db/test_request_database.py tests/test_db/test_request_database_lifecycle.py tests/test_db/test_request_database_tasks.py tests/test_db/test_background_admission.py`.
+These use scratch SQLite databases, including independent readers, cancellation,
+WAL cursor release and process-death recovery. Four explicit outcome comparisons
+keep the actual legacy middleware as the negative control. Shared MCP service E2E
+qualification is separate from this primitive coverage.
+
+`tests/test_db/test_request_database_tasks.py` exercises detached ownership,
+parent rollback, caller ContextVars, cancellation before start and during work,
+shutdown admission, and real activity/heartbeat persistence on scratch SQLite.
+It also checks deferred-recall and procedure-refresh bookkeeping when a job
+never enters its body. Providers and vector services are not called.
+
+Scoped graph selection and SQL identity parity are covered by
+`tests/test_memory/test_graph_request_database.py` and
+`tests/test_memory/test_graph_path_identity.py`. They use scratch SQLite with
+production table definitions, compare ordered traversal fields against NetworkX,
+and check own pending writes and selected-backend fallback. The FalkorDB boundary
+is simulated; these tests do not claim a live-engine or shared-service E2E run.
+
+For the service boundary, run the named files
+`tests/test_mcp/test_request_database_service.py`,
+`tests/test_mcp/test_request_service_initialization.py`,
+`tests/test_mcp/test_request_service_tool_bodies.py`, and
+`tests/test_mcp/test_request_standalone_health.py`. They use real FastMCP
+clients and service initializers with scratch SQLite, testing concurrent calls,
+protocol cancellation, finalization errors, durable explicit commits, restart,
+and real detached database writers. Standalone health status/alerts assert seeded
+SQL results across success, cancellation, enrichment error and shutdown; guard
+tests reject unsupported runtime health injection without mutating registration.
+Initialization also checks one bootstrap-owned history load, pending-flush
+ownership and scoped/legacy transitions. Bootstrap commit/cleanup failures across
+all four services preserve registration; bootstrap inside the current task's
+active unit is rejected before mutation. External host/provider/vector calls are stubbed;
+HTTP/UDS deployment and caller credentials need separate activation checks.
+
 Genesis v3 has **~21,000 test functions** across **~1,345 files** (counted
 2026-09-06 by `grep -rEh "^\s*(async )?def test_" tests/ --include=*.py | wc -l`;
 parametrized cases make the collected item count higher still). The suite runs
 without external service dependencies -- Qdrant, Ollama, and LLM APIs are
 mocked in unit tests.
 
-**Runtime.** CI runs the suite FULLY SERIALLY (no pytest-xdist; it is not a
-dependency). MEASURED 2026-09-06 over the last 23 successful `main` runs, for
+**Runtime.** CI's `test` job runs the suite on four pytest-xdist workers
+(`-n 4 --dist=loadfile --max-worker-restart=0`; xdist is pinned in
+`.github/test-tools/requirements.txt`). MEASURED 2026-11-05 over 6 runs: the
+`Run tests` step's median was 33.35 min, against 117.0 serial, with the same
+test ids (62,766), and a 7.8 GB memory peak. A local `-n` run is unsupported:
+that peak is too much for a shared box, and the full-suite guard refuses it.
+The figures that follow are older serial ones, from a suite less than half its
+current size, MEASURED 2026-09-06 over the last 23 successful `main` runs, for
 the **`test` job specifically** (`gh api .../actions/runs/<id>/jobs`, name ==
 `test`): min 19m38s, median 29m22s, max 31m15s. Do not quote workflow-RUN
 duration here — it is ~20 minutes longer because it spans 12 sibling jobs plus
@@ -40,15 +93,19 @@ queue time, and it is not what any of the ceilings below bound.
 Two ceilings bound the suite, and they are different things:
 
 - `timeout = 600` in `pyproject.toml` is pytest-timeout's **per-test** limit —
-  one hung test is killed and the suite continues. It is NOT a suite budget.
-  It applies wherever `pytest-timeout` is installed: always in CI, and locally
-  only if you installed it (it ships in the `[test]` extra, which no install
-  path installs). Without it a run starts with a warning saying so, because a
-  hung test then holds the box-wide test lock until it is killed by hand.
+  with the thread method it ends the process that ran the hung test, so the
+  run stops (under `--max-worker-restart=0`, once the other workers finish
+  what they were handed). It is NOT a suite budget.
+  It applies wherever `pytest-timeout` is installed: always in CI, and on an
+  install once bootstrap's non-fatal step has installed the `[test]` extra
+  (`install_runtime_extras`; a code-only deploy warns when it is missing).
+  Without it a run starts with a warning saying so, because a hung test then
+  holds the box-wide test lock until it is killed by hand.
 - `timeout-minutes: 180` on CI's `test` job bounds the whole job, for a hang
   the per-test timeout cannot catch. It must stay above (max job + one
-  per-test kill) — 31m15s + 10m ≈ 41m — or it would pre-empt the per-test
-  limit and make it dead code.
+  per-test kill), or it would pre-empt the per-test limit and make it dead
+  code. The serial job had reached 82-146 min by 2026-11-05; on four workers
+  the measured step took 31-48 min.
 
 The per-test cost of individual tests had never been measured; CI now prints
 `--durations=25` so the slowest are visible in every run's log. Read them
@@ -155,27 +212,23 @@ guardrail (code in the test process could get around it), not a sandbox.
     `claude-code` count) and `sudo`;
   - any `systemctl`/`systemd-run`/`gh`/`loginctl` called by a real path outside
     the test's temp dirs (`tempfile.gettempdir()` and pytest's basetemp);
-  - a deploy script (`scripts/{update,deploy_code_only,restore,backup,
-    bootstrap}.sh`) run with the real `HOME`, or acting on the deployed checkout
-    (`~/genesis`, plus a checkout named in `GENESIS_LIVE_FENCE_LIVE_ROOT`, which
-    counts only if it holds `scripts/update.sh`). Where each script acts:
-    `update.sh` and `deploy_code_only.sh` on their root override
-    (`GENESIS_UPDATE_ORIG_DIR`, `GENESIS_DEPLOY_ROOT`) or else the checkout they
-    live in; `backup.sh` and `restore.sh` on `GENESIS_DIR` or else
-    `$HOME/genesis`; `bootstrap.sh` on the checkout it lives in. A deploy script
-    in a `scripts/` directory under a temp dir is still refused with the real
-  `HOME`. A command named like
-    one whose file cannot be found (`cd <dir> && ./update.sh`) is judged by the
-    `HOME` rule alone.
+  - a deploy script run against live state — refused by the SCRIPT, not the
+    fence: the fence exports `GENESIS_TEST_FENCE_LIVE_ROOTS` (this checkout's
+    real root, plus the real home's `~/.genesis`/`~/genesis` when they exist,
+    plus a root named in `GENESIS_LIVE_FENCE_LIVE_ROOT`) and
+    `GENESIS_TEST_FENCE_LOG` (the fence's own log), and
+    `scripts/lib/live_system_guard.sh`'s `refuse_if_test_fenced_live` makes each
+    deploy script (`scripts/{update,deploy_code_only,restore,backup,
+    bootstrap}.sh` and `deploy_candidates`) print `REFUSED (test fence): ...`,
+    append the same line to the log, and exit 97 when its acting root,
+    `HOME`, `GENESIS_HOME` or `HOME/.genesis` is at or under a listed root
+    (or a path it must check cannot be resolved provably). This runs inside the script after bash's own expansion, so no
+    launch spelling escapes it — `bash script`, `bash -c`, `BASH_ENV`,
+    `--rcfile`, a here-string, whatever a child starts.
 
-  Every command is judged as far as the repo's own parser can read it:
-  wrappers (`env`, `timeout`, `sudo`, ...) are judged and stripped, `sh -c`
-  strings and here-strings fed to a shell are opened, every `PATH=` the line
-  sets is honored, and heredoc bodies that only feed data to a command
-  (`cat <<EOF`) are skipped. The refusal is a
-  `BaseException`, so an `except Exception` fallback in the code under test
-  cannot catch it and try another route; in a forked child the child exits 127
-  instead.
+  The in-process refusal is a `BaseException`, so an `except Exception`
+  fallback in the code under test cannot catch it and try another route; in a
+  forked child the child exits 127 instead.
 - **Answered like CI, and reported:** `systemctl`, `systemd-run`, `gh` and
   `loginctl` called by bare name (and `claude --version`/`--help`) reach a stub
   that answers as the real tool does on a CI runner, where nothing is reachable
@@ -184,40 +237,40 @@ guardrail (code in the test process could get around it), not a sandbox.
   stub". Stub the call in the test if its result matters. A stub exists only
   for a tool installed on the machine, so `shutil.which` still reports a missing
   tool as missing.
-- **A refusal that lands after its test ended** (a detached child) fails the
-  whole session, listed under "refusals outside their test".
-- Any program inside the test's temp dirs that is not a deploy script runs, so
-  a test that needs a fake of one of these tools puts it in `tmp_path`.
+- **A refusal drained after its test ended** (a detached child) fails the
+  whole session, listed under "refusals outside their test". Reporting ends at
+  the final session drain. The unique shim directory remains for surviving
+  children until normal temp cleanup, so inherited PATH lookups keep refusing.
+- Only the resolved program is ever judged in-process — never argv or a shell
+  string. Any program inside the test's temp dirs runs, so a test that needs a
+  fake of one of these tools puts it in `tmp_path`.
 - Give a test that runs a deploy script a private `HOME` and point the script's
   root at a fixture tree (the `tests/test_scripts/_deploy_station.py` fixture
-  is the model).
+  is the model); the script then runs its normal path.
 - Two explicit opt-outs, each listed in the run summary:
   - `user_manager`: may run the real `systemd-run` (a transient `--user` scope, a
-    unit check) and gets the real session-bus variables back; the command that
-    `systemd-run` would start is still judged, against the user manager's PATH.
+    unit check) and gets the real session-bus variables back.
   - `real_tool("gh", ...)`: deliberately runs the named installed tools (a
     table checked against their own `--help`, a kernel probe).
   Deploy scripts against live state stay refused for both.
 - Known gaps, by design (an in-process fence sees only this interpreter's own
-  launches and what its parser can read; the OS-level sandbox is the answer):
+  launches; the OS-level sandbox is the answer):
   - a program a child process starts by absolute path;
   - a child given a hand-built `env` without the fence's `PATH` and bus
     variables: a script that defaults `XDG_RUNTIME_DIR` when it is unset then
     reaches the real user manager;
-  - what the parser does not open (`eval`, a command held in a variable, a
-    function body, a script piped or redirected into a shell, `find -exec`,
-    `su`/`runuser`/`flock`/`script`/`unshare`/`setpriv`): only the PATH stubs
-    judge these, so a bare name is caught and an absolute path is not;
-  - a `systemd-run` started by a child in a `user_manager` test;
+  - whatever a child shell string or a real `systemd-run` in a `user_manager`
+    test goes on to start;
   - the stubs answer like CI only approximately: `claude --version` exits 127
     where CI raises "not found", and a system-level `systemctl` also gets "Failed
     to connect to bus".
 
-### The live closure: tests run without this machine's credentials
+### The live closure: tests run without this machine's credentials or live state
 
-`tests/_live_closure.py`, armed right after the live fence, takes credentials
-and live state paths out of the process environment before any test runs, so
-a test behaves as it does on CI, where none exist. Child processes inherit it.
+`tests/_live_closure.py`, armed right after the live fence, takes credentials,
+live state paths and endpoints out of the process environment before any test
+runs, so a test behaves as it does on CI, where none exist. Child processes
+inherit it.
 
 - `SECRETS_PATH` names a file that does not exist, so every `secrets.env`
   loader that honours it loads nothing. Each test gets its own such path under
@@ -226,85 +279,107 @@ a test behaves as it does on CI, where none exist. Child processes inherit it.
   a sandbox `GENESIS_DIR` drops `SECRETS_PATH` from the child's environment, so
   the sandbox decides where the secrets file is, as on CI.
 - Credential-shaped variables are removed for the run: `SSH_AUTH_SOCK`,
-  `GH_TOKEN`, `GITHUB_TOKEN`, and names containing `_API_KEY`, `_SECRET`,
+  `GH_TOKEN`, `GITHUB_TOKEN`, `GIT_ASKPASS`, `SSH_ASKPASS`, a bare `API_KEY`,
+  names starting `VSCODE_GIT_`, and names containing `_API_KEY`, `_SECRET`,
   `PASSWORD`, `PASSPHRASE`, `WEBHOOK`, `CREDENTIAL`, `_ACCESS_KEY` or
-  `_PRIVATE_KEY`, starting `API_KEY_`, or ending `_TOKEN`, `_PASS` or
-  `_KEY_ID`. The run summary lists their names, never values.
-- `GH_CONFIG_DIR` points at an empty directory, `GIT_TERMINAL_PROMPT=0`, and
-  `GIT_SSH_COMMAND=false`.
+  `_PRIVATE_KEY`, starting `API_KEY_`, or ending `_TOKEN`, `_PASS`, `_KEY_ID`
+  or `_AUTH_CONFIG`. The run summary lists their names, never values.
+- `GH_CONFIG_DIR` points at an empty directory, `GIT_TERMINAL_PROMPT=0`,
+  `GIT_SSH_COMMAND=false`, and `GIT_CONFIG_GLOBAL=/dev/null`,
+  `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_SYSTEM=/dev/null` close git's user and
+  system configuration (and any credential helper in it) whatever `HOME` or
+  `XDG_CONFIG_HOME` say, even for an explicit `git config --system`. Config git
+  takes from the environment (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT` and
+  its `KEY_n`/`VALUE_n`) is removed. A test that needs a git identity sets it
+  itself, as on CI.
+- `GENESIS_DB_PATH` is set when the plugin is imported, before pytest imports
+  any `tests/test*/conftest.py`, so a module that resolves the database path at
+  import (or as a default argument) binds the closure's file, never the
+  checkout's `data/genesis.db`. Each test then gets its own file
+  (`_isolate_genesis_db_path` in `tests/conftest.py`), the same one the
+  in-process patch returns. If something changes the variable between import
+  and configure, the run says so on stderr and restores it.
 - `GENESIS_PROACTIVE_HOOK_URL` points at a closed port, so a test running the
   memory hook as a child never posts to the live server.
-- `GENESIS_DB_PATH` is set per test (`_isolate_genesis_db_path` in
-  `tests/conftest.py`) to the same temp database the in-process patch returns.
 - `GENESIS_MCP_LOG_DIR` names a directory that does not exist, so importing the
   health MCP opens no log in the shared `~/tmp`.
-- `HOME` names a private directory for the whole session, so anything resolved
-  through `Path.home()` or `~` (tokens, the Guardian's shared policy file,
-  caches, stamps, logs, `~/tmp` scratch) lands there instead of the real home.
-  It sits beside pytest's basetemp in the per-process leaf under
-  `~/tmp/pytest/<pid>/` (basetemp is `<leaf>/bt`, the home `<leaf>/home`); on CI
-  or with an explicit `--basetemp` it is a temp directory beside that basetemp,
-  or in the default temp dir. It holds only `tmp/` at the start. It is set after
-  the box lock and basetemp are placed, which both read HOME. pytest imports
-  `tests/test*/conftest.py` before that point on a directory run, so state paths
-  `genesis` modules have already bound under the real home (`~/.genesis`,
-  `~/.claude`, `~/tmp`, `~/.cache`, `~/.config`, `~/.local/share`,
-  `~/.local/state`) are moved into the test home, and the summary names each
-  one. `_live_closure.REAL_HOME` names the real home for a test that must use it
-  (the fence's deploy-script tests do).
-  `PLAYWRIGHT_BROWSERS_PATH` keeps pointing at the real browser cache, so the
-  UI tests still find their browser.
 - A test that sets its own value with `monkeypatch` still wins.
-- `GENESIS_LIVE_E2E=1` (the opt-in live tests) leaves secrets and HOME in
-  place, and the summary says so; the git, gh and hook-URL settings still apply.
+- `GENESIS_LIVE_E2E=1` (the opt-in live tests) leaves `SECRETS_PATH` and the
+  credential variables in place, and the summary says so; the git, gh,
+  database, hook-URL and log settings still apply.
+- The closure's directory is removed at the end of the run; a child that
+  outlives pytest is left with paths that do not exist, so no credentials.
 - Not covered:
-  - a reader that builds its own path to `secrets.env` instead of honouring
-    `SECRETS_PATH`;
-  - a path built from the password database rather than HOME, and a child
-    process started with an environment that has no `HOME` at all (Python and
-    bash then fall back to the real home);
-  - an explicit `GENESIS_HOME` a test or the environment sets;
-  - a home path bound before the redirect as a string, inside a container, or
-    by a module outside the `genesis` package;
-  - `tempfile` output, which goes to `TMPDIR` (on some installs a directory in
-    the real home).
+  - a reader that builds its own path to `secrets.env` or the database
+    instead of honouring these variables;
+  - a credential under a name the rule does not match: for example `*_OAUTH`,
+    `*_BEARER*`, a bare `*_KEY` or `*_PWD`, a DSN, a credential embedded in a
+    URL value (`DATABASE_URL`, `HTTP_PROXY`), or a variable pointing at a
+    credential file (`AWS_PROFILE`, `DOCKER_CONFIG`, `NETRC`, `KUBECONFIG`);
+  - credentials a program finds through the home directory rather than the
+    environment (`~/.ssh`, tool config files);
+  - a child started with an environment that does not carry these variables,
+    including tests that strip every `GIT_*` variable from a child (its git
+    then reads the home's user config again);
+  - a repository-local `core.askPass` or `credential.helper`.
 
 ### The outbound fence: tests never connect to a live service
 
-`tests/_live_outbound.py`, armed after the live closure, refuses a test's
-connection to a service running on this machine, the way CI refuses it because
-nothing listens there. A PEP 578 audit hook judges every in-process
+`tests/_live_outbound.py`, armed after the live fence, refuses a test's
+connection to a live service on this machine (any TCP listener; unix sockets
+under the real home and the user and dbus run directories), the way CI refuses
+it because nothing listens there. A PEP 578 audit hook judges every in-process
 `socket.connect`:
 
 - **TCP to this machine** (loopback, `0.0.0.0`/`::`, or one of its own
-  addresses): refused when the port is listening NOW and no listening socket on
-  it belongs to the pytest process or one of its children. Decided at connect
-  time, so a test's own server (in a thread or a child) is always reachable, a
-  service that started mid-run is still fenced, and a port nobody listens on
-  fails on its own.
+  addresses): refused when a socket is listening NOW on that port at that
+  destination (the same address, or a wildcard on either side) and at least one
+  of those sockets does not belong to the pytest process or one of its
+  children. Decided at connect time, so a test's own server (in a thread or a
+  child) is reachable, a service that started mid-run is still fenced, a test's
+  own listener on one address does not vouch for someone else's on another, and
+  a port nobody listens on fails on its own.
 - **TCP to a private address that is not this machine** (the RFC 1918, CGNAT,
   link-local and ULA ranges in `genesis.util.netclass`): refused on any port.
 - Port 53 (DNS) is exempt everywhere.
 - **Unix sockets** under the real home, `/run/user/<uid>/` or `/run/dbus/`
   that are listening and not owned by the pytest tree: refused with
   `FileNotFoundError`, which is what CI gives for a socket that does not exist.
+  Paths are matched as bytes, so spaces and non-UTF-8 bytes are fine. Without a
+  resolvable real home only the two `/run` directories are judged.
 - Public addresses are untouched.
 
 A refusal raises `ConnectionRefusedError` (or `FileNotFoundError`) to the
 caller, so the code under test takes its CI path. The test is NOT failed; each
 refusal is listed in the run summary under "live fence: live connections
 refused", and `GENESIS_LIVE_OUTBOUND_REPORT=<file>` writes them per test (an
-empty file on a clean run).
+empty file on a clean run). `connect_ex` raises the refusal instead of
+returning `ECONNREFUSED`.
+
+Judging a TCP connect to this machine reads `/proc/net/tcp` and `tcp6`, about
+9 ms per connect measured here, even when nothing listens on the port. A test
+that polls a local port in a tight loop pays it on every attempt.
+
+A fault inside the judgement never breaks a connect: it is allowed, counted by
+exception type, and the summary prints `outbound fence: N judgments failed and
+were allowed (...)`.
 
 A test that must reach a live service is marked `live_service` and gated on
 `GENESIS_LIVE_E2E=1` (the Qdrant collection, retriever and FalkorDB engine
 tests are); the fence lets it connect for its whole run, setup and teardown
 included, and the summary lists it. Mark the whole module when its fixtures
-connect.
+connect. A test whose own server daemonizes (double fork, `setsid`) leaves the
+pytest tree, so it reads as someone else's: mark it `live_service`.
 
 Known gaps, by design (the OS-level sandbox is the boundary): connections made
-by child processes (the memory hook's URL is redirected by the live closure),
-connects done in C (curl_cffi), and UDP.
+by child processes, connects done in C (curl_cffi), UDP and unix datagram
+sockets; unix sockets outside the three directories above (`/run/systemd`, a
+VPN daemon's socket); a thread an earlier unmarked test left running, while a
+`live_service` test runs; a unix socket path
+containing a newline (it cannot be represented in `/proc/net/unix`); and an
+IPv6 link-local scope id, which `/proc/net/tcp6` does not record, so two
+listeners with the same link-local address on different interfaces are judged
+as one.
 
 ### The write audit: writes into the real home are reported
 

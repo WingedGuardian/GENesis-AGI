@@ -59,6 +59,7 @@ def test_every_tier_that_runs_post_merge_is_told_a_kept_unit_is_not_its_to_fix(p
     text = " ".join(getattr(updates, prompt).split())
     assert "never pass --take-template" in text
     assert "kept <unit>: edited by hand" in text
+    assert '"kept-etc <path>: ..."' in text  # an /etc file kept the same way
 
 
 def _orchestrate(

@@ -188,12 +188,111 @@ def test_a_failing_notice_still_exits(fake_os: dict) -> None:
 
 def test_arm_from_spawn_counts_from_process_start(monkeypatch: pytest.MonkeyPatch) -> None:
     seen: list[float] = []
-    monkeypatch.setattr(hd, "arm", lambda seconds, notice, label: seen.append(seconds))
+    diags: list[object] = []
+    monkeypatch.setattr(
+        hd,
+        "arm",
+        lambda seconds, notice, label, diag=None: (seen.append(seconds), diags.append(diag)),
+    )
     monkeypatch.setattr(hd, "process_age_s", lambda: 3.0)
     hd.arm_from_spawn(8.5, lambda: None)
     monkeypatch.setattr(hd, "process_age_s", lambda: None)
-    hd.arm_from_spawn(8.5, lambda: None)
+
+    def _diag() -> str:
+        return "D"
+
+    hd.arm_from_spawn(8.5, lambda: None, diag=_diag)
     assert seen == [5.5, 8.5]
+    assert diags == [None, _diag]  # the diag callback reaches arm()
+
+
+def test_fire_writes_diag_after_the_stack(fake_os: dict) -> None:
+    """The stack is proven; a new diag line must come after it, never before."""
+    with pytest.raises(_Exited):
+        hd._fire(8.5, "lbl", lambda: "NOTE", diag=lambda: "[hook-phases] {}\n")
+    assert [fd for fd, _ in fake_os["writes"]] == [1, 2, 2]
+    assert fake_os["writes"][1][1].startswith("[lbl] hard stop fired")
+    assert fake_os["writes"][2] == (2, "[hook-phases] {}\n")
+    assert fake_os["exit"] == 0
+
+
+def test_a_failing_diag_still_writes_the_stack_and_exits(fake_os: dict) -> None:
+    def _boom() -> str:
+        raise RuntimeError("diag broke")
+
+    with pytest.raises(_Exited):
+        hd._fire(1.0, "lbl", lambda: None, diag=_boom)
+    assert [fd for fd, _ in fake_os["writes"]] == [2]
+    assert fake_os["writes"][0][1].startswith("[lbl] hard stop fired")
+    assert fake_os["exit"] == 0
+
+
+def test_diag_is_written_even_without_the_stdout_lock(fake_os: dict) -> None:
+    """diag goes to stderr, which the lock does not guard: it is not skipped with the notice."""
+    hd.STDOUT_LOCK.acquire()
+    try:
+        result: list[BaseException] = []
+
+        def _run() -> None:
+            try:
+                hd._fire(1.0, "lbl", lambda: "NOTE", diag=lambda: "DIAG\n")
+            except BaseException as exc:  # noqa: BLE001 - captured for the assert
+                result.append(exc)
+
+        t = threading.Thread(target=_run)
+        t.start()
+        t.join(5)
+    finally:
+        hd.STDOUT_LOCK.release()
+    assert isinstance(result[0], _Exited)
+    assert fake_os["writes"][-1] == (2, "DIAG\n")
+    assert all(fd == 2 for fd, _ in fake_os["writes"])
+
+
+def test_a_full_stderr_pipe_cannot_hang_the_stop_or_its_diag() -> None:
+    """stderr's pipe is full and never read: the stack and diag writes fail fast."""
+    script = textwrap.dedent(
+        f"""
+        import os, sys, time
+        sys.path.insert(0, {str(_HOOKS_DIR)!r})
+        import hook_deadline as hd
+        os.set_blocking(2, False)
+        try:
+            while True:
+                os.write(2, b"x" * 4096)
+        except BlockingIOError:
+            pass
+        os.set_blocking(2, True)
+        hd.arm(0.3, lambda: "NOTICE-LINE", label="t", diag=lambda: "D" * 4096)
+        time.sleep(30)
+        """
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    try:
+        rc = proc.wait(timeout=10)  # NOT reading stderr: the pipe stays full
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        pytest.fail("the hard stop hung on a full stderr pipe")
+    proc.communicate()
+    assert rc == 0
+
+
+def test_a_real_stop_writes_the_diag_line_after_the_stack() -> None:
+    proc, elapsed = _run_child(
+        """
+        hd.arm(0.4, lambda: None, label="t", diag=lambda: "[hook-phases] {\\"cut\\":true}\\n")
+        time.sleep(30)
+        """
+    )
+    assert proc.returncode == 0
+    assert elapsed < 10
+    lines = proc.stderr.splitlines()
+    stack = next(i for i, ln in enumerate(lines) if "hard stop fired" in ln)
+    diag = next(i for i, ln in enumerate(lines) if ln.startswith("[hook-phases]"))
+    assert stack < diag
 
 
 def test_locked_stdout_tracks_an_open_line(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
@@ -293,3 +392,19 @@ def test_locked_stdout_counts_utf16_units(monkeypatch: pytest.MonkeyPatch, capsy
     out.write("\n")
     assert hd.written_units() == 5
     capsys.readouterr()
+
+
+def test_a_diag_that_blocks_cannot_hold_the_exit() -> None:
+    """Review round 1 (Codex P2): diag ran inline, so a diag stuck on a read held
+    os._exit back until Claude Code's kill discarded the notice and the stack."""
+    proc, elapsed = _run_child(
+        """
+        hd.arm(0.3, lambda: "NOTICE-LINE", label="t", diag=lambda: time.sleep(30) or "never")
+        time.sleep(30)
+        """
+    )
+    assert proc.returncode == 0
+    assert elapsed < 0.3 + hd.DIAG_BUDGET_S + 3.0, f"a blocked diag held the stop ({elapsed:.1f}s)"
+    assert proc.stdout.splitlines() == ["NOTICE-LINE"]
+    assert "hard stop fired" in proc.stderr
+    assert "never" not in proc.stderr

@@ -86,6 +86,14 @@ backend has its separate2GiB cap. There is no raw/PATH or address-space fallback
 and no legacy cap override. Missing setup refuses; registration never activates
 the service. A contained reader failure can be reconnected with `/mcp`; backend
 failure requires deliberate recovery. See `docs/reference/codebase-managed.md`.
+Queued Codebase indexing uses the exact pinned native worker in the existing
+8 GiB, zero-swap batch scope, with a 6 GiB native budget and fresh in-scope
+managed admission. Unavailability preserves pending Codebase work; a combined
+request can complete GitNexus and retain Codebase. There is no PATH-provider
+fallback or automatic activation. The coordinator retains its inherited
+nonmaximum OOM adjustment; only the native indexing child is promoted to 1000.
+Canonical repository-lock failure refuses managed work. These mechanisms do
+not establish production capacity or unattended resource-failure readiness.
 
 **GitNexus** — LadybugDB graph (v1.6.12). Snapshot-based: correct only when the
 index matches the working tree. Its reindex fires on local commit, **not** on
@@ -120,6 +128,14 @@ caps, and a **pressure watchdog** that pauses the index (cgroup freeze — the o
 working I/O throttle here) under load and kills a run that can't make headway. A
 guardrail test (`tests/test_scripts/test_code_intel_index.py`) fails the build on
 any new raw spawn site. `CODE_INTEL_INDEX_DISABLE=1` skips indexing entirely.
+
+**Automatic consumption is currently paused.** Until the queue protocol's
+explicit strict cutover lands, the runner observes readiness first and defers
+each tick that reaches it (exit 0, logged "automatic queue protocol incomplete"), so markers
+accumulate and no index refreshes on its own, including a fresh install's first
+index. Refresh by hand when freshness matters:
+`scripts/lib/code_intel_index.sh "$PWD" gitnexus fast` (the manual entrypoint is
+not fenced).
 
 **Emergency kill-switch — `genesis-code-intel-freeze`.** A managed systemd USER
 unit (`scripts/code_intel_freeze.sh`) that holds BOTH single-flight locks (the

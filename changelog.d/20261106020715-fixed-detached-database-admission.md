@@ -1,0 +1,1 @@
+- Opt-in request-owned database jobs use explicitly bounded background admission, preserving foreground capacity. Recall retries inline on queue pressure; best-effort observations tolerate refusal and pending bookmarks remain available for retry. No shared service is enabled by this change.

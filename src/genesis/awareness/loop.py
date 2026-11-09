@@ -178,7 +178,10 @@ async def _persist_health_alerts(db) -> None:
         from genesis.runtime import GenesisRuntime
 
         observation = {}
-        alerts, _current_ids = await _compute_alerts(agent_api_observation=observation)
+        queue_unknown_ids: set[str] = set()
+        alerts, _current_ids = await _compute_alerts(
+            agent_api_observation=observation, queue_unknown_ids=queue_unknown_ids,
+        )
         # Also preserve an open API incident if the health service itself could
         # not initialize and _compute_alerts returned before taking a snapshot.
         alerts = [a for a in alerts if a.get("id") != ALERT_ID]
@@ -196,7 +199,7 @@ async def _persist_health_alerts(db) -> None:
         state = observation.get("status")
         reasons = {ALERT_ID: state} if state in {"healthy", "disabled"} else None
         await _ae.reconcile_open_set(db, active=active, now=datetime.now(UTC).isoformat(),
-                                     resolution_reasons=reasons)
+                                     resolution_reasons=reasons, preserve_ids=queue_unknown_ids)
         runtime = GenesisRuntime.peek()
         await notify_pending(db, getattr(runtime, "_outreach_pipeline", None))
     except Exception:
@@ -579,10 +582,22 @@ _INFRA_POSTURE_DETAIL = {
         "guardian health on the host, or re-run scripts/host-setup.sh"
     ),
     "oomd_pressure_kill_off": (
-        "systemd-oomd pressure-kill is not enforced for user.slice — nothing "
-        "gracefully kills the memory hog before a hard OOM wedge. Re-run "
-        "scripts/bootstrap.sh (installs systemd-oomd and lays the user.slice "
-        "drop-in via lib/memory_resilience.sh)"
+        "no systemd-oomd pressure-kill monitor is confirmed in force: either "
+        "systemd-oomd is not running, or the user.slice backstop is not "
+        "configured and the user-manager monitor is not confirmed live. Nothing "
+        "may gracefully kill a memory hog before a hard OOM wedge. Re-run "
+        "scripts/bootstrap.sh as the Genesis user (lib/memory_resilience.sh "
+        "installs systemd-oomd, lays the user-manager and user.slice drop-ins, "
+        "and says which monitor it could not verify)"
+    ),
+    "oomd_user_manager_unmonitored": (
+        "systemd-oomd is running but does not list the user manager, so no "
+        "monitor honours genesis-server's kill-me-last preference: a "
+        "memory-pressure kill can come only from the root-owned user.slice "
+        "backstop, where configured, which ignores it. Re-run "
+        "scripts/bootstrap.sh as the Genesis user: lib/memory_resilience.sh "
+        "lays the user-manager root-slice drop-in (it survives `systemctl --user "
+        "daemon-reload`, systemd issue #43174) and names the check that failed"
     ),
     "pid_ceiling_unprovisioned": (
         "the per-user systemd slice PID/task ceiling is still on systemd's stock "
@@ -817,8 +832,23 @@ def _infra_missing_protections(profile: dict) -> list[str]:
         missing.append("container_swap_disabled")
     # Gated on a readable cgroup swap knob (a cgroup-v2 proxy): on v1 the
     # pressure-kill policy cannot work, so False there is not actionable.
-    if swap_max is not None and memory.get("oomd_user_slice_kill") is False:
+    # oomd not running is the alarm whatever is configured. Otherwise either
+    # monitor is protection: the user manager (live, the operative one) or
+    # user.slice (the backstop, configured). Neither is the alarm; an unknown
+    # user-manager state with user.slice off is treated as neither.
+    if swap_max is not None and (
+        memory.get("oomd_active") is False
+        or (
+            memory.get("oomd_user_slice_kill") is False
+            and memory.get("oomd_user_manager_monitored") is not True
+        )
+    ):
         missing.append("oomd_pressure_kill_off")
+    # The user-manager monitor explicitly not live: protection degrades to the
+    # backstop, where kill-me-last is ignored. Explicit False only (None means
+    # oomctl or a user manager is absent: nothing to act on).
+    if swap_max is not None and memory.get("oomd_user_manager_monitored") is False:
+        missing.append("oomd_user_manager_unmonitored")
     # PID/task ceiling still on systemd's stock 33% default. Explicit False only
     # (the collector reports the EFFECTIVE cap vs the container root budget);
     # None/absent (unreadable / no container cap) stays silent.
@@ -1436,7 +1466,8 @@ async def _resolve_memory_integrity_posture(db) -> None:
 # the host guardian a week behind, with zero signal anywhere. The collectors
 # live in observability/snapshots/deploy_health.py (shared with the health
 # snapshot); this check is the alerting layer. Hybrid severity: any drift is
-# a non-paging 'high' (dashboard); 'critical' (pages Telegram) only when
+# a non-paging 'high' (dashboard), except commits-behind-upstream alone, which
+# is 'medium' (routine maintenance); 'critical' (pages Telegram) only when
 # SUSTAINED — the 'stale_update' finding class (last successful update ≥7
 # days old AND ≥20 commits behind; thresholds live beside derive_findings in
 # deploy_health.py, the single producer of finding keys), or a missing
@@ -1645,6 +1676,10 @@ async def _check_deploy_staleness(db) -> None:
             _last_actionable_base_findings = [
                 f for f in findings if f.split(":", 1)[0] in _BASE_DEPENDENT_CLASSES
             ]
+        # Older repair report dirs not read (dismissed ones included) are named
+        # beside another finding, never an alert of their own.
+        if {f.split(":", 1)[0] for f in findings} == {"live_repair_unread_older"}:
+            findings = []
         if not findings:
             await _resolve_deploy_staleness(db)
             return
@@ -1699,8 +1734,22 @@ async def _check_deploy_staleness(db) -> None:
                 except ValueError:
                     pass
 
-        priority = "critical" if critical else "high"
+        # Being behind upstream (or holding live-move repair reports older than
+        # the newest read) and nothing else is routine: medium, so the morning
+        # report does not raise it as a blocker every day. Any other drift class
+        # beside it keeps the row at high.
+        if critical:
+            priority = "critical"
+        elif set(classes) <= _DEPLOY_INFORMATIONAL_CLASSES:
+            priority = "medium"
+        else:
+            priority = "high"
         alert_key = ",".join(classes) + ":" + priority
+        if set(classes) & _DEPLOY_REPAIR_CLASSES:
+            # The repair paragraph names reports specific to this snapshot: a
+            # new report is another alert, never the standing one left naming
+            # only the old.
+            alert_key += ":" + _deploy_repair_identity(snap.get("live_repairs") or {})
         now = time.monotonic()
         if (
             now - _last_deploy_alert_at < _DEPLOY_ALERT_COOLDOWN_S
@@ -1724,10 +1773,12 @@ async def _check_deploy_staleness(db) -> None:
         # The drift paragraph (and its update.sh recovery sentence) only when a
         # drift class is present: update.sh REFUSES a dirty deploy checkout, so
         # telling someone to run it for a dirty-only state is wrong advice.
-        if set(classes) - _DEPLOY_CHECKOUT_CLASSES - _DEPLOY_LIVE_CLASSES:
+        if set(classes) - _DEPLOY_CHECKOUT_CLASSES - _DEPLOY_LIVE_CLASSES - _DEPLOY_REPAIR_CLASSES:
             paragraphs.append(_deploy_drift_paragraph(snap, age_days, behind, git_facts))
         if set(classes) & _DEPLOY_LIVE_CLASSES:
             paragraphs.append(_deploy_live_paragraph(snap, findings))
+        if set(classes) & _DEPLOY_REPAIR_CLASSES:
+            paragraphs.append(_deploy_repair_paragraph(snap.get("live_repairs") or {}))
         if "main_checkout_dirty" in classes:
             paragraph = _deploy_checkout_dirty_paragraph(checkout)
             if carried and checkout.get("count") is not None:
@@ -1746,7 +1797,11 @@ async def _check_deploy_staleness(db) -> None:
             id=str(uuid.uuid4()),
             source="deploy_staleness_monitor",
             type="infrastructure_alert",
-            content=" ".join(paragraphs) + f" [findings: {', '.join(findings)}]",
+            # Text a database column can always hold: one field that is not
+            # valid Unicode (a lone surrogate) is escaped, never the whole alert lost.
+            content=(" ".join(paragraphs) + f" [findings: {', '.join(findings)}]")
+            .encode("utf-8", "backslashreplace")
+            .decode("utf-8"),
             priority=priority,
             created_at=datetime.now(UTC).isoformat(),
             content_hash=content_hash,
@@ -1778,6 +1833,101 @@ _DEPLOY_LIVE_CLASSES = frozenset(
         "live_candidate_tier2",
     }
 )
+
+#: Finding classes from the live-move repair's reports
+#: (deploy_health.live_repair_findings): their own wording, and they never page.
+_DEPLOY_REPAIR_CLASSES = frozenset(
+    {
+        "live_repair_saved",
+        "live_repair_unread_older",
+        "live_repair_unresolved",
+        "live_repair_refused",
+    }
+)
+#: Classes that alone are routine (a medium observation, not a blocker).
+_DEPLOY_INFORMATIONAL_CLASSES = frozenset({"behind_upstream", "live_repair_unread_older"})
+
+
+def _deploy_repair_identity(repairs: dict) -> str:
+    """What the repair paragraph names, hashed: per report its ts, saved count,
+    dismissal and unresolved flag, then the refused and unread counts. A new
+    report inside the cooldown is another alert, never the standing one."""
+    named = {
+        "reports": [
+            [r.get("ts"), r.get("saved"), r.get("dismissed"), r.get("unresolved"),
+             r.get("restore_refused")]
+            for r in repairs.get("reports") or []
+            if isinstance(r, dict)
+        ],
+        "refused": repairs.get("refused"),
+        "unread_older": repairs.get("unread_older"),
+    }
+    return hashlib.sha256(json.dumps(named, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+def _deploy_restore_refused(r: dict) -> str:
+    """The sentence for a report whose last restore refused parts (#3492 B2b)."""
+    n = r.get("restore_refused")
+    if type(n) is not int or n <= 0:
+        return ""
+    return (
+        f" Its last restore refused {n} part(s): its output names each, and where any newer "
+        "content it found was kept; a part it can never write (a socket, a file too large to "
+        f"hash, one with no record) goes back by hand from {r['backup_dir']}/tree, then "
+        f"--dismiss {r['ts']}."
+    )
+
+
+def _deploy_repair_paragraph(repairs: dict) -> str:
+    # Each ts is the writer's dir-name format (load_report's report_ts:
+    # digits, T, Z and -), so it needs no quoting in a command.
+    parts: list[str] = []
+    shown = [
+        r
+        for r in repairs.get("reports") or []
+        if isinstance(r, dict) and not r.get("dismissed") and r.get("saved")
+    ]
+    if shown:
+        each = [
+            f"Repair {r['ts']}: {r['saved']} path(s) the update did not write were recorded "
+            f"(their files, index entries or flags are in {r['backup_dir']}). To put them back: "
+            f"scripts/deploy_candidates repair-move --restore {r['ts']} (once both the installed "
+            "repair kit and scripts/deploy_candidates include --restore; an exit 2 saying "
+            "restoring is not available yet means the installed kit is older than that); to "
+            f"keep the checkout as it is: scripts/deploy_candidates repair-move --dismiss {r['ts']}."
+            + _deploy_restore_refused(r)
+            for r in shown
+        ]
+        parts.append(
+            "A repair of a half-written `live` checkout, moving it back to its rollback "
+            "tag, saved what it found there that was not the update's (someone's edits). "
+            + " ".join(each)
+            + " Restoring puts the saved files back as uncommitted edits: tracked ones make "
+            "deploy_code_only.sh and update.sh refuse to deploy until they are committed "
+            "(on a branch, as a PR), moved out, or removed; untracked ones block "
+            "deploy_code_only.sh only under src/, config/ or pyproject.toml. Backups are "
+            "pruned 90 days after the last write to their folder."
+        )
+    refused = repairs.get("refused") or 0
+    if refused:
+        parts.append(
+            f"{refused} live-move repair report(s) under ~/.genesis/deploy-backups/ could "
+            "not be read; they are named in the server log."
+        )
+    unread = repairs.get("unread_older") or 0
+    if unread:
+        parts.append(
+            f"{unread} older live-move repair report dir(s) not read, dismissed ones included "
+            "(only the newest are read); this is informational, and they are pruned with "
+            "their backups."
+        )
+    if repairs.get("unresolved"):
+        parts.append(
+            "The last live-move repair did not finish (it was killed partway, or its "
+            "REPAIR.json under ~/.genesis/deploy-backups/ names the reason); "
+            "scripts/deploy_candidates repair-move runs it again."
+        )
+    return " ".join(parts)
 
 
 def _deploy_drift_paragraph(snap: dict, age_days, behind, git_facts: dict) -> str:
@@ -2999,9 +3149,59 @@ async def _check_cc_slot_memory(db, slots: list[dict] | None = None) -> None:
 # last severity stored, so we fire on a NEW scope or an ESCALATION (degraded→error)
 # but suppress a same-or-LOWER severity within the window — no storm, no A→B→A
 # oscillation flood, and no alert announcing a de-escalation (an improvement).
-_last_pid_alerts: dict[str | None, tuple[int, float]] = {}
+# scope -> (severity rank, monotonic time of the last alert, resolved since?).
+_last_pid_alerts: dict[str | None, tuple[int, float, bool]] = {}
+# Indirection so tests can drive the cooldown clock without patching
+# time.monotonic, which the asyncio event loop itself reads.
+_pid_clock = time.monotonic
 _PID_BUDGET_ALERT_COOLDOWN_S = 3600  # one alert per scope per hour unless it escalates
 _PID_SEVERITY_RANK = {"degraded": 1, "error": 2}
+# Resolve an open alert only once utilization is clearly back down: the alert
+# fires at 80% (the collector's degraded threshold), and resolving anywhere
+# under 80% would close and reopen it on every tick of a load hovering at the
+# line. 5 points of hysteresis.
+_PID_RESOLVE_PCT = 75.0
+
+
+async def _resolve_pid_budget_alert(db, pct: float | None) -> None:
+    """Resolve open PID-budget alerts on a healthy tick below _PID_RESOLVE_PCT.
+
+    Keeps a peak from an earlier tick from reading as a current condition (the
+    morning report shows the live figure beside it). No in-memory guard: an
+    alert written before a restart or deploy must resolve too, so the store is
+    asked. A read-only probe gates the write, so a healthy tick with nothing
+    open writes nothing. A resolve that closed rows marks every scope's cooldown
+    as resolved: a new degradation then re-alerts after a quarter of the
+    cooldown instead of the full hour, while load oscillating around the line
+    still cannot alert every other tick.
+    ``pct`` None (no finite sub-cap visible) is resolvable.
+    """
+    global _last_pid_alerts  # noqa: PLW0603
+    if db is None or (pct is not None and pct >= _PID_RESOLVE_PCT):
+        return
+    try:
+        if not await observations.has_unresolved_matching(
+            db, source="pid_budget_monitor", content_like="%"
+        ):
+            return
+        note = (
+            "PID budget healthy: no sub-cap visible"
+            if pct is None
+            else f"PID budget back below {_PID_RESOLVE_PCT:.0f}%"
+        )
+        resolved = await observations.resolve_by_source_and_type(
+            db,
+            source="pid_budget_monitor",
+            type="infrastructure_alert",
+            resolved_at=datetime.now(UTC).isoformat(),
+            resolution_notes=note,
+        )
+    except Exception:
+        logger.debug("Failed to resolve pid_budget alert observation", exc_info=True)
+        return
+    if resolved:
+        _last_pid_alerts = {s: (v[0], v[1], True) for s, v in _last_pid_alerts.items()}
+        logger.info("PID budget healthy again: resolved %d alert observation(s)", resolved)
 
 
 async def _check_pid_budget(db, budget: dict | None = None) -> None:
@@ -3012,8 +3212,9 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
     read green (the blind spot this closes). The collector walks the cgroup chain and
     reports whichever level binds (session scope / user slice / container root); this
     emits a scope-matched remedy at degraded (>=80%) -> 'high'; error (>=90%) ->
-    'critical'. Fork-free cgroup read; best-effort — never raises into the tick.
-    `budget` may be injected (tests); otherwise it reads live."""
+    'critical'. A later HEALTHY read below _PID_RESOLVE_PCT resolves any open alert
+    (see `_resolve_pid_budget_alert`). Fork-free cgroup read; best-effort — never raises
+    into the tick. `budget` may be injected (tests); otherwise it reads live."""
     global _last_pid_alerts  # noqa: PLW0603
     try:
         if budget is None:
@@ -3025,8 +3226,12 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
         return
 
     status = budget.get("status")
+    if status == "healthy":
+        # Only a definite healthy read resolves; unavailable/unknown never does.
+        await _resolve_pid_budget_alert(db, budget.get("pct"))
+        return
     if status not in ("degraded", "error"):
-        return  # healthy / no sub-cap (pids.max="max") / unavailable → nothing to alert
+        return  # unavailable / unknown → nothing to alert, nothing to resolve
     # Record WHO holds the budget on every low tick, cooldown or not: the holders
     # may be gone by the next alert, and the count alone cannot name them.
     breakdown = None
@@ -3046,16 +3251,21 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
         except Exception:
             logger.warning("pid budget breakdown could not run", exc_info=True)
     scope = budget.get("scope")
-    now = time.monotonic()
+    now = _pid_clock()
     # Per-scope cooldown with escalation bypass: fire when the scope is new, its
     # window expired, or it ESCALATED to a higher severity; suppress a same-or-lower
     # severity within the window — that covers a repeat, an A→B→A oscillation (each
     # scope cools independently), AND a de-escalation error→degraded (never alert
     # because things improved).
+    # After a resolve the scope's window shrinks to a quarter of the cooldown: a
+    # fresh episode is news, but a load swinging across the line every tick must
+    # still not alert every other tick (critical at >=90%).
     rank = _PID_SEVERITY_RANK[status]
     prev = _last_pid_alerts.get(scope)
-    if prev is not None and (now - prev[1]) < _PID_BUDGET_ALERT_COOLDOWN_S and rank <= prev[0]:
-        return
+    if prev is not None and rank <= prev[0]:
+        window = _PID_BUDGET_ALERT_COOLDOWN_S / 4 if prev[2] else _PID_BUDGET_ALERT_COOLDOWN_S
+        if (now - prev[1]) < window:
+            return
     if db is None:
         return  # can't write the observation now; retry next tick (cooldown not consumed)
     pct = budget.get("pct")
@@ -3097,7 +3307,7 @@ async def _check_pid_budget(db, budget: dict | None = None) -> None:
     # Set before the await so a failed create still cools per-tick retries for the
     # same scope+severity. Prune scopes older than the cooldown to bound the map
     # (the server's own chain is a small fixed set, but keep it tidy regardless).
-    _last_pid_alerts[scope] = (rank, now)
+    _last_pid_alerts[scope] = (rank, now, False)
     _last_pid_alerts = {
         s: v for s, v in _last_pid_alerts.items() if now - v[1] < _PID_BUDGET_ALERT_COOLDOWN_S
     }
@@ -3964,6 +4174,7 @@ class AwarenessLoop:
         self._autonomous_cli_policy_export_fn = None
         self._briefing_writer_fn = None
         self._findings_ingest_fn = None
+        self._guardian_sent_log_ingest_fn = None
         self._session_observer_fn = None
         self._stopping: bool = False
         self._tick_count: int = 0
@@ -4299,6 +4510,13 @@ class AwarenessLoop:
             # completions (recorded by the invoker) and alerts on a run. Guarded
             # on db internally; a query failure no-ops (never breaks the tick).
             await _check_cc_cap_detection(self._db)
+            # Inbox sync staleness — reads one heartbeat file the timer-run sync
+            # writes; alerts when it stops succeeding (#3183). Every tick, not
+            # the hourly block: the hourly count resets on restart, and a dead
+            # sync went unnoticed for 17 days. Silent when no vault is set.
+            from genesis.inbox.sync_health import check_inbox_sync_health
+
+            await check_inbox_sync_health(self._db)
             # Dead-provider notification sweep — clock-driven ON PURPOSE (the
             # trip-driven version starved when traffic stopped; PR #1573).
             # Guarded on db internally; lever: provider_outage_notify domain +
@@ -4461,6 +4679,16 @@ class AwarenessLoop:
                         logger.info("Ingested %d Guardian findings", count)
                 except Exception:
                     logger.error("Guardian findings ingest failed", exc_info=True)
+
+            # Record the alerts the host Guardian sent to Telegram (it posts
+            # outside the channel adapter, so nothing else stores them).
+            if self._guardian_sent_log_ingest_fn:
+                try:
+                    count = await self._guardian_sent_log_ingest_fn(self._db)
+                    if count:
+                        logger.info("Recorded %d Guardian-sent alerts", count)
+                except Exception:
+                    logger.warning("Guardian sent-log ingest failed", exc_info=True)
 
             # Sentinel fire alarm check — evaluate conditions and dispatch if needed
             if self._sentinel:
@@ -5082,6 +5310,10 @@ class AwarenessLoop:
     def set_findings_ingest(self, fn) -> None:
         """Inject Guardian findings ingest for reading diagnosis results."""
         self._findings_ingest_fn = fn
+
+    def set_guardian_sent_log_ingest(self, fn) -> None:
+        """Inject the per-tick pull of Guardian-sent alerts into telegram_messages."""
+        self._guardian_sent_log_ingest_fn = fn
 
     def set_session_observer(self, fn) -> None:
         """Inject session observer processor for tool activity notes."""

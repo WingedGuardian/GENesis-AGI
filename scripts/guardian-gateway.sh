@@ -18,6 +18,9 @@
 #   test-approval   — E2E test the keyword-reply approval gate (no recovery)
 #   disk-status     — read-only storage-pool + snapshot JSON (Genesis's window
 #                     into host capacity: lvs data%/metadata%, VG free, snapshots)
+#   sent-log --since <epoch> — read-only JSON lines of the alerts the guardian
+#                     delivered to Telegram since <epoch>, for the container to
+#                     record in its message history
 #   host-profile    — read-only host body-schema JSON (meminfo/nproc/kernel,
 #                     storage pool, incus version + container limits.*) for the
 #                     container's infra_profile host plane
@@ -972,6 +975,37 @@ PYEOF
         PYTHONPATH="$INSTALL_DIR/src" \
         GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
             timeout 30 "$VENV_PY" -m genesis.guardian --ram-status
+        ;;
+    sent-log\ --since\ *)
+        # Read-only: print the alerts the guardian delivered to Telegram since
+        # <since> (epoch seconds) as JSON lines, then a terminal ok line. The
+        # container stores them so guardian alerts appear in conversation
+        # history. No mutation, no secrets, no sudo.
+        _SINCE="${SSH_ORIGINAL_COMMAND#sent-log --since }"
+        # Strict shape BEFORE use: up to 10 integer digits, optional fraction of
+        # up to 6. No sign, no exponent, no whitespace, nothing shell-active.
+        # The digits are LISTED, not a range: a range like [0-9] follows the
+        # locale's collation and admitted a non-ASCII digit under UTF-8.
+        if ! [[ "$_SINCE" =~ ^[0123456789]{1,10}(\.[0123456789]{1,6})?$ ]]; then
+            echo '{"ok": false, "action": "sent-log", "error": "invalid since (want epoch seconds)"}' >&2
+            exit 1
+        fi
+        INSTALL_DIR="${HOME}/.local/share/genesis-guardian"
+        VENV_PY="$INSTALL_DIR/.venv/bin/python"
+        if [ ! -x "$VENV_PY" ]; then
+            echo '{"ok": false, "action": "sent-log", "error": "guardian venv not found"}' >&2
+            exit 1
+        fi
+        # Skew guard (see host-profile): an old src tree has no --sent-log
+        # branch, and the flag would fall through main()'s if-chain into
+        # run_check(), a full guardian cycle triggered by a routine poll.
+        if [ ! -f "$INSTALL_DIR/src/genesis/guardian/alert/sent_log.py" ]; then
+            echo '{"ok": false, "action": "sent-log", "error": "guardian src predates sent-log — run update to redeploy"}' >&2
+            exit 1
+        fi
+        PYTHONPATH="$INSTALL_DIR/src" \
+        GUARDIAN_CONFIG="$INSTALL_DIR/config/guardian.yaml" \
+            timeout 15 "$VENV_PY" -m genesis.guardian --sent-log "$_SINCE"
         ;;
     cc-tmp-apply)
         # Host-side cc-tmp isolation apply — attaches ~/.genesis/cc-tmp to its

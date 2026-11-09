@@ -199,18 +199,19 @@ DO NOT apply this to bootstrap.sh or host-setup.sh, which is why this hook no lo
 
 Then VERIFY it took: with the same two bus variables set, 'systemctl --user is-active genesis-deploy-manual' must print 'active' (without them a scrubbed session gets a bus error, which is not evidence the launch failed). A failed launch is otherwise indistinguishable from a good one -- with a relative path and no --working-directory, bash exits instantly and --collect reaps the unit, leaving no trace. Check promptly (it also reads 'inactive' once the deploy has FINISHED), then poll the log. genesis-server going 'inactive' mid-run is EXPECTED.
 
-This hook does not check whether you already detached, so if you did, ignore it. Rationale, measurements and incident history: the genesis-development skill's Timeout Policy."""
+This hook does not check whether you already detached, so if you did, ignore it. Rationale, measurements and incident history: the validating-merges skill ("DEPLOYS ARE THE EXCEPTION") and the build-session skill's Timeout Policy."""
 
 
 def _names_target(segment) -> bool:
     return any(_TARGET in token for token in (segment.exe, *segment.argv))
 
 
-def _shell_operand(argv: list[str]) -> tuple[str | None, bool, bool]:
+def _shell_operand(argv: list[str], *, parser=None, _tail=None) -> tuple[str | None, bool, bool]:
     """(first operand, reads stdin, syntax check only) for a shell's argv."""
     exe = os.path.basename(argv[0])
-    allowed = _PARSER._C_BUNDLE_OPTIONS[exe]
-    takes_value = _PARSER._C_VALUE_TAKING.get(exe, _PARSER._C_VALUE_TAKING_DEFAULT)
+    parser = parser if parser is not None else _PARSER
+    allowed = parser._C_BUNDLE_OPTIONS[exe]
+    takes_value = parser._C_VALUE_TAKING.get(exe, parser._C_VALUE_TAKING_DEFAULT)
     i = 1
     noexec = sticky = False
     while i < len(argv):
@@ -223,7 +224,7 @@ def _shell_operand(argv: list[str]) -> tuple[str | None, bool, bool]:
             # Fold one option bundle through the existing state machine. The
             # local walk still accepts pre-script long options such as --norc;
             # _first_operand's post--c long-option refusal is not their grammar.
-            _, _, noexec, sticky = _PARSER._first_operand(
+            _, _, noexec, sticky = parser._first_operand(
                 argv[i : i + 1 + values], 0, allowed, takes_value, noexec, sticky
             )
         if arg in _SHELL_VALUE_OPTIONS:
@@ -239,6 +240,8 @@ def _shell_operand(argv: list[str]) -> tuple[str | None, bool, bool]:
             continue
         break
     operand = argv[i] if i < len(argv) and argv[i] != "-" else None
+    if _tail is not None and operand is not None:
+        _tail.extend(argv[i + 1:])
     return operand, operand is None, noexec or sticky
 
 

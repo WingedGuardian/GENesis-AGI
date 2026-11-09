@@ -87,6 +87,10 @@ installs with no graph engine, so it is enabled everywhere; see
 the oneshot bootstrap starts after installing the browser packages: the
 Camoufox engine and Chromium they pin, and their system libraries; see
 `scripts/install_browser_stack.sh`),
+`genesis-inbox-sync.timer` (every 5 minutes, mirrors the vault set in
+`inbox_monitor.sync_remote` into the inbox and pushes responses back; exits at
+once where none is set, and the awareness loop alerts when its heartbeat goes
+stale; see `scripts/inbox_sync.sh`),
 `genesis-code-intel.timer` (idle-gated code-intel
 index-request consumer; see `scripts/code_intel_runner.sh`) with
 `genesis-code-intel-freeze.service` as its on-demand kill-switch (rendered but
@@ -176,6 +180,13 @@ Genesis to research, summarize, write content, or do non-Genesis tasks).
   weeks-to-build is a first-class factor beside cost and quality. Run
   `/evaluate` when any candidate tool surfaces; the disposition is the user's
   call, not one to preempt.
+- **Genesis heals itself; no human operator** — No failure, edge case or
+  recovery path may depend on a person logging in to the machine to do manual
+  work. The user supplies input and decisions; Genesis does the work,
+  including repairing itself (the Sentinel, Guardian, watchdog and boot-time
+  repair exist for this). A design whose fallback is "a human resolves it" is
+  unfinished: make the recovery automatic and lossless (back up, then repair,
+  then report), and ask the user only for a decision.
 - **Flexibility > lock-in** — Adapter patterns, generic interfaces, pluggable
   components. Every external dependency should be swappable.
 - **LLM-first solutions** — Code handles structure (timeouts, validation, event
@@ -562,9 +573,9 @@ gate works, its exemption categories, and the unit rules for size bounds:
 - **No unsanctioned financial transactions.** Every transaction needs
   explicit user approval, every time. Prior approval does not carry forward.
 - **Timeout policy.** Justify any timeout with a specific failure mode.
-  Default floor: 2 hours (7200s). Full policy in genesis-development skill.
+  Default floor: 2 hours (7200s). Full policy in the build-session skill.
 - **Verify outcomes, not just tests.** "If the system restarts now, will
-  this work?" Built ≠ wired ≠ verified. Details in genesis-development skill.
+  this work?" Built ≠ wired ≠ verified. Details in the build-session skill.
 - **Code review after code changes.** Codex reviews your output — but only
   AUTOMATICALLY WHEN THE PR OPENS. A later push triggers nothing: after any push you
   want reviewed, comment `@codex review`, or the PR waits forever on a review nobody
@@ -589,25 +600,41 @@ gate works, its exemption categories, and the unit rules for size bounds:
   score; under the shipped `doc_findings: skip`, documentation findings do not
   score either. `codex-at-head: ok` is not "review is clear": read the
   `inline-findings` row, not just the Codex row.
+  **A review also comes before the PR.** `gh pr create` on the public repo is refused
+  until a reviewer agent or `/code-review` of the branch has finished in this session;
+  `# pr-review-waived` records the owner's yes given in chat (build-session). Codex CLI
+  sessions and normal dispatched sessions do not run this hook.
+  A self-authored PR merges through the maintainer's admin bypass of GitHub's
+  one-approval rule, because a sole maintainer cannot approve their own pull
+  request (`.github/rulesets/README.md`; closing-session skill, "Honest
+  enforcement model"). GitHub's rule evaluation therefore records every such merge as a
+  bypass, with the approval and update rules failed: that is the designed route,
+  not a skipped review. The required status checks have no bypass and bind the
+  admin too. Never infer whether a past merge was ready from that bypass record,
+  or from a merge-gate run that finished after the merge.
   **Below the floor, how much a change can afford depends on its LANE** — a
   consequence class computed from the diff, not chosen by the author. Two P2s
   block a `critical` change (enforcement hooks, `.github/**`, api/migration
   paths); ordinary code takes four; prose-and-tests-only takes six — config is
-  NOT prose, so a `.yaml`/`.toml` change is ordinary. The gate prints the
+  NOT prose, so a `.yaml`/`.toml` change is ordinary, except a short list of
+  files that steer a check or arm an action, which is critical. The gate prints the
   lane and its threshold whenever a non-zero score passes under one, so "it did
-  not block" never has to be guessed at. Table and rationale: genesis-development
+  not block" never has to be guessed at. Table and rationale: closing-session
   skill, Pre-Merge Gate.
   A PR whose diff touches the
   enforcement-hook surface additionally runs the **gate-fix lane** — wider round 1, and
-  a hard stop at 2 rounds that is doctrine you keep, not a gate that stops you. Both
-  protocols: genesis-development skill.
+  a 2-round limit: after round 2, fix commits and one marked confirmation request
+  proceed; any further review request, and any fix commit once the confirmation is
+  spent, needs the owner's approval at the action (refused in a dispatched session).
+  The round-2 merge-or-abandon call is doctrine you keep. Gate-fix protocol:
+  `.claude/skills/genesis-development/references/gate-fix-lane.md`.
 - **Commit continuously**: uncommitted = invisible = lost.
 - **Bias toward closing open work before opening new — softly (≈51/49).** Not a
   gate: parallel work and multiple in-flight PRs are fine, and you needn't finish
   everything before starting the next thing. Just lean, gently, toward landing or
   closing open PRs over opening more — so work doesn't pile up and go stale on the
   repo instead of getting done. (Merge-DRIVING specifically — when to actively
-  chase one PR to merged — is scoped by the genesis-development skill's "When to
+  chase one PR to merged — is scoped by the closing-session skill's "When to
   DRIVE a Merge" rule; this lean governs closing-shaped work, not watching.)
 - **Procedure recall is automatic** — the proactive hook surfaces relevant
   procedures. Store new procedures immediately when you discover them.
@@ -632,7 +659,7 @@ gate works, its exemption categories, and the unit rules for size bounds:
   NOT what decides which worktree a script acts on — the PROCESS CWD is, for
   anything that resolves its target from the directory it runs in (e.g.
   `review_state.py` `evidence-path`/`mark`). Run those from the worktree they
-  are about. Detail in the genesis-development skill.
+  are about. Detail in the build-session skill.
 - **AskUserQuestion — always pass ≥2 questions.** Never call `AskUserQuestion`
   with a single question — a Claude Code rendering bug rejects single-question
   calls. Always pass ≥2 questions; if only one is real, add a trivial/filler
@@ -653,8 +680,8 @@ gate works, its exemption categories, and the unit rules for size bounds:
   decisions. If something goes sideways — STOP and re-plan. A plan-mode
   document under `~/.claude/plans/` that will outlive one session opens with
   the structured header (status, `pinned.main`, `binds`/`prevents`, and the
-  trackers it executes) — format and rationale in the genesis-development
-  skill, `references/plan-docs.md`. Task-executor plans (`/task`,
+  trackers it executes) — format and rationale in the spec-session
+  skill and `.claude/skills/genesis-development/references/plan-docs.md`. Task-executor plans (`/task`,
   `TASK_INTAKE.md`) keep their own section contract and are out of scope.
   **A plan that
   proposes new source files carries an `## Adopt / Adapt / Build` verdict** —
@@ -685,7 +712,7 @@ gate works, its exemption categories, and the unit rules for size bounds:
   (or leaves it open, naming what is uncovered); Devin never closes one, so the
   closing session does that for a Devin rework. Detail:
   `.claude/docs/premise-check.md` ("Handing a verdict to a builder") and
-  genesis-development ("Building a rework").
+  build-session ("Building a rework").
 - **Use subagents** to keep main context clean. One concern per subagent.
   **A MANDATED subagent is already the request** — when a gate's block message
   tells you to dispatch one, dispatch it; don't stop to ask. Ask only for
@@ -792,44 +819,32 @@ gate works, its exemption categories, and the unit rules for size bounds:
   does the routing question below become the whole answer. Naming the OWNER of a
   piece of work is a classification, and a classification is not a decision.
 
-  Route by OWNER:
-  **Genesis-repo work** (code, tests, docs, infra — anything that would live in the
-  public repo, even when hit locally) → a **GitHub issue**, so anyone can pick it up.
-  **User-owned work** (a deliverable, an errand, anything asked for and unfinished),
-  and operational state purely local to this box → a local **follow-up** via
-  `follow_up_create`, never plain text. **Consciously not doing** (nitpick, someday, a
-  far-off direction) → **tabled** (`work_state="deferred_cold"`) — a private record,
-  never dispatched, surfaced, or filed as an issue, because we don't want it picked
-  up. `work_state` DERIVES the lane, so priority never picks it. ONE record per item.
-  A public post is IRREVERSIBLE and PUBLIC — so the gate on the issue route is WHAT
-  GOES IN IT, not permission to file. **Scan every issue for personal or identifying
-  detail** — names, hosts, IPs, paths embedding a username, anything about the user's
-  real-world life — and strip it; an issue carries technical detail only. Borderline,
-  either way? Ask. Filing itself needs no per-instance approval: a bug you found while
-  reviewing a PR, that does not block that PR, is the ordinary case — file it and keep
-  the PR moving (discriminator + bounds: genesis-development, "Keep the PR the PR").
-  One limit stays absolute, and it turns on **who gains**: a security defect —
-  one whose disclosure hands someone a capability they do not already have — is
-  NEVER filed publicly before it is fixed, no matter who owns it. Credential
-  exposure, an auth or privilege bypass, anything reachable by a party with LESS
-  access than it grants.
-  **A fail-open in a local development guard is USUALLY not that** — apply the
-  test, never the label, because the bare word "bypass" is what misroutes it.
-  Those hooks run only where an install wires them, and whoever can trigger one
-  already has commit access to that checkout. For a guard on the REVIEW chain
-  the worst case is typically an under-reviewed change reaching a PR that still
-  waits on maintainer approval — the state of any PR authored without them; a
-  guard protecting something else (local data, backups, repo routing) has its
-  own worst case — name it, never inherit this one. **The exception that the
-  test catches and the label does not:** a guard whose job is to stop a SECRET
-  or PRIVATE DATA reaching a public surface is security-class however local it
-  is — a branch on a public repo is public the moment it is pushed, merged or
-  not, and this repo's own leak incident was install IPs and personal emails,
-  not keys. So name the
-  adversary and what they gain before withholding; if the answer is "us, and
-  nothing we already lacked", file it. And verify the CHAIN rather than the
-  wording — a deny message naming "secrets" describes what the FLAG does to
-  git's hook chain, not which of this install's controls stand in that path.
+  **Actionable work is PUBLIC BY DEFAULT**, including install-local compatibility,
+  operations, security-related code and compliance/guard gaps. Route by the harm
+  of publishing the useful task, not by its owner or subsystem label. File a GitHub
+  issue whenever a useful description can be written safely. Filing needs no
+  per-instance approval within the session's authorized scope.
+
+  **Scrub the title, body and comments before publishing:** personal identifiers,
+  private configuration, user-specific sensitive or reputationally damaging details
+  and unnecessarily personal wording stay out. A public task with private supporting
+  evidence is a valid receipt. Sensitive evidence alone does not make the task private.
+
+  Keep the WHOLE item private only when a useful public description necessarily
+  reveals protected information or enables concrete exploitation, cost or harm.
+  An active public-internet-exploitable hole is a clear example; merely calling
+  something a security flaw, leak guard or compliance gap is insufficient. State the
+  specific harm and why redaction or a public task with private evidence cannot
+  avoid it. If it cannot be decided from the evidence, ask that concrete question.
+  A genuinely private task goes through `follow_up_create`; plain text or a run log
+  is not a task receipt. Nonactionable ideas consciously not pursued may be tabled
+  (`work_state="deferred_cold"`), but this is no exemption for unfinished real work.
+
+  Persist the measurement, route each actionable concern, verify its task readback,
+  then claim it handled. Reuse a matching issue rather than duplicating it. If a
+  writer is unavailable, preserve evidence and name routing as pending; do not
+  silently activate a new capability. Missing private tools do not block safe public
+  filing. Honor user pauses immediately and leave a checkpoint of what remains.
   Everything else — who may file, the command,
   labels, dispatched sessions, the time-gated case — is in
   `.claude/docs/mcp-tools-guide.md` ("Where Deferred Work Goes"). Read it before
@@ -875,6 +890,12 @@ gate works, its exemption categories, and the unit rules for size bounds:
 - **Bugs you see get fixed or tracked — never ignored.** Fix now by default; a
   deferred bug follows the routing above — a Genesis-repo bug becomes an ISSUE, a
   someday/not-pursuing one becomes `tabled` — never a silent drop.
+- **Found a Genesis bug or defect? Track it on the repo's issue tracker — in
+  addition to fixing it, never instead.** Foreground: offer to file it (a
+  courtesy, not an approval gate). Background/dispatched: never post; record it
+  per your profile and state it in your returned output so the foreground files
+  it (`.claude/docs/mcp-tools-guide.md`, "Dispatched / background sessions").
+  The privacy scrub and security-defect limit in "Where deferred work goes" apply.
 - **Data repair is not a fix.** If a mechanism failed to write or propagate
   something, hand-writing the missing artifact (memory, directive, row, flag)
   repairs ONE instance on ONE install. Label it "data repair", and fix the
@@ -894,7 +915,8 @@ gate works, its exemption categories, and the unit rules for size bounds:
   the broader class yourself instead of spiking only the named cases —
   "just a couple of examples" is always implied.
 - Dev-specific rules (commit prefixes, targeted tests, push/PR workflow,
-  capability registration) are in the genesis-development skill.
+  capability registration) are in the build-session skill and
+  `.claude/skills/genesis-development/references/commit-path.md`.
 
 ## Advisory Output Standards (all channels)
 

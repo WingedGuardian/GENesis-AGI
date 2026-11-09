@@ -3,9 +3,8 @@
 The engine (issue #1641) is a derived, rebuildable index over ``memory_links``;
 SQLite stays the system of record. This collector reports whether the SERVER
 side is provisioned and running. It deliberately does NOT connect to the engine
-or issue a query: the client is not a dependency at this stage, and a
-collector that needed one would fail on every install that has not adopted the
-engine yet.
+or issue a query: a collector that needed a live engine would fail on every
+install where the engine is not running, and that is most of them.
 
 ``collect_systemd`` already enumerates ``genesis-*`` units, so the unit's
 enablement and state are covered there — that is exactly why the unit is named
@@ -13,6 +12,12 @@ enablement and state are covered there — that is exactly why the unit is named
 artifact on disk, the socket the unit is supposed to create, and whether those
 agree with the unit's state. A unit that is active while its socket is missing
 is the one combination that means something is actually wrong.
+
+The engine ships as the ``falkordblite`` wheel, and provisioning copies its
+files out of the venv into a version-scoped directory under
+``~/.genesis/deps/falkordb`` that the unit runs from. So the module is found
+there, by looking at the filesystem only: no import, no network, no engine
+connection, nothing executed.
 """
 
 from __future__ import annotations
@@ -46,19 +51,24 @@ def _paths() -> tuple[Path, Path, Path]:
 
 
 def _installed_versions(deps_root: Path) -> list[str]:
-    """Version dirs that actually contain a module, newest-sorting last.
+    """Engine dirs that actually contain a module, newest-sorting last.
 
-    A directory without ``falkordb.so`` is an interrupted or refused install
-    (a checksum mismatch cleans up after itself, but a killed download between
-    mkdir and fetch would leave the dir), so presence of the FILE is what
-    counts as installed — not presence of the directory.
+    Two layouts count: ``<version>-<wheel tag>/redislite/bin/falkordb.so``, the
+    copy provisioning makes of the wheel's files, and the legacy
+    ``<version>/falkordb.so``. A directory without the module FILE is not an
+    install, and a dotted name is a copy still being built or being retired
+    (``.<name>.tmp-<pid>``, ``.<name>.stale-<pid>``), never one a unit runs.
     """
     if not deps_root.is_dir():
         return []
     found = []
     try:
         for child in deps_root.iterdir():
-            if child.is_dir() and (child / "falkordb.so").is_file():
+            if child.name.startswith(".") or not child.is_dir():
+                continue
+            if (child / "falkordb.so").is_file() or (
+                child / "redislite" / "bin" / "falkordb.so"
+            ).is_file():
                 found.append(child.name)
     except OSError:
         return []
@@ -124,7 +134,7 @@ async def _unit_states() -> tuple[str | None, str | None]:
         # failed. A box with no user manager has nothing to reach, will not
         # grow one on the next refresh, and answering "no unit state" for it
         # is a fact. Erroring the section instead would be permanent, and
-        # would discard four facts we DID read off the filesystem
+        # would discard the facts we DID read off the filesystem
         # (unit_present, module_installed, module_versions, socket_path)
         # because one sub-probe of the same section was unanswerable.
         if not user_manager_present():

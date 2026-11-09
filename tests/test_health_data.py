@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from genesis.observability.health_data import HealthDataService
+from genesis.resilience.deferred_work import DeferredWorkQueue
+from genesis.routing.dead_letter import DeadLetterQueue
 from genesis.routing.types import (
     CallSiteConfig,
     ProviderConfig,
@@ -14,6 +16,10 @@ from genesis.routing.types import (
     RetryPolicy,
     RoutingConfig,
 )
+
+# The health snapshot's deploy section would run the real deploy engine
+# (see the deploy_engine_unanswered fixture in tests/conftest.py).
+pytestmark = pytest.mark.usefixtures("deploy_engine_unanswered")
 
 
 def _make_provider(name: str, *, free: bool = True) -> ProviderConfig:
@@ -131,10 +137,13 @@ class TestGracefulDegradation:
 class TestQueues:
     @pytest.mark.asyncio
     async def test_queue_depths_from_subsystems(self):
-        deferred = AsyncMock()
-        deferred.count_pending = AsyncMock(return_value=5)
-        dead_letter = AsyncMock()
+        deferred = AsyncMock(spec_set=DeferredWorkQueue)
+        deferred.count_pending_split.return_value = {
+            "total": 5, "recovery": 5, "worklist": 0, "stalled": 0,
+        }
+        dead_letter = AsyncMock(spec_set=DeadLetterQueue)
         dead_letter.get_pending_count = AsyncMock(return_value=2)
+        dead_letter.get_stuck_count.return_value = 0
 
         svc = HealthDataService(deferred_queue=deferred, dead_letter=dead_letter)
         snap = await svc.snapshot()

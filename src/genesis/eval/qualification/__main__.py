@@ -125,12 +125,10 @@ async def run(args):
     if reports[args.alias]["admission"] != reports[against]["admission"]:
         raise Incomplete("paired_admission_changed")
     financial = execution.cost_report({alias: view.state for alias, view in views.items()})
-    return {
-        "status": "incomplete" if financial["unresolved_attempts"] else
-        qualification.worst((r["status"] for r in reports.values()), qualification.OVERALL),
-        "models": reports, "paired": qualification.pair(cases, *(records[a] for a in aliases)),
-        "financial": financial,
-    }
+    from .sampling import comparison
+
+    return comparison(cases, reports, records,
+                      {a: v.state for a, v in views.items()}, financial)
 
 
 def main(argv=None):

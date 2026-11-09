@@ -44,7 +44,9 @@ from genesis.memory.graph_telemetry import (
     exception_reason,
     note_traversal,
     publish_selection,
+    read_retry,
     read_selection,
+    reset_retry,
     reset_selection,
 )
 from genesis.memory.graphstore import (
@@ -253,11 +255,13 @@ async def traverse(
     start = time.monotonic()
 
     reset_selection()
+    reset_retry()
     active = _traversal_store()
     configured, selection_error = read_selection()
     track = _TraversalTrack(served_by=getattr(active, "name", "?"))
     outcome: str | None = None
     final_reason: str | None = None
+    primary_ms: float | None = None
 
     async def _record_break(kind: str) -> None:
         # The engine has failed: record that NOW, before awaiting a fallback that
@@ -272,9 +276,22 @@ async def traverse(
             served_by="pending",
             primary_reason=selection_error or track.primary_reason,
             final_reason=None,
+            diag=track.primary_diag,
         )
 
     track.on_break = _record_break
+
+    async def _record_retry(reason: str) -> None:
+        # The store is retrying a connection the engine dropped (#3035): the
+        # clock-breaking row is written NOW, before the retry is awaited, so a
+        # process killed mid-retry cannot lose it. One traversal, one row: a
+        # fallback after a failed retry finds the row already written.
+        if track.recorded:
+            return
+        track.primary_reason = reason
+        await _record_break("retried")
+
+    reset_retry(_record_retry)
     try:
         if selection_error:
             await _record_break("selection_failed")
@@ -292,6 +309,13 @@ async def traverse(
             outcome = "selection_failed"
         elif track.fell_back:
             outcome = "fallback"
+        elif (retried_after := read_retry()) is not None:
+            # The engine had already dropped a connection when the caller gave
+            # up (during the retry, or during the marker query after it). That
+            # drop is the event the clock exists to see; a cancellation must not
+            # turn it into a neutral row.
+            outcome = "retried"
+            track.primary_reason = retried_after
         else:
             outcome = "cancelled"
         track.served_by = "none"
@@ -306,10 +330,20 @@ async def traverse(
             outcome = "fallback"
         elif track.declined:
             outcome = "mode_unsupported"
+        elif (retried_after := read_retry()) is not None:
+            # The selected store answered, but only by retrying a connection the
+            # engine had dropped (#3035). Clock-breaking by design: a successful
+            # retry must never let a restarting engine read as a clean one.
+            outcome = "retried"
+            track.primary_reason = retried_after
         else:
             outcome = "primary"
+            primary_ms = result.query_ms
         return result
     finally:
+        # The retry hook closes over THIS traversal's track and db: clear it so
+        # a later store read in the same task cannot write through it.
+        reset_retry()
         # Only a classified outcome is recorded: anything else escaping
         # (interpreter shutdown) must not trigger a database write. A traversal
         # whose break was already recorded has its row.
@@ -321,6 +355,8 @@ async def traverse(
                 served_by=track.served_by,
                 primary_reason=selection_error or track.primary_reason,
                 final_reason=final_reason,
+                diag=track.primary_diag,
+                elapsed_ms=primary_ms,
             )
 
 
@@ -332,6 +368,9 @@ class _TraversalTrack:
     declined: bool = False
     fell_back: bool = False
     primary_reason: str | None = None
+    #: The selected store's own account of its failure (``GraphUnavailableError.diag``,
+    #: set by ``graphstore_falkor`` on a timeout), carried to the telemetry event.
+    primary_diag: dict | None = None
     #: Called once when the selected store fails, before any fallback runs.
     on_break: Callable[[str], Awaitable[None]] | None = None
     #: The break was recorded as it happened; nothing more to write.
@@ -388,6 +427,8 @@ async def _traverse_tiers(
     except GraphUnavailableError as exc:
         track.fell_back = True
         track.primary_reason = exception_reason(exc)
+        diag = getattr(exc, "diag", None)
+        track.primary_diag = diag if isinstance(diag, dict) else None
         if track.on_break is not None and not track.recorded:
             await track.on_break("fallback")
         # Traversal is an ENRICHMENT path — its readers already treat a thin
@@ -551,7 +592,7 @@ async def _traverse_cte(
         f"""
         WITH RECURSIVE connected(target_id, link_type, depth, strength, path) AS (
             SELECT target_id, link_type, 1, strength,
-                   source_id || ',' || target_id
+                   ',' || hex(source_id) || ',' || hex(target_id) || ','
             FROM memory_links
             WHERE source_id = ?
               AND target_id <> source_id
@@ -588,12 +629,14 @@ async def _traverse_cte(
                                 AND {_HIDDEN_CTE})
             UNION ALL
             SELECT ml.target_id, ml.link_type, c.depth + 1, ml.strength,
-                   c.path || ',' || ml.target_id
+                   c.path || hex(ml.target_id) || ','
             FROM memory_links ml
             JOIN connected c ON ml.source_id = c.target_id
             WHERE c.depth < ?
               AND ml.strength >= ?
-              AND c.path NOT LIKE '%' || ml.target_id || '%'
+              -- Hex tokens cannot contain commas: compare exact TEXT IDs,
+              -- including empty/NUL IDs, without substring or LIKE semantics.
+              AND instr(c.path, ',' || hex(ml.target_id) || ',') = 0
               -- Only the TARGET is gated in the recursive step, unchanged: a
               -- row's source is some earlier row's target and was already
               -- checked there, so the anchor is the only place a source needs

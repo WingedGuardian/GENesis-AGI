@@ -1,6 +1,6 @@
-# Codex is an external Genesis MCP client. This initial surface is deliberately
-# read-oriented; expand it only after a separately reviewed capability decision.
-# The launcher strips Genesis/Claude session identity before starting a server.
+# Codex is an external client: Genesis retains its health/recall floor, while
+# GitNexus provides the separately approved code-intelligence tools below.
+# The Genesis launcher strips inherited Genesis/Claude session identity.
 
 # Local CLI shell guard only. No Genesis session registration or approval receipt.
 # The outer fallback denies if the repository or the launcher cannot be found.
@@ -52,6 +52,33 @@ enabled_tools = [
 # here is that this list is auditable by inspection. Restoring machine-facts
 # visibility means splitting the tool into a read-only view plus a separate
 # refresh, not re-adding this line.
+default_tools_approval_mode = "approve"
+
+# Shared pinned launcher; no install-specific paths or npm downloads at startup.
+# GitNexus is snapshot-based. Availability does not imply a fresh index or
+# authorization to rename code or rebuild shared repository/group metadata.
+[mcp_servers.gitnexus]
+command = "bash"
+args = [".claude/mcp/run-gitnexus", "mcp"]
+cwd = "."
+startup_timeout_sec = 30
+enabled_tools = [
+  "api_impact",
+  "check",
+  "context",
+  "cypher",
+  "detect_changes",
+  "explain",
+  "group_list",
+  "impact",
+  "list_repos",
+  "pdg_query",
+  "query",
+  "route_map",
+  "shape_check",
+  "tool_map",
+  "trace",
+]
 default_tools_approval_mode = "approve"
 
 [mcp_servers.genesis-memory]

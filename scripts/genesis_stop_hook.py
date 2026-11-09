@@ -303,7 +303,7 @@ _FINISHING_PATTERNS = re.compile(
     # `complete[sd]?\b` and not a bare `complete`: without the boundary,
     # "implementation COMPLETELY" matches. MEASURED — 2 of the 6 wrong fires in
     # the corpus below were that exact bleed, both of them quotations of the
-    # genesis-development rule "Read the reference implementation COMPLETELY
+    # build-session rule "Read the reference implementation COMPLETELY
     # before deriving from it". `complete[sd]?` keeps "completed"/"completes",
     # which are real finishing claims; a bare `complete\b` would have lost them.
     r"|implementation\s+complete[sd]?\b"
@@ -317,7 +317,7 @@ _FINISHING_PATTERNS = re.compile(
 )
 
 # This repo's own review protocol closes every review with
-# `Ready to merge: Yes | No | With fixes` (genesis-development skill, "Close
+# `Ready to merge: Yes | No | With fixes` (closing-session skill, "Close
 # every review with a verdict"). When the assistant QUOTES a reviewer's verdict,
 # the two negative values are a report that the work is NOT finished — the exact
 # inverse of what `_FINISHING_PATTERNS` is looking for.

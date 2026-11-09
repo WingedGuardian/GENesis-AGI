@@ -35,6 +35,10 @@ async def create_all_tables(db: aiosqlite.Connection) -> None:
     # Schema migrations BEFORE indexes — migrations add columns that indexes may reference
     await _migrate_add_columns(db)
 
+    from genesis.db.peer_status import install_base
+
+    await install_base(db)
+
     # INVARIANT: every column an entry below references must already exist here —
     # i.e. it is in a canonical CREATE TABLE above OR added by
     # _migrate_add_columns. A legacy DB only has the numbered-migration runner
@@ -2217,6 +2221,16 @@ async def _migrate_add_columns(db: aiosqlite.Connection) -> None:
         "ALTER TABLE tool_call_outcomes ADD COLUMN tool_use_id TEXT",
         "tool_call_outcomes.tool_use_id",
     )
+
+    # How a session ENDED (crud.cc_sessions.update_status). Mirrored in
+    # migration 20261104144136 for the standalone runner; here so an existing DB
+    # gets them on the base create_all_tables path (schema_both_build_paths).
+    for _col in ("outcome", "outcome_reason", "outcome_paged_at"):
+        await _try_alter(
+            db,
+            f"ALTER TABLE cc_sessions ADD COLUMN {_col} TEXT",
+            f"cc_sessions.{_col}",
+        )
 
 
 async def _migrate_cognitive_state_check(db: aiosqlite.Connection) -> None:

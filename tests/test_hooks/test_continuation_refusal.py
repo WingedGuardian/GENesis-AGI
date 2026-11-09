@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -68,6 +69,15 @@ def _env(home: Path) -> dict[str, str]:
     env["HOME"] = str(home)
     env["GENESIS_HOME"] = str(home / ".genesis")
     return env
+
+
+def _nested_dynamic(program: str, tail: str) -> str:
+    payload = f"""echo "$(echo 'a"b')" ; {program} {tail}"""
+    return "bash -c " + shlex.quote(payload)
+
+
+def _nested_script(script: str) -> str:
+    return "bash -c " + shlex.quote(script)
 
 
 def _repo(tmp: Path) -> Path:
@@ -130,8 +140,7 @@ _GATED = [
 
 
 def _variants(one_line: str) -> dict[str, str]:
-    """Every place a continuation can sit: between words, and inside each of the
-    first two words (the program and the verb)."""
+    """Continuation placements and an unreadable nested-script carrier."""
     words = one_line.split(" ")
     out = {"between-first-words": one_line.replace(" ", CONT, 1)}
     out["before-last-word"] = " ".join(words[:-1]) + CONT + words[-1]
@@ -140,6 +149,7 @@ def _variants(one_line: str) -> dict[str, str]:
     if len(words) > 1 and len(words[1]) > 1:
         second = words[1]
         out["inside-verb"] = " ".join([first, second[:1] + MID + second[1:], *words[2:]])
+    out["nested-structural"] = _nested_script("echo ok # don't\n" + one_line)
     return out
 
 
@@ -390,6 +400,57 @@ def test_a_continued_command_with_a_variable_verb_is_refused(sandbox, command):
     assert res.returncode == 2, (res.stdout + res.stderr)[:400]
 
 
+@pytest.mark.parametrize(
+    ("guard", "program", "tail"),
+    [
+        (_PUSH_GUARD, GIT, "$ACTION origin feature-x"),
+        (_COMMIT_GATE, GIT, "$ACTION origin feature-x"),
+        (_DISCARD, GIT, "$ACTION origin feature-x"),
+        (_PUSH_GUARD, "gh", "pr $GH_ACTION --title x --body y"),
+    ],
+    ids=["push-git", "commit-git", "discard-git", "push-gh"],
+)
+def test_nested_dynamic_operation_is_refused_by_real_hooks(sandbox, guard, program, tail):
+    home, repo = sandbox
+    result = _run(guard, _nested_dynamic(program, tail), home, repo)
+    assert _refused(result), (result.stdout + result.stderr)[:400]
+
+
+@pytest.mark.parametrize(
+    ("guard", "command"),
+    [
+        (_COMMIT_GATE, "git --exec-path=/tmp status"),
+        (_DISCARD, "git --exec-path=/tmp status $ARG"),
+    ],
+    ids=["commit", "discard"],
+)
+def test_unclassified_global_option_refusal_gives_actionable_remedy(sandbox, guard, command):
+    home, repo = sandbox
+    result = _run(guard, command, home, repo)
+    message = result.stdout + result.stderr
+    assert _refused(result), message[:400]
+    assert "may run a git operation" in message
+    assert "unclassified Git global option" in message
+    assert "omit it or configure it another way" in message
+
+
+def test_visible_publish_prefix_does_not_make_hidden_tail_refusal_vacuous(sandbox):
+    home, repo = sandbox
+    prefix = "git push origin feature-x"
+    visible = _run(_PUSH_GUARD, prefix, home, repo)
+    assert not _refused(visible), (visible.stdout + visible.stderr)[:400]
+    hidden = prefix + "; " + _nested_script("echo ok # don't\ngit $ACTION origin feature-x")
+    result = _run(_PUSH_GUARD, hidden, home, repo)
+    assert _refused(result), (result.stdout + result.stderr)[:400]
+
+
+def test_built_escape_winner_still_refuses_real_push_hook(sandbox):
+    home, repo = sandbox
+    command = "echo $'\\x41'; " + _nested_script("echo ok # don't\ngit $ACTION origin feature-x")
+    result = _run(_PUSH_GUARD, command, home, repo)
+    assert _refused(result), (result.stdout + result.stderr)[:400]
+
+
 def test_a_continued_read_only_api_call_with_a_variable_is_not_refused(sandbox):
     """The control for the cell above: an expansion in an ARGUMENT is ordinary work
     (a repository slug in a path). MEASURED, a rule keyed on 'git/gh plus any `$`'
@@ -470,12 +531,19 @@ def test_the_close_advisory_notes_a_close_after_a_backslash_comment(sandbox):
     assert "could not check whether it closes" in res.stdout, res.stdout
 
 
-def test_a_continued_close_gets_the_short_note_and_no_step_count(sandbox):
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr close 5" + CONT + "--comment superseded",
+        _nested_script("echo ok # don't\ngh pr close 5"),
+    ],
+)
+def test_an_unreadable_close_gets_the_short_note_and_no_step_count(sandbox, command):
     """No count is claimed for a command the parse could not read."""
     home, repo = sandbox
     res = _run(
         _HOOKS_DIR / "pr_close_advisory.py",
-        "gh pr close 5" + CONT + "--comment superseded",
+        command,
         home,
         repo,
     )
