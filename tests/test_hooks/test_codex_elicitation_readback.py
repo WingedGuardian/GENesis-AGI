@@ -61,7 +61,7 @@ def golden(root, case):
     evidence = {"schema": "codex-elicitation/v1", "case": case, "fixture_consent": True,
                 "production_ready": False, "thread": "thread", "turns": [f"turn-{i}" for i in range(count)],
                 "started": started, "events": [{"id": 2, "result": started}], "sent": [],
-                "observed": [], "observations": [], "server": [], "driver_pid": 10,
+                "observed": [], "observations": [], "server": [], "completions": [], "driver_pid": 10,
                 "driver_before": {"pid": 10, "start": 10, "ppid": 9, "pgid": 10, "sid": 10, "state": "S"},
                 "owned": [{"before": {"pid": 20, "start": 20, "ppid": 10, "state": "S"},
                            "after": {"state": "absent"}, "ancestry": [20, 10]}],
@@ -97,6 +97,12 @@ def golden(root, case):
         evidence["sent"].append({"at": tick(), "message": {"id": 100, "method": "config/read", "params": {}}})
         evidence["events"].append({"id": 100, "result": {}})
         snapshot("after-negative-barrier")
+
+    def completed(turn, status):
+        message = {"method": "turn/completed", "params": {
+            "threadId": "thread", "turn": {"id": turn, "status": status}}}
+        evidence["completions"].append({"at": tick(), "message": copy.deepcopy(message)})
+        evidence["events"].append(message)
 
     # Literal oracle policy; never derive expected replies/outcomes from readback.
     replies = {
@@ -146,7 +152,9 @@ def golden(root, case):
                 snapshot("pending-ask")
             if case == "approval_eof":
                 evidence["eof_live"] = {"at": tick(), "driver": copy.deepcopy(evidence["driver_before"]),
-                    "writers": [copy.deepcopy(evidence["owned"][0]["before"])]}
+                    "writers": [copy.deepcopy(evidence["owned"][0]["before"])],
+                    "ancestries": [[copy.deepcopy(evidence["owned"][0]["before"]),
+                                    copy.deepcopy(evidence["driver_before"])]]}
                 snapshot("before-native-eof")
                 evidence["eof_input_at"] = tick()
                 evidence["eof_exit"] = {"code": 0, "before_forced_cleanup": True}
@@ -157,6 +165,7 @@ def golden(root, case):
                 evidence["sent"].append({"at": tick(), "message": {"id": 400 + index, "method": "turn/interrupt",
                     "params": {"threadId": "thread", "turnId": turn}}})
                 server("cancelled")
+                completed(turn, "interrupted")
                 snapshot("after-interrupt")
             elif no_ask:
                 server("response", response={"action": "accept", "content": {}} if case == "data_form_empty"
@@ -179,9 +188,8 @@ def golden(root, case):
                     server("appended", sink=f"{name}-sink.jsonl")
                 else:
                     server("refused")
-        if case != "approval_eof":
-            evidence["events"].append({"method": "turn/completed", "params": {"threadId": "thread", "turn": {
-                "id": turn, "status": "interrupted" if interrupted else "completed"}}})
+        if case != "approval_eof" and not interrupted:
+            completed(turn, "completed")
         if case == "approval_duplicate_reply":
             snapshot("before-duplicate")
             inject(200)
@@ -374,9 +382,10 @@ def test_negative_and_data_controls_cannot_be_promoted_to_authority(tmp_path, ca
     evidence, sinks = golden(tmp_path, case)
     if damage == "accepted":
         if case == "approval_interrupt":
+            upper = next(row["at"] for row in evidence["observations"] if row["label"] == "after-interrupt")
             evidence["server"][-1:] = [
                 {**evidence["server"][-1], "event": "response", "response": {"action": "accept", "content": {"confirmed": True}}},
-                {**evidence["server"][-1], "event": "refused", "at": 180},
+                {**evidence["server"][-1], "event": "refused", "at": upper - 1},
             ]
         else:
             evidence["server"][2]["response"]["action"] = "accept"
@@ -561,6 +570,7 @@ def test_matching_completion_cannot_precede_its_own_ask(tmp_path, case, index):
     if case == "approval_eof":
         terminal = {"method": "turn/completed", "params": {"threadId": "thread", "turn": {
             "id": turn, "status": "interrupted"}}}
+        evidence["completions"].append({"at": evidence["eof_input_at"] + 1, "message": copy.deepcopy(terminal)})
     else:
         terminal = next(row for row in evidence["events"] if row.get("method") == "turn/completed"
                         and row["params"]["turn"]["id"] == turn)
@@ -578,9 +588,11 @@ def test_eof_has_at_most_one_optional_interrupted_completion(tmp_path):
     terminal = {"method": "turn/completed", "params": {"threadId": "thread", "turn": {
         "id": "turn-0", "status": "interrupted"}}}
     evidence["events"].insert(-1, copy.deepcopy(terminal))
+    evidence["completions"].append({"at": evidence["eof_input_at"] + 1, "message": copy.deepcopy(terminal)})
     persist(tmp_path, evidence, sinks)
     check_case("approval_eof", tmp_path, evidence)
     evidence["events"].insert(-1, copy.deepcopy(terminal))
+    evidence["completions"].append({"at": evidence["eof_input_at"] + 2, "message": copy.deepcopy(terminal)})
     persist(tmp_path, evidence, sinks)
     with pytest.raises(ValueError):
         check_case("approval_eof", tmp_path, evidence)
@@ -614,4 +626,129 @@ def test_duplicate_replay_requires_the_first_effect_already_observed(tmp_path):
         snapshot["approval"] = raw if snapshot["at"] > barrier + 2 else None
     persist(tmp_path, evidence, sinks)
     with pytest.raises(ValueError):
+        check_case(case, tmp_path, evidence)
+
+
+@pytest.mark.parametrize("case", CASES)
+@pytest.mark.parametrize("phase", ["before_input", "after_observation"])
+def test_completion_receipt_is_bound_to_its_tested_input_and_observation(tmp_path, case, phase):
+    evidence, sinks = golden(tmp_path, case)
+    if case == "approval_eof":
+        message = {"method": "turn/completed", "params": {
+            "threadId": "thread", "turn": {"id": "turn-0", "status": "interrupted"}}}
+        evidence["events"].insert(-1, copy.deepcopy(message))
+        evidence["completions"].append({"at": evidence["eof_input_at"] + 1, "message": message})
+        persist(tmp_path, evidence, sinks)
+    check_case(case, tmp_path, evidence)
+    for index, receipt in enumerate(evidence["completions"]):
+        original = receipt["at"]
+        status = receipt["message"]["params"]["turn"]["status"]
+        if case == "approval_eof":
+            lower = evidence["eof_input_at"]
+            upper = next(row["at"] for row in evidence["observations"] if row["label"] == "after-close")
+        elif status == "interrupted":
+            lower = next(row["at"] for row in evidence["sent"] if row["message"].get("method") == "turn/interrupt")
+            upper = next(row["at"] for row in evidence["observations"] if row["label"] == "after-interrupt")
+        else:
+            replies = [row for row in evidence["sent"] if row.get("synthetic_frontend")]
+            lower = replies[-1 if case == "approval_stale_after_interrupt" else index]["at"] if replies else evidence["server"][0]["at"]
+            upper = next(row["at"] for row in evidence["observations"] if row["label"] == "before-close")
+        receipt["at"] = lower - 1 if phase == "before_input" else upper + 1
+        persist(tmp_path, evidence, sinks)
+        with pytest.raises(ValueError, match="completion receipt"):
+            check_case(case, tmp_path, evidence)
+        receipt["at"] = original
+
+
+@pytest.mark.parametrize("damage", ["missing", "extra", "message", "order", "clock_bool", "clock_zero", "clock_text"])
+def test_completion_receipts_exactly_match_the_raw_terminal_population(tmp_path, damage):
+    evidence, sinks = golden(tmp_path, "approval_two_requests")
+    check_case("approval_two_requests", tmp_path, evidence)
+    receipts = evidence["completions"]
+    if damage == "missing":
+        receipts.pop()
+    elif damage == "extra":
+        receipts.append(copy.deepcopy(receipts[-1]))
+    elif damage == "message":
+        receipts[0]["message"]["params"]["threadId"] = "foreign"
+    elif damage == "order":
+        receipts.reverse()
+    else:
+        receipts[0]["at"] = {"clock_bool": True, "clock_zero": 0, "clock_text": "123"}[damage]
+    persist(tmp_path, evidence, sinks)
+    with pytest.raises(ValueError):
+        check_case("approval_two_requests", tmp_path, evidence)
+
+
+@pytest.mark.parametrize("case", ["approval_two_requests", "approval_stale_after_interrupt", "approval_duplicate_reply"])
+def test_first_completion_receipt_precedes_next_request_or_duplicate_baseline(tmp_path, case):
+    evidence, sinks = golden(tmp_path, case)
+    check_case(case, tmp_path, evidence)
+    upper = (next(row["at"] for row in evidence["observations"] if row["label"] == "before-duplicate")
+             if case == "approval_duplicate_reply" else evidence["observed"][1]["at"])
+    evidence["completions"][0]["at"] = upper + 1
+    persist(tmp_path, evidence, sinks)
+    with pytest.raises(ValueError, match="completion receipt"):
+        check_case(case, tmp_path, evidence)
+
+
+@pytest.mark.parametrize("damage", ["detached", "missing", "first", "root", "edge", "cycle", "reused", "unknown", None])
+def test_fresh_eof_ancestry_checks_edges_and_known_identities_allowing_reparenting(tmp_path, damage):
+    evidence, sinks = golden(tmp_path, "approval_eof")
+    check_case("approval_eof", tmp_path, evidence)
+    intermediate = {"pid": 30, "start": 30, "ppid": 10, "state": "S"}
+    owned = {"before": copy.deepcopy(intermediate), "after": {"state": "absent"}, "ancestry": [30, 10]}
+    evidence["owned"].append(copy.deepcopy(owned))
+    evidence["eof_natural"].append(copy.deepcopy(owned))
+    live = evidence["eof_live"]
+    # Original writer parent remains10; only fresh parent changes to a known30.
+    live["writers"][0]["ppid"] = 30
+    live["ancestries"] = [[copy.deepcopy(live["writers"][0]), copy.deepcopy(intermediate), copy.deepcopy(live["driver"])]]
+    path = live["ancestries"][0]
+    persist(tmp_path, evidence, sinks)
+    check_case("approval_eof", tmp_path, evidence)
+    if damage == "detached":
+        live["writers"][0]["ppid"] = path[0]["ppid"] = 99
+    elif damage == "missing":
+        live.pop("ancestries")
+    elif damage == "first":
+        path[0]["start"] += 1
+    elif damage == "root":
+        path[-1]["start"] += 1
+    elif damage == "edge":
+        path[1]["ppid"] = 99
+    elif damage == "cycle":
+        path.insert(1, copy.deepcopy(path[0]))
+    elif damage == "reused":
+        path[1]["start"] += 1
+    elif damage == "unknown":
+        path[0]["ppid"] = live["writers"][0]["ppid"] = path[1]["pid"] = 99
+    persist(tmp_path, evidence, sinks)
+    if damage:
+        with pytest.raises(ValueError):
+            check_case("approval_eof", tmp_path, evidence)
+    else:
+        check_case("approval_eof", tmp_path, evidence)
+
+
+@pytest.mark.parametrize("case", ["approval_interrupt", "approval_stale_after_interrupt", "approval_eof"])
+@pytest.mark.parametrize("tail", ["refused", "cancelled"])
+@pytest.mark.parametrize("action", ["accept", "decline", "cancel"])
+def test_retired_response_action_is_checked_inside_a_valid_input_window(tmp_path, case, tail, action):
+    evidence, sinks = golden(tmp_path, case)
+    check_case(case, tmp_path, evidence)
+    lower = (evidence["eof_input_at"] if case == "approval_eof" else
+             next(row["at"] for row in evidence["sent"] if row["message"].get("method") == "turn/interrupt"))
+    entry = evidence["server"][0]
+    group = [row for row in evidence["server"] if row["nonce"] == entry["nonce"]]
+    later = [row for row in evidence["server"] if row["nonce"] != entry["nonce"]]
+    evidence["server"] = group[:2] + [
+        {**entry, "event": "response", "at": lower + 1, "response": {"action": action}},
+        {**entry, "event": tail, "at": lower + 2},
+    ] + later
+    persist(tmp_path, evidence, sinks)
+    if action == "accept":
+        with pytest.raises(ValueError, match="interrupted request received an acceptance"):
+            check_case(case, tmp_path, evidence)
+    else:
         check_case(case, tmp_path, evidence)

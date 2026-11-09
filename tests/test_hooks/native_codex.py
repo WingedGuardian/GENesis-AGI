@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import queue
@@ -21,6 +22,7 @@ class AppServer:
 
     def __init__(self, binary: str, root: Path, env: dict[str, str]):
         self.events: list[dict] = []
+        self.completions: list[dict] = []
         self.pending: queue.Queue = queue.Queue()
         self.stderr = (root / "app-stderr.txt").open("a")
         self.process = subprocess.Popen(  # noqa: S603
@@ -34,7 +36,10 @@ class AppServer:
     def _read(self):
         for line in self.process.stdout:
             try:
-                self.pending.put(json.loads(line))
+                message = json.loads(line)
+                if isinstance(message, dict) and message.get("method") == "turn/completed":
+                    self.completions.append({"at": time.monotonic_ns(), "message": copy.deepcopy(message)})
+                self.pending.put(message)
             except json.JSONDecodeError:
                 self.pending.put({"invalid_json": line})
         self.pending.put({"closed": True})

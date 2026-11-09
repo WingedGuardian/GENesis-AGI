@@ -125,6 +125,7 @@ def check_natural_eof(evidence, entered):
         and row["state"] in {"R", "S", "D", "T", "t", "K", "W", "P", "I"}
         for row, entry in zip(writers, entered, strict=True)),
         "active MCP writer was not live immediately before EOF")
+    check_eof_ancestry(evidence)
     natural = evidence["eof_natural"]
     require(same([{k: v for k, v in row.items() if k != "after"} for row in natural],
                  [{k: v for k, v in row.items() if k != "after"} for row in evidence["owned"]]),
@@ -135,6 +136,19 @@ def check_natural_eof(evidence, entered):
             < instant(labels["before-native-eof"]) < instant(evidence["eof_input_at"])
             < instant(labels["native-eof-retired"]) < instant(labels["before-close"]),
             "natural EOF proof was not captured before fallback cleanup")
+
+
+def check_eof_ancestry(evidence):
+    live = evidence["eof_live"]
+    paths = live["ancestries"]
+    known = {(row["before"]["pid"], row["before"]["start"]) for row in evidence["owned"]}
+    require(len(paths) == len(live["writers"]), "missing fresh EOF ancestry")
+    for writer, path in zip(live["writers"], paths, strict=True):
+        require(len(path) >= 2 and same(path[0], writer) and same(path[-1], live["driver"])
+                and len({row["pid"] for row in path}) == len(path)
+                and all(child["ppid"] == parent["pid"] for child, parent in zip(path, path[1:], strict=False))
+                and all((row["pid"], row["start"]) in known for row in path[:-1]),
+                "fresh EOF ancestry was detached or substituted")
 
 
 def check_schema(params, case):
@@ -194,6 +208,38 @@ def check_completions(case, evidence):
                          and row["params"]["turnId"] == event["params"]["turn"]["id"]]
         require(len(ask_positions) == 1 and ask_positions[0] < position,
                 "native completion preceded its own request")
+    check_completion_receipts(case, evidence)
+
+
+def check_completion_receipts(case, evidence):
+    terminal = [event for event in evidence["events"] if event.get("method") == "turn/completed"]
+    receipts = evidence["completions"]
+    require(same([row["message"] for row in receipts], terminal), "completion receipt population drift")
+    times = [instant(row["at"]) for row in receipts]
+    require(all(a < b for a, b in zip(times, times[1:], strict=False)), "unordered completion receipts")
+    labels = {}
+    for row in evidence["observations"]:
+        labels.setdefault(row["label"], []).append(instant(row["at"]))
+    replies = [row for row in evidence["sent"] if row.get("synthetic_frontend") is True]
+    normal = dict(zip(reply_slots(case), replies, strict=True))
+    interrupted = [i for i, status in enumerate(turn_statuses(case)) if status == "interrupted"]
+    for receipt, at in zip(receipts, times, strict=True):
+        index = evidence["turns"].index(receipt["message"]["params"]["turn"]["id"])
+        if case == "approval_eof":
+            lower, upper = instant(evidence["eof_input_at"]), labels["after-close"][0]
+        elif index in interrupted:
+            lower = next(row["at"] for row in evidence["sent"] if row["message"].get("method") == "turn/interrupt"
+                         and row["message"]["params"]["turnId"] == evidence["turns"][index])
+            upper = labels["after-interrupt"][interrupted.index(index)]
+        else:
+            lower = (normal[index]["at"] if index in normal else
+                     next(row["at"] for row in evidence["server"] if row["event"] == "entered"))
+            upper = labels["before-close"][0]
+        if index + 1 < len(evidence["turns"]):
+            upper = min(upper, evidence["observed"][index + 1]["at"])
+        if case == "approval_duplicate_reply":
+            upper = min(upper, labels["before-duplicate"][0])
+        require(instant(lower) < at < instant(upper), "completion receipt outside tested input/observation window")
 
 
 def check_native_run(case, evidence):

@@ -127,17 +127,30 @@ controls, not proof of every possible internal interleaving.
 Every server invocation must finish before fallback cleanup. The duplicate-reply
 control must observe the first physical append and its server record before replay.
 The raw stream must place each ask before its matching completion; an EOF turn
-has at most one optional interrupted completion. Exact completion-consumption
-time relative to the sent reply is not measured by these receipts.
+has at most one optional interrupted completion. The reader thread records a
+separate deep copy and monotonic receipt time before queueing each completion.
+Readback requires exact correspondence with raw completions. An interrupted
+receipt must follow its matching interrupt input and precede the post-interrupt
+observation. Normal receipts follow their own frontend reply (the no-ask controls
+use their server entry) and precede cleanup, the next ask, or the duplicate-reply
+baseline as applicable. Optional EOF receipts follow EOF input and may arrive
+during the stdout drain, before the after-close observation. These measure when
+the Python reader observed a completion, not backend emission time or universal
+causality across buffered processes.
 
 An interruption must start from a matching pending invocation and retain a
 nonempty terminal server sequence after its exact input and before the
 post-interrupt observation. EOF additionally rechecks the root and active writer
-live immediately before closing stdin, observes natural root exit0, and freezes
+live immediately before closing stdin, retains their ancestry from that same
+census, observes natural root exit0, and freezes
 retirement of the exact known child population before fallback cleanup. An empty
 EOF server tail is allowed only with that process proof; any retained terminal
 must follow EOF input. Final cleanup observations cannot replace natural EOF
-retirement. Scope is the already-observed owned descendants.
+retirement. Fresh ancestry must connect each writer to the live root through
+known PID/start identities and consistent parent edges; valid reparenting within
+that known tree is allowed. Scope is the already-observed owned descendants,
+not a complete monitor of escaped processes or authentication against someone
+deliberately rewriting mutually consistent artifacts and the verifier.
 
 Readback rejects malformed and RPC-error frames across the complete retained
 stream, including shutdown drains. Positive server invocations require the exact request/response/append sequence,

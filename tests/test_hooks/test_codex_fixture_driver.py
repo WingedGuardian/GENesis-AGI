@@ -20,6 +20,29 @@ def driver_with(*events):
     return driver
 
 
+def test_reader_records_completion_before_queueing_without_aliasing(monkeypatch):
+    from tests.test_hooks import native_codex as native
+
+    terminal = {"method": "turn/completed", "params": {"threadId": "thread", "turn": {"id": "turn"}}}
+    driver = driver_with()
+    driver.completions = []
+    driver.process.stdout = io.StringIO(json.dumps(terminal) + "\n")
+    original_put = driver.pending.put
+
+    def put(message):
+        if message.get("method") == "turn/completed":
+            assert driver.completions == [{"at": 123, "message": terminal}]
+        original_put(message)
+
+    monkeypatch.setattr(native.time, "monotonic_ns", lambda: 123)
+    monkeypatch.setattr(driver.pending, "put", put)
+    driver._read()
+    assert driver.events == []
+    message = driver.until(lambda row: row.get("method") == "turn/completed")
+    message["params"]["turn"]["id"] = "changed"
+    assert driver.completions[0]["message"] == terminal
+
+
 def test_unexpected_request_still_refuses():
     driver = driver_with({"method": "unexpected", "id": 4})
     with pytest.raises(AssertionError, match="Unanswered server request"):
@@ -156,15 +179,17 @@ def test_resume_measurement_detects_repeated_action(tmp_path, monkeypatch, repla
 
 def test_concurrent_provider_actions_bind_to_their_own_append_index(monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
-    from threading import Event, Lock
+    from threading import Event, Lock, get_ident
     from urllib.request import Request, urlopen
 
     from tests.test_hooks import native_codex as native
 
     first_appended, second_contended = Event(), Event()
+    locks = []
 
     class ControlledRequests(list):
         def append(self, body):
+            assert locks[0].owner == get_ident(), "append outside request lock"
             super().append(body)
             if body["probe"] == 1:
                 first_appended.set()
@@ -172,16 +197,24 @@ def test_concurrent_provider_actions_bind_to_their_own_append_index(monkeypatch)
             elif body["probe"] == 2:
                 second_contended.set()
 
+        def __len__(self):
+            assert locks[0].owner == get_ident(), "index read outside request lock"
+            return super().__len__()
+
     class ObservedLock:
         def __init__(self):
             self.lock = Lock()
+            self.owner = None
+            locks.append(self)
 
         def __enter__(self):
             if first_appended.is_set():
                 second_contended.set()
             self.lock.acquire()
+            self.owner = get_ident()
 
         def __exit__(self, *args):
+            self.owner = None
             self.lock.release()
 
     class CapturedServer(native.ThreadingHTTPServer):
@@ -244,6 +277,7 @@ def test_eof_input_capture_rechecks_live_pending_owned_writer(tmp_path, monkeypa
     else:
         native.capture_eof_live(driver, tmp_path, evidence, "thread", "turn-0")
         assert evidence["eof_live"]["writers"] == [population[20]]
+        assert evidence["eof_live"]["ancestries"] == [[population[20], population[10]]]
         assert evidence["eof_live"]["at"] < driver.observations[0]["at"] < evidence["eof_input_at"]
         assert driver.observations[0]["label"] == "before-native-eof"
 

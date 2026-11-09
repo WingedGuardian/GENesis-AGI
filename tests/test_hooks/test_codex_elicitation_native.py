@@ -135,7 +135,11 @@ def capture_eof_live(driver, root, evidence, thread, turn):
     assert parent["start"] == evidence["driver_before"]["start"] and parent["state"] != "Z"
     assert writer["start"] == entry["process"]["start"] and writer["state"] != "Z"
     assert writer["pid"] in descendants(population, parent["pid"])
-    evidence["eof_live"] = {"at": time.monotonic_ns(), "driver": parent, "writers": [writer]}
+    ancestry = [writer]
+    while ancestry[-1]["pid"] != parent["pid"]:
+        ancestry.append(population[ancestry[-1]["ppid"]])
+    evidence["eof_live"] = {"at": time.monotonic_ns(), "driver": parent, "writers": [writer],
+                            "ancestries": [ancestry]}
     driver.snapshot("before-native-eof")
     evidence["eof_input_at"] = time.monotonic_ns()
 
@@ -180,7 +184,8 @@ def test_native_elicitation(tmp_path, pinned, case):
                 evidence["trust"] = trust_fixture_hook(pinned["app"], tmp_path, env)
                 driver = ElicitationDriver(AppServer(pinned["app"], tmp_path, env), tmp_path)
                 evidence.update(events=driver.events, sent=driver.sent, observations=driver.observations,
-                                observed=driver.observed, driver_pid=driver.transport.process.pid)
+                                observed=driver.observed, completions=driver.transport.completions,
+                                driver_pid=driver.transport.process.pid)
                 driver.initialize()
                 started = driver.start_thread(tmp_path / "workspace")
                 evidence["started"] = started

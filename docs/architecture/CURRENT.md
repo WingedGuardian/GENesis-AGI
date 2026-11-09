@@ -5274,8 +5274,9 @@ verified: 81bbdb0a9 2026-11-08
   Initial native results were15passed/2failed; corrected expectations and client
   declarations require a fresh complete run before qualification.
   The elicitation reader checks all retained frames and binds interruption
-  terminals to their inputs. Foreign/stale controls finish on a current decline;
-  EOF requires fresh root/writer liveness and frozen known-child retirement
+  server terminals and reader-thread completion receipts to their inputs.
+  Foreign/stale controls finish on a current decline; EOF requires fresh
+  root/writer liveness, same-census ancestry and frozen known-child retirement
   before fallback cleanup. Independent golden replies and atomic provider
   indexing pin these witnesses; final contained verification remains required.
   Interactive native qualification records a Codex0.166.0 reference binary.
