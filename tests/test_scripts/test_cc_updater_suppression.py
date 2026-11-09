@@ -560,6 +560,158 @@ class TestSetIfAbsentDefaults:
         assert set(env) == {"DISABLE_AUTOUPDATER", "DISABLE_UPDATES"}, env
 
 
+class TestRetentionPolicy:
+    """Opt-in client policy uses the existing atomic writer, not a seeder."""
+
+    _POLICY = (
+        "'retention:cleanupPeriodDays=180' "
+        "'top:attribution={\"commit\":\"\",\"pr\":\"\",\"sessionUrl\":false}'"
+    )
+
+    def _call(self, tmp_path, *, override=None, check=False, path_dir=None):
+        import shlex
+
+        prefix = "" if override is None else (
+            "export GENESIS_CC_RETENTION_DAYS=" + shlex.quote(override) + "; "
+        )
+        return _run(
+            tmp_path,
+            prefix + 'rc=0; cc_ensure_updater_suppressed "" '
+            + self._POLICY + (" --check-only" if check else "")
+            + ' || rc=$?; echo "RC=$rc STATE=$CC_SUPPRESSION_STATE"; '
+            'echo "WRITTEN=$CC_SUPPRESSION_WRITTEN"; '
+            'echo "CREATED=$CC_SUPPRESSION_CREATED"',
+            path_dir=path_dir,
+        )
+
+    def _seed(self, tmp_path, **values):
+        settings = _settings(tmp_path)
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text(json.dumps({
+            "env": {"DISABLE_AUTOUPDATER": "1", "DISABLE_UPDATES": "1"},
+            "attribution": {"commit": "custom"}, **values,
+        }))
+        return settings
+
+    @pytest.mark.parametrize("current", [None, 30, 0, -1, True, False, "365", 180.0])
+    def test_repairs_invalid_or_low_retention(self, tmp_path, current):
+        settings = self._seed(tmp_path, cleanupPeriodDays=current)
+        result = self._call(tmp_path)
+        assert "RC=0 STATE=repaired" in result.stdout, result.stderr
+        data = json.loads(settings.read_text())
+        assert type(data["cleanupPeriodDays"]) is int
+        assert data["cleanupPeriodDays"] == 180
+        assert data["attribution"] == {"commit": "custom"}
+        assert "WRITTEN=cleanupPeriodDays" in result.stdout
+
+    @pytest.mark.parametrize("current", [180, 365])
+    def test_preserves_valid_retention_without_rewriting(self, tmp_path, current):
+        settings = self._seed(tmp_path, cleanupPeriodDays=current)
+        before = settings.stat()
+        result = self._call(tmp_path)
+        assert "RC=0 STATE=ok" in result.stdout, result.stderr
+        assert settings.stat().st_ino == before.st_ino
+        assert json.loads(settings.read_text())["cleanupPeriodDays"] == current
+
+    @pytest.mark.parametrize("override", ["1", "30", "365", "0180"])
+    def test_positive_override_is_exact(self, tmp_path, override):
+        settings = self._seed(tmp_path, cleanupPeriodDays=True)
+        result = self._call(tmp_path, override=override)
+        assert "RC=0 STATE=repaired" in result.stdout, result.stderr
+        actual = json.loads(settings.read_text())["cleanupPeriodDays"]
+        assert type(actual) is int and actual == int(override)
+
+    @pytest.mark.parametrize("override", ["", "0", "-1", "true", "1.5", " 7", "NaN"])
+    def test_invalid_override_warns_and_uses_floor(self, tmp_path, override):
+        settings = self._seed(tmp_path, cleanupPeriodDays=30)
+        result = self._call(tmp_path, override=override)
+        assert "RC=0 STATE=repaired" in result.stdout, result.stderr
+        assert "GENESIS_CC_RETENTION_DAYS" in result.stderr
+        assert json.loads(settings.read_text())["cleanupPeriodDays"] == 180
+
+    def test_absent_file_gets_client_policy(self, tmp_path):
+        result = self._call(tmp_path)
+        assert "RC=0 STATE=repaired" in result.stdout, result.stderr
+        data = json.loads(_settings(tmp_path).read_text())
+        assert data["cleanupPeriodDays"] == 180
+        assert data["attribution"] == {"commit": "", "pr": "", "sessionUrl": False}
+
+    @pytest.mark.parametrize("current, expected", [(30, 1), (365, 0)])
+    def test_read_only_policy_check_never_repairs(self, tmp_path, current, expected):
+        settings = self._seed(tmp_path, cleanupPeriodDays=current)
+        before = settings.read_bytes(), settings.stat().st_ino
+        result = self._call(tmp_path, check=True)
+        assert f"RC={expected}" in result.stdout, result.stderr
+        assert (settings.read_bytes(), settings.stat().st_ino) == before
+        assert "WRITTEN=\n" in result.stdout
+
+    def test_read_only_check_does_not_create_missing_settings(self, tmp_path):
+        result = self._call(tmp_path, check=True)
+        assert "RC=1 STATE=unverified" in result.stdout, result.stderr
+        assert not _settings(tmp_path).parent.exists()
+
+    def test_missing_python_cannot_claim_typed_policy(self, tmp_path):
+        bindir = _minimal_bin(tmp_path)
+        (bindir / "python3").unlink()
+        for name in ("mktemp", "mv", "grep"):
+            (bindir / name).symlink_to(shutil.which(name))
+        result = self._call(tmp_path, path_dir=bindir)
+        assert "RC=1 STATE=unverified" in result.stdout, result.stderr
+        assert "WRITTEN=DISABLE_AUTOUPDATER DISABLE_UPDATES" in result.stdout
+        assert "CREATED=1" in result.stdout
+        data = json.loads(_settings(tmp_path).read_text())
+        assert data["env"]["DISABLE_AUTOUPDATER"] == "1"
+        assert "cleanupPeriodDays" not in data
+
+    def test_exact_override_can_reduce_a_higher_existing_value(self, tmp_path):
+        settings = self._seed(tmp_path, cleanupPeriodDays=365)
+        result = self._call(tmp_path, override="30")
+        assert "RC=0 STATE=repaired" in result.stdout, result.stderr
+        assert json.loads(settings.read_text())["cleanupPeriodDays"] == 30
+
+    def test_missing_python_preserves_existing_file(self, tmp_path):
+        settings = self._seed(tmp_path, cleanupPeriodDays=30)
+        before = settings.read_bytes(), settings.stat().st_ino
+        bindir = _minimal_bin(tmp_path)
+        (bindir / "python3").unlink()
+        result = self._call(tmp_path, path_dir=bindir)
+        assert "RC=1" in result.stdout
+        assert "CREATED=0" in result.stdout
+        assert (settings.read_bytes(), settings.stat().st_ino) == before
+
+    def test_retention_uses_existing_symlink_metadata_contract(self, tmp_path):
+        settings = self._seed(tmp_path, cleanupPeriodDays=30)
+        target = settings.with_name("owned-target.json")
+        settings.rename(target)
+        settings.symlink_to(target.name)
+        target.chmod(0o640)
+        before = target.stat()
+        result = self._call(tmp_path)
+        assert "RC=0 STATE=repaired" in result.stdout, result.stderr
+        assert settings.is_symlink()
+        assert json.loads(target.read_text())["cleanupPeriodDays"] == 180
+        after = target.stat()
+        assert (after.st_uid, after.st_gid, stat.S_IMODE(after.st_mode)) == (
+            before.st_uid, before.st_gid, 0o640,
+        )
+
+    def test_retention_clobber_is_not_a_verified_repair(self, tmp_path):
+        result = TestTopLevelDefaults()._run_with_clobber(
+            tmp_path, "d['cleanupPeriodDays'] = 30", "retention:cleanupPeriodDays=180"
+        )
+        assert "STATE=contended" in result.stdout, result.stderr
+
+    def test_retention_readback_covers_policy_not_changed_by_this_write(self, tmp_path):
+        settings = self._seed(tmp_path, cleanupPeriodDays=365)
+        data = json.loads(settings.read_text())
+        data["env"]["DISABLE_UPDATES"] = "0"
+        settings.write_text(json.dumps(data))
+        result = TestTopLevelDefaults()._run_with_clobber(
+            tmp_path, "d['cleanupPeriodDays'] = 30", "retention:cleanupPeriodDays=180"
+        )
+        assert "STATE=contended" in result.stdout, result.stderr
+
+
 class TestTopLevelDefaults:
     """``top:KEY=<json>`` is a set-if-absent default for a TOP-LEVEL settings key
     (a sibling of ``env``), with a JSON-typed value — CC's own settings such as

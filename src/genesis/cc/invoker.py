@@ -21,12 +21,13 @@ from dataclasses import replace
 from functools import wraps
 from pathlib import Path
 
-from genesis.cc import final_status, roster
+from genesis.cc import final_status, oom, roster
 from genesis.cc.checkout_lock import CheckoutAdmission, admit_launch
 from genesis.cc.child_env import pin_dispatched_env
 from genesis.cc.exceptions import (
     CCError,
     CCMCPError,
+    CCMemoryPressureError,
     CCNetworkOfflineError,
     CCOverloadedError,
     CCProcessError,
@@ -3194,8 +3195,13 @@ class CCInvoker:
 
         proc = None
         reg_key: str | None = None
+        evidence = None
         try:
             launch = await self._launch_args(invocation, args, env)
+            # Managed when a scope prefix wraps the CLI (always, for a peer).
+            baseline = await asyncio.to_thread(
+                oom.capture_baseline, managed=len(launch) > len(args)
+            )
             create = spawn_owned if invocation.confirm_cleanup else asyncio.create_subprocess_exec
             proc = await create(
                 *launch,
@@ -3227,6 +3233,7 @@ class CCInvoker:
                 proc.communicate(input=invocation.prompt.encode()),
                 timeout=invocation.timeout_s,
             )
+            evidence = await asyncio.to_thread(oom.capture_finish, baseline, proc.returncode)
         except ProcessCleanupUncertain as exc:
             if exc.process is not None:
                 self._register_proc(f"pid:{exc.process.pid}", exc.process, confirm_cleanup=True)
@@ -3302,7 +3309,9 @@ class CCInvoker:
                 stderr_text[:500] or "(no stderr)",
                 stdout_text[:500] or "(no stdout)",
             )
-            err = self._classify_error(stderr_text, stdout_text)
+            err = oom.attribute_error(evidence, self._classify_error(stderr_text, stdout_text))
+            if isinstance(err, CCMemoryPressureError):
+                raise err
             await self._notify_status_change(err)
             raise err
 
@@ -3454,6 +3463,10 @@ class CCInvoker:
 
         try:
             launch = await self._launch_args(invocation, args, env)
+            # Managed when a scope prefix wraps the CLI (always, for a peer).
+            baseline = await asyncio.to_thread(
+                oom.capture_baseline, managed=len(launch) > len(args)
+            )
             create = spawn_owned if invocation.confirm_cleanup else asyncio.create_subprocess_exec
             proc = await create(
                 *launch,
@@ -3522,6 +3535,7 @@ class CCInvoker:
         rate_limit_raw: dict | None = None
         timed_out = False
         terminated_after_result = False
+        evidence = None
         line_count = 0
         oversized_dropped = 0
         # Buffer overruns, which is NOT the same number. A physical line much
@@ -3732,6 +3746,11 @@ class CCInvoker:
 
                     if on_event:
                         await on_event(event)
+            if not terminated_after_result:
+                # EOF can precede the child watcher's returncode update. Wait
+                # passively, then freeze evidence BEFORE confirmed/survivor cleanup.
+                await reap_bounded(proc)
+                evidence = await asyncio.to_thread(oom.capture_finish, baseline, proc.returncode)
         except TimeoutError:
             timed_out = True
             logger.error(
@@ -3840,6 +3859,14 @@ class CCInvoker:
             )
         if event_types:
             logger.info("CC stream events: %s", " → ".join(event_types))
+
+        if evidence is not None and evidence.correlated:
+            cause = (
+                CCRateLimitError("CC rate limited (stream event)", raw_event=rate_limit_raw)
+                if rate_limit_rejected(rate_limit_raw)
+                else self._classify_error(stderr_str, "".join(collected_text))
+            )
+            raise oom.attribute_error(evidence, cause)
 
         if timed_out:
             partial = "".join(collected_text)

@@ -9,6 +9,7 @@ from html import escape
 
 from genesis.cc import fallback_recovery, fallback_state, peer_availability, roster
 from genesis.cc.exceptions import (
+    CCMemoryPressureError,
     CCProcessError,
     CCQuotaExhaustedError,
     CCRateLimitError,
@@ -129,7 +130,10 @@ def _refusal(error):
         seen.add(id(error))
         chain.append(error)
         error = error.__cause__ or (None if error.__suppress_context__ else error.__context__)
-    if any(peer_availability._mentions_mcp(exc) for exc in chain):
+    if any(
+        isinstance(exc, CCMemoryPressureError) or peer_availability._mentions_mcp(exc)
+        for exc in chain
+    ):
         return None
     return next((exc for exc in chain if peer_availability.is_provider_refusal(exc)), None)
 
