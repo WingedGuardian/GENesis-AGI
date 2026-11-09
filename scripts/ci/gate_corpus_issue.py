@@ -17,6 +17,7 @@ the job goes red rather than losing the finding.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -26,6 +27,8 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 TITLE = "Gate defect corpus: the weekly run found a test owed"
+#: Applied at creation: premise-gate never runs on an issue this workflow opens.
+LABEL = "premises-missing"
 _MARKER = "<!-- gate-corpus-findings:"
 #: The public can open an issue with this title or post this marker, so only what the
 #: workflow's own token wrote counts. `gh` names that account differently by endpoint.
@@ -76,6 +79,23 @@ def _already_said(repo: str, number: int, body: str, gh: Runner) -> bool:
     return newest.rpartition(_MARKER)[2] == body.rpartition(_MARKER)[2]
 
 
+_LABEL_ARGS = [
+    "--color",
+    "D93F0B",
+    "--description",
+    "Premise answers missing; see .claude/docs/premise-check.md",
+]
+
+
+def _ensure_label(repo: str, gh: Runner) -> None:
+    """Create LABEL where it does not exist yet (a fork, a fresh clone), as
+    premise_gate.apply does. gh refuses when it already exists, the usual case,
+    so that refusal is ignored: a label that really is missing makes the create
+    that follows fail, and that failure turns the job red."""
+    with contextlib.suppress(subprocess.SubprocessError):
+        gh(["label", "create", LABEL, "--repo", repo, *_LABEL_ARGS])
+
+
 def file_findings(path: Path, repo: str, run_url: str, gh: Runner = _gh) -> str:
     doc = json.loads(path.read_text(encoding="utf-8"))
     if doc.get("complete") is not True:
@@ -88,7 +108,10 @@ def file_findings(path: Path, repo: str, run_url: str, gh: Runner = _gh) -> str:
     body = _body(findings, run_url)
     issue = _open_issue(repo, gh)
     if issue is None:
-        gh(["issue", "create", "--repo", repo, "--title", TITLE, "--body", body])
+        # The label comes with the create: an issues event this workflow's token
+        # causes starts no other workflow run, so premise-gate never sees it.
+        _ensure_label(repo, gh)
+        gh(["issue", "create", "--repo", repo, "--title", TITLE, "--body", body, "--label", LABEL])
         return "opened an issue"
     number = issue["number"]
     if _already_said(repo, number, body, gh):

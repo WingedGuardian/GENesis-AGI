@@ -1420,7 +1420,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: 1b79527b5c7 2026-11-08
+verified: a6528dab2 2026-11-09
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -1451,7 +1451,10 @@ verified: 1b79527b5c7 2026-11-08
   detect → create → dispatch;
   `approval_key_stable=True` (ONE
   site-level approval key). Resume consumes an approved grant before releasing
-  its awaiting row. A lookup/retirement failure preserves that row and defers
+  its awaiting row. Resume state transitions require the row to retain its
+  original `processing` status and exact awaiting-approval marker; a concurrent
+  claim, completion, supersession or new approval marker wins over the stale
+  transition. A lookup/retirement failure preserves that row and defers
   all new/modified/retry site work for the scan, while healthy approved siblings
   can resume after successful consumption. The refresh path folds parked files into the
   batch so approvals fire once (#914). A pending approval is HELD until the
@@ -1849,6 +1852,14 @@ the shared banner is not an assertion about all concurrent sessions.
   checks. Private runtime transport is not launch authority. The physical
   owner, monitor and recovery caller remain separate, and automatic readiness
   stays fenced.
+  The private CBM reporter consumes its bounded startup ACK before worker entry,
+  verifies its actual live parent and original scope, and rechecks ownership at
+  registration and native intent. Original counter baselines and fresh startup
+  OOM observations survive the handoff; either hierarchical or local sampled
+  kills refuse startup. The existing private output carries framed control
+  data, with provider output routed to logging. Watchdog/CPU/IO policy binds
+  the same source identity. Physical owner integration, GitNexus's runtime
+  adapter and native qualification remain separate gates.
   `index_marker_recovery.py` adds explicit transaction-only schema-5 storage,
   original-owner control completion, persistent provider holds and an exact
   terminal/control/source acceptance-watermark reader on the same queue.
@@ -2759,8 +2770,10 @@ verified: c712f1bde 2026-11-06
   idle past a threshold, so a ready-but-forgotten PR is re-raised instead of
   rotting. Sibling of the PR-watch surface above (external PR *changes*); this
   one is age-based and passive. `session_awareness/repo_pulse*.py`.
-- **Post-merge verification obligations** (shipped; producer automatic, consumer
-  manual-invoke only — nothing dispatches a validator yet — issue #1718):
+- **Post-merge verification obligations** (shipped; producer automatic; consumer
+  the standing validator session, owner-started and self-paced per the
+  validating-merges skill's "Standing mode", or any manual validator; nothing
+  dispatches one automatically — issue #1718):
   the pulse worker's verification lane opens one `pr_verifications` row per
   MERGED PR, so "run the E2E after merge" survives the merge instead of living
   in someone's memory. A documentation-only diff is auto-closed with the reason
@@ -4016,6 +4029,10 @@ drift; validated requests use `caller_context()`. Legacy reads remain raw and
 per-call. This does not requalify the remaining platform/data subsystems or
 activate shared MCP.
 
+A 2026-11-07 verification at the same commit covers the request-ownership
+prerequisite below; the other platform descriptions retain their individually
+cited verification dates.
+
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
 provider/model/outcome. Failed historical attempts render as a warning, not an
 inferred current provider outage. The readiness worker uses the shared
@@ -4213,6 +4230,15 @@ Refusing a proposed update preserves a previously valid opt-in.
   foreground-only construction allocates neither. Background admission is
   separate from foreground capacity; recall queue pressure falls back inline
   while shutdown refuses new resource work (source checked 2026-11-06).
+  `begin_draining`/explicit-grace `drain` extend the same registry; `close`
+  initiates zero-grace shutdown and concurrent callers join the first policy.
+  `run_in_thread` retains actual synchronous completion independently of an
+  asyncio proxy, including joined-child work, before DB finalization/admission
+  release. Ambiguous submission/canceled-before-start work retains its claim and
+  fails shutdown; dependent provider closure requires positive settlement.
+  `run_resource_thread` preserves ordinary legacy thread cancellation. These are
+  internal prerequisites; memory-consumer migration and shared factory wiring
+  remain separate. Lease budgets bound database connections, not executor items.
   Activity, embedding-heartbeat, deferred-recall, bookmark and proactive tasks use it;
   legacy connections keep ordinary task scheduling. Internal
   `initialize_request_service` bootstraps memory/health/recon/outreach with
@@ -5131,7 +5157,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 702274dfe 2026-11-05
+verified: 81bbdb0a9 2026-11-08
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -5199,6 +5225,11 @@ verified: 702274dfe 2026-11-05
   evidence, and returns control to the user without native approval or Genesis
   lifecycle registration. It does not enforce the future reflection gates or
   cover arbitrary indirect execution. See `docs/reference/codex-review-stop.md`.
+  The shared budget accepts issue-comment churn between its two reads only when
+  both complete policy projections are successful and identical. Counts,
+  confirmation consumption, findings, reflection keys, marks and reviewer
+  attribution participate; real policy changes still return unknown, and an
+  exhausted budget still requires approval. Head/review/ancestry checks remain.
   A separate, inactive `scripts/hooks/codex-validator-adapter` translates native
   validator calls to the existing guards concurrently. It requires an absolute
   Bash cd/exit opener terminated by a newline, confines patches to validator
@@ -5226,6 +5257,14 @@ verified: 702274dfe 2026-11-05
   Explicit login accepts `--device-auth` for headless authentication.
   Inspection/run disable account-connected Apps through fixed CLI arguments
   and verify that effective setting, retaining the exact two-server boundary.
+  A contained compatibility workflow extends the existing native fixture driver
+  for explicitly handled app-server requests and freezes its source/binary/case
+  manifest before execution. It checks native command approval, canonical guard
+  ask versus denial, resume, required MCP failure, dispatched provenance and
+  ready-descendant cleanup with synthetic loopback responses and harmless
+  effects. Independent copied-artifact readback refuses incomplete or stale
+  evidence; no production provider, native auth, lifecycle enrollment or live
+  policy is added. See `docs/reference/codex-native-harness.md`.
   Interactive native qualification records a Codex0.166.0 reference binary.
   The launcher warns on other recognizable versions and retains its startup
   inspection/refusal checks; those inspect state, not actual tool denial.

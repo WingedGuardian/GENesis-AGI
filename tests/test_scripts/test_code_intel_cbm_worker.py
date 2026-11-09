@@ -54,6 +54,26 @@ def _main_args(tmp_path):
             "--mode", "full", "--persistence", "false"]
 
 
+@pytest.mark.parametrize("private", [False, True])
+@pytest.mark.parametrize("error_type", [OSError, ValueError, RuntimeError,
+                                      worker.sqlite3.Error, worker.subprocess.SubprocessError])
+def test_main_preserves_default_errors_and_propagates_private_reporter_errors(
+        tmp_path, monkeypatch, capsys, private, error_type):
+    message = "synthetic-private-preparation-detail"
+
+    def refuse(env):
+        raise error_type(message)
+
+    monkeypatch.setattr(worker, "verify_scope", refuse)
+    if private:
+        with pytest.raises(error_type, match=message):
+            worker.main(_main_args(tmp_path), queued_native_environment=object())
+        assert capsys.readouterr().err == ""
+    else:
+        assert worker.main(_main_args(tmp_path)) == 111
+        assert message in capsys.readouterr().err
+
+
 def _fake_worker(tmp_path, monkeypatch, *, error=False, rc=0):
     binary = tmp_path / "binary"
     binary.write_text(
