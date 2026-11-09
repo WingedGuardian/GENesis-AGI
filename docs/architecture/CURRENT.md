@@ -5211,13 +5211,19 @@ verified: 702274dfe 2026-11-05
   It supplies no service/timer wiring, copied credentials, deploy authority or
   lifecycle enrollment. See `docs/reference/codex-validator-launcher.md` for
   operator commands, source inventory, permitted MCP startup effects and races.
-  Codex has a separate external-client adapter in `.codex/config.toml`: it
-  starts the existing standalone health and memory MCP servers through a
-  launcher that scrubs inherited Genesis session identity, provenance,
-  supervision, slot, and trace context, then allowlists health plus explicit
-  recall tools. The launcher also selects `--external-client`; memory initialization
-  then disables processing of Claude's pending plan-bookmark file. Ordinary
-  Genesis memory initialization keeps that processing enabled by default.
+  Codex's project config (`.codex/config.toml`) starts all four Genesis MCP
+  servers through `scripts/codex_owner_mcp.py`, which reuses the external
+  launcher's environment scrub and main-checkout resolution. An unmarked Codex
+  run is the owner's: the ordinary bootstrap, every tool, labelled
+  `GENESIS_CALLER_PROFILE=codex` (calls logged to `client_tool_calls`); read
+  tools are pre-approved in the config and every other tool prompts, new ones
+  included. A run Genesis starts unattended (`util/codex_cli.py` sets
+  `GENESIS_CC_SESSION=1`, forwarded through `env_vars`) gets
+  `--external-client` and the health/recall floor, and no outreach or recon
+  server. Memory initialization skips Claude's pending plan-bookmark file for
+  both: the external profile through `process_pending_bookmarks=False`, a
+  labelled caller per call. Ordinary Claude Code memory initialization keeps
+  that processing enabled.
   The standalone server enforces the `external` or `validator` tool profile
   during discovery and direct calls. External retains its health/recall floor;
   validator additionally admits memory_store, eligible private follow-up CRUD

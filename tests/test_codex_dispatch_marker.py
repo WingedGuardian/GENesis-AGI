@@ -46,6 +46,7 @@ CHOKEPOINT = "util/codex_cli.py"
 ALLOWED = {
     "runtime/init/process_reaper.py": 2,  # pgrep pattern and label for orphan reaping
     "contribution/review.py": 1,  # reviewer="codex" label on a ReviewResult
+    "caller_context.py": 2,  # client label -> "Codex session" for restart wording
 }
 _LOG_METHODS = frozenset({"debug", "info", "warning", "error", "exception", "critical", "log"})
 

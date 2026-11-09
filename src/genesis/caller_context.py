@@ -163,6 +163,18 @@ def caller_context_from_env() -> CallerContext:
     )
 
 
+_CLIENT_SESSION_NAMES = {"codex": "Codex session"}
+
+
+def client_session_name() -> str:
+    """What to call the caller's session in a message: "Claude Code session"
+    unless the caller is a labelled client with its own name (owner-mode Codex).
+    Messages that tell the reader to restart use it, so a Codex user is not told
+    to restart a Claude Code session; Claude Code's wording stays unchanged.
+    """
+    return _CLIENT_SESSION_NAMES.get(caller_context().profile or "", "Claude Code session")
+
+
 def drop_client_label(env: MutableMapping[str, str]) -> MutableMapping[str, str]:
     """Remove the client label from a child's environment, in place.
 
