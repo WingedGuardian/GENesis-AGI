@@ -123,6 +123,8 @@ HELPERS_TO_SYNC=(
     "db_admission_check.py"
     "pre_push_chain.py"
     "pre_push_gates.sh"
+    "push_privacy_scan.py"
+    "push_destinations.py"
 )
 
 MODIFIED_FOUND=0

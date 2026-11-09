@@ -8,6 +8,8 @@ import sys
 
 import pytest
 
+from tests.test_scripts._deploy_candidates_world import CHAIN_HELPERS
+
 
 @pytest.mark.parametrize("damage", [
     "manifest_missing", "manifest_invalid", "manifest_version", "prepared", "unenrolled",
@@ -76,7 +78,7 @@ def test_real_owned_native_chain_is_ready_and_runs(dc, dc_ready):
     assert dc.gate.hook_install_failures(dc.Engine(w.root, w.env, w.gh, w.serving)) == []
     result = subprocess.run(
         [sys.executable, str(w.root / ".git/hooks/pre-push"), "origin", "synthetic"],
-        input=b"synthetic refs\n", cwd=w.root, env=w.env, capture_output=True,
+        input=b"", cwd=w.root, env=w.env, capture_output=True,
     )
     assert result.returncode == 0, result.stderr
 
@@ -107,15 +109,15 @@ def test_chain_survives_legacy_rollback_and_reupgrade(dc, dc_ready, capsys, hist
     chain_tip = w.rev("HEAD")
     sync = (w.root / "scripts/hooks/sync-hooks.sh").read_text()
     arrays = sync[sync.index("HOOKS_TO_SYNC=("):sync.index("MODIFIED_FOUND=0")]
-    arrays = arrays.replace('    "pre_push_chain.py"\n', "").replace('    "pre_push_gates.sh"\n', "")
+    for name in CHAIN_HELPERS:
+        arrays = arrays.replace(f'    "{name}"\n', "")
     legacy_hook = (w.root / "scripts/hooks/pre_push_gates.sh").read_text()
     if history.startswith("unqualified"):
         legacy_hook += "# a prior source, but neither target gates nor shipped\n"
     legacy = w.candidate("feat/legacy", {
         "scripts/hooks/sync-hooks.sh": "#!/bin/bash\n" + arrays + "exit 0\n",
         "scripts/hooks/pre-push": legacy_hook,
-        "scripts/hooks/pre_push_chain.py": None,
-        "scripts/hooks/pre_push_gates.sh": None,
+        **{f"scripts/hooks/{name}": None for name in CHAIN_HELPERS},
     })
     w.git(w.root, "-c", "core.hooksPath=/dev/null", "switch", "-q", "-C", "live", legacy)
     assert w.run(dc, "restore-hooks", chain_tip, legacy, lock=True) == 0, capsys.readouterr()
@@ -151,7 +153,7 @@ def test_restore_does_not_recreate_a_missing_active_chain_helper(dc, dc_ready, c
 def _expanded_chain_changes(w):
     path = "scripts/hooks/pre_push_chain.py"
     source = (w.root / path).read_text()
-    before = 'HELPERS = ("pre_push_chain.py", "pre_push_gates.sh")'
+    before = next(line for line in source.split("\n") if line.startswith("HELPERS = "))
     assert source.count(before) == 1
     sync = (w.root / "scripts/hooks/sync-hooks.sh").read_text()
     return {
@@ -254,7 +256,7 @@ def test_candidate_additive_closure_admits_prior_ownership_before_mutation(dc, d
     assert dc.plan.sync_git_hooks(repo) is None
     assert dc.gate.hook_install_failures(repo) == []
     state = json.loads(record.read_text())
-    assert state["closure"] == ["pre_push_chain.py", "pre_push_gates.sh", "future_chain_helper.py"]
+    assert state["closure"] == [*CHAIN_HELPERS, "future_chain_helper.py"]
     assert target.read_bytes() == (w.root / "scripts/hooks/future_chain_helper.py").read_bytes()
 
 
@@ -278,12 +280,12 @@ def test_legacy_reupgrade_recovers_only_prior_owned_closure(dc, dc_ready, collis
     expanded = w.candidate("feat/expanded-closure", _expanded_chain_changes(w))
     sync = (w.root / "scripts/hooks/sync-hooks.sh").read_text()
     arrays = sync[sync.index("HOOKS_TO_SYNC=("):sync.index("MODIFIED_FOUND=0")]
-    arrays = arrays.replace('    "pre_push_chain.py"\n', "").replace('    "pre_push_gates.sh"\n', "")
+    for name in CHAIN_HELPERS:
+        arrays = arrays.replace(f'    "{name}"\n', "")
     legacy = w.candidate("feat/legacy-closure", {
         "scripts/hooks/sync-hooks.sh": "#!/bin/bash\n" + arrays + "exit 0\n",
         "scripts/hooks/pre-push": (w.root / "scripts/hooks/pre_push_gates.sh").read_text(),
-        "scripts/hooks/pre_push_chain.py": None,
-        "scripts/hooks/pre_push_gates.sh": None,
+        **{f"scripts/hooks/{name}": None for name in CHAIN_HELPERS},
     })
     repo = dc.Engine(w.root, w.env, w.gh, w.serving)
     w.git(w.root, "-c", "core.hooksPath=/dev/null", "switch", "-q", "-C", "live", legacy)

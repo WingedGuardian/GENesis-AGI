@@ -640,7 +640,8 @@ _FINGERPRINT_NOT_RUN = frozenset({_FINGERPRINT_UNREADABLE, _FINGERPRINT_EMPTY})
 
 
 def _check_fingerprints(
-    parsed: _ParsedDiff, fingerprint_file: Path | None
+    parsed: _ParsedDiff, fingerprint_file: Path | None, *, stop_after_first: bool = False,
+    fingerprint_text: str | None = None,
 ) -> list[Finding]:
     if fingerprint_file is None:
         return []
@@ -654,7 +655,8 @@ def _check_fingerprints(
     # exact-value scan, so text bound for a public surface passed a privacy check
     # that never looked at it. A MISSING file stays the WARN in ``scan_diff``.
     try:
-        raw = fingerprint_file.read_text(encoding="utf-8", errors="surrogateescape")
+        raw = fingerprint_text if fingerprint_text is not None else fingerprint_file.read_text(
+            encoding="utf-8", errors="surrogateescape")
     except OSError:
         return [
             Finding(
@@ -718,6 +720,8 @@ def _check_fingerprints(
                         detail=text.strip()[:120],
                     )
                 )
+                if stop_after_first:
+                    return hits
                 break
     return hits
 

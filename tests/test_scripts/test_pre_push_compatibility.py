@@ -3,7 +3,16 @@ import subprocess
 
 import pytest
 
-from tests.test_scripts.test_pre_push_chain import world as world
+from tests.test_scripts.test_pre_push_chain import world as _chain_world
+
+
+@pytest.fixture
+def world(tmp_path):
+    value = _chain_world.__wrapped__(tmp_path)
+    # These cases select their own runtime; remove only the fixture's venv
+    # symlink before creating a separate owned interpreter path.
+    (value[0] / ".venv").unlink()
+    return value
 
 
 def custom(world, content):

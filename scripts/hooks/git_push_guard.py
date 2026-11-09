@@ -326,6 +326,7 @@ _DEGRADED_GATED = (
 try:
     # Inside this block on purpose: a broken module degrades the guard closed
     # (degraded_exit below) instead of exiting 1, which the harness reads as allow.
+    import push_destinations as _destinations  # noqa: E402
     from gh_merge import (  # noqa: E402
         api_merge_reason,
         body_file_path,
@@ -1086,27 +1087,7 @@ _REPO_UNRESOLVED = object()
 
 
 def _normalize_repo(value: str) -> str | None:
-    """A plain github.com OWNER/REPO from a gh --repo value, or None if it cannot
-    be resolved to one.
-
-    Accepts ``owner/repo``, ``github.com/owner/repo``, and a github.com URL.
-    Returns None for a shell variable (``$X`` / backtick), an enterprise
-    ``HOST/OWNER/REPO`` (would misnormalize to github.com and gate the wrong
-    repo), or any other shape — the caller turns None-when-present into a
-    fail-closed block. Genesis is github.com-only, so refusing the exotic forms
-    is safe (a user can re-issue as OWNER/REPO)."""
-    if not value or "$" in value or "`" in value:
-        return None
-    v = value.strip().split("://", 1)[-1]  # strip scheme if a URL
-    parts = [p for p in v.split("/") if p]
-    # Drop a leading github.com HOST COMPONENT (exact match of the first path
-    # segment — NOT a substring test, which would mishandle `github.com.evil/…`
-    # or `evilgithub.com/…`; CodeQL py/incomplete-url-substring-sanitization).
-    if parts and parts[0] == "github.com":
-        parts = parts[1:]
-    if len(parts) != 2:  # not a plain OWNER/REPO (host-prefixed / malformed)
-        return None
-    return f"{parts[0]}/{parts[1]}"
+    return _destinations._normalize_repo(value)
 
 
 def _merge_target_repo(argv: list[str], cmd: str):
@@ -8259,20 +8240,7 @@ def _canonical_public_repo() -> str | None:
     override = os.environ.get("_TEST_CANONICAL_PUBLIC_REPO")
     if override is not None:
         return _normalize_repo(override) if override.strip() else None
-    path = os.path.expanduser("~/.genesis/config/genesis.yaml")
-    try:
-        import yaml  # lazy: keep the hook import-light; the genesis venv has pyyaml
-
-        with open(path) as fh:
-            cfg = yaml.safe_load(fh) or {}
-        gh = cfg.get("github") or {}
-        user = (gh.get("user") or "").strip()
-        repo = (gh.get("public_repo") or "").strip()
-        if user and repo:
-            return _normalize_repo(f"{user}/{repo}")
-    except Exception:
-        return None
-    return None
+    return _destinations.public_repo_config()[1]
 
 
 def _scheduled_gate_applies(repo: str | None) -> bool:
@@ -13468,22 +13436,7 @@ _ALLOWED_PUSH_URL_SCHEMES = frozenset({"https", "http", "ssh", "git", "file"})
 
 
 def _push_url_transport(url: str) -> str | None:
-    """Classify only built-in push transports and local paths."""
-    if not url or url != url.strip() or "\n" in url or "\r" in url:
-        return None
-    if url.startswith(("/", "./", "../", "~")) or re.match(r"^[A-Za-z]:[\\/]", url):
-        return "local"
-    if _SCP_PUSH_URL_RE.match(url):
-        return "ssh"
-    scheme = _URL_SCHEME_RE.match(url)
-    if scheme is not None:
-        name = scheme.group(1).lower()
-        if name not in _ALLOWED_PUSH_URL_SCHEMES:
-            return None
-        return name if url.lower().startswith(f"{name}://") else None
-    if ":" in url:
-        return None
-    return "local"
+    return _destinations._push_url_transport(url)
 
 
 def _push_url_without_userinfo(url: str) -> str:
@@ -14297,26 +14250,7 @@ rather than counted — see ``_open_pr_count_for_branch``."""
 
 
 def _repo_identity_from_url(url: str) -> tuple[str, str] | None:
-    """``(host, owner/repo)`` for a git remote URL, or None if it has neither.
-
-    Normalises the spellings of one remote so they compare equal: `https://`,
-    bare `git@host:owner/repo`, `ssh://git@host/owner/repo`, and a trailing
-    `.git` or `/` all reduce to the same pair. Any userinfo before the host is
-    dropped, since `git@` is not part of the destination's identity.
-    """
-    raw = url.strip().lower().rstrip("/")
-    raw = raw.removesuffix(".git")
-    if "://" in raw:
-        raw = raw.split("://", 1)[1]
-    elif ":" in raw and "/" not in raw.split(":", 1)[0]:
-        raw = raw.replace(":", "/", 1)            # git@host:owner/repo
-    if "@" in raw.split("/", 1)[0]:
-        raw = raw.split("@", 1)[1]                # strip userinfo
-    parts = [x for x in raw.split("/") if x]
-    if len(parts) < 3:
-        return None
-    host = parts[0].split(":", 1)[0]              # drop any :port
-    return host, "/".join(parts[-2:])
+    return _destinations._repo_identity_from_url(url)
 
 
 def _urls_name_repo(urls: set[str], canonical: str) -> bool:
@@ -15436,6 +15370,9 @@ def _run_merge_and_push_gates() -> int:
         segs, blind = analyze_checked(cmd)
 
         push_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "push"]
+        if any(_push_boolean_options(push_arg_stream(s.argv)).get("verify") is False for s in push_segs):
+            print("BLOCKED: --no-verify disables the native pre-push publication checks. Remove it.", file=sys.stderr)
+            return 2
         merge_git_segs = [s for s in segs if s.exe == "git" and git_subcommand(s.argv) == "merge"]
         # A help request creates nothing; it used to raise the create arm's ask.
         create_segs = [

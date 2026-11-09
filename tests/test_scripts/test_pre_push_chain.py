@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ import pytest
 from tests.conftest import private_module
 
 SOURCE = Path(__file__).resolve().parents[2] / "scripts/hooks"
+CHAIN_HELPERS = private_module("native_chain_fixture_closure", SOURCE / "pre_push_chain.py").HELPERS
 
 
 @pytest.fixture
@@ -29,9 +31,15 @@ def world(tmp_path):
     git("-c", "init.templateDir=", "init", "-q")
     hooks = repo / "scripts/hooks"
     hooks.mkdir(parents=True)
-    for name in ["sync-hooks.sh", "pre-push", "pre_push_chain.py", "pre_push_gates.sh"]:
+    for name in ["sync-hooks.sh", "pre-push", *CHAIN_HELPERS]:
         if (SOURCE / name).exists():
             shutil.copy2(SOURCE / name, hooks / name)
+
+    (repo / "src").symlink_to(SOURCE.parents[1] / "src", target_is_directory=True)
+    (repo / ".venv").symlink_to(Path(sys.executable).parent.parent, target_is_directory=True)
+    config = tmp_path / ".genesis/config"
+    config.mkdir(parents=True)
+    (config / "genesis.yaml").write_text("github:\n  user: fixture\n  public_repo: public\n")
 
     def sync(*args):
         return subprocess.run(["bash", str(hooks / "sync-hooks.sh"), *args], cwd=repo, env=env, capture_output=True)
@@ -414,7 +422,7 @@ def expand_source(repo):
     source = repo / "scripts/hooks"
     path = source / "pre_push_chain.py"
     text = path.read_text()
-    anchor = 'HELPERS = ("pre_push_chain.py", "pre_push_gates.sh")'
+    anchor = next(line for line in text.split("\n") if line.startswith("HELPERS = "))
     assert text.count(anchor) == 1
     path.write_text(text.replace(anchor, anchor[:-1] + ', "future_chain_helper.py")'))
     (source / "future_chain_helper.py").write_text("# inert future owned helper\n")
@@ -473,7 +481,7 @@ def test_additive_helper_installation_retains_prior_closure_on_retry(world, monk
             module.install(source, repo, opt_in=False)
     state = json.loads((target / module.MANIFEST).read_text())
     assert state["phase"] == "prepared"
-    assert state["previous"]["closure"] == ["pre_push_chain.py", "pre_push_gates.sh"]
+    assert state["previous"]["closure"] == list(CHAIN_HELPERS)
     assert state["closure"] == list(module.HELPERS)
     module.install(source, repo, opt_in=False)
     active = json.loads((target / module.MANIFEST).read_text())

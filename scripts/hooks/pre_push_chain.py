@@ -25,7 +25,7 @@ from pathlib import Path
 
 MANIFEST = ".genesis-pre-push.json"
 ORIGINAL = ".genesis-pre-push-original"
-HELPERS = ("pre_push_chain.py", "pre_push_gates.sh")
+HELPERS = ("pre_push_chain.py", "pre_push_gates.sh", "push_privacy_scan.py", "push_destinations.py")
 INPUT_LIMIT = 1024 * 1024
 
 
@@ -365,7 +365,9 @@ def run(argv: list[str]) -> int:
         code = _run_hook(consumer, argv, env, data)
         if code:
             return code if code > 0 else 128 - code
-    return 0
+    code = subprocess.run([sys.executable, str(directory / "push_privacy_scan.py"), str(root), common, "--", *argv],
+                          input=data, env=env, check=False).returncode
+    return code if code >= 0 else 128 - code
 
 
 def main() -> int:
