@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
+import sys
 from dataclasses import dataclass
 
 from genesis.session_awareness.pr_evidence import NOTE_PREFIXED_GAPS, Decision
@@ -21,8 +23,8 @@ def resolve_repo(open_repos: list[str], pr_number: int, repo: str) -> str:
     if not open_repos:
         raise LookupError(
             f"no OPEN row for PR #{pr_number} — it may be discharged already, or "
-            f"never opened. Run `python3 scripts/repo_pulse_worker.py "
-            f"--verification-backlog` to see the open set."
+            f"never opened. Run `{shlex.quote(sys.executable)} "
+            f"scripts/repo_pulse_worker.py --verification-backlog` to see the open set."
         )
     if repo not in open_repos:
         raise LookupError(

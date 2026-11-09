@@ -2759,8 +2759,10 @@ verified: c712f1bde 2026-11-06
   idle past a threshold, so a ready-but-forgotten PR is re-raised instead of
   rotting. Sibling of the PR-watch surface above (external PR *changes*); this
   one is age-based and passive. `session_awareness/repo_pulse*.py`.
-- **Post-merge verification obligations** (shipped; producer automatic, consumer
-  manual-invoke only — nothing dispatches a validator yet — issue #1718):
+- **Post-merge verification obligations** (shipped; producer automatic; consumer
+  the standing validator session, owner-started and self-paced per the
+  validating-merges skill's "Standing mode", or any manual validator; nothing
+  dispatches one automatically — issue #1718):
   the pulse worker's verification lane opens one `pr_verifications` row per
   MERGED PR, so "run the E2E after merge" survives the merge instead of living
   in someone's memory. A documentation-only diff is auto-closed with the reason
