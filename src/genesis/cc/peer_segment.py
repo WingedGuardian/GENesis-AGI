@@ -146,8 +146,25 @@ class PeerSegment:
                 "--strict-mcp-config", "--disable-slash-commands", "--no-chrome",
                 "--no-session-persistence"]
 
+    def _preflight(self) -> None:
+        """What cleanup will need, checked before the claim exists.
+
+        Cleanup cannot tell "never launched" from "maybe launched", so a
+        precondition it first meets there turns a configuration error into an
+        unconfirmed drain that holds the slot until restart. Refusing here
+        holds nothing."""
+        if self.deadline_at - time.time() <= 0:
+            raise ValueError("peer segment deadline expired")
+        try:
+            _systemctl()
+        except RuntimeError:
+            raise CCProcessError("peer containment unavailable: no systemctl on PATH") from None
+        if not (_CGROUP_ROOT / "cgroup.controllers").is_file():
+            raise CCProcessError("peer containment unavailable: no cgroup v2 filesystem")
+
     @contextlib.asynccontextmanager
     async def invocation(self):
+        self._preflight()
         # All invoker instances/loops in this server share scope ownership.
         # Rejected duplicates must never enter the owner's cleanup path.
         with _INVOCATION_LOCK:

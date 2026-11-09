@@ -6,7 +6,7 @@ belong to the private result, not the server log or tracing plane.
 """
 
 import logging
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from contextvars import ContextVar
 
 _private = ContextVar("genesis_private_execution", default=False)
@@ -24,17 +24,18 @@ def _group_members(exc: BaseException) -> tuple[BaseException, ...]:
 
 def _mark_private_exception(exc: BaseException) -> None:
     pending, seen = [exc], set()
-    try:
-        while pending:
-            current = pending.pop()
-            if id(current) in seen:
-                continue
-            seen.add(id(current))
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        # Per member: one refused write must not leave a sibling unmarked, and
+        # diagnostics must never replace the caller's exception.
+        with suppress(BaseException):
             attrs = BaseException.__dict__["__dict__"].__get__(current)
             dict.__setitem__(attrs, _ERROR_MARKER, PRIVATE_ERROR)
+        with suppress(BaseException):
             pending.extend(_group_members(current))
-    except BaseException:
-        pass  # Diagnostics must never replace the caller's exception.
 
 
 def exception_is_private(exc: BaseException | None) -> bool:

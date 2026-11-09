@@ -917,3 +917,46 @@ def test_scope_state_uses_systemctl_from_absolute_path_entries_only(tmp_path, mo
     monkeypatch.setenv("PATH", "rel/bin")
     with pytest.raises(RuntimeError, match="could not be confirmed"):
         peer._show_scope()
+
+
+@pytest.mark.parametrize("missing", ["systemctl", "cgroup v2", "deadline"])
+def test_a_host_that_cannot_contain_a_peer_refuses_before_the_claim(
+    tmp_path, monkeypatch, missing
+):
+    """Cleanup cannot tell never-launched from maybe-launched, so a missing
+    precondition is refused before the claim exists: nothing is held, and the
+    error is a plain refusal, not an unconfirmed drain."""
+    from genesis.util.proc_kill import ProcessCleanupUncertain
+
+    root = tmp_path / "cgroup"
+    root.mkdir()
+    (root / "cgroup.controllers").write_text("memory\n")
+    tool = tmp_path / "bin" / "systemctl"
+    tool.parent.mkdir()
+    tool.write_text("#!/bin/sh\nexit 0\n")
+    tool.chmod(0o755)
+    monkeypatch.setattr(peer_segment, "_CGROUP_ROOT", root)
+    monkeypatch.setenv("PATH", str(tool.parent))
+    deadline = time.time() + 60
+    if missing == "systemctl":
+        monkeypatch.setenv("PATH", "relative/bin")
+    elif missing == "cgroup v2":
+        (root / "cgroup.controllers").unlink()
+    else:
+        deadline = time.time() - 1
+    peer = PeerSegment(
+        segment_id="b" * 32, deadline_at=deadline, tools=("mcp__genesis_peer__perform",)
+    )
+    calls = []
+    monkeypatch.setattr(peer_segment.subprocess, "run", lambda *a, **k: calls.append(a))
+
+    async def enter():
+        async with peer.invocation():
+            raise AssertionError("the body must not run")
+
+    expected = ValueError if missing == "deadline" else CCProcessError
+    with pytest.raises(expected) as caught:
+        asyncio.run(enter())
+    assert not isinstance(caught.value, ProcessCleanupUncertain)
+    assert peer.unit_name not in peer_segment._INVOCATION_UNITS
+    assert calls == []  # no cleanup query for a claim that never existed

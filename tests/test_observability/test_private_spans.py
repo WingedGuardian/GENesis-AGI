@@ -222,3 +222,24 @@ def test_a_split_private_group_stays_private():
     assert exception_is_private(matched)
     assert exception_is_private(rest)
     assert exception_is_private(leaf)
+
+
+def test_a_refused_marker_write_does_not_leave_a_sibling_unmarked():
+    """One member whose marker write raises (a colliding key with a raising
+    ``__eq__``) must not stop the walk before its siblings are marked."""
+    from genesis.util import execution_privacy as ep
+
+    class Colliding:
+        def __hash__(self):
+            return hash(ep._ERROR_MARKER)
+
+        def __eq__(self, other):
+            raise TypeError("Synthetic collision")
+
+    sibling, poisoned = ValueError(CANARY), ValueError("Synthetic poisoned")
+    poisoned.__dict__[Colliding()] = 1
+    with pytest.raises(ExceptionGroup) as caught, private_execution():
+        raise ExceptionGroup("Synthetic group", [sibling, poisoned])
+    matched, _rest = caught.value.split(lambda exc: exc is sibling)
+    assert ep.exception_is_private(sibling)
+    assert ep.exception_is_private(matched)
