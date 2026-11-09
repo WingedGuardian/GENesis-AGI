@@ -394,6 +394,10 @@ ordinary environment explicitly skips the eleven SDK-specific modules before
 SDK imports. The caller-path policy, read-location API and ordinary preparation
 tests remain ordinary tests; policy and preparation also run in the qualified
 protocol selection.
+The health selection snapshot tests in `test_local_health_selection.py` remain
+ordinary tests too. They verify the real P7 program, exclusions, current limits,
+module cleanup and a configuration change during readiness without contacting a
+manager. The pinned job also runs them and the existing service-settings tests.
 Pure configuration and missing/later-version refusal tests remain ordinary
 tests in `tests/test_mcp/test_shared_http_settings.py`.
 
@@ -442,9 +446,22 @@ is restored after each completed child. Without it, CI compares the current
 bootstrap and direct prepared consumer against the independent names/data checks.
 `GENESIS_ORDINARY_PREPARATION_EVIDENCE_DIR` optionally preserves synthetic child
 receipts outside pytest's successful-temp-directory cleanup.
+The forwarder module also tests the actual ordinary health argv from a neutral
+cwd against a separately owned shared health service. Distinct seeded local and
+remote status values and body receipts establish where calls executed. The
+ordinary/mixed pair compares complete SDK catalogs and progress/native IDs;
+initialization metadata, mixed protocol eras, catalog refusal/retry and active
+local cancellation/EOF cover their respective boundaries. Browser implementation
+and external provider/process boundaries are explicitly synthetic/fenced; these
+are not native client, browser or payment turns. The protocol-only matrix uses a
+synthetic remote leg and the actual local peer against an ordinary SDK oracle.
+`GENESIS_LOCAL_HEALTH_EVIDENCE_DIR` optionally retains synthetic wire/body/close
+receipts outside successful-temp cleanup. Uvicorn re-raises captured SIGTERM
+after graceful shutdown in this qualified version, so the backend check requires
+the expected signal exit together with completed SDK/drain/resource events.
 They neither contact a native client/provider nor activate routing.
 Its fresh JUnit report must pass `scripts/check_skip_ceiling.py` with zero skips
-and a floor of 356 cases. Installation, collection, test or report-check failure
+and a floor of 392 cases. Installation, collection, test or report-check failure
 fails the job; missing or filtered workflow runs do not qualify a PR. Closing
 checks its actual head/base result. Ordinary skip-budget changes require observed
 skip identities; this workflow does not raise that budget automatically.

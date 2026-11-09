@@ -12,20 +12,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 
-class _SafeDiagnostics(logging.Filter):
-    def filter(self, record):
-        # SDK protocol diagnostics can include request bodies/parser excerpts.
-        # This dedicated process reports its own safe connection categories.
-        return record.name != "mcp" and not record.name.startswith("mcp.")
-
-
 def main(argv=None):
+    from genesis.mcp.shared_client._diagnostics import SafeDiagnostics
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server", required=True, choices=("health", "memory", "outreach", "recon"))
     parser.add_argument("--url", help="Must match this service's configured loopback URL")
     args = parser.parse_args(argv)
     handler = logging.StreamHandler()
-    handler.addFilter(_SafeDiagnostics())
+    handler.addFilter(SafeDiagnostics())
     logging.basicConfig(level=logging.WARNING, handlers=[handler], force=True)
     try:
         from genesis.mcp.shared_http import require_qualified_stack

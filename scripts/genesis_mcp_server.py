@@ -696,6 +696,55 @@ def _bearer_auth_middleware(expected_token: str):
     return Middleware(_AuthGuard)
 
 
+def _local_health_frontend(args, argv):
+    """Preflight a mixed ordinary health command before preparing any resource."""
+    import os
+
+    actual_args = list(sys.argv[1:] if argv is None else argv)
+    if (actual_args != ["--server", "health"] or args.transport != "stdio"
+            or args.external_client is not None):
+        return None
+    try:
+        from genesis.mcp.shared_settings import load_local_settings
+
+        root = Path(__file__).resolve().parents[1]
+        stdio = [sys.executable, str(root / "scripts/genesis_mcp_server.py"), *actual_args]
+        selected = load_local_settings(root, "health", dict(os.environ), stdio)
+        if selected is None:
+            return None
+        from genesis.caller_context import caller_context_from_env
+        from genesis.caller_credentials import forwarder_headers
+        from genesis.mcp.shared_http import require_qualified_stack
+        from genesis.mcp.shared_runner import require_source_checkout
+
+        require_qualified_stack()
+        require_source_checkout(root)
+
+        def headers():
+            return forwarder_headers(caller_context_from_env())
+
+        headers()  # Refusal still leaves ordinary startup/input untouched.
+    except Exception as error:
+        logger.warning("Local shared frontend preflight declined (%s)", type(error).__name__)
+        return None
+
+    def run():
+        from functools import partial
+
+        import anyio
+
+        from genesis.mcp.shared_client import serve_stdio
+        from genesis.mcp.shared_client._diagnostics import SafeDiagnostics
+
+        for handler in logging.getLogger().handlers:
+            handler.addFilter(SafeDiagnostics())
+        server = _prepare_health()
+        anyio.run(partial(serve_stdio, selected.settings, headers,
+                          local_server=server, stage=selected.stage))
+
+    return run
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     shared_root = None
@@ -854,6 +903,9 @@ def main(argv: list[str] | None = None) -> None:
     bootstrapper = _BOOTSTRAPPERS[args.server]
     options = {"external_profile": args.external_client} if args.external_client else {}
     try:
+        if local_frontend := _local_health_frontend(args, argv):
+            local_frontend()
+            return
         bootstrapper(transport_kwargs, **options)
     except Exception:
         _record_mcp_crash(args.server)

@@ -1,0 +1,1 @@
+- Preserve the complete health tool catalog and local browser state when health reads use the shared MCP frontend. The rollout ceiling remains off; memory sharing and final resource measurements still gate activation.
