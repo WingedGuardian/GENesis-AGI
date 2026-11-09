@@ -21,6 +21,8 @@ the schema authority; nothing here creates tables. ``now`` is always injected
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 
 import aiosqlite
@@ -285,6 +287,9 @@ async def close_verification(
     params = (reason, now, evidence, verdict, now)
     if stored is not None:
         params += (stored,)
+    if await _nyd_columns_available(db):
+        # A pass is "any other verdict": the not-yet-done repeat flag is cleared.
+        extra += ", nyd_repeat = NULL"
     cursor = await db.execute(
         "UPDATE pr_verifications SET status = 'closed', closed_reason = ?, "
         "closed_at = ?, evidence = ?, verdict = ?, last_attempt_at = ?, "
@@ -315,6 +320,59 @@ async def _verdict_columns_available(db: aiosqlite.Connection) -> bool:
     cursor = await db.execute("PRAGMA table_info(pr_verifications)")
     cols = {row[1] for row in await cursor.fetchall()}
     return {"verdict", "attempt_count", "last_attempt_at", "last_attempt_note"} <= cols
+
+
+#: Days a parked row, or a not-yet-done row whose last attempt repeated the one
+#: before it, waits before the picker offers it again. The picker's default and
+#: the writers' "offered again after" line both read it.
+REATTEMPT_DAYS = 7
+
+
+async def _nyd_columns_available(db: aiosqlite.Connection) -> bool:
+    """Does the not-yet-done repeat column exist? Asked EVERY time, uncached.
+
+    Same structural window as :func:`_verdict_columns_available`: a subprocess
+    writer can see the table before the numbered runner has added the column
+    (migration ``20261109120000``). Writers then skip it and the picker applies
+    no wait, which is the behaviour before the column existed.
+    """
+    if not await _tables_available(db):
+        return False
+    cursor = await db.execute("PRAGMA table_info(pr_verifications)")
+    return "nyd_repeat" in {row[1] for row in await cursor.fetchall()}
+
+
+def _norm_step(value: object) -> str:
+    return " ".join(value.split()).casefold() if isinstance(value, str) else ""
+
+
+def nyd_fingerprint(evidence: str | None) -> str | None:
+    """A short hash of an evidence document's REMAINING STEPS, or None.
+
+    The steps are its ``not_yet_done`` gaps, each reduced to its ``command`` and
+    ``detail`` with whitespace collapsed and case folded, sorted so their order in
+    the document does not matter. Two attempts with the same fingerprint named the same work
+    still to do: the second made no progress on it. None when there is no
+    document, it is not valid JSON, or it names no such gap; a None fingerprint
+    never counts as a repeat.
+    """
+    if not evidence:
+        return None
+    try:
+        doc = json.loads(evidence)
+    except ValueError:
+        return None
+    gaps = doc.get("gaps") if isinstance(doc, dict) else None
+    if not isinstance(gaps, list):
+        return None
+    steps = sorted(
+        (_norm_step(g.get("command")), _norm_step(g.get("detail")))
+        for g in gaps
+        if isinstance(g, dict) and g.get("kind") == "not_yet_done"
+    )
+    if not steps:
+        return None
+    return hashlib.sha256(json.dumps(steps).encode("utf-8")).hexdigest()[:16]
 
 
 async def record_attempt(
@@ -354,6 +412,21 @@ async def record_attempt(
     field describes the LATEST attempt, so an attempt made without a document leaves
     the row with none rather than showing an earlier attempt's document under this
     attempt's verdict. Capped at :data:`MAX_EVIDENCE_BYTES`; over the cap raises.
+
+    On ``not-yet-done`` it also sets ``nyd_repeat``: 1 when the row's previous
+    verdict was ``not-yet-done`` and :func:`nyd_fingerprint` of the previous and
+    the new evidence match (both non-None), else 0. Derived from the stored
+    evidence, not a stored fingerprint, so a row recorded before the column
+    existed is compared too. A not-yet-done write with no fingerprint (no
+    evidence, or none of its gaps is ``not_yet_done``) records NULL and never
+    waits; both writers always pass a document with such a gap, so that is
+    unreachable through them. Every other verdict clears it to NULL. Skipped
+    before the column exists (:func:`_nyd_columns_available`).
+
+    Atomic: the UPDATE also requires the row's verdict and evidence to be the ones
+    the comparison read. If another writer changed them in between, it re-reads
+    and tries once more; if that also loses, it returns ``"changed"`` and writes
+    nothing, so the caller re-reads before deciding whether to retry.
     """
     if verdict not in VERDICTS:
         raise ValueError(
@@ -387,15 +460,60 @@ async def record_attempt(
     # FIRST attempt's measured-failure document displayed under the new verdict,
     # unlabelled. The row's rule is that every attempt field describes the LATEST
     # attempt; a missing document is shown as missing, not disguised by an older one.
-    cursor = await db.execute(
+    sql = (
         "UPDATE pr_verifications SET verdict = ?, last_attempt_at = ?, "
-        "last_attempt_note = ?, attempt_count = attempt_count + 1, "
-        "evidence = ? "
-        "WHERE repo = ? AND pr_number = ? AND status = 'open'",
-        (verdict, now, note, evidence, repo, pr_number),
+        "last_attempt_note = ?, attempt_count = attempt_count + 1, evidence = ?"
     )
-    await db.commit()
-    return "recorded" if cursor.rowcount else "missing"
+    if not await _nyd_columns_available(db):
+        cursor = await db.execute(
+            sql + " WHERE repo = ? AND pr_number = ? AND status = 'open'",
+            (verdict, now, note, evidence, repo, pr_number),
+        )
+        await db.commit()
+        return "recorded" if cursor.rowcount else "missing"
+    new_fp = nyd_fingerprint(evidence) if verdict == "not-yet-done" else None
+    for _ in range(2):
+        cursor = await db.execute(
+            "SELECT verdict, evidence FROM pr_verifications "
+            "WHERE repo = ? AND pr_number = ? AND status = 'open'",
+            (repo, pr_number),
+        )
+        # fetchall, not fetchone: it finishes the statement, so this connection holds
+        # no read lock while the comparison runs.
+        rows = await cursor.fetchall()
+        if not rows:
+            return "missing"
+        old_verdict, old_evidence = rows[0][0], rows[0][1]
+        if new_fp is None:
+            repeat = None
+        else:
+            repeat = int(old_verdict == "not-yet-done" and nyd_fingerprint(old_evidence) == new_fp)
+        cursor = await db.execute(
+            sql + ", nyd_repeat = ? WHERE repo = ? AND pr_number = ? AND status = 'open' "
+            "AND verdict IS ? AND evidence IS ?",
+            (verdict, now, note, evidence, repeat, repo, pr_number, old_verdict, old_evidence),
+        )
+        await db.commit()
+        if cursor.rowcount:
+            return "recorded"
+    return "changed"
+
+
+async def attempt_repeat(db: aiosqlite.Connection, *, repo: str, pr_number: int) -> int | None:
+    """The row's ``nyd_repeat`` (1, 0 or None); None before the column exists.
+
+    Read by the writers right after :func:`record_attempt` to tell the validator
+    whether a not-yet-done attempt repeated the one before it, and so when the
+    picker will offer the row again.
+    """
+    if not await _nyd_columns_available(db):
+        return None
+    cursor = await db.execute(
+        "SELECT nyd_repeat FROM pr_verifications WHERE repo = ? AND pr_number = ?",
+        (repo, pr_number),
+    )
+    row = await cursor.fetchone()
+    return None if row is None else row[0]
 
 
 async def open_repos_for_pr(db: aiosqlite.Connection, *, pr_number: int) -> list[str]:
@@ -542,6 +660,8 @@ _CANDIDATE_TIERS = {
 }
 
 #: Picked only once their last attempt is older than the re-attempt window.
+#: (A ``not-yet-done`` row waits the same window only when ``nyd_repeat`` is set;
+#: see :func:`list_validation_candidates`.)
 _DELAYED_VERDICTS = frozenset({"cannot-verify"})
 
 #: Never picked: a failure is the owner's to act on, never the loop's to retry.
@@ -549,16 +669,22 @@ _NEVER_PICKED = frozenset({"fail-intent"})
 
 
 async def list_validation_candidates(
-    db: aiosqlite.Connection, *, now: str, reattempt_days: int = 7
+    db: aiosqlite.Connection, *, now: str, reattempt_days: int = REATTEMPT_DAYS
 ) -> list[dict]:
     """Open rows a validator may pick next, best first. Each carries a ``tier``.
 
-    Eligibility (owner ruling, 2026-10-29): ``not-yet-done`` always, with no
-    delay, because the commands that finish it are named and runnable now
-    (tier 0), as do passing measurements awaiting routing; never attempted
-    (tier 1); ``cannot-verify`` only once its last
-    attempt is at least ``reattempt_days`` old (tier 2), so a precondition gets
-    time to become reachable; ``fail-intent`` never. Within a tier, NEWEST merge
+    Eligibility (owner ruling 2026-10-29, amended 2026-11-09): ``not-yet-done``
+    with no delay (tier 0), because the commands that finish it are named, UNTIL
+    an attempt records the same remaining steps as the attempt before it
+    (``nyd_repeat``, set by :func:`record_attempt`). That row made no progress,
+    likely because its step needs an action a standing validator may not take
+    (push, deploy, merge), so it waits until its last attempt is at least
+    ``reattempt_days`` old, then returns to tier 0; without the wait every pass
+    re-picked it and the rest of the ledger was never reached. Passing
+    measurements awaiting routing are tier 0 with no wait. Never attempted
+    (tier 1); ``cannot-verify`` only once its last attempt is at least
+    ``reattempt_days`` old (tier 2), so a precondition gets time to become
+    reachable; ``fail-intent`` never. Within a tier, NEWEST merge
     first: a standing validator works recent merges while their context is warm,
     which is the opposite of :func:`list_open`'s backlog order, so this is its
     own query rather than a flag on that one.
@@ -570,11 +696,12 @@ async def list_validation_candidates(
     The re-attempt window compares parsed INSTANTS in Python, not strings in
     SQL: writers store ISO stamps in more than one spelling (``Z`` and
     ``+00:00``), and those sort differently as text. A stamp that does not parse
-    leaves the row out, since an unknown age is not "old enough".
+    leaves a waiting row out, since an unknown age is not "old enough".
 
     Before the verdict columns exist no attempt could have been recorded, so
-    every open row is never-attempted. Assumes a Row factory. Empty
-    pre-migration.
+    every open row is never-attempted. Before the repeat column exists no repeat
+    could have been recorded, so no not-yet-done row waits. Assumes a Row
+    factory. Empty pre-migration.
     """
     if reattempt_days < 1:
         raise ValueError(
@@ -595,6 +722,7 @@ async def list_validation_candidates(
         )
         return [{**dict(r), "tier": _CANDIDATE_TIERS[None]} for r in await cursor.fetchall()]
 
+    repeats_known = await _nyd_columns_available(db)
     named = sorted(v for v in _CANDIDATE_TIERS if v is not None)
     cursor = await db.execute(
         "SELECT * FROM pr_verifications WHERE status = 'open' AND "
@@ -606,7 +734,8 @@ async def list_validation_candidates(
     for raw in await cursor.fetchall():
         row = dict(raw)
         verdict = row.get("verdict")
-        if verdict in _DELAYED_VERDICTS:
+        stuck = verdict == "not-yet-done" and repeats_known and bool(row.get("nyd_repeat"))
+        if verdict in _DELAYED_VERDICTS or stuck:
             try:
                 last = datetime.fromisoformat(str(row.get("last_attempt_at")))
             except ValueError:

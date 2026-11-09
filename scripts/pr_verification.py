@@ -264,6 +264,27 @@ async def _close_schema_refusal(db, rechecks: list[dict]) -> str | None:
     return None
 
 
+def _nyd_repeat_line(repeat: int | None, now: str) -> str | None:
+    """When the picker offers a not-yet-done row again, from its ``nyd_repeat``.
+
+    None when no repeat was recorded (the column is absent, or the document named
+    no not_yet_done gap): the picker then applies no wait either.
+    """
+    if repeat is None:
+        return None
+    if not repeat:
+        return "steps differ from the previous attempt: offered again at once"
+    from datetime import datetime, timedelta
+
+    from genesis.db.crud.pr_verifications import REATTEMPT_DAYS
+
+    after = datetime.fromisoformat(now).astimezone(UTC) + timedelta(days=REATTEMPT_DAYS)
+    return (
+        "repeat of the previous attempt: offered again after "
+        f"{after.strftime('%Y-%m-%d %H:%M')} UTC"
+    )
+
+
 def _print_recheck_plan(rechecks: list[dict]) -> None:
     if not rechecks:
         return
@@ -426,6 +447,15 @@ async def _write(
                 evidence=payload,
                 tracking_pending=not tracking.complete,
             )
+            if outcome == "changed":
+                print(
+                    f"pr_verification: {target}#{pr_number} — changed. Another writer "
+                    f"recorded an attempt on this row while this one was being written, "
+                    f"so nothing was written. Re-read the row before deciding whether "
+                    f"to retry.",
+                    file=sys.stderr,
+                )
+                return 1
             if outcome != "recorded":
                 print(
                     f"pr_verification: {target}#{pr_number} — {outcome}. The row was "
@@ -442,6 +472,11 @@ async def _write(
                 f"pr_verification: {target}#{pr_number} STAYS OPEN — {verdict} recorded "
                 f"at {now}. The obligation is not discharged."
             )
+            if verdict == "not-yet-done":
+                repeat = await crud.attempt_repeat(db, repo=target, pr_number=pr_number)
+                line = _nyd_repeat_line(repeat, now)
+                if line:
+                    print(f"  {line}")
             if verdict == "fail-intent":
                 print(
                     "  This is a FAILED verification: bring it to the user as a "

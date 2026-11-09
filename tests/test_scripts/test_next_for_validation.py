@@ -3,8 +3,9 @@
 It answers one question, "which open obligation should a validator work next?",
 and every way it can be wrong is pinned here:
 
-- ranking: not-yet-done, then never-attempted, then a parked row past its
-  re-attempt window; within that, a PR with an ``E2E:`` plan before one
+- ranking: not-yet-done (unless its last attempt repeated the previous one's
+  steps inside the re-attempt window), then never-attempted, then a parked row
+  past its re-attempt window; within that, a PR with an ``E2E:`` plan before one
   without, then newest merge first;
 - deploy: a merge commit that is an ancestor of the serving commit is deployed;
   one that is not, or that is absent from the local object store, is not yet
@@ -221,6 +222,38 @@ def test_not_yet_done_beats_a_newer_untouched_row(tmp_path, repo, capsys):
     out = _pick(db, repo, _runner(prs), capsys)
     assert _picked(out) == 1, out
     assert "tier: unfinished work or tracking" in out
+
+
+def test_a_repeated_not_yet_done_inside_the_window_is_not_re_picked(tmp_path, repo, capsys):
+    """Owner ruling 2026-11-09: once an attempt repeats the previous attempt's
+    remaining steps (a standing pass could not do them: a push, deploy or merge),
+    the row waits the re-attempt window and the pass reaches the next row."""
+    _, s = repo
+    db = _db(
+        tmp_path, [(1, "2026-10-10T00:00:00Z", None, None), (2, "2026-10-12T00:00:00Z", None, None)]
+    )
+    doc = json.dumps({"gaps": [{"kind": "not_yet_done", "command": "push x", "detail": "d"}]})
+
+    async def attempt_twice():
+        from genesis.db.crud import pr_verifications as crud
+
+        async with aiosqlite.connect(str(db)) as conn:
+            for at in ("2026-10-20T10:00:00+00:00", "2026-10-20T11:00:00+00:00"):
+                await crud.record_attempt(
+                    conn,
+                    repo=REPO,
+                    pr_number=1,
+                    verdict="not-yet-done",
+                    note="n",
+                    now=at,
+                    evidence=doc,
+                )
+
+    asyncio.run(attempt_twice())
+    prs = [_pr(1, "2026-10-10T00:00:00Z", s["c1"]), _pr(2, "2026-10-12T00:00:00Z", s["c2"])]
+    out = _pick(db, repo, _runner(prs), capsys)
+    assert _picked(out) == 2, out
+    assert "tier: never-attempted" in out
 
 
 def test_an_untouched_row_beats_a_newer_reattempt(tmp_path, repo, capsys):
@@ -584,6 +617,32 @@ def test_no_eligible_row_says_so(tmp_path, repo, capsys):
     assert _picked(out) is None
     assert "no open row is eligible" in out
     assert run.calls == [], "nothing to rank, so nothing to ask GitHub"
+
+
+def test_no_eligible_row_names_a_waiting_repeated_not_yet_done(tmp_path, repo, capsys):
+    db = _db(tmp_path, [(1, "2026-10-10T00:00:00Z", None, None)])
+    doc = json.dumps({"gaps": [{"kind": "not_yet_done", "command": "push x", "detail": "d"}]})
+
+    async def attempt_twice():
+        from genesis.db.crud import pr_verifications as crud
+
+        async with aiosqlite.connect(str(db)) as conn:
+            for at in ("2026-10-20T10:00:00+00:00", "2026-10-20T11:00:00+00:00"):
+                await crud.record_attempt(
+                    conn,
+                    repo=REPO,
+                    pr_number=1,
+                    verdict="not-yet-done",
+                    note="n",
+                    now=at,
+                    evidence=doc,
+                )
+
+    asyncio.run(attempt_twice())
+    out = _pick(db, repo, _runner([]), capsys)
+    assert _picked(out) is None
+    assert "no open row is eligible" in out
+    assert "not-yet-done rows whose last attempt repeated the one before it" in out
 
 
 def test_nothing_deployed_is_not_a_failure(tmp_path, repo, capsys):

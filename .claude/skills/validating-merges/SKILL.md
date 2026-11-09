@@ -245,7 +245,13 @@ mode, and the Codex validator above does not run it. **Run one per install:** th
 picker has no lease, so two would pick the same row and report the same failure
 twice. Everything else in this skill applies to each pass, except that the
 picker's order (unfinished work first, then newest merge) replaces the backlog
-order in "Triage by risk".
+order in "Triage by risk". "Unfinished work" is a `not-yet-done` row, offered
+at once until an attempt records the same remaining steps (its `not_yet_done`
+gaps, compared by `command` and `detail`) as the attempt before it. Then it
+waits 7 days after that attempt and returns to the front, so a row whose step
+needs a push, deploy or merge costs one repeat pass, not every pass. When you
+made no progress, record the gaps as they were: rewording them reads as
+progress and keeps the row in front.
 
 **Once per session:** run the tracking preflight (above), from the main checkout,
 whose `.venv/bin/python` the commands below use (a linked worktree has no `.venv`).
@@ -314,12 +320,14 @@ the tool derives `cannot-verify`, and pass
 `--note "not in the serving tree: <sha>; standing mode does not deploy"`. Its
 `deploy` concern needs an issue like any other; one "awaiting deploy of <sha>"
 issue can carry several rows. This is deliberate: `not-yet-done` is offered
-again at once, while `cannot-verify` waits out the 7-day re-attempt window.
+again at once (until an attempt repeats the previous one's steps), while
+`cannot-verify` waits out the 7-day re-attempt window.
 
 **Stop and ask the owner** after any of:
 - 3 consecutive `cannot-verify` results with the same cause;
-- 3 consecutive passes picking the same `not-yet-done` row (it is offered again
-  with no delay);
+- 3 consecutive passes picking the same `not-yet-done` row (a repeated attempt
+  makes the row wait, so a third pick means the attempts are not being
+  recorded, or each one rewords its gaps);
 - 3 consecutive picker faults with the same cause;
 - routing that cannot complete (the filer refused, an indeterminate result, or
   GitHub unreachable): step 4 already stored the open verdict or saved the

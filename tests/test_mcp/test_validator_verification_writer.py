@@ -170,6 +170,32 @@ async def test_missing_mapping_does_not_prevent_recording_an_incomplete_attempt(
     assert row(path)["status"] == "open"
 
 
+async def test_a_recorded_not_yet_done_reports_whether_it_repeats_the_last_attempt(
+    recording, monkeypatch
+):
+    from genesis.mcp.health import validator_writes
+
+    path, _, config = recording
+    config.with_suffix(".local.yaml").write_text("dry_run_only: false")
+    monkeypatch.setattr(
+        validator_writes, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, "E2E: run the timer")
+    )
+    gap = {"kind": "not_yet_done", "detail": "not run", "command": "run timer"}
+    assert (await call(_doc(gaps=[gap])))["nyd_repeat"] == 0
+    assert (await call(_doc(gaps=[gap])))["nyd_repeat"] == 1
+    assert row(path)["nyd_repeat"] == 1
+    other = {**gap, "command": "run the other timer"}
+    assert (await call(_doc(gaps=[other])))["nyd_repeat"] == 0
+
+
+async def test_a_preview_carries_a_null_nyd_repeat(recording):
+    _, _, config = recording
+    config.with_suffix(".local.yaml").write_text("dry_run_only: false")
+    gap = {"kind": "not_yet_done", "detail": "not run", "command": "run timer"}
+    result = await call(_doc(gaps=[gap]), dry_run=True)
+    assert result["recorded"] is False and result["nyd_repeat"] is None
+
+
 async def test_existing_mcp_close_stores_rechecks_without_a_new_caller_argument(recording):
     path, _, config = recording
     config.with_suffix(".local.yaml").write_text("dry_run_only: false")

@@ -28,8 +28,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shlex
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
@@ -1267,6 +1269,28 @@ def test_a_not_yet_done_document_stays_open_with_the_command_as_its_note(tmp_pat
     out = capsys.readouterr().out
     assert "STAYS OPEN" in out and "run the commands above" in out
     assert "None" not in row["last_attempt_note"]
+
+
+def test_a_not_yet_done_record_says_when_the_picker_offers_it_again(tmp_path, capsys):
+    """Owner ruling 2026-11-09: same steps as the previous attempt -> the row waits
+    the re-attempt window; different steps -> offered again at once."""
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    assert _run(tmp_path, _doc(gaps=[UNDONE_GAP])) == 0
+    assert "steps differ from the previous attempt: offered again at once" in (
+        capsys.readouterr().out
+    )
+    assert _run(tmp_path, _doc(gaps=[UNDONE_GAP])) == 0
+    out = capsys.readouterr().out
+    after = re.search(r"repeat of the previous attempt: offered again after (\S+ \S+) UTC", out)
+    assert after, out
+    last = datetime.fromisoformat(_row(db)["last_attempt_at"])
+    assert after.group(1) == (last + timedelta(days=7)).astimezone(UTC).strftime("%Y-%m-%d %H:%M")
+    assert _row(db)["nyd_repeat"] == 1
+    changed = {**UNDONE_GAP, "command": "pytest tests/test_other.py"}
+    assert _run(tmp_path, _doc(gaps=[changed])) == 0
+    assert "steps differ from the previous attempt" in capsys.readouterr().out
+    assert _row(db)["nyd_repeat"] == 0
 
 
 def test_a_note_on_not_yet_done_is_appended_after_the_commands(tmp_path):

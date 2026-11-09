@@ -199,6 +199,9 @@ async def record_verification(
             "server_dry_run_only": forced,
             "recorded": False,
             "rechecks": rechecks,
+            # 1 when a recorded not-yet-done repeats the previous attempt's steps (the
+            # picker then waits the re-attempt window), 0 when they differ, else null.
+            "nyd_repeat": None,
         }
         if preview:
             return result
@@ -230,6 +233,8 @@ async def record_verification(
             )
         if not changed:
             raise ToolError("Obligation changed; re-read before deciding whether to retry")
+        if not closing:
+            result["nyd_repeat"] = await crud.attempt_repeat(db, repo=target, pr_number=pr)
         return result | {"recorded": True}
 
     return await record(shared) if preview else await owned_call(shared, record)
