@@ -3325,6 +3325,12 @@ def _env_command(argv: list[str], i: int, state: _EnvSplitState, contexts) -> tu
         if options and token in {"--", "-"}:
             options = False
             i += 1
+            # GNU env takes ONE lone `-` as -i exactly where option processing
+            # ends, so after `--` the next `-` is still that operand: `env -- -
+            # cmd` and `env -S '-- - cmd'` run cmd (MEASURED, GNU env 9.4). After
+            # a lone `-`, or after an assignment, a `-` is the program.
+            if argv[i - 1] == "--" and i < len(argv) and argv[i] == "-":
+                i += 1
             continue
         if options and token.startswith("-"):
             consumed = 1

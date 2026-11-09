@@ -113,6 +113,24 @@ def test_split_option_after_operand_boundary_is_not_a_carrier(parser, shim, pref
     assert not any(s.exe == "git" for s in parser.analyze(shlex.join(argv)))
 
 
+@pytest.mark.parametrize("prefix", [
+    ["--", "-"], ["-i", "--", "-"], ["-u", "X", "--", "-"], ["--", "-", "A=1"], ["-S", "-- -"],
+    ["-S", "--", "-"], ["-", "-"], ["--", "--"], ["--", "A=1", "-"], ["-S", "- -"],
+])
+def test_lone_dash_where_options_end_matches_native_env(parser, shim, prefix):
+    # GNU env takes ONE lone `-` as -i exactly where option processing ends,
+    # whether `--` or the first non-option ended it; anywhere later it is the
+    # program. The oracle decides which; the parser must find the same program.
+    argv = [ENV, *prefix, str(shim), "push"]
+    status, records = invoke(argv)
+    if records:
+        assert (status, records) == (0, [["push"]])
+        project(parser, shlex.join(argv), [str(shim), "push"])
+    else:
+        assert status != 0
+        assert not any(s.exe == "git" for s in parser.analyze(shlex.join(argv)))
+
+
 @pytest.mark.parametrize("body", [
     "-u REMOVE {shim} push", "-- {shim} push", "A=1 {shim} push",
     "-S '{shim} push'", "env -S '{shim} push'", "# ignored",
