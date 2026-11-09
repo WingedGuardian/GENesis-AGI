@@ -5154,7 +5154,7 @@ for contributing code upstream.
 ```yaml subsystem-map
 entry: modules-skills
 modules: [modules, skills, contribution, bookmark, workflows]
-verified: 702274dfe 2026-11-05
+verified: 81bbdb0a9 2026-11-08
 ```
 
 - **modules/**: capability modules are "hands, not brain" — a module may
@@ -5249,6 +5249,14 @@ verified: 702274dfe 2026-11-05
   Explicit login accepts `--device-auth` for headless authentication.
   Inspection/run disable account-connected Apps through fixed CLI arguments
   and verify that effective setting, retaining the exact two-server boundary.
+  A contained compatibility workflow extends the existing native fixture driver
+  for explicitly handled app-server requests and freezes its source/binary/case
+  manifest before execution. It checks native command approval, canonical guard
+  ask versus denial, resume, required MCP failure, dispatched provenance and
+  ready-descendant cleanup with synthetic loopback responses and harmless
+  effects. Independent copied-artifact readback refuses incomplete or stale
+  evidence; no production provider, native auth, lifecycle enrollment or live
+  policy is added. See `docs/reference/codex-native-harness.md`.
   Interactive native qualification records a Codex0.166.0 reference binary.
   The launcher warns on other recognizable versions and retains its startup
   inspection/refusal checks; those inspect state, not actual tool denial.
