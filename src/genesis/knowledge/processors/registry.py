@@ -31,8 +31,8 @@ class ContentProcessorRegistry:
         """Register a processor for URLs matching a regex pattern."""
         self._url_patterns.append((re.compile(pattern), processor))
 
-    def get_processor(self, source: str) -> ContentProcessor | None:
-        """Find the appropriate processor for a source path or URL."""
+    def get_url_processor(self, source: str) -> ContentProcessor | None:
+        """Apply the registered URL prefilters and processor checks in order."""
         # Check URL patterns first (URLs may also have extensions)
         # A pattern is a cheap pre-filter; the processor's own can_handle has
         # the last word, so a URL that merely contains a matching fragment falls
@@ -41,6 +41,13 @@ class ContentProcessorRegistry:
         for pattern, processor in self._url_patterns:
             if pattern.search(source) and processor.can_handle(source):
                 return processor
+        return None
+
+    def get_processor(self, source: str) -> ContentProcessor | None:
+        """Find the appropriate processor for a source path or URL."""
+        processor = self.get_url_processor(source)
+        if processor is not None:
+            return processor
 
         # Fall back to extension matching for file paths
         ext = Path(source).suffix.lower()

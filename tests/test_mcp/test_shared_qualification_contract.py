@@ -12,7 +12,10 @@ from packaging.requirements import Requirement
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULES = ["test_shared_http_admission", "test_shared_http_policy", "test_shared_http_runtime",
-           "test_shared_cli_startup_contract", "test_shared_forwarder", "test_shared_forwarder_http_errors"]
+           "test_shared_cli_startup_contract", "test_shared_forwarder", "test_shared_forwarder_http_errors",
+           "test_shared_paths", "test_shared_path_tools", "test_shared_path_routes",
+           "test_shared_path_versions", "test_shared_path_context"]
+LAZY_SDK_MODULES = {"test_shared_path_context"}
 PINS = {"fastmcp": "4.1.4", "mcp": "2.3.0", "uvicorn": "0.54.0"}
 
 CHILD = """
@@ -36,7 +39,7 @@ try:
     importlib.import_module('tests.test_mcp.'+sys.argv[2])
 except BaseException as error:
     print(json.dumps({'type':type(error).__name__,'error':str(error),'seen':seen}))
-else: raise AssertionError('No qualification or SDK boundary observed')
+else: print(json.dumps({'type':'imported','error':None,'seen':seen}))
 """
 
 
@@ -54,8 +57,11 @@ def test_qualification_precedes_any_sdk_import(module, strict, changed):
     assert run.returncode == 0, run.stderr
     result = json.loads(run.stdout)
     if changed is None:
-        assert result["type"] == "RuntimeError" and result["error"] == "SDK_IMPORT_SENTINEL"
-        assert len(result["seen"]) == 1
+        if module in LAZY_SDK_MODULES:
+            assert result == {"type": "imported", "error": None, "seen": []}
+        else:
+            assert result["type"] == "RuntimeError" and result["error"] == "SDK_IMPORT_SENTINEL"
+            assert len(result["seen"]) == 1
     else:
         assert result["seen"] == []
         assert result["type"] == ("RuntimeError" if strict == "1" else "Skipped"), result
@@ -117,8 +123,9 @@ def test_protocol_step_is_strict_complete_and_has_no_skip_escape():
     protocol = next(command for command in commands if "--junitxml=junit-shared-mcp.xml" in command)
     for module in MODULES:
         assert f"tests/test_mcp/{module}.py" in protocol
+    assert "tests/test_mcp/test_shared_path_policy.py" in protocol
     assert protocol.index("rm -f junit-shared-mcp.xml") < protocol.index("-m pytest")
     check = next(command for command in commands if "scripts/check_skip_ceiling.py" in command)
-    assert "junit-shared-mcp.xml --ceiling 0 --min-collected 243" in check
+    assert "junit-shared-mcp.xml --ceiling 0 --min-collected 340" in check
     assert not job.get("continue-on-error")
     assert not any(step.get("continue-on-error") for step in job["steps"])

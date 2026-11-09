@@ -6,8 +6,8 @@ existing shared service. It uses the same four service names and trusted
 Genesis service, runtime, provider or Qdrant client. Ordinary registrations,
 `adapter.argv`, the rollout ceiling and installed units stay unchanged.
 
-This is the transport increment. Caller-relative path integration, the complete
-local/shared tool union, bookmarks, payment ancestry and per-tool stage routing
+This is an explicit shared-only connection. The complete local/shared tool
+union, bookmarks, payment ancestry and per-tool stage routing
 remain required before it can replace a registration. The shared catalog
 deliberately excludes local tools. Native-client/provider qualification and
 matched memory measurements remain activation gates.
@@ -30,6 +30,52 @@ does not accept rollout stages or external-profile flags.
 The same exact shared-stack fence applies: FastMCP 4.1.4, MCP 2.3.0 and Uvicorn
 0.54.0. Ordinary floating dependencies remain supported by the ordinary stdio
 path; an unqualified explicit forwarder refuses before opening its transport.
+
+## Caller files and backend compatibility
+
+The trusted service URL still ends in `/mcp`. The forwarder derives `/mcp/v1`
+for every HTTP generation and cleanup request. Both routes use the same server,
+SDK session manager and limits. An older backend without the versioned endpoint
+refuses the connection before a tool runs; the frontend never downgrades or
+resends a tool call after rollback.
+
+Only immediate input-file fields are interpreted in the forwarder's cwd:
+
+| Tool | Field | Caller interpretation |
+|---|---|---|
+| `evo_run`, `experiment_run` | `golden_set_path` | Nonempty paths become absolute; empty keeps the managed default |
+| `skill_replay_run` | `suite_path` | Nonempty paths become absolute; empty keeps the managed default |
+| `task_submit` | `plan_path` | Strip, expand `~`, make absolute; existing plan-root, content and intake checks remain |
+| `document_index` | `path` | Expand `~` and make absolute, including empty cwd input |
+| `document_query` | `path_or_doc_id` | Keep `pi-` IDs; otherwise expand `~` and make absolute |
+| `knowledge_ingest_source` | `source` | Keep URLs accepted by the existing processor registry; otherwise make the read path absolute |
+| `knowledge_ingest_batch` | `directory` | Make absolute, including empty cwd input |
+| `resume_review` | `resume_source` | Existing caller paths become absolute; other strings remain resume text |
+
+The golden/suite, ingestion and resume rules do not expand `~`. Absolute paths
+retain symlink spelling; the tool's existing resolver and guards remain in
+charge. Non-string arguments reach authoritative schema validation unchanged.
+Remote-repository paths, glob patterns, durable strategy/charter references and
+browser upload are outside this immediate shared-file mapping.
+
+Rewritten ingestion arguments carry request-local original identity metadata:
+cache keys, unit IDs, manifest sources and tree keys retain the supplied source
+or directory spelling, while extraction and uploads read the caller's absolute
+file. This adds no persistent alias mapping or cache migration. Optional
+`read_path`/`read_directory` orchestrator arguments default to the existing
+ordinary behavior; ordinary callers omit them.
+
+The reserved `_meta["genesis/callerPath"]` hint is emitted only for rewritten
+source/directory arguments. The backend checks its exact shape and binding to
+the current argument. A missing optional hint on an absolute call is valid;
+missing required request context or a malformed/misbound supplied hint refuses
+before the file/provider consumer. Scope resets on success, error and cancellation.
+
+On the retained `/mcp` route, unambiguous absolute paths, URLs, IDs and managed
+defaults remain valid. Relative file arguments and relative resume strings
+refuse rather than guessing a server-cwd interpretation. On `/mcp/v1`, a
+relative resume string is text, so a same-named server file cannot replace it.
+Ordinary stdio keeps its existing file/text interpretation.
 
 ## Identity and credentials
 

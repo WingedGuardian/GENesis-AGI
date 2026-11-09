@@ -13,6 +13,8 @@ from mcp.shared.exceptions import MCPError
 from mcp.shared.jsonrpc_dispatcher import JSONRPCDispatcher
 from mcp_types import CONNECTION_CLOSED, INTERNAL_ERROR, INVALID_REQUEST, PARSE_ERROR
 
+from genesis.mcp.shared_paths import forwarder_url, prepare_params
+
 logger = logging.getLogger(__name__)
 
 
@@ -61,6 +63,7 @@ class _Negotiation:
 class RemotePeer:
     def __init__(self, group, settings, header_factory):
         self.group, self.settings, self.header_factory = group, settings, header_factory
+        self.url = forwarder_url(settings.http.url)
         self.current, self.front, self.initialization, self.version = None, None, None, None
         self.initialized, self.negotiation = False, None
         self.lock = anyio.Lock()
@@ -117,7 +120,7 @@ class RemotePeer:
                     headers = {"mcp-session-id": generation.session_id}
                     if version := generation.version or self.version:
                         headers["mcp-protocol-version"] = version
-                    response = await client.delete(self.settings.http.url, headers=headers)
+                    response = await client.delete(self.url, headers=headers)
                     if response.status_code not in {200, 204, 404}:
                         logger.warning("Shared MCP session cleanup refused (%s)", response.status_code)
             except Exception as error:
@@ -151,7 +154,7 @@ class RemotePeer:
                 event_hooks={"response": [observe_response]},
             ) as client:
                 async with streamable_http_client(
-                    self.settings.http.url, http_client=client,
+                    self.url, http_client=client,
                     terminate_on_close=False, max_sse_event_size=None,
                 ) as (incoming, outgoing):
                     generation = _Generation(JSONRPCDispatcher(incoming, outgoing))
@@ -196,6 +199,7 @@ class RemotePeer:
     async def request(self, context, method, params):
         generation, gate = None, self.negotiation if method == "initialize" else None
         try:
+            params = prepare_params(self.settings.http.service, method, params)
             if method != "initialize":
                 await self._wait_initialize()
             generation = await self._get()

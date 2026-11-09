@@ -131,7 +131,7 @@ factories; ordinary session launch keeps its existing selection. Four inert
 rendering does not enable them. Qualify actual manager readiness and measured
 start/stop settings before activation. The explicit
 [shared-only transport](mcp-shared-forwarder.md) is available for qualification;
-caller-path integration, the local catalog/bookmark union, per-tool stage routing
+the local catalog/bookmark union, per-tool stage routing
 and matched measurements remain rollout prerequisites. Constructing the
 HTTP app or rendering a unit alone is not activation evidence.
 

@@ -32,7 +32,7 @@ async def exchange(monkeypatch, response, method="tools/call"):
         return actual_client(*args, **kwargs, transport=httpx2.MockTransport(backend))
 
     monkeypatch.setattr(_connection.httpx2, "AsyncClient", client)
-    settings = SimpleNamespace(http=SimpleNamespace(url="http://127.0.0.1:1/mcp"), shutdown_grace_s=.25)
+    settings = SimpleNamespace(http=SimpleNamespace(url="http://127.0.0.1:1/mcp", service="health"), shutdown_grace_s=.25)
     async with anyio.create_task_group() as owners:
         peer = _connection.RemotePeer(owners, settings, lambda: {"Authorization": "Bearer fixture"})
         try:

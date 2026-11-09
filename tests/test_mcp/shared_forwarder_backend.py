@@ -99,6 +99,11 @@ async def main():
     application = await build_http_app(
         server, config=config, resolver=CallerResolver("f" * 43, {}), database=db, tracker=tracker,
         loaded_commit="a" * 40, started_at="2026-01-01T00:00:00+00:00", enabled=lambda: True)
+    if (root / "fixture-old-route").exists():
+        # Model the older backend's public route table, retaining the SAME
+        # qualified transport, manager and original endpoint for the oracle.
+        application.router.routes[:] = [route for route in application.router.routes
+                                       if getattr(route, "path", None) != "/mcp/v1"]
 
     async def instrumented(scope, receive, send):
         corrupt, sent, sse, fault = False, False, False, None

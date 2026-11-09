@@ -124,6 +124,11 @@ _LOST_SCOPE_CALLER = CallerContext(origin="external_untrusted")
 _warned_sites: set[tuple[str, int]] = set()
 
 
+def in_shared_service() -> bool:
+    """Whether this process has entered the existing shared-service mode."""
+    return _shared_service
+
+
 def enter_shared_service() -> None:
     """Mark this process as a shared service, for good: its environment names no caller.
 
