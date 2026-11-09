@@ -83,6 +83,10 @@ docs/actions/genesis/*.md
 docs/actions/user/*.md
 !docs/actions/README.md
 data/genesis.db
+# The whole live-DB file family: its -wal/-shm, and the safety snapshots the
+# update, restore and conversion paths leave beside it (genesis.db.pre-update*,
+# genesis.db.pre-restore.<epoch>, genesis.db.pre-nocow-*, *.corrupt-*).
+data/genesis.db*
 data/genesis.sql
 *.jsonl
 # Golden sets for the eval-judge calibration framework MUST be in the
