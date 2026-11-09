@@ -1,0 +1,1 @@
+- Added an explicit stdio forwarder for qualified shared MCP services, preserving request IDs and reporting uncertain outcomes without resending tools. Registration and rollout activation remain gated on the remaining capability and client checks.

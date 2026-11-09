@@ -31,14 +31,15 @@ The resolver never reads the process environment. A request with a missing,
 unknown or malformed credential is :class:`Rejected`, and its reason is the same
 whichever secret it was closest to.
 
-Nothing in the runtime calls this module yet: the shared-service mode is the
-reader.
+The shared service authenticates requests through the resolver. The explicit
+stdio forwarder uses :func:`forwarder_headers` as a read-only credential reader.
 """
 
 from __future__ import annotations
 
 import contextlib
 import hmac
+import json
 import logging
 import os
 import re
@@ -306,6 +307,19 @@ def _validated_identity(fields: object) -> CallerContext | None:
         transcript_id=fields.get("transcript_id"),
         legacy_session_id=fields.get("legacy_session_id"),
     )
+
+
+def forwarder_headers(caller: CallerContext, *, directory: Path | None = None) -> dict[str, str]:
+    """Read the existing forwarder secret; never provision, repair or widen a profile."""
+    if not isinstance(caller, CallerContext) or caller.profile is not None:
+        raise CredentialStoreError("Caller profile is unavailable to this forwarder")
+    fields = {name: getattr(caller, name) for name in _FORWARDED_FIELDS}
+    if _validated_identity(fields) is None:
+        raise CredentialStoreError("Invalid forwarder identity")
+    directory = directory or _default_dir()
+    _secure_dir(directory, create=False)
+    token = _read_token(directory / FORWARDER, repair_mode=False)
+    return {"Authorization": "Bearer " + token, "X-Genesis-Caller": json.dumps(fields, sort_keys=True)}
 
 
 class CallerResolver:
