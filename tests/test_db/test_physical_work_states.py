@@ -255,6 +255,9 @@ async def test_submission_error_after_enqueue_keeps_ownership(physical_path, mon
         proxy = real(pool, fn, *args)
         if isinstance(getattr(fn, "__self__", None), PhysicalWork):
             # The executor accepted the callable, but its caller gets no proxy.
+            # This case is work that already STARTED: wait for it, or the owner
+            # may settle first and abandon it (the unstarted case, tested below).
+            assert fn.__self__._started.wait(10), "physical work did not start"
             proxy.add_done_callback(lambda done: None if done.cancelled() else done.exception())
             raise RuntimeError("synthetic failure after enqueue")
         return proxy
@@ -287,6 +290,60 @@ async def test_submission_error_after_enqueue_keeps_ownership(physical_path, mon
         gate.release.set()
         await asyncio.gather(task, return_exceptions=True)
         await db.close()
+
+
+async def test_unstarted_work_after_failed_submission_never_runs(physical_path, monkeypatch):
+    # The owner settles a failed submission as unconfirmed and closes its DB.
+    # Work still queued behind a busy executor must not run after that.
+    from genesis.db.physical_work import PhysicalWork
+
+    db = scoped.RequestDatabase(physical_path, max_units=1)
+    loop = asyncio.get_running_loop()
+    executor = ThreadPoolExecutor(max_workers=1)
+    loop.set_default_executor(executor)
+    blocker_release = threading.Event()
+    blocker = executor.submit(blocker_release.wait, 10)
+    real = loop.run_in_executor
+    queued, refused = [], asyncio.Event()
+    calls = []
+
+    def enqueue_then_fail(pool, fn, *args):
+        proxy = real(pool, fn, *args)
+        if isinstance(getattr(fn, "__self__", None), PhysicalWork):
+            queued.append(proxy)
+            proxy.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+            raise RuntimeError("synthetic failure after enqueue")
+        return proxy
+
+    monkeypatch.setattr(loop, "run_in_executor", enqueue_then_fail)
+
+    async def owner():
+        async with db.unit_of_work():
+            try:
+                await db.run_in_thread(lambda: calls.append(True))
+            except scoped.DatabaseScopeError:
+                refused.set()
+                raise
+
+    task = asyncio.create_task(owner())
+    try:
+        await asyncio.wait_for(refused.wait(), 10)
+        with pytest.raises(scoped.DatabaseScopeError):
+            await asyncio.wait_for(task, 10)
+        blocker_release.set()
+        await asyncio.wait_for(asyncio.wrap_future(executor.submit(lambda: None)), 10)
+        assert queued and calls == []
+        assert db._closing and db._slots._value == 0
+        # Unconfirmed submission keeps its claim, as for any unconfirmed work:
+        # shutdown stays unconfirmed and admission never reopens.
+        with pytest.raises(scoped.DatabaseScopeError, match="unconfirmed"):
+            await asyncio.wait_for(db.close(), 10)
+        assert db._slots._value == 0 and db._unclosed
+    finally:
+        blocker_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        blocker.result(timeout=10)
+        executor.shutdown(wait=True)
 
 
 async def test_legacy_thread_helper_keeps_ordinary_cancellation():
