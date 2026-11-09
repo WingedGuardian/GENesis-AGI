@@ -104,7 +104,7 @@ def _normalize_desc(value: object) -> str:
 
 
 def _parse_frontmatter(content: str, fallback_name: str = "") -> dict:
-    """Parse YAML frontmatter into name/description/keywords.
+    """Parse name/description/keywords and optional manual-only metadata.
 
     Uses a real YAML parser (the bounded, alias-forbidding ``_FrontmatterLoader``)
     so descriptions with apostrophes, escaped quotes, inline comments, or
@@ -160,11 +160,15 @@ def _parse_frontmatter(content: str, fallback_name: str = "") -> dict:
                     keywords = [k.strip() for k in kw.split(",") if k.strip()]
                 else:
                     keywords = []
-                return {
+                info = {
                     "name": name,
                     "description": description,
                     "keywords": keywords,
                 }
+                manual = loaded.get("disable-model-invocation")
+                if manual is True or (isinstance(manual, str) and manual.strip().lower() == "true"):
+                    info["disable-model-invocation"] = True
+                return info
     # PyYAML unavailable, no frontmatter, oversized, or block not a mapping.
     return _parse_frontmatter_legacy(content, fallback_name)
 
@@ -178,10 +182,17 @@ def _parse_frontmatter_legacy(content: str, fallback_name: str = "") -> dict:
     name = fallback_name
     description = ""
     keywords: list[str] = []
+    manual_only = False
     if content.startswith("---"):
-        end = content.find("---", 3)
+        end = content.find("\n---", 3)
+        if end < 0:
+            end = content.find("---", 3)
         if end > 0:
             frontmatter = content[3:end]
+            manual_only = bool(re.search(
+                r'''^disable-model-invocation:[ \t]*(?:!!bool[ \t]+)?(?:true|'true'|"true")[ \t]*(?:\#.*)?$''',
+                frontmatter, re.MULTILINE | re.IGNORECASE,
+            ))
             name_match = re.search(r'name:\s*["\']?([^"\'\n]+)', frontmatter)
             if name_match:
                 name = name_match.group(1).strip()
@@ -212,7 +223,10 @@ def _parse_frontmatter_legacy(content: str, fallback_name: str = "") -> dict:
                     for k in kw_match.group(1).split(",")
                     if k.strip()
                 ]
-    return {"name": name, "description": description, "keywords": keywords}
+    info = {"name": name, "description": description, "keywords": keywords}
+    if manual_only:
+        info["disable-model-invocation"] = True
+    return info
 
 
 # SELF markers: the files that make a directory a skill IN ITS OWN RIGHT.
