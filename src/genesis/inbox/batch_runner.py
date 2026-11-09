@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 import uuid
@@ -21,6 +22,7 @@ from genesis.inbox.url_coverage import (
     _has_url_failures,
     _uncovered_urls,
 )
+from genesis.observability.spans import SpanKind, start_span
 
 if TYPE_CHECKING:
     from genesis.inbox.monitor import InboxMonitor
@@ -188,7 +190,21 @@ async def run_one_batch(
         return False
 
     try:
-        output = await run_with_overload_retry(monitor._invoker, invocation)
+        with start_span(
+            "inbox.evaluate",
+            SpanKind.OPERATION,
+            attributes={"inbox_batch_id": batch_id, "inbox_item_id": item.id},
+            include_exception_text=False,
+        ) as span:
+            returned = False
+            try:
+                output = await run_with_overload_retry(monitor._invoker, invocation)
+                returned = True
+            finally:
+                with contextlib.suppress(Exception):
+                    span.set_attr("evaluation_outcome", "returned" if returned else "not_returned")
+                    if not returned:
+                        span.set_status_error("evaluation_not_returned")
     except CCReplayUnsafeError as exc:
         err = f"{inbox_items.REPLAY_UNSAFE_PREFIX} CC work may already have run: {exc}"
         errors.append(err)

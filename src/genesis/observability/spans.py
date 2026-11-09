@@ -172,6 +172,7 @@ def start_span(
     attributes: dict[str, Any] | None = None,
     trace_id: str | None = None,
     parent_span_id: str | None = None,
+    include_exception_text: bool = True,
 ) -> Generator[Span | _NullSpan]:
     """Open a span for the duration of the block.
 
@@ -217,7 +218,11 @@ def start_span(
     try:
         yield span
     except Exception as exc:
-        span.set_status_error(f"{type(exc).__name__}: {exc}")
+        if include_exception_text:
+            span.set_status_error(f"{type(exc).__name__}: {exc}")
+        else:
+            with contextlib.suppress(Exception):
+                span.set_status_error("exception details omitted")
         raise
     finally:
         with contextlib.suppress(Exception):
