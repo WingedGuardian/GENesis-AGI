@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests.test_scripts.test_code_intel_cbm_worker import _args, _fake_worker, worker
+from tests.test_scripts.test_code_intel_effective_policy import policy as full_policy_value
 from tests.test_scripts.test_code_intel_execution import evidence as evidence
 from tests.test_scripts.test_code_intel_execution import scope as scope
 from tests.test_scripts.test_index_marker_execution import _reservation, _schema5
@@ -20,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 @pytest.fixture
 def bound(queue, scope, evidence, tmp_path, monkeypatch):
-    def prepare(*, error=False, frozen_environment=False, path_fault=None):
+    def prepare(*, error=False, frozen_environment=False, path_fault=None, full_policy=False):
         _fake_worker(tmp_path, monkeypatch, error=error)
         managed = worker.load_managed()
         config = managed["runtime_config"](tmp_path / "settings")
@@ -40,6 +41,8 @@ def bound(queue, scope, evidence, tmp_path, monkeypatch):
                                    current_matches=lambda: True)
         policy = dict(route="workload", slice="genesis-workload.slice", wall_seconds=3600,
                       sibling_reserve_bytes=2 * 1024**3, cache_reserve_bytes=2 * 1024**3)
+        if full_policy:
+            policy = full_policy_value()
         native_env = managed["native_env"](config)
         canonical_native_env = managed["native_env"]
         environment_recipe = None
@@ -214,11 +217,42 @@ def test_real_factory_binds_admission_before_actual_child_and_terminal(bound, qu
             worker._execute_stock_worker(tmp_path / "settings", case.args, 8 * 1024**3, queued_factory=factory)
     else:
         assert worker._execute_stock_worker(tmp_path / "settings", case.args, 8 * 1024**3, queued_factory=factory) == 0
-    assert case.calls == ["registration", "ready", "admission"]
+    assert case.calls == ["registration", "ready", "registration", "admission"]
     status = queue.execution_status(case.claimed["context"])
     assert status["native_intent"]["source"] == status["launch_reservation"]["source"]
     assert status["terminal"]["data"]["provider_ok"] is (not error)
     assert queue.apply_native(case.claimed["context"]) == ("pending" if error else "consumed")
+
+
+def test_complete_owner_policy_reaches_actual_native_intent_without_projection(bound, queue, tmp_path):
+    case = bound(full_policy=True)
+    factory = case.queued['cbm_factory'](case.snapshot, case.modules, case.claimed['context'], case.policy)
+    # A caller's later nested mutation cannot alter the retained factory recipe.
+    case.policy['watchdog']['interval'] = '999'
+    assert worker._execute_stock_worker(tmp_path / 'settings', case.args, 8 * 1024**3,
+                                        queued_factory=factory) == 0
+    status = queue.execution_status(case.claimed['context'])
+    assert status['native_intent']['source'] == status['launch_reservation']['source']
+    assert status['terminal']['data']['provider_ok'] is True
+
+
+@pytest.mark.parametrize('field', ['io_weight', 'cpu_quota', 'interval', 'warmup_interval',
+                                  'warmup_seconds', 'load_max', 'iowait_max', 'bad_samples',
+                                  'continuous_pause_max'])
+def test_complete_control_policy_drift_refuses_before_registration(bound, queue, tmp_path, field):
+    case = bound(full_policy=True)
+    if field == 'io_weight':
+        case.policy[field] = '21'
+    elif field == 'cpu_quota':
+        case.policy[field] = '201%'
+    else:
+        case.policy['watchdog'][field] = '31'
+    factory = case.queued['cbm_factory'](case.snapshot, case.modules, case.claimed['context'], case.policy)
+    with pytest.raises(ValueError, match='source|configuration'):
+        worker._execute_stock_worker(tmp_path / 'settings', case.args, 8 * 1024**3, queued_factory=factory)
+    assert not case.calls
+    status = queue.execution_status(case.claimed['context'])
+    assert status['scope_registration'] is None and status['native_intent'] is None
 
 
 @pytest.mark.parametrize("change", ["mode", "persistence", "settings", "environment", "cache", "wall", "reserve", "source"])

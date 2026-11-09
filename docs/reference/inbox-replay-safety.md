@@ -67,8 +67,15 @@ next scan. The row claim still precedes the evaluator call.
 This recovery does not release `replay_unsafe:` holds; unreadable held payloads
 still need deliberate operator repair as described above.
 
+Resume transitions update only a row still in `processing` with the exact
+`awaiting_approval:` marker read by that pass. If another process claims,
+completes, supersedes or reparks the row first, the stale transition leaves its
+state and retry count untouched. This covers rejection, ended approval, source
+changes/disappearance and corrupt payload recovery. Grant retirement still
+precedes the conditional row update; losing that update does not undo retirement.
+
 This does not add atomic retirement for a pending approval resolved concurrently
-with source deletion, or expected-state predicates for stale inbox-row updates.
+with source deletion.
 
 ## Limits
 

@@ -869,6 +869,7 @@ def _is_merged(ref: str, repo_root: Path, *, is_branch: bool = True) -> bool:
 
 def _merge_verdict(
     ref: str, repo_root: Path, *, is_branch: bool = True, allow_network: bool = True,
+    tip: str | None = None,
 ) -> str:
     """Return WHICH method proved the work is in ``main`` — or "" if none did.
 
@@ -891,6 +892,11 @@ def _merge_verdict(
     ``ref`` is a branch name (``is_branch=True``) or, for a detached-HEAD
     worktree, its HEAD commit SHA (``is_branch=False``).
 
+    ``tip`` is the commit to judge instead of what ``ref`` resolves to now: trash
+    expiry passes an archive's recorded head, so a branch that has since moved or
+    been deleted is judged by what was archived. ``gh`` is still asked by the
+    branch NAME, and the PR it returns must have merged exactly ``tip``.
+
     For a BRANCH, three methods in order:
     1. git merge-base --is-ancestor (fast; branch tip is an ancestor of main)
     2. gh pr list --head <branch> --state merged (handles squash merges)
@@ -912,10 +918,11 @@ def _merge_verdict(
     """
     # Method 1: git merge-base (branch ref or raw SHA) — the ONLY method for a
     # detached HEAD (see docstring: patch-id/PR methods are unsafe for a bare SHA).
+    commit = tip or ref
     try:
         result = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", ref, "main"],
-            capture_output=True, cwd=str(repo_root), timeout=10,
+            ["git", "merge-base", "--is-ancestor", commit, "main"],
+            capture_output=True, cwd=str(repo_root), timeout=10, env=_git_env(),
         )
         if result.returncode == 0:
             return "ancestor"
@@ -943,16 +950,17 @@ def _merge_verdict(
             ["gh", "pr", "list", "--head", ref, "--base", _default_branch(repo_root),
              "--state", "merged", "--limit", "10", "--json", "number,headRefOid"],
             capture_output=True, text=True, errors="surrogateescape",
+            # GH_REPO would point gh at another repository than the cwd's.
             cwd=str(repo_root), timeout=30,
+            env={k: v for k, v in _git_env().items() if k != "GH_REPO"},
         )
         if result.returncode == 0:
             prs = json.loads(result.stdout)
-            tip = _run_git(repo_root, ["rev-parse", ref], timeout=15)
-            tip = (tip or "").strip()
+            sha = tip or (_run_git(repo_root, ["rev-parse", ref], timeout=15) or "").strip()
             for pr in prs:
                 # No tip to compare against is NOT a pass: without it this is the
                 # name-only check that produced the false positive.
-                if tip and pr.get("headRefOid") == tip:
+                if sha and pr.get("headRefOid") == sha:
                     return "pr"
     except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError,
             _SkipNetwork):
@@ -961,9 +969,9 @@ def _merge_verdict(
     # Method 3: zero unique commits (patch-id equivalence) — branch heads only.
     try:
         result = subprocess.run(
-            ["git", "cherry", "main", ref],
+            ["git", "cherry", "main", commit],
             capture_output=True, text=True, errors="surrogateescape",
-            cwd=str(repo_root), timeout=10,
+            cwd=str(repo_root), timeout=10, env=_git_env(),
         )
         if result.returncode == 0:
             # Lines starting with '+' are unique commits not in main
@@ -3803,18 +3811,22 @@ def _list_trash() -> None:
 # else ever releases those anchors.
 #
 # RETENTION IS OFF BY DEFAULT (owner ruling 2026-09-27, split out of #2458).
-# The predicate below reads `lane` and `had_uncommitted_changes` from metadata
-# the reaper recorded at ARCHIVE time for a REVERSIBLE action, and that is not a
-# proof that deleting the archive loses nothing: `lane: merged` includes
-# patch-id verdicts, which cannot see an evil merge; the dirty-state sample
-# ignores gitignored files the tarball does capture; and it is taken before the
-# tree is archived. A read-only pass over one install (2026-09-27, method in
-# #2504) found 15 of 131 eligible archives holding files their recorded head
-# does not. So nothing schedules
-# expiry, and `--expire-trash` deletes nothing unless an operator names a window
-# explicitly. Issue #2504 specifies the content-verified predicate that has to
-# land before a default window returns. The delete -> unpin -> unlock -> prune
-# machinery below is kept: it is the part that is sound.
+# `lane` and `had_uncommitted_changes` are metadata the reaper recorded at
+# ARCHIVE time for a REVERSIBLE action, and they are not a proof that deleting
+# the archive loses nothing: `lane: merged` includes patch-id verdicts, which
+# cannot see an evil merge; the dirty-state sample ignores gitignored files the
+# tarball does capture; and it is taken before the tree is archived. A read-only
+# pass over one install (2026-09-27, method in #2504) found 15 of 131 eligible
+# archives holding files their recorded head does not.
+#
+# So those checks are only a pre-filter. An archive expires only when
+# `scripts/worktree_redundancy.py` (#2504) also proves it redundant NOW: its
+# recorded head resolves, a fresh `_merge_verdict` of that head is `ancestor` or
+# `pr` (never `patch-id`), and every file in the tarball matches the head's tree
+# byte for byte or is on a short allowlist of regenerable paths. Any failure
+# keeps the archive. Nothing schedules expiry yet, and `--expire-trash` deletes
+# nothing unless an operator names a window explicitly. The delete -> unpin ->
+# unlock -> prune machinery below is unchanged.
 #
 # The tombstone index is NOT pruned: it is kilobytes, it is the greppable record
 # of every reaped worktree, and it also records each expiry.
@@ -4393,12 +4405,14 @@ def _remove_anchors(repo_root: Path, entry: str, anchors: list[dict]) -> int:
 
 
 def _expire_trash(
-    repo_root: Path, *, days: int, now: float | None = None, dry_run: bool = False
+    repo_root: Path, *, days: int, now: float | None = None, dry_run: bool = False,
+    allow_network: bool = True,
 ) -> dict:
     """Expire clean MERGED archives older than ``days``: DELETE THE ARCHIVE, then
     its commit pin, then UNLOCK its anchor, then PRUNE that registration. Unmerged
-    archives, merged ones that held uncommitted changes, and any whose metadata
-    cannot be read, are never expired.
+    archives, merged ones that held uncommitted changes, any whose metadata
+    cannot be read, and any the redundancy check does not prove lossless
+    (`_archive_redundant`), are never expired.
 
     The order IS the safety property. The lock keeps an archive's registration
     — and with it the commits the archive points at — alive; once the archive
@@ -4409,7 +4423,10 @@ def _expire_trash(
     """
     now = time.time() if now is None else now
     counts = {"expired": 0, "anchors_removed": 0, "skipped": 0, "retried": 0,
-              "kept": 0}
+              "kept": 0, "would_expire": 0}
+    # The content-verified predicate (#2504). If it cannot load, nothing
+    # expires: there is no fallback to the metadata-only checks below.
+    redundancy = _load_redundancy_module()
     with _lifecycle_lock() as held:
         if not held:
             _log("SKIP expiry: another lifecycle run (expiry or --recover) holds the lock")
@@ -4463,14 +4480,25 @@ def _expire_trash(
                 _log(f"SKIP {name}: its registration's directory exists ({live[0]})")
                 counts["skipped"] += 1
                 continue
+            redundant, why = _archive_redundant(
+                redundancy, stored, meta, repo_root, allow_network=allow_network,
+                reflog_dirs=[a["admin"] for a in mine],
+            )
+            if not redundant:
+                _log(f"KEEP {name}: {why}")
+                counts["kept"] += 1
+                continue
             summary = {
                 "lane": meta.get("lane") or "?",
                 "branch": meta.get("branch", ""),
-                "unique_commits": len(meta.get("unique_commits") or []),
+                "unique_commits": (len(meta["unique_commits"])
+                                   if isinstance(meta.get("unique_commits"), list) else 0),
                 "had_uncommitted_changes": bool(meta.get("had_uncommitted_changes")),
             }
             if dry_run:
-                _log(f"WOULD EXPIRE {name} ({age:.0f}d, {summary}) and {len(mine)} anchor(s)")
+                counts["would_expire"] += 1
+                _log(f"WOULD EXPIRE {name} ({age:.0f}d, {summary}; {why}) "
+                     f"and {len(mine)} anchor(s)")
                 continue
             if not _append_record(
                 {
@@ -4494,7 +4522,7 @@ def _expire_trash(
             # not enough: it is written before the deletion, which can fail.
             _append_record({"event": "deleted", "name": name,
                             "at": datetime.now(UTC).isoformat()})
-            _log(f"EXPIRED {name} ({age:.0f}d > {days}d; {summary})")
+            _log(f"EXPIRED {name} ({age:.0f}d > {days}d; {summary}; {why})")
             # An archive and a leftover directory can share a base name (a
             # partial cleanup after compressing). The anchor protects whichever
             # form is left, so it goes only once NO stored form of this entry
@@ -4529,12 +4557,57 @@ def _expire_trash(
                     counts["retried"] += 1
                     counts["anchors_removed"] += removed
                     _log(f"FINISHED expiry of {name}: removed {removed} leftover anchor(s)")
+    dry = f"{counts['would_expire']} would expire (dry run), " if dry_run else ""
     _log(
-        f"Expiry: {counts['expired']} archive(s) expired, {counts['anchors_removed']} "
+        f"Expiry: {dry}{counts['expired']} archive(s) expired, {counts['anchors_removed']} "
         f"anchor(s) removed, {counts['retried']} earlier expiry finished, "
-        f"{counts['skipped']} skipped, {counts['kept']} kept (unmerged, held uncommitted changes, or undetermined)"
+        f"{counts['skipped']} skipped, {counts['kept']} kept (unmerged, held uncommitted "
+        f"changes or files not in its merged head, or undetermined)"
     )
     return counts
+
+
+def _load_redundancy_module():
+    """``scripts/worktree_redundancy.py`` under a private name, or None."""
+    import importlib.util
+
+    path = Path(__file__).resolve().parent / "worktree_redundancy.py"
+    try:
+        spec = importlib.util.spec_from_file_location("_worktree_lifecycle_redundancy", path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception as e:  # noqa: BLE001 — any load failure means "expire nothing"
+        _log(f"WARN could not load {path.name}: {e}; no archive will expire")
+        return None
+    return module
+
+
+def _archive_redundant(
+    module, stored: Path, meta: dict, repo_root: Path, *, reflog_dirs: list[Path],
+    allow_network: bool = True,
+) -> tuple[bool, str]:
+    """The predicate's verdict for one archive. Fails CLOSED on any error.
+
+    ``reflog_dirs`` (required) are the admin dirs of the registrations expiry
+    would prune.
+    """
+    if module is None:
+        return False, "redundancy check unavailable"
+    branch = meta.get("branch") if isinstance(meta.get("branch"), str) else ""
+
+    def verdict(head: str) -> str:  # the head the predicate validated
+        return _merge_verdict(branch or head, repo_root, is_branch=bool(branch), tip=head,
+                              allow_network=allow_network)
+
+    try:
+        redundant, why = module.archive_redundancy(
+            stored, meta, repo_root, verdict=verdict, reflog_dirs=reflog_dirs,
+        )
+    except Exception as e:  # noqa: BLE001
+        return False, f"redundancy check failed ({type(e).__name__})"
+    return redundant is True, str(why)
 
 
 # ---------------------------------------------------------------------------
@@ -4697,10 +4770,10 @@ def main() -> int:
         if days is None:
             _log(f"Trash expiry not run: {source}")
             return 0
-        _log(f"Trash expiry starting ({source}). WARNING: retention is off by default "
-             "because this predicate is NOT a losslessness proof (#2504); an archive it "
-             "expires may hold files no commit has")
-        _expire_trash(repo_root, days=days, dry_run=args.dry_run)
+        _log(f"Trash expiry starting ({source}). An archive expires only when its head "
+             "is in main and its files match that head (#2504); nothing schedules this run")
+        _expire_trash(repo_root, days=days, dry_run=args.dry_run,
+                      allow_network=not args.no_network)
         return 0
 
     if args.release_stale_claims:

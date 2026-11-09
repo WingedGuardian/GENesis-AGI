@@ -79,6 +79,7 @@ def validate_campaign(manifest, checked, alias, *, cases=None):
     ):
         raise Incomplete("campaign_transport_mismatch")
     identities = pinned.model_identities(transport)
+    receipt_policy = pinned.frozen_receipt_policy(transport)
     fingerprint = transport.get("credential_fingerprint")
     if (not isinstance(fingerprint, str) or len(fingerprint) != 64
         or any(char not in "0123456789abcdef" for char in fingerprint)
@@ -111,6 +112,7 @@ def validate_campaign(manifest, checked, alias, *, cases=None):
             or type(row.get("repetition")) is not int or coordinate in actual
             or pinned.frozen_credential_mode(row) != mode
             or pinned.model_identities(row) != identities
+            or pinned.frozen_receipt_policy(row) != receipt_policy
             or any(canonical(row.get(key)) != canonical(value) for key, value in fields.items())):
             raise Incomplete("campaign_schedule_mismatch")
         actual[coordinate] = row["request_hash"]
