@@ -4007,8 +4007,14 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, secrets_location.py, _config_overlay.py, caller_context.py, caller_credentials.py]
-verified: 58ff9f47c 2026-11-07
+verified: 5a3de4eee 2026-11-08
 ```
+
+Scoped verification: the caller identity boundary only. Shared mode refuses
+process-environment identity through both accessors, including after environment
+drift; validated requests use `caller_context()`. Legacy reads remain raw and
+per-call. This does not requalify the remaining platform/data subsystems or
+activate shared MCP.
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
 provider/model/outcome. Failed historical attempts render as a warning, not an
