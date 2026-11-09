@@ -12,7 +12,9 @@ as a script. It routes on argv, applies the caller's ``--jq`` with the real
 ``jq`` (``gh --jq`` prints strings raw and everything else as compact JSON, measured
 2026-11-08 against gh 2.101.0), and FAILS LOUDLY on any argv it does not know: exit
 97 and a ``FAKE-GH-UNROUTED`` line, which every test asserts is absent. A new ``gh``
-read in the report therefore fails here until a route records its answer.
+read in the report therefore fails here until a route records its answer. GraphQL
+answers only an exact stored copy of each gate query (``GRAPHQL_DOCUMENTS``), so a
+changed query is refused, and the drift test below names the document to re-record.
 
 NO ``_TEST_GH_*`` SEAMS. Each one returns before its ``gh`` call, which would skip the
 fetch and parse this file exists to run. The only seam set is
@@ -35,6 +37,7 @@ Synthetic values throughout: the repository, PR number, logins and shas are made
 """
 
 from __future__ import annotations
+import __future__
 
 import ast
 import base64
@@ -47,7 +50,14 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_hooks.fake_gh_replay import LOG_ENV, STATE_ENV, UNROUTED
+from tests.test_hooks.fake_gh_replay import (
+    GRAPHQL_DOCUMENTS,
+    LOG_ENV,
+    REVIEW_BUDGET_READS,
+    STATE_ENV,
+    UNROUTED,
+    _normalize,
+)
 
 _ROOT = Path(__file__).resolve().parents[2]
 _GUARD = _ROOT / "scripts" / "hooks" / "git_push_guard.py"
@@ -80,9 +90,9 @@ GH_CALLERS = {
     "_newest_pr_ci_run": "run list --commit",
     "_main_ci_runs": "run list --branch",
     "_run_failed_jobs": "run view --json jobs",
-    "_pr_base_sha": "api graphql ref(qualifiedName)",
-    "_codex_signal_evidence": "api graphql comments(last: 100)",
-    "_pr_outside_facts": "api graphql isCrossRepository",
+    "_pr_base_sha": "api graphql, stored document base_ref",
+    "_codex_signal_evidence": "api graphql, stored document codex_signal",
+    "_pr_outside_facts": "api graphql, stored document outside_pr",
     "_fetch_comments_paged": "api pulls|issues/N/<endpoint> -X GET page=",
     "_pr_review_records": "api pulls/N/reviews --paginate",
     "_scheduled_review_rows": "api issues/N/comments | pulls/N/reviews --paginate",
@@ -103,7 +113,7 @@ GH_CALLERS = {
 
 #: Outside the guard: the ``rounds`` row's evaluator.
 REVIEW_BUDGET_GH = {
-    "snapshot": "api graphql pullRequest(number: $number) { headRefOid body",
+    "snapshot": "api graphql, stored documents review_budget(_reread)",
     "_evaluate_pr_inner": "api pulls/N/files --paginate (a renamed file only)",
 }
 
@@ -735,18 +745,10 @@ def _fake_gh(tmp_path: Path, argv: list[str]) -> subprocess.CompletedProcess:
 
 _COMMENTS = f"repos/{REPO}/issues/{PR}/comments"
 _OWNER, _NAME = REPO.split("/")
+_VARS = ["-f", f"owner={_OWNER}", "-f", f"name={_NAME}", "-F", f"number={PR}"]
+_BUDGET_DOC = GRAPHQL_DOCUMENTS["review_budget"]
 #: A graphql read the fake has a recorded answer for, so only the method can refuse it.
-_GRAPHQL_READ = [
-    "-f",
-    "query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,"
-    "name:$name){pullRequest(number: $number) { headRefOid body }}}",
-    "-f",
-    f"owner={_OWNER}",
-    "-f",
-    f"name={_NAME}",
-    "-F",
-    f"number={PR}",
-]
+_GRAPHQL_READ = ["-f", f"query={_BUDGET_DOC}", *_VARS]
 
 
 @pytest.mark.parametrize(
@@ -792,6 +794,185 @@ def test_the_same_graphql_read_is_answered(tmp_path, method):
     proc = _fake_gh(tmp_path, ["api", "graphql", *method, *_GRAPHQL_READ])
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout)["data"]["repository"]["pullRequest"]["headRefOid"] == HEAD
+
+
+@pytest.mark.parametrize(
+    "document",
+    [
+        "mutation" + _BUDGET_DOC.removeprefix("query"),
+        "subscription" + _BUDGET_DOC.removeprefix("query"),
+        _BUDGET_DOC.replace("headRefOid body", "headRefOid body title", 1),
+        _BUDGET_DOC.replace(" changeType", "", 1),
+        _BUDGET_DOC + " # pullRequest(number: $number) { headRefOid body",
+        "mutation($owner: String!) { addComment { clientMutationId } }"
+        " # pullRequest(number: $number) { headRefOid body",
+    ],
+    ids=["mutation", "subscription", "extra-field", "missing-field", "comment", "phrase"],
+)
+def test_the_fake_refuses_any_document_but_a_stored_one(tmp_path, document):
+    """The variables match the stored review_budget read, which has a recorded
+    answer, so only the exact-document match refuses these."""
+    assert document != _BUDGET_DOC, "the edit did not change the stored document"
+    proc = _fake_gh(tmp_path, ["api", "graphql", "-f", f"query={document}", *_VARS])
+    assert proc.returncode == 97, proc.stdout
+    assert "is not a stored gate query" in proc.stderr, proc.stderr
+
+
+def test_a_stored_document_is_matched_after_whitespace_normalization(tmp_path):
+    """The control: the same text reflowed onto indented lines is the same document."""
+    spaced = _BUDGET_DOC.replace(" ", "\n  ")
+    proc = _fake_gh(tmp_path, ["api", "graphql", "-f", f"query={spaced}", *_VARS])
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_a_no_break_space_is_not_graphql_whitespace(tmp_path):
+    """GraphQL whitespace is space, tab, CR and LF; a no-break space is part of a
+    token, so a document spaced with one is a different document."""
+    nbsp = _BUDGET_DOC.replace(" ", " ")
+    proc = _fake_gh(tmp_path, ["api", "graphql", "-f", f"query={nbsp}", *_VARS])
+    assert proc.returncode == 97, proc.stdout
+    assert "is not a stored gate query" in proc.stderr, proc.stderr
+
+
+@pytest.mark.parametrize(
+    "route,variables",
+    [
+        ("review_budget", ["-f", f"owner={_OWNER}", "-f", f"name={_NAME}", "-f", f"number={PR}"]),
+        ("outside_pr", ["-f", f"owner={_OWNER}", "-f", f"name={_NAME}", "-f", f"num={PR}"]),
+        ("codex_signal", ["-F", f"owner={_OWNER}", "-f", f"name={_NAME}", "-F", f"number={PR}"]),
+    ],
+    ids=["number-as-string", "num-as-string", "name-by-other-flag"],
+)
+def test_a_variable_sent_by_another_flag_is_refused(tmp_path, route, variables):
+    """``-f`` sends a raw string, ``-F`` a coerced value; an ``Int!`` sent with ``-f``
+    is not the read the gate makes, so it is not answered as if GitHub had."""
+    doc = GRAPHQL_DOCUMENTS[route]
+    proc = _fake_gh(tmp_path, ["api", "graphql", "-f", f"query={doc}", *variables])
+    assert proc.returncode == 97, proc.stdout
+    assert "variables by flag" in proc.stderr, proc.stderr
+
+
+def test_graphql_paginate_is_refused(tmp_path):
+    proc = _fake_gh(tmp_path, ["api", "graphql", "--paginate", *_GRAPHQL_READ])
+    assert proc.returncode == 97, proc.stdout
+    assert "--paginate" in proc.stderr, proc.stderr
+
+
+def test_the_review_budget_answer_carries_only_what_the_document_selects(tmp_path):
+    doc = GRAPHQL_DOCUMENTS["review_budget_reread"]
+    proc = _fake_gh(tmp_path, ["api", "graphql", "-f", f"query={doc}", *_VARS])
+    assert proc.returncode == 0, proc.stderr
+    pull = json.loads(proc.stdout)["data"]["repository"]["pullRequest"]
+    assert set(pull) == {"headRefOid", "body", *REVIEW_BUDGET_READS["review_budget_reread"]}
+    assert "files" not in pull
+
+
+def _module_strings(path: Path) -> tuple[dict[str, str], ast.Module]:
+    """Module-level string constants of ``path``, read as text and never imported:
+    the corpus mutates these files, and an import would hand the test the mutant."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    values = {}
+    for node in tree.body:
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            try:
+                values[node.targets[0].id] = ast.literal_eval(node.value)
+            except (ValueError, TypeError, SyntaxError, RecursionError, MemoryError):
+                continue  # not a literal: no stored document comes from it
+    return values, tree
+
+
+def _function(tree: ast.Module, name: str) -> ast.FunctionDef:
+    found = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name]
+    assert len(found) == 1, f"{name} is no longer one top-level function"
+    return found[0]
+
+
+def _live_graphql_documents() -> dict[str, str]:
+    """Each stored document's live counterpart, rebuilt from the source text."""
+    guard, guard_tree = _module_strings(_GUARD)
+    base_ref = [
+        ast.literal_eval(n.value)
+        for n in ast.walk(_function(guard_tree, "_pr_base_sha"))
+        if isinstance(n, ast.Assign)
+        and len(n.targets) == 1
+        and isinstance(n.targets[0], ast.Name)
+        and n.targets[0].id == "query"
+    ]
+    assert len(base_ref) == 1, "_pr_base_sha no longer assigns one `query` literal"
+    budget, budget_tree = _module_strings(_REVIEW_BUDGET)
+    # The composer runs from its own source text in a namespace holding only the
+    # connection table it reads, so no other review_budget code executes.
+    namespace = {"_GRAPHQL_CONNECTIONS": budget["_GRAPHQL_CONNECTIONS"]}
+    composer = ast.Module([_function(budget_tree, "_graphql_query")], type_ignores=[])
+    code = compile(
+        composer,
+        str(_REVIEW_BUDGET),
+        "exec",
+        flags=__future__.annotations.compiler_flag,
+        dont_inherit=True,
+    )
+    exec(code, namespace)  # noqa: S102 - the repo's own composer, run from its source text
+    live = {
+        "base_ref": base_ref[0],
+        "codex_signal": guard["_CODEX_SIGNAL_QUERY"],
+        "outside_pr": guard["_OUTSIDE_PR_QUERY"],
+    }
+    for name, connections in _live_review_budget_reads(budget_tree).items():
+        live[name] = namespace["_graphql_query"](list(connections))
+    return live
+
+
+def _live_review_budget_reads(tree: ast.Module) -> dict[str, tuple[str, ...]]:
+    """The connections each snapshot in ``_evaluate_pr_inner`` reads when no seam is
+    set, as the server runs it: the ``seams`` keys in order, then the ``mutable``
+    re-read's tuple. Read from the source, so the fake's table is checked against
+    the evaluator and not against itself."""
+    inner = _function(tree, "_evaluate_pr_inner")
+    seams = mutable = None
+    for node in ast.walk(inner):
+        if not (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+        ):
+            continue
+        target = node.targets[0].id
+        if target == "seams" and isinstance(node.value, ast.Dict):
+            seams = tuple(ast.literal_eval(k) for k in node.value.keys)
+        elif target == "mutable" and isinstance(node.value, ast.ListComp):
+            mutable = ast.literal_eval(node.value.generators[0].iter)
+    assert seams and mutable, "_evaluate_pr_inner no longer names `seams` and `mutable`"
+    return {"review_budget": seams, "review_budget_reread": tuple(mutable)}
+
+
+def test_the_stored_review_budget_reads_match_the_evaluator():
+    live = _live_review_budget_reads(ast.parse(_REVIEW_BUDGET.read_text(encoding="utf-8")))
+    assert live == REVIEW_BUDGET_READS, (
+        f"review_budget now reads {live}; re-record REVIEW_BUDGET_READS and the matching "
+        "GRAPHQL_DOCUMENTS in tests/test_hooks/fake_gh_replay.py"
+    )
+
+
+def test_every_stored_graphql_document_matches_the_live_query():
+    """A gate query that really changed fails HERE, by name, with the instruction to
+    re-record; every replay test would otherwise fail as a bare UNROUTED."""
+    live = _live_graphql_documents()
+    assert set(live) == set(GRAPHQL_DOCUMENTS)
+    stale = [
+        name
+        for name, document in GRAPHQL_DOCUMENTS.items()
+        if _normalize(document) != _normalize(live[name])
+    ]
+    assert not stale, (
+        f"the stored GraphQL document(s) {stale} no longer match the live gate query; "
+        "if the query change is intended, re-record each one in "
+        "tests/test_hooks/fake_gh_replay.py GRAPHQL_DOCUMENTS from its live source "
+        "(whitespace-normalized), and update REVIEW_BUDGET_READS if the connections moved"
+    )
 
 
 def test_the_child_environment_carries_nothing_from_the_test_process(tmp_path, monkeypatch):

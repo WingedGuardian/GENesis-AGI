@@ -5,8 +5,10 @@ call the merge gate makes lands in ``main``. It routes on argv, applies the call
 ``--jq`` with the real ``jq`` (``gh --jq`` prints strings raw and everything else as
 compact JSON, measured 2026-11-08 against gh 2.101.0), and FAILS LOUDLY on any argv it
 does not know: exit 97 and a ``FAKE-GH-UNROUTED`` line, which every test asserts is
-absent. Each call is appended to the JSONL log named by ``LOG_ENV``; the recorded PR
-state is read from the JSON file named by ``STATE_ENV``.
+absent. GraphQL is the exception to argv routing: a query is answered only when its
+whitespace-normalized document is byte-equal to one of ``GRAPHQL_DOCUMENTS``, the
+gate's own queries recorded here. Each call is appended to the JSONL log named by
+``LOG_ENV``; the recorded PR state is read from the JSON file named by ``STATE_ENV``.
 
 It imports nothing from the repository, so it runs the same from a checkout and from
 the mutation sweep's copy of one (the shim names it by the test file's ``__file__``).
@@ -16,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -164,21 +167,100 @@ def _run_cmd(args: list[str], state: dict) -> tuple[int, str, str]:
     raise _Unrouted(f"run {sub}")
 
 
-#: Which recorded GraphQL answer a query gets, by a phrase only that query has.
-_GRAPHQL_ROUTES = (
-    ("base_ref", "ref(qualifiedName:$ref)"),
-    ("codex_signal", "comments(last: 100)"),
-    ("outside_pr", "isCrossRepository authorAssociation"),
-    ("review_budget", "pullRequest(number: $number) { headRefOid body"),
-)
+def _normalize(document: str) -> str:
+    """A GraphQL document with every whitespace run collapsed to one space.
 
-#: The variables each query may carry beside ``query``; any other one is refused, so
-#: a variable the fake never checks cannot change the answer unseen.
+    Only GraphQL's own whitespace (space, tab, CR, LF) counts. ``str.split()`` would
+    also fold a no-break space or a Unicode separator, which GitHub would not."""
+    return " ".join(re.split(r"[ \t\r\n]+", document.strip(" \t\r\n")))
+
+
+#: Every GraphQL document the gate sends, recorded whitespace-normalized. Only a
+#: document byte-equal to one of these is answered, so a mutation, a changed
+#: selection set or a phrase smuggled into a comment is UNROUTED by construction.
+#: Recorded by hand, never imported: the corpus mutates the files these come from,
+#: and a mutant's query must be refused. When a gate query really changes,
+#: ``test_every_stored_graphql_document_matches_the_live_query`` names the one to
+#: re-record. Sources: ``base_ref`` is the local ``query`` in
+#: ``git_push_guard._pr_base_sha``; ``codex_signal`` is ``_CODEX_SIGNAL_QUERY``;
+#: ``outside_pr`` is ``_OUTSIDE_PR_QUERY``; the two ``review_budget`` documents are
+#: ``review_budget._graphql_query`` of the connections in ``_REVIEW_BUDGET_READS``.
+GRAPHQL_DOCUMENTS = {
+    "base_ref": (
+        "query($owner:String!,$name:String!,$ref:String!){repository(owner:$owner,nam"
+        "e:$name){ref(qualifiedName:$ref){target{oid}}}}"
+    ),
+    "codex_signal": (
+        "query($owner: String!, $name: String!, $number: Int!) { repository(owner:"
+        " $owner, name: $name) { pullRequest(number: $number) { comments(last: 100) {"
+        " totalCount nodes { body author { login __typename } editor { login }"
+        " userContentEdits(first: 50) { totalCount nodes { editor { login } deletedAt"
+        " } } } } timelineItems(itemTypes: [HEAD_REF_FORCE_PUSHED_EVENT,"
+        " HEAD_REF_DELETED_EVENT, HEAD_REF_RESTORED_EVENT, BASE_REF_CHANGED_EVENT],"
+        " first: 1) { filteredCount nodes { __typename } } } } }"
+    ),
+    "outside_pr": (
+        "query($owner:String!,$name:String!,$num:Int!){repository(owner:$owner,name:$"
+        "name){pullRequest(number:$num){headRefOid"
+        " isCrossRepository authorAssociation author{__typename login}"
+        " userContentEdits(first:100){totalCount nodes{editor{__typename login}}}"
+        " timelineItems(itemTypes:[RENAMED_TITLE_EVENT],first:100){filteredCount"
+        " nodes{... on RenamedTitleEvent{actor{login}}}} forcePushes:"
+        " timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT],first:1){filteredCoun"
+        "t}}}}"
+    ),
+    "review_budget": (
+        "query($owner: String!, $name: String!, $number: Int!, $after_reviews:"
+        " String, $after_comments: String, $after_files: String, $after_commits:"
+        " String) { repository(owner: $owner, name: $name) { pullRequest(number:"
+        " $number) { headRefOid body reviews(first: 100, after: $after_reviews) {"
+        " pageInfo { hasNextPage endCursor } nodes { fullDatabaseId state submittedAt"
+        " body author { login __typename } commit { oid } comments(first: 100) {"
+        " pageInfo { hasNextPage } nodes { fullDatabaseId replyTo { id } body } } } }"
+        " comments(first: 100, after: $after_comments) { pageInfo { hasNextPage"
+        " endCursor } nodes { fullDatabaseId body createdAt updatedAt author { login"
+        " __typename } } } files(first: 100, after: $after_files) { pageInfo {"
+        " hasNextPage endCursor } nodes { path changeType } } commits(first: 100,"
+        " after: $after_commits) { pageInfo { hasNextPage endCursor } nodes { commit"
+        " { oid parents(first: 100) { totalCount nodes { oid } } } } } } } }"
+    ),
+    "review_budget_reread": (
+        "query($owner: String!, $name: String!, $number: Int!, $after_reviews:"
+        " String, $after_comments: String, $after_commits: String) {"
+        " repository(owner: $owner, name: $name) { pullRequest(number: $number) {"
+        " headRefOid body reviews(first: 100, after: $after_reviews) { pageInfo {"
+        " hasNextPage endCursor } nodes { fullDatabaseId state submittedAt body"
+        " author { login __typename } commit { oid } comments(first: 100) { pageInfo"
+        " { hasNextPage } nodes { fullDatabaseId replyTo { id } body } } } }"
+        " comments(first: 100, after: $after_comments) { pageInfo { hasNextPage"
+        " endCursor } nodes { fullDatabaseId body createdAt updatedAt author { login"
+        " __typename } } } commits(first: 100, after: $after_commits) { pageInfo {"
+        " hasNextPage endCursor } nodes { commit { oid parents(first: 100) {"
+        " totalCount nodes { oid } } } } } } } }"
+    ),
+}
+
+#: The connections each review_budget document selects, in its order: the first
+#: snapshot reads all four, the re-read after it only the three that can move.
+#: The answer carries exactly these, as GitHub's would.
+REVIEW_BUDGET_READS = {
+    "review_budget": ("reviews", "comments", "files", "commits"),
+    "review_budget_reread": ("reviews", "comments", "commits"),
+}
+
+_BY_DOCUMENT = {_normalize(doc): name for name, doc in GRAPHQL_DOCUMENTS.items()}
+
+#: The variables each query carries beside ``query``, with the flag its call site
+#: sends each one by: ``-f`` is a raw string, ``-F`` is type-coerced, which an
+#: ``Int!`` needs. Any other variable or flag is refused, so a value the fake never
+#: checks cannot change the answer unseen, and a number sent as a string is not
+#: answered as if GitHub had accepted it.
 _GRAPHQL_VARIABLES = {
-    "base_ref": {"owner", "name", "ref"},
-    "codex_signal": {"owner", "name", "number"},
-    "outside_pr": {"owner", "name", "num"},
-    "review_budget": {"owner", "name", "number"},
+    "base_ref": {"owner": "-f", "name": "-f", "ref": "-f"},
+    "codex_signal": {"owner": "-F", "name": "-F", "number": "-F"},
+    "outside_pr": {"owner": "-f", "name": "-f", "num": "-F"},
+    "review_budget": {"owner": "-f", "name": "-f", "number": "-F"},
+    "review_budget_reread": {"owner": "-f", "name": "-f", "number": "-F"},
 }
 
 
@@ -206,37 +288,41 @@ def _graphql(opts: dict[str, list[str]], state: dict) -> tuple[int, str, str]:
     # gh sends a graphql query as a POST; any other method is not the read recorded.
     if _one(opts, "-X") not in (None, "POST"):
         raise _Unrouted(f"api graphql -X {_one(opts, '-X')}")
+    if "--paginate" in opts:
+        raise _Unrouted("api graphql --paginate: every recorded page is the last")
     fields: dict[str, str] = {}
+    sent_by: dict[str, str] = {}
     for flag in ("-f", "-F"):
         for item in opts.get(flag, []):
             key, sep, value = item.partition("=")
             if not sep or key in fields:
                 raise _Unrouted(f"graphql field {item!r}")
             fields[key] = value
-    query = fields.pop("query", "")
-    hits = [name for name, phrase in _GRAPHQL_ROUTES if phrase in query]
-    if len(hits) != 1:
-        raise _Unrouted(f"graphql query matching {hits}: {query[:120]!r}")
+            sent_by[key] = flag
+    if sent_by.pop("query", None) != "-f":
+        raise _Unrouted("graphql query not sent as one raw -f field")
+    query = fields.pop("query")
+    route = _BY_DOCUMENT.get(_normalize(query))
+    if route is None:
+        raise _Unrouted(f"graphql document is not a stored gate query: {query[:120]!r}")
     if any(k.startswith("after_") for k in fields):
         raise _Unrouted("graphql asked for a second page; every recorded page is the last")
-    if set(fields) != _GRAPHQL_VARIABLES[hits[0]]:
-        raise _Unrouted(f"graphql {hits[0]} variables {sorted(fields)}")
+    if sent_by != _GRAPHQL_VARIABLES[route]:
+        raise _Unrouted(f"graphql {route} variables by flag {sorted(sent_by.items())}")
     owner, name = state["repo"].split("/")
     if fields.get("owner") != owner or fields.get("name") != name:
         raise _Unrouted("graphql owner/name is not the recorded repository")
     number = fields.get("number", fields.get("num"))
-    if hits[0] != "base_ref" and number != state["pr"]:
+    if route != "base_ref" and number != state["pr"]:
         raise _Unrouted(f"graphql for PR {number}, not {state['pr']}")
-    if (
-        hits[0] == "base_ref"
-        and fields.get("ref") != f"refs/heads/{state['pr_view']['baseRefName']}"
-    ):
+    if route == "base_ref" and fields.get("ref") != f"refs/heads/{state['pr_view']['baseRefName']}":
         raise _Unrouted(f"graphql ref {fields.get('ref')!r}")
-    if hits[0] == "review_budget":
-        return _answer(_review_budget_answer(state), _one(opts, "--jq"))
-    if hits[0] not in state["graphql"]:
-        raise _Unrouted(f"no recorded answer for the {hits[0]} query")
-    return _answer(state["graphql"][hits[0]], _one(opts, "--jq"))
+    if route in REVIEW_BUDGET_READS:
+        answer = _review_budget_answer(state, REVIEW_BUDGET_READS[route])
+        return _answer(answer, _one(opts, "--jq"))
+    if route not in state["graphql"]:
+        raise _Unrouted(f"no recorded answer for the {route} query")
+    return _answer(state["graphql"][route], _one(opts, "--jq"))
 
 
 def _graphql_author(user: dict) -> dict:
@@ -247,9 +333,10 @@ def _graphql_author(user: dict) -> dict:
     return {"login": login, "__typename": "User"}
 
 
-def _review_budget_answer(state: dict) -> dict:
+def _review_budget_answer(state: dict, connections: tuple[str, ...]) -> dict:
     """The ``rounds`` row's one GraphQL page, derived from the same REST records the
-    rows read, so a fixture states each fact once."""
+    rows read, so a fixture states each fact once. It carries only the
+    ``connections`` the document selected, as GitHub's answer would."""
     api, pr = state["api"], state["pr"]
     last = {"hasNextPage": False, "endCursor": None}
     inline = api[f"pulls/{pr}/comments"]
@@ -288,9 +375,11 @@ def _review_budget_answer(state: dict) -> dict:
         }
         for c in api[f"issues/{pr}/comments"]
     ]
-    files = [
-        {"path": f["filename"], "changeType": _change_type(f)} for f in api[f"pulls/{pr}/files"]
-    ]
+    files = (
+        [{"path": f["filename"], "changeType": _change_type(f)} for f in api[f"pulls/{pr}/files"]]
+        if "files" in connections
+        else []
+    )
     commits = [
         {
             "commit": {
@@ -303,20 +392,10 @@ def _review_budget_answer(state: dict) -> dict:
         }
         for c in api[f"pulls/{pr}/commits"]
     ]
-    return {
-        "data": {
-            "repository": {
-                "pullRequest": {
-                    "headRefOid": state["pr_view"]["headRefOid"],
-                    "body": state["pr_view"]["body"],
-                    "reviews": {"pageInfo": last, "nodes": reviews},
-                    "comments": {"pageInfo": last, "nodes": comments},
-                    "files": {"pageInfo": last, "nodes": files},
-                    "commits": {"pageInfo": last, "nodes": commits},
-                }
-            }
-        }
-    }
+    nodes = {"reviews": reviews, "comments": comments, "files": files, "commits": commits}
+    pull = {"headRefOid": state["pr_view"]["headRefOid"], "body": state["pr_view"]["body"]}
+    pull.update({name: {"pageInfo": last, "nodes": nodes[name]} for name in connections})
+    return {"data": {"repository": {"pullRequest": pull}}}
 
 
 def _api(args: list[str], state: dict) -> tuple[int, str, str]:
