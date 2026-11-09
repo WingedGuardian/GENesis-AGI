@@ -1420,7 +1420,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: a6528dab2 2026-11-09
+verified: f62608045437 2026-11-09
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -1447,6 +1447,9 @@ verified: a6528dab2 2026-11-09
   a guarantee of memory correctness. Reuse and
   deliverable-backed BUILD/adoption boundaries are described in
   `docs/reference/inbox-evaluation-quality.md`.
+  ADAPT output requests an explicit `why_not_adopt` explanation; the parser
+  preserves its optional string and warns on missing usable rationale without
+  changing existing recommendation routing or build ownership.
   The phase order is prompt preflight → recover pending → resume approval →
   detect → create → dispatch;
   `approval_key_stable=True` (ONE
