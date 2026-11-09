@@ -59,7 +59,8 @@ class ScopeProbe:
     scope = root/'scripts/lib/code_intel_scope.py'
     scope.write_text(scope.read_text()+'''
 class ScopeManager:
- def __init__(self,*args,deadline): self.deadline=deadline
+ def __init__(self,*args,deadline,require_runtime_limit=False):
+  self.deadline,self.require_runtime_limit=deadline,require_runtime_limit
  def _object(self,*args): return '/org/freedesktop/systemd1/unit/owned'
  def registration(self,unit,facts,**kwargs):
   return dict(unit=unit,facts=facts,invocation_id='1'*32,stop_usec=90000000)
@@ -82,6 +83,11 @@ def scope_command(snapshot,modules,ack_fd):
 def _fixture_no_manager_action(self,*args):
  raise ValueError('fixture never performs real manager control')
 PhysicalOwner._systemctl=_fixture_no_manager_action
+_fixture_original_run=PhysicalOwner.run
+def _fixture_owner_run(self,snapshot):
+ assert self.manager.require_runtime_limit is True
+ return _fixture_original_run(self,snapshot)
+PhysicalOwner.run=_fixture_owner_run
 ''')
     subprocess.run(['git','-C',str(root),'-c','core.hooksPath=/dev/null','-c','user.name=Fixture',
         '-c','user.email=fixture@example.invalid','commit','-am','harmless GN owner fixture'],check=True,capture_output=True)
