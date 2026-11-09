@@ -1,6 +1,6 @@
 """Every Genesis MCP tool description must fit the cap Claude Code applies.
 
-Claude Code truncates each MCP tool description at **2,048 characters** before
+Claude Code truncates each MCP tool description at **2,048 UTF-16 code units** before
 the model sees it. It is not silent — CC logs the cut ("Tool "X" description
 truncated from N to 2048 chars", in its per-server ``mcp-logs-*`` files) and
 appends "… [truncated]" — but the text past the cut is gone from the model's
@@ -31,6 +31,8 @@ import ast
 import unicodedata
 from pathlib import Path
 
+import pytest
+
 from tests.conftest import private_module
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -48,7 +50,20 @@ _is_mcp_tool_decorator = private_module(
 )._is_mcp_tool_decorator
 
 
-def _tool_descriptions() -> list[tuple[str, str, int]]:
+def _description_length(description: str) -> int:
+    """Return CC's NFKC-normalized JavaScript ``String.length`` value.
+
+    JavaScript counts UTF-16 code units, so a non-BMP character counts twice.
+    Count per character rather than encoding so a lone surrogate remains one
+    code unit, matching JavaScript instead of raising ``UnicodeEncodeError``.
+    """
+    normalized = unicodedata.normalize("NFKC", description)
+    return sum(2 if ord(char) > 0xFFFF else 1 for char in normalized)
+
+
+def _tool_descriptions(
+    *, repo: Path = _REPO, mcp_root: Path = _MCP_ROOT
+) -> list[tuple[str, str, int]]:
     """(name, path, description length) for every Genesis MCP tool function.
 
     The description CC receives is ``inspect.getdoc(fn)`` (fastmcp v2,
@@ -56,18 +71,20 @@ def _tool_descriptions() -> list[tuple[str, str, int]]:
     verified against the live server object, where raw ``__doc__`` differs
     materially (``direct_session_run``: 2,131 raw vs 2,006 cleaned).
 
-    Measured in NFKC-normalized characters, because that is what CC's own log
+    Measured in NFKC-normalized UTF-16 code units, because CC's own predicate
+    uses JavaScript ``String.length``. The normalization is retained because its log
     matches: it reported the pre-change ``follow_up_create`` as 4,735 where
     ``getdoc`` gives 4,733 — its one ``…`` normalizes to ``...`` (+2) — and
     ``memory_recall`` as 3,525 in both (2 of 2 tools). A raw codepoint count
-    would pass a 2,046-char description holding a single ``…`` that CC cuts.
+    would pass both a 2,046-character description holding one ``…`` and a
+    2,047-character description ending in one non-BMP character that CC cuts.
 
     Enumerated by AST rather than regex on purpose: an earlier regex pass over
     these same files found 21 of 147 tools and reported "0 over the cap", which
     is the silent under-read this repo's evidence rules warn about.
     """
     found: list[tuple[str, str, int]] = []
-    for path in sorted(_MCP_ROOT.rglob("*.py")):
+    for path in sorted(mcp_root.rglob("*.py")):
         try:
             tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
         except SyntaxError as exc:
@@ -76,7 +93,7 @@ def _tool_descriptions() -> list[tuple[str, str, int]]:
             # MEASURED: the largest file holds 13 of 147 tools, so no single
             # file's loss could trip a >=100 floor.
             raise AssertionError(
-                f"{path.relative_to(_REPO)} does not parse ({exc}); the cap check "
+                f"{path.relative_to(repo)} does not parse ({exc}); the cap check "
                 "would silently skip its tools"
             ) from exc
         for node in ast.walk(tree):
@@ -85,10 +102,31 @@ def _tool_descriptions() -> list[tuple[str, str, int]]:
             if not any(_is_mcp_tool_decorator(d) for d in node.decorator_list):
                 continue
             doc = ast.get_docstring(node) or ""
-            found.append(
-                (node.name, str(path.relative_to(_REPO)), len(unicodedata.normalize("NFKC", doc)))
-            )
+            found.append((node.name, str(path.relative_to(repo)), _description_length(doc)))
     return found
+
+
+def test_description_length_matches_client_utf16_units():
+    """Boundary controls use the same units as JavaScript ``String.length``."""
+    assert _description_length("a" * 2048) == 2048
+    assert _description_length("a" * 2049) == 2049
+    assert _description_length("\U0001f4a1" * 1024) == 2048
+    assert _description_length("\U0001f4a1" * 1025) == 2050
+    assert _description_length("a" * 2047 + "\U0001f4a1") == 2049
+    assert _description_length("…") == 3
+    assert _description_length("a" * 2045 + "…") == 2048
+    assert _description_length("a" * 2046 + "…") == 2049
+    assert _description_length("\ud800") == 1
+
+
+def test_unparseable_source_is_rejected(tmp_path: Path):
+    """A parse failure must not silently shrink the checked tool population."""
+    mcp_root = tmp_path / "src" / "genesis" / "mcp"
+    mcp_root.mkdir(parents=True)
+    (mcp_root / "broken.py").write_text("@mcp.tool()\ndef broken(:\n", encoding="utf-8")
+
+    with pytest.raises(AssertionError, match="does not parse"):
+        _tool_descriptions(repo=tmp_path, mcp_root=mcp_root)
 
 
 def test_mcp_tool_population_is_discoverable():
@@ -114,7 +152,7 @@ def test_mcp_tool_population_is_discoverable():
 
 
 def test_no_mcp_tool_description_exceeds_the_cc_cap():
-    """No Genesis tool description may exceed CC's 2,048-character cap.
+    """No Genesis tool description may exceed CC's 2,048-UTF-16-code-unit cap.
 
     Past the cap, CC cuts the text (logging the cut and marking it
     "… [truncated]"), so the tail is simply absent from the contract the model
@@ -122,10 +160,10 @@ def test_no_mcp_tool_description_exceeds_the_cc_cap():
     """
     over = [(n, p, ln) for n, p, ln in _tool_descriptions() if ln > _CC_DESCRIPTION_CAP]
     assert not over, (
-        f"MCP tool description(s) exceed Claude Code's {_CC_DESCRIPTION_CAP}-char "
+        f"MCP tool description(s) exceed Claude Code's {_CC_DESCRIPTION_CAP}-UTF-16-unit "
         "cap; everything past it is cut before the model sees it:\n"
         + "\n".join(
-            f"  {ln:>6} chars  {n}  ({p})"
+            f"  {ln:>6} UTF-16 units  {n}  ({p})"
             for n, p, ln in sorted(over, reverse=True, key=lambda t: t[2])
         )
         + "\n\nFix by MOVING PROSE OUT, not by leaning on a raised cap: rationale, "
