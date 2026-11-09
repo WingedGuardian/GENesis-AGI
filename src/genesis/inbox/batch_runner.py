@@ -8,7 +8,12 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from genesis.cc.exceptions import CCNetworkOfflineError, CCOverloadedError, CCReplayUnsafeError
+from genesis.cc.exceptions import (
+    CCMemoryPressureError,
+    CCNetworkOfflineError,
+    CCOverloadedError,
+    CCReplayUnsafeError,
+)
 from genesis.cc.transient_retry import run_with_overload_retry
 from genesis.inbox.scanner import extract_urls as _extract_urls
 from genesis.inbox.url_coverage import (
@@ -198,7 +203,8 @@ async def run_one_batch(
             logger.exception("Could not finalize session for held inbox batch %s", batch_id[:8])
         monitor._alert_parked(
             item.file_path, reason="replay_unsafe",
-            detail="Work may already have run. Inspect this batch before explicitly releasing it.",
+            detail=(f"{exc} " if isinstance(exc, CCMemoryPressureError) else "Work may already have run. ")
+            + "Inspect this batch before explicitly releasing it.",
             item_id=item.id, texts=[item.content], occurrence=f"{item.id}:{now_iso}",
         )
         return False

@@ -23,6 +23,7 @@ from aiosqlite.context import Result
 
 from genesis.db import lock_holders
 from genesis.db._slow_log import timed
+from genesis.db._txn_hold import TxnHoldTracker
 
 # BUSY_TIMEOUT_MS moved to genesis.env (it is an env-tunable default; env.py
 # sits below this module in the import graph) — re-exported here for the many
@@ -433,6 +434,7 @@ class SerializedConnection:
             "_holder",
             "_cancelled_holder",
             "_inflight",
+            "_txn_hold",
         }
     )
 
@@ -459,6 +461,9 @@ class SerializedConnection:
         object.__setattr__(self, "_holder", None)
         object.__setattr__(self, "_cancelled_holder", None)
         object.__setattr__(self, "_inflight", {})
+        # Long-held write transactions (genesis.db._txn_hold): who opened one
+        # that kept the database's writer slot past the threshold.
+        object.__setattr__(self, "_txn_hold", TxnHoldTracker())
         # Named in a lock-holder snapshot of its database (weakly held); the
         # site is the code that opened it (get_db's caller, for get_db).
         if db_path is not None:
@@ -500,11 +505,21 @@ class SerializedConnection:
                 t.acquired()
                 object.__setattr__(self, "_holder", sql)
                 object.__setattr__(self, "_cancelled_holder", None)
+                cancelled = False
                 try:
                     yield
                 except asyncio.CancelledError:
+                    cancelled = True
                     object.__setattr__(self, "_cancelled_holder", sql)
                     raise
+                finally:
+                    # Still under the lock, so no other operation on this
+                    # connection has run in between: the state read here is the
+                    # one this operation left. Read the way lock_holders reads it
+                    # (MEASURED safe across threads); None leaves it untouched.
+                    self._txn_hold.observe(
+                        lock_holders._in_transaction(self, "serialized"), sql, cancelled=cancelled
+                    )
 
     def _capture_lock_holders(self, exc: Exception, *, attempts: int, backoff_s: float) -> str:
         """Schedule sampled lock evidence; return the log text for it.
@@ -713,6 +728,9 @@ class SerializedConnection:
     async def close(self) -> None:
         async with self._lock:
             object.__setattr__(self, "_holder", "<close>")
+            # Closing with a transaction open discards it (an implicit
+            # rollback); report the hold it ends like any other close.
+            self._txn_hold.observe(False, "<close>")
             await self._conn.close()
 
     async def cursor(self) -> aiosqlite.Cursor:

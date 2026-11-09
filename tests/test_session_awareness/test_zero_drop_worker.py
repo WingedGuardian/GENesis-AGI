@@ -1521,7 +1521,7 @@ async def test_a_failed_BLIND_alert_resolve_reaches_degraded(env, db_path, monke
     Two surfaces disagreeing, with nothing pointing at the contradiction.
     """
 
-    async def _resolve_fails(db, *, degraded, frozen):
+    async def _resolve_fails(db, *, degraded, frozen, **_kw):
         return "resolve_failed"
 
     monkeypatch.setattr(w, "_maintain_blind_alert", _resolve_fails)
@@ -1971,5 +1971,309 @@ async def test_a_replaced_findings_alert_carries_its_surfacing(db_path):
         assert live == [
             {"surfaced_count": 1, "surfaced_at": "2026-03-10T11:00:00+00:00", "resolved": 0}
         ]
+    finally:
+        await conn.close()
+
+
+# ---------------------------------------------------------------------------
+# DB lock contention: a class that loses the writer slot is retried whole, and
+# when it still loses, the run says who held it rather than only that it was
+# held. MEASURED before this: 24-33 runs per class FROZEN on "database is
+# locked", with nothing recorded beyond the message.
+# ---------------------------------------------------------------------------
+
+
+def _locked() -> Exception:
+    return aiosqlite.OperationalError("database is locked")
+
+
+@pytest.fixture
+def no_retry_sleep(monkeypatch):
+    from genesis.db import connection
+
+    slept: list[float] = []
+
+    async def _sleep(s):
+        slept.append(s)
+
+    monkeypatch.setattr(connection, "_async_sleep", _sleep)
+    return slept
+
+
+@pytest.fixture
+def lock_evidence(monkeypatch):
+    """Record the lock-holder capture instead of reading /proc/locks.
+
+    The suite disables snapshots globally (tests/conftest.py); re-enable them
+    here, or the worker takes its "disabled" branch and these tests pass
+    without the capture ever being attempted."""
+    from genesis.db import lock_holders
+
+    monkeypatch.delenv(lock_holders.DISABLE_ENV, raising=False)
+    calls: list[dict] = []
+
+    def _capture(target, db_path, context):
+        calls.append(context)
+        return {"writer_pids": [4242]}
+
+    monkeypatch.setattr(lock_holders, "capture_and_write", _capture)
+    return calls
+
+
+async def test_a_class_that_loses_the_lock_ONCE_is_retried_and_applied(
+    env, db_path, monkeypatch, no_retry_sleep, lock_evidence, caplog
+):
+    real = zd.apply_sweep
+    calls = {"n": 0}
+
+    async def _flaky(db, *, class_, **kw):
+        if class_ == "unpushed_branch":
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _locked()
+        return await real(db, class_=class_, **kw)
+
+    monkeypatch.setattr(w.zd_crud, "apply_sweep", _flaky)
+    with caplog.at_level("WARNING", logger=w.logger.name):
+        out = await _run(db_path)
+
+    assert calls["n"] == 2
+    assert "unpushed_branch" not in out["degraded"]
+    assert out["applied"]["unpushed_branch"]["lock_retries"] == 1, (
+        "a retry that succeeded must still leave a trace in the run record"
+    )
+    assert len(no_retry_sleep) == 1
+    assert any("lost the DB lock (attempt 1/3" in r.getMessage() for r in caplog.records)
+    assert lock_evidence == [], "holders are captured only when the class finally gives up"
+
+
+async def test_a_class_that_ALWAYS_loses_the_lock_degrades_with_its_evidence(
+    env, db_path, monkeypatch, no_retry_sleep, lock_evidence, caplog
+):
+    real = zd.apply_sweep
+    calls = {"n": 0}
+
+    async def _held(db, *, class_, **kw):
+        if class_ == "unpushed_branch":
+            calls["n"] += 1
+            raise _locked()
+        return await real(db, class_=class_, **kw)
+
+    monkeypatch.setattr(w.zd_crud, "apply_sweep", _held)
+    with caplog.at_level("WARNING", logger=w.logger.name):
+        out = await _run(db_path)
+
+    assert calls["n"] == 3, "three attempts, no more"
+    reason = out["degraded"]["unpushed_branch"]
+    assert reason.startswith("reconcile failed after 3 attempts, ")
+    assert reason.endswith("ms: OperationalError: database is locked")
+    assert "SQLITE_" not in reason and "error name" not in reason, (
+        "the error name would re-mint the blindness alert when it flips"
+    )
+    assert "4242" not in reason, "holder pids would re-mint the blindness alert's hash"
+    assert lock_evidence and lock_evidence[0]["attempts"] == 3
+    assert any("writer_pids=[4242]" in r.getMessage() for r in caplog.records)
+    assert "pushed_no_pr" in out["applied"] and "dirty_worktree" in out["applied"]
+    record = json.loads(w.last_run_path().read_text())
+    entry = record["lock_evidence"]["reconcile of unpushed_branch"]
+    assert entry["writer_pids"] == [4242] and entry["attempts"] == 3, (
+        "the run record must say who held the lock, not only the log"
+    )
+
+
+async def test_a_FAILED_lock_holder_capture_does_not_lose_the_run(
+    env, db_path, monkeypatch, no_retry_sleep
+):
+    from genesis.db import lock_holders
+
+    async def _held(db, *, class_, **kw):
+        raise _locked()
+
+    tried = {"n": 0}
+
+    def _boom(*a, **kw):
+        tried["n"] += 1
+        raise OSError("disk full")
+
+    monkeypatch.delenv(lock_holders.DISABLE_ENV, raising=False)
+    monkeypatch.setattr(w.zd_crud, "apply_sweep", _held)
+    monkeypatch.setattr(lock_holders, "capture_and_write", _boom)
+    out = await _run(db_path)
+
+    assert tried["n"] >= 1, "the fixture never reached the capture it breaks"
+    assert out["degraded"]["unpushed_branch"].startswith("reconcile failed after ")
+    assert w.last_run_path().exists(), "the run record still lands"
+
+
+async def test_a_connection_left_DIRTY_by_a_class_is_abandoned_not_committed_through(
+    env, db_path, monkeypatch
+):
+    """If a class fails and cannot roll itself back, its half-finished rows sit
+    on the connection, and the heartbeat's commit would flush them while the
+    run record says the class was not applied."""
+    real = zd.apply_sweep
+
+    async def _dirty(db, *, class_, **kw):
+        if class_ == "unpushed_branch":
+            await db.execute(
+                "INSERT INTO zero_drop_findings (id, class, branch, status, first_seen_at, "
+                "last_seen_at, consecutive_runs, created_at, updated_at) VALUES "
+                "('partial', 'unpushed_branch', 'feat/partial', 'open', 'x', 'x', 1, 'x', 'x')"
+            )
+            raise RuntimeError("failed midway and could not roll back")
+        return await real(db, class_=class_, **kw)
+
+    monkeypatch.setattr(w.zd_crud, "apply_sweep", _dirty)
+    out = await _run(db_path)
+
+    assert "failed midway" in out["degraded"]["unpushed_branch"]
+    later = [c for c in w.ALL_CLASSES if c != "unpushed_branch"]
+    for cls in later:
+        assert out["degraded"][cls].startswith("skipped: the connection was unusable")
+        assert cls not in out["applied"]
+    assert w.last_run_path().exists()
+    assert "feat/partial" not in {r["branch"] for r in await _rows(db_path)}, (
+        "the partial row was committed by a later write on the dirty connection"
+    )
+    conn = await aiosqlite.connect(db_path)
+    try:
+        cur = await conn.execute(
+            "SELECT COUNT(*) FROM events WHERE subsystem = ? AND event_type = 'heartbeat'",
+            (w.HEARTBEAT_SUBSYSTEM,),
+        )
+        assert (await cur.fetchone())[0] == 1, "the run still pulses, on a fresh connection"
+    finally:
+        await conn.close()
+
+
+async def test_a_connection_left_DIRTY_by_the_alerts_is_reopened_before_the_heartbeat(
+    env, db_path, monkeypatch
+):
+    async def _dirty_blind(db, **_kw):
+        await db.execute(
+            "INSERT INTO observations (id, source, type, content, priority, created_at) "
+            "VALUES ('pending', 'zd-test', 'x', 'half-written', 'low', 'x')"
+        )
+        return "alert_failed"
+
+    monkeypatch.setattr(w, "_maintain_blind_alert", _dirty_blind)
+    out = await _run(db_path)
+    assert out["degraded"].get("blind_alert") == "alert_failed"
+    conn = await aiosqlite.connect(db_path)
+    try:
+        cur = await conn.execute("SELECT COUNT(*) FROM observations WHERE id = 'pending'")
+        assert (await cur.fetchone())[0] == 0, "the heartbeat's commit flushed a failed write"
+        cur = await conn.execute(
+            "SELECT COUNT(*) FROM events WHERE subsystem = ? AND event_type = 'heartbeat'",
+            (w.HEARTBEAT_SUBSYSTEM,),
+        )
+        assert (await cur.fetchone())[0] == 1
+    finally:
+        await conn.close()
+
+
+async def test_a_blind_alert_that_loses_the_lock_AFTER_creating_reports_created(
+    db_path, monkeypatch, no_retry_sleep
+):
+    """Each alert step commits on its own, so a lock lost at the supersede step
+    leaves the new row in place; the retry's create dedups to None. Reporting
+    "unchanged" then would be false, and the carry-over the new row needs
+    would be skipped."""
+    from genesis.db.crud import observations
+
+    real_supersede = observations.supersede_except_hash
+    real_carry = observations.carry_surfacing
+    calls = {"supersede": 0, "carry": []}
+
+    async def _flaky_supersede(*a, **kw):
+        calls["supersede"] += 1
+        if calls["supersede"] == 1:
+            raise _locked()
+        return await real_supersede(*a, **kw)
+
+    async def _carry(db, **kw):
+        calls["carry"].append(kw["to_id"])
+        return await real_carry(db, **kw)
+
+    monkeypatch.setattr(observations, "supersede_except_hash", _flaky_supersede)
+    monkeypatch.setattr(observations, "carry_surfacing", _carry)
+
+    conn = await aiosqlite.connect(db_path)
+    conn.row_factory = aiosqlite.Row
+    try:
+        out = await w._maintain_blind_alert(
+            conn, degraded={"branches": "gh boom"}, frozen=["pushed_no_pr"]
+        )
+        assert out == "created"
+        assert calls["supersede"] == 2
+        assert len(calls["carry"]) == 2 and calls["carry"][0] == calls["carry"][1], (
+            "the retry must carry over onto the row the first attempt created"
+        )
+        cur = await conn.execute(
+            "SELECT COUNT(*) FROM observations WHERE source = ? AND resolved = 0",
+            (w.BLIND_SOURCE,),
+        )
+        assert (await cur.fetchone())[0] == 1, "the retry must not insert a second row"
+    finally:
+        await conn.close()
+
+
+async def test_a_blind_alert_that_GIVES_UP_records_who_held_the_lock(
+    db_path, monkeypatch, no_retry_sleep, lock_evidence
+):
+    """Single-statement writes wait out busy_timeout, so a blind-alert loss is a
+    long-held writer: the one case where the holder IS the answer."""
+    from genesis.db.crud import observations
+
+    async def _held(db, **kw):
+        raise _locked()
+
+    monkeypatch.setattr(observations, "create", _held)
+    sink: dict = {}
+    conn = await aiosqlite.connect(db_path)
+    conn.row_factory = aiosqlite.Row
+    try:
+        out = await w._maintain_blind_alert(
+            conn,
+            degraded={"branches": "gh boom"},
+            frozen=[],
+            db_path=db_path,
+            lock_evidence=sink,
+        )
+    finally:
+        await conn.close()
+    assert out == "alert_failed"
+    assert sink["blind-alert write"]["writer_pids"] == [4242]
+    assert lock_evidence and lock_evidence[0]["unit"] == "blind-alert write"
+
+
+async def test_a_blind_alert_whose_INSERT_loses_the_lock_is_retried(
+    db_path, monkeypatch, no_retry_sleep
+):
+    """A statement that loses the lock leaves the implicit transaction open; the
+    helper must roll it back and retry, not give up on the first loss."""
+    from genesis.db.crud import observations
+
+    real_create = observations.create
+    calls = {"n": 0}
+
+    async def _flaky_create(db, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            await db.execute("INSERT INTO _probe_lock VALUES (1)")  # opens the implicit BEGIN
+            raise _locked()
+        return await real_create(db, **kw)
+
+    monkeypatch.setattr(observations, "create", _flaky_create)
+    conn = await aiosqlite.connect(db_path)
+    conn.row_factory = aiosqlite.Row
+    try:
+        await conn.execute("CREATE TABLE _probe_lock (x INTEGER)")
+        await conn.commit()
+        out = await w._maintain_blind_alert(conn, degraded={"branches": "gh boom"}, frozen=[])
+        assert out == "created"
+        assert calls["n"] == 2
+        cur = await conn.execute("SELECT COUNT(*) FROM _probe_lock")
+        assert (await cur.fetchone())[0] == 0, "the failed attempt's pending write was discarded"
     finally:
         await conn.close()

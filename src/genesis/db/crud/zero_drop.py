@@ -43,7 +43,6 @@ count of one install (~150 refs), so there is no unbounded growth to GC.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import uuid
@@ -141,31 +140,39 @@ async def apply_sweep(
     """
     ts = now or _now()
     held = set(held or ())
-    # The docstring below promises "no half-applied middle state — one commit at
-    # the end", and before this that was true only when nothing raised. The
-    # writes here are many statements with ONE commit, so a failure partway left
-    # them PENDING on a connection the worker goes on using: the next class's
-    # reconcile, the alert write, or the always-runs heartbeat commit would
-    # flush the failed class's partial updates — while `degraded[cls]` reported
-    # that class as not applied (Codex P2, PR #1794). A frozen class that
-    # silently half-applied is the precise failure this whole subsystem exists
-    # to prevent, arriving through the caller's own error handling.
+    # The docstring above promises "no half-applied middle state — one commit at
+    # the end". The writes here are many statements with ONE commit, so a
+    # failure partway must not leave them PENDING on a connection the worker
+    # goes on using: the next class's reconcile, the alert write, or the
+    # always-runs heartbeat commit would flush the failed class's partial
+    # updates while `degraded[cls]` reported that class as not applied (Codex
+    # P2, PR #1794).
     #
-    # A SAVEPOINT rather than a rollback at the call site, so the guarantee
-    # belongs to the function that makes it rather than to every caller
-    # remembering. The name is uniquely generated so a nested or concurrent
-    # sweep cannot release someone else's.
+    # So this function OWNS one transaction from start to finish, and refuses
+    # to run inside anyone else's: nested in a caller's transaction, the commit
+    # below would become THEIRS, committing work they had not finished. The
+    # only production caller (the zero-drop worker) opens its own connection.
     #
-    # PRECONDITION, stated because the commit below is this function's: do not
-    # call this inside a caller-owned transaction. When the savepoint is
-    # outermost, RELEASE commits and the `db.commit()` at the end is a no-op;
-    # nested inside someone else's transaction that commit would become THEIRS,
-    # committing work they had not finished.
-    #
-    # VERIFIED under aiosqlite: SAVEPOINT opens its own transaction without
-    # colliding with sqlite3's implicit BEGIN, and after ROLLBACK TO the later
-    # unrelated commit flushed only its own row.
-    savepoint = f"zd_sweep_{uuid.uuid4().hex}"
+    # BEGIN IMMEDIATE, not a deferred transaction. The body reads this class's
+    # prior rows and then writes; a deferred transaction (which is what an
+    # outermost SAVEPOINT is, per SQLite's lang_savepoint) has to UPGRADE from
+    # that read to a write, and that upgrade fails AT ONCE when another
+    # connection is writing: as SQLITE_BUSY while a peer holds the writer, or
+    # SQLITE_BUSY_SNAPSHOT once a peer has committed since the read. The busy
+    # handler is never consulted, so busy_timeout buys nothing, and the error
+    # name does not tell the two apart from a long-held writer — the elapsed
+    # time does. MEASURED 2026-11-07 with two connections on a WAL database:
+    # 0 ms to the error in both cases, and BEGIN IMMEDIATE made the PEER wait
+    # instead. In the live error log every one of 86 class tracebacks failed at
+    # a write after this read (84 at the recurring-row UPDATE) — a write can
+    # only lose the lock there as the upgrade, since once the writer is held
+    # no later statement needs it. Taking the writer slot first is where
+    # busy_timeout does apply.
+    if db.in_transaction:
+        raise RuntimeError(
+            f"zero_drop apply_sweep for class {class_!r} called inside an open "
+            "transaction; it commits its own work and would commit the caller's too"
+        )
     counts = dict.fromkeys(
         (
             "new",
@@ -180,7 +187,9 @@ async def apply_sweep(
         0,
     )
 
-    await db.execute(f"SAVEPOINT {savepoint}")
+    # A lock error here (the writer slot stayed taken past busy_timeout)
+    # propagates with nothing written; the caller decides whether to retry.
+    await db.execute("BEGIN IMMEDIATE")
     try:
         return await _apply_sweep_locked(
             db,
@@ -191,41 +200,28 @@ async def apply_sweep(
             escalation_k=escalation_k,
             held=held,
             counts=counts,
-            savepoint=savepoint,
         )
     except BaseException:
-        # Discard ONLY this class's partial writes.
+        # Discard this class's partial writes. The transaction is entirely
+        # ours (the entry check above), so a full rollback takes nothing that
+        # belongs to anyone else.
         #
-        # The recovery path can fail too, and blanket-suppressing that was this
-        # fix reproducing the defect it was written for. If `ROLLBACK TO`
-        # raises, `RELEASE` never runs, the savepoint stays on the stack and the
-        # transaction stays open carrying this class's half-finished rows. The
-        # caller then reconciles the NEXT class on the same connection, whose
-        # savepoint is now NESTED — so its RELEASE commits nothing, and its
-        # `db.commit()` issues a real COMMIT that flushes BOTH classes, while
-        # the run record reports this one as not applied. Exactly the state the
-        # savepoint exists to prevent, reached through its own error handling.
-        #
-        # So: log it (an unwind failure that leaves no trace anywhere is the
-        # report-authored-nowhere problem in its purest form), then fall back to
-        # a full rollback. A full rollback is SAFE here, contrary to what the
-        # note above this function used to claim: every sibling class ends with
-        # RELEASE + commit, so its work is already durable and the only
-        # uncommitted rows on this connection are ours.
+        # The recovery path can fail too, and blanket-suppressing that would
+        # reproduce the defect this exists for: the transaction stays open
+        # with half-finished rows, and the next commit on this connection
+        # flushes them. So it is LOGGED, the original error still propagates,
+        # and the connection's `in_transaction` stays True — which is the
+        # signal the worker reads to abandon this connection instead of
+        # committing anything else through it.
         try:
-            await db.execute(f"ROLLBACK TO {savepoint}")
-            await db.execute(f"RELEASE {savepoint}")
+            await db.rollback()
         except Exception:
             logger.error(
-                "zero_drop apply_sweep could not unwind savepoint %s for class %s — "
-                "falling back to a full rollback; this connection's uncommitted "
-                "writes are being discarded",
-                savepoint,
+                "zero_drop apply_sweep could not roll back class %s; the connection "
+                "still holds its partial writes and must not be committed through",
                 class_,
                 exc_info=True,
             )
-            with contextlib.suppress(Exception):
-                await db.rollback()
         raise
 
 
@@ -239,9 +235,8 @@ async def _apply_sweep_locked(
     escalation_k: int,
     held: set,
     counts: dict,
-    savepoint: str,
 ) -> dict:
-    """The body of :func:`apply_sweep`, inside its savepoint. Never called directly."""
+    """The body of :func:`apply_sweep`, inside its transaction. Never called directly."""
     cursor = await db.execute(
         "SELECT * FROM zero_drop_findings WHERE class = ?",
         (class_,),
@@ -374,7 +369,6 @@ async def _apply_sweep_locked(
         )
         counts["resolved"] += 1
 
-    await db.execute(f"RELEASE {savepoint}")
     await db.commit()
     return counts
 

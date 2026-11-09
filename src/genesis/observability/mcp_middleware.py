@@ -39,8 +39,15 @@ def install_instrumentation(server, tracker, server_name: str, db) -> None:
         if not (isinstance(middleware, InstrumentationMiddleware)
                 and middleware._server == server_name)
     ]
+    _remove_client_call_log(server, server_name)
     if not isinstance(db, RequestDatabase) and tracker is None:
         return
+    # The call log goes on exactly the servers that get instrumentation
+    # (every real bootstrap passes a tracker), writing to the server's own
+    # database when the handle names one.
+    _add_client_call_log(
+        server, server_name, getattr(db, "path", None) or getattr(db, "_db_path", None),
+    )
     # Health's external read-only instrumentation already declines legacy
     # transaction finalization. Writable services keep the database for their
     # commit boundary and the staleness guard. Scoped unit ownership remains
@@ -52,6 +59,32 @@ def install_instrumentation(server, tracker, server_name: str, db) -> None:
     ):
         db = None
     server.add_middleware(InstrumentationMiddleware(tracker, server_name, db=db))
+
+
+def _remove_client_call_log(server, server_name: str) -> None:
+    from genesis.observability.client_call_log import ClientCallLogMiddleware
+
+    server.middleware[:] = [
+        middleware for middleware in server.middleware
+        if not (isinstance(middleware, ClientCallLogMiddleware)
+                and middleware._server == server_name)
+    ]
+
+
+def _add_client_call_log(server, server_name: str, db_path) -> None:
+    """Install the labelled-client call log OUTERMOST on this server.
+
+    Outermost so a call another middleware refuses (an external profile's
+    admission) is still recorded. It decides per call, from
+    ``caller_context()``, whether the caller is a labelled client (owner-mode
+    Codex); unlabelled calls pass straight through.
+    """
+    from pathlib import Path
+
+    from genesis.observability.client_call_log import ClientCallLogMiddleware
+
+    path = Path(db_path) if isinstance(db_path, (str, Path)) else None
+    server.middleware.insert(0, ClientCallLogMiddleware(server_name, path))
 
 # Staleness verdict (`is_stale`) + the prefix-tolerant compare (`same_commit`) live
 # in the stdlib-only ``commit_identity`` leaf so the dashboard (Part B) shares the
