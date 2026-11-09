@@ -393,7 +393,7 @@ _NEXT_WINDOW_LIMIT = 1000
 #: deployment, the body carries the `E2E:` plan.
 _NEXT_FIELDS = "number,title,body,mergedAt,baseRefName,mergeCommit"
 
-_NEXT_TIER_LABEL = {0: "not-yet-done", 1: "never-attempted", 2: "cannot-verify, re-attempt"}
+_NEXT_TIER_LABEL = {0: "unfinished work or tracking", 1: "never-attempted", 2: "cannot-verify, re-attempt"}
 
 
 def _load_sibling(name: str):

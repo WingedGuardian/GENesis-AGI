@@ -679,6 +679,12 @@ async def _collect_live_repair(config: GuardianConfig) -> str:
             )
             + f"{saved} saved path(s) in its folder"
         )
+        block = report.get("restore")
+        if isinstance(block, dict):  # its last restore (live_move_restore.restore)
+            lines.append(
+                f"newest report's restore: restored_at {_quoted(block.get('restored_at'), 40)},"
+                f" refused {_quoted(block.get('refused'), 20)}"
+            )
         if foreign:  # last, so the field cap cuts paths before anything else
             more = f" (+{len(foreign) - 10} more)" if len(foreign) > 10 else ""
             tail = [f"newest report, not the update's{more}: {shown}"]

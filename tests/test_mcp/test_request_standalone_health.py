@@ -103,7 +103,7 @@ async def test_standalone_requests_keep_independent_ownership(health_db, standal
     request_ids = []
     original = service._enrich_from_db
 
-    async def enrich(result):
+    async def enrich(result, **kwargs):
         leases.append(db._current.get())
         request_ids.append(get_context().request_context.request_id)
         if len(leases) == 1:
@@ -113,7 +113,7 @@ async def test_standalone_requests_keep_independent_ownership(health_db, standal
                 raise RuntimeError("synthetic enrichment failure")
         else:
             second_entered.set()
-        await original(result)
+        await original(result, **kwargs)
 
     monkeypatch.setattr(service, "_enrich_from_db", enrich)
     server = await initialize_request_service("health", db=db, service=service)
@@ -123,7 +123,10 @@ async def test_standalone_requests_keep_independent_ownership(health_db, standal
         caller = asyncio.create_task(first.call_tool(tool))
         peer = None
         try:
-            await entered.wait()
+            # Bounded: if enrichment never runs (e.g. a stand-in signature
+            # mismatch caught by the snapshot), fail fast instead of hanging.
+            async with asyncio.timeout(30):
+                await entered.wait()
             peer = asyncio.create_task(second.call_tool(tool))
             if capacity > 1:
                 await second_entered.wait()

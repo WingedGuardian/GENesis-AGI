@@ -13,7 +13,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
-import shlex
 import shutil
 import subprocess
 import time
@@ -28,6 +27,7 @@ GUARD = LIB / "update_state_guard.py"
 KIT_FILES = (
     "live_move_repair.py",
     "live_move_restore.py",
+    "live_move_restore_write.py",
     "update_state_guard.py",
     "deploy_checkout.sh",
     "deploy_marker.sh",
@@ -413,88 +413,37 @@ def age_locks(w: World) -> None:
         os.utime(lock, (old, old))
 
 
-def _as_index(entry) -> list[tuple[str, str, str]]:
-    return [(entry[0], entry[1], "0")] if entry else []
+def update_bytes(w: World, rel: str, node) -> bool:
+    """Is ``node`` (a snapshot value) the move target's own file at ``rel``? A
+    restore leaves those out of a saved directory: they are the update's."""
+    got = subprocess.run(["git", "-C", str(w.root), "cat-file", "blob", f"{w.to}:{rel}"],
+                         capture_output=True, env=_git_env())  # fmt: skip
+    return isinstance(node, bytes) and got.returncode == 0 and got.stdout == node
 
 
-def _parents(p: str) -> list[str]:
-    out, d = [], os.path.dirname(p)
-    while d:
-        out.append(d)
-        d = os.path.dirname(d)
-    return out
+def foreign_rows(w: World) -> list[dict]:
+    return [r for r in w.report()["paths"] if r["class"] == "foreign"]
 
 
-def reapply_step(repo: str, backup: str, row: dict, below: list[str] | tuple = ()) -> str:
-    """TEST ORACLE ONLY: the writer's shell step (deleted from the writer, #3868),
-    kept so these tests can put a report's saved state back by hand until the
-    real restore (#3492 B2b) replaces it. Never run outside a scratch world: it
-    runs `rm -rf` unconditionally."""
-    q, path = shlex.quote, row["path"]
-    dst = os.path.join(repo, path)
-    steps = []
-    if [tuple(e) for e in row["index"]] != _as_index(row["tag"]):
-        for rel in row.get("blobs") or []:
-            blob = q(os.path.join(backup, rel))
-            steps.append(f"git -C {q(repo)} hash-object -w --no-filters -- {blob} >/dev/null")
-        null = "0" * len((row["index"] or [row["tag"]])[0][1])
-        stage0 = any(s == "0" for _m, _o, s in row["index"])
-        drops = [*below, path] if stage0 else [path]
-        recs = [f"0 {null}\t{d}" for d in drops]
-        recs += [f"{m} {o} {s}\t{path}" for m, o, s in row["index"]]
-        fields = " ".join(q(r) for r in recs)
-        steps.append(f"printf '%s\\0' {fields} | git -C {q(repo)} update-index -z --index-info")
-    parent = row.get("unreachable_through")
-    if parent and row["disk_changed"]:
-        note = (
-            f"{path} was not reachable through {parent} (a symlink or non-directory);"
-            " only its index state is re-applied"
-        )
-        steps.append(f"echo {q(note)} >&2")
-    elif row["disk_changed"]:
-        steps.append(f"rm -rf -- {q(dst)}")
-        special = row.get("special")
-        if row["saved_as"]:
-            src = os.path.join(backup, row["saved_as"])
-            steps += [f"mkdir -p -- {q(os.path.dirname(dst))}", f"cp -a -- {q(src)} {q(dst)}"]
-        elif special and special["type"] == "fifo":
-            steps.append(f"mkdir -p -- {q(os.path.dirname(dst))}")
-            steps.append(f"mkfifo -m {special['mode']} -- {q(dst)}")
-        elif special:
-            gone = (
-                f"{path} was a {special['type']} (mode {special['mode']}); it held nothing"
-                " to save, so whatever made it must make it again"
-            )
-            steps.append(f"echo {q(gone)} >&2")
-    flag = row["flag"]
-    if flag and flag in "Ss":
-        steps.append(f"git -C {q(repo)} update-index --skip-worktree -- {q(path)}")
-    if flag and flag.islower():
-        steps.append(f"git -C {q(repo)} update-index --assume-unchanged -- {q(path)}")
-    return " && ".join(steps)
-
-
-def reapply_steps(w: World) -> list[str]:
-    """TEST ORACLE ONLY: the steps the writer used to store in `reapply`, built
-    from the newest report as it built them (parents first; ``below`` from
-    rows that re-add what they held, or held nothing)."""
-    report, backup = w.report(), str(w.backups()[-1])
-    below: dict[str, list[str]] = {}
-    for r in report["paths"]:
-        if r["class"] != "foreign" and r["index"]:
-            continue
-        for d in _parents(r["path"]):
-            below.setdefault(d, []).append(r["path"])
-    foreign = sorted(
-        (r for r in report["paths"] if r["class"] == "foreign"), key=lambda r: r["path"].split("/")
+def restore(
+    w: World, ts: str | None = None, *extra: str, **env: str
+) -> subprocess.CompletedProcess:
+    """The real restore (`--restore TS`, #3492 B2b) of report ``ts`` (the newest)."""
+    ts = ts or w.report()["ts"]
+    return subprocess.run(
+        ["python3", "-I", "-S", str(MODULE), "--restore", ts, *extra, str(w.state), str(w.root)],
+        capture_output=True,
+        text=True,
+        env=w.env(**env),
+        timeout=600,
     )
-    return [reapply_step(str(w.root), backup, r, below.get(r["path"], ())) for r in foreign]
 
 
-def _run_steps(w: World) -> None:
-    for step in reapply_steps(w):
-        r = subprocess.run(["bash", "-c", step], capture_output=True, text=True, env=w.env())
-        assert r.returncode == 0, step + "\n" + r.stderr
+def restore_all(w: World) -> subprocess.CompletedProcess:
+    """The newest report put back by the real restore, every part of it."""
+    r = restore(w)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return r
 
 
 def _foreign_edit(w):

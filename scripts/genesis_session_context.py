@@ -53,12 +53,20 @@ def _db_is_fenced(db_path) -> bool:
 
 # Load secrets.env so USER_TIMEZONE and other env vars are available
 # before any genesis module imports (which may read os.environ at import time).
-# SECRETS_PATH wins, as in genesis.env.secrets_path() (not importable yet here).
-_SECRETS_PATH = (
-    Path(os.environ["SECRETS_PATH"]).expanduser()
-    if os.environ.get("SECRETS_PATH")
-    else Path(__file__).resolve().parent.parent / "secrets.env"
-)
+# Resolved as genesis.env.secrets_path() resolves it, by loading the stdlib-only
+# resolver module by path (the genesis package is not importable yet here).
+def _resolve_secrets_file(repo: Path) -> Path:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_genesis_secrets_location", repo / "src" / "genesis" / "secrets_location.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.resolve(environ=os.environ, repo_root=repo)
+
+
+_SECRETS_PATH = _resolve_secrets_file(Path(__file__).resolve().parent.parent)
 if _SECRETS_PATH.is_file():
     try:
         from dotenv import load_dotenv
@@ -1094,8 +1102,8 @@ def _emit_body() -> tuple[str, str, str] | None:
                 )
                 first = False
 
-        # In-flight working state (advisory): active autonomy tasks, live
-        # worktrees, and recently-touched plan files — computed fresh here
+        # In-flight working state (advisory): live sessions, active autonomy
+        # tasks, live worktrees, and recently-touched plan files — computed fresh here
         # because they change far faster than the L1 essential-knowledge
         # regeneration cadence. Folds directly UNDER Essential Knowledge with
         # NO "---" divider so it reads as session context for recollection, not
@@ -1103,7 +1111,7 @@ def _emit_body() -> tuple[str, str, str] | None:
         # the non-genesis-session branch). Writer: genesis.memory.open_loops.
         if _in("knowledge"):
             try:
-                _inflight = _load_inflight_block()
+                _inflight = _load_inflight_block(_hook_session_id)
                 for _chunk in _inflight_emission_chunks(
                     _inflight, ek_emitted=_ek_emitted, first=first
                 ):
@@ -1696,7 +1704,7 @@ def _inflight_emission_chunks(inflight: str, *, ek_emitted: bool, first: bool) -
     return chunks
 
 
-def _load_inflight_block() -> str:
+def _load_inflight_block(own_session_id: str = "") -> str:
     """Fresh in-flight working-state block for the foreground session context.
 
     Opens its own short-timeout connection (mirroring the "2.6 Codebase L0"
@@ -1718,7 +1726,10 @@ def _load_inflight_block() -> str:
 
             async with aiosqlite.connect(str(db_path), timeout=2) as db:
                 db.row_factory = aiosqlite.Row
-                return await build_inflight_block(db, repo_root=repo_root, plans_dir=plans_dir)
+                return await build_inflight_block(
+                    db, repo_root=repo_root, plans_dir=plans_dir,
+                    own_session_id=own_session_id,
+                )
 
         return asyncio.run(_run())
     except Exception:

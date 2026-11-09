@@ -209,6 +209,41 @@ async def test_silently_omitted_url_requeues_not_baselines(
 
 
 @pytest.mark.asyncio
+async def test_literal_url_retries_then_completes_only_with_exact_citation(
+    monitor, inbox_dir, db, mock_invoker,
+):
+    """Real scan/SQLite/writer pipeline, with a controlled evaluator response."""
+    from genesis.db.crud import inbox_items
+
+    literal = "https://example.com/literal)"
+    source = inbox_dir / "literal.md"
+    source.write_text(literal)
+    monitor._create_follow_ups_from_eval = AsyncMock()
+    mock_invoker.run.return_value = _success_output(
+        "# Evaluation\n**Source:** <https://example.com/literal>\n" + "x" * 300,
+    )
+    await monitor.check_once()
+    assert f"1. {literal}" in mock_invoker.run.await_args.args[0].prompt.splitlines()
+    failed = await inbox_items.get_by_file_path(db, str(source))
+    assert failed["status"] == "failed"
+    assert failed["evaluated_content"] is None
+    monitor._create_follow_ups_from_eval.assert_not_awaited()
+
+    mock_invoker.run.return_value = _success_output(
+        f"# Evaluation\n**Source:** <{literal}>\n" + "x" * 300,
+    )
+    await monitor.check_once()
+    completed = await inbox_items.get_by_file_path(db, str(source))
+    assert completed["status"] == "completed"
+    assert completed["evaluated_content"] == literal
+    assert completed["response_path"]
+    assert literal in Path(completed["response_path"]).read_text()
+    calls = mock_invoker.run.await_count
+    await monitor.check_once()
+    assert mock_invoker.run.await_count == calls
+
+
+@pytest.mark.asyncio
 async def test_shadow_mode_logs_but_does_not_requeue(monitor, inbox_dir, db, mock_invoker, caplog):
     """Shadow mode, the contrast with the test above: compute, log, act on nothing.
 
@@ -1462,6 +1497,11 @@ async def test_build_prompt_enumerates_urls(monitor, inbox_dir):
         ('see "https://example.com/x", later', "https://example.com/x"),
         # A code span around a URL is likewise presentation.
         ("`https://example.com/y`.", "https://example.com/y"),
+        ("``https://example.com/y``", "https://example.com/y"),
+        ("(see https://example.com/y)", "https://example.com/y"),
+        ('"[docs](https://example.com/y)"', "https://example.com/y"),
+        # An earlier matching code delimiter makes terminal trimming unproved.
+        ("`https://example.com/a`literal`", "https://example.com/a`literal`"),
         # A URL-shaped markdown LABEL is its own token and must not absorb
         # `](https://...` -- this case reaches the bare-domain `]` stop, which
         # the `[docs](...)` cases above never do.
@@ -1512,15 +1552,15 @@ async def test_build_prompt_lists_the_url_the_writer_meant(
 def test_citing_exactly_what_the_prompt_asked_for_covers_the_url():
     """A compliant answer must be able to satisfy the gate.
 
-    The prompt shows ``_display_url(token)`` while the gate discovered
-    ``token``. If only the untrimmed form counted, every URL whose two
+    The prompt uses the source-aware display while the gate discovered
+    the raw token. If only the untrimmed form counted, every URL whose two
     renderings differ would be permanently uncoverable -- a floor under the
     shadow flag rate, which is the signal the enforce decision reads.
     """
-    from genesis.inbox.url_coverage import _display_url, _uncovered_urls
+    from genesis.inbox.url_coverage import _coverage_url_occurrences, _uncovered_urls
 
     source = '"https://example.com/q?x=1",'
-    assert _display_url('https://example.com/q?x=1",') == "https://example.com/q?x=1"
+    assert _coverage_url_occurrences(source)[0].display == "https://example.com/q?x=1"
 
     # What the prompt actually asked for.
     assert _uncovered_urls("**Source:** <https://example.com/q?x=1>", source) == []
@@ -3016,6 +3056,10 @@ async def test_resume_pass_dispatches_on_pending_to_approved_transition(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("active_cap", "stored_retries"),
+    [(1, 0), (1, 1), (1, 3), (3, 0), (3, 2), (3, 3), (3, 5), (5, 2)],
+)
+@pytest.mark.parametrize(
     "corrupt_payload",
     [
         "inbox-items-v2:not-json",
@@ -3028,10 +3072,15 @@ async def test_resume_corrupt_v2_batch_rederives_without_full_file_replay(
     mock_invoker,
     db,
     corrupt_payload,
+    active_cap,
+    stored_retries,
 ):
     """Corrupt structured storage is not the legacy full-file fallback."""
+    from dataclasses import replace
+
     from genesis.db.crud import inbox_items
 
+    monitor._config = replace(monitor._config, max_retries=active_cap)
     path, _ = await _seed_parked_row(
         db,
         inbox_dir,
@@ -3043,7 +3092,7 @@ async def test_resume_corrupt_v2_batch_rederives_without_full_file_replay(
         "UPDATE inbox_items SET batch_items = ?, retry_count = ? WHERE id = ?",
         (
             corrupt_payload,
-            monitor._config.max_retries - 1,
+            stored_retries,
             "row-req-corrupt",
         ),
     )
@@ -3072,7 +3121,7 @@ async def test_resume_corrupt_v2_batch_rederives_without_full_file_replay(
     assert corrupt["error_message"] == (
         f"{inbox_items.AWAITING_APPROVAL_PREFIX}req-fresh"
     )
-    assert corrupt["retry_count"] == monitor._config.max_retries - 1
+    assert corrupt["retry_count"] == min(stored_retries, active_cap - 1)
     assert inbox_items.batch_items_for_dispatch(corrupt["batch_items"]) == "first item"
     dispatcher.approval_gate.mark_consumed.assert_awaited_once_with("req-corrupt")
     rows = await db.execute_fetchall(

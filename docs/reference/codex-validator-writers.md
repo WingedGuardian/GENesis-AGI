@@ -34,8 +34,12 @@ system excludes both, preserving existing NULL behavior.
 `park`, `note`, `verdict` expectation and `dry_run`. Duplicate JSON keys, strict
 model errors, PR mismatch and verdict-policy refusals precede DB work. Both raw
 UTF-8 and canonical evidence are capped at256KiB. The verdict is derived;
-closing decisions close an OPEN obligation and other decisions record a
-nonclosing attempt with the same note prefixes as the CLI. Closed obligations
+passing measurements close an OPEN obligation only after shared structured
+tracking checks complete. Pending routing stores the measurement and actual
+verdict on an OPEN row, even when it passed; `tracking_complete` and `would_close`
+expose the distinction. Other decisions record a nonclosing attempt with the
+same note prefixes as the CLI. See `validator-tracking.md` for preflight,
+checkpoints, public/private receipts, pause and historical audit. Closed obligations
 cannot be rewritten. A real attempt increments a counter and is not idempotent:
 after an uncertain response, re-read stored evidence/count before retrying.
 
