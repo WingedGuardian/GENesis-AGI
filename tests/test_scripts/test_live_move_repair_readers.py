@@ -98,6 +98,7 @@ def test_a_real_repair_is_reported_by_count_until_dismissed(w, make):
         "ts": d.name[: -len(SUFFIX)],
         "backup_dir": str(d),
         "saved": foreign,
+        "restore_refused": 0,
         "result": entry["result"],
         "dismissed": False,
         "unresolved": False,
@@ -353,6 +354,50 @@ def test_the_result_is_an_enum_never_the_reports_string(tmp_path, raw, enum):
     assert found["reports"][0]["result"] == enum, found
     if isinstance(raw, str) and enum == "unknown":
         assert raw[:12] not in json.dumps(found)
+
+
+# ── #3492 B2b: a restore's outcome (review SF-4, N-4) ───────────────────────
+
+
+@pytest.mark.parametrize(
+    ("block", "cleared", "refused"),
+    [
+        ({"inflight": None, "refused": 0, "restored_at": "2026-11-04T00:00:00Z"}, True, 0),
+        ({"inflight": None, "refused": 1, "restored_at": None}, False, 1),
+        ({"inflight": None, "refused": False, "restored_at": "2026-11-04T00:00:00Z"}, False, 0),
+        ({"inflight": None, "refused": 0, "restored_at": 5}, False, 0),
+        ({"inflight": None, "refused": -1, "restored_at": "2026-11-04T00:00:00Z"}, False, 0),
+        ({"inflight": None, "refused": "0", "restored_at": "2026-11-04T00:00:00Z"}, False, 0),
+        ("restored", False, 0),
+    ],
+    ids=["cleared", "one-refused", "bool-refused", "restored-at-not-str", "negative", "str",
+         "not-a-block"],
+)  # fmt: skip
+def test_a_report_clears_only_once_a_restore_refused_nothing(tmp_path, block, cleared, refused):
+    """Its saved paths drop out only when `restored_at` is a str and `refused`
+    an int (never a bool) of 0; a refused count is shown either way."""
+    _report_at(tmp_path, "20260101T000000Z-1", result="healed", repo=str(tmp_path),
+               paths=[_foreign(), _foreign("Y")], restore=block)  # fmt: skip
+    found = _dh().collect_live_repairs(tmp_path, tmp_path)
+    [entry] = found["reports"]
+    assert (found["saved"], entry["saved"]) == ((0, 0) if cleared else (2, 2)), found
+    assert entry["restore_refused"] == refused, entry
+
+
+def test_a_real_restore_clears_the_report(w):
+    """End to end: a real repair is counted, a real restore of it clears it."""
+    killed_tag_side(w, "Z3")
+    _lock_aside(w, lambda: _foreign_edit(w))
+    assert w.repair().returncode == 0
+    assert _found(w)["saved"] == 1
+    r = subprocess.run(
+        ["python3", "-I", "-S", str(MODULE), "--restore", w.report()["ts"], str(w.state),
+         str(w.root)],
+        capture_output=True, text=True, env=w.env(),
+    )  # fmt: skip
+    assert r.returncode == 0, r.stdout + r.stderr
+    found = _found(w)
+    assert found["saved"] == 0 and _dh().live_repair_findings(found) == [], found
 
 
 # ── which reports are read: the newest 8, by the writer's name ──────────────

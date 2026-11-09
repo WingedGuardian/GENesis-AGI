@@ -27,7 +27,7 @@ def _no_codex(monkeypatch: pytest.MonkeyPatch) -> None:
     Tests that specifically test the codex path patch this themselves.
     """
     monkeypatch.setattr(
-        "genesis.autonomy.executor.review.shutil.which",
+        "genesis.util.codex_cli.shutil.which",
         lambda name: None,
     )
 
@@ -352,7 +352,7 @@ class TestVerifyViaCodex:
     async def test_codex_pass(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """When codex returns a verdict, parse the JSONL output."""
         monkeypatch.setattr(
-            "genesis.autonomy.executor.review.shutil.which",
+            "genesis.util.codex_cli.shutil.which",
             lambda name: "/usr/bin/codex",
         )
         verdict_text = json.dumps({
@@ -380,7 +380,7 @@ class TestVerifyViaCodex:
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(
-            "genesis.autonomy.executor.review.shutil.which",
+            "genesis.util.codex_cli.shutil.which",
             lambda name: "/usr/bin/codex",
         )
 
@@ -401,7 +401,7 @@ class TestVerifyViaCodex:
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setattr(
-            "genesis.autonomy.executor.review.shutil.which",
+            "genesis.util.codex_cli.shutil.which",
             lambda name: "/usr/bin/codex",
         )
 
@@ -429,7 +429,7 @@ class TestVerifyViaCodex:
         indefinitely, since verify_deliverable runs under it.
         """
         monkeypatch.setattr(
-            "genesis.autonomy.executor.review.shutil.which",
+            "genesis.util.codex_cli.shutil.which",
             lambda name: "/usr/bin/codex",
         )
         # Tiny timeout so the test does not actually wait.
@@ -481,7 +481,7 @@ class TestVerifyViaCodex:
         (whose descendant still holds the pipe) can't defeat the tree-kill.
         getpgid must not even be consulted."""
         monkeypatch.setattr(
-            "genesis.autonomy.executor.review.shutil.which",
+            "genesis.util.codex_cli.shutil.which",
             lambda name: "/usr/bin/codex",
         )
         monkeypatch.setattr(
@@ -529,7 +529,7 @@ class TestVerifyViaCodex:
         """If proc.pid (== pgid) is <=1, killpg MUST NOT fire (killpg(1|0, sig)
         would signal every process in the container); fall back to proc.kill()."""
         monkeypatch.setattr(
-            "genesis.autonomy.executor.review.shutil.which",
+            "genesis.util.codex_cli.shutil.which",
             lambda name: "/usr/bin/codex",
         )
         monkeypatch.setattr(
@@ -571,7 +571,7 @@ class TestVerifyViaCodex:
         an OSError subclass) must degrade to None via the spawn handler — NOT
         reach the timeout-kill path with an unbound proc (UnboundLocalError)."""
         monkeypatch.setattr(
-            "genesis.autonomy.executor.review.shutil.which",
+            "genesis.util.codex_cli.shutil.which",
             lambda name: "/usr/bin/codex",
         )
 
@@ -594,7 +594,7 @@ class TestVerifyViaCodex:
         edge), the bounded wait_for must still let _verify_via_codex return None
         rather than re-wedging the executor."""
         monkeypatch.setattr(
-            "genesis.autonomy.executor.review.shutil.which",
+            "genesis.util.codex_cli.shutil.which",
             lambda name: "/usr/bin/codex",
         )
         monkeypatch.setattr(
@@ -690,7 +690,7 @@ class TestCodexSpawnOptions:
         session/group) so the timeout tree-kill can killpg it safely — and
         NOT via preexec_fn (post-fork deadlock risk in the threaded server)."""
         monkeypatch.setattr(
-            "genesis.autonomy.executor.review.shutil.which",
+            "genesis.util.codex_cli.shutil.which",
             lambda name: "/usr/bin/codex",
         )
 
@@ -763,7 +763,7 @@ class TestToolCapableReviewChain:
     ) -> None:
         """When codex succeeds, invoker and API are not called."""
         monkeypatch.setattr(
-            "genesis.autonomy.executor.review.shutil.which",
+            "genesis.util.codex_cli.shutil.which",
             lambda name: "/usr/bin/codex",
         )
         verdict = json.dumps({"verdict": "pass"})
@@ -976,7 +976,7 @@ async def test_codex_cancel_group_kills_and_reraises(monkeypatch):
     """Cancellation mid-verify must group-kill the detached codex tree before
     propagating — the same class as the timeout path (final-audit F2)."""
     monkeypatch.setattr(
-        "genesis.autonomy.executor.review.shutil.which",
+        "genesis.util.codex_cli.shutil.which",
         lambda name: "/usr/bin/codex",
     )
     killpg_calls: list[tuple[int, int]] = []

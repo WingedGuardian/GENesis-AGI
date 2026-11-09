@@ -335,26 +335,29 @@ async def test_a_class_that_FAILS_midway_leaves_no_partial_writes(db, monkeypatc
     assert after == before, f"a failed class half-applied: {before} -> {after}"
 
 
-async def test_a_FAILED_unwind_falls_back_to_a_full_rollback(tmp_path):
-    """The fix's own recovery path could reproduce the defect it was written for.
+async def test_a_FAILED_rollback_is_logged_and_leaves_the_connection_marked(tmp_path, caplog):
+    """The recovery path can reproduce the defect it was written for.
 
-    If `ROLLBACK TO` raises, `RELEASE` never runs (one exception exits the whole
-    block), so the savepoint stays on the stack and the transaction stays open
-    carrying this class's half-finished rows. The caller then reconciles the
-    NEXT class on the same connection, whose savepoint is now NESTED — its
-    RELEASE commits nothing, and its `db.commit()` issues a real COMMIT that
-    flushes BOTH classes while the run record reports this one as not applied.
+    If the rollback itself raises, the transaction stays open carrying this
+    class's half-finished rows, and the next commit on the connection flushes
+    them while the run record reports the class as not applied. The function
+    cannot repair that, so it must not hide it: the ORIGINAL error propagates,
+    the failure is logged, and `in_transaction` stays True — the signal the
+    worker reads to abandon the connection (closing it discards the rows)
+    rather than commit anything else through it.
 
-    Uses a RAW aiosqlite connection deliberately. The shared `db` fixture yields
-    a SerializedConnection whose `__setattr__` forwards to the wrapped
-    connection while the captured original is the proxy's own method, so
-    patching `execute` there re-enters a non-reentrant lock and hangs forever.
+    Uses a RAW aiosqlite connection deliberately: the shared `db` fixture's
+    SerializedConnection forwards attribute writes to the wrapped connection,
+    so patching a method there re-enters a non-reentrant lock and hangs.
     """
+    import logging
+
     import aiosqlite
 
     from genesis.db.schema import create_all_tables
 
-    conn = await aiosqlite.connect(str(tmp_path / "zd.db"))
+    path = tmp_path / "zd.db"
+    conn = await aiosqlite.connect(str(path))
     conn.row_factory = aiosqlite.Row
     try:
         await create_all_tables(conn)
@@ -364,15 +367,13 @@ async def test_a_FAILED_unwind_falls_back_to_a_full_rollback(tmp_path):
         )
         before = {r["branch"]: r["consecutive_runs"] for r in await zd.list_findings(conn)}
 
-        real_execute = conn.execute
+        real_rollback = conn.rollback
         real_details = zd._details_json
-        calls = {"details": 0, "rollback_to": 0}
+        calls = {"details": 0, "rollback": 0}
 
-        async def _no_unwind(sql, *a, **kw):
-            if sql.strip().upper().startswith("ROLLBACK TO"):
-                calls["rollback_to"] += 1
-                raise aiosqlite.OperationalError("no such savepoint (simulated)")
-            return await real_execute(sql, *a, **kw)
+        async def _no_rollback():
+            calls["rollback"] += 1
+            raise aiosqlite.OperationalError("disk I/O error (simulated)")
 
         def _flaky_details(details):
             calls["details"] += 1
@@ -380,31 +381,72 @@ async def test_a_FAILED_unwind_falls_back_to_a_full_rollback(tmp_path):
                 raise RuntimeError("the store failed midway through a class")
             return real_details(details)
 
-        conn.execute = _no_unwind
+        conn.rollback = _no_rollback
         zd._details_json = _flaky_details
         try:
-            with pytest.raises(RuntimeError):
+            with (
+                caplog.at_level(logging.ERROR, logger=zd.__name__),
+                pytest.raises(RuntimeError, match="midway"),
+            ):
                 await zd.apply_sweep(
                     conn, class_=CLS, present=[_f("feat/one"), _f("feat/two")], run_id="r2"
                 )
         finally:
-            conn.execute = real_execute
+            conn.rollback = real_rollback
             zd._details_json = real_details
 
-        assert calls["rollback_to"] == 1, "the fixture never reached the unwind it breaks"
-
-        # The worker continues on this connection and eventually commits.
-        await conn.execute("CREATE TABLE _probe (x INTEGER)")
-        await conn.execute("INSERT INTO _probe VALUES (1)")
-        await conn.commit()
-
-        after = {r["branch"]: r["consecutive_runs"] for r in await zd.list_findings(conn)}
-        assert after == before, (
-            f"a failed unwind left partial writes for a later commit to flush: "
-            f"{before} -> {after}"
-        )
+        assert calls["rollback"] == 1, "the fixture never reached the rollback it breaks"
+        assert conn.in_transaction, "the unrecoverable state must stay visible to the caller"
+        assert any("could not roll back" in r.getMessage() for r in caplog.records)
     finally:
         await conn.close()
+
+    # Closing discarded the partial rows: a fresh connection sees the store as
+    # it was before the failed class.
+    fresh = await aiosqlite.connect(str(path))
+    fresh.row_factory = aiosqlite.Row
+    try:
+        after = {r["branch"]: r["consecutive_runs"] for r in await zd.list_findings(fresh)}
+    finally:
+        await fresh.close()
+    assert after == before, f"partial writes survived the close: {before} -> {after}"
+
+
+async def test_apply_sweep_REFUSES_to_run_inside_a_caller_transaction(tmp_path):
+    """Its commit would become the caller's, committing work they had not finished."""
+    a, b = await _wal_pair(tmp_path)
+    await b.close()
+    try:
+        await a.execute("INSERT INTO _peer VALUES (7)")  # caller's open transaction
+        assert a.in_transaction
+        with pytest.raises(RuntimeError, match="inside an open transaction"):
+            await zd.apply_sweep(a, class_=CLS, present=[_f()], run_id="r1")
+        assert a.in_transaction, "the refusal must not have committed or rolled back"
+        await a.rollback()
+        cursor = await a.execute("SELECT COUNT(*) AS n FROM _peer")
+        assert (await cursor.fetchone())["n"] == 0
+    finally:
+        await a.close()
+
+
+async def test_a_class_whose_writer_slot_STAYS_taken_raises_with_nothing_written(tmp_path):
+    """A peer that holds the writer past busy_timeout: the lock error surfaces
+    from BEGIN IMMEDIATE, before any read, and the connection is left clean
+    for the caller's retry."""
+    import aiosqlite
+
+    a, b = await _wal_pair(tmp_path, peer_busy_ms=5000)
+    try:
+        await a.execute("PRAGMA busy_timeout=50")
+        await b.execute("BEGIN IMMEDIATE")
+        with pytest.raises(aiosqlite.OperationalError, match="locked"):
+            await zd.apply_sweep(a, class_=CLS, present=[_f()], run_id="r1")
+        assert not a.in_transaction
+        await b.rollback()
+        assert (await zd.apply_sweep(a, class_=CLS, present=[_f()], run_id="r2"))["new"] == 1
+    finally:
+        await b.close()
+        await a.close()
 
 
 async def test_an_ack_is_REFUSED_when_the_row_moves_between_read_and_write(db, monkeypatch):
@@ -535,3 +577,74 @@ async def test_a_refused_ack_does_not_DISCARD_another_writers_pending_work(tmp_p
         )
     finally:
         await conn.close()
+
+
+async def _wal_pair(tmp_path, *, peer_busy_ms=50):
+    """Two raw connections on one WAL database: the sweeper and a peer writer.
+
+    WAL is load-bearing. In rollback-journal mode the sweeper's read lock
+    blocks the PEER's commit instead, so the race under test never forms and
+    the test passes on the broken code.
+    """
+    import aiosqlite
+
+    from genesis.db.schema import create_all_tables
+
+    path = str(tmp_path / "zd.db")
+    a = await aiosqlite.connect(path)
+    a.row_factory = aiosqlite.Row
+    await a.execute("PRAGMA journal_mode=WAL")
+    await a.execute("PRAGMA busy_timeout=5000")
+    await create_all_tables(a)
+    await a.execute("CREATE TABLE IF NOT EXISTS _peer (x INTEGER)")
+    await a.commit()
+    b = await aiosqlite.connect(path)
+    await b.execute(f"PRAGMA busy_timeout={peer_busy_ms}")
+    return a, b
+
+
+async def test_a_peer_COMMIT_between_the_read_and_the_write_does_not_lose_the_class(tmp_path):
+    """The measured production failure (24-33 runs per class FROZEN).
+
+    A SAVEPOINT outside BEGIN is a DEFERRED transaction (SQLite
+    lang_savepoint). The sweep reads its prior rows and then writes; when
+    another connection commits in between, the upgrade to a write fails
+    IMMEDIATELY with SQLITE_BUSY_SNAPSHOT and busy_timeout is never consulted
+    (MEASURED 2026-11-07: 0 ms). The server writes constantly, so a sweep
+    loses this race routinely.
+
+    Taking the writer slot up front (BEGIN IMMEDIATE, where busy_timeout does
+    apply) moves the wait to the PEER, which is the side that can afford it.
+    """
+    import aiosqlite
+
+    a, b = await _wal_pair(tmp_path)
+    try:
+        real_execute = a.execute
+        peer = {"outcome": None}
+
+        async def _peer_commits_after_the_read(sql, *args, **kw):
+            result = await real_execute(sql, *args, **kw)
+            if peer["outcome"] is None and "FROM zero_drop_findings" in sql:
+                try:
+                    await b.execute("INSERT INTO _peer VALUES (1)")
+                    await b.commit()
+                    peer["outcome"] = "committed"
+                except aiosqlite.OperationalError as exc:
+                    peer["outcome"] = f"refused: {exc}"
+                    await b.rollback()
+            return result
+
+        a.execute = _peer_commits_after_the_read
+        try:
+            counts = await zd.apply_sweep(a, class_=CLS, present=[_f()], run_id="r1")
+        finally:
+            a.execute = real_execute
+
+        assert peer["outcome"] is not None, "the fixture never reached the read it races"
+        assert counts["new"] == 1
+        assert (await zd.get(a, class_=CLS, branch="feat/x")) is not None
+        assert not a.in_transaction, "the sweep must leave the connection clean"
+    finally:
+        await b.close()
+        await a.close()

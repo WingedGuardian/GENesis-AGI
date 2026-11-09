@@ -16,6 +16,7 @@ from genesis.cc.context_injector import ContextInjector
 from genesis.cc.exceptions import (
     CCError,
     CCMCPError,
+    CCMemoryPressureError,
     CCNetworkOfflineError,
     CCQuotaExhaustedError,
     CCRateLimitError,
@@ -138,6 +139,8 @@ _CAPPED_AFTER_TOOLS_NOTICE = (
 
 
 def _replay_notice(exc: CCReplayUnsafeError) -> str:
+    if isinstance(exc, CCMemoryPressureError):
+        return str(exc)
     if isinstance(exc, CCStreamTruncatedError):
         return _TRUNCATION_NOTICE
     return (
@@ -1845,6 +1848,8 @@ class ConversationLoop:
                     await record_fallback(self._db, peer_name,
                                           peer_inv.model_id_override or str(peer_inv.model),
                                           success=False)
+                    if isinstance(unsafe, CCMemoryPressureError):
+                        return _replay_notice(unsafe)
                     if unsafe.__cause__ is not None:
                         await _record_peer(peer_availability.note_failure, peer_name, unsafe.__cause__)
                     # The SAME hazard as the re-run inside `_run_failover_peer`,
@@ -1863,8 +1868,8 @@ class ConversationLoop:
                     # the peer refusing, and `note_failure` would decline it as
                     # evidence anyway.
                     logger.warning(
-                        "failover peer %s lost its answer to an over-limit stream "
-                        "line — abandoning failover rather than replaying the "
+                        "failover peer %s stopped after potentially completed "
+                        "work — abandoning failover rather than replaying the "
                         "prompt on another peer",
                         peer_name, exc_info=True,
                     )
@@ -2400,6 +2405,8 @@ class ConversationLoop:
         replay, which is the hazard itself. A truncated turn degrades or says
         so; it never queues itself for a re-run.
         """
+        if isinstance(exc, CCMemoryPressureError):
+            return _replay_notice(exc)
         self._fire_failure_detection(
             "stream_truncated" if isinstance(exc, CCStreamTruncatedError) else "replay_unsafe"
         )

@@ -182,9 +182,11 @@ Admission and producer regressions are covered in
 ## Shutdown grace and synchronous resource work
 
 `begin_draining()` synchronously refuses new independent units and detached jobs
-without starting a shutdown task. `await db.drain(grace_s=...)` permits already
-registered units/jobs to finish until the explicit grace deadline, then cancels
-and settles the remainder. Grace must be finite and nonnegative; booleans and
+without starting a shutdown task. `await db.drain(grace_s=...)` permits units
+already entered, including a job's unit once the job has entered it, to finish
+until the explicit grace deadline, then cancels and settles the remainder. A job
+that was spawned but has not yet entered its unit is refused when draining begins
+and never runs: this is not a durable queue, so shutdown can stop an accepted job. Grace must be finite and nonnegative; booleans and
 invalid values raise `ValueError` before admission changes. No default period is
 selected. All shutdown entrypoints reject an active owned or joined unit.
 
@@ -193,7 +195,11 @@ callers neither extend nor shorten it. Cancellation of a waiting caller leaves
 the shared shutdown task running. Already registered admission waiters remain
 owned; prestart jobs cannot enter a new unit after draining begins. Failed
 shutdown can be rechecked, but admission never reopens. A grace deadline permits
-cancellation, never an unconfirmed resource close. A stuck physical worker can
+cancellation, never an unconfirmed resource close. Synchronous work whose
+submission failed and that has not started when its owner settles it is
+abandoned at that point and never starts, so it cannot run against resources the
+owner then closes. Its claim is still held like any unconfirmed work: the unit
+fails, admission stays closed, and shutdown reports unconfirmed closures. A stuck physical worker can
 require the process owner's separate hard stop; there is no worker-thread kill
 or automatic write replay in this library.
 
