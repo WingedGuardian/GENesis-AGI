@@ -5199,6 +5199,11 @@ verified: 702274dfe 2026-11-05
   evidence, and returns control to the user without native approval or Genesis
   lifecycle registration. It does not enforce the future reflection gates or
   cover arbitrary indirect execution. See `docs/reference/codex-review-stop.md`.
+  The shared budget accepts issue-comment churn between its two reads only when
+  both complete policy projections are successful and identical. Counts,
+  confirmation consumption, findings, reflection keys, marks and reviewer
+  attribution participate; real policy changes still return unknown, and an
+  exhausted budget still requires approval. Head/review/ancestry checks remain.
   A separate, inactive `scripts/hooks/codex-validator-adapter` translates native
   validator calls to the existing guards concurrently. It requires an absolute
   Bash cd/exit opener terminated by a newline, confines patches to validator
