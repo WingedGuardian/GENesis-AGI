@@ -67,6 +67,115 @@ execution. Native runs use the contained workflow; the older opt-in invocation
 below describes the inherited harness mechanics, not authorization to run it on
 a live install.
 
+## Separate MCP elicitation experiment
+
+`codex-elicitation.yml` adds a separate17-case, app-server-only experiment on
+the same pinned package and containment. It extends the parent image rather than
+installing another native runtime. Its closed census, capture plugin, manifest
+and reader are independent of the inherited111-case qualification; neither
+reader accepts the other's population. The shared deterministic provider gains
+an optional request-index action plan. Append and index selection share one lock,
+so concurrent requests receive the action for their own recorded index; existing one-action callers keep their
+original behavior and retain the parent qualification workflow.
+Ordinary CI discovers and skips the17 opt-in cases; any skip-ceiling adjustment
+must use the actual CI JUnit measurement rather than a developer-host count.
+Run42566419285 measured615skips including2xfails: exactly the parent population
+plus these17native ids, with no removed skips or changed reasons. Its65,730
+passing tests had no failures/errors; the old598ceiling alone failed the job.
+The615ceiling change still requires fresh CI against the final head and main.
+
+The zero-argument fake `record` tool can append only to its owned scratch sink.
+It sends a required boolean form through the typed MCP SDK `send_request` API,
+with Codex's proper approval metadata and no persistent-grant option. Only an
+explicit accept with exactly `confirmed: true` can append an approval row.
+The synthetic frontend binds the observed native request id, thread and turn,
+consumes it once, and retires pending requests on interruption or shutdown.
+The nonce identifies the invocation and displayed action; it is not an echoed
+secret and cannot detect an old boolean deliberately re-enveloped under a new
+valid request id. A nullable native `turnId` is recorded but refuses this
+during-turn experiment, rather than inventing a turn association.
+
+The census covers true/false/decline/cancel/malformed responses, foreign and
+duplicate ids, interruption, EOF, two fresh requests, a stale reply after an
+interrupted turn, proper approval under Never, and fixture-local unattended
+refusal. Two separate data-form controls exercise the `Context.elicit(bool)`
+route under Never and empty-schema automatic acceptance. Data entry is not
+approval authority. The unattended control is the fixture's pre-request check
+of the explicitly forwarded `GENESIS_CC_SESSION=1`; it does not establish that
+native Codex understands Genesis roles. Modern protocol and missing-capability
+refusal are local SDK/fake-session controls, outside the native17-case census.
+
+The isolated frontend advertises `openai/standard-form-input` at initialization
+and starts an ephemeral thread with `threadSource: "user"`. Codex0.166 enables
+the nonempty data-form exception only for a root user thread advertising that
+extension; approval metadata still excludes a request from that exception.
+See the pinned [thread manager](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/thread_manager.rs#L2632)
+and [policy routing](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/codex-mcp/src/elicitation.rs#L590).
+These fixture declarations do not change a running user's frontend or policy.
+The first native experiment (run42566237032) passed15cases and failed2:
+its data control lacked those declarations, and the missing-content reader
+expected omission where native returned an empty object. The corrected reader
+requires the observed `accept` plus `{}` response, refusal and zero writes for
+that negative case. This failed run remains diagnostic evidence; a fresh complete
+native run is required to qualify the revised source.
+
+Foreign-ID and stale-after-interruption controls inject the old/foreign acceptance,
+then send a correctly bound decline and require natural completion plus the
+server's refusal before cleanup. The stale control interrupts only its first
+turn; its second turn must remain usable. These are bounded observable routing
+controls, not proof of every possible internal interleaving.
+Every server invocation must finish before fallback cleanup. The duplicate-reply
+control must observe the first physical append and its server record before replay.
+The raw stream must place each ask before its matching completion; an EOF turn
+has at most one optional interrupted completion. The reader thread records a
+separate deep copy and monotonic receipt time before queueing each completion.
+Readback requires exact correspondence with raw completions. An interrupted
+receipt must follow its matching interrupt input and precede the post-interrupt
+observation. Normal receipts follow their own frontend reply (the no-ask controls
+use their server entry) and precede cleanup, the next ask, or the duplicate-reply
+baseline as applicable. Optional EOF receipts follow EOF input and may arrive
+during the stdout drain, before the after-close observation. These measure when
+the Python reader observed a completion, not backend emission time or universal
+causality across buffered processes.
+
+An interruption must start from a matching pending invocation and retain a
+nonempty terminal server sequence after its exact input and before the
+post-interrupt observation. EOF additionally rechecks the root and active writer
+live immediately before closing stdin, retains their ancestry from that same
+census, observes natural root exit0, and freezes
+retirement of the exact known child population before fallback cleanup. An empty
+EOF server tail is allowed only with that process proof; any retained terminal
+must follow EOF input. Final cleanup observations cannot replace natural EOF
+retirement. Fresh ancestry must connect each writer to the live root through
+known PID/start identities and consistent parent edges; valid reparenting within
+that known tree is allowed. Scope is the already-observed owned descendants,
+not a complete monitor of escaped processes or authentication against someone
+deliberately rewriting mutually consistent artifacts and the verifier.
+
+Readback rejects malformed and RPC-error frames across the complete retained
+stream, including shutdown drains. Positive server invocations require the exact request/response/append sequence,
+so an extra early cancellation cannot hide alongside a later successful effect.
+Synthetic golden replies use an independent
+literal scenario map and separate deep copies for frontend and server content;
+removing either comparison must fail its own damage control. Earlier passing
+runs using weaker lifecycle evidence do not qualify this strengthened contract.
+
+The frozen manifest binds source and both binary hashes, head/base, workflow
+run and attempt. Readback requires complete passed phases, raw request/response
+provenance, negotiated legacy2025-06-18 capability, actual native policy,
+pre-response and post-retirement sink bytes, write ordering and owned-child
+retirement. Modified, missing, duplicate, stale or partial witnesses refuse
+qualification. Source observations or passing local fake-session tests are not
+native compatibility measurements. Read the actual workflow and downloaded raw
+artifact readback before claiming that the experiment passed.
+
+Even a complete result reports `production_ready: false` and human frontend
+behavior as unmeasured. This builds no real review dispatcher, approval store,
+live MCP profile, host agent execution or provider inference. An owner-operated
+Codex frontend with a supported approval interface is a separate final check;
+a Claude/Genesis terminal cannot certify that UI. Production action binding and
+fresh budget rechecks remain separate work.
+
 ## Inherited opt-in harness
 
 Run the opt-in integration file on a Unix host with Codex and the Genesis Python dependencies installed:

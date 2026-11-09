@@ -780,7 +780,10 @@ jobs:
         # Inherit the current runner ceiling and add exactly twenty identities.
         # Compatibility qualification (#4126): fifteen contained-only cases,
         # measured in run42514975072's JUnit; all fifteen pass in native CI.
-        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 598
+        # MCP elicitation (#4211): run42566419285 measured615 skips including
+        # the same2xfails: exactly17 new native ids; no removed ids or changed
+        # skip reasons against the retained598-skip parent report.
+        run: python scripts/check_skip_ceiling.py junit.xml --ceiling 615
 
   test-ubuntu-2404:
     # ubuntu-latest is moving to 26.04, so `test` alone stops showing a break on

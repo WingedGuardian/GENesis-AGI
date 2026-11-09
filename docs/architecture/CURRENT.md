@@ -5265,6 +5265,20 @@ verified: 81bbdb0a9 2026-11-08
   effects. Independent copied-artifact readback refuses incomplete or stale
   evidence; no production provider, native auth, lifecycle enrollment or live
   policy is added. See `docs/reference/codex-native-harness.md`.
+  A separate17-case MCP elicitation experiment has its own frozen manifest and
+  reader. Proper approval metadata, data-form controls, request binding and
+  physical sink ordering are tested independently; synthetic fixture results
+  confer no production action authority or human-frontend qualification.
+  Its isolated frontend declares standard form input and a root user thread;
+  this permits the data-entry Never control without exempting proper approvals.
+  Initial native results were15passed/2failed; corrected expectations and client
+  declarations require a fresh complete run before qualification.
+  The elicitation reader checks all retained frames and binds interruption
+  server terminals and reader-thread completion receipts to their inputs.
+  Foreign/stale controls finish on a current decline; EOF requires fresh
+  root/writer liveness, same-census ancestry and frozen known-child retirement
+  before fallback cleanup. Independent golden replies and atomic provider
+  indexing pin these witnesses; final contained verification remains required.
   Interactive native qualification records a Codex0.166.0 reference binary.
   The launcher warns on other recognizable versions and retains its startup
   inspection/refusal checks; those inspect state, not actual tool denial.
