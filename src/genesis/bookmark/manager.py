@@ -73,7 +73,8 @@ class BookmarkManager:
     ) -> str:
         """Create a micro-bookmark from session context.
 
-        No LLM call — topic is derived from message content. Fast and cheap.
+        Topic is derived from message content. Optional immediate extraction
+        below can use the runtime router, including a model call.
         """
         bookmark_id = str(uuid.uuid4())
         now = datetime.now(UTC).isoformat()

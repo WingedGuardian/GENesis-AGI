@@ -313,7 +313,7 @@ async def test_bookmark_capacity_refusal_retains_pending_marker(database, tmp_pa
     marker.write_text('{}')
     bodies = []
 
-    def pending(*args):
+    def pending(*args, **kwargs):
         async def process():
             marker.unlink()
         coroutine = process()

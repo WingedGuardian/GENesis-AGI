@@ -83,8 +83,12 @@ async def test_pending_bookmark_body_persists_on_its_own_unit(database, memory_s
     server, memory, _ = memory_service
     pending = tmp_path / ".genesis" / "plan_bookmark_pending.json"
     pending.parent.mkdir()
-    pending.write_text(json.dumps({"title": "Synthetic plan", "session_id_hint": "11111111-1111-1111-1111-111111111111"}))
-    monkeypatch.setattr(_plan_bookmark, "Path", SimpleNamespace(home=lambda: tmp_path))
+    pending.write_text(json.dumps({"title": "Synthetic plan", "session_id_hint": "11111111"}))
+    (pending.parent / "sessions" / "11111111-1111-1111-1111-111111111111").mkdir(parents=True)
+    server_home = tmp_path / "server-decoy"
+    (server_home / ".genesis/sessions/11111111-server-decoy").mkdir(parents=True)
+    monkeypatch.setattr(_plan_bookmark, "Path", SimpleNamespace(home=lambda: server_home))
+    monkeypatch.setattr(memory, "Path", SimpleNamespace(home=lambda: server_home))
     monkeypatch.setattr(memory, "_PLAN_BOOKMARK_PENDING", pending)
     monkeypatch.setattr(memory, "_process_pending_bookmarks", True)
     manager = BookmarkManager(
@@ -99,8 +103,8 @@ async def test_pending_bookmark_body_persists_on_its_own_unit(database, memory_s
     while database._jobs:
         await asyncio.gather(*tuple(database._jobs))
     async with database.unit_of_work():
-        rows = await database.execute_fetchall("SELECT topic,source FROM session_bookmarks")
-    assert [(row[0], row[1]) for row in rows] == [("Synthetic plan", "plan")]
+        rows = await database.execute_fetchall("SELECT topic,source,cc_session_id FROM session_bookmarks")
+    assert [tuple(row) for row in rows] == [("Synthetic plan", "plan", "11111111-1111-1111-1111-111111111111")]
     assert not pending.exists()
 
 

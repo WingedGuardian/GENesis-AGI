@@ -79,6 +79,15 @@ verified: 5a3de4eee 2026-11-07
 The 2026-11-07 verification covers the request-owned memory thread boundaries
 below; other memory descriptions retain their individually cited verification dates.
 
+**Pending plan bookmarks:** the memory guard captures its checked input path
+and resolves short session hints in that input's sibling `sessions` directory.
+Updated readers serialize read/unlink with a fixed adjacent lock, released before
+bookmark creation awaits. Old readers and the hook writer do not cooperate;
+partial/overlapping writes and crash loss remain existing limitations (#3064).
+The shared factory still disables this side effect: authenticated request-path
+routing remains a separate prerequisite. This scoped helper description does
+not restamp the complete memory entry or qualify the ordinary local task owner.
+
 **Shared-owner prerequisite (not activated):** nine thread boundaries in
 `memory/store.py`, `retrieval.py`, `intent.py` and `proactive.py` retain actual
 physical completion through their RequestDatabase unit. Legacy connections keep

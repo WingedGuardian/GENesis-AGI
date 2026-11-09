@@ -1,0 +1,1 @@
+- Serialize pending-file reads between updated memory MCP consumers, and resolve abbreviated session IDs beside the selected input.

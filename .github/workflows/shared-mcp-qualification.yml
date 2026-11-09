@@ -54,6 +54,6 @@ jobs:
       - name: Run the real protocol and shared CLI suites
         run: |
           rm -f junit-shared-mcp.xml
-          python -m pytest tests/test_mcp/test_shared_http_admission.py tests/test_mcp/test_shared_http_policy.py tests/test_mcp/test_shared_http_runtime.py tests/test_mcp/test_shared_cli_startup_contract.py tests/test_mcp/test_shared_forwarder.py tests/test_mcp/test_shared_forwarder_http_errors.py tests/test_forwarder_credentials.py tests/test_mcp/test_shared_path_policy.py tests/test_mcp/test_shared_paths.py tests/test_mcp/test_shared_path_tools.py tests/test_mcp/test_shared_path_routes.py tests/test_mcp/test_shared_path_versions.py tests/test_mcp/test_shared_path_context.py tests/test_mcp/test_ordinary_preparation.py -q --junitxml=junit-shared-mcp.xml
+          python -m pytest tests/test_mcp/test_shared_http_admission.py tests/test_mcp/test_shared_http_policy.py tests/test_mcp/test_shared_http_runtime.py tests/test_mcp/test_shared_cli_startup_contract.py tests/test_mcp/test_shared_forwarder.py tests/test_mcp/test_shared_forwarder_http_errors.py tests/test_forwarder_credentials.py tests/test_mcp/test_shared_path_policy.py tests/test_mcp/test_shared_paths.py tests/test_mcp/test_shared_path_tools.py tests/test_mcp/test_shared_path_routes.py tests/test_mcp/test_shared_path_versions.py tests/test_mcp/test_shared_path_context.py tests/test_mcp/test_ordinary_preparation.py tests/test_mcp/test_plan_bookmark_consumption.py -q --junitxml=junit-shared-mcp.xml
       - name: Require the complete unskipped protocol population
-        run: python scripts/check_skip_ceiling.py junit-shared-mcp.xml --ceiling 0 --min-collected 392
+        run: python scripts/check_skip_ceiling.py junit-shared-mcp.xml --ceiling 0 --min-collected 422
