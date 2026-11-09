@@ -64,9 +64,11 @@ finalization to its owner. Writable legacy services keep their database for the
 commit boundary and the staleness guard whatever that tracker setting is.
 Request-owned units still finalize every call with that tracker setting.
 
-No CLI or transport currently selects this bootstrap. Shared activation must
-also supply caller identity, resolve the pending-bookmark policy explicitly,
-and arrange shutdown; database isolation does not provide those boundaries.
+The explicit `--shared-service` entrypoint selects this bootstrap. Its HTTP
+wrapper supplies authenticated request context and the shared resource owner
+arranges shutdown. Ordinary `--server` entrypoints retain their per-process
+lifecycles. Shared pending-bookmark processing stays disabled until the separate
+caller-file policy is wired; database isolation alone does not provide it.
 
 Construct it with an existing database path and an explicit positive `max_units`.
 Use `async with db.unit_of_work():` around work. Each outer unit opens a fresh
@@ -249,3 +251,29 @@ after wrapper cleanup. The body never clears it. Prestart cancellation therefore
 also releases it, and body completion cannot permit a new job while old cleanup
 still owns the flag. Synchronous scheduling failure closes the unscheduled body
 and resets the flag. This is best-effort maintenance, not a durable queue.
+
+### Pending plan-bookmark input ownership
+
+The memory guard captures the checked pending-file path and binds session-prefix
+resolution to its sibling `sessions` directory before scheduling the job. The
+helper's optional `pending_file` and resolver's optional `sessions_dir` retain
+their HOME-based defaults for existing direct callers. Nonempty caller labels
+remain excluded by the guard. On a stacked branch predating the environment
+label accessor, request-context tests alone do not qualify ordinary/native label
+parity; integration with main's identity policy remains required.
+
+Updated readers take a nonblocking, fixed adjacent `.lock` inode only while
+reading/parsing/unlinking a pending file. They close it before awaiting bookmark
+creation. A busy or unopenable lock leaves the input for the holder or a later
+call. The inode remains reusable. Missing input creates no lock. This is
+cooperative reader serialization: the hook writer and old readers do not take
+the lock. Partial/replaced writes and unlink-before-create crash/failure loss
+retain their existing limits; this is not exactly-once delivery or a complete
+repair of #3064. Optional immediate extraction may use the runtime router.
+
+RequestDatabase cancellation before the helper starts, including background-unit
+wait, closes the unstarted coroutine and leaves its input untouched. Shared
+resource drain evidence does not qualify the retained ordinary memory
+lifespan's local task shutdown. Shared initialization still disables pending
+bookmarks; this prerequisite does not yet supply the authenticated request-path
+contract or route ordinary memory remotely.

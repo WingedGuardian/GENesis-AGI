@@ -4,33 +4,56 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import suppress
 from pathlib import Path
 
+from genesis.util.run_lock import _lock_nb
+
 logger = logging.getLogger(__name__)
+_MISSING = object()
+
+
+def _consume_pending(pending_file: Path):
+    """Serialize updated readers; the existing writer does not take this lock."""
+    if not pending_file.exists():
+        return _MISSING
+    try:
+        lock = _lock_nb(pending_file.with_name(pending_file.name + ".lock"), "a")
+    except OSError:
+        logger.warning("Pending plan bookmark claim unavailable", exc_info=True)
+        return _MISSING
+    # Closing this descriptor releases the flock. Keep its inode for the next
+    # caller; unlinking a lock file would permit independent holders.
+    with lock:
+        if not pending_file.exists():
+            return _MISSING
+        try:
+            return json.loads(pending_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            logger.warning("Failed to read plan bookmark pending file", exc_info=True)
+            return _MISSING
+        finally:
+            with suppress(OSError):
+                pending_file.unlink(missing_ok=True)
 
 
 async def _process_plan_bookmark_pending(
     bookmark_mgr,
     resolve_session_id_fn,
+    *,
+    pending_file: Path | None = None,
 ) -> None:
-    """Process a pending plan bookmark file (written by plan_bookmark_hook.py).
+    """Consume one pending plan; release its cooperative lock before any await.
 
-    One-shot, non-fatal. If the file doesn't exist, returns immediately.
+    The default retains the ordinary HOME input. This is not exactly-once
+    delivery: old readers and the writer ignore the lock, and a failed create
+    retains the existing unlink-before-create loss behavior.
     """
-    pending_file = Path.home() / ".genesis" / "plan_bookmark_pending.json"
-    if not pending_file.exists():
+    if pending_file is None:
+        pending_file = Path.home() / ".genesis" / "plan_bookmark_pending.json"
+    data = _consume_pending(pending_file)
+    if data is _MISSING:
         return
-
-    try:
-        raw = pending_file.read_text()
-        data = json.loads(raw)
-    except (json.JSONDecodeError, OSError):
-        logger.warning("Failed to read plan bookmark pending file", exc_info=True)
-        return
-    finally:
-        import contextlib
-        with contextlib.suppress(OSError):
-            pending_file.unlink(missing_ok=True)
 
     plan_path = data.get("plan_path", "")
     title = data.get("title", "Plan session")

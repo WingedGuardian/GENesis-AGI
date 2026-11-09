@@ -8,11 +8,13 @@ from __future__ import annotations
 import importlib
 import logging
 from contextlib import suppress
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from fastmcp import FastMCP
 
+from genesis.caller_context import caller_context
 from genesis.db.crud import (
     knowledge as knowledge_crud,
 )
@@ -163,28 +165,36 @@ def _require_init() -> None:
     if _store is None or _retriever is None or _db is None:
         raise RuntimeError("memory-mcp not initialized — call init() first")
 
-    if _process_pending_bookmarks and _PLAN_BOOKMARK_PENDING.exists():
+    pending_file = _PLAN_BOOKMARK_PENDING
+    # Preserve main's audit-label exclusion; native/environment parity still
+    # requires integration with its caller-context accessor (#4112/#4131).
+    if _process_pending_bookmarks and not caller_context().profile and pending_file.exists():
         from genesis.db.request_database import DatabaseScopeError, spawn_database_task
 
         # The marker is consumed only by an accepted job; retry next call.
         with suppress(DatabaseScopeError):
             spawn_database_task(
                 _db,
-                _process_plan_bookmark_pending(_bookmark_mgr, _resolve_session_id),
+                _process_plan_bookmark_pending(
+                    _bookmark_mgr,
+                    partial(_resolve_session_id, sessions_dir=pending_file.parent / "sessions"),
+                    pending_file=pending_file,
+                ),
                 name="plan-bookmark-pending",
             )
 
 
-def _resolve_session_id(session_id: str) -> str:
+def _resolve_session_id(session_id: str, *, sessions_dir: Path | None = None) -> str:
     """Resolve a potentially truncated session ID to a full UUID.
 
-    Scans ~/.genesis/sessions/ for a prefix match. Returns the full UUID
+    Scans the supplied directory, defaulting to ~/.genesis/sessions/. Returns the full UUID
     if exactly one match is found, otherwise returns the input unchanged.
     """
     if len(session_id) >= 36:
         return session_id
 
-    sessions_dir = Path.home() / ".genesis" / "sessions"
+    if sessions_dir is None:
+        sessions_dir = Path.home() / ".genesis" / "sessions"
     if not sessions_dir.exists():
         return session_id
 

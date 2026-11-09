@@ -6,7 +6,8 @@ When a plan is approved (ExitPlanMode fires), this hook:
 2. Outputs the architecture review recommendation as additionalContext
 
 The MCP server picks up the pending file on the next tool call and
-creates the bookmark programmatically — no LLM dependency.
+creates the bookmark programmatically. Optional extraction can use the runtime
+router, including a model call.
 
 Reads hook input from stdin as JSON (the PostToolUse shape):
   {"tool_name": "ExitPlanMode", "session_id": "...",

@@ -461,7 +461,7 @@ after graceful shutdown in this qualified version, so the backend check requires
 the expected signal exit together with completed SDK/drain/resource events.
 They neither contact a native client/provider nor activate routing.
 Its fresh JUnit report must pass `scripts/check_skip_ceiling.py` with zero skips
-and a floor of 392 cases. Installation, collection, test or report-check failure
+and a floor of 422 cases. Installation, collection, test or report-check failure
 fails the job; missing or filtered workflow runs do not qualify a PR. Closing
 checks its actual head/base result. Ordinary skip-budget changes require observed
 skip identities; this workflow does not raise that budget automatically.
@@ -529,3 +529,18 @@ arguments and provider doubles; they are not real-provider or native-client E2E.
 and inert ASGI/resource dependencies to verify signal replay, cancelled startup,
 bind errors, failed lifespan and cancelled/forced shutdown ordering. These tests
 do not send signals to another session or start a deployed service.
+
+### Pending plan-bookmark consumption
+
+`tests/test_mcp/test_plan_bookmark_consumption.py` exercises the actual helper
+against disposable HOME and GENESIS_HOME directories: explicit versus default
+input, absent/malformed/read/create failures, lock reuse/busy/open failure,
+separate OS readers, killed holders, session-prefix decoys and label exclusion.
+Owned RequestDatabase jobs cover cancellation before entry and while waiting
+for a background unit; a held manager proves no lock spans its await.
+`plan_bookmark_consumer_child.py` is the minimal owned process observer.
+The existing real SDK tool-body/SQLite-index test additionally checks a short
+caller hint against a conflicting server directory. Provider/vector/extraction
+boundaries in that test remain synthetic; it is not full mixed stdio/TCP memory
+qualification. The native environment-label path requires integrated-main
+evidence, separately from direct request-context guard tests.
