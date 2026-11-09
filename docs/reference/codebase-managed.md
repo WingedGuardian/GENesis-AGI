@@ -914,8 +914,9 @@ admission checks still apply before readiness and native execution. Standalone
 callers retain their existing environment behavior. The optional private runtime
 capsule transports closed top-level objects but supplies no launch or recovery
 authority: source-only queue/shell/availability roles refuse runtime-bearing
-capsules, and diagnostics never print their values. Full owner/monitor wiring
-and supervised recovery remain unfinished and separately qualified.
+capsules, and diagnostics never print their values. The private owner/monitor
+endpoint below remains separate from unfinished timer/provider integration and
+supervised recovery.
 
 The private CBM reporter role now checks the complete runtime source, provider
 pin, effective policy and environment recipe. It consumes a bounded atomic
@@ -929,9 +930,47 @@ excluded from native subprocess inheritance.
 
 The shared policy identity includes watchdog, CPU and I/O settings; a partial
 full-policy value cannot silently become the earlier five-field recipe. These
-reporter checks do not create the physical owner or monitor, enable automatic
-readiness, qualify native containment, or implement the GitNexus runtime adapter.
-Existing standalone indexing behavior remains unchanged.
+reporter checks do not enable automatic readiness or qualify native containment.
+
+The captured runner now exposes a private initial-owner endpoint for CBM. It
+validates the inherited canonical runner lock, takes the existing repository
+flock itself, and commits its actual process identity before creating workload
+children. Only the first acknowledged reservation releases its sealed runtime.
+For inherited routing, the original boot/PID/start snapshot brackets the actual
+owner-slice lookup and remains bound through the reservation checks. It does
+not exclude arbitrary external cgroup migration; the child and reporter still
+independently verify their original parent, route and scope before preparation.
+The owner installs its monitor and output handling, samples the original scope,
+then checks both children again before sending the one startup ACK. A manager
+read cannot turn an earlier alive check into permission for a dead monitor.
+
+The owner performs original-scope control before blocking journal publication.
+Its monitor only requests actions; retirement closes the owner's sole private
+stdin-pipe writer, without a signal trap. The current sample/iteration drains
+under the existing fixed cleanup budget; the owner fences
+late action requests. Original kernel and reporter samples keep separate ordered
+histories. Work expiry enters the existing stop transition before an exhausted
+final cleanup budget can return with an open obligation. Separate observations
+and delayed delivery cannot replace the first baseline or erase stronger
+owned OOM evidence. Clean control requires actual owned waits, output EOF,
+monitor-group absence and original-scope cleanup. An unresolved lifetime leaves
+the control obligation open. A launched child without registration remains
+uncertain even when it exits zero. A transport success is not indexing success.
+
+Sample selection preserves one actual snapshot, prioritizing hierarchical kill
+evidence, then local kills and observation time; the original baseline never
+changes. A late local-only kill that historical resource accounting does not
+represent leaves existing startup/controller uncertainty, even after successful
+waits. Retiring the monitor forbids late physical actions; it does not clear
+this safety hold. Native completion accounting remains independent.
+
+This endpoint is exercised through the actual queued factory and accepted
+harmless executable descriptor with real locks, processes, pipes and scratch
+SQL, including successful and failed native completion. The fixture substitutes
+its manager, kernel, resource-admission input and provider. It does not
+qualify native containment. Ordinary timer dispatch, the GitNexus adapter and
+positive supervised recovery remain separate; automatic readiness stays fenced.
+Existing standalone indexing policy remains unchanged.
 
 ## Verification
 

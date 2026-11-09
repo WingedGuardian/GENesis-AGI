@@ -89,20 +89,23 @@ _wd_kill()   {
 
 # _watchdog <kind> <target> <job_pid>: babysit a running index; pause under
 # pressure, resume when calm, kill a run that can't make headway.
+_wd_alive() { kill -0 "$1" 2>/dev/null; }
 _watchdog() {
     local kind="$1" target="$2" job_pid="$3"
-    local wall start now bad=0 paused=0 pause_start=0
+    local wall start now bad=0 paused=0 pause_start=0 _WD_STOP_REASON=''
     wall="$(_wall_cap)"; start="$(date +%s)"
     local have_sampler=1
     command -v pressure_loadavg1 >/dev/null 2>&1 || have_sampler=0
-    while kill -0 "$job_pid" 2>/dev/null; do
+    while _wd_alive "$job_pid"; do
         now="$(date +%s)"
         if [ "$(( now - start ))" -ge "$wall" ]; then
             _log "watchdog: wall cap ${wall}s reached (mode=$MODE) — killing index"
+            _WD_STOP_REASON=wall
             _wd_kill "$kind" "$target" "$job_pid"; return 0
         fi
         if [ "$paused" = 1 ] && [ "$(( now - pause_start ))" -ge "$_WD_CONT_PAUSE_MAX" ]; then
             _log "watchdog: paused ${_WD_CONT_PAUSE_MAX}s continuously (system never calmed) — killing index"
+            _WD_STOP_REASON=pressure_stop
             _wd_kill "$kind" "$target" "$job_pid"; return 0
         fi
         local interval="$_WD_INTERVAL" need="$_WD_BAD_SAMPLES"

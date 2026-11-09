@@ -183,6 +183,23 @@ class ScopeManager:
         identity, properties, path = self._snapshot("GetUnit", ("s", unit + ".scope"), "Scope")
         if reporter_unit != path or self._object("GetUnitByPID", "u", str(pid)) != path:
             raise ValueError("named scope does not own the actual reporter")
+        return self._registration(unit, facts, identity, properties, wall_seconds)
+
+    def original(self, registration, facts, *, object_path, wall_seconds, proof):
+        """Observe an original subtree after foreground exit; grant no action."""
+        if (type(wall_seconds) is not int or not 0 < wall_seconds <= 2**63 - 1
+                or not proof._facts(registration["facts"]) or not proof._facts(facts)):
+            raise ValueError("invalid original scope facts or wall cap")
+        proof._complete(registration["facts"], facts)
+        unit = registration["unit"]
+        identity, properties, path = self._snapshot("GetUnit", ("s", unit + ".scope"), "Scope")
+        current = self._registration(unit, facts, identity, properties, wall_seconds)
+        if (path != object_path or current["invocation_id"] != registration["invocation_id"]
+                or current["stop_usec"] != registration["stop_usec"]):
+            raise ValueError("original scope invocation, object or stop policy changed")
+        return current
+
+    def _registration(self, unit, facts, identity, properties, wall_seconds):
         leaf = PurePosixPath(facts["leaf"]["path"])
         group = self.property(properties, "ControlGroup", "s")
         target = PurePosixPath(group)
