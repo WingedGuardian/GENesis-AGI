@@ -42,6 +42,33 @@
       "validator": "python",
       "test": "tests/test_hooks/test_protected_paths_guard.py::TestProtectedDirBlocks::test_dir_itself",
       "why": "deleting a protected directory must be refused, and this is the single decision point that refuses it"
+    },
+    {
+      "label": "inbox rulings drops exact tag filtering",
+      "path": "scripts/inbox_review_rulings.py",
+      "anchor": "if \"inbox_disposition\" not in tags.split():",
+      "replacement": "if False:",
+      "validator": "python",
+      "test": "tests/test_scripts/test_inbox_review_rulings.py::test_exact_tags_include_all_whitespace_and_exclude_near_matches[space]",
+      "why": "Near-match tags are not owner disposition tags; every database and output is isolated."
+    },
+    {
+      "label": "inbox rulings hides metadata-free history",
+      "path": "scripts/inbox_review_rulings.py",
+      "anchor": "LEFT JOIN memory_metadata",
+      "replacement": "INNER JOIN memory_metadata",
+      "validator": "python",
+      "test": "tests/test_scripts/test_inbox_review_rulings.py::test_history_and_all_metadata_are_retained_without_authority[missing]",
+      "why": "Missing companion metadata must remain visible as uncertain history, never silently disappear."
+    },
+    {
+      "label": "inbox rulings loses snapshot across reads",
+      "path": "scripts/inbox_review_rulings.py",
+      "anchor": "    db.execute(\"BEGIN\")",
+      "replacement": "    pass",
+      "validator": "python",
+      "test": "tests/test_scripts/test_inbox_review_rulings.py::test_reader_keeps_snapshot_open_and_query_only",
+      "why": "A later fixture WAL writer must not change the active history reader's snapshot; no live store is reachable."
     }
   ]
 }

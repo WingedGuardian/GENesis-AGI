@@ -1430,6 +1430,14 @@ verified: a6528dab2 2026-11-09
   (`knowledge_ingest_source` MCP) requires explicit user confirmation —
   contrast the intake bypass in entry 4.
 - **inbox/**: file-drop monitor with approval-gated dispatch.
+  Explicit owner-requested disposition review uses the manual-only Tier-1
+  `inbox-review` skill, reached by the attended-request pointer in `CLAUDE.md`.
+  Its read-only `scripts/inbox_review_rulings.py` helper enumerates exact-tagged
+  retained FTS history in a snapshot, including uncertain metadata, without
+  ranking, authority adjudication or writes. The workflow uses existing memory
+  and per-review outcomes documents; it adds no ledger or automatic evaluation.
+  Activation prerequisites and deterministic/native validation limits are in
+  `docs/reference/owner-inbox-review.md` (verified: 2026-11-09).
   `monitor.py` owns scanning, approval, retries and baseline writes;
   `batch_runner.py` executes one approved batch and post-processes its output,
   reached through the monitor's `_run_one_batch` forwarding method. Before any

@@ -440,6 +440,11 @@ When multiple Genesis MCP tools could handle a task, see
 `.claude/docs/mcp-tools-guide.md` for decision trees (storage taxonomy,
 recall taxonomy, health debugging escalation).
 
+When the authenticated owner explicitly requests an inbox review in an attended
+conversation, Read `.claude/skills/inbox-review/SKILL.md` and follow it. This
+manual-only skill is loaded by explicit file path; automatic skill discovery is
+not its entry point. Resolve unknown caller context before starting the review.
+
 ## Reference Capture
 
 Credentials, URLs, IPs, and identifiers shared in conversation are
