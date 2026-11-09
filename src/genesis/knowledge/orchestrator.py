@@ -12,7 +12,7 @@ import hashlib
 import json
 import logging
 import typing
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from genesis.knowledge.distillation import MIN_EXTRACTION_RATIO, DistillationPipeline
@@ -75,8 +75,10 @@ class KnowledgeOrchestrator:
         purpose: list[str] | None = None,
         user_context: str | None = None,
         on_chunk_done: typing.Callable | None = None,
+        read_path: str | None = None,
     ) -> IngestResult:
-        """Ingest a single source (file path or URL) into the knowledge base."""
+        """Ingest source identity, optionally reading its file from read_path."""
+        read_source = source if read_path is None else read_path
         # NB: dedup is content-hash based and runs AFTER extraction (the
         # "content-hash dedup gate" below). The old source-identity gate that lived
         # here was removed so a re-ingest with CHANGED content re-distills instead
@@ -94,7 +96,9 @@ class KnowledgeOrchestrator:
 
         # 3. Process
         try:
-            content = await processor.process(source)
+            content = await processor.process(read_source)
+            if read_path is not None:
+                content = replace(content, source_path=source)
         except Exception as exc:
             # Regression guard for the content-hash gate move: every re-ingest now
             # runs the processor BEFORE any dedup check. If a previously-cached
@@ -166,7 +170,7 @@ class KnowledgeOrchestrator:
         tree_task: asyncio.Task | None = None
         source_resolved = None
         if not source.startswith(("http://", "https://")):
-            candidate = Path(source).resolve()
+            candidate = Path(read_source).resolve()
             # Path traversal guard: only allow files under $HOME
             home = Path.home().resolve()
             if candidate.is_relative_to(home):
@@ -184,7 +188,7 @@ class KnowledgeOrchestrator:
             # cancelled+awaited on every error path, so exceptions propagate
             # to the caller — tracked_task would double-report them.
             tree_task = asyncio.create_task(
-                self._tree_index_source(source),
+                self._tree_index_source(source, **({"read_path": read_path} if read_path is not None else {})),
                 name=f"tree-index-{Path(source).name}",
             )
 
@@ -200,7 +204,7 @@ class KnowledgeOrchestrator:
 
             # 5. Optionally save original
             original_path = None
-            source_path = Path(source)
+            source_path = Path(read_source)
             if source_path.exists():
                 original_path = self._manifest.save_original(source, source_path)
 
@@ -322,9 +326,10 @@ class KnowledgeOrchestrator:
         domain: str = "auto",
         purpose: list[str] | None = None,
         extensions: list[str] | None = None,
+        read_directory: str | None = None,
     ) -> list[IngestResult]:
-        """Batch-ingest all supported files from a directory."""
-        dir_path = Path(directory)
+        """Ingest directory identities, optionally reading a separate location."""
+        dir_path = Path(directory if read_directory is None else read_directory)
         if not dir_path.is_dir():
             return [
                 IngestResult(
@@ -348,10 +353,11 @@ class KnowledgeOrchestrator:
                 continue
 
             result = await self.ingest_source(
-                str(file_path),
+                str(file_path) if read_directory is None else str(Path(directory) / file_path.relative_to(dir_path)),
                 project_type=project_type,
                 domain=domain,
                 purpose=purpose,
+                **({"read_path": str(file_path)} if read_directory is not None else {}),
             )
             results.append(result)
 
@@ -381,14 +387,14 @@ class KnowledgeOrchestrator:
             )
             return None
 
-    async def _tree_index_source(self, source: str) -> str | None:
+    async def _tree_index_source(self, source: str, *, read_path: str | None = None) -> str | None:
         """Upload a document to PageIndex and save the tree index.
 
         Returns the doc_id on success, None on failure.
         """
         from genesis.knowledge.tree_index import save_tree_index
 
-        doc_id = await self._tree_index.upload_document(source)
+        doc_id = await self._tree_index.upload_document(source if read_path is None else read_path)
         tree = await self._tree_index.get_tree(doc_id)
         save_tree_index(source, doc_id, tree)
         logger.info("Tree index built for %s (doc_id=%s)", source, doc_id)

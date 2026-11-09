@@ -27,12 +27,23 @@ cancellation. It does not guarantee all HTTP handlers finish before resource
 shutdown; the resource-owner contract is a separate bootstrap obligation.
 
 An app-wide SDK-backed exact Host/Origin guard precedes bearer authentication.
-P3 authentication covers `/status` GET/HEAD and `/mcp` GET/POST/DELETE. Body limits
+P3 authentication covers `/status` GET/HEAD and both `/mcp` and `/mcp/v1`
+GET/POST/DELETE. The versioned route binds the forwarder's caller-file contract;
+it points at the same transport and manager, with the same session cap and
+authenticated principal. Body limits
 and raw-envelope admission follow authentication. Duplicate structural JSON
 fields, nonfinite constants, batches and IDs colliding under the qualified SDK's
 actual coercion helper are refused; admitted bytes are replayed unchanged.
 Task-augmented calls are explicitly refused: disabling the task extension alone
 does not prevent ordinary body execution on this stack.
+
+Both exact MCP routes pass through raw-envelope admission. Shared tool
+middleware binds the actual request's path interpretation and public FastMCP
+request metadata for the tool continuation, then resets that scope. Ingestion
+identity hints cannot retarget a nested call's arguments. Missing shared scope
+refuses at the ingestion/resume wrapper before constructing its provider-facing
+consumer; ordinary wrappers retain their defaults. See
+[caller-file semantics](mcp-shared-forwarder.md#caller-files-and-backend-compatibility).
 
 The entire validated caller participates in the SDK session principal. Every
 message binds caller, session and profile context from authenticated HTTP
@@ -74,7 +85,7 @@ deployed service readiness.
 
 The separate shared-MCP qualification workflow runs the real protocol and shared CLI suites
 under its pinned SDK constraints and requires zero skips. Ordinary floating CI
-keeps pure configuration/refusal coverage and explicitly skips these four
+keeps pure configuration/refusal coverage and explicitly skips the
 version-specific modules when unqualified; the dedicated job fails instead.
 See [testing environments](testing.md#shared-mcp-qualification-environments).
 

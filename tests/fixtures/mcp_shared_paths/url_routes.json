@@ -1,0 +1,3605 @@
+{
+  "basis": "Original default registry before caller-path refactor; 900 scheme/space/host/port/path cells. No fetching.",
+  "cases": [
+    {
+      "source": "http://youtube.com/watch?v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://youtube.com/watch?x=1&v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://youtube.com/embed/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://youtube.com/channel/name",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtube.com/shorts/clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://youtube.com/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtube.com:443/watch?v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtube.com:443/watch?x=1&v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtube.com:443/embed/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtube.com:443/channel/name",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtube.com:443/shorts/clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtube.com:443/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtu.be/watch?v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://youtu.be/watch?x=1&v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://youtu.be/embed/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://youtu.be/channel/name",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://youtu.be/shorts/clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://youtu.be/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://youtu.be:443/watch?v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtu.be:443/watch?x=1&v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtu.be:443/embed/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtu.be:443/channel/name",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtu.be:443/shorts/clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtu.be:443/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://www.youtu.be/watch?v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://www.youtu.be/watch?x=1&v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://www.youtu.be/embed/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://www.youtu.be/channel/name",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://www.youtu.be/shorts/clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://www.youtu.be/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://www.youtu.be:443/watch?v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://www.youtu.be:443/watch?x=1&v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://www.youtu.be:443/embed/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://www.youtu.be:443/channel/name",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://www.youtu.be:443/shorts/clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://www.youtu.be:443/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://notyoutube.com/watch?v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://notyoutube.com/watch?x=1&v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://notyoutube.com/embed/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://notyoutube.com/channel/name",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://notyoutube.com/shorts/clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://notyoutube.com/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://notyoutube.com:443/watch?v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://notyoutube.com:443/watch?x=1&v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://notyoutube.com:443/embed/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://notyoutube.com:443/channel/name",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://notyoutube.com:443/shorts/clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://notyoutube.com:443/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://example.invalid/watch?v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://example.invalid/watch?x=1&v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://example.invalid/embed/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://example.invalid/channel/name",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://example.invalid/shorts/clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://example.invalid/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://example.invalid:443/watch?v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://example.invalid:443/watch?x=1&v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://example.invalid:443/embed/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://example.invalid:443/channel/name",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://example.invalid:443/shorts/clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://example.invalid:443/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": " http://youtube.com/watch?v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " http://youtube.com/watch?x=1&v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " http://youtube.com/embed/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " http://youtube.com/channel/name",
+      "processor": null
+    },
+    {
+      "source": " http://youtube.com/shorts/clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " http://youtube.com/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " http://youtube.com:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " http://youtube.com:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " http://youtube.com:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " http://youtube.com:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " http://youtube.com:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " http://youtube.com:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " http://youtu.be/watch?v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " http://youtu.be/watch?x=1&v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " http://youtu.be/embed/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " http://youtu.be/channel/name",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " http://youtu.be/shorts/clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " http://youtu.be/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " http://youtu.be:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " http://youtu.be:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " http://youtu.be:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " http://youtu.be:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " http://youtu.be:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " http://youtu.be:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " http://www.youtu.be/watch?v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " http://www.youtu.be/watch?x=1&v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " http://www.youtu.be/embed/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " http://www.youtu.be/channel/name",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " http://www.youtu.be/shorts/clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " http://www.youtu.be/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " http://www.youtu.be:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " http://www.youtu.be:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " http://www.youtu.be:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " http://www.youtu.be:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " http://www.youtu.be:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " http://www.youtu.be:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " http://notyoutube.com/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " http://notyoutube.com/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " http://notyoutube.com/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " http://notyoutube.com/channel/name",
+      "processor": null
+    },
+    {
+      "source": " http://notyoutube.com/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " http://notyoutube.com/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " http://notyoutube.com:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " http://notyoutube.com:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " http://notyoutube.com:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " http://notyoutube.com:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " http://notyoutube.com:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " http://notyoutube.com:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " http://example.invalid/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " http://example.invalid/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " http://example.invalid/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " http://example.invalid/channel/name",
+      "processor": null
+    },
+    {
+      "source": " http://example.invalid/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " http://example.invalid/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " http://example.invalid:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " http://example.invalid:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " http://example.invalid:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " http://example.invalid:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " http://example.invalid:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " http://example.invalid:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "http://youtube.com/watch?v=clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://youtube.com/watch?x=1&v=clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://youtube.com/embed/clip.pdf ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://youtube.com/channel/name ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtube.com/shorts/clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://youtube.com/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtube.com:443/watch?v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtube.com:443/watch?x=1&v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtube.com:443/embed/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtube.com:443/channel/name ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtube.com:443/shorts/clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtube.com:443/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtu.be/watch?v=clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://youtu.be/watch?x=1&v=clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://youtu.be/embed/clip.pdf ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://youtu.be/channel/name ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://youtu.be/shorts/clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://youtu.be/clip.pdf ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://youtu.be:443/watch?v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtu.be:443/watch?x=1&v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtu.be:443/embed/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtu.be:443/channel/name ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtu.be:443/shorts/clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://youtu.be:443/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://www.youtu.be/watch?v=clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://www.youtu.be/watch?x=1&v=clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://www.youtu.be/embed/clip.pdf ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://www.youtu.be/channel/name ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://www.youtu.be/shorts/clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://www.youtu.be/clip.pdf ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "http://www.youtu.be:443/watch?v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://www.youtu.be:443/watch?x=1&v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://www.youtu.be:443/embed/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://www.youtu.be:443/channel/name ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://www.youtu.be:443/shorts/clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://www.youtu.be:443/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://notyoutube.com/watch?v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://notyoutube.com/watch?x=1&v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://notyoutube.com/embed/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://notyoutube.com/channel/name ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://notyoutube.com/shorts/clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://notyoutube.com/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://notyoutube.com:443/watch?v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://notyoutube.com:443/watch?x=1&v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://notyoutube.com:443/embed/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://notyoutube.com:443/channel/name ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://notyoutube.com:443/shorts/clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://notyoutube.com:443/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://example.invalid/watch?v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://example.invalid/watch?x=1&v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://example.invalid/embed/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://example.invalid/channel/name ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://example.invalid/shorts/clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://example.invalid/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://example.invalid:443/watch?v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://example.invalid:443/watch?x=1&v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://example.invalid:443/embed/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://example.invalid:443/channel/name ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://example.invalid:443/shorts/clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "http://example.invalid:443/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtube.com/watch?v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://youtube.com/watch?x=1&v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://youtube.com/embed/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://youtube.com/channel/name",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtube.com/shorts/clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://youtube.com/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtube.com:443/watch?v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtube.com:443/watch?x=1&v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtube.com:443/embed/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtube.com:443/channel/name",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtube.com:443/shorts/clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtube.com:443/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtu.be/watch?v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://youtu.be/watch?x=1&v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://youtu.be/embed/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://youtu.be/channel/name",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://youtu.be/shorts/clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://youtu.be/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://youtu.be:443/watch?v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtu.be:443/watch?x=1&v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtu.be:443/embed/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtu.be:443/channel/name",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtu.be:443/shorts/clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtu.be:443/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://www.youtu.be/watch?v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://www.youtu.be/watch?x=1&v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://www.youtu.be/embed/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://www.youtu.be/channel/name",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://www.youtu.be/shorts/clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://www.youtu.be/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://www.youtu.be:443/watch?v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://www.youtu.be:443/watch?x=1&v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://www.youtu.be:443/embed/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://www.youtu.be:443/channel/name",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://www.youtu.be:443/shorts/clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://www.youtu.be:443/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://notyoutube.com/watch?v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://notyoutube.com/watch?x=1&v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://notyoutube.com/embed/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://notyoutube.com/channel/name",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://notyoutube.com/shorts/clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://notyoutube.com/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://notyoutube.com:443/watch?v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://notyoutube.com:443/watch?x=1&v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://notyoutube.com:443/embed/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://notyoutube.com:443/channel/name",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://notyoutube.com:443/shorts/clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://notyoutube.com:443/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://example.invalid/watch?v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://example.invalid/watch?x=1&v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://example.invalid/embed/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://example.invalid/channel/name",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://example.invalid/shorts/clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://example.invalid/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://example.invalid:443/watch?v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://example.invalid:443/watch?x=1&v=clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://example.invalid:443/embed/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://example.invalid:443/channel/name",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://example.invalid:443/shorts/clip",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://example.invalid:443/clip.pdf",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": " https://youtube.com/watch?v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " https://youtube.com/watch?x=1&v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " https://youtube.com/embed/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " https://youtube.com/channel/name",
+      "processor": null
+    },
+    {
+      "source": " https://youtube.com/shorts/clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " https://youtube.com/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " https://youtube.com:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " https://youtube.com:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " https://youtube.com:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " https://youtube.com:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " https://youtube.com:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " https://youtube.com:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " https://youtu.be/watch?v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " https://youtu.be/watch?x=1&v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " https://youtu.be/embed/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " https://youtu.be/channel/name",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " https://youtu.be/shorts/clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " https://youtu.be/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " https://youtu.be:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " https://youtu.be:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " https://youtu.be:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " https://youtu.be:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " https://youtu.be:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " https://youtu.be:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " https://www.youtu.be/watch?v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " https://www.youtu.be/watch?x=1&v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " https://www.youtu.be/embed/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " https://www.youtu.be/channel/name",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " https://www.youtu.be/shorts/clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " https://www.youtu.be/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " https://www.youtu.be:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " https://www.youtu.be:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " https://www.youtu.be:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " https://www.youtu.be:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " https://www.youtu.be:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " https://www.youtu.be:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " https://notyoutube.com/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " https://notyoutube.com/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " https://notyoutube.com/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " https://notyoutube.com/channel/name",
+      "processor": null
+    },
+    {
+      "source": " https://notyoutube.com/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " https://notyoutube.com/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " https://notyoutube.com:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " https://notyoutube.com:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " https://notyoutube.com:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " https://notyoutube.com:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " https://notyoutube.com:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " https://notyoutube.com:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " https://example.invalid/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " https://example.invalid/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " https://example.invalid/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " https://example.invalid/channel/name",
+      "processor": null
+    },
+    {
+      "source": " https://example.invalid/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " https://example.invalid/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " https://example.invalid:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " https://example.invalid:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " https://example.invalid:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " https://example.invalid:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " https://example.invalid:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " https://example.invalid:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "https://youtube.com/watch?v=clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://youtube.com/watch?x=1&v=clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://youtube.com/embed/clip.pdf ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://youtube.com/channel/name ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtube.com/shorts/clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://youtube.com/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtube.com:443/watch?v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtube.com:443/watch?x=1&v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtube.com:443/embed/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtube.com:443/channel/name ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtube.com:443/shorts/clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtube.com:443/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtu.be/watch?v=clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://youtu.be/watch?x=1&v=clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://youtu.be/embed/clip.pdf ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://youtu.be/channel/name ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://youtu.be/shorts/clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://youtu.be/clip.pdf ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://youtu.be:443/watch?v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtu.be:443/watch?x=1&v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtu.be:443/embed/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtu.be:443/channel/name ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtu.be:443/shorts/clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://youtu.be:443/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://www.youtu.be/watch?v=clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://www.youtu.be/watch?x=1&v=clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://www.youtu.be/embed/clip.pdf ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://www.youtu.be/channel/name ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://www.youtu.be/shorts/clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://www.youtu.be/clip.pdf ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "https://www.youtu.be:443/watch?v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://www.youtu.be:443/watch?x=1&v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://www.youtu.be:443/embed/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://www.youtu.be:443/channel/name ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://www.youtu.be:443/shorts/clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://www.youtu.be:443/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://notyoutube.com/watch?v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://notyoutube.com/watch?x=1&v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://notyoutube.com/embed/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://notyoutube.com/channel/name ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://notyoutube.com/shorts/clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://notyoutube.com/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://notyoutube.com:443/watch?v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://notyoutube.com:443/watch?x=1&v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://notyoutube.com:443/embed/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://notyoutube.com:443/channel/name ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://notyoutube.com:443/shorts/clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://notyoutube.com:443/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://example.invalid/watch?v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://example.invalid/watch?x=1&v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://example.invalid/embed/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://example.invalid/channel/name ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://example.invalid/shorts/clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://example.invalid/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://example.invalid:443/watch?v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://example.invalid:443/watch?x=1&v=clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://example.invalid:443/embed/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://example.invalid:443/channel/name ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://example.invalid:443/shorts/clip ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "https://example.invalid:443/clip.pdf ",
+      "processor": "WebProcessor"
+    },
+    {
+      "source": "HTTPS://youtube.com/watch?v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://youtube.com/watch?x=1&v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://youtube.com/embed/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://youtube.com/channel/name",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://youtube.com/shorts/clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://youtube.com/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "HTTPS://youtube.com:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://youtube.com:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://youtube.com:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "HTTPS://youtube.com:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://youtube.com:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://youtube.com:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "HTTPS://youtu.be/watch?v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://youtu.be/watch?x=1&v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://youtu.be/embed/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://youtu.be/channel/name",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://youtu.be/shorts/clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://youtu.be/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://youtu.be:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://youtu.be:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://youtu.be:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "HTTPS://youtu.be:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://youtu.be:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://youtu.be:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "HTTPS://www.youtu.be/watch?v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://www.youtu.be/watch?x=1&v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://www.youtu.be/embed/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://www.youtu.be/channel/name",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://www.youtu.be/shorts/clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://www.youtu.be/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://www.youtu.be:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://www.youtu.be:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://www.youtu.be:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "HTTPS://www.youtu.be:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://www.youtu.be:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://www.youtu.be:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "HTTPS://notyoutube.com/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://notyoutube.com/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://notyoutube.com/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "HTTPS://notyoutube.com/channel/name",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://notyoutube.com/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://notyoutube.com/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "HTTPS://notyoutube.com:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://notyoutube.com:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://notyoutube.com:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "HTTPS://notyoutube.com:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://notyoutube.com:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://notyoutube.com:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "HTTPS://example.invalid/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://example.invalid/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://example.invalid/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "HTTPS://example.invalid/channel/name",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://example.invalid/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://example.invalid/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "HTTPS://example.invalid:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://example.invalid:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://example.invalid:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "HTTPS://example.invalid:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://example.invalid:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://example.invalid:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " HTTPS://youtube.com/watch?v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " HTTPS://youtube.com/watch?x=1&v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " HTTPS://youtube.com/embed/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " HTTPS://youtube.com/channel/name",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://youtube.com/shorts/clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " HTTPS://youtube.com/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " HTTPS://youtube.com:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://youtube.com:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://youtube.com:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " HTTPS://youtube.com:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://youtube.com:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://youtube.com:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " HTTPS://youtu.be/watch?v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " HTTPS://youtu.be/watch?x=1&v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " HTTPS://youtu.be/embed/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " HTTPS://youtu.be/channel/name",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " HTTPS://youtu.be/shorts/clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " HTTPS://youtu.be/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " HTTPS://youtu.be:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://youtu.be:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://youtu.be:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " HTTPS://youtu.be:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://youtu.be:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://youtu.be:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " HTTPS://www.youtu.be/watch?v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " HTTPS://www.youtu.be/watch?x=1&v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " HTTPS://www.youtu.be/embed/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " HTTPS://www.youtu.be/channel/name",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " HTTPS://www.youtu.be/shorts/clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " HTTPS://www.youtu.be/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " HTTPS://www.youtu.be:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://www.youtu.be:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://www.youtu.be:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " HTTPS://www.youtu.be:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://www.youtu.be:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://www.youtu.be:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " HTTPS://notyoutube.com/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://notyoutube.com/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://notyoutube.com/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " HTTPS://notyoutube.com/channel/name",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://notyoutube.com/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://notyoutube.com/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " HTTPS://notyoutube.com:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://notyoutube.com:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://notyoutube.com:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " HTTPS://notyoutube.com:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://notyoutube.com:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://notyoutube.com:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " HTTPS://example.invalid/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://example.invalid/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://example.invalid/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " HTTPS://example.invalid/channel/name",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://example.invalid/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://example.invalid/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " HTTPS://example.invalid:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://example.invalid:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://example.invalid:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " HTTPS://example.invalid:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://example.invalid:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " HTTPS://example.invalid:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "HTTPS://youtube.com/watch?v=clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://youtube.com/watch?x=1&v=clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://youtube.com/embed/clip.pdf ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://youtube.com/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://youtube.com/shorts/clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://youtube.com/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://youtube.com:443/watch?v=clip ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://youtube.com:443/watch?x=1&v=clip ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://youtube.com:443/embed/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://youtube.com:443/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://youtube.com:443/shorts/clip ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://youtube.com:443/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://youtu.be/watch?v=clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://youtu.be/watch?x=1&v=clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://youtu.be/embed/clip.pdf ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://youtu.be/channel/name ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://youtu.be/shorts/clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://youtu.be/clip.pdf ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://youtu.be:443/watch?v=clip ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://youtu.be:443/watch?x=1&v=clip ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://youtu.be:443/embed/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://youtu.be:443/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://youtu.be:443/shorts/clip ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://youtu.be:443/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://www.youtu.be/watch?v=clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://www.youtu.be/watch?x=1&v=clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://www.youtu.be/embed/clip.pdf ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://www.youtu.be/channel/name ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://www.youtu.be/shorts/clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://www.youtu.be/clip.pdf ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "HTTPS://www.youtu.be:443/watch?v=clip ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://www.youtu.be:443/watch?x=1&v=clip ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://www.youtu.be:443/embed/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://www.youtu.be:443/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://www.youtu.be:443/shorts/clip ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://www.youtu.be:443/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://notyoutube.com/watch?v=clip ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://notyoutube.com/watch?x=1&v=clip ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://notyoutube.com/embed/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://notyoutube.com/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://notyoutube.com/shorts/clip ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://notyoutube.com/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://notyoutube.com:443/watch?v=clip ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://notyoutube.com:443/watch?x=1&v=clip ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://notyoutube.com:443/embed/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://notyoutube.com:443/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://notyoutube.com:443/shorts/clip ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://notyoutube.com:443/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://example.invalid/watch?v=clip ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://example.invalid/watch?x=1&v=clip ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://example.invalid/embed/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://example.invalid/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://example.invalid/shorts/clip ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://example.invalid/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://example.invalid:443/watch?v=clip ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://example.invalid:443/watch?x=1&v=clip ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://example.invalid:443/embed/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://example.invalid:443/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://example.invalid:443/shorts/clip ",
+      "processor": null
+    },
+    {
+      "source": "HTTPS://example.invalid:443/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "youtube.com/watch?v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "youtube.com/watch?x=1&v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "youtube.com/embed/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "youtube.com/channel/name",
+      "processor": null
+    },
+    {
+      "source": "youtube.com/shorts/clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "youtube.com/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "youtube.com:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": "youtube.com:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": "youtube.com:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "youtube.com:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": "youtube.com:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": "youtube.com:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "youtu.be/watch?v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "youtu.be/watch?x=1&v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "youtu.be/embed/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "youtu.be/channel/name",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "youtu.be/shorts/clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "youtu.be/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "youtu.be:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": "youtu.be:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": "youtu.be:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "youtu.be:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": "youtu.be:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": "youtu.be:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "www.youtu.be/watch?v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "www.youtu.be/watch?x=1&v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "www.youtu.be/embed/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "www.youtu.be/channel/name",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "www.youtu.be/shorts/clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "www.youtu.be/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "www.youtu.be:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": "www.youtu.be:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": "www.youtu.be:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "www.youtu.be:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": "www.youtu.be:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": "www.youtu.be:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "notyoutube.com/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": "notyoutube.com/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": "notyoutube.com/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "notyoutube.com/channel/name",
+      "processor": null
+    },
+    {
+      "source": "notyoutube.com/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": "notyoutube.com/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "notyoutube.com:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": "notyoutube.com:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": "notyoutube.com:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "notyoutube.com:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": "notyoutube.com:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": "notyoutube.com:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "example.invalid/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": "example.invalid/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": "example.invalid/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "example.invalid/channel/name",
+      "processor": null
+    },
+    {
+      "source": "example.invalid/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": "example.invalid/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "example.invalid:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": "example.invalid:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": "example.invalid:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "example.invalid:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": "example.invalid:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": "example.invalid:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " youtube.com/watch?v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " youtube.com/watch?x=1&v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " youtube.com/embed/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " youtube.com/channel/name",
+      "processor": null
+    },
+    {
+      "source": " youtube.com/shorts/clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " youtube.com/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " youtube.com:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " youtube.com:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " youtube.com:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " youtube.com:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " youtube.com:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " youtube.com:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " youtu.be/watch?v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " youtu.be/watch?x=1&v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " youtu.be/embed/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " youtu.be/channel/name",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " youtu.be/shorts/clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " youtu.be/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " youtu.be:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " youtu.be:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " youtu.be:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " youtu.be:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " youtu.be:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " youtu.be:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " www.youtu.be/watch?v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " www.youtu.be/watch?x=1&v=clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " www.youtu.be/embed/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " www.youtu.be/channel/name",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " www.youtu.be/shorts/clip",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " www.youtu.be/clip.pdf",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": " www.youtu.be:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " www.youtu.be:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " www.youtu.be:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " www.youtu.be:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " www.youtu.be:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " www.youtu.be:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " notyoutube.com/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " notyoutube.com/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " notyoutube.com/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " notyoutube.com/channel/name",
+      "processor": null
+    },
+    {
+      "source": " notyoutube.com/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " notyoutube.com/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " notyoutube.com:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " notyoutube.com:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " notyoutube.com:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " notyoutube.com:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " notyoutube.com:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " notyoutube.com:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " example.invalid/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " example.invalid/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " example.invalid/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " example.invalid/channel/name",
+      "processor": null
+    },
+    {
+      "source": " example.invalid/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " example.invalid/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " example.invalid:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " example.invalid:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " example.invalid:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " example.invalid:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " example.invalid:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " example.invalid:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "youtube.com/watch?v=clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "youtube.com/watch?x=1&v=clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "youtube.com/embed/clip.pdf ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "youtube.com/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "youtube.com/shorts/clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "youtube.com/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "youtube.com:443/watch?v=clip ",
+      "processor": null
+    },
+    {
+      "source": "youtube.com:443/watch?x=1&v=clip ",
+      "processor": null
+    },
+    {
+      "source": "youtube.com:443/embed/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "youtube.com:443/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "youtube.com:443/shorts/clip ",
+      "processor": null
+    },
+    {
+      "source": "youtube.com:443/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "youtu.be/watch?v=clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "youtu.be/watch?x=1&v=clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "youtu.be/embed/clip.pdf ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "youtu.be/channel/name ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "youtu.be/shorts/clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "youtu.be/clip.pdf ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "youtu.be:443/watch?v=clip ",
+      "processor": null
+    },
+    {
+      "source": "youtu.be:443/watch?x=1&v=clip ",
+      "processor": null
+    },
+    {
+      "source": "youtu.be:443/embed/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "youtu.be:443/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "youtu.be:443/shorts/clip ",
+      "processor": null
+    },
+    {
+      "source": "youtu.be:443/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "www.youtu.be/watch?v=clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "www.youtu.be/watch?x=1&v=clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "www.youtu.be/embed/clip.pdf ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "www.youtu.be/channel/name ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "www.youtu.be/shorts/clip ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "www.youtu.be/clip.pdf ",
+      "processor": "YouTubeProcessor"
+    },
+    {
+      "source": "www.youtu.be:443/watch?v=clip ",
+      "processor": null
+    },
+    {
+      "source": "www.youtu.be:443/watch?x=1&v=clip ",
+      "processor": null
+    },
+    {
+      "source": "www.youtu.be:443/embed/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "www.youtu.be:443/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "www.youtu.be:443/shorts/clip ",
+      "processor": null
+    },
+    {
+      "source": "www.youtu.be:443/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "notyoutube.com/watch?v=clip ",
+      "processor": null
+    },
+    {
+      "source": "notyoutube.com/watch?x=1&v=clip ",
+      "processor": null
+    },
+    {
+      "source": "notyoutube.com/embed/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "notyoutube.com/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "notyoutube.com/shorts/clip ",
+      "processor": null
+    },
+    {
+      "source": "notyoutube.com/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "notyoutube.com:443/watch?v=clip ",
+      "processor": null
+    },
+    {
+      "source": "notyoutube.com:443/watch?x=1&v=clip ",
+      "processor": null
+    },
+    {
+      "source": "notyoutube.com:443/embed/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "notyoutube.com:443/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "notyoutube.com:443/shorts/clip ",
+      "processor": null
+    },
+    {
+      "source": "notyoutube.com:443/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "example.invalid/watch?v=clip ",
+      "processor": null
+    },
+    {
+      "source": "example.invalid/watch?x=1&v=clip ",
+      "processor": null
+    },
+    {
+      "source": "example.invalid/embed/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "example.invalid/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "example.invalid/shorts/clip ",
+      "processor": null
+    },
+    {
+      "source": "example.invalid/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "example.invalid:443/watch?v=clip ",
+      "processor": null
+    },
+    {
+      "source": "example.invalid:443/watch?x=1&v=clip ",
+      "processor": null
+    },
+    {
+      "source": "example.invalid:443/embed/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "example.invalid:443/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "example.invalid:443/shorts/clip ",
+      "processor": null
+    },
+    {
+      "source": "example.invalid:443/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtube.com/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtube.com/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtube.com/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "ftp://youtube.com/channel/name",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtube.com/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtube.com/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "ftp://youtube.com:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtube.com:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtube.com:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "ftp://youtube.com:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtube.com:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtube.com:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "ftp://youtu.be/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtu.be/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtu.be/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "ftp://youtu.be/channel/name",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtu.be/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtu.be/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "ftp://youtu.be:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtu.be:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtu.be:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "ftp://youtu.be:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtu.be:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtu.be:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "ftp://www.youtu.be/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://www.youtu.be/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://www.youtu.be/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "ftp://www.youtu.be/channel/name",
+      "processor": null
+    },
+    {
+      "source": "ftp://www.youtu.be/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://www.youtu.be/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "ftp://www.youtu.be:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://www.youtu.be:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://www.youtu.be:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "ftp://www.youtu.be:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": "ftp://www.youtu.be:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://www.youtu.be:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "ftp://notyoutube.com/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://notyoutube.com/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://notyoutube.com/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "ftp://notyoutube.com/channel/name",
+      "processor": null
+    },
+    {
+      "source": "ftp://notyoutube.com/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://notyoutube.com/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "ftp://notyoutube.com:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://notyoutube.com:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://notyoutube.com:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "ftp://notyoutube.com:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": "ftp://notyoutube.com:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://notyoutube.com:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "ftp://example.invalid/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://example.invalid/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://example.invalid/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "ftp://example.invalid/channel/name",
+      "processor": null
+    },
+    {
+      "source": "ftp://example.invalid/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://example.invalid/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "ftp://example.invalid:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://example.invalid:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://example.invalid:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "ftp://example.invalid:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": "ftp://example.invalid:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": "ftp://example.invalid:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " ftp://youtube.com/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://youtube.com/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://youtube.com/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " ftp://youtube.com/channel/name",
+      "processor": null
+    },
+    {
+      "source": " ftp://youtube.com/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://youtube.com/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " ftp://youtube.com:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://youtube.com:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://youtube.com:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " ftp://youtube.com:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " ftp://youtube.com:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://youtube.com:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " ftp://youtu.be/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://youtu.be/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://youtu.be/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " ftp://youtu.be/channel/name",
+      "processor": null
+    },
+    {
+      "source": " ftp://youtu.be/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://youtu.be/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " ftp://youtu.be:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://youtu.be:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://youtu.be:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " ftp://youtu.be:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " ftp://youtu.be:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://youtu.be:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " ftp://www.youtu.be/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://www.youtu.be/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://www.youtu.be/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " ftp://www.youtu.be/channel/name",
+      "processor": null
+    },
+    {
+      "source": " ftp://www.youtu.be/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://www.youtu.be/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " ftp://www.youtu.be:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://www.youtu.be:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://www.youtu.be:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " ftp://www.youtu.be:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " ftp://www.youtu.be:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://www.youtu.be:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " ftp://notyoutube.com/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://notyoutube.com/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://notyoutube.com/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " ftp://notyoutube.com/channel/name",
+      "processor": null
+    },
+    {
+      "source": " ftp://notyoutube.com/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://notyoutube.com/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " ftp://notyoutube.com:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://notyoutube.com:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://notyoutube.com:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " ftp://notyoutube.com:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " ftp://notyoutube.com:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://notyoutube.com:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " ftp://example.invalid/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://example.invalid/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://example.invalid/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " ftp://example.invalid/channel/name",
+      "processor": null
+    },
+    {
+      "source": " ftp://example.invalid/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://example.invalid/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " ftp://example.invalid:443/watch?v=clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://example.invalid:443/watch?x=1&v=clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://example.invalid:443/embed/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": " ftp://example.invalid:443/channel/name",
+      "processor": null
+    },
+    {
+      "source": " ftp://example.invalid:443/shorts/clip",
+      "processor": null
+    },
+    {
+      "source": " ftp://example.invalid:443/clip.pdf",
+      "processor": "PDFProcessor"
+    },
+    {
+      "source": "ftp://youtube.com/watch?v=clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtube.com/watch?x=1&v=clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtube.com/embed/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtube.com/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtube.com/shorts/clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtube.com/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtube.com:443/watch?v=clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtube.com:443/watch?x=1&v=clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtube.com:443/embed/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtube.com:443/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtube.com:443/shorts/clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtube.com:443/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtu.be/watch?v=clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtu.be/watch?x=1&v=clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtu.be/embed/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtu.be/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtu.be/shorts/clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtu.be/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtu.be:443/watch?v=clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtu.be:443/watch?x=1&v=clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtu.be:443/embed/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtu.be:443/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtu.be:443/shorts/clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://youtu.be:443/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "ftp://www.youtu.be/watch?v=clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://www.youtu.be/watch?x=1&v=clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://www.youtu.be/embed/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "ftp://www.youtu.be/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "ftp://www.youtu.be/shorts/clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://www.youtu.be/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "ftp://www.youtu.be:443/watch?v=clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://www.youtu.be:443/watch?x=1&v=clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://www.youtu.be:443/embed/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "ftp://www.youtu.be:443/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "ftp://www.youtu.be:443/shorts/clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://www.youtu.be:443/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "ftp://notyoutube.com/watch?v=clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://notyoutube.com/watch?x=1&v=clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://notyoutube.com/embed/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "ftp://notyoutube.com/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "ftp://notyoutube.com/shorts/clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://notyoutube.com/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "ftp://notyoutube.com:443/watch?v=clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://notyoutube.com:443/watch?x=1&v=clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://notyoutube.com:443/embed/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "ftp://notyoutube.com:443/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "ftp://notyoutube.com:443/shorts/clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://notyoutube.com:443/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "ftp://example.invalid/watch?v=clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://example.invalid/watch?x=1&v=clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://example.invalid/embed/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "ftp://example.invalid/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "ftp://example.invalid/shorts/clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://example.invalid/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "ftp://example.invalid:443/watch?v=clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://example.invalid:443/watch?x=1&v=clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://example.invalid:443/embed/clip.pdf ",
+      "processor": null
+    },
+    {
+      "source": "ftp://example.invalid:443/channel/name ",
+      "processor": null
+    },
+    {
+      "source": "ftp://example.invalid:443/shorts/clip ",
+      "processor": null
+    },
+    {
+      "source": "ftp://example.invalid:443/clip.pdf ",
+      "processor": null
+    }
+  ]
+}

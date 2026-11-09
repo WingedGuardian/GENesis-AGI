@@ -10,6 +10,7 @@ from mcp import MCPError
 
 from genesis.caller_context import request_caller
 from genesis.mcp.external_profiles import ExternalProfile, current_external_profile
+from genesis.mcp.shared_paths import FORWARDER_ENDPOINT, SharedPathError, request_paths
 from genesis.observability.mcp_middleware import InstrumentationMiddleware
 from genesis.observability.provider_activity import suppress_activity_persistence
 from genesis.observability.session_context import session_scope
@@ -79,6 +80,13 @@ class SharedMessages(Middleware):
             self.busy += 1
             raise MCPError(code=-32000, message=BUSY_MESSAGE) from None
         try:
-            return await call_next(context)
+            active = context.fastmcp_context.request_context if context.fastmcp_context is not None else None
+            with request_paths(self.service, context.message.name, context.message.arguments,
+                               active.meta if active is not None else None,
+                               versioned=get_http_request().url.path == FORWARDER_ENDPOINT,
+                               metadata_available=active is not None):
+                return await call_next(context)
+        except SharedPathError as error:
+            raise ToolError(str(error)) from None
         finally:
             self.limiter.release_on_behalf_of(token)

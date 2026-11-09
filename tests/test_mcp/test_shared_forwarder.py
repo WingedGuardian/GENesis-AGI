@@ -426,7 +426,8 @@ async def test_business_parse_error_is_not_mistaken_for_transport(method):
         async def send_raw_request(self, *args, **kwargs):
             raise MCPError(-32700, "fixture business error", data={"fixture": 7})
 
-    peer = RemotePeer(None, None, None)
+    settings = SimpleNamespace(http=SimpleNamespace(service="health", url="http://127.0.0.1:9123/mcp"))
+    peer = RemotePeer(None, settings, None)
 
     async def generation():
         return SimpleNamespace(dispatcher=Dispatcher(), session_missing=False)

@@ -1,0 +1,1 @@
+- Explicit shared MCP calls interpret input files in the caller's working directory and preserve ingestion source/cache identities. A versioned endpoint refuses incompatible older backends before a tool runs. Shared routing remains disabled by default.

@@ -1424,7 +1424,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: b0867170e 2026-10-02
+verified: d99da0513 2026-11-09
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -1433,6 +1433,12 @@ verified: b0867170e 2026-10-02
   only that method may tombstone). The conversational path
   (`knowledge_ingest_source` MCP) requires explicit user confirmation —
   contrast the intake bypass in entry 4.
+  Scoped caller-file change: optional orchestrator read locations keep original
+  source/directory identities in manifest/cache/tree keys; actual file extraction,
+  original copies and PageIndex uploads use the read location. Omitted options
+  retain ordinary processor origins and traversal behavior. The existing HOME
+  guard applies to the actual tree-upload file. This stamp covers that path
+  contract; other intake mechanisms retain their individual evidence below.
 - **inbox/**: file-drop monitor with approval-gated dispatch.
   `monitor.py` owns scanning, approval, retries and baseline writes;
   `batch_runner.py` executes one approved batch and post-processes its output,
@@ -1620,7 +1626,7 @@ Every surface a human (or host process) talks to Genesis through.
 ```yaml subsystem-map
 entry: channels-interfaces
 modules: [channels, dashboard, mcp, hosting, browser, mail, peers, live_agent]
-verified: e34ba4e4f 2026-11-08
+verified: d99da0513 2026-11-09
 ```
 
 Scoped verification covers `mcp/shared_http` composition. It receives
@@ -1639,9 +1645,13 @@ The explicit `scripts/genesis_mcp_forwarder.py` consumer reads existing P3
 credentials and forwards shared-only RPC through the qualified SDK dispatcher.
 It preserves request IDs, reports uncertain outcomes without resending tools,
 retires failed generations for later requests and handles stdin EOF with
-cancellable pipe output. This remains inert groundwork: caller-path integration,
-the local/bookmark union, per-tool stages, native-client checks and matched
-measurements still gate registration changes. See
+cancellable pipe output. Its versioned `/mcp/v1` endpoint shares the same SDK
+manager and guards as `/mcp`; nine immediate file fields use caller-cwd
+interpretation, and ingestion keeps original cache/manifest identities while
+reading the caller file. Missing shared scope and invalid supplied identity hints
+refuse before ingestion/resume consumers. Ordinary stdio retains its defaults.
+This remains inert groundwork: the local/bookmark union, per-tool stages,
+native-client checks and matched measurements still gate registration changes. See
 `docs/reference/mcp-shared-forwarder.md`.
 This stamp does not
 requalify the other channels/interfaces subsystems.

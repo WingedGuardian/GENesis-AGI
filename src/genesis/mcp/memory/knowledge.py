@@ -6,6 +6,7 @@ import json
 import logging
 from datetime import UTC, datetime
 
+from genesis.mcp.shared_paths import ingestion_input, probe_resume_file
 from genesis.memory import graph_expansion
 from genesis.memory.provenance import label_result_dicts, wrap_external_recall
 from genesis.memory.reference_ops import (
@@ -913,12 +914,14 @@ async def knowledge_ingest_source(
         domain: Knowledge domain (default "auto" — LLM determines).
         purpose: Optional purpose tags (e.g., ["resume-prep"]).
     """
+    source, read_options = ingestion_input("knowledge_ingest_source", "source", source)
     orchestrator = _get_orchestrator()
     result = await orchestrator.ingest_source(
         source,
         project_type=project_type,
         domain=domain,
         purpose=purpose,
+        **read_options,
     )
     response = {
         "source": result.source,
@@ -950,6 +953,7 @@ async def knowledge_ingest_batch(
         purpose: Optional purpose tags applied to all units.
         extensions: Optional filter — only process files with these extensions.
     """
+    directory, read_options = ingestion_input("knowledge_ingest_batch", "directory", directory)
     orchestrator = _get_orchestrator()
     results = await orchestrator.ingest_batch(
         directory,
@@ -957,6 +961,7 @@ async def knowledge_ingest_batch(
         domain=domain,
         purpose=purpose,
         extensions=extensions,
+        **read_options,
     )
     return {
         "total_sources": len(results),
@@ -991,6 +996,7 @@ async def resume_review(
         job_description: Optional job description text or URL for alignment scoring.
         knowledge_domains: Optional list of KB domains to query (default: all).
     """
+    probe_file = probe_resume_file(resume_source)
     from pathlib import Path
 
     from genesis.knowledge.applications.resume_review import ResumeReviewer
@@ -1007,7 +1013,7 @@ async def resume_review(
     # Resolve resume text
     resume_text = resume_source
     source_path = Path(resume_source)
-    if source_path.exists():
+    if probe_file and source_path.exists():
         if source_path.suffix.lower() == ".pdf":
             # Extract via the crash/hang-isolated pool (PyMuPDF is not
             # thread-safe and can crash on adversarial PDFs). Return a
