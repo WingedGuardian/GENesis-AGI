@@ -74,7 +74,8 @@ the same pinned package and containment. It extends the parent image rather than
 installing another native runtime. Its closed census, capture plugin, manifest
 and reader are independent of the inherited111-case qualification; neither
 reader accepts the other's population. The shared deterministic provider gains
-an optional request-index action plan; existing one-action callers keep their
+an optional request-index action plan. Append and index selection share one lock,
+so concurrent requests receive the action for their own recorded index; existing one-action callers keep their
 original behavior and retain the parent qualification workflow.
 Ordinary CI discovers and skips the17 opt-in cases; any skip-ceiling adjustment
 must use the actual CI JUnit measurement rather than a developer-host count.
@@ -117,6 +118,34 @@ expected omission where native returned an empty object. The corrected reader
 requires the observed `accept` plus `{}` response, refusal and zero writes for
 that negative case. This failed run remains diagnostic evidence; a fresh complete
 native run is required to qualify the revised source.
+
+Foreign-ID and stale-after-interruption controls inject the old/foreign acceptance,
+then send a correctly bound decline and require natural completion plus the
+server's refusal before cleanup. The stale control interrupts only its first
+turn; its second turn must remain usable. These are bounded observable routing
+controls, not proof of every possible internal interleaving.
+Every server invocation must finish before fallback cleanup. The duplicate-reply
+control must observe the first physical append and its server record before replay.
+The raw stream must place each ask before its matching completion; an EOF turn
+has at most one optional interrupted completion. Exact completion-consumption
+time relative to the sent reply is not measured by these receipts.
+
+An interruption must start from a matching pending invocation and retain a
+nonempty terminal server sequence after its exact input and before the
+post-interrupt observation. EOF additionally rechecks the root and active writer
+live immediately before closing stdin, observes natural root exit0, and freezes
+retirement of the exact known child population before fallback cleanup. An empty
+EOF server tail is allowed only with that process proof; any retained terminal
+must follow EOF input. Final cleanup observations cannot replace natural EOF
+retirement. Scope is the already-observed owned descendants.
+
+Readback rejects malformed and RPC-error frames across the complete retained
+stream, including shutdown drains. Positive server invocations require the exact request/response/append sequence,
+so an extra early cancellation cannot hide alongside a later successful effect.
+Synthetic golden replies use an independent
+literal scenario map and separate deep copies for frontend and server content;
+removing either comparison must fail its own damage control. Earlier passing
+runs using weaker lifecycle evidence do not qualify this strengthened contract.
 
 The frozen manifest binds source and both binary hashes, head/base, workflow
 run and attempt. Readback requires complete passed phases, raw request/response

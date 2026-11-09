@@ -5273,6 +5273,11 @@ verified: 81bbdb0a9 2026-11-08
   this permits the data-entry Never control without exempting proper approvals.
   Initial native results were15passed/2failed; corrected expectations and client
   declarations require a fresh complete run before qualification.
+  The elicitation reader checks all retained frames and binds interruption
+  terminals to their inputs. Foreign/stale controls finish on a current decline;
+  EOF requires fresh root/writer liveness and frozen known-child retirement
+  before fallback cleanup. Independent golden replies and atomic provider
+  indexing pin these witnesses; final contained verification remains required.
   Interactive native qualification records a Codex0.166.0 reference binary.
   The launcher warns on other recognizable versions and retains its startup
   inspection/refusal checks; those inspect state, not actual tool denial.

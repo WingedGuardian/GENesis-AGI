@@ -20,7 +20,6 @@ INVENTORY = (*SOURCE_PATHS, "python-packages.txt", "os-packages.txt")
 META = {"codex_approval_kind": "mcp_tool_call", "codex_request_type": "approval_request",
         "codex_requires_user_input": True, "tool_name": "record",
         "tool_params": {"target": "approval-sink.jsonl"}}
-INTERRUPTED = {"approval_interrupt", "approval_wrong_rpc_id", "approval_stale_after_interrupt"}
 NO_ASK = {"approval_never", "approval_unattended", "data_form_empty"}
 POSITIVE = {"approval_accept_true", "approval_duplicate_reply", "approval_two_requests"}
 
@@ -54,9 +53,22 @@ def lines(path):
         return [load_json(line) for line in stream]
 
 
+def turn_statuses(case):
+    if case == "approval_stale_after_interrupt":
+        return ("interrupted", "completed")
+    if case == "approval_interrupt":
+        return ("interrupted",)
+    return ("completed",) * (2 if case == "approval_two_requests" else 1)
+
+
+def reply_slots(case):
+    return [] if case in NO_ASK or case == "approval_eof" else [
+        index for index, status in enumerate(turn_statuses(case)) if status == "completed"]
+
+
 def response_for(case):
-    if case in {"approval_decline", "approval_cancel"}:
-        return {"action": case.removeprefix("approval_"), "content": None}
+    if case in {"approval_decline", "approval_cancel", "approval_wrong_rpc_id", "approval_stale_after_interrupt"}:
+        return {"action": "cancel" if case == "approval_cancel" else "decline", "content": None}
     result = {"action": "accept", "content": {"confirmed": True}}
     if case == "approval_false":
         result["content"]["confirmed"] = False
@@ -100,6 +112,31 @@ def check_ownership(evidence, entered):
             "native close required forced kill or failed")
 
 
+def check_natural_eof(evidence, entered):
+    live = evidence["eof_live"]
+    driver = live["driver"]
+    original = evidence["driver_before"]
+    require(all(driver[key] == original[key] for key in ("pid", "start", "pgid", "sid"))
+            and driver["state"] in {"R", "S", "D", "T", "t", "K", "W", "P", "I"},
+            "native root was not live immediately before EOF")
+    writers = live["writers"]
+    require(len(writers) == len(entered) and all(
+        row["pid"] == entry["process"]["pid"] and row["start"] == entry["process"]["start"]
+        and row["state"] in {"R", "S", "D", "T", "t", "K", "W", "P", "I"}
+        for row, entry in zip(writers, entered, strict=True)),
+        "active MCP writer was not live immediately before EOF")
+    natural = evidence["eof_natural"]
+    require(same([{k: v for k, v in row.items() if k != "after"} for row in natural],
+                 [{k: v for k, v in row.items() if k != "after"} for row in evidence["owned"]]),
+            "natural EOF retirement omitted or substituted an owned child")
+    check_ownership({**evidence, "owned": natural}, entered)
+    labels = {row["label"]: row["at"] for row in evidence["observations"]}
+    require(instant(evidence["observed"][-1]["at"]) < instant(live["at"])
+            < instant(labels["before-native-eof"]) < instant(evidence["eof_input_at"])
+            < instant(labels["native-eof-retired"]) < instant(labels["before-close"]),
+            "natural EOF proof was not captured before fallback cleanup")
+
+
 def check_schema(params, case):
     require(params["mode"] == "form", "wrong elicitation mode")
     schema = params["requestedSchema"]
@@ -131,9 +168,37 @@ def _check_case(case, root, evidence):
     check_server(case, root, evidence)
 
 
+def check_native_stream(events):
+    require(events and all(isinstance(row, dict) and "invalid_json" not in row and "error" not in row
+                           for row in events), "malformed or failed retained native stream")
+    require(events[-1] == {"closed": True} and not any("closed" in row for row in events[:-1]),
+            "native stdout did not reach EOF")
+
+
+def check_completions(case, evidence):
+    events, thread, turns = evidence["events"], evidence["thread"], evidence["turns"]
+    terminal = [event["params"] for event in events if event.get("method") == "turn/completed"]
+    if case == "approval_eof":
+        require(same(evidence["eof_exit"], {"code": 0, "before_forced_cleanup": True})
+                and evidence["exit_code"] == 0, "EOF was not observed before fallback cleanup")
+        require(len(terminal) <= 1 and all(row["threadId"] == thread and row["turn"]["id"] in turns
+                    and row["turn"]["status"] == "interrupted" for row in terminal), "unexpected EOF terminal")
+    else:
+        require([(row["threadId"], row["turn"]["id"], row["turn"]["status"]) for row in terminal]
+                == [(thread, turn, status) for turn, status in zip(turns, turn_statuses(case), strict=True)], "missing correlated native completion")
+    for position, event in enumerate(events):
+        if event.get("method") != "turn/completed" or case in NO_ASK:
+            continue
+        ask_positions = [index for index, row in enumerate(events)
+                         if row.get("method") == "mcpServer/elicitation/request"
+                         and row["params"]["turnId"] == event["params"]["turn"]["id"]]
+        require(len(ask_positions) == 1 and ask_positions[0] < position,
+                "native completion preceded its own request")
+
+
 def check_native_run(case, evidence):
     events = evidence["events"]
-    require(events[-1] == {"closed": True}, "native stdout did not reach EOF")
+    check_native_stream(events)
     initialization = [row["message"] for row in evidence["sent"]
                       if row["message"].get("method") == "initialize"]
     starts = [row["message"] for row in evidence["sent"]
@@ -156,22 +221,15 @@ def check_native_run(case, evidence):
     config = evidence["trust"]["effective_config"]
     require(config["approvals_reviewer"] == "user" and config["mcp_servers"]["fixture"]["default_tools_approval_mode"] == "approve",
             "an alternate reviewer or ordinary tool prompt confounded the experiment")
-    require(len(evidence["model_requests"]) == (count if case in INTERRUPTED or case == "approval_eof" else count * 2),
+    require(len(evidence["model_requests"]) == (1 if case == "approval_eof" else sum(1 if status == "interrupted" else 2 for status in turn_statuses(case))),
             "unexpected provider action population")
-    terminal = [event["params"] for event in events if event.get("method") == "turn/completed"]
-    wanted_status = "interrupted" if case in INTERRUPTED else "completed"
-    if case == "approval_eof":
-        require(same(evidence["eof_exit"], {"code": 0, "before_forced_cleanup": True})
-                and evidence["exit_code"] == 0, "EOF was not observed before fallback cleanup")
-        require(all(row["threadId"] == thread and row["turn"]["id"] in turns
-                    and row["turn"]["status"] == "interrupted" for row in terminal), "unexpected EOF terminal")
-    else:
-        require([(row["threadId"], row["turn"]["id"], row["turn"]["status"]) for row in terminal]
-                == [(thread, turn, wanted_status) for turn in turns], "missing correlated native completion")
+    check_completions(case, evidence)
     entered = [row for row in evidence["server"] if row["event"] == "entered"]
     require(len(entered) == count and len({row["nonce"] for row in entered}) == count,
             "missing or reused server invocation")
     check_ownership(evidence, entered)
+    if case == "approval_eof":
+        check_natural_eof(evidence, entered)
 
 
 def check_frontend(case, evidence):
@@ -187,11 +245,11 @@ def check_frontend(case, evidence):
     replies = [row for row in sent if "result" in row["message"]]
     normal = [row for row in replies if row.get("synthetic_frontend") is True and "negative_injection" not in row]
     raw = [row for row in replies if row.get("negative_injection") is True and "synthetic_frontend" not in row]
-    expected_normal = 0 if case in NO_ASK or case in INTERRUPTED or case == "approval_eof" else count
+    expected_normal = len(reply_slots(case))
     require(len(normal) == expected_normal and len(raw) == int(case in {
         "approval_wrong_rpc_id", "approval_duplicate_reply", "approval_stale_after_interrupt"})
         and len(replies) == len(normal) + len(raw), "reply provenance or population drift")
-    for index, reply in enumerate(normal):
+    for index, reply in zip(reply_slots(case), normal, strict=True):
         require(identity(reply["message"]["id"]) == identity(asks[index]["id"])
                 and same(reply["message"]["result"], response_for(case)), "foreign or malformed frontend reply")
         require(instant(observed[index]["at"]) < instant(reply["at"]), "reply preceded observed request")
@@ -252,21 +310,22 @@ def check_observation_order(case, evidence):
     labels = {}
     for row in snapshots:
         labels.setdefault(row["label"], []).append(instant(row["at"]))
-    count = 2 if case in {"approval_two_requests", "approval_stale_after_interrupt"} else 1
     normal = [row for row in sent if row.get("synthetic_frontend") is True]
     raw = [row for row in sent if row.get("negative_injection") is True]
-    interrupted = count if case in INTERRUPTED else 0
+    interrupted_slots = [index for index, status in enumerate(turn_statuses(case)) if status == "interrupted"]
+    interrupted = len(interrupted_slots)
     counts = {"pending-ask": len(observed), "before-response": len(normal),
               "before-negative-injection": len(raw), "after-negative-barrier": len(raw),
               "before-interrupt": interrupted, "after-interrupt": interrupted,
               "before-duplicate": int(case == "approval_duplicate_reply"),
+              "before-native-eof": int(case == "approval_eof"), "native-eof-retired": int(case == "approval_eof"),
               "before-close": 1, "after-close": 1, "after-retirement": 1}
     require({label: len(rows) for label, rows in labels.items()} == {k: v for k, v in counts.items() if v},
             "missing, duplicate or unknown sink observation")
     for index, row in enumerate(observed):
         require(row["at"] < labels["pending-ask"][index] < labels["before-close"][0], "unbound pending snapshot")
-    for index, row in enumerate(normal):
-        require(labels["pending-ask"][index] < labels["before-response"][index]
+    for position, (index, row) in enumerate(zip(reply_slots(case), normal, strict=True)):
+        require(labels["pending-ask"][index] < labels["before-response"][position]
                 < row["at"] < labels["before-close"][0], "unbound response snapshot")
     if raw:
         barrier = next(row for row in sent if row["message"].get("method") == "config/read")
@@ -278,16 +337,38 @@ def check_observation_order(case, evidence):
                 "duplicate baseline was not observed before replay")
     interrupts = [row for row in sent if row["message"].get("method") == "turn/interrupt"]
     require(len(interrupts) == interrupted, "missing native interruption input")
-    for index, row in enumerate(interrupts):
+    for position, (index, row) in enumerate(zip(interrupted_slots, interrupts, strict=True)):
         params = row["message"]["params"]
         require(params["threadId"] == evidence["thread"] and params["turnId"] == evidence["turns"][index]
-                and labels["pending-ask"][index] < labels["before-interrupt"][index] < row["at"]
-                < labels["after-interrupt"][index] < labels["before-close"][0], "uncorrelated interruption input")
+                and labels["pending-ask"][index] < labels["before-interrupt"][position] < row["at"]
+                < labels["after-interrupt"][position] < labels["before-close"][0], "uncorrelated interruption input")
     if case == "approval_stale_after_interrupt":
         require(labels["after-interrupt"][0] < observed[1]["at"]
-                and labels["after-negative-barrier"][0] < labels["before-interrupt"][1], "stale replay was not between interruptions")
+                and labels["after-negative-barrier"][0] < labels["before-response"][0], "stale replay did not precede current decline")
     elif case == "approval_wrong_rpc_id":
-        require(labels["after-negative-barrier"][0] < labels["before-interrupt"][0], "foreign reply did not precede interruption")
+        require(labels["after-negative-barrier"][0] < labels["before-response"][0], "foreign reply did not precede current decline")
+
+
+def check_retired_request(case, evidence, group, index):
+    sent, turns = evidence["sent"], evidence["turns"]
+    tail = [row["event"] for row in group[2:]]
+    require(tail in (([], ["cancelled"], ["request_error"], ["response", "refused"], ["response", "cancelled"])
+                     if case == "approval_eof" else (["cancelled"], ["request_error"], ["response", "refused"], ["response", "cancelled"])),
+            "interrupted request produced an unexplained effect")
+    if tail:
+        if case == "approval_eof":
+            lower = instant(evidence["eof_input_at"])
+            upper = next(row["at"] for row in evidence["observations"] if row["label"] == "native-eof-retired")
+        else:
+            lower = next(row["at"] for row in sent if row["message"].get("method") == "turn/interrupt"
+                         and row["message"]["params"]["turnId"] == turns[index])
+            position = [i for i, status in enumerate(turn_statuses(case)) if status == "interrupted"].index(index)
+            upper = [row["at"] for row in evidence["observations"] if row["label"] == "after-interrupt"][position]
+        require(lower < group[2]["at"] <= group[-1]["at"] < upper,
+                "terminal was not after its tested input and before cleanup")
+    if tail and tail[0] == "response":
+        require(group[2]["response"].get("action") in {"cancel", "decline"},
+                "interrupted request received an acceptance")
 
 
 def check_server(case, root, evidence):
@@ -296,6 +377,7 @@ def check_server(case, root, evidence):
     asks = [event for event in events if event.get("method") == "mcpServer/elicitation/request"]
     normal = [row for row in sent if "result" in row["message"] and row.get("synthetic_frontend") is True]
     entered = [row for row in evidence["server"] if row["event"] == "entered"]
+    before_close = next(row["at"] for row in evidence["observations"] if row["label"] == "before-close")
     for index, entry in enumerate(entered):
         require(entry["case"] == case and re.fullmatch(r"[0-9a-f]{32}", entry["nonce"])
                 and re.fullmatch(r"[0-9a-f]{32}", entry["incarnation"])
@@ -304,6 +386,7 @@ def check_server(case, root, evidence):
         group = [row for row in evidence["server"] if row["nonce"] == entry["nonce"]]
         require(group[0] == entry and all(row["case"] == case and row["incarnation"] == entry["incarnation"] for row in group)
                 and all(instant(a["at"]) < instant(b["at"]) for a, b in zip(group, group[1:], strict=False)), "server invocation drift")
+        require(group[-1]["at"] < before_close, "server invocation only finished during fallback cleanup")
         if case == "approval_unattended":
             require([row["event"] for row in group] == ["entered", "role_refused"], "unattended fixture prompted or acted")
             continue
@@ -325,13 +408,17 @@ def check_server(case, root, evidence):
         wanted = case in POSITIVE or case == "data_form_never"
         require(len(effects) == int(wanted), "server append witness disagrees with physical sink")
         if wanted:
+            require([row["event"] for row in group] == ["entered", request["event"], "response", "appended"],
+                    "positive invocation contained an unexplained terminal")
             response = next(row for row in group if row["event"] == "response")
             expected = response_for(case)
             require(same(response["response"], expected) and normal[index]["at"] < response["at"], "server did not receive its own explicit reply")
+            if case == "approval_duplicate_reply":
+                before_duplicate = next(row["at"] for row in evidence["observations"] if row["label"] == "before-duplicate")
+                require(effects[0]["at"] < before_duplicate, "first effect was not complete before replay")
             sink = effects[0]["sink"]
             require(sink == ("data-sink.jsonl" if case == "data_form_never" else "approval-sink.jsonl"), "data became approval authority")
             effect = next(row for row in lines(root / sink) if row["nonce"] == entry["nonce"])
-            before_close = next(row["at"] for row in evidence["observations"] if row["label"] == "before-close")
             require(response["at"] < effect["at"] < effects[0]["at"] < before_close, "early or late physical append")
         elif case == "data_form_empty":
             require([row["event"] for row in group] == ["entered", "requested", "response", "refused"]
@@ -339,21 +426,16 @@ def check_server(case, root, evidence):
         elif case == "approval_never":
             require([row["event"] for row in group] == ["entered", "requested", "response", "refused"]
                     and group[2]["response"].get("action") == "decline", "proper Never approval was not declined")
-        elif case not in INTERRUPTED and case != "approval_eof":
+        elif case != "approval_eof" and turn_statuses(case)[index] == "completed":
             require([row["event"] for row in group] == ["entered", "requested", "response", "refused"], "negative fixture did not complete its refusal")
             expected = {key: value for key, value in response_for(case).items() if value is not None}
             if case == "approval_missing_content":
                 # Native run 42566237032 normalized omitted accept content to
                 # an empty object. It still must refuse, with no physical write.
                 expected["content"] = {}
-            require(same(group[2]["response"], expected) and normal[index]["at"] < group[2]["at"], "negative response changed in transport")
+            require(same(group[2]["response"], expected) and normal[reply_slots(case).index(index)]["at"] < group[2]["at"], "negative response changed in transport")
         else:
-            tail = [row["event"] for row in group[2:]]
-            require(tail in ([], ["cancelled"], ["request_error"], ["response", "refused"]),
-                    "interrupted request produced an unexplained effect")
-            if tail == ["response", "refused"]:
-                require(group[2]["response"].get("action") in {"cancel", "decline"},
-                        "interrupted request received an acceptance")
+            check_retired_request(case, evidence, group, index)
     require(all(row["nonce"] in {entry["nonce"] for entry in entered} for row in evidence["server"]), "orphan server event")
 
 

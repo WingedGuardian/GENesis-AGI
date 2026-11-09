@@ -152,3 +152,129 @@ def test_resume_measurement_detects_repeated_action(tmp_path, monkeypatch, repla
     expected = nullcontext() if replay_at == "never" else pytest.raises(AssertionError)
     with expected:
         native.test_native_resume(tmp_path, {"app": "unused"}, {})
+
+
+def test_concurrent_provider_actions_bind_to_their_own_append_index(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event, Lock
+    from urllib.request import Request, urlopen
+
+    from tests.test_hooks import native_codex as native
+
+    first_appended, second_contended = Event(), Event()
+
+    class ControlledRequests(list):
+        def append(self, body):
+            super().append(body)
+            if body["probe"] == 1:
+                first_appended.set()
+                assert second_contended.wait(10)
+            elif body["probe"] == 2:
+                second_contended.set()
+
+    class ObservedLock:
+        def __init__(self):
+            self.lock = Lock()
+
+        def __enter__(self):
+            if first_appended.is_set():
+                second_contended.set()
+            self.lock.acquire()
+
+        def __exit__(self, *args):
+            self.lock.release()
+
+    class CapturedServer(native.ThreadingHTTPServer):
+        def __init__(self, address, handler):
+            cells = dict(zip(handler.do_POST.__code__.co_freevars, handler.do_POST.__closure__, strict=True))
+            assert cells["requests"].cell_contents == []
+            cells["requests"].cell_contents = ControlledRequests()
+            super().__init__(address, handler)
+
+    def post(url, probe):
+        request = Request(url + "/responses", data=json.dumps({"probe": probe}).encode(),  # noqa: S310
+                          headers={"Content-Type": "application/json"})
+        with urlopen(request, timeout=10) as response:  # noqa: S310 - owned loopback server only.
+            events = [json.loads(line[6:]) for line in response.read().decode().splitlines() if line.startswith("data: ")]
+        return events[-1]["response"]["output"][0]
+
+    monkeypatch.setattr(native, "ThreadingHTTPServer", CapturedServer)
+    monkeypatch.setattr(native, "Lock", ObservedLock, raising=False)
+    actions = {index: {"type": "function_call", "id": f"action-{index}"} for index in (1, 2, 3)}
+    with native.fixture_provider(actions[1], action_plan=actions) as (url, requests):
+        assert post(url, 0) == actions[1]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(post, url, 1)
+            assert first_appended.wait(10)
+            second = pool.submit(post, url, 2)
+            actual = [first.result(), second.result()]
+        assert requests == [{"probe": index} for index in (0, 1, 2)]
+        assert actual == [actions[2], actions[3]]
+
+
+@pytest.mark.parametrize("damage", [None, "root_dead", "writer_dead", "reused_writer", "detached", "already_terminal"])
+def test_eof_input_capture_rechecks_live_pending_owned_writer(tmp_path, monkeypatch, damage):
+    import copy
+
+    from tests.test_hooks import test_codex_elicitation_native as native
+    from tests.test_hooks.codex_elicitation_driver import ElicitationDriver
+    from tests.test_hooks.test_codex_elicitation_readback import golden, persist
+
+    evidence, sinks = golden(tmp_path, "approval_eof")
+    population = {10: copy.deepcopy(evidence["driver_before"]), 20: copy.deepcopy(evidence["owned"][0]["before"])}
+    ask = evidence["observed"][0]["message"]
+    driver = ElicitationDriver(SimpleNamespace(events=[], process=SimpleNamespace(pid=10)), tmp_path)
+    driver.consents.observe(ask)
+    monkeypatch.setattr(native, "census", lambda: population)
+    if damage == "root_dead":
+        population[10]["state"] = "Z"
+    elif damage == "writer_dead":
+        population[20]["state"] = "Z"
+    elif damage == "reused_writer":
+        population[20]["start"] += 1
+    elif damage == "detached":
+        population[20]["ppid"] = 99
+    elif damage == "already_terminal":
+        evidence["server"].append({**evidence["server"][-1], "event": "cancelled"})
+        persist(tmp_path, evidence, sinks)
+    if damage:
+        with pytest.raises(AssertionError):
+            native.capture_eof_live(driver, tmp_path, evidence, "thread", "turn-0")
+        assert not driver.observations
+    else:
+        native.capture_eof_live(driver, tmp_path, evidence, "thread", "turn-0")
+        assert evidence["eof_live"]["writers"] == [population[20]]
+        assert evidence["eof_live"]["at"] < driver.observations[0]["at"] < evidence["eof_input_at"]
+        assert driver.observations[0]["label"] == "before-native-eof"
+
+
+@pytest.mark.parametrize("state", ["natural", "after_close", "survivor"])
+def test_natural_eof_capture_precedes_cleanup_and_freezes_children(tmp_path, monkeypatch, state):
+    from tests.test_hooks import test_codex_elicitation_native as native
+    from tests.test_hooks.codex_elicitation_driver import ElicitationDriver
+
+    driver = ElicitationDriver(SimpleNamespace(events=[]), tmp_path)
+    evidence = {"owned": [{"before": {"pid": 20, "start": 20}, "ancestry": [20, 10]}]}
+    called = []
+
+    def retirement(value):
+        called.append(True)
+        if state == "survivor":
+            raise RuntimeError("owned child survived")
+        value["owned"][0]["after"] = {"state": "absent"}
+
+    monkeypatch.setattr(native, "observe_retirement", retirement)
+    if state == "after_close":
+        driver.snapshot("before-close")
+        with pytest.raises(AssertionError):
+            native.capture_natural_eof(driver, evidence)
+        assert not called
+    elif state == "survivor":
+        with pytest.raises(RuntimeError, match="survived"):
+            native.capture_natural_eof(driver, evidence)
+        assert "eof_natural" not in evidence and not driver.observations
+    else:
+        native.capture_natural_eof(driver, evidence)
+        evidence["owned"][0]["after"]["state"] = "S"
+        assert evidence["eof_natural"][0]["after"] == {"state": "absent"}
+        assert [row["label"] for row in driver.observations] == ["native-eof-retired"]

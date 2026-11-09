@@ -4,6 +4,7 @@ import copy
 import json
 import os
 import select
+import time
 from pathlib import Path
 
 import pytest
@@ -100,13 +101,50 @@ def start_turn(driver, thread, request_id):
     }, request_id, allow_requests=True)["turn"]["id"]
 
 
-def interrupt(driver, thread, turn, request_id):
+def pending_invocation(driver, root, thread, turn):
+    pending = [row for row in driver.consents.pending.values()
+               if row["params"]["threadId"] == thread and row["params"]["turnId"] == turn]
+    assert len(pending) == 1
+    message = pending[0]["params"]["message"]
+    requested = [row for row in rows(root) if row["event"] == "requested"
+                 and row["wire"]["params"]["message"] == message]
+    assert len(requested) == 1
+    group = [row for row in rows(root) if row["nonce"] == requested[0]["nonce"]]
+    assert [row["event"] for row in group] == ["entered", "requested"]
+    return group[0]
+
+
+def interrupt(driver, root, thread, turn, request_id):
+    entry = pending_invocation(driver, root, thread, turn)
     driver.snapshot("before-interrupt")
     driver.consents.retire(turn)
     driver.request("turn/interrupt", {"threadId": thread, "turnId": turn}, request_id,
                    allow_requests=True)
     complete(driver, turn, "interrupted")
+    wait_for(lambda: any(row["nonce"] == entry["nonce"] and row["event"] in {
+        "cancelled", "request_error", "refused", "appended"} for row in rows(root)))
     driver.snapshot("after-interrupt")
+
+
+def capture_eof_live(driver, root, evidence, thread, turn):
+    entry = pending_invocation(driver, root, thread, turn)
+    capture_ownership(driver, root, evidence)
+    population = census()
+    parent = population[driver.transport.process.pid]
+    writer = population[entry["process"]["pid"]]
+    assert parent["start"] == evidence["driver_before"]["start"] and parent["state"] != "Z"
+    assert writer["start"] == entry["process"]["start"] and writer["state"] != "Z"
+    assert writer["pid"] in descendants(population, parent["pid"])
+    evidence["eof_live"] = {"at": time.monotonic_ns(), "driver": parent, "writers": [writer]}
+    driver.snapshot("before-native-eof")
+    evidence["eof_input_at"] = time.monotonic_ns()
+
+
+def capture_natural_eof(driver, evidence):
+    assert not any(row["label"] == "before-close" for row in driver.observations)
+    observe_retirement(evidence)
+    evidence["eof_natural"] = copy.deepcopy(evidence["owned"])
+    driver.snapshot("native-eof-retired")
 
 
 @pytest.mark.parametrize("case", CASES)
@@ -159,7 +197,7 @@ def test_native_elicitation(tmp_path, pinned, case):
                 else:
                     pending = ask(driver, tmp_path, evidence)
                     if case == "approval_eof":
-                        capture_ownership(driver, tmp_path, evidence)
+                        capture_eof_live(driver, tmp_path, evidence, thread, turn)
                         driver.transport.process.stdin.close()
                         pidfd = os.pidfd_open(driver.transport.process.pid)
                         try:
@@ -170,20 +208,25 @@ def test_native_elicitation(tmp_path, pinned, case):
                             evidence["eof_exit"] = {"code": 0, "before_forced_cleanup": True}
                         finally:
                             os.close(pidfd)
+                        capture_natural_eof(driver, evidence)
                     elif case in {"approval_interrupt", "approval_wrong_rpc_id", "approval_stale_after_interrupt"}:
                         if case == "approval_wrong_rpc_id":
                             driver.raw_reply("foreign-fixture-request", {"action": "accept", "content": {"confirmed": True}})
                             driver.request("config/read", {"includeLayers": False}, 100, allow_requests=True)
                             driver.snapshot("after-negative-barrier")
-                        interrupt(driver, thread, turn, 101)
+                            driver.reply(pending, {"action": "decline", "content": None}, thread=thread, turn=turn)
+                            complete(driver, turn)
+                        else:
+                            interrupt(driver, tmp_path, thread, turn, 101)
                         if case == "approval_stale_after_interrupt":
                             second_turn = start_turn(driver, thread, 102)
                             evidence["turns"].append(second_turn)
-                            ask(driver, tmp_path, evidence)
+                            second_ask = ask(driver, tmp_path, evidence)
                             driver.raw_reply(pending["id"], {"action": "accept", "content": {"confirmed": True}})
                             driver.request("config/read", {"includeLayers": False}, 103, allow_requests=True)
                             driver.snapshot("after-negative-barrier")
-                            interrupt(driver, thread, second_turn, 104)
+                            driver.reply(second_ask, {"action": "decline", "content": None}, thread=thread, turn=second_turn)
+                            complete(driver, second_turn)
                     else:
                         result = {"action": "accept", "content": {"confirmed": True}}
                         if case in {"approval_decline", "approval_cancel"}:
