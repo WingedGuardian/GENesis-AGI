@@ -23,9 +23,11 @@ URL = "https://example.test/run/1"
 class FakeGh:
     """Answers `gh` from a small issue store, and records every write."""
 
-    def __init__(self, issue=None, incomplete=False):
+    def __init__(self, issue=None, incomplete=False, label_exists=True):
         self.issue = issue
         self.incomplete = incomplete
+        self.label_exists = label_exists
+        self.label_creates = []
         self.writes = []
 
     def __call__(self, argv):
@@ -39,6 +41,11 @@ class FakeGh:
                     "comments": self.issue.get("comments", []),
                 }
             )
+        if argv[:2] == ["label", "create"]:
+            self.label_creates.append(argv)
+            if self.label_exists:  # gh refuses to create a label that exists
+                raise subprocess.CalledProcessError(1, ["gh", *argv])
+            return ""
         self.writes.append(argv)
         return ""
 
@@ -75,6 +82,16 @@ def test_the_first_finding_opens_one_issue(tmp_path):
     # An issues event the workflow token causes starts no premise-gate run, so
     # the label has to come with the create (#4182).
     assert gh.writes[0][gh.writes[0].index("--label") + 1] == "premises-missing"
+
+
+@pytest.mark.parametrize("label_exists", [True, False])
+def test_the_label_is_created_first_and_an_existing_one_is_no_failure(tmp_path, label_exists):
+    # A fork or fresh clone may not have the label yet (#4182); where it
+    # exists, gh refuses the create and the issue is still opened.
+    gh = FakeGh(label_exists=label_exists)
+    assert _file(tmp_path, gh) == "opened an issue"
+    assert [a[:3] for a in gh.label_creates] == [["label", "create", "premises-missing"]]
+    assert gh.writes[0][:2] == ["issue", "create"]
 
 
 def test_a_similar_title_is_not_this_issue(tmp_path):
