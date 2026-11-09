@@ -1420,7 +1420,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: a6528dab2 2026-11-09
+verified: f62608045437 2026-11-09
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -1432,7 +1432,13 @@ verified: a6528dab2 2026-11-09
 - **inbox/**: file-drop monitor with approval-gated dispatch.
   `monitor.py` owns scanning, approval, retries and baseline writes;
   `batch_runner.py` executes one approved batch and post-processes its output,
-  reached through the monitor's `_run_one_batch` forwarding method. Before any
+  reached through the monitor's `_run_one_batch` forwarding method. Its manager
+  session scopes only the invoker/retry await, stamping child environment and
+  invocation-failure attribution. The prior task context is restored before
+  handlers, postprocessing and detached work; explicit follow-up transcript IDs
+  retain their namespace. This does not grant supervision or change external
+  provenance, approvals or replay policy. See `docs/reference/inbox-session-attribution.md`.
+  Before any
   DB, approval, response, or baseline mutation, it composes and validates one
   deterministic system prompt from `INBOX_EVALUATE.md`, the complete
   `evaluate` skill, the complete `user_evaluate` skill, and an explicit
