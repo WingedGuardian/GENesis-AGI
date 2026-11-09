@@ -25,6 +25,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from genesis import env
+from genesis.security.credential_names import is_credential_component
 from genesis.session_awareness.zero_drop_git import scrubbed_git_env
 
 from ..memory import mcp
@@ -50,8 +51,35 @@ _PRUNE_DIRS = frozenset({
     "paste-cache", "file-history", "backups", "downloads",
 })
 
+# Directory names whose files are never content-searched (still found by name):
+# tool config and auth state (gh's hosts.yml carries a token; ssh, cloud and
+# registry credentials live in the others).
+_CREDENTIAL_DIRS = frozenset({".config", ".ssh", ".aws", ".docker", ".gnupg", ".kube"})
+
+# Content-search additions to the shared credential-name predicate. The
+# dashboard's vocabulary only gates which paths it serves; here a missed name
+# means its contents are returned, so names ending in these words or carrying
+# these extensions are not content-searched either, unless git tracks the file:
+# tracked files are public and leak-scanned, and on a live install these words
+# otherwise skipped 12 ordinary source files (runtime/init/secrets.py and the
+# like) from code search.
+_LOCATE_CREDENTIAL_STEMS = frozenset({"secret", "secrets", "key", "keys", "apikey"})
+_LOCATE_CREDENTIAL_SUFFIXES = (".secret", ".tfvars", ".s3cfg", ".boto", ".dockercfg")
+_LOCATE_CREDENTIAL_NAMES = frozenset({"kubeconfig", "auth.json", "cookies.txt"})
+
+# Values from the secrets file that mark a file as holding a credential. A
+# value under a secret-named key counts from this length: measured on a live
+# install, the secret-named values of 6+ characters occurred in no tracked or
+# working-doc file, while a 4-character one occurred in 323 (an ordinary
+# substring). A value under any other key counts only when it looks random,
+# from 12 characters.
+_MIN_NAMED_SECRET_LEN = 6
+_MIN_SECRET_VALUE_LEN = 12
+_SECRETS_FILE_MAX_BYTES = 1_048_576
+
 # Per-file glob skips (binary/churn artifacts not worth surfacing).
 _SKIP_FILE_GLOBS = ("*.db", "*.db-wal", "*.db-shm", "*.sqlite", "*.sqlite3", "*.lock")
+
 
 _MAX_CONTENT_BYTES = 1_048_576       # 1 MiB — matches `rg --max-filesize 1M`
 _BINARY_SNIFF_BYTES = 8192
@@ -164,6 +192,242 @@ def _matches_skip_glob(name: str) -> bool:
     return any(fnmatch.fnmatch(name, g) for g in _SKIP_FILE_GLOBS)
 
 
+def _secret_file_ids() -> set[tuple[int, int]]:
+    """(device, inode) of the configured secrets file, whatever it is named.
+
+    ``SECRETS_PATH`` can point anywhere, and a hard link or a backup copy under
+    a neutral name is not caught by a name rule; the inode is.
+    """
+    try:
+        st = env.secrets_path().stat()
+    except OSError:
+        return set()
+    return {(st.st_dev, st.st_ino)}
+
+
+# A value is treated as a secret when its key names one, or when it looks
+# random. secrets.env also holds ordinary settings (URLs, paths, model names, a
+# timezone); measured on a live install, 14 of 35 values of 12+ characters were
+# such settings, and treating them as secrets would hide ordinary files. Key
+# words are anchored to whole name parts, so GIT_AUTHOR_NAME or BYPASS is not
+# a secret name.
+_SECRET_KEY_WORDS = re.compile(
+    r"(?:^|_)(?:KEY|KEYS|TOKEN|TOKENS|SECRET|SECRETS|PASS|PASSWORD|PASSWD|PASSPHRASE|"
+    r"CREDENTIAL|CREDENTIALS|AUTH|COOKIE|PRIVATE|SIGNING|WEBHOOK|APIKEY)(?:$|_)",
+    re.IGNORECASE,
+)
+_NOT_RANDOM = re.compile(r"^[a-z][a-z0-9+.-]*://|^[/~.]|^[^@\s]+@[^@\s]+$", re.IGNORECASE)
+# The password in a URL's userinfo (scheme://user:password@host).
+_URL_PASSWORD = re.compile(r"^[a-z][a-z0-9+.-]*://[^/@:\s]*:([^@/\s]+)@", re.IGNORECASE)
+# A generated token carries a long unbroken alphanumeric run mixing letters and
+# digits; a model name or slug (``large-v3-turbo``) has only short segments.
+_RANDOM_RUN = re.compile(r"[A-Za-z0-9]{16,}")
+
+
+def _looks_random(value: str) -> bool:
+    if any(ch.isspace() for ch in value) or _NOT_RANDOM.search(value):
+        return False
+    return any(
+        any(ch.isdigit() for ch in run) and any(ch.isalpha() for ch in run)
+        for run in _RANDOM_RUN.findall(value)
+    )
+
+
+def _value_parts(raw: str) -> list[str]:
+    """A value and, when it spans lines (a PEM key, real or literal newlines), each line.
+
+    A copy may hold only part of a multiline value, so each line is matched on
+    its own; armor lines (``-----BEGIN ...-----``) are markers, not key material.
+    """
+    value = raw.strip().strip("'\"")
+    lines = value.replace("\\n", "\n").splitlines()
+    parts = [value] if len(lines) <= 1 else [line.strip() for line in lines]
+    return [part for part in parts if part and not part.startswith("-----")]
+
+
+_secret_cache: dict[tuple, frozenset[str]] = {}
+_warned_secrets: set[str] = set()
+
+
+def _warn_secrets_once(why: str) -> None:
+    if why not in _warned_secrets:
+        _warned_secrets.add(why)
+        logger.warning("locate: %s; copies of credentials are not detected by value", why)
+
+
+def _secret_values() -> frozenset[str]:
+    """The secret values in the configured secrets file (never returned).
+
+    The file is read the way the runtime loads it (python-dotenv, which strips
+    inline comments, ``export`` and quotes) and the way the Telegram bridge
+    reads it, and both readings are kept. Cached by the file's identity, size
+    and mtime. A missing or unreadable file yields no values (logged once): the
+    name, directory and inode rules still apply.
+    """
+    from dotenv import dotenv_values
+
+    from genesis.channels.bridge_config import parse_secrets_env_text
+
+    path = env.secrets_path()
+    try:
+        st = path.stat()
+    except OSError:
+        _warn_secrets_once(f"no secrets file at {path}")
+        return frozenset()
+    if st.st_size > _SECRETS_FILE_MAX_BYTES:
+        _warn_secrets_once(f"secrets file over {_SECRETS_FILE_MAX_BYTES} bytes")
+        return frozenset()
+    cache_key = (str(path), st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+    if cache_key in _secret_cache:
+        return _secret_cache[cache_key]
+    try:
+        text = path.read_text(errors="replace")
+        runtime = dotenv_values(path)
+    except (OSError, ValueError):
+        _warn_secrets_once(f"secrets file at {path} is unreadable")
+        return frozenset()
+    pairs = [(k, v or "") for k, v in runtime.items()]
+    pairs += list(parse_secrets_env_text(text).items())
+    values = set()
+    for key, raw in pairs:
+        named = bool(_SECRET_KEY_WORDS.search(key))
+        for part in _value_parts(raw):
+            if (named and len(part) >= _MIN_NAMED_SECRET_LEN) or (
+                len(part) >= _MIN_SECRET_VALUE_LEN and _looks_random(part)
+            ):
+                values.add(part)
+            password = _URL_PASSWORD.match(part)
+            if password and len(password.group(1)) >= _MIN_NAMED_SECRET_LEN:
+                values.add(password.group(1))
+    result = frozenset(values)
+    _secret_cache.clear()
+    _secret_cache[cache_key] = result
+    return result
+
+
+def _files_holding_secrets(records: list[dict], values: frozenset[str]) -> set[str]:
+    """Paths of the files whose content carries any secret value.
+
+    Such a file is never content-searched at all, not even partly: hiding only
+    the matching lines would tell a caller whether a pattern matched a line
+    with a secret on it, which recovers the secret one character at a time.
+    The patterns go to rg on stdin, never into a file or the argv.
+    """
+    if not records or not values:
+        return set()
+    paths = [str(r["path"]) for r in records]
+    if _have_rg():
+        found: set[str] = set()
+        patterns = "\n".join(sorted(values)) + "\n"
+        for i in range(0, len(paths), _RG_CHUNK):
+            chunk = paths[i:i + _RG_CHUNK]
+            try:
+                proc = subprocess.run(
+                    ["rg", "-F", "-l", "--no-messages", "-f", "-", "--", *chunk],
+                    input=patterns, capture_output=True, text=True, timeout=60,
+                )
+            except (subprocess.TimeoutExpired, OSError):
+                found = set()
+                break
+            if proc.returncode not in (0, 1):
+                found = set()
+                break
+            found.update(line for line in proc.stdout.splitlines() if line)
+        else:
+            return found
+    found = set()
+    for path in paths:
+        try:
+            text = Path(path).read_text(errors="replace")
+        except OSError:
+            continue
+        if any(value in text for value in values):
+            found.add(path)
+    return found
+
+
+def _normalized_name(part: str) -> str:
+    """A path component with editor-backup wrapping removed (``x~``, ``.x.swp``, ``#x#``)."""
+    name = part.lower().rstrip("~").strip("#")
+    for suffix in (".swp", ".swo"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+    return name
+
+
+def _is_locate_credential_part(part: str) -> bool:
+    name = _normalized_name(part)
+    if part in _CREDENTIAL_DIRS or is_credential_component(name):
+        return True
+    if name in _LOCATE_CREDENTIAL_NAMES or name.endswith(_LOCATE_CREDENTIAL_SUFFIXES):
+        return True
+    return any(
+        segment and re.split(r"[_\-]+", segment)[-1] in _LOCATE_CREDENTIAL_STEMS
+        for segment in name.lstrip(".").split(".")[:-1] or [name.lstrip(".")]
+    )
+
+
+def _tracked_files(records: list[dict]) -> set[str]:
+    """Which of these files git tracks (empty for a non-git root or any error).
+
+    Asked only about the files the extra name rules would skip, grouped by
+    root, so a search across every worktree costs no git call at all unless
+    such a file is in it.
+    """
+    by_root: dict[Path, list[str]] = {}
+    for record in records:
+        by_root.setdefault(record["root"], []).append(str(record["path"]))
+    tracked: set[str] = set()
+    for root, paths in by_root.items():
+        for i in range(0, len(paths), _RG_CHUNK):
+            chunk = paths[i:i + _RG_CHUNK]
+            try:
+                result = subprocess.run(
+                    ["git", "ls-files", "-z", "--", *chunk],
+                    capture_output=True, cwd=str(root), timeout=30, env=scrubbed_git_env(),
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                break
+            if result.returncode != 0:
+                break
+            listed = {os.path.normpath(os.path.join(str(root), os.fsdecode(n)))
+                      for n in result.stdout.split(b"\0") if n}
+            tracked.update(p for p in chunk if os.path.normpath(p) in listed)
+    return tracked
+
+
+def _parts(record: dict) -> tuple[str, ...]:
+    try:
+        return record["path"].relative_to(record["root"]).parts
+    except ValueError:
+        return (record["name"],)
+
+
+def _extra_name_match(record: dict) -> bool:
+    return any(_is_locate_credential_part(part) for part in _parts(record))
+
+
+def _holds_credentials(
+    record: dict, secret_ids: set[tuple[int, int]], tracked: set[str] | None = None,
+) -> bool:
+    """Whether a file's content must never be searched, by name, place or inode (#4129).
+
+    A content match returns the matching lines, which in a credential file are
+    the secrets themselves. Such files stay findable by name; stored
+    credentials are read through ``reference_lookup``, which audits each read.
+    Uses the predicate the dashboard's file routes refuse paths by, plus the
+    content-search additions above.
+    """
+    if record["file_id"] in secret_ids:
+        return True
+    parts = _parts(record)
+    if any(part in _CREDENTIAL_DIRS or is_credential_component(part) for part in parts):
+        return True
+    if tracked is not None and str(record["path"]) in tracked:
+        return False
+    return any(_is_locate_credential_part(part) for part in parts)
+
+
 # ── walk ──────────────────────────────────────────────────────────────────────
 
 
@@ -230,6 +494,8 @@ def _walk(
                 "scope": label,
                 "mtime": st.st_mtime,
                 "size": st.st_size,
+                "root": root,
+                "file_id": (st.st_dev, st.st_ino),
             })
     return records
 
@@ -254,10 +520,15 @@ def _is_text_and_small(path: Path) -> bool:
     return b"\x00" not in head
 
 
-def _content_match(records: list[dict], contains: str, regex: bool) -> tuple[list[dict], str | None]:
+def _content_match(
+    records: list[dict], contains: str, regex: bool,
+) -> tuple[list[dict], str | None, int]:
     """Filter records to those whose content matches, attaching ``matches``.
 
-    Returns (records_with_matches, error). ``error`` set only on invalid regex.
+    Returns (records_with_matches, error, credential_files_skipped). ``error``
+    set only on invalid regex. A file that holds credentials, by its name, its
+    place, its inode or a secret value in its content, is never searched; the
+    count does not depend on the pattern, so it reveals nothing about one.
     Binary/oversize files are excluded up front (see ``_is_text_and_small``).
     Tries rg first (fast); falls back to pure Python when rg is absent or
     errors — identical result shape either way.
@@ -266,13 +537,20 @@ def _content_match(records: list[dict], contains: str, regex: bool) -> tuple[lis
         try:
             re.compile(contains)
         except re.error as exc:
-            return [], f"invalid regex: {exc}"
-    eligible = [r for r in records if _is_text_and_small(r["path"])]
+            return [], f"invalid regex: {exc}", 0
+    secret_ids = _secret_file_ids()
+    named = [r for r in records if _extra_name_match(r)]
+    tracked = _tracked_files(named) if named else set()
+    searchable = [r for r in records if not _holds_credentials(r, secret_ids, tracked)]
+    eligible = [r for r in searchable if _is_text_and_small(r["path"])]
+    holding = _files_holding_secrets(eligible, _secret_values())
+    eligible = [r for r in eligible if str(r["path"]) not in holding]
+    skipped = len(records) - len(searchable) + len(holding)
     if _have_rg():
         out = _content_match_rg(eligible, contains, regex)
         if out is not None:
-            return out, None
-    return _content_match_python(eligible, contains, regex), None
+            return out, None, skipped
+    return _content_match_python(eligible, contains, regex), None, skipped
 
 
 def _content_match_rg(records: list[dict], contains: str, regex: bool) -> list[dict] | None:
@@ -358,6 +636,7 @@ def _error_response(query: dict, error: str, *, roots=None, skipped=None, scanne
         "total_matched": 0,
         "truncated": False,
         "content_pool_capped": False,
+        "content_skipped_credential_files": 0,
         "scan_truncated": False,
         "scanned": scanned,
         "roots": roots or [],
@@ -367,10 +646,18 @@ def _error_response(query: dict, error: str, *, roots=None, skipped=None, scanne
     }
 
 
-def _summarize(scope, within, file_type, contains, total, shown, truncated, skipped, capped, scan_truncated) -> str:
+def _summarize(
+    scope, within, file_type, contains, total, shown, truncated, skipped, capped, scan_truncated,
+    credential_skipped=0,
+) -> str:
     extra = []
     if skipped:
         extra.append(f"{len(skipped)} root(s) absent")
+    if credential_skipped:
+        extra.append(
+            f"{credential_skipped} credential file(s) not content-searched "
+            "(find them by name; read stored credentials with reference_lookup)"
+        )
     if capped:
         extra.append(f"content pool capped at {_CONTENT_POOL_CAP}")
     if scan_truncated:
@@ -448,12 +735,13 @@ async def _impl_locate(
     scan_truncated = scan_budget[0] >= _MAX_FILES_SCANNED
 
     capped = False
+    credential_skipped = 0
     if contains:
         if len(records) > _CONTENT_POOL_CAP:
             records.sort(key=lambda r: (-r["mtime"], str(r["path"])))
             records = records[:_CONTENT_POOL_CAP]
             capped = True
-        records, error = _content_match(records, contains, regex)
+        records, error, credential_skipped = _content_match(records, contains, regex)
         if error:
             return _error_response(
                 query, error, roots=walked_roots, skipped=skipped_roots, scanned=scan_budget[0],
@@ -483,13 +771,14 @@ async def _impl_locate(
     return {
         "summary": _summarize(
             scope, within, file_type, contains, total, len(results),
-            truncated, skipped_roots, capped, scan_truncated,
+            truncated, skipped_roots, capped, scan_truncated, credential_skipped,
         ),
         "query": query,
         "count": len(results),
         "total_matched": total,
         "truncated": truncated,
         "content_pool_capped": capped,
+        "content_skipped_credential_files": credential_skipped,
         "scan_truncated": scan_truncated,
         "scanned": scan_budget[0],
         "roots": walked_roots,
@@ -526,15 +815,23 @@ async def locate(
             or "noncode" (.md/.txt/.pdf/… — the working-docs class).
         name: Case-insensitive glob on the filename, e.g. "*roadmap*.md". Empty = all.
         contains: Optional content match (only files passing the other filters are
-            opened). Empty = no content filtering.
+            opened). Empty = no content filtering. Credential files (the
+            secrets file and its backups, .env files, private keys, token and
+            credential files) are never content-searched: they stay findable by
+            name, content_skipped_credential_files counts them, and stored
+            credentials are read with reference_lookup. A file anywhere whose
+            content carries a secret value from the secrets file (a copy, a
+            pasted value) is skipped and counted the same way. Not covered:
+            encoded, re-wrapped or partial copies, and secrets that are not in
+            the secrets file.
         regex: Treat ``contains`` as a regex (default: literal substring).
         limit: Max results (default 50, hard cap 200; 0 or negative = all up to
             the cap). Truncation is reported explicitly via count / total_matched
             / truncated.
 
     Returns a dict with: summary, query (echoed), count, total_matched, truncated,
-    content_pool_capped, scan_truncated (true if the walk hit its file ceiling, so
-    results may be incomplete), scanned, roots, skipped_roots, and results[] (path,
+    content_pool_capped, content_skipped_credential_files, scan_truncated (true if
+    the walk hit its file ceiling, so results may be incomplete), scanned, roots, skipped_roots, and results[] (path,
     name, scope, mtime, age, size, and matches[] when ``contains`` is used), newest first.
     """
     return await _impl_locate(
