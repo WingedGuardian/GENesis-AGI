@@ -12,6 +12,10 @@ remain required before it can replace a registration. The shared catalog
 deliberately excludes local tools. Native-client/provider qualification and
 matched memory measurements remain activation gates.
 
+The ordinary health executable also has the inactive health-read consumer
+described below. This is one increment toward the complete four-service union;
+the explicit CLI above remains shared-only.
+
 The ordinary launcher exposes internal `_prepare_health` and `_prepare_memory`
 helpers for managed consumers. Its existing `_bootstrap_health` and
 `_bootstrap_memory` wrappers immediately run the returned module server with
@@ -22,6 +26,64 @@ memory DB still refuses, while health keeps its degraded mode. This preparation
 seam does not itself implement the local/shared union. In particular, ordinary
 health cleanup still owns process-global browser cleanup; any later composition
 must settle all local browser work before that lifespan exits.
+
+## Ordinary health read frontend
+
+The exact ordinary `python scripts/genesis_mcp_server.py --server health`
+command can host the local health server and forward its five health-floor
+calls. Selection reuses P7's current config, environment, code ceiling and unit
+readiness. The selected adapter command must equal that same ordinary command;
+other adapter programs retain their own behavior. Endpoint and limit parsing
+use that captured configuration. There is no inherited stage marker or new
+`Decision` field. The second readiness query is read-only.
+
+The shipped ceiling is still `off`, and `adapter.argv` remains empty. This
+increment changes neither registrations nor installed units and does not raise
+the ceiling. It admits health at `health-reads` only; memory, final `writes`,
+bookmarks and native label/credential integration remain separate work. All
+labelled/external-profile clients, extra argv and other transports keep their
+ordinary path. Preflight refusal before preparation/input also keeps that path;
+failure after the mixed owner starts ends that owner without replaying a call.
+
+One prepared ordinary health server retains the complete advertised registry.
+Every native request passes through its SDK connection before middleware
+selects a remote tool. The SDK owns protocol-era rules, schemas, ordering,
+pagination and malformed-request behavior. The frozen Catalog ancestry policy
+keeps browser/module/payment tools local. Unknown names, including hidden hash
+aliases outside that advertised catalog, return the ordinary unknown-tool
+error without executing a body. This is not a general dynamic MCP proxy.
+
+The local memory transport carries the original frame in a per-request
+ContextVar, preserving integer/string IDs and user metadata without reading a
+private SDK ID in production. Remote results use the public MCP-result wrapper;
+local calls retain ordinary Context, progress, cwd and instrumentation. Remote
+calls are instrumented by the service. There is one ordinary lifespan, whose
+browser cleanup runs after local SDK work settles; it is never upgraded by
+starting a second local server midway through a call.
+
+Legacy initialization is forwarded before the FastMCP hook delegates, so a
+remote refusal can prevent local state from committing. The SDK's typed
+initialize request selects the legacy HTTP header, even if request metadata
+carries a modern stamp. The bridge changes the transport header; parameter
+values follow the existing SDK framing/trace normalization described below.
+That header choice is retained for successful initialization replay. A modern connection's
+rejected initialize leaves its later valid modern calls usable, as on ordinary
+stdio. The existing shared-only CLI keeps its separate initialization policy
+described later in this reference.
+
+Each new mixed remote generation checks the existing authenticated `/status`
+service, schema version, enabled state and caller-scoped catalog revision
+against the local shared catalog. A mismatch refuses the generation without
+executing locally. This is a preflight, not an atomic upgrade lock; an unrelated
+non-routed schema change can also make the whole-catalog comparison refuse.
+
+The intermediate health process still initializes ordinary health resources.
+It establishes no memory saving or leak repair. Generic concurrent request
+callbacks from two independently allocating peers remain unqualified; current
+local Context uses are progress notifications. Payment peer constraints remain
+unchanged, and disposable protocol fixtures do not establish native payment or
+client acceptance. Final local ownership, remaining stages and matched
+all-process measurements still gate activation.
 
 ## Explicit invocation
 

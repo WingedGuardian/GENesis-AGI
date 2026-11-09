@@ -1650,8 +1650,14 @@ manager and guards as `/mcp`; nine immediate file fields use caller-cwd
 interpretation, and ingestion keeps original cache/manifest identities while
 reading the caller file. Missing shared scope and invalid supplied identity hints
 refuse before ingestion/resume consumers. Ordinary stdio retains its defaults.
-This remains inert groundwork: the local/bookmark union, per-tool stages,
-native-client checks and matched measurements still gate registration changes. See
+The ordinary health executable has a health-read consumer using one local SDK
+connection and middleware to forward the five health-floor calls. It preserves
+the full advertised local catalog and ordinary argv; selection reuses P7's
+current configuration/readiness, with the ceiling still off. Whole-catalog
+revision checks guard new remote generations. Memory/bookmarks, the final local
+health owner and remaining stages are incomplete; native-client checks and
+matched measurements still gate registration changes. This does not reverify the
+whole entry on main; that landing-dependent obligation remains tracked in#4232. See
 `docs/reference/mcp-shared-forwarder.md`.
 This stamp does not
 requalify the other channels/interfaces subsystems.

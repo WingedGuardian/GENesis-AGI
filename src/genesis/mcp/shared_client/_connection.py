@@ -61,12 +61,14 @@ class _Negotiation:
 
 
 class RemotePeer:
-    def __init__(self, group, settings, header_factory):
+    def __init__(self, group, settings, header_factory, *, expected_catalog_revision=None):
         self.group, self.settings, self.header_factory = group, settings, header_factory
         self.url = forwarder_url(settings.http.url)
         self.current, self.front, self.initialization, self.version = None, None, None, None
         self.initialized, self.negotiation = False, None
         self.lock = anyio.Lock()
+        self.expected_catalog_revision = expected_catalog_revision
+        self.initialization_header_version = None
 
     def arm_initialize(self):
         if self.negotiation is not None and not self.negotiation.done.is_set():
@@ -80,7 +82,7 @@ class RemotePeer:
             if not gate.succeeded:
                 raise MCPError(INVALID_REQUEST, "Initialization did not complete")
 
-    def _stamp(self, method, params, version=None):
+    def _stamp(self, method, params, version=None, *, initialize_version=None):
         headers = {"mcp-method": method}
         params = params or {}
         if method == "tools/call" and isinstance(params.get("name"), str):
@@ -88,6 +90,8 @@ class RemotePeer:
         meta = params.get("_meta")
         version = (meta.get("io.modelcontextprotocol/protocolVersion", version or self.version)
                    if isinstance(meta, dict) else version or self.version)
+        if method == "initialize" and initialize_version is not None:
+            version = initialize_version
         if isinstance(version, str):
             headers["mcp-protocol-version"] = version
         return headers
@@ -153,6 +157,17 @@ class RemotePeer:
                 timeout=httpx2.Timeout(MCP_DEFAULT_TIMEOUT, read=None),
                 event_hooks={"response": [observe_response]},
             ) as client:
+                if self.expected_catalog_revision is not None:
+                    response = await client.get(self.settings.http.origin + "/status")
+                    response.raise_for_status()
+                    status = response.json()
+                    if (not isinstance(status, dict)
+                            or status.get("service") != self.settings.http.service
+                            or status.get("enabled") is not True
+                            or type(status.get("transport_schema_version")) is not int
+                            or status["transport_schema_version"] != 1
+                            or status.get("catalog_revision") != self.expected_catalog_revision):
+                        raise ValueError("Shared catalog does not match this frontend")
                 async with streamable_http_client(
                     self.url, http_client=client,
                     terminate_on_close=False, max_sse_event_size=None,
@@ -164,7 +179,8 @@ class RemotePeer:
                             request_id, params = self.initialization
                             reply = await generation.dispatcher.send_raw_request(
                                 "initialize", copy.deepcopy(params),
-                                {"request_id": request_id, "headers": self._stamp("initialize", params),
+                                {"request_id": request_id, "headers": self._stamp(
+                                    "initialize", params, initialize_version=self.initialization_header_version),
                                  "cancel_on_abandon": False},
                             )
                             generation.version = reply.get("protocolVersion")
@@ -196,7 +212,7 @@ class RemotePeer:
                     finally:
                         generation.done.set()
 
-    async def request(self, context, method, params):
+    async def request(self, context, method, params, *, initialize_version=None):
         generation, gate = None, self.negotiation if method == "initialize" else None
         try:
             params = prepare_params(self.settings.http.service, method, params)
@@ -204,7 +220,8 @@ class RemotePeer:
                 await self._wait_initialize()
             generation = await self._get()
             reply = await generation.dispatcher.send_raw_request(method, params, {
-                "request_id": context.request_id, "headers": self._stamp(method, params),
+                "request_id": context.request_id, "headers": self._stamp(
+                    method, params, initialize_version=initialize_version),
                 "cancel_on_abandon": method != "initialize",
             })
             if method == "initialize":
@@ -212,6 +229,7 @@ class RemotePeer:
                 if not isinstance(version, str):
                     raise MCPError(INVALID_REQUEST, "Invalid shared MCP initialization")
                 self.initialization = (context.request_id, copy.deepcopy(params))
+                self.initialization_header_version = initialize_version
                 self.version = generation.version = version
                 if gate is not None:
                     gate.succeeded = True

@@ -2,7 +2,7 @@
 
 import os
 import sys
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 
 import anyio
 from mcp.server.stdio import _claim_fd, _open_stdin_diversion, _open_stdout_diversion, stdio_server
@@ -37,7 +37,20 @@ class _PipeTextOutput:
         pass  # os.write has no userspace buffer.
 
 
-async def serve(settings, header_factory):
+@asynccontextmanager
+async def _peer_owner(owners, settings, header_factory, local_server, stage):
+    if local_server is None and stage is None:
+        yield RemotePeer(owners, settings, header_factory)
+    else:
+        if local_server is None or stage is None:
+            raise ValueError("Local server and stage are required together")
+        from ._local import local_peer
+
+        async with local_peer(owners, settings, header_factory, local_server, stage) as peer:
+            yield peer
+
+
+async def serve(settings, header_factory, *, local_server=None, stage=None):
     ready, output, peer = anyio.Event(), None, None
 
     async def refuse():
@@ -81,14 +94,16 @@ async def serve(settings, header_factory):
             async with stdio_server(stdin=RawInput(), stdout=_PipeTextOutput(output_fd)) as (incoming, outgoing):
                 output = outgoing
                 async with anyio.create_task_group() as owners:
-                    peer = RemotePeer(owners, settings, header_factory)
-                    peer.front = JSONRPCDispatcher(incoming, outgoing)
-                    ready.set()
-                    try:
-                        await peer.front.run(peer.request, peer.notify)
-                    finally:
-                        with anyio.CancelScope(shield=True):
-                            await peer.close()
+                    async with _peer_owner(owners, settings, header_factory, local_server, stage) as peer:
+                        peer.front = JSONRPCDispatcher(incoming, outgoing)
+                        if hasattr(peer, "remote"):
+                            peer.remote.front = peer.front
+                        ready.set()
+                        try:
+                            await peer.front.run(peer.request, peer.notify)
+                        finally:
+                            with anyio.CancelScope(shield=True):
+                                await peer.close()
                     owners.cancel_scope.cancel()
                 stdio_owner.cancel()
     finally:

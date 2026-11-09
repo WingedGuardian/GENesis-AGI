@@ -5,6 +5,7 @@ from tests.shared_mcp_qualification import QUALIFIED_TEST_STACK as QUALIFIED_TES
 # isort: split
 import asyncio
 import json
+import os
 import signal
 import sys
 from contextlib import asynccontextmanager
@@ -33,10 +34,364 @@ async def send(child, message):
     await child.stdin.drain()
 
 
-async def receive(child):
-    raw = await asyncio.wait_for(child.stdout.readline(), 30)
+async def receive(child, *, timeout=30):
+    raw = await asyncio.wait_for(child.stdout.readline(), timeout)
     assert raw, ("frontend exited", child.returncode)
     return json.loads(raw)
+
+
+def _health_frontend_environment(install, directory, injection, *, role, mixed, bad_revision=False):
+    home = directory / "home"
+    state = home / ".genesis"
+    (state / "config").mkdir(parents=True)
+    (state / "cc_context_enabled").touch()
+    (state / "status.json").write_text(json.dumps({"queue_depths": {"fixture": 9}}))
+    (state / "empty.env").write_text("")
+    credentials = state / "mcp_credentials"
+    credentials.mkdir(mode=0o700)
+    token = credentials / "forwarder"
+    token.write_text("f" * 43 + "\n")
+    token.chmod(0o600)
+    config = json.loads((Path(install.env["GENESIS_HOME"]) / "config/mcp_shared.json").read_text())
+    config.update(stage="health-reads", adapter={"argv": [
+        "{python}", "{root}/scripts/genesis_mcp_server.py", "--server", "{server}",
+    ]})
+    (state / "config/mcp_shared.json").write_text(json.dumps(config))
+    report = directory / "receipt.jsonl"
+    return dict(install.env, HOME=str(home), GENESIS_HOME=str(state), SECRETS_PATH=str(state / "empty.env"),
+                PYTHONPATH=os.pathsep.join([str(injection), str(ROOT / "src"), str(ROOT)]),
+                GENESIS_CC_SESSION="1", GENESIS_SESSION_ORIGIN="external_untrusted",
+                LOCAL_HEALTH_TEST_PORT=str(install.port), LOCAL_HEALTH_TEST_REPORT=str(report),
+                LOCAL_HEALTH_TEST_ROLE=role, LOCAL_HEALTH_TEST_MIXED="1" if mixed else "0",
+                LOCAL_HEALTH_TEST_BAD_REVISION="1" if bad_revision else "0")
+
+
+def _health_injection(tmp_path):
+    injection = tmp_path / "injection"
+    injection.mkdir()
+    (injection / "sitecustomize.py").write_text(
+        "import os, traceback\ntry:\n"
+        "    from tests.test_mcp.local_health_fixture import install\n    install()\n"
+        "except BaseException:\n    traceback.print_exc()\n    os._exit(72)\n"
+    )
+    return injection
+
+
+async def _health_backend(install, errors, env):
+    child = await asyncio.create_subprocess_exec(
+        sys.executable, str(Path(__file__).with_name("shared_cli_lifecycle_child.py")),
+        "health", str(install.port), str(install.events), cwd="/", env=env,
+        stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL, stderr=errors,
+    )
+    headers = {"Authorization": "Bearer " + "f" * 43,
+               "X-Genesis-Caller": json.dumps({"dispatched": True, "supervised": False,
+                                              "origin": "external_untrusted"})}
+    try:
+        async with asyncio.timeout(180), httpx.AsyncClient(headers=headers, trust_env=False) as client:
+            while True:
+                assert child.returncode is None
+                try:
+                    if (await client.get(f"http://127.0.0.1:{install.port}/status")).status_code == 200:
+                        return child
+                except httpx.ConnectError:
+                    pass
+                await asyncio.sleep(.02)
+    except BaseException:
+        if child.returncode is None:
+            child.terminate()
+            await child.wait()
+        raise
+
+
+def _health_frame(era, request_id, method, **params):
+    meta = {"fixture.local": {"kept": True}}
+    if era == MODERN:
+        meta.update({"io.modelcontextprotocol/protocolVersion": MODERN,
+                     "io.modelcontextprotocol/clientCapabilities": {}})
+    return {"jsonrpc": "2.0", "id": request_id, "method": method,
+            "params": {**params, "_meta": {**meta, **params.get("_meta", {})}}}
+
+
+async def _finish_health_backend(backend, install):
+    if backend is None:
+        return
+    if backend.returncode is None:
+        backend.send_signal(signal.SIGTERM)
+    # Uvicorn restores/re-raises the signal after graceful shutdown.
+    assert await asyncio.wait_for(backend.wait(), 30) == -signal.SIGTERM
+    events = [json.loads(line) for line in install.events.read_text().splitlines()]
+    assert events.count("resources-closed") == 1 and events[-1] == "resources-closed"
+    assert events.index("lifespan-stopped") < events.index("resources-closed")
+    assert max(i for i, event in enumerate(events) if event == "drain-confirmed") < events.index("resources-closed")
+
+
+def _retain_health_evidence(tmp_path, label):
+    if evidence := os.environ.get("GENESIS_LOCAL_HEALTH_EVIDENCE_DIR"):
+        destination = Path(evidence) / label
+        destination.mkdir(parents=True)
+        names = ["events.jsonl", "backend/receipt.jsonl", "ordinary/receipt.jsonl", "mixed/receipt.jsonl",
+                 "ordinary/catalog.json", "mixed/catalog.json", "ordinary/initialize.json", "mixed/initialize.json"]
+        for name in names:
+            source = tmp_path / name
+            if source.exists():
+                target = destination / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(source.read_bytes())
+
+
+@pytest.mark.parametrize("service", ["health"])
+@pytest.mark.parametrize("era,init_stamp", [(LEGACY, False), (MODERN, False), (LEGACY, True)],
+                         ids=["legacy", "modern", "legacy-modern-meta"])
+async def test_ordinary_health_entry_composes_local_remote_catalog_and_progress(
+    tmp_path, service, era, init_stamp, shared_install,
+):
+    injection = _health_injection(tmp_path)
+    backend_env = _health_frontend_environment(shared_install, tmp_path / "backend", injection, role="backend", mixed=False)
+    # The independent shared source has a distinct seeded status value.
+    (Path(backend_env["GENESIS_HOME"]) / "status.json").write_text(json.dumps({"queue_depths": {"fixture": 7}}))
+    backend = None
+    catalogs = []
+    with (tmp_path / "backend.stderr").open("w") as backend_errors:
+        try:
+            backend = await _health_backend(shared_install, backend_errors, backend_env)
+            for mode in ("ordinary", "mixed"):
+                directory = tmp_path / mode
+                env = _health_frontend_environment(shared_install, directory, injection, role=mode, mixed=mode == "mixed")
+                child = None
+                with (directory / "stderr.log").open("w") as errors:
+                    try:
+                        child = await asyncio.create_subprocess_exec(
+                            sys.executable, str(ROOT / "scripts/genesis_mcp_server.py"), "--server", "health",
+                            cwd="/", env=env, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                            stderr=errors, limit=1024 * 1024,
+                        )
+                        if era == LEGACY:
+                            initialize = {"jsonrpc": "2.0", "id": "init", "method": "initialize", "params": {
+                                "protocolVersion": LEGACY, "capabilities": {}, "clientInfo": {"name": "fixture", "version": "1"},
+                            }}
+                            if init_stamp:
+                                initialize["params"]["_meta"] = _health_frame(MODERN, 0, "ping")["params"]["_meta"]
+                            await send(child, initialize)
+                            initialized = await receive(child, timeout=120)
+                            (directory / "initialize.json").write_text(json.dumps({"request": initialize, "response": initialized}))
+                            assert initialized["id"] == "init" and "result" in initialized
+                            await send(child, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+                        # Modern mode's first request is a tool, with no handshake/discovery.
+                        await send(child, _health_frame(era, 3, "tools/call", name="health_status", arguments={}))
+                        called = await receive(child, timeout=120)
+                        assert type(called["id"]) is int and called["id"] == 3
+                        assert json.loads(called["result"]["content"][0]["text"])["queues"] == {"fixture": 7 if mode == "mixed" else 9}
+                        schemas, cursor = [], None
+                        for page in range(20):  #92tools/page7; saturation is an error below.
+                            params = {} if cursor is None else {"cursor": cursor}
+                            await send(child, _health_frame(era, "list-" + str(page), "tools/list", **params))
+                            listed = await receive(child)
+                            assert listed["id"] == "list-" + str(page)
+                            schemas.extend(listed["result"]["tools"])
+                            cursor = listed["result"].get("nextCursor")
+                            if cursor is None:
+                                break
+                        assert cursor is None, "catalog cursor traversal saturated"
+                        (directory / "catalog.json").write_text(json.dumps(schemas))
+                        catalogs.append(schemas)
+                        if era == MODERN:
+                            await send(child, {"jsonrpc": "2.0", "id": "opposite-era", "method": "initialize", "params": {
+                                "protocolVersion": LEGACY, "capabilities": {}, "clientInfo": {"name": "fixture", "version": "1"},
+                            }})
+                        else:
+                            await send(child, _health_frame(MODERN, "opposite-era", "tools/call", name="health_status", arguments={}))
+                        rejected = await receive(child)
+                        assert rejected["id"] == "opposite-era" and rejected["error"]["code"] == (-32022 if era == MODERN else -32600)
+                        await send(child, _health_frame(era, "local-original", "tools/call", name="browser_fill",
+                                                       arguments={"selector": "#synthetic", "value": "fixture"},
+                                                       _meta={"progressToken": "fixture-progress"}))
+                        messages = [await receive(child), await receive(child)]
+                        progress = next(m for m in messages if m.get("method") == "notifications/progress")
+                        filled = next(m for m in messages if m.get("id") == "local-original")
+                        assert progress["params"]["progressToken"] == "fixture-progress"
+                        assert not filled["result"].get("isError")
+                        child.stdin.close()
+                        assert await asyncio.wait_for(child.wait(), 30) == 0
+                    finally:
+                        if child is not None and child.returncode is None:
+                            child.terminate()
+                            await child.wait()
+                receipts = [json.loads(line) for line in Path(env["LOCAL_HEALTH_TEST_REPORT"]).read_text().splitlines()]
+                source = next(r for r in receipts if r["event"] == "source")
+                assert source["argv"] == [str(ROOT / "scripts/genesis_mcp_server.py"), "--server", "health"]
+                bodies = [r for r in receipts if r["event"] == "body"]
+                assert [r["id"] for r in bodies if r["tool"] == "browser_fill"] == ["local-original"]
+                assert all(r["meta"]["fixture.local"] == {"kept": True} for r in bodies)
+                assert len([r for r in bodies if r["tool"] == "health_status"]) == (0 if mode == "mixed" else 1)
+                wire = [r for r in receipts if r["event"] == "http-request"]
+                if mode == "mixed":
+                    assert len([r for r in receipts if r["event"] == "lifespan-enter"]) == 1
+                    assert [r["active"] for r in receipts if r["event"] == "lifespan-returned"] == [0]
+                    if era == LEGACY:
+                        forwarded = [r for r in wire if (r["body"] or {}).get("method") == "initialize"]
+                        assert len(forwarded) == 1 and forwarded[0]["body"] == initialize
+                        assert forwarded[0]["protocol"] == LEGACY
+                else:
+                    assert not wire
+                assert [r["active"] for r in receipts if r["event"] == "browser-cleanup-returned"] == [0]
+                assert next(i for i, r in enumerate(receipts) if r["event"] == "handler-finished") < next(
+                    i for i, r in enumerate(receipts) if r["event"] == "browser-cleanup-returned")
+            assert catalogs[0] == catalogs[1]
+            frozen = json.loads((Path(__file__).with_name("fixtures") / "mcp_catalogs.json").read_text())["health"]
+            assert {t["name"] for t in catalogs[0]} == {t["name"] for t in frozen}
+            backend_receipts = [json.loads(line) for line in Path(backend_env["LOCAL_HEALTH_TEST_REPORT"]).read_text().splitlines()]
+            assert [r["id"] for r in backend_receipts if r["event"] == "body" and r["tool"] == "health_status"] == [3]
+        finally:
+            await _finish_health_backend(backend, shared_install)
+    _retain_health_evidence(tmp_path, f"{era}-{init_stamp}")
+
+
+@pytest.mark.parametrize("sequence", [
+    "modern-local-unstamped-remote", "modern-remote-unstamped-local", "modern-local-legacy-init",
+    "modern-remote-legacy-init", "legacy-modern-local", "legacy-modern-remote", "valid-modern",
+    "valid-legacy", "failed-init", "stamped-modern-init", "remote-wire-error", "remote-unknown-outcome",
+    "remote-error-result", "unknown-name",
+])
+@pytest.mark.parametrize("id_kind", ["int", "str"])
+async def test_mixed_peer_preserves_one_sdk_protocol_owner(monkeypatch, sequence, id_kind):
+    from tests.test_mcp.local_health_protocol import compare
+
+    oracle, mixed = await compare(monkeypatch, sequence, id_kind)
+    if evidence := os.environ.get("GENESIS_LOCAL_HEALTH_EVIDENCE_DIR"):
+        root = Path(evidence)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / f"protocol-{sequence}-{id_kind}.json").write_text(json.dumps({"oracle": oracle, "mixed": mixed}))
+    assert mixed["responses"] == oracle["responses"], "wire response changed"
+    def project(rows):
+        return [{k: v for k, v in row.items() if k != "owner"} for row in rows]
+    assert project(mixed["effects"]) == project(oracle["effects"])
+    assert all(row["owner"] == ("remote" if row["name"] == "health_status" else "local")
+               for row in mixed["effects"]), "wrong peer owner"
+    for request in mixed["requests"]:
+        assert type(request["id"]) is (int if id_kind == "int" else str)
+    if sequence.startswith("remote-"):
+        assert len(mixed["requests"]) == 1, "remote call was replayed"
+
+
+@pytest.mark.parametrize("id_kind", ["int", "str"])
+async def test_mixed_peer_closes_hidden_hash_lookup_outside_advertised_names(monkeypatch, id_kind):
+    from tests.test_mcp.local_health_protocol import compare
+
+    oracle, mixed = await compare(monkeypatch, "hidden-hash", id_kind)
+    assert not oracle["responses"][0]["result"].get("isError")
+    assert len(oracle["effects"]) == 1
+    assert mixed["responses"][0]["result"]["isError"] is True
+    assert not mixed["effects"] and not mixed["requests"]
+
+
+@pytest.mark.parametrize("service", ["health"])
+async def test_ordinary_health_entry_refuses_bad_catalog_then_retries_initialization(tmp_path, service, shared_install):
+    injection = _health_injection(tmp_path)
+    backend_env = _health_frontend_environment(shared_install, tmp_path / "backend", injection, role="backend", mixed=False)
+    state = tmp_path / "revision-state"
+    state.write_text("bad")
+    backend_env["LOCAL_HEALTH_TEST_REVISION_STATE"] = str(state)
+    env = _health_frontend_environment(shared_install, tmp_path / "mixed", injection, role="mixed", mixed=True)
+    backend = child = None
+    with (tmp_path / "backend.stderr").open("w") as backend_errors, (tmp_path / "mixed/stderr.log").open("w") as errors:
+        try:
+            backend = await _health_backend(shared_install, backend_errors, backend_env)
+            child = await asyncio.create_subprocess_exec(
+                sys.executable, str(ROOT / "scripts/genesis_mcp_server.py"), "--server", "health", cwd="/", env=env,
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=errors,
+            )
+            initialize = {"jsonrpc": "2.0", "id": "refused", "method": "initialize", "params": {
+                "protocolVersion": LEGACY, "capabilities": {}, "clientInfo": {"name": "fixture", "version": "1"},
+            }}
+            await send(child, initialize)
+            await send(child, _health_frame(LEGACY, 3, "tools/call", name="browser_fill",
+                                           arguments={"selector": "#synthetic", "value": "fixture"}))
+            denied = [await receive(child, timeout=120), await receive(child)]
+            assert {row["id"] for row in denied} == {"refused", 3}
+            assert next(row for row in denied if row["id"] == "refused")["error"]["code"] == -32600
+            assert next(row for row in denied if row["id"] == 3)["error"]["code"] == -32602
+            before = [json.loads(line) for line in Path(env["LOCAL_HEALTH_TEST_REPORT"]).read_text().splitlines()]
+            assert not [row for row in before if row["event"] == "body"]
+            state.write_text("good")
+            await send(child, {**initialize, "id": "retry"})
+            accepted = await receive(child)
+            assert accepted["id"] == "retry" and accepted["result"]["protocolVersion"] == LEGACY
+            await send(child, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+            await send(child, _health_frame(LEGACY, "after-retry", "tools/call", name="browser_fill",
+                                           arguments={"selector": "#synthetic", "value": "fixture"},
+                                           _meta={"progressToken": "retry-progress"}))
+            messages = [await receive(child), await receive(child)]
+            assert any(row.get("id") == "after-retry" and "result" in row for row in messages)
+            assert any(row.get("method") == "notifications/progress" for row in messages)
+            child.stdin.close()
+            assert await asyncio.wait_for(child.wait(), 30) == 0
+            receipts = [json.loads(line) for line in Path(env["LOCAL_HEALTH_TEST_REPORT"]).read_text().splitlines()]
+            assert [row["id"] for row in receipts if row["event"] == "body"] == ["after-retry"]
+            assert [row["active"] for row in receipts if row["event"] == "browser-cleanup-returned"] == [0]
+        finally:
+            if child is not None and child.returncode is None:
+                child.terminate()
+                await child.wait()
+            await _finish_health_backend(backend, shared_install)
+    _retain_health_evidence(tmp_path, "catalog-refusal-retry")
+
+
+@pytest.mark.parametrize("service", ["health"])
+@pytest.mark.parametrize("ending", ["cancel", "EOF"])
+async def test_ordinary_health_entry_settles_local_work_before_browser_close(tmp_path, service, ending, shared_install):
+    injection = _health_injection(tmp_path)
+    backend_env = _health_frontend_environment(shared_install, tmp_path / "backend", injection, role="backend", mixed=False)
+    (Path(backend_env["GENESIS_HOME"]) / "status.json").write_text(json.dumps({"queue_depths": {"fixture": 7}}))
+    env = _health_frontend_environment(shared_install, tmp_path / "mixed", injection, role="mixed", mixed=True)
+    backend = child = None
+    with (tmp_path / "backend.stderr").open("w") as backend_errors, (tmp_path / "mixed/stderr.log").open("w") as errors:
+        try:
+            backend = await _health_backend(shared_install, backend_errors, backend_env)
+            child = await asyncio.create_subprocess_exec(
+                sys.executable, str(ROOT / "scripts/genesis_mcp_server.py"), "--server", "health", cwd="/", env=env,
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=errors,
+            )
+            await send(child, _health_frame(MODERN, 3, "tools/call", name="health_status", arguments={}))
+            assert (await receive(child, timeout=120))["id"] == 3
+            await send(child, _health_frame(MODERN, "held", "tools/call", name="browser_fill",
+                                           arguments={"selector": "#synthetic", "value": "hold"},
+                                           _meta={"progressToken": "held-progress", "fixture.lane": "local"}))
+            progress = await receive(child)
+            assert progress["method"] == "notifications/progress"
+            assert progress["params"]["progressToken"] == "held-progress"
+            # A remote request must keep its own frame while the local handler is still held.
+            await send(child, _health_frame(MODERN, 4, "tools/call", name="health_status", arguments={},
+                                           _meta={"fixture.lane": "remote"}))
+            overlap = await receive(child)
+            assert type(overlap["id"]) is int and overlap["id"] == 4
+            assert json.loads(overlap["result"]["content"][0]["text"])["queues"] == {"fixture": 7}
+            live = [json.loads(line) for line in Path(env["LOCAL_HEALTH_TEST_REPORT"]).read_text().splitlines()]
+            assert not any(row["event"] == "handler-finished" for row in live)
+            local = next(row for row in live if row["event"] == "body" and row["tool"] == "browser_fill")
+            assert local["id"] == "held" and local["meta"]["fixture.lane"] == "local"
+            remote = [json.loads(line) for line in Path(backend_env["LOCAL_HEALTH_TEST_REPORT"]).read_text().splitlines()]
+            body = next(row for row in remote if row["event"] == "body" and row["id"] == 4)
+            assert body["meta"]["fixture.lane"] == "remote"
+            if ending == "cancel":
+                await send(child, {"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": "held"}})
+                await send(child, _health_frame(MODERN, "after-cancel", "tools/list"))
+                listed = await receive(child)
+                assert listed["id"] == "after-cancel" and listed["result"]["tools"]
+            child.stdin.close()
+            assert await asyncio.wait_for(child.wait(), 30) == 0
+            receipts = [json.loads(line) for line in Path(env["LOCAL_HEALTH_TEST_REPORT"]).read_text().splitlines()]
+            ended = next(i for i, row in enumerate(receipts) if row["event"] == "handler-finished")
+            cleaned = next(i for i, row in enumerate(receipts) if row["event"] == "browser-cleanup-returned")
+            returned = next(i for i, row in enumerate(receipts) if row["event"] == "lifespan-returned")
+            assert ended < cleaned < returned
+            assert receipts[cleaned]["active"] == receipts[returned]["active"] == 0
+            assert len([row for row in receipts if row["event"] == "browser-cleanup-returned"]) == 1
+        finally:
+            if child is not None and child.returncode is None:
+                child.terminate()
+                await child.wait()
+            await _finish_health_backend(backend, shared_install)
+    _retain_health_evidence(tmp_path, "local-" + ending)
 
 
 def seeded(payload, service, observation):

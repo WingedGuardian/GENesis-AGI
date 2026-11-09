@@ -3,6 +3,7 @@
 import importlib.util
 import math
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -20,6 +21,12 @@ class SharedServiceSettings:
     shutdown_grace_s: float
 
 
+@dataclass(frozen=True)
+class LocalSelection:
+    settings: SharedServiceSettings
+    stage: str
+
+
 def _seconds(spec, name, *, allow_zero=False):
     value = spec[name]
     if (isinstance(value, bool) or not isinstance(value, (int, float))
@@ -28,29 +35,35 @@ def _seconds(spec, name, *, allow_zero=False):
     return float(value)
 
 
-def load_shared_settings(root, service, env):
-    """Read current trusted source bytes; never invoke CLI or package loaders.
-
-    Every returned field is a generation snapshot. No caller/credential state is
-    retained and legacy rollout loading/merging semantics are unchanged.
-    """
-    module_name, field = None, "rollout source"
+@contextmanager
+def _rollout_program(root):
+    """Execute this checkout's complete trusted source, never a timestamp pyc."""
+    module_name = None
     try:
-        root = Path(root)
-        path = root / "scripts/lib/mcp_rollout.py"
-        source = path.read_bytes()
-        module_name = "_genesis_shared_rollout_" + uuid4().hex
-        module_spec = importlib.util.spec_from_file_location(module_name, path)
-        module = importlib.util.module_from_spec(module_spec)
-        sys.modules[module_name] = module
-        # Execute this checkout's trusted CLI source, never request/config text.
-        exec(compile(source, str(path), "exec"), module.__dict__)  # noqa: S102
-        config = module.load_config(root, env)
+        try:
+            path = Path(root) / "scripts/lib/mcp_rollout.py"
+            source = path.read_bytes()
+            module_name = "_genesis_shared_rollout_" + uuid4().hex
+            module_spec = importlib.util.spec_from_file_location(module_name, path)
+            module = importlib.util.module_from_spec(module_spec)
+            sys.modules[module_name] = module
+            exec(compile(source, str(path), "exec"), module.__dict__)  # noqa: S102
+        except Exception:
+            raise ValueError("Invalid shared MCP configuration: rollout source") from None
+        yield module
+    finally:
+        if module_name is not None:
+            sys.modules.pop(module_name, None)
+
+
+def _service_settings(config, service, valid_unit):
+    field = "service"
+    try:
         field = "service"
         spec = config["servers"][service]
         field = "unit"
         unit = spec["unit"]
-        if module.valid_unit(unit) is not True:
+        if valid_unit(unit) is not True:
             raise ValueError
         field = "HTTP limits"
         http = SharedHTTPConfig(
@@ -72,6 +85,36 @@ def load_shared_settings(root, service, env):
                                      db_checkout_timeout_s=checkout, shutdown_grace_s=grace)
     except Exception:
         raise ValueError(f"Invalid shared MCP configuration: {field}") from None
-    finally:
-        if module_name is not None:
-            sys.modules.pop(module_name, None)
+
+
+def load_shared_settings(root, service, env):
+    """Freeze the existing service program without retaining caller state."""
+    with _rollout_program(root) as module:
+        try:
+            config = module.load_config(Path(root), env)
+        except Exception:
+            raise ValueError("Invalid shared MCP configuration: rollout source") from None
+        return _service_settings(config, service, module.valid_unit)
+
+
+def load_local_settings(root, service, env, stdio, *, ready=None):
+    """Re-decide an ordinary health spawn; no inherited handoff state or ABI."""
+    if service != "health" or env.get("GENESIS_CALLER_PROFILE"):
+        return None
+    try:
+        with _rollout_program(root) as module:
+            config = module.load_config(Path(root), env)
+            ceiling = module.MAX_STAGE
+            decision = module.decide(
+                stdio, config=config, env=env, ready=module.unit_ready if ready is None else ready,
+                ceiling=ceiling, python=stdio[0], root=Path(root),
+            )
+            if not decision.shared or decision.argv != list(stdio):
+                return None
+            _requested, stage = module.stage_selection(config, env, ceiling)
+            if stage != "health-reads":
+                return None
+            settings = _service_settings(config, service, module.valid_unit)
+            return LocalSelection(settings=settings, stage=stage)
+    except Exception:
+        raise ValueError("Invalid local MCP configuration") from None

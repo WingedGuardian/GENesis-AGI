@@ -203,6 +203,16 @@ def kill_switch_on(env):
     return env.get(KILL_SWITCH, "") not in ("", "0")
 
 
+def stage_selection(config, env, ceiling):
+    """Requested/effective stages from one captured program input."""
+    requested = (
+        _stage(env[STAGE_ENV], STAGE_ENV)
+        if env.get(STAGE_ENV) is not None
+        else _stage(config.get("stage"), CONFIG_NAME)
+    )
+    return requested, min(requested, _stage(ceiling, "ceiling"), key=STAGES.index)
+
+
 def decide(argv, *, config, env, ready, ceiling, python, root):
     """The command for one spawn. <argv> is the stdio command the launcher would run."""
     stdio = list(argv)
@@ -210,12 +220,7 @@ def decide(argv, *, config, env, ready, ceiling, python, root):
         return Decision(stdio, False, "external client: never routed by this switch")
     if kill_switch_on(env):
         return Decision(stdio, False, f"{KILL_SWITCH} is set")
-    requested = (
-        _stage(env[STAGE_ENV], STAGE_ENV)
-        if env.get(STAGE_ENV) is not None
-        else _stage(config.get("stage"), CONFIG_NAME)
-    )
-    stage = min(requested, _stage(ceiling, "ceiling"), key=STAGES.index)
+    requested, stage = stage_selection(config, env, ceiling)
     capped = f" (requested {requested}, capped by the code ceiling)" if stage != requested else ""
     server = _server(stdio)
     if server is None:
