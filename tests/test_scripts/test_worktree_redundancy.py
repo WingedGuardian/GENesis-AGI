@@ -59,7 +59,9 @@ def _meta(a: dict) -> dict:
 
 def _judge(a: dict, root: Path) -> tuple[bool, str]:
     """The real predicate with the real verdict, as `_expire_trash` calls it."""
-    return wl._archive_redundant(wl._load_redundancy_module(), a["archive"], _meta(a), root)
+    return wl._archive_redundant(
+        wl._load_redundancy_module(), a["archive"], _meta(a), root, reflog_dirs=[]
+    )
 
 
 def _members(archive: Path) -> list[tuple[tarfile.TarInfo, bytes | None]]:
@@ -224,7 +226,7 @@ def test_an_unresolvable_head_keeps(ignoring, tmp_path):
     a = _archive(ignoring, tmp_path, "nohead")
     meta = _meta(a) | {"head": "f" * 40, "commit": "f" * 40}
     redundant, why = wl._archive_redundant(
-        wl._load_redundancy_module(), a["archive"], meta, ignoring
+        wl._load_redundancy_module(), a["archive"], meta, ignoring, reflog_dirs=[]
     )
     assert redundant is False and "does not resolve" in why
 
@@ -258,7 +260,9 @@ def test_a_legacy_directory_entry_keeps(ignoring, tmp_path):
     legacy.mkdir(parents=True)
     head = _git(ignoring, "rev-parse", "HEAD").stdout.strip()
     meta = {"head": head, "lane": "merged", "had_uncommitted_changes": False}
-    assert wl._archive_redundant(wl._load_redundancy_module(), legacy, meta, ignoring) == (
+    assert wl._archive_redundant(
+        wl._load_redundancy_module(), legacy, meta, ignoring, reflog_dirs=[]
+    ) == (
         False,
         "format not content-checked",
     )
@@ -404,6 +408,131 @@ def test_gh_json_that_is_not_a_list_keeps(ignoring, tmp_path, monkeypatch):
     a = {"archive": entry, "entry": entry.name[: -len(".tar.gz")]}
     _gh(tmp_path, monkeypatch, json.dumps({"number": 1}))
     assert _judge(a, ignoring)[0] is False
+
+
+def test_a_commit_only_the_worktree_reflog_reaches_keeps(ignoring, tmp_path):
+    """Committed, then reset back to main: the archive is clean and its head is
+    an ancestor, but the anchor's reflog is that commit's only reference, so
+    pruning the registration would let gc collect it."""
+    wt = tmp_path / "reset"
+    _git(ignoring, "worktree", "add", "-q", "--detach", str(wt))
+    (wt / "z.txt").write_text("only in the reflog\n")
+    _git(wt, "add", "z.txt")
+    _git(wt, "commit", "-qm", "reflog only")
+    lost = _git(wt, "rev-parse", "HEAD").stdout.strip()
+    _git(wt, "reset", "-q", "--hard", "main")
+    rec = next(x for x in wl._list_worktrees(ignoring) if x["path"] == str(wt))
+    assert wl._trash_worktree(rec, ignoring, lane="merged") is True
+    name = next(wl.TRASH_DIR.glob("reset-*.tar.gz")).name[: -len(".tar.gz")]
+    _backdate(name, 40)
+    clean = _archive(ignoring, tmp_path, "noreflog")  # control: same shape, no orphan
+    _backdate(clean["entry"], 40)
+    counts = wl._expire_trash(ignoring, days=30, dry_run=True)
+    assert counts["would_expire"] == 1 and counts["kept"] == 1
+    assert _registered(ignoring)[str(wt)], "the anchor holding the commit stays"
+    assert lost
+
+
+def _admin_of(root: Path, wt: Path) -> Path:
+    return next(
+        d
+        for d in (root / ".git" / "worktrees").iterdir()
+        if (d / "gitdir").read_text().strip() == str(wt / ".git")
+    )
+
+
+def test_an_unreadable_reflog_directory_keeps(ignoring, tmp_path):
+    """`os.walk` skips a directory it cannot list unless told to raise; a skipped
+    reflog would read as "no orphan"."""
+    a = _archive(ignoring, tmp_path, "lockedlog")
+    admin = _admin_of(ignoring, a["path"])
+    hidden = admin / "logs" / "refs" / "x"
+    hidden.mkdir(parents=True)
+    hidden.chmod(0)
+    try:
+        redundant, why = wl._archive_redundant(
+            wl._load_redundancy_module(), a["archive"], _meta(a), ignoring, reflog_dirs=[admin]
+        )
+    finally:
+        hidden.chmod(0o700)
+    assert redundant is False and "reflog unreadable" in why
+
+
+def test_a_reflog_commit_git_cannot_read_keeps(ignoring, tmp_path):
+    a = _archive(ignoring, tmp_path, "badref")
+    admin = _admin_of(ignoring, a["path"])
+    with (admin / "logs" / "HEAD").open("a") as log:  # an entry naming no object
+        log.write(f"{a['head']} {'e' * 40} T <t@example.invalid> 0 +0000\tcorrupt\n")
+    redundant, why = wl._archive_redundant(
+        wl._load_redundancy_module(), a["archive"], _meta(a), ignoring, reflog_dirs=[admin]
+    )
+    assert redundant is False and "could not be checked" in why
+
+
+def test_gh_never_sees_GH_REPO(ignoring, tmp_path, monkeypatch):
+    seen = tmp_path / "gh-env"
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(f'#!/bin/sh\necho "GH_REPO=${{GH_REPO:-unset}}" >> "{seen}"\necho "[]"\n')
+    gh.chmod(gh.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("GH_REPO", "someone/elsewhere")
+    wt = tmp_path / "ghrepo"
+    _git(ignoring, "worktree", "add", "-q", "-b", "ghrepo", str(wt))
+    (wt / "g.txt").write_text("not in main, so gh is asked\n")
+    _git(wt, "add", "g.txt")
+    _git(wt, "commit", "-qm", "unique")
+    wl._merge_verdict("ghrepo", ignoring, is_branch=True)
+    assert seen.read_text().strip() == "GH_REPO=unset"
+
+
+def test_an_exec_bit_the_head_does_not_have_keeps(ignoring, tmp_path):
+    a = _archive(ignoring, tmp_path, "modebit")
+    items = []
+    for m, d in _members(a["archive"]):
+        if m.name.endswith("/seed.txt"):
+            m.mode = 0o755
+        items.append((m, d))
+    _write(a["archive"], items)
+    redundant, why = _judge(a, ignoring)
+    assert redundant is False and "seed.txt" in why
+
+
+def test_git_location_variables_in_the_environment_are_ignored(ignoring, tmp_path, monkeypatch):
+    """A caller's GIT_DIR must not point the checks at another repository."""
+    a = _archive(ignoring, tmp_path, "envvar")
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "nowhere"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "nowhere"))
+    assert wl._merge_verdict(a["head"], ignoring, is_branch=False) == "ancestor"
+    assert _judge(a, ignoring)[0] is True
+
+
+def test_no_network_never_asks_gh(ignoring, tmp_path, monkeypatch):
+    """`--expire-trash --no-network`: a squash-merged branch archive is judged
+    offline, so it is kept, and gh is never run."""
+    wt = tmp_path / "offline"
+    _git(ignoring, "worktree", "add", "-q", "-b", "offline", str(wt))
+    (wt / "o.txt").write_text("feature\n")
+    _git(wt, "add", "o.txt")
+    _git(wt, "commit", "-qm", "feature")
+    _git(ignoring, "merge", "--squash", "-q", "offline")
+    _git(ignoring, "commit", "-qm", "squash offline")
+    rec = next(x for x in wl._list_worktrees(ignoring) if x["path"] == str(wt))
+    assert wl._trash_worktree(rec, ignoring, lane="merged") is True
+    name = next(wl.TRASH_DIR.glob("offline-*.tar.gz")).name[: -len(".tar.gz")]
+    _backdate(name, 40)
+    calls = tmp_path / "gh-calls"
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    gh = bindir / "gh"
+    gh.write_text(f'#!/bin/sh\necho called >> "{calls}"\necho "[]"\n')
+    gh.chmod(gh.stat().st_mode | stat.S_IXUSR)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    counts = wl._expire_trash(ignoring, days=30, dry_run=True, allow_network=False)
+    assert counts["would_expire"] == 0 and not calls.exists()
+    wl._expire_trash(ignoring, days=30, dry_run=True)  # control: online, gh IS asked
+    assert calls.exists()
 
 
 @pytest.mark.parametrize("value", ["abc", 3, {"x": 1}])

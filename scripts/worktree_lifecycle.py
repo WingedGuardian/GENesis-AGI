@@ -922,7 +922,7 @@ def _merge_verdict(
     try:
         result = subprocess.run(
             ["git", "merge-base", "--is-ancestor", commit, "main"],
-            capture_output=True, cwd=str(repo_root), timeout=10,
+            capture_output=True, cwd=str(repo_root), timeout=10, env=_git_env(),
         )
         if result.returncode == 0:
             return "ancestor"
@@ -950,7 +950,9 @@ def _merge_verdict(
             ["gh", "pr", "list", "--head", ref, "--base", _default_branch(repo_root),
              "--state", "merged", "--limit", "10", "--json", "number,headRefOid"],
             capture_output=True, text=True, errors="surrogateescape",
+            # GH_REPO would point gh at another repository than the cwd's.
             cwd=str(repo_root), timeout=30,
+            env={k: v for k, v in _git_env().items() if k != "GH_REPO"},
         )
         if result.returncode == 0:
             prs = json.loads(result.stdout)
@@ -969,7 +971,7 @@ def _merge_verdict(
         result = subprocess.run(
             ["git", "cherry", "main", commit],
             capture_output=True, text=True, errors="surrogateescape",
-            cwd=str(repo_root), timeout=10,
+            cwd=str(repo_root), timeout=10, env=_git_env(),
         )
         if result.returncode == 0:
             # Lines starting with '+' are unique commits not in main
@@ -4403,7 +4405,8 @@ def _remove_anchors(repo_root: Path, entry: str, anchors: list[dict]) -> int:
 
 
 def _expire_trash(
-    repo_root: Path, *, days: int, now: float | None = None, dry_run: bool = False
+    repo_root: Path, *, days: int, now: float | None = None, dry_run: bool = False,
+    allow_network: bool = True,
 ) -> dict:
     """Expire clean MERGED archives older than ``days``: DELETE THE ARCHIVE, then
     its commit pin, then UNLOCK its anchor, then PRUNE that registration. Unmerged
@@ -4477,7 +4480,10 @@ def _expire_trash(
                 _log(f"SKIP {name}: its registration's directory exists ({live[0]})")
                 counts["skipped"] += 1
                 continue
-            redundant, why = _archive_redundant(redundancy, stored, meta, repo_root)
+            redundant, why = _archive_redundant(
+                redundancy, stored, meta, repo_root, allow_network=allow_network,
+                reflog_dirs=[a["admin"] for a in mine],
+            )
             if not redundant:
                 _log(f"KEEP {name}: {why}")
                 counts["kept"] += 1
@@ -4578,17 +4584,27 @@ def _load_redundancy_module():
     return module
 
 
-def _archive_redundant(module, stored: Path, meta: dict, repo_root: Path) -> tuple[bool, str]:
-    """The predicate's verdict for one archive. Fails CLOSED on any error."""
+def _archive_redundant(
+    module, stored: Path, meta: dict, repo_root: Path, *, reflog_dirs: list[Path],
+    allow_network: bool = True,
+) -> tuple[bool, str]:
+    """The predicate's verdict for one archive. Fails CLOSED on any error.
+
+    ``reflog_dirs`` (required) are the admin dirs of the registrations expiry
+    would prune.
+    """
     if module is None:
         return False, "redundancy check unavailable"
     branch = meta.get("branch") if isinstance(meta.get("branch"), str) else ""
 
     def verdict(head: str) -> str:  # the head the predicate validated
-        return _merge_verdict(branch or head, repo_root, is_branch=bool(branch), tip=head)
+        return _merge_verdict(branch or head, repo_root, is_branch=bool(branch), tip=head,
+                              allow_network=allow_network)
 
     try:
-        redundant, why = module.archive_redundancy(stored, meta, repo_root, verdict=verdict)
+        redundant, why = module.archive_redundancy(
+            stored, meta, repo_root, verdict=verdict, reflog_dirs=reflog_dirs,
+        )
     except Exception as e:  # noqa: BLE001
         return False, f"redundancy check failed ({type(e).__name__})"
     return redundant is True, str(why)
@@ -4756,7 +4772,8 @@ def main() -> int:
             return 0
         _log(f"Trash expiry starting ({source}). An archive expires only when its head "
              "is in main and its files match that head (#2504); nothing schedules this run")
-        _expire_trash(repo_root, days=days, dry_run=args.dry_run)
+        _expire_trash(repo_root, days=days, dry_run=args.dry_run,
+                      allow_network=not args.no_network)
         return 0
 
     if args.release_stale_claims:

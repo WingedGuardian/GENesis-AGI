@@ -15,11 +15,12 @@ head. Nothing is extracted to disk.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import subprocess
 import tarfile
 import zlib
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 ARCHIVE_SUFFIX = ".tar.gz"
@@ -49,6 +50,20 @@ _CHUNK = 1 << 20
 _FILE_MODES = ("100644", "100755")
 _LINK_MODE = "120000"
 _READ_ERRORS = (OSError, EOFError, zlib.error, tarfile.TarError, UnicodeError)
+# Variables that make git (or gh) act on a repository other than ``repo_root``.
+# Wider than worktree_lifecycle.py's `_GIT_LOCATION_VARS`, which `_merge_verdict`
+# uses: there, a variable left in place can only make git fail (a keep), never
+# prove an ancestry that is not there.
+GIT_LOCATION_VARS = (
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GH_REPO",
+)
 
 
 def archive_redundancy(
@@ -57,11 +72,17 @@ def archive_redundancy(
     repo_root: Path,
     *,
     verdict: Callable[[str], str],
+    reflog_dirs: Sequence[Path],
 ) -> tuple[bool, str]:
     """``(True, reason)`` only when deleting ``stored`` loses nothing.
 
     ``verdict(head)`` returns `_merge_verdict`'s method for the archived head; it is
-    called only once the head resolves.
+    called only once the head resolves. ``reflog_dirs`` (required, so no caller
+    skips the check by omission) are the admin dirs of the registrations expiry
+    would prune: a commit only their reflogs reach would be
+    collectable afterwards, so any commit there that no branch, remote-tracking
+    ref or tag reaches keeps the archive. Archive pins (``refs/archived/*``) are
+    not counted: expiry deletes the entry's own pin.
     """
     if not (stored.name.endswith(ARCHIVE_SUFFIX) and stored.is_file()):
         return False, "format not content-checked"
@@ -76,6 +97,25 @@ def archive_redundancy(
         return False, f"merge verdict failed ({type(e).__name__})"
     if method not in ACCEPTED_VERDICTS:
         return False, f"head not proven in main (verdict: {method or 'none'})"
+    try:
+        logged = _reflog_commits(reflog_dirs)
+    except OSError as e:
+        return False, f"worktree reflog unreadable ({type(e).__name__})"
+    if logged:
+        # Asked per archive (about 0.1 s), so a ref deleted while a long run is
+        # under way is still seen. `--not` on the command line does not apply
+        # to the `--stdin` revisions, which stay positive.
+        out = _git(
+            repo_root,
+            ["rev-list", "--stdin", "--not", "--branches", "--remotes", "--tags"],
+            stdin="\n".join(sorted(logged)).encode() + b"\n",
+        )
+        if out is None:
+            return False, "reflog commits could not be checked against refs"
+        orphans = out.decode("ascii", "replace").split()
+        if orphans:
+            shown = ", ".join(c[:12] for c in orphans[:3])
+            return False, f"worktree reflog holds unreachable commit(s): {shown}"
     tree = _head_tree(repo_root, head)
     if tree is None:
         return False, "head tree could not be read"
@@ -97,9 +137,55 @@ class _Unsafe(Exception):
     """A member this check refuses to judge: the archive is kept."""
 
 
-def _git(repo_root: Path, args: list[str]) -> bytes | None:
+def git_env() -> dict[str, str]:
+    """The environment with every repository-location override removed."""
+    env = dict(os.environ)
+    for var in GIT_LOCATION_VARS:
+        env.pop(var, None)
+    return env
+
+
+def _raise(err: OSError) -> None:
+    raise err
+
+
+def _reflog_commits(dirs: Sequence[Path]) -> set[str]:
+    """Every commit id in the reflogs (``logs/**``) of the admin dirs ``dirs``.
+
+    Reflogs only: they are gc roots, so pruning the registration is what would
+    expose their commits. Pseudorefs (ORIG_HEAD, REBASE_HEAD, ...) are not gc
+    roots (MEASURED with git 2.43: a commit only they name is collected by
+    `gc --prune=now` whether or not the registration exists), so they protect
+    nothing and are not read. An unreadable directory raises (``os.walk`` would
+    otherwise skip it), so the caller keeps the archive.
+    """
+    found: set[str] = set()
+    for admin in dirs:
+        files: list[Path] = []
+        logs = admin / "logs"
+        if logs.is_dir():
+            for root, _dirs, names in os.walk(logs, onerror=_raise):
+                files.extend(Path(root) / n for n in names)
+        for f in files:
+            for line in f.read_text(encoding="ascii", errors="replace").splitlines():
+                for word in line.split("\t", 1)[0].split()[:2]:
+                    if _SHA.match(word) and word != "0" * 40:
+                        found.add(word)
+    return found
+
+
+def _git(
+    repo_root: Path, args: list[str], *, timeout: int = 60, stdin: bytes | None = None
+) -> bytes | None:
     try:
-        r = subprocess.run(["git", *args], cwd=str(repo_root), capture_output=True, timeout=60)
+        r = subprocess.run(
+            ["git", *args],
+            cwd=str(repo_root),
+            capture_output=True,
+            timeout=timeout,
+            env=git_env(),
+            input=stdin,
+        )
     except (OSError, subprocess.TimeoutExpired):
         return None
     return r.stdout if r.returncode == 0 else None
@@ -189,7 +275,15 @@ def _unmatched_members(
             if want is None and _allowlisted(rel, member):
                 continue
             if member.isreg():
-                ok = want is not None and want[0] in _FILE_MODES and want[1] == _blob_id(tf, member)
+                # Git records the owner's execute bit, and a mode-only change is
+                # a change too (core.fileMode=false hides it from the dirty check).
+                executable = bool(member.mode & 0o100)
+                ok = (
+                    want is not None
+                    and want[0] in _FILE_MODES
+                    and (want[0] == "100755") == executable
+                    and want[1] == _blob_id(tf, member)
+                )
             else:
                 ok = (
                     want is not None
