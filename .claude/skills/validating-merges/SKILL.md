@@ -245,7 +245,22 @@ mode, and the Codex validator above does not run it. **Run one per install:** th
 picker has no lease, so two would pick the same row and report the same failure
 twice. Everything else in this skill applies to each pass, except that the
 picker's order (unfinished work first, then newest merge) replaces the backlog
-order in "Triage by risk".
+order in "Triage by risk". "Unfinished work" is a `not-yet-done` row, offered
+at once unless its stored document declares `"no_progress": true`; then it waits
+7 days after that attempt and returns to the front, so a row whose step needs a
+push, deploy or merge costs one pass, not every pass.
+
+**Declaring no progress.** Before recording a `not-yet-done` on a row that already
+has one, read its previous attempt (`--verification-log --pr <N>`: the note and
+the stored document). Set the document's `"no_progress": true` only when this
+attempt's remaining steps are the same work as that attempt's: nothing you did
+moved them. Set it to `false` when you finished a step, a step changed, or the
+row had no earlier `not-yet-done`. A document copied from the stored record may
+already say `true` from an earlier wait, so set the value on every attempt and
+never inherit it. The flag is your judgment, not a text match: a
+reworded step that is the same work is no progress. While the record's tracking
+is pending the row is still offered at once; the routing re-record (step 5)
+carries the same document, so the wait starts once routing completes.
 
 **Once per session:** run the tracking preflight (above), from the main checkout,
 whose `.venv/bin/python` the commands below use (a linked worktree has no `.venv`).
@@ -314,12 +329,15 @@ the tool derives `cannot-verify`, and pass
 `--note "not in the serving tree: <sha>; standing mode does not deploy"`. Its
 `deploy` concern needs an issue like any other; one "awaiting deploy of <sha>"
 issue can carry several rows. This is deliberate: `not-yet-done` is offered
-again at once, while `cannot-verify` waits out the 7-day re-attempt window.
+again at once (unless it declares no progress), while `cannot-verify` waits out
+the 7-day re-attempt window.
 
 **Stop and ask the owner** after any of:
 - 3 consecutive `cannot-verify` results with the same cause;
-- 3 consecutive passes picking the same `not-yet-done` row (it is offered again
-  with no delay);
+- 3 consecutive passes picking the same `not-yet-done` row (a declared no
+  progress makes the row wait, so a third pick means either each attempt made
+  progress or `no_progress` was missed: read the last two attempts before
+  asking);
 - 3 consecutive picker faults with the same cause;
 - routing that cannot complete (the filer refused, an indeterminate result, or
   GitHub unreachable): step 4 already stored the open verdict or saved the
