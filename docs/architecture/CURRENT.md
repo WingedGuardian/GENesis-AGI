@@ -1420,7 +1420,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: 1b79527b5c7 2026-11-08
+verified: a6528dab2 2026-11-09
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -1451,7 +1451,10 @@ verified: 1b79527b5c7 2026-11-08
   detect → create → dispatch;
   `approval_key_stable=True` (ONE
   site-level approval key). Resume consumes an approved grant before releasing
-  its awaiting row. A lookup/retirement failure preserves that row and defers
+  its awaiting row. Resume state transitions require the row to retain its
+  original `processing` status and exact awaiting-approval marker; a concurrent
+  claim, completion, supersession or new approval marker wins over the stale
+  transition. A lookup/retirement failure preserves that row and defers
   all new/modified/retry site work for the scan, while healthy approved siblings
   can resume after successful consumption. The refresh path folds parked files into the
   batch so approvals fire once (#914). A pending approval is HELD until the
