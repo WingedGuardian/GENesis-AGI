@@ -2,8 +2,11 @@
 
 One nullable column on ``pr_verifications``: ``nyd_repeat`` (INTEGER). 1 when a
 ``not-yet-done`` attempt names the same remaining steps (its ``not_yet_done``
-gaps) as the previous attempt, which was also ``not-yet-done``; 0 when they
-differ or the previous attempt was something else; NULL for every other verdict.
+gaps) as the previous attempt, which was also ``not-yet-done`` and finished (its
+tracking complete); 0 when they differ or the previous attempt was something
+else; NULL for every other verdict. When the previous record had the same steps
+but pending tracking, the write is that attempt re-recorded after routing, and
+the previous value is carried unchanged.
 ``record_attempt`` derives it from the stored and the new evidence document, so
 no fingerprint is stored and a row recorded before this column existed is
 compared on its next attempt.

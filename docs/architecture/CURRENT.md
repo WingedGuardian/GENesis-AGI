@@ -2779,9 +2779,11 @@ verified: c712f1bde 2026-11-06
   `repo_pulse_worker.py --next-for-validation`, names the ONE row to work next:
   not-yet-done and passing rows awaiting tracking, then never-attempted, then a
   parked row past 7 days, never fail-intent. A not-yet-done row whose last
-  attempt recorded the same remaining steps as the one before it
-  (`nyd_repeat`, which `record_attempt` derives by comparing the `not_yet_done`
-  gaps of the stored and the new evidence) waits 7 days after that attempt,
+  attempt recorded the same remaining steps as the finished (tracking-complete)
+  attempt before it (`nyd_repeat`, which `record_attempt` derives by comparing
+  the `not_yet_done` gaps of the stored and the new evidence; a re-record of a
+  tracking-pending attempt after routing carries the previous value) waits 7
+  days after that attempt,
   then returns to the front; deployed rows with an `E2E:` plan first, newest merge first. Deploy
   is merge-commit ancestry of the serving commit, except a stacked PR, which is
   kept and labelled because ancestry cannot prove it either way. It fails closed

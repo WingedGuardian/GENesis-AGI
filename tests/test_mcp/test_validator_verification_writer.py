@@ -188,6 +188,27 @@ async def test_a_recorded_not_yet_done_reports_whether_it_repeats_the_last_attem
     assert (await call(_doc(gaps=[other])))["nyd_repeat"] == 0
 
 
+async def test_a_routing_re_record_reports_its_basis_and_carries_the_flag(
+    recording, monkeypatch
+):
+    from genesis.mcp.health import validator_writes
+
+    path, _, config = recording
+    config.with_suffix(".local.yaml").write_text("dry_run_only: false")
+    monkeypatch.setattr(
+        validator_writes, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, "E2E: run the timer")
+    )
+    gap = {"kind": "not_yet_done", "detail": "not run", "command": "run timer"}
+    first = await call(_doc(gaps=[gap]), route=False)
+    assert first["tracking_complete"] is False
+    assert (first["nyd_repeat"], first["nyd_basis"]) == (0, "progress")
+    routed = await call(_doc(gaps=[gap]))
+    assert (routed["nyd_repeat"], routed["nyd_basis"]) == (0, "routing")
+    again = await call(_doc(gaps=[gap]))
+    assert (again["nyd_repeat"], again["nyd_basis"]) == (1, "repeat")
+    assert row(path)["nyd_repeat"] == 1
+
+
 async def test_a_preview_carries_a_null_nyd_repeat(recording):
     _, _, config = recording
     config.with_suffix(".local.yaml").write_text("dry_run_only: false")

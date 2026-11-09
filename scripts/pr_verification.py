@@ -264,25 +264,34 @@ async def _close_schema_refusal(db, rechecks: list[dict]) -> str | None:
     return None
 
 
-def _nyd_repeat_line(repeat: int | None, now: str) -> str | None:
+def _nyd_repeat_line(repeat: int | None, now: str, basis: str | None = None) -> str | None:
     """When the picker offers a not-yet-done row again, from its ``nyd_repeat``.
 
-    None when no repeat was recorded (the column is absent, or the document named
-    no not_yet_done gap): the picker then applies no wait either.
+    ``basis`` is what ``record_attempt_detail`` returned. ``"routing"`` means this
+    write re-recorded an attempt whose tracking was pending, with the same steps:
+    the value was carried, so the line says that instead of claiming the steps
+    changed or repeated. None when no repeat was recorded (the column is absent,
+    or the document named no not_yet_done gap): the picker then applies no wait
+    either.
     """
+    routing = basis == "routing"
     if repeat is None:
-        return None
+        return "same steps; routing update, not a new attempt" if routing else None
     if not repeat:
+        if routing:
+            return "same steps; routing update, not a new attempt: offered again at once"
         return "steps differ from the previous attempt: offered again at once"
     from datetime import datetime, timedelta
 
     from genesis.db.crud.pr_verifications import REATTEMPT_DAYS
 
     after = datetime.fromisoformat(now).astimezone(UTC) + timedelta(days=REATTEMPT_DAYS)
-    return (
-        "repeat of the previous attempt: offered again after "
-        f"{after.strftime('%Y-%m-%d %H:%M')} UTC"
+    lead = (
+        "same steps; routing update of an attempt that repeated the one before it"
+        if routing
+        else "repeat of the previous attempt"
     )
+    return f"{lead}: offered again after {after.strftime('%Y-%m-%d %H:%M')} UTC"
 
 
 def _print_recheck_plan(rechecks: list[dict]) -> None:
@@ -437,7 +446,7 @@ async def _write(
                     print(f"  {len(rechecks)} recheck(s) stored on the closed row.")
                 return 0
 
-            outcome = await crud.record_attempt(
+            outcome, nyd_basis = await crud.record_attempt_detail(
                 db,
                 repo=target,
                 pr_number=pr_number,
@@ -474,7 +483,7 @@ async def _write(
             )
             if verdict == "not-yet-done":
                 repeat = await crud.attempt_repeat(db, repo=target, pr_number=pr_number)
-                line = _nyd_repeat_line(repeat, now)
+                line = _nyd_repeat_line(repeat, now, nyd_basis)
                 if line:
                     print(f"  {line}")
             if verdict == "fail-intent":

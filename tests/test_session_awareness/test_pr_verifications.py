@@ -1271,6 +1271,119 @@ async def test_a_writer_that_loses_the_race_twice_writes_nothing(db, tmp_path, m
     assert (row["attempt_count"], row["last_attempt_at"]) == (1, "2026-10-20T10:00:00+00:00")
 
 
+# ── a routing re-record is not a new attempt (Devin review of #4215) ─────
+# The standing flow records a not-yet-done with tracking PENDING (step 4), files
+# the receipts, and records the same document again with tracking complete (step
+# 5). Only a previous FINISHED attempt (tracking complete) makes a same-steps
+# write a repeat; after a pending one the previous flag is carried unchanged.
+
+
+async def _nyd_detail(db, n, at, *steps, pending=False):
+    return await verif_crud.record_attempt_detail(
+        db,
+        repo=REPO,
+        pr_number=n,
+        verdict="not-yet-done",
+        note="TRACKING PENDING: findings/0 needs an issue — n" if pending else "n",
+        now=at,
+        evidence=_steps_doc(*steps),
+        tracking_pending=pending,
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_standing_flow_records_a_routing_update_without_delaying_the_row(db):
+    await _open(db, 320)
+    assert await _nyd_detail(db, 320, "2026-10-20T10:00:00+00:00", STEP_A, pending=True) == (
+        "recorded", "progress",
+    )
+    assert (await _row(db, 320))["nyd_repeat"] == 0
+    # Step 5: the same document, now with its receipts. Not a new attempt.
+    assert await _nyd_detail(db, 320, "2026-10-20T10:05:00+00:00", STEP_A) == (
+        "recorded", "routing",
+    )
+    assert (await _row(db, 320))["nyd_repeat"] == 0
+    rows = await verif_crud.list_validation_candidates(db, now=PICK_NOW)
+    assert [(r["pr_number"], r["tier"]) for r in rows] == [(320, 0)]
+    # A later, finished attempt that made no progress IS a repeat, and waits.
+    assert await _nyd_detail(db, 320, "2026-10-20T11:00:00+00:00", STEP_A) == (
+        "recorded", "repeat",
+    )
+    assert (await _row(db, 320))["nyd_repeat"] == 1
+    assert await verif_crud.list_validation_candidates(db, now=PICK_NOW) == []
+
+
+@pytest.mark.asyncio
+async def test_after_a_finished_attempt_the_same_steps_are_a_repeat(db):
+    await _open(db, 321)
+    await _nyd_detail(db, 321, "2026-10-20T10:00:00+00:00", STEP_A)
+    assert await _nyd_detail(db, 321, "2026-10-20T11:00:00+00:00", STEP_A) == (
+        "recorded", "repeat",
+    )
+    assert (await _row(db, 321))["nyd_repeat"] == 1
+
+
+@pytest.mark.asyncio
+async def test_after_a_pending_attempt_changed_steps_are_progress(db):
+    await _open(db, 322)
+    await _nyd_detail(db, 322, "2026-10-20T10:00:00+00:00", STEP_A, pending=True)
+    assert await _nyd_detail(db, 322, "2026-10-20T10:05:00+00:00", STEP_B) == (
+        "recorded", "progress",
+    )
+    assert (await _row(db, 322))["nyd_repeat"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_routing_update_carries_a_repeat_and_a_null_unchanged(db):
+    await _open(db, 323)
+    await _nyd_detail(db, 323, "2026-10-20T09:00:00+00:00", STEP_A)
+    # A new attempt, same steps, whose own tracking is pending: a repeat.
+    assert await _nyd_detail(db, 323, "2026-10-20T10:00:00+00:00", STEP_A, pending=True) == (
+        "recorded", "repeat",
+    )
+    # Its routing re-record keeps the 1: the wait belongs to that attempt.
+    assert await _nyd_detail(db, 323, "2026-10-20T10:05:00+00:00", STEP_A) == (
+        "recorded", "routing",
+    )
+    assert (await _row(db, 323))["nyd_repeat"] == 1
+    # NULL stays NULL (a pending row whose flag was never set, e.g. pre-column).
+    await _nyd_detail(db, 323, "2026-10-20T10:10:00+00:00", STEP_A, pending=True)
+    await db.execute("UPDATE pr_verifications SET nyd_repeat = NULL WHERE pr_number = 323")
+    await db.commit()
+    assert await _nyd_detail(db, 323, "2026-10-20T10:15:00+00:00", STEP_A) == (
+        "recorded", "routing",
+    )
+    assert (await _row(db, 323))["nyd_repeat"] is None
+
+
+@pytest.mark.asyncio
+async def test_the_race_guard_covers_the_note_the_decision_reads(db, tmp_path, monkeypatch):
+    """A concurrent write that only marks the stored attempt pending changes the
+    decision (repeat -> routing), so the UPDATE must not land on the stale read."""
+    import sqlite3
+
+    await _open(db, 324)
+    await _nyd_detail(db, 324, "2026-10-20T10:00:00+00:00", STEP_A)
+    real = verif_crud.nyd_fingerprint
+    calls = {"n": 0}
+
+    def racing(evidence):
+        calls["n"] += 1
+        if calls["n"] == 2:  # after the read of the stored row, before the write
+            with sqlite3.connect(str(tmp_path / "genesis.db")) as other:
+                other.execute(
+                    "UPDATE pr_verifications SET last_attempt_note = "
+                    "'TRACKING PENDING: x' WHERE pr_number = 324"
+                )
+        return real(evidence)
+
+    monkeypatch.setattr(verif_crud, "nyd_fingerprint", racing)
+    assert await _nyd_detail(db, 324, "2026-10-20T11:00:00+00:00", STEP_A) == (
+        "recorded", "routing",
+    )
+    assert (await _row(db, 324))["nyd_repeat"] == 0
+
+
 @pytest.mark.asyncio
 async def test_the_nyd_migration_adds_one_NULL_column_and_is_idempotent(tmp_path):
     async with aiosqlite.connect(str(tmp_path / "legacy.db")) as conn:

@@ -247,7 +247,9 @@ twice. Everything else in this skill applies to each pass, except that the
 picker's order (unfinished work first, then newest merge) replaces the backlog
 order in "Triage by risk". "Unfinished work" is a `not-yet-done` row, offered
 at once until an attempt records the same remaining steps (its `not_yet_done`
-gaps, compared by `command` and `detail`) as the attempt before it. Then it
+gaps, compared by `command` and `detail`) as the finished attempt before it.
+Re-recording the same document after routing (step 5 below) is not a new
+attempt and does not count; the writer reports it as a routing update. Then it
 waits 7 days after that attempt and returns to the front, so a row whose step
 needs a push, deploy or merge costs one repeat pass, not every pass. When you
 made no progress, record the gaps as they were: rewording them reads as

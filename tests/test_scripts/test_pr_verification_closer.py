@@ -742,9 +742,9 @@ def test_a_lost_attempt_race_is_reported_and_exits_1(tmp_path, capsys, monkeypat
     from genesis.db.crud import pr_verifications as crud
 
     async def missing(*_a, **_k):
-        return "missing"
+        return "missing", None
 
-    monkeypatch.setattr(crud, "record_attempt", missing)
+    monkeypatch.setattr(crud, "record_attempt_detail", missing)
     rc = _run(tmp_path, _doc_for("cannot-verify"), "--verdict", "cannot-verify", "--note", "n")
     assert rc == 1
     assert "missing" in capsys.readouterr().err
@@ -1291,6 +1291,25 @@ def test_a_not_yet_done_record_says_when_the_picker_offers_it_again(tmp_path, ca
     assert _run(tmp_path, _doc(gaps=[changed])) == 0
     assert "steps differ from the previous attempt" in capsys.readouterr().out
     assert _row(db)["nyd_repeat"] == 0
+
+
+def test_the_routing_re_record_says_so_and_does_not_delay_the_row(tmp_path, capsys):
+    """The standing flow records before routing (tracking pending, exit 4) and the
+    same document after it. That second write is not a new attempt: it must not
+    report a repeat, nor claim the steps changed, nor make the row wait."""
+    db = tmp_path / "genesis.db"
+    _seed(db)
+    assert _run(tmp_path, _doc(gaps=[UNDONE_GAP]), route=False) == 4
+    assert _row(db)["nyd_repeat"] == 0
+    capsys.readouterr()
+    assert _run(tmp_path, _doc(gaps=[UNDONE_GAP])) == 0
+    out = capsys.readouterr().out
+    assert "same steps; routing update, not a new attempt: offered again at once" in out
+    assert "repeat of the previous attempt" not in out and "steps differ" not in out
+    assert _row(db)["nyd_repeat"] == 0
+    assert _run(tmp_path, _doc(gaps=[UNDONE_GAP])) == 0
+    assert "repeat of the previous attempt: offered again after" in capsys.readouterr().out
+    assert _row(db)["nyd_repeat"] == 1
 
 
 def test_a_note_on_not_yet_done_is_appended_after_the_commands(tmp_path):
