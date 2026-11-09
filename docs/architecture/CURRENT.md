@@ -1420,7 +1420,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: b0867170e 2026-10-02
+verified: 1b79527b5c7 2026-11-08
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -1439,6 +1439,14 @@ verified: b0867170e 2026-10-02
   precedence footer. A missing, unreadable, or empty component fails the scan
   closed without caching a partial prompt; a successful composite is reused
   byte-for-byte by the approval route, CC invocation, and prompt-version hash.
+  Evaluations request one model-reported Evidence section per item, preserving
+  source claims, acquired quotations or acquisition limits, current mechanism/
+  user evidence, and labelled uncertainty. The existing optional output-memory
+  extractor is unchanged and may still lose qualifications or introduce an
+  unsupported claim; evaluator evidence is not mechanical source grounding or
+  a guarantee of memory correctness. Reuse and
+  deliverable-backed BUILD/adoption boundaries are described in
+  `docs/reference/inbox-evaluation-quality.md`.
   The phase order is prompt preflight → recover pending → resume approval →
   detect → create → dispatch;
   `approval_key_stable=True` (ONE
