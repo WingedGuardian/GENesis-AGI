@@ -31,10 +31,13 @@ commands in the initial fixture ran immediately without approval, so that
 configuration cannot establish approval handling. Early approval requests are
 retained while awaiting the turn response; unexpected requests still fail by
 default in the shared driver.
+Resume uses an append-only action witness, checks its exact bytes before resume,
+and checks bytes and provider-request count after shutdown.
 
 The image installs test tools under `.github/test-tools/requirements.txt`, the
 same constraints CI uses; changes to those pins trigger fresh qualification.
-Changes to the main CI workflow or this reference also trigger qualification. Ordinary CI skips
+Changes to the main CI workflow, this reference or the owned-process cleanup helper
+also trigger qualification. Ordinary CI skips
 the fifteen contained-only compatibility cases; its skip ceiling includes those
 measured identities. The contained workflow requires every native case to run.
 It first runs the pure driver tests to exercise shared fixture setup and its

@@ -68,3 +68,54 @@ def test_explicit_approval_survives_start_response_order(early):
     observed = observed or driver.until(lambda e: "method" in e and "id" in e, allow_requests=True)
     driver.reply(observed, {"decision": "decline"})
     assert json.loads(driver.process.stdin.getvalue().splitlines()[-1])["id"] == "approval"
+
+
+@pytest.mark.parametrize("replay_at", ["never", "resume_only", "first_close", "resume", "close", "close_request"])
+def test_resume_measurement_detects_repeated_action(tmp_path, monkeypatch, replay_at):
+    """Exercise the real measurement with a cached replay and no provider request."""
+    import shlex
+    from contextlib import nullcontext
+    from unittest.mock import Mock
+
+    from tests.test_hooks import test_codex_compatibility_native as native
+
+    sink = tmp_path / "workspace/resume.txt"
+    sink.parent.mkdir()
+    requests = [{}, {}]
+    provider = Mock(return_value=nullcontext(("fixture", requests)))
+
+    def execute():
+        item = provider.call_args.args[0]
+        command = shlex.split(json.loads(item["arguments"])["cmd"])
+        assert command[:2] == ["printf", "fixture"] and command[-1] == "resume.txt"
+        with sink.open({">": "w", ">>": "a"}[command[-2]]) as output:
+            output.write("fixture")
+
+    def begin(*args, **kwargs):
+        if replay_at != "resume_only":
+            execute()
+        return "thread", "turn"
+
+    def resume(*args):
+        if replay_at in {"resume", "resume_only"}:
+            execute()
+        return {"thread": {"id": "thread"}}
+
+    def close_resumed():
+        if replay_at == "close":
+            execute()
+        if replay_at == "close_request":
+            requests.append({})
+
+    first = SimpleNamespace(events=[], close=lambda: execute() if replay_at == "first_close" else None)
+    resumed = SimpleNamespace(events=[], initialize=Mock(), request=resume,
+                              close=close_resumed)
+    monkeypatch.setattr(native, "fixture_provider", provider)
+    monkeypatch.setattr(native, "configure", lambda *args: {})
+    monkeypatch.setattr(native, "trust_fixture_hook", Mock())
+    monkeypatch.setattr(native, "AppServer", Mock(side_effect=[first, resumed]))
+    monkeypatch.setattr(native, "begin", begin)
+    monkeypatch.setattr(native, "completed", lambda *args: {"params": {"turn": {"status": "completed"}}})
+    expected = nullcontext() if replay_at == "never" else pytest.raises(AssertionError)
+    with expected:
+        native.test_native_resume(tmp_path, {"app": "unused"}, {})

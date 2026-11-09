@@ -192,7 +192,7 @@ def test_canonical_ask_route(tmp_path, pinned, evidence, client, mode):
 
 
 def test_native_resume(tmp_path, pinned, evidence):
-    with fixture_provider(shell_item("printf fixture > resume.txt")) as (url, requests):
+    with fixture_provider(shell_item("printf fixture >> resume.txt")) as (url, requests):
         env = configure(tmp_path, url, "allow")
         trust_fixture_hook(pinned["app"], tmp_path, env)
         driver = AppServer(pinned["app"], tmp_path, env)
@@ -203,17 +203,19 @@ def test_native_resume(tmp_path, pinned, evidence):
             assert completed(driver, turn)["params"]["turn"]["status"] == "completed"
         finally:
             driver.close()
+        sink = tmp_path / "workspace/resume.txt"
+        assert sink.is_file() and sink.read_bytes() == b"fixture", "initial action must execute exactly once"
         resumed = AppServer(pinned["app"], tmp_path, env)
         try:
             resumed.initialize()
             evidence["resume"] = resumed.request("thread/resume", {"threadId": thread}, 2)
             assert evidence["resume"]["thread"]["id"] == thread
-            assert (tmp_path / "workspace/resume.txt").read_text() == "fixture"
-            assert len(requests) == 2, "resume must not replay the completed action"
         finally:
             resumed.close()
             evidence["events"] = driver.events + resumed.events
             evidence.update(resume_events=resumed.events, model_requests=requests)
+        assert sink.read_bytes() == b"fixture", "resume must not replay the completed action"
+        assert len(requests) == 2, "resume must not request another model response"
 
 
 @pytest.mark.parametrize("failure", [False, True], ids=["provenance-cleanup", "required-failure"])
