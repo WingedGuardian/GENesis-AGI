@@ -20,8 +20,8 @@ A PEP 578 audit hook judges, in this interpreter:
   ``~/.claude/.credentials.json``, ``~/.config/gh/hosts.yml``,
   ``~/.genesis/cc_oauth_token.env``).
 
-A write counts when it lands under the real home and outside the allowed
-places: the temp directory (``tempfile.gettempdir()``), pytest's basetemp and its
+A write counts when it lands under the real home (or in this checkout, wherever
+it sits) and outside the allowed places: the temp directory (``tempfile.gettempdir()``), pytest's basetemp and its
 per-process leaf, the live closure's test HOME (when it sets one), the box lock
 file this run took,
 ``/dev``, and ``__pycache__`` / ``.pytest_cache`` directories.
@@ -32,6 +32,9 @@ and attributed to the running test.
 
 Output: a terminal-summary section, and, with ``GENESIS_LIVE_WRITES_REPORT=<file>``,
 one tab-separated line per (test, class, operation, path), written on every run.
+Under xdist each worker hands its hits to the controller at session end
+(``workeroutput``, as the live fence does), and only the controller reports; a
+worker that never reported is named in the summary.
 
 A hit is a write that happens: an operation the kernel will refuse or that
 changes nothing (``mkdir`` of an existing directory, ``unlink`` of a missing
@@ -58,6 +61,8 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+
+import pytest
 
 _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
 _EVENTS = frozenset(
@@ -86,6 +91,8 @@ class _State:
     credential_files: frozenset[str] = frozenset()
     credential_inodes: frozenset[tuple[int, int]] = frozenset()
     hits: dict[tuple[str, str, str, str], None] = {}  # insertion-ordered set
+    merged_workers: set[str] = set()  # xdist workers whose hits were merged
+    unreported: list[str] = []  # xdist workers whose hits never arrived
 
 
 _S = _State()
@@ -141,12 +148,13 @@ def _allowed(path: str) -> bool:
 
 def _label(path: str) -> str | None:
     """The class of a write that counts, or None when it does not."""
-    if not _under(path, _S.real_home) or _allowed(path):
+    if _allowed(path):
         return None
+    # The class roots first: this checkout need not sit under the home.
     for root, label in _S.classes:
         if _under(path, root):
             return label
-    return "elsewhere in the home"
+    return "elsewhere in the home" if _under(path, _S.real_home) else None
 
 
 def _node() -> str:
@@ -163,10 +171,32 @@ def _sqlite_target(database) -> str | None:
         return None
     if path.startswith("file:"):
         body, _, query = path[5:].partition("?")
-        if "mode=ro" in query or "immutable=1" in query or "mode=memory" in query:
+        target = _absolute(body)
+        if _read_only_uri(query.partition("#")[0], exists=bool(target) and os.path.lexists(target)):
             return None
-        path = body
+        return target
     return _absolute(path)
+
+
+def _read_only_uri(query: str, *, exists: bool = True) -> bool:
+    """Whether SQLite opens a ``file:`` URI with this query without writing.
+
+    Exact parameters, as SQLite reads them (MEASURED, CPython's sqlite3): the
+    first occurrence of a key wins, keys are case-sensitive, and ``immutable``
+    is true for yes/true/on in any case or a nonzero integer. A substring test
+    would let ``journal_mode=rollback`` pass as ``mode=ro``. ``immutable`` on a
+    missing file still creates it (MEASURED), so it is read-only only when the
+    file ``exists``.
+    """
+    params: dict[str, str] = {}
+    for pair in query.split("&"):
+        key, _, value = pair.partition("=")
+        params.setdefault(key, value)
+    if params.get("mode", "").lower() in ("ro", "memory"):
+        return True
+    immutable = params.get("immutable", "").lower()
+    on = immutable in ("yes", "true", "on") or (immutable.isdigit() and int(immutable) != 0)
+    return on and exists
 
 
 def _reopens_unchanged(flags, target: str) -> bool:
@@ -190,10 +220,14 @@ def _judge(event: str, args: tuple) -> None:
             # os.open's audit event omits dir_fd, so a relative name may be
             # relative to a directory descriptor rather than the cwd. Judge it
             # against the cwd, but label it so a reader knows it is a guess.
+            guess = _absolute(name)
+            if not guess:
+                return
             if writes:
-                guess = _absolute(name)
-                if guess and _label(guess) and not _reopens_unchanged(flags, guess):
+                if _label(guess) and not _reopens_unchanged(flags, guess):
                     _record("relative os.open (dir_fd unknown; judged against cwd)", "write", guess)
+            elif guess in _S.credential_files or _is_credential_file(guess):
+                _record("credential file read (relative os.open; judged against cwd)", "read", guess)
             return
         target = _absolute(path)
         if target is None:
@@ -369,27 +403,69 @@ def install(config) -> None:
     _S.installed = True
 
 
+def pytest_sessionfinish(session, exitstatus):
+    # An xdist worker's terminal summary never reaches the run, so it hands its
+    # hits to the controller (pytest_testnodedown), as the live fence does.
+    if hasattr(session.config, "workeroutput"):
+        session.config.workeroutput["genesis_live_writes"] = {
+            # As bytes: xdist's channel refuses a str it cannot encode as UTF-8
+            # (MEASURED: execnet DumpError), which an undecodable path is.
+            "hits": [
+                [field.encode("utf-8", "surrogateescape") for field in key]
+                for key in dict.copy(_S.hits)
+            ],
+            "disarmed": _S.disarmed,
+        }
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node, error):
+    """The controller merges each worker's hits, so an xdist run reports what a
+    serial one would. A worker that went down without reporting is named in the
+    summary: its writes are unknown, not absent."""
+    worker = (getattr(node, "gateway", None) and getattr(node.gateway, "id", None)) or "a worker"
+    if worker in _S.merged_workers:
+        return  # xdist can report one worker down twice (an interrupted run)
+    _S.merged_workers.add(worker)
+    got = (getattr(node, "workeroutput", None) or {}).get("genesis_live_writes")
+    if got is None:
+        _S.unreported.append(f"{worker} ({error})" if error else worker)
+        return
+    for key in got["hits"]:
+        _S.hits[tuple(field.decode("utf-8", "surrogateescape") for field in key)] = None
+    if got["disarmed"]:
+        _S.unreported.append(f"{worker} (disarmed: {got['disarmed']})")
+
+
 def pytest_terminal_summary(terminalreporter):
+    if hasattr(terminalreporter.config, "workeroutput"):
+        return  # a worker: its hits go to the controller, which reports once
     if not _S.installed:
         if _S.disarmed:
             terminalreporter.write_line(f"live writes: disarmed ({_S.disarmed})", yellow=True)
         return
     tr = terminalreporter
-    if _S.hits:
+    # One snapshot: a thread the run left behind can still record while this runs,
+    # and iterating the live dict would raise and fail a run this only reports on.
+    # dict.copy() takes it in one step under the GIL, without iterating the dict.
+    hits = list(dict.copy(_S.hits))
+    if hits:
         by_class: dict[str, set[str]] = {}
-        for node, label, _op, _path in _S.hits:
+        for node, label, _op, _path in hits:
             by_class.setdefault(label, set()).add(node)
-        tr.section("live fence: writes outside the test's temp dirs (reported, not failed)")
+        tr.section("live writes: writes outside the test's temp dirs (reported, not failed)")
         for label, nodes in sorted(by_class.items()):
             outside = "<outside a test>" in nodes
             count = len(nodes) - outside
             tr.write_line(f"{label}: {count} tests" + (", and outside any test" if outside else ""))
+    for worker in _S.unreported:
+        tr.write_line(f"live writes: no report from xdist worker {worker}", yellow=True)
     report = os.environ.get("GENESIS_LIVE_WRITES_REPORT")
     if report:
         try:
             # surrogateescape: a path os.fsdecode() could not decode is written back
             # as its original bytes instead of failing the run.
-            text = "".join("\t".join(key) + "\n" for key in _S.hits)
+            text = "".join("\t".join(key) + "\n" for key in hits)
             Path(report).write_bytes(text.encode("utf-8", "surrogateescape"))
         except (OSError, UnicodeError) as exc:  # report-only: never fails a run
             tr.write_line(f"live writes: could not write the report {report}: {exc}", yellow=True)
