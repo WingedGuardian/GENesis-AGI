@@ -30,11 +30,6 @@ from tests.test_session_awareness.conftest import (
 #: ``_build`` so a new migration reaches every suite at once (see the conftest).
 MIG = PR_VERIFICATION_MIGRATIONS[0]
 MIG_VERDICT = PR_VERIFICATION_MIGRATIONS[1]
-MIG_NYD = next(
-    m for m in PR_VERIFICATION_MIGRATIONS if m.__name__.endswith("_pr_verification_nyd_repeat")
-)
-#: Every migration but the not-yet-done repeat one: the window before it runs.
-PRE_NYD = tuple(m for m in PR_VERIFICATION_MIGRATIONS if m is not MIG_NYD)
 
 #: Every verdict that does NOT close the row, derived rather than listed.
 NON_CLOSING = tuple(v for v in verif_crud.VERDICTS if v not in verif_crud.PASS_VERDICTS)
@@ -694,13 +689,12 @@ async def test_both_build_paths_agree_on_the_effective_column_shape(tmp_path):
     # Guard-the-guard: the comparison is only meaningful if it actually saw the
     # appended columns in their positions. Without this the test would
     # pass just as happily against two identical PRE-migration tables.
-    assert [c[1] for c in fresh_cols][-6:] == [
+    assert [c[1] for c in fresh_cols][-5:] == [
         "verdict",
         "attempt_count",
         "last_attempt_at",
         "last_attempt_note",
         "rechecks",
-        "nyd_repeat",
     ]
     by_name = {c[1]: c for c in fresh_cols}
     assert by_name["attempt_count"][3] == 1, "attempt_count must be NOT NULL"
@@ -1034,11 +1028,9 @@ async def test_list_open_puts_not_yet_done_after_fail_intent_and_before_untouche
 
 # ── list_validation_candidates: what a standing validator may pick next ───────
 #
-# Eligibility (owner ruling 2026-10-29, amended 2026-11-09): not-yet-done with
-# no wait until an attempt repeats the previous attempt's remaining steps, then
-# only once that attempt is older than the re-attempt window; never-attempted
-# always; cannot-verify only once its last attempt is older than the window;
-# fail-intent never (it is the owner's, not the loop's). Order: tier
+# Eligibility (owner ruling 2026-10-29): not-yet-done always, never-attempted
+# always, cannot-verify only once its last attempt is older than the re-attempt
+# window, fail-intent never (it is the owner's, not the loop's). Order: tier
 # (not-yet-done, never-attempted, cannot-verify), then NEWEST merge first.
 
 PICK_NOW = "2026-10-20T12:00:00+00:00"
@@ -1063,364 +1055,11 @@ async def test_candidates_rank_not_yet_done_then_untouched_then_old_parked(db):
 
 @pytest.mark.asyncio
 async def test_a_not_yet_done_row_recorded_a_minute_ago_is_still_eligible(db):
-    """No re-attempt delay for a FRESH not-yet-done: the commands that finish it
-    are named, and no attempt has yet failed to make progress on them."""
+    """No re-attempt delay: the commands that finish it are named and runnable now."""
     await _open(db, 210)
     await _attempt(db, 210, "not-yet-done", "2026-10-20T11:59:00+00:00")
     rows = await verif_crud.list_validation_candidates(db, now=PICK_NOW)
     assert [r["pr_number"] for r in rows] == [210]
-
-
-# ── a not-yet-done attempt that repeats the one before it (owner ruling 2026-11-09)
-
-
-def _steps_doc(*steps):
-    """An evidence document whose not_yet_done gaps are *steps* ((command, detail))."""
-    gaps = [{"kind": "not_yet_done", "command": c, "detail": d} for c, d in steps]
-    gaps.append({"kind": "method", "detail": "not a remaining step"})
-    return json.dumps({"pr": 1, "gaps": gaps})
-
-
-async def _nyd(db, n, at, *steps):
-    await verif_crud.record_attempt(
-        db,
-        repo=REPO,
-        pr_number=n,
-        verdict="not-yet-done",
-        note="n",
-        now=at,
-        evidence=_steps_doc(*steps),
-    )
-
-
-STEP_A = ("dispatch the workflow in a fork", "needs a push")
-STEP_B = ("run the timer once", "not run yet")
-
-
-@pytest.mark.asyncio
-async def test_the_writer_marks_a_repeat_only_when_the_steps_match_the_previous_attempt(db):
-    await _open(db, 300)
-    seen = []
-    for at, steps in (
-        ("2026-10-01T00:00:00+00:00", (STEP_A,)),
-        ("2026-10-02T00:00:00+00:00", (STEP_A,)),
-        ("2026-10-03T00:00:00+00:00", (STEP_B,)),
-        ("2026-10-04T00:00:00+00:00", (STEP_B,)),
-    ):
-        await _nyd(db, 300, at, *steps)
-        seen.append((await _row(db, 300))["nyd_repeat"])
-    assert seen == [0, 1, 0, 1]
-    assert await verif_crud.attempt_repeat(db, repo=REPO, pr_number=300) == 1
-
-
-@pytest.mark.asyncio
-async def test_the_fingerprint_ignores_gap_order_whitespace_and_case_but_not_wording(db):
-    await _open(db, 301)
-    await _nyd(db, 301, "2026-10-01T00:00:00+00:00", STEP_A, STEP_B)
-    await _nyd(
-        db,
-        301,
-        "2026-10-02T00:00:00+00:00",
-        (" Run the  TIMER once ", "Not run\tyet"),
-        STEP_A,
-    )
-    assert (await _row(db, 301))["nyd_repeat"] == 1
-    await _nyd(db, 301, "2026-10-03T00:00:00+00:00", STEP_A, ("run the timer twice", "x"))
-    assert (await _row(db, 301))["nyd_repeat"] == 0
-
-
-@pytest.mark.asyncio
-async def test_a_repeated_not_yet_done_inside_the_window_is_excluded(db):
-    await _open(db, 302, merged="2026-09-01T00:00:00Z")
-    await _open(db, 303, merged="2026-09-20T00:00:00Z")  # never attempted
-    await _nyd(db, 302, "2026-10-20T11:00:00+00:00", STEP_A)
-    await _nyd(db, 302, "2026-10-20T11:59:00+00:00", STEP_A)
-    rows = await verif_crud.list_validation_candidates(db, now=PICK_NOW)
-    assert [r["pr_number"] for r in rows] == [303]
-
-
-@pytest.mark.asyncio
-async def test_a_repeated_not_yet_done_past_the_window_is_back_at_tier_0(db):
-    await _open(db, 304, merged="2026-09-01T00:00:00Z")  # older merge
-    await _open(db, 305, merged="2026-09-20T00:00:00Z")  # never attempted, newer
-    await _nyd(db, 304, "2026-10-01T00:00:00+00:00", STEP_A)
-    await _nyd(db, 304, "2026-10-13T11:00:00Z", STEP_A)  # 7d 1h ago
-    rows = await verif_crud.list_validation_candidates(db, now=PICK_NOW)
-    assert [(r["pr_number"], r["tier"]) for r in rows] == [(304, 0), (305, 1)]
-
-
-@pytest.mark.asyncio
-async def test_a_not_yet_done_whose_steps_changed_is_eligible_at_once(db):
-    await _open(db, 306)
-    await _nyd(db, 306, "2026-10-20T11:00:00+00:00", STEP_A)
-    await _nyd(db, 306, "2026-10-20T11:59:00+00:00", STEP_B)
-    rows = await verif_crud.list_validation_candidates(db, now=PICK_NOW)
-    assert [(r["pr_number"], r["tier"]) for r in rows] == [(306, 0)]
-
-
-@pytest.mark.asyncio
-async def test_an_unparseable_attempt_time_on_a_repeated_not_yet_done_is_ineligible(db):
-    await _open(db, 307)
-    await _nyd(db, 307, "2026-01-01T00:00:00+00:00", STEP_A)
-    await _nyd(db, 307, "2026-01-02T00:00:00+00:00", STEP_A)
-    await db.execute(
-        "UPDATE pr_verifications SET last_attempt_at = 'garbage' WHERE pr_number = 307"
-    )
-    await db.commit()
-    assert await verif_crud.list_validation_candidates(db, now=PICK_NOW) == []
-
-
-@pytest.mark.asyncio
-async def test_any_other_verdict_clears_the_fingerprint_and_the_repeat(db):
-    await _open(db, 308)
-    await _nyd(db, 308, "2026-10-01T00:00:00+00:00", STEP_A)
-    await _nyd(db, 308, "2026-10-02T00:00:00+00:00", STEP_A)
-    await _attempt(db, 308, "cannot-verify", "2026-10-03T00:00:00+00:00")
-    assert (await _row(db, 308))["nyd_repeat"] is None
-    # The previous not-yet-done is no longer "the attempt before it".
-    await _nyd(db, 308, "2026-10-04T00:00:00+00:00", STEP_A)
-    assert (await _row(db, 308))["nyd_repeat"] == 0
-    await verif_crud.close_verification(
-        db, repo=REPO, pr_number=308, verdict="pass-mechanical", reason="r", evidence="{}", now=NOW
-    )
-    assert (await _row(db, 308))["nyd_repeat"] is None
-
-
-@pytest.mark.asyncio
-async def test_a_not_yet_done_without_a_step_records_no_repeat_and_never_waits(db):
-    """Unreachable through either writer (both pass a document with a not_yet_done
-    gap), but the CRUD must not invent a repeat from nothing."""
-    await _open(db, 311)
-    await _attempt(db, 311, "not-yet-done", "2026-10-20T11:00:00+00:00")
-    await _attempt(db, 311, "not-yet-done", "2026-10-20T11:59:00+00:00")
-    assert (await _row(db, 311))["nyd_repeat"] is None
-    rows = await verif_crud.list_validation_candidates(db, now=PICK_NOW)
-    assert [r["pr_number"] for r in rows] == [311]
-
-
-@pytest.mark.asyncio
-async def test_a_row_recorded_before_the_column_existed_is_compared_on_its_next_attempt(tmp_path):
-    """The repeat is DERIVED from the stored evidence, so a not-yet-done row written
-    before the migration needs no backfill: its next same-steps attempt is a repeat."""
-    async with aiosqlite.connect(str(tmp_path / "legacy.db")) as conn:
-        conn.row_factory = aiosqlite.Row
-        for mig in PRE_NYD:
-            await mig.up(conn)
-        await _open(conn, 312)
-        await _nyd(conn, 312, "2026-10-20T10:00:00+00:00", STEP_A)
-        await MIG_NYD.up(conn)
-        assert (await _row(conn, 312))["nyd_repeat"] is None
-        await _nyd(conn, 312, "2026-10-20T11:00:00+00:00", STEP_A)
-        assert (await _row(conn, 312))["nyd_repeat"] == 1
-        assert await verif_crud.list_validation_candidates(conn, now=PICK_NOW) == []
-
-
-def _interfere_with(monkeypatch, path, n, times):
-    """Make another writer change row *n*'s evidence after record_attempt reads it,
-    *times* times: the read-compare-write window a concurrent writer could hit."""
-    import sqlite3
-
-    real = verif_crud.nyd_fingerprint
-    left = {"n": times, "calls": 0}
-
-    def racing(evidence):
-        # Call 1 fingerprints the NEW document, before the read; every later call
-        # fingerprints the row's stored document, after the read and before the write.
-        left["calls"] += 1
-        if left["calls"] > 1 and left["n"]:
-            left["n"] -= 1
-            with sqlite3.connect(str(path)) as other:
-                other.execute(
-                    "UPDATE pr_verifications SET evidence = ?, verdict = 'not-yet-done' "
-                    "WHERE pr_number = ?",
-                    (json.dumps({"other": left["n"], "gaps": []}), n),
-                )
-        return real(evidence)
-
-    monkeypatch.setattr(verif_crud, "nyd_fingerprint", racing)
-
-
-@pytest.mark.asyncio
-async def test_a_writer_that_loses_the_race_once_rereads_and_records(db, tmp_path, monkeypatch):
-    await _open(db, 313)
-    await _nyd(db, 313, "2026-10-20T10:00:00+00:00", STEP_A)
-    # The interfering write replaces the stored steps, so the retry compares with
-    # THAT document and records no repeat.
-    _interfere_with(monkeypatch, tmp_path / "genesis.db", 313, times=1)
-    await _nyd(db, 313, "2026-10-20T11:00:00+00:00", STEP_A)
-    row = await _row(db, 313)
-    assert (row["nyd_repeat"], row["last_attempt_at"]) == (0, "2026-10-20T11:00:00+00:00")
-
-
-@pytest.mark.asyncio
-async def test_a_writer_that_loses_the_race_twice_writes_nothing(db, tmp_path, monkeypatch):
-    await _open(db, 314)
-    await _nyd(db, 314, "2026-10-20T10:00:00+00:00", STEP_A)
-    _interfere_with(monkeypatch, tmp_path / "genesis.db", 314, times=2)
-    out = await verif_crud.record_attempt(
-        db,
-        repo=REPO,
-        pr_number=314,
-        verdict="not-yet-done",
-        note="n",
-        now="2026-10-20T11:00:00+00:00",
-        evidence=_steps_doc(STEP_A),
-    )
-    assert out == "changed"
-    row = await _row(db, 314)
-    assert (row["attempt_count"], row["last_attempt_at"]) == (1, "2026-10-20T10:00:00+00:00")
-
-
-# ── a routing re-record is not a new attempt (Devin review of #4215) ─────
-# The standing flow records a not-yet-done with tracking PENDING (step 4), files
-# the receipts, and records the same document again with tracking complete (step
-# 5). Only a previous FINISHED attempt (tracking complete) makes a same-steps
-# write a repeat; after a pending one the previous flag is carried unchanged.
-
-
-async def _nyd_detail(db, n, at, *steps, pending=False):
-    return await verif_crud.record_attempt_detail(
-        db,
-        repo=REPO,
-        pr_number=n,
-        verdict="not-yet-done",
-        note="TRACKING PENDING: findings/0 needs an issue — n" if pending else "n",
-        now=at,
-        evidence=_steps_doc(*steps),
-        tracking_pending=pending,
-    )
-
-
-@pytest.mark.asyncio
-async def test_the_standing_flow_records_a_routing_update_without_delaying_the_row(db):
-    await _open(db, 320)
-    assert await _nyd_detail(db, 320, "2026-10-20T10:00:00+00:00", STEP_A, pending=True) == (
-        "recorded", "progress",
-    )
-    assert (await _row(db, 320))["nyd_repeat"] == 0
-    # Step 5: the same document, now with its receipts. Not a new attempt.
-    assert await _nyd_detail(db, 320, "2026-10-20T10:05:00+00:00", STEP_A) == (
-        "recorded", "routing",
-    )
-    assert (await _row(db, 320))["nyd_repeat"] == 0
-    rows = await verif_crud.list_validation_candidates(db, now=PICK_NOW)
-    assert [(r["pr_number"], r["tier"]) for r in rows] == [(320, 0)]
-    # A later, finished attempt that made no progress IS a repeat, and waits.
-    assert await _nyd_detail(db, 320, "2026-10-20T11:00:00+00:00", STEP_A) == (
-        "recorded", "repeat",
-    )
-    assert (await _row(db, 320))["nyd_repeat"] == 1
-    assert await verif_crud.list_validation_candidates(db, now=PICK_NOW) == []
-
-
-@pytest.mark.asyncio
-async def test_after_a_finished_attempt_the_same_steps_are_a_repeat(db):
-    await _open(db, 321)
-    await _nyd_detail(db, 321, "2026-10-20T10:00:00+00:00", STEP_A)
-    assert await _nyd_detail(db, 321, "2026-10-20T11:00:00+00:00", STEP_A) == (
-        "recorded", "repeat",
-    )
-    assert (await _row(db, 321))["nyd_repeat"] == 1
-
-
-@pytest.mark.asyncio
-async def test_after_a_pending_attempt_changed_steps_are_progress(db):
-    await _open(db, 322)
-    await _nyd_detail(db, 322, "2026-10-20T10:00:00+00:00", STEP_A, pending=True)
-    assert await _nyd_detail(db, 322, "2026-10-20T10:05:00+00:00", STEP_B) == (
-        "recorded", "progress",
-    )
-    assert (await _row(db, 322))["nyd_repeat"] == 0
-
-
-@pytest.mark.asyncio
-async def test_a_routing_update_carries_a_repeat_and_a_null_unchanged(db):
-    await _open(db, 323)
-    await _nyd_detail(db, 323, "2026-10-20T09:00:00+00:00", STEP_A)
-    # A new attempt, same steps, whose own tracking is pending: a repeat.
-    assert await _nyd_detail(db, 323, "2026-10-20T10:00:00+00:00", STEP_A, pending=True) == (
-        "recorded", "repeat",
-    )
-    # Its routing re-record keeps the 1: the wait belongs to that attempt.
-    assert await _nyd_detail(db, 323, "2026-10-20T10:05:00+00:00", STEP_A) == (
-        "recorded", "routing",
-    )
-    assert (await _row(db, 323))["nyd_repeat"] == 1
-    # NULL stays NULL (a pending row whose flag was never set, e.g. pre-column).
-    await _nyd_detail(db, 323, "2026-10-20T10:10:00+00:00", STEP_A, pending=True)
-    await db.execute("UPDATE pr_verifications SET nyd_repeat = NULL WHERE pr_number = 323")
-    await db.commit()
-    assert await _nyd_detail(db, 323, "2026-10-20T10:15:00+00:00", STEP_A) == (
-        "recorded", "routing",
-    )
-    assert (await _row(db, 323))["nyd_repeat"] is None
-
-
-@pytest.mark.asyncio
-async def test_the_race_guard_covers_the_note_the_decision_reads(db, tmp_path, monkeypatch):
-    """A concurrent write that only marks the stored attempt pending changes the
-    decision (repeat -> routing), so the UPDATE must not land on the stale read."""
-    import sqlite3
-
-    await _open(db, 324)
-    await _nyd_detail(db, 324, "2026-10-20T10:00:00+00:00", STEP_A)
-    real = verif_crud.nyd_fingerprint
-    calls = {"n": 0}
-
-    def racing(evidence):
-        calls["n"] += 1
-        if calls["n"] == 2:  # after the read of the stored row, before the write
-            with sqlite3.connect(str(tmp_path / "genesis.db")) as other:
-                other.execute(
-                    "UPDATE pr_verifications SET last_attempt_note = "
-                    "'TRACKING PENDING: x' WHERE pr_number = 324"
-                )
-        return real(evidence)
-
-    monkeypatch.setattr(verif_crud, "nyd_fingerprint", racing)
-    assert await _nyd_detail(db, 324, "2026-10-20T11:00:00+00:00", STEP_A) == (
-        "recorded", "routing",
-    )
-    assert (await _row(db, 324))["nyd_repeat"] == 0
-
-
-@pytest.mark.asyncio
-async def test_the_nyd_migration_adds_one_NULL_column_and_is_idempotent(tmp_path):
-    async with aiosqlite.connect(str(tmp_path / "legacy.db")) as conn:
-        conn.row_factory = aiosqlite.Row
-        for mig in PRE_NYD:
-            await mig.up(conn)
-        await _open(conn, 309)
-        await _attempt(conn, 309, "not-yet-done", "2026-10-20T11:00:00+00:00")
-        await MIG_NYD.up(conn)
-        await MIG_NYD.up(conn)
-        cur = await conn.execute("PRAGMA table_info(pr_verifications)")
-        cols = [r[1] for r in await cur.fetchall()]
-        assert cols[-2:] == ["rechecks", "nyd_repeat"], "exactly one column added"
-        assert (await _row(conn, 309))["nyd_repeat"] is None, "no backfill"
-
-
-@pytest.mark.asyncio
-async def test_the_nyd_migration_on_a_database_without_the_table_is_a_no_op(bare_db):
-    await MIG_NYD.up(bare_db)
-    cur = await bare_db.execute("SELECT name FROM sqlite_master WHERE name = 'pr_verifications'")
-    assert await cur.fetchone() is None
-
-
-@pytest.mark.asyncio
-async def test_before_the_nyd_column_a_repeated_not_yet_done_still_goes_first(tmp_path):
-    """An absent column means no repeat could be recorded: no wait, as before the
-    ruling, and the writer still records the attempt."""
-    async with aiosqlite.connect(str(tmp_path / "pre.db")) as conn:
-        conn.row_factory = aiosqlite.Row
-        for mig in PRE_NYD:
-            await mig.up(conn)
-        await _open(conn, 310)
-        await _nyd(conn, 310, "2026-10-20T11:00:00+00:00", STEP_A)
-        await _nyd(conn, 310, "2026-10-20T11:59:00+00:00", STEP_A)
-        assert (await _row(conn, 310))["attempt_count"] == 2
-        rows = await verif_crud.list_validation_candidates(conn, now=PICK_NOW)
-    assert [(r["pr_number"], r["tier"]) for r in rows] == [(310, 0)]
 
 
 @pytest.mark.asyncio
@@ -1474,6 +1113,115 @@ async def test_an_unparseable_attempt_time_makes_a_parked_row_ineligible(db):
     )
     await db.commit()
     assert await verif_crud.list_validation_candidates(db, now=PICK_NOW) == []
+
+
+# ── a not-yet-done whose validator declared no progress (owner ruling 2026-11-09)
+# The validator judges it and writes ``no_progress`` into the document it already
+# records; the picker reads it from the stored evidence at pick time.
+
+
+def _nyd_doc(no_progress=None):
+    doc = {"pr": 1, "gaps": [{"kind": "not_yet_done", "detail": "d", "command": "c"}]}
+    if no_progress is not None:
+        doc["no_progress"] = no_progress
+    return json.dumps(doc)
+
+
+async def _nyd(db, n, at, *, no_progress=None, pending=False):
+    await verif_crud.record_attempt(
+        db,
+        repo=REPO,
+        pr_number=n,
+        verdict="not-yet-done",
+        note="TRACKING PENDING: findings/0 needs an issue — n" if pending else "n",
+        now=at,
+        evidence=_nyd_doc(no_progress),
+        tracking_pending=pending,
+    )
+
+
+def _picked(rows):
+    return [(r["pr_number"], r["tier"]) for r in rows]
+
+
+@pytest.mark.asyncio
+async def test_a_declared_no_progress_inside_the_window_is_excluded(db):
+    await _open(db, 300, merged="2026-09-01T00:00:00Z")
+    await _open(db, 301, merged="2026-09-20T00:00:00Z")  # never attempted
+    await _nyd(db, 300, "2026-10-20T11:59:00+00:00", no_progress=True)
+    rows = await verif_crud.list_validation_candidates(db, now=PICK_NOW)
+    assert _picked(rows) == [(301, 1)]
+
+
+@pytest.mark.asyncio
+async def test_a_declared_no_progress_past_the_window_is_back_at_tier_0(db):
+    await _open(db, 302, merged="2026-09-01T00:00:00Z")
+    await _open(db, 303, merged="2026-09-20T00:00:00Z")
+    await _nyd(db, 302, "2026-10-13T11:00:00Z", no_progress=True)  # 7d 1h ago
+    rows = await verif_crud.list_validation_candidates(db, now=PICK_NOW)
+    assert _picked(rows) == [(302, 0), (303, 1)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("declared", [None, False])
+async def test_an_undeclared_or_false_no_progress_is_eligible_at_once(db, declared):
+    await _open(db, 304)
+    await _nyd(db, 304, "2026-10-20T11:59:00+00:00", no_progress=declared)
+    assert _picked(await verif_crud.list_validation_candidates(db, now=PICK_NOW)) == [(304, 0)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["true", 1, "yes"])
+async def test_only_a_literal_true_is_a_declaration(db, value):
+    """The writers' model refuses any other type; a stored oddity is not a wait."""
+    await _open(db, 305)
+    await _nyd(db, 305, "2026-10-20T11:59:00+00:00", no_progress=value)
+    assert _picked(await verif_crud.list_validation_candidates(db, now=PICK_NOW)) == [(305, 0)]
+
+
+@pytest.mark.asyncio
+async def test_a_tracking_pending_no_progress_is_eligible_and_its_routing_re_record_waits(db):
+    """An interrupted routing is not hidden; the re-record carries the same document,
+    so the declaration carries with it and the wait starts once routing completes."""
+    await _open(db, 306)
+    await _nyd(db, 306, "2026-10-20T11:00:00+00:00", no_progress=True, pending=True)
+    assert _picked(await verif_crud.list_validation_candidates(db, now=PICK_NOW)) == [(306, 0)]
+    await _nyd(db, 306, "2026-10-20T11:05:00+00:00", no_progress=True)
+    assert await verif_crud.list_validation_candidates(db, now=PICK_NOW) == []
+
+
+@pytest.mark.asyncio
+async def test_an_unparseable_stamp_on_a_declared_no_progress_is_ineligible(db):
+    await _open(db, 307)
+    await _nyd(db, 307, "2026-01-01T00:00:00+00:00", no_progress=True)
+    await db.execute(
+        "UPDATE pr_verifications SET last_attempt_at = 'garbage' WHERE pr_number = 307"
+    )
+    await db.commit()
+    assert await verif_crud.list_validation_candidates(db, now=PICK_NOW) == []
+
+
+@pytest.mark.asyncio
+async def test_unparseable_stored_evidence_is_undeclared(db):
+    await _open(db, 308)
+    await verif_crud.record_attempt(
+        db, repo=REPO, pr_number=308, verdict="not-yet-done", note="n",
+        now="2026-10-20T11:59:00+00:00", evidence="{not json",
+    )
+    assert _picked(await verif_crud.list_validation_candidates(db, now=PICK_NOW)) == [(308, 0)]
+
+
+@pytest.mark.asyncio
+async def test_no_progress_on_another_verdict_does_not_delay_it(db):
+    """Only a not-yet-done row waits on the declaration; cannot-verify keeps its own
+    window and a never-delayed verdict stays undelayed."""
+    await _open(db, 309)
+    await verif_crud.record_attempt(
+        db, repo=REPO, pr_number=309, verdict="pass-mechanical",
+        note="TRACKING PENDING: findings/0 needs an issue", now="2026-10-20T11:59:00+00:00",
+        evidence=_nyd_doc(True), tracking_pending=True,
+    )
+    assert _picked(await verif_crud.list_validation_candidates(db, now=PICK_NOW)) == [(309, 0)]
 
 
 @pytest.mark.asyncio

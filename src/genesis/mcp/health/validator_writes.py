@@ -199,13 +199,9 @@ async def record_verification(
             "server_dry_run_only": forced,
             "recorded": False,
             "rechecks": rechecks,
-            # A recorded not-yet-done's stored flag: 1 means the picker waits the
-            # re-attempt window, 0 means it offers the row again at once, else null.
-            # nyd_basis says why: "repeat" (same steps as the previous finished
-            # attempt), "progress" (steps differ), or "routing" (the same attempt
-            # re-recorded after routing, so the previous flag was carried unchanged).
-            "nyd_repeat": None,
-            "nyd_basis": None,
+            # The document's own declaration. On a recorded not-yet-done whose
+            # tracking is complete, the picker waits the re-attempt window after it.
+            "no_progress": doc.no_progress,
         }
         if preview:
             return result
@@ -221,23 +217,22 @@ async def record_verification(
                 now=now,
             )
         else:
-            outcome, nyd_basis = await crud.record_attempt_detail(
-                db,
-                repo=target,
-                pr_number=pr,
-                verdict=decision.verdict,
-                note=(attempt_note(decision, note) if tracking.complete
-                      else tracking.note(attempt_note(decision, note))),
-                evidence=payload,
-                now=now,
-                tracking_pending=not tracking.complete,
+            changed = (
+                await crud.record_attempt(
+                    db,
+                    repo=target,
+                    pr_number=pr,
+                    verdict=decision.verdict,
+                    note=(attempt_note(decision, note) if tracking.complete
+                          else tracking.note(attempt_note(decision, note))),
+                    evidence=payload,
+                    now=now,
+                    tracking_pending=not tracking.complete,
+                )
+                == "recorded"
             )
-            changed = outcome == "recorded"
         if not changed:
             raise ToolError("Obligation changed; re-read before deciding whether to retry")
-        if not closing:
-            result["nyd_repeat"] = await crud.attempt_repeat(db, repo=target, pr_number=pr)
-            result["nyd_basis"] = nyd_basis
         return result | {"recorded": True}
 
     return await record(shared) if preview else await owned_call(shared, record)

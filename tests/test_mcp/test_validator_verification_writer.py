@@ -170,9 +170,8 @@ async def test_missing_mapping_does_not_prevent_recording_an_incomplete_attempt(
     assert row(path)["status"] == "open"
 
 
-async def test_a_recorded_not_yet_done_reports_whether_it_repeats_the_last_attempt(
-    recording, monkeypatch
-):
+@pytest.mark.parametrize("declared", [True, False, None])
+async def test_the_result_echoes_the_documents_no_progress(recording, monkeypatch, declared):
     from genesis.mcp.health import validator_writes
 
     path, _, config = recording
@@ -180,41 +179,13 @@ async def test_a_recorded_not_yet_done_reports_whether_it_repeats_the_last_attem
     monkeypatch.setattr(
         validator_writes, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, "E2E: run the timer")
     )
-    gap = {"kind": "not_yet_done", "detail": "not run", "command": "run timer"}
-    assert (await call(_doc(gaps=[gap])))["nyd_repeat"] == 0
-    assert (await call(_doc(gaps=[gap])))["nyd_repeat"] == 1
-    assert row(path)["nyd_repeat"] == 1
-    other = {**gap, "command": "run the other timer"}
-    assert (await call(_doc(gaps=[other])))["nyd_repeat"] == 0
-
-
-async def test_a_routing_re_record_reports_its_basis_and_carries_the_flag(
-    recording, monkeypatch
-):
-    from genesis.mcp.health import validator_writes
-
-    path, _, config = recording
-    config.with_suffix(".local.yaml").write_text("dry_run_only: false")
-    monkeypatch.setattr(
-        validator_writes, "gh_pr_metadata", lambda *a: PrMetadata(MERGE_SHA, "E2E: run the timer")
-    )
-    gap = {"kind": "not_yet_done", "detail": "not run", "command": "run timer"}
-    first = await call(_doc(gaps=[gap]), route=False)
-    assert first["tracking_complete"] is False
-    assert (first["nyd_repeat"], first["nyd_basis"]) == (0, "progress")
-    routed = await call(_doc(gaps=[gap]))
-    assert (routed["nyd_repeat"], routed["nyd_basis"]) == (0, "routing")
-    again = await call(_doc(gaps=[gap]))
-    assert (again["nyd_repeat"], again["nyd_basis"]) == (1, "repeat")
-    assert row(path)["nyd_repeat"] == 1
-
-
-async def test_a_preview_carries_a_null_nyd_repeat(recording):
-    _, _, config = recording
-    config.with_suffix(".local.yaml").write_text("dry_run_only: false")
-    gap = {"kind": "not_yet_done", "detail": "not run", "command": "run timer"}
-    result = await call(_doc(gaps=[gap]), dry_run=True)
-    assert result["recorded"] is False and result["nyd_repeat"] is None
+    over = {} if declared is None else {"no_progress": declared}
+    doc = _doc(gaps=[{"kind": "not_yet_done", "detail": "not run", "command": "run timer"}], **over)
+    result = await call(doc)
+    assert result["recorded"] and result["no_progress"] is bool(declared)
+    assert json.loads(row(path)["evidence"])["no_progress"] is bool(declared)
+    preview = await call(doc, dry_run=True)
+    assert preview["recorded"] is False and preview["no_progress"] is bool(declared)
 
 
 async def test_existing_mcp_close_stores_rechecks_without_a_new_caller_argument(recording):

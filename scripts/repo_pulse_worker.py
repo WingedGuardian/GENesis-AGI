@@ -441,11 +441,10 @@ def _print_next_for_validation(
     """The ONE open obligation a standing validator should work next, or why none.
 
     Candidates come from ``list_validation_candidates`` (not-yet-done, unless
-    its last attempt repeated the previous attempt's remaining steps inside the
-    re-attempt window; then never-attempted, then a parked row past its
-    re-attempt window; fail-intent never). This reader then asks GitHub, in
-    8-day windows stepping 7 days back from today, for each candidate's base
-    branch, merge commit and body, and ranks
+    its stored evidence declares ``no_progress`` and its last attempt is inside
+    the re-attempt window; then never-attempted, then a parked row past its
+    re-attempt window; fail-intent never). This reader then asks GitHub, in 8-day windows stepping 7 days back
+    from today, for each candidate's base branch, merge commit and body, and ranks
     within a tier: deployed with an ``E2E:`` plan, deployed without one, then
     deploy-unproven; newest merge first inside each.
 
@@ -526,7 +525,7 @@ def _print_next_for_validation(
         print(
             f"pr_verifications: no open row is eligible to pick ({open_total} open). "
             f"Failed rows are the owner's; parked rows, and not-yet-done rows whose last "
-            f"attempt repeated the one before it, wait out their re-attempt window."
+            f"attempt declared no progress, wait out their re-attempt window."
         )
         return
 
@@ -807,8 +806,8 @@ def main() -> None:
         "--next-for-validation",
         action="store_true",
         help="print the ONE open obligation a standing validator should work next "
-        "(not-yet-done, which waits 7 days only after an attempt that repeats the last "
-        "one's steps, then never-attempted, then parked past 7 days; deployed with an "
+        "(not-yet-done, which waits 7 days only when its evidence declares no_progress, "
+        "then never-attempted, then parked past 7 days; deployed with an "
         "E2E plan first, newest merge first) or why none, and exit — reads GitHub and "
         "git, writes nothing, fails closed",
     )

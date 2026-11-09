@@ -2142,8 +2142,7 @@ CREATE TABLE IF NOT EXISTS peer_grants (
             attempt_count     INTEGER NOT NULL DEFAULT 0,
             last_attempt_at   TEXT,
             last_attempt_note TEXT,
-            rechecks          TEXT,
-            nyd_repeat        INTEGER
+            rechecks          TEXT
         )
     """,
     # ── WS-2 sensor fabric (M9/M10) ──────────────────────────────────────

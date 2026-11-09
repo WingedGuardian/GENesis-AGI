@@ -243,7 +243,19 @@ SCHEMA_TEMPLATE = {
         {"kind": "accepted_limit", "target": "gaps/0",
          "rationale": "why this method limit needs no further work"},
     ],
+    "no_progress": False,
 }
+
+
+def _no_progress_line(at: str) -> str:
+    """When the picker offers a not-yet-done row whose document declares
+    ``no_progress`` again: ``at`` is the ``last_attempt_at`` this run just wrote."""
+    from datetime import datetime, timedelta
+
+    from genesis.db.crud.pr_verifications import REATTEMPT_DAYS
+
+    after = datetime.fromisoformat(at).astimezone(UTC) + timedelta(days=REATTEMPT_DAYS)
+    return f"declared no progress: offered again after {after.strftime('%Y-%m-%d %H:%M')} UTC"
 
 
 async def _close_schema_refusal(db, rechecks: list[dict]) -> str | None:
@@ -262,36 +274,6 @@ async def _close_schema_refusal(db, rechecks: list[dict]) -> str | None:
             "column is not present yet. Run the migration before closing. Nothing was written."
         )
     return None
-
-
-def _nyd_repeat_line(repeat: int | None, now: str, basis: str | None = None) -> str | None:
-    """When the picker offers a not-yet-done row again, from its ``nyd_repeat``.
-
-    ``basis`` is what ``record_attempt_detail`` returned. ``"routing"`` means this
-    write re-recorded an attempt whose tracking was pending, with the same steps:
-    the value was carried, so the line says that instead of claiming the steps
-    changed or repeated. None when no repeat was recorded (the column is absent,
-    or the document named no not_yet_done gap): the picker then applies no wait
-    either.
-    """
-    routing = basis == "routing"
-    if repeat is None:
-        return "same steps; routing update, not a new attempt" if routing else None
-    if not repeat:
-        if routing:
-            return "same steps; routing update, not a new attempt: offered again at once"
-        return "steps differ from the previous attempt: offered again at once"
-    from datetime import datetime, timedelta
-
-    from genesis.db.crud.pr_verifications import REATTEMPT_DAYS
-
-    after = datetime.fromisoformat(now).astimezone(UTC) + timedelta(days=REATTEMPT_DAYS)
-    lead = (
-        "same steps; routing update of an attempt that repeated the one before it"
-        if routing
-        else "repeat of the previous attempt"
-    )
-    return f"{lead}: offered again after {after.strftime('%Y-%m-%d %H:%M')} UTC"
 
 
 def _print_recheck_plan(rechecks: list[dict]) -> None:
@@ -446,7 +428,7 @@ async def _write(
                     print(f"  {len(rechecks)} recheck(s) stored on the closed row.")
                 return 0
 
-            outcome, nyd_basis = await crud.record_attempt_detail(
+            outcome = await crud.record_attempt(
                 db,
                 repo=target,
                 pr_number=pr_number,
@@ -456,15 +438,6 @@ async def _write(
                 evidence=payload,
                 tracking_pending=not tracking.complete,
             )
-            if outcome == "changed":
-                print(
-                    f"pr_verification: {target}#{pr_number} — changed. Another writer "
-                    f"recorded an attempt on this row while this one was being written, "
-                    f"so nothing was written. Re-read the row before deciding whether "
-                    f"to retry.",
-                    file=sys.stderr,
-                )
-                return 1
             if outcome != "recorded":
                 print(
                     f"pr_verification: {target}#{pr_number} — {outcome}. The row was "
@@ -481,11 +454,8 @@ async def _write(
                 f"pr_verification: {target}#{pr_number} STAYS OPEN — {verdict} recorded "
                 f"at {now}. The obligation is not discharged."
             )
-            if verdict == "not-yet-done":
-                repeat = await crud.attempt_repeat(db, repo=target, pr_number=pr_number)
-                line = _nyd_repeat_line(repeat, now, nyd_basis)
-                if line:
-                    print(f"  {line}")
+            if verdict == "not-yet-done" and doc.no_progress:
+                print(f"  {_no_progress_line(now)}")
             if verdict == "fail-intent":
                 print(
                     "  This is a FAILED verification: bring it to the user as a "
