@@ -78,6 +78,10 @@ an optional request-index action plan; existing one-action callers keep their
 original behavior and retain the parent qualification workflow.
 Ordinary CI discovers and skips the17 opt-in cases; any skip-ceiling adjustment
 must use the actual CI JUnit measurement rather than a developer-host count.
+Run42566419285 measured615skips including2xfails: exactly the parent population
+plus these17native ids, with no removed skips or changed reasons. Its65,730
+passing tests had no failures/errors; the old598ceiling alone failed the job.
+The615ceiling change still requires fresh CI against the final head and main.
 
 The zero-argument fake `record` tool can append only to its owned scratch sink.
 It sends a required boolean form through the typed MCP SDK `send_request` API,
@@ -99,6 +103,20 @@ approval authority. The unattended control is the fixture's pre-request check
 of the explicitly forwarded `GENESIS_CC_SESSION=1`; it does not establish that
 native Codex understands Genesis roles. Modern protocol and missing-capability
 refusal are local SDK/fake-session controls, outside the native17-case census.
+
+The isolated frontend advertises `openai/standard-form-input` at initialization
+and starts an ephemeral thread with `threadSource: "user"`. Codex0.166 enables
+the nonempty data-form exception only for a root user thread advertising that
+extension; approval metadata still excludes a request from that exception.
+See the pinned [thread manager](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/core/src/thread_manager.rs#L2632)
+and [policy routing](https://github.com/openai/codex/blob/rust-v0.166.0/codex-rs/codex-mcp/src/elicitation.rs#L590).
+These fixture declarations do not change a running user's frontend or policy.
+The first native experiment (run42566237032) passed15cases and failed2:
+its data control lacked those declarations, and the missing-content reader
+expected omission where native returned an empty object. The corrected reader
+requires the observed `accept` plus `{}` response, refusal and zero writes for
+that negative case. This failed run remains diagnostic evidence; a fresh complete
+native run is required to qualify the revised source.
 
 The frozen manifest binds source and both binary hashes, head/base, workflow
 run and attempt. Readback requires complete passed phases, raw request/response

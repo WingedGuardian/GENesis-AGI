@@ -134,6 +134,15 @@ def _check_case(case, root, evidence):
 def check_native_run(case, evidence):
     events = evidence["events"]
     require(events[-1] == {"closed": True}, "native stdout did not reach EOF")
+    initialization = [row["message"] for row in evidence["sent"]
+                      if row["message"].get("method") == "initialize"]
+    starts = [row["message"] for row in evidence["sent"]
+              if row["message"].get("method") == "thread/start"]
+    require(len(initialization) == len(starts) == 1
+            and same(initialization[0]["params"]["capabilities"], {
+                "experimentalApi": True, "extensions": {"openai/standard-form-input": {}}})
+            and starts[0]["params"]["threadSource"] == "user"
+            and starts[0]["params"]["ephemeral"] is True, "missing frontend form-input profile")
     thread, turns = evidence["thread"], evidence["turns"]
     count = 2 if case in {"approval_two_requests", "approval_stale_after_interrupt"} else 1
     require(isinstance(thread, str) and thread and len(turns) == len(set(turns)) == count
@@ -333,6 +342,10 @@ def check_server(case, root, evidence):
         elif case not in INTERRUPTED and case != "approval_eof":
             require([row["event"] for row in group] == ["entered", "requested", "response", "refused"], "negative fixture did not complete its refusal")
             expected = {key: value for key, value in response_for(case).items() if value is not None}
+            if case == "approval_missing_content":
+                # Native run 42566237032 normalized omitted accept content to
+                # an empty object. It still must refuse, with no physical write.
+                expected["content"] = {}
             require(same(group[2]["response"], expected) and normal[index]["at"] < group[2]["at"], "negative response changed in transport")
         else:
             tail = [row["event"] for row in group[2:]]

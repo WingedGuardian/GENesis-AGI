@@ -72,6 +72,13 @@ def golden(root, case):
                 "model_requests": [{}] * (count if interrupted or case == "approval_eof" else count * 2),
                 "trust": {"effective_config": {"approvals_reviewer": "user", "mcp_servers": {
                     "fixture": {"default_tools_approval_mode": "approve"}}}}}
+    evidence["sent"] = [
+        {"at": 20, "message": {"id": 1, "method": "initialize", "params": {
+            "capabilities": {"experimentalApi": True,
+                             "extensions": {"openai/standard-form-input": {}}}}}},
+        {"at": 30, "message": {"id": 2, "method": "thread/start", "params": {
+            "cwd": str(root), "ephemeral": True, "threadSource": "user"}}},
+    ]
     sinks = {"approval": [], "data": []}
 
     def snapshot(label, at):
@@ -118,7 +125,10 @@ def golden(root, case):
                 result = response_for(case)
                 evidence["sent"].append({"at": base + 140, "message": {
                     "id": index + 200, "result": result}, "synthetic_frontend": True})
-                server("response", 150, response={key: value for key, value in result.items() if value is not None})
+                response = {key: value for key, value in result.items() if value is not None}
+                if case == "approval_missing_content":
+                    response["content"] = {}
+                server("response", 150, response=response)
                 if positive:
                     name = "data" if case == "data_form_never" else "approval"
                     sinks[name].append({**common, "at": base + 160})
@@ -174,6 +184,43 @@ def test_complete_synthetic_raw_witnesses_are_readable(tmp_path, case):
     check_case(case, tmp_path, evidence)
 
 
+def test_missing_content_refuses_after_the_observed_native_empty_object_normalization(tmp_path):
+    evidence, sinks = golden(tmp_path, "approval_missing_content")
+    evidence["server"][2]["response"] = {"action": "accept", "content": {}}
+    persist(tmp_path, evidence, sinks)
+    check_case("approval_missing_content", tmp_path, evidence)
+    assert not (tmp_path / "approval-sink.jsonl").exists()
+
+
+@pytest.mark.parametrize("damage", ["absent", "capability", "origin", "persistent"])
+def test_missing_frontend_capability_and_user_origin_cannot_qualify(tmp_path, damage):
+    evidence, _ = golden(tmp_path, "data_form_never")
+    if damage == "absent":
+        evidence["sent"] = [row for row in evidence["sent"]
+                            if row["message"].get("method") not in {"initialize", "thread/start"}]
+    elif damage == "capability":
+        evidence["sent"][0]["message"]["params"]["capabilities"].pop("extensions")
+    elif damage == "origin":
+        evidence["sent"][1]["message"]["params"]["threadSource"] = "subagent"
+    else:
+        evidence["sent"][1]["message"]["params"]["ephemeral"] = False
+    with pytest.raises(ValueError, match="frontend.*profile"):
+        check_case("data_form_never", tmp_path, evidence)
+
+
+@pytest.mark.parametrize("response", [
+    {"action": "accept"}, {"action": "accept", "content": None},
+    {"action": "accept", "content": {"confirmed": True}},
+    {"action": "accept", "content": {}, "_meta": {"persist": "session"}},
+])
+def test_missing_content_normalization_does_not_allow_other_server_responses(tmp_path, response):
+    evidence, sinks = golden(tmp_path, "approval_missing_content")
+    evidence["server"][2]["response"] = response
+    persist(tmp_path, evidence, sinks)
+    with pytest.raises(ValueError, match="negative response"):
+        check_case("approval_missing_content", tmp_path, evidence)
+
+
 @pytest.mark.parametrize("damage", [
     "early_write", "late_write", "duplicate", "missing_ask", "wrong_turn", "bool_id", "unmarked",
     "default_true", "persistence", "model_reply", "missing_terminal", "survivor", "missing_start",
@@ -184,6 +231,7 @@ def test_semantic_damage_is_refused_even_after_artifacts_are_rehashed(tmp_path, 
     case = "approval_accept_true"
     evidence, sinks = golden(tmp_path, case)
     ask = evidence["events"][1]
+    reply = next(row for row in evidence["sent"] if row.get("synthetic_frontend"))
     wire = evidence["server"][1]["wire"]
     if damage == "early_write":
         sinks["approval"][0]["at"] = 139
@@ -197,15 +245,15 @@ def test_semantic_damage_is_refused_even_after_artifacts_are_rehashed(tmp_path, 
         ask["params"]["turnId"] = "foreign"
         evidence["observed"][0]["message"] = copy.deepcopy(ask)
     elif damage == "bool_id":
-        evidence["sent"][0]["message"]["id"] = True
+        reply["message"]["id"] = True
     elif damage == "unmarked":
         wire["params"].pop("_meta")
     elif damage == "default_true":
         wire["params"]["requestedSchema"]["properties"]["confirmed"]["default"] = True
     elif damage == "persistence":
-        evidence["sent"][0]["message"]["result"]["_meta"] = {"persist": "session"}
+        reply["message"]["result"]["_meta"] = {"persist": "session"}
     elif damage == "model_reply":
-        evidence["sent"][0].pop("synthetic_frontend")
+        reply.pop("synthetic_frontend")
     elif damage == "missing_terminal":
         evidence["events"] = [row for row in evidence["events"] if row.get("method") != "turn/completed"]
     elif damage == "survivor":
@@ -225,7 +273,7 @@ def test_semantic_damage_is_refused_even_after_artifacts_are_rehashed(tmp_path, 
     elif damage == "empty_snapshot":
         evidence["observations"][-1]["approval"] = None
     elif damage == "wrong_response":
-        evidence["sent"][0]["message"]["result"]["content"]["confirmed"] = 1
+        reply["message"]["result"]["content"]["confirmed"] = 1
     elif damage == "wrong_server_response":
         evidence["server"][2]["response"]["content"]["confirmed"] = 1
     elif damage == "missing_server_effect":

@@ -144,7 +144,7 @@ def test_native_elicitation(tmp_path, pinned, case):
                 evidence.update(events=driver.events, sent=driver.sent, observations=driver.observations,
                                 observed=driver.observed, driver_pid=driver.transport.process.pid)
                 driver.initialize()
-                started = driver.request("thread/start", {"cwd": str(tmp_path / "workspace"), "ephemeral": True}, 2)
+                started = driver.start_thread(tmp_path / "workspace")
                 evidence["started"] = started
                 assert started["approvalPolicy"] == ("never" if never else "on-request")
                 assert started["sandbox"]["type"] == ("dangerFullAccess" if never else "readOnly")

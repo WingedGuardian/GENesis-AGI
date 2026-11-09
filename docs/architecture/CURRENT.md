@@ -5216,6 +5216,10 @@ verified: 81bbdb0a9 2026-11-08
   reader. Proper approval metadata, data-form controls, request binding and
   physical sink ordering are tested independently; synthetic fixture results
   confer no production action authority or human-frontend qualification.
+  Its isolated frontend declares standard form input and a root user thread;
+  this permits the data-entry Never control without exempting proper approvals.
+  Initial native results were15passed/2failed; corrected expectations and client
+  declarations require a fresh complete run before qualification.
   Interactive native qualification records a Codex0.166.0 reference binary.
   The launcher warns on other recognizable versions and retains its startup
   inspection/refusal checks; those inspect state, not actual tool denial.

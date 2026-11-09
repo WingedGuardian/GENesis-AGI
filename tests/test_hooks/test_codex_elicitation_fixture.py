@@ -212,6 +212,43 @@ async def test_cancellation_while_waiting_never_appends(tmp_path):
     assert not (tmp_path / "approval-sink.jsonl").exists()
 
 
+def test_frontend_declares_form_input_and_user_origin_on_the_actual_requests(tmp_path):
+    class Transport:
+        def __init__(self):
+            self.events = []
+            self.packets = []
+
+        def initialize(self):
+            return {"legacy": True}
+
+        def send(self, method, params, request_id=None):
+            self.packets.append({"method": method, "params": params, "id": request_id})
+
+        def until(self, predicate, **kwargs):
+            event = {"id": self.packets[-1]["id"], "result": {"ok": True}}
+            self.events.append(event)
+            assert predicate(event)
+            return event
+
+    transport = Transport()
+    driver = ElicitationDriver(transport, tmp_path)
+    assert driver.initialize() == {"ok": True}
+    assert driver.start_thread(tmp_path) == {"ok": True}
+    assert transport.packets == [
+        {"id": 1, "method": "initialize", "params": {
+            "clientInfo": {"name": "genesis_native_fixture", "version": "1"},
+            "capabilities": {"experimentalApi": True,
+                             "extensions": {"openai/standard-form-input": {}}}}},
+        {"id": None, "method": "initialized", "params": {}},
+        {"id": 2, "method": "thread/start", "params": {
+            "cwd": str(tmp_path), "ephemeral": True, "threadSource": "user"}},
+    ]
+    assert [row["message"] for row in driver.sent] == [
+        {key: value for key, value in packet.items() if key != "id" or value is not None}
+        for packet in transport.packets
+    ]
+
+
 def test_frontend_writes_one_reply_and_keeps_shutdown_observations(tmp_path):
     class Transport:
         def __init__(self):

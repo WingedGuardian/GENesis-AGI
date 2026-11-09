@@ -18,7 +18,20 @@ class ElicitationDriver:
         self.consents = PendingRequests()
 
     def initialize(self):
-        return self.transport.initialize()
+        result = self.request("initialize", {
+            "clientInfo": {"name": "genesis_native_fixture", "version": "1"},
+            "capabilities": {"experimentalApi": True,
+                             "extensions": {"openai/standard-form-input": {}}},
+        }, 1)
+        self.send("initialized", {})
+        return result
+
+    def start_thread(self, cwd):
+        # Codex 0.166 thread_manager.rs:2641-2645 requires both the client
+        # extension and a root user thread for data entry under Never.
+        return self.request("thread/start", {
+            "cwd": str(cwd), "ephemeral": True, "threadSource": "user",
+        }, 2)
 
     def send(self, method, params, request_id=None):
         packet = {"method": method, "params": copy.deepcopy(params)}
