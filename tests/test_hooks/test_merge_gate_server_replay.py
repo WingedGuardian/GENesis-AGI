@@ -45,6 +45,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from tests.test_hooks.fake_gh_replay import LOG_ENV, STATE_ENV, UNROUTED
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -698,6 +700,45 @@ def _gh_holders(path: Path) -> bool:
         ):
             return True
     return False
+
+
+def _fake_gh(tmp_path: Path, argv: list[str]) -> subprocess.CompletedProcess:
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps(_green_state()), encoding="utf-8")
+    env = {**os.environ, STATE_ENV: str(state), LOG_ENV: str(tmp_path / "log.jsonl")}
+    return subprocess.run(
+        [sys.executable, str(_FAKE_GH), *argv], env=env, capture_output=True, text=True
+    )
+
+
+_COMMENTS = f"repos/{REPO}/issues/{PR}/comments"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        # No field that would change the recorded key: only the method can refuse these.
+        ["api", "-X", "POST", _COMMENTS],
+        ["api", _COMMENTS, "-f", "per_page=100"],
+        ["api", "-X", "PATCH", _COMMENTS],
+        ["pr", "merge", PR, "--repo", REPO, "--squash"],
+        ["pr", "comment", PR, "--repo", REPO, "--body", "x"],
+    ],
+    ids=["post", "fields-without-get", "patch", "pr-merge", "pr-comment"],
+)
+def test_the_fake_refuses_every_write(tmp_path, argv):
+    """A write the gate starts must fail loudly, never get a recorded answer: the
+    endpoint above has one for GET, so only the method keeps this from answering."""
+    proc = _fake_gh(tmp_path, argv)
+    assert proc.returncode == 97, proc.stdout
+    assert UNROUTED in proc.stderr
+
+
+def test_the_same_endpoint_read_with_get_is_answered(tmp_path):
+    """The control for the refusals above: the endpoint itself is routed."""
+    proc = _fake_gh(tmp_path, ["api", "-X", "GET", _COMMENTS])
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)
 
 
 def test_the_child_environment_carries_nothing_from_the_test_process(tmp_path, monkeypatch):
