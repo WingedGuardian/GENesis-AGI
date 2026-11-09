@@ -391,8 +391,9 @@ Ordinary CI keeps its existing runtime dependency ranges. The shared-only
 protocol and shared CLI suites require the exact versions admitted by
 `genesis.mcp.shared_http._settings.require_qualified_stack`; an unsupported
 ordinary environment explicitly skips the eleven SDK-specific modules before
-SDK imports. The caller-path policy and read-location API tests remain ordinary
-tests; the policy also runs in the qualified protocol selection.
+SDK imports. The caller-path policy, read-location API and ordinary preparation
+tests remain ordinary tests; policy and preparation also run in the qualified
+protocol selection.
 Pure configuration and missing/later-version refusal tests remain ordinary
 tests in `tests/test_mcp/test_shared_http_settings.py`.
 
@@ -404,8 +405,8 @@ qualification refusal becomes a collection error in this job. No production
 version, feature, credential or rollout gate changes.
 
 The protocol step names admission, policy, actual HTTP, shared CLI, explicit
-forwarder and forwarder HTTP-error modules, the caller-path suites, and the
-SDK-independent credential reader tests. The CLI checks start all four real factories with disposable local
+forwarder and forwarder HTTP-error modules, the caller-path suites, ordinary
+health/memory preparation, and SDK-independent credential reader tests. The CLI checks start all four real factories with disposable local
 dependencies, exercise catalog/authentication/read calls over TCP, and observe
 SDK shutdown and registered-owner drainage before resource closure on SIGTERM.
 They also exercise path/abstract readiness datagrams after bind and cleanup on
@@ -429,9 +430,21 @@ this does not certify an installed older release. Actual wrappers additionally
 refuse lost scope before orchestrator/runtime construction. Ordinary API tests
 cover cache states, copied originals, batch spelling/symlinks, tree keys/HOME
 guards and real PDF extraction with pool shutdown.
+Ordinary preparation checks enter the actual health/memory lifespans through
+the public in-memory transport, compare complete catalogs, preserve integer and
+string handler IDs, and read seeded SQLite data. They cover both protocol eras,
+external/validator discovery and direct-call refusal, degraded/missing DB and
+memory read-pool success/fallback/closure. The ordinary launchers remain runtime
+consumers of these preparations and retain their separate stdio regression suite.
+For local pre-change comparison, `GENESIS_ORDINARY_BOOTSTRAP_ORACLE` selects a
+retained launcher script only inside the disposable capsule; the candidate copy
+is restored after each completed child. Without it, CI compares the current
+bootstrap and direct prepared consumer against the independent names/data checks.
+`GENESIS_ORDINARY_PREPARATION_EVIDENCE_DIR` optionally preserves synthetic child
+receipts outside pytest's successful-temp-directory cleanup.
 They neither contact a native client/provider nor activate routing.
 Its fresh JUnit report must pass `scripts/check_skip_ceiling.py` with zero skips
-and a floor of 340 cases. Installation, collection, test or report-check failure
+and a floor of 356 cases. Installation, collection, test or report-check failure
 fails the job; missing or filtered workflow runs do not qualify a PR. Closing
 checks its actual head/base result. Ordinary skip-budget changes require observed
 skip identities; this workflow does not raise that budget automatically.

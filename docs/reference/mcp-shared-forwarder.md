@@ -12,6 +12,17 @@ remain required before it can replace a registration. The shared catalog
 deliberately excludes local tools. Native-client/provider qualification and
 matched memory measurements remain activation gates.
 
+The ordinary launcher exposes internal `_prepare_health` and `_prepare_memory`
+helpers for managed consumers. Its existing `_bootstrap_health` and
+`_bootstrap_memory` wrappers immediately run the returned module server with
+their original transport options. Preparation is once per process: existing
+profile middleware and degraded health setup remain eager; DB-backed resources,
+read pools, bookmark policy and cleanup stay in the ordinary lifespan. Missing
+memory DB still refuses, while health keeps its degraded mode. This preparation
+seam does not itself implement the local/shared union. In particular, ordinary
+health cleanup still owns process-global browser cleanup; any later composition
+must settle all local browser work before that lifespan exits.
+
 ## Explicit invocation
 
 In the qualified environment, with a configured/running service and its existing

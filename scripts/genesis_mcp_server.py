@@ -25,6 +25,10 @@ import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from fastmcp import FastMCP
 
 logger = logging.getLogger(__name__)
 
@@ -251,13 +255,16 @@ async def _init_standalone_health_actions(db) -> None:
         )
 
 
-def _bootstrap_health(transport_kwargs: dict, *, external_profile: str | None = None) -> None:
-    """Bootstrap and run the health MCP server.
+def _prepare_health(*, external_profile: str | None = None) -> FastMCP:
+    """Prepare the existing health server without starting its transport.
 
     Uses StandaloneHealthDataService which reads ~/.genesis/status.json
     instead of requiring live GenesisRuntime objects. When the DB exists,
     opens an aiosqlite connection via FastMCP's lifespan hook so that
     heartbeat queries and event-based tools work.
+
+    Like ordinary bootstrap, this prepares the module server once per process;
+    profile middleware and degraded no-DB initialization remain eager.
     """
     from genesis.mcp.health_mcp import init_health_mcp, mcp
     from genesis.mcp.standalone_health import StandaloneHealthDataService
@@ -274,8 +281,7 @@ def _bootstrap_health(transport_kwargs: dict, *, external_profile: str | None = 
         tracker = ProviderActivityTracker()
         init_health_mcp(svc, activity_tracker=tracker)
         clear_mcp_crash("health")
-        _run_mcp(mcp, transport_kwargs)
-        return
+        return mcp
 
     @asynccontextmanager
     async def _lifespan(server) -> AsyncIterator[None]:
@@ -310,17 +316,24 @@ def _bootstrap_health(transport_kwargs: dict, *, external_profile: str | None = 
             await db.close()
 
     mcp._lifespan = _lifespan
-    _run_mcp(mcp, transport_kwargs)
+    return mcp
 
 
-def _bootstrap_memory(
-    transport_kwargs: dict, *, process_pending_bookmarks: bool = True,
+def _bootstrap_health(transport_kwargs: dict, *, external_profile: str | None = None) -> None:
+    """Prepare and run the ordinary health server."""
+    _run_mcp(_prepare_health(external_profile=external_profile), transport_kwargs)
+
+
+def _prepare_memory(
+    *, process_pending_bookmarks: bool = True,
     external_profile: str | None = None,
-) -> None:
-    """Bootstrap and run the memory MCP server.
+) -> FastMCP | None:
+    """Prepare the existing memory server without starting its transport.
 
-    Requires Qdrant + Ollama for embeddings. Opens aiosqlite connection
-    inside the MCP event loop via FastMCP's lifespan hook.
+    Opens the ordinary database, vector and embedding dependencies inside
+    the MCP event loop via FastMCP's lifespan hook.
+    Returns None on the existing missing-DB refusal. Preparation is once per
+    process; resource initialization still belongs to the returned lifespan.
     """
     from genesis.env import qdrant_url
     from genesis.mcp.memory_mcp import mcp
@@ -428,7 +441,19 @@ def _bootstrap_memory(
         return
 
     mcp._lifespan = _lifespan
-    _run_mcp(mcp, transport_kwargs)
+    return mcp
+
+
+def _bootstrap_memory(
+    transport_kwargs: dict, *, process_pending_bookmarks: bool = True,
+    external_profile: str | None = None,
+) -> None:
+    """Prepare and run the ordinary memory server when its DB exists."""
+    mcp = _prepare_memory(
+        process_pending_bookmarks=process_pending_bookmarks, external_profile=external_profile,
+    )
+    if mcp is not None:
+        _run_mcp(mcp, transport_kwargs)
 
 
 def _bootstrap_recon(transport_kwargs: dict) -> None:
