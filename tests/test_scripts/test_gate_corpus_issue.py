@@ -72,6 +72,9 @@ def test_the_first_finding_opens_one_issue(tmp_path):
     assert gi.TITLE in gh.writes[0] and "--repo" in gh.writes[0]
     body = gh.writes[0][gh.writes[0].index("--body") + 1]
     assert "x ESCAPED" in body and URL in body
+    # An issues event the workflow token causes starts no premise-gate run, so
+    # the label has to come with the create (#4182).
+    assert gh.writes[0][gh.writes[0].index("--label") + 1] == "premises-missing"
 
 
 def test_a_similar_title_is_not_this_issue(tmp_path):

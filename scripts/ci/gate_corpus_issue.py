@@ -26,6 +26,8 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 TITLE = "Gate defect corpus: the weekly run found a test owed"
+#: Applied at creation: premise-gate never runs on an issue this workflow opens.
+LABEL = "premises-missing"
 _MARKER = "<!-- gate-corpus-findings:"
 #: The public can open an issue with this title or post this marker, so only what the
 #: workflow's own token wrote counts. `gh` names that account differently by endpoint.
@@ -88,7 +90,9 @@ def file_findings(path: Path, repo: str, run_url: str, gh: Runner = _gh) -> str:
     body = _body(findings, run_url)
     issue = _open_issue(repo, gh)
     if issue is None:
-        gh(["issue", "create", "--repo", repo, "--title", TITLE, "--body", body])
+        # The label comes with the create: an issues event this workflow's token
+        # causes starts no other workflow run, so premise-gate never sees it.
+        gh(["issue", "create", "--repo", repo, "--title", TITLE, "--body", body, "--label", LABEL])
         return "opened an issue"
     number = issue["number"]
     if _already_said(repo, number, body, gh):
