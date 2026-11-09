@@ -23,6 +23,8 @@ from tests import _live_writes as audit
 @pytest.fixture()
 def home(tmp_path, monkeypatch):
     """A fake home with a deployed checkout and ~/.genesis; a sibling temp dir."""
+    if not audit._S.installed:
+        pytest.skip(f"the audit is not armed here ({audit._S.disarmed or 'not installed'})")
     fake = tmp_path / "home"
     (fake / "genesis").mkdir(parents=True)
     (fake / ".genesis").mkdir()
@@ -153,6 +155,65 @@ def test_a_sqlite_file_is_a_write_but_read_only_and_memory_are_not(home):
     sqlite3.connect(f"file:{db}?mode=ro", uri=True).close()
     sqlite3.connect(":memory:").close()
     assert {h for h in _hits() if h[1] == "sqlite connect"} == set()
+
+
+@pytest.mark.parametrize(
+    ("query", "read_only"),
+    [
+        # Measured against CPython's sqlite3: which of these opened without writing.
+        ("mode=ro", True),
+        ("mode=memory", True),
+        ("immutable=1", True),
+        ("immutable=TRUE", True),
+        ("immutable=on", True),
+        ("immutable=2", True),
+        ("immutable=1&immutable=0", True),
+        ("journal_mode=rollback", False),
+        ("cache=shared&nomode=ro", False),
+        ("immutable=0", False),
+        ("immutable=no", False),
+        ("immutable=", False),
+        ("immutable", False),
+        ("immutable=0&immutable=1", False),
+        ("MODE=ro", False),
+    ],
+)
+def test_a_sqlite_uri_is_read_only_only_by_its_exact_parameters(query, read_only):
+    assert audit._read_only_uri(query) is read_only
+
+
+def test_an_immutable_uri_to_a_missing_file_is_a_write(home):
+    """SQLite creates the missing file even with immutable=1 (measured)."""
+    db = home / "genesis" / "new.db"
+    sqlite3.connect(f"file:{db}?immutable=1", uri=True).close()
+    assert ("the deployed checkout (~/genesis)", "sqlite connect", "new.db") in _hits()
+    audit._S.hits.clear()
+    sqlite3.connect(f"file:{db}?immutable=1", uri=True).close()  # now it exists
+    assert {h for h in _hits() if h[1] == "sqlite connect"} == set()
+
+
+def test_a_relative_os_open_read_of_a_credential_file_is_recorded(home, monkeypatch):
+    (home / "genesis" / "secrets.env").write_text("K=v\n")
+    monkeypatch.chdir(home / "genesis")
+    os.close(os.open("secrets.env", os.O_RDONLY))
+    assert (
+        "credential file read (relative os.open; judged against cwd)",
+        "read",
+        "secrets.env",
+    ) in _hits()
+
+
+def test_a_write_to_this_checkout_outside_the_home_is_recorded(home, tmp_path, monkeypatch):
+    """The checkout need not sit under the passwd home (a container mounts it
+    elsewhere); its class root is consulted before the home filter."""
+    checkout = tmp_path / "workspace" / "repo"
+    checkout.mkdir(parents=True)
+    monkeypatch.setattr(
+        audit._S, "classes", ((os.path.realpath(checkout), "this checkout"), *audit._S.classes)
+    )
+    (checkout / "state.json").write_text("{}")
+    (tmp_path / "workspace" / "beside.txt").write_text("x")  # neither home nor checkout
+    assert _hits() == {("this checkout", "write", "state.json")}
 
 
 def test_the_allowed_places_are_not_recorded(home, tmp_path):
@@ -326,7 +387,11 @@ def test_install_without_a_known_real_home_stays_disarmed(monkeypatch):
     assert hooks == [] and not audit._S.installed
     # Off is said out loud, so an empty summary never reads as "no writes".
     lines = []
-    reporter = type("R", (), {"write_line": lambda self, line, **kw: lines.append(line)})()
+    reporter = type(
+        "R",
+        (),
+        {"config": object(), "write_line": lambda self, line, **kw: lines.append(line)},
+    )()
     audit.pytest_terminal_summary(reporter)
     assert lines == ["live writes: disarmed (no real home known)"]
 
@@ -471,6 +536,110 @@ def test_writes_into_a_fake_home(tmp_path):
     _live_writes._S.allowed_roots = ()
     (tmp_path / "f").write_text("x")
 """
+
+
+def test_an_xdist_run_reports_the_workers_writes(tmp_path):
+    """CI runs the suite on xdist workers: their hits must reach the controller's
+    summary and report, which a worker's own summary never does."""
+    pytest.importorskip("xdist")
+    (tmp_path / "conftest.py").write_text(_SUBRUN_CONFTEST)
+    for name in ("test_one.py", "test_two.py"):  # --dist=loadfile: one file per worker
+        (tmp_path / name).write_text(_SUBRUN_TESTS)
+    report = tmp_path / "report.tsv"
+    repo = Path(__file__).resolve().parent.parent
+    env = {
+        **os.environ,
+        "PYTHONPATH": f"{repo}{os.pathsep}{repo / 'src'}",
+        "GENESIS_LIVE_WRITES_REPORT": str(report),
+    }
+    env.pop("PYTEST_CURRENT_TEST", None)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "-n",
+            "2",
+            "--dist=loadfile",
+            str(tmp_path / "test_one.py"),
+            str(tmp_path / "test_two.py"),
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    text = out.stdout + out.stderr
+    assert out.returncode == 0, text
+    lines = report.read_text().splitlines()
+    assert sorted(line.split("\t")[0].split("::")[0] for line in lines) == [
+        "test_one.py",
+        "test_two.py",
+    ], text
+    assert "live writes: writes outside the test's temp dirs" in text
+    assert "no report from xdist worker" not in text
+
+
+def test_a_worker_hands_over_an_undecodable_path_intact(monkeypatch):
+    """The handoff crosses xdist's channel, which refuses a str that is not
+    UTF-8 encodable: the path must arrive as it was recorded."""
+    gateway_base = pytest.importorskip("execnet.gateway_base")
+    key = ("t::a", "~/.genesis", "write", os.fsdecode(b"/h/bad-\xff-name"))
+    monkeypatch.setattr(audit._S, "hits", {key: None})
+    monkeypatch.setattr(audit._S, "disarmed", "")
+    config = type("C", (), {"workeroutput": {}})()
+    audit.pytest_sessionfinish(type("S", (), {"config": config})(), 0)
+    sent = gateway_base.loads(gateway_base.dumps(config.workeroutput))  # the channel
+    monkeypatch.setattr(audit._S, "hits", {})
+    monkeypatch.setattr(audit._S, "merged_workers", set())
+    monkeypatch.setattr(audit._S, "unreported", [])
+    gateway = type("G", (), {"id": "gw0"})()
+    audit.pytest_testnodedown(type("N", (), {"gateway": gateway, "workeroutput": sent})(), None)
+    assert list(audit._S.hits) == [key] and audit._S.unreported == []
+
+
+def test_a_worker_that_never_reported_is_named(monkeypatch):
+    monkeypatch.setattr(audit._S, "merged_workers", set())
+    monkeypatch.setattr(audit._S, "unreported", [])
+    monkeypatch.setattr(audit._S, "hits", {})
+    gateway = type("G", (), {"id": "gw3"})()
+    audit.pytest_testnodedown(type("N", (), {"gateway": gateway, "workeroutput": {}})(), "crashed")
+    audit.pytest_testnodedown(type("N", (), {"gateway": gateway, "workeroutput": {}})(), "crashed")
+    assert audit._S.unreported == ["gw3 (crashed)"]  # reported down twice, named once
+
+
+def test_the_summary_iterates_a_snapshot_of_the_hits(tmp_path, monkeypatch):
+    """A thread the run left behind may still record during the summary; the
+    summary must not iterate the live dict (that raises and fails the run)."""
+
+    class Racing(dict):
+        """Another thread records a hit as soon as anything iterates the dict."""
+
+        def __iter__(self):
+            it = super().__iter__()
+            self[("t::late", "~/.genesis", "write", f"/late{len(self)}")] = None
+            return it
+
+    monkeypatch.setattr(audit._S, "installed", True)
+    monkeypatch.setattr(audit._S, "unreported", [])
+    monkeypatch.setattr(audit._S, "hits", Racing({("t::a", "~/.genesis", "write", "/x"): None}))
+    monkeypatch.setenv("GENESIS_LIVE_WRITES_REPORT", str(tmp_path / "report.tsv"))
+    lines = []
+    reporter = type(
+        "R",
+        (),
+        {
+            "config": type("C", (), {})(),
+            "section": lambda self, *a, **k: None,
+            "write_line": lambda self, line, **k: lines.append(line),
+        },
+    )()
+    audit.pytest_terminal_summary(reporter)  # must not raise
+    assert (tmp_path / "report.tsv").read_text() == "t::a\t~/.genesis\twrite\t/x\n"
 
 
 def test_a_run_reports_writes_without_failing_the_test(tmp_path):
