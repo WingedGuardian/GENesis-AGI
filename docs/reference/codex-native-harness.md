@@ -67,6 +67,55 @@ execution. Native runs use the contained workflow; the older opt-in invocation
 below describes the inherited harness mechanics, not authorization to run it on
 a live install.
 
+## Separate MCP elicitation experiment
+
+`codex-elicitation.yml` adds a separate17-case, app-server-only experiment on
+the same pinned package and containment. It extends the parent image rather than
+installing another native runtime. Its closed census, capture plugin, manifest
+and reader are independent of the inherited111-case qualification; neither
+reader accepts the other's population. The shared deterministic provider gains
+an optional request-index action plan; existing one-action callers keep their
+original behavior and retain the parent qualification workflow.
+Ordinary CI discovers and skips the17 opt-in cases; any skip-ceiling adjustment
+must use the actual CI JUnit measurement rather than a developer-host count.
+
+The zero-argument fake `record` tool can append only to its owned scratch sink.
+It sends a required boolean form through the typed MCP SDK `send_request` API,
+with Codex's proper approval metadata and no persistent-grant option. Only an
+explicit accept with exactly `confirmed: true` can append an approval row.
+The synthetic frontend binds the observed native request id, thread and turn,
+consumes it once, and retires pending requests on interruption or shutdown.
+The nonce identifies the invocation and displayed action; it is not an echoed
+secret and cannot detect an old boolean deliberately re-enveloped under a new
+valid request id. A nullable native `turnId` is recorded but refuses this
+during-turn experiment, rather than inventing a turn association.
+
+The census covers true/false/decline/cancel/malformed responses, foreign and
+duplicate ids, interruption, EOF, two fresh requests, a stale reply after an
+interrupted turn, proper approval under Never, and fixture-local unattended
+refusal. Two separate data-form controls exercise the `Context.elicit(bool)`
+route under Never and empty-schema automatic acceptance. Data entry is not
+approval authority. The unattended control is the fixture's pre-request check
+of the explicitly forwarded `GENESIS_CC_SESSION=1`; it does not establish that
+native Codex understands Genesis roles. Modern protocol and missing-capability
+refusal are local SDK/fake-session controls, outside the native17-case census.
+
+The frozen manifest binds source and both binary hashes, head/base, workflow
+run and attempt. Readback requires complete passed phases, raw request/response
+provenance, negotiated legacy2025-06-18 capability, actual native policy,
+pre-response and post-retirement sink bytes, write ordering and owned-child
+retirement. Modified, missing, duplicate, stale or partial witnesses refuse
+qualification. Source observations or passing local fake-session tests are not
+native compatibility measurements. Read the actual workflow and downloaded raw
+artifact readback before claiming that the experiment passed.
+
+Even a complete result reports `production_ready: false` and human frontend
+behavior as unmeasured. This builds no real review dispatcher, approval store,
+live MCP profile, host agent execution or provider inference. An owner-operated
+Codex frontend with a supported approval interface is a separate final check;
+a Claude/Genesis terminal cannot certify that UI. Production action binding and
+fresh budget rechecks remain separate work.
+
 ## Inherited opt-in harness
 
 Run the opt-in integration file on a Unix host with Codex and the Genesis Python dependencies installed:

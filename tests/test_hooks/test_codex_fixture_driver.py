@@ -70,6 +70,39 @@ def test_explicit_approval_survives_start_response_order(early):
     assert json.loads(driver.process.stdin.getvalue().splitlines()[-1])["id"] == "approval"
 
 
+@pytest.mark.parametrize("mode", ["default", "empty_item", "scripted", "no_actions"])
+def test_fixture_provider_scripted_actions_preserve_default_and_empty_items(mode):
+    import urllib.request
+
+    from tests.test_hooks.native_codex import fixture_provider
+
+    first, second = {"type": "function_call", "id": "first"}, {"type": "function_call", "id": "second"}
+    item = {} if mode == "empty_item" else first
+    options = {"action_plan": {1: first, 3: second} if mode == "scripted" else {}}
+    if mode in {"default", "empty_item"}:
+        options = {}
+    with fixture_provider(item, **options) as (url, requests):
+        outputs = []
+        for n in range(4):
+            request = urllib.request.Request(  # noqa: S310 - URL from the owned localhost fixture.
+                url + "/responses", data=json.dumps({"probe": n}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(request) as reply:  # noqa: S310 - Same fixed localhost URL.
+                events = [json.loads(line[6:]) for line in reply.read().decode().splitlines()
+                          if line.startswith("data: ")]
+            outputs.append(events[-1]["response"]["output"][0])
+        assert len(requests) == 4
+    if mode == "scripted":
+        assert [outputs[i] for i in (0, 2)] == [first, second]
+        assert [outputs[i]["type"] for i in (1, 3)] == ["message", "message"]
+    elif mode == "no_actions":
+        assert [row["type"] for row in outputs] == ["message"] * 4
+    else:
+        assert outputs[0] == item
+        assert [row["type"] for row in outputs[1:]] == ["message"] * 3
+
+
 @pytest.mark.parametrize("replay_at", ["never", "resume_only", "first_close", "resume", "close", "close_request"])
 def test_resume_measurement_detects_repeated_action(tmp_path, monkeypatch, replay_at):
     """Exercise the real measurement with a cached replay and no provider request."""
