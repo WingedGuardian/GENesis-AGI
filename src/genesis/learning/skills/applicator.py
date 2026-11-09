@@ -246,6 +246,12 @@ class SkillApplicator:
                 call_site_id="33_skill_refiner",
                 messages=[{"role": "user", "content": prompt}],
             )
+            if not result.success or not result.content:
+                logger.warning(
+                    "Validation LLM call got no usable response (%s), defaulting to not validated",
+                    result.error or "empty content",
+                )
+                return False
             data = json.loads(result.content)
             return bool(data.get("approved", False))
         except Exception:

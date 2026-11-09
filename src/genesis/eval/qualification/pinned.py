@@ -345,6 +345,15 @@ def _response_identity(raw, response_headers):
     }
 
 
+def model_identities(spec):
+    """Exact gateway, backend and receipt pins; only absent pins use legacy IDs."""
+    values = (spec.get("model"), spec.get("backend_model", spec.get("model")),
+              spec.get("receipt_model", spec.get("model")))
+    if any(not isinstance(value, str) or not value.strip() for value in values):
+        raise LocalFailure("invalid frozen model identities")
+    return values
+
+
 def _observed_identity(observation, spec):
     """Keep field-specific conflicting facts unresolved in existing accounting fields.
 
@@ -358,9 +367,11 @@ def _observed_identity(observation, spec):
         # receipt-only observations can account expense, never qualify a route.
         return {"model": observation.get("model", observation.get("response_model")),
                 "upstream": observation.get("upstream")}
-    models = [raw.get("model"), *(item.get("model") for item in selected)]
+    model, backend_model, _ = model_identities(spec)
+    models = [(raw.get("model"), model),
+              *((item.get("model"), backend_model) for item in selected)]
     providers = [raw.get("provider"), *(item.get("provider") for item in selected)]
-    wrong_models = [value for value in models if value is not None and value != spec["model"]]
+    wrong_models = [value for value, expected in models if value is not None and value != expected]
     wrong_providers = [value for value in providers if value is not None and value != spec["receipt_provider"]]
     return {
         "model": wrong_models or observation.get("response_model", observation.get("model")),
@@ -372,6 +383,7 @@ def _observed_identity(observation, spec):
 
 def verify_routing(observation, spec):
     """Qualify the documented gateway route, never infer backend parameter execution."""
+    _, backend_model, _ = model_identities(spec)
     raw, metadata, available, selected = _route_facts(observation)
     headers = observation.get("response_headers", {})
     if not isinstance(headers, dict) or headers.get("x-openrouter-cache-status") not in (None, "MISS"):
@@ -392,7 +404,7 @@ def verify_routing(observation, spec):
         raise LocalFailure("routing metadata does not verify one unchanged pinned gateway attempt")
     endpoint = selected[0]
     if (
-        endpoint.get("model") != spec["model"]
+        endpoint.get("model") != backend_model
         or endpoint.get("provider") != spec["receipt_provider"]
         or observation.get("response_provider") != endpoint["provider"]
         or ("provider" in raw and raw["provider"] != endpoint["provider"])
@@ -402,7 +414,7 @@ def verify_routing(observation, spec):
         attempts = metadata["attempts"]
         if (
             not isinstance(attempts, list) or len(attempts) != 1 or not isinstance(attempts[0], dict)
-            or attempts[0].get("model") != spec["model"]
+            or attempts[0].get("model") != backend_model
             or attempts[0].get("provider") != spec["receipt_provider"]
             or type(attempts[0].get("status")) is not int or attempts[0]["status"] != 200
         ):
@@ -783,6 +795,10 @@ async def reconcile(journal, attempt: str, *, transport=None, association=None, 
     row = journal.attempt(attempt)
     spec = row["spec"]
     binding = journal.expected_manifest["binding"].get("transports", {}).get(spec["alias"], {})
+    _, _, receipt_model = model_identities(spec)
+    if ((binding and model_identities(spec) != model_identities(binding))
+            or (not binding and any(key in spec for key in ("backend_model", "receipt_model")))):
+        raise LocalFailure("reconciliation model identities differ from frozen transport")
     mode = frozen_credential_mode(spec)
     if (mode != frozen_credential_mode(binding)
             or (credential_mode is not None and credential_mode != mode)):
@@ -861,7 +877,7 @@ async def reconcile(journal, attempt: str, *, transport=None, association=None, 
         )
         if (
             data.get("id") != generation
-            or data.get("model") != spec["model"]
+            or data.get("model") != receipt_model
             or data.get("provider_name") != display
         ):
             raise LocalFailure("billing GET identity differs from frozen request")
@@ -869,7 +885,7 @@ async def reconcile(journal, attempt: str, *, transport=None, association=None, 
             identity_fields = _observed_identity(observation, spec)
             if any(value is not None and value != spec[name] for name, value in identity_fields.items()):
                 raise LocalFailure("retained routing identity contradicts billing settlement")
-        evidence.update(model=data["model"], upstream=spec["upstream"], charge=data["total_cost"])
+        evidence.update(model=spec["model"], upstream=spec["upstream"], charge=data["total_cost"])
     except (ValueError, KeyError, TypeError) as exc:
         evidence["error"] = failure_message(exc)
         # Invalid evidence is still durable; Journal refuses settlement.
@@ -1007,6 +1023,7 @@ class PinnedRouter:
             canonical(binding.get(k)) != canonical(v) for k, v in expected.items()
         ):
             raise LocalFailure("transport differs from the frozen campaign binding")
+        identities = model_identities(binding)
         mode = frozen_credential_mode(binding)
         selected_mode = credential_mode if credential_mode is not None else ("dedicated" if dispatch else mode)
         if selected_mode != mode:
@@ -1034,6 +1051,7 @@ class PinnedRouter:
                 or spec["generation_namespace"] != "openrouter"
                 or spec.get("credential_fingerprint") != self.fingerprint
                 or frozen_credential_mode(spec) != mode
+                or model_identities(spec) != identities
                 or not isinstance(spec.get("receipt_provider"), str)
                 or not spec["receipt_provider"].strip()
                 or not isinstance(spec.get("provider_identity_evidence"), str)

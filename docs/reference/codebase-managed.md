@@ -861,7 +861,7 @@ This storage and admission contract does not run either indexer, lift production
 disablement or qualify the unfinished runner/recovery paths. Disposable native
 and production acceptance remain separate gates.
 
-## Captured source diagnostics
+## Captured startup and source diagnostics
 
 `python3 -I scripts/lib/code_intel_source.py describe runner` captures the finite
 Python and shell source closure from the primary checkout, checks those bytes
@@ -880,12 +880,42 @@ standard input is replaced with `/dev/null` before helper assembly. A sealed
 descriptor preserves bytes and does not authenticate a producer or authorize a
 provider launch. No captured source is persisted as recovery permission.
 
-This is an explicit read-only diagnostic and a preparation API. Actual queued
-runner/watchdog execution from the captured shell buffers, supervised recovery
-and automatic readiness remain separate integration work. The command neither
-opens the queue nor activates or runs either indexer. Run it from the deployed
-primary checkout after its source has landed; a linked development worktree
-does not establish production identity or resource capacity.
+The `describe` command neither opens the queue nor activates or runs either
+indexer. Run it from the deployed primary checkout after its source has landed;
+a linked development worktree does not establish production identity or resource
+capacity.
+
+The service now enters captured `shell runner runner` startup, whose queue, availability
+and entry helpers use the held source buffers. Captured Bash ignores inherited
+startup files, shell functions and shell options. The runner-to-entry handoff
+preserves only its canonical runner-lock descriptor; missing, foreign or
+competing lock identity refuses. Scope/watchdog definitions are included in the
+source closure. Physical queued supervision and positive automatic readiness
+remain separate integration work; this startup path preserves the readiness
+fence and does not activate either provider.
+
+Existing units that invoke `scripts/code_intel_runner.sh` remain supported.
+An authorized full update through `scripts/update.sh` rerenders the unit with
+the new source entry and explicit runner role. A code-only deployment does not
+install those new unit arguments.
+
+Service startup uses `/` as its working directory and locates the checkout from
+the absolute source entry path. Native indexers retain their explicit repository
+working directories. Both ordinary renderers quote the complete PATH assignment
+and preserve literal home, venv and Node-tool paths, including spaces, quotes,
+backslashes, dollar signs and percent signs. This does not add write access for
+custom locations outside the existing sandbox allowlist.
+
+The queued-worker API can receive an immutable native environment. It freezes
+values without replacing the process environment; only `INVOCATION_ID` is
+resolved from the actual registered scope and must match the reporter's control
+environment. Current settings, managed paths, native pin, lifecycle and resource
+admission checks still apply before readiness and native execution. Standalone
+callers retain their existing environment behavior. The optional private runtime
+capsule transports closed top-level objects but supplies no launch or recovery
+authority: source-only queue/shell/availability roles refuse runtime-bearing
+capsules, and diagnostics never print their values. Full owner/monitor wiring
+and supervised recovery remain unfinished and separately qualified.
 
 ## Verification
 

@@ -28,7 +28,8 @@ def db():
 
 
 @pytest.fixture()
-def store(embedding_provider, qdrant, db):
+def store(embedding_provider, qdrant, db, monkeypatch):
+    monkeypatch.setattr("genesis.memory.entity_resolution.load_aliases", lambda: {})
     return MemoryStore(
         embedding_provider=embedding_provider,
         qdrant_client=qdrant,
