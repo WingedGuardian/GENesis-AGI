@@ -53,6 +53,8 @@ def _hits():
 
 
 def test_the_audit_is_armed():
+    if audit._S.disarmed:
+        pytest.skip(f"the audit is disarmed here: {audit._S.disarmed}")
     assert audit._S.installed
 
 
@@ -210,6 +212,203 @@ def test_attempts_that_change_nothing_are_not_writes(home):
         os.rmdir(g / "full")  # not empty: refused
     os.close(os.open(g / "lock", os.O_CREAT | os.O_RDONLY))  # reopened, unchanged
     assert _hits() == set()
+
+
+def test_refused_mkdir_rmdir_remove_and_rmtree_are_not_writes(home):
+    """Each fails in the kernel and changes nothing: mkdir of an existing file,
+    rmdir of a file, unlink of a directory, rmtree of a file."""
+    g = home / ".genesis"
+    (g / "plain").write_text("x")
+    (g / "adir").mkdir()
+    audit._S.hits.clear()
+    with pytest.raises(FileExistsError):
+        os.mkdir(g / "plain")
+    with pytest.raises(NotADirectoryError):
+        os.rmdir(g / "plain")
+    with pytest.raises(OSError):
+        os.remove(g / "adir")
+    with pytest.raises(OSError):
+        shutil.rmtree(g / "plain")
+    assert _hits() == set()
+    assert (g / "plain").read_text() == "x" and (g / "adir").is_dir()
+
+
+def test_mkdir_of_an_existing_file_is_not_a_write(home):
+    (home / ".genesis" / "plain").write_text("x")
+    audit._S.hits.clear()
+    with pytest.raises(FileExistsError):
+        os.mkdir(home / ".genesis" / "plain")
+    assert _hits() == set()
+
+
+def test_a_relative_os_open_truncating_an_existing_file_is_a_write(home, monkeypatch):
+    """No dir_fd, cwd under the home: truncating an existing file there is a real
+    write, judged against the cwd like a new one."""
+    target = home / "genesis" / "tracked.py"
+    target.write_text("x = 1\n")
+    monkeypatch.chdir(home / "genesis")
+    audit._S.hits.clear()
+    os.close(os.open("tracked.py", os.O_WRONLY | os.O_TRUNC))
+    assert target.read_text() == ""
+    assert _hits() == {
+        ("relative os.open (dir_fd unknown; judged against cwd)", "write", "tracked.py")
+    }
+
+
+def test_a_relative_os_open_that_only_reopens_an_existing_file_is_not_a_write(home, monkeypatch):
+    (home / "genesis" / "lock").write_text("")
+    monkeypatch.chdir(home / "genesis")
+    audit._S.hits.clear()
+    os.close(os.open("lock", os.O_CREAT | os.O_RDONLY))
+    assert _hits() == set()
+
+
+def test_a_credential_file_read_under_another_name_is_recorded(home, tmp_path, monkeypatch):
+    """Through a symlink and a hard link whose names say nothing: recorded."""
+    secrets = home / "genesis" / "secrets.env"
+    secrets.write_text("K=v\n")
+    st = os.stat(secrets)
+    monkeypatch.setattr(audit._S, "credential_inodes", frozenset({(st.st_dev, st.st_ino)}))
+    link = tmp_path / "allowed" / "current-creds"
+    link.symlink_to(secrets)
+    hard = home / "elsewhere" / "copy-of-creds"
+    os.link(secrets, hard)
+    audit._S.hits.clear()
+    link.read_text()
+    assert ("credential file read", "read", "secrets.env") in _hits()
+    audit._S.hits.clear()
+    hard.read_text()
+    assert ("credential file read", "read", "copy-of-creds") in _hits()
+
+
+def test_install_records_the_credential_files_by_inode(tmp_path, monkeypatch):
+    """The inode set is what lets a read under another name be recognised."""
+    fake = tmp_path / "home"
+    (fake / "genesis").mkdir(parents=True)
+    (fake / "genesis" / "secrets.env").write_text("K=v\n")
+    st = os.stat(fake / "genesis" / "secrets.env")
+    from tests import _live_fence
+
+    monkeypatch.setattr(audit._S, "installed", False)
+    monkeypatch.setattr(audit.sys, "addaudithook", lambda hook: None)
+    monkeypatch.setattr(_live_fence._S, "installed", True)
+    monkeypatch.setattr(_live_fence._S, "real_home", str(fake))
+    for name in ("real_home", "allowed_roots", "allowed_files", "classes", "credential_files"):
+        monkeypatch.setattr(audit._S, name, getattr(audit._S, name))
+    monkeypatch.setattr(audit._S, "credential_inodes", frozenset())
+    config = type("C", (), {"option": type("O", (), {"basetemp": None})()})()
+    audit.install(config)
+    assert (st.st_dev, st.st_ino) in audit._S.credential_inodes
+
+
+def test_install_without_a_known_real_home_stays_disarmed(monkeypatch):
+    """A numeric UID with no passwd entry must not abort the run.
+
+    The fence resolves the real home (falling back to an absolute HOME); when it
+    has none, there is no home to judge writes against, so the audit stays off.
+    """
+    from tests import _live_fence
+
+    hooks = []
+    monkeypatch.setattr(audit._S, "installed", False)
+    monkeypatch.setattr(audit._S, "disarmed", "")
+    monkeypatch.setattr(audit.sys, "addaudithook", hooks.append)
+    config = type("C", (), {"option": type("O", (), {"basetemp": None})()})()
+    # Armed fence that found no usable home.
+    monkeypatch.setattr(_live_fence._S, "installed", True)
+    monkeypatch.setattr(_live_fence._S, "real_home", None)
+    audit.install(config)
+    # No fence: no passwd entry and a relative HOME.
+    monkeypatch.setattr(_live_fence._S, "installed", False)
+    monkeypatch.setattr(audit.pwd, "getpwuid", lambda uid: (_ for _ in ()).throw(KeyError(uid)))
+    monkeypatch.setenv("HOME", "relative/home")
+    audit.install(config)
+    assert hooks == [] and not audit._S.installed
+    # Off is said out loud, so an empty summary never reads as "no writes".
+    lines = []
+    reporter = type("R", (), {"write_line": lambda self, line, **kw: lines.append(line)})()
+    audit.pytest_terminal_summary(reporter)
+    assert lines == ["live writes: disarmed (no real home known)"]
+
+
+def test_install_without_the_fence_takes_passwd_then_an_absolute_home(tmp_path, monkeypatch):
+    """The passwd entry wins over HOME: an inner pytest inherits the outer
+    closure's test HOME, and judging writes against it would hide them."""
+    from tests import _live_fence
+
+    passwd_home, env_home = tmp_path / "a", tmp_path / "b"
+    passwd_home.mkdir()
+    env_home.mkdir()
+    monkeypatch.setattr(audit.sys, "addaudithook", lambda hook: None)
+    monkeypatch.setattr(_live_fence._S, "installed", False)
+    monkeypatch.setattr(_live_fence._S, "real_home", None)
+    for name in ("real_home", "allowed_roots", "allowed_files", "classes", "credential_files"):
+        monkeypatch.setattr(audit._S, name, getattr(audit._S, name))
+    monkeypatch.setattr(audit._S, "credential_inodes", frozenset())
+    monkeypatch.setattr(audit._S, "disarmed", "")
+    monkeypatch.setenv("HOME", str(env_home))
+    config = type("C", (), {"option": type("O", (), {"basetemp": None})()})()
+
+    monkeypatch.setattr(audit._S, "installed", False)
+    monkeypatch.setattr(
+        audit.pwd, "getpwuid", lambda uid: type("P", (), {"pw_dir": str(passwd_home)})()
+    )
+    audit.install(config)
+    assert audit._S.installed and audit._S.real_home == os.path.realpath(passwd_home)
+
+    # No passwd entry: an absolute HOME arms it.
+    monkeypatch.setattr(audit._S, "installed", False)
+    monkeypatch.setattr(audit.pwd, "getpwuid", lambda uid: (_ for _ in ()).throw(KeyError(uid)))
+    audit.install(config)
+    assert audit._S.installed and audit._S.real_home == os.path.realpath(env_home)
+    assert not audit._S.disarmed
+
+
+def test_a_report_with_an_undecodable_path_never_fails_a_run(tmp_path):
+    """A path whose bytes are not UTF-8 is written to the report as its bytes."""
+    (tmp_path / "conftest.py").write_text(_SUBRUN_CONFTEST)
+    (tmp_path / "test_sub.py").write_text(_SUBRUN_UNDECODABLE)
+    report = tmp_path / "report.tsv"
+    repo = Path(__file__).resolve().parent.parent
+    env = {
+        **os.environ,
+        "PYTHONPATH": f"{repo}{os.pathsep}{repo / 'src'}",
+        "GENESIS_LIVE_WRITES_REPORT": str(report),
+    }
+    env.pop("PYTEST_CURRENT_TEST", None)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            str(tmp_path / "test_sub.py"),
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    text = out.stdout + out.stderr
+    assert out.returncode == 0, text
+    assert b"/bad-\xff-name" in report.read_bytes(), text
+
+
+_SUBRUN_UNDECODABLE = """
+import os
+
+from tests import _live_writes
+
+
+def test_writes_an_undecodable_name(tmp_path):
+    _live_writes._S.real_home = str(tmp_path)
+    _live_writes._S.allowed_roots = ()
+    with open(os.path.join(os.fsencode(tmp_path), b"bad-\\xff-name"), "w") as f:
+        f.write("x")
+"""
 
 
 def test_an_unwritable_report_path_never_fails_a_run(tmp_path):

@@ -158,3 +158,20 @@ Every live acceptance and retained replay rechecks the raw routing evidence.
 Expense settlement and failure acknowledgement cannot qualify a cached,
 transformed, retried or otherwise invalid response. Recovery remains explicit
 GET-only; rejected answers never trigger another completion.
+
+## Exact model namespaces
+
+A transport and each scheduled attempt can freeze `backend_model` and
+`receipt_model` separately from the gateway `model`. The public response model
+and routing `requested` field must still match `model`. The selected endpoint
+and optional attempt-history model must match `backend_model`; the generation
+GET model must match `receipt_model`. Each absent optional pin defaults to
+`model`, preserving strict historical behavior. Present null, blank or nonstring
+pins refuse. Transport and attempt effective identities must agree before
+credentials are accessed.
+
+Use evidence for each exact identifier; no suffix stripping or inferred alias
+mapping occurs. Raw response and receipt identities remain in the journal; only
+verified identities map to the canonical gateway model for accounting. Changing
+pins changes the consent-bound plan. Old stopped campaigns are not migrated,
+acknowledged or resent by this feature.

@@ -44,6 +44,38 @@ phase: 10
 skill_type: workflow
 ---
 
+## Tracking is a separate completion gate
+
+Before selecting a batch, read `docs/reference/validator-tracking.md` and run its
+preflight. Discover the actual tools exposed by this client; do not infer a private
+writer from an ordinary Codex connection, silently activate another profile, or
+register an external client as a Genesis session.
+
+For EACH row: persist valid measurement evidence immediately, classify every
+concern, file/reuse its safely redacted public issue (private only for the concrete
+disclosure harm in CLAUDE.md), read the task back, and add structured `tracking`.
+Free-text `findings[].disposition`, chat, a run log, or a verification row does not
+prove routing. Receipts carry the exact live task excerpt plus your rationale for
+how it covers this concern. Verify meaning as well as existence; quote matching
+does not decide semantic relevance for you. Each private receipt states the actual
+harm and why redaction/public-task/private-evidence cannot avoid it.
+
+Both writers retain the measurement verdict when routing is pending and leave the
+row OPEN. CLI exit **4 means measurement recorded or previewed, tracking pending**;
+re-read before retrying. MCP exposes `recorded`, `tracking_complete`, `tracking`
+and `would_close` separately. A preview stores nothing. Never call the batch
+handled until the selected-row checkpoint reports complete tracking.
+
+Checkpoint after each row, before moving batches, and before a completion report.
+**Honor a user pause immediately:** stop selecting new work, preserve the current
+measurement, run a selected-row `checkpoint --pause`, and report outstanding
+targets/receipts. Incomplete routing is not permission to refuse a pause. A missing
+private writer affects genuinely private items only; continue safe public filing.
+The historical audit reads OPEN and CLOSED rows, including gap-carrying legacy
+records. It reports debt for manual classification and never rewrites closed
+evidence. Search existing issues first; historical missing structured links are
+not proof that no issue exists.
+
 ## Running under Codex
 
 This section applies to the separately qualified interactive Codex validator.
@@ -91,15 +123,17 @@ whose ground truth had gaps.
 **Never deploy, change a service, push, merge or fix code.** The deploy recipes
 and Host-Deploy Gate below describe the Claude operator's responsibilities.
 For Codex, a row waiting on deployment is NOT-YET-DONE: leave it open and note
-the required deploy in the run log/private follow-up. Do not invent deployment
+the required deploy in a safely described public task and checkpoint (private
+only for unavoidable disclosure harm). Do not invent deployment
 evidence or mark cannot-verify just because this client cannot deploy.
 
 Public issues and issue/PR timeline comments go through
 `scripts/file_tracker_issue.py`; comments use --comment-on <number> with a
 --body-file. Use body files and the canonical shell restrictions, never raw gh
-or API writes. Privacy/security findings stay local in eligible private
-follow-ups and the owner conversation. A successful scan is not permission to
-publish private content. Validators do not request development reviews or
+or API writes. Public-by-default applies to security-related and install-local
+findings too. Redact sensitive supporting evidence; keep the whole task private
+only under CLAUDE.md's concrete disclosure-harm test. A successful scan is not
+permission to publish private content. Validators do not request development reviews or
 trigger paid agents; the filer is not a review-budget gate.
 
 **A native guard denial stops that action, not the run.** Do not retry it
@@ -267,7 +301,8 @@ RESOURCE.**
 - **Can you name a real actor and a real resource?** "a box without the graph
   client installed", "another install", "after the next deploy runs", "a clean
   venv". → **Reachable. This is ordinary work: FILE it.** A repo-owned defect is
-  a GitHub issue; state local to one box is a `follow_up_create` row. Scrub
+  a GitHub issue, including state local to one box. Use a private follow-up only
+  when useful public wording necessarily causes concrete disclosure harm. Scrub
   anything install-identifying first — an issue carries technical detail only.
 - **Does naming the actor require inventing a hypothetical?** Hardware nobody
   has and nobody has reason to get; an event that may never occur. → **Genuinely
@@ -313,8 +348,10 @@ Closing stores it on the same row, and **Rechecks due** surfaces it for later
 measurement without reopening the row. A repo defect still gets an issue. An
 event that may never occur is the cannot-verify case above and is not filed.
 
-A security defect is the one thing never filed publicly before it is fixed —
-private record plus a local row, whoever owns it.
+Security-related work is public by default too. Withhold the whole item only
+when a useful redacted public description necessarily enables concrete exploit,
+cost or harm, or reveals protected information; record that specific reason and
+why public wording with private evidence cannot avoid it.
 
 ---
 

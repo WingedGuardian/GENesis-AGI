@@ -26,13 +26,18 @@ if [ -z "${HOME:-}" ]; then
     export HOME
 fi
 
-SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+if declare -F _ci_source >/dev/null; then
+    SCRIPT_DIR="${_CI_ORIGIN%/*}"
+else
+    SCRIPT_DIR="$(unset CDPATH; cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+fi
 # CODE_INTEL_ENTRYPOINT is a test seam (inject a fake that returns a chosen rc);
 # it defaults to the real locked+capped entrypoint.
 ENTRYPOINT="${CODE_INTEL_ENTRYPOINT:-$SCRIPT_DIR/lib/code_intel_index.sh}"
 MARKER_PY="$SCRIPT_DIR/lib/index_marker.py"
 # shellcheck source=lib/proc_pressure.sh
-. "$SCRIPT_DIR/lib/proc_pressure.sh"
+if declare -F _ci_source >/dev/null; then _ci_source proc_pressure.sh || exit 76
+else . "$SCRIPT_DIR/lib/proc_pressure.sh"; fi
 
 GENESIS_HOME="${GENESIS_HOME:-$HOME/.genesis}"
 LOCK_DIR="$GENESIS_HOME/locks"
@@ -53,7 +58,10 @@ _log() {
         "$(date -Iseconds 2>/dev/null || date)" "$*" >> "$LOG_FILE" 2>&1
 }
 
-_marker() { python3 "$MARKER_PY" "$@"; }
+_marker() {
+    if declare -F _ci_queue >/dev/null; then _ci_queue "$@"
+    else python3 "$MARKER_PY" "$@"; fi
+}
 
 # Checked machine transport. _WIRE is replaced only after the child has exited;
 # the list snapshot is separately retained before claim/escalation reuse it.
@@ -124,6 +132,11 @@ _settle_exit() {
 # Check at each queue boundary; the sentinel can change while a tick runs.
 # Unresolvable configuration defers CBM, as the entrypoint does.
 _cbm_disabled() {
+    if declare -F _ci_available >/dev/null; then
+        ! _ci_available "$HOME/.genesis/config/codebase-managed.json" "$1" \
+            "${CODE_INTEL_INDEX_PERSISTENCE:-true}" >/dev/null 2>> "$LOG_FILE"
+        return $?
+    fi
     ! /usr/bin/python3 -I "$SCRIPT_DIR/codebase_managed.py" \
         --config "$HOME/.genesis/config/codebase-managed.json" available --repo "$1" \
         --persistence "${CODE_INTEL_INDEX_PERSISTENCE:-true}" \
@@ -178,7 +191,12 @@ elif [ "$lock_rc" -ne 0 ]; then
     exit 75
 fi
 
-if [ ! -f "$ENTRYPOINT" ] || [ ! -f "$MARKER_PY" ]; then
+if declare -F _ci_entry >/dev/null; then
+    if [ "$ENTRYPOINT" != "$_CI_EXPECTED_ENTRY" ]; then
+        _log "captured runner requires its captured entrypoint — deferring"
+        exit 75
+    fi
+elif [ ! -f "$ENTRYPOINT" ] || [ ! -f "$MARKER_PY" ]; then
     _log "entrypoint or marker helper missing — deferring without reading the queue"
     exit 75
 fi
@@ -317,8 +335,13 @@ for ((i=0; i<${#_MARKERS[@]}; i+=6)); do
     fi
 
     _log "indexing $repo (tools=$provider mode=$run_mode)"
-    CODE_INTEL_INDEX_LOCK_SKIP_RC=75 \
-        bash "$ENTRYPOINT" "$repo" "$provider" "$run_mode" >> "$LOG_FILE" 2>&1
+    if declare -F _ci_entry >/dev/null; then
+        CODE_INTEL_INDEX_LOCK_SKIP_RC=75 \
+            _ci_entry "$repo" "$provider" "$run_mode" >> "$LOG_FILE" 2>&1
+    else
+        CODE_INTEL_INDEX_LOCK_SKIP_RC=75 \
+            bash "$ENTRYPOINT" "$repo" "$provider" "$run_mode" >> "$LOG_FILE" 2>&1
+    fi
     rc=$?
     case "$rc" in
         0)

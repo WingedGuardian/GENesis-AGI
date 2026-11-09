@@ -21,6 +21,8 @@
 #      (WS-5 Discord observe-only gate log; bounds the shadow store)
 #   8. Retention prune of session_ledger_shadow_* (>45d) → scripts/prune_ledger_shadow.py
 #      (session-manager PR-3 ambient extractor shadow store; runs + events)
+#   8a. Retention prune of client_tool_calls (default 180d) → scripts/prune_client_tool_calls.py
+#      (labelled-client tool-call log, e.g. owner-mode Codex)
 #   8b. Retention prune of ~/.genesis/sessions/<id>/ (>60d, whole dirs)
 #      (per-session state + SessionStart context mirrors; age far exceeds any
 #      live session, which rewrites last_prompt_time every prompt)
@@ -92,6 +94,8 @@ fi
 
 # shellcheck source=scripts/lib/tmp_liveness.sh
 . "$SCRIPT_DIR/lib/tmp_liveness.sh"
+# shellcheck source=lib/secrets_path.sh
+. "$SCRIPT_DIR/lib/secrets_path.sh"
 
 # prune_tmp DIR [AGE_MIN] — delete direct children of DIR not modified for more
 # than AGE_MIN minutes (default: the historical `-mtime +7`), EXCLUDING
@@ -591,6 +595,8 @@ rotate_mcp_logs() {
 # one place on the box that holds every credential.
 _load_store_knob() {
     local key="$1"
+    # The checkout's file, not the resolver's: the hook-audit stores' writers
+    # read their directories from it, and this must read the same one.
     local file="${2:-$REPO_DIR/secrets.env}"
     local line=""
     local val
@@ -609,13 +615,16 @@ _load_store_knob() {
 
 # The Camoufox cache the browser tools use can come from secrets.env, which this
 # unit does not load: the provisioner installs where XDG_CACHE_HOME there points.
-# It is read by name from the file the runtime reads (genesis.env.secrets_path:
-# SECRETS_PATH with a leading ~ expanded, else the checkout's), in a subshell so it
-# reaches no later step. The engine override the decider reads itself.
+# It is read by name from the file the runtime reads (genesis_secrets_path, the
+# twin of genesis.env.secrets_path), in a subshell so it reaches no later step.
+# The engine override the decider reads itself.
 prune_camoufox_engines_step() {
     (
-        secrets="${SECRETS_PATH:-$REPO_DIR/secrets.env}"
-        _load_store_knob XDG_CACHE_HOME "${secrets/#\~/$HOME}"
+        # An unresolvable override loads nothing: never the checkout's file instead.
+        local _secrets
+        if _secrets="$(genesis_secrets_path "$REPO_DIR")"; then
+            _load_store_knob XDG_CACHE_HOME "$_secrets"
+        fi
         prune_browser_engines "${XDG_CACHE_HOME:-$HOME/.cache}/camoufox"
     )
 }
@@ -803,6 +812,10 @@ maintenance_main() {
     echo "--- ledger shadow retention prune (>45d) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_ledger_shadow.py" --days 45 \
         || echo "prune_ledger_shadow exited $?"
+
+    echo "--- client tool-call log retention prune (default window) ---"
+    "$VENV_PY" "$REPO_DIR/scripts/prune_client_tool_calls.py" \
+        || echo "prune_client_tool_calls exited $?"
 
     echo "--- repo pulse retention prune (>45d) ---"
     "$VENV_PY" "$REPO_DIR/scripts/prune_repo_pulse.py" --days 45 \
