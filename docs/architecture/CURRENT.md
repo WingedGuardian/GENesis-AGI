@@ -1420,7 +1420,7 @@ drop folder, web search/fetch, recon jobs, and the research pipeline.
 ```yaml subsystem-map
 entry: intake-research
 modules: [knowledge, inbox, research, recon, web, pipeline]
-verified: b0867170e 2026-10-02
+verified: a6528dab2 2026-11-09
 ```
 
 - **knowledge/**: orchestrator + manifest + tree index. Content-hash gate
@@ -1439,11 +1439,22 @@ verified: b0867170e 2026-10-02
   precedence footer. A missing, unreadable, or empty component fails the scan
   closed without caching a partial prompt; a successful composite is reused
   byte-for-byte by the approval route, CC invocation, and prompt-version hash.
+  Evaluations request one model-reported Evidence section per item, preserving
+  source claims, acquired quotations or acquisition limits, current mechanism/
+  user evidence, and labelled uncertainty. The existing optional output-memory
+  extractor is unchanged and may still lose qualifications or introduce an
+  unsupported claim; evaluator evidence is not mechanical source grounding or
+  a guarantee of memory correctness. Reuse and
+  deliverable-backed BUILD/adoption boundaries are described in
+  `docs/reference/inbox-evaluation-quality.md`.
   The phase order is prompt preflight → recover pending → resume approval →
   detect → create → dispatch;
   `approval_key_stable=True` (ONE
   site-level approval key). Resume consumes an approved grant before releasing
-  its awaiting row. A lookup/retirement failure preserves that row and defers
+  its awaiting row. Resume state transitions require the row to retain its
+  original `processing` status and exact awaiting-approval marker; a concurrent
+  claim, completion, supersession or new approval marker wins over the stale
+  transition. A lookup/retirement failure preserves that row and defers
   all new/modified/retry site work for the scan, while healthy approved siblings
   can resume after successful consumption. The refresh path folds parked files into the
   batch so approvals fire once (#914). A pending approval is HELD until the
@@ -1833,8 +1844,22 @@ the shared banner is not an assertion about all concurrent sessions.
   and a finite assembly API: Python and shell buffers match one immutable Git
   tree, and Python compilation/hashing use those same bytes with original origins.
   Private sealed handoff checks its caller-bound digest before entry compilation;
-  cached local modules refuse. This is not yet the queued shell/watchdog caller
-  and supplies no new launch, recovery or automatic-readiness authority.
+  cached local modules refuse. Service startup enters captured runner and
+  entry helpers, including the queue/availability and scope/watchdog closure;
+  only the canonical runner lock crosses its entry handoff. Optional queued
+  inputs freeze the native environment with one registered invocation slot,
+  preserving process-control environment and managed config/path/admission
+  checks. Private runtime transport is not launch authority. The physical
+  owner, monitor and recovery caller remain separate, and automatic readiness
+  stays fenced.
+  The private CBM reporter consumes its bounded startup ACK before worker entry,
+  verifies its actual live parent and original scope, and rechecks ownership at
+  registration and native intent. Original counter baselines and fresh startup
+  OOM observations survive the handoff; either hierarchical or local sampled
+  kills refuse startup. The existing private output carries framed control
+  data, with provider output routed to logging. Watchdog/CPU/IO policy binds
+  the same source identity. Physical owner integration, GitNexus's runtime
+  adapter and native qualification remain separate gates.
   `index_marker_recovery.py` adds explicit transaction-only schema-5 storage,
   original-owner control completion, persistent provider holds and an exact
   terminal/control/source acceptance-watermark reader on the same queue.
@@ -2040,8 +2065,10 @@ the shared banner is not an assertion about all concurrent sessions.
   skills and MCP servers like a terminal and registers as an owner foreground
   session. The host updates its initialized model and checkpoints existing rows
   after disconnect only when the recorded child is confirmed dead; failures
-  remain visible and leave the existing reaper as fallback. Phase 0 host:
-  `scripts/live_agent_cli.py`; only the `owner_cli`
+  remain visible and leave the existing reaper as fallback.
+  Hosts can declare `output_surface="speech"`; identity injection
+  then requests direct spoken replies without terminal model/effort headers.
+  Phase 0 host: `scripts/live_agent_cli.py`; only the `owner_cli`
   initiator may call `turn()` until model-initiated turns pass the
   autonomous-CLI approval gate. Turns the session injects itself
   (background-task notifications, peer or scheduled messages) still run, as in
@@ -2743,8 +2770,10 @@ verified: c712f1bde 2026-11-06
   idle past a threshold, so a ready-but-forgotten PR is re-raised instead of
   rotting. Sibling of the PR-watch surface above (external PR *changes*); this
   one is age-based and passive. `session_awareness/repo_pulse*.py`.
-- **Post-merge verification obligations** (shipped; producer automatic, consumer
-  manual-invoke only — nothing dispatches a validator yet — issue #1718):
+- **Post-merge verification obligations** (shipped; producer automatic; consumer
+  the standing validator session, owner-started and self-paced per the
+  validating-merges skill's "Standing mode", or any manual validator; nothing
+  dispatches one automatically — issue #1718):
   the pulse worker's verification lane opens one `pr_verifications` row per
   MERGED PR, so "run the E2E after merge" survives the merge instead of living
   in someone's memory. A documentation-only diff is auto-closed with the reason
@@ -3991,8 +4020,18 @@ entry: platform-data
 modules: [db, runtime, resilience, observability, security, codebase,
           restore, util, infra_profile, onboarding, hostmetrics, trash, payments,
           env.py, secrets_location.py, _config_overlay.py, caller_context.py, caller_credentials.py]
-verified: 58ff9f47c 2026-11-07
+verified: 5a3de4eee 2026-11-08
 ```
+
+Scoped verification: the caller identity boundary only. Shared mode refuses
+process-environment identity through both accessors, including after environment
+drift; validated requests use `caller_context()`. Legacy reads remain raw and
+per-call. This does not requalify the remaining platform/data subsystems or
+activate shared MCP.
+
+A 2026-11-07 verification at the same commit covers the request-ownership
+prerequisite below; the other platform descriptions retain their individually
+cited verification dates.
 
 `observability` seeds `cc_fallback` idle and reads its content-free last-run
 provider/model/outcome. Failed historical attempts render as a warning, not an
@@ -4191,6 +4230,15 @@ Refusing a proposed update preserves a previously valid opt-in.
   foreground-only construction allocates neither. Background admission is
   separate from foreground capacity; recall queue pressure falls back inline
   while shutdown refuses new resource work (source checked 2026-11-06).
+  `begin_draining`/explicit-grace `drain` extend the same registry; `close`
+  initiates zero-grace shutdown and concurrent callers join the first policy.
+  `run_in_thread` retains actual synchronous completion independently of an
+  asyncio proxy, including joined-child work, before DB finalization/admission
+  release. Ambiguous submission/canceled-before-start work retains its claim and
+  fails shutdown; dependent provider closure requires positive settlement.
+  `run_resource_thread` preserves ordinary legacy thread cancellation. These are
+  internal prerequisites; memory-consumer migration and shared factory wiring
+  remain separate. Lease budgets bound database connections, not executor items.
   Activity, embedding-heartbeat, deferred-recall, bookmark and proactive tasks use it;
   legacy connections keep ordinary task scheduling. Internal
   `initialize_request_service` bootstraps memory/health/recon/outreach with
@@ -5177,6 +5225,11 @@ verified: 81bbdb0a9 2026-11-08
   evidence, and returns control to the user without native approval or Genesis
   lifecycle registration. It does not enforce the future reflection gates or
   cover arbitrary indirect execution. See `docs/reference/codex-review-stop.md`.
+  The shared budget accepts issue-comment churn between its two reads only when
+  both complete policy projections are successful and identical. Counts,
+  confirmation consumption, findings, reflection keys, marks and reviewer
+  attribution participate; real policy changes still return unknown, and an
+  exhausted budget still requires approval. Head/review/ancestry checks remain.
   A separate, inactive `scripts/hooks/codex-validator-adapter` translates native
   validator calls to the existing guards concurrently. It requires an absolute
   Bash cd/exit opener terminated by a newline, confines patches to validator
@@ -5227,13 +5280,19 @@ verified: 81bbdb0a9 2026-11-08
   It supplies no service/timer wiring, copied credentials, deploy authority or
   lifecycle enrollment. See `docs/reference/codex-validator-launcher.md` for
   operator commands, source inventory, permitted MCP startup effects and races.
-  Codex has a separate external-client adapter in `.codex/config.toml`: it
-  starts the existing standalone health and memory MCP servers through a
-  launcher that scrubs inherited Genesis session identity, provenance,
-  supervision, slot, and trace context, then allowlists health plus explicit
-  recall tools. The launcher also selects `--external-client`; memory initialization
-  then disables processing of Claude's pending plan-bookmark file. Ordinary
-  Genesis memory initialization keeps that processing enabled by default.
+  Codex's project config (`.codex/config.toml`) starts all four Genesis MCP
+  servers through `scripts/codex_owner_mcp.py`, which reuses the external
+  launcher's environment scrub and main-checkout resolution. An unmarked Codex
+  run is the owner's: the ordinary bootstrap, every tool, labelled
+  `GENESIS_CALLER_PROFILE=codex` (calls logged to `client_tool_calls`); read
+  tools are pre-approved in the config and every other tool prompts, new ones
+  included. A run Genesis starts unattended (`util/codex_cli.py` sets
+  `GENESIS_CC_SESSION=1`, forwarded through `env_vars`) gets
+  `--external-client` and the health/recall floor, and no outreach or recon
+  server. Memory initialization skips Claude's pending plan-bookmark file for
+  both: the external profile through `process_pending_bookmarks=False`, a
+  labelled caller per call. Ordinary Claude Code memory initialization keeps
+  that processing enabled.
   The standalone server enforces the `external` or `validator` tool profile
   during discovery and direct calls. External retains its health/recall floor;
   validator additionally admits memory_store, eligible private follow-up CRUD

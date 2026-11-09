@@ -196,6 +196,59 @@ def test_lost_scope_work_is_untrusted_at_the_memory_writers(shared_service):
     assert session_origin_from_env() == ORIGIN_EXTERNAL_UNTRUSTED
 
 
+@pytest.mark.parametrize("in_request", [False, True])
+@pytest.mark.parametrize("bare_thread", [False, True])
+def test_explicit_env_accessor_cannot_restore_shared_process_authority(
+    shared_service, monkeypatch, in_request, bare_thread,
+):
+    import threading
+    from contextlib import nullcontext
+
+    from genesis.security.immunity_shadow import DispatchGateRefused, guard_human_gate
+
+    # Simulate later startup/child-env drift after shared mode was selected.
+    values = ("0", "1", "service-row", "owner", "service-transcript", "service-legacy")
+    names = (cc.CC_SESSION_ENV, cc.SUPERVISED_ENV, cc.SESSION_ID_ENV,
+             cc.SESSION_ORIGIN_ENV, cc.TRANSCRIPT_ID_ENV, cc.LEGACY_SESSION_ID_ENV)
+    for name, value in zip(names, values, strict=True):
+        monkeypatch.setenv(name, value)
+    request = CallerContext(dispatched=False, supervised=True, session_id="request-row")
+    seen = []
+
+    def read():
+        seen.append(shared_service.caller_context_from_env())
+
+    with request_caller(request) if in_request else nullcontext():
+        if bare_thread:
+            thread = threading.Thread(target=read)
+            thread.start()
+            thread.join(timeout=5)
+            assert not thread.is_alive()
+        else:
+            read()
+        if in_request:
+            assert caller_context() is request
+    assert seen == [shared_service._LOST_SCOPE_CALLER]
+    with request_caller(seen[0]), pytest.raises(DispatchGateRefused):
+        guard_human_gate("synthetic-env-accessor-probe")
+
+
+def test_explicit_env_accessor_keeps_raw_legacy_reads(monkeypatch):
+    monkeypatch.setattr(cc, "_shared_service", False)
+    monkeypatch.setenv(cc.CC_SESSION_ENV, "1")
+    monkeypatch.setenv(cc.SUPERVISED_ENV, "true")
+    monkeypatch.setenv(cc.SESSION_ID_ENV, "")
+    monkeypatch.setenv(cc.SESSION_ORIGIN_ENV, " raw ")
+    monkeypatch.setenv(cc.TRANSCRIPT_ID_ENV, " padded ")
+    monkeypatch.setenv(cc.LEGACY_SESSION_ID_ENV, "legacy")
+    expected = CallerContext(dispatched=True, supervised=False, session_id="", origin=" raw ",
+                             transcript_id=" padded ", legacy_session_id="legacy")
+    with request_caller(CallerContext(session_id="request-row")):
+        assert cc.caller_context_from_env() == expected
+        monkeypatch.setenv(cc.SUPERVISED_ENV, "1")
+        assert cc.caller_context_from_env().supervised is True
+
+
 def test_a_child_of_a_shared_service_is_refused_at_the_human_gate(shared_service):
     import os
     import subprocess

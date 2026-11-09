@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shlex
+import sys
 from pathlib import Path
 
 import aiosqlite
@@ -378,6 +380,8 @@ def test_no_open_row_refuses_and_points_at_the_backlog_reader():
         _prv.resolve_repo([], 7, None)
     assert "no OPEN row for PR #7" in str(exc.value)
     assert "--verification-backlog" in str(exc.value)
+    # A bare `python3` may lack aiosqlite, which the backlog reader needs.
+    assert shlex.quote(sys.executable) + " scripts/repo_pulse_worker.py" in str(exc.value)
 
 
 # ── the verdict/note couplings, all before any read ──────────────────────

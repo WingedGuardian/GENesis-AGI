@@ -6,9 +6,8 @@ tags to stdout (the harness prepends them to the prompt as context) and
 maintains session-scoped state files:
 1. Absolute timestamp / session clock (temporal awareness)
 2. Charter drift tag ([Charter: … | open: N]; chartered sessions only)
-3. MCP stale-code nudge — only when THIS session's MCP subprocesses run code
-   OLDER than the last deploy (they snapshot code at spawn and never reload;
-   there is no auto-restart, so the user is nudged to restart); throttled
+3. MCP recorded-revision nudge — when its captured revision differs from the
+   configured runtime checkout; loaded bytes remain unverified; throttled
 4. Rolling buffer of the last few user messages (for session bookmarks)
 5. /shelve|/unshelve soft hint
 
@@ -461,34 +460,15 @@ def _last_successful_deploy(db_path: Path) -> tuple[str, str] | None:
     return str(row[0]), str(row[1])
 
 
-def _staleness_message(
-    spawn_commit: str, spawn_at: str, deploy: tuple[str, str] | None
-) -> str | None:
-    """The nudge line if this session's MCP code is BEHIND the deploy, else None.
+def _staleness_message(spawn_commit: str, current_commit: str | None) -> str | None:
+    """A nondirectional recorded-revision notice, independent of deploy history."""
+    from genesis.observability.commit_identity import DIFFERENT_RECORDED_REVISION, recorded_revision
 
-    ``deploy`` is ``(completed_at, new_commit)``. Delegates the verdict to
-    ``commit_identity.is_stale`` — the EXACT same leaf the dashboard stale-code
-    badge and the Part-A guard use, so all three can never disagree (a session
-    AHEAD of the last recorded deploy, e.g. a manual ``git pull``, is NOT
-    flagged). Pure (no IO) so the verdict+wording is unit-testable."""
-    from genesis.observability.commit_identity import is_stale
-
-    if not deploy:
+    if recorded_revision(spawn_commit, current_commit) != DIFFERENT_RECORDED_REVISION:
         return None
-    completed_at, new_commit = deploy
-    # Defense-in-depth: this value becomes LLM-visible prompt context, so only ever
-    # interpolate a real short/full SHA. update_history is deploy-pipeline-only today
-    # (no user-facing writer), but a hex guard removes the vector entirely rather
-    # than trusting provenance. Also fail-open (skip) on a malformed commit.
-    if not re.fullmatch(r"[0-9a-fA-F]{4,64}", new_commit or ""):
-        return None
-    if not is_stale(spawn_commit, spawn_at, completed_at, new_commit):
-        return None
-    date = str(completed_at)[:10]  # YYYY-MM-DD
     return (
-        f"[⚠ Memory MCP stale: this session's MCP predates the {date} deploy "
-        f"(now {new_commit[:8]}) — restart the session to refresh recall "
-        f"+ security read-exclusions]"
+        "[MCP revision: recorded launch revision differs from current checkout "
+        f"({spawn_commit[:8]} → {current_commit[:8]}); loaded bytes unverified]"
     )
 
 
@@ -538,21 +518,15 @@ def _record_staleness_nudge(session_id: str, now: datetime) -> bool:
 
 
 def _emit_staleness_nudge(session_id: str, now: datetime) -> None:
-    """One-line nudge when THIS session's MCP subprocesses run code OLDER than
-    the last deploy.
+    """Compare this session's validated spawn record with runtime checkout HEAD.
 
-    Each FastMCP subprocess snapshots its code at spawn and NEVER reloads; a
-    deploy landing MID-session (update.sh restarts genesis-server, NOT a live
-    session's MCPs) leaves recall — and its current security read-exclusions —
-    on stale code until the user restarts the session. There is no auto-restart,
-    so the remedy is a nudge. Identify this session's slot by matching the
-    walked ``claude`` pid against the ``mcp-spawn`` file plane (world-readable;
-    pid- AND start-time-validated by ``read_spawn_identity`` against a recycled
-    pid), then apply the shared ``is_stale`` verdict. Throttled per session;
-    wrapped fail-open so a miss never surfaces as an error and a fresh session
-    stays silent."""
+    No claim about loaded bytes, history direction, or server reload follows
+    from this comparison. Read failures skip the optional line; the existing
+    session cooldown and bounded output remain authoritative.
+    """
     try:
         from genesis.observability.cc_slots import read_proc_start_iso
+        from genesis.observability.commit_identity import read_runtime_head
         from genesis.observability.mcp_spawn_store import (
             enumerate_spawn_slots,
             read_spawn_identity,
@@ -570,12 +544,10 @@ def _emit_staleness_nudge(session_id: str, now: datetime) -> None:
         ident = read_spawn_identity(slot, pid, read_proc_start_iso(pid))
         if ident is None:
             return
-        root = os.environ.get("GENESIS_REPO_ROOT", "")
-        db = (Path(root) if root else Path.home() / "genesis") / "data" / "genesis.db"
-        msg = _staleness_message(ident[0], ident[1], _last_successful_deploy(db))
-        if not msg:
-            return
         if _staleness_throttled(session_id, now):
+            return
+        msg = _staleness_message(ident[0], read_runtime_head())
+        if not msg:
             return
         # Persist the cooldown BEFORE printing: if the marker can't be written
         # (unwritable session dir), suppress rather than spam the banner on every
@@ -612,8 +584,7 @@ def main() -> None:
         _emit_temporal_context(session_id, now)
         # 1a. Charter drift tag (chartered sessions only; fail-open)
         _emit_charter_tag(session_id)
-        # 1b. MCP stale-code nudge (only when this session's MCP is behind the
-        # last deploy; throttled; fail-open)
+        # 1b. MCP recorded-revision difference (throttled; read failure is silent).
         _emit_staleness_nudge(session_id, now)
 
     # 2. Buffer user message for bookmarks

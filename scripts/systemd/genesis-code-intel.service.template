@@ -4,8 +4,10 @@ After=genesis-server.service
 
 [Service]
 Type=oneshot
-WorkingDirectory=__REPO_DIR__
-ExecStart=/bin/bash __REPO_DIR__/scripts/code_intel_runner.sh
+# Startup resolves its checkout from the absolute captured entry path. Native
+# indexers select their repository cwd explicitly.
+WorkingDirectory=/
+ExecStart=:/bin/sh -c 'exec "$@"' -- "__VENV_EXEC__/bin/python" -I "__REPO_EXEC__/scripts/lib/code_intel_source.py" shell runner runner
 # The runner runs the index FOREGROUND under a pressure watchdog whose full-mode
 # wall cap is 4h; keep the unit timeout comfortably above that so a legitimately
 # throttled (duty-cycled) full rebuild is never SIGTERMed mid-flight. A wedged
@@ -22,7 +24,7 @@ TimeoutStartSec=16200
 # __CC_BIN_DIR__ is the resolved npm prefix bin — it doubles as the nvm
 # fallback's bin dir, so a Node/GitNexus installed under ~/.nvm stays visible
 # to the timer instead of every index being refused off the system PATH.
-Environment=PATH=__VENV__/bin:__CC_BIN_DIR__:__HOME__/.npm-global/bin:__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment="PATH=__VENV_EXEC__/bin:__CC_BIN_EXEC__:__HOME_EXEC__/.npm-global/bin:__HOME_EXEC__/.local/bin:/usr/local/bin:/usr/bin:/bin"
 # Retain the renderer's literal selection for managed loaded-command validation.
 Environment="VENV_PATH=__VENV_EXEC__"
 StandardOutput=journal

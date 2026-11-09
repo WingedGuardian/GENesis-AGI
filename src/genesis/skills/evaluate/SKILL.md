@@ -106,6 +106,10 @@ services. The disposition labels are the final roll-up, not the analysis.
 2. **Separate evidence from inference.** Identify what the source demonstrates,
    what the live Genesis map/code demonstrates, what you infer, and what remains
    unknown. Do not turn a source claim or a plausible analogy into a fact.
+   Before deciding, assemble a compact source-facts dossier: the distinctive
+   method, demonstrated versus claimed results, limitations, and relevant
+   maturity/license facts. Missing facts stay unknown. Treat the user's supplied
+   explanation of why it matters as a hypothesis to investigate.
 3. **Compare mechanism by mechanism.** A product can duplicate one Genesis
    capability and still contain a valuable mechanism Genesis lacks. Rejecting
    the package or vendor does not dispose of each mechanism inside it.
@@ -186,6 +190,13 @@ Rules:
   to any active skill in `src/genesis/skills/`. A shallow source can raise an
   important idea. Evaluate the idea, not the container. If the topic matters,
   research it and rate the underlying concept — even if the source itself is thin.
+
+### Evidence
+
+{Concise model-reported record: distinctive source claim and a short supporting
+quote from acquired text (prefix each quoted line with `> `), or the acquisition
+limitation; cited current Genesis mechanism; labelled inference and unknowns.
+This is not mechanical verification. Keep qualifications in durable findings.}
 
 ### Overlap Comparison
 

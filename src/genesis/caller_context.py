@@ -150,7 +150,13 @@ def enter_shared_service() -> None:
 
 
 def caller_context_from_env() -> CallerContext:
-    """The caller as this process's environment describes it, read now."""
+    """Read legacy process identity; shared processes have no environment caller.
+
+    Shared mode returns the lost-scope caller even inside a request. Use
+    ``caller_context()`` for the validated request's identity instead.
+    """
+    if _shared_service:
+        return _LOST_SCOPE_CALLER
     env = os.environ
     return CallerContext(
         dispatched=env.get(CC_SESSION_ENV) == "1",
@@ -161,6 +167,18 @@ def caller_context_from_env() -> CallerContext:
         legacy_session_id=env.get(LEGACY_SESSION_ID_ENV),
         profile=env.get(PROFILE_ENV) or None,
     )
+
+
+_CLIENT_SESSION_NAMES = {"codex": "Codex session"}
+
+
+def client_session_name() -> str:
+    """What to call the caller's session in a message: "Claude Code session"
+    unless the caller is a labelled client with its own name (owner-mode Codex).
+    Messages that tell the reader to restart use it, so a Codex user is not told
+    to restart a Claude Code session; Claude Code's wording stays unchanged.
+    """
+    return _CLIENT_SESSION_NAMES.get(caller_context().profile or "", "Claude Code session")
 
 
 def drop_client_label(env: MutableMapping[str, str]) -> MutableMapping[str, str]:

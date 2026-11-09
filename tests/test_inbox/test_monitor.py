@@ -1159,6 +1159,70 @@ async def test_response_file_written(monitor, inbox_dir, writer):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["ADAPT", "explore", "BUILD"])
+async def test_evidence_survives_scan_delivery_and_recommendation_consumers(
+    monitor, inbox_dir, db, mock_invoker, action
+):
+    """Real isolated scan/DB/writer/baseline path; only the LLM is controlled."""
+    from genesis.db.crud import inbox_items
+    from genesis.inbox.recommendation import parse_recommendations
+
+    source = inbox_dir / "evidence.md"
+    source.write_text("https://example.com/article")
+    if action == "BUILD":
+        evaluation = _build_eval("needs_discussion", "Decide operator access for direct adoption")
+    else:
+        classification = "Genesis-relevant" if action == "ADAPT" else "User-relevant"
+        fields = (
+            "scope: V4\narchitecture_impact: extends\n"
+            if action == "ADAPT"
+            else "timeline: Soon\nrelevance: Tangential\n"
+        )
+        evaluation = (
+            f"# Inbox Evaluation\n\n## Example\n\n**Classification:** {classification}\n"
+            "### Summary\nA bounded trial is proposed, not an established preference.\n"
+            f"### Recommendation\n```yaml\naction: {action}\n"
+            'next_step: "Try the external CLI on one synthetic document"\n'
+            f"effort: Small\nconfidence: medium\n{fields}```\n"
+        )
+    evaluation += (
+        "\n### Evidence\n\n**Source:** <https://example.com/article>\n"
+        'Source claim, not independently verified: "Offline JSON interface."\n'
+        "> ## Source heading, not an inbox item\n"
+        "Personal fit is unknown; an architectural gap is unverified.\n"
+        "### Lens 1: What This Is\nA tool with a bounded external trial.\n"
+    )
+    mock_invoker.run.return_value = _success_output(evaluation)
+
+    await monitor.check_once()
+
+    row = await inbox_items.get_by_file_path(db, str(source))
+    assert row["status"] == "completed"
+    assert row["evaluated_content"] == source.read_text()
+    responses = list(inbox_dir.glob("*.genesis.md"))
+    assert len(responses) == 1
+    delivered = responses[0].read_text()
+    assert "Personal fit is unknown; an architectural gap is unverified." in delivered
+    assert parse_recommendations(delivered) == parse_recommendations(evaluation)
+    follow_ups = await _build_follow_ups(db)
+    assert len(follow_ups) == 1
+    assert follow_ups[0]["strategy"] == "user_input_needed"
+    cursor = await db.execute("SELECT domain FROM follow_ups WHERE source='inbox_evaluation'")
+    assert (await cursor.fetchone())["domain"] == (
+        "user_world" if action == "explore" else "internal"
+    )
+    if action == "BUILD":
+        assert follow_ups[0]["content"].startswith("[BUILD: NEEDS DISCUSSION]")
+    invocation = mock_invoker.run.call_args.args[0]
+    assert invocation.system_prompt == monitor._load_system_prompt()
+    assert "### Evidence" in invocation.system_prompt
+
+    await monitor.check_once()
+    assert mock_invoker.run.await_count == 1
+    assert len(await _build_follow_ups(db)) == 1
+
+
+@pytest.mark.asyncio
 async def test_message_queue_entry_created(monitor, inbox_dir, db):
     (inbox_dir / "item.md").write_text("some content")
     await monitor.check_once()

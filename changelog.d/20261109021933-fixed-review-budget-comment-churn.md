@@ -1,0 +1,1 @@
+- Review and commit checks no longer request approval solely because an unrelated PR comment changed while the review budget was being read. Changes to budget or review evidence still stop the action, and existing approval limits remain.

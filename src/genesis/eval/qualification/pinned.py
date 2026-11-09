@@ -6,6 +6,7 @@ their funded liability and can only be reconciled with GET requests.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -47,6 +48,10 @@ MAX_CURRENCY_CHARS = 4096
 # clock does. A response slower than the wall clock leaves a dispatched
 # attempt for the existing GET-only recovery path; it is never resent.
 COMPLETION_TIMEOUT_S = 120
+# Opt-in metadata availability limits; not a provider readiness guarantee.
+RECEIPT_WAIT_TIMEOUT = 600
+RECEIPT_WAIT_INTERVAL = 30
+RECEIPT_WAIT_READS = 21
 
 
 class LocalFailure(Incomplete):
@@ -784,6 +789,58 @@ def credential(mode="dedicated") -> str:
     return key
 
 
+def frozen_receipt_policy(spec):
+    policy = spec.get("receipt_policy", "single")
+    if not isinstance(policy, str) or policy not in ("single", "wait_404"):
+        raise LocalFailure("invalid frozen receipt policy")
+    return policy
+
+
+async def _receipt_response(journal, attempt, key, evidence, policy, transport):
+    """Failed lookups retain ownership and liability, never financial authority."""
+    wait = policy == "wait_404"
+    with private_logs():
+        client = httpx.AsyncClient(
+            transport=transport, follow_redirects=False,
+            **({"timeout": 30} if wait else {}),
+        )
+        try:
+            async with asyncio.timeout(RECEIPT_WAIT_TIMEOUT if wait else None):
+                for index in range(RECEIPT_WAIT_READS if wait else 1):
+                    try:
+                        response = await client.get(
+                            ENDPOINT + "/generation",
+                            params={"id": evidence["generation_id"]},
+                            headers={"Authorization": f"Bearer {key}"},
+                        )
+                    except BaseException as exc:
+                        try:
+                            journal.append("receipt_lookup", attempt=attempt, evidence=safe_evidence({
+                                **evidence, "http_status": None, "error": failure_message(exc),
+                            }))
+                        except BaseException as append_error:
+                            exc.add_note("lookup evidence append failed: " + exception_name(append_error))
+                        raise
+                    if response.status_code == 200:
+                        return response
+                    journal.append("receipt_lookup", attempt=attempt, evidence=safe_evidence({
+                        **evidence, "http_status": response.status_code,
+                        "raw_body": safe_body(response.content), "error": "billing GET failed",
+                    }))
+                    if response.status_code != 404 or not wait or index + 1 == RECEIPT_WAIT_READS:
+                        raise LocalFailure("billing GET failed")
+                    # Only this invocation's durably recorded404 permits another GET.
+                    await asyncio.sleep(RECEIPT_WAIT_INTERVAL)
+        finally:
+            active = sys.exception()
+            try:
+                await client.aclose()
+            except BaseException as cleanup:
+                if active is None or not isinstance(cleanup, Exception):
+                    raise
+                active.add_note("receipt client cleanup failed: " + exception_name(cleanup))
+
+
 async def reconcile(journal, attempt: str, *, transport=None, association=None, credential_mode=None):
     """Append GET evidence without sending a completion, including on recovery.
 
@@ -799,6 +856,10 @@ async def reconcile(journal, attempt: str, *, transport=None, association=None, 
     if ((binding and model_identities(spec) != model_identities(binding))
             or (not binding and any(key in spec for key in ("backend_model", "receipt_model")))):
         raise LocalFailure("reconciliation model identities differ from frozen transport")
+    policy = frozen_receipt_policy(spec)
+    if (policy != frozen_receipt_policy(binding)
+            or (not binding and "receipt_policy" in spec)):
+        raise LocalFailure("reconciliation receipt policy differs from frozen transport")
     mode = frozen_credential_mode(spec)
     if (mode != frozen_credential_mode(binding)
             or (credential_mode is not None and credential_mode != mode)):
@@ -846,25 +907,16 @@ async def reconcile(journal, attempt: str, *, transport=None, association=None, 
     key = credential(mode)
     if hashlib.sha256(key.encode()).hexdigest() != spec.get("credential_fingerprint"):
         raise LocalFailure("reconciliation credential differs from frozen identity")
-    with private_logs():
-        async with httpx.AsyncClient(transport=transport, follow_redirects=False) as client:
-            response = await client.get(
-                ENDPOINT + "/generation",
-                params={"id": generation},
-                headers={"Authorization": f"Bearer {key}"},
-            )
     evidence = {
         "generation_id": generation,
         "attempt": attempt,
         "request_hash": spec["request_hash"],
-        "http_status": response.status_code,
-        "raw_body": safe_body(response.content),
         "association": association_evidence,
         "provider_identity_evidence": identity,
     }
+    response = await _receipt_response(journal, attempt, key, evidence, policy, transport)
+    evidence.update(http_status=response.status_code, raw_body=safe_body(response.content))
     try:
-        if response.status_code != 200:
-            raise LocalFailure("billing GET failed")
         envelope = financial_json(response.content, (("data", "total_cost"),))
         if "error" in envelope:
             raise LocalFailure("billing GET returned an error envelope")
@@ -1024,6 +1076,7 @@ class PinnedRouter:
         ):
             raise LocalFailure("transport differs from the frozen campaign binding")
         identities = model_identities(binding)
+        receipt_policy = frozen_receipt_policy(binding)
         mode = frozen_credential_mode(binding)
         selected_mode = credential_mode if credential_mode is not None else ("dedicated" if dispatch else mode)
         if selected_mode != mode:
@@ -1052,6 +1105,7 @@ class PinnedRouter:
                 or spec.get("credential_fingerprint") != self.fingerprint
                 or frozen_credential_mode(spec) != mode
                 or model_identities(spec) != identities
+                or frozen_receipt_policy(spec) != receipt_policy
                 or not isinstance(spec.get("receipt_provider"), str)
                 or not spec["receipt_provider"].strip()
                 or not isinstance(spec.get("provider_identity_evidence"), str)
